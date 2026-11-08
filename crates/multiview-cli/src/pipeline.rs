@@ -1854,6 +1854,7 @@ pub struct Pipeline {
     /// Distinct concrete video encoders and one key per runnable output.
     rendition_configs: Vec<EncodeConfig>,
     output_video_keys: Vec<usize>,
+    output_audio_tracks: Vec<Vec<usize>>,
     /// The runnable outputs declared in the config.
     outputs: Vec<RunnableOutput>,
     /// The bake-consumer push handles for the configured AES67 outputs (#103),
@@ -2677,6 +2678,7 @@ impl Pipeline {
         apply_output_audio_selections(&mut outputs, &config.outputs, &discrete_tracks);
         let mut rendition_configs = Vec::<EncodeConfig>::new();
         let mut output_video_keys = Vec::with_capacity(outputs.len());
+        let mut output_audio_tracks = Vec::with_capacity(outputs.len());
         for output in &outputs {
             let requested = config
                 .outputs
@@ -2699,6 +2701,31 @@ impl Pipeline {
                 rendition_configs.len() - 1
             };
             output_video_keys.push(key);
+            let audio_selection = match output {
+                RunnableOutput::File { sink, .. }
+                | RunnableOutput::Hls { sink, .. }
+                | RunnableOutput::Push { sink, .. } => Some(sink.audio_selection()),
+                #[cfg(feature = "webrtc-native")]
+                RunnableOutput::WebRtc { .. } => None,
+                #[cfg(feature = "ndi-bindings")]
+                RunnableOutput::Ndi { .. } => None,
+                #[cfg(feature = "aes67")]
+                RunnableOutput::Aes67 { .. } => None,
+            };
+            let tracks = audio_selection.map_or_else(Vec::new, |selection| {
+                let mut indexes = Vec::with_capacity(selection.tracks.len() + 1);
+                if selection.program {
+                    indexes.push(0);
+                }
+                indexes.extend(
+                    selection
+                        .tracks
+                        .iter()
+                        .map(|track| usize::from(track.index) + 1),
+                );
+                indexes
+            });
+            output_audio_tracks.push(tracks);
         }
 
         // Derive the PER-SOURCE per-tick audio-loudness timelines off the
@@ -2847,6 +2874,7 @@ impl Pipeline {
             encode_cfg: cfg,
             rendition_configs,
             output_video_keys,
+            output_audio_tracks,
             outputs,
             #[cfg(feature = "display-kms")]
             display_plans: built.display,
@@ -3527,14 +3555,17 @@ impl Pipeline {
     /// bounded on-disk artifact instead.
     fn build_sink_runners(&mut self, live: bool) -> Vec<(SinkRunner, SinkSendPolicy)> {
         let configured = std::mem::take(&mut self.outputs);
-        let hls_key = configured
+        let hls_index = configured
             .iter()
-            .position(|output| matches!(output, RunnableOutput::Hls { .. }))
-            .and_then(|index| self.output_video_keys.get(index).copied());
+            .position(|output| matches!(output, RunnableOutput::Hls { .. }));
+        let hls_key = hls_index.and_then(|index| self.output_video_keys.get(index).copied());
+        let hls_audio = hls_index.and_then(|index| self.output_audio_tracks.get(index).cloned());
         let outputs = maybe_prepend_program_ts(configured, live);
         if !live {
             if let Some(hls_key) = hls_key {
                 self.output_video_keys.insert(0, hls_key);
+                self.output_audio_tracks
+                    .insert(0, hls_audio.unwrap_or_default());
             }
         }
         let mut links = Vec::new();
@@ -4123,6 +4154,7 @@ impl Pipeline {
             policy,
             video_encoders,
             self.output_video_keys.clone(),
+            self.output_audio_tracks.clone(),
             audio_encoder,
             audio_bus,
             self.audio_route.load(),
@@ -5164,6 +5196,7 @@ impl StreamEgress {
         policy: SendPolicy,
         video_encoders: Vec<VideoRenditionEncoder>,
         output_video_keys: Vec<usize>,
+        output_audio_tracks: Vec<Vec<usize>>,
         audio_encoder: Option<AudioRenditionEncoder>,
         audio_bus: Option<multiview_audio::program::ProgramBus>,
         audio_route: Option<Arc<crate::audio::AudioControlHandle>>,
@@ -5265,6 +5298,7 @@ impl StreamEgress {
                     video_encoders,
                     audio_encoder,
                     output_video_keys,
+                    output_audio_tracks,
                     audio_bus,
                     audio_route,
                     audio_loudnorm,
@@ -5605,6 +5639,7 @@ fn consumer_main(
     video_encoders: Vec<VideoRenditionEncoder>,
     mut audio_encoder: Option<AudioRenditionEncoder>,
     output_video_keys: Vec<usize>,
+    output_audio_tracks: Vec<Vec<usize>>,
     mut audio_bus: Option<multiview_audio::program::ProgramBus>,
     audio_route: Option<Arc<crate::audio::AudioControlHandle>>,
     mut audio_loudnorm: Option<multiview_audio::LoudnormProcessor>,
@@ -5649,6 +5684,9 @@ fn consumer_main(
         )?;
         workers.push(worker);
     }
+    let audio_specs = audio_encoder
+        .as_ref()
+        .map_or_else(Vec::new, AudioRenditionEncoder::watermark_streams);
     let audio_bases = audio_encoder.as_ref().map_or_else(Vec::new, |encoder| {
         let base = encoder.time_base();
         std::iter::repeat_n(
@@ -5666,7 +5704,7 @@ fn consumer_main(
         .map(|(index, &key)| BindingConfig {
             output_index: index,
             video_key: Some(key),
-            audio_tracks: (0..audio_bases.len()).collect(),
+            audio_tracks: output_audio_tracks.get(index).cloned().unwrap_or_default(),
         })
         .collect();
     let mut dispatcher = RenditionDispatcher::new(DispatchConfig {
@@ -5939,7 +5977,15 @@ fn consumer_main(
                     })
                     .and_then(EncodedPacket::pts);
                 watermarks.push(pts.and_then(|p| {
-                    crate::rendition_workers::next_frame_lower_bound_ns(p, 1024, 48_000)
+                    audio_specs
+                        .get(stream)
+                        .and_then(|&(frame_samples, sample_rate)| {
+                            crate::rendition_workers::next_frame_lower_bound_ns(
+                                p,
+                                frame_samples,
+                                sample_rate,
+                            )
+                        })
                 }));
             }
             event_tx

@@ -706,6 +706,26 @@ impl AudioRenditionEncoder {
         Ok(())
     }
 
+    /// Program-audio encoder frame size in exact samples (AAC is typically 1024).
+    #[must_use]
+    pub fn frame_samples(&self) -> Option<u32> {
+        u32::try_from(self.audio.frame_size).ok()
+    }
+
+    /// Per-track sample rate and frame size from the actual opened encoder.
+    #[must_use]
+    pub fn watermark_streams(&self) -> Vec<(u32, u32)> {
+        std::iter::once(&self.audio)
+            .chain(self.tracks.iter())
+            .filter_map(|state| {
+                Some((
+                    u32::try_from(state.frame_size).ok()?,
+                    u32::try_from(state.time_base.den).ok()?,
+                ))
+            })
+            .collect()
+    }
+
     /// Program-audio stream parameters and sample-clock time base.
     #[must_use]
     pub fn codec_params(&self) -> &StreamCodecParameters {
