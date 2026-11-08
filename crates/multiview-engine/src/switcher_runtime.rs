@@ -45,7 +45,8 @@ impl SwitcherRuntime {
             .scene_pair()
             .ok_or_else(|| Error::InvalidLayout("no M/E scene provider".into()))?;
         if pair.version != self.scene_version {
-            self.driver.revoke_provider_status();
+            self.driver
+                .reject_composed_tick(tick, "scene version changed before output admission");
             return Err(Error::InvalidLayout(
                 "switcher scene version changed before output admission".into(),
             ));
@@ -56,6 +57,7 @@ impl SwitcherRuntime {
         match rendered {
             Ok(frames) => {
                 let canvas = &pair.program.canvas;
+                self.driver.commit_composed_tick(tick);
                 self.driver.publish_provider_status(ProviderStatus {
                     scene_version: pair.version,
                     last_tick: tick.index,
@@ -67,7 +69,7 @@ impl SwitcherRuntime {
                 Ok(frames)
             }
             Err(error) => {
-                self.driver.revoke_provider_status();
+                self.driver.reject_composed_tick(tick, &error.to_string());
                 Err(error)
             }
         }

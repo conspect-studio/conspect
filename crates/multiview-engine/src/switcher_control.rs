@@ -143,6 +143,7 @@ impl SwitcherControl {
             primed_stores: None,
             pending_take: None,
             last_tick: 0,
+            staged_success: Vec::with_capacity(MAX_COMMANDS_PER_TICK),
         };
         (handle, driver)
     }
@@ -238,6 +239,7 @@ pub struct SwitcherTickDriver {
     primed_stores: Option<HashMap<String, Arc<TileStore<Nv12Image>>>>,
     pending_take: Option<(SwitcherCommand, u64)>,
     last_tick: u64,
+    staged_success: Vec<String>,
 }
 
 impl SwitcherTickDriver {
@@ -299,7 +301,7 @@ impl SwitcherTickDriver {
                 match self.machine.cut() {
                     Ok(next) => {
                         projection = next;
-                        self.publish_outcome(command.operation_id, tick.index, true, None);
+                        self.staged_success.push(command.operation_id);
                     }
                     Err(err) => self.publish_outcome(
                         command.operation_id,
@@ -322,7 +324,7 @@ impl SwitcherTickDriver {
         if projection.completed {
             if let Some(operation_id) = self.active_auto.take() {
                 self.active_auto_scenes = None;
-                self.publish_outcome(operation_id, tick.index, true, None);
+                self.staged_success.push(operation_id);
             }
         }
         for _ in 0..MAX_COMMANDS_PER_TICK {
@@ -439,7 +441,7 @@ impl SwitcherTickDriver {
                                 );
                             }
                         }
-                        self.publish_outcome(command.operation_id, tick.index, true, None);
+                        self.staged_success.push(command.operation_id);
                     }
                 }
                 Err(error) => {
@@ -447,6 +449,13 @@ impl SwitcherTickDriver {
                 }
             }
         }
+        projection
+    }
+
+    /// Confirm the staged scene was actually composited and published at this
+    /// tick before exposing state or an applied receipt. Repeat frames never
+    /// call this; failure calls `reject_composed_tick` instead.
+    pub fn commit_composed_tick(&mut self, tick: Tick) {
         self.snapshots.publish(SwitcherSnapshot {
             tick: tick.index,
             program: self.machine.program().clone(),
@@ -454,7 +463,19 @@ impl SwitcherTickDriver {
             in_flight: self.machine.is_in_flight(),
             completion_count: self.machine.completion_count(),
         });
-        projection
+        let accepted = std::mem::take(&mut self.staged_success);
+        for operation_id in accepted {
+            self.publish_outcome(operation_id, tick.index, true, None);
+        }
+    }
+
+    /// Never claim on-air success when the bus frame could not be rendered.
+    pub fn reject_composed_tick(&mut self, tick: Tick, reason: &str) {
+        let accepted = std::mem::take(&mut self.staged_success);
+        for operation_id in accepted {
+            self.publish_outcome(operation_id, tick.index, false, Some(reason.to_owned()));
+        }
+        self.revoke_provider_status();
     }
 
     fn publish_outcome(

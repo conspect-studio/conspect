@@ -92,6 +92,15 @@ async fn terminal_only_corr_and_dual_scope_survive_bounded_relay() {
         index: 3,
         pts: MediaTime::ZERO,
     });
+    assert_eq!(
+        publisher.events.sequence(),
+        0,
+        "terminal state still needs real composite"
+    );
+    driver.commit_composed_tick(Tick {
+        index: 3,
+        pts: MediaTime::ZERO,
+    });
     let frame = tokio::time::timeout(std::time::Duration::from_secs(2), allowed.next_delta())
         .await
         .unwrap()

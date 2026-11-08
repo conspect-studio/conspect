@@ -90,6 +90,7 @@ fn cold_preview_hold_preserves_program_cadence_then_exact_tick_cut() {
         .unwrap();
     for index in 0..9 {
         driver.drain_at_tick(tick(index));
+        driver.commit_composed_tick(tick(index));
         assert_eq!(handle.snapshot().unwrap().tick, index);
         assert_eq!(handle.snapshot().unwrap().program.as_str(), "a");
         assert!(
@@ -110,6 +111,12 @@ fn cold_preview_hold_preserves_program_cadence_then_exact_tick_cut() {
         MediaTime::ZERO,
     );
     driver.drain_at_tick(tick(9));
+    assert_eq!(
+        handle.snapshot().unwrap().program.as_str(),
+        "a",
+        "not applied before real frame"
+    );
+    driver.commit_composed_tick(tick(9));
     assert_eq!(handle.snapshot().unwrap().program.as_str(), "b");
     assert_eq!(handle.snapshot().unwrap().preview.as_str(), "a");
     let outcome = events.try_recv().unwrap();
@@ -117,6 +124,7 @@ fn cold_preview_hold_preserves_program_cadence_then_exact_tick_cut() {
     assert!(outcome.event.completed);
     for index in 10..20 {
         driver.drain_at_tick(tick(index));
+        driver.commit_composed_tick(tick(index));
         assert_eq!(handle.snapshot().unwrap().program.as_str(), "b");
     }
 }
@@ -133,6 +141,7 @@ fn cold_preview_deadline_reports_failure_without_pgm_swap() {
         .unwrap();
     for index in 0..51 {
         driver.drain_at_tick(tick(index));
+        driver.commit_composed_tick(tick(index));
     }
     let outcome = events.try_recv().unwrap();
     assert_eq!(outcome.event.tick, 50);

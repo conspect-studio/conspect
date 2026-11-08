@@ -160,6 +160,10 @@ async fn real_handle_returns_202_then_tick_exact_correlated_completion() {
         index: 9,
         pts: MediaTime::ZERO,
     });
+    driver.commit_composed_tick(Tick {
+        index: 9,
+        pts: MediaTime::ZERO,
+    });
     let outcome = events.try_recv().unwrap();
     assert_eq!(outcome.event.operation_id, op);
     assert_eq!(outcome.event.tick, 9);

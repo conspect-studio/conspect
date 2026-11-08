@@ -106,12 +106,18 @@ fn commands_apply_only_at_exact_tick_and_reject_overload_before_202() {
         .try_send(command(COMMAND_CAPACITY, SwitcherVerb::Cut))
         .is_err());
     driver.drain_at_tick(tick(5));
+    assert!(
+        handle.snapshot().is_none(),
+        "staging never claims an on-air frame"
+    );
+    driver.commit_composed_tick(tick(5));
     assert_eq!(handle.snapshot().unwrap().tick, 5);
     assert_eq!(
         handle.snapshot().unwrap().completion_count,
         MAX_COMMANDS_PER_TICK as u64
     );
     driver.drain_at_tick(tick(6));
+    driver.commit_composed_tick(tick(6));
     assert_eq!(
         handle.snapshot().unwrap().completion_count,
         (MAX_COMMANDS_PER_TICK * 2) as u64
@@ -136,6 +142,7 @@ fn auto_is_correlated_only_at_terminal_tick_and_rejection_changes_no_bus() {
         .try_send(command(2, SwitcherVerb::SelectPreview(source("b"))))
         .unwrap();
     driver.drain_at_tick(tick(1));
+    driver.commit_composed_tick(tick(1));
     let rejection = outcomes.try_recv().unwrap();
     assert_eq!(rejection.event.operation_id, "2");
     assert!(!rejection.event.completed);
@@ -147,6 +154,7 @@ fn auto_is_correlated_only_at_terminal_tick_and_rejection_changes_no_bus() {
         .contains("active take"));
     assert_eq!(handle.snapshot().unwrap().preview.as_str(), "b");
     driver.drain_at_tick(tick(25));
+    driver.commit_composed_tick(tick(25));
     assert_eq!(handle.snapshot().unwrap().program.as_str(), "b");
     let completion = outcomes.try_recv().unwrap();
     assert_eq!(completion.event.operation_id, "1");
@@ -162,6 +170,7 @@ fn no_provider_stale_scene_and_overlapping_mix_fail_closed() {
     let mut outcomes = handle.outcomes();
     handle.try_send(command(1, SwitcherVerb::Cut)).unwrap();
     driver.drain_at_tick(tick(0));
+    driver.commit_composed_tick(tick(0));
     assert!(!outcomes.try_recv().unwrap().event.completed);
     assert_eq!(handle.snapshot().unwrap().completion_count, 0);
     set_scenes(&handle);
@@ -222,6 +231,7 @@ fn cut_interrupts_auto_with_correlated_failure_and_new_success() {
     driver.drain_at_tick(tick(0));
     handle.try_send(command(2, SwitcherVerb::Cut)).unwrap();
     driver.drain_at_tick(tick(3));
+    driver.commit_composed_tick(tick(3));
     let cancelled = outcomes.try_recv().unwrap();
     assert_eq!(cancelled.event.operation_id, "1");
     assert!(!cancelled.event.completed);
