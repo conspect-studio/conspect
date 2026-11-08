@@ -91,7 +91,7 @@ msgstr ""
 #. placeholder {0}: String(selected.size)
 #. placeholder {1}: String(count)
 #. placeholder {1}: String(selected.size)
-#: src/iptv/ActivationChoice.tsx:65
+#: src/iptv/ActivationChoice.tsx:70
 #: src/pages/M3uImportDialog.tsx:270
 msgid "{0} always-on sources open {1} connections and decoders at once. Choose On demand unless every one must run all the time."
 msgstr ""
@@ -996,7 +996,7 @@ msgstr ""
 msgid "Always on setting"
 msgstr ""
 
-#: src/iptv/ActivationChoice.tsx:61
+#: src/iptv/ActivationChoice.tsx:66
 #: src/pages/M3uImportDialog.tsx:266
 msgid "Always on: each opens a connection and decodes from boot"
 msgstr ""
@@ -6575,7 +6575,7 @@ msgstr ""
 msgid "On demand (idle until something uses it)"
 msgstr ""
 
-#: src/iptv/ActivationChoice.tsx:50
+#: src/iptv/ActivationChoice.tsx:55
 #: src/pages/M3uImportDialog.tsx:257
 msgid "On demand: idle and free until something uses them"
 msgstr ""
@@ -8371,7 +8371,7 @@ msgstr ""
 
 #. placeholder {0}: String(count)
 #. placeholder {0}: String(selected.size)
-#: src/iptv/ActivationChoice.tsx:39
+#: src/iptv/ActivationChoice.tsx:44
 #: src/pages/M3uImportDialog.tsx:249
 msgid "Start the {0} selected source(s)"
 msgstr ""
