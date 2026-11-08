@@ -216,6 +216,8 @@ pub mod rendition_plan;
 /// reordered/delayed encoder.
 #[cfg(feature = "ffmpeg")]
 pub mod rendition_workers;
+#[cfg(feature = "ffmpeg")]
+mod rendition_dispatch;
 pub mod run;
 #[cfg(test)]
 mod source_event_automation_e2e;

@@ -259,6 +259,10 @@ pub(crate) trait WindowDelivery {
 
     /// Stop after serving every admitted window.
     fn finish(&mut self);
+
+    /// Fatal assembler loss: invalidate queued media and stop future offers.
+    /// Unlike `finish`, this does not claim an admitted tail was delivered.
+    fn abort(&mut self);
 }
 
 impl WindowDelivery for BindingDelivery {
@@ -326,6 +330,15 @@ impl WindowDelivery for BindingDelivery {
 
     fn finish(&mut self) {
         BindingDelivery::finish(self);
+    }
+    fn abort(&mut self) {
+        for binding in &mut self.bindings {
+            binding.staged.clear();
+            binding.queue.report_loss(OfferError::ProducerLoss);
+            binding.queue.close();
+            binding.failed = true;
+            binding.last_rejection = Some(RejectionReason::NeedsRecoveryPoint);
+        }
     }
 }
 
@@ -438,7 +451,8 @@ impl BindingDelivery {
                 continue;
             }
             for packet in packets {
-                let video_keyframe = matches!(packet.kind(), StreamKind::Video) && packet.is_keyframe();
+                let video_keyframe =
+                    matches!(packet.kind(), StreamKind::Video) && packet.is_keyframe();
                 if let BindingPolicy::Push(link) = &binding.policy {
                     if !link.admit_upstream(video_keyframe) {
                         continue;
@@ -704,7 +718,6 @@ impl BindingDelivery {
             })
             .collect()
     }
-
 }
 
 /// Send one packet to a sink, waiting at most [`PUMP_WEDGE_GRACE`] for a slot.
@@ -732,8 +745,8 @@ fn send_bounded_packet(tx: &SyncSender<EncodedPacket>, mut packet: EncodedPacket
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
     use super::{
-        tick_span, BindingDelivery, BindingPolicy, DeliveryLimits, RejectionReason,
-        HANDOFF_LEASES, PUMP_WEDGE_GRACE,
+        tick_span, BindingDelivery, BindingPolicy, DeliveryLimits, RejectionReason, HANDOFF_LEASES,
+        PUMP_WEDGE_GRACE,
     };
     use multiview_core::time::Rational;
     use multiview_ffmpeg::{CodecKind, EncodedPacket, NalFraming};
@@ -784,17 +797,17 @@ mod tests {
             tick_span(Rational::new(30_000, 1001)),
             Duration::from_nanos(33_366_666)
         );
-        assert_eq!(
-            tick_span(Rational::new(25, 1)),
-            Duration::from_millis(40)
-        );
+        assert_eq!(tick_span(Rational::new(25, 1)), Duration::from_millis(40));
         assert_eq!(tick_span(Rational::new(0, 1)), Duration::ZERO);
     }
 
     #[test]
     fn one_tick_is_admitted_atomically_and_reaches_its_sink() {
-        let (mut delivery, mut receivers) =
-            BindingDelivery::new(vec![BindingPolicy::Bounded], DeliveryLimits::default(), None);
+        let (mut delivery, mut receivers) = BindingDelivery::new(
+            vec![BindingPolicy::Bounded],
+            DeliveryLimits::default(),
+            None,
+        );
         let rx = receivers.remove(0);
         // A real sink drains for the whole run; the handoff is only one packet
         // deep, so the test drains on its own thread exactly like a muxer.
@@ -888,7 +901,10 @@ mod tests {
         delivery.stage(&[packet(2)]);
         delivery.flush_tick(Instant::now(), span);
         let statuses = delivery.statuses();
-        assert!(statuses[0].failed, "the dead binding must fail independently");
+        assert!(
+            statuses[0].failed,
+            "the dead binding must fail independently"
+        );
         assert_eq!(
             statuses[0].last_rejection,
             Some(RejectionReason::SinkWedged)
@@ -942,8 +958,11 @@ mod tests {
 
     #[test]
     fn finish_serves_every_admitted_tail_packet_before_closing() {
-        let (mut delivery, mut receivers) =
-            BindingDelivery::new(vec![BindingPolicy::Bounded], DeliveryLimits::default(), gate());
+        let (mut delivery, mut receivers) = BindingDelivery::new(
+            vec![BindingPolicy::Bounded],
+            DeliveryLimits::default(),
+            gate(),
+        );
         let rx = receivers.remove(0);
         let collector = std::thread::spawn(move || drain(&rx));
         let span = tick_span(Rational::new(30_000, 1001));
