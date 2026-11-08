@@ -316,7 +316,7 @@ async fn mixed_codec_pipeline_receives_decodable_media_not_just_headers() {
                 .arg(format!(
                     "srt://[::1]:{port}?mode=caller&connect_timeout=5000"
                 ))
-                .args(["-c", "copy", "-f", "mpegts"])
+                .args(["-map", "0", "-c", "copy", "-f", "mpegts"])
                 .arg(&path)
                 .status()
                 .expect("receive SRT")
