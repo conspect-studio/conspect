@@ -1,28 +1,38 @@
-// Verification only: never print the private endpoint or browser errors.
+// Static Vite build and private in-process endpoint injection; no external dev server.
 import { chromium } from '@playwright/test';
-import { readFileSync, statSync } from 'node:fs';
-const file = process.argv[2];
-if (!file || (statSync(file).mode & 0o077)) throw new Error('PRIVATE_HANDOFF_REQUIRED');
-const handoff = JSON.parse(readFileSync(file, 'utf8'));
-const token = handoff.tokens.find(t => t.operations.includes('subscribe'))?.secret;
-if (!token) throw new Error('SUBSCRIBE_TOKEN_REQUIRED');
-const browser = await chromium.launch({headless:true,args:['--no-sandbox','--enable-quic']});
+import { build, preview } from 'vite';
+import { readFileSync, statSync, mkdtempSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
+import { resolve } from 'node:path';
+const root=fileURLToPath(new URL('..',import.meta.url));
+const mode=process.argv[2];
+let endpoint,hash;
+if(mode==='local') {endpoint='https://localhost:4443';hash=process.argv[3];}
+else if(mode==='cloudflare') {
+ const file=process.argv[3];
+ if(!file || (statSync(file).mode & 0o077)) throw new Error('PRIVATE_HANDOFF_REQUIRED');
+ const handoff=JSON.parse(readFileSync(file,'utf8'));
+ const token=handoff.tokens.find(t=>t.operations.includes('subscribe'))?.secret;
+ if(!token)throw new Error('SUBSCRIBE_TOKEN_REQUIRED');
+ endpoint=`https://draft-16.cloudflare.mediaoverquic.com/${token}`;
+}else throw new Error('MODE_REQUIRED');
+const outDir=mkdtempSync(resolve(root,'node_modules/.cache-moq-probe-'));
+await build({configFile:false,root,logLevel:'silent',build:{outDir,emptyOutDir:false,rollupOptions:{input:resolve(root,'scripts/moq-cloudflare-page.html')}}});
+const server=await preview({configFile:false,root,logLevel:'silent',build:{outDir},preview:{host:'::1',port:0,strictPort:true}});
+const port=server.httpServer.address().port;
+const browser=await chromium.launch({headless:true,args:['--no-sandbox','--enable-quic']});
 try {
- const page = await browser.newPage();
- await page.addInitScript(endpoint => {
-  console.debug = console.log = console.info = console.warn = console.error = () => {};
-  window.cfEndpoint = endpoint;
- }, `https://draft-16.cloudflare.mediaoverquic.com/${token}`);
- let html = readFileSync(new URL('../src/preview/moq-fixture.html', import.meta.url),'utf8');
- html = html.replace("new URL('https://localhost:4443')", 'new URL(window.cfEndpoint)')
-  .replace("{serverCertificateHashes: [{value: query.get('hash')}]}", '{}')
-  .replace('window.fixture.error = String(error)', "window.fixture.error = 'CF_BROWSER_CONNECT_OR_DECODE_FAILED'");
- await page.route('**/src/preview/moq-fixture.html', route => route.fulfill({status:200,contentType:'text/html',body:html}));
- await page.goto('http://[::1]:5179/src/preview/moq-fixture.html');
- let timedOut = false;
- try { await page.waitForFunction(() => window.fixture?.frames >= 30 || window.fixture?.error, {timeout:45000}); } catch { timedOut = true; }
- const result = await page.evaluate(() => ({frames:window.fixture?.frames ?? 0,uniqueTimestamps:new Set(window.fixture?.timestamps ?? []).size,version:window.fixture?.version,error:window.fixture?.error}));
- console.log(JSON.stringify({...result,timedOut}));
- if(result.error || result.frames < 30 || result.uniqueTimestamps < 20 || result.version !== 'moq-transport-16') process.exitCode=1;
- await page.evaluate(() => window.fixture?.close?.());
-} catch {console.log('CF_BROWSER_PROBE_FAILED');process.exitCode=1;} finally {await browser.close();}
+ const page=await browser.newPage();
+ let pageErrors=0;page.on('pageerror',()=>{pageErrors++;});
+ await page.addInitScript(()=>{console.debug=console.log=console.info=console.warn=console.error=()=>{};});
+ await page.goto(`http://[::1]:${port}/scripts/moq-cloudflare-page.html`);
+ await page.waitForFunction(()=>typeof window.startProbe==='function',{timeout:15000});
+ await page.evaluate(options=>{void window.startProbe(options);},{endpoint,hash});
+ let timedOut=false;
+ try{await page.waitForFunction(()=>window.fixture.frames>=30||window.fixture.error,{timeout:45000});}catch{timedOut=true;}
+ const result=await page.evaluate(()=>({frames:window.fixture.frames,uniqueTimestamps:new Set(window.fixture.timestamps).size,version:window.fixture.version,error:window.fixture.error,errorType:window.fixture.errorType,phase:window.fixture.phase}));
+ console.log(JSON.stringify({mode,...result,timedOut,pageErrors}));
+ if(result.error||result.frames<30||result.uniqueTimestamps<20||result.version!=='moq-transport-16')process.exitCode=1;
+ await page.evaluate(()=>window.fixture.close?.());
+}catch{console.log(JSON.stringify({mode,error:'HARNESS_BOOT_FAILED'}));process.exitCode=1;}
+finally{await browser.close();await new Promise(r=>server.httpServer.close(r));}
