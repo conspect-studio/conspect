@@ -1,5 +1,10 @@
-/* eslint-disable react-refresh/only-export-components -- the warning threshold lives beside the control that uses it */
 // The explicit "Always on / On demand" choice for the IPTV-ORG add flows.
+//
+// `LARGE_ALWAYS_ON` is exported beside the control because the threshold and
+// the warning that uses it are one decision; the repo's
+// `react-refresh/only-export-components` sets `allowConstantExport`, so a
+// constant export here needs no eslint-disable (and an unused one fails the
+// `--max-warnings=0` gate).
 //
 // Nothing is preselected: the operator says how the sources start, and the add
 // control stays disabled until they do (`docs/io/iptv-org.md`, Integration

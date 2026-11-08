@@ -63,7 +63,11 @@ async fn count(h: &support::Harness) -> usize {
 /// The `activation` the durable source document carries (`null` when it leaves
 /// the choice implicit, which the config reads as `always_on`).
 async fn stored_activation(h: &support::Harness, id: &str) -> Value {
-    let r = send(&h.router, get(&format!("/api/v1/sources/{id}"), ADMIN_TOKEN)).await;
+    let r = send(
+        &h.router,
+        get(&format!("/api/v1/sources/{id}"), ADMIN_TOKEN),
+    )
+    .await;
     assert_eq!(r.status(), StatusCode::OK, "GET /sources/{id}");
     body_json(r).await["body"]["activation"].clone()
 }
@@ -91,7 +95,11 @@ async fn eight_are_accepted_and_all_created() {
 #[tokio::test]
 async fn nine_on_demand_are_accepted_and_stay_on_demand_durably() {
     let h = harness();
-    let r = send(&h.router, post_json(PATH, OPERATOR_TOKEN, &many_activation(9, "on_demand"))).await;
+    let r = send(
+        &h.router,
+        post_json(PATH, OPERATOR_TOKEN, &many_activation(9, "on_demand")),
+    )
+    .await;
     assert_eq!(r.status(), StatusCode::CREATED);
     let b = body_json(r).await;
     assert_eq!(b["results"].as_array().unwrap().len(), 9);
@@ -114,7 +122,11 @@ async fn nine_on_demand_are_accepted_and_stay_on_demand_durably() {
 #[tokio::test]
 async fn nine_always_on_are_accepted_when_every_entry_states_it() {
     let h = harness();
-    let r = send(&h.router, post_json(PATH, OPERATOR_TOKEN, &many_activation(9, "always_on"))).await;
+    let r = send(
+        &h.router,
+        post_json(PATH, OPERATOR_TOKEN, &many_activation(9, "always_on")),
+    )
+    .await;
     assert_eq!(r.status(), StatusCode::CREATED);
     assert_eq!(count(&h).await, 9);
     for i in 0..9 {
@@ -135,10 +147,7 @@ async fn above_the_old_cap_without_a_stated_activation_is_rejected() {
     )
     .await;
     assert_eq!(r.status(), StatusCode::UNPROCESSABLE_ENTITY);
-    let detail = body_json(r).await["detail"]
-        .as_str()
-        .unwrap()
-        .to_owned();
+    let detail = body_json(r).await["detail"].as_str().unwrap().to_owned();
     assert!(detail.contains("must state its `activation`"), "{detail}");
     assert!(detail.contains("1 of 9"), "{detail}");
     assert_eq!(count(&h).await, 0);
@@ -243,7 +252,11 @@ async fn a_large_batch_is_still_authorised_per_source() {
     // refuses the whole batch before anything is created (BOLA).
     let r = send(
         &h.router,
-        post_json(PATH, SCOPED_TOKEN, &many_activation(EXPLICIT_ABOVE + 1, "on_demand")),
+        post_json(
+            PATH,
+            SCOPED_TOKEN,
+            &many_activation(EXPLICIT_ABOVE + 1, "on_demand"),
+        ),
     )
     .await;
     assert_eq!(r.status(), StatusCode::FORBIDDEN);
