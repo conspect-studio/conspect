@@ -55,6 +55,7 @@ support matrix — update a row's status as it is implemented.
 | Supervised reconnect / backoff / circuit breaker | 🔵 | M3 | [resilience](docs/architecture/resilience.md) |
 | Per-source color override (4 axes) | 📐 | M5 | [color](docs/architecture/color.md) |
 | Per-input audio/subtitle track selection | 📐 | M4/M5 | [media](docs/media/audio-subtitles-overlays.md) |
+| Live Feed Exchange — offer and receive independently priced clean and branded contribution feeds by story location | 📋 backlog | Unscheduled | [Platform backlog](docs/development/live-feed-exchange-backlog.md) · [#205](https://github.com/conspect-studio/conspect/issues/205) |
 
 ## Outputs
 
