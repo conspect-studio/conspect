@@ -3020,6 +3020,60 @@ mod tests {
     const HEIGHT: u32 = 120;
 
     #[test]
+    fn concrete_rendition_opens_zero_latency_and_emits_every_tick() {
+        use multiview_core::frame::FrameMeta;
+        use multiview_core::pixel::PixelFormat;
+        use multiview_core::time::MediaTime;
+        for codec in ["libx264", "libx265"] {
+            if ffmpeg::encoder::find_by_name(codec).is_none() {
+                continue;
+            }
+            let mut config = EncodeConfig::mpeg2(WIDTH, HEIGHT);
+            config.codec_name = codec.to_owned();
+            config.gop = 30;
+            config.cadence = Rational::FPS_29_97;
+            let mut rendition = super::VideoRenditionEncoder::new(&config).unwrap();
+            assert!(
+                rendition.no_reorder_proven(),
+                "{codec} opened reorder/delay"
+            );
+            for tick in 0..65_u64 {
+                let frame = DecodedVideoFrame {
+                    frame: ffmpeg::util::frame::Video::new(
+                        ffmpeg::format::Pixel::YUV420P,
+                        WIDTH,
+                        HEIGHT,
+                    ),
+                    meta: FrameMeta {
+                        pts: MediaTime::ZERO,
+                        width: WIDTH,
+                        height: HEIGHT,
+                        format: PixelFormat::Nv12,
+                        color: multiview_core::color::ColorInfo::default(),
+                    },
+                    raw_pts: None,
+                    a53_cc: None,
+                };
+                let packets = rendition.encode_frame_at(frame, tick).unwrap();
+                assert!(
+                    !packets.is_empty(),
+                    "{codec} buffered input tick {tick} despite zero-latency proof"
+                );
+                assert!(
+                    packets
+                        .iter()
+                        .all(|packet| packet.dts() == Some(tick as i64)),
+                    "{codec} emitted delayed DTS for tick {tick}"
+                );
+            }
+            assert!(
+                rendition.finish().unwrap().is_empty(),
+                "{codec} hid delayed frames at EOF"
+            );
+        }
+    }
+
+    #[test]
     fn prior_rendition_retirement_and_ts_reaper_preserve_uri_references() {
         for (uri, pinned, fail_closed) in [
             ("video-0.ts?token=x", "video-0.ts", false),
