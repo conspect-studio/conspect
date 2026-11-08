@@ -205,12 +205,14 @@ pub mod preview;
 /// build's existing `can_encode` probes. Pure planning only — it opens no
 /// encoder and reserves no session; the `Pipeline::build` wiring is the next
 /// serial unit.
+#[cfg(feature = "ffmpeg")]
 pub mod rendition_plan;
 /// The independently bounded per-rendition encode workers (broadcast output
 /// contract, slice 2): one worker per distinct video rendition key, each with
 /// its own bounded admission queue, emitting typed events with a *proven* DTS
 /// completeness watermark so a window assembler never closes early on a
 /// reordered/delayed encoder.
+#[cfg(feature = "ffmpeg")]
 pub mod rendition_workers;
 pub mod run;
 #[cfg(test)]
