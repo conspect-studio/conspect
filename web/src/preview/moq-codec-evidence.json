@@ -1,0 +1,70 @@
+{
+  "browserVersion": "149.0.7827.55",
+  "video": {
+    "vp8": {
+      "config": {
+        "codec": "vp8",
+        "codedHeight": 180,
+        "codedWidth": 320,
+        "flip": false,
+        "hardwareAcceleration": "no-preference",
+        "rotation": 0
+      },
+      "supported": true
+    },
+    "avc1.42001f": {
+      "config": {
+        "codec": "avc1.42001f",
+        "codedHeight": 180,
+        "codedWidth": 320,
+        "flip": false,
+        "hardwareAcceleration": "no-preference",
+        "rotation": 0
+      },
+      "supported": true
+    },
+    "hvc1.1.6.L93.B0": {
+      "config": {
+        "codec": "hvc1.1.6.L93.B0",
+        "codedHeight": 180,
+        "codedWidth": 320,
+        "flip": false,
+        "hardwareAcceleration": "no-preference",
+        "rotation": 0
+      },
+      "supported": false
+    },
+    "hev1.1.6.L93.B0": {
+      "config": {
+        "codec": "hev1.1.6.L93.B0",
+        "codedHeight": 180,
+        "codedWidth": 320,
+        "flip": false,
+        "hardwareAcceleration": "no-preference",
+        "rotation": 0
+      },
+      "supported": false
+    }
+  },
+  "audio": {
+    "opus": {
+      "config": {
+        "codec": "opus",
+        "numberOfChannels": 2,
+        "sampleRate": 48000
+      },
+      "supported": true
+    },
+    "mp4a.40.2": {
+      "config": {
+        "codec": "mp4a.40.2",
+        "numberOfChannels": 2,
+        "sampleRate": 48000
+      },
+      "supported": true
+    }
+  },
+  "userAgent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) HeadlessChrome/149.0.7827.55 Safari/537.36",
+  "nativeAudioDecoder": "function",
+  "nativeAudioEncoder": "function"
+}

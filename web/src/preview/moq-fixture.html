@@ -4,14 +4,20 @@ import { Player } from '@moq/watch';
 import { connectMoq } from './moqConnection.ts';
 const query = new URLSearchParams(location.search);
 const origin = new Origin.Producer();
-window.fixture = { frames: 0, timestamps: [], version: null, error: null };
+window.fixture = { frames: 0, timestamps: [], audioFrames: 0, audioTimestamps: [], version: null, error: null };
+if (query.has('audio')) {
+ const Native = globalThis.AudioDecoder;
+ globalThis.AudioDecoder = class extends Native {
+  constructor(init) { super({...init, output(frame) {window.fixture.audioFrames++; window.fixture.audioTimestamps.push(frame.timestamp); init.output(frame);}}); }
+ };
+}
 // Test-only page: explicit certificate hash; production player never accepts this parameter.
 try {
 const session = await connectMoq(new URL('https://localhost:4443'), AbortSignal.timeout(10000), origin,
  {serverCertificateHashes: [{value: query.get('hash')}]});
 window.fixture.version = session.version;
 const player = new Player({origin, name: Path.from('fixture'), canvas: document.querySelector('canvas'),
- enabled:true, announced:false, muted:true, paused:false, visible:'always'});
+ enabled:true, announced:false, muted:!query.has('audio'), paused:false, visible:'always'});
 window.fixture.close = () => {player.close(); session.close(); origin.close();};
 const original = CanvasRenderingContext2D.prototype.drawImage;
 CanvasRenderingContext2D.prototype.drawImage = function(image, ...args) {
