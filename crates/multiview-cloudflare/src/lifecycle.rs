@@ -196,10 +196,7 @@ impl Registry {
             .pending_revoke
             .clone()
             .ok_or(Error::Invalid)?;
-        match client.revoke_token(id, &jti).await {
-            Ok(()) | Err(Error::Api(404)) => {}
-            Err(e) => return Err(e),
-        }
+        client.revoke_token(id, &jti).await?;
         self.records
             .get_mut(id)
             .ok_or(Error::Isolation)?

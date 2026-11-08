@@ -30,6 +30,8 @@ pub struct ManagedCloudflare {
     journal: PathBuf,
     state: Mutex<Snapshot>,
     reconciler_started: std::sync::atomic::AtomicBool,
+    #[cfg(test)]
+    test_origin: Option<String>,
 }
 impl ManagedCloudflare {
     /// Start one bounded, low-frequency management task. Busy ticks are dropped.
@@ -104,6 +106,8 @@ impl ManagedCloudflare {
             journal,
             state: Mutex::new(state),
             reconciler_started: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(test)]
+            test_origin: None,
         })
     }
     fn cleanup_token(
@@ -177,6 +181,12 @@ impl ManagedCloudflare {
             },
         };
         let client = Client::new(r.account_id.clone(), credential).map_err(|_| "account")?;
+        #[cfg(test)]
+        let client = if let Some(origin) = &self.test_origin {
+            client.with_test_origin(origin.clone())
+        } else {
+            client
+        };
         if action == "capabilities" {
             return Ok(CloudflareResult {
                 data: serde_json::json!({"automatic_reconciliation":self.reconciler_started.load(std::sync::atomic::Ordering::Acquire)}),
@@ -667,7 +677,7 @@ impl ManagedCloudflare {
                     .revoke_token(r.relay_id.as_deref().ok_or("relay")?, jti)
                     .await
                 {
-                    Ok(()) | Err(multiview_cloudflare::Error::Api(404)) => {}
+                    Ok(()) => {}
                     Err(multiview_cloudflare::Error::Api(status))
                         if (400..500).contains(&status) =>
                     {
@@ -702,10 +712,20 @@ impl ManagedCloudflare {
                     .pending_revoke
                     .clone()
                     .ok_or("rotation")?;
-                registry
+                match registry
                     .finish_rotation(&client, r.relay_id.as_deref().ok_or("relay")?, domain)
                     .await
-                    .map_err(|_| "revoke")?;
+                {
+                    Ok(()) => {}
+                    Err(multiview_cloudflare::Error::Api(status))
+                        if (400..500).contains(&status) =>
+                    {
+                        state.pending.remove(&key);
+                        self.persist(&state)?;
+                        return Err("rotation revoke rejected");
+                    }
+                    Err(_) => return Err("rotation revoke uncertain; retry same relay"),
+                }
                 self.cleanup_token(&mut state, owner, &key, &old_jti)?;
                 state
                     .rotation_ready
@@ -747,9 +767,218 @@ impl ManagedCloudflare {
         Ok(CloudflareResult { data })
     }
 }
+impl CloudflareManagement for ManagedCloudflare {
+    fn save(
+        &self,
+        owner: &str,
+        r: crate::routes::cloudflare::SaveCredential,
+    ) -> Result<String, &'static str> {
+        let credential = match r.kind.as_str() {
+            "global_key" => multiview_credentials::Credential::GlobalKey {
+                email: r.email.ok_or("email")?,
+                key: r.key.ok_or("key")?,
+            },
+            "scoped_token" => multiview_credentials::Credential::Bearer {
+                token: r.token.ok_or("token")?,
+            },
+            _ => return Err("kind"),
+        };
+        // Validate account shape without making an API request or retaining it in the secret.
+        Client::new(
+            r.account_id,
+            Credential::Bearer {
+                token: String::new(),
+            },
+        )
+        .map_err(|_| "account")?;
+        self.vault
+            .store(owner, &credential)
+            .map(|r| r.as_str().to_owned())
+            .map_err(|_| "credential persistence")
+    }
+    fn execute<'a>(
+        &'a self,
+        owner: &'a str,
+        action: &'a str,
+        request: CloudflareRequest,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<CloudflareResult, &'static str>> + Send + 'a>,
+    > {
+        Box::pin(self.run(owner, action, request))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn http_script(statuses: Vec<Option<u16>>) -> (String, std::thread::JoinHandle<()>) {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("[::1]:0").unwrap();
+        let origin = format!("http://{}", listener.local_addr().unwrap());
+        let task = std::thread::spawn(move || {
+            for status in statuses {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut bytes = [0; 4096];
+                let n = stream.read(&mut bytes).unwrap();
+                assert!(String::from_utf8_lossy(&bytes[..n]).starts_with("DELETE "));
+                if let Some(status) = status {
+                    let body = r#"{"success":true,"result":{}}"#;
+                    write!(stream,"HTTP/1.1 {status} fixture\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",body.len()).unwrap();
+                }
+            }
+        });
+        (origin, task)
+    }
+    fn request(reference: &str) -> CloudflareRequest {
+        CloudflareRequest {
+            account_id: "account".into(),
+            secret_ref: reference.into(),
+            relay_id: Some("relay".into()),
+            token_jti: Some("old".into()),
+            name: None,
+            auth_domain: None,
+            permission_group_id: None,
+            mode: None,
+            config: None,
+        }
+    }
+    fn setup() -> (tempfile::TempDir, ManagedCloudflare, String, SecretRef) {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let manager = ManagedCloudflare::from_master_key(dir.path(), [7; 32]).unwrap();
+        let credential = multiview_credentials::Credential::Bearer {
+            token: "fixture".into(),
+        };
+        let reference = manager.vault.store("alice", &credential).unwrap();
+        let old = manager.vault.store("alice", &credential).unwrap();
+        let key = serde_json::to_string(&("alice", "account")).unwrap();
+        let mut state = manager.state.try_lock().unwrap();
+        state.records.insert(
+            key.clone(),
+            vec![multiview_cloudflare::lifecycle::Record {
+                relay: multiview_cloudflare::Relay {
+                    uid: "relay".into(),
+                    name: "fixture".into(),
+                    config: multiview_cloudflare::RelayConfig::default(),
+                    status: None,
+                    issuers: vec![],
+                },
+                ownership: multiview_cloudflare::lifecycle::Ownership::Managed,
+                auth_domain: "alice".into(),
+                health: multiview_cloudflare::lifecycle::Health::Reachable,
+                pending_revoke: None,
+            }],
+        );
+        state
+            .token_refs
+            .entry(key)
+            .or_default()
+            .insert("old".into(), old.as_str().into());
+        manager.persist(&state).unwrap();
+        drop(state);
+        (dir, manager, reference.as_str().into(), old)
+    }
+    #[tokio::test]
+    async fn run_revoke_transport_retry_and_restart_missing_file() {
+        let (dir, mut manager, reference, old) = setup();
+        let (origin, server) = http_script(vec![None, Some(200)]);
+        manager.test_origin = Some(origin.clone());
+        assert!(manager
+            .run("alice", "revoke-token", request(&reference))
+            .await
+            .is_err());
+        assert!(manager.vault.resolve("alice", &old).is_ok());
+        // Simulate remote completion + local delete, followed by a crash before journal commit.
+        manager.vault.delete("alice", &old).unwrap();
+        drop(manager);
+        let mut restarted = ManagedCloudflare::from_master_key(dir.path(), [7; 32]).unwrap();
+        restarted.test_origin = Some(origin);
+        restarted
+            .run("alice", "revoke-token", request(&reference))
+            .await
+            .unwrap();
+        server.join().unwrap();
+        assert!(restarted.state.lock().await.pending.is_empty());
+        assert!(restarted.vault.resolve("alice", &old).is_err());
+        assert!(restarted
+            .vault
+            .resolve("alice", &SecretRef::parse(&reference).unwrap())
+            .is_ok());
+    }
+    #[tokio::test]
+    async fn run_revoke_403_and_404_never_delete_secret() {
+        let (_dir, mut manager, reference, old) = setup();
+        let (origin, server) = http_script(vec![Some(403), Some(404)]);
+        manager.test_origin = Some(origin);
+        for _ in 0..2 {
+            assert!(manager
+                .run("alice", "revoke-token", request(&reference))
+                .await
+                .is_err());
+            assert!(manager.vault.resolve("alice", &old).is_ok());
+            assert!(manager.state.lock().await.pending.is_empty());
+        }
+        server.join().unwrap();
+    }
+    async fn assert_cleanup_restart(
+        reopened: &ManagedCloudflare,
+        dir: &std::path::Path,
+        reference: &str,
+    ) {
+        let token_reference = reopened
+            .vault
+            .store(
+                "alice",
+                &multiview_credentials::Credential::Bearer {
+                    token: "revoked-secret".into(),
+                },
+            )
+            .unwrap();
+        {
+            let key = serde_json::to_string(&("alice", "account")).unwrap();
+            let mut state = reopened.state.lock().await;
+            state
+                .token_refs
+                .entry(key.clone())
+                .or_default()
+                .insert("revoked-jti".into(), token_reference.as_str().into());
+            state
+                .pending
+                .insert(key.clone(), "revoke-token:relay:revoked-jti".into());
+            reopened.persist(&state).unwrap();
+            reopened
+                .cleanup_token(&mut state, "alice", &key, "revoked-jti")
+                .unwrap();
+            assert!(reopened.vault.resolve("alice", &token_reference).is_err());
+            assert!(
+                reopened
+                    .vault
+                    .resolve("alice", &SecretRef::parse(reference).unwrap())
+                    .is_ok(),
+                "current credential must survive old-token cleanup"
+            );
+            assert!(!state.token_refs[&key].contains_key("revoked-jti"));
+        }
+        // Crash injection: deletion completed, but in-memory reference removal was
+        // never journaled. Reopen the persisted intent and repeat cleanup safely.
+        {
+            let crashed = ManagedCloudflare::from_master_key(dir, [7; 32]).unwrap();
+            let key = serde_json::to_string(&("alice", "account")).unwrap();
+            let mut state = crashed.state.lock().await;
+            assert_eq!(
+                state.pending.get(&key).map(String::as_str),
+                Some("revoke-token:relay:revoked-jti")
+            );
+            assert!(state.token_refs[&key].contains_key("revoked-jti"));
+            crashed
+                .cleanup_token(&mut state, "alice", &key, "revoked-jti")
+                .unwrap();
+            assert!(!state.token_refs[&key].contains_key("revoked-jti"));
+            state.pending.remove(&key);
+            crashed.persist(&state).unwrap();
+        }
+    }
     #[tokio::test]
     async fn durable_policy_and_owner_bound_reference() {
         use std::os::unix::fs::PermissionsExt;
@@ -828,70 +1057,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(result.data["token_refs"]["created-token"], reference);
-        let token_reference = reopened
-            .vault
-            .store(
-                "alice",
-                &multiview_credentials::Credential::Bearer {
-                    token: "revoked-secret".into(),
-                },
-            )
-            .unwrap();
-        {
-            let key = serde_json::to_string(&("alice", "account")).unwrap();
-            let mut state = reopened.state.lock().await;
-            state
-                .token_refs
-                .entry(key.clone())
-                .or_default()
-                .insert("revoked-jti".into(), token_reference.as_str().into());
-            state
-                .pending
-                .insert(key.clone(), "revoke-token:relay:revoked-jti".into());
-            reopened.persist(&state).unwrap();
-            reopened
-                .cleanup_token(&mut state, "alice", &key, "revoked-jti")
-                .unwrap();
-            assert!(reopened.vault.resolve("alice", &token_reference).is_err());
-            assert!(
-                reopened
-                    .vault
-                    .resolve("alice", &SecretRef::parse(&reference).unwrap())
-                    .is_ok(),
-                "current credential must survive old-token cleanup"
-            );
-            assert!(!state
-                .token_refs
-                .get(&key)
-                .unwrap()
-                .contains_key("revoked-jti"));
-        }
-        // Crash injection: deletion completed, but in-memory reference removal was
-        // never journaled. Reopen the persisted intent and repeat cleanup safely.
-        {
-            let crashed = ManagedCloudflare::from_master_key(&dir, [7; 32]).unwrap();
-            let key = serde_json::to_string(&("alice", "account")).unwrap();
-            let mut state = crashed.state.lock().await;
-            assert_eq!(
-                state.pending.get(&key).map(String::as_str),
-                Some("revoke-token:relay:revoked-jti")
-            );
-            assert!(state
-                .token_refs
-                .get(&key)
-                .unwrap()
-                .contains_key("revoked-jti"));
-            crashed
-                .cleanup_token(&mut state, "alice", &key, "revoked-jti")
-                .unwrap();
-            assert!(!state
-                .token_refs
-                .get(&key)
-                .unwrap()
-                .contains_key("revoked-jti"));
-            state.pending.remove(&key);
-            crashed.persist(&state).unwrap();
-        }
+        assert_cleanup_restart(&reopened, &dir, &reference).await;
         assert_eq!(result.data["mode"], "manual");
         assert_eq!(result.data["effective_transport"], "unverified");
         assert!(
@@ -904,46 +1070,5 @@ mod tests {
             .run("alice", "reconcile", request(None))
             .await
             .unwrap();
-    }
-}
-
-impl CloudflareManagement for ManagedCloudflare {
-    fn save(
-        &self,
-        owner: &str,
-        r: crate::routes::cloudflare::SaveCredential,
-    ) -> Result<String, &'static str> {
-        let credential = match r.kind.as_str() {
-            "global_key" => multiview_credentials::Credential::GlobalKey {
-                email: r.email.ok_or("email")?,
-                key: r.key.ok_or("key")?,
-            },
-            "scoped_token" => multiview_credentials::Credential::Bearer {
-                token: r.token.ok_or("token")?,
-            },
-            _ => return Err("kind"),
-        };
-        // Validate account shape without making an API request or retaining it in the secret.
-        Client::new(
-            r.account_id,
-            Credential::Bearer {
-                token: String::new(),
-            },
-        )
-        .map_err(|_| "account")?;
-        self.vault
-            .store(owner, &credential)
-            .map(|r| r.as_str().to_owned())
-            .map_err(|_| "credential persistence")
-    }
-    fn execute<'a>(
-        &'a self,
-        owner: &'a str,
-        action: &'a str,
-        request: CloudflareRequest,
-    ) -> std::pin::Pin<
-        Box<dyn std::future::Future<Output = Result<CloudflareResult, &'static str>> + Send + 'a>,
-    > {
-        Box::pin(self.run(owner, action, request))
     }
 }

@@ -137,7 +137,7 @@ pub struct Client {
     http: reqwest::Client,
     account: String,
     credential: Credential,
-    #[cfg(test)]
+    #[cfg(any(test, feature = "testing"))]
     test_origin: Option<String>,
 }
 fn valid_id(s: &str) -> bool {
@@ -147,6 +147,13 @@ fn valid_id(s: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
 }
 impl Client {
+    /// Set an injected local HTTP fixture origin in test builds only.
+    #[cfg(feature = "testing")]
+    #[must_use]
+    pub fn with_test_origin(mut self, origin: String) -> Self {
+        self.test_origin = Some(origin);
+        self
+    }
     /// Resolve credentials from the owner's `secret_ref` vault before constructing this client.
     /// # Errors
     /// Returns a sanitized error for invalid input, ownership conflicts, or API failure.
@@ -164,7 +171,7 @@ impl Client {
             http,
             account,
             credential,
-            #[cfg(test)]
+            #[cfg(any(test, feature = "testing"))]
             test_origin: None,
         })
     }
@@ -203,7 +210,7 @@ impl Client {
         url: String,
         body: Option<serde_json::Value>,
     ) -> Result<Envelope, Error> {
-        #[cfg(test)]
+        #[cfg(any(test, feature = "testing"))]
         let url = if let Some(origin) = &self.test_origin {
             url.replace("https://api.cloudflare.com", origin)
         } else {

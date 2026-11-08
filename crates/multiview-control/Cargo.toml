@@ -223,6 +223,7 @@ rustls = { version = "0.23", optional = true }
 rustls-pki-types = { version = "1", features = ["std"], optional = true }
 
 [dev-dependencies]
+multiview-cloudflare = { path = "../multiview-cloudflare", features = ["testing"] }
 # Self dev-dependency: the canonical way to enable a TEST-ONLY feature for this
 # crate's OWN tests without pulling it into the default build or a downstream
 # consumer's normal build. Dev-dependencies are inactive for a normal
