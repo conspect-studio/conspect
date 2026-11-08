@@ -1,4 +1,4 @@
-//! Authorized, finite-lived MoQ subscription control. No transport is enabled by default.
+//! Authorized, finite-lived `MoQ` subscription control. No transport is enabled by default.
 use crate::{auth::Principal, preview::WhepScope};
 use std::{
     collections::HashMap,
@@ -10,7 +10,7 @@ use std::{
 #[derive(Clone, serde::Serialize)]
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 pub struct MoqVideo {
-    /// WebCodecs codec identifier.
+    /// `WebCodecs` codec identifier.
     pub codec: String,
     /// Encoded width in pixels.
     pub coded_width: u32,
@@ -25,7 +25,7 @@ pub struct MoqVideo {
 pub struct MoqAudio {
     /// Stable audio track identifier.
     pub track: String,
-    /// WebCodecs codec identifier.
+    /// `WebCodecs` codec identifier.
     pub codec: String,
     /// Audio samples per second.
     pub sample_rate: u32,
@@ -67,7 +67,7 @@ pub struct MoqRevoked {
     pub revoked: bool,
 }
 /// Admission errors distinguish transport unavailability from policy/capacity failures.
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 pub enum MoqReject {
     /// No authorized transport is ready.
     Unavailable,
@@ -98,6 +98,8 @@ pub trait MoqProvider: Send + Sync {
         false
     }
     /// Authorize resolved dependencies and acquire one bounded subscription.
+    /// # Errors
+    /// Returns admission, authorization, or transport failures.
     fn admit(
         &self,
         principal: &Principal,
@@ -151,6 +153,8 @@ impl MoqRegistry {
         self.provider.available()
     }
     /// Admit a finite subscription and schedule independent expiry.
+    /// # Errors
+    /// Returns capacity or provider admission failure.
     pub fn open(
         self: &Arc<Self>,
         principal: &Principal,
@@ -162,7 +166,7 @@ impl MoqRegistry {
         }
         let id = uuid::Uuid::new_v4().to_string();
         let (mut lease, fence) = self.provider.admit(principal, scope, &id, self.ttl)?;
-        lease.lease_id = id.clone();
+        lease.lease_id.clone_from(&id);
         let seconds = (SystemTime::now() + self.ttl)
             .duration_since(SystemTime::UNIX_EPOCH)
             .unwrap_or_default()
@@ -197,6 +201,8 @@ impl MoqRegistry {
         Ok(lease)
     }
     /// Fence only the owner, scope and exact binding generation.
+    /// # Errors
+    /// Returns unknown lease, wrong owner/scope, or stale generation.
     pub fn revoke(
         &self,
         principal: &Principal,

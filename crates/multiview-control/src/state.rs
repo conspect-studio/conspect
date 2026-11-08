@@ -732,7 +732,7 @@ pub struct AppState {
     /// a focus session is a best-effort preview consumer that can never
     /// back-pressure the engine.
     pub whep: crate::preview::SharedWhep,
-    /// Finite, authorized MoQ subscriptions; unavailable until a provider is wired.
+    /// Finite, authorized `MoQ` subscriptions; unavailable until a provider is wired.
     pub moq: Arc<crate::moq::MoqRegistry>,
     /// Optional durable Cloudflare management provider, independent of media admission.
     pub cloudflare: Option<Arc<dyn crate::routes::cloudflare::CloudflareManagement>>,
@@ -1268,7 +1268,7 @@ impl AppState {
         self
     }
 
-    /// Install the authorized finite MoQ registry; the default remains unavailable.
+    /// Install the authorized finite `MoQ` registry; the default remains unavailable.
     #[must_use]
     pub fn with_moq(mut self, moq: Arc<crate::moq::MoqRegistry>) -> Self {
         self.moq = moq;

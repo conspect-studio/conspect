@@ -12,6 +12,7 @@ authors.workspace = true
 publish = false
 
 [dependencies]
+multiview-moq = { path = "../multiview-moq", optional = true }
 multiview-cloudflare = { path = "../multiview-cloudflare" }
 multiview-credentials = { path = "../multiview-credentials" }
 multiview-core = { workspace = true }
@@ -284,6 +285,8 @@ reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"
 tokio-rustls = "0.26"
 
 [features]
+# Authenticated QUIC transport remains opt-in until a production feed factory is wired.
+moq-transport = ["dep:multiview-moq"]
 "default" = ["openapi"]
 "openapi" = ["dep:utoipa", "dep:utoipa-axum", "dep:utoipa-scalar"]
 "embed-web" = ["dep:rust-embed", "dep:mime_guess"]

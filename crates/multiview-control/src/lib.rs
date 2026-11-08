@@ -62,6 +62,8 @@ pub mod layout_projection;
 pub(crate) mod limits;
 pub mod live_apply;
 pub mod moq;
+#[cfg(feature = "moq-transport")]
+pub mod moq_provider;
 pub mod nmos;
 pub mod notify;
 pub mod pending_actions;

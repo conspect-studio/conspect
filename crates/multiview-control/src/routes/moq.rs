@@ -1,4 +1,4 @@
-//! Authenticated MoQ lease endpoints; only explicit unavailability permits fallback.
+//! Authenticated `MoQ` lease endpoints; only explicit unavailability permits fallback.
 use crate::{
     auth::{Action, Principal},
     moq::MoqReject,
@@ -34,6 +34,7 @@ fn authorize(principal: &Principal, scope: &WhepScope) -> Result<(), crate::erro
         WhepScope::Output(id) => crate::auth::authorize_output(principal, id),
     }
 }
+#[allow(clippy::needless_pass_by_value)] // Owned route-extracted values, off the data plane.
 fn open(state: &AppState, principal: &Principal, scope: WhepScope, base: String) -> Response {
     if let Err(err) = authorize(principal, &scope) {
         return err.into_response();
@@ -51,6 +52,7 @@ fn open(state: &AppState, principal: &Principal, scope: WhepScope, base: String)
         Err(err) => reject(err),
     }
 }
+#[allow(clippy::needless_pass_by_value)] // Owned route-extracted values.
 fn close(
     state: &AppState,
     principal: &Principal,
