@@ -1,8 +1,12 @@
 //! Atomic encoded-window transport with bounded, nonblocking admission.
 //!
 //! A window contains every packet emitted by a single encoder/audio collection
-//! interval, including zero or many packets per stream. PTS/DTS remain those of
-//! the encoded packets; no frame-per-tick assumption is made here. The queue
+//! interval, including zero or many packets per stream. An interval with zero
+//! emissions needs no queued object. PTS/DTS remain those of the encoded packets;
+//! no frame-per-tick assumption is made here. On recovery the producer must
+//! assemble the strict-RAP video access unit as the FIRST packet, ahead of
+//! same-interval audio. If audio precedes it, or the window spans a pre-RAP
+//! picture, the entire window is rejected; recovery waits for the next RAP. The queue
 //! counts referenced payload bytes per admitted window, not distinct allocations:
 //! `Arc` sharing avoids copying coded data, but each queue independently owns
 //! its reservation until the consumer drops its lease.
@@ -22,7 +26,7 @@ pub const MAX_BATCH_BYTES: usize = 12 * 1024 * 1024;
 pub const MAX_BATCH_SPAN: Duration = Duration::from_millis(250);
 /// Maximum packets owned by one queue, including consumer-held leases.
 pub const MAX_QUEUE_PACKETS: usize = 512;
-/// Maximum independently allocated windows in the queue, including empty ones.
+/// Maximum independently allocated nonempty windows in the queue.
 pub const MAX_QUEUE_WINDOWS: usize = 512;
 /// Maximum referenced coded bytes owned by one queue, including leases.
 pub const MAX_QUEUE_BYTES: usize = 16 * 1024 * 1024;
@@ -124,6 +128,10 @@ fn checked_payload_bytes(lengths: impl IntoIterator<Item = usize>) -> Result<usi
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RecoveryGate {
     /// The first packet must be video with a strict codec-specific RAP.
+    /// The producer must place this AU before same-interval audio and may not
+    /// combine pre-RAP pictures with it. An audio-then-RAP window is rejected
+    /// in full, so recovery waits for a subsequent RAP; no scan or splice
+    /// inside a partially admitted A/V window is possible.
     /// The codec and framing describe the actual packets offered to this queue.
     StrictRap {
         /// Encoded video codec chosen for this rendition.
@@ -152,6 +160,58 @@ pub enum OfferError {
     WrongProgramShape,
     /// The owner closed the queue; no further admission is possible.
     Closed,
+    /// The producer discarded real encoded media before queue admission.
+    ProducerLoss,
+}
+
+/// An encoder emission failed validation or atomic queue admission.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EmissionError {
+    /// A nonempty encoder emission breached the validated batch limits.
+    InvalidWindow(BatchError),
+    /// A validated batch was not admitted.
+    Admission(OfferError),
+}
+
+/// Summary of a real emitted window lost before admission.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EmittedLoss {
+    /// Number of emitted packets rejected atomically.
+    pub packets: usize,
+    /// Sum of referenced payload bytes, or `None` if count exceeds the scan cap
+    /// or checked addition overflowed.
+    pub payload_bytes: Option<usize>,
+    /// Producer-reported collection duration.
+    pub media_span: Duration,
+    /// First video PTS in video encoder time base (never mixed with audio PTS).
+    pub first_video_pts: Option<i64>,
+    /// Last video PTS in video encoder time base.
+    pub last_video_pts: Option<i64>,
+}
+
+impl EmittedLoss {
+    fn from_packets(packets: &[EncodedPacket], media_span: Duration) -> Self {
+        let mut video_pts = packets
+            .iter()
+            .take(MAX_BATCH_PACKETS + 1)
+            .filter(|p| matches!(p.kind(), StreamKind::Video))
+            .filter_map(EncodedPacket::pts);
+        let first_video_pts = video_pts.next();
+        let last_video_pts = video_pts.next_back().or(first_video_pts);
+        Self {
+            packets: packets.len(),
+            payload_bytes: if packets.len() <= MAX_BATCH_PACKETS {
+                packets
+                    .iter()
+                    .try_fold(0usize, |sum, p| sum.checked_add(p.len()))
+            } else {
+                None // Do not scan an unbounded producer allocation.
+            },
+            media_span,
+            first_video_pts,
+            last_video_pts,
+        }
+    }
 }
 
 /// A loss notification; consumers must reset mux continuity and await an IDR.
@@ -161,6 +221,15 @@ pub struct Discontinuity {
     pub generation: u64,
     /// Initial reason this generation was invalidated.
     pub reason: OfferError,
+    /// Whole queued windows sacrificed when the damaged GOP was flushed.
+    pub flushed_windows: usize,
+    /// Packets sacrificed from the previously admitted queued backlog.
+    pub flushed_packets: usize,
+    /// Referenced coded bytes sacrificed from queued windows.
+    pub flushed_bytes: usize,
+    /// First nonempty incoming emission lost before or during admission, if
+    /// supplied. Not an aggregate over subsequent rejected recovery windows.
+    pub emitted_loss: Option<EmittedLoss>,
 }
 
 #[derive(Default)]
@@ -237,6 +306,8 @@ impl BoundedBatchQueue {
     /// Old queued windows are discarded before admission; their loss is
     /// reported as `OldestAge`. In-flight windows remain reserved until drop.
     /// Invalid producer requests do not damage the existing healthy backlog.
+    /// If an invalid batch held real encoded media, the producer MUST invoke
+    /// [`Self::report_loss`] to invalidate the now-missing GOP.
     ///
     /// # Errors
     /// Returns [`OfferError`] for an invalid window, a full or stale queue,
@@ -378,6 +449,58 @@ impl BoundedBatchQueue {
         self.entries.len()
     }
 
+    /// Declare a real encoded-media loss before continuing delivery.
+    ///
+    /// The producer calls this after a nonempty batch fails construction, or
+    /// after intentionally discarding a nonempty, invalid window. It flushes
+    /// the GOP and requires a strict RAP (unless explicitly audio-only).
+    /// Capacity and age failures already call this internally.
+    pub fn report_loss(&mut self, reason: OfferError) {
+        if !self.closed {
+            self.invalidate(reason);
+        }
+    }
+
+    /// Offer a complete real encoder emission in one call: invalid nonempty
+    /// emissions cannot be discarded without declaring a discontinuity.
+    /// A zero-packet encoder tick returns `Ok(())` and creates no queue object.
+    ///
+    /// # Errors
+    /// Returns construction or admission errors after fencing any lost media.
+    pub fn offer_emitted(
+        &mut self,
+        packets: Vec<EncodedPacket>,
+        media_span: Duration,
+        now: Instant,
+    ) -> Result<(), EmissionError> {
+        if packets.is_empty() {
+            return Ok(());
+        }
+        // Inspect at most the bounded window cap; count is known in O(1) even
+        // when a malformed producer supplies an oversized Vec.
+        let emitted = EmittedLoss::from_packets(&packets, media_span);
+        let batch = match PacketBatch::try_new(packets, media_span) {
+            Ok(batch) => batch,
+            Err(error) => {
+                self.report_loss(OfferError::ProducerLoss);
+                self.set_emitted_loss(emitted);
+                return Err(EmissionError::InvalidWindow(error));
+            }
+        };
+        self.try_offer(Arc::new(batch), now).map_err(|error| {
+            if matches!(
+                error,
+                OfferError::Oversized | OfferError::ClockReversed | OfferError::WrongProgramShape
+            ) {
+                self.report_loss(OfferError::ProducerLoss);
+            }
+            if error != OfferError::Closed {
+                self.set_emitted_loss(emitted);
+            }
+            EmissionError::Admission(error)
+        })
+    }
+
     /// Permanently refuse admission, flush queued windows, and invalidate
     /// in-flight generations. An owner retains this queue until drained.
     pub fn close(&mut self) {
@@ -393,13 +516,36 @@ impl BoundedBatchQueue {
         self.entries.is_empty() && self.reserved() == (0, 0)
     }
 
+    fn set_emitted_loss(&mut self, emitted: EmittedLoss) {
+        if let Some(event) = &mut self.pending_discontinuity {
+            // One generation can lose many offers before the next RAP. The
+            // counter is exact for queue flushes; emitted_loss records the
+            // first offending emission only and never claims a total.
+            if event.emitted_loss.is_none() {
+                event.emitted_loss = Some(emitted);
+            }
+        }
+    }
+
     fn invalidate(&mut self, reason: OfferError) {
         if !self.needs_keyframe {
             let generation = self.reservations.generation.fetch_add(1, Ordering::AcqRel) + 1;
-            self.pending_discontinuity = Some(Discontinuity { generation, reason });
+            self.pending_discontinuity = Some(Discontinuity {
+                generation,
+                reason,
+                flushed_windows: 0,
+                flushed_packets: 0,
+                flushed_bytes: 0,
+                emitted_loss: None,
+            });
         }
         self.needs_keyframe = true;
         while let Some(entry) = self.entries.pop_front() {
+            if let Some(event) = &mut self.pending_discontinuity {
+                event.flushed_windows += 1;
+                event.flushed_packets += entry.batch.packet_count();
+                event.flushed_bytes += entry.batch.payload_bytes();
+            }
             self.reservations
                 .packets
                 .fetch_sub(entry.batch.packet_count(), Ordering::AcqRel);
@@ -730,6 +876,73 @@ mod tests {
             q.pop_at(now).unwrap().unwrap().packets()[0].kind(),
             StreamKind::Audio
         );
+    }
+
+    #[test]
+    fn real_emission_build_failure_fences_gop_but_empty_tick_does_not() {
+        let now = Instant::now();
+        let mut q = strict_queue();
+        q.offer_emitted(vec![], Duration::ZERO, now).unwrap();
+        assert_eq!(q.generation(), 0);
+        q.offer_emitted(
+            vec![packet(StreamKind::Video, 1, false)],
+            Duration::ZERO,
+            now,
+        )
+        .unwrap();
+        assert_eq!(q.queued_windows(), 1);
+        assert_eq!(
+            q.offer_emitted(
+                vec![packet(StreamKind::Audio, 1, false)],
+                Duration::from_secs(1),
+                now
+            ),
+            Err(EmissionError::InvalidWindow(BatchError::MediaSpan))
+        );
+        let event = q.take_discontinuity().unwrap();
+        assert_eq!(event.reason, OfferError::ProducerLoss);
+        assert_eq!(event.emitted_loss.unwrap().packets, 1);
+        assert_eq!(event.emitted_loss.unwrap().payload_bytes, Some(1));
+        assert_eq!(
+            (
+                event.flushed_windows,
+                event.flushed_packets,
+                event.flushed_bytes
+            ),
+            (1, 1, 1)
+        );
+        assert_eq!(
+            q.offer_emitted(
+                vec![packet(StreamKind::Video, 1, true)],
+                Duration::ZERO,
+                now
+            ),
+            Err(EmissionError::Admission(OfferError::NeedsRecoveryPoint))
+        );
+        let idr = Packet::copy(&[0, 0, 0, 1, 0x65, 0x88]);
+        q.offer_emitted(vec![EncodedPacket::from_packet(idr)], Duration::ZERO, now)
+            .unwrap();
+        assert_eq!(q.generation(), 1);
+    }
+
+    #[test]
+    fn recovery_window_rejects_audio_before_a_strict_idr() {
+        let now = Instant::now();
+        let mut q = strict_queue();
+        q.report_loss(OfferError::ProducerLoss);
+        let idr = Packet::copy(&[0, 0, 0, 1, 0x65, 0x88]);
+        assert_eq!(
+            q.try_offer(
+                window(vec![
+                    packet(StreamKind::Audio, 1, false),
+                    EncodedPacket::from_packet(idr)
+                ]),
+                now
+            ),
+            Err(OfferError::NeedsRecoveryPoint)
+        );
+        assert_eq!(q.generation(), 1);
+        q.try_offer(h264_au(0x65, false), now).unwrap();
     }
 
     #[test]
