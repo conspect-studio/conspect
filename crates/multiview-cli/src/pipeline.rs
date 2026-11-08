@@ -72,12 +72,16 @@ use ffmpeg_next as ffmpeg;
 use ffmpeg_next::format::Pixel;
 use ffmpeg_next::util::frame::Video;
 
-use crate::binding_delivery::{tick_span, BindingDelivery, BindingPolicy, DeliveryLimits, LeasedPacket};
-use crate::rendition_dispatch::{BindingConfig, DispatchConfig, DtsTimeBase, RenditionDispatcher};
-use crate::rendition_workers::{BakedTick, DispatchEvent, RenditionWorker, ReorderBound, VideoEncodeWorker};
+use crate::binding_delivery::{
+    tick_span, BindingDelivery, BindingPolicy, DeliveryLimits, LeasedPacket,
+};
 use crate::display_size::{
     cell_pixel_size, display_size, DecoderState, DisplayDriver, DisplayFollow, DisplayLayoutSlot,
     DisplayStep, HandoverDecoder, SkipThrough,
+};
+use crate::rendition_dispatch::{BindingConfig, DispatchConfig, DtsTimeBase, RenditionDispatcher};
+use crate::rendition_workers::{
+    BakedTick, DispatchEvent, RenditionWorker, ReorderBound, VideoEncodeWorker,
 };
 use multiview_compositor::blend::LinearRgba;
 use multiview_compositor::pipeline::{CanvasColor, Nv12Image};
@@ -100,9 +104,9 @@ use multiview_events::Event;
 use multiview_ffmpeg::{
     DecodedVideoFrame, EncodedPacket, ScaleSpec, Scaler, StreamCodecParameters, StreamVideoDecoder,
 };
-use multiview_output::batch::RecoveryGate;
 use multiview_framestore::{NoSignalPolicy, TileStore, TileThresholds};
 use multiview_input::srt::{KeyLength, SrtConfig, SrtError, SrtMode, StreamId};
+use multiview_output::batch::RecoveryGate;
 #[cfg(all(feature = "ndi", any(feature = "ndi-bindings", test)))]
 use multiview_output::ndi::NdiOutput;
 use multiview_output::sink::{
@@ -434,9 +438,13 @@ fn resolve_encoder(codec_token: &str) -> Result<ResolvedEncoder, PipelineError> 
 }
 
 fn codec_for_encoder(name: &str) -> multiview_ffmpeg::VideoCodec {
-    if name.contains("264") { multiview_ffmpeg::VideoCodec::H264 }
-    else if name.contains("265") || name.contains("hevc") { multiview_ffmpeg::VideoCodec::H265 }
-    else { logical_codec(name) }
+    if name.contains("264") {
+        multiview_ffmpeg::VideoCodec::H264
+    } else if name.contains("265") || name.contains("hevc") {
+        multiview_ffmpeg::VideoCodec::H265
+    } else {
+        logical_codec(name)
+    }
 }
 
 /// The recovery policy for one encoded elementary stream.
@@ -2629,7 +2637,11 @@ impl Pipeline {
         // Resolve each supported encoded output without changing its requested
         // codec. The ordered key set opens one video encoder per distinct codec;
         // compatible sinks share the encoded packet allocation.
-        let codec_token = config.outputs.iter().find_map(output_codec).unwrap_or("mpeg2video");
+        let codec_token = config
+            .outputs
+            .iter()
+            .find_map(output_codec)
+            .unwrap_or("mpeg2video");
         let encoder = resolve_encoder(codec_token)?;
 
         // One-second GOP (rounded), also the per-segment frame count for HLS.
@@ -2688,10 +2700,17 @@ impl Pipeline {
         let mut rendition_configs = Vec::<EncodeConfig>::new();
         let mut output_video_keys = Vec::with_capacity(outputs.len());
         for output in &outputs {
-            let requested = config.outputs.iter().find(|item| item.id() == output.id())
-                .and_then(output_codec).unwrap_or("mpeg2video");
+            let requested = config
+                .outputs
+                .iter()
+                .find(|item| item.id() == output.id())
+                .and_then(output_codec)
+                .unwrap_or("mpeg2video");
             let concrete = resolve_encoder(requested)?;
-            let key = if let Some(index) = rendition_configs.iter().position(|cfg| cfg.codec_name == concrete.name) {
+            let key = if let Some(index) = rendition_configs
+                .iter()
+                .position(|cfg| cfg.codec_name == concrete.name)
+            {
                 index
             } else {
                 let mut video_cfg = cfg.clone();
@@ -3529,7 +3548,17 @@ impl Pipeline {
     /// ever-growing `program.ts` (HLS-2, ADR-0032) — the rolling HLS window is the
     /// bounded on-disk artifact instead.
     fn build_sink_runners(&mut self, live: bool) -> Vec<(SinkRunner, SinkSendPolicy)> {
-        let outputs = maybe_prepend_program_ts(std::mem::take(&mut self.outputs), live);
+        let configured = std::mem::take(&mut self.outputs);
+        let hls_key = configured
+            .iter()
+            .position(|output| matches!(output, RunnableOutput::Hls { .. }))
+            .and_then(|index| self.output_video_keys.get(index).copied());
+        let outputs = maybe_prepend_program_ts(configured, live);
+        if !live {
+            if let Some(hls_key) = hls_key {
+                self.output_video_keys.insert(0, hls_key);
+            }
+        }
         let mut links = Vec::new();
         let runners = outputs
             .into_iter()
@@ -3595,7 +3624,9 @@ impl Pipeline {
                     let (tx, plain_rx) = std::sync::mpsc::sync_channel(1);
                     let bridge = std::thread::spawn(move || {
                         while let Ok(leased) = rx.recv() {
-                            if tx.send(leased.packet).is_err() { break; }
+                            if tx.send(leased.packet).is_err() {
+                                break;
+                            }
                         }
                     });
                     let outcome = r(plain_rx);
@@ -3891,15 +3922,26 @@ impl Pipeline {
 
         // Open each distinct video key independently before the clock starts.
         // No output may borrow the codec parameters of another rendition.
-        let video_encoders: Vec<VideoRenditionEncoder> = self.rendition_configs.iter()
-            .map(|cfg| VideoRenditionEncoder::new(cfg).map_err(|e| PipelineError::Output {
-                kind: "encode", reason: e.to_string(),
-            }))
+        let video_encoders: Vec<VideoRenditionEncoder> = self
+            .rendition_configs
+            .iter()
+            .map(|cfg| {
+                VideoRenditionEncoder::new(cfg).map_err(|e| PipelineError::Output {
+                    kind: "encode",
+                    reason: e.to_string(),
+                })
+            })
             .collect::<Result<_, _>>()?;
-        let mut audio_encoder = self.encode_cfg.audio.as_ref()
-            .map(|cfg| AudioRenditionEncoder::new(cfg).map_err(|e| PipelineError::Output {
-                kind: "encode-audio", reason: e.to_string(),
-            }))
+        let mut audio_encoder = self
+            .encode_cfg
+            .audio
+            .as_ref()
+            .map(|cfg| {
+                AudioRenditionEncoder::new(cfg).map_err(|e| PipelineError::Output {
+                    kind: "encode-audio",
+                    reason: e.to_string(),
+                })
+            })
             .transpose()?;
         // #152: one encoder per declared discrete track, opened with the
         // program audio's settings. Tracks need the program-audio bus (their
@@ -3914,9 +3956,12 @@ impl Pipeline {
             Vec::new()
         } else {
             let count = u16::try_from(self.discrete_track_inputs.len()).unwrap_or(u16::MAX);
-            audio_encoder.as_mut().ok_or_else(|| PipelineError::Output {
-                kind: "encode-audio", reason: "audio encoder unavailable".to_owned(),
-            })?
+            audio_encoder
+                .as_mut()
+                .ok_or_else(|| PipelineError::Output {
+                    kind: "encode-audio",
+                    reason: "audio encoder unavailable".to_owned(),
+                })?
                 .open_tracks(count)
                 .map_err(|e| PipelineError::Output {
                     kind: "encode-audio",
@@ -4090,7 +4135,10 @@ impl Pipeline {
         let (egress, hot_tx) = StreamEgress::spawn(
             bake_ctx,
             runners,
-            self.rendition_configs.iter().map(|cfg| recovery_gate(codec_for_encoder(&cfg.codec_name))).collect(),
+            self.rendition_configs
+                .iter()
+                .map(|cfg| recovery_gate(codec_for_encoder(&cfg.codec_name)))
+                .collect(),
             tick_span(self.encode_cfg.cadence),
             self.encode_cfg.cadence,
             policy,
@@ -5155,12 +5203,16 @@ impl StreamEgress {
 
         // Opened codec metadata belongs to the selected video key, never the
         // first output. Audio is a single independent shared encoder.
-        let video_params: Vec<_> = video_encoders.iter().map(|encoder|
-            (encoder.codec_params().clone(), encoder.time_base())).collect();
-        let audio: Option<(StreamCodecParameters, Rational)> = audio_encoder.as_ref()
+        let video_params: Vec<_> = video_encoders
+            .iter()
+            .map(|encoder| (encoder.codec_params().clone(), encoder.time_base()))
+            .collect();
+        let audio: Option<(StreamCodecParameters, Rational)> = audio_encoder
+            .as_ref()
             .map(|encoder| (encoder.codec_params().clone(), encoder.time_base()));
-        let track_streams = audio_encoder.as_ref().map_or_else(Vec::new,
-            AudioRenditionEncoder::track_streams);
+        let track_streams = audio_encoder
+            .as_ref()
+            .map_or_else(Vec::new, AudioRenditionEncoder::track_streams);
 
         // One independently bounded delivery per binding + thread per sink. The
         // sink thread drives `PacketMuxSink::run` (or a test fake) over a
@@ -5175,8 +5227,12 @@ impl StreamEgress {
                 SinkSendPolicy::Bounded => BindingPolicy::Bounded,
             })
             .collect();
-        let binding_gates: Vec<_> = output_video_keys.iter().map(|&key| gates.get(key).copied().flatten()).collect();
-        let (delivery, receivers) = BindingDelivery::new(policies, DeliveryLimits::default(), binding_gates);
+        let binding_gates: Vec<_> = output_video_keys
+            .iter()
+            .map(|&key| gates.get(key).copied().flatten())
+            .collect();
+        let (delivery, receivers) =
+            BindingDelivery::new(policies, DeliveryLimits::default(), binding_gates);
         let mut receivers = receivers.into_iter();
         let mut sinks = Vec::with_capacity(runners.len());
         for (i, (runner, _send_policy)) in runners.into_iter().enumerate() {
@@ -5189,8 +5245,11 @@ impl StreamEgress {
                 continue;
             };
             let builder = std::thread::Builder::new().name(format!("multiview-sink-{i}"));
-            let Some((params, time_base)) = output_video_keys.get(i)
-                .and_then(|&key| video_params.get(key)).cloned() else {
+            let Some((params, time_base)) = output_video_keys
+                .get(i)
+                .and_then(|&key| video_params.get(key))
+                .cloned()
+            else {
                 sinks.push(spawn_failed_sink("missing opened video key".to_owned()));
                 continue;
             };
@@ -5300,11 +5359,15 @@ impl StreamEgress {
                 binding.reserved_packets,
                 binding.reserved_bytes,
                 match binding.last_rejection {
-                    Some(reason) => format!(", last loss: {}{}", reason.label(), if binding.failed {
-                        " (binding failed)"
-                    } else {
-                        ""
-                    }),
+                    Some(reason) => format!(
+                        ", last loss: {}{}",
+                        reason.label(),
+                        if binding.failed {
+                            " (binding failed)"
+                        } else {
+                            ""
+                        }
+                    ),
                     None => String::new(),
                 }
             ));
@@ -5508,19 +5571,26 @@ struct PipelineVideoWorker(VideoRenditionEncoder);
 impl VideoEncodeWorker for PipelineVideoWorker {
     fn encode(&mut self, item: BakedTick) -> Result<Vec<EncodedPacket>, PipelineError> {
         let frame = nv12_to_decoded(&item.canvas)?;
-        self.0.encode_frame_at(frame, item.tick).map_err(|e| PipelineError::Output {
-            kind: "encode", reason: e.to_string(),
-        })
+        self.0
+            .encode_frame_at(frame, item.tick)
+            .map_err(|e| PipelineError::Output {
+                kind: "encode",
+                reason: e.to_string(),
+            })
     }
 
     fn reorder_bound(&self) -> ReorderBound {
-        if self.0.no_reorder_proven() { ReorderBound::NoReorder }
-        else { ReorderBound::Unknown }
+        if self.0.no_reorder_proven() {
+            ReorderBound::NoReorder
+        } else {
+            ReorderBound::Unknown
+        }
     }
 
     fn finish(&mut self) -> Result<Vec<EncodedPacket>, PipelineError> {
         self.0.finish().map_err(|e| PipelineError::Output {
-            kind: "encode", reason: e.to_string(),
+            kind: "encode",
+            reason: e.to_string(),
         })
     }
 }
@@ -5570,36 +5640,69 @@ fn consumer_main(
     let mut baker = StreamBaker::new(ctx)?;
     let (event_tx, event_rx) = std::sync::mpsc::sync_channel::<DispatchEvent>(256);
     if video_encoders.is_empty() {
-        return Err(PipelineError::Output { kind: "encode", reason: "no video rendition".to_owned() });
+        return Err(PipelineError::Output {
+            kind: "encode",
+            reason: "no video rendition".to_owned(),
+        });
     }
     let mut workers = Vec::with_capacity(video_encoders.len());
-    let video_bases: Vec<_> = video_encoders.iter().map(|v| DtsTimeBase {
-        num: v.time_base().num, den: v.time_base().den,
-    }).collect();
+    let video_bases: Vec<_> = video_encoders
+        .iter()
+        .map(|v| DtsTimeBase {
+            num: v.time_base().num,
+            den: v.time_base().den,
+        })
+        .collect();
     for (key, encoder) in video_encoders.into_iter().enumerate() {
         let base = encoder.time_base();
         let tx = event_tx.clone();
-        let worker = RenditionWorker::spawn(key, cadence, base, Box::new(PipelineVideoWorker(encoder)),
-            move |event| tx.send(event).map_err(|e| PipelineError::Output {
-                kind: "video-worker", reason: e.to_string(),
-            }))?;
+        let worker = RenditionWorker::spawn(
+            key,
+            cadence,
+            base,
+            Box::new(PipelineVideoWorker(encoder)),
+            move |event| {
+                tx.send(event).map_err(|e| PipelineError::Output {
+                    kind: "video-worker",
+                    reason: e.to_string(),
+                })
+            },
+        )?;
         workers.push(worker);
     }
     let audio_bases = audio_encoder.as_ref().map_or_else(Vec::new, |encoder| {
         let base = encoder.time_base();
-        std::iter::repeat_n(DtsTimeBase { num: base.num, den: base.den },
-            encoder.track_streams().len() + 1).collect()
+        std::iter::repeat_n(
+            DtsTimeBase {
+                num: base.num,
+                den: base.den,
+            },
+            encoder.track_streams().len() + 1,
+        )
+        .collect()
     });
-    let bindings = output_video_keys.iter().enumerate().map(|(index, &key)| BindingConfig {
-        output_index: index,
-        video_key: Some(key),
-        audio_tracks: (0..audio_bases.len()).collect(),
-    }).collect();
+    let bindings = output_video_keys
+        .iter()
+        .enumerate()
+        .map(|(index, &key)| BindingConfig {
+            output_index: index,
+            video_key: Some(key),
+            audio_tracks: (0..audio_bases.len()).collect(),
+        })
+        .collect();
     let mut dispatcher = RenditionDispatcher::new(DispatchConfig {
-        video_count: video_bases.len(), audio_count: audio_bases.len(),
-        video_time_base: video_bases, audio_time_base: audio_bases.clone(),
-        bindings, first_tick: 0, cadence,
-    }).map_err(|e| PipelineError::Output { kind: "dispatch", reason: format!("{e:?}") })?;
+        video_count: video_bases.len(),
+        audio_count: audio_bases.len(),
+        video_time_base: video_bases,
+        audio_time_base: audio_bases.clone(),
+        bindings,
+        first_tick: 0,
+        cadence,
+    })
+    .map_err(|e| PipelineError::Output {
+        kind: "dispatch",
+        reason: format!("{e:?}"),
+    })?;
     // A monotonic clock for rate-bounding the loudness emit, sampled OFF the hot
     // loop (this is the bake-consumer thread). The epoch is the consumer start;
     // the conflator only ever sees a non-decreasing `now_ns`.
@@ -5636,13 +5739,23 @@ fn consumer_main(
         // continue (invariants #1/#10, no queue-size-only bandaid).
         while let Ok(event) = event_rx.try_recv() {
             if let Err(e) = dispatcher.dispatch(event, Instant::now(), &mut delivery) {
-                if !matches!(e, crate::rendition_dispatch::DispatchError::Admission { .. }) {
-                    return Err(PipelineError::Output { kind: "dispatch", reason: format!("{e:?}") });
+                if !matches!(
+                    e,
+                    crate::rendition_dispatch::DispatchError::Admission { .. }
+                ) {
+                    return Err(PipelineError::Output {
+                        kind: "dispatch",
+                        reason: format!("{e:?}"),
+                    });
                 }
             }
         }
-        dispatcher.watchdog(Instant::now(), &mut delivery)
-            .map_err(|e| PipelineError::Output { kind: "dispatch", reason: format!("{e:?}") })?;
+        dispatcher
+            .watchdog(Instant::now(), &mut delivery)
+            .map_err(|e| PipelineError::Output {
+                kind: "dispatch",
+                reason: format!("{e:?}"),
+            })?;
         // Freeze the declared track selection before this tick samples the bus.
         // A concurrent routing PUT changes only the following tick's selection.
         let selected_tracks = track_inputs.load();
@@ -5677,8 +5790,15 @@ fn consumer_main(
         // rendition. An overloaded rendition fails explicitly, never pacing the
         // program clock or encoding a sibling rendition on this consumer.
         for worker in &workers {
-            worker.offer(BakedTick { tick: item.tick_index, canvas: Arc::clone(&overlaid) })
-                .map_err(|e| PipelineError::Output { kind: "video-worker", reason: format!("{e:?}") })?;
+            worker
+                .offer(BakedTick {
+                    tick: item.tick_index,
+                    canvas: Arc::clone(&overlaid),
+                })
+                .map_err(|e| PipelineError::Output {
+                    kind: "video-worker",
+                    reason: format!("{e:?}"),
+                })?;
         }
         // Program audio (AUD-4 + RT-8b), OFF the engine hot loop: when the bus is
         // present, mix program audio up to THIS frame's output tick index — catching
@@ -5800,11 +5920,18 @@ fn consumer_main(
                 // intentionally ignore here (drop-oldest; inv #10).
                 let _ = slot.push(block.clone());
             }
-            let audio = audio_encoder.as_mut().ok_or_else(|| PipelineError::Output {
-                kind: "encode-audio", reason: "audio bus has no encoder".to_owned(),
-            })?;
-            let mut audio_packets = audio.encode_interleaved(block.interleaved(), block.frame_count())
-                .map_err(|e| PipelineError::Output { kind: "encode-audio", reason: e.to_string() })?;
+            let audio = audio_encoder
+                .as_mut()
+                .ok_or_else(|| PipelineError::Output {
+                    kind: "encode-audio",
+                    reason: "audio bus has no encoder".to_owned(),
+                })?;
+            let mut audio_packets = audio
+                .encode_interleaved(block.interleaved(), block.frame_count())
+                .map_err(|e| PipelineError::Output {
+                    kind: "encode-audio",
+                    reason: e.to_string(),
+                })?;
             // #152: discrete tracks, same tick, same sample budget (inv #3).
             if !selected_tracks.is_empty() {
                 #[cfg(feature = "overlay")]
@@ -5823,18 +5950,33 @@ fn consumer_main(
             }
             let mut watermarks = Vec::with_capacity(audio_bases.len());
             for stream in 0..audio_bases.len() {
-                let pts = audio_packets.iter().rev().find(|p| match p.kind() {
-                    multiview_ffmpeg::StreamKind::Audio => stream == 0,
-                    multiview_ffmpeg::StreamKind::AudioTrack(i) => stream == usize::from(i) + 1,
-                    _ => false,
-                }).and_then(EncodedPacket::pts);
-                watermarks.push(pts.and_then(|p| crate::rendition_workers::next_frame_lower_bound_ns(p, 1024, 48_000)));
+                let pts = audio_packets
+                    .iter()
+                    .rev()
+                    .find(|p| match p.kind() {
+                        multiview_ffmpeg::StreamKind::Audio => stream == 0,
+                        multiview_ffmpeg::StreamKind::AudioTrack(i) => stream == usize::from(i) + 1,
+                        _ => false,
+                    })
+                    .and_then(EncodedPacket::pts);
+                watermarks.push(pts.and_then(|p| {
+                    crate::rendition_workers::next_frame_lower_bound_ns(p, 1024, 48_000)
+                }));
             }
-            event_tx.send(DispatchEvent::Audio {
-                tick: item.tick_index,
-                timebases: audio_bases.iter().map(|tb| Rational::new(tb.num, tb.den)).collect(),
-                packets: audio_packets, watermarks,
-            }).map_err(|e| PipelineError::Output { kind: "audio-dispatch", reason: e.to_string() })?;
+            event_tx
+                .send(DispatchEvent::Audio {
+                    tick: item.tick_index,
+                    timebases: audio_bases
+                        .iter()
+                        .map(|tb| Rational::new(tb.num, tb.den))
+                        .collect(),
+                    packets: audio_packets,
+                    watermarks,
+                })
+                .map_err(|e| PipelineError::Output {
+                    kind: "audio-dispatch",
+                    reason: e.to_string(),
+                })?;
         } else if let Some(bus) = display_audio.dedicated_bus.as_mut() {
             // A video-only run with audio-enabled display heads: drive the
             // dedicated display bus by the same absolute tick index (RT-8b —
@@ -5854,21 +5996,35 @@ fn consumer_main(
     }
     if let Some(audio) = audio_encoder.as_mut() {
         let tail = audio.finish().map_err(|e| PipelineError::Output {
-            kind: "encode-audio", reason: e.to_string(),
+            kind: "encode-audio",
+            reason: e.to_string(),
         })?;
-        event_tx.send(DispatchEvent::FinishAudio { packets: tail })
-            .map_err(|e| PipelineError::Output { kind: "audio-dispatch", reason: e.to_string() })?;
+        event_tx
+            .send(DispatchEvent::FinishAudio { packets: tail })
+            .map_err(|e| PipelineError::Output {
+                kind: "audio-dispatch",
+                reason: e.to_string(),
+            })?;
     }
     drop(event_tx);
     while let Ok(event) = event_rx.recv() {
         if let Err(e) = dispatcher.dispatch(event, Instant::now(), &mut delivery) {
-            if !matches!(e, crate::rendition_dispatch::DispatchError::Admission { .. }) {
-                return Err(PipelineError::Output { kind: "dispatch", reason: format!("{e:?}") });
+            if !matches!(
+                e,
+                crate::rendition_dispatch::DispatchError::Admission { .. }
+            ) {
+                return Err(PipelineError::Output {
+                    kind: "dispatch",
+                    reason: format!("{e:?}"),
+                });
             }
         }
     }
     if !dispatcher.is_finished() {
-        return Err(PipelineError::Output { kind: "dispatch", reason: "incomplete final window".to_owned() });
+        return Err(PipelineError::Output {
+            kind: "dispatch",
+            reason: "incomplete final window".to_owned(),
+        });
     }
     delivery.finish();
     // The per-binding delivery truth travels with the run: a healthy clock plus
@@ -10780,7 +10936,11 @@ struct StreamingPacketSource {
 
 impl StreamingPacketSource {
     fn new(rx: Receiver<LeasedPacket>) -> Self {
-        Self { rx, current_permit: None, delivered: 0 }
+        Self {
+            rx,
+            current_permit: None,
+            delivered: 0,
+        }
     }
 }
 

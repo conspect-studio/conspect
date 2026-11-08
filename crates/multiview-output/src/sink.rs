@@ -567,7 +567,22 @@ impl VideoRenditionEncoder {
     /// Returns an error if the video encoder is unavailable or invalid.
     pub fn new(config: &EncodeConfig) -> Result<Self> {
         config.validate()?;
-        let encoder = VideoEncoder::new(&config.target()).map_err(ff)?;
+        let pairs: &[(&str, &str)] =
+            if config.codec_name == "libx264" || config.codec_name == "libx265" {
+                &[("tune", "zerolatency"), ("bf", "0")]
+            } else if config.codec_name.ends_with("_nvenc") {
+                &[
+                    ("tune", "ull"),
+                    ("zerolatency", "1"),
+                    ("delay", "0"),
+                    ("bf", "0"),
+                ]
+            } else {
+                &[("bf", "0")]
+            };
+        let options = multiview_ffmpeg::CodecOptions::from_pairs(pairs)
+            .map_err(|e| Error::Output(e.to_string()))?;
+        let encoder = VideoEncoder::new_with_options(&config.target(), &options).map_err(ff)?;
         let params = StreamCodecParameters::from_encoder(&encoder);
         let time_base = encoder.time_base();
         let no_reorder = encoder.no_reorder_proven();
@@ -614,9 +629,13 @@ impl VideoRenditionEncoder {
                 "video rendition encoder is finished".to_owned(),
             ));
         }
-        let pts = i64::try_from(tick).map_err(|_| Error::Output("video tick exceeds i64 PTS".to_owned()))?;
+        let pts = i64::try_from(tick)
+            .map_err(|_| Error::Output("video tick exceeds i64 PTS".to_owned()))?;
         if pts != self.tick {
-            return Err(Error::Output(format!("video tick discontinuity: expected {}, got {pts}", self.tick)));
+            return Err(Error::Output(format!(
+                "video tick discontinuity: expected {}, got {pts}",
+                self.tick
+            )));
         }
         let prepared = self.converter.prepare(frame.frame, pts)?;
         self.encoder.send_frame(&prepared).map_err(ff)?;
@@ -2346,7 +2365,10 @@ impl<'a> SegmentState<'a> {
             // i.e. one full coded-payload copy per HLS write.
             segment
                 .muxer
-                .write_packet(segment.stream_index, packet.to_owned_packet_shared_ref().map_err(ff)?)
+                .write_packet(
+                    segment.stream_index,
+                    packet.to_owned_packet_shared_ref().map_err(ff)?,
+                )
                 .map_err(ff)?;
             segment.packets = segment.packets.saturating_add(1);
         }
