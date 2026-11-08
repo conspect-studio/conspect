@@ -2334,7 +2334,7 @@ impl<'a> SegmentState<'a> {
             // i.e. one full coded-payload copy per HLS write.
             segment
                 .muxer
-                .write_packet(segment.stream_index, packet.to_owned_packet_shared_ref())
+                .write_packet(segment.stream_index, packet.to_owned_packet_shared_ref().map_err(ff)?)
                 .map_err(ff)?;
             segment.packets = segment.packets.saturating_add(1);
         }

@@ -393,7 +393,11 @@ impl BindingDelivery {
                 .spawn(move || {
                     while let Ok(lease) = lease_rx.recv() {
                         for packet in lease.packets() {
-                            if !send_bounded_packet(&packet_tx, packet.clone_shared_ref()) {
+                            let Ok(shared) = packet.clone_shared_ref() else {
+                                pump_wedged.store(true, Ordering::Release);
+                                return;
+                            };
+                            if !send_bounded_packet(&packet_tx, shared) {
                                 // The sink hung up or stopped draining for the
                                 // whole grace: this binding is finished. Drop
                                 // the lease (releasing its reservation) and end
@@ -459,7 +463,16 @@ impl BindingDelivery {
                     }
                 }
                 // Shared-ref copy: independent AVPacket metadata, ONE coded payload.
-                binding.staged.push(packet.clone_shared_ref());
+                match packet.clone_shared_ref() {
+                    Ok(shared) => binding.staged.push(shared),
+                    Err(_) => {
+                        binding.staged.clear();
+                        binding.queue.report_loss(OfferError::ProducerLoss);
+                        binding.failed = true;
+                        binding.last_rejection = Some(RejectionReason::InvalidWindow);
+                        break;
+                    }
+                }
             }
         }
     }

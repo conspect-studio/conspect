@@ -75,6 +75,8 @@ pub(crate) enum DispatchError {
     WatermarkReversed,
     LatePacket,
     StagingOverflow,
+    /// `av_packet_ref` failed; no partial AV window may be admitted.
+    PacketReference,
     WatchdogExpired,
     /// A binding rejected a whole window; its delivery owner retains details.
     Admission {
@@ -581,12 +583,18 @@ impl RenditionDispatcher {
                 let mut packets = Vec::new();
                 if let Some(v) = binding.video_key {
                     for p in &video[v] {
-                        packets.push(p.clone_shared_ref());
+                        packets.push(
+                            p.clone_shared_ref()
+                                .map_err(|_| DispatchError::PacketReference)?,
+                        );
                     }
                 }
                 for &a in &binding.audio_tracks {
                     for p in &audio[a] {
-                        packets.push(p.clone_shared_ref());
+                        packets.push(
+                            p.clone_shared_ref()
+                                .map_err(|_| DispatchError::PacketReference)?,
+                        );
                     }
                 }
                 let start =
