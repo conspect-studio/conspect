@@ -239,6 +239,10 @@ impl RenditionDispatcher {
             || i128::from(config.cadence.den) * 1_000_000_000
                 > i128::from(config.cadence.num) * 250_000_000
             || config.video_count != config.video_time_base.len()
+            || config.video_time_base.iter().any(|tb| {
+                i128::from(tb.num).checked_mul(i128::from(config.cadence.num))
+                    != i128::from(tb.den).checked_mul(i128::from(config.cadence.den))
+            })
             || config.audio_count != config.audio_time_base.len()
             || config.video_count == 0
             || config.bindings.is_empty()
@@ -820,6 +824,15 @@ mod tests {
             packets,
             watermarks,
         }
+    }
+    #[test]
+    fn video_encoder_timebase_must_equal_inverse_program_cadence() {
+        let mut config = cfg(vec![binding(0, 0, 1)], 1, 1);
+        config.video_time_base[0] = DtsTimeBase { num: 1, den: 30 };
+        assert!(matches!(
+            RenditionDispatcher::new(config),
+            Err(DispatchError::InvalidConfig)
+        ));
     }
     #[test]
     fn zero_then_many_delayed_waits_for_both_proven_watermarks() {
