@@ -141,9 +141,22 @@ msgstr "{desired} (desired)"
 msgid "{hours} h ago"
 msgstr "{hours} h ago"
 
+#: src/api/operationStatus.ts:80
+msgid "{label} completed"
+msgstr "{label} completed"
+
 #: src/resources/FormControls.tsx:350
 msgid "{label} copied to the clipboard."
 msgstr "{label} copied to the clipboard."
+
+#: src/api/operationStatus.ts:74
+msgid "{label} failed"
+msgstr "{label} failed"
+
+#. placeholder {0}: accepted.operation_id
+#: src/api/operationStatus.ts:88
+msgid "{label}: no result arrived for operation {0}. It may still be running."
+msgstr "{label}: no result arrived for operation {0}. It may still be running."
 
 #: src/devices/lastSeen.tsx:57
 msgid "{minutes} min ago"
@@ -628,7 +641,7 @@ msgstr "Accessible editing path: Cells form + Inspector in the editor"
 msgid "Accessible toasts announce via a live region."
 msgstr "Accessible toasts announce via a live region."
 
-#: src/app/navigation.tsx:77
+#: src/app/navigation.tsx:79
 #: src/pages/AccountPage.tsx:139
 msgid "Account"
 msgstr "Account"
@@ -917,7 +930,7 @@ msgstr "Alarm policy (dwell, severity, latching)"
 msgid "Alarm when offline"
 msgstr "Alarm when offline"
 
-#: src/app/navigation.tsx:67
+#: src/app/navigation.tsx:69
 #: src/docs/registry.ts:262
 #: src/pages/AlarmsPage.tsx:152
 #: src/pages/docs/FeaturesPage.tsx:164
@@ -1247,7 +1260,7 @@ msgstr "ATSC A/85 (−24 LKFS)"
 msgid "Attached automatically"
 msgstr "Attached automatically"
 
-#: src/app/navigation.tsx:56
+#: src/app/navigation.tsx:57
 #: src/pages/AudioPage.tsx:440
 #: src/pages/OutputsPage.tsx:762
 msgid "Audio"
@@ -1273,7 +1286,7 @@ msgstr "Audio routes"
 msgid "Audio silence"
 msgstr "Audio silence"
 
-#: src/app/navigation.tsx:72
+#: src/app/navigation.tsx:74
 #: src/pages/AuditPage.tsx:55
 msgid "Audit"
 msgstr "Audit"
@@ -1301,6 +1314,10 @@ msgstr "Authentication required to read source events."
 msgid "auto"
 msgstr "auto"
 
+#: src/pages/SwitcherPage.tsx:102
+msgid "Auto"
+msgstr "Auto"
+
 #: src/iptv/BulkAddDialog.tsx:45
 msgid "Auto — apply URL/header changes"
 msgstr "Auto — apply URL/header changes"
@@ -1312,6 +1329,10 @@ msgstr "Auto (drop leading zero units)"
 #: src/pages/SourcesPage.tsx:707
 msgid "Auto (first usable track)"
 msgstr "Auto (first usable track)"
+
+#: src/pages/SwitcherPage.tsx:101
+msgid "Auto frames"
+msgstr "Auto frames"
 
 #: src/pages/SourcesPage.tsx:237
 msgid "Automatic (default)"
@@ -1700,7 +1721,7 @@ msgstr "Canvas width and height must be positive whole numbers."
 msgid "Canvas width in pixels."
 msgstr "Canvas width in pixels."
 
-#: src/app/navigation.tsx:69
+#: src/app/navigation.tsx:71
 #: src/pages/CapabilitiesPage.tsx:285
 #: src/pages/DeviceDetailPage.tsx:490
 msgid "Capabilities"
@@ -1719,7 +1740,7 @@ msgstr "Captions"
 msgid "Carry the file to an online portal to obtain a signed lease."
 msgstr "Carry the file to an online portal to obtain a signed lease."
 
-#: src/app/navigation.tsx:59
+#: src/app/navigation.tsx:60
 #: src/pages/CastPage.tsx:215
 #: src/pages/CastPage.tsx:257
 msgid "Cast"
@@ -1879,6 +1900,10 @@ msgstr "Channels (route {row})"
 msgid "Checked from this server."
 msgstr "Checked from this server."
 
+#: src/pages/SwitcherPage.tsx:83
+msgid "Checking switcher engine…"
+msgstr "Checking switcher engine…"
+
 #: src/auth/LoginPage.tsx:102
 msgid "Checking…"
 msgstr "Checking…"
@@ -1886,6 +1911,10 @@ msgstr "Checking…"
 #: src/pages/graphics/LibraryView.tsx:131
 msgid "Choose a data source…"
 msgstr "Choose a data source…"
+
+#: src/pages/SwitcherPage.tsx:94
+msgid "Choose a source"
+msgstr "Choose a source"
 
 #: src/pages/AudioPage.tsx:124
 msgid "Choose an input"
@@ -2095,10 +2124,15 @@ msgstr "Column gap"
 msgid "Columns"
 msgstr "Columns"
 
+#: src/api/operationStatus.ts:55
 #: src/pages/MediaPlayersPage.tsx:145
 #: src/pages/SalvosPage.tsx:153
 msgid "Command accepted"
 msgstr "Command accepted"
+
+#: src/pages/SwitcherPage.tsx:85
+msgid "Command accepted; awaiting the output tick"
+msgstr "Command accepted; awaiting the output tick"
 
 #: src/pages/MediaPlayersPage.tsx:151
 #: src/pages/MediaPlayersPage.tsx:172
@@ -2847,6 +2881,10 @@ msgstr "Custom frame rate (num/den)"
 msgid "Custom…"
 msgstr "Custom…"
 
+#: src/pages/SwitcherPage.tsx:100
+msgid "Cut"
+msgstr "Cut"
+
 #: src/pages/graphics/PlayoutView.tsx:310
 msgid "CUT"
 msgstr "CUT"
@@ -2860,12 +2898,12 @@ msgstr "D:HH:MM:SS (drop day when zero)"
 msgid "Daily forecast for {0}"
 msgstr "Daily forecast for {0}"
 
-#: src/app/navigation.tsx:50
+#: src/app/navigation.tsx:51
 #: src/pages/DashboardPage.tsx:50
 msgid "Dashboard"
 msgstr "Dashboard"
 
-#: src/app/navigation.tsx:78
+#: src/app/navigation.tsx:80
 #: src/pages/DataPage.tsx:377
 #: src/pages/GraphicsPage.tsx:20
 msgid "Data"
@@ -3142,7 +3180,7 @@ msgstr "Device id"
 msgid "Device-reported streams"
 msgstr "Device-reported streams"
 
-#: src/app/navigation.tsx:58
+#: src/app/navigation.tsx:59
 #: src/docs/registry.ts:158
 #: src/pages/DevicesPage.tsx:656
 #: src/pages/docs/ConfigPage.tsx:329
@@ -3302,7 +3340,7 @@ msgstr "docker run"
 msgid "docker run and docker compose, GPU access, volumes, healthchecks, and the API token."
 msgstr "docker run and docker compose, GPU access, volumes, healthchecks, and the API token."
 
-#: src/app/navigation.tsx:73
+#: src/app/navigation.tsx:75
 msgid "Docs"
 msgstr "Docs"
 
@@ -4223,7 +4261,7 @@ msgstr "Grace until"
 msgid "Gradient (opaque)"
 msgstr "Gradient (opaque)"
 
-#: src/app/navigation.tsx:65
+#: src/app/navigation.tsx:67
 #: src/pages/GraphicsPage.tsx:29
 msgid "Graphics"
 msgstr "Graphics"
@@ -4740,7 +4778,7 @@ msgstr "Invalid source"
 msgid "IP cameras, fixed encoders"
 msgstr "IP cameras, fixed encoders"
 
-#: src/app/navigation.tsx:54
+#: src/app/navigation.tsx:55
 #: src/pages/IptvPage.tsx:116
 msgid "IPTV playlist"
 msgstr "IPTV playlist"
@@ -4797,6 +4835,10 @@ msgstr "Jitter buffer"
 #: src/events/SourceEventsButton.tsx:193
 msgid "Journal"
 msgstr "Journal"
+
+#: src/pages/SwitcherPage.tsx:104
+msgid "Keyers, aux buses, multi-M/E and compositions as sources remain future switcher stages."
+msgstr "Keyers, aux buses, multi-M/E and compositions as sources remain future switcher stages."
 
 #: src/pages/AlarmsPage.tsx:218
 #: src/pages/OverlaysPage.tsx:173
@@ -4974,7 +5016,7 @@ msgstr "Layout saved & applied live"
 msgid "Layout saved, but apply failed"
 msgstr "Layout saved, but apply failed"
 
-#: src/app/navigation.tsx:51
+#: src/app/navigation.tsx:52
 #: src/docs/registry.ts:227
 #: src/pages/DashboardPage.tsx:58
 #: src/pages/docs/FeaturesPage.tsx:25
@@ -5042,7 +5084,7 @@ msgstr "Level"
 msgid "Library"
 msgstr "Library"
 
-#: src/app/navigation.tsx:76
+#: src/app/navigation.tsx:78
 #: src/pages/LicencePage.tsx:459
 msgid "Licence"
 msgstr "Licence"
@@ -5405,7 +5447,7 @@ msgstr "Locking every device's frame timing to one shared reference signal so al
 msgid "Logo URL"
 msgstr "Logo URL"
 
-#: src/app/navigation.tsx:71
+#: src/app/navigation.tsx:73
 #: src/pages/LogsPage.tsx:90
 msgid "Logs"
 msgstr "Logs"
@@ -5593,7 +5635,7 @@ msgstr "Measured, never assumed"
 msgid "Measurement running"
 msgstr "Measurement running"
 
-#: src/app/navigation.tsx:64
+#: src/app/navigation.tsx:66
 #: src/docs/registry.ts:257
 #: src/pages/docs/FeaturesPage.tsx:149
 #: src/pages/MediaPlayersPage.tsx:220
@@ -5627,7 +5669,7 @@ msgstr "Members"
 msgid "Memory"
 msgstr "Memory"
 
-#: src/app/navigation.tsx:79
+#: src/app/navigation.tsx:81
 #: src/pages/MeshPage.tsx:281
 msgid "Mesh"
 msgstr "Mesh"
@@ -5708,7 +5750,7 @@ msgstr "Modern GPUs and SoCs contain dedicated video engines — separate silico
 msgid "Momentary (400 ms)"
 msgstr "Momentary (400 ms)"
 
-#: src/app/navigation.tsx:61
+#: src/app/navigation.tsx:63
 #: src/pages/MonitoringPage.tsx:190
 msgid "Monitoring"
 msgstr "Monitoring"
@@ -6678,6 +6720,7 @@ msgstr "Operation {0}; the outcome arrives on the realtime stream."
 msgid "Operation {0}; the result arrives on the realtime stream."
 msgstr "Operation {0}; the result arrives on the realtime stream."
 
+#: src/api/operationStatus.ts:56
 #: src/pages/LayoutEditorPage.tsx:118
 #: src/pages/LayoutsPage.tsx:148
 #: src/pages/MediaPlayersPage.tsx:146
@@ -6729,6 +6772,14 @@ msgstr "Ours of host total"
 msgid "Out of spec"
 msgstr "Out of spec"
 
+#: src/api/operationStatus.ts:87
+msgid "Outcome not received"
+msgstr "Outcome not received"
+
+#: src/pages/SwitcherPage.tsx:73
+msgid "Outcome unknown; refresh the engine state before taking again"
+msgstr "Outcome unknown; refresh the engine state before taking again"
+
 #: src/pages/CastPage.tsx:318
 #: src/pages/IptvPage.tsx:232
 msgid "Output"
@@ -6775,7 +6826,7 @@ msgstr "Output playback unavailable: the configured playlist path is missing."
 msgid "Output: {0} ({1})"
 msgstr "Output: {0} ({1})"
 
-#: src/app/navigation.tsx:53
+#: src/app/navigation.tsx:54
 #: src/docs/registry.ts:153
 #: src/docs/registry.ts:237
 #: src/pages/docs/ConfigPage.tsx:258
@@ -6792,7 +6843,7 @@ msgstr "Over ceiling"
 msgid "Over the layout drop zone."
 msgstr "Over the layout drop zone."
 
-#: src/app/navigation.tsx:55
+#: src/app/navigation.tsx:56
 #: src/docs/registry.ts:148
 #: src/docs/registry.ts:242
 #: src/layout/components/SourcePalette.tsx:224
@@ -7113,7 +7164,7 @@ msgstr "Probe: {sourceName}"
 msgid "probed from {0} at <0>{1}</0>"
 msgstr "probed from {0} at <0>{1}</0>"
 
-#: src/app/navigation.tsx:66
+#: src/app/navigation.tsx:68
 #: src/pages/ProbesPage.tsx:474
 msgid "Probes"
 msgstr "Probes"
@@ -7146,6 +7197,10 @@ msgstr "PROG"
 #: src/pages/MonitoringPage.tsx:203
 msgid "Program"
 msgstr "Program"
+
+#: src/pages/SwitcherPage.tsx:81
+msgid "Program / Preview switcher"
+msgstr "Program / Preview switcher"
 
 #: src/pages/OutputsPage.tsx:754
 msgid "Program bus only"
@@ -7246,6 +7301,10 @@ msgstr "Publish this source's upstream URL directly (credentials are always remo
 #: src/pages/SourcesPage.tsx:349
 msgid "Publisher token (optional)"
 msgstr "Publisher token (optional)"
+
+#: src/pages/SwitcherPage.tsx:99
+msgid "Punch PGM"
+msgstr "Punch PGM"
 
 #: src/pages/docs/ConfigPage.tsx:294
 msgid "Push the encoded stream to a destination <0>url</0>."
@@ -7750,7 +7809,7 @@ msgstr "Route each input's audio: program-mix membership and discrete tracks."
 msgid "Routes to"
 msgstr "Routes to"
 
-#: src/app/navigation.tsx:60
+#: src/app/navigation.tsx:61
 #: src/pages/RoutingPage.tsx:227
 msgid "Routing"
 msgstr "Routing"
@@ -7852,7 +7911,7 @@ msgstr "Salvo deleted"
 msgid "Salvo saved"
 msgstr "Salvo saved"
 
-#: src/app/navigation.tsx:63
+#: src/app/navigation.tsx:65
 #: src/docs/registry.ts:252
 #: src/pages/docs/FeaturesPage.tsx:137
 #: src/pages/SalvosPage.tsx:171
@@ -8047,6 +8106,10 @@ msgstr "Select cell"
 msgid "Select or cue an item to see its fields."
 msgstr "Select or cue an item to see its fields."
 
+#: src/pages/SwitcherPage.tsx:98
+msgid "Select PVW"
+msgstr "Select PVW"
+
 #: src/iptv/IptvOrgPage.tsx:849
 msgid "Select stream {title} for bulk add"
 msgstr "Select stream {title} for bulk add"
@@ -8119,7 +8182,7 @@ msgstr "Set the receiver volume"
 msgid "Set volume"
 msgstr "Set volume"
 
-#: src/app/navigation.tsx:74
+#: src/app/navigation.tsx:76
 #: src/pages/SettingsPage.tsx:147
 msgid "Settings"
 msgstr "Settings"
@@ -8220,6 +8283,7 @@ msgstr "Some sources could not be created"
 #: src/layout/components/CellsForm.tsx:398
 #: src/layout/components/GridLayoutEditor.tsx:667
 #: src/pages/IptvPage.tsx:232
+#: src/pages/SwitcherPage.tsx:92
 msgid "Source"
 msgstr "Source"
 
@@ -8270,7 +8334,7 @@ msgstr "Source URL"
 msgid "Source: {0} ({1})"
 msgstr "Source: {0} ({1})"
 
-#: src/app/navigation.tsx:52
+#: src/app/navigation.tsx:53
 #: src/docs/registry.ts:138
 #: src/docs/registry.ts:232
 #: src/layout/components/SourcePalette.tsx:203
@@ -8573,7 +8637,7 @@ msgstr "Summary"
 msgid "Superseded"
 msgstr "Superseded"
 
-#: src/app/navigation.tsx:80
+#: src/app/navigation.tsx:82
 #: src/pages/SupportPage.tsx:527
 msgid "Support"
 msgstr "Support"
@@ -8623,6 +8687,19 @@ msgstr "Switch to an alternative"
 msgid "Switched to the alternative"
 msgstr "Switched to the alternative"
 
+#: src/app/navigation.tsx:62
+#: src/pages/SwitcherPage.tsx:64
+msgid "Switcher"
+msgstr "Switcher"
+
+#: src/pages/SwitcherPage.tsx:68
+msgid "Switcher operation rejected"
+msgstr "Switcher operation rejected"
+
+#: src/pages/SwitcherPage.tsx:82
+msgid "Switcher unavailable: no real Program/Preview bus is attached. Controls are disabled."
+msgstr "Switcher unavailable: no real Program/Preview bus is attached. Controls are disabled."
+
 #: src/pages/DeviceDetailPage.tsx:447
 msgid "Sync"
 msgstr "Sync"
@@ -8651,12 +8728,12 @@ msgstr "Synchronized output"
 msgid "Synthetic sources (bars, solid colour, clock, timer) apply to the running engine immediately when saved, and deleting any source removes it from the running engine immediately. Network and file sources (RTSP, HLS, MPEG-TS, SRT, RTMP, RIST, file) also apply live on a full-engine run; on the software engine, and for NDI / YouTube / AES67, they are stored and go live via config export + restart. Each save response declares which applied (X-Multiview-Apply: live or restart)."
 msgstr "Synthetic sources (bars, solid colour, clock, timer) apply to the running engine immediately when saved, and deleting any source removes it from the running engine immediately. Network and file sources (RTSP, HLS, MPEG-TS, SRT, RTMP, RIST, file) also apply live on a full-engine run; on the software engine, and for NDI / YouTube / AES67, they are stored and go live via config export + restart. Each save response declares which applied (X-Multiview-Apply: live or restart)."
 
-#: src/app/navigation.tsx:68
+#: src/app/navigation.tsx:70
 #: src/pages/SystemPage.tsx:236
 msgid "System"
 msgstr "System"
 
-#: src/app/navigation.tsx:70
+#: src/app/navigation.tsx:72
 #: src/pages/SystemActionsPage.tsx:297
 msgid "System actions"
 msgstr "System actions"
@@ -8695,7 +8772,7 @@ msgstr "Take vamp exit"
 msgid "Takes effect at the next frame boundary."
 msgstr "Takes effect at the next frame boundary."
 
-#: src/app/navigation.tsx:62
+#: src/app/navigation.tsx:64
 #: src/docs/registry.ts:247
 #: src/docs/registry.ts:753
 #: src/pages/docs/concepts/GlossaryPage.tsx:326
@@ -9478,6 +9555,10 @@ msgstr "This toast is announced to assistive technology."
 msgid "This URL must start with http:// or https://."
 msgstr "This URL must start with http:// or https://."
 
+#: src/pages/SwitcherPage.tsx:86
+msgid "Tick"
+msgstr "Tick"
+
 #: src/pages/SupportPage.tsx:80
 msgid "Ticket raised"
 msgstr "Ticket raised"
@@ -9601,6 +9682,10 @@ msgstr "Transfer ownership"
 #: src/pages/graphics/PlayoutView.tsx:298
 msgid "Transition"
 msgstr "Transition"
+
+#: src/pages/SwitcherPage.tsx:86
+msgid "Transition running"
+msgstr "Transition running"
 
 #: src/pages/graphics/LibraryView.tsx:141
 msgid "Transparent (key over video)"
@@ -9936,6 +10021,10 @@ msgstr "VT transport for the configured media-player channels. Load an asset, cu
 #: src/preview/PreviewSurface.tsx:43
 msgid "Waiting for a frame…"
 msgstr "Waiting for a frame…"
+
+#: src/pages/SwitcherPage.tsx:26
+msgid "Waiting for a real frame"
+msgstr "Waiting for a real frame"
 
 #: src/components/SourceDemandBadge.tsx:57
 msgid "waiting for a start slot"
