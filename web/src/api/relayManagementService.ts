@@ -14,7 +14,19 @@ const records = z.object({ mode: z.enum(["auto", "manual"]), desired_transport: 
   health: z.string(),
 })).nullable(), pending: z.string().nullable() });
 export function createRelayManagementService(client: MultiviewApiClient = createApiClient()): RelayManagementService {
+  let automatic = false;
+  let validatedIdentity: string | null = null;
+  let generation = 0;
+  const identity = (credential: CredentialView) => JSON.stringify([credential.accountId, credential.reference]);
+  function invalidate() { automatic = false; validatedIdentity = null; generation += 1; }
+  function requireAutomatic(credential: CredentialView) {
+    if (!automatic || validatedIdentity !== identity(credential)) {
+      invalidate();
+      throw new Error("Automatic mode unavailable");
+    }
+  }
   async function action(credential: CredentialView, name: string, extra: Partial<components["schemas"]["CloudflareRequest"]> = {}) {
+    if (validatedIdentity !== null && validatedIdentity !== identity(credential)) invalidate();
     const response = await client.POST("/api/v1/cloudflare/{action}", {
       params: { path: { action: name } },
       body: { ...extra, account_id: credential.accountId, secret_ref: credential.reference },
@@ -23,10 +35,10 @@ export function createRelayManagementService(client: MultiviewApiClient = create
     if (!response.data) throw new Error("Cloudflare response unavailable");
     return response.data.data;
   }
-  let automatic = false;
   return {
     get supportsAutomaticMode() { return automatic; },
     async saveCredential(accountId, input) {
+      invalidate();
       const response = await client.POST("/api/v1/cloudflare/credentials", { body: { account_id: accountId, ...input } });
       if (!response.response.ok || !response.data) throw new Error("Credential storage unavailable");
       return { accountId, kind: input.kind, reference: reference.parse(response.data.data).secret_ref };
@@ -36,6 +48,7 @@ export function createRelayManagementService(client: MultiviewApiClient = create
       return { count: result.tokens.length, allPagesLoaded: result.all_pages_loaded };
     },
     async createScopedToken(credential) {
+      invalidate();
       const groups = z.array(permission).parse(await action(credential, "permissions"));
       const selected = groups.find((group) => (group.name === "MoQ Write" || group.name === "MoQ Edit") && group.is_selectable === true && group.scopes.includes("com.cloudflare.api.account"));
       if (!selected) throw new Error("Required account-only permission unavailable");
@@ -43,10 +56,14 @@ export function createRelayManagementService(client: MultiviewApiClient = create
       return { ...credential, reference: result.secret_ref, kind: "scoped_token" };
     },
     async list(credential) {
-      automatic = false;
-      automatic = capabilities.parse(await action(credential, "capabilities")).automatic_reconciliation;
+      invalidate();
+      const refreshGeneration = generation;
+      const supported = capabilities.parse(await action(credential, "capabilities")).automatic_reconciliation;
       const result = records.parse(await action(credential, "relays"));
       if (result.pending !== null || result.records === null) throw new Error("Relay recovery pending");
+      if (refreshGeneration !== generation) throw new Error("Relay inventory superseded");
+      validatedIdentity = identity(credential);
+      automatic = supported;
       return result.records.map((record) => ({
         id: record.relay.uid, name: record.relay.name, mode: result.mode,
         requestedTransport: result.desired_transport, effectiveTransport: null,
@@ -55,8 +72,9 @@ export function createRelayManagementService(client: MultiviewApiClient = create
     },
     async create(credential, name, mode) {
       if (mode === "auto") {
-        if (!automatic) throw new Error("Automatic mode unavailable");
+        requireAutomatic(credential);
         await action(credential, "set-mode", { mode, name });
+        requireAutomatic(credential);
         await action(credential, "reconcile");
       } else {
         await action(credential, "provision", { name });
@@ -64,7 +82,7 @@ export function createRelayManagementService(client: MultiviewApiClient = create
     },
     async importRelay(credential, id) { await action(credential, "import", { relay_id: id }); },
     async setMode(credential, id, mode) {
-      if (mode === "auto" && !automatic) throw new Error("Automatic mode unavailable");
+      if (mode === "auto") requireAutomatic(credential);
       await action(credential, "set-mode", { relay_id: id, mode });
     },
     async update(credential, id, config) {

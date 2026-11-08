@@ -10,6 +10,29 @@ afterAll(() => { server.close(); });
 const credential = { accountId: "acct", reference: "vault:test", kind: "global_key" as const };
 const service = () => createRelayManagementService(createApiClient({ baseUrl: "http://localhost" }));
 describe("generated relay management adapter", () => {
+  it.each([{ records: [], pending: "recovery" }, { records: null, pending: null }])("fails closed after stale successful inventory then invalid refresh %j", async (invalid) => {
+    let broken = false;
+    let mutations = 0;
+    server.use(http.post("*/api/v1/cloudflare/capabilities", () => HttpResponse.json({ data: { automatic_reconciliation: true } })), http.post("*/api/v1/cloudflare/relays", () => HttpResponse.json({ data: { mode: "auto", desired_transport: "moq", ...(broken ? invalid : { records: [], pending: null }) } })), http.post("*/api/v1/cloudflare/set-mode", () => { mutations += 1; return HttpResponse.json({ data: {} }); }), http.post("*/api/v1/cloudflare/reconcile", () => { mutations += 1; return HttpResponse.json({ data: {} }); }));
+    const api = service();
+    await api.list(credential);
+    expect(api.supportsAutomaticMode).toBe(true);
+    broken = true;
+    await expect(api.list(credential)).rejects.toThrow("pending");
+    expect(api.supportsAutomaticMode).toBe(false);
+    await expect(api.create(credential, "relay", "auto")).rejects.toThrow("unavailable");
+    await expect(api.setMode(credential, "relay", "auto")).rejects.toThrow("unavailable");
+    expect(mutations).toBe(0);
+  });
+  it("does not reuse validated automatic capability for another account or reference", async () => {
+    server.use(http.post("*/api/v1/cloudflare/capabilities", () => HttpResponse.json({ data: { automatic_reconciliation: true } })), http.post("*/api/v1/cloudflare/relays", () => HttpResponse.json({ data: { mode: "auto", desired_transport: "moq", records: [], pending: null } })));
+    const api = service();
+    for (const changed of [{ ...credential, accountId: "other" }, { ...credential, reference: "vault:other" }]) {
+      await api.list(credential);
+      await expect(api.create(changed, "relay", "auto")).rejects.toThrow("unavailable");
+      expect(api.supportsAutomaticMode).toBe(false);
+    }
+  });
   it("sends typed update config and standalone token revocation", async () => {
     server.use(http.post("*/api/v1/cloudflare/update", async ({ request }) => {
       expect(await request.json()).toEqual({ account_id: "acct", secret_ref: "vault:test", relay_id: "relay-id", name: "Changed", config: { upstreams: { enabled: true, upstreams: [{ url: "https://relay.example.com" }] } } });
