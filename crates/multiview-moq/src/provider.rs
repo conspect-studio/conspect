@@ -413,7 +413,10 @@ mod tests {
         drop(received);
         fence.revoke();
         assert_eq!(fence.charged.load(Ordering::Acquire), 3);
+        let slice = retained.slice(1..2);
         drop(retained);
+        assert_eq!(fence.charged.load(Ordering::Acquire), 3);
+        drop(slice);
         assert_eq!(fence.charged.load(Ordering::Acquire), 0);
     }
     #[test]
