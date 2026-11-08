@@ -169,7 +169,7 @@ include_in_program_bus = false
     )
 }
 /// Decode the selected AAC stream to PCM, not merely inspect headers.
-fn decoded_audio_samples(path: &Path, stream_index: usize) -> usize {
+fn decoded_audio_samples(path: &Path, stream_index: usize) -> Result<usize, String> {
     let output = Command::new("ffmpeg")
         .args(["-hide_banner", "-loglevel", "error", "-i"])
         .arg(path)
@@ -178,12 +178,13 @@ fn decoded_audio_samples(path: &Path, stream_index: usize) -> usize {
         .args(["-t", "3", "-ac", "1", "-ar", "48000", "-f", "f32le", "-"])
         .output()
         .expect("decode AAC PCM");
-    assert!(
-        output.status.success(),
-        "AAC stream {stream_index} failed decode: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    output.stdout.len() / 4
+    if !output.status.success() {
+        return Err(format!(
+            "AAC stream {stream_index} decode failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        ));
+    }
+    Ok(output.stdout.len() / 4)
 }
 fn probe_audio_count(path: &Path) -> usize {
     let output = Command::new("ffprobe")
@@ -282,6 +283,7 @@ async fn mixed_codec_pipeline_receives_decodable_media_not_just_headers() {
     config.validate().unwrap();
     let mut pipeline = Pipeline::build(&config)
         .expect("three bindings must build without first-codec substitution");
+    pipeline.enable_program_audio();
     let hevc_path = dir.path().join("hevc.ts");
     let avc_path = dir.path().join("avc.ts");
     let receive = |path: std::path::PathBuf, port: u16| {
@@ -331,11 +333,12 @@ async fn mixed_codec_pipeline_receives_decodable_media_not_just_headers() {
             faults.push(format!("{label}: {count} AAC tracks != 5"));
         }
         for index in 0..count.min(5) {
-            let samples = decoded_audio_samples(path, index);
-            if samples < 48_000 {
-                faults.push(format!(
+            match decoded_audio_samples(path, index) {
+                Ok(samples) if samples >= 48_000 => {}
+                Ok(samples) => faults.push(format!(
                     "{label}: AAC track {index} only {samples} decoded PCM samples"
-                ));
+                )),
+                Err(error) => faults.push(format!("{label}: {error}")),
             }
         }
     }
