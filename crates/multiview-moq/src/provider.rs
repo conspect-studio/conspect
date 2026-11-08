@@ -7,7 +7,7 @@ use std::{
     collections::HashMap,
     sync::{
         Arc, Mutex,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     time::Duration,
 };
@@ -25,7 +25,31 @@ pub struct Feed {
 
 /// Per-subscription synchronous producer fence. `try_offer` and `revoke` share
 /// the same small critical section; no transport operation runs under it.
+static RETAINED_BYTES: AtomicUsize = AtomicUsize::new(0);
+const GLOBAL_BYTES: usize = 64 * 1024 * 1024;
+const SUBSCRIPTION_BYTES: usize = 8 * 1024 * 1024;
+
+// Bytes::from_owner carries the charge through every library clone/slice and
+// refunds only when the final retained payload reference actually drops.
+struct ChargedPayload {
+    payload: bytes::Bytes,
+    charge: usize,
+    subscription: Arc<AtomicUsize>,
+}
+impl AsRef<[u8]> for ChargedPayload {
+    fn as_ref(&self) -> &[u8] {
+        &self.payload
+    }
+}
+impl Drop for ChargedPayload {
+    fn drop(&mut self) {
+        self.subscription.fetch_sub(self.charge, Ordering::AcqRel);
+        RETAINED_BYTES.fetch_sub(self.charge, Ordering::AcqRel);
+    }
+}
+
 pub struct Fence {
+    charged: Arc<AtomicUsize>,
     sender: Mutex<Option<mpsc::Sender<AvWindow>>>,
     cancel: watch::Sender<bool>,
 }
@@ -35,6 +59,7 @@ impl Fence {
         let (cancel, _) = watch::channel(false);
         (
             Arc::new(Self {
+                charged: Arc::new(AtomicUsize::new(0)),
                 sender: Mutex::new(Some(sender)),
                 cancel,
             }),
@@ -42,7 +67,7 @@ impl Fence {
         )
     }
     /// The authorized feed owner must use this instead of retaining a raw sender.
-    pub fn try_offer(&self, window: AvWindow) -> Result<(), AvWindow> {
+    pub fn try_offer(&self, mut window: AvWindow) -> Result<(), AvWindow> {
         if *self.cancel.borrow() {
             return Err(window);
         }
@@ -58,16 +83,45 @@ impl Fence {
         for packet in packets {
             count += 1;
             let Some(total) = bytes.checked_add(packet.payload.len()) else {
+                self.cancel.send_replace(true);
                 return Err(window);
             };
             bytes = total;
             if bytes > VideoAdapter::MAX_BYTES || count > 512 {
+                self.cancel.send_replace(true);
                 return Err(window);
             }
         }
         let Ok(sender) = self.sender.try_lock() else {
+            self.cancel.send_replace(true);
             return Err(window);
         };
+        // Reserve before retention. The owner wrapper follows every Bytes clone
+        // into queue, publisher cache, and transport; final drop refunds credit.
+        if self.charged.load(Ordering::Acquire).saturating_add(bytes) > SUBSCRIPTION_BYTES
+            || RETAINED_BYTES
+                .try_update(Ordering::AcqRel, Ordering::Acquire, |used| {
+                    used.checked_add(bytes).filter(|sum| *sum <= GLOBAL_BYTES)
+                })
+                .is_err()
+        {
+            self.cancel.send_replace(true);
+            return Err(window);
+        }
+        self.charged.fetch_add(bytes, Ordering::AcqRel);
+        for packet in window
+            .video
+            .packets
+            .iter_mut()
+            .chain(window.audio.values_mut().flatten())
+        {
+            let payload = std::mem::take(&mut packet.payload);
+            packet.payload = bytes::Bytes::from_owner(ChargedPayload {
+                charge: payload.len(),
+                payload,
+                subscription: self.charged.clone(),
+            });
+        }
         match sender.as_ref() {
             Some(sender) => sender.try_send(window).map_err(|e| {
                 self.cancel.send_replace(true);
@@ -115,6 +169,21 @@ impl Drop for Runtime {
 }
 
 impl Runtime {
+    pub async fn listen_files(
+        bind: std::net::SocketAddr,
+        endpoint: String,
+        protocol: &str,
+        cert: std::path::PathBuf,
+        key: std::path::PathBuf,
+    ) -> anyhow::Result<Arc<Self>> {
+        anyhow::ensure!(bind.is_ipv6(), "IPv6-first listener required");
+        let mut config = moq_tokio::listen::Config::default();
+        config.bind = Some(moq_tokio::listen::Bind::Addr(bind));
+        config.version = vec![protocol.parse().map_err(anyhow::Error::msg)?];
+        config.tls.cert = vec![cert];
+        config.tls.key = vec![key];
+        Self::listen(config, endpoint, protocol).await
+    }
     pub async fn listen(
         config: moq_tokio::listen::Config,
         base_url: String,
@@ -161,7 +230,7 @@ impl Runtime {
                             Some((entry.origin.clone(), entry.fence.clone()))
                         });
                         let Some((origin, fence)) = admitted else { let _ = request.reject(moq_tokio::server::Reject::Unauthorized).await; continue };
-                        if sessions.len() >= 128 { fence.revoke(); let _ = request.reject(moq_tokio::server::Reject::App(429)).await; continue }
+                        if sessions.len() >= 16 { fence.revoke(); let _ = request.reject(moq_tokio::server::Reject::App(429)).await; continue }
                         sessions.spawn(async move {
                             let mut cancel = fence.cancel.subscribe();
                             let accepted = tokio::select! {
@@ -170,6 +239,8 @@ impl Runtime {
                             };
                             if let Some(session) = accepted {
                                 tokio::select! { _ = session.closed() => {}, _ = cancel.wait_for(|value| *value) => {} }
+                                session.abort(moq_net::Error::Cancel);
+                                let _ = tokio::time::timeout(Duration::from_secs(1), session.closed()).await;
                                 drop(session);
                             }
                             fence.revoke();
@@ -238,7 +309,7 @@ impl Runtime {
                 .entries
                 .lock()
                 .map_err(|_| anyhow::anyhow!("registry poisoned"))?;
-            anyhow::ensure!(entries.len() < 128, "capacity");
+            anyhow::ensure!(entries.len() < 16, "capacity");
             entries.insert(
                 token.clone(),
                 Entry {
@@ -320,6 +391,30 @@ mod tests {
         .unwrap();
         assert!(state.entries.lock().unwrap().is_empty());
         assert!(*fence.cancel.borrow());
+    }
+    #[test]
+    fn retained_payload_credit_survives_queue_and_inflight_clones() {
+        let (fence, mut rx) = Fence::channel(1);
+        let window = AvWindow {
+            video: crate::Window {
+                generation: 1,
+                packets: vec![crate::Packet {
+                    payload: bytes::Bytes::from_static(&[1, 2, 3]),
+                    pts_us: 0,
+                    verified_rap: true,
+                }],
+            },
+            audio: Default::default(),
+        };
+        assert!(fence.try_offer(window).is_ok());
+        assert_eq!(fence.charged.load(Ordering::Acquire), 3);
+        let received = rx.try_recv().unwrap();
+        let retained = received.video.packets[0].payload.clone();
+        drop(received);
+        fence.revoke();
+        assert_eq!(fence.charged.load(Ordering::Acquire), 3);
+        drop(retained);
+        assert_eq!(fence.charged.load(Ordering::Acquire), 0);
     }
     #[test]
     fn fence_rejects_after_revoke_and_bounds_queue() {
