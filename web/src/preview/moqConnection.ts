@@ -19,7 +19,10 @@ export function ownMoqSession(
   let ended = false;
   let succeeded = false;
   let inFlight: Promise<void> | undefined;
-  const confirmed = session.closed.then(() => { ended = true; });
+  const confirmed = session.closed.then(
+    () => { ended = true; },
+    () => { ended = true; }, // A rejected closed promise also confirms termination.
+  );
   const attempt = (): Promise<void> => {
     if (succeeded) return Promise.resolve();
     if (inFlight) return inFlight;
@@ -44,7 +47,13 @@ export function ownMoqSession(
   const close = (): Promise<void> => {
     if (!closing && !ended) {
       closing = true;
-      session.close();
+      try {
+        session.close();
+      } catch {
+        // A close request can fail synchronously. Only the independently
+        // settled closed promise confirms termination; otherwise time out.
+        closing = false;
+      }
     }
     return attempt();
   };

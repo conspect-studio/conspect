@@ -4,6 +4,25 @@ import { connectMoq, ownMoqSession } from './moqConnection';
 afterEach(() => vi.unstubAllGlobals());
 
 describe('established session ownership', () => {
+  it('releases after rejected termination confirmation', async () => {
+    const release = vi.fn(() => Promise.resolve());
+    const owned = ownMoqSession({ close: vi.fn(), closed: Promise.reject(new Error('remote reset')) }, new AbortController().signal, release);
+    await owned.released;
+    await owned.close();
+    expect(release).toHaveBeenCalledOnce();
+  });
+
+  it('does not throw from pre-aborted ownership when close throws', async () => {
+    let finish!: () => void;
+    const closed = new Promise<null>((resolve) => { finish = () => { resolve(null); }; });
+    const release = vi.fn(() => Promise.resolve());
+    const owned = ownMoqSession({ close: () => { throw new Error('close boom'); }, closed }, AbortSignal.abort(), release);
+    expect(release).not.toHaveBeenCalled();
+    finish();
+    await owned.released;
+    expect(release).toHaveBeenCalledOnce();
+  });
+
   it('waits for transport closure before releasing the lease exactly once', async () => {
     const events: string[] = [];
     let finish!: () => void;

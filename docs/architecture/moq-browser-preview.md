@@ -30,6 +30,8 @@ Expose requested transport policy separately from effective transport (`moq-webt
 
 The output redesign will finalize concrete Rust types. Preserve public `program`/`input`/`output` scopes: input acquires a source-demand lease, program retains the legacy main-program mapping, and output resolves its effective mux binding to the actual rendition/bus, never a global-program assumption or pending desired configuration. Carry bus identity internally; a public bus scope waits for switcher runtime support. Authorize both the requested public object and its resolved dependencies without disclosing unauthorized identifiers.
 
+The shipping owners agreed the following ownership split (concrete runtime types remain pending): the binding registry keyed by `(program, bus, output, generation)` owns the stop-enqueue revocation fence and source-demand release; the batch queue owns in-flight leases and reserved count/bytes until actual drop; the MoQ adapter owns QUIC shutdown and bounded quarantine. Every peer additionally has a distinct subscription ID: revoking one viewer must not invalidate the shared rendition or another viewer on the same output.
+
 The transport contract requires:
 
 - An admitted, principal-authorized scope and an immutable binding identity plus generation.
@@ -58,9 +60,21 @@ Research identified a transitive LGPL-2.1 libav.js audio polyfill in the watch s
 
 Use interoperable MoQ, not a proprietary WebTransport byte stream labelled MoQ.
 
-Authorize every program/input/output identifier at lease creation and bind the transport credential to that lease and scope. Browser transport credentials must be short-lived; never put a long-lived control bearer in a URL or log. Admission and subscriber limits also apply to the QUIC endpoint. Configure trusted TLS and IPv6-first binding; an HTTP reverse proxy does not implicitly provide a QUIC/WebTransport endpoint.
+Authorize every program/input/output identifier at lease creation and bind the transport credential to that lease and scope. Every server lease has a finite maximum lifetime, enforced by a server-side monotonic expiry task independently of browser callbacks and transport promises. Renewal requires current authorization and admission; a disconnected or stalled browser cannot retain source demand indefinitely. A revoke endpoint must acknowledge the revoked generation idempotently. Report a client close deadline as a retryable teardown failure, not as successful release or an indefinitely pending UI state. Browser transport credentials must be short-lived; never put a long-lived control bearer in a URL or log. Admission and subscriber limits also apply to the QUIC endpoint. Configure trusted TLS and IPv6-first binding; an HTTP reverse proxy does not implicitly provide a QUIC/WebTransport endpoint.
 
 Do not advertise MoQ merely because the binary includes its crate. Advertise it only when the configured listener, protocol adapter, and authorized rendition provider are available.
+
+## Cloudflare relay management (required scope)
+
+The user requires full Cloudflare MoQ relay management, not merely a manually supplied relay URL: automatic and manual provisioning, discovery/import of existing relays, configuration, credential rotation, teardown, health/status monitoring, error reporting and recovery. Distinguish application-owned resources from imported resources before destructive operations. Preserve an audit trail without credential material.
+
+Accept either a user-supplied scoped API token or Global API Key (with its required account email). Store credentials server-side under the product secret-storage policy; never return keys to the browser or logs. When a global key is supplied, offer creation of a least-privilege scoped token if the user has fewer than 50 existing scoped tokens. Count all pages, handle unavailable permission/count information explicitly, and recheck quota/conflict errors at creation. Offer, do not silently create. Do not delete unrelated tokens to make room. A supplied scoped token remains a supported path. The operator's 1Password credential reference is operational input, not shipped product configuration.
+
+Cloudflare's [current service documentation](https://developers.cloudflare.com/moq/) lists deployed draft-14 and authenticated draft-16, with draft-18 testing through the [interop runner](https://github.com/englishm/moq-interop-runner). The runner registry also lists experimental Cloudflare draft-18/22. Target authenticated draft-16 and draft-18 compatibility with explicit version/endpoint selection and negotiated-version diagnostics. Do not call draft-18 the latest IETF draft or experimental endpoints production-ready. Confirm current endpoint capabilities when implementation starts; pin the interop runner revision and implementation versions in test evidence. Legacy unauthenticated draft-14 must not become a silent downgrade.
+
+Cloudflare relay credentials are distinct from account-management API credentials. Its draft-16 relay token travels in the URL path, so redact the entire credential-bearing path, not only query parameters. Keep publisher and subscriber permissions separate, use finite expiry, and support revocation/rotation. Relay creation returns token secrets only once: securely persist or recover from partial provisioning without leaking secrets or creating orphan relays.
+
+Protocol interop runner tests are necessary but insufficient: its current CLI/container tests explicitly exclude browser-only implementations. Require a separate actual browser WebTransport media decode test through the Cloudflare relay, plus authorization, revocation, fallback and isolation tests.
 
 ## Delivery and verification plan
 
