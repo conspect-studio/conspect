@@ -54,6 +54,10 @@ The canonical Rust Cloudflare request and generated TypeScript both include `mod
 4. Connected-session cutoff, cached/in-flight media bounds, quarantine, and per-peer source-demand release need end-to-end proof with the production binding owner.
 5. Cloudflare independent review identified response/pagination and automatic-recovery concerns. Owner fixes and live evidence must be reviewed separately; central route compilation does not close those findings.
 
+## Later shipping-owner confirmation
+
+Captain relayed that the production factory is not ready and has no ETA. Reported output checkpoint `1bcaaabb` has 27 tests, but production consumer/`StreamEgress` wiring remains pending. Reported dispatcher checkpoint `41410ab9` has six behavior tests and a copy defect under repair. These are owner-reported references, not locally verified integration results. They do not satisfy the factory or production media acceptance criteria above. Preserve typed unavailable; continue standalone Cloudflare management gates without a fake feed.
+
 ## Proposed PR summary
 
 Introduce authenticated finite MoQ control leases, generated browser/relay APIs, safe unavailable defaults, optional trusted transport startup, and secure Cloudflare management service wiring. Preserve the production output path and keep MoQ disabled without an authorized real factory.
