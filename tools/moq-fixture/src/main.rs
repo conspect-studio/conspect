@@ -1,4 +1,4 @@
-//! Development-only, shared pre-encoded VP8 publisher. No runtime encoder.
+//! Development-only, shared pre-encoded VP8/H264 publisher. No runtime encoder.
 use anyhow::ensure;
 use bytes::Bytes;
 use std::time::Duration;
@@ -33,6 +33,34 @@ fn frames(data: &[u8]) -> anyhow::Result<Vec<Bytes>> {
     Ok(result)
 }
 
+fn h264_frames(data: &[u8]) -> anyhow::Result<Vec<Bytes>> {
+    ensure!(data.starts_with(b"H264"), "expected H264 packet fixture");
+    let mut offset = 4;
+    let mut frames = Vec::new();
+    while offset < data.len() {
+        ensure!(offset + 4 <= data.len(), "truncated H264 length");
+        let len = u32::from_le_bytes(data[offset..offset + 4].try_into()?) as usize;
+        offset += 4;
+        ensure!(
+            len > 0 && len <= 1024 * 1024 && offset + len <= data.len(),
+            "invalid H264 length"
+        );
+        let packet = &data[offset..offset + len];
+        for nal in [7u8, 8, 5] {
+            ensure!(
+                packet
+                    .windows(4)
+                    .any(|w| w[..3] == [0, 0, 1] && w[3] & 31 == nal),
+                "all-IDR fixture requires SPS/PPS/IDR in each access unit"
+            );
+        }
+        frames.push(Bytes::copy_from_slice(packet));
+        offset += len;
+    }
+    ensure!(!frames.is_empty(), "empty H264 fixture");
+    Ok(frames)
+}
+
 #[tokio::main(worker_threads = 2)]
 async fn main() -> anyhow::Result<()> {
     let args: Vec<_> = std::env::args().collect();
@@ -51,7 +79,12 @@ async fn main() -> anyhow::Result<()> {
         .take(16 * 1024 * 1024 + 1)
         .read_to_end(&mut data)?;
     ensure!(data.len() <= 16 * 1024 * 1024, "fixture exceeds 16MiB");
-    let frames = frames(&data)?;
+    let h264 = data.starts_with(b"H264");
+    let frames = if h264 {
+        h264_frames(&data)?
+    } else {
+        frames(&data)?
+    };
     let mut audio_packets = Vec::new();
     if let Some(path) = args.get(5) {
         let bytes = std::fs::read(path)?;
@@ -90,11 +123,10 @@ async fn main() -> anyhow::Result<()> {
     } else {
         av_json
     };
-    let _: hang::catalog::Catalog = hang::catalog::Catalog::from_slice(json)?;
-    catalog.write_frame(
-        moq_net::Timestamp::from_millis(0)?,
-        Bytes::from_static(json),
-    )?;
+    let json =
+        String::from_utf8(json.to_vec())?.replace("vp8", if h264 { "avc1.42c01e" } else { "vp8" });
+    let _: hang::catalog::Catalog = hang::catalog::Catalog::from_slice(json.as_bytes())?;
+    catalog.write_frame(moq_net::Timestamp::from_millis(0)?, Bytes::from(json))?;
     let video = broadcast.create_track(
         "video",
         hang::container::track_info(hang::catalog::PRIORITY.video)
@@ -120,7 +152,7 @@ async fn main() -> anyhow::Result<()> {
         for index in 0u64.. {
             tick.tick().await;
             let payload = frames[index as usize % frames.len()].clone();
-            let verified_rap = payload[0] & 1 == 0;
+            let verified_rap = h264 || payload[0] & 1 == 0;
             let mut audio = std::collections::BTreeMap::new();
             if !audio_packets.is_empty() {
                 let mut packets = Vec::new();
@@ -201,6 +233,18 @@ mod tests {
         truncated.pop();
         assert!(frames(&truncated).is_err());
         assert!(frames(&ivf(&[])).is_err());
+    }
+    #[test]
+    fn h264_requires_complete_independent_access_units() {
+        assert!(h264_frames(b"H264").is_err());
+        assert!(h264_frames(b"H264\x01").is_err());
+        let payload = [0, 0, 1, 0x67, 0, 0, 1, 0x68, 0, 0, 1, 0x65];
+        let mut bytes = b"H264".to_vec();
+        bytes.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+        bytes.extend_from_slice(&payload);
+        assert_eq!(h264_frames(&bytes).unwrap().len(), 1);
+        bytes.pop();
+        assert!(h264_frames(&bytes).is_err());
     }
     #[test]
     fn exact_drafts_parse_without_downgrade() {
