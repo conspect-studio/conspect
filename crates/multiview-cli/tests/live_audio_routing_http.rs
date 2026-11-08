@@ -123,6 +123,14 @@ async fn put_routing(
     let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
     let caps = multiview_control::LiveApplyCaps::default()
         .with_audio_routing(routing_live_capability(slot));
+    // `nvidia` enables GPU capability discovery in bind_and_serve. Each test
+    // creates its own server, and concurrent wgpu adapter probes can stall the
+    // host GPU driver. Serialize only server startup, not HTTP requests or the
+    // audio bus: the independent routing tests still run concurrently.
+    #[cfg(feature = "gpu")]
+    static GPU_PROBE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+    #[cfg(feature = "gpu")]
+    let gpu_probe = GPU_PROBE.lock().await;
     let (addr, server, _state) = control::bind_and_serve(
         "[::1]:0",
         &cfg,
@@ -144,6 +152,8 @@ async fn put_routing(
     )
     .await
     .expect("control server binds");
+    #[cfg(feature = "gpu")]
+    drop(gpu_probe);
     let body = serde_json::to_string(body).unwrap();
     let req = format!(
         "PUT /api/v1/audio-routing HTTP/1.0\r\nHost: {addr}\r\nAuthorization: Bearer admin.test-secret\r\nIf-Match: W/\"1\"\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
