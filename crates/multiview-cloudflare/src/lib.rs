@@ -491,6 +491,18 @@ mod tests {
         assert!(!text.contains("config"));
     }
     #[tokio::test]
+    async fn relay_list_rejects_invalid_counts_and_boundary_ties() {
+        for body in [
+            r#"{"success":true,"result":[],"result_info":{"count":1,"total":1}}"#,
+            r#"{"success":true,"result":[{"uid":"a","name":"a","created":"2026-11-08T10:00:00Z"},{"uid":"b","name":"b","created":"2026-11-08T10:00:00Z"}],"result_info":{"count":2,"total":3}}"#,
+        ] {
+            assert_eq!(
+                client(origin_server(body)).await.list().await.unwrap_err(),
+                Error::Response
+            );
+        }
+    }
+    #[tokio::test]
     async fn relay_list_walks_two_abbreviated_pages() {
         use std::io::{Read, Write};
         let listener = std::net::TcpListener::bind("[::1]:0").unwrap();
