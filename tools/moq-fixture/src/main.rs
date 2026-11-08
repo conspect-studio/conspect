@@ -37,8 +37,8 @@ fn frames(data: &[u8]) -> anyhow::Result<Vec<Bytes>> {
 async fn main() -> anyhow::Result<()> {
     let args: Vec<_> = std::env::args().collect();
     ensure!(
-        args.len() == 5,
-        "usage: conspect-moq-fixture <16|18> <fixture.ivf> <cert.pem> <key.pem>"
+        args.len() == 5 || args.len() == 6,
+        "usage: conspect-moq-fixture <16|18> <fixture.ivf> <cert.pem> <key.pem> [audio.packets]"
     );
     let protocol = match args[1].as_str() {
         "16" => "moq-transport-16",
@@ -52,6 +52,24 @@ async fn main() -> anyhow::Result<()> {
         .read_to_end(&mut data)?;
     ensure!(data.len() <= 16 * 1024 * 1024, "fixture exceeds 16MiB");
     let frames = frames(&data)?;
+    let mut audio_packets = Vec::new();
+    if let Some(path) = args.get(5) {
+        let bytes = std::fs::read(path)?;
+        ensure!(bytes.len() <= 1024 * 1024, "audio fixture too large");
+        let mut offset = 0;
+        while offset < bytes.len() {
+            ensure!(offset + 4 <= bytes.len(), "audio header truncated");
+            let len = u32::from_le_bytes(bytes[offset..offset + 4].try_into()?) as usize;
+            offset += 4;
+            ensure!(
+                len > 0 && len <= 65536 && offset + len <= bytes.len(),
+                "audio packet invalid"
+            );
+            audio_packets.push(Bytes::copy_from_slice(&bytes[offset..offset + len]));
+            offset += len;
+        }
+        ensure!(!audio_packets.is_empty(), "audio fixture empty");
+    }
     let mut config = moq_tokio::listen::Config::default();
     config.bind = Some("[::]:4443".parse()?);
     config.version = vec![protocol.parse().map_err(anyhow::Error::msg)?];
@@ -65,7 +83,13 @@ async fn main() -> anyhow::Result<()> {
         "catalog.json",
         hang::catalog::Catalog::<()>::default_track_info(),
     )?;
-    let json = br#"{"video":{"renditions":{"video":{"codec":"vp8","codedWidth":320,"codedHeight":180,"framerate":30}}},"audio":{"renditions":{}}}"#;
+    let video_json = br#"{"video":{"renditions":{"video":{"codec":"vp8","codedWidth":320,"codedHeight":180,"framerate":30}}},"audio":{"renditions":{}}}"#;
+    let av_json = br#"{"video":{"renditions":{"video":{"codec":"vp8","codedWidth":320,"codedHeight":180,"framerate":30}}},"audio":{"renditions":{"audio":{"codec":"opus","sampleRate":48000,"numberOfChannels":2}}}}"#;
+    let json: &[u8] = if audio_packets.is_empty() {
+        video_json
+    } else {
+        av_json
+    };
     let _: hang::catalog::Catalog = hang::catalog::Catalog::from_slice(json)?;
     catalog.write_frame(
         moq_net::Timestamp::from_millis(0)?,
@@ -76,23 +100,51 @@ async fn main() -> anyhow::Result<()> {
         hang::container::track_info(hang::catalog::PRIORITY.video)
             .with_max_age(Duration::from_secs(2)),
     )?;
+    let mut audio_tracks = std::collections::BTreeMap::new();
+    if !audio_packets.is_empty() {
+        audio_tracks.insert(
+            "audio".to_string(),
+            broadcast.create_track(
+                "audio",
+                hang::container::track_info(hang::catalog::PRIORITY.audio),
+            )?,
+        );
+    }
     let producer = tokio::spawn(async move {
         let mut tick = tokio::time::interval(Duration::from_nanos(1_000_000_000 / 30));
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        use conspect_moq_fixture::{Packet, VideoAdapter, Window};
-        let mut adapter = VideoAdapter::new(video, 1);
+        use multiview_moq::{Packet, VideoAdapter, Window};
+        let mut adapter =
+            multiview_moq::av::AvAdapter::new(VideoAdapter::new(video, 1), audio_tracks);
+        let mut audio_index = 0u64;
         for index in 0u64.. {
             tick.tick().await;
             let payload = frames[index as usize % frames.len()].clone();
             let verified_rap = payload[0] & 1 == 0;
+            let mut audio = std::collections::BTreeMap::new();
+            if !audio_packets.is_empty() {
+                let mut packets = Vec::new();
+                while audio_index * 20000 < (index + 1) * 1_000_000 / 30 {
+                    packets.push(Packet {
+                        payload: audio_packets[audio_index as usize % audio_packets.len()].clone(),
+                        pts_us: audio_index * 20000,
+                        verified_rap: true,
+                    });
+                    audio_index += 1;
+                }
+                audio.insert("audio".to_string(), packets);
+            }
             adapter
-                .publish(&Window {
-                    generation: 1,
-                    packets: vec![Packet {
-                        payload,
-                        pts_us: index * 1_000_000 / 30,
-                        verified_rap,
-                    }],
+                .publish(&multiview_moq::av::AvWindow {
+                    audio,
+                    video: Window {
+                        generation: 1,
+                        packets: vec![Packet {
+                            payload,
+                            pts_us: index * 1_000_000 / 30,
+                            verified_rap,
+                        }],
+                    },
                 })
                 .map_err(|error| anyhow::anyhow!("publication failed: {error:?}"))?;
         }
