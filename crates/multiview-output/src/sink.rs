@@ -1859,6 +1859,8 @@ struct SegmentState<'a> {
     recovery_failures: u8,
     /// A close/playlist publication failure must reach the caller, not hide.
     publication_failed: bool,
+    #[cfg(test)]
+    fail_playlist_publish_once: Option<()>,
     stats: EncodeStats,
     /// The optional rolling **live** playlist driver (HLS-0/1, ADR-0032). `None`
     /// is the historical **batch** behaviour: segments mux in place and the
@@ -1966,6 +1968,8 @@ impl<'a> SegmentState<'a> {
             fail_packet_write_once: false,
             recovery_failures: 0,
             publication_failed: false,
+            #[cfg(test)]
+            fail_playlist_publish_once: None,
             stats: EncodeStats::default(),
             live: None,
             seg_index: 0,
@@ -2355,7 +2359,14 @@ impl<'a> SegmentState<'a> {
         while let Some(packet) = source.next_packet()? {
             // A damaged muxer cannot be reused. Drain the source until a fresh
             // decoder-ready video access point; never publish its partial TS.
-            if self.recovering && !(packet.kind() == StreamKind::Video && packet.is_keyframe()) {
+            if self.recovering
+                && !(packet.kind() == StreamKind::Video
+                    && packet.is_keyframe()
+                    && match self.seed {
+                        StreamSeed::Params(params) => params.is_decoder_ready_rap(&packet),
+                        StreamSeed::Encoder(_) => false,
+                    })
+            {
                 continue;
             }
             let pts = pts_from_packet(packet.pts(), self.stats.packets, self.time_base);
@@ -2648,6 +2659,12 @@ impl<'a> SegmentState<'a> {
             segment.muxer.flush().map_err(ff)?;
         }
         let segment = &*segment;
+        #[cfg(test)]
+        if self.fail_playlist_publish_once.take().is_some() {
+            return Err(Error::Output(
+                "injected playlist publication failure".to_owned(),
+            ));
+        }
         if let Some(live) = self.live.as_mut() {
             if segment.write_path != segment.path {
                 std::fs::rename(&segment.write_path, &segment.path).map_err(|e| {
@@ -3060,6 +3077,55 @@ mod tests {
         assert!(!playlist.contains("seg0.ts"));
         assert!(playlist.contains("#EXT-X-DISCONTINUITY\n"));
         assert!(playlist.contains("seg1.ts"));
+    }
+
+    #[test]
+    fn playlist_publication_fault_is_terminal_and_keeps_prior_manifest() {
+        use super::{SegmentState, StreamSeed};
+        use crate::hls::LivePlaylist;
+        use ffmpeg::codec::packet::{Flags, Packet};
+        use multiview_ffmpeg::{EncodedPacket, StreamCodecParameters, VideoEncoder};
+        let dir = tempfile::tempdir().unwrap();
+        let encoder = VideoEncoder::new(&EncodeConfig::mpeg2(WIDTH, HEIGHT).target()).unwrap();
+        let params = StreamCodecParameters::from_encoder(&encoder);
+        let mut state = SegmentState::new(
+            StreamSeed::Params(&params),
+            encoder.time_base(),
+            None,
+            dir.path(),
+            "seg",
+        );
+        state.live = Some(LivePlaylist::new(dir.path().join("index.m3u8"), 3));
+        let make_packet = |pts| {
+            let mut packet = Packet::copy(&[0, 0, 1, 0, 0, 8, 0, 0]);
+            packet.set_flags(Flags::KEY);
+            packet.set_pts(Some(pts));
+            packet.set_dts(Some(pts));
+            EncodedPacket::from_packet(packet)
+        };
+        state
+            .write_source_packet(make_packet(0), multiview_core::time::MediaTime::ZERO)
+            .unwrap();
+        state
+            .write_source_packet(
+                make_packet(1),
+                multiview_core::time::MediaTime::from_nanos(33_333_333),
+            )
+            .unwrap();
+        let previous = std::fs::read_to_string(dir.path().join("index.m3u8")).unwrap();
+        assert!(previous.contains("seg0.ts"));
+        state.fail_playlist_publish_once = Some(());
+        let failure = state.start_segment(multiview_core::time::MediaTime::from_nanos(66_666_666));
+        assert!(failure.is_err());
+        assert!(state.publication_failed);
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("index.m3u8")).unwrap(),
+            previous
+        );
+        assert!(!previous.contains("seg1.ts"));
+        state.abandon_incomplete_segments();
+        assert!(dir.path().join("seg0.ts").exists());
+        assert!(!dir.path().join("seg1.ts.tmp").exists());
     }
 
     #[test]
