@@ -2707,6 +2707,14 @@ impl Pipeline {
         let mut rendition_configs = Vec::<EncodeConfig>::new();
         let mut output_video_keys = Vec::with_capacity(outputs.len());
         let mut output_audio_tracks = Vec::with_capacity(outputs.len());
+        // Truthful binding (#202/#203 follow-up): the program audio track only
+        // exists when the run actually carries program audio (`[audio]` on). A
+        // video-only run MUST NOT declare audio track 0 — the dispatcher
+        // validates every declared track against the opened audio streams, so a
+        // phantom program track fails the whole bake consumer at startup
+        // (InvalidConfig: dead outputs). The output's default selection means
+        // "program audio if present", not "require program audio".
+        let program_audio_on = config.audio.is_some();
         for output in &outputs {
             let requested = config
                 .outputs
@@ -2742,7 +2750,7 @@ impl Pipeline {
             };
             let tracks = audio_selection.map_or_else(Vec::new, |selection| {
                 let mut indexes = Vec::with_capacity(selection.tracks.len() + 1);
-                if selection.program {
+                if selection.program && program_audio_on {
                     indexes.push(0);
                 }
                 indexes.extend(
