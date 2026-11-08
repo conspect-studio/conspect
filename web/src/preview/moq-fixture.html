@@ -4,11 +4,11 @@ import { Player } from '@moq/watch';
 import { connectMoq } from './moqConnection.ts';
 const query = new URLSearchParams(location.search);
 const origin = new Origin.Producer();
-window.fixture = { frames: 0, timestamps: [], audioFrames: 0, audioTimestamps: [], version: null, error: null };
+window.fixture = { frames: 0, timestamps: [], audioFrames: 0, audioTimestamps: [], videoWallMs: [], audioWallMs: [], version: null, error: null };
 if (query.has('audio')) {
  const Native = globalThis.AudioDecoder;
  globalThis.AudioDecoder = class extends Native {
-  constructor(init) { super({...init, output(frame) {window.fixture.audioFrames++; window.fixture.audioTimestamps.push(frame.timestamp); init.output(frame);}}); }
+  constructor(init) { super({...init, output(frame) {window.fixture.audioFrames++; window.fixture.audioTimestamps.push(frame.timestamp); window.fixture.audioWallMs.push(performance.now()); init.output(frame);}}); }
  };
 }
 // Test-only page: explicit certificate hash; production player never accepts this parameter.
@@ -21,7 +21,7 @@ const player = new Player({origin, name: Path.from('fixture'), canvas: document.
 window.fixture.close = () => {player.close(); session.close(); origin.close();};
 const original = CanvasRenderingContext2D.prototype.drawImage;
 CanvasRenderingContext2D.prototype.drawImage = function(image, ...args) {
- if (image instanceof VideoFrame) {window.fixture.frames++; window.fixture.timestamps.push(image.timestamp);}
+ if (image instanceof VideoFrame) {window.fixture.frames++; window.fixture.timestamps.push(image.timestamp); window.fixture.videoWallMs.push(performance.now());}
  return original.call(this, image, ...args);
 };
 } catch (error) {window.fixture.error = String(error);}
