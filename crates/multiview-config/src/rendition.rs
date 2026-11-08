@@ -826,7 +826,10 @@ impl Fnv {
     }
 
     /// Mix one byte into the hash.
-    const fn write_byte(&mut self, byte: u8) {
+    ///
+    /// Not `const`: `u64::from(u8)` is not yet stable in a `const fn`, and the
+    /// workspace denies `as_conversions` (R3 config module — no lint bypass).
+    fn write_byte(&mut self, byte: u8) {
         self.0 ^= u64::from(byte);
         self.0 = self.0.wrapping_mul(Self::PRIME);
     }
