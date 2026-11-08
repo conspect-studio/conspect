@@ -368,7 +368,7 @@ msgstr ""
 msgid "A salvo is a named, atomically-applied recall. One salvo can switch the layout, rebind sources into cells, set tally colors, and update under-monitor display text — all at once — so an operator can move a whole arrangement (say, a VTR review setup) with a single action instead of a series of separate edits."
 msgstr ""
 
-#: src/pages/RelayManagementPage.tsx:57
+#: src/pages/RelayManagementPage.tsx:58
 msgid "A scoped token is optional. Creation requires a complete inventory below 50 tokens and explicit consent. Permissions apply only to the selected account."
 msgstr ""
 
@@ -536,7 +536,7 @@ msgstr ""
 msgid "Account audit log, oldest first within the page."
 msgstr ""
 
-#: src/pages/RelayManagementPage.tsx:46
+#: src/pages/RelayManagementPage.tsx:47
 msgid "Account ID"
 msgstr ""
 
@@ -902,7 +902,7 @@ msgstr ""
 msgid "API key"
 msgstr ""
 
-#: src/pages/RelayManagementPage.tsx:51
+#: src/pages/RelayManagementPage.tsx:52
 msgid "API secret"
 msgstr ""
 
@@ -953,6 +953,10 @@ msgstr ""
 #: src/pages/DeviceDetailPage.tsx:972
 #: src/pages/DeviceDetailPage.tsx:985
 msgid "Apply mode"
+msgstr ""
+
+#: src/pages/RelayConfigurationControls.tsx:31
+msgid "Apply requested configuration"
 msgstr ""
 
 #: src/layout/components/GridLayoutEditor.tsx:567
@@ -1082,8 +1086,8 @@ msgstr ""
 msgid "Auto (first usable track)"
 msgstr ""
 
-#: src/pages/RelayManagementPage.tsx:65
-#: src/pages/RelayManagementPage.tsx:77
+#: src/pages/RelayManagementPage.tsx:66
+#: src/pages/RelayManagementPage.tsx:78
 msgid "Automatic"
 msgstr ""
 
@@ -1095,7 +1099,7 @@ msgstr ""
 msgid "Automatic (EDID preferred mode)"
 msgstr ""
 
-#: src/pages/RelayManagementPage.tsx:62
+#: src/pages/RelayManagementPage.tsx:63
 msgid "Automatic reconciliation is unavailable. Relay creation and deletion require explicit actions."
 msgstr ""
 
@@ -1325,7 +1329,7 @@ msgstr ""
 #: src/pages/DeviceDetailPage.tsx:1210
 #: src/pages/LayoutsPage.tsx:319
 #: src/pages/MediaPlayersPage.tsx:493
-#: src/pages/RelayManagementPage.tsx:78
+#: src/pages/RelayManagementPage.tsx:80
 #: src/pages/SalvosPage.tsx:281
 #: src/pages/SalvosPage.tsx:395
 #: src/pages/SalvosPage.tsx:433
@@ -1342,6 +1346,10 @@ msgstr ""
 
 #: src/pages/SalvosPage.tsx:275
 msgid "Cancel salvo"
+msgstr ""
+
+#: src/pages/RelayConfigurationControls.tsx:39
+msgid "Cancel token revocation"
 msgstr ""
 
 #: src/pages/MediaPlayersPage.tsx:429
@@ -1546,7 +1554,7 @@ msgstr ""
 msgid "Channels (route {row})"
 msgstr ""
 
-#: src/pages/RelayManagementPage.tsx:58
+#: src/pages/RelayManagementPage.tsx:59
 msgid "Check all token pages"
 msgstr ""
 
@@ -1647,11 +1655,11 @@ msgstr ""
 msgid "Clip"
 msgstr ""
 
-#: src/pages/RelayManagementPage.tsx:50
+#: src/pages/RelayManagementPage.tsx:51
 msgid "Cloudflare email"
 msgstr ""
 
-#: src/pages/RelayManagementPage.tsx:37
+#: src/pages/RelayManagementPage.tsx:38
 msgid "Cloudflare media relays"
 msgstr ""
 
@@ -1736,7 +1744,7 @@ msgid "Compiled features"
 msgstr ""
 
 #. placeholder {0}: inventory.count
-#: src/pages/RelayManagementPage.tsx:59
+#: src/pages/RelayManagementPage.tsx:60
 msgid "Complete token count: {0}"
 msgstr ""
 
@@ -1834,8 +1842,12 @@ msgstr ""
 msgid "Configured sync groups."
 msgstr ""
 
-#: src/pages/RelayManagementPage.tsx:78
+#: src/pages/RelayManagementPage.tsx:80
 msgid "Confirm teardown"
+msgstr ""
+
+#: src/pages/RelayConfigurationControls.tsx:38
+msgid "Confirm token revocation"
 msgstr ""
 
 #: src/components/ConnectionStatus.tsx:29
@@ -2243,11 +2255,11 @@ msgstr ""
 msgid "Create"
 msgstr ""
 
-#: src/pages/RelayManagementPage.tsx:60
+#: src/pages/RelayManagementPage.tsx:61
 msgid "Create account-only scoped token"
 msgstr ""
 
-#: src/pages/RelayManagementPage.tsx:66
+#: src/pages/RelayManagementPage.tsx:67
 msgid "Create relay"
 msgstr ""
 
@@ -2271,11 +2283,11 @@ msgstr ""
 msgid "Creates an ordinary managed source bound to this device via device_ref."
 msgstr ""
 
-#: src/pages/RelayManagementPage.tsx:45
+#: src/pages/RelayManagementPage.tsx:46
 msgid "Credential onboarding"
 msgstr ""
 
-#: src/pages/RelayManagementPage.tsx:47
+#: src/pages/RelayManagementPage.tsx:48
 msgid "Credential type"
 msgstr ""
 
@@ -2502,7 +2514,7 @@ msgstr ""
 msgid "Delete tally profile?"
 msgstr ""
 
-#: src/pages/RelayManagementPage.tsx:78
+#: src/pages/RelayManagementPage.tsx:80
 msgid "Delete this relay? Active clients can disconnect. Imported resources also require explicit deletion."
 msgstr ""
 
@@ -2990,7 +3002,7 @@ msgstr ""
 msgid "Effective licence"
 msgstr ""
 
-#: src/pages/RelayManagementPage.tsx:75
+#: src/pages/RelayManagementPage.tsx:76
 msgid "Effective transport"
 msgstr ""
 
@@ -3004,6 +3016,10 @@ msgstr ""
 
 #: src/pages/SourcesPage.tsx:638
 msgid "Embedded CEA-608 (CC1–CC4 only)"
+msgstr ""
+
+#: src/pages/RelayConfigurationControls.tsx:28
+msgid "Enable requested upstreams"
 msgstr ""
 
 #: src/docs/registry.ts:538
@@ -3179,7 +3195,7 @@ msgstr ""
 msgid "Example sync group"
 msgstr ""
 
-#: src/pages/RelayManagementPage.tsx:69
+#: src/pages/RelayManagementPage.tsx:70
 msgid "Existing relay ID"
 msgstr ""
 
@@ -3423,7 +3439,7 @@ msgstr ""
 msgid "Glitchy, corrupt, and malformed inputs are the expected workload, not an edge case: decode errors on one stream are tolerated and recovered per tile, and a broken track inside a transport (for example a damaged subtitle rendition) is warned about and recovered without killing the streams alongside it."
 msgstr ""
 
-#: src/pages/RelayManagementPage.tsx:48
+#: src/pages/RelayManagementPage.tsx:49
 msgid "Global API key and email"
 msgstr ""
 
@@ -3769,7 +3785,7 @@ msgstr ""
 msgid "Images"
 msgstr ""
 
-#: src/pages/RelayManagementPage.tsx:70
+#: src/pages/RelayManagementPage.tsx:71
 msgid "Import relay"
 msgstr ""
 
@@ -4513,8 +4529,8 @@ msgstr ""
 msgid "Management address"
 msgstr ""
 
-#: src/pages/RelayManagementPage.tsx:65
-#: src/pages/RelayManagementPage.tsx:77
+#: src/pages/RelayManagementPage.tsx:66
+#: src/pages/RelayManagementPage.tsx:78
 msgid "Management mode"
 msgstr ""
 
@@ -4522,8 +4538,8 @@ msgstr ""
 msgid "Manifest signalling"
 msgstr ""
 
-#: src/pages/RelayManagementPage.tsx:65
-#: src/pages/RelayManagementPage.tsx:77
+#: src/pages/RelayManagementPage.tsx:66
+#: src/pages/RelayManagementPage.tsx:78
 msgid "Manual"
 msgstr ""
 
@@ -5435,7 +5451,7 @@ msgstr ""
 msgid "Operation id"
 msgstr ""
 
-#: src/pages/RelayManagementPage.tsx:81
+#: src/pages/RelayManagementPage.tsx:83
 msgid "Operation in progress"
 msgstr ""
 
@@ -6012,7 +6028,7 @@ msgstr ""
 msgid "Refresh (exact rational)"
 msgstr ""
 
-#: src/pages/RelayManagementPage.tsx:72
+#: src/pages/RelayManagementPage.tsx:73
 msgid "Refresh relay status"
 msgstr ""
 
@@ -6024,19 +6040,23 @@ msgstr ""
 msgid "Relay"
 msgstr ""
 
-#: src/pages/RelayManagementPage.tsx:39
+#: src/pages/RelayManagementPage.tsx:40
 msgid "Relay changes are control-plane operations. A transport change can reset media connections. A shared relay does not provide per-source privacy."
 msgstr ""
 
-#: src/pages/RelayManagementPage.tsx:38
+#: src/pages/RelayConfigurationControls.tsx:19
+msgid "Relay configuration and tokens"
+msgstr ""
+
+#: src/pages/RelayManagementPage.tsx:39
 msgid "Relay credentials use encrypted server storage. The server needs an external master key; no plaintext configuration fallback exists."
 msgstr ""
 
-#: src/pages/RelayManagementPage.tsx:54
+#: src/pages/RelayManagementPage.tsx:55
 msgid "Relay management"
 msgstr ""
 
-#: src/pages/RelayManagementPage.tsx:64
+#: src/pages/RelayManagementPage.tsx:65
 msgid "Relay name"
 msgstr ""
 
@@ -6045,8 +6065,12 @@ msgstr ""
 msgid "Relay neighbours' heartbeats"
 msgstr ""
 
-#: src/pages/RelayManagementPage.tsx:76
+#: src/pages/RelayManagementPage.tsx:77
 msgid "Relay reports an error. Check server diagnostics."
+msgstr ""
+
+#: src/pages/RelayConfigurationControls.tsx:33
+msgid "Relay token ID to revoke (not the secret)"
 msgstr ""
 
 #: src/pages/MeshPage.tsx:243
@@ -6158,8 +6182,20 @@ msgstr ""
 msgid "requested by"
 msgstr ""
 
-#: src/pages/RelayManagementPage.tsx:75
+#: src/pages/RelayConfigurationControls.tsx:20
+msgid "Requested configuration only. Saving replaces all upstreams; it does not prove media health. Use at most 16 HTTPS or MoQT URLs, without credentials, query strings, or fragments."
+msgstr ""
+
+#: src/pages/RelayConfigurationControls.tsx:26
+msgid "Requested relay name"
+msgstr ""
+
+#: src/pages/RelayManagementPage.tsx:76
 msgid "Requested transport"
+msgstr ""
+
+#: src/pages/RelayConfigurationControls.tsx:29
+msgid "Requested upstream URLs, one per line"
 msgstr ""
 
 #: src/pages/SettingsPage.tsx:139
@@ -6240,6 +6276,14 @@ msgstr ""
 
 #: src/components/account/chrome.tsx:116
 msgid "Review actions"
+msgstr ""
+
+#: src/pages/RelayConfigurationControls.tsx:35
+msgid "Revoke relay token"
+msgstr ""
+
+#: src/pages/RelayConfigurationControls.tsx:36
+msgid "Revoke this token for this relay? New connections lose access. Existing connected sessions are not terminated."
 msgstr ""
 
 #: src/pages/docs/components.tsx:147
@@ -6463,7 +6507,7 @@ msgstr ""
 msgid "Scope"
 msgstr ""
 
-#: src/pages/RelayManagementPage.tsx:48
+#: src/pages/RelayManagementPage.tsx:49
 msgid "Scoped API token"
 msgstr ""
 
@@ -6797,7 +6841,7 @@ msgstr ""
 #: src/pages/DataPage.tsx:88
 #: src/pages/MeshPage.tsx:62
 #: src/pages/OutputsPage.tsx:685
-#: src/pages/RelayManagementPage.tsx:75
+#: src/pages/RelayManagementPage.tsx:76
 msgid "Status"
 msgstr ""
 
@@ -6839,7 +6883,7 @@ msgstr ""
 msgid "Stopped"
 msgstr ""
 
-#: src/pages/RelayManagementPage.tsx:52
+#: src/pages/RelayManagementPage.tsx:53
 msgid "Store credential securely"
 msgstr ""
 
@@ -6847,7 +6891,7 @@ msgstr ""
 msgid "Stored and applied: the device's supervised driver converges it now. Config export captures it for restarts."
 msgstr ""
 
-#: src/pages/RelayManagementPage.tsx:55
+#: src/pages/RelayManagementPage.tsx:56
 msgid "Stored credential reference:"
 msgstr ""
 
@@ -7102,7 +7146,7 @@ msgstr ""
 msgid "TCP only; stalls then reconnects"
 msgstr ""
 
-#: src/pages/RelayManagementPage.tsx:78
+#: src/pages/RelayManagementPage.tsx:80
 msgid "Teardown relay"
 msgstr ""
 
@@ -7372,7 +7416,7 @@ msgstr ""
 msgid "The open standard for publishing a WebRTC stream into a server: a browser or encoder POSTs an SDP offer to a single URL and receives the answer, then sends media over the peer connection. A Multiview <0>webrtc</0> source is published to over WHIP."
 msgstr ""
 
-#: src/pages/RelayManagementPage.tsx:40
+#: src/pages/RelayManagementPage.tsx:41
 msgid "The operation failed. Check server diagnostics and permissions, then retry. No successful change is assumed."
 msgstr ""
 
@@ -7777,8 +7821,12 @@ msgstr ""
 msgid "Title"
 msgstr ""
 
-#: src/pages/RelayManagementPage.tsx:59
+#: src/pages/RelayManagementPage.tsx:60
 msgid "Token inventory incomplete; creation disabled"
+msgstr ""
+
+#: src/pages/RelayConfigurationControls.tsx:41
+msgid "Token revoked. Existing connected sessions are not terminated."
 msgstr ""
 
 #: src/layout/components/CellsForm.tsx:393
@@ -7922,7 +7970,7 @@ msgstr ""
 msgid "unverified"
 msgstr ""
 
-#: src/pages/RelayManagementPage.tsx:75
+#: src/pages/RelayManagementPage.tsx:76
 msgid "Unverified"
 msgstr ""
 

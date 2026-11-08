@@ -10,6 +10,7 @@ function service(): RelayManagementService {
     inspectTokens: vi.fn(() => Promise.resolve({ count: 49, allPagesLoaded: true })),
     createScopedToken: vi.fn(() => Promise.resolve({ reference: "vault:scoped", accountId: "account", kind: "scoped_token" as const })),
     list: vi.fn(() => Promise.resolve([{ id: "relay-1", name: "Relay one", mode: "manual" as const, requestedTransport: "moq", effectiveTransport: null, status: "failed", errorCode: "provider" }])),
+    update: vi.fn(() => Promise.resolve()), revokeToken: vi.fn(() => Promise.resolve()),
     create: vi.fn(() => Promise.resolve()), importRelay: vi.fn(() => Promise.resolve()), setMode: vi.fn(() => Promise.resolve()), teardown: vi.fn(() => Promise.resolve()),
   };
 }
@@ -64,6 +65,23 @@ describe("relay management", () => {
     if (!relayMode) throw new Error("relay mode control missing");
     fireEvent.change(relayMode, { target: { value: "auto" } });
     await waitFor(() => { expect(api.setMode).toHaveBeenCalledWith(expect.anything(), "relay-1", "auto"); });
+  });
+  it("updates requested configuration and cancels or confirms token revocation", async () => {
+    const api = service(); await onboard(api);
+    fireEvent.change(screen.getByLabelText("Requested relay name"), { target: { value: "Renamed" } });
+    fireEvent.click(screen.getByLabelText("Enable requested upstreams"));
+    fireEvent.change(screen.getByLabelText("Requested upstream URLs, one per line"), { target: { value: "https://relay.example.com" } });
+    fireEvent.click(screen.getByRole("button", { name: "Apply requested configuration" }));
+    await waitFor(() => { expect(api.update).toHaveBeenCalledWith(expect.anything(), "relay-1", { name: "Renamed", enabled: true, urls: ["https://relay.example.com"] }); });
+    await waitFor(() => { expect(screen.getByLabelText("Relay token ID to revoke (not the secret)")).toBeEnabled(); });
+    fireEvent.change(screen.getByLabelText("Relay token ID to revoke (not the secret)"), { target: { value: "token-123" } });
+    fireEvent.click(screen.getByRole("button", { name: "Revoke relay token" }));
+    fireEvent.click(screen.getByRole("button", { name: "Cancel token revocation" }));
+    expect(api.revokeToken).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole("button", { name: "Revoke relay token" }));
+    fireEvent.click(screen.getByRole("button", { name: "Confirm token revocation" }));
+    await waitFor(() => { expect(api.revokeToken).toHaveBeenCalledWith(expect.anything(), "relay-1", "token-123"); });
+    expect(await screen.findByText("Token revoked. Existing connected sessions are not terminated.")).toBeInTheDocument();
   });
   it("requires teardown confirmation", async () => {
     const api = service(); await onboard(api);

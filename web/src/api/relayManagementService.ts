@@ -1,7 +1,7 @@
 import { z } from "zod";
 import { createApiClient, type MultiviewApiClient } from "./client";
 import type { components } from "./schema";
-import type { CredentialView, RelayManagementService } from "../pages/relayManagementModel";
+import { validateRelayConfig, type CredentialView, type RelayManagementService } from "../pages/relayManagementModel";
 
 // The generated envelope deliberately exposes unknown JSON. Validate data at
 // this boundary; never assume management health proves media connectivity.
@@ -66,6 +66,14 @@ export function createRelayManagementService(client: MultiviewApiClient = create
     async setMode(credential, id, mode) {
       if (mode === "auto" && !automatic) throw new Error("Automatic mode unavailable");
       await action(credential, "set-mode", { relay_id: id, mode });
+    },
+    async update(credential, id, config) {
+      validateRelayConfig(config);
+      await action(credential, "update", { relay_id: id, name: config.name, config: { upstreams: { enabled: config.enabled, upstreams: config.urls.map((url) => ({ url })) } } });
+    },
+    async revokeToken(credential, id, tokenId) {
+      if (!/^[A-Za-z0-9_-]{1,256}$/.test(tokenId)) throw new Error("Invalid token ID");
+      z.object({ revoked: z.literal(true), connected_sessions_terminated: z.literal(false) }).parse(await action(credential, "revoke-token", { relay_id: id, token_jti: tokenId }));
     },
     async teardown(credential, id) { await action(credential, "teardown", { relay_id: id }); },
   };

@@ -10,6 +10,26 @@ afterAll(() => { server.close(); });
 const credential = { accountId: "acct", reference: "vault:test", kind: "global_key" as const };
 const service = () => createRelayManagementService(createApiClient({ baseUrl: "http://localhost" }));
 describe("generated relay management adapter", () => {
+  it("sends typed update config and standalone token revocation", async () => {
+    server.use(http.post("*/api/v1/cloudflare/update", async ({ request }) => {
+      expect(await request.json()).toEqual({ account_id: "acct", secret_ref: "vault:test", relay_id: "relay-id", name: "Changed", config: { upstreams: { enabled: true, upstreams: [{ url: "https://relay.example.com" }] } } });
+      return HttpResponse.json({ data: {} });
+    }), http.post("*/api/v1/cloudflare/revoke-token", async ({ request }) => {
+      expect(await request.json()).toEqual({ account_id: "acct", secret_ref: "vault:test", relay_id: "relay-id", token_jti: "token-id" });
+      return HttpResponse.json({ data: { revoked: true, connected_sessions_terminated: false } });
+    }));
+    await service().update(credential, "relay-id", { name: "Changed", enabled: true, urls: ["https://relay.example.com"] });
+    await service().revokeToken(credential, "relay-id", "token-id");
+  });
+  it.each([403, 503])("sanitizes unauthorized and unavailable responses (%s)", async (status) => {
+    server.use(http.post("*/api/v1/cloudflare/revoke-token", () => HttpResponse.json({ detail: "DO-NOT-ECHO-SECRET" }, { status })));
+    await expect(service().revokeToken(credential, "relay-id", "token-id")).rejects.toThrow("Cloudflare operation unavailable");
+  });
+  it("rejects oversized or credential-bearing upstream requests before HTTP", async () => {
+    for (const urls of [Array<string>(17).fill("https://relay.example.com"), ["https://user:pass@relay.example.com"], ["https://relay.example.com?token=secret"], ["https://relay.example.com/" + "x".repeat(2048)]]) {
+      await expect(service().update(credential, "relay-id", { name: "Changed", enabled: true, urls })).rejects.toThrow();
+    }
+  });
   it("stores credentials through generated route and returns references only", async () => {
     server.use(http.post("*/api/v1/cloudflare/credentials", async ({ request }) => {
       expect(await request.json()).toEqual({ account_id: "acct", kind: "scoped_token", token: "input-secret" });

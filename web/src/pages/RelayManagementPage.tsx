@@ -4,6 +4,7 @@ import { Button } from "../components/ui/button";
 import { Input } from "../components/ui/input";
 import { PageHeader } from "../components/PageHeader";
 import { createRelayManagementService } from "../api/relayManagementService";
+import { RelayConfigurationControls } from "./RelayConfigurationControls";
 import { canCreateScopedToken, type CredentialView, type RelayManagementService, type RelayView, type TokenInventory } from "./relayManagementModel";
 
 /** All mutations use an injected generated-client adapter. Secrets only live in
@@ -75,6 +76,7 @@ export function RelayManagementPage({ service: injectedService }: { service?: Re
         <dl><dt><Trans>Status</Trans></dt><dd>{relay.status}</dd><dt><Trans>Requested transport</Trans></dt><dd>{relay.requestedTransport}</dd><dt><Trans>Effective transport</Trans></dt><dd>{relay.effectiveTransport ?? t`Unverified`}</dd></dl>
         {relay.errorCode && <p role="alert"><Trans>Relay reports an error. Check server diagnostics.</Trans></p>}
         <label><Trans>Management mode</Trans><select value={relay.mode} disabled={busy || !service.supportsAutomaticMode} onChange={(e) => { const next = e.target.value === "auto" ? "auto" : "manual"; void run(async () => { await service.setMode(credential, relay.id, next); await refresh(credential); }); }}><option value="manual">{t`Manual`}</option><option value="auto">{t`Automatic`}</option></select></label>
+        <RelayConfigurationControls key={`${credential.reference}:${relay.id}`} relay={relay} credential={credential} service={service} disabled={busy} run={run} refresh={() => refresh(credential)} />
         {confirmDelete === relay.id ? <div><p><Trans>Delete this relay? Active clients can disconnect. Imported resources also require explicit deletion.</Trans></p><Button disabled={busy} onClick={() => void run(async () => { await service.teardown(credential, relay.id); setConfirmDelete(null); await refresh(credential); })}><Trans>Confirm teardown</Trans></Button><Button disabled={busy} onClick={() => { setConfirmDelete(null); }}><Trans>Cancel</Trans></Button></div> : <Button disabled={busy} onClick={() => { setConfirmDelete(relay.id); }}><Trans>Teardown relay</Trans></Button>}
       </li>)}</ul>
     </section>}
