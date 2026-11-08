@@ -581,7 +581,8 @@ impl Demuxer {
     ///
     /// The codec comes from the stream's codec id; the framing is read from the
     /// stream's extradata — an avcC/hvcC config record (first byte `0x01`) means
-    /// length-prefixed NALs with `nal_length_size = (extradata[4] & 3) + 1`,
+    /// length-prefixed NALs with codec-specific length-size fields (avcC byte 4,
+    /// hvcC byte 21),
     /// otherwise the elementary stream is Annex-B (start codes), and AV1 is always
     /// the OBU stream. Returns [`None`] for a non-existent stream or a codec whose
     /// random-access structure this classifier does not model.
@@ -598,7 +599,7 @@ impl Demuxer {
             // AV1 is carried as the low-overhead OBU stream.
             CodecKind::Av1 => NalFraming::Obu,
             // H.264 / HEVC: avcC/hvcC extradata ⇒ length-prefixed; else Annex-B.
-            CodecKind::H264 | CodecKind::Hevc => nal_framing_from_extradata(&params),
+            CodecKind::H264 | CodecKind::Hevc => nal_framing_from_extradata(&params)?,
             CodecKind::Other => return None,
         };
         Some((codec, framing))
@@ -1035,12 +1036,11 @@ use ffi_open::open_input_with_interrupt;
 
 /// Read the NAL framing of an H.264 / HEVC stream from its codec extradata.
 ///
-/// avcC / hvcC config records begin with `configurationVersion == 1`; their
-/// `lengthSizeMinusOne` lives in `extradata[4] & 0x03`, so each NAL is preceded
-/// by `(that + 1)` big-endian length bytes. Anything else (no extradata, or a
-/// leading `0x00 0x00 0x01` start code) is the Annex-B elementary stream.
+/// avcC and hvcC config records use different length-size offsets. Delegate
+/// to the same checked parser as encoder output; unknown/truncated records do
+/// not silently inherit the wrong codec framing.
 #[allow(unsafe_code)]
-fn nal_framing_from_extradata(params: &Parameters) -> NalFraming {
+fn nal_framing_from_extradata(params: &Parameters) -> Option<NalFraming> {
     // SAFETY: `params.as_ptr()` is a valid `AVCodecParameters` for the lifetime
     // of the borrow. `extradata`/`extradata_size` are plain fields; we read the
     // pointer + length and build a bounded slice (or treat absent/short as
@@ -1055,13 +1055,7 @@ fn nal_framing_from_extradata(params: &Parameters) -> NalFraming {
             std::slice::from_raw_parts(ptr, len)
         }
     };
-    match (extradata.first(), extradata.get(4)) {
-        // avcC / hvcC: version byte 0x01, length-size in the low 2 bits of byte 4.
-        (Some(&0x01), Some(&size_byte)) => NalFraming::LengthPrefixed {
-            nal_length_size: (size_byte & 0x03) + 1,
-        },
-        _ => NalFraming::AnnexB,
-    }
+    crate::packet::nal_framing_from_config(params.id(), extradata)
 }
 
 #[cfg(test)]

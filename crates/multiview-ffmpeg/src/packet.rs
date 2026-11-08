@@ -308,7 +308,7 @@ impl StreamCodecParameters {
 /// Parse codec-configuration-record framing without borrowing libav state.
 /// avcC stores `lengthSizeMinusOne` in byte 4; hvcC stores it in byte 21.
 /// Unknown or truncated records fail closed instead of guessing Annex-B.
-fn nal_framing_from_config(
+pub(crate) fn nal_framing_from_config(
     id: ffmpeg::codec::Id,
     extradata: &[u8],
 ) -> Option<crate::idr::NalFraming> {
