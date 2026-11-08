@@ -420,6 +420,55 @@ mod tests {
         assert_eq!(fence.charged.load(Ordering::Acquire), 0);
     }
     #[test]
+    fn revoking_one_peer_preserves_other_peer_and_shared_payload_credits() {
+        let payload = bytes::Bytes::from(vec![7u8; 1024]);
+        let window = |pts_us| AvWindow {
+            video: crate::Window {
+                generation: 1,
+                packets: vec![crate::Packet {
+                    payload: payload.clone(),
+                    pts_us,
+                    verified_rap: true,
+                }],
+            },
+            audio: Default::default(),
+        };
+        let (first, mut first_rx) = Fence::channel(2);
+        let (second, mut second_rx) = Fence::channel(2);
+        assert!(first.try_offer(window(0)).is_ok());
+        assert!(second.try_offer(window(0)).is_ok());
+        let first_window = first_rx.try_recv().unwrap();
+        let retained_first = first_window.video.packets[0].payload.clone();
+        let second_window = second_rx.try_recv().unwrap();
+        assert_eq!(retained_first.as_ptr(), payload.as_ptr());
+        assert_eq!(
+            second_window.video.packets[0].payload.as_ptr(),
+            payload.as_ptr()
+        );
+        first.revoke();
+        assert!(first.try_offer(window(1)).is_err());
+        assert!(!*second.cancel.borrow());
+        let mut continuing_frames = 1;
+        for pts in 1..10 {
+            assert!(second.try_offer(window(pts)).is_ok());
+            let received = second_rx.try_recv().unwrap();
+            assert_eq!(received.video.packets[0].pts_us, pts);
+            continuing_frames += received.video.packets.len();
+        }
+        assert_eq!(continuing_frames, 10);
+        assert_eq!(first.charged.load(Ordering::Acquire), 1024);
+        assert_eq!(second.charged.load(Ordering::Acquire), 1024);
+        drop(first_window);
+        assert_eq!(first.charged.load(Ordering::Acquire), 1024);
+        drop(retained_first);
+        assert_eq!(first.charged.load(Ordering::Acquire), 0);
+        assert_eq!(second.charged.load(Ordering::Acquire), 1024);
+        drop(second_window);
+        assert_eq!(second.charged.load(Ordering::Acquire), 0);
+        assert!(!*second.cancel.borrow());
+    }
+
+    #[test]
     fn fence_rejects_after_revoke_and_bounds_queue() {
         let (fence, _rx) = Fence::channel(1);
         let window = || AvWindow {
