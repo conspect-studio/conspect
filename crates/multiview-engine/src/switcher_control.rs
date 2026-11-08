@@ -84,6 +84,7 @@ pub struct SwitcherControl {
     outcomes: EventStream<SwitcherOutcome>,
     scenes: LatestState<ScenePair>,
     readiness: LatestState<ProviderStatus>,
+    applied_tick: Arc<std::sync::atomic::AtomicU64>,
 }
 
 /// Actual paired-bus frame capability, published after the rendering provider
@@ -130,6 +131,7 @@ impl SwitcherControl {
             outcomes,
             scenes: LatestState::new(),
             readiness: LatestState::new(),
+            applied_tick: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         };
         let driver = SwitcherTickDriver {
             rx,
@@ -138,12 +140,15 @@ impl SwitcherControl {
             outcomes: handle.outcomes.clone(),
             scenes: handle.scenes.clone(),
             readiness: handle.readiness.clone(),
+            applied_tick: Arc::clone(&handle.applied_tick),
             active_auto: None,
             active_auto_scenes: None,
             primed_stores: None,
             pending_take: None,
             last_tick: 0,
             staged_success: Vec::with_capacity(MAX_COMMANDS_PER_TICK),
+            spare_success: Vec::with_capacity(MAX_COMMANDS_PER_TICK),
+            before_staged: None,
         };
         (handle, driver)
     }
@@ -178,10 +183,17 @@ impl SwitcherControl {
         Ok(())
     }
 
-    /// Most recently applied frame-boundary state, never a predicted state.
+    /// Most recently applied scene (change-only publication) with the freshest
+    /// real frame tick from a cheap atomic load; never a predicted state.
     #[must_use]
     pub fn snapshot(&self) -> Option<std::sync::Arc<SwitcherSnapshot>> {
         self.snapshots.latest()
+    }
+
+    /// Last freshly published tick, independent of change-only state snapshots.
+    #[must_use]
+    pub fn applied_tick(&self) -> u64 {
+        self.applied_tick.load(std::sync::atomic::Ordering::Acquire)
     }
 
     /// Real paired-bus publication status, or `None` before the first frame.
@@ -236,10 +248,13 @@ pub struct SwitcherTickDriver {
     active_auto: Option<String>,
     active_auto_scenes: Option<Arc<ScenePair>>,
     readiness: LatestState<ProviderStatus>,
+    applied_tick: Arc<std::sync::atomic::AtomicU64>,
     primed_stores: Option<HashMap<String, Arc<TileStore<Nv12Image>>>>,
     pending_take: Option<(SwitcherCommand, u64)>,
     last_tick: u64,
     staged_success: Vec<String>,
+    spare_success: Vec<String>,
+    before_staged: Option<SwitcherState>,
 }
 
 impl SwitcherTickDriver {
@@ -330,6 +345,9 @@ impl SwitcherTickDriver {
                 .and_then(|stores| stores.get(selected))
                 .is_some_and(|store| store.is_primed());
             if primed {
+                if self.before_staged.is_none() {
+                    self.before_staged = Some(self.machine.clone());
+                }
                 match self.machine.cut() {
                     Ok(next) => {
                         projection = next;
@@ -364,6 +382,17 @@ impl SwitcherTickDriver {
                 break;
             };
             let scenes = self.scenes.latest();
+            if self.before_staged.is_none()
+                && matches!(
+                    command.verb,
+                    SwitcherVerb::SelectProgram(_)
+                        | SwitcherVerb::Cut
+                        | SwitcherVerb::Auto(_)
+                        | SwitcherVerb::SelectPreview(_)
+                )
+            {
+                self.before_staged = Some(self.machine.clone());
+            }
             let result: Result<SwitcherProjection, String> = if scenes
                 .as_ref()
                 .is_some_and(|pair| pair.version != command.scene_version)
@@ -484,27 +513,50 @@ impl SwitcherTickDriver {
         projection
     }
 
+    /// End the public snapshot stream at this tick if the output loop is about
+    /// to stop; state remains the last actually published frame.
+    #[must_use]
+    pub fn last_observed_tick(&self) -> u64 {
+        self.last_tick
+    }
+
     /// Confirm the staged scene was actually composited and published at this
     /// tick before exposing state or an applied receipt. Repeat frames never
     /// call this; failure calls `reject_composed_tick` instead.
     pub fn commit_composed_tick(&mut self, tick: Tick) {
-        self.snapshots.publish(SwitcherSnapshot {
-            tick: tick.index,
-            program: self.machine.program().clone(),
-            preview: self.machine.preview().clone(),
-            in_flight: self.machine.is_in_flight(),
-            completion_count: self.machine.completion_count(),
+        self.before_staged = None;
+        self.applied_tick
+            .store(tick.index, std::sync::atomic::Ordering::Release);
+        let changed = self.snapshots.latest().is_none_or(|previous| {
+            previous.program != *self.machine.program()
+                || previous.preview != *self.machine.preview()
+                || previous.in_flight != self.machine.is_in_flight()
+                || previous.completion_count != self.machine.completion_count()
         });
-        let accepted = std::mem::take(&mut self.staged_success);
-        for operation_id in accepted {
+        if changed {
+            self.snapshots.publish(SwitcherSnapshot {
+                tick: tick.index,
+                program: self.machine.program().clone(),
+                preview: self.machine.preview().clone(),
+                in_flight: self.machine.is_in_flight(),
+                completion_count: self.machine.completion_count(),
+            });
+        }
+        self.spare_success.clear();
+        std::mem::swap(&mut self.staged_success, &mut self.spare_success);
+        while let Some(operation_id) = self.spare_success.pop() {
             self.publish_outcome(operation_id, tick.index, true, None);
         }
     }
 
     /// Never claim on-air success when the bus frame could not be rendered.
     pub fn reject_composed_tick(&mut self, tick: Tick, reason: &str) {
-        let accepted = std::mem::take(&mut self.staged_success);
-        for operation_id in accepted {
+        if let Some(previous) = self.before_staged.take() {
+            self.machine = previous;
+        }
+        self.spare_success.clear();
+        std::mem::swap(&mut self.staged_success, &mut self.spare_success);
+        while let Some(operation_id) = self.spare_success.pop() {
             self.publish_outcome(operation_id, tick.index, false, Some(reason.to_owned()));
         }
         self.revoke_provider_status();

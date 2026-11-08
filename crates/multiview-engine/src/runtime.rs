@@ -247,7 +247,7 @@ pub trait FrameControl {
     /// Confirm that the staged scene really became a fresh output frame.
     fn after_compose(&mut self, frame: &CompositedFrame);
     /// A catch-up repeat re-emits old pixels; expire holds but do not apply.
-    fn on_repeat(&mut self, _tick: Tick) {}
+    fn on_repeat(&mut self, _drive: &mut CompositorDrive<Nv12Image>, _tick: Tick) {}
 }
 
 struct LegacyControl<F>(F);
@@ -256,6 +256,9 @@ impl<F: FnMut(&mut CompositorDrive<Nv12Image>, Tick)> FrameControl for LegacyCon
         (self.0)(drive, tick);
     }
     fn after_compose(&mut self, _frame: &CompositedFrame) {}
+    fn on_repeat(&mut self, drive: &mut CompositorDrive<Nv12Image>, tick: Tick) {
+        (self.0)(drive, tick);
+    }
 }
 
 /// The integrated engine runtime: owns the clock, the drive loop, the outbound
@@ -745,7 +748,7 @@ impl<P: Pacer> EngineRuntime<P> {
                     // being emitted, never a stale or future one.
                     let repeat_tick: Tick = self.clock.tick();
                     if repeats_since_control >= MAX_REPEATS_BETWEEN_CONTROL {
-                        control.on_repeat(repeat_tick);
+                        control.on_repeat(&mut self.drive, repeat_tick);
                         repeats_since_control = 0;
                     }
                     let Some(last) = last_good.as_mut() else {

@@ -120,3 +120,91 @@ async fn owned_hook_cut_changes_actual_composited_program_without_false_202() {
     assert!(outcome.event.completed);
     assert!(outcomes.try_recv().is_err());
 }
+
+#[test]
+fn failed_rebind_rolls_back_selection_and_never_airs_later() {
+    use multiview_engine::runtime::FrameControl;
+    let color = ColorInfo::default().resolve_defaults(64, 64);
+    let a = Arc::new(TileStore::<Nv12Image>::with_defaults("a"));
+    let b = Arc::new(TileStore::<Nv12Image>::with_defaults("b"));
+    a.publish(
+        Nv12Image::solid(64, 64, 200, 128, 128, color).unwrap(),
+        multiview_core::time::MediaTime::ZERO,
+    );
+    b.publish(
+        Nv12Image::solid(64, 64, 60, 128, 128, color).unwrap(),
+        multiview_core::time::MediaTime::ZERO,
+    );
+    let stores = HashMap::from([("a".into(), Arc::clone(&a)), ("b".into(), Arc::clone(&b))]);
+    let drive = CompositorDrive::new(
+        layout("a"),
+        stores.clone(),
+        Nv12Image::solid(64, 64, 16, 128, 128, color).unwrap(),
+        CanvasColor::default(),
+        LinearRgba::TRANSPARENT,
+    )
+    .unwrap();
+    let (handle, mut driver) = SwitcherControl::new(SwitcherState::new(
+        SourceRef::new("a"),
+        SourceRef::new("b"),
+        vec![],
+    ));
+    driver.set_prime_stores(stores);
+    handle
+        .set_scenes(ScenePair {
+            version: 1,
+            program: layout("a"),
+            preview: layout("b"),
+        })
+        .unwrap();
+    let mut hook = SwitcherFrameHook::new(
+        driver,
+        "missing-cell-id".into(),
+        |_: &mut CompositorDrive<Nv12Image>| {},
+    );
+    let mut drive = drive;
+    let mut outcomes = handle.outcomes();
+    handle
+        .try_send(SwitcherCommand {
+            operation_id: "failed-cut".into(),
+            scene_version: 1,
+            verb: SwitcherVerb::Cut,
+        })
+        .unwrap();
+    hook.before_compose(
+        &mut drive,
+        multiview_engine::clock::Tick {
+            index: 0,
+            pts: multiview_core::time::MediaTime::ZERO,
+        },
+    );
+    assert!(outcomes.try_recv().unwrap().event.error.is_some());
+    assert!(
+        handle.snapshot().is_none(),
+        "a failed initial frame cannot publish a guessed bus"
+    );
+    hook.after_compose(
+        &drive
+            .compose(multiview_engine::clock::Tick {
+                index: 0,
+                pts: multiview_core::time::MediaTime::ZERO,
+            })
+            .unwrap(),
+    );
+    for index in 1..5 {
+        let tick = multiview_engine::clock::Tick {
+            index,
+            pts: multiview_core::time::MediaTime::ZERO,
+        };
+        hook.before_compose(&mut drive, tick);
+        hook.after_compose(&drive.compose(tick).unwrap());
+        assert!(
+            handle.snapshot().is_none(),
+            "invalid provider cannot pretend PGM state"
+        );
+        assert!(
+            outcomes.try_recv().is_err(),
+            "failed Cut cannot later air without new accepted op"
+        );
+    }
+}

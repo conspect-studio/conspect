@@ -56,7 +56,8 @@ impl<C: FnMut(&mut CompositorDrive<Nv12Image>)> FrameControl for SwitcherFrameHo
         }
     }
 
-    fn on_repeat(&mut self, tick: Tick) {
+    fn on_repeat(&mut self, drive: &mut CompositorDrive<Nv12Image>, tick: Tick) {
+        (self.legacy)(drive);
         self.driver.repeat_tick(tick);
     }
 }

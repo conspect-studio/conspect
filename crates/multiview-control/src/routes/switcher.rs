@@ -182,13 +182,14 @@ pub(crate) async fn get_switcher(
             id: me,
         });
     }
-    let snapshot = engine(&state)?.snapshot().ok_or_else(|| {
+    let handle = engine(&state)?;
+    let snapshot = handle.snapshot().ok_or_else(|| {
         ControlError::Conflict("switcher has not emitted a real output tick".into())
     })?;
     Ok((
         StatusCode::OK,
         Json(SwitcherStateResponse {
-            tick: snapshot.tick,
+            tick: handle.applied_tick(),
             program_source: snapshot.program.as_str().to_owned(),
             preview_source: snapshot.preview.as_str().to_owned(),
             in_flight: snapshot.in_flight,
@@ -254,6 +255,20 @@ pub(crate) async fn submit_switcher(
         .scene_version()
         .ok_or_else(|| ControlError::Conflict("switcher has no active scene".into()))?;
     let verb = verb(&req, &kind)?;
+    // A PVW selection is a sustained video consumer, not a one-shot JPEG poll.
+    // Until an owner installs an on-arm lease the route must refuse a cold
+    // on-demand source rather than accept a take that can never prime.
+    if let Some(source) = &req.source {
+        if let Some(demand) = &state.source_demand {
+            if demand.status(source).phase == crate::source_demand::SourceDemandPhase::Idle
+                && req.action == "select_preview"
+            {
+                return Err(ControlError::Conflict(
+                    "preview source is idle; warm-on-arm lease is not installed".into(),
+                ));
+            }
+        }
+    }
     let Some(key) = idem.0.as_deref().filter(|key| !key.trim().is_empty()) else {
         return Err(ControlError::Validation(
             "Idempotency-Key is required".into(),
