@@ -146,3 +146,46 @@ pub(crate) async fn output_close(
         query.generation,
     )
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::auth::Role;
+    fn principal(role: Role) -> Principal {
+        Principal {
+            key_id: "owner".into(),
+            role,
+            scoped_object_ids: None,
+            scoped_output_ids: None,
+            scoped_discovery_domains: None,
+        }
+    }
+    #[test]
+    fn authorization_rejects_read_roles_and_scoped_program() {
+        for role in [Role::ReadOnly, Role::Viewer] {
+            let p = principal(role);
+            for scope in [
+                WhepScope::Program,
+                WhepScope::Input("a".into()),
+                WhepScope::Output("a".into()),
+            ] {
+                assert!(authorize(&p, &scope).is_err());
+            }
+        }
+        let mut p = principal(Role::Operator);
+        p.scoped_object_ids = Some(vec!["a".into()]);
+        assert!(authorize(&p, &WhepScope::Program).is_err());
+        assert!(authorize(&p, &WhepScope::Input("a".into())).is_ok());
+        assert!(authorize(&p, &WhepScope::Input("b".into())).is_err());
+        p.scoped_output_ids = Some(vec!["out".into()]);
+        assert!(authorize(&p, &WhepScope::Output("out".into())).is_ok());
+        assert!(authorize(&p, &WhepScope::Output("a".into())).is_err());
+    }
+    #[test]
+    fn generation_query_is_required_and_integer() {
+        assert!(Query::<Generation>::try_from_uri(&"/lease?generation=7".parse().unwrap()).is_ok());
+        for uri in ["/lease", "/lease?generation=oops", "/lease?generation=-1"] {
+            assert!(Query::<Generation>::try_from_uri(&uri.parse().unwrap()).is_err());
+        }
+    }
+}

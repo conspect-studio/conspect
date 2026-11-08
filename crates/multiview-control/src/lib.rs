@@ -45,6 +45,7 @@ pub mod audio_routing;
 pub mod audit;
 pub mod auth;
 pub mod boot_model;
+pub mod cloudflare_management;
 pub mod command;
 pub mod concurrency;
 pub mod config_lock;
@@ -61,7 +62,6 @@ pub mod layout_projection;
 pub(crate) mod limits;
 pub mod live_apply;
 pub mod moq;
-pub mod cloudflare_management;
 pub mod nmos;
 pub mod notify;
 pub mod pending_actions;
@@ -269,6 +269,12 @@ pub fn router(state: AppState) -> Router {
             state.clone(),
             config_lock::config_lock_guard,
         ));
+
+    let api = if let Some(provider) = state.cloudflare.clone() {
+        api.layer(axum::Extension(provider))
+    } else {
+        api
+    };
 
     // SEC-14 post-auth per-API-key rate limit on the authenticated `/api/v1`
     // surface: resolves the presented `Bearer` credential and limits a *validated*
