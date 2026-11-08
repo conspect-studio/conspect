@@ -12,6 +12,10 @@ struct Snapshot {
     pending: BTreeMap<String, String>,
     #[serde(default)]
     policies: BTreeMap<String, Policy>,
+    #[serde(default)]
+    token_refs: BTreeMap<String, BTreeMap<String, String>>,
+    #[serde(default)]
+    rotation_ready: BTreeMap<String, bool>,
 }
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 struct Policy {
@@ -186,6 +190,31 @@ impl ManagedCloudflare {
             });
         }
         let policy = state.policies.get(&key).cloned();
+        if action == "reconcile"
+            && policy.as_ref().is_some_and(|p| p.mode == "auto")
+            && !state.pending.contains_key(&key)
+        {
+            let records = state.records.get(&key).cloned().unwrap_or_default();
+            let mut observed = Vec::new();
+            for mut record in records {
+                match client.get(&record.relay.uid).await {
+                    Ok(remote) => {
+                        record.relay = remote;
+                        record.health = multiview_cloudflare::lifecycle::Health::Reachable;
+                    }
+                    Err(multiview_cloudflare::Error::Api(404))
+                        if record.ownership
+                            == multiview_cloudflare::lifecycle::Ownership::Managed =>
+                    {
+                        continue
+                    }
+                    Err(_) => record.health = multiview_cloudflare::lifecycle::Health::Unavailable,
+                }
+                observed.push(record);
+            }
+            state.records.insert(key.clone(), observed);
+            self.persist(&state)?;
+        }
         let action = if action == "reconcile" {
             if policy.as_ref().is_some_and(|p| p.mode == "auto")
                 && state
@@ -213,7 +242,7 @@ impl ManagedCloudflare {
         }
         if action == "relays" {
             return Ok(CloudflareResult {
-                data: serde_json::json!({"records":state.records.get(&key),"pending":state.pending.get(&key),"mode":policy.as_ref().map(|p|p.mode.as_str()).unwrap_or("manual"),"desired_transport":"moq","effective_transport":"unverified"}),
+                data: serde_json::json!({"records":state.records.get(&key),"pending":state.pending.get(&key),"token_refs":state.token_refs.get(&key),"mode":policy.as_ref().map(|p|p.mode.as_str()).unwrap_or("manual"),"desired_transport":"moq","effective_transport":"unverified"}),
             });
         }
         if action == "recover" {
@@ -247,6 +276,29 @@ impl ManagedCloudflare {
         if state.pending.contains_key(&key) {
             return Err("manual recovery required");
         }
+        if action == "rotation-installed" {
+            let id = r.relay_id.as_deref().ok_or("relay")?;
+            let records = state.records.get(&key).ok_or("relay")?;
+            if !records
+                .iter()
+                .any(|record| record.relay.uid == id && record.pending_revoke.is_some())
+            {
+                return Err("rotation");
+            }
+            state.rotation_ready.insert(format!("{key}:{id}"), true);
+            self.persist(&state)?;
+            return Ok(CloudflareResult {
+                data: serde_json::json!({"installed":true}),
+            });
+        }
+        if action == "revoke"
+            && state
+                .rotation_ready
+                .get(&format!("{key}:{}", r.relay_id.as_deref().ok_or("relay")?))
+                != Some(&true)
+        {
+            return Err("replacement not acknowledged installed");
+        }
         if !matches!(
             action,
             "provision"
@@ -263,6 +315,24 @@ impl ManagedCloudflare {
         }
         if !state.records.contains_key(&key) && state.records.len() >= 32 {
             return Err("account quota");
+        }
+        if matches!(action, "provision" | "scoped-token")
+            && r.name.as_ref().is_none_or(|s| s.trim().is_empty())
+        {
+            return Err("name");
+        }
+        if action == "scoped-token" && r.permission_group_id.is_none() {
+            return Err("permission");
+        }
+        if matches!(
+            action,
+            "import" | "teardown" | "observe" | "update" | "rotate" | "revoke" | "detach"
+        ) && r.relay_id.is_none()
+        {
+            return Err("relay");
+        }
+        if action == "rotate" && r.token_jti.is_none() {
+            return Err("token");
         }
         state.pending.insert(key.clone(), action.to_owned());
         self.persist(&state)?;
@@ -289,6 +359,11 @@ impl ManagedCloudflare {
                         },
                     )
                     .map_err(|_| "token persistence")?;
+                state.token_refs.entry(key.clone()).or_default().insert(
+                    token.id.unwrap_or_else(|| "scoped-token".into()),
+                    reference.as_str().to_owned(),
+                );
+                self.persist(&state)?;
                 serde_json::json!({"secret_ref":reference.as_str()})
             }
             "provision" => {
@@ -313,6 +388,12 @@ impl ManagedCloudflare {
                                 },
                             )
                             .map_err(|_| "token persistence")?;
+                        state
+                            .token_refs
+                            .entry(key.clone())
+                            .or_default()
+                            .insert(token.jti.clone(), reference.as_str().to_owned());
+                        self.persist(&state)?;
                         refs.push(
                             serde_json::json!({"jti":token.jti,"secret_ref":reference.as_str()}),
                         );
@@ -373,11 +454,18 @@ impl ManagedCloudflare {
                                 },
                             )
                             .map_err(|_| "token persistence")?;
+                        state
+                            .token_refs
+                            .entry(key.clone())
+                            .or_default()
+                            .insert(token.jti.clone(), reference.as_str().to_owned());
+                        self.persist(&state)?;
                         refs.push(
                             serde_json::json!({"jti":token.jti,"secret_ref":reference.as_str()}),
                         );
                     }
                 }
+                state.rotation_ready.insert(format!("{key}:{id}"), false);
                 serde_json::json!({"tokens":refs,"old_token_still_valid":true})
             }
             "revoke" => {
@@ -385,6 +473,9 @@ impl ManagedCloudflare {
                     .finish_rotation(&client, r.relay_id.as_deref().ok_or("relay")?, domain)
                     .await
                     .map_err(|_| "revoke")?;
+                state
+                    .rotation_ready
+                    .remove(&format!("{key}:{}", r.relay_id.as_deref().ok_or("relay")?));
                 serde_json::json!({"connected_sessions_terminated":false})
             }
             "import" => {
@@ -462,12 +553,27 @@ mod tests {
             .run("alice", "set-mode", request(Some("manual".into())))
             .await
             .unwrap();
+        assert!(manager
+            .run("alice", "scoped-token", request(None))
+            .await
+            .is_err());
+        assert!(manager.state.lock().await.pending.is_empty());
+        {
+            let mut state = manager.state.lock().await;
+            state
+                .token_refs
+                .entry(serde_json::to_string(&("alice", "account")).unwrap())
+                .or_default()
+                .insert("created-token".into(), reference.clone());
+            manager.persist(&state).unwrap();
+        }
         drop(manager);
         let reopened = ManagedCloudflare::from_master_key(&dir, [7; 32]).unwrap();
         let result = reopened
             .run("alice", "relays", request(None))
             .await
             .unwrap();
+        assert_eq!(result.data["token_refs"]["created-token"], reference);
         assert_eq!(result.data["mode"], "manual");
         assert_eq!(result.data["effective_transport"], "unverified");
         assert!(
