@@ -17,157 +17,9 @@ use multiview_config::MultiviewConfig;
 use std::path::Path;
 use std::process::Command;
 use std::time::Duration;
+#[path = "common/broadcast_fixture.rs"]
+mod broadcast_fixture;
 
-fn fixture(path: &Path, frequency: u32) {
-    let status = Command::new("ffmpeg")
-        .args([
-            "-hide_banner",
-            "-loglevel",
-            "error",
-            "-y",
-            "-f",
-            "lavfi",
-            "-i",
-        ])
-        .arg("testsrc=size=320x180:rate=30000/1001:duration=15")
-        .args(["-f", "lavfi", "-i"])
-        .arg(format!(
-            "sine=frequency={frequency}:sample_rate=48000:duration=15"
-        ))
-        .args([
-            "-c:v",
-            "mpeg2video",
-            "-pix_fmt",
-            "yuv420p",
-            "-c:a",
-            "aac",
-            "-f",
-            "mpegts",
-        ])
-        .arg(path)
-        .status()
-        .expect("generate deterministic source");
-    assert!(status.success());
-}
-fn config(
-    clips: &[std::path::PathBuf; 6],
-    playlist: &Path,
-    port_hevc: u16,
-    port_avc: u16,
-) -> String {
-    format!(
-        r##"
-schema_version = 1
-[canvas]
-width = 320
-height = 180
-fps = "30000/1001"
-pixel_format = "nv12"
-background = "#101014"
-[canvas.color]
-profile = "sdr-bt709-limited"
-[layout]
-kind = "grid"
-columns = ["1fr"]
-rows = ["1fr"]
-areas = ["a"]
-[[sources]]
-id = "broadcast_fixture"
-kind = "file"
-path = "{clip0}"
-[[sources]]
-id = "tone_1"
-kind = "file"
-path = "{clip1}"
-[[sources]]
-id = "tone_2"
-kind = "file"
-path = "{clip2}"
-[[sources]]
-id = "tone_3"
-kind = "file"
-path = "{clip3}"
-[[sources]]
-id = "tone_4"
-kind = "file"
-path = "{clip4}"
-[[sources]]
-id = "tone_5"
-kind = "file"
-path = "{clip5}"
-[[cells]]
-id = "cell_a"
-area = "a"
-[cells.source]
-input_id = "broadcast_fixture"
-[[outputs]]
-kind = "hls"
-path = "{playlist}"
-codec = "h264"
-segment_ms = 1000
-[outputs.audio]
-mode = "tracks"
-tracks = ["track-1", "track-2", "track-3", "track-4", "track-5"]
-[[outputs]]
-kind = "srt"
-url = "srt://[::]:{port_hevc}?mode=listener"
-codec = "hevc"
-[outputs.audio]
-mode = "tracks"
-tracks = ["track-1", "track-2", "track-3", "track-4", "track-5"]
-[[outputs]]
-kind = "srt"
-url = "srt://[::]:{port_avc}?mode=listener"
-codec = "h264"
-[outputs.audio]
-mode = "tracks"
-tracks = ["track-1", "track-2", "track-3", "track-4", "track-5"]
-[audio]
-sample_rate_hz = 48000
-[[audio.routes]]
-input_id = "broadcast_fixture"
-channels = {{ kind = "stereo" }}
-include_in_program_bus = true
-[[audio.routes]]
-input_id = "tone_1"
-channels = {{ kind = "stereo" }}
-target_track = "track-1"
-language = "eng"
-include_in_program_bus = false
-[[audio.routes]]
-input_id = "tone_2"
-channels = {{ kind = "stereo" }}
-target_track = "track-2"
-language = "eng"
-include_in_program_bus = false
-[[audio.routes]]
-input_id = "tone_3"
-channels = {{ kind = "stereo" }}
-target_track = "track-3"
-language = "eng"
-include_in_program_bus = false
-[[audio.routes]]
-input_id = "tone_4"
-channels = {{ kind = "stereo" }}
-target_track = "track-4"
-language = "eng"
-include_in_program_bus = false
-[[audio.routes]]
-input_id = "tone_5"
-channels = {{ kind = "stereo" }}
-target_track = "track-5"
-language = "eng"
-include_in_program_bus = false
-"##,
-        clip0 = clips[0].display(),
-        clip1 = clips[1].display(),
-        clip2 = clips[2].display(),
-        clip3 = clips[3].display(),
-        clip4 = clips[4].display(),
-        clip5 = clips[5].display(),
-        playlist = playlist.display()
-    )
-}
 /// Decode the selected AAC stream to PCM, not merely inspect headers.
 fn decoded_audio_samples(path: &Path, stream_index: usize) -> Result<usize, String> {
     let output = Command::new("ffmpeg")
@@ -283,15 +135,17 @@ fn cadence_faults(pts: &[i64], label: &str, minimum: usize) -> Vec<String> {
 async fn mixed_codec_pipeline_receives_decodable_media_not_just_headers() {
     const TICKS: u64 = 300; // 10s diagnostic @ exact 30000/1001.
     let dir = tempfile::tempdir().unwrap();
-    let clips: [std::path::PathBuf; 6] =
-        std::array::from_fn(|index| dir.path().join(format!("source{index}.ts")));
-    for (index, clip) in clips.iter().enumerate() {
-        fixture(clip, 440 + u32::try_from(index).unwrap() * 110);
-    }
+    let clips = broadcast_fixture::paths(dir.path());
+    broadcast_fixture::generate(&clips, 15);
     let playlist = dir.path().join("hls/index.m3u8");
     let base = 25_000 + u16::try_from(std::process::id() % 10_000).unwrap();
-    let config =
-        MultiviewConfig::load_from_toml(&config(&clips, &playlist, base, base + 1)).unwrap();
+    let config = MultiviewConfig::load_from_toml(&broadcast_fixture::config(
+        &clips,
+        &playlist,
+        base,
+        base + 1,
+    ))
+    .unwrap();
     config.validate().unwrap();
     let mut pipeline = Pipeline::build(&config)
         .expect("three bindings must build without first-codec substitution");

@@ -16,6 +16,8 @@ use multiview_engine::StopSignal;
 use std::path::Path;
 use std::process::{Child, Command};
 use std::time::Duration;
+#[path = "common/broadcast_fixture.rs"]
+mod broadcast_fixture;
 
 /// Always resume a suspended test-owned child before kill/wait, even on panic.
 struct OwnedClient(Child);
@@ -27,82 +29,13 @@ impl Drop for OwnedClient {
         let _ = self.0.wait();
     }
 }
-fn fixture(path: &Path) {
-    let status = Command::new("ffmpeg")
-        .args([
-            "-hide_banner",
-            "-loglevel",
-            "error",
-            "-y",
-            "-f",
-            "lavfi",
-            "-i",
-            "testsrc=size=320x180:rate=30000/1001:duration=35",
-            "-c:v",
-            "mpeg2video",
-            "-pix_fmt",
-            "yuv420p",
-            "-f",
-            "mpegts",
-        ])
-        .arg(path)
-        .status()
-        .unwrap();
-    assert!(status.success());
-}
-fn config(clip: &Path, playlist: &Path, slow: u16, healthy: u16) -> String {
-    format!(
-        r##"
-schema_version=1
-[canvas]
-width=320
-height=180
-fps="30000/1001"
-pixel_format="nv12"
-background="#101014"
-[canvas.color]
-profile="sdr-bt709-limited"
-[layout]
-kind="grid"
-columns=["1fr"]
-rows=["1fr"]
-areas=["a"]
-[[sources]]
-id="isolated_source"
-kind="file"
-path="{clip}"
-[[cells]]
-id="cell_a"
-area="a"
-[cells.source]
-input_id="isolated_source"
-[[outputs]]
-kind="hls"
-path="{playlist}"
-codec="h264"
-segment_ms=1000
-[[outputs]]
-kind="srt"
-url="srt://[::]:{slow}?mode=listener"
-codec="hevc"
-[[outputs]]
-kind="srt"
-url="srt://[::]:{healthy}?mode=listener"
-codec="h264"
-"##,
-        clip = clip.display(),
-        playlist = playlist.display()
-    )
-}
-fn decode_pts(path: &Path) -> Vec<i64> {
+fn probe_media(path: &Path) -> (String, Vec<i64>, usize) {
     let output = Command::new("ffprobe")
         .args([
             "-v",
             "error",
-            "-select_streams",
-            "v:0",
             "-show_entries",
-            "frame=best_effort_timestamp",
+            "stream=codec_name,codec_type:frame=best_effort_timestamp,media_type",
             "-show_frames",
             "-of",
             "json",
@@ -116,25 +49,44 @@ fn decode_pts(path: &Path) -> Vec<i64> {
         String::from_utf8_lossy(&output.stderr)
     );
     let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
-    json["frames"]
+    let streams = json["streams"].as_array().unwrap();
+    let codec = streams
+        .iter()
+        .find(|stream| stream["codec_type"] == "video")
+        .and_then(|stream| stream["codec_name"].as_str())
+        .unwrap_or_default()
+        .to_owned();
+    let audio = streams
+        .iter()
+        .filter(|stream| stream["codec_type"] == "audio" && stream["codec_name"] == "aac")
+        .count();
+    let pts = json["frames"]
         .as_array()
         .unwrap()
         .iter()
+        .filter(|frame| frame["media_type"] == "video")
         .filter_map(|frame| frame["best_effort_timestamp"].as_i64())
-        .collect()
+        .collect();
+    (codec, pts, audio)
 }
 #[tokio::test]
 async fn live_clock_survives_slow_ipv4_peer_and_ipv6_reconnect() {
     // A live 30s run (not run_for): the hot producer must not await one peer.
     let dir = tempfile::tempdir().unwrap();
-    let source = dir.path().join("source.ts");
-    fixture(&source);
+    let clips = broadcast_fixture::paths(dir.path());
+    broadcast_fixture::generate(&clips, 35);
     let playlist = dir.path().join("hls/index.m3u8");
     let port = 30_000 + u16::try_from(std::process::id() % 9_000).unwrap();
-    let config =
-        MultiviewConfig::load_from_toml(&config(&source, &playlist, port, port + 1)).unwrap();
+    let config = MultiviewConfig::load_from_toml(&broadcast_fixture::config(
+        &clips,
+        &playlist,
+        port,
+        port + 1,
+    ))
+    .unwrap();
     config.validate().unwrap();
     let mut pipeline = Pipeline::build(&config).unwrap();
+    pipeline.enable_program_audio();
     let stop = StopSignal::new();
     let stopper = stop.clone();
     let stopped = std::thread::spawn(move || {
@@ -194,26 +146,40 @@ async fn live_clock_survives_slow_ipv4_peer_and_ipv6_reconnect() {
     stopped.join().unwrap();
     let _ = slow.join().unwrap();
     let _ = healthy.join().unwrap();
-    assert!(
-        report.frames >= 850,
-        "30s live clock produced {} frames, expected ~899",
-        report.frames
-    );
-    assert!(
-        !report.faltered,
-        "live hot clock shed {} frames",
-        report.dropped
-    );
-    let pts = decode_pts(&healthy_path);
-    assert!(
-        pts.len() > 150,
-        "healthy IPv6 peer decoded only {} frames",
-        pts.len()
-    );
+    let (codec, pts, audio_count) = probe_media(&healthy_path);
+    let mut faults = Vec::new();
+    if report.frames < 850 {
+        faults.push(format!("hot clock only {} ticks /30s", report.frames));
+    }
+    if report.faltered {
+        faults.push(format!("hot clock dropped {} ticks", report.dropped));
+    }
+    if codec != "h264" {
+        faults.push(format!("IPv6 healthy codec {codec} !=h264"));
+    }
+    if audio_count != 5 {
+        faults.push(format!("IPv6 healthy AAC tracks {audio_count} !=5"));
+    }
+    if pts.len() <= 150 {
+        faults.push(format!("IPv6 healthy decoded frames {} <=150", pts.len()));
+    }
     let mut sorted = pts;
     sorted.sort_unstable();
     for pair in sorted.windows(2) {
-        assert_eq!(pair[1] - pair[0], 3003, "healthy peer video gap");
+        if pair[1] - pair[0] != 3003 {
+            faults.push(format!(
+                "IPv6 healthy video PTS delta {} !=3003",
+                pair[1] - pair[0]
+            ));
+            break;
+        }
     }
-    assert!(playlist.exists(), "HLS remained available during slow peer");
+    if !playlist.exists() {
+        faults.push("HLS unavailable during slow peer".to_owned());
+    }
+    assert!(
+        faults.is_empty(),
+        "live mixed-output acceptance failed:\n{}",
+        faults.join("\n")
+    );
 }
