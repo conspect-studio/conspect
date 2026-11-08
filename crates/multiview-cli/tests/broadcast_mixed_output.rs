@@ -72,6 +72,26 @@ areas = ["a"]
 id = "broadcast_fixture"
 kind = "file"
 path = "{clip}"
+[[sources]]
+id = "tone_1"
+kind = "file"
+path = "{clip}"
+[[sources]]
+id = "tone_2"
+kind = "file"
+path = "{clip}"
+[[sources]]
+id = "tone_3"
+kind = "file"
+path = "{clip}"
+[[sources]]
+id = "tone_4"
+kind = "file"
+path = "{clip}"
+[[sources]]
+id = "tone_5"
+kind = "file"
+path = "{clip}"
 [[cells]]
 id = "cell_a"
 area = "a"
@@ -83,25 +103,58 @@ path = "{playlist}"
 codec = "h264"
 segment_ms = 1000
 [outputs.audio]
-mode = "auto"
+mode = "tracks"
+tracks = ["track-1", "track-2", "track-3", "track-4", "track-5"]
 [[outputs]]
 kind = "srt"
 url = "srt://[::]:{port_hevc}?mode=listener"
 codec = "hevc"
 [outputs.audio]
-mode = "auto"
+mode = "tracks"
+tracks = ["track-1", "track-2", "track-3", "track-4", "track-5"]
 [[outputs]]
 kind = "srt"
 url = "srt://[::]:{port_avc}?mode=listener"
 codec = "h264"
 [outputs.audio]
-mode = "auto"
+mode = "tracks"
+tracks = ["track-1", "track-2", "track-3", "track-4", "track-5"]
 [audio]
 sample_rate_hz = 48000
 [[audio.routes]]
 input_id = "broadcast_fixture"
 channels = {{ kind = "stereo" }}
 include_in_program_bus = true
+[[audio.routes]]
+input_id = "tone_1"
+channels = {{ kind = "stereo" }}
+target_track = "track-1"
+language = "eng"
+include_in_program_bus = false
+[[audio.routes]]
+input_id = "tone_2"
+channels = {{ kind = "stereo" }}
+target_track = "track-2"
+language = "eng"
+include_in_program_bus = false
+[[audio.routes]]
+input_id = "tone_3"
+channels = {{ kind = "stereo" }}
+target_track = "track-3"
+language = "eng"
+include_in_program_bus = false
+[[audio.routes]]
+input_id = "tone_4"
+channels = {{ kind = "stereo" }}
+target_track = "track-4"
+language = "eng"
+include_in_program_bus = false
+[[audio.routes]]
+input_id = "tone_5"
+channels = {{ kind = "stereo" }}
+target_track = "track-5"
+language = "eng"
+include_in_program_bus = false
 "##,
         clip = clip.display(),
         playlist = playlist.display()
