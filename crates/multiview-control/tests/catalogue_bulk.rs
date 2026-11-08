@@ -149,7 +149,9 @@ async fn above_the_old_cap_without_a_stated_activation_is_rejected() {
     assert_eq!(r.status(), StatusCode::UNPROCESSABLE_ENTITY);
     let detail = body_json(r).await["detail"].as_str().unwrap().to_owned();
     assert!(detail.contains("must state its `activation`"), "{detail}");
-    assert!(detail.contains("1 of 9"), "{detail}");
+    // This case leaves every entry implicit, so the count names all nine; the
+    // single-implicit-entry case is covered by its own test below.
+    assert!(detail.contains("9 of 9"), "{detail}");
     assert_eq!(count(&h).await, 0);
 }
 

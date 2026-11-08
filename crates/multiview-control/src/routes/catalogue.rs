@@ -773,6 +773,11 @@ pub(crate) struct BulkAddResponse {
         ),
     )
 )]
+// One checked-then-created path: the request cap, the explicit-activation rule
+// and the capacity check must all be decided under the single config-mutation
+// lock hold below, so splitting them would hide the ordering that makes the
+// batch atomic. Repo convention, as elsewhere in this crate.
+#[allow(clippy::too_many_lines)]
 pub(crate) async fn post_bulk_sources(
     State(state): State<AppState>,
     principal: Principal,

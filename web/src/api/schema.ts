@@ -3671,7 +3671,10 @@ export interface components {
         };
         /** @description Request body of `POST /catalogues/iptv-org/sources`. */
         BulkAddBody: {
-            /** @description 1..=8 sources to create. */
+            /**
+             * @description 1..=200 sources to create. Above 8 every entry must state its own
+             *     `activation` (`always_on` | `on_demand`).
+             */
             sources: components["schemas"]["BulkAddEntry"][];
         };
         /**
@@ -8820,7 +8823,7 @@ export interface operations {
                     "application/json": components["schemas"]["Problem"];
                 };
             };
-            /** @description At most 8 sources per bulk add (each starts always on until activation lands); or an entry is invalid or duplicated. Nothing was created. */
+            /** @description More than 200 sources in one bulk add; or more than 8 with an entry that leaves its `activation` implicit; or an entry is invalid or duplicated. Nothing was created. */
             422: {
                 headers: {
                     [name: string]: unknown;
