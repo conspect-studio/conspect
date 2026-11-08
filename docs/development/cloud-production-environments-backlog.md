@@ -1,0 +1,34 @@
+# On-demand Conspect Cloud production environments
+
+[Engine implementation epic #213](https://github.com/conspect-studio/conspect/issues/213) · Backlog, unscheduled
+
+A production has a stable environment ID. An operator can sync an existing show, start a funded Cloud session, edit or record during the session, stop the machine, then resume the same show on a newly provisioned machine. The account control plane owns wallets, tenancy, provisioning, retention policy and billing. The engine owns what it saves, what it can restore and the evidence it provides before a session is ready or safe to release.
+
+## What survives a stop
+
+| State | Durable representation | Behaviour on resume |
+| --- | --- | --- |
+| Show configuration | Versioned bundle derived from accepted [desired state](../architecture/live-durable-desired-state.md). Inventory all supported configuration, including sources and outputs with stable IDs, routes, audio mixes, every named layout and the exact selected layout, switcher settings, graphics, media cues/playlists and recording configuration. | Validate and migrate before applying. Preserve references across resources. Show the operator any missing media, credentials, plug-ins or device bindings, with a way to rebind. |
+| Recallable live state | Optional, revision-linked [warm-restart checkpoint](../decisions/ADR-M012.md) for supported items such as bus selections, keyer state and cue points. | Apply after the base configuration. Resolve an interrupted transition to its completed state. External transmissions and recording need an explicit re-arm policy or operator action. |
+| Production media | Tenant-scoped asset IDs and a versioned manifest for uploads, playout clips, graphics, and programme and isolated-source (ISO) recordings. AWS S3 or Cloudflare R2 holds the durable bytes. | Resolve assets by ID and verify critical assets before declaring the show usable. Hydrate other assets on demand so a large archive need not download before the multiviewer opens. |
+| Machine-local state | Scratch space for transcodes, bounded recording staging and a replaceable read cache. Secret references live in the bundle under [ADR-M006](../decisions/ADR-M006.md). | Obtain fresh scoped credentials. Recreate caches and connections. Flag host-local paths, capture cards and unreachable network sources that require rebinding. |
+
+## Save and resume contract
+
+1. **Sync a production.** Preview and validate the initial import from an existing engine, including the media it references. Report unsupported resources. Thereafter, sync accepted edits continuously and offer an explicit save. Tag each revision with the environment, schema, parent revision and asset manifest. Publish the current pointer only after validation and verification of required objects. Display the last cloud-acknowledged revision and any local or pending changes.
+2. **Coordinate writers.** The control plane grants a scoped run identity and generation. Each write checks that authority and the expected parent revision. Fence old workers and surface a conflict if two editors save against the same base. Retries may reuse uploaded objects and must leave a complete previous revision available. Allow recovery to a selected known-good revision with operator visibility.
+3. **Restore on fresh compute.** Accept a funded, authorised start from the control plane. Resolve the committed revision, validate capability and schema, refresh secret references, and restore the show in dependency order. Report distinct events for provisioning, restore progress, reachable multiviewer, usable production, and any blocked or degraded resources. A readiness event identifies the exact run and revision. A failed restore reports the cause and enables cleanup or retry without claiming readiness.
+4. **Stop and release.** Acknowledge the stop request, quiesce external outputs and recording, close segments, and report the last committed config and media boundaries. The control plane can release the worker once durability is confirmed. If the store is unavailable, enter a bounded drain with a visible outstanding-data report and an explicit recovery or discard decision before voluntary destruction. A crash may lose unacknowledged edits or a recording tail. On the next start, identify the last confirmed segment and any known gap.
+5. **Keep the production while stopped.** The environment, its revisions and its retained objects remain accessible to authorised users under the account's storage policy. Deleting the environment or purging retained media is a separate authorised operation. Revoking an old worker's write lease must also prevent it publishing over a resumed session.
+
+## Recording and media I/O
+
+Extend the [segmented recorder](../decisions/ADR-0037.md) and [bounded recording offload](../decisions/ADR-0070.md). Upload closed segments asynchronously, use resumable or multipart transfers where appropriate, verify size and checksum, then publish the manifest entry. Treat local staging and incomplete remote objects as pending. Expose pending bytes, upload failures, the last committed segment and any recording gap. Cap the staging budget and report when recording must stop. An unavailable bucket, full disk or slow transfer must never stall the programme output clock. Scope reads, writes and signed access to the authorised tenant and environment.
+
+## Definition of done
+
+- **Replacement drill.** Import a show with two saved layouts, a selected layout, stable input and output IDs, audio routing, a graphic and a playout cue. Edit it while running, record programme and ISO, then stop. Destroy the VM and its disks. Resume using only the environment identity and new authorisation. Compare the restored revision and resource graph, play the clip, and retrieve the committed recordings. Repeat on AWS S3 and Cloudflare R2.
+- **Failure drill.** Interrupt a multipart upload and a configuration save. Exercise a disconnected client, a former worker that reconnects, duplicate start/stop delivery, an expired grant, a missing device, and a cross-tenant object request. Confirm one authoritative run, the last complete revision, an intelligible repair report and continued programme timing during storage faults.
+- **Time to restore.** Measure request-to-multiviewer and request-to-usable-production separately on a cold worker, including a large-library case. Record timings, library size, and which assets were required for readiness. Share the signals with the Cloud portal so it can show readiness, an actionable blocker or progress.
+
+The [media library](https://github.com/conspect-studio/conspect/issues/37) and [stored layout persistence](https://github.com/conspect-studio/conspect/issues/176) supply resources for the bundle. The [Exchange restreaming worker](https://github.com/conspect-studio/conspect/issues/211) handles a single booked feed and has its own lifecycle.
