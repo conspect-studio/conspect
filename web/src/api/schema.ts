@@ -6831,7 +6831,7 @@ export interface operations {
             query?: never;
             header?: never;
             path: {
-                /** @description audit, scoped-token, relays, provision, import, update, teardown, observe, rotate, revoke */
+                /** @description audit, permissions, scoped-token, relays, provision, import, update, teardown, observe, rotate, rotation-installed, revoke, revoke-token, detach, set-mode, reconcile, recover, adopt-recovery, acknowledge-recovery, capabilities */
                 action: string;
             };
             cookie?: never;
