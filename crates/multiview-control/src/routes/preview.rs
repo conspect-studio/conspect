@@ -52,10 +52,9 @@ pub(crate) async fn capabilities(State(state): State<AppState>, principal: Princ
     if let Err(err) = principal.role.require(Action::Read) {
         return err.into_response();
     }
-    Json(crate::preview::PreviewCapabilities::from_provider(
-        state.whep.as_ref(),
-    ))
-    .into_response()
+    let mut capabilities = crate::preview::PreviewCapabilities::from_provider(state.whep.as_ref());
+    capabilities.moq = state.moq.available();
+    Json(capabilities).into_response()
 }
 
 /// `GET /api/v1/preview/program.jpg` — the latest composited program frame

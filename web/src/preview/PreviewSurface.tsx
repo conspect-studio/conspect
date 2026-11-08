@@ -9,7 +9,9 @@
 //     (non-2xx POST incl. 503 capacity, connectionState=failed, or the stats
 //     stall watchdog) with a VISIBLE "Fallback — still preview" badge and a
 //     "retry live preview" affordance (a fresh WHEP attempt), never a hot loop.
-import { useState } from 'react';
+import { useMemo, useState } from 'react';
+import { MoqPlayer } from './MoqPlayer';
+import { createMoqLeaseApi } from './moqLeaseApi';
 import type { JSX } from 'react';
 import { Trans, useLingui } from '@lingui/react/macro';
 import { RotateCw, Wifi } from 'lucide-react';
@@ -142,7 +144,17 @@ export function PreviewSurface({
   const [busy, setBusy] = useState(false);
   const [released, setReleased] = useState(true);
 
+  const [moqUnavailable, setMoqUnavailable] = useState(false);
+  const [moqFailed, setMoqFailed] = useState(false);
+  const moqApi = useMemo(() => createMoqLeaseApi(scope, whepEndpoint), [scope, whepEndpoint]);
   const canWhep = whepAvailable(capabilities, scope);
+
+  if (moqFailed) return <div role="alert"><Trans>Live input preview failed.</Trans></div>;
+  if (capabilities?.moq && !moqUnavailable) {
+    return <MoqPlayer api={moqApi} label={label} audio={audio} className={className}
+      onUnavailable={() => { setMoqUnavailable(true); }} onFatal={() => { setMoqFailed(true); }}
+      onLeaseState={(state) => { onLeaseState?.(state); if (state === 'released') onSessionReleased?.(); }} />;
+  }
 
   // No WebRTC for this scope/build: JPEG is the honest primary — NO badge.
   // This applies to every scope, including `input`: a build with no WebRTC at

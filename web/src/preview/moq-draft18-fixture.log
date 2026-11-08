@@ -1,0 +1,17 @@
+debug [vite] connecting...
+debug [vite] connected.
+debug https://localhost:4443/ connected via WebTransport
+debug https://localhost:4443/ negotiated ALPN: moqt-18
+debug subscribe start: id=2 broadcast=fixture track=catalog.json
+debug subscribe_namespace written: requestId=0
+debug subscribe written: id=2 broadcast=fixture track=catalog.json
+debug announced: broadcast=fixture active=true
+debug subscribe ok: id=2 broadcast=fixture track=catalog.json
+debug received catalog hang fixture {video: Object, audio: Object}
+debug subscribe start: id=4 broadcast=fixture track=video
+debug subscribe written: id=4 broadcast=fixture track=video
+debug subscribe ok: id=4 broadcast=fixture track=video
+{"frames":30,"timestamps":[336000000,336366666,336866666,336900000,336933333,336966666,337000000,337033333,337066666,337100000,337133333,337166666,337200000,337233333,337266666,337300000,337333333,337366666,337400000,337433333,337466666,337500000,337533333,337566666,337600000,337633333,337666666,337700000,337733333,337766666],"version":"moq-transport-18","error":null}
+debug announced: broadcast=fixture active=false
+debug subscribe close: id=2 broadcast=fixture track=catalog.json
+debug subscribe close: id=4 broadcast=fixture track=video

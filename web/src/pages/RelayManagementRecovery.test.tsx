@@ -1,0 +1,25 @@
+import { afterAll, afterEach, beforeAll, expect, it } from "vitest";
+import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { http, HttpResponse } from "msw";
+import { setupServer } from "msw/node";
+import { I18nProvider } from "../i18n/I18nProvider";
+import { RelayManagementPage } from "./RelayManagementPage";
+import { createRelayManagementService } from "../api/relayManagementService";
+import { createApiClient } from "../api/client";
+const server = setupServer();
+beforeAll(() => { server.listen({ onUnhandledRequest: "error" }); });
+afterEach(() => { server.resetHandlers(); });
+afterAll(() => { server.close(); });
+it.each([{ records: [], pending: "recovery" }, { records: null, pending: null }])("disables automatic selection when real adapter inventory is invalid %j", async (invalid) => {
+  let mutations = 0;
+  server.use(http.post("*/api/v1/cloudflare/credentials", () => HttpResponse.json({ data: { secret_ref: "vault:stored" } })), http.post("*/api/v1/cloudflare/capabilities", () => HttpResponse.json({ data: { automatic_reconciliation: true } })), http.post("*/api/v1/cloudflare/relays", () => HttpResponse.json({ data: { mode: "manual", desired_transport: "moq", ...invalid } })), http.post("*/api/v1/cloudflare/set-mode", () => { mutations += 1; return HttpResponse.json({ data: {} }); }), http.post("*/api/v1/cloudflare/reconcile", () => { mutations += 1; return HttpResponse.json({ data: {} }); }));
+  const service = createRelayManagementService(createApiClient({ baseUrl: "http://localhost" }));
+  render(<I18nProvider><RelayManagementPage service={service} /></I18nProvider>);
+  fireEvent.change(screen.getByLabelText("Account ID"), { target: { value: "account" } });
+  fireEvent.change(screen.getByLabelText("API secret"), { target: { value: "secret" } });
+  fireEvent.click(screen.getByRole("button", { name: "Store credential securely" }));
+  await screen.findByRole("alert");
+  await waitFor(() => { expect(screen.getByLabelText("Management mode")).toBeDisabled(); });
+  expect(service.supportsAutomaticMode).toBe(false);
+  expect(mutations).toBe(0);
+});

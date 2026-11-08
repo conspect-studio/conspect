@@ -1,0 +1,28 @@
+[
+  {
+    "protocol": "moq-transport-16",
+    "videoPaints": 30,
+    "uniqueVideoPts": 29,
+    "nativeAudioOutputs": 54,
+    "matchedPtsSamples": 28,
+    "videoPaintMinusAudioDecodeMs": {
+      "min": 111.60000002384186,
+      "max": 146.89999997615814,
+      "mean": 123.84642857100282
+    },
+    "meaning": "Callback timing only; no speaker/display synchronization bound"
+  },
+  {
+    "protocol": "moq-transport-18",
+    "videoPaints": 30,
+    "uniqueVideoPts": 29,
+    "nativeAudioOutputs": 55,
+    "matchedPtsSamples": 28,
+    "videoPaintMinusAudioDecodeMs": {
+      "min": 110.69999998807907,
+      "max": 147.0,
+      "mean": 122.59642856674535
+    },
+    "meaning": "Callback timing only; no speaker/display synchronization bound"
+  }
+]

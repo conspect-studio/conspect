@@ -12,6 +12,9 @@ authors.workspace = true
 publish = false
 
 [dependencies]
+multiview-moq = { path = "../multiview-moq", optional = true }
+multiview-cloudflare = { path = "../multiview-cloudflare" }
+multiview-credentials = { path = "../multiview-credentials" }
 multiview-core = { workspace = true }
 multiview-engine = { workspace = true }
 multiview-events = { workspace = true }
@@ -220,6 +223,7 @@ rustls = { version = "0.23", optional = true }
 rustls-pki-types = { version = "1", features = ["std"], optional = true }
 
 [dev-dependencies]
+multiview-cloudflare = { path = "../multiview-cloudflare", features = ["testing"] }
 # Self dev-dependency: the canonical way to enable a TEST-ONLY feature for this
 # crate's OWN tests without pulling it into the default build or a downstream
 # consumer's normal build. Dev-dependencies are inactive for a normal
@@ -282,6 +286,8 @@ reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"
 tokio-rustls = "0.26"
 
 [features]
+# Authenticated QUIC transport remains opt-in until a production feed factory is wired.
+moq-transport = ["dep:multiview-moq"]
 "default" = ["openapi"]
 "openapi" = ["dep:utoipa", "dep:utoipa-axum", "dep:utoipa-scalar"]
 "embed-web" = ["dep:rust-embed", "dep:mime_guess"]
