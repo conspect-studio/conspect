@@ -549,7 +549,20 @@ fn configured_cloudflare(
     }
     let mut key = [0u8; 32];
     let mut file = std::fs::File::open(path)?;
-    file.read_exact(&mut key)?;
+    let opened = file.metadata()?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if opened.dev() != metadata.dev() || opened.ino() != metadata.ino()
+            || opened.mode() & 0o077 != 0 || !opened.is_file()
+        {
+            return Err(Error::new(ErrorKind::PermissionDenied, "Cloudflare master-key file changed during open"));
+        }
+    }
+    if let Err(error) = file.read_exact(&mut key) {
+        key.fill(0);
+        return Err(error);
+    }
     let mut trailing = [0u8; 1];
     if file.read(&mut trailing)? != 0 {
         key.fill(0);

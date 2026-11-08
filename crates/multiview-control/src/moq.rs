@@ -89,6 +89,9 @@ pub trait MoqFence: Send + Sync {
     fn revoke(&self);
 }
 /// Provider must authorize resolved dependencies before admission. It must never encode per viewer.
+/// Admission and fence callbacks must be bounded and nonblocking: no network or disk I/O.
+/// The transport must independently enforce the supplied TTL at its enqueue/session gate,
+/// so a delayed control-plane executor cannot extend access to future media.
 pub trait MoqProvider: Send + Sync {
     /// Whether the complete authorized transport is ready.
     fn available(&self) -> bool {
