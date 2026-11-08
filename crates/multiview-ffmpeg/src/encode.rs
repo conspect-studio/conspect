@@ -90,6 +90,8 @@ pub struct VideoEncoder {
     /// path (no pin requested, a non-NVENC codec, or a bind that gracefully fell
     /// back to the default device).
     hw_device: Option<crate::hwframe::HwDeviceContext>,
+    /// Opened context proves no B frames and no buffered encoder delay.
+    no_reorder: bool,
 }
 
 impl VideoEncoder {
@@ -135,6 +137,7 @@ impl VideoEncoder {
         ctx.set_height(target.height);
         ctx.set_format(target.format);
         ctx.set_time_base(tb);
+        ctx.set_max_b_frames(0);
         if target.bit_rate > 0 {
             ctx.set_bit_rate(target.bit_rate);
         }
@@ -175,8 +178,16 @@ impl VideoEncoder {
             ctx.open_as_with(codec, to_dictionary(options))
         }
         .map_err(FfmpegError::OpenEncoder)?;
+        // SAFETY: `encoder` owns the opened AVCodecContext for this read-only
+        // snapshot. The pointer remains valid for its entire lifetime.
+        #[allow(unsafe_code)] // SAFETY: read only the live opened encoder context.
+        let no_reorder = unsafe {
+            let ctx = encoder.as_ptr();
+            (*ctx).max_b_frames == 0 && (*ctx).has_b_frames == 0 && (*ctx).delay == 0
+        };
         Ok(Self {
             encoder,
+            no_reorder,
             time_base: target.time_base,
             configured_bit_rate: u64::try_from(target.bit_rate).ok().filter(|rate| *rate > 0),
             dimensions: (target.width, target.height),
@@ -228,6 +239,12 @@ impl VideoEncoder {
     #[must_use]
     pub const fn configured_bit_rate(&self) -> Option<u64> {
         self.configured_bit_rate
+    }
+
+    /// Whether the opened encoder context proves zero reorder and delay.
+    #[must_use]
+    pub const fn no_reorder_proven(&self) -> bool {
+        self.no_reorder
     }
 
     /// Configured output dimensions.

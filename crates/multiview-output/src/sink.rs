@@ -557,6 +557,7 @@ pub struct VideoRenditionEncoder {
     time_base: Rational,
     tick: i64,
     finished: bool,
+    no_reorder: bool,
 }
 
 impl VideoRenditionEncoder {
@@ -569,6 +570,7 @@ impl VideoRenditionEncoder {
         let encoder = VideoEncoder::new(&config.target()).map_err(ff)?;
         let params = StreamCodecParameters::from_encoder(&encoder);
         let time_base = encoder.time_base();
+        let no_reorder = encoder.no_reorder_proven();
         Ok(Self {
             encoder,
             converter: FrameConverter::new(config.format),
@@ -576,7 +578,14 @@ impl VideoRenditionEncoder {
             time_base,
             tick: 0,
             finished: false,
+            no_reorder,
         })
+    }
+
+    /// True only when the opened encoder's effective reorder and delay are zero.
+    #[must_use]
+    pub const fn no_reorder_proven(&self) -> bool {
+        self.no_reorder
     }
 
     /// Codec parameters for all bindings to this rendition.
@@ -605,7 +614,10 @@ impl VideoRenditionEncoder {
                 "video rendition encoder is finished".to_owned(),
             ));
         }
-        let pts = i64::try_from(tick).unwrap_or(i64::MAX).max(self.tick);
+        let pts = i64::try_from(tick).map_err(|_| Error::Output("video tick exceeds i64 PTS".to_owned()))?;
+        if pts != self.tick {
+            return Err(Error::Output(format!("video tick discontinuity: expected {}, got {pts}", self.tick)));
+        }
         let prepared = self.converter.prepare(frame.frame, pts)?;
         self.encoder.send_frame(&prepared).map_err(ff)?;
         self.tick = pts.saturating_add(1);
