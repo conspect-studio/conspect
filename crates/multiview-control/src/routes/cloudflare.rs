@@ -69,6 +69,24 @@ pub struct CloudflareRequest {
     pub token_jti: Option<String>,
     /// auto creates a missing managed relay on reconcile; manual only observes.
     pub mode: Option<String>,
+    /// Whole-object upstream replacement; omitted preserves remote configuration.
+    pub config: Option<CloudflareRelayConfig>,
+}
+#[derive(serde::Deserialize, serde::Serialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+pub struct CloudflareRelayConfig {
+    pub upstreams: Option<CloudflareUpstreams>,
+}
+#[derive(serde::Deserialize, serde::Serialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+pub struct CloudflareUpstreams {
+    pub enabled: bool,
+    pub upstreams: Vec<CloudflareUpstream>,
+}
+#[derive(serde::Deserialize, serde::Serialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+pub struct CloudflareUpstream {
+    pub url: String,
 }
 #[derive(serde::Serialize)]
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]

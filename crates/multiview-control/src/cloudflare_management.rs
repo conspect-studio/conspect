@@ -72,6 +72,7 @@ impl ManagedCloudflare {
                                 permission_group_id: None,
                                 token_jti: None,
                                 mode: None,
+                                config: None,
                             },
                         )
                         .await;
@@ -267,7 +268,12 @@ impl ManagedCloudflare {
         if action == "recover" {
             // Explicit read-only discovery: never guess that a timed-out POST failed.
             // Operator must inspect remote resources before separately acknowledging.
-            let relays = client.list().await.map_err(|_| "recovery discovery")?;
+            let relays = client.list().await.map_err(|error| match error {
+                multiview_cloudflare::Error::IncompleteInventory => {
+                    "inventory incomplete; use explicit resource recovery"
+                }
+                _ => "recovery discovery",
+            })?;
             return Ok(CloudflareResult {
                 data: serde_json::json!({"remote_relays":relays,"pending":state.pending.get(&key)}),
             });
@@ -383,6 +389,7 @@ impl ManagedCloudflare {
                 | "update"
                 | "rotate"
                 | "revoke"
+                | "revoke-token"
                 | "detach"
         ) {
             return Err("unsupported operation");
@@ -400,12 +407,19 @@ impl ManagedCloudflare {
         }
         if matches!(
             action,
-            "import" | "teardown" | "observe" | "update" | "rotate" | "revoke" | "detach"
+            "import"
+                | "teardown"
+                | "observe"
+                | "update"
+                | "rotate"
+                | "revoke"
+                | "revoke-token"
+                | "detach"
         ) && r.relay_id.is_none()
         {
             return Err("relay");
         }
-        if action == "rotate" && r.token_jti.is_none() {
+        if matches!(action, "rotate" | "revoke-token") && r.token_jti.is_none() {
             return Err("token");
         }
         let valid_id = |s: &str| {
@@ -424,6 +438,19 @@ impl ManagedCloudflare {
             .is_some_and(|s| s.trim().is_empty() || s.len() > 120)
         {
             return Err("name");
+        }
+        if let Some(upstreams) = r
+            .config
+            .as_ref()
+            .and_then(|config| config.upstreams.as_ref())
+        {
+            if upstreams.upstreams.len() > 32 {
+                return Err("upstream quota");
+            }
+            for upstream in &upstreams.upstreams {
+                multiview_cloudflare::validate_upstream(&upstream.url)
+                    .map_err(|_| "upstream URL")?;
+            }
         }
         let domain = r.auth_domain.as_deref().unwrap_or(owner);
         if domain.is_empty() {
@@ -516,7 +543,16 @@ impl ManagedCloudflare {
                         domain,
                         &multiview_cloudflare::RelayUpdate {
                             name: r.name.clone(),
-                            config: None,
+                            config: r
+                                .config
+                                .as_ref()
+                                .map(|config| {
+                                    serde_json::from_value(
+                                        serde_json::to_value(config).map_err(|_| "config")?,
+                                    )
+                                    .map_err(|_| "config")
+                                })
+                                .transpose()?,
                         },
                     )
                     .await
@@ -574,6 +610,20 @@ impl ManagedCloudflare {
                 }
                 state.rotation_ready.insert(format!("{key}:{id}"), false);
                 serde_json::json!({"tokens":refs,"old_token_still_valid":true})
+            }
+            "revoke-token" => {
+                let jti = r.token_jti.as_deref().ok_or("token")?;
+                match client
+                    .revoke_token(r.relay_id.as_deref().ok_or("relay")?, jti)
+                    .await
+                {
+                    Ok(()) | Err(multiview_cloudflare::Error::Api(404)) => {}
+                    Err(_) => return Err("revoke token"),
+                }
+                if let Some(refs) = state.token_refs.get_mut(&key) {
+                    refs.remove(jti);
+                }
+                serde_json::json!({"revoked":true,"connected_sessions_terminated":false})
             }
             "revoke" => {
                 registry
@@ -651,6 +701,7 @@ mod tests {
             permission_group_id: None,
             token_jti: None,
             mode,
+            config: None,
         };
         assert!(manager
             .run("bob", "set-mode", request(Some("auto".into())))
@@ -664,6 +715,25 @@ mod tests {
             .run("alice", "scoped-token", request(None))
             .await
             .is_err());
+        assert!(manager.state.lock().await.pending.is_empty());
+        let mut invalid_update = request(None);
+        invalid_update.relay_id = Some("relay".into());
+        invalid_update.config = Some(crate::routes::cloudflare::CloudflareRelayConfig {
+            upstreams: Some(crate::routes::cloudflare::CloudflareUpstreams {
+                enabled: true,
+                upstreams: vec![crate::routes::cloudflare::CloudflareUpstream {
+                    url: "file:///etc/passwd".into(),
+                }],
+            }),
+        });
+        assert!(manager
+            .run("alice", "update", invalid_update)
+            .await
+            .is_err());
+        let mut revoke = request(None);
+        revoke.relay_id = Some("relay".into());
+        revoke.token_jti = Some("token".into());
+        assert!(manager.run("alice", "revoke-token", revoke).await.is_err());
         assert!(manager.state.lock().await.pending.is_empty());
         {
             let mut state = manager.state.lock().await;

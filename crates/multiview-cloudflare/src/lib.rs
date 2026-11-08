@@ -43,6 +43,8 @@ pub enum Error {
     Api(u16),
     #[error("invalid management API response")]
     Response,
+    #[error("inventory incomplete; use explicit resource recovery")]
+    IncompleteInventory,
     #[error("authorization domain conflict or quota exceeded")]
     Isolation,
     #[error("imported resource cannot be destroyed automatically")]
@@ -274,14 +276,14 @@ impl Client {
             if count == 100 && count < total {
                 // An unseen sibling can share the last timestamp. Strict cursors
                 // would skip it; do not return a falsely complete enumeration.
-                return Err(Error::Response);
+                return Err(Error::IncompleteInventory);
             }
             if count < total
                 && page
                     .windows(2)
                     .any(|pair| pair[0].created == pair[1].created)
             {
-                return Err(Error::Response);
+                return Err(Error::IncompleteInventory);
             }
             for item in page {
                 if !seen.insert(item.uid.clone()) {
@@ -304,7 +306,7 @@ impl Client {
             }
             cursor = Some(next);
         }
-        Err(Error::Response)
+        Err(Error::IncompleteInventory)
     }
     /// # Errors
     /// Returns a sanitized error for invalid input, ownership conflicts, or API failure.
@@ -414,6 +416,20 @@ fn token_result(v: serde_json::Value) -> Result<Vec<Token>, Error> {
 }
 
 pub mod account;
+/// Validate a Cloudflare upstream URL without exposing any embedded credentials.
+/// # Errors
+/// Returns `Error::Invalid` for unsupported schemes, absent hosts, or credentials.
+pub fn validate_upstream(value: &str) -> Result<(), Error> {
+    let url = reqwest::Url::parse(value).map_err(|_| Error::Invalid)?;
+    if !matches!(url.scheme(), "https" | "moqt")
+        || url.host_str().is_none()
+        || !url.username().is_empty()
+        || url.password().is_some()
+    {
+        return Err(Error::Invalid);
+    }
+    Ok(())
+}
 pub mod lifecycle;
 
 #[cfg(test)]
@@ -497,13 +513,19 @@ mod tests {
     }
     #[tokio::test]
     async fn relay_list_rejects_invalid_counts_and_boundary_ties() {
-        for body in [
-            r#"{"success":true,"result":[],"result_info":{"count":1,"total":1}}"#,
-            r#"{"success":true,"result":[{"uid":"a","name":"a","created":"2026-11-08T10:00:00Z"},{"uid":"b","name":"b","created":"2026-11-08T10:00:00Z"}],"result_info":{"count":2,"total":3}}"#,
+        for (body, expected) in [
+            (
+                r#"{"success":true,"result":[],"result_info":{"count":1,"total":1}}"#,
+                Error::Response,
+            ),
+            (
+                r#"{"success":true,"result":[{"uid":"a","name":"a","created":"2026-11-08T10:00:00Z"},{"uid":"b","name":"b","created":"2026-11-08T10:00:00Z"}],"result_info":{"count":2,"total":3}}"#,
+                Error::IncompleteInventory,
+            ),
         ] {
             assert_eq!(
                 client(origin_server(body)).await.list().await.unwrap_err(),
-                Error::Response
+                expected
             );
         }
     }
@@ -522,7 +544,7 @@ mod tests {
                 .list()
                 .await
                 .unwrap_err(),
-            Error::Response
+            Error::IncompleteInventory
         );
     }
     #[tokio::test]
