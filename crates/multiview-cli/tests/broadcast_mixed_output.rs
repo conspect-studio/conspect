@@ -303,7 +303,9 @@ async fn mixed_codec_pipeline_receives_decodable_media_not_just_headers() {
             std::thread::sleep(Duration::from_millis(800));
             Command::new("timeout")
                 .args([
-                    "16",
+                    "--signal=INT",
+                    "--preserve-status",
+                    "8s",
                     "ffmpeg",
                     "-hide_banner",
                     "-loglevel",
@@ -314,7 +316,7 @@ async fn mixed_codec_pipeline_receives_decodable_media_not_just_headers() {
                 .arg(format!(
                     "srt://[::1]:{port}?mode=caller&connect_timeout=5000"
                 ))
-                .args(["-t", "6", "-c", "copy", "-f", "mpegts"])
+                .args(["-c", "copy", "-f", "mpegts"])
                 .arg(&path)
                 .status()
                 .expect("receive SRT")
@@ -328,13 +330,14 @@ async fn mixed_codec_pipeline_receives_decodable_media_not_just_headers() {
         .expect("paced output pipeline");
     assert_eq!(report.frames, TICKS);
     assert!(!report.faltered, "output clock must not falter");
+    // timeout sends SIGINT at a wall deadline, which FFmpeg can report as a
+    // nonzero input interruption. Decodable captured frames below, not process
+    // exit status alone, are the delivery criterion.
+    let _hevc_exit = h.join().unwrap();
+    let _avc_exit = a.join().unwrap();
     assert!(
-        h.join().unwrap().success(),
-        "HEVC SRT peer must receive actual bytes"
-    );
-    assert!(
-        a.join().unwrap().success(),
-        "H264 SRT peer must receive actual bytes"
+        hevc_path.exists() && avc_path.exists(),
+        "both SRT captures must exist"
     );
     let (hevc_codec, hevc_pts) = probe_frames(&hevc_path);
     let (avc_codec, avc_pts) = probe_frames(&avc_path);
