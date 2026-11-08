@@ -53,6 +53,15 @@ pub struct BakedTick {
 /// packet whose DTS equals the bound may still arrive. A watermark is a
 /// monotonic non-decreasing claim about the *stream*, never a claim about the
 /// current call.
+///
+/// Exactness requirement: the bound is computed with the same monotone
+/// floor-to-nanoseconds rational rescale the consumer uses, so under
+/// [`ReorderBound::NoReorder`] `floor_ns(PTS(tick + 1))` really is a lower
+/// bound on every future packet's rescaled DTS (floor is monotone, and future
+/// encoder DTS values are ≥ the exact PTS of tick `tick + 1`). A producer that
+/// cannot show that equality must publish `None`: a bound even one nanosecond
+/// too high would let the window assembler close a window whose packet is still
+/// in flight.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct DtsWatermark {
     /// Exclusive upper bound in nanoseconds on the DTS of any future packet.
@@ -98,12 +107,16 @@ pub enum DispatchEvent {
     Audio {
         /// The absolute program tick whose sample window was encoded.
         tick: u64,
-        /// The opened audio encoder's timebase.
-        timebase: Rational,
+        /// Per configured audio stream, indexed by stream index: the **opened**
+        /// encoder's timebase for that stream. Independent tracks may run at
+        /// different sample rates, so one common timebase is not assumed; a
+        /// consumer that cannot validate every stream's base must reject the
+        /// event rather than rescale a packet with the wrong base.
+        timebases: Vec<Rational>,
         /// All packets emitted for every configured audio stream this tick.
         packets: Vec<EncodedPacket>,
-        /// Per configured audio stream, indexed by stream index: a silent or
-        /// absent track must never inherit another track's proof.
+        /// Per configured audio stream, indexed the same way as `timebases`: a
+        /// silent or absent track must never inherit another track's proof.
         watermarks: Vec<Option<DtsWatermark>>,
     },
     /// Terminal event: the encoder was **flushed**, `packets` is the complete
@@ -193,12 +206,14 @@ impl WatermarkTracker {
     }
 }
 
-/// The exclusive DTS lower bound for the tick **after** `tick`, in nanoseconds.
+/// The exclusive DTS lower bound for the tick **after** `tick`, in nanoseconds:
+/// exactly `floor_ns(PTS(tick + 1))`.
 ///
-/// All packets for inputs at or after tick `tick + 1` have an encoder DTS of at
-/// least the exact PTS of that tick, so the floor of that PTS minus 1 ns is a
-/// conservative exclusive bound. Returns `None` for a degenerate cadence, which
-/// makes the worker publish no watermark at all rather than a wrong one.
+/// Under [`ReorderBound::NoReorder`] every packet for an input at or after tick
+/// `tick + 1` has an encoder DTS of at least the exact PTS of that tick, and the
+/// floor rescale is monotone, so no future packet's rescaled DTS is below this
+/// value. Returns `None` for a degenerate cadence, which makes the worker
+/// publish no watermark at all rather than a wrong one.
 #[must_use]
 pub fn next_tick_lower_bound_ns(tick: u64, cadence: Rational) -> Option<DtsWatermark> {
     if cadence.num <= 0 || cadence.den <= 0 {
@@ -207,29 +222,39 @@ pub fn next_tick_lower_bound_ns(tick: u64, cadence: Rational) -> Option<DtsWater
     let num = u128::try_from(cadence.num).ok()?;
     let den = u128::try_from(cadence.den).ok()?;
     let next_tick = u128::from(tick).checked_add(1)?;
-    // floor(next_tick * den * 1e9 / num) - 1, all in u128, then narrowed.
+    // floor(next_tick * den * 1e9 / num), all in u128, then narrowed.
     let ns = next_tick
         .checked_mul(den)?
         .checked_mul(1_000_000_000)?
-        .checked_div(num)?
-        .checked_sub(1)?;
+        .checked_div(num)?;
     Some(DtsWatermark {
         complete_before_ns: i128::try_from(ns).ok()?,
     })
 }
 
-/// The exclusive DTS lower bound after submitting `samples` samples at
-/// `sample_rate` Hz: no packet for that stream can have a PTS below the exact
-/// presentation time of the samples already submitted.
+/// The exclusive DTS lower bound after a FIFO, frame-aligned audio encoder has
+/// emitted its `last_pts` packet: exactly `floor_ns(last_pts + frame_samples)`.
+///
+/// Correct only when the next packet's PTS is exactly `last_pts +
+/// frame_samples` — true for AAC-family FIFO encoders whose packets are
+/// frame-aligned and whose output order is emission order. The bound is derived
+/// from the emitted packet PTS, never from the submitted sample count: a
+/// partially submitted frame may still produce a packet for earlier samples,
+/// so `samples_submitted` is not a proof.
 #[must_use]
-pub fn audio_sample_lower_bound_ns(samples: u64, sample_rate: u32) -> Option<DtsWatermark> {
-    if sample_rate == 0 {
+pub fn next_frame_lower_bound_ns(
+    last_pts: i64,
+    frame_samples: u32,
+    sample_rate: u32,
+) -> Option<DtsWatermark> {
+    if sample_rate == 0 || frame_samples == 0 {
         return None;
     }
-    let ns = u128::from(samples)
+    let next_pts = i128::from(last_pts).checked_add(i128::from(frame_samples))?;
+    let next_pts = u128::try_from(next_pts).ok()?;
+    let ns = next_pts
         .checked_mul(1_000_000_000)?
-        .checked_div(u128::from(sample_rate))?
-        .checked_sub(1)?;
+        .checked_div(u128::from(sample_rate))?;
     Some(DtsWatermark {
         complete_before_ns: i128::try_from(ns).ok()?,
     })
@@ -341,7 +366,7 @@ impl RenditionWorker {
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
     use super::{
-        audio_sample_lower_bound_ns, next_tick_lower_bound_ns, BakedTick, DispatchEvent,
+        next_frame_lower_bound_ns, next_tick_lower_bound_ns, BakedTick, DispatchEvent,
         DtsWatermark, OfferRejection, RenditionWorker, ReorderBound, VideoEncodeWorker,
         WatermarkTracker, WORKER_QUEUE_TICKS,
     };
@@ -530,9 +555,9 @@ mod tests {
         }
         worker.join().expect("join");
 
-        // floor(1 * 1001 * 1e9 / 30000) - 1 = 33366666 - 1
+        // floor(1 * 1001 * 1e9 / 30000) = 33366666
         let expected = next_tick_lower_bound_ns(0, CADENCE).expect("bound");
-        assert_eq!(expected.complete_before_ns, 33_366_665);
+        assert_eq!(expected.complete_before_ns, 33_366_666);
         let events = events.lock().expect("lock");
         let marks: Vec<i128> = events
             .iter()
@@ -544,7 +569,7 @@ mod tests {
                 _ => None,
             })
             .collect();
-        assert_eq!(marks, vec![33_366_665, 66_733_332, 100_099_999]);
+        assert_eq!(marks, vec![33_366_666, 66_733_333, 100_100_000]);
         assert!(marks.windows(2).all(|pair| pair[0] < pair[1]));
         // The terminal event is EOF completeness, not a watermark claim.
         assert!(matches!(
@@ -678,26 +703,18 @@ mod tests {
 
     #[test]
     fn audio_watermarks_are_per_stream_and_never_decrease() {
-        // 48000 Hz: 1024 samples = 21_333_333 ns, exclusive bound 21_333_332.
-        let first = audio_sample_lower_bound_ns(1024, 48_000).expect("bound");
-        assert_eq!(first.complete_before_ns, 21_333_332);
+        // 48000 Hz, 1024-sample frames: after the packet at PTS 1024, the next
+        // packet's PTS is 2048 -> floor(2048 * 1e9 / 48000) = 42_666_666 ns.
+        let first = next_frame_lower_bound_ns(1024, 1024, 48_000).expect("bound");
+        assert_eq!(first.complete_before_ns, 42_666_666);
         let mut tracker = WatermarkTracker::new();
         assert_eq!(tracker.current(), None);
-        // A track that submitted nothing this tick withdraws nothing.
+        // A track that emitted nothing this tick withdraws nothing.
         assert_eq!(tracker.advance(None), None);
-        assert_eq!(
-            tracker.advance(Some(first)),
-            Some(DtsWatermark {
-                complete_before_ns: 21_333_332
-            })
-        );
-        assert_eq!(
-            tracker.advance(Some(first)),
-            Some(DtsWatermark {
-                complete_before_ns: 21_333_332
-            })
-        );
-        let later = audio_sample_lower_bound_ns(2048, 48_000).expect("bound");
+        assert_eq!(tracker.advance(Some(first)), Some(first));
+        assert_eq!(tracker.advance(Some(first)), Some(first));
+        let later = next_frame_lower_bound_ns(2048, 1024, 48_000).expect("bound");
+        assert_eq!(later.complete_before_ns, 64_000_000);
         assert_eq!(tracker.advance(Some(later)), Some(later));
         // Out-of-order/smaller candidates never move the proof backwards.
         assert_eq!(tracker.advance(Some(first)), Some(later));
@@ -708,6 +725,7 @@ mod tests {
     fn degenerate_cadence_proves_nothing() {
         assert!(next_tick_lower_bound_ns(0, Rational::new(0, 1)).is_none());
         assert!(next_tick_lower_bound_ns(0, Rational::new(30_000, 0)).is_none());
-        assert!(audio_sample_lower_bound_ns(1024, 0).is_none());
+        assert!(next_frame_lower_bound_ns(0, 1024, 0).is_none());
+        assert!(next_frame_lower_bound_ns(0, 0, 48_000).is_none());
     }
 }

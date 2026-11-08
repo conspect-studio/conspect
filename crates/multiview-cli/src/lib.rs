@@ -200,6 +200,8 @@ pub mod outputs;
 /// emits `ShedLoad`, and drives the engine make-before-break crosspoint.
 pub mod placement;
 pub mod preview;
+#[cfg(feature = "ffmpeg")]
+mod binding_delivery;
 /// The runtime-facing rendition-plan seam (broadcast output contract, slice 1):
 /// projects the configured outputs onto shared video/audio renditions using the
 /// build's existing `can_encode` probes. Pure planning only — it opens no

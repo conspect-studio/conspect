@@ -343,15 +343,20 @@ pub struct RenditionPlan {
 impl RenditionPlan {
     /// The number of video encoders this plan admits (one per distinct video
     /// rendition). A third output with an identical key does not raise it.
+    ///
+    /// Not `const`: `Vec::len` in a `const fn` needs Rust 1.87 and this
+    /// workspace's MSRV is 1.85.
     #[must_use]
-    pub const fn video_encoder_count(&self) -> usize {
+    pub fn video_encoder_count(&self) -> usize {
         self.video.len()
     }
 
     /// The number of audio encoders this plan admits (one per distinct audio
     /// rendition).
+    ///
+    /// Not `const`: see [`Self::video_encoder_count`].
     #[must_use]
-    pub const fn audio_encoder_count(&self) -> usize {
+    pub fn audio_encoder_count(&self) -> usize {
         self.audio.len()
     }
 
