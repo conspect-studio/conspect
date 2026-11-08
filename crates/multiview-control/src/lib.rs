@@ -64,6 +64,8 @@ pub mod live_apply;
 pub mod moq;
 #[cfg(feature = "moq-transport")]
 pub mod moq_provider;
+#[cfg(feature = "moq-transport")]
+pub mod moq_startup;
 pub mod nmos;
 pub mod notify;
 pub mod pending_actions;
