@@ -141,6 +141,32 @@ fn probe_frames(path: &Path) -> (String, Vec<i64>) {
         .collect();
     (codec, pts)
 }
+/// The output PTS uses an exact 90 kHz clock: 30000/1001 fps = 3003 ticks.
+/// B-frame decode order can differ, so compare sorted presentation timestamps.
+fn cadence_faults(pts: &[i64], label: &str, minimum: usize) -> Vec<String> {
+    let mut faults = Vec::new();
+    if pts.len() < minimum {
+        faults.push(format!(
+            "{label}: only {} decoded frames, need {minimum}",
+            pts.len()
+        ));
+    }
+    let mut sorted = pts.to_vec();
+    sorted.sort_unstable();
+    for (index, window) in sorted.windows(2).enumerate() {
+        if window[1] - window[0] != 3003 {
+            faults.push(format!(
+                "{label}: frame {index} PTS delta {} != 3003",
+                window[1] - window[0]
+            ));
+            if faults.len() >= 12 {
+                break;
+            }
+        }
+    }
+    faults
+}
+
 #[tokio::test]
 async fn mixed_codec_pipeline_receives_decodable_media_not_just_headers() {
     const TICKS: u64 = 300; // 10s diagnostic @ exact 30000/1001.
@@ -196,18 +222,30 @@ async fn mixed_codec_pipeline_receives_decodable_media_not_just_headers() {
     );
     let (hevc_codec, hevc_pts) = probe_frames(&hevc_path);
     let (avc_codec, avc_pts) = probe_frames(&avc_path);
-    assert_eq!(
-        hevc_codec, "hevc",
-        "SRT HEVC binding must not inherit first HLS codec"
-    );
-    assert_eq!(avc_codec, "h264");
-    assert!(
-        hevc_pts.len() > 100 && avc_pts.len() > 100,
-        "SRT must carry sustained decoded frames"
-    );
-    assert!(playlist.exists(), "HLS manifest must remain available");
+    let mut faults = cadence_faults(&hevc_pts, "HEVC SRT", 100);
+    faults.extend(cadence_faults(&avc_pts, "H264 SRT", 100));
+    if hevc_codec != "hevc" {
+        faults.push(format!("HEVC SRT codec {hevc_codec} != hevc"));
+    }
+    if avc_codec != "h264" {
+        faults.push(format!("H264 SRT codec {avc_codec} != h264"));
+    }
+    if !playlist.exists() {
+        faults.push("HLS manifest missing".to_owned());
+    }
     let segment = dir.path().join("hls/seg0.ts");
-    let (hls_codec, hls_pts) = probe_frames(&segment);
-    assert_eq!(hls_codec, "h264");
-    assert!(!hls_pts.is_empty(), "HLS must decode real frames");
+    if segment.exists() {
+        let (hls_codec, hls_pts) = probe_frames(&segment);
+        if hls_codec != "h264" {
+            faults.push(format!("HLS codec {hls_codec} != h264"));
+        }
+        faults.extend(cadence_faults(&hls_pts, "H264 HLS segment", 10));
+    } else {
+        faults.push("HLS first segment missing".to_owned());
+    }
+    assert!(
+        faults.is_empty(),
+        "mixed-output acceptance failed:\n{}",
+        faults.join("\n")
+    );
 }
