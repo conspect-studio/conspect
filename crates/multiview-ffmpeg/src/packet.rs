@@ -288,6 +288,21 @@ impl StreamCodecParameters {
         }
     }
 
+    /// The opened codec's concrete identity; never a pending requested token.
+    #[must_use]
+    pub fn codec_id(&self) -> ffmpeg::codec::Id {
+        self.parameters.id()
+    }
+
+    /// Copy the opened encoder's exact codec configuration (e.g. avcC/hvcC or
+    /// AAC AudioSpecificConfig), if it supplied one. This copies only the
+    /// small codec record, never a coded frame or an encoder instance.
+    #[must_use]
+    pub fn codec_config_bytes(&self) -> Option<Vec<u8>> {
+        let bytes = self.extradata();
+        (!bytes.is_empty()).then(|| bytes.to_vec())
+    }
+
     /// NAL framing for the opened H.264/HEVC encoder, derived from its codec
     /// parameter record. A malformed avcC/hvcC record returns `None` rather than
     /// guessing that a closed random-access point exists.
