@@ -258,6 +258,9 @@
                   "$ref": "#/components/schemas/SalvoEvent"
                 },
                 {
+                  "$ref": "#/components/schemas/SwitcherOperation"
+                },
+                {
                   "$ref": "#/components/schemas/MediaPlayerEvent"
                 },
                 {
@@ -501,6 +504,15 @@
         },
         "summary": "Client requests subscription to one or more topics.",
         "title": "$subscribe control frame (client to server)"
+      },
+      "SwitcherOperation": {
+        "contentType": "application/json",
+        "name": "SwitcherOperation",
+        "payload": {
+          "$ref": "#/components/schemas/SwitcherOperation"
+        },
+        "summary": "The engine applied or rejected an M/E command at an exact output tick.",
+        "title": "Switcher operation terminal result"
       },
       "SystemMetrics": {
         "contentType": "application/json",
@@ -1987,6 +1999,38 @@
           "topic",
           "effective_rate_hz",
           "snapshot_seq"
+        ],
+        "type": "object"
+      },
+      "SwitcherOperation": {
+        "description": "Terminal outcome, emitted only at the engine output tick; envelope corr equals operation_id, id equals M/E id.",
+        "properties": {
+          "completed": {
+            "type": "boolean"
+          },
+          "error": {
+            "type": "string"
+          },
+          "me": {
+            "type": "string"
+          },
+          "operation_id": {
+            "type": "string"
+          },
+          "program": {
+            "type": "string"
+          },
+          "tick": {
+            "format": "uint64",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "me",
+          "program",
+          "tick",
+          "operation_id",
+          "completed"
         ],
         "type": "object"
       },

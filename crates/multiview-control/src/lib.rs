@@ -83,6 +83,7 @@ mod serve_stream;
 pub mod state;
 pub mod support_bundle;
 pub mod support_store;
+pub mod switcher_events;
 pub mod system;
 pub mod tally_ingest;
 pub mod tally_state;

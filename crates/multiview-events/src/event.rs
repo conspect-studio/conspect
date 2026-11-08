@@ -912,6 +912,25 @@ pub struct MediaPlayerEvent {
     pub position_frames: u64,
 }
 
+/// An M/E command's terminal result, emitted only after the output tick
+/// actually applied or rejected it. The operation id is echoed in `corr`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SwitcherOperation {
+    /// M/E id whose command changed (or failed to change) state.
+    pub me: String,
+    /// Main program this M/E belongs to; scoped separately from the M/E id.
+    pub program: String,
+    /// The exact output tick at which the operation settled.
+    pub tick: u64,
+    /// Opaque operation id from the accepted 202 response.
+    pub operation_id: String,
+    /// `true` only when the command was really applied to on-air state.
+    pub completed: bool,
+    /// Typed refusal details, present only when `completed` is false.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
 /// A graphics (CG) playout channel's PVW/PGM state changed (topic
 /// [`crate::topic::Topic::Switcher`]): emitted on cue / take / clear / next.
 /// Lossless lifecycle event, scoped by the channel id.
@@ -1675,6 +1694,14 @@ pub enum AuthzScope<'a> {
     /// `program:<id>` — the program-namespaced grant that carries `timing.status`
     /// without punning the plain output-id namespace (ADR-W026).
     Program(&'a str),
+    /// Requires both the M/E object grant and the namespaced program grant;
+    /// a scoped principal can neither see another M/E nor infer its program.
+    ObjectAndProgram {
+        /// M/E resource id.
+        object: &'a str,
+        /// Program grant required alongside the M/E.
+        program: &'a str,
+    },
     /// Restricted by discovery **domain** (ADR-W026). `Some(label)` is matched
     /// against `scoped_discovery_domains`; `None` is an *unlabelled* row, which a
     /// discovery-scoped principal is denied (fail-closed). The policy lives in
@@ -1839,6 +1866,10 @@ pub enum Event {
     SalvoCancelled(SalvoEvent),
 
     // ---- Switcher realtime surface (topic `switcher`, ADR-RT008) ----
+    /// One terminal frame-boundary operation result with direct operation-id
+    /// correlation. Lossless; a rejected operation never masquerades as applied.
+    #[serde(rename = "switcher.operation")]
+    SwitcherOperation(SwitcherOperation),
     /// A media player's discrete transport state changed (topic `switcher`,
     /// envelope `id` = player id). A **lossless** lifecycle event kept in the
     /// replay ring ([`Event::is_conflated`] is `false`): cued / playing / paused /
@@ -1941,6 +1972,7 @@ impl Event {
             Self::SalvoArmed(_) => "salvo.armed",
             Self::SalvoTaken(_) => "salvo.taken",
             Self::SalvoCancelled(_) => "salvo.cancelled",
+            Self::SwitcherOperation(_) => "switcher.operation",
             Self::MediaPlayerState(_) => "media.player_state",
             Self::GraphicsChannelState(_) => "graphics.channel_state",
             Self::CatalogueLinkStatus(_) => "catalogue.link_status",
@@ -1995,6 +2027,10 @@ impl Event {
             Self::DeviceSync(e) => AuthzScope::Object(&e.device_id),
             Self::CastSessionStarted(e) => AuthzScope::Object(&e.session_id),
             Self::CastSessionRemoved(e) => AuthzScope::Object(&e.session_id),
+            Self::SwitcherOperation(e) => AuthzScope::ObjectAndProgram {
+                object: &e.me,
+                program: &e.program,
+            },
             Self::MediaPlayerState(e) => AuthzScope::Object(&e.player),
             Self::GraphicsChannelState(e) => AuthzScope::Object(&e.channel),
             // A tile bound to an input is object-scoped by that input id; a

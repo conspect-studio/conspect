@@ -48,6 +48,7 @@ pub mod salvos;
 pub mod source_events;
 pub mod sources;
 pub mod support;
+pub mod switcher;
 pub mod sync_groups;
 pub mod system;
 pub mod tally;
@@ -1390,6 +1391,9 @@ pub fn api_router() -> Router<AppState> {
             post(media_players::cancel_exit),
         )
         // Per-stream crosspoint routing (RT-11): classify (plan) + apply (take).
+        .route("/switcher/{me}", get(switcher::get_switcher))
+        .route("/switcher/plan", post(switcher::plan_switcher))
+        .route("/switcher/commands/{kind}", post(switcher::submit_switcher))
         .route("/routing/plan", post(routing::plan_route))
         .route("/routing/{kind}/take", post(routing::take_route))
         // Tally operator surface: read resolved state, profiles, manual override.

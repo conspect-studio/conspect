@@ -524,6 +524,16 @@ export interface Subscribed {
   readonly topic: string;
 }
 
+/** Terminal outcome, emitted only at the engine output tick; envelope corr equals operation_id, id equals M/E id. */
+export interface SwitcherOperation {
+  readonly completed: boolean;
+  readonly error?: string;
+  readonly me: string;
+  readonly operation_id: string;
+  readonly program: string;
+  readonly tick: number;
+}
+
 /** How well a device can participate in synchronized presentation (fixed probed tri-state). */
 export type SyncCapability = "frame-accurate" | "offset-only" | "none";
 
