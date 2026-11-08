@@ -1,8 +1,14 @@
 // Map an IPTV-ORG stream onto the ordinary source form (ONE code path for
-// “Add as source” and “Bulk add”): the same SourceFormState → sourceFormToBody.
+// “Add as source” and “Bulk add”): the same SourceFormState → sourceFormToBody,
+// with the operator's activation made explicit (`catalogueSourceBody`).
 import type { IndexStream } from '../api/catalogue';
-import { emptySourceForm } from '../resources/forms';
-import type { OriginFollow, SourceFormKind, SourceFormState } from '../resources/forms';
+import { emptySourceForm, sourceFormToBody } from '../resources/forms';
+import type {
+  OriginFollow,
+  SourceActivationChoice,
+  SourceFormKind,
+  SourceFormState,
+} from '../resources/forms';
 
 /** The protocols the engine can ingest, mapped to a source kind. */
 export function sourceKindFor(s: IndexStream): SourceFormKind | undefined {
@@ -67,18 +73,27 @@ export function uniqueId(base: string, taken: ReadonlySet<string>): string {
   return `${base}-${String(Date.now())}`;
 }
 
-/** Build the prefilled source form for a stream. */
+/**
+ * Build the prefilled source form for a stream.
+ *
+ * `activation` is the operator's explicit choice from the add flow. It defaults
+ * to `always_on` only to keep the ordinary default for direct callers; the add
+ * flows always pass what the operator picked (there is no silent default in the
+ * UI — see `ActivationChoice.tsx`).
+ */
 export function toSourceForm(
   s: IndexStream,
   taken: ReadonlySet<string>,
   follow: OriginFollow = 'notify',
   now: Date = new Date(),
   catNames: ReadonlyMap<string, string> = new Map(),
+  activation: SourceActivationChoice = 'always_on',
 ): SourceFormState {
   const kind = sourceKindFor(s) ?? 'hls';
   return {
     ...emptySourceForm(),
     id: uniqueId(slugId(s), taken),
+    activation,
     // Lead with the station (stream title), not the network channel name.
     name: s.title,
     kind,
@@ -100,4 +115,20 @@ export function toSourceForm(
       follow,
     },
   };
+}
+
+/**
+ * The create body of a catalogue add: the ordinary source body with the
+ * operator's activation written explicitly for BOTH choices.
+ *
+ * The generic form leaves `always_on` implicit because it is the config default
+ * — correct for a stored document, wrong for this flow: the server lifts its
+ * old 8-source bulk cap only for a request whose entries say how they start,
+ * and a bulk add must record what the operator chose instead of inheriting a
+ * default. `on_demand` was already written by `sourceFormToBody`.
+ */
+export function catalogueSourceBody(form: SourceFormState): Record<string, unknown> {
+  const body = sourceFormToBody(form);
+  body.activation = form.activation;
+  return body;
 }

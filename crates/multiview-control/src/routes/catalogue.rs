@@ -677,11 +677,34 @@ pub(crate) async fn post_source_network(
     Ok(Json(report))
 }
 
-/// The most sources one bulk add may create. The web dialog uses the same
-/// number (`BULK_ADD_MAX` in `web/src/iptv/BulkAddDialog.tsx`); this is the
-/// server-side enforcement. Lifted by the activation follow-up
+/// The most sources one bulk add may create in a single request.
+///
+/// Bounds the request body and — because the whole batch is created in order
+/// under one `lock_config_mutation` hold — the mutation itself: bounded work,
+/// never an unbounded queue (inv #10). The pre-activation cap of 8 existed
+/// because every created source silently started always on; now that the
+/// browser makes the operator state how the sources start, the limit is a
+/// plain request cap (see [`BULK_ADD_EXPLICIT_ACTIVATION_ABOVE`]).
+pub(crate) const BULK_ADD_MAX: usize = 200;
+
+/// Above this many sources the request must state every entry's `activation`
+/// explicitly.
+///
+/// The old unconditional cap of 8 guarded against "add N sources and silently
+/// open N connections and decoders at boot". That guard is now "say what you
+/// mean": a batch larger than the old cap is accepted when each entry declares
+/// `"activation": "always_on" | "on_demand"`, and refused with `422` when any
+/// entry leaves it implicit. Below the threshold an absent `activation` keeps
+/// the config default (`always_on`), so existing callers are unaffected
 /// (`docs/io/iptv-org.md`, Integration rules, item 3).
-pub(crate) const BULK_ADD_MAX: usize = 8;
+pub(crate) const BULK_ADD_EXPLICIT_ACTIVATION_ABOVE: usize = 8;
+
+/// Whether a submitted entry states its own `activation` (a present, non-null
+/// `activation` key). The value itself is validated by
+/// [`super::sources::validate_source_body`], which rejects an unknown token.
+fn states_activation(body: &serde_json::Value) -> bool {
+    body.get("activation").is_some_and(|raw| !raw.is_null())
+}
 
 /// One entry of a bulk add: the same `{name, body}` a single create takes, plus
 /// the source id (the `{id}` of `POST /sources/{id}`).
@@ -701,7 +724,8 @@ pub(crate) struct BulkAddEntry {
 #[derive(Debug, Clone, Deserialize)]
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 pub(crate) struct BulkAddBody {
-    /// 1..=8 sources to create.
+    /// 1..=200 sources to create. Above 8 every entry must state its own
+    /// `activation` (`always_on` | `on_demand`).
     pub sources: Vec<BulkAddEntry>,
 }
 
@@ -745,7 +769,7 @@ pub(crate) struct BulkAddResponse {
             (status = 201, description = "Every source was created; per-item results in request order.", body = BulkAddResponse),
             (status = 207, description = "A durable write failed part-way: earlier items are created, the failed item and the rest are reported.", body = BulkAddResponse),
             (status = 403, description = "Requires write, or an id is outside the caller's scope.", body = crate::problem::Problem),
-            (status = 422, description = "At most 8 sources per bulk add (each starts always on until activation lands); or an entry is invalid or duplicated. Nothing was created.", body = crate::problem::Problem),
+            (status = 422, description = "More than 200 sources in one bulk add; or more than 8 with an entry that leaves its `activation` implicit; or an entry is invalid or duplicated. Nothing was created.", body = crate::problem::Problem),
         ),
     )
 )]
@@ -758,7 +782,7 @@ pub(crate) async fn post_bulk_sources(
     let n = body.sources.len();
     if n == 0 || n > BULK_ADD_MAX {
         return Err(ControlError::Validation(format!(
-            "at most {BULK_ADD_MAX} sources per bulk add; each starts always on until activation lands (got {n})"
+            "at most {BULK_ADD_MAX} sources per bulk add (got {n})"
         )));
     }
     // BOLA: authorise every id before revealing anything about any of them.
@@ -768,6 +792,7 @@ pub(crate) async fn post_bulk_sources(
     // Validate everything first; reject the whole request on any problem.
     let mut seen = HashSet::new();
     let mut inputs = Vec::with_capacity(n);
+    let mut unstated = 0usize;
     for e in &body.sources {
         if !seen.insert(e.id.as_str()) {
             return Err(ControlError::Validation(format!(
@@ -775,11 +800,25 @@ pub(crate) async fn post_bulk_sources(
                 e.id
             )));
         }
+        // The activation token itself is validated here (an unknown value is a
+        // 422 naming the field); the count below is what lifts the old cap.
         let validated = super::sources::validate_source_body(&e.id, &e.body)?;
+        if !states_activation(&e.body) {
+            unstated += 1;
+        }
         inputs.push(crate::resource_store::ResourceInput {
             name: e.name.clone(),
             body: validated,
         });
+    }
+    // The old cap of 8 is lifted only for a request that says how every source
+    // starts: silently starting more than 8 sources always on is exactly the
+    // operation the cap guarded against.
+    if n > BULK_ADD_EXPLICIT_ACTIVATION_ABOVE && unstated > 0 {
+        return Err(ControlError::Validation(format!(
+            "above {BULK_ADD_EXPLICIT_ACTIVATION_ABOVE} sources every entry must state its \
+             `activation` (\"always_on\" or \"on_demand\"); {unstated} of {n} left it implicit"
+        )));
     }
     // One lock hold across the pre-checks and every create, so the checked
     // state cannot change underneath the batch.

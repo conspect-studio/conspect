@@ -225,12 +225,23 @@ describe('IptvOrgPage', () => {
     expect(screen.getByRole('button', { name: /add wps tv as source/i })).toBeDisabled();
   });
 
-  it('Add as source opens the Sources create dialog prefilled with url/UA/referer/origin', async () => {
+  it('Add as source asks how it starts, then opens the Sources dialog prefilled', async () => {
     renderPage();
     await ready();
     await userEvent.type(screen.getByRole('searchbox', { name: /search channels/i }), 'axn black');
     await userEvent.click(await screen.findByRole('button', { name: /show streams of axn black/i }));
     await userEvent.click(await screen.findByRole('button', { name: /add axn black romania as source/i }));
+    // The activation step comes first, with nothing preselected: with no choice
+    // there is no way on to the create dialog.
+    const choice = await screen.findByRole('dialog');
+    const proceed = within(choice).getByRole('button', { name: /^continue$/i });
+    expect(within(choice).getByRole('radio', { name: /always on: each opens a connection/i })).not.toBeChecked();
+    expect(within(choice).getByRole('radio', { name: /on demand: idle and free/i })).not.toBeChecked();
+    expect(proceed).toBeDisabled();
+    await userEvent.click(proceed);
+    expect(created).toHaveLength(0);
+    await userEvent.click(within(choice).getByRole('radio', { name: /always on: each opens a connection/i }));
+    await userEvent.click(proceed);
     const dialog = await screen.findByRole('dialog');
     expect(within(dialog).getByDisplayValue(AXN.url)).toBeInTheDocument();
     expect(within(dialog).getByText(/linked to iptv-org/i)).toBeInTheDocument();
@@ -246,6 +257,27 @@ describe('IptvOrgPage', () => {
         origin: { provider: 'iptv-org', channel: 'AXNBlack.us', follow: 'notify' },
       },
     });
+    // Always on is the config default, so the durable body may leave it implicit.
+    expect(
+      (created[0]?.payload as { body: { activation?: string } }).body.activation ?? 'always_on',
+    ).toBe('always_on');
+  });
+
+  it('Add as source propagates an On demand choice into the created source', async () => {
+    renderPage();
+    await ready();
+    await userEvent.type(screen.getByRole('searchbox', { name: /search channels/i }), 'axn black');
+    await userEvent.click(await screen.findByRole('button', { name: /show streams of axn black/i }));
+    await userEvent.click(await screen.findByRole('button', { name: /add axn black romania as source/i }));
+    const choice = await screen.findByRole('dialog');
+    await userEvent.click(within(choice).getByRole('radio', { name: /on demand: idle and free/i }));
+    await userEvent.click(within(choice).getByRole('button', { name: /^continue$/i }));
+    const dialog = await screen.findByRole('dialog');
+    await userEvent.click(within(dialog).getByRole('button', { name: /^create$/i }));
+    await waitFor(() => { expect(created).toHaveLength(1); });
+    expect(created[0]?.payload).toMatchObject({
+      body: { kind: 'hls', url: AXN.url, activation: 'on_demand' },
+    });
   });
 
   it('Add as source sends the upstream logo_url, never the page origin', async () => {
@@ -254,6 +286,9 @@ describe('IptvOrgPage', () => {
     await userEvent.type(screen.getByRole('searchbox', { name: /search channels/i }), 'axn black');
     await userEvent.click(await screen.findByRole('button', { name: /show streams of axn black/i }));
     await userEvent.click(await screen.findByRole('button', { name: /add axn black romania as source/i }));
+    const choice = await screen.findByRole('dialog');
+    await userEvent.click(within(choice).getByRole('radio', { name: /always on: each opens a connection/i }));
+    await userEvent.click(within(choice).getByRole('button', { name: /^continue$/i }));
     const dialog = await screen.findByRole('dialog');
     await userEvent.click(within(dialog).getByRole('button', { name: /^create$/i }));
     await waitFor(() => { expect(created).toHaveLength(1); });
@@ -293,9 +328,11 @@ describe('IptvOrgPage', () => {
     await userEvent.click(await screen.findByRole('checkbox', { name: /select bbc news uk hd for bulk add/i }));
     await userEvent.click(screen.getByRole('button', { name: /add selected \(2\)/i }));
     const dialog = await screen.findByRole('dialog');
+    await userEvent.click(within(dialog).getByRole('radio', { name: /on demand: idle and free/i }));
     await userEvent.click(within(dialog).getByRole('button', { name: /add 2 sources/i }));
     await waitFor(() => { expect(within(dialog).getAllByText(/created|failed/i).length).toBeGreaterThanOrEqual(2); });
     expect(created.map((c) => c.id)).toEqual(['nbc-us-kshbtv']);
+    expect((created[0]?.payload as { body: { activation?: string } }).body.activation).toBe('on_demand');
     expect(within(dialog).getByText(/Failed: Conflict/)).toBeInTheDocument();
   });
 });

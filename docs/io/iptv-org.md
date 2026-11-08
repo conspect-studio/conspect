@@ -42,20 +42,26 @@ The `release/mda001-rc3` line already ships the managed IPTV playlist and EPG
    of the metadata-only path (`guide_only_change` in `routes/sources.rs`). An `origin`-only change may
    use that path.
 3. **Activation is the operator's choice.** Add and bulk add from the browser require an explicit
-   **Always on** or **On demand** choice, with no silent default. Show the selected count and a warning
-   for large selections (a 500-source always-on add opens 500 connections). The `activation` field
-   (`always_on` | `on_demand`, default `always_on`) comes from `feat/rc-demand-driven-sources` and is
-   not merged yet. **Follow-up once it lands on rc3:** the single "Add as source" seed and the bulk add
-   dialog get the same explicit radio choice the M3U import dialog uses (no preselected value, the add
-   button disabled until one is chosen, and the M3U dialog's large-selection warning), writing
-   `activation` through the shared `sourceFormToBody` path.
-   **Until then** (agreed with the rc3 owner, 2026-11-07): a single bulk add creates at most
-   `BULK_ADD_MAX = 8` sources. **The server enforces this:** `POST /api/v1/catalogues/iptv-org/sources`
-   (Write role, body `{"sources":[{id,name,body}]}`) refuses more than 8 entries, and any invalid or
-   duplicate entry, with `422` before creating anything; it then creates the entries in order through
-   the canonical `create_source` path (`lock_config_mutation`, `commit_resource`, audit, live apply) with
-   per-object authorization on every id. The web constant only mirrors it for the UI. The dialog states that each new source starts always on and opens
-   a connection and decoder at boot. The cap is lifted by the activation follow-up.
+   **Always on** or **On demand** choice, with no silent default. Both flows share one control
+   (`web/src/iptv/ActivationChoice.tsx`): nothing is preselected, the add control stays disabled until
+   one is chosen, and an always-on selection above `LARGE_ALWAYS_ON = 20` shows the same
+   large-selection warning as the M3U import dialog (every always-on source opens a connection and a
+   decoder at boot). The single "Add as source" step carries the choice into the Sources create dialog
+   through the seed (`toSourceForm`); the bulk add writes it through the shared `sourceFormToBody`
+   path (`catalogueSourceBody` in `web/src/iptv/toSource.ts`), so every entry states it explicitly.
+   The `activation` field (`always_on` | `on_demand`, default `always_on`, from
+   `feat/rc-demand-driven-sources`) is durable: the created document records what the operator chose.
+   **The server enforces the bounds:** `POST /api/v1/catalogues/iptv-org/sources`
+   (Write role, body `{"sources":[{id,name,body}]}`) authorises every id (per-object authorization,
+   BOLA) and validates every entry before creating anything — an invalid, duplicate or out-of-scope
+   entry is `422`/`403` and nothing is created — then creates the entries in order through the
+   canonical `create_source` path (`lock_config_mutation`, `commit_resource`, audit, live apply). One
+   request carries at most `BULK_ADD_MAX = 200` sources, which bounds both the request body and the
+   single config-mutation lock hold (inv #10, bounded work). Above the old cap of 8 every entry must
+   state its `activation` explicitly (`BULK_ADD_EXPLICIT_ACTIVATION_ABOVE = 8`); a batch that leaves
+   any entry implicit is refused with `422` — silently starting more than 8 sources always on is the
+   operation the old cap guarded against. At or below that threshold an absent `activation` still
+   means `always_on`, so existing documents and callers keep the documented default.
 4. **Build.** Production builds `--features nvidia,web`. The `nvidia` preset enables
    `catalogue-ffmpeg`, which enables `catalogue`; the PR shows the resolved feature check.
 5. **Headers on every rail.** HLS `user_agent`/`referrer` go through the shared loopback fetcher and

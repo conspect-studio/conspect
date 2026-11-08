@@ -438,8 +438,12 @@ export interface BulkAddResponse {
   readonly results: readonly BulkAddItem[];
 }
 /**
- * `POST /sources` (bulk create; write role). The server refuses more than 8
- * entries, and any invalid/duplicate entry, with 422 before creating anything.
+ * `POST /sources` (bulk create; write role). The server authorises every id and
+ * validates every entry before creating anything: an invalid, duplicate or
+ * out-of-scope entry rejects the whole request with 422/403 and nothing is
+ * created. One request carries at most 200 sources, and above 8 every entry
+ * must state its `activation` explicitly — the browser always does, because the
+ * add flows require the operator's Always on / On demand choice.
  */
 export function bulkAddSources(
   sources: readonly BulkAddEntry[],

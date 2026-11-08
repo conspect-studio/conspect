@@ -24,7 +24,9 @@ import { Button } from '../components/ui/button';
 import { Input } from '../components/ui/input';
 import { Label } from '../components/ui/label';
 import { SelectField } from '../resources/FormControls';
+import type { SourceActivationChoice } from '../resources/forms';
 import { useSources } from '../resources/queries';
+import { AddSourceDialog } from './AddSourceDialog';
 import { DataSourcesFooter, FlagBadge, VerdictBadge, useFlagLabel } from './Badges';
 import { BulkAddDialog } from './BulkAddDialog';
 import { CatalogueLogo } from './CatalogueLogo';
@@ -110,6 +112,8 @@ export function IptvOrgPage(): JSX.Element {
   const [probeError, setProbeError] = useState<string | null>(null);
   const [probing, setProbing] = useState<ReadonlySet<string>>(new Set());
   const [bulkOpen, setBulkOpen] = useState(false);
+  /** The stream whose "Add as source" activation step is open, if any. */
+  const [addStream, setAddStream] = useState<IndexStream | null>(null);
   const [focus, setFocus] = useState<MapFocus | null>(null);
 
   const placeIndex = useMemo(
@@ -307,10 +311,27 @@ export function IptvOrgPage(): JSX.Element {
   };
 
   const addAsSource = (s: IndexStream): void => {
+    // Ask how the source starts before seeding anything: no default, nothing
+    // preselected.
+    setAddStream(s);
+  };
+
+  const confirmAdd = (activation: SourceActivationChoice): void => {
+    const s = addStream;
+    setAddStream(null);
+    if (s === null) {
+      return;
+    }
     // One code path: the same form the source dialog edits; the Sources page
-    // opens its create dialog prefilled (nothing is saved until confirmed).
+    // opens its create dialog prefilled with the chosen start (nothing is saved
+    // until confirmed there).
     void navigate('/sources', {
-      state: { iptvSeed: { ts: Date.now(), form: toSourceForm(s, takenIds, 'notify', new Date(), catName) } },
+      state: {
+        iptvSeed: {
+          ts: Date.now(),
+          form: toSourceForm(s, takenIds, 'notify', new Date(), catName, activation),
+        },
+      },
     });
   };
 
@@ -684,6 +705,14 @@ export function IptvOrgPage(): JSX.Element {
         </div>
       )}
 
+      <AddSourceDialog
+        open={addStream !== null}
+        stream={addStream}
+        onClose={(): void => {
+          setAddStream(null);
+        }}
+        onConfirm={confirmAdd}
+      />
       <BulkAddDialog
         open={bulkOpen}
         streams={selectedStreams}

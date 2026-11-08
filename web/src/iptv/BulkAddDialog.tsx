@@ -20,11 +20,12 @@ import {
   DialogHeader,
   DialogTitle,
 } from '../components/ui/dialog';
-import { ORIGIN_FOLLOWS, sourceFormToBody, validateSourceForm } from '../resources/forms';
-import type { OriginFollow } from '../resources/forms';
+import { ORIGIN_FOLLOWS, validateSourceForm } from '../resources/forms';
+import type { OriginFollow, SourceActivationChoice } from '../resources/forms';
 import { SelectField } from '../resources/FormControls';
 import { resourceKeys } from '../resources/queries';
-import { toSourceForm } from './toSource';
+import { ActivationChoice } from './ActivationChoice';
+import { catalogueSourceBody, toSourceForm } from './toSource';
 
 interface ItemResult {
   readonly key: string;
@@ -44,14 +45,6 @@ export function useFollowLabel(): (f: OriginFollow) => string {
         ? t`Notify — tell me about upstream changes`
         : t`Auto — apply URL/header changes`;
 }
-
-/**
- * Most sources one bulk add may create. Until the per-source `activation`
- * choice (Always on / On demand) reaches this branch, every new source is
- * always on: it opens a connection and a decoder at boot. Agreed with the rc3
- * owner; lifted when the activation follow-up lands.
- */
-export const BULK_ADD_MAX = 8;
 
 /** The bulk-add confirmation dialog. */
 export function BulkAddDialog({
@@ -73,13 +66,14 @@ export function BulkAddDialog({
   const queryClient = useQueryClient();
   const followLabel = useFollowLabel();
   const [follow, setFollow] = useState<OriginFollow>('notify');
+  // No preselection: the operator says how the whole batch starts, and the
+  // server refuses a batch above its old cap that leaves the choice implicit.
+  const [activation, setActivation] = useState<SourceActivationChoice | null>(null);
   const [results, setResults] = useState<readonly ItemResult[] | null>(null);
   const [running, setRunning] = useState(false);
 
-  const overCap = streams.length > BULK_ADD_MAX;
-
   const run = async (): Promise<void> => {
-    if (overCap) {
+    if (activation === null) {
       return;
     }
     setRunning(true);
@@ -88,19 +82,19 @@ export function BulkAddDialog({
     const entries: BulkAddEntry[] = [];
     const sent: { key: string; title: string; id: string }[] = [];
     for (const s of streams) {
-      const form = toSourceForm(s, taken, follow, new Date(), catNames);
+      const form = toSourceForm(s, taken, follow, new Date(), catNames, activation);
       taken.add(form.id);
       const invalid = Object.keys(validateSourceForm(form, true)).length > 0;
       if (invalid) {
         out.push({ key: s.k, title: s.title, id: form.id, ok: false, message: t`Invalid source` });
         continue;
       }
-      entries.push({ id: form.id, name: form.name.trim(), body: sourceFormToBody(form) });
+      entries.push({ id: form.id, name: form.name.trim(), body: catalogueSourceBody(form) });
       sent.push({ key: s.k, title: s.title, id: form.id });
     }
     if (entries.length > 0) {
-      // One server call: the server enforces the cap and validates every entry
-      // before it creates any (all-or-nothing on a bad request).
+      // One server call: the server enforces its request cap and validates every
+      // entry before it creates any (all-or-nothing on a bad request).
       try {
         const response = await bulkAddSources(entries);
         for (const item of sent) {
@@ -126,6 +120,8 @@ export function BulkAddDialog({
 
   const close = (): void => {
     setResults(null);
+    // Each open asks again: no choice carried over from a previous dialog.
+    setActivation(null);
     onClose();
   };
 
@@ -160,20 +156,12 @@ export function BulkAddDialog({
                 </li>
               ))}
             </ul>
-            <p className="text-sm text-muted-foreground">
-              <Trans>
-                These {streams.length} sources start always on: each opens a connection and decoder
-                when the server starts.
-              </Trans>
-            </p>
-            {overCap ? (
-              <p role="alert" className="text-sm text-destructive">
-                <Trans>
-                  Add at most {BULK_ADD_MAX} sources at a time. Deselect {streams.length - BULK_ADD_MAX} to
-                  continue.
-                </Trans>
-              </p>
-            ) : null}
+            <ActivationChoice
+              value={activation}
+              onChange={setActivation}
+              count={streams.length}
+              name="catalogue-bulk-activation"
+            />
             <SelectField<OriginFollow>
               label={t`Follow upstream changes`}
               value={follow}
@@ -206,7 +194,7 @@ export function BulkAddDialog({
           {results === null ? (
             <Button
               type="button"
-              disabled={running || streams.length === 0 || overCap}
+              disabled={running || streams.length === 0 || activation === null}
               onClick={(): void => {
                 void run();
               }}
