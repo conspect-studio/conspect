@@ -12,7 +12,7 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use multiview_ffmpeg::{EncodedPacket, StreamKind};
+use multiview_ffmpeg::{is_idr, CodecKind, EncodedPacket, NalFraming, StreamKind};
 
 /// Maximum encoded packets in a single atomic collection window.
 pub const MAX_BATCH_PACKETS: usize = 256;
@@ -22,6 +22,8 @@ pub const MAX_BATCH_BYTES: usize = 12 * 1024 * 1024;
 pub const MAX_BATCH_SPAN: Duration = Duration::from_millis(250);
 /// Maximum packets owned by one queue, including consumer-held leases.
 pub const MAX_QUEUE_PACKETS: usize = 512;
+/// Maximum independently allocated windows in the queue, including empty ones.
+pub const MAX_QUEUE_WINDOWS: usize = 512;
 /// Maximum referenced coded bytes owned by one queue, including leases.
 pub const MAX_QUEUE_BYTES: usize = 16 * 1024 * 1024;
 /// Maximum time since admission for a *queued*, unconsumed window.
@@ -36,6 +38,8 @@ pub enum BatchError {
     PayloadBytes,
     /// The supplied collection interval exceeds the per-window cap.
     MediaSpan,
+    /// A producer supplied no packet; do not queue an unbounded number of empty objects.
+    EmptyWindow,
 }
 
 /// Immutable, fully collected video and audio emission for one interval.
@@ -51,7 +55,14 @@ pub struct PacketBatch {
 
 impl PacketBatch {
     /// Validate the complete window before making it available for admission.
+    ///
+    /// # Errors
+    /// Returns [`BatchError`] when packet count, referenced bytes, or span
+    /// exceeds its cap, or when the window contains no encoded packet.
     pub fn try_new(packets: Vec<EncodedPacket>, media_span: Duration) -> Result<Self, BatchError> {
+        if packets.is_empty() {
+            return Err(BatchError::EmptyWindow);
+        }
         if packets.len() > MAX_BATCH_PACKETS {
             return Err(BatchError::PacketCount);
         }
@@ -93,11 +104,13 @@ impl PacketBatch {
         self.media_span
     }
 
-    fn begins_with_video_keyframe(&self) -> bool {
-        self.packets
-            .iter()
-            .find(|p| matches!(p.kind(), StreamKind::Video))
-            .is_some_and(EncodedPacket::is_keyframe)
+    fn begins_with_rap(&self, codec: CodecKind, framing: NalFraming) -> bool {
+        self.packets.first().is_some_and(|packet| {
+            matches!(packet.kind(), StreamKind::Video)
+                && packet
+                    .payload()
+                    .is_some_and(|au| is_idr(au, codec, framing))
+        })
     }
 }
 
@@ -105,6 +118,21 @@ fn checked_payload_bytes(lengths: impl IntoIterator<Item = usize>) -> Result<usi
     lengths.into_iter().try_fold(0usize, |sum, length| {
         sum.checked_add(length).ok_or(BatchError::PayloadBytes)
     })
+}
+
+/// Recovery policy fixed at queue construction, never inferred from KEY flags.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RecoveryGate {
+    /// The first packet must be video with a strict codec-specific RAP.
+    /// The codec and framing describe the actual packets offered to this queue.
+    StrictRap {
+        /// Encoded video codec chosen for this rendition.
+        codec: CodecKind,
+        /// Coded packet framing before any mux-specific bitstream conversion.
+        framing: NalFraming,
+    },
+    /// There is no video; coded audio frames independently restart after a loss.
+    AudioOnly,
 }
 
 /// Reason the complete window was rejected without partial A/V admission.
@@ -118,8 +146,12 @@ pub enum OfferError {
     OldestAge,
     /// Producer's `Instant` moved backwards relative to a queued offer.
     ClockReversed,
-    /// A loss requires a video keyframe before admission resumes.
-    NeedsKeyframe,
+    /// A loss requires a strict random-access point before AV admission resumes.
+    NeedsRecoveryPoint,
+    /// An audio-only queue was offered video; caller must use an AV queue.
+    WrongProgramShape,
+    /// The owner closed the queue; no further admission is possible.
+    Closed,
 }
 
 /// A loss notification; consumers must reset mux continuity and await an IDR.
@@ -157,6 +189,8 @@ pub struct BoundedBatchQueue {
     max_packets: usize,
     max_bytes: usize,
     max_age: Duration,
+    recovery_gate: Option<RecoveryGate>,
+    closed: bool,
 }
 
 impl Default for BoundedBatchQueue {
@@ -183,7 +217,17 @@ impl BoundedBatchQueue {
             max_packets: max_packets.min(MAX_QUEUE_PACKETS),
             max_bytes: max_bytes.min(MAX_QUEUE_BYTES),
             max_age: max_age.min(MAX_QUEUE_AGE),
+            recovery_gate: None,
+            closed: false,
         }
+    }
+
+    /// Configure a strict codec RAP gate or an explicitly audio-only queue.
+    /// An unconfigured queue fails closed after loss, never trusting a KEY flag.
+    #[must_use]
+    pub fn with_recovery_gate(mut self, gate: RecoveryGate) -> Self {
+        self.recovery_gate = Some(gate);
+        self
     }
 
     /// Atomically admit all packet streams or reject the entire window.
@@ -192,17 +236,31 @@ impl BoundedBatchQueue {
     /// successful admission, not media PTS, packet DTS or wall-clock time.
     /// Old queued windows are discarded before admission; their loss is
     /// reported as `OldestAge`. In-flight windows remain reserved until drop.
+    /// Invalid producer requests do not damage the existing healthy backlog.
+    ///
+    /// # Errors
+    /// Returns [`OfferError`] for an invalid window, a full or stale queue,
+    /// a reversed clock, or a missing recovery point after delivery loss.
     pub fn try_offer(&mut self, batch: Arc<PacketBatch>, now: Instant) -> Result<(), OfferError> {
+        if self.closed {
+            return Err(OfferError::Closed);
+        }
         if batch.packet_count() > self.max_packets || batch.payload_bytes() > self.max_bytes {
-            self.invalidate(OfferError::Oversized);
             return Err(OfferError::Oversized);
+        }
+        if matches!(self.recovery_gate, Some(RecoveryGate::AudioOnly))
+            && batch
+                .packets()
+                .iter()
+                .any(|packet| matches!(packet.kind(), StreamKind::Video))
+        {
+            return Err(OfferError::WrongProgramShape);
         }
         if self
             .entries
             .iter()
             .any(|entry| now.checked_duration_since(entry.offered_at).is_none())
         {
-            self.invalidate(OfferError::ClockReversed);
             return Err(OfferError::ClockReversed);
         }
         if self
@@ -213,8 +271,17 @@ impl BoundedBatchQueue {
             self.invalidate(OfferError::OldestAge);
             return Err(OfferError::OldestAge);
         }
-        if self.needs_keyframe && !batch.begins_with_video_keyframe() {
-            return Err(OfferError::NeedsKeyframe);
+        if self.needs_keyframe {
+            match self.recovery_gate {
+                Some(RecoveryGate::StrictRap { codec, framing })
+                    if batch.begins_with_rap(codec, framing) => {}
+                Some(RecoveryGate::AudioOnly) => {}
+                _ => return Err(OfferError::NeedsRecoveryPoint),
+            }
+        }
+        if self.entries.len() >= MAX_QUEUE_WINDOWS {
+            self.invalidate(OfferError::Occupied);
+            return Err(OfferError::Occupied);
         }
         let packets = self
             .reservations
@@ -252,13 +319,36 @@ impl BoundedBatchQueue {
         Ok(())
     }
 
-    /// Take the oldest window without releasing its admission reservation.
+    /// Take the oldest window, rejecting any stale queued window first.
+    ///
+    /// Uses the caller's monotonic clock when available. Use [`Self::pop_at`]
+    /// for deterministic scheduling and tests.
     pub fn pop(&mut self) -> Option<BatchLease> {
-        self.entries.pop_front().map(|entry| BatchLease {
+        self.pop_at(Instant::now()).ok().flatten()
+    }
+
+    /// Take a window at `now`; a stale or reversed clock invalidates the GOP.
+    /// In-flight windows still own their reservations after invalidation.
+    ///
+    /// # Errors
+    /// Returns [`OfferError::OldestAge`] for expired data or
+    /// [`OfferError::ClockReversed`] for an invalid monotonic timestamp.
+    pub fn pop_at(&mut self, now: Instant) -> Result<Option<BatchLease>, OfferError> {
+        if let Some(oldest) = self.entries.front() {
+            let Some(age) = now.checked_duration_since(oldest.offered_at) else {
+                self.invalidate(OfferError::ClockReversed);
+                return Err(OfferError::ClockReversed);
+            };
+            if age > self.max_age {
+                self.invalidate(OfferError::OldestAge);
+                return Err(OfferError::OldestAge);
+            }
+        }
+        Ok(self.entries.pop_front().map(|entry| BatchLease {
             batch: entry.batch,
             generation: entry.generation,
             reservations: Arc::clone(&self.reservations),
-        })
+        }))
     }
 
     /// The generation currently accepted by this queue.
@@ -286,6 +376,21 @@ impl BoundedBatchQueue {
     #[must_use]
     pub fn queued_windows(&self) -> usize {
         self.entries.len()
+    }
+
+    /// Permanently refuse admission, flush queued windows, and invalidate
+    /// in-flight generations. An owner retains this queue until drained.
+    pub fn close(&mut self) {
+        if !self.closed {
+            self.closed = true;
+            self.invalidate(OfferError::Closed);
+        }
+    }
+
+    /// No queued or in-flight window still owns admission capacity.
+    #[must_use]
+    pub fn is_drained(&self) -> bool {
+        self.entries.is_empty() && self.reserved() == (0, 0)
     }
 
     fn invalidate(&mut self, reason: OfferError) {
@@ -333,6 +438,7 @@ impl BatchLease {
     }
 
     /// Iterate original encoded packets without copying their payloads.
+    #[must_use]
     pub fn packets(&self) -> &[EncodedPacket] {
         self.batch.packets()
     }
@@ -363,6 +469,12 @@ impl Drop for BatchLease {
 
 #[cfg(test)]
 mod tests {
+    #![allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::indexing_slicing
+    )]
     use super::*;
     use ffmpeg_next::codec::packet::{Flags, Packet};
 
@@ -379,9 +491,28 @@ mod tests {
     fn key() -> Arc<PacketBatch> {
         window(vec![packet(StreamKind::Video, 1, true)])
     }
+    fn audio() -> Arc<PacketBatch> {
+        window(vec![packet(StreamKind::Audio, 1, false)])
+    }
+    fn audio_queue() -> BoundedBatchQueue {
+        BoundedBatchQueue::new().with_recovery_gate(RecoveryGate::AudioOnly)
+    }
+    fn strict_queue() -> BoundedBatchQueue {
+        BoundedBatchQueue::new().with_recovery_gate(RecoveryGate::StrictRap {
+            codec: CodecKind::H264,
+            framing: NalFraming::AnnexB,
+        })
+    }
+    fn h264_au(nal: u8, flagged_key: bool) -> Arc<PacketBatch> {
+        let mut raw = Packet::copy(&[0, 0, 0, 1, nal, 0x88]);
+        if flagged_key {
+            raw.set_flags(Flags::KEY);
+        }
+        window(vec![EncodedPacket::from_packet(raw)])
+    }
 
     #[test]
-    fn healthy_burst_exceeds_four_and_preserves_tracks_and_zero_emission() {
+    fn healthy_burst_exceeds_four_and_preserves_tracks() {
         let mut q = BoundedBatchQueue::new();
         let now = Instant::now();
         let burst = window(
@@ -400,12 +531,16 @@ mod tests {
                 .collect(),
         );
         q.try_offer(burst, now).unwrap();
-        q.try_offer(window(vec![]), now).unwrap();
+        assert!(matches!(
+            PacketBatch::try_new(vec![], Duration::ZERO),
+            Err(BatchError::EmptyWindow)
+        ));
+        q.try_offer(audio(), now).unwrap();
         let lease = q.pop().unwrap();
         assert_eq!(lease.packets().len(), 9);
         assert_eq!(lease.packets()[1].kind(), StreamKind::AudioTrack(1));
         assert!(lease.is_current());
-        assert_eq!(q.pop().unwrap().packets().len(), 0);
+        assert_eq!(q.pop_at(now).unwrap().unwrap().packets().len(), 1);
         assert_eq!(q.reserved(), (9, 9216));
         drop(lease);
         assert_eq!(q.reserved(), (0, 0));
@@ -422,12 +557,9 @@ mod tests {
         assert_eq!(q.try_offer(av, now), Err(OfferError::Oversized));
         assert_eq!(q.queued_windows(), 0);
         assert_eq!(q.reserved(), (0, 0));
-        assert_eq!(q.take_discontinuity().unwrap().generation, 1);
-        assert_eq!(
-            q.try_offer(window(vec![packet(StreamKind::Audio, 1, false)]), now),
-            Err(OfferError::NeedsKeyframe)
-        );
-        q.try_offer(key(), now).unwrap();
+        assert!(q.take_discontinuity().is_none());
+        q.try_offer(audio(), now).unwrap();
+        assert_eq!(q.reserved(), (1, 1));
     }
 
     #[test]
@@ -447,8 +579,8 @@ mod tests {
         );
         assert!(!lease.is_current());
         drop(lease);
-        q.try_offer(key(), now).unwrap();
-        assert_eq!(q.reserved(), (1, 1));
+        assert_eq!(q.try_offer(key(), now), Err(OfferError::NeedsRecoveryPoint));
+        assert_eq!(q.reserved(), (0, 0));
     }
 
     #[test]
@@ -465,8 +597,159 @@ mod tests {
             q.take_discontinuity().unwrap().reason,
             OfferError::OldestAge
         );
-        q.try_offer(key(), now + MAX_QUEUE_AGE + Duration::from_nanos(1))
+        assert_eq!(
+            q.try_offer(key(), now + MAX_QUEUE_AGE + Duration::from_nanos(1)),
+            Err(OfferError::NeedsRecoveryPoint)
+        );
+    }
+
+    #[test]
+    fn pop_checks_age_without_a_new_offer_and_preserves_inflight_budget() {
+        let now = Instant::now();
+        let mut q = BoundedBatchQueue::new();
+        q.try_offer(key(), now).unwrap();
+        let lease = q.pop_at(now).unwrap().unwrap();
+        q.try_offer(key(), now).unwrap();
+        assert!(matches!(
+            q.pop_at(now + MAX_QUEUE_AGE + Duration::from_nanos(1)),
+            Err(OfferError::OldestAge)
+        ));
+        assert_eq!(q.reserved(), (1, 1));
+        assert!(!lease.is_current());
+        assert_eq!(
+            q.take_discontinuity().unwrap().reason,
+            OfferError::OldestAge
+        );
+        drop(lease);
+        assert_eq!(q.reserved(), (0, 0));
+    }
+
+    #[test]
+    fn bounded_producer_never_waits_for_a_held_consumer_lease() {
+        use std::sync::mpsc;
+        let now = Instant::now();
+        let mut q = BoundedBatchQueue::with_limits(1, 1, MAX_QUEUE_AGE);
+        q.try_offer(key(), now).unwrap();
+        let lease = q.pop_at(now).unwrap().unwrap();
+        let (sender, receiver) = mpsc::channel();
+        let handle = std::thread::spawn(move || {
+            let result = q.try_offer(key(), now);
+            sender.send((result, q.reserved())).unwrap();
+        });
+        // The producer returns immediately, even though the consumer retains
+        // the only available permit. The test has a finite failure timeout.
+        let (result, reserved) = receiver.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert_eq!(result, Err(OfferError::Occupied));
+        assert_eq!(reserved, (1, 1));
+        drop(lease);
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn strict_rap_rejects_flagged_open_gop_and_accepts_real_idr() {
+        let now = Instant::now();
+        let mut q = strict_queue();
+        q.try_offer(
+            window(vec![packet(StreamKind::Video, 5 * 1024 * 1024, false)]),
+            now,
+        )
+        .unwrap();
+        let held = q.pop_at(now).unwrap().unwrap();
+        let full = window(vec![packet(StreamKind::Audio, MAX_BATCH_BYTES, false)]);
+        // A large, valid window cannot fit alongside a held lease.
+        assert_eq!(
+            q.try_offer(Arc::clone(&full), now),
+            Err(OfferError::Occupied)
+        );
+        assert!(!held.is_current());
+        drop(held);
+        assert_eq!(
+            q.try_offer(h264_au(0x41, true), now),
+            Err(OfferError::NeedsRecoveryPoint)
+        );
+        q.try_offer(h264_au(0x65, false), now).unwrap();
+        assert_eq!(q.generation(), 1);
+        assert!(q.pop_at(now).unwrap().unwrap().is_current());
+        drop(full);
+    }
+
+    #[test]
+    fn hevc_cra_flag_cannot_reopen_a_broken_gop() {
+        let now = Instant::now();
+        let mut q = BoundedBatchQueue::with_limits(1, 8, MAX_QUEUE_AGE).with_recovery_gate(
+            RecoveryGate::StrictRap {
+                codec: CodecKind::Hevc,
+                framing: NalFraming::AnnexB,
+            },
+        );
+        q.try_offer(h264_au(0x41, false), now).unwrap();
+        assert_eq!(
+            q.try_offer(h264_au(0x41, false), now),
+            Err(OfferError::Occupied)
+        );
+        let mut cra = Packet::copy(&[0, 0, 0, 1, 21 << 1, 1]);
+        cra.set_flags(Flags::KEY);
+        assert_eq!(
+            q.try_offer(window(vec![EncodedPacket::from_packet(cra)]), now),
+            Err(OfferError::NeedsRecoveryPoint)
+        );
+        let idr = Packet::copy(&[0, 0, 0, 1, 19 << 1, 1]);
+        q.try_offer(window(vec![EncodedPacket::from_packet(idr)]), now)
             .unwrap();
+        assert_eq!(q.queued_windows(), 1);
+    }
+
+    #[test]
+    fn audio_only_recovers_and_invalid_request_keeps_healthy_backlog() {
+        let now = Instant::now();
+        let mut q = audio_queue();
+        q.try_offer(audio(), now).unwrap();
+        assert_eq!(q.try_offer(key(), now), Err(OfferError::WrongProgramShape));
+        assert_eq!(
+            q.try_offer(window(vec![packet(StreamKind::Audio, 3, false)]), now),
+            Ok(())
+        );
+        assert_eq!(q.queued_windows(), 2);
+        assert_eq!(q.generation(), 0);
+        q.try_offer(
+            window(vec![packet(StreamKind::Audio, MAX_BATCH_BYTES, false)]),
+            now,
+        )
+        .unwrap();
+        assert_eq!(q.queued_windows(), 3);
+        assert_eq!(
+            q.try_offer(
+                window(vec![packet(StreamKind::Audio, 5 * 1024 * 1024, false)]),
+                now
+            ),
+            Err(OfferError::Occupied)
+        );
+        assert_eq!(q.take_discontinuity().unwrap().generation, 1);
+        q.try_offer(audio(), now).unwrap();
+        assert_eq!(
+            q.pop_at(now).unwrap().unwrap().packets()[0].kind(),
+            StreamKind::Audio
+        );
+    }
+
+    #[test]
+    fn close_fences_offers_and_retains_inflight_ownership_until_release() {
+        let now = Instant::now();
+        let mut q = audio_queue();
+        q.try_offer(audio(), now).unwrap();
+        let held = q.pop_at(now).unwrap().unwrap();
+        q.try_offer(audio(), now).unwrap();
+        q.close();
+        assert_eq!(q.queued_windows(), 0);
+        assert_eq!(q.reserved(), (1, 1));
+        assert!(!held.is_current());
+        assert!(!q.is_drained());
+        assert_eq!(q.try_offer(audio(), now), Err(OfferError::Closed));
+        assert_eq!(q.take_discontinuity().unwrap().reason, OfferError::Closed);
+        drop(held);
+        assert!(q.is_drained());
+        q.close();
+        assert_eq!(q.generation(), 1);
     }
 
     #[test]
@@ -484,6 +767,13 @@ mod tests {
         ));
         assert!(matches!(
             PacketBatch::try_new(vec![], Duration::from_secs(1)),
+            Err(BatchError::EmptyWindow)
+        ));
+        assert!(matches!(
+            PacketBatch::try_new(
+                vec![packet(StreamKind::Audio, 1, false)],
+                Duration::from_secs(1)
+            ),
             Err(BatchError::MediaSpan)
         ));
         let mut q = BoundedBatchQueue::with_limits(usize::MAX, usize::MAX, Duration::MAX);
