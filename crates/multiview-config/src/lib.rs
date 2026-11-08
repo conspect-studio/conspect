@@ -51,6 +51,7 @@ pub mod placement;
 pub mod playback;
 pub mod probe;
 pub mod program;
+pub mod rendition;
 pub mod routing;
 pub mod salvo;
 pub mod schema;
@@ -114,6 +115,12 @@ pub use playback::{
 };
 pub use probe::{DetectionZone, Dwell, LoudnessTarget, Probe, ProbeKind};
 pub use program::{ProgramId, ProgramKind, ProgramSpec};
+pub use rendition::{
+    plan_from_config, AudioRenditionKey, AudioTrackId, EncodeCapabilities, MuxBinding,
+    OutputTransport, RenditionAudioCodec, RenditionColorKey, RenditionPlan, RenditionPlanError,
+    RenditionVideoCodec, VideoRenditionKey, MAX_AUDIO_RENDITIONS_PER_PROGRAM,
+    MAX_VIDEO_RENDITIONS_PER_PROGRAM,
+};
 pub use routing::{
     AudioCrosspoint, OutputCrosspoint, OutputRef, RoutingRefs, RoutingTable, StreamRef,
     StreamSelector, SubtitleCrosspoint, VideoCrosspoint, MAIN_PROGRAM,

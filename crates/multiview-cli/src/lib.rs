@@ -200,6 +200,12 @@ pub mod outputs;
 /// emits `ShedLoad`, and drives the engine make-before-break crosspoint.
 pub mod placement;
 pub mod preview;
+/// The runtime-facing rendition-plan seam (broadcast output contract, slice 1):
+/// projects the configured outputs onto shared video/audio renditions using the
+/// build's existing `can_encode` probes. Pure planning only — it opens no
+/// encoder and reserves no session; the `Pipeline::build` wiring is the next
+/// serial unit.
+pub mod rendition_plan;
 pub mod run;
 #[cfg(test)]
 mod source_event_automation_e2e;
