@@ -281,7 +281,7 @@ impl Client {
             if count < total
                 && page
                     .windows(2)
-                    .any(|pair| pair[0].created == pair[1].created)
+                    .any(|pair| matches!(pair, [a, b] if a.created == b.created))
             {
                 return Err(Error::IncompleteInventory);
             }
