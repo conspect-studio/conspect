@@ -12190,7 +12190,7 @@
         "properties": {
           "codec": {
             "type": "string",
-            "description": "WebCodecs codec identifier."
+            "description": "`WebCodecs` codec identifier."
           },
           "description": {
             "type": [
@@ -12306,7 +12306,7 @@
         "properties": {
           "codec": {
             "type": "string",
-            "description": "WebCodecs codec identifier."
+            "description": "`WebCodecs` codec identifier."
           },
           "coded_height": {
             "type": "integer",
@@ -13417,7 +13417,7 @@
           },
           "moq": {
             "type": "boolean",
-            "description": "True only when an authorized MoQ transport provider is ready."
+            "description": "True only when an authorized `MoQ` transport provider is ready."
           },
           "scopes": {
             "$ref": "#/components/schemas/ScopeCapabilities",

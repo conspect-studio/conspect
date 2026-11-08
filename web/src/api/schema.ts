@@ -4107,7 +4107,7 @@ export interface components {
         };
         /** @description Independent audio decoder configuration. */
         MoqAudio: {
-            /** @description WebCodecs codec identifier. */
+            /** @description `WebCodecs` codec identifier. */
             codec: string;
             /** @description Base64 decoder initialization bytes, when required. */
             description?: string | null;
@@ -4160,7 +4160,7 @@ export interface components {
         };
         /** @description Decoder configuration; description is base64 decoder initialization data. */
         MoqVideo: {
-            /** @description WebCodecs codec identifier. */
+            /** @description `WebCodecs` codec identifier. */
             codec: string;
             /**
              * Format: int32
@@ -4539,7 +4539,7 @@ export interface components {
              *     fallback literal everywhere — ADR-P006 move 6).
              */
             fallback: string;
-            /** @description True only when an authorized MoQ transport provider is ready. */
+            /** @description True only when an authorized `MoQ` transport provider is ready. */
             moq: boolean;
             /** @description Per-scope WHEP availability + the program fidelity label. */
             scopes: components["schemas"]["ScopeCapabilities"];
