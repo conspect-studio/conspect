@@ -226,7 +226,71 @@ describe("OutputLinkStatus", () => {
     expect(screen.getByText("[2001:db8::7]:5000")).toBeInTheDocument();
     expect(screen.getByText("192.0.2.4:5001")).toBeInTheDocument();
     expect(screen.getByText("connection lost")).toBeInTheDocument();
+    // A body with no reason counters (an older server) keeps its conflated
+    // total; the split is only possible once the server sends it.
     expect(screen.getByText("42 packets dropped")).toBeInTheDocument();
+  });
+
+  it("reports no-caller discards as information, never as drops", async () => {
+    renderLink({
+      ...link,
+      state: "listening",
+      clients: 0,
+      dropped: 1_412_904,
+      discarded_no_client: 1_412_904,
+      discarded_awaiting_keyframe: 0,
+      dropped_slow_peer: 0,
+      dropped_upstream: 0,
+    });
+    expect(
+      await screen.findByText("Listening, no caller attached"),
+    ).toBeInTheDocument();
+    const discards = screen.getByText(
+      "1412904 packets discarded while no caller was attached",
+    );
+    expect(discards).toHaveClass("text-muted-foreground");
+    expect(discards).not.toHaveClass("text-destructive");
+    expect(screen.queryByText(/packets dropped/)).not.toBeInTheDocument();
+  });
+
+  it("still alarms on a real slow-peer drop and separates the benign holds", async () => {
+    renderLink({
+      ...link,
+      state: "connected",
+      clients: 1,
+      dropped: 45,
+      discarded_no_client: 0,
+      discarded_awaiting_keyframe: 15,
+      dropped_slow_peer: 30,
+      dropped_upstream: 0,
+    });
+    expect(await screen.findByText("Connected (1)")).toBeInTheDocument();
+    const slow = screen.getByText("30 packets dropped (slow peer)");
+    expect(slow).toHaveClass("text-destructive");
+    expect(
+      screen.getByText("15 packets discarded waiting for a keyframe"),
+    ).toHaveClass("text-muted-foreground");
+    expect(screen.queryByText(/discarded while no caller/)).not.toBeInTheDocument();
+  });
+
+  it("keeps a previous session's error as muted history, not a current alarm", async () => {
+    renderLink({
+      ...link,
+      state: "listening",
+      clients: 0,
+      dropped: 5,
+      discarded_no_client: 5,
+      discarded_awaiting_keyframe: 0,
+      dropped_slow_peer: 0,
+      dropped_upstream: 0,
+      last_error: null,
+      last_session_error: "Input/output error",
+    });
+    const history = await screen.findByText(
+      "Last session ended: Input/output error",
+    );
+    expect(history).toHaveClass("text-muted-foreground");
+    expect(history).not.toHaveClass("text-destructive");
   });
 
   it("renders nothing while the program is stopped", async () => {

@@ -112,7 +112,19 @@ function hasLiveLink(kind: OutputKind): boolean {
   return kind === 'srt' || kind === 'rtmp' || kind === 'rist';
 }
 
-/** A push output's live link: whether a peer is attached, and what went wrong. */
+/**
+ * A push output's live link: whether a peer is attached, what is wrong *now*,
+ * and why packets were not delivered.
+ *
+ * HONESTY (issue #202): a listener waiting for a caller discards every encoded
+ * packet, which is expected — reporting that as "packets dropped" alongside an
+ * error from a previous session reads as a fault when the link is healthy. So
+ * (1) only `last_error` — current link health — is shown as an alarm;
+ * `last_session_error` is muted history from the previous session; and (2) the
+ * additive reason counters separate benign discards (no caller, waiting for a
+ * keyframe) from real delivery failures (slow peer, upstream shed). Bodies from
+ * a server without the reason counters fall back to the one conflated total.
+ */
 export function OutputLinkStatus({ id }: { readonly id: string }): JSX.Element | null {
   const { t } = useLingui();
   const link = useOutputLink(id, true).data;
@@ -133,6 +145,17 @@ export function OutputLinkStatus({ id }: { readonly id: string }): JSX.Element |
         return t`Idle`;
     }
   })();
+  // The reason counters are additive; an older server sends none of them and
+  // only its conflated `dropped` total, which we cannot honestly split.
+  const hasReasons =
+    link.discarded_no_client !== undefined &&
+    link.discarded_awaiting_keyframe !== undefined &&
+    link.dropped_slow_peer !== undefined &&
+    link.dropped_upstream !== undefined;
+  const discardedNoClient = link.discarded_no_client ?? 0;
+  const discardedKeyframe = link.discarded_awaiting_keyframe ?? 0;
+  const slowPeerDrops = link.dropped_slow_peer ?? 0;
+  const upstreamDrops = link.dropped_upstream ?? 0;
   return (
     <div className="flex flex-col gap-0.5 text-xs" data-testid="output-link">
       <span>{state}</span>
@@ -144,8 +167,41 @@ export function OutputLinkStatus({ id }: { readonly id: string }): JSX.Element |
       {link.last_error !== undefined && link.last_error !== null ? (
         <span className="text-destructive">{link.last_error}</span>
       ) : null}
-      {link.dropped > 0 ? (
+      {link.last_session_error !== undefined &&
+      link.last_session_error !== null ? (
         <span className="text-muted-foreground">
+          <Trans>Last session ended: {link.last_session_error}</Trans>
+        </span>
+      ) : null}
+      {hasReasons ? (
+        <>
+          {slowPeerDrops > 0 ? (
+            <span className="text-destructive">
+              <Trans>{slowPeerDrops} packets dropped (slow peer)</Trans>
+            </span>
+          ) : null}
+          {upstreamDrops > 0 ? (
+            <span className="text-destructive">
+              <Trans>{upstreamDrops} packets dropped upstream (queue full)</Trans>
+            </span>
+          ) : null}
+          {discardedNoClient > 0 ? (
+            <span className="text-muted-foreground">
+              <Trans>
+                {discardedNoClient} packets discarded while no caller was attached
+              </Trans>
+            </span>
+          ) : null}
+          {discardedKeyframe > 0 ? (
+            <span className="text-muted-foreground">
+              <Trans>
+                {discardedKeyframe} packets discarded waiting for a keyframe
+              </Trans>
+            </span>
+          ) : null}
+        </>
+      ) : link.dropped > 0 ? (
+        <span className="text-destructive">
           <Trans>{link.dropped} packets dropped</Trans>
         </span>
       ) : null}

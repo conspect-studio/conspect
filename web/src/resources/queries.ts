@@ -32,7 +32,7 @@ import {
   toSourceView,
   writeResource,
 } from './api';
-import type { OutputLink } from './api';
+import type { OutputLinkWithReasons } from './api';
 import type { ResourceWithEtag } from './api';
 import type {
   OutputView,
@@ -157,12 +157,12 @@ export function useOutputLink(
   id: string,
   enabled: boolean,
   context: ResourceContext = {},
-): UseQueryResult<OutputLink | null, ApiError> {
-  return useQuery<OutputLink | null, ApiError>({
+): UseQueryResult<OutputLinkWithReasons | null, ApiError> {
+  return useQuery<OutputLinkWithReasons | null, ApiError>({
     queryKey: ['outputs', id, 'link'],
     enabled,
     refetchInterval: OUTPUT_LINK_REFRESH_MS,
-    queryFn: async (): Promise<OutputLink | null> => {
+    queryFn: async (): Promise<OutputLinkWithReasons | null> => {
       try {
         return await getOutputLink(id, requestOptions(context));
       } catch (error) {

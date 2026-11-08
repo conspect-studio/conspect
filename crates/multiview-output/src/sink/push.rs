@@ -8,8 +8,12 @@
 //!   fan-out queue as fast as packets arrive and hands each packet to every
 //!   attached peer's own bounded queue with `try_send`. With no peer attached
 //!   (a listener waiting for a caller, a caller reconnecting) the packet is
-//!   **dropped and counted** — it never blocks, so the consumer's fan-out queue
-//!   never fills and the sink is never marked wedged.
+//!   **discarded and counted as such** — it never blocks, so the consumer's
+//!   fan-out queue never fills and the sink is never marked wedged. Each
+//!   non-delivery is attributed to one reason on the link status (no client /
+//!   awaiting keyframe / slow peer / upstream shed) so an operator waiting for
+//!   a caller is never shown a delivery failure; the `dropped` total stays the
+//!   sum of those reasons.
 //! * **link thread** — *caller* mode opens the transport through
 //!   [`Muxer::create_push`], whose `AVIOInterruptCB` makes the blocking connect
 //!   abortable, keeps one session, and reconnects with back-off (0.5 s → 5 s,
@@ -85,7 +89,9 @@ pub struct PushRunReport {
     pub sessions: u64,
     /// Packets the distributor pulled from the fan-out queue.
     pub received: u64,
-    /// Packets dropped for this output (no peer attached / peer overflow).
+    /// Packets dropped for this output, for any reason (no peer attached /
+    /// waiting for a keyframe / slow peer / upstream shed). The live link
+    /// status splits this total by reason.
     pub dropped: u64,
 }
 
@@ -259,7 +265,7 @@ fn distribute<P: PacketSource>(
         // that keyframe.
         let mut clients = shared.clients();
         if clients.is_empty() {
-            shared.link.add_dropped(1);
+            shared.link.discard_no_client();
             continue;
         }
         clients.retain_mut(|client| deliver(client, &packet, &shared.link));
@@ -271,7 +277,7 @@ fn distribute<P: PacketSource>(
 /// writer has gone (remove it).
 fn deliver(client: &mut Client, packet: &EncodedPacket, link: &PushLinkStatus) -> bool {
     if client.gated && !(matches!(packet.kind(), StreamKind::Video) && packet.is_keyframe()) {
-        link.add_dropped(1);
+        link.discard_awaiting_keyframe();
         return true;
     }
     match client.tx.try_send(packet.clone()) {
@@ -283,7 +289,7 @@ fn deliver(client: &mut Client, packet: &EncodedPacket, link: &PushLinkStatus) -
             // Slow peer: shed and resync on the next keyframe rather than
             // splice a hole into the middle of a GOP.
             client.gated = true;
-            link.add_dropped(1);
+            link.drop_slow_peer();
             true
         }
         Err(TrySendError::Disconnected(_)) => false,
@@ -389,6 +395,10 @@ fn caller_main(shared: &Shared, url: &str, muxer_name: &'static str, spec: &Writ
         if started.elapsed() >= STABLE_SESSION {
             backoff.reset();
         }
+        // The session that just ended is why we are reconnecting: its end
+        // error is the CURRENT reason here (a listener instead returns to
+        // `Listening` and keeps it historical).
+        shared.link.promote_session_error();
         shared.link.set_state(PushLinkState::Reconnecting);
         sleep_unless_stopped(shared, backoff.next_delay());
     }
@@ -410,6 +420,10 @@ fn listener_main(shared: &Shared, url: &str, muxer_name: &'static str, spec: &Wr
             }
         };
         backoff.reset();
+        // A successful (re)bind resolves any earlier bind failure: the link is
+        // healthy again, so no stale current error may outlive it. The last
+        // session's ending error stays historical.
+        shared.link.clear_error();
         shared.link.set_state(PushLinkState::Listening);
         tracing::info!(addr = %listener.local_addr(), "srt listener ready");
         let failure = accept_callers(shared, &listener, muxer_name, spec);
@@ -453,7 +467,9 @@ fn accept_callers(
                     shared.writers().push(handle);
                 }
             }
-            Err(e) => shared.link.set_error(e.to_string()),
+            // The accepted caller's session could not start: a session-scoped
+            // failure, so the still-healthy listener reports it as history.
+            Err(e) => shared.link.set_session_error(e.to_string()),
         }
     }
 }
@@ -543,7 +559,9 @@ fn writer_main(
     link.client_detached(peer);
     if let Err(e) = result {
         tracing::warn!(error = %e, "push peer session ended");
-        link.set_error(e.to_string());
+        // Session-scoped: historical for a listener going back to `Listening`,
+        // promoted to the current reason by caller mode before it reconnects.
+        link.set_session_error(e.to_string());
     } else {
         tracing::info!("push peer session closed at end-of-program");
     }
@@ -593,7 +611,12 @@ fn write_session(
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
-    use super::{deliver, is_srt_listener_url, Client};
+    use std::sync::atomic::AtomicBool;
+    use std::sync::{Arc, Mutex};
+
+    use super::{
+        deliver, distribute, is_srt_listener_url, Client, PacketSource, PushRunReport, Shared,
+    };
     use crate::push_link::PushLinkStatus;
     use ffmpeg_next::codec::packet::{Flags, Packet};
     use multiview_ffmpeg::EncodedPacket;
@@ -604,6 +627,47 @@ mod tests {
             packet.set_flags(Flags::KEY);
         }
         EncodedPacket::from_packet(packet)
+    }
+
+    /// A source handing out `n` keyframes, then end-of-program.
+    struct Packets(usize);
+
+    impl PacketSource for Packets {
+        fn next_packet(&mut self) -> crate::error::Result<Option<EncodedPacket>> {
+            if self.0 == 0 {
+                return Ok(None);
+            }
+            self.0 -= 1;
+            Ok(Some(video(true)))
+        }
+    }
+
+    /// A distributor with no peer attached must attribute every discard to
+    /// "no client" — the operator complaint this fixes: a listener waiting for
+    /// a caller must not be reported as a delivery failure.
+    #[test]
+    fn no_peer_discards_are_attributed_to_no_client_not_a_peer_drop() {
+        let link = Arc::new(PushLinkStatus::new("srt", true, "srt://[::]:9000"));
+        let shared = Shared {
+            clients: Mutex::new(Vec::new()),
+            writers: Mutex::new(Vec::new()),
+            stop: Arc::new(AtomicBool::new(false)),
+            link: Arc::clone(&link),
+        };
+        let mut source = Packets(5);
+        let mut report = PushRunReport::default();
+        distribute(&mut source, &shared, &mut report).expect("distribute");
+        let snap = link.snapshot();
+        assert_eq!(report.received, 5);
+        assert_eq!(snap.discarded_no_client, 5, "all five: no caller attached");
+        assert_eq!(snap.dropped, 5, "the total still counts the discards");
+        assert_eq!(snap.dropped_slow_peer, 0);
+        assert_eq!(snap.discarded_awaiting_keyframe, 0);
+        assert_eq!(
+            snap.last_error, None,
+            "waiting for a caller is not an error"
+        );
+        assert_eq!(snap.last_session_error, None);
     }
 
     #[test]
@@ -618,7 +682,13 @@ mod tests {
         assert!(deliver(&mut client, &video(false), &link));
         assert!(deliver(&mut client, &audio, &link));
         assert!(rx.try_recv().is_err(), "nothing before the first video key");
-        assert_eq!(link.dropped(), 2);
+        let snap = link.snapshot();
+        assert_eq!(snap.dropped, 2);
+        assert_eq!(
+            snap.discarded_awaiting_keyframe, 2,
+            "gating on the first keyframe is its own reason"
+        );
+        assert_eq!(snap.dropped_slow_peer, 0);
 
         assert!(deliver(&mut client, &video(true), &link));
         assert!(!client.gated, "the keyframe opened the gate");
@@ -631,7 +701,13 @@ mod tests {
         assert!(deliver(&mut client, &video(false), &link));
         assert!(deliver(&mut client, &video(false), &link));
         assert!(client.gated, "overflow re-gates on the next keyframe");
-        assert_eq!(link.dropped(), 3);
+        let snap = link.snapshot();
+        assert_eq!(snap.dropped, 3);
+        assert_eq!(snap.dropped_slow_peer, 1, "the overflow is a slow peer");
+        assert_eq!(
+            snap.discarded_awaiting_keyframe, 2,
+            "the two holds before the first keyframe are unchanged"
+        );
 
         drop(rx);
         client.gated = false;

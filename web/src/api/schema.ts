@@ -5525,11 +5525,44 @@ export interface components {
             clients: number;
             /**
              * Format: int64
-             * @description Packets dropped for this output (no peer attached / slow peer).
+             * @description Packets discarded while the session waited for a video keyframe (session
+             *     start or a post-overflow resync). Expected and benign.
+             */
+            discarded_awaiting_keyframe: number;
+            /**
+             * Format: int64
+             * @description Packets discarded because no peer was attached (a listener waiting for a
+             *     caller, or a caller between sessions). Expected and benign.
+             */
+            discarded_no_client: number;
+            /**
+             * Format: int64
+             * @description Packets dropped for this output, for any reason: the sum of the four
+             *     reason counters below.
              */
             dropped: number;
-            /** @description The last connect/listen/write error since the last successful connect. */
+            /**
+             * Format: int64
+             * @description Packets dropped on a slow peer's full bounded queue (a real delivery
+             *     failure).
+             */
+            dropped_slow_peer: number;
+            /**
+             * Format: int64
+             * @description Packets dropped upstream of the distributor (the producer shed a packet
+             *     or held its post-loss gate).
+             */
+            dropped_upstream: number;
+            /**
+             * @description The current link error, if any since the last successful connect. Never
+             *     a peer session ending (that is `last_session_error`).
+             */
             last_error?: string | null;
+            /**
+             * @description How the most recent peer session ended, when it ended with an error and
+             *     no newer peer is attached. Historical context, not current link health.
+             */
+            last_session_error?: string | null;
             /** @description `caller` or `listener`. */
             mode: string;
             /** @description Attached peer addresses: an SRT listener's callers, or a caller's target. */

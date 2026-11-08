@@ -180,7 +180,30 @@ export async function getResource(
 /** Live link state of a push output (`GET /api/v1/outputs/{id}/link`). */
 export type OutputLink = components['schemas']['OutputLinkDoc'];
 
-function isOutputLink(value: unknown): value is OutputLink {
+/**
+ * The additive drop/discard reason counters (issue #202) are part of the
+ * release that introduced them, so a browser running this bundle can meet a
+ * server that predates them and sends none of them. The generated schema types
+ * them required because the *current* server always emits them, and
+ * {@link isOutputLink} deliberately does not demand them for that reason; this
+ * alias is the web-facing read type, so consumers test for their presence
+ * instead of treating an older body's absence as impossible.
+ */
+export type LinkReasonCounter =
+  | 'discarded_no_client'
+  | 'discarded_awaiting_keyframe'
+  | 'dropped_slow_peer'
+  | 'dropped_upstream';
+
+/** {@link OutputLink} as this bundle must read it: reason counters optional. */
+export type OutputLinkWithReasons = Omit<OutputLink, LinkReasonCounter> &
+  Partial<Pick<OutputLink, LinkReasonCounter>>;
+
+/**
+ * Validate the fields the UI cannot render without; the reason counters are
+ * read through {@link OutputLinkWithReasons} and may be absent (older server).
+ */
+function isOutputLink(value: unknown): value is OutputLinkWithReasons {
   return (
     typeof value === 'object' &&
     value !== null &&
@@ -202,7 +225,7 @@ function isOutputLink(value: unknown): value is OutputLink {
 export async function getOutputLink(
   id: string,
   options: ResourceRequestOptions = {},
-): Promise<OutputLink | null> {
+): Promise<OutputLinkWithReasons | null> {
   const response = await fetch(`${itemUrl('outputs', id, options)}/link`, {
     method: 'GET',
     headers: headersFor(options, false),

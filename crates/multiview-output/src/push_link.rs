@@ -6,8 +6,9 @@
 //! [`PushLinkStatus`] is the lock-free shared record of that state:
 //!
 //! * the **sink side** (acceptor / connector / per-client writers) writes it;
-//! * the **consumer side** only bumps the dropped-packet counter (an atomic,
-//!   never a lock — invariant #10);
+//! * the **consumer side** only bumps the drop/discard counters (atomics, never
+//!   a lock — invariant #10); each drop is attributed to one reason so a
+//!   listener waiting for a caller is never reported as a delivery failure;
 //! * the **status side** (the engine-state snapshot the control plane serves)
 //!   reads a [`PushLinkSnapshot`] with atomics + a lock-free
 //!   [`SwapCell`](multiview_framestore::SwapCell) load.
@@ -87,9 +88,24 @@ pub struct PushLinkStatus {
     clients: AtomicUsize,
     /// Total sessions ever established (connects + accepts).
     sessions: AtomicU64,
-    /// Packets dropped for this output because no peer was attached / a peer
-    /// queue was full / the sink queue was full. Monotonic.
+    /// Packets dropped for this output, for **any** reason (no peer attached /
+    /// waiting for a keyframe / slow peer / upstream shed). Monotonic; by
+    /// construction the sum of the four reason counters below.
     dropped: AtomicU64,
+    /// Packets discarded because **no peer was attached** (a listener waiting
+    /// for a caller, or a caller between sessions). Expected and benign — it is
+    /// not a delivery failure. Part of `dropped`.
+    discarded_no_client: AtomicU64,
+    /// Packets discarded because the session was **waiting for a video
+    /// keyframe** (a fresh session, or a post-overflow resync). Expected and
+    /// benign. Part of `dropped`.
+    discarded_awaiting_keyframe: AtomicU64,
+    /// Packets dropped because a **peer's bounded queue was full** (a slow
+    /// peer). A real delivery failure. Part of `dropped`.
+    dropped_slow_peer: AtomicU64,
+    /// Packets dropped **upstream of the distributor** (the producer shed a
+    /// packet or held its post-loss gate). Part of `dropped`.
+    dropped_upstream: AtomicU64,
     /// Packets written to peers. Monotonic.
     written: AtomicU64,
     /// The consumer shed a packet before the distributor saw it (observable
@@ -100,8 +116,14 @@ pub struct PushLinkStatus {
     /// it happens rather than against older queued packets (review SRT-04).
     /// Touched only by the one bake consumer thread.
     upstream_gated: AtomicBool,
-    /// The most recent connect/listen/write error (cleared on connect).
+    /// The most recent **link-level** connect/listen error (cleared by the next
+    /// successful bind/connect). A peer session ending is NOT recorded here: it
+    /// is history, not current link health (see `last_session_error`).
     last_error: SwapCell<Option<Arc<String>>>,
+    /// How the most recent peer session ended — **historical**, never a current
+    /// health alarm. Cleared when the next session attaches and ignored while a
+    /// newer peer is already attached.
+    last_session_error: SwapCell<Option<Arc<String>>>,
     /// Attached peer addresses, published for lock-free reads by the snapshot.
     peers: SwapCell<Arc<Vec<String>>>,
     /// Serialises the sink-side threads' read-modify-write of `peers`. Never
@@ -125,12 +147,28 @@ pub struct PushLinkSnapshot {
     pub clients: usize,
     /// Sessions established so far.
     pub sessions: u64,
-    /// Packets dropped (not delivered) for this output.
+    /// Packets dropped (not delivered) for this output, for any reason. The sum
+    /// of the four reason counters below.
     pub dropped: u64,
+    /// Packets discarded because no peer was attached (benign: a listener
+    /// waiting for a caller, or a caller between sessions).
+    pub discarded_no_client: u64,
+    /// Packets discarded while the session waited for a video keyframe (benign:
+    /// session start, or a post-overflow resync).
+    pub discarded_awaiting_keyframe: u64,
+    /// Packets dropped on a slow peer's full bounded queue (a real failure).
+    pub dropped_slow_peer: u64,
+    /// Packets dropped upstream of the distributor (producer shed / post-loss
+    /// gate).
+    pub dropped_upstream: u64,
     /// Packets written to peers.
     pub written: u64,
-    /// Last error, if any since the last successful connect.
+    /// The current link error, if any since the last successful connect. Never
+    /// a peer session ending — see `last_session_error`.
     pub last_error: Option<String>,
+    /// How the most recent peer session ended, if it ended with an error (and
+    /// no newer peer is attached). Historical context, not current link health.
+    pub last_session_error: Option<String>,
     /// Attached peer addresses (an SRT listener's callers; a caller's target).
     pub peers: Vec<String>,
 }
@@ -147,10 +185,15 @@ impl PushLinkStatus {
             clients: AtomicUsize::new(0),
             sessions: AtomicU64::new(0),
             dropped: AtomicU64::new(0),
+            discarded_no_client: AtomicU64::new(0),
+            discarded_awaiting_keyframe: AtomicU64::new(0),
+            dropped_slow_peer: AtomicU64::new(0),
+            dropped_upstream: AtomicU64::new(0),
             written: AtomicU64::new(0),
             resync: AtomicBool::new(false),
             upstream_gated: AtomicBool::new(false),
             last_error: SwapCell::new(None),
+            last_session_error: SwapCell::new(None),
             peers: SwapCell::new(Arc::new(Vec::new())),
             peers_edit: Mutex::new(Vec::new()),
         }
@@ -167,16 +210,57 @@ impl PushLinkStatus {
         self.state.store(state.to_u8(), Ordering::Release);
     }
 
-    /// Record a connect/listen/write failure (shown until the next connect).
+    /// Record a **link-level** connect/listen failure (shown until the next
+    /// successful bind/connect). A peer session ending does NOT belong here:
+    /// use [`set_session_error`](Self::set_session_error).
     pub fn set_error(&self, error: impl Into<String>) {
         self.last_error.store(Some(Arc::new(error.into())));
     }
 
-    /// A peer attached: count the session and clear the last error.
+    /// Clear the current link error: a successful bind (listener) or attach
+    /// (caller) resolved it. Never touches the historical session error.
+    pub fn clear_error(&self) {
+        self.last_error.store(None);
+    }
+
+    /// Record how a peer session ended. Historical by construction: this never
+    /// becomes the current link error, and it is ignored when a newer peer is
+    /// already attached (that session supersedes the ending one). Cleared by
+    /// the next successful attach.
+    pub fn set_session_error(&self, error: impl Into<String>) {
+        if self.clients() > 0 {
+            return;
+        }
+        self.last_session_error.store(Some(Arc::new(error.into())));
+    }
+
+    /// How the most recent peer session ended, if it did (`None` once the next
+    /// session attaches). Read by caller mode, where the session's death *is*
+    /// the reason for the reconnect.
+    #[must_use]
+    pub fn session_error(&self) -> Option<Arc<String>> {
+        self.last_session_error.load()
+    }
+
+    /// Move the last session-end error into the current link error — caller
+    /// mode: the session died, so its error is the live reason for the
+    /// reconnect (a listener instead returns to `Listening` and keeps it
+    /// historical). No-op when there is none.
+    pub fn promote_session_error(&self) {
+        if let Some(error) = self.last_session_error.load() {
+            self.last_error.store(Some(error));
+            self.last_session_error.store(None);
+        }
+    }
+
+    /// A peer attached: count the session, clear the current error and retire
+    /// the previous session's ending error (a successful connection supersedes
+    /// both).
     pub fn client_attached(&self, peer: Option<String>) {
         self.clients.fetch_add(1, Ordering::AcqRel);
         self.sessions.fetch_add(1, Ordering::AcqRel);
         self.last_error.store(None);
+        self.last_session_error.store(None);
         if let Some(peer) = peer {
             self.edit_peers(|peers| peers.push(peer));
         }
@@ -220,15 +304,44 @@ impl PushLinkStatus {
         self.clients.load(Ordering::Acquire)
     }
 
-    /// Count `n` dropped packets (wait-free; safe from the consumer thread).
+    /// Count `n` dropped packets toward the total only, with **no** reason
+    /// attribution (wait-free; safe from the consumer thread). Prefer the
+    /// reason-specific counters so the total stays decomposable.
     pub fn add_dropped(&self, n: u64) {
         self.dropped.fetch_add(n, Ordering::Relaxed);
+    }
+
+    /// Count a packet discarded because no peer is attached (expected: a
+    /// listener waiting for a caller). Wait-free.
+    pub fn discard_no_client(&self) {
+        self.add_dropped(1);
+        self.discarded_no_client.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Count a packet discarded while a session waits for a video keyframe
+    /// (fresh session or post-overflow resync). Wait-free.
+    pub fn discard_awaiting_keyframe(&self) {
+        self.add_dropped(1);
+        self.discarded_awaiting_keyframe
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Count a packet dropped on a slow peer's full bounded queue. Wait-free.
+    pub fn drop_slow_peer(&self) {
+        self.add_dropped(1);
+        self.dropped_slow_peer.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Count a packet dropped upstream of the distributor. Wait-free.
+    fn drop_upstream(&self) {
+        self.add_dropped(1);
+        self.dropped_upstream.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Count a packet shed upstream of the distributor and request a keyframe
     /// resync (wait-free; called from the bake consumer).
     pub fn shed_upstream(&self) {
-        self.add_dropped(1);
+        self.drop_upstream();
         self.upstream_gated.store(true, Ordering::Release);
         self.resync.store(true, Ordering::Release);
     }
@@ -240,7 +353,7 @@ impl PushLinkStatus {
         if !self.upstream_gated.load(Ordering::Acquire) || video_keyframe {
             return true;
         }
-        self.add_dropped(1);
+        self.drop_upstream();
         false
     }
 
@@ -286,8 +399,13 @@ impl PushLinkStatus {
             clients,
             sessions: self.sessions.load(Ordering::Acquire),
             dropped: self.dropped(),
+            discarded_no_client: self.discarded_no_client.load(Ordering::Relaxed),
+            discarded_awaiting_keyframe: self.discarded_awaiting_keyframe.load(Ordering::Relaxed),
+            dropped_slow_peer: self.dropped_slow_peer.load(Ordering::Relaxed),
+            dropped_upstream: self.dropped_upstream.load(Ordering::Relaxed),
             written: self.written.load(Ordering::Relaxed),
             last_error: self.last_error.load().map(|e| e.as_ref().clone()),
+            last_session_error: self.last_session_error.load().map(|e| e.as_ref().clone()),
             peers: self.peers.load().as_ref().clone(),
         }
     }
@@ -428,5 +546,109 @@ mod tests {
         assert_eq!(s.snapshot().state, PushLinkState::Listening);
         s.add_dropped(3);
         assert_eq!(s.snapshot().dropped, 3);
+    }
+
+    #[test]
+    fn drop_reasons_are_counted_separately_and_sum_to_the_total() {
+        let s = PushLinkStatus::new("srt", true, "srt://[::]:9000");
+        for _ in 0..7 {
+            s.discard_no_client();
+        }
+        for _ in 0..3 {
+            s.discard_awaiting_keyframe();
+        }
+        s.drop_slow_peer();
+        s.shed_upstream();
+        s.shed_upstream();
+        assert!(
+            !s.admit_upstream(false),
+            "post-shed gate holds non-keyframes"
+        );
+        assert!(s.admit_upstream(true), "a keyframe is admitted");
+
+        let snap = s.snapshot();
+        assert_eq!(snap.discarded_no_client, 7);
+        assert_eq!(snap.discarded_awaiting_keyframe, 3);
+        assert_eq!(snap.dropped_slow_peer, 1);
+        // Two explicit sheds plus the held post-loss gate.
+        assert_eq!(snap.dropped_upstream, 3);
+        assert_eq!(snap.dropped, 7 + 3 + 1 + 3, "the total stays the sum");
+    }
+
+    #[test]
+    fn a_session_end_error_is_history_never_current_health() {
+        let s = PushLinkStatus::new("srt", true, "srt://[::]:9000");
+        s.set_state(PushLinkState::Listening);
+        // The caller hung up: the session ended with an I/O error.
+        s.set_session_error("Input/output error");
+        let snap = s.snapshot();
+        assert_eq!(snap.state, PushLinkState::Listening);
+        assert_eq!(snap.last_error, None, "not a current link-health alarm");
+        assert_eq!(
+            snap.last_session_error.as_deref(),
+            Some("Input/output error"),
+            "kept as history"
+        );
+        // A session ending while a newer peer is already attached is superseded.
+        s.client_attached(Some("[::1]:5000".to_owned()));
+        assert_eq!(s.snapshot().last_session_error, None);
+        assert_eq!(s.snapshot().last_error, None);
+        s.set_session_error("late error from the superseded session");
+        assert_eq!(
+            s.snapshot().last_session_error,
+            None,
+            "a newer attached peer supersedes the ending one"
+        );
+        // The next successful connection clears everything anyway.
+        s.client_detached(Some("[::1]:5000"));
+        s.set_session_error("detached session error");
+        assert!(s.snapshot().last_session_error.is_some());
+        s.client_attached(None);
+        let snap = s.snapshot();
+        assert_eq!(snap.last_error, None);
+        assert_eq!(snap.last_session_error, None);
+        assert_eq!(snap.clients, 1);
+    }
+
+    #[test]
+    fn caller_mode_promotes_a_session_end_error_to_the_current_reason() {
+        let s = PushLinkStatus::new("srt", false, "srt://[::1]:9000");
+        s.set_state(PushLinkState::Connecting);
+        s.client_attached(None);
+        s.client_detached(None);
+        s.set_session_error("Broken pipe");
+        assert_eq!(
+            s.snapshot().last_error,
+            None,
+            "still history while deciding"
+        );
+        assert_eq!(
+            s.session_error().as_deref().map(String::as_str),
+            Some("Broken pipe")
+        );
+        s.promote_session_error();
+        let snap = s.snapshot();
+        assert_eq!(snap.last_error.as_deref(), Some("Broken pipe"));
+        assert_eq!(snap.last_session_error, None, "promoted, not duplicated");
+        // Idempotent: nothing left to promote.
+        s.clear_error();
+        s.promote_session_error();
+        assert_eq!(s.snapshot().last_error, None);
+    }
+
+    #[test]
+    fn a_successful_bind_clears_the_link_error_but_not_session_history() {
+        let s = PushLinkStatus::new("srt", true, "srt://[::]:9000");
+        s.set_error("transient bind failure");
+        assert!(s.snapshot().last_error.is_some());
+        s.set_session_error("Input/output error");
+        s.clear_error();
+        let snap = s.snapshot();
+        assert_eq!(snap.last_error, None, "the bind recovered");
+        assert_eq!(
+            snap.last_session_error.as_deref(),
+            Some("Input/output error"),
+            "history is untouched by a link-level clear"
+        );
     }
 }

@@ -16977,6 +16977,10 @@
           "clients",
           "sessions",
           "dropped",
+          "discarded_no_client",
+          "discarded_awaiting_keyframe",
+          "dropped_slow_peer",
+          "dropped_upstream",
           "written",
           "peers"
         ],
@@ -16987,10 +16991,34 @@
             "description": "Peers attached right now.",
             "minimum": 0
           },
+          "discarded_awaiting_keyframe": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Packets discarded while the session waited for a video keyframe (session\nstart or a post-overflow resync). Expected and benign.",
+            "minimum": 0
+          },
+          "discarded_no_client": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Packets discarded because no peer was attached (a listener waiting for a\ncaller, or a caller between sessions). Expected and benign.",
+            "minimum": 0
+          },
           "dropped": {
             "type": "integer",
             "format": "int64",
-            "description": "Packets dropped for this output (no peer attached / slow peer).",
+            "description": "Packets dropped for this output, for any reason: the sum of the four\nreason counters below.",
+            "minimum": 0
+          },
+          "dropped_slow_peer": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Packets dropped on a slow peer's full bounded queue (a real delivery\nfailure).",
+            "minimum": 0
+          },
+          "dropped_upstream": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Packets dropped upstream of the distributor (the producer shed a packet\nor held its post-loss gate).",
             "minimum": 0
           },
           "last_error": {
@@ -16998,7 +17026,14 @@
               "string",
               "null"
             ],
-            "description": "The last connect/listen/write error since the last successful connect."
+            "description": "The current link error, if any since the last successful connect. Never\na peer session ending (that is `last_session_error`)."
+          },
+          "last_session_error": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "How the most recent peer session ended, when it ended with an error and\nno newer peer is attached. Historical context, not current link health."
           },
           "mode": {
             "type": "string",

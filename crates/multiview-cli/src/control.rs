@@ -1045,8 +1045,12 @@ pub fn insert_input_fragment(
 
 /// Serialise the live push-output link records into the `outputs` snapshot
 /// fragment: `{ "<id>": { "link": { state, mode, transport, url, clients,
-/// sessions, dropped, written, peers, last_error? } } }`, or `None` when the
-/// run has no push outputs. Reads atomics + lock-free cells only (inv #10).
+/// sessions, dropped, discarded_no_client, discarded_awaiting_keyframe,
+/// dropped_slow_peer, dropped_upstream, written, peers, last_error?,
+/// last_session_error? } } }`, or `None` when the run has no push outputs.
+/// `dropped` is the total of the four reason counters; `last_error` is current
+/// link health, `last_session_error` is history. Reads atomics + lock-free
+/// cells only (inv #10).
 #[must_use]
 pub fn push_links_fragment(
     links: &[(
@@ -1068,12 +1072,22 @@ pub fn push_links_fragment(
             "clients": snap.clients,
             "sessions": snap.sessions,
             "dropped": snap.dropped,
+            "discarded_no_client": snap.discarded_no_client,
+            "discarded_awaiting_keyframe": snap.discarded_awaiting_keyframe,
+            "dropped_slow_peer": snap.dropped_slow_peer,
+            "dropped_upstream": snap.dropped_upstream,
             "written": snap.written,
             "peers": snap.peers,
         });
         if let Some(map) = obj.as_object_mut() {
             if let Some(err) = snap.last_error {
                 map.insert("last_error".to_owned(), serde_json::Value::String(err));
+            }
+            if let Some(err) = snap.last_session_error {
+                map.insert(
+                    "last_session_error".to_owned(),
+                    serde_json::Value::String(err),
+                );
             }
         }
         outputs.insert(id.clone(), serde_json::json!({ "link": obj }));
@@ -4491,5 +4505,67 @@ input_id = "in_a"
         for id in ["program", "low-latency_1.0~alt", "ABC123"] {
             assert_eq!(multiview_config::hls_mount_segment(id), id);
         }
+    }
+}
+
+/// Regression tests for the push-output link fragment (issue #202): every
+/// non-delivery is attributed to its own reason, and a peer session ending is
+/// history — never current link health.
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
+mod push_links_tests {
+    use std::sync::Arc;
+
+    use super::push_links_fragment;
+    use multiview_output::push_link::PushLinkStatus;
+
+    #[test]
+    fn every_non_delivery_is_attributed_and_a_session_end_is_history() {
+        let link = Arc::new(PushLinkStatus::new("srt", true, "srt://[::]:9000"));
+        link.discard_no_client();
+        link.discard_no_client();
+        link.discard_awaiting_keyframe();
+        link.drop_slow_peer();
+        link.set_session_error("Input/output error");
+
+        let links = vec![("srt-main".to_owned(), Arc::clone(&link))];
+        let fragment = push_links_fragment(&links).expect("a non-empty fragment");
+        let out = &fragment["srt-main"]["link"];
+        assert_eq!(out["discarded_no_client"], 2, "waiting for a caller: {out}");
+        assert_eq!(out["discarded_awaiting_keyframe"], 1, "{out}");
+        assert_eq!(out["dropped_slow_peer"], 1, "{out}");
+        assert_eq!(out["dropped_upstream"], 0, "{out}");
+        assert_eq!(
+            out["dropped"], 4,
+            "the total is the sum of the reasons: {out}"
+        );
+        assert_eq!(
+            out["last_session_error"], "Input/output error",
+            "a session ending is carried as history: {out}"
+        );
+        assert!(
+            out.get("last_error").is_none(),
+            "a session ending is NOT current link health: {out}"
+        );
+        assert_eq!(out["state"], "idle", "the fragment is a pure projection");
+    }
+
+    #[test]
+    fn a_link_error_is_current_health_while_a_session_end_is_not() {
+        let link = Arc::new(PushLinkStatus::new("srt", true, "srt://[::]:9000"));
+        link.set_error("bind failed");
+        let links = vec![("srt-main".to_owned(), Arc::clone(&link))];
+        let fragment = push_links_fragment(&links).expect("fragment");
+        let out = &fragment["srt-main"]["link"];
+        assert_eq!(out["last_error"], "bind failed", "{out}");
+        assert!(
+            out.get("last_session_error").is_none(),
+            "no session has ended: {out}"
+        );
+    }
+
+    #[test]
+    fn no_push_outputs_means_no_fragment() {
+        assert!(push_links_fragment(&[]).is_none());
     }
 }

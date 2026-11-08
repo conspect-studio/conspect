@@ -2507,13 +2507,31 @@ pub struct OutputLinkDoc {
     pub clients: u64,
     /// Peer sessions established this run.
     pub sessions: u64,
-    /// Packets dropped for this output (no peer attached / slow peer).
+    /// Packets dropped for this output, for any reason: the sum of the four
+    /// reason counters below.
     pub dropped: u64,
+    /// Packets discarded because no peer was attached (a listener waiting for a
+    /// caller, or a caller between sessions). Expected and benign.
+    pub discarded_no_client: u64,
+    /// Packets discarded while the session waited for a video keyframe (session
+    /// start or a post-overflow resync). Expected and benign.
+    pub discarded_awaiting_keyframe: u64,
+    /// Packets dropped on a slow peer's full bounded queue (a real delivery
+    /// failure).
+    pub dropped_slow_peer: u64,
+    /// Packets dropped upstream of the distributor (the producer shed a packet
+    /// or held its post-loss gate).
+    pub dropped_upstream: u64,
     /// Packets written to peers.
     pub written: u64,
-    /// The last connect/listen/write error since the last successful connect.
+    /// The current link error, if any since the last successful connect. Never
+    /// a peer session ending (that is `last_session_error`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_error: Option<String>,
+    /// How the most recent peer session ended, when it ended with an error and
+    /// no newer peer is attached. Historical context, not current link health.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_session_error: Option<String>,
     /// Attached peer addresses: an SRT listener's callers, or a caller's target.
     pub peers: Vec<String>,
 }
