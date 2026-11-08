@@ -250,10 +250,91 @@ impl StreamCodecParameters {
         }
     }
 
+    /// NAL framing for the opened H.264/HEVC encoder, derived from its codec
+    /// parameter record. A malformed avcC/hvcC record returns `None` rather than
+    /// guessing that a closed random-access point exists.
+    #[must_use]
+    pub fn nal_framing(&self) -> Option<crate::idr::NalFraming> {
+        let id = self.parameters.id();
+        let bytes = self.extradata();
+        nal_framing_from_config(id, bytes)
+    }
+
+    /// A strict decoder-ready access-unit gate for recovery after packet loss.
+    /// A keyframe flag alone is not sufficient for H.264/HEVC open GOPs or CRA.
+    #[must_use]
+    pub fn is_decoder_ready_rap(&self, packet: &EncodedPacket) -> bool {
+        if packet.kind() != StreamKind::Video || !packet.is_keyframe() {
+            return false;
+        }
+        match self.parameters.id() {
+            ffmpeg::codec::Id::MPEG2VIDEO => true,
+            ffmpeg::codec::Id::H264 => self.nal_framing().is_some_and(|framing| {
+                packet.payload().is_some_and(|payload| {
+                    crate::idr::is_idr(payload, crate::idr::CodecKind::H264, framing)
+                })
+            }),
+            ffmpeg::codec::Id::HEVC => self.nal_framing().is_some_and(|framing| {
+                packet.payload().is_some_and(|payload| {
+                    crate::idr::is_idr(payload, crate::idr::CodecKind::Hevc, framing)
+                })
+            }),
+            _ => false,
+        }
+    }
+
+    #[allow(unsafe_code)]
+    fn extradata(&self) -> &[u8] {
+        // SAFETY: `parameters` owns its AVCodecParameters for this borrow.
+        // Pointer and nonnegative size refer to its allocated extradata; no
+        // pointer escapes the borrowed slice or is modified here.
+        unsafe {
+            let raw = self.parameters.as_ptr();
+            let len = usize::try_from((*raw).extradata_size).unwrap_or(0);
+            if (*raw).extradata.is_null() || len == 0 {
+                &[]
+            } else {
+                std::slice::from_raw_parts((*raw).extradata, len)
+            }
+        }
+    }
+
     /// Borrow the underlying `ffmpeg_next` parameters (for the muxer wrapper).
     pub(crate) fn as_parameters(&self) -> &codec::Parameters {
         &self.parameters
     }
+}
+
+/// Parse codec-configuration-record framing without borrowing libav state.
+/// avcC stores `lengthSizeMinusOne` in byte 4; hvcC stores it in byte 21.
+/// Unknown or truncated records fail closed instead of guessing Annex-B.
+fn nal_framing_from_config(
+    id: ffmpeg::codec::Id,
+    extradata: &[u8],
+) -> Option<crate::idr::NalFraming> {
+    use crate::idr::NalFraming;
+    let index = match id {
+        ffmpeg::codec::Id::H264 => 4,
+        ffmpeg::codec::Id::HEVC => 21,
+        _ => return None,
+    };
+    if extradata.starts_with(&[0, 0, 1]) || extradata.starts_with(&[0, 0, 0, 1]) {
+        return Some(NalFraming::AnnexB);
+    }
+    if extradata.is_empty() {
+        // Raw encoder output (for example MPEG-TS) can use Annex-B with no
+        // extradata. The strict IDR parser still rejects malformed packets.
+        return Some(NalFraming::AnnexB);
+    }
+    if extradata.first() != Some(&1) {
+        return None;
+    }
+    let size_byte = *extradata.get(index)?;
+    let nal_length_size = (size_byte & 0x03) + 1;
+    if nal_length_size == 3 {
+        return None;
+    }
+    Some(NalFraming::LengthPrefixed { nal_length_size })
 }
 
 impl Clone for StreamCodecParameters {
@@ -276,6 +357,59 @@ impl std::fmt::Debug for StreamCodecParameters {
             .field("configured_bit_rate", &self.configured_bit_rate)
             .field("video_dimensions", &self.video_dimensions)
             .finish()
+    }
+}
+
+#[cfg(test)]
+mod nal_config_tests {
+    use super::nal_framing_from_config;
+    use crate::idr::{is_idr, CodecKind, NalFraming};
+    use ffmpeg_next::codec::Id;
+
+    #[test]
+    fn avcc_uses_byte_four_and_rejects_truncation() {
+        assert_eq!(
+            nal_framing_from_config(Id::H264, &[1, 0, 0, 0, 0xff]),
+            Some(NalFraming::LengthPrefixed { nal_length_size: 4 })
+        );
+        assert_eq!(nal_framing_from_config(Id::H264, &[1, 0, 0, 0]), None);
+        assert_eq!(
+            nal_framing_from_config(Id::H264, &[0, 0, 0, 1, 0x65]),
+            Some(NalFraming::AnnexB)
+        );
+        assert!(is_idr(
+            &[0, 0, 0, 1, 0x65, 0x80],
+            CodecKind::H264,
+            NalFraming::AnnexB
+        ));
+    }
+
+    #[test]
+    fn hvcc_uses_byte_twenty_one_not_avcc_offset_and_rejects_cra() {
+        let mut hvcc = vec![0; 22];
+        hvcc[0] = 1;
+        hvcc[4] = 0;
+        hvcc[21] = 3;
+        assert_eq!(
+            nal_framing_from_config(Id::HEVC, &hvcc),
+            Some(NalFraming::LengthPrefixed { nal_length_size: 4 })
+        );
+        assert_eq!(nal_framing_from_config(Id::HEVC, &hvcc[..21]), None);
+        assert_eq!(
+            nal_framing_from_config(Id::HEVC, &[0, 0, 1, 0x26, 1]),
+            Some(NalFraming::AnnexB)
+        );
+        // HEVC CRA is NAL 21 (0x2a) and may depend on earlier pictures.
+        assert!(!is_idr(
+            &[0, 0, 1, 0x2a, 1, 0x80],
+            CodecKind::Hevc,
+            NalFraming::AnnexB
+        ));
+        assert!(is_idr(
+            &[0, 0, 1, 0x26, 1, 0x80],
+            CodecKind::Hevc,
+            NalFraming::AnnexB
+        ));
     }
 }
 
