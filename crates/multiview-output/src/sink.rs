@@ -1852,6 +1852,9 @@ struct SegmentState<'a> {
     last_pts: MediaTime,
     /// A failed live muxer is discarded. Resume only at a video keyframe.
     recovering: bool,
+    /// Inject one packet-write failure in the real segment driver (unit test only).
+    #[cfg(test)]
+    fail_packet_write_once: bool,
     /// Consecutive failed reopen attempts; terminal errors reach the supervisor.
     recovery_failures: u8,
     /// A close/playlist publication failure must reach the caller, not hide.
@@ -1959,6 +1962,8 @@ impl<'a> SegmentState<'a> {
             done: Vec::new(),
             last_pts: MediaTime::ZERO,
             recovering: false,
+            #[cfg(test)]
+            fail_packet_write_once: false,
             recovery_failures: 0,
             publication_failed: false,
             stats: EncodeStats::default(),
@@ -2389,6 +2394,10 @@ impl<'a> SegmentState<'a> {
                     self.start_segment(pts)?;
                 }
                 self.write_audio_rendition(&packet)?;
+                #[cfg(test)]
+                if std::mem::take(&mut self.fail_packet_write_once) {
+                    return Err(Error::Output("injected packet write failure".to_owned()));
+                }
                 let owned = packet.into_owned_packet();
                 let (muxer, index) = self.current_muxer()?;
                 muxer.write_packet(index, owned).map_err(ff)?;
@@ -2996,6 +3005,62 @@ mod tests {
 
     const WIDTH: u32 = 160;
     const HEIGHT: u32 = 120;
+
+    #[test]
+    fn packet_write_failure_discards_partial_and_resumes_at_rap() {
+        use super::{PacketSource, SegmentState, StreamSeed};
+        use crate::hls::LivePlaylist;
+        use ffmpeg::codec::packet::{Flags, Packet};
+        use multiview_ffmpeg::{EncodedPacket, StreamCodecParameters, VideoEncoder};
+
+        struct Packets(std::vec::IntoIter<EncodedPacket>);
+        impl PacketSource for Packets {
+            fn next_packet(&mut self) -> Result<Option<EncodedPacket>> {
+                Ok(self.0.next())
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let encoder = VideoEncoder::new(&EncodeConfig::mpeg2(WIDTH, HEIGHT).target()).unwrap();
+        let params = StreamCodecParameters::from_encoder(&encoder);
+        let time_base = encoder.time_base();
+        let mut state = SegmentState::new(
+            StreamSeed::Params(&params),
+            time_base,
+            None,
+            dir.path(),
+            "seg",
+        );
+        state.live = Some(LivePlaylist::new(dir.path().join("index.m3u8"), 3));
+        let mut packets = Vec::new();
+        for index in 0..5 {
+            let mut packet = Packet::copy(&[0, 0, 1, 0, 0, 8, 0, 0]);
+            packet.set_flags(if index == 0 || index == 3 {
+                Flags::KEY
+            } else {
+                Flags::empty()
+            });
+            packet.set_pts(Some(index));
+            packet.set_dts(Some(index));
+            packets.push(EncodedPacket::from_packet(packet));
+        }
+        // The initial access unit is written into the live .tmp file. The
+        // next write fails and must not advertise that partial file.
+        let first = packets.remove(0);
+        state
+            .write_source_packet(first, multiview_core::time::MediaTime::ZERO)
+            .unwrap();
+        state.fail_packet_write_once = true;
+        state
+            .drive_from_packets(&mut Packets(packets.into_iter()))
+            .unwrap();
+        let mut report = crate::hls::MediaPlaylist::new(crate::hls::SegmentType::MpegTs);
+        state.finish(&mut report, 33_333_333).unwrap();
+        assert!(!dir.path().join("seg0.ts.tmp").exists());
+        let playlist = std::fs::read_to_string(dir.path().join("index.m3u8")).unwrap();
+        assert!(!playlist.contains("seg0.ts"));
+        assert!(playlist.contains("#EXT-X-DISCONTINUITY\n"));
+        assert!(playlist.contains("seg1.ts"));
+    }
 
     #[test]
     fn live_report_stays_bounded_across_many_segment_cuts() {

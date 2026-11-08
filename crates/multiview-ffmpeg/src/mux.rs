@@ -812,9 +812,10 @@ impl Muxer {
                 && *(priv_data.cast::<*const ffmpeg::ffi::AVClass>())
                     == (*(*ctx).oformat).priv_class;
             if is_mpegts {
-                if let (Ok(key), Ok(val)) =
-                    (CString::new("mpegts_flags"), CString::new("resend_headers"))
-                {
+                if let (Ok(key), Ok(val)) = (
+                    CString::new("mpegts_flags"),
+                    CString::new("+resend_headers"),
+                ) {
                     let _ignored =
                         ffmpeg::ffi::av_opt_set(priv_data, key.as_ptr(), val.as_ptr(), 0);
                 }
