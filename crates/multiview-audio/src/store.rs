@@ -2774,6 +2774,56 @@ mod resync_tests {
         assert!(q.overflow_frames > 0);
     }
 
+    /// Replayed transport timestamps can create overlapping audio spans. The
+    /// newest video anchor then belongs to the replay, not to the older queued
+    /// blocks. Those blocks must not hold the queue ahead of audible new PCM.
+    #[test]
+    fn overlapping_replayed_epoch_does_not_starve_fresh_anchored_audio() {
+        let format = AudioFormat::new(48_000, ChannelLayout::Stereo);
+        let store = AudioStore::timeline(format, 288_000);
+        let mut queue = DecodedQueue::default();
+        let raw0 = 100 * SEC;
+        for i in 0..120 {
+            let raw = raw0 + i * SEC / 10;
+            queue.push(
+                AudioBlock::from_interleaved(format, vec![0.2; 4_800 * 2]).unwrap(),
+                raw,
+                48_000,
+                usize::MAX,
+            );
+        }
+        // Jump back by 12 s, beyond SPLICE_NS, into the old span's raw range.
+        queue.push(
+            AudioBlock::from_interleaved(format, vec![0.8; 4_800 * 2]).unwrap(),
+            raw0,
+            48_000,
+            usize::MAX,
+        );
+        let stale_epoch = queue.units.front().unwrap().epoch;
+        let replay_epoch = queue.units.back().unwrap().epoch;
+        assert_ne!(stale_epoch, replay_epoch);
+        assert_eq!(queue.epochs.epoch_of(raw0), Some(replay_epoch));
+        let mut placer =
+            Placer::new(48_000, 3 * RATE, std::time::Duration::from_secs(1)).require_video_anchor();
+        let now = std::time::Instant::now();
+        let video = anchor(1, 2 * SEC, raw0);
+        assert_eq!(
+            placer.map.map(raw0, stale_epoch, &queue.epochs, 0),
+            Mapped::None,
+            "old epoch has no anchor from the replay"
+        );
+        placer.step(&store, &mut queue, Some(video), 0, now);
+        placer.step(
+            &store,
+            &mut queue,
+            Some(video),
+            0,
+            now + std::time::Duration::from_secs(30),
+        );
+        assert!(queue.is_empty(), "stale head must not block the anchored replay");
+        assert_eq!(raw_at(&store, 2 * RATE), 0.8, "only the replay may air");
+    }
+
     #[test]
     fn required_video_anchor_never_self_anchors_after_timeout() {
         let format = AudioFormat::new(48_000, ChannelLayout::Stereo);
