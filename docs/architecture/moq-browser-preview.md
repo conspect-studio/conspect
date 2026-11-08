@@ -24,6 +24,8 @@ R3: a new media subscriber must preserve output-clock and isolation invariants. 
 
 The existing still-image path remains available when no live transport is available. A still image is never labelled live video.
 
+Expose requested transport policy separately from effective transport (`moq-webtransport`, `webrtc`, or `jpeg`). Preserve the typed availability/fallback reason, connection lifecycle, and effective binding generation for UI diagnostics. Never report an intended MoQ connection as effective before negotiation and media readiness. Redact credentials, relay query strings, and unauthorized dependency identifiers from diagnostics. The UI design lane requires this distinction for future transport/fallback indicators.
+
 ## Proposed shared-rendition seam
 
 The output redesign will finalize concrete Rust types. Preserve public `program`/`input`/`output` scopes: input acquires a source-demand lease, program retains the legacy main-program mapping, and output resolves its effective mux binding to the actual rendition/bus, never a global-program assumption or pending desired configuration. Carry bus identity internally; a public bus scope waits for switcher runtime support. Authorize both the requested public object and its resolved dependencies without disclosing unauthorized identifiers.
