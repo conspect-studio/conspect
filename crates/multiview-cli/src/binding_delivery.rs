@@ -344,6 +344,10 @@ impl WindowDelivery for BindingDelivery {
 
 /// One packet and the whole-window admission permit. The permit is retained
 /// through the actual sink write, including the last packet in a window.
+/// `av_interleaved_write_frame` can move the packet into libav's internal
+/// interleave buffer: its `AVBufferRef` keeps coded bytes alive after the next
+/// pull releases this permit. That separate mux-internal retention must have
+/// its own interleave bound; the queue reservation covers the sink-write ack.
 pub(crate) struct LeasedPacket {
     pub(crate) packet: EncodedPacket,
     pub(crate) permit: Arc<BatchLease>,
