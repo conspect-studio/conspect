@@ -405,6 +405,7 @@ impl RenditionDispatcher {
         self.global_staged_bytes = total;
         Ok(())
     }
+    #[allow(clippy::too_many_lines)] // One exhaustive typed worker-event state transition; splitting hides the protocol invariants.
     fn apply(&mut self, event: DispatchEvent, now: Instant) -> Result<(), DispatchError> {
         match event {
             DispatchEvent::Video {
@@ -519,6 +520,7 @@ impl RenditionDispatcher {
         }
         Ok(())
     }
+    #[allow(clippy::too_many_lines)] // Atomic whole-window closure and fanout are reviewed as one state transition.
     fn drain<D: WindowDelivery>(
         &mut self,
         now: Instant,
@@ -586,7 +588,7 @@ impl RenditionDispatcher {
             for binding in &mut self.bindings {
                 let mut packets = Vec::new();
                 if let Some(v) = binding.video_key {
-                    for p in &video[v] {
+                    for p in video.get(v).ok_or(DispatchError::InvalidConfig)? {
                         packets.push(
                             p.clone_shared_ref()
                                 .map_err(|_| DispatchError::PacketReference)?,
@@ -594,7 +596,7 @@ impl RenditionDispatcher {
                     }
                 }
                 for &a in &binding.audio_tracks {
-                    for p in &audio[a] {
+                    for p in audio.get(a).ok_or(DispatchError::InvalidConfig)? {
                         packets.push(
                             p.clone_shared_ref()
                                 .map_err(|_| DispatchError::PacketReference)?,
@@ -794,10 +796,10 @@ mod tests {
             audio_tracks: (0..a).collect(),
         }
     }
-    fn mark(ns: i128) -> Option<DtsWatermark> {
-        Some(DtsWatermark {
+    fn mark(ns: i128) -> DtsWatermark {
+        DtsWatermark {
             complete_before_ns: ns,
-        })
+        }
     }
     fn ve(
         key_index: usize,
@@ -840,22 +842,26 @@ mod tests {
         let mut d = RenditionDispatcher::new(cfg(vec![binding(0, 0, 1)], 1, 1)).unwrap();
         let mut sink = FakeDelivery::new(1);
         d.dispatch(ve(0, 0, vec![], None), now, &mut sink).unwrap();
-        d.dispatch(ae(0, vec![audio(0, 0)], vec![mark(TICK)]), now, &mut sink)
-            .unwrap();
-        assert!(sink.windows.is_empty());
+        d.dispatch(
+            ae(0, vec![audio(0, 0)], vec![Some(mark(TICK))]),
+            now,
+            &mut sink,
+        )
+        .unwrap();
+        assert_eq!(sink.windows.len(), 0);
         d.dispatch(
             ve(
                 0,
                 1,
                 (0..5).map(|_| video(0, 6, false)).collect(),
-                mark(TICK - 1),
+                Some(mark(TICK - 1)),
             ),
             now,
             &mut sink,
         )
         .unwrap();
-        assert!(sink.windows.is_empty());
-        d.dispatch(ve(0, 2, vec![], mark(TICK)), now, &mut sink)
+        assert_eq!(sink.windows.len(), 0);
+        d.dispatch(ve(0, 2, vec![], Some(mark(TICK))), now, &mut sink)
             .unwrap();
         assert_eq!(sink.windows, vec![(0, 6)]);
         assert_eq!(
@@ -871,7 +877,7 @@ mod tests {
         let mut d = RenditionDispatcher::new(config).unwrap();
         let mut sink = FakeDelivery::new(1);
         d.dispatch(
-            ve(0, 0, vec![video(0, 8, true)], mark(TICK)),
+            ve(0, 0, vec![video(0, 8, true)], Some(mark(TICK))),
             now,
             &mut sink,
         )
@@ -880,15 +886,15 @@ mod tests {
             tick: 0,
             timebases: vec![Rational::new(1, 5), Rational::new(1, 10)],
             packets: vec![audio(0, 0), audio(0, 1)],
-            watermarks: vec![mark(TICK), None],
+            watermarks: vec![Some(mark(TICK)), None],
         };
         d.dispatch(event, now, &mut sink).unwrap();
-        assert!(sink.windows.is_empty()); // unproven discrete track gates BOTH streams
+        assert_eq!(sink.windows.len(), 0); // unproven discrete track gates BOTH streams
         let event = DispatchEvent::Audio {
             tick: 1,
             timebases: vec![Rational::new(1, 5), Rational::new(1, 10)],
             packets: vec![],
-            watermarks: vec![mark(TICK), mark(TICK)],
+            watermarks: vec![Some(mark(TICK)), Some(mark(TICK))],
         };
         d.dispatch(event, now, &mut sink).unwrap();
         assert_eq!(sink.windows, vec![(0, 3)]);
@@ -906,19 +912,23 @@ mod tests {
         .unwrap();
         let mut sink = FakeDelivery::new(3);
         d.dispatch(
-            ve(0, 0, vec![video(0, 8, true)], mark(TICK)),
+            ve(0, 0, vec![video(0, 8, true)], Some(mark(TICK))),
             now,
             &mut sink,
         )
         .unwrap();
         d.dispatch(
-            ve(1, 0, vec![video(0, 8, true)], mark(TICK)),
+            ve(1, 0, vec![video(0, 8, true)], Some(mark(TICK))),
             now,
             &mut sink,
         )
         .unwrap();
-        d.dispatch(ae(0, vec![audio(0, 0)], vec![mark(TICK)]), now, &mut sink)
-            .unwrap();
+        d.dispatch(
+            ae(0, vec![audio(0, 0)], vec![Some(mark(TICK))]),
+            now,
+            &mut sink,
+        )
+        .unwrap();
         assert_eq!(sink.windows, vec![(0, 2), (1, 2), (2, 2)]);
         let held = sink.queues[1].pop_at(now).unwrap().unwrap();
         sink.queues[1] = BoundedBatchQueue::with_limits(1, 1, Duration::from_secs(2))
@@ -927,20 +937,20 @@ mod tests {
                 framing: NalFraming::AnnexB,
             });
         d.dispatch(
-            ve(0, 1, vec![video(1, 8, false)], mark(TICK * 2)),
+            ve(0, 1, vec![video(1, 8, false)], Some(mark(TICK * 2))),
             now,
             &mut sink,
         )
         .unwrap();
         d.dispatch(
-            ve(1, 1, vec![video(1, 8, false)], mark(TICK * 2)),
+            ve(1, 1, vec![video(1, 8, false)], Some(mark(TICK * 2))),
             now,
             &mut sink,
         )
         .unwrap();
         assert_eq!(
             d.dispatch(
-                ae(1, vec![audio(1, 0)], vec![mark(TICK * 2)]),
+                ae(1, vec![audio(1, 0)], vec![Some(mark(TICK * 2))]),
                 now,
                 &mut sink
             ),
@@ -962,7 +972,7 @@ mod tests {
                 framing: NalFraming::AnnexB,
             });
         d.dispatch(
-            ve(0, 0, vec![video(0, 8, true)], mark(TICK)),
+            ve(0, 0, vec![video(0, 8, true)], Some(mark(TICK))),
             now,
             &mut sink,
         )
@@ -972,7 +982,7 @@ mod tests {
                 ae(
                     0,
                     (0..5).map(|i| audio(0, i)).collect(),
-                    vec![mark(TICK); 5]
+                    vec![Some(mark(TICK)); 5]
                 ),
                 now,
                 &mut sink
@@ -993,7 +1003,12 @@ mod tests {
         .unwrap();
         let mut sink = FakeDelivery::new(3);
         d.dispatch(
-            ve(0, 0, vec![video(0, 11 * 1024 * 1024, false)], mark(TICK)),
+            ve(
+                0,
+                0,
+                vec![video(0, 11 * 1024 * 1024, false)],
+                Some(mark(TICK)),
+            ),
             now,
             &mut sink,
         )
@@ -1083,13 +1098,13 @@ mod tests {
         ))
         .unwrap();
         d.dispatch(
-            ve(0, 0, vec![video(0, 6, true)], mark(TICK)),
+            ve(0, 0, vec![video(0, 6, true)], Some(mark(TICK))),
             now,
             &mut delivery,
         )
         .unwrap();
         d.dispatch(
-            ae(0, vec![audio(0, 0)], vec![mark(TICK)]),
+            ae(0, vec![audio(0, 0)], vec![Some(mark(TICK))]),
             now,
             &mut delivery,
         )
