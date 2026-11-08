@@ -96,12 +96,10 @@ impl AvAdapter {
                     let timestamp =
                         moq_net::Timestamp::new(packet.pts_us, moq_net::Timescale::MICRO)
                             .map_err(|_| Reject::Timestamp)?;
-                    hang::container::Frame {
-                        timestamp,
-                        payload: packet.payload.clone(),
-                    }
-                    .write_to(&mut group)
-                    .map_err(|_| Reject::Transport)?;
+                    let serialized = crate::provider::serialized_frame(packet)?;
+                    group
+                        .write_frame(timestamp, serialized)
+                        .map_err(|_| Reject::Transport)?;
                     group.finish().map_err(|_| Reject::Transport)
                 })();
                 if let Err(error) = result {

@@ -48,6 +48,50 @@ impl Drop for ChargedPayload {
     }
 }
 
+/// Reserve the complete serialized object before allocation. Its owner retains
+/// the original admission charge as well as the extra framing allocation.
+pub(crate) fn serialized_frame(packet: &crate::Packet) -> Result<bytes::Bytes, crate::Reject> {
+    let timestamp = moq_net::Timestamp::new(packet.pts_us, moq_net::Timescale::MICRO)
+        .map_err(|_| crate::Reject::Timestamp)?;
+    let maximum = packet
+        .payload
+        .len()
+        .checked_add(8)
+        .ok_or(crate::Reject::Budget)?;
+    RETAINED_BYTES
+        .try_update(Ordering::AcqRel, Ordering::Acquire, |used| {
+            used.checked_add(maximum).filter(|sum| *sum <= GLOBAL_BYTES)
+        })
+        .map_err(|_| crate::Reject::Budget)?;
+    struct Serialized {
+        data: Vec<u8>,
+        _source: bytes::Bytes,
+        charge: usize,
+    }
+    impl AsRef<[u8]> for Serialized {
+        fn as_ref(&self) -> &[u8] {
+            &self.data
+        }
+    }
+    impl Drop for Serialized {
+        fn drop(&mut self) {
+            RETAINED_BYTES.fetch_sub(self.charge, Ordering::AcqRel);
+        }
+    }
+    let mut owner = Serialized {
+        data: Vec::with_capacity(maximum),
+        _source: packet.payload.clone(),
+        charge: maximum,
+    };
+    hang::container::Frame {
+        timestamp,
+        payload: packet.payload.clone(),
+    }
+    .encode(&mut owner.data)
+    .map_err(|_| crate::Reject::Transport)?;
+    Ok(bytes::Bytes::from_owner(owner))
+}
+
 pub struct Fence {
     charged: Arc<AtomicUsize>,
     sender: Mutex<Option<mpsc::Sender<AvWindow>>>,
@@ -392,6 +436,51 @@ mod tests {
         assert!(state.entries.lock().unwrap().is_empty());
         assert!(*fence.cancel.borrow());
     }
+    #[tokio::test]
+    async fn actual_moq_frame_retains_serialized_owner_and_source_charge() {
+        let (fence, mut rx) = Fence::channel(1);
+        let window = AvWindow {
+            video: crate::Window {
+                generation: 1,
+                packets: vec![crate::Packet {
+                    payload: bytes::Bytes::from_static(&[1, 2, 3]),
+                    pts_us: 123,
+                    verified_rap: true,
+                }],
+            },
+            audio: Default::default(),
+        };
+        assert!(fence.try_offer(window).is_ok());
+        let window = rx.try_recv().unwrap();
+        let serialized = serialized_frame(&window.video.packets[0]).unwrap();
+        let expected_ptr = serialized.as_ptr();
+        let broadcast = moq_net::broadcast::Producer::new(Default::default());
+        let track = broadcast
+            .create_track("video", crate::VideoAdapter::track_info())
+            .unwrap();
+        let mut group = track.append_group().unwrap();
+        let mut consumer = group.consume();
+        group
+            .write_frame(moq_net::Timestamp::from_micros(123).unwrap(), serialized)
+            .unwrap();
+        group.finish().unwrap();
+        drop(window);
+        fence.revoke();
+        let frame = consumer.read_frame().await.unwrap().unwrap();
+        assert_eq!(
+            frame.payload.as_ptr(),
+            expected_ptr,
+            "must use upstream Shared rather than Segment copy"
+        );
+        drop((group, consumer, track, broadcast));
+        assert_eq!(fence.charged.load(Ordering::Acquire), 3);
+        let decoded = hang::container::Frame::decode(frame.payload.clone()).unwrap();
+        assert_eq!(decoded.payload.as_ref(), &[1, 2, 3]);
+        drop(decoded);
+        drop(frame);
+        assert_eq!(fence.charged.load(Ordering::Acquire), 0);
+    }
+
     #[test]
     fn retained_payload_credit_survives_queue_and_inflight_clones() {
         let (fence, mut rx) = Fence::channel(1);

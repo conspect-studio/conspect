@@ -142,12 +142,12 @@ impl VideoAdapter {
         }
         let timestamp = moq_net::Timestamp::new(packet.pts_us, moq_net::Timescale::MICRO)
             .map_err(|_| Reject::Timestamp)?;
-        hang::container::Frame {
-            timestamp,
-            payload: packet.payload.clone(),
-        }
-        .write_to(self.group.as_mut().ok_or(Reject::NeedsRap)?)
-        .map_err(|_| Reject::Transport)
+        let serialized = provider::serialized_frame(packet)?;
+        self.group
+            .as_mut()
+            .ok_or(Reject::NeedsRap)?
+            .write_frame(timestamp, serialized)
+            .map_err(|_| Reject::Transport)
     }
 }
 
