@@ -182,6 +182,53 @@ fn swap_doc(rate: u32) -> serde_json::Value {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_new_discrete_track_defers_only_tracks_and_changes_audible_program() {
+    let mut run = running_bus();
+    let live_tracks = Arc::new(multiview_framestore::SwapCell::from_pointee(
+        Vec::<String>::new(),
+    ));
+    let startup: multiview_config::AudioRouting =
+        serde_json::from_value(serde_json::json!({"sample_rate_hz": 48000, "routes": []}))
+            .expect("startup routing");
+    let handle = Arc::new(
+        AudioControlHandle::from_sources(
+            std::collections::HashMap::new(),
+            std::collections::HashMap::from([
+                ("cnn".to_owned(), run.cnn),
+                ("bbc".to_owned(), run.bbc),
+            ]),
+        )
+        .with_startup(Some(&startup), ["cnn".to_owned(), "bbc".to_owned()])
+        .with_declared_tracks(Some(&startup), Arc::clone(&live_tracks)),
+    );
+    run.slot.store(Some(Arc::clone(&handle)));
+    run.handle = handle;
+    let before = run.bus.tick_to(1);
+    assert!((before.interleaved()[0] - 0.2).abs() < 1e-4);
+    let mut doc = swap_doc(48_000);
+    doc["routes"][1]["target_track"] = serde_json::json!("bbc-clean");
+    let (status, header) = put_routing(Arc::clone(&run.slot), &doc).await;
+    assert!(status.contains(" 200"), "{status}");
+    assert_eq!(header.as_deref(), Some("partial"));
+    assert!(
+        live_tracks.load().is_empty(),
+        "new output track must not rebind encoder"
+    );
+    assert!(run.handle.apply_pending(&mut run.bus) >= 2);
+    for tick in 2..=4 {
+        let frame = run.bus.tick_to(tick);
+        if tick == 4 {
+            let expected = 0.4 * 10f64.powf(3.0 / 20.0);
+            let actual = f64::from(*frame.interleaved().last().unwrap());
+            assert!(
+                (actual - expected).abs() < 1e-3,
+                "audible program {actual} != {expected}"
+            );
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_routing_put_changes_the_running_bus_gains_live_and_click_free() {
     let mut run = running_bus();
     // Before: the program carries cnn (0.2) only.

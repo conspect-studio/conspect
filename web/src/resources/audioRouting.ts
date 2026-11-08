@@ -69,7 +69,7 @@ export interface AudioRoutingWithEtag {
    * program bus applied it, `restart` when it needs a restart. `undefined` on
    * GET or when the server sent no header.
    */
-  readonly apply?: 'live' | 'restart';
+  readonly apply?: 'live' | 'partial' | 'restart';
 }
 
 /** Connection options shared by both calls. */
@@ -204,7 +204,9 @@ async function readState(response: Response): Promise<AudioRoutingWithEtag> {
   const etag = response.headers.get('ETag');
   const applyHeader = response.headers.get('X-Multiview-Apply');
   const apply =
-    applyHeader === 'live' || applyHeader === 'restart' ? applyHeader : undefined;
+    applyHeader === 'live' || applyHeader === 'partial' || applyHeader === 'restart'
+      ? applyHeader
+      : undefined;
   return {
     state: body,
     etag: etag ?? undefined,

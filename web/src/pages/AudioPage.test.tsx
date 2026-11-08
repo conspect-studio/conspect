@@ -191,6 +191,24 @@ describe("AudioPage", () => {
     expect(status).not.toHaveTextContent(/restart/i);
   });
 
+  it("reports partial apply without saying the running program mix is unchanged", async () => {
+    server.use(
+      http.put("*/api/v1/audio-routing", () =>
+        HttpResponse.json(
+          { ...ROUTING, configured: true },
+          { headers: { ETag: 'W/"8"', "X-Multiview-Apply": "partial" } },
+        ),
+      ),
+    );
+    renderAudio();
+    await screen.findByLabelText(/sample rate/i);
+    await userEvent.click(screen.getByTestId("audio-save"));
+    const status = screen.getByRole("status");
+    await waitFor(() => expect(status).toHaveTextContent(/program mix.*apply live/i));
+    expect(status).toHaveTextContent(/tracks remain pending/i);
+    expect(status).not.toHaveTextContent(/program mix is unchanged/i);
+  });
+
   it("warns inline, BEFORE saving, that an output carrying the renamed track will be updated", async () => {
     renderAudio();
     const trackField = await screen.findByLabelText(/discrete track name/i);

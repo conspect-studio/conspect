@@ -374,7 +374,7 @@ export function AudioPage(): JSX.Element {
   const [edited, setEdited] = useState<AudioFormState | undefined>(undefined);
   const [savedEtag, setSavedEtag] = useState<string | undefined>(undefined);
   const [errors, setErrors] = useState<AudioFormErrors | undefined>(undefined);
-  const [status, setStatus] = useState<'idle' | 'live' | 'saved' | 'error'>('idle');
+  const [status, setStatus] = useState<'idle' | 'live' | 'partial' | 'saved' | 'error'>('idle');
   const [saveError, setSaveError] = useState<string | undefined>(undefined);
   const [outputsUpdated, setOutputsUpdated] = useState<
     readonly OutputsUpdatedEntry[]
@@ -422,7 +422,7 @@ export function AudioPage(): JSX.Element {
       {
         onSuccess: (result): void => {
           setSavedEtag(result.etag);
-          setStatus(result.apply === 'live' ? 'live' : 'saved');
+          setStatus(result.apply === 'live' ? 'live' : result.apply === 'partial' ? 'partial' : 'saved');
           setSaveError(undefined);
           setOutputsUpdated(result.state.outputs_updated ?? []);
         },
@@ -453,12 +453,12 @@ export function AudioPage(): JSX.Element {
         helpLabel={t`How configuration applies`}
         message={
           <Trans>
-            Program-mix changes (on the program mix, gain, mute) apply to the
-            running program audio immediately when saved, with a short fade —
-            no restart. A changed sample rate, or mixing an input that has no
-            audio on this run, is stored and goes live via config export +
-            restart. Each save response declares which applied
-            (X-Multiview-Apply: live or restart).
+            Program mix gain, mute, and source membership apply on the next
+            audio tick with a short fade. New, removed, or renamed discrete
+            tracks can remain pending while the program mix applies live.
+            A changed output sample rate or unknown mixed source requires a
+            config export and restart. X-Multiview-Apply reports live, partial,
+            or restart.
           </Trans>
         }
       />
@@ -606,6 +606,15 @@ export function AudioPage(): JSX.Element {
                   <Trans>
                     Saved and applied live: the program mix is now following
                     the new routing.
+                  </Trans>
+                </span>
+              ) : null}
+              {status === 'partial' ? (
+                <span className="text-muted-foreground">
+                  <Trans>
+                    Saved: program mix gain, mute, and source routes apply live.
+                    New, removed, reordered, or renamed output tracks remain pending
+                    until output reconfiguration. The saved document is not fully live.
                   </Trans>
                 </span>
               ) : null}

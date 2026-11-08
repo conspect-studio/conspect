@@ -151,7 +151,9 @@ pub use is07::{
     Is07EventType, Is07Message, Is07Payload, Is07Subscription, Is07Timing,
 };
 pub use jwt::{JwtError, JwtValidator, SignatureAlgorithm};
-pub use live_apply::{AudioRoutingLiveCapability, LiveApplyCaps, OverlayLiveCapability};
+pub use live_apply::{
+    AudioRoutingApplyResult, AudioRoutingLiveCapability, LiveApplyCaps, OverlayLiveCapability,
+};
 pub use nmos::is04::{Device, MediaFormat, Node, Receiver, Registration, ResourceCore, Sender};
 pub use nmos::is05::{
     parse_sdp_transport, Activation, ActivationMode, ConnectionRequest, ConnectionState,

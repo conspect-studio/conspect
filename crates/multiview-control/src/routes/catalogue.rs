@@ -827,6 +827,7 @@ pub(crate) async fn post_bulk_sources(
                 etag: Some(versioned.version.to_etag()),
                 apply: Some(match mode {
                     crate::typed_resources::ApplyMode::Live => "live",
+                    crate::typed_resources::ApplyMode::Partial => "partial",
                     crate::typed_resources::ApplyMode::Restart => "restart",
                 }),
                 error: None,

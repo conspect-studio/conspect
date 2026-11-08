@@ -2641,7 +2641,7 @@ msgstr ""
 msgid "Could not save salvo"
 msgstr ""
 
-#: src/pages/AudioPage.tsx:623
+#: src/pages/AudioPage.tsx:632
 msgid "Could not save the audio routing:"
 msgstr ""
 
@@ -7169,6 +7169,10 @@ msgstr ""
 msgid "Program mix"
 msgstr ""
 
+#: src/pages/AudioPage.tsx:455
+msgid "Program mix gain, mute, and source membership apply on the next audio tick with a short fade. New, removed, or renamed discrete tracks can remain pending while the program mix applies live. A changed output sample rate or unknown mixed source requires a config export and restart. X-Multiview-Apply reports live, partial, or restart."
+msgstr ""
+
 #: src/pages/SystemPage.tsx:318
 msgid "Program output"
 msgstr ""
@@ -7189,10 +7193,6 @@ msgstr ""
 #. placeholder {0}: output.name
 #: src/pages/MonitoringPage.tsx:281
 msgid "Program still image for output {0}"
-msgstr ""
-
-#: src/pages/AudioPage.tsx:455
-msgid "Program-mix changes (on the program mix, gain, mute) apply to the running program audio immediately when saved, with a short fade — no restart. A changed sample rate, or mixing an input that has no audio on this run, is stored and goes live via config export + restart. Each save response declares which applied (X-Multiview-Apply: live or restart)."
 msgstr ""
 
 #: src/pages/CastPage.tsx:483
@@ -7939,6 +7939,10 @@ msgstr ""
 msgid "Saved as device"
 msgstr ""
 
+#: src/pages/AudioPage.tsx:614
+msgid "Saved: program mix gain, mute, and source routes apply live. New, removed, reordered, or renamed output tracks remain pending until output reconfiguration. The saved document is not fully live."
+msgstr ""
+
 #: src/pages/docs/ConfigPage.tsx:237
 msgid "Saving an overlay through the API or this UI applies it to the running engine at the next frame where the build renders that kind — today an analog-face <0>clock</0> appears, moves, or disappears live. Kinds without a renderer are stored losslessly and take effect via config export + restart; every save response declares which happened in its X-Multiview-Apply header."
 msgstr ""
@@ -8467,7 +8471,7 @@ msgstr ""
 msgid "Stored sidecar (not decoded per source)"
 msgstr ""
 
-#: src/pages/AudioPage.tsx:614
+#: src/pages/AudioPage.tsx:623
 msgid "Stored, not applied live: this change needs a restart (for example a changed sample rate, or an input with no audio on this run). The running program mix is unchanged until then."
 msgstr ""
 

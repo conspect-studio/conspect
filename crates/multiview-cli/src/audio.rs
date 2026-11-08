@@ -210,7 +210,7 @@ pub struct AudioControlHandle {
     unrouted_unity: Arc<multiview_framestore::SwapCell<Arc<std::collections::HashSet<String>>>>,
     /// Output tracks are pinned to source ids at startup until the discrete
     /// encoder's route table accepts live updates.
-    declared_tracks: std::collections::HashMap<String, usize>,
+    declared_tracks: std::collections::HashMap<String, (usize, Option<String>, Option<String>)>,
     /// Shared stable-index source list read by the bake consumer each tick.
     live_track_inputs: Option<Arc<multiview_framestore::SwapCell<Arc<Vec<String>>>>>,
     /// Test-only interleaving point inside [`Self::request_routing`], after the
@@ -465,9 +465,16 @@ impl AudioControlHandle {
             .map(|r| {
                 r.routes
                     .iter()
-                    .filter_map(|route| route.target_track.as_deref())
+                    .filter(|route| route.target_track.is_some())
                     .enumerate()
-                    .map(|(index, name)| (name.to_owned(), index))
+                    .filter_map(|(index, route)| {
+                        route.target_track.as_ref().map(|name| {
+                            (
+                                name.clone(),
+                                (index, route.language.clone(), route.title.clone()),
+                            )
+                        })
+                    })
                     .collect()
             })
             .unwrap_or_default();
@@ -475,18 +482,28 @@ impl AudioControlHandle {
         self
     }
 
-    /// Apply an `[audio]` routing document to the RUNNING program bus, if it can
-    /// be applied live. Returns `true` when the new gain table was published for
-    /// the bake consumer (it lands at its next tick, ramped click-free), `false`
-    /// when only a restart can honour it: a different `sample_rate_hz` than the
-    /// running bus, or a route that mixes an input that does not exist on this
-    /// run. Off-clock control path; never touches the bus or output clock (inv #1/#10).
+    /// Publish a compatible program gain table for the bake consumer to apply
+    /// on its next tick, independent of startup-pinned output track topology.
+    /// A different bus rate or an unknown program source changes nothing.
+    /// The result distinguishes a live program mix from deferred output tracks.
+    /// Off-clock control path; never touches the bus or output clock (inv #1/#10).
     #[must_use]
-    pub fn request_routing(&self, routing: &multiview_config::AudioRouting) -> bool {
+    pub fn request_routing(
+        &self,
+        routing: &multiview_config::AudioRouting,
+    ) -> multiview_control::AudioRoutingApplyResult {
+        use multiview_control::AudioRoutingApplyResult;
         if routing.sample_rate_hz != self.sample_rate {
-            return false;
+            return AudioRoutingApplyResult::Restart;
         }
         let known = self.known.load();
+        if routing
+            .routes
+            .iter()
+            .any(|r| r.contributes_to_program() && !known.contains_key(&r.input_id))
+        {
+            return AudioRoutingApplyResult::Restart;
+        }
         let requested: Vec<(&str, &str)> = routing
             .routes
             .iter()
@@ -497,22 +514,20 @@ impl AudioControlHandle {
                     .map(|name| (name, route.input_id.as_str()))
             })
             .collect();
-        if requested.len() != self.declared_tracks.len()
-            || requested.iter().enumerate().any(|(index, (name, source))| {
-                self.declared_tracks.get(*name) != Some(&index) || !known.contains_key(*source)
-            })
-        {
-            // An added/removed/reordered output track needs output-only
-            // reconfiguration; a source absent from the live registry cannot be routed.
-            return false;
-        }
-        if routing
-            .routes
-            .iter()
-            .any(|r| r.contributes_to_program() && !known.contains_key(&r.input_id))
-        {
-            return false;
-        }
+        let tracks_live = requested.len() == self.declared_tracks.len()
+            && routing
+                .routes
+                .iter()
+                .filter(|route| route.target_track.is_some())
+                .enumerate()
+                .all(|(index, route)| {
+                    route
+                        .target_track
+                        .as_deref()
+                        .and_then(|name| self.declared_tracks.get(name))
+                        == Some(&(index, route.language.clone(), route.title.clone()))
+                        && known.contains_key(&route.input_id)
+                });
         // Review H3 publication protocol: publish the routing document BEFORE
         // taking the channel snapshot. A live join inserts its channel under the
         // `channels` write lock and only then re-reads the routing. The lock
@@ -532,18 +547,29 @@ impl AudioControlHandle {
         #[cfg(test)]
         self.run_routing_gap_hook();
         if let Some(live) = &self.live_track_inputs {
-            live.store(Arc::new(
-                requested
-                    .iter()
-                    .map(|(_, source)| (*source).to_owned())
-                    .collect(),
-            ));
+            // The encoder has startup-pinned slots. Rebind only existing named
+            // slots; never replace the vector with an incompatible track list.
+            let mut inputs = live.load().as_ref().clone();
+            for (name, source) in &requested {
+                if let Some(&(slot, _, _)) = self.declared_tracks.get(*name) {
+                    if known.contains_key(*source) {
+                        if let Some(input) = inputs.get_mut(slot) {
+                            *input = (*source).to_owned();
+                        }
+                    }
+                }
+            }
+            live.store(Arc::new(inputs));
         }
         self.pending_gains.store(Some(Arc::new(gains)));
         if let Some(set) = &self.route_demand {
             set.publish(crate::source_demand::audio_route_items(Some(routing)));
         }
-        true
+        if tracks_live {
+            AudioRoutingApplyResult::Live
+        } else {
+            AudioRoutingApplyResult::ProgramLiveTracksDeferred
+        }
     }
 
     /// Let `id` join at unity while no routing is declared, matching what a
@@ -745,8 +771,10 @@ pub fn routing_live_capability(
     slot: Arc<multiview_framestore::SwapCell<Option<Arc<AudioControlHandle>>>>,
 ) -> multiview_control::AudioRoutingLiveCapability {
     multiview_control::AudioRoutingLiveCapability::new(move |routing| {
-        slot.load()
-            .is_some_and(|handle| handle.request_routing(routing))
+        slot.load().map_or(
+            multiview_control::AudioRoutingApplyResult::Restart,
+            |handle| handle.request_routing(routing),
+        )
     })
 }
 
@@ -754,6 +782,7 @@ pub fn routing_live_capability(
 mod route_seam_tests {
     use super::*;
     use multiview_audio::program::ProgramBus;
+    use multiview_control::AudioRoutingApplyResult::{Live, ProgramLiveTracksDeferred};
 
     #[test]
     fn changed_discrete_track_source_does_not_claim_live_apply() {
@@ -773,15 +802,56 @@ mod route_seam_tests {
             .with_startup(Some(&routing("old")), ["old".to_owned(), "new".to_owned()])
             .with_declared_tracks(Some(&routing("old")), Arc::clone(&live));
         // A known source without a decoded store is still a valid silent track.
-        assert!(handle.request_routing(&routing("new")));
+        assert_eq!(handle.request_routing(&routing("new")), Live);
         assert_eq!(live.load().as_slice(), &["new".to_owned()]);
-        assert!(!handle.request_routing(&routing("missing")));
+        assert_eq!(
+            handle.request_routing(&routing("missing")),
+            ProgramLiveTracksDeferred
+        );
         assert_eq!(live.load().as_slice(), &["new".to_owned()]);
         assert!(handle.remove_source("new"));
-        assert!(!handle.request_routing(&routing("new")));
+        assert_eq!(
+            handle.request_routing(&routing("new")),
+            ProgramLiveTracksDeferred
+        );
         assert_eq!(live.load().as_slice(), &["new".to_owned()]);
         assert!(handle.set_source_audio("new", Some(new_store())));
-        assert!(handle.request_routing(&routing("new")));
+        assert_eq!(handle.request_routing(&routing("new")), Live);
+    }
+
+    #[test]
+    fn reordered_and_renamed_tracks_do_not_block_program_mix_or_rewire_encoder_slots() {
+        let routing = |tracks: &[(&str, &str)]| {
+            serde_json::from_value::<multiview_config::AudioRouting>(serde_json::json!({
+                "sample_rate_hz": 48000,
+                "routes": tracks.iter().map(|(source, name)| serde_json::json!({
+                    "input_id": source, "channels": {"kind": "stereo"},
+                    "target_track": name, "include_in_program_bus": true
+                })).collect::<Vec<_>>()
+            }))
+            .expect("valid tracks")
+        };
+        let old = routing(&[("old", "clean"), ("new", "alt")]);
+        let reordered = routing(&[("new", "alt"), ("old", "clean")]);
+        let renamed = routing(&[("new", "replacement"), ("old", "clean")]);
+        let inputs = Arc::new(multiview_framestore::SwapCell::from_pointee(vec![
+            "old".to_owned(),
+            "new".to_owned(),
+        ]));
+        let handle = AudioControlHandle::new()
+            .with_startup(Some(&old), ["old".to_owned(), "new".to_owned()])
+            .with_declared_tracks(Some(&old), Arc::clone(&inputs));
+        assert_eq!(
+            handle.request_routing(&reordered),
+            ProgramLiveTracksDeferred
+        );
+        assert_eq!(inputs.load().as_slice(), &["old", "new"]);
+        assert_eq!(handle.request_routing(&renamed), ProgramLiveTracksDeferred);
+        assert_eq!(inputs.load().as_slice(), &["old", "new"]);
+        assert!(
+            handle.pending_gains.load().is_some(),
+            "program table published"
+        );
     }
 
     #[test]
@@ -832,7 +902,7 @@ mod route_seam_tests {
         handle.set_routing_gap_hook(move || {
             racer.apply_pending(&mut racing_bus.lock().unwrap());
         });
-        assert!(handle.request_routing(&routing(false)));
+        assert_eq!(handle.request_routing(&routing(false)), Live);
         let mut bus = bus.lock().unwrap();
         handle.apply_pending(&mut bus);
         let point = handle.test_source_point("late").expect("late joined");

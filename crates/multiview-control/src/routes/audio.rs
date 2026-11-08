@@ -400,9 +400,15 @@ pub(crate) async fn put_audio_routing(
     }
     // Hand the new table to the running bus's bounded mailbox (wait-free; the
     // bake consumer applies it at its next tick). Never touches the bus here.
-    let mode = match state.live_apply.audio_routing.as_ref() {
-        Some(capability) if capability.apply(&routing) => ApplyMode::Live,
-        _ => ApplyMode::Restart,
+    let mode = match state
+        .live_apply
+        .audio_routing
+        .as_ref()
+        .map(|capability| capability.apply(&routing))
+    {
+        Some(crate::AudioRoutingApplyResult::Live) => ApplyMode::Live,
+        Some(crate::AudioRoutingApplyResult::ProgramLiveTracksDeferred) => ApplyMode::Partial,
+        Some(crate::AudioRoutingApplyResult::Restart) | None => ApplyMode::Restart,
     };
     // A read failure after this point is explicitly indeterminate, not a
     // successful live response for an event that never reached the bus.
