@@ -1,0 +1,10 @@
+[package]
+name = "verify-moq-roots"
+version = "0.1.0"
+edition = "2021"
+publish = false
+[workspace]
+[dependencies]
+webpki-root-certs = "=1.0.11"
+webpki-roots = "=1.0.11"
+rustls = { version = "0.23", default-features = false, features = ["std"] }
