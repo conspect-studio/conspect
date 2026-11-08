@@ -41,9 +41,24 @@ fetch() {
 
 # Primary source: the signed release tarball from ffmpeg.org, verified by
 # SHA-256 pin AND the detached GPG signature against the pinned release key.
+fetch_release_file() {
+  local status=0
+  fetch "$1" "$2" || status=$?
+  case "${status}" in
+    0) return 0 ;;
+    # DNS, connect, timeout, TLS handshake and interrupted transport only.
+    # HTTP errors (22), certificate failures and local I/O errors fail closed.
+    5|6|7|28|35|52|55|56) return 1 ;;
+    *)
+      echo "ffmpeg-fetch: release download failed (curl ${status}); refusing fallback." >&2
+      exit 3
+      ;;
+  esac
+}
+
 fetch_release_tarball() {
-  fetch "${TARBALL}"     "${BASE_URL}/${TARBALL}"     || return 1
-  fetch "${TARBALL}.asc" "${BASE_URL}/${TARBALL}.asc" || return 1
+  fetch_release_file "${TARBALL}"     "${BASE_URL}/${TARBALL}"     || return 1
+  fetch_release_file "${TARBALL}.asc" "${BASE_URL}/${TARBALL}.asc" || return 1
 
   # SHA-256 (defense-in-depth pin). A mismatch is fatal, never a fallback.
   echo "${FFMPEG_SHA256}  ${TARBALL}" | sha256sum -c - || exit 4
@@ -64,7 +79,7 @@ fetch_release_tarball() {
     exit 3
   fi
   gpg --batch --verify "${TARBALL}.asc" "${TARBALL}" || exit 3
-  tar -xJf "${TARBALL}"
+  tar -xJf "${TARBALL}" || exit 4
 }
 
 # Fallback source (only when ffmpeg.org is unreachable): FFmpeg's own upstream
