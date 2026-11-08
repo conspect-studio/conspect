@@ -29,6 +29,7 @@ import { WelcomePage } from "../pages/WelcomePage";
 import { LicencePage } from "../pages/LicencePage";
 import { DataPage } from "../pages/DataPage";
 import { MeshPage } from "../pages/MeshPage";
+import { RelayManagementPage } from "../pages/RelayManagementPage";
 import { AccountPage } from "../pages/AccountPage";
 import { SystemActionsPage } from "../pages/SystemActionsPage";
 import { SupportPage } from "../pages/SupportPage";
@@ -85,6 +86,7 @@ export const router = createBrowserRouter([
       { path: "settings/licence", element: <LicencePage /> },
       { path: "settings/data", element: <DataPage /> },
       { path: "settings/mesh", element: <MeshPage /> },
+      { path: "settings/relays", element: <RelayManagementPage /> },
       { path: "settings/account", element: <AccountPage /> },
       // The account-side support surface. It lives at /help/support but is a
       // SIBLING of the /help docs layout — it renders in the plain app chrome
