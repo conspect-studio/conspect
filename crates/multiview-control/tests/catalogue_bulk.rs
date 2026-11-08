@@ -8,7 +8,14 @@
 //! still means `always_on` (the config default), so nothing changes for callers
 //! that predate the choice.
 #![cfg(feature = "catalogue")]
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+// Indexing the JSON responses directly is the point of these assertions, as in
+// every sibling integration test here.
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing
+)]
 
 mod support;
 
