@@ -474,8 +474,11 @@ fn compose_document(state: &AppState, accepted: bool) -> ControlResult<serde_jso
 /// `tally_profiles` — onto the composed document FROM their stores.
 ///
 /// * **`audio`** overlays the `audio` key when an operator (or the seeded
-///   config) configured it; otherwise the base document's authored block (if
-///   any) is left untouched.
+///   config) configured it. Under the accepted envelope (`accepted = true`,
+///   used by export/promote) a `None` is accepted intent that CLEARED the
+///   routing, so the inherited base-document block is REMOVED; with no envelope
+///   yet (a store-only run, or the pre-first-commit window) a `None` store
+///   leaves the base document's authored block untouched.
 /// * **`salvos` + `tally_profiles`** (ADR-W024 round 6 / F1) are runtime-mutable
 ///   through their definition routes (`PUT/DELETE /salvos/{id}`, `PUT/DELETE
 ///   /tally/profiles/{id}`) — a pure control-plane store edit with NO engine
@@ -547,6 +550,16 @@ fn insert_store_backed_sections(
                 ))
             })?,
         );
+    } else if accepted && has_accepted_envelope(state)? {
+        // The accepted envelope owns `audio` (a versioned config section): a
+        // `None` there is accepted intent that CLEARED the routing, not an
+        // unconfigured store. The boot-authored `[audio]` block inherited from
+        // `base_document` is therefore stale — drop it so export and promote
+        // represent the accepted envelope instead of resurrecting a section the
+        // envelope removed (review R3-01). With NO envelope yet (store-only run,
+        // or before the first commit) the store is still the fallback and the
+        // base document's authored block stays authoritative, exactly as before.
+        doc.remove("audio");
     }
     doc.insert(
         "salvos".to_owned(),
@@ -619,6 +632,22 @@ fn insert_section_families(
         }
     }
     Ok(())
+}
+
+/// Whether this modeled run has published an authoritative accepted envelope —
+/// the same predicate [`crate::boot_model::accepted_audio`] and the other
+/// `accepted_*` helpers use to choose the envelope over the legacy store.
+/// `Ok(false)` is a store-only run or the pre-first-commit window, where the
+/// live store is still the fallback and a boot-authored section in
+/// `base_document` remains authoritative.
+fn has_accepted_envelope(state: &AppState) -> ControlResult<bool> {
+    let Some(model) = state.boot_model.as_ref() else {
+        return Ok(false);
+    };
+    Ok(model
+        .accepted()
+        .map_err(crate::error::ControlError::Repository)?
+        .is_some())
 }
 
 /// `GET /api/v1/config/watch-status` — the config-file watch status

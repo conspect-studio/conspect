@@ -1612,6 +1612,9 @@ impl Placer {
             self.stats.generations = self.stats.generations.saturating_add(1);
         }
         let mut batch: Vec<PendingBlock> = Vec::new();
+        // Scan only when the head has no mapping. Cache the newest proven
+        // video-locked epoch for this pass so a long stale prefix is linear.
+        let mut superseding_epoch = None;
         while let Some(front) = queue.units.front() {
             let mapped = self
                 .map
@@ -1647,14 +1650,19 @@ impl Placer {
                 queue.frames = queue.frames.saturating_sub(unit.block.frame_count());
                 batch.push(unit);
             } else if mapped == Mapped::Skipped {
-                if let Some(unit) = queue.units.pop_front() {
-                    queue.frames = queue.frames.saturating_sub(unit.block.frame_count());
-                    self.stats.skipped = self
-                        .stats
-                        .skipped
-                        .saturating_add(u64::try_from(unit.block.frame_count()).unwrap_or(0));
-                }
+                self.discard_unmapped_head(queue);
             } else {
+                // A replay can overlap an older raw-PTS span. Its video anchor
+                // belongs to the newer epoch, leaving the old queue head with
+                // no mapping. Discard only that unmappable head, and only after
+                // a later queued epoch demonstrably maps through video. Never
+                // skip a mapped old block or promote the replay to an anchor.
+                let newer_video_epoch = *superseding_epoch
+                    .get_or_insert_with(|| self.newer_video_epoch(queue, front.epoch, cursor));
+                if newer_video_epoch.is_some_and(|epoch| front.epoch < epoch) {
+                    self.discard_unmapped_head(queue);
+                    continue;
+                }
                 if self.require_video_anchor
                     || now.saturating_duration_since(front.enqueued_at) < self.wait
                 {
@@ -1704,6 +1712,30 @@ impl Placer {
             };
             self.history_frames = self.history_frames.saturating_sub(old.block.frame_count());
         }
+    }
+
+    /// Account for an unmappable old head superseded by a video-locked epoch.
+    fn discard_unmapped_head(&mut self, queue: &mut DecodedQueue) {
+        if let Some(unit) = queue.units.pop_front() {
+            queue.frames = queue.frames.saturating_sub(unit.block.frame_count());
+            self.stats.skipped = self
+                .stats
+                .skipped
+                .saturating_add(u64::try_from(unit.block.frame_count()).unwrap_or(0));
+        }
+    }
+
+    /// Find a queued later epoch with a valid video mapping. Do not infer a
+    /// mapping from matching raw PTS: replayed timestamps can overlap.
+    fn newer_video_epoch(&self, queue: &DecodedQueue, old_epoch: u64, cursor: i64) -> Option<u64> {
+        queue.units.iter().rev().find_map(|unit| {
+            (unit.epoch > old_epoch
+                && matches!(
+                    self.map.map(unit.raw_ns, unit.epoch, &queue.epochs, cursor),
+                    Mapped::Video(_)
+                ))
+            .then_some(unit.epoch)
+        })
     }
 
     /// Log the window's frame counts every [`STATS_PERIOD`] and start a new one.
@@ -2850,6 +2882,141 @@ mod resync_tests {
         }
         assert!(q.frames <= DECODED_QUEUE_CAP);
         assert!(q.overflow_frames > 0);
+    }
+
+    /// Replayed transport timestamps can create overlapping audio spans. The
+    /// newest video anchor then belongs to the replay, not to the older queued
+    /// blocks. Those blocks must not hold the queue ahead of audible new PCM.
+    #[test]
+    fn overlapping_replayed_epoch_does_not_starve_fresh_anchored_audio() {
+        let format = AudioFormat::new(48_000, ChannelLayout::Stereo);
+        let store = AudioStore::timeline(format, 288_000);
+        let mut queue = DecodedQueue::default();
+        let raw0 = 100 * SEC;
+        for i in 0..120 {
+            let raw = raw0 + i * SEC / 10;
+            queue.push(
+                AudioBlock::from_interleaved(format, vec![0.2; 4_800 * 2]).unwrap(),
+                raw,
+                48_000,
+                usize::MAX,
+            );
+        }
+        // Jump back by 12 s, beyond SPLICE_NS, into the old span's raw range.
+        queue.push(
+            AudioBlock::from_interleaved(format, vec![0.8; 4_800 * 2]).unwrap(),
+            raw0,
+            48_000,
+            usize::MAX,
+        );
+        let stale_epoch = queue.units.front().unwrap().epoch;
+        let replay_epoch = queue.units.back().unwrap().epoch;
+        assert_ne!(stale_epoch, replay_epoch);
+        assert_eq!(queue.epochs.epoch_of(raw0), Some(replay_epoch));
+        let mut placer =
+            Placer::new(48_000, 3 * RATE, std::time::Duration::from_secs(1)).require_video_anchor();
+        let now = std::time::Instant::now();
+        let video = anchor(1, 2 * SEC, raw0);
+        assert_eq!(
+            placer.map.map(raw0, stale_epoch, &queue.epochs, 0),
+            Mapped::None,
+            "old epoch has no anchor from the replay"
+        );
+        placer.step(&store, &mut queue, Some(video), 0, now);
+        assert_eq!(placer.stats.skipped, 120 * 4_800);
+        assert_eq!(placer.stats.placed, 4_800);
+        placer.step(
+            &store,
+            &mut queue,
+            Some(video),
+            0,
+            now + std::time::Duration::from_secs(30),
+        );
+        assert!(
+            queue.is_empty(),
+            "stale head must not block the anchored replay"
+        );
+        assert_eq!(
+            queue.frames, 0,
+            "discarded frames are removed from the bound"
+        );
+        assert_eq!(raw_at(&store, 2 * RATE), 0.8, "only the replay may air");
+    }
+
+    /// An older epoch with its own video anchor remains playable even if the
+    /// replay has overlapping raw PTS and its own newer video anchor.
+    #[test]
+    fn overlapping_replay_preserves_playable_older_epoch() {
+        let format = AudioFormat::new(48_000, ChannelLayout::Stereo);
+        let store = AudioStore::timeline(format, 20 * 48_000);
+        let mut queue = DecodedQueue::default();
+        let raw0 = 100 * SEC;
+        for i in 0..120 {
+            let raw = raw0 + i * SEC / 10;
+            queue.push(
+                AudioBlock::from_interleaved(format, vec![0.2; 4_800 * 2]).unwrap(),
+                raw,
+                48_000,
+                usize::MAX,
+            );
+        }
+        queue.push(
+            AudioBlock::from_interleaved(format, vec![0.8; 4_800 * 2]).unwrap(),
+            raw0,
+            48_000,
+            usize::MAX,
+        );
+        let mut placer = Placer::new(48_000, 16 * RATE, std::time::Duration::from_secs(1))
+            .require_video_anchor();
+        let old_video = anchor(1, 13 * SEC + 900_000_000, raw0 + 11 * SEC + 900_000_000);
+        let replay_video = anchor(2, 3 * SEC, raw0);
+        let old_epoch = queue.units.front().unwrap().epoch;
+        assert!(placer.map.observe(Some(old_video)));
+        assert_eq!(
+            placer.map.map(raw0, old_epoch, &queue.epochs, 0),
+            Mapped::Video(2 * RATE),
+        );
+        let now = std::time::Instant::now();
+        placer.step(&store, &mut queue, Some(replay_video), 0, now);
+        assert!(queue.is_empty());
+        assert_eq!(
+            placer.stats.skipped, 0,
+            "playable old audio is not discarded"
+        );
+        assert_eq!(raw_at(&store, 2 * RATE), 0.2);
+        assert_eq!(raw_at(&store, 3 * RATE), 0.8);
+    }
+
+    /// A newer queued epoch alone cannot justify discarding old audio: the
+    /// newer epoch must already have a video anchor.
+    #[test]
+    fn overlapping_replay_without_video_anchor_keeps_old_head() {
+        let format = AudioFormat::new(48_000, ChannelLayout::Stereo);
+        let store = AudioStore::timeline(format, 288_000);
+        let mut queue = DecodedQueue::default();
+        let raw0 = 100 * SEC;
+        queue.push(stamped(format, raw0), raw0, 48_000, DECODED_QUEUE_CAP);
+        queue.push(
+            stamped(format, raw0 + 12 * SEC),
+            raw0 + 12 * SEC,
+            48_000,
+            DECODED_QUEUE_CAP,
+        );
+        queue.push(stamped(format, raw0), raw0, 48_000, DECODED_QUEUE_CAP);
+        let mut placer =
+            Placer::new(48_000, 3 * RATE, std::time::Duration::from_secs(1)).require_video_anchor();
+        let now = std::time::Instant::now();
+        placer.step(
+            &store,
+            &mut queue,
+            None,
+            0,
+            now + std::time::Duration::from_secs(30),
+        );
+        assert_eq!(queue.units.len(), 3);
+        assert_eq!(queue.frames, 3 * 4_800);
+        assert_eq!(placer.stats.skipped, 0);
+        assert_eq!(store.buffered_frames(), 0);
     }
 
     #[test]

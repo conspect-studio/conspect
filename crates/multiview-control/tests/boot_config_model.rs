@@ -93,6 +93,24 @@ codec = "mpeg2video"
 segment_ms = 1000
 "##;
 
+/// An `[audio]` block appended to [`BOOT_DOC`]: one route over the `in_a`
+/// source (the boot-authored routing the base document carries). Used by the
+/// cleared-audio regression to give `base_document` a routing block the
+/// accepted envelope can later drop.
+const BOOT_AUDIO_SECTION: &str = r#"
+[audio]
+sample_rate_hz = 48000
+
+[[audio.routes]]
+input_id = "in_a"
+target_track = "in_a-clean"
+include_in_program_bus = true
+gain_db = -3.0
+
+[audio.routes.channels]
+kind = "stereo"
+"#;
+
 /// The whole rig: a temp config dir holding the boot file, the shared
 /// control-plane state (stores seeded from the boot doc + the boot model),
 /// the router, and the engine-side command receiver.
@@ -870,6 +888,75 @@ async fn promote_writes_running_to_the_boot_file_and_versions_it() {
         loaded_divergence.contains(&serde_json::json!("sources")),
         "the Loaded snapshot still differs (promote does not move Loaded)"
     );
+}
+
+/// A watched ADR-W020 edit that DROPS `[audio]` clears the accepted envelope's
+/// routing. Export and promote compose "what was accepted" (review R3-01), so
+/// neither may resurrect the boot-authored `[audio]` block the inherited
+/// `base_document` still carries: a `None` accepted audio means the envelope
+/// cleared it, and the envelope — not the startup document — is authoritative
+/// for a versioned config section.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_cleared_audio_block_is_not_resurrected_by_export_or_promote() {
+    let doc = format!("{BOOT_DOC}{BOOT_AUDIO_SECTION}");
+    let r = rig(&doc);
+    // Guard the guard: the boot document really authors `[audio]` (so the
+    // base document carries a block that could be resurrected).
+    assert!(r.config.audio.is_some(), "the boot doc authors [audio]");
+
+    let (options, mut poll) = WatchOptions::default()
+        .with_poll_interval(TEST_POLL)
+        .with_manual_poll();
+    let watch = spawn_watch(
+        r.boot_path.clone(),
+        r.config.clone(),
+        r.state.clone(),
+        options,
+    );
+    settle_initial(&mut poll, &r.state).await;
+
+    // The operator saves the boot file WITHOUT `[audio]`: the watcher commits
+    // the reloaded document as accepted intent, so the envelope's audio is
+    // `None` while the live store deliberately keeps its last value until
+    // restart (`resync_audio`).
+    external_edit(&r.boot_path, BOOT_DOC);
+    drive_polls(&mut poll, 2).await;
+    assert_eq!(
+        r.state.config_watch.snapshot().applied_count,
+        1,
+        "dropping [audio] is a real external edit the watcher applies"
+    );
+
+    // Export composes from the accepted envelope: no `[audio]`, never the base
+    // document's boot-authored block.
+    let resp = send(&r.router, get("/api/v1/config/export", VIEWER_TOKEN)).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let text = core::str::from_utf8(&body).unwrap();
+    let exported: MultiviewConfig = toml::from_str(text).expect("export parses");
+    assert!(
+        exported.audio.is_none(),
+        "export resurrected the cleared boot-authored [audio]:\n{text}"
+    );
+
+    // Promote writes the accepted envelope to the boot file: the cleared
+    // `[audio]` must not come back there either.
+    let resp = send(
+        &r.router,
+        post_idem("/api/v1/config/promote", OPERATOR_TOKEN, None),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let promoted_text = std::fs::read_to_string(&r.boot_path).expect("read promoted boot file");
+    let promoted = MultiviewConfig::load_from_toml(&promoted_text).expect("promoted file parses");
+    assert!(
+        promoted.audio.is_none(),
+        "promote resurrected the cleared boot-authored [audio]:\n{promoted_text}"
+    );
+
+    watch.stop();
 }
 
 /// A replayed `Idempotency-Key` answers without rewriting the file or
