@@ -381,69 +381,47 @@ struct ResolvedEncoder {
     name: String,
     /// The pixel format the encoder is fed (`yuv420p` for the software codecs).
     format: Pixel,
-    /// The logical codec this encoder **actually** encodes (the fallback, not the
-    /// request, when the request is not encodable in this build). The delivery
-    /// layer derives its strict-RAP recovery gate from this, never from the
-    /// config token.
-    codec: multiview_ffmpeg::VideoCodec,
 }
 
 /// Map a config output `codec` token to a logical [`multiview_ffmpeg::VideoCodec`].
-/// Unknown / unsupported tokens fall back to MPEG-2 (the LGPL-clean default).
-fn logical_codec(token: &str) -> multiview_ffmpeg::VideoCodec {
+/// Unknown codec names are rejected, never silently replaced.
+fn logical_codec(token: &str) -> Result<multiview_ffmpeg::VideoCodec, PipelineError> {
     use multiview_ffmpeg::VideoCodec;
     match token.to_ascii_lowercase().as_str() {
-        "h264" | "avc" => VideoCodec::H264,
-        "h265" | "hevc" => VideoCodec::H265,
-        "ffv1" => VideoCodec::Ffv1,
-        "mjpeg" => VideoCodec::Mjpeg,
-        _ => VideoCodec::Mpeg2Video,
+        "h264" | "avc" | "libx264" | "h264_nvenc" => Ok(VideoCodec::H264),
+        "h265" | "hevc" | "libx265" | "hevc_nvenc" => Ok(VideoCodec::H265),
+        "ffv1" => Ok(VideoCodec::Ffv1),
+        "mjpeg" => Ok(VideoCodec::Mjpeg),
+        "mpeg2video" => Ok(VideoCodec::Mpeg2Video),
+        _ => Err(PipelineError::Codec {
+            codec: token.to_owned(),
+            reason: "unsupported codec".to_owned(),
+        }),
     }
 }
 
 /// Resolve the encoder to use for `codec_token`, honouring the compiled features
 /// (LGPL `mpeg2video` by default; `libx264`/`libx265` under `gpl-codecs`).
 ///
-/// If the requested codec cannot be encoded by this build (e.g. H.264 with no
-/// `gpl-codecs`), this falls back to MPEG-2 so a config that names `h264` still
-/// produces a real, playable file in an LGPL-clean build — and logs the
-/// substitution. Returns [`PipelineError::Codec`] only if even the fallback is
-/// somehow unavailable in the linked `FFmpeg`.
+/// An unavailable requested codec fails before the clock starts. No output
+/// silently changes its requested codec or substitutes MPEG-2.
 fn resolve_encoder(codec_token: &str) -> Result<ResolvedEncoder, PipelineError> {
-    use multiview_ffmpeg::{select_encoder, VideoCodec};
-    let requested = logical_codec(codec_token);
-    if let Some(name) = select_encoder(requested) {
-        return Ok(ResolvedEncoder {
-            name: name.to_owned(),
-            format: encoder_input_format(name),
-            codec: requested,
-        });
-    }
-    // The requested codec is not encodable in this build; fall back to MPEG-2.
-    tracing::warn!(
-        requested = ?requested,
-        "requested output codec is not encodable in this build (need gpl-codecs/cuda); \
-         falling back to LGPL mpeg2video"
-    );
-    let fallback = select_encoder(VideoCodec::Mpeg2Video).ok_or_else(|| PipelineError::Codec {
+    use multiview_ffmpeg::select_encoder;
+    let requested = logical_codec(codec_token)?;
+    let name = select_encoder(requested).ok_or_else(|| PipelineError::Codec {
         codec: codec_token.to_owned(),
-        reason: "neither the requested codec nor the mpeg2video fallback is present in FFmpeg"
-            .to_owned(),
+        reason: "requested encoder is unavailable in this build or linked FFmpeg".to_owned(),
     })?;
     Ok(ResolvedEncoder {
-        name: fallback.to_owned(),
-        format: encoder_input_format(fallback),
-        codec: VideoCodec::Mpeg2Video,
+        name: name.to_owned(),
+        format: encoder_input_format(name),
     })
 }
 
 fn codec_for_encoder(name: &str) -> multiview_ffmpeg::VideoCodec {
-    if name.contains("264") {
-        multiview_ffmpeg::VideoCodec::H264
-    } else if name.contains("265") || name.contains("hevc") {
-        multiview_ffmpeg::VideoCodec::H265
-    } else {
-        logical_codec(name)
+    match logical_codec(name) {
+        Ok(codec) => codec,
+        Err(_) => multiview_ffmpeg::VideoCodec::Mpeg2Video,
     }
 }
 
@@ -4135,10 +4113,11 @@ impl Pipeline {
         let (egress, hot_tx) = StreamEgress::spawn(
             bake_ctx,
             runners,
-            self.rendition_configs
+            &self
+                .rendition_configs
                 .iter()
                 .map(|cfg| recovery_gate(codec_for_encoder(&cfg.codec_name)))
-                .collect(),
+                .collect::<Vec<_>>(),
             tick_span(self.encode_cfg.cadence),
             self.encode_cfg.cadence,
             policy,
@@ -5179,7 +5158,7 @@ impl StreamEgress {
     fn spawn(
         ctx: BakeContext,
         runners: Vec<(SinkRunner, SinkSendPolicy)>,
-        gates: Vec<Option<RecoveryGate>>,
+        gates: &[Option<RecoveryGate>],
         media_span: Duration,
         cadence: Rational,
         policy: SendPolicy,
@@ -6074,6 +6053,7 @@ enum SinkSendPolicy {
     DropWhenFull(Arc<multiview_output::push_link::PushLinkStatus>),
 }
 // scatter the dispatch without reducing complexity.
+#[allow(clippy::too_many_lines)] // Each sink variant seeds its independent mux and transport state.
 fn run_one_output(
     output: RunnableOutput,
     rx: Receiver<LeasedPacket>,
