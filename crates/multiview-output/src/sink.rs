@@ -706,6 +706,26 @@ impl AudioRenditionEncoder {
         Ok(())
     }
 
+    /// Program-audio encoder frame size in exact samples (AAC is typically 1024).
+    #[must_use]
+    pub fn frame_samples(&self) -> Option<u32> {
+        u32::try_from(self.audio.frame_size).ok()
+    }
+
+    /// Per-track sample rate and frame size from the actual opened encoder.
+    #[must_use]
+    pub fn watermark_streams(&self) -> Vec<(u32, u32)> {
+        std::iter::once(&self.audio)
+            .chain(self.tracks.iter())
+            .filter_map(|state| {
+                Some((
+                    u32::try_from(state.frame_size).ok()?,
+                    u32::try_from(state.time_base.den).ok()?,
+                ))
+            })
+            .collect()
+    }
+
     /// Program-audio stream parameters and sample-clock time base.
     #[must_use]
     pub fn codec_params(&self) -> &StreamCodecParameters {
@@ -3494,6 +3514,60 @@ mod tests {
         }
         assert_eq!(done.len(), 6);
         assert_eq!(done[0].0, Path::new("seg9994.ts"));
+    }
+
+    #[test]
+    fn concrete_rendition_opens_zero_latency_and_emits_every_tick() {
+        use multiview_core::frame::FrameMeta;
+        use multiview_core::pixel::PixelFormat;
+        use multiview_core::time::MediaTime;
+        for codec in ["libx264", "libx265"] {
+            if ffmpeg::encoder::find_by_name(codec).is_none() {
+                continue;
+            }
+            let mut config = EncodeConfig::mpeg2(WIDTH, HEIGHT);
+            config.codec_name = codec.to_owned();
+            config.gop = 30;
+            config.cadence = Rational::FPS_29_97;
+            let mut rendition = super::VideoRenditionEncoder::new(&config).unwrap();
+            assert!(
+                rendition.no_reorder_proven(),
+                "{codec} opened reorder/delay"
+            );
+            for tick in 0..65_u64 {
+                let frame = DecodedVideoFrame {
+                    frame: ffmpeg::util::frame::Video::new(
+                        ffmpeg::format::Pixel::YUV420P,
+                        WIDTH,
+                        HEIGHT,
+                    ),
+                    meta: FrameMeta {
+                        pts: MediaTime::ZERO,
+                        width: WIDTH,
+                        height: HEIGHT,
+                        format: PixelFormat::Nv12,
+                        color: multiview_core::color::ColorInfo::default(),
+                    },
+                    raw_pts: None,
+                    a53_cc: None,
+                };
+                let packets = rendition.encode_frame_at(frame, tick).unwrap();
+                assert!(
+                    !packets.is_empty(),
+                    "{codec} buffered input tick {tick} despite zero-latency proof"
+                );
+                assert!(
+                    packets
+                        .iter()
+                        .all(|packet| packet.dts() == Some(tick as i64)),
+                    "{codec} emitted delayed DTS for tick {tick}"
+                );
+            }
+            assert!(
+                rendition.finish().unwrap().is_empty(),
+                "{codec} hid delayed frames at EOF"
+            );
+        }
     }
 
     #[test]

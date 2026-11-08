@@ -90,9 +90,10 @@ impl RejectionReason {
             OfferError::Occupied => Self::Occupied,
             OfferError::OldestAge => Self::OldestAge,
             OfferError::ClockReversed => Self::ClockReversed,
-            OfferError::NeedsRecoveryPoint => Self::NeedsRecoveryPoint,
+            OfferError::NeedsRecoveryPoint | OfferError::Closed | OfferError::ProducerLoss => {
+                Self::NeedsRecoveryPoint
+            }
             OfferError::WrongProgramShape => Self::WrongProgramShape,
-            OfferError::Closed | OfferError::ProducerLoss => Self::NeedsRecoveryPoint,
         }
     }
 
@@ -145,6 +146,7 @@ pub(crate) struct BindingStatus {
 /// Admission limits. Defaults are the carrier's broadcast ceilings; tests and
 /// capacity measurement may tighten them, never to paper over overload.
 #[derive(Debug, Clone, Copy)]
+#[allow(clippy::struct_field_names)] // Public limit names mirror the carrier's max_packets/max_bytes/max_age contract.
 pub(crate) struct DeliveryLimits {
     /// Maximum packets owned by one binding, including in-flight leases.
     pub(crate) max_packets: usize,
@@ -333,6 +335,7 @@ impl WindowDelivery for BindingDelivery {
     }
     fn abort(&mut self) {
         for binding in &mut self.bindings {
+            #[cfg(test)]
             binding.staged.clear();
             binding.queue.report_loss(OfferError::ProducerLoss);
             binding.queue.close();
@@ -359,6 +362,7 @@ struct Binding {
     lease_tx: SyncSender<BatchLease>,
     /// A lease popped but not yet handed to the pump (at most one).
     pending: Option<BatchLease>,
+    #[cfg(test)]
     staged: Vec<EncodedPacket>,
     wedged: Arc<AtomicBool>,
     pump: Option<JoinHandle<()>>,
@@ -445,6 +449,7 @@ impl BindingDelivery {
                 queue,
                 lease_tx,
                 pending: None,
+                #[cfg(test)]
                 staged: Vec::new(),
                 wedged,
                 pump,
@@ -462,6 +467,9 @@ impl BindingDelivery {
         (Self { bindings }, receivers)
     }
 
+    #[cfg(test)]
+    /// Test-only legacy staging entry. Production admits only fully assembled
+    /// windows through [`WindowDelivery::offer_window`].
     /// Stage one emitted packet group (a tick's video, program audio or discrete
     /// tracks) for every live binding. Cloning an [`EncodedPacket`] is a
     /// ref-counted copy of the coded payload, exactly as the previous fan-out.
@@ -486,29 +494,28 @@ impl BindingDelivery {
                     }
                 }
                 // Shared-ref copy: independent AVPacket metadata, ONE coded payload.
-                match packet.clone_shared_ref() {
-                    Ok(shared) => binding.staged.push(shared),
-                    Err(_) => {
-                        binding.staged.clear();
-                        binding.queue.report_loss(OfferError::ProducerLoss);
-                        binding.failed = true;
-                        binding.last_rejection = Some(RejectionReason::InvalidWindow);
-                        break;
-                    }
+                if let Ok(shared) = packet.clone_shared_ref() {
+                    binding.staged.push(shared);
+                } else {
+                    binding.staged.clear();
+                    binding.queue.report_loss(OfferError::ProducerLoss);
+                    binding.failed = true;
+                    binding.last_rejection = Some(RejectionReason::InvalidWindow);
+                    break;
                 }
             }
         }
     }
 
+    #[cfg(test)]
+    /// Test-only direct tick flush. Production closes complete DTS-watermarked
+    /// windows through the dispatcher; this preserves the original queue tests.
     /// Atomically admit the staged batch of the **previous** tick to every
     /// binding. Never waits: the only outcome of a full or stale binding is a
     /// whole-batch loss recorded against that binding.
     ///
-    /// This is the pipeline's *direct* path (the bake consumer knows the tick
-    /// boundary itself). An external window assembler uses
-    /// [`WindowDelivery::offer_window`], which funnels into the same single
-    /// admission path — there is exactly one queue and one generation per
-    /// binding either way.
+    /// This test-only path still calls [`WindowDelivery::offer_window`], so the
+    /// queue and generation semantics remain identical to production.
     pub(crate) fn flush_tick(&mut self, now: Instant, media_span: Duration) {
         for index in 0..self.bindings.len() {
             if self.bindings[index].failed {
@@ -579,12 +586,24 @@ impl BindingDelivery {
             .iter()
             .map(|packet| matches!(packet.kind(), StreamKind::Video) && packet.is_keyframe())
             .collect();
-        let binding = &mut self.bindings[index];
+        let Some(binding) = self.bindings.get_mut(index) else {
+            return Err(WindowRejection {
+                output_index: index,
+                generation: 0,
+                reason: RejectionReason::WrongProgramShape,
+                packets,
+                bytes,
+            });
+        };
         match binding.queue.offer_emitted(staged, media_span, now) {
             Ok(()) => {
                 binding.admitted_batches = binding.admitted_batches.saturating_add(1);
-                binding.admitted_packets = binding.admitted_packets.saturating_add(packets as u64);
-                binding.admitted_bytes = binding.admitted_bytes.saturating_add(bytes as u64);
+                binding.admitted_packets = binding
+                    .admitted_packets
+                    .saturating_add(u64::try_from(packets).unwrap_or(u64::MAX));
+                binding.admitted_bytes = binding
+                    .admitted_bytes
+                    .saturating_add(u64::try_from(bytes).unwrap_or(u64::MAX));
                 if let BindingPolicy::Push(link) = &binding.policy {
                     for keyframe in &keyframes {
                         link.queued_upstream(*keyframe);
@@ -597,8 +616,12 @@ impl BindingDelivery {
                     EmissionError::Admission(offer) => RejectionReason::from_offer(offer),
                 };
                 binding.rejected_batches = binding.rejected_batches.saturating_add(1);
-                binding.rejected_packets = binding.rejected_packets.saturating_add(packets as u64);
-                binding.rejected_bytes = binding.rejected_bytes.saturating_add(bytes as u64);
+                binding.rejected_packets = binding
+                    .rejected_packets
+                    .saturating_add(u64::try_from(packets).unwrap_or(u64::MAX));
+                binding.rejected_bytes = binding
+                    .rejected_bytes
+                    .saturating_add(u64::try_from(bytes).unwrap_or(u64::MAX));
                 binding.last_rejection = Some(reason);
                 if let BindingPolicy::Push(link) = &binding.policy {
                     for _ in &keyframes {
@@ -803,11 +826,11 @@ mod tests {
         ]))
     }
 
-    fn gate() -> Option<RecoveryGate> {
-        Some(RecoveryGate::StrictRap {
+    fn gate() -> RecoveryGate {
+        RecoveryGate::StrictRap {
             codec: CodecKind::H264,
             framing: NalFraming::AnnexB,
-        })
+        }
     }
 
     fn limits(max_packets: usize) -> DeliveryLimits {
@@ -833,7 +856,7 @@ mod tests {
         let (mut delivery, receivers) = BindingDelivery::new(
             vec![BindingPolicy::Bounded],
             DeliveryLimits::default(),
-            vec![gate()],
+            vec![Some(gate())],
         );
         let mut receivers = receivers;
         let rx = receivers.pop().unwrap();
@@ -853,7 +876,7 @@ mod tests {
         let (mut delivery, mut receivers) = BindingDelivery::new(
             vec![BindingPolicy::Bounded, BindingPolicy::Bounded],
             DeliveryLimits::default(),
-            vec![gate(), gate()],
+            vec![Some(gate()), Some(gate())],
         );
         let healthy = receivers.pop().unwrap();
         let slow = receivers.pop().unwrap();
@@ -864,6 +887,12 @@ mod tests {
         assert_eq!(delivery.statuses()[0].reserved_packets, 1);
         assert_eq!(delivery.statuses()[1].reserved_packets, 1);
         drop(ready); // healthy mux write acknowledged
+                     // The pump may still hold its local Arc briefly after sending. Wait
+                     // only for that finite handoff to finish; do not assert scheduler speed.
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while delivery.statuses()[1].reserved_packets != 0 && Instant::now() < deadline {
+            std::thread::yield_now();
+        }
         assert_eq!(delivery.statuses()[1].reserved_packets, 0);
         assert_eq!(delivery.statuses()[0].reserved_packets, 1);
         delivery.stage(&[packet(4)]);
@@ -1048,7 +1077,7 @@ mod tests {
         let (mut delivery, mut receivers) = BindingDelivery::new(
             vec![BindingPolicy::Bounded],
             DeliveryLimits::default(),
-            vec![gate()],
+            vec![Some(gate())],
         );
         let rx = receivers.remove(0);
         let collector = std::thread::spawn(move || drain(&rx));
@@ -1075,7 +1104,7 @@ mod tests {
         // Cap of one packet: a two-packet window is rejected whole, which is a
         // real delivery loss and closes the recovery gate.
         let (mut delivery, mut receivers) =
-            BindingDelivery::new(vec![BindingPolicy::Bounded], limits(1), vec![gate()]);
+            BindingDelivery::new(vec![BindingPolicy::Bounded], limits(1), vec![Some(gate())]);
         let rx = receivers.remove(0);
         let collector = std::thread::spawn(move || drain(&rx));
         let span = tick_span(Rational::new(30_000, 1001));

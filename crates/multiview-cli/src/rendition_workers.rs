@@ -146,6 +146,9 @@ pub enum DispatchEvent {
 pub trait VideoEncodeWorker: Send + 'static {
     /// Encode one baked tick. May return zero to many packets, including
     /// packets for *earlier* ticks when the encoder reorders.
+    ///
+    /// # Errors
+    /// Returns a concrete encoder failure without publishing a false watermark.
     fn encode(&mut self, item: BakedTick) -> Result<Vec<EncodedPacket>, PipelineError>;
 
     /// The demonstrated reorder bound of the encoder that actually opened.
@@ -153,6 +156,9 @@ pub trait VideoEncodeWorker: Send + 'static {
 
     /// Flush the encoder, returning every delayed packet. Called once, on the
     /// worker thread, when the program ends.
+    ///
+    /// # Errors
+    /// Returns a concrete encoder flush failure without publishing false EOF.
     fn finish(&mut self) -> Result<Vec<EncodedPacket>, PipelineError>;
 }
 
@@ -441,7 +447,11 @@ mod tests {
         }
 
         fn finish(&mut self) -> Result<Vec<EncodedPacket>, PipelineError> {
-            Ok(self.pending.take().map(|pts| vec![packet(pts)]).unwrap_or_default())
+            Ok(self
+                .pending
+                .take()
+                .map(|pts| vec![packet(pts)])
+                .unwrap_or_default())
         }
     }
 
@@ -614,31 +624,26 @@ mod tests {
         for event in &video {
             match event {
                 DispatchEvent::Video { watermark, .. } => assert!(watermark.is_none()),
-                _ => unreachable!(),
+                _ => panic!("unexpected worker event"),
             }
         }
         // Tick 0's packet is released during call 1; tick 2's only at finish.
         match video[0] {
             DispatchEvent::Video { packets, .. } => assert!(packets.is_empty()),
-            _ => unreachable!(),
+            _ => panic!("unexpected worker event"),
         }
         match events.last().expect("terminal") {
             DispatchEvent::FinishVideo { packets, .. } => assert_eq!(packets.len(), 1),
-            _ => unreachable!(),
+            _ => panic!("unexpected worker event"),
         }
     }
 
     #[test]
     fn overload_is_reported_promptly_without_waiting() {
         let (release, gate) = mpsc::channel();
-        let worker = RenditionWorker::spawn(
-            0,
-            CADENCE,
-            TIMEBASE,
-            Box::new(Stalled { gate }),
-            |_| Ok(()),
-        )
-        .expect("worker");
+        let worker =
+            RenditionWorker::spawn(0, CADENCE, TIMEBASE, Box::new(Stalled { gate }), |_| Ok(()))
+                .expect("worker");
         let canvas = canvas();
         // The stalled worker holds one item and its bounded queue holds at most
         // `WORKER_QUEUE_TICKS` more (the exact split depends on whether the
@@ -647,7 +652,7 @@ mod tests {
         let started = Instant::now();
         let mut accepted = 0_u64;
         let mut rejection = None;
-        for tick in 0..=WORKER_QUEUE_TICKS as u64 {
+        for tick in 0..=u64::try_from(WORKER_QUEUE_TICKS).expect("queue cap fits u64") {
             match worker.offer(BakedTick {
                 tick,
                 canvas: Arc::clone(&canvas),
@@ -660,7 +665,7 @@ mod tests {
             }
         }
         assert_eq!(rejection, Some(OfferRejection::Overloaded));
-        assert!(accepted <= WORKER_QUEUE_TICKS as u64 + 1);
+        assert!(accepted <= u64::try_from(WORKER_QUEUE_TICKS).expect("queue cap fits u64") + 1);
         assert!(
             started.elapsed() < Duration::from_millis(250),
             "offer must never wait on a stalled encoder"
@@ -687,10 +692,8 @@ mod tests {
                 Ok(Vec::new())
             }
         }
-        let worker =
-            RenditionWorker::spawn(0, CADENCE, TIMEBASE, Box::new(Failing), |_| Ok(())).expect(
-                "worker",
-            );
+        let worker = RenditionWorker::spawn(0, CADENCE, TIMEBASE, Box::new(Failing), |_| Ok(()))
+            .expect("worker");
         worker
             .offer(BakedTick {
                 tick: 0,
@@ -698,7 +701,13 @@ mod tests {
             })
             .expect("offer");
         let error = worker.join().expect_err("encoder failure must surface");
-        assert!(matches!(error, PipelineError::Output { kind: "test-encoder", .. }));
+        assert!(matches!(
+            error,
+            PipelineError::Output {
+                kind: "test-encoder",
+                ..
+            }
+        ));
     }
 
     #[test]

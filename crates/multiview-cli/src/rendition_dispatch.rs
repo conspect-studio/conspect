@@ -41,7 +41,20 @@ impl DtsTimeBase {
         i128::from(dts)
             .checked_mul(i128::from(self.num))?
             .checked_mul(1_000_000_000)?
-            .checked_div(i128::from(self.den))
+            .checked_div_euclid(i128::from(self.den))
+    }
+
+    // Divide ONCE after composing the two exact rational time bases. Converting
+    // DTS to integer nanoseconds first loses one fractional ns at 30000/1001;
+    // another floor against the tick boundary misassigns tick N to N-1.
+    fn window_index(self, dts: i64, cadence: Rational) -> Option<i128> {
+        if self.num <= 0 || self.den <= 0 || cadence.num <= 0 || cadence.den <= 0 {
+            return None;
+        }
+        i128::from(dts)
+            .checked_mul(i128::from(self.num))?
+            .checked_mul(i128::from(cadence.num))?
+            .checked_div_euclid(i128::from(self.den).checked_mul(i128::from(cadence.den))?)
     }
 }
 
@@ -127,10 +140,24 @@ impl StreamStage {
         {
             return Err(DispatchError::LatePacket);
         }
-        let index = dts
-            .checked_mul(i128::from(cadence.num))
-            .and_then(|v| v.checked_div(i128::from(cadence.den) * 1_000_000_000))
+        let exact_index = time_base
+            .window_index(packet.dts().ok_or(DispatchError::MissingDts)?, cadence)
             .ok_or(DispatchError::InvalidEvent)?;
+        // An AAC encoder may emit ONE bounded negative priming frame before
+        // sample zero. Preserve its signed DTS for muxing; only its atomic
+        // admission window is zero. Never hide later negative or video DTS.
+        let index = if exact_index < 0 {
+            if packet.kind() != StreamKind::Video
+                && self.last_dts.is_none()
+                && packet.dts().is_some_and(|raw| raw >= -1024)
+            {
+                0
+            } else {
+                return Err(DispatchError::LatePacket);
+            }
+        } else {
+            exact_index
+        };
         if self.windows.back().is_some_and(|w| index < w.index) {
             return Err(DispatchError::LatePacket);
         }
@@ -296,9 +323,17 @@ impl RenditionDispatcher {
             delivery.abort();
             return Err(error);
         }
-        let result = self
-            .apply(event, now)
-            .and_then(|()| self.drain(now, delivery));
+        let result = self.apply(event, now).and_then(|()| {
+            if self.video.iter().chain(&self.audio).any(|stage| {
+                stage
+                    .windows
+                    .front()
+                    .is_some_and(|window| self.next_window.is_some_and(|next| window.index < next))
+            }) {
+                return Err(DispatchError::LatePacket);
+            }
+            self.drain(now, delivery)
+        });
         if let Err(error) = result {
             if let DispatchError::Admission { output_index, .. } = error {
                 // A slow binding already fenced its own queue. Other outputs
@@ -688,6 +723,76 @@ mod tests {
     use multiview_output::batch::{BoundedBatchQueue, RecoveryGate};
 
     const TICK: i128 = 200_000_000;
+
+    #[test]
+    fn rational_dts_never_falls_into_the_prior_ntsc_window() {
+        let frame_base = DtsTimeBase {
+            num: 1001,
+            den: 30_000,
+        };
+        for tick in 0..108_000_i64 {
+            assert_eq!(
+                frame_base.window_index(tick, Rational::FPS_29_97),
+                Some(i128::from(tick))
+            );
+        }
+        let samples = DtsTimeBase {
+            num: 1,
+            den: 48_000,
+        };
+        for sample in [0, 1024, 48_000, 480_000, 172_800_000] {
+            assert_eq!(
+                samples.window_index(sample, Rational::FPS_29_97),
+                Some(i128::from(sample) * 30_000 / (48_000 * 1001))
+            );
+        }
+        assert_eq!(frame_base.window_index(-1, Rational::FPS_29_97), Some(-1));
+    }
+
+    #[test]
+    fn bounded_aac_negative_priming_joins_zero_window_without_timestamp_rewrite() {
+        let mut stage = StreamStage::new();
+        let now = Instant::now();
+        let tb = DtsTimeBase {
+            num: 1,
+            den: 48_000,
+        };
+        stage
+            .put(audio(-1024, 0), tb, Rational::FPS_29_97, now)
+            .unwrap();
+        assert_eq!(stage.windows.front().unwrap().index, 0);
+        assert_eq!(stage.windows.front().unwrap().packets[0].dts(), Some(-1024));
+        stage
+            .put(audio(0, 0), tb, Rational::FPS_29_97, now)
+            .unwrap();
+        stage
+            .put(audio(1024, 0), tb, Rational::FPS_29_97, now)
+            .unwrap();
+        assert_eq!(stage.take(0).len(), 3);
+        assert!(stage.windows.is_empty());
+        assert_eq!(
+            stage.put(audio(-1024, 0), tb, Rational::FPS_29_97, now),
+            Err(DispatchError::LatePacket)
+        );
+    }
+
+    #[test]
+    fn stale_window_is_rejected_instead_of_accumulating_to_overflow() {
+        let mut stage = StreamStage::new();
+        let now = Instant::now();
+        let cadence = Rational::FPS_29_97;
+        let tb = DtsTimeBase {
+            num: 1001,
+            den: 30_000,
+        };
+        stage.put(video(22, 1, true), tb, cadence, now).unwrap();
+        assert_eq!(stage.windows.front().unwrap().index, 22);
+        assert_eq!(
+            stage.put(video(21, 1, false), tb, cadence, now),
+            Err(DispatchError::LatePacket)
+        );
+    }
+
     fn packet(kind: StreamKind, dts: i64, len: usize, rap: bool) -> EncodedPacket {
         let mut raw = if rap {
             Packet::copy(&[0, 0, 0, 1, 0x65, 0x88])
@@ -1089,7 +1194,7 @@ mod tests {
                 BindingPolicy::Bounded,
             ],
             DeliveryLimits::default(),
-            vec![Some(gate);3],
+            vec![Some(gate); 3],
         );
         let mut d = RenditionDispatcher::new(cfg(
             vec![binding(0, 0, 1), binding(1, 0, 1), binding(2, 0, 1)],
