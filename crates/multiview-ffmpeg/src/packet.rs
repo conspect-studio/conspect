@@ -260,6 +260,16 @@ impl StreamCodecParameters {
         nal_framing_from_config(id, bytes)
     }
 
+    /// Whether this video codec has a supported, testable recovery RAP gate.
+    #[must_use]
+    pub fn supports_decoder_ready_rap(&self) -> bool {
+        match self.parameters.id() {
+            ffmpeg::codec::Id::MPEG2VIDEO => true,
+            ffmpeg::codec::Id::H264 | ffmpeg::codec::Id::HEVC => self.nal_framing().is_some(),
+            _ => false,
+        }
+    }
+
     /// A strict decoder-ready access-unit gate for recovery after packet loss.
     /// A keyframe flag alone is not sufficient for H.264/HEVC open GOPs or CRA.
     #[must_use]

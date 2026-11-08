@@ -2380,6 +2380,18 @@ impl<'a> SegmentState<'a> {
                     return Err(error);
                 }
                 self.abandon_incomplete_segments();
+                // Unsupported codecs and encoder-seeded live sinks have no
+                // decoder-ready RAP classifier. Fail now rather than silently
+                // draining an unbounded live packet source forever.
+                let supported = match self.seed {
+                    StreamSeed::Params(params) => params.supports_decoder_ready_rap(),
+                    StreamSeed::Encoder(_) => false,
+                };
+                if !supported {
+                    return Err(Error::Output(format!(
+                        "HLS muxer recovery unsupported for this video codec: {error}"
+                    )));
+                }
                 if self.recovering && boundary {
                     self.recovery_failures = self.recovery_failures.saturating_add(1);
                     if self.recovery_failures >= 3 {
@@ -3082,6 +3094,51 @@ mod tests {
         assert!(!playlist.contains("seg0.ts"));
         assert!(playlist.contains("#EXT-X-DISCONTINUITY\n"));
         assert!(playlist.contains("seg1.ts"));
+    }
+
+    #[test]
+    fn unsupported_recovery_fails_before_live_source_can_drain() {
+        use super::{PacketSource, SegmentState, StreamSeed};
+        use crate::hls::LivePlaylist;
+        use ffmpeg::codec::packet::{Flags, Packet};
+        use multiview_ffmpeg::{EncodedPacket, VideoEncoder};
+        struct Endless {
+            pulls: usize,
+        }
+        impl PacketSource for Endless {
+            fn next_packet(&mut self) -> Result<Option<EncodedPacket>> {
+                self.pulls += 1;
+                assert!(
+                    self.pulls <= 2,
+                    "unsupported recovery must not drain the live source"
+                );
+                let mut packet = Packet::copy(&[0, 0, 1, 0, 0, 8, 0, 0]);
+                packet.set_flags(Flags::KEY);
+                let pts = i64::try_from(self.pulls).expect("bounded test pull count");
+                packet.set_pts(Some(pts));
+                packet.set_dts(Some(pts));
+                Ok(Some(EncodedPacket::from_packet(packet)))
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let encoder = VideoEncoder::new(&EncodeConfig::mpeg2(WIDTH, HEIGHT).target()).unwrap();
+        let mut state = SegmentState::new(
+            StreamSeed::Encoder(&encoder),
+            encoder.time_base(),
+            None,
+            dir.path(),
+            "seg",
+        );
+        state.live = Some(LivePlaylist::new(dir.path().join("index.m3u8"), 3));
+        state.fail_packet_write_once = true;
+        let mut source = Endless { pulls: 0 };
+        let error = state
+            .drive_from_packets(&mut source)
+            .expect_err("unsupported recovery must fail");
+        assert!(error.to_string().contains("recovery unsupported"));
+        assert_eq!(source.pulls, 1);
+        assert!(!dir.path().join("seg0.ts.tmp").exists());
+        assert!(!dir.path().join("index.m3u8").exists());
     }
 
     #[test]
