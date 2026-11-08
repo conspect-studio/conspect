@@ -388,10 +388,14 @@ impl BindingDelivery {
         limits: DeliveryLimits,
         gates: Vec<Option<multiview_output::batch::RecoveryGate>>,
     ) -> (Self, Vec<Receiver<LeasedPacket>>) {
-        assert_eq!(policies.len(),gates.len(),"each output must declare a recovery gate");
+        assert_eq!(
+            policies.len(),
+            gates.len(),
+            "each output must declare a recovery gate"
+        );
         let mut bindings = Vec::with_capacity(policies.len());
         let mut receivers = Vec::with_capacity(policies.len());
-        for (policy,gate) in policies.into_iter().zip(gates) {
+        for (policy, gate) in policies.into_iter().zip(gates) {
             let (packet_tx, packet_rx) = mpsc::sync_channel::<LeasedPacket>(HANDOFF_PACKETS);
             let (lease_tx, lease_rx) = mpsc::sync_channel::<BatchLease>(HANDOFF_LEASES);
             let wedged = Arc::new(AtomicBool::new(false));
@@ -840,6 +844,36 @@ mod tests {
     }
 
     #[test]
+    fn blocked_last_mux_write_keeps_its_budget_without_stalling_healthy_peer() {
+        let now = Instant::now();
+        let (mut delivery, mut receivers) = BindingDelivery::new(
+            vec![BindingPolicy::Bounded, BindingPolicy::Bounded],
+            DeliveryLimits::default(),
+            vec![gate(), gate()],
+        );
+        let healthy = receivers.pop().unwrap();
+        let slow = receivers.pop().unwrap();
+        delivery.stage(&[h264_packet(5)]);
+        delivery.flush_tick(now, Duration::from_millis(33));
+        let held = slow.recv_timeout(Duration::from_secs(1)).unwrap();
+        let ready = healthy.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert_eq!(delivery.statuses()[0].reserved_packets, 1);
+        assert_eq!(delivery.statuses()[1].reserved_packets, 1);
+        drop(ready); // healthy mux write acknowledged
+        assert_eq!(delivery.statuses()[1].reserved_packets, 0);
+        assert_eq!(delivery.statuses()[0].reserved_packets, 1);
+        delivery.stage(&[packet(4)]);
+        delivery.flush_tick(now, Duration::from_millis(33));
+        assert_eq!(delivery.statuses()[1].admitted_batches, 2);
+        assert_eq!(delivery.statuses()[0].reserved_packets, 2);
+        drop(held); // slow mux completes; later packet remains outstanding
+        assert_eq!(delivery.statuses()[0].reserved_packets, 1);
+        drop(healthy);
+        drop(slow);
+        delivery.finish();
+    }
+
+    #[test]
     fn tick_span_is_exact_for_ntsc_cadence() {
         // 1001/30000 s = 33_366_666.66… ns → floor 33_366_666 ns.
         assert_eq!(
@@ -900,7 +934,7 @@ mod tests {
         let (mut delivery, mut receivers) = BindingDelivery::new(
             vec![BindingPolicy::Bounded, BindingPolicy::Bounded],
             limits(64),
-            vec![None,None],
+            vec![None, None],
         );
         let span = tick_span(Rational::new(30_000, 1001));
         // Binding 0's sink never drains: its pump fills the one-packet handoff
