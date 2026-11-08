@@ -3288,6 +3288,7 @@ dependencies = [
  "multiview-overlay",
  "multiview-telemetry",
  "proptest",
+ "proptest-state-machine 0.7.0",
  "rustix",
  "serde",
  "serde_json",
@@ -3330,7 +3331,7 @@ version = "0.1.0"
 dependencies = [
  "multiview-core",
  "proptest",
- "proptest-state-machine",
+ "proptest-state-machine 0.8.0",
  "thiserror 2.0.18",
 ]
 
@@ -4201,6 +4202,15 @@ dependencies = [
  "rusty-fork",
  "tempfile",
  "unarray",
+]
+
+[[package]]
+name = "proptest-state-machine"
+version = "0.7.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8e16286b04f551efe9a5d76283e512e829fa77900ba0fb4b5bbaa5d1cb0d81d1"
+dependencies = [
+ "proptest",
 ]
 
 [[package]]
