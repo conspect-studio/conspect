@@ -70,6 +70,7 @@ fn probe_media(path: &Path) -> (String, Vec<i64>, usize) {
     (codec, pts, audio)
 }
 #[tokio::test]
+#[allow(clippy::too_many_lines)] // The timed peer lifecycle and media assertions are one integration test.
 async fn live_clock_survives_slow_ipv4_peer_and_ipv6_reconnect() {
     // A live 30s run (not run_for): the hot producer must not await one peer.
     let dir = tempfile::tempdir().unwrap();
@@ -88,10 +89,10 @@ async fn live_clock_survives_slow_ipv4_peer_and_ipv6_reconnect() {
     let mut pipeline = Pipeline::build(&config).unwrap();
     pipeline.enable_program_audio();
     let stop = StopSignal::new();
-    let stopper = stop.clone();
-    let stopped = std::thread::spawn(move || {
+    let stop_for_thread = stop.clone();
+    let timer_thread = std::thread::spawn(move || {
         std::thread::sleep(Duration::from_secs(30));
-        stopper.stop();
+        stop_for_thread.stop();
     });
     let slow = std::thread::spawn(move || {
         std::thread::sleep(Duration::from_secs(2));
@@ -109,8 +110,8 @@ async fn live_clock_survives_slow_ipv4_peer_and_ipv6_reconnect() {
         let child = OwnedClient(child);
         std::thread::sleep(Duration::from_secs(3));
         let pid = child.0.id().to_string();
-        let stopped = Command::new("kill").args(["-STOP", &pid]).status().unwrap();
-        assert!(stopped.success(), "stop only owned SRT client");
+        let suspended = Command::new("kill").args(["-STOP", &pid]).status().unwrap();
+        assert!(suspended.success(), "stop only owned SRT client");
         std::thread::sleep(Duration::from_secs(8));
         let resumed = Command::new("kill").args(["-CONT", &pid]).status().unwrap();
         assert!(resumed.success(), "resume owned SRT client for cleanup");
@@ -143,8 +144,8 @@ async fn live_clock_survives_slow_ipv4_peer_and_ipv6_reconnect() {
         }
     });
     let report = pipeline.run_until(&stop).await.unwrap();
-    stopped.join().unwrap();
-    let _ = slow.join().unwrap();
+    timer_thread.join().unwrap();
+    slow.join().unwrap();
     let _ = healthy.join().unwrap();
     let (codec, pts, audio_count) = probe_media(&healthy_path);
     let mut faults = Vec::new();

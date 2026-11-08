@@ -41,6 +41,7 @@ pub(crate) fn generate(clips: &[PathBuf; 6], seconds: u32) {
 pub(crate) fn paths(dir: &Path) -> [PathBuf; 6] {
     std::array::from_fn(|index| dir.join(format!("source{index}.ts")))
 }
+#[allow(clippy::too_many_lines)] // The single declarative six-source configuration belongs together.
 pub(crate) fn config(clips: &[PathBuf; 6], playlist: &Path, hevc: u16, avc: u16) -> String {
     format!(
         r##"
