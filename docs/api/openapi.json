@@ -968,6 +968,80 @@
         }
       }
     },
+    "/api/v1/cloudflare/credentials": {
+      "post": {
+        "tags": [
+          "cloudflare"
+        ],
+        "operationId": "save",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SaveCredential"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Owner-bound secret reference",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CloudflareResult"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/cloudflare/{action}": {
+      "post": {
+        "tags": [
+          "cloudflare"
+        ],
+        "operationId": "execute",
+        "parameters": [
+          {
+            "name": "action",
+            "in": "path",
+            "description": "audit, scoped-token, relays, provision, import, update, teardown, observe, rotate, revoke",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CloudflareRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Secret-free management result",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CloudflareResult"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Management unavailable"
+          }
+        }
+      }
+    },
     "/api/v1/commands/apply-layout": {
       "post": {
         "tags": [
@@ -4849,6 +4923,145 @@
         }
       }
     },
+    "/api/v1/preview/inputs/{id}/moq": {
+      "post": {
+        "tags": [
+          "preview"
+        ],
+        "operationId": "input_open",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "201": {
+            "description": "MoQ lease result",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MoqLease"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Forbidden",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "415": {
+            "description": "Unsupported codec",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Unavailable or capacity",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/preview/inputs/{id}/moq/{lease_id}": {
+      "delete": {
+        "tags": [
+          "preview"
+        ],
+        "operationId": "input_close",
+        "parameters": [
+          {
+            "name": "generation",
+            "in": "query",
+            "description": "Exact admitted generation",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "format": "int64",
+              "minimum": 0
+            }
+          },
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "lease_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "MoQ lease result",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MoqRevoked"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Forbidden",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Unknown lease",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Generation mismatch",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/v1/preview/inputs/{id}/whep": {
       "post": {
         "tags": [
@@ -5002,6 +5215,145 @@
         }
       }
     },
+    "/api/v1/preview/outputs/{id}/moq": {
+      "post": {
+        "tags": [
+          "preview"
+        ],
+        "operationId": "output_open",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "201": {
+            "description": "MoQ lease result",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MoqLease"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Forbidden",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "415": {
+            "description": "Unsupported codec",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Unavailable or capacity",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/preview/outputs/{id}/moq/{lease_id}": {
+      "delete": {
+        "tags": [
+          "preview"
+        ],
+        "operationId": "output_close",
+        "parameters": [
+          {
+            "name": "generation",
+            "in": "query",
+            "description": "Exact admitted generation",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "format": "int64",
+              "minimum": 0
+            }
+          },
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "lease_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "MoQ lease result",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MoqRevoked"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Forbidden",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Unknown lease",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Generation mismatch",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/v1/preview/outputs/{id}/whep": {
       "post": {
         "tags": [
@@ -5144,6 +5496,127 @@
           },
           "404": {
             "description": "No such live focus session.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/preview/program/moq": {
+      "post": {
+        "tags": [
+          "preview"
+        ],
+        "operationId": "program_open",
+        "responses": {
+          "201": {
+            "description": "MoQ lease result",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MoqLease"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Forbidden",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "415": {
+            "description": "Unsupported codec",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Unavailable or capacity",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/preview/program/moq/{lease_id}": {
+      "delete": {
+        "tags": [
+          "preview"
+        ],
+        "operationId": "program_close",
+        "parameters": [
+          {
+            "name": "generation",
+            "in": "query",
+            "description": "Exact admitted generation",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "format": "int64",
+              "minimum": 0
+            }
+          },
+          {
+            "name": "lease_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "MoQ lease result",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MoqRevoked"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Forbidden",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Unknown lease",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Generation mismatch",
             "content": {
               "application/json": {
                 "schema": {
@@ -9948,6 +10421,69 @@
           "dual"
         ]
       },
+      "CloudflareRequest": {
+        "type": "object",
+        "required": [
+          "account_id",
+          "secret_ref"
+        ],
+        "properties": {
+          "account_id": {
+            "type": "string"
+          },
+          "auth_domain": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "mode": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "auto creates a missing managed relay on reconcile; manual only observes."
+          },
+          "name": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "permission_group_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "relay_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "secret_ref": {
+            "type": "string"
+          },
+          "token_jti": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        }
+      },
+      "CloudflareResult": {
+        "type": "object",
+        "required": [
+          "data"
+        ],
+        "properties": {
+          "data": {
+            "description": "Secret-free result. Token values must be persisted before this is returned."
+          }
+        }
+      },
       "ColorOverrideDoc": {
         "type": "object",
         "description": "`OpenAPI` mirror of `multiview_config::ColorOverride` (four color axes).",
@@ -11642,6 +12178,157 @@
         },
         "additionalProperties": false
       },
+      "MoqAudio": {
+        "type": "object",
+        "description": "Independent audio decoder configuration.",
+        "required": [
+          "track",
+          "codec",
+          "sample_rate",
+          "number_of_channels"
+        ],
+        "properties": {
+          "codec": {
+            "type": "string",
+            "description": "WebCodecs codec identifier."
+          },
+          "description": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Base64 decoder initialization bytes, when required."
+          },
+          "number_of_channels": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Decoded channel count.",
+            "minimum": 0
+          },
+          "sample_rate": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Audio samples per second.",
+            "minimum": 0
+          },
+          "track": {
+            "type": "string",
+            "description": "Stable audio track identifier."
+          }
+        }
+      },
+      "MoqLease": {
+        "type": "object",
+        "description": "Secret-bearing admission response. Deliberately does not implement Debug.",
+        "required": [
+          "lease_id",
+          "generation",
+          "expires_at",
+          "url",
+          "broadcast",
+          "protocol",
+          "video",
+          "audio"
+        ],
+        "properties": {
+          "audio": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/MoqAudio"
+            },
+            "description": "Independent audio decoder configurations."
+          },
+          "broadcast": {
+            "type": "string",
+            "description": "Authorized broadcast namespace."
+          },
+          "expires_at": {
+            "type": "string",
+            "description": "Server-enforced expiry in RFC3339 format."
+          },
+          "generation": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Immutable binding generation.",
+            "minimum": 0
+          },
+          "lease_id": {
+            "type": "string",
+            "description": "Unique subscription identifier."
+          },
+          "protocol": {
+            "type": "string",
+            "description": "Explicit negotiated protocol identifier."
+          },
+          "url": {
+            "type": "string",
+            "description": "Short-lived authorized transport URL; never log."
+          },
+          "video": {
+            "$ref": "#/components/schemas/MoqVideo",
+            "description": "Video decoder configuration."
+          }
+        }
+      },
+      "MoqRevoked": {
+        "type": "object",
+        "description": "Acknowledges a synchronous stop-enqueue fence, not transport shutdown.",
+        "required": [
+          "lease_id",
+          "generation",
+          "revoked"
+        ],
+        "properties": {
+          "generation": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Immutable binding generation.",
+            "minimum": 0
+          },
+          "lease_id": {
+            "type": "string",
+            "description": "Unique subscription identifier."
+          },
+          "revoked": {
+            "type": "boolean",
+            "description": "True only after the enqueue fence completes."
+          }
+        }
+      },
+      "MoqVideo": {
+        "type": "object",
+        "description": "Decoder configuration; description is base64 decoder initialization data.",
+        "required": [
+          "codec",
+          "coded_width",
+          "coded_height"
+        ],
+        "properties": {
+          "codec": {
+            "type": "string",
+            "description": "WebCodecs codec identifier."
+          },
+          "coded_height": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Encoded height in pixels.",
+            "minimum": 0
+          },
+          "coded_width": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Encoded width in pixels.",
+            "minimum": 0
+          },
+          "description": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Base64 decoder initialization bytes, when required."
+          }
+        }
+      },
       "NdiAttribution": {
         "type": "object",
         "description": "The mandatory NDI attribution (AGENTS.md §G) — present iff the `ndi` feature\nis compiled.",
@@ -12719,6 +13406,7 @@
         "description": "The `GET /api/v1/preview/capabilities` response (ADR-P006 move 6): what preview\ntransports this build can serve, so the SPA picks WHEP vs the JPEG ladder\n(ADR-W020) **before** issuing an offer.",
         "required": [
           "webrtc",
+          "moq",
           "scopes",
           "fallback"
         ],
@@ -12726,6 +13414,10 @@
           "fallback": {
             "type": "string",
             "description": "The always-available fallback transport literal: `\"jpeg\"` (the one\nfallback literal everywhere — ADR-P006 move 6)."
+          },
+          "moq": {
+            "type": "boolean",
+            "description": "True only when an authorized MoQ transport provider is ready."
           },
           "scopes": {
             "$ref": "#/components/schemas/ScopeCapabilities",
@@ -13644,6 +14336,39 @@
               "null"
             ],
             "description": "The promoted device's display name (defaults to the session's name)."
+          }
+        }
+      },
+      "SaveCredential": {
+        "type": "object",
+        "required": [
+          "account_id",
+          "kind"
+        ],
+        "properties": {
+          "account_id": {
+            "type": "string"
+          },
+          "email": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "key": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "kind": {
+            "type": "string"
+          },
+          "token": {
+            "type": [
+              "string",
+              "null"
+            ]
           }
         }
       },

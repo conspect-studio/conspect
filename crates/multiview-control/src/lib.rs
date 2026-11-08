@@ -60,6 +60,8 @@ pub mod layout_projection;
 /// request-concurrency + rate middleware backing the control-plane `DoS` floor.
 pub(crate) mod limits;
 pub mod live_apply;
+pub mod moq;
+pub mod cloudflare_management;
 pub mod nmos;
 pub mod notify;
 pub mod pending_actions;

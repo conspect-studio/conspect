@@ -732,6 +732,8 @@ pub struct AppState {
     /// a focus session is a best-effort preview consumer that can never
     /// back-pressure the engine.
     pub whep: crate::preview::SharedWhep,
+    /// Finite, authorized MoQ subscriptions; unavailable until a provider is wired.
+    pub moq: Arc<crate::moq::MoqRegistry>,
     /// The WHIP ingest transport seam (RFC 9725 WebRTC contribution sources).
     /// The default ([`NoWhip`](crate::whip::NoWhip)) refuses every publish with
     /// an honest `503`; the binary swaps in a `multiview-webrtc`-backed provider.
@@ -992,6 +994,7 @@ impl AppState {
             preview: crate::preview::no_preview(),
             source_events: None,
             whep: crate::preview::no_whep(),
+            moq: Arc::new(crate::moq::MoqRegistry::default()),
             whip: crate::whip::no_whip(),
             whep_output: crate::whep_output::no_whep_output(),
             // Secure default: authentication is REQUIRED. An operator opts out

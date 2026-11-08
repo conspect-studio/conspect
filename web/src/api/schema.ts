@@ -251,6 +251,38 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/cloudflare/credentials": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post: operations["save"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/cloudflare/{action}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post: operations["execute"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/commands/apply-layout": {
         parameters: {
             query?: never;
@@ -1373,6 +1405,38 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/preview/inputs/{id}/moq": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post: operations["input_open"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/preview/inputs/{id}/moq/{lease_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post?: never;
+        delete: operations["input_close"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/preview/inputs/{id}/whep": {
         parameters: {
             query?: never;
@@ -1413,6 +1477,38 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/preview/outputs/{id}/moq": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post: operations["output_open"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/preview/outputs/{id}/moq/{lease_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post?: never;
+        delete: operations["output_close"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/preview/outputs/{id}/whep": {
         parameters: {
             query?: never;
@@ -1448,6 +1544,38 @@ export interface paths {
          *     focus session (role: write).
          */
         delete: operations["output_whep_close"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/preview/program/moq": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post: operations["program_open"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/preview/program/moq/{lease_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post?: never;
+        delete: operations["program_close"];
         options?: never;
         head?: never;
         patch?: never;
@@ -2973,6 +3101,21 @@ export interface components {
          * @enum {string}
          */
         ClockFaceDoc: "analog" | "digital" | "dual";
+        CloudflareRequest: {
+            account_id: string;
+            auth_domain?: string | null;
+            /** @description auto creates a missing managed relay on reconcile; manual only observes. */
+            mode?: string | null;
+            name?: string | null;
+            permission_group_id?: string | null;
+            relay_id?: string | null;
+            secret_ref: string;
+            token_jti?: string | null;
+        };
+        CloudflareResult: {
+            /** @description Secret-free result. Token values must be persisted before this is returned. */
+            data: unknown;
+        };
         /** @description `OpenAPI` mirror of `multiview_config::ColorOverride` (four color axes). */
         ColorOverrideDoc: {
             /** @description Matrix axis. */
@@ -3962,6 +4105,76 @@ export interface components {
              */
             via?: string | null;
         };
+        /** @description Independent audio decoder configuration. */
+        MoqAudio: {
+            /** @description WebCodecs codec identifier. */
+            codec: string;
+            /** @description Base64 decoder initialization bytes, when required. */
+            description?: string | null;
+            /**
+             * Format: int32
+             * @description Decoded channel count.
+             */
+            number_of_channels: number;
+            /**
+             * Format: int32
+             * @description Audio samples per second.
+             */
+            sample_rate: number;
+            /** @description Stable audio track identifier. */
+            track: string;
+        };
+        /** @description Secret-bearing admission response. Deliberately does not implement Debug. */
+        MoqLease: {
+            /** @description Independent audio decoder configurations. */
+            audio: components["schemas"]["MoqAudio"][];
+            /** @description Authorized broadcast namespace. */
+            broadcast: string;
+            /** @description Server-enforced expiry in RFC3339 format. */
+            expires_at: string;
+            /**
+             * Format: int64
+             * @description Immutable binding generation.
+             */
+            generation: number;
+            /** @description Unique subscription identifier. */
+            lease_id: string;
+            /** @description Explicit negotiated protocol identifier. */
+            protocol: string;
+            /** @description Short-lived authorized transport URL; never log. */
+            url: string;
+            /** @description Video decoder configuration. */
+            video: components["schemas"]["MoqVideo"];
+        };
+        /** @description Acknowledges a synchronous stop-enqueue fence, not transport shutdown. */
+        MoqRevoked: {
+            /**
+             * Format: int64
+             * @description Immutable binding generation.
+             */
+            generation: number;
+            /** @description Unique subscription identifier. */
+            lease_id: string;
+            /** @description True only after the enqueue fence completes. */
+            revoked: boolean;
+        };
+        /** @description Decoder configuration; description is base64 decoder initialization data. */
+        MoqVideo: {
+            /** @description WebCodecs codec identifier. */
+            codec: string;
+            /**
+             * Format: int32
+             * @description Encoded height in pixels.
+             */
+            coded_height: number;
+            /**
+             * Format: int32
+             * @description Encoded width in pixels.
+             */
+            coded_width: number;
+            /** @description Base64 decoder initialization bytes, when required. */
+            description?: string | null;
+        };
         /**
          * @description The mandatory NDI attribution (AGENTS.md §G) — present iff the `ndi` feature
          *     is compiled.
@@ -4326,6 +4539,8 @@ export interface components {
              *     fallback literal everywhere — ADR-P006 move 6).
              */
             fallback: string;
+            /** @description True only when an authorized MoQ transport provider is ready. */
+            moq: boolean;
             /** @description Per-scope WHEP availability + the program fidelity label. */
             scopes: components["schemas"]["ScopeCapabilities"];
             /**
@@ -4816,6 +5031,13 @@ export interface components {
             device_id: string;
             /** @description The promoted device's display name (defaults to the session's name). */
             display_name?: string | null;
+        };
+        SaveCredential: {
+            account_id: string;
+            email?: string | null;
+            key?: string | null;
+            kind: string;
+            token?: string | null;
         };
         /**
          * @description The `202 Accepted` body for a scan: the operation id correlating the scan and
@@ -6566,6 +6788,64 @@ export interface operations {
                 content: {
                     "application/json": components["schemas"]["Problem"];
                 };
+            };
+        };
+    };
+    save: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["SaveCredential"];
+            };
+        };
+        responses: {
+            /** @description Owner-bound secret reference */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["CloudflareResult"];
+                };
+            };
+        };
+    };
+    execute: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description audit, scoped-token, relays, provision, import, update, teardown, observe, rotate, revoke */
+                action: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["CloudflareRequest"];
+            };
+        };
+        responses: {
+            /** @description Secret-free management result */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["CloudflareResult"];
+                };
+            };
+            /** @description Management unavailable */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
             };
         };
     };
@@ -9734,6 +10014,108 @@ export interface operations {
             };
         };
     };
+    input_open: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description MoQ lease result */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MoqLease"];
+                };
+            };
+            /** @description Forbidden */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Unsupported codec */
+            415: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Unavailable or capacity */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
+    input_close: {
+        parameters: {
+            query: {
+                /** @description Exact admitted generation */
+                generation: number;
+            };
+            header?: never;
+            path: {
+                id: string;
+                lease_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description MoQ lease result */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MoqRevoked"];
+                };
+            };
+            /** @description Forbidden */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Unknown lease */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Generation mismatch */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
     input_whep_open: {
         parameters: {
             query?: never;
@@ -9857,6 +10239,108 @@ export interface operations {
             };
         };
     };
+    output_open: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description MoQ lease result */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MoqLease"];
+                };
+            };
+            /** @description Forbidden */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Unsupported codec */
+            415: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Unavailable or capacity */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
+    output_close: {
+        parameters: {
+            query: {
+                /** @description Exact admitted generation */
+                generation: number;
+            };
+            header?: never;
+            path: {
+                id: string;
+                lease_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description MoQ lease result */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MoqRevoked"];
+                };
+            };
+            /** @description Forbidden */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Unknown lease */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Generation mismatch */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
     output_whep_open: {
         parameters: {
             query?: never;
@@ -9971,6 +10455,105 @@ export interface operations {
             };
             /** @description No such live focus session. */
             404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
+    program_open: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description MoQ lease result */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MoqLease"];
+                };
+            };
+            /** @description Forbidden */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Unsupported codec */
+            415: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Unavailable or capacity */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
+    program_close: {
+        parameters: {
+            query: {
+                /** @description Exact admitted generation */
+                generation: number;
+            };
+            header?: never;
+            path: {
+                lease_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description MoQ lease result */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MoqRevoked"];
+                };
+            };
+            /** @description Forbidden */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Unknown lease */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Generation mismatch */
+            409: {
                 headers: {
                     [name: string]: unknown;
                 };
