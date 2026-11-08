@@ -267,7 +267,17 @@ impl Client {
             if count != page.len() || count > 100 || total < count {
                 return Err(Error::Response);
             }
+            // https://developers.cloudflare.com/api/resources/moq/subresources/relays/methods/list/index.md
+            // total is remaining after cursor filtering, not the original account total.
+            // A strict timestamp cursor cannot disambiguate ties at a page boundary.
             let next = page.last().map(|r| r.created.clone());
+            if count < total
+                && page
+                    .windows(2)
+                    .any(|pair| pair[0].created == pair[1].created)
+            {
+                return Err(Error::Response);
+            }
             for item in page {
                 if !seen.insert(item.uid.clone()) {
                     return Err(Error::Response);
@@ -480,6 +490,40 @@ mod tests {
         assert!(text.contains(r#"{"name":"demo"}"#));
         assert!(!text.contains("config"));
     }
+    #[tokio::test]
+    async fn relay_list_walks_two_abbreviated_pages() {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("[::1]:0").unwrap();
+        let origin = format!("http://{}", listener.local_addr().unwrap());
+        let server = std::thread::spawn(move || {
+            for (index, id, created, total) in [
+                (0, "new", "2026-11-08T10:00:00Z", 2),
+                (1, "old", "2026-11-07T10:00:00Z", 1),
+            ] {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut bytes = [0; 4096];
+                let n = stream.read(&mut bytes).unwrap();
+                let request = String::from_utf8_lossy(&bytes[..n]);
+                if index == 1 {
+                    assert!(request.contains("created_before=2026-11-08T10%3A00%3A00Z"));
+                }
+                let body=serde_json::json!({"success":true,"result":[{"uid":id,"name":id,"created":created}],"result_info":{"count":1,"total":total}}).to_string();
+                write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                )
+                .unwrap();
+            }
+        });
+        let relays = client(origin).await.list().await.unwrap();
+        server.join().unwrap();
+        assert_eq!(
+            relays.iter().map(|r| r.uid.as_str()).collect::<Vec<_>>(),
+            vec!["new", "old"]
+        );
+    }
     fn origin_server(body: &'static str) -> String {
         use std::io::{Read, Write};
         let listener = std::net::TcpListener::bind("[::1]:0").unwrap();
@@ -510,9 +554,13 @@ mod tests {
     #[tokio::test]
     async fn documented_list_shape_and_create_secret_roundtrip() {
         let list_body = r#"{"success":true,"result":[{"created":"2019-12-27T18:11:19.117Z","modified":"2019-12-27T18:11:19.117Z","name":"name","uid":"a1b2c3d4e5f67890a1b2c3d4e5f67890"}],"result_info":{"count":1,"total":1}}"#;
-        let listed=client(origin_server(list_body)).await.list().await.expect("documented abbreviated list succeeds");
-        assert_eq!(listed.len(),1);
-        assert_eq!(listed[0].uid,"a1b2c3d4e5f67890a1b2c3d4e5f67890");
+        let listed = client(origin_server(list_body))
+            .await
+            .list()
+            .await
+            .expect("documented abbreviated list succeeds");
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].uid, "a1b2c3d4e5f67890a1b2c3d4e5f67890");
         let create_body = r#"{"success":true,"result":{"uid":"relayuid","name":"demo","config":{"upstreams":{"enabled":false,"upstreams":[]}},"issuers":[{"type":"cloudflare_jwt","issuer":"cloudflare","cloudflare_tokens":[{"jti":"abc","operations":["subscribe"],"expires":"2030-01-01T00:00:00Z","secret":"ONCE-SECRET-JWT"}]}]}}"#;
         let relay = client(origin_server(create_body))
             .await

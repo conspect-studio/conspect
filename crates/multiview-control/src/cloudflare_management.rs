@@ -229,6 +229,9 @@ impl ManagedCloudflare {
             }
             state.records.insert(key.clone(), observed);
             self.persist(&state)?;
+            if state.pending.contains_key(&key) {
+                return Err("remote missing: explicit repair required");
+            }
         }
         let action = if action == "reconcile" {
             if policy.as_ref().is_some_and(|p| p.mode == "auto")
@@ -311,6 +314,20 @@ impl ManagedCloudflare {
                 .is_none_or(|records| !records.iter().any(|record| record.relay.uid == remote.uid))
             {
                 return Err("relay must be adopted before acknowledgement");
+            }
+            if let Some(records) = state.records.get_mut(&key) {
+                for record in records.iter_mut() {
+                    if record.relay.uid == remote.uid {
+                        record.relay = remote.clone();
+                        record.health = multiview_cloudflare::lifecycle::Health::Reachable;
+                    }
+                }
+                if records.iter().any(|record| {
+                    record.health == multiview_cloudflare::lifecycle::Health::Unavailable
+                }) {
+                    self.persist(&state)?;
+                    return Err("other resources still unavailable");
+                }
             }
             state.pending.remove(&key);
             self.persist(&state)?;
