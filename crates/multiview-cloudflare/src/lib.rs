@@ -1,10 +1,15 @@
 //! Cloudflare management-plane client. Never call from an output clock or media task.
 //! All calls have deadlines; mutations are never automatically retried.
 #![forbid(unsafe_code)]
+#![allow(
+    clippy::missing_errors_doc,
+    clippy::must_use_candidate,
+    clippy::doc_markdown
+)]
 use serde::{Deserialize, Serialize};
 use std::{fmt, time::Duration};
 
-#[derive(Clone)]
+#[derive(Clone, zeroize::Zeroize, zeroize::ZeroizeOnDrop)]
 pub enum Credential {
     Bearer { token: String },
     GlobalKey { email: String, key: String },
@@ -14,10 +19,11 @@ impl fmt::Debug for Credential {
         f.write_str("Credential([REDACTED])")
     }
 }
-#[derive(Clone, Deserialize)]
+#[derive(Clone, Deserialize, zeroize::Zeroize, zeroize::ZeroizeOnDrop)]
 #[serde(transparent)]
 pub struct Secret(String);
 impl Secret {
+    #[must_use]
     pub fn expose(&self) -> &str {
         &self.0
     }
@@ -49,7 +55,9 @@ pub struct RelayConfig {
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Upstreams {
+    #[serde(default)]
     pub enabled: bool,
+    #[serde(default)]
     pub upstreams: Vec<Upstream>,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -60,11 +68,15 @@ pub struct Upstream {
 pub struct Relay {
     pub uid: String,
     pub name: String,
+    #[serde(default, deserialize_with = "nullable_config")]
     pub config: RelayConfig,
     #[serde(default)]
     pub status: Option<String>,
     #[serde(default, skip_serializing)]
     pub issuers: Vec<Issuer>,
+}
+fn nullable_config<'de, D: serde::Deserializer<'de>>(d: D) -> Result<RelayConfig, D::Error> {
+    Ok(Option::<RelayConfig>::deserialize(d)?.unwrap_or_default())
 }
 #[derive(Debug, Clone, Deserialize)]
 pub struct Issuer {
@@ -133,7 +145,9 @@ fn valid_id(s: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
 }
 impl Client {
-    /// Resolve credentials from the owner's secret_ref vault before constructing this client.
+    /// Resolve credentials from the owner's `secret_ref` vault before constructing this client.
+    /// # Errors
+    /// Returns a sanitized error for invalid input, ownership conflicts, or API failure.
     pub fn new(account: String, credential: Credential) -> Result<Self, Error> {
         if !valid_id(&account) {
             return Err(Error::Invalid);
@@ -219,18 +233,24 @@ impl Client {
         decode(&bytes, status)?;
         serde_json::from_slice(&bytes).map_err(|_| Error::Response)
     }
+    /// # Errors
+    /// Returns a sanitized error for invalid input, ownership conflicts, or API failure.
     pub async fn list(&self) -> Result<Vec<Relay>, Error> {
         parse(
             self.call(reqwest::Method::GET, self.url(None, None, false)?, None)
                 .await?,
         )
     }
+    /// # Errors
+    /// Returns a sanitized error for invalid input, ownership conflicts, or API failure.
     pub async fn get(&self, id: &str) -> Result<Relay, Error> {
         parse(
             self.call(reqwest::Method::GET, self.url(Some(id), None, false)?, None)
                 .await?,
         )
     }
+    /// # Errors
+    /// Returns a sanitized error for invalid input, ownership conflicts, or API failure.
     pub async fn create(&self, name: &str) -> Result<Relay, Error> {
         if name.trim().is_empty() {
             return Err(Error::Invalid);
@@ -244,6 +264,8 @@ impl Client {
             .await?,
         )
     }
+    /// # Errors
+    /// Returns a sanitized error for invalid input, ownership conflicts, or API failure.
     pub async fn update(&self, id: &str, update: &RelayUpdate) -> Result<Relay, Error> {
         if update.name.as_ref().is_some_and(|s| s.trim().is_empty()) {
             return Err(Error::Invalid);
@@ -257,6 +279,8 @@ impl Client {
             .await?,
         )
     }
+    /// # Errors
+    /// Returns a sanitized error for invalid input, ownership conflicts, or API failure.
     pub async fn delete(&self, id: &str) -> Result<(), Error> {
         self.call(
             reqwest::Method::DELETE,
@@ -266,12 +290,16 @@ impl Client {
         .await?;
         Ok(())
     }
+    /// # Errors
+    /// Returns a sanitized error for invalid input, ownership conflicts, or API failure.
     pub async fn tokens(&self, id: &str) -> Result<Vec<Token>, Error> {
         token_result(
             self.call(reqwest::Method::GET, self.url(Some(id), None, true)?, None)
                 .await?,
         )
     }
+    /// # Errors
+    /// Returns a sanitized error for invalid input, ownership conflicts, or API failure.
     pub async fn create_token(
         &self,
         id: &str,
@@ -289,6 +317,8 @@ impl Client {
             .await?,
         )
     }
+    /// # Errors
+    /// Returns a sanitized error for invalid input, ownership conflicts, or API failure.
     pub async fn revoke_token(&self, id: &str, jti: &str) -> Result<(), Error> {
         self.call(
             reqwest::Method::DELETE,
@@ -324,6 +354,17 @@ pub mod lifecycle;
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn live_cloudflare_null_config_is_accepted() {
+        let relay: Relay =
+            parse(serde_json::json!({"uid":"fixture","name":"disposable","config":null})).unwrap();
+        assert!(relay.config.upstreams.is_none());
+        let relay: Relay = parse(
+            serde_json::json!({"uid":"fixture","name":"disposable","config":{"upstreams":{}}}),
+        )
+        .unwrap();
+        assert!(!relay.config.upstreams.unwrap().enabled);
+    }
     #[test]
     fn secrets_do_not_serialize_or_debug() {
         let t: Token = parse(serde_json::json!({"jti":"id","operations":["subscribe"],"expires":"later","secret":"sensitive"})).unwrap();
@@ -388,5 +429,97 @@ mod tests {
         let text = server.join().unwrap();
         assert!(text.contains(r#"{"name":"demo"}"#));
         assert!(!text.contains("config"));
+    }
+    fn origin_server(body: &'static str) -> String {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("[::1]:0").unwrap();
+        let origin = format!("http://{}", listener.local_addr().unwrap());
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(3)))
+                .unwrap();
+            let mut buf = [0u8; 4096];
+            let _ = stream.read(&mut buf);
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            )
+            .unwrap();
+        });
+        origin
+    }
+    async fn client(origin: String) -> Client {
+        let mut c = Client::new(
+            "account".into(),
+            Credential::Bearer {
+                token: "t".into(),
+            },
+        )
+        .unwrap();
+        c.test_origin = Some(origin);
+        c
+    }
+    #[tokio::test]
+    async fn documented_list_shape_and_create_secret_roundtrip() {
+        let list_body = r#"{"success":true,"result":[{"created":"2019-12-27T18:11:19.117Z","modified":"2019-12-27T18:11:19.117Z","name":"name","uid":"a1b2c3d4e5f67890a1b2c3d4e5f67890"}],"result_info":{"count":1,"total":1}}"#;
+        match client(origin_server(list_body)).await.list().await {
+            Ok(v) => panic!("LIST_OK count={}", v.len()),
+            Err(e) => eprintln!("LIST_ERR {e:?}"),
+        }
+        let create_body = r#"{"success":true,"result":{"uid":"relayuid","name":"demo","config":{"upstreams":{"enabled":false,"upstreams":[]}},"issuers":[{"type":"cloudflare_jwt","issuer":"cloudflare","cloudflare_tokens":[{"jti":"abc","operations":["subscribe"],"expires":"2030-01-01T00:00:00Z","secret":"ONCE-SECRET-JWT"}]}]}}"#;
+        let relay = client(origin_server(create_body))
+            .await
+            .create("demo")
+            .await
+            .expect("create");
+        let dumped = serde_json::to_string(&relay).unwrap();
+        eprintln!(
+            "CREATE secrets_in_memory={} serialized_contains_secret={} dumped={dumped}",
+            relay
+                .issuers
+                .iter()
+                .flat_map(|i| i.cloudflare_tokens.iter())
+                .any(|t| t.secret.is_some()),
+            dumped.contains("ONCE-SECRET-JWT")
+        );
+        let get_body = r#"{"success":true,"result":{"config":{"upstreams":{"enabled":true,"upstreams":[{"url":"https://example.com"}]}},"created":"2019-12-27T18:11:19.117Z","modified":"2019-12-27T18:11:19.117Z","name":"Production","uid":"a1b2c3d4e5f67890a1b2c3d4e5f67890","status":"connected"}}"#;
+        match client(origin_server(get_body)).await.get("relayuid").await {
+            Ok(r) => eprintln!("GET_OK status={:?}", r.status),
+            Err(e) => eprintln!("GET_ERR {e:?}"),
+        }
+        let tok_body = r#"{"success":true,"result":{"issuers":[{"type":"cloudflare_jwt","cloudflare_tokens":[{"jti":"j1","operations":["subscribe"],"expires":"2030-01-01T00:00:00Z","secret":"ROTATE-SECRET"}]}]}}"#;
+        let tokens = client(origin_server(tok_body))
+            .await
+            .create_token(
+                "relayuid",
+                &TokenRequest {
+                    operations: vec![Operation::Subscribe],
+                    expires: None,
+                    label: None,
+                },
+            )
+            .await
+            .expect("token");
+        let dumped = serde_json::to_string(&tokens).unwrap();
+        eprintln!(
+            "TOKEN secret_in_memory={} serialized_contains={}",
+            tokens.iter().any(|t| t.secret.is_some()),
+            dumped.contains("ROTATE-SECRET")
+        );
+        let audit_body = r#"{"success":true,"result":[{"id":"tok","name":"n","status":"active","policies":[{"resources":{"com.cloudflare.api.account.other":"*"}}],"value":"SHOULD-NOT-LEAK"}],"result_info":{"page":1,"total_count":1}}"#;
+        let audit = client(origin_server(audit_body))
+            .await
+            .audit_user_tokens()
+            .await
+            .expect("audit");
+        let dumped = serde_json::to_string(&audit).unwrap();
+        eprintln!(
+            "AUDIT serialized_contains_value={} dumped={dumped}",
+            dumped.contains("SHOULD-NOT-LEAK")
+        );
+        panic!("probe-complete");
     }
 }

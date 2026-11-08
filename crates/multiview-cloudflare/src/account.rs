@@ -32,6 +32,8 @@ pub struct PermissionGroup {
 impl Client {
     /// Hard cap bounds both memory and management traffic. Incomplete audits never
     /// claim capacity or suitability. Existing token secrets cannot be recovered.
+    /// # Errors
+    /// Returns a sanitized error for invalid input, ownership conflicts, or API failure.
     pub async fn audit_user_tokens(&self) -> Result<Audit, Error> {
         let mut tokens = Vec::new();
         for page in 1..=20 {
@@ -48,7 +50,7 @@ impl Client {
             if info.page != page || count > 50 {
                 return Err(Error::Response);
             }
-            if tokens.len() >= info.total_count as usize {
+            if tokens.len() >= usize::try_from(info.total_count).map_err(|_| Error::Response)? {
                 return Ok(Audit {
                     tokens,
                     all_pages_loaded: true,
@@ -63,6 +65,8 @@ impl Client {
             all_pages_loaded: false,
         })
     }
+    /// # Errors
+    /// Returns a sanitized error for invalid input, ownership conflicts, or API failure.
     pub async fn permission_groups(&self) -> Result<Vec<PermissionGroup>, Error> {
         parse(
             self.call(
@@ -75,12 +79,18 @@ impl Client {
     }
     /// Explicit user choice only. Re-fetch live permission metadata and constrain
     /// resources to this account. Never accept arbitrary user-supplied policies.
+    /// # Errors
+    /// Returns a sanitized error for invalid input, ownership conflicts, or API failure.
     pub async fn create_scoped_token(
         &self,
         name: &str,
         permission_id: &str,
     ) -> Result<UserToken, Error> {
         if name.is_empty() || name.len() > 120 {
+            return Err(Error::Invalid);
+        }
+        let audit = self.audit_user_tokens().await?;
+        if !audit.all_pages_loaded || audit.tokens.len() >= 50 {
             return Err(Error::Invalid);
         }
         let groups = self.permission_groups().await?;

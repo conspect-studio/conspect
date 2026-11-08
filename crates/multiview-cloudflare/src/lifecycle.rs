@@ -34,12 +34,17 @@ pub struct Registry {
     quota: usize,
 }
 impl Registry {
+    /// # Errors
+    /// Returns a sanitized error for invalid input, ownership conflicts, or API failure.
+    #[must_use]
     pub fn new(quota: usize) -> Self {
         Self {
             records: BTreeMap::new(),
             quota,
         }
     }
+    /// # Errors
+    /// Returns a sanitized error for invalid input, ownership conflicts, or API failure.
     pub fn restore(quota: usize, records: Vec<Record>) -> Result<Self, Error> {
         let mut registry = Self::new(quota);
         for record in records {
@@ -50,6 +55,8 @@ impl Registry {
     pub fn records(&self) -> impl Iterator<Item = &Record> {
         self.records.values()
     }
+    /// # Errors
+    /// Returns a sanitized error for invalid input, ownership conflicts, or API failure.
     pub fn record(&self, id: &str, domain: &str) -> Result<&Record, Error> {
         self.records
             .get(id)
@@ -67,6 +74,8 @@ impl Registry {
         Ok(())
     }
     /// Manual import verifies existence without changing the Cloudflare resource.
+    /// # Errors
+    /// Returns a sanitized error for invalid input, ownership conflicts, or API failure.
     pub async fn import(&mut self, client: &Client, id: &str, domain: String) -> Result<(), Error> {
         if domain.is_empty() || self.records.contains_key(id) || self.records.len() >= self.quota {
             return Err(Error::Isolation);
@@ -82,6 +91,8 @@ impl Registry {
     }
     /// Explicit product choice only. No scheduler invokes provisioning automatically.
     /// Return auto-created secrets once so the caller can persist them in its vault.
+    /// # Errors
+    /// Returns a sanitized error for invalid input, ownership conflicts, or API failure.
     pub async fn provision(
         &mut self,
         client: &Client,
@@ -106,6 +117,8 @@ impl Registry {
         })?;
         Ok(tokens)
     }
+    /// # Errors
+    /// Returns a sanitized error for invalid input, ownership conflicts, or API failure.
     pub async fn update(
         &mut self,
         client: &Client,
@@ -118,6 +131,8 @@ impl Registry {
         self.records.get_mut(id).ok_or(Error::Isolation)?.relay = relay;
         Ok(())
     }
+    /// # Errors
+    /// Returns a sanitized error for invalid input, ownership conflicts, or API failure.
     pub async fn delete_managed(
         &mut self,
         client: &Client,
@@ -136,6 +151,8 @@ impl Registry {
         Ok(())
     }
     /// Forget imported ownership only; never delete a user's pre-existing relay.
+    /// # Errors
+    /// Returns a sanitized error for invalid input, ownership conflicts, or API failure.
     pub fn detach(&mut self, id: &str, domain: &str) -> Result<(), Error> {
         if self.record(id, domain)?.ownership != Ownership::Imported {
             return Err(Error::Invalid);
@@ -144,8 +161,10 @@ impl Registry {
         Ok(())
     }
     /// Rotation phase one: mint a replacement. The old token remains valid.
-    /// Caller must save the new secret, install it, and persist pending_revoke
-    /// before calling finish_rotation. Repeating this phase is not automatic.
+    /// Caller must save the new secret, install it, and persist `pending_revoke`
+    /// before calling `finish_rotation`. Repeating this phase is not automatic.
+    /// # Errors
+    /// Returns a sanitized error for invalid input, ownership conflicts, or API failure.
     pub async fn begin_rotation(
         &mut self,
         client: &Client,
@@ -164,6 +183,8 @@ impl Registry {
             .pending_revoke = Some(old_jti);
         Ok(tokens)
     }
+    /// # Errors
+    /// Returns a sanitized error for invalid input, ownership conflicts, or API failure.
     pub async fn finish_rotation(
         &mut self,
         client: &Client,
@@ -187,6 +208,8 @@ impl Registry {
     }
     /// One bounded observation, with no create/delete/retry and no media callbacks.
     /// API reachability is not a claim about on-air media health.
+    /// # Errors
+    /// Returns a sanitized error for invalid input, ownership conflicts, or API failure.
     pub async fn observe(
         &mut self,
         client: &Client,

@@ -29,11 +29,14 @@ pub struct ManagedCloudflare {
     vault: Arc<Vault>,
     journal: PathBuf,
     state: Mutex<Snapshot>,
+    reconciler_started: std::sync::atomic::AtomicBool,
 }
 impl ManagedCloudflare {
     /// Start one bounded, low-frequency management task. Busy ticks are dropped.
     /// Dropping the returned handle does not stop it; abort it during shutdown.
     pub fn spawn_reconciler(self: Arc<Self>) -> tokio::task::JoinHandle<()> {
+        self.reconciler_started
+            .store(true, std::sync::atomic::Ordering::Release);
         tokio::spawn(async move {
             let mut timer = tokio::time::interval(std::time::Duration::from_secs(60));
             timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -78,6 +81,8 @@ impl ManagedCloudflare {
     }
     /// Explicit runtime injection from the service's external secret provider.
     /// No environment/default key or op:// pseudo-resolution is implemented.
+    /// # Errors
+    /// Returns an error if the private vault or recovery journal is unavailable.
     pub fn from_master_key(
         private_dir: &std::path::Path,
         master_key: [u8; 32],
@@ -85,6 +90,8 @@ impl ManagedCloudflare {
         let vault = Vault::open(private_dir, master_key).map_err(|_| "vault unavailable")?;
         Self::open(Arc::new(vault), private_dir.join("cloudflare-journal.json"))
     }
+    /// # Errors
+    /// Returns an error when the recovery journal cannot be read or decoded.
     pub fn open(vault: Arc<Vault>, journal: PathBuf) -> Result<Self, &'static str> {
         let state = match std::fs::read(&journal) {
             Ok(bytes) => serde_json::from_slice(&bytes).map_err(|_| "invalid journal")?,
@@ -95,6 +102,7 @@ impl ManagedCloudflare {
             vault,
             journal,
             state: Mutex::new(state),
+            reconciler_started: std::sync::atomic::AtomicBool::new(false),
         })
     }
     fn persist(&self, state: &Snapshot) -> Result<(), &'static str> {
@@ -120,6 +128,7 @@ impl ManagedCloudflare {
             .and_then(|d| d.sync_all())
             .map_err(|_| "journal sync")
     }
+    #[allow(clippy::too_many_lines)] // One serialized journal transaction owns each action.
     async fn run(
         &self,
         owner: &str,
@@ -149,6 +158,11 @@ impl ManagedCloudflare {
             },
         };
         let client = Client::new(r.account_id.clone(), credential).map_err(|_| "account")?;
+        if action == "capabilities" {
+            return Ok(CloudflareResult {
+                data: serde_json::json!({"automatic_reconciliation":self.reconciler_started.load(std::sync::atomic::Ordering::Acquire)}),
+            });
+        }
         if action == "audit" {
             return Ok(CloudflareResult {
                 data: serde_json::to_value(client.audit_user_tokens().await.map_err(|_| "audit")?)
@@ -217,10 +231,11 @@ impl ManagedCloudflare {
         }
         let action = if action == "reconcile" {
             if policy.as_ref().is_some_and(|p| p.mode == "auto")
-                && state
-                    .records
-                    .get(&key)
-                    .is_none_or(|records| records.is_empty())
+                && state.records.get(&key).is_none_or(|records| {
+                    !records
+                        .iter()
+                        .any(|r| r.ownership == multiview_cloudflare::lifecycle::Ownership::Managed)
+                })
             {
                 "provision"
             } else {
@@ -242,7 +257,7 @@ impl ManagedCloudflare {
         }
         if action == "relays" {
             return Ok(CloudflareResult {
-                data: serde_json::json!({"records":state.records.get(&key),"pending":state.pending.get(&key),"token_refs":state.token_refs.get(&key),"mode":policy.as_ref().map(|p|p.mode.as_str()).unwrap_or("manual"),"desired_transport":"moq","effective_transport":"unverified"}),
+                data: serde_json::json!({"records":state.records.get(&key),"pending":state.pending.get(&key),"token_refs":state.token_refs.get(&key),"mode":policy.as_ref().map_or("manual",|p|p.mode.as_str()),"desired_transport":"moq","effective_transport":"unverified"}),
             });
         }
         if action == "recover" {
@@ -334,12 +349,45 @@ impl ManagedCloudflare {
         if action == "rotate" && r.token_jti.is_none() {
             return Err("token");
         }
-        state.pending.insert(key.clone(), action.to_owned());
-        self.persist(&state)?;
+        let valid_id = |s: &str| {
+            !s.is_empty()
+                && s.len() <= 128
+                && s.bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+        };
+        if r.relay_id.as_deref().is_some_and(|id| !valid_id(id))
+            || r.token_jti.as_deref().is_some_and(|id| !valid_id(id))
+        {
+            return Err("invalid id");
+        }
+        if r.name
+            .as_ref()
+            .is_some_and(|s| s.trim().is_empty() || s.len() > 120)
+        {
+            return Err("name");
+        }
+        let domain = r.auth_domain.as_deref().unwrap_or(owner);
+        if domain.is_empty() {
+            return Err("domain");
+        }
         let mut registry =
             Registry::restore(32, state.records.get(&key).cloned().unwrap_or_default())
                 .map_err(|_| "registry")?;
-        let domain = r.auth_domain.as_deref().unwrap_or(owner);
+        if !matches!(action, "import" | "provision" | "scoped-token") {
+            let record = registry
+                .record(r.relay_id.as_deref().ok_or("relay")?, domain)
+                .map_err(|_| "ownership")?;
+            if action == "rotate" && record.pending_revoke.is_some() {
+                return Err("rotation in progress");
+            }
+            if action == "teardown"
+                && record.ownership != multiview_cloudflare::lifecycle::Ownership::Managed
+            {
+                return Err("imported ownership");
+            }
+        }
+        state.pending.insert(key.clone(), action.to_owned());
+        self.persist(&state)?;
         let data = match action {
             "scoped-token" => {
                 let token = client

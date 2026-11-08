@@ -1,4 +1,4 @@
-//! Cloudflare management is separate from MoQ media admission. No engine callbacks.
+//! Cloudflare management is separate from `MoQ` media admission. No engine callbacks.
 #![allow(missing_docs)]
 use crate::{
     auth::{Action, Principal},
@@ -79,6 +79,8 @@ pub struct CloudflareResult {
 /// Provider implementation must use owner-bound vault resolution, durable
 /// write-ahead journal, and bounded admission. No default provider is installed.
 pub trait CloudflareManagement: Send + Sync {
+    /// # Errors
+    /// Returns a sanitized error if credential validation or persistence fails.
     fn save(&self, owner: &str, request: SaveCredential) -> Result<String, &'static str>;
     fn execute<'a>(
         &'a self,
