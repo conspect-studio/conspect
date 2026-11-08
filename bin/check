@@ -12,7 +12,15 @@ APPROVED = (
     '4c6c0613240b094ad32bfe98ed91d07fa8512141',
     'edc6daa12fed4cba5184e053befe5205bc33b095',
     '26dbbfd55b2edf2466e4f5c23b52d5c4dd21c6a6',
+    'fa4389cddeeeec80679fd88bbc5a51f174b43eee',
+    'c6654f1b5b3f7f6c4213b2004bf6020301660590',
 )
+REPAIR_PATH = 'crates/multiview-control/src/moq_provider.rs'
+REPAIR_BLOB = '2db829b472b1ecfa749704118bab85f82e7d253a'
+PRIOR_POLICY_BLOBS = {
+    'bin/check': '385591d8209531f89e736069afefe4bfb9f8515a',
+    'docs/development/moq-local-gate.md': 'cd36798fad0f56a677ff57560cd5fe993ca67256',
+}
 LOG_SHA256 = '594918d1d9dbeb0e559f26bc8ee2d54a4007042e8bff658976a5359ff5720969'
 POLICY_PATHS = {'bin/check', 'docs/development/moq-local-gate.md'}
 ROOT = pathlib.Path(__file__).resolve().parent.parent
@@ -38,16 +46,24 @@ def evidence(sha, status, log, expected_hash=LOG_SHA256):
     require(re.search(r'Doc-tests xtask\s+running 0 tests\s+test result: ok\. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in [^\n]+\s*\Z', text), 'baseline log completion missing')
 
 
+def policy_boundary(parents, changed_paths, repair_blob):
+    require(parents == [APPROVED[-1]], 'unexpected parent(s): obtain a new reviewed gate/budget decision')
+    require(set(changed_paths) == POLICY_PATHS, 'gate amendment contains unexpected changes')
+    require(repair_blob == REPAIR_BLOB, 'provider differs from exact reviewed lint repair')
+
+
 def validate():
     require(not git('status', '--porcelain', '--untracked-files=all'), 'working tree must be clean, including untracked files')
     require(git('rev-list', '--reverse', f'{BASE}..{APPROVED[-1]}').splitlines() == list(APPROVED), 'approved delta ancestry changed')
     subprocess.run(['git', 'merge-base', '--is-ancestor', BASE, 'HEAD'], cwd=ROOT, check=True)
-    # Exactly one policy commit atop the reviewed immutable product tree. No
-    # runtime path exceptions, cherry-picked substitutes, or later edits allowed.
-    require(git('rev-parse', 'HEAD^') == APPROVED[-1], 'unexpected post-baseline changes: obtain a new reviewed gate/budget decision')
-    require(set(git('diff', '--name-only', APPROVED[-1], 'HEAD').splitlines()) == POLICY_PATHS, 'policy commit contains unexpected changes')
-    for path in POLICY_PATHS:
-        require(git('ls-tree', APPROVED[-1], '--', path) == '', 'policy path unexpectedly preexists approved tree')
+    # Exactly one reviewed gate amendment atop the immutable lint repair.
+    # Require a single parent (not a merge) and bind the repaired runtime blob.
+    policy_boundary(git('show', '-s', '--format=%P', 'HEAD').split(),
+                    git('diff', '--name-only', APPROVED[-1], 'HEAD').splitlines(),
+                    git('rev-parse', f'HEAD:{REPAIR_PATH}'))
+    require(git('diff', '--name-only', APPROVED[-2], APPROVED[-1]).splitlines() == [REPAIR_PATH], 'lint repair changes unexpected paths')
+    for path, blob in PRIOR_POLICY_BLOBS.items():
+        require(git('rev-parse', f'{APPROVED[-1]}:{path}') == blob, 'historical gate policy blob mismatch')
     directory = ROOT / 'target/moq-gates'
     try:
         evidence((directory / 'workspace-test.sha').read_text(),
@@ -78,7 +94,20 @@ def self_test():
             print('rejected:', label)
         else:
             raise RuntimeError('negative case accepted: '+label)
-    print('evidence positive and six negative cases passed; no build/test suite executed')
+    policy_boundary([APPROVED[-1]], POLICY_PATHS, REPAIR_BLOB)
+    for label, parents, paths, blob in [
+        ('extra unapproved commit', ['0'*40], POLICY_PATHS, REPAIR_BLOB),
+        ('merge parent', [APPROVED[-1], BASE], POLICY_PATHS, REPAIR_BLOB),
+        ('extra runtime path', [APPROVED[-1]], POLICY_PATHS | {REPAIR_PATH}, REPAIR_BLOB),
+        ('tampered provider blob', [APPROVED[-1]], POLICY_PATHS, '0'*40),
+    ]:
+        try:
+            policy_boundary(parents, paths, blob)
+        except RuntimeError:
+            print('rejected:', label)
+        else:
+            raise RuntimeError('negative policy case accepted: '+label)
+    print('evidence/policy positives and ten negative cases passed; no build/test suite executed')
 
 
 COMMANDS = [

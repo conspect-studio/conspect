@@ -50,13 +50,24 @@ Only this ordered immutable commit chain follows the baseline:
    browser evidence. Existing live recordings remain dated evidence, not a new
    live run. Web lint/build recheck the affected frontend artifacts.
 
-The only following commit may add exactly `bin/check` and this document. Its
-parent must be the last SHA above, both policy paths must be new, and the whole
-working tree must be clean including untracked files. Thus no runtime wildcard,
-unknown commit, modified source, or later policy revision is silently allowed.
-Any further change requires a new reviewed gate and suite-budget decision.
-Independent review binds the gate commit externally; no self-signed approval is
-created. Amendments during initial independent review retain the same parent.
+5. `fa4389cddeeeec80679fd88bbc5a51f174b43eee`: initial independently reviewed
+   proportional gate. Its real wrapper run failed optional-feature Clippy in
+   `moq_provider.rs` (documentation and match-style lints). This was NOT a gate
+   pass; no successful receipt is claimed for that execution.
+6. `c6654f1b5b3f7f6c4213b2004bf6020301660590`: behavior-equivalent, one-file
+   optional-provider lint repair. Owner reports strict optional-feature Clippy
+   and six focused tests passed. The gate still reruns its complete command list.
+
+Only one gate-amendment commit may follow, with exactly the two policy paths
+`bin/check` and this document changed, and a single parent equal to the exact
+repair SHA. Both historical policy blobs are pinned; the provider must equal
+blob `2db829b472b1ecfa749704118bab85f82e7d253a`. The repair itself must change
+only that provider path. The complete baseline-to-repair commit chain is exact,
+not a path wildcard. The whole working tree must be clean including untracked
+files. Extra commits, merge parents, runtime changes or a different provider
+blob fail closed. Further changes require a new reviewed gate/budget decision.
+Independent review binds this gate amendment externally; the script cannot
+self-approve its own changed bytes. Review amendments retain the same parent.
 
 ## Commands and limits
 
@@ -67,7 +78,8 @@ bundle comparison, web lint/build, and probe syntax. Every command actually runs
 and any failure stops the gate. The final HEAD and clean-tree checks run again
 afterward. No full workspace test command runs a third time.
 
-`bin/check --self-test` checks real evidence plus six safe in-memory corruptions;
+`bin/check --self-test` checks real evidence plus six evidence corruptions and
+four policy-boundary failures (extra commit, merge, runtime path, provider blob);
 `--validate-only` checks historical evidence/ancestry/cleanliness without builds.
 Neither is a receipt-generating successful full gate: invoke the normal wrapper
 without these flags only after independent review. The branch still lacks the
