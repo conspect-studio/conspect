@@ -1,6 +1,6 @@
 name: release-plz
 
-# Open/update the Release PR (version bump + changelog) on every push to main.
+# Open/update the Release PR (version bump + changelog) on eligible pushes to main.
 # release-plz reads Conventional Commits since the last release, computes the
 # next version per the pre-1.0 policy in release-plz.toml + cliff.toml, and keeps
 # a "release PR" open. Merging that PR is what tags the release (which then
@@ -13,6 +13,18 @@ name: release-plz
 on:
   push:
     branches: [main]
+    paths:
+      - '**'
+      - '!FEATURES.md'
+      - '!ROADMAP.md'
+      - '!WHY.md'
+      - '!docs/**/*.md'
+      - 'docs/api/**'
+      - 'docs/agents/**'
+      - 'docs/licensing/**'
+      - 'docs/standards/**'
+      - 'docs/**/AGENTS.md'
+      - 'docs/**/CLAUDE.md'
 
 permissions:
   contents: read

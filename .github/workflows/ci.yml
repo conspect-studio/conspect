@@ -3,7 +3,20 @@ name: CI
 on:
   push:
     branches: [main]
+    paths: &run_paths
+      - '**'
+      - '!FEATURES.md'
+      - '!ROADMAP.md'
+      - '!WHY.md'
+      - '!docs/**/*.md'
+      - 'docs/api/**'
+      - 'docs/agents/**'
+      - 'docs/licensing/**'
+      - 'docs/standards/**'
+      - 'docs/**/AGENTS.md'
+      - 'docs/**/CLAUDE.md'
   pull_request:
+    paths: *run_paths
 
 concurrency:
   group: ci-${{ github.ref }}
@@ -36,11 +49,9 @@ jobs:
   # xtask/ deploy/ crates/) → `code = true` → the FULL matrix runs. "When in
   # doubt, run everything" is the default, not the exception.
   #
-  # On `push` to main (no PR base to diff against) we do NOT gate: the heavy jobs
-  # below also key on `github.event_name == 'pull_request'` so a push always runs
-  # the full matrix. This also means that if branch protection is later added,
-  # required checks on a docs-only PR are satisfied by the always-run light jobs,
-  # while every code PR still runs (and reports) the full set unchanged.
+  # Event-level paths omit pure planning/prose changes before Actions queues a run.
+  # For admitted pushes to main, run the full matrix. For admitted PRs, keep
+  # the existing broader job-level classification; see ADR-0046.
   changes:
     name: classify changes
     runs-on: ubuntu-latest
@@ -902,7 +913,7 @@ jobs:
         run: cargo run --locked -p xtask -- check-release-features
 
   # ── always-run light jobs ────────────────────────────────────────────────
-  # These run on EVERY push and PR — including docs-only PRs that skip the heavy
+  # These run on every admitted push and PR — including PRs that skip the heavy
   # matrix above — so a prose-docs PR still gets a real green signal (and stays
   # safe as a required check if branch protection is later added). They are
   # intentionally NOT gated on `changes`.

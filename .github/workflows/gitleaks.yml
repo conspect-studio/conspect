@@ -1,5 +1,20 @@
 name: gitleaks
-on: [pull_request, push]
+on:
+  push:
+    paths: &run_paths
+      - '**'
+      - '!FEATURES.md'
+      - '!ROADMAP.md'
+      - '!WHY.md'
+      - '!docs/**/*.md'
+      - 'docs/api/**'
+      - 'docs/agents/**'
+      - 'docs/licensing/**'
+      - 'docs/standards/**'
+      - 'docs/**/AGENTS.md'
+      - 'docs/**/CLAUDE.md'
+  pull_request:
+    paths: *run_paths
 permissions:
   contents: read
 jobs:

@@ -17,6 +17,18 @@ on:
   push:
     branches: [main]
     tags: ["v*"] # also matches pre-release tags (v1.2.3-rc.1 → RC images)
+    paths:
+      - '**'
+      - '!FEATURES.md'
+      - '!ROADMAP.md'
+      - '!WHY.md'
+      - '!docs/**/*.md'
+      - 'docs/api/**'
+      - 'docs/agents/**'
+      - 'docs/licensing/**'
+      - 'docs/standards/**'
+      - 'docs/**/AGENTS.md'
+      - 'docs/**/CLAUDE.md'
   workflow_dispatch:
 
 concurrency:

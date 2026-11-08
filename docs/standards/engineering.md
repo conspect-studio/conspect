@@ -56,8 +56,8 @@ paths do not show (see the invariant clause above).
   uses to skip the heavy matrix — so the classifier and CI can never disagree. Both fail *upward*:
   an extension nobody allowlisted is code.
 - **Every apply-trigger path is R2 minimum.** `docker.yml` and `release*.yml` publish to GHCR and to
-  the public release feed; `docker.yml` has no `paths:` filter, so **every merge to `main` publishes
-  an image**. `deploy/**` and the publishing workflows carry the blast radius of that publish, not of
+  the public release feed; `docker.yml` can publish an image on any merge to `main`
+  outside the narrow [prose path exclusions](../decisions/ADR-0046.md#event-level-prose-filter). `deploy/**` and the publishing workflows carry the blast radius of that publish, not of
   their own diff.
 - **The data plane is R2.** Its whole product promise is bulletproof output from bad inputs on
   contended hosts; `conventions.md` invariants #1–#10 live in those crates.
