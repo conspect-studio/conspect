@@ -466,6 +466,7 @@ pub(crate) fn submit_accepted_body(
     build: impl FnOnce(OperationId) -> ControlResult<Command>,
 ) -> ControlResult<AcceptedBody> {
     match state.idempotency.reserve(idem.0.as_deref()) {
+        Reservation::Capacity => Err(ControlError::IdempotencyCapacity),
         Reservation::Replay(op) => {
             // A retried request with the same key: return the original id
             // without re-enqueuing the command (and without re-running
@@ -808,6 +809,7 @@ pub(crate) async fn cmd_apply_layout(
     // Reserve the idempotency key and a bounded engine slot before the disk
     // commit. A full bus cannot create an unacknowledged accepted selection.
     let op = match state.idempotency.reserve(idem.0.as_deref()) {
+        Reservation::Capacity => return Err(ControlError::IdempotencyCapacity),
         Reservation::Replay(op) => {
             return Ok((
                 StatusCode::ACCEPTED,
@@ -971,7 +973,7 @@ impl axum::extract::FromRequestParts<AppState> for Principal {
 }
 
 /// Resolve the request's [`Principal`] from its headers (synchronous).
-fn authenticate_principal(
+pub(crate) fn authenticate_principal(
     parts: &axum::http::request::Parts,
     state: &AppState,
 ) -> Result<Principal, ControlError> {
