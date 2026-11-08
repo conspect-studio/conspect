@@ -295,7 +295,7 @@ impl StreamCodecParameters {
     }
 
     /// Copy the opened encoder's exact codec configuration (e.g. avcC/hvcC or
-    /// AAC AudioSpecificConfig), if it supplied one. This copies only the
+    /// AAC `AudioSpecificConfig`), if it supplied one. This copies only the
     /// small codec record, never a coded frame or an encoder instance.
     #[must_use]
     pub fn codec_config_bytes(&self) -> Option<Vec<u8>> {
