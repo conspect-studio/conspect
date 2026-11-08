@@ -367,8 +367,8 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
     use super::{
         next_frame_lower_bound_ns, next_tick_lower_bound_ns, BakedTick, DispatchEvent,
-        DtsWatermark, OfferRejection, RenditionWorker, ReorderBound, VideoEncodeWorker,
-        WatermarkTracker, WORKER_QUEUE_TICKS,
+        OfferRejection, RenditionWorker, ReorderBound, VideoEncodeWorker, WatermarkTracker,
+        WORKER_QUEUE_TICKS,
     };
     use crate::pipeline::PipelineError;
     use multiview_compositor::pipeline::Nv12Image;

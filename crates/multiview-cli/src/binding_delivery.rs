@@ -185,7 +185,6 @@ pub(crate) fn tick_span(cadence: Rational) -> Duration {
 ///
 /// The window assembler (DTS watermarking + which packets belong to which
 /// encoded interval) owns this; delivery owns the queue it is admitted into.
-#[allow(dead_code)] // reason: constructed by the window assembler (rendition_dispatch); delivery owns the admission it feeds.
 pub(crate) struct DeliveryWindow {
     /// Index into the configured output order.
     pub(crate) output_index: usize,
@@ -274,17 +273,21 @@ impl WindowDelivery for BindingDelivery {
         if packets.is_empty() {
             return Ok(());
         }
-        let Some(binding) = self.bindings.get(output_index) else {
+        if !self.bindings.iter().any(|_| true) || self.bindings.get(output_index).is_none() {
             return Err(EmissionError::Admission(OfferError::WrongProgramShape));
-        };
-        if binding.failed {
-            return Err(EmissionError::Admission(OfferError::Closed));
         }
         // The queue's generation is authoritative. A stale assembler generation
         // is not fatal: its own `take_discontinuity` call realigns it, and the
         // window still has to pass the strict-RAP gate.
         let _ = generation;
-        match self.admit(output_index, packets, media_span, now) {
+        match self.try_offer(
+            DeliveryWindow {
+                output_index,
+                packets,
+                media_span,
+            },
+            now,
+        ) {
             Ok(_) => Ok(()),
             Err(rejection) => Err(EmissionError::Admission(match rejection.reason {
                 RejectionReason::InvalidWindow => OfferError::Oversized,
@@ -470,6 +473,43 @@ impl BindingDelivery {
             // generation argument is advisory (the queue is authoritative).
             let _ = self.offer_window(index, 0, packets, media_span, now);
         }
+    }
+
+    /// Atomically admit one assembled window (the assembler-facing entry
+    /// point; [`WindowDelivery::offer_window`] is the same path).
+    ///
+    /// # Errors
+    /// Returns the whole-window rejection: none of its packets were queued.
+    pub(crate) fn try_offer(
+        &mut self,
+        window: DeliveryWindow,
+        now: Instant,
+    ) -> Result<Admission, WindowRejection> {
+        let DeliveryWindow {
+            output_index,
+            packets,
+            media_span,
+        } = window;
+        if packets.is_empty() {
+            return Ok(Admission {
+                output_index,
+                generation: self.generation(output_index),
+            });
+        }
+        if self
+            .bindings
+            .get(output_index)
+            .is_some_and(|binding| binding.failed)
+        {
+            return Err(WindowRejection {
+                output_index,
+                generation: self.generation(output_index),
+                reason: RejectionReason::SinkWedged,
+                packets: packets.len(),
+                bytes: packets.iter().map(EncodedPacket::len).sum(),
+            });
+        }
+        self.admit(output_index, packets, media_span, now)
     }
 
     /// The single admission path for one binding's complete window.
@@ -696,7 +736,7 @@ mod tests {
         HANDOFF_LEASES, PUMP_WEDGE_GRACE,
     };
     use multiview_core::time::Rational;
-    use multiview_ffmpeg::{CodecKind, EncodedPacket, NalFraming, StreamKind};
+    use multiview_ffmpeg::{CodecKind, EncodedPacket, NalFraming};
     use multiview_output::batch::RecoveryGate;
     use std::sync::mpsc::Receiver;
     use std::time::{Duration, Instant};
