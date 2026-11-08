@@ -200,7 +200,20 @@ pub struct SubtitleCrosspoint {
     pub source: StreamRef,
 }
 
-/// One **output** crosspoint: an `output` ← a `program`.
+/// Output rendition tap; a configured preview output must never carry PGM.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OutputBus {
+    /// Post-switcher on-air canvas.
+    #[default]
+    Program,
+    /// Pre-DSK clean feed; same canvas as PGM until DSK exists.
+    Clean,
+    /// Preview canvas of the declared M/E.
+    Preview,
+}
+
+/// One **output** crosspoint: an `output` ← a `program` and bus tap.
 ///
 /// The `program` defaults to [`MAIN_PROGRAM`] (`"main"`) — the single-program
 /// world today; ADR-0030's `ProgramSet` will make multiple programs addressable,
@@ -216,6 +229,13 @@ pub struct OutputCrosspoint {
     /// The program this output carries. Absent ⇒ [`MAIN_PROGRAM`].
     #[serde(default = "main_program")]
     pub program: String,
+    /// The actual canvas this output carries. Defaults to on-air PGM.
+    #[serde(default, skip_serializing_if = "is_program_bus")]
+    pub bus: OutputBus,
+}
+
+fn is_program_bus(bus: &OutputBus) -> bool {
+    *bus == OutputBus::Program
 }
 
 impl OutputCrosspoint {
