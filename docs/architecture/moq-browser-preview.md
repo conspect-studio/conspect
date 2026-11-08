@@ -34,7 +34,9 @@ The transport contract requires:
 - Video codec/profile, initialization bytes, color metadata, dimensions, rational cadence, and rational timestamp timebase.
 - Independent audio track identities and codec/configuration, sample rate, channel layout, and timebase.
 - Shared immutable encoded payloads with PTS, DTS, duration, verified random-access status, and configuration generation.
-- Separate bounded video/audio receivers. Each subscriber has packet-count, byte, and age limits; bounded queues alone do not bound a library's downstream stream buffers.
+- Admission operates on an immutable encoded-time batch/window, not a sequence of independent packet offers that can accept half an audio/video window. `try_offer(window, now)` either retains the entire validated window or rejects it with an explicit discontinuity. Window validation and capacity accounting precede publication. Count, byte, and age limits apply to both the window and the complete subscriber backlog.
+- Transport-side demultiplexing may use separate bounded video/audio receivers only with explicit per-track gap/configuration generations and common binding readiness. A per-track packet acceptance is not atomic audio/video acceptance. Recovery must coordinate the binding epoch; video waits for matching configuration and verified RAP, while audio uses the same epoch and declared timestamp alignment.
+- Retained payload accounting includes shared `Arc` allocations: sharing prevents copies but does not make retained bytes free. Enforce conservative per-subscriber referenced-byte limits and a global retained-allocation budget at the shared-rendition owner. Bounded queues alone do not bound a library's downstream stream buffers.
 - An explicit discontinuity after loss or configuration change. Video resumes only at a verified independently decodable random-access point with matching decoder configuration. The adapter must not forward a partial dependency chain.
 - One RAII lease that owns admission and source demand. Cancellation and timeout release it exactly once off the production clock.
 

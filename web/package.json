@@ -25,6 +25,7 @@
     "@dnd-kit/utilities": "^3.2.2",
     "@lingui/core": "^6.5.0",
     "@lingui/react": "^6.5.0",
+    "@moq/net": "0.4.7",
     "@radix-ui/react-dialog": "^1.1.19",
     "@radix-ui/react-label": "^2.1.11",
     "@radix-ui/react-select": "^2.3.3",
@@ -40,8 +41,8 @@
     "lucide-react": "^1.24.0",
     "minisearch": "^7.2.0",
     "openapi-fetch": "^0.17.0",
-    "react": "^19.0.0",
-    "react-dom": "^19.0.0",
+    "react": "19.3.1",
+    "react-dom": "19.3.1",
     "react-konva": "^19.2.5",
     "react-router-dom": "^7.18.1",
     "tailwind-merge": "^3.6.0"
