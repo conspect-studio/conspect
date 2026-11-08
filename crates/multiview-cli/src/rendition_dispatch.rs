@@ -1089,7 +1089,7 @@ mod tests {
                 BindingPolicy::Bounded,
             ],
             DeliveryLimits::default(),
-            vec![Some(gate);3],
+            vec![Some(gate); 3],
         );
         let mut d = RenditionDispatcher::new(cfg(
             vec![binding(0, 0, 1), binding(1, 0, 1), binding(2, 0, 1)],

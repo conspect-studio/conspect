@@ -441,7 +441,11 @@ mod tests {
         }
 
         fn finish(&mut self) -> Result<Vec<EncodedPacket>, PipelineError> {
-            Ok(self.pending.take().map(|pts| vec![packet(pts)]).unwrap_or_default())
+            Ok(self
+                .pending
+                .take()
+                .map(|pts| vec![packet(pts)])
+                .unwrap_or_default())
         }
     }
 
@@ -631,14 +635,9 @@ mod tests {
     #[test]
     fn overload_is_reported_promptly_without_waiting() {
         let (release, gate) = mpsc::channel();
-        let worker = RenditionWorker::spawn(
-            0,
-            CADENCE,
-            TIMEBASE,
-            Box::new(Stalled { gate }),
-            |_| Ok(()),
-        )
-        .expect("worker");
+        let worker =
+            RenditionWorker::spawn(0, CADENCE, TIMEBASE, Box::new(Stalled { gate }), |_| Ok(()))
+                .expect("worker");
         let canvas = canvas();
         // The stalled worker holds one item and its bounded queue holds at most
         // `WORKER_QUEUE_TICKS` more (the exact split depends on whether the
@@ -687,10 +686,8 @@ mod tests {
                 Ok(Vec::new())
             }
         }
-        let worker =
-            RenditionWorker::spawn(0, CADENCE, TIMEBASE, Box::new(Failing), |_| Ok(())).expect(
-                "worker",
-            );
+        let worker = RenditionWorker::spawn(0, CADENCE, TIMEBASE, Box::new(Failing), |_| Ok(()))
+            .expect("worker");
         worker
             .offer(BakedTick {
                 tick: 0,
@@ -698,7 +695,13 @@ mod tests {
             })
             .expect("offer");
         let error = worker.join().expect_err("encoder failure must surface");
-        assert!(matches!(error, PipelineError::Output { kind: "test-encoder", .. }));
+        assert!(matches!(
+            error,
+            PipelineError::Output {
+                kind: "test-encoder",
+                ..
+            }
+        ));
     }
 
     #[test]

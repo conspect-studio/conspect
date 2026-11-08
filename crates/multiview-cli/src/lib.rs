@@ -142,6 +142,8 @@ pub fn log_ring() -> Option<std::sync::Arc<multiview_telemetry::LogRing>> {
 /// `gpu-present-no-vulkan-adapter` warning through the engine's drop-oldest
 /// publisher. A thin seam over the pure hal cross-check + the control emit helper.
 pub mod av_sync;
+#[cfg(feature = "ffmpeg")]
+mod binding_delivery;
 pub mod boot;
 pub mod capability_warn;
 pub mod cli;
@@ -201,7 +203,7 @@ pub mod outputs;
 pub mod placement;
 pub mod preview;
 #[cfg(feature = "ffmpeg")]
-mod binding_delivery;
+mod rendition_dispatch;
 /// The runtime-facing rendition-plan seam (broadcast output contract, slice 1):
 /// projects the configured outputs onto shared video/audio renditions using the
 /// build's existing `can_encode` probes. Pure planning only — it opens no
@@ -216,8 +218,6 @@ pub mod rendition_plan;
 /// reordered/delayed encoder.
 #[cfg(feature = "ffmpeg")]
 pub mod rendition_workers;
-#[cfg(feature = "ffmpeg")]
-mod rendition_dispatch;
 pub mod run;
 #[cfg(test)]
 mod source_event_automation_e2e;
