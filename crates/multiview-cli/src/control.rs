@@ -553,10 +553,15 @@ fn configured_cloudflare(
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
-        if opened.dev() != metadata.dev() || opened.ino() != metadata.ino()
-            || opened.mode() & 0o077 != 0 || !opened.is_file()
+        if opened.dev() != metadata.dev()
+            || opened.ino() != metadata.ino()
+            || opened.mode() & 0o077 != 0
+            || !opened.is_file()
         {
-            return Err(Error::new(ErrorKind::PermissionDenied, "Cloudflare master-key file changed during open"));
+            return Err(Error::new(
+                ErrorKind::PermissionDenied,
+                "Cloudflare master-key file changed during open",
+            ));
         }
     }
     if let Err(error) = file.read_exact(&mut key) {
