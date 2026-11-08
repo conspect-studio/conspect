@@ -126,7 +126,12 @@ mod tests {
                 .unwrap(),
             1,
         );
-        let audio = broadcast.create_track("audio", None).unwrap();
+        let audio = broadcast
+            .create_track(
+                "audio",
+                hang::container::track_info(hang::catalog::PRIORITY.audio),
+            )
+            .unwrap();
         let mut adapter = AvAdapter::new(video, BTreeMap::from([("audio".into(), audio)]));
         let mut window = AvWindow {
             video: Window {

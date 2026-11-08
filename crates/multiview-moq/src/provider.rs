@@ -495,6 +495,61 @@ mod tests {
         assert!(*fence.cancel.borrow());
     }
     #[tokio::test]
+    async fn actual_audio_shared_frame_preserves_1500_microseconds_and_credit() {
+        let (fence, mut rx) = Fence::channel(1);
+        let packet = crate::Packet {
+            payload: bytes::Bytes::from_static(&[4, 5, 6]),
+            pts_us: 1500,
+            verified_rap: false,
+        };
+        assert!(
+            fence
+                .try_offer(AvWindow {
+                    video: crate::Window {
+                        generation: 1,
+                        packets: vec![]
+                    },
+                    audio: std::collections::BTreeMap::from([("audio".into(), vec![packet])])
+                })
+                .is_ok()
+        );
+        let window = rx.try_recv().unwrap();
+        let serialized = serialized_frame(&window.audio["audio"][0]).unwrap();
+        let expected_ptr = serialized.as_ptr();
+        let broadcast = moq_net::broadcast::Producer::new(Default::default());
+        let track = broadcast
+            .create_track(
+                "audio",
+                hang::container::track_info(hang::catalog::PRIORITY.audio),
+            )
+            .unwrap();
+        let mut group = track.append_group().unwrap();
+        let mut consumer = group.consume();
+        group
+            .write_frame(moq_net::Timestamp::from_micros(1500).unwrap(), serialized)
+            .unwrap();
+        group.finish().unwrap();
+        drop(window);
+        let frame = consumer.read_frame().await.unwrap().unwrap();
+        assert_eq!(
+            frame.timestamp,
+            moq_net::Timestamp::from_micros(1500).unwrap()
+        );
+        assert_eq!(frame.payload.as_ptr(), expected_ptr);
+        drop((group, consumer, track, broadcast));
+        assert_eq!(fence.charged.load(Ordering::Acquire), 3);
+        let decoded = hang::container::Frame::decode(frame.payload.clone()).unwrap();
+        assert_eq!(
+            decoded.timestamp,
+            moq_net::Timestamp::from_micros(1500).unwrap()
+        );
+        assert_eq!(decoded.payload.as_ref(), &[4, 5, 6]);
+        drop(decoded);
+        drop(frame);
+        assert_eq!(fence.charged.load(Ordering::Acquire), 0);
+    }
+
+    #[tokio::test]
     async fn actual_moq_frame_retains_serialized_owner_and_source_charge() {
         let (fence, mut rx) = Fence::channel(1);
         let window = AvWindow {
