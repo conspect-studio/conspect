@@ -1,0 +1,71 @@
+# MoQ-first browser preview — implementation design
+
+Status: proposed; not production-wired. This document describes the acceptance contract, not existing support.
+
+## Goal and ownership
+
+A browser uses Media-over-QUIC (MoQ) when the deployment, browser, and selected media format support the same protocol. WebRTC is the fallback only when MoQ is unavailable. WebTransport alone does not establish MoQ or codec support.
+
+This change owns the MoQ adapter, authenticated control API, browser player, and transport selection. The concurrent broadcast-output redesign owns the production shared-rendition subscription and pipeline wiring. No additional decoder, compositor, or video encoder is created per compatible browser viewer.
+
+## Safety classification
+
+R3: a new media subscriber must preserve output-clock and isolation invariants. Production output dimensions and rational cadence remain unchanged. The producer never awaits a browser, network stream, admission request, or teardown. The implementation requires bounded-consumer chaos tests before integration.
+
+## Transport selection
+
+1. Read authenticated per-scope server capabilities.
+2. Check secure-context WebTransport and the player APIs, then probe the advertised video and requested audio configurations with WebCodecs.
+3. If the protocol or required browser capabilities are absent, select WebRTC without opening a MoQ lease.
+4. Otherwise acquire one authorized MoQ lease and connect to its exact authorized broadcast.
+5. On a typed transport-unavailable result, fully release that lease before a WebRTC attempt.
+6. Authorization, capacity, invalid configuration, and unsupported rendition errors remain visible. They never trigger a concealed transport retry.
+7. An established stream failure is visible and permits an explicit retry. It does not create an unbounded automatic reconnection loop.
+
+The existing still-image path remains available when no live transport is available. A still image is never labelled live video.
+
+## Proposed shared-rendition seam
+
+The output redesign will finalize concrete Rust types. Preserve public `program`/`input`/`output` scopes: input acquires a source-demand lease, program retains the legacy main-program mapping, and output resolves its effective mux binding to the actual rendition/bus, never a global-program assumption or pending desired configuration. Carry bus identity internally; a public bus scope waits for switcher runtime support. Authorize both the requested public object and its resolved dependencies without disclosing unauthorized identifiers.
+
+The transport contract requires:
+
+- An admitted, principal-authorized scope and an immutable binding identity plus generation.
+- Video codec/profile, initialization bytes, color metadata, dimensions, rational cadence, and rational timestamp timebase.
+- Independent audio track identities and codec/configuration, sample rate, channel layout, and timebase.
+- Shared immutable encoded payloads with PTS, DTS, duration, verified random-access status, and configuration generation.
+- Separate bounded video/audio receivers. Each subscriber has packet-count, byte, and age limits; bounded queues alone do not bound a library's downstream stream buffers.
+- An explicit discontinuity after loss or configuration change. Video resumes only at a verified independently decodable random-access point with matching decoder configuration. The adapter must not forward a partial dependency chain.
+- One RAII lease that owns admission and source demand. Cancellation and timeout release it exactly once off the production clock.
+
+The adapter may transform framing and timestamps for the selected MoQ media mapping. It must not decode, encode, bake, cause global keyframe storms, or retain an unbounded group of packets. Audio/video watermark and ordering semantics require agreement with the output redesign before concrete types are frozen.
+
+## Security and protocol decision gates
+
+Candidate ecosystem: moq-dev's `moq-lite` protocol and `hang` media mapping, with Rust `moq-relay` 0.17.14 / `moq-net` 0.3.21 / `moq-tokio` 0.19.34 / `hang` 0.21.22 / `moq-mux` 0.10.22 and browser `@moq/net` 0.4.7 / `@moq/watch` 0.6.6. These are research candidates, not installed dependencies or verified end-to-end interoperability. Pin exact versions after API verification. Do not describe the moq-lite subset as full IETF MoQ Transport feature parity.
+
+The upstream [transport documentation](https://doc.moq.dev/concept/transport) states that its browser client restricts WebTransport to Firefox 153+ and currently avoids Safari WebTransport, despite API presence. It also automatically races a WebSocket/qmux fallback. The Conspect adapter must disable that race: TCP qmux is not the requested QUIC-first/WebRTC fallback policy. Verify the pinned client can do this before adoption. Do not advertise browser support from a user-agent table or API presence alone.
+
+The pinned [relay API](https://docs.rs/moq-relay/0.17.14/moq_relay/struct.Relay.html) supports embedded admission decisions and bounded shutdown. A relay is not itself the production publisher: bounded subscriber queues, downstream stream/cache budgets, and shared rendition wiring still require implementation and tests.
+
+Research identified a transitive LGPL-2.1 libav.js audio polyfill in the watch stack. Resolve distribution obligations with the product's legal process before adopting that bundle; do not edit legal documents as engineering work. Prefer native decoder capability checks where possible, without silently losing requested audio.
+
+Use interoperable MoQ, not a proprietary WebTransport byte stream labelled MoQ.
+
+Authorize every program/input/output identifier at lease creation and bind the transport credential to that lease and scope. Browser transport credentials must be short-lived; never put a long-lived control bearer in a URL or log. Admission and subscriber limits also apply to the QUIC endpoint. Configure trusted TLS and IPv6-first binding; an HTTP reverse proxy does not implicitly provide a QUIC/WebTransport endpoint.
+
+Do not advertise MoQ merely because the binary includes its crate. Advertise it only when the configured listener, protocol adapter, and authorized rendition provider are available.
+
+## Delivery and verification plan
+
+- [ ] Pin interoperable protocol, media mapping, and browser/server library versions.
+- [ ] Finalize transport contract with the shared-rendition owner.
+- [ ] Implement bounded transport adapter and fake-producer tests before pipeline wiring.
+- [ ] Implement per-object authorization, lease cleanup, capabilities, and generated API types.
+- [ ] Implement browser playback and MoQ-first selection tests.
+- [ ] Verify actual browser/server interoperability and decoded media delivery.
+- [ ] Verify slow, disconnected, malicious, and failed consumers cannot stall production or exceed queue budgets.
+- [ ] Integrate shared-rendition production wiring with its owner.
+- [ ] Complete independent cross-vendor review, CI, and reviewed integration.
+
+Required selection tests cover unsupported browser/deployment, supported MoQ, cleanup-before-fallback, no fallback for authorization/capacity/codec errors, unmount during connection, and idempotent lease release. Isolation tests cover blocked consumers, audio bursts, oversized frames, loss within a GOP, configuration generation changes, and bounded teardown.
