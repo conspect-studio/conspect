@@ -53,6 +53,10 @@
 /// feature `aes67`) touches a socket.
 pub mod aes67;
 
+/// Atomic bounded encoded-window carrier for the opt-in libav output path.
+#[cfg(feature = "ffmpeg")]
+pub mod batch;
+
 /// DEV-B1 / ADR-0044 — local DRM/KMS display output: the raw-frame sink that
 /// scans the pre-encode NV12 canvas out to HDMI/DP glass via atomic page
 /// flips. The mailbox, mode policy (EDID/CVT-RB), flip state machine, and the
