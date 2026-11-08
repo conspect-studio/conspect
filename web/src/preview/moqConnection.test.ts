@@ -1,7 +1,36 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { connectMoq } from './moqConnection';
+import { connectMoq, ownMoqSession } from './moqConnection';
 
 afterEach(() => vi.unstubAllGlobals());
+
+describe('established session ownership', () => {
+  it('waits for transport closure before releasing the lease exactly once', async () => {
+    const events: string[] = [];
+    let finish!: () => void;
+    const closed = new Promise<null>((resolve) => { finish = () => { resolve(null); }; });
+    const controller = new AbortController();
+    const release = vi.fn(() => { events.push('release'); return Promise.resolve(); });
+    const owned = ownMoqSession({ close: () => { events.push('close'); }, closed }, controller.signal, release);
+    controller.abort();
+    expect(events).toEqual(['close']);
+    const teardown = owned.close();
+    finish();
+    await teardown;
+    await owned.close();
+    expect(events).toEqual(['close', 'release']);
+    expect(release).toHaveBeenCalledOnce();
+  });
+
+  it('releases after remote termination without waiting for unmount', async () => {
+    const close = vi.fn();
+    const release = vi.fn(() => Promise.resolve());
+    const owned = ownMoqSession({ close, closed: Promise.resolve(null) }, new AbortController().signal, release);
+    await owned.released;
+    await owned.close();
+    expect(release).toHaveBeenCalledOnce();
+    expect(close).not.toHaveBeenCalled();
+  });
+});
 
 describe('QUIC-only MoQ connection', () => {
   it('disables WebSocket on the real pinned client before any dial', async () => {
