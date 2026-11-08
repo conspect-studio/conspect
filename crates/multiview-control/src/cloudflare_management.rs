@@ -106,6 +106,24 @@ impl ManagedCloudflare {
             reconciler_started: std::sync::atomic::AtomicBool::new(false),
         })
     }
+    fn cleanup_token(
+        &self,
+        state: &mut Snapshot,
+        owner: &str,
+        key: &str,
+        jti: &str,
+    ) -> Result<(), &'static str> {
+        if let Some(reference) = state.token_refs.get(key).and_then(|refs| refs.get(jti)) {
+            let reference = SecretRef::parse(reference).map_err(|_| "invalid stored reference")?;
+            self.vault
+                .delete_if_present(owner, &reference)
+                .map_err(|_| "revoked remotely; retry credential cleanup")?;
+        }
+        if let Some(refs) = state.token_refs.get_mut(key) {
+            refs.remove(jti);
+        }
+        Ok(())
+    }
     fn persist(&self, state: &Snapshot) -> Result<(), &'static str> {
         // Atomic snapshot + fsync. Parent is an operator-created private directory.
         use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
@@ -353,8 +371,28 @@ impl ManagedCloudflare {
                 }
             }
         }
-        if state.pending.contains_key(&key) {
-            return Err("manual recovery required");
+        let revoke_intent = if action == "revoke-token" {
+            Some(format!(
+                "revoke-token:{}:{}",
+                r.relay_id.as_deref().ok_or("relay")?,
+                r.token_jti.as_deref().ok_or("token")?
+            ))
+        } else if action == "revoke" {
+            let id = r.relay_id.as_deref().ok_or("relay")?;
+            let jti = state
+                .records
+                .get(&key)
+                .and_then(|records| records.iter().find(|record| record.relay.uid == id))
+                .and_then(|record| record.pending_revoke.as_deref())
+                .ok_or("rotation")?;
+            Some(format!("revoke-rotation:{id}:{jti}"))
+        } else {
+            None
+        };
+        if let Some(pending) = state.pending.get(&key) {
+            if revoke_intent.as_ref() != Some(pending) {
+                return Err("manual recovery required");
+            }
         }
         if action == "rotation-installed" {
             let id = r.relay_id.as_deref().ok_or("relay")?;
@@ -472,7 +510,19 @@ impl ManagedCloudflare {
                 return Err("imported ownership");
             }
         }
-        state.pending.insert(key.clone(), action.to_owned());
+        if action == "revoke-token" {
+            if let Some(reference) = state
+                .token_refs
+                .get(&key)
+                .and_then(|refs| r.token_jti.as_ref().and_then(|jti| refs.get(jti)))
+            {
+                SecretRef::parse(reference).map_err(|_| "invalid stored reference")?;
+            }
+        }
+        state.pending.insert(
+            key.clone(),
+            revoke_intent.unwrap_or_else(|| action.to_owned()),
+        );
         self.persist(&state)?;
         let data = match action {
             "scoped-token" => {
@@ -618,18 +668,45 @@ impl ManagedCloudflare {
                     .await
                 {
                     Ok(()) | Err(multiview_cloudflare::Error::Api(404)) => {}
-                    Err(_) => return Err("revoke token"),
+                    Err(multiview_cloudflare::Error::Api(status))
+                        if (400..500).contains(&status) =>
+                    {
+                        state.pending.remove(&key);
+                        self.persist(&state)?;
+                        return Err("revoke rejected");
+                    }
+                    Err(_) => return Err("revoke token; retry same relay and token"),
                 }
-                if let Some(refs) = state.token_refs.get_mut(&key) {
-                    refs.remove(jti);
+                self.cleanup_token(&mut state, owner, &key, jti)?;
+                let id = r.relay_id.as_deref().ok_or("relay")?;
+                if registry
+                    .record(id, domain)
+                    .map_err(|_| "relay")?
+                    .pending_revoke
+                    .as_deref()
+                    == Some(jti)
+                {
+                    // Idempotent DELETE also finishes an outstanding old-token rotation.
+                    registry
+                        .finish_rotation(&client, id, domain)
+                        .await
+                        .map_err(|_| "rotation reconciliation")?;
+                    state.rotation_ready.remove(&format!("{key}:{id}"));
                 }
                 serde_json::json!({"revoked":true,"connected_sessions_terminated":false})
             }
             "revoke" => {
+                let old_jti = registry
+                    .record(r.relay_id.as_deref().ok_or("relay")?, domain)
+                    .map_err(|_| "relay")?
+                    .pending_revoke
+                    .clone()
+                    .ok_or("rotation")?;
                 registry
                     .finish_rotation(&client, r.relay_id.as_deref().ok_or("relay")?, domain)
                     .await
                     .map_err(|_| "revoke")?;
+                self.cleanup_token(&mut state, owner, &key, &old_jti)?;
                 state
                     .rotation_ready
                     .remove(&format!("{key}:{}", r.relay_id.as_deref().ok_or("relay")?));
@@ -751,6 +828,70 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(result.data["token_refs"]["created-token"], reference);
+        let token_reference = reopened
+            .vault
+            .store(
+                "alice",
+                &multiview_credentials::Credential::Bearer {
+                    token: "revoked-secret".into(),
+                },
+            )
+            .unwrap();
+        {
+            let key = serde_json::to_string(&("alice", "account")).unwrap();
+            let mut state = reopened.state.lock().await;
+            state
+                .token_refs
+                .entry(key.clone())
+                .or_default()
+                .insert("revoked-jti".into(), token_reference.as_str().into());
+            state
+                .pending
+                .insert(key.clone(), "revoke-token:relay:revoked-jti".into());
+            reopened.persist(&state).unwrap();
+            reopened
+                .cleanup_token(&mut state, "alice", &key, "revoked-jti")
+                .unwrap();
+            assert!(reopened.vault.resolve("alice", &token_reference).is_err());
+            assert!(
+                reopened
+                    .vault
+                    .resolve("alice", &SecretRef::parse(&reference).unwrap())
+                    .is_ok(),
+                "current credential must survive old-token cleanup"
+            );
+            assert!(!state
+                .token_refs
+                .get(&key)
+                .unwrap()
+                .contains_key("revoked-jti"));
+        }
+        // Crash injection: deletion completed, but in-memory reference removal was
+        // never journaled. Reopen the persisted intent and repeat cleanup safely.
+        {
+            let crashed = ManagedCloudflare::from_master_key(&dir, [7; 32]).unwrap();
+            let key = serde_json::to_string(&("alice", "account")).unwrap();
+            let mut state = crashed.state.lock().await;
+            assert_eq!(
+                state.pending.get(&key).map(String::as_str),
+                Some("revoke-token:relay:revoked-jti")
+            );
+            assert!(state
+                .token_refs
+                .get(&key)
+                .unwrap()
+                .contains_key("revoked-jti"));
+            crashed
+                .cleanup_token(&mut state, "alice", &key, "revoked-jti")
+                .unwrap();
+            assert!(!state
+                .token_refs
+                .get(&key)
+                .unwrap()
+                .contains_key("revoked-jti"));
+            state.pending.remove(&key);
+            crashed.persist(&state).unwrap();
+        }
         assert_eq!(result.data["mode"], "manual");
         assert_eq!(result.data["effective_transport"], "unverified");
         assert!(

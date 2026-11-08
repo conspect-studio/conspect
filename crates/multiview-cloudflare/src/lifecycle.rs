@@ -238,7 +238,7 @@ mod tests {
             relay: Relay {
                 uid: id.into(),
                 name: "test".into(),
-                config: Default::default(),
+                config: crate::RelayConfig::default(),
                 status: None,
                 issuers: vec![],
             },

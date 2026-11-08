@@ -109,7 +109,7 @@ pub trait CloudflareManagement: Send + Sync {
         Box<dyn std::future::Future<Output = Result<CloudflareResult, &'static str>> + Send + 'a>,
     >;
 }
-#[cfg_attr(feature="openapi",utoipa::path(post,path="/api/v1/cloudflare/{action}",tag="cloudflare",params(("action"=String,Path,description="audit, scoped-token, relays, provision, import, update, teardown, observe, rotate, revoke")),request_body=CloudflareRequest,responses((status=200,description="Secret-free management result",body=CloudflareResult),(status=503,description="Management unavailable"))))]
+#[cfg_attr(feature="openapi",utoipa::path(post,path="/api/v1/cloudflare/{action}",tag="cloudflare",params(("action"=String,Path,description="audit, permissions, scoped-token, relays, provision, import, update, teardown, observe, rotate, rotation-installed, revoke, revoke-token, detach, set-mode, reconcile, recover, adopt-recovery, acknowledge-recovery, capabilities")),request_body=CloudflareRequest,responses((status=200,description="Secret-free management result",body=CloudflareResult),(status=503,description="Management unavailable"))))]
 pub(crate) async fn execute(
     principal: Principal,
     provider: Option<Extension<Arc<dyn CloudflareManagement>>>,

@@ -40,16 +40,6 @@ fn check_capacity(complete: bool, count: usize) -> Result<(), Error> {
         Ok(())
     }
 }
-#[cfg(test)]
-mod tests {
-    use super::*;
-    #[test]
-    fn quota_requires_complete_audit_and_fewer_than_fifty() {
-        assert!(check_capacity(true, 49).is_ok());
-        assert_eq!(check_capacity(true, 50), Err(Error::Invalid));
-        assert_eq!(check_capacity(false, 0), Err(Error::Invalid));
-    }
-}
 impl Client {
     /// Hard cap bounds both memory and management traffic. Incomplete audits never
     /// claim capacity or suitability. Existing token secrets cannot be recovered.
@@ -129,5 +119,16 @@ impl Client {
         }
         let resource = format!("com.cloudflare.api.account.{}", self.account);
         parse(self.call(reqwest::Method::POST,"https://api.cloudflare.com/client/v4/user/tokens".into(),Some(serde_json::json!({"name":name,"policies":[{"effect":"allow","permission_groups":[{"id":group.id}],"resources":{resource:"*"}}]}))).await?)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn quota_requires_complete_audit_and_fewer_than_fifty() {
+        assert!(check_capacity(true, 49).is_ok());
+        assert_eq!(check_capacity(true, 50), Err(Error::Invalid));
+        assert_eq!(check_capacity(false, 0), Err(Error::Invalid));
     }
 }

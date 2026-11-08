@@ -524,7 +524,7 @@ mod tests {
             ),
         ] {
             assert_eq!(
-                client(origin_server(body)).await.list().await.unwrap_err(),
+                client(origin_server(body)).list().await.unwrap_err(),
                 expected
             );
         }
@@ -540,7 +540,6 @@ mod tests {
         let body=serde_json::json!({"success":true,"result":rows,"result_info":{"count":100,"total":102}}).to_string();
         assert_eq!(
             client(origin_server(Box::leak(body.into_boxed_str())))
-                .await
                 .list()
                 .await
                 .unwrap_err(),
@@ -574,7 +573,7 @@ mod tests {
                 .unwrap();
             }
         });
-        let relays = client(origin).await.list().await.unwrap();
+        let relays = client(origin).list().await.unwrap();
         server.join().unwrap();
         assert_eq!(
             relays.iter().map(|r| r.uid.as_str()).collect::<Vec<_>>(),
@@ -602,7 +601,7 @@ mod tests {
         });
         origin
     }
-    async fn client(origin: String) -> Client {
+    fn client(origin: String) -> Client {
         let mut c =
             Client::new("account".into(), Credential::Bearer { token: "t".into() }).unwrap();
         c.test_origin = Some(origin);
@@ -612,7 +611,6 @@ mod tests {
     async fn documented_list_shape_and_create_secret_roundtrip() {
         let list_body = r#"{"success":true,"result":[{"created":"2019-12-27T18:11:19.117Z","modified":"2019-12-27T18:11:19.117Z","name":"name","uid":"a1b2c3d4e5f67890a1b2c3d4e5f67890"}],"result_info":{"count":1,"total":1}}"#;
         let listed = client(origin_server(list_body))
-            .await
             .list()
             .await
             .expect("documented abbreviated list succeeds");
@@ -620,7 +618,6 @@ mod tests {
         assert_eq!(listed[0].uid, "a1b2c3d4e5f67890a1b2c3d4e5f67890");
         let create_body = r#"{"success":true,"result":{"uid":"relayuid","name":"demo","config":{"upstreams":{"enabled":false,"upstreams":[]}},"issuers":[{"type":"cloudflare_jwt","issuer":"cloudflare","cloudflare_tokens":[{"jti":"abc","operations":["subscribe"],"expires":"2030-01-01T00:00:00Z","secret":"ONCE-SECRET-JWT"}]}]}}"#;
         let relay = client(origin_server(create_body))
-            .await
             .create("demo")
             .await
             .expect("create");
@@ -635,13 +632,12 @@ mod tests {
             dumped.contains("ONCE-SECRET-JWT")
         );
         let get_body = r#"{"success":true,"result":{"config":{"upstreams":{"enabled":true,"upstreams":[{"url":"https://example.com"}]}},"created":"2019-12-27T18:11:19.117Z","modified":"2019-12-27T18:11:19.117Z","name":"Production","uid":"a1b2c3d4e5f67890a1b2c3d4e5f67890","status":"connected"}}"#;
-        match client(origin_server(get_body)).await.get("relayuid").await {
+        match client(origin_server(get_body)).get("relayuid").await {
             Ok(r) => eprintln!("GET_OK status={:?}", r.status),
             Err(e) => eprintln!("GET_ERR {e:?}"),
         }
         let tok_body = r#"{"success":true,"result":{"issuers":[{"type":"cloudflare_jwt","cloudflare_tokens":[{"jti":"j1","operations":["subscribe"],"expires":"2030-01-01T00:00:00Z","secret":"ROTATE-SECRET"}]}]}}"#;
         let tokens = client(origin_server(tok_body))
-            .await
             .create_token(
                 "relayuid",
                 &TokenRequest {
@@ -660,7 +656,6 @@ mod tests {
         );
         let audit_body = r#"{"success":true,"result":[{"id":"tok","name":"n","status":"active","policies":[{"resources":{"com.cloudflare.api.account.other":"*"}}],"value":"SHOULD-NOT-LEAK"}],"result_info":{"page":1,"total_count":1}}"#;
         let audit = client(origin_server(audit_body))
-            .await
             .audit_user_tokens()
             .await
             .expect("audit");
