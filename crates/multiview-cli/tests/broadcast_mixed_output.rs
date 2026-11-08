@@ -18,7 +18,7 @@ use std::path::Path;
 use std::process::Command;
 use std::time::Duration;
 
-fn fixture(path: &Path) {
+fn fixture(path: &Path, frequency: u32) {
     let status = Command::new("ffmpeg")
         .args([
             "-hide_banner",
@@ -30,12 +30,10 @@ fn fixture(path: &Path) {
             "-i",
         ])
         .arg("testsrc=size=320x180:rate=30000/1001:duration=15")
-        .args([
-            "-f",
-            "lavfi",
-            "-i",
-            "sine=frequency=440:sample_rate=48000:duration=15",
-        ])
+        .args(["-f", "lavfi", "-i"])
+        .arg(format!(
+            "sine=frequency={frequency}:sample_rate=48000:duration=15"
+        ))
         .args([
             "-c:v",
             "mpeg2video",
@@ -51,7 +49,12 @@ fn fixture(path: &Path) {
         .expect("generate deterministic source");
     assert!(status.success());
 }
-fn config(clip: &Path, playlist: &Path, port_hevc: u16, port_avc: u16) -> String {
+fn config(
+    clips: &[std::path::PathBuf; 6],
+    playlist: &Path,
+    port_hevc: u16,
+    port_avc: u16,
+) -> String {
     format!(
         r##"
 schema_version = 1
@@ -71,27 +74,27 @@ areas = ["a"]
 [[sources]]
 id = "broadcast_fixture"
 kind = "file"
-path = "{clip}"
+path = "{clip0}"
 [[sources]]
 id = "tone_1"
 kind = "file"
-path = "{clip}"
+path = "{clip1}"
 [[sources]]
 id = "tone_2"
 kind = "file"
-path = "{clip}"
+path = "{clip2}"
 [[sources]]
 id = "tone_3"
 kind = "file"
-path = "{clip}"
+path = "{clip3}"
 [[sources]]
 id = "tone_4"
 kind = "file"
-path = "{clip}"
+path = "{clip4}"
 [[sources]]
 id = "tone_5"
 kind = "file"
-path = "{clip}"
+path = "{clip5}"
 [[cells]]
 id = "cell_a"
 area = "a"
@@ -156,9 +159,52 @@ target_track = "track-5"
 language = "eng"
 include_in_program_bus = false
 "##,
-        clip = clip.display(),
+        clip0 = clips[0].display(),
+        clip1 = clips[1].display(),
+        clip2 = clips[2].display(),
+        clip3 = clips[3].display(),
+        clip4 = clips[4].display(),
+        clip5 = clips[5].display(),
         playlist = playlist.display()
     )
+}
+/// Decode the selected AAC stream to PCM, not merely inspect headers.
+fn decoded_audio_samples(path: &Path, stream_index: usize) -> usize {
+    let output = Command::new("ffmpeg")
+        .args(["-hide_banner", "-loglevel", "error", "-i"])
+        .arg(path)
+        .args(["-map"])
+        .arg(format!("0:a:{stream_index}"))
+        .args(["-t", "3", "-ac", "1", "-ar", "48000", "-f", "f32le", "-"])
+        .output()
+        .expect("decode AAC PCM");
+    assert!(
+        output.status.success(),
+        "AAC stream {stream_index} failed decode: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    output.stdout.len() / 4
+}
+fn probe_audio_count(path: &Path) -> usize {
+    let output = Command::new("ffprobe")
+        .args([
+            "-v",
+            "error",
+            "-select_streams",
+            "a",
+            "-show_entries",
+            "stream=index",
+            "-of",
+            "csv=p=0",
+        ])
+        .arg(path)
+        .output()
+        .expect("probe AAC streams");
+    assert!(output.status.success());
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .count()
 }
 fn probe_frames(path: &Path) -> (String, Vec<i64>) {
     let output = Command::new("ffprobe")
@@ -224,12 +270,15 @@ fn cadence_faults(pts: &[i64], label: &str, minimum: usize) -> Vec<String> {
 async fn mixed_codec_pipeline_receives_decodable_media_not_just_headers() {
     const TICKS: u64 = 300; // 10s diagnostic @ exact 30000/1001.
     let dir = tempfile::tempdir().unwrap();
-    let clip = dir.path().join("source.ts");
-    fixture(&clip);
+    let clips: [std::path::PathBuf; 6] =
+        std::array::from_fn(|index| dir.path().join(format!("source{index}.ts")));
+    for (index, clip) in clips.iter().enumerate() {
+        fixture(clip, 440 + u32::try_from(index).unwrap() * 110);
+    }
     let playlist = dir.path().join("hls/index.m3u8");
     let base = 25_000 + u16::try_from(std::process::id() % 10_000).unwrap();
     let config =
-        MultiviewConfig::load_from_toml(&config(&clip, &playlist, base, base + 1)).unwrap();
+        MultiviewConfig::load_from_toml(&config(&clips, &playlist, base, base + 1)).unwrap();
     config.validate().unwrap();
     let mut pipeline = Pipeline::build(&config)
         .expect("three bindings must build without first-codec substitution");
@@ -276,6 +325,20 @@ async fn mixed_codec_pipeline_receives_decodable_media_not_just_headers() {
     let (hevc_codec, hevc_pts) = probe_frames(&hevc_path);
     let (avc_codec, avc_pts) = probe_frames(&avc_path);
     let mut faults = cadence_faults(&hevc_pts, "HEVC SRT", 100);
+    for (label, path) in [("HEVC SRT", &hevc_path), ("H264 SRT", &avc_path)] {
+        let count = probe_audio_count(path);
+        if count != 5 {
+            faults.push(format!("{label}: {count} AAC tracks != 5"));
+        }
+        for index in 0..count.min(5) {
+            let samples = decoded_audio_samples(path, index);
+            if samples < 48_000 {
+                faults.push(format!(
+                    "{label}: AAC track {index} only {samples} decoded PCM samples"
+                ));
+            }
+        }
+    }
     faults.extend(cadence_faults(&avc_pts, "H264 SRT", 100));
     if hevc_codec != "hevc" {
         faults.push(format!("HEVC SRT codec {hevc_codec} != hevc"));
