@@ -299,12 +299,26 @@ impl RenditionWorker {
                 while let Ok(item) = receiver.recv() {
                     let tick = item.tick;
                     let packets = encoder.encode(item)?;
-                    // A zero-reorder encoder that returned from the call for
-                    // this tick cannot later emit a packet for this or any
-                    // earlier tick; an unproven encoder claims nothing.
+                    // A zero-reorder encoder emits packets in frame order, so a
+                    // packet's PTS is its frame's tick and no LATER packet can
+                    // carry an earlier or equal frame. The watermark therefore
+                    // keys off the packets this event ACTUALLY EMITTED — not
+                    // the submitted tick — because a delayed-but-ordered
+                    // encoder (e.g. mpeg2video's fixed one-frame delay, whose
+                    // drained packets are re-stamped `DTS := PTS` upstream)
+                    // may emit zero packets for this tick and still be
+                    // perfectly healthy. An unproven encoder claims nothing.
                     let watermark = match proof {
                         ReorderBound::NoReorder => {
-                            watermarks.advance(next_tick_lower_bound_ns(tick, cadence))
+                            let highest_emitted = packets
+                                .iter()
+                                .filter_map(EncodedPacket::pts)
+                                .max()
+                                .and_then(|pts| u64::try_from(pts).ok());
+                            watermarks.advance(
+                                highest_emitted
+                                    .and_then(|emitted| next_tick_lower_bound_ns(emitted, cadence)),
+                            )
                         }
                         ReorderBound::Unknown => None,
                     };
@@ -352,6 +366,47 @@ impl RenditionWorker {
             TrySendError::Full(_) => OfferRejection::Overloaded,
             TrySendError::Disconnected(_) => OfferRejection::Ended,
         })
+    }
+
+    /// Offer one baked tick, waiting up to `bound` for the worker to take it.
+    ///
+    /// The bake consumer (OFF the hot path) uses this with a CADENCE-DERIVED
+    /// bound — one hot-queue drain horizon — so that while the consumer waits
+    /// inside the real-time envelope, the hot queue keeps absorbing engine
+    /// ticks and NOTHING is shed (no-falter). A momentarily-full worker queue
+    /// (a burst or a transient encode stall) back-pressures the consumer only
+    /// within that horizon; only a worker that cannot drain even one tick
+    /// within it — a genuinely wedged encoder, beyond the real-time envelope
+    /// — fails explicitly, so the fatal signal stops the run and the
+    /// supervisor restarts a fresh process. This is not an unbounded wait:
+    /// the bound is fixed by the output cadence, not by back-pressure growing
+    /// with load.
+    ///
+    /// # Errors
+    /// Returns [`OfferRejection::Overloaded`] when the bound elapsed without a
+    /// slot (wedged encoder), or [`OfferRejection::Ended`] when the worker ended.
+    pub fn offer_within(
+        &self,
+        mut item: BakedTick,
+        bound: std::time::Duration,
+    ) -> Result<(), OfferRejection> {
+        // `SyncSender::send_timeout` is still unstable, so the bound is a
+        // 1 ms poll — coarse, but this is the OFF-hot-path consumer waiting on
+        // an encoder that takes a tick span per frame anyway.
+        let deadline = std::time::Instant::now() + bound;
+        loop {
+            match self.input.try_send(item) {
+                Ok(()) => return Ok(()),
+                Err(TrySendError::Full(returned)) => {
+                    item = returned;
+                    if std::time::Instant::now() >= deadline {
+                        return Err(OfferRejection::Overloaded);
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+                Err(TrySendError::Disconnected(_)) => return Err(OfferRejection::Ended),
+            }
+        }
     }
 
     /// Stop the worker: drop the input, wait for `finish()` and the terminal

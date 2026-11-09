@@ -597,7 +597,11 @@ impl VideoRenditionEncoder {
         })
     }
 
-    /// True only when the opened encoder's effective reorder and delay are zero.
+    /// True only when the opened encoder is proven never to reorder (no B
+    /// frames configured). NOT a zero-delay claim: a delayed-but-ordered
+    /// encoder (e.g. mpeg2video's fixed one-frame delay) still proves this
+    /// true, and its drained packets are re-stamped `DTS := PTS` (see
+    /// [`Self::drain`]); the emission order is pinned empirically by tests.
     #[must_use]
     pub const fn no_reorder_proven(&self) -> bool {
         self.no_reorder
@@ -660,6 +664,22 @@ impl VideoRenditionEncoder {
         let mut packets = Vec::new();
         while let Some(packet) = self.encoder.receive_packet().map_err(ff)? {
             packets.push(EncodedPacket::from_packet(packet));
+        }
+        // A proven no-reorder encoder emits packets in frame order, so this
+        // packet's PTS is its frame's tick and decode order equals
+        // presentation order: re-stamp DTS := PTS (the output-clock rule —
+        // timestamps come from the tick counter, never from a floating encoder
+        // artifact). This cancels the one-frame DTS lag of delayed-but-ordered
+        // encoders (e.g. mpeg2video's fixed `delay = 1`, whose first packet
+        // would otherwise carry DTS one tick below zero and fall outside the
+        // dispatcher's tick-window protocol). Reordering encoders keep
+        // libav's DTS untouched: their decode order genuinely differs from
+        // presentation order. The per-codec emission order this relies on is
+        // PINNED EMPIRICALLY by the emission-order tests below, not by doc.
+        if self.no_reorder {
+            for packet in &mut packets {
+                packet.set_dts_to_pts();
+            }
         }
         Ok(packets)
     }
@@ -3516,6 +3536,102 @@ mod tests {
         assert_eq!(done[0].0, Path::new("seg9994.ts"));
     }
 
+    /// EMPIRICAL per-codec emission proof (t70 causal 2 / t62 finding: the
+    /// no-reorder claim must be codec-EMPIRICAL, never a doc assertion). For
+    /// every encodable LGPL/GPL codec in this build, encode a strictly
+    /// consecutive tick sequence through the REAL rendition encoder and PIN:
+    /// (1) EMISSION ORDER equals submission order — the i-th emitted packet's
+    /// PTS is exactly the i-th submitted tick, across interleaved
+    /// `encode_frame_at` calls AND the EOF `finish()` tail (a single
+    /// reordering packet fails the test); (2) the restamped DTS equals PTS on
+    /// every packet (the output-clock rule; decode order == presentation order
+    /// for these proven encoders); (3) every submitted tick is emitted exactly
+    /// once — no frame lost inside the encoder, none duplicated. This is the
+    /// proof the `DTS := PTS` restamp and the emission-keyed dispatcher
+    /// watermark rely on; mpeg2video's one-frame DELAY is thereby proven
+    /// compatible (delayed but strictly ordered), not assumed.
+    #[test]
+    fn proven_codecs_emit_in_submission_order_with_restamped_dts() {
+        use multiview_core::frame::FrameMeta;
+        use multiview_core::pixel::PixelFormat;
+        use multiview_core::time::MediaTime;
+        const WIDTH: u32 = 64;
+        const HEIGHT: u32 = 48;
+        const TICKS: u64 = 12;
+
+        // mpeg2video is the LGPL default (always present). libx264/libx265 are
+        // probed and skipped when the build lacks gpl-codecs.
+        let mut codecs = vec!["mpeg2video"];
+        for optional in ["libx264", "libx265"] {
+            if ffmpeg::encoder::find_by_name(optional).is_some() {
+                codecs.push(optional);
+            }
+        }
+        for codec in codecs {
+            let mut config = EncodeConfig::mpeg2(WIDTH, HEIGHT);
+            config.codec_name = codec.to_owned();
+            config.gop = 30;
+            config.cadence = Rational::FPS_29_97;
+            let mut rendition = super::VideoRenditionEncoder::new(&config)
+                .unwrap_or_else(|e| panic!("{codec} must open: {e}"));
+
+            let mut emitted: Vec<(i64, i64)> = Vec::new();
+            for tick in 0..TICKS {
+                let frame = DecodedVideoFrame {
+                    frame: ffmpeg::util::frame::Video::new(
+                        ffmpeg::format::Pixel::YUV420P,
+                        WIDTH,
+                        HEIGHT,
+                    ),
+                    meta: FrameMeta {
+                        pts: MediaTime::ZERO,
+                        width: WIDTH,
+                        height: HEIGHT,
+                        format: PixelFormat::Nv12,
+                        color: multiview_core::color::ColorInfo::default(),
+                    },
+                    raw_pts: None,
+                    a53_cc: None,
+                };
+                for packet in rendition
+                    .encode_frame_at(frame, tick)
+                    .unwrap_or_else(|e| panic!("{codec} tick {tick}: {e}"))
+                {
+                    let (pts, dts) = (packet.pts(), packet.dts());
+                    emitted.push((
+                        pts.expect("encoder stamps PTS"),
+                        dts.expect("encoder stamps DTS"),
+                    ));
+                }
+            }
+            for packet in rendition
+                .finish()
+                .unwrap_or_else(|e| panic!("{codec} finish: {e}"))
+            {
+                let (pts, dts) = (packet.pts(), packet.dts());
+                emitted.push((pts.expect("tail stamps PTS"), dts.expect("tail stamps DTS")));
+            }
+
+            assert_eq!(
+                emitted.len(),
+                usize::try_from(TICKS).unwrap(),
+                "{codec}: every submitted tick must be emitted exactly once (delayed emission                  is fine; loss or duplication is not), got {:?}",
+                emitted
+            );
+            for (index, (pts, dts)) in emitted.iter().enumerate() {
+                let expected = i64::try_from(index).unwrap();
+                assert_eq!(
+                    *pts, expected,
+                    "{codec}: emission order must equal submission order — packet {index} has                      PTS {pts}, a reordering encoder is NOT proven no-reorder"
+                );
+                assert_eq!(
+                    *dts, *pts,
+                    "{codec}: the restamped DTS must equal PTS (decode order == presentation                      order for proven no-reorder encoders), packet {index}"
+                );
+            }
+        }
+    }
+
     #[test]
     fn concrete_rendition_opens_zero_latency_and_emits_every_tick() {
         use multiview_core::frame::FrameMeta;
@@ -3559,7 +3675,7 @@ mod tests {
                 assert!(
                     packets
                         .iter()
-                        .all(|packet| packet.dts() == Some(tick as i64)),
+                        .all(|packet| packet.dts() == Some(i64::try_from(tick).unwrap_or(i64::MAX))),
                     "{codec} emitted delayed DTS for tick {tick}"
                 );
             }

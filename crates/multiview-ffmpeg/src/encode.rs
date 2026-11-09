@@ -90,7 +90,16 @@ pub struct VideoEncoder {
     /// path (no pin requested, a non-NVENC codec, or a bind that gracefully fell
     /// back to the default device).
     hw_device: Option<crate::hwframe::HwDeviceContext>,
-    /// Opened context proves no B frames and no buffered encoder delay.
+    /// Opened context proves the ENCODER never reorders: no B frames
+    /// CONFIGURED (`max_b_frames == 0`) — the only reorder source. This is
+    /// NOT a zero-delay claim: a one-frame emit DELAY (mpeg2video's fixed
+    /// `delay = 1`, which also reports `has_b_frames = 1` with `-bf 0`) does
+    /// NOT disqualify, because emission order still equals submission order —
+    /// the delay only shifts WHEN a packet is emitted, never which frame it
+    /// carries. The per-codec behaviour this relies on is PINNED EMPIRICALLY
+    /// by the emission-order tests in multiview-output (`sink.rs` tests:
+    /// every emitted packet's PTS equals its submission tick, in order), not
+    /// asserted from documentation.
     no_reorder: bool,
 }
 
@@ -183,7 +192,7 @@ impl VideoEncoder {
         #[allow(unsafe_code)] // SAFETY: read only the live opened encoder context.
         let no_reorder = unsafe {
             let ctx = encoder.as_ptr();
-            (*ctx).max_b_frames == 0 && (*ctx).has_b_frames == 0 && (*ctx).delay == 0
+            (*ctx).max_b_frames == 0
         };
         Ok(Self {
             encoder,
@@ -241,7 +250,11 @@ impl VideoEncoder {
         self.configured_bit_rate
     }
 
-    /// Whether the opened encoder context proves zero reorder and delay.
+    /// Whether the opened encoder context proves the encoder never REORDERS
+    /// (no B frames configured). NOT a zero-delay claim: a delayed-but-ordered
+    /// encoder (mpeg2video's fixed one-frame delay) still proves this true, and
+    /// its drained packets are re-stamped `DTS := PTS` upstream; see the
+    /// empirical emission-order tests in multiview-output.
     #[must_use]
     pub const fn no_reorder_proven(&self) -> bool {
         self.no_reorder

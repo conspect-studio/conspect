@@ -109,6 +109,23 @@ impl EncodedPacket {
         self.packet.dts()
     }
 
+    /// Re-stamp the decode timestamp to equal the presentation timestamp.
+    ///
+    /// Correct ONLY for a proven no-reorder stream (decode order equals
+    /// presentation order — no B frames), where a muxer legitimately decodes
+    /// each packet at its presentation instant. Used to cancel an encoder's
+    /// one-frame DTS lag (e.g. mpeg2video's fixed `delay = 1`, which stamps
+    /// the first packet DTS one tick below zero) so downstream tick-window
+    /// admission sees the packet's true frame tick — the output-clock rule:
+    /// every PTS/DTS is re-stamped from the tick counter, never trusted from a
+    /// floating encoder artifact. The per-codec no-reorder fact is pinned
+    /// empirically (see `multiview-output` sink tests), not by documentation.
+    pub fn set_dts_to_pts(&mut self) {
+        if let Some(pts) = self.packet.pts() {
+            self.packet.set_dts(Some(pts));
+        }
+    }
+
     /// Whether this packet is a keyframe (carries `AV_PKT_FLAG_KEY`). The
     /// segmented mux sink starts a new segment on a keyframe-flagged packet —
     /// the GOP boundary — rather than counting encoder frames.
