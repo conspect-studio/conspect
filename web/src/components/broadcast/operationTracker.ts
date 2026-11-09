@@ -5,6 +5,7 @@ import type { QueryClient } from '@tanstack/react-query';
 import { OperationApiError } from '../../api/operations';
 import type { AcceptedBody } from '../../api/operations';
 import { getStoredToken } from '../../api/token';
+import { isCorrelatedKind } from '../../realtime/correlatedCommands';
 import { parseMediaPlayerEvent } from '../../realtime/envelope';
 import type { Envelope } from '../../realtime/envelope';
 import type { MediaPlayerState, OutputRunState } from '../../realtime/generated-types';
@@ -32,6 +33,15 @@ interface ParsedEvent { readonly corr: string; readonly topic: string; readonly 
   readonly event: 'media.player_state' | 'output.status'; readonly state: PlayerState | OutputRunState;
   readonly at: number; readonly exitArmed?: boolean }
 export interface SubmissionResult { readonly kind: 'tracked' | 'accepted-unobserved'; readonly operationId: string }
+/** Server-issued identity on an unresolved 202; absent fields are never fabricated. */
+export interface UnknownSeatDetail {
+  readonly operationId?: string;
+  readonly kind?: string;
+  readonly reason: 'uncorrelated-kind' | 'unsupported-expectation' | 'invalid-deadline';
+}
+export type TrackerSnapshot = OperationOutcomeState & {
+  readonly unknownSeatDetails: ReadonlyMap<number, UnknownSeatDetail>;
+};
 
 function parseEvent(envelope: Envelope): ParsedEvent | undefined {
   if (!envelope.corr || !envelope.id) return undefined;
@@ -51,6 +61,25 @@ function parseEvent(envelope: Envelope): ParsedEvent | undefined {
   }
   return undefined;
 }
+// Correlation alone is insufficient: a caller cannot turn a play into a pause,
+// or claim a switcher cut from a player/output state. These are the exact
+// observable CorrKey::for_command projections in realtime.rs; named salvo and
+// direct switcher operation outcomes have no predicate in this tracker yet.
+function matchesCommandKind(kind: string, expectation: OperationExpectation): boolean {
+  if (!isCorrelatedKind(kind) || typeof expectation.resource !== 'string' || !expectation.resource.trim()) return false;
+  if (expectation.topic === 'outputs') {
+    return (kind === 'start' && expectation.terminal.state === 'running') ||
+      (kind === 'stop' && expectation.terminal.state === 'idle');
+  }
+  const { state, exitArmed } = expectation.terminal;
+  if (kind === 'arm_media_exit' || kind === 'take_media_exit' || kind === 'cancel_media_exit')
+    return state === 'vamping' && exitArmed === (kind !== 'cancel_media_exit');
+  if (exitArmed !== undefined) return false;
+  return (kind === 'media_play' && state === 'playing') ||
+    (kind === 'media_pause' && state === 'paused') ||
+    (kind === 'media_stop' && state === 'stopped') ||
+    (kind === 'media_cue' && state === 'cued');
+}
 function matching(event: ParsedEvent, expectation: OperationExpectation, corr: string): boolean {
   return event.corr === corr && event.topic === expectation.topic &&
     event.resource === expectation.resource && event.event === expectation.event;
@@ -64,6 +93,7 @@ function verdict(event: ParsedEvent, expectation: OperationExpectation): 'applie
 export class OperationTracker {
   private state: OperationOutcomeState = createOperationOutcomeState();
   private readonly expectations = new Map<string, OperationExpectation>();
+  private readonly unknownSeatDetails = new Map<number, UnknownSeatDetail>();
   private early: ParsedEvent[] = [];
   private identity: string | undefined;
   private deadlineTimer: ReturnType<typeof setTimeout> | undefined;
@@ -87,15 +117,19 @@ export class OperationTracker {
     this.generation += 1;
     this.state = createOperationOutcomeState();
     this.expectations.clear();
+    this.unknownSeatDetails.clear();
     this.early = [];
     this.publish();
   }
-  snapshot(): OperationOutcomeState {
+  snapshot(): TrackerSnapshot {
     this.checkIdentity();
-    return this.state;
+    return this.withSeatDetails();
+  }
+  private withSeatDetails(): TrackerSnapshot {
+    return { ...this.state, unknownSeatDetails: new Map(this.unknownSeatDetails) };
   }
   private publish(): void {
-    this.client.setQueryData(OPERATION_TRACKER_QUERY_KEY, this.state);
+    this.client.setQueryData(OPERATION_TRACKER_QUERY_KEY, this.withSeatDetails());
     this.scheduleDeadline();
   }
   private scheduleDeadline(): void {
@@ -178,21 +212,32 @@ export class OperationTracker {
     // A change of principal while the POST was in flight must not publish its
     // result under another operator's QueryClient identity.
     this.checkIdentity();
+    // API generics describe the expected body; a malformed 202 still crosses
+    // this boundary at runtime and must never become a tracked operation.
+    const body: unknown = accepted;
+    const operationId = body !== null && typeof body === 'object' && 'operation_id' in body &&
+      typeof body.operation_id === 'string' ? body.operation_id : '';
+    const kind = body !== null && typeof body === 'object' && 'kind' in body &&
+      typeof body.kind === 'string' ? body.kind : undefined;
     if (generation !== this.generation || !this.state.provisional.has(token))
-      return { kind: 'accepted-unobserved', operationId: accepted.operation_id };
-    if (!expectation?.resource || !accepted.operation_id) {
-      // 202 is authoritative admission even without observable correlation.
-      // Preserve the anonymous capacity seat: unsupported is not rejection.
+      return { kind: 'accepted-unobserved', operationId };
+    const unknown = (reason: UnknownSeatDetail['reason']): SubmissionResult => {
       this.state = markOperationResponseUnknown(this.state, token, 'transport-unknown');
+      this.unknownSeatDetails.set(token, {
+        ...(operationId.trim() ? { operationId } : {}),
+        ...(kind?.trim() ? { kind } : {}), reason,
+      });
       this.publish();
-      return { kind: 'accepted-unobserved', operationId: accepted.operation_id };
+      return { kind: 'accepted-unobserved', operationId };
+    };
+    if (!operationId.trim() || !kind || !expectation || !matchesCommandKind(kind, expectation)) {
+      // The actual 202 kind, never a caller's claimed expectation, determines
+      // whether a frame can prove application. Replays hide their original kind.
+      // Preserve the capacity seat: unsupported is not rejection.
+      return unknown(!kind || !isCorrelatedKind(kind) ? 'uncorrelated-kind' : 'unsupported-expectation');
     }
     const deadlineMs = options.deadlineMs ?? DEFAULT_OPERATION_DEADLINE_MS;
-    if (!Number.isFinite(deadlineMs) || deadlineMs < 0) {
-      this.state = markOperationResponseUnknown(this.state, token, 'transport-unknown');
-      this.publish();
-      return { kind: 'accepted-unobserved', operationId: accepted.operation_id };
-    }
+    if (!Number.isFinite(deadlineMs) || deadlineMs < 0) return unknown('invalid-deadline');
     try {
       this.state = admitOperationOutcome(this.state, token, {
         operationId: accepted.operation_id, corr: accepted.operation_id, topic: expectation.topic,
@@ -211,14 +256,13 @@ export class OperationTracker {
           if (outcome !== undefined) this.acceptEvidence(item, outcome);
         }
       }
-      return { kind: 'tracked', operationId: accepted.operation_id };
+      return { kind: 'tracked', operationId };
     } catch (error) {
       // The server accepted a command: a client-side identity/schema failure
       // cannot release its reserved seat or turn the command into a rejection.
-      this.state = markOperationResponseUnknown(this.state, token, 'transport-unknown');
-      this.publish();
+      const result = unknown('unsupported-expectation');
       if (!(error instanceof OperationOutcomeError)) throw error;
-      return { kind: 'accepted-unobserved', operationId: accepted.operation_id };
+      return result;
     }
   }
 }

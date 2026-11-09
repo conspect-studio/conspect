@@ -12,7 +12,7 @@ const player = (corr: string, kind: string, topic = 'switcher', id = 'p1') => ({
 });
 const expectation = { topic: 'switcher' as const, resource: 'p1', event: 'media.player_state' as const,
   terminal: { kind: 'player-state' as const, state: 'playing' as const } };
-const accepted = { operation_id: 'op1', kind: 'media.play' };
+const accepted = { operation_id: 'op1', kind: 'media_play' };
 const server = setupServer();
 beforeAll(() => { server.listen({ onUnhandledRequest: 'error' }); });
 afterEach(() => { server.resetHandlers(); });
@@ -56,7 +56,7 @@ describe('actual operation tracker', () => {
 
   it('accepts output idle as typed terminal, not starting or unrelated states', async () => {
     const tracker = getOperationTracker(new QueryClient());
-    await tracker.submit(() => Promise.resolve(accepted), { topic: 'outputs', resource: 'out1', event: 'output.status',
+    await tracker.submit(() => Promise.resolve({ ...accepted, kind: 'stop' }), { topic: 'outputs', resource: 'out1', event: 'output.status',
       terminal: { kind: 'output-state', state: 'idle' } });
     tracker.onEnvelope({ ...player('op1', 'playing', 'outputs', 'out1'), t: 'output.status', data: { state: 'starting' } });
     expect(tracker.snapshot().records.get('op1')?.phase).toBe('accepted');
@@ -116,7 +116,7 @@ describe('actual operation tracker', () => {
 
   it('does not infer failure from output error without an explicit command failure contract', async () => {
     const tracker = getOperationTracker(new QueryClient());
-    await tracker.submit(() => Promise.resolve(accepted), { topic: 'outputs', resource: 'o1', event: 'output.status',
+    await tracker.submit(() => Promise.resolve({ ...accepted, kind: 'start' }), { topic: 'outputs', resource: 'o1', event: 'output.status',
       terminal: { kind: 'output-state', state: 'running' } });
     tracker.onEnvelope({ ...player('op1', 'playing', 'outputs', 'o1'), t: 'output.status', data: { state: 'error' } });
     expect(tracker.snapshot().records.get('op1')?.phase).toBe('accepted');
@@ -124,7 +124,7 @@ describe('actual operation tracker', () => {
 
   it('distinguishes vamp arm and disarm despite the same state kind', async () => {
     const tracker = getOperationTracker(new QueryClient());
-    await tracker.submit(() => Promise.resolve(accepted), { topic: 'switcher', resource: 'p1', event: 'media.player_state',
+    await tracker.submit(() => Promise.resolve({ ...accepted, kind: 'arm_media_exit' }), { topic: 'switcher', resource: 'p1', event: 'media.player_state',
       terminal: { kind: 'player-state', state: 'vamping', exitArmed: true } });
     tracker.onEnvelope({ ...player('op1', 'vamping'), data: { player: 'p1', position_frames: 0,
       state: { kind: 'vamping', exit_armed: false } } });
@@ -132,6 +132,79 @@ describe('actual operation tracker', () => {
     tracker.onEnvelope({ ...player('op1', 'vamping'), data: { player: 'p1', position_frames: 0,
       state: { kind: 'vamping', exit_armed: true } } });
     expect(tracker.snapshot().records.get('op1')?.phase).toBe('applied');
+  });
+
+  it.each([
+    ['media_load', 'cued'], ['media_seek', 'playing'], ['replay', 'playing'],
+    ['media.play', 'playing'], ['unknown_kind', 'playing'],
+  ])('does not invent correlation for %s even with a caller expectation', async (kind, state) => {
+    const tracker = getOperationTracker(new QueryClient());
+    const result = await tracker.submit(() => Promise.resolve({ operation_id: 'op1', kind }), expectation);
+    expect(result).toEqual({ kind: 'accepted-unobserved', operationId: 'op1' });
+    tracker.onEnvelope(player('op1', state));
+    expect(tracker.snapshot().records.size).toBe(0);
+    expect([...tracker.snapshot().provisional.values()].map((seat) => seat.phase)).toEqual(['unknown']);
+    expect([...tracker.snapshot().unknownSeatDetails.values()]).toEqual([{
+      operationId: 'op1', kind, reason: 'uncorrelated-kind',
+    }]);
+  });
+
+  it.each([
+    ['media_play', 'paused'], ['media_pause', 'playing'], ['media_cue', 'playing'],
+    ['media_stop', 'playing'], ['start', 'playing'], ['arm_media_exit', 'playing'],
+  ])('rejects a mismatched %s expectation for %s', async (kind, state) => {
+    const tracker = getOperationTracker(new QueryClient());
+    const result = await tracker.submit(() => Promise.resolve({ operation_id: 'op1', kind }), {
+      ...expectation, terminal: { ...expectation.terminal, state: state as 'playing' | 'paused' },
+    });
+    expect(result).toEqual({ kind: 'accepted-unobserved', operationId: 'op1' });
+    tracker.onEnvelope(player('op1', state));
+    expect(tracker.snapshot().records.size).toBe(0);
+    expect([...tracker.snapshot().provisional.values()].map((seat) => seat.phase)).toEqual(['unknown']);
+    expect([...tracker.snapshot().unknownSeatDetails.values()]).toEqual([{
+      operationId: 'op1', kind, reason: 'unsupported-expectation',
+    }]);
+  });
+
+  it('retains bounded metadata for 202 seats, but never invents an id for an uncertain POST', async () => {
+    const tracker = getOperationTracker(new QueryClient());
+    await tracker.submit(() => Promise.reject(new Error('network')), expectation).catch(() => undefined);
+    const acceptedSeat = await tracker.submit(() => Promise.resolve({ operation_id: 'op-known', kind: 'media_load' }), expectation);
+    expect(acceptedSeat.operationId).toBe('op-known');
+    expect([...tracker.snapshot().unknownSeatDetails.values()]).toEqual([{
+      operationId: 'op-known', kind: 'media_load', reason: 'uncorrelated-kind',
+    }]);
+    expect(tracker.snapshot().provisional.size).toBe(2);
+    tracker.resetIdentity('different');
+    expect(tracker.snapshot().unknownSeatDetails.size).toBe(0);
+    expect(tracker.snapshot().provisional.size).toBe(0);
+  });
+
+  it('retains a malformed 202 seat without inventing a server operation id', async () => {
+    const tracker = getOperationTracker(new QueryClient());
+    // @ts-expect-error Deliberately malformed server response crossing the typed API boundary.
+    const malformed: Awaited<ReturnType<typeof submitOperation>> = { kind: 'media_play' };
+    const result = await tracker.submit(() => Promise.resolve(malformed), expectation);
+    expect(result).toEqual({ kind: 'accepted-unobserved', operationId: '' });
+    expect([...tracker.snapshot().unknownSeatDetails.values()]).toEqual([{
+      kind: 'media_play', reason: 'unsupported-expectation',
+    }]);
+    expect([...tracker.snapshot().provisional.values()].map((seat) => seat.phase)).toEqual(['unknown']);
+  });
+
+  it('rejects untruthful output terminal predicates while allowing the matching start/stop', async () => {
+    const tracker = getOperationTracker(new QueryClient());
+    const wrong = await tracker.submit(() => Promise.resolve({ operation_id: 'out-wrong', kind: 'start' }), {
+      topic: 'outputs', resource: 'out1', event: 'output.status', terminal: { kind: 'output-state', state: 'idle' },
+    });
+    expect(wrong.kind).toBe('accepted-unobserved');
+    const correct = await tracker.submit(() => Promise.resolve({ operation_id: 'out-good', kind: 'start' }), {
+      topic: 'outputs', resource: 'out1', event: 'output.status', terminal: { kind: 'output-state', state: 'running' },
+    });
+    expect(correct.kind).toBe('tracked');
+    tracker.onEnvelope({ ...player('out-good', 'playing', 'outputs', 'out1'), t: 'output.status', data: { state: 'running' } });
+    expect(tracker.snapshot().records.get('out-good')?.phase).toBe('applied');
+    expect(tracker.snapshot().unknownSeatDetails.size).toBe(1);
   });
 
   it('unsupported commands remain accepted-unobserved without a fabricated correlation', async () => {
