@@ -9,6 +9,7 @@ import { LayoutsPage } from "../pages/LayoutsPage";
 import { LayoutEditorPage } from "../pages/LayoutEditorPage";
 import { CastPage } from "../pages/CastPage";
 import { RoutingPage } from "../pages/RoutingPage";
+import { SwitcherPage } from "../pages/SwitcherPage";
 import { LogsPage } from "../pages/LogsPage";
 import { NotFoundPage } from "../pages/NotFoundPage";
 import { MonitoringPage } from "../pages/MonitoringPage";
@@ -79,6 +80,7 @@ export const router = createBrowserRouter([
       { path: "devices/:id", element: <DeviceDetailPage /> },
       { path: "cast", element: <CastPage /> },
       { path: "routing", element: <RoutingPage /> },
+      { path: "switcher", element: <SwitcherPage /> },
       { path: "sync-groups", element: <SyncGroupsPage /> },
       { path: "graphics", element: <GraphicsPage /> },
       { path: "graphics/:view", element: <GraphicsPage /> },

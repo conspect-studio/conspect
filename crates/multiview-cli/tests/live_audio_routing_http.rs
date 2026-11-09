@@ -137,6 +137,8 @@ async fn put_routing(
         publisher,
         commands,
         multiview_control::no_preview(),
+        None, // switcher absent (legacy path)
+        None, // switcher lease owner absent
         None,
         None,
         None,

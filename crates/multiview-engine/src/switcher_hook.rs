@@ -1,0 +1,114 @@
+//! Owned frame hook for a first-slice one-cell Program scene. No shared mutex
+//! crosses between the frame boundary and completion callbacks.
+use crate::clock::Tick;
+use crate::drive::{CompositedFrame, CompositorDrive};
+use crate::runtime::FrameControl;
+use crate::switcher_control::SwitcherTickDriver;
+use multiview_compositor::pipeline::Nv12Image;
+use multiview_core::switcher::SourceRef;
+use multiview_framestore::{SwapCell, TileStore};
+use std::collections::HashMap;
+use std::sync::Arc;
+
+/// Rebinds only one named full-canvas cell; the separate PVW monitor/encode
+/// provider owns its own frame slot. Unknown source/store is rejected up front.
+pub struct SwitcherFrameHook<C> {
+    /// Sole M/E state owner on the output-clock task.
+    pub driver: SwitcherTickDriver,
+    /// The source-selected full-canvas program cell id.
+    pub cell_id: String,
+    /// Existing live source/layout/overlay control hook, preserved verbatim.
+    pub legacy: C,
+    last_program: Option<SourceRef>,
+    failed_tick: Option<u64>,
+    /// Off-clock PVW monitor slot; `None` until a real PVW source frame exists.
+    pub preview_slot: Option<Arc<SwapCell<Option<Arc<Nv12Image>>>>>,
+    /// Shared store map, reused rather than decoding the preview source twice.
+    pub preview_stores: Option<HashMap<String, Arc<TileStore<Nv12Image>>>>,
+    fps_num: i64,
+    fps_den: i64,
+}
+
+impl<C> SwitcherFrameHook<C> {
+    /// Create the hook with a live source id in one addressable cell.
+    #[must_use]
+    pub fn new(driver: SwitcherTickDriver, cell_id: String, legacy: C) -> Self {
+        Self {
+            driver,
+            cell_id,
+            legacy,
+            last_program: None,
+            failed_tick: None,
+            preview_slot: None,
+            preview_stores: None,
+            fps_num: 0,
+            fps_den: 0,
+        }
+    }
+}
+
+impl<C: FnMut(&mut CompositorDrive<Nv12Image>)> FrameControl for SwitcherFrameHook<C> {
+    fn before_compose(&mut self, drive: &mut CompositorDrive<Nv12Image>, tick: Tick) {
+        self.fps_num = drive.layout().canvas.fps_num;
+        self.fps_den = drive.layout().canvas.fps_den;
+        (self.legacy)(drive);
+        self.driver.drain_at_tick(tick);
+        let (program, _) = self.driver.selections();
+        if self.last_program.as_ref() != Some(program) {
+            if let Err(error) = drive.rebind_cell(&self.cell_id, program.as_str()) {
+                self.failed_tick = Some(tick.index);
+                self.driver.reject_composed_tick(tick, &error.to_string());
+            } else {
+                self.last_program = Some(program.clone());
+            }
+        }
+    }
+
+    fn after_compose(&mut self, frame: &CompositedFrame) {
+        // A cheap, wait-free source sample only (no lock, no allocation): the
+        // selected PVW source's newest frame becomes the monitor picture. An
+        // actual configured full-rate PVW output must instead own its own
+        // admitted compositor/rendition — this tap never composes or encodes.
+        if let (Some(slot), Some(stores)) = (&self.preview_slot, &self.preview_stores) {
+            let (_, preview) = self.driver.selections();
+            let picture = stores
+                .get(preview.as_str())
+                .and_then(|store| store.read_at(frame.tick.pts).frame().cloned());
+            // A missing PVW frame stays an honest "unavailable" monitor; it is
+            // never replaced with the Program canvas.
+            slot.store(picture);
+        }
+        // A rejected take must not commit its (rolled-back) state, and a repeat
+        // tick never reaches here. Everything below describes a fresh frame.
+        if self.failed_tick.take() == Some(frame.tick.index) {
+            return;
+        }
+        self.driver.commit_composed_tick(frame.tick);
+        // Capability is advertised only once BOTH real buses have a picture and
+        // the authored scene generation is known — never a fabricated version,
+        // so the control plane cannot 202 an unwired or version-mismatched
+        // provider.
+        let preview_ready = self
+            .preview_slot
+            .as_ref()
+            .is_some_and(|slot| slot.load().is_some());
+        if preview_ready {
+            if let Some(pair) = self.driver.scene_pair() {
+                self.driver
+                    .publish_provider_status(crate::switcher_control::ProviderStatus {
+                        scene_version: pair.version,
+                        last_tick: frame.tick.index,
+                        width: frame.canvas.width(),
+                        height: frame.canvas.height(),
+                        fps_num: self.fps_num,
+                        fps_den: self.fps_den,
+                    });
+            }
+        }
+    }
+
+    fn on_repeat(&mut self, drive: &mut CompositorDrive<Nv12Image>, tick: Tick) {
+        (self.legacy)(drive);
+        self.driver.repeat_tick(tick);
+    }
+}

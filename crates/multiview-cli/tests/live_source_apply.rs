@@ -632,6 +632,8 @@ async fn a_policy_only_generic_put_never_restarts_a_synthetic_producer() {
         Arc::clone(&publisher),
         sender,
         multiview_control::no_preview(),
+        None, // switcher absent (legacy path)
+        None, // switcher lease owner absent
         None,
         None,
         None,
@@ -868,6 +870,8 @@ async fn an_identical_reapply_after_a_guide_only_edit_retries_the_producer() {
         Arc::clone(&publisher),
         sender,
         multiview_control::no_preview(),
+        None, // switcher absent (legacy path)
+        None, // switcher lease owner absent
         None,
         None,
         None,

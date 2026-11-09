@@ -13,6 +13,7 @@
 import {
   apiUrl,
   buildHeaders,
+  sendCommand,
   OperationApiError,
   readProblem,
 } from './operations';
@@ -112,13 +113,10 @@ export async function takeRoute(
   request: RouteTakeRequest,
   options: RequestOptions = {},
 ): Promise<TakeOutcome> {
-  const response = await fetch(
-    apiUrl(options, `/api/v1/routing/${encodeURIComponent(kind)}/take`),
-    {
-      method: 'POST',
-      headers: buildHeaders(options, true),
-      body: JSON.stringify(request),
-    },
+  const response = await sendCommand(
+    `/api/v1/routing/${encodeURIComponent(kind)}/take`,
+    options,
+    { body: request },
   );
   if (!response.ok) {
     throw await readProblem(response);

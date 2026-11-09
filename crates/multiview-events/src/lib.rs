@@ -49,9 +49,9 @@ pub use event::{
     HealthWarning, ImpactClass, InputConnection, InputLifecycle, InputStreams, JobProgress,
     LeaseHolder, LifecycleState, MediaPlayerEvent, MediaPlayerState, ModePhase, OutputRunState,
     OutputStatus, RistLinkRole, RistLinkStats, SalvoEvent, SalvoPhase, ShedLoad, ShedReason,
-    ShedScope, SourceLifecycle, SyncCapability, SyncChange, SyncGroupSkew, SystemMetrics,
-    TallyEvent, TallyTarget, TileSnapshotEntry, TileState, TilesSnapshot, TimingStatus,
-    WarningCode, WarningSeverity,
+    ShedScope, SourceLifecycle, SwitcherOperation, SyncCapability, SyncChange, SyncGroupSkew,
+    SystemMetrics, TallyEvent, TallyTarget, TileSnapshotEntry, TileState, TilesSnapshot,
+    TimingStatus, WarningCode, WarningSeverity,
 };
 pub use ordering::{Accepted, TopicCursor};
 pub use seq::{Seq, SeqCounter};

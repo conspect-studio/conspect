@@ -10575,6 +10575,199 @@
         }
       }
     },
+    "/api/v1/switcher/commands/{kind}": {
+      "post": {
+        "tags": [
+          "switcher"
+        ],
+        "summary": "Enqueue a checked verb; a 202 never asserts frame application.",
+        "operationId": "submit_switcher",
+        "parameters": [
+          {
+            "name": "kind",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SwitcherRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "202": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SwitcherAccepted"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/switcher/plan": {
+      "post": {
+        "tags": [
+          "switcher"
+        ],
+        "summary": "Dry-run command admission, including BOLA on every referenced object.",
+        "operationId": "plan_switcher",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SwitcherRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SwitcherPlan"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/switcher/{me}": {
+      "get": {
+        "tags": [
+          "switcher"
+        ],
+        "summary": "Read authoritative state; no runtime means an explicit 409, never fake PGM.",
+        "operationId": "get_switcher",
+        "parameters": [
+          {
+            "name": "me",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SwitcherStateResponse"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/v1/sync-groups": {
       "get": {
         "tags": [
@@ -21354,6 +21547,132 @@
           "tile": {
             "type": "string",
             "description": "The tile/cell id whose source binding changes."
+          }
+        }
+      },
+      "SwitcherAccepted": {
+        "type": "object",
+        "description": "A 202 means queued, not yet on-air; operation completion arrives on a\ncorrelated engine outcome at its actual tick.",
+        "required": [
+          "operation_id",
+          "kind"
+        ],
+        "properties": {
+          "kind": {
+            "type": "string",
+            "description": "Verb name, never `applied`."
+          },
+          "operation_id": {
+            "type": "string",
+            "description": "Correlation id, echoed by the real tick driver's outcome."
+          }
+        }
+      },
+      "SwitcherPlan": {
+        "type": "object",
+        "description": "A dry-run result, including the scene generation the take must recheck.",
+        "required": [
+          "class",
+          "scene_version",
+          "can_take"
+        ],
+        "properties": {
+          "can_take": {
+            "type": "boolean",
+            "description": "Plan is valid only when a real engine bus is attached."
+          },
+          "class": {
+            "type": "string",
+            "description": "First-slice admission classification."
+          },
+          "scene_version": {
+            "type": "integer",
+            "format": "int64",
+            "description": "The exact immutable scene generation the caller may submit against.",
+            "minimum": 0
+          }
+        }
+      },
+      "SwitcherRequest": {
+        "type": "object",
+        "description": "One source-select, take or output-binding request. References are checked\nindependently; absent references never authorize implicitly.",
+        "required": [
+          "me",
+          "program",
+          "action"
+        ],
+        "properties": {
+          "action": {
+            "type": "string",
+            "description": "Action to classify on `/plan`, one of `select_program`, `select_preview`,\n`cut`, `auto`; the action is part of the same validated request."
+          },
+          "duration_frames": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32",
+            "description": "AUTO duration at the output's exact cadence; no floating milliseconds.",
+            "minimum": 0
+          },
+          "layout": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Referenced stored layout, when selecting an authored scene."
+          },
+          "me": {
+            "type": "string",
+            "description": "M/E identity (`me1` for the first slice)."
+          },
+          "output": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Referenced output to bind; all output reads/writes require output BOLA."
+          },
+          "program": {
+            "type": "string",
+            "description": "Program identity (`main` for the first slice)."
+          },
+          "source": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Referenced source for `select_program`/`select_preview`."
+          }
+        }
+      },
+      "SwitcherStateResponse": {
+        "type": "object",
+        "description": "Engine-owned bus selection and current tick, never guessed from request.",
+        "required": [
+          "tick",
+          "program_source",
+          "preview_source",
+          "in_flight"
+        ],
+        "properties": {
+          "in_flight": {
+            "type": "boolean",
+            "description": "Active AUTO status."
+          },
+          "preview_source": {
+            "type": "string",
+            "description": "Actual PVW source id."
+          },
+          "program_source": {
+            "type": "string",
+            "description": "Actual PGM source id."
+          },
+          "tick": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Applied output tick.",
+            "minimum": 0
           }
         }
       },

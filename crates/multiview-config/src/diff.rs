@@ -183,6 +183,7 @@ impl ConfigDiff {
             cells: running_cells,
             overlays: running_overlays,
             outputs: running_outputs,
+            programs: running_programs,
             probes: running_probes,
             tally_profiles: running_tally_profiles,
             salvos: running_salvos,
@@ -193,6 +194,7 @@ impl ConfigDiff {
             api: running_api,
             placement: running_placement,
             audio: running_audio,
+            switcher: running_switcher,
             routing: running_routing,
             discovery: running_discovery,
             catalogues: running_catalogues,
@@ -216,6 +218,7 @@ impl ConfigDiff {
             cells: next_cells,
             overlays: next_overlays,
             outputs: next_outputs,
+            programs: next_programs,
             probes: next_probes,
             tally_profiles: next_tally_profiles,
             salvos: next_salvos,
@@ -226,6 +229,7 @@ impl ConfigDiff {
             api: next_api,
             placement: next_placement,
             audio: next_audio,
+            switcher: next_switcher,
             routing: next_routing,
             discovery: next_discovery,
             catalogues: next_catalogues,
@@ -275,12 +279,14 @@ impl ConfigDiff {
         let media_changed = running_media_library != next_media_library
             || running_media_players != next_media_players;
         let mut changed_sections = BTreeSet::new();
-        let sectioned: [(&'static str, bool); 26] = [
+        let sectioned: [(&'static str, bool); 28] = [
             (
                 "schema_version",
                 running_schema_version != next_schema_version,
             ),
             ("outputs", running_outputs != next_outputs),
+            ("programs", running_programs != next_programs),
+            ("switcher", running_switcher != next_switcher),
             // Order-sensitive (`Vec` compares by position): a pure overlay
             // REORDER sets this so the file-watch overlay apply (`apply_overlay_
             // changes`) still reseeds the store to the new declaration order — the

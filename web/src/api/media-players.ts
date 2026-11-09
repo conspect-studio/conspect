@@ -20,6 +20,7 @@
 import {
   apiUrl,
   buildHeaders,
+  sendCommand,
   OperationApiError,
   readProblem,
   submitOperation,
@@ -111,11 +112,7 @@ async function submitTransport(
   body: TransportBody,
   options: RequestOptions = {},
 ): Promise<AcceptedBody> {
-  const response = await fetch(apiUrl(options, path), {
-    method: 'POST',
-    headers: buildHeaders(options, true),
-    body: JSON.stringify(body),
-  });
+  const response = await sendCommand(path, options, { body });
   if (!response.ok) {
     throw await readProblem(response);
   }

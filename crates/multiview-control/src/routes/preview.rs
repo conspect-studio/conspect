@@ -69,6 +69,40 @@ pub(crate) async fn program_jpeg(State(state): State<AppState>, principal: Princ
     }
 }
 
+/// `GET /api/v1/preview/switcher/{me}/preview.jpg` — an actual PVW tap,
+/// never a silent copy of the PGM monitor. M/E+program authorization applies.
+pub(crate) async fn switcher_preview_jpeg(
+    State(state): State<AppState>,
+    principal: Principal,
+    Path(me): Path<String>,
+) -> Response {
+    if let Err(err) = principal.role.require(Action::Read) {
+        return err.into_response();
+    }
+    if let Err(err) = crate::auth::authorize_object(&principal, &me) {
+        return err.into_response();
+    }
+    if let Err(err) =
+        crate::auth::authorize_scope(&principal, multiview_events::AuthzScope::Program("main"))
+    {
+        return err.into_response();
+    }
+    if me != "me1" {
+        return crate::error::ControlError::NotFound {
+            kind: "mix_effects",
+            id: me,
+        }
+        .into_response();
+    }
+    if state.switcher.is_none() {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    }
+    match state.preview.switcher_preview_jpeg(PREVIEW_QUALITY) {
+        Some(bytes) => jpeg_response(bytes),
+        None => StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    }
+}
+
 /// `GET /api/v1/preview/inputs/{id}.jpg` — the latest frame of input `id`
 /// (role: read). `503` when the input is unknown or has produced no frame.
 pub(crate) async fn input_jpeg(
