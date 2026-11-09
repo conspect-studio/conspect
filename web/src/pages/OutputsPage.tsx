@@ -1184,6 +1184,10 @@ export function OutputsPage(): JSX.Element {
 
   return (
     <>
+      <div
+        data-testid="output-page-header"
+        className="min-w-0 max-w-full [&>div>div]:min-w-0 [&>div>div]:max-w-full"
+      >
       <PageHeader
         title={<Trans>Outputs</Trans>}
         description={
@@ -1196,15 +1200,16 @@ export function OutputsPage(): JSX.Element {
           </span>
         }
         actions={
-          <>
+          <div data-testid="output-header-actions" className="flex min-w-0 max-w-full flex-wrap items-center gap-2">
             <ExportConfigButton compact />
-            <Button data-testid="crud-new" className="h-12 min-w-12" onClick={openCreate}>
+            <Button data-testid="crud-new" className="h-auto min-h-12 min-w-12 max-w-full whitespace-normal break-words py-2" onClick={openCreate}>
               <Plus aria-hidden="true" />
               <Trans>New output</Trans>
             </Button>
-          </>
+          </div>
         }
       />
+      </div>
 
       <ApplySemanticsCallout
         helpTo="/help/config#outputs"

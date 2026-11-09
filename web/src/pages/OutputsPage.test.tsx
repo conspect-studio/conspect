@@ -153,6 +153,19 @@ describe('OutputsPage broadcast cards (configured facts)', () => {
     expect(within(card).getByText('contribution-main-program-hls-primary-very-long-output-identifier')).toHaveClass('min-w-0', 'break-all');
   });
 
+  it('bounds and wraps both header actions without hiding labels or shrinking touch targets', async () => {
+    renderOutputs();
+    await screen.findByTestId('output-card-program');
+    const actions = screen.getByTestId('output-header-actions');
+    expect(actions).toHaveClass('flex', 'flex-wrap', 'min-w-0', 'max-w-full');
+    const header = screen.getByTestId('output-page-header');
+    // PageHeader's otherwise-nowrap action parent must also shrink to the route.
+    expect(header).toHaveClass('[&>div>div]:min-w-0', '[&>div>div]:max-w-full');
+    const create = within(actions).getByRole('button', { name: 'New output' });
+    expect(create).toHaveClass('h-auto', 'min-h-12', 'min-w-12', 'max-w-full', 'whitespace-normal', 'break-words');
+    expect(within(actions).getByRole('button', { name: /Export/ })).toBeVisible();
+  });
+
   it('keeps the 48px touch floor on every card action and the phone disclosure classes', async () => {
     renderOutputs();
     await screen.findByTestId('output-card-program');
@@ -162,7 +175,7 @@ describe('OutputsPage broadcast cards (configured facts)', () => {
     expect(edit).toHaveClass('h-12');
     expect(del).toHaveClass('h-12');
     // The New output key keeps the same floor.
-    expect(screen.getByRole('button', { name: 'New output' })).toHaveClass('h-12');
+    expect(screen.getByRole('button', { name: 'New output' })).toHaveClass('min-h-12');
 
     // The Details disclosure is the phone-only (md:hidden) 48px key, fully
     // controlled: aria-expanded flips on press and the panel follows it.
