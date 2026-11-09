@@ -325,6 +325,8 @@ fn persist_loaded_best_effort(boot_model: &multiview_control::boot_model::BootMo
 struct ControlPlaneWiring {
     #[cfg(feature = "moq-output")]
     moq_factory: Option<Arc<dyn multiview_control::moq_provider::AuthorizedFeedFactory>>,
+    #[cfg(feature = "moq-output")]
+    moq_slot: Option<multiview_cli::output_window_registry::WindowSubscriptionSlot>,
     /// The shared program-frame slot the run loop fills for previews.
     program_slot: multiview_cli::preview::ProgramSlot,
     /// The per-source last-good stores (the preview provider's initial map).
@@ -411,6 +413,8 @@ async fn serve_control_plane(
     let ControlPlaneWiring {
         #[cfg(feature = "moq-output")]
         moq_factory,
+        #[cfg(feature = "moq-output")]
+        moq_slot,
         program_slot,
         stores,
         registry,
@@ -516,6 +520,8 @@ async fn serve_control_plane(
         source_events,
         #[cfg(feature = "moq-output")]
         moq,
+        #[cfg(feature = "moq-output")]
+        moq_slot,
         async move {
             let _ = shutdown_rx.await;
         },
@@ -668,6 +674,8 @@ async fn run_pipeline_until_ctrl_c(
             ControlPlaneWiring {
                 #[cfg(feature = "moq-output")]
                 moq_factory: Some(pipeline.moq_feed_factory()),
+                #[cfg(feature = "moq-output")]
+                moq_slot: Some(pipeline.window_subscriptions()),
                 program_slot: Arc::clone(&preview_slot),
                 stores: pipeline.preview_stores(),
                 registry: pipeline.stop_registry(),
@@ -1055,6 +1063,8 @@ async fn run_software_until_ctrl_c(
             ControlPlaneWiring {
                 #[cfg(feature = "moq-output")]
                 moq_factory: None,
+                #[cfg(feature = "moq-output")]
+                moq_slot: None,
                 program_slot: engine.program_preview(),
                 stores: engine.preview_stores(),
                 registry: engine.stop_registry(),

@@ -147,6 +147,8 @@ where
         source_events,
         #[cfg(feature = "moq-output")]
         None,
+        #[cfg(feature = "moq-output")]
+        None,
         shutdown,
     )
     .await
@@ -189,6 +191,9 @@ pub async fn bind_and_serve_with_moq<F>(
     // the default unavailable provider for run paths without an event runtime.
     source_events: Option<crate::source_event_runtime::RuntimeReader>,
     #[cfg(feature = "moq-output")] moq: Option<Arc<multiview_control::moq::MoqRegistry>>,
+    #[cfg(feature = "moq-output")] moq_slot: Option<
+        crate::output_window_registry::WindowSubscriptionSlot,
+    >,
     shutdown: F,
 ) -> std::io::Result<(SocketAddr, JoinHandle<std::io::Result<()>>, AppState)>
 where
@@ -285,11 +290,19 @@ where
     #[cfg(not(feature = "gpu"))]
     let compositor_adapter: Option<multiview_hal::AdapterReport> = None;
 
+    let api_keys = Arc::new(api_keys);
+    #[cfg(feature = "moq-output")]
+    let outgoing = match moq_slot {
+        Some(slot) => crate::moq_outputs::factory::DynamicRegistryFactory(slot)
+            .activate_from_env(api_keys.clone())
+            .map_err(|_| std::io::Error::other("MoQ relay activation rejected"))?,
+        None => None,
+    };
     let mut state = AppState::new(
         publisher,
         commands,
         Arc::new(InMemoryRepository::new()),
-        Arc::new(api_keys),
+        api_keys,
     )
     .with_seeded_resources(seeded)
     .with_base_document(
@@ -492,6 +505,8 @@ where
     // the server future is dropped, so no management task survives the server.
     let shutdown = async move {
         let _reconciler = reconciler;
+        #[cfg(feature = "moq-output")]
+        let _outgoing = outgoing;
         shutdown.await;
     };
     let mut app = multiview_control::router(state.clone());

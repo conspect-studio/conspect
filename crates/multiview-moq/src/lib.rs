@@ -177,13 +177,16 @@ impl VideoAdapter {
             return Err(error);
         }
         // Reserve/serialize the ENTIRE window before mutating any group or PTS.
-        let prepared = window.packets.iter().map(|packet| {
-            provider::serialized_frame_in(packet, self.allocation.as_ref())
-        }).collect::<Result<Vec<_>, _>>()?;
+        let prepared = window
+            .packets
+            .iter()
+            .map(|packet| provider::serialized_frame_in(packet, self.allocation.as_ref()))
+            .collect::<Result<Vec<_>, _>>()?;
         for (packet, serialized) in window.packets.iter().zip(prepared) {
             if let Err(error) = self.publish_packet(packet, serialized) {
                 // Transport mutation cannot be rolled back; make this adapter terminal.
-                self.abort_group(); self.revoked = true;
+                self.abort_group();
+                self.revoked = true;
                 return Err(error);
             }
             self.last_pts = Some(packet.pts_us);
@@ -241,13 +244,18 @@ mod tests {
     }
     #[test]
     fn second_packet_budget_failure_preserves_video_group_and_pts() {
-        let budget=allocation::AllocationBudget::new(12).unwrap();
-        let mut adapter=adapter().with_allocation_budget(budget.clone());
-        let mut window=window(0,true);
-        window.packets.push(Packet { payload:Bytes::from_static(&[0,1]),pts_us:1,verified_rap:false });
-        assert_eq!(adapter.publish(&window),Err(Reject::Budget));
-        assert!(adapter.group.is_none()); assert_eq!(adapter.last_pts,None);
-        assert_eq!(budget.retained_bytes(),0);
+        let budget = allocation::AllocationBudget::new(12).unwrap();
+        let mut adapter = adapter().with_allocation_budget(budget.clone());
+        let mut window = window(0, true);
+        window.packets.push(Packet {
+            payload: Bytes::from_static(&[0, 1]),
+            pts_us: 1,
+            verified_rap: false,
+        });
+        assert_eq!(adapter.publish(&window), Err(Reject::Budget));
+        assert!(adapter.group.is_none());
+        assert_eq!(adapter.last_pts, None);
+        assert_eq!(budget.retained_bytes(), 0);
         assert!(!adapter.revoked);
     }
     #[test]

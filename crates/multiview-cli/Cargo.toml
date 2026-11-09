@@ -271,7 +271,7 @@ required-features = ["webrtc-native"]
 # in with one flag.
 [features]
 # Real existing-output conversion only; never opens a viewer encoder.
-moq-output = ["ffmpeg", "dep:multiview-moq", "dep:bytes", "dep:hang", "multiview-control/moq-transport"]
+moq-output = ["ffmpeg", "dep:multiview-moq", "dep:bytes", "dep:hang", "dep:url", "dep:rustix", "multiview-control/moq-transport"]
 default = ["software"]
 
 # Software-only reference path (always available).

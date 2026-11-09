@@ -3096,9 +3096,7 @@ impl Pipeline {
     /// into. The control plane (WHEP / MoQ startup) loads it to attach
     /// shared-rendition subscribers; an unloaded cell simply has no subscribers.
     #[allow(dead_code)] // reason: the control-plane consumer (MoQ/WHEP startup) wires in its own lane; the producer side is published and tested here.
-    pub(crate) fn window_subscriptions(
-        &self,
-    ) -> crate::output_window_registry::WindowSubscriptionSlot {
+    pub fn window_subscriptions(&self) -> crate::output_window_registry::WindowSubscriptionSlot {
         Arc::clone(&self.window_subscriptions)
     }
 

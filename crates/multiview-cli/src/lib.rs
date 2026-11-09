@@ -191,7 +191,7 @@ mod binding_delivery;
 #[cfg(feature = "moq-output")]
 pub mod moq_outputs;
 #[cfg(feature = "ffmpeg")]
-pub(crate) mod output_window_registry;
+pub mod output_window_registry;
 /// The full libav\* end-to-end `multiview run` pipeline (ingest → composite →
 /// encode-once → fan out to file/HLS sinks). Behind the off-by-default `ffmpeg`
 /// feature so the baseline build stays pure-Rust; software H.264/H.265 needs

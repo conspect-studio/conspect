@@ -377,7 +377,7 @@ fn try_reserve_slot(slots: &AtomicUsize) -> Result<(), SubscribeError> {
 
 /// Off-clock handle for authenticated, effective-output lookup and attachment.
 #[derive(Clone)]
-pub(crate) struct SubscriptionFactory {
+pub struct SubscriptionFactory {
     effective: Arc<SwapCell<Arc<Vec<EffectiveBinding>>>>,
     commands: SyncSender<Attach>,
     next_id: Arc<AtomicU64>,
@@ -514,7 +514,7 @@ pub(crate) fn next_run_generation() -> u64 {
 /// plane (reader, e.g. the MoQ/WHEP startup). The consumer stores this run's
 /// factory once, before the first window; the reader loads it lock-free and
 /// never blocks the producer (invariants #1/#10).
-pub(crate) type WindowSubscriptionSlot = Arc<SwapCell<Option<Arc<SubscriptionFactory>>>>;
+pub type WindowSubscriptionSlot = Arc<SwapCell<Option<Arc<SubscriptionFactory>>>>;
 #[must_use]
 pub(crate) fn window_subscription_slot() -> WindowSubscriptionSlot {
     Arc::new(SwapCell::empty())

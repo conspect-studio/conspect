@@ -104,6 +104,114 @@ pub(crate) struct RenditionFamily {
 pub(crate) struct DynamicRegistryFactory(
     pub(crate) crate::output_window_registry::WindowSubscriptionSlot,
 );
+pub(crate) struct OutgoingTask(tokio::task::JoinHandle<()>);
+impl Drop for OutgoingTask {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+impl DynamicRegistryFactory {
+    /// Explicit one-shot opt-in, independent of viewer admissions. The endpoint
+    /// is read from a private regular file, never an argument or diagnostic.
+    pub(crate) fn activate_from_env(
+        &self,
+        keys: Arc<multiview_control::auth::ApiKeyStore>,
+    ) -> Result<Option<OutgoingTask>, MoqReject> {
+        let Some(key_id) = std::env::var("MULTIVIEW_MOQ_RELAY_KEY_ID").ok() else {
+            return Ok(None);
+        };
+        let output =
+            std::env::var("MULTIVIEW_MOQ_RELAY_OUTPUT").map_err(|_| MoqReject::Unavailable)?;
+        let principal = keys
+            .principal_for_key(&key_id)
+            .ok_or(MoqReject::Forbidden)?;
+        principal
+            .role
+            .require(multiview_control::auth::Action::Write)
+            .map_err(|_| MoqReject::Forbidden)?;
+        let path =
+            std::env::var("MULTIVIEW_MOQ_RELAY_URL_FILE").map_err(|_| MoqReject::Unavailable)?;
+        #[cfg(unix)]
+        let endpoint = {
+            use std::io::Read;
+            use std::os::unix::fs::OpenOptionsExt;
+            use std::os::unix::fs::PermissionsExt;
+            let file = std::fs::OpenOptions::new()
+                .read(true)
+                .custom_flags(
+                    i32::try_from(rustix::fs::OFlags::NOFOLLOW.bits())
+                        .map_err(|_| MoqReject::Unavailable)?,
+                )
+                .open(path)
+                .map_err(|_| MoqReject::Unavailable)?;
+            let meta = file.metadata().map_err(|_| MoqReject::Unavailable)?;
+            if !meta.is_file() || meta.permissions().mode() & 0o077 != 0 || meta.len() > 8192 {
+                return Err(MoqReject::Unavailable);
+            }
+            let mut value = String::new();
+            file.take(8193)
+                .read_to_string(&mut value)
+                .map_err(|_| MoqReject::Unavailable)?;
+            value.trim().to_owned()
+        };
+        #[cfg(not(unix))]
+        let endpoint: String = {
+            let _ = path;
+            return Err(MoqReject::Unavailable);
+        };
+        let endpoint = url::Url::parse(&endpoint).map_err(|_| MoqReject::Unavailable)?;
+        if endpoint.scheme() != "https"
+            || endpoint.host_str().is_none()
+            || endpoint.fragment().is_some()
+        {
+            return Err(MoqReject::Unavailable);
+        }
+        if std::env::var("MULTIVIEW_MOQ_RELAY_PROTECTED")
+            .ok()
+            .is_some_and(|value| value != "false")
+        {
+            return Err(MoqReject::Unavailable);
+        }
+        let config = multiview_moq::provider::FamilyRelayConfig {
+            endpoint,
+            connect: Default::default(),
+            overhead_bps: 0,
+            send_window_bytes: 4 * 1024 * 1024,
+            retained_bytes: 8 * 1024 * 1024,
+            protected: false,
+        };
+        let generation = keys.generation();
+        let slot = self.0.clone();
+        Ok(Some(OutgoingTask(tokio::spawn(async move {
+            let dynamic = DynamicRegistryFactory(slot);
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+            while !dynamic.available() {
+                if keys.generation() != generation || tokio::time::Instant::now() >= deadline {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            let scope = WhepScope::Output(output);
+            let Ok(mut publisher) = dynamic.start_outgoing(&principal, &scope, config).await else {
+                return;
+            };
+            loop {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                if keys.generation() != generation || !dynamic.available() {
+                    break;
+                }
+                let Ok(current) = dynamic.current() else {
+                    break;
+                };
+                if current.subscriptions.generation() != publisher.ladder().generation() {
+                    break;
+                }
+            }
+            publisher.shutdown().await;
+        }))))
+    }
+}
+
 impl DynamicRegistryFactory {
     pub(crate) async fn start_outgoing(
         &self,
