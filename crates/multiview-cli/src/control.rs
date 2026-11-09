@@ -130,6 +130,70 @@ pub async fn bind_and_serve<F>(
 where
     F: Future<Output = ()> + Send + 'static,
 {
+    bind_and_serve_with_moq(
+        listen,
+        config,
+        publisher,
+        commands,
+        preview,
+        whep,
+        whip,
+        whep_output,
+        licence,
+        mesh,
+        live_apply,
+        live_sources,
+        boot_model,
+        source_events,
+        #[cfg(feature = "moq-output")]
+        None,
+        shutdown,
+    )
+    .await
+}
+
+/// Serve the control plane with an explicit run-scoped MoQ authority.
+/// # Errors
+/// Returns listener, seed-resource or control server initialization errors.
+#[allow(
+    clippy::too_many_arguments,
+    clippy::too_many_lines,
+    clippy::similar_names
+)]
+pub async fn bind_and_serve_with_moq<F>(
+    listen: &str,
+    config: &MultiviewConfig,
+    publisher: Arc<EnginePublisher<EngineStateSnapshot, Event>>,
+    commands: CommandSender,
+    preview: SharedPreview,
+    // The WHEP focus transport (ADR-P006), already cap-decorated. `None` keeps
+    // the default `NoWhep` (a pure build sheds every focus to the JPEG ladder).
+    whep: Option<multiview_control::SharedWhep>,
+    // The WHIP ingest provider (ADR-T014). `None` keeps the default `NoWhip`
+    // (every publish answers `503`; routes stay present + authz-enforced).
+    whip: Option<multiview_control::SharedWhip>,
+    whep_output: Option<multiview_control::SharedWhepOutput>,
+    licence: Option<multiview_control::LicenceState>,
+    mesh: Option<Arc<multiview_mesh::MeshState>>,
+    live_apply: multiview_control::LiveApplyCaps,
+    // The run-path live-apply capability (ADR-W018): which source kinds the
+    // RUNNING engine can take live. The binary derives it from the seams it
+    // actually wired (network kinds iff the hub has an ingest spawner), so
+    // the X-Multiview-Apply header never over-claims.
+    live_sources: multiview_control::LiveSourceCapability,
+    // The Boot/Loaded/Running model (ADR-W024): `Some` for a config-file run
+    // (backs `GET /config/boot-model` + the revert/promote actions); `None`
+    // for store-only/`--ticks` runs (those routes report `modeled: false`).
+    boot_model: Option<Arc<multiview_control::boot_model::BootModel>>,
+    // Read-only source event snapshots from the running pipeline. `None` keeps
+    // the default unavailable provider for run paths without an event runtime.
+    source_events: Option<crate::source_event_runtime::RuntimeReader>,
+    #[cfg(feature = "moq-output")] moq: Option<Arc<multiview_control::moq::MoqRegistry>>,
+    shutdown: F,
+) -> std::io::Result<(SocketAddr, JoinHandle<std::io::Result<()>>, AppState)>
+where
+    F: Future<Output = ()> + Send + 'static,
+{
     let listener = TcpListener::bind(listen).await?;
     let addr = listener.local_addr()?;
 
@@ -234,6 +298,8 @@ where
     )
     .with_preview(preview)
     .with_warning_store(warnings);
+    #[cfg(feature = "moq-output")]
+    if let Some(moq) = moq { state = state.with_moq(moq); }
     if let Some(reader) = source_events {
         state = state.with_source_events(Arc::new(reader));
     }

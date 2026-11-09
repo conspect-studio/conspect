@@ -34,6 +34,34 @@ pub struct MoqAudio {
     /// Base64 decoder initialization bytes, when required.
     pub description: Option<String>,
 }
+/// One selectable video alternative of an authorized ladder, on the HTTP wire.
+///
+/// `description` stays **base64**, exactly like [`MoqVideo::description`]; the
+/// Hang catalog's hexadecimal form is a different, internal encoding and must
+/// never be substituted here. A published alternative always carries an exact
+/// rational cadence and a positive verified bitrate: a rung whose cadence or
+/// bitrate is not verified is omitted (`video_alternatives` stays empty) rather
+/// than fabricated or emitted as `0`.
+#[derive(Clone, serde::Serialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+pub struct MoqVideoAlternative {
+    /// Stable rendition identity inside the family (the published track name).
+    pub track: String,
+    /// `WebCodecs` codec identifier from the opened encoder.
+    pub codec: String,
+    /// Encoded width in pixels.
+    pub coded_width: u32,
+    /// Encoded height in pixels.
+    pub coded_height: u32,
+    /// Exact cadence numerator (frames per `cadence_denominator`).
+    pub cadence_numerator: u32,
+    /// Exact cadence denominator; never a float frame rate.
+    pub cadence_denominator: u32,
+    /// Verified bitrate in bits per second; never `0` and never a guess.
+    pub bitrate_bps: u64,
+    /// Base64 decoder initialization bytes, when the encoder supplied them.
+    pub description: Option<String>,
+}
 /// Secret-bearing admission response. Deliberately does not implement Debug.
 #[derive(Clone, serde::Serialize)]
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
@@ -44,16 +72,27 @@ pub struct MoqLease {
     pub generation: u64,
     /// Server-enforced expiry in RFC3339 format.
     pub expires_at: String,
+    /// Conservative remaining server lifetime at response construction.
+    pub expires_in_ms: u64,
     /// Short-lived authorized transport URL; never log.
     pub url: String,
     /// Authorized broadcast namespace.
     pub broadcast: String,
     /// Explicit negotiated protocol identifier.
     pub protocol: String,
-    /// Video decoder configuration.
+    /// Video decoder configuration of the selected rendition.
     pub video: MoqVideo,
-    /// Independent audio decoder configurations.
+    /// Every authorized video alternative of this lease's ladder, in registry
+    /// order. Empty for a single-rendition lease; the selected [`Self::video`]
+    /// stays populated for back-compatible consumers.
+    pub video_alternatives: Vec<MoqVideoAlternative>,
+    /// Independent audio decoder configurations, shared by every alternative.
     pub audio: Vec<MoqAudio>,
+    /// PTS-zero wall time in microseconds, when the pipeline supplied the epoch.
+    /// `None` when no validated epoch is available on this seam — never a
+    /// fabricated `0`, which would silently claim all renditions start at the
+    /// Unix epoch.
+    pub clock_wall_micros: Option<u64>,
 }
 /// Acknowledges a synchronous stop-enqueue fence, not transport shutdown.
 #[derive(serde::Serialize)]
@@ -85,7 +124,8 @@ pub enum MoqReject {
 /// Subscription-owned registry fence. Must synchronously stop enqueue and release demand;
 /// transport teardown and retained batch leases remain independently bounded.
 pub trait MoqFence: Send + Sync {
-    /// Stop enqueue synchronously; never wait for network teardown.
+    /// Stop enqueue synchronously; never wait for network teardown. Implementations
+    /// must be bounded and nonpanicking. A failed/panicking fence is never ACKed.
     fn revoke(&self);
 }
 /// Provider must authorize resolved dependencies before admission. It must never encode per viewer.
@@ -125,13 +165,16 @@ struct Entry {
     scope: String,
     generation: u64,
     fence: Option<Arc<dyn MoqFence>>,
+    fenced: Arc<std::sync::atomic::AtomicBool>,
 }
-/// Bounded control registry. Tombstones live only until original TTL to allow idempotent close.
+/// Bounded control registry. Identity tombstones survive expiry for one bounded
+/// grace period so a matching DELETE can acknowledge the completed fence.
 pub struct MoqRegistry {
     provider: Arc<dyn MoqProvider>,
     entries: Mutex<HashMap<String, Entry>>,
     ttl: Duration,
     capacity: usize,
+    tombstones: Mutex<HashMap<String, (Entry, std::time::Instant)>>,
 }
 impl Default for MoqRegistry {
     fn default() -> Self {
@@ -146,6 +189,7 @@ impl MoqRegistry {
             entries: Mutex::new(HashMap::new()),
             ttl: ttl.clamp(Duration::from_secs(1), Duration::from_secs(60)),
             capacity: capacity.min(4096),
+            tombstones: Mutex::new(HashMap::new()),
         }
     }
     /// Whether admission has a real transport provider.
@@ -164,9 +208,12 @@ impl MoqRegistry {
         if entries.len() >= self.capacity {
             return Err(MoqReject::Capacity);
         }
+        let started = std::time::Instant::now();
         let id = uuid::Uuid::new_v4().to_string();
         let (mut lease, fence) = self.provider.admit(principal, scope, &id, self.ttl)?;
         lease.lease_id.clone_from(&id);
+        lease.expires_in_ms = u64::try_from(self.ttl.saturating_sub(started.elapsed()).as_millis())
+            .unwrap_or(u64::MAX);
         let seconds = (SystemTime::now() + self.ttl)
             .duration_since(SystemTime::UNIX_EPOCH)
             .unwrap_or_default()
@@ -182,6 +229,7 @@ impl MoqRegistry {
                 scope: scope.label(),
                 generation: lease.generation,
                 fence: Some(fence),
+                fenced: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             },
         );
         let weak = Arc::downgrade(self);
@@ -189,11 +237,32 @@ impl MoqRegistry {
         tokio::spawn(async move {
             tokio::time::sleep(ttl).await;
             if let Some(registry) = weak.upgrade() {
-                if let Ok(mut entries) = registry.entries.lock() {
-                    if let Some(entry) = entries.remove(&id) {
-                        if let Some(fence) = entry.fence {
-                            fence.revoke();
+                let transition = (|| {
+                    // Acquire both maps before removing the identity. A poisoned
+                    // second lock cannot discard an otherwise valid lease.
+                    let mut entries = registry.entries.lock().ok()?;
+                    let mut tombstones = registry.tombstones.lock().ok()?;
+                    let mut entry = entries.remove(&id)?;
+                    let fence = entry.fence.take();
+                    let fenced = entry.fenced.clone();
+                    let now = std::time::Instant::now();
+                    tombstones.retain(|_, (_, expiry)| *expiry > now);
+                    if tombstones.len() >= registry.capacity {
+                        if let Some(oldest) = tombstones
+                            .iter()
+                            .min_by_key(|(_, (_, expiry))| *expiry)
+                            .map(|(id, _)| id.clone())
+                        {
+                            tombstones.remove(&oldest);
                         }
+                    }
+                    tombstones.insert(id.clone(), (entry, now + Duration::from_secs(60)));
+                    Some((fence, fenced))
+                })();
+                if let Some((fence, fenced)) = transition {
+                    if let Some(fence) = fence {
+                        fence.revoke();
+                        fenced.store(true, std::sync::atomic::Ordering::Release);
                     }
                 }
             }
@@ -211,15 +280,32 @@ impl MoqRegistry {
         generation: u64,
     ) -> Result<MoqRevoked, MoqReject> {
         let mut entries = self.entries.lock().map_err(|_| MoqReject::Unavailable)?;
-        let entry = entries.get_mut(id).ok_or(MoqReject::NotFound)?;
+        let mut tombstones = self.tombstones.lock().map_err(|_| MoqReject::Unavailable)?;
+        let now = std::time::Instant::now();
+        tombstones.retain(|_, (_, expiry)| *expiry > now);
+        let entry = if let Some(entry) = entries.get_mut(id) {
+            entry
+        } else {
+            &mut tombstones.get_mut(id).ok_or(MoqReject::NotFound)?.0
+        };
         if entry.owner != principal.key_id || entry.scope != scope.label() {
             return Err(MoqReject::Forbidden);
         }
         if entry.generation != generation {
             return Err(MoqReject::Generation);
         }
-        if let Some(fence) = entry.fence.take() {
+        let fence = entry.fence.take();
+        let fenced = entry.fenced.clone();
+        if fence.is_none() && !fenced.load(std::sync::atomic::Ordering::Acquire) {
+            // A concurrent expiry/DELETE owns the synchronous fence. Never ACK
+            // before that callback completes and never block unrelated leases.
+            return Err(MoqReject::Unavailable);
+        }
+        drop(tombstones);
+        drop(entries);
+        if let Some(fence) = fence {
             fence.revoke();
+            fenced.store(true, std::sync::atomic::Ordering::Release);
         }
         Ok(MoqRevoked {
             lease_id: id.to_owned(),
@@ -264,6 +350,7 @@ mod tests {
                     lease_id: String::new(),
                     generation: 7,
                     expires_at: String::new(),
+                    expires_in_ms: 0,
                     url: "https://example.test".into(),
                     broadcast: "test".into(),
                     protocol: "moqt-16".into(),
@@ -273,6 +360,8 @@ mod tests {
                         coded_height: 180,
                         description: None,
                     },
+                    video_alternatives: vec![],
+                    clock_wall_micros: None,
                     audio: vec![],
                 },
                 Arc::new(Fence(self.0.clone())),
@@ -342,6 +431,116 @@ mod tests {
         drop(r);
         assert_eq!(calls.load(Ordering::SeqCst), 2);
     }
+    #[tokio::test]
+    async fn expired_identity_ack_requires_owner_scope_and_generation() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let registry = Arc::new(MoqRegistry::new(
+            Arc::new(Provider(calls.clone())),
+            Duration::from_secs(1),
+            1,
+        ));
+        let owner = principal("owner");
+        let lease = registry.open(&owner, &WhepScope::Program).unwrap();
+        tokio::time::sleep(Duration::from_millis(1100)).await;
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert!(matches!(
+            registry.revoke(&principal("other"), &WhepScope::Program, &lease.lease_id, 7),
+            Err(MoqReject::Forbidden)
+        ));
+        assert!(matches!(
+            registry.revoke(&owner, &WhepScope::Program, &lease.lease_id, 8),
+            Err(MoqReject::Generation)
+        ));
+        assert!(
+            registry
+                .revoke(&owner, &WhepScope::Program, &lease.lease_id, 7)
+                .unwrap()
+                .revoked
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert!(registry.open(&owner, &WhepScope::Program).is_ok());
+        assert!(registry.tombstones.lock().unwrap().len() <= 1);
+    }
+
+    #[tokio::test]
+    async fn fence_callback_runs_without_registry_locks_and_pending_never_acks() {
+        struct Reentrant {
+            registry: std::sync::Weak<MoqRegistry>,
+            id: String,
+            checked: Arc<AtomicUsize>,
+        }
+        impl MoqFence for Reentrant {
+            fn revoke(&self) {
+                let registry = self.registry.upgrade().unwrap();
+                assert!(registry.entries.try_lock().is_ok());
+                assert!(registry.tombstones.try_lock().is_ok());
+                assert!(matches!(
+                    registry.revoke(&principal("a"), &WhepScope::Program, &self.id, 7),
+                    Err(MoqReject::Unavailable)
+                ));
+                self.checked.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        let registry = Arc::new(MoqRegistry::default());
+        let checked = Arc::new(AtomicUsize::new(0));
+        registry.entries.lock().unwrap().insert(
+            "id".into(),
+            Entry {
+                owner: "a".into(),
+                scope: WhepScope::Program.label(),
+                generation: 7,
+                fence: Some(Arc::new(Reentrant {
+                    registry: Arc::downgrade(&registry),
+                    id: "id".into(),
+                    checked: checked.clone(),
+                })),
+                fenced: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            },
+        );
+        assert!(
+            registry
+                .revoke(&principal("a"), &WhepScope::Program, "id", 7)
+                .unwrap()
+                .revoked
+        );
+        assert_eq!(checked.load(Ordering::SeqCst), 1);
+        assert!(
+            registry
+                .revoke(&principal("a"), &WhepScope::Program, "id", 7)
+                .unwrap()
+                .revoked
+        );
+    }
+
+    #[test]
+    fn panicking_fence_never_becomes_acknowledged() {
+        struct Panics;
+        impl MoqFence for Panics {
+            fn revoke(&self) {
+                panic!("invalid fence implementation");
+            }
+        }
+        let registry = MoqRegistry::default();
+        registry.entries.lock().unwrap().insert(
+            "id".into(),
+            Entry {
+                owner: "a".into(),
+                scope: WhepScope::Program.label(),
+                generation: 7,
+                fence: Some(Arc::new(Panics)),
+                fenced: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            },
+        );
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            registry.revoke(&principal("a"), &WhepScope::Program, "id", 7)
+        }));
+        assert!(result.is_err());
+        assert!(matches!(
+            registry.revoke(&principal("a"), &WhepScope::Program, "id", 7),
+            Err(MoqReject::Unavailable)
+        ));
+    }
+
     #[tokio::test]
     async fn default_unavailable() {
         let r = Arc::new(MoqRegistry::default());

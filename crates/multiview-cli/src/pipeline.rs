@@ -3102,6 +3102,16 @@ impl Pipeline {
         Arc::clone(&self.window_subscriptions)
     }
 
+    /// The control-plane adapter for this exact run's canonical registry slot.
+    #[cfg(feature = "moq-output")]
+    pub fn moq_feed_factory(
+        &self,
+    ) -> Arc<dyn multiview_control::moq_provider::AuthorizedFeedFactory> {
+        Arc::new(crate::moq_outputs::factory::DynamicRegistryFactory(
+            self.window_subscriptions(),
+        ))
+    }
+
     /// Run the engine for exactly `max_ticks` ticks under the realtime pacer,
     /// then encode the composited program once and fan it out to every
     /// configured sink.

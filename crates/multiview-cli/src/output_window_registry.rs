@@ -44,16 +44,16 @@ const WINDOW_HANDOFF: usize = 2;
 /// Opened video codec data for an effective rendition.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct VideoDescriptor {
-    /// Converter-facing identifier: the RFC 6381 token when the opened
-    /// parameters identify one, else the exact libav identity.
+    /// Converter-facing RFC 6381 token from actual SPS bytes. A libav identity
+    /// is internal-only while the initial metadata remains unavailable.
     pub(crate) codec: String,
     /// Exact opened libav codec identity — never a requested token or a guessed
     /// profile.
     pub(crate) codec_id: String,
     pub(crate) coded_width: u32,
     pub(crate) coded_height: u32,
-    /// Opened encoder's exact codec configuration record (avcC/hvcC/…), if it
-    /// supplied one.
+    /// Validated decoder description, possibly derived from emitted parameter
+    /// sets. This does NOT change packet framing: avcC samples need conversion.
     pub(crate) config: Option<Vec<u8>>,
     pub(crate) time_base: Rational,
     /// Actual output clock cadence, independent of the packet timestamp scale.
@@ -94,14 +94,27 @@ impl VideoDescriptor {
             _ => None,
         };
         let identity = format!("{:?}", params.codec_id());
+        let avc = (params.codec_id() == ffmpeg::codec::Id::H264)
+            .then(|| params.codec_config_bytes())
+            .flatten()
+            .and_then(|bytes| {
+                multiview_ffmpeg::codec_metadata::AvcDecoderConfig::from_extradata(&bytes)
+            });
         Some(Self {
-            codec: params
-                .hls_codec()
-                .map_or_else(|| identity.clone(), str::to_owned),
+            codec: avc.as_ref().map_or_else(
+                || {
+                    if params.codec_id() == ffmpeg::codec::Id::H264 {
+                        "H264".to_owned() // internal pending marker, never published
+                    } else {
+                        params.hls_codec().unwrap_or("").to_owned()
+                    }
+                },
+                |config| config.codec.clone(),
+            ),
             codec_id: identity,
             coded_width,
             coded_height,
-            config: params.codec_config_bytes(),
+            config: avc.map(|config| config.description),
             time_base,
             cadence,
             bitrate_bps: params.opened_bit_rate(),
@@ -119,6 +132,7 @@ pub(crate) struct AudioDescriptor {
     pub(crate) track: String,
     pub(crate) kind: StreamKind,
     pub(crate) codec: String,
+    /// Actual opened bitrate; unknown remains absent.
     pub(crate) bitrate_bps: Option<u64>,
     pub(crate) sample_rate: u32,
     pub(crate) channels: u32,
@@ -364,11 +378,12 @@ fn try_reserve_slot(slots: &AtomicUsize) -> Result<(), SubscribeError> {
 /// Off-clock handle for authenticated, effective-output lookup and attachment.
 #[derive(Clone)]
 pub(crate) struct SubscriptionFactory {
-    effective: Arc<Vec<EffectiveBinding>>,
+    effective: Arc<SwapCell<Arc<Vec<EffectiveBinding>>>>,
     commands: SyncSender<Attach>,
     next_id: Arc<AtomicU64>,
     slots: Arc<AtomicUsize>,
     generation: u64,
+    closed: Arc<AtomicBool>,
 }
 impl SubscriptionFactory {
     /// `Program` has no arbitrary first-output fallback; `Input` has no
@@ -376,10 +391,14 @@ impl SubscriptionFactory {
     /// Resolve effective immutable codec/dependency metadata BEFORE authorization
     /// without allocating demand or a peer slot.
     pub(crate) fn resolve(&self, scope: &WhepScope) -> Result<EffectiveBinding, SubscribeError> {
+        if self.closed.load(Ordering::Acquire) {
+            return Err(SubscribeError::ProducerEnded);
+        }
         let WhepScope::Output(id) = scope else {
             return Err(SubscribeError::UnsupportedScope);
         };
         self.effective
+            .load()
             .iter()
             .find(|b| b.output_id == *id)
             .cloned()
@@ -402,6 +421,15 @@ impl SubscriptionFactory {
         generation: u64,
         external_cancelled: Arc<AtomicBool>,
     ) -> Result<Subscription, SubscribeError> {
+        self.subscribe_with_close_boundary(scope, generation, external_cancelled, || {})
+    }
+    fn subscribe_with_close_boundary(
+        &self,
+        scope: &WhepScope,
+        generation: u64,
+        external_cancelled: Arc<AtomicBool>,
+        before_enqueue: impl FnOnce(),
+    ) -> Result<Subscription, SubscribeError> {
         let binding = self.resolve(scope)?;
         if binding.video.reorder != crate::rendition_workers::ReorderBound::NoReorder {
             return Err(SubscribeError::Unavailable);
@@ -422,6 +450,7 @@ impl SubscriptionFactory {
             self.slots.fetch_sub(1, Ordering::AcqRel);
             return Err(SubscribeError::Capacity);
         }
+        before_enqueue();
         self.commands
             .try_send(Attach {
                 binding: binding.clone(),
@@ -436,6 +465,11 @@ impl SubscriptionFactory {
                     TrySendError::Disconnected(_) => SubscribeError::ProducerEnded,
                 }
             })?;
+        if self.closed.load(Ordering::Acquire) {
+            own_revoked.store(true, Ordering::Release);
+            self.slots.fetch_sub(1, Ordering::AcqRel);
+            return Err(SubscribeError::ProducerEnded);
+        }
         Ok(Subscription {
             id,
             binding,
@@ -463,7 +497,7 @@ impl SubscriptionFactory {
     /// are absent by construction. Read-only: resolving or listing allocates no
     /// demand and takes no peer slot.
     pub(crate) fn admitted(&self) -> Arc<Vec<EffectiveBinding>> {
-        Arc::clone(&self.effective)
+        self.effective.load()
     }
 }
 
@@ -494,9 +528,11 @@ pub(crate) fn window_subscription_slot() -> WindowSubscriptionSlot {
 /// own windows.
 pub(crate) struct OutputWindowRegistry {
     effective: Arc<Vec<EffectiveBinding>>,
+    published: Arc<SwapCell<Arc<Vec<EffectiveBinding>>>>,
     commands: Receiver<Attach>,
     peers: Vec<Peer>,
     rejected_windows: u64,
+    closed: Arc<AtomicBool>,
 }
 impl OutputWindowRegistry {
     /// # Errors
@@ -531,25 +567,36 @@ impl OutputWindowRegistry {
     /// snapshot is valid (a display-only run has no subscribable rendition).
     fn bare(effective: Vec<EffectiveBinding>, generation: u64) -> (Self, SubscriptionFactory) {
         let (tx, commands) = mpsc::sync_channel(COMMAND_DEPTH);
+        let published = Arc::new(SwapCell::new(Arc::new(effective.clone())));
         let effective = Arc::new(effective);
+        let closed = Arc::new(AtomicBool::new(false));
         (
             Self {
                 effective: Arc::clone(&effective),
+                published: Arc::clone(&published),
                 commands,
                 peers: Vec::new(),
                 rejected_windows: 0,
+                closed: closed.clone(),
             },
             SubscriptionFactory {
-                effective,
+                effective: published,
                 commands: tx,
                 next_id: Arc::new(AtomicU64::new(1)),
                 slots: Arc::new(AtomicUsize::new(0)),
                 generation,
+                closed,
             },
         )
     }
     /// Drain bounded commands; called once at each complete encoded window.
     fn reconcile(&mut self) {
+        if self.closed.load(Ordering::Acquire) {
+            while let Ok(attach) = self.commands.try_recv() {
+                attach.own_revoked.store(true, Ordering::Release);
+            }
+            return;
+        }
         for _ in 0..COMMAND_DEPTH {
             let Ok(attach) = self.commands.try_recv() else {
                 break;
@@ -664,6 +711,7 @@ impl OutputWindowRegistry {
     /// blind growth); the window's own age bound then decides between delivery and
     /// an explicit whole-window loss.
     pub(crate) fn pump(&mut self, now: Instant) {
+        self.reconcile();
         for peer in &mut self.peers {
             if !peer.enqueueable() {
                 continue;
@@ -704,10 +752,15 @@ impl OutputWindowRegistry {
     }
     /// Every subscription ended by the registry itself (run finished/aborted).
     pub(crate) fn close(&mut self) {
+        self.closed.store(true, Ordering::Release);
         for peer in &mut self.peers {
+            peer.own_revoked.store(true, Ordering::Release);
             peer.queue.close();
         }
         self.peers.clear();
+        while let Ok(attach) = self.commands.try_recv() {
+            attach.own_revoked.store(true, Ordering::Release);
+        }
     }
     pub(crate) fn rejected_windows(&self) -> u64 {
         self.rejected_windows
@@ -727,6 +780,12 @@ impl OutputWindowRegistry {
         })
     }
 }
+impl Drop for OutputWindowRegistry {
+    fn drop(&mut self) {
+        self.close();
+    }
+}
+
 /// Whether one effective binding may be admitted into a registry that serves
 /// `generation`. `ids` accumulates the ids already admitted, so a duplicate is
 /// refused instead of shadowing the binding that resolved first.
@@ -850,6 +909,7 @@ pub(crate) struct OutputWindowTap<D: WindowDelivery> {
     delivery: D,
     registry: OutputWindowRegistry,
     config_generation: u64,
+    pending_metadata: Vec<(EffectiveBinding, usize)>,
 }
 impl<D: WindowDelivery> OutputWindowTap<D> {
     /// Wrap the physical delivery exactly once. Every binding that is not
@@ -865,14 +925,19 @@ impl<D: WindowDelivery> OutputWindowTap<D> {
         let mut ids = std::collections::HashSet::new();
         let effective: Vec<EffectiveBinding> = effective
             .into_iter()
+            .filter(|binding| binding.video.codec_id != "HEVC")
             .filter(|binding| admissible(binding, config_generation, &mut ids))
             .collect();
+        let (pending, effective): (Vec<_>, Vec<_>) = effective.into_iter().partition(|binding| {
+            binding.video.codec_id == "H264" && binding.video.config.is_none()
+        });
         let (registry, factory) = OutputWindowRegistry::bare(effective, config_generation);
         (
             Self {
                 delivery,
                 registry,
                 config_generation,
+                pending_metadata: pending.into_iter().map(|b| (b, 0)).collect(),
             },
             factory,
         )
@@ -890,6 +955,48 @@ impl<D: WindowDelivery> WindowDelivery for OutputWindowTap<D> {
         media_span: Duration,
         now: Instant,
     ) -> Result<(), multiview_output::batch::EmissionError> {
+        // Inspect at most 32 complete windows and 4 MiB per candidate packet.
+        // No packet retention, extra encoder, sleep, or clock-side wait.
+        let mut admitted = Vec::new();
+        self.pending_metadata.retain_mut(|(binding, attempts)| {
+            if binding.output_index != output_index {
+                return true;
+            }
+            *attempts += 1;
+            let mut inspected_bytes = 0_usize;
+            for packet in packets.iter().take(64) {
+                if packet.kind() != StreamKind::Video || !packet.is_keyframe() {
+                    continue;
+                }
+                let Some(payload) = packet.payload() else {
+                    continue;
+                };
+                inspected_bytes = inspected_bytes.saturating_add(payload.len());
+                if inspected_bytes > 4 * 1024 * 1024 {
+                    break;
+                }
+                if let Some(config) =
+                    multiview_ffmpeg::codec_metadata::AvcDecoderConfig::from_initial_rap(payload)
+                {
+                    binding.video.codec = config.codec;
+                    binding.video.config = Some(config.description);
+                    binding.video.framing = NalFraming::AnnexB;
+                    binding.video.recovery = Some(RecoveryGate::StrictRap {
+                        codec: CodecKind::H264,
+                        framing: NalFraming::AnnexB,
+                    });
+                    admitted.push(binding.clone());
+                    return false;
+                }
+            }
+            *attempts < 32
+        });
+        if !admitted.is_empty() {
+            let mut effective = self.registry.effective.as_ref().clone();
+            effective.extend(admitted);
+            self.registry.published.store(Arc::new(effective.clone()));
+            self.registry.effective = Arc::new(effective);
+        }
         // Mirror first: it cannot wait, and the physical binding's own admission
         // is the authoritative outcome the dispatcher reports.
         self.registry.offer_complete(
@@ -973,6 +1080,24 @@ mod tests {
         );
         assert_eq!(descriptor.bitrate_bps, Some(128_000));
         assert_eq!(binding("unknown", 0).audio[0].bitrate_bps, None);
+    }
+
+    #[test]
+    fn close_between_resolve_and_enqueue_refunds_slot_and_fences_pending_command() {
+        let (mut registry, factory) = registry(vec![binding("out", 0)]).unwrap();
+        let result = factory.subscribe_with_close_boundary(
+            &WhepScope::Output("out".into()),
+            GENERATION,
+            Arc::new(AtomicBool::new(false)),
+            || registry.close(),
+        );
+        assert!(matches!(result, Err(SubscribeError::ProducerEnded)));
+        assert_eq!(factory.slots_in_use(), 0);
+        registry.pump(Instant::now());
+        assert_eq!(registry.active_peers(), 0);
+        assert!(registry.commands.try_recv().is_err());
+        registry.close();
+        assert_eq!(factory.slots_in_use(), 0);
     }
 
     #[test]
@@ -1547,6 +1672,135 @@ mod tests {
                 self.finished = true;
             }
         }
+        // Exercise the actual no-extradata libx264 open/encode path, not a
+        // desired codec token or an independently fabricated parameter record.
+        let options = multiview_ffmpeg::CodecOptions::from_pairs(&[
+            ("preset", "ultrafast"),
+            ("tune", "zerolatency"),
+        ])
+        .unwrap();
+        let mut encoder = multiview_ffmpeg::VideoEncoder::new_with_options(
+            &multiview_ffmpeg::VideoEncodeTarget {
+                codec_name: "libx264".into(),
+                width: 64,
+                height: 64,
+                format: ffmpeg::format::Pixel::YUV420P,
+                time_base: Rational::new(1, 25),
+                bit_rate: 100_000,
+                gop: 25,
+                cuda_device: None,
+            },
+            &options,
+        )
+        .expect("actual libx264 opens");
+        let params = StreamCodecParameters::from_encoder(&encoder);
+        assert!(params.codec_config_bytes().is_none());
+        let mut frame = ffmpeg::frame::Video::new(ffmpeg::format::Pixel::YUV420P, 64, 64);
+        for plane in 0..3 {
+            frame.data_mut(plane).fill(128);
+        }
+        frame.set_pts(Some(0));
+        encoder.send_frame(&frame).unwrap();
+        let source = EncodedPacket::from_packet(
+            encoder
+                .receive_packet()
+                .unwrap()
+                .expect("actual emitted IDR"),
+        );
+        let mut pending = binding("live", 0);
+        pending.video = VideoDescriptor::from_opened(
+            &params,
+            Rational::new(1, 25),
+            crate::rendition_workers::ReorderBound::NoReorder,
+            Rational::new(25, 1),
+        )
+        .unwrap();
+        let (mut actual, live) = OutputWindowTap::new(
+            Spy {
+                offers: Vec::new(),
+                finished: false,
+            },
+            vec![pending],
+            GENERATION,
+        );
+        assert!(matches!(
+            live.resolve(&WhepScope::Output("live".into())),
+            Err(SubscribeError::Unavailable)
+        ));
+        actual
+            .offer_window(
+                0,
+                1,
+                vec![source.clone_shared_ref().unwrap()],
+                Duration::from_millis(40),
+                Instant::now(),
+            )
+            .unwrap();
+        let metadata = live
+            .resolve(&WhepScope::Output("live".into()))
+            .expect("actual metadata ready");
+        assert!(metadata.video.codec.starts_with("avc1."));
+        assert!(
+            multiview_ffmpeg::codec_metadata::AvcDecoderConfig::from_extradata(
+                metadata.video.config.as_ref().unwrap()
+            )
+            .is_some()
+        );
+        assert_eq!(metadata.video.framing, NalFraming::AnnexB);
+        assert_eq!(metadata.config_generation, GENERATION);
+        assert_eq!(actual.delivery.offers[0].2, pointer(&source));
+        let subscribed = live
+            .subscribe(&WhepScope::Output("live".into()), GENERATION)
+            .unwrap();
+        actual
+            .offer_window(
+                0,
+                1,
+                vec![source.clone_shared_ref().unwrap()],
+                Duration::from_millis(40),
+                Instant::now(),
+            )
+            .unwrap();
+        let received = subscribed.try_recv_window().unwrap().unwrap();
+        assert_eq!(pointer(&received.permit.packets()[0]), pointer(&source));
+
+        let mut invalid = binding("invalid", 0);
+        invalid.video.config = None;
+        invalid.video.codec = "H264".into();
+        let (mut bounded, unavailable) = OutputWindowTap::new(
+            Spy {
+                offers: Vec::new(),
+                finished: false,
+            },
+            vec![invalid],
+            GENERATION,
+        );
+        for _ in 0..40 {
+            bounded
+                .offer_window(
+                    0,
+                    1,
+                    vec![encoded(0, true).clone_shared_ref().unwrap()],
+                    Duration::from_millis(40),
+                    Instant::now(),
+                )
+                .unwrap();
+        }
+        assert_eq!(
+            bounded.delivery.offers.len(),
+            40,
+            "invalid metadata never blocks physical output"
+        );
+        assert!(
+            bounded.pending_metadata.is_empty(),
+            "initial inspection expires after 32 windows"
+        );
+        assert!(unavailable.admitted().is_empty());
+        assert!(matches!(
+            unavailable.resolve(&WhepScope::Output("invalid".into())),
+            Err(SubscribeError::Unavailable)
+        ));
+
         let source = encoded(0, true);
         let (mut tap, factory) = OutputWindowTap::new(
             Spy {

@@ -54,6 +54,9 @@ wgpu = { version = "30", default-features = false, features = [
   "std",
 ], optional = true }
 multiview-ffmpeg = { workspace = true }
+multiview-moq = { path = "../multiview-moq", optional = true }
+bytes = { version = "1", optional = true }
+hang = { version = "=0.21.22", optional = true }
 multiview-input = { workspace = true }
 multiview-output = { workspace = true }
 multiview-audio = { workspace = true }
@@ -267,6 +270,8 @@ required-features = ["webrtc-native"]
 # the vendor toolchains/SDKs installed); they exist so a release build can opt
 # in with one flag.
 [features]
+# Real existing-output conversion only; never opens a viewer encoder.
+moq-output = ["ffmpeg", "dep:multiview-moq", "dep:bytes", "dep:hang", "multiview-control/moq-transport"]
 default = ["software"]
 
 # Software-only reference path (always available).

@@ -287,7 +287,7 @@ tokio-rustls = "0.26"
 
 [features]
 # Authenticated QUIC transport remains opt-in until a production feed factory is wired.
-moq-transport = ["dep:multiview-moq"]
+moq-transport = ["dep:multiview-moq", "dep:url"]
 "default" = ["openapi"]
 "openapi" = ["dep:utoipa", "dep:utoipa-axum", "dep:utoipa-scalar"]
 "embed-web" = ["dep:rust-embed", "dep:mime_guess"]

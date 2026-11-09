@@ -323,6 +323,8 @@ fn persist_loaded_best_effort(boot_model: &multiview_control::boot_model::BootMo
 /// shared producer stop registry, and supported live-apply capabilities.
 /// Only the binary knows both compiled features and the selected run path.
 struct ControlPlaneWiring {
+    #[cfg(feature = "moq-output")]
+    moq_factory: Option<Arc<dyn multiview_control::moq_provider::AuthorizedFeedFactory>>,
     /// The shared program-frame slot the run loop fills for previews.
     program_slot: multiview_cli::preview::ProgramSlot,
     /// The per-source last-good stores (the preview provider's initial map).
@@ -407,6 +409,8 @@ async fn serve_control_plane(
     // boot file stays the watch + promote target (ADR-W024).
     let config = &start.running;
     let ControlPlaneWiring {
+        #[cfg(feature = "moq-output")]
+        moq_factory,
         program_slot,
         stores,
         registry,
@@ -480,7 +484,22 @@ async fn serve_control_plane(
     // snapshot; the model backs `GET /api/v1/config/boot-model` and the
     // revert-to-start/promote actions, and is the persister's target.
     let boot_model = Arc::new(start.to_boot_model(config_path));
-    let (addr, handle, state) = control::bind_and_serve(
+    #[cfg(feature = "moq-output")]
+    let moq = match multiview_control::moq_startup::MoqListenerConfig::from_env()
+        .map_err(|_| anyhow::anyhow!("invalid explicit MoQ listener configuration"))?
+    {
+        Some(config) => Some(
+            multiview_control::moq_startup::start(config, moq_factory)
+                .await
+                .map_err(|_| anyhow::anyhow!("MoQ listener startup failed"))?,
+        ),
+        None => None,
+    };
+    #[cfg(feature = "moq-output")]
+    let bind_control = control::bind_and_serve_with_moq;
+    #[cfg(not(feature = "moq-output"))]
+    let bind_control = control::bind_and_serve;
+    let (addr, handle, state) = bind_control(
         listen,
         config,
         Arc::clone(publisher),
@@ -495,6 +514,8 @@ async fn serve_control_plane(
         live_capability,
         Some(Arc::clone(&boot_model)),
         source_events,
+        #[cfg(feature = "moq-output")]
+        moq,
         async move {
             let _ = shutdown_rx.await;
         },
@@ -645,6 +666,8 @@ async fn run_pipeline_until_ctrl_c(
             config_path,
             &publisher,
             ControlPlaneWiring {
+                #[cfg(feature = "moq-output")]
+                moq_factory: Some(pipeline.moq_feed_factory()),
                 program_slot: Arc::clone(&preview_slot),
                 stores: pipeline.preview_stores(),
                 registry: pipeline.stop_registry(),
@@ -1030,6 +1053,8 @@ async fn run_software_until_ctrl_c(
             config_path,
             &publisher,
             ControlPlaneWiring {
+                #[cfg(feature = "moq-output")]
+                moq_factory: None,
                 program_slot: engine.program_preview(),
                 stores: engine.preview_stores(),
                 registry: engine.stop_registry(),

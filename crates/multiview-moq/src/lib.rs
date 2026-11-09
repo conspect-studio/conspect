@@ -1,7 +1,13 @@
 //! Encoded-video adapter seam. Call only from an off-clock bounded consumer task.
 //! Admission, global retained-allocation accounting and authorization are external.
 pub mod av;
+/// Shared multi-rendition ladder: exact admitted specs, one catalog, one clock.
+pub mod ladder;
 pub mod provider;
+/// Real multi-track publication of one admitted shared ladder.
+pub mod publication;
+/// Publisher-side uplink budgeting and bounded peer subscription tracking.
+pub mod uplink;
 use bytes::Bytes;
 use std::time::Duration;
 
@@ -18,6 +24,18 @@ pub struct Packet {
 pub struct Window {
     pub generation: u64,
     pub packets: Vec<Packet>,
+}
+
+/// A bounded, already admitted window shape that a subscription fence may carry.
+///
+/// The fence charges and wraps exactly the packets this visits, in a bounded deterministic
+/// order, so one fence — one queue bound, one charge account, one revocation identity —
+/// serves both the single-rendition and the shared-ladder shapes. There is no second fence.
+pub trait RetainedWindow: Send + 'static {
+    /// The configuration generation this window was admitted under.
+    fn generation(&self) -> u64;
+    /// Visit every retained packet mutably. Bounded by construction, never parallel.
+    fn for_each_packet(&mut self, visit: &mut dyn FnMut(&mut Packet));
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
