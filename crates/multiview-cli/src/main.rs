@@ -594,8 +594,8 @@ async fn run_pipeline_until_ctrl_c(
     // below calls `pipeline.set_program_audio_preview`). Without that feature the
     // binding is never mutated, so the `mut` is conditional to stay
     // `unused_mut`-clean on the `ffmpeg`/`rist`-only feature legs.
-    #[cfg(feature = "webrtc-native")] mut pipeline: multiview_cli::pipeline::Pipeline,
-    #[cfg(not(feature = "webrtc-native"))] pipeline: multiview_cli::pipeline::Pipeline,
+    #[cfg(any(feature = "webrtc-native", feature = "moq-output"))] mut pipeline: multiview_cli::pipeline::Pipeline,
+    #[cfg(not(any(feature = "webrtc-native", feature = "moq-output")))] pipeline: multiview_cli::pipeline::Pipeline,
     start: &multiview_cli::boot::StartConfig,
     plane: &multiview_cli::licence::EntitlementPlane,
     config_path: &Path,

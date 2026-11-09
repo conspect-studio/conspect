@@ -114,14 +114,15 @@ async fn await_outgoing_start<F: std::future::Future>(
         if invalid() || *stopped.borrow() {
             return None;
         }
-        tokio::select! {
+        let ready = tokio::select! {
             biased;
             _ = stopped.wait_for(|stop| *stop) => return None,
-            _ = tokio::time::sleep(Duration::from_millis(20)) => {},
-            result = &mut future => {
-                if invalid() || *stopped.borrow() { return None; }
-                return Some(result);
-            }
+            _ = tokio::time::sleep(Duration::from_millis(20)) => None,
+            result = &mut future => Some(result),
+        };
+        if let Some(result) = ready {
+            if invalid() || *stopped.borrow() { return None; }
+            return Some(result);
         }
     }
 }
