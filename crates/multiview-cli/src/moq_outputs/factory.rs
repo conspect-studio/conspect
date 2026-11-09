@@ -105,6 +105,16 @@ pub(crate) struct DynamicRegistryFactory(
     pub(crate) crate::output_window_registry::WindowSubscriptionSlot,
 );
 impl DynamicRegistryFactory {
+    pub(crate) async fn start_outgoing(
+        &self,
+        principal: &Principal,
+        scope: &WhepScope,
+        config: multiview_moq::provider::FamilyRelayConfig,
+    ) -> Result<multiview_moq::provider::FamilyPublisher, MoqReject> {
+        self.current()?
+            .start_outgoing(principal, scope, config)
+            .await
+    }
     fn current(&self) -> Result<RegistryFeedFactory, MoqReject> {
         let factory = self.0.load();
         let snapshot = factory.as_ref();
@@ -273,6 +283,38 @@ impl RegistryFeedFactory {
             renditions,
             ready: Arc::new(AtomicBool::new(true)),
         })
+    }
+
+    /// Start the one outgoing publisher from this canonical registry snapshot.
+    /// The service supplies its explicit scoped principal, never a synthetic
+    /// privileged viewer. All family axes are authorized before demand exists.
+    pub(crate) async fn start_outgoing(
+        &self,
+        principal: &Principal,
+        scope: &WhepScope,
+        config: multiview_moq::provider::FamilyRelayConfig,
+    ) -> Result<multiview_moq::provider::FamilyPublisher, MoqReject> {
+        let (sink, windows) = Fence::ladder_channel(4);
+        let shared = match self.attach_shared(principal, scope, sink.clone()) {
+            Ok(Some(shared)) => shared,
+            Ok(None) => {
+                sink.revoke();
+                return Err(MoqReject::Unavailable);
+            }
+            Err(error) => {
+                sink.revoke();
+                return Err(error);
+            }
+        };
+        let AuthorizedSharedFeed { mut feed, .. } = shared;
+        feed.windows = windows;
+        match multiview_moq::provider::FamilyPublisher::start(feed, Some(config)).await {
+            Ok(publisher) => Ok(publisher),
+            Err(_) => {
+                sink.revoke();
+                Err(MoqReject::Unavailable)
+            }
+        }
     }
 
     /// Every admitted rendition of the ladder, in registry order.

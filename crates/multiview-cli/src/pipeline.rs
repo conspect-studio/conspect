@@ -3112,6 +3112,20 @@ impl Pipeline {
         ))
     }
 
+    /// Start an explicitly configured outgoing family after this run publishes
+    /// its actual effective metadata. Call once per run/family, not per viewer.
+    #[cfg(feature = "moq-output")]
+    pub async fn start_moq_family_relay(
+        &self,
+        principal: &multiview_control::auth::Principal,
+        scope: &multiview_control::WhepScope,
+        config: multiview_moq::provider::FamilyRelayConfig,
+    ) -> Result<multiview_moq::provider::FamilyPublisher, multiview_control::moq::MoqReject> {
+        crate::moq_outputs::factory::DynamicRegistryFactory(self.window_subscriptions())
+            .start_outgoing(principal, scope, config)
+            .await
+    }
+
     /// Run the engine for exactly `max_ticks` ticks under the realtime pacer,
     /// then encode the composited program once and fan it out to every
     /// configured sink.
