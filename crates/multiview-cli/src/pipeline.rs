@@ -21181,6 +21181,76 @@ segment_ms = 1000
         });
     }
 
+    /// Actual opened libx264 output -> canonical run slot -> HTTP MoQ authority.
+    #[cfg(all(feature = "moq-output", feature = "gpl-codecs"))]
+    #[test]
+    fn actual_h264_pipeline_http_authority_fences_unused_ticket_after_run() {
+        use multiview_control::{
+            auth::{ApiKeyStore, Principal, Role},
+            moq_provider::WebTransportProvider,
+        };
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let config = MultiviewConfig::load_from_toml(&three_outputs_two_encodes().replace("mpeg2video", "h264").replace("ffv1", "h264")).unwrap();
+            let mut pipeline = Pipeline::build(&config).unwrap();
+            let factory = pipeline.moq_feed_factory();
+            assert!(!factory.available());
+            let slot = pipeline.window_subscriptions();
+            let dir = std::env::temp_dir().join(format!("moq-pipeline-http-{}", std::process::id()));
+            std::fs::create_dir_all(&dir).unwrap();
+            let cert = dir.join("cert.pem"); let key = dir.join("key.pem");
+            assert!(std::process::Command::new("openssl").args(["req", "-x509", "-newkey", "rsa:2048", "-nodes", "-days", "1", "-subj", "/CN=localhost", "-keyout"]).arg(&key).arg("-out").arg(&cert).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).status().unwrap().success());
+            let transport = multiview_moq::provider::Runtime::listen_files("[::1]:0".parse().unwrap(), "https://localhost".into(), "moq-transport-16", cert, key).await.unwrap();
+            let authority = Arc::new(multiview_control::moq::MoqRegistry::new(Arc::new(WebTransportProvider::new(transport, factory.clone())), Duration::from_secs(30), 4));
+            let principal = Principal { key_id: "test".into(), role: Role::Admin, scoped_object_ids: None, scoped_output_ids: None, scoped_discovery_domains: None };
+            let mut keys = ApiKeyStore::new(b"test-pepper".to_vec()); keys.register("test", "test-secret", principal);
+            let publisher = Arc::new(multiview_engine::EnginePublisher::<multiview_control::EngineStateSnapshot, multiview_events::Event>::new(8));
+            let (commands, _rx) = multiview_control::command_bus(8);
+            let state = multiview_control::AppState::new(publisher, commands, Arc::new(multiview_control::InMemoryRepository::new()), Arc::new(keys)).with_moq(authority);
+            let socket = tokio::net::TcpListener::bind("[::1]:0").await.unwrap();
+            let address = socket.local_addr().unwrap();
+            let server = tokio::spawn(async move { multiview_control::serve(socket, state, std::future::pending::<()>()).await });
+            let runners = (0..3).map(|_| Box::new(|rx: Receiver<EncodedPacket>| { let mut frames = 0; while rx.recv().is_ok() { frames += 1; } TestSinkOutcome { frames } }) as TestSinkRunner).collect();
+            let driver = std::thread::spawn(move || {
+                let clock = Arc::new(ManualTimeSource::new()); let stop_driver = Arc::new(AtomicBool::new(false));
+                spawn_clock_driver(clock.clone(), stop_driver.clone());
+                let runner = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+                let result = runner.block_on(pipeline.drive_streaming_for_test(StreamTestParams { time: clock, pacer: CooperativePacer, max_ticks: Some(50), policy: SendPolicy::BlockForExact, runners, hot_tick_observer: None, consumer_fault_after_ticks: None, shed_at_tick: None }, &StopSignal::new()));
+                stop_driver.store(true, Ordering::Release); result
+            });
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+            while !factory.available() {
+                if let Some(current) = slot.load() { eprintln!("opened-debug {:?}", current.admitted()); break; }
+                if driver.is_finished() { panic!("pipeline ended before availability: {:?}", driver.join().unwrap()); }
+                if tokio::time::Instant::now() >= deadline { panic!("factory unavailable with opened descriptors: {:?}", slot.load().as_ref().map(|factory| factory.admitted())); }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            let output = slot.load().unwrap().admitted()[0].output_id.clone();
+            async fn request(address: std::net::SocketAddr, method: &str, path: &str) -> (u16, serde_json::Value) {
+                use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                let mut socket = tokio::net::TcpStream::connect(address).await.unwrap();
+                socket.write_all(format!("{method} {path} HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer test.test-secret\r\nConnection: close\r\nContent-Length: 0\r\n\r\n").as_bytes()).await.unwrap();
+                let mut bytes = Vec::new(); socket.read_to_end(&mut bytes).await.unwrap();
+                let response = String::from_utf8(bytes).unwrap();
+                let (headers, body) = response.split_once("\r\n\r\n").unwrap();
+                let status = headers.split_whitespace().nth(1).unwrap().parse().unwrap();
+                (status, serde_json::from_str(body).unwrap())
+            }
+            let path = format!("/api/v1/preview/outputs/{output}/moq");
+            let (status, lease) = request(address, "POST", &path).await;
+            assert_eq!(status, 201, "{lease}");
+            assert!(lease["url"].as_str().unwrap().contains("ticket="));
+            let id = lease["lease_id"].as_str().unwrap(); let generation = lease["generation"].as_u64().unwrap();
+            let (status, _) = request(address, "DELETE", &format!("{path}/{id}?generation={generation}")).await;
+            assert_eq!(status, 200);
+            assert!(driver.join().unwrap().is_ok());
+            assert!(!factory.available()); server.abort();
+        });
+    }
+
     /// One subscribed window observed on the live pipeline, with the frame
     /// held so its payload allocation stays alive while the pointer is used.
     struct ObservedWindow {
