@@ -13,6 +13,12 @@ const player = (corr: string, kind: string, topic = 'switcher', id = 'p1') => ({
 const expectation = { topic: 'switcher' as const, resource: 'p1', event: 'media.player_state' as const,
   terminal: { kind: 'player-state' as const, state: 'playing' as const } };
 const accepted = { operation_id: 'op1', kind: 'media_play' };
+const switcherExpectation = { topic: 'switcher' as const, resource: 'me1', event: 'switcher.operation' as const,
+  terminal: { kind: 'switcher-operation' as const, me: 'me1' } };
+const switcher = (completed: boolean, overrides: Record<string, unknown> = {}) => ({
+  v: 1, t: 'switcher.operation', topic: 'switcher', id: 'me1', seq: 1, ts: 1, corr: 'op1',
+  data: { me: 'me1', operation_id: 'op1', program: 'camera1', tick: 42, completed, ...overrides },
+});
 const server = setupServer();
 beforeAll(() => { server.listen({ onUnhandledRequest: 'error' }); });
 afterEach(() => { server.resetHandlers(); });
@@ -205,6 +211,54 @@ describe('actual operation tracker', () => {
     tracker.onEnvelope({ ...player('out-good', 'playing', 'outputs', 'out1'), t: 'output.status', data: { state: 'running' } });
     expect(tracker.snapshot().records.get('out-good')?.phase).toBe('applied');
     expect(tracker.snapshot().unknownSeatDetails.size).toBe(1);
+  });
+
+  it.each([true, false])('settles a validated switcher operation completed=%s', async (completed) => {
+    const tracker = getOperationTracker(new QueryClient());
+    expect(await tracker.submit(() => Promise.resolve({ operation_id: 'op1', kind: 'cut' }), switcherExpectation))
+      .toEqual({ kind: 'tracked', operationId: 'op1' });
+    tracker.onEnvelope(switcher(completed));
+    expect(tracker.snapshot().records.get('op1')?.phase).toBe(completed ? 'applied' : 'failed');
+  });
+
+  it('matches an early switcher operation without treating progress as terminal', async () => {
+    const tracker = getOperationTracker(new QueryClient());
+    tracker.onEnvelope({ ...switcher(true), t: 'job.progress' });
+    tracker.onEnvelope(switcher(true, { completed: 'loading' }));
+    tracker.onEnvelope(switcher(false));
+    expect(await tracker.submit(() => Promise.resolve({ operation_id: 'op1', kind: 'auto' }), switcherExpectation))
+      .toEqual({ kind: 'tracked', operationId: 'op1' });
+    expect(tracker.snapshot().records.get('op1')?.phase).toBe('failed');
+  });
+
+  it('refuses wrong switcher ME, topic, correlation and payload operation identity', async () => {
+    const tracker = getOperationTracker(new QueryClient());
+    await tracker.submit(() => Promise.resolve({ operation_id: 'op1', kind: 'select_preview' }), switcherExpectation);
+    tracker.onEnvelope({ ...switcher(true), id: 'me2', data: { ...switcher(true).data, me: 'me2' } });
+    tracker.onEnvelope({ ...switcher(true), topic: 'outputs' });
+    tracker.onEnvelope({ ...switcher(true), corr: 'op2' });
+    tracker.onEnvelope(switcher(true, { operation_id: 'op2' }));
+    tracker.onEnvelope(switcher(true, { me: 'me2' }));
+    expect(tracker.snapshot().records.get('op1')?.phase).toBe('accepted');
+    tracker.onEnvelope(switcher(true));
+    expect(tracker.snapshot().records.get('op1')?.phase).toBe('applied');
+  });
+
+  it.each(['replay', 'media_play', 'media_load', 'unknown_kind'])('cannot settle switcher evidence from %s acceptance', async (kind) => {
+    const tracker = getOperationTracker(new QueryClient());
+    expect(await tracker.submit(() => Promise.resolve({ operation_id: 'op1', kind }), switcherExpectation))
+      .toEqual({ kind: 'accepted-unobserved', operationId: 'op1' });
+    tracker.onEnvelope(switcher(true));
+    expect(tracker.snapshot().records.size).toBe(0);
+  });
+
+  it('does not match a switcher command to a player expectation or a mismatched ME', async () => {
+    const tracker = getOperationTracker(new QueryClient());
+    expect((await tracker.submit(() => Promise.resolve({ operation_id: 'op1', kind: 'cut' }), expectation)).kind)
+      .toBe('accepted-unobserved');
+    expect((await tracker.submit(() => Promise.resolve({ operation_id: 'op2', kind: 'cut' }), {
+      ...switcherExpectation, terminal: { kind: 'switcher-operation', me: 'me2' },
+    })).kind).toBe('accepted-unobserved');
   });
 
   it('unsupported commands remain accepted-unobserved without a fabricated correlation', async () => {

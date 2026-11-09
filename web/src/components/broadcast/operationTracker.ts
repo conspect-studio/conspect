@@ -7,6 +7,7 @@ import type { AcceptedBody } from '../../api/operations';
 import { getStoredToken } from '../../api/token';
 import { isCorrelatedKind } from '../../realtime/correlatedCommands';
 import { parseMediaPlayerEvent } from '../../realtime/envelope';
+import { switcherOperationEvidence } from '../../realtime/operationEvidence';
 import type { Envelope } from '../../realtime/envelope';
 import type { MediaPlayerState, OutputRunState } from '../../realtime/generated-types';
 import {
@@ -27,11 +28,19 @@ export type OperationExpectation =
       readonly terminal: { readonly kind: 'player-state'; readonly state: PlayerState;
         readonly exitArmed?: boolean } }
   | { readonly topic: 'outputs'; readonly resource: string; readonly event: 'output.status';
-      readonly terminal: { readonly kind: 'output-state'; readonly state: OutputRunState } };
+      readonly terminal: { readonly kind: 'output-state'; readonly state: OutputRunState } }
+  | { readonly topic: 'switcher'; readonly resource: string; readonly event: 'switcher.operation';
+      readonly terminal: { readonly kind: 'switcher-operation'; readonly me: string } };
 
-interface ParsedEvent { readonly corr: string; readonly topic: string; readonly resource: string;
-  readonly event: 'media.player_state' | 'output.status'; readonly state: PlayerState | OutputRunState;
-  readonly at: number; readonly exitArmed?: boolean }
+type ParsedEvent =
+  | { readonly corr: string; readonly topic: 'switcher'; readonly resource: string;
+      readonly event: 'media.player_state'; readonly state: PlayerState;
+      readonly at: number; readonly exitArmed?: boolean }
+  | { readonly corr: string; readonly topic: 'outputs'; readonly resource: string;
+      readonly event: 'output.status'; readonly state: OutputRunState; readonly at: number }
+  | { readonly corr: string; readonly topic: 'switcher'; readonly resource: string;
+      readonly event: 'switcher.operation'; readonly me: string;
+      readonly result: 'applied' | 'failed'; readonly at: number };
 export interface SubmissionResult { readonly kind: 'tracked' | 'accepted-unobserved'; readonly operationId: string }
 /** Server-issued identity on an unresolved 202; absent fields are never fabricated. */
 export interface UnknownSeatDetail {
@@ -44,6 +53,10 @@ export type TrackerSnapshot = OperationOutcomeState & {
 };
 
 function parseEvent(envelope: Envelope): ParsedEvent | undefined {
+  const switcher = switcherOperationEvidence(envelope);
+  if (switcher !== undefined) return { corr: switcher.corr, topic: switcher.topic,
+    resource: switcher.resource, event: switcher.event, me: switcher.me,
+    result: switcher.verdict, at: Date.now() };
   if (!envelope.corr || !envelope.id) return undefined;
   if (envelope.t === 'media.player_state' && envelope.topic === 'switcher') {
     const data = parseMediaPlayerEvent(envelope.data);
@@ -62,12 +75,15 @@ function parseEvent(envelope: Envelope): ParsedEvent | undefined {
   return undefined;
 }
 // Correlation alone is insufficient: a caller cannot turn a play into a pause,
-// or claim a switcher cut from a player/output state. These are the exact
-// observable CorrKey::for_command projections in realtime.rs; named salvo and
-// direct switcher operation outcomes have no predicate in this tracker yet.
+// or claim a switcher cut from a player/output state. The switcher 202 uses
+// the exact verb string and its validated output-tick outcome is independent
+// of the CorrKey::for_command registry in realtime.rs.
 function matchesCommandKind(kind: string, expectation: OperationExpectation): boolean {
   if (!isCorrelatedKind(kind) || typeof expectation.resource !== 'string' || !expectation.resource.trim()) return false;
-  if (expectation.topic === 'outputs') {
+  if (expectation.event === 'switcher.operation')
+    return expectation.terminal.me === expectation.resource &&
+      (kind === 'select_program' || kind === 'select_preview' || kind === 'cut' || kind === 'auto');
+  if (expectation.event === 'output.status') {
     return (kind === 'start' && expectation.terminal.state === 'running') ||
       (kind === 'stop' && expectation.terminal.state === 'idle');
   }
@@ -85,9 +101,16 @@ function matching(event: ParsedEvent, expectation: OperationExpectation, corr: s
     event.resource === expectation.resource && event.event === expectation.event;
 }
 function verdict(event: ParsedEvent, expectation: OperationExpectation): 'applied' | 'failed' | undefined {
-  if (expectation.terminal.kind === 'player-state' && event.state === 'vamping' &&
-      expectation.terminal.exitArmed !== undefined && event.exitArmed !== expectation.terminal.exitArmed) return undefined;
-  return event.state === expectation.terminal.state ? 'applied' : undefined;
+  if (event.event === 'switcher.operation' && expectation.event === 'switcher.operation')
+    return event.me === expectation.terminal.me ? event.result : undefined;
+  if (event.event === 'media.player_state' && expectation.event === 'media.player_state') {
+    if (event.state === 'vamping' && expectation.terminal.exitArmed !== undefined &&
+        event.exitArmed !== expectation.terminal.exitArmed) return undefined;
+    return event.state === expectation.terminal.state ? 'applied' : undefined;
+  }
+  if (event.event === 'output.status' && expectation.event === 'output.status')
+    return event.state === expectation.terminal.state ? 'applied' : undefined;
+  return undefined;
 }
 
 export class OperationTracker {
