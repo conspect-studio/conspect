@@ -19,10 +19,11 @@
 // observation never infers a state. The tracker join adds: pending resolves to
 // applied ONLY on exact terminal evidence; uncorrelated load/seek stay
 // accepted-unobserved forever; a lost link is unknown, never failed.
-import { afterAll, afterEach, beforeAll, describe, expect, it } from 'vitest';
+import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from 'vitest';
+import { Profiler } from 'react';
 import { act, render, screen, waitFor, within } from '@testing-library/react';
 import { setStoredToken } from '../api/token';
-import { readMediaPlayerOperations, MEDIA_PLAYER_OPERATIONS_QUERY_KEY } from './mediaPlayerPresentation';
+import { readMediaPlayerOperations, updateMediaPlayerOperation, MEDIA_PLAYER_OPERATIONS_QUERY_KEY } from './mediaPlayerPresentation';
 import userEvent from '@testing-library/user-event';
 import { http, HttpResponse } from 'msw';
 import { setupServer } from 'msw/node';
@@ -57,6 +58,7 @@ beforeAll(() => {
 });
 afterEach(() => {
   server.resetHandlers();
+  vi.restoreAllMocks();
   setStoredToken('');
 });
 afterAll(() => {
@@ -72,6 +74,7 @@ function renderPage(
   options: {
     readonly live?: Record<string, MediaPlayerEvent>;
     readonly client?: QueryClient;
+    readonly onRender?: () => void;
   } = {},
 ): RenderedPage {
   const client = options.client
@@ -87,7 +90,9 @@ function renderPage(
     <QueryClientProvider client={client}>
       <I18nProvider i18n={i18n}>
         <MemoryRouter>
-          <MediaPlayersPage />
+          <Profiler id="media-players" onRender={() => options.onRender?.()}>
+            <MediaPlayersPage />
+          </Profiler>
         </MemoryRouter>
       </I18nProvider>
     </QueryClientProvider>,
@@ -440,7 +445,31 @@ describe('MediaPlayersPage unresolved registry and principal partition', () => {
     expect(screen.queryByText(/Earlier unresolved commands/)).toBeNull();
   });
 
+  it('guards the first remount commit before credential cleanup, but preserves same-token navigation', async () => {
+    setStoredToken('actor-a');
+    const first = renderPage();
+    await screen.findByTestId('player-console-vt-1');
+    act(() => {
+      updateMediaPlayerOperation(first.client, 'vt-1', () => ({
+        phase: 'unknown', verb: 'play', label: 'PRIVATE-A', reason: 'PRIVATE-A',
+      }));
+    });
+    await screen.findByText(/PRIVATE-A outcome unknown/);
+    first.unmount();
+    const same = renderPage({ client: first.client });
+    expect(screen.getByText(/PRIVATE-A outcome unknown/)).toBeInTheDocument();
+    same.unmount();
+    setStoredToken('actor-b');
+    const commits: string[] = [];
+    renderPage({ client: first.client, onRender: () => { commits.push(document.body.textContent); } });
+    expect(commits.length).toBeGreaterThan(0);
+    expect(commits.every((text) => !text.includes('PRIVATE-A'))).toBe(true);
+    expect(readMediaPlayerOperations(first.client)).toEqual({});
+    expect(first.client.getQueryData(MEDIA_PLAYER_OPERATIONS_QUERY_KEY)).toBeUndefined();
+  });
+
   it('removes accepted actor A identifiers on actor B save and on credential clear', async () => {
+    const errors = vi.spyOn(console, 'error');
     setStoredToken('actor-a');
     server.use(http.post('*/api/v1/media/players/vt-1/play', () =>
       HttpResponse.json({ operation_id: 'op-actor-a', kind: 'media_play' })));
@@ -454,12 +483,14 @@ describe('MediaPlayersPage unresolved registry and principal partition', () => {
     await waitFor(() => expect(consoleOf('vt-1')).not.toHaveTextContent('op-actor-a'));
     expect(readMediaPlayerOperations(client)).toEqual({});
     expect(JSON.stringify(client.getQueryCache().getAll().map((query) => query.state.data))).not.toContain('op-actor-a');
+    expect(errors.mock.calls.flat().join(' ')).not.toMatch(/Cannot update a component.*while rendering/);
     setStoredToken('');
     await act(async () => { await client.invalidateQueries(); });
     expect(readMediaPlayerOperations(client)).toEqual({});
   });
 
-  it('partitions token changes before render and rejects an earlier identity in-flight completion', async () => {
+  it.each([false, true])('partitions token changes and rejects old in-flight completion (remount: %s)', async (remount) => {
+    const errors = vi.spyOn(console, 'error');
     setStoredToken('actor-a');
     let release: (response: Response) => void = () => undefined;
     server.use(http.post('*/api/v1/media/players/vt-1/play', () => new Promise<Response>((resolve) => { release = resolve; })));
@@ -467,12 +498,16 @@ describe('MediaPlayersPage unresolved registry and principal partition', () => {
     await screen.findByTestId('player-console-vt-1');
     await userEvent.click(screen.getByRole('button', { name: 'Play player: vt-1' }));
     expect(readMediaPlayerOperations(first.client)['vt-1']?.phase).toBe('sending');
+    if (remount) first.unmount();
     setStoredToken('actor-b');
+    if (remount) renderPage({ client: first.client });
     await act(async () => { await first.client.invalidateQueries(); });
     expect(screen.queryByText(/Sending Play VT 1/)).toBeNull();
     expect(readMediaPlayerOperations(first.client)).toEqual({});
     release(HttpResponse.json({ operation_id: 'op-actor-a', kind: 'media_play' }));
-    await waitFor(() => { expect(getOperationTracker(first.client).snapshot().records.has('op-actor-a')).toBe(false); });
+    await waitFor(() => { expect(first.client.getMutationCache().getAll()[0]?.state.status).toBe('success'); });
+    expect(getOperationTracker(first.client).snapshot().records.has('op-actor-a')).toBe(false);
+    expect(errors.mock.calls.flat().join(' ')).not.toMatch(/Cannot update a component.*while rendering/);
     expect(readMediaPlayerOperations(first.client)).toEqual({});
     expect(JSON.stringify(first.client.getQueryCache().getAll().map((query) => query.queryKey))).not.toContain('actor-');
     setStoredToken('');

@@ -392,6 +392,13 @@ export const MEDIA_PLAYER_OPERATIONS_QUERY_KEY = ['media-players', 'operations']
 // Credentials never enter query keys, data or developer-facing labels. A
 // QueryClient-scoped epoch isolates callbacks issued under an earlier token.
 const identities = new WeakMap<QueryClient, { token: string | undefined; epoch: number }>();
+/** Pure, stable render snapshot, including a not-yet-committed transition. */
+export function mediaPlayerIdentitySnapshot(client: QueryClient): number {
+  const current = identities.get(client);
+  return current === undefined ? 0 : current.epoch + Number(current.token !== getStoredToken());
+}
+
+/** Commit outside render. Repeated notifications/effects clean up only once. */
 export function mediaPlayerIdentity(client: QueryClient): number {
   const token = getStoredToken();
   const current = identities.get(client);
@@ -402,7 +409,12 @@ export function mediaPlayerIdentity(client: QueryClient): number {
   if (current.token !== token) {
     const epoch = current.epoch + 1;
     identities.set(client, { token, epoch });
-    client.removeQueries({ queryKey: MEDIA_PLAYER_OPERATIONS_QUERY_KEY });
+    // A render may already have created the incoming epoch's empty query.
+    // Keep it attached to its observer; remove only prior identities' stores.
+    client.removeQueries({
+      queryKey: MEDIA_PLAYER_OPERATIONS_QUERY_KEY,
+      predicate: (query) => query.queryKey[2] !== epoch,
+    });
     return epoch;
   }
   return current.epoch;
@@ -418,7 +430,11 @@ export type MediaPlayerOperations = Record<string, MediaPlayerOperation | undefi
 
 /** Read the persisted per-player operation records (empty when none yet). */
 export function readMediaPlayerOperations(client: QueryClient): MediaPlayerOperations {
-  return client.getQueryData<MediaPlayerOperations>(mediaPlayerOperationsKey(mediaPlayerIdentity(client))) ?? {};
+  const current = identities.get(client);
+  // Guard reads immediately, even on the first render after an unmounted
+  // credential change, before the effect commits the new epoch and cleanup.
+  if (current === undefined || current.token !== getStoredToken()) return {};
+  return client.getQueryData<MediaPlayerOperations>(mediaPlayerOperationsKey(current.epoch)) ?? {};
 }
 
 /** Keep every earlier command's evidence separate from the latest visible feedback. */

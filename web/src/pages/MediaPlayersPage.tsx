@@ -47,7 +47,7 @@
 // state is the authoritative VT readout. The load dialog takes an asset id
 // only (the shipped backend): no asset inventory exists to browse, which the
 // dialog says honestly; save/unload verbs land with ML4 and are absent here.
-import { useMemo, useState, useSyncExternalStore } from 'react';
+import { useEffect, useMemo, useState, useSyncExternalStore } from 'react';
 import type { JSX } from 'react';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { Trans, useLingui } from '@lingui/react/macro';
@@ -77,6 +77,7 @@ import type { MediaPlayerEvent } from '../realtime/generated-types';
 import { OperationFeedback, TaskWorkspace, TouchAction } from '../components/broadcast';
 import { useSubmitTrackedOperation } from '../components/broadcast/useOperationFeedback';
 import { getOperationTracker, OPERATION_TRACKER_QUERY_KEY } from '../components/broadcast/operationTracker';
+import { createOperationOutcomeState } from '../components/broadcast/operationOutcomes';
 import type { OperationOutcomeState } from '../components/broadcast/operationOutcomes';
 import { getStoredToken } from '../api/token';
 import { PageHeader } from '../components/PageHeader';
@@ -98,6 +99,7 @@ import {
   effectiveSelectedPlayerId,
   isExitArmed,
   mediaPlayerIdentity,
+  mediaPlayerIdentitySnapshot,
   mediaPlayerOperationsKey,
   operationFeedbackView,
   readMediaPlayerOperations,
@@ -503,11 +505,21 @@ export function MediaPlayersPage(): JSX.Element {
     (notify) => {
       const listener = (): void => { notify(); };
       window.addEventListener('storage', listener);
-      const unsubscribe = queryClient.getQueryCache().subscribe(listener);
+      // Query creation/observer attachment can occur during render. Those
+      // events are not credential signals and must not synchronously notify
+      // React while it is constructing the incoming epoch's query.
+      const unsubscribe = queryClient.getQueryCache().subscribe((event) => {
+        if (event.type === 'updated') listener();
+      });
       return (): void => { window.removeEventListener('storage', listener); unsubscribe(); };
     },
-    () => mediaPlayerIdentity(queryClient),
+    () => mediaPlayerIdentitySnapshot(queryClient),
+    () => mediaPlayerIdentitySnapshot(queryClient),
   );
+  useEffect(() => {
+    mediaPlayerIdentity(queryClient);
+    getOperationTracker(queryClient).resetIdentity(getStoredToken());
+  }, [queryClient, identityEpoch]);
   const operationsQuery = useQuery<MediaPlayerOperations>({
     queryKey: mediaPlayerOperationsKey(identityEpoch),
     queryFn: (): MediaPlayerOperations => ({}),
@@ -518,17 +530,18 @@ export function MediaPlayersPage(): JSX.Element {
   // clean slate, never a loading state.
   // Never render an old observer's data during a token-change render. The
   // token is compared only in memory, never copied into query keys/devtools.
-  const ops: MediaPlayerOperations = identityEpoch === mediaPlayerIdentity(queryClient)
-    ? (queryClient.getQueryData<MediaPlayerOperations>(mediaPlayerOperationsKey(identityEpoch)) ?? {})
-    : {};
+  const ops: MediaPlayerOperations = readMediaPlayerOperations(queryClient);
   void operationsQuery.data;
   const trackerQuery = useQuery<OperationOutcomeState>({
     queryKey: OPERATION_TRACKER_QUERY_KEY,
     queryFn: () => getOperationTracker(queryClient).snapshot(),
     enabled: false,
-    initialData: () => getOperationTracker(queryClient).snapshot(),
+    initialData: createOperationOutcomeState,
   });
-  const tracker = getOperationTracker(queryClient).snapshot();
+  // snapshot() also resets tracker identity and publishes; never call it in
+  // render. Old records cannot be joined because ops is credential-guarded.
+  const tracker = queryClient.getQueryData<OperationOutcomeState>(OPERATION_TRACKER_QUERY_KEY)
+    ?? createOperationOutcomeState();
   void operationsQuery;
   void trackerQuery;
 

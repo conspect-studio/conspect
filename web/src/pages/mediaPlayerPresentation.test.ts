@@ -33,6 +33,7 @@ import {
   replaceMediaPlayerOperation,
   unresolvedMediaPlayerOperations,
   mediaPlayerIdentity,
+  mediaPlayerIdentitySnapshot,
   mediaPlayerOperationsKey,
   stateVariant,
   transportExpectation,
@@ -411,6 +412,17 @@ describe('per-player operation store — QueryClient-backed, survives navigation
 });
 
 describe('preserved uncertainty and credential epochs', () => {
+  it('does not initialize identity or mutate cache in an initial snapshot', () => {
+    const client = new QueryClient();
+    setStoredToken('principal-one');
+    expect(mediaPlayerIdentitySnapshot(client)).toBe(0);
+    setStoredToken('principal-two');
+    // If the initial snapshot had written the WeakMap, this would be epoch 1.
+    expect(mediaPlayerIdentitySnapshot(client)).toBe(0);
+    expect(client.getQueryCache().getAll()).toEqual([]);
+    setStoredToken('');
+  });
+
   it('retains unresolved play separately from latest pause and resolves only with tracker evidence', () => {
     const unknown: MediaPlayerOperation = { phase: 'unknown', verb: 'play', label: 'Play', reason: 'No answer' };
     const sending: MediaPlayerOperation = { phase: 'sending', verb: 'pause', label: 'Pause' };
@@ -429,9 +441,20 @@ describe('preserved uncertainty and credential epochs', () => {
     const epoch = mediaPlayerIdentity(client);
     updateMediaPlayerOperation(client, 'vt-1', () => ACCEPTED_PLAY);
     setStoredToken('principal-two');
-    const nextEpoch = mediaPlayerIdentity(client);
+    const events: string[] = [];
+    const unsubscribe = client.getQueryCache().subscribe((event) => events.push(event.type));
+    const nextEpoch = mediaPlayerIdentitySnapshot(client);
     expect(nextEpoch).toBe(epoch + 1);
+    expect(mediaPlayerIdentitySnapshot(client)).toBe(nextEpoch);
     expect(readMediaPlayerOperations(client)).toEqual({});
+    expect(events).toEqual([]);
+    expect(client.getQueryData(MEDIA_PLAYER_OPERATIONS_QUERY_KEY)).toBeDefined();
+    // Commit outside render; repeated effects/notifications do not clean twice.
+    expect(mediaPlayerIdentity(client)).toBe(nextEpoch);
+    expect(events).toEqual(['removed']);
+    expect(mediaPlayerIdentity(client)).toBe(nextEpoch);
+    expect(events).toEqual(['removed']);
+    unsubscribe();
     expect(client.getQueryData(MEDIA_PLAYER_OPERATIONS_QUERY_KEY)).toBeUndefined();
     expect(JSON.stringify(mediaPlayerOperationsKey(nextEpoch))).not.toContain('principal');
     setStoredToken('');
