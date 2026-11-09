@@ -21223,7 +21223,6 @@ segment_ms = 1000
             });
             let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
             while !factory.available() {
-                if let Some(current) = slot.load() { eprintln!("opened-debug {:?}", current.admitted()); break; }
                 if driver.is_finished() { panic!("pipeline ended before availability: {:?}", driver.join().unwrap()); }
                 if tokio::time::Instant::now() >= deadline { panic!("factory unavailable with opened descriptors: {:?}", slot.load().as_ref().map(|factory| factory.admitted())); }
                 tokio::time::sleep(Duration::from_millis(10)).await;
