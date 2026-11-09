@@ -294,6 +294,9 @@ impl RegistryFeedFactory {
         scope: &WhepScope,
         config: multiview_moq::provider::FamilyRelayConfig,
     ) -> Result<multiview_moq::provider::FamilyPublisher, MoqReject> {
+        if config.protected {
+            return Err(MoqReject::Unavailable);
+        }
         let (sink, windows) = Fence::ladder_channel(4);
         let shared = match self.attach_shared(principal, scope, sink.clone()) {
             Ok(Some(shared)) => shared,

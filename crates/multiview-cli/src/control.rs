@@ -299,7 +299,9 @@ where
     .with_preview(preview)
     .with_warning_store(warnings);
     #[cfg(feature = "moq-output")]
-    if let Some(moq) = moq { state = state.with_moq(moq); }
+    if let Some(moq) = moq {
+        state = state.with_moq(moq);
+    }
     if let Some(reader) = source_events {
         state = state.with_source_events(Arc::new(reader));
     }
