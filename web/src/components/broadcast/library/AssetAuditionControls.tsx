@@ -33,16 +33,17 @@ export interface AnalysisModeOption {
   readonly gate: ActionGate;
 }
 
-/**
- * The caller's ACTUAL analysis for the active mode — measured data only.
- * `peaks` are normalized 0..1 amplitude values across the window; the
- * component draws them as bars and never invents values.
- */
-export interface AnalysisData {
-  readonly kind: 'waveform' | 'spectrogram';
-  readonly peaks: readonly number[];
-  /** Already-localized provenance note (e.g. measured window), if any. */
-  readonly measuredNote?: string | null | undefined;
+/** Exact asset sample window. */
+export interface AnalysisWindow { readonly startSample: number; readonly endSample: number; readonly sampleRateHz: number }
+interface AnalysisBinding { readonly assetId: string; readonly assetRevision: string; readonly channelId: string; readonly window: AnalysisWindow; readonly measuredNote?: string | null }
+export type AnalysisData =
+  | (AnalysisBinding & { readonly kind: 'waveform'; readonly amplitudeUnit: 'normalized_peak'; readonly peaks: readonly number[] })
+  | (AnalysisBinding & { readonly kind: 'spectrogram'; readonly frequencyUnit: 'hz'; readonly magnitudeUnit: 'dbfs'; readonly frequencyBinsHz: readonly number[]; readonly timeBins: readonly { readonly startSample: number; readonly endSample: number; readonly magnitudes: readonly number[] }[] });
+function validWindow(window: AnalysisWindow): boolean { return Number.isSafeInteger(window.startSample) && window.startSample >= 0 && Number.isSafeInteger(window.endSample) && window.endSample > window.startSample && Number.isSafeInteger(window.sampleRateHz) && window.sampleRateHz > 0; }
+function validAnalysis(analysis: AnalysisData | null, assetId: string, revision: string, channel: string | null, mode: string | null, window: AnalysisWindow): analysis is AnalysisData {
+  if (!analysis || !validWindow(window) || !validWindow(analysis.window) || analysis.assetId !== assetId || analysis.assetRevision !== revision || analysis.channelId !== channel || analysis.kind !== mode || analysis.window.startSample !== window.startSample || analysis.window.endSample !== window.endSample || analysis.window.sampleRateHz !== window.sampleRateHz) return false;
+  if (analysis.kind === 'waveform') return analysis.peaks.length > 0 && analysis.peaks.every((peak) => Number.isFinite(peak) && peak >= 0 && peak <= 1);
+  return analysis.frequencyBinsHz.length > 0 && analysis.frequencyBinsHz.every((hz, index) => Number.isFinite(hz) && hz > 0 && (index === 0 || hz > (analysis.frequencyBinsHz[index - 1] ?? 0))) && analysis.timeBins.length > 0 && analysis.timeBins.every((bin, index) => Number.isSafeInteger(bin.startSample) && Number.isSafeInteger(bin.endSample) && bin.startSample >= window.startSample && bin.endSample <= window.endSample && bin.endSample > bin.startSample && (index === 0 || bin.startSample >= (analysis.timeBins[index - 1]?.endSample ?? 0)) && bin.magnitudes.length === analysis.frequencyBinsHz.length && bin.magnitudes.every((db) => Number.isFinite(db) && db <= 0));
 }
 
 /** One selectable audio channel. */
@@ -56,6 +57,9 @@ export interface ChannelOption {
 export interface AssetAuditionControlsProps {
   /** The asset being auditioned (for the header). */
   readonly assetName: string;
+  readonly assetId: string;
+  readonly assetRevision: string;
+  readonly analysisWindow: AnalysisWindow;
   /**
    * Capability gate for per-asset audition itself. `supported: false`
    * renders the honest unavailable panel with the reason — the default
@@ -97,6 +101,9 @@ export interface AssetAuditionControlsProps {
  */
 export function AssetAuditionControls({
   assetName,
+  assetId,
+  assetRevision,
+  analysisWindow,
   auditionGate,
   transport,
   onPlayPauseIntent,
@@ -110,6 +117,7 @@ export function AssetAuditionControls({
   analysis,
 }: AssetAuditionControlsProps): JSX.Element {
   const { t } = useLingui();
+  const usableAnalysis = validAnalysis(analysis, assetId, assetRevision, activeChannelId, activeAnalysisModeId, analysisWindow) && analysisModes.some((mode) => mode.id === activeAnalysisModeId && mode.gate.supported);
 
   if (!auditionGate.supported) {
     return (
@@ -226,43 +234,15 @@ export function AssetAuditionControls({
         </div>
       ) : null}
 
-      <div
-        data-testid="audition-analysis-surface"
-        data-analysis-kind={analysis?.kind ?? 'none'}
-        className="flex min-h-24 min-w-0 flex-wrap items-end gap-0.5 rounded-lg border p-2"
-      >
-        {analysis === null ? (
-          <p className="min-w-0 flex-1 basis-full break-words text-xs text-muted-foreground">
-            {t`No analysis for this mode — no analysis service supplied it.`}
-          </p>
-        ) : analysis.peaks.length === 0 ? (
-          <p className="min-w-0 flex-1 basis-full break-words text-xs text-muted-foreground">
-            {t`Analysis not measured yet.`}
-          </p>
-        ) : (
-          <>
-            {analysis.peaks.map((peak, index) => {
-              // Clamp the caller's peaks into [0,1] — a NaN/undefined
-              // peak degrades to a flat bar, never a NaN height.
-              const level =
-                Number.isFinite(peak) && peak > 0 ? Math.min(1, peak) : 0;
-              return (
-                <span
-                  key={index}
-                  data-testid="audition-analysis-bar"
-                  aria-hidden="true"
-                  className="w-1 shrink-0 rounded-sm bg-foreground"
-                  style={{
-                    height: `${String(Math.max(2, Math.round(level * 80)))}px`,
-                  }}
-                />
-              );
-            })}
-            <p className="min-w-0 flex-1 basis-full break-words text-xs text-muted-foreground">
-              {analysis.measuredNote ?? t`Measured analysis.`}
-            </p>
-          </>
-        )}
+      <div data-testid="audition-analysis-surface" data-analysis-kind={usableAnalysis ? analysis.kind : 'none'} className="flex min-h-24 min-w-0 flex-wrap items-end gap-0.5 rounded-lg border p-2">
+        {!usableAnalysis ? <p className="min-w-0 flex-1 basis-full break-words text-xs text-muted-foreground">{analysis === null ? t`No analysis for this mode — no analysis service supplied it.` : t`Analysis unavailable — stale, unbound or invalid measured data.`}</p> : analysis.kind === 'waveform' ? <>
+          {analysis.peaks.map((peak, index) => <span key={index} data-testid="audition-analysis-bar" aria-hidden="true" className="w-1 shrink-0 rounded-sm bg-foreground" style={{ height: `${String(Math.max(2, Math.round(peak * 80)))}px` }} />)}
+          <p className="min-w-0 flex-1 basis-full break-words text-xs text-muted-foreground">{analysis.measuredNote ?? t`Measured waveform amplitude (normalized peak).`}</p>
+        </> : <div data-testid="audition-spectrogram" className="flex min-w-0 flex-col gap-1 text-xs">
+          <p>{t`Spectrogram frequency bins (Hz): ${analysis.frequencyBinsHz.join(', ')} · magnitude (dBFS)`}</p>
+          <div className="flex flex-wrap gap-1" aria-label={t`Measured time-frequency bins`}>{analysis.timeBins.map((bin, index) => <span key={index} className="rounded border p-1" data-testid="spectrogram-time-bin">{`${String(bin.startSample)}–${String(bin.endSample)}: ${bin.magnitudes.join(', ')} dBFS`}</span>)}</div>
+          {analysis.measuredNote !== undefined && analysis.measuredNote !== null ? <p>{analysis.measuredNote}</p> : null}
+        </div>}
       </div>
     </section>
   );

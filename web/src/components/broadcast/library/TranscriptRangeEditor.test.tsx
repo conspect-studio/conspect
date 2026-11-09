@@ -66,6 +66,7 @@ function renderEditor(overrides: {
   const onSelectionChange = vi.fn();
   const view = renderWithProviders(
     <TranscriptRangeEditor
+      transcriptRevision="rev-1" alignedRevision="rev-1"
       words={overrides.words ?? WORDS}
       selection={overrides.selection ?? null}
       onSelectionChange={onSelectionChange}
@@ -78,7 +79,8 @@ function renderEditor(overrides: {
   const rerender = (selection: TranscriptSelection | null): void => {
     view.rerender(
       <TranscriptRangeEditor
-        words={overrides.words ?? WORDS}
+        transcriptRevision="rev-1" alignedRevision="rev-1"
+      words={overrides.words ?? WORDS}
         selection={selection}
         onSelectionChange={onSelectionChange}
         readOnly={overrides.readOnly ?? false}
@@ -353,5 +355,37 @@ describe('TranscriptRangeEditor — readonly and empty honesty', () => {
     const match = option('w2');
     expect(match.className).toMatch(/\bmin-h-12\b/);
     expect(match.className).toMatch(/\bmin-w-12\b/);
+  });
+});
+
+describe('TranscriptRangeEditor — precision readiness', () => {
+  it('keeps unaligned interior words text-only and blocks all precision steppers', () => {
+    const words = [WORDS[0]!, { ...WORDS[1]!, startBoundary: null }, WORDS[2]!];
+    const onSelectionChange = vi.fn();
+    renderWithProviders(<TranscriptRangeEditor words={words} selection={{ startWordId: 'w0', endWordId: 'w2' }} transcriptRevision="rev-1" alignedRevision="rev-1" onSelectionChange={onSelectionChange} />);
+    expect(screen.getByTestId('transcript-selection-readout')).toHaveTextContent(/Text selection only/);
+    for (const button of within(screen.getByTestId('transcript-selection-readout')).getAllByRole('button')) expect(button).toBeDisabled();
+  });
+  it('blocks clip precision on mixed grids, overlaps, zero intervals and stale revision', () => {
+    const candidates = [
+      { words: [WORDS[0]!, { ...WORDS[1]!, startBoundary: { kind: 'frames' as const, index: 25, numerator: 30000, denominator: 1001 } }, WORDS[2]!], revision: 'r1' },
+      { words: [WORDS[0]!, { ...WORDS[1]!, startBoundary: { kind: 'frames' as const, index: 20, numerator: 25, denominator: 1 } }, WORDS[2]!], revision: 'r1' },
+      { words: [WORDS[0]!, { ...WORDS[1]!, endBoundary: { kind: 'frames' as const, index: 25, numerator: 25, denominator: 1 } }, WORDS[2]!], revision: 'r1' },
+      { words: [WORDS[0]!, WORDS[1]!, WORDS[2]!], revision: 'stale' },
+    ];
+    for (const item of candidates) {
+      const view = renderWithProviders(<TranscriptRangeEditor words={item.words} selection={{ startWordId: 'w0', endWordId: 'w2' }} transcriptRevision={item.revision} alignedRevision="r1" onSelectionChange={vi.fn()} />);
+      expect(within(view.container).getByTestId('transcript-clip-readiness')).toHaveTextContent(/Text selection only/);
+      for (const button of within(view.container).getAllByRole('button', { name: /Step (IN|OUT)/ })) expect(button).toBeDisabled();
+      view.unmount();
+    }
+  });
+  it('restores a tab stop after words change and readonly toggles', () => {
+    const onSelectionChange = vi.fn();
+    const view = renderWithProviders(<TranscriptRangeEditor words={WORDS} selection={null} onSelectionChange={onSelectionChange} />);
+    fireEvent.focus(option('w2'));
+    view.rerender(<TranscriptRangeEditor words={[WORDS[3]!, WORDS[4]!]} selection={null} onSelectionChange={onSelectionChange} readOnly />);
+    view.rerender(<TranscriptRangeEditor words={[WORDS[3]!, WORDS[4]!]} selection={null} onSelectionChange={onSelectionChange} />);
+    expect(option('w3')).toHaveAttribute('tabindex', '0');
   });
 });

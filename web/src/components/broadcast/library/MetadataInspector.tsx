@@ -466,34 +466,29 @@ function TrimControl({
 }): JSX.Element {
   const { t } = useLingui();
 
-  const sameGridPair =
-    inBoundary !== null &&
-    outBoundary !== null &&
-    isSameGrid(inBoundary, outBoundary);
-
-  // Clamp every proposal to the measured length when it shares the grid.
-  const maxIndexFor = (boundary: RationalBoundary): number | null => {
-    if (
-      measuredLengthBoundary !== null &&
-      isSameGrid(boundary, measuredLengthBoundary)
-    ) {
-      return measuredLengthBoundary.index;
-    }
-    return null;
-  };
+  const validMeasured = measuredLengthBoundary !== null &&
+    Number.isSafeInteger(measuredLengthBoundary.index) && measuredLengthBoundary.index > 0 &&
+    formatBoundaryLabel(measuredLengthBoundary) !== null;
+  const validEndpoint = (boundary: RationalBoundary | null): boolean => boundary === null ||
+    (measuredLengthBoundary !== null && isSameGrid(boundary, measuredLengthBoundary) &&
+      formatBoundaryLabel(boundary) !== null && boundary.index <= measuredLengthBoundary.index);
+  const validTrim = validMeasured && validEndpoint(inBoundary) && validEndpoint(outBoundary) &&
+    (inBoundary === null || outBoundary === null || inBoundary.index < outBoundary.index);
+  const trimEditable = editable && validTrim;
+  const maxIndexFor = (): number | null => measuredLengthBoundary?.index ?? null;
 
   // `in < out` is engine law (media.rs:78) — never propose a crossing.
   // (compareBoundaries returns null on differing grids; only a non-null
   // comparison may gate the step.)
   const stepIn = (direction: -1 | 1): (() => void) | undefined => {
-    if (!editable || inBoundary === null) {
+    if (!trimEditable || inBoundary === null) {
       return undefined;
     }
-    const next = stepBoundary(inBoundary, direction, maxIndexFor(inBoundary));
+    const next = stepBoundary(inBoundary, direction, maxIndexFor());
     if (next === null) {
       return undefined;
     }
-    if (outBoundary !== null && sameGridPair) {
+    if (outBoundary !== null) {
       const cmp = compareBoundaries(next, outBoundary);
       if (cmp !== null && cmp >= 0) {
         return undefined;
@@ -505,14 +500,14 @@ function TrimControl({
   };
 
   const stepOut = (direction: -1 | 1): (() => void) | undefined => {
-    if (!editable || outBoundary === null) {
+    if (!trimEditable || outBoundary === null) {
       return undefined;
     }
-    const next = stepBoundary(outBoundary, direction, maxIndexFor(outBoundary));
+    const next = stepBoundary(outBoundary, direction, maxIndexFor());
     if (next === null) {
       return undefined;
     }
-    if (inBoundary !== null && sameGridPair) {
+    if (inBoundary !== null) {
       const cmp = compareBoundaries(next, inBoundary);
       if (cmp !== null && cmp <= 0) {
         return undefined;
@@ -524,7 +519,7 @@ function TrimControl({
   };
 
   const setInAtStart =
-    editable && inBoundary === null && measuredLengthBoundary !== null
+    inBoundary === null && trimEditable
       ? (): void => {
           const start =
             measuredGrid !== null ? boundaryAtGridIndex(measuredGrid, 0) : null;
@@ -535,7 +530,7 @@ function TrimControl({
       : undefined;
 
   const setOutAtEnd =
-    editable && outBoundary === null && measuredLengthBoundary !== null
+    outBoundary === null && trimEditable
       ? (): void => {
           onTrimBoundaryChange?.('out', measuredLengthBoundary);
         }
@@ -546,10 +541,11 @@ function TrimControl({
       data-testid="metadata-trim-control"
       className="flex min-w-0 flex-col gap-2"
     >
+      {!validTrim ? <span role="status" className="text-xs text-destructive">{t`Trim unavailable — invalid measured length or mismatched asset grid and endpoints. Revalidate metadata before saving.`}</span> : null}
       <TrimBoundRow
         label={t`IN`}
         boundary={inBoundary}
-        editable={editable}
+        editable={trimEditable}
         onStepBackward={stepIn(-1)}
         onStepForward={stepIn(1)}
         onSet={setInAtStart}
@@ -558,7 +554,7 @@ function TrimControl({
       <TrimBoundRow
         label={t`OUT`}
         boundary={outBoundary}
-        editable={editable}
+        editable={trimEditable}
         onStepBackward={stepOut(-1)}
         onStepForward={stepOut(1)}
         onSet={setOutAtEnd}

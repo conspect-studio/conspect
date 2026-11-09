@@ -245,6 +245,13 @@ describe('LibraryBrowser — capability gates', () => {
     ).toBeNull();
   });
 
+  it('hides stale selection, facet counts and result count without listing', () => {
+    const helpers = renderBrowser({ listingGate: { supported: false, unavailableReason: 'No inventory' }, selectionMode: true });
+    expect(screen.queryByText(/shown|selected|Exit select mode/i)).toBeNull();
+    expect(screen.queryByRole('button', { name: /Filters/i })).toBeNull();
+    expect(helpers.container.querySelector('[data-facet-group]')).toBeNull();
+  });
+
   it('row actions fire intents only through supported gates; per-asset overrides block with the reason', () => {
     const helpers = renderBrowser({
       rowActions: [

@@ -73,10 +73,15 @@ disabled with the reason on the control. **Save alone stays available**
 
 Callbacks are intents (`onSaveIntent`, `onUnloadIntent`,
 `onRowAction`, `onBatchAction`, `onSelectionChange`, …). Components
-never render applied/saved/working on their own; the accepted-but-not-
-applied state is passed in as `pendingOperation` and renders as
-"accepted — waiting for the applied event" — the applied event is the
-only truth (same wording family as `../OperationFeedback`).
+never infer persistence or detachment from a callback or a generic `applied`
+event. `pendingOperation` is a caller-supplied durable operation-journal snapshot:
+`accepted`, `failed_before_commit`, `saved_detach_pending`,
+`saved_reference_changed` or `completed`. Its operation ID, expected and
+observed slot generations, saved asset ID and authoritative `referenceCleared`
+acknowledgement distinguish durable bytes from a still-attached reference.
+Retry a pending detach using the **same operation**, never promote again;
+a changed generation must not clear a replacement slot. The operation journal
+adapter and generation-checked runtime acknowledgement do not yet exist.
 
 ### Exact time, never float
 
@@ -119,10 +124,11 @@ must supply:
   asset's own grid; corrections are overlays in the caller's store (a
   text edit must never silently move a timecode); STT capability
   explanation for the readonly state.
-- **Audition analysis**: REAL measured data only — waveform peaks
-  normalized 0..1 for the active window (invalid/NaN values degrade to
-  the floor); `null` when no service supplied it. The component never
-  generates synthetic analysis.
+- **Audition analysis**: REAL measured data only, bound to asset ID/revision,
+  selected channel and exact sample window. Waveform normalized peaks and
+  spectrogram time-frequency bins with Hz/dBFS units are distinct data types;
+  malformed or stale data renders unavailable, never a flat synthetic bar.
+  No waveform, spectrogram or per-asset audition backend exists yet.
 - **On-air truth**: derive from the desk programme state; never from
   the slot's own fields.
 - **Gates**: one `ActionGate` per action, with a localized
@@ -133,9 +139,10 @@ must supply:
   a per-operator preference store does not exist yet — session state is
   the caller's choice, `localStorage` authority is not.
 
-Every "supported: false" gate above is the correct production wiring
-until the backend workstream ships its contract; flip a gate only when
-the matching route actually exists.
+Every `supported: false` gate above is correct until a matching backend
+operation, authorization, persistence and reconciliation contract is shipped
+and verified. A route merely existing is insufficient; no gate flips in this
+component-only repair.
 
 ## i18n
 

@@ -17,7 +17,7 @@ import { fireEvent, screen, within } from '@testing-library/react';
 
 import { renderWithProviders } from '../../../test/render';
 import { AssetAuditionControls } from './AssetAuditionControls';
-import type { AnalysisModeOption } from './AssetAuditionControls';
+import type { AnalysisData, AnalysisModeOption } from './AssetAuditionControls';
 import type { ActionGate } from './types';
 
 const SUPPORTED: ActionGate = { supported: true, unavailableReason: null };
@@ -41,13 +41,11 @@ function renderAudition(overrides: {
   activeChannelId?: string | null;
   analysisModes?: readonly AnalysisModeOption[];
   activeAnalysisModeId?: string | null;
-  analysis?:
-    | {
-        kind: 'waveform' | 'spectrogram';
-        peaks: readonly number[];
-        measuredNote?: string | null;
-      }
-    | null;
+  analysis?: AnalysisData | null;
+  assetId?: string;
+  assetRevision?: string;
+  windowStart?: number;
+  windowEnd?: number;
 } = {}) {
   const onPlayPauseIntent = vi.fn();
   const onStopIntent = vi.fn();
@@ -56,6 +54,8 @@ function renderAudition(overrides: {
   const { container } = renderWithProviders(
     <AssetAuditionControls
       assetName="Interview 12"
+      assetId={overrides.assetId ?? "asset-1"} assetRevision={overrides.assetRevision ?? "r1"}
+      analysisWindow={{ startSample: overrides.windowStart ?? 0, endSample: overrides.windowEnd ?? 48000, sampleRateHz: 48000 }}
       auditionGate={overrides.auditionGate ?? SUPPORTED}
       transport={
         overrides.transport ?? { playing: false, positionLabel: null }
@@ -187,35 +187,23 @@ describe('AssetAuditionControls — analysis surface honesty', () => {
     ).toHaveLength(0);
   });
 
-  it('renders ONLY the caller’s real supplied peaks, clamped to 0..1', () => {
-    const { container } = renderAudition({
-      analysis: {
-        kind: 'waveform',
-        peaks: [0.5, 1, -3, Number.NaN, 0.25],
-        measuredNote: 'Peak envelope, −12 dBFS window',
-      },
-    });
-    const surface = within(container).getByTestId('audition-analysis-surface');
-    expect(surface.dataset.analysisKind).toBe('waveform');
-    const bars = within(surface).getAllByTestId('audition-analysis-bar');
-    expect(bars).toHaveLength(5);
-    // Real values scale; invalid values degrade to the flat floor — never NaN.
-    expect(bars[0]).toHaveStyle({ height: '40px' });
-    expect(bars[1]).toHaveStyle({ height: '80px' });
-    expect(bars[2]).toHaveStyle({ height: '2px' });
-    expect(bars[3]).toHaveStyle({ height: '2px' });
-    expect(bars[4]).toHaveStyle({ height: '20px' });
-    expect(surface).toHaveTextContent(/Peak envelope, −12 dBFS window/);
+  it('rejects invalid, stale or wrong-channel waveform rather than drawing zero bars', () => {
+    for (const analysis of [
+      { kind: 'waveform' as const, assetId: 'other', assetRevision: 'r1', channelId: 'stereo', window: { startSample: 0, endSample: 48000, sampleRateHz: 48000 }, amplitudeUnit: 'normalized_peak' as const, peaks: [0.5] },
+      { kind: 'waveform' as const, assetId: 'asset-1', assetRevision: 'r1', channelId: 'left', window: { startSample: 0, endSample: 48000, sampleRateHz: 48000 }, amplitudeUnit: 'normalized_peak' as const, peaks: [0.5] },
+      { kind: 'waveform' as const, assetId: 'asset-1', assetRevision: 'r1', channelId: 'stereo', window: { startSample: 0, endSample: 48000, sampleRateHz: 48000 }, amplitudeUnit: 'normalized_peak' as const, peaks: [Number.NaN] },
+    ]) {
+      const { container } = renderAudition({ analysis });
+      const surface = within(container).getByTestId('audition-analysis-surface');
+      expect(within(surface).queryAllByTestId('audition-analysis-bar')).toHaveLength(0);
+      expect(surface).toHaveTextContent(/unavailable/i);
+
+    }
+  });
+  it('renders time-frequency bins as a spectrogram, never waveform amplitude bars', () => {
+    const { container } = renderAudition({ activeAnalysisModeId: 'spectrogram', analysisModes: [{ id: 'spectrogram', label: 'Spectrogram', gate: SUPPORTED }], analysis: { kind: 'spectrogram', assetId: 'asset-1', assetRevision: 'r1', channelId: 'stereo', window: { startSample: 0, endSample: 48000, sampleRateHz: 48000 }, frequencyUnit: 'hz', magnitudeUnit: 'dbfs', frequencyBinsHz: [100, 1000], timeBins: [{ startSample: 0, endSample: 24000, magnitudes: [-60, -30] }] } });
+    expect(within(container).getByTestId('audition-analysis-surface').querySelectorAll('[data-testid="audition-analysis-bar"]')).toHaveLength(0);
+    expect(within(container).getByTestId('audition-analysis-surface')).toHaveTextContent(/100.*1000/);
   });
 
-  it('an empty analysis window renders not-measured, not a fake surface', () => {
-    const { container } = renderAudition({
-      analysis: { kind: 'waveform', peaks: [] },
-    });
-    const surface = within(container).getByTestId('audition-analysis-surface');
-    expect(surface).toHaveTextContent(/Analysis not measured yet\./);
-    expect(
-      within(surface).queryAllByTestId('audition-analysis-bar'),
-    ).toHaveLength(0);
-  });
 });

@@ -15,7 +15,7 @@ import { fireEvent, screen, within } from '@testing-library/react';
 import { renderWithProviders } from '../../../test/render';
 import type { ActionGate } from './types';
 import { VTReferenceSummary } from './VTReferenceSummary';
-import type { VTReferenceState } from './VTReferenceSummary';
+import type { VTOperationOutcome, VTReferenceState } from './VTReferenceSummary';
 
 const SUPPORTED: ActionGate = { supported: true, unavailableReason: null };
 const UNSUPPORTED: ActionGate = {
@@ -49,11 +49,12 @@ function renderSlot(overrides: {
   onAirReason?: string;
   saveGate?: ActionGate;
   unloadGate?: ActionGate;
-  pendingOperation?: { label: string } | null;
+  pendingOperation?: VTOperationOutcome | null;
 } = {}) {
   const onSaveIntent = vi.fn();
   const onSaveAndUnloadIntent = vi.fn();
   const onUnloadIntent = vi.fn();
+  const onRetryDetachIntent = vi.fn();
   const onOpenBrowserIntent = vi.fn();
   const { container } = renderWithProviders(
     <VTReferenceSummary
@@ -68,6 +69,7 @@ function renderSlot(overrides: {
       onSaveIntent={onSaveIntent}
       onSaveAndUnloadIntent={onSaveAndUnloadIntent}
       onUnloadIntent={onUnloadIntent}
+      onRetryDetachIntent={onRetryDetachIntent}
       onOpenBrowserIntent={onOpenBrowserIntent}
     />,
   );
@@ -76,6 +78,7 @@ function renderSlot(overrides: {
     onSaveIntent,
     onSaveAndUnloadIntent,
     onUnloadIntent,
+    onRetryDetachIntent,
     onOpenBrowserIntent,
   };
 }
@@ -124,11 +127,11 @@ describe('VTReferenceSummary — explicit states', () => {
 
   it('pending is the accepted-not-applied line — never a success claim', () => {
     const { container } = renderSlot({
-      pendingOperation: { label: 'Save VT 1' },
+      pendingOperation: { label: 'Save VT 1', operationId: 'op1', state: 'accepted', expectedGeneration: 'g1', observedGeneration: null, assetId: null, referenceCleared: false },
     });
     const pending = within(summary(container)).getByTestId('vt-reference-pending');
     expect(pending).toHaveTextContent(
-      /Save VT 1 accepted — waiting for the applied event\./,
+      /Save VT 1 accepted — awaiting durable operation outcome\./,
     );
     // The summary itself never claims applied/saved/working.
     expect(pending.textContent).not.toMatch(/applied\./);
@@ -205,4 +208,19 @@ describe('VTReferenceSummary — capability gates and intents', () => {
       within(summary(container)).queryByRole('button', { name: /^Unload$/ }),
     ).toBeNull();
   });
+});
+
+it('shows durable save without asserting that a newer reference was cleared', () => {
+  const { container } = renderSlot({ pendingOperation: { label: 'Save VT 1', operationId: 'op1', state: 'saved_reference_changed', assetId: 'asset1', expectedGeneration: 'g1', observedGeneration: 'g2', referenceCleared: false } });
+  expect(container).toHaveTextContent(/saved/i);
+  expect(container).toHaveTextContent(/reference changed/i);
+  expect(container).toHaveTextContent(/g2/);
+  expect(container).not.toHaveTextContent(/waiting for the applied event/i);
+});
+
+it('retries only the same durable detach operation without promoting again', () => {
+  const helpers = renderSlot({ pendingOperation: { label: 'Save VT 1', operationId: 'op1', state: 'saved_detach_pending', assetId: 'asset1', expectedGeneration: 'g1', observedGeneration: 'g1', referenceCleared: false } });
+  fireEvent.click(screen.getByRole('button', { name: /Retry detach/i }));
+  expect(helpers.onRetryDetachIntent).toHaveBeenCalledWith('op1', 'g1');
+  expect(helpers.onSaveAndUnloadIntent).not.toHaveBeenCalled();
 });

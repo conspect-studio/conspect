@@ -36,6 +36,8 @@ import {
   describeBoundaryUnit,
   formatBoundaryLabel,
 } from './boundaries';
+import type { RationalBoundary } from '../duration';
+import { isSameGrid } from './boundaries';
 import type {
   TranscriptSelection,
   TranscriptWord,
@@ -61,6 +63,10 @@ export interface TranscriptRangeEditorProps {
   readonly readOnlyReason?: string | undefined;
   /** Overrides the empty-state line (already localized by the caller). */
   readonly emptyLabel?: string | undefined;
+  /** Transcript revision selected by the caller. */
+  readonly transcriptRevision?: string | null | undefined;
+  /** Revision whose alignment has been validated against this asset. */
+  readonly alignedRevision?: string | null | undefined;
 }
 
 /** The normalized inclusive range indexes of a selection, or null. */
@@ -82,6 +88,22 @@ function rangeOf(
   return { min: Math.min(startIndex, endIndex), max: Math.max(startIndex, endIndex) };
 }
 
+/** Validate every selected interval, not only the two visible endpoints. */
+function clipRangeReady(words: readonly TranscriptWord[], range: { min: number; max: number }, transcriptRevision?: string | null, alignedRevision?: string | null): boolean {
+  if (!transcriptRevision || transcriptRevision !== alignedRevision) return false;
+  const selected = words.slice(range.min, range.max + 1);
+  let previous: RationalBoundary | null = null;
+  const first = selected[0]?.startBoundary;
+  if (!first || formatBoundaryLabel(first) === null) return false;
+  for (const word of selected) {
+    const start = word.startBoundary;
+    const end = word.endBoundary;
+    if (!start || !end || formatBoundaryLabel(start) === null || formatBoundaryLabel(end) === null || !isSameGrid(first, start) || !isSameGrid(first, end) || end.index <= start.index || (previous !== null && start.index < previous.index)) return false;
+    previous = end;
+  }
+  return previous !== null && previous.index > first.index;
+}
+
 /**
  * The word-range selection editor: controlled words + selection, exact
  * boundary readouts, 48px endpoint steppers, keyboard support, and an
@@ -94,12 +116,15 @@ export function TranscriptRangeEditor({
   readOnly = false,
   readOnlyReason,
   emptyLabel,
+  transcriptRevision,
+  alignedRevision,
 }: TranscriptRangeEditorProps): JSX.Element {
   const { t } = useLingui();
   const wordRefs = useRef(new Map<string, HTMLButtonElement | HTMLSpanElement>());
   const [focusedWordId, setFocusedWordId] = useState<string | null>(null);
 
   const range = useMemo(() => rangeOf(words, selection), [words, selection]);
+  const clipReady = range !== null && clipRangeReady(words, range, transcriptRevision, alignedRevision);
 
   // Consecutive groups sharing a segmentId; ungrouped words (null) each
   // form their own group without a header.
@@ -114,8 +139,8 @@ export function TranscriptRangeEditor({
       const lastGroup = groups.at(-1) ?? null;
       const sameGroup =
         lastGroup !== null &&
-        word.segmentId !== null &&
-        lastGroup.segmentId === word.segmentId;
+        lastGroup.segmentId === word.segmentId &&
+        (word.segmentId !== null || lastGroup.speakerLabel === word.speakerLabel);
       if (sameGroup) {
         lastGroup.words.push({ word, index });
         return;
@@ -137,7 +162,7 @@ export function TranscriptRangeEditor({
 
   // The roving tab stop: the focused word, else the anchor, else word 0.
   const tabStopId =
-    focusedWordId ?? selection?.startWordId ?? words.at(0)?.id ?? null;
+    [focusedWordId, selection?.startWordId, words.at(0)?.id].find((id) => id !== null && id !== undefined && words.some((word) => word.id === id)) ?? null;
 
   const activate = useCallback(
     (wordId: string, extend: boolean): void => {
@@ -175,10 +200,10 @@ export function TranscriptRangeEditor({
 
   const handleKeyDown = useCallback(
     (event: KeyboardEvent<HTMLElement>): void => {
-      if (readOnly || words.length === 0 || focusedWordId === null) {
+      if (readOnly || words.length === 0 || tabStopId === null) {
         return;
       }
-      const focusedIndex = words.findIndex((word) => word.id === focusedWordId);
+      const focusedIndex = words.findIndex((word) => word.id === tabStopId);
       if (focusedIndex < 0) {
         return;
       }
@@ -232,13 +257,13 @@ export function TranscriptRangeEditor({
       onSelectionChange,
       readOnly,
       words,
-      focusedWordId,
+      tabStopId,
     ],
   );
 
   // Steppers step one word at a time, never past each other.
   const stepRange = (bound: 'in' | 'out', direction: -1 | 1): void => {
-    if (range === null) {
+    if (range === null || !clipReady) {
       return;
     }
     let { min, max } = range;
@@ -255,16 +280,17 @@ export function TranscriptRangeEditor({
     if (inWord === undefined || outWord === undefined) {
       return;
     }
+    if (!clipRangeReady(words, { min, max }, transcriptRevision, alignedRevision)) return;
     onSelectionChange({
       startWordId: inWord.id,
       endWordId: outWord.id,
     });
   };
 
-  const inBackwardDisabled = range === null || range.min === 0;
-  const inForwardDisabled = range === null || range.min >= range.max;
-  const outBackwardDisabled = range === null || range.max <= range.min;
-  const outForwardDisabled = range === null || range.max === words.length - 1;
+  const inBackwardDisabled = range === null || !clipReady || range.min === 0;
+  const inForwardDisabled = range === null || !clipReady || range.min >= range.max;
+  const outBackwardDisabled = range === null || !clipReady || range.max <= range.min;
+  const outForwardDisabled = range === null || !clipReady || range.max === words.length - 1;
 
   if (words.length === 0) {
     return (
@@ -318,7 +344,7 @@ export function TranscriptRangeEditor({
           data-testid="transcript-selection-readout"
           className="flex min-w-0 flex-col gap-2 rounded-lg border p-3"
         >
-          <SelectionReadout words={words} range={range} />
+          <SelectionReadout words={words} range={range} clipReady={clipReady} />
           <div className="flex min-w-0 flex-wrap items-start gap-2">
             <EndpointStepper
               label={t`IN`}
@@ -433,7 +459,9 @@ export function TranscriptRangeEditor({
 function SelectionReadout({
   words,
   range,
+  clipReady,
 }: {
+  readonly clipReady: boolean;
   readonly words: readonly TranscriptWord[];
   readonly range: { min: number; max: number };
 }): JSX.Element {
@@ -461,6 +489,7 @@ function SelectionReadout({
           ? `${startLabel} → ${endLabel}`
           : t`Timecodes not aligned`}
       </p>
+      <p data-testid="transcript-clip-readiness" className="text-xs text-muted-foreground">{clipReady ? t`Clip-ready selection` : t`Text selection only — alignment, asset grid, interval order or transcript revision is unavailable.`}</p>
       {startUnit !== null && endUnit !== null ? (
         <p className="min-w-0 break-words text-xs text-muted-foreground">
           {`${startUnit} · ${endUnit}`}

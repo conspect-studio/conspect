@@ -9,6 +9,7 @@ export { AssetAuditionControls } from './AssetAuditionControls';
 export type {
   AnalysisData,
   AnalysisModeOption,
+  AnalysisWindow,
   AssetAuditionControlsProps,
   ChannelOption,
 } from './AssetAuditionControls';
@@ -26,7 +27,7 @@ export type {
 export { TranscriptRangeEditor } from './TranscriptRangeEditor';
 export type { TranscriptRangeEditorProps } from './TranscriptRangeEditor';
 export { VTReferenceSummary } from './VTReferenceSummary';
-export type { VTReferenceState, VTReferenceSummaryProps } from './VTReferenceSummary';
+export type { VTReferenceState, VTOperationOutcome, VTReferenceSummaryProps } from './VTReferenceSummary';
 export {
   AssetKindChip,
   InUseChip,

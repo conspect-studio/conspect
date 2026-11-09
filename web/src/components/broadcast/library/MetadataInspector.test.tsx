@@ -334,3 +334,16 @@ describe('MetadataInspector — provenance and usage records', () => {
     expect(provenance).toHaveTextContent(/Derived from/);
   });
 });
+
+it('rejects mismatched grid and invalid measured length trim proposals', () => {
+  for (const asset of [
+    { ...ASSET, declared: { ...ASSET.declared, inBoundary: { kind: 'frames' as const, index: 15, numerator: 25, denominator: 1 } } },
+    { ...ASSET, measured: { ...ASSET.measured, units: Number.NaN } },
+  ]) {
+    const helpers = renderInspector({ asset });
+    const trim = within(helpers.container).getByTestId('metadata-trim-control');
+    expect(trim).toHaveTextContent(/invalid|unavailable/i);
+    expect(within(trim).queryAllByRole('button')).toHaveLength(0);
+    expect(helpers.onTrimBoundaryChange).not.toHaveBeenCalled();
+  }
+});

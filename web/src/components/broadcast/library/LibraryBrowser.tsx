@@ -178,7 +178,7 @@ export function LibraryBrowser({
       <h2 className="min-w-0 break-words text-base font-semibold">
         {t`Library`}
         <span className="ml-2 align-middle text-xs font-normal text-muted-foreground">
-          {t`${assets.length} shown`}
+          {listingAvailable ? t`${assets.length} shown` : null}
         </span>
       </h2>
 
@@ -211,7 +211,7 @@ export function LibraryBrowser({
             </option>
           ))}
         </select>
-        {selectionMode && onSelectionModeToggle !== undefined ? (
+        {listingAvailable && selectionMode && onSelectionModeToggle !== undefined ? (
           <TouchAction
             variant="outline"
             aria-pressed={selectionMode}
@@ -221,7 +221,7 @@ export function LibraryBrowser({
           >
             {t`Exit select mode`}
           </TouchAction>
-        ) : !selectionMode && onSelectionModeToggle !== undefined ? (
+        ) : listingAvailable && !selectionMode && onSelectionModeToggle !== undefined ? (
           <TouchAction
             variant="outline"
             onPress={(): void => {
@@ -231,7 +231,7 @@ export function LibraryBrowser({
             {t`Select…`}
           </TouchAction>
         ) : null}
-        {facetGroups !== undefined && facetGroups.length > 0 && onFiltersToggle !== undefined ? (
+        {listingAvailable && facetGroups !== undefined && facetGroups.length > 0 && onFiltersToggle !== undefined ? (
           <TouchAction
             variant="outline"
             className="md:hidden"
@@ -246,7 +246,7 @@ export function LibraryBrowser({
         ) : null}
       </div>
 
-      {facetGroups !== undefined && facetGroups.length > 0 ? (
+      {listingAvailable && facetGroups !== undefined && facetGroups.length > 0 ? (
         <div
           id={filtersPanelId}
           className={cn(

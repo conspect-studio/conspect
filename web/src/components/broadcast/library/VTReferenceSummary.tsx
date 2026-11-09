@@ -11,8 +11,8 @@
 //                   (`AssetDurationLabel`), rights render through the
 //                   never-cleared rights chip.
 //   * `pendingOperation` — an accepted-but-not-applied ledger operation:
-//                   "accepted — waiting for the applied event", NEVER
-//                   "working"/"done" (the applied event is the only truth).
+//                   "accepted — awaiting durable operation outcome", NEVER
+//                   "working"/"done" (only the durable operation journal and authoritative detach acknowledgement establish truth).
 //
 // Gates: `onAir` (derived desk truth, never a second hardcoded state)
 // disables unload-style actions with the reason on the control — saving
@@ -63,6 +63,18 @@ export type VTReferenceState =
       readonly rightsExpiryLabel?: string | null;
     };
 
+/** Backend-owned durable operation journal snapshot; no event implies completion. */
+export interface VTOperationOutcome {
+  readonly label: string;
+  readonly operationId: string;
+  readonly state: 'accepted' | 'failed_before_commit' | 'saved_detach_pending' | 'saved_reference_changed' | 'completed';
+  readonly assetId: string | null;
+  readonly expectedGeneration: string;
+  readonly observedGeneration: string | null;
+  readonly referenceCleared: boolean;
+  readonly reason?: string | null;
+}
+
 /** Props for {@link VTReferenceSummary}. */
 export interface VTReferenceSummaryProps {
   /** The slot id (echoed in intents so one strip can host many rows). */
@@ -85,7 +97,7 @@ export interface VTReferenceSummaryProps {
    * An accepted-but-not-applied ledger operation on this slot, if any.
    * Rendered as the honest pending line — never a success claim.
    */
-  readonly pendingOperation?: { readonly label: string } | null | undefined;
+  readonly pendingOperation?: VTOperationOutcome | null | undefined;
   /** Capability gate for saving the fetched bytes to the library. */
   readonly saveGate: ActionGate;
   /** Capability gate for dropping the slot's reference (unload). */
@@ -102,6 +114,8 @@ export interface VTReferenceSummaryProps {
    * reference drop, never byte deletion).
    */
   readonly onUnloadIntent?: (() => void) | undefined;
+  /** Retry the SAME durable operation and expected generation; never re-promote. */
+  readonly onRetryDetachIntent?: ((operationId: string, expectedGeneration: string) => void) | undefined;
   /** Intent: open the library browser (navigation only — no mutation). */
   readonly onOpenBrowserIntent?: (() => void) | undefined;
 }
@@ -122,6 +136,7 @@ export function VTReferenceSummary({
   onSaveIntent,
   onSaveAndUnloadIntent,
   onUnloadIntent,
+  onRetryDetachIntent,
   onOpenBrowserIntent,
 }: VTReferenceSummaryProps): JSX.Element {
   const { t } = useLingui();
@@ -202,8 +217,18 @@ export function VTReferenceSummary({
           data-testid="vt-reference-pending"
           className="min-w-0 break-words text-xs text-muted-foreground"
         >
-          {t`${pendingOperation.label} accepted — waiting for the applied event.`}
+          {pendingOperation.state === 'accepted' ? t`${pendingOperation.label} accepted — awaiting durable operation outcome.` : null}
+          {pendingOperation.state === 'failed_before_commit' ? t`${pendingOperation.label} failed before save; original slot remains attached.` : null}
+          {pendingOperation.state === 'saved_detach_pending' ? t`${pendingOperation.label} saved; detach pending. Keep the slot until authoritative acknowledgement; retry the same operation.` : null}
+          {pendingOperation.state === 'saved_reference_changed' ? t`${pendingOperation.label} saved; reference changed. A newer slot must not be cleared.` : null}
+          {pendingOperation.state === 'completed' ? (pendingOperation.referenceCleared ? t`${pendingOperation.label} completed; reference cleared.` : t`${pendingOperation.label} completed; saved reference remains attached.`) : null}
+          {' · '}{t`Operation ${pendingOperation.operationId} · expected generation ${pendingOperation.expectedGeneration} · observed generation ${pendingOperation.observedGeneration ?? '—'}`}
+          {pendingOperation.assetId !== null ? <> · {t`Saved asset ${pendingOperation.assetId}`}</> : null}
+          {pendingOperation.reason ? <> · {pendingOperation.reason}</> : null}
         </p>
+      ) : null}
+      {pendingOperation?.state === 'saved_detach_pending' && onRetryDetachIntent !== undefined ? (
+        <ActionCell><TouchAction variant="outline" disabled={unloadBlocked} disabledReason={unloadReason ?? undefined} onPress={(): void => { onRetryDetachIntent(pendingOperation.operationId, pendingOperation.expectedGeneration); }}>{t`Retry detach (same operation)`}</TouchAction></ActionCell>
       ) : null}
 
       <div className="flex min-w-0 flex-wrap items-start gap-2">
@@ -212,7 +237,7 @@ export function VTReferenceSummary({
             <ActionCell>
               <TouchAction
                 variant="default"
-                disabled={saveBlocked}
+                disabled={saveBlocked || pendingOperation?.state === 'saved_detach_pending' || pendingOperation?.state === 'saved_reference_changed' || pendingOperation?.state === 'completed'}
                 disabledReason={saveReason ?? undefined}
                 onPress={(): void => {
                   onSaveIntent?.();
@@ -224,7 +249,7 @@ export function VTReferenceSummary({
             <ActionCell>
               <TouchAction
                 variant="outline"
-                disabled={unloadBlocked}
+                disabled={unloadBlocked || pendingOperation?.state === 'saved_detach_pending' || pendingOperation?.state === 'saved_reference_changed' || pendingOperation?.state === 'completed'}
                 disabledReason={unloadReason ?? undefined}
                 onPress={(): void => {
                   onSaveAndUnloadIntent?.();
