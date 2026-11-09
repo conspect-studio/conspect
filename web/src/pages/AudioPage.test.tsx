@@ -209,6 +209,21 @@ describe("AudioPage", () => {
     expect(within(context).getByRole("button", { name: /export configuration/i })).toBeInTheDocument();
   });
 
+  it("bounds essential toolbar controls and wraps labels without reducing touch targets", async () => {
+    renderAudio();
+    await console();
+    for (const control of [
+      screen.getByTestId("audio-save"),
+      screen.getByTestId("audio-add-route"),
+      screen.getByRole("button", { name: "Whole mix overview" }),
+      ...screen.getAllByTestId("audio-strip-chip"),
+    ]) {
+      expect(control).toHaveClass("h-auto", "min-h-12", "min-w-12", "max-w-full", "whitespace-normal", "break-words");
+      expect(control).not.toHaveClass("h-12");
+    }
+    expect(screen.getByTestId("audio-save")).toHaveTextContent("Save audio routing");
+  });
+
   it("shows the apply-semantics callout", async () => {
     renderAudio();
     expect(await screen.findByRole("note")).toHaveTextContent(

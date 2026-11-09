@@ -1087,7 +1087,7 @@ export function AudioPage(): JSX.Element {
                   variant="outline"
                   data-testid="audio-strip-chip"
                   aria-pressed={index === focused}
-                  className="h-12 px-4 aria-pressed:bg-secondary aria-pressed:font-semibold"
+                  className="h-auto min-h-12 min-w-12 max-w-full whitespace-normal break-words px-4 aria-pressed:bg-secondary aria-pressed:font-semibold"
                   onClick={(): void => {
                     ride(index);
                   }}
@@ -1110,7 +1110,7 @@ export function AudioPage(): JSX.Element {
               <Trans>Mix bank</Trans>
             </h3>
             {form.routes.length > 1 ? (
-              <Button type="button" variant="outline" className="mb-3 h-12" aria-expanded={bankExpanded} onClick={(): void => { setBankExpanded(!bankExpanded); }}>
+              <Button type="button" variant="outline" className="mb-3 h-auto min-h-12 min-w-12 max-w-full whitespace-normal break-words" aria-expanded={bankExpanded} onClick={(): void => { setBankExpanded(!bankExpanded); }}>
                 {bankExpanded ? <Trans>Show selected channel</Trans> : <Trans>Show all channels</Trans>}
               </Button>
             ) : null}
@@ -1195,7 +1195,7 @@ export function AudioPage(): JSX.Element {
           ) : null}
 
           <div>
-            <Button type="button" variant="outline" className="h-12" aria-expanded={overviewOpen} onClick={(): void => { setOverviewOpen(!overviewOpen); }}>
+            <Button type="button" variant="outline" className="h-auto min-h-12 min-w-12 max-w-full whitespace-normal break-words" aria-expanded={overviewOpen} onClick={(): void => { setOverviewOpen(!overviewOpen); }}>
               <Trans>Whole mix overview</Trans>
             </Button>
           </div>
@@ -1246,7 +1246,7 @@ export function AudioPage(): JSX.Element {
               type="button"
               variant="outline"
               data-testid="audio-add-route"
-              className="h-12 px-4"
+              className="h-auto min-h-12 min-w-12 max-w-full whitespace-normal break-words px-4"
               onClick={(): void => {
                 update({ ...form, routes: [...form.routes, emptyAudioRoute()] }, [...rowIds, Math.max(nextRowId.current++, ...rowIds.map((id) => id + 1))]);
               }}
@@ -1257,7 +1257,7 @@ export function AudioPage(): JSX.Element {
             <Button
               type="button"
               data-testid="audio-save"
-              className="h-12 px-6"
+              className="h-auto min-h-12 min-w-12 max-w-full whitespace-normal break-words px-6"
               disabled={save.isPending || conflicted || queryDiverged}
               onClick={onSave}
             >
@@ -1266,7 +1266,7 @@ export function AudioPage(): JSX.Element {
             {(conflicted || queryDiverged) ? (
               <div role="alert" className="flex flex-wrap items-center gap-2 text-sm text-destructive">
                 <Trans>Audio routing changed on the server. Your draft is preserved; review the latest version before saving again.</Trans>
-                <Button type="button" variant="outline" className="h-12" onClick={(): void => {
+                <Button type="button" variant="outline" className="h-auto min-h-12 min-w-12 max-w-full whitespace-normal break-words" onClick={(): void => {
                   if (routing.data === undefined) return;
                   const latest = audioFormFromDocument(routing.data.state.routing);
                   setBaseline({ form: latest, etag: routing.data.etag, rowIds: latest.routes.map((_, index) => index) });
