@@ -30,6 +30,8 @@ import type {
   MediaPlayerEvent,
 } from "./generated-types";
 import { resourceKeys } from "../resources/queries";
+import { getOperationTracker } from "../components/broadcast/operationTracker";
+import { getStoredToken } from "../api/token";
 // `LifecycleState` (LIVE/STALE/RECONNECTING/NO_SIGNAL) comes from the generated
 // AsyncAPI schema types — the canonical source of truth for tile lifecycle values
 // (resilience invariant #2). `envelope.ts` re-exports it as `TileState` for
@@ -325,7 +327,10 @@ export function useEngineEvents(): EngineEvents {
   const [lastSeq, setLastSeq] = useState(0);
   const [gaps, setGaps] = useState(0);
   useEffect(() => {
+    const tracker = getOperationTracker(queryClient);
     const unsubscribe = subscribeRealtimeAll((envelope): void => {
+        tracker.resetIdentity(getStoredToken());
+        tracker.onEnvelope(envelope);
         // Control frames may carry seq 0; only advance the displayed cursor for
         // real, sequenced frames so the indicator never regresses.
         if (envelope.seq > 0) {
@@ -400,7 +405,11 @@ export function useEngineEvents(): EngineEvents {
             // Unknown event types are ignored (forward-compatible, §2).
             return;
         }
-      }, setStatus, (): void => {
+      }, (next): void => {
+        setStatus(next);
+        if (next === 'reconnecting' || next === 'closed') tracker.onGap();
+      }, (): void => {
+        tracker.onGap();
         // Missed frames: refetch everything the stream feeds (resume failed).
         setGaps((count) => count + 1);
         void queryClient.invalidateQueries();
