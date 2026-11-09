@@ -951,7 +951,7 @@ function OutputCard({
           <span lang="" dir="auto" className="font-medium">
             {output.name}
           </span>
-          <code className="text-xs text-muted-foreground">{output.id}</code>
+          <code className="min-w-0 break-all text-xs text-muted-foreground" lang="" dir="auto">{output.id}</code>
         </span>
       }
       status={

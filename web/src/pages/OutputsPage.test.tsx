@@ -144,6 +144,15 @@ describe('OutputsPage broadcast cards (configured facts)', () => {
     ).not.toBeInTheDocument();
   });
 
+  it('keeps a long output identifier breakable inside the phone card', async () => {
+    server.use(http.get('*/api/v1/outputs', () => HttpResponse.json([
+      { id: 'contribution-main-program-hls-primary-very-long-output-identifier', name: 'Long output', body: { kind: 'hls', path: '/srv/index.m3u8', codec: 'h264' } },
+    ])));
+    renderOutputs();
+    const card = await screen.findByTestId('output-card-contribution-main-program-hls-primary-very-long-output-identifier');
+    expect(within(card).getByText('contribution-main-program-hls-primary-very-long-output-identifier')).toHaveClass('min-w-0', 'break-all');
+  });
+
   it('keeps the 48px touch floor on every card action and the phone disclosure classes', async () => {
     renderOutputs();
     await screen.findByTestId('output-card-program');
@@ -366,17 +375,15 @@ describe('OutputsPage collision honesty (derived mounts)', () => {
     expect(stable).toHaveAttribute('href', '/hls/program/index.m3u8');
     // …while the normalized duplicates and the runtime-suffixed mount get
     // no link: their mounts depend on configuration order.
-    const dup = within(screen.getByTestId('output-card-a-b-2'));
-    expect(within(screen.getByTestId('output-card-a b')).queryByRole('link', { name: 'Open HLS playlist' })).not.toBeInTheDocument();
-    expect(within(screen.getByTestId('output-card-a-b')).queryByRole('link', { name: 'Open HLS playlist' })).not.toBeInTheDocument();
-    expect(
-      dup.queryByRole('link', { name: 'Open HLS playlist' }),
-    ).not.toBeInTheDocument();
-    expect(
-      dup.getByText(
-        'HLS link unavailable: output IDs resolve to colliding mounts; the runtime mount depends on configuration order.',
-      ),
-    ).toBeInTheDocument();
+    for (const id of ['a b', 'a-b', 'a-b-2']) {
+      const collidingCard = within(screen.getByTestId(`output-card-${id}`));
+      expect(collidingCard.queryByRole('link', { name: 'Open HLS playlist' })).not.toBeInTheDocument();
+      expect(
+        collidingCard.getByText(
+          'HLS link unavailable: output IDs resolve to colliding mounts; the runtime mount depends on configuration order.',
+        ),
+      ).toBeInTheDocument();
+    }
     // Only one playlist link exists, exactly as with the old table.
     expect(screen.getAllByRole('link', { name: 'Open HLS playlist' }).length).toBe(1);
   });
