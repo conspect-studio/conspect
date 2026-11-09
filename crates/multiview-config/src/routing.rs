@@ -234,6 +234,9 @@ pub struct OutputCrosspoint {
     pub bus: OutputBus,
 }
 
+#[allow(clippy::trivially_copy_pass_by_ref)]
+// reason: serde's `skip_serializing_if` requires a `fn(&T) -> bool` predicate, so
+// this cannot take `OutputBus` by value.
 fn is_program_bus(bus: &OutputBus) -> bool {
     *bus == OutputBus::Program
 }
