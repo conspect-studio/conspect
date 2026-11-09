@@ -204,7 +204,7 @@ tempfile = "3"
 # `rustix::process::geteuid` — a SAFE wrapper (this crate forbids `unsafe`) used
 # to fail-closed when the `.multiview` state dir is owned by another uid
 # (ADR-W024 MAJOR-A). Permissive (Apache-2.0/MIT/BSD), already in the lock.
-rustix = { version = "1", features = ["process"] }
+rustix = { version = "1", features = ["process", "fs"] }
 
 # Control-plane TLS termination (TLS-0, ADR-W029; HTTP/1-only serve loop SEC-14 #126 R2 /
 # ADR-W031): OFF by default (`tls`). The `[control.tls]` schema + the plain-HTTP serve path
@@ -223,6 +223,10 @@ rustls = { version = "0.23", optional = true }
 rustls-pki-types = { version = "1", features = ["std"], optional = true }
 
 [dev-dependencies]
+hang = "=0.21.22"
+url = "2"
+moq-net = "=0.3.21"
+moq-tokio = { version = "=0.19.34", default-features = false, features = ["noq", "ring"] }
 multiview-cloudflare = { path = "../multiview-cloudflare", features = ["testing"] }
 # Self dev-dependency: the canonical way to enable a TEST-ONLY feature for this
 # crate's OWN tests without pulling it into the default build or a downstream

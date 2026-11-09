@@ -71,9 +71,9 @@ impl Controller {
     /// trial deadline/memory bounds, reset canceled streams and keep audio reserved.
     /// Unknown or idle evidence cannot prove capacity or admit an upshift.
     pub fn observe(&mut self, sample: Option<Snapshot>, elapsed: Duration) -> Admission {
-        let Some(s) = sample
-            .filter(|s| !s.invalid && !s.unsupported && !elapsed.is_zero() && elapsed <= Duration::from_secs(2))
-        else {
+        let Some(s) = sample.filter(|s| {
+            !s.invalid && !s.unsupported && !elapsed.is_zero() && elapsed <= Duration::from_secs(2)
+        }) else {
             self.rollback();
             self.baseline = None;
             return self.admission();
@@ -198,7 +198,13 @@ mod tests {
         assert!(controller.admission().trial);
         sample.unsupported = true;
         controller.observe(Some(sample), Duration::from_secs(1));
-        assert_eq!(controller.admission(), Admission { level: 0, trial: false });
+        assert_eq!(
+            controller.admission(),
+            Admission {
+                level: 0,
+                trial: false
+            }
+        );
     }
     #[test]
     fn gaps_and_idle_cannot_raise() {

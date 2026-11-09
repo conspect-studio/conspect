@@ -156,14 +156,21 @@ pub struct SharedPublication {
 
 impl SharedPublication {
     /// Render an admitted ladder into real tracks on an existing broadcast.
-    pub fn create_with_budget(ladder: SharedLadder, broadcast: &moq_net::broadcast::Producer,
-        budget: crate::allocation::AllocationBudget) -> Result<Self, PublishError> {
+    pub fn create_with_budget(
+        ladder: SharedLadder,
+        broadcast: &moq_net::broadcast::Producer,
+        budget: crate::allocation::AllocationBudget,
+    ) -> Result<Self, PublishError> {
         let mut publication = Self::create(ladder, broadcast)?;
-        for adapter in &mut publication.adapters { adapter.allocation = Some(budget.clone()); }
+        for adapter in &mut publication.adapters {
+            adapter.allocation = Some(budget.clone());
+        }
         publication.allocation = Some(budget);
         Ok(publication)
     }
-    pub fn allocation_budget(&self) -> Option<&crate::allocation::AllocationBudget> { self.allocation.as_ref() }
+    pub fn allocation_budget(&self) -> Option<&crate::allocation::AllocationBudget> {
+        self.allocation.as_ref()
+    }
 
     pub fn create(
         ladder: SharedLadder,
@@ -257,8 +264,12 @@ impl SharedPublication {
     /// Opt into bounded trial cancellation on an existing non-base rendition.
     /// This never creates tracks/encoders and never changes independent audio.
     pub fn enable_trial_cancellation(&mut self, level: usize) -> Result<(), PublishError> {
-        if level == 0 { return Err(PublishError::UnknownRendition(level)); }
-        self.adapters.get_mut(level).ok_or(PublishError::UnknownRendition(level))?
+        if level == 0 {
+            return Err(PublishError::UnknownRendition(level));
+        }
+        self.adapters
+            .get_mut(level)
+            .ok_or(PublishError::UnknownRendition(level))?
             .enable_trial_cancellation();
         Ok(())
     }
@@ -266,8 +277,13 @@ impl SharedPublication {
     /// Cancel only the selected video rung's current and bounded retained groups.
     /// The caller must separately enforce actual transport allocation limits.
     pub fn cancel_trial(&mut self, level: usize) -> Result<(), PublishError> {
-        if level == 0 { return Err(PublishError::UnknownRendition(level)); }
-        self.adapters.get_mut(level).ok_or(PublishError::UnknownRendition(level))?.abort_group();
+        if level == 0 {
+            return Err(PublishError::UnknownRendition(level));
+        }
+        self.adapters
+            .get_mut(level)
+            .ok_or(PublishError::UnknownRendition(level))?
+            .abort_group();
         Ok(())
     }
 
@@ -313,7 +329,8 @@ impl SharedPublication {
             }
             let timestamp = moq_net::Timestamp::new(packet.pts_us, Timescale::MICRO)
                 .map_err(|_| PublishError::Timestamp)?;
-            let serialized = crate::provider::serialized_frame_in(packet, self.allocation.as_ref())?;
+            let serialized =
+                crate::provider::serialized_frame_in(packet, self.allocation.as_ref())?;
             prepared.push((timestamp, serialized));
             last = Some(packet.pts_us);
         }

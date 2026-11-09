@@ -94,7 +94,9 @@ impl RelayPublisher {
         publication: &mut SharedPublication,
         admission: Admission,
     ) -> Result<(), RelayError> {
-        if publication.allocation_budget().is_none() { return Err(RelayError::InvalidBudget); }
+        if publication.allocation_budget().is_none() {
+            return Err(RelayError::InvalidBudget);
+        }
         validate_prefix(
             &self.identity,
             publication,
@@ -193,20 +195,40 @@ mod tests {
     fn family_budget_failure_publishes_no_partial_audio_and_tracks_live_owner_bytes() {
         let origin = moq_net::broadcast::Producer::new(Default::default());
         let budget = crate::allocation::AllocationBudget::new(20).unwrap();
-        let mut publication = SharedPublication::create_with_budget(ladder(1), &origin, budget.clone()).unwrap();
+        let mut publication =
+            SharedPublication::create_with_budget(ladder(1), &origin, budget.clone()).unwrap();
         let packets = vec![
-            crate::Packet { payload: Bytes::from_static(&[1;8]), pts_us: 1, verified_rap: true },
-            crate::Packet { payload: Bytes::from_static(&[2;8]), pts_us: 2, verified_rap: true },
+            crate::Packet {
+                payload: Bytes::from_static(&[1; 8]),
+                pts_us: 1,
+                verified_rap: true,
+            },
+            crate::Packet {
+                payload: Bytes::from_static(&[2; 8]),
+                pts_us: 2,
+                verified_rap: true,
+            },
         ];
         assert!(publication.publish_audio("audio", &packets).is_err());
-        assert_eq!(budget.retained_bytes(), 0, "failed preflight refunds every reservation");
+        assert_eq!(
+            budget.retained_bytes(),
+            0,
+            "failed preflight refunds every reservation"
+        );
         publication.publish_audio("audio", &packets[..1]).unwrap();
         assert!(budget.retained_bytes() > 0);
         let before = budget.retained_bytes();
         publication.enable_trial_cancellation(1).unwrap();
         publication.cancel_trial(1).unwrap();
-        assert_eq!(budget.retained_bytes(), before, "video cancel never releases independent audio");
-        assert!(publication.publish_audio("audio", &packets[..1]).is_err(), "audio published once per PTS");
+        assert_eq!(
+            budget.retained_bytes(),
+            before,
+            "video cancel never releases independent audio"
+        );
+        assert!(
+            publication.publish_audio("audio", &packets[..1]).is_err(),
+            "audio published once per PTS"
+        );
     }
     #[test]
     fn fresh_outgoing_meter_is_not_capacity_evidence() {

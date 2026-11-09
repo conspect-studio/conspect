@@ -72,6 +72,145 @@ pub struct LadderFeed {
     pub demand: Box<dyn Send + Sync>,
 }
 
+/// Explicit outgoing publisher policy. Endpoint credentials stay private and this
+/// type deliberately has no Debug implementation. Protected mode fails closed.
+pub struct FamilyRelayConfig {
+    pub endpoint: url::Url,
+    pub connect: moq_tokio::connect::Config,
+    pub overhead_bps: u64,
+    pub send_window_bytes: u64,
+    pub retained_bytes: usize,
+    pub protected: bool,
+}
+/// One canonical publisher per admitted family, independent of viewer tickets.
+/// The caller must retain exactly one owner per factory/run generation.
+pub struct FamilyPublisher {
+    origin: moq_net::origin::Consumer,
+    ladder: Arc<SharedLadder>,
+    stop: watch::Sender<bool>,
+    worker: tokio::task::JoinHandle<()>,
+}
+impl FamilyPublisher {
+    pub fn origin(&self) -> moq_net::origin::Consumer {
+        self.origin.clone()
+    }
+    pub fn ladder(&self) -> &SharedLadder {
+        &self.ladder
+    }
+    /// Await actual task teardown before a caller acknowledges replacement.
+    pub async fn shutdown(&mut self) {
+        self.stop.send_replace(true);
+        let _ = (&mut self.worker).await;
+    }
+    /// Start from the canonical registry's family feed, never a viewer feed.
+    /// No encoder is opened. Every await runs off the production clock.
+    pub async fn start(feed: LadderFeed, relay: Option<FamilyRelayConfig>) -> anyhow::Result<Self> {
+        anyhow::ensure!(
+            relay.is_some(),
+            "outgoing family relay requires explicit configuration"
+        );
+        if relay.as_ref().is_some_and(|config| config.protected) {
+            anyhow::bail!("protected family publication is unavailable");
+        }
+        let LadderFeed {
+            ladder,
+            capacity_bps: _,
+            config: _,
+            mut windows,
+            demand,
+        } = feed;
+        let ladder = Arc::new(ladder);
+        let limit = relay
+            .as_ref()
+            .map_or(8 * 1024 * 1024, |config| config.retained_bytes);
+        anyhow::ensure!(
+            limit > 0 && limit <= 64 * 1024 * 1024,
+            "invalid retained family budget"
+        );
+        let budget = crate::allocation::AllocationBudget::new(limit)
+            .map_err(|_| anyhow::anyhow!("invalid retained family budget"))?;
+        let mut origin_config = moq_net::origin::Config::default();
+        origin_config.cache_duration = Duration::from_secs(2);
+        origin_config.pool = moq_net::cache::Pool::new(
+            moq_net::cache::Config::default()
+                .with_capacity(limit as u64)
+                .with_expiry(Duration::from_secs(2)),
+        );
+        let origin = moq_tokio::origin::spawn_config(origin_config);
+        let broadcast = origin.create_broadcast("media")?;
+        broadcast.announce(Default::default())?;
+        let mut publication =
+            SharedPublication::create_with_budget((*ladder).clone(), &broadcast, budget)?;
+        let mut relay = match relay {
+            Some(config) => Some(
+                crate::relay::RelayPublisher::connect(
+                    config.connect,
+                    config.endpoint,
+                    origin.consume(),
+                    &ladder,
+                    config.overhead_bps,
+                    config.send_window_bytes,
+                )
+                .await
+                .map_err(|_| anyhow::anyhow!("family relay connection failed"))?,
+            ),
+            None => None,
+        };
+        let (stop, mut stopped) = watch::channel(false);
+        let consumer = origin.consume();
+        let generation = ladder.generation();
+        let levels = ladder.len();
+        let worker = tokio::spawn(async move {
+            let _demand = demand;
+            let mut sample = tokio::time::interval(Duration::from_secs(1));
+            let mut level = 0usize;
+            loop {
+                tokio::select! {
+                    biased;
+                    _ = stopped.wait_for(|stop| *stop) => break,
+                    _ = sample.tick(), if relay.is_some() => {
+                        let publisher = relay.as_mut().unwrap();
+                        let admission = match publisher.sample(Duration::from_secs(1)) { Ok(admission) => admission, Err(_) => break };
+                        if publisher.apply_prefix(&mut publication, admission).is_err() { break; }
+                        level = admission.level;
+                    }
+                    window = windows.recv() => {
+                        let Some(window) = window else { break; };
+                        if window.generation != generation || window.renditions.len() != levels { break; }
+                        let mut failed = false;
+                        for (index, rung) in window.renditions.iter().enumerate() {
+                            if window.discontinuities & (1 << index) != 0 && publication.discontinuity(index).is_err() { failed = true; break; }
+                            if index > level || rung.packets.is_empty() { continue; }
+                            match publication.publish(index, rung) { Ok(()) | Err(PublishError::Reject(crate::Reject::NeedsRap)) => {}, Err(_) => { failed = true; break; } }
+                        }
+                        if failed { break; }
+                        for (name, packets) in &window.audio {
+                            if !packets.is_empty() && publication.publish_audio(name, packets).is_err() { failed = true; break; }
+                        }
+                        if failed { break; }
+                    }
+                }
+            }
+            if let Some(relay) = relay {
+                relay.abort();
+            }
+            drop((publication, broadcast, origin));
+        });
+        Ok(Self {
+            origin: consumer,
+            ladder,
+            stop,
+            worker,
+        })
+    }
+}
+impl Drop for FamilyPublisher {
+    fn drop(&mut self) {
+        self.stop.send_replace(true);
+        self.worker.abort();
+    }
+}
+
 /// Live state of one admitted shared-ladder subscription: the publication, the publisher's
 /// uplink controller and the meter fed from the publishing session's own statistics.
 pub struct AdmittedLadder {
