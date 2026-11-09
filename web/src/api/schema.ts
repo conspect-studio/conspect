@@ -2831,6 +2831,57 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/switcher/commands/{kind}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Enqueue a checked verb; a 202 never asserts frame application. */
+        post: operations["submit_switcher"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/switcher/plan": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Dry-run command admission, including BOLA on every referenced object. */
+        post: operations["plan_switcher"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/switcher/{me}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Read authoritative state; no runtime means an explicit 409, never fake PGM. */
+        get: operations["get_switcher"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/sync-groups": {
         parameters: {
             query?: never;
@@ -7396,6 +7447,68 @@ export interface components {
             source: string;
             /** @description The tile/cell id whose source binding changes. */
             tile: string;
+        };
+        /**
+         * @description A 202 means queued, not yet on-air; operation completion arrives on a
+         *     correlated engine outcome at its actual tick.
+         */
+        SwitcherAccepted: {
+            /** @description Verb name, never `applied`. */
+            kind: string;
+            /** @description Correlation id, echoed by the real tick driver's outcome. */
+            operation_id: string;
+        };
+        /** @description A dry-run result, including the scene generation the take must recheck. */
+        SwitcherPlan: {
+            /** @description Plan is valid only when a real engine bus is attached. */
+            can_take: boolean;
+            /** @description First-slice admission classification. */
+            class: string;
+            /**
+             * Format: int64
+             * @description The exact immutable scene generation the caller may submit against.
+             */
+            scene_version: number;
+        };
+        /**
+         * @description One source-select, take or output-binding request. References are checked
+         *     independently; absent references never authorize implicitly.
+         */
+        SwitcherRequest: {
+            /**
+             * @description Action to classify on `/plan`, one of `select_program`, `select_preview`,
+             *     `cut`, `auto`; the action is part of the same validated request.
+             */
+            action: string;
+            /**
+             * Format: int32
+             * @description AUTO duration at the output's exact cadence; no floating milliseconds.
+             */
+            duration_frames?: number | null;
+            /** @description Referenced stored layout, when selecting an authored scene. */
+            layout?: string | null;
+            /** @description M/E identity (`me1` for the first slice). */
+            me: string;
+            /** @description Referenced output to bind; all output reads/writes require output BOLA. */
+            output?: string | null;
+            /** @description Program identity (`main` for the first slice). */
+            program: string;
+            /** @description Referenced source for `select_program`/`select_preview`. */
+            source?: string | null;
+        };
+        /** @description Engine-owned bus selection and current tick, never guessed from request. */
+        SwitcherStateResponse: {
+            /** @description Active AUTO status. */
+            in_flight: boolean;
+            /** @description Actual PVW source id. */
+            preview_source: string;
+            /** @description Actual PGM source id. */
+            program_source: string;
+            /**
+             * Format: int64
+             * @description Applied output tick.
+             */
+            tick: number;
         };
         /**
          * @description `OpenAPI` mirror of [`multiview_config::SyncGroup`] (ADR-M008/M010): the
@@ -16426,6 +16539,147 @@ export interface operations {
                 };
             };
             /** @description The ticket is closed — replies are refused. */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
+    submit_switcher: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                kind: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["SwitcherRequest"];
+            };
+        };
+        responses: {
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SwitcherAccepted"];
+                };
+            };
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
+    plan_switcher: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["SwitcherRequest"];
+            };
+        };
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SwitcherPlan"];
+                };
+            };
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
+    get_switcher: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                me: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SwitcherStateResponse"];
+                };
+            };
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
             409: {
                 headers: {
                     [name: string]: unknown;

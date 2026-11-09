@@ -728,6 +728,12 @@ pub struct AppState {
     pub config_versions: Arc<dyn ConfigVersionStore>,
     /// The `Idempotency-Key` deduplication store.
     pub idempotency: Arc<IdempotencyStore>,
+    /// Real M/E frame-boundary handle; absent until dual-bus pipeline is wired.
+    /// Routes fail closed rather than pretending that an unwired switcher applied.
+    pub switcher: Option<multiview_engine::switcher_control::SwitcherControl>,
+    /// Bounded sustained PVW lease retained across requests; the previous lease
+    /// is released only after a new source lease is acquired.
+    pub switcher_preview_lease: Arc<crate::source_demand::SwitcherPreviewLeases>,
     /// The command-outcome correlation registry: pairs each accepted command's
     /// [`OperationId`](crate::command::OperationId) with the realtime outcome
     /// event it will produce, so the outcome's envelope echoes the op id as
@@ -1045,6 +1051,8 @@ impl AppState {
             pending_actions: Arc::new(InMemoryPendingActions::new()),
             config_versions: Arc::new(InMemoryConfigVersionStore::new()),
             idempotency: Arc::new(IdempotencyStore::new()),
+            switcher: None,
+            switcher_preview_lease: Arc::new(crate::source_demand::SwitcherPreviewLeases::default()),
             // Bound the in-flight correlations: a generous ceiling for pending
             // command outcomes (drop-oldest beyond it, invariant #10). A backlog
             // this deep means outcomes are not being consumed; the oldest
@@ -1377,6 +1385,17 @@ impl AppState {
         injector: crate::source_events::SharedSourceEventTestInjector,
     ) -> Self {
         self.source_event_test_injector = Some(injector);
+        self
+    }
+
+    /// Attach only after the engine is actually composing PGM/PVW and the
+    /// configured output bus has a live frame provider.
+    #[must_use]
+    pub fn with_switcher(
+        mut self,
+        switcher: multiview_engine::switcher_control::SwitcherControl,
+    ) -> Self {
+        self.switcher = Some(switcher);
         self
     }
 

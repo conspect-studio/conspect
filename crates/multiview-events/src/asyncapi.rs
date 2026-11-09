@@ -470,6 +470,16 @@ fn input_streams_message() -> Value {
 /// lossless `media.player_state` lifecycle event on topic `switcher`.
 fn build_messages_switcher_events() -> serde_json::Map<String, Value> {
     let mut map = serde_json::Map::new();
+    map.insert(
+        "SwitcherOperation".to_owned(),
+        json!({
+            "name": "SwitcherOperation",
+            "title": "Switcher operation terminal result",
+            "summary": "The engine applied or rejected an M/E command at an exact output tick.",
+            "contentType": "application/json",
+            "payload": { "$ref": "#/components/schemas/SwitcherOperation" }
+        }),
+    );
     map.insert("MediaPlayerEvent".to_owned(), json!({
         "name": "MediaPlayerEvent",
         "title": "Media-player transport-state lifecycle",
@@ -725,6 +735,7 @@ fn event_payload_one_of() -> Value {
         { "$ref": "#/components/schemas/AlarmTransition" },
         { "$ref": "#/components/schemas/TallyEvent" },
         { "$ref": "#/components/schemas/SalvoEvent" },
+        { "$ref": "#/components/schemas/SwitcherOperation" },
         { "$ref": "#/components/schemas/MediaPlayerEvent" },
         { "$ref": "#/components/schemas/GraphicsChannelEvent" },
         { "$ref": "#/components/schemas/CatalogueLinkStatus" },
@@ -1548,10 +1559,27 @@ fn salvo_event_schema() -> Value {
 /// transport-state event and its tagged state union.
 fn switcher_event_schemas() -> Value {
     json!({
+        "SwitcherOperation": switcher_operation_schema(),
         "MediaPlayerState": media_player_state_schema(),
         "MediaPlayerEvent": media_player_event_schema(),
         "GraphicsChannelEvent": graphics_channel_event_schema(),
         "CatalogueLinkStatus": catalogue_link_status_schema()
+    })
+}
+
+fn switcher_operation_schema() -> Value {
+    json!({
+        "type": "object",
+        "description": "Terminal outcome, emitted only at the engine output tick; envelope corr equals operation_id, id equals M/E id.",
+        "required": ["me", "program", "tick", "operation_id", "completed"],
+        "properties": {
+            "me": { "type": "string" },
+            "program": { "type": "string" },
+            "tick": { "type": "integer", "format": "uint64" },
+            "operation_id": { "type": "string" },
+            "completed": { "type": "boolean" },
+            "error": { "type": "string" }
+        }
     })
 }
 

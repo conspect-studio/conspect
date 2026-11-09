@@ -175,6 +175,223 @@ pub enum StopRefusal {
 /// A held demand. Dropping it releases the demand.
 pub trait SourceDemandLease: Send + Sync {}
 
+/// Sized RAII wrapper for one sustained M/E PVW lease. The backing store owns
+/// only this one latest handle; replacing it releases the old source after the
+/// new source has already been acquired (make-before-break).
+pub struct SwitcherPreviewLease {
+    /// Keep the on-demand producer wanted until the M/E arms another source.
+    #[allow(dead_code)]
+    lease: Box<dyn SourceDemandLease>,
+}
+
+impl SwitcherPreviewLease {
+    /// Wrap an acquired preview lease for the shared latest-state cell.
+    #[must_use]
+    pub fn new(lease: Box<dyn SourceDemandLease>) -> Self {
+        Self { lease }
+    }
+}
+
+/// A pending resource reservation, not an operation-status record.
+struct PendingPreviewLease {
+    lease: SwitcherPreviewLease,
+    target: String,
+    accepted_tick: u64,
+    accepted_at: std::time::Instant,
+}
+
+/// Resource reconciliation counts. These are NOT operation outcomes: a released
+/// reservation may have applied and subsequently been superseded.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SwitcherLeaseSweep {
+    /// Reservations retained as the current preview demand.
+    pub adopted: usize,
+    /// Reservations no longer needed by the current preview.
+    pub dropped: usize,
+    /// Reservations with no authoritative picture yet.
+    pub retained: usize,
+    /// Reservations cancelled at teardown.
+    pub cancelled: usize,
+}
+
+#[derive(Default)]
+struct PreviewLeaseState {
+    closed: bool,
+    control: Option<multiview_engine::switcher_control::SwitcherControl>,
+    generation: u64,
+    current: Option<SwitcherPreviewLease>,
+    pending: std::collections::BTreeMap<String, PendingPreviewLease>,
+}
+
+/// Bounded control-only resource owner. One lock serializes admission, resolution,
+/// reconciliation and permanent detach. No engine clock path takes this lock.
+#[derive(Default)]
+pub struct SwitcherPreviewLeases {
+    state: std::sync::Mutex<PreviewLeaseState>,
+}
+
+impl SwitcherPreviewLeases {
+    /// Maximum outstanding reservations.
+    pub const MAX_PENDING: usize = 64;
+    /// Committed frames (not tick indices) sufficient to drain the 64-slot FIFO.
+    pub const DRAIN_TICKS_BOUND: u64 = 6;
+    /// Minimum age before resource reconciliation.
+    pub const RECONCILE_FLOOR: std::time::Duration = std::time::Duration::from_millis(250);
+
+    /// Seed a new owner's initial demand. A detached owner cannot reopen.
+    pub fn seed(&self, lease: SwitcherPreviewLease) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !state.closed {
+            state.current = Some(lease);
+        }
+    }
+
+    /// Reserve and enqueue under the same control-only lock so the drain bound
+    /// starts after enqueue, not before a possibly descheduled HTTP task.
+    /// # Errors
+    /// Returns the lease if closed, full, duplicate, or enqueue fails.
+    pub fn admit(
+        &self,
+        id: String,
+        target: String,
+        lease: SwitcherPreviewLease,
+        control: &multiview_engine::switcher_control::SwitcherControl,
+        enqueue: impl FnOnce() -> Result<u64, ()>,
+    ) -> Result<(), SwitcherPreviewLease> {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if state.closed
+            || state.pending.len() >= Self::MAX_PENDING
+            || state.pending.contains_key(&id)
+        {
+            return Err(lease);
+        }
+        let Ok(accepted_tick) = enqueue() else {
+            return Err(lease);
+        };
+        state.control = Some(control.clone());
+        state.pending.insert(
+            id,
+            PendingPreviewLease {
+                lease,
+                target,
+                accepted_tick,
+                accepted_at: std::time::Instant::now(),
+            },
+        );
+        Ok(())
+    }
+
+    /// Resolve an exact receipt, but choose current demand from the snapshot,
+    /// not receipt order (engine batches emit receipts in reverse order).
+    pub fn resolve(&self, id: &str, applied: bool) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(entry) = state.pending.remove(id) {
+            if applied
+                && state
+                    .control
+                    .as_ref()
+                    .and_then(multiview_engine::switcher_control::SwitcherControl::snapshot)
+                    .is_some_and(|s| s.preview.as_str() == entry.target)
+            {
+                state.current = Some(entry.lease);
+            }
+        }
+    }
+
+    /// Reconcile resources only; never infer applied/rejected operation status.
+    /// `applied_tick` is the committed-frame COUNT read before the snapshot.
+    #[must_use]
+    pub fn sweep(
+        &self,
+        engine_preview: Option<&str>,
+        applied_tick: u64,
+        now: std::time::Instant,
+        max: usize,
+    ) -> SwitcherLeaseSweep {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut report = SwitcherLeaseSweep::default();
+        let candidates: Vec<String> = state
+            .pending
+            .iter()
+            .filter(|(_, entry)| {
+                now.saturating_duration_since(entry.accepted_at) >= Self::RECONCILE_FLOOR
+                    && applied_tick.saturating_sub(entry.accepted_tick) >= Self::DRAIN_TICKS_BOUND
+            })
+            .take(max)
+            .map(|(id, _)| id.clone())
+            .collect();
+        for id in candidates {
+            let Some(preview) = engine_preview else {
+                report.retained += 1;
+                continue;
+            };
+            if let Some(entry) = state.pending.remove(&id) {
+                if entry.target == preview {
+                    state.current = Some(entry.lease);
+                    report.adopted += 1;
+                } else {
+                    report.dropped += 1;
+                }
+            }
+        }
+        report
+    }
+
+    /// Permanently close this run's owner; late requests and receipts cannot
+    /// resurrect demand. A new boot must construct a new owner.
+    pub fn detach(&self) -> usize {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.closed = true;
+        state.generation = state.generation.saturating_add(1);
+        let cancelled = state.pending.len();
+        state.pending.clear();
+        state.current = None;
+        cancelled
+    }
+
+    /// Pending resource reservations.
+    #[must_use]
+    pub fn pending_count(&self) -> usize {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .pending
+            .len()
+    }
+    /// Whether a current demand is held.
+    #[must_use]
+    pub fn has_current(&self) -> bool {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .current
+            .is_some()
+    }
+    /// Teardown generation.
+    #[must_use]
+    pub fn generation(&self) -> u64 {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .generation
+    }
+}
+
 /// The demand surface the binary provides.
 pub trait SourceDemandProvider: Send + Sync {
     /// The demand state of `id`. An unknown or unconsumed source is idle.

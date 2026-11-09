@@ -263,6 +263,39 @@ struct StreamPlan {
     hot_tick_observer: Option<Arc<AtomicU64>>,
 }
 
+/// Is this document's canvas one the first slice can drive as a real M/E bus?
+///
+/// Exactly one full-canvas, fully opaque, unclipped, non-overlay cell bound to
+/// the declared `program_source` — the shape the engine treats as the
+/// source-agnostic bus canvas. An unsupported opted-in layout is refused with a
+/// typed error instead of silently replacing the operator's multiview.
+#[allow(clippy::float_cmp)]
+// reason: authored layout fractions compared against their exact canonical
+// values; an approximate comparison would admit a windowed/tiled canvas as
+// "full canvas" and change which sources the buses admit.
+fn first_slice_me_layout_supported(
+    layout: &Layout,
+    config: &MultiviewConfig,
+    me: &multiview_config::MixEffectsConfig,
+) -> bool {
+    layout.cells.len() == 1
+        && config.overlays.is_empty()
+        && !config.cells.first().is_some_and(|cell| {
+            cell.corner_radius.is_some()
+                || cell.border.is_some()
+                || cell.fit.as_deref().is_some_and(|fit| fit != "fill")
+                || cell.visible == Some(false)
+        })
+        && layout.cells.first().is_some_and(|cell| {
+            cell.x == 0.0 && cell.y == 0.0 && cell.w == 1.0 && cell.h == 1.0 && cell.opacity == 1.0
+        })
+        && config
+            .cells
+            .first()
+            .and_then(|cell| cell.source.input_id.as_deref())
+            == Some(me.program_source.as_str())
+}
+
 /// Errors building or running the libav\* pipeline.
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
@@ -1673,6 +1706,14 @@ pub struct Pipeline {
     /// per-program context [`PipelineError`] carries. The `programs: Vec<…>`
     /// schema root + multi-program supervisor arrive in MP-1/MP-5.
     program_spec: multiview_config::ProgramSpec,
+    /// Optional first-slice M/E on this one program; absent preserves legacy
+    /// source/layout/encode behaviour byte-for-byte.
+    switcher_me: Option<multiview_config::MixEffectsConfig>,
+    /// Live control handle published only when the paired bus provider starts.
+    switcher_control: Option<multiview_engine::switcher_control::SwitcherControl>,
+    switcher_driver: Option<multiview_engine::switcher_control::SwitcherTickDriver>,
+    /// Separate PVW JPEG tap: never silently copy the PGM canvas here.
+    switcher_preview: Option<crate::preview::ProgramSlot>,
     /// Per-source native caption cue stores, keyed by source id. Each store is
     /// written by an isolated caption reader thread (HLS `WebVTT` rendition demux)
     /// and **sampled** at each output tick by the overlay baker, which burns the
@@ -2344,6 +2385,20 @@ impl Pipeline {
         #[cfg(feature = "aes67")]
         ensure_no_cell_binds_an_aes67_source(config)?;
         let layout = Arc::new(config.solve_layout()?);
+        let switcher_me = config
+            .switcher
+            .as_ref()
+            .and_then(|s| s.mix_effects.first())
+            .cloned();
+        // This slice admits a single real full-canvas source cell. A running
+        // legacy multiview with multiple cells remains untouched when the M/E
+        // block is absent; an opted-in unsupported layout fails loudly instead
+        // of replacing the operator's canvas with a guessed source.
+        if let Some(me) = &switcher_me {
+            if !first_slice_me_layout_supported(&layout, config, me) {
+                return Err(PipelineError::Engine("first-slice M/E requires one full-canvas source cell initially bound to program_source; multi-cell layouts are not replaced".into()));
+            }
+        }
         let cadence = config.canvas.fps.rational();
         let canvas_color = CanvasColor::default();
         let tag = canvas_color.output_tag();
@@ -2884,6 +2939,10 @@ impl Pipeline {
             display_layout,
             cadence,
             program_spec,
+            switcher_me,
+            switcher_control: None,
+            switcher_driver: None,
+            switcher_preview: None,
             stores,
             source_registry,
             source_handles,
@@ -3514,6 +3573,58 @@ impl Pipeline {
         Ok(out.report)
     }
 
+    /// Active first-slice program scene, validated at construction.
+    #[must_use]
+    pub fn switcher_program_layout(&self) -> Arc<Layout> {
+        Arc::clone(&self.layout)
+    }
+
+    /// A preview bus scene with the exact same canvas and alternate selected
+    /// source, prepared off-clock for admission and geometry validation.
+    #[must_use]
+    pub fn switcher_preview_layout(&self, source: &str) -> Arc<Layout> {
+        let mut scene = (*self.layout).clone();
+        if let Some(cell) = scene.cells.first_mut() {
+            cell.source = Some(source.to_owned());
+        }
+        Arc::new(scene)
+    }
+
+    /// Configured first-slice M/E descriptor for the launcher, if present.
+    #[must_use]
+    pub fn switcher_me(&self) -> Option<&multiview_config::MixEffectsConfig> {
+        self.switcher_me.as_ref()
+    }
+
+    /// Installed, real M/E handle for the management API.
+    #[must_use]
+    pub fn switcher_control(&self) -> Option<multiview_engine::switcher_control::SwitcherControl> {
+        self.switcher_control.clone()
+    }
+
+    /// Install a real first-slice M/E command handle and separate PVW tap. An
+    /// absent `[switcher]` block remains the unchanged legacy one-canvas path.
+    /// The caller must attach this pair BEFORE running or serving control.
+    ///
+    /// # Errors
+    /// Refuses an absent M/E or a config that cannot provide two actual buses.
+    pub fn attach_switcher(
+        &mut self,
+        handle: multiview_engine::switcher_control::SwitcherControl,
+        driver: multiview_engine::switcher_control::SwitcherTickDriver,
+        preview: crate::preview::ProgramSlot,
+    ) -> Result<(), PipelineError> {
+        if self.switcher_me.is_none() {
+            return Err(PipelineError::Engine(
+                "no first-slice M/E was declared".into(),
+            ));
+        }
+        self.switcher_control = Some(handle);
+        self.switcher_driver = Some(driver);
+        self.switcher_preview = Some(preview);
+        Ok(())
+    }
+
     /// The per-source frame stores, shared with the control plane's preview
     /// provider for the live per-input thumbnails.
     #[must_use]
@@ -3802,6 +3913,13 @@ impl Pipeline {
             self.background,
         )
         .map_err(|e| PipelineError::Engine(e.to_string()))?;
+        // The first-slice M/E rebinds its existing one-cell PGM drive. The PVW
+        // tap is independent; the legacy no-M/E drive gets no new cell index.
+        let drive = if self.switcher_me.is_some() {
+            drive.with_cell_ids(vec![Some(self.program_spec.id.as_str().to_owned())])
+        } else {
+            drive
+        };
         // Under the opt-in `gpu` feature the run PREFERS the wgpu GPU
         // compositor. The device is chosen LOAD-AWARE at admission (ADR-0035
         // Tier-1, decide-once): poll NVML ONCE, score every visible GPU, and pin
@@ -4594,16 +4712,42 @@ impl Pipeline {
         // `EngineRuntime` path — the run methods no longer take `stop`; the same
         // bounded (`run_for`) vs forever (`run`) split + the same publisher /
         // state/event projections / per-frame control hook are threaded verbatim.
-        let outcome = match max_ticks {
-            Some(max) => {
-                program
-                    .run_for_with_control(publisher, max, state_of, event_of, control)
-                    .await
+        let outcome = if let Some(mut switcher_driver) = self.switcher_driver.take() {
+            switcher_driver.set_prime_stores(self.catalogue_stores());
+            let Some(preview_slot) = self.switcher_preview.clone() else {
+                return Err(PipelineError::Engine("switcher preview tap missing".into()));
+            };
+            let mut hook = multiview_engine::switcher_hook::SwitcherFrameHook::new(
+                switcher_driver,
+                self.program_spec.id.as_str().to_owned(),
+                control,
+            );
+            hook.preview_slot = Some(preview_slot);
+            hook.preview_stores = Some(self.catalogue_stores());
+            match max_ticks {
+                Some(max) => {
+                    program
+                        .run_for_with_frame_control(publisher, max, state_of, event_of, hook)
+                        .await
+                }
+                None => {
+                    program
+                        .run_with_frame_control(publisher, state_of, event_of, hook)
+                        .await
+                }
             }
-            None => {
-                program
-                    .run_with_control(publisher, state_of, event_of, control)
-                    .await
+        } else {
+            match max_ticks {
+                Some(max) => {
+                    program
+                        .run_for_with_control(publisher, max, state_of, event_of, control)
+                        .await
+                }
+                None => {
+                    program
+                        .run_with_control(publisher, state_of, event_of, control)
+                        .await
+                }
             }
         }
         .map_err(|e| PipelineError::Engine(e.to_string()));
