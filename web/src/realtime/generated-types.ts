@@ -420,7 +420,7 @@ export type MediaPlayerState =
 };
 
 /** Running state of an output sink. */
-export type OutputRunState = "starting" | "running" | "migrating" | "error";
+export type OutputRunState = "idle" | "starting" | "running" | "migrating" | "error";
 
 /** Data body of the `output.status` event. */
 export interface OutputStatus {

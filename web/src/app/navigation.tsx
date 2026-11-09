@@ -77,5 +77,6 @@ export const NAV_ITEMS: readonly NavItem[] = [
   { path: "/settings/account", label: <Trans>Account</Trans>, Icon: UserCircle },
   { path: "/settings/data", label: <Trans>Data</Trans>, Icon: Database },
   { path: "/settings/mesh", label: <Trans>Mesh</Trans>, Icon: Network },
+  { path: "/settings/relays", label: <Trans>Media relays</Trans>, Icon: Network },
   { path: "/help/support", label: <Trans>Support</Trans>, Icon: LifeBuoy },
 ];

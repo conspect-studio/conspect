@@ -1697,6 +1697,7 @@
       "OutputRunState": {
         "description": "Running state of an output sink.",
         "enum": [
+          "idle",
           "starting",
           "running",
           "migrating",

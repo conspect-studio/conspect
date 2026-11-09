@@ -1,0 +1,24 @@
+<!doctype html><html lang="en"><head><title>Authorized TTL fixture</title></head><body><canvas></canvas><script type="module">
+import {Origin, Path} from '@moq/net';
+import {Player} from '@moq/watch';
+import {connectMoq} from './moqConnection.ts';
+console.debug=()=>{}; console.log=()=>{};
+window.runAuthorized=async({url,broadcast,hash})=>{
+ const origin=new Origin.Producer();
+ const start=performance.now();
+ const session=await connectMoq(new URL(url),AbortSignal.timeout(5000),origin,{serverCertificateHashes:[{value:hash}]});
+ const result=window.evidence={frames:0,timestamps:[],version:session.version,transport:session.transport,closed:false};
+ const draw=CanvasRenderingContext2D.prototype.drawImage;
+ CanvasRenderingContext2D.prototype.drawImage=function(image,...args){if(image instanceof VideoFrame){result.frames++;result.timestamps.push(image.timestamp);}return draw.call(this,image,...args);};
+ const player=new Player({origin,name:Path.from(broadcast),canvas:document.querySelector('canvas'),enabled:true,announced:false,muted:true,paused:false,visible:'always'});
+ await session.closed;
+ result.closed=true; result.closedAfterMs=Math.round(performance.now()-start);
+ result.framesAtClose=result.frames;
+ await new Promise(resolve=>setTimeout(resolve,1000));
+ result.framesAfterDrain=result.frames;
+ await new Promise(resolve=>setTimeout(resolve,1000));
+ result.framesAfterQuiet=result.frames;
+ player.close();origin.close();
+ return result;
+};
+</script></body></html>

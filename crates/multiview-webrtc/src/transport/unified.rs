@@ -67,6 +67,44 @@ const MAX_DATAGRAMS_PER_WAKE: usize = 256;
 const MAX_DRAIN_TIME: Duration = Duration::from_millis(2);
 
 /// How a single-wake inbound drain ended (invariant #10, MAJOR #1).
+/// Which `select!` arm triggered a [`UnifiedEndpoint::service_timers_and_gc`]
+/// pass, so the function itself — not a separate call site — can distinguish
+/// the idle-tick servicing cadence from the invariant-#10 bounded handoff that
+/// must fire once per exhausted receive budget. Keeping the distinction inside
+/// the function (rather than an increment the caller bolts on afterwards)
+/// means a regression that stops *calling* the handoff pass can never still
+/// satisfy the handoff counter: there is no second place to fake it.
+///
+/// `cfg(test)`-only (review PR193-04): this origin tag, the parameter that
+/// threads it, and the [`RunProbe::handoff_services`] counter it gates exist
+/// solely so a soak test can assert the handoff fires once per exhausted
+/// budget. None of it is needed for the production servicing pass itself
+/// (which always runs the same work regardless of why it was invoked), so it
+/// must not cost a release build an extra enum/branch/atomic.
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ServiceOrigin {
+    /// The periodic idle-tick arm (`tick.tick()`).
+    IdleTick,
+    /// The explicit bounded handoff run immediately after a receive budget
+    /// was exhausted (invariant #10, round-2 BLOCKER).
+    ExhaustionHandoff,
+    /// The outbound-only pump after a wake that drained the socket to
+    /// `WouldBlock` (not a full servicing pass; tags sends only).
+    DrainedDry,
+}
+
+/// Most STUN Binding Requests [`RunProbe::sent_checks`] retains, so the
+/// test-only send log stays bounded however long a run lasts.
+#[cfg(test)]
+const SENT_CHECK_LOG_CAP: usize = 256;
+
+/// Whether `payload` is a STUN Binding Request (type 0x0001 + magic cookie).
+#[cfg(test)]
+fn is_stun_binding_request(payload: &[u8]) -> bool {
+    payload.len() >= 20 && payload[..2] == [0x00, 0x01] && payload[4..8] == [0x21, 0x12, 0xA4, 0x42]
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct DrainOutcome {
     /// Datagrams read this wake (routed + dropped-malformed), capped by the budget.
@@ -94,6 +132,61 @@ struct RunProbe {
     /// GC) — once per idle tick, and once per exhausted receive budget as the
     /// bounded handoff.
     driver_services: std::sync::atomic::AtomicU64,
+    /// Times the driver ran the explicit **bounded handoff** servicing pump
+    /// specifically — i.e. the pump triggered by an exhausted receive budget,
+    /// distinct from the pump triggered by an idle tick. Unlike
+    /// [`driver_services`](Self::driver_services) (bumped by both paths), this
+    /// counter is bumped ONLY on the exhaustion handoff path, so a test can
+    /// assert the handoff itself keeps pace with exhaustions — an idle tick
+    /// that happens to also run a service cannot inflate this counter and mask
+    /// a regression that drops the explicit handoff.
+    ///
+    /// `cfg(test)`-only (review PR193-04): nothing in production distinguishes
+    /// the handoff pass from an idle-tick pass (both run identical work), so
+    /// this counter — and the [`ServiceOrigin`] tag that feeds it — would be
+    /// pure unused instrumentation state in a release build.
+    #[cfg(test)]
+    handoff_services: std::sync::atomic::AtomicU64,
+    /// Times a readable wake drained the socket to `WouldBlock` (or failed)
+    /// instead of exhausting its budget — a NATURAL yield point, after which
+    /// the next `readable()` can return `Pending`. `cfg(test)`-only (review
+    /// PR193-06): the flood test uses it to prove the socket stayed
+    /// continuously readable across each fairness interval it measures, so a
+    /// natural drain-to-empty cannot stand in for the production `yield_now`.
+    #[cfg(test)]
+    drained_dry: std::sync::atomic::AtomicU64,
+    /// Consecutive exhausted budgets since the last dry drain (reset to 0 by
+    /// one), and the longest such run seen. During a dry-free run the receive
+    /// arm never returns `Pending`, so the ONLY way another task on the
+    /// runtime can be scheduled inside it is the production `yield_now`
+    /// (review PR193-06). `cfg(test)`-only.
+    #[cfg(test)]
+    dry_free_run: std::sync::atomic::AtomicU64,
+    #[cfg(test)]
+    max_dry_free_run: std::sync::atomic::AtomicU64,
+    /// Every STUN Binding Request the driver sent, recorded at the actual
+    /// send site with the servicing path that sent it, its destination and
+    /// its exact bytes (bounded by [`SENT_CHECK_LOG_CAP`]). The flood test
+    /// matches a datagram the peer received against this log, so the pump
+    /// effect is attributed at its source rather than inferred from a time
+    /// window (review PR193-07). `cfg(test)`-only.
+    #[cfg(test)]
+    sent_checks: std::sync::Mutex<Vec<(ServiceOrigin, SocketAddr, Vec<u8>)>>,
+}
+
+#[cfg(test)]
+impl RunProbe {
+    /// Record one sent datagram if it is a STUN Binding Request.
+    fn record_send(&self, origin: ServiceOrigin, dst: SocketAddr, payload: &[u8]) {
+        if !is_stun_binding_request(payload) {
+            return;
+        }
+        if let Ok(mut log) = self.sent_checks.lock() {
+            if log.len() < SENT_CHECK_LOG_CAP {
+                log.push((origin, dst, payload.to_vec()));
+            }
+        }
+    }
 }
 
 /// The single-socket WebRTC endpoint: ONE bound dual-stack UDP socket and ONE
@@ -287,12 +380,28 @@ impl UnifiedEndpoint {
     /// # Errors
     ///
     /// [`WebRtcError::Socket`] if converting the bound socket to async fails.
+    async fn run_inner(self, stop: Arc<AtomicBool>, probe: &RunProbe) -> Result<()> {
+        self.run_inner_body(stop, probe, MAX_DRAIN_TIME, DRIVER_TICK)
+            .await
+    }
+
     #[allow(
         clippy::too_many_lines,
         reason = "one select! loop owning the single socket per ADR-0048 §4 — \
                   splitting the arms would re-introduce per-role drivers"
     )]
-    async fn run_inner(self, stop: Arc<AtomicBool>, probe: &RunProbe) -> Result<()> {
+    async fn run_inner_body(
+        self,
+        stop: Arc<AtomicBool>,
+        probe: &RunProbe,
+        time_budget: Duration,
+        // The idle-tick period. Production always passes `DRIVER_TICK`; the
+        // flood test passes a period far longer than the test so that, after
+        // the interval's immediate first tick, the exhaustion handoff is the
+        // ONLY path that drains commands, fires timers, pumps and reaps — so
+        // an effect it observes is attributable to the handoff (PR193-02-R2).
+        tick_period: Duration,
+    ) -> Result<()> {
         let bind_addr = self.endpoint.config().bind_addr();
         let local_addr = self.endpoint.local_addr()?;
         // The concrete candidates an inbound datagram's local destination may be
@@ -336,7 +445,7 @@ impl UnifiedEndpoint {
         let mut push = self.push;
 
         let mut buf = vec![0u8; RECV_BUFFER];
-        let mut tick = tokio::time::interval(DRIVER_TICK);
+        let mut tick = tokio::time::interval(tick_period);
 
         loop {
             if stop.load(Ordering::Acquire) {
@@ -357,6 +466,8 @@ impl UnifiedEndpoint {
                         &socket, &mut turn,
                         &mut ingest, &mut serve, preview.as_ref(), &mut push,
                         local_addr, now, probe,
+                        #[cfg(test)]
+                        ServiceOrigin::IdleTick,
                     ).await;
                 }
                 ready = socket.readable() => {
@@ -369,8 +480,9 @@ impl UnifiedEndpoint {
                         // recovers the CONCRETE local destination via PKTINFO and
                         // resolves it onto a gathered candidate so str0m's STUN
                         // matching accepts the check (defect #3).
-                        Self::drain_inbound_budgeted(
+                        Self::drain_inbound_budgeted_with(
                             &socket, &mut buf, local_addr, &concrete_candidates,
+                            time_budget,
                             |src, dst, payload| {
                                 Self::route_inbound(
                                     &mut turn,
@@ -401,13 +513,25 @@ impl UnifiedEndpoint {
                         probe
                             .recv_budgets_exhausted
                             .fetch_add(1, Ordering::Relaxed);
+                        #[cfg(test)]
+                        {
+                            let run = probe.dry_free_run.fetch_add(1, Ordering::Relaxed) + 1;
+                            probe.max_dry_free_run.fetch_max(run, Ordering::Relaxed);
+                        }
                         tokio::task::yield_now().await;
                         Self::service_timers_and_gc(
                             &socket, &mut turn,
                             &mut ingest, &mut serve, preview.as_ref(), &mut push,
                             local_addr, now, probe,
+                            #[cfg(test)]
+                            ServiceOrigin::ExhaustionHandoff,
                         ).await;
                     } else {
+                        #[cfg(test)]
+                        {
+                            probe.drained_dry.fetch_add(1, Ordering::Relaxed);
+                            probe.dry_free_run.store(0, Ordering::Relaxed);
+                        }
                         // The socket drained within budget: just pump outbound
                         // (the full tick servicing runs on the idle tick arm). No
                         // re-arm is needed — tokio cleared readiness.
@@ -415,6 +539,10 @@ impl UnifiedEndpoint {
                             &socket, &mut turn,
                             ingest.as_mut(), serve.as_mut(), preview.as_ref(), &mut push,
                             local_addr, now,
+                            #[cfg(test)]
+                            probe,
+                            #[cfg(test)]
+                            ServiceOrigin::DrainedDry,
                         ).await;
                     }
                 }
@@ -442,6 +570,7 @@ impl UnifiedEndpoint {
         local_addr: SocketAddr,
         now: Instant,
         probe: &RunProbe,
+        #[cfg(test)] origin: ServiceOrigin,
     ) {
         probe.driver_services.fetch_add(1, Ordering::Relaxed);
         // Drain pending register/release commands for each lane.
@@ -462,6 +591,10 @@ impl UnifiedEndpoint {
             push,
             local_addr,
             now,
+            #[cfg(test)]
+            probe,
+            #[cfg(test)]
+            origin,
         )
         .await;
         // GC dead sessions per lane.
@@ -470,6 +603,15 @@ impl UnifiedEndpoint {
         }
         if let Some(lane) = serve.as_mut() {
             WhepServeEndpoint::reap(&mut lane.viewers, &lane.shared);
+        }
+        // `cfg(test)`-only (review PR193-04): counts completed exhaustion
+        // handoffs, gated on the origin the caller threads through, so a
+        // missing handoff call or an early return before this point desyncs it
+        // from `recv_budgets_exhausted`. It does NOT prove the work above ran;
+        // the flood test asserts each step's own effect for that (PR193-02-R2).
+        #[cfg(test)]
+        if origin == ServiceOrigin::ExhaustionHandoff {
+            probe.handoff_services.fetch_add(1, Ordering::Relaxed);
         }
     }
 
@@ -511,6 +653,7 @@ impl UnifiedEndpoint {
     /// defer the rest of the driver past one receive budget.
     ///
     /// [`recv_from_with_local`]: crate::transport::local_addr::recv_from_with_local
+    #[cfg(test)]
     fn drain_inbound_budgeted(
         socket: &tokio::net::UdpSocket,
         buf: &mut [u8],
@@ -647,6 +790,8 @@ impl UnifiedEndpoint {
         push: &mut [PushLane],
         local_addr: SocketAddr,
         now: Instant,
+        #[cfg(test)] probe: &RunProbe,
+        #[cfg(test)] origin: ServiceOrigin,
     ) {
         // Drive the shared TURN driver first so a fresh relay is published before
         // the roles gather candidates for the next negotiation.
@@ -665,7 +810,15 @@ impl UnifiedEndpoint {
         }
 
         if let Some(lane) = ingest {
-            WhipEndpoint::pump_outbound(socket, &mut lane.sessions, turn, now).await;
+            WhipEndpoint::pump_outbound(
+                socket,
+                &mut lane.sessions,
+                turn,
+                now,
+                #[cfg(test)]
+                &mut |dst, payload| probe.record_send(origin, dst, payload),
+            )
+            .await;
         }
         if let Some(lane) = serve {
             WhepServeEndpoint::pump_outbound(socket, &mut lane.viewers, turn, now).await;
@@ -716,6 +869,10 @@ mod tests {
 
     /// Count queued UDP datagrams with Linux's advancing peek cursor. No read
     /// consumes a datagram; restore the default offset before the real drain.
+    /// Linux-only inspection path for [`servicing_keeps_pace_with_the_receive_budget_under_flood`]'s
+    /// precondition; the guarantee itself (below) is proven on every platform
+    /// via a portable OS-thread flooder, not via this inspection (review
+    /// PR193-01).
     #[cfg(target_os = "linux")]
     fn queued_datagrams(socket: &tokio::net::UdpSocket) -> std::io::Result<usize> {
         use std::mem::MaybeUninit;
@@ -735,45 +892,160 @@ mod tests {
         Ok(count)
     }
 
-    /// Invariant #10 / round-2 BLOCKER: under a **permanent** inbound flood the
-    /// driver's servicing pass (commands + timers + outbound + GC) must keep pace
-    /// with the receive budget — every exhausted budget is followed by a
-    /// deterministic servicing pass **before** the next datagram is read, not by
-    /// probabilistic `select!` fairness.
+    /// Stops and joins the flood OS thread on EVERY exit path — normal return,
+    /// a failed assertion or a timeout `expect` — so a failing flood test can
+    /// never detach a sender that keeps flooding loopback for the rest of the
+    /// test process (review PR193-05). Dropping a `JoinHandle` only detaches;
+    /// this guard raises both stop flags first, then joins.
+    struct FloodGuard {
+        stop: Arc<AtomicBool>,
+        flood_stop: Arc<AtomicBool>,
+        flooders: Vec<std::thread::JoinHandle<()>>,
+    }
+
+    impl Drop for FloodGuard {
+        fn drop(&mut self) {
+            self.stop.store(true, Ordering::Release);
+            self.flood_stop.store(true, Ordering::Release);
+            for flooder in self.flooders.drain(..) {
+                // A flooder panic must not double-panic during unwinding; the
+                // original failure is what the test reports.
+                let _ = flooder.join();
+            }
+        }
+    }
+
+    /// Build a publisher offer with a host candidate (mirrors
+    /// `tests/unified_socket.rs::offer`), so the flood test can negotiate a
+    /// REAL ingest session and observe a REAL effect of servicing — not just an
+    /// entry counter (review PR193-02).
+    fn publisher_offer(peer: SocketAddr) -> String {
+        let now = Instant::now();
+        let mut s =
+            crate::transport::Session::new(&crate::transport::SessionConfig::default(), now);
+        s.add_host_candidate(peer).expect("host candidate accepted");
+        s.create_offer(&[crate::transport::MediaKind::Video])
+            .expect("offer built")
+    }
+
+    /// Await `cond` while the flood runs, bounded by COUNT: give up once the
+    /// driver has exhausted `cap` further receive budgets without `cond`
+    /// holding (review PR193-06), with `SAFETY` only as a hang guard. Returns
+    /// whether `cond` held.
+    async fn within_exhaustions(
+        probe: &RunProbe,
+        cap: u64,
+        safety: Duration,
+        mut cond: impl FnMut() -> bool,
+    ) -> bool {
+        let start = probe.recv_budgets_exhausted.load(Ordering::Relaxed);
+        tokio::time::timeout(safety, async {
+            loop {
+                if cond() {
+                    return true;
+                }
+                if probe.recv_budgets_exhausted.load(Ordering::Relaxed) - start >= cap {
+                    return false;
+                }
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .unwrap_or(false)
+    }
+
+    /// Invariant #10 / round-2 BLOCKER, plus review PR193-02/PR193-03: under a
+    /// **sustained, portable** inbound flood the driver's servicing pass
+    /// (commands + timers + outbound + GC) must keep pace with the receive
+    /// budget, and the runtime itself must stay fair to an unrelated task.
     ///
-    /// The discriminating assertion is an **ordering** one, not a timing one
-    /// (timing cannot tell a starved loop from a lucky scheduler): after the
-    /// driver has run under a saturating flood, the number of servicing passes
-    /// must be at least the number of exhausted receive budgets. The round-1 loop
-    /// (drain as a bare statement, unbiased `select!`, no `yield_now`) serviced
-    /// only when the tick arm happened to win, so `driver_services` lagged far
-    /// behind `recv_budgets_exhausted`; the bounded-handoff fix services once per
-    /// exhausted budget, so it keeps pace.
+    /// Checks, each bounded by exhaustion COUNTS (wall clock is only a hang
+    /// guard, review PR193-06):
     ///
-    /// The flood precondition is driven to a **fixed count**, not a wall-clock
-    /// window: a real OS-thread flooder keeps the socket permanently readable, so
-    /// the driver will exhaust budgets given enough scheduler time — but *how
-    /// many* it exhausts in a fixed 400ms window depends on how much CPU the
-    /// flooder and driver tasks actually got, which on a contended/starved CI
-    /// runner can be ~none (the flooder thread never runs -> zero budgets
-    /// exhausted -> the precondition spuriously fails even though nothing
-    /// regressed). So instead of sleeping a fixed window and *hoping* the flood
-    /// saturated, the test polls [`RunProbe::recv_budgets_exhausted`] and stops
-    /// the driver only once it has genuinely exhausted `TARGET_EXHAUSTIONS`
-    /// budgets — guaranteed regardless of CPU, so the saturation precondition is
-    /// deterministic. A generous [`tokio::time::timeout`] still bounds the whole
-    /// run, so a regression that wedges the loop (and so can never reach the
-    /// target) fails deterministically rather than hanging.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    /// 1. **Ordering**: `handoff_services == recv_budgets_exhausted` — a
+    ///    missing handoff call or an early return before the tail increment
+    ///    desyncs the two.
+    /// 2. **Servicing effects owned by the handoff** (review PR193-02-R2). The
+    ///    driver runs with an idle tick far longer than the test, so after its
+    ///    one immediate tick the exhaustion handoff is the only full servicing
+    ///    path. Every command is queued only after saturation and a completed
+    ///    handoff. Then: a mid-flood Register + the session's ICE timer must
+    ///    put a STUN check on the wire to a peer (command drain + timer); a
+    ///    check the peer received must be one the handoff's own outbound pump
+    ///    sent, attributed at the send site (review PR193-07); a mid-flood
+    ///    Release must close the RTP ring (command drain); and the dead session must be closed in the session table,
+    ///    which only reap/GC does.
+    /// 3. **Independent fairness** (review PR193-03-R2): a separate task on the
+    ///    same current-thread runtime records, at each of ITS polls, how many
+    ///    exhaustions ran since its previous poll, including the final interval
+    ///    up to driver stop. The max must stay `<= MAX_TOLERATED_GAP`. The
+    ///    window must contain `REQUIRED_DRY_FREE_RUN` consecutive exhaustions
+    ///    with no drain reaching `WouldBlock`, so only the production
+    ///    `yield_now` can schedule the observer there (the driver runs
+    ///    `unconstrained`): removing it fails the gap assertion.
+    ///
+    /// Portable (no Linux-only socket inspection in the production guarantee):
+    /// a dedicated OS thread (not a tokio worker) floods the bound socket
+    /// without pause, keeping `socket.readable()` effectively always ready on
+    /// every platform CI runs on (Linux, macOS).
+    #[allow(
+        clippy::too_many_lines,
+        reason = "ordering, handoff servicing effects and runtime fairness share \
+                  one flood scenario; splitting them would re-run the flood setup"
+    )]
+    #[tokio::test(flavor = "current_thread")]
     async fn servicing_keeps_pace_with_the_receive_budget_under_flood() {
         use std::sync::atomic::AtomicBool;
 
         // How many receive budgets the flood must drive to exhaustion before we
-        // stop the driver. Above 1 so the test exercises a *sustained* saturating
-        // flood (many consecutive budget->handoff cycles), not a single lucky
-        // trip; still tiny, so even a heavily CPU-starved runner reaches it
-        // quickly once the flooder gets any time slice at all.
+        // stop the driver. Above 1 so the test exercises a *sustained*
+        // saturating flood (many consecutive budget->handoff cycles).
         const TARGET_EXHAUSTIONS: u64 = 8;
+        // The fairness window is bounded by COUNTS, not time (review
+        // PR193-06): it measures at least this many further exhaustions AND
+        // must contain one dry-free run of `REQUIRED_DRY_FREE_RUN` exhaustions
+        // (see below); `FAIRNESS_EXHAUSTION_CAP` ends a window that never
+        // finds one, which then fails the saturation precondition.
+        const FAIRNESS_WINDOW_EXHAUSTIONS: u64 = 300;
+        const FAIRNESS_EXHAUSTION_CAP: u64 = 5_000;
+        // Saturation proof (review PR193-06): within the measured window the
+        // socket must stay continuously readable for this many consecutive
+        // exhausted budgets — no drain reached `WouldBlock`, so the receive
+        // arm never returned `Pending`. Inside such a run the ONLY way the
+        // observer can be scheduled is the production `yield_now` (the driver
+        // runs `unconstrained`, so Tokio's coop budget cannot do it either);
+        // without it the observer's gap is at least this run's length, which
+        // is three times `MAX_TOLERATED_GAP`. This turns the no-yield
+        // detection from a throughput assumption into a checked precondition.
+        // Kept modest because the kernel caps the receive queue (Linux
+        // `rmem_max` default ~208 KiB, about one budget of small datagrams);
+        // measured on 2 contended cores the longest run per window was 40-41.
+        const REQUIRED_DRY_FREE_RUN: u64 = 24;
+        // Several sender threads so a descheduled sender cannot let the
+        // (default ~200 KiB, about one budget) receive queue run dry on a
+        // contended 2-core runner. Bounded and joined by `FloodGuard`.
+        const FLOODER_THREADS: usize = 4;
+        // The largest tolerated number of exhaustions between two consecutive
+        // observer polls, as recorded by the observer itself. With the
+        // production `yield_now` on every exhausted budget the current-thread
+        // runtime polls the observer between consecutive exhaustions, so the
+        // gap is structurally 1-2 (measured 2, idle and on 2 contended cores);
+        // without it the gap spans the whole dry-free run (measured 52-84, and
+        // at least REQUIRED_DRY_FREE_RUN by construction).
+        const MAX_TOLERATED_GAP: u64 = 8;
+        // Hang guard ONLY, never the pass/fail bound: every phase ends on a
+        // count. The flooder itself stops sending at this deadline (it runs on
+        // an OS thread, so this works even if a regression never lets the
+        // runtime poll its own timers); the socket then drains, the driver
+        // returns `Pending`, and the Tokio timeouts below can fire.
+        const SAFETY_TIMEOUT: Duration = Duration::from_secs(120);
+        // Count bound for each servicing-effect phase: give up (and fail on
+        // the phase's assertion) after this many further exhausted budgets.
+        // Correct code needs 0-3 per phase (measured), so this is >300x slack.
+        const SERVICE_EXHAUSTION_CAP: u64 = 1_000;
+        // An idle-tick period no test run approaches, so the tick arm fires
+        // exactly once (immediately, before any command is queued).
+        const HANDOFF_ONLY_TICK: Duration = Duration::from_secs(3600);
 
         let cfg = crate::config::EndpointConfig {
             udp_port: 0,
@@ -782,18 +1054,42 @@ mod tests {
         };
         let builder = UnifiedEndpoint::bind(cfg).expect("the single shared socket binds once");
         let bound = builder.local_addr().expect("a bound local addr");
-        let (builder, _whip) = builder.with_ingest();
+        let (builder, whip) = builder.with_ingest();
         let endpoint = builder.build();
+
+        // The ingest session's remote "publisher": a plain loopback socket
+        // whose address the offer advertises as its host candidate. Once the
+        // driver fires the session's ICE timer, str0m (full ICE) queues STUN
+        // connectivity checks to it and the outbound pump sends them here —
+        // an observable effect of the timer AND pump steps (PR193-02-R2).
+        let peer = UdpSocket::bind(SocketAddr::V6(SocketAddrV6::new(
+            Ipv6Addr::LOCALHOST,
+            0,
+            0,
+            0,
+        )))
+        .expect("peer binds a v6 loopback");
+        peer.set_nonblocking(true).expect("peer is non-blocking");
+        let peer_addr = peer.local_addr().expect("peer addr");
+        let bound_v6 = SocketAddr::V6(SocketAddrV6::new(Ipv6Addr::LOCALHOST, bound.port(), 0, 0));
 
         let probe = Arc::new(RunProbe::default());
         let stop = Arc::new(AtomicBool::new(false));
 
-        // Saturating flood from a dedicated OS thread (not a tokio worker) so the
-        // driver's `socket.readable()` is effectively always ready.
+        // Saturating flood from a dedicated OS thread (not a tokio worker) so
+        // the driver's `socket.readable()` is effectively always ready — the
+        // permanent, saturating, hostile flood the BLOCKER is about. Portable:
+        // no platform-specific socket inspection sits on this path, only a
+        // plain blocking `send_to` loop (review PR193-01).
         let flood_stop = Arc::new(AtomicBool::new(false));
-        let flooder = {
+        let mut flood_guard = FloodGuard {
+            stop: Arc::clone(&stop),
+            flood_stop: Arc::clone(&flood_stop),
+            flooders: Vec::with_capacity(FLOODER_THREADS),
+        };
+        for _ in 0..FLOODER_THREADS {
             let flood_stop = Arc::clone(&flood_stop);
-            std::thread::spawn(move || {
+            flood_guard.flooders.push(std::thread::spawn(move || {
                 let s = UdpSocket::bind(SocketAddr::V6(SocketAddrV6::new(
                     Ipv6Addr::LOCALHOST,
                     0,
@@ -804,70 +1100,286 @@ mod tests {
                 let target =
                     SocketAddr::V6(SocketAddrV6::new(Ipv6Addr::LOCALHOST, bound.port(), 0, 0));
                 let junk = [0u8; 64];
-                while !flood_stop.load(Ordering::Relaxed) {
+                let deadline = Instant::now() + SAFETY_TIMEOUT;
+                while !flood_stop.load(Ordering::Relaxed) && Instant::now() < deadline {
                     for _ in 0..1024 {
                         let _ = s.send_to(&junk, target);
                     }
                 }
+            }));
+        }
+
+        // The INDEPENDENT fairness observer: a separate task on the SAME
+        // single-threaded runtime, genuinely contending with the driver for
+        // the one worker thread. The fairness statistic is computed HERE, at
+        // the observer's own polls (review PR193-03-R2): at each poll it reads
+        // the driver's exhaustion count and records how many exhaustions ran
+        // since ITS previous poll; the result is the max of those deltas. No
+        // coordinator timer samples the counters, so scheduler/timer latency
+        // cannot inflate the statistic, and the observer takes one final poll
+        // after the driver has stopped, so a trailing starved interval with no
+        // observer progress is counted too.
+        let driver_done = Arc::new(AtomicBool::new(false));
+        let observer = {
+            let probe = Arc::clone(&probe);
+            let driver_done = Arc::clone(&driver_done);
+            tokio::spawn(async move {
+                let mut last = probe.recv_budgets_exhausted.load(Ordering::Relaxed);
+                let mut max_gap = 0u64;
+                let mut polls = 0u64;
+                loop {
+                    // Read `done` BEFORE the counter: once the driver has
+                    // returned no further exhaustion can occur, so this poll's
+                    // delta closes the final interval up to driver stop.
+                    let done = driver_done.load(Ordering::Acquire);
+                    let now = probe.recv_budgets_exhausted.load(Ordering::Relaxed);
+                    max_gap = max_gap.max(now - last);
+                    last = now;
+                    polls += 1;
+                    if done {
+                        return (max_gap, polls);
+                    }
+                    tokio::task::yield_now().await;
+                }
             })
         };
 
-        // Run the driver under the flood.
+        // Run the driver under the flood. `tokio::task::unconstrained` disables
+        // Tokio's OWN cooperative-scheduling auto-yield (its periodic forced
+        // yield after an I/O-bound poll budget) for this task, so the ONLY
+        // thing that can give the single worker thread back to the observer is
+        // the driver's own explicit `yield_now` on the exhaustion-handoff path.
+        // Without this, Tokio's runtime-level fairness safety net would mask
+        // removing that production `yield_now` (review PR193-03) — the
+        // observer would still progress on Tokio's own budget resets, not on
+        // anything the driver itself does.
         let driver = {
             let probe = Arc::clone(&probe);
             let stop = Arc::clone(&stop);
-            tokio::spawn(async move { endpoint.run_inner(stop, &probe).await })
+            let driver_done = Arc::clone(&driver_done);
+            tokio::spawn(tokio::task::unconstrained(async move {
+                // Idle tick far longer than the test: after the interval's
+                // immediate first tick (which runs before any command is
+                // queued), the exhaustion handoff is the ONLY servicing path,
+                // so every effect asserted below is the handoff's.
+                let result = endpoint
+                    .run_inner_body(stop, &probe, MAX_DRAIN_TIME, HANDOFF_ONLY_TICK)
+                    .await;
+                driver_done.store(true, Ordering::Release);
+                result
+            }))
         };
 
-        // Drive the flood to a DETERMINISTIC number of exhausted budgets rather
-        // than for a fixed wall-clock window: poll the counter until the flood has
-        // genuinely saturated `TARGET_EXHAUSTIONS` budgets, so the precondition
-        // holds regardless of how little CPU a contended runner gave the flooder.
-        // The outer timeout only bounds a wedged regression that can never reach
-        // the target (it would otherwise spin here forever).
-        let saturated = tokio::time::timeout(Duration::from_secs(30), async {
-            loop {
-                if probe.recv_budgets_exhausted.load(Ordering::Relaxed) >= TARGET_EXHAUSTIONS {
-                    return;
-                }
-                tokio::time::sleep(Duration::from_millis(2)).await;
+        // Saturate first: wait (by count) for `TARGET_EXHAUSTIONS` exhausted
+        // budgets AND at least one completed handoff, so every command below is
+        // queued strictly AFTER the idle tick's one immediate firing and after
+        // the flood has demonstrably reached the handoff path (PR193-02-R2).
+        let saturated = tokio::time::timeout(SAFETY_TIMEOUT, async {
+            while probe.recv_budgets_exhausted.load(Ordering::Relaxed) < TARGET_EXHAUSTIONS {
+                tokio::time::sleep(Duration::from_millis(1)).await;
             }
         })
         .await;
-
-        stop.store(true, Ordering::Release);
-        flood_stop.store(true, Ordering::Relaxed);
-        let stopped = tokio::time::timeout(Duration::from_secs(5), driver).await;
-        let _ = flooder.join();
-
-        let exhausted = probe.recv_budgets_exhausted.load(Ordering::Relaxed);
-        let services = probe.driver_services.load(Ordering::Relaxed);
-
-        // The flood must actually have saturated the receive budget (else the test
-        // proves nothing). Driving to a fixed exhaustion count makes this
-        // deterministic — a timeout here means the driver could not reach
-        // `TARGET_EXHAUSTIONS` even in 30s, i.e. it wedged or the flood never
-        // landed (a real regression), not merely a slow runner.
         assert!(
             saturated.is_ok(),
-            "the flood must exhaust at least {TARGET_EXHAUSTIONS} receive budgets \
-             within the bound (got {exhausted}); the flood never saturated — the \
-             driver wedged or inbound never landed"
+            "the flood must exhaust {TARGET_EXHAUSTIONS} receive budgets (hang \
+             guard hit: the flood never saturated or the driver wedged)"
         );
+        let first_handoff =
+            within_exhaustions(&probe, SERVICE_EXHAUSTION_CAP, SAFETY_TIMEOUT, || {
+                probe.handoff_services.load(Ordering::Relaxed) > 0
+            })
+            .await;
+        assert!(
+            first_handoff,
+            "no exhaustion handoff completed within {SERVICE_EXHAUSTION_CAP} \
+             exhausted budgets: the handoff is missing or returns early \
+             (invariant #10 BLOCKER)"
+        );
+
+        // Mid-flood Register: ONLY a handoff can drain it now.
+        let negotiated = whip
+            .negotiate("flood-source", &publisher_offer(peer_addr), false)
+            .expect("WHIP ingest negotiates a publisher mid-flood");
+        let ring = negotiated.ring.clone();
+        assert!(!ring.is_ended(), "freshly-negotiated ring is open");
+
+        // TIMER + PUMP effect. Any STUN check at the peer proves the session
+        // was registered (command drain) and its ICE timer fired (nothing else
+        // makes str0m queue a check: the junk flood is never accepted). Which
+        // servicing path SENT a received check is attributed at the source
+        // (review PR193-07), not inferred from a time window: the driver logs
+        // every Binding Request at its actual send site, tagged with the
+        // servicing origin, destination and exact bytes. Each check the peer
+        // receives is matched, in send order, to its own log entry; it counts
+        // as the handoff's pump effect only if that entry is tagged
+        // `ExhaustionHandoff` and addressed to the peer. Each queued datagram
+        // is popped and sent exactly once, by exactly one path, so a match
+        // has no other servicing path in between, and an unrelated dry drain
+        // elsewhere can no longer discard it.
+        let mut stun_seen = 0u64;
+        let mut handoff_stun = 0u64;
+        let mut other_stun = 0u64;
+        // Received checks not yet matched (the send log is read after the
+        // peer, so a check may briefly lead its own entry).
+        let mut unmatched: Vec<Vec<u8>> = Vec::new();
+        let mut consumed = vec![false; SENT_CHECK_LOG_CAP];
+        let mut datagram = [0u8; 1500];
+        let pumped = within_exhaustions(&probe, SERVICE_EXHAUSTION_CAP, SAFETY_TIMEOUT, || {
+            while let Ok((len, _)) = peer.recv_from(&mut datagram) {
+                if is_stun_binding_request(&datagram[..len]) {
+                    stun_seen += 1;
+                    unmatched.push(datagram[..len].to_vec());
+                }
+            }
+            let log = probe.sent_checks.lock().expect("send log lock");
+            unmatched.retain(|bytes| {
+                let entry = log.iter().enumerate().find(|(i, (_, dst, sent))| {
+                    !consumed[*i] && *dst == peer_addr && sent == bytes
+                });
+                match entry {
+                    Some((i, (origin, _, _))) => {
+                        consumed[i] = true;
+                        if *origin == ServiceOrigin::ExhaustionHandoff {
+                            handoff_stun += 1;
+                        } else {
+                            other_stun += 1;
+                        }
+                        false
+                    }
+                    None => true,
+                }
+            });
+            handoff_stun > 0
+        })
+        .await;
+        assert!(
+            stun_seen > 0,
+            "the ingest session's ICE timer never fired under the flood: no STUN \
+             check reached the peer within {SERVICE_EXHAUSTION_CAP} exhausted \
+             budgets (handoff timer step starved or deleted, PR193-02-R2)"
+        );
+        assert!(
+            pumped,
+            "{stun_seen} STUN checks reached the peer but none was sent by the \
+             exhaustion handoff's own outbound pump ({other_stun} attributed to \
+             another servicing path, {} unattributed) within \
+             {SERVICE_EXHAUSTION_CAP} exhausted budgets (handoff outbound pump \
+             starved or deleted, PR193-02-R2 / PR193-07)",
+            unmatched.len()
+        );
+
+        // COMMAND-DRAIN effect: a mid-flood Release closes the ring only when
+        // the handoff drains it.
+        assert!(
+            whip.release("flood-source", negotiated.session_id.as_str()),
+            "release dispatches a teardown command for the live session"
+        );
+        let released = within_exhaustions(&probe, SERVICE_EXHAUSTION_CAP, SAFETY_TIMEOUT, || {
+            ring.is_ended()
+        })
+        .await;
+        assert!(
+            released,
+            "under a permanent flood the handoff must drain the Release command \
+             (close the ring) within {SERVICE_EXHAUSTION_CAP} exhausted budgets \
+             (handoff command drain starved or deleted, PR193-02-R2)"
+        );
+
+        // REAP/GC effect: only the driver's reap step closes the released
+        // (now dead) session in the table; `release` itself only forgets the
+        // source.
+        let reaped = within_exhaustions(&probe, SERVICE_EXHAUSTION_CAP, SAFETY_TIMEOUT, || {
+            whip.session_closed_in_table(&negotiated.session_id)
+        })
+        .await;
+        assert!(
+            reaped,
+            "the handoff's reap/GC step must close the released session in the \
+             table within {SERVICE_EXHAUSTION_CAP} exhausted budgets (handoff \
+             reap starved or deleted, PR193-02-R2)"
+        );
+
+        // Keep the flood saturating while the observer measures, until the
+        // window holds `FAIRNESS_WINDOW_EXHAUSTIONS` further exhaustions AND a
+        // proven dry-free run of `REQUIRED_DRY_FREE_RUN` (or the count cap is
+        // hit). This loop only decides WHEN to stop, by counts; it computes
+        // nothing (the statistic lives in the observer). The window's dry-free
+        // record starts fresh here so only a run inside the window counts.
+        let exh_start = probe.recv_budgets_exhausted.load(Ordering::Relaxed);
+        probe.max_dry_free_run.store(0, Ordering::Relaxed);
+        let window = tokio::time::timeout(SAFETY_TIMEOUT, async {
+            loop {
+                let done = probe.recv_budgets_exhausted.load(Ordering::Relaxed) - exh_start;
+                let run = probe.max_dry_free_run.load(Ordering::Relaxed);
+                if (done >= FAIRNESS_WINDOW_EXHAUSTIONS && run >= REQUIRED_DRY_FREE_RUN)
+                    || done >= FAIRNESS_EXHAUSTION_CAP
+                {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await;
+        let window_run = probe.max_dry_free_run.load(Ordering::Relaxed);
+
+        stop.store(true, Ordering::Release);
+        // The idle tick is an hour away, so wake the driver with one datagram
+        // in case the flood has already ended: it must reach its top-of-loop
+        // stop check, not park on an empty socket.
+        let _ = peer.send_to(b"wake", bound_v6);
+        let stopped = tokio::time::timeout(SAFETY_TIMEOUT, driver).await;
+        // Hang guard only: the observer returns once it sees the driver stop.
+        let (max_gap, observer_polls) = tokio::time::timeout(SAFETY_TIMEOUT, observer)
+            .await
+            .expect("the observer finishes once the driver has stopped")
+            .expect("the observer task completes");
+        // Stop + join the flooder now (the guard also does this on any panic
+        // path above, review PR193-05).
+        drop(flood_guard);
+
+        let exhausted = probe.recv_budgets_exhausted.load(Ordering::Relaxed);
+        let handoffs = probe.handoff_services.load(Ordering::Relaxed);
+
         assert!(
             exhausted >= TARGET_EXHAUSTIONS,
             "the flood must exhaust at least {TARGET_EXHAUSTIONS} receive budgets \
              (got {exhausted}); the flood was not saturating"
         );
-        // The discriminating invariant: servicing keeps pace with the receive
-        // budget. Each exhausted budget hands off to exactly one servicing pass
-        // (plus the idle-tick passes), so services >= exhausted. A starved loop
-        // (round-1) leaves services far below exhausted.
-        assert!(
-            services >= exhausted,
-            "servicing must keep pace with the receive budget under flood: \
-             {services} services < {exhausted} exhausted budgets — the rest of \
+        // The discriminating ordering invariant: the explicit HANDOFF (not idle
+        // ticks) fires exactly once per exhausted budget, and is only bumped
+        // AFTER every real servicing step ran.
+        assert_eq!(
+            handoffs, exhausted,
+            "the explicit exhaustion handoff must service exactly once per \
+             exhausted receive budget, independent of idle-tick servicing: \
+             {handoffs} handoffs != {exhausted} exhausted budgets — the rest of \
              the driver was starved (invariant #10 BLOCKER)"
+        );
+        assert!(
+            window.is_ok(),
+            "hang guard: the fairness window did not reach its exhaustion \
+             counts within {SAFETY_TIMEOUT:?}"
+        );
+        assert!(
+            window_run >= REQUIRED_DRY_FREE_RUN,
+            "saturation precondition (review PR193-06): the measured window must \
+             contain {REQUIRED_DRY_FREE_RUN} consecutive exhausted budgets with \
+             no drain reaching WouldBlock, but the longest was {window_run} — \
+             the flood was not continuously readable, so a natural yield could \
+             mask a missing production `yield_now`"
+        );
+        assert!(
+            observer_polls > 1,
+            "the observer must have polled during the run (got {observer_polls})"
+        );
+        assert!(
+            max_gap <= MAX_TOLERATED_GAP,
+            "an independent task on the same (single-threaded) runtime must get \
+             scheduled at least every {MAX_TOLERATED_GAP} exhaustions while the \
+             driver services a permanent flood, but it went {max_gap} \
+             exhaustions without a scheduling chance — the driver is not \
+             yielding the thread between receive budgets (review PR193-03)"
         );
         assert!(
             matches!(stopped, Ok(Ok(Ok(())))),

@@ -760,6 +760,10 @@ pub struct AppState {
     /// a focus session is a best-effort preview consumer that can never
     /// back-pressure the engine.
     pub whep: crate::preview::SharedWhep,
+    /// Finite, authorized `MoQ` subscriptions; unavailable until a provider is wired.
+    pub moq: Arc<crate::moq::MoqRegistry>,
+    /// Optional durable Cloudflare management provider, independent of media admission.
+    pub cloudflare: Option<Arc<dyn crate::routes::cloudflare::CloudflareManagement>>,
     /// The WHIP ingest transport seam (RFC 9725 WebRTC contribution sources).
     /// The default ([`NoWhip`](crate::whip::NoWhip)) refuses every publish with
     /// an honest `503`; the binary swaps in a `multiview-webrtc`-backed provider.
@@ -1054,6 +1058,8 @@ impl AppState {
             source_event_test_injector: None,
             automation: None,
             whep: crate::preview::no_whep(),
+            moq: Arc::new(crate::moq::MoqRegistry::default()),
+            cloudflare: None,
             whip: crate::whip::no_whip(),
             whep_output: crate::whep_output::no_whep_output(),
             // Secure default: authentication is REQUIRED. An operator opts out
@@ -1382,8 +1388,24 @@ impl AppState {
         self
     }
 
-    /// Replace the WHEP focus transport provider (the binary wires a
-    /// transport-backed one; the default refuses every focus with a `fallback`).
+    /// Install durable Cloudflare management independently of media transport.
+    #[must_use]
+    pub fn with_cloudflare(
+        mut self,
+        provider: Arc<dyn crate::routes::cloudflare::CloudflareManagement>,
+    ) -> Self {
+        self.cloudflare = Some(provider);
+        self
+    }
+
+    /// Install the authorized finite `MoQ` registry; the default remains unavailable.
+    #[must_use]
+    pub fn with_moq(mut self, moq: Arc<crate::moq::MoqRegistry>) -> Self {
+        self.moq = moq;
+        self
+    }
+
+    /// Replace the WHEP focus transport provider.
     #[must_use]
     pub fn with_whep(mut self, whep: crate::preview::SharedWhep) -> Self {
         self.whep = whep;

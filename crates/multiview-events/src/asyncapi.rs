@@ -1145,7 +1145,7 @@ fn output_run_state_schema() -> Value {
     json!({
         "type": "string",
         "description": "Running state of an output sink.",
-        "enum": ["starting", "running", "migrating", "error"]
+        "enum": ["idle", "starting", "running", "migrating", "error"]
     })
 }
 

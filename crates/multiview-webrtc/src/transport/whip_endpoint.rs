@@ -354,6 +354,18 @@ impl WhipHandle {
         self.inner.live_by_source.lock().map_or(0, |m| m.len())
     }
 
+    /// Whether the session table has CLOSED `session_id` — which only the
+    /// driver's reap/GC step does for an ingest session (`release` merely
+    /// forgets the source). Test-only probe for the unified flood test
+    /// (review PR193-02-R2).
+    #[cfg(test)]
+    pub(crate) fn session_closed_in_table(&self, session_id: &SessionId) -> bool {
+        self.inner
+            .table
+            .lock()
+            .is_ok_and(|table| table.is_closed(session_id))
+    }
+
     fn forget_source(&self, source_id: &str) {
         if let Ok(mut live) = self.inner.live_by_source.lock() {
             let _ = live.remove(source_id);
@@ -459,14 +471,22 @@ impl WhipEndpoint {
                         }
                     }
                     Self::pump_turn(&socket, &mut turn, now, &self.shared).await;
-                    Self::pump_outbound(&socket, &mut sessions, &mut turn, now).await;
+                    Self::pump_outbound(
+                        &socket, &mut sessions, &mut turn, now,
+                        #[cfg(test)]
+                        &mut |_, _| {},
+                    ).await;
                 }
                 // The idle tick: advance timers, drain RTP, drive TURN, GC.
                 _ = tick.tick() => {
                     let now = Instant::now();
                     Self::tick(&mut sessions, now);
                     Self::pump_turn(&socket, &mut turn, now, &self.shared).await;
-                    Self::pump_outbound(&socket, &mut sessions, &mut turn, now).await;
+                    Self::pump_outbound(
+                        &socket, &mut sessions, &mut turn, now,
+                        #[cfg(test)]
+                        &mut |_, _| {},
+                    ).await;
                     Self::reap(&mut sessions, &self.shared);
                 }
             }
@@ -561,6 +581,10 @@ impl WhipEndpoint {
         sessions: &mut [DrivenSession],
         turn: &mut TurnRelayDriver,
         now: Instant,
+        // `cfg(test)`-only (review PR193-07): told about every datagram at the
+        // actual send site, so the unified driver's flood test can attribute
+        // each outbound datagram to the servicing path that sent it.
+        #[cfg(test)] on_sent: &mut (dyn FnMut(SocketAddr, &[u8]) + Send),
     ) {
         for s in sessions.iter_mut() {
             while let Some((source, dst, payload)) = s.session.poll_transmit(now) {
@@ -568,6 +592,8 @@ impl WhipEndpoint {
                 // own retransmit/ICE recovers it; the loop never blocks.
                 crate::transport::relay_io::send_routed(socket, turn, source, dst, &payload, now)
                     .await;
+                #[cfg(test)]
+                on_sent(dst, &payload);
             }
         }
     }

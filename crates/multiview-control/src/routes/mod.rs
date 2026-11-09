@@ -28,6 +28,7 @@ pub mod audio;
 pub mod audit;
 pub mod cast_sessions;
 pub(crate) mod catalogue;
+pub mod cloudflare;
 pub mod config;
 pub mod devices;
 pub mod discovery;
@@ -39,6 +40,7 @@ pub mod licence;
 pub mod logs;
 pub mod media_players;
 pub mod mesh;
+pub mod moq;
 pub mod outputs;
 pub mod overlays;
 pub mod preview;
@@ -1342,6 +1344,8 @@ fn conspect_router() -> Router<AppState> {
 /// routes, which are wired by [`crate::router()`]).
 pub fn api_router() -> Router<AppState> {
     Router::new()
+        .route("/cloudflare/credentials", post(cloudflare::save))
+        .route("/cloudflare/{action}", post(cloudflare::execute))
         .merge(resource_router())
         .merge(conspect_router())
         .route("/commands/start", post(cmd_start))
@@ -1459,6 +1463,12 @@ pub fn signalling_router() -> Router<AppState> {
     Router::new()
         // Preview transport capabilities (WHEP vs the JPEG ladder, ADR-P006).
         .route("/preview/capabilities", get(preview::capabilities))
+        .route("/preview/program/moq", post(moq::program_open))
+        .route("/preview/program/moq/{lease_id}", axum::routing::delete(moq::program_close))
+        .route("/preview/inputs/{id}/moq", post(moq::input_open))
+        .route("/preview/inputs/{id}/moq/{lease_id}", axum::routing::delete(moq::input_close))
+        .route("/preview/outputs/{id}/moq", post(moq::output_open))
+        .route("/preview/outputs/{id}/moq/{lease_id}", axum::routing::delete(moq::output_close))
         // WHEP focus sessions (sub-second WebRTC preview) per scope: SDP offer
         // in -> 201 + answer SDP + Location; DELETE the resource to release.
         .route("/preview/program/whep", post(preview::program_whep_open))

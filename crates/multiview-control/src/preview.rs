@@ -233,6 +233,8 @@ pub struct PreviewCapabilities {
     /// Whether this build can serve WHEP/WebRTC at all (a native transport is
     /// wired). `false` on a pure / negotiation-only build.
     pub webrtc: bool,
+    /// True only when an authorized `MoQ` transport provider is ready.
+    pub moq: bool,
     /// Per-scope WHEP availability + the program fidelity label.
     pub scopes: ScopeCapabilities,
     /// The always-available fallback transport literal: `"jpeg"` (the one
@@ -249,6 +251,7 @@ impl PreviewCapabilities {
         let webrtc = provider.webrtc_available();
         Self {
             webrtc,
+            moq: false,
             scopes: ScopeCapabilities {
                 program: ScopeCapability {
                     whep: webrtc,
