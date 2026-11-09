@@ -185,12 +185,22 @@ pub mod synth;
 /// executor in [`pipeline`] performs the [`player::PlayerAction`]s it returns.
 pub mod player;
 
+#[cfg(feature = "ffmpeg")]
+mod binding_delivery;
+#[cfg(feature = "ffmpeg")]
+pub(crate) mod output_window_registry;
 /// The full libav\* end-to-end `multiview run` pipeline (ingest → composite →
 /// encode-once → fan out to file/HLS sinks). Behind the off-by-default `ffmpeg`
 /// feature so the baseline build stays pure-Rust; software H.264/H.265 needs
 /// `gpl-codecs` on top.
 #[cfg(feature = "ffmpeg")]
 pub mod pipeline;
+#[cfg(feature = "ffmpeg")]
+mod rendition_dispatch;
+#[cfg(feature = "ffmpeg")]
+pub mod rendition_plan;
+#[cfg(feature = "ffmpeg")]
+pub mod rendition_workers;
 
 /// Live HLS segment fetcher: parallel byte-range segment downloads served to
 /// the libav demuxer from memory over loopback, so a source whose single TCP

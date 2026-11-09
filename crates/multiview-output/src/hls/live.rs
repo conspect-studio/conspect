@@ -98,6 +98,12 @@ impl LivePlaylist {
         self.initial_discontinuity = true;
     }
 
+    /// The maximum segment count retained by the live media playlist.
+    #[must_use]
+    pub const fn window_size(&self) -> usize {
+        self.window
+    }
+
     /// The on-disk path the manifest is published to.
     #[must_use]
     pub fn playlist_path(&self) -> &Path {

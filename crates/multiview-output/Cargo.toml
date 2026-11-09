@@ -119,6 +119,7 @@ alsa = { workspace = true, optional = true }
 # `unsafe_code = forbid`). `cargo deny check` runs with all-features=false so it
 # never sees this opt-in dependency.
 multiview-ffmpeg = { workspace = true, optional = true }
+multiview-srt-sys = { workspace = true, optional = true }
 
 # Opt-in alongside `multiview-ffmpeg`, used ONLY to name `ffmpeg-next`'s safe value
 # types (`format::Pixel`, the encoded-packet/`Video` frame types) when calling
@@ -154,6 +155,7 @@ multiview-input = { workspace = true }
 # feature is enabled — exactly when the tests that need it are compiled.
 
 [features]
+srt-libsrt = ["ffmpeg", "dep:multiview-srt-sys"]
 "default" = []
 # AES67 / SMPTE ST 2110-30 PCM-audio RTP egress (ADR-0033). OFF by default: it
 # adds only the thin tokio `UdpSocket` send loop in `aes67::transport`. The pure
