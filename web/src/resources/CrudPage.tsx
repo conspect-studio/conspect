@@ -122,6 +122,8 @@ export interface CrudPageProps<View, Form, Field extends string> {
   readonly dialogEditTitle: string;
   readonly dialogDescription: string;
   readonly caption: string;
+  /** Opt-in control sizing for portalled resource dialogs; default pages are unchanged. */
+  readonly dialogClassName?: string;
   readonly emptyMessage: JSX.Element;
   readonly list: readonly View[];
   readonly isPending: boolean;
@@ -349,7 +351,7 @@ export function CrudPage<View, Form, Field extends string>(
           }
         }}
       >
-        <DialogContent>
+        <DialogContent className={props.dialogClassName}>
           <DialogHeader>
             <DialogTitle>
               {creating ? props.dialogCreateTitle : props.dialogEditTitle}
@@ -394,7 +396,7 @@ export function CrudPage<View, Form, Field extends string>(
           }
         }}
       >
-        <DialogContent>
+        <DialogContent className={props.dialogClassName}>
           <DialogHeader>
             <DialogTitle>
               <Trans>Delete this resource?</Trans>

@@ -29,6 +29,8 @@ describe('Sources touch cards', () => {
     renderSources();
     const card = await screen.findByTestId('source-card-camera');
     expect(screen.queryByRole('table')).not.toBeInTheDocument();
+    expect(screen.getByRole('list', { name: 'Configured ingest sources.' })).toContainElement(card);
+    expect(within(card).getByRole('heading')).toHaveTextContent('Studio camera');
     expect(within(card).getByText('Studio camera')).toBeInTheDocument();
     expect(within(card).getByText('https://example.test/live.m3u8')).toHaveClass('break-all');
     expect(within(card).getByRole('button', { name: 'Edit source: Studio camera' })).toHaveClass('min-h-12');
@@ -37,6 +39,8 @@ describe('Sources touch cards', () => {
     expect(within(card).getByRole('button', { name: /events/i })).toBeInTheDocument();
     expect(within(card).getByText('Not linked to IPTV-ORG')).toBeInTheDocument();
     // An absent demand record is not evidence of either Idle or Ready.
+    expect(within(card).getByText('Status unknown')).toBeVisible();
+    expect(within(card).queryByRole('button', { name: /^(Start|Stop)/ })).not.toBeInTheDocument();
     expect(within(card).queryByText('Idle')).not.toBeInTheDocument();
     expect(within(card).queryByText('Ready')).not.toBeInTheDocument();
     expect(screen.getByRole('button', { name: 'New source' })).toBeInTheDocument();
@@ -45,12 +49,53 @@ describe('Sources touch cards', () => {
   it('refuses unknown-kind editing but preserves delete confirmation', async () => {
     renderSources();
     const card = await screen.findByTestId('source-card-future');
+    expect(within(card).getByText('No locator configured')).toBeVisible();
+    expect(within(card).getByText('Not linked to IPTV-ORG')).toBeVisible();
     const edit = within(card).getByRole('button', { name: /edit source: future input/i });
     expect(edit).toHaveAttribute('aria-disabled', 'true');
+    expect(edit).toBeDisabled();
+    expect(edit).toHaveAccessibleDescription(/isn't editable in this UI/);
+    edit.focus();
+    await userEvent.keyboard('{Enter} ');
+    expect(edit).not.toHaveFocus();
     await userEvent.click(edit);
     expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
     await userEvent.click(within(card).getByRole('button', { name: 'Delete source: Future input' }));
     expect(await screen.findByRole('dialog', { name: 'Delete this resource?' })).toBeInTheDocument();
+  });
+
+  it('shows unknown status without lifecycle actions after a status failure', async () => {
+    let requested = false;
+    server.use(http.get('*/api/v1/sources/status', () => {
+      requested = true;
+      return new HttpResponse(null, { status: 503 });
+    }));
+    renderSources();
+    const card = await screen.findByTestId('source-card-camera');
+    await waitFor(() => { expect(requested).toBe(true); });
+    expect(within(card).getByText('Status unknown')).toBeVisible();
+    expect(within(card).queryByText('Idle')).not.toBeInTheDocument();
+    expect(within(card).queryByRole('button', { name: /^(Start|Stop)/ })).not.toBeInTheDocument();
+  });
+
+  it('keeps actual idle status and the original Start mutation', async () => {
+    const idle = { id: 'camera', phase: 'idle', consumers: [], video_running: false, audio_running: false };
+    let started = false;
+    server.use(
+      http.get('*/api/v1/sources/status', () => HttpResponse.json([idle])),
+      http.post('*/api/v1/sources/camera/start', () => {
+        started = true;
+        return HttpResponse.json({ ...idle, phase: 'starting' });
+      }),
+    );
+    renderSources();
+    const card = await screen.findByTestId('source-card-camera');
+    expect(await within(card).findByText('Idle')).toBeVisible();
+    expect(within(card).getByText(/not running and costs nothing/)).toBeInTheDocument();
+    const start = within(card).getByRole('button', { name: /^Start/ });
+    expect(start).toBeEnabled();
+    await userEvent.click(start);
+    await waitFor(() => { expect(started).toBe(true); });
   });
 
   it('deletes through the original resource mutation after confirmation', async () => {

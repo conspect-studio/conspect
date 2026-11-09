@@ -606,7 +606,7 @@ msgstr ""
 msgid "A source is a managed input. Each one owns its ingest, decode, color handling, and reconnect behaviour, and is referenced by tiles via a stable id. Supported kinds include RTSP, HLS, MPEG-TS, SRT, RTMP, NDI, file, and a built-in synthetic test pattern. When a source stops delivering frames, its tile holds the last good frame and moves through a clear state machine — live, stale, reconnecting, no-signal — while the engine reconnects without disturbing the rest of the wall."
 msgstr ""
 
-#: src/pages/SourcesPage.tsx:1192
+#: src/pages/SourcesPage.tsx:1167
 msgid "A source is an ingest input bound into the multiview by id."
 msgstr ""
 
@@ -690,8 +690,8 @@ msgid "About probes and alarms"
 msgstr ""
 
 #: src/pages/docs/FeaturesPage.tsx:53
-#: src/pages/SourcesPage.tsx:1186
-#: src/pages/SourcesPage.tsx:1280
+#: src/pages/SourcesPage.tsx:1161
+#: src/pages/SourcesPage.tsx:1256
 msgid "About source transports"
 msgstr ""
 
@@ -717,7 +717,7 @@ msgid "About the tile lifecycle"
 msgstr ""
 
 #: src/pages/MonitoringPage.tsx:239
-#: src/pages/SourcesPage.tsx:1112
+#: src/pages/SourcesPage.tsx:1108
 msgid "About tile lifecycle states"
 msgstr ""
 
@@ -790,7 +790,6 @@ msgstr ""
 #: src/pages/LayoutsPage.tsx:86
 #: src/pages/OverlaysPage.tsx:194
 #: src/pages/ProbesPage.tsx:452
-#: src/pages/SourcesPage.tsx:1160
 #: src/pages/SyncGroupsPage.tsx:295
 #: src/pages/TallyPage.tsx:367
 msgid "Actions"
@@ -848,7 +847,7 @@ msgstr ""
 msgid "Add an output or source"
 msgstr ""
 
-#: src/pages/SourcesPage.tsx:1185
+#: src/pages/SourcesPage.tsx:1160
 msgid "Add and manage live ingest sources."
 msgstr ""
 
@@ -1731,7 +1730,7 @@ msgid "Broadcast area"
 msgstr ""
 
 #: src/iptv/IptvOrgPage.tsx:363
-#: src/pages/SourcesPage.tsx:1203
+#: src/pages/SourcesPage.tsx:1178
 msgid "Browse IPTV-ORG"
 msgstr ""
 
@@ -1818,8 +1817,8 @@ msgstr ""
 #: src/pages/SalvosPage.tsx:433
 #: src/pages/SystemActionsPage.tsx:151
 #: src/pages/TallyPage.tsx:432
-#: src/resources/CrudPage.tsx:370
-#: src/resources/CrudPage.tsx:415
+#: src/resources/CrudPage.tsx:380
+#: src/resources/CrudPage.tsx:425
 msgid "Cancel"
 msgstr ""
 
@@ -2448,7 +2447,8 @@ msgstr ""
 msgid "Configured fail-state probes."
 msgstr ""
 
-#: src/pages/SourcesPage.tsx:1193
+#: src/pages/SourcesPage.tsx:1089
+#: src/pages/SourcesPage.tsx:1168
 msgid "Configured ingest sources."
 msgstr ""
 
@@ -2672,7 +2672,7 @@ msgid "Could not copy diagnostics. Select the safe technical details and copy th
 msgstr ""
 
 #: src/pages/OutputsPage.tsx:1151
-#: src/resources/CrudPage.tsx:271
+#: src/resources/CrudPage.tsx:279
 msgid "Could not create"
 msgstr ""
 
@@ -2685,7 +2685,7 @@ msgid "Could not create sources"
 msgstr ""
 
 #: src/pages/OutputsPage.tsx:1174
-#: src/resources/CrudPage.tsx:290
+#: src/resources/CrudPage.tsx:298
 msgid "Could not delete"
 msgstr ""
 
@@ -2751,7 +2751,7 @@ msgstr ""
 
 #: src/pages/DevicesPage.tsx:518
 #: src/pages/OutputsPage.tsx:1114
-#: src/resources/CrudPage.tsx:238
+#: src/resources/CrudPage.tsx:246
 msgid "Could not load for editing"
 msgstr ""
 
@@ -2795,7 +2795,7 @@ msgstr ""
 msgid "Could not load salvos:"
 msgstr ""
 
-#: src/pages/SourcesPage.tsx:1196
+#: src/pages/SourcesPage.tsx:1171
 msgid "Could not load sources:"
 msgstr ""
 
@@ -2896,7 +2896,7 @@ msgstr ""
 
 #: src/pages/IptvPage.tsx:104
 #: src/pages/OutputsPage.tsx:1151
-#: src/resources/CrudPage.tsx:271
+#: src/resources/CrudPage.tsx:279
 msgid "Could not save"
 msgstr ""
 
@@ -2999,7 +2999,7 @@ msgstr ""
 #: src/pages/DeviceDetailPage.tsx:1094
 #: src/pages/DeviceDetailPage.tsx:1213
 #: src/pages/OutputsPage.tsx:1337
-#: src/resources/CrudPage.tsx:373
+#: src/resources/CrudPage.tsx:383
 msgid "Create"
 msgstr ""
 
@@ -3047,7 +3047,7 @@ msgstr ""
 #: src/iptv/BulkAddDialog.tsx:105
 #: src/iptv/BulkAddDialog.tsx:184
 #: src/pages/OutputsPage.tsx:1144
-#: src/resources/CrudPage.tsx:264
+#: src/resources/CrudPage.tsx:272
 msgid "Created"
 msgstr ""
 
@@ -3323,10 +3323,11 @@ msgstr ""
 #: src/pages/OutputsPage.tsx:1387
 #: src/pages/SalvosPage.tsx:307
 #: src/pages/SalvosPage.tsx:436
+#: src/pages/SourcesPage.tsx:1134
 #: src/pages/TallyPage.tsx:392
 #: src/pages/TallyPage.tsx:435
 #: src/resources/CrudPage.tsx:109
-#: src/resources/CrudPage.tsx:422
+#: src/resources/CrudPage.tsx:432
 msgid "Delete"
 msgstr ""
 
@@ -3374,7 +3375,7 @@ msgstr ""
 msgid "Delete salvo?"
 msgstr ""
 
-#: src/pages/SourcesPage.tsx:1166
+#: src/pages/SourcesPage.tsx:1133
 msgid "Delete source"
 msgstr ""
 
@@ -3391,12 +3392,12 @@ msgid "Delete this relay? Active clients can disconnect. Imported resources also
 msgstr ""
 
 #: src/pages/OutputsPage.tsx:1356
-#: src/resources/CrudPage.tsx:392
+#: src/resources/CrudPage.tsx:402
 msgid "Delete this resource?"
 msgstr ""
 
 #: src/pages/OutputsPage.tsx:1168
-#: src/resources/CrudPage.tsx:286
+#: src/resources/CrudPage.tsx:294
 msgid "Deleted"
 msgstr ""
 
@@ -3802,7 +3803,7 @@ msgstr ""
 
 #: src/devices/InputStreamsInspector.tsx:62
 #: src/pages/RoutingPage.tsx:280
-#: src/pages/SourcesPage.tsx:1257
+#: src/pages/SourcesPage.tsx:1233
 msgid "e.g. cam-north"
 msgstr ""
 
@@ -3938,6 +3939,7 @@ msgstr ""
 #: src/pages/LayoutsPage.tsx:106
 #: src/pages/OutputsPage.tsx:1047
 #: src/pages/SalvosPage.tsx:296
+#: src/pages/SourcesPage.tsx:1131
 #: src/resources/CrudPage.tsx:97
 msgid "Edit"
 msgstr ""
@@ -3995,8 +3997,9 @@ msgstr ""
 msgid "Edit salvo"
 msgstr ""
 
-#: src/pages/SourcesPage.tsx:1165
-#: src/pages/SourcesPage.tsx:1191
+#: src/pages/SourcesPage.tsx:1124
+#: src/pages/SourcesPage.tsx:1124
+#: src/pages/SourcesPage.tsx:1166
 msgid "Edit source"
 msgstr ""
 
@@ -4180,7 +4183,6 @@ msgstr ""
 #: src/events/SourceEventsButton.tsx:182
 #: src/events/SourceEventsButton.tsx:192
 #: src/pages/DeviceDetailPage.tsx:453
-#: src/pages/SourcesPage.tsx:1149
 msgid "Events"
 msgstr ""
 
@@ -4408,7 +4410,7 @@ msgid "Fit"
 msgstr ""
 
 #: src/pages/OutputsPage.tsx:1325
-#: src/resources/CrudPage.tsx:365
+#: src/resources/CrudPage.tsx:375
 msgid "Fix the highlighted fields, then save again."
 msgstr ""
 
@@ -4884,7 +4886,7 @@ msgstr ""
 #: src/pages/OutputsPage.tsx:1211
 #: src/pages/OverlaysPage.tsx:234
 #: src/pages/ProbesPage.tsx:496
-#: src/pages/SourcesPage.tsx:1212
+#: src/pages/SourcesPage.tsx:1187
 msgid "How configuration applies"
 msgstr ""
 
@@ -4967,7 +4969,7 @@ msgstr ""
 #: src/pages/ProbesPage.tsx:520
 #: src/pages/SalvosPage.tsx:211
 #: src/pages/SalvosPage.tsx:341
-#: src/pages/SourcesPage.tsx:1253
+#: src/pages/SourcesPage.tsx:1229
 #: src/pages/SyncGroupsPage.tsx:379
 #: src/pages/TallyPage.tsx:364
 msgid "Identifier"
@@ -5285,18 +5287,18 @@ msgstr ""
 #: src/pages/OverlaysPage.tsx:289
 #: src/pages/ProbesPage.tsx:419
 #: src/pages/ProbesPage.tsx:542
-#: src/pages/SourcesPage.tsx:1093
-#: src/pages/SourcesPage.tsx:1274
+#: src/pages/SourcesPage.tsx:1250
 #: src/pages/SystemActionsPage.tsx:234
 msgid "Kind"
 msgstr ""
 
 #. placeholder {0}: ctx.row.original.rawKind
 #. placeholder {0}: output.rawKind
+#. placeholder {0}: source.rawKind
 #: src/pages/OutputsPage.tsx:944
 #: src/pages/OverlaysPage.tsx:204
 #: src/pages/ProbesPage.tsx:462
-#: src/pages/SourcesPage.tsx:1170
+#: src/pages/SourcesPage.tsx:1093
 msgid "kind \"{0}\" isn't editable in this UI; the document is preserved as authored"
 msgstr ""
 
@@ -5579,8 +5581,8 @@ msgid "Limited vs full range"
 msgstr ""
 
 #: src/pages/SourcesPage.tsx:1128
-msgid "Link"
-msgstr ""
+#~ msgid "Link"
+#~ msgstr ""
 
 #: src/pages/docs/components.tsx:44
 msgid "Link to section"
@@ -5831,7 +5833,7 @@ msgstr ""
 msgid "Loading source events…"
 msgstr ""
 
-#: src/pages/SourcesPage.tsx:1195
+#: src/pages/SourcesPage.tsx:1170
 msgid "Loading sources…"
 msgstr ""
 
@@ -5903,7 +5905,7 @@ msgstr ""
 msgid "Location id"
 msgstr ""
 
-#: src/pages/SourcesPage.tsx:1098
+#: src/pages/SourcesPage.tsx:1116
 msgid "Locator"
 msgstr ""
 
@@ -6428,8 +6430,7 @@ msgstr ""
 #: src/pages/ProbesPage.tsx:414
 #: src/pages/ProbesPage.tsx:532
 #: src/pages/SalvosPage.tsx:210
-#: src/pages/SourcesPage.tsx:1088
-#: src/pages/SourcesPage.tsx:1265
+#: src/pages/SourcesPage.tsx:1241
 #: src/pages/SyncGroupsPage.tsx:234
 #: src/pages/SyncGroupsPage.tsx:391
 #: src/pages/TallyPage.tsx:241
@@ -6585,8 +6586,8 @@ msgstr ""
 msgid "New salvo"
 msgstr ""
 
-#: src/pages/SourcesPage.tsx:1189
-#: src/pages/SourcesPage.tsx:1190
+#: src/pages/SourcesPage.tsx:1164
+#: src/pages/SourcesPage.tsx:1165
 msgid "New source"
 msgstr ""
 
@@ -6780,6 +6781,10 @@ msgstr ""
 msgid "No locations yet. Nothing is fetched until one is added."
 msgstr ""
 
+#: src/pages/SourcesPage.tsx:1117
+msgid "No locator configured"
+msgstr ""
+
 #: src/pages/LogsPage.tsx:163
 msgid "No log records match the filter."
 msgstr ""
@@ -6890,7 +6895,7 @@ msgstr ""
 msgid "No source events in the current server snapshot. When this source airs an ad break, a badge/countdown overlay will appear automatically on its multiview tile."
 msgstr ""
 
-#: src/pages/SourcesPage.tsx:1194
+#: src/pages/SourcesPage.tsx:1169
 msgid "No sources configured."
 msgstr ""
 
@@ -6997,7 +7002,7 @@ msgid "not currently declared"
 msgstr ""
 
 #: src/pages/OutputsPage.tsx:1105
-#: src/resources/CrudPage.tsx:229
+#: src/resources/CrudPage.tsx:237
 msgid "Not editable in this UI"
 msgstr ""
 
@@ -7010,6 +7015,7 @@ msgid "Not in use: this source is not running and costs nothing."
 msgstr ""
 
 #: src/iptv/SourceLinks.tsx:93
+#: src/pages/SourcesPage.tsx:1138
 msgid "Not linked to IPTV-ORG"
 msgstr ""
 
@@ -7714,7 +7720,6 @@ msgid "preview"
 msgstr ""
 
 #: src/layout/components/GridLayoutEditor.tsx:552
-#: src/pages/SourcesPage.tsx:1144
 #: src/preview/SourcePreviewButton.tsx:16
 msgid "Preview"
 msgstr ""
@@ -8304,7 +8309,7 @@ msgstr ""
 msgid "Removed. Member devices keep running; only the alignment grouping is gone."
 msgstr ""
 
-#: src/pages/SourcesPage.tsx:1228
+#: src/pages/SourcesPage.tsx:1203
 msgid "Removed. The running engine drops the source immediately (the response header confirms) — tiles bound to it show the no-signal slate until re-routed."
 msgstr ""
 
@@ -8686,7 +8691,7 @@ msgstr ""
 #: src/pages/OutputsPage.tsx:1337
 #: src/pages/SalvosPage.tsx:398
 #: src/pages/SettingsPage.tsx:218
-#: src/resources/CrudPage.tsx:373
+#: src/resources/CrudPage.tsx:383
 msgid "Save"
 msgstr ""
 
@@ -8736,7 +8741,7 @@ msgstr ""
 
 #: src/pages/AudioPage.tsx:292
 #: src/pages/OutputsPage.tsx:1144
-#: src/resources/CrudPage.tsx:264
+#: src/resources/CrudPage.tsx:272
 msgid "Saved"
 msgstr ""
 
@@ -9179,7 +9184,7 @@ msgstr ""
 #: src/layout/components/SourcePalette.tsx:203
 #: src/pages/docs/ConfigPage.tsx:141
 #: src/pages/docs/FeaturesPage.tsx:38
-#: src/pages/SourcesPage.tsx:1182
+#: src/pages/SourcesPage.tsx:1157
 msgid "Sources"
 msgstr ""
 
@@ -9321,8 +9326,12 @@ msgstr ""
 #: src/pages/graphics/DataView.tsx:355
 #: src/pages/MeshPage.tsx:62
 #: src/pages/RelayManagementPage.tsx:76
-#: src/pages/SourcesPage.tsx:1109
+#: src/pages/SourcesPage.tsx:1107
 msgid "Status"
+msgstr ""
+
+#: src/pages/SourcesPage.tsx:126
+msgid "Status unknown"
 msgstr ""
 
 #: src/pages/DataPage.tsx:278
@@ -9424,7 +9433,7 @@ msgstr ""
 msgid "Stored. It goes live via config export + restart; the running engine is unchanged until then."
 msgstr ""
 
-#: src/pages/SourcesPage.tsx:1227
+#: src/pages/SourcesPage.tsx:1202
 msgid "Stored. Synthetic sources (bars, solid colour, clock, timer) and — on a full-engine run — network/file sources apply to the running engine immediately; NDI / YouTube / AES67 (and any kind on the software engine) go live via config export + restart. The response header declares which applied."
 msgstr ""
 
@@ -9600,7 +9609,7 @@ msgstr ""
 msgid "Synchronized output"
 msgstr ""
 
-#: src/pages/SourcesPage.tsx:1214
+#: src/pages/SourcesPage.tsx:1189
 msgid "Synthetic sources (bars, solid colour, clock, timer) apply to the running engine immediately when saved, and deleting any source removes it from the running engine immediately. Network and file sources (RTSP, HLS, MPEG-TS, SRT, RTMP, RIST, file) also apply live on a full-engine run; on the software engine, and for NDI / YouTube / AES67, they are stored and go live via config export + restart. Each save response declares which applied (X-Multiview-Apply: live or restart)."
 msgstr ""
 
@@ -10337,7 +10346,7 @@ msgid "this document's shape isn't editable in this UI; it is preserved as autho
 msgstr ""
 
 #: src/pages/OutputsPage.tsx:1106
-#: src/resources/CrudPage.tsx:230
+#: src/resources/CrudPage.tsx:238
 msgid "This entry's kind has no form here; the stored document is preserved as authored."
 msgstr ""
 
@@ -10422,7 +10431,7 @@ msgid "This permanently removes the salvo definition."
 msgstr ""
 
 #: src/pages/OutputsPage.tsx:1359
-#: src/resources/CrudPage.tsx:395
+#: src/resources/CrudPage.tsx:405
 msgid "This permanently removes the stored resource. The running engine is not affected until a new configuration is applied."
 msgstr ""
 
@@ -10587,7 +10596,7 @@ msgstr ""
 msgid "Token revoked. Existing connected sessions are not terminated."
 msgstr ""
 
-#: src/components/broadcast/useOperationFeedback.ts:29
+#: src/components/broadcast/useOperationFeedback.ts:51
 msgid "Too many unresolved commands. Wait for an outcome or resolve an unknown command before retrying."
 msgstr ""
 

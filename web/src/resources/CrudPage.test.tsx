@@ -31,6 +31,13 @@ describe('CrudPage optional item renderer', () => {
     expect(screen.getByRole('cell', { name: 'Camera' })).toBeInTheDocument();
   });
 
+  it('opts into portalled dialog styling without changing default pages', async () => {
+    renderWithProviders(<CrudPage {...props} dialogClassName="sources-dialog-controls" />);
+    await userEvent.click(screen.getByRole('button', { name: 'New source' }));
+    expect(await screen.findByRole('dialog')).toHaveClass('sources-dialog-controls');
+    await userEvent.click(screen.getByRole('button', { name: 'Cancel' }));
+  });
+
   it('passes the original rows and CRUD callbacks to the renderer', async () => {
     const renderer = vi.fn((rows: readonly typeof row[], edit: (item: typeof row) => void, remove: (item: typeof row) => void) => (
       <><button onClick={() => { edit(rows[0]!); }}>Card edit</button><button onClick={() => { remove(rows[0]!); }}>Card delete</button></>

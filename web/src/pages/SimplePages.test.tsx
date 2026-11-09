@@ -41,6 +41,7 @@ const OUTPUTS = [
 ];
 
 const server = setupServer(
+  http.get("*/api/v1/sources/status", () => HttpResponse.json([])),
   http.get("*/api/v1/sources", () => HttpResponse.json(SOURCES)),
   http.get("*/api/v1/sources/:id", ({ params }) => {
     const found = SOURCES.find((s) => s.id === String(params.id));
@@ -125,16 +126,13 @@ describe("SourcesPage honest surfaces", () => {
     );
   });
 
-  it("shows an honest idle state when nothing consumes a source", async () => {
+  it("shows unknown status without lifecycle actions when demand is absent", async () => {
     renderSources();
     expect(await screen.findByText("Camera 1")).toBeInTheDocument();
-    // Demand-driven sources: with no status yet, every row reads Idle with its
-    // explanation in text (not colour), and nothing reads as a fault.
-    const idle = screen.getAllByText("Idle");
-    expect(idle.length).toBeGreaterThanOrEqual(2);
-    expect(
-      screen.getAllByText(/not running and costs nothing/, { exact: false }).length,
-    ).toBeGreaterThanOrEqual(2);
+    expect(screen.getAllByText("Status unknown")).toHaveLength(SOURCES.length);
+    expect(screen.queryByText("Idle")).not.toBeInTheDocument();
+    expect(screen.queryByText(/not running and costs nothing/)).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /^(Start|Stop)/ })).not.toBeInTheDocument();
     expect(screen.queryByText(/No signal/i)).toBeNull();
   });
 
