@@ -1,9 +1,15 @@
-// MSW test for the Audio routing page: loads the singleton document
-// (GET /api/v1/audio-routing), renders one labelled table row per route, lists
-// the selectable tracks ("prog" + declared), validates inline, and saves the
-// whole document with PUT + If-Match.
+// MSW test for the Audio page's broadcast console (the adopted designer
+// direction, honest to the REAL API): loads the singleton document
+// (GET /api/v1/audio-routing), renders the whole-mix overview + strip console
+// (focused strip below xl, bank at xl+), lists the selectable tracks, validates
+// inline, and saves the WHOLE document with PUT + If-Match. The console's
+// core honesty is pinned here: gain/mute/PGM edits STAGE THE DRAFT ONLY (no
+// request leaves the page on a nudge, a fader change or a key tap), Draft vs
+// Saved is always explicit, per-strip Undo is a LOCAL draft revert, and the
+// save status reports exactly the server's X-Multiview-Apply (live / partial /
+// restart) plus its authoritative outputs_updated report.
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
-import { screen, waitFor, within } from "@testing-library/react";
+import { fireEvent, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { http, HttpResponse } from "msw";
 import { setupServer } from "msw/node";
@@ -37,6 +43,25 @@ const ROUTING = {
   selectable_tracks: ["prog", "cam1-clean"],
 };
 
+/** A second two-channel document for the strip-picker / whole-mix tests. */
+const ROUTING_TWO = {
+  ...ROUTING,
+  routing: {
+    sample_rate_hz: 48000,
+    routes: [
+      ROUTING.routing.routes[0],
+      {
+        input_id: "cam-2",
+        channels: { kind: "mono" },
+        include_in_program_bus: false,
+        gain_db: 0,
+        mute: false,
+      },
+    ],
+  },
+  selectable_tracks: ["prog", "cam1-clean"],
+};
+
 /** An output currently selecting the discrete track the ROUTING document
  * above declares (`cam1-clean`) — the fixture the pending-impact warning and
  * the outputs_updated note exercise. */
@@ -63,6 +88,7 @@ const server = setupServer(
   http.get("*/api/v1/audio-routing", () =>
     HttpResponse.json(ROUTING, { headers: { ETag: 'W/"7"' } }),
   ),
+  http.post("*/api/v1/ws/ticket", () => new HttpResponse(null, { status: 401 })),
   http.put("*/api/v1/audio-routing", async ({ request }) => {
     lastPut = {
       body: await request.json(),
@@ -94,18 +120,49 @@ function renderAudio(): void {
   );
 }
 
+/** Narrow a possibly-undefined indexed lookup (`noUncheckedIndexedAccess`). */
+function required<T>(value: T | undefined, what: string): T {
+  if (value === undefined) {
+    throw new Error(`expected ${what}`);
+  }
+  return value;
+}
+
+/** The console's surfaces, scoped: the whole-mix overview, the (sub-xl)
+ * focused strip + channel picker, and the (xl+) bank of strips. */
+async function console() {
+  const overview = await screen.findByTestId("audio-mix-overview");
+  return {
+    overview,
+    focused: screen.getByTestId("audio-focused-strip"),
+    bank: screen.getByTestId("audio-bank"),
+    picker: screen.getByTestId("audio-strip-picker"),
+  };
+}
+
 describe("AudioPage", () => {
-  it("loads the document into the form and lists the selectable tracks", async () => {
+  it("loads the saved routing into the console and lists the selectable tracks", async () => {
     renderAudio();
-    // The sample rate field prefills from the document.
+    const { overview, focused, bank } = await console();
+    // The sample rate field (inside the Bus-setup disclosure) prefills.
     expect(await screen.findByLabelText(/sample rate/i)).toHaveValue(48000);
-    // One row per route, inside a labelled table.
-    const table = screen.getByRole("table", { name: /audio route/i });
-    expect(within(table).getByDisplayValue("cam1-clean")).toBeInTheDocument();
+    // One channel everywhere: one overview row (plus the pinned PROGRAM row),
+    // one bank strip, one focused strip, one picker chip.
+    expect(within(overview).getAllByTestId("audio-overview-row")).toHaveLength(1);
+    expect(within(bank).getAllByTestId("audio-strip")).toHaveLength(1);
+    expect(within(focused).getAllByTestId("audio-strip")).toHaveLength(1);
+    expect(within(screen.getByTestId("audio-strip-picker")).getAllByTestId("audio-strip-chip")).toHaveLength(1);
+    expect(within(overview).getByTestId("audio-overview-program")).toBeInTheDocument();
+    // The saved values are explicit: Draft -3 dB · Saved -3 dB on the strip.
+    expect(within(focused).getByTestId("audio-strip-readout")).toHaveTextContent(
+      /Draft -3 dB.*Saved -3 dB/s,
+    );
     // The resulting selectable tracks are listed: the program bus + declared.
     const tracks = screen.getByTestId("audio-tracks-list");
     expect(within(tracks).getByText("prog")).toBeInTheDocument();
     expect(within(tracks).getByText("cam1-clean")).toBeInTheDocument();
+    // A clean document shows no draft banner: nothing is claimed pending.
+    expect(screen.queryByTestId("audio-draft-summary")).not.toBeInTheDocument();
   });
 
   it("shows the apply-semantics callout", async () => {
@@ -115,22 +172,143 @@ describe("AudioPage", () => {
     );
   });
 
-  it("adds and removes route rows from the keyboard", async () => {
+  it("toggles mute and program mix in the draft only — no request, saved state unchanged", async () => {
     renderAudio();
+    const { overview, focused } = await console();
+    const mute = within(focused).getByRole("button", { name: /Camera 1 MUTE/i });
+    expect(mute).toHaveAttribute("aria-pressed", "false");
+    await userEvent.click(mute);
+    expect(mute).toHaveAttribute("aria-pressed", "true");
+    expect(within(focused).getByTestId("audio-strip-status")).toHaveTextContent(/MUTED/);
+    expect(within(focused).getByTestId("audio-strip-status")).toHaveTextContent(/in PGM/);
+    // The overview keeps reporting the SAVED state, marked as edited.
+    expect(within(overview).getByTestId("audio-draft-mark")).toBeInTheDocument();
+    expect(lastPut).toBeUndefined();
+    // PGM (program-bus include) is a draft toggle too — never a live claim.
+    const pgm = within(focused).getByRole("button", { name: /Camera 1 PGM/i });
+    expect(pgm).toHaveAttribute("aria-pressed", "true");
+    await userEvent.click(pgm);
+    expect(pgm).toHaveAttribute("aria-pressed", "false");
+    expect(within(focused).getByTestId("audio-strip-status")).toHaveTextContent(/off PGM/);
+    expect(lastPut).toBeUndefined();
+  });
+
+  it("stages a tap nudge in the draft without any request, and never clamps it silently", async () => {
+    renderAudio();
+    const { focused } = await console();
+    await userEvent.click(
+      within(focused).getByRole("button", { name: /Camera 1 gain −1 dB/i }),
+    );
+    const readout = within(focused).getByTestId("audio-strip-readout");
+    expect(readout).toHaveTextContent(/Draft -4 dB/s);
+    expect(readout).toHaveTextContent(/Saved -3 dB/s);
+    expect(within(focused).getByTestId("audio-fader")).toHaveAttribute(
+      "aria-valuetext",
+      "draft -4 dB, saved -3 dB",
+    );
+    expect(lastPut).toBeUndefined();
+    // The page-level draft banner says exactly what is pending.
+    expect(screen.getByTestId("audio-draft-summary")).toHaveTextContent(/channels changed: 1/i);
+    expect(screen.getByTestId("audio-draft-summary")).toHaveTextContent(/nothing reaches the bus until you save/i);
+    // +6 from the staged -4 dB is +2 dB — beyond the fader's top, but still
+    // an exact, legal draft: the fader pins at 0 while the readout carries
+    // the truth (never a silent clamp).
+    await userEvent.click(
+      within(focused).getByRole("button", { name: /Camera 1 gain \+6 dB/i }),
+    );
+    expect(within(focused).getByTestId("audio-strip-readout")).toHaveTextContent(/Draft 2 dB/s);
+    // The fader PINS at its 0 dB top while the readout carries the exact +2.
+    expect(within(focused).getByTestId("audio-fader")).toHaveValue("0");
+    expect(lastPut).toBeUndefined();
+  });
+
+  it("stages fader drags and PageUp/PageDown keys, and Escape reverts the draft gain to the saved one", async () => {
+    renderAudio();
+    const { focused } = await console();
+    const fader = within(focused).getByTestId("audio-fader");
+    // A drag (input event) stages the draft; nothing is sent.
+    fireEvent.input(fader, { target: { value: "-12" } });
+    expect(within(focused).getByTestId("audio-strip-readout")).toHaveTextContent(/Draft -12 dB/s);
+    expect(within(focused).getByTestId("audio-strip-readout")).toHaveTextContent(/Saved -3 dB/s);
+    expect(lastPut).toBeUndefined();
+    // PageUp/PageDown step by ±6 dB, staged like the nudges.
+    fireEvent.keyDown(fader, { key: "PageDown" });
+    expect(within(focused).getByTestId("audio-strip-readout")).toHaveTextContent(/Draft -18 dB/s);
+    fireEvent.keyDown(fader, { key: "PageUp" });
+    expect(within(focused).getByTestId("audio-strip-readout")).toHaveTextContent(/Draft -12 dB/s);
+    expect(lastPut).toBeUndefined();
+    // Escape reverts the DRAFT gain to the saved one (a local, reversible
+    // draft edit — never an on-air event undo).
+    fireEvent.keyDown(fader, { key: "Escape" });
+    expect(within(focused).getByTestId("audio-strip-readout")).toHaveTextContent(/Draft -3 dB/s);
+    expect(within(focused).getByTestId("audio-strip-readout")).toHaveTextContent(/Saved -3 dB/s);
+    expect(lastPut).toBeUndefined();
+  });
+
+  it("keeps strip identity and focus stable while the draft changes (stable keys)", async () => {
+    renderAudio();
+    const { focused } = await console();
+    const fader = within(focused).getByTestId("audio-fader");
+    const nudge = required(within(focused).getAllByTestId("audio-nudge")[3], "the −6 nudge");
+    await userEvent.click(nudge);
+    // Same DOM nodes across the re-render: the strip never remounts.
+    expect(within(focused).getByTestId("audio-fader")).toBe(fader);
+    expect(document.activeElement).toBe(nudge);
+    // A second nudge keeps both properties.
+    await userEvent.click(nudge);
+    expect(within(focused).getByTestId("audio-fader")).toBe(fader);
+    expect(within(focused).getByTestId("audio-strip-readout")).toHaveTextContent(/Draft -15 dB/s);
+  });
+
+  it("rides a channel from the whole-mix overview: tap a row, the focused strip follows (touch selection)", async () => {
+    server.use(
+      http.get("*/api/v1/audio-routing", () =>
+        HttpResponse.json(ROUTING_TWO, { headers: { ETag: 'W/"7"' } }),
+      ),
+    );
+    renderAudio();
+    const { overview, focused, picker } = await console();
+    expect(within(overview).getAllByTestId("audio-overview-row")).toHaveLength(2);
+    // Camera 2 is off the mix and carries no track — the overview says so.
+    const cam2 = within(overview).getByRole("button", { name: /Ride Camera 2/i });
+    expect(within(cam2).getByText(/off PGM/i)).toBeInTheDocument();
+    await userEvent.click(cam2);
+    // The focused strip + picker follow the tapped row.
+    expect(within(focused).getByTestId("audio-strip-name")).toHaveTextContent("Camera 2");
+    const chips = within(picker).getAllByTestId("audio-strip-chip");
+    expect(required(chips[0], "the first chip")).toHaveAttribute("aria-pressed", "false");
+    expect(required(chips[1], "the second chip")).toHaveAttribute("aria-pressed", "true");
+    // Nudges act on the ridden channel, and the nudge key keeps focus
+    // across the re-render (no remount).
+    await userEvent.click(
+      within(focused).getByRole("button", { name: /Camera 2 gain −6 dB/i }),
+    );
+    expect(within(focused).getByTestId("audio-strip-readout")).toHaveTextContent(/Draft -6 dB/s);
+    expect(within(focused).getByTestId("audio-strip-readout")).toHaveTextContent(/Saved 0 dB/s);
+    expect(document.activeElement).toBe(within(focused).getAllByTestId("audio-nudge")[3]);
+    expect(lastPut).toBeUndefined();
+  });
+
+  it("adds and removes route rows from the console", async () => {
+    renderAudio();
+    const { overview, focused, bank } = await console();
     await screen.findByLabelText(/sample rate/i);
-    const addButton = screen.getByTestId("audio-add-route");
-    await userEvent.click(addButton);
-    expect(screen.getAllByTestId("audio-route-row")).toHaveLength(2);
-    // Each row carries an accessible remove control; removing the new row
-    // returns to one.
-    const rows = screen.getAllByTestId("audio-route-row");
-    const lastRow = rows[1];
-    expect(lastRow).toBeDefined();
-    if (lastRow === undefined) {
-      throw new Error("expected a second route row");
-    }
-    await userEvent.click(within(lastRow).getByRole("button", { name: /remove/i }));
-    expect(screen.getAllByTestId("audio-route-row")).toHaveLength(1);
+    await userEvent.click(screen.getByTestId("audio-add-route"));
+    expect(within(overview).getAllByTestId("audio-overview-row")).toHaveLength(2);
+    expect(within(bank).getAllByTestId("audio-strip")).toHaveLength(2);
+    // The new route is explicitly new — nothing saved to compare against.
+    const newStrip = required(within(bank).getAllByTestId("audio-strip")[1], "the second bank strip");
+    expect(within(newStrip).getByTestId("audio-strip-readout")).toHaveTextContent(/not saved yet/i);
+    // Each strip carries an accessible remove control inside its Details;
+    // ride the new route, remove it there, and the console is back to one
+    // channel — the original one.
+    await userEvent.click(
+      required(within(overview).getAllByTestId("audio-overview-row")[1], "the second overview row"),
+    );
+    await userEvent.click(within(focused).getByTestId("audio-remove-route"));
+    expect(within(overview).getAllByTestId("audio-overview-row")).toHaveLength(1);
+    expect(within(bank).getAllByTestId("audio-strip")).toHaveLength(1);
+    expect(required(within(bank).getAllByTestId("audio-strip")[0], "the first bank strip")).toHaveTextContent(/Camera 1/);
   });
 
   it("renders an inline error instead of saving an invalid form", async () => {
@@ -141,6 +319,8 @@ describe("AudioPage", () => {
     expect(await screen.findByText(/required/i)).toBeInTheDocument();
     expect(rate).toHaveAttribute("aria-invalid", "true");
     expect(lastPut).toBeUndefined();
+    // The Bus-setup disclosure opens itself so the error is not hidden.
+    expect(screen.getByTestId("audio-bus-setup")).toHaveAttribute("open");
   });
 
   it("saves the whole document with PUT + If-Match", async () => {
@@ -169,6 +349,18 @@ describe("AudioPage", () => {
           mute: false,
         },
       ],
+    });
+  });
+
+  it("saves again with the refreshed ETag from the previous save", async () => {
+    renderAudio();
+    await screen.findByLabelText(/sample rate/i);
+    await userEvent.click(screen.getByTestId("audio-save"));
+    const status = screen.getByRole("status");
+    await waitFor(() => expect(status).toHaveTextContent(/stored, not applied live/i));
+    await userEvent.click(screen.getByTestId("audio-save"));
+    await waitFor(() => {
+      expect(lastPut?.ifMatch).toBe('W/"8"');
     });
   });
 
@@ -209,9 +401,29 @@ describe("AudioPage", () => {
     expect(status).not.toHaveTextContent(/program mix is unchanged/i);
   });
 
+  it("surfaces a failed save as an error, never a fake success", async () => {
+    server.use(
+      http.put("*/api/v1/audio-routing", () =>
+        HttpResponse.json(
+          { title: "Precondition Failed", status: 412, detail: "the routing document changed on the server" },
+          { status: 412 },
+        ),
+      ),
+    );
+    renderAudio();
+    await screen.findByLabelText(/sample rate/i);
+    await userEvent.click(screen.getByTestId("audio-save"));
+    const status = screen.getByRole("status");
+    await waitFor(() =>
+      expect(status).toHaveTextContent(/could not save the audio routing: precondition failed/i),
+    );
+    expect(screen.queryByTestId("audio-outputs-updated-note")).not.toBeInTheDocument();
+  });
+
   it("warns inline, BEFORE saving, that an output carrying the renamed track will be updated", async () => {
     renderAudio();
-    const trackField = await screen.findByLabelText(/discrete track name/i);
+    const { focused } = await console();
+    const trackField = within(focused).getByLabelText(/discrete track name/i);
     await userEvent.clear(trackField);
     await userEvent.type(trackField, "us-cnn");
     // The warning appears before any save attempt.
@@ -256,12 +468,31 @@ describe("AudioPage", () => {
       }),
     );
     renderAudio();
-    const trackField = await screen.findByLabelText(/discrete track name/i);
+    const { focused } = await console();
+    const trackField = within(focused).getByLabelText(/discrete track name/i);
     await userEvent.clear(trackField);
     await userEvent.type(trackField, "us-cnn");
     await userEvent.click(screen.getByTestId("audio-save"));
     const note = await screen.findByTestId("audio-outputs-updated-note");
     expect(note).toHaveTextContent(/hls-out/);
     expect(note).toHaveTextContent(/cam1-clean.*us-cnn/);
+  });
+
+  it("shows the program meters and loudness as the real telemetry sections, and no strip fabricates a level", async () => {
+    renderAudio();
+    const { focused } = await console();
+    // The ACTUAL meters (engine telemetry), each exactly once.
+    expect(screen.getByRole("region", { name: /program meters/i })).toBeInTheDocument();
+    expect(screen.getByRole("region", { name: /program loudness/i })).toBeInTheDocument();
+    // With no realtime telemetry in the test environment the strips show an
+    // absent reading — never a number derived from gain, mute or the draft.
+    expect(within(focused).getByTestId("audio-in-peak").textContent).toBe("—");
+  });
+
+  it("offers no fake PFL/listen key, and states plainly that it is unavailable", async () => {
+    renderAudio();
+    const { focused } = await console();
+    expect(within(focused).queryByRole("button", { name: /listen|PFL|solo/i })).not.toBeInTheDocument();
+    expect(screen.getByTestId("audio-pfl-note")).toHaveTextContent(/pre-fade listen.*not available/i);
   });
 });
