@@ -23,7 +23,7 @@ pub struct PreviewStartup {
     pub(crate) overhead_bps: u64,
     pub(crate) opened_parent: Option<crate::output_window_registry::EffectiveBinding>,
     #[cfg(test)]
-    pub startup_delay: std::time::Duration,
+    pub(crate) startup_delay: std::time::Duration,
 }
 
 impl PreviewStartup {
@@ -96,6 +96,15 @@ pub(crate) struct PreviewIngress {
     alive: Arc<AtomicBool>,
 }
 impl PreviewIngress {
+    fn terminal_audio(&self, packets: Vec<multiview_ffmpeg::EncodedPacket>) {
+        if self
+            .tx
+            .try_send(Input::Audio(DispatchEvent::FinishAudio { packets }))
+            .is_err()
+        {
+            self.alive.store(false, Ordering::Release);
+        }
+    }
     pub(crate) fn spawn(
         request: PreviewStartup,
         factory: Arc<crate::output_window_registry::SubscriptionFactory>,
@@ -151,6 +160,12 @@ impl PreviewIngress {
                             if let Some(v) = vertical.as_ref() {
                                 v.audio(&event);
                             }
+                            if matches!(event, DispatchEvent::FinishAudio { .. }) {
+                                if let Some(v) = vertical.take() {
+                                    v.finish();
+                                }
+                                break;
+                            }
                         }
                     }
                 }
@@ -170,6 +185,18 @@ impl PreviewIngress {
         }
     }
     pub(crate) fn audio(&self, event: &DispatchEvent) {
+        if let DispatchEvent::FinishAudio { packets } = event {
+            let Ok(packets) = packets
+                .iter()
+                .map(multiview_ffmpeg::EncodedPacket::clone_shared_ref)
+                .collect::<Result<Vec<_>, _>>()
+            else {
+                self.alive.store(false, Ordering::Release);
+                return;
+            };
+            self.terminal_audio(packets);
+            return;
+        }
         if !self.alive.load(Ordering::Acquire) {
             return;
         }
@@ -205,18 +232,31 @@ impl PreviewIngress {
     }
 }
 
-impl Drop for PreviewIngress {
-    fn drop(&mut self) {
-        self.alive.store(false, Ordering::Release);
-    }
-}
-
 pub(crate) struct PreviewVertical {
     workers: Vec<crate::preview_fanout::PreviewWorker>,
     tx: SyncSender<DispatchEvent>,
     alive: Arc<AtomicBool>,
 }
 impl PreviewVertical {
+    fn finish(mut self) {
+        for worker in self.workers.drain(..) {
+            if worker.join().is_err() {
+                self.alive.store(false, Ordering::Release);
+            }
+        }
+        // Closing the last event sender lets the assembler process its complete
+        // video/audio EOF tail before the registration retires.
+        self.alive.store(false, Ordering::Release);
+    }
+    fn terminal_audio(&self, packets: Vec<multiview_ffmpeg::EncodedPacket>) {
+        if self
+            .tx
+            .try_send(DispatchEvent::FinishAudio { packets })
+            .is_err()
+        {
+            self.alive.store(false, Ordering::Release);
+        }
+    }
     #[allow(clippy::too_many_lines)] // Admission, worker ownership and publication form one transaction.
     pub(crate) fn start(
         request: PreviewStartup,
@@ -319,7 +359,7 @@ impl PreviewVertical {
                     ready: std::collections::HashSet::new(),
                     pending: Vec::new(),
                 };
-                while thread_alive.load(Ordering::Acquire) {
+                loop {
                     match rx.recv_timeout(std::time::Duration::from_millis(50)) {
                         Ok(event) => {
                             if dispatcher
@@ -330,6 +370,9 @@ impl PreviewVertical {
                             }
                         }
                         Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                            if !thread_alive.load(Ordering::Acquire) {
+                                break;
+                            }
                             if dispatcher
                                 .watchdog(std::time::Instant::now(), &mut delivery)
                                 .is_err()
@@ -387,6 +430,18 @@ impl PreviewVertical {
         }
     }
     pub(crate) fn audio(&self, event: &DispatchEvent) {
+        if let DispatchEvent::FinishAudio { packets } = event {
+            let Ok(packets) = packets
+                .iter()
+                .map(multiview_ffmpeg::EncodedPacket::clone_shared_ref)
+                .collect::<Result<Vec<_>, _>>()
+            else {
+                self.alive.store(false, Ordering::Release);
+                return;
+            };
+            self.terminal_audio(packets);
+            return;
+        }
         if !self.alive.load(Ordering::Acquire) {
             return;
         }

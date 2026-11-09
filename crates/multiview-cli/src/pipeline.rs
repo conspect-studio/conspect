@@ -6402,12 +6402,14 @@ fn consumer_main<D: WindowDelivery>(
             kind: "encode-audio",
             reason: e.to_string(),
         })?;
-        event_tx
-            .send(DispatchEvent::FinishAudio { packets: tail })
-            .map_err(|e| PipelineError::Output {
-                kind: "audio-dispatch",
-                reason: e.to_string(),
-            })?;
+        let event = DispatchEvent::FinishAudio { packets: tail };
+        if let Some(preview) = optional.as_ref() {
+            preview.audio(&event);
+        }
+        event_tx.send(event).map_err(|e| PipelineError::Output {
+            kind: "audio-dispatch",
+            reason: e.to_string(),
+        })?;
     }
     drop(event_tx);
     while let Ok(event) = event_rx.recv() {
@@ -21294,6 +21296,7 @@ segment_ms = 1000
                 "codec = \"mpeg2video\"",
                 &format!("codec = \"{production_codec}\""),
             );
+            let config_text = config_text.replace("segment_ms = 1000", "segment_ms = 1000\n[outputs.audio]\nmode = \"tracks\"\ntracks = [\"main\", \"selected\"]") + "\n[audio]\nsample_rate_hz = 48000\n[[audio.routes]]\ninput_id = \"in_a\"\nchannels = { kind = \"stereo\" }\ntarget_track = \"selected\"\ninclude_in_program_bus = true\n";
             let config = MultiviewConfig::load_from_toml(&config_text).unwrap();
             let mut pipeline = Pipeline::build(&config).unwrap();
             pipeline.enable_program_audio();
@@ -21397,7 +21400,7 @@ segment_ms = 1000
                     if packet.kind() == multiview_ffmpeg::StreamKind::Video {
                         o.0.push(packet.pts().unwrap());
                     }
-                    if packet.kind() == multiview_ffmpeg::StreamKind::Audio {
+                    if packet.kind() == multiview_ffmpeg::StreamKind::AudioTrack(0) {
                         o.1.push((
                             packet.pts().unwrap(),
                             packet.payload().unwrap().as_ptr() as usize,
@@ -21444,7 +21447,7 @@ segment_ms = 1000
                     if let Some(sub) = sub.as_ref() {
                         while let Ok(Some(window)) = sub.try_recv_window() {
                             for p in window.permit.packets() {
-                                if p.kind() == multiview_ffmpeg::StreamKind::Audio {
+                                if p.kind() == multiview_ffmpeg::StreamKind::AudioTrack(0) {
                                     o.2.push((
                                         p.pts().unwrap(),
                                         p.payload().unwrap().as_ptr() as usize,
