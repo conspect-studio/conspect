@@ -41,6 +41,17 @@ impl PreviewStartup {
         overhead_bps: u64,
     ) -> Option<Self> {
         let capacity = capacity?;
+        // Public typed construction cannot bypass the same cadence validity
+        // required by file parsing. Check every axis before value comparisons.
+        if production
+            .iter()
+            .map(|p| &p.key)
+            .chain(requests.iter().map(|r| &r.key))
+            .chain(measured.iter().map(|(key, _)| key))
+            .any(|key| key.cadence.num <= 0 || key.cadence.den <= 0)
+        {
+            return None;
+        }
         let first = requests.first()?;
         if parent_output.is_empty()
             || production.is_empty()

@@ -6,6 +6,16 @@
 #![allow(missing_docs)] // The pure admission fields are described by the API contracts below.
 use multiview_core::time::Rational;
 
+fn deserialize_cadence<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Rational, D::Error> {
+    let cadence = <Rational as serde::Deserialize>::deserialize(deserializer)?;
+    if cadence.num <= 0 || cadence.den <= 0 {
+        return Err(serde::de::Error::custom("cadence must be positive"));
+    }
+    Ok(cadence)
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PreviewKey {
@@ -15,6 +25,7 @@ pub struct PreviewKey {
     pub encoder_name: String,
     pub width: u32,
     pub height: u32,
+    #[serde(deserialize_with = "deserialize_cadence")]
     pub cadence: Rational,
     pub bitrate_bps: u64,
     /// Explicit opened profile constraint. `None` means caller has no profile

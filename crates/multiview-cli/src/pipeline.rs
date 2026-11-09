@@ -5239,7 +5239,7 @@ impl StreamEgress {
                                 .eq_ignore_ascii_case(&format!("{:?}", params.codec_id()))
                             && params
                                 .opened_bit_rate()
-                                .is_none_or(|rate| rate == reservation.key.bitrate_bps)
+                                .is_some_and(|rate| rate > 0 && rate == reservation.key.bitrate_bps)
                     })
                 })
         });
