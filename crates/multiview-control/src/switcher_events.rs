@@ -15,11 +15,13 @@ pub async fn forward_switcher_outcomes(
     publisher: Arc<EnginePublisher<EngineStateSnapshot, Event>>,
     me: String,
     program: String,
+    leases: Arc<crate::source_demand::SwitcherPreviewLeases>,
 ) {
     loop {
         match outcomes.recv().await {
             Ok(item) => {
                 let outcome = &item.event;
+                leases.resolve(&outcome.operation_id, outcome.completed);
                 publisher.publish_event(Event::SwitcherOperation(SwitcherOperation {
                     me: me.clone(),
                     program: program.clone(),

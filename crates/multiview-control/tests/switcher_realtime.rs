@@ -69,6 +69,7 @@ async fn terminal_only_corr_and_dual_scope_survive_bounded_relay() {
         Arc::clone(&publisher),
         "me1".into(),
         "main".into(),
+        Arc::new(multiview_control::source_demand::SwitcherPreviewLeases::default()),
     ));
     control
         .try_send(SwitcherCommand {

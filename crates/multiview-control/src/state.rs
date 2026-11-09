@@ -731,6 +731,9 @@ pub struct AppState {
     /// Real M/E frame-boundary handle; absent until dual-bus pipeline is wired.
     /// Routes fail closed rather than pretending that an unwired switcher applied.
     pub switcher: Option<multiview_engine::switcher_control::SwitcherControl>,
+    /// Bounded sustained PVW lease retained across requests; the previous lease
+    /// is released only after a new source lease is acquired.
+    pub switcher_preview_lease: Arc<crate::source_demand::SwitcherPreviewLeases>,
     /// The command-outcome correlation registry: pairs each accepted command's
     /// [`OperationId`](crate::command::OperationId) with the realtime outcome
     /// event it will produce, so the outcome's envelope echoes the op id as
@@ -1045,6 +1048,7 @@ impl AppState {
             config_versions: Arc::new(InMemoryConfigVersionStore::new()),
             idempotency: Arc::new(IdempotencyStore::new()),
             switcher: None,
+            switcher_preview_lease: Arc::new(crate::source_demand::SwitcherPreviewLeases::default()),
             // Bound the in-flight correlations: a generous ceiling for pending
             // command outcomes (drop-oldest beyond it, invariant #10). A backlog
             // this deep means outcomes are not being consumed; the oldest

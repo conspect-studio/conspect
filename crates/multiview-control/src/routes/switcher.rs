@@ -255,20 +255,9 @@ pub(crate) async fn submit_switcher(
         .scene_version()
         .ok_or_else(|| ControlError::Conflict("switcher has no active scene".into()))?;
     let verb = verb(&req, &kind)?;
-    // A PVW selection is a sustained video consumer, not a one-shot JPEG poll.
-    // Until an owner installs an on-arm lease the route must refuse a cold
-    // on-demand source rather than accept a take that can never prime.
-    if let Some(source) = &req.source {
-        if let Some(demand) = &state.source_demand {
-            if demand.status(source).phase == crate::source_demand::SourceDemandPhase::Idle
-                && req.action == "select_preview"
-            {
-                return Err(ControlError::Conflict(
-                    "preview source is idle; warm-on-arm lease is not installed".into(),
-                ));
-            }
-        }
-    }
+    // The request's lease is acquired only on the Fresh reservation arm below;
+    // a replay never changes PVW demand. Keep the old lease through admission.
+    let demand = state.source_demand.clone();
     let Some(key) = idem.0.as_deref().filter(|key| !key.trim().is_empty()) else {
         return Err(ControlError::Validation(
             "Idempotency-Key is required".into(),
@@ -278,6 +267,37 @@ pub(crate) async fn submit_switcher(
     let op = match operation {
         Reservation::Replay(op) => op,
         Reservation::Fresh(op) => {
+            let lease = if req.action == "select_preview" {
+                match (demand.as_ref(), req.source.as_ref()) {
+                    (Some(demand), Some(source)) => {
+                        let Some(lease) = demand.preview_lease(source, "switcher:me1:pvw") else {
+                            state.idempotency.release(Some(key), &op);
+                            return Err(ControlError::Conflict(
+                                "preview source lease unavailable (unknown source or lease limit)"
+                                    .into(),
+                            ));
+                        };
+                        Some(crate::source_demand::SwitcherPreviewLease::new(lease))
+                    }
+                    (None, _) => None,
+                    (_, None) => {
+                        state.idempotency.release(Some(key), &op);
+                        return Err(ControlError::Validation("preview source required".into()));
+                    }
+                }
+            } else {
+                None
+            };
+            if let Some(lease) = lease {
+                if state
+                    .switcher_preview_lease
+                    .hold(op.to_string(), lease)
+                    .is_err()
+                {
+                    state.idempotency.release(Some(key), &op);
+                    return Err(ControlError::EngineBusy);
+                }
+            }
             if handle
                 .try_send(SwitcherCommand {
                     operation_id: op.to_string(),
@@ -286,6 +306,7 @@ pub(crate) async fn submit_switcher(
                 })
                 .is_err()
             {
+                state.switcher_preview_lease.resolve(op.as_str(), false);
                 state.idempotency.release(Some(key), &op);
                 return Err(ControlError::EngineBusy);
             }

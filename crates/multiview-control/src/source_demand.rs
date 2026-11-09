@@ -175,6 +175,93 @@ pub enum StopRefusal {
 /// A held demand. Dropping it releases the demand.
 pub trait SourceDemandLease: Send + Sync {}
 
+/// Sized RAII wrapper for one sustained M/E PVW lease. The backing store owns
+/// only this one latest handle; replacing it releases the old source after the
+/// new source has already been acquired (make-before-break).
+pub struct SwitcherPreviewLease {
+    /// Keep the on-demand producer wanted until the M/E arms another source.
+    #[allow(dead_code)]
+    lease: Box<dyn SourceDemandLease>,
+}
+
+impl SwitcherPreviewLease {
+    /// Wrap an acquired preview lease for the shared latest-state cell.
+    #[must_use]
+    pub fn new(lease: Box<dyn SourceDemandLease>) -> Self {
+        Self { lease }
+    }
+}
+
+/// Control-only bounded two-phase lease owner. `pending` leases remain held
+/// until the engine reports their exact operation as applied; a rejected
+/// command releases its new lease and preserves the previous active PVW lease.
+#[derive(Default)]
+pub struct SwitcherPreviewLeases {
+    current: std::sync::Mutex<Option<SwitcherPreviewLease>>,
+    pending: std::sync::Mutex<std::collections::HashMap<String, SwitcherPreviewLease>>,
+}
+
+impl SwitcherPreviewLeases {
+    /// Maximum outstanding PVW selections; a command storm is shed at the edge.
+    pub const MAX_PENDING: usize = 64;
+
+    /// Install the initial selected preview source before starting the engine.
+    pub fn seed(&self, lease: SwitcherPreviewLease) {
+        *self
+            .current
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(lease);
+    }
+
+    /// Retain an accepted operation's new lease. Control-plane-only locks never
+    /// touch the output tick. A full table refuses new admission.
+    ///
+    /// # Errors
+    /// Returns the lease unchanged when 64 requests already await outcomes.
+    pub fn hold(
+        &self,
+        id: String,
+        lease: SwitcherPreviewLease,
+    ) -> Result<(), SwitcherPreviewLease> {
+        let mut pending = self
+            .pending
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if pending.len() >= Self::MAX_PENDING {
+            return Err(lease);
+        }
+        pending.insert(id, lease);
+        Ok(())
+    }
+
+    /// Resolve the actual terminal engine outcome; a failed operation never
+    /// changes the active PVW. A successful one replaces only after receipt.
+    pub fn resolve(&self, id: &str, applied: bool) {
+        let lease = self
+            .pending
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(id);
+        if applied {
+            if let Some(lease) = lease {
+                *self
+                    .current
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(lease);
+            }
+        }
+    }
+
+    /// Count pending selections for tests/observability.
+    #[must_use]
+    pub fn pending_count(&self) -> usize {
+        self.pending
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .len()
+    }
+}
+
 /// The demand surface the binary provides.
 pub trait SourceDemandProvider: Send + Sync {
     /// The demand state of `id`. An unknown or unconsumed source is idle.
