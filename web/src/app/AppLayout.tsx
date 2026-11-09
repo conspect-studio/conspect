@@ -1,6 +1,15 @@
 // The application shell: skip link, sidebar (desktop rail + mobile drawer),
-// header with connection status + theme/locale controls, and the routed Outlet.
+// a touch-friendly responsive header, the banner stack, and the routed Outlet.
 // Focus is moved to the main heading on route change (SC 2.4.3).
+//
+// Header status (production-health-contract.md): ONE status line — the
+// broadcast ProducerStatus — whose management chip carries the realtime
+// connection word (the exact strings ConnectionStatus shows) while the
+// PRODUCER verdict stays UNKNOWN: the engine exposes no output-tick feed,
+// so a connected management plane is never decoded-media-health proof. The
+// old standalone ConnectionStatus chip was folded into that line to avoid a
+// duplicate status surface; the words, text+glyph pairing and polite live
+// region all remain (MonitoringPage/SystemPage still render the chip).
 import { useEffect, useRef, useState } from "react";
 import type { JSX } from "react";
 import { Trans, useLingui } from "@lingui/react/macro";
@@ -13,7 +22,7 @@ import {
   LicenceChip,
   PendingActionStrip,
 } from "../components/account/chrome";
-import { ConnectionStatus } from "../components/ConnectionStatus";
+import { ProducerStatus } from "../components/broadcast";
 import { HealthBanner } from "../components/HealthBanner";
 import { LocaleSwitcher } from "../components/LocaleSwitcher";
 import { SystemFooter } from "../components/SystemFooter";
@@ -42,6 +51,18 @@ export function AppLayout(): JSX.Element {
     mainRef.current?.focus();
   }, [location.pathname]);
 
+  // The management plane's own connection word — exactly the strings the
+  // ConnectionStatus badge maps — passed to the producer line as its own
+  // SEPARATE chip. It never feeds the producer verdict.
+  const managementLabel =
+    status === "open"
+      ? t`Connected`
+      : status === "connecting"
+        ? t`Connecting`
+        : status === "reconnecting"
+          ? t`Reconnecting`
+          : t`Disconnected`;
+
   return (
     <div className="min-h-dvh bg-background text-foreground">
       <a
@@ -60,12 +81,21 @@ export function AppLayout(): JSX.Element {
         </aside>
 
         <div className="flex min-w-0 flex-1 flex-col">
-          <header className="flex h-14 items-center gap-2 border-b bg-card px-4">
+          {/* Touch-friendly, responsive header. `min-h-14` keeps every row at
+              least 48px while `flex-wrap` lets the producer line take its own
+              full-width row at 320–390px instead of clipping; the drawer key
+              keeps the broadcast 48px touch floor (`size-12`). */}
+          <header className="flex min-h-14 flex-wrap items-center gap-x-2 gap-y-1 border-b bg-card px-4">
             {/* Mobile drawer trigger. */}
             <div className="md:hidden">
               <Dialog open={drawerOpen} onOpenChange={setDrawerOpen}>
                 <DialogTrigger asChild>
-                  <Button variant="ghost" size="icon" aria-label={t`Open navigation`}>
+                  <Button
+                    variant="ghost"
+                    size="icon"
+                    aria-label={t`Open navigation`}
+                    className="size-12"
+                  >
                     <Menu aria-hidden="true" />
                   </Button>
                 </DialogTrigger>
@@ -82,13 +112,26 @@ export function AppLayout(): JSX.Element {
               </Dialog>
             </div>
 
-            <div className="ms-auto flex items-center gap-2">
+            {/* Header controls cluster. On touch widths it stays on the first
+                row (right-aligned); at md+ it sits at the header's end. */}
+            <div className="ms-auto flex items-center gap-2 md:order-2">
               {/* Account-side licence chip: links to claim (unclaimed) or the
                   licence screen (claimed); colour paired with text. */}
               <LicenceChip />
-              <ConnectionStatus status={status} />
               <LocaleSwitcher />
               <ThemeToggle />
+            </div>
+
+            {/* The one status line: producer verdict + management chip. No
+                output-tick feed exists yet, so the producer input is honestly
+                UNKNOWN — no fabricated tick; the line wraps (min-w-0 +
+                break-words inside) and never clips at 320/390. */}
+            <div className="order-last min-w-0 basis-full md:order-1 md:basis-auto md:flex-1">
+              <ProducerStatus
+                state="unknown"
+                lastTickAt={null}
+                managementLabel={managementLabel}
+              />
             </div>
           </header>
 
