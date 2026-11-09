@@ -229,3 +229,6 @@ mod tests {
         assert_eq!(adapter.validate(&span), Err(Reject::Budget));
     }
 }
+
+/// Family-scoped retained serialized allocation reservations.
+pub mod allocation;

@@ -345,6 +345,12 @@ impl Drop for ChargedPayload {
 /// Reserve the complete serialized object before allocation. Its owner retains
 /// the original admission charge as well as the extra framing allocation.
 pub(crate) fn serialized_frame(packet: &crate::Packet) -> Result<bytes::Bytes, crate::Reject> {
+    serialized_frame_in(packet, None)
+}
+pub(crate) fn serialized_frame_in(
+    packet: &crate::Packet,
+    budget: Option<&crate::allocation::AllocationBudget>,
+) -> Result<bytes::Bytes, crate::Reject> {
     let timestamp = moq_net::Timestamp::new(packet.pts_us, moq_net::Timescale::MICRO)
         .map_err(|_| crate::Reject::Timestamp)?;
     let maximum = packet
@@ -352,6 +358,10 @@ pub(crate) fn serialized_frame(packet: &crate::Packet) -> Result<bytes::Bytes, c
         .len()
         .checked_add(8)
         .ok_or(crate::Reject::Budget)?;
+    let family_charge = budget
+        .map(|budget| budget.reserve(maximum))
+        .transpose()
+        .map_err(|_| crate::Reject::Budget)?;
     RETAINED_BYTES
         .try_update(Ordering::AcqRel, Ordering::Acquire, |used| {
             used.checked_add(maximum).filter(|sum| *sum <= GLOBAL_BYTES)
@@ -361,6 +371,7 @@ pub(crate) fn serialized_frame(packet: &crate::Packet) -> Result<bytes::Bytes, c
         data: Vec<u8>,
         _source: bytes::Bytes,
         charge: usize,
+        _family_charge: Option<crate::allocation::Reservation>,
     }
     impl AsRef<[u8]> for Serialized {
         fn as_ref(&self) -> &[u8] {
@@ -373,10 +384,15 @@ pub(crate) fn serialized_frame(packet: &crate::Packet) -> Result<bytes::Bytes, c
         }
     }
     let mut owner = Serialized {
-        data: Vec::with_capacity(maximum),
+        data: Vec::new(),
         _source: packet.payload.clone(),
         charge: maximum,
+        _family_charge: family_charge,
     };
+    owner
+        .data
+        .try_reserve_exact(maximum)
+        .map_err(|_| crate::Reject::Budget)?;
     hang::container::Frame {
         timestamp,
         payload: packet.payload.clone(),
