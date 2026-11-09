@@ -104,6 +104,44 @@ pub(crate) struct RenditionFamily {
 pub(crate) struct DynamicRegistryFactory(
     pub(crate) crate::output_window_registry::WindowSubscriptionSlot,
 );
+fn read_relay_endpoint(path: &std::path::Path) -> Result<url::Url, MoqReject> {
+    #[cfg(unix)]
+    let endpoint = {
+        use std::io::Read;
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(
+                i32::try_from(rustix::fs::OFlags::NOFOLLOW.bits())
+                    .map_err(|_| MoqReject::Unavailable)?,
+            )
+            .open(path)
+            .map_err(|_| MoqReject::Unavailable)?;
+        let meta = file.metadata().map_err(|_| MoqReject::Unavailable)?;
+        if !meta.is_file() || meta.permissions().mode() & 0o077 != 0 || meta.len() > 8192 {
+            return Err(MoqReject::Unavailable);
+        }
+        let mut value = String::new();
+        file.take(8193)
+            .read_to_string(&mut value)
+            .map_err(|_| MoqReject::Unavailable)?;
+        value.trim().to_owned()
+    };
+    #[cfg(not(unix))]
+    let endpoint: String = {
+        let _ = path;
+        return Err(MoqReject::Unavailable);
+    };
+    let endpoint = url::Url::parse(&endpoint).map_err(|_| MoqReject::Unavailable)?;
+    if endpoint.scheme() != "https"
+        || endpoint.host_str().is_none()
+        || endpoint.fragment().is_some()
+    {
+        return Err(MoqReject::Unavailable);
+    }
+    Ok(endpoint)
+}
+
 fn outgoing_principal(
     keys: &multiview_control::auth::ApiKeyStore,
     key_id: &str,
@@ -147,41 +185,7 @@ impl DynamicRegistryFactory {
         let (principal, generation) = outgoing_principal(&keys, &key_id)?;
         let path =
             std::env::var("MULTIVIEW_MOQ_RELAY_URL_FILE").map_err(|_| MoqReject::Unavailable)?;
-        #[cfg(unix)]
-        let endpoint = {
-            use std::io::Read;
-            use std::os::unix::fs::OpenOptionsExt;
-            use std::os::unix::fs::PermissionsExt;
-            let file = std::fs::OpenOptions::new()
-                .read(true)
-                .custom_flags(
-                    i32::try_from(rustix::fs::OFlags::NOFOLLOW.bits())
-                        .map_err(|_| MoqReject::Unavailable)?,
-                )
-                .open(path)
-                .map_err(|_| MoqReject::Unavailable)?;
-            let meta = file.metadata().map_err(|_| MoqReject::Unavailable)?;
-            if !meta.is_file() || meta.permissions().mode() & 0o077 != 0 || meta.len() > 8192 {
-                return Err(MoqReject::Unavailable);
-            }
-            let mut value = String::new();
-            file.take(8193)
-                .read_to_string(&mut value)
-                .map_err(|_| MoqReject::Unavailable)?;
-            value.trim().to_owned()
-        };
-        #[cfg(not(unix))]
-        let endpoint: String = {
-            let _ = path;
-            return Err(MoqReject::Unavailable);
-        };
-        let endpoint = url::Url::parse(&endpoint).map_err(|_| MoqReject::Unavailable)?;
-        if endpoint.scheme() != "https"
-            || endpoint.host_str().is_none()
-            || endpoint.fragment().is_some()
-        {
-            return Err(MoqReject::Unavailable);
-        }
+        let endpoint = read_relay_endpoint(std::path::Path::new(&path))?;
         if std::env::var("MULTIVIEW_MOQ_RELAY_PROTECTED")
             .ok()
             .is_some_and(|value| value != "false")
@@ -2216,5 +2220,54 @@ mod tests {
             outgoing_principal(&keys, "service"),
             Err(MoqReject::Forbidden)
         ));
+    }
+    #[test]
+    fn outgoing_read_only_identity_is_not_promoted_to_service_writer() {
+        let mut keys = multiview_control::auth::ApiKeyStore::new(b"test".to_vec());
+        let mut principal = global();
+        principal.role = Role::ReadOnly;
+        keys.register("reader", "test-only", principal);
+        assert!(matches!(
+            outgoing_principal(&keys, "reader"),
+            Err(MoqReject::Forbidden)
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn relay_url_file_requires_private_regular_inode_and_https() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+        let dir = std::env::temp_dir().join(format!("relay-url-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("endpoint");
+        std::fs::write(&path, "https://relay.invalid/publisher").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(read_relay_endpoint(&path).is_ok());
+        let link = dir.join("link");
+        let _ = std::fs::symlink_metadata(&link);
+        // Unique process-local link name avoids mutating another lane's fixture.
+        if !link.exists() {
+            symlink(&path, &link).unwrap();
+        }
+        assert!(read_relay_endpoint(&link).is_err());
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(read_relay_endpoint(&path).is_err());
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        std::fs::write(&path, "http://relay.invalid").unwrap();
+        assert!(read_relay_endpoint(&path).is_err());
+    }
+
+    #[tokio::test]
+    async fn outgoing_task_shutdown_awaits_worker_quiescence_once() {
+        let completed = Arc::new(AtomicBool::new(false));
+        let observed = completed.clone();
+        let (stop, mut stopped) = tokio::sync::watch::channel(false);
+        let worker = tokio::spawn(async move {
+            stopped.wait_for(|stop| *stop).await.unwrap();
+            tokio::task::yield_now().await;
+            observed.store(true, Ordering::Release);
+        });
+        OutgoingTask { stop, worker }.shutdown().await;
+        assert!(completed.load(Ordering::Acquire));
     }
 }
