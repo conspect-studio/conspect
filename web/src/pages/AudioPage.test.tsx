@@ -112,6 +112,34 @@ afterAll(() => {
   server.close();
 });
 
+it("locks every draft control until a gated PUT installs the canonical baseline", async () => {
+  let release!: () => void;
+  const gate = new Promise<void>((resolve) => { release = resolve; });
+  server.use(http.put("*/api/v1/audio-routing", async ({ request }) => {
+    lastPut = { body: await request.json(), ifMatch: request.headers.get("if-match") };
+    await gate;
+    return HttpResponse.json(ROUTING, { headers: { ETag: 'W/"8"' } });
+  }));
+  const user = userEvent.setup();
+  renderAudio();
+  const strip = (await screen.findAllByTestId("audio-strip"))[0]!;
+  await user.click(within(strip).getAllByTestId("audio-nudge")[1]!);
+  await user.click(screen.getByTestId("audio-save"));
+  await waitFor(() => { expect(lastPut).toBeDefined(); });
+  try {
+    expect(screen.getByText("Saving audio routing. Draft controls are locked until the save completes.")).toBeInTheDocument();
+    for (const control of document.querySelectorAll('fieldset input, fieldset select, fieldset textarea, fieldset button')) {
+      expect(control).toBeDisabled();
+    }
+    await user.click(within(strip).getByTestId("audio-mute"));
+    expect(within(strip).getByTestId("audio-mute")).toHaveAttribute("aria-pressed", "false");
+    expect(within(strip).getByTestId("audio-strip-readout")).toHaveTextContent("-2");
+  } finally { release(); }
+  await waitFor(() => { expect(screen.getByTestId("audio-save")).toBeEnabled(); });
+  expect(within(strip).getByTestId("audio-strip-readout")).toHaveTextContent("-3");
+  expect(screen.queryByTestId("audio-draft-summary")).not.toBeInTheDocument();
+});
+
 function renderAudio(): void {
   renderWithProviders(
     <MemoryRouter>

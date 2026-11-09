@@ -258,7 +258,7 @@ function ChannelStrip({
     <section
       data-testid="audio-strip"
       aria-label={t`Channel strip — ${label}`}
-      className="flex w-full min-w-0 flex-col gap-3 rounded-md border p-3"
+      className="flex w-full min-w-0 flex-col gap-2 rounded-md border p-3"
     >
       <header className="flex min-w-0 flex-col gap-1">
         <span
@@ -333,7 +333,7 @@ function ChannelStrip({
       </div>
 
       {/* ±1 / ±6 dB tap nudges (48 px), staged exactly like the drag. */}
-      <div className="flex items-center gap-1" data-testid="audio-nudges">
+      <div className="flex flex-wrap items-center gap-1" data-testid="audio-nudges">
         {([6, 1, -1, -6] as const).map((delta) => (
           <Button
             key={delta}
@@ -883,6 +883,8 @@ export function AudioPage(): JSX.Element {
     previousEtag?: string | undefined;
   } | undefined>(undefined);
   const nextRowId = useRef(0);
+  // Also guards events before React commits the disabled fieldset.
+  const saveLocked = useRef(false);
   const [draftRowIds, setDraftRowIds] = useState<readonly number[] | undefined>();
   const [conflicted, setConflicted] = useState(false);
   const [errors, setErrors] = useState<AudioFormErrors | undefined>(undefined);
@@ -938,6 +940,7 @@ export function AudioPage(): JSX.Element {
       : undefined;
 
   const update = (next: AudioFormState, nextIds: readonly number[] = rowIds): void => {
+    if (saveLocked.current) return;
     if (baseline === undefined && routing.data !== undefined && serverForm !== undefined) {
       setBaseline({ form: serverForm, etag: routing.data.etag, rowIds });
       nextRowId.current = Math.max(nextRowId.current, ...rowIds.map((id) => id + 1));
@@ -991,7 +994,7 @@ export function AudioPage(): JSX.Element {
   };
 
   const onSave = (): void => {
-    if (form === undefined || conflicted || queryDiverged) {
+    if (saveLocked.current || form === undefined || conflicted || queryDiverged) {
       return;
     }
     const validation = validateAudioForm(form);
@@ -1014,11 +1017,14 @@ export function AudioPage(): JSX.Element {
       return;
     }
     setErrors(undefined);
+    setStatus('idle');
+    saveLocked.current = true;
     const submitted = form;
     save.mutate(
       { document: audioFormToDocument(submitted), etag: baseline?.etag ?? routing.data?.etag },
       {
         onSuccess: (result): void => {
+          saveLocked.current = false;
           const canonical = audioFormFromDocument(result.state.routing);
           const canonicalIds = canonical.routes.map((_, index) => rowIds[index] ?? nextRowId.current++);
           setBaseline({ form: canonical, etag: result.etag, rowIds: canonicalIds, previousEtag: baseline?.etag ?? routing.data?.etag });
@@ -1030,6 +1036,7 @@ export function AudioPage(): JSX.Element {
           setOutputsUpdated(result.state.outputs_updated ?? []);
         },
         onError: (error): void => {
+          saveLocked.current = false;
           setStatus('error');
           if (error.status === 412) {
             setConflicted(true);
@@ -1054,20 +1061,6 @@ export function AudioPage(): JSX.Element {
         }
         actions={<div className="max-w-full min-w-0 [&_button]:max-w-full [&_button]:whitespace-normal [&_button]:break-words"><ExportConfigButton compact /></div>}
       />
-      <ApplySemanticsCallout
-        helpTo="/help/features#outputs"
-        helpLabel={t`How configuration applies`}
-        message={
-          <Trans>
-            Program mix gain, mute, and source membership apply on the next
-            audio tick with a short fade. New, removed, or renamed discrete
-            tracks can remain pending while the program mix applies live.
-            A changed output sample rate or unknown mixed source requires a
-            config export and restart. X-Multiview-Apply reports live, partial,
-            or restart.
-          </Trans>
-        }
-      />
 
       {routing.isPending || form === undefined ? (
         routing.isError ? (
@@ -1081,33 +1074,16 @@ export function AudioPage(): JSX.Element {
           </p>
         )
       ) : (
-        <div className="flex flex-col gap-6">
+        <fieldset disabled={save.isPending} aria-busy={save.isPending} className="flex min-w-0 flex-col gap-3">
           {errors?.program !== undefined ? (
             <p role="alert" className="text-sm text-destructive">
               <FieldErrorMessage code={errors.program} />
             </p>
           ) : null}
 
-          <div>
-            <Button type="button" variant="outline" className="h-12" aria-expanded={overviewOpen} onClick={(): void => { setOverviewOpen(!overviewOpen); }}>
-              <Trans>Whole mix overview</Trans>
-            </Button>
-          </div>
-          <div className={overviewOpen ? '' : 'hidden'}>
-          <MixOverview
-            form={form}
-            savedRows={form.routes.map((_, index) => savedRowFor(index))}
-            rowIds={rowIds}
-            diff={draftDiff}
-            sourceNames={sourceNames}
-            inputs={meter.inputs}
-            onRide={ride}
-          />
-          </div>
-
           {/* Touch-first surface (below xl): pinned chip picker + ONE
               focused strip — every channel stays one tap away in the
-              overview above (designer round 4). */}
+              overview below (designer round 4). */}
           {form.routes.length > 0 ? (
             <div
               role="group"
@@ -1229,6 +1205,23 @@ export function AudioPage(): JSX.Element {
             </section>
           ) : null}
 
+          <div>
+            <Button type="button" variant="outline" className="h-12" aria-expanded={overviewOpen} onClick={(): void => { setOverviewOpen(!overviewOpen); }}>
+              <Trans>Whole mix overview</Trans>
+            </Button>
+          </div>
+          <div className={overviewOpen ? '' : 'hidden'}>
+          <MixOverview
+            form={form}
+            savedRows={form.routes.map((_, index) => savedRowFor(index))}
+            rowIds={rowIds}
+            diff={draftDiff}
+            sourceNames={sourceNames}
+            inputs={meter.inputs}
+            onRide={ride}
+          />
+          </div>
+
           {/* The draft banner: what is pending, in the operator's words —
               never a claim that anything is applied. */}
           {draftDiff?.anyChanged ? (
@@ -1298,6 +1291,7 @@ export function AudioPage(): JSX.Element {
               </div>
             ) : null}
             <p role="status" aria-live="polite" className="text-sm">
+              {save.isPending ? <Trans>Saving audio routing. Draft controls are locked until the save completes.</Trans> : null}
               {status === 'live' ? (
                 <span className="text-muted-foreground">
                   <Trans>
@@ -1331,6 +1325,20 @@ export function AudioPage(): JSX.Element {
               ) : null}
             </p>
           </div>
+          <ApplySemanticsCallout
+            helpTo="/help/features#outputs"
+            helpLabel={t`How configuration applies`}
+            message={
+              <Trans>
+                Program mix gain, mute, and source membership apply on the next
+                audio tick with a short fade. New, removed, or renamed discrete
+                tracks can remain pending while the program mix applies live.
+                A changed output sample rate or unknown mixed source requires a
+                config export and restart. X-Multiview-Apply reports live, partial,
+                or restart.
+              </Trans>
+            }
+          />
           <OutputsUpdatedNote entries={outputsUpdated} />
 
           {/* Bus setup: the document-level configuration out of the operating
@@ -1380,7 +1388,7 @@ export function AudioPage(): JSX.Element {
               path (invariant #10). */}
           <ProgramMeters />
           <LoudnessMeter />
-        </div>
+        </fieldset>
       )}
     </div>
   );
