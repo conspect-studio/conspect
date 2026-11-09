@@ -247,6 +247,27 @@ describe('OutputsPage broadcast cards (configured facts)', () => {
 });
 
 describe('OutputsPage CRUD flow (card actions)', () => {
+  it('uses the touch scroll surface and preserves the edit payload and ETag', async () => {
+    let updated: { ifMatch: string | null; body: unknown } | undefined;
+    server.use(http.put('*/api/v1/outputs/program', async ({ request }) => {
+      updated = { ifMatch: request.headers.get('if-match'), body: await request.json() };
+      return HttpResponse.json(OUTPUTS[0], { headers: { ETag: '"2"' } });
+    }));
+    const user = userEvent.setup();
+    renderOutputs();
+    await user.click(await screen.findByRole('button', { name: 'Edit output: Program HLS' }));
+    const dialog = await screen.findByRole('dialog');
+    expect(dialog).toHaveClass('overflow-y-auto', 'max-h-[calc(100dvh-1rem)]');
+    expect(within(dialog).getByRole('button', { name: 'Close' })).toHaveClass('size-12');
+    const name = await within(dialog).findByLabelText('Name');
+    await user.clear(name);
+    await user.type(name, 'Renamed HLS');
+    await user.click(within(dialog).getByRole('button', { name: 'Save' }));
+    await waitFor(() => { expect(updated).toBeDefined(); });
+    expect(updated).toEqual({ ifMatch: '"1"', body: { name: 'Renamed HLS', body: { kind: 'hls', path: '/srv/index.m3u8', codec: 'h264' } } });
+    await waitFor(() => { expect(screen.queryByRole('dialog')).not.toBeInTheDocument(); });
+  });
+
   it('edit loads the record via GET and prefills the kind-specific fields', async () => {
     renderOutputs();
     await screen.findByTestId('output-card-program');

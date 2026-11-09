@@ -33,8 +33,11 @@ export const DialogOverlay = forwardRef<
 /** The dialog surface. Requires a `DialogTitle` for an accessible name. */
 export const DialogContent = forwardRef<
   ComponentRef<typeof DialogPrimitive.Content>,
-  ComponentPropsWithoutRef<typeof DialogPrimitive.Content>
->(function DialogContent({ className, children, ...props }, ref) {
+  ComponentPropsWithoutRef<typeof DialogPrimitive.Content> & {
+    /** Opt in to a viewport-contained, touch-sized, single scroll surface. */
+    touchScroll?: boolean;
+  }
+>(function DialogContent({ className, children, touchScroll = false, ...props }, ref) {
   return (
     <DialogPortal>
       <DialogOverlay />
@@ -42,13 +45,18 @@ export const DialogContent = forwardRef<
         ref={ref}
         className={cn(
           "fixed start-1/2 top-1/2 z-50 grid w-full max-w-lg -translate-x-1/2 -translate-y-1/2 gap-4 rounded-lg border bg-background p-6 shadow-lg rtl:translate-x-1/2",
+          touchScroll &&
+            "max-h-[calc(100dvh-1rem)] overflow-y-auto overscroll-contain [overflow-wrap:anywhere] [&>*]:min-w-0 [&_input]:min-h-12 [&_input]:min-w-0 [&_button]:min-h-12 [&_button]:min-w-12 [&_[role=combobox]]:min-w-0 [&_[role=combobox]>span]:min-w-0 [&_[role=combobox]>span]:whitespace-normal [&>div:first-child]:pe-12",
           className,
         )}
         {...props}
       >
         {children}
         <DialogPrimitive.Close
-          className="absolute end-4 top-4 rounded-sm opacity-70 transition-opacity hover:opacity-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+          className={cn(
+            "absolute end-4 top-4 rounded-sm opacity-70 transition-opacity hover:opacity-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring",
+            touchScroll && "inline-flex size-12 items-center justify-center",
+          )}
           aria-label="Close"
         >
           <X className="size-4" aria-hidden="true" />

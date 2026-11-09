@@ -329,7 +329,7 @@ function OutputKindFields({
               setForm({ ...form, path: next });
             }}
           />
-          <div className="grid grid-cols-3 gap-3">
+          <div className="grid grid-cols-1 gap-3 sm:grid-cols-3">
             <FormField
               id="output-part-ms"
               label={t`Part target (ms)`}
@@ -640,7 +640,7 @@ function DisplayKindFields({
         }}
       />
       {form.displayModeChoice === 'auto' ? null : (
-        <div className="grid grid-cols-3 gap-3">
+        <div className="grid grid-cols-1 gap-3 sm:grid-cols-3">
           <FormField
             id="output-display-width"
             label={t`Width (px)`}
@@ -882,7 +882,7 @@ function OutputAdvancedFields({
         }}
       />
       {form.gpuPinEnabled ? (
-        <div className="grid grid-cols-2 gap-3">
+        <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
           <SelectField<PinVendor>
             label={t`GPU vendor`}
             value={form.gpuPinVendor}
@@ -1255,7 +1255,7 @@ export function OutputsPage(): JSX.Element {
           }
         }}
       >
-        <DialogContent>
+        <DialogContent touchScroll>
           <DialogHeader>
             <DialogTitle>
               {creating ? <Trans>New output</Trans> : <Trans>Edit output</Trans>}
@@ -1273,7 +1273,7 @@ export function OutputsPage(): JSX.Element {
                 submitForm();
               }}
             >
-              <div className="flex max-h-[60vh] flex-col gap-4 overflow-y-auto pe-1">
+              <div className="flex min-w-0 flex-col gap-4">
                 {creating ? (
                   // Device decode targets (ADR-M009 facet (b)): picking one binds
                   // the new output to the device via device_ref.
@@ -1350,7 +1350,7 @@ export function OutputsPage(): JSX.Element {
           }
         }}
       >
-        <DialogContent>
+        <DialogContent touchScroll>
           <DialogHeader>
             <DialogTitle>
               <Trans>Delete this resource?</Trans>
