@@ -91,8 +91,17 @@ fn cold_preview_hold_preserves_program_cadence_then_exact_tick_cut() {
     for index in 0..9 {
         driver.drain_at_tick(tick(index));
         driver.commit_composed_tick(tick(index));
-        assert_eq!(handle.snapshot().unwrap().tick, index);
-        assert_eq!(handle.snapshot().unwrap().program.as_str(), "a");
+        // Every genuine composed frame advances the engine's authoritative
+        // applied tick, while the published state snapshot is change-only (its
+        // tick is the frame that last changed a bus) — the rollback/change-only
+        // publication contract the failed-take repair pinned.
+        assert_eq!(handle.applied_tick(), index);
+        let snapshot = handle.snapshot().unwrap();
+        assert_eq!(
+            snapshot.tick, 0,
+            "no bus changed, so no snapshot was republished"
+        );
+        assert_eq!(snapshot.program.as_str(), "a");
         assert!(
             events.try_recv().is_err(),
             "unprimed take cannot claim applied"

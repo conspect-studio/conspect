@@ -20,6 +20,35 @@ use crate::switcher::{SwitcherProjection, SwitcherState};
 
 /// Maximum command applications in one output frame.
 pub const MAX_COMMANDS_PER_TICK: usize = 16;
+
+/// Does this authored scene admit `source` on its bus?
+///
+/// A scene with exactly one full-canvas, fully opaque cell is the first slice's
+/// source-agnostic bus canvas: the M/E machine's selection decides which source
+/// fills it and the frame hook rebinds that one cell on every change, so the
+/// cell's placeholder source is not a membership rule. Every other (multi-cell
+/// or windowed) scene keeps the strict membership check: a source that is not
+/// authored into the scene is refused with a typed error rather than silently
+/// selected.
+#[allow(clippy::float_cmp)]
+// reason: these are authored layout fractions compared against their exact
+// canonical values (0.0/1.0) — an approximate comparison would admit a
+// windowed scene as "full canvas" and change which sources are admissible.
+fn scene_admits_source(scene: &Layout, source: &str) -> bool {
+    if scene
+        .cells
+        .iter()
+        .any(|cell| cell.source.as_deref() == Some(source))
+    {
+        return true;
+    }
+    match scene.cells.as_slice() {
+        [cell] => {
+            cell.x == 0.0 && cell.y == 0.0 && cell.w == 1.0 && cell.h == 1.0 && cell.opacity == 1.0
+        }
+        _ => false,
+    }
+}
 /// Maximum queued commands, including unresponsive data-plane scenarios.
 pub const COMMAND_CAPACITY: usize = 64;
 
@@ -159,7 +188,9 @@ impl SwitcherControl {
     /// # Errors
     /// Returns the command unchanged if the bounded mailbox is full or closed.
     pub fn try_send(&self, command: SwitcherCommand) -> Result<(), SwitcherCommand> {
-        self.tx.try_send(command).map_err(|err| err.into_inner())
+        self.tx
+            .try_send(command)
+            .map_err(tokio::sync::mpsc::error::TrySendError::into_inner)
     }
 
     /// Publish an immutable pair after validating its layout geometry. This is
@@ -334,6 +365,12 @@ impl SwitcherTickDriver {
     /// Process at most 16 queued commands, then advance the exact-tick machine;
     /// always produces one snapshot even if a client wedges or a command fails.
     /// The caller composes the resulting PGM/PVW scene on this same `tick`.
+    #[allow(clippy::too_many_lines)]
+    // reason: one flat, linear per-tick drain: the pending-take prime deadline,
+    // then the bounded command match (SelectPreview/SelectProgram/Cut/Auto) and
+    // its staged/held/failed arms. Splitting it would move the all-or-nothing
+    // per-tick staging state (`before_staged`/`staged_success`) behind one-use
+    // helpers and hide the single-tick atomicity this test set pins.
     pub fn drain_at_tick(&mut self, tick: Tick) -> SwitcherProjection {
         self.last_tick = tick.index;
         let mut projection = self.machine.sample(tick);
@@ -402,18 +439,13 @@ impl SwitcherTickDriver {
                 match &command.verb {
                     SwitcherVerb::SelectPreview(source) => {
                         if let Some(pair) = &scenes {
-                            if !pair
-                                .preview
-                                .cells
-                                .iter()
-                                .any(|cell| cell.source.as_deref() == Some(source.as_str()))
-                            {
-                                Err("preview source is absent from the active scene".into())
-                            } else {
+                            if scene_admits_source(&pair.preview, source.as_str()) {
                                 self.machine
                                     .set_preview(source.clone())
                                     .map(|()| self.machine.sample(tick))
                                     .map_err(|e| e.to_string())
+                            } else {
+                                Err("preview source is absent from the active scene".into())
                             }
                         } else {
                             Err("no active PGM/PVW scene provider".into())
@@ -421,15 +453,10 @@ impl SwitcherTickDriver {
                     }
                     SwitcherVerb::SelectProgram(source) => {
                         if let Some(pair) = &scenes {
-                            if !pair
-                                .program
-                                .cells
-                                .iter()
-                                .any(|cell| cell.source.as_deref() == Some(source.as_str()))
-                            {
-                                Err("program source is absent from the active scene".into())
-                            } else {
+                            if scene_admits_source(&pair.program, source.as_str()) {
                                 Ok(self.machine.punch(source.clone()))
+                            } else {
+                                Err("program source is absent from the active scene".into())
                             }
                         } else {
                             Err("no active PGM/PVW scene provider".into())
@@ -506,7 +533,7 @@ impl SwitcherTickDriver {
                     }
                 }
                 Err(error) => {
-                    self.publish_outcome(command.operation_id, tick.index, false, Some(error))
+                    self.publish_outcome(command.operation_id, tick.index, false, Some(error));
                 }
             }
         }

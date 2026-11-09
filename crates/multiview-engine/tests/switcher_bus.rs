@@ -55,6 +55,10 @@ fn drive(
 }
 
 #[test]
+#[allow(clippy::too_many_lines)]
+// reason: one linear dual-bus proof (two drives, one tick, shared stores, no
+// PGM/PVW substitution) whose setup is the fixture; splitting it would hide the
+// single-tick relationship it pins.
 fn two_buses_share_source_stores_and_tick_without_pgm_fallback() {
     let thresholds = TileThresholds::from_millis(500, 2000, 10000).unwrap();
     let a = Arc::new(TileStore::<Nv12Image>::new(

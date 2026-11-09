@@ -114,13 +114,13 @@ fn commands_apply_only_at_exact_tick_and_reject_overload_before_202() {
     assert_eq!(handle.snapshot().unwrap().tick, 5);
     assert_eq!(
         handle.snapshot().unwrap().completion_count,
-        MAX_COMMANDS_PER_TICK as u64
+        u64::try_from(MAX_COMMANDS_PER_TICK).unwrap()
     );
     driver.drain_at_tick(tick(6));
     driver.commit_composed_tick(tick(6));
     assert_eq!(
         handle.snapshot().unwrap().completion_count,
-        (MAX_COMMANDS_PER_TICK * 2) as u64
+        u64::try_from(MAX_COMMANDS_PER_TICK * 2).unwrap()
     );
 }
 
@@ -241,4 +241,75 @@ fn cut_interrupts_auto_with_correlated_failure_and_new_success() {
     assert!(cut.event.completed);
     driver.drain_at_tick(tick(25));
     assert!(outcomes.try_recv().is_err());
+}
+
+/// The first slice's one-full-canvas-cell scene is a source-agnostic bus canvas:
+/// the M/E selection decides which source fills it (the frame hook rebinds that
+/// single cell), so a source that is not the authored placeholder is admitted —
+/// while a multi-cell scene keeps the strict membership rule and refuses an
+/// unauthored source with a typed error instead of drawing it into a tile it was
+/// never placed in.
+#[test]
+fn single_full_canvas_scene_is_source_agnostic_but_multi_cell_scenes_are_not() {
+    let (handle, mut driver) = pair();
+    set_scenes(&handle);
+    let mut outcomes = handle.outcomes();
+
+    handle
+        .try_send(command(1, SwitcherVerb::SelectPreview(source("c"))))
+        .unwrap();
+    driver.drain_at_tick(tick(0));
+    driver.commit_composed_tick(tick(0));
+    let preview = outcomes.try_recv().unwrap();
+    assert!(
+        preview.event.completed,
+        "a full-canvas scene admits any selected source: {:?}",
+        preview.event.error
+    );
+
+    handle
+        .try_send(command(2, SwitcherVerb::SelectProgram(source("c"))))
+        .unwrap();
+    driver.drain_at_tick(tick(1));
+    driver.commit_composed_tick(tick(1));
+    let program = outcomes.try_recv().unwrap();
+    assert!(
+        program.event.completed,
+        "a full-canvas scene admits any punched source: {:?}",
+        program.event.error
+    );
+
+    handle
+        .set_scenes(ScenePair {
+            version: 2,
+            program: scene(&["a", "c"]),
+            preview: scene(&["a", "b"]),
+        })
+        .unwrap();
+    handle
+        .try_send(SwitcherCommand {
+            operation_id: "3".into(),
+            scene_version: 2,
+            verb: SwitcherVerb::SelectPreview(source("c")),
+        })
+        .unwrap();
+    driver.drain_at_tick(tick(2));
+    let refused = outcomes.try_recv().unwrap();
+    assert!(!refused.event.completed);
+    assert!(
+        refused
+            .event
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("absent from the active scene")),
+        "a multi-cell scene must refuse an unauthored source: {:?}",
+        refused.event.error
+    );
+    assert_eq!(
+        handle
+            .snapshot()
+            .map(|snapshot| snapshot.preview.as_str().to_owned()),
+        Some("c".to_owned()),
+        "a refused selection never changes the effective bus"
+    );
 }
