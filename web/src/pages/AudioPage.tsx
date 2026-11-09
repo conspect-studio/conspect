@@ -301,11 +301,14 @@ function ChannelStrip({
         )}
       </p>
 
+      {/* At tablet widths, put the keys beside the full-height fader rather
+          than below it. Keep source/focus order and the 48 px target floor. */}
+      <div data-testid="audio-strip-essential" className="flex min-w-0 flex-col gap-2 md:max-xl:grid md:max-xl:grid-cols-2 md:max-xl:items-center">
       {/* The fader: ticks, knob and readout share ONE linear dB mapping; the
           48 px knob hit box travels a 240 px track; 0 dB is at the TOP. The
           range is a display bound only — the readout above carries the exact
           draft, and the Details field accepts any finite value. */}
-      <div className="flex items-end justify-center gap-2">
+      <div className="flex items-end justify-center gap-2 md:max-xl:row-span-2">
         <div className="relative h-60 w-7" aria-hidden="true">
           {GAIN_SCALE_TICKS_DB.map((tick) => (
             <span
@@ -411,6 +414,8 @@ function ChannelStrip({
             {delta > 0 ? `+${String(delta)}` : `−${String(Math.abs(delta))}`}
           </Button>
         ))}
+      </div>
+
       </div>
 
       {/* Reserved local Undo region: the strip-scoped draft revert appears in

@@ -202,6 +202,21 @@ describe("AudioPage", () => {
     expect(fader.compareDocumentPosition(mute) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
     expect(fader.compareDocumentPosition(nudges) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
     expect(fader).toHaveClass("h-12", "w-60");
+    // Tablet first-fold contract: all essential keys share the fader's two
+    // rows, not a stack below its 240 px track. Browser evidence also checks
+    // every control's rectangle and hit target against the fixed footer.
+    const essential = within(focused).getByTestId("audio-strip-essential");
+    expect(essential).toHaveClass("flex-col", "md:max-xl:grid", "md:max-xl:grid-cols-2");
+    expect(fader.parentElement?.parentElement).toHaveClass("md:max-xl:row-span-2");
+    const pgm = within(essential).getByTestId("audio-pgm");
+    expect(within(essential).getByTestId("audio-mute")).toBe(mute);
+    expect(mute.compareDocumentPosition(pgm) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    expect(pgm.compareDocumentPosition(nudges) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    expect(mute).toHaveClass("h-12", "min-w-12");
+    expect(pgm).toHaveClass("h-12", "min-w-12");
+    for (const nudge of within(essential).getAllByTestId("audio-nudge")) {
+      expect(nudge).toHaveClass("size-12");
+    }
     expect(screen.getByRole("heading", { name: "Channel strip" })).toHaveClass("sr-only");
     const context = screen.getByTestId("audio-page-context");
     expect(focused.compareDocumentPosition(context) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
