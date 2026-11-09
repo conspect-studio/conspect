@@ -5029,6 +5029,13 @@ impl ConsumerHotSource {
 /// consumer receives [`StreamItem`]s over the bounded hot queue, bakes each into
 /// an `Arc<Nv12Image>`, and fans it (blocking send — off the hot path, so it can
 /// only pace the consumer, never the engine) to each sink's bounded channel.
+struct WindowSlotGuard(crate::output_window_registry::WindowSubscriptionSlot);
+impl Drop for WindowSlotGuard {
+    fn drop(&mut self) {
+        self.0.store(None);
+    }
+}
+
 struct StreamEgress {
     consumer: JoinHandle<Result<Vec<crate::binding_delivery::BindingStatus>, PipelineError>>,
     /// The consumer sets this before it drops the hot receiver on a fatal error.
@@ -5217,8 +5224,10 @@ impl StreamEgress {
         // drops its captured guard and wakes any hub producer already waiting.
         let consumer_guard = audio_route.as_ref().map(|route| route.consumer_guard());
         let builder = std::thread::Builder::new().name("multiview-bake-consumer".to_owned());
+        let window_slot_guard = WindowSlotGuard(window_subscriptions);
         let consumer = builder
             .spawn(move || {
+                let _window_slot_guard = window_slot_guard;
                 let _consumer_guard = consumer_guard;
                 // The hot receive end the consumer pulls: the real bounded queue,
                 // or — under the fatal-consumer regression seam — a counting
