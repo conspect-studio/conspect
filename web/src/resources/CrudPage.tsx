@@ -140,6 +140,12 @@ export interface CrudPageProps<View, Form, Field extends string> {
     onEdit: (row: View) => void,
     onDelete: (row: View) => void,
   ) => ColumnDef<View>[];
+  /** Optional list presentation; scaffold retains loading, error and empty states. */
+  readonly renderItems?: (
+    rows: readonly View[],
+    onEdit: (row: View) => void,
+    onDelete: (row: View) => void,
+  ) => ReactNode;
   /** A fresh, empty form for a create. */
   readonly emptyForm: () => Form;
   /**
@@ -324,6 +330,8 @@ export function CrudPage<View, Form, Field extends string>(
         <p role="alert" className="text-sm text-destructive">
           {props.errorPrefix} {props.errorMessage ?? ''}
         </p>
+      ) : props.renderItems !== undefined && props.list.length > 0 ? (
+        props.renderItems(props.list, openEdit, setPendingDelete)
       ) : (
         <ResourceTable
           rows={props.list}

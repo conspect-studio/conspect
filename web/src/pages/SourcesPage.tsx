@@ -11,7 +11,6 @@ import { useState } from 'react';
 import type { JSX } from 'react';
 import { Link, useLocation } from 'react-router-dom';
 import { Trans, useLingui } from '@lingui/react/macro';
-import type { ColumnDef } from '@tanstack/react-table';
 
 import { useSources } from '../resources/queries';
 import type { SaveResourceVars } from '../resources/queries';
@@ -52,7 +51,7 @@ import type {
   SourceActivationChoice,
   WallClockChoice,
 } from '../resources/forms';
-import { CrudPage, KindCell, NameCell, RowActions } from '../resources/CrudPage';
+import { CrudPage, KindCell } from '../resources/CrudPage';
 import { SourcePreviewButton } from '../preview/SourcePreviewButton';
 import { SourceEventsButton } from '../events/SourceEventsButton';
 import {
@@ -81,7 +80,8 @@ import { SourceLifecycleActions } from '../components/SourceLifecycleActions';
 import { useSourceStatus } from '../api/sourceStatus';
 import type { SourceDemand } from '../api/sourceStatus';
 import { useSystemCapabilities } from '../api/systemQueries';
-import { Info, TriangleAlert } from 'lucide-react';
+import { Info, Pencil, Trash2, TriangleAlert } from 'lucide-react';
+import { TaskWorkspace, TouchAction } from '../components/broadcast';
 
 /** The form-kind options offered in the picker (no legacy alias). */
 const FORM_KINDS: readonly SourceFormKind[] = SOURCE_KINDS.filter(
@@ -123,7 +123,7 @@ function SourceStatusCell({
   const running = demand !== undefined && (demand.video_running || demand.audio_running);
   return (
     <span className="inline-flex flex-wrap items-center gap-1.5">
-      <SourceDemandBadge demand={demand} />
+      {demand !== undefined ? <SourceDemandBadge demand={demand} /> : <span>—</span>}
       {running && tile !== undefined ? <TileStateBadge state={tile.state} /> : null}
       <SourceLifecycleActions id={id} name={name} demand={demand} />
     </span>
@@ -1079,104 +1079,78 @@ export function SourcesPage(): JSX.Element {
     setSeed({ key: incoming.ts, creating: true, form: incoming.form });
   }
 
-  const columns = (
+  // Keep row identity and the original action components: their permissions,
+  // live status queries and mutations remain the source of truth.
+  const renderItems = (
+    rows: readonly SourceView[],
     onEdit: (row: SourceView) => void,
     onDelete: (row: SourceView) => void,
-  ): ColumnDef<SourceView>[] => [
-    {
-      accessorKey: 'name',
-      header: t`Name`,
-      cell: (ctx): JSX.Element => <NameCell value={ctx.row.original.name} />,
-    },
-    {
-      accessorKey: 'kind',
-      header: t`Kind`,
-      cell: (ctx): JSX.Element => <KindCell value={ctx.row.original.rawKind} />,
-    },
-    {
-      accessorKey: 'locator',
-      header: t`Locator`,
-      cell: (ctx): JSX.Element => (
-        <code className="text-xs text-muted-foreground" lang="" dir="auto">
-          {ctx.row.original.locator ?? '—'}
-        </code>
-      ),
-    },
-    {
-      id: 'status',
-      header: (): JSX.Element => (
-        <span className="inline-flex items-center gap-1.5">
-          <Trans>Status</Trans>
-          <HelpLink
-            to="/help/concepts/resilience#tile-lifecycle"
-            label={t`About tile lifecycle states`}
-            compact
-          />
-        </span>
-      ),
-      cell: (ctx): JSX.Element => (
-        <SourceStatusCell
-          id={ctx.row.original.id}
-          name={ctx.row.original.name}
-          tile={tileForSource(tiles, ctx.row.original.id)}
-          demand={demand.data?.get(ctx.row.original.id)}
-        />
-      ),
-    },
-    {
-      id: 'link',
-      header: t`Link`,
-      cell: (ctx): JSX.Element => (
-        <div className="flex flex-col gap-1">
-          <LinkCell link={linkBySource.get(ctx.row.original.id)} />
-          <LinkActions
-            sourceId={ctx.row.original.id}
-            sourceName={ctx.row.original.name}
-            locator={ctx.row.original.locator}
-            link={linkBySource.get(ctx.row.original.id)}
-          />
-          <SourceNetworkAction sourceId={ctx.row.original.id} sourceName={ctx.row.original.name} />
-        </div>
-      ),
-    },
-    {
-      id: 'preview',
-      header: t`Preview`,
-      cell: (ctx): JSX.Element => <SourcePreviewButton id={ctx.row.original.id} name={ctx.row.original.name} />,
-    },
-    {
-      id: 'events',
-      header: t`Events`,
-      cell: (ctx): JSX.Element => (
-        <SourceEventsButton
-          id={ctx.row.original.id}
-          name={ctx.row.original.name}
-          eventObservation={ctx.row.original.eventObservation}
-        />
-      ),
-    },
-    {
-      id: 'actions',
-      header: t`Actions`,
-      cell: (ctx): JSX.Element => (
-        <RowActions
-          row={ctx.row.original}
-          name={ctx.row.original.name}
-          editLabel={t`Edit source`}
-          deleteLabel={t`Delete source`}
-          editDisabledReason={
-            ctx.row.original.editable
-              ? undefined
-              : t`kind "${ctx.row.original.rawKind}" isn't editable in this UI; the document is preserved as authored`
-          }
-          onEdit={onEdit}
-          onDelete={onDelete}
-        />
-      ),
-    },
-  ];
+  ): JSX.Element => (
+    <section aria-label={t`Configured ingest sources.`} className="grid min-w-0 grid-cols-1 gap-4 xl:grid-cols-2">
+      {rows.map((source) => {
+        const editReason = source.editable
+          ? undefined
+          : t`kind "${source.rawKind}" isn't editable in this UI; the document is preserved as authored`;
+        return (
+          <article key={source.id} data-testid={`source-card-${source.id}`} className="min-w-0 break-words">
+            <TaskWorkspace
+              title={
+                <span className="flex min-w-0 flex-wrap items-baseline gap-x-2">
+                  <span lang="" dir="auto" className="min-w-0 break-all">{source.name}</span>
+                  <code lang="" dir="auto" className="min-w-0 break-all text-xs text-muted-foreground">{source.id}</code>
+                  <KindCell value={source.rawKind} />
+                </span>
+              }
+              status={
+                <div className="flex min-w-0 flex-col gap-2">
+                  <div className="flex flex-wrap items-center gap-2">
+                    <Trans>Status</Trans>
+                    <HelpLink to="/help/concepts/resilience#tile-lifecycle" label={t`About tile lifecycle states`} compact />
+                  </div>
+                  <SourceStatusCell id={source.id} name={source.name} tile={tileForSource(tiles, source.id)} demand={demand.data?.get(source.id)} />
+                </div>
+              }
+            >
+              <div className="grid min-w-0 gap-4">
+                <div className="min-w-0 text-sm">
+                  <span className="text-muted-foreground"><Trans>Locator</Trans>: </span>
+                  <code lang="" dir="auto" className="break-all text-xs">{source.locator ?? '—'}</code>
+                </div>
+                <div className="flex min-w-0 flex-wrap items-start gap-2">
+                  <SourcePreviewButton id={source.id} name={source.name} />
+                  <SourceEventsButton id={source.id} name={source.name} eventObservation={source.eventObservation} />
+                  <TouchAction
+                    variant="outline"
+                    aria-label={editReason === undefined ? `${t`Edit source`}: ${source.name}` : `${t`Edit source`}: ${source.name} — ${editReason}`}
+                    aria-disabled={!source.editable}
+                    title={editReason}
+                    className="min-h-12"
+                    onPress={(): void => { if (source.editable) { onEdit(source); } }}
+                  >
+                    <Pencil aria-hidden="true" /><Trans>Edit</Trans>
+                  </TouchAction>
+                  <TouchAction variant="ghost" className="min-h-12" aria-label={`${t`Delete source`}: ${source.name}`} onPress={(): void => { onDelete(source); }}>
+                    <Trash2 aria-hidden="true" /><Trans>Delete</Trans>
+                  </TouchAction>
+                </div>
+                {editReason !== undefined ? <p className="text-sm text-muted-foreground">{editReason}</p> : null}
+                <div className="grid min-w-0 gap-2 border-t pt-3 text-sm">
+                  <LinkCell link={linkBySource.get(source.id)} />
+                  <div className="flex min-w-0 flex-wrap items-start gap-2">
+                    <LinkActions sourceId={source.id} sourceName={source.name} locator={source.locator} link={linkBySource.get(source.id)} />
+                    <SourceNetworkAction sourceId={source.id} sourceName={source.name} />
+                  </div>
+                </div>
+              </div>
+            </TaskWorkspace>
+          </article>
+        );
+      })}
+    </section>
+  );
 
   return (
+    <div className="min-w-0 [&_button]:min-h-12 [&_button]:min-w-12 [&_button]:h-auto [&_button]:whitespace-normal [&_a]:min-h-12 [&_a]:whitespace-normal [&_a]:break-words [&>div:first-child>div:last-child]:flex-wrap [&>div:first-child>div:last-child]:min-w-0 [&>div:first-child>div:last-child]:max-w-full">
     <CrudPage<SourceView, SourceFormState, SourceField>
       kind="sources"
       title={<Trans>Sources</Trans>}
@@ -1230,7 +1204,8 @@ export function SourcesPage(): JSX.Element {
       isPending={sources.isPending}
       isError={sources.isError}
       errorMessage={sources.error?.message}
-      columns={columns}
+      columns={() => []}
+      renderItems={renderItems}
       rowId={(row): string => row.id}
       rowName={(row): string => row.name}
       emptyForm={emptySourceForm}
@@ -1291,5 +1266,6 @@ export function SourcesPage(): JSX.Element {
         </>
       )}
     />
+    </div>
   );
 }
