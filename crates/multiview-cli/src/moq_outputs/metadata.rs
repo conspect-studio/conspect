@@ -601,3 +601,27 @@ pub fn configure_optional_preview(
     );
     Ok(())
 }
+
+#[cfg(test)]
+mod measured_config_tests {
+    use super::MeasuredPreviewConfig;
+    #[test]
+    fn unknown_measured_config_fields_do_not_become_capacity_defaults() {
+        let source = r#"{"parent_output":"out","production":[],"requests":[],"capacity":null,"measured":[],"audio_once_bps":0,"overhead_bps":0,"invented":1}"#;
+        assert!(serde_json::from_str::<MeasuredPreviewConfig>(source).is_err());
+    }
+    #[test]
+    fn absent_capacity_and_measurements_fail_engine_constructor() {
+        let source = r#"{"parent_output":"out","production":[],"requests":[],"capacity":null,"measured":[],"audio_once_bps":0,"overhead_bps":0}"#;
+        let config: MeasuredPreviewConfig = serde_json::from_str(source).unwrap();
+        assert!(config.into_startup().is_none());
+    }
+    #[test]
+    fn malformed_typed_cadence_is_not_interpreted_as_default() {
+        let source = r#"{"profile_id":"p","key":{"program":"main","bus":"main","codec":"h264","encoder_name":"libx264","width":64,"height":64,"cadence":"invalid","bitrate_bps":100000,"codec_profile":null,"pixel_format":"yuv420p","color":"sdr-bt709-limited","gpu_pin":null,"codec_config":null}}"#;
+        assert!(
+            serde_json::from_str::<multiview_config::preview_ladder::PreviewRequest>(source)
+                .is_err()
+        );
+    }
+}
