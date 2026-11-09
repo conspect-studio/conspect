@@ -114,7 +114,7 @@ export function AppLayout(): JSX.Element {
 
             {/* Header controls cluster. On touch widths it stays on the first
                 row (right-aligned); at md+ it sits at the header's end. */}
-            <div className="ms-auto flex items-center gap-2 md:order-2">
+            <div className="ms-auto flex min-w-0 max-w-full flex-wrap items-center justify-end gap-2 md:order-2">
               {/* Account-side licence chip: links to claim (unclaimed) or the
                   licence screen (claimed); colour paired with text. */}
               <LicenceChip />
@@ -159,7 +159,7 @@ export function AppLayout(): JSX.Element {
             id="main-content"
             ref={mainRef}
             tabIndex={-1}
-            className="flex-1 scroll-mt-16 p-4 focus-visible:outline-none md:p-6"
+            className="min-w-0 flex-1 scroll-mt-16 p-4 focus-visible:outline-none md:p-6"
           >
             <Outlet />
           </main>

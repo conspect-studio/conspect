@@ -32,7 +32,7 @@ export function LocaleSwitcher(): JSX.Element {
         }
       }}
     >
-      <SelectTrigger className="w-40" aria-label={t`Language`}>
+      <SelectTrigger className="h-auto min-h-12 min-w-12 w-40 max-w-full flex-wrap whitespace-normal [&>span]:line-clamp-none [&>span]:min-w-0 [&>span]:break-words" aria-label={t`Language`}>
         <Languages className="size-4 opacity-70" aria-hidden="true" />
         <SelectValue />
       </SelectTrigger>

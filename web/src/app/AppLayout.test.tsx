@@ -24,6 +24,7 @@ import { Link, MemoryRouter, Route, Routes } from "react-router-dom";
 import { AppLayout } from "./AppLayout";
 import { I18nProvider } from "../i18n/I18nProvider";
 import { ThemeProvider } from "../theme/ThemeProvider";
+import { ExportConfigButton } from "../resources/FormControls";
 import { renderWithProviders } from "../test/render";
 import type { EngineEvents } from "../realtime/useEngineEvents";
 import type * as engineEventsModule from "../realtime/useEngineEvents";
@@ -169,6 +170,7 @@ function ProbePage(props: {
   return (
     <div>
       <h1>{props.label}</h1>
+      <ExportConfigButton compact />
       {props.linkTo === undefined ? null : <Link to={props.linkTo}>Go next</Link>}
     </div>
   );
@@ -258,6 +260,8 @@ describe("AppLayout — unchanged shell behaviors", () => {
     // Account-side chrome: the claimed licence chip links to the licence screen.
     const chip = await screen.findByRole("link", { name: /studio/i });
     expect(chip).toHaveAttribute("href", "/settings/licence");
+    expect(chip.className).toContain("min-h-12");
+    expect(chip.className).toContain("min-w-12");
     // Ladder + config-lock banners (account-side enforcement).
     expect(await screen.findByTestId("ladder-banner")).toBeInTheDocument();
     expect(screen.getByTestId("config-lock-banner")).toBeInTheDocument();
@@ -303,8 +307,21 @@ describe("AppLayout — touch-friendly responsive header", () => {
 
   it("keeps the locale and theme controls mounted in the header cluster", () => {
     renderShell("/a");
-    expect(screen.getByRole("combobox", { name: "Language" })).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: /theme/i })).toBeInTheDocument();
+    const language = screen.getByRole("combobox", { name: "Language" });
+    expect(language.className).toContain("min-h-12");
+    expect(language.className).toContain("max-w-full");
+    const cluster = language.parentElement;
+    expect(cluster?.className).toContain("flex-wrap");
+    expect(cluster?.className).toContain("min-w-0");
+    expect(screen.getByRole("button", { name: /theme/i }).className).toContain("size-12");
+    expect(screen.getByRole("main").className).toContain("min-w-0");
+    const footer = screen.getByRole("button", { name: "Open the system metrics page" });
+    expect(footer.className).toContain("min-h-12");
+    expect(footer.className).toContain("flex-wrap");
+    const exportButton = screen.getByRole("button", { name: "Export configuration" });
+    expect(exportButton.className).toContain("min-h-12");
+    expect(exportButton.className).toContain("whitespace-normal");
+    expect(exportButton.className).toContain("max-w-full");
   });
 });
 

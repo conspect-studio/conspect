@@ -223,7 +223,7 @@ export function SystemFooter(): JSX.Element {
           void navigate("/system");
         }}
         aria-label={t`Open the system metrics page`}
-        className="flex w-full items-center gap-5 overflow-x-auto px-4 py-1.5 text-start hover:bg-accent/40 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+        className="flex min-h-12 min-w-12 w-full flex-wrap items-center gap-x-5 gap-y-2 px-4 py-1.5 text-start hover:bg-accent/40 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
       >
         <LiveDot status={status} />
         <Cell

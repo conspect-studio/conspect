@@ -668,7 +668,11 @@ export function ExportConfigButton({
       });
   };
   return (
-    <Button variant={compact ? 'outline' : 'default'} onClick={exportNow}>
+    <Button
+      variant={compact ? 'outline' : 'default'}
+      className="h-auto min-h-12 min-w-12 max-w-full whitespace-normal"
+      onClick={exportNow}
+    >
       <Download aria-hidden="true" />
       <Trans>Export configuration</Trans>
     </Button>
