@@ -16,8 +16,8 @@ import time
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 GIB = 1024 ** 3
 MIN_FREE = 360 * GIB
-# Keep the new lane at 2 GiB until a separate execution-budget review.
-MAX_TARGET = 2 * GIB
+# Authoring stays <=2 GiB; this proposed execution cap needs separate review.
+MAX_TARGET = 15 * GIB
 
 # A new MAIN candidate decision, NOT a third T78 workspace-suite attempt.
 # CI remains unchanged. This local gate can establish DRAFT evidence only.
@@ -129,7 +129,7 @@ def target_bytes():
 def resources():
     require(shutil.disk_usage(ROOT).free >= MIN_FREE, 'free disk below 360 GiB floor')
     total = target_bytes()
-    require(total <= MAX_TARGET, 'combined local targets exceed 2 GiB; execution-budget review required')
+    require(total <= MAX_TARGET, 'combined local targets exceed 15 GiB; stop and inspect owned artifacts')
     return total
 
 

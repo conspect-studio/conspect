@@ -97,7 +97,7 @@ class GateTests(unittest.TestCase):
         with tempfile.TemporaryDirectory(dir=gate.ROOT / 'target') as tmp:
             with patch.object(gate.shutil, 'disk_usage') as usage, patch.object(gate, 'target_bytes', return_value=gate.MAX_TARGET + 1):
                 usage.return_value.free = gate.MIN_FREE
-                with self.assertRaisesRegex(RuntimeError, '2 GiB'):
+                with self.assertRaisesRegex(RuntimeError, '15 GiB'):
                     gate.resources()
 
     def test_target_walk_disappearing_file_is_the_only_ignored_error(self):

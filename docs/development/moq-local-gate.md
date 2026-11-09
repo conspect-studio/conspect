@@ -66,10 +66,13 @@ The runner reuses the resource/process machinery reviewed in `0b20f816`, not its
 old task ledger. It forces `CARGO_BUILD_JOBS=2`, `CARGO_INCREMENTAL=0`, rejects
 Cargo target-directory overrides, and uses only worktree-local targets.
 The three root/tool targets count together. Free capacity must remain at least
-360 GiB. The new lane stays at a **2 GiB combined target cap** until a separate
-execution-budget review; the cap is deliberately not an assertion that native
-builds fit. Cold native peak is unmeasured. Do not begin an expensive gate merely
-to discover that it exceeds the cap. Do not duplicate or borrow another lane's
+360 GiB. Source authoring must keep this new lane below **2 GiB**. The runner
+proposes a **15 GiB combined execution target cap**, not permission to execute.
+A separate execution-budget review must approve that bound against measured
+warm aggregate size and projected cold growth before any expensive gate runs.
+The existing aggregate cache reached roughly 5.4 GiB; that is not a cold-peak
+measurement or proof that 15 GiB fits. Cold native peak is unmeasured. Do not begin
+an expensive gate merely to discover that it exceeds the cap. Do not duplicate or borrow another lane's
 cache, remove its artifacts, or consume space up to ENOSPC.
 
 Each command has a wall timeout: workspace/feature check and Clippy 20 minutes;
