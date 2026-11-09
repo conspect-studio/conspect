@@ -254,6 +254,9 @@ struct StreamPlan {
     /// to leave a healthy UI over dead outputs) deterministically. `None` on BOTH
     /// production paths; only the `drive_streaming_for_test` seam sets it.
     consumer_fault_after_ticks: Option<u64>,
+    /// Frame-substitution seam (test-only): drop the hot item at this tick
+    /// before the consumer, deterministically replaying one shed tick.
+    shed_at_tick: Option<u64>,
     /// Incremented once per emitted tick on the hot loop when present, so a test
     /// can prove a frame was encoded while the engine was still ticking. `None`
     /// on the production paths.
@@ -3401,6 +3404,7 @@ impl Pipeline {
             policy: SendPolicy::BlockForExact,
             runners: self.build_sink_runners(false),
             consumer_fault_after_ticks: None,
+            shed_at_tick: None,
             hot_tick_observer: None,
         };
         let preview = crate::preview::program_slot();
@@ -3492,6 +3496,7 @@ impl Pipeline {
             policy: SendPolicy::DropOnOverload,
             runners: self.build_sink_runners(true),
             consumer_fault_after_ticks: None,
+            shed_at_tick: None,
             hot_tick_observer: tick_observer,
         };
         let out = self
@@ -3682,6 +3687,7 @@ impl Pipeline {
             policy,
             runners,
             consumer_fault_after_ticks,
+            shed_at_tick,
             hot_tick_observer,
         } = params;
         let runners: Vec<(SinkRunner, SinkSendPolicy)> = runners
@@ -3715,6 +3721,7 @@ impl Pipeline {
             policy,
             runners,
             consumer_fault_after_ticks,
+            shed_at_tick,
             hot_tick_observer,
         };
         // The test seam serves no UI: throwaway publisher/preview + no-op control.
@@ -3779,6 +3786,7 @@ impl Pipeline {
             policy,
             runners,
             consumer_fault_after_ticks,
+            shed_at_tick,
             hot_tick_observer,
         } = plan;
         let clock =
@@ -4246,6 +4254,7 @@ impl Pipeline {
             self.encode_cfg.cadence,
             policy,
             consumer_fault_after_ticks,
+            shed_at_tick,
             video_encoders,
             self.output_video_keys.clone(),
             enforced_audio_tracks,
@@ -5236,6 +5245,13 @@ pub struct StreamTestParams<P> {
     /// healthy report over dead outputs). `None` (all existing uses) keeps the
     /// consumer healthy for the whole run.
     pub consumer_fault_after_ticks: Option<u64>,
+    /// Frame-substitution regression seam: when `Some(k)`, the seam DROPS the
+    /// hot item at tick index `k` before the consumer sees it — deterministically
+    /// replaying one hot-queue shed tick (a transient consumer stall). The
+    /// no-falter contract requires the consumer to SUBSTITUTE that missing tick
+    /// (last-good canvas restamped at `k`) so the muxed output still carries a
+    /// frame for EVERY tick. `None` (all existing uses) forwards everything.
+    pub shed_at_tick: Option<u64>,
     /// Optional hot-loop tick observer (incremented once per emitted tick).
     pub hot_tick_observer: Option<Arc<AtomicU64>>,
 }
@@ -5374,6 +5390,7 @@ impl StreamEgress {
         cadence: Rational,
         policy: SendPolicy,
         consumer_fault_after_ticks: Option<u64>,
+        shed_at_tick: Option<u64>,
         video_encoders: Vec<VideoRenditionEncoder>,
         output_video_keys: Vec<usize>,
         output_audio_tracks: Vec<Vec<usize>>,
@@ -5475,9 +5492,10 @@ impl StreamEgress {
                 // or — under the fatal-consumer regression seam — a counting
                 // forwarder's channel that ends (and reports a fault) after the
                 // configured number of successfully processed items.
-                let hot_source = match consumer_fault_after_ticks {
-                    None => ConsumerHotSource::Real(hot_rx),
-                    Some(after) => {
+                let hot_source = match (consumer_fault_after_ticks, shed_at_tick) {
+                    (None, None) => ConsumerHotSource::Real(hot_rx),
+                    (fault_after, shed_at) => {
+                        let after = fault_after.unwrap_or(u64::MAX);
                         // Replay a mid-stream encoder failure: forward `after`
                         // items so the consumer provably produces real output
                         // first, then drop the real queue end (the consumer loses
@@ -5490,6 +5508,13 @@ impl StreamEgress {
                             .spawn(move || {
                                 let mut forwarded = 0u64;
                                 while let Ok(item) = hot_rx.recv() {
+                                    // Frame-substitution seam: DETERMINISTICALLY
+                                    // drop this one tick before the consumer —
+                                    // the exact replay of a transient hot-queue
+                                    // shed. The consumer must substitute it.
+                                    if shed_at == Some(item.tick_index) {
+                                        continue;
+                                    }
                                     if forwarded >= after {
                                         return true;
                                     }

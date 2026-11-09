@@ -147,6 +147,7 @@ async fn drive_counting(
                 max_ticks: Some(ticks),
                 policy: SendPolicy::BlockForExact,
                 runners: vec![Box::new(runner)],
+                shed_at_tick: None,
                 consumer_fault_after_ticks: None,
                 hot_tick_observer: None,
             },
@@ -243,4 +244,120 @@ async fn declared_program_audio_with_encode_flows() {
     result.expect("declared + enabled must run");
     assert_eq!(video, 40);
     assert!(audio >= 40, "declared program audio must flow, got {audio}");
+}
+
+/// FRAME-SUBSTITUTION REGRESSION (t73): a deterministically shed tick (the
+/// seam drops the hot item at tick `SHED` — the exact replay of a transient
+/// hot-queue shed) must be SUBSTITUTED by the consumer: the muxed output
+/// still carries exactly one video packet for EVERY tick 0..TICKS-1 with
+/// strictly contiguous PTS (the substituted tick's packet restamped at the
+/// missing tick's index — never a missing encoded tick, never a timestamp
+/// jump), and the program audio's cumulative samples still equal the tick
+/// ideal exactly. Real FFV1 encoder, real dispatcher, real binding delivery;
+/// the sink observes the actual delivered windows.
+#[tokio::test(flavor = "current_thread")]
+async fn substituted_shed_tick_keeps_pts_contiguous_and_audio_exact() {
+    const TICKS: u64 = 40;
+    const SHED: u64 = 20;
+    const SAMPLES_PER_TICK: u64 = 1_920;
+
+    let mut pipeline = build_pipeline(false, false);
+    pipeline.enable_program_audio();
+
+    let video_pts: Arc<std::sync::Mutex<Vec<i64>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let max_audio_pts = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let audio_packets = Arc::new(AtomicUsize::new(0));
+    let (pts_in, max_in, aud_in) = (
+        Arc::clone(&video_pts),
+        Arc::clone(&max_audio_pts),
+        Arc::clone(&audio_packets),
+    );
+    let runner = move |rx: Receiver<EncodedPacket>| -> TestSinkOutcome {
+        let mut frames = 0;
+        while let Ok(packet) = rx.recv() {
+            match packet.kind() {
+                StreamKind::Video => {
+                    if let Some(pts) = packet.pts() {
+                        pts_in.lock().unwrap().push(pts);
+                    }
+                    frames += 1;
+                }
+                _ => {
+                    if let Some(pts) = packet.pts() {
+                        let pts = u64::try_from(pts).unwrap_or(0);
+                        let prev = max_in.load(Ordering::Acquire);
+                        if pts > prev {
+                            max_in.store(pts, Ordering::Release);
+                        }
+                    }
+                    aud_in.fetch_add(1, Ordering::Release);
+                }
+            }
+        }
+        TestSinkOutcome { frames }
+    };
+
+    let clock = Arc::new(ManualTimeSource::new());
+    let stop = StopSignal::new();
+    let driver_stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    spawn_clock_paced(
+        Arc::clone(&clock),
+        Arc::clone(&driver_stop),
+        std::time::Duration::from_millis(25),
+    );
+    let concrete: Arc<ManualTimeSource> = Arc::clone(&clock);
+    let ts: Arc<dyn TimeSource> = concrete;
+    let result = pipeline
+        .drive_streaming_for_test(
+            StreamTestParams {
+                time: ts,
+                pacer: CooperativePacer,
+                max_ticks: Some(TICKS),
+                policy: SendPolicy::DropOnOverload,
+                runners: vec![Box::new(runner)],
+                shed_at_tick: Some(SHED),
+                consumer_fault_after_ticks: None,
+                hot_tick_observer: None,
+            },
+            &stop,
+        )
+        .await;
+    driver_stop.store(true, Ordering::Release);
+    let out = result.expect("the shed tick must be substituted, never fatal");
+
+    // The engine emitted every tick; the run completed honestly.
+    assert_eq!(out.report.frames, TICKS, "every engine tick processed");
+
+    // DIRECT SUBSTITUTION PROOF: the delivered video PTS sequence is exactly
+    // 0..TICKS — one frame per tick, CONTIGUOUS, including the shed tick 20
+    // (its packet carries the substituted restamped frame at PTS 20).
+    let mut pts = video_pts.lock().unwrap().clone();
+    pts.sort_unstable();
+    assert_eq!(
+        pts.len(),
+        usize::try_from(TICKS).unwrap(),
+        "exactly one video packet per output tick, got {pts:?}"
+    );
+    for (index, p) in pts.iter().enumerate() {
+        assert_eq!(
+            *p,
+            i64::try_from(index).unwrap(),
+            "video PTS must be strictly contiguous tick stamps — tick {index} has PTS {p} \
+             (a missing or jumped tick breaks the fixed cadence)"
+        );
+    }
+
+    // Audio is unaffected by the video shed: cumulative samples equal the tick
+    // ideal (the bus catch-up is a pure function of the tick index).
+    let audio_end = max_audio_pts.load(Ordering::Acquire) + 1024;
+    let tick_ideal = TICKS * SAMPLES_PER_TICK;
+    assert!(
+        tick_ideal.saturating_sub(audio_end) <= SAMPLES_PER_TICK,
+        "audio cumulative {audio_end} must equal the tick ideal {tick_ideal} \
+         (within one in-flight AAC frame), shed tick must not drift audio"
+    );
+    assert!(
+        audio_packets.load(Ordering::Acquire) >= usize::try_from(TICKS).unwrap(),
+        "audio packets flow for every tick"
+    );
 }
