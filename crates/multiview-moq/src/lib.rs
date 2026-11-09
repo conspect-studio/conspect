@@ -176,9 +176,14 @@ impl VideoAdapter {
             self.discontinuity();
             return Err(error);
         }
-        for packet in &window.packets {
-            if let Err(error) = self.publish_packet(packet) {
-                self.discontinuity();
+        // Reserve/serialize the ENTIRE window before mutating any group or PTS.
+        let prepared = window.packets.iter().map(|packet| {
+            provider::serialized_frame_in(packet, self.allocation.as_ref())
+        }).collect::<Result<Vec<_>, _>>()?;
+        for (packet, serialized) in window.packets.iter().zip(prepared) {
+            if let Err(error) = self.publish_packet(packet, serialized) {
+                // Transport mutation cannot be rolled back; make this adapter terminal.
+                self.abort_group(); self.revoked = true;
                 return Err(error);
             }
             self.last_pts = Some(packet.pts_us);
@@ -186,10 +191,9 @@ impl VideoAdapter {
         Ok(())
     }
 
-    fn publish_packet(&mut self, packet: &Packet) -> Result<(), Reject> {
+    fn publish_packet(&mut self, packet: &Packet, serialized: bytes::Bytes) -> Result<(), Reject> {
         let timestamp = moq_net::Timestamp::new(packet.pts_us, moq_net::Timescale::MICRO)
             .map_err(|_| Reject::Timestamp)?;
-        let serialized = provider::serialized_frame_in(packet, self.allocation.as_ref())?;
         if packet.verified_rap {
             if let Some(previous) = self.group.take() {
                 previous.finish().map_err(|_| Reject::Transport)?;
@@ -234,6 +238,17 @@ mod tests {
                 verified_rap: rap,
             }],
         }
+    }
+    #[test]
+    fn second_packet_budget_failure_preserves_video_group_and_pts() {
+        let budget=allocation::AllocationBudget::new(12).unwrap();
+        let mut adapter=adapter().with_allocation_budget(budget.clone());
+        let mut window=window(0,true);
+        window.packets.push(Packet { payload:Bytes::from_static(&[0,1]),pts_us:1,verified_rap:false });
+        assert_eq!(adapter.publish(&window),Err(Reject::Budget));
+        assert!(adapter.group.is_none()); assert_eq!(adapter.last_pts,None);
+        assert_eq!(budget.retained_bytes(),0);
+        assert!(!adapter.revoked);
     }
     #[test]
     fn trial_retention_is_bounded_and_opt_in_is_idempotent() {

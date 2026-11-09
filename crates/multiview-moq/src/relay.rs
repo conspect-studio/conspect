@@ -26,6 +26,7 @@ pub struct RelayPublisher {
     controller: Controller,
     identity: Bytes,
     applied: usize,
+    terminal: bool,
 }
 impl RelayPublisher {
     /// Build the client here so its per-connection send-buffer and stream bounds cannot
@@ -50,13 +51,11 @@ impl RelayPublisher {
         )
         .ok_or(RelayError::InvalidBudget)?;
         config.once = Some(true);
-        let mut quic = config.quic.take().unwrap_or_default();
-        quic.send_window = Some(send_window_bytes);
-        quic.max_streams = Some(64);
-        config.quic = Some(quic);
+        let quic = bounded_quic(config.quic.take().unwrap_or_default(), send_window_bytes);
+
         let counters = moq_net::delivery::Counters::default();
         let client = config
-            .init(Default::default())
+            .init(quic)
             .map_err(|_| RelayError::Connect)?
             .with_publisher(origin)
             .with_stats(moq_net::stats::Session::default().with_delivery(counters.clone()));
@@ -73,9 +72,13 @@ impl RelayPublisher {
             controller,
             identity: ladder.descriptor_json(),
             applied: 0,
+            terminal: false,
         })
     }
     pub fn sample(&mut self, elapsed: Duration) -> Result<Admission, RelayError> {
+        if self.terminal {
+            return Err(RelayError::Publication);
+        }
         let snapshot = self.counters.snapshot();
         if snapshot.unsupported {
             self.controller.observe(None, elapsed);
@@ -94,6 +97,9 @@ impl RelayPublisher {
         publication: &mut SharedPublication,
         admission: Admission,
     ) -> Result<(), RelayError> {
+        if self.terminal {
+            return Err(RelayError::Publication);
+        }
         if publication.allocation_budget().is_none() {
             return Err(RelayError::InvalidBudget);
         }
@@ -103,22 +109,11 @@ impl RelayPublisher {
             admission,
             self.controller.admission(),
         )?;
-        let levels = publication.ladder().level_costs_bps().len();
-        for level in 1..levels {
-            publication
-                .enable_trial_cancellation(level)
-                .map_err(|_| RelayError::Publication)?;
+        if commit_prefix(publication, self.applied, admission.level).is_err() {
+            self.terminal = true;
+            self.connection.abort(moq_net::Error::Cancel);
+            return Err(RelayError::Publication);
         }
-        if admission.level < self.applied {
-            for level in admission.level + 1..=self.applied {
-                publication
-                    .cancel_trial(level)
-                    .map_err(|_| RelayError::Publication)?;
-            }
-        }
-        publication
-            .set_stalled(&(admission.level + 1..levels).collect::<Vec<_>>())
-            .map_err(|_| RelayError::Publication)?;
         self.applied = admission.level;
         Ok(())
     }
@@ -129,6 +124,41 @@ impl RelayPublisher {
     pub fn abort(&self) {
         self.connection.abort(moq_net::Error::Cancel);
     }
+}
+
+fn bounded_quic(mut quic: moq_tokio::quic::Config, bytes: u64) -> moq_tokio::quic::Config {
+    quic.send_window = Some(bytes);
+    quic.max_streams = Some(64);
+    quic
+}
+
+fn commit_prefix(
+    publication: &mut SharedPublication,
+    applied: usize,
+    next: usize,
+) -> Result<(), RelayError> {
+    let levels = publication.ladder().level_costs_bps().len();
+    if applied >= levels || next >= levels {
+        return Err(RelayError::InvalidBudget);
+    }
+    // Fallible catalog write first. Subsequent indexed operations are prevalidated;
+    // any unexpected error is terminal in the caller rather than a fake rollback.
+    publication
+        .set_stalled(&(next + 1..levels).collect::<Vec<_>>())
+        .map_err(|_| RelayError::Publication)?;
+    for level in 1..levels {
+        publication
+            .enable_trial_cancellation(level)
+            .map_err(|_| RelayError::Publication)?;
+    }
+    if next < applied {
+        for level in next + 1..=applied {
+            publication
+                .cancel_trial(level)
+                .map_err(|_| RelayError::Publication)?;
+        }
+    }
+    Ok(())
 }
 
 fn validate_prefix(
@@ -229,6 +259,40 @@ mod tests {
             publication.publish_audio("audio", &packets[..1]).is_err(),
             "audio published once per PTS"
         );
+    }
+    #[test]
+    fn catalog_failure_precedes_video_cancellation_and_preserves_audio() {
+        let origin = moq_net::broadcast::Producer::new(Default::default());
+        let budget = crate::allocation::AllocationBudget::new(10000).unwrap();
+        let mut publication =
+            SharedPublication::create_with_budget(ladder(1), &origin, budget).unwrap();
+        let audio = publication.audio_track("audio").unwrap().clone();
+        let catalog = publication.catalog_track().clone();
+        catalog.abort(moq_net::Error::Cancel).unwrap();
+        assert_eq!(
+            commit_prefix(&mut publication, 1, 0),
+            Err(RelayError::Publication)
+        );
+        assert!(publication.stalled().is_empty());
+        assert!(publication.enable_trial_cancellation(0).is_err());
+        let mut group = audio.append_group().unwrap();
+        group
+            .write_frame(
+                moq_net::Timestamp::from_millis(1).unwrap(),
+                Bytes::from_static(b"audio"),
+            )
+            .unwrap();
+        group.finish().unwrap();
+    }
+    #[test]
+    fn actual_init_argument_carries_transport_buffer_and_stream_bounds() {
+        let quic = bounded_quic(moq_tokio::quic::Config::default(), 123456);
+        assert_eq!(quic.send_window, Some(123456));
+        assert_eq!(quic.max_streams, Some(64));
+        // This exact value is passed to connect::Config::init, not config.quic.
+        let resolved = quic.resolve();
+        assert_eq!(resolved.send_window, Some(123456));
+        assert_eq!(resolved.max_streams, 64);
     }
     #[test]
     fn fresh_outgoing_meter_is_not_capacity_evidence() {
