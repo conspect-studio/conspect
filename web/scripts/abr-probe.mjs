@@ -388,7 +388,7 @@ try {
     }));
     const paintIn = (s, after, width) => s.paints.some((p) => p.tMs >= after && p.width === width);
     const checks = [
-      { criterion: 'both viewers render actual high stable for three seconds within 60-second readiness bound', passed: startupMs <= 60000 }, 
+      { criterion: 'both viewers render actual high stable for three seconds within 60-second readiness bound', passed: startupMs <= 60000 },
       { criterion: 'shaped consumer renders actual low after capacity reduction', passed: paintIn(shaped.slow, firstDownBoundary, 160) },
       { criterion: 'healthy consumer continues high during reduction', passed: paintIn(shaped.healthy, baseline.healthy.elapsedMs, 640) },
       { criterion: 'restored consumer renders mid or high after restoration', passed: restored.slow.paints.some((p) => p.tMs > firstRestoreBoundary && p.width >= 320) },

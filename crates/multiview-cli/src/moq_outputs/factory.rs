@@ -104,6 +104,28 @@ pub(crate) struct RenditionFamily {
 pub(crate) struct DynamicRegistryFactory(
     pub(crate) crate::output_window_registry::WindowSubscriptionSlot,
 );
+async fn await_outgoing_start<F: std::future::Future>(
+    future: F,
+    stopped: &mut tokio::sync::watch::Receiver<bool>,
+    invalid: impl Fn() -> bool,
+) -> Option<F::Output> {
+    tokio::pin!(future);
+    loop {
+        if invalid() || *stopped.borrow() {
+            return None;
+        }
+        tokio::select! {
+            biased;
+            _ = stopped.wait_for(|stop| *stop) => return None,
+            _ = tokio::time::sleep(Duration::from_millis(20)) => {},
+            result = &mut future => {
+                if invalid() || *stopped.borrow() { return None; }
+                return Some(result);
+            }
+        }
+    }
+}
+
 fn read_relay_endpoint(path: &std::path::Path) -> Result<url::Url, MoqReject> {
     #[cfg(unix)]
     let endpoint = {
@@ -214,8 +236,13 @@ impl DynamicRegistryFactory {
                     tokio::select! { _ = tokio::time::sleep(Duration::from_millis(20)) => {}, _ = stopped.wait_for(|stop| *stop) => return }
                 }
                 let scope = WhepScope::Output(output);
-                let Ok(mut publisher) = dynamic.start_outgoing(&principal, &scope, config).await
-                else {
+                let started = await_outgoing_start(
+                    dynamic.start_outgoing(&principal, &scope, config),
+                    &mut stopped,
+                    || keys.generation() != generation || !dynamic.available(),
+                )
+                .await;
+                let Some(Ok(mut publisher)) = started else {
                     return;
                 };
                 loop {
@@ -2269,5 +2296,58 @@ mod tests {
         });
         OutgoingTask { stop, worker }.shutdown().await;
         assert!(completed.load(Ordering::Acquire));
+    }
+    #[tokio::test]
+    async fn pending_outgoing_handshake_is_dropped_on_stop_and_acl_change() {
+        struct Pending {
+            dropped: Arc<AtomicBool>,
+            polled: Arc<AtomicBool>,
+        }
+        impl std::future::Future for Pending {
+            type Output = ();
+            fn poll(
+                self: std::pin::Pin<&mut Self>,
+                _: &mut std::task::Context<'_>,
+            ) -> std::task::Poll<()> {
+                self.polled.store(true, Ordering::Release);
+                std::task::Poll::Pending
+            }
+        }
+        impl Drop for Pending {
+            fn drop(&mut self) {
+                self.dropped.store(true, Ordering::Release);
+            }
+        }
+        for change_acl in [false, true] {
+            let dropped = Arc::new(AtomicBool::new(false));
+            let polled = Arc::new(AtomicBool::new(false));
+            let invalid = Arc::new(AtomicBool::new(false));
+            let (stop, mut stopped) = tokio::sync::watch::channel(false);
+            let invalid_task = invalid.clone();
+            let future = Pending {
+                dropped: dropped.clone(),
+                polled: polled.clone(),
+            };
+            let task = tokio::spawn(async move {
+                await_outgoing_start(future, &mut stopped, move || {
+                    invalid_task.load(Ordering::Acquire)
+                })
+                .await
+            });
+            while !polled.load(Ordering::Acquire) {
+                tokio::task::yield_now().await;
+            }
+            if change_acl {
+                invalid.store(true, Ordering::Release);
+            } else {
+                stop.send_replace(true);
+            }
+            assert!(tokio::time::timeout(Duration::from_secs(1), task)
+                .await
+                .unwrap()
+                .unwrap()
+                .is_none());
+            assert!(dropped.load(Ordering::Acquire));
+        }
     }
 }
