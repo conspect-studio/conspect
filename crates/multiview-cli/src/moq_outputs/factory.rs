@@ -2360,4 +2360,31 @@ mod tests {
             assert!(dropped.load(Ordering::Acquire));
         }
     }
+    #[tokio::test]
+    async fn pending_outgoing_handshake_rejects_configuration_generation_replacement() {
+        let generation = Arc::new(std::sync::atomic::AtomicU64::new(7));
+        let current = generation.clone();
+        let polled = Arc::new(AtomicBool::new(false));
+        let observed = polled.clone();
+        let (_stop, mut stopped) = tokio::sync::watch::channel(false);
+        let task = tokio::spawn(async move {
+            let pending = std::future::poll_fn(move |_| {
+                observed.store(true, Ordering::Release);
+                std::task::Poll::<()>::Pending
+            });
+            await_outgoing_start(pending, &mut stopped, || {
+                current.load(Ordering::Acquire) != 7
+            })
+            .await
+        });
+        while !polled.load(Ordering::Acquire) {
+            tokio::task::yield_now().await;
+        }
+        generation.store(8, Ordering::Release);
+        assert!(tokio::time::timeout(Duration::from_secs(1), task)
+            .await
+            .unwrap()
+            .unwrap()
+            .is_none());
+    }
 }
