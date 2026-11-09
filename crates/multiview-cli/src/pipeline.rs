@@ -4204,6 +4204,8 @@ impl Pipeline {
         let dropped = Arc::new(AtomicU64::new(0));
         let in_flight = Arc::clone(&egress.in_flight);
         let peak_occupancy = Arc::clone(&egress.peak_occupancy);
+        let egress_fatal = Arc::clone(&egress.fatal);
+        let egress_stop = stop.clone();
 
         let hot_dropped = Arc::clone(&dropped);
         // A read-only clone for the per-tick event projection: it samples this
@@ -4384,6 +4386,10 @@ impl Pipeline {
                 #[cfg(feature = "overlay")]
                 faults,
             };
+            // The output clock completes this tick; then the program owner
+            // joins the consumer and propagates its exact fatal cause. A UI
+            // that still answers HTTP must never mask stopped encoded media.
+            stop_on_egress_failure(&egress_fatal, &egress_stop, false);
             match policy {
                 SendPolicy::BlockForExact => {
                     // A blocking send back-pressures the OFFLINE renderer (not a
@@ -4391,6 +4397,9 @@ impl Pipeline {
                     // Disconnect only happens if the consumer died; nothing to do.
                     if hot_tx.send(item).is_ok() {
                         bump_occupancy(&in_flight, &peak_occupancy);
+                    } else {
+                        egress_fatal.store(true, Ordering::Release);
+                        egress_stop.stop();
                     }
                 }
                 SendPolicy::DropOnOverload => match hot_tx.try_send(item) {
@@ -4400,8 +4409,10 @@ impl Pipeline {
                         hot_dropped.fetch_add(1, Ordering::Release);
                     }
                     Err(TrySendError::Disconnected(_)) => {
-                        // The consumer ended (it cannot, mid-run, in normal
-                        // operation); count as a drop and keep ticking.
+                        // The output producer died. Stop at this tick boundary
+                        // rather than reporting a healthy UI over dead streams.
+                        egress_fatal.store(true, Ordering::Release);
+                        egress_stop.stop();
                         hot_dropped.fetch_add(1, Ordering::Release);
                     }
                 },
@@ -5052,6 +5063,20 @@ struct SinkRunOutcome {
     frames: usize,
 }
 
+/// Request a tick-boundary stop if the shared encoded-output producer fails.
+/// Returns true only for a fatal producer fault, not a normal queue overload.
+fn stop_on_egress_failure(fatal: &AtomicBool, stop: &StopSignal, disconnected: bool) -> bool {
+    if disconnected {
+        fatal.store(true, Ordering::Release);
+    }
+    if fatal.load(Ordering::Acquire) {
+        stop.stop();
+        true
+    } else {
+        false
+    }
+}
+
 /// A boxed closure that drives ONE mux-only output sink to completion over its
 /// bounded fan-out channel of coded packets, run on its own thread by the
 /// [`StreamEgress`]. Production builds one per [`RunnableOutput`] (calling
@@ -5159,6 +5184,10 @@ fn bump_occupancy(in_flight: &AtomicI64, peak: &AtomicUsize) {
 /// only pace the consumer, never the engine) to each sink's bounded channel.
 struct StreamEgress {
     consumer: JoinHandle<Result<Vec<crate::binding_delivery::BindingStatus>, PipelineError>>,
+    /// The consumer sets this before it drops the hot receiver on a fatal error.
+    /// The engine reads one atomic bit per tick and requests a clean tick-boundary
+    /// stop; the owner then propagates the exact joined error to its supervisor.
+    fatal: Arc<AtomicBool>,
     sinks: Vec<JoinHandle<Result<SinkRunOutcome, PipelineError>>>,
     /// Frames currently queued in the hot-loop → consumer channel (bumped by the
     /// hot loop on send, decremented by the consumer on recv).
@@ -5174,6 +5203,7 @@ struct StreamEgress {
 
 /// The folded outcome of joining the egress threads: the report lines (in sink
 /// order), the peak queue occupancy, and the per-sink frame counts.
+#[derive(Debug)]
 struct EgressOutcome {
     lines: Vec<String>,
     peak_occupancy: usize,
@@ -5282,6 +5312,8 @@ impl StreamEgress {
 
         let (hot_tx, hot_rx) = std::sync::mpsc::sync_channel::<StreamItem>(policy.queue_cap());
         let consumer_in_flight = Arc::clone(&in_flight);
+        let fatal = Arc::new(AtomicBool::new(false));
+        let consumer_fatal = Arc::clone(&fatal);
         // Keep a guard outside the spawn closure too: a failed thread spawn
         // drops its captured guard and wakes any hub producer already waiting.
         let consumer_guard = audio_route.as_ref().map(|route| route.consumer_guard());
@@ -5289,7 +5321,7 @@ impl StreamEgress {
         let consumer = builder
             .spawn(move || {
                 let _consumer_guard = consumer_guard;
-                consumer_main(
+                let result = consumer_main(
                     ctx,
                     &hot_rx,
                     delivery,
@@ -5310,20 +5342,32 @@ impl StreamEgress {
                     #[cfg(feature = "aes67")]
                     aes67_send_handles,
                     &consumer_in_flight,
-                )
+                );
+                if let Err(error) = &result {
+                    tracing::error!(error = %error, "fatal encoded-output consumer failure");
+                    consumer_fatal.store(true, Ordering::Release);
+                }
+                result
             })
             .unwrap_or_else(|_| {
                 // Spawning the consumer failed: fall back to a thread that does
                 // nothing. The `hot_rx`/`sink_txs` moved into the failed closure
                 // drop, closing the channels so the hot loop sees Disconnected and
                 // each sink sees end-of-program — nothing wedges.
-                std::thread::spawn(|| Ok(Vec::new()))
+                fatal.store(true, Ordering::Release);
+                std::thread::spawn(|| {
+                    Err(PipelineError::Output {
+                        kind: "bake-consumer",
+                        reason: "failed to spawn encoded-output consumer".to_owned(),
+                    })
+                })
             });
 
         (
             Self {
                 consumer,
                 sinks,
+                fatal,
                 in_flight,
                 peak_occupancy,
             },
@@ -5351,6 +5395,20 @@ impl StreamEgress {
     /// Returns a [`PipelineError`] if the consumer panicked, or a sink that DID
     /// finish errored/panicked (a detached wedged sink is reported, not errored).
     fn join(self) -> Result<EgressOutcome, PipelineError> {
+        // A fatal native encoder can wedge in libav without returning an error.
+        // Do not let shutdown wait forever: systemd owns a fresh-process restart
+        // after this bounded error, and the detached thread cannot poison a new
+        // in-process encoder generation.
+        let deadline = Instant::now() + SINK_WEDGE_GRACE;
+        while !self.consumer.is_finished() && Instant::now() < deadline {
+            std::thread::park_timeout(Duration::from_millis(10));
+        }
+        if !self.consumer.is_finished() {
+            return Err(PipelineError::Output {
+                kind: "bake-consumer",
+                reason: "encoder consumer failed to stop within bounded teardown".to_owned(),
+            });
+        }
         let bindings = self
             .consumer
             .join()
@@ -5437,6 +5495,173 @@ fn spawn_failed_sink(reason: String) -> JoinHandle<Result<SinkRunOutcome, Pipeli
             reason: format!("could not spawn sink thread: {reason}"),
         })
     })
+}
+
+/// Fatal-consumer health-propagation regressions (issue #202/#203 follow-up):
+/// the atomic fatal bit, the tick-boundary stop it raises, and the bounded
+/// teardown that hands a wedged consumer to systemd's restart instead of
+/// hanging `stop` forever.
+#[cfg(test)]
+mod egress_fatal_tests {
+    use super::{stop_on_egress_failure, PipelineError, StreamEgress, SINK_WEDGE_GRACE};
+    use multiview_engine::StopSignal;
+    use std::sync::atomic::{AtomicBool, AtomicI64, AtomicUsize, Ordering};
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+
+    /// Build an egress around a given consumer thread handle (unit-level: no
+    /// encoders, no sinks — `join`'s own bounds are what these tests pin).
+    fn egress_with_consumer(
+        consumer: std::thread::JoinHandle<
+            Result<Vec<crate::binding_delivery::BindingStatus>, PipelineError>,
+        >,
+        fatal: bool,
+    ) -> StreamEgress {
+        StreamEgress {
+            consumer,
+            fatal: Arc::new(AtomicBool::new(fatal)),
+            sinks: Vec::new(),
+            in_flight: Arc::new(AtomicI64::new(0)),
+            peak_occupancy: Arc::new(AtomicUsize::new(0)),
+        }
+    }
+
+    /// The per-tick hot-loop check: a healthy consumer leaves the run running;
+    /// only a fatal consumer (flagged by the consumer itself, or a disconnected
+    /// hot queue) raises the stop and reports the fault.
+    #[test]
+    fn stop_on_egress_failure_only_stops_on_fatal() {
+        // Healthy: no fatal bit, no disconnection — no stop, keep ticking.
+        let fatal = AtomicBool::new(false);
+        let stop = StopSignal::new();
+        assert!(!stop_on_egress_failure(&fatal, &stop, false));
+        assert!(
+            !stop.is_stopped(),
+            "a healthy consumer must never stop the run"
+        );
+        assert!(!fatal.load(Ordering::Acquire));
+
+        // A disconnected hot queue (the consumer died and dropped its end)
+        // IS fatal: the bit is set, the stop is raised, and the fault is
+        // reported — never a silent healthy UI over dead outputs.
+        assert!(stop_on_egress_failure(&fatal, &stop, true));
+        assert!(fatal.load(Ordering::Acquire));
+        assert!(stop.is_stopped());
+
+        // Once the consumer flagged fatal, every later tick re-checks the bit
+        // and keeps the stop raised (idempotent).
+        let fatal2 = AtomicBool::new(true);
+        let stop2 = StopSignal::new();
+        assert!(stop_on_egress_failure(&fatal2, &stop2, false));
+        assert!(stop2.is_stopped());
+
+        // The normal overload path (queue full, shed) never trips this gate:
+        // a non-fatal, non-disconnected check on a fresh run stops nothing.
+        let fatal3 = AtomicBool::new(false);
+        let stop3 = StopSignal::new();
+        assert!(!stop_on_egress_failure(&fatal3, &stop3, false));
+        assert!(!stop3.is_stopped());
+    }
+
+    /// A consumer that finished healthy still joins clean — the bounded wait
+    /// adds no regression to the normal teardown path.
+    #[test]
+    fn join_returns_outcome_for_finished_healthy_consumer() {
+        let consumer = std::thread::spawn(|| Ok(Vec::new()));
+        let egress = egress_with_consumer(consumer, false);
+        let outcome = egress.join().expect("healthy consumer joins clean");
+        assert!(outcome.sink_frames.is_empty());
+        assert_eq!(outcome.peak_occupancy, 0);
+    }
+
+    /// A consumer whose exact error already failed (fatal native encoder that
+    /// returned an error) propagates that EXACT error through `join` — the
+    /// supervisor (systemd) restarts on the real cause, never a generic one.
+    #[test]
+    fn join_propagates_the_exact_consumer_error() {
+        let consumer = std::thread::spawn(|| {
+            Err::<Vec<crate::binding_delivery::BindingStatus>, PipelineError>(
+                PipelineError::Output {
+                    kind: "bake-consumer",
+                    reason: "encoder rejected the rendition".to_owned(),
+                },
+            )
+        });
+        let egress = egress_with_consumer(consumer, true);
+        match egress.join() {
+            Err(PipelineError::Output { kind, reason }) => {
+                assert_eq!(kind, "bake-consumer");
+                assert_eq!(reason, "encoder rejected the rendition");
+            }
+            other => panic!("consumer failure must surface as a typed output error, got {other:?}"),
+        }
+    }
+
+    /// A consumer that WEDGED (a fatal native encoder can hang inside libav
+    /// without returning) must not hang `stop` forever: teardown is bounded by
+    /// [`SINK_WEDGE_GRACE`], after which the run returns a typed failure so
+    /// systemd's `Restart=always` owns a fresh process (the atomic signal).
+    #[test]
+    fn join_bounds_a_wedged_consumer_to_the_teardown_grace() {
+        let started = Instant::now();
+        // A consumer that never finishes: parked forever, like an encoder
+        // wedged inside a libav call.
+        let consumer = std::thread::Builder::new()
+            .name("test-wedged-consumer".to_owned())
+            .spawn(|| {
+                loop {
+                    std::thread::park();
+                }
+                #[allow(unreachable_code)]
+                Ok(Vec::new())
+            })
+            .expect("spawn wedged consumer");
+        let egress = egress_with_consumer(consumer, true);
+        match egress.join() {
+            Err(PipelineError::Output { kind, reason }) => {
+                assert_eq!(kind, "bake-consumer");
+                assert!(
+                    reason.contains("bounded teardown"),
+                    "the wedge error must name the bounded teardown, got {reason:?}"
+                );
+            }
+            other => panic!("wedged consumer must surface as a typed output error, got {other:?}"),
+        }
+        // Bounded: well past the 2 s grace the wait is over — and this test
+        // itself returning proves teardown never hung.
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed >= SINK_WEDGE_GRACE,
+            "the grace must actually be waited out, elapsed {elapsed:?}"
+        );
+        assert!(
+            elapsed < SINK_WEDGE_GRACE + Duration::from_secs(10),
+            "teardown must be bounded, elapsed {elapsed:?}"
+        );
+    }
+
+    /// The failed-consumer-spawn fallback thread is fatal by construction: its
+    /// error text is the exact cause the run reports (the hot loop also sees
+    /// Disconnected and stops at the next tick).
+    #[test]
+    fn failed_consumer_spawn_falls_back_to_a_fatal_error_thread() {
+        let consumer = std::thread::spawn(|| {
+            Err::<Vec<crate::binding_delivery::BindingStatus>, PipelineError>(
+                PipelineError::Output {
+                    kind: "bake-consumer",
+                    reason: "failed to spawn encoded-output consumer".to_owned(),
+                },
+            )
+        });
+        let egress = egress_with_consumer(consumer, true);
+        match egress.join() {
+            Err(PipelineError::Output { kind, reason }) => {
+                assert_eq!(kind, "bake-consumer");
+                assert_eq!(reason, "failed to spawn encoded-output consumer");
+            }
+            other => panic!("spawn failure must surface as a typed output error, got {other:?}"),
+        }
+    }
 }
 
 /// Build the program-audio bus (AUD-4) from the run's [`AudioEncodeConfig`] and
