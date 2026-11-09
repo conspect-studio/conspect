@@ -1220,8 +1220,22 @@ segment_ms = 1000
         let polls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let spawner = LiveIngestSpawner {
             demand: None,
-            source_events: Arc::new(crate::source_event_runtime::Runtime::new().expect("events")),
-            display: DisplayFollow::new(
+            source_events: std::sync::Arc::new(
+                crate::source_event_runtime::Runtime::new().expect("events"),
+            ),
+            #[cfg(feature = "overlay")]
+            caption_stores: std::sync::Arc::new(multiview_framestore::SwapCell::from_pointee(
+                Default::default(),
+            )),
+            #[cfg(feature = "overlay")]
+            caption_generations: std::sync::Arc::new(multiview_framestore::SwapCell::from_pointee(
+                Default::default(),
+            )),
+            #[cfg(feature = "overlay")]
+            caption_display_times: std::sync::Arc::new(
+                multiview_framestore::SwapCell::from_pointee(Default::default()),
+            ),
+            display: super::DisplayFollow::new(
                 std::sync::Arc::new(multiview_framestore::SwapCell::new(std::sync::Arc::new(
                     layout.clone(),
                 ))),
@@ -1320,8 +1334,22 @@ segment_ms = 1000
         let polls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let spawner = LiveIngestSpawner {
             demand: None,
-            source_events: Arc::new(crate::source_event_runtime::Runtime::new().expect("events")),
-            display: DisplayFollow::new(
+            source_events: std::sync::Arc::new(
+                crate::source_event_runtime::Runtime::new().expect("events"),
+            ),
+            #[cfg(feature = "overlay")]
+            caption_stores: std::sync::Arc::new(multiview_framestore::SwapCell::from_pointee(
+                Default::default(),
+            )),
+            #[cfg(feature = "overlay")]
+            caption_generations: std::sync::Arc::new(multiview_framestore::SwapCell::from_pointee(
+                Default::default(),
+            )),
+            #[cfg(feature = "overlay")]
+            caption_display_times: std::sync::Arc::new(
+                multiview_framestore::SwapCell::from_pointee(Default::default()),
+            ),
+            display: super::DisplayFollow::new(
                 std::sync::Arc::new(multiview_framestore::SwapCell::new(std::sync::Arc::new(
                     layout.clone(),
                 ))),
