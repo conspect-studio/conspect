@@ -318,3 +318,30 @@ fn valid(key: &PreviewKey) -> bool {
         && key.cadence.den > 0
         && key.bitrate_bps > 0
 }
+
+#[cfg(test)]
+mod cadence_deserialization_tests {
+    use super::PreviewKey;
+    fn key(cadence: &str) -> String {
+        format!(
+            r#"{{"program":"main","bus":"main","codec":"h264","encoder_name":"libx264","width":64,"height":64,"cadence":{cadence},"bitrate_bps":100000,"codec_profile":null,"pixel_format":"yuv420p","color":"sdr-bt709-limited","gpu_pin":null,"codec_config":null}}"#
+        )
+    }
+    #[test]
+    fn preview_cadence_rejects_zero_negative_and_out_of_range_integer() {
+        for cadence in [
+            r#"{"num":0,"den":1}"#,
+            r#"{"num":25,"den":0}"#,
+            r#"{"num":-25,"den":1}"#,
+            r#"{"num":25,"den":-1}"#,
+            r#"{"num":9223372036854775808,"den":1}"#,
+        ] {
+            assert!(serde_json::from_str::<PreviewKey>(&key(cadence)).is_err());
+        }
+        let maximum = serde_json::from_str::<PreviewKey>(&key(
+            r#"{"num":9223372036854775807,"den":9223372036854775807}"#,
+        ))
+        .unwrap();
+        assert_eq!(maximum.cadence, multiview_core::time::Rational::new(1, 1));
+    }
+}
