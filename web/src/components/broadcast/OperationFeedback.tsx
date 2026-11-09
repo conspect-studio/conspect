@@ -1,4 +1,4 @@
-// OperationFeedback — the stable, honest feedback + Undo region for
+// OperationFeedback — the honest feedback + Undo region for
 // correlated broadcast mutations. Contracts carried from the correction-4
 // reviews:
 //   * accepted ≠ applied: the pending line says the request was ACCEPTED and
@@ -11,12 +11,10 @@
 //     reconciled later; an `unknown` outcome persists (no Dismiss is offered
 //     for it — only the caller's reconciliation clears it), while a failure
 //     persists until explicitly dismissed.
-//   * the region is RESERVED: idle, pending and applied all keep the same
-//     min-height slot, with no overflow-hidden and no fixed height — the
-//     prototype's 68px slot clipped 4px off its own 75px Undo toast
-//     (correction-4 comfort, Audio row) and the pending ticker once widened
-//     the 320px document; here the region wraps (`break-words`, `min-w-0`)
-//     and the Undo key wraps inside it instead.
+//   * placement contract: keep any position-critical controls BEFORE the
+//     feedback region. Its minimum height is not a stable height: long status,
+//     correlation, reason and Undo labels can grow it. It wraps rather than
+//     clipping necessary text or the reachable 48px Undo.
 //   * presentational only: no localStorage authority, no fetch — the
 //     component stores nothing and queries nothing.
 import type { JSX } from 'react';
@@ -43,8 +41,10 @@ export interface OperationFeedbackProps {
   readonly operationLabel: string;
   /** The correlation id the outcome will be reported against. */
   readonly correlationId?: string | null | undefined;
-  /** Why the operation failed, already localized; shown on `failed`. */
+  /** Authoritative failure detail, already localized; shown on `failed`. */
   readonly failureReason?: string | null | undefined;
+  /** Caller-verified explanation of an unknown outcome (e.g. a confirmed timeout), already localized. */
+  readonly unknownReason?: string | null | undefined;
   /** Offer an Undo key on `applied`. Its presence implies undoability. */
   readonly onUndo?: (() => void) | undefined;
   /** Overrides the default `Undo {operationLabel}` key label. */
@@ -55,9 +55,8 @@ export interface OperationFeedbackProps {
   readonly onDismiss?: (() => void) | undefined;
 }
 
-// The reserved slot: 6rem fits the 48px Undo key, its label line and the
-// region padding at every font scale (all rem), with room to spare over the
-// prototype's 75px toast. Same class in every phase — no shift on transition.
+// Minimum empty-state space, not a fixed-size or position-stability promise.
+// Long accessible content is allowed to increase the region's height.
 const REGION_CLASSES =
   'flex min-h-24 min-w-0 flex-col gap-1 break-words rounded-md border bg-muted/40 p-2';
 
@@ -80,15 +79,18 @@ function PhaseIcon({ phase }: { readonly phase: OperationPhase }): JSX.Element {
 }
 
 /**
- * The reserved feedback region for one correlated operation. Render it inline
- * under the action it reports on; the slot exists (and keeps its size) even
- * while idle, so appearing feedback never moves the controls around it.
+ * Feedback region for one correlated operation. Render it AFTER the action it
+ * reports on and AFTER any other position-critical controls. Its minimum
+ * empty-state height does not prevent long content from growing the region;
+ * controls following it can move between phases. Never clip Undo or details
+ * to simulate stable placement.
  */
 export function OperationFeedback({
   phase,
   operationLabel,
   correlationId,
   failureReason,
+  unknownReason,
   onUndo,
   undoLabel,
   undoPending,
@@ -103,7 +105,7 @@ export function OperationFeedback({
       className={cn(REGION_CLASSES)}
     >
       {phase === 'pending' ? (
-        <p className="flex items-center gap-2 text-sm">
+        <p className="flex min-w-0 items-center gap-2 text-sm [&>span]:min-w-0 [&>span]:break-all">
           <PhaseIcon phase={phase} />
           <span>
             <Trans>
@@ -113,7 +115,7 @@ export function OperationFeedback({
         </p>
       ) : null}
       {phase === 'applied' ? (
-        <p className="flex items-center gap-2 text-sm">
+        <p className="flex min-w-0 items-center gap-2 text-sm [&>span]:min-w-0 [&>span]:break-all">
           <PhaseIcon phase={phase} />
           <span>
             <Trans>{operationLabel} applied.</Trans>
@@ -121,36 +123,39 @@ export function OperationFeedback({
         </p>
       ) : null}
       {phase === 'failed' ? (
-        <p className="flex items-center gap-2 text-sm">
+        <p className="flex min-w-0 items-center gap-2 text-sm [&>span]:min-w-0 [&>span]:break-all">
           <PhaseIcon phase={phase} />
           <span>
-            <Trans>{operationLabel} failed — nothing was changed.</Trans>
+            <Trans>{operationLabel} failed.</Trans>
           </span>
         </p>
       ) : null}
       {phase === 'cancelled' ? (
-        <p className="flex items-center gap-2 text-sm">
+        <p className="flex min-w-0 items-center gap-2 text-sm [&>span]:min-w-0 [&>span]:break-all">
           <PhaseIcon phase={phase} />
           <span>
-            <Trans>{operationLabel} cancelled — nothing was changed.</Trans>
+            <Trans>{operationLabel} cancelled.</Trans>
           </span>
         </p>
       ) : null}
       {phase === 'unknown' ? (
-        <p className="flex items-center gap-2 text-sm">
+        <p className="flex min-w-0 items-center gap-2 text-sm [&>span]:min-w-0 [&>span]:break-all">
           <PhaseIcon phase={phase} />
           <span>
-            <Trans>{operationLabel} timed out — outcome unknown.</Trans>
+            <Trans>{operationLabel} outcome unknown.</Trans>
           </span>
         </p>
       ) : null}
       {phase === 'failed' && failureReason !== undefined && failureReason !== null ? (
         <p className="text-sm text-muted-foreground">{failureReason}</p>
       ) : null}
+      {phase === 'unknown' && unknownReason !== undefined && unknownReason !== null ? (
+        <p className="text-sm text-muted-foreground">{unknownReason}</p>
+      ) : null}
       {correlationId !== undefined && correlationId !== null ? (
         <p className="text-xs text-muted-foreground">
           <Trans>Correlation</Trans>{' '}
-          <code className="rounded bg-muted px-1 py-0.5 font-mono">
+          <code className="break-all rounded bg-muted px-1 py-0.5 font-mono">
             {correlationId}
           </code>
         </p>
@@ -162,7 +167,7 @@ export function OperationFeedback({
           pending={undoPending}
           // The undo key may carry a long label: wrap inside the reserved
           // region instead of overflowing it at 320–390px.
-          className="max-w-full self-start whitespace-normal text-left"
+          className="max-w-full self-start !h-auto min-h-12 whitespace-normal break-all py-2 text-left [&>span]:min-w-0 [&>span]:break-all"
         >
           {undoLabel ?? t`Undo ${operationLabel}`}
         </TouchAction>

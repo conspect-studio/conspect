@@ -164,6 +164,44 @@ describe('formatAssetDuration — unknown and unmeasured', () => {
   });
 });
 
+describe('formatAssetDuration — safe exact integer domain', () => {
+  it('rejects unsafe counts and cadence members without fabricating boundaries', () => {
+    const unsafe = Number.MAX_SAFE_INTEGER + 1;
+    expect(formatAssetDuration({ grid: { kind: 'audio', sampleRateHz: 48000 }, units: unsafe })).toMatchObject({ state: 'unmeasured', duration: null, boundary: null });
+    expect(formatAssetDuration({ grid: { kind: 'video', numerator: 25, denominator: 1 }, units: 1e308 })).toMatchObject({ state: 'unmeasured', duration: null, boundary: null });
+    for (const grid of [
+      { kind: 'audio' as const, sampleRateHz: unsafe },
+      { kind: 'video' as const, numerator: unsafe, denominator: 1 },
+      { kind: 'video' as const, numerator: 25, denominator: unsafe },
+    ]) {
+      expect(formatAssetDuration({ grid, units: 100 })).toMatchObject({ state: 'unknown', duration: null, boundary: null });
+    }
+  });
+
+  it('formats max-safe audio samples by exact integer division', () => {
+    const units = Number.MAX_SAFE_INTEGER;
+    const rate = 48000;
+    const ms = BigInt(units) * 1000n / BigInt(rate);
+    const h = ms / 3600000n;
+    const m = ms / 60000n % 60n;
+    const s = ms / 1000n % 60n;
+    const fraction = ms % 1000n;
+    expect(formatAssetDuration({ grid: { kind: 'audio', sampleRateHz: rate }, units })).toMatchObject({
+      state: 'formatted',
+      duration: `${String(h).padStart(2, '0')}:${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}.${String(fraction).padStart(3, '0')}`,
+      boundary: { kind: 'samples', index: units, sampleRateHz: rate },
+    });
+  });
+
+  it('formats safe upper video index without floating point label arithmetic', () => {
+    const units = Number.MAX_SAFE_INTEGER;
+    const fps = 25n;
+    const totalSeconds = BigInt(units) / fps;
+    const label = `${String(totalSeconds / 3600n).padStart(2, '0')}:${String(totalSeconds / 60n % 60n).padStart(2, '0')}:${String(totalSeconds % 60n).padStart(2, '0')}:${String(BigInt(units) % fps).padStart(2, '0')}`;
+    expect(formatAssetDuration({ grid: { kind: 'video', numerator: 25, denominator: 1 }, units }).duration).toBe(label);
+  });
+});
+
 describe('formatAssetDuration — derivative fallback', () => {
   it('inherits the parent grid and marks the origin inherited', () => {
     const out = formatAssetDuration(

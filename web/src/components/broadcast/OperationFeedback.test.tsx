@@ -1,4 +1,4 @@
-// OperationFeedback tests — the stable feedback/undo contract from the
+// OperationFeedback tests — the feedback/undo contract from the
 // correction-4 reviews:
 //   * accepted ≠ applied: the pending line says the request was accepted and
 //     is WAITING for the applied event; it never claims applied (safety S3).
@@ -6,9 +6,8 @@
 //     applied" wording is obsolete); the component owns no timer, so a pending
 //     operation can never age itself into a false failure.
 //   * the correlation id is displayed so the outcome can be reconciled later.
-//   * the region is reserved and stable: idle, pending and applied all keep
-//     the same min-height slot, no overflow-hidden, no fixed height — the
-//     68px-slot defect that clipped the 75px undo toast must not return.
+//   * the region has minimum height but grows for long copy. Position-critical
+//     controls belong before it; never clip Undo to fake a stable height.
 //   * no localStorage authority, no fetch: the component is presentational.
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { fireEvent, screen } from '@testing-library/react';
@@ -109,12 +108,21 @@ describe('OperationFeedback — phase wording', () => {
     const region = regionOf(container);
     expect(region?.dataset.phase).toBe('unknown');
     expect(region).toHaveTextContent(
-      /Save VT 2 timed out — outcome unknown\./,
+      /Save VT 2 outcome unknown\./,
     );
     expect(region?.textContent).not.toMatch(/failed/i);
   });
 
-  it('failed names the failure, says nothing changed, and persists until dismissed', () => {
+  it('shows a supplied verified cause only for unknown, not a default timeout claim', () => {
+    const { container, rerender } = renderWithProviders(
+      <OperationFeedback phase="unknown" operationLabel="Save VT 2" unknownReason="Connection lost" />,
+    );
+    expect(regionOf(container)).toHaveTextContent(/Connection lost/);
+    rerender(<OperationFeedback phase="unknown" operationLabel="Save VT 2" />);
+    expect(regionOf(container)?.textContent).not.toMatch(/Connection lost|timed out/i);
+  });
+
+  it('failed names the failure without promising rollback and persists until dismissed', () => {
     const onDismiss = vi.fn();
     const { container } = renderWithProviders(
       <OperationFeedback
@@ -125,19 +133,19 @@ describe('OperationFeedback — phase wording', () => {
       />,
     );
     const region = regionOf(container);
-    expect(region).toHaveTextContent(/Save VT 2 failed — nothing was changed\./);
+    expect(region).toHaveTextContent(/Save VT 2 failed\./);
+    expect(region?.textContent).not.toMatch(/nothing (?:was )?changed|rolled back/i);
     expect(region).toHaveTextContent(/slot held by an unresolved operation/);
     fireEvent.click(screen.getByRole('button', { name: 'Dismiss' }));
     expect(onDismiss).toHaveBeenCalledOnce();
   });
 
-  it('cancelled says nothing was changed', () => {
+  it('cancelled does not assert that effects were rolled back', () => {
     const { container } = renderWithProviders(
       <OperationFeedback phase="cancelled" operationLabel="Save VT 2" />,
     );
-    expect(regionOf(container)).toHaveTextContent(
-      /Save VT 2 cancelled — nothing was changed\./,
-    );
+    expect(regionOf(container)).toHaveTextContent(/Save VT 2 cancelled\./);
+    expect(regionOf(container)?.textContent).not.toMatch(/nothing (?:was )?changed|rolled back/i);
   });
 
   it('displays the correlation id on pending and unknown phases', () => {
@@ -169,7 +177,7 @@ describe('OperationFeedback — stability and honesty', () => {
     }
   });
 
-  it('reserves the same stable slot in every phase — no clipping container', () => {
+  it('keeps a minimum empty slot without clipping long content', () => {
     for (const phase of PHASES) {
       const { container, unmount } = renderWithProviders(
         <OperationFeedback phase={phase} operationLabel="Mute CAM 3" />,

@@ -2,7 +2,8 @@
 // during render (react-hooks/purity), so — exactly like the devices' last-seen
 // clock in `src/devices/lastSeen.tsx` — the impure read happens inside a
 // shared interval, is cached, and is exposed as a `useSyncExternalStore`
-// snapshot. One interval serves every mounted consumer and stops when the
+// snapshot. The first subscription after idle refreshes the cached time
+// before React re-reads the snapshot, including after a delayed first mount. One interval serves every mounted consumer and stops when the
 // last one unmounts. Tests bypass it by injecting `now` into
 // {@link ProducerStatus} for a deterministic age.
 import { useSyncExternalStore } from 'react';
@@ -14,6 +15,9 @@ const nowListeners = new Set<() => void>();
 let nowTimer: ReturnType<typeof setInterval> | undefined;
 
 function subscribeNow(listener: () => void): () => void {
+  if (nowListeners.size === 0) {
+    cachedNowMs = Date.now();
+  }
   nowListeners.add(listener);
   nowTimer ??= setInterval(() => {
     cachedNowMs = Date.now();

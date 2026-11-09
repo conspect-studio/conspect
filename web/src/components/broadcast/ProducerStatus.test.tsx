@@ -46,6 +46,21 @@ describe('deriveProducerDisplay — pure derivation', () => {
     });
   });
 
+  it('rejects non-finite timestamps, clocks, thresholds and unsafe age arithmetic', () => {
+    for (const bad of [NaN, Infinity, -Infinity]) {
+      expect(deriveProducerDisplay('producing', bad, NOW, 3000)).toMatchObject({ display: 'unknown', ageMs: null });
+      expect(deriveProducerDisplay('producing', NOW - 100, bad, 3000)).toMatchObject({ display: 'unknown', ageMs: null });
+      expect(deriveProducerDisplay('producing', NOW - 100, NOW, bad)).toMatchObject({ display: 'unknown', ageMs: null });
+      expect(deriveProducerDisplay('failed', bad, NOW, 3000).ageMs).toBeNull();
+    }
+    for (const bad of [0, -1]) {
+      expect(deriveProducerDisplay('producing', NOW - 100, NOW, bad)).toMatchObject({ display: 'unknown', ageMs: null });
+    }
+    expect(deriveProducerDisplay('producing', -Number.MAX_VALUE, Number.MAX_VALUE, 3000)).toMatchObject({ display: 'unknown', ageMs: null });
+    expect(deriveProducerDisplay('producing', 1, Number.MAX_SAFE_INTEGER + 1, 3000)).toMatchObject({ display: 'unknown', ageMs: null });
+    expect(deriveProducerDisplay('producing', -Number.MAX_SAFE_INTEGER, Number.MAX_SAFE_INTEGER, 3000)).toMatchObject({ display: 'unknown', ageMs: null });
+  });
+
   it('lets failed and stopped win over tick freshness', () => {
     expect(deriveProducerDisplay('failed', NOW - 100, NOW, 3000).display).toBe('failed');
     expect(deriveProducerDisplay('stopped', NOW - 100, NOW, 3000).display).toBe('stopped');

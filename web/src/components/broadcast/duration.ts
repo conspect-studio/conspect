@@ -77,12 +77,12 @@ function isUsableGrid(
     return false;
   }
   if (grid.kind === 'audio') {
-    return Number.isInteger(grid.sampleRateHz) && grid.sampleRateHz >= 1;
+    return Number.isSafeInteger(grid.sampleRateHz) && grid.sampleRateHz >= 1;
   }
   return (
-    Number.isInteger(grid.numerator) &&
+    Number.isSafeInteger(grid.numerator) &&
     grid.numerator >= 1 &&
-    Number.isInteger(grid.denominator) &&
+    Number.isSafeInteger(grid.denominator) &&
     grid.denominator >= 1
   );
 }
@@ -93,21 +93,21 @@ function isUsableUnits(
   return (
     units !== null &&
     units !== undefined &&
-    Number.isInteger(units) &&
+    Number.isSafeInteger(units) &&
     units >= 0
   );
 }
 
-function pad(value: number, width: number): string {
+function pad(value: bigint, width: number): string {
   return String(value).padStart(width, '0');
 }
 
 /** Elapsed audio clock label, `HH:MM:SS.mmm`, floored at the millisecond. */
-function elapsedClock(totalMs: number): string {
-  const hours = Math.floor(totalMs / 3_600_000);
-  const minutes = Math.floor(totalMs / 60_000) % 60;
-  const seconds = Math.floor(totalMs / 1000) % 60;
-  const millis = totalMs % 1000;
+function elapsedClock(totalMs: bigint): string {
+  const hours = totalMs / 3_600_000n;
+  const minutes = totalMs / 60_000n % 60n;
+  const seconds = totalMs / 1000n % 60n;
+  const millis = totalMs % 1000n;
   return `${pad(hours, 2)}:${pad(minutes, 2)}:${pad(seconds, 2)}.${pad(millis, 3)}`;
 }
 
@@ -117,10 +117,11 @@ function elapsedClock(totalMs: number): string {
  * broadcast reviews require (a 30000/1001 asset labels 30 frames a second;
  * the exact position stays the integer index).
  */
-function ndfTimecode(frames: number, framesPerSecond: number): string {
-  const hours = Math.floor(frames / (framesPerSecond * 3600));
-  const minutes = Math.floor(frames / (framesPerSecond * 60)) % 60;
-  const seconds = Math.floor(frames / framesPerSecond) % 60;
+function ndfTimecode(frames: bigint, framesPerSecond: bigint): string {
+  const secondsTotal = frames / framesPerSecond;
+  const hours = secondsTotal / 3600n;
+  const minutes = secondsTotal / 60n % 60n;
+  const seconds = secondsTotal % 60n;
   const frameField = frames % framesPerSecond;
   return `${pad(hours, 2)}:${pad(minutes, 2)}:${pad(seconds, 2)}:${pad(frameField, 2)}`;
 }
@@ -162,7 +163,7 @@ export function formatAssetDuration(
   if (grid.kind === 'audio') {
     return {
       state: 'formatted',
-      duration: elapsedClock(Math.floor((units * 1000) / grid.sampleRateHz)),
+      duration: elapsedClock(BigInt(units) * 1000n / BigInt(grid.sampleRateHz)),
       boundary: {
         kind: 'samples',
         index: units,
@@ -174,7 +175,7 @@ export function formatAssetDuration(
   }
   return {
     state: 'formatted',
-    duration: ndfTimecode(units, Math.ceil(grid.numerator / grid.denominator)),
+    duration: ndfTimecode(BigInt(units), (BigInt(grid.numerator) + BigInt(grid.denominator) - 1n) / BigInt(grid.denominator)),
     boundary: {
       kind: 'frames',
       index: units,

@@ -3,7 +3,8 @@
 // OUTPUT TICKS ONLY. A management connection — however healthy — never feeds
 // it; a missing tick is UNKNOWN; an old tick is FROZEN / STALE past an exact
 // threshold; a future timestamp cannot verify freshness, so it is UNKNOWN
-// too; and reading or changing the state enum never fabricates a tick.
+// too; invalid telemetry values cannot imply fresh health or show NaN;
+// reading or changing the state enum never fabricates a tick.
 // Pure functions only: no React, no i18n, no side effects.
 
 /** The producer state the control plane reports. */
@@ -21,7 +22,8 @@ export type ProducerDisplay =
 export type ProducerUnknownReason =
   | 'no-tick'
   | 'future-tick'
-  | 'state-unknown';
+  | 'state-unknown'
+  | 'invalid-observation';
 
 export interface DerivedProducerDisplay {
   readonly display: ProducerDisplay;
@@ -32,11 +34,11 @@ export interface DerivedProducerDisplay {
 }
 
 function tickAge(lastTickAt: number | null, nowMs: number): number | null {
-  if (lastTickAt === null) {
+  if (lastTickAt === null || !Number.isSafeInteger(lastTickAt) || !Number.isSafeInteger(nowMs)) {
     return null;
   }
   const age = nowMs - lastTickAt;
-  return age >= 0 ? age : null;
+  return Number.isSafeInteger(age) && age >= 0 ? age : null;
 }
 
 /**
@@ -63,7 +65,14 @@ export function deriveProducerDisplay(
   if (lastTickAt === null) {
     return { display: 'unknown', ageMs: null, reason: 'no-tick' };
   }
+  if (!Number.isSafeInteger(lastTickAt) || !Number.isSafeInteger(nowMs) ||
+      !Number.isFinite(staleAfterMs) || staleAfterMs <= 0) {
+    return { display: 'unknown', ageMs: null, reason: 'invalid-observation' };
+  }
   const ageMs = nowMs - lastTickAt;
+  if (!Number.isSafeInteger(ageMs)) {
+    return { display: 'unknown', ageMs: null, reason: 'invalid-observation' };
+  }
   if (ageMs < 0) {
     return { display: 'unknown', ageMs: null, reason: 'future-tick' };
   }
