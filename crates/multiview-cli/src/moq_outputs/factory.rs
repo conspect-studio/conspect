@@ -104,10 +104,32 @@ pub(crate) struct RenditionFamily {
 pub(crate) struct DynamicRegistryFactory(
     pub(crate) crate::output_window_registry::WindowSubscriptionSlot,
 );
-pub(crate) struct OutgoingTask(tokio::task::JoinHandle<()>);
+fn outgoing_principal(
+    keys: &multiview_control::auth::ApiKeyStore,
+    key_id: &str,
+) -> Result<(Principal, u64), MoqReject> {
+    let principal = keys.principal_for_key(key_id).ok_or(MoqReject::Forbidden)?;
+    principal
+        .role
+        .require(multiview_control::auth::Action::Write)
+        .map_err(|_| MoqReject::Forbidden)?;
+    Ok((principal, keys.generation()))
+}
+
+pub(crate) struct OutgoingTask {
+    stop: tokio::sync::watch::Sender<bool>,
+    worker: tokio::task::JoinHandle<()>,
+}
+impl OutgoingTask {
+    pub(crate) async fn shutdown(mut self) {
+        self.stop.send_replace(true);
+        let _ = (&mut self.worker).await;
+    }
+}
 impl Drop for OutgoingTask {
     fn drop(&mut self) {
-        self.0.abort();
+        self.stop.send_replace(true);
+        self.worker.abort();
     }
 }
 impl DynamicRegistryFactory {
@@ -122,13 +144,7 @@ impl DynamicRegistryFactory {
         };
         let output =
             std::env::var("MULTIVIEW_MOQ_RELAY_OUTPUT").map_err(|_| MoqReject::Unavailable)?;
-        let principal = keys
-            .principal_for_key(&key_id)
-            .ok_or(MoqReject::Forbidden)?;
-        principal
-            .role
-            .require(multiview_control::auth::Action::Write)
-            .map_err(|_| MoqReject::Forbidden)?;
+        let (principal, generation) = outgoing_principal(&keys, &key_id)?;
         let path =
             std::env::var("MULTIVIEW_MOQ_RELAY_URL_FILE").map_err(|_| MoqReject::Unavailable)?;
         #[cfg(unix)]
@@ -180,35 +196,39 @@ impl DynamicRegistryFactory {
             retained_bytes: 8 * 1024 * 1024,
             protected: false,
         };
-        let generation = keys.generation();
         let slot = self.0.clone();
-        Ok(Some(OutgoingTask(tokio::spawn(async move {
-            let dynamic = DynamicRegistryFactory(slot);
-            let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
-            while !dynamic.available() {
-                if keys.generation() != generation || tokio::time::Instant::now() >= deadline {
+        let (stop, mut stopped) = tokio::sync::watch::channel(false);
+        Ok(Some(OutgoingTask {
+            stop,
+            worker: tokio::spawn(async move {
+                let dynamic = DynamicRegistryFactory(slot);
+                let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+                while !dynamic.available() {
+                    if keys.generation() != generation || tokio::time::Instant::now() >= deadline {
+                        return;
+                    }
+                    tokio::select! { _ = tokio::time::sleep(Duration::from_millis(20)) => {}, _ = stopped.wait_for(|stop| *stop) => return }
+                }
+                let scope = WhepScope::Output(output);
+                let Ok(mut publisher) = dynamic.start_outgoing(&principal, &scope, config).await
+                else {
                     return;
-                }
-                tokio::time::sleep(Duration::from_millis(20)).await;
-            }
-            let scope = WhepScope::Output(output);
-            let Ok(mut publisher) = dynamic.start_outgoing(&principal, &scope, config).await else {
-                return;
-            };
-            loop {
-                tokio::time::sleep(Duration::from_millis(100)).await;
-                if keys.generation() != generation || !dynamic.available() {
-                    break;
-                }
-                let Ok(current) = dynamic.current() else {
-                    break;
                 };
-                if current.subscriptions.generation() != publisher.ladder().generation() {
-                    break;
+                loop {
+                    tokio::select! { _ = tokio::time::sleep(Duration::from_millis(100)) => {}, _ = stopped.wait_for(|stop| *stop) => break }
+                    if keys.generation() != generation || !dynamic.available() {
+                        break;
+                    }
+                    let Ok(current) = dynamic.current() else {
+                        break;
+                    };
+                    if current.subscriptions.generation() != publisher.ladder().generation() {
+                        break;
+                    }
                 }
-            }
-            publisher.shutdown().await;
-        }))))
+                publisher.shutdown().await;
+            }),
+        }))
     }
 }
 
@@ -2162,5 +2182,39 @@ mod tests {
         assert!(windows.try_recv().is_err());
         drop(feed);
         assert_eq!(registry.active_subscriptions(), 0);
+    }
+    #[test]
+    fn outgoing_activation_resolves_existing_scoped_identity_and_detects_withdrawal() {
+        let mut keys = multiview_control::auth::ApiKeyStore::new(b"test".to_vec());
+        assert!(matches!(
+            outgoing_principal(&keys, "missing"),
+            Err(MoqReject::Forbidden)
+        ));
+        let scoped = operator(
+            Some(vec!["camera-a".into(), "program".into()]),
+            Some(vec!["low".into()]),
+        );
+        keys.register("service", "test-only", scoped);
+        let (principal, generation) = outgoing_principal(&keys, "service").unwrap();
+        assert!(metadata::authorize_binding(
+            &principal,
+            &WhepScope::Output("low".into()),
+            "low",
+            &["camera-a".into()]
+        )
+        .is_ok());
+        assert!(metadata::authorize_binding(
+            &principal,
+            &WhepScope::Output("low".into()),
+            "high",
+            &["camera-a".into()]
+        )
+        .is_err());
+        assert!(keys.revoke("service"));
+        assert_ne!(keys.generation(), generation);
+        assert!(matches!(
+            outgoing_principal(&keys, "service"),
+            Err(MoqReject::Forbidden)
+        ));
     }
 }

@@ -506,8 +506,12 @@ where
     let shutdown = async move {
         let _reconciler = reconciler;
         #[cfg(feature = "moq-output")]
-        let _outgoing = outgoing;
+        let outgoing = outgoing;
         shutdown.await;
+        #[cfg(feature = "moq-output")]
+        if let Some(outgoing) = outgoing {
+            outgoing.shutdown().await;
+        }
     };
     let mut app = multiview_control::router(state.clone());
     for mount in hls_mounts(config) {

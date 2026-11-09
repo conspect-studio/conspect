@@ -278,33 +278,53 @@ mod tests {
         assert!(publication.enable_trial_cancellation(1).is_err());
         assert!(publication.cancel_trial(1).is_err());
         assert!(publication.discontinuity(1).is_err());
-        assert!(video.append_group().is_err(), "preexisting video producer clone is revoked");
-        assert!(audio.append_group().is_err(), "whole publication terminal, not ordinary video downshift");
+        assert!(
+            video.append_group().is_err(),
+            "preexisting video producer clone is revoked"
+        );
+        assert!(
+            audio.append_group().is_err(),
+            "whole publication terminal, not ordinary video downshift"
+        );
         assert!(publication.publish_audio("audio", &[]).is_err());
         assert!(publication.set_stalled(&[]).is_err());
-        let other_origin=moq_net::broadcast::Producer::new(Default::default());
-        let other=SharedPublication::create(ladder(2), &other_origin).unwrap();
+        let other_origin = moq_net::broadcast::Producer::new(Default::default());
+        let other = SharedPublication::create(ladder(2), &other_origin).unwrap();
         assert!(other.rendition_track(1).unwrap().append_group().is_ok());
     }
     #[test]
     fn old_catalog_group_partial_cannot_poison_new_catalog_group() {
-        let origin=moq_net::broadcast::Producer::new(Default::default());
-        let mut publication=SharedPublication::create(ladder(1),&origin).unwrap();
-        let catalog=publication.catalog_track().clone();
-        let mut old=catalog.append_group().unwrap();
-        let _partial=old.create_frame(moq_net::frame::Info { timestamp:moq_net::Timestamp::from_millis(0).unwrap(),size:10 }).unwrap();
+        let origin = moq_net::broadcast::Producer::new(Default::default());
+        let mut publication = SharedPublication::create(ladder(1), &origin).unwrap();
+        let catalog = publication.catalog_track().clone();
+        let mut old = catalog.append_group().unwrap();
+        let _partial = old
+            .create_frame(moq_net::frame::Info {
+                timestamp: moq_net::Timestamp::from_millis(0).unwrap(),
+                size: 10,
+            })
+            .unwrap();
         publication.set_stalled(&[1]).unwrap();
-        assert_eq!(publication.stalled(),&[1]);
+        assert_eq!(publication.stalled(), &[1]);
     }
     #[test]
     fn audio_transport_failure_is_terminal_not_fake_rollback() {
-        let origin=moq_net::broadcast::Producer::new(Default::default());
-        let mut publication=SharedPublication::create(ladder(1),&origin).unwrap();
-        publication.audio_track("audio").unwrap().clone().abort(moq_net::Error::Cancel).unwrap();
-        let packet=crate::Packet {payload:Bytes::from_static(b"audio"),pts_us:1,verified_rap:true};
-        assert!(publication.publish_audio("audio",&[packet]).is_err());
+        let origin = moq_net::broadcast::Producer::new(Default::default());
+        let mut publication = SharedPublication::create(ladder(1), &origin).unwrap();
+        publication
+            .audio_track("audio")
+            .unwrap()
+            .clone()
+            .abort(moq_net::Error::Cancel)
+            .unwrap();
+        let packet = crate::Packet {
+            payload: Bytes::from_static(b"audio"),
+            pts_us: 1,
+            verified_rap: true,
+        };
+        assert!(publication.publish_audio("audio", &[packet]).is_err());
         assert!(publication.set_stalled(&[]).is_err());
-        assert!(publication.publish_audio("audio",&[]).is_err());
+        assert!(publication.publish_audio("audio", &[]).is_err());
     }
     #[test]
     fn actual_init_argument_carries_transport_buffer_and_stream_bounds() {
