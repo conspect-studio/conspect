@@ -24,7 +24,7 @@ describe('shell realtime operation adapter', () => {
       <QueryClientProvider client={client}>{children}</QueryClientProvider>;
     const hook = renderHook(() => useEngineEvents(), { wrapper });
     const tracker = getOperationTracker(client);
-    await tracker.submit(() => Promise.resolve({ operation_id: 'op1', kind: 'media.play' }), {
+    await tracker.submit(() => Promise.resolve({ operation_id: 'op1', kind: 'media_play' }), {
       topic: 'switcher', resource: 'p1', event: 'media.player_state',
       terminal: { kind: 'player-state', state: 'playing' },
     });
