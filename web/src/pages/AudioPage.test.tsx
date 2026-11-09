@@ -353,6 +353,15 @@ describe("AudioPage", () => {
   });
 
   it("saves again with the refreshed ETag from the previous save", async () => {
+    let revision = 7;
+    server.use(
+      http.get("*/api/v1/audio-routing", () => HttpResponse.json(ROUTING, { headers: { ETag: `W/"${String(revision)}"` } })),
+      http.put("*/api/v1/audio-routing", async ({ request }) => {
+        lastPut = { body: await request.json(), ifMatch: request.headers.get("if-match") };
+        revision++;
+        return HttpResponse.json(ROUTING, { headers: { ETag: `W/"${String(revision)}"`, "X-Multiview-Apply": "restart" } });
+      }),
+    );
     renderAudio();
     await screen.findByLabelText(/sample rate/i);
     await userEvent.click(screen.getByTestId("audio-save"));
@@ -362,6 +371,116 @@ describe("AudioPage", () => {
     await waitFor(() => {
       expect(lastPut?.ifMatch).toBe('W/"8"');
     });
+  });
+
+  it("adopts the canonical successful response as both saved baseline and clean draft", async () => {
+    let revision = 7;
+    let state = ROUTING;
+    server.use(
+      http.get("*/api/v1/audio-routing", () => HttpResponse.json(state, { headers: { ETag: `W/"${String(revision)}"` } })),
+      http.put("*/api/v1/audio-routing", async ({ request }) => {
+        lastPut = { body: await request.json(), ifMatch: request.headers.get("if-match") };
+        revision++;
+        state = { ...ROUTING, routing: { ...ROUTING.routing, routes: [{ ...required(ROUTING.routing.routes[0], "canonical route"), gain_db: -6, title: "Normalized by server" }] } };
+        return HttpResponse.json(state, { headers: { ETag: `W/"${String(revision)}"`, "X-Multiview-Apply": "partial" } });
+      }),
+    );
+    renderAudio();
+    const focused = (await console()).focused;
+    await userEvent.click(within(focused).getByRole("button", { name: /Camera 1 gain \+1 dB/i }));
+    await userEvent.click(screen.getByTestId("audio-save"));
+    await waitFor(() => expect(within(focused).getByTestId("audio-strip-readout")).toHaveTextContent(/Draft -6 dB.*Saved -6 dB/s));
+    expect(screen.queryByTestId("audio-draft-summary")).not.toBeInTheDocument();
+    expect(within(focused).queryByTestId("audio-strip-undo")).not.toBeInTheDocument();
+    await userEvent.click(within(focused).getByRole("button", { name: /Camera 1 gain \+1 dB/i }));
+    await userEvent.click(within(focused).getByTestId("audio-strip-undo"));
+    expect(within(focused).getByTestId("audio-strip-readout")).toHaveTextContent(/Draft -6 dB.*Saved -6 dB/s);
+    expect(lastPut?.ifMatch).toBe('W/"7"');
+  });
+
+  it("keeps invalid exact gain visible instead of nudging it into zero", async () => {
+    renderAudio();
+    const focused = (await console()).focused;
+    await userEvent.click(within(focused).getByTestId("audio-strip-details").querySelector("summary")!);
+    const gain = within(focused).getByLabelText(/Gain in dB/i);
+    await userEvent.clear(gain);
+    await userEvent.type(gain, "-");
+    expect(gain).toHaveValue("-");
+    expect(within(focused).getByTestId("audio-strip-readout")).toHaveTextContent(/invalid gain/i);
+    for (const button of within(focused).getAllByTestId("audio-nudge")) expect(button).toBeDisabled();
+    expect(within(focused).getByTestId("audio-fader")).toBeDisabled();
+    await userEvent.click(screen.getByTestId("audio-save"));
+    expect(lastPut).toBeUndefined();
+    expect(gain).toHaveValue("-");
+  });
+
+  it("preserves row association after removing the first route, including duplicate input ids", async () => {
+    const three = { ...ROUTING_TWO, routing: { ...ROUTING_TWO.routing, routes: [
+      ROUTING.routing.routes[0],
+      { ...ROUTING.routing.routes[0], gain_db: -9, target_track: "duplicate-clean", title: "Duplicate camera" },
+      { ...ROUTING.routing.routes[0], input_id: "cam-2", target_track: "third-clean", gain_db: -12, title: "Third camera" },
+    ] } };
+    server.use(
+      http.get("*/api/v1/audio-routing", () => HttpResponse.json(three, { headers: { ETag: 'W/"7"' } })),
+      http.put("*/api/v1/audio-routing", async ({ request }) => {
+        lastPut = { body: await request.json(), ifMatch: request.headers.get("if-match") };
+        return HttpResponse.json(three, { headers: { ETag: 'W/"8"', "X-Multiview-Apply": "partial" } });
+      }),
+    );
+    renderAudio();
+    const focused = (await console()).focused;
+    await userEvent.click(within(focused).getByRole("button", { name: /remove route/i }));
+    expect(within(focused).getByTestId("audio-strip-readout")).toHaveTextContent(/Draft -9 dB.*Saved -9 dB/s);
+    await userEvent.click(within(focused).getByRole("button", { name: /MUTE/i }));
+    await userEvent.click(within(focused).getByTestId("audio-strip-undo"));
+    expect(within(focused).getByTestId("audio-strip-readout")).toHaveTextContent(/Draft -9 dB.*Saved -9 dB/s);
+    await userEvent.click(screen.getByTestId("audio-save"));
+    expect(screen.getByTestId("audio-save")).not.toBeDisabled();
+    expect(screen.queryAllByRole("alert").map((node) => node.textContent)).toEqual([]);
+    await waitFor(() => { expect(lastPut).toBeDefined(); });
+    expect(lastPut?.body).toMatchObject({ routes: [
+      { input_id: "cam-1", gain_db: -9, title: "Duplicate camera" },
+      { input_id: "cam-2", gain_db: -12, title: "Third camera" },
+    ] });
+  });
+
+  it("blocks stale whole-document writes after a 412 until explicit reload", async () => {
+    let revision = 7;
+    let seenConflict = false;
+    let state = ROUTING;
+    const writes: { body: unknown; ifMatch: string | null }[] = [];
+    server.use(
+      http.get("*/api/v1/audio-routing", () => HttpResponse.json(state, { headers: { ETag: `W/"${String(revision)}"` } })),
+      http.put("*/api/v1/audio-routing", async ({ request }) => {
+        const write = { body: await request.json(), ifMatch: request.headers.get("if-match") };
+        writes.push(write);
+        if (write.ifMatch !== `W/"${String(revision)}"`) {
+          seenConflict = true;
+          return new HttpResponse(null, { status: 412 });
+        }
+        revision++;
+        return HttpResponse.json(state, { headers: { ETag: `W/"${String(revision)}"`, "X-Multiview-Apply": "live" } });
+      }),
+    );
+    renderAudio();
+    const focused = (await console()).focused;
+    await userEvent.click(within(focused).getByRole("button", { name: /Camera 1 gain \+1 dB/i }));
+    revision = 8;
+    expect(seenConflict).toBe(false);
+    state = { ...ROUTING, routing: { ...ROUTING.routing, routes: [{ ...required(ROUTING.routing.routes[0], "remote route"), title: "Remote operator" }] } };
+    expect(screen.getByTestId("audio-save")).not.toBeDisabled();
+    await userEvent.click(screen.getByTestId("audio-save"));
+    await waitFor(() => { expect(writes).toHaveLength(1); }, { timeout: 1500 });
+    expect(screen.queryAllByRole("alert").map((node) => node.textContent)).not.toContain("This channel has draft errors — they are marked inside Details.");
+    await screen.findByRole("button", { name: /reload latest routing/i });
+    expect(within(focused).getByTestId("audio-strip-readout")).toHaveTextContent(/Draft -2 dB.*Saved -3 dB/s);
+    expect(screen.getByTestId("audio-save")).toBeDisabled();
+    expect(writes[0]?.ifMatch).toBe('W/"7"');
+    await userEvent.click(screen.getByRole("button", { name: /reload latest routing/i }));
+    await userEvent.click(within(focused).getByRole("button", { name: /Camera 1 gain \+1 dB/i }));
+    await userEvent.click(screen.getByTestId("audio-save"));
+    await waitFor(() => { expect(writes).toHaveLength(2); });
+    expect(writes[1]).toMatchObject({ ifMatch: 'W/"8"', body: { routes: [{ title: "Remote operator", gain_db: -2 }] } });
   });
 
   it("reports a live-applied save without asking for a restart", async () => {

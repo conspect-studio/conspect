@@ -96,6 +96,12 @@ describe('nudgeGainDb', () => {
     expect(nudgeGainDb('-3', 6)).toBe('3');
   });
 
+  it('does not convert an invalid transient gain to fabricated zero', () => {
+    for (const value of ['-', 'NaN', 'Infinity', '1e999']) {
+      expect(nudgeGainDb(value, 1)).toBe(value);
+    }
+  });
+
   it('keeps fractional drafts exact', () => {
     expect(nudgeGainDb('-3.5', -1)).toBe('-4.5');
     expect(nudgeGainDb('0.5', 1)).toBe('1.5');
@@ -200,6 +206,15 @@ describe('documentDraftDiff', () => {
     expect(added.routes[0]?.isNew).toBe(false);
     expect(added.routes[1]?.isNew).toBe(true);
     expect(added.changedRouteCount).toBe(1);
+  });
+
+  it('associates saved rows by local identity, never duplicate input names or shifted positions', () => {
+    const saved = form([row({ inputId: 'dup', gainDb: '-3' }), row({ inputId: 'dup', gainDb: '-9' })]);
+    const draft = form([row({ inputId: 'dup', gainDb: '-9' }), row({ inputId: 'dup', gainDb: '0' })]);
+    const diff = documentDraftDiff(saved, draft, [1, undefined]);
+    expect(diff.routes[0]?.changed).toBe(false);
+    expect(diff.routes[1]?.isNew).toBe(true);
+    expect(diff.changedRouteCount).toBe(2); // one new row and one removed row
   });
 
   it('compares the sample rate semantically, not lexically', () => {

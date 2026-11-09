@@ -219,7 +219,7 @@ function ChannelStrip({
   idPrefix,
 }: {
   readonly route: AudioRouteRow;
-  /** The saved row at the same position; `undefined` for a new route. */
+  /** The saved row associated with this local row id; absent for a new route. */
   readonly saved: AudioRouteRow | undefined;
   readonly diff: RouteDraftDiff | undefined;
   readonly index: number;
@@ -239,8 +239,8 @@ function ChannelStrip({
   const { t } = useLingui();
   const row = index + 1;
   const track = route.targetTrack.trim();
-  const draftDb = parseGainDb(route.gainDb) ?? 0;
-  const savedDb = saved !== undefined ? parseGainDb(saved.gainDb) ?? 0 : undefined;
+  const draftDb = parseGainDb(route.gainDb);
+  const savedDb = saved !== undefined ? parseGainDb(saved.gainDb) : undefined;
   const routeHasErrors = errors !== undefined && Object.keys(errors).length > 0;
   // The input picker offers the managed sources; a route bound to an id the
   // list does not carry (authored elsewhere / source deleted) stays selectable
@@ -258,7 +258,7 @@ function ChannelStrip({
     <section
       data-testid="audio-strip"
       aria-label={t`Channel strip — ${label}`}
-      className="flex w-full flex-col gap-3 rounded-md border p-3"
+      className="flex w-full min-w-0 flex-col gap-3 rounded-md border p-3"
     >
       <header className="flex min-w-0 flex-col gap-1">
         <span
@@ -284,8 +284,7 @@ function ChannelStrip({
         </span>
         {' '}
         <span className="font-mono text-base font-semibold tabular-nums">
-          {formatDb(draftDb)}{' '}
-          <span className="text-xs font-normal text-muted-foreground">dB</span>
+          {draftDb === undefined ? <Trans>invalid gain</Trans> : <>{formatDb(draftDb)}{' '}<span className="text-xs font-normal text-muted-foreground">dB</span></>}
         </span>
         {savedDb !== undefined ? (
           <span className="text-xs text-muted-foreground">
@@ -347,6 +346,7 @@ function ChannelStrip({
                 : t`${label} gain −${Math.abs(delta)} dB`
             }
             className="size-12 p-0 font-mono"
+            disabled={draftDb === undefined}
             onClick={(): void => {
               setGain(nudgeGainDb(route.gainDb, delta));
             }}
@@ -380,12 +380,15 @@ function ChannelStrip({
             min={GAIN_FADER_MIN_DB}
             max={GAIN_FADER_MAX_DB}
             step={1}
-            value={faderDisplayDb(draftDb)}
+            value={faderDisplayDb(draftDb ?? 0)}
+            disabled={draftDb === undefined}
             aria-label={t`${label} gain fader (0 dB at the top, −60 dB at the bottom)`}
             aria-valuetext={
-              savedDb !== undefined && savedDb !== draftDb
-                ? t`draft ${formatDb(draftDb)} dB, saved ${formatDb(savedDb)} dB`
-                : t`${formatDb(draftDb)} dB`
+              draftDb === undefined
+                ? t`invalid gain; edit exact gain in Details`
+                : savedDb !== undefined && savedDb !== draftDb
+                  ? t`draft ${formatDb(draftDb)} dB, saved ${formatDb(savedDb)} dB`
+                  : t`${formatDb(draftDb)} dB`
             }
             className="absolute left-1/2 top-1/2 h-12 w-60 max-w-none -translate-x-1/2 -translate-y-1/2 -rotate-90 cursor-pointer accent-primary"
             onChange={(event): void => {
@@ -768,14 +771,16 @@ function OverviewRow({
  * while the operator carries a draft. Tap a row to ride that channel. */
 function MixOverview({
   form,
-  serverForm,
+  savedRows,
+  rowIds,
   diff,
   sourceNames,
   inputs,
   onRide,
 }: {
   readonly form: AudioFormState;
-  readonly serverForm: AudioFormState;
+  readonly savedRows: readonly (AudioRouteRow | undefined)[];
+  readonly rowIds: readonly number[];
   readonly diff: ReturnType<typeof documentDraftDiff> | undefined;
   readonly sourceNames: ReadonlyMap<string, string>;
   readonly inputs: readonly AudioMeterSample[];
@@ -830,9 +835,9 @@ function MixOverview({
         ) : (
           form.routes.map((route, index) => (
             <OverviewRow
-              key={index}
+              key={rowIds[index]}
               draft={route}
-              saved={serverForm.routes[index]}
+              saved={savedRows[index]}
               changed={diff?.routes[index]?.changed === true}
               label={
                 route.inputId.trim() === ''
@@ -865,12 +870,21 @@ export function AudioPage(): JSX.Element {
   // subscription feeds the overview rows and every strip's IN column.
   const meter = useAudioMeter();
 
-  // The operator's edits own the form once they start; until then the form is
-  // DERIVED from the fetched document (no state-sync effect needed). The etag
-  // tracks the same way: a successful save overrides the fetched one until the
-  // invalidated query re-reads it.
+  // Before the first edit the form follows the query. Once edited, the draft
+  // and its original document/ETag stay bound through query invalidations;
+  // a successful save replaces both with the canonical server response.
   const [edited, setEdited] = useState<AudioFormState | undefined>(undefined);
-  const [savedEtag, setSavedEtag] = useState<string | undefined>(undefined);
+  // The draft and its If-Match baseline are one snapshot. A query refresh may
+  // never lend a newer ETag to an older whole-document draft.
+  const [baseline, setBaseline] = useState<{
+    form: AudioFormState;
+    etag: string | undefined;
+    rowIds: readonly number[];
+    previousEtag?: string | undefined;
+  } | undefined>(undefined);
+  const nextRowId = useRef(0);
+  const [draftRowIds, setDraftRowIds] = useState<readonly number[] | undefined>();
+  const [conflicted, setConflicted] = useState(false);
   const [errors, setErrors] = useState<AudioFormErrors | undefined>(undefined);
   const [status, setStatus] = useState<'idle' | 'live' | 'partial' | 'saved' | 'error'>('idle');
   const [saveError, setSaveError] = useState<string | undefined>(undefined);
@@ -892,27 +906,43 @@ export function AudioPage(): JSX.Element {
     (routing.data !== undefined
       ? audioFormFromDocument(routing.data.state.routing)
       : undefined);
-  const etag = savedEtag ?? routing.data?.etag;
+  const serverForm = baseline?.form ?? (routing.data !== undefined
+    ? audioFormFromDocument(routing.data.state.routing) : undefined);
+  const rowIds = draftRowIds ?? form?.routes.map((_, index) => index) ?? [];
+  const savedRowFor = (index: number): AudioRouteRow | undefined => {
+    const id = rowIds[index];
+    const savedIndex = baseline?.rowIds.indexOf(id ?? -1) ?? index;
+    return savedIndex < 0 ? undefined : serverForm?.routes[savedIndex];
+  };
+  const queryDiverged = baseline !== undefined && routing.data !== undefined &&
+    routing.data.etag !== baseline.etag && routing.data.etag !== baseline.previousEtag;
+  const savedIndices = rowIds.map((id) => {
+    const index = baseline?.rowIds.indexOf(id) ?? id;
+    return index < 0 ? undefined : index;
+  });
 
   const sourceIds = (sources.data ?? []).map((source) => source.id);
   const sourceNames = new Map(
     (sources.data ?? []).map((source) => [source.id, source.name] as const),
   );
 
-  // The document currently on the server (unedited) — the baseline the
-  // pending-impact warning AND the console's Draft/Saved diff use.
-  const serverForm =
-    routing.data !== undefined ? audioFormFromDocument(routing.data.state.routing) : undefined;
+  // The captured saved document, not a separately refreshed query document,
+  // drives both pending impact and Draft/Saved comparisons.
   const pendingImpacts =
     form !== undefined && serverForm !== undefined && outputSelections.data !== undefined
       ? pendingTrackImpacts(serverForm, form, outputSelections.data)
       : [];
   const draftDiff =
     form !== undefined && serverForm !== undefined
-      ? documentDraftDiff(serverForm, form)
+      ? documentDraftDiff(serverForm, form, savedIndices)
       : undefined;
 
-  const update = (next: AudioFormState): void => {
+  const update = (next: AudioFormState, nextIds: readonly number[] = rowIds): void => {
+    if (baseline === undefined && routing.data !== undefined && serverForm !== undefined) {
+      setBaseline({ form: serverForm, etag: routing.data.etag, rowIds });
+      nextRowId.current = Math.max(nextRowId.current, ...rowIds.map((id) => id + 1));
+    }
+    setDraftRowIds(nextIds);
     setEdited(next);
     setStatus('idle');
     setOutputsUpdated([]);
@@ -947,6 +977,8 @@ export function AudioPage(): JSX.Element {
       ? 0
       : Math.min(focusedIndex, Math.max(0, form.routes.length - 1));
   const focusedRoute = form === undefined ? undefined : form.routes[focused];
+  const [overviewOpen, setOverviewOpen] = useState(false);
+  const [bankExpanded, setBankExpanded] = useState(false);
 
   /** The strip's display label: the managed source's name when known, the
    * raw input id otherwise, and a positional label for an unwritten route. */
@@ -959,7 +991,7 @@ export function AudioPage(): JSX.Element {
   };
 
   const onSave = (): void => {
-    if (form === undefined) {
+    if (form === undefined || conflicted || queryDiverged) {
       return;
     }
     const validation = validateAudioForm(form);
@@ -982,17 +1014,26 @@ export function AudioPage(): JSX.Element {
       return;
     }
     setErrors(undefined);
+    const submitted = form;
     save.mutate(
-      { document: audioFormToDocument(form), etag },
+      { document: audioFormToDocument(submitted), etag: baseline?.etag ?? routing.data?.etag },
       {
         onSuccess: (result): void => {
-          setSavedEtag(result.etag);
+          const canonical = audioFormFromDocument(result.state.routing);
+          const canonicalIds = canonical.routes.map((_, index) => rowIds[index] ?? nextRowId.current++);
+          setBaseline({ form: canonical, etag: result.etag, rowIds: canonicalIds, previousEtag: baseline?.etag ?? routing.data?.etag });
+          setDraftRowIds(canonicalIds);
+          setEdited(canonical);
+          setConflicted(false);
           setStatus(result.apply === 'live' ? 'live' : result.apply === 'partial' ? 'partial' : 'saved');
           setSaveError(undefined);
           setOutputsUpdated(result.state.outputs_updated ?? []);
         },
         onError: (error): void => {
           setStatus('error');
+          if (error.status === 412) {
+            setConflicted(true);
+          }
           setSaveError(error.message);
         },
       },
@@ -1011,7 +1052,7 @@ export function AudioPage(): JSX.Element {
             <HelpLink to="/help/features#outputs" label={t`About outputs and audio`} />
           </span>
         }
-        actions={<ExportConfigButton compact />}
+        actions={<div className="max-w-full min-w-0 [&_button]:max-w-full [&_button]:whitespace-normal [&_button]:break-words"><ExportConfigButton compact /></div>}
       />
       <ApplySemanticsCallout
         helpTo="/help/features#outputs"
@@ -1047,14 +1088,22 @@ export function AudioPage(): JSX.Element {
             </p>
           ) : null}
 
+          <div>
+            <Button type="button" variant="outline" className="h-12" aria-expanded={overviewOpen} onClick={(): void => { setOverviewOpen(!overviewOpen); }}>
+              <Trans>Whole mix overview</Trans>
+            </Button>
+          </div>
+          <div className={overviewOpen ? '' : 'hidden'}>
           <MixOverview
             form={form}
-            serverForm={serverForm ?? form}
+            savedRows={form.routes.map((_, index) => savedRowFor(index))}
+            rowIds={rowIds}
             diff={draftDiff}
             sourceNames={sourceNames}
             inputs={meter.inputs}
             onRide={ride}
           />
+          </div>
 
           {/* Touch-first surface (below xl): pinned chip picker + ONE
               focused strip — every channel stays one tap away in the
@@ -1068,7 +1117,7 @@ export function AudioPage(): JSX.Element {
             >
               {form.routes.map((route, index) => (
                 <Button
-                  key={index}
+                  key={rowIds[index]}
                   type="button"
                   variant="outline"
                   data-testid="audio-strip-chip"
@@ -1095,6 +1144,11 @@ export function AudioPage(): JSX.Element {
             <h3 id="audio-bank-heading" className="mb-3 text-sm font-medium">
               <Trans>Mix bank</Trans>
             </h3>
+            {form.routes.length > 1 ? (
+              <Button type="button" variant="outline" className="mb-3 h-12" aria-expanded={bankExpanded} onClick={(): void => { setBankExpanded(!bankExpanded); }}>
+                {bankExpanded ? <Trans>Show selected channel</Trans> : <Trans>Show all channels</Trans>}
+              </Button>
+            ) : null}
             {form.routes.length === 0 ? (
               <p className="text-sm text-muted-foreground">
                 <Trans>
@@ -1103,12 +1157,12 @@ export function AudioPage(): JSX.Element {
                 </Trans>
               </p>
             ) : (
-              <div className="flex gap-4 overflow-x-auto pb-2">
+              <div className="flex max-w-full gap-4 overflow-x-auto pb-2">
                 {form.routes.map((route, index) => (
-                  <div key={index} className="w-60 shrink-0">
+                  <div key={rowIds[index]} className={bankExpanded || index === focused ? 'w-60 shrink-0' : 'hidden'}>
                     <ChannelStrip
                       route={route}
-                      saved={serverForm?.routes[index]}
+                      saved={savedRowFor(index)}
                       diff={draftDiff?.routes[index]}
                       index={index}
                       label={labelFor(route, index + 1)}
@@ -1132,7 +1186,7 @@ export function AudioPage(): JSX.Element {
                         update({
                           ...form,
                           routes: form.routes.filter((_, i) => i !== index),
-                        });
+                        }, rowIds.filter((_, i) => i !== index));
                       }}
                     />
                   </div>
@@ -1152,7 +1206,7 @@ export function AudioPage(): JSX.Element {
               </h3>
               <ChannelStrip
                 route={focusedRoute}
-                saved={serverForm?.routes[focused]}
+                saved={savedRowFor(focused)}
                 diff={draftDiff?.routes[focused]}
                 index={focused}
                 label={labelFor(focusedRoute, focused + 1)}
@@ -1169,7 +1223,7 @@ export function AudioPage(): JSX.Element {
                   update({
                     ...form,
                     routes: form.routes.filter((_, i) => i !== focused),
-                  });
+                  }, rowIds.filter((_, i) => i !== focused));
                 }}
               />
             </section>
@@ -1205,14 +1259,14 @@ export function AudioPage(): JSX.Element {
 
           <PendingTrackWarning impacts={pendingImpacts} />
 
-          <div className="flex flex-wrap items-center gap-2">
+          <div className="order-first sticky top-0 z-10 flex flex-wrap items-center gap-2 rounded-md border bg-background/95 p-2 shadow-sm">
             <Button
               type="button"
               variant="outline"
               data-testid="audio-add-route"
               className="h-12 px-4"
               onClick={(): void => {
-                update({ ...form, routes: [...form.routes, emptyAudioRoute()] });
+                update({ ...form, routes: [...form.routes, emptyAudioRoute()] }, [...rowIds, Math.max(nextRowId.current++, ...rowIds.map((id) => id + 1))]);
               }}
             >
               <Plus aria-hidden="true" />
@@ -1222,11 +1276,27 @@ export function AudioPage(): JSX.Element {
               type="button"
               data-testid="audio-save"
               className="h-12 px-6"
-              disabled={save.isPending}
+              disabled={save.isPending || conflicted || queryDiverged}
               onClick={onSave}
             >
               <Trans>Save audio routing</Trans>
             </Button>
+            {(conflicted || queryDiverged) ? (
+              <div role="alert" className="flex flex-wrap items-center gap-2 text-sm text-destructive">
+                <Trans>Audio routing changed on the server. Your draft is preserved; review the latest version before saving again.</Trans>
+                <Button type="button" variant="outline" className="h-12" onClick={(): void => {
+                  if (routing.data === undefined) return;
+                  const latest = audioFormFromDocument(routing.data.state.routing);
+                  setBaseline({ form: latest, etag: routing.data.etag, rowIds: latest.routes.map((_, index) => index) });
+                  setEdited(latest);
+                  setDraftRowIds(latest.routes.map((_, index) => index));
+                  nextRowId.current = latest.routes.length;
+                  setConflicted(false);
+                  setSaveError(undefined);
+                  setStatus('idle');
+                }}><Trans>Reload latest routing (discard draft)</Trans></Button>
+              </div>
+            ) : null}
             <p role="status" aria-live="polite" className="text-sm">
               {status === 'live' ? (
                 <span className="text-muted-foreground">

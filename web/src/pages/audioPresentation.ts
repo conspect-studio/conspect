@@ -9,7 +9,7 @@
 //     display bound, not a document bound — the typed-gain field stays the
 //     source of truth);
 //   * the draft-vs-saved document diff the console's "Draft / Saved" honesty
-//     rides on — positional, like the document's rows, and semantic (blank
+//     rides on — editor-owned row associations, and semantic (blank
 //     gain is unity; "-3.0" is -3; whitespace never counts as an edit).
 //
 // The API this models is DOCUMENT-LEVEL: gain/mute/include edits live in the
@@ -51,8 +51,8 @@ export function formatDb(value: number): string {
  * and the saved document carry the exact value; the fader only pins
  * visually at its ends for out-of-range drafts. */
 export function nudgeGainDb(current: string, delta: number): string {
-  const base = parseGainDb(current) ?? 0;
-  return formatDb(base + delta);
+  const base = parseGainDb(current);
+  return base === undefined ? current : formatDb(base + delta);
 }
 
 /** The fader's displayed value: the draft clamped into the fader's bounds. */
@@ -76,7 +76,7 @@ function textEqual(a: string, b: string): boolean {
 export interface RouteDraftDiff {
   /** The route's position in the document (rows are positional edits). */
   readonly index: number;
-  /** True when no saved route exists at this position (a newly added route). */
+  /** True when no saved route is associated with this local draft row. */
   readonly isNew: boolean;
   /** Any field differs (isNew implies changed). */
   readonly changed: boolean;
@@ -135,15 +135,23 @@ function parseSampleRate(value: string): number {
 /** Diff the operator's DRAFT against the document currently saved on the
  * server. Both sides come from the same form model, so the comparison is
  * semantic: whitespace and formatting never count as edits. */
-export function documentDraftDiff(saved: AudioFormState, draft: AudioFormState): DocumentDraftDiff {
-  const routes = draft.routes.map((route, index) => routeDiffAt(saved.routes[index], route, index));
+export function documentDraftDiff(
+  saved: AudioFormState,
+  draft: AudioFormState,
+  savedIndexByDraftIndex: readonly (number | undefined)[] = draft.routes.map((_, index) => index),
+): DocumentDraftDiff {
+  const routes = draft.routes.map((route, index) => {
+    const savedIndex = savedIndexByDraftIndex[index];
+    return routeDiffAt(savedIndex === undefined ? undefined : saved.routes[savedIndex], route, index);
+  });
   const savedRate = parseSampleRate(saved.sampleRateHz);
   const draftRate = parseSampleRate(draft.sampleRateHz);
   const sampleRateChanged =
     Number.isNaN(savedRate) || Number.isNaN(draftRate)
       ? saved.sampleRateHz.trim() !== draft.sampleRateHz.trim()
       : savedRate !== draftRate;
-  const changedRouteCount = routes.filter((route) => route.changed).length;
+  const removedCount = saved.routes.length - savedIndexByDraftIndex.filter((index) => index !== undefined).length;
+  const changedRouteCount = routes.filter((route) => route.changed).length + Math.max(0, removedCount);
   return {
     routes,
     sampleRateChanged,
