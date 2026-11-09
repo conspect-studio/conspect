@@ -659,9 +659,13 @@ impl RenditionDispatcher {
                     });
                 }
             }
-            if let Some(error) = first_admission_error {
-                return Err(error);
-            }
+            // The dispatcher's COMPLETION is a fact about its own stages and
+            // must be recorded even when a binding rejected this window (the
+            // rejection is that binding's own explicit loss, reported in its
+            // truth line — it must not also corrupt the completion bookkeeping:
+            // the last window of a run landing in a full binding previously
+            // left `finished` unset and failed the run as "incomplete final
+            // window").
             if self
                 .video
                 .iter()
@@ -669,6 +673,11 @@ impl RenditionDispatcher {
                 .all(|s| s.finished && s.windows.is_empty())
             {
                 self.finished = true;
+            }
+            if let Some(error) = first_admission_error {
+                return Err(error);
+            }
+            if self.finished {
                 return Ok(());
             }
             if self

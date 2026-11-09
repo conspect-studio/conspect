@@ -93,131 +93,63 @@ fn spawn_clock_driver(clock: Arc<ManualTimeSource>, stop: Arc<std::sync::atomic:
     });
 }
 
-/// (1) Live + a blocked sink: the engine still emits every tick, the channel
-/// occupancy never exceeds the cap, and the overload is shed and counted (a hard,
-/// encoder-independent floor of dropped frames, not merely `dropped > 0`).
-///
-/// **Determinism across encoder speeds (ENG-1c).** The drop is forced by the
-/// *engine* outpacing a *frozen* consumer, NOT by the real encoder being fast.
-/// The earlier shape used a fixed tick budget (`max_ticks = 400`) and hoped the
-/// real `mpeg2video` encoder emitted enough packets *within that budget* to fill
-/// the sink channel (cap `SINK_QUEUE_CAP`), wedge the bake consumer, back up the
-/// hot queue (cap `LIVE_QUEUE_CAP`), and make the hot loop `try_send` see `Full`.
-/// On a slower encoder (e.g. ffmpeg 5.1) the no-sleep engine reached tick 400 and
-/// the run *ended* before the consumer had wedged long enough to back up the hot
-/// queue — so `dropped == 0` and the assertion failed, even though the
-/// drop-oldest policy is correct. The bound here was on real encode latency, not
-/// on the policy under test.
-///
-/// This version removes that race. It drives the engine **unbounded**
-/// (`max_ticks = None`) and lets a watcher stop it only once the consumer is
-/// provably wedged AND the engine has driven a generous margin of *additional*
-/// ticks past that point. The sink freezes after its first packet, so the bake
-/// consumer wedges on the full sink channel and cannot pull another hot item;
-/// from then on the engine (manual clock, no real sleep) produces ticks at memory
-/// speed while the consumer is frozen, so *every* tick after the hot queue fills
-/// is dropped. The encoder speed only changes *how soon* that first packet lands
-/// — not whether drops then accumulate — so `dropped` is large and deterministic
-/// regardless of ffmpeg version. The never-stall / bounded-memory assertions are
-/// unchanged and strengthened (we now also pin the exact post-saturation drop
-/// floor, not just `> 0`).
+/// Like [`spawn_clock_driver`], but paced near real time (one 40 ms tick
+/// advance per `period` of wall time). The no-falter contract keeps the
+/// consumer inside the real-time envelope — a memory-speed driver is beyond
+/// the admitted envelope by construction and now fails the run with a typed
+/// beyond-envelope error (see `beyond_envelope_shed_fails_visibly`), which is
+/// the honest behaviour for hardware that cannot keep the cadence.
+fn spawn_clock_driver_paced(
+    clock: Arc<ManualTimeSource>,
+    stop: Arc<std::sync::atomic::AtomicBool>,
+    period: std::time::Duration,
+) {
+    std::thread::spawn(move || {
+        while !stop.load(Ordering::Acquire) {
+            clock.advance(std::time::Duration::from_millis(40));
+            std::thread::sleep(period);
+        }
+    });
+}
+
+/// (1) Live + a blocked sink, NO-FALTER contract (t70): a sink that freezes
+/// after its first packet must never stall the output clock AND never cause a
+/// single hot-queue drop — inside the real-time envelope the engine keeps
+/// ticking, the consumer keeps encoding, and the frozen sink's loss is
+/// reported EXPLICITLY at its own binding (admission losses against the
+/// binding's bounded queue), never as silent missing encoded ticks. A
+/// hardware failure beyond the envelope fails the run with a typed error
+/// (see `beyond_envelope_shed_fails_visibly`), never as routine shed.
 #[tokio::test(flavor = "current_thread")]
-async fn live_blocked_sink_stays_bounded_and_never_stalls() {
-    // Ticks the engine must drive *past* the moment the consumer wedges before we
-    // stop it. Once wedged, the consumer cannot pull another hot item, so the hot
-    // queue (cap `LIVE_QUEUE_CAP`) fills within a few ticks and every subsequent
-    // tick is shed. This margin therefore lower-bounds (minus the in-flight buffer
-    // depth below) how many frames *must* be dropped before we stop — an encoder-
-    // independent count.
-    const POST_WEDGE_TICKS: u64 = 200;
-    // The number of ticks that can still *succeed* in the window after the watcher
-    // first observes the wedge (`received >= 1`) before the pipeline saturates and
-    // drops begin. It bounds the total buffering between the hot-loop sender and
-    // the frozen sink: the hot queue (`LIVE_QUEUE_CAP` = 4) + one frame in transit
-    // at the consumer's `recv` + one being baked/encoded + the sink fan-out channel
-    // (`SINK_QUEUE_CAP` = 4) + the one packet the sink already pulled, plus a couple
-    // of ticks of scheduling slack between the watcher's `received`-read and its
-    // `hot_tick` base-read. Measured at 9 here (ffmpeg 7.1); 24 is a generous
-    // ceiling that holds across encoders/schedulers while still pinning a hard
-    // floor of `POST_WEDGE_TICKS - 24` = 176 dropped — far stronger than `> 0`.
-    const IN_FLIGHT_SLACK: u64 = 24;
-    // Generous bound on how long the engine takes to drive `POST_WEDGE_TICKS`
-    // memory-speed ticks once wedged; far above the microseconds it actually
-    // needs, so the watcher never gives up early on a slow CI box.
-    const WATCHDOG: std::time::Duration = std::time::Duration::from_secs(30);
+async fn live_blocked_sink_never_stalls_and_never_sheds() {
+    const TICKS: u64 = 120;
 
     let mut pipeline = build_pipeline();
 
-    // A fake sink that pulls exactly one packet and then freezes forever: a wedged
-    // muxer/encoder that cannot keep up. It must never be able to stall the engine
-    // — under the drop-on-overload policy the hot loop sheds frames instead.
+    // A sink that pulls exactly one packet and then freezes forever.
     let received = Arc::new(AtomicUsize::new(0));
     let received_in_sink = Arc::clone(&received);
     let blocked_runner = move |rx: Receiver<EncodedPacket>| -> TestSinkOutcome {
-        // Pull exactly one packet (records that the fan-out reached the sink), then
-        // stop draining entirely. The sink channel fills behind us, wedging the
-        // bake consumer, which can no longer pull from the hot queue.
         if rx.recv().is_ok() {
             received_in_sink.fetch_add(1, Ordering::Release);
         }
-        // Now freeze HARD: never drain another packet. The sink channel
-        // (cap `SINK_QUEUE_CAP`) fills behind us and stays full, so the bake
-        // consumer wedges on its bounded fan-out send and can no longer pull from
-        // the hot queue — which then fills and forces the hot loop to shed every
-        // subsequent tick. We hold `rx` (so the channel is not Disconnected) and
-        // park; teardown detaches this thread after the bounded `SINK_WEDGE_GRACE`
-        // (exactly the bounded-teardown path test (5) exercises), so it never hangs
-        // `stop`. Under DropOnOverload the hot loop sheds, never blocks, so the
-        // output clock keeps ticking despite this permanent wedge.
         let _hold = rx;
         loop {
             std::thread::sleep(std::time::Duration::from_secs(3600));
         }
     };
 
+    let hot_tick = Arc::new(AtomicU64::new(0));
     let clock = Arc::new(ManualTimeSource::new());
     let stop = StopSignal::new();
     let driver_stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    spawn_clock_driver(Arc::clone(&clock), Arc::clone(&driver_stop));
-
-    // The hot-loop tick observer: incremented once per emitted tick on the hot
-    // loop (before the send), so the watcher can count engine ticks and prove the
-    // engine drove well past the consumer's wedge — independent of encoder speed.
-    let hot_tick = Arc::new(AtomicU64::new(0));
-
-    // The watcher decides when the engine has provably outpaced the frozen
-    // consumer, then raises `stop`. It does NOT touch the hot path — it only
-    // *observes* (the sink's first-packet flag + the hot-tick gauge) and signals
-    // stop, exactly like a controller would. This is what makes the drop count
-    // deterministic across encoder speeds: the engine keeps ticking (and shedding)
-    // until we say stop, rather than racing a fixed budget against the encoder.
-    let watch_received = Arc::clone(&received);
-    let watch_hot_tick = Arc::clone(&hot_tick);
-    let watch_stop = stop.clone();
-    std::thread::spawn(move || {
-        let deadline = std::time::Instant::now() + WATCHDOG;
-        // 1) Wait for the consumer to wedge: the sink got its first packet, so the
-        //    sink channel is now backing up behind the frozen sink.
-        while watch_received.load(Ordering::Acquire) == 0 {
-            if std::time::Instant::now() >= deadline {
-                watch_stop.stop();
-                return;
-            }
-            std::thread::yield_now();
-        }
-        // 2) From the tick the wedge was first observable, drive POST_WEDGE_TICKS
-        //    further ticks. Every tick past the point the hot queue fills is shed,
-        //    so this lower-bounds the drop count regardless of the encoder.
-        let base = watch_hot_tick.load(Ordering::Acquire);
-        let target = base.saturating_add(POST_WEDGE_TICKS);
-        while watch_hot_tick.load(Ordering::Acquire) < target {
-            if std::time::Instant::now() >= deadline {
-                break;
-            }
-            std::thread::yield_now();
-        }
-        watch_stop.stop();
-    });
+    // ~1.6x real time: the consumer (a real encoder at memory-µs per frame)
+    // keeps up — inside the admitted envelope nothing is shed.
+    spawn_clock_driver_paced(
+        Arc::clone(&clock),
+        Arc::clone(&driver_stop),
+        std::time::Duration::from_millis(25),
+    );
 
     let clock_concrete: Arc<ManualTimeSource> = Arc::clone(&clock);
     let ts: Arc<dyn TimeSource> = clock_concrete;
@@ -226,9 +158,7 @@ async fn live_blocked_sink_stays_bounded_and_never_stalls() {
             StreamTestParams {
                 time: ts,
                 pacer: CooperativePacer,
-                // Unbounded: the engine runs until the watcher stops it, so drops
-                // are forced by saturation, not by a budget racing the encoder.
-                max_ticks: None,
+                max_ticks: Some(TICKS),
                 policy: SendPolicy::DropOnOverload,
                 runners: vec![Box::new(blocked_runner)],
                 consumer_fault_after_ticks: None,
@@ -237,60 +167,46 @@ async fn live_blocked_sink_stays_bounded_and_never_stalls() {
             &stop,
         )
         .await
-        .expect("drive streaming");
+        .expect("a blocked sink must never fail or stall the run");
     driver_stop.store(true, Ordering::Release);
 
-    // Invariant #1: the engine kept emitting ticks throughout despite the wedged
-    // sink — it drove past the wedge by at least the post-wedge margin.
-    assert!(
-        result.report.frames >= POST_WEDGE_TICKS,
-        "the output clock must keep ticking past the wedge (inv #1): emitted {} ticks, \
-         expected at least the post-wedge margin {POST_WEDGE_TICKS}",
-        result.report.frames
+    // NO-FALTER: not a single hot-queue drop — every output tick the engine
+    // emitted reached the consumer and was encoded.
+    assert_eq!(
+        hot_tick.load(Ordering::Acquire),
+        TICKS,
+        "the engine must emit every tick"
     );
-    // Invariant #10 / bounded memory: occupancy is O(cap) — bounded by the fixed
-    // cap, INDEPENDENT of the run length (it stays tiny next to the hundreds of
-    // ticks driven, never growing with the number of frames; that is the OOM the
-    // ADR fixes).
-    //
-    // The bound is cap+1, not cap, and that ceiling is exact and race-free — NOT
-    // a fudge. `peak_occupancy` is a gauge: the single engine sender does
-    // `in_flight.fetch_add(1)` AFTER a successful send, and the single bake
-    // consumer does `in_flight.fetch_sub(1)` AFTER `recv()`. The channel itself
-    // (`sync_channel(cap)`) never buffers more than cap by construction. The gauge
-    // exceeds the true buffered count by at most one, and only at the full
-    // boundary: the consumer's `recv()` frees a slot, the sender refills it and
-    // increments before the consumer's matching `fetch_sub` lands — exactly one
-    // in-transit frame double-counted. One sender + one consumer ⇒ at most one
-    // such pending decrement ⇒ the gauge's high-watermark is at most cap+1.
+    assert_eq!(
+        result.report.frames, TICKS,
+        "every emitted tick must be processed"
+    );
+    assert_eq!(
+        result.report.dropped, 0,
+        "NO-FALTER: a blocked sink must not shed a single hot frame"
+    );
+    // Bounded memory: occupancy never exceeded the cap (+1 in-transit).
     assert!(
         result.peak_occupancy <= result.capacity + 1,
-        "peak occupancy {} must stay within cap+1 = {} — O(cap) bounded memory, \
-         not O(ticks); the +1 is the single-consumer in-transit transient (inv #10)",
+        "occupancy {} must stay bounded by the cap {} (+1 in transit)",
         result.peak_occupancy,
-        result.capacity + 1
+        result.capacity
     );
-    // Overload was shed and COUNTED (visible, not hidden), so the run faltered.
-    // Deterministic floor: once the consumer wedges, every tick after the whole
-    // pipeline buffer (hot queue + in-transit + sink channel, bounded by
-    // `IN_FLIGHT_SLACK`) fills is shed. The watcher drove POST_WEDGE_TICKS ticks
-    // past the wedge, so at least `POST_WEDGE_TICKS - IN_FLIGHT_SLACK` of them MUST
-    // have been dropped — a hard, encoder-independent lower bound, not just `> 0`.
-    let min_drops = POST_WEDGE_TICKS.saturating_sub(IN_FLIGHT_SLACK);
+    // The frozen sink's loss is EXPLICIT at its own binding — counted,
+    // labelled, never silent.
     assert!(
-        result.report.dropped >= min_drops,
-        "a wedged sink under live policy must shed frames and count them: got {} dropped, \
-         expected at least {min_drops} (POST_WEDGE_TICKS {POST_WEDGE_TICKS} minus the \
-         in-flight buffer depth {IN_FLIGHT_SLACK} that can still drain after the wedge)",
-        result.report.dropped
+        result
+            .report
+            .outputs
+            .iter()
+            .any(|line| line.contains("windows lost") && !line.contains(" 0 packets")),
+        "the frozen binding must report its explicit admission losses, got {:?}",
+        result.report.outputs
     );
-    assert!(
-        result.report.faltered,
-        "dropped > 0 means the live output faltered (honest reporting)"
-    );
-    assert!(
-        received.load(Ordering::Acquire) >= 1,
-        "the sink should have received at least one coded packet before wedging"
+    assert_eq!(
+        received.load(Ordering::Acquire),
+        1,
+        "the sink received exactly its first packet before freezing"
     );
 }
 
@@ -397,7 +313,11 @@ async fn frame_zero_is_encoded_while_engine_still_ticking() {
     let clock = Arc::new(ManualTimeSource::new());
     let stop = StopSignal::new();
     let driver_stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    spawn_clock_driver(Arc::clone(&clock), Arc::clone(&driver_stop));
+    spawn_clock_driver_paced(
+        Arc::clone(&clock),
+        Arc::clone(&driver_stop),
+        std::time::Duration::from_millis(25),
+    );
 
     let clock_concrete: Arc<ManualTimeSource> = Arc::clone(&clock);
     let ts: Arc<dyn TimeSource> = clock_concrete;
@@ -461,13 +381,17 @@ async fn clean_stop_closes_sinks_for_finalisation() {
     let clock = Arc::new(ManualTimeSource::new());
     let stop = StopSignal::new();
     let driver_stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    spawn_clock_driver(Arc::clone(&clock), Arc::clone(&driver_stop));
+    spawn_clock_driver_paced(
+        Arc::clone(&clock),
+        Arc::clone(&driver_stop),
+        std::time::Duration::from_millis(25),
+    );
 
     // Raise the stop signal shortly after launching so the unbounded `run_until`
     // path stops promptly (it would otherwise run to MAX).
     let stop_for_thread = stop.clone();
     std::thread::spawn(move || {
-        std::thread::sleep(std::time::Duration::from_millis(50));
+        std::thread::sleep(std::time::Duration::from_millis(500));
         stop_for_thread.stop();
     });
 
@@ -536,7 +460,21 @@ fn wedged_sink_does_not_hang_teardown() {
             .build()
             .expect("build runtime");
         let result = rt.block_on(async move {
-            let mut pipeline = build_pipeline();
+            // Two OUTPUTS for the two sinks: the per-binding delivery maps each
+            // injected sink runner 1:1 to an output binding (with its own
+            // recovery gate), so a two-sink scenario needs two outputs. Both
+            // share the one mpeg2video rendition (encode-once-mux-many, inv #7).
+            let text = config_text()
+                + r#"
+[[outputs]]
+kind = "hls"
+path = "/tmp/multiview-streaming-test/second.m3u8"
+codec = "mpeg2video"
+segment_ms = 1000
+"#;
+            let config = MultiviewConfig::load_from_toml(&text).expect("parse config");
+            config.validate().expect("config validates");
+            let mut pipeline = Pipeline::build(&config).expect("build pipeline");
 
             // Sink A — healthy: drains every packet, returns cleanly on EOF.
             let healthy = move |rx: Receiver<EncodedPacket>| -> TestSinkOutcome {
@@ -561,7 +499,11 @@ fn wedged_sink_does_not_hang_teardown() {
             let clock = Arc::new(ManualTimeSource::new());
             let stop = StopSignal::new();
             let driver_stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
-            spawn_clock_driver(Arc::clone(&clock), Arc::clone(&driver_stop));
+            spawn_clock_driver_paced(
+                Arc::clone(&clock),
+                Arc::clone(&driver_stop),
+                std::time::Duration::from_millis(25),
+            );
             let ts: Arc<dyn TimeSource> = clock;
 
             let out = pipeline
@@ -615,72 +557,128 @@ fn wedged_sink_does_not_hang_teardown() {
     );
 }
 
-/// (6) RT-8b held-out lip-sync-under-overload, END TO END through the real cli
-/// bake consumer (not the extracted helper): with program audio enabled and the
-/// engine driven UNBOUNDED while a slow-but-alive sink paces the bake consumer
-/// below the engine, the hot queue overflows and `DropOnOverload` sheds VIDEO
-/// frames. The decisive property — audio must NOT drift behind video under that
-/// shed — is observed at the muxer boundary: the cumulative AUDIO samples the bake
-/// consumer fed the encoder must track the **tick count** (every emitted output
-/// tick), NOT the count of surviving video frames.
-///
-/// The audio packet `pts` is a pure sample counter (`audio_pts = Σ samples`), so
-/// the last audio packet's `pts + its frame size` is the cumulative samples fed.
-/// At 48 kHz / 25 fps that is 1920 samples per OUTPUT TICK. The pre-RT-8b driver
-/// called `bus.tick()` once per SURVIVING frame, so under a heavy shed its
-/// cumulative samples would be `survivors * 1920` — far short of `ticks * 1920` —
-/// i.e. audio trailing video by the dropped ticks' worth of samples. This test
-/// fails on that regression: it asserts the cumulative audio is close to the tick
-/// ideal and strictly far above the survivor-count ceiling.
+/// (6) RT-8b lip-sync, NO-FALTER contract (t70): with program audio enabled
+/// and the engine inside the real-time envelope, the muxed output carries a
+/// video frame for EVERY tick and program audio whose cumulative samples
+/// track the tick counter exactly (a pure function of the tick index, never
+/// of frame loss — trivially so, because inside the envelope nothing is
+/// lost). The audio packet `pts` is a pure sample counter (1920 samples per
+/// output tick at 48 kHz / 25 fps), so the highest observed audio `pts` plus
+/// one AAC frame must equal the tick ideal.
 #[tokio::test(flavor = "current_thread")]
-async fn rt8b_audio_stays_lip_synced_to_the_tick_index_under_video_drops() {
+async fn rt8b_audio_tracks_every_tick_inside_the_envelope() {
     // 48 kHz / 25 fps = exactly 1920 audio samples per output tick.
     const SAMPLES_PER_TICK: u64 = 1_920;
-    // Drive a generous margin of ticks past the first observed drop so the shed is
-    // substantial and the tick-vs-survivor gap is unmistakable.
-    const POST_DROP_TICKS: u64 = 400;
-    const WATCHDOG: std::time::Duration = std::time::Duration::from_secs(30);
+    const TICKS: u64 = 60;
 
     let mut pipeline = build_pipeline();
-    // Opt into program audio: the bake consumer now drives the bus per tick index
-    // and fans AAC packets to the SAME sink as video.
+    // Program audio WITHOUT a routing section — the truthful binding keys off
+    // the OPENED encoder (causal 1); the audio must actually flow.
     pipeline.enable_program_audio();
 
-    // The sink is SLOW (sleeps per packet) but never wedges: it keeps draining, so
-    // the bake consumer keeps producing audio while running BELOW the engine — the
-    // hot queue overflows and the engine sheds video frames. The sink tracks the
-    // cumulative audio samples (the max `pts + frame_size` over audio packets) and
-    // a flag once any drop is observable (it has drained a packet).
-    let max_audio_end = Arc::new(AtomicU64::new(0));
+    let max_audio_pts = Arc::new(AtomicU64::new(0));
     let audio_packets = Arc::new(AtomicU64::new(0));
-    let drained_one = Arc::new(AtomicUsize::new(0));
-    let max_audio_end_in = Arc::clone(&max_audio_end);
-    let audio_packets_in = Arc::clone(&audio_packets);
-    let drained_one_in = Arc::clone(&drained_one);
-    let slow_runner = move |rx: Receiver<EncodedPacket>| -> TestSinkOutcome {
+    let video_packets = Arc::new(AtomicUsize::new(0));
+    let (max_in, aud_in, vid_in) = (
+        Arc::clone(&max_audio_pts),
+        Arc::clone(&audio_packets),
+        Arc::clone(&video_packets),
+    );
+    let runner = move |rx: Receiver<EncodedPacket>| -> TestSinkOutcome {
         let mut frames = 0_usize;
         while let Ok(packet) = rx.recv() {
-            // Pace the consumer below the (no-sleep, memory-speed) engine so the
-            // hot queue saturates and the engine sheds — but never wedge.
-            std::thread::sleep(std::time::Duration::from_millis(1));
-            if packet.kind() == multiview_ffmpeg::StreamKind::Audio {
-                // `pts` is the cumulative sample position at the START of this
-                // packet's frame; `len()` is bytes, not samples, so track the max
-                // observed start `pts` and add a single AAC frame (1024) for the
-                // tail. The exact tail size is immaterial — the tick-vs-survivor gap
-                // is hundreds of thousands of samples.
-                if let Some(pts) = packet.pts() {
-                    let pts = u64::try_from(pts).unwrap_or(0);
-                    let prev = max_audio_end_in.load(Ordering::Acquire);
-                    if pts > prev {
-                        max_audio_end_in.store(pts, Ordering::Release);
-                    }
+            match packet.kind() {
+                multiview_ffmpeg::StreamKind::Video => {
+                    vid_in.fetch_add(1, Ordering::Release);
+                    frames += 1;
                 }
-                audio_packets_in.fetch_add(1, Ordering::Release);
-            } else {
-                frames += 1;
-                drained_one_in.store(1, Ordering::Release);
+                _ => {
+                    if let Some(pts) = packet.pts() {
+                        let pts = u64::try_from(pts).unwrap_or(0);
+                        let prev = max_in.load(Ordering::Acquire);
+                        if pts > prev {
+                            max_in.store(pts, Ordering::Release);
+                        }
+                    }
+                    aud_in.fetch_add(1, Ordering::Release);
+                }
             }
+        }
+        TestSinkOutcome { frames }
+    };
+
+    let clock = Arc::new(ManualTimeSource::new());
+    let stop = StopSignal::new();
+    let driver_stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    spawn_clock_driver_paced(
+        Arc::clone(&clock),
+        Arc::clone(&driver_stop),
+        std::time::Duration::from_millis(25),
+    );
+
+    let clock_concrete: Arc<ManualTimeSource> = Arc::clone(&clock);
+    let ts: Arc<dyn TimeSource> = clock_concrete;
+    let result = pipeline
+        .drive_streaming_for_test(
+            StreamTestParams {
+                time: ts,
+                pacer: CooperativePacer,
+                max_ticks: Some(TICKS),
+                policy: SendPolicy::DropOnOverload,
+                runners: vec![Box::new(runner)],
+                consumer_fault_after_ticks: None,
+                hot_tick_observer: None,
+            },
+            &stop,
+        )
+        .await
+        .expect("drive streaming");
+    driver_stop.store(true, Ordering::Release);
+
+    assert_eq!(
+        result.report.frames, TICKS,
+        "every emitted tick must be processed inside the envelope"
+    );
+    assert_eq!(
+        result.report.dropped, 0,
+        "NO-FALTER: nothing is shed inside the real-time envelope"
+    );
+    assert_eq!(
+        video_packets.load(Ordering::Acquire),
+        usize::try_from(TICKS).unwrap(),
+        "the muxed output has a video frame for EVERY tick — never a missing encoded tick"
+    );
+    assert!(
+        audio_packets.load(Ordering::Acquire) >= TICKS,
+        "program audio must flow ({} packets)",
+        audio_packets.load(Ordering::Acquire)
+    );
+    // Cumulative audio tracks the tick counter exactly: the highest audio
+    // packet starts at sample position max_pts and spans one AAC frame (1024),
+    // so max_pts + 1024 must reach the tick ideal within one frame.
+    let tick_ideal = TICKS * SAMPLES_PER_TICK;
+    let audio_end = max_audio_pts.load(Ordering::Acquire) + 1024;
+    assert!(
+        tick_ideal.saturating_sub(audio_end) <= SAMPLES_PER_TICK,
+        "cumulative audio {audio_end} must track the tick ideal {tick_ideal}          (within one AAC frame of in-flight tail)"
+    );
+}
+
+/// Beyond the admitted envelope (t70: never overclaim that hardware cannot
+/// fail): a memory-speed engine outruns any real encoder by orders of
+/// magnitude, the consumer falls behind by more than a full queue drain
+/// horizon, and the run must FAIL with the exact typed cause — a visible
+/// failure the supervisor restarts on — never silently shedding ticks into
+/// timestamp gaps (the rejected gap-as-designed behaviour).
+#[tokio::test(flavor = "current_thread")]
+async fn beyond_envelope_shed_fails_visibly() {
+    const TICKS: u64 = 4_000;
+
+    let mut pipeline = build_pipeline();
+    let runner = move |rx: Receiver<EncodedPacket>| -> TestSinkOutcome {
+        let mut frames = 0;
+        while rx.recv().is_ok() {
+            frames += 1;
         }
         TestSinkOutcome { frames }
     };
@@ -690,34 +688,6 @@ async fn rt8b_audio_stays_lip_synced_to_the_tick_index_under_video_drops() {
     let driver_stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
     spawn_clock_driver(Arc::clone(&clock), Arc::clone(&driver_stop));
 
-    let hot_tick = Arc::new(AtomicU64::new(0));
-
-    // Watcher: once the sink has drained at least one packet (the consumer is
-    // running but paced below the engine), drive POST_DROP_TICKS further engine
-    // ticks — every tick past the hot-queue fill is shed — then stop.
-    let watch_drained = Arc::clone(&drained_one);
-    let watch_hot_tick = Arc::clone(&hot_tick);
-    let watch_stop = stop.clone();
-    std::thread::spawn(move || {
-        let deadline = std::time::Instant::now() + WATCHDOG;
-        while watch_drained.load(Ordering::Acquire) == 0 {
-            if std::time::Instant::now() >= deadline {
-                watch_stop.stop();
-                return;
-            }
-            std::thread::yield_now();
-        }
-        let base = watch_hot_tick.load(Ordering::Acquire);
-        let target = base.saturating_add(POST_DROP_TICKS);
-        while watch_hot_tick.load(Ordering::Acquire) < target {
-            if std::time::Instant::now() >= deadline {
-                break;
-            }
-            std::thread::yield_now();
-        }
-        watch_stop.stop();
-    });
-
     let clock_concrete: Arc<ManualTimeSource> = Arc::clone(&clock);
     let ts: Arc<dyn TimeSource> = clock_concrete;
     let result = pipeline
@@ -725,35 +695,31 @@ async fn rt8b_audio_stays_lip_synced_to_the_tick_index_under_video_drops() {
             StreamTestParams {
                 time: ts,
                 pacer: CooperativePacer,
-                max_ticks: None,
+                max_ticks: Some(TICKS),
                 policy: SendPolicy::DropOnOverload,
-                runners: vec![Box::new(slow_runner)],
+                runners: vec![Box::new(runner)],
                 consumer_fault_after_ticks: None,
-                hot_tick_observer: Some(Arc::clone(&hot_tick)),
+                hot_tick_observer: None,
             },
             &stop,
         )
-        .await
-        .expect("drive streaming");
+        .await;
     driver_stop.store(true, Ordering::Release);
 
-    // Preconditions: the shed actually happened, and audio flowed.
-    assert!(
-        result.report.dropped > 0,
-        "the slow sink must have forced the engine to shed video frames (got {} dropped)",
-        result.report.dropped
-    );
-    assert!(
-        audio_packets.load(Ordering::Acquire) > 0,
-        "program audio must have reached the sink"
-    );
-
-    assert_audio_tracks_tick_index(
-        result.report.frames,
-        result.report.dropped,
-        max_audio_end.load(Ordering::Acquire),
-        SAMPLES_PER_TICK,
-    );
+    let err = result.expect_err("beyond-envelope overrun must fail visibly, never silently shed");
+    match &err {
+        multiview_cli::pipeline::PipelineError::Output { kind, reason } => {
+            assert_eq!(*kind, "video-worker");
+            assert!(
+                reason.contains("beyond the admitted envelope"),
+                "the exact overrun cause must propagate, got {reason:?}"
+            );
+        }
+        other => panic!("expected the typed beyond-envelope error, got {other:?}"),
+    }
+    // The run stopped at a tick boundary via the fatal signal, not by running
+    // the full budget of silent gaps.
+    assert!(stop.is_stopped(), "the fatal signal must be raised");
 }
 
 /// The RT-8b decision: cumulative audio samples must track the TICK count, not the

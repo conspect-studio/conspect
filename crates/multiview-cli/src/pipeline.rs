@@ -6043,6 +6043,44 @@ impl VideoEncodeWorker for PipelineVideoWorker {
     }
 }
 
+/// The per-item frame-substitution limit: the maximum number of consecutive
+/// output ticks a single received item may fill by substitution (the hot
+/// queue's capacity — in the admitted real-time envelope a transient consumer
+/// stall can shed at most a queue's worth of ticks). A larger gap means the
+/// consumer fell behind by more than a full queue drain horizon — beyond the
+/// real-time envelope — and fails the run explicitly rather than silently
+/// stamping a fast-forward jump into the encoded stream.
+const FRAME_SUBSTITUTION_LIMIT: u64 = 8;
+
+/// The tick indexes a received item must FILL before its own tick so the
+/// encoded stream never misses a tick (no-falter): every tick between the last
+/// processed tick and this item's tick is substituted with the last good baked
+/// canvas, restamped at the missing tick's index — fixed cadence output, frame
+/// substitution when input is unavailable, never a missing encoded tick.
+///
+/// # Errors
+/// Returns a typed error when the gap exceeds [`FRAME_SUBSTITUTION_LIMIT`] —
+/// the consumer is beyond the admitted envelope; the fatal signal stops the
+/// run and the supervisor restarts a fresh process (visible failure, never a
+/// silent timestamp jump).
+fn missing_ticks_before(
+    last_tick: Option<u64>,
+    current_tick: u64,
+) -> Result<std::ops::Range<u64>, PipelineError> {
+    let start = last_tick.map_or(current_tick, |last| last.saturating_add(1));
+    if current_tick.saturating_sub(start) > FRAME_SUBSTITUTION_LIMIT {
+        return Err(PipelineError::Output {
+            kind: "video-worker",
+            reason: format!(
+                "output fell {gap} ticks behind the clock (beyond the admitted envelope of \
+                 {FRAME_SUBSTITUTION_LIMIT}): the encoder cannot keep the fixed cadence",
+                gap = current_tick.saturating_sub(start)
+            ),
+        });
+    }
+    Ok(start..current_tick)
+}
+
 /// The single bake-consumer thread body (encode-once-mux-many, invariant #7):
 /// build the [`StreamBaker`] from the owned [`BakeContext`] and own the single
 /// [`ProgramEncoder`], then loop receiving [`StreamItem`]s — bake each into an
@@ -6069,7 +6107,7 @@ fn consumer_main(
     ctx: BakeContext,
     hot_rx: &Receiver<StreamItem>,
     mut delivery: BindingDelivery,
-    _media_span: Duration,
+    media_span: Duration,
     cadence: Rational,
     video_encoders: Vec<VideoRenditionEncoder>,
     mut audio_encoder: Option<AudioRenditionEncoder>,
@@ -6179,6 +6217,19 @@ fn consumer_main(
     let mut av_meter = audio_bus
         .as_ref()
         .map(|bus| crate::av_sync::AvMeter::new(bus.cadence(), bus.format().sample_rate()));
+    // The encoder-work admission horizon (no-falter): the consumer may wait
+    // for a momentarily-full worker queue up to ONE hot-queue drain horizon —
+    // cadence-derived, fixed — so the hot queue keeps absorbing engine ticks
+    // while the consumer waits and nothing is shed. Beyond the horizon the
+    // encoder is wedged past the real-time envelope and fails explicitly.
+    let offer_horizon = media_span.saturating_mul(4);
+    // The last processed tick and the last good BAKED canvas — the source for
+    // frame substitution (no-falter: a transient consumer stall sheds ticks
+    // from the hot queue; the encoded stream still gets a restamped frame for
+    // every one of them, duplicated content over the gap, never a missing
+    // tick and never a timestamp jump).
+    let mut last_tick: Option<u64> = None;
+    let mut last_baked: Option<Arc<Nv12Image>> = None;
     // `recv()` returns `Err` only when the hot sender drops = end-of-program
     // (clean stop / EOF), which ends the loop.
     while let Ok(item) = hot_rx.recv() {
@@ -6238,20 +6289,52 @@ fn consumer_main(
             None
         };
         let overlaid = baker.bake(&item)?;
+        // NO-FALTER: fill any ticks this consumer missed (a transient stall
+        // shed them from the hot queue) with frame substitution — the last
+        // good baked canvas restamped at each missing tick's index. The
+        // encoder therefore sees a STRICTLY consecutive tick sequence (its
+        // deployed continuity contract is untouched) and the muxed stream has
+        // a frame for EVERY output tick. A gap beyond the admitted envelope
+        // fails the run explicitly (never silently skips forward).
+        for missing in missing_ticks_before(last_tick, item.tick_index)? {
+            let canvas = last_baked.as_ref().unwrap_or(&overlaid);
+            for worker in &workers {
+                worker
+                    .offer_within(
+                        BakedTick {
+                            tick: missing,
+                            canvas: Arc::clone(canvas),
+                        },
+                        offer_horizon,
+                    )
+                    .map_err(|e| PipelineError::Output {
+                        kind: "video-worker",
+                        reason: format!("{e:?}"),
+                    })?;
+            }
+        }
         // One immutable baked allocation is offered to each independent video
-        // rendition. An overloaded rendition fails explicitly, never pacing the
-        // program clock or encoding a sibling rendition on this consumer.
+        // rendition. A momentarily-full worker queue back-pressures this
+        // consumer for up to one queue drain horizon (the hot queue keeps
+        // absorbing engine ticks meanwhile — nothing is shed inside the
+        // envelope); only a worker wedged beyond the horizon fails
+        // explicitly, never pacing the program clock.
         for worker in &workers {
             worker
-                .offer(BakedTick {
-                    tick: item.tick_index,
-                    canvas: Arc::clone(&overlaid),
-                })
+                .offer_within(
+                    BakedTick {
+                        tick: item.tick_index,
+                        canvas: Arc::clone(&overlaid),
+                    },
+                    offer_horizon,
+                )
                 .map_err(|e| PipelineError::Output {
                     kind: "video-worker",
                     reason: format!("{e:?}"),
                 })?;
         }
+        last_tick = Some(item.tick_index);
+        last_baked = Some(Arc::clone(&overlaid));
         // Program audio (AUD-4 + RT-8b), OFF the engine hot loop: when the bus is
         // present, mix program audio up to THIS frame's output tick index — catching
         // up the samples for any ticks `DropOnOverload` shed since the last surviving
