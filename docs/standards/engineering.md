@@ -56,8 +56,8 @@ paths do not show (see the invariant clause above).
   uses to skip the heavy matrix — so the classifier and CI can never disagree. Both fail *upward*:
   an extension nobody allowlisted is code.
 - **Every apply-trigger path is R2 minimum.** `docker.yml` and `release*.yml` publish to GHCR and to
-  the public release feed; `docker.yml` has no `paths:` filter, so **every merge to `main` publishes
-  an image**. `deploy/**` and the publishing workflows carry the blast radius of that publish, not of
+  the public release feed; `docker.yml` can publish an image on any merge to `main`
+  outside the narrow [prose path exclusions](../decisions/ADR-0046.md#event-level-prose-filter). `deploy/**` and the publishing workflows carry the blast radius of that publish, not of
   their own diff.
 - **The data plane is R2.** Its whole product promise is bulletproof output from bad inputs on
   contended hosts; `conventions.md` invariants #1–#10 live in those crates.
@@ -129,7 +129,8 @@ are flagged in CI is not true today — no DCO workflow exists.
 
 ## E. Parallelism and delegation
 
-- Independent units run **concurrently** in separate worktree lanes. Serial execution of independent
+- Independent units run **concurrently** in separate worktree lanes, bounded by the capacity checks
+  and cleanup requirements in [workspace disk hygiene](../development/working-in-this-monorepo.md#workspace-disk-hygiene). Serial execution of independent
   work is a defect, not caution. Serialize only what contends on a hot shared file.
 - Batch independent tool calls into a single message.
 - Delegate wide reading and mechanical edits to subagents; keep their conclusions, not their transcripts.
@@ -172,6 +173,6 @@ satisfied honestly, say so and stop — those are the only two options.
 ---
 
 Toolchain forensics (lint ordering, clippy traps, mutation exit codes, tool-version gotchas):
-[agent-guardrails](../development/agent-guardrails.md). Agent operations (lanes, build-dir hygiene,
+[agent-guardrails](../development/agent-guardrails.md). Agent operations (lanes, workspace disk hygiene,
 context reload behaviour): [working-in-this-monorepo](../development/working-in-this-monorepo.md).
 The live delivery loop: [ADR-G007](../decisions/ADR-G007.md) + the `orchestrate` skill.

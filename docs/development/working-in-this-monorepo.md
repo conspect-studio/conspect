@@ -91,21 +91,79 @@ the direction tells you which crate a change belongs in before you start reading
 A Rust language-server plugin replaces many file reads with jump-to-definition across 23 crates;
 install with `/plugin install rust-lsp@claude-plugins-official` (needs `rust-analyzer` present).
 
-## Build-dir hygiene — never fill `/tmp`
+## Workspace disk hygiene
 
-Per-lane build artifacts have filled `/tmp` with **terabytes** (operator directive, 2026-06-10;
-the incident is written up in
-[`devcontainer-cargo-target.md`](../runbooks/devcontainer-cargo-target.md) — loadavg 675 with ~627
-processes stuck in D-state). The rules, for every agent and every parallel lane:
+**Each agent owns the disk footprint of its task, including delegated lanes.** Isolation is not
+permission to retain unlimited caches. In November 2026 this checkout reached 875 GiB across
+132 worktrees; 67 idle Rust build caches alone consumed 652 GiB. Keep disk use bounded throughout
+the task, not just after an ENOSPC failure.
 
-- **Do not set `CARGO_TARGET_DIR` to a `/tmp` path** — do not override it at all. Each worktree's
-  `target/` is already isolated from every other lane, and it is deleted with the worktree.
-- **Remove your worktree when the lane is done** (PR pushed, branch on the remote):
-  `git worktree remove --force <path> && git worktree prune`, run from anywhere inside the repo.
-  Orphaned worktrees and their `target/` dirs are the debt.
-- If a `/tmp` scratch dir is genuinely unavoidable (non-cargo tooling), `rm -rf` it before finishing.
-- **Sweep rule:** any `/tmp/*-target*` directory not written to in the last ~3 hours is orphaned —
-  delete it. Check mtimes first; never delete a dir an active lane is writing.
+### Before work and before each large build or fan-out
+
+- Work in a task-specific Git worktree; never edit or build in the root checkout. Integrate through
+  a reviewed omnibus PR. Only sync the root after merge, without overwriting existing changes.
+- Check `df -h .` and `df -i .`, then inspect `git worktree list --porcelain` and the size of your
+  own worktree, `target/`, dependency caches and scratch outputs with `du -sh <exact-path>`.
+- Estimate and record peak additional bytes and inodes for **all** concurrent lanes in the PR or
+  task handoff, not only final artifact size. Require free bytes to be at least
+  `max(20% of filesystem capacity, estimated peak additional bytes + 50 GiB)`, and free inodes
+  to cover estimated peak additional inodes plus 20% of total inodes (where inode limits apply).
+  Otherwise do not start another large build, dependency install or fan-out. Reclaim verified
+  disposable task artifacts, reduce concurrency, or arrange capacity first. Recheck during long
+  runs and between waves.
+- Keep Cargo's per-worktree `target/` isolation. Never override `CARGO_TARGET_DIR`, share a sibling's
+  cache, or move build output to `/tmp` or another filesystem to evade the capacity check. See
+  [`devcontainer-cargo-target.md`](../runbooks/devcontainer-cargo-target.md) for the I/O-storm history.
+- Reuse your current lane for successive steps rather than create a checkout for every command.
+  Bound parallel build lanes to available disk and memory. Documentation-only changes need no
+  Rust or web build artifacts. Keep logs, recordings, coverage and test output bounded too.
+
+### During work and at handoff
+
+- Stop your own completed background jobs and release disposable build outputs before the next
+  wave. Do not remove an artifact still needed for review, integration, deployment or evidence.
+- A paused task must state its worktree owner, reason for retention, retained size and cleanup
+  condition in the PR or handoff. A pushed branch is not, by itself, permission to delete a lane.
+- Before removal, resolve and verify the exact absolute path. Check owner/session and process
+  activity, worktree locks and nested worktrees. Run
+  `git status --short --ignored --untracked-files=all` inside the lane to list ignored and untracked
+  paths together. A collapsed `!! <dir>/` line remains unclassified, never disposable; inventory
+  its contents before any deletion. Do not read secret contents.
+- Preserve uncommitted, untracked and non-rebuildable ignored data, open-PR work and unique commits.
+  Preserve detached commits with a durable branch ref before removing their checkout. A clean Git
+  status, old mtime, dead PID or merged branch alone does **not** prove a directory disposable.
+- Coordinate with the owner before touching a sibling lane or shared cache. Never use a broad
+  `git clean -fdx`, recursive workspace deletion, Docker/volume prune, toolchain purge or age-only
+  `/tmp` sweep as a shortcut. Protect scratch data and unrelated sessions.
+
+### After merge or explicit abandonment
+
+Explicit abandonment requires a recorded owner decision and durable refs for every unmerged commit;
+a handoff alone is not abandonment. Before a root sync, inspect root tracked, untracked and ignored
+paths without reading secrets. Refuse the update if any local work lacks an explicit preservation
+plan. Use a safe sync that preserves all local paths and commits; abort on collision. Never reset,
+clean, stash or force the root to make a sync pass. `pull --ff-only` alone is not a preservation plan.
+
+1. Verify the merged commit on `origin/main`, or record a deliberate handoff for any unmerged work.
+2. Stop your own processes and leave the worktree before removal. Recheck the path and protections
+   above immediately before deletion; do not rely on an old inventory.
+3. Inventory **all ignored paths** before removal, including nested directories; do not infer
+   safety from a clean tracked status. Positively classify each as rebuildable or preserve it
+   through an owner-approved secure handoff. Refuse removal while any path is unclassified.
+   Plain `git worktree remove` deletes ignored data without warning, even without `--force`.
+4. Remove only verified disposable outputs; never follow symlinks or cross mount boundaries.
+   Before a Cargo clean, use `env -u CARGO_TARGET_DIR cargo metadata --no-deps --format-version 1`
+   in the inactive lane and verify `target_directory` resolves exactly to `<lane>/target`, not a
+   root/shared/mounted cache. Only then use `env -u CARGO_TARGET_DIR cargo clean` there. Remove
+   only your disposable dependency installs, logs and scratch files. Never clean the root cache.
+5. Refuse removal if nested worktrees remain. Remove your finished checkout with
+   `git worktree remove <verified-absolute-path>` from outside it, only after the inventory and
+   preservation above. Do not use `--force` to bypass dirty/untracked data or a lock. Retain
+   branches until merge or durable handoff is verified; do not force-delete unique commits.
+6. Check `git worktree list --porcelain`, `df -h .` and `df -i .` again. Report reclaimed space and
+   any retained lane, its owner and cleanup condition. Cleanup is part of completion, not optional
+   follow-up. If safe cleanup cannot restore headroom, report the capacity blocker instead of
+   starting more disk-heavy work.
 
 ## Build-cache honesty
 

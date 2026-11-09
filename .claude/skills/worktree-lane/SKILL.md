@@ -83,15 +83,15 @@ git -C "$ROOT/.claude/worktrees/<integrator-lane>" cherry-pick <sha>   # one at 
 
 ## 5. Clean up — the lane dies with its work, root catches up
 
-```bash
-# Re-derive $ROOT here if this is a fresh shell (see §1) — never a literal path.
-git -C "$ROOT" worktree remove --force ".claude/worktrees/$LANE"
-git -C "$ROOT" worktree prune
-# After a PR merge, the merging agent refreshes the root mirror:
-git -C "$ROOT" fetch origin && git -C "$ROOT" pull --ff-only origin main
-```
+Follow [workspace disk hygiene](../../../docs/development/working-in-this-monorepo.md#workspace-disk-hygiene)
+before builds/fan-out and after merge. Check capacity, owner/activity, locks, nested worktrees,
+all untracked/ignored paths and durable refs before removal. Age or a dead PID is never enough.
+Plain `git worktree remove` deletes ignored data: inventory and positively classify every path,
+preserve non-rebuildable data, then remove verified disposable outputs before the checkout.
+Leave the lane and remove its verified absolute path without `--force`. Retain unfinished work
+with an owner and cleanup condition. Never sweep sibling worktrees or force-delete unique commits.
 
-Run cleanup as soon as the lane's work is merged/integrated, so the next lane
-bases on current HEAD. Sweep any orphaned worktrees idle for more than a few
-hours: `git worktree list`. Never force-remove a worktree that is `locked` or
-holds another active session's unmerged work — that disrupts a sibling lane.
+Only sync the root after merge. Inspect tracked, untracked and ignored root paths first; preserve
+all local data and commits explicitly and abort on collisions. Do not use reset/clean/stash or
+assume `pull --ff-only` protects ignored files. Base new lanes on fetched `origin/main`, not a
+possibly stale root HEAD. Report reclaimed space and any retained lane at completion.

@@ -11,6 +11,22 @@ import { lingui } from "@lingui/vite-plugin";
 // wire the macro through @vitejs/plugin-react's Babel pipeline.
 export default defineConfig({
   plugins: [
+    {
+      name: 'native-moq-audio-only',
+      enforce: 'pre',
+      resolveId(source, importer) {
+        if (source === './libav' && importer?.replaceAll('\\\\', '/').endsWith('/@moq/hang/util/index.js')) {
+          return new URL('./src/preview/nativeAudioOnly.ts', import.meta.url).pathname;
+        }
+      },
+      generateBundle(_options, bundle) {
+        for (const output of Object.values(bundle)) {
+          if (output.type === 'chunk' && Object.keys(output.modules).some((id) => /(?:@libav\.js|libavjs-webcodecs-polyfill)/.test(id))) {
+            throw new Error('Native-only distribution must not include libav decoder modules');
+          }
+        }
+      },
+    },
     react({
       babel: {
         plugins: ["@lingui/babel-plugin-lingui-macro"],

@@ -55,6 +55,7 @@ support matrix — update a row's status as it is implemented.
 | Supervised reconnect / backoff / circuit breaker | 🔵 | M3 | [resilience](docs/architecture/resilience.md) |
 | Per-source color override (4 axes) | 📐 | M5 | [color](docs/architecture/color.md) |
 | Per-input audio/subtitle track selection | 📐 | M4/M5 | [media](docs/media/audio-subtitles-overlays.md) |
+| Live Feed Exchange — offer and receive independently priced clean and branded contribution feeds by story location | 📋 backlog | Unscheduled | [Platform backlog](docs/development/live-feed-exchange-backlog.md) · [#205](https://github.com/conspect-studio/conspect/issues/205) |
 
 ## Outputs
 
@@ -133,6 +134,7 @@ support matrix — update a row's status as it is implemented.
 | CI (fmt/clippy/test/deny/inclusive-language/web) | ✅ | M0 | `.github/workflows/ci.yml` |
 | Agent guardrails (typing, TDD, adversarial review) | ✅ (docs) | M0 | [agent-guardrails](docs/development/agent-guardrails.md) |
 | Linux container (NVIDIA Toolkit / VAAPI) | 📐 | M9 | [operations/containerization.md](docs/operations/containerization.md) |
+| On-demand Conspect Cloud production environments with full show restore and durable S3/R2 media | 📋 backlog | Unscheduled | [Platform backlog](docs/development/cloud-production-environments-backlog.md) · [#213](https://github.com/conspect-studio/conspect/issues/213) |
 | Observability (tracing, Prometheus, health) | 🔵 | M3/M8 | [operations/observability.md](docs/operations/observability.md) |
 | Testing: synthetic sources, chaos/soak, mutation, density | 📐 | M3/M9 | [operations/testing-and-benchmarking.md](docs/operations/testing-and-benchmarking.md) |
 

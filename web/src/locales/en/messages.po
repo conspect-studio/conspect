@@ -488,6 +488,10 @@ msgstr "A salvo id is required"
 msgid "A salvo is a named, atomically-applied recall. One salvo can switch the layout, rebind sources into cells, set tally colors, and update under-monitor display text — all at once — so an operator can move a whole arrangement (say, a VTR review setup) with a single action instead of a series of separate edits."
 msgstr "A salvo is a named, atomically-applied recall. One salvo can switch the layout, rebind sources into cells, set tally colors, and update under-monitor display text — all at once — so an operator can move a whole arrangement (say, a VTR review setup) with a single action instead of a series of separate edits."
 
+#: src/pages/RelayManagementPage.tsx:58
+msgid "A scoped token is optional. Creation requires a complete inventory below 50 tokens and explicit consent. Permissions apply only to the selected account."
+msgstr "A scoped token is optional. Creation requires a complete inventory below 50 tokens and explicit consent. Permissions apply only to the selected account."
+
 #: src/pages/MeshPage.tsx:74
 msgid "A signed summary only — salted digests and a signed entitlement summary, never raw identity. The exhaustive list:"
 msgstr "A signed summary only — salted digests and a signed entitlement summary, never raw identity. The exhaustive list:"
@@ -659,6 +663,10 @@ msgstr "Account audit log"
 #: src/pages/SystemActionsPage.tsx:231
 msgid "Account audit log, oldest first within the page."
 msgstr "Account audit log, oldest first within the page."
+
+#: src/pages/RelayManagementPage.tsx:47
+msgid "Account ID"
+msgstr "Account ID"
 
 #: src/pages/DeviceDetailPage.tsx:730
 msgid "achieved tier not measured yet"
@@ -1127,6 +1135,10 @@ msgstr "API access token"
 msgid "API key"
 msgstr "API key"
 
+#: src/pages/RelayManagementPage.tsx:52
+msgid "API secret"
+msgstr "API secret"
+
 #: src/pages/SettingsPage.tsx:203
 msgid "API token"
 msgstr "API token"
@@ -1176,6 +1188,10 @@ msgstr "Apply layout to engine"
 #: src/pages/DeviceDetailPage.tsx:985
 msgid "Apply mode"
 msgstr "Apply mode"
+
+#: src/pages/RelayConfigurationControls.tsx:31
+msgid "Apply requested configuration"
+msgstr "Apply requested configuration"
 
 #: src/layout/components/GridLayoutEditor.tsx:567
 msgid "Area cell"
@@ -1329,6 +1345,11 @@ msgstr "Auto (drop leading zero units)"
 msgid "Auto (first usable track)"
 msgstr "Auto (first usable track)"
 
+#: src/pages/RelayManagementPage.tsx:66
+#: src/pages/RelayManagementPage.tsx:78
+msgid "Automatic"
+msgstr "Automatic"
+
 #: src/pages/SourcesPage.tsx:237
 msgid "Automatic (default)"
 msgstr "Automatic (default)"
@@ -1340,6 +1361,10 @@ msgstr "Automatic (EDID preferred mode)"
 #: src/pages/SourcesPage.tsx:1036
 msgid "Automatic (resolve the guide automatically)"
 msgstr "Automatic (resolve the guide automatically)"
+
+#: src/pages/RelayManagementPage.tsx:63
+msgid "Automatic reconciliation is unavailable. Relay creation and deletion require explicit actions."
+msgstr "Automatic reconciliation is unavailable. Relay creation and deletion require explicit actions."
 
 #: src/events/AutomationPanel.tsx:20
 msgid "Automation executor is not running on this server (source events are unavailable)."
@@ -1638,6 +1663,7 @@ msgstr "Camera 1"
 #: src/pages/graphics/LibraryView.tsx:155
 #: src/pages/LayoutsPage.tsx:319
 #: src/pages/MediaPlayersPage.tsx:493
+#: src/pages/RelayManagementPage.tsx:80
 #: src/pages/SalvosPage.tsx:281
 #: src/pages/SalvosPage.tsx:395
 #: src/pages/SalvosPage.tsx:433
@@ -1655,6 +1681,10 @@ msgstr "Cancel exit"
 #: src/pages/SalvosPage.tsx:275
 msgid "Cancel salvo"
 msgstr "Cancel salvo"
+
+#: src/pages/RelayConfigurationControls.tsx:39
+msgid "Cancel token revocation"
+msgstr "Cancel token revocation"
 
 #: src/pages/MediaPlayersPage.tsx:429
 msgid "Cancel vamp exit"
@@ -1892,6 +1922,10 @@ msgstr "Channels"
 msgid "Channels (route {row})"
 msgstr "Channels (route {row})"
 
+#: src/pages/RelayManagementPage.tsx:59
+msgid "Check all token pages"
+msgstr "Check all token pages"
+
 #: src/iptv/SourceLinks.tsx:433
 msgid "Checked from this server."
 msgstr "Checked from this server."
@@ -2051,6 +2085,14 @@ msgstr "Close details"
 msgid "Closed"
 msgstr "Closed"
 
+#: src/pages/RelayManagementPage.tsx:51
+msgid "Cloudflare email"
+msgstr "Cloudflare email"
+
+#: src/pages/RelayManagementPage.tsx:38
+msgid "Cloudflare media relays"
+msgstr "Cloudflare media relays"
+
 #: src/components/HealthBanner.tsx:68
 msgid "Code:"
 msgstr "Code:"
@@ -2134,6 +2176,11 @@ msgstr "Community support"
 #: src/pages/CapabilitiesPage.tsx:197
 msgid "Compiled features"
 msgstr "Compiled features"
+
+#. placeholder {0}: inventory.count
+#: src/pages/RelayManagementPage.tsx:60
+msgid "Complete token count: {0}"
+msgstr "Complete token count: {0}"
 
 #: src/pages/ProbesPage.tsx:303
 msgid "Compliance standard"
@@ -2236,6 +2283,14 @@ msgstr "Configured weather locations"
 #: src/events/AutomationPanel.tsx:134
 msgid "Confirm"
 msgstr "Confirm"
+
+#: src/pages/RelayManagementPage.tsx:80
+msgid "Confirm teardown"
+msgstr "Confirm teardown"
+
+#: src/pages/RelayConfigurationControls.tsx:38
+msgid "Confirm token revocation"
+msgstr "Confirm token revocation"
 
 #: src/components/ConnectionStatus.tsx:29
 #: src/iptv/NetworkDialog.tsx:111
@@ -2756,6 +2811,10 @@ msgstr "Create {0} source(s)"
 msgid "Create 7-day source"
 msgstr "Create 7-day source"
 
+#: src/pages/RelayManagementPage.tsx:61
+msgid "Create account-only scoped token"
+msgstr "Create account-only scoped token"
+
 #: src/pages/graphics/LibraryView.tsx:151
 msgid "Create item"
 msgstr "Create item"
@@ -2763,6 +2822,10 @@ msgstr "Create item"
 #: src/pages/graphics/PlayoutView.tsx:254
 msgid "Create PVW/PGM sources"
 msgstr "Create PVW/PGM sources"
+
+#: src/pages/RelayManagementPage.tsx:67
+msgid "Create relay"
+msgstr "Create relay"
 
 #: src/pages/graphics/DataView.tsx:338
 msgid "Create sources with a transparent background (for layering over video)"
@@ -2801,6 +2864,14 @@ msgstr "Creates an ordinary managed output bound to this device via device_ref; 
 #: src/pages/DeviceDetailPage.tsx:1013
 msgid "Creates an ordinary managed source bound to this device via device_ref."
 msgstr "Creates an ordinary managed source bound to this device via device_ref."
+
+#: src/pages/RelayManagementPage.tsx:46
+msgid "Credential onboarding"
+msgstr "Credential onboarding"
+
+#: src/pages/RelayManagementPage.tsx:48
+msgid "Credential type"
+msgstr "Credential type"
 
 #: src/docs/registry.ts:319
 #: src/pages/docs/DevicesAdoptHelpPage.tsx:63
@@ -3089,6 +3160,10 @@ msgstr "Delete sync group"
 #: src/pages/TallyPage.tsx:414
 msgid "Delete tally profile?"
 msgstr "Delete tally profile?"
+
+#: src/pages/RelayManagementPage.tsx:80
+msgid "Delete this relay? Active clients can disconnect. Imported resources also require explicit deletion."
+msgstr "Delete this relay? Active clients can disconnect. Imported resources also require explicit deletion."
 
 #: src/resources/CrudPage.tsx:392
 msgid "Delete this resource?"
@@ -3655,6 +3730,10 @@ msgstr "Edited locally"
 msgid "Effective licence"
 msgstr "Effective licence"
 
+#: src/pages/RelayManagementPage.tsx:76
+msgid "Effective transport"
+msgstr "Effective transport"
+
 #: src/events/SourceEventsButton.tsx:27
 msgid "Elapsed"
 msgstr "Elapsed"
@@ -3666,6 +3745,10 @@ msgstr "Element name"
 #: src/pages/SourcesPage.tsx:715
 msgid "Embedded CEA-608 (CC1–CC4 only)"
 msgstr "Embedded CEA-608 (CC1–CC4 only)"
+
+#: src/pages/RelayConfigurationControls.tsx:28
+msgid "Enable requested upstreams"
+msgstr "Enable requested upstreams"
 
 #: src/docs/registry.ts:538
 #: src/pages/docs/concepts/CodecsPage.tsx:129
@@ -3866,6 +3949,10 @@ msgstr "Example ICE / TURN configuration"
 msgid "Example sync group"
 msgstr "Example sync group"
 
+#: src/pages/RelayManagementPage.tsx:70
+msgid "Existing relay ID"
+msgstr "Existing relay ID"
+
 #: src/pages/MediaPlayersPage.tsx:294
 msgid "exit armed"
 msgstr "exit armed"
@@ -3940,7 +4027,7 @@ msgstr "Failed: {0}"
 msgid "Failures use RFC 9457 problem documents (<0>application/problem+json</0>) with a machine-readable type and a human-readable detail."
 msgstr "Failures use RFC 9457 problem documents (<0>application/problem+json</0>) with a machine-readable type and a human-readable detail."
 
-#: src/preview/PreviewSurface.tsx:78
+#: src/preview/PreviewSurface.tsx:80
 msgid "Fallback — still preview (~1 fps)"
 msgstr "Fallback — still preview (~1 fps)"
 
@@ -4166,6 +4253,10 @@ msgstr "Glass-to-glass latency, what each protocol adds, and the trade-offs agai
 #: src/pages/docs/concepts/ResiliencePage.tsx:115
 msgid "Glitchy, corrupt, and malformed inputs are the expected workload, not an edge case: decode errors on one stream are tolerated and recovered per tile, and a broken track inside a transport (for example a damaged subtitle rendition) is warned about and recovered without killing the streams alongside it."
 msgstr "Glitchy, corrupt, and malformed inputs are the expected workload, not an edge case: decode errors on one stream are tolerated and recovered per tile, and a broken track inside a transport (for example a damaged subtitle rendition) is warned about and recovered without killing the streams alongside it."
+
+#: src/pages/RelayManagementPage.tsx:49
+msgid "Global API key and email"
+msgstr "Global API key and email"
 
 #: src/docs/registry.ts:622
 #: src/pages/docs/concepts/GlossaryPage.tsx:16
@@ -4601,6 +4692,10 @@ msgstr "Images"
 #: src/pages/M3uImportDialog.tsx:128
 msgid "Import from M3U"
 msgstr "Import from M3U"
+
+#: src/pages/RelayManagementPage.tsx:71
+msgid "Import relay"
+msgstr "Import relay"
 
 #: src/pages/M3uImportDialog.tsx:140
 msgid "Import sources from an M3U playlist"
@@ -5162,15 +5257,16 @@ msgstr "Live ephemeral cast sessions."
 msgid "Live host and accelerator utilisation streaming from the engine."
 msgstr "Live host and accelerator utilisation streaming from the engine."
 
-#: src/preview/PreviewSurface.tsx:164
+#: src/preview/PreviewSurface.tsx:152
+#: src/preview/PreviewSurface.tsx:176
 msgid "Live input preview failed."
 msgstr "Live input preview failed."
 
-#: src/preview/PreviewSurface.tsx:164
+#: src/preview/PreviewSurface.tsx:176
 msgid "Live input preview is busy. Another viewer has the session."
 msgstr "Live input preview is busy. Another viewer has the session."
 
-#: src/preview/PreviewSurface.tsx:177
+#: src/preview/PreviewSurface.tsx:189
 msgid "Live preview is busy. Another viewer has the session."
 msgstr "Live preview is busy. Another viewer has the session."
 
@@ -5536,9 +5632,19 @@ msgstr "Managed facility LAN"
 msgid "Management address"
 msgstr "Management address"
 
+#: src/pages/RelayManagementPage.tsx:66
+#: src/pages/RelayManagementPage.tsx:78
+msgid "Management mode"
+msgstr "Management mode"
+
 #: src/events/SourceEventsButton.tsx:22
 msgid "Manifest signalling"
 msgstr "Manifest signalling"
+
+#: src/pages/RelayManagementPage.tsx:66
+#: src/pages/RelayManagementPage.tsx:78
+msgid "Manual"
+msgstr "Manual"
 
 #: src/iptv/BulkAddDialog.tsx:43
 msgid "Manual — never change automatically"
@@ -5625,6 +5731,10 @@ msgstr "Measurement running"
 #: src/pages/MediaPlayersPage.tsx:220
 msgid "Media players"
 msgstr "Media players"
+
+#: src/app/navigation.tsx:80
+msgid "Media relays"
+msgstr "Media relays"
 
 #: src/pages/AuditPage.tsx:112
 #: src/pages/SystemActionsPage.tsx:236
@@ -6715,6 +6825,10 @@ msgstr "Operation {0}; the result arrives on the realtime stream."
 msgid "Operation id"
 msgstr "Operation id"
 
+#: src/pages/RelayManagementPage.tsx:83
+msgid "Operation in progress"
+msgstr "Operation in progress"
+
 #: src/pages/docs/ApiPage.tsx:72
 msgid "Optimistic concurrency"
 msgstr "Optimistic concurrency"
@@ -7472,6 +7586,10 @@ msgstr "Refresh"
 msgid "Refresh (exact rational)"
 msgstr "Refresh (exact rational)"
 
+#: src/pages/RelayManagementPage.tsx:73
+msgid "Refresh relay status"
+msgstr "Refresh relay status"
+
 #: src/iptv/Controls.tsx:55
 msgid "Region"
 msgstr "Region"
@@ -7488,10 +7606,38 @@ msgstr "Related"
 msgid "Relay"
 msgstr "Relay"
 
+#: src/pages/RelayManagementPage.tsx:40
+msgid "Relay changes are control-plane operations. A transport change can reset media connections. A shared relay does not provide per-source privacy."
+msgstr "Relay changes are control-plane operations. A transport change can reset media connections. A shared relay does not provide per-source privacy."
+
+#: src/pages/RelayConfigurationControls.tsx:19
+msgid "Relay configuration and tokens"
+msgstr "Relay configuration and tokens"
+
+#: src/pages/RelayManagementPage.tsx:39
+msgid "Relay credentials use encrypted server storage. The server needs an external master key; no plaintext configuration fallback exists."
+msgstr "Relay credentials use encrypted server storage. The server needs an external master key; no plaintext configuration fallback exists."
+
+#: src/pages/RelayManagementPage.tsx:55
+msgid "Relay management"
+msgstr "Relay management"
+
+#: src/pages/RelayManagementPage.tsx:65
+msgid "Relay name"
+msgstr "Relay name"
+
 #: src/pages/MeshPage.tsx:141
 #: src/pages/MeshPage.tsx:148
 msgid "Relay neighbours' heartbeats"
 msgstr "Relay neighbours' heartbeats"
+
+#: src/pages/RelayManagementPage.tsx:77
+msgid "Relay reports an error. Check server diagnostics."
+msgstr "Relay reports an error. Check server diagnostics."
+
+#: src/pages/RelayConfigurationControls.tsx:33
+msgid "Relay token ID to revoke (not the secret)"
+msgstr "Relay token ID to revoke (not the secret)"
 
 #: src/pages/MeshPage.tsx:243
 msgid "Relaying for us"
@@ -7628,6 +7774,22 @@ msgstr "Request headers"
 msgid "requested by"
 msgstr "requested by"
 
+#: src/pages/RelayConfigurationControls.tsx:20
+msgid "Requested configuration only. Saving replaces all upstreams; it does not prove media health. Use at most 16 HTTPS or MoQT URLs, without credentials, query strings, or fragments."
+msgstr "Requested configuration only. Saving replaces all upstreams; it does not prove media health. Use at most 16 HTTPS or MoQT URLs, without credentials, query strings, or fragments."
+
+#: src/pages/RelayConfigurationControls.tsx:26
+msgid "Requested relay name"
+msgstr "Requested relay name"
+
+#: src/pages/RelayManagementPage.tsx:76
+msgid "Requested transport"
+msgstr "Requested transport"
+
+#: src/pages/RelayConfigurationControls.tsx:29
+msgid "Requested upstream URLs, one per line"
+msgstr "Requested upstream URLs, one per line"
+
 #: src/pages/SettingsPage.tsx:139
 msgid "Requests will be unauthenticated."
 msgstr "Requests will be unauthenticated."
@@ -7721,7 +7883,7 @@ msgstr "Results"
 msgid "Results stream in below as they are found. {0}"
 msgstr "Results stream in below as they are found. {0}"
 
-#: src/preview/PreviewSurface.tsx:89
+#: src/preview/PreviewSurface.tsx:91
 msgid "Retry live preview"
 msgstr "Retry live preview"
 
@@ -7744,6 +7906,14 @@ msgstr "Review changes: {sourceName}"
 #: src/iptv/SourceLinks.tsx:322
 msgid "Review upstream changes"
 msgstr "Review upstream changes"
+
+#: src/pages/RelayConfigurationControls.tsx:35
+msgid "Revoke relay token"
+msgstr "Revoke relay token"
+
+#: src/pages/RelayConfigurationControls.tsx:36
+msgid "Revoke this token for this relay? New connections lose access. Existing connected sessions are not terminated."
+msgstr "Revoke this token for this relay? New connections lose access. Existing connected sessions are not terminated."
 
 #: src/pages/docs/components.tsx:147
 msgid "Roadmap"
@@ -7998,6 +8168,10 @@ msgstr "Scan the canvas out to a local HDMI/DisplayPort screen by KMS <0>connect
 #: src/pages/AlarmsPage.tsx:219
 msgid "Scope"
 msgstr "Scope"
+
+#: src/pages/RelayManagementPage.tsx:49
+msgid "Scoped API token"
+msgstr "Scoped API token"
 
 #: src/events/SourceEventsButton.tsx:22
 msgid "SCTE-35 signalling"
@@ -8445,6 +8619,7 @@ msgstr "Station WMO id (optional)"
 #: src/pages/graphics/DataView.tsx:355
 #: src/pages/MeshPage.tsx:62
 #: src/pages/OutputsPage.tsx:920
+#: src/pages/RelayManagementPage.tsx:76
 #: src/pages/SourcesPage.tsx:1109
 msgid "Status"
 msgstr "Status"
@@ -8461,7 +8636,7 @@ msgstr "Stereo"
 msgid "Still preview (~1 fps)"
 msgstr "Still preview (~1 fps)"
 
-#: src/preview/PreviewSurface.tsx:95
+#: src/preview/PreviewSurface.tsx:97
 msgid "Still preview (~1 fps) — live video is unavailable for this preview."
 msgstr "Still preview (~1 fps) — live video is unavailable for this preview."
 
@@ -8492,9 +8667,17 @@ msgstr "Stop this cast session?"
 msgid "Stopped"
 msgstr "Stopped"
 
+#: src/pages/RelayManagementPage.tsx:53
+msgid "Store credential securely"
+msgstr "Store credential securely"
+
 #: src/pages/DevicesPage.tsx:711
 msgid "Stored and applied: the device's supervised driver converges it now. Config export captures it for restarts."
 msgstr "Stored and applied: the device's supervised driver converges it now. Config export captures it for restarts."
+
+#: src/pages/RelayManagementPage.tsx:56
+msgid "Stored credential reference:"
+msgstr "Stored credential reference:"
 
 #: src/pages/SourcesPage.tsx:717
 msgid "Stored sidecar (not decoded per source)"
@@ -8606,7 +8789,7 @@ msgstr "Summary"
 msgid "Superseded"
 msgstr "Superseded"
 
-#: src/app/navigation.tsx:80
+#: src/app/navigation.tsx:81
 #: src/pages/SupportPage.tsx:527
 msgid "Support"
 msgstr "Support"
@@ -8800,6 +8983,10 @@ msgstr "Target video cell"
 #: src/pages/docs/concepts/TransportsPage.tsx:278
 msgid "TCP only; stalls then reconnects"
 msgstr "TCP only; stalls then reconnects"
+
+#: src/pages/RelayManagementPage.tsx:80
+msgid "Teardown relay"
+msgstr "Teardown relay"
 
 #: src/pages/SourcesPage.tsx:775
 msgid "Teletext page"
@@ -9124,6 +9311,10 @@ msgstr "The open standard for playing a WebRTC stream from a browser: the player
 #: src/pages/docs/concepts/GlossaryPage.tsx:373
 msgid "The open standard for publishing a WebRTC stream into a server: a browser or encoder POSTs an SDP offer to a single URL and receives the answer, then sends media over the peer connection. A Multiview <0>webrtc</0> source is published to over WHIP."
 msgstr "The open standard for publishing a WebRTC stream into a server: a browser or encoder POSTs an SDP offer to a single URL and receives the answer, then sends media over the peer connection. A Multiview <0>webrtc</0> source is published to over WHIP."
+
+#: src/pages/RelayManagementPage.tsx:41
+msgid "The operation failed. Check server diagnostics and permissions, then retry. No successful change is assumed."
+msgstr "The operation failed. Check server diagnostics and permissions, then retry. No successful change is assumed."
 
 #: src/pages/docs/ConfigPage.tsx:376
 msgid "The optional <0>[webrtc]</0> section tunes the built-in WebRTC endpoint that serves WHEP playback and the live preview and accepts WHIP publishing. Most deployments need none of it: browsers on the same network reach the server directly. When viewers or publishers sit behind strict NATs or firewalls, add one or more <1>[[webrtc.ice_servers]]</1> entries pointing at a STUN and/or TURN server so the connection can be relayed."
@@ -9583,6 +9774,14 @@ msgstr "To let callers pull the program, use srt://[::]:7001?mode=listener: one 
 msgid "To receive from a remote encoder, use srt://[::]:7001?mode=listener: one socket accepts an IPv6 or IPv4 caller, one at a time. 0.0.0.0 is IPv4 only."
 msgstr "To receive from a remote encoder, use srt://[::]:7001?mode=listener: one socket accepts an IPv6 or IPv4 caller, one at a time. 0.0.0.0 is IPv4 only."
 
+#: src/pages/RelayManagementPage.tsx:60
+msgid "Token inventory incomplete; creation disabled"
+msgstr "Token inventory incomplete; creation disabled"
+
+#: src/pages/RelayConfigurationControls.tsx:41
+msgid "Token revoked. Existing connected sessions are not terminated."
+msgstr "Token revoked. Existing connected sessions are not terminated."
+
 #: src/layout/components/CellsForm.tsx:393
 msgid "Top (%)"
 msgstr "Top (%)"
@@ -9766,6 +9965,10 @@ msgstr "Until start"
 #: src/pages/DeviceDetailPage.tsx:584
 msgid "unverified"
 msgstr "unverified"
+
+#: src/pages/RelayManagementPage.tsx:76
+msgid "Unverified"
+msgstr "Unverified"
 
 #: src/devices/FromDevice.tsx:181
 msgid "unverified — supply the URL yourself"
@@ -9965,7 +10168,7 @@ msgid "VT transport for the configured media-player channels. Load an asset, cue
 msgstr "VT transport for the configured media-player channels. Load an asset, cue, play, pause, stop, and — for a vamp/loop fill — arm, take, or cancel a clean exit at the next vamp boundary. Each command is accepted asynchronously; the player's live state and playhead arrive on the realtime stream."
 
 #: src/pages/MonitoringPage.tsx:87
-#: src/preview/PreviewSurface.tsx:43
+#: src/preview/PreviewSurface.tsx:45
 msgid "Waiting for a frame…"
 msgstr "Waiting for a frame…"
 

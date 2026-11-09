@@ -1,0 +1,23 @@
+debug [vite] connecting...
+debug [vite] connected.
+debug https://localhost:4443/ connected via WebTransport
+debug https://localhost:4443/ negotiated ALPN: moqt-16
+debug subscribe start: id=2 broadcast=fixture track=catalog.json
+debug subscribe written: id=2 broadcast=fixture track=catalog.json
+debug subscribe_namespace written: requestId=0
+debug announced: broadcast=fixture active=true
+debug subscribe ok: id=2 broadcast=fixture track=catalog.json
+debug received catalog hang fixture {video: Object, audio: Object}
+debug subscribe start: id=4 broadcast=fixture track=audio
+debug subscribe start: id=6 broadcast=fixture track=video
+debug subscribe written: id=4 broadcast=fixture track=audio
+debug subscribe written: id=6 broadcast=fixture track=video
+debug subscribe ok: id=6 broadcast=fixture track=video
+debug subscribe ok: id=4 broadcast=fixture track=audio
+warning [audio] SharedArrayBuffer unavailable, falling back to the higher latency postMessage audio buffer. Serve the page cross-origin isolated (Cross-Origin-Opener-Policy: same-origin, Cross-Origin-Embedder-Policy: require-corp) to avoid this.
+{"frames":31,"timestamps":[86000000,86266666,86633333,86666666,86700000,86733333,86766666,86800000,86833333,86866666,86900000,86933333,86966666,87000000,87033333,87066666,87100000,87133333,87166666,87200000,87233333,87266666,87300000,87333333,87366666,87400000,87433333,87466666,87500000,87533333,87566666],"audioFrames":49,"audioTimestamps":[86720000,86740000,86760000,86780000,86800000,86820000,86840000,86860000,86880000,86900000,86920000,86940000,86960000,86979999,87000000,87020000,87040000,87060000,87080000,87100000,87120000,87140000,87160000,87180000,87200000,87220000,87239999,87260000,87280000,87300000,87320000,87340000,87360000,87380000,87400000,87420000,87440000,87460000,87480000,87500000,87520000,87540000,87560000,87580000,87600000,87620000,87640000,87660000,87680000],"version":"moq-transport-16","error":null}
+debug adapter: close() called
+debug announced: broadcast=fixture active=false
+debug subscribe close: id=2 broadcast=fixture track=catalog.json
+debug subscribe close: id=6 broadcast=fixture track=video
+debug subscribe close: id=4 broadcast=fixture track=audio

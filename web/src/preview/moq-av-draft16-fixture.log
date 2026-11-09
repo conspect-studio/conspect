@@ -1,0 +1,24 @@
+debug [vite] connecting...
+debug [vite] connected.
+debug https://localhost:4443/ connected via WebTransport
+debug https://localhost:4443/ negotiated ALPN: moqt-16
+debug subscribe start: id=2 broadcast=fixture track=catalog.json
+debug subscribe written: id=2 broadcast=fixture track=catalog.json
+debug subscribe_namespace written: requestId=0
+debug announced: broadcast=fixture active=true
+debug subscribe ok: id=2 broadcast=fixture track=catalog.json
+debug received catalog hang fixture {video: Object, audio: Object}
+debug subscribe start: id=4 broadcast=fixture track=audio
+debug subscribe start: id=6 broadcast=fixture track=video
+debug subscribe written: id=4 broadcast=fixture track=audio
+debug subscribe written: id=6 broadcast=fixture track=video
+debug subscribe ok: id=4 broadcast=fixture track=audio
+debug subscribe ok: id=6 broadcast=fixture track=video
+debug sync[video]: 9 late frame(s), max 287ms behind
+warning [audio] SharedArrayBuffer unavailable, falling back to the higher latency postMessage audio buffer. Serve the page cross-origin isolated (Cross-Origin-Opener-Policy: same-origin, Cross-Origin-Embedder-Policy: require-corp) to avoid this.
+{"frames":30,"timestamps":[103333333,103366666,103400000,103433333,103466666,103500000,103533333,103566666,103600000,103633333,103666666,103700000,103733333,103766666,103800000,103833333,103866666,103900000,103933333,103966666,104000000,104033333,104066666,104100000,104133333,104166666,104200000,104233333,104266666,104300000],"audioFrames":52,"audioTimestamps":[103420000,103440000,103460000,103480000,103500000,103520000,103540000,103560000,103580000,103600000,103620000,103640000,103660000,103679999,103700000,103720000,103740000,103760000,103780000,103800000,103820000,103840000,103860000,103880000,103900000,103920000,103939999,103960000,103980000,104000000,104020000,104040000,104060000,104080000,104100000,104120000,104140000,104160000,104180000,104200000,104220000,104240000,104260000,104280000,104300000,104320000,104340000,104360000,104380000,104400000,104420000,104440000],"version":"moq-transport-16","error":null}
+debug adapter: close() called
+debug announced: broadcast=fixture active=false
+debug subscribe close: id=2 broadcast=fixture track=catalog.json
+debug subscribe close: id=6 broadcast=fixture track=video
+debug subscribe close: id=4 broadcast=fixture track=audio

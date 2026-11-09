@@ -523,6 +523,21 @@ where
     // IPTV guide refresher (epg-playlist): one control-plane task that only
     // fetches while `[iptv] enabled`; never touches the engine (inv #1/#10).
     drop(multiview_control::iptv::spawn_refresher(state.clone()));
+    let cloudflare = configured_cloudflare()?;
+    let reconciler = cloudflare
+        .as_ref()
+        .map(|provider| AbortTask(provider.clone().spawn_reconciler()));
+    let state = if let Some(provider) = cloudflare {
+        state.with_cloudflare(provider)
+    } else {
+        state
+    };
+    // Keep the abort guard inside the server's shutdown future. It also runs if
+    // the server future is dropped, so no management task survives the server.
+    let shutdown = async move {
+        let _reconciler = reconciler;
+        shutdown.await;
+    };
     let mut app = multiview_control::router(state.clone());
     for mount in hls_mounts(config) {
         app = app.nest(
@@ -599,6 +614,93 @@ where
         }
     };
     Ok((addr, handle, state))
+}
+
+/// Abort the off-clock management task when the server exits or is cancelled.
+struct AbortTask(tokio::task::JoinHandle<()>);
+impl Drop for AbortTask {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+/// Opt-in startup configuration references a private key file, never a raw key
+/// argument or environment value. Errors deliberately omit secret paths/data.
+fn configured_cloudflare(
+) -> std::io::Result<Option<Arc<multiview_control::cloudflare_management::ManagedCloudflare>>> {
+    use std::io::{Error, ErrorKind, Read};
+    let dir = std::env::var_os("MULTIVIEW_CLOUDFLARE_STATE_DIR");
+    let key_path = std::env::var_os("MULTIVIEW_CLOUDFLARE_MASTER_KEY_FILE");
+    let (dir, key_path) = match (dir, key_path) {
+        (None, None) => return Ok(None),
+        (Some(dir), Some(key)) => (dir, key),
+        _ => {
+            return Err(Error::new(
+                ErrorKind::InvalidInput,
+                "Cloudflare requires state directory and private master-key file",
+            ))
+        }
+    };
+    let path = std::path::Path::new(&key_path);
+    let metadata = std::fs::symlink_metadata(path)?;
+    if !metadata.is_file() || metadata.file_type().is_symlink() {
+        return Err(Error::new(
+            ErrorKind::PermissionDenied,
+            "Cloudflare master-key file must be regular",
+        ));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if metadata.permissions().mode() & 0o077 != 0 {
+            return Err(Error::new(
+                ErrorKind::PermissionDenied,
+                "Cloudflare master-key file must be private",
+            ));
+        }
+    }
+    let mut key = [0u8; 32];
+    let mut file = std::fs::File::open(path)?;
+    let opened = file.metadata()?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if opened.dev() != metadata.dev()
+            || opened.ino() != metadata.ino()
+            || opened.mode() & 0o077 != 0
+            || !opened.is_file()
+        {
+            return Err(Error::new(
+                ErrorKind::PermissionDenied,
+                "Cloudflare master-key file changed during open",
+            ));
+        }
+    }
+    if let Err(error) = file.read_exact(&mut key) {
+        key.fill(0);
+        return Err(error);
+    }
+    let mut trailing = [0u8; 1];
+    if file.read(&mut trailing)? != 0 {
+        key.fill(0);
+        return Err(Error::new(
+            ErrorKind::InvalidData,
+            "Cloudflare master key must contain exactly 32 bytes",
+        ));
+    }
+    let provider = multiview_control::cloudflare_management::ManagedCloudflare::from_master_key(
+        std::path::Path::new(&dir),
+        key,
+    );
+    key.fill(0);
+    provider
+        .map(|provider| Some(Arc::new(provider)))
+        .map_err(|_| {
+            Error::new(
+                ErrorKind::InvalidData,
+                "Cloudflare private state unavailable",
+            )
+        })
 }
 
 /// Build the runtime device-poller registry for the control plane (DEV-A4/D2).
