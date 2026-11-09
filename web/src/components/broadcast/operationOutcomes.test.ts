@@ -14,6 +14,10 @@ import {
   NON_TERMINAL_EVENTS,
   OPERATION_RECORDS_MAX,
   reserveOperationOutcome,
+  admitOperationOutcome,
+  releaseOperationReservation,
+  markOperationResponseUnknown,
+  readProvisionalOperation,
   applyOperationAcceptance,
   applyTerminalEvidence,
   createOperationOutcomeState,
@@ -339,6 +343,14 @@ describe('operationOutcomes — bounded early-terminal cache', () => {
     expect(readOperationOutcome(state, 'op-newest')?.phase).toBe('applied');
   });
 
+  it('a wrong-topic early frame cannot block correct same-corr evidence', () => {
+    let state = applyTerminalEvidence(createOperationOutcomeState(), evidence({ topic: 'wrong', verdict: 'failed', at: 1 }));
+    state = applyTerminalEvidence(state, evidence({ topic: 'outputs', verdict: 'applied', at: 2 }));
+    expect(state.earlyEvidence).toHaveLength(2);
+    state = applyOperationAcceptance(state, accept());
+    expect(readOperationOutcome(state, 'op-1')?.phase).toBe('applied');
+  });
+
   it('does not cache a duplicate frame twice', () => {
     const frame = evidence({ corr: 'corr-d', at: 8 });
     const state = applyTerminalEvidence(createOperationOutcomeState(), frame);
@@ -380,32 +392,83 @@ describe('operationOutcomes — bounded records', () => {
   });
 });
 
+describe('anonymous pre-submit admission', () => {
+  it('binds real server-issued 202 identity in the same seat and joins an earlier terminal frame', () => {
+    const seat = reserveOperationOutcome(createOperationOutcomeState());
+    const body = { operation_id: 'op_8f2a', kind: 'output.start', applied_live: null, carried_only: null };
+    const requestResource = 'out-1';
+    let state = applyTerminalEvidence(seat.state, evidence({ corr: body.operation_id, resource: requestResource, event: 'output.status', at: 30 }));
+    state = admitOperationOutcome(state, seat.token, accept({ operationId: body.operation_id,
+      corr: body.operation_id, resource: requestResource, event: 'output.status', kind: body.kind, acceptedAt: 31 }));
+    expect(state.records.size + state.provisional.size).toBe(1);
+    expect(readProvisionalOperation(state, seat.token)).toBeUndefined();
+    expect(readOperationOutcome(state, body.operation_id)?.phase).toBe('applied');
+    expect(state.earlyEvidence).toHaveLength(0);
+  });
+
+  it('releases definitive HTTP rejection and pre-submit cancellation idempotently, without leaking 256 seats', () => {
+    let state = createOperationOutcomeState();
+    for (let i = 0; i < OPERATION_RECORDS_MAX; i++) {
+      const seat = reserveOperationOutcome(state);
+      state = releaseOperationReservation(seat.state, seat.token, 'pre-submit-cancelled');
+      expect(releaseOperationReservation(state, seat.token, 'pre-submit-cancelled')).toBe(state);
+    }
+    expect(state.provisional.size).toBe(0);
+    const rejected = reserveOperationOutcome(state);
+    state = releaseOperationReservation(rejected.state, rejected.token, 'definitive-http-rejection');
+    expect(state.records.size + state.provisional.size).toBe(0);
+  });
+
+  it('sent cancellation or network uncertainty retains the anonymous seat until identity is known', () => {
+    const seat = reserveOperationOutcome(createOperationOutcomeState());
+    let state = markOperationResponseUnknown(seat.state, seat.token, 'sent-cancelled');
+    expect(readProvisionalOperation(state, seat.token)?.phase).toBe('unknown');
+    expect(markOperationResponseUnknown(state, seat.token, 'transport-unknown')).toBe(state);
+    expect(releaseOperationReservation(state, seat.token, 'pre-submit-cancelled')).toBe(state);
+    state = expireOperationDeadlines(state, 10 ** 12);
+    expect(readProvisionalOperation(state, seat.token)?.phase).toBe('unknown');
+    state = admitOperationOutcome(state, seat.token, accept({ operationId: 'server-identity', corr: 'server-identity' }));
+    expect(readOperationOutcome(state, 'server-identity')?.phase).toBe('accepted');
+    expect(state.provisional.size).toBe(0);
+  });
+
+  it('does not double-count occupied seats or evict unresolved records', () => {
+    let state = createOperationOutcomeState();
+    for (let i = 0; i < OPERATION_RECORDS_MAX; i++) state = reserveOperationOutcome(state).state;
+    expect(() => reserveOperationOutcome(state)).toThrow(/capacity/);
+    const first = state.provisional.keys().next().value;
+    expect(first).toBeDefined();
+    state = admitOperationOutcome(state, first!, accept({ operationId: 'real', corr: 'real' }));
+    expect(state.records.size + state.provisional.size).toBe(OPERATION_RECORDS_MAX);
+    expect(() => reserveOperationOutcome(state)).toThrow(/capacity/);
+  });
+});
+
 describe('admission, uncertain authority, and hostile input', () => {
   it('reserves before submission and rejects full unresolved capacity without dropping unknown', () => {
     let state = createOperationOutcomeState();
     for (let i = 0; i < OPERATION_RECORDS_MAX; i++) {
-      state = reserveOperationOutcome(state, accept({ operationId: `op-${String(i)}`, corr: `c-${String(i)}`, deadlineAt: 1 }));
-      state = applyOperationAcceptance(state, accept({ operationId: `op-${String(i)}`, corr: `c-${String(i)}`, deadlineAt: 1 }));
+      const seat = reserveOperationOutcome(state);
+      state = admitOperationOutcome(seat.state, seat.token, accept({ operationId: `op-${String(i)}`, corr: `op-${String(i)}`, deadlineAt: 1 }));
       state = expireOperationDeadlines(state, 1);
     }
     expect(state.records.size).toBe(256);
-    expect(() => reserveOperationOutcome(state, accept({ operationId: 'overflow', corr: 'overflow' }))).toThrow(/capacity/);
+    expect(() => reserveOperationOutcome(state)).toThrow(/capacity/);
     expect(() => applyOperationAcceptance(state, accept({ operationId: 'late-202', corr: 'late-202' }))).toThrow(/capacity/);
     expect(readOperationOutcome(state, 'op-0')?.phase).toBe('unknown');
-    state = applyTerminalEvidence(state, evidence({ corr: 'c-0', at: 2 }));
+    state = applyTerminalEvidence(state, evidence({ corr: 'op-0', at: 2 }));
     expect(readOperationOutcome(state, 'op-0')?.phase).toBe('applied');
-    state = reserveOperationOutcome(state, accept({ operationId: 'next', corr: 'next' }));
-    expect(state.records.size).toBe(256);
+    state = reserveOperationOutcome(state).state;
+    expect(state.records.size + state.provisional.size).toBe(256);
   });
 
   it('rejects 300 unresolved acceptances at the hard cap', () => {
     let state = createOperationOutcomeState();
     for (let i = 0; i < 300; i++) {
-      const request = accept({ operationId: `op-${String(i)}`, corr: `c-${String(i)}` });
-      if (i < OPERATION_RECORDS_MAX) state = reserveOperationOutcome(state, request);
-      else expect(() => reserveOperationOutcome(state, request)).toThrow(/capacity/);
+      if (i < OPERATION_RECORDS_MAX) state = reserveOperationOutcome(state).state;
+      else expect(() => reserveOperationOutcome(state)).toThrow(/capacity/);
     }
-    expect(state.records.size).toBe(OPERATION_RECORDS_MAX);
+    expect(state.provisional.size).toBe(OPERATION_RECORDS_MAX);
   });
 
   it('conflicting replay cannot mutate expectation or deadline', () => {
@@ -430,7 +493,7 @@ describe('admission, uncertain authority, and hostile input', () => {
 
   it('rejects malformed ingress and non-finite clocks', () => {
     const state = createOperationOutcomeState();
-    expect(() => reserveOperationOutcome(state, accept({deadlineAt: Number.NaN}))).toThrow(/invalid/);
+    expect(() => admitOperationOutcome(reserveOperationOutcome(state).state, 1, accept({deadlineAt: Number.NaN}))).toThrow(/invalid/);
     expect(() => applyOperationAcceptance(state, accept({corr: '   '}))).toThrow(/invalid/);
     expect(applyTerminalEvidence(state, {...evidence(), verdict: 'other'} as unknown as TerminalEvidence)).toBe(state);
     expect(applyTerminalEvidence(state, {...evidence(), at: Infinity})).toBe(state);

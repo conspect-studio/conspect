@@ -9,10 +9,9 @@
 //   id (`corr`) and the realtime `topic` match exactly, plus the resource id
 //   and the event type when the expectation pins them. A same-corr frame on
 //   the wrong topic or naming the wrong resource settles nothing.
-// - Reserve a capacity seat BEFORE submitting; a reserved command becomes
-//   accepted on REST 202. A 202 without reservation may fail admission with
-//   an explicit capacity error: it has ALREADY been accepted by the engine,
-//   so callers must retain/reconcile it outside this store, never say rejected.
+// - Reserve an anonymous token seat BEFORE submitting: the server alone mints
+//   operation_id and corr in its 202 response. Bind that real identity to the
+//   same seat; transport uncertainty keeps the anonymous seat occupied.
 // - `accepted` can only ever become `applied`, `failed` or `unknown`. There
 //   is deliberately NO "rolled back" phase: an outcome that was never
 //   observed never implies the engine reverted (the server's bounded corr
@@ -41,7 +40,9 @@
 // the wiring layer maps envelopes onto the plain shapes below.
 
 /** The phases one tracked operation can be in (first valid terminal verdict wins). */
-export type OperationPhase = 'reserved' | 'accepted' | 'applied' | 'failed' | 'unknown';
+export type OperationPhase = 'accepted' | 'applied' | 'failed' | 'unknown';
+export type ProvisionalPhase = 'reserved' | 'unknown';
+export type ReservationToken = number;
 
 /** A rejected admission never asserts that an already-submitted engine command failed. */
 export class OperationOutcomeError extends Error {
@@ -62,7 +63,7 @@ export const EARLY_EVIDENCE_MAX = 64;
 
 /**
  * Hard cap. Only authoritative applied/failed history may be evicted;
- * reserved, accepted and unknown operations retain their uncertain authority.
+ * anonymous seats, accepted and unknown operations retain their uncertain authority.
  */
 export const OPERATION_RECORDS_MAX = 256;
 
@@ -78,7 +79,7 @@ export interface OperationAcceptance {
   readonly resource?: string | undefined;
   /** The event type the evidence must carry, when the caller can pin it. */
   readonly event?: string | undefined;
-  /** The command kind from the acceptance body (for caller-side copy). */
+  /** The command kind from the acceptance body (for caller-side copy; replay may say 'replay'). */
   readonly kind?: string | undefined;
   /** Wall-clock ms the 202 was observed at, when the caller tracks it. */
   readonly acceptedAt?: number | undefined;
@@ -121,36 +122,77 @@ export interface OperationRecord {
   readonly settledAt?: number | undefined;
 }
 
-/** The store: tracked operation records + the bounded early-evidence cache. */
+/** An anonymous seat has no server identity until an actual 202 or replay supplies it. */
+export interface ProvisionalOperation {
+  readonly phase: ProvisionalPhase;
+}
+
+/** Tracked operation records, anonymous seats, and bounded early evidence. */
 export interface OperationOutcomeState {
   readonly records: ReadonlyMap<string, OperationRecord>;
+  readonly provisional: ReadonlyMap<ReservationToken, ProvisionalOperation>;
+  readonly nextToken: ReservationToken;
   readonly earlyEvidence: readonly TerminalEvidence[];
 }
 
-/** Reserve a seat before submitting a command. A capacity rejection means DO NOT POST.
- * Carry the returned state forward to the 202 acceptance. No I/O occurs here. */
-export function reserveOperationOutcome(
-  state: OperationOutcomeState,
-  expectation: OperationAcceptance,
+/** Reserve BEFORE POST. A capacity error here means do not submit. */
+export function reserveOperationOutcome(state: OperationOutcomeState): {
+  readonly state: OperationOutcomeState;
+  readonly token: ReservationToken;
+} {
+  const records = makeRoom(state.records, state.provisional.size);
+  const token = state.nextToken;
+  const provisional = new Map(state.provisional);
+  provisional.set(token, { phase: 'reserved' });
+  return { token, state: { ...state, records, provisional, nextToken: token + 1 } };
+}
+
+/** A sent request whose response is unavailable remains uncertain and occupies its seat. */
+export function markOperationResponseUnknown(
+  state: OperationOutcomeState, token: ReservationToken,
+  reason: 'sent-cancelled' | 'transport-unknown',
 ): OperationOutcomeState {
-  validateAcceptance(expectation);
-  if (state.records.has(expectation.operationId) ||
-      [...state.records.values()].some((record) => record.corr === expectation.corr)) {
-    throw new OperationOutcomeError('identity');
-  }
-  const records = makeRoom(state.records);
-  records.set(expectation.operationId, makeRecord(expectation, 'reserved'));
-  return { records, earlyEvidence: state.earlyEvidence };
+  void reason;
+  const seat = state.provisional.get(token);
+  if (seat === undefined || seat.phase === 'unknown') return state;
+  const provisional = new Map(state.provisional);
+  provisional.set(token, { phase: 'unknown' });
+  return { ...state, provisional };
+}
+
+/** Release ONLY on definitive pre-accept rejection or cancellation before sending.
+ * Never release a sent request merely because the caller cancelled waiting. */
+export function releaseOperationReservation(
+  state: OperationOutcomeState, token: ReservationToken,
+  reason: 'pre-submit-cancelled' | 'definitive-http-rejection',
+): OperationOutcomeState {
+  // A sent request cancelled locally is NOT one of the definitive reasons.
+  void reason;
+  // A transport-unknown sent request cannot be disproved by a later local
+  // cancellation (nor by a distinct retry's HTTP rejection).
+  if (state.provisional.get(token)?.phase === 'unknown') return state;
+  if (!state.provisional.has(token)) return state;
+  const provisional = new Map(state.provisional);
+  provisional.delete(token);
+  return { ...state, provisional };
+}
+
+/** Read anonymous uncertainty without making up an operation id. */
+export function readProvisionalOperation(
+  state: OperationOutcomeState, token: ReservationToken,
+): ProvisionalOperation | undefined {
+  return state.provisional.get(token);
 }
 
 /** An empty store. */
 export function createOperationOutcomeState(): OperationOutcomeState {
-  return { records: new Map(), earlyEvidence: [] };
+  return { records: new Map(), provisional: new Map(), nextToken: 1, earlyEvidence: [] };
 }
 
 /**
- * Record a `202 Accepted` operation. Prefer reserveOperationOutcome before
- * POST; absent a reservation, this may explicitly throw on full capacity.
+ * Record a `202 Accepted` operation. For an in-flight POST use
+ * admitOperationOutcome(token, actual202) instead; without a token this may
+ * explicitly throw on full capacity.
  * A replay is valid only for the same identity; its deadline may extend,
  * never shorten. Cached earlier terminal evidence settles on acceptance.
  */
@@ -162,33 +204,48 @@ export function applyOperationAcceptance(
   const existing = state.records.get(acceptance.operationId);
   if (existing !== undefined) {
     if (!sameIdentity(existing, acceptance)) throw new OperationOutcomeError('identity');
-    if (existing.phase === 'reserved') {
-      if (existing.deadlineAt !== undefined && acceptance.deadlineAt !== undefined &&
-          existing.deadlineAt !== acceptance.deadlineAt) throw new OperationOutcomeError('identity');
-      const records = new Map(state.records);
-      const record = { ...existing, phase: 'accepted' as const,
-        acceptedAt: acceptance.acceptedAt, deadlineAt: acceptance.deadlineAt };
-      const joined = state.earlyEvidence.findIndex((item) => matchesExpectation(record, item));
-      records.set(acceptance.operationId, joined < 0 ? record : settleRecord(record, state.earlyEvidence.slice(joined, joined + 1)[0] ?? evidenceFallback()));
-      return { records, earlyEvidence: joined < 0 ? state.earlyEvidence :
-        state.earlyEvidence.filter((_, index) => index !== joined) };
-    }
     if (existing.phase !== 'accepted' || acceptance.deadlineAt === undefined ||
         (existing.deadlineAt !== undefined && acceptance.deadlineAt <= existing.deadlineAt)) return state;
     const records = new Map(state.records);
     records.set(acceptance.operationId, { ...existing, deadlineAt: acceptance.deadlineAt });
-    return { records, earlyEvidence: state.earlyEvidence };
+    return { ...state, records };
   }
   if ([...state.records.values()].some((record) => record.corr === acceptance.corr))
     throw new OperationOutcomeError('identity');
   // An unsolicited 202 has ALREADY happened. Throw an explicit capacity signal;
   // the caller must keep its acceptance outside this store for reconciliation.
   // Never return an unchanged state as if the engine declined the command.
-  const records = makeRoom(state.records);
-  const record = makeRecord(acceptance, 'accepted');
+  const records = makeRoom(state.records, state.provisional.size);
+  const record = makeRecord(acceptance);
   const joined = state.earlyEvidence.findIndex((item) => matchesExpectation(record, item));
   records.set(acceptance.operationId, joined < 0 ? record : settleRecord(record, state.earlyEvidence.slice(joined, joined + 1)[0] ?? evidenceFallback()));
-  return { records, earlyEvidence: joined < 0 ? state.earlyEvidence :
+  return { ...state, records, earlyEvidence: joined < 0 ? state.earlyEvidence :
+    state.earlyEvidence.filter((_, index) => index !== joined) };
+}
+
+/** Atomically exchange an anonymous seat for the server-issued 202 identity.
+ * An unknown response can be adopted later on an idempotency replay or query;
+ * without such identity it must remain uncertain, never timed out as failure. */
+export function admitOperationOutcome(
+  state: OperationOutcomeState, token: ReservationToken, acceptance: OperationAcceptance,
+): OperationOutcomeState {
+  validateAcceptance(acceptance);
+  // The current server stamps the minted operation_id as realtime corr.
+  if (acceptance.operationId !== acceptance.corr) throw new OperationOutcomeError('identity');
+  if (!state.provisional.has(token)) throw new OperationOutcomeError('identity');
+  if (state.records.has(acceptance.operationId) ||
+      [...state.records.values()].some((record) => record.corr === acceptance.corr))
+    throw new OperationOutcomeError('identity');
+  // The seat is already counted. Join early evidence without a second
+  // admission or eviction; a failed identity check leaves the seat intact.
+  const provisional = new Map(state.provisional);
+  provisional.delete(token);
+  const records = new Map(state.records);
+  const record = makeRecord(acceptance);
+  const joined = state.earlyEvidence.findIndex((item) => matchesExpectation(record, item));
+  records.set(acceptance.operationId, joined < 0 ? record :
+    settleRecord(record, state.earlyEvidence[joined] ?? evidenceFallback()));
+  return { ...state, records, provisional, earlyEvidence: joined < 0 ? state.earlyEvidence :
     state.earlyEvidence.filter((_, index) => index !== joined) };
 }
 
@@ -216,14 +273,14 @@ function sameIdentity(a: OperationRecord, b: OperationAcceptance): boolean {
     a.event === b.event && a.kind === b.kind &&
     (a.acceptedAt === undefined || b.acceptedAt === undefined || a.acceptedAt === b.acceptedAt);
 }
-function makeRecord(value: OperationAcceptance, phase: 'reserved' | 'accepted'): OperationRecord {
+function makeRecord(value: OperationAcceptance): OperationRecord {
   return { operationId: value.operationId, corr: value.corr, topic: value.topic,
     resource: value.resource, event: value.event, kind: value.kind,
-    acceptedAt: value.acceptedAt, deadlineAt: value.deadlineAt, phase };
+    acceptedAt: value.acceptedAt, deadlineAt: value.deadlineAt, phase: 'accepted' };
 }
-function makeRoom(current: ReadonlyMap<string, OperationRecord>): Map<string, OperationRecord> {
+function makeRoom(current: ReadonlyMap<string, OperationRecord>, provisionalCount: number): Map<string, OperationRecord> {
   const records = new Map(current);
-  if (records.size < OPERATION_RECORDS_MAX) return records;
+  if (records.size + provisionalCount < OPERATION_RECORDS_MAX) return records;
   for (const [id, record] of records) {
     if (record.phase === 'applied' || record.phase === 'failed') {
       records.delete(id);
@@ -272,7 +329,7 @@ export function applyTerminalEvidence(
     }
   }
   if (settledAny) {
-    return { records, earlyEvidence: state.earlyEvidence };
+    return { ...state, records };
   }
   for (const record of state.records.values()) {
     if (
@@ -283,17 +340,14 @@ export function applyTerminalEvidence(
       return state;
     }
   }
-  if (state.earlyEvidence.some((cached) => cached.corr === evidence.corr)) {
+  if (state.earlyEvidence.some((cached) => sameEvidenceIdentity(cached, evidence))) {
     return state;
   }
   const grown = [...state.earlyEvidence, evidence];
   const overflow = grown.length - EARLY_EVIDENCE_MAX;
   // Drop-oldest eviction is safe: the later acceptance simply finds no frame
   // and stays `accepted` (→ `unknown` at its deadline) — never a fabrication.
-  return {
-    records: state.records,
-    earlyEvidence: overflow > 0 ? grown.slice(overflow) : grown,
-  };
+  return { ...state, earlyEvidence: overflow > 0 ? grown.slice(overflow) : grown };
 }
 
 /**
@@ -320,7 +374,7 @@ export function expireOperationDeadlines(
       records.set(operationId, record);
     }
   }
-  return expired ? { records, earlyEvidence: state.earlyEvidence } : state;
+  return expired ? { ...state, records } : state;
 }
 
 /** Read one tracked operation by its `operation_id`, if the store holds it. */
@@ -353,6 +407,12 @@ function matchesExpectation(
     return false;
   }
   return true;
+}
+
+/** Frames of one exact identity share the first terminal verdict. */
+function sameEvidenceIdentity(a: TerminalEvidence, b: TerminalEvidence): boolean {
+  return a.corr === b.corr && a.topic === b.topic &&
+    a.resource === b.resource && a.event === b.event;
 }
 
 /** Apply a terminal verdict to a record, stamping the evidence time when known. */
