@@ -299,7 +299,7 @@ impl SwitcherPreviewLeases {
                 && state
                     .control
                     .as_ref()
-                    .and_then(|c| c.snapshot())
+                    .and_then(multiview_engine::switcher_control::SwitcherControl::snapshot)
                     .is_some_and(|s| s.preview.as_str() == entry.target)
             {
                 state.current = Some(entry.lease);

@@ -299,7 +299,7 @@ pub(crate) async fn submit_switcher(
             let admitted = if let Some((target, lease)) = lease {
                 state
                     .switcher_preview_lease
-                    .admit(op.to_string(), target, lease, &handle, || {
+                    .admit(op.to_string(), target, lease, handle, || {
                         handle.try_send(command).map_err(|_| ())?;
                         Ok(handle.composed_count())
                     })
