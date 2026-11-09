@@ -49,8 +49,8 @@ no result comes from an old log:
   The outgoing and handshake filters intentionally overlap, not disjoint evidence.
 - `authority-bridge-unit-test` runs the five `bridge_tests` unit tests in the named
   `abr_authority` example through libtest. It does **not** execute the authority
-  program's `main` (IVF ladder/registry/router). `moq-transport` is an additional
-  enabled feature, not the selector or a feature requirement for those tests.
+  program's `main` (IVF ladder/registry/router). `moq-transport` is required to
+  compile the example's imports; it does not select those tests.
 - The actual native canonical H.264 pipeline -> HTTP authority test, with GPL
   codec feature enabled explicitly. OpenSSL executable on PATH and libav with
   libx264 are required fail-closed prerequisites. Before any expensive command,
