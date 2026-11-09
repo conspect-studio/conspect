@@ -141,7 +141,7 @@ fn read_relay_endpoint(path: &std::path::Path) -> Result<url::Url, MoqReject> {
             .map_err(|_| MoqReject::Unavailable)?;
         let meta = file.metadata().map_err(|_| MoqReject::Unavailable)?;
         let uid = rustix::process::geteuid().as_raw();
-        if meta.uid() != 0 && meta.uid() != uid {
+        if meta.uid() != uid {
             return Err(MoqReject::Unavailable);
         }
         if !meta.is_file() || meta.permissions().mode() & 0o077 != 0 || meta.len() > 8192 {
