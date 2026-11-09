@@ -1,87 +1,107 @@
-# MoQ component branch: proportional local gate
+# MAIN candidate: CURRENT-HEAD proportional DRAFT gate
 
-This task-specific `bin/check` does not replace CI or assert a full suite passed
-on the final commit. Missing local historical evidence fails closed. CI must
-continue its ordinary full workspace suite; fresh clones cannot use this local
-evidence exception. No receipt, hook, global configuration, or test is bypassed.
-The shipping owner authorized this gate to respect the two-full-suite budget.
-An independent vendor must review the gate before its execution through the
-normal local-gate wrapper. The script cannot certify its own review.
+## Decision and scope
 
-## Dated full-suite evidence
+This replaces the obsolete component-branch single-chain/historical-receipt policy.
+That policy cannot validate the main-based aggregate. This is a **new MAIN
+candidate proportional decision**, subject to independent review of the exact
+policy commit before execution. It does not rename, reset, or extend T78: that
+task exhausted attempt 2. Do not run a third local whole-workspace test suite.
+There is no copied, reset, or newly initialized workspace-attempt ledger here.
 
-Baseline: `22661b9f479fabc097e9f70eea844964a49a39f3`.
-The integration owner recovered the original tool history, job
-`bash-4b73d7db3d3642db`, completion 2026-11-08T16:34:53Z, exit 0:
+`bin/check` actually executes its complete command list against the clean current
+HEAD, including a merge HEAD. It has no ancestry whitelist, historical-log
+acceptance, availability skips, forced success, or inherited test-pass claim.
+A nonzero command, timeout, resource error, changed HEAD, dirty tree, or missing
+positive test output fails. A filtered Rust test command that matches zero tests
+fails even if Cargo exits zero. Focused test filters select scope; they do not
+mean the whole workspace suite ran.
 
-```sh
-set -o pipefail
-git rev-parse HEAD > target/moq-gates/workspace-test.sha
-df -h .
-cargo test --locked --workspace -j2 > target/moq-gates/workspace-test.log 2>&1
-result=$?
-printf '%s\n' "$result" > target/moq-gates/workspace-test.exit
-tail -n 80 target/moq-gates/workspace-test.log
-exit "$result"
-```
+**DRAFT is not merge approval.** Normal PR CI must execute its existing full
+configured suite unmodified and be green before merge. The gate changes no CI
+workflow. The existing CI workspace command has a pre-existing
+`--skip tile_driven_meets_budget` argument; this policy neither adds that skip nor
+claims that CI runs every workspace test without filters. The existing
+[CI rationale](../../.github/workflows/ci.yml#L178-L183) cites
+[ADR-E009](../decisions/ADR-E009.md): a wall-clock performance budget needs
+consistent dedicated hardware, not shared CI. CI green alone does not certify
+that budget or the separate received-media/no-falter requirement. Any correction
+to that baseline requires separate owner action. No local command here uses `--skip`.
 
-This command provenance is owner-reported original tool history, not a new or
-synthetic execution record. The log itself does not print the command. The gate
-pins the actual complete log SHA256
-`594918d1d9dbeb0e559f26bc8ee2d54a4007042e8bff658976a5359ff5720969`,
-checks the SHA and zero exit sidecars, all result lines for success and zero
-filtered tests, the formerly problematic tile budget test passing, and the
-last xtask doctest completion. It does not infer final-HEAD full-suite coverage.
-These local artifacts are not signed attestations; their exact bytes are pinned
-in the independently reviewed gate. Do not reconstruct missing artifacts.
+The captain owns push credentials and all pushes. Do not push or run the official
+wrapper/issue a receipt before fresh cross-vendor policy review, owner coordination,
+and a separate gate execution-budget decision. Review binds the exact commit
+externally; the gate cannot certify its own review. After review the captain
+integrates only this policy/test/docs delta onto the quiescent aggregate. The
+runtime owner worktree and runtime source remain untouched.
 
-## Exact approved delta
+## Actual command scope
 
-Only this ordered immutable commit chain follows the baseline:
+The executable `COMMANDS` list is authoritative. Every selected command runs;
+no result comes from an old log:
 
-1. `45349ebf3b17bffc4c8cf788f1cbbc3efcad52d5`: dependency advisory/license repair,
-   native TLS sources unchanged; wasm trust-anchor policy has one stricter `.tr`
-   constraint. Targeted MoQ tests and root identity comparison are rerun.
-2. `4c6c0613240b094ad32bfe98ed91d07fa8512141`: independently reviewed provenance
-   clarification; no runtime changes.
-3. `edc6daa12fed4cba5184e053befe5205bc33b095`: standalone fixture H264 parser;
-   the fixture package tests are rerun, not presumed covered by the old suite.
-4. `26dbbfd55b2edf2466e4f5c23b52d5c4dd21c6a6`: test generators and actual H264
-   browser evidence. Existing live recordings remain dated evidence, not a new
-   live run. Web lint/build recheck the affected frontend artifacts.
+- Runner mechanical tests, actual formatting, locked default workspace check,
+  strict all-target workspace Clippy, and dependency audit.
+- Native MoQ output check and strict Clippy with `moq-output,gpl-codecs`.
+- MoQ transport library, production factory, outgoing publication, pending
+  handshake cancellation, relay URL file, and control authority example tests.
+- The actual native canonical H.264 pipeline -> HTTP authority test, with GPL
+  codec feature enabled explicitly. Missing libav/codec/tool dependencies fail;
+  they are not a successful unavailable/skip result.
+- Fresh web dependency install, the two ABR/player test files (historically 45
+  tests, not evidence of current results), eight focused preview test files,
+  complete web lint/build, and probe syntax.
 
-5. `fa4389cddeeeec80679fd88bbc5a51f174b43eee`: initial independently reviewed
-   proportional gate. Its real wrapper run failed optional-feature Clippy in
-   `moq_provider.rs` (documentation and match-style lints). This was NOT a gate
-   pass; no successful receipt is claimed for that execution.
-6. `c6654f1b5b3f7f6c4213b2004bf6020301660590`: behavior-equivalent, one-file
-   optional-provider lint repair. Owner reports strict optional-feature Clippy
-   and six focused tests passed. The gate still reruns its complete command list.
+The eight preview files cover connection, playback, lease API, selection,
+PreviewSurface, capabilities, output playback, and diagnostics. These are Vitest
+browser-component/unit tests, not a real live browser/network acceptance claim.
+The required test logs must report positive test execution. Native/compiler and
+web checks remain **UNRUN** until the captain authorizes execution. The gate does
+not execute the full workspace test suite locally. Clippy remains required;
+a compiler/lint failure must be fixed or reported, never relabeled as a pass.
 
-Only one gate-amendment commit may follow, with exactly the two policy paths
-`bin/check` and this document changed, and a single parent equal to the exact
-repair SHA. Both historical policy blobs are pinned; the provider must equal
-blob `2db829b472b1ecfa749704118bab85f82e7d253a`. The repair itself must change
-only that provider path. The complete baseline-to-repair commit chain is exact,
-not a path wildcard. The whole working tree must be clean including untracked
-files. Extra commits, merge parents, runtime changes or a different provider
-blob fail closed. Further changes require a new reviewed gate/budget decision.
-Independent review binds this gate amendment externally; the script cannot
-self-approve its own changed bytes. Review amendments retain the same parent.
+## Resource and process contract
 
-## Commands and limits
+The runner reuses the resource/process machinery reviewed in `0b20f816`, not its
+old task ledger. It forces `CARGO_BUILD_JOBS=2`, `CARGO_INCREMENTAL=0`, rejects
+Cargo target-directory overrides, and uses only worktree-local targets.
+The three root/tool targets count together. Free capacity must remain at least
+360 GiB. The new lane stays at a **2 GiB combined target cap** until a separate
+execution-budget review; the cap is deliberately not an assertion that native
+builds fit. Cold native peak is unmeasured. Do not begin an expensive gate merely
+to discover that it exceeds the cap. Do not duplicate or borrow another lane's
+cache, remove its artifacts, or consume space up to ENOSPC.
 
-The executable `COMMANDS` list is authoritative: workspace fmt/check/strict
-all-target Clippy, dependency audit, optional MoQ control feature check/Clippy,
-MoQ/Cloudflare/vault/controller targeted tests, standalone fixture tests, root
-bundle comparison, web lint/build, and probe syntax. Every command actually runs
-and any failure stops the gate. The final HEAD and clean-tree checks run again
-afterward. No full workspace test command runs a third time.
+Each command has a wall timeout: workspace/feature check and Clippy 20 minutes;
+other commands 10 minutes. Commands execute serially. A nonblocking worktree
+flock prevents concurrent gate runs. The runner creates a separate process
+session for each command; cleanup sends TERM and then KILL only to that owned
+process group, including descendants after the leader exits. This cleanup does
+not remove build directories or any owner's data.
 
-`bin/check --self-test` checks real evidence plus six evidence corruptions and
-four policy-boundary failures (extra commit, merge, runtime path, provider blob);
-`--validate-only` checks historical evidence/ancestry/cleanliness without builds.
-Neither is a receipt-generating successful full gate: invoke the normal wrapper
-without these flags only after independent review. The branch still lacks the
-production shared-feed factory and paid/AV-sync acceptance. Green local checks
-do not establish CI green, merge, or whole-feature delivery.
+Accounting pins directory descriptors, does not follow symlinks, counts the
+larger of apparent/allocated bytes, and deduplicates hard-linked inodes. Only
+vanished entries may be omitted; permission, I/O and directory-substitution
+errors fail closed. Samples occur before commands, every five seconds while
+active, and afterward. This is race-resistant traversal, **not atomic accounting
+or a hard disk quota**: growth between samples can exceed a limit before detection.
+Logs report sampled peak/growth, not an invented exact peak. Logs and dependency
+install artifacts also use disk; the free-space floor covers the filesystem.
+
+## Evidence and remaining concerns
+
+`python3 -B scripts/test_final_head_gate.py` runs only mechanical tests. It tests
+real nonzero command failure, dirty/change-HEAD rejection, timeout descendant
+cleanup, failure-only records, zero-test rejection, resource boundaries and
+vanishing/sparse/symlink accounting. Mocked successes are runner tests, never
+native or browser evidence. `bin/check --validate-only` is a preflight, not a test
+pass or a receipt. Actual runs write SHA/command/time/timeout/log/status records
+under the local target directory. No historical receipt is read or fabricated.
+
+The aggregate remains unfinished: historical Cloudflare QoS **failed**; protected
+activation remains **OFF/unavailable** with unresolved security concerns; optional
+A/V preview startup/application integration remains unfinished; distinct optional
+cadence and HEVC metadata remain unsupported. This policy does not waive failed
+tests, certify paid-provider QoS, assert deployment, or erase these concerns.
+Normal CI green and independent runtime review are still required. A green draft
+local run alone never permits merge or whole-feature completion.
