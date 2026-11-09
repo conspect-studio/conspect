@@ -1889,6 +1889,11 @@ pub struct Pipeline {
     rendition_configs: Vec<EncodeConfig>,
     output_video_keys: Vec<usize>,
     output_audio_tracks: Vec<Vec<usize>>,
+    /// Outputs that EXPLICITLY declared an audio selection (per output: the id
+    /// and its full declared track list). Drives the run-time truthful binding:
+    /// a run without a program-audio encode strips the implicit default's
+    /// track 0, but an explicit declaration it cannot honor fails the run.
+    declared_audio_outputs: Vec<(String, Vec<usize>)>,
     /// The runnable outputs declared in the config.
     outputs: Vec<RunnableOutput>,
     /// The bake-consumer push handles for the configured AES67 outputs (#103),
@@ -2713,14 +2718,7 @@ impl Pipeline {
         let mut rendition_configs = Vec::<EncodeConfig>::new();
         let mut output_video_keys = Vec::with_capacity(outputs.len());
         let mut output_audio_tracks = Vec::with_capacity(outputs.len());
-        // Truthful binding (#202/#203 follow-up): the program audio track only
-        // exists when the run actually carries program audio (`[audio]` on). A
-        // video-only run MUST NOT declare audio track 0 — the dispatcher
-        // validates every declared track against the opened audio streams, so a
-        // phantom program track fails the whole bake consumer at startup
-        // (InvalidConfig: dead outputs). The output's default selection means
-        // "program audio if present", not "require program audio".
-        let program_audio_on = config.audio.is_some();
+        let mut declared_audio_outputs: Vec<(String, Vec<usize>)> = Vec::new();
         for output in &outputs {
             let requested = config
                 .outputs
@@ -2756,7 +2754,7 @@ impl Pipeline {
             };
             let tracks = audio_selection.map_or_else(Vec::new, |selection| {
                 let mut indexes = Vec::with_capacity(selection.tracks.len() + 1);
-                if selection.program && program_audio_on {
+                if selection.program {
                     indexes.push(0);
                 }
                 indexes.extend(
@@ -2767,7 +2765,24 @@ impl Pipeline {
                 );
                 indexes
             });
-            output_audio_tracks.push(tracks);
+            output_audio_tracks.push(tracks.clone());
+            // Truthful audio binding (t62 finding): remember which outputs
+            // EXPLICITLY declared an audio selection (an `[[outputs.audio]]`
+            // block). At run time the binding is decided against the program
+            // audio encode that actually opens: an implicit default selection
+            // means "program audio if present" (track 0 is stripped from a
+            // video-only run), while an EXPLICIT declaration that the run
+            // cannot honor fails the run with a typed error — never a silent
+            // drop to video-only.
+            let explicit = config
+                .outputs
+                .iter()
+                .find(|item| item.id() == output.id())
+                .and_then(multiview_config::Output::audio)
+                .is_some();
+            if explicit && !tracks.is_empty() {
+                declared_audio_outputs.push((output.id().to_owned(), tracks));
+            }
         }
 
         // Derive the PER-SOURCE per-tick audio-loudness timelines off the
@@ -2917,6 +2932,7 @@ impl Pipeline {
             rendition_configs,
             output_video_keys,
             output_audio_tracks,
+            declared_audio_outputs,
             outputs,
             #[cfg(feature = "display-kms")]
             display_plans: built.display,
@@ -4026,6 +4042,36 @@ impl Pipeline {
             self.discrete_track_inputs.clone()
         };
 
+        // Truthful program-audio binding (t62 finding: silent drop → explicit
+        // reject). The dispatcher assembles each binding window from the audio
+        // stream indexes the binding DECLARES, so the declared tracks must
+        // match the streams the run actually opens. The decision keys off the
+        // OPENED program-audio encoder — the ground truth — never the input
+        // routing section (a config may declare `[audio]` input routing with
+        // program audio off, and a seam may enable program audio with no
+        // routing section; both were previously mis-bound). An IMPLICIT
+        // default selection means "program audio if present": a run without a
+        // program-audio encode simply strips track 0 (video-only run). An
+        // EXPLICIT `[[outputs.audio]]` declaration the run cannot honor fails
+        // the run with a typed error — an operator asking for audio on an
+        // output must never silently get video-only (dead air).
+        let mut enforced_audio_tracks = self.output_audio_tracks.clone();
+        if audio_encoder.is_none() {
+            if let Some((id, _)) = self.declared_audio_outputs.first() {
+                return Err(PipelineError::Output {
+                    kind: "encode-audio",
+                    reason: format!(
+                        "output {id:?} explicitly declares an audio selection, but this run \
+                         carries no program-audio encoder; enable program audio or drop the \
+                         declaration — never silently air video-only"
+                    ),
+                });
+            }
+            for tracks in &mut enforced_audio_tracks {
+                tracks.retain(|track| *track != 0);
+            }
+        }
+
         // The program-audio bus (AUD-4): built ONLY when this run opted into audio
         // (`encode_cfg.audio` is `Some`). It mixes one block per output tick at the
         // audio config's sample rate + channel layout, paced by the pipeline
@@ -4202,7 +4248,7 @@ impl Pipeline {
             consumer_fault_after_ticks,
             video_encoders,
             self.output_video_keys.clone(),
-            self.output_audio_tracks.clone(),
+            enforced_audio_tracks,
             audio_encoder,
             audio_bus,
             self.audio_route.load(),
