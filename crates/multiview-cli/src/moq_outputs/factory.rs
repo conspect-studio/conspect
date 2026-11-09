@@ -236,10 +236,20 @@ impl DynamicRegistryFactory {
                     tokio::select! { _ = tokio::time::sleep(Duration::from_millis(20)) => {}, _ = stopped.wait_for(|stop| *stop) => return }
                 }
                 let scope = WhepScope::Output(output);
+                let Ok(current) = dynamic.current() else {
+                    return;
+                };
+                let config_generation = current.subscriptions.generation();
                 let started = await_outgoing_start(
                     dynamic.start_outgoing(&principal, &scope, config),
                     &mut stopped,
-                    || keys.generation() != generation || !dynamic.available(),
+                    || {
+                        keys.generation() != generation
+                            || !dynamic.available()
+                            || dynamic.current().map_or(true, |current| {
+                                current.subscriptions.generation() != config_generation
+                            })
+                    },
                 )
                 .await;
                 let Some(Ok(mut publisher)) = started else {
