@@ -87,6 +87,11 @@ msgstr "{0} · {1} issued {2}"
 msgid "{0} 7-day weather"
 msgstr "{0} 7-day weather"
 
+#. placeholder {0}: pendingOperation.label
+#: src/components/broadcast/library/VTReferenceSummary.tsx:220
+msgid "{0} accepted — awaiting durable operation outcome."
+msgstr "{0} accepted — awaiting durable operation outcome."
+
 #. placeholder {0}: String(count)
 #. placeholder {0}: String(selected.size)
 #. placeholder {1}: String(count)
@@ -109,10 +114,25 @@ msgstr "{0} area(s) · {1} cell(s) · {2} bound to a source"
 msgid "{0} cell(s) · {1} bound to a source"
 msgstr "{0} cell(s) · {1} bound to a source"
 
+#. placeholder {0}: pendingOperation.label
+#: src/components/broadcast/library/VTReferenceSummary.tsx:224
+msgid "{0} completed; reference cleared."
+msgstr "{0} completed; reference cleared."
+
+#. placeholder {0}: pendingOperation.label
+#: src/components/broadcast/library/VTReferenceSummary.tsx:224
+msgid "{0} completed; saved reference remains attached."
+msgstr "{0} completed; saved reference remains attached."
+
 #. placeholder {0}: hits.length
 #: src/pages/docs/DocsSearch.tsx:109
 msgid "{0} documentation results"
 msgstr "{0} documentation results"
+
+#. placeholder {0}: pendingOperation.label
+#: src/components/broadcast/library/VTReferenceSummary.tsx:221
+msgid "{0} failed before save; original slot remains attached."
+msgstr "{0} failed before save; original slot remains attached."
 
 #. placeholder {0}: stats.dropped
 #: src/events/JournalPanel.tsx:111
@@ -124,12 +144,27 @@ msgstr "{0} observations were dropped since this server started, so this history
 msgid "{0} packets dropped"
 msgstr "{0} packets dropped"
 
+#. placeholder {0}: pendingOperation.label
+#: src/components/broadcast/library/VTReferenceSummary.tsx:222
+msgid "{0} saved; detach pending. Keep the slot until authoritative acknowledgement; retry the same operation."
+msgstr "{0} saved; detach pending. Keep the slot until authoritative acknowledgement; retry the same operation."
+
+#. placeholder {0}: pendingOperation.label
+#: src/components/broadcast/library/VTReferenceSummary.tsx:223
+msgid "{0} saved; reference changed. A newer slot must not be cleared."
+msgstr "{0} saved; reference changed. A newer slot must not be cleared."
+
 #. placeholder {0}: durationSeconds(marker.duration_ms)
 #. placeholder {0}: durationSeconds(timing.pre_roll_ms)
 #: src/events/JournalPanel.tsx:27
 #: src/events/SourceEventsButton.tsx:66
 msgid "{0} seconds"
 msgstr "{0} seconds"
+
+#. placeholder {0}: assets.length
+#: src/components/broadcast/library/LibraryBrowser.tsx:181
+msgid "{0} shown"
+msgstr "{0} shown"
 
 #. placeholder {0}: view.location.name
 #: src/pages/graphics/DataView.tsx:184
@@ -177,6 +212,26 @@ msgstr "{minutes} min ago"
 msgid "{offset} s against this host"
 msgstr "{offset} s against this host"
 
+#: src/components/broadcast/OperationFeedback.tsx:111
+msgid "{operationLabel} accepted — waiting for the applied event."
+msgstr "{operationLabel} accepted — waiting for the applied event."
+
+#: src/components/broadcast/OperationFeedback.tsx:121
+msgid "{operationLabel} applied."
+msgstr "{operationLabel} applied."
+
+#: src/components/broadcast/OperationFeedback.tsx:137
+msgid "{operationLabel} cancelled."
+msgstr "{operationLabel} cancelled."
+
+#: src/components/broadcast/OperationFeedback.tsx:129
+msgid "{operationLabel} failed."
+msgstr "{operationLabel} failed."
+
+#: src/components/broadcast/OperationFeedback.tsx:145
+msgid "{operationLabel} outcome unknown."
+msgstr "{operationLabel} outcome unknown."
+
 #: src/layout/components/CellPropertiesPanel.tsx:124
 #: src/layout/components/CellPropertiesPanel.tsx:221
 #: src/layout/components/CellPropertiesPanel.tsx:317
@@ -190,6 +245,10 @@ msgstr "{seconds} s ago"
 #: src/events/SourceEventsButton.tsx:51
 msgid "{seconds} seconds"
 msgstr "{seconds} seconds"
+
+#: src/components/broadcast/library/LibraryBrowser.tsx:310
+msgid "{selectedCount} selected"
+msgstr "{selectedCount} selected"
 
 #: src/components/SystemFooter.tsx:147
 msgid "{short} compute utilisation {computeTotal} (device total)"
@@ -984,7 +1043,7 @@ msgstr "All cells showing this source"
 msgid "All configured layouts."
 msgstr "All configured layouts."
 
-#: src/pages/MediaPlayersPage.tsx:251
+#: src/pages/MediaPlayersPage.tsx:544
 msgid "All configured media players."
 msgstr "All configured media players."
 
@@ -1046,9 +1105,13 @@ msgstr "Amber"
 msgid "AMD"
 msgstr "AMD"
 
-#: src/pages/MediaPlayersPage.tsx:193
+#: src/pages/MediaPlayersPage.tsx:605
 msgid "An asset id is required"
 msgstr "An asset id is required"
+
+#: src/pages/MediaPlayersPage.tsx:245
+msgid "An exit is already armed."
+msgstr "An exit is already armed."
 
 #: src/pages/docs/concepts/TransportsPage.tsx:241
 msgid "An honest comparison — figures are typical classes, not guarantees; the network you run on dominates:"
@@ -1097,6 +1160,10 @@ msgstr "Analog (hands on a dial)"
 #: src/pages/OverlaysPage.tsx:236
 msgid "Analog clock overlays apply to the running engine immediately when saved or deleted — the face appears, moves, or disappears at the next frame. Other overlay kinds are stored losslessly and go live via config export + restart (this build draws no renderer for them). Each save response declares which applied (X-Multiview-Apply: live or restart)."
 msgstr "Analog clock overlays apply to the running engine immediately when saved or deleted — the face appears, moves, or disappears at the next frame. Other overlay kinds are stored losslessly and go live via config export + restart (this build draws no renderer for them). Each save response declares which applied (X-Multiview-Apply: live or restart)."
+
+#: src/components/broadcast/library/AssetAuditionControls.tsx:238
+msgid "Analysis unavailable — stale, unbound or invalid measured data."
+msgstr "Analysis unavailable — stale, unbound or invalid measured data."
 
 #: src/pages/MeshPage.tsx:195
 msgid "and install the signed lease by hand."
@@ -1231,7 +1298,7 @@ msgstr "Arm"
 msgid "Arm automation? Confirmed ad breaks on this source will switch program output automatically."
 msgstr "Arm automation? Confirmed ad breaks on this source will switch program output automatically."
 
-#: src/pages/MediaPlayersPage.tsx:411
+#: src/pages/MediaPlayersPage.tsx:331
 msgid "Arm exit"
 msgstr "Arm exit"
 
@@ -1239,9 +1306,14 @@ msgstr "Arm exit"
 msgid "Arm salvo"
 msgstr "Arm salvo"
 
-#: src/pages/MediaPlayersPage.tsx:405
+#: src/pages/MediaPlayersPage.tsx:325
 msgid "Arm vamp exit"
 msgstr "Arm vamp exit"
+
+#. placeholder {0}: player.name
+#: src/pages/MediaPlayersPage.tsx:155
+msgid "Arm vamp exit on {0}"
+msgstr "Arm vamp exit on {0}"
 
 #: src/events/AutomationPanel.tsx:35
 msgid "Armed — idle, waiting for a break."
@@ -1267,9 +1339,21 @@ msgstr "Assessment"
 msgid "Asset"
 msgstr "Asset"
 
-#: src/pages/MediaPlayersPage.tsx:473
+#: src/pages/MediaPlayersPage.tsx:579
 msgid "Asset id"
 msgstr "Asset id"
+
+#: src/components/broadcast/library/LibraryBrowser.tsx:125
+msgid "Asset listing is not available"
+msgstr "Asset listing is not available"
+
+#: src/components/broadcast/library/MetadataInspector.tsx:226
+msgid "Asset metadata"
+msgstr "Asset metadata"
+
+#: src/components/broadcast/library/MetadataInspector.tsx:255
+msgid "Asset name"
+msgstr "Asset name"
 
 #: src/layout/components/AreaMatrixEditor.tsx:281
 msgid "Assign to selection"
@@ -1293,6 +1377,7 @@ msgid "Attached automatically"
 msgstr "Attached automatically"
 
 #: src/app/navigation.tsx:57
+#: src/components/broadcast/library/Chips.tsx:138
 #: src/pages/AudioPage.tsx:440
 #: src/pages/OutputsPage.tsx:826
 msgid "Audio"
@@ -1322,6 +1407,15 @@ msgstr "Audio silence"
 #: src/pages/AuditPage.tsx:55
 msgid "Audit"
 msgstr "Audit"
+
+#: src/components/broadcast/library/AssetAuditionControls.tsx:127
+#: src/components/broadcast/library/AssetAuditionControls.tsx:147
+msgid "Audition"
+msgstr "Audition"
+
+#: src/components/broadcast/library/AssetAuditionControls.tsx:131
+msgid "Audition is not available"
+msgstr "Audition is not available"
 
 #: src/devices/DeviceStateBadge.tsx:60
 msgid "Auth failed"
@@ -1661,6 +1755,18 @@ msgstr "Build feature compiled"
 msgid "Bus"
 msgstr "Bus"
 
+#: src/components/broadcast/library/MetadataInspector.tsx:340
+msgid "Cadence"
+msgstr "Cadence"
+
+#: src/components/broadcast/library/MetadataInspector.tsx:344
+msgid "Cadence not probed"
+msgstr "Cadence not probed"
+
+#: src/components/broadcast/AssetDurationLabel.tsx:51
+msgid "cadence unknown"
+msgstr "cadence unknown"
+
 #: src/pages/AudioPage.tsx:225
 msgid "Camera 1"
 msgstr "Camera 1"
@@ -1683,7 +1789,7 @@ msgstr "Camera 1"
 #: src/pages/graphics/DataView.tsx:319
 #: src/pages/graphics/LibraryView.tsx:155
 #: src/pages/LayoutsPage.tsx:319
-#: src/pages/MediaPlayersPage.tsx:493
+#: src/pages/MediaPlayersPage.tsx:617
 #: src/pages/RelayManagementPage.tsx:80
 #: src/pages/SalvosPage.tsx:281
 #: src/pages/SalvosPage.tsx:395
@@ -1695,7 +1801,7 @@ msgstr "Camera 1"
 msgid "Cancel"
 msgstr "Cancel"
 
-#: src/pages/MediaPlayersPage.tsx:435
+#: src/pages/MediaPlayersPage.tsx:357
 msgid "Cancel exit"
 msgstr "Cancel exit"
 
@@ -1707,9 +1813,14 @@ msgstr "Cancel salvo"
 msgid "Cancel token revocation"
 msgstr "Cancel token revocation"
 
-#: src/pages/MediaPlayersPage.tsx:429
+#: src/pages/MediaPlayersPage.tsx:351
 msgid "Cancel vamp exit"
 msgstr "Cancel vamp exit"
+
+#. placeholder {0}: player.name
+#: src/pages/MediaPlayersPage.tsx:159
+msgid "Cancel vamp exit on {0}"
+msgstr "Cancel vamp exit on {0}"
 
 #: src/events/SourceEventsButton.tsx:18
 msgid "Cancelled"
@@ -1782,6 +1893,11 @@ msgstr "Caption field / service"
 #: src/pages/SourcesPage.tsx:764
 msgid "Captions"
 msgstr "Captions"
+
+#: src/components/broadcast/library/MetadataInspector.tsx:207
+#: src/components/broadcast/library/MetadataInspector.tsx:403
+msgid "Captured"
+msgstr "Captured"
 
 #: src/pages/LicencePage.tsx:281
 msgid "Carry the file to an online portal to obtain a signed lease."
@@ -2072,6 +2188,14 @@ msgstr "Clear override"
 msgid "Clear place"
 msgstr "Clear place"
 
+#: src/components/broadcast/library/LibraryBrowser.tsx:333
+msgid "Clear selection"
+msgstr "Clear selection"
+
+#: src/components/broadcast/library/MetadataInspector.tsx:199
+msgid "Cleared"
+msgstr "Cleared"
+
 #: src/pages/ProbesPage.tsx:70
 msgid "Cleared (no alarm)"
 msgstr "Cleared (no alarm)"
@@ -2080,9 +2204,14 @@ msgstr "Cleared (no alarm)"
 msgid "Cleared only"
 msgstr "Cleared only"
 
+#: src/components/broadcast/library/Chips.tsx:138
 #: src/pages/ProgramMeters.tsx:85
 msgid "Clip"
 msgstr "Clip"
+
+#: src/components/broadcast/library/TranscriptRangeEditor.tsx:492
+msgid "Clip-ready selection"
+msgstr "Clip-ready selection"
 
 #: src/events/JournalPanel.tsx:31
 msgid "Clock"
@@ -2126,6 +2255,7 @@ msgstr "Cloudflare media relays"
 msgid "Code:"
 msgstr "Code:"
 
+#: src/components/broadcast/library/MetadataInspector.tsx:356
 #: src/pages/OutputsPage.tsx:672
 #: src/pages/OutputsPage.tsx:911
 msgid "Codec"
@@ -2184,7 +2314,6 @@ msgid "Columns"
 msgstr "Columns"
 
 #: src/api/operationStatus.ts:55
-#: src/pages/MediaPlayersPage.tsx:145
 #: src/pages/SalvosPage.tsx:153
 msgid "Command accepted"
 msgstr "Command accepted"
@@ -2193,8 +2322,6 @@ msgstr "Command accepted"
 msgid "Command accepted; awaiting the output tick"
 msgstr "Command accepted; awaiting the output tick"
 
-#: src/pages/MediaPlayersPage.tsx:151
-#: src/pages/MediaPlayersPage.tsx:172
 #: src/pages/SalvosPage.tsx:159
 msgid "Command failed"
 msgstr "Command failed"
@@ -2282,7 +2409,7 @@ msgstr "Configuration file"
 msgid "Configure output servers and renditions."
 msgstr "Configure output servers and renditions."
 
-#: src/pages/MediaPlayersPage.tsx:257
+#: src/pages/MediaPlayersPage.tsx:362
 msgid "Configured default"
 msgstr "Configured default"
 
@@ -2326,6 +2453,7 @@ msgstr "Confirm teardown"
 msgid "Confirm token revocation"
 msgstr "Confirm token revocation"
 
+#: src/app/AppLayout.tsx:59
 #: src/components/ConnectionStatus.tsx:29
 #: src/iptv/NetworkDialog.tsx:111
 msgid "Connected"
@@ -2336,6 +2464,7 @@ msgstr "Connected"
 msgid "Connected ({0})"
 msgstr "Connected ({0})"
 
+#: src/app/AppLayout.tsx:61
 #: src/components/ConnectionStatus.tsx:35
 #: src/pages/OutputsPage.tsx:147
 msgid "Connecting"
@@ -2356,6 +2485,10 @@ msgstr "Connection timed out. The network cause is unknown."
 #: src/pages/OutputsPage.tsx:584
 msgid "Connector"
 msgstr "Connector"
+
+#: src/components/broadcast/library/MetadataInspector.tsx:377
+msgid "Content hash"
+msgstr "Content hash"
 
 #: src/pages/SupportPage.tsx:424
 msgid "Context pack"
@@ -2455,6 +2588,7 @@ msgstr "Corner radius (px)"
 msgid "Corner radius must be a whole number of pixels (0 or more)."
 msgstr "Corner radius must be a whole number of pixels (0 or more)."
 
+#: src/components/broadcast/OperationFeedback.tsx:157
 #: src/events/SourceEventsButton.tsx:49
 msgid "Correlation"
 msgstr "Correlation"
@@ -2561,10 +2695,6 @@ msgstr "Could not install the lease"
 msgid "Could not load alarms:"
 msgstr "Could not load alarms:"
 
-#: src/pages/MediaPlayersPage.tsx:208
-msgid "Could not load asset"
-msgstr "Could not load asset"
-
 #: src/pages/CapabilitiesPage.tsx:299
 msgid "Could not load capabilities."
 msgstr "Could not load capabilities."
@@ -2598,7 +2728,7 @@ msgstr "Could not load graphics channels."
 msgid "Could not load layouts:"
 msgstr "Could not load layouts:"
 
-#: src/pages/MediaPlayersPage.tsx:238
+#: src/pages/MediaPlayersPage.tsx:530
 msgid "Could not load media players:"
 msgstr "Could not load media players:"
 
@@ -2931,19 +3061,20 @@ msgstr "Critical"
 msgid "CUDA-enabled image (NVDEC / NVENC plus a wgpu compositor) for NVIDIA GPUs."
 msgstr "CUDA-enabled image (NVDEC / NVENC plus a wgpu compositor) for NVIDIA GPUs."
 
-#: src/pages/MediaPlayersPage.tsx:353
+#: src/pages/MediaPlayersPage.tsx:426
 msgid "Cue"
 msgstr "Cue"
 
-#: src/pages/MediaPlayersPage.tsx:166
-msgid "Cue accepted"
-msgstr "Cue accepted"
+#. placeholder {0}: player.name
+#: src/pages/MediaPlayersPage.tsx:145
+msgid "Cue {0}"
+msgstr "Cue {0}"
 
-#: src/pages/MediaPlayersPage.tsx:347
+#: src/pages/MediaPlayersPage.tsx:420
 msgid "Cue player to in-point"
 msgstr "Cue player to in-point"
 
-#: src/pages/MediaPlayersPage.tsx:122
+#: src/pages/MediaPlayersPage.tsx:125
 msgid "Cued"
 msgstr "Cued"
 
@@ -3037,6 +3168,22 @@ msgstr "Dead"
 #: src/pages/docs/concepts/LatencyPage.tsx:121
 msgid "Decide who needs low latency. An operator wall watching for faults wants seconds at most; overflow viewing in a browser can tolerate plain HLS."
 msgstr "Decide who needs low latency. An operator wall watching for faults wants seconds at most; overflow viewing in a browser can tolerate plain HLS."
+
+#: src/components/broadcast/library/MetadataInspector.tsx:307
+msgid "Declare rights status"
+msgstr "Declare rights status"
+
+#: src/components/broadcast/library/MetadataInspector.tsx:245
+msgid "Declared"
+msgstr "Declared"
+
+#: src/components/broadcast/library/MetadataInspector.tsx:242
+msgid "Declared — operator intent (read-only while editing is unavailable)."
+msgstr "Declared — operator intent (read-only while editing is unavailable)."
+
+#: src/components/broadcast/library/MetadataInspector.tsx:241
+msgid "Declared — operator intent. Edits emit intents; the engine applies them."
+msgstr "Declared — operator intent. Edits emit intents; the engine applies them."
 
 #: src/pages/docs/concepts/ColorPage.tsx:38
 msgid "Decode a BT.601 stream with the BT.709 recipe (or vice versa) and every pixel is still \"valid\" — just subtly wrong: greens and reds shift, skin tones look off. Because many real-world feeds (especially IP cameras) ship with no color tags at all, Multiview detects what is signaled, fills the gaps with the same resolution-based rules real players use, converts every tile to the canvas color space before compositing, and tags the output so downstream players decode it correctly. A per-source override exists for the cases where a camera tags its stream wrongly."
@@ -3211,9 +3358,21 @@ msgstr "Delete this resource?"
 msgid "Deleted"
 msgstr "Deleted"
 
+#: src/components/broadcast/library/MetadataInspector.tsx:215
+msgid "Derived clip"
+msgstr "Derived clip"
+
+#: src/components/broadcast/library/MetadataInspector.tsx:399
+msgid "Derived from"
+msgstr "Derived from"
+
 #: src/pages/SupportPage.tsx:129
 msgid "Description"
 msgstr "Description"
+
+#: src/components/broadcast/library/LibraryBrowser.tsx:413
+msgid "Deselect"
+msgstr "Deselect"
 
 #: src/docs/registry.ts:31
 #: src/pages/docs/OverviewPage.tsx:54
@@ -3239,11 +3398,13 @@ msgstr "destination id"
 msgid "Destination URL"
 msgstr "Destination URL"
 
+#: src/components/broadcast/library/MetadataInspector.tsx:394
 #: src/events/SourceEventsButton.tsx:46
 #: src/pages/SystemActionsPage.tsx:237
 msgid "Detail"
 msgstr "Detail"
 
+#: src/components/broadcast/TaskWorkspace.tsx:82
 #: src/events/JournalPanel.tsx:126
 #: src/iptv/IptvOrgPage.tsx:841
 msgid "Details"
@@ -3348,6 +3509,7 @@ msgstr "Disarmed — no automatic action will be taken."
 msgid "Discard the source wall-clock"
 msgstr "Discard the source wall-clock"
 
+#: src/app/AppLayout.tsx:64
 #: src/components/ConnectionStatus.tsx:47
 msgid "Disconnected"
 msgstr "Disconnected"
@@ -3397,6 +3559,10 @@ msgstr "Discrete track name (route {row})"
 #: src/pages/RoutingPage.tsx:361
 msgid "Discrete-track channel count (optional)"
 msgstr "Discrete-track channel count (optional)"
+
+#: src/components/broadcast/OperationFeedback.tsx:181
+msgid "Dismiss"
+msgstr "Dismiss"
 
 #: src/pages/SourcesPage.tsx:651
 msgid "Display format"
@@ -3541,6 +3707,7 @@ msgstr "DTLS transport failed."
 msgid "Dual (analogue face + digital readout)"
 msgstr "Dual (analogue face + digital readout)"
 
+#: src/components/broadcast/library/MetadataInspector.tsx:347
 #: src/events/SourceEventsButton.tsx:66
 msgid "Duration"
 msgstr "Duration"
@@ -3548,6 +3715,16 @@ msgstr "Duration"
 #: src/pages/graphics/PlayoutView.tsx:315
 msgid "Duration (frames)"
 msgstr "Duration (frames)"
+
+#: src/components/broadcast/AssetDurationLabel.tsx:40
+#: src/components/broadcast/library/MetadataInspector.tsx:352
+msgid "Duration not measured"
+msgstr "Duration not measured"
+
+#: src/components/broadcast/AssetDurationLabel.tsx:41
+#: src/components/broadcast/library/MetadataInspector.tsx:353
+msgid "Duration unknown"
+msgstr "Duration unknown"
 
 #: src/pages/SourcesPage.tsx:711
 msgid "DVB teletext page"
@@ -3809,7 +3986,7 @@ msgstr "Encoder utilisation (device total)"
 msgid "Encoder utilisation: ours over device total"
 msgstr "Encoder utilisation: ours over device total"
 
-#: src/pages/MediaPlayersPage.tsx:132
+#: src/pages/MediaPlayersPage.tsx:135
 msgid "End of file"
 msgstr "End of file"
 
@@ -3991,14 +4168,19 @@ msgstr "Example sync group"
 msgid "Existing relay ID"
 msgstr "Existing relay ID"
 
-#: src/pages/MediaPlayersPage.tsx:294
+#: src/pages/MediaPlayersPage.tsx:292
 msgid "exit armed"
 msgstr "exit armed"
+
+#: src/components/broadcast/library/LibraryBrowser.tsx:222
+msgid "Exit select mode"
+msgstr "Exit select mode"
 
 #: src/events/SourceEventsButton.tsx:26
 msgid "Expected return in"
 msgstr "Expected return in"
 
+#: src/components/broadcast/library/MetadataInspector.tsx:201
 #: src/pages/graphics/DataView.tsx:142
 #: src/pages/LicencePage.tsx:157
 msgid "Expired"
@@ -4050,6 +4232,10 @@ msgstr "External evidence (test injection or authenticated hook)"
 msgid "Face"
 msgstr "Face"
 
+#: src/components/broadcast/ProducerStatus.tsx:60
+msgid "Failed"
+msgstr "Failed"
+
 #: src/components/SourceDemandBadge.tsx:98
 msgid "Failed, retrying"
 msgstr "Failed, retrying"
@@ -4086,6 +4272,15 @@ msgstr "Fetch an extended-M3U channel list by URL or paste its text, then pick t
 msgid "Fetch error"
 msgstr "Fetch error"
 
+#: src/components/broadcast/library/MetadataInspector.tsx:211
+msgid "Fetched"
+msgstr "Fetched"
+
+#. placeholder {0}: state.fetchedAtLabel
+#: src/components/broadcast/library/VTReferenceSummary.tsx:201
+msgid "Fetched {0}"
+msgstr "Fetched {0}"
+
 #: src/iptv/SourceLinks.tsx:331
 msgid "Field"
 msgstr "Field"
@@ -4119,6 +4314,10 @@ msgstr "Filter by kind"
 msgid "Filter by object id"
 msgstr "Filter by object id"
 
+#: src/components/broadcast/library/LibraryBrowser.tsx:244
+msgid "Filters"
+msgstr "Filters"
+
 #: src/iptv/IptvOrgPage.tsx:365
 msgid "Find a public live channel by name, topic or place, check that it plays from this server, and add it as a linked source."
 msgstr "Find a public live channel by name, topic or place, check that it plays from this server, and add it as a linked source."
@@ -4148,6 +4347,14 @@ msgstr "Fix these before saving:"
 #: src/iptv/IptvOrgPage.tsx:479
 msgid "Flags"
 msgstr "Flags"
+
+#: src/pages/MediaPlayersPage.tsx:389
+msgid "Focus player transport"
+msgstr "Focus player transport"
+
+#: src/pages/MediaPlayersPage.tsx:394
+msgid "Focus transport"
+msgstr "Focus transport"
 
 #: src/iptv/BulkAddDialog.tsx:166
 #: src/iptv/SourceLinks.tsx:74
@@ -4203,6 +4410,10 @@ msgstr "Frame-accurate with sub-millisecond flip deltas — all heads are driven
 msgid "Frame-accurate: every node presents the same frame index, with at most a fraction of one refresh of phase residual. This is the tier for video walls."
 msgstr "Frame-accurate: every node presents the same frame index, with at most a fraction of one refresh of phase residual. This is the tier for video walls."
 
+#: src/pages/MediaPlayersPage.tsx:313
+msgid "frames"
+msgstr "frames"
+
 #: src/pages/docs/concepts/ResiliencePage.tsx:36
 msgid "Fresh frames are arriving; the tile shows the newest one. This is the normal state."
 msgstr "Fresh frames are arriving; the tile shows the newest one. This is the normal state."
@@ -4214,6 +4425,10 @@ msgstr "From"
 #: src/devices/FromDevice.tsx:82
 msgid "From a managed device"
 msgstr "From a managed device"
+
+#: src/components/broadcast/ProducerStatus.tsx:54
+msgid "Frozen / stale"
+msgstr "Frozen / stale"
 
 #: src/pages/ProbesPage.tsx:58
 msgid "Frozen picture"
@@ -4739,10 +4954,27 @@ msgstr "Import relay"
 msgid "Import sources from an M3U playlist"
 msgstr "Import sources from an M3U playlist"
 
+#: src/components/broadcast/library/MetadataInspector.tsx:209
+msgid "Imported"
+msgstr "Imported"
+
 #. placeholder {0}: String(created)
 #: src/pages/M3uImportDialog.tsx:100
 msgid "Imported {0} source(s)"
 msgstr "Imported {0} source(s)"
+
+#: src/components/broadcast/library/MetadataInspector.tsx:546
+#: src/components/broadcast/library/TranscriptRangeEditor.tsx:350
+msgid "IN"
+msgstr "IN"
+
+#: src/components/broadcast/library/Chips.tsx:126
+msgid "In {slotName}"
+msgstr "In {slotName}"
+
+#: src/components/broadcast/library/Chips.tsx:126
+msgid "In {slotName} — ON AIR"
+msgstr "In {slotName} — ON AIR"
 
 #: src/pages/docs/concepts/LatencyPage.tsx:40
 msgid "In a multiview chain there are two transports in the path: the one each source arrives on, and the one the composed wall goes out on. Both choices matter, and they are independent — a wall of low-latency RTSP cameras served out over plain HLS is still tens of seconds behind for its viewers."
@@ -4751,6 +4983,10 @@ msgstr "In a multiview chain there are two transports in the path: the one each 
 #: src/events/AutomationPanel.tsx:27
 msgid "In break: replaced {swaps} since {since}"
 msgstr "In break: replaced {swaps} since {since}"
+
+#: src/components/broadcast/library/MetadataInspector.tsx:419
+msgid "In slots"
+msgstr "In slots"
 
 #: src/pages/LoudnessMeter.tsx:50
 msgid "In spec"
@@ -4796,6 +5032,10 @@ msgstr "Index"
 #: src/pages/TallyPage.tsx:366
 msgid "Index→cell rules"
 msgstr "Index→cell rules"
+
+#: src/components/broadcast/AssetDurationLabel.tsx:43
+msgid "inherited from source"
+msgstr "inherited from source"
 
 #: src/events/SourceEventsButton.tsx:101
 msgid "Inject a clearly-labelled synthetic break so you can see the overlay/automation work without waiting for a live ad break. If automation is armed, a test start takes the replacement and a test end restores it."
@@ -5056,6 +5296,11 @@ msgstr "Last session ended: {0}"
 msgid "Last success {0} · next {1} · {2} channel(s), {3} programme(s)"
 msgstr "Last success {0} · next {1} · {2} channel(s), {3} programme(s)"
 
+#. placeholder {0}: (derived.ageMs / 1000).toFixed(1)
+#: src/components/broadcast/ProducerStatus.tsx:107
+msgid "last tick {0}s ago"
+msgstr "last tick {0}s ago"
+
 #: src/docs/registry.ts:673
 #: src/pages/docs/concepts/GlossaryPage.tsx:136
 msgid "Last-good frame"
@@ -5201,9 +5446,14 @@ msgstr "Letting many viewers watch the composed wall: HLS, or LL-HLS when delay 
 msgid "Level"
 msgstr "Level"
 
+#: src/components/broadcast/library/LibraryBrowser.tsx:179
 #: src/pages/GraphicsPage.tsx:18
 msgid "Library"
 msgstr "Library"
+
+#: src/components/broadcast/library/LibraryBrowser.tsx:175
+msgid "Library browser"
+msgstr "Library browser"
 
 #: src/app/navigation.tsx:78
 #: src/pages/LicencePage.tsx:459
@@ -5342,24 +5592,25 @@ msgstr "Live tiles from the engine stream."
 msgid "LL-HLS (Low-Latency HLS)"
 msgstr "LL-HLS (Low-Latency HLS)"
 
-#: src/pages/MediaPlayersPage.tsx:341
-#: src/pages/MediaPlayersPage.tsx:496
+#: src/pages/MediaPlayersPage.tsx:413
+#: src/pages/MediaPlayersPage.tsx:626
 msgid "Load"
 msgstr "Load"
 
-#: src/pages/MediaPlayersPage.tsx:460
+#. placeholder {0}: player.name
+#: src/pages/MediaPlayersPage.tsx:143
+msgid "Load {0}"
+msgstr "Load {0}"
+
+#: src/pages/MediaPlayersPage.tsx:566
 msgid "Load a media-library asset into this player. It cues to the asset's in-point, ready to take."
 msgstr "Load a media-library asset into this player. It cues to the asset's in-point, ready to take."
 
-#: src/pages/MediaPlayersPage.tsx:201
-msgid "Load accepted"
-msgstr "Load accepted"
-
-#: src/pages/MediaPlayersPage.tsx:457
+#: src/pages/MediaPlayersPage.tsx:563
 msgid "Load asset"
 msgstr "Load asset"
 
-#: src/pages/MediaPlayersPage.tsx:335
+#: src/pages/MediaPlayersPage.tsx:407
 msgid "Load asset into player"
 msgstr "Load asset into player"
 
@@ -5367,15 +5618,19 @@ msgstr "Load asset into player"
 msgid "Load candidates"
 msgstr "Load candidates"
 
+#: src/components/broadcast/library/VTReferenceSummary.tsx:283
+msgid "Load from library…"
+msgstr "Load from library…"
+
 #: src/events/JournalPanel.tsx:132
 msgid "Load older records"
 msgstr "Load older records"
 
-#: src/pages/MediaPlayersPage.tsx:256
-msgid "Loaded asset"
-msgstr "Loaded asset"
+#: src/pages/MediaPlayersPage.tsx:300
+msgid "Loaded"
+msgstr "Loaded"
 
-#: src/pages/MediaPlayersPage.tsx:120
+#: src/pages/MediaPlayersPage.tsx:123
 msgid "Loading"
 msgstr "Loading"
 
@@ -5444,7 +5699,7 @@ msgstr "Loading licensing contact…"
 msgid "Loading logs…"
 msgstr "Loading logs…"
 
-#: src/pages/MediaPlayersPage.tsx:234
+#: src/pages/MediaPlayersPage.tsx:526
 msgid "Loading media players…"
 msgstr "Loading media players…"
 
@@ -5539,6 +5794,10 @@ msgstr "Loading…"
 msgid "Local (this city)"
 msgstr "Local (this city)"
 
+#: src/components/broadcast/library/AssetAuditionControls.tsx:154
+msgid "Local audition — not a program path"
+msgstr "Local audition — not a program path"
+
 #: src/pages/SourcesPage.tsx:585
 msgid "Local YYYY-MM-DDTHH:MM:SS, resolved in the timezone below."
 msgstr "Local YYYY-MM-DDTHH:MM:SS, resolved in the timezone below."
@@ -5586,7 +5845,7 @@ msgstr "Long-running ops"
 msgid "Looking for Cast receivers…"
 msgstr "Looking for Cast receivers…"
 
-#: src/pages/MediaPlayersPage.tsx:394
+#: src/pages/MediaPlayersPage.tsx:374
 msgid "Loop default"
 msgstr "Loop default"
 
@@ -5668,6 +5927,10 @@ msgstr "Managed devices."
 #: src/pages/docs/concepts/TransportsPage.tsx:312
 msgid "Managed facility LAN"
 msgstr "Managed facility LAN"
+
+#: src/components/broadcast/ProducerStatus.tsx:122
+msgid "Management"
+msgstr "Management"
 
 #: src/pages/DeviceDetailPage.tsx:462
 #: src/pages/DevicesPage.tsx:145
@@ -5753,9 +6016,22 @@ msgstr "Measure now"
 msgid "Measure skew"
 msgstr "Measure skew"
 
+#: src/components/broadcast/library/MetadataInspector.tsx:338
 #: src/pages/SyncGroupsPage.tsx:278
 msgid "Measured"
 msgstr "Measured"
+
+#: src/components/broadcast/library/MetadataInspector.tsx:336
+msgid "Measured — probed machine truth, read-only; never authored here."
+msgstr "Measured — probed machine truth, read-only; never authored here."
+
+#: src/components/broadcast/library/AssetAuditionControls.tsx:243
+msgid "Measured time-frequency bins"
+msgstr "Measured time-frequency bins"
+
+#: src/components/broadcast/library/AssetAuditionControls.tsx:240
+msgid "Measured waveform amplitude (normalized peak)."
+msgstr "Measured waveform amplitude (normalized peak)."
 
 #: src/docs/registry.ts:372
 #: src/pages/docs/SyncHelpPage.tsx:84
@@ -5770,7 +6046,7 @@ msgstr "Measurement running"
 #: src/app/navigation.tsx:66
 #: src/docs/registry.ts:257
 #: src/pages/docs/FeaturesPage.tsx:149
-#: src/pages/MediaPlayersPage.tsx:220
+#: src/pages/MediaPlayersPage.tsx:508
 msgid "Media players"
 msgstr "Media players"
 
@@ -5783,7 +6059,7 @@ msgstr "Media relays"
 msgid "Media time"
 msgstr "Media time"
 
-#: src/pages/MediaPlayersPage.tsx:478
+#: src/pages/MediaPlayersPage.tsx:584
 msgid "Media-library asset id"
 msgstr "Media-library asset id"
 
@@ -5813,6 +6089,18 @@ msgstr "Mesh"
 #: src/pages/LogsPage.tsx:175
 msgid "Message"
 msgstr "Message"
+
+#: src/components/broadcast/library/MetadataInspector.tsx:230
+msgid "Metadata"
+msgstr "Metadata"
+
+#: src/components/broadcast/library/MetadataInspector.tsx:325
+msgid "Metadata editing is not available."
+msgstr "Metadata editing is not available."
+
+#: src/components/broadcast/library/MetadataInspector.tsx:229
+msgid "Metadata for one library asset."
+msgstr "Metadata for one library asset."
 
 #: src/pages/RoutingPage.tsx:197
 msgid "Migration accepted"
@@ -6029,6 +6317,7 @@ msgstr "Mute {label}"
 msgid "Mute on the program mix (route {row})"
 msgstr "Mute on the program mix (route {row})"
 
+#: src/components/broadcast/library/MetadataInspector.tsx:248
 #: src/events/JournalPanel.tsx:124
 #: src/pages/CastPage.tsx:255
 #: src/pages/CastPage.tsx:316
@@ -6076,7 +6365,7 @@ msgstr "Names declared by the audio routing block; the program bus is always ava
 msgid "National"
 msgstr "National"
 
-#: src/app/AppLayout.tsx:74
+#: src/app/AppLayout.tsx:104
 msgid "Navigation"
 msgstr "Navigation"
 
@@ -6248,6 +6537,22 @@ msgstr "No alarms match the current filter."
 msgid "No alternatives are available."
 msgstr "No alternatives are available."
 
+#: src/components/broadcast/library/AssetAuditionControls.tsx:238
+msgid "No analysis for this mode — no analysis service supplied it."
+msgstr "No analysis for this mode — no analysis service supplied it."
+
+#: src/pages/MediaPlayersPage.tsx:597
+msgid "No asset browser is available here yet: this control plane has no library listing to pick from, so the asset id must be typed exactly as the media library defines it."
+msgstr "No asset browser is available here yet: this control plane has no library listing to pick from, so the asset id must be typed exactly as the media library defines it."
+
+#: src/components/broadcast/library/LibraryBrowser.tsx:347
+msgid "No assets in the library yet."
+msgstr "No assets in the library yet."
+
+#: src/components/broadcast/library/LibraryBrowser.tsx:346
+msgid "No assets match the current search and filters."
+msgstr "No assets match the current search and filters."
+
 #: src/pages/AuditPage.tsx:101
 #: src/pages/SystemActionsPage.tsx:225
 msgid "No audit entries match."
@@ -6288,6 +6593,10 @@ msgstr "No devices adopted."
 #: src/layout/components/SourcePalette.tsx:185
 msgid "No drop target."
 msgstr "No drop target."
+
+#: src/pages/MediaPlayersPage.tsx:247
+msgid "No exit is armed."
+msgstr "No exit is armed."
 
 #: src/pages/DashboardPage.tsx:123
 msgid "No frame-rate sample."
@@ -6354,9 +6663,13 @@ msgstr "No licence installed"
 msgid "No licence is installed on this machine. Use the offline exchange to install a signed lease."
 msgstr "No licence is installed on this machine. Use the offline exchange to install a signed lease."
 
-#: src/pages/MediaPlayersPage.tsx:298
+#: src/pages/MediaPlayersPage.tsx:296
 msgid "No live state"
 msgstr "No live state"
+
+#: src/pages/MediaPlayersPage.tsx:241
+msgid "No live state yet — the player's vamp status is unknown."
+msgstr "No live state yet — the player's vamp status is unknown."
 
 #: src/pages/DashboardPage.tsx:102
 msgid "No live tiles yet. They appear once the engine streams a snapshot."
@@ -6378,7 +6691,7 @@ msgstr "No matching place."
 msgid "No media"
 msgstr "No media"
 
-#: src/pages/MediaPlayersPage.tsx:243
+#: src/pages/MediaPlayersPage.tsx:535
 msgid "No media players are configured. Declare them under<0>media_players</0> in the config."
 msgstr "No media players are configured. Declare them under<0>media_players</0> in the config."
 
@@ -6397,6 +6710,10 @@ msgstr "No monitor source yet — use “Create PVW/PGM sources” below."
 #: src/pages/DevicesPage.tsx:84
 msgid "No offline alarm"
 msgstr "No offline alarm"
+
+#: src/components/broadcast/ProducerStatus.tsx:101
+msgid "No output tick observed"
+msgstr "No output tick observed"
 
 #: src/pages/OutputsPage.tsx:990
 msgid "No outputs configured."
@@ -6487,6 +6804,10 @@ msgstr "No streams match. Loosen a filter or choose another place."
 msgid "No sync groups configured."
 msgstr "No sync groups configured."
 
+#: src/components/broadcast/library/MetadataInspector.tsx:284
+msgid "No tags"
+msgstr "No tags"
+
 #: src/pages/TallyPage.tsx:357
 msgid "No tally profiles are defined."
 msgstr "No tally profiles are defined."
@@ -6507,6 +6828,14 @@ msgstr "No tickets yet."
 msgid "No tracks declared yet on the Audio page."
 msgstr "No tracks declared yet on the Audio page."
 
+#: src/components/broadcast/library/Chips.tsx:107
+msgid "No transcript"
+msgstr "No transcript"
+
+#: src/components/broadcast/library/TranscriptRangeEditor.tsx:304
+msgid "No transcript available for this asset."
+msgstr "No transcript available for this asset."
+
 #: src/pages/LicencePage.tsx:183
 msgid "No watermark"
 msgstr "No watermark"
@@ -6515,7 +6844,7 @@ msgstr "No watermark"
 msgid "Nodes enrol with a keypair identity: the node proves itself with its key, not with a network address, so a node keeps its identity across DHCP changes and re-images. That is why the management address is optional for the <0>displaynode</0> driver — an enrolled node finds the controller and authenticates itself. After a network loss the node reconnects with its enrolled identity, re-pulls its stream, and re-converges its sync offset before un-muting its output."
 msgstr "Nodes enrol with a keypair identity: the node proves itself with its key, not with a network address, so a node keeps its identity across DHCP changes and re-images. That is why the management address is optional for the <0>displaynode</0> driver — an enrolled node finds the controller and authenticates itself. After a network loss the node reconnects with its enrolled identity, re-pulls its stream, and re-converges its sync offset before un-muting its output."
 
-#: src/pages/MediaPlayersPage.tsx:318
+#: src/pages/MediaPlayersPage.tsx:368
 #: src/pages/SalvosPage.tsx:240
 msgid "None"
 msgstr "None"
@@ -6585,9 +6914,17 @@ msgstr "Not linked to IPTV-ORG"
 msgid "Not loaded"
 msgstr "Not loaded"
 
+#: src/components/broadcast/library/MetadataInspector.tsx:446
+msgid "Not measured"
+msgstr "Not measured"
+
 #: src/pages/DeviceDetailPage.tsx:190
 msgid "Not probed yet."
 msgstr "Not probed yet."
+
+#: src/components/broadcast/library/MetadataInspector.tsx:432
+msgid "Not referenced by any slot"
+msgstr "Not referenced by any slot"
 
 #: src/layout/components/CellPropertiesPanel.tsx:252
 msgid "Not static"
@@ -6629,6 +6966,10 @@ msgstr "Nothing enumerated yet — the list fills in once the device's driver ha
 #: src/pages/IptvPage.tsx:224
 msgid "Nothing is published yet."
 msgstr "Nothing is published yet."
+
+#: src/components/broadcast/library/VTReferenceSummary.tsx:175
+msgid "Nothing loaded — no bytes at risk"
+msgstr "Nothing loaded — no bytes at risk"
 
 #: src/pages/SupportPage.tsx:498
 msgid "Nothing was redacted."
@@ -6736,6 +7077,10 @@ msgstr "On"
 msgid "on {0}"
 msgstr "on {0}"
 
+#: src/components/broadcast/library/Chips.tsx:21
+msgid "ON AIR"
+msgstr "ON AIR"
+
 #: src/pages/graphics/PlayoutView.tsx:238
 msgid "On air:"
 msgstr "On air:"
@@ -6781,6 +7126,10 @@ msgstr "ONLINE / DEGRADED"
 msgid "Only CEA-608 fields cc1, cc2, cc3 and cc4 decode. CEA-708 services are not supported."
 msgstr "Only CEA-608 fields cc1, cc2, cc3 and cc4 decode. CEA-708 services are not supported."
 
+#: src/pages/MediaPlayersPage.tsx:243
+msgid "Only while the player is vamping."
+msgstr "Only while the player is vamping."
+
 #: src/layout/components/CellPropertiesPanel.tsx:186
 msgid "Opacity (0–1)"
 msgstr "Opacity (0–1)"
@@ -6805,7 +7154,7 @@ msgstr "Open HLS playlist"
 msgid "Open in VLC"
 msgstr "Open in VLC"
 
-#: src/app/AppLayout.tsx:68
+#: src/app/AppLayout.tsx:96
 msgid "Open navigation"
 msgstr "Open navigation"
 
@@ -6835,6 +7184,13 @@ msgstr "opening"
 msgid "Opening this preview starts the source if it was idle; closing it lets the source stop again. WebRTC is used only when the server supports it. Source previews are video-only."
 msgstr "Opening this preview starts the source if it was idle; closing it lets the source stop again. WebRTC is used only when the server supports it. Source previews are video-only."
 
+#. placeholder {0}: pendingOperation.operationId
+#. placeholder {1}: pendingOperation.expectedGeneration
+#. placeholder {2}: pendingOperation.observedGeneration ?? '—'
+#: src/components/broadcast/library/VTReferenceSummary.tsx:225
+msgid "Operation {0} · expected generation {1} · observed generation {2}"
+msgstr "Operation {0} · expected generation {1} · observed generation {2}"
+
 #. placeholder {0}: accepted.operation_id
 #: src/pages/CastPage.tsx:177
 msgid "Operation {0}; the level arrives on the realtime stream."
@@ -6860,9 +7216,6 @@ msgstr "Operation {0}; the result arrives on the realtime stream."
 #: src/api/operationStatus.ts:56
 #: src/pages/LayoutEditorPage.tsx:118
 #: src/pages/LayoutsPage.tsx:148
-#: src/pages/MediaPlayersPage.tsx:146
-#: src/pages/MediaPlayersPage.tsx:167
-#: src/pages/MediaPlayersPage.tsx:202
 #: src/pages/SalvosPage.tsx:154
 #: src/pages/TallyPage.tsx:142
 msgid "Operation id"
@@ -6884,6 +7237,7 @@ msgstr "Optional <0>captions</0> select a caption or subtitle track (auto, telet
 msgid "Optional for display nodes — an enrolled node is located by its keypair identity."
 msgstr "Optional for display nodes — an enrolled node is located by its keypair identity."
 
+#: src/components/broadcast/library/MetadataInspector.tsx:390
 #: src/events/JournalPanel.tsx:79
 #: src/events/JournalPanel.tsx:123
 msgid "Origin"
@@ -6892,6 +7246,10 @@ msgstr "Origin"
 #: src/pages/OutputsPage.tsx:547
 msgid "Origin token (optional)"
 msgstr "Origin token (optional)"
+
+#: src/components/broadcast/library/MetadataInspector.tsx:217
+msgid "Origin unknown"
+msgstr "Origin unknown"
 
 #: src/layout/components/GridLayoutEditor.tsx:484
 msgid "Orphaned cells"
@@ -6908,6 +7266,11 @@ msgstr "Our NVENC sessions / device-wide sessions / ceiling"
 #: src/pages/SystemPage.tsx:256
 msgid "Ours of host total"
 msgstr "Ours of host total"
+
+#: src/components/broadcast/library/MetadataInspector.tsx:555
+#: src/components/broadcast/library/TranscriptRangeEditor.tsx:361
+msgid "OUT"
+msgstr "OUT"
 
 #: src/pages/LoudnessMeter.tsx:54
 msgid "Out of spec"
@@ -6960,6 +7323,10 @@ msgstr "Output path"
 #: src/pages/OutputsPage.tsx:946
 msgid "Output playback unavailable: the configured playlist path is missing."
 msgstr "Output playback unavailable: the configured playlist path is missing."
+
+#: src/components/broadcast/ProducerStatus.tsx:103
+msgid "Output tick observation is invalid — age cannot be verified"
+msgstr "Output tick observation is invalid — age cannot be verified"
 
 #. placeholder {0}: o.name
 #. placeholder {1}: o.id
@@ -7051,15 +7418,21 @@ msgstr "Paste the control-plane bearer token. Set it from the MULTIVIEW_CONTROL_
 msgid "Paste this command into a terminal to open the stream in VLC."
 msgstr "Paste this command into a terminal to open the stream in VLC."
 
-#: src/pages/MediaPlayersPage.tsx:377
+#: src/components/broadcast/library/AssetAuditionControls.tsx:165
+#: src/pages/MediaPlayersPage.tsx:452
 msgid "Pause"
 msgstr "Pause"
 
-#: src/pages/MediaPlayersPage.tsx:371
+#. placeholder {0}: player.name
+#: src/pages/MediaPlayersPage.tsx:149
+msgid "Pause {0}"
+msgstr "Pause {0}"
+
+#: src/pages/MediaPlayersPage.tsx:446
 msgid "Pause player"
 msgstr "Pause player"
 
-#: src/pages/MediaPlayersPage.tsx:126
+#: src/pages/MediaPlayersPage.tsx:129
 msgid "Paused"
 msgstr "Paused"
 
@@ -7142,11 +7515,17 @@ msgstr "Plain UDP has no recovery at all: a lost packet is a glitch on screen. T
 msgid "Plan (dry run)"
 msgstr "Plan (dry run)"
 
-#: src/pages/MediaPlayersPage.tsx:365
+#: src/components/broadcast/library/AssetAuditionControls.tsx:165
+#: src/pages/MediaPlayersPage.tsx:439
 msgid "Play"
 msgstr "Play"
 
-#: src/pages/MediaPlayersPage.tsx:359
+#. placeholder {0}: player.name
+#: src/pages/MediaPlayersPage.tsx:147
+msgid "Play {0}"
+msgstr "Play {0}"
+
+#: src/pages/MediaPlayersPage.tsx:433
 msgid "Play player"
 msgstr "Play player"
 
@@ -7166,12 +7545,11 @@ msgstr "Playback unavailable. The output may not be active, or this browser may 
 msgid "Playback URL"
 msgstr "Playback URL"
 
-#: src/pages/MediaPlayersPage.tsx:254
-#: src/pages/MediaPlayersPage.tsx:469
+#: src/pages/MediaPlayersPage.tsx:575
 msgid "Player"
 msgstr "Player"
 
-#: src/pages/MediaPlayersPage.tsx:124
+#: src/pages/MediaPlayersPage.tsx:127
 msgid "Playing"
 msgstr "Playing"
 
@@ -7188,9 +7566,19 @@ msgstr "Playout"
 msgid "Playout command failed"
 msgstr "Playout command failed"
 
-#: src/pages/MediaPlayersPage.tsx:258
-msgid "Position (frames)"
-msgstr "Position (frames)"
+#: src/pages/MediaPlayersPage.tsx:312
+msgid "Position"
+msgstr "Position"
+
+#. placeholder {0}: state.positionLabel
+#: src/components/broadcast/library/VTReferenceSummary.tsx:208
+msgid "Position {0}"
+msgstr "Position {0}"
+
+#: src/components/broadcast/library/AssetAuditionControls.tsx:177
+#: src/components/broadcast/library/VTReferenceSummary.tsx:209
+msgid "Position not reported"
+msgstr "Position not reported"
 
 #: src/pages/MonitoringPage.tsx:139
 msgid "Pre-encode canvas approximation"
@@ -7315,6 +7703,14 @@ msgstr "Probes"
 msgid "Probing…"
 msgstr "Probing…"
 
+#: src/components/broadcast/ProducerStatus.tsx:130
+msgid "Producer state not reported"
+msgstr "Producer state not reported"
+
+#: src/components/broadcast/ProducerStatus.tsx:48
+msgid "Producing"
+msgstr "Producing"
+
 #: src/pages/DataPage.tsx:190
 msgid "Product telemetry"
 msgstr "Product telemetry"
@@ -7399,9 +7795,14 @@ msgstr "Promote this ephemeral session to a permanent managed Cast device."
 msgid "Protocol"
 msgstr "Protocol"
 
+#: src/components/broadcast/library/MetadataInspector.tsx:388
 #: src/events/SourceEventsButton.tsx:44
 msgid "Provenance"
 msgstr "Provenance"
+
+#: src/components/broadcast/library/MetadataInspector.tsx:387
+msgid "Provenance — recorded history, read-only."
+msgstr "Provenance — recorded history, read-only."
 
 #: src/pages/SourcesPage.tsx:966
 msgid "Provider channel id"
@@ -7599,6 +8000,7 @@ msgstr "Reconfiguration locked"
 msgid "Reconnect behaviour"
 msgstr "Reconnect behaviour"
 
+#: src/app/AppLayout.tsx:63
 #: src/components/ConnectionStatus.tsx:41
 #: src/components/TileStateBadge.tsx:41
 #: src/pages/OutputsPage.tsx:149
@@ -7608,6 +8010,10 @@ msgstr "Reconnecting"
 #: src/pages/docs/concepts/ResiliencePage.tsx:48
 msgid "RECONNECTING"
 msgstr "RECONNECTING"
+
+#: src/components/broadcast/library/MetadataInspector.tsx:213
+msgid "Recovered"
+msgstr "Recovered"
 
 #: src/pages/docs/concepts/ResiliencePage.tsx:57
 msgid "Recovery has not succeeded within the no-signal timeout. The tile switches to a clear \"signal lost\" slate — an honest statement that what is on screen is no longer recent video."
@@ -7883,6 +8289,7 @@ msgstr "Resilience"
 msgid "Resilience & the tile lifecycle"
 msgstr "Resilience & the tile lifecycle"
 
+#: src/components/broadcast/library/MetadataInspector.tsx:359
 #: src/iptv/ProbeSummary.tsx:36
 msgid "Resolution"
 msgstr "Resolution"
@@ -7942,6 +8349,10 @@ msgstr "Results"
 msgid "Results stream in below as they are found. {0}"
 msgstr "Results stream in below as they are found. {0}"
 
+#: src/components/broadcast/library/VTReferenceSummary.tsx:231
+msgid "Retry detach (same operation)"
+msgstr "Retry detach (same operation)"
+
 #: src/preview/PreviewSurface.tsx:91
 msgid "Retry live preview"
 msgstr "Retry live preview"
@@ -7973,6 +8384,26 @@ msgstr "Revoke relay token"
 #: src/pages/RelayConfigurationControls.tsx:36
 msgid "Revoke this token for this relay? New connections lose access. Existing connected sessions are not terminated."
 msgstr "Revoke this token for this relay? New connections lose access. Existing connected sessions are not terminated."
+
+#: src/components/broadcast/library/MetadataInspector.tsx:288
+msgid "Rights"
+msgstr "Rights"
+
+#: src/components/broadcast/library/Chips.tsx:49
+msgid "Rights cleared"
+msgstr "Rights cleared"
+
+#: src/components/broadcast/library/Chips.tsx:61
+msgid "Rights expired"
+msgstr "Rights expired"
+
+#: src/components/broadcast/library/Chips.tsx:61
+msgid "Rights expired — {expiryLabel}"
+msgstr "Rights expired — {expiryLabel}"
+
+#: src/components/broadcast/library/Chips.tsx:68
+msgid "Rights unknown"
+msgstr "Rights unknown"
 
 #: src/pages/docs/components.tsx:147
 msgid "Roadmap"
@@ -8123,6 +8554,7 @@ msgstr "Same machine, multiple outputs"
 msgid "Sample rate (Hz)"
 msgstr "Sample rate (Hz)"
 
+#: src/components/broadcast/library/VTReferenceSummary.tsx:246
 #: src/pages/CastPage.tsx:523
 #: src/pages/IptvPage.tsx:125
 #: src/pages/SalvosPage.tsx:398
@@ -8135,6 +8567,10 @@ msgstr "Save"
 #: src/layout/components/LayoutEditor.tsx:202
 msgid "Save & apply to engine"
 msgstr "Save & apply to engine"
+
+#: src/components/broadcast/library/VTReferenceSummary.tsx:258
+msgid "Save & unload"
+msgstr "Save & unload"
 
 #: src/pages/CastPage.tsx:480
 msgid "Save as a device"
@@ -8195,6 +8631,11 @@ msgstr "Saved as {0}. Restart Multiview with this file to apply stored changes."
 msgid "Saved as device"
 msgstr "Saved as device"
 
+#. placeholder {0}: pendingOperation.assetId
+#: src/components/broadcast/library/VTReferenceSummary.tsx:226
+msgid "Saved asset {0}"
+msgstr "Saved asset {0}"
+
 #: src/pages/AudioPage.tsx:614
 msgid "Saved: program mix gain, mute, and source routes apply live. New, removed, reordered, or renamed output tracks remain pending until output reconfiguration. The saved document is not fully live."
 msgstr "Saved: program mix gain, mute, and source routes apply live. New, removed, reordered, or renamed output tracks remain pending until output reconfiguration. The saved document is not fully live."
@@ -8253,6 +8694,11 @@ msgstr "Search docs…"
 msgid "Search documentation"
 msgstr "Search documentation"
 
+#: src/components/broadcast/library/LibraryBrowser.tsx:195
+#: src/components/broadcast/library/LibraryBrowser.tsx:196
+msgid "Search library assets"
+msgstr "Search library assets"
+
 #: src/pages/docs/DocsSearch.tsx:117
 msgid "Search results"
 msgstr "Search results"
@@ -8273,6 +8719,11 @@ msgstr "Seed from a preset"
 msgid "Seeding from a preset replaces every cell in this draft. Nothing is saved until you save the layout."
 msgstr "Seeding from a preset replaces every cell in this draft. Nothing is saved until you save the layout."
 
+#. placeholder {0}: player.name
+#: src/pages/MediaPlayersPage.tsx:153
+msgid "Seek {0}"
+msgstr "Seek {0}"
+
 #: src/devices/lastSeen.tsx:93
 msgid "seen (age unknown)"
 msgstr "seen (age unknown)"
@@ -8284,6 +8735,10 @@ msgstr "Segment (ms)"
 #: src/pages/OutputsPage.tsx:273
 msgid "Segment duration (ms, optional)"
 msgstr "Segment duration (ms, optional)"
+
+#: src/components/broadcast/library/LibraryBrowser.tsx:413
+msgid "Select"
+msgstr "Select"
 
 #: src/iptv/IptvOrgPage.tsx:768
 msgid "Select {name} for bulk add"
@@ -8319,6 +8774,10 @@ msgstr "Select PVW"
 msgid "Select stream {title} for bulk add"
 msgstr "Select stream {title} for bulk add"
 
+#: src/components/broadcast/library/LibraryBrowser.tsx:231
+msgid "Select…"
+msgstr "Select…"
+
 #: src/pages/AudioPage.tsx:253
 msgid "Selectable tracks"
 msgstr "Selectable tracks"
@@ -8335,6 +8794,14 @@ msgstr "Selected item"
 msgid "Selected rows {0}–{1}, columns {2}–{3}"
 msgstr "Selected rows {0}–{1}, columns {2}–{3}"
 
+#: src/components/broadcast/library/TranscriptRangeEditor.tsx:482
+msgid "Selected:"
+msgstr "Selected:"
+
+#: src/components/broadcast/library/TranscriptRangeEditor.tsx:473
+msgid "Selection unavailable"
+msgstr "Selection unavailable"
+
 #: src/layout/components/CellsForm.tsx:403
 msgid "Send backward"
 msgstr "Send backward"
@@ -8347,6 +8814,11 @@ msgstr "Send daily product telemetry"
 #: src/pages/SupportPage.tsx:266
 msgid "Send reply"
 msgstr "Send reply"
+
+#. placeholder {0}: op.label
+#: src/pages/MediaPlayersPage.tsx:473
+msgid "Sending {0}…"
+msgstr "Sending {0}…"
 
 #: src/pages/SourcesPage.tsx:747
 msgid "Sent on every HLS request. Not a secret; exported with the config."
@@ -8377,6 +8849,14 @@ msgstr "Set an identifier above; the WHEP play endpoint is derived from it and s
 #: src/pages/SourcesPage.tsx:321
 msgid "Set an identifier above; the WHIP publish endpoint is derived from it and shown here once it is filled in."
 msgstr "Set an identifier above; the WHIP publish endpoint is derived from it and shown here once it is filled in."
+
+#: src/components/broadcast/library/MetadataInspector.tsx:561
+msgid "Set at end"
+msgstr "Set at end"
+
+#: src/components/broadcast/library/MetadataInspector.tsx:552
+msgid "Set at start"
+msgstr "Set at start"
 
 #: src/pages/CastPage.tsx:541
 msgid "Set the receiver volume"
@@ -8468,7 +8948,11 @@ msgstr "Silence level (dBFS)"
 msgid "Silent (gated)"
 msgstr "Silent (gated)"
 
-#: src/app/AppLayout.tsx:51
+#: src/components/broadcast/library/MetadataInspector.tsx:368
+msgid "Size"
+msgstr "Size"
+
+#: src/app/AppLayout.tsx:72
 msgid "Skip to content"
 msgstr "Skip to content"
 
@@ -8484,6 +8968,10 @@ msgstr "Snapshot {0} assembled."
 #: src/pages/M3uImportDialog.tsx:105
 msgid "Some sources could not be created"
 msgstr "Some sources could not be created"
+
+#: src/components/broadcast/library/LibraryBrowser.tsx:205
+msgid "Sort order"
+msgstr "Sort order"
 
 #: src/layout/components/CellsForm.tsx:398
 #: src/layout/components/GridLayoutEditor.tsx:667
@@ -8528,6 +9016,7 @@ msgstr "Source input id"
 msgid "Source preview"
 msgstr "Source preview"
 
+#: src/components/broadcast/library/MetadataInspector.tsx:406
 #: src/pages/DeviceDetailPage.tsx:1070
 #: src/pages/SourcesPage.tsx:216
 msgid "Source URL"
@@ -8556,6 +9045,11 @@ msgstr "Sources → Layouts → Outputs. The accessible editor offers a form-bas
 #: src/pages/SourcesPage.tsx:492
 msgid "Specific date & time"
 msgstr "Specific date & time"
+
+#. placeholder {0}: analysis.frequencyBinsHz.join(', ')
+#: src/components/broadcast/library/AssetAuditionControls.tsx:242
+msgid "Spectrogram frequency bins (Hz): {0} · magnitude (dBFS)"
+msgstr "Spectrogram frequency bins (Hz): {0} · magnitude (dBFS)"
 
 #: src/pages/docs/concepts/LatencyPage.tsx:128
 msgid "Spend buffer where the network is bad (the internet leg), not where it is good (the facility LAN)."
@@ -8662,7 +9156,6 @@ msgstr "Starting: {startingPhase}"
 #: src/pages/AlarmsPage.tsx:183
 #: src/pages/CastPage.tsx:319
 #: src/pages/DevicesPage.tsx:552
-#: src/pages/MediaPlayersPage.tsx:255
 msgid "State"
 msgstr "State"
 
@@ -8692,6 +9185,22 @@ msgstr "Status"
 msgid "Staying off"
 msgstr "Staying off"
 
+#: src/components/broadcast/library/MetadataInspector.tsx:611
+msgid "Step {label} back one grid unit"
+msgstr "Step {label} back one grid unit"
+
+#: src/components/broadcast/library/TranscriptRangeEditor.tsx:524
+msgid "Step {label} back one word"
+msgstr "Step {label} back one word"
+
+#: src/components/broadcast/library/MetadataInspector.tsx:621
+msgid "Step {label} forward one grid unit"
+msgstr "Step {label} forward one grid unit"
+
+#: src/components/broadcast/library/TranscriptRangeEditor.tsx:532
+msgid "Step {label} forward one word"
+msgstr "Step {label} forward one word"
+
 #: src/pages/AudioPage.tsx:72
 msgid "Stereo"
 msgstr "Stereo"
@@ -8704,18 +9213,24 @@ msgstr "Still preview (~1 fps)"
 msgid "Still preview (~1 fps) — live video is unavailable for this preview."
 msgstr "Still preview (~1 fps) — live video is unavailable for this preview."
 
+#: src/components/broadcast/library/AssetAuditionControls.tsx:174
 #: src/components/SourceLifecycleActions.tsx:67
 #: src/pages/CastPage.tsx:382
 #: src/pages/CastPage.tsx:606
-#: src/pages/MediaPlayersPage.tsx:389
+#: src/pages/MediaPlayersPage.tsx:465
 msgid "Stop"
 msgstr "Stop"
+
+#. placeholder {0}: player.name
+#: src/pages/MediaPlayersPage.tsx:151
+msgid "Stop {0}"
+msgstr "Stop {0}"
 
 #: src/components/SourceLifecycleActions.tsx:61
 msgid "Stop {name}"
 msgstr "Stop {name}"
 
-#: src/pages/MediaPlayersPage.tsx:383
+#: src/pages/MediaPlayersPage.tsx:459
 msgid "Stop player"
 msgstr "Stop player"
 
@@ -8727,7 +9242,8 @@ msgstr "Stop session"
 msgid "Stop this cast session?"
 msgstr "Stop this cast session?"
 
-#: src/pages/MediaPlayersPage.tsx:128
+#: src/components/broadcast/ProducerStatus.tsx:66
+#: src/pages/MediaPlayersPage.tsx:131
 msgid "Stopped"
 msgstr "Stopped"
 
@@ -8954,6 +9470,10 @@ msgstr "System"
 msgid "System actions"
 msgstr "System actions"
 
+#: src/components/broadcast/library/MetadataInspector.tsx:274
+msgid "Tags"
+msgstr "Tags"
+
 #: src/pages/RoutingPage.tsx:432
 #: src/pages/SalvosPage.tsx:269
 msgid "Take"
@@ -8967,7 +9487,7 @@ msgstr "TAKE"
 msgid "Take applied"
 msgstr "Take applied"
 
-#: src/pages/MediaPlayersPage.tsx:423
+#: src/pages/MediaPlayersPage.tsx:344
 msgid "Take exit"
 msgstr "Take exit"
 
@@ -8979,9 +9499,14 @@ msgstr "Take kind"
 msgid "Take salvo"
 msgstr "Take salvo"
 
-#: src/pages/MediaPlayersPage.tsx:417
+#: src/pages/MediaPlayersPage.tsx:338
 msgid "Take vamp exit"
 msgstr "Take vamp exit"
+
+#. placeholder {0}: player.name
+#: src/pages/MediaPlayersPage.tsx:157
+msgid "Take vamp exit on {0}"
+msgstr "Take vamp exit on {0}"
 
 #: src/pages/LayoutEditorPage.tsx:118
 #: src/pages/LayoutsPage.tsx:148
@@ -9008,6 +9533,10 @@ msgstr "Tally profiles and their rule counts."
 #: src/pages/docs/FeaturesPage.tsx:126
 msgid "Tally shows which sources are on-air. A tally profile maps the bits of an external tally bus to colors (for example red for program, green for preview) and maps bus index positions to specific tiles. A <0>tally_border</0> overlay then lights the tile's edge to match. This lets an upstream router or mixer drive the borders on the wall."
 msgstr "Tally shows which sources are on-air. A tally profile maps the bits of an external tally bus to colors (for example red for program, green for preview) and maps bus index positions to specific tiles. A <0>tally_border</0> overlay then lights the tile's edge to match. This lets an upstream router or mixer drive the borders on the wall."
+
+#: src/components/broadcast/library/TranscriptRangeEditor.tsx:338
+msgid "Tap one word to select it; tap another to select the range between — or step the IN/OUT endpoints."
+msgstr "Tap one word to select it; tap another to select the range between — or step the IN/OUT endpoints."
 
 #: src/pages/LogsPage.tsx:173
 #: src/pages/OverlaysPage.tsx:178
@@ -9069,6 +9598,14 @@ msgstr "Teardown relay"
 msgid "Teletext page"
 msgstr "Teletext page"
 
+#: src/components/broadcast/library/VTReferenceSummary.tsx:309
+msgid "TEMP — unsaved bytes"
+msgstr "TEMP — unsaved bytes"
+
+#: src/components/broadcast/library/VTReferenceSummary.tsx:308
+msgid "TEMP — unsaved bytes ({byteSizeLabel})"
+msgstr "TEMP — unsaved bytes ({byteSizeLabel})"
+
 #: src/pages/DeviceDetailPage.tsx:480
 #: src/pages/DevicesPage.tsx:595
 msgid "Temperature"
@@ -9115,6 +9652,10 @@ msgstr "Test pattern requested"
 #: src/pages/docs/concepts/TransportsPage.tsx:328
 msgid "Testing, placeholders, layout work"
 msgstr "Testing, placeholders, layout work"
+
+#: src/components/broadcast/library/TranscriptRangeEditor.tsx:492
+msgid "Text selection only — alignment, asset grid, interval order or transcript revision is unavailable."
+msgstr "Text selection only — alignment, asset grid, interval order or transcript revision is unavailable."
 
 #: src/auth/LoginPage.tsx:50
 msgid "That key was not accepted. Check it and try again."
@@ -9179,6 +9720,10 @@ msgstr "The condition must persist this long before the alarm raises."
 #: src/pages/ProbesPage.tsx:373
 msgid "The condition must stay clear this long before the alarm clears."
 msgstr "The condition must stay clear this long before the alarm clears."
+
+#: src/pages/MediaPlayersPage.tsx:189
+msgid "The control plane did not answer. The command may or may not have been applied."
+msgstr "The control plane did not answer. The command may or may not have been applied."
 
 #: src/pages/docs/ApiPage.tsx:36
 msgid "The control plane serves an interactive OpenAPI reference at the backend <0>/docs</0> path. It is generated from the same spec the UI client is generated from, so it always matches the running server. Open it to browse every endpoint, see schemas, and try requests."
@@ -9409,6 +9954,10 @@ msgstr "The output clock"
 #: src/docs/registry.ts:460
 msgid "The output clock, genlock, PTP, and wall-clock time — how frames are paced and aligned."
 msgstr "The output clock, genlock, PTP, and wall-clock time — how frames are paced and aligned."
+
+#: src/pages/MediaPlayersPage.tsx:270
+msgid "The previous command's outcome is unknown — repeating it could duplicate the command."
+msgstr "The previous command's outcome is unknown — repeating it could duplicate the command."
 
 #: src/pages/docs/concepts/GlossaryPage.tsx:112
 msgid "The procedure WebRTC peers use to find a working network path between them. Each side gathers candidate addresses — its own local address, its public address as seen through NAT (via a STUN server), and, when a direct path is impossible, a relayed address from a TURN server — and the pair probes them to pick one. A TURN relay is what lets WebRTC work across strict firewalls; it is configured on the server, never in the browser."
@@ -9742,6 +10291,10 @@ msgstr "This server cannot resolve YouTube sources right now: `yt-dlp` was not f
 msgid "This server, as the internet sees it"
 msgstr "This server, as the internet sees it"
 
+#: src/components/broadcast/library/VTReferenceSummary.tsx:144
+msgid "This slot is on air — take another source or stop first."
+msgstr "This slot is on air — take another source or stop first."
+
 #: src/events/SourceEventsButton.tsx:125
 msgid "This source has never been active; connect it before injecting a test event."
 msgstr "This source has never been active; connect it before injecting a test event."
@@ -9782,6 +10335,10 @@ msgstr "This URL must start with http:// or https://."
 msgid "Tick"
 msgstr "Tick"
 
+#: src/components/broadcast/ProducerStatus.tsx:105
+msgid "Tick timestamp is ahead of the clock — age cannot be verified"
+msgstr "Tick timestamp is ahead of the clock — age cannot be verified"
+
 #: src/pages/SupportPage.tsx:80
 msgid "Ticket raised"
 msgstr "Ticket raised"
@@ -9815,6 +10372,14 @@ msgstr "Time not known."
 #: src/pages/SourcesPage.tsx:490
 msgid "Time of day (recurring)"
 msgstr "Time of day (recurring)"
+
+#: src/components/broadcast/library/TranscriptRangeEditor.tsx:394
+msgid "timecodes not aligned"
+msgstr "timecodes not aligned"
+
+#: src/components/broadcast/library/TranscriptRangeEditor.tsx:490
+msgid "Timecodes not aligned"
+msgstr "Timecodes not aligned"
 
 #: src/events/SourceEventsButton.tsx:22
 msgid "Timed ID3"
@@ -9863,6 +10428,10 @@ msgstr "Token inventory incomplete; creation disabled"
 msgid "Token revoked. Existing connected sessions are not terminated."
 msgstr "Token revoked. Existing connected sessions are not terminated."
 
+#: src/components/broadcast/useOperationFeedback.ts:29
+msgid "Too many unresolved commands. Wait for an outcome or resolve an unknown command before retrying."
+msgstr "Too many unresolved commands. Wait for an outcome or resolve an unknown command before retrying."
+
 #: src/layout/components/CellsForm.tsx:393
 msgid "Top (%)"
 msgstr "Top (%)"
@@ -9901,6 +10470,31 @@ msgstr "Transcoding"
 msgid "Transcoding is decoding compressed video back to raw pictures and recompressing it — usually into a different codec, size, or bitrate. Every transcode costs three things: <0>quality</0> (each recompression is a new lossy generation), <1>latency</1> (decoding and re-encoding both buffer frames), and <2>compute</2> (encoding is by far the most expensive step in a video pipeline). Good systems therefore transcode only when they must, and exactly once."
 msgstr "Transcoding is decoding compressed video back to raw pictures and recompressing it — usually into a different codec, size, or bitrate. Every transcode costs three things: <0>quality</0> (each recompression is a new lossy generation), <1>latency</1> (decoding and re-encoding both buffer frames), and <2>compute</2> (encoding is by far the most expensive step in a video pipeline). Good systems therefore transcode only when they must, and exactly once."
 
+#: src/components/broadcast/library/TranscriptRangeEditor.tsx:300
+#: src/components/broadcast/library/TranscriptRangeEditor.tsx:319
+msgid "Transcript"
+msgstr "Transcript"
+
+#: src/components/broadcast/library/Chips.tsx:86
+msgid "Transcript done"
+msgstr "Transcript done"
+
+#: src/components/broadcast/library/Chips.tsx:101
+msgid "Transcript failed"
+msgstr "Transcript failed"
+
+#: src/components/broadcast/library/TranscriptRangeEditor.tsx:328
+msgid "Transcript is read-only — selection is unavailable."
+msgstr "Transcript is read-only — selection is unavailable."
+
+#: src/components/broadcast/library/Chips.tsx:93
+msgid "Transcript processing"
+msgstr "Transcript processing"
+
+#: src/components/broadcast/library/TranscriptRangeEditor.tsx:378
+msgid "Transcript words"
+msgstr "Transcript words"
+
 #: src/pages/SourcesPage.tsx:846
 msgid "Transfer"
 msgstr "Transfer"
@@ -9925,7 +10519,6 @@ msgstr "Transparent (key over video)"
 #: src/pages/DataPage.tsx:109
 #: src/pages/docs/concepts/TransportsPage.tsx:257
 #: src/pages/LicencePage.tsx:247
-#: src/pages/MediaPlayersPage.tsx:259
 #: src/pages/OutputsPage.tsx:897
 #: src/pages/OutputsPage.tsx:1047
 msgid "Transport"
@@ -9939,6 +10532,22 @@ msgstr "Transport comparison: latency class, network fit, robustness, and typica
 #: src/pages/docs/concepts/TransportsPage.tsx:44
 msgid "Transports compared"
 msgstr "Transports compared"
+
+#: src/components/broadcast/library/MetadataInspector.tsx:630
+msgid "Trim not set"
+msgstr "Trim not set"
+
+#: src/components/broadcast/library/MetadataInspector.tsx:630
+msgid "Trim not set (read-only)"
+msgstr "Trim not set (read-only)"
+
+#: src/components/broadcast/library/MetadataInspector.tsx:544
+msgid "Trim unavailable — invalid measured length or mismatched asset grid and endpoints. Revalidate metadata before saving."
+msgstr "Trim unavailable — invalid measured length or mismatched asset grid and endpoints. Revalidate metadata before saving."
+
+#: src/components/broadcast/library/MetadataInspector.tsx:263
+msgid "Trims"
+msgstr "Trims"
 
 #: src/pages/LoudnessMeter.tsx:192
 msgid "True peak"
@@ -9986,10 +10595,19 @@ msgstr "Unclaimed"
 msgid "Under ceiling"
 msgstr "Under ceiling"
 
+#: src/components/broadcast/OperationFeedback.tsx:172
+msgid "Undo {operationLabel}"
+msgstr "Undo {operationLabel}"
+
 #: src/pages/DevicesPage.tsx:459
 #: src/pages/DevicesPage.tsx:476
 msgid "unhealthy"
 msgstr "unhealthy"
+
+#: src/components/broadcast/library/MetadataInspector.tsx:201
+#: src/components/broadcast/ProducerStatus.tsx:72
+msgid "Unknown"
+msgstr "Unknown"
 
 #: src/pages/DataPage.tsx:317
 #: src/pages/LicencePage.tsx:286
@@ -10001,6 +10619,10 @@ msgstr "Unknown error"
 #: src/preview/PreviewDiagnostics.tsx:27
 msgid "Unknown values mean the browser did not provide evidence. Network blocking is not established."
 msgstr "Unknown values mean the browser did not provide evidence. Network blocking is not established."
+
+#: src/components/broadcast/library/TranscriptRangeEditor.tsx:390
+msgid "Unlabeled speaker"
+msgstr "Unlabeled speaker"
 
 #: src/pages/LicencePage.tsx:148
 msgid "unlimited"
@@ -10027,6 +10649,10 @@ msgstr "Unlinked"
 msgid "Unlinked from IPTV-ORG"
 msgstr "Unlinked from IPTV-ORG"
 
+#: src/components/broadcast/library/VTReferenceSummary.tsx:273
+msgid "Unload"
+msgstr "Unload"
+
 #: src/preview/WhepPlayer.tsx:353
 msgid "Unmute {label}"
 msgstr "Unmute {label}"
@@ -10046,6 +10672,10 @@ msgstr "Unsupported"
 #: src/events/SourceEventsButton.tsx:26
 msgid "Until start"
 msgstr "Until start"
+
+#: src/components/broadcast/library/MetadataInspector.tsx:596
+msgid "Unusable boundary"
+msgstr "Unusable boundary"
 
 #: src/pages/DeviceDetailPage.tsx:584
 msgid "unverified"
@@ -10109,6 +10739,14 @@ msgstr "Upstream XMLTV feeds of published sources with an EPG set, refreshed in 
 msgid "URL"
 msgstr "URL"
 
+#: src/components/broadcast/library/MetadataInspector.tsx:417
+msgid "Usage"
+msgstr "Usage"
+
+#: src/components/broadcast/library/MetadataInspector.tsx:416
+msgid "Usage — slots currently referencing this asset."
+msgstr "Usage — slots currently referencing this asset."
+
 #: src/devices/FromDevice.tsx:250
 msgid "Use decode target"
 msgstr "Use decode target"
@@ -10142,11 +10780,7 @@ msgstr "valid to"
 msgid "Validation and import / export"
 msgstr "Validation and import / export"
 
-#: src/pages/MediaPlayersPage.tsx:260
-msgid "Vamp exit"
-msgstr "Vamp exit"
-
-#: src/pages/MediaPlayersPage.tsx:130
+#: src/pages/MediaPlayersPage.tsx:133
 msgid "Vamping"
 msgstr "Vamping"
 
@@ -10174,6 +10808,10 @@ msgstr "Very low (<1 s)"
 #: src/pages/docs/concepts/TransportsPage.tsx:283
 msgid "Very low (~1 frame)"
 msgstr "Very low (~1 frame)"
+
+#: src/components/broadcast/library/Chips.tsx:138
+msgid "Video"
+msgstr "Video"
 
 #: src/preview/PreviewDiagnostics.tsx:21
 msgid "Video progress could not be determined from browser statistics."
@@ -10248,7 +10886,7 @@ msgstr "VRAM used of total"
 msgid "VRAM: ours / device used / device total"
 msgstr "VRAM: ours / device used / device total"
 
-#: src/pages/MediaPlayersPage.tsx:222
+#: src/pages/MediaPlayersPage.tsx:510
 msgid "VT transport for the configured media-player channels. Load an asset, cue, play, pause, stop, and — for a vamp/loop fill — arm, take, or cancel a clean exit at the next vamp boundary. Each command is accepted asynchronously; the player's live state and playhead arrive on the realtime stream."
 msgstr "VT transport for the configured media-player channels. Load an asset, cue, play, pause, stop, and — for a vamp/loop fill — arm, take, or cancel a clean exit at the next vamp boundary. Each command is accepted asynchronously; the player's live state and playhead arrive on the realtime stream."
 
