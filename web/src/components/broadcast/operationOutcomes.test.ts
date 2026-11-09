@@ -13,6 +13,7 @@ import {
   EARLY_EVIDENCE_MAX,
   NON_TERMINAL_EVENTS,
   OPERATION_RECORDS_MAX,
+  reserveOperationOutcome,
   applyOperationAcceptance,
   applyTerminalEvidence,
   createOperationOutcomeState,
@@ -98,11 +99,11 @@ describe('operationOutcomes — acceptance', () => {
 
   it('refuses trackless acceptances: no id, no corr, or no topic changes nothing', () => {
     const start = createOperationOutcomeState();
-    expect(applyOperationAcceptance(start, accept({ operationId: '' }))).toBe(start);
+    expect(() => applyOperationAcceptance(start, accept({ operationId: '' }))).toThrow(/invalid/);
     // An uncorrelated command can never be joined to evidence, so it is not
     // outcome-trackable at all.
-    expect(applyOperationAcceptance(start, accept({ corr: '' }))).toBe(start);
-    expect(applyOperationAcceptance(start, accept({ topic: '' }))).toBe(start);
+    expect(() => applyOperationAcceptance(start, accept({ corr: '' }))).toThrow(/invalid/);
+    expect(() => applyOperationAcceptance(start, accept({ topic: '' }))).toThrow(/invalid/);
     expect(start.records.size).toBe(0);
   });
 
@@ -165,14 +166,14 @@ describe('operationOutcomes — terminal evidence must match exactly', () => {
 
   it('a same-corr frame on the wrong topic settles nothing (and waits for its own acceptance)', () => {
     let state = applyOperationAcceptance(createOperationOutcomeState(), accept());
-    state = applyTerminalEvidence(state, evidence({ topic: 'switcher', at: 5 }));
+    state = applyTerminalEvidence(state, evidence({ corr: 'switcher-corr', topic: 'switcher', at: 5 }));
     expect(readOperationOutcome(state, 'op-1')?.phase).toBe('accepted');
     // The frame is cached for an acceptance expecting that topic…
     expect(state.earlyEvidence).toHaveLength(1);
     // …which it then settles, while the outputs op stays honestly accepted.
     state = applyOperationAcceptance(
       state,
-      accept({ operationId: 'op-2', topic: 'switcher' }),
+      accept({ operationId: 'op-2', corr: 'switcher-corr', topic: 'switcher' }),
     );
     expect(readOperationOutcome(state, 'op-2')?.phase).toBe('applied');
     expect(readOperationOutcome(state, 'op-1')?.phase).toBe('accepted');
@@ -213,7 +214,7 @@ describe('operationOutcomes — terminal evidence must match exactly', () => {
 
   it('job.progress is never terminal: it settles nothing and is never cached', () => {
     expect(NON_TERMINAL_EVENTS.has('job.progress')).toBe(true);
-    let state = applyOperationAcceptance(
+    const state = applyOperationAcceptance(
       createOperationOutcomeState(),
       accept({ topic: 'jobs', event: 'job.progress' }),
     );
@@ -227,22 +228,22 @@ describe('operationOutcomes — terminal evidence must match exactly', () => {
   });
 
   it('uncorrelated frames never settle anything and are not cached', () => {
-    let state = applyOperationAcceptance(createOperationOutcomeState(), accept());
+    const state = applyOperationAcceptance(createOperationOutcomeState(), accept());
     const uncorrelated = applyTerminalEvidence(state, evidence({ corr: '' }));
     expect(uncorrelated).toBe(state);
     expect(readOperationOutcome(uncorrelated, 'op-1')?.phase).toBe('accepted');
     expect(uncorrelated.earlyEvidence).toHaveLength(0);
   });
 
-  it('one evidence frame settles every waiting record on that corr+topic', () => {
+  it('a correlation id cannot be accepted for two operation identities', () => {
     let state = applyOperationAcceptance(
       createOperationOutcomeState(),
       accept({ operationId: 'op-a' }),
     );
-    state = applyOperationAcceptance(state, accept({ operationId: 'op-b' }));
+    expect(() => applyOperationAcceptance(state, accept({ operationId: 'op-b' }))).toThrow(/identity/);
     state = applyTerminalEvidence(state, evidence({ at: 9 }));
     expect(readOperationOutcome(state, 'op-a')?.phase).toBe('applied');
-    expect(readOperationOutcome(state, 'op-b')?.phase).toBe('applied');
+    expect(readOperationOutcome(state, 'op-b')).toBeUndefined();
   });
 
   it('the first terminal verdict stands: late conflicting evidence flips nothing and is not cached', () => {
@@ -340,7 +341,7 @@ describe('operationOutcomes — bounded early-terminal cache', () => {
 
   it('does not cache a duplicate frame twice', () => {
     const frame = evidence({ corr: 'corr-d', at: 8 });
-    let state = applyTerminalEvidence(createOperationOutcomeState(), frame);
+    const state = applyTerminalEvidence(createOperationOutcomeState(), frame);
     const deduped = applyTerminalEvidence(state, frame);
     expect(deduped).toBe(state);
     expect(state.earlyEvidence).toHaveLength(1);
@@ -348,7 +349,7 @@ describe('operationOutcomes — bounded early-terminal cache', () => {
 });
 
 describe('operationOutcomes — bounded records', () => {
-  it('evicts the oldest settled record at the cap but never an unresolved one', () => {
+  it('keeps a hard cap and evicts only authoritative history', () => {
     let state: OperationOutcomeState = createOperationOutcomeState();
     for (let i = 0; i < OPERATION_RECORDS_MAX; i += 1) {
       state = applyOperationAcceptance(
@@ -362,22 +363,77 @@ describe('operationOutcomes — bounded records', () => {
     }
     expect(state.records.size).toBe(OPERATION_RECORDS_MAX);
     // All 256 are unresolved: the next acceptance must NOT evict any of them.
-    state = applyOperationAcceptance(
+    expect(() => applyOperationAcceptance(
       state,
       accept({ operationId: 'op-256', corr: 'corr-256' }),
-    );
-    expect(state.records.size).toBe(OPERATION_RECORDS_MAX + 1);
+    )).toThrow(/capacity/);
+    expect(state.records.size).toBe(OPERATION_RECORDS_MAX);
     expect(readOperationOutcome(state, 'op-0')?.phase).toBe('accepted');
-    // Settle the oldest, then one more acceptance evicts exactly that record.
+    expect(readOperationOutcome(state, 'op-256')).toBeUndefined();
+    // Capacity becomes available only by evicting authoritative history.
     state = applyTerminalEvidence(state, evidence({ corr: 'corr-0', at: 5 }));
-    state = applyOperationAcceptance(
-      state,
-      accept({ operationId: 'op-257', corr: 'corr-257' }),
-    );
-    expect(state.records.size).toBe(OPERATION_RECORDS_MAX + 1);
+    state = applyOperationAcceptance(state, accept({ operationId: 'op-257', corr: 'corr-257' }));
+    expect(state.records.size).toBe(OPERATION_RECORDS_MAX);
     expect(readOperationOutcome(state, 'op-0')).toBeUndefined();
     expect(readOperationOutcome(state, 'op-1')?.phase).toBe('accepted');
-    expect(readOperationOutcome(state, 'op-256')?.phase).toBe('accepted');
     expect(readOperationOutcome(state, 'op-257')?.phase).toBe('accepted');
+  });
+});
+
+describe('admission, uncertain authority, and hostile input', () => {
+  it('reserves before submission and rejects full unresolved capacity without dropping unknown', () => {
+    let state = createOperationOutcomeState();
+    for (let i = 0; i < OPERATION_RECORDS_MAX; i++) {
+      state = reserveOperationOutcome(state, accept({ operationId: `op-${String(i)}`, corr: `c-${String(i)}`, deadlineAt: 1 }));
+      state = applyOperationAcceptance(state, accept({ operationId: `op-${String(i)}`, corr: `c-${String(i)}`, deadlineAt: 1 }));
+      state = expireOperationDeadlines(state, 1);
+    }
+    expect(state.records.size).toBe(256);
+    expect(() => reserveOperationOutcome(state, accept({ operationId: 'overflow', corr: 'overflow' }))).toThrow(/capacity/);
+    expect(() => applyOperationAcceptance(state, accept({ operationId: 'late-202', corr: 'late-202' }))).toThrow(/capacity/);
+    expect(readOperationOutcome(state, 'op-0')?.phase).toBe('unknown');
+    state = applyTerminalEvidence(state, evidence({ corr: 'c-0', at: 2 }));
+    expect(readOperationOutcome(state, 'op-0')?.phase).toBe('applied');
+    state = reserveOperationOutcome(state, accept({ operationId: 'next', corr: 'next' }));
+    expect(state.records.size).toBe(256);
+  });
+
+  it('rejects 300 unresolved acceptances at the hard cap', () => {
+    let state = createOperationOutcomeState();
+    for (let i = 0; i < 300; i++) {
+      const request = accept({ operationId: `op-${String(i)}`, corr: `c-${String(i)}` });
+      if (i < OPERATION_RECORDS_MAX) state = reserveOperationOutcome(state, request);
+      else expect(() => reserveOperationOutcome(state, request)).toThrow(/capacity/);
+    }
+    expect(state.records.size).toBe(OPERATION_RECORDS_MAX);
+  });
+
+  it('conflicting replay cannot mutate expectation or deadline', () => {
+    const original = accept({ resource: 'out-1', event: 'output.status', kind: 'start', deadlineAt: 100 });
+    const state = applyOperationAcceptance(createOperationOutcomeState(), original);
+    for (const change of [{corr: 'other'}, {topic: 'other'}, {resource: 'out-2'},
+      {event: 'other'}, {kind: 'stop'}]) {
+      expect(() => applyOperationAcceptance(state, {...original, ...change, deadlineAt: 1})).toThrow(/identity/);
+    }
+    expect(readOperationOutcome(state, 'op-1')?.deadlineAt).toBe(100);
+    expect(applyOperationAcceptance(state, {...original, deadlineAt: 1})).toBe(state);
+  });
+
+  it('first contradictory early terminal verdict wins for one corr', () => {
+    let state = applyTerminalEvidence(createOperationOutcomeState(), evidence({verdict: 'failed', at: 1}));
+    state = applyTerminalEvidence(state, evidence({verdict: 'applied', at: 2}));
+    expect(state.earlyEvidence).toHaveLength(1);
+    state = applyOperationAcceptance(state, accept());
+    expect(readOperationOutcome(state, 'op-1')?.phase).toBe('failed');
+    expect(() => applyOperationAcceptance(state, accept({operationId: 'other'}))).toThrow(/identity/);
+  });
+
+  it('rejects malformed ingress and non-finite clocks', () => {
+    const state = createOperationOutcomeState();
+    expect(() => reserveOperationOutcome(state, accept({deadlineAt: Number.NaN}))).toThrow(/invalid/);
+    expect(() => applyOperationAcceptance(state, accept({corr: '   '}))).toThrow(/invalid/);
+    expect(applyTerminalEvidence(state, {...evidence(), verdict: 'other'} as unknown as TerminalEvidence)).toBe(state);
+    expect(applyTerminalEvidence(state, {...evidence(), at: Infinity})).toBe(state);
+    expect(() => expireOperationDeadlines(state, Number.NaN)).toThrow(/invalid/);
   });
 });

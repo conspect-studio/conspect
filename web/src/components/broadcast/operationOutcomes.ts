@@ -1,4 +1,4 @@
-// operationOutcomes — the pure, bounded store that joins REST 202 command
+// operationOutcomes — the pure, hard-capped store that joins REST 202 command
 // acceptances to their realtime TERMINAL evidence (the "202 accepted ≠
 // applied" gap; production component audit §3). Pages today toast the
 // `operation_id` at 202 and nothing reconciles it with the outcome frames the
@@ -9,6 +9,10 @@
 //   id (`corr`) and the realtime `topic` match exactly, plus the resource id
 //   and the event type when the expectation pins them. A same-corr frame on
 //   the wrong topic or naming the wrong resource settles nothing.
+// - Reserve a capacity seat BEFORE submitting; a reserved command becomes
+//   accepted on REST 202. A 202 without reservation may fail admission with
+//   an explicit capacity error: it has ALREADY been accepted by the engine,
+//   so callers must retain/reconcile it outside this store, never say rejected.
 // - `accepted` can only ever become `applied`, `failed` or `unknown`. There
 //   is deliberately NO "rolled back" phase: an outcome that was never
 //   observed never implies the engine reverted (the server's bounded corr
@@ -36,8 +40,16 @@
 // (the missing `idle` OutputRunState drift, audit §2) plus review; until then
 // the wiring layer maps envelopes onto the plain shapes below.
 
-/** The phases one tracked operation can be in (first terminal verdict wins). */
-export type OperationPhase = 'accepted' | 'applied' | 'failed' | 'unknown';
+/** The phases one tracked operation can be in (first valid terminal verdict wins). */
+export type OperationPhase = 'reserved' | 'accepted' | 'applied' | 'failed' | 'unknown';
+
+/** A rejected admission never asserts that an already-submitted engine command failed. */
+export class OperationOutcomeError extends Error {
+  constructor(readonly code: 'capacity' | 'identity' | 'invalid') {
+    super(`Operation outcome ${code}: submission status is not inferred`);
+    this.name = 'OperationOutcomeError';
+  }
+}
 
 /** The terminal verdict a piece of evidence carries. */
 export type EvidenceVerdict = 'applied' | 'failed';
@@ -49,10 +61,8 @@ export const NON_TERMINAL_EVENTS: ReadonlySet<string> = new Set(['job.progress']
 export const EARLY_EVIDENCE_MAX = 64;
 
 /**
- * Max tracked-operation records kept. Settled/expired history is evicted
- * oldest-first beyond this bound; UNRESOLVED (`accepted`) records are never
- * evicted — dropping a live operation would fabricate "no such operation",
- * so a burst larger than the cap of concurrently-unresolved ops grows past it.
+ * Hard cap. Only authoritative applied/failed history may be evicted;
+ * reserved, accepted and unknown operations retain their uncertain authority.
  */
 export const OPERATION_RECORDS_MAX = 256;
 
@@ -117,93 +127,115 @@ export interface OperationOutcomeState {
   readonly earlyEvidence: readonly TerminalEvidence[];
 }
 
+/** Reserve a seat before submitting a command. A capacity rejection means DO NOT POST.
+ * Carry the returned state forward to the 202 acceptance. No I/O occurs here. */
+export function reserveOperationOutcome(
+  state: OperationOutcomeState,
+  expectation: OperationAcceptance,
+): OperationOutcomeState {
+  validateAcceptance(expectation);
+  if (state.records.has(expectation.operationId) ||
+      [...state.records.values()].some((record) => record.corr === expectation.corr)) {
+    throw new OperationOutcomeError('identity');
+  }
+  const records = makeRoom(state.records);
+  records.set(expectation.operationId, makeRecord(expectation, 'reserved'));
+  return { records, earlyEvidence: state.earlyEvidence };
+}
+
 /** An empty store. */
 export function createOperationOutcomeState(): OperationOutcomeState {
   return { records: new Map(), earlyEvidence: [] };
 }
 
 /**
- * Record a `202 Accepted` operation and what its terminal evidence must look
- * like. Idempotent per `operationId`: a replayed acceptance never regresses a
- * settled or deadline-expired record, and while the record is still waiting
- * for evidence the replay may only re-arm its deadline. If matching terminal
- * evidence was already cached (it arrived before the 202), the record settles
- * immediately and the cached frame is consumed.
+ * Record a `202 Accepted` operation. Prefer reserveOperationOutcome before
+ * POST; absent a reservation, this may explicitly throw on full capacity.
+ * A replay is valid only for the same identity; its deadline may extend,
+ * never shorten. Cached earlier terminal evidence settles on acceptance.
  */
 export function applyOperationAcceptance(
   state: OperationOutcomeState,
   acceptance: OperationAcceptance,
 ): OperationOutcomeState {
-  // An operation without a corr can never be joined to evidence, and an
-  // id-less acceptance cannot be tracked; both are refused rather than
-  // fabricated.
-  if (
-    acceptance.operationId === '' ||
-    acceptance.corr === '' ||
-    acceptance.topic === ''
-  ) {
-    return state;
-  }
+  validateAcceptance(acceptance);
   const existing = state.records.get(acceptance.operationId);
   if (existing !== undefined) {
-    if (existing.phase !== 'accepted') {
-      // Settled or deadline-expired: the replay changes nothing.
-      return state;
+    if (!sameIdentity(existing, acceptance)) throw new OperationOutcomeError('identity');
+    if (existing.phase === 'reserved') {
+      if (existing.deadlineAt !== undefined && acceptance.deadlineAt !== undefined &&
+          existing.deadlineAt !== acceptance.deadlineAt) throw new OperationOutcomeError('identity');
+      const records = new Map(state.records);
+      const record = { ...existing, phase: 'accepted' as const,
+        acceptedAt: acceptance.acceptedAt, deadlineAt: acceptance.deadlineAt };
+      const joined = state.earlyEvidence.findIndex((item) => matchesExpectation(record, item));
+      records.set(acceptance.operationId, joined < 0 ? record : settleRecord(record, state.earlyEvidence.slice(joined, joined + 1)[0] ?? evidenceFallback()));
+      return { records, earlyEvidence: joined < 0 ? state.earlyEvidence :
+        state.earlyEvidence.filter((_, index) => index !== joined) };
     }
-    if (
-      acceptance.deadlineAt === undefined ||
-      acceptance.deadlineAt === existing.deadlineAt
-    ) {
-      return state;
+    if (existing.phase !== 'accepted' || acceptance.deadlineAt === undefined ||
+        (existing.deadlineAt !== undefined && acceptance.deadlineAt <= existing.deadlineAt)) return state;
+    const records = new Map(state.records);
+    records.set(acceptance.operationId, { ...existing, deadlineAt: acceptance.deadlineAt });
+    return { records, earlyEvidence: state.earlyEvidence };
+  }
+  if ([...state.records.values()].some((record) => record.corr === acceptance.corr))
+    throw new OperationOutcomeError('identity');
+  // An unsolicited 202 has ALREADY happened. Throw an explicit capacity signal;
+  // the caller must keep its acceptance outside this store for reconciliation.
+  // Never return an unchanged state as if the engine declined the command.
+  const records = makeRoom(state.records);
+  const record = makeRecord(acceptance, 'accepted');
+  const joined = state.earlyEvidence.findIndex((item) => matchesExpectation(record, item));
+  records.set(acceptance.operationId, joined < 0 ? record : settleRecord(record, state.earlyEvidence.slice(joined, joined + 1)[0] ?? evidenceFallback()));
+  return { records, earlyEvidence: joined < 0 ? state.earlyEvidence :
+    state.earlyEvidence.filter((_, index) => index !== joined) };
+}
+
+function evidenceFallback(): TerminalEvidence {
+  throw new OperationOutcomeError('invalid');
+}
+function validText(value: unknown): value is string {
+  return typeof value === 'string' && value.trim().length > 0;
+}
+function validOptionalText(value: unknown): boolean {
+  return value === undefined || validText(value);
+}
+function validOptionalTime(value: unknown): boolean {
+  return value === undefined || (typeof value === 'number' && Number.isFinite(value));
+}
+function validateAcceptance(value: OperationAcceptance): void {
+  if (!validText(value.operationId) || !validText(value.corr) ||
+      !validText(value.topic) || !validOptionalText(value.resource) ||
+      !validOptionalText(value.event) || !validOptionalText(value.kind) ||
+      !validOptionalTime(value.acceptedAt) || !validOptionalTime(value.deadlineAt))
+    throw new OperationOutcomeError('invalid');
+}
+function sameIdentity(a: OperationRecord, b: OperationAcceptance): boolean {
+  return a.corr === b.corr && a.topic === b.topic && a.resource === b.resource &&
+    a.event === b.event && a.kind === b.kind &&
+    (a.acceptedAt === undefined || b.acceptedAt === undefined || a.acceptedAt === b.acceptedAt);
+}
+function makeRecord(value: OperationAcceptance, phase: 'reserved' | 'accepted'): OperationRecord {
+  return { operationId: value.operationId, corr: value.corr, topic: value.topic,
+    resource: value.resource, event: value.event, kind: value.kind,
+    acceptedAt: value.acceptedAt, deadlineAt: value.deadlineAt, phase };
+}
+function makeRoom(current: ReadonlyMap<string, OperationRecord>): Map<string, OperationRecord> {
+  const records = new Map(current);
+  if (records.size < OPERATION_RECORDS_MAX) return records;
+  for (const [id, record] of records) {
+    if (record.phase === 'applied' || record.phase === 'failed') {
+      records.delete(id);
+      return records;
     }
-    const replayed = new Map(state.records);
-    replayed.set(acceptance.operationId, {
-      ...existing,
-      deadlineAt: acceptance.deadlineAt,
-    });
-    return { records: replayed, earlyEvidence: state.earlyEvidence };
   }
-
-  const record: OperationRecord = {
-    operationId: acceptance.operationId,
-    corr: acceptance.corr,
-    topic: acceptance.topic,
-    phase: 'accepted',
-    resource: acceptance.resource,
-    event: acceptance.event,
-    kind: acceptance.kind,
-    acceptedAt: acceptance.acceptedAt,
-    deadlineAt: acceptance.deadlineAt,
-  };
-
-  // Terminal-before-acceptance race: consume the FIRST matching cached frame
-  // (earliest terminal evidence wins, matching post-acceptance behaviour).
-  const evidenceIndex = state.earlyEvidence.findIndex((cached) =>
-    matchesExpectation(record, cached),
-  );
-  const joined =
-    evidenceIndex >= 0 ? state.earlyEvidence[evidenceIndex] : undefined;
-  const records = new Map(state.records);
-  if (joined !== undefined) {
-    records.set(acceptance.operationId, settleRecord(record, joined));
-    const earlyEvidence = state.earlyEvidence.filter(
-      (_, index) => index !== evidenceIndex,
-    );
-    return {
-      records: evictSettled(records, OPERATION_RECORDS_MAX),
-      earlyEvidence,
-    };
-  }
-  records.set(acceptance.operationId, record);
-  return {
-    records: evictSettled(records, OPERATION_RECORDS_MAX),
-    earlyEvidence: state.earlyEvidence,
-  };
+  throw new OperationOutcomeError('capacity');
 }
 
 /**
  * Offer a realtime frame as terminal evidence. Frames with exact corr+topic
- * (+pinned resource/event) settle every waiting record with the frame's
+ * (+pinned resource/event) settle the waiting record with the frame's
  * verdict; a frame that matches an already-settled record is late noise (the
  * first terminal verdict stands) and is dropped; an unmatched frame is cached
  * for the acceptance that may follow. `job.progress` and uncorrelated frames
@@ -213,7 +245,10 @@ export function applyTerminalEvidence(
   state: OperationOutcomeState,
   evidence: TerminalEvidence,
 ): OperationOutcomeState {
-  if (evidence.corr === '') {
+  if (!validText(evidence.corr) || !validText(evidence.topic) ||
+      !validOptionalText(evidence.resource) || !validOptionalText(evidence.event) ||
+      !validOptionalTime(evidence.at) ||
+      !(['applied', 'failed'] as readonly unknown[]).includes(evidence.verdict)) {
     // Uncorrelated frames can never produce success.
     return state;
   }
@@ -228,7 +263,9 @@ export function applyTerminalEvidence(
     // deadline (the caller's reconciliation) may still settle them honestly.
     if (
       (record.phase === 'accepted' || record.phase === 'unknown') &&
-      matchesExpectation(record, evidence)
+      matchesExpectation(record, evidence) &&
+      ![...state.records.values()].some((other) => other.corr === record.corr &&
+        (other.phase === 'applied' || other.phase === 'failed'))
     ) {
       records.set(operationId, settleRecord(record, evidence));
       settledAny = true;
@@ -246,7 +283,7 @@ export function applyTerminalEvidence(
       return state;
     }
   }
-  if (state.earlyEvidence.some((cached) => sameEvidence(cached, evidence))) {
+  if (state.earlyEvidence.some((cached) => cached.corr === evidence.corr)) {
     return state;
   }
   const grown = [...state.earlyEvidence, evidence];
@@ -268,6 +305,7 @@ export function expireOperationDeadlines(
   state: OperationOutcomeState,
   nowMs: number,
 ): OperationOutcomeState {
+  if (!Number.isFinite(nowMs)) throw new OperationOutcomeError('invalid');
   const records = new Map<string, OperationRecord>();
   let expired = false;
   for (const [operationId, record] of state.records) {
@@ -327,40 +365,4 @@ function settleRecord(
     : { ...record, phase: evidence.verdict, settledAt: evidence.at };
 }
 
-/** Whether two evidence frames are identical in every field (cache dedupe). */
-function sameEvidence(a: TerminalEvidence, b: TerminalEvidence): boolean {
-  return (
-    a.corr === b.corr &&
-    a.topic === b.topic &&
-    a.event === b.event &&
-    a.resource === b.resource &&
-    a.verdict === b.verdict &&
-    a.at === b.at
-  );
-}
-
-/**
- * Enforce the records bound by dropping the OLDEST settled/expired records;
- * unresolved (`accepted`) records are never evicted. Iteration follows Map
- * insertion order (acceptance order), so "oldest" is well-defined.
- */
-function evictSettled(
-  records: ReadonlyMap<string, OperationRecord>,
-  max: number,
-): ReadonlyMap<string, OperationRecord> {
-  let overflow = records.size - max;
-  if (overflow <= 0) {
-    return records;
-  }
-  const next = new Map(records);
-  for (const [operationId, record] of records) {
-    if (overflow <= 0) {
-      break;
-    }
-    if (record.phase !== 'accepted') {
-      next.delete(operationId);
-      overflow -= 1;
-    }
-  }
-  return next;
-}
+/** Retained history is evicted only on admission, never on expiry. */

@@ -318,7 +318,7 @@ describe("AppLayout — producer vs management truth separation", () => {
   });
 
   it("never infers producer health from the management plane — every status word keeps the producer UNKNOWN", () => {
-    const words: ReadonlyArray<readonly [EngineEvents["status"], string]> = [
+    const words: readonly (readonly [EngineEvents["status"], string])[] = [
       ["open", "Connected"],
       ["connecting", "Connecting"],
       ["reconnecting", "Reconnecting"],
