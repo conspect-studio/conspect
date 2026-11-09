@@ -7,7 +7,7 @@ use crate::idr::NalFraming;
 pub struct AvcDecoderConfig {
     /// RFC 6381 profile/compatibility/level from the SPS bytes.
     pub codec: String,
-    /// AVCDecoderConfigurationRecord. Samples require four-byte NAL lengths.
+    /// `AVCDecoderConfigurationRecord`. Samples require four-byte NAL lengths.
     pub description: Vec<u8>,
 }
 
@@ -20,7 +20,11 @@ impl AvcDecoderConfig {
         if bytes.first() != Some(&1) {
             return Self::from_annex_b(bytes, false);
         }
-        if bytes.len() > MAX_CONFIG || bytes.len() < 7 || bytes[4] != 0xff || bytes[5] != 0xe1 {
+        if bytes.len() > MAX_CONFIG
+            || bytes.len() < 7
+            || bytes.get(4) != Some(&0xff)
+            || bytes.get(5) != Some(&0xe1)
+        {
             return None;
         }
         let mut offset = 6;
@@ -88,14 +92,17 @@ impl AvcDecoderConfig {
 
     fn from_sets(sps: &[u8], pps: &[u8]) -> Option<Self> {
         validate_sets(sps, pps)?;
-        let mut description = vec![1, sps[1], sps[2], sps[3], 0xff, 0xe1];
+        let &[profile, compatibility, level] = sps.get(1..4)? else {
+            return None;
+        };
+        let mut description = vec![1, profile, compatibility, level, 0xff, 0xe1];
         description.extend_from_slice(&u16::try_from(sps.len()).ok()?.to_be_bytes());
         description.extend_from_slice(sps);
         description.push(1);
         description.extend_from_slice(&u16::try_from(pps.len()).ok()?.to_be_bytes());
         description.extend_from_slice(pps);
-        if matches!(sps[1], 100 | 110 | 122 | 144) {
-            let rbsp = rbsp(&sps[1..])?;
+        if matches!(profile, 100 | 110 | 122 | 144) {
+            let rbsp = rbsp(sps.get(1..)?)?;
             let mut bits = Bits::new(&rbsp);
             bits.read(24)?;
             bits.ue()?;
@@ -113,14 +120,19 @@ impl AvcDecoderConfig {
             ]);
         }
         Some(Self {
-            codec: format!("avc1.{:02X}{:02X}{:02X}", sps[1], sps[2], sps[3]),
+            codec: format!("avc1.{profile:02X}{compatibility:02X}{level:02X}"),
             description,
         })
     }
 }
 
 fn record_nal<'a>(bytes: &'a [u8], offset: &mut usize) -> Option<&'a [u8]> {
-    let length = u16::from_be_bytes(bytes.get(*offset..*offset + 2)?.try_into().ok()?) as usize;
+    let length = usize::from(u16::from_be_bytes(
+        bytes
+            .get(*offset..offset.checked_add(2)?)?
+            .try_into()
+            .ok()?,
+    ));
     *offset += 2;
     let nal = bytes.get(*offset..offset.checked_add(length)?)?;
     *offset += length;
@@ -149,13 +161,13 @@ fn annex_b_nals(bytes: &[u8]) -> Option<Vec<&[u8]>> {
             pos += 1;
         }
         let mut end = pos;
-        while end > start && bytes[end - 1] == 0 {
+        while end > start && *bytes.get(end - 1)? == 0 {
             end -= 1;
         }
         if end == start || result.len() >= 128 {
             return None;
         }
-        result.push(&bytes[start..end]);
+        result.push(bytes.get(start..end)?);
         if pos == bytes.len() {
             break;
         }
@@ -169,7 +181,7 @@ fn rbsp(bytes: &[u8]) -> Option<Vec<u8>> {
     let mut zeros = 0;
     let mut pos = 0;
     while pos < bytes.len() {
-        let b = bytes[pos];
+        let b = *bytes.get(pos)?;
         if zeros >= 2 {
             if b == 3 {
                 if *bytes.get(pos + 1)? > 3 {
@@ -207,7 +219,8 @@ impl<'a> Bits<'a> {
         }
         let mut value = 0;
         for _ in 0..count {
-            value = (value << 1) | u32::from((self.bytes[self.pos / 8] >> (7 - self.pos % 8)) & 1);
+            let byte = *self.bytes.get(self.pos / 8)?;
+            value = (value << 1) | u32::from((byte >> (7 - self.pos % 8)) & 1);
             self.pos += 1;
         }
         Some(value)
@@ -253,6 +266,12 @@ fn validate_sets(sps: &[u8], pps: &[u8]) -> Option<(u32, u32)> {
     {
         return None;
     }
+    let sps_id = validate_sps(sps)?;
+    let pps_id = validate_pps(pps, sps_id)?;
+    Some((sps_id, pps_id))
+}
+
+fn validate_sps(sps: &[u8]) -> Option<u32> {
     let s = rbsp(sps.get(1..)?)?;
     let mut b = Bits::new(&s);
     let profile = b.read(8)?;
@@ -329,6 +348,10 @@ fn validate_sets(sps: &[u8], pps: &[u8]) -> Option<(u32, u32)> {
         vui(&mut b)?;
     }
     b.trailing()?;
+    Some(sps_id)
+}
+
+fn validate_pps(pps: &[u8], sps_id: u32) -> Option<u32> {
     let p = rbsp(pps.get(1..)?)?;
     let mut b = Bits::new(&p);
     let pps_id = b.ue()?;
@@ -355,7 +378,7 @@ fn validate_sets(sps: &[u8], pps: &[u8]) -> Option<(u32, u32)> {
     if b.remaining() == 0 {
         return None;
     }
-    if b.remaining() > 8 || (b.bytes[b.pos / 8] << (b.pos % 8)) != 0x80 {
+    if b.remaining() > 8 || (*b.bytes.get(b.pos / 8)? << (b.pos % 8)) != 0x80 {
         b.read(1)?;
         if b.read(1)? != 0 {
             return None;
@@ -363,7 +386,7 @@ fn validate_sets(sps: &[u8], pps: &[u8]) -> Option<(u32, u32)> {
         b.se()?;
     }
     b.trailing()?;
-    Some((sps_id, pps_id))
+    Some(pps_id)
 }
 fn hrd(b: &mut Bits<'_>) -> Option<()> {
     let count = b.ue()?;
