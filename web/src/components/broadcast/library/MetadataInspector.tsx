@@ -136,7 +136,7 @@ function Row({
   readonly children: ReactNode;
 }): JSX.Element {
   return (
-    <div className="flex min-w-0 flex-wrap items-baseline gap-x-3 gap-y-1 py-1">
+    <div className="flex min-w-0 flex-col gap-x-3 gap-y-1 py-1 md:flex-row md:items-baseline">
       <dt className="min-w-24 shrink-0 text-xs font-medium text-muted-foreground">
         {label}
       </dt>
@@ -253,7 +253,7 @@ export function MetadataInspector({
                 onNameChange(event.currentTarget.value);
               }}
               aria-label={t`Asset name`}
-              className="h-12"
+              className="h-12 min-w-0 max-w-full"
             />
           ) : (
             <span className="min-w-0 break-words">{asset.name}</span>
