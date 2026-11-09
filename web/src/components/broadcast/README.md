@@ -62,8 +62,8 @@ Derivation (`deriveProducerDisplay`, default `staleAfterMs` 3000):
 1. `failed` / `stopped` report their own state.
 2. No observed tick → **Unknown** ("No output tick observed") — even if the
    state enum claims `producing`.
-3. Non-finite tick/clock/threshold, nonpositive threshold, or non-finite age
-   → **Unknown** (invalid observation; no numeric age or green badge).
+3. Non-safe-integer tick/clock/threshold, nonpositive threshold, or unsafe age
+   → **Unknown** (visible invalid-observation explanation; no numeric age or green badge).
 4. A tick in the future → **Unknown** (clock skew; age unverifiable).
 5. Tick age ≥ `staleAfterMs` → **Frozen / stale** (with the real age).
 6. Fresh tick + `producing` → **Producing** (with the real age).

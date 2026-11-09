@@ -126,6 +126,17 @@ describe('ProducerStatus — rendering', () => {
     expect(screen.queryByText('Producing')).toBeNull();
   });
 
+  it('explains an invalid observation without reporting a producing output', () => {
+    render(
+      <TestProviders>
+        <ProducerStatus state="producing" lastTickAt={NaN} now={() => NOW} />
+      </TestProviders>,
+    );
+    expect(screen.getByText('Unknown')).toBeInTheDocument();
+    expect(screen.getByText('Output tick observation is invalid — age cannot be verified')).toBeInTheDocument();
+    expect(screen.queryByText('Producing')).toBeNull();
+  });
+
   it('shows failed even with a fresh tick, and stopped plainly', () => {
     render(
       <TestProviders>

@@ -99,6 +99,8 @@ export function ProducerStatus({
   const ageText =
     derived.reason === 'no-tick'
       ? t`No output tick observed`
+      : derived.reason === 'invalid-observation'
+        ? t`Output tick observation is invalid — age cannot be verified`
       : derived.reason === 'future-tick'
         ? t`Tick timestamp is ahead of the clock — age cannot be verified`
         : derived.ageMs !== null
