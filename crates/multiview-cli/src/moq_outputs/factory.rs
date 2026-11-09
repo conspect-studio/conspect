@@ -130,7 +130,7 @@ fn read_relay_endpoint(path: &std::path::Path) -> Result<url::Url, MoqReject> {
     #[cfg(unix)]
     let endpoint = {
         use std::io::Read;
-        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+        use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
         let file = std::fs::OpenOptions::new()
             .read(true)
             .custom_flags(
@@ -140,6 +140,10 @@ fn read_relay_endpoint(path: &std::path::Path) -> Result<url::Url, MoqReject> {
             .open(path)
             .map_err(|_| MoqReject::Unavailable)?;
         let meta = file.metadata().map_err(|_| MoqReject::Unavailable)?;
+        let uid = rustix::process::geteuid().as_raw();
+        if meta.uid() != 0 && meta.uid() != uid {
+            return Err(MoqReject::Unavailable);
+        }
         if !meta.is_file() || meta.permissions().mode() & 0o077 != 0 || meta.len() > 8192 {
             return Err(MoqReject::Unavailable);
         }

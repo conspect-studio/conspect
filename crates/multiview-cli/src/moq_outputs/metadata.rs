@@ -8,7 +8,7 @@ pub fn read_measured_startup<T: serde::de::DeserializeOwned>(
 ) -> Result<T, multiview_control::moq::MoqReject> {
     use multiview_control::moq::MoqReject;
     use std::io::Read;
-    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
     let file = std::fs::OpenOptions::new()
         .read(true)
         .custom_flags(
@@ -18,6 +18,10 @@ pub fn read_measured_startup<T: serde::de::DeserializeOwned>(
         .open(path)
         .map_err(|_| MoqReject::Unavailable)?;
     let meta = file.metadata().map_err(|_| MoqReject::Unavailable)?;
+    let uid = rustix::process::geteuid().as_raw();
+    if meta.uid() != 0 && meta.uid() != uid {
+        return Err(MoqReject::Unavailable);
+    }
     if !meta.is_file() || meta.permissions().mode() & 0o077 != 0 || meta.len() > 64 * 1024 {
         return Err(MoqReject::Unavailable);
     }
