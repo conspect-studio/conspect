@@ -266,18 +266,15 @@ impl SharedPublication {
     /// Opt into bounded trial cancellation on an existing non-base rendition.
     /// This never creates tracks/encoders and never changes independent audio.
     pub fn enable_trial_cancellation(&mut self, level: usize) -> Result<(), PublishError> {
-<<<<<<< ours
+        if self.terminal {
+            return Err(PublishError::Moq(moq_net::Error::Cancel));
+        }
         if level == 0 {
             return Err(PublishError::UnknownRendition(level));
         }
         self.adapters
             .get_mut(level)
             .ok_or(PublishError::UnknownRendition(level))?
-=======
-        if self.terminal { return Err(PublishError::Moq(moq_net::Error::Cancel)); }
-        if level == 0 { return Err(PublishError::UnknownRendition(level)); }
-        self.adapters.get_mut(level).ok_or(PublishError::UnknownRendition(level))?
->>>>>>> theirs
             .enable_trial_cancellation();
         Ok(())
     }
@@ -285,7 +282,9 @@ impl SharedPublication {
     /// Cancel only the selected video rung's current and bounded retained groups.
     /// The caller must separately enforce actual transport allocation limits.
     pub fn cancel_trial(&mut self, level: usize) -> Result<(), PublishError> {
-<<<<<<< ours
+        if self.terminal {
+            return Err(PublishError::Moq(moq_net::Error::Cancel));
+        }
         if level == 0 {
             return Err(PublishError::UnknownRendition(level));
         }
@@ -293,18 +292,15 @@ impl SharedPublication {
             .get_mut(level)
             .ok_or(PublishError::UnknownRendition(level))?
             .abort_group();
-=======
-        if self.terminal { return Err(PublishError::Moq(moq_net::Error::Cancel)); }
-        if level == 0 { return Err(PublishError::UnknownRendition(level)); }
-        self.adapters.get_mut(level).ok_or(PublishError::UnknownRendition(level))?.abort_group();
->>>>>>> theirs
         Ok(())
     }
 
     /// Publish one already-admitted window to one rendition. Never encodes and never copies
     /// the payload: the shared `Bytes` allocation stays shared through the transport.
     pub fn publish(&mut self, level: usize, window: &Window) -> Result<(), PublishError> {
-        if self.terminal { return Err(PublishError::Moq(moq_net::Error::Cancel)); }
+        if self.terminal {
+            return Err(PublishError::Moq(moq_net::Error::Cancel));
+        }
         let adapter = self
             .adapters
             .get_mut(level)
@@ -331,7 +327,9 @@ impl SharedPublication {
     /// Publish the independent audio for one tick. Audio is written once per tick regardless
     /// of which rungs are active, and a rendition switch never touches it.
     pub fn publish_audio(&mut self, name: &str, packets: &[Packet]) -> Result<(), PublishError> {
-        if self.terminal { return Err(PublishError::Moq(moq_net::Error::Cancel)); }
+        if self.terminal {
+            return Err(PublishError::Moq(moq_net::Error::Cancel));
+        }
         let previous = self.audio_last_pts.get(name).copied();
         let mut last = previous;
         let track = self
@@ -355,9 +353,13 @@ impl SharedPublication {
             let result = (|| -> Result<(), moq_net::Error> {
                 let mut group = track.append_group()?;
                 group.write_frame(timestamp, serialized)?;
-                group.finish()?; Ok(())
+                group.finish()?;
+                Ok(())
             })();
-            if let Err(error) = result { self.terminate(); return Err(PublishError::Moq(error)); }
+            if let Err(error) = result {
+                self.terminate();
+                return Err(PublishError::Moq(error));
+            }
         }
         if let Some(last) = last {
             self.audio_last_pts.insert(name.to_string(), last);
@@ -376,11 +378,14 @@ impl SharedPublication {
         let mut stalled = levels.to_vec();
         stalled.sort_unstable();
         stalled.dedup();
-        if self.terminal { return Err(PublishError::Moq(moq_net::Error::Cancel)); }
+        if self.terminal {
+            return Err(PublishError::Moq(moq_net::Error::Cancel));
+        }
         let data = self.ladder.catalog_with_stalled(&stalled)?.to_vec()?;
         let timestamp = pts_zero()?;
         if let Err(error) = self.catalog.write_frame(timestamp, data) {
-            self.terminate(); return Err(PublishError::Moq(error));
+            self.terminate();
+            return Err(PublishError::Moq(error));
         }
         self.stalled = stalled;
         Ok(())
@@ -389,7 +394,9 @@ impl SharedPublication {
     /// Signal a lost or gapped window for one rendition: its next published window must
     /// start at a verified RAP. Other renditions are unaffected, and production continues.
     pub fn discontinuity(&mut self, level: usize) -> Result<(), PublishError> {
-        if self.terminal { return Err(PublishError::Moq(moq_net::Error::Cancel)); }
+        if self.terminal {
+            return Err(PublishError::Moq(moq_net::Error::Cancel));
+        }
         let adapter = self
             .adapters
             .get_mut(level)
@@ -402,9 +409,16 @@ impl SharedPublication {
     /// visible catalog/audio update. This is NOT an ordinary ABR downshift.
     pub fn terminate(&mut self) {
         self.terminal = true;
-        for adapter in &mut self.adapters { adapter.abort_group(); adapter.revoke(); }
-        for track in &self.video { let _ = track.clone().abort(moq_net::Error::Cancel); }
-        for track in &self.audio { let _ = track.1.clone().abort(moq_net::Error::Cancel); }
+        for adapter in &mut self.adapters {
+            adapter.abort_group();
+            adapter.revoke();
+        }
+        for track in &self.video {
+            let _ = track.clone().abort(moq_net::Error::Cancel);
+        }
+        for track in &self.audio {
+            let _ = track.1.clone().abort(moq_net::Error::Cancel);
+        }
         let _ = self.catalog.clone().abort(moq_net::Error::Cancel);
         let _ = self.ladder_track.clone().abort(moq_net::Error::Cancel);
     }
