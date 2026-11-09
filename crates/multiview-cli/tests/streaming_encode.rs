@@ -231,6 +231,7 @@ async fn live_blocked_sink_stays_bounded_and_never_stalls() {
                 max_ticks: None,
                 policy: SendPolicy::DropOnOverload,
                 runners: vec![Box::new(blocked_runner)],
+                consumer_fault_after_ticks: None,
                 hot_tick_observer: Some(Arc::clone(&hot_tick)),
             },
             &stop,
@@ -335,6 +336,7 @@ async fn offline_block_for_exact_delivers_all_n_frames() {
                 max_ticks: Some(TICKS),
                 policy: SendPolicy::BlockForExact,
                 runners: vec![Box::new(slow_runner)],
+                consumer_fault_after_ticks: None,
                 hot_tick_observer: None,
             },
             &stop,
@@ -407,6 +409,7 @@ async fn frame_zero_is_encoded_while_engine_still_ticking() {
                 max_ticks: Some(TICKS),
                 policy: SendPolicy::BlockForExact,
                 runners: vec![Box::new(runner)],
+                consumer_fault_after_ticks: None,
                 hot_tick_observer: Some(Arc::clone(&hot_tick)),
             },
             &stop,
@@ -478,6 +481,7 @@ async fn clean_stop_closes_sinks_for_finalisation() {
                 max_ticks: Some(MAX),
                 policy: SendPolicy::DropOnOverload,
                 runners: vec![Box::new(runner)],
+                consumer_fault_after_ticks: None,
                 hot_tick_observer: None,
             },
             &stop,
@@ -568,6 +572,7 @@ fn wedged_sink_does_not_hang_teardown() {
                         max_ticks: Some(TICKS),
                         policy: SendPolicy::BlockForExact,
                         runners: vec![Box::new(healthy), Box::new(wedged)],
+                        consumer_fault_after_ticks: None,
                         hot_tick_observer: None,
                     },
                     &stop,
@@ -723,6 +728,7 @@ async fn rt8b_audio_stays_lip_synced_to_the_tick_index_under_video_drops() {
                 max_ticks: None,
                 policy: SendPolicy::DropOnOverload,
                 runners: vec![Box::new(slow_runner)],
+                consumer_fault_after_ticks: None,
                 hot_tick_observer: Some(Arc::clone(&hot_tick)),
             },
             &stop,
@@ -789,5 +795,433 @@ fn assert_audio_tracks_tick_index(ticks: u64, dropped: u64, cumulative: u64, per
         "RT-8b: cumulative audio {cumulative} must track the tick ideal {tick_ideal} \
          (within a bounded {tail_slack}-sample in-flight tail) — the bus must catch up across \
          every dropped tick, not trail by the dropped span"
+    );
+}
+
+// ===================== FATAL-CONSUMER REGRESSIONS (t63) =====================
+//
+// The minimal incident patch (fatal bake-consumer signal) proves, through the
+// REAL streaming core (real engine clock, real bake consumer, real FFV1
+// encoder — only the sinks are the standard ADR-0025 fakes), that a dead
+// consumer STOPS the run at a tick boundary and fails it with the exact cause,
+// instead of ticking on with a healthy UI over dead outputs.
+//
+// FFV1 is the codec: LGPL-clean, intra-only, zero-delay — its packets carry
+// DTS == PTS == tick on the deployed base, so windows admit and REAL output
+// provably flows before any fault. (mpeg2video, the branch-tip default, has
+// a one-frame DTS delay that kills the consumer through the dispatcher's
+// window protocol on this base — a SEPARATE, root-caused repair.)
+
+/// A tiny single-tile FFV1 config: same shape as [`config_text`] with the
+/// zero-delay LGPL codec.
+fn fatal_config_text() -> String {
+    r##"
+schema_version = 1
+
+[canvas]
+width = 64
+height = 64
+fps = "25/1"
+pixel_format = "nv12"
+background = "#101014"
+[canvas.color]
+profile = "sdr-bt709-limited"
+
+[layout]
+kind = "grid"
+columns = ["1fr"]
+rows = ["1fr"]
+areas = ["a"]
+
+[[sources]]
+id = "in_a"
+kind = "test"
+
+[[cells]]
+id = "cell_a"
+area = "a"
+[cells.source]
+input_id = "in_a"
+
+[[outputs]]
+kind = "hls"
+path = "/tmp/multiview-fatal-test/index.m3u8"
+codec = "ffv1"
+segment_ms = 1000
+"##
+    .to_owned()
+}
+
+fn build_fatal_pipeline() -> Pipeline {
+    let config = MultiviewConfig::load_from_toml(&fatal_config_text()).expect("parse config");
+    config.validate().expect("config validates");
+    Pipeline::build(&config).expect("build real pipeline")
+}
+
+/// Like [`spawn_clock_driver`], but paced (one 40 ms tick advance per `period`
+/// of wall time) so the consumer's real encode keeps up — the fatal tests
+/// measure the SIGNAL, not shed pressure.
+fn spawn_fatal_clock_paced(
+    clock: Arc<ManualTimeSource>,
+    stop: Arc<std::sync::atomic::AtomicBool>,
+    period: std::time::Duration,
+) {
+    std::thread::spawn(move || {
+        while !stop.load(Ordering::Acquire) {
+            clock.advance(std::time::Duration::from_millis(40));
+            std::thread::sleep(period);
+        }
+    });
+}
+
+/// FATAL REGRESSION 1 — mid-run death after REAL output: the consumer dies
+/// mid-stream (the seam kills its input after 8 processed items). The sink
+/// must have received REAL coded packets first (outputs were alive, then
+/// died — the incident shape), the run must STOP at a tick boundary far
+/// short of the budget, the atomic stop must be raised (the signal systemd's
+/// Restart=always restarts on), and the run must FAIL with the exact typed
+/// cause — never a healthy report over dead outputs.
+#[tokio::test(flavor = "current_thread")]
+async fn fatal_consumer_midrun_stops_run_and_returns_exact_error() {
+    const FAULT_AFTER: u64 = 8;
+    const MAX_TICKS: u64 = 10_000;
+    const EARLY_STOP_BOUND: u64 = 2_000;
+
+    let mut pipeline = build_fatal_pipeline();
+
+    let received = Arc::new(AtomicUsize::new(0));
+    let received_in_sink = Arc::clone(&received);
+    let runner = move |rx: Receiver<EncodedPacket>| -> TestSinkOutcome {
+        let mut frames = 0;
+        while let Ok(_packet) = rx.recv() {
+            received_in_sink.fetch_add(1, Ordering::Release);
+            frames += 1;
+        }
+        TestSinkOutcome { frames }
+    };
+
+    let hot_tick = Arc::new(AtomicU64::new(0));
+    let clock = Arc::new(ManualTimeSource::new());
+    let stop = StopSignal::new();
+    let driver_stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    spawn_fatal_clock_paced(
+        Arc::clone(&clock),
+        Arc::clone(&driver_stop),
+        std::time::Duration::from_millis(25),
+    );
+
+    let clock_concrete: Arc<ManualTimeSource> = Arc::clone(&clock);
+    let ts: Arc<dyn TimeSource> = clock_concrete;
+    let result = pipeline
+        .drive_streaming_for_test(
+            StreamTestParams {
+                time: ts,
+                pacer: CooperativePacer,
+                max_ticks: Some(MAX_TICKS),
+                policy: SendPolicy::DropOnOverload,
+                runners: vec![Box::new(runner)],
+                consumer_fault_after_ticks: Some(FAULT_AFTER),
+                hot_tick_observer: Some(Arc::clone(&hot_tick)),
+            },
+            &stop,
+        )
+        .await;
+    driver_stop.store(true, Ordering::Release);
+
+    let err = result.expect_err("a dead consumer must fail the run");
+    match &err {
+        multiview_cli::pipeline::PipelineError::Output { kind, reason } => {
+            assert_eq!(*kind, "bake-consumer");
+            assert!(
+                reason.contains(&format!("after {FAULT_AFTER} hot item")),
+                "the exact fatal cause must propagate, got {reason:?}"
+            );
+        }
+        other => panic!("expected a typed output error, got {other:?}"),
+    }
+    assert!(
+        stop.is_stopped(),
+        "the fatal consumer must raise the atomic stop signal"
+    );
+    let ticks = hot_tick.load(Ordering::Acquire);
+    assert!(
+        ticks < EARLY_STOP_BOUND,
+        "the run must stop at a tick boundary near the fault, not run {MAX_TICKS} ticks (emitted {ticks})"
+    );
+    let sink_packets = received.load(Ordering::Acquire);
+    assert!(
+        sink_packets >= 1,
+        "the consumer must have produced real encoded output before dying (received {sink_packets})"
+    );
+}
+
+/// FATAL REGRESSION 2 — startup death: a consumer that dies AT START must fail
+/// the run through the same atomic signal, even under block-for-exact. The
+/// consumer's OWN finalization error (it ended with no complete window) takes
+/// precedence over the seam's injected reason — the exact real cause is what
+/// must propagate.
+#[tokio::test(flavor = "current_thread")]
+async fn fatal_consumer_at_start_fails_run_immediately() {
+    const MAX_TICKS: u64 = 10_000;
+    const EARLY_STOP_BOUND: u64 = 100;
+
+    let mut pipeline = build_fatal_pipeline();
+    let received = Arc::new(AtomicUsize::new(0));
+    let received_in_sink = Arc::clone(&received);
+    let runner = move |rx: Receiver<EncodedPacket>| -> TestSinkOutcome {
+        let mut frames = 0;
+        while let Ok(_packet) = rx.recv() {
+            received_in_sink.fetch_add(1, Ordering::Release);
+            frames += 1;
+        }
+        TestSinkOutcome { frames }
+    };
+
+    let hot_tick = Arc::new(AtomicU64::new(0));
+    let clock = Arc::new(ManualTimeSource::new());
+    let stop = StopSignal::new();
+    let driver_stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    spawn_fatal_clock_paced(
+        Arc::clone(&clock),
+        Arc::clone(&driver_stop),
+        std::time::Duration::from_millis(25),
+    );
+
+    let clock_concrete: Arc<ManualTimeSource> = Arc::clone(&clock);
+    let ts: Arc<dyn TimeSource> = clock_concrete;
+    let result = pipeline
+        .drive_streaming_for_test(
+            StreamTestParams {
+                time: ts,
+                pacer: CooperativePacer,
+                max_ticks: Some(MAX_TICKS),
+                policy: SendPolicy::BlockForExact,
+                runners: vec![Box::new(runner)],
+                consumer_fault_after_ticks: Some(0),
+                hot_tick_observer: Some(Arc::clone(&hot_tick)),
+            },
+            &stop,
+        )
+        .await;
+    driver_stop.store(true, Ordering::Release);
+
+    let err = result.expect_err("a consumer dead at start must fail the run");
+    match &err {
+        multiview_cli::pipeline::PipelineError::Output { kind, reason } => {
+            assert!(
+                *kind == "dispatch" || *kind == "bake-consumer",
+                "unexpected failure kind {kind:?} ({reason:?})"
+            );
+            assert!(
+                reason.contains("test consumer fault")
+                    || reason.contains("incomplete final window"),
+                "the cause must name the consumer's real failure, got {reason:?}"
+            );
+        }
+        other => panic!("expected a typed output error, got {other:?}"),
+    }
+    assert!(
+        stop.is_stopped(),
+        "the fatal consumer must raise the stop signal"
+    );
+    let ticks = hot_tick.load(Ordering::Acquire);
+    assert!(
+        ticks < EARLY_STOP_BOUND,
+        "the run must stop almost immediately, not run {MAX_TICKS} ticks (emitted {ticks})"
+    );
+    assert_eq!(
+        received.load(Ordering::Acquire),
+        0,
+        "a consumer dead at start encodes nothing"
+    );
+}
+
+/// FATAL REGRESSION 3 — NO FALSE FAILURE on a full hot queue: the fatal
+/// signal must fire ONLY on a dead consumer, never on queue pressure. Under
+/// block-for-exact the hot queue runs FULL for the entire run (the engine
+/// blocks on each send until the consumer takes it — the whole point of the
+/// policy); the run must complete exact-N, raise no stop, and return no
+/// error. The drop-on-overload Full arm (shed and COUNT, never fatal) is
+/// pinned by the unit gate test; its end-to-end shed variant additionally
+/// requires the tick-gap tolerance repair (fix/broadcast-output-contract,
+/// separately reviewed) because on this base any real shed hands the
+/// consumer gapped ticks and the deployed strict-tick encoder rejects them
+/// — a pre-existing, root-caused death this minimal patch turns into a
+/// visible fast failure + restart (the acknowledged interim posture).
+#[tokio::test(flavor = "current_thread")]
+async fn full_hot_queue_never_fails_the_run() {
+    const TICKS: u64 = 40;
+
+    let mut pipeline = build_fatal_pipeline();
+    let received = Arc::new(AtomicUsize::new(0));
+    let received_in_sink = Arc::clone(&received);
+    let runner = move |rx: Receiver<EncodedPacket>| -> TestSinkOutcome {
+        let mut frames = 0;
+        while let Ok(_packet) = rx.recv() {
+            received_in_sink.fetch_add(1, Ordering::Release);
+            frames += 1;
+        }
+        TestSinkOutcome { frames }
+    };
+
+    let clock = Arc::new(ManualTimeSource::new());
+    let stop = StopSignal::new();
+    let driver_stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    // ~4x real time: the engine races ahead of the consumer, so the hot queue
+    // sits at its cap and the engine blocks on (nearly) every send — sustained
+    // queue-full pressure for the whole run.
+    spawn_fatal_clock_paced(
+        Arc::clone(&clock),
+        Arc::clone(&driver_stop),
+        std::time::Duration::from_millis(10),
+    );
+
+    let clock_concrete: Arc<ManualTimeSource> = Arc::clone(&clock);
+    let ts: Arc<dyn TimeSource> = clock_concrete;
+    let result = pipeline
+        .drive_streaming_for_test(
+            StreamTestParams {
+                time: ts,
+                pacer: CooperativePacer,
+                max_ticks: Some(TICKS),
+                policy: SendPolicy::BlockForExact,
+                runners: vec![Box::new(runner)],
+                consumer_fault_after_ticks: None,
+                hot_tick_observer: None,
+            },
+            &stop,
+        )
+        .await;
+    driver_stop.store(true, Ordering::Release);
+
+    let out = result.expect("queue-full pressure must NEVER fail the run");
+    assert_eq!(
+        out.report.frames, TICKS,
+        "block-for-exact emits every tick despite the full queue"
+    );
+    assert_eq!(
+        out.report.dropped, 0,
+        "block-for-exact never drops — a full queue back-pressures the renderer"
+    );
+    assert!(
+        !stop.is_stopped(),
+        "a full hot queue must not raise the fatal stop"
+    );
+    assert_eq!(
+        out.sink_frames,
+        vec![usize::try_from(TICKS).unwrap()],
+        "every frame reached the sink — full queue pressure, zero loss"
+    );
+}
+
+/// FATAL REGRESSION 4 — finite exit with a wedged sink: a sink that wedges in
+/// its finalise must not hang teardown — the bounded (2 s) sink grace detaches
+/// and REPORTS it while the healthy co-sink finalises all its packets. The
+/// plain (non-tokio) watchdog on the test thread proves teardown RETURNS.
+#[test]
+fn wedged_sink_teardown_is_finite_and_reported() {
+    const TICKS: u64 = 30;
+    type DriveResult =
+        Result<multiview_cli::pipeline::StreamTestResult, multiview_cli::pipeline::PipelineError>;
+
+    let healthy_count = Arc::new(AtomicUsize::new(0));
+    let reached_wedge = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let healthy_in = Arc::clone(&healthy_count);
+    let reached_in = Arc::clone(&reached_wedge);
+
+    // Two FFV1 outputs for the two sinks: the per-binding delivery maps each
+    // injected sink runner 1:1 to an output binding (with its own recovery
+    // gate), so a two-sink scenario needs two outputs. Both share the one
+    // FFV1 rendition (encode-once-mux-many, invariant #7).
+    let text = fatal_config_text()
+        + r#"
+[[outputs]]
+kind = "hls"
+path = "/tmp/multiview-fatal-test/second.m3u8"
+codec = "ffv1"
+segment_ms = 1000
+"#;
+    let config = MultiviewConfig::load_from_toml(&text).expect("parse config");
+    config.validate().expect("config validates");
+
+    let (done_tx, done_rx) = std::sync::mpsc::channel::<DriveResult>();
+    std::thread::spawn(move || {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("build runtime");
+        let result = rt.block_on(async move {
+            let mut pipeline = Pipeline::build(&config).expect("build pipeline");
+
+            let healthy = move |rx: Receiver<EncodedPacket>| -> TestSinkOutcome {
+                let mut n = 0_usize;
+                while rx.recv().is_ok() {
+                    n += 1;
+                }
+                healthy_in.store(n, Ordering::Release);
+                TestSinkOutcome { frames: n }
+            };
+            let wedged = move |rx: Receiver<EncodedPacket>| -> TestSinkOutcome {
+                while rx.recv().is_ok() {}
+                reached_in.store(true, Ordering::Release);
+                loop {
+                    std::thread::sleep(std::time::Duration::from_secs(3600));
+                }
+            };
+
+            let clock = Arc::new(ManualTimeSource::new());
+            let stop = StopSignal::new();
+            let driver_stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            spawn_fatal_clock_paced(
+                Arc::clone(&clock),
+                Arc::clone(&driver_stop),
+                std::time::Duration::from_millis(25),
+            );
+            let ts: Arc<dyn TimeSource> = clock;
+
+            let out = pipeline
+                .drive_streaming_for_test(
+                    StreamTestParams {
+                        time: ts,
+                        pacer: CooperativePacer,
+                        max_ticks: Some(TICKS),
+                        policy: SendPolicy::BlockForExact,
+                        runners: vec![Box::new(healthy), Box::new(wedged)],
+                        consumer_fault_after_ticks: None,
+                        hot_tick_observer: None,
+                    },
+                    &stop,
+                )
+                .await;
+            driver_stop.store(true, Ordering::Release);
+            out
+        });
+        let _ = done_tx.send(result);
+    });
+
+    let result = done_rx
+        .recv_timeout(std::time::Duration::from_secs(8))
+        .expect(
+            "teardown must complete within the bound — a wedged sink must NOT hang stop (inv #1)",
+        )
+        .expect("drive streaming");
+
+    assert!(
+        reached_wedge.load(Ordering::Acquire),
+        "the wedged sink must have drained to end-of-program before wedging"
+    );
+    assert!(
+        result
+            .report
+            .outputs
+            .iter()
+            .any(|line| line.to_ascii_uppercase().contains("WEDGED")),
+        "the wedged sink must be reported in the run outputs, got {:?}",
+        result.report.outputs
+    );
+    assert_eq!(
+        healthy_count.load(Ordering::Acquire),
+        usize::try_from(TICKS).unwrap(),
+        "the healthy sink must finalise all N packets despite a wedged co-sink"
     );
 }

@@ -248,6 +248,12 @@ struct StreamPlan {
     /// One runner per output sink, each driving its sink to completion off-hot,
     /// paired with how the consumer sends to it (bounded wait vs drop-when-full).
     runners: Vec<(SinkRunner, SinkSendPolicy)>,
+    /// Fatal-consumer regression seam (issue #202/#203 follow-up): when set, the
+    /// bake consumer dies after successfully processing this many hot items —
+    /// replaying the production incident (a mid-stream encoder failure that used
+    /// to leave a healthy UI over dead outputs) deterministically. `None` on BOTH
+    /// production paths; only the `drive_streaming_for_test` seam sets it.
+    consumer_fault_after_ticks: Option<u64>,
     /// Incremented once per emitted tick on the hot loop when present, so a test
     /// can prove a frame was encoded while the engine was still ticking. `None`
     /// on the production paths.
@@ -3378,6 +3384,7 @@ impl Pipeline {
         let plan = StreamPlan {
             policy: SendPolicy::BlockForExact,
             runners: self.build_sink_runners(false),
+            consumer_fault_after_ticks: None,
             hot_tick_observer: None,
         };
         let preview = crate::preview::program_slot();
@@ -3468,6 +3475,7 @@ impl Pipeline {
         let plan = StreamPlan {
             policy: SendPolicy::DropOnOverload,
             runners: self.build_sink_runners(true),
+            consumer_fault_after_ticks: None,
             hot_tick_observer: tick_observer,
         };
         let out = self
@@ -3657,6 +3665,7 @@ impl Pipeline {
             max_ticks,
             policy,
             runners,
+            consumer_fault_after_ticks,
             hot_tick_observer,
         } = params;
         let runners: Vec<(SinkRunner, SinkSendPolicy)> = runners
@@ -3689,6 +3698,7 @@ impl Pipeline {
         let plan = StreamPlan {
             policy,
             runners,
+            consumer_fault_after_ticks,
             hot_tick_observer,
         };
         // The test seam serves no UI: throwaway publisher/preview + no-op control.
@@ -3752,6 +3762,7 @@ impl Pipeline {
         let StreamPlan {
             policy,
             runners,
+            consumer_fault_after_ticks,
             hot_tick_observer,
         } = plan;
         let clock =
@@ -4188,6 +4199,7 @@ impl Pipeline {
             tick_span(self.encode_cfg.cadence),
             self.encode_cfg.cadence,
             policy,
+            consumer_fault_after_ticks,
             video_encoders,
             self.output_video_keys.clone(),
             self.output_audio_tracks.clone(),
@@ -5171,6 +5183,13 @@ pub struct StreamTestParams<P> {
     pub policy: SendPolicy,
     /// One fake sink runner per output, run on its own off-hot-path thread.
     pub runners: Vec<TestSinkRunner>,
+    /// Fatal-consumer regression seam: when `Some(n)`, the bake consumer dies
+    /// after successfully processing `n` hot items, replaying a mid-stream
+    /// encoder failure deterministically (the run must then STOP at a tick
+    /// boundary and return the consumer's exact error instead of reporting a
+    /// healthy report over dead outputs). `None` (all existing uses) keeps the
+    /// consumer healthy for the whole run.
+    pub consumer_fault_after_ticks: Option<u64>,
     /// Optional hot-loop tick observer (incremented once per emitted tick).
     pub hot_tick_observer: Option<Arc<AtomicU64>>,
 }
@@ -5208,6 +5227,54 @@ fn bump_occupancy(in_flight: &AtomicI64, peak: &AtomicUsize) {
             ) {
                 Ok(_) => break,
                 Err(prev) => observed = prev,
+            }
+        }
+    }
+}
+
+/// The bake consumer's hot receive end: the real bounded channel, or — under
+/// the fatal-consumer regression seam (`StreamPlan::consumer_fault_after_ticks`)
+/// — a counting forwarder's channel that ends (and reports a fault) after the
+/// configured number of successfully processed items, replaying a mid-stream
+/// encoder failure deterministically.
+enum ConsumerHotSource {
+    /// The real hot queue (both production paths, and every test that keeps the
+    /// consumer healthy).
+    Real(Receiver<StreamItem>),
+    /// The forwarder's channel plus its completion flag: `true` means the
+    /// forwarder armed the fault (the consumer processed its budget of items
+    /// and then lost its input); `false` means the hot queue ended normally.
+    Faulted {
+        /// The forwarded receive end the consumer pulls instead.
+        hot: Receiver<StreamItem>,
+        /// Whether the seam fault fired (or the queue ended without faulting).
+        forwarder: JoinHandle<bool>,
+    },
+}
+
+impl ConsumerHotSource {
+    /// The receiver the consumer pulls: the real queue, or the forwarder's.
+    fn hot(&self) -> &Receiver<StreamItem> {
+        match self {
+            Self::Real(hot) => hot,
+            Self::Faulted { hot, .. } => hot,
+        }
+    }
+
+    /// Whether the fault seam fired for this source. `false` when the consumer
+    /// ran on the real queue (it can never fault synthetically).
+    fn faulted(self) -> bool {
+        match self {
+            Self::Real(_) => false,
+            Self::Faulted { hot, forwarder } => {
+                // Drop the forwarded receive end FIRST: if the consumer ended
+                // early (its own real failure) with items still queued, the
+                // forwarder may be blocked sending into this channel — dropping
+                // the receiver unblocks it (its send fails, reporting no fault)
+                // so this join can never wedge teardown and mask the consumer's
+                // real error with the bounded-teardown timeout.
+                drop(hot);
+                forwarder.join().unwrap_or(false)
             }
         }
     }
@@ -5260,6 +5327,7 @@ impl StreamEgress {
         media_span: Duration,
         cadence: Rational,
         policy: SendPolicy,
+        consumer_fault_after_ticks: Option<u64>,
         video_encoders: Vec<VideoRenditionEncoder>,
         output_video_keys: Vec<usize>,
         output_audio_tracks: Vec<Vec<usize>>,
@@ -5357,9 +5425,54 @@ impl StreamEgress {
         let consumer = builder
             .spawn(move || {
                 let _consumer_guard = consumer_guard;
+                // The hot receive end the consumer pulls: the real bounded queue,
+                // or — under the fatal-consumer regression seam — a counting
+                // forwarder's channel that ends (and reports a fault) after the
+                // configured number of successfully processed items.
+                let hot_source = match consumer_fault_after_ticks {
+                    None => ConsumerHotSource::Real(hot_rx),
+                    Some(after) => {
+                        // Replay a mid-stream encoder failure: forward `after`
+                        // items so the consumer provably produces real output
+                        // first, then drop the real queue end (the consumer loses
+                        // its input exactly like a dead encoder) and report the
+                        // fault through the forwarder's completion flag.
+                        let (fwd_tx, fwd_rx) =
+                            std::sync::mpsc::sync_channel::<StreamItem>(policy.queue_cap());
+                        let forwarder = std::thread::Builder::new()
+                            .name("multiview-bake-fault".to_owned())
+                            .spawn(move || {
+                                let mut forwarded = 0u64;
+                                while let Ok(item) = hot_rx.recv() {
+                                    if forwarded >= after {
+                                        return true;
+                                    }
+                                    forwarded += 1;
+                                    if fwd_tx.send(item).is_err() {
+                                        // The consumer went away first (its own
+                                        // real failure): not a seam fault.
+                                        return false;
+                                    }
+                                }
+                                false
+                            })
+                            .unwrap_or_else(|_| {
+                                // The forwarder owns the real hot queue end; if
+                                // its thread could not spawn, that end is dropped
+                                // and the consumer sees end-of-input at once.
+                                // Report the fault rather than a silently
+                                // healthy short run.
+                                std::thread::spawn(|| true)
+                            });
+                        ConsumerHotSource::Faulted {
+                            hot: fwd_rx,
+                            forwarder,
+                        }
+                    }
+                };
                 let result = consumer_main(
                     ctx,
-                    &hot_rx,
+                    hot_source.hot(),
                     delivery,
                     media_span,
                     cadence,
@@ -5379,6 +5492,21 @@ impl StreamEgress {
                     aes67_send_handles,
                     &consumer_in_flight,
                 );
+                // The seam's fault fires only when the consumer itself finished
+                // healthy on its (shortened) input: its real outcome is replaced
+                // by the fatal error the run must propagate. A consumer that
+                // failed on its own keeps its exact original error.
+                let result = if hot_source.faulted() && result.is_ok() {
+                    Err(PipelineError::Output {
+                        kind: "bake-consumer",
+                        reason: format!(
+                            "test consumer fault after {} hot item(s)",
+                            consumer_fault_after_ticks.unwrap_or(0),
+                        ),
+                    })
+                } else {
+                    result
+                };
                 if let Err(error) = &result {
                     tracing::error!(error = %error, "fatal encoded-output consumer failure");
                     consumer_fatal.store(true, Ordering::Release);
