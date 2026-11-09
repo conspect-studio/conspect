@@ -103,6 +103,8 @@ pub async fn bind_and_serve<F>(
     publisher: Arc<EnginePublisher<EngineStateSnapshot, Event>>,
     commands: CommandSender,
     preview: SharedPreview,
+    switcher: Option<multiview_engine::switcher_control::SwitcherControl>,
+    switcher_leases: Option<Arc<multiview_control::source_demand::SwitcherPreviewLeases>>,
     // The WHEP focus transport (ADR-P006), already cap-decorated. `None` keeps
     // the default `NoWhep` (a pure build sheds every focus to the JPEG ladder).
     whep: Option<multiview_control::SharedWhep>,
@@ -272,6 +274,12 @@ where
     )
     .with_preview(preview)
     .with_warning_store(warnings);
+    if let Some(switcher) = switcher {
+        state = state.with_switcher(switcher);
+    }
+    if let Some(leases) = switcher_leases {
+        state.switcher_preview_lease = leases;
+    }
     let mut break_provider: Option<multiview_control::source_events::SharedSourceBreakProvider> =
         None;
     if let Some(demand) = crate::source_demand::installed_control_demand() {
@@ -4152,6 +4160,8 @@ input_id = "in_b"
             publisher,
             commands,
             multiview_control::no_preview(),
+            None, // switcher: absent unless a real paired bus is attached
+            None, // switcher lease owner absent
             // whep: the default (no native transport) — a pure build path.
             None,
             None,
@@ -4233,6 +4243,8 @@ input_id = "in_b"
             publisher,
             commands,
             multiview_control::no_preview(),
+            None, // switcher absent (legacy path)
+            None, // switcher lease owner absent
             None,
             None,
             None,
@@ -4329,6 +4341,8 @@ input_id = "in_b"
             publisher,
             commands,
             multiview_control::no_preview(),
+            None, // switcher absent (legacy path)
+            None, // switcher lease owner absent
             None,
             None,
             None,

@@ -487,6 +487,8 @@ async fn a_generic_source_put_of_automation_updates_the_pins() {
         publisher,
         commands,
         multiview_control::no_preview(),
+        None, // switcher absent (legacy path)
+        None, // switcher lease owner absent
         None,
         None,
         None,

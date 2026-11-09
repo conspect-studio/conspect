@@ -219,6 +219,8 @@ async fn boot(boot_path: &Path) -> Run {
         publisher,
         commands,
         multiview_control::no_preview(),
+        None, // switcher absent (legacy path)
+        None, // switcher lease owner absent
         None,
         None,
         None,
@@ -645,6 +647,8 @@ async fn a_corrupt_envelope_stops_the_real_binary_and_is_never_reset() {
             publisher,
             commands,
             multiview_control::no_preview(),
+            None, // switcher absent (legacy path)
+            None, // switcher lease owner absent
             None,
             None,
             None,

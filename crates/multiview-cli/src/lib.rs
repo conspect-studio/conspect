@@ -289,6 +289,13 @@ pub mod pipeline;
 /// (`docs/architecture/demand-driven-sources.md`).
 pub mod source_demand;
 
+/// First-slice Program/Preview launcher wiring: the real M/E handle, its bounded
+/// PVW demand-lease owner and the separate preview monitor tap, in one place the
+/// production run path and the CLI integration test share. Behind `ffmpeg` with
+/// the pipeline it attaches to.
+#[cfg(feature = "ffmpeg")]
+pub mod switcher_runtime;
+
 /// The run's demand rail driver: starts and stops a source's video and audio
 /// rails as consumers come and go. Behind `ffmpeg` (it spawns real ingest).
 #[cfg(feature = "ffmpeg")]
