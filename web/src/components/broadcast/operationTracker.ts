@@ -113,8 +113,13 @@ function verdict(event: ParsedEvent, expectation: OperationExpectation): 'applie
   return undefined;
 }
 
+const EMPTY_SNAPSHOT: TrackerSnapshot = {
+  ...createOperationOutcomeState(), unknownSeatDetails: new Map(),
+};
+
 export class OperationTracker {
   private state: OperationOutcomeState = createOperationOutcomeState();
+  private currentSnapshot: TrackerSnapshot = { ...this.state, unknownSeatDetails: new Map() };
   private readonly expectations = new Map<string, OperationExpectation>();
   private readonly unknownSeatDetails = new Map<number, UnknownSeatDetail>();
   private early: ParsedEvent[] = [];
@@ -144,15 +149,13 @@ export class OperationTracker {
     this.early = [];
     this.publish();
   }
+  /** Pure, referentially stable render read. Never expose another credential's evidence. */
   snapshot(): TrackerSnapshot {
-    this.checkIdentity();
-    return this.withSeatDetails();
-  }
-  private withSeatDetails(): TrackerSnapshot {
-    return { ...this.state, unknownSeatDetails: new Map(this.unknownSeatDetails) };
+    return this.identity === getStoredToken() ? this.currentSnapshot : EMPTY_SNAPSHOT;
   }
   private publish(): void {
-    this.client.setQueryData(OPERATION_TRACKER_QUERY_KEY, this.withSeatDetails());
+    this.currentSnapshot = { ...this.state, unknownSeatDetails: new Map(this.unknownSeatDetails) };
+    this.client.setQueryData(OPERATION_TRACKER_QUERY_KEY, this.currentSnapshot);
     this.scheduleDeadline();
   }
   private scheduleDeadline(): void {
