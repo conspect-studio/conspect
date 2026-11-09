@@ -20,13 +20,58 @@ class GateTests(unittest.TestCase):
     def test_real_draft_commands_without_workspace_suite_or_skips(self):
         commands = dict(gate.COMMANDS)
         self.assertEqual(len(commands), len(gate.COMMANDS))
-        self.assertEqual(commands['check'], ['cargo', 'check', '--locked', '--workspace'])
-        self.assertIn('--all-targets', commands['clippy'])
-        self.assertIn('actual_h264_pipeline_http', commands['native-h264-http-test'])
-        self.assertIn('moq_outputs::', commands['factory-test'])
         self.assertTrue(all('--skip' not in command for _, command in gate.COMMANDS))
         self.assertFalse(any('test' in command and '--workspace' in command for _, command in gate.COMMANDS))
-        self.assertEqual(sum(path.endswith(('.test.ts', '.test.tsx')) for path in commands['web-preview']), 8)
+
+    def test_exact_non_test_commands(self):
+        self.assertEqual([(label, argv) for label, argv in gate.COMMANDS
+                          if argv[:2] != ['cargo', 'test'] and argv[:5] != ['npm', '--prefix', 'web', 'run', 'test']], [
+            ('gate-tests', ['python3', '-B', 'scripts/test_final_head_gate.py']),
+            ('fmt', ['cargo', 'fmt', '--all', '--', '--check']),
+            ('check', ['cargo', 'check', '--locked', '--workspace']),
+            ('clippy', ['cargo', 'clippy', '--locked', '--workspace', '--all-targets', '--', '-D', 'warnings']),
+            ('deny', ['cargo', 'deny', 'check']),
+            ('moq-check', ['cargo', 'check', '--locked', '-p', 'multiview-cli', '--features', 'moq-output,gpl-codecs']),
+            ('moq-clippy', ['cargo', 'clippy', '--locked', '-p', 'multiview-cli', '--features', 'moq-output,gpl-codecs', '--all-targets', '--', '-D', 'warnings']),
+            ('web-install', ['npm', '--prefix', 'web', 'ci']),
+            ('web-lint', ['npm', '--prefix', 'web', 'run', 'lint']),
+            ('web-build', ['npm', '--prefix', 'web', 'run', 'build']),
+            ('probe-syntax', ['node', '--check', 'web/scripts/moq-cloudflare-probe.mjs']),
+        ])
+
+    def test_exact_rust_test_commands(self):
+        self.assertEqual([(label, argv) for label, argv in gate.COMMANDS if argv[:2] == ['cargo', 'test']], [
+            ('moq-test', ['cargo', 'test', '--locked', '-p', 'multiview-moq', '--lib']),
+            ('moq-outputs-test', ['cargo', 'test', '--locked', '-p', 'multiview-cli', '--features', 'moq-output', '--lib', 'moq_outputs::']),
+            ('outgoing-including-handshake-test', ['cargo', 'test', '--locked', '-p', 'multiview-cli', '--features', 'moq-output', '--lib', 'outgoing_']),
+            ('handshake-test', ['cargo', 'test', '--locked', '-p', 'multiview-cli', '--features', 'moq-output', '--lib', 'pending_outgoing_handshake']),
+            ('relay-url-test', ['cargo', 'test', '--locked', '-p', 'multiview-cli', '--features', 'moq-output', '--lib', 'relay_url_file']),
+            ('authority-bridge-unit-test', ['cargo', 'test', '--locked', '-p', 'multiview-control', '--features', 'moq-transport', '--example', 'abr_authority']),
+            ('native-h264-http-test', ['cargo', 'test', '--locked', '-p', 'multiview-cli', '--features', 'moq-output,gpl-codecs', '--lib', 'actual_h264_pipeline_http', '--', '--test-threads=1']),
+        ])
+
+    def test_exact_vitest_path_tuples(self):
+        self.assertEqual([(label, argv) for label, argv in gate.COMMANDS if argv[:5] == ['npm', '--prefix', 'web', 'run', 'test']], [
+            ('web-moq-abr', ['npm', '--prefix', 'web', 'run', 'test', '--', 'src/preview/moqAbr.test.ts', 'src/preview/MoqPlayerAbr.test.tsx', '--maxWorkers=2']),
+            ('web-preview', ['npm', '--prefix', 'web', 'run', 'test', '--', 'src/preview/moqConnection.test.ts', 'src/preview/moqPlayback.test.ts', 'src/preview/moqLeaseApi.test.ts', 'src/preview/MoqSelection.test.tsx', 'src/preview/PreviewSurface.test.tsx', 'src/preview/capabilities.test.ts', 'src/preview/outputPlayback.test.ts', 'src/preview/diagnostics.test.ts', 'src/preview/PreviewDiagnostics.test.tsx', '--maxWorkers=2']),
+        ])
+        for _, argv in gate.COMMANDS:
+            for token in argv:
+                if token.endswith(('.test.ts', '.test.tsx')):
+                    self.assertTrue((gate.ROOT / 'web' / token).is_file(), token)
+
+    def test_missing_openssl_fails_preflight_before_commands(self):
+        for args in (['bin/check'], ['bin/check', '--validate-only']):
+            with self.subTest(args=args), patch.object(gate.sys, 'argv', args), patch.object(gate, 'validate', return_value='head'), patch.object(gate, 'environment', return_value={'PATH': '/missing'}), patch.object(gate.shutil, 'which', return_value=None) as which, patch.object(gate, 'execute') as execute, patch.object(gate, 'resources') as resources:
+                with self.assertRaisesRegex(RuntimeError, '^required native prerequisite unavailable: openssl executable on PATH$'):
+                    gate.main()
+                which.assert_called_once_with('openssl', path='/missing')
+                execute.assert_not_called()
+                resources.assert_not_called()
+
+    def test_available_openssl_passes_preflight(self):
+        with patch.object(gate.shutil, 'which', return_value='/usr/bin/openssl'):
+            gate.prerequisites({'PATH': '/usr/bin'})
 
     def test_dirty_tree_rejected(self):
         with patch.object(gate, 'git', return_value=' M bin/check'):
@@ -53,7 +98,10 @@ class GateTests(unittest.TestCase):
                     gate.environment()
 
     def test_timeout_budgets_are_proportional(self):
-        for label in ('native-h264-http-test', 'web-build'):
+        for label in ('gate-tests', 'fmt', 'deny', 'moq-test', 'moq-outputs-test',
+                      'outgoing-including-handshake-test', 'handshake-test', 'relay-url-test',
+                      'authority-bridge-unit-test', 'native-h264-http-test', 'web-install',
+                      'web-moq-abr', 'web-preview', 'web-lint', 'web-build', 'probe-syntax'):
             self.assertEqual(gate.command_timeout(label), 600)
         for label in ('check', 'clippy', 'moq-check', 'moq-clippy'):
             self.assertEqual(gate.command_timeout(label), 1200)
@@ -164,10 +212,11 @@ class GateTests(unittest.TestCase):
             log.write_text('test result: ok. 1 passed; 0 failed; 20 filtered out;')
             gate.verify_test_execution(command, log)
             web = ['npm', '--prefix', 'web', 'run', 'test']
-            log.write_text('No test files found')
-            with self.assertRaisesRegex(RuntimeError, 'no passing browser'):
-                gate.verify_test_execution(web, log)
-            log.write_text(' Tests  45 passed (45)')
+            for text in ('No test files found', ' Tests  0 passed (0)', ''):
+                log.write_text(text)
+                with self.assertRaisesRegex(RuntimeError, 'no passing browser'):
+                    gate.verify_test_execution(web, log)
+            log.write_text(' Tests  3 passed (3)')
             gate.verify_test_execution(web, log)
 
     def test_no_success_record_or_next_command_after_failure(self):

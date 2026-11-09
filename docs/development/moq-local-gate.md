@@ -43,17 +43,33 @@ no result comes from an old log:
 - Runner mechanical tests, actual formatting, locked default workspace check,
   strict all-target workspace Clippy, and dependency audit.
 - Native MoQ output check and strict Clippy with `moq-output,gpl-codecs`.
-- MoQ transport library, production factory, outgoing publication, pending
-  handshake cancellation, relay URL file, and control authority example tests.
+- MoQ transport library; the whole `moq_outputs::` module (factory, parent
+  conversion, and metadata tests); `outgoing_` tests including the pending
+  handshake pair; pending handshake cancellation again; and relay URL file tests.
+  The outgoing and handshake filters intentionally overlap, not disjoint evidence.
+- `authority-bridge-unit-test` runs the five `bridge_tests` unit tests in the named
+  `abr_authority` example through libtest. It does **not** execute the authority
+  program's `main` (IVF ladder/registry/router). `moq-transport` is an additional
+  enabled feature, not the selector or a feature requirement for those tests.
 - The actual native canonical H.264 pipeline -> HTTP authority test, with GPL
-  codec feature enabled explicitly. Missing libav/codec/tool dependencies fail;
-  they are not a successful unavailable/skip result.
-- Fresh web dependency install, the two ABR/player test files (historically 45
-  tests, not evidence of current results), eight focused preview test files,
+  codec feature enabled explicitly. OpenSSL executable on PATH and libav with
+  libx264 are required fail-closed prerequisites. Before any expensive command,
+  preflight rejects missing OpenSSL with a static error (also in validate-only).
+  Missing libav/libx264 still fails compilation or the native leg, never an
+  unavailable-pass or skip.
+- Fresh web dependency install, the ABR/player files (`web-moq-abr`), focused
+  preview test files (`web-preview`),
   complete web lint/build, and probe syntax.
 
-The eight preview files cover connection, playback, lease API, selection,
-PreviewSurface, capabilities, output playback, and diagnostics. These are Vitest
+The ABR path tuple is `src/preview/moqAbr.test.ts`,
+`src/preview/MoqPlayerAbr.test.tsx`. The preview path tuple is
+`src/preview/moqConnection.test.ts`, `src/preview/moqPlayback.test.ts`,
+`src/preview/moqLeaseApi.test.ts`, `src/preview/MoqSelection.test.tsx`,
+`src/preview/PreviewSurface.test.tsx`, `src/preview/capabilities.test.ts`,
+`src/preview/outputPlayback.test.ts`, `src/preview/diagnostics.test.ts`, and
+`src/preview/PreviewDiagnostics.test.tsx` (included). Paths are relative to web;
+the mechanical tests pin both exact tuples, not an arbitrary file count.
+No leg label claims a test-result count. These are Vitest
 browser-component/unit tests, not a real live browser/network acceptance claim.
 The required test logs must report positive test execution. Native/compiler and
 web checks remain **UNRUN** until the captain authorizes execution. The gate does
@@ -76,7 +92,9 @@ an expensive gate merely to discover that it exceeds the cap. Do not duplicate o
 cache, remove its artifacts, or consume space up to ENOSPC.
 
 Each command has a wall timeout: workspace/feature check and Clippy 20 minutes;
-other commands 10 minutes. Commands execute serially. A nonblocking worktree
+other commands 10 minutes. In particular the native H.264 HTTP leg has a
+600s wall timeout including cold compilation: exceeding it **fails** the leg,
+not a skip or permission to retry/extend the budget. Commands execute serially. A nonblocking worktree
 flock prevents concurrent gate runs. The runner creates a separate process
 session for each command; cleanup sends TERM and then KILL only to that owned
 process group, including descendants after the leader exits. This cleanup does

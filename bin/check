@@ -30,15 +30,15 @@ COMMANDS = [
     ('moq-check', ['cargo', 'check', '--locked', '-p', 'multiview-cli', '--features', 'moq-output,gpl-codecs']),
     ('moq-clippy', ['cargo', 'clippy', '--locked', '-p', 'multiview-cli', '--features', 'moq-output,gpl-codecs', '--all-targets', '--', '-D', 'warnings']),
     ('moq-test', ['cargo', 'test', '--locked', '-p', 'multiview-moq', '--lib']),
-    ('factory-test', ['cargo', 'test', '--locked', '-p', 'multiview-cli', '--features', 'moq-output', '--lib', 'moq_outputs::']),
-    ('outgoing-test', ['cargo', 'test', '--locked', '-p', 'multiview-cli', '--features', 'moq-output', '--lib', 'outgoing_']),
+    ('moq-outputs-test', ['cargo', 'test', '--locked', '-p', 'multiview-cli', '--features', 'moq-output', '--lib', 'moq_outputs::']),
+    ('outgoing-including-handshake-test', ['cargo', 'test', '--locked', '-p', 'multiview-cli', '--features', 'moq-output', '--lib', 'outgoing_']),
     ('handshake-test', ['cargo', 'test', '--locked', '-p', 'multiview-cli', '--features', 'moq-output', '--lib', 'pending_outgoing_handshake']),
     ('relay-url-test', ['cargo', 'test', '--locked', '-p', 'multiview-cli', '--features', 'moq-output', '--lib', 'relay_url_file']),
-    ('authority-test', ['cargo', 'test', '--locked', '-p', 'multiview-control', '--features', 'moq-transport', '--example', 'abr_authority']),
+    ('authority-bridge-unit-test', ['cargo', 'test', '--locked', '-p', 'multiview-control', '--features', 'moq-transport', '--example', 'abr_authority']),
     ('native-h264-http-test', ['cargo', 'test', '--locked', '-p', 'multiview-cli', '--features', 'moq-output,gpl-codecs', '--lib', 'actual_h264_pipeline_http', '--', '--test-threads=1']),
     ('web-install', ['npm', '--prefix', 'web', 'ci']),
-    ('web-moq-45', ['npm', '--prefix', 'web', 'run', 'test', '--', 'src/preview/moqAbr.test.ts', 'src/preview/MoqPlayerAbr.test.tsx', '--maxWorkers=2']),
-    ('web-preview', ['npm', '--prefix', 'web', 'run', 'test', '--', 'src/preview/moqConnection.test.ts', 'src/preview/moqPlayback.test.ts', 'src/preview/moqLeaseApi.test.ts', 'src/preview/MoqSelection.test.tsx', 'src/preview/PreviewSurface.test.tsx', 'src/preview/capabilities.test.ts', 'src/preview/outputPlayback.test.ts', 'src/preview/diagnostics.test.ts', '--maxWorkers=2']),
+    ('web-moq-abr', ['npm', '--prefix', 'web', 'run', 'test', '--', 'src/preview/moqAbr.test.ts', 'src/preview/MoqPlayerAbr.test.tsx', '--maxWorkers=2']),
+    ('web-preview', ['npm', '--prefix', 'web', 'run', 'test', '--', 'src/preview/moqConnection.test.ts', 'src/preview/moqPlayback.test.ts', 'src/preview/moqLeaseApi.test.ts', 'src/preview/MoqSelection.test.tsx', 'src/preview/PreviewSurface.test.tsx', 'src/preview/capabilities.test.ts', 'src/preview/outputPlayback.test.ts', 'src/preview/diagnostics.test.ts', 'src/preview/PreviewDiagnostics.test.tsx', '--maxWorkers=2']),
     ('web-lint', ['npm', '--prefix', 'web', 'run', 'lint']),
     ('web-build', ['npm', '--prefix', 'web', 'run', 'build']),
     ('probe-syntax', ['node', '--check', 'web/scripts/moq-cloudflare-probe.mjs']),
@@ -68,6 +68,12 @@ def environment():
     require('CARGO_BUILD_TARGET_DIR' not in env, 'unset CARGO_BUILD_TARGET_DIR')
     env.update(CARGO_BUILD_JOBS='2', CARGO_INCREMENTAL='0')
     return env
+
+
+def prerequisites(env):
+    # Check before any expensive leg, not as a panic inside the native test.
+    require(shutil.which('openssl', path=env.get('PATH', os.defpath)) is not None,
+            'required native prerequisite unavailable: openssl executable on PATH')
 
 
 def target_directories():
@@ -199,7 +205,7 @@ def verify_test_execution(command, log):
         require(results and sum(map(int, results)) > 0,
                 f'no passing Rust tests reported; see {log}')
     if command[:5] == ['npm', '--prefix', 'web', 'run', 'test']:
-        require(re.search(r'Tests\s+\d+ passed', text),
+        require(re.search(r'Tests\s+[1-9]\d* passed', text),
                 f'no passing browser tests reported; see {log}')
 
 
@@ -233,6 +239,7 @@ def main():
     require(sys.argv[1:] in ([], ['--validate-only']), 'usage: bin/check [--validate-only]')
     head = validate()
     env = environment()
+    prerequisites(env)
     if sys.argv[1:]:
         resources()
         print('Preflight target bytes:', target_bytes(), '; cap:', MAX_TARGET,
