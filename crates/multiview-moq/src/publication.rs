@@ -142,6 +142,7 @@ impl From<hang::Error> for PublishError {
 /// A live shared-ladder publication: bounded tracks, one clock, one generation.
 pub struct SharedPublication {
     ladder: SharedLadder,
+    allocation: Option<crate::allocation::AllocationBudget>,
     broadcast: moq_net::broadcast::Producer,
     video: Vec<moq_net::track::Producer>,
     adapters: Vec<VideoAdapter>,
@@ -155,6 +156,15 @@ pub struct SharedPublication {
 
 impl SharedPublication {
     /// Render an admitted ladder into real tracks on an existing broadcast.
+    pub fn create_with_budget(ladder: SharedLadder, broadcast: &moq_net::broadcast::Producer,
+        budget: crate::allocation::AllocationBudget) -> Result<Self, PublishError> {
+        let mut publication = Self::create(ladder, broadcast)?;
+        for adapter in &mut publication.adapters { adapter.allocation = Some(budget.clone()); }
+        publication.allocation = Some(budget);
+        Ok(publication)
+    }
+    pub fn allocation_budget(&self) -> Option<&crate::allocation::AllocationBudget> { self.allocation.as_ref() }
+
     pub fn create(
         ladder: SharedLadder,
         broadcast: &moq_net::broadcast::Producer,
@@ -191,6 +201,7 @@ impl SharedPublication {
         )?;
         let publication = Self {
             ladder,
+            allocation: None,
             broadcast: broadcast.clone(),
             video,
             adapters,
@@ -243,6 +254,23 @@ impl SharedPublication {
         &self.stalled
     }
 
+    /// Opt into bounded trial cancellation on an existing non-base rendition.
+    /// This never creates tracks/encoders and never changes independent audio.
+    pub fn enable_trial_cancellation(&mut self, level: usize) -> Result<(), PublishError> {
+        if level == 0 { return Err(PublishError::UnknownRendition(level)); }
+        self.adapters.get_mut(level).ok_or(PublishError::UnknownRendition(level))?
+            .enable_trial_cancellation();
+        Ok(())
+    }
+
+    /// Cancel only the selected video rung's current and bounded retained groups.
+    /// The caller must separately enforce actual transport allocation limits.
+    pub fn cancel_trial(&mut self, level: usize) -> Result<(), PublishError> {
+        if level == 0 { return Err(PublishError::UnknownRendition(level)); }
+        self.adapters.get_mut(level).ok_or(PublishError::UnknownRendition(level))?.abort_group();
+        Ok(())
+    }
+
     /// Publish one already-admitted window to one rendition. Never encodes and never copies
     /// the payload: the shared `Bytes` allocation stays shared through the transport.
     pub fn publish(&mut self, level: usize, window: &Window) -> Result<(), PublishError> {
@@ -278,16 +306,21 @@ impl SharedPublication {
             .audio
             .get(name)
             .ok_or(PublishError::UnknownAudioTrack(name.to_string()))?;
+        let mut prepared = Vec::with_capacity(packets.len());
         for packet in packets {
             if last.is_some_and(|pts| packet.pts_us <= pts) {
                 return Err(PublishError::Reject(Reject::Timestamp));
             }
-            let mut group = track.append_group()?;
             let timestamp = moq_net::Timestamp::new(packet.pts_us, Timescale::MICRO)
                 .map_err(|_| PublishError::Timestamp)?;
-            group.write_frame(timestamp, crate::provider::serialized_frame(packet)?)?;
-            group.finish()?;
+            let serialized = crate::provider::serialized_frame_in(packet, self.allocation.as_ref())?;
+            prepared.push((timestamp, serialized));
             last = Some(packet.pts_us);
+        }
+        for (timestamp, serialized) in prepared {
+            let mut group = track.append_group()?;
+            group.write_frame(timestamp, serialized)?;
+            group.finish()?;
         }
         if let Some(last) = last {
             self.audio_last_pts.insert(name.to_string(), last);

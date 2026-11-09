@@ -1,0 +1,654 @@
+//! Iroh P2P transport, dialed by endpoint id instead of a hostname.
+//!
+//! A single [`Endpoint`] serves both roles, hole-punching directly to peers and
+//! falling back to an iroh relay. Both WebTransport-over-H3 and raw QUIC are
+//! negotiated via ALPN.
+
+use std::{net, path::Path, str::FromStr, sync::Arc};
+
+use crate::quic::CongestionControl;
+use url::Url;
+use web_transport_iroh::iroh::{self, SecretKey};
+// NOTE: web-transport-iroh should re-export proto like web-transport-moq does.
+use web_transport_proto::{ConnectRequest, ConnectResponse};
+
+pub use iroh::Endpoint;
+pub use web_transport_iroh;
+
+/// The iroh controller factory for a congestion control family.
+///
+/// iroh is built on noq, so its BBR is v3. It re-exports the `ControllerFactory`
+/// trait but not the concrete configs, hence the direct `noq-proto` dependency.
+fn congestion_factory(family: CongestionControl) -> Arc<dyn iroh::endpoint::ControllerFactory + Send + Sync> {
+	match family {
+		CongestionControl::Loss => Arc::new(noq_proto::congestion::CubicConfig::default()),
+		CongestionControl::Delay => Arc::new(noq_proto::congestion::Bbr3Config::default()),
+	}
+}
+
+/// Errors specific to the iroh P2P backend.
+#[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
+pub enum Error {
+	/// The supplied QUIC transport configuration is invalid.
+	#[error(transparent)]
+	Config(crate::Error),
+
+	/// Reading or writing the secret key file failed.
+	#[error(transparent)]
+	Io(#[from] std::io::Error),
+
+	/// The QUIC config was parsed from released spellings that no longer work. The
+	/// payload is the migration to print.
+	#[error("{0}")]
+	Deprecated(crate::cli::Deprecated),
+
+	/// The configured secret was neither a valid hex key nor a readable key file.
+	#[error("invalid iroh secret key: {0}")]
+	Secret(String),
+
+	/// The endpoint could not bind its UDP socket.
+	#[error("{0}")]
+	Bind(String),
+
+	/// A configured bind address was rejected by iroh.
+	#[error("{0}")]
+	BindAddr(String),
+
+	/// Dialing the peer failed before a connection was started.
+	#[error("{0}")]
+	Connect(String),
+
+	/// The QUIC handshake failed while connecting.
+	#[error("{0}")]
+	Connecting(String),
+
+	/// The peer never settled on an ALPN.
+	#[error("{0}")]
+	Alpn(String),
+
+	/// An established connection was lost or closed.
+	#[error("{0}")]
+	Connection(String),
+
+	/// The client side of the WebTransport handshake failed.
+	#[error("{0}")]
+	Client(String),
+
+	/// The server side of the WebTransport handshake failed.
+	#[error("{0}")]
+	Server(String),
+
+	/// The negotiated ALPN was not valid UTF-8.
+	#[error("failed to decode ALPN")]
+	DecodeAlpn(#[from] std::string::FromUtf8Error),
+
+	/// The peer negotiated an ALPN outside the configured versions.
+	#[error("unsupported ALPN: {0}")]
+	UnsupportedAlpn(String),
+
+	/// The configured version list is empty, so there is no ALPN to offer.
+	#[error("no MoQ versions configured; iroh has no ALPN to offer")]
+	NoVersions,
+
+	/// The URL had no host, so there is no endpoint id to dial.
+	#[error("Invalid URL: missing host")]
+	MissingHost,
+
+	/// The URL host was not an iroh endpoint id. Unlike QUIC, iroh dials a public key, not a hostname.
+	#[error("Invalid URL: host is not an iroh endpoint id: {0}")]
+	InvalidEndpointId(String),
+
+	/// The URL could not be rewritten to the `https` scheme for the H3 request.
+	#[error("invalid URL")]
+	InvalidUrl,
+
+	/// The rewritten URL failed to parse.
+	#[error("{0}")]
+	Url(String),
+
+	/// The client connected but never sent a valid WebTransport CONNECT request.
+	#[error("failed to receive WebTransport request: {0}")]
+	RecvRequest(String),
+
+	/// GSO is always on for iroh, so `--quic-gso=false` cannot be honored.
+	#[error("the iroh backend cannot disable GSO; drop --quic-gso=false or use the noq backend")]
+	GsoUnsupported,
+}
+
+crate::error::from_message! {
+	iroh::endpoint::BindError => Bind,
+	iroh::endpoint::InvalidSocketAddr => BindAddr,
+	iroh::endpoint::ConnectWithOptsError => Connect,
+	iroh::endpoint::ConnectingError => Connecting,
+	iroh::endpoint::AlpnError => Alpn,
+	iroh::endpoint::ConnectionError => Connection,
+	web_transport_iroh::ClientError => Client,
+	web_transport_iroh::ServerError => Server,
+	url::ParseError => Url,
+}
+
+type Result<T> = std::result::Result<T, Error>;
+
+/// Settings for the shared iroh endpoint, used by both the client and server.
+#[derive(usage::Args, Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
+#[usage(unknown_flags = "error", args_override_self = false)]
+#[serde(deny_unknown_fields, default)]
+#[non_exhaustive]
+pub struct Config {
+	/// Whether to enable iroh support.
+	#[usage(
+		name = "iroh-enabled",
+		long = "iroh-enabled",
+		env = "MOQ_IROH_ENABLED",
+		setting = "iroh.enabled",
+		default_missing = "true",
+		num_args = 0..=1,
+		require_equals = true,
+	)]
+	pub enabled: Option<bool>,
+
+	/// Secret key for the iroh endpoint, either a hex-encoded string or a path to a file.
+	/// If the file does not exist, a random key will be generated and written to the path.
+	/// Files must be regular, with no symlinks; on Unix, new files use mode 0600 and
+	/// existing files readable by group or others are refused without changing permissions.
+	#[usage(
+		name = "iroh-secret",
+		long = "iroh-secret",
+		env = "MOQ_IROH_SECRET",
+		setting = "iroh.secret"
+	)]
+	pub secret: Option<String>,
+
+	/// Listen for UDP packets on the given address.
+	/// Defaults to `0.0.0.0:0` if not provided.
+	#[usage(
+		name = "iroh-bind-v4",
+		long = "iroh-bind-v4",
+		env = "MOQ_IROH_BIND_V4",
+		setting = "iroh.bind_v4"
+	)]
+	pub bind_v4: Option<net::SocketAddrV4>,
+
+	/// Listen for UDP packets on the given address.
+	/// Defaults to `[::]:0` if not provided.
+	#[usage(
+		name = "iroh-bind-v6",
+		long = "iroh-bind-v6",
+		env = "MOQ_IROH_BIND_V6",
+		setting = "iroh.bind_v6"
+	)]
+	pub bind_v6: Option<net::SocketAddrV6>,
+
+	/// Disable the iroh relay, using only direct P2P connections.
+	#[usage(
+		name = "iroh-disable-relay",
+		long = "iroh-disable-relay",
+		env = "MOQ_IROH_DISABLE_RELAY",
+		setting = "iroh.disable_relay",
+		default_missing = "true",
+		num_args = 0..=1,
+		require_equals = true,
+	)]
+	pub disable_relay: Option<bool>,
+}
+
+impl Config {
+	/// Bind the iroh endpoint, applying the per-connection [`crate::quic::Config`] knobs.
+	///
+	/// The endpoint accepts nothing until a [`crate::server::Server`] takes it, which
+	/// registers the ALPNs of its configured versions.
+	///
+	/// iroh is a single P2P endpoint shared by both roles, so it takes the client
+	/// section (the per-connection knobs are symmetric). It only honors the knobs
+	/// its transport-config builder exposes (stream limits, idle timeout, MTU
+	/// discovery, congestion control, flow-control windows); it has no keep-alive
+	/// knob and cannot disable GSO, so `gso = false` fails with
+	/// [`Error::GsoUnsupported`].
+	pub async fn bind(self, quic: &crate::quic::Config) -> Result<Option<Endpoint>> {
+		if !self.enabled.unwrap_or(false) {
+			return Ok(None);
+		}
+
+		// Public, and takes a config this crate did not necessarily check, so it
+		// refuses rather than trusting the caller: `resolve` reads the canonical
+		// fields, and a released `--client-quic-gso=false` would arrive here as "GSO
+		// on" and bind an endpoint the caller asked not to have.
+		let deprecated = quic.deprecated();
+		if !deprecated.is_empty() {
+			return Err(Error::Deprecated(deprecated));
+		}
+		quic.validate().map_err(Error::Config)?;
+
+		let quic = quic.resolve();
+		if quic.gso_disabled() {
+			return Err(Error::GsoUnsupported);
+		}
+
+		// If the secret matches the expected format (hex encoded), use it directly.
+		let secret_key = if let Some(secret) = self.secret.as_ref().and_then(|s| SecretKey::from_str(s).ok()) {
+			secret
+		} else if let Some(path) = self.secret {
+			let generated = hex::encode(SecretKey::generate().to_bytes());
+			let key_str = load_or_create(Path::new(&path), &generated).await?;
+			SecretKey::from_str(&key_str).map_err(|err| Error::Secret(crate::error::message(err)))?
+		} else {
+			// Otherwise, generate a new random secret.
+			SecretKey::generate()
+		};
+
+		// MoQ opens a stream per group, so raise the low default; also carry the
+		// shared idle-timeout / MTU knobs onto iroh's own transport config.
+		let max_streams = iroh::endpoint::VarInt::from_u64(quic.max_streams).unwrap_or(iroh::endpoint::VarInt::MAX);
+		let mut transport = iroh::endpoint::QuicTransportConfig::builder()
+			.max_concurrent_bidi_streams(max_streams)
+			.max_concurrent_uni_streams(max_streams)
+			.max_idle_timeout(Some(quic.idle_timeout.try_into().expect("idle timeout out of range")));
+		if !quic.mtu_discovery {
+			transport = transport.mtu_discovery_config(None);
+		}
+		// iroh's connection window is unlimited, so apply ours when unset.
+		let window = quic.receive_window.unwrap_or(crate::quic::DEFAULT_RECEIVE_WINDOW);
+		let window = iroh::endpoint::VarInt::from_u64(window).unwrap_or(iroh::endpoint::VarInt::MAX);
+		transport = transport.receive_window(window);
+		if let Some(window) = quic.stream_receive_window {
+			let window = iroh::endpoint::VarInt::from_u64(window).unwrap_or(iroh::endpoint::VarInt::MAX);
+			transport = transport.stream_receive_window(window);
+		}
+		if let Some(window) = quic.send_window {
+			transport = transport.send_window(window);
+		}
+		transport = transport.congestion_controller_factory(congestion_factory(quic.congestion()));
+
+		let mut builder = if self.disable_relay.unwrap_or(false) {
+			Endpoint::builder(iroh::endpoint::presets::N0DisableRelay)
+		} else {
+			Endpoint::builder(iroh::endpoint::presets::N0)
+		}
+		.secret_key(secret_key)
+		.transport_config(transport.build());
+		if let Some(addr) = self.bind_v4 {
+			builder = builder.bind_addr(addr)?;
+		}
+		if let Some(addr) = self.bind_v6 {
+			builder = builder.bind_addr(addr)?;
+		}
+
+		let endpoint = builder.bind().await?;
+		tracing::info!(endpoint_id = %endpoint.id(), "iroh listening");
+
+		Ok(Some(endpoint))
+	}
+}
+
+/// Register the ALPNs a listener accepts on `endpoint`, one per configured version.
+///
+/// Refuses an empty list rather than binding a listener no peer can reach.
+pub(crate) fn listen(endpoint: &Endpoint, versions: &moq_net::Versions) -> Result<()> {
+	let alpns = versions.alpns();
+	if alpns.is_empty() {
+		return Err(Error::NoVersions);
+	}
+
+	// H3 is last because it requires WebTransport framing which not all H3 endpoints support.
+	let mut accepted: Vec<Vec<u8>> = alpns.iter().map(|alpn| alpn.as_bytes().to_vec()).collect();
+	accepted.push(web_transport_iroh::ALPN_H3.as_bytes().to_vec());
+	endpoint.set_alpns(accepted);
+	Ok(())
+}
+
+/// Accept an iroh connection, negotiate WebTransport or raw QUIC, and complete the
+/// handshake. Returns the established session plus the request URL (raw QUIC carries
+/// none). iroh exposes no client-certificate identity, so the identity is always `None`,
+/// and it addresses peers by EndpointId rather than a dialed hostname, so the authority
+/// is always `None` too.
+pub(crate) async fn accept(
+	conn: iroh::endpoint::Incoming,
+	alpns: Vec<&'static str>,
+) -> Result<crate::server::Accepted<web_transport_iroh::Session>> {
+	let conn = conn.accept()?.await?;
+	let alpn = String::from_utf8(conn.alpn().to_vec())?;
+	tracing::Span::current().record("id", conn.stable_id());
+	tracing::debug!(remote = %conn.remote_id().fmt_short(), %alpn, "accepted");
+	match alpn.as_str() {
+		web_transport_iroh::ALPN_H3 => {
+			let request = web_transport_iroh::H3Request::accept(conn)
+				.await
+				.map_err(|err| Error::RecvRequest(crate::error::message(err)))?;
+			let url = Some(request.url.clone());
+
+			let mut response = ConnectResponse::OK;
+			let mut link = crate::server::Link::default();
+			if let Some(protocol) = request.protocols.iter().find(|p| alpns.contains(&p.as_str())) {
+				response = response.with_protocol(protocol);
+				link.alpn = Some(protocol.clone());
+			}
+			let session = request
+				.respond(response)
+				.await
+				.map_err(|err| Error::Server(crate::error::message(err)))?;
+			Ok(crate::server::Accepted {
+				session,
+				url,
+				identity: None,
+				authority: None,
+				link,
+			})
+		}
+		// Raw QUIC carries no request URL; the path rides the SETUP.
+		alpn if alpns.contains(&alpn) => {
+			let session = web_transport_iroh::QuicRequest::accept(conn).ok();
+			Ok(crate::server::Accepted {
+				session,
+				url: None,
+				identity: None,
+				authority: None,
+				link: crate::server::Link {
+					alpn: Some(alpn.to_string()),
+					..Default::default()
+				},
+			})
+		}
+		_ => Err(Error::UnsupportedAlpn(alpn)),
+	}
+}
+
+/// Which transport binding an `iroh://` dial negotiated.
+///
+/// Unlike the other schemes, this isn't known until the ALPN is chosen, and it decides
+/// where the request target travels: H3 puts it in the CONNECT URL, raw QUIC has nowhere
+/// to put it but the SETUP.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum Binding {
+	/// Raw QUIC over an iroh connection, carrying no request URI.
+	Raw,
+	/// WebTransport over HTTP/3, carrying the request URI in its CONNECT.
+	H3,
+}
+
+pub(crate) async fn connect(
+	endpoint: &Endpoint,
+	url: Url,
+	addrs: impl IntoIterator<Item = std::net::SocketAddr>,
+	versions: &moq_net::Versions,
+) -> Result<(web_transport_iroh::Session, Binding)> {
+	let alpns = versions.alpns();
+	let (primary, rest) = alpns.split_first().ok_or(Error::NoVersions)?;
+
+	let host = url.host().ok_or(Error::MissingHost)?.to_string();
+	let endpoint_id: iroh::EndpointId = host
+		.parse()
+		.map_err(|err| Error::InvalidEndpointId(crate::error::message(err)))?;
+
+	// Build an EndpointAddr with any direct IP addresses provided.
+	let mut endpoint_addr = iroh::EndpointAddr::new(endpoint_id);
+	for addr in addrs {
+		endpoint_addr = endpoint_addr.with_ip_addr(addr);
+	}
+
+	// We need to use this API to provide multiple ALPNs.
+	// H3 is last because it requires WebTransport framing which not all H3 endpoints support.
+	let mut additional: Vec<Vec<u8>> = rest.iter().map(|alpn| alpn.as_bytes().to_vec()).collect();
+	additional.push(b"h3".to_vec());
+	let opts = iroh::endpoint::ConnectOptions::new().with_additional_alpns(additional);
+
+	let mut connecting = endpoint
+		.connect_with_opts(endpoint_addr, primary.as_bytes(), opts)
+		.await?;
+	let alpn = connecting.alpn().await?;
+	let alpn = String::from_utf8(alpn)?;
+
+	let session = match alpn.as_str() {
+		web_transport_iroh::ALPN_H3 => {
+			let conn = connecting.await?;
+			let url = url_set_scheme(url, "https")?;
+
+			let mut request = ConnectRequest::new(url);
+			for alpn in &alpns {
+				request = request.with_protocol(alpn.to_string());
+			}
+
+			(
+				web_transport_iroh::Session::connect_h3(conn, request).await?,
+				Binding::H3,
+			)
+		}
+		alpn if alpns.contains(&alpn) => {
+			let conn = connecting.await?;
+			(web_transport_iroh::Session::raw(conn), Binding::Raw)
+		}
+		_ => return Err(Error::UnsupportedAlpn(alpn)),
+	};
+
+	Ok(session)
+}
+
+/// Returns a new URL with a changed scheme.
+///
+/// [`Url::set_scheme`] returns an error if the scheme change is not valid according to
+/// [the URL specification's section on legal scheme state overrides](https://url.spec.whatwg.org/#scheme-state).
+///
+/// This function allows all scheme changes, as long as the resulting URL is valid.
+fn url_set_scheme(url: Url, scheme: &str) -> Result<Url> {
+	let url = format!(
+		"{}:{}",
+		scheme,
+		url.to_string().split_once(":").ok_or(Error::InvalidUrl)?.1
+	)
+	.parse()?;
+	Ok(url)
+}
+
+/// Load a persisted secret, or exclusively create its private file.
+async fn load_or_create(path: &Path, generated: &str) -> std::io::Result<String> {
+	use std::io;
+	use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+	let mut options = std::fs::OpenOptions::new();
+	options.write(true).create_new(true);
+	#[cfg(unix)]
+	{
+		use std::os::unix::fs::OpenOptionsExt;
+		options.mode(0o600);
+	}
+	match tokio::fs::OpenOptions::from(options).open(path).await {
+		Ok(mut file) => {
+			file.write_all(generated.as_bytes()).await?;
+			file.flush().await?;
+			return Ok(generated.to_owned());
+		}
+		Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {}
+		Err(err) => return Err(err),
+	}
+
+	let mut options = std::fs::OpenOptions::new();
+	options.read(true);
+	#[cfg(unix)]
+	{
+		use std::os::unix::fs::OpenOptionsExt;
+		// Validate the opened inode, without following a symlink or blocking on a FIFO.
+		options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+	}
+	#[cfg(windows)]
+	{
+		use std::os::windows::fs::OpenOptionsExt;
+		// FILE_FLAG_OPEN_REPARSE_POINT opens the link itself for validation.
+		options.custom_flags(0x00200000);
+	}
+	let mut file = tokio::fs::OpenOptions::from(options).open(path).await?;
+	let metadata = file.metadata().await?;
+	if !metadata.is_file() {
+		return Err(io::Error::new(
+			io::ErrorKind::InvalidInput,
+			"secret must be a regular file",
+		));
+	}
+	#[cfg(unix)]
+	{
+		use std::os::unix::fs::PermissionsExt;
+		if metadata.permissions().mode() & 0o044 != 0 {
+			return Err(io::Error::new(
+				io::ErrorKind::PermissionDenied,
+				"secret must not be readable by group or others; use chmod 600",
+			));
+		}
+	}
+	let mut contents = String::new();
+	file.read_to_string(&mut contents).await?;
+	Ok(contents)
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	const KEY: &str = "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f";
+
+	#[tokio::test]
+	async fn persisted_secret_is_private_and_reused() {
+		let dir = tempfile::tempdir().unwrap();
+		let path = dir.path().join("secret.key");
+		assert_eq!(load_or_create(&path, KEY).await.unwrap(), KEY);
+		#[cfg(unix)]
+		{
+			use std::os::unix::fs::PermissionsExt;
+			let metadata = std::fs::metadata(&path).unwrap();
+			assert_eq!(metadata.permissions().mode() & 0o177, 0);
+			std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o400)).unwrap();
+		}
+		assert_eq!(load_or_create(&path, "replacement").await.unwrap(), KEY);
+		assert_eq!(std::fs::read_to_string(&path).unwrap(), KEY);
+	}
+
+	#[cfg(unix)]
+	#[tokio::test]
+	async fn persisted_secret_refuses_shared_read_permissions() {
+		use std::os::unix::fs::PermissionsExt;
+
+		let dir = tempfile::tempdir().unwrap();
+		let path = dir.path().join("secret.key");
+		std::fs::write(&path, KEY).unwrap();
+		for mode in [0o640, 0o604, 0o644] {
+			std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).unwrap();
+			let err = load_or_create(&path, "replacement").await.unwrap_err();
+			assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied);
+			assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, mode);
+			assert_eq!(std::fs::read_to_string(&path).unwrap(), KEY);
+		}
+	}
+
+	#[cfg(unix)]
+	#[tokio::test]
+	async fn persisted_secret_refuses_symlinks_without_touching_the_target() {
+		use std::os::unix::fs::symlink;
+
+		let dir = tempfile::tempdir().unwrap();
+		let target = dir.path().join("target.key");
+		let link = dir.path().join("secret.key");
+		symlink(&target, &link).unwrap();
+		assert!(load_or_create(&link, KEY).await.is_err());
+		assert!(!target.exists());
+		std::fs::write(&target, KEY).unwrap();
+		assert!(load_or_create(&link, "replacement").await.is_err());
+		assert_eq!(std::fs::read_to_string(&target).unwrap(), KEY);
+	}
+
+	#[tokio::test]
+	async fn persisted_secret_refuses_nonregular_files() {
+		let dir = tempfile::tempdir().unwrap();
+		assert!(load_or_create(dir.path(), KEY).await.is_err());
+		#[cfg(unix)]
+		{
+			let path = dir.path().join("socket");
+			let _socket = std::os::unix::net::UnixListener::bind(&path).unwrap();
+			assert!(load_or_create(&path, KEY).await.is_err());
+
+			use std::os::unix::ffi::OsStrExt;
+			let path = dir.path().join("fifo");
+			let name = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+			// SAFETY: name is a valid, NUL-terminated path and mkfifo retains no pointer.
+			assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+			assert!(load_or_create(&path, KEY).await.is_err());
+		}
+	}
+
+	/// A public builder taking a config this crate did not check, so it refuses
+	/// before it touches the key file or a socket.
+	///
+	/// Without this, `resolve()` reads the canonical fields, sees `gso = None`, and
+	/// binds an endpoint the caller asked not to have. The canonical spelling errors
+	/// with [`Error::GsoUnsupported`], so the released one silently getting an
+	/// endpoint is the accepted-and-ignored failure in miniature.
+	#[tokio::test]
+	async fn bind_refuses_a_released_quic_spelling() {
+		#[derive(usage::Cli)]
+		#[usage(unknown_flags = "error", args_override_self = false)]
+		#[usage(settings)]
+		struct Cli {
+			#[usage(flatten)]
+			quic: crate::quic::Config,
+		}
+
+		let quic = Cli::parse_from(&[std::ffi::OsStr::new("--client-quic-gso=false")])
+			.unwrap()
+			.quic;
+		let config = Config {
+			enabled: Some(true),
+			..Default::default()
+		};
+
+		let Err(err) = config.bind(&quic).await else {
+			panic!("binding must refuse a released spelling");
+		};
+		assert!(matches!(err, Error::Deprecated(_)), "{err}");
+		assert!(err.to_string().contains("--quic-gso / MOQ_QUIC_GSO"), "{err}");
+	}
+
+	#[tokio::test]
+	async fn bind_rejects_invalid_windows_before_reading_secret() {
+		let dir = tempfile::tempdir().unwrap();
+		for (name, value) in [
+			("receive_window", 0),
+			("stream_receive_window", 0),
+			("send_window", 0),
+			("receive_window", 1 << 62),
+			("stream_receive_window", u64::MAX),
+		] {
+			let mut quic = crate::quic::Config::default();
+			match name {
+				"receive_window" => quic.receive_window = Some(value),
+				"stream_receive_window" => quic.stream_receive_window = Some(value),
+				"send_window" => quic.send_window = Some(value),
+				_ => unreachable!(),
+			}
+			let config = Config {
+				enabled: Some(true),
+				// Reading a directory fails if validation lets the invalid config through.
+				secret: Some(dir.path().to_str().unwrap().to_owned()),
+				..Default::default()
+			};
+			let Err(err) = config.bind(&quic).await else {
+				panic!("binding must reject {name} = {value}");
+			};
+			assert!(
+				matches!(&err, Error::Config(crate::Error::WindowRange(knob)) if *knob == name),
+				"{err}"
+			);
+		}
+	}
+
+	/// Build a controller from each family's factory and downcast it to the
+	/// concrete implementation it must map to. iroh runs on noq, so this is the
+	/// same pairing as the noq backend.
+	#[test]
+	fn congestion_factory_maps_each_family() {
+		let now = std::time::Instant::now();
+		let mtu = 1200;
+
+		let loss = congestion_factory(CongestionControl::Loss).build(now, mtu);
+		assert!(loss.into_any().downcast::<noq_proto::congestion::Cubic>().is_ok());
+
+		let delay = congestion_factory(CongestionControl::Delay).build(now, mtu);
+		assert!(delay.into_any().downcast::<noq_proto::congestion::Bbr3>().is_ok());
+	}
+}
