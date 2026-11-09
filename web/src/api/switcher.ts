@@ -1,10 +1,8 @@
 // Program/Preview first-slice HTTP calls. Wire types are generated from
 // OpenAPI; every mutation returns 202 pending, never an optimistic on-air claim.
 import type { components } from './schema';
-import { apiUrl, buildHeaders, OperationApiError, readProblem } from './operations';
+import { apiUrl, buildHeaders, OperationApiError, readProblem, newIdempotencyKey } from './operations';
 import type { RequestOptions } from './operations';
-import { correlateOperation } from '../realtime/operations';
-import type { OperationOutcome } from '../realtime/operations';
 
 export type SwitcherRequest = components['schemas']['SwitcherRequest'];
 export type SwitcherState = components['schemas']['SwitcherStateResponse'];
@@ -49,24 +47,19 @@ export async function planSwitcher(request: SwitcherRequest, options: RequestOpt
   return body;
 }
 
-/** An accepted command and its actual engine-completion promise. */
-export interface SwitcherPending {
-  readonly accepted: SwitcherAccepted;
-  readonly completion: Promise<OperationOutcome>;
-}
-
-/** Submit once with a fresh idempotency key; resolve only on `switcher.operation`. */
+/** Submit once; 202 is acceptance, not output-tick completion. */
 export async function commandSwitcher(
   action: SwitcherAction,
   request: SwitcherRequest,
-  options: RequestOptions & { readonly idempotencyKey: string },
-): Promise<SwitcherPending> {
-  const response = await fetch(apiUrl(options, `/api/v1/switcher/commands/${action}`), {
-    method: 'POST', headers: buildHeaders(options, true), body: JSON.stringify(request),
+  options: RequestOptions = {},
+): Promise<SwitcherAccepted> {
+  const requestOptions = { ...options, idempotencyKey: options.idempotencyKey ?? newIdempotencyKey() };
+  const response = await fetch(apiUrl(requestOptions, `/api/v1/switcher/commands/${action}`), {
+    method: 'POST', headers: buildHeaders(requestOptions, true), body: JSON.stringify(request),
   });
   if (!response.ok) throw await readProblem(response);
   if (response.status !== 202) throw new OperationApiError('Switcher command was not accepted', response.status);
   const body: unknown = await response.json();
   if (!isAccepted(body)) throw new OperationApiError('Invalid switcher operation id');
-  return { accepted: body, completion: correlateOperation(body, 60_000) };
+  return body;
 }

@@ -32,19 +32,10 @@ describe('submitOperation', () => {
 });
 
 describe('submitOperation completion', () => {
-  it('exposes a completion promise resolved by a corr-matched envelope', async () => {
-    const { resolveOperationEnvelope } = await import('../realtime/operations');
-    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response(JSON.stringify({ operation_id: 'op-c', kind: 'take_salvo' }), { status: 202 })));
+  it.each(['take_salvo', 'media_play', 'replay'])('does not arm a generic completion for %s', async (kind) => {
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response(JSON.stringify({ operation_id: `op-${kind}`, kind }), { status: 202 })));
     const accepted = await submitOperation('/api/v1/x/take');
-    resolveOperationEnvelope({ v: 1, t: 'operation.completed', topic: 'system', seq: 1, ts: 1, corr: 'op-c', data: {} });
-    await expect(accepted.completion).resolves.toMatchObject({ operationId: 'op-c' });
-  });
-
-  it('resolves completion when the outcome beat the POST response', async () => {
-    const { resolveOperationEnvelope } = await import('../realtime/operations');
-    resolveOperationEnvelope({ v: 1, t: 'operation.completed', topic: 'system', seq: 1, ts: 1, corr: 'op-e', data: {} });
-    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response(JSON.stringify({ operation_id: 'op-e', kind: 'take_salvo' }), { status: 202 })));
-    const accepted = await submitOperation('/api/v1/x/take');
-    await expect(accepted.completion).resolves.toMatchObject({ operationId: 'op-e' });
+    expect(accepted.completion).toBeUndefined();
+    expect(accepted.operation_id).toBe(`op-${kind}`);
   });
 });

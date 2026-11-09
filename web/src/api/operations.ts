@@ -20,9 +20,6 @@
 // caller can surface the id. `ETag`/`If-Match` optimistic concurrency is honoured
 // on the version-stamped mutations (alarm ack, salvo/profile replace + delete).
 import type { components } from './schema';
-import { isCorrelatedKind, REPLAY_KIND } from '../realtime/correlatedCommands';
-import { correlateOperation } from '../realtime/operations';
-import type { OperationOutcome } from '../realtime/operations';
 import { getStoredToken } from './token';
 
 /** An RFC 9457 problem document, as modelled in the spec. */
@@ -31,29 +28,12 @@ export type Problem = components['schemas']['Problem'];
 /** The `202 Accepted` body the command endpoints return. */
 export type AcceptedBody = components['schemas']['AcceptedBody'];
 
-/**
- * An accepted command plus the authoritative completion: resolves when the
- * realtime envelope whose `corr` equals `operation_id` arrives (or from the
- * early-outcome cache), rejects on timeout. Ignoring it is safe.
- */
-export type AcceptedOperation = AcceptedBody & {
-  /**
-   * Present only when the server correlates this command's outcome (see
-   * `../realtime/correlatedCommands`) or the acceptance is an Idempotency-Key
-   * replay (the original kind is unknown). Absent = acceptance-only.
-   */
-  readonly completion?: Promise<OperationOutcome>;
-};
+/** Compatibility shape: completion is never armed without a command-specific expectation. */
+export type AcceptedOperation = AcceptedBody & { readonly completion?: undefined };
 
-/** Register an accepted body for correlation and attach its completion promise. */
+/** Preserve existing caller shape while leaving the shared tracker as the only matcher. */
 export function trackAccepted(body: AcceptedBody): AcceptedOperation {
-  if (!isCorrelatedKind(body.kind) && body.kind !== REPLAY_KIND) {
-    return { ...body };
-  }
-  const completion = correlateOperation(body);
-  // A caller that never awaits `completion` must not trigger an unhandled rejection.
-  completion.catch(() => undefined);
-  return { ...body, completion };
+  return { ...body };
 }
 
 /** A failed operator-surface call, normalized to a message + status (+ detail). */
@@ -210,8 +190,8 @@ export async function sendCommand(
 /**
  * Send a long-running command (optionally with a JSON body) and return its `202
  * Accepted` body. The outcome arrives later on the realtime stream, never in this
- * response (conventions section 6); completion tracking is attached only for
- * commands the server correlates.
+ * response (conventions section 6); consumers that need evidence must submit
+ * through the shared tracker with a command-specific terminal expectation.
  */
 export async function submitOperation(
   path: string,

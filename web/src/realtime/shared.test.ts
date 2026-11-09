@@ -1,7 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { subscribeRealtime, subscribeRealtimeAll } from "./shared";
-import { correlateOperation } from "./operations";
 
 vi.mock("./ticket", () => ({
   realtimeWsBaseUrl: () => "ws://test/api/v1/ws",
@@ -108,30 +107,13 @@ describe("shared realtime service", () => {
     offB();
   });
 
-  it("resolves a pending operation from an envelope whose corr matches", async () => {
-    const off = subscribeRealtime("system", vi.fn());
+  it("delivers a corr frame to subscribers without an independent completion matcher", async () => {
+    const listener = vi.fn();
+    const off = subscribeRealtime("switcher", listener);
     const ws = await socket();
-    const outcome = correlateOperation({ operation_id: "op-1", kind: "take" });
-    ws.emit({ t: "operation.completed", topic: "system", seq: 1, corr: "op-1", data: {} });
-    await expect(outcome).resolves.toMatchObject({ operationId: "op-1", replayed: false });
-    off();
-  });
-
-  it("ignores envelopes with an unknown corr", async () => {
-    const off = subscribeRealtime("system", vi.fn());
-    const ws = await socket();
-    const outcome = correlateOperation({ operation_id: "op-2", kind: "take" }, 50);
-    ws.emit({ t: "x", topic: "system", seq: 1, corr: "other", data: {} });
-    await expect(outcome).rejects.toThrow(/timed out/);
-    off();
-  });
-
-  it("resolves a kind:replay acceptance only when the matching corr arrives", async () => {
-    const off = subscribeRealtime("system", vi.fn());
-    const ws = await socket();
-    const outcome = correlateOperation({ operation_id: "op-3", kind: "replay" });
-    ws.emit({ t: "operation.completed", topic: "system", seq: 1, corr: "op-3", data: {} });
-    await expect(outcome).resolves.toMatchObject({ operationId: "op-3", replayed: true });
+    ws.emit({ t: "media.player_state", topic: "switcher", id: "player-1", seq: 1, corr: "op-1", data: { state: { kind: "loading" } } });
+    expect(listener).toHaveBeenCalledTimes(1);
+    expect(listener.mock.calls[0]?.[0]).toMatchObject({ t: "media.player_state", corr: "op-1" });
     off();
   });
 });

@@ -12,7 +12,9 @@ import { useSources } from '../resources/queries';
 import { commandSwitcher, getSwitcher, planSwitcher } from '../api/switcher';
 import type { SwitcherAction, SwitcherRequest } from '../api/switcher';
 import { subscribeRealtime } from '../realtime/shared';
-import { followOperation } from '../api/operationStatus';
+import { useOperationFeedback, useSubmitTrackedOperation } from '../components/broadcast/useOperationFeedback';
+import { OperationFeedback } from '../components/broadcast/OperationFeedback';
+import { switcherOperationEvidence } from '../realtime/operationEvidence';
 import { newIdempotencyKey } from '../api/operations';
 import { useJpegPreview } from '../preview/useJpegPreview';
 
@@ -33,19 +35,26 @@ function SwitcherMonitor({ bus, path }: { readonly bus: string; readonly path: s
 export function SwitcherPage(): JSX.Element {
   const { t } = useLingui();
   const queryClient = useQueryClient();
+  const submitTracked = useSubmitTrackedOperation();
   const state = useQuery({ queryKey: STATE_KEY, queryFn: () => getSwitcher(), retry: false });
   const sources = useSources();
   const [selected, setSelected] = useState('');
   const [duration, setDuration] = useState('25');
-  const [pending, setPending] = useState<string | undefined>();
+  const [operationId, setOperationId] = useState<string | undefined>();
+  const operation = useOperationFeedback(operationId);
+  const [failureReason, setFailureReason] = useState<string | undefined>();
   const [error, setError] = useState<string | undefined>();
   useEffect(() => subscribeRealtime('switcher', (envelope) => {
-    if (envelope.t === 'switcher.operation') {
-      void queryClient.invalidateQueries({ queryKey: STATE_KEY });
+    if (envelope.t !== 'switcher.operation') return;
+    // Display-only reason: the shared tracker, not this page, decides the phase.
+    const evidence = switcherOperationEvidence(envelope);
+    if (evidence !== undefined && evidence.corr === operationId && evidence.resource === 'me1' && evidence.verdict === 'failed') {
+      setFailureReason(evidence.reason);
     }
+    void queryClient.invalidateQueries({ queryKey: STATE_KEY });
   }, undefined, () => {
     void queryClient.invalidateQueries({ queryKey: STATE_KEY });
-  }), [queryClient]);
+  }), [queryClient, operationId]);
   const mutate = useMutation({
     mutationFn: async (action: SwitcherAction) => {
       const source = action === 'select_program' || action === 'select_preview' ? selected : undefined;
@@ -56,33 +65,32 @@ export function SwitcherPage(): JSX.Element {
         ...(durationFrames === undefined ? {} : { duration_frames: durationFrames }),
       };
       await planSwitcher(req);
-      return commandSwitcher(action, req, { idempotencyKey: newIdempotencyKey() });
+      return submitTracked(() => commandSwitcher(action, req, { idempotencyKey: newIdempotencyKey() }),
+        { topic: 'switcher', resource: 'me1', event: 'switcher.operation', terminal: { kind: 'switcher-operation', me: 'me1' } });
     },
     onSuccess: (result) => {
-      setPending(result.accepted.operation_id);
+      setOperationId(result.operationId);
+      setFailureReason(undefined);
       setError(undefined);
-      followOperation({ ...result.accepted, completion: result.completion }, t`Switcher`);
-      void result.completion.then((outcome) => {
-        setPending(undefined);
-        if (outcome.envelope.t === 'switcher.operation' && typeof outcome.envelope.data === 'object' && outcome.envelope.data !== null && 'completed' in outcome.envelope.data && outcome.envelope.data.completed !== true) {
-          setError(t`Switcher operation rejected`);
-        }
-        void queryClient.invalidateQueries({ queryKey: STATE_KEY });
-      }).catch(() => {
-        setPending(undefined);
-        setError(t`Outcome unknown; refresh the engine state before taking again`);
-      });
     },
     onError: (reason: Error) => { setError(reason.message); },
   });
-  const ready = state.data !== undefined && pending === undefined && !mutate.isPending;
+  // Unknown (including unobserved/replay) is not permission to take again.
+  const settled = operation?.phase === 'applied' || operation?.phase === 'failed';
+  const ready = state.data !== undefined && (operationId === undefined || settled) && !mutate.isPending;
   return (
     <main className="space-y-5 p-4">
       <PageHeader title={t`Program / Preview switcher`} />
       {state.isError && <p role="status" className="rounded border border-amber-600 p-3"><Trans>Switcher unavailable: no real Program/Preview bus is attached. Controls are disabled.</Trans></p>}
       {state.isLoading && <p role="status"><Trans>Checking switcher engine…</Trans></p>}
       {error !== undefined && <p role="alert" className="text-destructive">{error}</p>}
-      {pending !== undefined && <p role="status"><Trans>Command accepted; awaiting the output tick</Trans> — {pending}</p>}
+      {operationId !== undefined && <OperationFeedback
+        phase={operation?.phase === 'accepted' ? 'pending' : operation?.phase ?? 'unknown'}
+        operationLabel={t`Switcher`}
+        correlationId={operationId}
+        failureReason={failureReason ?? t`Switcher operation rejected`}
+        unknownReason={t`Outcome unknown; refresh the engine state before taking again`}
+      />}
       {state.data !== undefined && <p role="status">PGM: {state.data.program_source} · PVW: {state.data.preview_source} · {t`Tick`} {state.data.tick}{state.data.in_flight ? ` · ${t`Transition running`}` : ''}</p>}
       <div className="grid gap-4 md:grid-cols-2">
         <SwitcherMonitor bus="PGM" path="/api/v1/preview/program.jpg" />

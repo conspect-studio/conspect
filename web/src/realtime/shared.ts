@@ -3,12 +3,11 @@
 // Hooks register a topic-keyed listener; the first subscriber opens the single
 // `RealtimeConnection`, the last one closes it. Resume (`last_seq`, ADR-RT002/003)
 // lives in the connection; a sequence gap is fanned out to every listener's
-// `onGap` so each one refetches/rebuilds its own state. Every envelope is also
-// offered to the operation-correlation layer (`corr` -> pending operation id).
+// `onGap` so each one refetches/rebuilds its own state. The shell listener
+// passes envelopes to the QueryClient-scoped operation tracker.
 import { RealtimeConnection } from "./connection";
 import type { RealtimeStatus } from "./connection";
 import type { Envelope } from "./envelope";
-import { resolveOperationEnvelope } from "./operations";
 import { mintWsTicket, realtimeWsBaseUrl } from "./ticket";
 
 export type EnvelopeListener = (envelope: Envelope) => void;
@@ -35,7 +34,6 @@ const STICKY_TOPIC = "system";
 let sticky: Envelope | undefined;
 
 function dispatchEnvelope(envelope: Envelope): void {
-  resolveOperationEnvelope(envelope);
   if (envelope.topic === STICKY_TOPIC) {
     sticky = envelope;
   }
