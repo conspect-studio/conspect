@@ -1236,6 +1236,33 @@ mod tests {
     }
 
     #[test]
+    fn serialized_family_charge_rejects_before_allocation_and_lasts_until_final_slice() {
+        let budget = crate::allocation::AllocationBudget::new(11).unwrap();
+        let packet = crate::Packet {
+            payload: bytes::Bytes::from_static(&[1, 2, 3]),
+            pts_us: 1,
+            verified_rap: true,
+        };
+        let frame = serialized_frame_in(&packet, Some(&budget)).unwrap();
+        assert_eq!(budget.retained_bytes(), 11);
+        assert_eq!(
+            serialized_frame_in(&packet, Some(&budget)).unwrap_err(),
+            crate::Reject::Budget
+        );
+        let retained = frame.slice(0..1);
+        drop(frame);
+        assert_eq!(budget.retained_bytes(), 11);
+        drop(retained);
+        assert_eq!(budget.retained_bytes(), 0);
+        let small = crate::allocation::AllocationBudget::new(10).unwrap();
+        assert_eq!(
+            serialized_frame_in(&packet, Some(&small)).unwrap_err(),
+            crate::Reject::Budget
+        );
+        assert_eq!(small.retained_bytes(), 0);
+    }
+
+    #[test]
     fn full_queue_returned_window_credit_lasts_exactly_as_long_as_its_payload() {
         let (fence, receiver) = Fence::channel(1);
         let window = |len| AvWindow {
