@@ -1927,3 +1927,6 @@ fn validate_display_output(
     }
     Ok(())
 }
+
+/// Explicit finite platform-measured preview admission.
+pub mod preview_ladder;

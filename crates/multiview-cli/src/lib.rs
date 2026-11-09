@@ -264,3 +264,12 @@ pub mod webrtc_outputs;
 /// bind hit `EADDRINUSE` and silently degraded. Behind `webrtc-native`.
 #[cfg(feature = "webrtc-native")]
 pub mod webrtc_unified;
+
+#[cfg(feature = "ffmpeg")]
+pub(crate) mod optional_rendition;
+#[cfg(feature = "ffmpeg")]
+pub(crate) mod preview_fanout;
+#[cfg(feature = "ffmpeg")]
+pub mod preview_runtime;
+#[cfg(feature = "ffmpeg")]
+pub mod preview_vertical;

@@ -666,6 +666,9 @@ async fn run_pipeline_until_ctrl_c(
         let live_apply = live_apply.with_audio_routing(
             multiview_cli::audio::routing_live_capability(pipeline.audio_route_slot()),
         );
+        #[cfg(feature = "moq-output")]
+        multiview_cli::moq_outputs::metadata::configure_optional_preview(&mut pipeline)
+            .map_err(|_| anyhow::anyhow!("explicit measured MoQ preview configuration rejected"))?;
         let (handle, command_rx, hub, watch, persist) = serve_control_plane(
             &cfg.listen,
             start,

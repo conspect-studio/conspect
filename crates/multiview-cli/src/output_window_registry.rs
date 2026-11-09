@@ -38,6 +38,7 @@ use crate::binding_delivery::WindowDelivery;
 const MAX_PEERS: usize = 16;
 /// Command depth limits unprocessed attach requests from the control plane.
 const COMMAND_DEPTH: usize = 32;
+const OPTIONAL_INGRESS_DEPTH: usize = 8;
 /// Whole admitted leases awaiting the transport (each retains its reservation).
 const WINDOW_HANDOFF: usize = 2;
 
@@ -106,7 +107,9 @@ impl VideoDescriptor {
                     if params.codec_id() == ffmpeg::codec::Id::H264 {
                         "H264".to_owned() // internal pending marker, never published
                     } else {
-                        params.hls_codec().unwrap_or("").to_owned()
+                        params
+                            .hls_codec()
+                            .map_or_else(|| identity.clone(), str::to_owned)
                     }
                 },
                 |config| config.codec.clone(),
@@ -132,7 +135,7 @@ pub(crate) struct AudioDescriptor {
     pub(crate) track: String,
     pub(crate) kind: StreamKind,
     pub(crate) codec: String,
-    /// Actual opened bitrate; unknown remains absent.
+    /// Actual opened bitrate. Unknown remains absent; admission must fail closed.
     pub(crate) bitrate_bps: Option<u64>,
     pub(crate) sample_rate: u32,
     pub(crate) channels: u32,
@@ -342,6 +345,7 @@ struct Attach {
     external: ExternalCancellation,
 }
 struct Peer {
+    binding: EffectiveBinding,
     output_index: usize,
     generation: u64,
     queue: BoundedBatchQueue,
@@ -375,17 +379,119 @@ fn try_reserve_slot(slots: &AtomicUsize) -> Result<(), SubscribeError> {
     }
 }
 
+/// Bounded ingress owned by the real optional encoder adapter. Clones share
+/// the routing identity and loss fence; no output-clock lock or acknowledgement wait.
+#[derive(Clone)]
+pub(crate) struct OptionalWindowProducer {
+    effective: EffectiveSnapshot,
+    tx: SyncSender<OptionalWindow>,
+    output_index: usize,
+    generation: u64,
+    lost: Arc<AtomicBool>,
+}
+struct OptionalWindow {
+    output_index: usize,
+    generation: u64,
+    packets: Vec<EncodedPacket>,
+    span: Duration,
+    now: Instant,
+    lost: bool,
+}
+impl OptionalWindowProducer {
+    pub(crate) fn matches(
+        &self,
+        factory: &SubscriptionFactory,
+        index: usize,
+        generation: u64,
+    ) -> bool {
+        Arc::ptr_eq(&self.effective, &factory.effective)
+            && self.output_index == index
+            && self.generation == generation
+    }
+    /// Nonblocking, whole-window admission. Overflow fences recovery on the next
+    /// drain; the caller must not retry a partially delivered window.
+    pub(crate) fn offer_complete(
+        &self,
+        packets: Vec<EncodedPacket>,
+        span: Duration,
+        now: Instant,
+    ) -> Result<(), SubscribeError> {
+        use multiview_output::batch::{MAX_BATCH_BYTES, MAX_BATCH_PACKETS, MAX_BATCH_SPAN};
+        if !self
+            .effective
+            .load()
+            .effective
+            .iter()
+            .any(|b| b.output_index == self.output_index && b.config_generation == self.generation)
+        {
+            return Err(SubscribeError::Unavailable);
+        }
+        if packets.is_empty()
+            || packets.len() > MAX_BATCH_PACKETS
+            || span > MAX_BATCH_SPAN
+            || packets.iter().map(EncodedPacket::len).sum::<usize>() > MAX_BATCH_BYTES
+        {
+            self.lost.store(true, Ordering::Release);
+            return Err(SubscribeError::Capacity);
+        }
+        self.tx
+            .try_send(OptionalWindow {
+                output_index: self.output_index,
+                generation: self.generation,
+                packets,
+                span,
+                now,
+                lost: self.lost.swap(false, Ordering::AcqRel),
+            })
+            .map_err(|e| {
+                self.lost.store(true, Ordering::Release);
+                match e {
+                    TrySendError::Full(_) => SubscribeError::Capacity,
+                    TrySendError::Disconnected(_) => SubscribeError::ProducerEnded,
+                }
+            })
+    }
+}
+
 /// Off-clock handle for authenticated, effective-output lookup and attachment.
 #[derive(Clone)]
 pub struct SubscriptionFactory {
-    effective: Arc<SwapCell<Arc<Vec<EffectiveBinding>>>>,
+    optional_publisher_claimed: Arc<AtomicBool>,
+    effective: EffectiveSnapshot,
     commands: SyncSender<Attach>,
+    optional: SyncSender<OptionalWindow>,
     next_id: Arc<AtomicU64>,
     slots: Arc<AtomicUsize>,
-    generation: u64,
     closed: Arc<AtomicBool>,
 }
 impl SubscriptionFactory {
+    /// Claim once per factory lifecycle, including all cloned handles. Never
+    /// reset: a replacement owner would lose the retired-index watermark.
+    pub(crate) fn claim_optional_publisher(&self) -> bool {
+        self.optional_publisher_claimed
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+    }
+
+    /// Create the real adapter ingress before registration; registration validates
+    /// that this handle belongs to this registry and exact routing key.
+    pub(crate) fn optional_producer(
+        &self,
+        output_index: usize,
+        generation: u64,
+    ) -> OptionalWindowProducer {
+        OptionalWindowProducer {
+            effective: Arc::clone(&self.effective),
+            tx: self.optional.clone(),
+            output_index,
+            generation,
+            lost: Arc::new(AtomicBool::new(false)),
+        }
+    }
+    pub(crate) fn snapshot(&self) -> Arc<EffectiveSnapshotState> {
+        self.effective.load()
+    }
+
     /// `Program` has no arbitrary first-output fallback; `Input` has no
     /// independent encoded key in this output registry.
     /// Resolve effective immutable codec/dependency metadata BEFORE authorization
@@ -399,6 +505,7 @@ impl SubscriptionFactory {
         };
         self.effective
             .load()
+            .effective
             .iter()
             .find(|b| b.output_id == *id)
             .cloned()
@@ -486,10 +593,37 @@ impl SubscriptionFactory {
     pub(crate) fn slots_in_use(&self) -> usize {
         self.slots.load(Ordering::Acquire)
     }
+    /// The immutable effective snapshot this factory serves. Read-only by
+    /// design: an additive caller (optional preview registration) composes a NEW
+    /// snapshot over it and never mutates this one, so production bindings,
+    /// their dependencies and their generation are preserved exactly.
+    #[must_use]
+    pub(crate) fn effective(&self) -> Arc<Vec<EffectiveBinding>> {
+        self.effective.load().effective.clone()
+    }
+
+    /// Publish `effective` as this run's admitted snapshot and return the
+    /// generation it now serves — the producer-side ACK: once this returns, the
+    /// producer's `reconcile`/`offer_complete` load the new snapshot, so a peer
+    /// attached to a binding in it can be routed. One atomic store, never a
+    /// block on the output clock, and the same `Attach` channel, peer-slot
+    /// counter and id source stay shared, so production peers are untouched.
+    pub(crate) fn publish_effective(
+        &self,
+        effective: Vec<EffectiveBinding>,
+        generation: u64,
+    ) -> u64 {
+        self.effective.store(Arc::new(EffectiveSnapshotState {
+            effective: Arc::new(effective),
+            generation,
+        }));
+        generation
+    }
+
     /// The effective-configuration generation this factory serves. A subscriber
     /// that resolved against another generation is refused `StaleGeneration`.
     pub(crate) fn generation(&self) -> u64 {
-        self.generation
+        self.effective.load().generation
     }
     /// Every admitted effective binding, in binding order — the admitted-only
     /// catalogue, as an immutable snapshot of this factory's single instance.
@@ -497,7 +631,7 @@ impl SubscriptionFactory {
     /// are absent by construction. Read-only: resolving or listing allocates no
     /// demand and takes no peer slot.
     pub(crate) fn admitted(&self) -> Arc<Vec<EffectiveBinding>> {
-        self.effective.load()
+        self.effective.load().effective.clone()
     }
 }
 
@@ -519,6 +653,36 @@ pub type WindowSubscriptionSlot = Arc<SwapCell<Option<Arc<SubscriptionFactory>>>
 pub(crate) fn window_subscription_slot() -> WindowSubscriptionSlot {
     Arc::new(SwapCell::empty())
 }
+
+/// One authoritative effective snapshot: the admitted bindings AND the
+/// generation they were published for.
+#[derive(Debug, Default)]
+pub(crate) struct EffectiveSnapshotState {
+    /// The admitted bindings, in binding order.
+    pub(crate) effective: Arc<Vec<EffectiveBinding>>,
+    /// The generation this snapshot serves.
+    pub(crate) generation: u64,
+}
+
+/// The SINGLE authority on which bindings are admitted right now. The producer
+/// read path (`reconcile`, `offer_complete`, peer admission) and the resolver
+/// load THIS cell, so a registration published mid-run is visible to the
+/// producer without a second copy of the truth. Per-binding `config_generation`
+/// stays the authority for staleness, so publishing a new snapshot never
+/// invalidates an already-attached production peer.
+pub(crate) type EffectiveSnapshot = Arc<SwapCell<Arc<EffectiveSnapshotState>>>;
+
+/// Build the shared snapshot cell an egress build publishes through.
+#[must_use]
+pub(crate) fn effective_snapshot(
+    effective: Vec<EffectiveBinding>,
+    generation: u64,
+) -> EffectiveSnapshot {
+    Arc::new(SwapCell::new(Arc::new(EffectiveSnapshotState {
+        effective: Arc::new(effective),
+        generation,
+    })))
+}
 /// Producer-owned queue registry. Only the off-clock dispatcher calls its methods.
 ///
 /// Retention is bounded globally by construction: at most [`MAX_PEERS`] peers,
@@ -527,9 +691,9 @@ pub(crate) fn window_subscription_slot() -> WindowSubscriptionSlot {
 /// released by the [`BatchLease`] drop, so a stalled transport can only lose its
 /// own windows.
 pub(crate) struct OutputWindowRegistry {
-    effective: Arc<Vec<EffectiveBinding>>,
-    published: Arc<SwapCell<Arc<Vec<EffectiveBinding>>>>,
+    effective: EffectiveSnapshot,
     commands: Receiver<Attach>,
+    optional: Receiver<OptionalWindow>,
     peers: Vec<Peer>,
     rejected_windows: u64,
     closed: Arc<AtomicBool>,
@@ -565,27 +729,33 @@ impl OutputWindowRegistry {
     /// Build the registry pair from an already-validated snapshot. Only the
     /// validating constructor and the tap's filtering path call this; an empty
     /// snapshot is valid (a display-only run has no subscribable rendition).
-    fn bare(effective: Vec<EffectiveBinding>, generation: u64) -> (Self, SubscriptionFactory) {
+    pub(crate) fn bare(
+        effective: Vec<EffectiveBinding>,
+        generation: u64,
+    ) -> (Self, SubscriptionFactory) {
         let (tx, commands) = mpsc::sync_channel(COMMAND_DEPTH);
-        let published = Arc::new(SwapCell::new(Arc::new(effective.clone())));
-        let effective = Arc::new(effective);
+        let (optional_tx, optional) = mpsc::sync_channel(OPTIONAL_INGRESS_DEPTH);
+        // ONE cell, shared by the producer registry and the factory handle:
+        // neither side keeps a private copy of the admitted set.
+        let snapshot = effective_snapshot(effective, generation);
         let closed = Arc::new(AtomicBool::new(false));
         (
             Self {
-                effective: Arc::clone(&effective),
-                published: Arc::clone(&published),
+                effective: Arc::clone(&snapshot),
                 commands,
+                optional,
                 peers: Vec::new(),
                 rejected_windows: 0,
                 closed: closed.clone(),
             },
             SubscriptionFactory {
-                effective: published,
+                effective: snapshot,
                 commands: tx,
+                optional: optional_tx,
                 next_id: Arc::new(AtomicU64::new(1)),
                 slots: Arc::new(AtomicUsize::new(0)),
-                generation,
                 closed,
+                optional_publisher_claimed: Arc::new(AtomicBool::new(false)),
             },
         )
     }
@@ -605,8 +775,10 @@ impl OutputWindowRegistry {
             // never admitted; the control plane must re-resolve.
             let still_effective = self
                 .effective
+                .load()
+                .effective
                 .iter()
-                .any(|b| b.output_id == attach.binding.output_id);
+                .any(|b| b == &attach.binding);
             if !still_effective
                 || attach.own_revoked.load(Ordering::Acquire)
                 || attach.external.is_cancelled()
@@ -615,6 +787,7 @@ impl OutputWindowRegistry {
             }
             debug_assert!(self.peers.len() < MAX_PEERS);
             self.peers.push(Peer {
+                binding: attach.binding.clone(),
                 output_index: attach.binding.output_index,
                 generation: attach.binding.config_generation,
                 queue: match attach.binding.video.recovery {
@@ -630,8 +803,9 @@ impl OutputWindowRegistry {
                 rejected: 0,
             });
         }
+        let snapshot = self.effective.load();
         self.peers.retain_mut(|peer| {
-            if peer.enqueueable() {
+            if peer.enqueueable() && snapshot.effective.iter().any(|b| b == &peer.binding) {
                 true
             } else {
                 // Close the peer's queue and drop its sender: the transport's
@@ -659,6 +833,8 @@ impl OutputWindowRegistry {
     ) {
         self.reconcile();
         if !self
+            .effective
+            .load()
             .effective
             .iter()
             .any(|b| b.output_index == output_index && b.config_generation == generation)
@@ -699,7 +875,7 @@ impl OutputWindowRegistry {
         // once per output tick by `pump`, so a subscriber whose channel the
         // transport has drained still receives the queued tail after the encoder
         // goes quiet — no window can sit indefinitely in `pending`/queue.
-        self.pump(now);
+        self.pump_peers(now);
     }
 
     /// Move already-admitted windows to their transports without waiting on any
@@ -712,6 +888,24 @@ impl OutputWindowRegistry {
     /// an explicit whole-window loss.
     pub(crate) fn pump(&mut self, now: Instant) {
         self.reconcile();
+        for _ in 0..OPTIONAL_INGRESS_DEPTH {
+            let Ok(window) = self.optional.try_recv() else {
+                break;
+            };
+            if window.lost {
+                self.report_loss(window.output_index, OfferError::ProducerLoss);
+            }
+            self.offer_complete(
+                window.output_index,
+                window.generation,
+                &window.packets,
+                window.span,
+                window.now,
+            );
+        }
+        self.pump_peers(now);
+    }
+    fn pump_peers(&mut self, now: Instant) {
         for peer in &mut self.peers {
             if !peer.enqueueable() {
                 continue;
@@ -868,8 +1062,7 @@ impl OpenedRenditions<'_> {
                 ));
                 for (track_index, (params, time_base)) in self.audio_tracks.iter().enumerate() {
                     let kind = u16::try_from(track_index)
-                        .map(StreamKind::AudioTrack)
-                        .unwrap_or(StreamKind::Audio);
+                        .map_or(StreamKind::Audio, StreamKind::AudioTrack);
                     let track = self
                         .declared_tracks
                         .get(track_index)
@@ -992,10 +1185,15 @@ impl<D: WindowDelivery> WindowDelivery for OutputWindowTap<D> {
             *attempts < 32
         });
         if !admitted.is_empty() {
-            let mut effective = self.registry.effective.as_ref().clone();
+            let snapshot = self.registry.effective.load();
+            let mut effective = snapshot.effective.as_ref().clone();
             effective.extend(admitted);
-            self.registry.published.store(Arc::new(effective.clone()));
-            self.registry.effective = Arc::new(effective);
+            self.registry
+                .effective
+                .store(Arc::new(EffectiveSnapshotState {
+                    effective: Arc::new(effective),
+                    generation: snapshot.generation,
+                }));
         }
         // Mirror first: it cannot wait, and the physical binding's own admission
         // is the authoritative outcome the dispatcher reports.
@@ -1101,6 +1299,7 @@ mod tests {
     }
 
     #[test]
+
     fn opened_descriptor_preserves_cadence_independent_of_timestamp_scale() {
         let encoder = multiview_ffmpeg::VideoEncoder::new(&multiview_ffmpeg::VideoEncodeTarget {
             codec_name: "mpeg2video".into(),
@@ -1197,6 +1396,27 @@ mod tests {
     }
     fn pointer(packet: &EncodedPacket) -> usize {
         packet.payload().unwrap().as_ptr() as usize
+    }
+
+    #[test]
+    fn pending_attach_checks_full_authorized_binding_after_publication() {
+        let old = binding("auth", 0);
+        let generation = old.config_generation;
+        let (mut registry, factory) = OutputWindowRegistry::bare(vec![old.clone()], generation);
+        let sub = factory
+            .subscribe(&WhepScope::Output("auth".into()), generation)
+            .unwrap();
+        let mut replacement = old;
+        replacement.dependencies.push(Dependency {
+            kind: DependencyKind::Source,
+            id: "new-private-source".into(),
+        });
+        factory.publish_effective(vec![replacement], generation);
+        registry.pump(Instant::now());
+        assert!(matches!(
+            sub.try_recv_window(),
+            Err(SubscribeError::ProducerEnded)
+        ));
     }
 
     #[test]
@@ -1527,7 +1747,7 @@ mod tests {
         registry.reconcile();
         assert_eq!(registry.active_peers(), MAX_PEERS);
         assert_eq!(new_peer.binding.output_id, "b");
-        assert_eq!(registry.effective.len(), 2);
+        assert_eq!(registry.effective.load().effective.len(), 2);
     }
 
     #[test]

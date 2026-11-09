@@ -1905,6 +1905,7 @@ pub struct Pipeline {
     /// startup) loads it lock-free to attach shared-rendition subscribers. The
     /// cell exists from build time; the factory appears when the egress starts.
     window_subscriptions: crate::output_window_registry::WindowSubscriptionSlot,
+    optional_preview: Option<crate::preview_vertical::PreviewStartup>,
     /// The run's **real** authorization axes for every effective output (t65):
     /// the implicit program the legacy config desugars to, plus each ingest
     /// source a cell actually binds. Derived once from the configuration —
@@ -2807,6 +2808,7 @@ impl Pipeline {
             epoch_anchor: crate::timing_status::anchor_slot(),
             program_audio_preview: None,
             window_subscriptions: crate::output_window_registry::window_subscription_slot(),
+            optional_preview: None,
             window_dependencies: Arc::new(window_dependency_axes(config)),
         })
     }
@@ -3088,6 +3090,12 @@ impl Pipeline {
     /// slow/absent WHEP consumer can never back-pressure the engine (inv #1/#10).
     pub fn set_program_audio_preview(&mut self, slot: crate::preview::ProgramAudioSlot) {
         self.program_audio_preview = Some(slot);
+    }
+
+    /// Opt in with an explicit finite platform-measured reservation request.
+    #[allow(dead_code)] // Explicit startup integration API; control owns request construction.
+    pub fn set_optional_preview(&mut self, request: crate::preview_vertical::PreviewStartup) {
+        self.optional_preview = Some(request);
     }
 
     /// The run's effective-output subscription rendezvous (t65): the SAME cell
@@ -4015,6 +4023,7 @@ impl Pipeline {
             binding_ids,
             Arc::clone(&self.window_dependencies),
             Arc::clone(&self.window_subscriptions),
+            self.optional_preview.clone(),
             &self
                 .rendition_configs
                 .iter()
@@ -5082,13 +5091,18 @@ impl StreamEgress {
     /// on. Dropping that sender (when the engine loop ends) closes the hot queue
     /// → the consumer drains, fans the remainder, drops the sink senders → each
     /// sink sees end-of-program and finalises → [`StreamEgress::join`] folds stats.
-    #[allow(clippy::too_many_arguments)] // reason: the bake consumer threads the encode, the audio bus + loudnorm + loudness meter, and the publisher — each a distinct, irreducible owned input to the off-hot-path consumer.
+    #[allow(
+        clippy::too_many_arguments,
+        clippy::too_many_lines,
+        clippy::needless_pass_by_value
+    )] // Each distinct owned startup input transfers into one egress lifecycle.
     fn spawn(
         ctx: BakeContext,
         runners: Vec<(SinkRunner, SinkSendPolicy)>,
         binding_ids: Vec<Option<String>>,
         dependency_axes: Arc<Vec<crate::output_window_registry::Dependency>>,
         window_subscriptions: crate::output_window_registry::WindowSubscriptionSlot,
+        optional_preview: Option<crate::preview_vertical::PreviewStartup>,
         gates: &[Option<RecoveryGate>],
         media_span: Duration,
         cadence: Rational,
@@ -5187,12 +5201,50 @@ impl StreamEgress {
             dependencies: dependency_axes.as_ref(),
             generation: window_generation,
         };
+        let opened_bindings = opened.bindings();
+        let optional_preview = optional_preview.map(|mut request| {
+            request.opened_parent = opened_bindings
+                .iter()
+                .find(|b| b.output_id == request.parent_output)
+                .cloned();
+            request
+        });
         let (delivery, factory) = crate::output_window_registry::OutputWindowTap::new(
             delivery,
-            opened.bindings(),
+            opened_bindings,
             window_generation,
         );
-        window_subscriptions.store(Some(Arc::new(factory)));
+        // Check reservations against ALL opened production encoders, including
+        // outputs that cannot enter the subscriber catalog (for example FFV1).
+        let optional_preview = optional_preview.filter(|request| {
+            request.production.len() == binding_ids.iter().flatten().count()
+                && binding_ids.iter().enumerate().all(|(index, id)| {
+                    let Some(id) = id else {
+                        return true;
+                    };
+                    let Some((params, _)) = output_video_keys
+                        .get(index)
+                        .and_then(|key| video_params.get(*key))
+                    else {
+                        return false;
+                    };
+                    request.production.iter().any(|reservation| {
+                        reservation.output_id == *id
+                            && params.video_dimensions()
+                                == Some((reservation.key.width, reservation.key.height))
+                            && reservation.key.cadence == cadence
+                            && reservation
+                                .key
+                                .codec
+                                .eq_ignore_ascii_case(&format!("{:?}", params.codec_id()))
+                            && params
+                                .opened_bit_rate()
+                                .is_none_or(|rate| rate == reservation.key.bitrate_bps)
+                    })
+                })
+        });
+        let factory = Arc::new(factory);
+        window_subscriptions.store(Some(factory.clone()));
         let mut receivers = receivers.into_iter();
         let mut sinks = Vec::with_capacity(runners.len());
         for (i, (runner, _send_policy)) in runners.into_iter().enumerate() {
@@ -5304,6 +5356,8 @@ impl StreamEgress {
                     audio_encoder,
                     output_video_keys,
                     output_audio_tracks,
+                    optional_preview,
+                    factory,
                     audio_bus,
                     audio_route,
                     audio_loudnorm,
@@ -5891,6 +5945,8 @@ fn consumer_main<D: WindowDelivery>(
     mut audio_encoder: Option<AudioRenditionEncoder>,
     output_video_keys: Vec<usize>,
     output_audio_tracks: Vec<Vec<usize>>,
+    optional_preview: Option<crate::preview_vertical::PreviewStartup>,
+    factory: Arc<crate::output_window_registry::SubscriptionFactory>,
     mut audio_bus: Option<multiview_audio::program::ProgramBus>,
     audio_route: Option<Arc<crate::audio::AudioControlHandle>>,
     mut audio_loudnorm: Option<multiview_audio::LoudnormProcessor>,
@@ -5948,6 +6004,21 @@ fn consumer_main<D: WindowDelivery>(
             encoder.track_streams().len() + 1,
         )
         .collect()
+    });
+    let optional = optional_preview.and_then(|request| {
+        let tracks = request
+            .opened_parent
+            .as_ref()
+            .and_then(|b| output_audio_tracks.get(b.output_index))
+            .cloned()
+            .unwrap_or_default();
+        crate::preview_vertical::PreviewIngress::spawn(
+            request,
+            factory,
+            cadence,
+            audio_bases.clone(),
+            tracks,
+        )
     });
     let bindings = output_video_keys
         .iter()
@@ -6114,6 +6185,9 @@ fn consumer_main<D: WindowDelivery>(
                     kind: "video-worker",
                     reason: format!("{e:?}"),
                 })?;
+        }
+        if let Some(preview) = optional.as_ref() {
+            preview.offer(item.tick_index, &overlaid);
         }
         last_tick = Some(item.tick_index);
         last_baked = Some(Arc::clone(&overlaid));
@@ -6288,16 +6362,20 @@ fn consumer_main<D: WindowDelivery>(
                         })
                 }));
             }
+            let audio_event = DispatchEvent::Audio {
+                tick: item.tick_index,
+                timebases: audio_bases
+                    .iter()
+                    .map(|tb| Rational::new(tb.num, tb.den))
+                    .collect(),
+                packets: audio_packets,
+                watermarks,
+            };
+            if let Some(preview) = optional.as_ref() {
+                preview.audio(&audio_event);
+            }
             event_tx
-                .send(DispatchEvent::Audio {
-                    tick: item.tick_index,
-                    timebases: audio_bases
-                        .iter()
-                        .map(|tb| Rational::new(tb.num, tb.den))
-                        .collect(),
-                    packets: audio_packets,
-                    watermarks,
-                })
+                .send(audio_event)
                 .map_err(|e| PipelineError::Output {
                     kind: "audio-dispatch",
                     reason: e.to_string(),
@@ -11133,7 +11211,7 @@ impl PacketSource for StreamingPacketSource {
 /// placeholder. The consumer calls this once per baked frame, before the single
 /// encode (invariant #7) — the bridge that used to run once *per sink* now runs
 /// once *per frame*.
-fn nv12_to_decoded(image: &Nv12Image) -> Result<DecodedVideoFrame, PipelineError> {
+pub(crate) fn nv12_to_decoded(image: &Nv12Image) -> Result<DecodedVideoFrame, PipelineError> {
     let frame = nv12_to_video(image)?;
     let meta = FrameMeta {
         pts: MediaTime::ZERO,
@@ -21170,6 +21248,264 @@ codec = "ffv1"
 segment_ms = 1000
 "##
         .to_owned()
+    }
+
+    #[cfg(feature = "gpl-codecs")]
+    #[test]
+    fn actual_pipeline_optional_h264_shares_audio_and_preserves_production_ticks() {
+        optional_pipeline_case(Duration::ZERO, 1, "mpeg2video");
+    }
+
+    #[cfg(feature = "gpl-codecs")]
+    #[test]
+    fn actual_pipeline_slow_optional_startup_never_stalls_production() {
+        optional_pipeline_case(Duration::from_millis(500), 1, "mpeg2video");
+    }
+
+    #[cfg(feature = "gpl-codecs")]
+    #[test]
+    fn actual_pipeline_three_finite_optional_profiles() {
+        optional_pipeline_case(Duration::ZERO, 3, "mpeg2video");
+    }
+
+    #[cfg(feature = "gpl-codecs")]
+    #[test]
+    fn actual_pipeline_h264_production_with_optional_h264() {
+        optional_pipeline_case(Duration::ZERO, 1, "libx264");
+    }
+
+    #[cfg(feature = "gpl-codecs")]
+    #[test]
+    fn actual_pipeline_hevc_production_with_optional_h264() {
+        optional_pipeline_case(Duration::ZERO, 1, "libx265");
+    }
+
+    #[cfg(feature = "gpl-codecs")]
+    fn optional_pipeline_case(startup_delay: Duration, profiles: usize, production_codec: &str) {
+        use multiview_config::preview_ladder::{
+            PreviewKey, PreviewRequest, ProductionReservation, ResourceCost,
+        };
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let config_text = three_outputs_two_encodes().replace(
+                "codec = \"mpeg2video\"",
+                &format!("codec = \"{production_codec}\""),
+            );
+            let config = MultiviewConfig::load_from_toml(&config_text).unwrap();
+            let mut pipeline = Pipeline::build(&config).unwrap();
+            pipeline.enable_program_audio();
+            let slot = pipeline.window_subscriptions();
+            let key = PreviewKey {
+                program: "main".into(),
+                bus: "main".into(),
+                codec: "mpeg2video".into(),
+                encoder_name: "mpeg2video".into(),
+                width: 64,
+                height: 64,
+                cadence: Rational::new(25, 1),
+                bitrate_bps: 4_000_000,
+                codec_profile: None,
+                pixel_format: "nv12".into(),
+                color: "bt709-limited".into(),
+                gpu_pin: None,
+                codec_config: None,
+            };
+            let mut optional_key = key.clone();
+            optional_key.codec = "h264".into();
+            optional_key.encoder_name = "libx264".into();
+            optional_key.bitrate_bps = 100_000;
+            let cost = ResourceCost {
+                encoder_sessions: 1,
+                cpu_units: 1,
+                memory_bytes: 1_048_576,
+                ..ResourceCost::default()
+            };
+            // Measurements are supplied by this explicit software test admission,
+            // never a runtime default or a claim about a GPU's capacity.
+            let mut production = Vec::new();
+            for (i, codec) in ["mpeg2video", "mpeg2video", "ffv1"].iter().enumerate() {
+                let mut k = key.clone();
+                let codec = if *codec == "mpeg2video" {
+                    production_codec
+                } else {
+                    codec
+                };
+                k.codec = match codec {
+                    "libx264" => "h264",
+                    "libx265" => "hevc",
+                    other => other,
+                }
+                .into();
+                k.encoder_name = codec.into();
+                production.push(ProductionReservation {
+                    output_id: format!("test-sink-{i}"),
+                    key: k,
+                    cost,
+                });
+            }
+            let keys: Vec<_> = (0..profiles)
+                .map(|i| {
+                    let mut key = optional_key.clone();
+                    key.bitrate_bps += u64::try_from(i).unwrap() * 50_000;
+                    key.width = 64 - u32::try_from(i).unwrap() * 16;
+                    key.height = key.width;
+                    key
+                })
+                .collect();
+            pipeline.set_optional_preview(crate::preview_vertical::PreviewStartup {
+                parent_output: "test-sink-0".into(),
+                production,
+                requests: keys
+                    .iter()
+                    .enumerate()
+                    .map(|(i, key)| PreviewRequest {
+                        profile_id: format!("profile-{i}"),
+                        key: key.clone(),
+                    })
+                    .collect(),
+                capacity: Some(ResourceCost {
+                    encoder_sessions: 6,
+                    cpu_units: 6,
+                    memory_bytes: 8_388_608,
+                    uplink_bps: 20_000_000,
+                    ..ResourceCost::default()
+                }),
+                measured: keys.into_iter().map(|key| (key, cost)).collect(),
+                audio_once_bps: 128_000,
+                overhead_bps: 100_000,
+                opened_parent: None,
+                startup_delay,
+            });
+            let observations = Arc::new(std::sync::Mutex::new((
+                Vec::<i64>::new(),
+                Vec::<(i64, usize)>::new(),
+                Vec::<(i64, usize)>::new(),
+                false,
+            )));
+            let observed = observations.clone();
+            let runner: TestSinkRunner = Box::new(move |rx| {
+                let factory = slot.load().unwrap();
+                let mut sub = None;
+                let mut stalled = None;
+                let mut frames = 0;
+                while let Ok(packet) = rx.recv() {
+                    frames += 1;
+                    let mut o = observed.lock().unwrap();
+                    if packet.kind() == multiview_ffmpeg::StreamKind::Video {
+                        o.0.push(packet.pts().unwrap());
+                    }
+                    if packet.kind() == multiview_ffmpeg::StreamKind::Audio {
+                        o.1.push((
+                            packet.pts().unwrap(),
+                            packet.payload().unwrap().as_ptr() as usize,
+                        ));
+                    }
+                    if sub.is_none() {
+                        if let Some(binding) = factory
+                            .effective()
+                            .iter()
+                            .find(|b| b.output_id.starts_with("preview:"))
+                        {
+                            let ready = factory.effective();
+                            assert_eq!(
+                                ready
+                                    .iter()
+                                    .filter(|b| b.output_id.starts_with("preview:"))
+                                    .count(),
+                                profiles
+                            );
+                            o.3 = !binding.audio.is_empty()
+                                && binding.video.codec.starts_with("avc1.");
+                            stalled = Some(
+                                factory
+                                    .subscribe(
+                                        &multiview_control::WhepScope::Output(
+                                            binding.output_id.clone(),
+                                        ),
+                                        factory.generation(),
+                                    )
+                                    .unwrap(),
+                            );
+                            sub = Some(
+                                factory
+                                    .subscribe(
+                                        &multiview_control::WhepScope::Output(
+                                            binding.output_id.clone(),
+                                        ),
+                                        factory.generation(),
+                                    )
+                                    .unwrap(),
+                            );
+                        }
+                    }
+                    if let Some(sub) = sub.as_ref() {
+                        while let Ok(Some(window)) = sub.try_recv_window() {
+                            for p in window.permit.packets() {
+                                if p.kind() == multiview_ffmpeg::StreamKind::Audio {
+                                    o.2.push((
+                                        p.pts().unwrap(),
+                                        p.payload().unwrap().as_ptr() as usize,
+                                    ));
+                                }
+                            }
+                        }
+                    }
+                }
+                if startup_delay.is_zero() {
+                    assert!(
+                        stalled.is_some(),
+                        "second optional peer stays stalled for the run"
+                    );
+                }
+                TestSinkOutcome { frames }
+            });
+            let count = || -> TestSinkRunner {
+                Box::new(|rx| TestSinkOutcome {
+                    frames: rx.iter().count(),
+                })
+            };
+            let clock = Arc::new(ManualTimeSource::new());
+            let driver_stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            spawn_clock_driver(clock.clone(), driver_stop.clone());
+            let result = pipeline
+                .drive_streaming_for_test(
+                    StreamTestParams {
+                        time: clock,
+                        pacer: CooperativePacer,
+                        max_ticks: Some(40),
+                        policy: SendPolicy::BlockForExact,
+                        runners: vec![runner, count(), count()],
+                        hot_tick_observer: None,
+                        consumer_fault_after_ticks: None,
+                        shed_at_tick: None,
+                    },
+                    &StopSignal::new(),
+                )
+                .await
+                .unwrap();
+            driver_stop.store(true, Ordering::Release);
+            assert_eq!(result.report.frames, 40);
+            let o = observations.lock().unwrap();
+            assert_eq!(o.0, (0..40).collect::<Vec<_>>());
+            if !startup_delay.is_zero() {
+                // The fixed ingress bound retires a startup that cannot catch
+                // up; it never waits for native open or grows to hide the delay.
+                assert!(!o.3, "slow optional startup must remain unavailable");
+                return;
+            }
+            assert!(o.3, "actual opened optional metadata must be published");
+            assert!(
+                !o.2.is_empty(),
+                "actual optional whole AV windows must arrive"
+            );
+            assert!(
+                o.2.iter().any(|audio| o.1.contains(audio)),
+                "optional audio must share production payload references"
+            );
+        });
     }
 
     fn build_pipeline() -> Pipeline {

@@ -549,3 +549,55 @@ mod tests {
         assert!(authorize_binding(&p, &scope, "effective", &[]).is_err());
     }
 }
+
+/// Explicit measurements and requested profiles. The engine constructor is the
+/// validation boundary; unknown fields do not become silent capacity defaults.
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MeasuredPreviewConfig {
+    parent_output: String,
+    production: Vec<multiview_config::preview_ladder::ProductionReservation>,
+    requests: Vec<multiview_config::preview_ladder::PreviewRequest>,
+    capacity: Option<multiview_config::preview_ladder::ResourceCost>,
+    measured: Vec<(
+        multiview_config::preview_ladder::PreviewKey,
+        multiview_config::preview_ladder::ResourceCost,
+    )>,
+    audio_once_bps: u64,
+    overhead_bps: u64,
+}
+impl MeasuredPreviewConfig {
+    /// Validate without opening any encoder or exposing internal parent metadata.
+    pub fn into_startup(self) -> Option<crate::preview_vertical::PreviewStartup> {
+        crate::preview_vertical::PreviewStartup::new(
+            self.parent_output,
+            self.production,
+            self.requests,
+            self.capacity,
+            self.measured,
+            self.audio_once_bps,
+            self.overhead_bps,
+        )
+    }
+}
+/// Install only explicit measured configuration before the run starts.
+pub fn configure_optional_preview(
+    pipeline: &mut crate::pipeline::Pipeline,
+) -> Result<(), multiview_control::moq::MoqReject> {
+    let Some(path) = std::env::var("MULTIVIEW_MOQ_PREVIEW_CONFIG_FILE").ok() else {
+        return Ok(());
+    };
+    #[cfg(unix)]
+    let config: MeasuredPreviewConfig = read_measured_startup(std::path::Path::new(&path))?;
+    #[cfg(not(unix))]
+    let config: MeasuredPreviewConfig = {
+        let _ = path;
+        return Err(multiview_control::moq::MoqReject::Unavailable);
+    };
+    pipeline.set_optional_preview(
+        config
+            .into_startup()
+            .ok_or(multiview_control::moq::MoqReject::Unavailable)?,
+    );
+    Ok(())
+}
