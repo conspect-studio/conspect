@@ -178,10 +178,9 @@ pub use log_bridge::install as install_log_bridge;
 pub use idr::{is_idr, CodecKind, NalFraming};
 
 pub use hwdecode::{
-    cuvid_decoder, cuvid_resize_option, decode_surface_pool, nvdec_disabled, nvdec_resize_target,
-    plan_decode_resize, want_hw_decode, DecodeResizeStrategy, DecodeSurfacePool, HwBitDepth,
-    HwDecodePlan, HwDeviceKind, HwInputCodec, PoolInputs, ResizeInputs, TileSize,
-    NVDEC_DISABLE_ENV, NVDEC_RESIZE_DISABLE_ENV,
+    cuvid_decoder, decode_surface_pool, nvdec_disabled, plan_decode_resize, want_hw_decode,
+    DecodeResizeStrategy, DecodeSurfacePool, HwBitDepth, HwDecodePlan, HwDeviceKind, HwInputCodec,
+    PoolInputs, ResizeInputs, TileSize, NVDEC_DISABLE_ENV,
 };
 
 #[cfg(feature = "ffmpeg")]
@@ -235,10 +234,6 @@ pub mod decode_stream;
 
 #[cfg(feature = "ffmpeg")]
 pub mod demux;
-
-/// Bounded demux+decode sample probe for the IPTV-ORG deep probe.
-#[cfg(feature = "ffmpeg")]
-pub mod media_probe;
 
 #[cfg(feature = "ffmpeg")]
 pub mod encode;
@@ -309,9 +304,7 @@ pub use decode_stream::{
 };
 
 #[cfg(feature = "ffmpeg")]
-pub use demux::{
-    discard_unrouted_subtitles, DemuxOptions, Demuxer, HttpHeaders, ReadPacket, StreamParams,
-};
+pub use demux::{discard_unrouted_subtitles, DemuxOptions, Demuxer, ReadPacket, StreamParams};
 
 #[cfg(feature = "ffmpeg")]
 pub use encode::{AudioEncodeTarget, AudioEncoder, VideoEncodeTarget, VideoEncoder};
