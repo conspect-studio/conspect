@@ -6,11 +6,19 @@
 // feedback (OperationFeedback) instead of transient toasts.
 //
 // These tests run with NO WebSocket, so no `media.player_state` arrives on
-// its own: cases that need live truth seed the realtime cache directly. The
-// preserved honesty contract (rule 27 — never fabricate state) holds: a
+// its own: cases that need live truth seed the realtime cache directly, and
+// cases that need a command outcome feed FAKE envelopes into the SHARED
+// QueryClient operation tracker exactly the way the shell-owned
+// `useEngineEvents` subscription does (`getOperationTracker(client).onEnvelope`).
+// Every submission is a REAL MSW HTTP request: the operation id comes from an
+// actual 202 body, never a fixture-only shortcut.
+//
+// The preserved honesty contract (rule 27 — never fabricate state) holds: a
 // boot-idle player with a configured default renders as NOT LOADED, the
 // configured default shows as its own separate fact, and a missing runtime
-// observation never infers a state.
+// observation never infers a state. The tracker join adds: pending resolves to
+// applied ONLY on exact terminal evidence; uncorrelated load/seek stay
+// accepted-unobserved forever; a lost link is unknown, never failed.
 import { afterAll, afterEach, beforeAll, describe, expect, it } from 'vitest';
 import { render, screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
@@ -24,6 +32,8 @@ import { I18nProvider } from '@lingui/react';
 import { MediaPlayersPage } from './MediaPlayersPage';
 import { MEDIA_PLAYER_STATE_QUERY_KEY } from '../realtime/useEngineEvents';
 import type { MediaPlayerEvent } from '../realtime/generated-types';
+import type { Envelope } from '../realtime/envelope';
+import { getOperationTracker } from '../components/broadcast/operationTracker';
 import { messages } from '../locales/en/messages';
 
 i18n.load('en', messages);
@@ -50,16 +60,27 @@ afterAll(() => {
   server.close();
 });
 
-function renderPage(live?: Record<string, MediaPlayerEvent>): void {
-  const client = new QueryClient({
-    defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
-  });
-  if (live !== undefined) {
+interface RenderedPage {
+  readonly client: QueryClient;
+  readonly unmount: () => void;
+}
+
+function renderPage(
+  options: {
+    readonly live?: Record<string, MediaPlayerEvent>;
+    readonly client?: QueryClient;
+  } = {},
+): RenderedPage {
+  const client = options.client
+    ?? new QueryClient({
+      defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
+    });
+  if (options.live !== undefined) {
     // Seed the realtime latest-wins player-state cache exactly as
     // `media.player_state` events would have written it.
-    client.setQueryData(MEDIA_PLAYER_STATE_QUERY_KEY, live);
+    client.setQueryData(MEDIA_PLAYER_STATE_QUERY_KEY, options.live);
   }
-  render(
+  const view = render(
     <QueryClientProvider client={client}>
       <I18nProvider i18n={i18n}>
         <MemoryRouter>
@@ -68,6 +89,39 @@ function renderPage(live?: Record<string, MediaPlayerEvent>): void {
       </I18nProvider>
     </QueryClientProvider>,
   );
+  return { client, unmount: view.unmount };
+}
+
+/** A fake `media.player_state` envelope, exactly as the shell would deliver it. */
+function playerEvent(
+  corr: string | undefined,
+  playerId: string,
+  state: MediaPlayerEvent['state'],
+): Envelope {
+  return {
+    v: 1,
+    t: 'media.player_state',
+    topic: 'switcher',
+    id: playerId,
+    seq: 1,
+    ts: 1,
+    ...(corr === undefined ? {} : { corr }),
+    data: { player: playerId, position_frames: 0, state },
+  };
+}
+
+/** A fake `job.progress` envelope — never terminal evidence for anything. */
+function progressEvent(corr: string, playerId: string): Envelope {
+  return {
+    v: 1,
+    t: 'job.progress',
+    topic: 'jobs',
+    id: playerId,
+    seq: 2,
+    ts: 2,
+    corr,
+    data: { phase: 'loading', pct: 10 },
+  };
 }
 
 /** One player's transport console (the always-rendered slot div). */
@@ -78,6 +132,12 @@ function consoleOf(id: string): HTMLElement {
 /** The nth card's always-visible status line (render order = data order). */
 function statusOf(index: number): HTMLElement {
   return screen.getAllByTestId('task-workspace-status')[index]!;
+}
+
+/** The feedback region element wrapping the given text. */
+function regionOf(text: RegExp | string): HTMLElement {
+  const line = screen.getByText(text);
+  return line.closest<HTMLElement>('[data-phase]')!;
 }
 
 describe('MediaPlayersPage loaded-asset honesty (preserved)', () => {
@@ -135,11 +195,13 @@ describe('MediaPlayersPage responsive slot fold', () => {
 describe('MediaPlayersPage live truth vs configured default', () => {
   it('shows the measured live asset and playhead, separately from the configured default', async () => {
     renderPage({
-      'vt-1': {
-        player: 'vt-1',
-        asset: 'live-clip',
-        position_frames: 1250,
-        state: { kind: 'playing' },
+      live: {
+        'vt-1': {
+          player: 'vt-1',
+          asset: 'live-clip',
+          position_frames: 1250,
+          state: { kind: 'playing' },
+        },
       },
     });
     await screen.findByTestId('player-console-vt-1');
@@ -172,10 +234,12 @@ describe('MediaPlayersPage live truth vs configured default', () => {
 
   it('gates the vamp-exit triad on the live state only', async () => {
     renderPage({
-      'vt-1': {
-        player: 'vt-1',
-        position_frames: 12,
-        state: { kind: 'vamping', exit_armed: true },
+      live: {
+        'vt-1': {
+          player: 'vt-1',
+          position_frames: 12,
+          state: { kind: 'vamping', exit_armed: true },
+        },
       },
     });
     await screen.findByTestId('player-console-vt-1');
@@ -245,7 +309,7 @@ describe('MediaPlayersPage operation feedback', () => {
     expect(screen.getByRole('button', { name: 'Play player: vt-1' })).toBeEnabled();
   });
 
-  it('shows the accepted 202 persistently with its operation id — and never claims applied', async () => {
+  it('shows the accepted 202 persistently with its operation id — and never claims applied on its own', async () => {
     server.use(
       http.post('*/api/v1/media/players/vt-1/play', () =>
         HttpResponse.json({ operation_id: 'op-9001', kind: 'play' }),
@@ -259,7 +323,8 @@ describe('MediaPlayersPage operation feedback', () => {
     expect(region?.dataset.phase).toBe('pending');
     // The correlation id is retained for later reconciliation.
     expect(region).toHaveTextContent('op-9001');
-    // No success or applied claim ever comes from the page's own state.
+    // No success or applied claim ever comes from the page's own state: only
+    // the shared tracker's exact terminal evidence can produce `applied`.
     expect(region?.textContent).not.toMatch(/applied(?! event)/);
     expect(region?.textContent).not.toMatch(/Command accepted/);
     // The region is inline and persistent — it survives re-renders.
@@ -267,7 +332,7 @@ describe('MediaPlayersPage operation feedback', () => {
     expect(
       screen.getByText(/Play VT 1 accepted — waiting for the applied event\./),
     ).toBeInTheDocument();
-    // No tracker join exists yet, so the transport must NOT deadlock.
+    // An unresolved acceptance still deadlocks nothing.
     expect(screen.getByRole('button', { name: 'Play player: vt-1' })).toBeEnabled();
   });
 
@@ -308,9 +373,7 @@ describe('MediaPlayersPage operation feedback', () => {
     // allowed to carry the word, and it is browser text, not a UI claim.
     expect(region).toHaveTextContent(/may or may not have been applied/);
     // The page-authored reason sentence is the claim itself: it names the
-    // uncertainty and never a failure or a rollback. (Only the appended raw
-    // transport detail — the browser's "Failed to fetch" — may carry the
-    // word, and that is browser text, not a UI claim.)
+    // uncertainty and never a failure or a rollback.
     expect(
       screen.getByText(
         /The control plane did not answer\. The command may or may not have been applied\./,
@@ -321,6 +384,268 @@ describe('MediaPlayersPage operation feedback', () => {
     // ...while every other verb stays usable — the page never deadlocks.
     expect(screen.getByRole('button', { name: 'Pause player: vt-1' })).toBeEnabled();
     expect(screen.getByRole('button', { name: 'Stop player: vt-1' })).toBeEnabled();
+  });
+});
+
+describe('MediaPlayersPage tracker join — shared QueryClient tracker, real MSW 202', () => {
+  it('resolves pending to applied only on the exact terminal event, after the real 202', async () => {
+    server.use(
+      http.post('*/api/v1/media/players/vt-1/play', () =>
+        HttpResponse.json({ operation_id: 'op-9001', kind: 'play' }),
+      ),
+    );
+    const { client } = renderPage();
+    await screen.findByTestId('player-console-vt-1');
+    await userEvent.click(screen.getByRole('button', { name: 'Play player: vt-1' }));
+    const line = await screen.findByText(/Play VT 1 accepted — waiting for the applied event\./);
+    expect(line.closest<HTMLElement>('[data-phase]')?.dataset.phase).toBe('pending');
+    // A different state on the same corr is a state change, NOT the play
+    // command's outcome — and it is never a failure either.
+    getOperationTracker(client).onEnvelope(playerEvent('op-9001', 'vt-1', { kind: 'paused' }));
+    expect(regionOf(/Play VT 1 accepted — waiting for the applied event\./).dataset.phase)
+      .toBe('pending');
+    // The exact terminal state for the play verb settles it.
+    getOperationTracker(client).onEnvelope(playerEvent('op-9001', 'vt-1', { kind: 'playing' }));
+    expect(await screen.findByText(/Play VT 1 applied\./)).toBeInTheDocument();
+    expect(screen.queryByText(/waiting for the applied event/)).toBeNull();
+    expect(regionOf(/Play VT 1 applied\./).dataset.phase).toBe('applied');
+  });
+
+  it('joins an early socket frame that arrived before the real 202', async () => {
+    const client = new QueryClient({
+      defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
+    });
+    server.use(
+      http.post('*/api/v1/media/players/vt-1/play', () => {
+        // The shell's shared tracker sees the outcome frame BEFORE the 202
+        // response resolves — the bounded early cache must join it.
+        getOperationTracker(client).onEnvelope(playerEvent('op-9001', 'vt-1', { kind: 'playing' }));
+        return HttpResponse.json({ operation_id: 'op-9001', kind: 'play' });
+      }),
+    );
+    renderPage({ client });
+    await screen.findByTestId('player-console-vt-1');
+    await userEvent.click(screen.getByRole('button', { name: 'Play player: vt-1' }));
+    // The operation id still comes from the actual 202 body, and the early
+    // frame settles it straight to applied — no fabricated correlation.
+    expect(await screen.findByText(/Play VT 1 applied\./)).toBeInTheDocument();
+    expect(getOperationTracker(client).snapshot().records.get('op-9001')?.phase)
+      .toBe('applied');
+  });
+
+  it('ignores a wrong-resource frame, a progress frame and a wrong-topic frame', async () => {
+    server.use(
+      http.post('*/api/v1/media/players/vt-1/play', () =>
+        HttpResponse.json({ operation_id: 'op-9001', kind: 'play' }),
+      ),
+    );
+    const { client } = renderPage();
+    await screen.findByTestId('player-console-vt-1');
+    await userEvent.click(screen.getByRole('button', { name: 'Play player: vt-1' }));
+    await screen.findByText(/Play VT 1 accepted — waiting for the applied event\./);
+    // Wrong resource (another player), job progress and a wrong topic are all
+    // noise: none of them may settle or poison the waiting record.
+    getOperationTracker(client).onEnvelope(playerEvent('op-9001', 'vt-2', { kind: 'playing' }));
+    getOperationTracker(client).onEnvelope(progressEvent('op-9001', 'vt-1'));
+    getOperationTracker(client).onEnvelope({
+      ...playerEvent('op-9001', 'vt-1', { kind: 'playing' }),
+      topic: 'devices',
+    });
+    expect(regionOf(/Play VT 1 accepted — waiting for the applied event\./).dataset.phase)
+      .toBe('pending');
+    // The exact frame afterwards still applies.
+    getOperationTracker(client).onEnvelope(playerEvent('op-9001', 'vt-1', { kind: 'playing' }));
+    expect(await screen.findByText(/Play VT 1 applied\./)).toBeInTheDocument();
+  });
+
+  it('distinguishes arm from disarm: only exit_armed=true applied the arm verb', async () => {
+    server.use(
+      http.post('*/api/v1/media/players/vt-1/exit/arm', () =>
+        HttpResponse.json({ operation_id: 'op-arm', kind: 'arm_media_exit' }),
+      ),
+    );
+    const { client } = renderPage({
+      live: {
+        'vt-1': {
+          player: 'vt-1',
+          position_frames: 3,
+          state: { kind: 'vamping', exit_armed: false },
+        },
+      },
+    });
+    await screen.findByTestId('player-console-vt-1');
+    await userEvent.click(screen.getByRole('button', { name: 'Arm vamp exit: vt-1' }));
+    await screen.findByText(/Arm vamp exit on VT 1 accepted — waiting for the applied event\./);
+    // Same state kind, wrong exit_armed: not the arm command's outcome.
+    getOperationTracker(client).onEnvelope(
+      playerEvent('op-arm', 'vt-1', { kind: 'vamping', exit_armed: false }),
+    );
+    expect(
+      regionOf(/Arm vamp exit on VT 1 accepted — waiting for the applied event\./).dataset.phase,
+    ).toBe('pending');
+    getOperationTracker(client).onEnvelope(
+      playerEvent('op-arm', 'vt-1', { kind: 'vamping', exit_armed: true }),
+    );
+    expect(await screen.findByText(/Arm vamp exit on VT 1 applied\./)).toBeInTheDocument();
+  });
+
+  it('keeps an uncorrelated load accepted-unobserved — never applied, even on a state event', async () => {
+    server.use(
+      http.post('*/api/v1/media/players/vt-1/load', () =>
+        HttpResponse.json({ operation_id: 'op-77', kind: 'load' }),
+      ),
+    );
+    const { client } = renderPage();
+    await screen.findByTestId('player-console-vt-1');
+    await userEvent.click(screen.getByRole('button', { name: 'Load asset into player: vt-1' }));
+    const input = screen.getByLabelText('Asset id');
+    await userEvent.type(input, 'promo-clip');
+    await userEvent.click(screen.getByRole('button', { name: 'Load' }));
+    const line = await screen.findByText(/Load VT 1 accepted\./);
+    const region = line.closest<HTMLElement>('[data-phase]');
+    expect(region?.dataset.phase).toBe('accepted-unobserved');
+    // The honest uncorrelated note replaces the "waiting for the applied
+    // event" wording: no applied event will ever arrive for load.
+    expect(screen.getByText(/does not correlate this command's outcome/)).toBeInTheDocument();
+    expect(screen.queryByText(/waiting for the applied event/)).toBeNull();
+    expect(region).toHaveTextContent('op-77');
+    // Even a state event naming this operation id settles nothing (the server
+    // never correlates load), and the real load outcome arrives uncorrelated.
+    getOperationTracker(client).onEnvelope(playerEvent('op-77', 'vt-1', { kind: 'cued' }));
+    getOperationTracker(client).onEnvelope(playerEvent(undefined, 'vt-1', { kind: 'cued' }));
+    expect(screen.queryByText(/Load VT 1 applied\./)).toBeNull();
+    expect(regionOf(/Load VT 1 accepted\./).dataset.phase).toBe('accepted-unobserved');
+  });
+
+  it('marks a lost realtime link unknown — gating only the duplicate verb, reconcilable late', async () => {
+    server.use(
+      http.post('*/api/v1/media/players/vt-1/play', () =>
+        HttpResponse.json({ operation_id: 'op-9001', kind: 'play' }),
+      ),
+    );
+    const { client } = renderPage();
+    await screen.findByTestId('player-console-vt-1');
+    await userEvent.click(screen.getByRole('button', { name: 'Play player: vt-1' }));
+    await screen.findByText(/Play VT 1 accepted — waiting for the applied event\./);
+    // A gap/disconnect loses the observation window: unknown, never failed.
+    getOperationTracker(client).onGap();
+    const line = await screen.findByText(/Play VT 1 outcome unknown\./);
+    const region = line.closest<HTMLElement>('[data-phase]');
+    expect(region?.dataset.phase).toBe('unknown');
+    expect(region).toHaveTextContent(/applied event was not observed/);
+    // The operation id stays visible for later reconciliation...
+    expect(region).toHaveTextContent('op-9001');
+    // ...the duplicate verb is gated, every other verb stays usable.
+    expect(screen.getByRole('button', { name: 'Play player: vt-1' })).toBeDisabled();
+    expect(screen.getByRole('button', { name: 'Pause player: vt-1' })).toBeEnabled();
+    // A late exact event still reconciles the unknown record to applied.
+    getOperationTracker(client).onEnvelope(playerEvent('op-9001', 'vt-1', { kind: 'playing' }));
+    expect(await screen.findByText(/Play VT 1 applied\./)).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Play player: vt-1' })).toBeEnabled();
+  });
+
+  it('persists the latest operation across page navigation — and resolves it while away', async () => {
+    server.use(
+      http.post('*/api/v1/media/players/vt-1/play', () =>
+        HttpResponse.json({ operation_id: 'op-9001', kind: 'play' }),
+      ),
+    );
+    const first = renderPage();
+    await screen.findByTestId('player-console-vt-1');
+    await userEvent.click(screen.getByRole('button', { name: 'Play player: vt-1' }));
+    await screen.findByText(/Play VT 1 accepted — waiting for the applied event\./);
+    first.unmount();
+    // While the operator is on another page, the shell keeps feeding the
+    // shared tracker; returning to this page must show the resolved truth.
+    getOperationTracker(first.client).onEnvelope(
+      playerEvent('op-9001', 'vt-1', { kind: 'playing' }),
+    );
+    renderPage({ client: first.client });
+    expect(await screen.findByText(/Play VT 1 applied\./)).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Play player: vt-1' })).toBeEnabled();
+  });
+
+  it('settles an in-flight submission while the page is unmounted', async () => {
+    server.use(
+      http.post('*/api/v1/media/players/vt-1/play', async () => {
+        await new Promise((resolve) => {
+          setTimeout(resolve, 80);
+        });
+        return HttpResponse.json({ operation_id: 'op-9002', kind: 'play' });
+      }),
+    );
+    const { client, unmount } = renderPage();
+    await screen.findByTestId('player-console-vt-1');
+    await userEvent.click(screen.getByRole('button', { name: 'Play player: vt-1' }));
+    expect(consoleOf('vt-1')).toHaveTextContent(/Sending Play VT 1…/);
+    unmount();
+    // The 202 lands while the page is away; the QueryClient-backed record
+    // (not component state) carries it.
+    await waitFor(() => {
+      expect(getOperationTracker(client).snapshot().records.has('op-9002')).toBe(true);
+    });
+    renderPage({ client });
+    expect(
+      await screen.findByText(/Play VT 1 accepted — waiting for the applied event\./),
+    ).toBeInTheDocument();
+    expect(screen.queryByText(/Sending Play VT 1…/)).toBeNull();
+  });
+
+  it('keeps a transport-unknown outcome visible across navigation — never silently forgotten', async () => {
+    server.use(
+      http.post('*/api/v1/media/players/vt-1/play', () => HttpResponse.error()),
+    );
+    const { client, unmount } = renderPage();
+    await screen.findByTestId('player-console-vt-1');
+    await userEvent.click(screen.getByRole('button', { name: 'Play player: vt-1' }));
+    await screen.findByText(/Play VT 1 outcome unknown\./);
+    unmount();
+    // The anonymous seat stays in the tracker and the page's own record
+    // survives navigation: the unresolved command is not silently dropped.
+    renderPage({ client });
+    expect(await screen.findByText(/Play VT 1 outcome unknown\./)).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Play player: vt-1' })).toBeDisabled();
+    expect(screen.getByRole('button', { name: 'Pause player: vt-1' })).toBeEnabled();
+    expect(
+      [...getOperationTracker(client).snapshot().provisional.values()].some(
+        (seat) => seat.phase === 'unknown',
+      ),
+    ).toBe(true);
+  });
+
+  it('shows the localized capacity message before any POST — not a raw exception', async () => {
+    const client = new QueryClient({
+      defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
+    });
+    // Fill the shared tracker's bounded store with unresolved anonymous seats
+    // (exactly the state a long ambiguous session leaves behind).
+    const tracker = getOperationTracker(client);
+    for (let i = 0; i < 256; i += 1) {
+      await expect(
+        tracker.submit(() => Promise.reject(new Error('network')), undefined),
+      ).rejects.toThrow('network');
+    }
+    let posts = 0;
+    server.use(
+      http.post('*/api/v1/media/players/vt-1/play', () => {
+        posts += 1;
+        return HttpResponse.json({ operation_id: 'op-x', kind: 'play' });
+      }),
+    );
+    renderPage({ client });
+    await screen.findByTestId('player-console-vt-1');
+    await userEvent.click(screen.getByRole('button', { name: 'Play player: vt-1' }));
+    // The actionable, localized message — never the raw exception text.
+    const alert = await screen.findByRole('alert');
+    expect(alert).toHaveTextContent(
+      /Too many unresolved commands\. Wait for an outcome or resolve an unknown command before retrying\./,
+    );
+    // The refusal happened before the POST: nothing was sent, no replay.
+    expect(posts).toBe(0);
+    // A refusal is not a command outcome: it never blocks the transport.
+    expect(screen.getByRole('button', { name: 'Play player: vt-1' })).toBeEnabled();
+    expect(screen.queryByText(/Play VT 1 failed\./)).toBeNull();
+    expect(screen.queryByText(/Play VT 1 outcome unknown\./)).toBeNull();
   });
 });
 
@@ -358,7 +683,7 @@ describe('MediaPlayersPage load dialog — asset id only, honest capability', ()
     await waitFor(() => {
       expect(loaded).toBe('promo-clip');
     });
-    await screen.findByText(/Load VT 1 accepted — waiting for the applied event\./);
+    await screen.findByText(/Load VT 1 accepted\./);
     expect(screen.queryByRole('dialog')).toBeNull();
   });
 });

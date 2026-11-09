@@ -9,21 +9,29 @@
 // its console while the other slots collapse to a 48px switch row (broadcast
 // design round 3); from `md:` up every console is in flow.
 //
-// Every command is a `202 Accepted` whose operation id the page RETAINS in a
-// persistent per-player feedback region (OperationFeedback) — never a toast:
-//   * while the POST is in flight, a separate local "sending" status shows
-//     and nothing says accepted until the real 202 arrives;
-//   * the 202 shows "accepted — waiting for the applied event" with the
-//     correlation id. The page NEVER claims applied on its own: the realtime
-//     tracker bridge is a separate workstream (see
-//     ./mediaPlayerPresentation.ts — the adapter seam; the sanctioned join
-//     point is ../components/broadcast/operationOutcomes.ts), so a 202 stays
-//     honestly pending and the transport stays usable — no deadlock;
-//   * a definitive HTTP rejection is `failed` (dismissable); an unverifiable
-//     transport error is `unknown` — the command may or may not have been
-//     applied, and nothing here ever claims a failure or a rollback. Only the
-//     duplicate of the possibly-in-flight verb is blocked; every other verb
-//     stays usable.
+// Every command is submitted through the shared QueryClient operation tracker
+// (`useSubmitTrackedOperation`, fed by the ONE shell-owned WebSocket
+// subscription) with the existing transport hook as its real POST:
+//   * tracker capacity is reserved BEFORE the POST. A capacity refusal shows
+//     the localized actionable message and nothing is ever sent;
+//   * the real 202's operation id — minted by the server, never here — binds
+//     the tracker record. Correlated verbs (play/pause/stop/cue and the
+//     vamp-exit triad, mirroring `CorrKey::for_command`) resolve
+//     pending→applied ONLY on exact terminal evidence (corr + topic +
+//     resource + event + the verb's own expected terminal state). Uncorrelated
+//     verbs (load/seek — ambiguous outcome server-side) stay
+//     accepted-unobserved: no applied event exists for them, so no expected
+//     media state is ever guessed;
+//   * a definitive HTTP 4xx/5xx rejection is `failed` (dismissable); anything
+//     unverifiable — a transport error after send, a realtime gap or the
+//     tracker deadline — is `unknown`, never a failure or a rollback claim.
+//     Only the duplicate of the possibly-in-flight verb is blocked; every
+//     other verb stays usable — no deadlock;
+//   * the per-player latest record persists in the QueryClient, so the
+//     feedback region survives navigating away and back, and an in-flight
+//     submit settles its record while the page is unmounted. The transport
+//     result may carry a completion promise; it is deliberately ignored — no
+//     second feedback channel and no premature success claim.
 //
 // The player's live transport state, playhead and loaded asset arrive ONLY on
 // the realtime `media.player_state` stream (engine isolation, inv #10): a
@@ -41,8 +49,10 @@
 // dialog says honestly; save/unload verbs land with ML4 and are absent here.
 import { useMemo, useState } from 'react';
 import type { JSX } from 'react';
+import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { Trans, useLingui } from '@lingui/react/macro';
 import {
+  CheckCircle2,
   CircleStop,
   FlagTriangleRight,
   FolderInput,
@@ -65,6 +75,7 @@ import type {
 import { useMediaPlayerStates } from '../realtime/useEngineEvents';
 import type { MediaPlayerEvent } from '../realtime/generated-types';
 import { OperationFeedback, TaskWorkspace, TouchAction } from '../components/broadcast';
+import { useOperationFeedback, useSubmitTrackedOperation } from '../components/broadcast/useOperationFeedback';
 import { PageHeader } from '../components/PageHeader';
 import { Badge } from '../components/ui/badge';
 import {
@@ -78,158 +89,93 @@ import {
 import { Input } from '../components/ui/input';
 import { Label } from '../components/ui/label';
 import {
-  classifyTransportError,
+  classifySubmissionError,
   configuredDefaultAsset,
   configuredLoop,
   effectiveSelectedPlayerId,
   isExitArmed,
+  MEDIA_PLAYER_OPERATIONS_QUERY_KEY,
   operationFeedbackView,
   stateVariant,
+  transportExpectation,
+  unresolvedVerb,
+  updateMediaPlayerOperation,
   vampGate,
   verbBlockedByOperation,
 } from './mediaPlayerPresentation';
 import type {
   MediaPlayerOperation,
+  MediaPlayerOperations,
   StateKind,
   VampGateReason,
 } from './mediaPlayerPresentation';
 
-/** The media-player (VT) transport panel. */
-export function MediaPlayersPage(): JSX.Element {
+/** Props for one player's compact VT card (a component so the per-operation tracker read stays hook-legal). */
+interface MediaPlayerCardProps {
+  readonly player: MediaPlayer;
+  readonly live: MediaPlayerEvent | undefined;
+  /** The player's latest submitted operation (page-persisted, latest wins). */
+  readonly op: MediaPlayerOperation | undefined;
+  readonly focused: boolean;
+  readonly detailsOpen: boolean;
+  readonly onDetailsToggle: (open: boolean) => void;
+  readonly onFocus: () => void;
+  readonly onSubmit: (player: MediaPlayer, vars: TransportVars, label: string) => void;
+  readonly onOpenLoad: (player: MediaPlayer) => void;
+  readonly onDismissOutcome: (playerId: string) => void;
+  readonly stateLabel: (kind: StateKind) => string;
+  readonly operationLabel: (verb: TransportAction, player: MediaPlayer) => string;
+}
+
+/**
+ * One player's compact VT card (TaskWorkspace) with its transport console and
+ * the tracker-joined feedback region. The shared tracker record for the card's
+ * latest operation id is read here (per-card, never in a loop) and joined
+ * with the page's own record: `applied` and tracker-`unknown` verdicts come
+ * from that record alone.
+ */
+function MediaPlayerCard({
+  player,
+  live,
+  op,
+  focused,
+  detailsOpen,
+  onDetailsToggle,
+  onFocus,
+  onSubmit,
+  onOpenLoad,
+  onDismissOutcome,
+  stateLabel,
+  operationLabel,
+}: MediaPlayerCardProps): JSX.Element {
   const { t } = useLingui();
-  const players = useMediaPlayers();
-  const transport = useMediaPlayerTransport();
-  const liveStates = useMediaPlayerStates();
-
-  const [loadFor, setLoadFor] = useState<MediaPlayer | null>(null);
-  const [assetDraft, setAssetDraft] = useState('');
-  const [assetMissing, setAssetMissing] = useState(false);
-  // The focused slot and each card's Details disclosure are caller-owned
-  // state (the TaskWorkspace controlled-disclosure contract).
-  const [selectedId, setSelectedId] = useState<string | null>(null);
-  const [detailsOpen, setDetailsOpen] = useState<Record<string, boolean>>({});
-  // One latest-wins operation record per player id (stable key), page-local.
-  // The tracker bridge resolves these when it lands; see the module header of
-  // mediaPlayerPresentation.ts for the adapter seam.
-  const [ops, setOps] = useState<Record<string, MediaPlayerOperation | undefined>>({});
-
-  const data = useMemo<MediaPlayer[]>(() => players.data ?? [], [players.data]);
-  const focusedId = effectiveSelectedPlayerId(selectedId, data);
-
-  /** Localized, human-readable label for a transport-state kind. */
-  const stateLabel = (kind: StateKind): string => {
-    switch (kind) {
-      case 'loading':
-        return t`Loading`;
-      case 'cued':
-        return t`Cued`;
-      case 'playing':
-        return t`Playing`;
-      case 'paused':
-        return t`Paused`;
-      case 'stopped':
-        return t`Stopped`;
-      case 'vamping':
-        return t`Vamping`;
-      case 'eof':
-        return t`End of file`;
-    }
+  // The shared tracker's record for this player's latest operation. An
+  // uncorrelated acceptance (load/seek) never has one — nothing to look up.
+  const tracked = useOperationFeedback(
+    op?.phase === 'accepted' && !op.uncorrelated ? op.operationId : undefined,
+  );
+  const feedback = operationFeedbackView(
+    op,
+    tracked,
+    t`The applied event was not observed on the realtime stream. The command may or may not have been applied.`,
+  );
+  const kind = live?.state.kind;
+  const configuredDefault = configuredDefaultAsset(player);
+  const gates = {
+    arm: vampGate(live, 'arm'),
+    take: vampGate(live, 'take'),
+    cancel: vampGate(live, 'cancel'),
   };
-
-  /** What the feedback region calls one submitted operation. */
-  const operationLabel = (verb: TransportAction, player: MediaPlayer): string => {
-    switch (verb) {
-      case 'load':
-        return t`Load ${player.name}`;
-      case 'cue':
-        return t`Cue ${player.name}`;
-      case 'play':
-        return t`Play ${player.name}`;
-      case 'pause':
-        return t`Pause ${player.name}`;
-      case 'stop':
-        return t`Stop ${player.name}`;
-      case 'seek':
-        return t`Seek ${player.name}`;
-      case 'arm-exit':
-        return t`Arm vamp exit on ${player.name}`;
-      case 'take-exit':
-        return t`Take vamp exit on ${player.name}`;
-      case 'cancel-exit':
-        return t`Cancel vamp exit on ${player.name}`;
-    }
-  };
-
-  /**
-   * Submit one transport verb for one player. The local `sending` record is
-   * written BEFORE the POST; the real 202 (and only the real 202) replaces it
-   * with the accepted record carrying the server's operation id.
-   */
-  const submit = (player: MediaPlayer, vars: TransportVars, label: string): void => {
-    const verb = vars.action;
-    setOps((prev) => ({ ...prev, [player.id]: { phase: 'sending', verb, label } }));
-    transport.mutate(vars, {
-      onSuccess: (accepted): void => {
-        setOps((prev) => ({
-          ...prev,
-          [player.id]: { phase: 'accepted', operationId: accepted.operation_id, label },
-        }));
-      },
-      onError: (error): void => {
-        // A definitive HTTP rejection failed. Anything else (a
-        // transport-level failure, an unreadable 2xx) is an UNKNOWN
-        // outcome: the command may or may not have been applied, and
-        // nothing here ever claims a rollback.
-        setOps((prev) => ({
-          ...prev,
-          [player.id]: classifyTransportError(
-            error,
-            verb,
-            label,
-            t`The control plane did not answer. The command may or may not have been applied.`,
-          ),
-        }));
-      },
-    });
-  };
-
-  /** Dismiss a definitive failure — the only record that clears here. */
-  const dismissOutcome = (playerId: string): void => {
-    setOps((prev) => {
-      if (prev[playerId]?.phase !== 'failed') {
-        return prev;
-      }
-      const next = { ...prev };
-      next[playerId] = undefined;
-      return next;
-    });
-  };
-
-  const openLoad = (player: MediaPlayer): void => {
-    // The configured default prefills the DRAFT as a starting point — never
-    // as a loaded-asset claim (rule 27).
-    setAssetDraft(configuredDefaultAsset(player) ?? '');
-    setAssetMissing(false);
-    setLoadFor(player);
-  };
-
-  const loadOp = loadFor !== null ? ops[loadFor.id] : undefined;
-  const dialogPending = loadOp?.phase === 'sending' && loadOp.verb === 'load';
-
-  const submitLoad = (): void => {
-    const player = loadFor;
-    if (player === null) {
-      return;
-    }
-    const asset = assetDraft.trim();
-    if (asset === '') {
-      setAssetMissing(true);
-      return;
-    }
-    // Close the dialog: the outcome is tracked persistently in the card's
-    // inline feedback region, so nothing needs to stay open to be seen.
-    setLoadFor(null);
-    submit(player, { id: player.id, action: 'load', asset }, operationLabel('load', player));
+  const keyBlocked = (verb: TransportAction): boolean =>
+    verbBlockedByOperation(op, verb, tracked);
+  const keyPending = (verb: TransportAction): boolean =>
+    op?.phase === 'sending' && op.verb === verb;
+  const duplicateReason = (verb: TransportAction): string | undefined =>
+    unresolvedVerb(op, tracked) === verb
+      ? t`The previous command's outcome is unknown — repeating it could duplicate the command.`
+      : undefined;
+  const runVerb = (verb: Exclude<TransportAction, 'load' | 'cue' | 'seek'>): void => {
+    onSubmit(player, { id: player.id, action: verb }, operationLabel(verb, player));
   };
 
   /** Localized, human-readable reason for a vamp gate. */
@@ -248,156 +194,126 @@ export function MediaPlayersPage(): JSX.Element {
     }
   };
 
-  /** One player's compact VT card (TaskWorkspace) with its transport console. */
-  const renderPlayer = (player: MediaPlayer): JSX.Element => {
-    const live: MediaPlayerEvent | undefined = liveStates[player.id];
-    const kind = live?.state.kind;
-    const op = ops[player.id];
-    const feedback = operationFeedbackView(op);
-    const isFocused = focusedId === player.id;
-    const configuredDefault = configuredDefaultAsset(player);
-    const gates = {
-      arm: vampGate(live, 'arm'),
-      take: vampGate(live, 'take'),
-      cancel: vampGate(live, 'cancel'),
-    };
-    const keyBlocked = (verb: TransportAction): boolean =>
-      verbBlockedByOperation(op, verb);
-    const keyPending = (verb: TransportAction): boolean =>
-      op?.phase === 'sending' && op.verb === verb;
-    const duplicateReason = (verb: TransportAction): string | undefined =>
-      op?.phase === 'unknown' && op.verb === verb
-        ? t`The previous command's outcome is unknown — repeating it could duplicate the command.`
-        : undefined;
-    const runVerb = (verb: Exclude<TransportAction, 'load' | 'cue' | 'seek'>): void => {
-      submit(player, { id: player.id, action: verb }, operationLabel(verb, player));
-    };
-
-    return (
-      <TaskWorkspace
-        key={player.id}
-        title={
-          <span className="flex min-w-0 flex-wrap items-baseline gap-x-2 break-words">
-            <span lang="" dir="auto" className="font-medium">
-              {player.name}
-            </span>
-            <code className="text-xs text-muted-foreground">{player.id}</code>
+  return (
+    <TaskWorkspace
+      title={
+        <span className="flex min-w-0 flex-wrap items-baseline gap-x-2 break-words">
+          <span lang="" dir="auto" className="font-medium">
+            {player.name}
           </span>
-        }
-        status={
-          <span className="flex min-w-0 flex-wrap items-center gap-x-3 gap-y-1 break-words">
-            {kind !== undefined ? (
-              <Badge variant={stateVariant(kind)}>
-                {stateLabel(kind)}
-                {isExitArmed(live) ? ` · ${t`exit armed`}` : ''}
-              </Badge>
+          <code className="text-xs text-muted-foreground">{player.id}</code>
+        </span>
+      }
+      status={
+        <span className="flex min-w-0 flex-wrap items-center gap-x-3 gap-y-1 break-words">
+          {kind !== undefined ? (
+            <Badge variant={stateVariant(kind)}>
+              {stateLabel(kind)}
+              {isExitArmed(live) ? ` · ${t`exit armed`}` : ''}
+            </Badge>
+          ) : (
+            <span>
+              <Trans>No live state</Trans>
+            </span>
+          )}
+          <span className="min-w-0">
+            <Trans>Loaded</Trans>:{' '}
+            {live?.asset !== undefined && live.asset !== '' ? (
+              <code className="break-all rounded bg-muted px-1 py-0.5 font-mono">
+                {live.asset}
+              </code>
             ) : (
               <span>
-                <Trans>No live state</Trans>
+                <Trans>Not loaded</Trans>
               </span>
             )}
-            <span className="min-w-0">
-              <Trans>Loaded</Trans>:{' '}
-              {live?.asset !== undefined && live.asset !== '' ? (
+          </span>
+          <span className="tabular-nums">
+            <Trans>Position</Trans>:{' '}
+            {live !== undefined ? `${String(live.position_frames)} ${t`frames`}` : '—'}
+          </span>
+        </span>
+      }
+      details={
+        <div className="grid gap-3">
+          <div className="flex flex-wrap items-start gap-2">
+            <TouchAction
+              variant="outline"
+              disabled={gates.arm !== undefined || keyBlocked('arm-exit')}
+              pending={keyPending('arm-exit')}
+              disabledReason={gateReason(gates.arm) ?? duplicateReason('arm-exit')}
+              aria-label={`${t`Arm vamp exit`}: ${player.id}`}
+              onPress={(): void => {
+                runVerb('arm-exit');
+              }}
+            >
+              <FlagTriangleRight aria-hidden="true" />
+              <Trans>Arm exit</Trans>
+            </TouchAction>
+            <TouchAction
+              variant="outline"
+              disabled={gates.take !== undefined || keyBlocked('take-exit')}
+              pending={keyPending('take-exit')}
+              disabledReason={gateReason(gates.take) ?? duplicateReason('take-exit')}
+              aria-label={`${t`Take vamp exit`}: ${player.id}`}
+              onPress={(): void => {
+                runVerb('take-exit');
+              }}
+            >
+              <Play aria-hidden="true" />
+              <Trans>Take exit</Trans>
+            </TouchAction>
+            <TouchAction
+              variant="ghost"
+              disabled={gates.cancel !== undefined || keyBlocked('cancel-exit')}
+              pending={keyPending('cancel-exit')}
+              disabledReason={gateReason(gates.cancel) ?? duplicateReason('cancel-exit')}
+              aria-label={`${t`Cancel vamp exit`}: ${player.id}`}
+              onPress={(): void => {
+                runVerb('cancel-exit');
+              }}
+            >
+              <XCircle aria-hidden="true" />
+              <Trans>Cancel exit</Trans>
+            </TouchAction>
+          </div>
+          <div className="grid gap-1.5 text-xs text-muted-foreground">
+            <p className="flex min-w-0 flex-wrap break-words">
+              <Trans>Configured default</Trans>:{' '}
+              {configuredDefault !== undefined && configuredDefault !== '' ? (
                 <code className="break-all rounded bg-muted px-1 py-0.5 font-mono">
-                  {live.asset}
+                  {configuredDefault}
                 </code>
               ) : (
-                <span>
-                  <Trans>Not loaded</Trans>
-                </span>
+                <Trans>None</Trans>
               )}
-            </span>
-            <span className="tabular-nums">
-              <Trans>Position</Trans>:{' '}
-              {live !== undefined ? `${String(live.position_frames)} ${t`frames`}` : '—'}
-            </span>
-          </span>
-        }
-        details={
-          <div className="grid gap-3">
-            <div className="flex flex-wrap items-start gap-2">
-              <TouchAction
-                variant="outline"
-                disabled={gates.arm !== undefined || keyBlocked('arm-exit')}
-                pending={keyPending('arm-exit')}
-                disabledReason={gateReason(gates.arm) ?? duplicateReason('arm-exit')}
-                aria-label={`${t`Arm vamp exit`}: ${player.id}`}
-                onPress={(): void => {
-                  runVerb('arm-exit');
-                }}
-              >
-                <FlagTriangleRight aria-hidden="true" />
-                <Trans>Arm exit</Trans>
-              </TouchAction>
-              <TouchAction
-                variant="outline"
-                disabled={gates.take !== undefined || keyBlocked('take-exit')}
-                pending={keyPending('take-exit')}
-                disabledReason={gateReason(gates.take) ?? duplicateReason('take-exit')}
-                aria-label={`${t`Take vamp exit`}: ${player.id}`}
-                onPress={(): void => {
-                  runVerb('take-exit');
-                }}
-              >
-                <Play aria-hidden="true" />
-                <Trans>Take exit</Trans>
-              </TouchAction>
-              <TouchAction
-                variant="ghost"
-                disabled={gates.cancel !== undefined || keyBlocked('cancel-exit')}
-                pending={keyPending('cancel-exit')}
-                disabledReason={gateReason(gates.cancel) ?? duplicateReason('cancel-exit')}
-                aria-label={`${t`Cancel vamp exit`}: ${player.id}`}
-                onPress={(): void => {
-                  runVerb('cancel-exit');
-                }}
-              >
-                <XCircle aria-hidden="true" />
-                <Trans>Cancel exit</Trans>
-              </TouchAction>
-            </div>
-            <div className="grid gap-1.5 text-xs text-muted-foreground">
-              <p className="flex min-w-0 flex-wrap break-words">
-                <Trans>Configured default</Trans>:{' '}
-                {configuredDefault !== undefined && configuredDefault !== '' ? (
-                  <code className="break-all rounded bg-muted px-1 py-0.5 font-mono">
-                    {configuredDefault}
-                  </code>
-                ) : (
-                  <Trans>None</Trans>
-                )}
-              </p>
-              {configuredLoop(player) ? (
-                <Badge variant="secondary" className="gap-1 self-start">
-                  <Repeat aria-hidden="true" className="size-3" />
-                  <Trans>Loop default</Trans>
-                </Badge>
-              ) : null}
-            </div>
+            </p>
+            {configuredLoop(player) ? (
+              <Badge variant="secondary" className="gap-1 self-start">
+                <Repeat aria-hidden="true" className="size-3" />
+                <Trans>Loop default</Trans>
+              </Badge>
+            ) : null}
           </div>
-        }
-        detailsOpen={detailsOpen[player.id] === true}
-        onDetailsToggle={(open: boolean): void => {
-          setDetailsOpen((prev) => ({ ...prev, [player.id]: open }));
-        }}
-      >
-        {!isFocused ? (
-          <TouchAction
-            variant="outline"
-            className="md:hidden"
-            aria-label={`${t`Focus player transport`}: ${player.id}`}
-            onPress={(): void => {
-              setSelectedId(player.id);
-            }}
-          >
-            <Trans>Focus transport</Trans>
-          </TouchAction>
-        ) : null}
-        <div
-          data-testid={`player-console-${player.id}`}
-          className={isFocused ? 'block' : 'hidden md:block'}
+        </div>
+      }
+      detailsOpen={detailsOpen}
+      onDetailsToggle={onDetailsToggle}
+    >
+      {!focused ? (
+        <TouchAction
+          variant="outline"
+          className="md:hidden"
+          aria-label={`${t`Focus player transport`}: ${player.id}`}
+          onPress={onFocus}
         >
+          <Trans>Focus transport</Trans>
+        </TouchAction>
+      ) : null}
+      <div
+        data-testid={`player-console-${player.id}`}
+        className={focused ? 'block' : 'hidden md:block'}
+      >
           <div className="flex flex-wrap items-start gap-2">
             <TouchAction
               variant="outline"
@@ -406,7 +322,7 @@ export function MediaPlayersPage(): JSX.Element {
               disabledReason={duplicateReason('load')}
               aria-label={`${t`Load asset into player`}: ${player.id}`}
               onPress={(): void => {
-                openLoad(player);
+                onOpenLoad(player);
               }}
             >
               <FolderInput aria-hidden="true" />
@@ -419,7 +335,7 @@ export function MediaPlayersPage(): JSX.Element {
               disabledReason={duplicateReason('cue')}
               aria-label={`${t`Cue player to in-point`}: ${player.id}`}
               onPress={(): void => {
-                submit(player, { id: player.id, action: 'cue' }, operationLabel('cue', player));
+                onSubmit(player, { id: player.id, action: 'cue' }, operationLabel('cue', player));
               }}
             >
               <SkipBack aria-hidden="true" />
@@ -473,34 +389,248 @@ export function MediaPlayersPage(): JSX.Element {
               {t`Sending ${op.label}…`}
             </p>
           ) : null}
+          {op?.phase === 'refused' ? (
+            // The tracker refused BEFORE any POST: an actionable, localized
+            // message — never a raw exception, and never a failed/unknown
+            // command outcome (nothing was sent).
+            <p role="alert" className="mt-2 text-sm text-destructive">
+              {op.reason}
+            </p>
+          ) : null}
           {op !== undefined && feedback !== undefined ? (
-            <div className="mt-2">
-              <OperationFeedback
-                phase={feedback.phase}
-                operationLabel={op.label}
-                correlationId={
-                  feedback.phase === 'pending' ? feedback.correlationId : undefined
-                }
-                failureReason={
-                  feedback.phase === 'failed' ? feedback.failureReason : undefined
-                }
-                unknownReason={
-                  feedback.phase === 'unknown' ? feedback.unknownReason : undefined
-                }
-                onDismiss={
-                  feedback.phase === 'failed'
-                    ? (): void => {
-                        dismissOutcome(player.id);
-                      }
-                    : undefined
-                }
-              />
-            </div>
+            feedback.phase === 'accepted-unobserved' ? (
+              // Uncorrelated verb (load/seek): accepted, but the control
+              // plane correlates no outcome for it, so honestly no applied
+              // event will ever arrive — the "waiting for the applied event"
+              // wording would be a lie here.
+              <div
+                role="status"
+                aria-live="polite"
+                data-phase="accepted-unobserved"
+                className="mt-2 flex min-w-0 flex-col gap-1 break-words rounded-md border bg-muted/40 p-2"
+              >
+                <p className="flex min-w-0 items-center gap-2 text-sm [&>span]:min-w-0 [&>span]:break-all">
+                  <CheckCircle2 className="size-4 shrink-0" aria-hidden="true" />
+                  <span>
+                    <Trans>{op.label} accepted.</Trans>
+                  </span>
+                </p>
+                <p className="text-sm text-muted-foreground">
+                  <Trans>
+                    The control plane does not correlate this command's
+                    outcome, so no applied event will arrive.
+                  </Trans>
+                </p>
+                <p className="text-xs text-muted-foreground">
+                  <Trans>Correlation</Trans>{' '}
+                  <code className="break-all rounded bg-muted px-1 py-0.5 font-mono">
+                    {feedback.correlationId}
+                  </code>
+                </p>
+              </div>
+            ) : (
+              <div className="mt-2">
+                <OperationFeedback
+                  phase={feedback.phase}
+                  operationLabel={op.label}
+                  correlationId={feedback.correlationId}
+                  failureReason={
+                    feedback.phase === 'failed' ? feedback.failureReason : undefined
+                  }
+                  unknownReason={
+                    feedback.phase === 'unknown' ? feedback.unknownReason : undefined
+                  }
+                  onDismiss={
+                    op.phase === 'failed' && feedback.phase === 'failed'
+                      ? (): void => {
+                          onDismissOutcome(player.id);
+                        }
+                      : undefined
+                  }
+                />
+              </div>
+            )
           ) : null}
         </div>
-      </TaskWorkspace>
+    </TaskWorkspace>
+  );
+}
+
+/** The media-player (VT) transport panel. */
+export function MediaPlayersPage(): JSX.Element {
+  const { t } = useLingui();
+  const queryClient = useQueryClient();
+  const players = useMediaPlayers();
+  const transport = useMediaPlayerTransport();
+  const liveStates = useMediaPlayerStates();
+  const submitTracked = useSubmitTrackedOperation();
+
+  const [loadFor, setLoadFor] = useState<MediaPlayer | null>(null);
+  const [assetDraft, setAssetDraft] = useState('');
+  const [assetMissing, setAssetMissing] = useState(false);
+  // The focused slot and each card's Details disclosure are caller-owned
+  // state (the TaskWorkspace controlled-disclosure contract).
+  const [selectedId, setSelectedId] = useState<string | null>(null);
+  const [detailsOpen, setDetailsOpen] = useState<Record<string, boolean>>({});
+  // One latest-wins operation record per player id (stable key), persisted in
+  // the QueryClient (never component state): the feedback region survives
+  // page navigation, and an in-flight submit settles its record even while
+  // the page is unmounted. The shared tracker owns every verdict transition.
+  const operationsQuery = useQuery<MediaPlayerOperations>({
+    queryKey: MEDIA_PLAYER_OPERATIONS_QUERY_KEY,
+    queryFn: (): MediaPlayerOperations => ({}),
+    enabled: false,
+    initialData: {},
+  });
+  // `initialData` makes `data` always defined — the empty store is the
+  // clean slate, never a loading state.
+  const ops: MediaPlayerOperations = operationsQuery.data;
+
+  const data = useMemo<MediaPlayer[]>(() => players.data ?? [], [players.data]);
+  const focusedId = effectiveSelectedPlayerId(selectedId, data);
+
+  /** Localized, human-readable label for a transport-state kind. */
+  const stateLabel = (kind: StateKind): string => {
+    switch (kind) {
+      case 'loading':
+        return t`Loading`;
+      case 'cued':
+        return t`Cued`;
+      case 'playing':
+        return t`Playing`;
+      case 'paused':
+        return t`Paused`;
+      case 'stopped':
+        return t`Stopped`;
+      case 'vamping':
+        return t`Vamping`;
+      case 'eof':
+        return t`End of file`;
+    }
+  };
+
+  /** What the feedback region calls one submitted operation. */
+  const operationLabel = (verb: TransportAction, player: MediaPlayer): string => {
+    switch (verb) {
+      case 'load':
+        return t`Load ${player.name}`;
+      case 'cue':
+        return t`Cue ${player.name}`;
+      case 'play':
+        return t`Play ${player.name}`;
+      case 'pause':
+        return t`Pause ${player.name}`;
+      case 'stop':
+        return t`Stop ${player.name}`;
+      case 'seek':
+        return t`Seek ${player.name}`;
+      case 'arm-exit':
+        return t`Arm vamp exit on ${player.name}`;
+      case 'take-exit':
+        return t`Take vamp exit on ${player.name}`;
+      case 'cancel-exit':
+        return t`Cancel vamp exit on ${player.name}`;
+    }
+  };
+
+  /**
+   * Submit one transport verb for one player through the shared tracker. The
+   * local `sending` record is written BEFORE the POST; the real 202 (and only
+   * the real 202) replaces it with the accepted record carrying the server's
+   * operation id. The verb's expected terminal state mirrors
+   * `CorrKey::for_command` — `undefined` for the uncorrelated load/seek, which
+   * stay accepted-unobserved. The transport result's optional completion
+   * promise is deliberately ignored: the shared tracker is the single
+   * feedback authority (no double feedback, no premature success).
+   */
+  const submit = (player: MediaPlayer, vars: TransportVars, label: string): void => {
+    const verb = vars.action;
+    updateMediaPlayerOperation(queryClient, player.id, () => ({ phase: 'sending', verb, label }));
+    void submitTracked(
+      () => transport.mutateAsync(vars),
+      transportExpectation(player.id, verb),
+    ).then(
+      (result): void => {
+        updateMediaPlayerOperation(queryClient, player.id, () => ({
+          phase: 'accepted',
+          operationId: result.operationId,
+          verb,
+          label,
+          uncorrelated: result.kind === 'accepted-unobserved',
+        }));
+      },
+      (error: unknown): void => {
+        // A definitive HTTP rejection failed. A capacity refusal (before any
+        // POST) is a local refusal. Anything else (a transport-level failure,
+        // an unreadable 2xx) is an UNKNOWN outcome: the command may or may
+        // not have been applied, and nothing here ever claims a rollback.
+        updateMediaPlayerOperation(queryClient, player.id, () =>
+          classifySubmissionError(
+            error,
+            verb,
+            label,
+            t`The control plane did not answer. The command may or may not have been applied.`,
+          ),
+        );
+      },
     );
   };
+
+  /** Dismiss a definitive failure — the only record that clears here. */
+  const dismissOutcome = (playerId: string): void => {
+    updateMediaPlayerOperation(queryClient, playerId, (previous) =>
+      previous?.phase === 'failed' ? undefined : previous,
+    );
+  };
+
+  const openLoad = (player: MediaPlayer): void => {
+    // The configured default prefills the DRAFT as a starting point — never
+    // as a loaded-asset claim (rule 27).
+    setAssetDraft(configuredDefaultAsset(player) ?? '');
+    setAssetMissing(false);
+    setLoadFor(player);
+  };
+
+  const loadOp = loadFor !== null ? ops[loadFor.id] : undefined;
+  const dialogPending = loadOp?.phase === 'sending' && loadOp.verb === 'load';
+
+  const submitLoad = (): void => {
+    const player = loadFor;
+    if (player === null) {
+      return;
+    }
+    const asset = assetDraft.trim();
+    if (asset === '') {
+      setAssetMissing(true);
+      return;
+    }
+    // Close the dialog: the outcome is tracked persistently in the card's
+    // inline feedback region, so nothing needs to stay open to be seen.
+    setLoadFor(null);
+    submit(player, { id: player.id, action: 'load', asset }, operationLabel('load', player));
+  };
+
+  const renderPlayer = (player: MediaPlayer): JSX.Element => (
+    <MediaPlayerCard
+      key={player.id}
+      player={player}
+      live={liveStates[player.id]}
+      op={ops[player.id]}
+      focused={focusedId === player.id}
+      detailsOpen={detailsOpen[player.id] === true}
+      onDetailsToggle={(open: boolean): void => {
+        setDetailsOpen((prev) => ({ ...prev, [player.id]: open }));
+      }}
+      onFocus={(): void => {
+        setSelectedId(player.id);
+      }}
+      onSubmit={submit}
+      onOpenLoad={openLoad}
+      onDismissOutcome={dismissOutcome}
+      stateLabel={stateLabel}
+      operationLabel={operationLabel}
+    />
+  );
 
   return (
     <>
