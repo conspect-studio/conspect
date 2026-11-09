@@ -24,6 +24,7 @@
 //     `refused` record (actionable, localized), never a failure and never an
 //     unknown outcome — nothing was sent.
 import type { QueryClient } from '@tanstack/react-query';
+import { getStoredToken } from '../api/token';
 import type { MediaPlayer, TransportAction } from '../api/media-playersQueries';
 import { OperationApiError } from '../api/operations';
 import type { OperationRecord } from '../components/broadcast/operationOutcomes';
@@ -182,7 +183,7 @@ function playerStateExpectation(
  * capacity): no command outcome exists at all. Only the shared tracker's
  * exact terminal evidence may later resolve an `accepted` record.
  */
-export type MediaPlayerOperation =
+export type MediaPlayerOperation = (
   | { readonly phase: 'sending'; readonly verb: TransportAction; readonly label: string }
   | {
       readonly phase: 'accepted';
@@ -199,7 +200,12 @@ export type MediaPlayerOperation =
       readonly verb: TransportAction;
       readonly reason: string;
       readonly label: string;
-    };
+    }
+) & {
+  readonly requestId?: number;
+  /** Earlier outcomes remain evidence even when another verb is the latest feedback. */
+  readonly prior?: readonly MediaPlayerOperation[] | undefined;
+};
 
 /**
  * The OperationFeedback view of one operation, joined with the shared
@@ -377,19 +383,67 @@ export function classifyTransportError(
 }
 
 /**
- * The stable QueryClient key for the page's per-player latest-operation
- * records. The store lives in the QueryClient — not component state — so the
- * feedback region survives navigating away and back, and an in-flight submit
- * still settles its record while the page is unmounted.
+ * Base key of the page's QueryClient-backed operation records. An opaque
+ * in-memory credential epoch partitions the key without exposing the token;
+ * navigation within the same identity retains the feedback and evidence.
  */
 export const MEDIA_PLAYER_OPERATIONS_QUERY_KEY = ['media-players', 'operations'] as const;
+
+// Credentials never enter query keys, data or developer-facing labels. A
+// QueryClient-scoped epoch isolates callbacks issued under an earlier token.
+const identities = new WeakMap<QueryClient, { token: string | undefined; epoch: number }>();
+export function mediaPlayerIdentity(client: QueryClient): number {
+  const token = getStoredToken();
+  const current = identities.get(client);
+  if (current === undefined) {
+    identities.set(client, { token, epoch: 0 });
+    return 0;
+  }
+  if (current.token !== token) {
+    const epoch = current.epoch + 1;
+    identities.set(client, { token, epoch });
+    client.removeQueries({ queryKey: MEDIA_PLAYER_OPERATIONS_QUERY_KEY });
+    return epoch;
+  }
+  return current.epoch;
+}
+
+/** Do not put the bearer token in the key, even transiently. */
+export function mediaPlayerOperationsKey(epoch: number): readonly (string | number)[] {
+  return epoch === 0 ? MEDIA_PLAYER_OPERATIONS_QUERY_KEY : [...MEDIA_PLAYER_OPERATIONS_QUERY_KEY, epoch];
+}
 
 /** The per-player latest-operation records the page persists. */
 export type MediaPlayerOperations = Record<string, MediaPlayerOperation | undefined>;
 
 /** Read the persisted per-player operation records (empty when none yet). */
 export function readMediaPlayerOperations(client: QueryClient): MediaPlayerOperations {
-  return client.getQueryData<MediaPlayerOperations>(MEDIA_PLAYER_OPERATIONS_QUERY_KEY) ?? {};
+  return client.getQueryData<MediaPlayerOperations>(mediaPlayerOperationsKey(mediaPlayerIdentity(client))) ?? {};
+}
+
+/** Keep every earlier command's evidence separate from the latest visible feedback. */
+export function replaceMediaPlayerOperation(
+  previous: MediaPlayerOperation | undefined,
+  next: MediaPlayerOperation,
+  tracked: (id: string) => OperationRecord | undefined = () => undefined,
+): MediaPlayerOperation {
+  if (previous === undefined) return next;
+  const { prior = [], ...latest } = previous;
+  const retain = (entry: MediaPlayerOperation): boolean =>
+    entry.phase === 'unknown' || (entry.phase === 'accepted' && !entry.uncorrelated &&
+      tracked(entry.operationId)?.phase !== 'applied' && tracked(entry.operationId)?.phase !== 'failed');
+  return { ...next, prior: [...prior, latest].filter(retain) };
+}
+
+/** Every unresolved verb, including earlier correlated tracker-unknown outcomes. */
+export function unresolvedMediaPlayerOperations(
+  op: MediaPlayerOperation | undefined,
+  tracked: (id: string) => OperationRecord | undefined,
+): MediaPlayerOperation[] {
+  if (op === undefined) return [];
+  return [...(op.prior ?? []), op].filter((entry) =>
+    unresolvedVerb(entry, entry.phase === 'accepted' ? tracked(entry.operationId) : undefined) !== undefined,
+  );
 }
 
 /**
@@ -402,7 +456,8 @@ export function updateMediaPlayerOperation(
   playerId: string,
   update: (previous: MediaPlayerOperation | undefined) => MediaPlayerOperation | undefined,
 ): void {
-  client.setQueryData<MediaPlayerOperations>(MEDIA_PLAYER_OPERATIONS_QUERY_KEY, (previous) => {
+  const epoch = mediaPlayerIdentity(client);
+  client.setQueryData<MediaPlayerOperations>(mediaPlayerOperationsKey(epoch), (previous) => {
     const base: MediaPlayerOperations = previous ?? {};
     return { ...base, [playerId]: update(base[playerId]) };
   });

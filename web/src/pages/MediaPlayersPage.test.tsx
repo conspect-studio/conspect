@@ -20,7 +20,9 @@
 // applied ONLY on exact terminal evidence; uncorrelated load/seek stay
 // accepted-unobserved forever; a lost link is unknown, never failed.
 import { afterAll, afterEach, beforeAll, describe, expect, it } from 'vitest';
-import { render, screen, waitFor, within } from '@testing-library/react';
+import { act, render, screen, waitFor, within } from '@testing-library/react';
+import { setStoredToken } from '../api/token';
+import { readMediaPlayerOperations, MEDIA_PLAYER_OPERATIONS_QUERY_KEY } from './mediaPlayerPresentation';
 import userEvent from '@testing-library/user-event';
 import { http, HttpResponse } from 'msw';
 import { setupServer } from 'msw/node';
@@ -55,6 +57,7 @@ beforeAll(() => {
 });
 afterEach(() => {
   server.resetHandlers();
+  setStoredToken('');
 });
 afterAll(() => {
   server.close();
@@ -284,7 +287,7 @@ describe('MediaPlayersPage operation feedback', () => {
         await new Promise((resolve) => {
           setTimeout(resolve, 80);
         });
-        return HttpResponse.json({ operation_id: 'op-9001', kind: 'play' });
+        return HttpResponse.json({ operation_id: 'op-9001', kind: 'media_play' });
       }),
     );
     renderPage();
@@ -312,7 +315,7 @@ describe('MediaPlayersPage operation feedback', () => {
   it('shows the accepted 202 persistently with its operation id — and never claims applied on its own', async () => {
     server.use(
       http.post('*/api/v1/media/players/vt-1/play', () =>
-        HttpResponse.json({ operation_id: 'op-9001', kind: 'play' }),
+        HttpResponse.json({ operation_id: 'op-9001', kind: 'media_play' }),
       ),
     );
     renderPage();
@@ -387,11 +390,103 @@ describe('MediaPlayersPage operation feedback', () => {
   });
 });
 
+describe('MediaPlayersPage unresolved registry and principal partition', () => {
+  it('keeps unknown play blocked through accepted, failed, and refused pause; late play evidence settles only its own record', async () => {
+    let pauseStatus: 'accepted' | 'failed' = 'accepted';
+    server.use(
+      http.post('*/api/v1/media/players/vt-1/play', () => HttpResponse.error()),
+      http.post('*/api/v1/media/players/vt-1/pause', () => pauseStatus === 'accepted'
+        ? HttpResponse.json({ operation_id: 'op-pause', kind: 'media_pause' })
+        : HttpResponse.json({ status: 409, title: 'busy' }, { status: 409 })),
+    );
+    const { client } = renderPage();
+    await screen.findByTestId('player-console-vt-1');
+    await userEvent.click(screen.getByRole('button', { name: 'Play player: vt-1' }));
+    await screen.findByText(/Play VT 1 outcome unknown/);
+    await userEvent.click(screen.getByRole('button', { name: 'Pause player: vt-1' }));
+    await screen.findByText(/Pause VT 1 accepted/);
+    expect(screen.getByText(/Earlier unresolved commands/)).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Play player: vt-1' })).toBeDisabled();
+    // The anonymous transport failure has no correlation id. A later player
+    // event may not be invented as its settlement.
+    getOperationTracker(client).onEnvelope(playerEvent('op-pause', 'vt-1', { kind: 'paused' }));
+    expect(screen.getByRole('button', { name: 'Play player: vt-1' })).toBeDisabled();
+    pauseStatus = 'failed';
+    await userEvent.click(screen.getByRole('button', { name: 'Pause player: vt-1' }));
+    await screen.findByText(/Pause VT 1 failed/);
+    expect(screen.getByRole('button', { name: 'Play player: vt-1' })).toBeDisabled();
+    expect(readMediaPlayerOperations(client)['vt-1']?.prior?.some((op) => op.phase === 'unknown')).toBe(true);
+  });
+
+  it('retains a correlated unknown play through unobserved load and resolves only exact late evidence', async () => {
+    server.use(
+      http.post('*/api/v1/media/players/vt-1/play', () => HttpResponse.json({ operation_id: 'op-play', kind: 'media_play' })),
+      http.post('*/api/v1/media/players/vt-1/load', () => HttpResponse.json({ operation_id: 'op-load', kind: 'media_load' })),
+    );
+    const { client } = renderPage();
+    await screen.findByTestId('player-console-vt-1');
+    await userEvent.click(screen.getByRole('button', { name: 'Play player: vt-1' }));
+    await screen.findByText(/Play VT 1 accepted/);
+    getOperationTracker(client).onGap();
+    await screen.findByText(/Play VT 1 outcome unknown/);
+    await userEvent.click(screen.getByRole('button', { name: 'Load asset into player: vt-1' }));
+    await userEvent.click(screen.getByRole('button', { name: 'Load' }));
+    await screen.findByText(/Load VT 1 accepted/);
+    expect(screen.getByRole('button', { name: 'Play player: vt-1' })).toBeDisabled();
+    getOperationTracker(client).onEnvelope(playerEvent('op-load', 'vt-1', { kind: 'playing' }));
+    expect(screen.getByRole('button', { name: 'Play player: vt-1' })).toBeDisabled();
+    getOperationTracker(client).onEnvelope(playerEvent('op-play', 'vt-1', { kind: 'playing' }));
+    await waitFor(() => expect(screen.getByRole('button', { name: 'Play player: vt-1' })).toBeEnabled());
+    expect(screen.queryByText(/Earlier unresolved commands/)).toBeNull();
+  });
+
+  it('removes accepted actor A identifiers on actor B save and on credential clear', async () => {
+    setStoredToken('actor-a');
+    server.use(http.post('*/api/v1/media/players/vt-1/play', () =>
+      HttpResponse.json({ operation_id: 'op-actor-a', kind: 'media_play' })));
+    const { client } = renderPage();
+    await screen.findByTestId('player-console-vt-1');
+    await userEvent.click(screen.getByRole('button', { name: 'Play player: vt-1' }));
+    await screen.findByText(/Play VT 1 accepted/);
+    expect(consoleOf('vt-1')).toHaveTextContent('op-actor-a');
+    setStoredToken('actor-b');
+    await act(async () => { await client.invalidateQueries(); });
+    await waitFor(() => expect(consoleOf('vt-1')).not.toHaveTextContent('op-actor-a'));
+    expect(readMediaPlayerOperations(client)).toEqual({});
+    expect(JSON.stringify(client.getQueryCache().getAll().map((query) => query.state.data))).not.toContain('op-actor-a');
+    setStoredToken('');
+    await act(async () => { await client.invalidateQueries(); });
+    expect(readMediaPlayerOperations(client)).toEqual({});
+  });
+
+  it('partitions token changes before render and rejects an earlier identity in-flight completion', async () => {
+    setStoredToken('actor-a');
+    let release: (response: Response) => void = () => undefined;
+    server.use(http.post('*/api/v1/media/players/vt-1/play', () => new Promise<Response>((resolve) => { release = resolve; })));
+    const first = renderPage();
+    await screen.findByTestId('player-console-vt-1');
+    await userEvent.click(screen.getByRole('button', { name: 'Play player: vt-1' }));
+    expect(readMediaPlayerOperations(first.client)['vt-1']?.phase).toBe('sending');
+    setStoredToken('actor-b');
+    await act(async () => { await first.client.invalidateQueries(); });
+    expect(screen.queryByText(/Sending Play VT 1/)).toBeNull();
+    expect(readMediaPlayerOperations(first.client)).toEqual({});
+    release(HttpResponse.json({ operation_id: 'op-actor-a', kind: 'media_play' }));
+    await waitFor(() => { expect(getOperationTracker(first.client).snapshot().records.has('op-actor-a')).toBe(false); });
+    expect(readMediaPlayerOperations(first.client)).toEqual({});
+    expect(JSON.stringify(first.client.getQueryCache().getAll().map((query) => query.queryKey))).not.toContain('actor-');
+    setStoredToken('');
+    await act(async () => { await first.client.invalidateQueries(); });
+    expect(readMediaPlayerOperations(first.client)).toEqual({});
+    expect(first.client.getQueryData(MEDIA_PLAYER_OPERATIONS_QUERY_KEY)).toBeUndefined();
+  });
+});
+
 describe('MediaPlayersPage tracker join — shared QueryClient tracker, real MSW 202', () => {
   it('resolves pending to applied only on the exact terminal event, after the real 202', async () => {
     server.use(
       http.post('*/api/v1/media/players/vt-1/play', () =>
-        HttpResponse.json({ operation_id: 'op-9001', kind: 'play' }),
+        HttpResponse.json({ operation_id: 'op-9001', kind: 'media_play' }),
       ),
     );
     const { client } = renderPage();
@@ -420,7 +515,7 @@ describe('MediaPlayersPage tracker join — shared QueryClient tracker, real MSW
         // The shell's shared tracker sees the outcome frame BEFORE the 202
         // response resolves — the bounded early cache must join it.
         getOperationTracker(client).onEnvelope(playerEvent('op-9001', 'vt-1', { kind: 'playing' }));
-        return HttpResponse.json({ operation_id: 'op-9001', kind: 'play' });
+        return HttpResponse.json({ operation_id: 'op-9001', kind: 'media_play' });
       }),
     );
     renderPage({ client });
@@ -436,7 +531,7 @@ describe('MediaPlayersPage tracker join — shared QueryClient tracker, real MSW
   it('ignores a wrong-resource frame, a progress frame and a wrong-topic frame', async () => {
     server.use(
       http.post('*/api/v1/media/players/vt-1/play', () =>
-        HttpResponse.json({ operation_id: 'op-9001', kind: 'play' }),
+        HttpResponse.json({ operation_id: 'op-9001', kind: 'media_play' }),
       ),
     );
     const { client } = renderPage();
@@ -520,7 +615,7 @@ describe('MediaPlayersPage tracker join — shared QueryClient tracker, real MSW
   it('marks a lost realtime link unknown — gating only the duplicate verb, reconcilable late', async () => {
     server.use(
       http.post('*/api/v1/media/players/vt-1/play', () =>
-        HttpResponse.json({ operation_id: 'op-9001', kind: 'play' }),
+        HttpResponse.json({ operation_id: 'op-9001', kind: 'media_play' }),
       ),
     );
     const { client } = renderPage();
@@ -547,7 +642,7 @@ describe('MediaPlayersPage tracker join — shared QueryClient tracker, real MSW
   it('persists the latest operation across page navigation — and resolves it while away', async () => {
     server.use(
       http.post('*/api/v1/media/players/vt-1/play', () =>
-        HttpResponse.json({ operation_id: 'op-9001', kind: 'play' }),
+        HttpResponse.json({ operation_id: 'op-9001', kind: 'media_play' }),
       ),
     );
     const first = renderPage();
@@ -571,7 +666,7 @@ describe('MediaPlayersPage tracker join — shared QueryClient tracker, real MSW
         await new Promise((resolve) => {
           setTimeout(resolve, 80);
         });
-        return HttpResponse.json({ operation_id: 'op-9002', kind: 'play' });
+        return HttpResponse.json({ operation_id: 'op-9002', kind: 'media_play' });
       }),
     );
     const { client, unmount } = renderPage();

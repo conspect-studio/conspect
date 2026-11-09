@@ -12,6 +12,7 @@
 // happens BEFORE any POST and is neither failed nor unknown.
 import { describe, expect, it } from 'vitest';
 import { QueryClient } from '@tanstack/react-query';
+import { setStoredToken } from '../api/token';
 
 import { OperationApiError } from '../api/operations';
 import type { MediaPlayer } from '../api/media-playersQueries';
@@ -29,6 +30,10 @@ import {
   MEDIA_PLAYER_OPERATIONS_QUERY_KEY,
   operationFeedbackView,
   readMediaPlayerOperations,
+  replaceMediaPlayerOperation,
+  unresolvedMediaPlayerOperations,
+  mediaPlayerIdentity,
+  mediaPlayerOperationsKey,
   stateVariant,
   transportExpectation,
   unresolvedVerb,
@@ -402,6 +407,34 @@ describe('per-player operation store — QueryClient-backed, survives navigation
     updateMediaPlayerOperation(client, 'vt-1', () => ({ phase: 'failed', reason: 'no', label: 'Play VT 1' }));
     updateMediaPlayerOperation(client, 'vt-1', (prev) => (prev?.phase === 'failed' ? undefined : prev));
     expect(readMediaPlayerOperations(client)['vt-1']).toBeUndefined();
+  });
+});
+
+describe('preserved uncertainty and credential epochs', () => {
+  it('retains unresolved play separately from latest pause and resolves only with tracker evidence', () => {
+    const unknown: MediaPlayerOperation = { phase: 'unknown', verb: 'play', label: 'Play', reason: 'No answer' };
+    const sending: MediaPlayerOperation = { phase: 'sending', verb: 'pause', label: 'Pause' };
+    const pause = replaceMediaPlayerOperation(replaceMediaPlayerOperation(unknown, sending), {
+      phase: 'accepted', verb: 'pause', label: 'Pause', operationId: 'op-pause', uncorrelated: false,
+    });
+    expect(unresolvedMediaPlayerOperations(pause, () => undefined)).toMatchObject([{ phase: 'unknown', verb: 'play' }]);
+    expect(pause.prior?.some((entry) => entry.phase === 'unknown')).toBe(true);
+    expect(verbBlockedByOperation(pause, 'pause')).toBe(false);
+    expect(replaceMediaPlayerOperation(ACCEPTED_PLAY, sending, () => tracked('applied')).prior).toEqual([]);
+  });
+
+  it('never puts credentials into a key and clears old page records on identity change', () => {
+    setStoredToken('principal-one');
+    const client = new QueryClient();
+    const epoch = mediaPlayerIdentity(client);
+    updateMediaPlayerOperation(client, 'vt-1', () => ACCEPTED_PLAY);
+    setStoredToken('principal-two');
+    const nextEpoch = mediaPlayerIdentity(client);
+    expect(nextEpoch).toBe(epoch + 1);
+    expect(readMediaPlayerOperations(client)).toEqual({});
+    expect(client.getQueryData(MEDIA_PLAYER_OPERATIONS_QUERY_KEY)).toBeUndefined();
+    expect(JSON.stringify(mediaPlayerOperationsKey(nextEpoch))).not.toContain('principal');
+    setStoredToken('');
   });
 });
 

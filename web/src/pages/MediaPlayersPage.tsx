@@ -27,9 +27,9 @@
 //     tracker deadline — is `unknown`, never a failure or a rollback claim.
 //     Only the duplicate of the possibly-in-flight verb is blocked; every
 //     other verb stays usable — no deadlock;
-//   * the per-player latest record persists in the QueryClient, so the
-//     feedback region survives navigating away and back, and an in-flight
-//     submit settles its record while the page is unmounted. The transport
+//   * the per-player latest feedback and earlier unresolved commands persist
+//     in a credential-partitioned QueryClient store across navigation; a
+//     changed identity drops the prior store and its in-flight callbacks. The transport
 //     result may carry a completion promise; it is deliberately ignored — no
 //     second feedback channel and no premature success claim.
 //
@@ -47,7 +47,7 @@
 // state is the authoritative VT readout. The load dialog takes an asset id
 // only (the shipped backend): no asset inventory exists to browse, which the
 // dialog says honestly; save/unload verbs land with ML4 and are absent here.
-import { useMemo, useState } from 'react';
+import { useMemo, useState, useSyncExternalStore } from 'react';
 import type { JSX } from 'react';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { Trans, useLingui } from '@lingui/react/macro';
@@ -75,7 +75,10 @@ import type {
 import { useMediaPlayerStates } from '../realtime/useEngineEvents';
 import type { MediaPlayerEvent } from '../realtime/generated-types';
 import { OperationFeedback, TaskWorkspace, TouchAction } from '../components/broadcast';
-import { useOperationFeedback, useSubmitTrackedOperation } from '../components/broadcast/useOperationFeedback';
+import { useSubmitTrackedOperation } from '../components/broadcast/useOperationFeedback';
+import { getOperationTracker, OPERATION_TRACKER_QUERY_KEY } from '../components/broadcast/operationTracker';
+import type { OperationOutcomeState } from '../components/broadcast/operationOutcomes';
+import { getStoredToken } from '../api/token';
 import { PageHeader } from '../components/PageHeader';
 import { Badge } from '../components/ui/badge';
 import {
@@ -94,11 +97,14 @@ import {
   configuredLoop,
   effectiveSelectedPlayerId,
   isExitArmed,
-  MEDIA_PLAYER_OPERATIONS_QUERY_KEY,
+  mediaPlayerIdentity,
+  mediaPlayerOperationsKey,
   operationFeedbackView,
+  readMediaPlayerOperations,
+  replaceMediaPlayerOperation,
+  unresolvedMediaPlayerOperations,
   stateVariant,
   transportExpectation,
-  unresolvedVerb,
   updateMediaPlayerOperation,
   vampGate,
   verbBlockedByOperation,
@@ -114,8 +120,9 @@ import type {
 interface MediaPlayerCardProps {
   readonly player: MediaPlayer;
   readonly live: MediaPlayerEvent | undefined;
-  /** The player's latest submitted operation (page-persisted, latest wins). */
+  /** Latest feedback and preserved earlier command evidence. */
   readonly op: MediaPlayerOperation | undefined;
+  readonly tracker: OperationOutcomeState;
   readonly focused: boolean;
   readonly detailsOpen: boolean;
   readonly onDetailsToggle: (open: boolean) => void;
@@ -138,6 +145,7 @@ function MediaPlayerCard({
   player,
   live,
   op,
+  tracker,
   focused,
   detailsOpen,
   onDetailsToggle,
@@ -149,11 +157,11 @@ function MediaPlayerCard({
   operationLabel,
 }: MediaPlayerCardProps): JSX.Element {
   const { t } = useLingui();
-  // The shared tracker's record for this player's latest operation. An
-  // uncorrelated acceptance (load/seek) never has one — nothing to look up.
-  const tracked = useOperationFeedback(
-    op?.phase === 'accepted' && !op.uncorrelated ? op.operationId : undefined,
-  );
+  // Shared tracker records are read for both the latest feedback and all
+  // earlier uncertain outcomes; load/seek have no correlated tracker record.
+  const tracked = op?.phase === 'accepted' && !op.uncorrelated
+    ? tracker.records.get(op.operationId) : undefined;
+  const unresolved = unresolvedMediaPlayerOperations(op, (id) => tracker.records.get(id));
   const feedback = operationFeedbackView(
     op,
     tracked,
@@ -167,11 +175,11 @@ function MediaPlayerCard({
     cancel: vampGate(live, 'cancel'),
   };
   const keyBlocked = (verb: TransportAction): boolean =>
-    verbBlockedByOperation(op, verb, tracked);
+    verbBlockedByOperation(op, verb, tracked) || unresolved.some((entry) => 'verb' in entry && entry.verb === verb);
   const keyPending = (verb: TransportAction): boolean =>
     op?.phase === 'sending' && op.verb === verb;
   const duplicateReason = (verb: TransportAction): string | undefined =>
-    unresolvedVerb(op, tracked) === verb
+    unresolved.some((entry) => 'verb' in entry && entry.verb === verb)
       ? t`The previous command's outcome is unknown — repeating it could duplicate the command.`
       : undefined;
   const runVerb = (verb: Exclude<TransportAction, 'load' | 'cue' | 'seek'>): void => {
@@ -381,6 +389,20 @@ function MediaPlayerCard({
               <Trans>Stop</Trans>
             </TouchAction>
           </div>
+          {unresolved.filter((entry) => entry !== op).length > 0 ? (
+            <div role="status" className="mt-2 rounded-md border border-amber-500/50 p-2 text-xs break-words">
+              <Trans>Earlier unresolved commands</Trans>:
+              <ul className="list-inside list-disc">
+                {unresolved.filter((entry) => entry !== op).map((entry, index) => (
+                  <li key={`${String(entry.requestId ?? index)}-${'verb' in entry ? entry.verb : ''}`}>
+                    {entry.label} — <Trans>outcome unknown; do not repeat</Trans>
+                    {entry.phase === 'accepted' ? <code className="ml-1 break-all">{entry.operationId}</code> : null}
+                    {entry.phase === 'unknown' ? <span className="ml-1">{entry.reason}</span> : null}
+                  </li>
+                ))}
+              </ul>
+            </div>
+          ) : null}
           {op?.phase === 'sending' ? (
             // A separate local submitting status: before the real 202 nothing
             // says accepted (the OperationFeedback pending wording is only
@@ -456,6 +478,8 @@ function MediaPlayerCard({
   );
 }
 
+let nextMediaPlayerRequestId = 0;
+
 /** The media-player (VT) transport panel. */
 export function MediaPlayersPage(): JSX.Element {
   const { t } = useLingui();
@@ -472,19 +496,41 @@ export function MediaPlayersPage(): JSX.Element {
   // state (the TaskWorkspace controlled-disclosure contract).
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [detailsOpen, setDetailsOpen] = useState<Record<string, boolean>>({});
-  // One latest-wins operation record per player id (stable key), persisted in
-  // the QueryClient (never component state): the feedback region survives
-  // page navigation, and an in-flight submit settles its record even while
-  // the page is unmounted. The shared tracker owns every verdict transition.
+  // Latest feedback plus preserved unresolved evidence per player, scoped to
+  // an opaque credential epoch. Navigation within an identity retains it;
+  // callbacks from another epoch cannot publish into the new operator view.
+  const identityEpoch = useSyncExternalStore(
+    (notify) => {
+      const listener = (): void => { notify(); };
+      window.addEventListener('storage', listener);
+      const unsubscribe = queryClient.getQueryCache().subscribe(listener);
+      return (): void => { window.removeEventListener('storage', listener); unsubscribe(); };
+    },
+    () => mediaPlayerIdentity(queryClient),
+  );
   const operationsQuery = useQuery<MediaPlayerOperations>({
-    queryKey: MEDIA_PLAYER_OPERATIONS_QUERY_KEY,
+    queryKey: mediaPlayerOperationsKey(identityEpoch),
     queryFn: (): MediaPlayerOperations => ({}),
     enabled: false,
     initialData: {},
   });
   // `initialData` makes `data` always defined — the empty store is the
   // clean slate, never a loading state.
-  const ops: MediaPlayerOperations = operationsQuery.data;
+  // Never render an old observer's data during a token-change render. The
+  // token is compared only in memory, never copied into query keys/devtools.
+  const ops: MediaPlayerOperations = identityEpoch === mediaPlayerIdentity(queryClient)
+    ? (queryClient.getQueryData<MediaPlayerOperations>(mediaPlayerOperationsKey(identityEpoch)) ?? {})
+    : {};
+  void operationsQuery.data;
+  const trackerQuery = useQuery<OperationOutcomeState>({
+    queryKey: OPERATION_TRACKER_QUERY_KEY,
+    queryFn: () => getOperationTracker(queryClient).snapshot(),
+    enabled: false,
+    initialData: () => getOperationTracker(queryClient).snapshot(),
+  });
+  const tracker = getOperationTracker(queryClient).snapshot();
+  void operationsQuery;
+  void trackerQuery;
 
   const data = useMemo<MediaPlayer[]>(() => players.data ?? [], [players.data]);
   const focusedId = effectiveSelectedPlayerId(selectedId, data);
@@ -545,32 +591,46 @@ export function MediaPlayersPage(): JSX.Element {
    */
   const submit = (player: MediaPlayer, vars: TransportVars, label: string): void => {
     const verb = vars.action;
-    updateMediaPlayerOperation(queryClient, player.id, () => ({ phase: 'sending', verb, label }));
+    const token = getStoredToken();
+    const epoch = mediaPlayerIdentity(queryClient);
+    const requestId = ++nextMediaPlayerRequestId;
+    const currentIdentity = (): boolean => {
+      const same = token === getStoredToken() && epoch === mediaPlayerIdentity(queryClient);
+      if (!same) mediaPlayerIdentity(queryClient);
+      return same;
+    };
+    const prior = readMediaPlayerOperations(queryClient)[player.id];
+    if (prior?.phase === 'sending' || unresolvedMediaPlayerOperations(
+      prior, (id) => getOperationTracker(queryClient).snapshot().records.get(id),
+    ).some((entry) => 'verb' in entry && entry.verb === verb)) return;
+    updateMediaPlayerOperation(queryClient, player.id, (previous) =>
+      replaceMediaPlayerOperation(previous, { phase: 'sending', verb, label, requestId },
+        (id) => getOperationTracker(queryClient).snapshot().records.get(id)));
     void submitTracked(
       () => transport.mutateAsync(vars),
       transportExpectation(player.id, verb),
     ).then(
       (result): void => {
-        updateMediaPlayerOperation(queryClient, player.id, () => ({
-          phase: 'accepted',
-          operationId: result.operationId,
-          verb,
-          label,
-          uncorrelated: result.kind === 'accepted-unobserved',
-        }));
+        if (!currentIdentity()) return;
+        updateMediaPlayerOperation(queryClient, player.id, (previous) =>
+          previous?.requestId === requestId
+            ? { ...previous, phase: 'accepted', operationId: result.operationId,
+                verb, label, uncorrelated: result.kind === 'accepted-unobserved' }
+            : previous);
       },
       (error: unknown): void => {
         // A definitive HTTP rejection failed. A capacity refusal (before any
         // POST) is a local refusal. Anything else (a transport-level failure,
         // an unreadable 2xx) is an UNKNOWN outcome: the command may or may
         // not have been applied, and nothing here ever claims a rollback.
-        updateMediaPlayerOperation(queryClient, player.id, () =>
-          classifySubmissionError(
-            error,
-            verb,
-            label,
-            t`The control plane did not answer. The command may or may not have been applied.`,
-          ),
+        if (!currentIdentity()) return;
+        updateMediaPlayerOperation(queryClient, player.id, (previous) =>
+          previous?.requestId === requestId
+            ? { ...classifySubmissionError(
+                error, verb, label,
+                t`The control plane did not answer. The command may or may not have been applied.`,
+              ), requestId, prior: previous.prior }
+            : previous,
         );
       },
     );
@@ -616,6 +676,7 @@ export function MediaPlayersPage(): JSX.Element {
       player={player}
       live={liveStates[player.id]}
       op={ops[player.id]}
+      tracker={tracker}
       focused={focusedId === player.id}
       detailsOpen={detailsOpen[player.id] === true}
       onDetailsToggle={(open: boolean): void => {
