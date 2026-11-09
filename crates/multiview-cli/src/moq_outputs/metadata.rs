@@ -1,4 +1,36 @@
 //! Validated effective decoder descriptors. This module never acquires source demand.
+/// Read a bounded measured startup request from a private, regular, non-symlink
+/// file. Parsing uses the eventual config-owned serde type; this reader never
+/// creates profiles, guesses measurements, or opens an encoder.
+#[cfg(unix)]
+pub fn read_measured_startup<T: serde::de::DeserializeOwned>(
+    path: &std::path::Path,
+) -> Result<T, multiview_control::moq::MoqReject> {
+    use multiview_control::moq::MoqReject;
+    use std::io::Read;
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(
+            i32::try_from(rustix::fs::OFlags::NOFOLLOW.bits())
+                .map_err(|_| MoqReject::Unavailable)?,
+        )
+        .open(path)
+        .map_err(|_| MoqReject::Unavailable)?;
+    let meta = file.metadata().map_err(|_| MoqReject::Unavailable)?;
+    if !meta.is_file() || meta.permissions().mode() & 0o077 != 0 || meta.len() > 64 * 1024 {
+        return Err(MoqReject::Unavailable);
+    }
+    let mut value = Vec::new();
+    file.take(64 * 1024 + 1)
+        .read_to_end(&mut value)
+        .map_err(|_| MoqReject::Unavailable)?;
+    if value.len() > 64 * 1024 {
+        return Err(MoqReject::Unavailable);
+    }
+    serde_json::from_slice(&value).map_err(|_| MoqReject::Unavailable)
+}
+
 use super::{Timebase, TrackMapping};
 use base64::{engine::general_purpose::STANDARD, Engine};
 use multiview_control::{
@@ -378,6 +410,29 @@ mod tests {
             },
         }
     }
+    #[cfg(unix)]
+    #[test]
+    fn measured_startup_reader_rejects_unsafe_file_and_never_fabricates_config() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+        let dir = std::env::temp_dir().join(format!("measured-startup-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("request.json");
+        std::fs::write(&path, br#"{"measured":true}"#).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let value: serde_json::Value = read_measured_startup(&path).unwrap();
+        assert_eq!(value["measured"], true);
+        let link = dir.join("link.json");
+        if !link.exists() {
+            symlink(&path, &link).unwrap();
+        }
+        assert!(read_measured_startup::<serde_json::Value>(&link).is_err());
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(read_measured_startup::<serde_json::Value>(&path).is_err());
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        std::fs::write(&path, vec![b' '; 64 * 1024 + 1]).unwrap();
+        assert!(read_measured_startup::<serde_json::Value>(&path).is_err());
+    }
+
     #[test]
     fn descriptions_match_lease_base64_and_catalog_hex() {
         let v = video();
