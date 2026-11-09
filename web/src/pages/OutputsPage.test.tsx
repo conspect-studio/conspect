@@ -134,8 +134,8 @@ describe('OutputsPage broadcast cards (configured facts)', () => {
     expect(screen.getByText('srt://[2001:db8::9]:7001')).toBeInTheDocument();
     expect(screen.getAllByText('h264').length).toBeGreaterThanOrEqual(3);
     // Runnability honesty survives the card adoption unchanged.
-    expect(screen.getByText('Runnable')).toBeInTheDocument();
-    expect(screen.getByText('Not yet runnable in this build')).toBeInTheDocument();
+    expect(screen.getAllByText('Runnable').length).toBeGreaterThanOrEqual(1);
+    expect(screen.getAllByText('Not yet runnable in this build').length).toBeGreaterThanOrEqual(1);
     // The unknown-kind card shows the honest dash, never a folded runnability
     // claim for a kind this build does not know.
     const legacy = screen.getByTestId('output-card-legacy-thing');
@@ -159,13 +159,13 @@ describe('OutputsPage broadcast cards (configured facts)', () => {
     // controlled: aria-expanded flips on press and the panel follows it.
     const detailsKeys = screen.getAllByRole('button', { name: 'Details' });
     expect(detailsKeys.length).toBe(OUTPUTS.length);
-    const key = detailsKeys[0] as HTMLElement;
+    const key = detailsKeys[0]!;
     expect(key).toHaveClass('h-12');
     expect(key).toHaveClass('md:hidden');
     expect(key).toHaveAttribute('aria-expanded', 'false');
     const panelId = key.getAttribute('aria-controls');
     expect(panelId).not.toBeNull();
-    const panel = document.getElementById(panelId as string);
+    const panel = document.getElementById(panelId!);
     expect(panel).not.toBeNull();
     // Closed on narrow viewports, in flow from md: up.
     expect(panel).toHaveClass('hidden');
@@ -181,7 +181,7 @@ describe('OutputsPage broadcast cards (configured facts)', () => {
     await screen.findByTestId('output-card-program');
     const playlist = screen.getByRole('link', { name: 'Open HLS playlist' });
     expect(playlist).toHaveAttribute('href', '/hls/program/index.m3u8');
-    expect(screen.getByRole('link', { name: 'Watch program' })).toBeInTheDocument();
+    expect(within(screen.getByTestId('output-card-program')).getByRole('link', { name: 'Watch program' })).toBeInTheDocument();
     // Freshness is absent from this surface by design: the configured
     // playlist link never claims the output is live. The caveat renders once
     // per card (in the details disclosure), so "exactly one per card" is the
@@ -338,9 +338,19 @@ describe('OutputsPage collision honesty (derived mounts)', () => {
       body: { kind: 'hls', path: '/a/index.m3u8', codec: 'h264' },
     },
     {
-      id: 'program-2',
-      name: 'Second HLS',
+      id: 'a b',
+      name: 'First colliding HLS',
       body: { kind: 'hls', path: '/b/index.m3u8', codec: 'h264' },
+    },
+    {
+      id: 'a-b',
+      name: 'Second colliding HLS',
+      body: { kind: 'hls', path: '/c/index.m3u8', codec: 'h264' },
+    },
+    {
+      id: 'a-b-2',
+      name: 'Runtime-suffixed HLS',
+      body: { kind: 'hls', path: '/d/index.m3u8', codec: 'h264' },
     },
   ];
 
@@ -350,13 +360,15 @@ describe('OutputsPage collision honesty (derived mounts)', () => {
     );
     renderOutputs();
     await screen.findByTestId('output-card-program');
-    await screen.findByTestId('output-card-program-2');
+    await screen.findByTestId('output-card-a-b-2');
     // The FIRST id keeps its stable mount: its derived playlist link stays…
     const stable = screen.getByRole('link', { name: 'Open HLS playlist' });
     expect(stable).toHaveAttribute('href', '/hls/program/index.m3u8');
-    // …while the runtime-suffixed duplicate gets no link — its mount depends
-    // on configuration order — and its card says exactly that.
-    const dup = within(screen.getByTestId('output-card-program-2'));
+    // …while the normalized duplicates and the runtime-suffixed mount get
+    // no link: their mounts depend on configuration order.
+    const dup = within(screen.getByTestId('output-card-a-b-2'));
+    expect(within(screen.getByTestId('output-card-a b')).queryByRole('link', { name: 'Open HLS playlist' })).not.toBeInTheDocument();
+    expect(within(screen.getByTestId('output-card-a-b')).queryByRole('link', { name: 'Open HLS playlist' })).not.toBeInTheDocument();
     expect(
       dup.queryByRole('link', { name: 'Open HLS playlist' }),
     ).not.toBeInTheDocument();

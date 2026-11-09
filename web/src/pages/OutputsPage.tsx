@@ -31,7 +31,7 @@ import { useState } from 'react';
 import type { JSX } from 'react';
 import { Link } from 'react-router-dom';
 import { hlsPlaybackCollisionIds, hlsPlaybackPaths } from '../preview/outputPlayback';
-import { Trans, useLingpi } from '@lingui/react/macro';
+import { Trans, useLingui } from '@lingui/react/macro';
 import { CircleCheck, Hourglass, MonitorCog, Pencil, Plus, Trash2 } from 'lucide-react';
 
 import { OutputFromDeviceSection } from '../devices/FromDevice';
@@ -166,7 +166,7 @@ function hasLiveLink(kind: OutputKind): boolean {
  * without the reason counters fall back to the one conflated total.
  */
 export function OutputLinkStatus({ id }: { readonly id: string }): JSX.Element | null {
-  const { t } = useLingpi();
+  const { t } = useLingui();
   const link = useOutputLink(id, true).data;
   if (link === undefined || link === null) {
     return null;
@@ -261,7 +261,7 @@ function OutputKindFields({
   readonly setForm: (next: OutputFormState) => void;
   readonly errors: FieldErrors<OutputField>;
 }): JSX.Element {
-  const { t } = useLingpi();
+  const { t } = useLingui();
   switch (form.kind) {
     case 'rtsp':
       return (
@@ -441,7 +441,7 @@ function OutputKindFields({
  * here — there is nothing to derive yet.
  */
 function PlaybackUrlsSection({ outputId }: { readonly outputId: string }): JSX.Element | null {
-  const { t } = useLingpi();
+  const { t } = useLingui();
   const playback = useOutputPlayback(outputId === '' ? undefined : outputId);
   if (outputId === '' || playback.data === undefined || playback.data.length === 0) {
     return null;
@@ -479,7 +479,7 @@ function WebrtcOutputFields({
   readonly setForm: (next: OutputFormState) => void;
   readonly errors: FieldErrors<OutputField>;
 }): JSX.Element {
-  const { t } = useLingpi();
+  const { t } = useLingui();
   const id = form.id.trim();
   return (
     <>
@@ -556,7 +556,7 @@ function WhipPushOutputFields({
   readonly setForm: (next: OutputFormState) => void;
   readonly errors: FieldErrors<OutputField>;
 }): JSX.Element {
-  const { t } = useLingpi();
+  const { t } = useLingui();
   return (
     <>
       <FormField
@@ -600,7 +600,7 @@ function DisplayKindFields({
   readonly setForm: (next: OutputFormState) => void;
   readonly errors: FieldErrors<OutputField>;
 }): JSX.Element {
-  const { t } = useLingpi();
+  const { t } = useLingui();
   const modeLabel = (choice: DisplayModeChoice): JSX.Element => {
     switch (choice) {
       case 'auto':
@@ -693,7 +693,7 @@ function CodecFields({
   readonly setForm: (next: OutputFormState) => void;
   readonly errors: FieldErrors<OutputField>;
 }): JSX.Element | null {
-  const { t } = useLingpi();
+  const { t } = useLingui();
   if (form.kind === 'ndi' || form.kind === 'display') {
     // NDI and the local display head carry frames, not an encoded rendition —
     // no codec field exists.
@@ -758,7 +758,7 @@ function AudioTracksField({
   readonly error: FieldErrors<OutputField>['audioTracks'];
   readonly selectableTracks: readonly string[] | undefined;
 }): JSX.Element {
-  const { t } = useLingpi();
+  const { t } = useLingui();
   if (selectableTracks === undefined) {
     return (
       <FormField
@@ -843,7 +843,7 @@ function OutputAdvancedFields({
   readonly errors: FieldErrors<OutputField>;
   readonly selectableTracks: readonly string[] | undefined;
 }): JSX.Element {
-  const { t } = useLingpi();
+  const { t } = useLingui();
   const audioLabel = (choice: OutputAudioChoice): JSX.Element => {
     switch (choice) {
       case 'default':
@@ -933,7 +933,7 @@ function OutputCard({
   readonly onEdit: (row: OutputView) => void;
   readonly onDelete: (row: OutputView) => void;
 }): JSX.Element {
-  const { t } = useLingpi();
+  const { t } = useLingui();
   // An unknown-kind document renders + deletes normally but Edit is refused —
   // editing through a fold would silently rewrite the authored document.
   // `aria-disabled` (not `disabled`) keeps the control focusable so the
@@ -944,7 +944,8 @@ function OutputCard({
     ? t`kind "${output.rawKind}" isn't editable in this UI; the document is preserved as authored`
     : undefined;
   return (
-    <TaskWorkspace
+    <div data-testid={`output-card-${output.id}`}>
+      <TaskWorkspace
       title={
         <span className="flex min-w-0 flex-wrap items-baseline gap-x-2 break-words">
           <span lang="" dir="auto" className="font-medium">
@@ -1013,7 +1014,7 @@ function OutputCard({
       detailsOpen={detailsOpen}
       onDetailsToggle={onDetailsToggle}
     >
-      <div data-testid={`output-card-${output.id}`} className="grid gap-2">
+      <div className="grid gap-2">
         <div className="flex flex-wrap items-center gap-3 text-sm">
           <Link className="underline" to="/monitoring">
             <Trans>Watch program</Trans>
@@ -1029,7 +1030,7 @@ function OutputCard({
             variant="outline"
             aria-label={
               editRefused
-                ? `${t`Edit output`}: ${output.name} — ${editDisabledReason}`
+                ? `${t`Edit output`}: ${output.name} — ${editDisabledReason ?? ''}`
                 : `${t`Edit output`}: ${output.name}`
             }
             aria-disabled={editRefused}
@@ -1058,6 +1059,7 @@ function OutputCard({
         </div>
       </div>
     </TaskWorkspace>
+    </div>
   );
 }
 
@@ -1067,7 +1069,7 @@ const NO_ERRORS = {};
 
 /** Outputs management. */
 export function OutputsPage(): JSX.Element {
-  const { t } = useLingpi();
+  const { t } = useLingui();
   const outputs = useOutputs();
   const routing = useAudioRouting();
   const selectableTracks = routing.data?.state.selectable_tracks;
@@ -1127,7 +1129,7 @@ export function OutputsPage(): JSX.Element {
     }
     const found = validateOutputForm(form, creating);
     setErrors(found);
-    if (Object.values(found).some((code) => code !== undefined)) {
+    if (Object.keys(found).length > 0) {
       return;
     }
     save.mutate(
@@ -1178,7 +1180,7 @@ export function OutputsPage(): JSX.Element {
     setPendingDelete(null);
   };
 
-  const hasErrors = Object.values(errors).some((code) => code !== undefined);
+  const hasErrors = Object.keys(errors).length > 0;
 
   return (
     <>
@@ -1215,9 +1217,9 @@ export function OutputsPage(): JSX.Element {
         </p>
       ) : outputs.isError ? (
         <p role="alert" className="text-sm text-destructive">
-          <Trans>Could not load outputs:</Trans> {outputs.error?.message ?? ''}
+          <Trans>Could not load outputs:</Trans> {outputs.error.message}
         </p>
-      ) : (outputs.data ?? []).length === 0 ? (
+      ) : outputs.data.length === 0 ? (
         <p className="text-sm text-muted-foreground">
           <Trans>No outputs configured.</Trans>
         </p>
@@ -1225,7 +1227,7 @@ export function OutputsPage(): JSX.Element {
         <div>
           <p className="mb-3 text-xs text-muted-foreground">{t`Configured output sinks.`}</p>
           <div className="grid gap-4">
-            {(outputs.data ?? []).map((output) => (
+            {outputs.data.map((output) => (
               <OutputCard
                 key={output.id}
                 output={output}
