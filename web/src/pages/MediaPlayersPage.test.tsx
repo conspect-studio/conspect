@@ -22,7 +22,7 @@
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from 'vitest';
 import { Profiler } from 'react';
 import { act, render, screen, waitFor, within } from '@testing-library/react';
-import { setStoredToken } from '../api/token';
+import { clearStoredToken, setStoredToken } from '../api/token';
 import { readMediaPlayerOperations, updateMediaPlayerOperation, MEDIA_PLAYER_OPERATIONS_QUERY_KEY } from './mediaPlayerPresentation';
 import userEvent from '@testing-library/user-event';
 import { http, HttpResponse } from 'msw';
@@ -59,7 +59,7 @@ beforeAll(() => {
 afterEach(() => {
   server.resetHandlers();
   vi.restoreAllMocks();
-  setStoredToken('');
+  act(() => { setStoredToken(''); });
 });
 afterAll(() => {
   server.close();
@@ -468,6 +468,33 @@ describe('MediaPlayersPage unresolved registry and principal partition', () => {
     expect(first.client.getQueryData(MEDIA_PLAYER_OPERATIONS_QUERY_KEY)).toBeUndefined();
   });
 
+  it.each(['replace', 'clear', 'empty', 'storage'] as const)('removes the previous operator reason on a quiet mounted %s without invalidation or parent rerender', async (change) => {
+    setStoredToken('actor-a');
+    const client = new QueryClient({
+      defaultOptions: { queries: { retry: false, staleTime: Infinity, refetchOnWindowFocus: false } },
+    });
+    renderPage({ client });
+    await screen.findByTestId('player-console-vt-1');
+    act(() => {
+      updateMediaPlayerOperation(client, 'vt-1', () => ({
+        phase: 'unknown', verb: 'play', label: 'PRIVATE-A', reason: 'PRIVATE-REASON-A',
+      }));
+    });
+    await screen.findByText(/PRIVATE-REASON-A/);
+    const invalidate = vi.spyOn(client, 'invalidateQueries');
+    act(() => {
+      if (change === 'storage') {
+        window.localStorage.setItem('multiview.apiToken', 'actor-b');
+        window.dispatchEvent(new StorageEvent('storage', { key: 'multiview.apiToken' }));
+      } else if (change === 'clear') clearStoredToken();
+      else setStoredToken(change === 'empty' ? '' : 'actor-b');
+    });
+    expect(screen.queryByText(/PRIVATE-REASON-A/)).toBeNull();
+    expect(readMediaPlayerOperations(client)).toEqual({});
+    expect(invalidate).not.toHaveBeenCalled();
+    expect(JSON.stringify(client.getQueryCache().getAll().map((query) => query.queryKey))).not.toContain('actor-');
+  });
+
   it('removes accepted actor A identifiers on actor B save and on credential clear', async () => {
     const errors = vi.spyOn(console, 'error');
     setStoredToken('actor-a');
@@ -478,14 +505,12 @@ describe('MediaPlayersPage unresolved registry and principal partition', () => {
     await userEvent.click(screen.getByRole('button', { name: 'Play player: vt-1' }));
     await screen.findByText(/Play VT 1 accepted/);
     expect(consoleOf('vt-1')).toHaveTextContent('op-actor-a');
-    setStoredToken('actor-b');
-    await act(async () => { await client.invalidateQueries(); });
+    act(() => { setStoredToken('actor-b'); });
     await waitFor(() => expect(consoleOf('vt-1')).not.toHaveTextContent('op-actor-a'));
     expect(readMediaPlayerOperations(client)).toEqual({});
     expect(JSON.stringify(client.getQueryCache().getAll().map((query) => query.state.data))).not.toContain('op-actor-a');
     expect(errors.mock.calls.flat().join(' ')).not.toMatch(/Cannot update a component.*while rendering/);
-    setStoredToken('');
-    await act(async () => { await client.invalidateQueries(); });
+    act(() => { setStoredToken(''); });
     expect(readMediaPlayerOperations(client)).toEqual({});
   });
 
@@ -499,9 +524,8 @@ describe('MediaPlayersPage unresolved registry and principal partition', () => {
     await userEvent.click(screen.getByRole('button', { name: 'Play player: vt-1' }));
     expect(readMediaPlayerOperations(first.client)['vt-1']?.phase).toBe('sending');
     if (remount) first.unmount();
-    setStoredToken('actor-b');
+    act(() => { setStoredToken('actor-b'); });
     if (remount) renderPage({ client: first.client });
-    await act(async () => { await first.client.invalidateQueries(); });
     expect(screen.queryByText(/Sending Play VT 1/)).toBeNull();
     expect(readMediaPlayerOperations(first.client)).toEqual({});
     release(HttpResponse.json({ operation_id: 'op-actor-a', kind: 'media_play' }));
@@ -510,8 +534,7 @@ describe('MediaPlayersPage unresolved registry and principal partition', () => {
     expect(errors.mock.calls.flat().join(' ')).not.toMatch(/Cannot update a component.*while rendering/);
     expect(readMediaPlayerOperations(first.client)).toEqual({});
     expect(JSON.stringify(first.client.getQueryCache().getAll().map((query) => query.queryKey))).not.toContain('actor-');
-    setStoredToken('');
-    await act(async () => { await first.client.invalidateQueries(); });
+    act(() => { setStoredToken(''); });
     expect(readMediaPlayerOperations(first.client)).toEqual({});
     expect(first.client.getQueryData(MEDIA_PLAYER_OPERATIONS_QUERY_KEY)).toBeUndefined();
   });

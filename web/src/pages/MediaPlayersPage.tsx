@@ -79,7 +79,7 @@ import { useSubmitTrackedOperation } from '../components/broadcast/useOperationF
 import { getOperationTracker, OPERATION_TRACKER_QUERY_KEY } from '../components/broadcast/operationTracker';
 import { createOperationOutcomeState } from '../components/broadcast/operationOutcomes';
 import type { OperationOutcomeState } from '../components/broadcast/operationOutcomes';
-import { getStoredToken } from '../api/token';
+import { getStoredToken, subscribeStoredToken } from '../api/token';
 import { PageHeader } from '../components/PageHeader';
 import { Badge } from '../components/ui/badge';
 import {
@@ -505,13 +505,18 @@ export function MediaPlayersPage(): JSX.Element {
     (notify) => {
       const listener = (): void => { notify(); };
       window.addEventListener('storage', listener);
+      const unsubscribeToken = subscribeStoredToken(listener);
       // Query creation/observer attachment can occur during render. Those
       // events are not credential signals and must not synchronously notify
       // React while it is constructing the incoming epoch's query.
       const unsubscribe = queryClient.getQueryCache().subscribe((event) => {
         if (event.type === 'updated') listener();
       });
-      return (): void => { window.removeEventListener('storage', listener); unsubscribe(); };
+      return (): void => {
+        window.removeEventListener('storage', listener);
+        unsubscribeToken();
+        unsubscribe();
+      };
     },
     () => mediaPlayerIdentitySnapshot(queryClient),
     () => mediaPlayerIdentitySnapshot(queryClient),
