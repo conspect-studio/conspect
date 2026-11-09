@@ -574,6 +574,7 @@ fn attach_run_switcher(
     pipeline: &mut multiview_cli::pipeline::Pipeline,
     demand: Option<multiview_control::SharedSourceDemand>,
     publisher: &Arc<EnginePublisher<EngineStateSnapshot, Event>>,
+    stop: &StopSignal,
 ) -> anyhow::Result<Option<multiview_cli::switcher_runtime::FirstSliceSwitcher>> {
     let Some(attached) = multiview_cli::switcher_runtime::attach_first_slice(pipeline, demand)?
     else {
@@ -596,6 +597,16 @@ fn attach_run_switcher(
             Arc::clone(&attached.leases),
         ),
     );
+    // The correlated relay above is the primary lease resolver, but it can die
+    // or lag; this off-clock, bounded sweep reconciles any accepted-but-
+    // unresolved selection against the engine's own applied snapshot so a
+    // preview demand can never be leaked forever. It stops with the run.
+    tokio::spawn(multiview_control::switcher_events::sweep_switcher_leases(
+        attached.control.clone(),
+        Arc::clone(&attached.leases),
+        stop.clone(),
+        multiview_control::switcher_events::SWEEPER_INTERVAL,
+    ));
     Ok(Some(attached))
 }
 
@@ -649,6 +660,20 @@ async fn run_pipeline_until_ctrl_c(
     let mut switcher_leases = None;
     let mut switcher_preview_slot = None;
     let mut switcher_attached = false;
+    struct LeaseCleanup(
+        Option<Arc<multiview_control::source_demand::SwitcherPreviewLeases>>,
+        StopSignal,
+    );
+    impl Drop for LeaseCleanup {
+        fn drop(&mut self) {
+            self.1.stop();
+            if let Some(leases) = &self.0 {
+                leases.detach();
+            }
+        }
+    }
+    let mut lease_cleanup = LeaseCleanup(None, stop.clone());
+    let mut attached_switcher: Option<multiview_cli::switcher_runtime::FirstSliceSwitcher> = None;
     // The shared program-audio preview tap (ADR-P006 audio): wired ONLY when this
     // run carries program audio AND a live WHEP egress can consume it
     // (`webrtc-native`). The bake consumer pushes post-loudnorm program PCM into
@@ -733,10 +758,13 @@ async fn run_pipeline_until_ctrl_c(
             &mut pipeline,
             multiview_cli::source_demand::installed_control_demand(),
             &publisher,
+            &stop,
         )? {
+            lease_cleanup.0 = Some(Arc::clone(&attached.leases));
             switcher_leases = Some(Arc::clone(&attached.leases));
             switcher_preview_slot = Some(Arc::clone(&attached.preview_slot));
             switcher_attached = true;
+            attached_switcher = Some(attached);
         }
         let (handle, command_rx, hub, watch, persist) = serve_control_plane(
             &cfg.listen,
@@ -822,7 +850,7 @@ async fn run_pipeline_until_ctrl_c(
     // skipped honestly (the configured PVW source is warmed by whoever selects
     // it, which in this run means nobody).
     if !switcher_attached {
-        let _ = attach_run_switcher(&mut pipeline, None, &publisher)?;
+        attached_switcher = attach_run_switcher(&mut pipeline, None, &publisher, &stop)?;
     }
 
     let stop_for_signal = stop.clone();
@@ -942,6 +970,13 @@ async fn run_pipeline_until_ctrl_c(
     let report =
         drive_main_program_in_set(pipeline, cadence, &stop, &publisher, &preview_slot, drain)
             .await?;
+
+    // The run is over: release this generation's preview demand explicitly
+    // (the sweeper has stopped on the same signal, so nothing can re-adopt a
+    // cancelled selection), then tear the shared tenants down.
+    if let Some(attached) = &attached_switcher {
+        attached.leases.detach();
+    }
 
     // The pipeline loop returned; tear down every run tenant in one call.
     shutdown_run_tenants(RunTenants {

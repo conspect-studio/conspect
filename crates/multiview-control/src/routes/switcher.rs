@@ -277,7 +277,10 @@ pub(crate) async fn submit_switcher(
                                     .into(),
                             ));
                         };
-                        Some(crate::source_demand::SwitcherPreviewLease::new(lease))
+                        Some((
+                            source.clone(),
+                            crate::source_demand::SwitcherPreviewLease::new(lease),
+                        ))
                     }
                     (None, _) => None,
                     (_, None) => {
@@ -288,25 +291,23 @@ pub(crate) async fn submit_switcher(
             } else {
                 None
             };
-            if let Some(lease) = lease {
-                if state
+            let command = SwitcherCommand {
+                operation_id: op.to_string(),
+                scene_version,
+                verb,
+            };
+            let admitted = if let Some((target, lease)) = lease {
+                state
                     .switcher_preview_lease
-                    .hold(op.to_string(), lease)
-                    .is_err()
-                {
-                    state.idempotency.release(Some(key), &op);
-                    return Err(ControlError::EngineBusy);
-                }
-            }
-            if handle
-                .try_send(SwitcherCommand {
-                    operation_id: op.to_string(),
-                    scene_version,
-                    verb,
-                })
-                .is_err()
-            {
-                state.switcher_preview_lease.resolve(op.as_str(), false);
+                    .admit(op.to_string(), target, lease, &handle, || {
+                        handle.try_send(command).map_err(|_| ())?;
+                        Ok(handle.composed_count())
+                    })
+                    .is_ok()
+            } else {
+                handle.try_send(command).is_ok()
+            };
+            if !admitted {
                 state.idempotency.release(Some(key), &op);
                 return Err(ControlError::EngineBusy);
             }

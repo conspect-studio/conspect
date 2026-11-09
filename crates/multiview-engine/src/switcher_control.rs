@@ -114,6 +114,7 @@ pub struct SwitcherControl {
     scenes: LatestState<ScenePair>,
     readiness: LatestState<ProviderStatus>,
     applied_tick: Arc<std::sync::atomic::AtomicU64>,
+    composed_count: Arc<std::sync::atomic::AtomicU64>,
 }
 
 /// Actual paired-bus frame capability, published after the rendering provider
@@ -161,6 +162,7 @@ impl SwitcherControl {
             scenes: LatestState::new(),
             readiness: LatestState::new(),
             applied_tick: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            composed_count: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         };
         let driver = SwitcherTickDriver {
             rx,
@@ -170,6 +172,7 @@ impl SwitcherControl {
             scenes: handle.scenes.clone(),
             readiness: handle.readiness.clone(),
             applied_tick: Arc::clone(&handle.applied_tick),
+            composed_count: Arc::clone(&handle.composed_count),
             active_auto: None,
             active_auto_scenes: None,
             primed_stores: None,
@@ -219,6 +222,13 @@ impl SwitcherControl {
     #[must_use]
     pub fn snapshot(&self) -> Option<std::sync::Arc<SwitcherSnapshot>> {
         self.snapshots.latest()
+    }
+
+    /// Number of committed frames, independent of skipped tick indices.
+    #[must_use]
+    pub fn composed_count(&self) -> u64 {
+        self.composed_count
+            .load(std::sync::atomic::Ordering::Acquire)
     }
 
     /// Last freshly published tick, independent of change-only state snapshots.
@@ -280,6 +290,7 @@ pub struct SwitcherTickDriver {
     active_auto_scenes: Option<Arc<ScenePair>>,
     readiness: LatestState<ProviderStatus>,
     applied_tick: Arc<std::sync::atomic::AtomicU64>,
+    composed_count: Arc<std::sync::atomic::AtomicU64>,
     primed_stores: Option<HashMap<String, Arc<TileStore<Nv12Image>>>>,
     pending_take: Option<(SwitcherCommand, u64)>,
     last_tick: u64,
@@ -569,6 +580,8 @@ impl SwitcherTickDriver {
                 completion_count: self.machine.completion_count(),
             });
         }
+        self.composed_count
+            .fetch_add(1, std::sync::atomic::Ordering::Release);
         self.spare_success.clear();
         std::mem::swap(&mut self.staged_success, &mut self.spare_success);
         while let Some(operation_id) = self.spare_success.pop() {
