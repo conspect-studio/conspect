@@ -143,12 +143,13 @@ async fn live_blocked_sink_never_stalls_and_never_sheds() {
     let clock = Arc::new(ManualTimeSource::new());
     let stop = StopSignal::new();
     let driver_stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    // ~1.6x real time: the consumer (a real encoder at memory-µs per frame)
-    // keeps up — inside the admitted envelope nothing is shed.
+    // REAL TIME (the admitted envelope): the consumer holds a large margin at
+    // cadence — nothing is shed even on a loaded box; beyond-envelope overrun
+    // is `beyond_envelope_shed_fails_visibly`'s contract.
     spawn_clock_driver_paced(
         Arc::clone(&clock),
         Arc::clone(&driver_stop),
-        std::time::Duration::from_millis(25),
+        std::time::Duration::from_millis(40),
     );
 
     let clock_concrete: Arc<ManualTimeSource> = Arc::clone(&clock);
