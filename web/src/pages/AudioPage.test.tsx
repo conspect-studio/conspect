@@ -193,6 +193,22 @@ describe("AudioPage", () => {
     expect(screen.queryByTestId("audio-draft-summary")).not.toBeInTheDocument();
   });
 
+  it("puts the full-height fader before secondary strip controls and keeps context after the console", async () => {
+    renderAudio();
+    const { focused } = await console();
+    const fader = within(focused).getByTestId("audio-fader");
+    const mute = within(focused).getByTestId("audio-mute");
+    const nudges = within(focused).getByTestId("audio-nudges");
+    expect(fader.compareDocumentPosition(mute) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    expect(fader.compareDocumentPosition(nudges) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    expect(fader).toHaveClass("h-12", "w-60");
+    expect(screen.getByRole("heading", { name: "Channel strip" })).toHaveClass("sr-only");
+    const context = screen.getByTestId("audio-page-context");
+    expect(focused.compareDocumentPosition(context) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    expect(context).toHaveTextContent(/Route each input's audio/);
+    expect(within(context).getByRole("button", { name: /export configuration/i })).toBeInTheDocument();
+  });
+
   it("shows the apply-semantics callout", async () => {
     renderAudio();
     expect(await screen.findByRole("note")).toHaveTextContent(

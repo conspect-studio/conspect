@@ -301,61 +301,6 @@ function ChannelStrip({
         )}
       </p>
 
-      {/* The strip keys: MUTE and PGM (program-bus include) — draft toggles,
-          pressed state visible by style AND text in the status line. */}
-      <div className="flex flex-wrap items-center gap-2">
-        <Button
-          type="button"
-          variant="outline"
-          data-testid="audio-mute"
-          aria-pressed={route.mute}
-          aria-label={t`${label} MUTE`}
-          className="h-12 min-w-12 px-4 aria-pressed:border-destructive/60 aria-pressed:bg-destructive/15 aria-pressed:text-destructive"
-          onClick={(): void => {
-            onChange({ ...route, mute: !route.mute });
-          }}
-        >
-          {t`MUTE`}
-        </Button>
-        <Button
-          type="button"
-          variant="outline"
-          data-testid="audio-pgm"
-          aria-pressed={route.includeInProgramBus}
-          aria-label={t`${label} PGM (include in the program mix)`}
-          className="h-12 min-w-12 px-4 aria-pressed:border-status-live/60 aria-pressed:bg-status-live/15"
-          onClick={(): void => {
-            onChange({ ...route, includeInProgramBus: !route.includeInProgramBus });
-          }}
-        >
-          {t`PGM`}
-        </Button>
-      </div>
-
-      {/* ±1 / ±6 dB tap nudges (48 px), staged exactly like the drag. */}
-      <div className="flex flex-wrap items-center gap-1" data-testid="audio-nudges">
-        {([6, 1, -1, -6] as const).map((delta) => (
-          <Button
-            key={delta}
-            type="button"
-            variant="outline"
-            data-testid="audio-nudge"
-            aria-label={
-              delta > 0
-                ? t`${label} gain +${delta} dB`
-                : t`${label} gain −${Math.abs(delta)} dB`
-            }
-            className="size-12 p-0 font-mono"
-            disabled={draftDb === undefined}
-            onClick={(): void => {
-              setGain(nudgeGainDb(route.gainDb, delta));
-            }}
-          >
-            {delta > 0 ? `+${String(delta)}` : `−${String(Math.abs(delta))}`}
-          </Button>
-        ))}
-      </div>
-
       {/* The fader: ticks, knob and readout share ONE linear dB mapping; the
           48 px knob hit box travels a 240 px track; 0 dB is at the TOP. The
           range is a display bound only — the readout above carries the exact
@@ -411,6 +356,61 @@ function ChannelStrip({
           />
         </div>
         <InputMeterColumn sample={inputSample} />
+      </div>
+
+      {/* The strip keys: MUTE and PGM (program-bus include) — draft toggles,
+          pressed state visible by style AND text in the status line. */}
+      <div className="flex flex-wrap items-center gap-2">
+        <Button
+          type="button"
+          variant="outline"
+          data-testid="audio-mute"
+          aria-pressed={route.mute}
+          aria-label={t`${label} MUTE`}
+          className="h-12 min-w-12 px-4 aria-pressed:border-destructive/60 aria-pressed:bg-destructive/15 aria-pressed:text-destructive"
+          onClick={(): void => {
+            onChange({ ...route, mute: !route.mute });
+          }}
+        >
+          {t`MUTE`}
+        </Button>
+        <Button
+          type="button"
+          variant="outline"
+          data-testid="audio-pgm"
+          aria-pressed={route.includeInProgramBus}
+          aria-label={t`${label} PGM (include in the program mix)`}
+          className="h-12 min-w-12 px-4 aria-pressed:border-status-live/60 aria-pressed:bg-status-live/15"
+          onClick={(): void => {
+            onChange({ ...route, includeInProgramBus: !route.includeInProgramBus });
+          }}
+        >
+          {t`PGM`}
+        </Button>
+      </div>
+
+      {/* ±1 / ±6 dB tap nudges (48 px), staged exactly like the drag. */}
+      <div className="flex flex-wrap items-center gap-1" data-testid="audio-nudges">
+        {([6, 1, -1, -6] as const).map((delta) => (
+          <Button
+            key={delta}
+            type="button"
+            variant="outline"
+            data-testid="audio-nudge"
+            aria-label={
+              delta > 0
+                ? t`${label} gain +${delta} dB`
+                : t`${label} gain −${Math.abs(delta)} dB`
+            }
+            className="size-12 p-0 font-mono"
+            disabled={draftDb === undefined}
+            onClick={(): void => {
+              setGain(nudgeGainDb(route.gainDb, delta));
+            }}
+          >
+            {delta > 0 ? `+${String(delta)}` : `−${String(Math.abs(delta))}`}
+          </Button>
+        ))}
       </div>
 
       {/* Reserved local Undo region: the strip-scoped draft revert appears in
@@ -1049,18 +1049,7 @@ export function AudioPage(): JSX.Element {
 
   return (
     <div>
-      <PageHeader
-        title={<Trans>Audio</Trans>}
-        description={
-          <span className="inline-flex flex-wrap items-center gap-x-3 gap-y-1">
-            <Trans>
-              Route each input's audio: program-mix membership and discrete tracks.
-            </Trans>
-            <HelpLink to="/help/features#outputs" label={t`About outputs and audio`} />
-          </span>
-        }
-        actions={<div className="max-w-full min-w-0 [&_button]:max-w-full [&_button]:whitespace-normal [&_button]:break-words"><ExportConfigButton compact /></div>}
-      />
+      <PageHeader title={<Trans>Audio</Trans>} />
 
       {routing.isPending || form === undefined ? (
         routing.isError ? (
@@ -1177,7 +1166,7 @@ export function AudioPage(): JSX.Element {
               data-testid="audio-focused-strip"
               className="flex flex-col gap-3 xl:hidden"
             >
-              <h3 id="audio-focused-heading" className="text-sm font-medium">
+              <h3 id="audio-focused-heading" className="sr-only">
                 <Trans>Channel strip</Trans>
               </h3>
               <ChannelStrip
@@ -1324,6 +1313,16 @@ export function AudioPage(): JSX.Element {
                 </span>
               ) : null}
             </p>
+          </div>
+          {/* Secondary context follows the operating surface, not the fader. */}
+          <div data-testid="audio-page-context" className="flex min-w-0 flex-col gap-3 text-sm text-muted-foreground">
+            <p className="flex flex-wrap items-center gap-x-3 gap-y-1">
+              <Trans>
+                Route each input's audio: program-mix membership and discrete tracks.
+              </Trans>
+              <HelpLink to="/help/features#outputs" label={t`About outputs and audio`} />
+            </p>
+            <div className="max-w-full min-w-0 [&_button]:min-h-12 [&_button]:max-w-full [&_button]:whitespace-normal [&_button]:break-words"><ExportConfigButton compact /></div>
           </div>
           <ApplySemanticsCallout
             helpTo="/help/features#outputs"
