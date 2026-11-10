@@ -5,6 +5,7 @@
 // reorder), the selected item's fields, and TAKE / CLEAR / NEXT with the
 // common CG-app shortcuts: F1 take, F2 clear, Space next. Cut/mix and the
 // mix duration (frames) are the channel's transition preset.
+import { isBackendUnavailable } from '../../api/operations';
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import type { DragEvent, JSX, KeyboardEvent as ReactKeyboardEvent } from 'react';
 import { Trans, useLingui } from '@lingui/react/macro';
@@ -183,6 +184,9 @@ export function PlayoutView(): JSX.Element {
 
   if (channels.isLoading) {
     return <p><Trans>Loading…</Trans></p>;
+  }
+  if (isBackendUnavailable(channels.error)) {
+    return <p role="status"><Trans>Graphics are unavailable: this server does not provide them yet (backend not deployed).</Trans></p>;
   }
   if (channel === undefined) {
     return <p><Trans>Could not load graphics channels.</Trans></p>;

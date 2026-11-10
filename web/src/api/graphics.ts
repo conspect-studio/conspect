@@ -7,9 +7,9 @@
 //
 // Types come from the generated OpenAPI schema; this module only adds thin
 // fetch wrappers in the same style as `weather.ts`.
-import { apiUrl, buildHeaders, OperationApiError, readProblem } from './operations';
+import { apiUrl, buildHeaders, OperationApiError, readPendingProblem, readProblem } from './operations';
 import type { RequestOptions } from './operations';
-import type { components } from './schema';
+import type { components } from './types';
 
 export type ChannelView = components['schemas']['ChannelView'];
 export type ItemDoc = components['schemas']['ItemDoc'];
@@ -36,6 +36,7 @@ async function call(
   path: string,
   body?: unknown,
   options: RequestOptions = {},
+  served: 'pending' | 'main' = 'pending',
 ): Promise<unknown> {
   const response = await fetch(apiUrl(options, path), {
     method,
@@ -43,7 +44,7 @@ async function call(
     ...(body !== undefined ? { body: JSON.stringify(body) } : {}),
   });
   if (!response.ok) {
-    throw await readProblem(response);
+    throw await (served === 'pending' ? readPendingProblem(response) : readProblem(response));
   }
   if (response.status === 204) {
     return undefined;
@@ -155,7 +156,7 @@ export async function createChannelSources(channel: ChannelView): Promise<void> 
 
 /** The ids of every configured source (to tell whether channel sources exist). */
 export async function listSourceIds(): Promise<string[]> {
-  const body = await call('GET', '/api/v1/sources');
+  const body = await call('GET', '/api/v1/sources', undefined, {}, 'main');
   if (!Array.isArray(body)) return [];
   return body
     .map((s: unknown) =>

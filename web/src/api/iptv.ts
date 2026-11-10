@@ -7,9 +7,9 @@
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import type { UseMutationResult, UseQueryResult } from '@tanstack/react-query';
 
-import { apiUrl, buildHeaders, OperationApiError, readProblem } from './operations';
+import { apiUrl, buildHeaders, OperationApiError, readPendingProblem } from './operations';
 import type { RequestOptions } from './operations';
-import type { components } from './schema';
+import type { components } from './types';
 
 /** The `GET`/`PUT /api/v1/iptv` envelope. */
 export type IptvState = components['schemas']['IptvState'];
@@ -60,7 +60,7 @@ export async function getIptv(options: RequestOptions = {}): Promise<IptvWithEta
     method: 'GET',
     headers: buildHeaders(options, false),
   });
-  if (!response.ok) throw await readProblem(response);
+  if (!response.ok) throw await readPendingProblem(response);
   const body: unknown = await response.json();
   if (!isIptvState(body)) throw new OperationApiError('The server returned an unexpected IPTV document.');
   return { state: body, etag: response.headers.get('ETag') ?? undefined };
@@ -73,7 +73,7 @@ export async function putIptv(config: IptvConfig, options: RequestOptions = {}):
     headers: buildHeaders(options, true),
     body: JSON.stringify(config),
   });
-  if (!response.ok) throw await readProblem(response);
+  if (!response.ok) throw await readPendingProblem(response);
   const body: unknown = await response.json();
   if (!isIptvState(body)) throw new OperationApiError('The server returned an unexpected IPTV document.');
   return { state: body, etag: response.headers.get('ETag') ?? undefined };
@@ -93,7 +93,7 @@ export async function importM3u(request: M3uImportRequest, options: RequestOptio
     headers: buildHeaders(options, true),
     body: JSON.stringify(request),
   });
-  if (!response.ok) throw await readProblem(response);
+  if (!response.ok) throw await readPendingProblem(response);
   const body: unknown = await response.json();
   if (!isCatalogue(body)) throw new OperationApiError('The server returned an unexpected catalogue.');
   return body;

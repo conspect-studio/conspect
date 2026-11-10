@@ -12,7 +12,7 @@
 // once. That makes the ack robust against an engine update racing the operator
 // without inventing an unconditional ack the server does not allow.
 import { getStoredToken } from './token';
-import type { components } from './schema';
+import type { components } from './types';
 
 /** One alarm record, exactly as the control plane returns it. */
 export type AlarmRecord = components['schemas']['AlarmRecordDoc'];

@@ -22,7 +22,7 @@ import {
   readProblem,
 } from './operations';
 import type { AcceptedBody, RequestOptions } from './operations';
-import type { components } from './schema';
+import type { components } from './types';
 
 /** One resolved tally entry (target + lamp state). */
 export type TallyEntry = components['schemas']['TallyEntryDoc'];

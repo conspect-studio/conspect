@@ -13,7 +13,7 @@ import {
   readProblem,
 } from './operations';
 import type { RequestOptions } from './operations';
-import type { components } from './schema';
+import type { components } from './types';
 
 /** The elementary-stream inventory of one input. */
 export type StreamInventory = components['schemas']['StreamInventoryDoc'];

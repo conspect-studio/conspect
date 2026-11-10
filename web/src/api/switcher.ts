@@ -1,7 +1,7 @@
 // Program/Preview first-slice HTTP calls. Wire types are generated from
 // OpenAPI; every mutation returns 202 pending, never an optimistic on-air claim.
-import type { components } from './schema';
-import { apiUrl, buildHeaders, OperationApiError, readProblem, newIdempotencyKey } from './operations';
+import type { components } from './types';
+import { apiUrl, buildHeaders, OperationApiError, readPendingProblem, newIdempotencyKey } from './operations';
 import type { RequestOptions } from './operations';
 
 export type SwitcherRequest = components['schemas']['SwitcherRequest'];
@@ -30,7 +30,7 @@ function isAccepted(value: unknown): value is SwitcherAccepted {
 /** Read only state the real engine published after an actual output tick. */
 export async function getSwitcher(options: RequestOptions = {}): Promise<SwitcherState> {
   const response = await fetch(apiUrl(options, '/api/v1/switcher/me1'), { headers: buildHeaders(options, false) });
-  if (!response.ok) throw await readProblem(response);
+  if (!response.ok) throw await readPendingProblem(response);
   const body: unknown = await response.json();
   if (!isState(body)) throw new OperationApiError('Invalid switcher state');
   return body;
@@ -41,7 +41,7 @@ export async function planSwitcher(request: SwitcherRequest, options: RequestOpt
   const response = await fetch(apiUrl(options, '/api/v1/switcher/plan'), {
     method: 'POST', headers: buildHeaders(options, true), body: JSON.stringify(request),
   });
-  if (!response.ok) throw await readProblem(response);
+  if (!response.ok) throw await readPendingProblem(response);
   const body: unknown = await response.json();
   if (!isPlan(body)) throw new OperationApiError('Invalid switcher plan');
   return body;
@@ -57,7 +57,7 @@ export async function commandSwitcher(
   const response = await fetch(apiUrl(requestOptions, `/api/v1/switcher/commands/${action}`), {
     method: 'POST', headers: buildHeaders(requestOptions, true), body: JSON.stringify(request),
   });
-  if (!response.ok) throw await readProblem(response);
+  if (!response.ok) throw await readPendingProblem(response);
   if (response.status !== 202) throw new OperationApiError('Switcher command was not accepted', response.status);
   const body: unknown = await response.json();
   if (!isAccepted(body)) throw new OperationApiError('Invalid switcher operation id');

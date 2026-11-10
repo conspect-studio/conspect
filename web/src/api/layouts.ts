@@ -17,7 +17,7 @@
 // the spec omits it from `parameters`, so we pass it via `headers` in the
 // openapi-fetch options).
 import type { MultiviewApiClient } from './client';
-import type { components } from './schema';
+import type { components } from './types';
 
 /** A persisted layout resource, exactly as the control plane returns it. */
 export type Layout = components['schemas']['Layout'];

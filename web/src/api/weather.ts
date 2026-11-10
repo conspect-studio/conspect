@@ -8,9 +8,9 @@
 //
 // A weather *source* (the on-screen graphic) is an ordinary source of kind
 // `weather` created through the sources API (`POST /api/v1/sources/{id}`).
-import { apiUrl, buildHeaders, OperationApiError, readProblem } from './operations';
+import { apiUrl, buildHeaders, OperationApiError, readPendingProblem, readProblem } from './operations';
 import type { RequestOptions } from './operations';
-import type { components } from './schema';
+import type { components } from './types';
 
 export type WeatherLocationView = components['schemas']['WeatherLocationView'];
 export type WeatherLocationInput = components['schemas']['WeatherLocationInput'];
@@ -106,7 +106,7 @@ export async function listWeatherLocations(
     headers: buildHeaders(options, false),
   });
   if (!response.ok) {
-    throw await readProblem(response);
+    throw await readPendingProblem(response);
   }
   const body: unknown = await response.json();
   if (!Array.isArray(body) || !body.every(isView)) {
@@ -127,7 +127,7 @@ export async function putWeatherLocation(
     body: JSON.stringify(input),
   });
   if (!response.ok) {
-    throw await readProblem(response);
+    throw await readPendingProblem(response);
   }
   const body: unknown = await response.json();
   if (!isView(body)) {
@@ -136,7 +136,7 @@ export async function putWeatherLocation(
   return body;
 }
 
-/** Delete a location (404 counts as already gone). */
+/** Delete a location. A 404/405/501 is "backend not deployed", never "already gone". */
 export async function deleteWeatherLocation(
   id: string,
   options: RequestOptions = {},
@@ -145,8 +145,8 @@ export async function deleteWeatherLocation(
     method: 'DELETE',
     headers: buildHeaders(options, false),
   });
-  if (!response.ok && response.status !== 404) {
-    throw await readProblem(response);
+  if (!response.ok) {
+    throw await readPendingProblem(response);
   }
 }
 

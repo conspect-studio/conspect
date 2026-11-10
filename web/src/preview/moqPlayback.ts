@@ -2,7 +2,7 @@ import { Connection, Origin, Path } from '@moq/net';
 import type { Player } from '@moq/watch';
 import { connectMoq, ownMoqSession } from './moqConnection';
 
-import type { components } from '../api/schema';
+import type { components } from '../api/types';
 export type MoqLease = components['schemas']['MoqLease'];
 export interface MoqLeaseApi {
   acquire(signal: AbortSignal): Promise<MoqLease>;

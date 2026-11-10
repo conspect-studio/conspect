@@ -18,7 +18,7 @@ import {
   readProblem,
 } from './operations';
 import type { AcceptedBody, RequestOptions } from './operations';
-import type { components } from './schema';
+import type { components } from './types';
 
 /** The body of a plan or take request (a source → target crosspoint). */
 export type RouteTakeRequest = components['schemas']['RouteTakeRequest'];

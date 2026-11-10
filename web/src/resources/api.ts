@@ -10,7 +10,8 @@
 // write ops — the calls go through `fetch` with EXPLICITLY-TYPED request/response
 // shapes and typed field guards. The opaque `body` is read with `stringField`/
 // `numberField`, never an `as`-cast of an untyped value.
-import type { components } from '../api/schema';
+import type { components } from '../api/types';
+import { BackendUnavailableError, hasProblemBody, isUnavailableStatus } from '../api/operations';
 import { getStoredToken } from '../api/token';
 import {
   parseOutputFormKind,
@@ -219,8 +220,9 @@ function isOutputLink(value: unknown): value is OutputLinkWithReasons {
 }
 
 /**
- * Fetch a push output's live link state, or `null` when it has none (`404`:
- * the program is not running, so there is no link to report).
+ * Fetch a push output's live link state, or `null` when it has none (a `404`
+ * problem document: the program is not running). A route-level 404 (no problem
+ * body), 405 or 501 throws {@link BackendUnavailableError} (pending backend).
  */
 export async function getOutputLink(
   id: string,
@@ -230,8 +232,13 @@ export async function getOutputLink(
     method: 'GET',
     headers: headersFor(options, false),
   });
-  if (response.status === 404) {
+  if (response.status === 404 && (await hasProblemBody(response))) {
+    // A deployed backend: the program is not running, so there is no link.
     return null;
+  }
+  if (isUnavailableStatus(response.status)) {
+    // Route missing (no problem body), 405 or 501: backend not deployed.
+    throw new BackendUnavailableError(response.status, 'the output link state');
   }
   if (!response.ok) {
     throw await readProblem(response);

@@ -105,12 +105,19 @@ function ProgramStillPreview({ label }: { readonly label: string }): JSX.Element
  */
 function ProgramPlaybackUrls({ outputId }: { readonly outputId: string }): JSX.Element | null {
   const playback = useOutputPlayback(outputId === '' ? undefined : outputId);
-  if (outputId === '' || playback.data === undefined || playback.data.length === 0) {
+  if (outputId !== '' && playback.data?.unavailable === true) {
+    return (
+      <p className="text-sm text-muted-foreground" role="status">
+        <Trans>Playback URLs are unavailable: this server does not provide them yet (backend not deployed).</Trans>
+      </p>
+    );
+  }
+  if (outputId === '' || playback.data === undefined || playback.data.urls.length === 0) {
     return null;
   }
   return (
     <div className="flex flex-col gap-2">
-      {playback.data.map((entry, index) => (
+      {playback.data.urls.map((entry, index) => (
         <PlaybackUrlRow
           key={`${entry.label}-${String(index)}`}
           idPrefix={`monitoring-program-playback-${outputId}-${String(index)}`}

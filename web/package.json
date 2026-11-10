@@ -8,6 +8,8 @@
   "scripts": {
     "dev": "vite",
     "generate:api": "openapi-typescript ../docs/api/openapi.json -o src/api/schema.ts",
+    "generate:pending-api": "node scripts/gen-pending-api.mjs",
+    "generate:pending-events": "node scripts/gen-pending-events.mjs",
     "generate:events": "node scripts/gen-events-types.mjs",
     "build": "lingui compile && tsc --noEmit && vite build",
     "lint": "eslint . --max-warnings=0",

@@ -5,6 +5,7 @@
 // are the contract. `crates/multiview-control/tests/catalogue_contract.rs`
 // serialises real endpoint output and asserts every field declared here is
 // present, so a backend change that drops a field fails that test.
+import { BackendUnavailableError, hasProblemBody, isUnavailableStatus } from './operations';
 import { getStoredToken } from './token';
 
 /** Computed-server-side flag vocabulary (§2.2). `already_added` is client-derived. */
@@ -376,6 +377,9 @@ async function request<T>(
     ...(init !== undefined ? { body: JSON.stringify(init.body) } : {}),
   });
   if (!response.ok) {
+    if (isUnavailableStatus(response.status) && (response.status !== 404 || !(await hasProblemBody(response)))) {
+      throw new BackendUnavailableError(response.status, 'the IPTV-ORG catalogue');
+    }
     let message = `Request failed (${String(response.status)})`;
     try {
       const body: unknown = await response.json();
@@ -469,6 +473,9 @@ export async function fetchSourceNetwork(
     { method: 'POST', headers: headers(o, true), body: '{}' },
   );
   if (!response.ok) {
+    if (isUnavailableStatus(response.status) && (response.status !== 404 || !(await hasProblemBody(response)))) {
+      throw new BackendUnavailableError(response.status, 'the IPTV-ORG catalogue');
+    }
     let message = `Request failed (${String(response.status)})`;
     try {
       const body: unknown = await response.json();

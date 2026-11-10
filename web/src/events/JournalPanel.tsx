@@ -2,7 +2,7 @@ import { useState } from 'react';
 import type { JSX } from 'react';
 import { Trans, useLingui } from '@lingui/react/macro';
 import { Button } from '../components/ui/button';
-import { OperationApiError } from '../api/operations';
+import { isBackendUnavailable, OperationApiError } from '../api/operations';
 import { ClockNote } from './eventTime';
 import { downloadJournal, durationSeconds, localTime, rawHex, useEventJournal } from './sourceEvents';
 import type { JournalFilters, JournalRecord } from './sourceEvents';
@@ -110,7 +110,8 @@ export function JournalPanel({ id }: { readonly id: string }): JSX.Element {
     {downloadFailed ? <p role="alert"><Trans>The journal could not be downloaded.</Trans></p> : null}
     {stats && stats.dropped > 0 ? <p role="status"><Trans>{stats.dropped} observations were dropped since this server started, so this history has gaps.</Trans></p> : null}
     {query.isError
-      ? <p role="alert">{status === 403 ? <Trans>You do not have permission to read this source's journal.</Trans>
+      ? <p role="alert">{isBackendUnavailable(query.error) ? <Trans>The event journal is unavailable: this server does not provide it yet (backend not deployed).</Trans>
+        : status === 403 ? <Trans>You do not have permission to read this source's journal.</Trans>
         : status === 404 ? <Trans>This source has no journal yet.</Trans>
         : status === 503 ? <Trans>The event journal is busy or unavailable. Try again shortly.</Trans>
         : <Trans>The event journal could not be read.</Trans>}</p>

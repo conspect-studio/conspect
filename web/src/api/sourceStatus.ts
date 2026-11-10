@@ -5,9 +5,9 @@
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import type { UseMutationResult, UseQueryResult } from '@tanstack/react-query';
 
-import { apiUrl, buildHeaders, OperationApiError, readProblem } from './operations';
+import { apiUrl, buildHeaders, OperationApiError, readPendingProblem } from './operations';
 import type { RequestOptions } from './operations';
-import type { components } from './schema';
+import type { components } from './types';
 
 /** One source's demand state. */
 export type SourceDemand = components['schemas']['SourceDemandView'];
@@ -28,7 +28,7 @@ export async function getSourceStatus(options: RequestOptions = {}): Promise<Sou
     headers: buildHeaders(options, false),
   });
   if (!response.ok) {
-    throw await readProblem(response);
+    throw await readPendingProblem(response);
   }
   const body: unknown = await response.json();
   if (!isDemandList(body)) {
@@ -65,7 +65,7 @@ export async function postSourceAction(
     { method: 'POST', headers: buildHeaders(options, true), body: '{}' },
   );
   if (!response.ok) {
-    throw await readProblem(response);
+    throw await readPendingProblem(response);
   }
   const body: unknown = await response.json();
   const list: unknown = [body];

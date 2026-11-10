@@ -19,7 +19,7 @@
 // (conventions section 6, ADR-W008). `submitOperation` returns that body so the
 // caller can surface the id. `ETag`/`If-Match` optimistic concurrency is honoured
 // on the version-stamped mutations (alarm ack, salvo/profile replace + delete).
-import type { components } from './schema';
+import type { components } from './types';
 import { getStoredToken } from './token';
 
 /** An RFC 9457 problem document, as modelled in the spec. */
@@ -101,6 +101,82 @@ export async function readProblem(response: Response): Promise<OperationApiError
     `Request failed (${String(response.status)})`,
     response.status,
   );
+}
+
+/**
+ * HTTP statuses a server answers with for a route it does not serve: 404 (no
+ * such route), 405 (route exists without this method) and 501 (not
+ * implemented). For PENDING-BACKEND routes (see `api/pending/`) these mean
+ * "the backend is not deployed", never a generic failure and never success.
+ */
+export const BACKEND_UNAVAILABLE_STATUSES: readonly number[] = [404, 405, 501];
+
+/** True when `status` means the backend does not serve this route. */
+export function isUnavailableStatus(status: number | undefined): boolean {
+  return status !== undefined && BACKEND_UNAVAILABLE_STATUSES.includes(status);
+}
+
+/** Typed "unavailable (backend not deployed)" state for a pending route. */
+export class BackendUnavailableError extends OperationApiError {
+  /** Always true; lets callers branch without `instanceof` across bundles. */
+  readonly unavailable = true as const;
+
+  constructor(status: number, route?: string) {
+    super(
+      `Unavailable: this server does not provide ${route ?? 'this feature'} (backend not deployed)`,
+      status,
+    );
+    this.name = 'BackendUnavailableError';
+  }
+}
+
+/** True for a {@link BackendUnavailableError}. */
+export function isBackendUnavailable(error: unknown): error is BackendUnavailableError {
+  return error instanceof BackendUnavailableError;
+}
+
+/**
+ * Error for a non-2xx response from a PENDING-BACKEND route: 404/405/501
+ * become a {@link BackendUnavailableError}; everything else keeps the RFC 9457
+ * problem handling of {@link readProblem}.
+ */
+export async function readPendingProblem(
+  response: Response,
+  route?: string,
+  resourceLevel404 = false,
+): Promise<OperationApiError> {
+  if (isUnavailableStatus(response.status)) {
+    // A deployed backend answers a missing *resource* with an RFC 9457 problem
+    // body; a missing *route* has none. Only routes whose 404 can legitimately
+    // mean "no such resource" opt in with `resourceLevel404`.
+    if (response.status !== 404 || !resourceLevel404 || !(await hasProblemBody(response))) {
+      return new BackendUnavailableError(response.status, route);
+    }
+  }
+  return readProblem(response);
+}
+
+export async function hasProblemBody(response: Response): Promise<boolean> {
+  try {
+    return isProblem(await response.clone().json());
+  } catch {
+    return false;
+  }
+}
+
+/** For openapi-fetch callers: build the error for a failed pending-route response. */
+export async function pendingFailure(
+  response: Response,
+  message: string,
+  route?: string,
+  resourceLevel404 = false,
+): Promise<OperationApiError> {
+  if (isUnavailableStatus(response.status)) {
+    if (response.status !== 404 || !resourceLevel404 || !(await hasProblemBody(response))) {
+      return new BackendUnavailableError(response.status, route);
+    }
+  }
+  return new OperationApiError(message, response.status);
 }
 
 /** Build the request headers, injecting the bearer token and `If-Match`. */

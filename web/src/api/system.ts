@@ -8,7 +8,7 @@
 // hook reads it once and does not poll.
 import { apiUrl, buildHeaders, OperationApiError, readProblem } from './operations';
 import type { RequestOptions } from './operations';
-import type { components } from './schema';
+import type { components } from './types';
 
 /** The build capability + licence surface (`SystemCapabilities`). */
 export type SystemCapabilities = components['schemas']['SystemCapabilities'];

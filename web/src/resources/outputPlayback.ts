@@ -7,7 +7,8 @@ import { useQuery } from '@tanstack/react-query';
 import type { UseQueryResult } from '@tanstack/react-query';
 
 import { createApiClient } from '../api/client';
-import type { components } from '../api/schema';
+import { isUnavailableStatus } from '../api/operations';
+import type { components } from '../api/types';
 
 /** One playback URL (or no-URL note) — the generated schema type. */
 export type PlaybackUrl = components['schemas']['PlaybackUrlDoc'];
@@ -20,20 +21,31 @@ export type PlaybackUrl = components['schemas']['PlaybackUrlDoc'];
  * React Query forbids a query function returning `undefined`, so an empty
  * array is the "nothing to show yet" value, not `undefined`.
  */
+export interface OutputPlayback {
+  readonly urls: readonly PlaybackUrl[];
+  /** True when the server does not serve the playback route (404/405/501). */
+  readonly unavailable: boolean;
+}
+
 export function useOutputPlayback(
   outputId: string | undefined,
-): UseQueryResult<readonly PlaybackUrl[]> {
-  return useQuery<readonly PlaybackUrl[]>({
+): UseQueryResult<OutputPlayback> {
+  return useQuery<OutputPlayback>({
     queryKey: ['outputs', outputId, 'playback'],
-    queryFn: async (): Promise<readonly PlaybackUrl[]> => {
+    queryFn: async (): Promise<OutputPlayback> => {
       if (outputId === undefined || outputId === '') {
-        return [];
+        return { urls: [], unavailable: false };
       }
       const client = createApiClient();
-      const { data } = await client.GET('/api/v1/outputs/{id}/playback', {
+      const { data, response } = await client.GET('/api/v1/outputs/{id}/playback', {
         params: { path: { id: outputId } },
       });
-      return data?.urls ?? [];
+      // 404/405/501: main does not serve this route yet — an explicit
+      // "unavailable (backend not deployed)" state, not an empty success.
+      if (isUnavailableStatus(response.status)) {
+        return { urls: [], unavailable: true };
+      }
+      return { urls: data?.urls ?? [], unavailable: false };
     },
     enabled: outputId !== undefined && outputId !== '',
     retry: false,

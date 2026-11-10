@@ -2,8 +2,8 @@ import { useInfiniteQuery, useMutation, useQueryClient } from '@tanstack/react-q
 import type { UseMutationResult } from '@tanstack/react-query';
 import { useQuery } from '@tanstack/react-query';
 import { createApiClient } from '../api/client';
-import { OperationApiError } from '../api/operations';
-import type { components } from '../api/schema';
+import { isUnavailableStatus, OperationApiError, pendingFailure } from '../api/operations';
+import type { components } from '../api/types';
 
 export type SourceEvents = components['schemas']['SourceEventsDto'];
 export type SourceEvent = components['schemas']['SourceEventDto'];
@@ -48,7 +48,7 @@ export function useInjectTestEvent(id: string): UseMutationResult<undefined, Ope
         params: { path: { id } },
         body,
       });
-      if (!response.ok) throw new OperationApiError('Test event injection failed', response.status);
+      if (!response.ok) throw await pendingFailure(response, 'Test event injection failed', 'source event injection', true);
       return undefined;
     },
     onSuccess: (): void => {
@@ -88,6 +88,7 @@ export function useAutomation(id: string) {
       const { data, response } = await createApiClient().GET('/api/v1/inputs/{id}/events/automation', {
         params: { path: { id } }, signal, cache: 'no-store',
       });
+      if (isUnavailableStatus(response.status)) throw await pendingFailure(response, 'Automation request failed', 'source event automation');
       if (!response.ok || data === undefined) {
         throw new OperationApiError('Automation request failed', response.status, await problemDetail(response));
       }
@@ -118,6 +119,7 @@ export function useAutomationCommand(id: string): UseMutationResult<AutomationVi
           : command.kind === 'disarm'
             ? await client.POST('/api/v1/inputs/{id}/events/automation/disarm', params)
             : await client.POST('/api/v1/inputs/{id}/events/automation/restore', params);
+      if (isUnavailableStatus(result.response.status)) throw await pendingFailure(result.response, 'Automation command failed', 'source event automation');
       if (!result.response.ok || result.data === undefined) {
         throw new OperationApiError('Automation command failed', result.response.status, await problemDetail(result.response));
       }
@@ -166,7 +168,8 @@ export function useEventJournal(id: string, filters: JournalFilters) {
         signal,
         cache: 'no-store',
       });
-      if (!response.ok || data?.source_id !== id) {
+      if (!response.ok) throw await pendingFailure(response, 'Event journal request failed', 'the event journal', true);
+      if (data?.source_id !== id) {
         throw new OperationApiError('Event journal request failed', response.status);
       }
       return data;
@@ -185,7 +188,8 @@ export async function downloadJournal(id: string, filters: JournalFilters): Prom
     parseAs: 'blob',
     cache: 'no-store',
   });
-  if (!response.ok || data === undefined) {
+  if (!response.ok) throw await pendingFailure(response, 'Event journal download failed', 'the event journal', true);
+  if (data === undefined) {
     throw new OperationApiError('Event journal download failed', response.status);
   }
   const url = URL.createObjectURL(data);

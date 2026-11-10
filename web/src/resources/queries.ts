@@ -20,6 +20,7 @@ import type {
   UseQueryResult,
 } from '@tanstack/react-query';
 
+import { BackendUnavailableError } from '../api/operations';
 import {
   getOutputLink,
   deleteResource,
@@ -58,7 +59,15 @@ export class ApiError extends Error {
   }
 }
 
+/** A pending-backend route the server does not serve (404/405/501). */
+export class BackendUnavailableApiError extends ApiError {
+  readonly unavailable = true as const;
+}
+
 function toApiError(error: unknown): ApiError {
+  if (error instanceof BackendUnavailableError) {
+    return new BackendUnavailableApiError(error.message, error.status);
+  }
   if (error instanceof ResourceApiError) {
     return new ApiError(error.message, error.status);
   }

@@ -9,7 +9,7 @@
 // inventory, ADR-0041). Request/response shapes reuse the generated
 // `components['schemas']` types from ../api/schema — never hand-written
 // duplicates — through the shared helpers in ../api/operations.
-import type { components } from '../api/schema';
+import type { components } from '../api/types';
 import {
   apiUrl,
   buildHeaders,

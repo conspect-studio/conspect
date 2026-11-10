@@ -21,7 +21,7 @@ import {
   readProblem,
 } from './operations';
 import type { AcceptedBody, RequestOptions } from './operations';
-import type { components } from './schema';
+import type { components } from './types';
 
 /** One live cast session, exactly as the control plane returns it. */
 export type CastSession = components['schemas']['CastSessionDoc'];

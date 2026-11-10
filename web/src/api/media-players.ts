@@ -26,7 +26,7 @@ import {
   submitOperation,
 } from './operations';
 import type { AcceptedBody, RequestOptions } from './operations';
-import type { components } from './schema';
+import type { components } from './types';
 
 /** A configured media player, exactly as the control plane returns it. */
 export type MediaPlayer = components['schemas']['Resource'];

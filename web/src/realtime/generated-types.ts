@@ -91,19 +91,6 @@ export interface CastSessionStarted {
   readonly session_id: string;
 }
 
-/** Data body of `catalogue.link_status` (IPTV-ORG, ADR-M015): a linked source's catalogue link status changed. Envelope `id` = source id. */
-export interface CatalogueLinkStatus {
-  readonly channel?: string;
-  readonly feed?: string;
-  /** Previous status, when known. */
-  readonly previous?: string;
-  /** Replacement channel id (channel_closed). */
-  readonly replaced_by?: string;
-  /** The linked source id. */
-  readonly source_id: string;
-  readonly status: "in_sync" | "updated" | "stream_removed" | "channel_closed" | "blocklisted" | "unlinked" | "edited";
-}
-
 /** Data body of `device.adopted`: a device was adopted into the registry. */
 export interface DeviceAdopted {
   /** The registry device id. */
@@ -266,20 +253,6 @@ export interface GpuMetrics {
 /** GPU/accelerator hardware vendor (selects which per-engine signals to expect). */
 export type GpuVendor = "nvidia" | "intel" | "amd" | "apple" | "other";
 
-/** Data body of `graphics.channel_state`: a graphics playout channel's preview/program after a cue / take / clear / next. Envelope `id` = channel id. */
-export interface GraphicsChannelEvent {
-  /** The verb that produced this state: cue, take, clear, next or rundown. */
-  readonly action: string;
-  /** Graphics channel id (matches the envelope `id`). */
-  readonly channel: string;
-  /** Cued (preview) item id, if any. */
-  readonly preview?: string;
-  /** On-air (program) item id, if any. */
-  readonly program?: string;
-  /** Increments on every program change. */
-  readonly seq: number;
-}
-
 /** Data body of `health.warning.raised` and `health.warning.cleared`. A richer sibling of `Alert`: the `code` is the stable dedupe key, and `remediation` carries the concrete fix. Capability-mismatch codes are latched build-time facts (raised once, cleared on reconfigure/restart). */
 export interface HealthWarning {
   /** Whether the condition is currently active (raise vs clear). */
@@ -324,24 +297,6 @@ export interface InputConnection {
   /** The owning input's id (the configured source id) — the object axis this lifecycle event is authorized under (ADR-W026). */
   readonly input_id: string;
   readonly state: LifecycleState;
-}
-
-/** Data body of the `input.lifecycle` event. */
-export interface InputLifecycle {
-  /** Unix milliseconds. */
-  readonly at_ms: number;
-  readonly from: "idle" | "starting" | "ready" | "failed";
-  /** Start generation; increments on every start from idle. */
-  readonly generation: number;
-  readonly lease_holders?: readonly {
-    readonly kind: string;
-    readonly label: string;
-  }[];
-  /** Operator-safe reason. */
-  readonly reason: string;
-  /** The source id (the authorization object). */
-  readonly source_id: string;
-  readonly to: "idle" | "starting" | "ready" | "failed";
 }
 
 /** Data body of the `input.streams` event: an input's full elementary-stream inventory (RT-3). */
@@ -420,7 +375,7 @@ export type MediaPlayerState =
 };
 
 /** Running state of an output sink. */
-export type OutputRunState = "idle" | "starting" | "running" | "migrating" | "error";
+export type OutputRunState = "starting" | "running" | "migrating" | "error";
 
 /** Data body of the `output.status` event. */
 export interface OutputStatus {
@@ -522,16 +477,6 @@ export interface Subscribed {
   readonly snapshot_seq: number;
   /** The topic that was subscribed. */
   readonly topic: string;
-}
-
-/** Terminal outcome, emitted only at the engine output tick; envelope corr equals operation_id, id equals M/E id. */
-export interface SwitcherOperation {
-  readonly completed: boolean;
-  readonly error?: string;
-  readonly me: string;
-  readonly operation_id: string;
-  readonly program: string;
-  readonly tick: number;
 }
 
 /** How well a device can participate in synchronized presentation (fixed probed tri-state). */
@@ -670,7 +615,7 @@ export interface WallClockRef {
 }
 
 /** Stable catalog code of a health warning (kebab-case). `#[non_exhaustive]`: the catalog grows over time, so a client must treat an unknown code as a forward-compatible warning, not an error. */
-export type WarningCode = "gpu-present-no-vulkan-adapter" | "config-file-invalid" | "config-file-requires-restart" | "config-file-apply-incomplete" | "container-no-host-networking" | "catalogue-link-attention";
+export type WarningCode = "gpu-present-no-vulkan-adapter" | "config-file-invalid" | "config-file-requires-restart" | "config-file-apply-incomplete" | "container-no-host-networking";
 
 /** Severity of a health warning (sibling of AlertSeverity). */
 export type WarningSeverity = "info" | "warning" | "critical";

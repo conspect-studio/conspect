@@ -7,6 +7,7 @@
 // source" action per location (seven-day or today graphic, via the ordinary
 // sources API), and the latest data in a table. Values are shown exactly as
 // BOM published them; absent values render as an em dash.
+import { isBackendUnavailable } from '../../api/operations';
 import { useMemo, useState } from 'react';
 import type { JSX, SyntheticEvent } from 'react';
 import { Trans, useLingui } from '@lingui/react/macro';
@@ -376,7 +377,11 @@ export function DataView(): JSX.Element {
           {locations.isError ? (
             <TableRow>
               <TableCell colSpan={6}>
-                <Trans>Could not load weather locations.</Trans>
+                {isBackendUnavailable(locations.error) ? (
+                  <Trans>Weather is unavailable: this server does not provide it yet (backend not deployed).</Trans>
+                ) : (
+                  <Trans>Could not load weather locations.</Trans>
+                )}
               </TableCell>
             </TableRow>
           ) : null}

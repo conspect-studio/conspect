@@ -9,7 +9,8 @@ import { isCorrelatedKind } from '../../realtime/correlatedCommands';
 import { parseMediaPlayerEvent } from '../../realtime/envelope';
 import { switcherOperationEvidence } from '../../realtime/operationEvidence';
 import type { Envelope } from '../../realtime/envelope';
-import type { MediaPlayerState, OutputRunState } from '../../realtime/generated-types';
+import type { MediaPlayerState } from '../../realtime/generated-types';
+import type { OutputRunState } from '../../realtime/pending/events.pending';
 import {
   admitOperationOutcome, applyTerminalEvidence, createOperationOutcomeState, reserveOperationOutcome,
   expireOperationDeadlines, markOperationResponseUnknown, OperationOutcomeError,
