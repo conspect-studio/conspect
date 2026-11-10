@@ -42,6 +42,10 @@
 # NVENC/NVDEC/cuvid/cuda-llvm/vaapi/libvpl/gnutls/libsrt/libopus are all
 # LGPL-clean. We scale with scale_cuda (--enable-cuda-llvm), never scale_npp.
 set -euo pipefail
+# Resolve this script's own directory NOW, before any `cd`: a relative $0
+# (e.g. `bash deploy/ffmpeg-build.sh`) stops resolving once the build cds into
+# its temp dir, which used to break the fetch-script and patch-dir lookups.
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd -P)"
 
 FFMPEG_VERSION="${FFMPEG_VERSION:-9.0.2}"
 FFMPEG_GPG_KEY="${FFMPEG_GPG_KEY:-FCF986EA15E6E293A5644F10B4322F04D67658D8}"
@@ -198,7 +202,7 @@ SRC="${WORK}/ffmpeg-${FFMPEG_VERSION}"
 if [ -n "${FFMPEG_SRC_DIR:-}" ]; then
   cp -a "${FFMPEG_SRC_DIR}/ffmpeg-${FFMPEG_VERSION}" "${SRC}"
 else
-  "$(dirname "$(readlink -f "$0")")/ffmpeg-fetch-source.sh" "${WORK}"
+  "${SCRIPT_DIR}/ffmpeg-fetch-source.sh" "${WORK}"
 fi
 
 # -----------------------------------------------------------------------------
@@ -208,7 +212,7 @@ fi
 #     the build input, so a patch change rebuilds the base image. A patch that no
 #     longer applies fails the build rather than being skipped.
 # -----------------------------------------------------------------------------
-PATCH_DIR="${FFMPEG_PATCH_DIR:-$(dirname "$(readlink -f "$0")")/ffmpeg-patches}/${FFMPEG_VERSION}"
+PATCH_DIR="${FFMPEG_PATCH_DIR:-${SCRIPT_DIR}/ffmpeg-patches}/${FFMPEG_VERSION}"
 if [ -d "${PATCH_DIR}" ]; then
   for p in "${PATCH_DIR}"/*.patch; do
     [ -e "${p}" ] || continue

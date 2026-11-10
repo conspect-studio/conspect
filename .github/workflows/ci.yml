@@ -732,6 +732,13 @@ jobs:
         # Lint the real libav decode/resample integration and its test targets
         # against the same pinned LGPL FFmpeg build used in production.
         run: cargo clippy --locked -p multiview-audio --features ffmpeg --all-targets -- -D warnings
+      - name: test multiview-ffmpeg avio_fetch against the pinned FFmpeg
+        # The HTTP fetch regression tests (chunked redirect -> chunked body must
+        # fetch; a truncated sized body must not) only mean something when they
+        # link the pinned build, carried patches included (ADR-0031 FF-0c). They
+        # fail on an unpatched 9.0.2, so this step enforces the carried patch.
+        timeout-minutes: 10
+        run: cargo test --locked -p multiview-ffmpeg --features ffmpeg --lib avio_fetch
       - name: test multiview-audio --features ffmpeg
         # Committed MOV/pcm_s16le fixtures need only the pinned build's demuxer
         # and decoder: no second system FFmpeg CLI or unavailable WAV demuxer.
