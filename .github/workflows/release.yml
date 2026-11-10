@@ -2,13 +2,21 @@ name: release
 
 # Build the `multiview` binary for each supported target on a version tag,
 # tar.gz + sha256 each artifact, attest provenance, and attach them to the
-# GitHub Release. macOS builds are codesigned + notarized when the signing
-# secrets are present, and ship unsigned otherwise (so dev/fork builds still
-# work).
+# GitHub Release.
 #
-# We build linux `ffmpeg,linux-vaapi` and macOS `ffmpeg,apple` (the LGPL-clean
-# default + the platform HW backend). The GPL `gpl-codecs` build is NOT a
-# release artifact.
+# We build linux `ffmpeg,linux-vaapi` (the LGPL-clean default + the platform HW
+# backend) against OUR pinned FFmpeg (ADR-0031) and ship the pinned libav*
+# shared libraries next to the binary (dynamic linkage; the pinned
+# --enable-version3 build is LGPL-3.0-or-later and its licence texts ship in
+# licenses/ffmpeg/; the binary finds the libraries via an $ORIGIN-relative
+# RUNPATH). The GPL `gpl-codecs` build is
+# NOT a release artifact.
+#
+# macOS is deliberately NOT in the matrix yet. It must link a pinned LGPL
+# FFmpeg (a VideoToolbox/AudioToolbox profile for deploy/ffmpeg-build.sh is
+# the next change); Homebrew's `ffmpeg` is GPL (x264/x265) and a different
+# major, so it must NEVER feed a release artifact. The codesign + notarize
+# steps below stay, gated on runner.os, for when the macOS legs return.
 
 on:
   push:
@@ -23,7 +31,7 @@ permissions:
 jobs:
   build:
     name: build ${{ matrix.target }}
-    # Per-target release build: FFmpeg install (apt PPA / brew) + a `--release
+    # Per-target release build: pinned FFmpeg source build + a `--release
     # --locked` cargo build, plus (macOS) codesign + notarytool --wait, which can
     # block on Apple's notarization service. 60min covers a cold cache + a slow
     # notarization round-trip while still capping a wedged runner well under 6h.
@@ -42,19 +50,6 @@ jobs:
           - os: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
             features: ffmpeg,linux-vaapi
-          # macOS-15 (Apple Silicon runner) builds BOTH macOS arches as TWO
-          # SEPARATE binaries — NOT a universal2 lipo. Homebrew's FFmpeg bottle
-          # is arm64-only on Apple Silicon runners, so an x86_64 link against it
-          # would fail; we cross-compile the x86_64 binary against the same
-          # arm64 Homebrew FFmpeg headers (ABI-compatible at the C boundary) and
-          # ship it separately, leaving universal2 muxing for a future release
-          # when a true x86_64 libav is available.
-          - os: macos-15
-            target: aarch64-apple-darwin
-            features: ffmpeg,apple
-          - os: macos-15
-            target: x86_64-apple-darwin
-            features: ffmpeg,apple
     runs-on: ${{ matrix.os }}
     steps:
       - name: Checkout
@@ -71,53 +66,46 @@ jobs:
           key: ${{ matrix.target }}
 
       # ---------------------------------------------------------------------
-      # FFmpeg 7.x.
-      #
-      # GOTCHA: Ubuntu 24.04 apt ships FFmpeg 6.1 (libavcodec.so.60), NOT 7.x.
-      # The build links the FFmpeg 7.x soname family (libavcodec.so.61), so we
-      # install 7.x from the maintained `ubuntuhandbook1/ffmpeg7` PPA and then
-      # ASSERT `pkg-config --modversion libavcodec` reports 61.x. If the PPA is
-      # ever unavailable, the documented fallback is a source build of an
-      # LGPL-clean FFmpeg 7.x (configure --disable-gpl --disable-nonfree).
-      #
-      # macOS: `brew install ffmpeg` is 7.x already; we just verify the version.
+      # FFmpeg 9.0.2 — OUR pinned, LGPL-clean build (ADR-0031), never a distro
+      # package. The binding is `ffmpeg-sys-next 9.0.1` (libavcodec 63); Ubuntu
+      # apt ships an older major. Build from the GPG- AND SHA-256-verified
+      # source through the same deploy/ffmpeg-build.sh the images use, then
+      # ASSERT the soname. The prefix is bundled into the archive below.
       # ---------------------------------------------------------------------
-      - name: Install FFmpeg 7.x (Linux)
-        if: runner.os == 'Linux'
+      - name: Build pinned FFmpeg 9.0.2
+        env:
+          FF_PREFIX: /opt/multiview-ffmpeg
+          FF_LICENSE: lgpl
+          FF_HWACCEL: vaapi
         run: |
           set -euo pipefail
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends software-properties-common
-          sudo add-apt-repository -y ppa:ubuntuhandbook1/ffmpeg7
+          # deploy/Dockerfile.ffmpeg is the single source of truth for the pin.
+          pin() { sed -n "s/^ARG $1=//p" deploy/Dockerfile.ffmpeg | head -1; }
+          FFMPEG_VERSION="$(pin FFMPEG_VERSION)"; FFMPEG_SHA256="$(pin FFMPEG_SHA256)"
+          FFMPEG_GIT_COMMIT="$(pin FFMPEG_GIT_COMMIT)"
+          export FFMPEG_VERSION FFMPEG_SHA256 FFMPEG_GIT_COMMIT
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            pkg-config clang nasm \
-            libavcodec-dev libavformat-dev libavutil-dev libavfilter-dev \
-            libavdevice-dev libswscale-dev libswresample-dev \
-            libva-dev
-          MODVER="$(pkg-config --modversion libavcodec)"
+            pkg-config clang nasm build-essential xz-utils gnupg dirmngr patchelf \
+            libopus-dev libsrt-openssl-dev libgnutls28-dev libdrm-dev libva-dev zlib1g-dev
+          case "$(uname -m)" in
+            x86_64)
+              sudo apt-get install -y --no-install-recommends libvpl-dev
+              export TARGETARCH=amd64 ;;
+            aarch64) export TARGETARCH=arm64 ;;
+            *) echo "::error::unsupported runner arch $(uname -m)"; exit 1 ;;
+          esac
+          sudo -E bash deploy/ffmpeg-build.sh
+          MODVER="$(PKG_CONFIG_PATH="${FF_PREFIX}/lib/pkgconfig" pkg-config --modversion libavcodec)"
           echo "libavcodec modversion: ${MODVER}"
           case "${MODVER}" in
-            61.*) echo "FFmpeg 7.x confirmed (libavcodec ${MODVER})." ;;
-            *) echo "::error::Expected libavcodec 61.x (FFmpeg 7.x), got ${MODVER}"; exit 1 ;;
+            63.*) echo "FFmpeg 9.0.x confirmed (libavcodec ${MODVER})." ;;
+            *) echo "::error::Expected libavcodec 63.x (FFmpeg 9.0.x), got ${MODVER}"; exit 1 ;;
           esac
-
-      - name: Install FFmpeg 7.x (macOS)
-        if: runner.os == 'macOS'
-        run: |
-          set -euo pipefail
-          brew update
-          brew install ffmpeg pkg-config
-          # Make the Homebrew FFmpeg discoverable to pkg-config/clang for both
-          # the native arm64 link and the x86_64 cross-link.
-          BREW_PREFIX="$(brew --prefix)"
-          echo "PKG_CONFIG_PATH=${BREW_PREFIX}/lib/pkgconfig" >> "$GITHUB_ENV"
-          MODVER="$(PKG_CONFIG_PATH="${BREW_PREFIX}/lib/pkgconfig" pkg-config --modversion libavcodec)"
-          echo "libavcodec modversion: ${MODVER}"
-          case "${MODVER}" in
-            61.*) echo "FFmpeg 7.x confirmed (libavcodec ${MODVER})." ;;
-            *) echo "::error::Expected libavcodec 61.x (FFmpeg 7.x), got ${MODVER}"; exit 1 ;;
-          esac
+          {
+            echo "FF_PREFIX=${FF_PREFIX}"
+            echo "PKG_CONFIG_PATH=${FF_PREFIX}/lib/pkgconfig"
+          } >> "$GITHUB_ENV"
 
       - name: Build release binary
         run: |
@@ -193,7 +181,42 @@ jobs:
           STAGE="multiview-${{ github.ref_name }}-${{ matrix.target }}"
           mkdir -p "dist/${STAGE}"
           cp "${BIN}" "dist/${STAGE}/multiview"
-          cp README.md LICENSE LICENSE-COMMERCIAL.md NOTICE THIRD-PARTY-NOTICES.md "dist/${STAGE}/" 2>/dev/null || true
+          if [ "${RUNNER_OS}" = "Linux" ]; then
+            # Ship the pinned LGPL libav* next to the binary (dynamic linkage,
+            # THIRD-PARTY-NOTICES §1) and point the binary at them with an
+            # $ORIGIN-relative RUNPATH, so the archive runs on a stock host
+            # without LD_LIBRARY_PATH. The remaining deps are ordinary distro
+            # packages, listed for users in RUNTIME-DEPENDENCIES.txt below.
+            mkdir -p "dist/${STAGE}/lib" "dist/${STAGE}/licenses"
+            cp -a "${FF_PREFIX}/share/licenses/ffmpeg" "dist/${STAGE}/licenses/ffmpeg"
+            test -s "dist/${STAGE}/licenses/ffmpeg/COPYING.LGPLv3"
+            test -s "dist/${STAGE}/licenses/ffmpeg/COPYING.GPLv3"
+            cp -a "${FF_PREFIX}"/lib/lib{avcodec,avdevice,avfilter,avformat,avutil,swresample,swscale}.so.* "dist/${STAGE}/lib/"
+            patchelf --set-rpath '$ORIGIN/lib' "dist/${STAGE}/multiview"
+            # Prove the bundle resolves with NO loader override: every libav*
+            # must come from the archive's own lib/, and nothing may be missing.
+            out="$(env -u LD_LIBRARY_PATH ldd "dist/${STAGE}/multiview")"
+            printf '%s\n' "${out}"
+            if printf '%s\n' "${out}" | grep -q 'not found'; then
+              echo "::error::release binary has unresolved libraries"; exit 1
+            fi
+            {
+              echo "multiview ${{ github.ref_name }} (${{ matrix.target }}) - host runtime packages"
+              echo "The pinned FFmpeg libraries are bundled in lib/. Install these on Debian 13 / Ubuntu 24.04:"
+              echo "  sudo apt-get install libgnutls30t64 libopus0 libsrt1.5-openssl libva2 libva-drm2 libdrm2 zlib1g"
+              echo "  (older releases name the first package libgnutls30)"
+              if [ "$(uname -m)" = x86_64 ]; then
+                echo "  sudo apt-get install libvpl2   # Intel QSV (oneVPL) on amd64"
+              fi
+              echo "Then check: ldd ./multiview | grep 'not found' (no output means ready)."
+            } > "dist/${STAGE}/RUNTIME-DEPENDENCIES.txt"
+            for so in libavcodec.so.63 libavformat.so.63 libavutil.so.61; do
+              printf '%s\n' "${out}" | grep -q "${so} => .*/dist/${STAGE}/lib/${so}" \
+                || { echo "::error::${so} does not resolve from the bundled lib/"; exit 1; }
+            done
+          fi
+          # Legal files are mandatory: a missing one fails the release.
+          cp README.md LICENSE LICENSE-COMMERCIAL.md NOTICE THIRD-PARTY-NOTICES.md "dist/${STAGE}/"
           tar -C dist -czf "dist/${STAGE}.tar.gz" "${STAGE}"
           ( cd dist && shasum -a 256 "${STAGE}.tar.gz" > "${STAGE}.tar.gz.sha256" )
           echo "archive=dist/${STAGE}.tar.gz" >> "$GITHUB_OUTPUT"

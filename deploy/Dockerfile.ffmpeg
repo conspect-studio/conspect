@@ -4,7 +4,7 @@
 #
 # This is the SEPARATELY-PUBLISHED, digest-referenced base image the app
 # Dockerfiles consume via `FROM ${FFMPEG_IMAGE} AS ffmpeg` + `COPY --from=ffmpeg
-# /opt/multiview-ffmpeg …`. It builds OUR OWN pinned FFmpeg 8.1.1 from a GPG- AND
+# /opt/multiview-ffmpeg …`. It builds OUR OWN pinned FFmpeg 9.0.2 from a GPG- AND
 # SHA-256-verified ffmpeg.org source tarball under the exact ADR-0031 LGPL-clean
 # allowlist. The audited configure-flag list lives in ONE place —
 # deploy/ffmpeg-build.sh — which both this builder and the GPL/nonfree guardrail
@@ -13,18 +13,18 @@
 # escaping GHA cache's branch-isolation + 10 GB LRU eviction.
 #
 # Flavours (selected by build-args, published as ghcr.io/<owner>/multiview-ffmpeg
-# :8.1.1-{lgpl,nvidia,gpl}):
+# :9.0.2-{lgpl,nvidia,gpl}):
 #   * lgpl   — FF_HWACCEL=vaapi  FF_LICENSE=lgpl  (VAAPI + Intel QSV/libvpl on
 #              amd64; multi-arch; the genuinely LGPL-clean default).
 #   * nvidia — FF_HWACCEL=nvidia FF_LICENSE=lgpl  (NVENC/NVDEC/cuvid/scale_cuda
 #              via nv-codec-headers + --enable-cuda-llvm, NO CUDA SDK; still
 #              LGPL-clean; amd64-only for now).
 #   * gpl    — FF_HWACCEL=vaapi  FF_LICENSE=gpl   (adds x264/x265; whole build
-#              becomes GPLv2+; opt-in only).
+#              becomes GPL-3.0-or-later via --enable-version3; opt-in only).
 #
-# 8.1.1 → libavcodec.so.62 / libavutil.so.60 / libavformat.so.62, matching
-# `ffmpeg-sys-next 8.1.0` (build.rs `ffmpeg_8_1` → libavcodec 62), the version
-# the workspace lockfile resolves — so the app binary links .so.62.
+# 9.0.2 → libavcodec.so.63 / libavutil.so.61 / libavformat.so.63, matching
+# `ffmpeg-sys-next 9.0.1` (build.rs `ffmpeg_9_0` → libavcodec 63), the version
+# the workspace lockfile resolves — so the app binary links .so.63.
 #
 # Base-image pinning: the `debian:trixie` tag below is a floating minor line. For
 # a reproducible release pin it by digest, e.g.
@@ -41,12 +41,12 @@
 # verified source (Renovate bumps the digest deliberately).
 FROM debian:trixie@sha256:9c6e381421d0f48d1b8133e573f33c185ee16cbf505eda9c4a8a4791b25ea8a6 AS source
 ENV DEBIAN_FRONTEND=noninteractive
-ARG FFMPEG_VERSION=8.1.1
-ARG FFMPEG_SHA256=b6863adde98898f42602017462871b5f6333e65aec803fdd7a6308639c52edf3
+ARG FFMPEG_VERSION=9.0.2
+ARG FFMPEG_SHA256=8c3850283eb25fa026482078a04051e0be17347b09ef81a0849bec15a96e002e
 ARG FFMPEG_GPG_KEY=FCF986EA15E6E293A5644F10B4322F04D67658D8
-# Fallback only when ffmpeg.org is unreachable: FFmpeg upstream git tag n8.1.1,
-# content-pinned to this commit (git ls-remote https://github.com/FFmpeg/FFmpeg n8.1.1^{}).
-ARG FFMPEG_GIT_COMMIT=239f2c733de417201d7ad3b3b8b0d9b63285b2b1
+# Fallback only when ffmpeg.org is unreachable: FFmpeg upstream git tag n9.0.2,
+# content-pinned to this commit (git ls-remote https://github.com/FFmpeg/FFmpeg n9.0.2^{}).
+ARG FFMPEG_GIT_COMMIT=946fcce07b6dcd0331c8cc609192aeff5e1924f8
 RUN apt-get update \
  && apt-get install -y --no-install-recommends ca-certificates curl gnupg dirmngr git xz-utils \
  && rm -rf /var/lib/apt/lists/*
@@ -66,23 +66,23 @@ FROM debian:trixie AS builder
 
 ENV DEBIAN_FRONTEND=noninteractive
 
-# FFmpeg source pin. FFMPEG_SHA256 is the SHA-256 of ffmpeg-8.1.1.tar.xz from
+# FFmpeg source pin. FFMPEG_SHA256 is the SHA-256 of ffmpeg-9.0.2.tar.xz from
 # ffmpeg.org/releases, verified end-to-end (the GPG good-signature + this digest
 # both checked against the real tarball at author time). The build ALSO verifies
 # the detached GPG .asc against FFMPEG_GPG_KEY; BOTH must pass or the build aborts.
-ARG FFMPEG_VERSION=8.1.1
-ARG FFMPEG_SHA256=b6863adde98898f42602017462871b5f6333e65aec803fdd7a6308639c52edf3
+ARG FFMPEG_VERSION=9.0.2
+ARG FFMPEG_SHA256=8c3850283eb25fa026482078a04051e0be17347b09ef81a0849bec15a96e002e
 ARG FFMPEG_GPG_KEY=FCF986EA15E6E293A5644F10B4322F04D67658D8
-# Fallback only when ffmpeg.org is unreachable: FFmpeg upstream git tag n8.1.1,
-# content-pinned to this commit (git ls-remote https://github.com/FFmpeg/FFmpeg n8.1.1^{}).
-ARG FFMPEG_GIT_COMMIT=239f2c733de417201d7ad3b3b8b0d9b63285b2b1
+# Fallback only when ffmpeg.org is unreachable: FFmpeg upstream git tag n9.0.2,
+# content-pinned to this commit (git ls-remote https://github.com/FFmpeg/FFmpeg n9.0.2^{}).
+ARG FFMPEG_GIT_COMMIT=946fcce07b6dcd0331c8cc609192aeff5e1924f8
 # nv-codec-headers content-pinned by git commit (tag n13.0.19.0 → this commit).
 # Only consumed when FF_HWACCEL=nvidia.
 ARG NVCODEC_COMMIT=e844e5b26f46bb77479f063029595293aa8f812d
 # Hardware-acceleration profile: vaapi (default) | nvidia. Selects the hwaccel
 # configure block in deploy/ffmpeg-build.sh.
 ARG FF_HWACCEL=vaapi
-# Licensing profile: lgpl (default) | gpl. gpl adds x264/x265 (whole build GPLv2+).
+# Licensing profile: lgpl (default) | gpl. gpl adds x264/x265 (whole build GPL-3.0-or-later; --enable-version3).
 ARG FF_LICENSE=lgpl
 # Buildx supplies TARGETARCH (amd64|arm64); QSV/libvpl is gated amd64-only both
 # in the apt install below and in deploy/ffmpeg-build.sh.

@@ -4,17 +4,17 @@
 #
 # Multi-stage:
 #   * ffmpeg   — pulled from the SEPARATELY-PUBLISHED FFmpeg base image
-#                (ghcr.io/aperim/multiview-ffmpeg:8.1.1-lgpl, ADR-0031 §5). It
-#                ships OUR OWN pinned, GPG+SHA-256-verified FFmpeg 8.1.1 under the
+#                (ghcr.io/aperim/multiview-ffmpeg:9.0.2-lgpl, ADR-0031 §5). It
+#                ships OUR OWN pinned, GPG+SHA-256-verified FFmpeg 9.0.2 under the
 #                ADR-0031 LGPL-clean allowlist (VAAPI + Intel QSV via libvpl on
 #                amd64; NO GPL/nonfree) at /opt/multiview-ffmpeg (libavcodec
-#                .so.62). The ~10-min source build is amortised to a multi-second
+#                .so.63). The ~10-min source build is amortised to a multi-second
 #                COPY — see deploy/Dockerfile.ffmpeg + .github/workflows/
 #                ffmpeg-base.yml. Pin FFMPEG_IMAGE by @sha256: for a release.
 #   * web      — Node 22, builds the React SPA to `web/dist` (npm ci + npm run
 #                build). MUST run before the rust build: the `web` feature embeds
 #                `web/dist` into the binary at compile time (rust_embed).
-#   * chef     — Debian trixie + Rust + cargo-chef + OUR FFmpeg 8.1.1 headers
+#   * chef     — Debian trixie + Rust + cargo-chef + OUR FFmpeg 9.0.2 headers
 #                (COPY --from=ffmpeg) on PKG_CONFIG_PATH. Shared base for planner
 #                + builder so rustc/pkg-config are identical across the recipe.
 #   * planner  — `cargo chef prepare` → recipe.json (manifests + Cargo.lock only).
@@ -27,28 +27,28 @@
 #                binary on the [control] listener). ffmpeg-sys-next's build.rs
 #                probes OUR pkg-config, so the ffmpeg headers are COPYed in BEFORE
 #                cook.
-#   * runtime  — debian:trixie-slim with OUR FFmpeg 8.1.1 runtime sonames
-#                (libavcodec.so.62, …) + VAAPI userspace (Intel/AMD), a non-root
+#   * runtime  — debian:trixie-slim with OUR FFmpeg 9.0.2 runtime sonames
+#                (libavcodec.so.63, …) + VAAPI userspace (Intel/AMD), a non-root
 #                user, and the binary.
 #
-# FFmpeg provenance (ADR-0031 FF-0/FF-0b): the base image builds FFmpeg 8.1.1 from
+# FFmpeg provenance (ADR-0031 FF-0/FF-0b): the base image builds FFmpeg 9.0.2 from
 # the pinned ffmpeg.org tarball, verified by BOTH the FFmpeg release GPG key
 # (FCF986EA15E6E293A5644F10B4322F04D67658D8) AND a pinned SHA-256, under our
 # `--disable-everything` allowlist — replacing the opaque apt libav* (provenance
 # + soname we did not own). The default build is genuinely LGPL-clean: we
 # DELIBERATELY do NOT enable `gpl-codecs` (x264/x265) here. A separate `-gpl`
 # image tag (built with `--build-arg
-# FFMPEG_IMAGE=ghcr.io/aperim/multiview-ffmpeg:8.1.1-gpl --build-arg
+# FFMPEG_IMAGE=ghcr.io/aperim/multiview-ffmpeg:9.0.2-gpl --build-arg
 # CARGO_FEATURES=ffmpeg,linux-vaapi,web,ntp,gpl-codecs`) is the opt-in GPL variant.
 #
-# 8.1.1 → libavcodec.so.62 / libavutil.so.60 / libavformat.so.62, matching
-# `ffmpeg-sys-next 8.1.0` (build.rs `ffmpeg_8_1` → libavcodec 62), the version
-# the workspace lockfile resolves — so the binary links .so.62.
+# 9.0.2 → libavcodec.so.63 / libavutil.so.61 / libavformat.so.63, matching
+# `ffmpeg-sys-next 9.0.1` (build.rs `ffmpeg_9_0` → libavcodec 63), the version
+# the workspace lockfile resolves — so the binary links .so.63.
 #
 # Base-image pinning: the FFmpeg base (FFMPEG_IMAGE) and the `rust:1-trixie` /
 # `debian:trixie-slim` tags below are floating lines. For a reproducible release
 # pin each by digest, e.g.
-#   ARG FFMPEG_IMAGE=ghcr.io/aperim/multiview-ffmpeg:8.1.1-lgpl@sha256:<digest>
+#   ARG FFMPEG_IMAGE=ghcr.io/aperim/multiview-ffmpeg:9.0.2-lgpl@sha256:<digest>
 #   FROM rust:1-trixie@sha256:<digest> AS chef
 #   FROM debian:trixie-slim@sha256:<digest> AS runtime
 # (Renovate adds + bumps these digests; CI provenance/SBOM record them anyway.)
@@ -58,10 +58,10 @@
 # override with `--build-arg FFMPEG_IMAGE=…@sha256:<digest>`. The default stays the public
 # upstream image; docker.yml passes the repo owner's own base once published
 # (scripts/resolve-ffmpeg-image.sh).
-ARG FFMPEG_IMAGE=ghcr.io/aperim/multiview-ffmpeg:8.1.1-lgpl
+ARG FFMPEG_IMAGE=ghcr.io/aperim/multiview-ffmpeg:9.0.2-lgpl
 
 # -----------------------------------------------------------------------------
-# Stage 0: ffmpeg — the published FFmpeg 8.1.1 base (VAAPI/QSV, LGPL-clean).
+# Stage 0: ffmpeg — the published FFmpeg 9.0.2 base (VAAPI/QSV, LGPL-clean).
 # Ships /opt/multiview-ffmpeg/{lib,include,lib/pkgconfig}. Built by
 # deploy/Dockerfile.ffmpeg; here it is just a pulled, digest-pinnable layer.
 # -----------------------------------------------------------------------------
@@ -86,10 +86,10 @@ COPY web/ ./
 RUN npm run build
 
 # -----------------------------------------------------------------------------
-# Stage 2a: chef — Rust toolchain + native build deps + OUR FFmpeg 8.1.1 headers
+# Stage 2a: chef — Rust toolchain + native build deps + OUR FFmpeg 9.0.2 headers
 # + cargo-chef. Shared base for `planner` and `builder` so rustc + pkg-config are
 # byte-identical across the recipe (a toolchain mismatch silently invalidates the
-# cooked dependency layer). Links against OUR FFmpeg 8.1.1 (libavcodec.so.62).
+# cooked dependency layer). Links against OUR FFmpeg 9.0.2 (libavcodec.so.63).
 # -----------------------------------------------------------------------------
 FROM rust:1-trixie AS chef
 
@@ -100,7 +100,7 @@ ENV DEBIAN_FRONTEND=noninteractive
 #   * libva-dev                    — VAAPI (Intel/AMD) for the `linux-vaapi` path.
 #   * libopus0/libsrt/gnutls/libdrm2 — OUR FFmpeg's transitive runtime libs: the
 #     `builder` stage's `multiview --version` smoke test dynamically loads
-#     libavcodec.so.62 which NEEDs them; without them the loader exits 127.
+#     libavcodec.so.63 which NEEDs them; without them the loader exits 127.
 # The libav* themselves come from the published ffmpeg base (COPY --from=ffmpeg
 # below) — NOT from apt (no libav*-dev here; that opaque apt source is exactly
 # what we replaced).
@@ -111,9 +111,9 @@ RUN apt-get update \
       libopus0 libsrt1.5-openssl libgnutls30t64 libdrm2 \
  && rm -rf /var/lib/apt/lists/*
 
-# Our pinned FFmpeg 8.1.1 (headers + .so + .pc) from the published base image.
+# Our pinned FFmpeg 9.0.2 (headers + .so + .pc) from the published base image.
 # Point pkg-config + the loader at it so `ffmpeg-sys-next`'s build.rs discovers
-# FFmpeg 8.1.1 (detects ffmpeg_8_1 → libavcodec 62) and the build links .so.62.
+# FFmpeg 9.0.2 (detects ffmpeg_9_0 → libavcodec 63) and the build links .so.63.
 # This MUST precede `cargo chef cook`: build.rs probes pkg-config at dep-compile
 # time, so the headers have to be present for the cooked layer to be valid.
 COPY --from=ffmpeg /opt/multiview-ffmpeg /opt/multiview-ffmpeg
@@ -149,7 +149,7 @@ FROM chef AS builder
 # it — the linux-vaapi preset already implies it, named here so an override list
 # keeps it deliberately; no GPL deps). Pass
 # `--build-arg CARGO_FEATURES=ffmpeg,linux-vaapi,web,ntp,gpl-codecs` (with
-# `--build-arg FFMPEG_IMAGE=…:8.1.1-gpl`) to produce the GPL `-gpl` image variant.
+# `--build-arg FFMPEG_IMAGE=…:9.0.2-gpl`) to produce the GPL `-gpl` image variant.
 # CARGO_FEATURES is threaded IDENTICALLY into `cook` and `build` — a mismatch
 # pre-builds the wrong dependency closure and silently triggers a near-full
 # rebuild while appearing to hit the cache.
@@ -184,16 +184,16 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
  && /usr/local/bin/multiview --version
 
 # -----------------------------------------------------------------------------
-# Stage 3: runtime — debian:trixie-slim + OUR FFmpeg 8.1.1 sonames + VAAPI
+# Stage 3: runtime — debian:trixie-slim + OUR FFmpeg 9.0.2 sonames + VAAPI
 # -----------------------------------------------------------------------------
 FROM debian:trixie-slim AS runtime
 
 ENV DEBIAN_FRONTEND=noninteractive
 
-# Runtime deps for OUR FFmpeg 8.1.1 shared libs + VAAPI userspace + Intel/AMD
+# Runtime deps for OUR FFmpeg 9.0.2 shared libs + VAAPI userspace + Intel/AMD
 # drivers. We build FFmpeg --enable-shared against libopus/libsrt/gnutls/libdrm
 # (+ libvpl on amd64), so the runtime needs those shared libs present (the loader
-# resolves them when the binary pulls in libavcodec.so.62 et al). libva2 +
+# resolves them when the binary pulls in libavcodec.so.63 et al). libva2 +
 # mesa-va-drivers provide VAAPI; intel-media-va-driver is x86_64-only (no arm64
 # package), installed only on amd64; libvpl2 (oneVPL runtime) likewise amd64-only.
 RUN apt-get update \
@@ -206,15 +206,18 @@ RUN apt-get update \
     fi \
  && rm -rf /var/lib/apt/lists/*
 
-# Our FFmpeg 8.1.1 shared libraries (libavcodec.so.62, libavutil.so.60,
-# libavformat.so.62, libavfilter.so.11, libswscale.so.9, libswresample.so.6, and
+# Our FFmpeg 9.0.2 shared libraries (libavcodec.so.63, libavutil.so.61,
+# libavformat.so.63, libavfilter.so.12, libswscale.so.10, libswresample.so.7, and
 # their symlinks). Install into /usr/local/lib and ldconfig so the binary finds
-# them with NO LD_LIBRARY_PATH override. Assert the 8.1.1 soname (.so.62, NOT
+# them with NO LD_LIBRARY_PATH override. Assert the 9.0.2 soname (.so.63, NOT
 # .61) so a version/layout drift fails the BUILD, not the deploy.
 COPY --from=ffmpeg /opt/multiview-ffmpeg/lib /usr/local/lib
+# The LGPL-3.0-or-later (+ GPLv3) texts that must accompany those libraries.
+COPY --from=ffmpeg /opt/multiview-ffmpeg/share/licenses/ffmpeg /usr/share/licenses/ffmpeg
 RUN ldconfig \
- && test -e /usr/local/lib/libavcodec.so.62 \
- && test -e /usr/local/lib/libavutil.so.60
+ && test -e /usr/local/lib/libavcodec.so.63 \
+ && test -e /usr/local/lib/libavutil.so.61 \
+ && test -s /usr/share/licenses/ffmpeg/COPYING.LGPLv3
 
 # Non-root runtime user (fixed uid/gid 10001). The render group is added at
 # `docker run` time (e.g. compose `group_add`) for VAAPI /dev/dri access.

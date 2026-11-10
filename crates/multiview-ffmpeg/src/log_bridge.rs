@@ -869,7 +869,7 @@ mod ffi {
             // arm64/aarch64; the decayed `*mut __va_list_tag` on x86-64 trixie),
             // so no single explicit annotation is correct on both. The
             // `missing_transmute_annotations` lint fires only on the array
-            // rendering (FFmpeg 8.1.x, libavcodec .so.62) — exactly the rendering
+            // rendering (FFmpeg 9.0.x, libavcodec .so.63) — exactly the rendering
             // the inferred `_` exists to stay portable across — so it is suppressed
             // here rather than spelling a per-arch type that would break the other.
             #[allow(clippy::missing_transmute_annotations)]

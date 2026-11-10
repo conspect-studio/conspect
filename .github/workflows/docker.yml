@@ -52,7 +52,7 @@ jobs:
     # build of the whole workspace inside the image) + push by digest, on native
     # amd64/arm64 runners. A cold build cache + arm64 native runner can run long;
     # 90min is generous headroom while still capping a wedged runner far below 6h.
-    timeout-minutes: 90
+    timeout-minutes: 165  # 90 build + up to 75 waiting for a freshly bumped FFmpeg base (see Resolve step)
     permissions:
       contents: read
       packages: write
@@ -62,20 +62,20 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # generic (VAAPI/QSV) — both arches; FFmpeg base = …:8.1.1-lgpl.
+          # generic (VAAPI/QSV) — both arches; FFmpeg base = …:9.0.2-lgpl.
           - variant: generic
             dockerfile: deploy/Dockerfile
             platform: linux/amd64
             runner: ubuntu-24.04
             arch: amd64
-            ffmpeg_tag: 8.1.1-lgpl
+            ffmpeg_tag: 9.0.2-lgpl
             features: "ffmpeg,linux-vaapi,web"
           - variant: generic
             dockerfile: deploy/Dockerfile
             platform: linux/arm64
             runner: ubuntu-24.04-arm
             arch: arm64
-            ffmpeg_tag: 8.1.1-lgpl
+            ffmpeg_tag: 9.0.2-lgpl
             features: "ffmpeg,linux-vaapi,web"
           # nvidia (CUDA/NVENC) — amd64 ONLY until arm64 CUDA base + nv-codec are validated.
           - variant: nvidia
@@ -83,7 +83,7 @@ jobs:
             platform: linux/amd64
             runner: ubuntu-24.04
             arch: amd64
-            ffmpeg_tag: 8.1.1-nvidia
+            ffmpeg_tag: 9.0.2-nvidia
             features: "ffmpeg,nvidia,web"
     runs-on: ${{ matrix.runner }}
     outputs:
@@ -109,8 +109,35 @@ jobs:
 
       - name: Resolve FFmpeg base image
         # Owner-published base if the tag exists, else the public upstream one.
+        #
+        # A commit that bumps the FFmpeg pin also starts ffmpeg-base.yml on the
+        # same push, and that workflow publishes the new tag only after its
+        # per-arch builds and manifest merge. On a publishing run, wait (bounded)
+        # for the base tag to exist rather than failing FROM ${FFMPEG_IMAGE}; on
+        # a pull_request nothing is pushed, so resolve once as before.
         id: ffmpeg
-        run: echo "image=$(scripts/resolve-ffmpeg-image.sh "${{ github.repository_owner }}" "${{ matrix.ffmpeg_tag }}")" >> "$GITHUB_OUTPUT"
+        run: |
+          set -euo pipefail
+          tag="${{ matrix.ffmpeg_tag }}"
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            echo "image=$(scripts/resolve-ffmpeg-image.sh "${{ github.repository_owner }}" "${tag}")" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          # Publishing run: wait for THIS owner's base only. The resolver's
+          # upstream fallback is not proof that ffmpeg-base.yml published, and
+          # a published app image must be built FROM the owner's own base.
+          owner="$(printf '%s' "${{ github.repository_owner }}" | tr '[:upper:]' '[:lower:]')"
+          image="ghcr.io/${owner}/multiview-ffmpeg:${tag}"
+          deadline=$(( $(date +%s) + 75 * 60 ))
+          until docker manifest inspect "${image}" >/dev/null 2>&1; do
+            if [ "$(date +%s)" -ge "${deadline}" ]; then
+              echo "::error::FFmpeg base ${image} is not published (is ffmpeg-base.yml still running or failed?)"
+              exit 1
+            fi
+            echo "waiting for ffmpeg-base.yml to publish ${image} ..."
+            sleep 60
+          done
+          echo "image=${image}" >> "$GITHUB_OUTPUT"
 
       - name: Build and push by digest
         id: build

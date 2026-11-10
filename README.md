@@ -73,7 +73,7 @@ source and re-run `up -d`. Tear down with `docker compose -f deploy/compose.yaml
 | Method | Get it |
 |--------|--------|
 | **Container (recommended)** | `docker pull ghcr.io/conspect-studio/conspect:latest` (multi-arch `amd64`+`arm64`, SLSA provenance + cosign-signed). NVIDIA variant: `:latest-nvidia`. |
-| **Prebuilt binaries** | Linux (`x86_64`/`aarch64`) and macOS (Apple Silicon/Intel, signed + notarized) on the [Releases page](https://github.com/conspect-studio/conspect/releases). Requires FFmpeg 7.x on the host. |
+| **Prebuilt binaries** | Linux (`x86_64`/`aarch64`) on the [Releases page](https://github.com/conspect-studio/conspect/releases). The pinned LGPL FFmpeg libraries are bundled; `RUNTIME-DEPENDENCIES.txt` in each archive lists the few distro packages to install. macOS binaries return once the pinned macOS FFmpeg build lands. |
 | **From source** | `cargo build` (pure-Rust, LGPL-clean default). Feature presets and the FFmpeg/toolchain requirements are in **[docs/operations/building.md](docs/operations/building.md)**. |
 
 ---

@@ -10,7 +10,7 @@
 #   Leaves the verified source tree at <dest-dir>/ffmpeg-${FFMPEG_VERSION}.
 set -euo pipefail
 
-FFMPEG_VERSION="${FFMPEG_VERSION:-8.1.1}"
+FFMPEG_VERSION="${FFMPEG_VERSION:-9.0.2}"
 FFMPEG_GPG_KEY="${FFMPEG_GPG_KEY:-FCF986EA15E6E293A5644F10B4322F04D67658D8}"
 DEST="${1:?usage: ffmpeg-fetch-source.sh <dest-dir>}"
 
