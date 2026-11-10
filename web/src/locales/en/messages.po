@@ -13,14 +13,6 @@ msgstr ""
 "Language-Team: \n"
 "Plural-Forms: \n"
 
-#: src/components/broadcast/ProductionDesk.tsx:38
-#~ msgid " · Still preview (~1 fps) — live video is unavailable for this preview"
-#~ msgstr " · Still preview (~1 fps) — live video is unavailable for this preview"
-
-#: src/components/broadcast/ProductionDesk.tsx:38
-#~ msgid " · Still preview (~1 fps), live video unavailable"
-#~ msgstr " · Still preview (~1 fps), live video unavailable"
-
 #: src/pages/approved/SourcesSurface.tsx:219
 msgid "— dark"
 msgstr "— dark"
@@ -460,14 +452,6 @@ msgstr "● ON AIR — PROGRAM"
 #: src/pages/approved/RoutingSurface.tsx:443
 msgid "● on PGM"
 msgstr "● on PGM"
-
-#: src/components/broadcast/ProductionDesk.tsx:33
-#~ msgid "● PREVIEW"
-#~ msgstr "● PREVIEW"
-
-#: src/components/broadcast/ProductionDesk.tsx:33
-#~ msgid "● PROGRAM"
-#~ msgstr "● PROGRAM"
 
 #: src/pages/approved/SourcesSurface.tsx:214
 msgid "● RED — on air"
@@ -953,10 +937,6 @@ msgstr "Add {title} as source"
 msgid "Add an output or source"
 msgstr "Add an output or source"
 
-#: src/pages/SourcesPage.tsx:1160
-#~ msgid "Add and manage live ingest sources."
-#~ msgstr "Add and manage live ingest sources."
-
 #: src/iptv/AddSourceDialog.tsx:55
 #: src/iptv/IptvOrgPage.tsx:918
 #: src/iptv/IptvOrgPage.tsx:1051
@@ -1158,14 +1138,6 @@ msgstr "Alarms — {alarmCount} active system"
 #: src/components/broadcast/ProductionDesk.tsx:149
 msgid "Alarms & engine health"
 msgstr "Alarms & engine health"
-
-#: src/components/broadcast/BroadcastShell.tsx:40
-#~ msgid "Alarms and engine health"
-#~ msgstr "Alarms and engine health"
-
-#: src/components/broadcast/BroadcastShell.tsx:40
-#~ msgid "Alarms and engine health — {alarmCount} active"
-#~ msgstr "Alarms and engine health — {alarmCount} active"
 
 #: src/pages/docs/FeaturesPage.tsx:166
 msgid "Alarms are raised by content-aware fault probes attached to a tile. Probes can detect a black picture, a frozen picture, audio silence, and loudness that drifts from an EBU R128 target. Each probe has a severity and dwell timers, so a brief glitch does not trip an alarm while a sustained fault does. Severities follow the standard cleared / indeterminate / warning / minor / major / critical scale."
@@ -1549,10 +1521,6 @@ msgstr "Audio at or below this level counts as silent (e.g. −60)."
 #: src/iptv/ProbeSummary.tsx:60
 msgid "Audio languages"
 msgstr "Audio languages"
-
-#: src/components/broadcast/ProductionDesk.tsx:34
-#~ msgid "Audio meters unavailable — no measured level contract"
-#~ msgstr "Audio meters unavailable — no measured level contract"
 
 #: src/components/broadcast/ProductionDesk.tsx:47
 msgid "Audio meters unavailable — no measured level telemetry"
@@ -4392,10 +4360,6 @@ msgstr "Engine default (mixed program bus)"
 msgid "Engine default (reclock to house)"
 msgstr "Engine default (reclock to house)"
 
-#: src/components/broadcast/ProductionDesk.tsx:129
-#~ msgid "Engine state confirmed · takes follow the lock"
-#~ msgstr "Engine state confirmed · takes follow the lock"
-
 #: src/components/broadcast/ProductionDesk.tsx:137
 msgid "ENGINE TICK"
 msgstr "ENGINE TICK"
@@ -4766,10 +4730,6 @@ msgstr "Fix these before saving:"
 #: src/pages/AudioPage.tsx:1185
 msgid "Fix these problems before saving:"
 msgstr "Fix these problems before saving:"
-
-#: src/pages/AudioPage.tsx:1142
-#~ msgid "Fix these routes before saving:"
-#~ msgstr "Fix these routes before saving:"
 
 #: src/iptv/IptvOrgPage.tsx:479
 msgid "Flags"
@@ -5169,6 +5129,8 @@ msgid "Height (px)"
 msgstr "Height (px)"
 
 #: src/components/broadcast/ProductionDesk.tsx:137
+#: src/components/broadcast/ProductionDesk.tsx:137
+#: src/components/broadcast/ProductionDesk.tsx:137
 #: src/pages/approved/MediaSurface.tsx:135
 #: src/pages/approved/RoutingSurface.tsx:94
 #: src/pages/approved/ShowPage.tsx:41
@@ -5322,11 +5284,6 @@ msgstr "HTTP only"
 #: src/pages/DevicesPage.tsx:157
 msgid "HTTP(S) management endpoint. Wrap IPv6 literals in brackets."
 msgstr "HTTP(S) management endpoint. Wrap IPv6 literals in brackets."
-
-#: src/pages/approved/RoutingSurface.tsx:93
-#: src/pages/SourcesPage.tsx:1087
-#~ msgid "ⓘ Help"
-#~ msgstr "ⓘ Help"
 
 #: src/docs/registry.ts:663
 #: src/pages/docs/concepts/GlossaryPage.tsx:110
@@ -6014,10 +5971,6 @@ msgstr "List at least one track name (comma-separated)."
 msgid "LISTEN"
 msgstr "LISTEN"
 
-#: src/pages/AudioPage.tsx:451
-#~ msgid "LISTEN: unavailable (no monitor path)"
-#~ msgstr "LISTEN: unavailable (no monitor path)"
-
 #: src/pages/OutputsPage.tsx:190
 msgid "Listening, no caller attached"
 msgstr "Listening, no caller attached"
@@ -6071,10 +6024,6 @@ msgstr "Live preview of input {0}"
 #: src/pages/AudioPage.tsx:893
 msgid "Live program meters are in the PROGRAM region below."
 msgstr "Live program meters are in the PROGRAM region below."
-
-#: src/pages/AudioPage.tsx:825
-#~ msgid "Live program meters are rendered below the console."
-#~ msgstr "Live program meters are rendered below the console."
 
 #: src/pages/MonitoringPage.tsx:219
 msgid "Live program output"
@@ -6337,10 +6286,6 @@ msgstr "Location"
 msgid "Location id"
 msgstr "Location id"
 
-#: src/pages/SourcesPage.tsx:1116
-#~ msgid "Locator"
-#~ msgstr "Locator"
-
 #: src/components/broadcast/BroadcastShell.tsx:44
 msgid "Locked"
 msgstr "Locked"
@@ -6511,10 +6456,6 @@ msgstr "Map rendering by <0>MapLibre GL JS</0> (BSD-3-Clause). No map tiles are 
 msgid "Marker type"
 msgstr "Marker type"
 
-#: src/pages/approved/AudioSurface.tsx:167
-#~ msgid "Master gain and mute are unavailable: the control plane exposes only per-input gain and mute in the saved audio document."
-#~ msgstr "Master gain and mute are unavailable: the control plane exposes only per-input gain and mute in the saved audio document."
-
 #: src/pages/approved/AudioSurface.tsx:161
 msgid "Master gain/mute unavailable: control plane exposes only per-input gain and mute in the saved audio document"
 msgstr "Master gain/mute unavailable: control plane exposes only per-input gain and mute in the saved audio document"
@@ -6590,10 +6531,6 @@ msgstr "Measurement running"
 #: src/components/broadcast/BroadcastShell.tsx:34
 msgid "Media"
 msgstr "Media"
-
-#: src/pages/approved/MediaSurface.tsx:92
-#~ msgid "Media · VT"
-#~ msgstr "Media · VT"
 
 #: src/pages/approved/MediaSurface.tsx:125
 msgid "Media · VT & graphics"
@@ -6740,10 +6677,6 @@ msgstr "MOMENTARY"
 #: src/pages/LoudnessMeter.tsx:162
 msgid "Momentary (400 ms)"
 msgstr "Momentary (400 ms)"
-
-#: src/pages/approved/AudioSurface.tsx:176
-#~ msgid "Monitor / LISTEN (PFL) is unavailable: no headphone monitoring path exists on this control plane."
-#~ msgstr "Monitor / LISTEN (PFL) is unavailable: no headphone monitoring path exists on this control plane."
 
 #: src/pages/approved/AudioSurface.tsx:194
 msgid "MONITOR OUT — LISTEN (PFL) is unavailable: no headphone monitoring path exists on this control plane."
@@ -7333,10 +7266,6 @@ msgstr "No locator configured"
 #: src/pages/LogsPage.tsx:163
 msgid "No log records match the filter."
 msgstr "No log records match the filter."
-
-#: src/pages/approved/AudioSurface.tsx:35
-#~ msgid "No loudness telemetry"
-#~ msgstr "No loudness telemetry"
 
 #: src/iptv/Controls.tsx:85
 msgid "No matching place."
@@ -8593,10 +8522,6 @@ msgid "PROGRAM LOUDNESS (short-term)"
 msgstr "PROGRAM LOUDNESS (short-term)"
 
 #: src/pages/approved/AudioSurface.tsx:173
-#~ msgid "PROGRAM master gain"
-#~ msgstr "PROGRAM master gain"
-
-#: src/pages/approved/AudioSurface.tsx:173
 msgid "PROGRAM master gain — unavailable"
 msgstr "PROGRAM master gain — unavailable"
 
@@ -9335,10 +9260,6 @@ msgstr "Route {0}"
 #: src/pages/AudioPage.tsx:1079
 msgid "Route {row}"
 msgstr "Route {row}"
-
-#: src/pages/RoutingPage.tsx:229
-#~ msgid "Route a source elementary stream onto a destination. Plan classifies the take without applying it; Take applies it — a Class-2 migration is accepted asynchronously and its outcome arrives on the realtime stream."
-#~ msgstr "Route a source elementary stream onto a destination. Plan classifies the take without applying it; Take applies it — a Class-2 migration is accepted asynchronously and its outcome arrives on the realtime stream."
 
 #: src/pages/AudioPage.tsx:1522
 msgid "Route each input's audio: program-mix membership and discrete tracks."
@@ -11765,10 +11686,6 @@ msgstr "Unavailable:"
 msgid "unavailable: no monitor path"
 msgstr "unavailable: no monitor path"
 
-#: src/app/router.tsx:66
-#~ msgid "Unavailable: no production rundown control contract exists. No video switch occurs here."
-#~ msgstr "Unavailable: no production rundown control contract exists. No video switch occurs here."
-
 #: src/pages/approved/ShowPage.tsx:98
 msgid "Unavailable: there is no cue list, so cue actions cannot run."
 msgstr "Unavailable: there is no cue list, so cue actions cannot run."
@@ -12136,14 +12053,6 @@ msgstr "VT slots are transport channels. Each command is accepted asynchronously
 #: src/pages/approved/MediaSurface.tsx:117
 msgid "VT transport"
 msgstr "VT transport"
-
-#: src/pages/MediaPlayersPage.tsx:719
-#~ msgid "VT transport for the configured media-player channels. Load an asset, cue, play, pause, stop, and — for a vamp/loop fill — arm, take, or cancel a clean exit at the next vamp boundary. Each command is accepted asynchronously; the player's live state and playhead arrive on the realtime stream."
-#~ msgstr "VT transport for the configured media-player channels. Load an asset, cue, play, pause, stop, and — for a vamp/loop fill — arm, take, or cancel a clean exit at the next vamp boundary. Each command is accepted asynchronously; the player's live state and playhead arrive on the realtime stream."
-
-#: src/pages/approved/MediaSurface.tsx:94
-#~ msgid "VT transport, capture and the clip library."
-#~ msgstr "VT transport, capture and the clip library."
 
 #: src/pages/approved/MediaSurface.tsx:127
 msgid "VT transport, graphics, capture and the clip library."

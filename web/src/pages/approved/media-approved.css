@@ -157,3 +157,7 @@
   [data-approved-page] .help-btn svg{width:18px;height:18px;margin:0}
   [data-approved-page] .screen-sub,[data-approved-page] .src-sub{flex-wrap:nowrap;justify-content:space-between;width:100%}
 }
+/* Final-fix2: the unknown-duration note wraps onto two lines, never ellipsized. */
+[data-approved-page="media"] .vt-scrub { overflow: visible; height: auto; }
+[data-approved-page="media"] .vt-scrub-note { white-space: normal; overflow: visible; text-overflow: clip; overflow-wrap: anywhere; line-height: 1.35; }
+[data-approved-page="media"] .vt-scrub-note > * { white-space: normal; }

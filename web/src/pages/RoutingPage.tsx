@@ -616,7 +616,7 @@ export function RoutingPage(): JSX.Element {
                 </div>
               ) : null}
 
-              <div className="flex items-center gap-2">
+              <div className="route-actions flex items-center gap-2">
                 <Button
                   type="button"
                   variant="outline"

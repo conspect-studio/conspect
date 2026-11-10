@@ -348,3 +348,25 @@
 .bd-desk-clock .bd-clock-na{font-size:12px;white-space:nowrap}
 .bd-desk-clock .bd-tick b{font-size:16px}
 }
+
+/* Final-fix2: tablet (768-1279) desk heading — title+subtitle with Help on row 1 (right),
+   alarm chip + clock panel together, right-aligned, on row 2. No overlaps; subtitle <=2 lines. */
+@media(min-width:768px) and (max-width:1279px){
+.bd-heading{display:grid;grid-template-columns:minmax(0,1fr) auto;align-items:start;gap:8px 12px;margin-bottom:10px}
+.bd-heading>div:first-child{grid-column:1;grid-row:1;min-width:0}
+.bd-heading>.bd-help-btn{grid-column:2;grid-row:1;margin:0}
+.bd-heading>.bd-heading-side{grid-column:1/-1;grid-row:2;justify-content:flex-end;flex-wrap:nowrap}
+.bd-heading-side .bd-desk-clock{flex:0 1 auto;min-width:0;gap:12px;padding:6px 12px}
+}
+/* Help pill on phones: icon + visible 'Help' label when >=360px, icon-only below (aria-label always present). */
+@media(max-width:767px){
+.broadcast-shell .bd-help-btn{width:auto;min-width:48px;padding:0 12px;font-size:12px;gap:4px}
+}
+@media(max-width:359px){
+.broadcast-shell .bd-help-btn{width:48px;padding:0;font-size:0;gap:0}
+}
+@media(min-width:1280px){
+.bd-heading{justify-content:flex-start}
+.bd-heading>.bd-help-btn{margin:0}
+.bd-heading>.bd-heading-side{margin-left:auto}
+}
