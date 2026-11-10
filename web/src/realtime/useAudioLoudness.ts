@@ -243,7 +243,7 @@ export interface AudioLoudnessState {
   /** The held (max) true-peak since the meter mounted, dBTP. */
   readonly heldPeakDbtp: number | undefined;
   /** Client receipt time (ms epoch) of `current`; undefined before the first. */
-  readonly receivedAt?: number;
+  readonly receivedAt?: number | undefined;
 }
 
 /**

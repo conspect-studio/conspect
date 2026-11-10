@@ -18,10 +18,10 @@ export const LOUDNESS_STALE_MS = 6000;
 function useFreshSample(
   state: AudioLoudnessState,
 ): AudioLoudnessState['current'] {
-  const [, setTick] = useState(0);
+  const [now, setNow] = useState(() => Date.now());
   useEffect(() => {
     const id = setInterval(() => {
-      setTick((n) => n + 1);
+      setNow(Date.now());
     }, 1000);
     return (): void => {
       clearInterval(id);
@@ -30,7 +30,7 @@ function useFreshSample(
   if (state.status !== 'open' || state.receivedAt === undefined) {
     return undefined;
   }
-  return Date.now() - state.receivedAt > LOUDNESS_STALE_MS
+  return now - state.receivedAt > LOUDNESS_STALE_MS
     ? undefined
     : state.current;
 }

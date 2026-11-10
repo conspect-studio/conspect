@@ -1130,8 +1130,7 @@ export function AudioPage(): JSX.Element {
             </p>
           ) : null}
 
-          {errors !== undefined &&
-          errors.routes.some((r) => Object.keys(r).length > 0) ? (
+          {errors?.routes.some((r) => Object.keys(r).length > 0) ? (
             <div
               ref={summaryRef}
               tabIndex={-1}
