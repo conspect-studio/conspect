@@ -3,18 +3,18 @@
 #[path = "../tests/support/mod.rs"]
 mod support;
 use multiview_control::{
-    Principal,
     moq::{MoqRegistry, MoqReject, MoqVideo, MoqVideoAlternative},
     moq_provider::{
         AuthorizedFeed, AuthorizedFeedFactory, AuthorizedSharedFeed, WebTransportProvider,
     },
     preview::WhepScope,
+    Principal,
 };
 use multiview_moq::{
-    Packet, Window,
     ladder::{RenditionSpec, SharedLadder},
     provider::{Fence, LadderFeed, Runtime},
     publication::LadderWindow,
+    Packet, Window,
 };
 use std::{
     sync::{Arc, Mutex, Weak},
@@ -333,7 +333,7 @@ mod bridge_tests {
     use super::*;
     #[test]
     fn private_handoff_uses_regular_owned_private_fd_and_rejects_symlink() {
-        use std::os::unix::fs::{PermissionsExt, symlink};
+        use std::os::unix::fs::{symlink, PermissionsExt};
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("private.json");
         std::fs::write(&path, b"{}").unwrap();

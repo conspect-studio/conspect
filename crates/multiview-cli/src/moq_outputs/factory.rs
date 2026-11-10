@@ -121,7 +121,9 @@ async fn await_outgoing_start<F: std::future::Future>(
             result = &mut future => Some(result),
         };
         if let Some(result) = ready {
-            if invalid() || *stopped.borrow() { return None; }
+            if invalid() || *stopped.borrow() {
+                return None;
+            }
             return Some(result);
         }
     }
