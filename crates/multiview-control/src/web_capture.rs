@@ -4,22 +4,31 @@ use crate::{
     auth::{authorize_object, Action, Principal},
     error::{ControlError, ControlResult},
 };
+use crate::web_capture_store::{
+    digest_hex, Ledger, Reserve, TermsAcceptance, TermsRepository,
+};
 use multiview_webengine::{
     capture::{Background, Capture, WindyView},
-    service::{JobId, Request, Service, State, SubmitError, Submitted},
+    service::{CancelOutcome, JobId, Request, Service, State, SubmitError, Submitted},
 };
 use serde::{Deserialize, Serialize};
 use std::{sync::Arc, time::Duration};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+
+/// Concurrent artifact streams allowed across all clients.
+pub const ARTIFACT_STREAMS: usize = 2;
 
 /// Windy terms version attached to this built-in template.
 pub const WINDY_TERMS_VERSION: &str = "windy-2023-09-01";
 /// One authorized, bounded public Windy view. Premium needs a configured secret resolver.
-#[derive(Deserialize)]
+#[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct CaptureBody {
     /// Fill authorization object.
     pub fill_id: String,
-    /// Existing target-player authorization object, when supplied.
+    /// Optional existing media player; validated by the route when supplied.
+    /// Standalone artifact capture needs none; no player-load is implied.
+    #[serde(default)]
     pub target_player: Option<String>,
     /// Site parameters, never a URL or executable path.
     pub view: View,
@@ -27,7 +36,7 @@ pub struct CaptureBody {
     pub terms: Terms,
 }
 /// Site-specific bounded view.
-#[derive(Deserialize)]
+#[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct View {
     /// Latitude.
@@ -51,7 +60,7 @@ pub struct View {
     pub public: bool,
 }
 /// Explicit versioned site-terms acceptance.
-#[derive(Deserialize)]
+#[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Terms {
     /// Must be true.
@@ -74,16 +83,49 @@ pub struct JobView {
     pub resources: Option<serde_json::Value>,
 }
 /// Shared provider; its service worker has no reference to the output clock.
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct Provider {
     service: Option<Arc<Service>>,
+    terms: Option<Arc<dyn TermsRepository>>,
+    ledger: Arc<Ledger>,
+    streams: Arc<Semaphore>,
+}
+impl Default for Provider {
+    fn default() -> Self {
+        Self {
+            service: None,
+            terms: None,
+            ledger: Arc::new(Ledger::memory()),
+            streams: Arc::new(Semaphore::new(ARTIFACT_STREAMS)),
+        }
+    }
+}
+/// A fresh or replayed admission.
+pub struct Admission {
+    /// Job number.
+    pub job_id: u64,
+    /// True only for the first use of the idempotency key (audit once).
+    pub fresh: bool,
+}
+/// Cancel result mapped by the route.
+#[derive(Debug, PartialEq, Eq)]
+pub struct CancelResult {
+    /// True only for the first accepted use of the key.
+    pub fresh: bool,
 }
 impl Provider {
-    /// Inject a configured real service created at CLI startup.
+    /// Inject a configured real service plus its private terms and idempotency stores.
     #[must_use]
-    pub fn configured(service: Arc<Service>) -> Self {
+    pub fn configured(
+        service: Arc<Service>,
+        terms: Arc<dyn TermsRepository>,
+        ledger: Arc<Ledger>,
+    ) -> Self {
         Self {
             service: Some(service),
+            terms: Some(terms),
+            ledger,
+            streams: Arc::new(Semaphore::new(ARTIFACT_STREAMS)),
         }
     }
     /// Honest runtime capabilities, including the disabled URL download boundary.
@@ -91,10 +133,11 @@ impl Provider {
     pub fn capabilities(&self) -> serde_json::Value {
         serde_json::json!({"capture_available":self.service.is_some(),"premium_available":false,"url_fetch_available":false,"url_fetch_reason":"enforced download boundary not provisioned","accounting":"process_tree_estimated","kernel_limits":false})
     }
-    /// Authorize all named objects before allocating a background job.
+    /// Authorize all named objects before allocating a background job. Blocking.
     /// # Errors
-    /// Rejects unauthorized objects, stale terms, unsupported Premium, or full service.
-    pub fn submit(&self, p: &Principal, body: CaptureBody) -> ControlResult<u64> {
+    /// Rejects unauthorized objects, stale terms, unsupported Premium, divergent
+    /// idempotent replays, or full service.
+    pub fn submit(&self, p: &Principal, key: &str, body: CaptureBody) -> ControlResult<Admission> {
         p.role.require(Action::Write)?;
         authorize_object(p, &body.fill_id)?;
         if let Some(player) = &body.target_player {
@@ -119,7 +162,7 @@ impl Provider {
                 lat: body.view.lat,
                 lon: body.view.lon,
                 zoom: body.view.zoom,
-                overlay: body.view.overlay,
+                overlay: body.view.overlay.clone(),
                 terms_accepted: true,
                 require_premium: false,
                 credentials: None,
@@ -129,16 +172,72 @@ impl Provider {
             .validate()
             .map_err(|_| ControlError::Validation("invalid capture view".into()))?;
         let service = self.service.as_ref().ok_or(ControlError::EngineBusy)?;
+        let terms = self.terms.as_ref().ok_or(ControlError::EngineBusy)?;
+        let digest = digest_hex(&serde_json::to_vec(&body).map_err(|_| {
+            ControlError::Validation("capture body not serializable".into())
+        })?);
+        match self.ledger.reserve(&p.key_id, "submit", key, &digest) {
+            Ok(Reserve::Replay(id)) => {
+                return Ok(Admission {
+                    job_id: id,
+                    fresh: false,
+                })
+            }
+            Ok(Reserve::Fresh) => {}
+            Err(true) => {
+                return Err(ControlError::Conflict(
+                    "Idempotency-Key reused with a different request".into(),
+                ))
+            }
+            Err(false) => {
+                return Err(ControlError::Conflict(
+                    "Idempotency-Key request already in progress".into(),
+                ))
+            }
+        }
+        let outcome = self.admit(p, key, service, terms.as_ref(), &body, capture);
+        if outcome.is_err() {
+            self.ledger.abandon(&p.key_id, "submit", key);
+        }
+        outcome
+    }
+    fn admit(
+        &self,
+        p: &Principal,
+        key: &str,
+        service: &Service,
+        terms: &dyn TermsRepository,
+        body: &CaptureBody,
+        capture: Capture,
+    ) -> ControlResult<Admission> {
+        let accepted_at_unix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs());
+        terms
+            .record(&TermsAcceptance {
+                key_id: p.key_id.clone(),
+                fill: body.fill_id.clone(),
+                version: body.terms.version.clone(),
+                accepted_at_unix,
+            })
+            .map_err(|_| ControlError::Repository("terms acceptance could not be persisted".into()))?;
         let request = Request {
             owner: p.key_id.clone(),
-            fill: body.fill_id,
+            fill: body.fill_id.clone(),
             capture,
             maximum_bytes: 64 * 1024 * 1024,
             timeout: Duration::from_secs(120),
         };
-        match service.submit(request).map_err(submit_error)? {
-            Submitted::Accepted(id) | Submitted::Coalesced(id) => Ok(id.raw()),
-        }
+        let id = match service.submit(request).map_err(submit_error)? {
+            Submitted::Accepted(id) | Submitted::Coalesced(id) => id.raw(),
+        };
+        self.ledger
+            .complete(&p.key_id, "submit", key, id)
+            .map_err(|_| ControlError::Repository("idempotency record could not be persisted".into()))?;
+        Ok(Admission {
+            job_id: id,
+            fresh: true,
+        })
     }
     /// Fetch an actor-owned job after object authorization.
     /// # Errors
@@ -167,38 +266,73 @@ impl Provider {
         })
     }
     /// Obtain an immutable artifact lease after authenticating the owning job.
+    /// The returned permit bounds concurrent streams and must live as long as the reader.
     /// Blocking hash verification belongs on a management blocking worker.
     /// # Errors
-    /// Rejects unknown, cross-owner, unready or unavailable artifacts.
+    /// Rejects unknown, cross-owner, unready or unavailable artifacts, or no stream capacity.
     pub fn pin(
         &self,
         p: &Principal,
         id: u64,
-    ) -> ControlResult<multiview_webengine::artifact::Lease> {
+    ) -> ControlResult<(multiview_webengine::artifact::Lease, OwnedSemaphorePermit)> {
         let job = self.status(p, id)?;
         let artifact = job
             .artifact_id
             .ok_or_else(|| ControlError::Conflict("capture has no completed artifact".into()))?;
         let artifact = multiview_webengine::artifact::ArtifactId::parse(&artifact)
             .map_err(|_| ControlError::Repository("invalid capture artifact identity".into()))?;
-        self.service
+        let permit = self
+            .streams
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| ControlError::EngineBusy)?;
+        let lease = self
+            .service
             .as_ref()
             .ok_or(ControlError::EngineBusy)?
             .pin(&artifact, &p.key_id)
-            .map_err(|_| ControlError::EngineBusy)
+            .map_err(|_| ControlError::EngineBusy)?;
+        Ok((lease, permit))
     }
 
-    /// Cancel an actor-owned, authorized job.
+    /// Cancel an actor-owned, authorized job under an idempotency key. Blocking.
     /// # Errors
-    /// Requires write permission on the job's fill.
-    pub fn cancel(&self, p: &Principal, id: u64) -> ControlResult<()> {
+    /// Unknown 404; finished 409; divergent key reuse 409.
+    pub fn cancel(&self, p: &Principal, key: &str, id: u64) -> ControlResult<CancelResult> {
         p.role.require(Action::Write)?;
         let _ = self.status(p, id)?;
-        self.service
+        let op = "cancel";
+        let digest = digest_hex(id.to_string().as_bytes());
+        match self.ledger.reserve(&p.key_id, op, key, &digest) {
+            Ok(Reserve::Replay(_)) => return Ok(CancelResult { fresh: false }),
+            Ok(Reserve::Fresh) => {}
+            Err(_) => {
+                return Err(ControlError::Conflict(
+                    "Idempotency-Key reused with a different or in-flight request".into(),
+                ))
+            }
+        }
+        let outcome = self
+            .service
             .as_ref()
             .ok_or(ControlError::EngineBusy)?
             .cancel(&p.key_id, JobId::from_raw(id));
-        Ok(())
+        match outcome {
+            CancelOutcome::Cancelled | CancelOutcome::Cancelling => {
+                self.ledger
+                    .complete(&p.key_id, op, key, id)
+                    .map_err(|_| ControlError::Repository("idempotency record could not be persisted".into()))?;
+                Ok(CancelResult { fresh: true })
+            }
+            CancelOutcome::Finished => {
+                self.ledger.abandon(&p.key_id, op, key);
+                Err(ControlError::Conflict("capture job already finished".into()))
+            }
+            CancelOutcome::Unknown => {
+                self.ledger.abandon(&p.key_id, op, key);
+                Err(missing(id))
+            }
+        }
     }
 }
 fn missing(id: u64) -> ControlError {

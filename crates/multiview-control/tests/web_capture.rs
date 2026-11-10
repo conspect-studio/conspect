@@ -38,6 +38,26 @@ async fn viewer_and_other_object_are_denied_before_provider_admission() {
         assert_eq!(r.status(), StatusCode::FORBIDDEN);
     }
 }
+#[test]
+fn symlink_root_is_rejected_at_startup() {
+    let d = tempfile::tempdir().unwrap();
+    let real = d.path().join("real");
+    std::fs::create_dir(&real).unwrap();
+    let link = d.path().join("link");
+    std::os::unix::fs::symlink(&real, &link).unwrap();
+    assert!(multiview_control::web_capture_startup::reject_symlink(&link).is_err());
+    assert!(multiview_control::web_capture_startup::reject_symlink(&real.join("new")).is_ok());
+}
+#[test]
+fn ledger_replay_divergence_and_bounds() {
+    use multiview_control::web_capture_store::{Ledger, Reserve};
+    let l = Ledger::memory();
+    assert_eq!(l.reserve("a", "submit", "k", "d1"), Ok(Reserve::Fresh));
+    l.complete("a", "submit", "k", 7).unwrap();
+    assert_eq!(l.reserve("a", "submit", "k", "d1"), Ok(Reserve::Replay(7)));
+    assert_eq!(l.reserve("a", "submit", "k", "d2"), Err(true));
+    assert_eq!(l.reserve("b", "submit", "k", "d2"), Ok(Reserve::Fresh));
+}
 #[tokio::test]
 async fn terms_and_untrusted_fields_are_rejected() {
     let h = harness_with(|s| s);

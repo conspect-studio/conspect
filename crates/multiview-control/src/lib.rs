@@ -1053,3 +1053,5 @@ where
 pub mod web_capture;
 
 pub mod web_capture_startup;
+
+pub mod web_capture_store;

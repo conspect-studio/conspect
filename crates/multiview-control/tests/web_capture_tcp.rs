@@ -2,7 +2,8 @@
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
 mod support;
 use multiview_control::{
-    command_bus, web_capture::Provider, AppState, EngineStateSnapshot, InMemoryRepository,
+    command_bus, web_capture::Provider,
+    web_capture_store::{DurableTerms, Ledger}, AppState, EngineStateSnapshot, InMemoryRepository,
 };
 use multiview_engine::EnginePublisher;
 use multiview_events::Event;
@@ -20,8 +21,18 @@ async fn request(
     body: &str,
     token: &str,
 ) -> String {
+    request_keyed(addr, method, path, body, token, "get-key").await
+}
+async fn request_keyed(
+    addr: std::net::SocketAddr,
+    method: &str,
+    path: &str,
+    body: &str,
+    token: &str,
+    key: &str,
+) -> String {
     let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
-    let text=format!("{method} {path} HTTP/1.0\r\nHost: localhost\r\nAuthorization: Bearer {token}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",body.len());
+    let text=format!("{method} {path} HTTP/1.0\r\nHost: localhost\r\nAuthorization: Bearer {token}\r\nIdempotency-Key: {key}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",body.len());
     stream.write_all(text.as_bytes()).await.unwrap();
     let mut output = Vec::new();
     stream.read_to_end(&mut output).await.unwrap();
@@ -73,7 +84,11 @@ async fn actual_tcp_post_runs_service_and_returns_owner_scoped_artifact() {
         Arc::new(InMemoryRepository::new()),
         Arc::new(support::seeded_keys()),
     )
-    .with_web_capture(Provider::configured(service.clone()));
+    .with_web_capture(Provider::configured(
+        service.clone(),
+        Arc::new(DurableTerms::open(&root.path().join("terms.log")).unwrap()),
+        Arc::new(Ledger::durable(&root.path().join("idem.log")).unwrap()),
+    ));
     let listener = tokio::net::TcpListener::bind("[::1]:0").await.unwrap();
     let address = listener.local_addr().unwrap();
     let (stop, done) = tokio::sync::oneshot::channel();
@@ -94,6 +109,23 @@ async fn actual_tcp_post_runs_service_and_returns_owner_scoped_artifact() {
         "{response}"
     );
     let id = json(&response)["job_id"].as_u64().unwrap();
+    // Same key + body replays the same job; divergent body is 409.
+    let replay = request_keyed(address, "POST", "/api/v1/media/captures", &body, support::OPERATOR_TOKEN, "get-key").await;
+    assert_eq!(json(&replay)["job_id"].as_u64().unwrap(), id, "{replay}");
+    let divergent = body.replace("\"frames\":2", "\"frames\":3");
+    let r = request_keyed(address, "POST", "/api/v1/media/captures", &divergent, support::OPERATOR_TOKEN, "get-key").await;
+    assert!(r.contains(" 409"), "{r}");
+    // Missing key rejected.
+    let no_key = request_keyed(address, "POST", "/api/v1/media/captures", &body, support::OPERATOR_TOKEN, "").await;
+    assert!(no_key.contains(" 400"), "{no_key}");
+    // Unknown target player rejected before allocation.
+    let with_player = body.replace("\"view\"", "\"target_player\":\"no-such-player\",\"view\"");
+    let r = request_keyed(address, "POST", "/api/v1/media/captures", &with_player, support::OPERATOR_TOKEN, "k-player").await;
+    assert!(r.contains(" 404"), "{r}");
+    // Terms acceptance durably recorded.
+    let log = std::fs::read_to_string(root.path().join("terms.log")).unwrap();
+    assert!(log.contains("operator-key") && log.contains("windy-2023-09-01"));
+    assert_eq!(log.lines().count(), 1, "replay must not re-record terms");
     let path = format!("/api/v1/media/captures/{id}");
     let status = tokio::time::timeout(Duration::from_secs(10), async {
         loop {
@@ -110,6 +142,16 @@ async fn actual_tcp_post_runs_service_and_returns_owner_scoped_artifact() {
     assert!(status["artifact_id"].as_str().unwrap().starts_with('a'));
     let denied = request(address, "GET", &path, "", support::VIEWER_TOKEN).await;
     assert!(denied.contains("404"));
+    // A different key with the same Operator role must not see the job or artifact.
+    let other = request(address, "GET", &path, "", support::ADMIN_TOKEN).await;
+    assert!(other.contains(" 404"), "{other}");
+    let other = request(address, "GET", &format!("{path}/artifact"), "", support::ADMIN_TOKEN).await;
+    assert!(other.contains(" 404"), "{other}");
+    // Cancelling a finished job is 409; unknown job 404.
+    let r = request_keyed(address, "POST", &format!("{path}/cancel"), "", support::OPERATOR_TOKEN, "c1").await;
+    assert!(r.contains(" 409"), "{r}");
+    let r = request_keyed(address, "POST", "/api/v1/media/captures/999999/cancel", "", support::OPERATOR_TOKEN, "c2").await;
+    assert!(r.contains(" 404"), "{r}");
     stop.send(()).unwrap();
     server.await.unwrap().unwrap();
     service.shutdown();
