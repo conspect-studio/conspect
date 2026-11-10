@@ -71,4 +71,23 @@ describe('ProductionDesk truthful wall, indices and meters', () => {
     const waiting = await screen.findByText('Waiting for a frame…');
     expect(waiting.closest('[role="img"]')).toBeNull();
   });
+  it('renders the PGM TC / SHOW ELAPSED panel as explicit unavailable with the real engine tick', async () => {
+    page();
+    const tc = await screen.findByTestId('desk-tc-unavailable');
+    expect(tc).toHaveTextContent('PGM TC');
+    expect(tc).toHaveTextContent('unavailable');
+    expect(tc).toHaveAttribute('title', 'No timecode source in the engine API');
+    expect(screen.getByTestId('desk-elapsed-unavailable')).toHaveTextContent('SHOW ELAPSED');
+    expect(tc.closest('.bd-desk-clock')).toHaveTextContent('ENGINE TICK');
+    expect(await screen.findByText('7', { selector: '.bd-desk-clock b' })).toBeInTheDocument();
+    expect(tc.textContent).not.toMatch(/\d\d:\d\d/);
+  });
+  it('Help pill toggles the help panel', async () => {
+    page();
+    const btn = await screen.findByRole('button', { name: /Help/ });
+    expect(btn).toHaveAttribute('aria-expanded', 'false');
+    btn.click();
+    await screen.findByText(/Tally vs signal/);
+    expect(btn).toHaveAttribute('aria-expanded', 'true');
+  });
 });
