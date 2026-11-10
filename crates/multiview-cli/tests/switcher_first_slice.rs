@@ -476,7 +476,7 @@ async fn http_cut_after_cold_preview_lease_changes_received_program_and_monitor(
         .as_str()
         .expect("accepted operation id")
         .to_owned();
-    assert!(!operation_id.is_empty());
+    assert_ne!(operation_id, "");
     let terminal = tokio::time::timeout(Duration::from_secs(15), async {
         loop {
             let item = terminal_events

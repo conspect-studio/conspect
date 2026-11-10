@@ -32,7 +32,10 @@ fn energy(samples: &[f32], hz: f64) -> f64 {
     let mut re = 0.0;
     let mut im = 0.0;
     for (i, frame) in samples.chunks_exact(2).enumerate() {
-        let phase = std::f64::consts::TAU * hz * i as f64 / 48_000.0;
+        let phase = std::f64::consts::TAU
+            * hz
+            * f64::from(u16::try_from(i).expect("40ms fixture block fits u16"))
+            / 48_000.0;
         re += f64::from(frame[0]) * phase.cos();
         im += f64::from(frame[0]) * phase.sin();
     }
@@ -62,8 +65,8 @@ async fn assert_tone(tap: &ProgramAudioSlot, wanted: f64, absent: f64) {
     .expect("three consecutive actual PCM blocks contain only selected tone");
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 3)]
-async fn real_cut_follows_program_audio_and_never_mixes_preview() {
+// Keep the real A/V fixture alive for the entire pipeline run.
+fn real_av_pipeline() -> (tempfile::TempDir, Pipeline) {
     let dir = tempfile::tempdir().unwrap();
     let clip = dir.path().join("preview.ts");
     let generated = std::process::Command::new("ffmpeg")
@@ -138,7 +141,13 @@ preview_source="clip"
     );
     let cfg = MultiviewConfig::load_from_toml(&config).unwrap();
     cfg.validate().unwrap();
-    let mut pipeline = Pipeline::build(&cfg).unwrap();
+    let pipeline = Pipeline::build(&cfg).unwrap();
+    (dir, pipeline)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+async fn real_cut_follows_program_audio_and_never_mixes_preview() {
+    let (_fixture, mut pipeline) = real_av_pipeline();
     pipeline.enable_program_audio();
     let tap = ProgramAudioSlot::new();
     pipeline.set_program_audio_preview(tap.clone());
