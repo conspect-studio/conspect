@@ -192,3 +192,11 @@
 .bd-health{margin-right:auto}
 .bd-brand{flex:none}
 }
+@media(min-width:768px) and (max-width:1279px){
+.bd-wordmark{display:none}
+.bd-brand{min-width:48px;justify-content:center;padding:0}
+.bd-health [role=status]{flex-wrap:nowrap}
+.bd-health [role=status]>.text-muted-foreground{display:none}
+.bd-lock{white-space:nowrap}
+}
+@media(min-width:768px) and (max-width:1279px){.bd-health{flex:none;min-width:max-content}.bd-tabs{min-width:0;overflow:hidden}}
