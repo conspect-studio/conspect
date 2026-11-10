@@ -459,13 +459,21 @@ fn atomic_write_fenced(path: &Path, bytes: &[u8], fence: &PublishFence) -> Resul
     );
     name.push(format!(".{}.{seq}.tmp", std::process::id()));
     let tmp = path.with_file_name(name);
-    {
+    let written = (|| {
         let mut file = std::fs::File::create(&tmp)
             .map_err(|e| Error::Output(format!("creating temp file {}: {e}", tmp.display())))?;
         file.write_all(bytes)
             .map_err(|e| Error::Output(format!("writing temp file {}: {e}", tmp.display())))?;
         file.sync_all()
-            .map_err(|e| Error::Output(format!("fsync temp file {}: {e}", tmp.display())))?;
+            .map_err(|e| Error::Output(format!("fsync temp file {}: {e}", tmp.display())))
+    })();
+    if let Err(e) = written {
+        // Never leave this write's unique temp behind on a failed write/fsync,
+        // or a persistently failing disk would accumulate one file per attempt.
+        match std::fs::remove_file(&tmp) {
+            Ok(()) | Err(_) => {}
+        }
+        return Err(e);
     }
     let mut renamed = || {
         std::fs::rename(&tmp, path).map_err(|e| {
@@ -485,6 +493,44 @@ fn atomic_write_fenced(path: &Path, bytes: &[u8], fence: &PublishFence) -> Resul
         }
     }
     outcome.map(|_| ())
+}
+
+/// Remove background temps (`<name>.<pid>.<seq>.tmp`) of `playlist_path` left by
+/// a crashed process. Only names of that exact shape for this playlist whose
+/// `<pid>` is not this process are removed, so a concurrently running publisher
+/// of this process (and any foreign file) is never touched.
+fn remove_stale_temps(playlist_path: &Path) {
+    let (Some(dir), Some(base)) = (
+        playlist_path.parent(),
+        playlist_path.file_name().and_then(std::ffi::OsStr::to_str),
+    ) else {
+        return;
+    };
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    let me = std::process::id().to_string();
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(rest) = name
+            .to_str()
+            .and_then(|n| n.strip_prefix(base))
+            .and_then(|n| n.strip_prefix('.'))
+            .and_then(|n| n.strip_suffix(".tmp"))
+        else {
+            continue;
+        };
+        let mut parts = rest.split('.');
+        let (Some(pid), Some(seq), None) = (parts.next(), parts.next(), parts.next()) else {
+            continue;
+        };
+        let numeric = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
+        if numeric(pid) && numeric(seq) && pid != me {
+            match std::fs::remove_file(entry.path()) {
+                Ok(()) | Err(_) => {}
+            }
+        }
+    }
 }
 
 /// The visibility fence of one background publisher (#220). `Drop` of an
@@ -556,6 +602,14 @@ fn temp_path(path: &Path) -> PathBuf {
 /// it was dropped.
 pub type ManifestWriter = Arc<dyn Fn(&Path, &[u8], &PublishFence) -> Result<()> + Send + Sync>;
 
+/// The production background writer: unique temp + fsync + fenced rename.
+#[must_use]
+pub fn default_writer() -> ManifestWriter {
+    Arc::new(|path: &Path, bytes: &[u8], fence: &PublishFence| {
+        atomic_write_fenced(path, bytes, fence)
+    })
+}
+
 /// The most retired segments a run of failed publishes may carry before the
 /// oldest are dropped from the list (left on disk, never unlinked) — keeps a
 /// persistently failing disk from growing memory without bound.
@@ -599,6 +653,7 @@ impl std::fmt::Debug for BackgroundPublisher {
 
 impl BackgroundPublisher {
     fn spawn(playlist_path: PathBuf, writer: ManifestWriter) -> Result<Self> {
+        remove_stale_temps(&playlist_path);
         let shared = Arc::new(Shared {
             slot: Mutex::new(Slot::default()),
             wake: Condvar::new(),
@@ -750,13 +805,17 @@ impl BackgroundFile {
     /// # Errors
     /// Returns [`Error::Output`] if the thread cannot be spawned.
     pub fn spawn(path: PathBuf) -> Result<Self> {
+        Self::spawn_with(path, default_writer())
+    }
+
+    /// [`spawn`](Self::spawn) with an injectable writer (tests).
+    ///
+    /// # Errors
+    /// Returns [`Error::Output`] if the thread cannot be spawned.
+    #[doc(hidden)]
+    pub fn spawn_with(path: PathBuf, writer: ManifestWriter) -> Result<Self> {
         Ok(Self {
-            inner: BackgroundPublisher::spawn(
-                path,
-                Arc::new(|path: &Path, bytes: &[u8], fence: &PublishFence| {
-                    atomic_write_fenced(path, bytes, fence)
-                }),
-            )?,
+            inner: BackgroundPublisher::spawn(path, writer)?,
         })
     }
 
@@ -853,5 +912,48 @@ mod fenced_write_tests {
         }
         assert_eq!(seen.len(), 5, "every write landed");
         assert_eq!(tmp_files(dir.path()), Vec::<String>::new());
+    }
+}
+
+#[cfg(test)]
+mod temp_hygiene_tests {
+    use super::{atomic_write_fenced, remove_stale_temps, PublishFence};
+
+    #[test]
+    fn a_failed_write_leaves_no_temp() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        // The manifest path's parent is a file, so creating the temp fails.
+        let blocker = dir.path().join("not-a-dir");
+        std::fs::write(&blocker, b"x").expect("blocker");
+        let path = blocker.join("index.m3u8");
+        assert!(atomic_write_fenced(&path, b"#EXTM3U\n", &PublishFence::default()).is_err());
+        let left: Vec<_> = std::fs::read_dir(dir.path())
+            .expect("dir")
+            .flatten()
+            .map(|e| e.file_name())
+            .collect();
+        assert_eq!(left, vec![std::ffi::OsString::from("not-a-dir")]);
+    }
+
+    #[test]
+    fn stale_temps_of_other_processes_are_collected_and_nothing_else() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("index.m3u8");
+        let me = std::process::id();
+        let other = if me == 1 { 2 } else { me - 1 };
+        let names = [
+            format!("index.m3u8.{other}.7.tmp"), // stale: removed
+            format!("index.m3u8.{me}.3.tmp"),    // live publisher of this process: kept
+            "index.m3u8.tmp".to_owned(),         // synchronous writer's temp: kept
+            format!("other.m3u8.{other}.1.tmp"), // another playlist: kept
+            "index.m3u8".to_owned(),             // the manifest: kept
+        ];
+        for n in &names {
+            std::fs::write(dir.path().join(n), b"x").expect("fixture");
+        }
+        remove_stale_temps(&path);
+        for (i, n) in names.iter().enumerate() {
+            assert_eq!(dir.path().join(n).exists(), i != 0, "{n}");
+        }
     }
 }
