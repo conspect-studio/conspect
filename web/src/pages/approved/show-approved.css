@@ -38,9 +38,11 @@
 [data-approved-page="show"] .cue-line span:first-child { color: var(--text-3); }
 [data-approved-page="show"] .cue-line b { text-align: right; }
 [data-approved-page="show"] .cue-actions { margin-top: 12px; }
-@media (max-width: 1279px) {
+@media (max-width: 1023px) {
   [data-approved-page="show"] .show-grid { grid-template-columns: 1fr; }
-  [data-approved-page="show"] .cue-rail { grid-template-columns: 1fr 1fr; }
+  [data-approved-page="show"] .cue-rail { grid-template-columns: 1fr; }
+}
+@media (max-width: 1279px) {
   [data-approved-page="show"] .now-next { grid-template-columns: 1fr 1fr; }
   [data-approved-page="show"] .nn-actions { grid-column: 1 / -1; }
 }
@@ -61,3 +63,15 @@
 [data-approved-page="show"] .nn-note { color: var(--amber); border-left: 3px solid var(--amber-dim); padding-left: 8px; }
 [data-approved-page="show"] .rundown-empty { border-color: var(--amber-dim); }
 [data-approved-page="show"] .cue-actions + .nn-note { margin: 10px 0 0; }
+
+/* Fix13: two-column rundown + cue-card rail at >=1024; compact empty states. */
+@media (min-width: 1024px) {
+  [data-approved-page="show"] .show-grid { grid-template-columns: minmax(0, 1fr) minmax(280px, 340px); }
+}
+[data-approved-page="show"] .rundown-empty { min-height: 0; padding: 10px 14px; }
+[data-approved-page="show"] .rundown-empty b { margin-bottom: 0; }
+[data-approved-page="show"] .rundown-empty a { min-height: 48px; }
+[data-approved-page="show"] .cue-card { padding: 12px 16px; }
+[data-approved-page="show"] .cue-card h2 { margin-bottom: 8px; }
+[data-approved-page="show"] .cue-body { gap: 6px; }
+[data-approved-page="show"] .now-next { margin-bottom: 10px; }

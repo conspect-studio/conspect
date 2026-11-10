@@ -133,3 +133,20 @@
   [data-approved-page="media"] .vt-slot > button,
   [data-approved-page="media"] .vt-slot button[aria-controls] { display: none; }
 }
+
+/* Fix13: VT rack card composition (header row, one-line duration strip) and a proper phone action row. */
+[data-approved-page="media"] .vt-head { margin-bottom: 6px; flex-wrap: nowrap; }
+[data-approved-page="media"] .vt-head h3 { min-width: 0; }
+[data-approved-page="media"] .vt-tc { flex: none; font-size: 16px; }
+[data-approved-page="media"] .vt-scrub { min-height: 32px; margin: 6px 0; padding: 4px 10px; min-width: 0; overflow: hidden; }
+[data-approved-page="media"] .vt-scrub-note { flex-wrap: nowrap; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; min-width: 0; display: block; }
+[data-approved-page="media"] .vt-slot { padding: 12px; }
+[data-approved-page="media"] .vt-details { margin-top: 8px; }
+@media (max-width: 767px) {
+  [data-approved-page="media"] .vt-slot { display: grid; gap: 8px; }
+  [data-approved-page="media"] .vt-slot > * { min-width: 0; margin: 0; }
+  [data-approved-page="media"] .vt-slot > button,
+  [data-approved-page="media"] .vt-slot button[aria-controls] { width: 100%; margin: 0; }
+  [data-approved-page="media"] .vt-scrub-note { white-space: normal; }
+  [data-approved-page="media"] .vt-scrub { min-height: 32px; }
+}
