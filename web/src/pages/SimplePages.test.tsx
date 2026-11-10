@@ -100,6 +100,7 @@ describe("SourcesPage dialogs render over a populated table (smoke)", () => {
   it("opens the delete confirmation", async () => {
     renderSources();
     expect(await screen.findByText("Camera 1")).toBeInTheDocument();
+    await userEvent.click(screen.getByRole("button", { name: /^Details: Camera 1/ }));
     await userEvent.click(
       screen.getByRole("button", { name: "Delete source: Camera 1" }),
     );
@@ -109,6 +110,7 @@ describe("SourcesPage dialogs render over a populated table (smoke)", () => {
   it("opens the edit dialog (loads the record)", async () => {
     renderSources();
     expect(await screen.findByText("Camera 1")).toBeInTheDocument();
+    await userEvent.click(screen.getByRole("button", { name: /^Details: Camera 1/ }));
     await userEvent.click(
       screen.getByRole("button", { name: "Edit source: Camera 1" }),
     );
@@ -145,6 +147,7 @@ describe("SourcesPage honest surfaces", () => {
     expect(await screen.findByText("AoIP feed")).toBeInTheDocument();
     expect(screen.getByText("aes67")).toBeInTheDocument();
     // Edit is disabled with an accessible explanation; delete stays allowed.
+    await userEvent.click(screen.getByRole("button", { name: /^Details: AoIP feed/ }));
     const edit = screen.getByRole("button", { name: /Edit source: AoIP feed/ });
     expect(edit).toHaveAttribute("aria-disabled", "true");
     expect(edit.getAttribute("aria-label")).toMatch(/isn't editable in this UI/i);

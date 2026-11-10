@@ -74,6 +74,7 @@ afterAll(() => { server.close(); });
 describe('Network panel', () => {
   it('opens from an unlinked source row, POSTs, and shows IPv4 vs IPv6 side by side', async () => {
     renderWithProviders(<MemoryRouter><SourcesPage /></MemoryRouter>);
+    await userEvent.click(await screen.findByRole('button', { name: /^Details: KSHB 41/i }));
     await userEvent.click(await screen.findByRole('button', { name: /^network: kshb 41$/i }));
     const dialog = await screen.findByRole('dialog');
     const host = await within(dialog).findByTestId('net-host-content.uplynk.com');
@@ -98,6 +99,7 @@ describe('Network panel', () => {
 
   it('shows a DNS lookup failure for a host instead of empty records', async () => {
     renderWithProviders(<MemoryRouter><SourcesPage /></MemoryRouter>);
+    await userEvent.click(await screen.findByRole('button', { name: /^Details: KSHB 41/i }));
     await userEvent.click(await screen.findByRole('button', { name: /^network: kshb 41$/i }));
     const dialog = await screen.findByRole('dialog');
     const host = await within(dialog).findByTestId('net-host-keys.example.test');
@@ -108,6 +110,7 @@ describe('Network panel', () => {
   it('shows an error when the report cannot be fetched', async () => {
     server.use(http.post('*/api/v1/sources/:id/network', () => HttpResponse.json({ title: 'Forbidden', status: 403 }, { status: 403 })));
     renderWithProviders(<MemoryRouter><SourcesPage /></MemoryRouter>);
+    await userEvent.click(await screen.findByRole('button', { name: /^Details: KSHB 41/i }));
     await userEvent.click(await screen.findByRole('button', { name: /^network: kshb 41$/i }));
     expect(await screen.findByRole('alert')).toHaveTextContent('Forbidden');
   });
@@ -116,6 +119,7 @@ describe('Network panel', () => {
     const writeText = vi.fn().mockResolvedValue(undefined);
     Object.defineProperty(navigator, 'clipboard', { value: { writeText }, configurable: true });
     renderWithProviders(<MemoryRouter><SourcesPage /></MemoryRouter>);
+    await userEvent.click(await screen.findByRole('button', { name: /^Details: KSHB 41/i }));
     await userEvent.click(await screen.findByRole('button', { name: /^network: kshb 41$/i }));
     const dialog = await screen.findByRole('dialog');
     await userEvent.click(await within(dialog).findByRole('button', { name: 'Copy as text' }));
