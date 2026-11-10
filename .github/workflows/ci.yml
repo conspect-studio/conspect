@@ -569,7 +569,8 @@ jobs:
           apt-get update
           apt-get install -y --no-install-recommends \
             ca-certificates build-essential pkg-config clang libclang-dev nasm \
-            libva2 libva-drm2 libopus0 libsrt1.5-openssl libvpl2 libx264-dev libx265-dev
+            libva2 libva-drm2 libopus0 libsrt1.5-openssl libvpl2 libx264-dev libx265-dev \
+            libnuma1 libdrm2 libgnutls30t64
           export PKG_CONFIG_PATH="${FFMPEG_PREFIX}/lib/pkgconfig"
           export LD_LIBRARY_PATH="${FFMPEG_PREFIX}/lib"
           version="$(pkg-config --modversion libavcodec)"
