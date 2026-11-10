@@ -105,8 +105,8 @@ impl LivePlaylist {
     /// Returns [`Error::Output`] if the publisher thread cannot be spawned.
     pub fn enable_background_publish(&mut self) -> Result<()> {
         self.enable_background_publish_with(Arc::new(
-            |path: &Path, bytes: &[u8], cancelled: &dyn Fn() -> bool| {
-                atomic_write_fenced(path, bytes, cancelled)
+            |path: &Path, bytes: &[u8], fence: &PublishFence| {
+                atomic_write_fenced(path, bytes, fence)
             },
         ))
     }
@@ -444,12 +444,21 @@ pub(crate) fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
     })
 }
 
-/// [`atomic_write`] for a background publisher: identical, except the final
-/// `rename` is skipped (and the temp removed) when `cancelled` reports the
-/// publisher was abandoned while the write + fsync ran. Closes the window in
-/// which an abandoned run could still replace the next run's manifest.
-fn atomic_write_fenced(path: &Path, bytes: &[u8], cancelled: &dyn Fn() -> bool) -> Result<()> {
-    let tmp = temp_path(path);
+/// [`atomic_write`] for a background publisher. Two differences:
+/// * the temp file is unique per write (`<name>.<pid>.<seq>.tmp`), so an
+///   abandoned writer and the next run never share a temp inode;
+/// * the visibility step (`rename`) runs inside [`PublishFence::commit`], which
+///   holds the fence lock: an abandoned publisher (fence cancelled by `Drop`)
+///   never renames after `Drop` returned, and its own temp is removed.
+fn atomic_write_fenced(path: &Path, bytes: &[u8], fence: &PublishFence) -> Result<()> {
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let mut name = path.file_name().map_or_else(
+        || std::ffi::OsString::from("hls-publish"),
+        std::ffi::OsStr::to_os_string,
+    );
+    name.push(format!(".{}.{seq}.tmp", std::process::id()));
+    let tmp = path.with_file_name(name);
     {
         let mut file = std::fs::File::create(&tmp)
             .map_err(|e| Error::Output(format!("creating temp file {}: {e}", tmp.display())))?;
@@ -458,22 +467,69 @@ fn atomic_write_fenced(path: &Path, bytes: &[u8], cancelled: &dyn Fn() -> bool) 
         file.sync_all()
             .map_err(|e| Error::Output(format!("fsync temp file {}: {e}", tmp.display())))?;
     }
-    if cancelled() {
+    let mut renamed = || {
+        std::fs::rename(&tmp, path).map_err(|e| {
+            Error::Output(format!(
+                "renaming {} -> {}: {e}",
+                tmp.display(),
+                path.display()
+            ))
+        })
+    };
+    let outcome = fence.commit(&mut renamed);
+    // Remove our own temp whenever it was not renamed into place (cancelled or
+    // failed). A unique name means this can never touch another run's file.
+    if !matches!(outcome, Ok(true)) {
         match std::fs::remove_file(&tmp) {
             Ok(()) | Err(_) => {}
         }
-        return Ok(());
     }
-    std::fs::rename(&tmp, path).map_err(|e| {
-        match std::fs::remove_file(&tmp) {
-            Ok(()) | Err(_) => {}
+    outcome.map(|_| ())
+}
+
+/// The visibility fence of one background publisher (#220). `Drop` of an
+/// abandoned publisher cancels it under the same lock the final `rename` runs
+/// under, so cancellation and publication are serialized: after `cancel`
+/// returns, no rename of this publisher can start or be in progress. The lock is
+/// only held for the rename (never for the write or fsync), and the packet path
+/// never takes it while a run is live.
+#[derive(Debug, Default)]
+pub struct PublishFence {
+    cancelled: Mutex<bool>,
+}
+
+impl PublishFence {
+    /// Run `visible` (the rename) unless cancelled. Returns `Ok(true)` when it
+    /// ran and succeeded, `Ok(false)` when cancelled, or its error.
+    ///
+    /// # Errors
+    /// The error of `visible`.
+    pub fn commit(&self, visible: &mut dyn FnMut() -> Result<()>) -> Result<bool> {
+        let cancelled = self
+            .cancelled
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if *cancelled {
+            return Ok(false);
         }
-        Error::Output(format!(
-            "renaming {} -> {}: {e}",
-            tmp.display(),
-            path.display()
-        ))
-    })
+        visible().map(|()| true)
+    }
+
+    /// Whether the publisher was abandoned.
+    #[must_use]
+    pub fn is_cancelled(&self) -> bool {
+        *self
+            .cancelled
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn cancel(&self) {
+        *self
+            .cancelled
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = true;
+    }
 }
 
 /// Derive the same-directory temp path for `path` by appending a `.tmp` suffix to
@@ -495,9 +551,10 @@ fn temp_path(path: &Path) -> PathBuf {
 /// A manifest writer: `(path, bytes)` → durable atomic publish. Production uses
 /// [`atomic_write`]; tests inject slow or failing writers.
 ///
-/// The third argument reports whether the publisher was abandoned; a writer
-/// must not make a new manifest visible once it returns `true`.
-pub type ManifestWriter = Arc<dyn Fn(&Path, &[u8], &dyn Fn() -> bool) -> Result<()> + Send + Sync>;
+/// The writer must make the manifest visible only through
+/// [`PublishFence::commit`], so an abandoned publisher can never publish after
+/// it was dropped.
+pub type ManifestWriter = Arc<dyn Fn(&Path, &[u8], &PublishFence) -> Result<()> + Send + Sync>;
 
 /// The most retired segments a run of failed publishes may carry before the
 /// oldest are dropped from the list (left on disk, never unlinked) — keeps a
@@ -518,14 +575,13 @@ struct Slot {
     pending: Pending,
     error: Option<String>,
     finished: bool,
-    /// Set by `Drop` on an abandoned publisher: no further write may start.
-    cancelled: bool,
 }
 
 /// Latest-wins hand-off between the sink (producer) and the `hls-publish` thread.
 struct Shared {
     slot: Mutex<Slot>,
     wake: Condvar,
+    fence: PublishFence,
 }
 
 /// The off-packet-path manifest publisher (#220).
@@ -546,6 +602,7 @@ impl BackgroundPublisher {
         let shared = Arc::new(Shared {
             slot: Mutex::new(Slot::default()),
             wake: Condvar::new(),
+            fence: PublishFence::default(),
         });
         let worker = Arc::clone(&shared);
         let thread = std::thread::Builder::new()
@@ -592,17 +649,18 @@ impl BackgroundPublisher {
 impl Drop for BackgroundPublisher {
     fn drop(&mut self) {
         // An abandoned (never finalized) playlist — e.g. a sink that errored on
-        // its packet thread. Never block here (the writer could be stuck in a
-        // slow fsync): fence instead. `cancelled` is checked under the slot lock
-        // immediately before every write, so once this returns no further write
-        // to this path can start; a write already in progress finishes on its
-        // own thread and is the only one that can still land.
+        // its packet thread. Never wait for a write or fsync here: cancel the
+        // fence instead. Once this returns, this publisher cannot make any
+        // manifest visible; an in-flight write removes its own unique temp.
         let mut slot = lock(&self.shared.slot);
         slot.finished = true;
-        slot.cancelled = true;
         slot.pending = Pending::default();
         drop(slot);
         self.shared.wake.notify_one();
+        // Serialized with the publisher's rename: waits at most for one
+        // in-flight rename (never a write or fsync), after which no rename of
+        // this publisher can happen.
+        self.shared.fence.cancel();
         // Detach: the thread exits after its current (if any) write.
         drop(self.thread.take());
     }
@@ -628,11 +686,10 @@ fn lock(m: &Mutex<Slot>) -> std::sync::MutexGuard<'_, Slot> {
 /// publish keeps its retired segments for the next attempt and records the error.
 fn publish_one(shared: &Shared, playlist_path: &Path, writer: &ManifestWriter, job: Pending) {
     let Some(text) = job.text else { return };
-    let cancelled = || lock(&shared.slot).cancelled;
-    if cancelled() {
+    if shared.fence.is_cancelled() {
         return;
     }
-    match writer(playlist_path, text.as_bytes(), &cancelled) {
+    match writer(playlist_path, text.as_bytes(), &shared.fence) {
         Ok(()) => {
             let references = playlist_path.parent().and_then(media_segment_references);
             if let Some(references) = references {
@@ -696,8 +753,8 @@ impl BackgroundFile {
         Ok(Self {
             inner: BackgroundPublisher::spawn(
                 path,
-                Arc::new(|path: &Path, bytes: &[u8], cancelled: &dyn Fn() -> bool| {
-                    atomic_write_fenced(path, bytes, cancelled)
+                Arc::new(|path: &Path, bytes: &[u8], fence: &PublishFence| {
+                    atomic_write_fenced(path, bytes, fence)
                 }),
             )?,
         })
@@ -723,5 +780,78 @@ impl BackgroundFile {
     pub fn finish(self, text: String) -> Result<()> {
         self.inner.submit(text, Vec::new(), true);
         self.inner.join()
+    }
+}
+
+#[cfg(test)]
+mod fenced_write_tests {
+    use super::{atomic_write_fenced, PublishFence};
+
+    fn tmp_files(dir: &std::path::Path) -> Vec<String> {
+        std::fs::read_dir(dir)
+            .map(|entries| {
+                entries
+                    .flatten()
+                    .map(|e| e.file_name().to_string_lossy().into_owned())
+                    .filter(|n| {
+                        std::path::Path::new(n)
+                            .extension()
+                            .is_some_and(|e| e.eq_ignore_ascii_case("tmp"))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    #[test]
+    fn a_live_fence_publishes_and_leaves_no_temp() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("index.m3u8");
+        let fence = PublishFence::default();
+        atomic_write_fenced(&path, b"#EXTM3U\nA\n", &fence).expect("publish");
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("read"),
+            "#EXTM3U\nA\n"
+        );
+        assert_eq!(
+            tmp_files(dir.path()),
+            Vec::<String>::new(),
+            "no temp may remain"
+        );
+    }
+
+    #[test]
+    fn a_cancelled_fence_never_replaces_the_manifest_and_removes_only_its_temp() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("index.m3u8");
+        std::fs::write(&path, b"#EXTM3U\nNEXT-RUN\n").expect("next run's manifest");
+        // Another run's temp in the same directory must survive.
+        let foreign = dir.path().join("index.m3u8.tmp");
+        std::fs::write(&foreign, b"foreign").expect("foreign temp");
+        let fence = PublishFence::default();
+        fence.cancel();
+        atomic_write_fenced(&path, b"#EXTM3U\nOLD-RUN\n", &fence)
+            .expect("cancelled is not an error");
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("read"),
+            "#EXTM3U\nNEXT-RUN\n"
+        );
+        assert_eq!(tmp_files(dir.path()), vec!["index.m3u8.tmp".to_owned()]);
+    }
+
+    #[test]
+    fn each_write_uses_a_distinct_temp_name() {
+        // Unique temps mean two publishers of one path never share an inode.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("index.m3u8");
+        let fence = PublishFence::default();
+        let mut seen = std::collections::HashSet::new();
+        for i in 0..5 {
+            atomic_write_fenced(&path, format!("#EXTM3U\n{i}\n").as_bytes(), &fence)
+                .expect("publish");
+            seen.insert(std::fs::read_to_string(&path).expect("read"));
+        }
+        assert_eq!(seen.len(), 5, "every write landed");
+        assert_eq!(tmp_files(dir.path()), Vec::<String>::new());
     }
 }

@@ -46,6 +46,13 @@ successful publish, never unlink a segment any on-disk manifest still lists), bu
    and never written inline). Pruning of the previous run's files still waits until the
    on-disk master equals the new text; `finish` publishes the master if a short run closed
    before its media writes landed, then reaps the prior generations.
+8. **No write outlives its run.** `Drop` of an abandoned publisher (an errored sink) never
+   waits for a write or fsync. It cancels a `PublishFence`; the background writer makes a
+   manifest visible only inside `PublishFence::commit`, which holds the fence lock for the
+   rename alone, so cancellation and publication are serialized — after `Drop` returns, that
+   publisher can no longer rename. Every background write uses a unique temp name
+   (`<name>.<pid>.<seq>.tmp`) and removes only its own temp, so two runs never share a temp
+   inode. `Drop` can wait at most for one in-flight `rename` (metadata only), never an fsync.
 7. A surfaced publish error re-queues the committed (failed) manifest and does not commit
    the close that observed it, so the next successful publish still lists every URI the
    failed manifest listed. The carried retired list is re-capped after every merge.

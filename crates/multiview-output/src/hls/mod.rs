@@ -34,7 +34,7 @@ mod pdt;
 
 #[cfg(feature = "ffmpeg")]
 pub(crate) use live::{media_segment_references, media_segment_uris};
-pub use live::{BackgroundFile, LivePlaylist, ManifestWriter};
+pub use live::{BackgroundFile, LivePlaylist, ManifestWriter, PublishFence};
 pub use master::{AudioRendition, MasterPlaylist, VariantStream};
 pub use media::{MediaPlaylist, Part, Segment, SegmentType, ServerControl};
 pub use pdt::format_program_date_time;

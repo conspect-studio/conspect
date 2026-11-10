@@ -315,10 +315,16 @@ fn background_publish_never_blocks_on_a_slow_manifest_write() {
     let dir = tempfile::tempdir().expect("tempdir");
     let manifest = dir.path().join("index.m3u8");
     let mut live = LivePlaylist::new(manifest.clone(), WINDOW);
-    let slow: multiview_output::hls::ManifestWriter = Arc::new(|path, bytes, _cancelled| {
-        std::thread::sleep(Duration::from_millis(300));
-        std::fs::write(path, bytes).map_err(|e| multiview_output::Error::Output(e.to_string()))
-    });
+    let slow: multiview_output::hls::ManifestWriter =
+        Arc::new(|path, bytes, fence: &multiview_output::hls::PublishFence| {
+            std::thread::sleep(Duration::from_millis(300));
+            fence
+                .commit(&mut || {
+                    std::fs::write(path, bytes)
+                        .map_err(|e| multiview_output::Error::Output(e.to_string()))
+                })
+                .map(|_| ())
+        });
     live.enable_background_publish_with(slow)
         .expect("publisher");
 
@@ -388,8 +394,8 @@ fn background_publish_failure_surfaces_and_prunes_nothing() {
     let mut live = LivePlaylist::new(manifest, 1);
     let failing = Arc::new(AtomicBool::new(true));
     let gate = Arc::clone(&failing);
-    let writer: multiview_output::hls::ManifestWriter =
-        Arc::new(move |_path, _bytes, _cancelled| {
+    let writer: multiview_output::hls::ManifestWriter = Arc::new(
+        move |_path, _bytes, _fence: &multiview_output::hls::PublishFence| {
             if gate.load(Ordering::SeqCst) {
                 Err(multiview_output::Error::Output(
                     "injected disk failure".to_owned(),
@@ -397,7 +403,8 @@ fn background_publish_failure_surfaces_and_prunes_nothing() {
             } else {
                 Ok(())
             }
-        });
+        },
+    );
     live.enable_background_publish_with(writer)
         .expect("publisher");
 
@@ -445,16 +452,23 @@ fn background_publish_recovers_without_skipping_the_failed_manifest() {
     let calls = Arc::new(AtomicUsize::new(0));
     let written: Arc<Mutex<Vec<String>>> = Arc::default();
     let (c, w) = (Arc::clone(&calls), Arc::clone(&written));
-    let writer: multiview_output::hls::ManifestWriter = Arc::new(move |path, bytes, _cancelled| {
-        // The second publish fails once; every other publish succeeds.
-        if c.fetch_add(1, Ordering::SeqCst) == 1 {
-            return Err(multiview_output::Error::Output("injected".to_owned()));
-        }
-        w.lock()
-            .unwrap()
-            .push(String::from_utf8_lossy(bytes).into_owned());
-        std::fs::write(path, bytes).map_err(|e| multiview_output::Error::Output(e.to_string()))
-    });
+    let writer: multiview_output::hls::ManifestWriter = Arc::new(
+        move |path, bytes, fence: &multiview_output::hls::PublishFence| {
+            // The second publish fails once; every other publish succeeds.
+            if c.fetch_add(1, Ordering::SeqCst) == 1 {
+                return Err(multiview_output::Error::Output("injected".to_owned()));
+            }
+            w.lock()
+                .unwrap()
+                .push(String::from_utf8_lossy(bytes).into_owned());
+            fence
+                .commit(&mut || {
+                    std::fs::write(path, bytes)
+                        .map_err(|e| multiview_output::Error::Output(e.to_string()))
+                })
+                .map(|_| ())
+        },
+    );
     live.enable_background_publish_with(writer)
         .expect("publisher");
 
@@ -500,13 +514,16 @@ fn dropping_a_background_playlist_quiesces_its_writer() {
     let mut live = LivePlaylist::new(manifest.clone(), 2);
     // A slow write that, like the production writer, checks the fence right
     // before making the manifest visible.
-    let slow: multiview_output::hls::ManifestWriter = Arc::new(|path, bytes, cancelled| {
-        std::thread::sleep(Duration::from_millis(200));
-        if cancelled() {
-            return Ok(());
-        }
-        std::fs::write(path, bytes).map_err(|e| multiview_output::Error::Output(e.to_string()))
-    });
+    let slow: multiview_output::hls::ManifestWriter =
+        Arc::new(|path, bytes, fence: &multiview_output::hls::PublishFence| {
+            std::thread::sleep(Duration::from_millis(200));
+            fence
+                .commit(&mut || {
+                    std::fs::write(path, bytes)
+                        .map_err(|e| multiview_output::Error::Output(e.to_string()))
+                })
+                .map(|_| ())
+        });
     live.enable_background_publish_with(slow)
         .expect("publisher");
     let path = touch_segment(dir.path(), "seg0.ts");
