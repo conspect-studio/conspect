@@ -8,7 +8,7 @@
 // Saved is always explicit, per-strip Undo is a LOCAL draft revert, and the
 // save status reports exactly the server's X-Multiview-Apply (live / partial /
 // restart) plus its authoritative outputs_updated report.
-import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import { fireEvent, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { http, HttpResponse } from "msw";
@@ -214,7 +214,8 @@ describe("AudioPage", () => {
     const nudges = within(focused).getByTestId("audio-nudges");
     expect(fader.compareDocumentPosition(mute) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
     expect(fader.compareDocumentPosition(nudges) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
-    expect(fader).toHaveClass("h-12", "w-60");
+    // The fader is a custom pointer-event slider (not a rotated native range).
+    expect(fader).toHaveAttribute("role", "slider");
     // Tablet first-fold contract: all essential keys share the fader's two
     // rows, not a stack below its 240 px track. Browser evidence also checks
     // every control's rectangle and hit target against the fixed footer.
@@ -306,7 +307,7 @@ describe("AudioPage", () => {
     );
     expect(within(focused).getByTestId("audio-strip-readout")).toHaveTextContent(/Draft 2 dB/s);
     // The fader PINS at its 0 dB top while the readout carries the exact +2.
-    expect(within(focused).getByTestId("audio-fader")).toHaveValue("0");
+    expect(within(focused).getByTestId("audio-fader")).toHaveAttribute("aria-valuenow", "0");
     expect(lastPut).toBeUndefined();
   });
 
@@ -314,8 +315,12 @@ describe("AudioPage", () => {
     renderAudio();
     const { focused } = await console();
     const fader = within(focused).getByTestId("audio-fader");
-    // A drag (input event) stages the draft; nothing is sent.
-    fireEvent.input(fader, { target: { value: "-12" } });
+    // A drag (pointer events) stages the draft; nothing is sent. The fader
+    // track is 240 px tall in a real browser; jsdom has no layout, so stub it.
+    // -12 dB = 80% up the 192 px knob-centre travel => y = 24 + 192 * 0.2.
+    vi.spyOn(fader, "getBoundingClientRect").mockReturnValue(new DOMRect(0, 0, 56, 240));
+    fireEvent.pointerDown(fader, { pointerId: 1, clientY: 24 + 192 * 0.2, button: 0 });
+    fireEvent.pointerUp(fader, { pointerId: 1, clientY: 24 + 192 * 0.2 });
     expect(within(focused).getByTestId("audio-strip-readout")).toHaveTextContent(/Draft -12 dB/s);
     expect(within(focused).getByTestId("audio-strip-readout")).toHaveTextContent(/Saved -3 dB/s);
     expect(lastPut).toBeUndefined();
@@ -330,6 +335,31 @@ describe("AudioPage", () => {
     fireEvent.keyDown(fader, { key: "Escape" });
     expect(within(focused).getByTestId("audio-strip-readout")).toHaveTextContent(/Draft -3 dB/s);
     expect(within(focused).getByTestId("audio-strip-readout")).toHaveTextContent(/Saved -3 dB/s);
+    expect(lastPut).toBeUndefined();
+  });
+
+  it("two bank faders driven by interleaved pointers in the same frame both keep their draft (no lost update)", async () => {
+    renderAudio();
+    await console();
+    await userEvent.click(screen.getByTestId("audio-add-route"));
+    const bank = screen.getByTestId("audio-bank");
+    const faders = within(bank).getAllByTestId("audio-fader");
+    const [a, b] = [required(faders[0], "fader 1"), required(faders[1], "fader 2")];
+    for (const f of [a, b]) vi.spyOn(f, "getBoundingClientRect").mockReturnValue(new DOMRect(0, 0, 56, 240));
+    const pe = (type: string, id: number, y: number): PointerEvent => {
+      const e = new MouseEvent(type, { bubbles: true, cancelable: true, clientY: y, button: 0 });
+      Object.defineProperty(e, "pointerId", { value: id });
+      Object.defineProperty(e, "pointerType", { value: "touch" });
+      return e as unknown as PointerEvent;
+    };
+    const y = (db: number): number => 24 + 192 * (1 - (db + 60) / 60);
+    // Dispatch both moves back to back, with no React flush between them.
+    fireEvent(a, pe("pointerdown", 1, y(Number(a.getAttribute("aria-valuenow")))));
+    fireEvent(b, pe("pointerdown", 2, y(Number(b.getAttribute("aria-valuenow")))));
+    fireEvent(a, pe("pointermove", 1, y(-20)));
+    fireEvent(b, pe("pointermove", 2, y(-40)));
+    expect(a).toHaveAttribute("aria-valuenow", "-20");
+    expect(b).toHaveAttribute("aria-valuenow", "-40");
     expect(lastPut).toBeUndefined();
   });
 
@@ -529,7 +559,8 @@ describe("AudioPage", () => {
     expect(gain).toHaveValue("-");
     expect(within(focused).getByTestId("audio-strip-readout")).toHaveTextContent(/invalid gain/i);
     for (const button of within(focused).getAllByTestId("audio-nudge")) expect(button).toBeDisabled();
-    expect(within(focused).getByTestId("audio-fader")).toBeDisabled();
+    // A custom slider is disabled via aria-disabled (no native disabled attr).
+    expect(within(focused).getByTestId("audio-fader")).toHaveAttribute("aria-disabled", "true");
     await userEvent.click(screen.getByTestId("audio-save"));
     expect(lastPut).toBeUndefined();
     expect(gain).toHaveValue("-");

@@ -87,6 +87,8 @@ import {
   AudioSurface,
 } from './approved/AudioSurface';
 import { useAudioLoudness } from '../realtime/useAudioLoudness';
+import { Fader } from './approved/Fader';
+import { TapButton } from './approved/TapButton';
 import { Badge } from '../components/ui/badge';
 import { Button } from '../components/ui/button';
 
@@ -257,7 +259,7 @@ function ChannelStrip({
   readonly onChange: (next: AudioRouteRow) => void;
   readonly onRemove: () => void;
   /** Registers the fader element (the xl bank wires overview taps to it). */
-  readonly registerFader?: (element: HTMLInputElement | null) => void;
+  readonly registerFader?: (element: HTMLElement | null) => void;
   /** Unique field-id prefix for this surface (bank vs focused). */
   readonly idPrefix: string;
 }): JSX.Element {
@@ -351,10 +353,10 @@ function ChannelStrip({
             className="fader-fill"
             style={{ height: `calc(24px + (100% - 48px) * ${String(faderPos(faderDisplayDb(draftDb ?? 0)))})` }}
           />
-          <input
-            type="range"
-            ref={registerFader}
+          <Fader
+            elementRef={registerFader}
             data-testid="audio-fader"
+            data-staged={draftDb !== undefined && savedDb !== undefined && savedDb !== draftDb}
             min={GAIN_FADER_MIN_DB}
             max={GAIN_FADER_MAX_DB}
             step={1}
@@ -368,9 +370,8 @@ function ChannelStrip({
                   ? t`draft ${formatDb(draftDb)} dB, saved ${formatDb(savedDb)} dB`
                   : t`${formatDb(draftDb)} dB`
             }
-            className="absolute left-1/2 top-1/2 h-12 w-60 max-w-none -translate-x-1/2 -translate-y-1/2 -rotate-90 cursor-pointer accent-primary"
-            onChange={(event): void => {
-              setGain(formatDb(Number(event.target.value)));
+            onValueChange={(next): void => {
+              setGain(formatDb(next));
             }}
             onKeyDown={(event): void => {
               if (event.key === 'PageUp') {
@@ -391,7 +392,7 @@ function ChannelStrip({
       {/* ±1 / ±6 dB tap nudges (48 px) stacked beside the fader like the approved side-stack; staged exactly like the drag. */}
       <div className="audio-nudge-col" data-testid="audio-nudges">
         {([6, 1, -1, -6] as const).map((delta) => (
-          <Button
+          <TapButton
             key={delta}
             type="button"
             variant="outline"
@@ -403,12 +404,12 @@ function ChannelStrip({
             }
             className="audio-nudge-btn h-12 min-w-12 p-0 font-mono"
             disabled={draftDb === undefined}
-            onClick={(): void => {
+            onTap={(): void => {
               setGain(nudgeGainDb(route.gainDb, delta));
             }}
           >
             {delta > 0 ? `+${String(delta)}` : `−${String(Math.abs(delta))}`}
-          </Button>
+          </TapButton>
         ))}
       </div>
         <InputMeterColumn sample={inputSample} />
@@ -417,32 +418,32 @@ function ChannelStrip({
       {/* The strip keys: MUTE and PGM (program-bus include) — draft toggles,
           pressed state visible by style AND text in the status line. */}
       <div className="audio-strip-keys flex flex-wrap items-center gap-2">
-        <Button
+        <TapButton
           type="button"
           variant="outline"
           data-testid="audio-mute"
           aria-pressed={route.mute}
           aria-label={t`${label} MUTE`}
           className="h-12 min-w-12 px-4 aria-pressed:border-destructive/60 aria-pressed:bg-destructive/15 aria-pressed:text-destructive"
-          onClick={(): void => {
+          onTap={(): void => {
             onChange({ ...route, mute: !route.mute });
           }}
         >
           {t`MUTE`}
-        </Button>
-        <Button
+        </TapButton>
+        <TapButton
           type="button"
           variant="outline"
           data-testid="audio-pgm"
           aria-pressed={route.includeInProgramBus}
           aria-label={t`${label} PGM (include in the program mix)`}
           className="h-12 min-w-12 px-4 aria-pressed:border-status-live/60 aria-pressed:bg-status-live/15"
-          onClick={(): void => {
+          onTap={(): void => {
             onChange({ ...route, includeInProgramBus: !route.includeInProgramBus });
           }}
         >
           {t`PGM`}
-        </Button>
+        </TapButton>
         <span
           data-testid="audio-strip-listen-note"
           className="audio-listen-note text-xs text-muted-foreground"
@@ -931,13 +932,22 @@ export function AudioPage(): JSX.Element {
   const [busSetupOpen, setBusSetupOpen] = useState(false);
   // The xl bank's faders, so an overview tap can hand keyboard focus to the
   // channel it rides (below xl the focused strip follows the tap instead).
-  const bankFaders = useRef<Map<number, HTMLInputElement>>(new Map());
+  const bankFaders = useRef<Map<number, HTMLElement>>(new Map());
 
   const form =
     edited ??
     (routing.data !== undefined
       ? audioFormFromDocument(routing.data.state.routing)
       : undefined);
+  // Multi-touch: two faders can emit pointermove in the same frame, before
+  // React re-renders. Each handler must build on the LATEST draft (this ref is
+  // refreshed every render and advanced synchronously by update()), never on
+  // the render-time `form` closure, or the second finger would overwrite the
+  // first finger's fader.
+  const latestForm = useRef<AudioFormState | undefined>(form);
+  useEffect(() => {
+    latestForm.current = form;
+  });
   const serverForm = baseline?.form ?? (routing.data !== undefined
     ? audioFormFromDocument(routing.data.state.routing) : undefined);
   const rowIds = draftRowIds ?? form?.routes.map((_, index) => index) ?? [];
@@ -975,6 +985,7 @@ export function AudioPage(): JSX.Element {
       setBaseline({ form: serverForm, etag: routing.data.etag, rowIds });
       nextRowId.current = Math.max(nextRowId.current, ...rowIds.map((id) => id + 1));
     }
+    latestForm.current = next;
     setDraftRowIds(nextIds);
     setEdited(next);
     setStatus('idle');
@@ -1241,7 +1252,7 @@ export function AudioPage(): JSX.Element {
                         }
                       }}
                       onChange={(next): void => {
-                        update(withRoute(form, index, next));
+                        update(withRoute(latestForm.current ?? form, index, next));
                       }}
                       onRemove={(): void => {
                         update({
@@ -1279,7 +1290,7 @@ export function AudioPage(): JSX.Element {
                 onDetailsOpenChange={setStripDetailsOpen}
                 idPrefix={`audio-focused-route-${String(focused + 1)}`}
                 onChange={(next): void => {
-                  update(withRoute(form, focused, next));
+                  update(withRoute(latestForm.current ?? form, focused, next));
                 }}
                 onRemove={(): void => {
                   update({
