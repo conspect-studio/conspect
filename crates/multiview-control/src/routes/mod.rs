@@ -1264,11 +1264,20 @@ pub fn api_router() -> Router<AppState> {
         // Media-player transport surface (ADR-0057/ADR-0097): read + the
         // load/cue/play/pause/stop/seek verbs + the vamp-exit arm/take/cancel
         // triad, each 202 + op id onto the bounded command bus.
-        .route("/media/captures/capabilities", get(web_capture::capabilities))
+        .route(
+            "/media/captures/capabilities",
+            get(web_capture::capabilities),
+        )
         .route("/media/captures", post(web_capture::create))
         .route("/media/captures/{id}", get(web_capture::get))
-        .route("/media/captures/{id}/artifact", get(web_capture::artifact))
-        .route("/media/captures/{id}/cancel", post(web_capture::cancel))
+        .route(
+            "/media/captures/{id}/artifact",
+            get(web_capture::artifact),
+        )
+        .route(
+            "/media/captures/{id}/cancel",
+            post(web_capture::cancel),
+        )
         .route("/media/players", get(media_players::list_players))
         .route("/media/players/{id}", get(media_players::get_player))
         .route("/media/players/{id}/load", post(media_players::load_player))
