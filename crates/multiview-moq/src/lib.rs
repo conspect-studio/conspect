@@ -202,10 +202,10 @@ impl VideoAdapter {
                 previous.finish().map_err(|_| Reject::Transport)?;
                 if let Some(groups) = &mut self.cancel_groups {
                     groups.push_back(previous);
-                    if groups.len() > 4 {
-                        if let Some(old) = groups.pop_front() {
-                            let _ = old.abort(moq_net::Error::Old);
-                        }
+                    if groups.len() > 4
+                        && let Some(old) = groups.pop_front()
+                    {
+                        let _ = old.abort(moq_net::Error::Old);
                     }
                 }
             }

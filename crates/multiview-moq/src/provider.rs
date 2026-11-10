@@ -2059,16 +2059,14 @@ mod tests {
         let budget =
             UplinkBudget::from_ladder(&ladder, Some(10_000_000), Default::default()).unwrap();
         let admitted = AdmittedLadder::new(ladder, publication, budget);
-        let mut track = admitted
+        let consumer = admitted
             .publication
             .lock()
             .unwrap()
             .rendition_track(0)
             .unwrap()
-            .consume()
-            .subscribe(retain())
-            .await
-            .unwrap();
+            .consume();
+        let mut track = consumer.subscribe(retain()).await.unwrap();
         admitted.publish(&ladder_tick(5, 0, 1)).unwrap();
         let mut old = track.recv_group().await.unwrap().unwrap();
         old.read_frame().await.unwrap().unwrap();

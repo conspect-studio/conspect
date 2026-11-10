@@ -564,18 +564,26 @@ async fn serve_control_plane(
     // startup window where a promote skips suppression. `bind_and_serve`
     // installs it for every config-file run (a boot model is wired), so it is
     // present here.
+    let watch = start_config_watch(start, config_path, &state);
+    Ok((handle, command_rx, hub, watch, persist))
+}
+
+fn start_config_watch(
+    start: &multiview_cli::boot::StartConfig,
+    config_path: &Path,
+    state: &multiview_control::AppState,
+) -> multiview_cli::config_watch::ConfigWatchHandle {
     let mut watch_options = multiview_cli::config_watch::WatchOptions::default()
         .with_initial_observed(start.boot_text.clone());
     if let Some(installed) = state.watch_handle() {
         watch_options = watch_options.with_handle(installed);
     }
-    let watch = multiview_cli::config_watch::spawn(
+    multiview_cli::config_watch::spawn(
         config_path.to_path_buf(),
-        config.clone(),
+        start.running.clone(),
         state.clone(),
         watch_options,
-    );
-    Ok((handle, command_rx, hub, watch, persist))
+    )
 }
 
 /// Drive the ingest/composite/encode pipeline until Ctrl-C while **also**
