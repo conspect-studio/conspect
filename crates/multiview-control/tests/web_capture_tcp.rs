@@ -46,12 +46,31 @@ fn json(response: &str) -> serde_json::Value {
 #[allow(clippy::too_many_lines)] // One server lifetime covers the complete authorized transaction.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn actual_tcp_post_runs_service_and_returns_owner_scoped_artifact() {
+    capture_flow(false).await;
+}
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn actual_browser_http_post_commits_decodable_artifact() {
+    capture_flow(true).await;
+}
+#[allow(clippy::too_many_lines)]
+async fn capture_flow(real_browser: bool) {
     let root = tempfile::tempdir().unwrap();
     let producer = root.path().join("node");
     // This test exercises HTTP/service/artifact integration, not the Chrome codec.
     // Real Chrome/FFmpeg capture is proved by the runtime's required browser tests.
     std::fs::write(&producer,"#!/bin/sh\ncat >/dev/null\nprintf 'actual-producer-bytes'\nprintf '%s\\n' '{\"event\":\"capture_complete\",\"frames\":2}' >&2\n").unwrap();
     std::fs::set_permissions(&producer, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let browser = std::path::PathBuf::from("/home/vscode/.cache/ms-playwright/chromium_headless_shell-1228/chrome-headless-shell-linux64/chrome-headless-shell");
+    if real_browser {
+        assert!(browser.is_file(), "required real browser missing");
+        // Test-only trusted adapter changes the source, never the production API.
+        std::fs::write(&producer, r##"#!/usr/bin/python3
+import json,subprocess,sys
+request=json.load(sys.stdin)
+request['source']={'kind':'html','document':'<body style="margin:0;background:red">HTTP capture proof</body>'}
+sys.exit(subprocess.run(['/usr/local/share/nvm/current/bin/node']+sys.argv[1:],input=json.dumps(request).encode()).returncode)
+"##).unwrap();
+    }
     let store_path = root.path().join("store");
     std::fs::create_dir(&store_path).unwrap();
     let store = ArtifactStore::open(
@@ -66,8 +85,16 @@ async fn actual_tcp_post_runs_service_and_returns_owner_scoped_artifact() {
         Service::start_durable(
             Tools {
                 node: producer,
-                browser: "/bin/sh".into(),
-                ffmpeg: "/bin/sh".into(),
+                browser: if real_browser {
+                    browser
+                } else {
+                    "/bin/sh".into()
+                },
+                ffmpeg: if real_browser {
+                    "/usr/bin/ffmpeg".into()
+                } else {
+                    "/bin/sh".into()
+                },
             },
             store,
             Config {
@@ -220,6 +247,28 @@ async fn actual_tcp_post_runs_service_and_returns_owner_scoped_artifact() {
     )
     .await;
     assert!(r.contains(" 404"), "{r}");
+    if real_browser {
+        use std::io::Read;
+        let artifact = multiview_webengine::artifact::ArtifactId::parse(
+            status["artifact_id"].as_str().unwrap(),
+        )
+        .unwrap();
+        let mut lease = service.pin(&artifact, "operator-key").unwrap();
+        let mut bytes = Vec::new();
+        lease.read_to_end(&mut bytes).unwrap();
+        let mov = root.path().join("proof.mov");
+        std::fs::write(&mov, bytes).unwrap();
+        let result = std::process::Command::new("/usr/bin/ffprobe").args(["-v","error","-count_frames","-show_entries","stream=codec_name,width,height,nb_read_frames,color_range,color_space,color_transfer,color_primaries","-of","json"]).arg(&mov).output().unwrap();
+        assert!(result.status.success());
+        let value: serde_json::Value = serde_json::from_slice(&result.stdout).unwrap();
+        let video = &value["streams"][0];
+        assert_eq!(video["codec_name"], "ffv1");
+        assert_eq!(video["width"], 1280);
+        assert_eq!(video["height"], 720);
+        assert_eq!(video["nb_read_frames"], "2");
+        assert_eq!(video["color_range"], "tv");
+        assert_eq!(video["color_transfer"], "iec61966-2-1");
+    }
     stop.send(()).unwrap();
     server.await.unwrap().unwrap();
     service.shutdown();
