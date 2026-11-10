@@ -126,13 +126,15 @@ export function SourcesSurface(props: SourcesSurfaceProps): JSX.Element {
 
   const identity = (source: SourceView, heading: boolean): JSX.Element => (
     <div className="src-name">
-      <span className="kind-chip" lang="" dir="auto">{source.rawKind}</span>
-      {heading ? (
-        <h3 lang="" dir="auto" className="src-title">{source.name}</h3>
-      ) : (
-        <b lang="" dir="auto" className="src-title">{source.name}</b>
-      )}
-      <code lang="" dir="auto" className="src-ep break-all">{source.id}</code>
+      <span className="src-head">
+        <span className="kind-chip" lang="" dir="auto">{source.rawKind}</span>
+        {heading ? (
+          <h3 lang="" dir="auto" className="src-title">{source.name}</h3>
+        ) : (
+          <b lang="" dir="auto" className="src-title">{source.name}</b>
+        )}
+        <code lang="" dir="auto" className="src-ep break-all">{source.id}</code>
+      </span>
       <span className="src-ep">
         <code lang="" dir="auto" className="break-all">{source.locator ?? t`No locator configured`}</code>
       </span>
@@ -346,7 +348,6 @@ export function SourcesSurface(props: SourcesSurfaceProps): JSX.Element {
                   <tr data-testid={`source-row-${source.id}`} data-phase={demandOf(source.id)?.phase ?? 'unknown'} className={isException(source) ? 'tr-exception' : undefined}>
                     <td>
                       {identity(source, false)}
-                      {failure(source)}
                       {crossLink(source)}
                     </td>
                     <td>{signal(source)}</td>
@@ -360,6 +361,11 @@ export function SourcesSurface(props: SourcesSurfaceProps): JSX.Element {
                       </div>
                     </td>
                   </tr>
+                  {demandOf(source.id)?.phase === 'failed' ? (
+                    <tr className="src-fail-row" data-testid={`source-fail-row-${source.id}`}>
+                      <td colSpan={6}>{failure(source)}</td>
+                    </tr>
+                  ) : null}
                   {open.has(source.id) ? (
                     <tr className="src-detail-row">
                       <td colSpan={6} id={`src-detail-${source.id}`}>{details(source)}</td>

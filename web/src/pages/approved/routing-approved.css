@@ -109,20 +109,27 @@
 
 /* Fix9: disabled primary actions (Plan/Take) must read as disabled, never as a lit white button. */
 [data-approved-page="routing"] button:disabled,[data-approved-page="routing"] button[aria-disabled="true"]{background:var(--bg-1);color:var(--text-3);border:1px dashed var(--line-2);opacity:1;cursor:not-allowed}
-/* Fix9: visible scroll affordance on the crosspoint grid: always-on scrollbar + edge shadows that fade when scrolled to the end. */
-[data-approved-page="routing"] .patch-wrap[data-testid="crosspoint-grid"]{
-  background:
-    linear-gradient(to right,var(--bg-1) 30%,transparent) left center/32px 100% no-repeat local,
-    linear-gradient(to left,var(--bg-1) 30%,transparent) right center/32px 100% no-repeat local,
-    linear-gradient(to bottom,var(--bg-1) 30%,transparent) center top/100% 24px no-repeat local,
-    linear-gradient(to top,var(--bg-1) 30%,transparent) center bottom/100% 24px no-repeat local,
-    radial-gradient(farthest-side at 0 50%,rgba(106,166,255,.45),transparent) left center/14px 100% no-repeat scroll,
-    radial-gradient(farthest-side at 100% 50%,rgba(106,166,255,.45),transparent) right center/14px 100% no-repeat scroll,
-    radial-gradient(farthest-side at 50% 0,rgba(106,166,255,.45),transparent) center top/100% 14px no-repeat scroll,
-    radial-gradient(farthest-side at 50% 100%,rgba(106,166,255,.45),transparent) center bottom/100% 14px no-repeat scroll;
-  scrollbar-width:auto;scrollbar-color:var(--blue) var(--bg-3);
-}
-[data-approved-page="routing"] .patch-wrap::-webkit-scrollbar{width:12px;height:12px;-webkit-appearance:none}
-[data-approved-page="routing"] .patch-wrap::-webkit-scrollbar-track{background:var(--bg-3);border-radius:6px}
-[data-approved-page="routing"] .patch-wrap::-webkit-scrollbar-thumb{background:var(--blue);border-radius:6px;border:2px solid var(--bg-3)}
 [data-approved-page="routing"] .patch-table th.patch-src,[data-approved-page="routing"] .patch-table th.src-h{background:var(--bg-1);box-shadow:1px 0 0 var(--line-2)}
+
+/* Fix13: compact fixed-width crosspoint matrix, clean scroll, sticky first column + header rows, one-line headers. */
+[data-approved-page="routing"] .patch-table{table-layout:fixed;width:max-content;min-width:100%;border-collapse:separate;border-spacing:0}
+[data-approved-page="routing"] .patch-table th.src-h{width:96px;min-width:96px;max-width:96px;left:0;vertical-align:bottom;font-size:11px;white-space:normal;line-height:1.2}
+[data-approved-page="routing"] .patch-table th.patch-src{width:96px;min-width:96px;max-width:96px;box-sizing:border-box}
+[data-approved-page="routing"] .patch-table th.dest-h{width:60px;min-width:60px;max-width:60px;box-sizing:border-box;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;font-size:10px;letter-spacing:0;padding:6px 2px;border-bottom:1px solid var(--line-2)}
+[data-approved-page="routing"] .patch-table th.grp-h{font-size:10px;letter-spacing:.1em;text-align:left;padding:6px 4px;color:var(--blue);border-left:1px solid var(--line-2);white-space:nowrap;overflow:hidden}
+[data-approved-page="routing"] .patch-table td{width:60px;min-width:60px;max-width:60px;box-sizing:border-box;padding:2px}
+[data-approved-page="routing"] .xpt{min-width:0;width:56px}
+[data-approved-page="routing"] .patch-wrap[data-testid="crosspoint-grid"]{background:none;scrollbar-width:thin;scrollbar-color:var(--line-2) transparent;border:1px solid var(--line);border-radius:var(--r-md)}
+[data-approved-page="routing"] .patch-wrap::-webkit-scrollbar{width:8px;height:8px}
+[data-approved-page="routing"] .patch-wrap::-webkit-scrollbar-track{background:transparent;border-radius:0}
+[data-approved-page="routing"] .patch-wrap::-webkit-scrollbar-thumb{background:var(--line-2);border:0;border-radius:4px}
+@media (min-width:768px){
+[data-approved-page="routing"] .patch-table thead tr.grp-row th{top:0}
+[data-approved-page="routing"] .patch-table thead tr:nth-child(2) th{top:29px}
+}
+[data-approved-page="routing"] .plan-tile{display:flex;flex-direction:column;align-items:flex-start;justify-content:center;gap:2px;min-height:var(--tap);padding:6px 14px;border-radius:var(--r-md);border:1px dashed var(--line-2);background:var(--bg-1);color:var(--text-2);font-size:13px;font-weight:700;text-align:left;cursor:not-allowed;justify-self:start;max-width:100%}
+[data-approved-page="routing"] .plan-tile .plan-tile-why{font-size:11px;font-weight:400;color:var(--text-3)}
+@media (max-width:767px){
+[data-approved-page="routing"] .rp-dests{grid-template-columns:repeat(auto-fill,minmax(112px,1fr))}
+[data-approved-page="routing"] .rp-dests .rp-row{flex-direction:column;align-items:flex-start;gap:2px;padding:6px 12px}
+}

@@ -145,16 +145,49 @@ export function CrosspointGrid({
       </p>
     );
   }
+  const groups: { kind: RouteDest["kind"]; count: number }[] = [];
+  for (const d of dests) {
+    const last = groups[groups.length - 1];
+    if (last?.kind === d.kind) {
+      last.count += 1;
+    } else {
+      groups.push({ kind: d.kind, count: 1 });
+    }
+  }
   return (
     <div className="patch-wrap" data-testid="crosspoint-grid">
       <table className="patch-table">
         <thead>
-          <tr>
-            <th className="src-h" scope="col">
+          <tr className="grp-row" data-testid="crosspoint-groups">
+            <th className="src-h" scope="col" rowSpan={2}>
               <Trans>Source ↓ / Dest →</Trans>
             </th>
+            {groups.map((g) => (
+              <th
+                key={g.kind}
+                scope="colgroup"
+                colSpan={g.count}
+                className="grp-h"
+                data-kind={g.kind}
+              >
+                {g.kind === "video" ? (
+                  <Trans>Video cells</Trans>
+                ) : g.kind === "audio" ? (
+                  <Trans>Audio program / tracks</Trans>
+                ) : (
+                  <Trans>Subtitle layers</Trans>
+                )}
+              </th>
+            ))}
+          </tr>
+          <tr>
             {dests.map((d) => (
-              <th key={`${d.kind}:${d.id}`} scope="col" title={d.kind}>
+              <th
+                key={`${d.kind}:${d.id}`}
+                scope="col"
+                title={`${d.label} (${d.kind})`}
+                className="dest-h"
+              >
                 {d.label}
               </th>
             ))}
@@ -249,6 +282,7 @@ export function DestinationPicker({
             </Trans>
           </p>
         ) : (
+          <>
           <div className="rp-dests">
             {dests.map((d) => (
               <button
@@ -263,12 +297,19 @@ export function DestinationPicker({
               >
                 <b>{d.label}</b>
                 <span className="rp-cur">{d.kind}</span>
-                <span className="pill">
+                <span className="sr-only">
                   <Trans>Crosspoint: Unknown</Trans>
                 </span>
               </button>
             ))}
           </div>
+          <p className="rp-note" data-testid="route-dest-unknown-note">
+            <Trans>
+              Crosspoint state is Unknown for every destination: the routing
+              API has no readback.
+            </Trans>
+          </p>
+          </>
         )
       ) : null}
     </div>
