@@ -22,6 +22,7 @@ const server = setupServer(
   ),
   http.get('*/api/v1/sources', () => HttpResponse.json([])),
   http.get('*/api/v1/outputs', () => HttpResponse.json([])),
+  http.get('*/api/v1/layouts', () => HttpResponse.json([])),
   http.get('*/api/v1/audio-routing', () => HttpResponse.json({ state: { selectable_tracks: [] } })),
   http.post('http://localhost:3000/api/v1/routing/plan', async ({ request }) => {
     lastPlanBody = await request.json();

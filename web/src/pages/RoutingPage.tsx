@@ -24,10 +24,22 @@ import type {
 } from "../api/routingQueries";
 import { ROUTE_KINDS } from "../api/routingQueries";
 import { getSwitcher } from "../api/switcher";
-import { PageHeader } from "../components/PageHeader";
+import { createApiClient } from "../api/client";
+import { useLayouts } from "../api/queries";
+import { useTakeLock } from "../components/broadcast/BroadcastShell";
+import { useAudioRouting } from "../resources/audioRouting";
+import { cellIdsFromLayouts } from "../resources/forms";
 import { Badge } from "../components/ui/badge";
 import type { BadgeProps } from "../components/ui/badge";
 import { Button } from "../components/ui/button";
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from "../components/ui/dialog";
 import { Input } from "../components/ui/input";
 import { Label } from "../components/ui/label";
 import {
@@ -41,11 +53,16 @@ import { toast } from "../components/ui/use-toast";
 import { useSources } from "../resources/queries";
 import { OutputsSurface } from "./OutputsPage";
 import {
+  CrosspointGrid,
+  DestinationPicker,
+  PlanPanel,
   RouteGrid,
   RoutingFrame,
+  RoutingHead,
   RouteTruthStrip,
   SourcePicker,
 } from "./approved/RoutingSurface";
+import type { RouteDest } from "./approved/RoutingSurface";
 
 /** A stream selector strategy (mirrors `StreamSelectorDoc.by`). */
 type SelectorBy = "best" | "index" | "language" | "stream_id";
@@ -79,6 +96,8 @@ interface RouteForm {
   readonly pinnedChannels: string;
   /** Operator-confirmed down/up-mix to a pinned layout. */
   readonly coerce: boolean;
+  /** A discrete audio track picked from the destination list (no channel pin). */
+  readonly discrete: boolean;
 }
 
 const EMPTY_FORM: RouteForm = {
@@ -89,6 +108,7 @@ const EMPTY_FORM: RouteForm = {
   target: "",
   pinnedChannels: "",
   coerce: false,
+  discrete: false,
 };
 
 /** A stream selector, narrowed to the non-undefined variants of the wire type. */
@@ -135,6 +155,9 @@ function buildTarget(form: RouteForm): RouteTarget {
           track: id,
           pinned_channels: pinned,
         };
+      }
+      if (form.discrete) {
+        return { kind: "audio_discrete_track", track: id };
       }
       return { kind: "audio_program_bus", channel: id };
     }
@@ -198,6 +221,37 @@ export function RoutingPage(): JSX.Element {
       ? "error"
       : "ready";
 
+  // Real destination identities only: layout cells (video) and declared
+  // discrete audio tracks. Subtitle layers have no listing API, so they stay
+  // reachable through the typed selector only. Crosspoint state is Unknown.
+  const client = useMemo(() => createApiClient(), []);
+  const layouts = useLayouts(client);
+  const audio = useAudioRouting();
+  const dests = useMemo<readonly RouteDest[]>(() => {
+    const cells = cellIdsFromLayouts(layouts.data ?? []).map(
+      (id): RouteDest => ({ kind: "video", id, label: id }),
+    );
+    const tracks = (audio.data?.state.selectable_tracks ?? [])
+      .filter((track) => track !== "prog")
+      .map((id): RouteDest => ({ kind: "audio", id, label: id }));
+    return [...cells, ...tracks];
+  }, [layouts.data, audio.data]);
+  const [phoneStep, setPhoneStep] = useState<1 | 2>(1);
+  const [confirmTake, setConfirmTake] = useState(false);
+  const { locked } = useTakeLock();
+
+  const pickDest = (dest: RouteDest): void => {
+    setPlan(null);
+    setForm({
+      ...form,
+      kind: dest.kind,
+      target: dest.id,
+      pinnedChannels: "",
+      discrete: dest.kind === "audio",
+    });
+    setPhoneStep(2);
+  };
+
   const planRoute = usePlanRoute();
   const takeRoute = useTakeRoute();
 
@@ -225,7 +279,16 @@ export function RoutingPage(): JSX.Element {
     });
   };
 
+  // A take is program-affecting when it routes the switcher's CURRENT program
+  // source, or targets the audio program bus. While takes are locked that
+  // needs an explicit confirmation; other targets have no program readback.
+  const affectsProgram =
+    form.inputId.trim() !== "" && form.inputId.trim() === programSource
+      ? true
+      : form.kind === "audio" && !form.discrete;
+
   const onTake = (): void => {
+    setConfirmTake(false);
     takeRoute.mutate(
       { kind: form.kind, request: buildRequest(form) },
       {
@@ -266,22 +329,40 @@ export function RoutingPage(): JSX.Element {
 
   return (
     <RoutingFrame>
-      <PageHeader
-        title={<Trans>Routing</Trans>}
-        description={
-          <Trans>
-            Route a source elementary stream onto a destination. Plan classifies
-            the take without applying it; Take applies it — a Class-2 migration
-            is accepted asynchronously and its outcome arrives on the realtime
-            stream.
-          </Trans>
-        }
-      />
+      <RoutingHead />
 
       <RouteTruthStrip pgm={{ programSource, loading: switcher.isPending }} />
       <RouteGrid
         patch={
           <>
+            <CrosspointGrid
+              sources={(sources.data ?? []).map((x) => ({ id: x.id, name: x.name }))}
+              dests={dests}
+              selectedSource={form.inputId}
+              selectedDest={form.target}
+              planned={plan !== null}
+              onPick={(source, dest): void => {
+                setPlan(null);
+                setForm({
+                  ...form,
+                  inputId: source,
+                  kind: dest.kind,
+                  target: dest.id,
+                  pinnedChannels: "",
+                  discrete: dest.kind === "audio",
+                });
+                setPhoneStep(2);
+              }}
+            />
+            <DestinationPicker
+              dests={dests}
+              selected={form.target}
+              step={phoneStep}
+              onPick={pickDest}
+              onBack={(): void => {
+                setPhoneStep(1);
+              }}
+            />
             <SourcePicker
               sources={sources.data ?? []}
               selected={form.inputId}
@@ -291,13 +372,26 @@ export function RoutingPage(): JSX.Element {
                 setPlan(null);
                 setForm({ ...form, inputId: id });
               }}
+              hidden={dests.length > 0 && phoneStep === 1}
             />
+            <PlanPanel
+              selected={valid}
+              summary={
+                <Trans>
+                  Plan: {form.inputId.trim()} → {form.target.trim()}
+                </Trans>
+              }
+            >
             <form
-              className="route-form plan-panel"
+              className="route-form"
               onSubmit={(e): void => {
                 e.preventDefault();
                 if (valid) {
-                  onTake();
+                  if (locked && affectsProgram) {
+                    setConfirmTake(true);
+                  } else {
+                    onTake();
+                  }
                 }
               }}
             >
@@ -505,6 +599,37 @@ export function RoutingPage(): JSX.Element {
                 </Button>
               </div>
             </form>
+            </PlanPanel>
+            <Dialog open={confirmTake} onOpenChange={setConfirmTake}>
+              <DialogContent>
+                <DialogHeader>
+                  <DialogTitle>
+                    <Trans>Confirm a program-affecting take?</Trans>
+                  </DialogTitle>
+                  <DialogDescription>
+                    <Trans>
+                      Takes are locked and this one changes what is on program
+                      (the current PGM source or the audio program bus).
+                      Confirm to apply it.
+                    </Trans>
+                  </DialogDescription>
+                </DialogHeader>
+                <DialogFooter>
+                  <Button
+                    variant="outline"
+                    className="min-h-12"
+                    onClick={(): void => {
+                      setConfirmTake(false);
+                    }}
+                  >
+                    <Trans>Cancel</Trans>
+                  </Button>
+                  <Button className="min-h-12" onClick={onTake}>
+                    <Trans>Confirm take</Trans>
+                  </Button>
+                </DialogFooter>
+              </DialogContent>
+            </Dialog>
           </>
         }
         outputs={<OutputsSurface embedded />}
