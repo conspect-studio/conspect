@@ -115,7 +115,7 @@ impl ControlError {
                 Problem::new(409, "conflict", "Conflict with current state").with_detail(msg)
             }
             Self::CaptureOutcomeUncertain => Problem::new(409, "capture-outcome-uncertain", "Capture outcome is uncertain")
-                .with_detail("This request will not run again with the same Idempotency-Key. Check the fill and latest good artifact; use a new key only for an explicit rerun."),
+                .with_detail("This request will not run again with the same Idempotency-Key. Do not bypass it with a new key. An administrator must verify the producer generation and artifacts before an audited recovery decision."),
             Self::Unauthenticated => {
                 Problem::new(401, "unauthenticated", "Authentication required")
                     .with_detail("a valid Bearer API key is required")
