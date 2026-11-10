@@ -54,8 +54,8 @@ pub enum SrtError {
     #[error("srt backend is unsupported until SRT-5")]
     UnsupportedBackend,
 
-    /// An option has no corresponding `FFmpeg` 8.1.1 SRT URL parameter.
-    #[error("srt option {0} is unsupported by FFmpeg 8.1.1")]
+    /// An option has no corresponding SRT URL parameter in the pinned `FFmpeg`.
+    #[error("srt option {0} is unsupported by the pinned FFmpeg")]
     UnsupportedOption(&'static str),
 
     /// A referenced passphrase could not be resolved at socket setup.

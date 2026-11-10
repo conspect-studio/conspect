@@ -10065,7 +10065,7 @@ fn rist_resolved_url(
     lower_rist_url(base_url, opts, resolved.as_deref(), redact)
 }
 
-/// Lower typed SRT options to the `FFmpeg` 8.1.1 `libsrt` protocol URL. This is
+/// Lower typed SRT options to the pinned `FFmpeg` `libsrt` protocol URL. This is
 /// control-plane setup only; the output clock never waits for this work (#1/#10).
 /// Unknown backend and unsupported peer-idle timeout fail closed, not ignored.
 #[allow(clippy::too_many_lines)] // URL assembly keeps option precedence and redaction together.
@@ -10084,7 +10084,7 @@ fn srt_resolved_url(
     if matches!(opts.backend, Some(backend) if backend != SrtBackend::Ffmpeg) {
         return Err(SrtError::UnsupportedBackend);
     }
-    // FFmpeg 8.1.1 libavformat/libsrt.c has no peer_idle_timeout AVOption.
+    // The pinned FFmpeg's libavformat/libsrt.c (8.1.1 and 9.0.2) has no peer_idle_timeout AVOption.
     if opts.peer_idle_timeout_ms.is_some() {
         return Err(SrtError::UnsupportedOption("peer_idle_timeout_ms"));
     }

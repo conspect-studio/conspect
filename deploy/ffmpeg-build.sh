@@ -4,19 +4,19 @@
 #
 # Ratifies ADR-0031 (FF-0b): replace the third-party libav* (jellyfin-ffmpeg7 on
 # the NVIDIA image, Debian-trixie apt libav*-dev on the VAAPI image) with a
-# pinned, GPG- AND SHA-256-verified FFmpeg 8.1.1 source build under OUR exact
+# pinned, GPG- AND SHA-256-verified FFmpeg 9.0.2 source build under OUR exact
 # `--disable-everything` allowlist. This is the single, audited source of the
 # configure flag list — both deploy/Dockerfile and deploy/Dockerfile.nvidia call
 # this one script, so the LGPL-clean guardrail (no GPL/nonfree leak) lives in
 # exactly one place.
 #
-# Soname target: FFmpeg 8.1.1 → libavcodec.so.62 / libavutil.so.60 /
-# libavformat.so.62 / libavfilter.so.11 / libswscale.so.9 / libswresample.so.6.
-# This matches `ffmpeg-sys-next 8.1.0` (build.rs maps `ffmpeg_8_1` → libavcodec
-# 62), the version the workspace lockfile resolves, so `cargo build` links .so.62.
+# Soname target: FFmpeg 9.0.2 → libavcodec.so.63 / libavutil.so.61 /
+# libavformat.so.63 / libavfilter.so.12 / libswscale.so.10 / libswresample.so.7.
+# This matches `ffmpeg-sys-next 9.0.1` (build.rs maps `ffmpeg_9_0` → libavcodec
+# 63), the version the workspace lockfile resolves, so `cargo build` links .so.63.
 #
 # Inputs (environment variables, supplied by the Dockerfile via ARG→ENV):
-#   FFMPEG_VERSION   FFmpeg release to build               (default 8.1.1)
+#   FFMPEG_VERSION   FFmpeg release to build               (default 9.0.2)
 #   FFMPEG_SHA256    SHA-256 of ffmpeg-${FFMPEG_VERSION}.tar.xz  (REQUIRED)
 #   FFMPEG_GPG_KEY   FFmpeg release signing key fingerprint (default below)
 #   FFMPEG_GIT_COMMIT upstream commit of tag n${FFMPEG_VERSION}; fallback source
@@ -33,7 +33,7 @@
 # author time against the real ffmpeg.org tarball:
 #   GPG  : Good signature from "FFmpeg release signing key <ffmpeg-devel@ffmpeg.org>"
 #          primary key fingerprint FCF986EA 15E6 E293 A564 4F10 B432 2F04 D676 58D8
-#   SHA256 b6863adde98898f42602017462871b5f6333e65aec803fdd7a6308639c52edf3
+#   SHA256 8c3850283eb25fa026482078a04051e0be17347b09ef81a0849bec15a96e002e
 #          (independently confirmed: Fossies SHA-256, rpmfusion SHA-512).
 #
 # LGPL-clean guardrail (ADR-0031 §"Enable-flags", CLAUDE.md §7): the default
@@ -42,8 +42,12 @@
 # NVENC/NVDEC/cuvid/cuda-llvm/vaapi/libvpl/gnutls/libsrt/libopus are all
 # LGPL-clean. We scale with scale_cuda (--enable-cuda-llvm), never scale_npp.
 set -euo pipefail
+# Resolve this script's own directory NOW, before any `cd`: a relative $0
+# (e.g. `bash deploy/ffmpeg-build.sh`) stops resolving once the build cds into
+# its temp dir, which used to break the fetch-script and patch-dir lookups.
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd -P)"
 
-FFMPEG_VERSION="${FFMPEG_VERSION:-8.1.1}"
+FFMPEG_VERSION="${FFMPEG_VERSION:-9.0.2}"
 FFMPEG_GPG_KEY="${FFMPEG_GPG_KEY:-FCF986EA15E6E293A5644F10B4322F04D67658D8}"
 FF_LICENSE="${FF_LICENSE:-lgpl}"
 FF_HWACCEL="${FF_HWACCEL:-vaapi}"
@@ -106,7 +110,7 @@ smoke_srt() (
     host='127.0.0.1'
     echo 'ffmpeg-build: IPv6 loopback unavailable; using 127.0.0.1' >&2
   fi
-  printf 'Multiview FFmpeg SRT loopback smoke: 8.1.1\n' > "${work}/in.bin"
+  printf 'Multiview FFmpeg SRT loopback smoke: 9.0.2\n' > "${work}/in.bin"
   if [[ "${host}" == '[::1]' ]]; then udp_table=/proc/net/udp6; else udp_table=/proc/net/udp; fi
 
   # Each caller needs its own listener: a failed/slow caller can consume the
@@ -198,7 +202,23 @@ SRC="${WORK}/ffmpeg-${FFMPEG_VERSION}"
 if [ -n "${FFMPEG_SRC_DIR:-}" ]; then
   cp -a "${FFMPEG_SRC_DIR}/ffmpeg-${FFMPEG_VERSION}" "${SRC}"
 else
-  "$(dirname "$(readlink -f "$0")")/ffmpeg-fetch-source.sh" "${WORK}"
+  "${SCRIPT_DIR}/ffmpeg-fetch-source.sh" "${WORK}"
+fi
+
+# -----------------------------------------------------------------------------
+# 1b. Carried patches for this exact version (deploy/ffmpeg-patches/<version>/,
+#     applied in name order). Each is a minimal fix for a regression we hit,
+#     documented in its header with the upstream status; the directory is part of
+#     the build input, so a patch change rebuilds the base image. A patch that no
+#     longer applies fails the build rather than being skipped.
+# -----------------------------------------------------------------------------
+PATCH_DIR="${FFMPEG_PATCH_DIR:-${SCRIPT_DIR}/ffmpeg-patches}/${FFMPEG_VERSION}"
+if [ -d "${PATCH_DIR}" ]; then
+  for p in "${PATCH_DIR}"/*.patch; do
+    [ -e "${p}" ] || continue
+    echo "ffmpeg-build: applying $(basename "${p}")"
+    patch -d "${SRC}" -p1 --forward --batch < "${p}"
+  done
 fi
 
 # -----------------------------------------------------------------------------
@@ -250,8 +270,8 @@ case "${FF_HWACCEL}" in
     # NVENC/NVDEC/cuvid via nv-codec-headers; scale_cuda via cuda-llvm (no SDK).
     # --enable-nvenc/nvdec/cuvid turn on the CAPABILITY only; --disable-everything
     # still strips the actual encoders/decoders/hwaccels/filters unless each is
-    # named in an allowlist below. All FFmpeg-8.1.1 names verified against the
-    # n8.1.1 source (libavcodec/allcodecs.c, libavcodec/hwaccels.h,
+    # named in an allowlist below. All FFmpeg-9.0.2 names verified against the
+    # n9.0.2 source (libavcodec/allcodecs.c, libavcodec/hwaccels.h,
     # libavfilter/allfilters.c). NVENC/NVDEC/cuvid/scale_cuda are all LGPL-clean.
     # shellcheck disable=SC2054  # commas are FFmpeg list-value syntax (one word)
     CONFIGURE_ARGS+=(
@@ -267,7 +287,7 @@ case "${FF_HWACCEL}" in
     # Intel/AMD on Linux. libvpl (Intel QSV via oneVPL) is amd64-only.
     # --enable-vaapi turns on the CAPABILITY only; --disable-everything still
     # strips the VAAPI encoders/hwaccels/scale filter unless each is named in an
-    # allowlist below. Names verified against FFmpeg n8.1.1 source
+    # allowlist below. Names verified against FFmpeg n9.0.2 source
     # (libavcodec/allcodecs.c, libavcodec/hwaccels.h, libavfilter/allfilters.c).
     # VAAPI encode/decode is LGPL-clean.
     # shellcheck disable=SC2054  # commas are FFmpeg list-value syntax (one word)
@@ -345,13 +365,24 @@ done
 make -j"$(nproc)"
 make install
 
+# Licence texts travel WITH the libraries: every artifact that conveys these
+# libav* binaries (app images, release tarballs) copies ${FF_PREFIX}/share/licenses.
+# --enable-version3 makes the LGPL build LGPL-3.0-or-later, which requires the
+# LGPLv3 AND GPLv3 texts; the gpl flavour is GPL-3.0-or-later. Ship all four from
+# the verified source tree (FFmpeg's LICENSE.md names them) plus LICENSE.md.
+install -d "${FF_PREFIX}/share/licenses/ffmpeg"
+install -m 0644 LICENSE.md COPYING.LGPLv3 COPYING.GPLv3 COPYING.LGPLv2.1 COPYING.GPLv2 \
+  "${FF_PREFIX}/share/licenses/ffmpeg/"
+
 # -----------------------------------------------------------------------------
 # 5. Assert actual installed features (configure flags alone do not prove they
-#    survived dependency resolution) and the FFmpeg 8.1.1 sonames. Fail the BUILD
+#    survived dependency resolution) and the FFmpeg 9.0.2 sonames. Fail the BUILD
 #    here rather than shipping an unusable image.
 # -----------------------------------------------------------------------------
-test -e "${FF_PREFIX}/lib/libavcodec.so.62"
-test -e "${FF_PREFIX}/lib/libavutil.so.60"
-test -e "${FF_PREFIX}/lib/libavformat.so.62"
+test -e "${FF_PREFIX}/lib/libavcodec.so.63"
+test -e "${FF_PREFIX}/lib/libavutil.so.61"
+test -e "${FF_PREFIX}/lib/libavformat.so.63"
+test -s "${FF_PREFIX}/share/licenses/ffmpeg/COPYING.LGPLv3"
+test -s "${FF_PREFIX}/share/licenses/ffmpeg/COPYING.GPLv3"
 assert_features
-echo "ffmpeg-build: OK — FFmpeg ${FFMPEG_VERSION} installed to ${FF_PREFIX} (libavcodec.so.62)."
+echo "ffmpeg-build: OK — FFmpeg ${FFMPEG_VERSION} installed to ${FF_PREFIX} (libavcodec.so.63)."

@@ -143,12 +143,12 @@ The licensing model is the [conventions](../architecture/conventions.md) §7 and
 
 | Build profile | What it adds | Effect on the image |
 |---------------|-------------|----------------------|
-| **default** | LGPL-2.1 FFmpeg (dynamic), NVENC/NVDEC via MIT headers, native AAC + GnuTLS | **Redistributable, LGPL-clean** — the shippable image |
-| **`gpl-codecs`** | x264 / x265 | Whole artifact becomes **GPL-2.0-or-later**; opt-in only |
+| **default** | LGPL FFmpeg (dynamic; LGPL-3.0-or-later for the pinned `--enable-version3` build), NVENC/NVDEC via MIT headers, native AAC + GnuTLS | **Redistributable, LGPL-clean** — the shippable image |
+| **`gpl-codecs`** | x264 / x265 | Whole artifact becomes **GPL-3.0-or-later** (pinned `--enable-version3` build); opt-in only |
 | **`nonfree`** | libnpp / FDK-AAC / OpenSSL | **NOT redistributable** — internal/personal images only |
 | **`ndi`** | proprietary NDI runtime (runtime-loaded) | Permissive code + NDI EULA + mandatory attribution; SDK **never vendored** into the image |
 
-**Why dynamic linking matters in a container.** FFmpeg is linked **dynamically (LGPL-2.1)** so the
+**Why dynamic linking matters in a container.** FFmpeg is linked **dynamically (LGPL)** so the
 LGPL relink right is preserved — a user can replace `libav*` inside the image. Keep that property:
 do not statically fold libav into the binary, and do not strip the dynamic libs out
 ([core-engine](../research/core-engine.md) §17, [ADR-0012](../decisions/ADR-0012.md)).

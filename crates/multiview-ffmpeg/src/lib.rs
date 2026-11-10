@@ -144,7 +144,8 @@ pub use caption::{
 };
 
 pub use encode_options::{
-    preview_gop_frames, preview_h264_options, preview_vp8_options, CodecOptionError, CodecOptions,
+    preview_gop_frames, preview_h264_options, preview_vp8_options, program_h264_options,
+    CodecOptionError, CodecOptions, PROGRAM_H264_PROFILE,
 };
 
 pub use codec::{
