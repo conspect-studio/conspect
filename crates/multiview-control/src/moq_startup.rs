@@ -20,8 +20,10 @@ pub struct MoqListenerConfig {
 }
 
 impl MoqListenerConfig {
-    /// Read explicit opt-in listener settings. Absent endpoint disables MoQ;
+    /// Read explicit opt-in listener settings. Absent endpoint disables `MoQ`;
     /// partial or unsafe settings fail instead of enabling an insecure listener.
+    /// # Errors
+    /// Returns unavailable for incomplete or unsafe explicit listener settings.
     pub fn from_env() -> Result<Option<Self>, MoqReject> {
         Self::from_values(|name| std::env::var(name).ok())
     }

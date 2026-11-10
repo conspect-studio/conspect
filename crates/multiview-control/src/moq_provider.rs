@@ -77,6 +77,8 @@ pub trait AuthorizedFeedFactory: Send + Sync {
     fn available(&self) -> bool;
     /// Return a shared-family binding only when this factory supports it.
     /// `None` chooses the legacy path; refusal never falls back.
+    /// # Errors
+    /// Returns the authorization, codec, capacity or lifecycle admission refusal.
     fn attach_shared(
         &self,
         _principal: &Principal,
@@ -138,17 +140,13 @@ impl MoqProvider for WebTransportProvider {
         {
             Ok(Some(mut shared)) => {
                 shared.feed.windows = shared_windows;
-                let admission =
-                    match self
-                        .runtime
+                let Ok(admission) =
+                    self.runtime
                         .admit_shared(shared.feed, shared_fence.clone(), ttl)
-                    {
-                        Ok(admission) => admission,
-                        Err(_) => {
-                            shared_fence.revoke();
-                            return Err(MoqReject::Unavailable);
-                        }
-                    };
+                else {
+                    shared_fence.revoke();
+                    return Err(MoqReject::Unavailable);
+                };
                 return Ok((
                     MoqLease {
                         lease_id: subscription_id.into(),
