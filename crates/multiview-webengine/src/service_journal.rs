@@ -15,9 +15,9 @@
 //! Use a journal path dedicated to one store (the store's own lock guards the
 //! store, not this file).
 use crate::artifact::ArtifactId;
+use rustix::fs::{self, Mode, OFlags};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use rustix::fs::{self, Mode, OFlags};
 use std::{
     ffi::OsStr,
     fs::File,

@@ -126,11 +126,17 @@ mod tests {
         let d = tempfile::tempdir().unwrap();
         let p = d.path().join("a").join("b");
         private_dir(&p).unwrap();
-        assert_eq!(std::fs::metadata(&p).unwrap().permissions().mode() & 0o777, 0o700);
+        assert_eq!(
+            std::fs::metadata(&p).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
         // No silent chmod repair: a loose existing directory is refused.
         std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
         assert!(private_dir(&p).is_err());
-        assert_eq!(std::fs::metadata(&p).unwrap().permissions().mode() & 0o777, 0o755);
+        assert_eq!(
+            std::fs::metadata(&p).unwrap().permissions().mode() & 0o777,
+            0o755
+        );
     }
 
     #[test]
