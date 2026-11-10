@@ -411,6 +411,19 @@ describe("AudioPage", () => {
     expect(screen.getByTestId("audio-bus-setup")).toHaveAttribute("open");
   });
 
+  it("shows and focuses the alert summary for a sample-rate-only error and focuses the field from its button", async () => {
+    renderAudio();
+    const rate = await screen.findByLabelText(/sample rate/i);
+    await userEvent.clear(rate);
+    await userEvent.click(screen.getByTestId("audio-save"));
+    const summary = await screen.findByTestId("audio-validation-summary");
+    expect(summary).toHaveAttribute("role", "alert");
+    expect(summary).toHaveFocus();
+    await userEvent.click(within(summary).getByRole("button", { name: /Sample rate/ }));
+    await waitFor(() => { expect(screen.getByLabelText(/sample rate/i)).toHaveFocus(); });
+    expect(lastPut).toBeUndefined();
+  });
+
   it("selects the first invalid non-selected route and shows an alert summary (focused strip)", async () => {
     const bad = { ...ROUTING_TWO, routing: { ...ROUTING_TWO.routing, routes: [
       ROUTING.routing.routes[0],

@@ -1124,13 +1124,7 @@ export function AudioPage(): JSX.Element {
         )
       ) : (
         <fieldset disabled={save.isPending} aria-busy={save.isPending} className="flex min-w-0 flex-col gap-3">
-          {errors?.program !== undefined ? (
-            <p role="alert" className="text-sm text-destructive">
-              <FieldErrorMessage code={errors.program} />
-            </p>
-          ) : null}
-
-          {errors?.routes.some((r) => Object.keys(r).length > 0) ? (
+          {errors?.hasErrors === true ? (
             <div
               ref={summaryRef}
               tabIndex={-1}
@@ -1139,9 +1133,51 @@ export function AudioPage(): JSX.Element {
               className="rounded-md border border-destructive p-3 text-sm text-destructive"
             >
               <p className="font-medium">
-                <Trans>Fix these routes before saving:</Trans>
+                <Trans>Fix these problems before saving:</Trans>
               </p>
+              {errors.program !== undefined ? (
+                <p>
+                  <FieldErrorMessage code={errors.program} />
+                </p>
+              ) : null}
               <ul className="mt-2 flex flex-wrap gap-2">
+                {errors.sampleRateHz !== undefined ? (
+                  <li>
+                    <Button
+                      type="button"
+                      variant="outline"
+                      className="h-auto min-h-12 min-w-12 max-w-full whitespace-normal break-words"
+                      onClick={(): void => {
+                        setBusSetupOpen(true);
+                        requestAnimationFrame(() => {
+                          document.getElementById('audio-sample-rate')?.focus();
+                        });
+                      }}
+                    >
+                      <Trans>Sample rate</Trans>
+                    </Button>
+                  </li>
+                ) : null}
+                {errors.program !== undefined ? (
+                  <li>
+                    <Button
+                      type="button"
+                      variant="outline"
+                      className="h-auto min-h-12 min-w-12 max-w-full whitespace-normal break-words"
+                      onClick={(): void => {
+                        setFocusedIndex(0);
+                        setBankExpanded(true);
+                        requestAnimationFrame(() => {
+                          document
+                            .querySelector<HTMLElement>('[data-testid="audio-strip"] input[aria-label*="PGM"], [data-testid="audio-strip"] [aria-label*="PGM"]')
+                            ?.focus();
+                        });
+                      }}
+                    >
+                      <Trans>Program mix</Trans>
+                    </Button>
+                  </li>
+                ) : null}
                 {errors.routes.map((routeErrors, index) =>
                   Object.keys(routeErrors).length > 0 && form.routes[index] !== undefined ? (
                     <li key={rowIds[index]}>
@@ -1152,6 +1188,11 @@ export function AudioPage(): JSX.Element {
                         onClick={(): void => {
                           setFocusedIndex(index);
                           setBankExpanded(true);
+                          requestAnimationFrame(() => {
+                            document
+                              .querySelector<HTMLElement>('[data-testid="audio-strip"] [aria-invalid="true"]')
+                              ?.focus();
+                          });
                         }}
                       >
                         {labelFor(form.routes[index], index + 1)}

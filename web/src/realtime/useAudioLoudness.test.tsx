@@ -176,3 +176,45 @@ describe('LoudnessBallistics', () => {
     expect(b.latest()?.lra).toBe(5.1);
   });
 });
+
+describe('useAudioLoudness validity', () => {
+  it('invalidates on disconnect and expiry, and needs a fresh sample after reconnect', async () => {
+    const { vi } = await import('vitest');
+    const { renderHook, act } = await import('@testing-library/react');
+    const shared = await import('../realtime/shared');
+    let onEnv: (e: { t: string; data: unknown }) => void = () => undefined;
+    let onStatus: (s: string) => void = () => undefined;
+    let onGap: () => void = () => undefined;
+    vi.useFakeTimers();
+    const spy = vi.spyOn(shared, 'subscribeRealtime').mockImplementation(((_t: string, e: typeof onEnv, s: typeof onStatus, g: typeof onGap) => {
+      onEnv = e; onStatus = s; onGap = g;
+      return () => undefined;
+    }) as never);
+    const { useAudioLoudness: hook } = await import('./useAudioLoudness');
+    const { result } = renderHook(() => hook());
+    const body = { program: 0, target_lufs: -23, ceiling_dbtp: -1.5, tolerance_lu: 1, sampled_hz: 10, integrated: -23, true_peak_dbtp: -3 };
+    const push = (): void => { act(() => { onEnv({ t: 'audio.loudness', data: body }); }); };
+    act(() => { onStatus('open'); });
+    push();
+    expect(result.current.current).toBeDefined();
+    // silence expiry
+    act(() => { vi.advanceTimersByTime(8000); });
+    expect(result.current.current).toBeUndefined();
+    // fresh, then disconnect
+    push();
+    expect(result.current.current).toBeDefined();
+    act(() => { onStatus('reconnecting'); });
+    expect(result.current.current).toBeUndefined();
+    expect(result.current.heldPeakDbtp).toBeUndefined();
+    // reconnect alone does not resurrect it
+    act(() => { onStatus('open'); });
+    expect(result.current.current).toBeUndefined();
+    push();
+    expect(result.current.current).toBeDefined();
+    // resync gap drops it too
+    act(() => { onGap(); });
+    expect(result.current.current).toBeUndefined();
+    spy.mockRestore();
+    vi.useRealTimers();
+  });
+});

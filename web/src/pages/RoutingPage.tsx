@@ -7,7 +7,7 @@
 // a banner. "Take" applies it: a hot take resolves immediately; a Class-2
 // migration is accepted with a 202 operation id whose outcome lands on the
 // realtime stream. The take carries a fresh Idempotency-Key per attempt.
-import { useMemo, useState } from "react";
+import { useMemo, useRef, useState } from "react";
 import type { JSX } from "react";
 import { Trans, useLingui } from "@lingui/react/macro";
 import { Play, Route as RouteIcon } from "lucide-react";
@@ -268,9 +268,17 @@ export function RoutingPage(): JSX.Element {
 
   const needsSelectorValue = form.selectorBy !== "best";
 
+  // Synchronous guards: two same-turn events must not start two requests.
+  const planLock = useRef(false);
+  const takeLock = useRef(false);
   const onPlan = (): void => {
+    if (planLock.current) return;
+    planLock.current = true;
     setPlan(null);
     planRoute.mutate(buildRequest(form), {
+      onSettled: (): void => {
+        planLock.current = false;
+      },
       onSuccess: (result): void => {
         setPlan(result);
       },
@@ -295,10 +303,15 @@ export function RoutingPage(): JSX.Element {
       : form.kind === "audio" && !form.discrete;
 
   const onTake = (): void => {
+    if (takeLock.current) return;
+    takeLock.current = true;
     setConfirmTake(false);
     takeRoute.mutate(
       { kind: form.kind, request: buildRequest(form) },
       {
+        onSettled: (): void => {
+          takeLock.current = false;
+        },
         onSuccess: (outcome): void => {
           if (outcome.status === "applied") {
             toast({
