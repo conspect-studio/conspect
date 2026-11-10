@@ -141,7 +141,7 @@ impl Drop for RuntimePermit {
 
 /// A single budget fences startup, all native leases, and its reaper together.
 /// A failed spawn drops the join handles, not the native leases on their threads.
-fn bounded_reap(permit: Arc<RuntimePermit>, reap: impl FnOnce() + Send + 'static) {
+pub(crate) fn bounded_reap(permit: Arc<RuntimePermit>, reap: impl FnOnce() + Send + 'static) {
     bounded_reap_with(permit, reap, |task| {
         std::thread::Builder::new()
             .name("optional-worker-reaper".into())

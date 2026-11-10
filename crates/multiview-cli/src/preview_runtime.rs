@@ -19,7 +19,34 @@ pub struct PreviewEncoderLease {
     producer: std::sync::OnceLock<crate::output_window_registry::OptionalWindowProducer>,
     pub(crate) initial_packets: Option<Vec<multiview_ffmpeg::EncodedPacket>>,
     initial_avc: Option<multiview_ffmpeg::codec_metadata::AvcDecoderConfig>,
+    #[cfg(test)]
+    before_encode: Option<Box<dyn FnOnce() + Send>>,
+    #[cfg(test)]
+    before_flush: Option<Box<dyn FnOnce() + Send>>,
     _runtime_permit: Option<std::sync::Arc<crate::preview_vertical::RuntimePermit>>,
+}
+impl PreviewEncoderLease {
+    pub(crate) fn encode_frame_at(
+        &mut self,
+        frame: multiview_ffmpeg::DecodedVideoFrame,
+        tick: u64,
+    ) -> multiview_output::Result<Vec<multiview_ffmpeg::EncodedPacket>> {
+        #[cfg(test)]
+        if let Some(hang) = self.before_encode.take() {
+            hang();
+        }
+        self.encoder.encode_frame_at(frame, tick)
+    }
+
+    pub(crate) fn finish(
+        &mut self,
+    ) -> multiview_output::Result<Vec<multiview_ffmpeg::EncodedPacket>> {
+        #[cfg(test)]
+        if let Some(hang) = self.before_flush.take() {
+            hang();
+        }
+        self.encoder.finish()
+    }
 }
 impl PreviewLease for PreviewEncoderLease {
     fn descriptor(&self) -> &OpenedPreview {
@@ -181,6 +208,10 @@ impl<R: OptionalRegistry> PreviewOpener for PreviewRuntimeOpener<R> {
             producer: std::sync::OnceLock::new(),
             initial_packets,
             initial_avc,
+            #[cfg(test)]
+            before_encode: None,
+            #[cfg(test)]
+            before_flush: None,
             _runtime_permit: self.runtime_permit.clone(),
         })
     }
@@ -394,7 +425,7 @@ mod actual_bridge_tests {
         (key, cost, production)
     }
     #[test]
-    fn hung_native_open_blocks_newly_parsed_reloads_until_native_completion() {
+    fn hung_native_open_blocks_replacements_until_native_completion() {
         let (key, cost, _) = actual_preview_setup();
         let budget = crate::preview_vertical::PreviewAdmissionBudget::new();
         let permit = budget.acquire().unwrap();
@@ -426,6 +457,81 @@ mod actual_bridge_tests {
         );
         drop(lease);
         assert!(budget.acquire().is_some());
+    }
+
+    fn assert_native_worker_hang_quarantines_budget(flush: bool) {
+        let (key, cost, _) = actual_preview_setup();
+        struct NoPublication;
+        impl OptionalRegistry for NoPublication {
+            type Registration = ();
+            fn publish_optional(&mut self, _: &[OpenedPreview]) -> Option<()> {
+                None
+            }
+        }
+        let budget = crate::preview_vertical::PreviewAdmissionBudget::new();
+        let mut opener = PreviewRuntimeOpener::new(vec![(key.clone(), cost)], NoPublication);
+        opener.runtime_permit = Some(budget.acquire().unwrap());
+        let mut lease = opener.open(&key).unwrap();
+        let reaper_permit = opener.runtime_permit.as_ref().unwrap().clone();
+        drop(opener);
+        let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(1);
+        let (release_tx, release_rx) = std::sync::mpsc::sync_channel(1);
+        let hang: Box<dyn FnOnce() + Send> = Box::new(move || {
+            entered_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+        });
+        if flush {
+            lease.before_flush = Some(hang);
+        } else {
+            lease.before_encode = Some(hang);
+        }
+        let mut worker =
+            crate::preview_fanout::PreviewWorker::spawn(0, key.cadence, key.cadence, lease, |_| {
+                Ok(())
+            })
+            .unwrap();
+        if !flush {
+            let canvas = Arc::new(
+                multiview_compositor::pipeline::Nv12Image::solid(
+                    160,
+                    120,
+                    16,
+                    128,
+                    128,
+                    multiview_core::color::ColorInfo::default(),
+                )
+                .unwrap(),
+            );
+            worker.offer(0, &canvas).unwrap();
+        }
+        let start = Instant::now();
+        crate::preview_vertical::bounded_reap(reaper_permit, move || {
+            worker.join().unwrap();
+        });
+        assert!(start.elapsed() < Duration::from_secs(1));
+        entered_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        for _ in 0..100 {
+            assert!(budget.acquire().is_none());
+        }
+        release_tx.send(()).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            if budget.acquire().is_some() {
+                break;
+            }
+            assert!(Instant::now() < deadline);
+            std::thread::yield_now();
+        }
+    }
+
+    #[test]
+    fn actual_optional_worker_encode_hang_retains_native_permit() {
+        assert_native_worker_hang_quarantines_budget(false);
+    }
+
+    #[test]
+    fn actual_optional_worker_flush_hang_retains_native_permit() {
+        assert_native_worker_hang_quarantines_budget(true);
     }
 
     #[test]
