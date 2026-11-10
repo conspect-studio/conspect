@@ -161,7 +161,8 @@
 .bd-takes label{width:100%}
 .bd-wall-grid{grid-template-columns:repeat(2,minmax(0,1fr))}
 .bd-rail{grid-template-columns:1fr}
-.bd-meter-note{display:none}
+/* the 'meters unavailable' statement is the only truthful meter UI without telemetry: never hide it on phones */
+.bd-meter-note{display:block}
 }
 
 
