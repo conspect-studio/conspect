@@ -260,3 +260,20 @@
 [data-approved-page="audio"] .mo-row,[data-approved-page="audio"] [data-testid="audio-overview-row"],[data-approved-page="audio"] [data-testid="audio-overview-program"] { min-height: var(--tap); }
 [data-approved-page="audio"] a[href] { min-width: var(--tap); justify-content: center; }
 [data-approved-page="audio"] .strip-bank [data-testid="audio-strip"] { padding: 10px 4px; }
+
+/* Round 3: bank at tablet+ (>=768): strips keep the column layout inside the
+   bank (fader + nudges beside, keys under) and the bank scrolls inside itself. */
+[data-approved-page="audio"] .strip-bank [data-testid="audio-strip-essential"] {
+  display: flex; flex-direction: column; align-items: stretch;
+}
+[data-approved-page="audio"] .strip-bank [data-testid="audio-strip-essential"] > div { grid-row: auto; }
+[data-approved-page="audio"] .mixer-main > * { min-width: 0; max-width: 100%; }
+[data-approved-page="audio"] .master-col > * { min-width: 0; max-width: 100%; }
+[data-approved-page="audio"] .strip-bank { overscroll-behavior-x: contain; }
+@media (min-width: 1280px) {
+  [data-approved-page="audio"] .mixer { grid-template-columns: minmax(0, 1fr) 240px; }
+  [data-approved-page="audio"] .master-col { width: 240px; max-width: 240px; overflow: hidden; }
+}
+/* sr-only (absolute) children must be clipped by the bank, not the page. */
+[data-approved-page="audio"] .strip-bank { position: relative; }
+[data-approved-page="audio"] { position: relative; overflow-x: clip; }

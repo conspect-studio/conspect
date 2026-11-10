@@ -1112,7 +1112,7 @@ export function AudioPage(): JSX.Element {
               role="group"
               aria-label={t`Channel picker — tap a channel to ride its strip`}
               data-testid="audio-strip-picker"
-              className="flex flex-wrap gap-2 xl:hidden"
+              className="flex flex-wrap gap-2 md:hidden"
             >
               {form.routes.map((route, index) => (
                 <Button
@@ -1140,7 +1140,7 @@ export function AudioPage(): JSX.Element {
           <section
             aria-labelledby="audio-bank-heading"
             data-testid="audio-bank"
-            className="hidden xl:block"
+            className="hidden md:block"
           >
             <h3 id="audio-bank-heading" className="mb-3 text-sm font-medium">
               <Trans>Mix bank</Trans>
@@ -1201,7 +1201,7 @@ export function AudioPage(): JSX.Element {
             <section
               aria-labelledby="audio-focused-heading"
               data-testid="audio-focused-strip"
-              className="flex flex-col gap-3 xl:hidden"
+              className="flex flex-col gap-3 md:hidden"
             >
               <h3 id="audio-focused-heading" className="sr-only">
                 <Trans>Channel strip</Trans>
