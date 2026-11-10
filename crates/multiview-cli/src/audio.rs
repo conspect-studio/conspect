@@ -554,7 +554,7 @@ impl AudioControlHandle {
                 if let Some(&(slot, _, _)) = self.declared_tracks.get(*name) {
                     if known.contains_key(*source) {
                         if let Some(input) = inputs.get_mut(slot) {
-                            *input = (*source).to_owned();
+                            (*source).clone_into(input);
                         }
                     }
                 }

@@ -5462,8 +5462,7 @@ impl ConsumerHotSource {
     /// The receiver the consumer pulls: the real queue, or the forwarder's.
     fn hot(&self) -> &Receiver<StreamItem> {
         match self {
-            Self::Real(hot) => hot,
-            Self::Faulted { hot, .. } => hot,
+            Self::Real(hot) | Self::Faulted { hot, .. } => hot,
         }
     }
 
@@ -5525,6 +5524,8 @@ impl StreamEgress {
     /// on. Dropping that sender (when the engine loop ends) closes the hot queue
     /// → the consumer drains, fans the remainder, drops the sink senders → each
     /// sink sees end-of-program and finalises → [`StreamEgress::join`] folds stats.
+    #[allow(clippy::too_many_lines)]
+    // reason: one linear spawn sequence (sink threads, then the single bake consumer) sharing many owned handles; splitting would only thread them through helper signatures.
     #[allow(clippy::too_many_arguments)] // reason: the bake consumer threads the encode, the audio bus + loudnorm + loudness meter, and the publisher — each a distinct, irreducible owned input to the off-hot-path consumer.
     fn spawn(
         ctx: BakeContext,
@@ -5745,8 +5746,8 @@ impl StreamEgress {
         (
             Self {
                 consumer,
-                sinks,
                 fatal,
+                sinks,
                 in_flight,
                 peak_occupancy,
             },
@@ -5949,7 +5950,7 @@ mod egress_fatal_tests {
         let consumer = std::thread::spawn(|| Ok(Vec::new()));
         let egress = egress_with_consumer(consumer, false);
         let outcome = egress.join().expect("healthy consumer joins clean");
-        assert!(outcome.sink_frames.is_empty());
+        assert_eq!(outcome.sink_frames.len(), 0);
         assert_eq!(outcome.peak_occupancy, 0);
     }
 
