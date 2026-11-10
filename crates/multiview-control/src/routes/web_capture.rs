@@ -62,9 +62,9 @@ pub(crate) async fn create(
     key: IdempotencyKey,
     Json(body): Json<CaptureBody>,
 ) -> ControlResult<(StatusCode, Json<serde_json::Value>)> {
-    let key = required_key(key)?;
     principal.role.require(Action::Write)?;
     authorize_object(&principal, &body.fill_id)?;
+    let key = required_key(key)?;
     if let Some(player) = &body.target_player {
         authorize_object(&principal, player)?;
         state.media_players.get(player)?;
