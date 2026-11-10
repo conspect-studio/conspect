@@ -11,9 +11,11 @@ import { OutputsPage } from '../OutputsPage';
 import { CrosspointGrid, DestinationPicker, RouteTruthStrip, RoutingHead, SourcePicker } from './RoutingSurface';
 import { renderWithProviders } from '../../test/render';
 
+let pgmTick = 0;
 const server = setupServer(
+  // The tick advances on every poll so the PGM readout can be confirmed.
   http.get('*/api/v1/switcher/me1', () =>
-    HttpResponse.json({ in_flight: false, preview_source: 'cam-b', program_source: 'cam-a', tick: 1 }),
+    HttpResponse.json({ in_flight: false, preview_source: 'cam-b', program_source: 'cam-a', tick: (pgmTick += 1) }),
   ),
   http.get('*/api/v1/sources', () =>
     HttpResponse.json([
@@ -68,7 +70,7 @@ describe('RoutingSurface', () => {
     renderWithProviders(<MemoryRouter><RoutingPage /></MemoryRouter>);
     await waitFor(() => {
       expect(within(screen.getByTestId('pgm-readout')).getByText('cam-a')).toBeInTheDocument();
-    });
+    }, { timeout: 8000 });
     await user.click(await screen.findByTestId('route-source-cam-b'));
     expect(screen.getByLabelText('Source input id')).toHaveValue('cam-b');
     expect(await screen.findByTestId('output-card-program')).toBeInTheDocument();

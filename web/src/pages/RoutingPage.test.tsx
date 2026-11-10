@@ -75,6 +75,9 @@ describe('RoutingPage', () => {
     await user.type(screen.getByLabelText('Source input id'), 'cam-north');
     await user.type(screen.getByLabelText('Target video cell'), 'cell-a');
     await user.click(screen.getByRole('button', { name: 'Take' }));
+    // PGM is unconfirmed (frozen tick) and takes are locked: the fail-safe
+    // asks for confirmation before sending.
+    await user.click(await screen.findByRole('button', { name: 'Confirm take' }));
 
     await waitFor(() => {
       expect(lastTakePath).toBe('/api/v1/routing/video/take');
