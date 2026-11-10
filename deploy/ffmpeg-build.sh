@@ -248,11 +248,16 @@ CONFIGURE_ARGS=(
   --disable-doc --disable-ffplay --disable-debug --disable-autodetect
   # ffprobe is KEPT (invariant #8: verify output with ffprobe); ffplay dropped.
   --enable-decoder=h264,hevc,av1,vp9,mpeg2video,mjpeg,ffv1,aac,opus,mp2,ac3,pcm_s16le,pcm_s24le,pcm_f32le,flac
+  # Caption/subtitle decoders the caption pipeline opens by name
+  # (multiview-ffmpeg caption_decode: cc_dec=ccaption, webvtt, subrip, mov_text=movtext, ass).
+  --enable-decoder=ccaption,webvtt,subrip,movtext,ass
   --enable-encoder=mpeg2video,ffv1,mjpeg,rawvideo,aac,libopus,mp2,flac,pcm_s16le,pcm_s24le,pcm_f32le
   --enable-parser=h264,hevc,av1,vp9,aac,opus,mpegaudio,mpegvideo
-  --enable-bsf=h264_mp4toannexb,hevc_mp4toannexb,extract_extradata,aac_adtstoasc,null
-  --enable-demuxer=mpegts,hls,mov,flv,rtsp,rtp,sdp,aac,matroska,h264,hevc,data,wav,pcm_f32le,pcm_s16le,pcm_s24le,flac
-  --enable-muxer=mpegts,mp4,mov,flv,rtsp,rtp,adts,data,wav,pcm_f32le,pcm_s16le,pcm_s24le,flac
+  # dump_extradata (runtime name dump_extra): in-band SPS/PPS before every IDR for
+  # continuous-ES splicing (multiview-ffmpeg bsf_select FILTER_DUMP_EXTRA).
+  --enable-bsf=h264_mp4toannexb,hevc_mp4toannexb,extract_extradata,dump_extradata,aac_adtstoasc,null
+  --enable-demuxer=mpegts,hls,mov,flv,rtsp,rtp,sdp,aac,matroska,h264,hevc,data,wav,pcm_f32le,pcm_s16le,pcm_s24le,flac,ogg,webvtt
+  --enable-muxer=mpegts,mp4,mov,flv,rtsp,rtp,adts,data,wav,pcm_f32le,pcm_s16le,pcm_s24le,flac,matroska
   # RTSP/HLS are demuxers (RTSP also a muxer); libsrt is the SRT URL protocol.
   --enable-protocol=file,pipe,tcp,udp,rtp,rtmp,http,https,tls,crypto,data,libsrt
   --enable-filter=scale,format,aformat,aresample,anull,null,fps,setpts,asetpts
@@ -355,6 +360,8 @@ echo "ffmpeg-build: ./configure ${CONFIGURE_ARGS[*]}"
 # resolved components now (before the expensive compile) as well as the final
 # CLI below. The URL scheme srt is implemented by CONFIG_LIBSRT_PROTOCOL.
 for component in LIBSRT_PROTOCOL RTSP_DEMUXER HLS_DEMUXER WAV_DEMUXER \
+                 CCAPTION_DECODER WEBVTT_DECODER SUBRIP_DECODER MOVTEXT_DECODER ASS_DECODER \
+                 DUMP_EXTRADATA_BSF OGG_DEMUXER WEBVTT_DEMUXER MATROSKA_MUXER \
                  PCM_F32LE_DEMUXER PCM_S16LE_DEMUXER PCM_S24LE_DEMUXER \
                  WAV_MUXER PCM_F32LE_MUXER PCM_S16LE_MUXER PCM_S24LE_MUXER; do
   if ! awk -v n="CONFIG_${component}" '$1 == "#define" && $2 == n && $3 == "1" { found=1 } END { exit !found }' config_components.h; then
