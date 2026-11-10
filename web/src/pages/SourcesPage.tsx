@@ -51,9 +51,7 @@ import type {
   SourceActivationChoice,
   WallClockChoice,
 } from '../resources/forms';
-import { CrudPage, KindCell } from '../resources/CrudPage';
-import { SourcePreviewButton } from '../preview/SourcePreviewButton';
-import { SourceEventsButton } from '../events/SourceEventsButton';
+import { CrudPage } from '../resources/CrudPage';
 import {
   AdvancedSection,
   ApplySemanticsCallout,
@@ -71,17 +69,14 @@ import { tileForSource, useLiveTiles } from '../resources/useLiveTiles';
 import type { LiveTile } from '../realtime/useEngineEvents';
 import { Button } from '../components/ui/button';
 import { useCatalogueLinks } from '../api/catalogueQueries';
-import { LinkActions, LinkCell, OriginPanel, SourceNetworkAction } from '../iptv/SourceLinks';
+import { OriginPanel } from '../iptv/SourceLinks';
 import type { SourceFormState as SeedForm } from '../resources/forms';
 import { HelpLink } from '../components/HelpLink';
-import { TileStateBadge } from '../components/TileStateBadge';
-import { SourceDemandBadge } from '../components/SourceDemandBadge';
-import { SourceLifecycleActions } from '../components/SourceLifecycleActions';
 import { useSourceStatus } from '../api/sourceStatus';
-import type { SourceDemand } from '../api/sourceStatus';
 import { useSystemCapabilities } from '../api/systemQueries';
-import { Info, Pencil, Trash2, TriangleAlert } from 'lucide-react';
-import { TaskWorkspace, TouchAction } from '../components/broadcast';
+import { Info, TriangleAlert } from 'lucide-react';
+import { SourcesSurface } from './approved/SourcesSurface';
+import { useProgramTally } from './approved/useProgramTally';
 
 /** The form-kind options offered in the picker (no legacy alias). */
 const FORM_KINDS: readonly SourceFormKind[] = SOURCE_KINDS.filter(
@@ -102,33 +97,6 @@ function fromTransportChoice(value: RtspTransportChoice): RtspTransport {
 }
 const WALLCLOCK_CHOICES: readonly WallClockChoice[] = ['default', 'use', 'discard'];
 const ACTIVATION_CHOICES: readonly SourceActivationChoice[] = ['always_on', 'on_demand'];
-
-/**
- * The status cell: the lifecycle state (idle / starting / ready / failed, with
- * who uses the source), the tile signal state while it runs (a separate axis),
- * and manual Start / Stop. Only an actual demand record establishes a phase;
- * missing status is unknown and must not authorize a lifecycle action.
- */
-function SourceStatusCell({
-  id,
-  name,
-  tile,
-  demand,
-}: {
-  readonly id: string;
-  readonly name: string;
-  readonly tile: LiveTile | undefined;
-  readonly demand: SourceDemand | undefined;
-}): JSX.Element {
-  const running = demand !== undefined && (demand.video_running || demand.audio_running);
-  return (
-    <span className="inline-flex flex-wrap items-center gap-1.5">
-      {demand !== undefined ? <SourceDemandBadge demand={demand} /> : <span><Trans>Status unknown</Trans></span>}
-      {running && tile !== undefined ? <TileStateBadge state={tile.state} /> : null}
-      {demand !== undefined ? <SourceLifecycleActions id={id} name={name} demand={demand} /> : null}
-    </span>
-  );
-}
 
 /**
  * The `youtube` source kind's live-only note + VT redirect, plus an honest
@@ -1067,6 +1035,8 @@ export function SourcesPage(): JSX.Element {
   const tiles = useLiveTiles();
   const demand = useSourceStatus();
   const links = useCatalogueLinks();
+  const programTally = useProgramTally();
+  const [helpOpen, setHelpOpen] = useState(false);
   const linkBySource = new Map((links.data?.links ?? []).map((l) => [l.source_id, l]));
   // "Add as source" from /sources/iptv-org arrives as router state; each distinct
   // timestamp opens the create dialog once, prefilled (nothing is saved yet).
@@ -1079,86 +1049,43 @@ export function SourcesPage(): JSX.Element {
     setSeed({ key: incoming.ts, creating: true, form: incoming.form });
   }
 
-  // Keep row identity and the original action components: their permissions,
-  // live status queries and mutations remain the source of truth.
+  // The approved surface owns presentation only; the original action
+  // components, permissions, live status queries and mutations stay the
+  // source of truth.
   const renderItems = (
     rows: readonly SourceView[],
     onEdit: (row: SourceView) => void,
     onDelete: (row: SourceView) => void,
   ): JSX.Element => (
-    <ul aria-label={t`Configured ingest sources.`} className="grid min-w-0 grid-cols-1 gap-4 xl:grid-cols-2">
-      {rows.map((source) => {
-        const editReason = source.editable
-          ? undefined
-          : t`kind "${source.rawKind}" isn't editable in this UI; the document is preserved as authored`;
-        return (
-          <li key={source.id} data-testid={`source-card-${source.id}`} className="min-w-0 break-words">
-            <TaskWorkspace
-              title={
-                <span className="flex min-w-0 flex-wrap items-baseline gap-x-2">
-                  <span lang="" dir="auto" className="min-w-0 break-all">{source.name}</span>
-                  <code lang="" dir="auto" className="min-w-0 break-all text-xs text-muted-foreground">{source.id}</code>
-                  <KindCell value={source.rawKind} />
-                </span>
-              }
-              status={
-                <div className="flex min-w-0 flex-col gap-2 text-sm text-foreground">
-                  <div className="flex flex-wrap items-center gap-2">
-                    <Trans>Status</Trans>
-                    <HelpLink to="/help/concepts/resilience#tile-lifecycle" label={t`About tile lifecycle states`} compact />
-                  </div>
-                  <SourceStatusCell id={source.id} name={source.name} tile={tileForSource(tiles, source.id)} demand={demand.data?.get(source.id)} />
-                </div>
-              }
-            >
-              <div className="grid min-w-0 gap-4">
-                <div className="min-w-0 text-sm">
-                  <span className="text-muted-foreground"><Trans>Locator</Trans>: </span>
-                  <code lang="" dir="auto" className="break-all text-xs">{source.locator ?? t`No locator configured`}</code>
-                </div>
-                <div className="flex min-w-0 flex-wrap items-start gap-2">
-                  <SourcePreviewButton id={source.id} name={source.name} />
-                  <SourceEventsButton id={source.id} name={source.name} eventObservation={source.eventObservation} />
-                  <TouchAction
-                    variant="outline"
-                    aria-label={editReason === undefined ? `${t`Edit source`}: ${source.name}` : `${t`Edit source`}: ${source.name} — ${editReason}`}
-                    aria-disabled={!source.editable}
-                    disabled={!source.editable}
-                    disabledReason={editReason}
-                    className="min-h-12"
-                    onPress={(): void => { if (source.editable) { onEdit(source); } }}
-                  >
-                    <Pencil aria-hidden="true" /><Trans>Edit</Trans>
-                  </TouchAction>
-                  <TouchAction variant="ghost" className="min-h-12" aria-label={`${t`Delete source`}: ${source.name}`} onPress={(): void => { onDelete(source); }}>
-                    <Trash2 aria-hidden="true" /><Trans>Delete</Trans>
-                  </TouchAction>
-                </div>
-                <div className="grid min-w-0 gap-2 border-t pt-3 text-sm">
-                  {linkBySource.has(source.id) ? <LinkCell link={linkBySource.get(source.id)} /> : <span className="text-muted-foreground"><Trans>Not linked to IPTV-ORG</Trans></span>}
-                  <div className="flex min-w-0 flex-wrap items-start gap-2">
-                    <LinkActions sourceId={source.id} sourceName={source.name} locator={source.locator} link={linkBySource.get(source.id)} />
-                    <SourceNetworkAction sourceId={source.id} sourceName={source.name} />
-                  </div>
-                </div>
-              </div>
-            </TaskWorkspace>
-          </li>
-        );
-      })}
-    </ul>
+    <SourcesSurface
+      rows={rows}
+      demand={demand.data}
+      tileFor={(id): LiveTile | undefined => tileForSource(tiles, id)}
+      linkFor={(id): ReturnType<typeof linkBySource.get> => linkBySource.get(id)}
+      onEdit={onEdit}
+      onDelete={onDelete}
+      tally={programTally}
+    />
   );
 
   return (
-    <div data-sources-touch="" className="min-w-0 [&_button]:min-h-12 [&_button]:min-w-12 [&_button]:h-auto [&_button]:whitespace-normal [&_button]:break-words [&_button]:max-w-full [&_button>span]:min-w-0 [&_button>span]:whitespace-normal [&_button>span]:[overflow-wrap:anywhere] [&_a]:min-w-12 [&_a]:min-h-12 [&_a]:whitespace-normal [&_a]:break-words [&>div:first-child>div:last-child]:flex-wrap [&>div:first-child>div:last-child]:min-w-0 [&>div:first-child>div:last-child]:max-w-full">
+    <div data-sources-touch="" data-approved-page="sources" className="src-page min-w-0 [&_button]:min-h-12 [&_button]:min-w-12 [&_button]:h-auto [&_button]:whitespace-normal [&_button]:break-words [&_button]:max-w-full [&_button>span]:min-w-0 [&_button>span]:whitespace-normal [&_button>span]:[overflow-wrap:anywhere] [&_a]:min-w-12 [&_a]:min-h-12 [&_a]:whitespace-normal [&_a]:break-words [&>div:first-child>div:last-child]:flex-wrap [&>div:first-child>div:last-child]:min-w-0 [&>div:first-child>div:last-child]:max-w-full">
     <CrudPage<SourceView, SourceFormState, SourceField>
       kind="sources"
       dialogClassName="[&_button]:min-h-12 [&_button]:min-w-12 [&_button]:h-auto [&_button]:whitespace-normal [&_button]:[overflow-wrap:anywhere] [&_summary]:min-h-12 [&_summary]:content-center [&_input]:min-h-12 [&_input]:min-w-12 [&_select:not([aria-hidden=true])]:min-h-12 [&_select:not([aria-hidden=true])]:min-w-12 [&_[role=combobox]]:min-h-12 [&_[role=combobox]]:min-w-12 [&_a]:min-h-12 [&_a]:min-w-12 [&_a]:inline-flex [&_a]:items-center [&_a]:whitespace-normal [&_a]:[overflow-wrap:anywhere] [&_*]:min-w-0"
-      title={<Trans>Sources</Trans>}
+      title={<Trans>Sources &amp; library</Trans>}
       description={
-        <span className="inline-flex flex-wrap items-center gap-x-3 gap-y-1">
-          <Trans>Add and manage live ingest sources.</Trans>
-          <HelpLink to="/help/concepts/transports#choosing" label={t`About source transports`} />
+        <span className="src-sub">
+          <Trans>Live source lifecycle — exceptions sort first.</Trans>
+          <button
+            type="button"
+            className="help-btn"
+            aria-expanded={helpOpen}
+            aria-controls="src-help-panel"
+            onClick={(): void => { setHelpOpen((v) => !v); }}
+          >
+            <Trans>ⓘ Help</Trans>
+          </button>
         </span>
       }
       newLabel={t`New source`}
@@ -1182,9 +1109,27 @@ export function SourcesPage(): JSX.Element {
         </>
       }
       callout={
-        <ApplySemanticsCallout
-          helpTo="/help/config#sources"
-          helpLabel={t`How configuration applies`}
+        helpOpen ? (
+          <div className="help-panel" id="src-help-panel" role="region" aria-label={t`Sources help`}>
+            <p>
+              <Trans>
+                <b>Read the row:</b> Signal (frames arriving), Lifecycle (idle → starting → ready → failed),
+                Activation (always-on / on-demand) and Tally (red = on programme) are separate facts. Anything
+                this page cannot confirm reads Unknown.
+              </Trans>
+            </p>
+            <p>
+              <Trans>
+                <b>YouTube restream:</b> the inbound ingest and the outbound destination publishing (Routing)
+                are separate paths — one failing never means the other is broken.
+              </Trans>
+            </p>
+            <p>
+              <HelpLink to="/help/concepts/transports#choosing" label={t`About source transports`} />
+            </p>
+            <ApplySemanticsCallout
+              helpTo="/help/config#sources"
+              helpLabel={t`How configuration applies`}
           message={
             <Trans>
               Synthetic sources (bars, solid colour, clock, timer) apply to the
@@ -1197,7 +1142,9 @@ export function SourcesPage(): JSX.Element {
               or restart).
             </Trans>
           }
-        />
+            />
+          </div>
+        ) : null
       }
       savedDescription={t`Stored. Synthetic sources (bars, solid colour, clock, timer) and — on a full-engine run — network/file sources apply to the running engine immediately; NDI / YouTube / AES67 (and any kind on the software engine) go live via config export + restart. The response header declares which applied.`}
       deletedDescription={t`Removed. The running engine drops the source immediately (the response header confirms) — tiles bound to it show the no-signal slate until re-routed.`}
