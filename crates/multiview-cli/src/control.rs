@@ -234,6 +234,7 @@ where
     )
     .with_preview(preview)
     .with_warning_store(warnings);
+    state = state.with_web_capture(multiview_control::web_capture_startup::from_environment()?);
     if let Some(reader) = source_events {
         state = state.with_source_events(Arc::new(reader));
     }

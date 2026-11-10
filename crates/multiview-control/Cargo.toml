@@ -12,6 +12,7 @@ authors.workspace = true
 publish = false
 
 [dependencies]
+multiview-webengine = { path = "../multiview-webengine" }
 multiview-moq = { path = "../multiview-moq", optional = true }
 multiview-cloudflare = { path = "../multiview-cloudflare" }
 multiview-credentials = { path = "../multiview-credentials" }

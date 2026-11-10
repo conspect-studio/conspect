@@ -542,6 +542,8 @@ impl Default for LiveSourceCapability {
 /// * `idempotency` — the `Idempotency-Key` dedupe store.
 #[derive(Clone)]
 pub struct AppState {
+    /// Optional real background browser capture service.
+    pub web_capture: crate::web_capture::Provider,
     /// The engine's outbound publisher (state slot + event broadcast).
     pub engine: Arc<EnginePublisher<EngineStateSnapshot, Event>>,
     /// The inbound, bounded, non-blocking command bus sender.
@@ -997,6 +999,7 @@ impl AppState {
             source_events: None,
             whep: crate::preview::no_whep(),
             moq: Arc::new(crate::moq::MoqRegistry::default()),
+            web_capture: crate::web_capture::Provider::default(),
             cloudflare: None,
             whip: crate::whip::no_whip(),
             whep_output: crate::whep_output::no_whep_output(),
@@ -2085,5 +2088,14 @@ areas = ["a"]
             2,
             "both authored cells mirrored into the layout"
         );
+    }
+}
+
+impl AppState {
+    /// Attach a real capture service created by the binary management startup.
+    #[must_use]
+    pub fn with_web_capture(mut self, provider: crate::web_capture::Provider) -> Self {
+        self.web_capture = provider;
+        self
     }
 }

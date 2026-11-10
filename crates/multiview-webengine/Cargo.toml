@@ -1,0 +1,34 @@
+[package]
+name = "multiview-webengine"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license-file.workspace = true
+repository.workspace = true
+authors.workspace = true
+# Workspace-internal implementation crate; never published to crates.io
+# (matches xtask / multiview-ntpsys). This lets cargo-deny's allow-wildcard-paths
+# exempt the intra-workspace path deps while still denying real "*" version
+# wildcards.
+publish = false
+description = "Web-engine resource scopes, process-tree/cgroup accounting sampler and the clip-job state model (ADR-0099, ADR-0100)."
+
+[dependencies]
+tokio = { workspace = true, features = ["signal"] }
+serde = { workspace = true }
+thiserror = { workspace = true }
+serde_json = { workspace = true }
+sha2 = "0.10"
+rustix = { workspace = true, features = ["event", "fs", "process", "param"] }
+# Rust-owned private job root (profile/HOME/TMPDIR) removed after all children are dead.
+tempfile = "3"
+
+[dev-dependencies]
+# Asserting the wire shape of the published record, in particular that an
+# unknown GPU figure serializes as absent rather than zero. Already a workspace
+# dependency.
+serde_json = { workspace = true }
+# Declared-file fixtures for the /proc and /sys walks (never the real ones) and
+
+[lints]
+workspace = true
