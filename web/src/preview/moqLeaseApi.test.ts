@@ -15,7 +15,7 @@ describe('MoQ typed lease adapter', () => {
   await expect(createMoqLeaseApi('program','/api/v1/preview/program/whep').acquire(new AbortController().signal)).rejects.toBeInstanceOf(MoqUnavailable);
  });
  it('scopes release and checks generation acknowledgement', async () => {
-  const lease: MoqLease = {lease_id:'lease',generation:7,protocol:'moq-transport-18',expires_at:'',url:'',broadcast:'',audio:[],video:{codec:'vp8',coded_width:320,coded_height:180}};
+  const lease: MoqLease = {lease_id:'lease',generation:7,protocol:'moq-transport-18',expires_at:'',expires_in_ms:60000,url:'',broadcast:'',audio:[],video_alternatives:[],video:{codec:'vp8',coded_width:320,coded_height:180}};
   mocks.DELETE.mockResolvedValue({data:{lease_id:'lease',generation:6,revoked:true}});
   await expect(createMoqLeaseApi('input','/api/v1/preview/inputs/camera/whep').release(lease)).rejects.toThrow('not acknowledged');
   expect(mocks.DELETE).toHaveBeenCalledWith('/api/v1/preview/inputs/{id}/moq/{lease_id}',expect.objectContaining({params:{path:{id:'camera',lease_id:'lease'},query:{generation:7}}}));

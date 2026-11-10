@@ -1,18 +1,264 @@
-#!/usr/bin/env bash
-# Repository local gate: the full CI set documented in AGENTS.md
-# ("Commands" -> full CI set). The pre-push hook runs this through the DSH
-# local-gate wrapper; CI still runs its own full matrix.
-#
-# It replaces a task-specific MoQ branch gate that merged to main and could
-# only ever pass for that one branch's exact commit.
-set -euo pipefail
-cd "$(dirname "$0")/.."
-test -z "$(git status --porcelain --untracked-files=all)" || {
-  echo "bin/check: working tree must be clean" >&2; exit 1; }
-set -x
-cargo fmt --all -- --check
-cargo clippy --locked --workspace --all-targets -- -D warnings
-# tile_driven_meets_budget is a wall-clock budget test; ci.yml skips it on
-# shared runners for the same reason.
-cargo test --locked --workspace -- --skip tile_driven_meets_budget
-cargo deny check
+#!/usr/bin/env python3
+"""Run actual current-HEAD proportional checks; DRAFT evidence, never merge approval."""
+import fcntl
+import json
+import os
+import pathlib
+import re
+import shlex
+import shutil
+import signal
+import stat
+import subprocess
+import sys
+import time
+
+ROOT = pathlib.Path(__file__).resolve().parent.parent
+GIB = 1024 ** 3
+MIN_FREE = 360 * GIB
+# Authoring stays <=2 GiB; this proposed execution cap needs separate review.
+MAX_TARGET = 15 * GIB
+
+# A new MAIN candidate decision, NOT a third T78 workspace-suite attempt.
+# CI remains unchanged. This local gate can establish DRAFT evidence only.
+COMMANDS = [
+    ('gate-tests', ['python3', '-B', 'scripts/test_final_head_gate.py']),
+    ('fmt', ['cargo', 'fmt', '--all', '--', '--check']),
+    ('check', ['cargo', 'check', '--locked', '--workspace']),
+    ('clippy', ['cargo', 'clippy', '--locked', '--workspace', '--all-targets', '--', '-D', 'warnings']),
+    ('deny', ['cargo', 'deny', 'check']),
+    ('moq-check', ['cargo', 'check', '--locked', '-p', 'multiview-cli', '--features', 'moq-output,gpl-codecs']),
+    ('moq-clippy', ['cargo', 'clippy', '--locked', '-p', 'multiview-cli', '--features', 'moq-output,gpl-codecs', '--all-targets', '--', '-D', 'warnings']),
+    ('moq-test', ['cargo', 'test', '--locked', '-p', 'multiview-moq', '--lib']),
+    ('moq-outputs-test', ['cargo', 'test', '--locked', '-p', 'multiview-cli', '--features', 'moq-output', '--lib', 'moq_outputs::']),
+    ('outgoing-including-handshake-test', ['cargo', 'test', '--locked', '-p', 'multiview-cli', '--features', 'moq-output', '--lib', 'outgoing_']),
+    ('handshake-test', ['cargo', 'test', '--locked', '-p', 'multiview-cli', '--features', 'moq-output', '--lib', 'pending_outgoing_handshake']),
+    ('relay-url-test', ['cargo', 'test', '--locked', '-p', 'multiview-cli', '--features', 'moq-output', '--lib', 'relay_url_file']),
+    ('authority-bridge-unit-test', ['cargo', 'test', '--locked', '-p', 'multiview-control', '--features', 'moq-transport', '--example', 'abr_authority']),
+    ('native-h264-http-test', ['cargo', 'test', '--locked', '-p', 'multiview-cli', '--features', 'moq-output,gpl-codecs', '--lib', 'actual_h264_pipeline_http', '--', '--test-threads=1']),
+    ('web-install', ['npm', '--prefix', 'web', 'ci']),
+    ('web-moq-abr', ['npm', '--prefix', 'web', 'run', 'test', '--', 'src/preview/moqAbr.test.ts', 'src/preview/MoqPlayerAbr.test.tsx', '--maxWorkers=2']),
+    ('web-preview', ['npm', '--prefix', 'web', 'run', 'test', '--', 'src/preview/moqConnection.test.ts', 'src/preview/moqPlayback.test.ts', 'src/preview/moqLeaseApi.test.ts', 'src/preview/MoqSelection.test.tsx', 'src/preview/PreviewSurface.test.tsx', 'src/preview/capabilities.test.ts', 'src/preview/outputPlayback.test.ts', 'src/preview/diagnostics.test.ts', 'src/preview/PreviewDiagnostics.test.tsx', '--maxWorkers=2']),
+    ('web-lint', ['npm', '--prefix', 'web', 'run', 'lint']),
+    ('web-build', ['npm', '--prefix', 'web', 'run', 'build']),
+    ('probe-syntax', ['node', '--check', 'web/scripts/moq-cloudflare-probe.mjs']),
+]
+
+
+def require(condition, message):
+    if not condition:
+        raise RuntimeError(message)
+
+
+def git(*args):
+    return subprocess.check_output(['git', *args], cwd=ROOT, text=True).strip()
+
+
+def validate(expected_head=None):
+    require(not git('status', '--porcelain', '--untracked-files=all'),
+            'working tree must be clean, including untracked files')
+    head = git('rev-parse', 'HEAD')
+    require(expected_head is None or head == expected_head, 'HEAD changed during gate')
+    return head
+
+
+def environment():
+    env = os.environ.copy()
+    require('CARGO_TARGET_DIR' not in env, 'unset CARGO_TARGET_DIR: use only worktree-local targets')
+    require('CARGO_BUILD_TARGET_DIR' not in env, 'unset CARGO_BUILD_TARGET_DIR')
+    env.update(CARGO_BUILD_JOBS='2', CARGO_INCREMENTAL='0')
+    return env
+
+
+def prerequisites(env):
+    # Check before any expensive leg, not as a panic inside the native test.
+    require(shutil.which('openssl', path=env.get('PATH', os.defpath)) is not None,
+            'required native prerequisite unavailable: openssl executable on PATH')
+
+
+def target_directories():
+    # Standalone tool manifests have their own local targets, counted together.
+    return [ROOT / 'target', ROOT / 'tools/moq-fixture/target',
+            ROOT / 'tools/verify-moq-roots/target']
+
+
+def target_bytes():
+    """Sample pinned directories; only vanished entries may be omitted.
+
+    Not an atomic snapshot: concurrent creation/growth between visits can escape
+    a sample. Count the larger of apparent/allocated bytes, including directories
+    and symlinks (without following them), and deduplicate hard-linked inodes.
+    """
+    seen = set()
+
+    def size(info):
+        identity = (info.st_dev, info.st_ino)
+        if identity in seen:
+            return 0
+        seen.add(identity)
+        return max(info.st_size, info.st_blocks * 512)
+
+    def walk(descriptor):
+        total = size(os.fstat(descriptor))
+        with os.scandir(descriptor) as entries:
+            for entry in entries:
+                try:
+                    info = os.stat(entry.name, dir_fd=descriptor, follow_symlinks=False)
+                    if stat.S_ISDIR(info.st_mode):
+                        child = os.open(entry.name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                                        dir_fd=descriptor)
+                        try:
+                            total += walk(child)
+                        finally:
+                            os.close(child)
+                    else:
+                        total += size(info)
+                except FileNotFoundError:
+                    # Rust removes temporary rmeta/object files during a build.
+                    # Permission, I/O, symlink-substitution and other errors fail closed.
+                    continue
+        return total
+
+    total = 0
+    for target in target_directories():
+        try:
+            descriptor = os.open(target, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        except FileNotFoundError:
+            continue
+        try:
+            total += walk(descriptor)
+        finally:
+            os.close(descriptor)
+    return total
+
+
+def resources():
+    require(shutil.disk_usage(ROOT).free >= MIN_FREE, 'free disk below 360 GiB floor')
+    total = target_bytes()
+    require(total <= MAX_TARGET, 'combined local targets exceed 15 GiB; stop and inspect owned artifacts')
+    return total
+
+
+def command_timeout(label):
+    if label.startswith(('native-', 'web-')):
+        return 10 * 60
+    if 'check' in label or 'clippy' in label:
+        return 20 * 60
+    return 10 * 60
+
+
+def stop_process_group(process):
+    # Always address only the new session we own, even if its leader has exited.
+    try:
+        os.killpg(process.pid, signal.SIGTERM)
+    except ProcessLookupError:
+        return
+    try:
+        process.wait(timeout=10)
+    except subprocess.TimeoutExpired:
+        pass
+    try:
+        os.killpg(process.pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    process.wait()
+
+
+def run_command(command, log, env, timeout_seconds=600):
+    before = resources()
+    peak = before
+    print('+', shlex.join(command), 'log:', log.relative_to(ROOT), flush=True)
+    started = time.monotonic()
+    with log.open('wb') as output:
+        output.write(f'target_bytes_before={before} timeout_seconds={timeout_seconds}\n'.encode())
+        output.flush()
+        process = subprocess.Popen(command, cwd=ROOT, env=env, stdout=output,
+                                   stderr=subprocess.STDOUT, start_new_session=True)
+        try:
+            while True:
+                remaining = timeout_seconds - (time.monotonic() - started)
+                require(remaining > 0, f'wall timeout after {timeout_seconds}s: {shlex.join(command)}; see {log}')
+                try:
+                    result = process.wait(timeout=min(5, remaining))
+                    break
+                except subprocess.TimeoutExpired:
+                    peak = max(peak, resources())
+            require(result == 0, f'{shlex.join(command)} exited {result}; see {log}')
+            peak = max(peak, resources())
+        finally:
+            stop_process_group(process)
+            after = target_bytes()
+            peak = max(peak, after)
+            output.write(f'\ntarget_bytes_after={after} growth_bytes={after - before} '
+                         f'sampled_peak_bytes={peak}\n'.encode())
+
+
+def verify_test_execution(command, log):
+    """A zero-test filter match is not evidence for a required test leg."""
+    rust = command[:2] == ['cargo', 'test']
+    browser = command[:5] == ['npm', '--prefix', 'web', 'run', 'test']
+    if not (rust or browser):
+        return
+    text = log.read_text(errors='replace')
+    if rust:
+        results = re.findall(r'^test result: ok\. (\d+) passed;', text, re.MULTILINE)
+        require(results and sum(map(int, results)) > 0,
+                f'no passing Rust tests reported; see {log}')
+    if command[:5] == ['npm', '--prefix', 'web', 'run', 'test']:
+        require(re.search(r'Tests\s+[1-9]\d* passed', text),
+                f'no passing browser tests reported; see {log}')
+
+
+def execute(directory, head, env):
+    for label, command in COMMANDS:
+        validate(head)
+        started = time.time()
+        log = directory / f'{head}-{label}-{time.time_ns()}.log'
+        record = {'head': head, 'label': label, 'command': command,
+                  'started_unix': started, 'timeout_seconds': command_timeout(label),
+                  'log': str(log.relative_to(ROOT))}
+        try:
+            run_command(command, log, env, command_timeout(label))
+            verify_test_execution(command, log)
+            validate(head)
+        except BaseException as error:
+            record.update(status='failed', error=f'{type(error).__name__}: {error}')
+            with (directory / 'commands.jsonl').open('a') as output:
+                output.write(json.dumps(record) + '\n')
+            raise
+        record.update(status='passed', exit=0)
+        with (directory / 'commands.jsonl').open('a') as output:
+            output.write(json.dumps(record) + '\n')
+    validate(head)
+    print('DRAFT proportional checks completed on CURRENT HEAD:', head, flush=True)
+    print('NOT merge approval; full workspace suite NOT run locally; require normal CI green.', flush=True)
+    print('Native logs are host-tested evidence, not deployment or CI matrix acceptance.', flush=True)
+
+
+def main():
+    require(sys.argv[1:] in ([], ['--validate-only']), 'usage: bin/check [--validate-only]')
+    head = validate()
+    env = environment()
+    prerequisites(env)
+    if sys.argv[1:]:
+        resources()
+        print('Preflight target bytes:', target_bytes(), '; cap:', MAX_TARGET,
+              '; full workspace/native peak UNMEASURED; no duplicate cold caches')
+        print('Preflight only:', head, '; NO tests run and NO gate pass')
+        return
+    directory = ROOT / 'target/main-draft-gate'
+    directory.mkdir(parents=True, exist_ok=True)
+    with (directory / 'run.lock').open('w') as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as error:
+            raise RuntimeError('another local gate is already active') from error
+        execute(directory, head, env)
+
+
+if __name__ == '__main__':
+    try:
+        main()
+    except (RuntimeError, subprocess.CalledProcessError, OSError, ValueError) as error:
+        print('CURRENT-HEAD draft gate FAIL:', error, file=sys.stderr)
+        sys.exit(1)
