@@ -5384,6 +5384,169 @@ fn drive_audio_for_item(
     bus.tick_to(tick_index.saturating_add(1))
 }
 
+/// Mix one survivor without assigning its selection to earlier, shed ticks.
+fn drive_selected_audio_for_item(
+    bus: &mut multiview_audio::program::ProgramBus,
+    handle: Option<&crate::audio::AudioControlHandle>,
+    item: &StreamItem,
+    last_tick: &mut Option<u64>,
+) -> Result<multiview_audio::format::AudioBlock, PipelineError> {
+    if last_tick.is_some_and(|last| item.tick_index <= last) {
+        // A stale item must neither read PCM again nor change the next tick's gains.
+        return Ok(multiview_audio::format::AudioBlock::silence(
+            bus.format(),
+            0,
+        ));
+    }
+    // tick_to is exclusive: current_tick catches up ONLY the preceding ticks.
+    // Preserve the previous selection and routing for that entire shed interval.
+    let preceding = if item.switcher_audio_enabled && last_tick.is_some() {
+        Some(bus.tick_to(item.tick_index))
+    } else {
+        None
+    };
+    if let Some(handle) = handle {
+        handle.apply_pending(bus);
+        if item.switcher_audio_enabled {
+            handle.select_program_source(bus, item.switcher_audio.as_deref());
+        }
+    }
+    let current = drive_audio_for_item(bus, item.tick_index);
+    *last_tick = Some(item.tick_index);
+    match preceding {
+        Some(preceding) if preceding.frame_count() != 0 => {
+            let mut samples =
+                Vec::with_capacity(preceding.interleaved().len() + current.interleaved().len());
+            samples.extend_from_slice(preceding.interleaved());
+            samples.extend_from_slice(current.interleaved());
+            multiview_audio::format::AudioBlock::from_interleaved(current.format(), samples)
+                .map_err(|error| PipelineError::Engine(format!("audio catch-up: {error}")))
+        }
+        _ => Ok(current),
+    }
+}
+
+#[cfg(test)]
+mod switcher_shed_audio_tests {
+    use super::*;
+    use multiview_audio::{
+        format::AudioFormat, program::ProgramBus, store::AudioStore, ChannelLayout,
+    };
+    #[cfg(feature = "overlay")]
+    use std::collections::HashMap;
+
+    fn item(tick_index: u64, source: &str) -> StreamItem {
+        StreamItem {
+            switcher_audio: Some(source.into()),
+            switcher_audio_enabled: true,
+            #[cfg(feature = "overlay")]
+            events: HashMap::new(),
+            canvas: Arc::new(
+                Nv12Image::solid(16, 16, 16, 128, 128, CanvasColor::default().output_tag())
+                    .expect("canvas"),
+            ),
+            tick_index,
+            #[cfg(feature = "overlay")]
+            source_states: HashMap::new(),
+            #[cfg(feature = "overlay")]
+            tile_specs: Arc::new(Vec::new()),
+            #[cfg(feature = "overlay")]
+            captions: HashMap::new(),
+            #[cfg(feature = "overlay")]
+            caption_bitmaps: HashMap::new(),
+            #[cfg(feature = "overlay")]
+            faults: HashMap::new(),
+        }
+    }
+
+    #[test]
+    fn switcher_shed_gap_keeps_pre_cut_tone_and_stale_item_cannot_change_gain() {
+        let format = AudioFormat::new(48_000, ChannelLayout::Stereo);
+        let tone = |hz: f32| -> Vec<f32> {
+            (0..24_000)
+                .flat_map(|n| {
+                    let sample = 0.2 * (std::f32::consts::TAU * hz * n as f32 / 48_000.0).sin();
+                    [sample, sample]
+                })
+                .collect()
+        };
+        let pcm_a = tone(400.0);
+        let pcm_b = tone(1000.0);
+        let a = Arc::new(AudioStore::timeline(format, 24_000));
+        let b = Arc::new(AudioStore::timeline(format, 24_000));
+        a.publish_window(0, &pcm_a).expect("A tone");
+        b.publish_window(0, &pcm_b).expect("B tone");
+        let mut bus = ProgramBus::new(format, Rational::new(25, 1));
+        let pa = bus.add_source("a", Arc::clone(&a), 1.0);
+        let pb = bus.add_source("b", Arc::clone(&b), 1.0);
+        let handle = crate::audio::AudioControlHandle::from_sources(
+            [("a".into(), a), ("b".into(), b)].into_iter().collect(),
+            [("a".into(), pa), ("b".into(), pb)].into_iter().collect(),
+        );
+        // The production live queue is genuinely filled: ticks 4 and 5 are shed.
+        let (tx, rx) = std::sync::mpsc::sync_channel(LIVE_QUEUE_CAP);
+        for tick in 0..4 {
+            tx.try_send(item(tick, "a")).expect("queue capacity");
+        }
+        for tick in 4..6 {
+            assert!(matches!(
+                tx.try_send(item(tick, "a")),
+                Err(std::sync::mpsc::TrySendError::Full(_))
+            ));
+        }
+        let mut last = None;
+        for tick in 0..4 {
+            let survivor = rx.recv().expect("A survivor");
+            let block =
+                drive_selected_audio_for_item(&mut bus, Some(&handle), &survivor, &mut last)
+                    .expect("audio");
+            assert_eq!(block.frame_count(), 1920);
+            assert_pcm(&block, &pcm_a, tick * 1920);
+        }
+        tx.try_send(item(6, "b")).expect("CUT survivor");
+        let block = drive_selected_audio_for_item(
+            &mut bus,
+            Some(&handle),
+            &rx.recv().expect("CUT"),
+            &mut last,
+        )
+        .expect("audio");
+        assert_eq!(
+            block.frame_count(),
+            3 * 1920,
+            "two shed ticks plus the current tick, no lost or double-read samples"
+        );
+        for (i, actual) in block.interleaved().iter().enumerate() {
+            let expected = if i < 2 * 1920 * 2 { &pcm_a } else { &pcm_b };
+            assert!(
+                (actual - expected[4 * 1920 * 2 + i]).abs() < 1e-5,
+                "tick {} must retain its composited source",
+                4 + i / (1920 * 2)
+            );
+        }
+        let stale =
+            drive_selected_audio_for_item(&mut bus, Some(&handle), &item(5, "a"), &mut last)
+                .expect("stale audio");
+        assert_eq!(stale.frame_count(), 0);
+        assert_eq!(
+            bus.program_gain(pa),
+            Some(0.0),
+            "stale item must not switch back to A"
+        );
+        assert_eq!(bus.program_gain(pb), Some(1.0));
+        let next = drive_selected_audio_for_item(&mut bus, Some(&handle), &item(7, "b"), &mut last)
+            .expect("next audio");
+        assert_pcm(&next, &pcm_b, 7 * 1920);
+    }
+
+    fn assert_pcm(block: &multiview_audio::format::AudioBlock, expected: &[f32], start: usize) {
+        assert_eq!(block.frame_count(), 1920, "exact current-tick PCM budget");
+        for (actual, expected) in block.interleaved().iter().zip(&expected[start * 2..]) {
+            assert!((actual - expected).abs() < 1e-5, "selected PCM sample");
+        }
+    }
+}
+
 /// The single bake-consumer thread body (encode-once-mux-many, invariant #7):
 /// build the [`StreamBaker`] from the owned [`BakeContext`] and own the single
 /// [`ProgramEncoder`], then loop receiving [`StreamItem`]s — bake each into an
@@ -5450,6 +5613,7 @@ fn consumer_main(
     // Track which sinks are still live (their receiver has not hung up) so a sink
     // that ended early does not wedge or repeatedly error the consumer.
     let mut live: Vec<bool> = vec![true; sink_txs.len()];
+    let mut last_audio_tick = None;
     // `recv()` returns `Err` only when the hot sender drops = end-of-program
     // (clean stop / EOF), which ends the loop.
     while let Ok(item) = hot_rx.recv() {
@@ -5462,18 +5626,17 @@ fn consumer_main(
         // bars represent the same output instant, never the preceding frame.
         #[cfg(feature = "overlay")]
         let early_audio_block = if let Some(bus) = audio_bus.as_mut() {
-            if let Some(handle) = audio_route.as_ref() {
-                handle.apply_pending(bus);
-                if item.switcher_audio_enabled {
-                    handle.select_program_source(bus, item.switcher_audio.as_deref());
-                }
-            }
             if bus.live_strip_count() != av_strips {
                 av_strips = bus.live_strip_count();
                 av_ids = bus.timeline_source_ids();
             }
             let tick_frame = bus.position_at(item.tick_index);
-            let input_block = drive_audio_for_item(bus, item.tick_index);
+            let input_block = drive_selected_audio_for_item(
+                bus,
+                audio_route.as_deref(),
+                &item,
+                &mut last_audio_tick,
+            )?;
             if let Some(meter) = av_meter.as_mut() {
                 meter.sample(&av_ids, item.tick_index, tick_frame);
             }
@@ -5519,13 +5682,6 @@ fn consumer_main(
             // advancing the absolute tick clock. A stalled consumer merely sheds
             // bounded pending commands; it never holds the output clock (#1/#10).
             #[cfg(not(feature = "overlay"))]
-            if let Some(handle) = audio_route.as_ref() {
-                handle.apply_pending(bus);
-                if item.switcher_audio_enabled {
-                    handle.select_program_source(bus, item.switcher_audio.as_deref());
-                }
-            }
-            #[cfg(not(feature = "overlay"))]
             if bus.live_strip_count() != av_strips {
                 av_strips = bus.live_strip_count();
                 av_ids = bus.timeline_source_ids();
@@ -5535,7 +5691,12 @@ fn consumer_main(
             #[cfg(not(feature = "overlay"))]
             let tick_frame = bus.position_at(item.tick_index);
             #[cfg(not(feature = "overlay"))]
-            let block = drive_audio_for_item(bus, item.tick_index);
+            let block = drive_selected_audio_for_item(
+                bus,
+                audio_route.as_deref(),
+                &item,
+                &mut last_audio_tick,
+            )?;
             #[cfg(feature = "overlay")]
             let block = early_audio_block.ok_or_else(|| {
                 PipelineError::Engine(
