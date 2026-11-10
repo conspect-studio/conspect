@@ -91,6 +91,7 @@ pub struct Provider {
     terms: Option<Arc<dyn TermsRepository>>,
     ledger: Arc<Ledger>,
     streams: Arc<Semaphore>,
+    pin_requests: Arc<Semaphore>,
 }
 impl Default for Provider {
     fn default() -> Self {
@@ -99,6 +100,7 @@ impl Default for Provider {
             terms: None,
             ledger: Arc::new(Ledger::memory()),
             streams: Arc::new(Semaphore::new(ARTIFACT_STREAMS)),
+            pin_requests: Arc::new(Semaphore::new(ARTIFACT_STREAMS)),
         }
     }
 }
@@ -128,6 +130,7 @@ impl Provider {
             terms: Some(terms),
             ledger,
             streams: Arc::new(Semaphore::new(ARTIFACT_STREAMS)),
+            pin_requests: Arc::new(Semaphore::new(ARTIFACT_STREAMS)),
         }
     }
     /// Honest runtime capabilities, including the disabled URL download boundary.
@@ -335,8 +338,8 @@ impl Provider {
             .ok_or_else(|| ControlError::Conflict("capture has no completed artifact".into()))?;
         let artifact = multiview_webengine::artifact::ArtifactId::parse(&artifact)
             .map_err(|_| ControlError::Repository("invalid capture artifact identity".into()))?;
-        let permit = self
-            .streams
+        let pin_request = self
+            .pin_requests
             .clone()
             .try_acquire_owned()
             .map_err(|_| ControlError::EngineBusy)?;
@@ -345,6 +348,12 @@ impl Provider {
             .as_ref()
             .ok_or(ControlError::EngineBusy)?
             .pin(&artifact, &p.key_id)
+            .map_err(|_| ControlError::EngineBusy)?;
+        drop(pin_request);
+        let permit = self
+            .streams
+            .clone()
+            .try_acquire_owned()
             .map_err(|_| ControlError::EngineBusy)?;
         Ok((lease, permit))
     }

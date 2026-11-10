@@ -349,6 +349,7 @@ struct PinCommand {
     id: ArtifactId,
     owner: String,
     reply: mpsc::Sender<io::Result<Lease>>,
+    cancelled: Arc<AtomicBool>,
 }
 #[derive(Default)]
 struct Shared {
@@ -997,6 +998,7 @@ impl Service {
     /// after shutdown.
     pub fn pin(&self, id: &ArtifactId, owner: &str) -> io::Result<Lease> {
         let (reply, receive) = mpsc::channel();
+        let cancelled = Arc::new(AtomicBool::new(false));
         {
             let mut shared = lock(&self.inner);
             if shared.shutdown {
@@ -1009,10 +1011,15 @@ impl Service {
                 id: id.clone(),
                 owner: owner.to_owned(),
                 reply,
+                cancelled: Arc::clone(&cancelled),
             });
         }
         self.inner.wake.notify_all();
-        receive_pin(receive, Duration::from_secs(5))
+        let outcome = receive_pin(receive, Duration::from_secs(5));
+        if outcome.is_err() {
+            cancelled.store(true, Ordering::Release);
+        }
+        outcome
     }
 
     /// Cancel the active and queued jobs, stop the worker and join it. Idempotent.
@@ -1107,7 +1114,12 @@ fn worker(inner: &Inner, mut store: ArtifactStore, tools: &Tools, fetch: Option<
             Work::Stop => break,
             Work::Pins(commands) => {
                 for c in commands {
-                    let _ = c.reply.send(store.pin(&c.id, &c.owner, |_| true));
+                    if c.cancelled.load(Ordering::Acquire) {
+                        continue;
+                    }
+                    let result =
+                        store.pin(&c.id, &c.owner, |_| !c.cancelled.load(Ordering::Acquire));
+                    let _ = c.reply.send(result);
                 }
             }
             Work::Job(id, request, flag, generation) => {
