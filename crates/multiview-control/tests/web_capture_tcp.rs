@@ -64,12 +64,12 @@ async fn capture_flow(real_browser: bool) {
     if real_browser {
         assert!(browser.is_file(), "required real browser missing");
         // Test-only trusted adapter changes the source, never the production API.
-        std::fs::write(&producer, r##"#!/usr/bin/python3
+        std::fs::write(&producer, r#"#!/usr/bin/python3
 import json,subprocess,sys
 request=json.load(sys.stdin)
 request['source']={'kind':'html','document':'<body style="margin:0;background:red">HTTP capture proof</body>'}
 sys.exit(subprocess.run(['/usr/local/share/nvm/current/bin/node']+sys.argv[1:],input=json.dumps(request).encode()).returncode)
-"##).unwrap();
+"#).unwrap();
     }
     let store_path = root.path().join("store");
     std::fs::create_dir(&store_path).unwrap();
