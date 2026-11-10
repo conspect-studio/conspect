@@ -177,22 +177,32 @@ pub(crate) async fn artifact(
         .map_err(|_| ControlError::Repository("artifact pin worker failed".into()))??;
     // Bounded channel: no whole-clip allocation and no filesystem I/O on an async worker.
     let (tx, rx) = tokio::sync::mpsc::channel::<Result<Vec<u8>, std::io::Error>>(2);
+    let runtime = tokio::runtime::Handle::current();
     tokio::task::spawn_blocking(move || {
         use std::io::Read;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
         let _permit = permit; // held until the reader ends
         let mut lease = lease;
         loop {
+            if std::time::Instant::now() >= deadline {
+                break;
+            }
             let mut chunk = vec![0; 64 * 1024];
             match lease.read(&mut chunk) {
                 Ok(0) => break,
                 Ok(n) => {
                     chunk.truncate(n);
-                    if tx.blocking_send(Ok(chunk)).is_err() {
+                    let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+                    let wait = remaining.min(std::time::Duration::from_secs(5));
+                    if !matches!(
+                        runtime.block_on(tokio::time::timeout(wait, tx.send(Ok(chunk)))),
+                        Ok(Ok(()))
+                    ) {
                         break;
                     }
                 }
                 Err(e) => {
-                    let _ = tx.blocking_send(Err(e));
+                    let _ = tx.try_send(Err(e));
                     break;
                 }
             }

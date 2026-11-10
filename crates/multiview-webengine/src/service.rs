@@ -1301,7 +1301,10 @@ fn recover(
     for j in &mut doc.jobs {
         let unresolved = match j.state {
             Rec::Queued => {
-                j.state = Rec::Cancelled;
+                // The request payload is deliberately not journaled. An abrupt
+                // restart cannot distinguish an acknowledged queued intent from
+                // a crash during admission; do not report an operator cancel.
+                j.state = Rec::Uncertain;
                 continue;
             }
             Rec::Succeeded { .. } => continue,
