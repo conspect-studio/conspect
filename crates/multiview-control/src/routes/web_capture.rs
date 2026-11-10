@@ -26,6 +26,7 @@ fn required_key(key: IdempotencyKey) -> ControlResult<String> {
     utoipa::path(
         get,
         path = "/api/v1/media/captures/capabilities",
+        operation_id = "capture_capabilities",
         tag = "media-captures",
         responses(
             (status = 200, description = "Honest capture capabilities."),

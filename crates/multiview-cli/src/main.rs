@@ -116,7 +116,7 @@ async fn main() -> ExitCode {
     }
 
     let cli = Cli::parse();
-    match dispatch(cli).await {
+    match Box::pin(dispatch(cli)).await {
         Ok(code) => code,
         Err(err) => {
             tracing::error!(error = %format!("{err:#}"), "command failed");

@@ -10,7 +10,7 @@
 //   Mandatory media validation: the downloaded bytes are tee'd to a private (0600) spool file
 //   inside the private (0700) per-run dir, bounded by the same max_bytes quota. After the
 //   download closes OK, the configured ffmpeg DECODES the first video frame (protocol
-//   whitelist file,pipe, no stdin). "done" is emitted only if that validator exits 0;
+//   allowlist file,pipe, no stdin). "done" is emitted only if that validator exits 0;
 //   JSON/HTML/corrupt/audio-only payloads fail with code invalid_media. Spool is removed on
 //   every path (it lives in the run dir, which cleanup() deletes).
 //   SIGTERM/SIGINT or parent stdout closing = cancellation: owned process group is killed.
