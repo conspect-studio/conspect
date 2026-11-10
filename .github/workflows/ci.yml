@@ -552,12 +552,16 @@ jobs:
         # selected Rust toolchain and cache, but resolve native libraries here.
         run: |
           set -euo pipefail
+          toolchain_bin="$(dirname "$(rustup which cargo)")"
+          "${toolchain_bin}/rustc" -vV
+          "${toolchain_bin}/cargo" --version
           docker run --rm -i \
             -v "$PWD:$PWD" -w "$PWD" \
             -v "$HOME/.cargo:/cargo" -v "$HOME/.rustup:/rustup:ro" \
             -v "${FFMPEG_PREFIX}:${FFMPEG_PREFIX}:ro" \
             -e CARGO_HOME=/cargo -e RUSTUP_HOME=/rustup \
-            -e PATH=/cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
+            -v "${toolchain_bin}:/selected-rust:ro" \
+            -e PATH=/selected-rust:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
             -e FFMPEG_PREFIX="${FFMPEG_PREFIX}" \
             debian:trixie@sha256:9c6e381421d0f48d1b8133e573f33c185ee16cbf505eda9c4a8a4791b25ea8a6 \
             bash -s <<'TRIXIE'
