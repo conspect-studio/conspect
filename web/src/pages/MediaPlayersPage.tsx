@@ -80,7 +80,8 @@ import { getOperationTracker, OPERATION_TRACKER_QUERY_KEY } from '../components/
 import { createOperationOutcomeState } from '../components/broadcast/operationOutcomes';
 import type { OperationOutcomeState } from '../components/broadcast/operationOutcomes';
 import { getStoredToken, subscribeStoredToken } from '../api/token';
-import { PageHeader } from '../components/PageHeader';
+import { MediaSurface } from './approved/MediaSurface';
+import type { MediaTab } from './approved/MediaSurface';
 import { Badge } from '../components/ui/badge';
 import {
   Dialog,
@@ -491,6 +492,7 @@ export function MediaPlayersPage(): JSX.Element {
   const liveStates = useMediaPlayerStates();
   const submitTracked = useSubmitTrackedOperation();
 
+  const [mediaTab, setMediaTab] = useState<MediaTab>('transport');
   const [loadFor, setLoadFor] = useState<MediaPlayer | null>(null);
   const [assetDraft, setAssetDraft] = useState('');
   const [assetMissing, setAssetMissing] = useState(false);
@@ -713,19 +715,10 @@ export function MediaPlayersPage(): JSX.Element {
 
   return (
     <>
-      <PageHeader
-        title={<Trans>Media players</Trans>}
-        description={
-          <Trans>
-            VT transport for the configured media-player channels. Load an
-            asset, cue, play, pause, stop, and — for a vamp/loop fill — arm,
-            take, or cancel a clean exit at the next vamp boundary. Each
-            command is accepted asynchronously; the player's live state
-            and playhead arrive on the realtime stream.
-          </Trans>
-        }
-      />
-
+      <MediaSurface
+        tab={mediaTab}
+        onTabChange={setMediaTab}
+        transport={<>
       {players.isPending ? (
         <p
           role="status"
@@ -752,11 +745,13 @@ export function MediaPlayersPage(): JSX.Element {
           <p className="mb-3 text-xs text-muted-foreground">
             <Trans>All configured media players.</Trans>
           </p>
-          <div className="grid gap-4">
+          <div className="vt-rack">
             {data.map((player) => renderPlayer(player))}
           </div>
         </div>
       )}
+        </>}
+      />
 
       <Dialog
         open={loadFor !== null}
