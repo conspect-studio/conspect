@@ -1405,3 +1405,59 @@ fn queued_fetch_real_ffmpeg_rejects_non_media_and_accepts_real_mp4() {
     lease.read_to_end(&mut got).unwrap();
     assert_eq!(got, want);
 }
+
+static ADMISSION_PAUSE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+fn pause_admitted(
+    boundary: multiview_webengine::service_journal::JournalBoundary,
+) -> std::io::Result<()> {
+    use std::sync::atomic::Ordering;
+    if boundary == multiview_webengine::service_journal::JournalBoundary::DirectorySync
+        && ADMISSION_PAUSE
+            .compare_exchange(1, 2, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok()
+    {
+        while ADMISSION_PAUSE.load(Ordering::SeqCst) == 2 {
+            std::thread::yield_now();
+        }
+    }
+    Ok(())
+}
+#[test]
+fn shutdown_after_durable_intent_is_uncertain_not_definite_refusal() {
+    use std::sync::{atomic::Ordering, Arc};
+    let _serial = SERIAL.lock().unwrap();
+    let durable = Durable::new();
+    let service = Arc::new(
+        Service::start_durable_with_hook(
+            durable.tools(),
+            durable.store(),
+            config(2, 8),
+            &durable.journal(),
+            pause_admitted,
+        )
+        .unwrap(),
+    );
+    ADMISSION_PAUSE.store(1, Ordering::SeqCst);
+    let submitter = Arc::clone(&service);
+    let result = std::thread::spawn(move || submitter.submit(request("admission-race")));
+    let guard = Instant::now() + Duration::from_secs(10);
+    while ADMISSION_PAUSE.load(Ordering::SeqCst) != 2 {
+        assert!(Instant::now() < guard);
+        std::thread::yield_now();
+    }
+    // No queued job is yet exposed in memory. Shutdown sets the flag while
+    // the durable-intent hook holds the admission transaction before exposure.
+    service.shutdown();
+    ADMISSION_PAUSE.store(3, Ordering::SeqCst);
+    assert!(matches!(
+        result.join().unwrap(),
+        Err(SubmitError::Persistence)
+    ));
+    drop(service);
+    let restarted = durable.start().unwrap();
+    assert!(matches!(
+        restarted.status("o", JobId::from_raw(1)).unwrap().state,
+        State::Cancelled | State::Uncertain
+    ));
+    assert!(restarted.latest_good("o", "admission-race").is_none());
+}
