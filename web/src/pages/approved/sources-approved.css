@@ -240,3 +240,23 @@
 [data-approved-page="sources"] .src-card .sc-pills { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px 12px; }
 [data-approved-page="sources"] .src-card .sc-meta-item { display: grid; gap: 4px; align-content: start; min-width: 0; }
 [data-approved-page="sources"] .src-card .sc-meta-item > div { display: flex; flex-wrap: wrap; gap: 4px; min-width: 0; }
+
+/* Fix13: compact rows. Stop/Start + Details side by side (>=48px each), failure callout is its own full-width row, narrow status columns. */
+[data-approved-page="sources"] .src-table .src-head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; min-width: 0; }
+[data-approved-page="sources"] .src-table .src-name { gap: 4px; }
+[data-approved-page="sources"] .src-table td { padding-top: 8px; padding-bottom: 8px; }
+@media (min-width: 1024px) {
+  [data-approved-page="sources"] .src-table .src-actions-cell { flex-direction: row; flex-wrap: nowrap; align-items: center; gap: 6px; }
+  [data-approved-page="sources"] .src-table .src-actions-cell > span,
+  [data-approved-page="sources"] .src-table .src-actions-cell > span > span { flex-direction: row; align-items: center; }
+  [data-approved-page="sources"] .src-table .src-actions-cell button { min-width: 64px; }
+  [data-approved-page="sources"] .src-table th:nth-child(2),
+  [data-approved-page="sources"] .src-table th:nth-child(3),
+  [data-approved-page="sources"] .src-table th:nth-child(4),
+  [data-approved-page="sources"] .src-table th:nth-child(5) { width: 1%; white-space: nowrap; }
+  [data-approved-page="sources"] .src-table td:nth-child(n+2):nth-child(-n+5) { white-space: nowrap; }
+  [data-approved-page="sources"] .src-table th:first-child { width: 36%; }
+}
+[data-approved-page="sources"] .src-table tr[data-phase="failed"]:not(.src-detail-row) > td { border-bottom: 0; }
+[data-approved-page="sources"] .src-table tr.src-fail-row > td { padding: 0 12px 10px; background: rgba(232,163,61,.04); }
+[data-approved-page="sources"] .src-table tr.src-fail-row .src-fail { margin: 0; display: flex; align-items: center; justify-content: space-between; gap: 12px; }

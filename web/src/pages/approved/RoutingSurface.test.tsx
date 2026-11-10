@@ -168,3 +168,34 @@ describe('crosspoint destinations legend', () => {
   });
 });
 
+
+describe('fix13 crosspoint layout contracts', () => {
+  it('groups destinations by kind with one-line titled headers', () => {
+    renderWithProviders(
+      <CrosspointGrid
+        sources={[{ id: 'cam-a', name: 'Camera A' }]}
+        dests={[
+          { kind: 'video', id: 'CELL-0', label: 'CELL-0' },
+          { kind: 'video', id: 'CELL-1', label: 'CELL-1' },
+          { kind: 'audio', id: 'eng', label: 'eng' },
+        ]}
+        selectedSource=""
+        selectedDest=""
+        planned={false}
+        onPick={(): void => undefined}
+      />,
+    );
+    const groups = within(screen.getByTestId('crosspoint-groups')).getAllByRole('columnheader');
+    expect(groups.map((g) => g.getAttribute('data-kind'))).toEqual([null, 'video', 'audio']);
+    expect(groups[1]).toHaveAttribute('colspan', '2');
+    expect(screen.getByTitle('CELL-1 (video)')).toHaveTextContent('CELL-1');
+  });
+
+  it('output sink card carries a disabled Plan tile with the unavailable reason', async () => {
+    renderWithProviders(<MemoryRouter><RoutingPage /></MemoryRouter>);
+    const card = await screen.findByTestId('output-card-program');
+    const tile = within(card).getByTestId('output-plan-tile');
+    expect(tile).toHaveAttribute('aria-disabled', 'true');
+    expect(tile).toHaveTextContent(/no output routing target/);
+  });
+});

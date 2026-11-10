@@ -1037,6 +1037,18 @@ function OutputCard({
         <p className="out-flag">
           <Trans>Requires an active output; saved settings do not confirm playback.</Trans>
         </p>
+        <button
+          type="button"
+          className="plan-tile"
+          aria-disabled="true"
+          data-testid="output-plan-tile"
+          title={t`Output sinks are not routing targets: the routing API accepts video cells, audio tracks and subtitle layers only.`}
+        >
+          <Trans>Plan a source → {output.name}</Trans>
+          <span className="plan-tile-why">
+            <Trans>Unavailable — no output routing target in the API</Trans>
+          </span>
+        </button>
         <div className="out-actions">
           <TouchAction
             variant="outline"
