@@ -199,9 +199,9 @@ impl Provider {
             }
         }
         let outcome = self.admit(p, key, service, terms.as_ref(), &body, capture);
-        if outcome.is_err() {
-            self.ledger.abandon(&p.key_id, "submit", key);
-        }
+        // Keep the durable pending receipt on any indeterminate outcome. The
+        // service may already have accepted a job even if the final receipt
+        // fsync failed. A retry must not allocate a second browser job.
         outcome
     }
     fn admit(
