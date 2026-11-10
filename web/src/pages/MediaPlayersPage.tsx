@@ -107,7 +107,6 @@ import {
   readMediaPlayerOperations,
   replaceMediaPlayerOperation,
   unresolvedMediaPlayerOperations,
-  stateVariant,
   transportExpectation,
   updateMediaPlayerOperation,
   vampGate,
@@ -234,10 +233,10 @@ function MediaPlayerCard({
   const statusNode = (
         <span className="flex min-w-0 flex-wrap items-center gap-x-3 gap-y-1 break-words">
           {kind !== undefined ? (
-            <Badge variant={stateVariant(kind)}>
+            <span className={`vt-chip vt-chip-${kind}`} data-testid={`vt-chip-${player.id}`}>
               {stateLabel(kind)}
               {isExitArmed(live) ? ` · ${t`exit armed`}` : ''}
-            </Badge>
+            </span>
           ) : (
             <span>
               <Trans>No live state</Trans>
@@ -351,15 +350,6 @@ function MediaPlayerCard({
       <div className="vt-head">
         <h3>
           {titleNode}
-          {kind !== undefined ? (
-            <span className={`vt-chip vt-chip-${kind}`} data-testid={`vt-chip-${player.id}`}>
-              {stateLabel(kind)}
-            </span>
-          ) : (
-            <span className="vt-chip vt-chip-unknown" data-testid={`vt-chip-${player.id}`}>
-              <Trans>Unknown</Trans>
-            </span>
-          )}
         </h3>
         <span className="vt-tc mono" data-testid={`vt-tc-${player.id}`}>
           {live !== undefined ? `${String(live.position_frames)} ${t`frames`}` : t`Unknown`}

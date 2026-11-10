@@ -10,6 +10,8 @@ import { LicenceChip } from '../account/chrome';
 import { LocaleSwitcher } from '../LocaleSwitcher';
 import { ThemeToggle } from '../ThemeToggle';
 import { ProducerStatus } from './ProducerStatus';
+import { useConfirmedTick } from './useSwitcherTickEvidence';
+import { TICK_FRESH_MS } from './tickObservation';
 import './broadcast-desk.css';
 
 const TakeLock = createContext({ locked: true });
@@ -25,6 +27,7 @@ export function BroadcastShell({ children, managementLabel }: { readonly childre
   // Real count only: unknown (loading/error) renders no badge at all.
   const alarms = useAlarms({ active: true, scope: 'system' });
   const alarmCount = alarms.isSuccess ? alarms.data.length : undefined;
+  const tick = useConfirmedTick();
   const { pathname } = useLocation();
   const tabs: readonly (readonly [string, string])[] = [
     ['/', t`Desk`], ['/show', t`Show`], ['/sources', t`Sources`],
@@ -36,7 +39,7 @@ export function BroadcastShell({ children, managementLabel }: { readonly childre
       <NavLink to="/" className="bd-brand" aria-label={t`CONSPECT Control — Desk`}><span className="bd-mark" aria-hidden="true" /><span className="bd-wordmark">CONSPECT</span> <small><Trans>Control</Trans></small>{current && <span className="bd-screen-title">{current}</span>}</NavLink>
       <nav className="bd-tabs" aria-label={t`Core screens`}>{tabs.map(([path, label], index) => <NavLink key={path} to={path} end={path === '/'}><span>{index + 1}</span>{label}</NavLink>)}</nav>
       <div className="bd-top-actions">
-        <div className="bd-health"><ProducerStatus state="unknown" lastTickAt={null} managementLabel={managementLabel} /></div>
+        <div className="bd-health"><ProducerStatus state={tick === null ? 'unknown' : 'producing'} lastTickAt={tick?.at ?? null} now={tick === null ? undefined : () => tick.now} staleAfterMs={TICK_FRESH_MS} managementLabel={managementLabel} /></div>
         {locked
           ? <Dialog open={unlock} onOpenChange={setUnlock}><DialogTrigger asChild><button className="bd-lock" aria-pressed="true"><Lock size={14} aria-hidden="true" /><span>{t`Takes locked`}</span></button></DialogTrigger>
             <DialogContent touchScroll><DialogTitle><Trans>Unlock time-critical takes?</Trans></DialogTitle><p><Trans>CUT will execute without another confirmation. AUTO remains unavailable. Direct program selection remains guarded.</Trans></p><button onClick={() => { setLocked(false); setUnlock(false); }}><Trans>Unlock takes</Trans></button><button onClick={() => { setUnlock(false); }}><Trans>Cancel</Trans></button></DialogContent></Dialog>
