@@ -51,3 +51,13 @@
   [data-approved-page="show"] .now-next { grid-template-columns: 1fr; padding: 10px 12px; }
   [data-approved-page="show"] .cue-rail { grid-template-columns: 1fr; order: -1; }
 }
+/* Round-2: design colour tokens on the disabled-but-visible controls (legible, reason inline) */
+[data-approved-page="show"] { --red: #e5484d; --violet: #b18aff; --green: #3dd68c; }
+[data-approved-page="show"] .show-btn[disabled] { opacity: 1; cursor: not-allowed; border-style: dashed; color: var(--text-2); background: var(--bg-1); }
+[data-approved-page="show"] .show-btn-take[disabled] { background: #1b2c47; border-color: #3d6cb0; color: #a9c9ff; }
+[data-approved-page="show"] .show-btn-stop[disabled] { background: #3a1517; border-color: #8f3438; color: #ff9a9e; }
+[data-approved-page="show"] .show-btn-arm[disabled] { background: #251a3d; border-color: #6a52a6; color: #cdb4ff; }
+[data-approved-page="show"] .nn-line { color: var(--text-1); }
+[data-approved-page="show"] .nn-note { color: var(--amber); border-left: 3px solid var(--amber-dim); padding-left: 8px; }
+[data-approved-page="show"] .rundown-empty { border-color: var(--amber-dim); }
+[data-approved-page="show"] .cue-actions + .nn-note { margin: 10px 0 0; }

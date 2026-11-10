@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 import { screen } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { useState } from 'react';
+import { MemoryRouter } from 'react-router-dom';
 import { renderWithProviders } from '../../test/render';
 import { MediaSurface } from './MediaSurface';
 import type { MediaTab } from './MediaSurface';
@@ -13,7 +14,7 @@ function Harness(): React.JSX.Element {
 
 describe('MediaSurface', () => {
   it('switches tabs and shows explicit unavailable capture and library states', async () => {
-    const { container } = renderWithProviders(<Harness />);
+    const { container } = renderWithProviders(<MemoryRouter><Harness /></MemoryRouter>);
     expect(container.querySelector('[data-approved-page="media"]')).not.toBeNull();
     expect(screen.getByText('transport-body')).toBeInTheDocument();
     await userEvent.click(screen.getByRole('button', { name: 'Capture' }));
@@ -22,5 +23,13 @@ describe('MediaSurface', () => {
     await userEvent.click(screen.getByRole('button', { name: 'Clip library' }));
     expect(screen.getByTestId('library-listing-unavailable')).toBeInTheDocument();
     expect(screen.getByRole('button', { name: 'Clip library' })).toHaveAttribute('aria-pressed', 'true');
+  });
+
+  it('titles the page per the reference and links the real graphics workflow', () => {
+    renderWithProviders(<MemoryRouter><Harness /></MemoryRouter>);
+    expect(screen.getByRole('heading', { level: 1 })).toHaveTextContent('Media · VT & graphics');
+    const region = screen.getByTestId('media-graphics-region');
+    expect(region.querySelector('a[href="/graphics"]')).not.toBeNull();
+    expect(region.querySelector('a[href="/graphics/templates"]')).not.toBeNull();
   });
 });

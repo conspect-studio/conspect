@@ -313,11 +313,23 @@ function MediaPlayerCard({
   return (
     <section
       data-testid={`vt-slot-${player.id}`}
+      data-state={kind ?? 'unknown'}
       className={`vt-slot${focused ? ' focused' : ''}${playing ? ' on' : ''}`}
       aria-label={player.name}
     >
       <div className="vt-head">
-        <h3>{titleNode}</h3>
+        <h3>
+          {titleNode}
+          {kind !== undefined ? (
+            <span className={`vt-chip vt-chip-${kind}`} data-testid={`vt-chip-${player.id}`}>
+              {stateLabel(kind)}
+            </span>
+          ) : (
+            <span className="vt-chip vt-chip-unknown" data-testid={`vt-chip-${player.id}`}>
+              <Trans>Unknown</Trans>
+            </span>
+          )}
+        </h3>
         <span className="vt-tc mono" data-testid={`vt-tc-${player.id}`}>
           {live !== undefined ? `${String(live.position_frames)} ${t`frames`}` : t`Unknown`}
         </span>
@@ -354,19 +366,6 @@ function MediaPlayerCard({
           <div className="vt-transport">
             <TouchAction
               variant="outline"
-              disabled={keyBlocked('load')}
-              pending={keyPending('load')}
-              disabledReason={duplicateReason('load')}
-              aria-label={`${t`Load asset into player`}: ${player.id}`}
-              onPress={(): void => {
-                onOpenLoad(player);
-              }}
-            >
-              <FolderInput aria-hidden="true" />
-              <Trans>Load</Trans>
-            </TouchAction>
-            <TouchAction
-              variant="outline"
               disabled={keyBlocked('cue')}
               pending={keyPending('cue')}
               disabledReason={duplicateReason('cue')}
@@ -380,6 +379,7 @@ function MediaPlayerCard({
             </TouchAction>
             <TouchAction
               variant="outline"
+              className="vt-play"
               disabled={keyBlocked('play')}
               pending={keyPending('play')}
               disabledReason={duplicateReason('play')}
@@ -405,7 +405,8 @@ function MediaPlayerCard({
               <Trans>Pause</Trans>
             </TouchAction>
             <TouchAction
-              variant="ghost"
+              variant="outline"
+              className="vt-stop"
               disabled={keyBlocked('stop')}
               pending={keyPending('stop')}
               disabledReason={duplicateReason('stop')}
@@ -416,6 +417,19 @@ function MediaPlayerCard({
             >
               <CircleStop aria-hidden="true" />
               <Trans>Stop</Trans>
+            </TouchAction>
+            <TouchAction
+              variant="outline"
+              disabled={keyBlocked('load')}
+              pending={keyPending('load')}
+              disabledReason={duplicateReason('load')}
+              aria-label={`${t`Load asset into player`}: ${player.id}`}
+              onPress={(): void => {
+                onOpenLoad(player);
+              }}
+            >
+              <FolderInput aria-hidden="true" />
+              <Trans>Load</Trans>
             </TouchAction>
           </div>
           {unresolved.filter((entry) => entry !== op).length > 0 ? (
