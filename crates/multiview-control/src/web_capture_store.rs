@@ -151,9 +151,6 @@ impl Ledger {
                 let Ok(r) = serde_json::from_str::<Rec>(&line?) else {
                     continue;
                 };
-                if r.value.is_none() {
-                    continue;
-                }
                 let id = (r.actor.clone(), r.op.clone(), r.key.clone());
                 if map.insert(id.clone(), r).is_none() {
                     order.push_back(id);
@@ -206,10 +203,27 @@ impl Ledger {
             digest: digest.to_owned(),
             value: None,
         };
-        // Evict only completed records; in-flight ones are bounded by service capacity.
+        // Never evict uncertain/in-flight intent: it may already have started a
+        // durable capture. Retrying such a key must fail closed, not duplicate it.
         while g.1.len() >= LEDGER_CAPACITY {
-            let Some(old) = g.1.pop_front() else { break };
+            let Some(position) =
+                g.1.iter()
+                    .position(|old| g.0.get(old).is_some_and(|r| r.value.is_some()))
+            else {
+                return Err(false);
+            };
+            let Some(old) = g.1.remove(position) else {
+                return Err(false);
+            };
             g.0.remove(&old);
+        }
+        if let Some(file) = &self.file {
+            let mut line = serde_json::to_vec(&rec).map_err(|_| false)?;
+            line.push(b'\n');
+            let mut file = file.lock().map_err(|_| false)?;
+            file.write_all(&line)
+                .and_then(|()| file.sync_all())
+                .map_err(|_| false)?;
         }
         g.1.push_back(id.clone());
         g.0.insert(id, rec);
@@ -225,11 +239,12 @@ impl Ledger {
                 .inner
                 .lock()
                 .map_err(|_| io::Error::other("ledger poisoned"))?;
-            let Some(r) = g.0.get_mut(&id) else {
-                return Ok(());
+            let Some(r) = g.0.get(&id) else {
+                return Err(io::Error::other("idempotency reservation missing"));
             };
-            r.value = Some(value);
-            r.clone()
+            let mut record = r.clone();
+            record.value = Some(value);
+            record
         };
         if let Some(f) = &self.file {
             let mut l = serde_json::to_vec(&rec).map_err(io::Error::other)?;
@@ -238,6 +253,11 @@ impl Ledger {
             f.write_all(&l)?;
             f.sync_all()?;
         }
+        self.inner
+            .lock()
+            .map_err(|_| io::Error::other("ledger poisoned"))?
+            .0
+            .insert(id, rec);
         Ok(())
     }
     /// Drop an unfinished reservation so the client may retry.

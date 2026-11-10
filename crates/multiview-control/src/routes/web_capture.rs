@@ -131,6 +131,7 @@ pub(crate) async fn cancel(
     key: IdempotencyKey,
     Path(id): Path<u64>,
 ) -> ControlResult<StatusCode> {
+    principal.role.require(Action::Write)?;
     let key = required_key(key)?;
     let provider = state.web_capture.clone();
     let actor = principal.clone();

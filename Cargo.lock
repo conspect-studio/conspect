@@ -3782,6 +3782,7 @@ dependencies = [
  "multiview-moq",
  "multiview-preview",
  "multiview-telemetry",
+ "multiview-webengine",
  "proptest",
  "prost",
  "rcgen",
@@ -4102,6 +4103,19 @@ dependencies = [
  "chrono",
  "quick-xml",
  "thiserror 2.0.18",
+]
+
+[[package]]
+name = "multiview-webengine"
+version = "0.1.0"
+dependencies = [
+ "rustix",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
 ]
 
 [[package]]

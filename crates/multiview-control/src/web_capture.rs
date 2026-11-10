@@ -1,11 +1,9 @@
 //! Actual background browser capture provider. No browser is started by default.
 //! Only service-selected tools/templates enter this boundary; HTTP cannot submit HTML.
+use crate::web_capture_store::{digest_hex, Ledger, Reserve, TermsAcceptance, TermsRepository};
 use crate::{
     auth::{authorize_object, Action, Principal},
     error::{ControlError, ControlResult},
-};
-use crate::web_capture_store::{
-    digest_hex, Ledger, Reserve, TermsAcceptance, TermsRepository,
 };
 use multiview_webengine::{
     capture::{Background, Capture, WindyView},
@@ -22,6 +20,7 @@ pub const ARTIFACT_STREAMS: usize = 2;
 pub const WINDY_TERMS_VERSION: &str = "windy-2023-09-01";
 /// One authorized, bounded public Windy view. Premium needs a configured secret resolver.
 #[derive(Deserialize, Serialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[serde(deny_unknown_fields)]
 pub struct CaptureBody {
     /// Fill authorization object.
@@ -37,6 +36,7 @@ pub struct CaptureBody {
 }
 /// Site-specific bounded view.
 #[derive(Deserialize, Serialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[serde(deny_unknown_fields)]
 pub struct View {
     /// Latitude.
@@ -61,6 +61,7 @@ pub struct View {
 }
 /// Explicit versioned site-terms acceptance.
 #[derive(Deserialize, Serialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[serde(deny_unknown_fields)]
 pub struct Terms {
     /// Must be true.
@@ -70,6 +71,7 @@ pub struct Terms {
 }
 /// Public job status projection with no URL, credentials, document or disk path.
 #[derive(Serialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 pub struct JobView {
     /// Stable opaque job number.
     pub job_id: u64,
@@ -173,9 +175,10 @@ impl Provider {
             .map_err(|_| ControlError::Validation("invalid capture view".into()))?;
         let service = self.service.as_ref().ok_or(ControlError::EngineBusy)?;
         let terms = self.terms.as_ref().ok_or(ControlError::EngineBusy)?;
-        let digest = digest_hex(&serde_json::to_vec(&body).map_err(|_| {
-            ControlError::Validation("capture body not serializable".into())
-        })?);
+        let digest = digest_hex(
+            &serde_json::to_vec(&body)
+                .map_err(|_| ControlError::Validation("capture body not serializable".into()))?,
+        );
         match self.ledger.reserve(&p.key_id, "submit", key, &digest) {
             Ok(Reserve::Replay(id)) => {
                 return Ok(Admission {
@@ -220,7 +223,9 @@ impl Provider {
                 version: body.terms.version.clone(),
                 accepted_at_unix,
             })
-            .map_err(|_| ControlError::Repository("terms acceptance could not be persisted".into()))?;
+            .map_err(|_| {
+                ControlError::Repository("terms acceptance could not be persisted".into())
+            })?;
         let request = Request {
             owner: p.key_id.clone(),
             fill: body.fill_id.clone(),
@@ -233,7 +238,9 @@ impl Provider {
         };
         self.ledger
             .complete(&p.key_id, "submit", key, id)
-            .map_err(|_| ControlError::Repository("idempotency record could not be persisted".into()))?;
+            .map_err(|_| {
+                ControlError::Repository("idempotency record could not be persisted".into())
+            })?;
         Ok(Admission {
             job_id: id,
             fresh: true,
@@ -319,14 +326,16 @@ impl Provider {
             .cancel(&p.key_id, JobId::from_raw(id));
         match outcome {
             CancelOutcome::Cancelled | CancelOutcome::Cancelling => {
-                self.ledger
-                    .complete(&p.key_id, op, key, id)
-                    .map_err(|_| ControlError::Repository("idempotency record could not be persisted".into()))?;
+                self.ledger.complete(&p.key_id, op, key, id).map_err(|_| {
+                    ControlError::Repository("idempotency record could not be persisted".into())
+                })?;
                 Ok(CancelResult { fresh: true })
             }
             CancelOutcome::Finished => {
                 self.ledger.abandon(&p.key_id, op, key);
-                Err(ControlError::Conflict("capture job already finished".into()))
+                Err(ControlError::Conflict(
+                    "capture job already finished".into(),
+                ))
             }
             CancelOutcome::Unknown => {
                 self.ledger.abandon(&p.key_id, op, key);
