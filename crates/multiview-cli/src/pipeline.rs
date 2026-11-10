@@ -453,12 +453,18 @@ fn logical_codec(token: &str) -> Result<multiview_ffmpeg::VideoCodec, PipelineEr
 /// An unavailable requested codec fails before the clock starts. No output
 /// silently changes its requested codec or substitutes MPEG-2.
 fn resolve_encoder(codec_token: &str) -> Result<ResolvedEncoder, PipelineError> {
-    use multiview_ffmpeg::select_encoder;
+    use multiview_ffmpeg::{probe_encoder_opens, select_usable_encoder};
     let requested = logical_codec(codec_token)?;
-    let name = select_encoder(requested).ok_or_else(|| PipelineError::Codec {
-        codec: codec_token.to_owned(),
-        reason: "requested encoder is unavailable in this build or linked FFmpeg".to_owned(),
-    })?;
+    // A registered hardware encoder (VideoToolbox/NVENC) is used only if it
+    // actually opens here; otherwise the next permitted candidate is taken.
+    let name =
+        select_usable_encoder(requested, &mut |n| probe_encoder_opens(n)).ok_or_else(|| {
+            PipelineError::Codec {
+                codec: codec_token.to_owned(),
+                reason: "requested encoder is unavailable in this build or linked FFmpeg"
+                    .to_owned(),
+            }
+        })?;
     Ok(ResolvedEncoder {
         name: name.to_owned(),
         format: encoder_input_format(name),

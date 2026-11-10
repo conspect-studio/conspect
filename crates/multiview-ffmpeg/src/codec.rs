@@ -200,6 +200,58 @@ pub fn select_encoder(codec: VideoCodec) -> Option<&'static str> {
         .find(|name| ffmpeg_next::encoder::find_by_name(name).is_some())
 }
 
+/// Whether `name` is a hardware encoder whose presence in the libav registry
+/// does not prove it can open (no device, a VM without `VideoToolbox`, a GPU
+/// without NVENC sessions left).
+#[must_use]
+pub fn is_hardware_encoder(name: &str) -> bool {
+    name.ends_with("_videotoolbox") || name.ends_with("_nvenc")
+}
+
+/// Like [`select_encoder`], but a **hardware** candidate is accepted only if
+/// `opens(name)` reports that a real encoder session opens. A failing hardware
+/// encoder falls through to the next permitted candidate (software), so a Mac
+/// or GPU host whose hardware encoder is registered but unusable still gets an
+/// encoded program — never a dead output. Software candidates are not probed.
+///
+/// Call this once at pipeline build (never per tick). `opens` is the probe
+/// seam; production passes [`probe_encoder_opens`].
+#[cfg(feature = "ffmpeg")]
+pub fn select_usable_encoder(
+    codec: VideoCodec,
+    opens: &mut dyn FnMut(&'static str) -> bool,
+) -> Option<&'static str> {
+    candidate_encoders(codec).into_iter().find(|name| {
+        ffmpeg_next::encoder::find_by_name(name).is_some()
+            && (!is_hardware_encoder(name) || opens(name))
+    })
+}
+
+/// Probe whether hardware encoder `name` opens a real session: a tiny NV12
+/// encoder (256x144, 25 fps) is opened and dropped. Any error means "not
+/// usable here".
+#[cfg(feature = "ffmpeg")]
+#[must_use]
+pub fn probe_encoder_opens(name: &'static str) -> bool {
+    let target = crate::VideoEncodeTarget {
+        codec_name: name.to_owned(),
+        width: 256,
+        height: 144,
+        format: ffmpeg_next::format::Pixel::NV12,
+        time_base: multiview_core::time::Rational::new(1, 25),
+        bit_rate: 500_000,
+        gop: 25,
+        cuda_device: None,
+    };
+    match crate::VideoEncoder::new(&target) {
+        Ok(_) => true,
+        Err(e) => {
+            tracing::warn!(encoder = name, error = %e, "hardware encoder is registered but does not open; falling back");
+            false
+        }
+    }
+}
+
 /// A logical audio codec the output pipeline can target.
 ///
 /// The audio analogue of [`VideoCodec`]: callers request a *family* — "give me
