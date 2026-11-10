@@ -3,7 +3,7 @@
 [![discord](https://img.shields.io/discord/1124083992740761730)](https://discord.gg/FCYF3p99mr)
 
 # web-transport-moq
-A wrapper around the [moq-noq](../README.md) API (the MoQ fork of Noq, a Quinn fork), abstracting away the annoying HTTP/3 internals. The same adapter for upstream noq is [web-transport-noq](https://github.com/moq-dev/web-transport).
+A wrapper around the [moq-noq](https://github.com/moq-dev/noq/blob/79070726cbae339553765897250e9561f91ab95b/README.md) API (the MoQ fork of Noq, a Quinn fork), abstracting away the annoying HTTP/3 internals. The same adapter for upstream noq is [web-transport-noq](https://github.com/moq-dev/web-transport).
 Provides a QUIC-like API but with web support!
 
 ## WebTransport

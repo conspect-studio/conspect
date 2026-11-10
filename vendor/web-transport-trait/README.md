@@ -9,12 +9,12 @@ Most importantly, QUIC supports multiple independent data streams.
 
 This crate provides a WebTransport trait for Send runtimes.
 
--   Quinn: [web-transport-quinn](../web-transport-quinn)
--   Noq: [web-transport-noq](../web-transport-noq)
--   WebSocket / TCP / TLS: [qmux](../qmux)
+-   Quinn: [web-transport-quinn](https://github.com/moq-dev/web-transport/tree/9e79dd65aa133cf3b6ab87692197934ec3252bbc/rs/web-transport-quinn)
+-   Noq: [web-transport-noq](https://github.com/moq-dev/web-transport/tree/9e79dd65aa133cf3b6ab87692197934ec3252bbc/rs/web-transport-noq)
+-   WebSocket / TCP / TLS: [qmux](https://github.com/moq-dev/web-transport/tree/9e79dd65aa133cf3b6ab87692197934ec3252bbc/rs/qmux)
 - Quiche+Tokio: TODO
 
-If you don't care about the underyling runtime, use the [web-transport](../web-transport) crate.
+If you don't care about the underyling runtime, use the [web-transport](https://github.com/moq-dev/web-transport/tree/9e79dd65aa133cf3b6ab87692197934ec3252bbc/rs/web-transport) crate.
 
 ## Why Send?
 Async traits are awful because you have to choose either `Send` or `!Send`.

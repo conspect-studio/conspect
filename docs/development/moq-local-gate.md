@@ -10,7 +10,7 @@ task exhausted attempt 2. Do not run a third local whole-workspace test suite.
 There is no copied, reset, or newly initialized workspace-attempt ledger here.
 
 `bin/check` actually executes its complete command list against the clean current
-HEAD, including a merge HEAD. It has no ancestry whitelist, historical-log
+HEAD, including a merge HEAD. It has no ancestry allowlist, historical-log
 acceptance, availability skips, forced success, or inherited test-pass claim.
 A nonzero command, timeout, resource error, changed HEAD, dirty tree, or missing
 positive test output fails. A filtered Rust test command that matches zero tests
