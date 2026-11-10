@@ -13,7 +13,11 @@ msgstr ""
 "Language-Team: \n"
 "Plural-Forms: \n"
 
-#: src/pages/approved/SourcesSurface.tsx:217
+#: src/components/broadcast/ProductionDesk.tsx:38
+msgid " · Still preview (~1 fps), live video unavailable"
+msgstr ""
+
+#: src/pages/approved/SourcesSurface.tsx:219
 msgid "— dark"
 msgstr ""
 
@@ -296,7 +300,7 @@ msgstr ""
 msgid "{upstreamDrops} packets dropped upstream (queue full)"
 msgstr ""
 
-#: src/pages/approved/RoutingSurface.tsx:238
+#: src/pages/approved/RoutingSurface.tsx:271
 msgid "← Back"
 msgstr ""
 
@@ -429,7 +433,7 @@ msgstr ""
 msgid "△ PREVIEW — unconfirmed"
 msgstr ""
 
-#: src/components/broadcast/ProductionDesk.tsx:149
+#: src/components/broadcast/ProductionDesk.tsx:148
 msgid "○ Dark — neither bus"
 msgstr ""
 
@@ -437,11 +441,11 @@ msgstr ""
 msgid "○ PROGRAM — unconfirmed"
 msgstr ""
 
-#: src/components/broadcast/ProductionDesk.tsx:149
+#: src/components/broadcast/ProductionDesk.tsx:148
 msgid "● Amber — PREVIEW"
 msgstr ""
 
-#: src/pages/approved/SourcesSurface.tsx:215
+#: src/pages/approved/SourcesSurface.tsx:217
 msgid "● AMBER — preview"
 msgstr ""
 
@@ -449,7 +453,7 @@ msgstr ""
 msgid "● ON AIR — PROGRAM"
 msgstr ""
 
-#: src/pages/approved/RoutingSurface.tsx:378
+#: src/pages/approved/RoutingSurface.tsx:419
 msgid "● on PGM"
 msgstr ""
 
@@ -461,15 +465,15 @@ msgstr ""
 #~ msgid "● PROGRAM"
 #~ msgstr ""
 
-#: src/pages/approved/SourcesSurface.tsx:212
+#: src/pages/approved/SourcesSurface.tsx:214
 msgid "● RED — on air"
 msgstr ""
 
-#: src/components/broadcast/ProductionDesk.tsx:149
+#: src/components/broadcast/ProductionDesk.tsx:148
 msgid "● Red — PROGRAM"
 msgstr ""
 
-#: src/pages/approved/RoutingSurface.tsx:230
+#: src/pages/approved/RoutingSurface.tsx:263
 msgid "1 — pick a destination"
 msgstr ""
 
@@ -489,7 +493,7 @@ msgstr ""
 msgid "12-hour clock"
 msgstr ""
 
-#: src/pages/approved/RoutingSurface.tsx:235
+#: src/pages/approved/RoutingSurface.tsx:268
 msgid "2 — pick the source for"
 msgstr ""
 
@@ -864,7 +868,7 @@ msgid "Action log"
 msgstr ""
 
 #: src/pages/AlarmsPage.tsx:221
-#: src/pages/approved/SourcesSurface.tsx:340
+#: src/pages/approved/SourcesSurface.tsx:342
 #: src/pages/CastPage.tsx:320
 #: src/pages/DevicesPage.tsx:634
 #: src/pages/graphics/DataView.tsx:364
@@ -880,12 +884,12 @@ msgstr ""
 msgid "Actions that take time return <0>202 Accepted</0> with an operation id; the final result arrives on the realtime stream, not in the HTTP response body."
 msgstr ""
 
-#: src/pages/approved/SourcesSurface.tsx:338
-#: src/pages/approved/SourcesSurface.tsx:387
+#: src/pages/approved/SourcesSurface.tsx:340
+#: src/pages/approved/SourcesSurface.tsx:393
 msgid "Activation"
 msgstr ""
 
-#: src/pages/approved/SourcesSurface.tsx:198
+#: src/pages/approved/SourcesSurface.tsx:200
 msgid "Activation unknown"
 msgstr ""
 
@@ -909,11 +913,11 @@ msgstr ""
 msgid "Active only"
 msgstr ""
 
-#: src/components/broadcast/ProductionDesk.tsx:149
+#: src/components/broadcast/ProductionDesk.tsx:148
 msgid "Active system alarm summary"
 msgstr ""
 
-#: src/components/broadcast/ProductionDesk.tsx:149
+#: src/components/broadcast/ProductionDesk.tsx:148
 msgid "Active system alarms only"
 msgstr ""
 
@@ -1121,7 +1125,7 @@ msgstr ""
 msgid "Alarm policy (dwell, severity, latching)"
 msgstr ""
 
-#: src/components/broadcast/ProductionDesk.tsx:149
+#: src/components/broadcast/ProductionDesk.tsx:148
 msgid "Alarm summary unavailable"
 msgstr ""
 
@@ -1131,7 +1135,7 @@ msgstr ""
 
 #: src/app/navigation.tsx:70
 #: src/components/broadcast/BroadcastShell.tsx:47
-#: src/components/broadcast/ProductionDesk.tsx:135
+#: src/components/broadcast/ProductionDesk.tsx:136
 #: src/docs/registry.ts:262
 #: src/pages/AlarmsPage.tsx:152
 #: src/pages/docs/FeaturesPage.tsx:164
@@ -1139,7 +1143,7 @@ msgid "Alarms"
 msgstr ""
 
 #. placeholder {0}: alarms.data.length
-#: src/components/broadcast/ProductionDesk.tsx:135
+#: src/components/broadcast/ProductionDesk.tsx:136
 msgid "Alarms — {0} active system"
 msgstr ""
 
@@ -1147,7 +1151,7 @@ msgstr ""
 msgid "Alarms — {alarmCount} active system"
 msgstr ""
 
-#: src/components/broadcast/ProductionDesk.tsx:149
+#: src/components/broadcast/ProductionDesk.tsx:148
 msgid "Alarms & engine health"
 msgstr ""
 
@@ -1172,7 +1176,7 @@ msgid "Align"
 msgstr ""
 
 #: src/events/JournalPanel.tsx:85
-#: src/pages/approved/SourcesSurface.tsx:289
+#: src/pages/approved/SourcesSurface.tsx:291
 msgid "All"
 msgstr ""
 
@@ -1224,8 +1228,8 @@ msgstr ""
 msgid "Also known as"
 msgstr ""
 
-#: src/pages/approved/SourcesSurface.tsx:198
-#: src/pages/approved/SourcesSurface.tsx:323
+#: src/pages/approved/SourcesSurface.tsx:200
+#: src/pages/approved/SourcesSurface.tsx:325
 #: src/pages/DataPage.tsx:91
 #: src/pages/MeshPage.tsx:65
 msgid "Always on"
@@ -1280,7 +1284,7 @@ msgstr ""
 msgid "An ordinary managed source was created carrying device_ref {deviceId}."
 msgstr ""
 
-#: src/pages/OutputsPage.tsx:1427
+#: src/pages/OutputsPage.tsx:1439
 msgid "An output is a sink/server that publishes the program."
 msgstr ""
 
@@ -1554,6 +1558,10 @@ msgstr ""
 msgid "Audio mixer"
 msgstr ""
 
+#: src/pages/approved/RoutingSurface.tsx:176
+msgid "Audio program / tracks"
+msgstr ""
+
 #: src/components/SourceDemandBadge.tsx:19
 msgid "audio route"
 msgstr ""
@@ -1619,21 +1627,21 @@ msgstr ""
 msgid "Auto (first usable track)"
 msgstr ""
 
-#: src/components/broadcast/ProductionDesk.tsx:146
+#: src/components/broadcast/ProductionDesk.tsx:145
 #: src/pages/SwitcherPage.tsx:109
 msgid "Auto frames"
 msgstr ""
 
-#: src/components/broadcast/ProductionDesk.tsx:146
+#: src/components/broadcast/ProductionDesk.tsx:145
 msgid "AUTO frames"
 msgstr ""
 
-#: src/components/broadcast/ProductionDesk.tsx:145
-#: src/components/broadcast/ProductionDesk.tsx:145
+#: src/components/broadcast/ProductionDesk.tsx:144
+#: src/components/broadcast/ProductionDesk.tsx:144
 msgid "AUTO unavailable: the current engine rejects AUTO with HTTP 422"
 msgstr ""
 
-#: src/components/broadcast/ProductionDesk.tsx:146
+#: src/components/broadcast/ProductionDesk.tsx:145
 msgid "AUTO unavailable: the current engine rejects AUTO with HTTP 422."
 msgstr ""
 
@@ -1953,7 +1961,7 @@ msgid "Camera 1"
 msgstr ""
 
 #: src/components/broadcast/BroadcastShell.tsx:45
-#: src/components/broadcast/ProductionDesk.tsx:151
+#: src/components/broadcast/ProductionDesk.tsx:150
 #: src/events/AutomationPanel.tsx:135
 #: src/iptv/AddSourceDialog.tsx:79
 #: src/iptv/BulkAddDialog.tsx:192
@@ -1973,8 +1981,8 @@ msgstr ""
 #: src/pages/graphics/LibraryView.tsx:155
 #: src/pages/LayoutsPage.tsx:319
 #: src/pages/MediaPlayersPage.tsx:894
-#: src/pages/OutputsPage.tsx:1493
-#: src/pages/OutputsPage.tsx:1542
+#: src/pages/OutputsPage.tsx:1505
+#: src/pages/OutputsPage.tsx:1554
 #: src/pages/RelayManagementPage.tsx:80
 #: src/pages/RoutingPage.tsx:654
 #: src/pages/SalvosPage.tsx:281
@@ -2474,7 +2482,7 @@ msgstr ""
 
 #: src/components/broadcast/library/MetadataInspector.tsx:356
 #: src/pages/OutputsPage.tsx:724
-#: src/pages/OutputsPage.tsx:1101
+#: src/pages/OutputsPage.tsx:1113
 msgid "Codec"
 msgstr ""
 
@@ -2622,7 +2630,7 @@ msgstr ""
 msgid "Configuration file"
 msgstr ""
 
-#: src/pages/OutputsPage.tsx:1351
+#: src/pages/OutputsPage.tsx:1363
 msgid "Configure output servers and renditions."
 msgstr ""
 
@@ -2638,8 +2646,8 @@ msgstr ""
 msgid "Configured fail-state probes."
 msgstr ""
 
-#: src/pages/approved/SourcesSurface.tsx:332
-#: src/pages/approved/SourcesSurface.tsx:374
+#: src/pages/approved/SourcesSurface.tsx:334
+#: src/pages/approved/SourcesSurface.tsx:380
 #: src/pages/SourcesPage.tsx:1095
 msgid "Configured ingest sources."
 msgstr ""
@@ -2648,7 +2656,7 @@ msgstr ""
 msgid "Configured multiview layouts."
 msgstr ""
 
-#: src/pages/OutputsPage.tsx:1390
+#: src/pages/OutputsPage.tsx:1402
 msgid "Configured output sinks."
 msgstr ""
 
@@ -2672,11 +2680,11 @@ msgstr ""
 msgid "Confirm a program-affecting take?"
 msgstr ""
 
-#: src/components/broadcast/ProductionDesk.tsx:151
+#: src/components/broadcast/ProductionDesk.tsx:150
 msgid "Confirm program change"
 msgstr ""
 
-#: src/components/broadcast/ProductionDesk.tsx:151
+#: src/components/broadcast/ProductionDesk.tsx:150
 #: src/pages/RoutingPage.tsx:657
 msgid "Confirm take"
 msgstr ""
@@ -2746,7 +2754,7 @@ msgstr ""
 msgid "Control"
 msgstr ""
 
-#: src/components/broadcast/ProductionDesk.tsx:136
+#: src/components/broadcast/ProductionDesk.tsx:137
 msgid "Controls disabled"
 msgstr ""
 
@@ -2892,7 +2900,7 @@ msgstr ""
 msgid "Could not copy diagnostics. Select the safe technical details and copy them manually."
 msgstr ""
 
-#: src/pages/OutputsPage.tsx:1293
+#: src/pages/OutputsPage.tsx:1305
 #: src/resources/CrudPage.tsx:279
 msgid "Could not create"
 msgstr ""
@@ -2905,7 +2913,7 @@ msgstr ""
 msgid "Could not create sources"
 msgstr ""
 
-#: src/pages/OutputsPage.tsx:1316
+#: src/pages/OutputsPage.tsx:1328
 #: src/resources/CrudPage.tsx:298
 msgid "Could not delete"
 msgstr ""
@@ -2971,7 +2979,7 @@ msgid "Could not load discovery:"
 msgstr ""
 
 #: src/pages/DevicesPage.tsx:518
-#: src/pages/OutputsPage.tsx:1256
+#: src/pages/OutputsPage.tsx:1268
 #: src/resources/CrudPage.tsx:246
 msgid "Could not load for editing"
 msgstr ""
@@ -2988,7 +2996,7 @@ msgstr ""
 msgid "Could not load media players:"
 msgstr ""
 
-#: src/pages/OutputsPage.tsx:1382
+#: src/pages/OutputsPage.tsx:1394
 msgid "Could not load outputs:"
 msgstr ""
 
@@ -3116,7 +3124,7 @@ msgid "Could not reboot"
 msgstr ""
 
 #: src/pages/IptvPage.tsx:104
-#: src/pages/OutputsPage.tsx:1293
+#: src/pages/OutputsPage.tsx:1305
 #: src/resources/CrudPage.tsx:279
 msgid "Could not save"
 msgstr ""
@@ -3219,7 +3227,7 @@ msgstr ""
 
 #: src/pages/DeviceDetailPage.tsx:1094
 #: src/pages/DeviceDetailPage.tsx:1213
-#: src/pages/OutputsPage.tsx:1500
+#: src/pages/OutputsPage.tsx:1512
 #: src/resources/CrudPage.tsx:383
 msgid "Create"
 msgstr ""
@@ -3267,7 +3275,7 @@ msgstr ""
 
 #: src/iptv/BulkAddDialog.tsx:105
 #: src/iptv/BulkAddDialog.tsx:184
-#: src/pages/OutputsPage.tsx:1286
+#: src/pages/OutputsPage.tsx:1298
 #: src/resources/CrudPage.tsx:272
 msgid "Created"
 msgstr ""
@@ -3316,23 +3324,27 @@ msgstr ""
 msgid "Critical"
 msgstr ""
 
-#: src/pages/approved/RoutingSurface.tsx:390
+#: src/pages/approved/RoutingSurface.tsx:431
 msgid "Crosspoint state for video cells and audio targets is Unknown: the routing API has no readback. A take applies only from the plan panel."
 msgstr ""
 
-#: src/pages/approved/RoutingSurface.tsx:178
+#: src/pages/approved/RoutingSurface.tsx:307
+msgid "Crosspoint state is Unknown for every destination: the routing API has no readback."
+msgstr ""
+
+#: src/pages/approved/RoutingSurface.tsx:211
 msgid "Crosspoint state Unknown — no readback"
 msgstr ""
 
-#: src/pages/approved/RoutingSurface.tsx:194
+#: src/pages/approved/RoutingSurface.tsx:227
 msgid "Crosspoint states: ? Unknown (no readback) · ◇ SEL selected · ? PLAN dry-run plan. A take applies only from the plan panel."
 msgstr ""
 
-#: src/pages/approved/RoutingSurface.tsx:267
+#: src/pages/approved/RoutingSurface.tsx:301
 msgid "Crosspoint: Unknown"
 msgstr ""
 
-#: src/pages/approved/RoutingSurface.tsx:412
+#: src/pages/approved/RoutingSurface.tsx:453
 msgid "Crosspoints"
 msgstr ""
 
@@ -3399,7 +3411,7 @@ msgstr ""
 msgid "CUT will execute without another confirmation. AUTO remains unavailable. Direct program selection remains guarded."
 msgstr ""
 
-#: src/components/broadcast/ProductionDesk.tsx:145
+#: src/components/broadcast/ProductionDesk.tsx:144
 msgid "Cuts to"
 msgstr ""
 
@@ -3575,12 +3587,12 @@ msgstr ""
 msgid "Degraded event evidence: information may be incomplete."
 msgstr ""
 
-#: src/pages/approved/SourcesSurface.tsx:247
+#: src/pages/approved/SourcesSurface.tsx:249
 #: src/pages/LayoutsPage.tsx:118
 #: src/pages/LayoutsPage.tsx:322
-#: src/pages/OutputsPage.tsx:1069
-#: src/pages/OutputsPage.tsx:1186
-#: src/pages/OutputsPage.tsx:1550
+#: src/pages/OutputsPage.tsx:1081
+#: src/pages/OutputsPage.tsx:1198
+#: src/pages/OutputsPage.tsx:1562
 #: src/pages/SalvosPage.tsx:307
 #: src/pages/SalvosPage.tsx:436
 #: src/pages/TallyPage.tsx:392
@@ -3610,8 +3622,8 @@ msgstr ""
 msgid "Delete layout?"
 msgstr ""
 
-#: src/pages/OutputsPage.tsx:1063
-#: src/pages/OutputsPage.tsx:1180
+#: src/pages/OutputsPage.tsx:1075
+#: src/pages/OutputsPage.tsx:1192
 msgid "Delete output"
 msgstr ""
 
@@ -3635,7 +3647,7 @@ msgstr ""
 msgid "Delete salvo?"
 msgstr ""
 
-#: src/pages/approved/SourcesSurface.tsx:246
+#: src/pages/approved/SourcesSurface.tsx:248
 msgid "Delete source"
 msgstr ""
 
@@ -3651,12 +3663,12 @@ msgstr ""
 msgid "Delete this relay? Active clients can disconnect. Imported resources also require explicit deletion."
 msgstr ""
 
-#: src/pages/OutputsPage.tsx:1519
+#: src/pages/OutputsPage.tsx:1531
 #: src/resources/CrudPage.tsx:402
 msgid "Delete this resource?"
 msgstr ""
 
-#: src/pages/OutputsPage.tsx:1310
+#: src/pages/OutputsPage.tsx:1322
 #: src/resources/CrudPage.tsx:294
 msgid "Deleted"
 msgstr ""
@@ -3690,7 +3702,7 @@ msgstr ""
 msgid "Desk"
 msgstr ""
 
-#: src/pages/OutputsPage.tsx:1090
+#: src/pages/OutputsPage.tsx:1102
 msgid "Destination"
 msgstr ""
 
@@ -3705,7 +3717,7 @@ msgstr ""
 msgid "Destination URL"
 msgstr ""
 
-#: src/pages/approved/RoutingSurface.tsx:199
+#: src/pages/approved/RoutingSurface.tsx:232
 msgid "Destinations are layout cells and audio tracks because those are the only targets the routing API accepts (video cell, audio track / program bus, subtitle layer); output sinks (PGM, HLS …) are not crosspoint targets and are configured in the outputs panel."
 msgstr ""
 
@@ -3718,8 +3730,8 @@ msgstr ""
 #: src/components/broadcast/TaskWorkspace.tsx:82
 #: src/events/JournalPanel.tsx:126
 #: src/iptv/IptvOrgPage.tsx:841
-#: src/pages/approved/SourcesSurface.tsx:267
-#: src/pages/approved/SourcesSurface.tsx:270
+#: src/pages/approved/SourcesSurface.tsx:269
+#: src/pages/approved/SourcesSurface.tsx:272
 #: src/pages/MediaPlayersPage.tsx:548
 msgid "Details"
 msgstr ""
@@ -4131,7 +4143,7 @@ msgstr ""
 msgid "e.g. out-foyer"
 msgstr ""
 
-#: src/pages/OutputsPage.tsx:1451
+#: src/pages/OutputsPage.tsx:1463
 msgid "e.g. program-hls"
 msgstr ""
 
@@ -4215,10 +4227,10 @@ msgstr ""
 msgid "EBU R128 (−23 LUFS)"
 msgstr ""
 
-#: src/pages/approved/SourcesSurface.tsx:244
+#: src/pages/approved/SourcesSurface.tsx:246
 #: src/pages/LayoutsPage.tsx:106
-#: src/pages/OutputsPage.tsx:1059
-#: src/pages/OutputsPage.tsx:1176
+#: src/pages/OutputsPage.tsx:1071
+#: src/pages/OutputsPage.tsx:1188
 #: src/pages/SalvosPage.tsx:296
 #: src/resources/CrudPage.tsx:97
 msgid "Edit"
@@ -4256,11 +4268,11 @@ msgstr ""
 msgid "Edit location"
 msgstr ""
 
-#: src/pages/OutputsPage.tsx:1045
-#: src/pages/OutputsPage.tsx:1046
-#: src/pages/OutputsPage.tsx:1162
-#: src/pages/OutputsPage.tsx:1163
-#: src/pages/OutputsPage.tsx:1424
+#: src/pages/OutputsPage.tsx:1057
+#: src/pages/OutputsPage.tsx:1058
+#: src/pages/OutputsPage.tsx:1174
+#: src/pages/OutputsPage.tsx:1175
+#: src/pages/OutputsPage.tsx:1436
 msgid "Edit output"
 msgstr ""
 
@@ -4279,8 +4291,8 @@ msgstr ""
 msgid "Edit salvo"
 msgstr ""
 
-#: src/pages/approved/SourcesSurface.tsx:237
-#: src/pages/approved/SourcesSurface.tsx:237
+#: src/pages/approved/SourcesSurface.tsx:239
+#: src/pages/approved/SourcesSurface.tsx:239
 #: src/pages/SourcesPage.tsx:1093
 msgid "Edit source"
 msgstr ""
@@ -4375,7 +4387,7 @@ msgstr ""
 #~ msgid "Engine state confirmed · takes follow the lock"
 #~ msgstr ""
 
-#: src/components/broadcast/ProductionDesk.tsx:135
+#: src/components/broadcast/ProductionDesk.tsx:136
 msgid "ENGINE TICK"
 msgstr ""
 
@@ -4540,7 +4552,7 @@ msgstr ""
 msgid "Example sync group"
 msgstr ""
 
-#: src/pages/approved/SourcesSurface.tsx:325
+#: src/pages/approved/SourcesSurface.tsx:327
 msgid "Exceptions (failed / starting) sort first"
 msgstr ""
 
@@ -4621,11 +4633,11 @@ msgid "Face"
 msgstr ""
 
 #: src/components/broadcast/ProducerStatus.tsx:60
-#: src/pages/approved/SourcesSurface.tsx:322
+#: src/pages/approved/SourcesSurface.tsx:324
 msgid "Failed"
 msgstr ""
 
-#: src/pages/approved/SourcesSurface.tsx:152
+#: src/pages/approved/SourcesSurface.tsx:154
 msgid "Failed — no reason reported."
 msgstr ""
 
@@ -4707,7 +4719,7 @@ msgstr ""
 msgid "Filter by object id"
 msgstr ""
 
-#: src/pages/approved/SourcesSurface.tsx:287
+#: src/pages/approved/SourcesSurface.tsx:289
 msgid "Filter sources"
 msgstr ""
 
@@ -4732,7 +4744,7 @@ msgstr ""
 msgid "Fit"
 msgstr ""
 
-#: src/pages/OutputsPage.tsx:1488
+#: src/pages/OutputsPage.tsx:1500
 #: src/resources/CrudPage.tsx:375
 msgid "Fix the highlighted fields, then save again."
 msgstr ""
@@ -5143,6 +5155,7 @@ msgstr ""
 msgid "Height (px)"
 msgstr ""
 
+#: src/components/broadcast/ProductionDesk.tsx:136
 #: src/pages/approved/MediaSurface.tsx:134
 #: src/pages/approved/ShowPage.tsx:40
 msgid "Help"
@@ -5194,7 +5207,7 @@ msgid "HLS and LL-HLS"
 msgstr ""
 
 #: src/pages/OutputsPage.tsx:1031
-#: src/pages/OutputsPage.tsx:1120
+#: src/pages/OutputsPage.tsx:1132
 msgid "HLS link unavailable: output IDs resolve to colliding mounts; the runtime mount depends on configuration order."
 msgstr ""
 
@@ -5235,7 +5248,7 @@ msgid "Hosts, IPv4 vs IPv6"
 msgstr ""
 
 #: src/pages/AudioPage.tsx:1531
-#: src/pages/OutputsPage.tsx:1373
+#: src/pages/OutputsPage.tsx:1385
 #: src/pages/OverlaysPage.tsx:234
 #: src/pages/ProbesPage.tsx:496
 #: src/pages/SourcesPage.tsx:1137
@@ -5321,7 +5334,7 @@ msgstr ""
 #: src/pages/DeviceDetailPage.tsx:1134
 #: src/pages/DevicesPage.tsx:113
 #: src/pages/LayoutsPage.tsx:70
-#: src/pages/OutputsPage.tsx:1447
+#: src/pages/OutputsPage.tsx:1459
 #: src/pages/OverlaysPage.tsx:268
 #: src/pages/ProbesPage.tsx:520
 #: src/pages/SalvosPage.tsx:211
@@ -5341,7 +5354,7 @@ msgid "Identify requested"
 msgstr ""
 
 #: src/components/SourceDemandBadge.tsx:106
-#: src/pages/approved/SourcesSurface.tsx:321
+#: src/pages/approved/SourcesSurface.tsx:323
 #: src/pages/OutputsPage.tsx:198
 msgid "Idle"
 msgstr ""
@@ -5666,7 +5679,7 @@ msgstr ""
 #. placeholder {0}: ctx.row.original.rawKind
 #. placeholder {0}: output.rawKind
 #. placeholder {0}: source.rawKind
-#: src/pages/approved/SourcesSurface.tsx:228
+#: src/pages/approved/SourcesSurface.tsx:230
 #: src/pages/OutputsPage.tsx:964
 #: src/pages/OverlaysPage.tsx:204
 #: src/pages/ProbesPage.tsx:462
@@ -5781,7 +5794,7 @@ msgstr ""
 msgid "Latency"
 msgstr ""
 
-#: src/pages/OutputsPage.tsx:1354
+#: src/pages/OutputsPage.tsx:1366
 msgid "Latency & protocol guide"
 msgstr ""
 
@@ -5931,8 +5944,8 @@ msgstr ""
 msgid "Licensing heartbeat"
 msgstr ""
 
-#: src/pages/approved/SourcesSurface.tsx:337
-#: src/pages/approved/SourcesSurface.tsx:386
+#: src/pages/approved/SourcesSurface.tsx:339
+#: src/pages/approved/SourcesSurface.tsx:392
 msgid "Lifecycle"
 msgstr ""
 
@@ -6119,7 +6132,7 @@ msgstr ""
 msgid "Loading"
 msgstr ""
 
-#: src/components/broadcast/ProductionDesk.tsx:149
+#: src/components/broadcast/ProductionDesk.tsx:148
 msgid "Loading alarm summary"
 msgstr ""
 
@@ -6192,7 +6205,7 @@ msgstr ""
 msgid "Loading media players…"
 msgstr ""
 
-#: src/pages/OutputsPage.tsx:1378
+#: src/pages/OutputsPage.tsx:1390
 msgid "Loading outputs…"
 msgstr ""
 
@@ -6232,7 +6245,7 @@ msgstr ""
 msgid "Loading source events…"
 msgstr ""
 
-#: src/pages/approved/RoutingSurface.tsx:345
+#: src/pages/approved/RoutingSurface.tsx:386
 #: src/pages/SourcesPage.tsx:1097
 msgid "Loading sources…"
 msgstr ""
@@ -6372,7 +6385,7 @@ msgstr ""
 msgid "Luma threshold (0–255)"
 msgstr ""
 
-#: src/components/broadcast/ProductionDesk.tsx:143
+#: src/components/broadcast/ProductionDesk.tsx:142
 msgid "M/E 1 — Switcher"
 msgstr ""
 
@@ -6734,7 +6747,7 @@ msgstr ""
 msgid "More"
 msgstr ""
 
-#: src/components/broadcast/ProductionDesk.tsx:147
+#: src/components/broadcast/ProductionDesk.tsx:146
 msgid "More keys — unavailable"
 msgstr ""
 
@@ -6891,7 +6904,7 @@ msgstr ""
 #: src/pages/graphics/PlayoutView.tsx:463
 #: src/pages/IptvPage.tsx:253
 #: src/pages/LayoutsPage.tsx:61
-#: src/pages/OutputsPage.tsx:1459
+#: src/pages/OutputsPage.tsx:1471
 #: src/pages/OverlaysPage.tsx:168
 #: src/pages/OverlaysPage.tsx:280
 #: src/pages/ProbesPage.tsx:414
@@ -6971,7 +6984,7 @@ msgstr ""
 msgid "Needs headers"
 msgstr ""
 
-#: src/pages/approved/SourcesSurface.tsx:292
+#: src/pages/approved/SourcesSurface.tsx:294
 msgid "Needs me"
 msgstr ""
 
@@ -7034,9 +7047,9 @@ msgstr ""
 msgid "New layout"
 msgstr ""
 
-#: src/pages/OutputsPage.tsx:1338
-#: src/pages/OutputsPage.tsx:1363
-#: src/pages/OutputsPage.tsx:1424
+#: src/pages/OutputsPage.tsx:1350
+#: src/pages/OutputsPage.tsx:1375
+#: src/pages/OutputsPage.tsx:1436
 msgid "New output"
 msgstr ""
 
@@ -7099,7 +7112,7 @@ msgstr ""
 msgid "No active stream."
 msgstr ""
 
-#: src/components/broadcast/ProductionDesk.tsx:149
+#: src/components/broadcast/ProductionDesk.tsx:148
 msgid "No active system alarms reported"
 msgstr ""
 
@@ -7172,7 +7185,7 @@ msgstr ""
 msgid "No crosspoint grid: it needs both configured sources and known destinations (layout cells, audio discrete tracks). Use the typed selectors below."
 msgstr ""
 
-#: src/pages/approved/RoutingSurface.tsx:246
+#: src/pages/approved/RoutingSurface.tsx:279
 msgid "No destinations known (no layout cells or discrete audio tracks). Use the typed selectors."
 msgstr ""
 
@@ -7274,7 +7287,7 @@ msgstr ""
 msgid "No live item: timing and overrun are unknown."
 msgstr ""
 
-#: src/pages/approved/SourcesSurface.tsx:177
+#: src/pages/approved/SourcesSurface.tsx:179
 msgid "No live signal data"
 msgstr ""
 
@@ -7294,7 +7307,7 @@ msgstr ""
 msgid "No locations yet. Nothing is fetched until one is added."
 msgstr ""
 
-#: src/pages/approved/SourcesSurface.tsx:137
+#: src/pages/approved/SourcesSurface.tsx:139
 msgid "No locator configured"
 msgstr ""
 
@@ -7342,7 +7355,7 @@ msgstr ""
 msgid "No output tick observed"
 msgstr ""
 
-#: src/pages/OutputsPage.tsx:1386
+#: src/pages/OutputsPage.tsx:1398
 msgid "No outputs configured."
 msgstr ""
 
@@ -7407,6 +7420,10 @@ msgstr ""
 msgid "No services discovered yet. Run a scan to browse the network."
 msgstr ""
 
+#: src/components/broadcast/ProductionDesk.tsx:136
+msgid "No show clock in the engine API"
+msgstr ""
+
 #: src/components/broadcast/ProductionDesk.tsx:53
 #: src/components/TileStateBadge.tsx:47
 msgid "No signal"
@@ -7429,16 +7446,16 @@ msgstr ""
 msgid "No source events in the current server snapshot. When this source airs an ad break, a badge/countdown overlay will appear automatically on its multiview tile."
 msgstr ""
 
-#: src/components/broadcast/ProductionDesk.tsx:144
+#: src/components/broadcast/ProductionDesk.tsx:143
 msgid "No sources available"
 msgstr ""
 
-#: src/pages/approved/RoutingSurface.tsx:355
+#: src/pages/approved/RoutingSurface.tsx:396
 #: src/pages/SourcesPage.tsx:1096
 msgid "No sources configured."
 msgstr ""
 
-#: src/pages/approved/SourcesSurface.tsx:329
+#: src/pages/approved/SourcesSurface.tsx:331
 msgid "No sources match this filter."
 msgstr ""
 
@@ -7472,6 +7489,10 @@ msgstr ""
 
 #: src/pages/SupportPage.tsx:307
 msgid "No tickets yet."
+msgstr ""
+
+#: src/components/broadcast/ProductionDesk.tsx:136
+msgid "No timecode source in the engine API"
 msgstr ""
 
 #: src/pages/OutputsPage.tsx:816
@@ -7544,7 +7565,7 @@ msgstr ""
 msgid "not currently declared"
 msgstr ""
 
-#: src/pages/OutputsPage.tsx:1247
+#: src/pages/OutputsPage.tsx:1259
 #: src/resources/CrudPage.tsx:237
 msgid "Not editable in this UI"
 msgstr ""
@@ -7558,7 +7579,7 @@ msgid "Not in use: this source is not running and costs nothing."
 msgstr ""
 
 #: src/iptv/SourceLinks.tsx:93
-#: src/pages/approved/SourcesSurface.tsx:251
+#: src/pages/approved/SourcesSurface.tsx:253
 msgid "Not linked to IPTV-ORG"
 msgstr ""
 
@@ -7750,8 +7771,8 @@ msgstr ""
 msgid "on {0}"
 msgstr ""
 
-#: src/pages/approved/SourcesSurface.tsx:296
-#: src/pages/approved/SourcesSurface.tsx:307
+#: src/pages/approved/SourcesSurface.tsx:298
+#: src/pages/approved/SourcesSurface.tsx:309
 msgid "On air"
 msgstr ""
 
@@ -7759,7 +7780,7 @@ msgstr ""
 msgid "ON AIR"
 msgstr ""
 
-#: src/pages/approved/SourcesSurface.tsx:314
+#: src/pages/approved/SourcesSurface.tsx:316
 msgid "On air filter unavailable: the program bus is not confirmed right now (switcher state missing or stale), so no source can be confirmed on air."
 msgstr ""
 
@@ -7771,7 +7792,7 @@ msgstr ""
 msgid "On break start"
 msgstr ""
 
-#: src/pages/approved/SourcesSurface.tsx:198
+#: src/pages/approved/SourcesSurface.tsx:200
 msgid "On demand"
 msgstr ""
 
@@ -7832,7 +7853,7 @@ msgstr ""
 msgid "Open a ticket to read and reply to its thread."
 msgstr ""
 
-#: src/components/broadcast/ProductionDesk.tsx:149
+#: src/components/broadcast/ProductionDesk.tsx:148
 msgid "Open alarms"
 msgstr ""
 
@@ -7841,7 +7862,7 @@ msgid "open documentation"
 msgstr ""
 
 #: src/pages/OutputsPage.tsx:1025
-#: src/pages/OutputsPage.tsx:1153
+#: src/pages/OutputsPage.tsx:1165
 msgid "Open HLS playlist"
 msgstr ""
 
@@ -7975,11 +7996,11 @@ msgstr ""
 msgid "Out of spec"
 msgstr ""
 
-#: src/pages/approved/SourcesSurface.tsx:162
+#: src/pages/approved/SourcesSurface.tsx:164
 msgid "Outbound publishing is a separate path (Routing)"
 msgstr ""
 
-#: src/components/broadcast/ProductionDesk.tsx:136
+#: src/components/broadcast/ProductionDesk.tsx:137
 msgid "Outcome unknown; controls remain blocked until a correlated terminal event"
 msgstr ""
 
@@ -8027,12 +8048,16 @@ msgstr ""
 msgid "Output path"
 msgstr ""
 
-#: src/pages/OutputsPage.tsx:1130
+#: src/pages/OutputsPage.tsx:1142
 msgid "Output playback unavailable: the configured playlist path is missing."
 msgstr ""
 
-#: src/pages/OutputsPage.tsx:1332
+#: src/pages/OutputsPage.tsx:1344
 msgid "Output sinks"
+msgstr ""
+
+#: src/pages/OutputsPage.tsx:1045
+msgid "Output sinks are not routing targets: the routing API accepts video cells, audio tracks and subtitle layers only."
 msgstr ""
 
 #: src/components/broadcast/ProducerStatus.tsx:103
@@ -8050,7 +8075,7 @@ msgstr ""
 #: src/docs/registry.ts:237
 #: src/pages/docs/ConfigPage.tsx:258
 #: src/pages/docs/FeaturesPage.tsx:65
-#: src/pages/OutputsPage.tsx:1348
+#: src/pages/OutputsPage.tsx:1360
 msgid "Outputs"
 msgstr ""
 
@@ -8178,19 +8203,19 @@ msgstr ""
 msgid "PGM"
 msgstr ""
 
-#: src/components/broadcast/ProductionDesk.tsx:144
+#: src/components/broadcast/ProductionDesk.tsx:143
 msgid "PGM bus — direct taps always confirm"
 msgstr ""
 
-#: src/pages/approved/RoutingSurface.tsx:382
+#: src/pages/approved/RoutingSurface.tsx:423
 msgid "PGM: not this source"
 msgstr ""
 
-#: src/pages/approved/RoutingSurface.tsx:374
+#: src/pages/approved/RoutingSurface.tsx:415
 msgid "PGM: unconfirmed"
 msgstr ""
 
-#: src/pages/approved/RoutingSurface.tsx:299
+#: src/pages/approved/RoutingSurface.tsx:340
 msgid "Pick a destination and a source (or type them below) to plan a take. Plan and Take stay disabled until both are set."
 msgstr ""
 
@@ -8206,7 +8231,7 @@ msgstr ""
 msgid "Pick a rectangle of squares with the arrow keys (hold Shift to extend) or by click-dragging, then type a name and assign it. Every named area must form a contiguous rectangle."
 msgstr ""
 
-#: src/pages/approved/RoutingSurface.tsx:341
+#: src/pages/approved/RoutingSurface.tsx:382
 msgid "Pick a source"
 msgstr ""
 
@@ -8247,12 +8272,17 @@ msgstr ""
 msgid "Plain UDP has no recovery at all: a lost packet is a glitch on screen. That is acceptable on a managed facility LAN and wrong for the internet (use SRT there, which wraps the same transport stream in a recovering envelope). Multicast group management is IPv6-first: receivers join groups via MLDv2, with IPv4/IGMP as the legacy path."
 msgstr ""
 
-#: src/pages/approved/RoutingSurface.tsx:295
+#: src/pages/approved/RoutingSurface.tsx:336
 msgid "Plan — nothing selected"
 msgstr ""
 
 #: src/pages/RoutingPage.tsx:623
 msgid "Plan (dry run)"
+msgstr ""
+
+#. placeholder {0}: output.name
+#: src/pages/OutputsPage.tsx:1047
+msgid "Plan a source → {0}"
 msgstr ""
 
 #: src/pages/approved/RoutingSurface.tsx:98
@@ -8377,7 +8407,7 @@ msgstr ""
 msgid "Preview diagnostics"
 msgstr ""
 
-#: src/components/broadcast/ProductionDesk.tsx:36
+#: src/components/broadcast/ProductionDesk.tsx:37
 msgid "Preview monitor"
 msgstr ""
 
@@ -8478,8 +8508,8 @@ msgid "Product telemetry"
 msgstr ""
 
 #: src/app/navigation.tsx:51
-#: src/components/broadcast/ProductionDesk.tsx:134
 #: src/components/broadcast/ProductionDesk.tsx:135
+#: src/components/broadcast/ProductionDesk.tsx:136
 msgid "Production desk"
 msgstr ""
 
@@ -8559,7 +8589,7 @@ msgstr ""
 msgid "Program mix gain, mute, and source membership apply on the next audio tick with a short fade. New, removed, or renamed discrete tracks can remain pending while the program mix applies live. A changed output sample rate or unknown mixed source requires a config export and restart. X-Multiview-Apply reports live, partial, or restart."
 msgstr ""
 
-#: src/components/broadcast/ProductionDesk.tsx:36
+#: src/components/broadcast/ProductionDesk.tsx:37
 msgid "Program monitor"
 msgstr ""
 
@@ -8589,8 +8619,12 @@ msgstr ""
 msgid "Program still image for output {0}"
 msgstr ""
 
-#: src/pages/approved/SourcesSurface.tsx:206
+#: src/pages/approved/SourcesSurface.tsx:208
 msgid "Program tally is not confirmed right now (switcher state missing or stale), so it is not guessed."
+msgstr ""
+
+#: src/components/broadcast/ProductionDesk.tsx:136
+msgid "Program timecode"
 msgstr ""
 
 #: src/pages/CastPage.tsx:483
@@ -8667,7 +8701,7 @@ msgstr ""
 msgid "PVW"
 msgstr ""
 
-#: src/components/broadcast/ProductionDesk.tsx:144
+#: src/components/broadcast/ProductionDesk.tsx:143
 msgid "PVW bus"
 msgstr ""
 
@@ -8756,7 +8790,7 @@ msgid "Reading…"
 msgstr ""
 
 #: src/components/SourceDemandBadge.tsx:80
-#: src/pages/approved/SourcesSurface.tsx:319
+#: src/pages/approved/SourcesSurface.tsx:321
 msgid "Ready"
 msgstr ""
 
@@ -8997,7 +9031,7 @@ msgstr ""
 msgid "Removed from the registry. A device still referenced by a Source or Output (device_ref) is refused with a conflict instead."
 msgstr ""
 
-#: src/pages/OutputsPage.tsx:1311
+#: src/pages/OutputsPage.tsx:1323
 #: src/pages/ProbesPage.tsx:500
 msgid "Removed from the store. The running engine is unchanged until a config export + restart."
 msgstr ""
@@ -9091,7 +9125,7 @@ msgid "Requires a display-kms build"
 msgstr ""
 
 #: src/pages/OutputsPage.tsx:1038
-#: src/pages/OutputsPage.tsx:1137
+#: src/pages/OutputsPage.tsx:1149
 msgid "Requires an active output; saved settings do not confirm playback."
 msgstr ""
 
@@ -9427,7 +9461,7 @@ msgstr ""
 #: src/components/broadcast/library/VTReferenceSummary.tsx:246
 #: src/pages/CastPage.tsx:523
 #: src/pages/IptvPage.tsx:125
-#: src/pages/OutputsPage.tsx:1500
+#: src/pages/OutputsPage.tsx:1512
 #: src/pages/SalvosPage.tsx:398
 #: src/pages/SettingsPage.tsx:218
 #: src/resources/CrudPage.tsx:383
@@ -9479,7 +9513,7 @@ msgid "Save stores this layout for later use. Save & apply stores it, then asks 
 msgstr ""
 
 #: src/pages/AudioPage.tsx:425
-#: src/pages/OutputsPage.tsx:1286
+#: src/pages/OutputsPage.tsx:1298
 #: src/resources/CrudPage.tsx:272
 msgid "Saved"
 msgstr ""
@@ -9593,11 +9627,11 @@ msgstr ""
 msgid "Search results"
 msgstr ""
 
-#: src/pages/approved/SourcesSurface.tsx:284
+#: src/pages/approved/SourcesSurface.tsx:286
 msgid "Search sources by name"
 msgstr ""
 
-#: src/pages/approved/SourcesSurface.tsx:283
+#: src/pages/approved/SourcesSurface.tsx:285
 msgid "Search sources…"
 msgstr ""
 
@@ -9640,7 +9674,7 @@ msgstr ""
 
 #. placeholder {0}: src.name
 #. placeholder {1}: d.label
-#: src/pages/approved/RoutingSurface.tsx:177
+#: src/pages/approved/RoutingSurface.tsx:210
 msgid "Select {0} to {1}"
 msgstr ""
 
@@ -9857,8 +9891,8 @@ msgstr ""
 msgid "Sign in"
 msgstr ""
 
-#: src/pages/approved/SourcesSurface.tsx:336
-#: src/pages/approved/SourcesSurface.tsx:385
+#: src/pages/approved/SourcesSurface.tsx:338
+#: src/pages/approved/SourcesSurface.tsx:391
 msgid "Signal"
 msgstr ""
 
@@ -9866,7 +9900,7 @@ msgstr ""
 msgid "Signal unconfirmed"
 msgstr ""
 
-#: src/pages/approved/SourcesSurface.tsx:177
+#: src/pages/approved/SourcesSurface.tsx:179
 msgid "Signal unknown"
 msgstr ""
 
@@ -9910,13 +9944,13 @@ msgstr ""
 #: src/layout/components/CellsForm.tsx:398
 #: src/layout/components/GridLayoutEditor.tsx:667
 #: src/pages/approved/ShowPage.tsx:89
-#: src/pages/approved/SourcesSurface.tsx:335
+#: src/pages/approved/SourcesSurface.tsx:337
 #: src/pages/IptvPage.tsx:232
 #: src/pages/SwitcherPage.tsx:100
 msgid "Source"
 msgstr ""
 
-#: src/pages/approved/RoutingSurface.tsx:154
+#: src/pages/approved/RoutingSurface.tsx:163
 msgid "Source ↓ / Dest →"
 msgstr ""
 
@@ -9956,7 +9990,7 @@ msgstr ""
 msgid "Source input id"
 msgstr ""
 
-#: src/pages/approved/RoutingSurface.tsx:349
+#: src/pages/approved/RoutingSurface.tsx:390
 msgid "Source list unavailable — type the source input id below."
 msgstr ""
 
@@ -9968,7 +10002,7 @@ msgstr ""
 msgid "Source still preview"
 msgstr ""
 
-#: src/components/broadcast/ProductionDesk.tsx:145
+#: src/components/broadcast/ProductionDesk.tsx:144
 msgid "source unknown"
 msgstr ""
 
@@ -10112,7 +10146,7 @@ msgstr ""
 
 #: src/components/broadcast/ProductionDesk.tsx:53
 #: src/components/SourceDemandBadge.tsx:89
-#: src/pages/approved/SourcesSurface.tsx:320
+#: src/pages/approved/SourcesSurface.tsx:322
 msgid "Starting"
 msgstr ""
 
@@ -10150,7 +10184,7 @@ msgstr ""
 msgid "Status"
 msgstr ""
 
-#: src/pages/approved/SourcesSurface.tsx:187
+#: src/pages/approved/SourcesSurface.tsx:189
 msgid "Status unknown"
 msgstr ""
 
@@ -10182,7 +10216,6 @@ msgstr ""
 msgid "Still preview (~1 fps)"
 msgstr ""
 
-#: src/components/broadcast/ProductionDesk.tsx:37
 #: src/preview/PreviewSurface.tsx:97
 msgid "Still preview (~1 fps) — live video is unavailable for this preview."
 msgstr ""
@@ -10253,7 +10286,7 @@ msgstr ""
 msgid "Stored. Drift is measured against the group's target skew; the achieved tier is reported, never over-claimed."
 msgstr ""
 
-#: src/pages/OutputsPage.tsx:1287
+#: src/pages/OutputsPage.tsx:1299
 #: src/pages/ProbesPage.tsx:499
 msgid "Stored. It goes live via config export + restart; the running engine is unchanged until then."
 msgstr ""
@@ -10327,6 +10360,10 @@ msgstr ""
 msgid "Subsystem:"
 msgstr ""
 
+#: src/pages/approved/RoutingSurface.tsx:178
+msgid "Subtitle layers"
+msgstr ""
+
 #: src/components/SourceDemandBadge.tsx:21
 msgid "subtitle route"
 msgstr ""
@@ -10372,7 +10409,7 @@ msgstr ""
 msgid "Switch"
 msgstr ""
 
-#: src/components/broadcast/ProductionDesk.tsx:135
+#: src/components/broadcast/ProductionDesk.tsx:136
 msgid "Switch PGM/PVW, watch the wall, feel the tally."
 msgstr ""
 
@@ -10402,12 +10439,12 @@ msgid "Switched to the alternative"
 msgstr ""
 
 #: src/app/navigation.tsx:63
-#: src/components/broadcast/ProductionDesk.tsx:136
+#: src/components/broadcast/ProductionDesk.tsx:137
 #: src/pages/SwitcherPage.tsx:89
 msgid "Switcher"
 msgstr ""
 
-#: src/components/broadcast/ProductionDesk.tsx:136
+#: src/components/broadcast/ProductionDesk.tsx:137
 #: src/pages/SwitcherPage.tsx:91
 msgid "Switcher operation rejected"
 msgstr ""
@@ -10513,11 +10550,15 @@ msgstr ""
 msgid "Takes unlocked"
 msgstr ""
 
+#: src/components/broadcast/ProductionDesk.tsx:136
+msgid "Takes: when locked, CUT confirms once, naming both sources. PGM bus taps always confirm."
+msgstr ""
+
 #: src/app/navigation.tsx:65
 #: src/docs/registry.ts:247
 #: src/docs/registry.ts:753
-#: src/pages/approved/SourcesSurface.tsx:339
-#: src/pages/approved/SourcesSurface.tsx:388
+#: src/pages/approved/SourcesSurface.tsx:341
+#: src/pages/approved/SourcesSurface.tsx:394
 #: src/pages/docs/concepts/GlossaryPage.tsx:326
 #: src/pages/docs/FeaturesPage.tsx:124
 #: src/pages/TallyPage.tsx:178
@@ -10532,11 +10573,11 @@ msgstr ""
 msgid "Tally follows the engine bus IDs; source presence does not prove signal."
 msgstr ""
 
-#: src/components/broadcast/ProductionDesk.tsx:149
+#: src/components/broadcast/ProductionDesk.tsx:148
 msgid "Tally is separate from signal and output transmission."
 msgstr ""
 
-#: src/components/broadcast/ProductionDesk.tsx:149
+#: src/components/broadcast/ProductionDesk.tsx:148
 msgid "Tally legend"
 msgstr ""
 
@@ -10548,8 +10589,12 @@ msgstr ""
 msgid "Tally shows which sources are on-air. A tally profile maps the bits of an external tally bus to colors (for example red for program, green for preview) and maps bus index positions to specific tiles. A <0>tally_border</0> overlay then lights the tile's edge to match. This lets an upstream router or mixer drive the borders on the wall."
 msgstr ""
 
-#: src/pages/approved/SourcesSurface.tsx:207
+#: src/pages/approved/SourcesSurface.tsx:209
 msgid "Tally unknown"
+msgstr ""
+
+#: src/components/broadcast/ProductionDesk.tsx:136
+msgid "Tally vs signal: the wall border and lamp are tally (red = on program, amber = cue); the chip is signal state. A source can be live and red, or live and dark — never one merged state."
 msgstr ""
 
 #: src/components/broadcast/library/TranscriptRangeEditor.tsx:338
@@ -10829,7 +10874,7 @@ msgstr ""
 msgid "The effective build-profile licence of this artifact (its codec-linking licence), distinct from the project’s source-available licence."
 msgstr ""
 
-#: src/components/broadcast/ProductionDesk.tsx:113
+#: src/components/broadcast/ProductionDesk.tsx:114
 msgid "The engine refused this plan"
 msgstr ""
 
@@ -11015,7 +11060,7 @@ msgstr ""
 msgid "The production rundown is unavailable: no show-control contract exists. No video switch occurs here; the Desk PROGRAM monitor is the only truth for what viewers see."
 msgstr ""
 
-#: src/components/broadcast/ProductionDesk.tsx:151
+#: src/components/broadcast/ProductionDesk.tsx:150
 msgid "The program bus changes what viewers see. Acceptance is not completion."
 msgstr ""
 
@@ -11239,7 +11284,7 @@ msgstr ""
 msgid "this document's shape isn't editable in this UI; it is preserved as authored"
 msgstr ""
 
-#: src/pages/OutputsPage.tsx:1248
+#: src/pages/OutputsPage.tsx:1260
 #: src/resources/CrudPage.tsx:238
 msgid "This entry's kind has no form here; the stored document is preserved as authored."
 msgstr ""
@@ -11324,7 +11369,7 @@ msgstr ""
 msgid "This permanently removes the salvo definition."
 msgstr ""
 
-#: src/pages/OutputsPage.tsx:1522
+#: src/pages/OutputsPage.tsx:1534
 #: src/resources/CrudPage.tsx:405
 msgid "This permanently removes the stored resource. The running engine is not affected until a new configuration is applied."
 msgstr ""
@@ -11578,7 +11623,7 @@ msgstr ""
 msgid "Transition running"
 msgstr ""
 
-#: src/components/broadcast/ProductionDesk.tsx:145
+#: src/components/broadcast/ProductionDesk.tsx:144
 msgid "Transition type — unavailable"
 msgstr ""
 
@@ -11593,7 +11638,7 @@ msgstr ""
 #: src/pages/DataPage.tsx:109
 #: src/pages/docs/concepts/TransportsPage.tsx:257
 #: src/pages/LicencePage.tsx:247
-#: src/pages/OutputsPage.tsx:1468
+#: src/pages/OutputsPage.tsx:1480
 msgid "Transport"
 msgstr ""
 
@@ -11656,13 +11701,18 @@ msgstr ""
 msgid "Unacknowledged"
 msgstr ""
 
-#: src/pages/approved/AudioSurface.tsx:173
-#~ msgid "unavailable"
-#~ msgstr ""
+#: src/components/broadcast/ProductionDesk.tsx:136
+#: src/components/broadcast/ProductionDesk.tsx:136
+msgid "unavailable"
+msgstr ""
 
 #: src/components/broadcast/ProductionDesk.tsx:141
 #: src/pages/approved/MediaSurface.tsx:29
 msgid "Unavailable"
+msgstr ""
+
+#: src/pages/OutputsPage.tsx:1049
+msgid "Unavailable — no output routing target in the API"
 msgstr ""
 
 #: src/pages/approved/ShowPage.tsx:72
@@ -11716,10 +11766,10 @@ msgstr ""
 
 #: src/components/broadcast/library/MetadataInspector.tsx:201
 #: src/components/broadcast/ProducerStatus.tsx:72
-#: src/components/broadcast/ProductionDesk.tsx:151
-#: src/components/broadcast/ProductionDesk.tsx:151
+#: src/components/broadcast/ProductionDesk.tsx:150
+#: src/components/broadcast/ProductionDesk.tsx:150
 #: src/pages/approved/RoutingSurface.tsx:43
-#: src/pages/approved/SourcesSurface.tsx:324
+#: src/pages/approved/SourcesSurface.tsx:326
 #: src/pages/MediaPlayersPage.tsx:355
 msgid "Unknown"
 msgstr ""
@@ -11735,7 +11785,7 @@ msgstr ""
 msgid "Unknown error"
 msgstr ""
 
-#: src/components/broadcast/ProductionDesk.tsx:145
+#: src/components/broadcast/ProductionDesk.tsx:144
 msgid "unknown source"
 msgstr ""
 
@@ -11956,6 +12006,10 @@ msgstr ""
 msgid "Video"
 msgstr ""
 
+#: src/pages/approved/RoutingSurface.tsx:174
+msgid "Video cells"
+msgstr ""
+
 #: src/preview/PreviewDiagnostics.tsx:21
 msgid "Video progress could not be determined from browser statistics."
 msgstr ""
@@ -12049,7 +12103,7 @@ msgstr ""
 msgid "VT transport, graphics, capture and the clip library."
 msgstr ""
 
-#: src/components/broadcast/ProductionDesk.tsx:36
+#: src/components/broadcast/ProductionDesk.tsx:37
 #: src/pages/MonitoringPage.tsx:87
 #: src/preview/PreviewSurface.tsx:45
 msgid "Waiting for a frame…"
@@ -12115,7 +12169,7 @@ msgid "Watch / live / channel URL"
 msgstr ""
 
 #: src/pages/OutputsPage.tsx:1021
-#: src/pages/OutputsPage.tsx:1149
+#: src/pages/OutputsPage.tsx:1161
 msgid "Watch program"
 msgstr ""
 
@@ -12319,7 +12373,7 @@ msgstr ""
 msgid "Whole mix overview"
 msgstr ""
 
-#: src/components/broadcast/ProductionDesk.tsx:146
+#: src/components/broadcast/ProductionDesk.tsx:145
 msgid "Why AUTO is unavailable · transition options"
 msgstr ""
 
@@ -12346,12 +12400,12 @@ msgstr ""
 msgid "Window"
 msgstr ""
 
-#: src/components/broadcast/ProductionDesk.tsx:145
-#: src/components/broadcast/ProductionDesk.tsx:145
+#: src/components/broadcast/ProductionDesk.tsx:144
+#: src/components/broadcast/ProductionDesk.tsx:144
 msgid "WIPE and DIP have no supported control contract"
 msgstr ""
 
-#: src/components/broadcast/ProductionDesk.tsx:147
+#: src/components/broadcast/ProductionDesk.tsx:146
 msgid "WIPE, DIP, USK, DSK and AUX have no supported control contract."
 msgstr ""
 
