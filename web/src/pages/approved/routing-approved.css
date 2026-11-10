@@ -74,3 +74,13 @@
 [data-approved-page="routing"] [data-testid="output-header-actions"] button:hover{background:var(--bg-3)}
 [data-approved-page="routing"] [data-testid="output-header-actions"] button[data-testid="crud-new"]{background:var(--blue);color:#0b1220;border-color:transparent}
 [data-approved-page="routing"] .out-card button,[data-approved-page="routing"] .plan-actions button{border-radius:var(--r-md);font-weight:700}
+
+/* Round 2: 48px targets, muted borders, plan-panel flow. */
+[data-approved-page="routing"] .help-btn{min-height:var(--tap)}
+[data-approved-page="routing"] .pgm-readout .rp-cur{font-family:var(--mono);font-size:11px;color:var(--text-3)}
+[data-approved-page="routing"] .out-flag a,[data-approved-page="routing"] .out-card a,[data-approved-page="routing"] .outputs-block a{display:inline-flex;align-items:center;min-height:var(--tap);min-width:var(--tap);padding:0 8px}
+[data-approved-page="routing"] .outputs-block [role="alert"],[data-approved-page="routing"] .outputs-block [role="status"],[data-approved-page="routing"] .outputs-block [data-slot="alert"]{border-color:var(--line-2);background:var(--bg-2)}
+[data-approved-page="routing"] .route-form{grid-template-columns:repeat(auto-fit,minmax(220px,1fr));align-items:end}
+[data-approved-page="routing"] .route-form>*{min-width:0}
+[data-approved-page="routing"] .route-form [role="combobox"],[data-approved-page="routing"] .route-form input:not([type="checkbox"]){width:100%}
+[data-approved-page="routing"] .patch-table th{white-space:nowrap}

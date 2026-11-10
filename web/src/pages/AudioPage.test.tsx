@@ -193,6 +193,19 @@ describe("AudioPage", () => {
     expect(screen.queryByTestId("audio-draft-summary")).not.toBeInTheDocument();
   });
 
+  it("stacks the four nudges beside the fader (side-stack) and renders one toolbar with one Add route / Save pair", async () => {
+    renderAudio();
+    const { focused } = await console();
+    const fader = within(focused).getByTestId("audio-fader");
+    const nudges = within(focused).getByTestId("audio-nudges");
+    expect(nudges).toHaveClass("audio-nudge-col");
+    expect(fader.parentElement?.parentElement).toContainElement(nudges);
+    expect(within(nudges).getAllByTestId("audio-nudge")).toHaveLength(4);
+    expect(screen.getAllByTestId("audio-toolbar")).toHaveLength(1);
+    expect(screen.getAllByTestId("audio-save")).toHaveLength(1);
+    expect(screen.getAllByTestId("audio-add-route")).toHaveLength(1);
+  });
+
   it("puts the full-height fader before secondary strip controls and keeps context after the console", async () => {
     renderAudio();
     const { focused } = await console();
@@ -211,11 +224,12 @@ describe("AudioPage", () => {
     const pgm = within(essential).getByTestId("audio-pgm");
     expect(within(essential).getByTestId("audio-mute")).toBe(mute);
     expect(mute.compareDocumentPosition(pgm) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
-    expect(pgm.compareDocumentPosition(nudges) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    // Round 2: the nudges are the fader's side-stack, so they precede the keys.
+    expect(nudges.compareDocumentPosition(mute) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
     expect(mute).toHaveClass("h-12", "min-w-12");
     expect(pgm).toHaveClass("h-12", "min-w-12");
     for (const nudge of within(essential).getAllByTestId("audio-nudge")) {
-      expect(nudge).toHaveClass("size-12");
+      expect(nudge).toHaveClass("h-12", "min-w-12");
     }
     expect(screen.getByRole("heading", { name: "Channel strip" })).toHaveClass("sr-only");
     const context = screen.getByTestId("audio-page-context");

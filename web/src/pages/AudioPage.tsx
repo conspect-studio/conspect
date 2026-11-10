@@ -126,7 +126,9 @@ function DetailsDisclosure({
   open,
   onOpenChange,
   children,
+  compact = false,
 }: {
+  readonly compact?: boolean;
   readonly testId: string;
   readonly summary: string;
   readonly open: boolean;
@@ -140,7 +142,7 @@ function DetailsDisclosure({
       onToggle={(event): void => {
         onOpenChange(event.currentTarget.open);
       }}
-      className="group rounded-md border p-3"
+      className={compact ? "group audio-details-compact" : "group rounded-md border p-3"}
     >
       <summary
         className="flex min-h-12 cursor-pointer list-none items-center gap-1 text-sm font-medium [&::-webkit-details-marker]:hidden"
@@ -386,6 +388,29 @@ function ChannelStrip({
             }}
           />
         </div>
+      {/* ±1 / ±6 dB tap nudges (48 px) stacked beside the fader like the approved side-stack; staged exactly like the drag. */}
+      <div className="audio-nudge-col" data-testid="audio-nudges">
+        {([6, 1, -1, -6] as const).map((delta) => (
+          <Button
+            key={delta}
+            type="button"
+            variant="outline"
+            data-testid="audio-nudge"
+            aria-label={
+              delta > 0
+                ? t`${label} gain +${delta} dB`
+                : t`${label} gain −${Math.abs(delta)} dB`
+            }
+            className="audio-nudge-btn h-12 min-w-12 p-0 font-mono"
+            disabled={draftDb === undefined}
+            onClick={(): void => {
+              setGain(nudgeGainDb(route.gainDb, delta));
+            }}
+          >
+            {delta > 0 ? `+${String(delta)}` : `−${String(Math.abs(delta))}`}
+          </Button>
+        ))}
+      </div>
         <InputMeterColumn sample={inputSample} />
       </div>
 
@@ -418,30 +443,6 @@ function ChannelStrip({
         >
           {t`PGM`}
         </Button>
-      </div>
-
-      {/* ±1 / ±6 dB tap nudges (48 px), staged exactly like the drag. */}
-      <div className="flex flex-wrap items-center gap-1" data-testid="audio-nudges">
-        {([6, 1, -1, -6] as const).map((delta) => (
-          <Button
-            key={delta}
-            type="button"
-            variant="outline"
-            data-testid="audio-nudge"
-            aria-label={
-              delta > 0
-                ? t`${label} gain +${delta} dB`
-                : t`${label} gain −${Math.abs(delta)} dB`
-            }
-            className="size-12 p-0 font-mono"
-            disabled={draftDb === undefined}
-            onClick={(): void => {
-              setGain(nudgeGainDb(route.gainDb, delta));
-            }}
-          >
-            {delta > 0 ? `+${String(delta)}` : `−${String(Math.abs(delta))}`}
-          </Button>
-        ))}
       </div>
 
       </div>
@@ -494,6 +495,7 @@ function ChannelStrip({
 
       <DetailsDisclosure
         testId="audio-strip-details"
+        compact
         summary={t`Channel details`}
         open={detailsOpen}
         onOpenChange={(next): void => {
