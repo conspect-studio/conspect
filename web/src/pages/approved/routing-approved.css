@@ -96,3 +96,13 @@
 [data-approved-page="routing"] input[type="checkbox"]{appearance:none;-webkit-appearance:none;display:inline-grid;place-content:center;flex:none;width:var(--tap);min-width:var(--tap);height:var(--tap);margin:0;border:0;background:transparent;cursor:pointer}
 [data-approved-page="routing"] input[type="checkbox"]::before{content:"";width:22px;height:22px;border:2px solid var(--line-2);border-radius:5px;background:var(--bg-2)}
 [data-approved-page="routing"] input[type="checkbox"]:checked::before{background:var(--blue);border-color:var(--blue);box-shadow:inset 0 0 0 4px var(--bg-2)}
+/* Row headers: never wrap per letter — sane min width, single line, ellipsis (full name in title). */
+[data-approved-page="routing"] .patch-table th.patch-src{white-space:nowrap;overflow-wrap:normal;min-width:72px;max-width:112px;overflow:hidden;text-overflow:ellipsis}
+[data-approved-page="routing"] .patch-table th.src-h{white-space:nowrap;min-width:72px}
+/* Grid scrolls inside its panel (both axes) with sticky headers, so Plan/Take stay reachable below it. */
+@media (min-width:768px){
+[data-approved-page="routing"] .patch-wrap{max-height:min(46vh,360px);overflow:auto;overscroll-behavior:contain}
+[data-approved-page="routing"] .patch-table thead th{position:sticky;top:0;background:var(--bg-1);z-index:3}
+[data-approved-page="routing"] .patch-table thead th.src-h{z-index:4}
+[data-approved-page="routing"] .xpt{min-width:56px}
+}

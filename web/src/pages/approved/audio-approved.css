@@ -279,18 +279,19 @@
 [data-approved-page="audio"] .strip-bank { position: relative; }
 [data-approved-page="audio"] { position: relative; overflow-x: clip; }
 
-/* Round 3b: 1440 bank fit — nudges drop to a 2x2 block under the fader so a
-   strip is ~120px wide and all 8 strips + the 220px rail fit without clipping. */
+/* Round 5: 1440 bank fit — nudges are a 48px side stack BESIDE the fader (reference);
+   ticks/track/meter are tightened so all 8 strips + the rail fit without clipping. */
 @media (min-width: 1280px) {
-  [data-approved-page="audio"] .mixer { grid-template-columns: minmax(0, 1fr) 220px; }
-  [data-approved-page="audio"] .master-col { width: 220px; max-width: 220px; overflow: visible; }
-  [data-approved-page="audio"] .strip-bank { grid-auto-columns: minmax(120px, 1fr); }
-  [data-approved-page="audio"] .strip-bank [data-testid="audio-strip-essential"] > div:first-child { flex-wrap: wrap; justify-content: flex-start; row-gap: 6px; }
-  [data-approved-page="audio"] .strip-bank .audio-nudge-col {
-    order: 5; flex: 1 1 100%; width: auto; grid-template-columns: repeat(2, minmax(48px, 1fr));
-  }
-  [data-approved-page="audio"] .strip-bank .audio-nudge-btn { width: 100%; }
-  [data-approved-page="audio"] .strip-bank [data-testid="audio-strip-essential"] > div:first-child .fader-track { flex: none; }
+  [data-approved-page="audio"] .mixer { grid-template-columns: minmax(0, 1fr) 200px; gap: 10px; }
+  [data-approved-page="audio"] .master-col { width: 200px; max-width: 200px; overflow: visible; }
+  [data-approved-page="audio"] .strip-bank { grid-auto-columns: minmax(0, 1fr); gap: 6px; }
+  [data-approved-page="audio"] .strip-bank [data-testid="audio-strip"] { padding: 10px 3px; min-width: 0; }
+  [data-approved-page="audio"] .strip-bank [data-testid="audio-strip-essential"] > div:first-child { flex-wrap: nowrap; justify-content: center; gap: 3px; min-width: 0; }
+  [data-approved-page="audio"] .strip-bank [data-testid="audio-strip-essential"] > div:first-child > div:first-child { width: 20px; flex: none; }
+  [data-approved-page="audio"] .strip-bank [data-testid="audio-strip-essential"] > div:first-child .fader-track { flex: none; width: 48px; }
+  [data-approved-page="audio"] .strip-bank .audio-nudge-col { order: 0; flex: none; width: 48px; grid-template-columns: 48px; }
+  [data-approved-page="audio"] .strip-bank .audio-nudge-btn { width: 48px; }
+  [data-approved-page="audio"] .strip-bank .meter-col { width: 8px; }
 }
 /* Phone (reference-audio-390): keys + LISTEN note above the fader, nudges beside it. */
 @media (max-width: 767px) {

@@ -163,7 +163,7 @@ export function CrosspointGrid({
         <tbody>
           {sources.map((src) => (
             <tr key={src.id}>
-              <th className="patch-src" scope="row">
+              <th className="patch-src" scope="row" title={src.name}>
                 {src.name}
               </th>
               {dests.map((d) => {
