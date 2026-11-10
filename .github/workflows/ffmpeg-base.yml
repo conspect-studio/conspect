@@ -23,12 +23,14 @@ on:
     paths:
       - "deploy/ffmpeg-build.sh"
       - "deploy/ffmpeg-fetch-source.sh"
+      - "deploy/ffmpeg-patches/**"
       - "deploy/Dockerfile.ffmpeg"
       - ".github/workflows/ffmpeg-base.yml"
   pull_request:
     paths:
       - "deploy/ffmpeg-build.sh"
       - "deploy/ffmpeg-fetch-source.sh"
+      - "deploy/ffmpeg-patches/**"
       - "deploy/Dockerfile.ffmpeg"
       - ".github/workflows/ffmpeg-base.yml"
   schedule:

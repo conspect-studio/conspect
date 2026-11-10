@@ -202,6 +202,22 @@ else
 fi
 
 # -----------------------------------------------------------------------------
+# 1b. Carried patches for this exact version (deploy/ffmpeg-patches/<version>/,
+#     applied in name order). Each is a minimal fix for a regression we hit,
+#     documented in its header with the upstream status; the directory is part of
+#     the build input, so a patch change rebuilds the base image. A patch that no
+#     longer applies fails the build rather than being skipped.
+# -----------------------------------------------------------------------------
+PATCH_DIR="${FFMPEG_PATCH_DIR:-$(dirname "$(readlink -f "$0")")/ffmpeg-patches}/${FFMPEG_VERSION}"
+if [ -d "${PATCH_DIR}" ]; then
+  for p in "${PATCH_DIR}"/*.patch; do
+    [ -e "${p}" ] || continue
+    echo "ffmpeg-build: applying $(basename "${p}")"
+    patch -d "${SRC}" -p1 --forward --batch < "${p}"
+  done
+fi
+
+# -----------------------------------------------------------------------------
 # 2. nv-codec-headers (NVIDIA path only) — install the NVENC/NVDEC headers from
 #    a content-pinned git commit. No CUDA SDK: --enable-cuda-llvm JIT-compiles
 #    scale_cuda via clang, keeping the build LGPL-clean (ADR-0031, §4 brief).

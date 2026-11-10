@@ -98,7 +98,7 @@ ARG TARGETARCH
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \
       ca-certificates curl gnupg git \
-      build-essential clang llvm pkg-config nasm yasm make \
+      build-essential clang llvm pkg-config nasm yasm make patch \
       libopus-dev libsrt-openssl-dev libgnutls28-dev libdrm-dev libva-dev zlib1g-dev \
  && if [ "${FF_HWACCEL}" = "vaapi" ] && [ "$(dpkg --print-architecture)" = "amd64" ]; then \
       apt-get install -y --no-install-recommends libvpl-dev; \
@@ -115,6 +115,7 @@ RUN apt-get update \
 # aborts. Output: /opt/multiview-ffmpeg/{lib,include,lib/pkgconfig}.
 COPY --from=source /src /usr/src/ffmpeg
 COPY deploy/ffmpeg-build.sh /usr/local/bin/ffmpeg-build.sh
+COPY deploy/ffmpeg-patches /usr/local/bin/ffmpeg-patches
 RUN chmod 0755 /usr/local/bin/ffmpeg-build.sh \
  && FF_HWACCEL="${FF_HWACCEL}" \
     FFMPEG_VERSION="${FFMPEG_VERSION}" \

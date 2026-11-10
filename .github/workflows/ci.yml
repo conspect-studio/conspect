@@ -623,7 +623,7 @@ jobs:
           else
             echo "::warning::${FFMPEG_IMAGE} is not published yet; building the pinned FFmpeg from source (bootstrap)."
             sudo apt-get install -y --no-install-recommends \
-              build-essential xz-utils gnupg dirmngr \
+              build-essential xz-utils gnupg dirmngr patch \
               libopus-dev libsrt-openssl-dev libgnutls28-dev libdrm-dev libva-dev libvpl-dev zlib1g-dev
             pin() { sed -n "s/^ARG $1=//p" deploy/Dockerfile.ffmpeg | head -1; }
             sudo env FF_PREFIX="${FFMPEG_PREFIX}" FF_LICENSE=lgpl FF_HWACCEL=vaapi TARGETARCH=amd64 \

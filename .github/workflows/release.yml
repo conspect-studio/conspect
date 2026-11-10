@@ -86,7 +86,7 @@ jobs:
           export FFMPEG_VERSION FFMPEG_SHA256 FFMPEG_GIT_COMMIT
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            pkg-config clang nasm build-essential xz-utils gnupg dirmngr patchelf \
+            pkg-config clang nasm build-essential xz-utils gnupg dirmngr patchelf patch \
             libopus-dev libsrt-openssl-dev libgnutls28-dev libdrm-dev libva-dev zlib1g-dev
           case "$(uname -m)" in
             x86_64)
