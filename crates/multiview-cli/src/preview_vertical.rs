@@ -551,7 +551,7 @@ impl PreviewVertical {
                 thread_alive.store(false, Ordering::Release);
             })
             .ok()?;
-        let mut workers = Vec::new();
+        let mut workers: Vec<crate::preview_fanout::PreviewWorker> = Vec::new();
         for (index, lease) in leases.into_iter().enumerate() {
             let cadence = lease.descriptor().key.cadence;
             let sender = tx.clone();
