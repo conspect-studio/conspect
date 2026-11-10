@@ -297,6 +297,15 @@ impl<T> TileStore<T> {
         }
     }
 
+    /// Retire retained pictures after the caller has fenced the producer.
+    /// Sequence numbers stay monotonic; old snapshots cannot prune a later run.
+    pub fn clear(&self) {
+        self.slot.take();
+        self.ring.store(Arc::new(Vec::new()));
+        self.last_frame_at_ns
+            .store(NEVER_PUBLISHED, Ordering::Release);
+    }
+
     /// Create a tile store with default thresholds and the [`NoSignalPolicy::Slate`]
     /// default.
     #[must_use]

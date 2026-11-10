@@ -465,7 +465,7 @@ pub(crate) fn submit_accepted_body(
     build: impl FnOnce(OperationId) -> ControlResult<Command>,
 ) -> ControlResult<AcceptedBody> {
     match state.idempotency.reserve(idem.0.as_deref()) {
-        Reservation::Capacity => return Err(ControlError::IdempotencyCapacity),
+        Reservation::Capacity => Err(ControlError::IdempotencyCapacity),
         Reservation::Replay(op) => {
             // A retried request with the same key: return the original id
             // without re-enqueuing the command (and without re-running

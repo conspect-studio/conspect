@@ -834,7 +834,7 @@ pub(crate) fn reserve_operation(
     idem: &IdempotencyKey,
 ) -> ControlResult<OperationId> {
     match state.idempotency.reserve(idem.0.as_deref()) {
-        Reservation::Capacity => return Err(ControlError::IdempotencyCapacity),
+        Reservation::Capacity => Err(ControlError::IdempotencyCapacity),
         Reservation::Fresh(op) | Reservation::Replay(op) => Ok(op),
     }
 }

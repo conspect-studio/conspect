@@ -93,6 +93,14 @@ pub fn audio_route_items(routing: Option<&multiview_config::AudioRouting>) -> Ve
         .collect()
 }
 
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::cast_precision_loss,
+    clippy::as_conversions
+)]
+// Normalized validated cell fractions and bounded canvas pixels; round once to
+// positive decode metadata, never to output timestamps or allocation sizes.
 fn cell_dims(cell: &multiview_core::layout::Cell, width: u32, height: u32) -> (u32, u32) {
     (
         (cell.w * width as f32).round().max(1.0) as u32,

@@ -670,6 +670,33 @@ impl AudioControlHandle {
         applied
     }
 
+    /// Select the source rendered into this exact switcher output frame.
+    /// Called only on the bake consumer, after membership/routing updates.
+    pub(crate) fn select_program_source(
+        &self,
+        bus: &mut multiview_audio::program::ProgramBus,
+        selected: Option<&str>,
+    ) {
+        let channels = self
+            .channels
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let routing = self.routing.load();
+        let selected_gain = selected.map_or(0.0, |id| {
+            crate::pipeline::program_bus_gains(std::iter::once(id), routing.as_deref())
+                .first()
+                .map_or(0.0, |(_, gain)| *gain)
+        });
+        for (id, point) in channels.iter() {
+            let gain = if selected == Some(id.as_str()) {
+                selected_gain
+            } else {
+                0.0
+            };
+            let _ = bus.set_program_gain_ramped(*point, gain, 0);
+        }
+    }
+
     #[cfg(test)]
     fn pending_len(&self) -> usize {
         self.pending.load().len()
@@ -697,6 +724,87 @@ pub fn routing_live_capability(
 mod route_seam_tests {
     use super::*;
     use multiview_audio::program::ProgramBus;
+
+    #[test]
+    fn switcher_two_tones_follow_frame_selection_without_preview_mix() {
+        let format = canonical_format();
+        let a = Arc::new(AudioStore::timeline(format, 16_000));
+        let b = Arc::new(AudioStore::timeline(format, 16_000));
+        let tone = |hz: f32| -> Vec<f32> {
+            (0..12_000)
+                .flat_map(|n| {
+                    let sample = 0.2 * (std::f32::consts::TAU * hz * n as f32 / 48_000.0).sin();
+                    [sample, sample]
+                })
+                .collect()
+        };
+        let pcm_a = tone(400.0);
+        let pcm_b = tone(1000.0);
+        a.publish_window(0, &pcm_a).expect("tone A");
+        b.publish_window(0, &pcm_b).expect("tone B");
+        let mut bus = ProgramBus::new(format, Rational::new(25, 1));
+        let pa = bus.add_source("a", Arc::clone(&a), 1.0);
+        let pb = bus.add_source("b", Arc::clone(&b), 1.0);
+        let handle = AudioControlHandle::from_sources(
+            [("a".into(), a), ("b".into(), b)].into_iter().collect(),
+            [("a".into(), pa), ("b".into(), pb)].into_iter().collect(),
+        );
+        for (tick, selected) in [(0, "a"), (1, "b"), (2, "b"), (3, "a")] {
+            // Repeating B represents a rejected take: selection metadata stays B.
+            handle.select_program_source(&mut bus, Some(selected));
+            let block = bus.tick();
+            let expected = if selected == "a" { &pcm_a } else { &pcm_b };
+            let start = tick * 1920 * 2;
+            for (actual, expected) in block.interleaved().iter().zip(&expected[start..]) {
+                assert!(
+                    (actual - expected).abs() < 1e-5,
+                    "only selected tone is audible"
+                );
+            }
+            assert_eq!(block.frame_count(), 1920);
+        }
+    }
+
+    #[test]
+    fn switcher_selection_preserves_authored_gain_and_live_mute() {
+        let a = new_store();
+        let b = new_store();
+        let mut bus = ProgramBus::new(canonical_format(), Rational::new(25, 1));
+        let pa = bus.add_source("a", Arc::clone(&a), 1.0);
+        let pb = bus.add_source("b", Arc::clone(&b), 1.0);
+        let handle = AudioControlHandle::from_sources(
+            [("a".into(), a), ("b".into(), b)].into_iter().collect(),
+            [("a".into(), pa), ("b".into(), pb)].into_iter().collect(),
+        );
+        let routing: multiview_config::AudioRouting = serde_json::from_value(serde_json::json!({
+            "sample_rate_hz": 48000,
+            "routes": [
+                {"input_id": "a", "channels": {"kind": "stereo"}, "include_in_program_bus": true, "gain_db": -6.0},
+                {"input_id": "b", "channels": {"kind": "stereo"}, "include_in_program_bus": true, "mute": true}
+            ]
+        }))
+        .expect("audio routing fixture");
+        assert!(handle.request_routing(&routing));
+        handle.apply_pending(&mut bus);
+        handle.select_program_source(&mut bus, Some("a"));
+        assert!((bus.program_gain(pa).expect("a gain") - 10f64.powf(-6.0 / 20.0)).abs() < 1e-9);
+        assert_eq!(bus.program_gain(pb), Some(0.0));
+        handle.select_program_source(&mut bus, Some("b"));
+        assert_eq!(bus.program_gain(pa), Some(0.0));
+        assert_eq!(bus.program_gain(pb), Some(0.0), "muted PGM remains muted");
+        let mut updated = routing;
+        updated.routes[1].mute = false;
+        updated.routes[1].gain_db = -12.0;
+        assert!(handle.request_routing(&updated));
+        handle.apply_pending(&mut bus);
+        handle.select_program_source(&mut bus, Some("b"));
+        assert!((bus.program_gain(pb).expect("b gain") - 10f64.powf(-12.0 / 20.0)).abs() < 1e-9);
+        assert_eq!(
+            bus.program_gain(pa),
+            Some(0.0),
+            "PVW stays inaudible after routing update"
+        );
+    }
 
     #[test]
     fn changed_discrete_track_source_does_not_claim_live_apply() {

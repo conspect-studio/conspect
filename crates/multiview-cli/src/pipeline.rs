@@ -1213,6 +1213,7 @@ segment_ms = 1000
 
         let polls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let spawner = LiveIngestSpawner {
+            edit_demand: None,
             source_events: Arc::new(crate::source_event_runtime::Runtime::new().expect("events")),
             layout: std::sync::Arc::new(layout),
             canvas_color: CanvasColor::default(),
@@ -1306,6 +1307,7 @@ segment_ms = 1000
 
         let polls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let spawner = LiveIngestSpawner {
+            edit_demand: None,
             source_events: Arc::new(crate::source_event_runtime::Runtime::new().expect("events")),
             layout: std::sync::Arc::new(layout),
             canvas_color: CanvasColor::default(),
@@ -1591,6 +1593,7 @@ pub struct Pipeline {
     boot_pins: Vec<(String, Vec<crate::source_demand::StandingPin>)>,
     /// The boot audio routes' consumers.
     boot_audio_routes: Vec<multiview_engine::SetItem>,
+    switcher_audio_warm: Option<multiview_engine::ConsumerSet<Nv12Image>>,
     /// The layout and audio-route consumer sets, once the manager exists.
     demand_sets: Option<(
         multiview_engine::ConsumerSet<Nv12Image>,
@@ -2704,6 +2707,7 @@ impl Pipeline {
             boot_rails,
             boot_pins,
             boot_audio_routes,
+            switcher_audio_warm: None,
             demand_sets: None,
             source_events,
             layout,
@@ -2955,6 +2959,11 @@ impl Pipeline {
 
     fn live_spawner(&self) -> LiveIngestSpawner {
         LiveIngestSpawner {
+            edit_demand: self.switcher_me.as_ref().and_then(|_| {
+                self.demand
+                    .clone()
+                    .map(|manager| (Arc::clone(&self.catalogue), manager))
+            }),
             source_events: Arc::clone(&self.source_events),
             layout: Arc::clone(&self.layout),
             canvas_color: self.canvas_color,
@@ -3036,6 +3045,25 @@ impl Pipeline {
         }
         // The pipeline's own boot references are superseded by the leases.
         self.source_handles.clear();
+        if self.encode_cfg.audio.is_some() {
+            if let Some(me) = &self.switcher_me {
+                let warm =
+                    manager.consumer_set(multiview_engine::ConsumerClass::AudioRoute, Rails::ALL);
+                warm.seed(vec![
+                    multiview_engine::SetItem {
+                        id: me.program_source.clone().into(),
+                        label: "switcher-pgm-audio".into(),
+                        size: None,
+                    },
+                    multiview_engine::SetItem {
+                        id: me.preview_source.clone().into(),
+                        label: "switcher-pvw-audio".into(),
+                        size: None,
+                    },
+                ]);
+                self.switcher_audio_warm = Some(warm);
+            }
+        }
         self.demand_sets = Some((layout, audio));
         self.demand = Some(manager.clone());
         manager
@@ -3112,6 +3140,63 @@ impl Pipeline {
     /// canonical program format).
     pub fn enable_program_audio(&mut self) {
         self.encode_cfg.audio = Some(multiview_output::AudioEncodeConfig::aac(48_000, 2, 128_000));
+        if let Some(me) = &self.switcher_me {
+            for id in [&me.program_source, &me.preview_source] {
+                if self.audio_stores.contains_key(id) {
+                    continue;
+                }
+                let entry = self.catalogue.load().get(id).cloned();
+                let Some(entry) = entry else {
+                    continue;
+                };
+                let lifecycle = if self.ingest_plans.iter().any(|plan| plan.id == *id) {
+                    live_lifecycle(id)
+                } else {
+                    let lifecycle = begin_live_lifecycle(id);
+                    match ingest_plan_for(
+                        entry.source(),
+                        self.layout.canvas.width,
+                        self.layout.canvas.height,
+                        Arc::clone(entry.store()),
+                        self.canvas_color,
+                        self.cadence,
+                    ) {
+                        Ok(mut plan) => {
+                            plan.lifecycle = lifecycle;
+                            plan.source_events = self.source_events.activate(id, lifecycle);
+                            self.ingest_plans.push(plan);
+                            self.stores.insert(id.clone(), Arc::clone(entry.store()));
+                            self.boot_rails.insert(id.clone(), Rails::VIDEO);
+                        }
+                        Err(error) => {
+                            tracing::warn!(source = %id, %error, "switcher audio warm video could not be planned");
+                        }
+                    }
+                    lifecycle
+                };
+                if let Some(mut plan) = audio_ingest_plan_for(entry.source()) {
+                    plan.lifecycle = lifecycle;
+                    let store = if plan.live {
+                        crate::audio::new_live_store()
+                    } else {
+                        crate::audio::new_file_store()
+                    };
+                    self.audio_stores.insert(id.clone(), store);
+                    self.audio_ingest_plans.push(plan);
+                    self.boot_rails
+                        .entry(id.clone())
+                        .and_modify(|rails| rails.audio = true)
+                        .or_insert(Rails::AUDIO);
+                } else if matches!(entry.source().kind, SourceKind::Bars) {
+                    self.audio_stores
+                        .insert(id.clone(), crate::audio::new_tone_store());
+                    self.boot_rails
+                        .entry(id.clone())
+                        .and_modify(|rails| rails.audio = true)
+                        .or_insert(Rails::AUDIO);
+                }
+            }
+        }
     }
 
     /// Whether this run carries **program audio** (`enable_program_audio` was
@@ -4121,6 +4206,7 @@ impl Pipeline {
         // and hands it to the bake consumer over the bounded queue per `policy`:
         // blocking send offline (exact-N back-pressure on the renderer), wait-free
         // `try_send` + drop-and-count live (the engine never blocks — inv #1/#10).
+        let switcher_audio_enabled = self.switcher_me.is_some();
         let source_event_reader = self.source_events.reader();
         let state_of = move |frame: &CompositedFrame| -> EngineStateSnapshot {
             // RT-10b: sample the per-layer subtitle router (drains any pending
@@ -4188,6 +4274,10 @@ impl Pipeline {
             #[cfg(not(feature = "overlay"))]
             let _ = events;
             let item = StreamItem {
+                switcher_audio: switcher_audio_enabled
+                    .then(|| frame.source_states.keys().next().cloned())
+                    .flatten(),
+                switcher_audio_enabled,
                 #[cfg(feature = "overlay")]
                 events,
                 canvas: Arc::clone(&canvas),
@@ -4778,6 +4868,8 @@ impl StreamBaker {
 /// loop this tick (captions/faults must be sampled now, before the small live
 /// cue window evicts them). The bake *render* runs on the consumer thread.
 struct StreamItem {
+    switcher_audio: Option<String>,
+    switcher_audio_enabled: bool,
     #[cfg(feature = "overlay")]
     events: std::collections::HashMap<String, multiview_core::event_overlay::EventOverlay>,
     /// The composited canvas the protected output core emitted this tick.
@@ -5372,6 +5464,9 @@ fn consumer_main(
         let early_audio_block = if let Some(bus) = audio_bus.as_mut() {
             if let Some(handle) = audio_route.as_ref() {
                 handle.apply_pending(bus);
+                if item.switcher_audio_enabled {
+                    handle.select_program_source(bus, item.switcher_audio.as_deref());
+                }
             }
             if bus.live_strip_count() != av_strips {
                 av_strips = bus.live_strip_count();
@@ -5426,6 +5521,9 @@ fn consumer_main(
             #[cfg(not(feature = "overlay"))]
             if let Some(handle) = audio_route.as_ref() {
                 handle.apply_pending(bus);
+                if item.switcher_audio_enabled {
+                    handle.select_program_source(bus, item.switcher_audio.as_deref());
+                }
             }
             #[cfg(not(feature = "overlay"))]
             if bus.live_strip_count() != av_strips {
@@ -7210,6 +7308,11 @@ fn spawn_ingest_producer(
 /// spawns the same supervised [`ingest_loop`]. Runs on the hub worker thread
 /// only — heavy/blocking work never touches the output clock (inv #1).
 struct LiveIngestSpawner {
+    /// First-slice switcher edits fail closed until a restart can rebuild leases.
+    edit_demand: Option<(
+        crate::source_rails::Catalogue,
+        multiview_engine::DemandManager<Nv12Image>,
+    )>,
     source_events: Arc<crate::source_event_runtime::Runtime>,
     /// The solved startup layout: tile geometry for a bound cell, the canvas
     /// fallback for an unbound one — the same sizing rule the startup build
@@ -7273,6 +7376,17 @@ impl LiveIngestSpawner {
 }
 
 impl crate::live_sources::IngestSpawner for LiveIngestSpawner {
+    fn invalidate_live_edit(&self, id: &str) -> bool {
+        if self.edit_demand.is_none() {
+            return false;
+        }
+        // Invalidate before reconciliation can resolve a stale configured rail.
+        // Fencing also excludes any detached old producer's late publications.
+        self.source_removed(id);
+        tracing::warn!(source = %id, "switcher source edit requires restart; stale demand catalogue entry invalidated");
+        true
+    }
+
     #[allow(clippy::too_many_lines)]
     // reason: the hub worker configures separate native caption forms and the
     // video producer together; no part of this runs on the output clock.
@@ -7321,7 +7435,19 @@ impl crate::live_sources::IngestSpawner for LiveIngestSpawner {
     }
 
     fn source_removed(&self, id: &str) {
+        let retired_store = self.edit_demand.as_ref().and_then(|(catalogue, manager)| {
+            let store = catalogue
+                .load()
+                .get(id)
+                .map(|entry| Arc::clone(entry.store()));
+            crate::source_rails::catalogue_remove(catalogue, id);
+            manager.remove_source(id);
+            store
+        });
         let lifecycle = remove_live_lifecycle(id);
+        if let Some(store) = retired_store {
+            store.clear();
+        }
         if let Some(lease) = self.source_events.activate(id, lifecycle) {
             lease.retire();
         }
@@ -7395,12 +7521,13 @@ impl LiveIngestSpawner {
         size: Option<RequestedSize>,
     ) -> Option<crate::live_sources::SpawnedProducer> {
         let source = source.clone();
-        let (tile_w, tile_h) = size
-            .map(|size| (size.width, size.height))
-            .unwrap_or_else(|| {
+        let (tile_w, tile_h) = size.map_or_else(
+            || {
                 cell_pixel_size(&self.layout, &source.id)
                     .unwrap_or((self.layout.canvas.width, self.layout.canvas.height))
-            });
+            },
+            |size| (size.width, size.height),
+        );
         let mut plan = match ingest_plan_for(
             &source,
             tile_w,
@@ -17860,6 +17987,8 @@ mod live_overlay_bake_tests {
     fn item(tick_index: u64) -> StreamItem {
         let tag = CanvasColor::default().output_tag();
         StreamItem {
+            switcher_audio: None,
+            switcher_audio_enabled: false,
             #[cfg(feature = "overlay")]
             events: std::collections::HashMap::new(),
             canvas: Arc::new(Nv12Image::solid(320, 180, 16, 128, 128, tag).expect("solid")),
@@ -19246,6 +19375,40 @@ segment_ms = 1000
         }
         crate::live_sources::stop_rail(&spawner.registry, &cold.id, true, false, handles);
         assert!(store.sequence() > 0, "cold source publishes a real picture");
+    }
+
+    #[test]
+    fn switcher_live_edits_and_removal_cannot_resolve_stale_media() {
+        use crate::live_sources::IngestSpawner;
+        use multiview_engine::RailDriver;
+
+        let config = two_cells_one_source_config();
+        let mut pipeline = Pipeline::build(&config).expect("pipeline builds");
+        let manager = pipeline.demand();
+        let legacy = pipeline.live_spawner();
+        assert!(
+            !legacy.invalidate_live_edit("cam1"),
+            "legacy edits stay live"
+        );
+        let mut guarded = pipeline.live_spawner();
+        guarded.edit_demand = Some((pipeline.catalogue(), manager));
+        let rails = crate::source_rails::SourceRails::new(
+            pipeline.catalogue(),
+            pipeline.stop_registry(),
+            Arc::new(DemandSpawner {
+                live: pipeline.live_spawner(),
+                registry: pipeline.stop_registry(),
+            }),
+        );
+        let retained = rails.store("cam1").expect("boot store exists");
+        assert!(guarded.invalidate_live_edit("cam1"));
+        assert!(retained.read_at(MediaTime::from_nanos(0)).frame().is_none());
+        assert_eq!(rails.resolve("cam1", Rails::VIDEO), Rails::NONE);
+        assert!(rails.store("cam1").is_none());
+        crate::source_rails::catalogue_upsert(&pipeline.catalogue(), &config.sources[0]);
+        guarded.source_removed("cam1");
+        assert_eq!(rails.resolve("cam1", Rails::VIDEO), Rails::NONE);
+        assert!(rails.store("cam1").is_none());
     }
 
     #[test]

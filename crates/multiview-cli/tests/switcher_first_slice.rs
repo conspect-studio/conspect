@@ -371,6 +371,16 @@ async fn http_cut_after_cold_preview_lease_changes_received_program_and_monitor(
         .with_switcher_preview(Arc::clone(&attached.preview_slot)),
     );
     let publisher = Arc::new(EnginePublisher::<EngineStateSnapshot, Event>::new(64));
+    let mut terminal_events = publisher.subscribe();
+    let relay = tokio::spawn(
+        multiview_control::switcher_events::forward_switcher_outcomes(
+            attached.control.outcomes(),
+            Arc::clone(&publisher),
+            attached.me_id.clone(),
+            attached.program.clone(),
+            Arc::clone(&attached.leases),
+        ),
+    );
     let (commands, _command_rx) = multiview_control::command_bus(8);
     let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
     let (addr, _server, _state) = multiview_cli::control::bind_and_serve(
@@ -462,11 +472,33 @@ async fn http_cut_after_cold_preview_lease_changes_received_program_and_monitor(
         !String::from_utf8_lossy(&body).contains("applied"),
         "202 is a queue receipt, not a claim of on-air application"
     );
+    let operation_id = serde_json::from_slice::<serde_json::Value>(&body).unwrap()["operation_id"]
+        .as_str()
+        .expect("accepted operation id")
+        .to_owned();
+    assert!(!operation_id.is_empty());
+    let terminal = tokio::time::timeout(Duration::from_secs(15), async {
+        loop {
+            let item = terminal_events
+                .recv()
+                .await
+                .expect("live terminal event stream");
+            if let Event::SwitcherOperation(outcome) = item.event.as_ref() {
+                if outcome.operation_id == operation_id {
+                    break outcome.clone();
+                }
+            }
+        }
+    })
+    .await
+    .expect("actual composited CUT publishes terminal completion");
     assert!(
-        serde_json::from_slice::<serde_json::Value>(&body).unwrap()["operation_id"]
-            .as_str()
-            .is_some_and(|id| !id.is_empty())
+        terminal.completed,
+        "queued is not applied: {:?}",
+        terminal.error
     );
+    assert_eq!(terminal.me, "me1");
+    assert_eq!(terminal.program, "main");
 
     // 4. The engine-owned state reflects the take at its own tick.
     let deadline = std::time::Instant::now() + Duration::from_secs(15);
@@ -515,6 +547,7 @@ async fn http_cut_after_cold_preview_lease_changes_received_program_and_monitor(
         "the output clock must not falter while the API is driven"
     );
     drop(shutdown_tx);
+    relay.abort();
 }
 
 /// Six cells (the live multi-tile shape) mapped three-to-two across the three
