@@ -803,7 +803,7 @@ fn durable_unfinished_jobs_are_not_silently_successful_at_boot() {
     assert!(service.latest_good("o", "f").is_some());
     assert_eq!(
         service.status("o", JobId::from_raw(hw)).unwrap().state,
-        State::Cancelled
+        State::Uncertain
     );
     assert!(matches!(
         service.status("o", JobId::from_raw(hw + 1)).unwrap().state,

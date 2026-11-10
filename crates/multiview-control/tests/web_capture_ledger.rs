@@ -13,6 +13,8 @@ fn durable_pending_receipt_survives_restart_and_refuses_duplicate() {
         );
     }
     let recovered = Ledger::durable(&file).unwrap();
+    assert!(recovered.outcome_uncertain("actor", "submit", "key"));
+    assert!(!recovered.outcome_uncertain("other-actor", "submit", "key"));
     assert_eq!(
         recovered.reserve("actor", "submit", "key", "body"),
         Err(false)
