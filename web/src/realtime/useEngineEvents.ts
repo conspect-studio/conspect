@@ -235,6 +235,19 @@ function applyDeviceStatus(client: QueryClient, envelope: Envelope): void {
   );
 }
 
+/**
+ * Retire every latest-wins player state. Called on `$resync`, a sequence gap
+ * and a dropped/reconnecting socket: after any of those the cached transport
+ * state can no longer be confirmed, so the UI reads "no live state" (and the
+ * vamp-exit keys disarm) until a fresh `media.player_state` arrives.
+ */
+export function clearMediaPlayerState(client: QueryClient): void {
+  client.setQueryData<Record<string, MediaPlayerEvent>>(
+    MEDIA_PLAYER_STATE_QUERY_KEY,
+    {},
+  );
+}
+
 function applyMediaPlayerState(client: QueryClient, envelope: Envelope): void {
   const event = parseMediaPlayerEvent(envelope.data);
   if (event === undefined) {
@@ -360,6 +373,7 @@ export function useEngineEvents(): EngineEvents {
           if (envelope.t === "$resync") {
             queryClient.removeQueries({ queryKey: TILES_QUERY_KEY });
             clearDeviceCaches(queryClient);
+            clearMediaPlayerState(queryClient);
           }
           // $snapshot frames carry their topic in `topic`, not `$control`, per
           // §5; nothing else on $control mutates cached domain state here.
@@ -407,9 +421,13 @@ export function useEngineEvents(): EngineEvents {
         }
       }, (next): void => {
         setStatus(next);
-        if (next === 'reconnecting' || next === 'closed') tracker.onGap();
+        if (next === 'reconnecting' || next === 'closed') {
+          tracker.onGap();
+          clearMediaPlayerState(queryClient);
+        }
       }, (): void => {
         tracker.onGap();
+        clearMediaPlayerState(queryClient);
         // Missed frames: refetch everything the stream feeds (resume failed).
         setGaps((count) => count + 1);
         void queryClient.invalidateQueries();

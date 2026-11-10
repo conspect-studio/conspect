@@ -63,6 +63,7 @@ import {
   SourcePicker,
 } from "./approved/RoutingSurface";
 import type { RouteDest } from "./approved/RoutingSurface";
+import { useProgramTally } from "./approved/useProgramTally";
 
 /** A stream selector strategy (mirrors `StreamSelectorDoc.by`). */
 type SelectorBy = "best" | "index" | "language" | "stream_id";
@@ -213,7 +214,11 @@ export function RoutingPage(): JSX.Element {
     retry: false,
     refetchInterval: 2000,
   });
-  const programSource = switcher.data?.program_source;
+  // Confirmed only while the switcher keeps refreshing AND its engine tick
+  // keeps advancing (shared hook); otherwise PGM is Unknown, never last-seen.
+  const tally = useProgramTally();
+  const programSource = tally?.program;
+  const programUnknown = tally === undefined;
   const sources = useSources();
   const pickerStatus = sources.isPending
     ? "pending"
@@ -282,8 +287,10 @@ export function RoutingPage(): JSX.Element {
   // A take is program-affecting when it routes the switcher's CURRENT program
   // source, or targets the audio program bus. While takes are locked that
   // needs an explicit confirmation; other targets have no program readback.
-  const affectsProgram =
-    form.inputId.trim() !== "" && form.inputId.trim() === programSource
+  // Fail safe: while PGM is unconfirmed any take is treated as program-affecting.
+  const affectsProgram = programUnknown
+    ? true
+    : form.inputId.trim() !== "" && form.inputId.trim() === programSource
       ? true
       : form.kind === "audio" && !form.discrete;
 
@@ -335,7 +342,7 @@ export function RoutingPage(): JSX.Element {
           programSource,
           programName: (sources.data ?? []).find((x) => x.id === programSource)
             ?.name,
-          loading: switcher.isPending,
+          loading: switcher.isPending && programUnknown,
         }} />
       <RouteGrid
         patch={
@@ -372,6 +379,7 @@ export function RoutingPage(): JSX.Element {
               sources={sources.data ?? []}
               selected={form.inputId}
               programSource={programSource}
+              programUnknown={programUnknown}
               status={pickerStatus}
               onPick={(id): void => {
                 setPlan(null);
@@ -414,6 +422,7 @@ export function RoutingPage(): JSX.Element {
                       kind: asRouteKind(value),
                       target: "",
                       pinnedChannels: "",
+                      discrete: false,
                     });
                   }}
                 >
@@ -517,7 +526,8 @@ export function RoutingPage(): JSX.Element {
                   }
                   onChange={(e): void => {
                     setPlan(null);
-                    setForm({ ...form, target: e.target.value });
+                    // A typed target is never a picked discrete track.
+                    setForm({ ...form, target: e.target.value, discrete: false });
                   }}
                 />
               </div>
@@ -592,13 +602,14 @@ export function RoutingPage(): JSX.Element {
                 <Button
                   type="button"
                   variant="outline"
+                  className="min-h-12"
                   disabled={!valid || planRoute.isPending}
                   onClick={onPlan}
                 >
                   <RouteIcon aria-hidden="true" />
                   <Trans>Plan (dry run)</Trans>
                 </Button>
-                <Button type="submit" disabled={!valid || takeRoute.isPending}>
+                <Button type="submit" className="min-h-12" disabled={!valid || takeRoute.isPending}>
                   <Play aria-hidden="true" />
                   <Trans>Take</Trans>
                 </Button>

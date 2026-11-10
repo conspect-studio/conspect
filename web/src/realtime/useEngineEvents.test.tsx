@@ -7,7 +7,7 @@ import { act, renderHook } from '@testing-library/react';
 import type { ReactNode } from 'react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
-import { TILES_QUERY_KEY, useEngineEvents } from './useEngineEvents';
+import { MEDIA_PLAYER_STATE_QUERY_KEY, TILES_QUERY_KEY, useEngineEvents } from './useEngineEvents';
 import type { LiveTile } from './useEngineEvents';
 
 /** A controllable WebSocket double the hook connects to. */
@@ -171,6 +171,50 @@ describe('useEngineEvents connect-time tiles snapshot', () => {
     );
     expect(tiles?.cam1?.state).toBe('STALE');
     expect(tiles?.cam2).toBeUndefined();
+    unmount();
+  });
+
+  it('clears stale media.player_state on $resync and on a dropped socket', async () => {
+    const { unmount } = renderHook(() => useEngineEvents(), { wrapper });
+    const socket = await firstSocket();
+    const playerFrame = (seq: number): string =>
+      JSON.stringify({
+        v: 1,
+        topic: 'switcher',
+        seq,
+        ts: 9,
+        t: 'media.player_state',
+        id: 'vt-1',
+        data: {
+          player: 'vt-1',
+          state: { kind: 'vamping', exit_armed: true },
+          position_frames: 10,
+        },
+      });
+    act(() => {
+      socket.onopen?.();
+      socket.emit(HELLO_FRAME);
+      socket.emit(playerFrame(2));
+    });
+    expect(
+      Object.keys(client.getQueryData(MEDIA_PLAYER_STATE_QUERY_KEY) ?? {}),
+    ).toEqual(['vt-1']);
+    act(() => {
+      socket.emit(
+        JSON.stringify({ v: 1, topic: '$control', seq: 0, ts: 10, t: '$resync', data: {} }),
+      );
+    });
+    expect(client.getQueryData(MEDIA_PLAYER_STATE_QUERY_KEY)).toEqual({});
+    act(() => {
+      socket.emit(playerFrame(3));
+    });
+    expect(
+      Object.keys(client.getQueryData(MEDIA_PLAYER_STATE_QUERY_KEY) ?? {}),
+    ).toEqual(['vt-1']);
+    act(() => {
+      socket.onclose?.();
+    });
+    expect(client.getQueryData(MEDIA_PLAYER_STATE_QUERY_KEY)).toEqual({});
     unmount();
   });
 });

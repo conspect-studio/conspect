@@ -22,7 +22,8 @@
 [data-approved-page="routing"] .plan-panel{margin-top:12px;padding:14px;border-radius:var(--r-md);background:var(--bg-2);border:1px solid var(--amber-dim);display:grid;gap:12px}
 [data-approved-page="routing"] .plan-panel h3{margin:0;font-size:13px}
 [data-approved-page="routing"] .plan-actions{display:flex;gap:8px;flex-wrap:wrap}
-[data-approved-page="routing"] .plan-actions button,[data-approved-page="routing"] .rp-row,[data-approved-page="routing"] input,[data-approved-page="routing"] [role="combobox"]{min-height:var(--tap)}
+[data-approved-page="routing"] .route-form button{min-height:var(--tap)}
+[data-approved-page="routing"] .plan-actions button,[data-approved-page="routing"] .rp-row,[data-approved-page="routing"] input:not([type="checkbox"]),[data-approved-page="routing"] [role="combobox"]{min-height:var(--tap)}
 [data-approved-page="routing"] .route-form{max-width:none}
 [data-approved-page="routing"] :focus-visible{outline:2px solid var(--blue);outline-offset:3px}
 @media (min-width:768px){[data-approved-page="routing"] .route-dests{display:none}[data-approved-page="routing"] .patch-block:has(.patch-table) .source-step{display:none}}

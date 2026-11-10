@@ -88,4 +88,47 @@ describe('RoutingPage', () => {
     expect(screen.getByRole('button', { name: /Plan/i })).toBeDisabled();
     expect(screen.getByRole('button', { name: 'Take' })).toBeDisabled();
   });
+
+  it('reads PGM as Unknown and confirms a locked take when the switcher is unreadable', async () => {
+    server.use(
+      http.get('*/api/v1/switcher/me1', () => HttpResponse.json({ error: 'down' }, { status: 500 })),
+    );
+    const user = userEvent.setup();
+    renderWithProviders(<MemoryRouter><RoutingPage /></MemoryRouter>);
+    await waitFor(() => {
+      expect(screen.getByTestId('pgm-readout')).toHaveTextContent('Unknown');
+    });
+    await user.type(screen.getByLabelText('Source input id'), 'cam-north');
+    await user.type(screen.getByLabelText('Target video cell'), 'cell-a');
+    await user.click(screen.getByRole('button', { name: 'Take' }));
+    expect(await screen.findByText('Confirm a program-affecting take?')).toBeInTheDocument();
+    expect(lastTakePath).toBe('');
+  });
+
+  it('never keeps a picked discrete track once the target is typed: the route is a program-bus channel', async () => {
+    server.use(
+      http.get('*/api/v1/audio-routing', () =>
+        HttpResponse.json(
+          { configured: true, routing: null, selectable_tracks: ['prog', 'trk-1'] },
+          { headers: { ETag: 'W/"1"' } },
+        ),
+      ),
+    );
+    const user = userEvent.setup();
+    renderWithProviders(<MemoryRouter><RoutingPage /></MemoryRouter>);
+    await user.click(await screen.findByTestId('route-dest-trk-1'));
+    await user.type(screen.getByLabelText('Source input id'), 'cam-north');
+    const target = screen.getByLabelText(/Target/);
+    await user.clear(target);
+    await user.type(target, 'main-L');
+    await user.click(screen.getByRole('button', { name: /Plan/i }));
+    await screen.findByText('class2');
+    expect(lastPlanBody).toMatchObject({ target: { kind: 'audio_program_bus', channel: 'main-L' } });
+  });
+
+  it('sizes Plan and Take to the 48px floor', () => {
+    renderWithProviders(<MemoryRouter><RoutingPage /></MemoryRouter>);
+    expect(screen.getByRole('button', { name: /Plan/i })).toHaveClass('min-h-12');
+    expect(screen.getByRole('button', { name: 'Take' })).toHaveClass('min-h-12');
+  });
 });

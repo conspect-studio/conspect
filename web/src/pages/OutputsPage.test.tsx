@@ -242,6 +242,23 @@ describe('OutputsPage broadcast cards (configured facts)', () => {
     expect(screen.queryByText('Healthy')).not.toBeInTheDocument();
   });
 
+  it('annotates the last link snapshot as stale once the poll starts failing', async () => {
+    let calls = 0;
+    server.use(
+      http.get('*/api/v1/outputs/:id/link', () => {
+        calls += 1;
+        return calls === 1
+          ? HttpResponse.json(SRT_LINK)
+          : HttpResponse.json({ error: 'down' }, { status: 500 });
+      }),
+    );
+    renderOutputs();
+    const srt = await screen.findByTestId('output-card-srt-main');
+    await within(srt).findByText('connection lost');
+    expect(within(srt).queryByTestId('output-link-stale')).toBeNull();
+    expect(await within(srt).findByTestId('output-link-stale', {}, { timeout: 5000 })).toBeInTheDocument();
+  }, 10000);
+
   it('refuses to edit an unknown-kind card, keeping the document as authored', async () => {
     renderOutputs();
     await screen.findByTestId('output-card-legacy-thing');
