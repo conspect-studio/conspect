@@ -1012,14 +1012,7 @@ impl Service {
             });
         }
         self.inner.wake.notify_all();
-        receive
-            .recv_timeout(Duration::from_secs(5))
-            .map_err(|error| match error {
-                mpsc::RecvTimeoutError::Timeout => {
-                    io::Error::new(io::ErrorKind::TimedOut, "artifact pin deadline")
-                }
-                mpsc::RecvTimeoutError::Disconnected => io::Error::other("capture service stopped"),
-            })?
+        receive_pin(receive, Duration::from_secs(5))
     }
 
     /// Cancel the active and queued jobs, stop the worker and join it. Idempotent.
@@ -1567,4 +1560,38 @@ fn verify_good(store: &ArtifactStore, g: &GoodRec, doc: &Doc) -> io::Result<()> 
         return Err(bad_journal());
     }
     Ok(())
+}
+
+// Own the receiver: timeout closes it, so a late worker reply drops its lease.
+fn receive_pin<T>(receive: mpsc::Receiver<io::Result<T>>, timeout: Duration) -> io::Result<T> {
+    receive.recv_timeout(timeout).map_err(|error| match error {
+        mpsc::RecvTimeoutError::Timeout => {
+            io::Error::new(io::ErrorKind::TimedOut, "artifact pin deadline")
+        }
+        mpsc::RecvTimeoutError::Disconnected => io::Error::other("capture service stopped"),
+    })?
+}
+#[cfg(test)]
+mod pin_deadline_tests {
+    #[test]
+    fn timeout_closes_receiver_and_late_reply_drops_its_owned_lease() {
+        use std::sync::{
+            atomic::{AtomicBool, Ordering},
+            Arc,
+        };
+        struct FakeLease(Arc<AtomicBool>);
+        impl Drop for FakeLease {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+        let dropped = Arc::new(AtomicBool::new(false));
+        let (tx, rx) = std::sync::mpsc::channel::<std::io::Result<FakeLease>>();
+        let result = super::receive_pin(rx, std::time::Duration::ZERO);
+        assert!(matches!(result,Err(ref error) if error.kind()==std::io::ErrorKind::TimedOut));
+        let reply = tx.send(Ok(FakeLease(dropped.clone())));
+        assert!(reply.is_err());
+        drop(reply);
+        assert!(dropped.load(Ordering::SeqCst));
+    }
 }
