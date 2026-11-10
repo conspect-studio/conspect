@@ -1061,7 +1061,7 @@ export interface paths {
             path?: never;
             cookie?: never;
         };
-        get: operations["capabilities"];
+        get: operations["capture_capabilities"];
         put?: never;
         post?: never;
         delete?: never;
@@ -8952,7 +8952,7 @@ export interface operations {
             };
         };
     };
-    capabilities: {
+    capture_capabilities: {
         parameters: {
             query?: never;
             header?: never;

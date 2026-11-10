@@ -3420,7 +3420,7 @@
         "tags": [
           "media-captures"
         ],
-        "operationId": "capabilities",
+        "operationId": "capture_capabilities",
         "responses": {
           "200": {
             "description": "Honest capture capabilities."
