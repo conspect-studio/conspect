@@ -87,14 +87,19 @@ for (const [width, height] of [
         if (name && name.scrollWidth > name.clientWidth) clipped.push(i);
       });
       const bank = els[0]?.parentElement;
+      const tops = new Set(els.map((e) => Math.round(e.getBoundingClientRect().top)));
       return {
         overlaps,
         clipped,
+        rowCount: tops.size,
         bankFits: bank ? bank.scrollWidth <= bank.clientWidth : true,
         pageFits: document.documentElement.scrollWidth <= window.innerWidth,
       };
     });
 
+    // 8 strips at tablet width must wrap into more than one row; a single row
+    // would mean they are crushed (the original 118px-wide defect) or scrolled.
+    if (width === 1024) expect(result.rowCount, "strips did not wrap into rows").toBeGreaterThan(1);
     expect(result.overlaps, "nudge column intersects the fader scale").toEqual([]);
     expect(result.clipped, "strip name is clipped").toEqual([]);
     expect(result.bankFits, "strip bank scrolls horizontally").toBe(true);
