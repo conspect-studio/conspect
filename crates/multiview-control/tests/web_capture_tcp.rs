@@ -124,7 +124,8 @@ sys.exit(subprocess.run([{}]+sys.argv[1:],input=json.dumps(request).encode()).re
                     "/bin/sh".into()
                 },
                 ffmpeg: if real_browser {
-                    "/usr/bin/ffmpeg".into()
+                    std::env::var_os("CONSPECT_WEB_FFMPEG")
+                        .map_or_else(|| find_tool("ffmpeg"), std::path::PathBuf::from)
                 } else {
                     "/bin/sh".into()
                 },
@@ -291,7 +292,7 @@ sys.exit(subprocess.run([{}]+sys.argv[1:],input=json.dumps(request).encode()).re
         lease.read_to_end(&mut bytes).unwrap();
         let mov = root.path().join("proof.mov");
         std::fs::write(&mov, bytes).unwrap();
-        let result = std::process::Command::new("/usr/bin/ffprobe").args(["-v","error","-count_frames","-show_entries","stream=codec_name,width,height,nb_read_frames,color_range,color_space,color_transfer,color_primaries","-of","json"]).arg(&mov).output().unwrap();
+        let result = std::process::Command::new(find_tool("ffprobe")).args(["-v","error","-count_frames","-show_entries","stream=codec_name,width,height,nb_read_frames,color_range,color_space,color_transfer,color_primaries","-of","json"]).arg(&mov).output().unwrap();
         assert!(result.status.success());
         let value: serde_json::Value = serde_json::from_slice(&result.stdout).unwrap();
         let video = &value["streams"][0];

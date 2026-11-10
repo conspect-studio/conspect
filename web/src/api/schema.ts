@@ -8896,15 +8896,6 @@ export interface operations {
                 };
                 content?: never;
             };
-            /** @description Invalid body, terms or missing key. */
-            400: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["Problem"];
-                };
-            };
             /** @description Missing or invalid credentials. */
             401: {
                 headers: {
@@ -8934,6 +8925,15 @@ export interface operations {
             };
             /** @description Key reused with a different body. */
             409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Invalid body, terms or missing key. */
+            422: {
                 headers: {
                     [name: string]: unknown;
                 };

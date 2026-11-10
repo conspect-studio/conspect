@@ -169,6 +169,31 @@ jobs:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@1.99.1
       - uses: Swatinem/rust-cache@v2
+      # Capture tests invoke external tools, never link FFmpeg into the default build.
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '22'
+      - name: provision required capture tools (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg
+          npx --yes --package=playwright@1.58.2 playwright install --with-deps chromium
+          echo "CONSPECT_WEB_NODE=$(command -v node)" >> "$GITHUB_ENV"
+          echo "CONSPECT_WEB_FFMPEG=$(command -v ffmpeg)" >> "$GITHUB_ENV"
+      - name: provision required capture tools (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          brew install ffmpeg
+          npx --yes --package=playwright@1.58.2 playwright install chromium
+          echo "CONSPECT_WEB_NODE=$(command -v node)" >> "$GITHUB_ENV"
+          echo "CONSPECT_WEB_FFMPEG=$(command -v ffmpeg)" >> "$GITHUB_ENV"
+      - name: resolve required capture browser
+        shell: bash
+        run: |
+          browser=$(find "$HOME/.cache/ms-playwright" "$HOME/Library/Caches/ms-playwright" -type f \( -name chrome-headless-shell -o -name Chromium \) 2>/dev/null | head -n 1 || true)
+          test -n "$browser"
+          echo "CONSPECT_WEB_BROWSER=$browser" >> "$GITHUB_ENV"
       # Default features are pure-Rust (no FFmpeg/GPU), so CI needs no native libs.
       # --locked enforces the committed Cargo.lock — cargo ignores the lockfile
       # without it — so check + test are deterministic.

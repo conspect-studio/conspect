@@ -3352,16 +3352,6 @@
           "202": {
             "description": "Capture job accepted."
           },
-          "400": {
-            "description": "Invalid body, terms or missing key.",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/Problem"
-                }
-              }
-            }
-          },
           "401": {
             "description": "Missing or invalid credentials.",
             "content": {
@@ -3394,6 +3384,16 @@
           },
           "409": {
             "description": "Key reused with a different body.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Invalid body, terms or missing key.",
             "content": {
               "application/json": {
                 "schema": {
