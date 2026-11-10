@@ -16,7 +16,7 @@ export function AppLayout(): JSX.Element {
   useEffect(() => { mainRef.current?.focus(); }, [location.pathname]);
   const managementLabel = status === 'open' ? t`Connected` : status === 'connecting' ? t`Connecting` : status === 'reconnecting' ? t`Reconnecting` : t`Disconnected`;
   return <BroadcastShell managementLabel={managementLabel}>
-    <a href="#main-content" className="sr-only focus:not-sr-only"><Trans>Skip to content</Trans></a>
+    <a href="#main-content" className="sr-only focus:not-sr-only bd-skip"><Trans>Skip to content</Trans></a>
     <HealthBanner /><LadderBanner /><PendingActionStrip /><ConfigLockBanner />
     <main id="main-content" ref={mainRef} tabIndex={-1}><Outlet /></main>
   </BroadcastShell>;

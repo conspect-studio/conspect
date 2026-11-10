@@ -1,11 +1,13 @@
 // Program/preview bus ids for the Sources tally column, from the SAME switcher
 // state the Desk reads (`program_source` is a source id there too). Confirmed
-// only while the state keeps refreshing and the engine tick keeps advancing;
-// otherwise undefined so the page reads Unknown and never guesses.
+// only after the engine tick has been OBSERVED ADVANCING between polls and the
+// state is still refreshing; a frozen tick, a cached remount or a merely
+// successful poll never confirms, so the page reads Unknown and never guesses.
 import { useEffect, useState } from 'react';
-import { useQuery } from '@tanstack/react-query';
+import { useQuery, useQueryClient } from '@tanstack/react-query';
 
 import { getSwitcher } from '../../api/switcher';
+import { tickConfirmed, useTickAdvancedAt } from '../../components/broadcast/tickObservation';
 
 /** Confirmed bus ids. */
 export interface ProgramTally {
@@ -13,30 +15,24 @@ export interface ProgramTally {
   readonly preview: string;
 }
 
-const FRESH_MS = 6000;
+const STATE_KEY = ['switcher', 'me1'] as const;
 
 /** The confirmed program/preview source ids, or undefined when not confirmed. */
 export function useProgramTally(): ProgramTally | undefined {
+  const client = useQueryClient();
   const state = useQuery({
-    queryKey: ['switcher', 'me1'],
+    queryKey: STATE_KEY,
     queryFn: () => getSwitcher(),
     retry: false,
     refetchInterval: 2000,
   });
   const [now, setNow] = useState(Date.now);
-  const [lastTickAt, setLastTickAt] = useState(0);
-  useEffect(() => {
-    const timer = setTimeout(() => {
-      if (state.data?.tick !== undefined) setLastTickAt(Date.now());
-    }, 0);
-    return (): void => { clearTimeout(timer); };
-  }, [state.data?.tick]);
+  const advancedAt = useTickAdvancedAt(client, STATE_KEY.join('/'), state.data?.tick, state.dataUpdatedAt);
   useEffect(() => {
     const timer = setInterval(() => { setNow(Date.now()); }, 1000);
     return (): void => { clearInterval(timer); };
   }, []);
   const data = state.data;
-  if (data === undefined || state.isError || state.dataUpdatedAt <= 0 || lastTickAt <= 0) return undefined;
-  if (now - state.dataUpdatedAt >= FRESH_MS || now - lastTickAt >= FRESH_MS) return undefined;
+  if (data === undefined || !tickConfirmed(advancedAt, state.dataUpdatedAt, now, state.isError)) return undefined;
   return { program: data.program_source, preview: data.preview_source };
 }

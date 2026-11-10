@@ -23,7 +23,7 @@ export function BroadcastShell({ children, managementLabel }: { readonly childre
   const [locked, setLocked] = useState(true);
   const [unlock, setUnlock] = useState(false);
   // Real count only: unknown (loading/error) renders no badge at all.
-  const alarms = useAlarms({ active: true });
+  const alarms = useAlarms({ active: true, scope: 'system' });
   const alarmCount = alarms.isSuccess ? alarms.data.length : undefined;
   const { pathname } = useLocation();
   const tabs: readonly (readonly [string, string])[] = [
@@ -37,10 +37,12 @@ export function BroadcastShell({ children, managementLabel }: { readonly childre
       <nav className="bd-tabs" aria-label={t`Core screens`}>{tabs.map(([path, label], index) => <NavLink key={path} to={path} end={path === '/'}><span>{index + 1}</span>{label}</NavLink>)}</nav>
       <div className="bd-top-actions">
         <div className="bd-health"><ProducerStatus state="unknown" lastTickAt={null} managementLabel={managementLabel} /></div>
-        <Dialog open={unlock} onOpenChange={setUnlock}><DialogTrigger asChild><button className="bd-lock" aria-pressed={locked} onClick={(event) => { if (!locked) { event.preventDefault(); setLocked(true); } }}>{locked ? <Lock size={14} aria-hidden="true" /> : <LockOpen size={14} aria-hidden="true" />}<span>{locked ? t`Takes locked` : t`Takes unlocked`}</span></button></DialogTrigger>
-          <DialogContent><DialogTitle><Trans>Unlock time-critical takes?</Trans></DialogTitle><p><Trans>CUT will execute without another confirmation. AUTO remains unavailable. Direct program selection remains guarded.</Trans></p><button onClick={() => { setLocked(false); setUnlock(false); }}><Trans>Unlock takes</Trans></button><button onClick={() => { setUnlock(false); }}><Trans>Cancel</Trans></button></DialogContent></Dialog>
-        <NavLink className="bd-icon" to="/alarms" aria-label={alarmCount ? t`Alarms and engine health — ${alarmCount} active` : t`Alarms and engine health`}><Bell size={20} aria-hidden="true" />{alarmCount ? <span className="bd-badge" data-testid="alarm-count" aria-hidden="true">{alarmCount}</span> : null}</NavLink>
-        <Dialog open={open} onOpenChange={setOpen}><DialogTrigger asChild><button className="bd-icon" aria-label={t`Open navigation`}><Menu size={20} aria-hidden="true" /></button></DialogTrigger><DialogContent className="bd-drawer"><DialogTitle><Trans>All screens</Trans></DialogTitle><p className="bd-drawer-mgmt"><Trans>Management</Trans> · {managementLabel}</p><div className="flex flex-wrap gap-2"><LicenceChip /><LocaleSwitcher /><ThemeToggle /></div><Sidebar onNavigate={() => { setOpen(false); }} /></DialogContent></Dialog>
+        {locked
+          ? <Dialog open={unlock} onOpenChange={setUnlock}><DialogTrigger asChild><button className="bd-lock" aria-pressed="true"><Lock size={14} aria-hidden="true" /><span>{t`Takes locked`}</span></button></DialogTrigger>
+            <DialogContent touchScroll><DialogTitle><Trans>Unlock time-critical takes?</Trans></DialogTitle><p><Trans>CUT will execute without another confirmation. AUTO remains unavailable. Direct program selection remains guarded.</Trans></p><button onClick={() => { setLocked(false); setUnlock(false); }}><Trans>Unlock takes</Trans></button><button onClick={() => { setUnlock(false); }}><Trans>Cancel</Trans></button></DialogContent></Dialog>
+          : <button className="bd-lock" aria-pressed="false" onClick={() => { setLocked(true); }}><LockOpen size={14} aria-hidden="true" /><span>{t`Takes unlocked`}</span></button>}
+        <NavLink className="bd-icon" to="/alarms" aria-label={alarmCount ? t`Alarms — ${alarmCount} active system` : t`Alarms`}><Bell size={20} aria-hidden="true" />{alarmCount ? <span className="bd-badge" data-testid="alarm-count" aria-hidden="true">{alarmCount}</span> : null}</NavLink>
+        <Dialog open={open} onOpenChange={setOpen}><DialogTrigger asChild><button className="bd-icon" aria-label={t`Open navigation`}><Menu size={20} aria-hidden="true" /></button></DialogTrigger><DialogContent touchScroll className="bd-drawer"><DialogTitle><Trans>All screens</Trans></DialogTitle><p className="bd-drawer-mgmt"><Trans>Management</Trans> · {managementLabel}</p><div className="flex flex-wrap gap-2"><LicenceChip /><LocaleSwitcher /><ThemeToggle /></div><Sidebar onNavigate={() => { setOpen(false); }} /></DialogContent></Dialog>
       </div>
     </header>
     {children}

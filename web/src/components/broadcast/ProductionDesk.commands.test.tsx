@@ -22,8 +22,10 @@ i18n.activate('en');
 
 const state = { program_source: 'cam-1', preview_source: 'cam-2', tick: 7, in_flight: false };
 let commandCount = 0;
+let polls = 0;
+let frozenTick = false;
 const server = setupServer(
-  http.get('*/api/v1/switcher/me1', () => HttpResponse.json(state)),
+  http.get('*/api/v1/switcher/me1', () => { polls += 1; return HttpResponse.json({ ...state, tick: frozenTick ? state.tick : state.tick + polls }); }),
   http.get('*/api/v1/layouts', () => HttpResponse.json([])),
   http.get('*/api/v1/alarms', () => HttpResponse.json([])),
   http.get('*/api/v1/preview/capabilities', () => HttpResponse.json({ webrtc: false })),
@@ -35,7 +37,7 @@ const server = setupServer(
   }),
 );
 beforeAll(() => { server.listen(); });
-afterEach(() => { server.resetHandlers(); commandCount = 0; vi.useRealTimers(); });
+afterEach(() => { server.resetHandlers(); commandCount = 0; polls = 0; frozenTick = false; vi.useRealTimers(); });
 afterAll(() => { server.close(); });
 
 function page() {
@@ -51,10 +53,11 @@ function outcome(id: string, completed: boolean, error?: string) {
 }
 
 // Tracker events are supplied as the shell-owned socket supplies them; no second socket.
-describe('ProductionDesk single-authority completion', () => {
+// Confirmation needs two polls with an advancing tick (2 s refetch), hence the longer waits.
+describe('ProductionDesk single-authority completion', { timeout: 15000 }, () => {
   it('keeps unsupported transitions disabled before the dominant CUT in DOM order', async () => {
     const { container } = page();
-    await waitFor(() => { expect(screen.getByRole('button', { name: 'CUT' })).not.toBeDisabled(); });
+    await waitFor(() => { expect(screen.getByRole('button', { name: 'CUT' })).not.toBeDisabled(); }, { timeout: 6000 });
     const keys = [...container.querySelectorAll('.bd-takes button')];
     expect(keys.map((key) => key.textContent)).toEqual(['MIX', 'WIPE', 'DIP', 'AUTO', 'CUT · cam-2']);
     for (const key of keys.slice(0, 4)) expect(key).toBeDisabled();
@@ -66,7 +69,7 @@ describe('ProductionDesk single-authority completion', () => {
 
   it('pairs CUT with its real source and an alarm button; AUTO frames sit in a disclosure', async () => {
     const { container } = page();
-    await waitFor(() => { expect(screen.getByRole('button', { name: 'CUT' })).not.toBeDisabled(); });
+    await waitFor(() => { expect(screen.getByRole('button', { name: 'CUT' })).not.toBeDisabled(); }, { timeout: 6000 });
     expect(screen.getByRole('button', { name: 'CUT' })).toHaveTextContent('CUT · cam-2');
     expect(container.querySelector('.bd-cutrow .bd-alarm-btn')).toHaveAttribute('href', '/alarms');
     expect(container.querySelector('.bd-more')).toContainElement(screen.getByRole('spinbutton', { name: 'Auto frames' }));
@@ -78,9 +81,45 @@ describe('ProductionDesk single-authority completion', () => {
     page();
     expect(screen.getByText('○ PROGRAM — unconfirmed')).toBeInTheDocument();
     expect(screen.queryByText('● ON AIR — PROGRAM')).toBeNull();
-    await screen.findByText('● ON AIR — PROGRAM');
+    await screen.findByText('● ON AIR — PROGRAM', undefined, { timeout: 6000 });
     expect(screen.getByText('● PGM')).toBeInTheDocument();
     expect(screen.getByText('▲ PVW')).toBeInTheDocument();
+  });
+
+  it('does not confirm ON AIR from a same-tick poll, and CUT stays disabled', async () => {
+    frozenTick = true;
+    server.use(http.get('*/api/v1/sources', () => HttpResponse.json([{ id: 'cam-1', name: 'CAM 1', body: { kind: 'srt', url: 'srt://[::1]:1' } }])));
+    page();
+    await waitFor(() => { expect(polls).toBeGreaterThanOrEqual(1); });
+    await new Promise((r) => setTimeout(r, 2600));
+    expect(polls).toBeGreaterThanOrEqual(2);
+    expect(screen.getByText('○ PROGRAM — unconfirmed')).toBeInTheDocument();
+    expect(screen.queryByText('● ON AIR — PROGRAM')).toBeNull();
+    expect(screen.getByRole('button', { name: /CUT/ })).toBeDisabled();
+  }, 10000);
+
+  it('a cached remount alone does not confirm; advancement after remount does', async () => {
+    frozenTick = true;
+    const { client, unmount } = page();
+    await waitFor(() => { expect(client.getQueryData(['switcher', 'me1'])).toBeTruthy(); });
+    unmount();
+    render(<QueryClientProvider client={client}><I18nProvider i18n={i18n}><MemoryRouter><ProductionDesk /></MemoryRouter></I18nProvider></QueryClientProvider>);
+    expect(screen.getByText('○ PROGRAM — unconfirmed')).toBeInTheDocument();
+    frozenTick = false;
+    await screen.findByText('● ON AIR — PROGRAM', undefined, { timeout: 6000 });
+  }, 10000);
+
+  it('blocks a double-activation of Confirm take for the life of the command', async () => {
+    page();
+    await waitFor(() => { expect(screen.getByRole('button', { name: 'CUT' })).not.toBeDisabled(); }, { timeout: 6000 });
+    await userEvent.click(screen.getByRole('button', { name: 'CUT' }));
+    const confirm = screen.getByRole('button', { name: 'Confirm take' });
+    await userEvent.dblClick(confirm);
+    await waitFor(() => { expect(commandCount).toBe(1); });
+    expect(screen.getByRole('button', { name: 'CUT' })).toBeDisabled();
+    expect(screen.queryByText(/Engine state confirmed/)).toBeNull();
+    await userEvent.click(screen.getByRole('button', { name: 'CUT' }));
+    expect(commandCount).toBe(1);
   });
 
   it('exposes Open alarms as a 48px button-class link', async () => {
@@ -114,7 +153,7 @@ describe('ProductionDesk single-authority completion', () => {
   });
   it('does not clear awaiting state on unrelated topic, M/E, corr or media loading', async () => {
     const { client } = page();
-    await waitFor(() => { expect(screen.getByRole('button', { name: 'CUT' })).not.toBeDisabled(); });
+    await waitFor(() => { expect(screen.getByRole('button', { name: 'CUT' })).not.toBeDisabled(); }, { timeout: 6000 });
     await userEvent.click(screen.getByRole('button', { name: 'CUT' }));
     expect(commandCount).toBe(0);
     await userEvent.click(screen.getByRole('button', { name: 'Confirm take' }));
@@ -135,7 +174,7 @@ describe('ProductionDesk single-authority completion', () => {
 
   it('keeps unknown outcome visibly unresolved and prevents a second cut', async () => {
     const { client } = page();
-    await waitFor(() => { expect(screen.getByRole('button', { name: 'CUT' })).not.toBeDisabled(); });
+    await waitFor(() => { expect(screen.getByRole('button', { name: 'CUT' })).not.toBeDisabled(); }, { timeout: 6000 });
     await userEvent.click(screen.getByRole('button', { name: 'CUT' }));
     expect(commandCount).toBe(0);
     await userEvent.click(screen.getByRole('button', { name: 'Confirm take' }));
@@ -148,7 +187,7 @@ describe('ProductionDesk single-authority completion', () => {
 
   it('accepts exact completed true output-tick event and allows the next cut', async () => {
     const { client } = page();
-    await waitFor(() => { expect(screen.getByRole('button', { name: 'CUT' })).not.toBeDisabled(); });
+    await waitFor(() => { expect(screen.getByRole('button', { name: 'CUT' })).not.toBeDisabled(); }, { timeout: 6000 });
     await userEvent.click(screen.getByRole('button', { name: 'CUT' }));
     expect(commandCount).toBe(0);
     await userEvent.click(screen.getByRole('button', { name: 'Confirm take' }));

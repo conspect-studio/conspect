@@ -176,7 +176,12 @@
 
 
 /* programmatic route-focus on <main> must not paint a blue rule under the header / page end */
-.broadcast-shell main#main-content:focus,.broadcast-shell main#main-content:focus-visible{outline:none}
+.broadcast-shell main#main-content:focus,.broadcast-shell main#main-content:focus-visible{outline:none;box-shadow:inset 3px 0 0 var(--bd-amber)}
+/* route-focus cue is a non-outline left rule; skip link is a real, visible 48px target on focus */
+.broadcast-shell .bd-skip:focus{position:absolute;top:8px;left:8px;z-index:100;display:inline-flex;align-items:center;min-height:48px;padding:0 16px;width:auto;height:auto;margin:0;clip:auto;overflow:visible;white-space:nowrap;background:#10131a;color:#e8ecf1;border:2px solid var(--bd-amber);border-radius:8px;font-weight:800}
+.broadcast-shell{position:relative}
+/* real edge drawer: pinned to the viewport's trailing edge, full height */
+[role=dialog].bd-drawer{inset-block:0;inset-inline-start:auto;inset-inline-end:0;left:auto;right:0;top:0;bottom:0;transform:none!important;width:min(420px,100vw);max-width:100vw;height:100dvh;max-height:100dvh;border-radius:0;border-width:0 0 0 1px}
 .bd-brand{min-width:48px}
 @media(max-width:767px){
 .bd-brand{justify-content:center;padding:0}
