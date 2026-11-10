@@ -200,7 +200,7 @@ pub mod output_window_registry;
 pub mod pipeline;
 #[cfg(feature = "ffmpeg")]
 mod rendition_dispatch;
-#[cfg(feature = "ffmpeg")]
+// Planning uses compile-feature probes only and needs no native FFmpeg linkage.
 pub mod rendition_plan;
 #[cfg(feature = "ffmpeg")]
 pub mod rendition_workers;
