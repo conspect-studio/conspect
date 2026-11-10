@@ -1873,6 +1873,8 @@ struct SegmentState<'a> {
     /// The discrete tracks (#152) registered into every segment muxer after
     /// the program audio, plus the per-track seeds. Empty ⇒ unchanged layout.
     tracks: Option<(&'a AudioSelection, &'a [MuxStream<'a>])>,
+    /// The rendition-master writer (production default; tests may inject one).
+    master_writer: crate::hls::ManifestWriter,
 }
 
 /// One audio-only MPEG-TS muxer, opened at the same video GOP boundary.

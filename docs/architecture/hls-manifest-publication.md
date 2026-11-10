@@ -52,8 +52,9 @@ successful publish, never unlink a segment any on-disk manifest still lists), bu
    rename alone, so cancellation and publication are serialized — after `Drop` returns, that
    publisher can no longer rename. Every background write uses a unique temp name
    (`<name>.<pid>.<seq>.tmp`) and removes only its own temp, so two runs never share a temp
-   inode; a failed write or fsync removes its temp, and a new publisher removes temps a crashed
-   process left for the same playlist. `Drop` can wait for one in-flight `rename` (a
+   inode; a failed write or fsync removes its own temp. Temps left by a process that crashed
+   mid-write are not garbage-collected automatically (deleting another process's temp is
+   unsafe when two processes share a directory); they are bounded by one per crash. `Drop` can wait for one in-flight `rename` (a
    metadata operation, not an fsync) — usually microseconds, but not time-bounded on a
    pathologically slow filesystem.
 7. A surfaced publish error re-queues the committed (failed) manifest and does not commit

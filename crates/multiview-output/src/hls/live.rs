@@ -495,44 +495,6 @@ fn atomic_write_fenced(path: &Path, bytes: &[u8], fence: &PublishFence) -> Resul
     outcome.map(|_| ())
 }
 
-/// Remove background temps (`<name>.<pid>.<seq>.tmp`) of `playlist_path` left by
-/// a crashed process. Only names of that exact shape for this playlist whose
-/// `<pid>` is not this process are removed, so a concurrently running publisher
-/// of this process (and any foreign file) is never touched.
-fn remove_stale_temps(playlist_path: &Path) {
-    let (Some(dir), Some(base)) = (
-        playlist_path.parent(),
-        playlist_path.file_name().and_then(std::ffi::OsStr::to_str),
-    ) else {
-        return;
-    };
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return;
-    };
-    let me = std::process::id().to_string();
-    for entry in entries.flatten() {
-        let name = entry.file_name();
-        let Some(rest) = name
-            .to_str()
-            .and_then(|n| n.strip_prefix(base))
-            .and_then(|n| n.strip_prefix('.'))
-            .and_then(|n| n.strip_suffix(".tmp"))
-        else {
-            continue;
-        };
-        let mut parts = rest.split('.');
-        let (Some(pid), Some(seq), None) = (parts.next(), parts.next(), parts.next()) else {
-            continue;
-        };
-        let numeric = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
-        if numeric(pid) && numeric(seq) && pid != me {
-            match std::fs::remove_file(entry.path()) {
-                Ok(()) | Err(_) => {}
-            }
-        }
-    }
-}
-
 /// The visibility fence of one background publisher (#220). `Drop` of an
 /// abandoned publisher cancels it under the same lock the final `rename` runs
 /// under, so cancellation and publication are serialized: after `cancel`
@@ -653,7 +615,6 @@ impl std::fmt::Debug for BackgroundPublisher {
 
 impl BackgroundPublisher {
     fn spawn(playlist_path: PathBuf, writer: ManifestWriter) -> Result<Self> {
-        remove_stale_temps(&playlist_path);
         let shared = Arc::new(Shared {
             slot: Mutex::new(Slot::default()),
             wake: Condvar::new(),
@@ -917,7 +878,7 @@ mod fenced_write_tests {
 
 #[cfg(test)]
 mod temp_hygiene_tests {
-    use super::{atomic_write_fenced, remove_stale_temps, PublishFence};
+    use super::{atomic_write_fenced, PublishFence};
 
     #[test]
     fn a_failed_write_leaves_no_temp() {
@@ -933,27 +894,5 @@ mod temp_hygiene_tests {
             .map(|e| e.file_name())
             .collect();
         assert_eq!(left, vec![std::ffi::OsString::from("not-a-dir")]);
-    }
-
-    #[test]
-    fn stale_temps_of_other_processes_are_collected_and_nothing_else() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let path = dir.path().join("index.m3u8");
-        let me = std::process::id();
-        let other = if me == 1 { 2 } else { me - 1 };
-        let names = [
-            format!("index.m3u8.{other}.7.tmp"), // stale: removed
-            format!("index.m3u8.{me}.3.tmp"),    // live publisher of this process: kept
-            "index.m3u8.tmp".to_owned(),         // synchronous writer's temp: kept
-            format!("other.m3u8.{other}.1.tmp"), // another playlist: kept
-            "index.m3u8".to_owned(),             // the manifest: kept
-        ];
-        for n in &names {
-            std::fs::write(dir.path().join(n), b"x").expect("fixture");
-        }
-        remove_stale_temps(&path);
-        for (i, n) in names.iter().enumerate() {
-            assert_eq!(dir.path().join(n).exists(), i != 0, "{n}");
-        }
     }
 }
