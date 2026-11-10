@@ -48,6 +48,7 @@ export function Fader({
   // The one pointer currently driving THIS fader, and where in the knob it
   // grabbed. Other fingers on other faders have their own component state.
   const active = useRef<{ id: number; offset: number } | undefined>(undefined);
+  const extra = useRef<Set<number>>(new Set());
   const pos = max === min ? 0 : (value - min) / (max - min);
 
   const apply = (clientY: number, offset: number): void => {
@@ -58,6 +59,11 @@ export function Fader({
   };
 
   const release = (event: PointerEvent<HTMLDivElement>): void => {
+    if (extra.current.delete(event.pointerId)) {
+      const el = ref.current;
+      if (el !== null && 'hasPointerCapture' in el && el.hasPointerCapture(event.pointerId)) el.releasePointerCapture(event.pointerId);
+      return;
+    }
     if (active.current?.id !== event.pointerId) return;
     active.current = undefined;
     const element = ref.current;
@@ -86,9 +92,16 @@ export function Fader({
       className="audio-fader-hit"
       style={{ touchAction: 'none' }}
       onPointerDown={(event): void => {
-        if (disabled || active.current !== undefined) return;
+        if (disabled) return;
         if (event.pointerType === 'mouse' && event.button !== 0) return;
         const element = event.currentTarget;
+        if (active.current !== undefined) {
+          // A second finger on an active fader: capture it so its release
+          // stays here, but never change the value.
+          if ('setPointerCapture' in element) element.setPointerCapture(event.pointerId);
+          extra.current.add(event.pointerId);
+          return;
+        }
         const rect = element.getBoundingClientRect();
         const knobCentre = rect.top + KNOB_PX / 2 + (rect.height - KNOB_PX) * (1 - pos);
         // Grabbing the knob keeps the finger's offset (no jump); grabbing the

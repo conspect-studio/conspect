@@ -170,7 +170,7 @@ export function AudioMasterRegion({
           <Trans>PROGRAM</Trans>
         </h2>
         <div className="master-fader-row" title={reason}>
-          <div className="audio-fader-box fader-track master-track" data-testid="audio-master-fader" role="slider" aria-disabled="true" aria-orientation="vertical" aria-label={t`PROGRAM master gain`} aria-valuetext={t`unavailable`} aria-valuemin={-60} aria-valuemax={0} aria-valuenow={0} />
+          <div className="audio-fader-box fader-track master-track" data-testid="audio-master-fader" role="group" tabIndex={-1} aria-disabled="true" aria-label={t`PROGRAM master gain — unavailable`} title={reason} />
           <div className="audio-nudge-col">
             {(['+6', '+1', '−1', '−6'] as const).map((label) => (
               <Button key={label} type="button" variant="outline" disabled className="audio-nudge-btn h-12 min-w-12 p-0 font-mono" aria-label={t`PROGRAM gain ${label} dB — unavailable`}>

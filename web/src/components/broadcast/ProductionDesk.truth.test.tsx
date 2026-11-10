@@ -66,4 +66,9 @@ describe('ProductionDesk truthful wall, indices and meters', () => {
     expect(await screen.findByTestId('desk-meters')).toHaveTextContent('-12.3 dBFS');
     expect(screen.queryByTestId('desk-meters-unavailable')).toBeNull();
   });
+  it('exposes the waiting state as ordinary text, not hidden behind an image role', async () => {
+    page();
+    const waiting = await screen.findByText('Waiting for a frame…');
+    expect(waiting.closest('[role="img"]')).toBeNull();
+  });
 });

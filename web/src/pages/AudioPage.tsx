@@ -116,6 +116,17 @@ function withRoute(
   };
 }
 
+/** Apply a row value, or a function of the LATEST row, at `index`. */
+function applyRouteChange(
+  form: AudioFormState,
+  index: number,
+  next: AudioRouteRow | ((latest: AudioRouteRow) => AudioRouteRow),
+): AudioFormState {
+  const current = form.routes[index];
+  if (typeof next !== 'function') return withRoute(form, index, next);
+  return current === undefined ? form : withRoute(form, index, next(current));
+}
+
 /**
  * A keyboard-native collapsible disclosure (a real <details>/<summary>, so it
  * needs no extra ARIA wiring) whose open state is synced through React — the
@@ -268,7 +279,8 @@ function ChannelStrip({
   readonly inputSample: AudioMeterSample | undefined;
   readonly detailsOpen: boolean;
   readonly onDetailsOpenChange: (index: number, next: boolean) => void;
-  readonly onChange: (next: AudioRouteRow) => void;
+  /** A function receives the LATEST row, so same-frame taps compose. */
+  readonly onChange: (next: AudioRouteRow | ((latest: AudioRouteRow) => AudioRouteRow)) => void;
   readonly onRemove: () => void;
   /** Registers the fader element (the xl bank wires overview taps to it). */
   readonly registerFader?: (element: HTMLElement | null) => void;
@@ -290,7 +302,10 @@ function ChannelStrip({
       : sourceIds;
 
   const setGain = (next: string): void => {
-    onChange({ ...route, gainDb: next });
+    onChange((latest) => ({ ...latest, gainDb: next }));
+  };
+  const nudgeGain = (delta: number): void => {
+    onChange((latest) => ({ ...latest, gainDb: nudgeGainDb(latest.gainDb, delta) }));
   };
 
   return (
@@ -356,10 +371,10 @@ function ChannelStrip({
             onKeyDown={(event): void => {
               if (event.key === 'PageUp') {
                 event.preventDefault();
-                setGain(nudgeGainDb(route.gainDb, 6));
+                nudgeGain(6);
               } else if (event.key === 'PageDown') {
                 event.preventDefault();
-                setGain(nudgeGainDb(route.gainDb, -6));
+                nudgeGain(-6);
               } else if (event.key === 'Escape' && saved !== undefined) {
                 // Escape reverts the DRAFT gain to the saved one — a local,
                 // reversible draft edit, never an on-air event undo.
@@ -385,7 +400,7 @@ function ChannelStrip({
             className="audio-nudge-btn h-12 min-w-12 p-0 font-mono"
             disabled={draftDb === undefined}
             onTap={(): void => {
-              setGain(nudgeGainDb(route.gainDb, delta));
+              nudgeGain(delta);
             }}
           >
             {delta > 0 ? `+${String(delta)}` : `−${String(Math.abs(delta))}`}
@@ -443,7 +458,7 @@ function ChannelStrip({
           aria-label={t`${label} MUTE`}
           className="h-12 min-w-12 px-4 aria-pressed:border-destructive/60 aria-pressed:bg-destructive/15 aria-pressed:text-destructive"
           onTap={(): void => {
-            onChange({ ...route, mute: !route.mute });
+            onChange((latest) => ({ ...latest, mute: !latest.mute }));
           }}
         >
           {t`MUTE`}
@@ -456,7 +471,7 @@ function ChannelStrip({
           aria-label={t`${label} PGM (include in the program mix)`}
           className="h-12 min-w-12 px-4 aria-pressed:border-status-live/60 aria-pressed:bg-status-live/15"
           onTap={(): void => {
-            onChange({ ...route, includeInProgramBus: !route.includeInProgramBus });
+            onChange((latest) => ({ ...latest, includeInProgramBus: !latest.includeInProgramBus }));
           }}
         >
           {t`PGM`}
@@ -1311,7 +1326,7 @@ export function AudioPage(): JSX.Element {
                         }
                       }}
                       onChange={(next): void => {
-                        update(withRoute(latestForm.current ?? form, index, next));
+                        update(applyRouteChange(latestForm.current ?? form, index, next));
                       }}
                       onRemove={(): void => {
                         update({
@@ -1349,7 +1364,7 @@ export function AudioPage(): JSX.Element {
                 onDetailsOpenChange={setStripDetailsOpen}
                 idPrefix={`audio-focused-route-${String(focused + 1)}`}
                 onChange={(next): void => {
-                  update(withRoute(latestForm.current ?? form, focused, next));
+                  update(applyRouteChange(latestForm.current ?? form, focused, next));
                 }}
                 onRemove={(): void => {
                   update({

@@ -9,18 +9,19 @@ import { type PointerEvent, useRef } from 'react';
 export function useTouchTap(action: () => void): {
   onPointerDown: (event: PointerEvent<HTMLElement>) => void;
   onPointerUp: (event: PointerEvent<HTMLElement>) => void;
-  onPointerCancel: () => void;
+  onPointerCancel: (event: PointerEvent<HTMLElement>) => void;
   onClick: () => void;
 } {
-  const down = useRef<number | undefined>(undefined);
+  // Every finger is tracked by its own pointerId: a second finger on the same
+  // button must not displace the first.
+  const down = useRef<Set<number>>(new Set());
   const handledAt = useRef(-Infinity);
   return {
     onPointerDown: (event): void => {
-      if (event.pointerType === 'touch') down.current = event.pointerId;
+      if (event.pointerType === 'touch') down.current.add(event.pointerId);
     },
     onPointerUp: (event): void => {
-      if (event.pointerType !== 'touch' || down.current !== event.pointerId) return;
-      down.current = undefined;
+      if (event.pointerType !== 'touch' || !down.current.delete(event.pointerId)) return;
       const rect = event.currentTarget.getBoundingClientRect();
       const inside =
         event.clientX >= rect.left && event.clientX <= rect.right &&
@@ -29,8 +30,8 @@ export function useTouchTap(action: () => void): {
       handledAt.current = performance.now();
       action();
     },
-    onPointerCancel: (): void => {
-      down.current = undefined;
+    onPointerCancel: (event): void => {
+      down.current.delete(event.pointerId);
     },
     onClick: (): void => {
       if (performance.now() - handledAt.current < 700) {

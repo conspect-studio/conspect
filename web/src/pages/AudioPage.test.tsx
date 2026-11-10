@@ -822,3 +822,26 @@ describe("AudioPage", () => {
     expect(screen.getByTestId("audio-pfl-note")).toHaveTextContent(/pre-fade listen.*not available/i);
   });
 });
+
+it("two same-frame nudges on one strip BOTH apply (+1 and +1 => +2)", async () => {
+  renderAudio();
+  const strip = (await screen.findAllByTestId("audio-strip"))[0]!;
+  const plus1 = within(strip).getAllByTestId("audio-nudge")[1]!;
+  const rect = new DOMRect(0, 0, 48, 48);
+  vi.spyOn(plus1, "getBoundingClientRect").mockReturnValue(rect);
+  const pe = (type: string, id: number): Event => {
+    const e = new MouseEvent(type, { bubbles: true, cancelable: true, clientX: 5, clientY: 5 });
+    Object.defineProperty(e, "pointerId", { value: id });
+    Object.defineProperty(e, "pointerType", { value: "touch" });
+    return e;
+  };
+  fireEvent(plus1, pe("pointerdown", 1));
+  fireEvent(plus1, pe("pointerdown", 2));
+  // Both finger lifts land in one batch, before any re-render.
+  const { act } = await import("@testing-library/react");
+  act(() => {
+    fireEvent(plus1, pe("pointerup", 1));
+    fireEvent(plus1, pe("pointerup", 2));
+  });
+  expect(within(strip).getByTestId("audio-strip-readout")).toHaveTextContent(/Draft -1 dB.*Saved -3 dB/s);
+});

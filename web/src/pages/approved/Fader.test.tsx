@@ -167,3 +167,24 @@ describe("Fader keyboard and disabled", () => {
     expect(f).toHaveAttribute("aria-disabled", "true");
   });
 });
+
+describe("Fader extra finger", () => {
+  it("captures a second finger on an active fader, never changes the value, and releases it", () => {
+    const [a] = setup(1) as [HTMLElement];
+    const el = a as HTMLElement & { hasPointerCapture: () => boolean };
+    const capture = vi.fn(), releaseCapture = vi.fn();
+    el.setPointerCapture = capture;
+    el.hasPointerCapture = () => true;
+    el.releasePointerCapture = releaseCapture;
+    fire(a, "pointerdown", 1, yFor(-30));
+    fire(a, "pointerdown", 2, yFor(-10));
+    expect(capture).toHaveBeenCalledWith(2);
+    expect(now(a)).toBe(-30);
+    fire(a, "pointermove", 2, yFor(-5));
+    expect(now(a)).toBe(-30);
+    fire(a, "pointerup", 2, yFor(-5));
+    expect(releaseCapture).toHaveBeenCalledWith(2);
+    fire(a, "pointermove", 1, yFor(-20));
+    expect(now(a)).toBe(-20);
+  });
+});

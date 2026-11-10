@@ -115,7 +115,11 @@ describe('AudioSurface', () => {
     expect(screen.getByTestId('audio-master-unavailable')).toHaveTextContent(
       'Master gain/mute unavailable: control plane exposes only per-input gain and mute in the saved audio document',
     );
-    expect(screen.getByTestId('audio-master-fader')).toHaveAttribute('aria-disabled', 'true');
+    const master = screen.getByTestId('audio-master-fader');
+    expect(master).toHaveAttribute('aria-disabled', 'true');
+    expect(master).toHaveAttribute('tabindex', '-1');
+    for (const a of ['aria-valuenow', 'aria-valuemin', 'aria-valuemax']) expect(master).not.toHaveAttribute(a);
+    expect(master).toHaveAttribute('role', 'group');
   });
 
   it('phone master offers no invented mute control', () => {

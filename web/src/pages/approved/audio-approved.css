@@ -151,7 +151,7 @@
   -webkit-tap-highlight-color: transparent;
 }
 [data-approved-page="audio"] .audio-fader-knob {
-  position: absolute; left: 4px; right: 4px; height: 48px; pointer-events: none;
+  position: absolute; left: 2px; right: 2px; height: 48px; pointer-events: none;
   border-radius: 6px; box-sizing: border-box;
   background: linear-gradient(180deg, #4b5563, #2b323d); border: 1px solid var(--line-2);
   box-shadow: 0 4px 10px rgba(0,0,0,.5);
@@ -284,7 +284,7 @@
   [data-approved-page="audio"] .strip-bank [data-testid="audio-strip"] { padding: 10px 3px; min-width: 0; }
   [data-approved-page="audio"] .strip-bank [data-testid="audio-strip-essential"] > div:first-child { flex-wrap: nowrap; justify-content: center; gap: 3px; min-width: 0; }
   [data-approved-page="audio"] .strip-bank [data-testid="audio-strip-essential"] > div:first-child > div:first-child { width: 20px; flex: none; }
-  [data-approved-page="audio"] .strip-bank [data-testid="audio-strip-essential"] > div:first-child .fader-track { flex: none; width: 48px; }
+  [data-approved-page="audio"] .strip-bank [data-testid="audio-strip-essential"] > div:first-child .fader-track { flex: none; width: 56px; }
   [data-approved-page="audio"] .strip-bank .audio-nudge-col { order: 0; flex: none; width: 48px; grid-template-columns: 48px; }
   [data-approved-page="audio"] .strip-bank .audio-nudge-btn { width: 48px; }
   [data-approved-page="audio"] .strip-bank .meter-col { width: 8px; }

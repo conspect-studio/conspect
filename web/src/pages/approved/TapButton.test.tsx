@@ -46,4 +46,41 @@ describe("TapButton", () => {
     fireEvent(el, pe("pointerup", 1, "touch"));
     expect(a).not.toHaveBeenCalled();
   });
+
+  it("finger1 down, finger2 down, finger1 up, finger2 up on two different buttons: both fire once", () => {
+    const a = vi.fn(), b = vi.fn();
+    render(<><TapButton onTap={a}>A</TapButton><TapButton onTap={b}>B</TapButton></>);
+    const [ba, bb] = [screen.getByText("A"), screen.getByText("B")];
+    for (const x of [ba, bb]) vi.spyOn(x, "getBoundingClientRect").mockReturnValue(rect);
+    fireEvent(ba, pe("pointerdown", 1, "touch"));
+    fireEvent(bb, pe("pointerdown", 2, "touch"));
+    fireEvent(ba, pe("pointerup", 1, "touch"));
+    fireEvent(bb, pe("pointerup", 2, "touch"));
+    expect([a.mock.calls.length, b.mock.calls.length]).toEqual([1, 1]);
+  });
+
+  it("two fingers on the SAME button fire twice; a second finger does not cancel the first", () => {
+    const a = vi.fn();
+    render(<TapButton onTap={a}>A</TapButton>);
+    const el = screen.getByText("A");
+    vi.spyOn(el, "getBoundingClientRect").mockReturnValue(rect);
+    fireEvent(el, pe("pointerdown", 1, "touch"));
+    fireEvent(el, pe("pointerdown", 2, "touch"));
+    fireEvent(el, pe("pointerup", 1, "touch"));
+    expect(a).toHaveBeenCalledTimes(1);
+    fireEvent(el, pe("pointerup", 2, "touch"));
+    expect(a).toHaveBeenCalledTimes(2);
+  });
+
+  it("cancelling one finger leaves the other finger's tap intact", () => {
+    const a = vi.fn();
+    render(<TapButton onTap={a}>A</TapButton>);
+    const el = screen.getByText("A");
+    vi.spyOn(el, "getBoundingClientRect").mockReturnValue(rect);
+    fireEvent(el, pe("pointerdown", 1, "touch"));
+    fireEvent(el, pe("pointerdown", 2, "touch"));
+    fireEvent(el, pe("pointercancel", 1, "touch"));
+    fireEvent(el, pe("pointerup", 2, "touch"));
+    expect(a).toHaveBeenCalledTimes(1);
+  });
 });
