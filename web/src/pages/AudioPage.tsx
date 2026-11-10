@@ -165,6 +165,34 @@ function DetailsDisclosure({
  * the Clip word carry the meaning. No level is ever derived from the draft. */
 const METER_SEGMENTS = 24;
 
+/** Peak chip above the dB readout: REAL pre-fader input peak, never derived. */
+function InputPeakChip({
+  sample,
+}: {
+  readonly sample: AudioMeterSample | undefined;
+}): JSX.Element {
+  const peak = sample === undefined ? undefined : inputPeakDb(sample);
+  return (
+    <span className="audio-peak-chip">
+      <span>peak</span>
+      <span data-testid="audio-in-peak" className="font-mono tabular-nums">
+        {peak === undefined ? '—' : peak.toFixed(1)}
+      </span>
+      {peak === undefined ? null : <span>dB</span>}
+      {sample?.clip ? (
+        <span className="font-semibold text-destructive">
+          <Trans>Clip</Trans>
+        </span>
+      ) : null}
+      {peak === undefined ? (
+        <span className="sr-only">
+          <Trans>No input telemetry</Trans>
+        </span>
+      ) : null}
+    </span>
+  );
+}
+
 function InputMeterColumn({
   sample,
 }: {
@@ -202,22 +230,6 @@ function InputMeterColumn({
         })}
       </div>
       <span className="text-xs text-muted-foreground">{t`IN`}</span>
-      <span
-        data-testid="audio-in-peak"
-        className="font-mono text-xs tabular-nums text-muted-foreground"
-      >
-        {peak === undefined ? '—' : peak.toFixed(1)}
-      </span>
-      {sample?.clip ? (
-        <span className="text-xs font-semibold text-destructive">
-          <Trans>Clip</Trans>
-        </span>
-      ) : null}
-      {peak === undefined ? (
-        <span className="sr-only">
-          <Trans>No input telemetry</Trans>
-        </span>
-      ) : null}
     </div>
   );
 }
@@ -287,46 +299,14 @@ function ChannelStrip({
       aria-label={t`Channel strip — ${label}`}
       className="flex w-full min-w-0 flex-col gap-2 rounded-md border p-3"
     >
-      <header className="flex min-w-0 flex-col gap-1">
+      <header className="audio-strip-head flex min-w-0 flex-col gap-1">
         <span
           data-testid="audio-strip-name"
           className="truncate text-sm font-semibold"
         >
           {label}
         </span>
-        {track !== '' ? (
-          <Badge variant="secondary" className="w-fit font-mono">
-            {track}
-          </Badge>
-        ) : null}
       </header>
-
-      {/* Draft vs Saved — always explicit, never an apply claim. */}
-      <p
-        data-testid="audio-strip-readout"
-        className="flex flex-wrap items-baseline gap-x-2 text-sm"
-      >
-        <span className="text-xs font-medium uppercase tracking-wide text-muted-foreground">
-          <Trans>Draft</Trans>
-        </span>
-        {' '}
-        <span className="font-mono text-base font-semibold tabular-nums">
-          {draftDb === undefined ? <Trans>invalid gain</Trans> : <>{formatDb(draftDb)}{' '}<span className="text-xs font-normal text-muted-foreground">dB</span></>}
-        </span>
-        {savedDb !== undefined ? (
-          <span className="text-xs text-muted-foreground">
-            {' · '}
-            <Trans>Saved</Trans>
-            {' '}
-            <span className="font-mono tabular-nums">{formatDb(savedDb)} dB</span>
-          </span>
-        ) : (
-          <span className="text-xs text-muted-foreground">
-            {' · '}
-            <Trans>not saved yet</Trans>
-          </span>
-        )}
-      </p>
 
       {/* At tablet widths, put the keys beside the full-height fader rather
           than below it. Keep source/focus order and the 48 px target floor. */}
@@ -336,7 +316,7 @@ function ChannelStrip({
           range is a display bound only — the readout above carries the exact
           draft, and the Details field accepts any finite value. */}
       <div className="flex items-end justify-center gap-2 md:max-xl:row-span-2">
-        <div className="relative h-60 w-7" aria-hidden="true">
+        <div className="audio-fader-box relative h-60 w-7" aria-hidden="true">
           {GAIN_SCALE_TICKS_DB.map((tick) => (
             <span
               key={tick}
@@ -347,7 +327,7 @@ function ChannelStrip({
             </span>
           ))}
         </div>
-        <div className="fader-track relative h-60 w-14">
+        <div className="fader-track audio-fader-box relative h-60 w-14">
           <span
             aria-hidden="true"
             className="fader-fill"
@@ -415,9 +395,46 @@ function ChannelStrip({
         <InputMeterColumn sample={inputSample} />
       </div>
 
+        {/* One compact line under the fader: the DRAFT dB, an amber "draft"
+            mark only when it differs from the saved row (tooltip carries the
+            saved value). The full Draft/Saved wording stays for assistive tech. */}
+        <div className="audio-strip-meta">
+          <InputPeakChip sample={inputSample} />
+          <p data-testid="audio-strip-readout" className="audio-readout">
+            <span className="sr-only">
+              <Trans>Draft</Trans>{' '}
+              {draftDb === undefined ? <Trans>invalid gain</Trans> : <>{formatDb(draftDb)} dB</>}
+              {savedDb !== undefined ? (
+                <>
+                  {' · '}
+                  <Trans>Saved</Trans> {formatDb(savedDb)} dB
+                </>
+              ) : (
+                <>
+                  {' · '}
+                  <Trans>not saved yet</Trans>
+                </>
+              )}
+            </span>
+            <span aria-hidden="true" className="font-mono tabular-nums">
+              {draftDb === undefined ? t`invalid gain` : `${formatDb(draftDb)} dB`}
+            </span>
+            {draftDb !== undefined && savedDb !== undefined && savedDb !== draftDb ? (
+              <span aria-hidden="true" className="audio-draft-pip" title={t`saved ${formatDb(savedDb)} dB`}>
+                {t`draft`}
+              </span>
+            ) : null}
+            {savedDb === undefined ? (
+              <span aria-hidden="true" className="audio-draft-pip">
+                {t`new`}
+              </span>
+            ) : null}
+          </p>
+        </div>
+
       {/* The strip keys: MUTE and PGM (program-bus include) — draft toggles,
           pressed state visible by style AND text in the status line. */}
-      <div className="audio-strip-keys flex flex-wrap items-center gap-2">
+      <div className="audio-strip-keys">
         <TapButton
           type="button"
           variant="outline"
@@ -444,12 +461,18 @@ function ChannelStrip({
         >
           {t`PGM`}
         </TapButton>
-        <span
-          data-testid="audio-strip-listen-note"
-          className="audio-listen-note text-xs text-muted-foreground"
+        <TapButton
+          type="button"
+          variant="outline"
+          data-testid="audio-listen"
+          disabled
+          onTap={(): void => undefined}
+          aria-label={t`${label} LISTEN — unavailable: no monitor path`}
+          title={t`unavailable: no monitor path`}
+          className="audio-listen-key h-12 min-w-12 px-2"
         >
-          {t`LISTEN: unavailable (no monitor path)`}
-        </span>
+          {t`LISTEN`}
+        </TapButton>
       </div>
 
       </div>
@@ -458,7 +481,7 @@ function ChannelStrip({
           a fixed slot, so it can never move the keys or nudges (designer
           correction round 3). Only a LOCAL draft reversible — the saved row
           is restored as-is; nothing is sent. */}
-      <div className="min-h-12">
+      <div className="audio-undo-slot">
         {diff?.changed === true && saved !== undefined ? (
           <Button
             type="button"
@@ -1254,14 +1277,9 @@ export function AudioPage(): JSX.Element {
             data-testid="audio-bank"
             className="hidden md:block"
           >
-            <h3 id="audio-bank-heading" className="mb-3 text-sm font-medium">
+            <h3 id="audio-bank-heading" className="sr-only">
               <Trans>Mix bank</Trans>
             </h3>
-            {form.routes.length > 1 ? (
-              <Button type="button" variant="outline" className="mb-3 h-auto min-h-12 min-w-12 max-w-full whitespace-normal break-words" aria-expanded={bankExpanded} onClick={(): void => { setBankExpanded(!bankExpanded); }}>
-                {bankExpanded ? <Trans>Show selected channel</Trans> : <Trans>Show all channels</Trans>}
-              </Button>
-            ) : null}
             {form.routes.length === 0 ? (
               <p className="text-sm text-muted-foreground">
                 <Trans>
@@ -1415,6 +1433,11 @@ export function AudioPage(): JSX.Element {
               <Plus aria-hidden="true" />
               <Trans>Add route</Trans>
             </Button>
+            {form.routes.length > 1 ? (
+              <Button type="button" variant="outline" data-testid="audio-bank-toggle" className="hidden h-auto min-h-12 min-w-12 max-w-full whitespace-normal break-words px-3 md:inline-flex" aria-expanded={bankExpanded} onClick={(): void => { setBankExpanded(!bankExpanded); }}>
+                {bankExpanded ? <Trans>Show selected channel</Trans> : <Trans>Show all channels</Trans>}
+              </Button>
+            ) : null}
             <Button
               type="button"
               data-testid="audio-save"
@@ -1424,6 +1447,9 @@ export function AudioPage(): JSX.Element {
             >
               <Trans>Save audio routing</Trans>
             </Button>
+            <span data-testid="audio-draft-note" className="audio-draft-note">
+              <Trans>Edits are drafts until saved</Trans>
+            </span>
             {(conflicted || queryDiverged) ? (
               <div role="alert" className="flex flex-wrap items-center gap-2 text-sm text-destructive">
                 <Trans>Audio routing changed on the server. Your draft is preserved; review the latest version before saving again.</Trans>

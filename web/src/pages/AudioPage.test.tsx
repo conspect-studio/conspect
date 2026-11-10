@@ -517,12 +517,12 @@ describe("AudioPage", () => {
     ] } };
     server.use(http.get("*/api/v1/audio-routing", () => HttpResponse.json(bad, { headers: { ETag: 'W/"7"' } })));
     renderAudio();
-    const { bank } = await console();
-    await userEvent.click(within(bank).getByRole("button", { name: /Show selected channel/i }));
-    expect(within(bank).getByRole("button", { name: /Show all channels/i })).toHaveAttribute("aria-expanded", "false");
+    await console();
+    await userEvent.click(screen.getByRole("button", { name: /Show selected channel/i }));
+    expect(screen.getByRole("button", { name: /Show all channels/i })).toHaveAttribute("aria-expanded", "false");
     await userEvent.click(screen.getByTestId("audio-save"));
     expect(await screen.findByTestId("audio-validation-summary")).toBeInTheDocument();
-    expect(within(bank).getByRole("button", { name: /Show selected channel/i })).toHaveAttribute("aria-expanded", "true");
+    expect(screen.getByRole("button", { name: /Show selected channel/i })).toHaveAttribute("aria-expanded", "true");
   });
 
   it("saves the whole document with PUT + If-Match", async () => {
@@ -814,7 +814,11 @@ describe("AudioPage", () => {
   it("offers no fake PFL/listen key, and states plainly that it is unavailable", async () => {
     renderAudio();
     const { focused } = await console();
-    expect(within(focused).queryByRole("button", { name: /listen|PFL|solo/i })).not.toBeInTheDocument();
+    // Approved LISTEN key is present only as a DISABLED placeholder with the reason.
+    const listen = within(focused).getByTestId("audio-listen");
+    expect(listen).toBeDisabled();
+    expect(listen).toHaveAttribute("title", "unavailable: no monitor path");
+    expect(within(focused).queryByRole("button", { name: /PFL|solo/i })).not.toBeInTheDocument();
     expect(screen.getByTestId("audio-pfl-note")).toHaveTextContent(/pre-fade listen.*not available/i);
   });
 });
