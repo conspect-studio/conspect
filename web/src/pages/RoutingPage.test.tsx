@@ -6,6 +6,7 @@ import { screen, waitFor } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { http, HttpResponse } from 'msw';
 import { setupServer } from 'msw/node';
+import { MemoryRouter } from 'react-router-dom';
 
 import { RoutingPage } from './RoutingPage';
 import { renderWithProviders } from '../test/render';
@@ -15,6 +16,14 @@ let lastTakePath = '';
 let lastTakeIdempotency: string | null = null;
 
 const server = setupServer(
+  // The composed page also reads the PGM state, sources and outputs.
+  http.get('*/api/v1/switcher/me1', () =>
+    HttpResponse.json({ in_flight: false, preview_source: 'cam-b', program_source: 'cam-a', tick: 1 }),
+  ),
+  http.get('*/api/v1/sources', () => HttpResponse.json([])),
+  http.get('*/api/v1/outputs', () => HttpResponse.json([])),
+  http.get('*/api/v1/layouts', () => HttpResponse.json([])),
+  http.get('*/api/v1/audio-routing', () => HttpResponse.json({ state: { selectable_tracks: [] } })),
   http.post('http://localhost:3000/api/v1/routing/plan', async ({ request }) => {
     lastPlanBody = await request.json();
     return HttpResponse.json({ class: 'class2', coerced: false });
@@ -45,7 +54,7 @@ afterAll(() => {
 describe('RoutingPage', () => {
   it('plans a video take and shows the classified class', async () => {
     const user = userEvent.setup();
-    renderWithProviders(<RoutingPage />);
+    renderWithProviders(<MemoryRouter><RoutingPage /></MemoryRouter>);
 
     await user.type(screen.getByLabelText('Source input id'), 'cam-north');
     await user.type(screen.getByLabelText('Target video cell'), 'cell-a');
@@ -61,7 +70,7 @@ describe('RoutingPage', () => {
 
   it('takes the crosspoint with a fresh Idempotency-Key', async () => {
     const user = userEvent.setup();
-    renderWithProviders(<RoutingPage />);
+    renderWithProviders(<MemoryRouter><RoutingPage /></MemoryRouter>);
 
     await user.type(screen.getByLabelText('Source input id'), 'cam-north');
     await user.type(screen.getByLabelText('Target video cell'), 'cell-a');
@@ -75,7 +84,7 @@ describe('RoutingPage', () => {
   });
 
   it('disables Plan and Take until an input and target are given', () => {
-    renderWithProviders(<RoutingPage />);
+    renderWithProviders(<MemoryRouter><RoutingPage /></MemoryRouter>);
     expect(screen.getByRole('button', { name: /Plan/i })).toBeDisabled();
     expect(screen.getByRole('button', { name: 'Take' })).toBeDisabled();
   });

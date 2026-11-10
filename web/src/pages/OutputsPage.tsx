@@ -924,7 +924,9 @@ function OutputCard({
   onDetailsToggle,
   onEdit,
   onDelete,
+  embedded = false,
 }: {
+  readonly embedded?: boolean;
   readonly output: OutputView;
   readonly playbackPath: string | undefined;
   readonly playbackCollision: boolean;
@@ -943,6 +945,115 @@ function OutputCard({
   const editDisabledReason = editRefused
     ? t`kind "${output.rawKind}" isn't editable in this UI; the document is preserved as authored`
     : undefined;
+  if (embedded) {
+    // Approved Routing composition: Requested (config) beside Effective
+    // (measured). Only configured facts are shown as requested; effective and
+    // restart state have no readback in the API, so they are Unknown.
+    const unbuilt = output.editable && OUTPUT_RUNNABLE[output.kind] === 'unbuilt';
+    return (
+      <div className="out-card" data-testid={`output-card-${output.id}`}>
+        <div className="out-head">
+          <b lang="" dir="auto">{output.name}</b>
+          <span className="pill pill-idle" data-testid="output-kind-tag">{output.rawKind}</span>
+        </div>
+        <p className="out-sub">
+          <code lang="" dir="auto">{output.id}</code>
+          {output.target !== undefined ? (
+            <>
+              {' · '}
+              <span lang="" dir="auto" className="break-all">{output.target}</span>
+            </>
+          ) : null}
+        </p>
+        <div className="out-tx" data-testid="output-transmission">
+          {unbuilt ? (
+            <span className="pill pill-nosig"><Trans>⊘ Not available</Trans></span>
+          ) : (
+            <span className="pill pill-nosig"><Trans>Transmission: Unknown</Trans></span>
+          )}
+          {output.editable ? (
+            <span className="flex min-w-0 flex-col gap-1">
+              <RunnabilityNote kind={output.kind} />
+              {hasLiveLink(output.kind) ? <OutputLinkStatus id={output.id} /> : null}
+            </span>
+          ) : (
+            <span aria-hidden="true">—</span>
+          )}
+        </div>
+        <div className="req-eff">
+          <div data-testid="output-requested">
+            <span className="lbl"><Trans>Requested (config)</Trans></span>
+            <span className="mono">
+              {output.codec ?? <Trans>codec not set</Trans>}
+            </span>
+          </div>
+          <div data-testid="output-effective">
+            <span className="lbl"><Trans>Effective (measured)</Trans></span>
+            <span className="mono">
+              <Trans>Unknown — no measured readback</Trans>
+            </span>
+          </div>
+        </div>
+        <p className="out-flag" data-testid="output-restart">
+          <span className="pill pill-idle"><Trans>Restart: Unknown</Trans></span>
+          <span><Trans>The API exposes no per-output restart readback.</Trans></span>
+        </p>
+        <div className="out-flag">
+          <Link className="underline" to="/monitoring">
+            <Trans>Watch program</Trans>
+          </Link>
+          {playbackPath !== undefined ? (
+            <a className="underline" href={playbackPath} target="_blank" rel="noreferrer">
+              <Trans>Open HLS playlist</Trans>
+            </a>
+          ) : null}
+        </div>
+        {playbackCollision ? (
+          <p className="out-flag">
+            <Trans>
+              HLS link unavailable: output IDs resolve to colliding mounts; the
+              runtime mount depends on configuration order.
+            </Trans>
+          </p>
+        ) : null}
+        <p className="out-flag">
+          <Trans>Requires an active output; saved settings do not confirm playback.</Trans>
+        </p>
+        <div className="out-actions">
+          <TouchAction
+            variant="outline"
+            aria-label={
+              editRefused
+                ? `${t`Edit output`}: ${output.name} — ${editDisabledReason ?? ''}`
+                : `${t`Edit output`}: ${output.name}`
+            }
+            aria-disabled={editRefused}
+            {...(editRefused ? { title: editDisabledReason } : {})}
+            {...(editRefused ? { className: 'cursor-not-allowed opacity-50' } : {})}
+            onPress={(): void => {
+              if (editRefused) {
+                return;
+              }
+              onEdit(output);
+            }}
+          >
+            <Pencil aria-hidden="true" />
+            <Trans>Edit</Trans>
+          </TouchAction>
+          <TouchAction
+            variant="ghost"
+            aria-label={`${t`Delete output`}: ${output.name}`}
+            onPress={(): void => {
+              onDelete(output);
+            }}
+          >
+            <Trash2 aria-hidden="true" />
+            <Trans>Delete</Trans>
+          </TouchAction>
+        </div>
+      </div>
+    );
+  }
   return (
     <div data-testid={`output-card-${output.id}`}>
       <TaskWorkspace
@@ -1067,8 +1178,21 @@ const RESOURCE_CONTEXT: ResourceContext = {};
 
 const NO_ERRORS = {};
 
-/** Outputs management. */
+/** Outputs management (standalone `/outputs` route). */
 export function OutputsPage(): JSX.Element {
+  return <OutputsSurface />;
+}
+
+/**
+ * The Outputs controller + cards. `embedded` renders it as the Routing page's
+ * "Output sinks" block (block heading + New action instead of the page
+ * header); the CRUD dialogs, ETag flows and cards are identical in both.
+ */
+export function OutputsSurface({
+  embedded = false,
+}: {
+  readonly embedded?: boolean;
+}): JSX.Element {
   const { t } = useLingui();
   const outputs = useOutputs();
   const routing = useAudioRouting();
@@ -1184,6 +1308,20 @@ export function OutputsPage(): JSX.Element {
 
   return (
     <>
+      {embedded ? (
+        <div className="block-head" data-testid="output-sinks-head">
+          <h2>
+            <Trans>Output sinks</Trans>
+          </h2>
+          <div data-testid="output-header-actions" className="flex min-w-0 max-w-full flex-wrap items-center gap-2">
+            <ExportConfigButton compact />
+            <Button data-testid="crud-new" className="h-auto min-h-12 min-w-12 max-w-full whitespace-normal break-words py-2" onClick={openCreate}>
+              <Plus aria-hidden="true" />
+              <Trans>New output</Trans>
+            </Button>
+          </div>
+        </div>
+      ) : (
       <div
         data-testid="output-page-header"
         className="min-w-0 max-w-full [&>div>div]:min-w-0 [&>div>div]:max-w-full"
@@ -1210,6 +1348,7 @@ export function OutputsPage(): JSX.Element {
         }
       />
       </div>
+      )}
 
       <ApplySemanticsCallout
         helpTo="/help/config#outputs"
@@ -1231,10 +1370,11 @@ export function OutputsPage(): JSX.Element {
       ) : (
         <div>
           <p className="mb-3 text-xs text-muted-foreground">{t`Configured output sinks.`}</p>
-          <div className="grid gap-4">
+          <div className={embedded ? 'out-cards' : 'grid gap-4'}>
             {outputs.data.map((output) => (
               <OutputCard
                 key={output.id}
+                embedded={embedded}
                 output={output}
                 playbackPath={playbackPaths.get(output.id)}
                 playbackCollision={playbackCollisions.has(output.id)}
