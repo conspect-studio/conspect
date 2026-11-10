@@ -1,0 +1,28 @@
+/* Routing & outputs — exact round-4 rules, namespaced. */
+[data-approved-page="routing"]{--bg-1:#10131a;--bg-2:#161b23;--bg-3:#1d242e;--bg-4:#232b36;--line:#232b36;--line-2:#2e3947;--text-1:#e8ecf1;--text-2:#9aa4b2;--text-3:#7d8794;--green:#3dd68c;--green-dim:#123524;--amber:#e8a33d;--amber-dim:#4a3515;--blue:#6aa6ff;--r-sm:6px;--r-md:10px;--r-lg:14px;--tap:48px;color:var(--text-1)}
+[data-approved-page="routing"] .route-truth{display:flex;gap:12px;align-items:center;flex-wrap:wrap;background:var(--bg-1);border:1px solid var(--line);border-radius:var(--r-md);padding:8px 14px;margin-bottom:14px}
+[data-approved-page="routing"] .pgm-readout{display:inline-flex;align-items:center;gap:12px;min-height:var(--tap);padding:6px 14px;border-radius:var(--r-sm);border:1px solid var(--line-2);background:var(--bg-2);color:var(--text-1)}
+[data-approved-page="routing"] .pgm-readout b{font-size:15px}
+[data-approved-page="routing"] .lbl{font-size:12px;letter-spacing:.08em;text-transform:uppercase;color:var(--text-3);margin:0}
+[data-approved-page="routing"] .pending-summary{font-size:12px;color:var(--amber);font-weight:700}
+[data-approved-page="routing"] .route-grid{display:grid;grid-template-columns:minmax(0,1.5fr) minmax(0,1fr);gap:14px;align-items:start}
+[data-approved-page="routing"] .patch-block,[data-approved-page="routing"] .outputs-block{background:var(--bg-1);border:1px solid var(--line);border-radius:var(--r-lg);padding:14px;min-width:0}
+[data-approved-page="routing"] .block-head{display:flex;justify-content:space-between;align-items:center;gap:8px;flex-wrap:wrap;margin-bottom:10px}
+[data-approved-page="routing"] .block-head h2{margin:0;font-size:15px;font-weight:800}
+[data-approved-page="routing"] .route-picker{display:grid;gap:12px;margin-bottom:12px}
+[data-approved-page="routing"] .rp-sources{display:grid;gap:8px}
+[data-approved-page="routing"] .rp-note{font-size:12px;color:var(--text-2);margin:0}
+[data-approved-page="routing"] .rp-row{display:flex;align-items:center;gap:10px;width:100%;min-height:var(--tap);padding:8px 14px;text-align:left;border:1px solid var(--line-2);border-radius:var(--r-md);background:var(--bg-2);color:var(--text-1)}
+[data-approved-page="routing"] .rp-row b{font-size:14px}
+[data-approved-page="routing"] .rp-row .rp-cur{font-size:12px;color:var(--text-2)}
+[data-approved-page="routing"] .rp-row[aria-pressed="true"]{border-color:var(--blue);box-shadow:inset 0 0 0 1px var(--blue)}
+[data-approved-page="routing"] .rp-row .pill{margin-left:auto;font-size:12px;font-weight:700;color:var(--text-3);border:1px solid var(--line-2);border-radius:999px;padding:2px 10px}
+[data-approved-page="routing"] .rp-row .pill-live{color:var(--green);border-color:var(--green);background:var(--green-dim)}
+[data-approved-page="routing"] .patch-legend{font-size:12px;color:var(--text-3);margin:2px 2px 0}
+[data-approved-page="routing"] .plan-panel{margin-top:12px;padding:14px;border-radius:var(--r-md);background:var(--bg-2);border:1px solid var(--amber-dim);display:grid;gap:12px}
+[data-approved-page="routing"] .plan-panel h3{margin:0;font-size:13px}
+[data-approved-page="routing"] .plan-actions{display:flex;gap:8px;flex-wrap:wrap}
+[data-approved-page="routing"] .plan-actions button,[data-approved-page="routing"] .rp-row,[data-approved-page="routing"] input,[data-approved-page="routing"] [role="combobox"]{min-height:var(--tap)}
+[data-approved-page="routing"] .route-form{max-width:none}
+[data-approved-page="routing"] :focus-visible{outline:2px solid var(--blue);outline-offset:3px}
+@media (max-width:1279px){[data-approved-page="routing"] .route-grid{grid-template-columns:1fr}}

@@ -1067,8 +1067,21 @@ const RESOURCE_CONTEXT: ResourceContext = {};
 
 const NO_ERRORS = {};
 
-/** Outputs management. */
+/** Outputs management (standalone `/outputs` route). */
 export function OutputsPage(): JSX.Element {
+  return <OutputsSurface />;
+}
+
+/**
+ * The Outputs controller + cards. `embedded` renders it as the Routing page's
+ * "Output sinks" block (block heading + New action instead of the page
+ * header); the CRUD dialogs, ETag flows and cards are identical in both.
+ */
+export function OutputsSurface({
+  embedded = false,
+}: {
+  readonly embedded?: boolean;
+}): JSX.Element {
   const { t } = useLingui();
   const outputs = useOutputs();
   const routing = useAudioRouting();
@@ -1184,6 +1197,20 @@ export function OutputsPage(): JSX.Element {
 
   return (
     <>
+      {embedded ? (
+        <div className="block-head" data-testid="output-sinks-head">
+          <h2>
+            <Trans>Output sinks</Trans>
+          </h2>
+          <div data-testid="output-header-actions" className="flex min-w-0 max-w-full flex-wrap items-center gap-2">
+            <ExportConfigButton compact />
+            <Button data-testid="crud-new" className="h-auto min-h-12 min-w-12 max-w-full whitespace-normal break-words py-2" onClick={openCreate}>
+              <Plus aria-hidden="true" />
+              <Trans>New output</Trans>
+            </Button>
+          </div>
+        </div>
+      ) : (
       <div
         data-testid="output-page-header"
         className="min-w-0 max-w-full [&>div>div]:min-w-0 [&>div>div]:max-w-full"
@@ -1210,6 +1237,7 @@ export function OutputsPage(): JSX.Element {
         }
       />
       </div>
+      )}
 
       <ApplySemanticsCallout
         helpTo="/help/config#outputs"
