@@ -3321,6 +3321,267 @@
         }
       }
     },
+    "/api/v1/media/captures": {
+      "post": {
+        "tags": [
+          "media-captures"
+        ],
+        "operationId": "create",
+        "parameters": [
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "description": "Required; same key and body replays the same job.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CaptureBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "202": {
+            "description": "Capture job accepted."
+          },
+          "400": {
+            "description": "Invalid body, terms or missing key.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid credentials.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Not authorized.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Unknown target player.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Key reused with a different body.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Capture unavailable or queue full.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/media/captures/capabilities": {
+      "get": {
+        "tags": [
+          "media-captures"
+        ],
+        "operationId": "capabilities",
+        "responses": {
+          "200": {
+            "description": "Honest capture capabilities."
+          },
+          "401": {
+            "description": "Missing or invalid credentials.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/media/captures/{id}": {
+      "get": {
+        "tags": [
+          "media-captures"
+        ],
+        "operationId": "get",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Capture job id.",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "format": "int64",
+              "minimum": 0
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Job status.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/JobView"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Unknown or not owned.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/media/captures/{id}/artifact": {
+      "get": {
+        "tags": [
+          "media-captures"
+        ],
+        "operationId": "artifact",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Capture job id.",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "format": "int64",
+              "minimum": 0
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Artifact bytes (video/quicktime)."
+          },
+          "404": {
+            "description": "Unknown or not owned.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Stream capacity exhausted.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/media/captures/{id}/cancel": {
+      "post": {
+        "tags": [
+          "media-captures"
+        ],
+        "operationId": "cancel",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Capture job id.",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "format": "int64",
+              "minimum": 0
+            }
+          },
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "description": "Required.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "202": {
+            "description": "Cancellation accepted."
+          },
+          "404": {
+            "description": "Unknown or not owned.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Already finished or key conflict.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/v1/media/players": {
       "get": {
         "tags": [
@@ -10291,6 +10552,37 @@
         ],
         "description": "`OpenAPI` mirror of `multiview_config::CaptionSelector` (tagged by `mode`)."
       },
+      "CaptureBody": {
+        "type": "object",
+        "description": "One authorized, bounded public Windy view. Premium needs a configured secret resolver.",
+        "required": [
+          "fill_id",
+          "view",
+          "terms"
+        ],
+        "properties": {
+          "fill_id": {
+            "type": "string",
+            "description": "Fill authorization object."
+          },
+          "target_player": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Optional existing media player; validated by the route when supplied.\nStandalone artifact capture needs none; no player-load is implied."
+          },
+          "terms": {
+            "$ref": "#/components/schemas/Terms",
+            "description": "User acceptance checked against the current template version."
+          },
+          "view": {
+            "$ref": "#/components/schemas/View",
+            "description": "Site parameters, never a URL or executable path."
+          }
+        },
+        "additionalProperties": false
+      },
       "CastSessionDoc": {
         "type": "object",
         "description": "One ephemeral cast session as the API serves it: the descriptive record\nplus the live lifecycle state.",
@@ -11636,6 +11928,41 @@
           "x-nmos-api": {
             "$ref": "#/components/schemas/NmosApiClaim",
             "description": "The NMOS per-API access grant — `x-nmos-api`."
+          }
+        }
+      },
+      "JobView": {
+        "type": "object",
+        "description": "Public job status projection with no URL, credentials, document or disk path.",
+        "required": [
+          "job_id",
+          "fill_id",
+          "state"
+        ],
+        "properties": {
+          "artifact_id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Present only after the immutable artifact is committed."
+          },
+          "fill_id": {
+            "type": "string",
+            "description": "Authorized fill identity."
+          },
+          "job_id": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Stable opaque job number.",
+            "minimum": 0
+          },
+          "resources": {
+            "description": "Estimated producer resources; GPU remains unknown."
+          },
+          "state": {
+            "type": "string",
+            "description": "Queued, running, succeeded, failed, cancelled or uncertain."
           }
         }
       },
@@ -16236,6 +16563,25 @@
           }
         }
       },
+      "Terms": {
+        "type": "object",
+        "description": "Explicit versioned site-terms acceptance.",
+        "required": [
+          "accepted",
+          "version"
+        ],
+        "properties": {
+          "accepted": {
+            "type": "boolean",
+            "description": "Must be true."
+          },
+          "version": {
+            "type": "string",
+            "description": "Must match the built-in template version."
+          }
+        },
+        "additionalProperties": false
+      },
       "Ticket": {
         "type": "object",
         "description": "A ticket: a `CS-xxxx` id, the subject + severity, the auto-attached machine\ncontext, an append-only update thread (opening body first), and the route +\nstate. The portal sync mirrors this local resource over the later transport.",
@@ -16615,6 +16961,71 @@
             "description": "The label text to display."
           }
         }
+      },
+      "View": {
+        "type": "object",
+        "description": "Site-specific bounded view.",
+        "required": [
+          "lat",
+          "lon",
+          "zoom",
+          "overlay",
+          "width",
+          "height",
+          "fps",
+          "frames"
+        ],
+        "properties": {
+          "fps": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Capture cadence.",
+            "minimum": 0
+          },
+          "frames": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Capture frame count.",
+            "minimum": 0
+          },
+          "height": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Pixel height.",
+            "minimum": 0
+          },
+          "lat": {
+            "type": "number",
+            "format": "double",
+            "description": "Latitude."
+          },
+          "lon": {
+            "type": "number",
+            "format": "double",
+            "description": "Longitude."
+          },
+          "overlay": {
+            "type": "string",
+            "description": "Radar or wind."
+          },
+          "public": {
+            "type": "boolean",
+            "description": "Explicitly use the public unauthenticated page. Default requests Premium."
+          },
+          "width": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Pixel width.",
+            "minimum": 0
+          },
+          "zoom": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Map zoom.",
+            "minimum": 0
+          }
+        },
+        "additionalProperties": false
       },
       "WallClockUseDoc": {
         "type": "string",

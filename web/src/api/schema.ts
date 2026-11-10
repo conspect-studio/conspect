@@ -1038,6 +1038,86 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/media/captures": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post: operations["create"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/media/captures/capabilities": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["capabilities"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/media/captures/{id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/media/captures/{id}/artifact": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["artifact"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/media/captures/{id}/cancel": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post: operations["cancel"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/media/players": {
         parameters: {
             query?: never;
@@ -3024,6 +3104,20 @@ export interface components {
             /** @description Filesystem path to the sidecar. */
             path: string;
         };
+        /** @description One authorized, bounded public Windy view. Premium needs a configured secret resolver. */
+        CaptureBody: {
+            /** @description Fill authorization object. */
+            fill_id: string;
+            /**
+             * @description Optional existing media player; validated by the route when supplied.
+             *     Standalone artifact capture needs none; no player-load is implied.
+             */
+            target_player?: string | null;
+            /** @description User acceptance checked against the current template version. */
+            terms: components["schemas"]["Terms"];
+            /** @description Site parameters, never a URL or executable path. */
+            view: components["schemas"]["View"];
+        };
         /**
          * @description One ephemeral cast session as the API serves it: the descriptive record
          *     plus the live lifecycle state.
@@ -3777,6 +3871,22 @@ export interface components {
             sub: string;
             /** @description The NMOS per-API access grant — `x-nmos-api`. */
             "x-nmos-api"?: components["schemas"]["NmosApiClaim"];
+        };
+        /** @description Public job status projection with no URL, credentials, document or disk path. */
+        JobView: {
+            /** @description Present only after the immutable artifact is committed. */
+            artifact_id?: string | null;
+            /** @description Authorized fill identity. */
+            fill_id: string;
+            /**
+             * Format: int64
+             * @description Stable opaque job number.
+             */
+            job_id: number;
+            /** @description Estimated producer resources; GPU remains unknown. */
+            resources?: unknown;
+            /** @description Queued, running, succeeded, failed, cancelled or uncertain. */
+            state: string;
         };
         /**
          * @description `OpenAPI` mirror of [`multiview_licence::LadderState`] (the seven conditions).
@@ -5782,6 +5892,13 @@ export interface components {
             /** @description The schema version (stable across machine + portal). */
             version: string;
         };
+        /** @description Explicit versioned site-terms acceptance. */
+        Terms: {
+            /** @description Must be true. */
+            accepted: boolean;
+            /** @description Must match the built-in template version. */
+            version: string;
+        };
         /**
          * @description A ticket: a `CS-xxxx` id, the subject + severity, the auto-attached machine
          *     context, an append-only update thread (opening body first), and the route +
@@ -5985,6 +6102,48 @@ export interface components {
             cell: string;
             /** @description The label text to display. */
             text: string;
+        };
+        /** @description Site-specific bounded view. */
+        View: {
+            /**
+             * Format: int32
+             * @description Capture cadence.
+             */
+            fps: number;
+            /**
+             * Format: int32
+             * @description Capture frame count.
+             */
+            frames: number;
+            /**
+             * Format: int32
+             * @description Pixel height.
+             */
+            height: number;
+            /**
+             * Format: double
+             * @description Latitude.
+             */
+            lat: number;
+            /**
+             * Format: double
+             * @description Longitude.
+             */
+            lon: number;
+            /** @description Radar or wind. */
+            overlay: string;
+            /** @description Explicitly use the public unauthenticated page. Default requests Premium. */
+            public?: boolean;
+            /**
+             * Format: int32
+             * @description Pixel width.
+             */
+            width: number;
+            /**
+             * Format: int32
+             * @description Map zoom.
+             */
+            zoom: number;
         };
         /**
          * @description `OpenAPI` mirror of `multiview_config::WallClockUse` (ADR-0038 verb).
@@ -8705,6 +8864,225 @@ export interface operations {
             };
             /** @description An unrecognised level or kind filter. */
             422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
+    create: {
+        parameters: {
+            query?: never;
+            header: {
+                /** @description Required; same key and body replays the same job. */
+                "Idempotency-Key": string;
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["CaptureBody"];
+            };
+        };
+        responses: {
+            /** @description Capture job accepted. */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Invalid body, terms or missing key. */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Missing or invalid credentials. */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Not authorized. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Unknown target player. */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Key reused with a different body. */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Capture unavailable or queue full. */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
+    capabilities: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Honest capture capabilities. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Missing or invalid credentials. */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
+    get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Capture job id. */
+                id: number;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Job status. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["JobView"];
+                };
+            };
+            /** @description Unknown or not owned. */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
+    artifact: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Capture job id. */
+                id: number;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Artifact bytes (video/quicktime). */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Unknown or not owned. */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Stream capacity exhausted. */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
+    cancel: {
+        parameters: {
+            query?: never;
+            header: {
+                /** @description Required. */
+                "Idempotency-Key": string;
+            };
+            path: {
+                /** @description Capture job id. */
+                id: number;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Cancellation accepted. */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Unknown or not owned. */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Already finished or key conflict. */
+            409: {
                 headers: {
                     [name: string]: unknown;
                 };
