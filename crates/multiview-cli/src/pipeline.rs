@@ -62,9 +62,9 @@
 //!   `gpl-codecs`. No FFI lives here — the crate stays `unsafe_code = forbid`.
 
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, SyncSender, TrySendError};
+use std::sync::Arc;
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
@@ -73,7 +73,7 @@ use ffmpeg_next::format::Pixel;
 use ffmpeg_next::util::frame::Video;
 
 use crate::binding_delivery::{
-    BindingDelivery, BindingPolicy, DeliveryLimits, LeasedPacket, WindowDelivery, tick_span,
+    tick_span, BindingDelivery, BindingPolicy, DeliveryLimits, LeasedPacket, WindowDelivery,
 };
 use crate::rendition_dispatch::{BindingConfig, DispatchConfig, DtsTimeBase, RenditionDispatcher};
 use crate::rendition_workers::{
@@ -81,9 +81,9 @@ use crate::rendition_workers::{
 };
 use multiview_compositor::blend::LinearRgba;
 use multiview_compositor::pipeline::{CanvasColor, Nv12Image};
-use multiview_config::{MultiviewConfig, Output, Source, SourceKind, SrtBackend, SrtOptions};
 #[cfg(feature = "rist")]
-use multiview_config::{RistOptions, lower_rist_url};
+use multiview_config::{lower_rist_url, RistOptions};
+use multiview_config::{MultiviewConfig, Output, Source, SourceKind, SrtBackend, SrtOptions};
 use multiview_control::EngineStateSnapshot;
 use multiview_core::frame::FrameMeta;
 use multiview_core::layout::{Cell, Layout};
@@ -108,7 +108,7 @@ use multiview_output::sink::{
     AudioRenditionEncoder, EncodeConfig, PacketMuxOutcome, PacketMuxSink, PacketSource,
     PushProtocol, VideoRenditionEncoder,
 };
-use multiview_output::{DisplayMatrix, display_matrix};
+use multiview_output::{display_matrix, DisplayMatrix};
 
 /// The per-subscriber drop-oldest depth of the engine's outbound event stream.
 /// The pipeline has no realtime consumers wired here, but the publisher still
@@ -599,8 +599,8 @@ fn select_admission_pick(
     use multiview_core::pixel::PixelFormat;
     use multiview_core::traits::BackendKind;
     use multiview_hal::{
-        Capability, CostBudget, GpuCandidate, Pins, PipelineDemand, PlacementPolicy, Resolution,
-        Stage, StageCaps, TileLoad, select_device,
+        select_device, Capability, CostBudget, GpuCandidate, Pins, PipelineDemand, PlacementPolicy,
+        Resolution, Stage, StageCaps, TileLoad,
     };
 
     let loads = load_source.poll();
@@ -775,8 +775,8 @@ fn select_live_decode_placement(
     use multiview_core::pixel::PixelFormat;
     use multiview_core::traits::BackendKind;
     use multiview_hal::{
-        Capability, CostBudget, GpuCandidate, Pins, PipelineDemand, PlacementPolicy, Resolution,
-        Stage, StageCaps, TileLoad, select_device,
+        select_device, Capability, CostBudget, GpuCandidate, Pins, PipelineDemand, PlacementPolicy,
+        Resolution, Stage, StageCaps, TileLoad,
     };
 
     // Fresh measured load at decision time (the ADR-W018 §7 re-poll): a
@@ -5549,10 +5549,10 @@ fn spawn_failed_sink(reason: String) -> JoinHandle<Result<SinkRunOutcome, Pipeli
 /// hanging `stop` forever.
 #[cfg(test)]
 mod egress_fatal_tests {
-    use super::{PipelineError, SINK_WEDGE_GRACE, StreamEgress, stop_on_egress_failure};
+    use super::{stop_on_egress_failure, PipelineError, StreamEgress, SINK_WEDGE_GRACE};
     use multiview_engine::StopSignal;
-    use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, AtomicI64, AtomicUsize, Ordering};
+    use std::sync::Arc;
     use std::time::{Duration, Instant};
 
     /// Build an egress around a given consumer thread handle (unit-level: no
@@ -7283,8 +7283,8 @@ impl FaultDetector {
         source_probes: std::collections::HashMap<String, SourceProbeOverride>,
     ) -> Self {
         use multiview_engine::{
-            AlarmHysteresis, BlackConfig, BlackProbe, FreezeConfig, FreezeProbe,
-            black_config_from_kind, freeze_config_from_kind,
+            black_config_from_kind, freeze_config_from_kind, AlarmHysteresis, BlackConfig,
+            BlackProbe, FreezeConfig, FreezeProbe,
         };
         // Dwell windows on the media timeline. Black/silence raise after ~0.5 s of
         // the condition and clear after ~0.3 s of its absence; freeze needs a
@@ -7294,21 +7294,21 @@ impl FaultDetector {
             MediaTime::from_nanos(secs_num.saturating_mul(1_000_000_000) / secs_den.max(1))
         };
         let down = dwell(3, 10); // 0.3 s
-        // The CLI freeze probe widens only the PER-SAMPLE tolerance vs the engine
-        // default — the root cause of the missed badge was tolerance, not the
-        // change threshold. Instrumented across the three real demo sources scaled
-        // to a 636x356 tile, the changed-fraction with diff_tolerance=6 was:
-        //   frozen:  median 0.000%, max 1.27%, 148/150 frames <= 0.1%
-        //   silent:  median 0.229%, max 1.91%,   4/150 frames <= 0.1%  (moving)
-        //   healthy: median 3.13%,  max 71%,      5/150 frames <= 0.1%
-        // diff_tolerance=6 collapses GOP re-quantization noise (the frozen source's
-        // per-GOP spike drops from 1.2-4.6% at the default tolerance 2 to <= 1.27%,
-        // its steady frames to 0.000%); the engine-default change_threshold (0.1%)
-        // is KEPT because at tolerance 6 it already separates a frozen feed (148/150
-        // below) from a moving-but-silent feed (only 4/150 below). An earlier 0.5%
-        // threshold over-loosened this and wrongly flagged the moving silent tile.
-        // The two residual per-GOP spikes the frozen source still shows are absorbed
-        // by the debounce window below, not by a looser threshold.
+                                 // The CLI freeze probe widens only the PER-SAMPLE tolerance vs the engine
+                                 // default — the root cause of the missed badge was tolerance, not the
+                                 // change threshold. Instrumented across the three real demo sources scaled
+                                 // to a 636x356 tile, the changed-fraction with diff_tolerance=6 was:
+                                 //   frozen:  median 0.000%, max 1.27%, 148/150 frames <= 0.1%
+                                 //   silent:  median 0.229%, max 1.91%,   4/150 frames <= 0.1%  (moving)
+                                 //   healthy: median 3.13%,  max 71%,      5/150 frames <= 0.1%
+                                 // diff_tolerance=6 collapses GOP re-quantization noise (the frozen source's
+                                 // per-GOP spike drops from 1.2-4.6% at the default tolerance 2 to <= 1.27%,
+                                 // its steady frames to 0.000%); the engine-default change_threshold (0.1%)
+                                 // is KEPT because at tolerance 6 it already separates a frozen feed (148/150
+                                 // below) from a moving-but-silent feed (only 4/150 below). An earlier 0.5%
+                                 // threshold over-loosened this and wrongly flagged the moving silent tile.
+                                 // The two residual per-GOP spikes the frozen source still shows are absorbed
+                                 // by the debounce window below, not by a looser threshold.
         let freeze_cfg = FreezeConfig::default().with_tolerance(6);
         // Build the per-source config-derived analysers ONCE from any declared
         // black/freeze probe (its operator-authored threshold + zone). A declared
@@ -8357,7 +8357,7 @@ impl LiveIngestSpawner {
 #[allow(clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
 mod live_edit_audio_regression_tests {
     use super::*;
-    use crate::live_sources::{LiveSourceHub, SourceSpawn, shared_stores};
+    use crate::live_sources::{shared_stores, LiveSourceHub, SourceSpawn};
     use multiview_audio::{AudioFormat, ChannelLayout, ProgramBus};
     use multiview_framestore::{NoSignalPolicy, TileThresholds};
     use std::io::{Read, Write};
@@ -9249,11 +9249,9 @@ mod live_audio_spawn_tests {
         let store =
             spawn_live_audio(&source, &stop, &registry, 0, 0).expect("network source has audio");
         assert!(store.is_timeline(), "live audio is locked to vision");
-        assert!(
-            registry
-                .lock()
-                .is_ok_and(|map| map.contains_key("live-audio-1/audio"))
-        );
+        assert!(registry
+            .lock()
+            .is_ok_and(|map| map.contains_key("live-audio-1/audio")));
     }
 
     /// A runtime bars edit gets a synchronous tone, not a decode worker.
@@ -11979,8 +11977,8 @@ fn resolve_incontainer_sub_route(
     selector: &multiview_config::schema::CaptionSelector,
     location: &SourceLocation,
 ) -> Option<(InContainerSubRoute, Arc<crate::captions::CueStore>)> {
-    use multiview_ffmpeg::Demuxer;
     use multiview_ffmpeg::convert::MediaKind;
+    use multiview_ffmpeg::Demuxer;
 
     // Only a local-path container can be opened by `Demuxer` here; a `Ts` URL
     // source is decoded by the URL ingest path and is out of this MVP's scope.
@@ -12722,8 +12720,8 @@ fn connect_ndi_receiver(
 mod ndi_license_gate_tests {
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
     use super::*;
-    use multiview_input::ndi::NdiLoadStatus;
     use multiview_input::ndi::license::LicenseAcceptance;
+    use multiview_input::ndi::NdiLoadStatus;
 
     fn complete_audit() -> LicenseAcceptance {
         LicenseAcceptance {
@@ -12777,7 +12775,7 @@ mod ndi_egress_tests {
     use multiview_output::ndi::license::LicenseAcceptance;
     use multiview_output::ndi::{FakeNdiApi, NdiLicense, NdiOutput};
 
-    use super::{NdiCanvasFrame, ndi_timecode_100ns, run_ndi_output};
+    use super::{ndi_timecode_100ns, run_ndi_output, NdiCanvasFrame};
 
     fn accepted() -> NdiLicense {
         NdiLicense::accept(LicenseAcceptance {
@@ -13202,8 +13200,8 @@ const AES67_RX_BRIDGE_CAP: usize = 512;
 /// dedicated runtime worker.
 #[cfg(feature = "aes67")]
 fn drive_aes67_rx(plan: &Aes67RxPlan, stop: &AtomicBool) {
-    use multiview_input::st2110::Aes67AudioProducer;
     use multiview_input::st2110::transport::{MulticastInterface, RtpReceiver};
+    use multiview_input::st2110::Aes67AudioProducer;
 
     let runtime = match tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -13390,7 +13388,7 @@ fn timeline_pts(
 /// off and retries while the tile degrades; it is never a panic.
 #[cfg(feature = "youtube")]
 fn resolve_youtube_master(watch_url: &str) -> Result<String, String> {
-    use multiview_input::youtube::reresolve::{ProcessResolver, Resolver, ingest_url};
+    use multiview_input::youtube::reresolve::{ingest_url, ProcessResolver, Resolver};
 
     // A dedicated current-thread runtime for this one resolve. `yt-dlp`'s own hard
     // timeout (ResolverConfig::default) bounds the await, so this never blocks the
@@ -13466,7 +13464,7 @@ fn youtube_reresolve_thread(
     stop: &AtomicBool,
 ) {
     use multiview_input::youtube::reresolve::{
-        ProcessResolver, ReresolveConfig, SystemUnixClock, run_reresolve_loop,
+        run_reresolve_loop, ProcessResolver, ReresolveConfig, SystemUnixClock,
     };
 
     let runtime = match tokio::runtime::Builder::new_current_thread()
@@ -16822,7 +16820,7 @@ mod prime_wait_tests {
     use multiview_engine::ManualTimeSource;
     use multiview_framestore::{NoSignalPolicy, TileStore, TileThresholds};
 
-    use super::{PRIME_WAIT_POLL, wait_for_prime};
+    use super::{wait_for_prime, PRIME_WAIT_POLL};
 
     /// A tiny NV12 frame to publish so a store reads primed.
     fn frame() -> Nv12Image {
@@ -16942,9 +16940,9 @@ mod reconnect_tests {
     use std::time::Duration;
 
     use super::{
-        INGEST_RECONNECT_BASE, INGEST_RECONNECT_CAP, INGEST_RECONNECT_HEALTHY,
-        INGEST_RECONNECT_MAX_ATTEMPT, INGEST_RW_TIMEOUT, JitterRng, SourceLocation,
-        ingest_open_options, is_hls_location, next_reconnect_attempt, reconnect_backoff,
+        ingest_open_options, is_hls_location, next_reconnect_attempt, reconnect_backoff, JitterRng,
+        SourceLocation, INGEST_RECONNECT_BASE, INGEST_RECONNECT_CAP, INGEST_RECONNECT_HEALTHY,
+        INGEST_RECONNECT_MAX_ATTEMPT, INGEST_RW_TIMEOUT,
     };
 
     #[test]
@@ -17307,7 +17305,7 @@ mod youtube_tests {
     use multiview_core::time::Rational;
     use multiview_framestore::{NoSignalPolicy, TileStore, TileThresholds};
 
-    use super::{SourceLocation, ingest_open_options, ingest_plan_for, youtube_open_url};
+    use super::{ingest_open_options, ingest_plan_for, youtube_open_url, SourceLocation};
 
     /// Build a `youtube` `Source` via serde (the type is `#[non_exhaustive]`, so a
     /// struct literal is not available cross-crate — config is produced by
@@ -17475,7 +17473,7 @@ mod youtube_tests {
         }
     }
 
-    use multiview_input::youtube::reresolve::{ManualClock, ReresolveConfig, run_reresolve_loop};
+    use multiview_input::youtube::reresolve::{run_reresolve_loop, ManualClock, ReresolveConfig};
     use multiview_input::youtube::{LiveStatus, ResolvedHls, YoutubeError};
 
     fn resolved(tag: &str, expire_unix: i64) -> ResolvedHls {
@@ -17616,7 +17614,7 @@ mod ndi_tests {
     use multiview_core::time::Rational;
     use multiview_framestore::{NoSignalPolicy, TileStore, TileThresholds};
 
-    use super::{SourceLocation, ingest_plan_for};
+    use super::{ingest_plan_for, SourceLocation};
 
     /// Build an `ndi` `Source` via serde (the kind is `#[non_exhaustive]`, so a
     /// struct literal is not available cross-crate; config is deserialized anyway).
@@ -17682,7 +17680,7 @@ mod rist_tests {
     use multiview_framestore::{NoSignalPolicy, TileStore, TileThresholds};
 
     use super::{
-        RunnableOutput, SourceLocation, build_outputs, ingest_plan_for, rist_resolved_url,
+        build_outputs, ingest_plan_for, rist_resolved_url, RunnableOutput, SourceLocation,
     };
 
     fn rist_source(json: serde_json::Value) -> Source {
@@ -17809,8 +17807,8 @@ buffer_ms = 700
 #[cfg(test)]
 mod srt_wiring_tests {
     use super::{
-        PipelineError, RunnableOutput, SourceLocation, audio_ingest_plan_for, build_outputs,
-        ingest_plan_for, srt_resolved_url,
+        audio_ingest_plan_for, build_outputs, ingest_plan_for, srt_resolved_url, PipelineError,
+        RunnableOutput, SourceLocation,
     };
     use multiview_compositor::pipeline::CanvasColor;
     use multiview_config::{Output, Source};
@@ -18131,12 +18129,12 @@ mod live_source_registry_tests {
     //! exactly one startup source's producers (including its caption reader).
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
-    use std::sync::Arc;
     use std::sync::atomic::Ordering;
+    use std::sync::Arc;
 
     use multiview_config::MultiviewConfig;
 
-    use super::{IngestSupervisor, ingest_plan_for};
+    use super::{ingest_plan_for, IngestSupervisor};
     use crate::live_sources::stop_registry;
 
     /// A minimal config carrying one never-connecting RTSP source.
@@ -18246,11 +18244,9 @@ segment_ms = 1000
         );
         assert_eq!(super::live_lifecycle("net1"), before.saturating_add(1));
         assert!(pipeline.live_caption_stores.load().get("net1").is_none());
-        assert!(
-            store
-                .active_at_generation(MediaTime::from_nanos(1), original)
-                .is_none()
-        );
+        assert!(store
+            .active_at_generation(MediaTime::from_nanos(1), original)
+            .is_none());
         // The same id reappears with captions. Its token must not reset,
         // or a held old picture could render its new cue.
         let token = pipeline
@@ -18272,11 +18268,9 @@ segment_ms = 1000
         )
         .expect("cue");
         store.publish_for_generation(token, fresh.start(), fresh.end(), fresh);
-        assert!(
-            store
-                .active_at_generation(old_picture.pts, old_picture.generation)
-                .is_none()
-        );
+        assert!(store
+            .active_at_generation(old_picture.pts, old_picture.generation)
+            .is_none());
         assert!(store.active_at_generation(old_picture.pts, token).is_some());
     }
 
@@ -18440,7 +18434,7 @@ mod shed_emission_tests {
     //! wired in `drive_streaming`.
     use multiview_events::{Event, ShedReason, ShedScope};
 
-    use super::{SHED_EVENT_EVERY_TICKS, shed_load_event};
+    use super::{shed_load_event, SHED_EVENT_EVERY_TICKS};
 
     #[test]
     fn no_drop_emits_nothing() {
@@ -18972,7 +18966,7 @@ mod outmeta_wiring_tests {
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
     use super::output_mux_meta;
-    use multiview_output::{MetadataScope, display_matrix_degrees};
+    use multiview_output::{display_matrix_degrees, MetadataScope};
 
     fn output_from(json: serde_json::Value) -> multiview_config::Output {
         serde_json::from_value(json).expect("output deserializes")
@@ -20835,7 +20829,7 @@ mod live_stamper_tests {
     use multiview_core::time::MediaTime;
     use multiview_engine::{ManualTimeSource, TimeSource};
 
-    use super::{LIVE_JITTER_HOLD, LiveStamper};
+    use super::{LiveStamper, LIVE_JITTER_HOLD};
 
     const SECOND: i64 = 1_000_000_000;
 
@@ -21006,11 +21000,11 @@ mod program_bus_gain_tests {
 
 #[cfg(test)]
 mod packet_reader_tests {
-    use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::Arc;
     use std::time::{Duration, Instant};
 
-    use super::{ReadItem, prebuffer, spawn_packet_reader};
+    use super::{prebuffer, spawn_packet_reader, ReadItem};
 
     fn wait_until(deadline: Duration, mut cond: impl FnMut() -> bool) -> bool {
         let end = Instant::now() + deadline;
@@ -21596,29 +21590,27 @@ segment_ms = 1000
         std::fs::create_dir_all(&dir).unwrap();
         let cert = dir.join("cert.pem");
         let key = dir.join("key.pem");
-        assert!(
-            std::process::Command::new("openssl")
-                .args([
-                    "req",
-                    "-x509",
-                    "-newkey",
-                    "rsa:2048",
-                    "-nodes",
-                    "-days",
-                    "1",
-                    "-subj",
-                    "/CN=localhost",
-                    "-keyout"
-                ])
-                .arg(&key)
-                .arg("-out")
-                .arg(&cert)
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .status()
-                .unwrap()
-                .success()
-        );
+        assert!(std::process::Command::new("openssl")
+            .args([
+                "req",
+                "-x509",
+                "-newkey",
+                "rsa:2048",
+                "-nodes",
+                "-days",
+                "1",
+                "-subj",
+                "/CN=localhost",
+                "-keyout"
+            ])
+            .arg(&key)
+            .arg("-out")
+            .arg(&cert)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .unwrap()
+            .success());
         let transport = multiview_moq::provider::Runtime::listen_files(
             "[::1]:0".parse().unwrap(),
             "https://localhost".into(),

@@ -19,9 +19,9 @@
 //! external token.
 #![allow(dead_code)] // reason: published registry + tap seam; the reviewed wiring is the single `WindowDelivery` wrap at the egress construction point (output-owner change in this series).
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender, TryRecvError, TrySendError};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use ffmpeg_next as ffmpeg;
