@@ -363,6 +363,44 @@ describe("AudioPage", () => {
     expect(lastPut).toBeUndefined();
   });
 
+  it("multi-finger drags leave every untouched fader (and the hidden focused mirror) at its value", async () => {
+    renderAudio();
+    await console();
+    for (let i = 0; i < 3; i += 1) await userEvent.click(screen.getByTestId("audio-add-route"));
+    const bank = screen.getByTestId("audio-bank");
+    const faders = within(bank).getAllByTestId("audio-fader");
+    expect(faders).toHaveLength(4);
+    for (const f of faders) vi.spyOn(f, "getBoundingClientRect").mockReturnValue(new DOMRect(0, 0, 56, 240));
+    const all = (): string[] =>
+      screen.getAllByTestId("audio-fader").map((f) => f.getAttribute("aria-valuenow") ?? "");
+    const pe = (type: string, id: number, y: number): PointerEvent => {
+      const e = new MouseEvent(type, { bubbles: true, cancelable: true, clientY: y, button: 0 });
+      Object.defineProperty(e, "pointerId", { value: id });
+      Object.defineProperty(e, "pointerType", { value: "touch" });
+      return e as unknown as PointerEvent;
+    };
+    const y = (db: number): number => 24 + 192 * (1 - (db + 60) / 60);
+    const before = all();
+    // Fingers on bank faders 2 and 3 (indices 1, 2) only; fader 4 and the
+    // focused-strip mirror (route 0) have no finger.
+    const [, b, c] = faders;
+    const fb = required(b, "fader 2");
+    const fc = required(c, "fader 3");
+    fireEvent(fb, pe("pointerdown", 1, y(Number(fb.getAttribute("aria-valuenow")))));
+    fireEvent(fc, pe("pointerdown", 2, y(Number(fc.getAttribute("aria-valuenow")))));
+    fireEvent(fb, pe("pointermove", 1, y(-20)));
+    fireEvent(fc, pe("pointermove", 2, y(-40)));
+    fireEvent(fb, pe("pointermove", 1, y(-25)));
+    fireEvent(fb, pe("pointerup", 1, y(-25)));
+    fireEvent(fc, pe("pointerup", 2, y(-40)));
+    const after = all();
+    const changed = after.map((v, i) => (v !== before[i] ? i : -1)).filter((i) => i >= 0);
+    // bank order is [0,1,2,3] then the focused mirror at index 4; only 1 and 2 may change.
+    expect(changed).toEqual([1, 2]);
+    expect(after[1]).toBe("-25");
+    expect(after[2]).toBe("-40");
+  });
+
   it("keeps strip identity and focus stable while the draft changes (stable keys)", async () => {
     renderAudio();
     const { focused } = await console();

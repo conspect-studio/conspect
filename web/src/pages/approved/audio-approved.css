@@ -295,3 +295,45 @@
   [data-approved-page="audio"] .audio-listen-note { display: block; flex: 1 1 100%; text-align: center; }
   [data-approved-page="audio"] [data-testid="audio-strip-essential"] { max-width: 100%; }
 }
+
+/* Fix9 — Program loudness cards: wrap, never overflow the card, units stay visible. */
+[data-approved-page="audio"] .strip-master > section [data-testid="loudness-integrated"],
+[data-approved-page="audio"] .strip-master > section [data-testid="loudness-true-peak"] { min-width: 0; }
+[data-approved-page="audio"] .strip-master > section [data-testid="loudness-integrated"] > span,
+[data-approved-page="audio"] .strip-master > section [data-testid="loudness-true-peak"] > span { flex-wrap: wrap; min-width: 0; }
+[data-approved-page="audio"] .strip-master > section .grid { grid-template-columns: repeat(auto-fit, minmax(128px, 1fr)); }
+[data-approved-page="audio"] .strip-master > section [data-testid^="loudness-"] { min-width: 0; overflow-wrap: anywhere; }
+[data-approved-page="audio"] .strip-master > section [data-testid^="loudness-"] .font-mono { white-space: nowrap; }
+[data-approved-page="audio"] .strip-master > section [data-testid="loudness-integrated"] .text-2xl { font-size: 20px; }
+
+/* Fix9 — bank below xl: wrap into rows (no strip is ever cut mid-way). */
+@media (max-width: 1279px) {
+  [data-approved-page="audio"] .strip-bank {
+    grid-auto-flow: row; grid-template-columns: repeat(auto-fill, minmax(176px, 1fr)); grid-auto-columns: auto; overflow-x: visible;
+  }
+}
+/* Fix9 — xl+: a bank with more strips than fit scrolls with snap + a visible bar. */
+@media (min-width: 1280px) {
+  [data-approved-page="audio"] .strip-bank {
+    scroll-snap-type: x mandatory; scrollbar-width: auto; scrollbar-color: var(--blue) var(--bg-3);
+    grid-auto-columns: minmax(124px, 1fr);
+  }
+  [data-approved-page="audio"] .strip-bank > div { scroll-snap-align: start; }
+  /* Rail: overview on the right across both rows, PROGRAM/loudness UNDER the bank (no dead area). */
+  [data-approved-page="audio"] .mixer { grid-template-columns: minmax(0, 1fr) 210px; grid-template-rows: auto auto auto; column-gap: 14px; row-gap: 12px; }
+  [data-approved-page="audio"] .mixer-main { grid-column: 1; grid-row: 1; }
+  [data-approved-page="audio"] .master-col { display: contents; width: auto; max-width: none; }
+  [data-approved-page="audio"] .master-col > .hidden.xl\:block { display: block; grid-column: 2; grid-row: 1 / span 3; min-width: 0; align-self: start; }
+  [data-approved-page="audio"] .master-col > .strip-master { grid-column: 1; grid-row: 2; }
+  [data-approved-page="audio"] .master-col > .mix-note { grid-column: 1; grid-row: 3; }
+  [data-approved-page="audio"] .strip-master > section .grid { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+}
+/* Compact PROGRAM row in the whole-mix list. */
+[data-approved-page="audio"] [data-testid="audio-overview-program"] > span:nth-child(2),
+[data-approved-page="audio"] [data-testid="audio-overview-program"] > span:nth-child(4) { display: none; }
+[data-approved-page="audio"] [data-testid="audio-overview-program"] { min-height: 0; padding: 6px 10px; }
+[data-approved-page="audio"] .audio-nudge-btn:disabled { opacity: 1; background: var(--bg-1); color: var(--text-3); border-style: dashed; }
+[data-approved-page="audio"] [data-testid="audio-save"]:disabled { opacity: 1; background: var(--bg-2); color: var(--text-3); border: 1px dashed var(--line-2); }
+@media (min-width: 1280px) {
+  [data-approved-page="audio"] .strip-bank { grid-auto-columns: minmax(124px, 1fr); }
+}

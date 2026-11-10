@@ -106,3 +106,23 @@
 [data-approved-page="routing"] .patch-table thead th.src-h{z-index:4}
 [data-approved-page="routing"] .xpt{min-width:56px}
 }
+
+/* Fix9: disabled primary actions (Plan/Take) must read as disabled, never as a lit white button. */
+[data-approved-page="routing"] button:disabled,[data-approved-page="routing"] button[aria-disabled="true"]{background:var(--bg-1);color:var(--text-3);border:1px dashed var(--line-2);opacity:1;cursor:not-allowed}
+/* Fix9: visible scroll affordance on the crosspoint grid: always-on scrollbar + edge shadows that fade when scrolled to the end. */
+[data-approved-page="routing"] .patch-wrap[data-testid="crosspoint-grid"]{
+  background:
+    linear-gradient(to right,var(--bg-1) 30%,transparent) left center/32px 100% no-repeat local,
+    linear-gradient(to left,var(--bg-1) 30%,transparent) right center/32px 100% no-repeat local,
+    linear-gradient(to bottom,var(--bg-1) 30%,transparent) center top/100% 24px no-repeat local,
+    linear-gradient(to top,var(--bg-1) 30%,transparent) center bottom/100% 24px no-repeat local,
+    radial-gradient(farthest-side at 0 50%,rgba(106,166,255,.45),transparent) left center/14px 100% no-repeat scroll,
+    radial-gradient(farthest-side at 100% 50%,rgba(106,166,255,.45),transparent) right center/14px 100% no-repeat scroll,
+    radial-gradient(farthest-side at 50% 0,rgba(106,166,255,.45),transparent) center top/100% 14px no-repeat scroll,
+    radial-gradient(farthest-side at 50% 100%,rgba(106,166,255,.45),transparent) center bottom/100% 14px no-repeat scroll;
+  scrollbar-width:auto;scrollbar-color:var(--blue) var(--bg-3);
+}
+[data-approved-page="routing"] .patch-wrap::-webkit-scrollbar{width:12px;height:12px;-webkit-appearance:none}
+[data-approved-page="routing"] .patch-wrap::-webkit-scrollbar-track{background:var(--bg-3);border-radius:6px}
+[data-approved-page="routing"] .patch-wrap::-webkit-scrollbar-thumb{background:var(--blue);border-radius:6px;border:2px solid var(--bg-3)}
+[data-approved-page="routing"] .patch-table th.patch-src,[data-approved-page="routing"] .patch-table th.src-h{background:var(--bg-1);box-shadow:1px 0 0 var(--line-2)}

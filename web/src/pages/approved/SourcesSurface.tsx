@@ -382,10 +382,10 @@ export function SourcesSurface(props: SourcesSurfaceProps): JSX.Element {
               {identity(source, true)}
               {failure(source)}
               <div className="sc-pills">
-                <span className="lbl"><Trans>Signal</Trans></span>{signal(source)}
-                <span className="lbl"><Trans>Lifecycle</Trans></span>{lifecycle(source)}
-                <span className="lbl"><Trans>Activation</Trans></span>{activation(source)}
-                <span className="lbl"><Trans>Tally</Trans></span>{tally(source)}
+                <div className="sc-meta-item"><span className="lbl"><Trans>Signal</Trans></span><div>{signal(source)}</div></div>
+                <div className="sc-meta-item"><span className="lbl"><Trans>Lifecycle</Trans></span><div>{lifecycle(source)}</div></div>
+                <div className="sc-meta-item"><span className="lbl"><Trans>Activation</Trans></span><div>{activation(source)}</div></div>
+                <div className="sc-meta-item"><span className="lbl"><Trans>Tally</Trans></span><div>{tally(source)}</div></div>
               </div>
               <div className="sc-actions">
                 {lifecycleActions(source)}

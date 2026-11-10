@@ -223,3 +223,19 @@
 .bd-lock span{font-size:12px}
 }
 @media(max-width:767px){.bd-mark{display:none}.bd-top{gap:6px;padding:6px 8px}.bd-health [role=status]>:first-child{padding:6px 8px}.bd-top-actions{gap:4px;min-width:0}.bd-icon{min-width:48px;padding:0 6px}}
+
+/* Fix9: disabled CUT must not look lit; compact brand back at tablet widths; desk monitors fill the row height. */
+.broadcast-shell .bd-takes button.bd-cut:disabled{background:#2a1a1d;color:#b88a8e;border-color:#6b3a40}
+.broadcast-shell .bd-takes button:disabled{opacity:1}
+@media(min-width:768px) and (max-width:1279px){
+.bd-wordmark{display:inline;font-size:13px;letter-spacing:.08em}
+.bd-brand{min-width:0;padding:0 6px 0 0;gap:6px}
+.bd-tabs{gap:0}
+.bd-tabs a{padding:0 7px;font-size:13px}
+}
+@media(min-width:1280px){
+.bd-desk-grid{align-items:stretch}
+.bd-pgm,.bd-pvw{display:flex;flex-direction:column}
+.bd-pgm .bd-picture,.bd-pvw .bd-picture{flex:1 1 auto;max-height:none;aspect-ratio:auto;min-height:150px}
+.bd-wall,.bd-rail{align-self:start}
+}
