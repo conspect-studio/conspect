@@ -338,24 +338,28 @@ impl Provider {
             .ok_or_else(|| ControlError::Conflict("capture has no completed artifact".into()))?;
         let artifact = multiview_webengine::artifact::ArtifactId::parse(&artifact)
             .map_err(|_| ControlError::Repository("invalid capture artifact identity".into()))?;
-        let pin_request = self
-            .pin_requests
-            .clone()
-            .try_acquire_owned()
-            .map_err(|_| ControlError::EngineBusy)?;
-        let lease = self
-            .service
-            .as_ref()
-            .ok_or(ControlError::EngineBusy)?
-            .pin(&artifact, &p.key_id)
-            .map_err(|_| ControlError::EngineBusy)?;
-        drop(pin_request);
+        let lease = self.with_pin_request(|| {
+            self.service
+                .as_ref()
+                .ok_or(ControlError::EngineBusy)?
+                .pin(&artifact, &p.key_id)
+                .map_err(|_| ControlError::EngineBusy)
+        })?;
         let permit = self
             .streams
             .clone()
             .try_acquire_owned()
             .map_err(|_| ControlError::EngineBusy)?;
         Ok((lease, permit))
+    }
+
+    fn with_pin_request<T>(&self, pin: impl FnOnce() -> ControlResult<T>) -> ControlResult<T> {
+        let _request = self
+            .pin_requests
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| ControlError::EngineBusy)?;
+        pin()
     }
 
     /// Cancel an actor-owned, authorized job under an idempotency key. Blocking.
@@ -431,5 +435,40 @@ fn submit_error(error: SubmitError) -> ControlError {
         SubmitError::Persistence => {
             ControlError::Repository("capture intent could not be persisted".into())
         }
+    }
+}
+
+#[cfg(test)]
+mod pin_admission_tests {
+    #[test]
+    fn two_failed_pin_waits_release_admission_and_do_not_consume_stream_slots() {
+        use std::sync::{Arc, Barrier};
+        let provider = super::Provider::default();
+        let entered = Arc::new(Barrier::new(3));
+        let release = Arc::new(Barrier::new(3));
+        let mut joins = Vec::new();
+        for _ in 0..2 {
+            let provider = provider.clone();
+            let entered = entered.clone();
+            let release = release.clone();
+            joins.push(std::thread::spawn(move || {
+                provider.with_pin_request::<()>(|| {
+                    entered.wait();
+                    release.wait();
+                    Err(crate::error::ControlError::EngineBusy)
+                })
+            }));
+        }
+        entered.wait();
+        assert_eq!(provider.pin_requests.available_permits(), 0);
+        assert_eq!(provider.streams.available_permits(), 2);
+        assert!(provider.with_pin_request(|| Ok(())).is_err());
+        release.wait();
+        for join in joins {
+            assert!(join.join().is_ok_and(|result| result.is_err()));
+        }
+        assert_eq!(provider.pin_requests.available_permits(), 2);
+        assert_eq!(provider.streams.available_permits(), 2);
+        assert!(provider.with_pin_request(|| Ok(())).is_ok());
     }
 }
