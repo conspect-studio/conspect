@@ -32,9 +32,9 @@ mod master;
 mod media;
 mod pdt;
 
-pub use live::LivePlaylist;
 #[cfg(feature = "ffmpeg")]
 pub(crate) use live::{atomic_write, media_segment_references, media_segment_uris};
+pub use live::{LivePlaylist, ManifestWriter};
 pub use master::{AudioRendition, MasterPlaylist, VariantStream};
 pub use media::{MediaPlaylist, Part, Segment, SegmentType, ServerControl};
 pub use pdt::format_program_date_time;

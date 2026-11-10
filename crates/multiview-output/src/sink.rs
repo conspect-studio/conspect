@@ -1760,6 +1760,8 @@ impl PacketMuxSink {
                 if next != 0 {
                     live.set_initial_discontinuity();
                 }
+                // #220: manifest write + fsync + rename off the packet path.
+                live.enable_background_publish()?;
                 state.seg_index = next;
                 state.live = Some(live);
                 state.set_audio_renditions(
@@ -1769,7 +1771,7 @@ impl PacketMuxSink {
                     video,
                     audio,
                     track_streams,
-                );
+                )?;
                 let driven = state.drive_from_packets(source);
                 finish_segments(state, driven, video.time_base)
                     .map(|result| PacketMuxOutcome::Segment(Box::new(result)))
@@ -1876,6 +1878,9 @@ struct AudioRenditions<'a> {
     video: AudioRenditionState<'a>,
     master: PathBuf,
     master_text: Option<String>,
+    /// The master is static for a run: written once (#220), not re-fsynced on
+    /// every segment close.
+    master_published: bool,
     retention_window: usize,
 }
 
@@ -1942,7 +1947,7 @@ impl<'a> SegmentState<'a> {
         video: MuxStream<'a>,
         audio: Option<MuxStream<'a>>,
         tracks: &'a [MuxStream<'a>],
-    ) {
+    ) -> Result<()> {
         let default_selection = AudioSelection::default();
         let selection = self
             .tracks
@@ -1956,6 +1961,7 @@ impl<'a> SegmentState<'a> {
                 let uri = format!("audio-program-g{generation}.m3u8");
                 let mut live = LivePlaylist::new(parent.join(&uri), window);
                 live.set_epoch_source(epoch.clone());
+                live.enable_background_publish()?;
                 live.set_media_sequence(self.seg_index);
                 if self.seg_index != 0 {
                     live.set_initial_discontinuity();
@@ -1983,6 +1989,7 @@ impl<'a> SegmentState<'a> {
             let uri = format!("audio-track{}-g{generation}.m3u8", track.index);
             let mut live = LivePlaylist::new(parent.join(&uri), window);
             live.set_epoch_source(epoch.clone());
+            live.enable_background_publish()?;
             live.set_media_sequence(self.seg_index);
             if self.seg_index != 0 {
                 live.set_initial_discontinuity();
@@ -2007,6 +2014,7 @@ impl<'a> SegmentState<'a> {
         let video_uri = format!("video-g{generation}.m3u8");
         let mut video_live = LivePlaylist::new(parent.join(&video_uri), window);
         video_live.set_epoch_source(epoch);
+        video_live.enable_background_publish()?;
         video_live.set_media_sequence(self.seg_index);
         if self.seg_index != 0 {
             video_live.set_initial_discontinuity();
@@ -2065,8 +2073,10 @@ impl<'a> SegmentState<'a> {
             },
             master: parent.join("master.m3u8"),
             master_text: bandwidth.map(|_| master.render()),
+            master_published: false,
             retention_window: window,
         });
+        Ok(())
     }
 
     fn open_audio_segments(&mut self, index: u64) -> Result<()> {
@@ -2451,18 +2461,20 @@ impl<'a> SegmentState<'a> {
                 segment.start_pts.as_nanos(),
             )?;
         }
-        if let Some(renditions) = self.renditions.as_ref() {
+        if let Some(renditions) = self.renditions.as_mut() {
             // Publish master last, after video and every audio playlist exist.
             // A run without valid video bitrate metadata still serves the legacy
             // index and media playlists, but never publishes a false BANDWIDTH.
             if let Some(master_text) = renditions.master_text.as_ref() {
-                if renditions
-                    .states
-                    .iter()
-                    .all(|state| state.live.playlist_path().exists())
+                if !renditions.master_published
+                    && renditions
+                        .states
+                        .iter()
+                        .all(|state| state.live.playlist_path().exists())
                     && renditions.video.live.playlist_path().exists()
                 {
                     atomic_write(&renditions.master, master_text.as_bytes())?;
+                    renditions.master_published = true;
                 }
             } else if renditions.video.live.playlist_path().exists() {
                 // No trustworthy BANDWIDTH: retire the previous master only once

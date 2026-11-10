@@ -20,6 +20,7 @@ use std::collections::{HashSet, VecDeque};
 use std::ffi::OsString;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Condvar, Mutex};
 
 use super::{MediaPlaylist, Segment, SegmentType};
 use crate::epoch::SharedEpoch;
@@ -66,6 +67,9 @@ pub struct LivePlaylist {
     epoch_generation: Option<u64>,
     /// A new encoder run starts an independent timestamp sequence.
     initial_discontinuity: bool,
+    /// The off-packet-path publisher (#220), when enabled. `None` keeps the
+    /// original synchronous publish (write + fsync + rename inline).
+    background: Option<BackgroundPublisher>,
 }
 
 impl LivePlaylist {
@@ -85,7 +89,40 @@ impl LivePlaylist {
             epoch: None,
             epoch_generation: None,
             initial_discontinuity: false,
+            background: None,
         }
+    }
+
+    /// Publish manifests on a dedicated `hls-publish` thread instead of inline
+    /// (#220, `docs/architecture/hls-manifest-publication.md`): each
+    /// [`push_closed_segment`](Self::push_closed_segment) renders in memory and
+    /// hands the newest manifest to the publisher through a latest-wins slot, so
+    /// a slow `fsync` can never block the caller (the sink's packet path).
+    /// A publish error is reported by a later call or by
+    /// [`finalize`](Self::finalize). Idempotent.
+    ///
+    /// # Errors
+    /// Returns [`Error::Output`] if the publisher thread cannot be spawned.
+    pub fn enable_background_publish(&mut self) -> Result<()> {
+        self.enable_background_publish_with(Arc::new(|path: &Path, bytes: &[u8]| {
+            atomic_write(path, bytes)
+        }))
+    }
+
+    /// [`enable_background_publish`](Self::enable_background_publish) with an
+    /// injectable manifest writer — the seam the slow-disk chaos tests use.
+    ///
+    /// # Errors
+    /// Returns [`Error::Output`] if the publisher thread cannot be spawned.
+    #[doc(hidden)]
+    pub fn enable_background_publish_with(&mut self, writer: ManifestWriter) -> Result<()> {
+        if self.background.is_none() {
+            self.background = Some(BackgroundPublisher::spawn(
+                self.playlist_path.clone(),
+                writer,
+            )?);
+        }
+        Ok(())
     }
 
     /// Set the next media sequence when a restarted run uses non-reused segment names.
@@ -182,6 +219,25 @@ impl LivePlaylist {
         next_playlist.push_segment(segment);
         // TARGETDURATION must be >= every EXTINF still listed, as an integer.
         next_playlist.recompute_target_duration();
+        if self.background.is_some() {
+            // Off the packet path: surface an earlier publish failure, then hand
+            // the newest manifest + the segments it retired to the publisher.
+            if let Some(background) = self.background.as_ref() {
+                background.take_error()?;
+            }
+            let text = next_playlist.render();
+            self.commit(next_playlist, next_generation, path);
+            let mut retired = Vec::new();
+            while self.retired_paths.len() > self.window.max(3) {
+                if let Some(expired) = self.retired_paths.pop_front() {
+                    retired.push(expired);
+                }
+            }
+            if let Some(background) = self.background.as_ref() {
+                background.submit(text, retired, false);
+            }
+            return Ok(());
+        }
         atomic_write(&self.playlist_path, next_playlist.render().as_bytes())?;
         self.playlist = next_playlist;
         self.initial_discontinuity = false;
@@ -219,7 +275,25 @@ impl LivePlaylist {
     /// written.
     pub fn finalize(&mut self) -> Result<()> {
         self.playlist.set_finished(true);
+        if let Some(background) = self.background.take() {
+            background.submit(self.playlist.render(), Vec::new(), true);
+            return background.join();
+        }
         self.publish()
+    }
+
+    /// Commit an accepted segment close to the in-memory state (background mode):
+    /// the playlist, epoch generation, and the listed/retired segment queues.
+    fn commit(&mut self, playlist: MediaPlaylist, generation: Option<u64>, path: PathBuf) {
+        self.playlist = playlist;
+        self.initial_discontinuity = false;
+        self.epoch_generation = generation;
+        self.seg_paths.push_back(path);
+        while self.seg_paths.len() > self.window {
+            if let Some(evicted) = self.seg_paths.pop_front() {
+                self.retired_paths.push_back(evicted);
+            }
+        }
     }
 
     /// Render the current playlist and atomically publish it to `playlist_path`.
@@ -375,5 +449,170 @@ fn temp_path(path: &Path) -> PathBuf {
     match path.parent() {
         Some(parent) => parent.join(name),
         None => PathBuf::from(name),
+    }
+}
+
+/// A manifest writer: `(path, bytes)` → durable atomic publish. Production uses
+/// [`atomic_write`]; tests inject slow or failing writers.
+pub type ManifestWriter = Arc<dyn Fn(&Path, &[u8]) -> Result<()> + Send + Sync>;
+
+/// The most retired segments a run of failed publishes may carry before the
+/// oldest are dropped from the list (left on disk, never unlinked) — keeps a
+/// persistently failing disk from growing memory without bound.
+const MAX_CARRIED_RETIRED: usize = 1024;
+
+/// One pending publish: the newest manifest text, every segment retired since the
+/// last successful publish, and whether this is the final (`ENDLIST`) manifest.
+#[derive(Debug, Default)]
+struct Pending {
+    text: Option<String>,
+    retired: Vec<PathBuf>,
+    last: bool,
+}
+
+#[derive(Debug, Default)]
+struct Slot {
+    pending: Pending,
+    error: Option<String>,
+    finished: bool,
+}
+
+/// Latest-wins hand-off between the sink (producer) and the `hls-publish` thread.
+struct Shared {
+    slot: Mutex<Slot>,
+    wake: Condvar,
+}
+
+/// The off-packet-path manifest publisher (#220).
+struct BackgroundPublisher {
+    shared: Arc<Shared>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl std::fmt::Debug for BackgroundPublisher {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BackgroundPublisher")
+            .finish_non_exhaustive()
+    }
+}
+
+impl BackgroundPublisher {
+    fn spawn(playlist_path: PathBuf, writer: ManifestWriter) -> Result<Self> {
+        let shared = Arc::new(Shared {
+            slot: Mutex::new(Slot::default()),
+            wake: Condvar::new(),
+        });
+        let worker = Arc::clone(&shared);
+        let thread = std::thread::Builder::new()
+            .name("hls-publish".to_owned())
+            .spawn(move || publisher_main(&worker, &playlist_path, &writer))
+            .map_err(|e| Error::Output(format!("spawning hls-publish thread: {e}")))?;
+        Ok(Self {
+            shared,
+            thread: Some(thread),
+        })
+    }
+
+    /// Replace the pending manifest (latest wins) and append newly retired
+    /// segments. Never blocks on I/O: the mutex is only held for this swap.
+    fn submit(&self, text: String, retired: Vec<PathBuf>, last: bool) {
+        let mut slot = lock(&self.shared.slot);
+        slot.pending.text = Some(text);
+        slot.pending.retired.extend(retired);
+        let overflow = slot
+            .pending
+            .retired
+            .len()
+            .saturating_sub(MAX_CARRIED_RETIRED);
+        if overflow > 0 {
+            slot.pending.retired.drain(..overflow);
+        }
+        slot.pending.last |= last;
+        drop(slot);
+        self.shared.wake.notify_one();
+    }
+
+    /// Return (and clear) the error of a failed background publish, if any.
+    fn take_error(&self) -> Result<()> {
+        match lock(&self.shared.slot).error.take() {
+            Some(e) => Err(Error::Output(e)),
+            None => Ok(()),
+        }
+    }
+
+    /// Wait for the final manifest to be published and the thread to exit.
+    fn join(mut self) -> Result<()> {
+        if let Some(thread) = self.thread.take() {
+            thread
+                .join()
+                .map_err(|_| Error::Output("hls-publish thread panicked".to_owned()))?;
+        }
+        self.take_error()
+    }
+}
+
+impl Drop for BackgroundPublisher {
+    fn drop(&mut self) {
+        // An abandoned (never finalized) playlist: let the thread finish the
+        // pending publish and exit; do not wait on it here.
+        lock(&self.shared.slot).finished = true;
+        self.shared.wake.notify_one();
+    }
+}
+
+/// Lock the slot, recovering from poisoning (the data is plain values; a panic
+/// elsewhere must not wedge publication).
+fn lock(m: &Mutex<Slot>) -> std::sync::MutexGuard<'_, Slot> {
+    m.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// The `hls-publish` loop: take the newest pending manifest, publish it, then
+/// prune the segments it retired that no on-disk manifest still lists. A failed
+/// publish keeps its retired segments for the next attempt and records the error.
+fn publish_one(shared: &Shared, playlist_path: &Path, writer: &ManifestWriter, job: Pending) {
+    let Some(text) = job.text else { return };
+    match writer(playlist_path, text.as_bytes()) {
+        Ok(()) => {
+            let references = playlist_path.parent().and_then(media_segment_references);
+            if let Some(references) = references {
+                for expired in job.retired {
+                    let name = expired.file_name().unwrap_or_default().to_os_string();
+                    if !references.contains(&name) {
+                        prune_segment(&expired);
+                    }
+                }
+            }
+        }
+        Err(e) => {
+            let mut slot = lock(&shared.slot);
+            // Keep the retired segments for the next successful publish (older
+            // first) so nothing listed by the last good manifest is unlinked.
+            let mut carried = job.retired;
+            carried.append(&mut slot.pending.retired);
+            slot.pending.retired = carried;
+            slot.error = Some(e.to_string());
+        }
+    }
+}
+
+fn publisher_main(shared: &Shared, playlist_path: &Path, writer: &ManifestWriter) {
+    loop {
+        let (job, exit) = {
+            let mut slot = lock(&shared.slot);
+            while slot.pending.text.is_none() && !slot.finished {
+                slot = shared
+                    .wake
+                    .wait(slot)
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+            }
+            let job = std::mem::take(&mut slot.pending);
+            let exit = job.last || (slot.finished && job.text.is_none());
+            (job, exit)
+        };
+        let last = job.last;
+        publish_one(shared, playlist_path, writer, job);
+        if exit || last {
+            return;
+        }
     }
 }

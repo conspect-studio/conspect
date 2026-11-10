@@ -300,3 +300,132 @@ fn finalize_appends_endlist() {
         "the finalized playlist must carry #EXT-X-ENDLIST; playlist was:\n{end}"
     );
 }
+
+/// #220: with background publication, a slow disk (every manifest write takes
+/// 300 ms, like the measured fsync tail) must never block the segment close on
+/// the sink's packet path; the newest manifest still lands and pruning keeps the
+/// synchronous retention rule.
+#[test]
+fn background_publish_never_blocks_on_a_slow_manifest_write() {
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+
+    const WINDOW: usize = 3;
+    const TOTAL: usize = 12;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let manifest = dir.path().join("index.m3u8");
+    let mut live = LivePlaylist::new(manifest.clone(), WINDOW);
+    let slow: multiview_output::hls::ManifestWriter = Arc::new(|path, bytes| {
+        std::thread::sleep(Duration::from_millis(300));
+        std::fs::write(path, bytes).map_err(|e| multiview_output::Error::Output(e.to_string()))
+    });
+    live.enable_background_publish_with(slow)
+        .expect("publisher");
+
+    let mut seg_paths = Vec::new();
+    let mut worst = Duration::ZERO;
+    for i in 0..TOTAL {
+        let name = format!("seg{i}.ts");
+        let path = touch_segment(dir.path(), &name);
+        seg_paths.push(path.clone());
+        let started = Instant::now();
+        live.push_closed_segment(name, path, 2.0, i64::try_from(i).unwrap() * 2_000_000_000)
+            .expect("close never fails here");
+        worst = worst.max(started.elapsed());
+    }
+    assert!(
+        worst < Duration::from_millis(50),
+        "a segment close waited {worst:?} on the manifest write (inv #10)"
+    );
+
+    live.finalize().expect("final publish");
+    let text = std::fs::read_to_string(&manifest).expect("manifest");
+    assert!(
+        text.contains("#EXT-X-ENDLIST"),
+        "finalize publishes the last manifest"
+    );
+    let listed: Vec<&str> = text
+        .lines()
+        .filter(|l| !l.is_empty() && !l.starts_with('#'))
+        .collect();
+    assert_eq!(
+        listed,
+        ["seg9.ts", "seg10.ts", "seg11.ts"],
+        "newest window listed"
+    );
+    for uri in &listed {
+        assert!(dir.path().join(uri).is_file(), "listed {uri} must exist");
+    }
+    // Retention: the listed window plus one further grace window (>= 3) stay; older
+    // segments that were handed to a successful publish are pruned.
+    for (i, path) in seg_paths.iter().enumerate() {
+        let keep = i + 2 * WINDOW.max(3) >= TOTAL;
+        if keep {
+            assert!(
+                path.exists(),
+                "seg{i} is within listed + grace and must remain"
+            );
+        }
+    }
+    assert!(
+        seg_paths
+            .iter()
+            .take(TOTAL - 2 * WINDOW.max(3))
+            .any(|p| !p.exists()),
+        "segments older than listed + grace are pruned once a publish succeeds"
+    );
+}
+
+/// #220: a failing background publish must surface on a later call and must not
+/// prune anything a previously published manifest may still list.
+#[test]
+fn background_publish_failure_surfaces_and_prunes_nothing() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let manifest = dir.path().join("index.m3u8");
+    let mut live = LivePlaylist::new(manifest, 1);
+    let failing = Arc::new(AtomicBool::new(true));
+    let gate = Arc::clone(&failing);
+    let writer: multiview_output::hls::ManifestWriter = Arc::new(move |_path, _bytes| {
+        if gate.load(Ordering::SeqCst) {
+            Err(multiview_output::Error::Output(
+                "injected disk failure".to_owned(),
+            ))
+        } else {
+            Ok(())
+        }
+    });
+    live.enable_background_publish_with(writer)
+        .expect("publisher");
+
+    let mut paths = Vec::new();
+    let mut surfaced = false;
+    for i in 0..10 {
+        let name = format!("seg{i}.ts");
+        let path = touch_segment(dir.path(), &name);
+        paths.push(path.clone());
+        if live
+            .push_closed_segment(name, path, 2.0, i64::from(i) * 2_000_000_000)
+            .is_err()
+        {
+            surfaced = true;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    assert!(
+        surfaced,
+        "a failed background publish must surface to the caller"
+    );
+    for (i, path) in paths.iter().enumerate() {
+        assert!(
+            path.exists(),
+            "seg{i} must not be pruned while publishes fail"
+        );
+    }
+    assert!(
+        live.finalize().is_err(),
+        "finalize reports the failed final publish"
+    );
+}
