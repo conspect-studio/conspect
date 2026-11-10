@@ -349,11 +349,27 @@ describe("AppLayout — single header row", () => {
     alarmRows = [{ id: "a1" }, { id: "a2" }, { id: "a3" }].map((r) => ({ ...r, kind: "SignalLoss", severity: "major", scope: { kind: "system" }, ack: {}, dwell: 0, raised_at: 0, latched: false }));
     const view = renderShell("/a");
     expect(await screen.findByTestId("alarm-count")).toHaveTextContent("3");
+    expect(screen.getByRole("link", { name: "Alarms — 3 active system" })).toBeInTheDocument();
     view.unmount();
     alarmRows = [];
     renderShell("/a");
-    await waitFor(() => { expect(screen.getByRole("link", { name: "Alarms and engine health" })).toBeInTheDocument(); });
+    await waitFor(() => { expect(screen.getByRole("link", { name: "Alarms" })).toBeInTheDocument(); });
     expect(screen.queryByTestId("alarm-count")).toBeNull();
+  });
+
+  it("locks and unlocks with separate controls: unlocked lock never opens the dialog", async () => {
+    const user = userEvent.setup();
+    renderShell("/a");
+    await user.click(screen.getByRole("button", { name: /Takes locked/ }));
+    const dialog = screen.getByRole("dialog", { name: "Unlock time-critical takes?" });
+    await user.click(within(dialog).getByRole("button", { name: "Unlock takes" }));
+    await waitFor(() => { expect(screen.queryByRole("dialog")).toBeNull(); });
+    const unlocked = screen.getByRole("button", { name: /Takes unlocked/ });
+    expect(unlocked).toHaveAttribute("aria-pressed", "false");
+    await user.click(unlocked);
+    expect(screen.queryByRole("dialog")).toBeNull();
+    expect(screen.getByRole("button", { name: /Takes locked/ })).toHaveAttribute("aria-pressed", "true");
+    expect(screen.queryByRole("button", { name: "Unlock takes" })).toBeNull();
   });
 
   it("marks the active drawer item with the approved token, not an inverted fill", async () => {

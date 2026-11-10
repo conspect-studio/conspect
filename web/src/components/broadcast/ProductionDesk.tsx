@@ -1,5 +1,5 @@
 import { deskControlReason, tallyForSource } from './deskSafety';
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import type { JSX } from 'react';
 import { Trans, useLingui } from '@lingui/react/macro';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
@@ -24,8 +24,10 @@ import { Dialog, DialogContent, DialogTitle } from '../ui/dialog';
 import { useOperationFeedback, useSubmitTrackedOperation } from './useOperationFeedback';
 import { OperationFeedback } from './OperationFeedback';
 import { useTakeLock } from './BroadcastShell';
+import { tickConfirmed, useTickAdvancedAt } from './tickObservation';
 
 const STATE_KEY = ['switcher', 'me1'] as const;
+const SENDING = '\u0000sending';
 function PreviewMonitor({ program, source, fresh }: { readonly program: boolean; readonly source: string | undefined; readonly fresh: boolean }): JSX.Element {
   const { t } = useLingui();
   const caps = usePreviewCapabilities();
@@ -74,6 +76,8 @@ export function ProductionDesk(): JSX.Element {
   const client = useMemo(() => createApiClient(), []);
   const layouts = useLayouts(client);
   const tiles = useLiveTiles();
+  // The tile cache is seeded {} before any snapshot; an empty map means no snapshot yet, not zero tiles.
+  const tilesKnown = tiles.size > 0;
   const [operationId, setOperationId] = useState<string>();
   const operation = useOperationFeedback(operationId);
   const submit = useSubmitTrackedOperation();
@@ -82,12 +86,9 @@ export function ProductionDesk(): JSX.Element {
   const [confirm, setConfirm] = useState<{ action: SwitcherAction; source?: string }>();
   const [frames, setFrames] = useState('25');
   const [now, setNow] = useState(Date.now);
-  const [lastTickAt, setLastTickAt] = useState(0);
-  const submitting = useRef(false);
-  useEffect(() => {
-    const timer = setTimeout(() => { if (state.data?.tick !== undefined) setLastTickAt(Date.now()); }, 0);
-    return () => { clearTimeout(timer); };
-  }, [state.data?.tick]);
+  // 'sending' from click until the tracker record is terminal; then the operation id.
+  const [guard, setGuard] = useState<string>();
+  const advancedAt = useTickAdvancedAt(qc, STATE_KEY.join('/'), state.data?.tick, state.dataUpdatedAt);
   useEffect(() => { const timer = setInterval(() => { setNow(Date.now()); }, 1000); return () => { clearInterval(timer); }; }, []);
   useEffect(() => subscribeRealtime('switcher', (envelope) => {
     if (envelope.t !== 'switcher.operation') return;
@@ -96,23 +97,28 @@ export function ProductionDesk(): JSX.Element {
     void qc.invalidateQueries({ queryKey: STATE_KEY });
   }, undefined, () => { void qc.invalidateQueries({ queryKey: STATE_KEY }); }), [qc, operationId]);
   const settled = operation?.phase === 'applied' || operation?.phase === 'failed';
-  const fresh = !state.isError && state.dataUpdatedAt > 0 && lastTickAt > 0 && now - state.dataUpdatedAt < 6000 && now - lastTickAt < 6000;
-  const reason = deskControlReason(!!state.data, status === 'open', fresh, state.data?.in_flight ?? false, (operationId !== undefined && !settled));
+  // Derived: in flight from click until the record for THIS command is terminal.
+  const inFlight = guard !== undefined && !(guard !== SENDING && guard === operationId && settled);
+  // Fresh = the engine tick was observed ADVANCING and the poll is recent. Socket-open and
+  // poll/refetch time alone never prove the program is on air.
+  const fresh = tickConfirmed(advancedAt, state.dataUpdatedAt, now, state.isError);
+  const baseReason = deskControlReason(!!state.data, status === 'open', fresh, state.data?.in_flight ?? false, operationId !== undefined && !settled);
+  const reason = baseReason ?? (inFlight ? 'Command in flight' : undefined);
   const mutate = useMutation({ mutationFn: async ({ action, source }: { action: SwitcherAction; source?: string }) => {
-    if (reason) throw new Error(reason);
+    if (baseReason) throw new Error(baseReason);
     const req: SwitcherRequest = { me: 'me1', program: 'main', action, ...(source ? { source } : {}), ...(action === 'auto' ? { duration_frames: Number(frames) } : {}) };
     const plan = await planSwitcher(req);
     if (!plan.can_take) throw new Error(t`The engine refused this plan`);
     return submit(() => commandSwitcher(action, req, { idempotencyKey: newIdempotencyKey() }), { topic: 'switcher', resource: 'me1', event: 'switcher.operation', terminal: { kind: 'switcher-operation', me: 'me1' } });
-  }, onSuccess: (result) => { setOperationId(result.operationId); setError(undefined); setFailure(undefined); }, onError: (err: Error) => { setError(err.message); } });
-  const disabled = !!reason || mutate.isPending;
+  }, onSuccess: (result) => { setOperationId(result.operationId); setGuard(result.operationId); setError(undefined); setFailure(undefined); }, onError: (err: Error) => { setError(err.message); setGuard(undefined); } });
+  const disabled = !!reason || mutate.isPending || inFlight;
   const send = (command: { action: SwitcherAction; source?: string }): void => {
-    if (disabled || submitting.current) return;
-    submitting.current = true;
-    mutate.mutate(command, { onSettled: () => { submitting.current = false; } });
+    if (disabled) return;
+    setGuard(SENDING);
+    mutate.mutate(command);
   };
   const request = (action: SwitcherAction, source?: string): void => {
-    if (disabled || submitting.current) return;
+    if (disabled) return;
     const command = { action, ...(source ? { source } : {}) };
     if (action === 'select_program' || (locked && (action === 'cut' || action === 'auto'))) setConfirm(command);
     else send(command);
@@ -130,9 +136,9 @@ export function ProductionDesk(): JSX.Element {
         <details className="bd-more"><summary><Trans>Why AUTO is unavailable · transition options</Trans></summary><p className="bd-unsupported"><Trans>AUTO unavailable: the current engine rejects AUTO with HTTP 422.</Trans></p><label><Trans>AUTO frames</Trans><input aria-label={t`Auto frames`} value={frames} type="number" min="1" max="1000" disabled onChange={(e) => { setFrames(e.target.value); }} /></label></details>
         <details><summary><Trans>More keys — unavailable</Trans></summary><p><Trans>WIPE, DIP, USK, DSK and AUX have no supported control contract.</Trans></p></details>
       </section>
-      <section className="bd-wall"><h2><Trans>Multiview wall</Trans></h2><div className="bd-wall-grid">{sources.data?.map((source) => <div className="bd-wall-tile" key={source.id} data-tile-state={tileForSource(tiles, source.id)?.state ?? 'unknown'} data-tally={tallyForSource(source.id, state.data, fresh && status === 'open')}><SourcePicture id={source.id} /><small>{tallyGlyph(tallyForSource(source.id, state.data, fresh && status === 'open'))}</small><b>{source.name}</b><span><TileLabel tile={tileForSource(tiles, source.id)} /></span></div>)}</div><p>{sources.isError ? t`Source catalog unavailable` : !sources.data?.length ? t`No source catalog available` : t`Tally follows the engine bus IDs; source presence does not prove signal.`}</p><p><Trans>Layouts</Trans>: {layouts.isError ? t`Unavailable` : layouts.data?.length ?? '—'} · <Trans>Observed tiles</Trans>: {tiles.size} · <Link className="bd-link48" to="/monitoring"><Trans>Open live monitoring</Trans></Link></p></section>
+      <section className="bd-wall"><h2><Trans>Multiview wall</Trans></h2><div className="bd-wall-grid">{sources.data?.map((source) => <div className="bd-wall-tile" key={source.id} data-tile-state={tileForSource(tiles, source.id)?.state ?? 'unknown'} data-tally={tallyForSource(source.id, state.data, fresh && status === 'open')}><SourcePicture id={source.id} /><small>{tallyGlyph(tallyForSource(source.id, state.data, fresh && status === 'open'))}</small><b>{source.name}</b><span><TileLabel tile={tileForSource(tiles, source.id)} /></span></div>)}</div><p>{sources.isError ? t`Source catalog unavailable` : !sources.data?.length ? t`No source catalog available` : t`Tally follows the engine bus IDs; source presence does not prove signal.`}</p><p><Trans>Layouts</Trans>: {layouts.isError ? t`Unavailable` : layouts.data?.length ?? '—'} · <Trans>Observed tiles</Trans>: {tilesKnown ? tiles.size : '—'} · <Link className="bd-link48" to="/monitoring"><Trans>Open live monitoring</Trans></Link></p></section>
       <aside className="bd-rail"><section><h2><Trans>Tally legend</Trans></h2><p className="bd-red"><Trans>● Red — PROGRAM</Trans></p><p className="bd-amber"><Trans>● Amber — PREVIEW</Trans></p><p><Trans>○ Dark — neither bus</Trans></p><small><Trans>Tally is separate from signal and output transmission.</Trans></small></section><section><h2><Trans>Alarms & engine health</Trans></h2><div className="bd-alarm-summary" role="region" aria-label={t`Active system alarm summary`}><p><Trans>Active system alarms only</Trans></p>{alarms.isError ? <p><Trans>Alarm summary unavailable</Trans></p> : alarms.isPending ? <p><Trans>Loading alarm summary</Trans></p> : alarms.data.length === 0 ? <p><Trans>No active system alarms reported</Trans></p> : <ul>{alarms.data.slice(0, 3).map((alarm) => <li key={alarm.id} title={`${alarm.severity} · ${alarm.kind}`}><span>{alarm.severity}</span> · {alarm.kind}</li>)}</ul>}</div><Link className="bd-btn" to="/alarms"><Trans>Open alarms</Trans></Link></section></aside>
     </div>
-    <Dialog open={confirm !== undefined} onOpenChange={(open) => { if (!open) setConfirm(undefined); }}><DialogContent><DialogTitle><Trans>Confirm program change</Trans></DialogTitle><p>{confirm?.action.toUpperCase()} · {name(state.data?.program_source) ?? t`Unknown`} → {name(confirm?.source ?? state.data?.preview_source) ?? t`Unknown`}</p><p><Trans>The program bus changes what viewers see. Acceptance is not completion.</Trans></p><button disabled={disabled} onClick={() => { if (confirm) send(confirm); setConfirm(undefined); }}><Trans>Confirm take</Trans></button><button onClick={() => { setConfirm(undefined); }}><Trans>Cancel</Trans></button></DialogContent></Dialog>
+    <Dialog open={confirm !== undefined} onOpenChange={(open) => { if (!open) setConfirm(undefined); }}><DialogContent touchScroll><DialogTitle><Trans>Confirm program change</Trans></DialogTitle><p>{confirm?.action.toUpperCase()} · {name(state.data?.program_source) ?? t`Unknown`} → {name(confirm?.source ?? state.data?.preview_source) ?? t`Unknown`}</p><p><Trans>The program bus changes what viewers see. Acceptance is not completion.</Trans></p><button disabled={disabled} onClick={() => { if (confirm) send(confirm); setConfirm(undefined); }}><Trans>Confirm take</Trans></button><button onClick={() => { setConfirm(undefined); }}><Trans>Cancel</Trans></button></DialogContent></Dialog>
   </section>;
 }
