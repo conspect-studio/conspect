@@ -1,7 +1,7 @@
 import { createContext, useContext, useState } from 'react';
 import type { JSX, ReactNode } from 'react';
 import { Trans, useLingui } from '@lingui/react/macro';
-import { NavLink } from 'react-router-dom';
+import { NavLink, useLocation } from 'react-router-dom';
 import { Bell, Lock, LockOpen, Menu } from 'lucide-react';
 import { useAlarms } from '../../api/alarmsQueries';
 import { Dialog, DialogContent, DialogTitle, DialogTrigger } from '../ui/dialog';
@@ -25,13 +25,15 @@ export function BroadcastShell({ children, managementLabel }: { readonly childre
   // Real count only: unknown (loading/error) renders no badge at all.
   const alarms = useAlarms({ active: true });
   const alarmCount = alarms.isSuccess ? alarms.data.length : undefined;
+  const { pathname } = useLocation();
   const tabs: readonly (readonly [string, string])[] = [
     ['/', t`Desk`], ['/show', t`Show`], ['/sources', t`Sources`],
     ['/audio', t`Audio`], ['/routing', t`Routing`], ['/media-players', t`Media`],
   ];
+  const current = tabs.find(([path]) => (path === '/' ? pathname === '/' : pathname === path || pathname.startsWith(`${path}/`)))?.[1];
   return <TakeLock.Provider value={{ locked }}><div className="broadcast-shell dark">
     <header className="bd-top">
-      <NavLink to="/" className="bd-brand" aria-label={t`CONSPECT Control — Desk`}><span className="bd-mark" aria-hidden="true" /><span className="bd-wordmark">CONSPECT</span> <small><Trans>Control</Trans></small></NavLink>
+      <NavLink to="/" className="bd-brand" aria-label={t`CONSPECT Control — Desk`}><span className="bd-mark" aria-hidden="true" /><span className="bd-wordmark">CONSPECT</span> <small><Trans>Control</Trans></small>{current && <span className="bd-screen-title">{current}</span>}</NavLink>
       <nav className="bd-tabs" aria-label={t`Core screens`}>{tabs.map(([path, label], index) => <NavLink key={path} to={path} end={path === '/'}><span>{index + 1}</span>{label}</NavLink>)}</nav>
       <div className="bd-top-actions">
         <div className="bd-health"><ProducerStatus state="unknown" lastTickAt={null} managementLabel={managementLabel} /></div>

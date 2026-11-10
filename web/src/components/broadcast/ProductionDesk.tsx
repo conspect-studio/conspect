@@ -12,9 +12,11 @@ import { useLayouts } from '../../api/queries';
 import { useAlarms } from '../../api/alarmsQueries';
 import { useSources } from '../../resources/queries';
 import { subscribeRealtime } from '../../realtime/shared';
-import { useEngineEvents, TILES_QUERY_KEY } from '../../realtime/useEngineEvents';
+import { useEngineEvents } from '../../realtime/useEngineEvents';
 import type { LiveTile } from '../../realtime/useEngineEvents';
 import { switcherOperationEvidence } from '../../realtime/operationEvidence';
+import { tileForSource, useLiveTiles } from '../../resources/useLiveTiles';
+import { meterFillPercent, useAudioMeter } from '../../realtime/useAudioMeter';
 import { usePreviewCapabilities } from '../../preview/capabilities';
 import { PreviewSurface } from '../../preview/PreviewSurface';
 import { useJpegPreview } from '../../preview/useJpegPreview';
@@ -31,8 +33,21 @@ function PreviewMonitor({ program, source, fresh }: { readonly program: boolean;
   return <figure className={`bd-monitor ${program ? 'bd-pgm' : 'bd-pvw'}`} data-tally={fresh && source ? (program ? 'program' : 'preview') : 'unknown'}>
     <div className="bd-picture">{program ? <PreviewSurface scope="program" whepEndpoint="/api/v1/preview/program/whep" jpegPath="/api/v1/preview/program.jpg" label={t`Program monitor`} capabilities={caps.data} className="bd-video" /> : pvw ? <img src={pvw} alt={t`Preview monitor`} /> : <span><Trans>Waiting for a real frame</Trans></span>}</div>
     <figcaption><b>{program ? (fresh && source ? t`● ON AIR — PROGRAM` : t`○ PROGRAM — unconfirmed`) : (fresh && source ? t`▲ PREVIEW` : t`△ PREVIEW — unconfirmed`)}</b><span>{source ?? t`Unknown source`}</span><small>{fresh ? t`Engine-confirmed bus` : t`Unconfirmed / stale`}</small></figcaption>
-    {program && <div className="bd-meter-note"><Trans>Audio meters unavailable — no measured level contract</Trans></div>}
+    {program && <ProgramLevels />}
   </figure>;
+}
+
+/** Program L/R levels strictly from the audio.meter telemetry; otherwise explicitly unavailable. */
+function ProgramLevels(): JSX.Element {
+  const { current } = useAudioMeter();
+  if (current === undefined || current.peak_db.length === 0) return <div className="bd-meter-note" data-testid="desk-meters-unavailable"><Trans>Audio meters unavailable — no measured level telemetry</Trans></div>;
+  return <ul className="bd-meters" aria-label="Program meters" data-testid="desk-meters">{current.peak_db.map((db, i) => <li key={i}><span>{current.peak_db.length === 2 ? (i === 0 ? 'L' : 'R') : String(i + 1)}</span><i aria-hidden="true"><em style={{ width: `${String(meterFillPercent(db))}%` }} /></i><b>{db.toFixed(1)} dBFS</b></li>)}</ul>;
+}
+
+/** Truthful wall label from the live tile lifecycle; no tile means unconfirmed. */
+function TileLabel({ tile }: { readonly tile: LiveTile | undefined }): JSX.Element {
+  if (!tile) return <Trans>Signal unconfirmed</Trans>;
+  return tile.state === 'LIVE' ? <Trans>Live</Trans> : tile.state === 'RECONNECTING' ? <Trans>Starting</Trans> : tile.state === 'STALE' ? <Trans>Stale</Trans> : <Trans>No signal</Trans>;
 }
 
 /** Tally text + glyph (never colour alone); unknown stays unknown. */
@@ -58,7 +73,7 @@ export function ProductionDesk(): JSX.Element {
   const alarms = useAlarms({ active: true, scope: 'system' });
   const client = useMemo(() => createApiClient(), []);
   const layouts = useLayouts(client);
-  const tiles = useQuery<Record<string, LiveTile>>({ queryKey: TILES_QUERY_KEY, queryFn: (): Record<string, LiveTile> => ({}), enabled: false, initialData: {} });
+  const tiles = useLiveTiles();
   const [operationId, setOperationId] = useState<string>();
   const operation = useOperationFeedback(operationId);
   const submit = useSubmitTrackedOperation();
@@ -110,12 +125,12 @@ export function ProductionDesk(): JSX.Element {
       <PreviewMonitor program source={name(state.data?.program_source)} fresh={fresh && status === 'open'} />
       <PreviewMonitor program={false} source={name(state.data?.preview_source)} fresh={fresh && status === 'open'} />
       <section className="bd-switcher"><h2><Trans>M/E 1 — Switcher</Trans></h2>
-        <div className="bd-buses">{(['preview', 'program'] as const).map((bus) => <div className={`bd-bus bd-bus-${bus}`} key={bus} role="group" aria-label={bus === 'program' ? t`PGM bus — direct taps always confirm` : t`PVW bus`}><b>{bus === 'program' ? 'PGM' : 'PVW'}</b><div>{sources.data?.map((source) => <button key={source.id} disabled={disabled} title={reason ? `${source.name} — ${reason}` : source.name} aria-pressed={tallyForSource(source.id, state.data, fresh && status === 'open') === bus} onClick={() => { request(bus === 'program' ? 'select_program' : 'select_preview', source.id); }}>{source.name}</button>)}{!sources.data?.length && <span><Trans>No sources available</Trans></span>}</div></div>)}</div>
+        <div className="bd-buses">{(['preview', 'program'] as const).map((bus) => <div className={`bd-bus bd-bus-${bus}`} key={bus} role="group" aria-label={bus === 'program' ? t`PGM bus — direct taps always confirm` : t`PVW bus`}><b>{bus === 'program' ? 'PGM' : 'PVW'}</b><div>{sources.data?.map((source, index) => <button key={source.id} disabled={disabled} title={reason ? `${source.name} — ${reason}` : source.name} aria-pressed={tallyForSource(source.id, state.data, fresh && status === 'open') === bus} onClick={() => { request(bus === 'program' ? 'select_program' : 'select_preview', source.id); }}><i className="bd-idx" aria-hidden="true">{index + 1}</i>{source.name}</button>)}{!sources.data?.length && <span><Trans>No sources available</Trans></span>}</div></div>)}</div>
         <div className="bd-takes"><div className="bd-transitions" role="group" aria-label={t`Transition type — unavailable`}><button disabled aria-pressed="true" title={t`AUTO unavailable: the current engine rejects AUTO with HTTP 422`}>MIX</button><button disabled title={t`WIPE and DIP have no supported control contract`}>WIPE</button><button disabled title={t`WIPE and DIP have no supported control contract`}>DIP</button></div><button className="bd-auto" disabled title={t`AUTO unavailable: the current engine rejects AUTO with HTTP 422`} onClick={() => { request('auto'); }}>AUTO</button><div className="bd-cutrow"><button className="bd-cut" disabled={disabled} aria-describedby="bd-cut-src" onClick={() => { request('cut'); }}>CUT<span aria-hidden="true" className="bd-cut-src"> · {name(state.data?.preview_source) ?? t`source unknown`}</span></button><span id="bd-cut-src" className="sr-only">{t`Cuts to`} {name(state.data?.preview_source) ?? t`unknown source`}</span><Link className="bd-alarm-btn" to="/alarms" aria-label={alarms.isSuccess ? t`Alarms — ${alarms.data.length} active system` : t`Alarms`}>⚠{alarms.isSuccess ? <b>{alarms.data.length}</b> : null}</Link></div></div>
         <details className="bd-more"><summary><Trans>Why AUTO is unavailable · transition options</Trans></summary><p className="bd-unsupported"><Trans>AUTO unavailable: the current engine rejects AUTO with HTTP 422.</Trans></p><label><Trans>AUTO frames</Trans><input aria-label={t`Auto frames`} value={frames} type="number" min="1" max="1000" disabled onChange={(e) => { setFrames(e.target.value); }} /></label></details>
         <details><summary><Trans>More keys — unavailable</Trans></summary><p><Trans>WIPE, DIP, USK, DSK and AUX have no supported control contract.</Trans></p></details>
       </section>
-      <section className="bd-wall"><h2><Trans>Multiview wall</Trans></h2><div className="bd-wall-grid">{sources.data?.map((source) => <div className="bd-wall-tile" key={source.id} data-tally={tallyForSource(source.id, state.data, fresh && status === 'open')}><SourcePicture id={source.id} /><small>{tallyGlyph(tallyForSource(source.id, state.data, fresh && status === 'open'))}</small><b>{source.name}</b><span><Trans>Signal unconfirmed</Trans></span></div>)}</div><p>{sources.isError ? t`Source catalog unavailable` : !sources.data?.length ? t`No source catalog available` : t`Tally follows the engine bus IDs; source presence does not prove signal.`}</p><p><Trans>Layouts</Trans>: {layouts.isError ? t`Unavailable` : layouts.data?.length ?? '—'} · <Trans>Observed tiles</Trans>: {Object.keys(tiles.data).length} · <Link className="bd-link48" to="/monitoring"><Trans>Open live monitoring</Trans></Link></p></section>
+      <section className="bd-wall"><h2><Trans>Multiview wall</Trans></h2><div className="bd-wall-grid">{sources.data?.map((source) => <div className="bd-wall-tile" key={source.id} data-tile-state={tileForSource(tiles, source.id)?.state ?? 'unknown'} data-tally={tallyForSource(source.id, state.data, fresh && status === 'open')}><SourcePicture id={source.id} /><small>{tallyGlyph(tallyForSource(source.id, state.data, fresh && status === 'open'))}</small><b>{source.name}</b><span><TileLabel tile={tileForSource(tiles, source.id)} /></span></div>)}</div><p>{sources.isError ? t`Source catalog unavailable` : !sources.data?.length ? t`No source catalog available` : t`Tally follows the engine bus IDs; source presence does not prove signal.`}</p><p><Trans>Layouts</Trans>: {layouts.isError ? t`Unavailable` : layouts.data?.length ?? '—'} · <Trans>Observed tiles</Trans>: {tiles.size} · <Link className="bd-link48" to="/monitoring"><Trans>Open live monitoring</Trans></Link></p></section>
       <aside className="bd-rail"><section><h2><Trans>Tally legend</Trans></h2><p className="bd-red"><Trans>● Red — PROGRAM</Trans></p><p className="bd-amber"><Trans>● Amber — PREVIEW</Trans></p><p><Trans>○ Dark — neither bus</Trans></p><small><Trans>Tally is separate from signal and output transmission.</Trans></small></section><section><h2><Trans>Alarms & engine health</Trans></h2><div className="bd-alarm-summary" role="region" aria-label={t`Active system alarm summary`}><p><Trans>Active system alarms only</Trans></p>{alarms.isError ? <p><Trans>Alarm summary unavailable</Trans></p> : alarms.isPending ? <p><Trans>Loading alarm summary</Trans></p> : alarms.data.length === 0 ? <p><Trans>No active system alarms reported</Trans></p> : <ul>{alarms.data.slice(0, 3).map((alarm) => <li key={alarm.id} title={`${alarm.severity} · ${alarm.kind}`}><span>{alarm.severity}</span> · {alarm.kind}</li>)}</ul>}</div><Link className="bd-btn" to="/alarms"><Trans>Open alarms</Trans></Link></section></aside>
     </div>
     <Dialog open={confirm !== undefined} onOpenChange={(open) => { if (!open) setConfirm(undefined); }}><DialogContent><DialogTitle><Trans>Confirm program change</Trans></DialogTitle><p>{confirm?.action.toUpperCase()} · {name(state.data?.program_source) ?? t`Unknown`} → {name(confirm?.source ?? state.data?.preview_source) ?? t`Unknown`}</p><p><Trans>The program bus changes what viewers see. Acceptance is not completion.</Trans></p><button disabled={disabled} onClick={() => { if (confirm) send(confirm); setConfirm(undefined); }}><Trans>Confirm take</Trans></button><button onClick={() => { setConfirm(undefined); }}><Trans>Cancel</Trans></button></DialogContent></Dialog>
