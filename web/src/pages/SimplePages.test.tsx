@@ -121,6 +121,8 @@ describe("SourcesPage dialogs render over a populated table (smoke)", () => {
 describe("SourcesPage honest surfaces", () => {
   it("shows the apply-semantics callout", async () => {
     renderSources();
+    // The approved layout keeps the callout in the Help panel (still reachable).
+    await userEvent.click(await screen.findByRole("button", { name: /help/i }));
     expect(await screen.findByRole("note")).toHaveTextContent(
       /config export.*restart|exporting the configuration/i,
     );
