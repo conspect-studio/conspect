@@ -154,7 +154,7 @@ where
     .await
 }
 
-/// Serve the control plane with an explicit run-scoped MoQ authority.
+/// Serve the control plane with an explicit run-scoped `MoQ` authority.
 /// # Errors
 /// Returns listener, seed-resource or control server initialization errors.
 #[allow(
