@@ -70,6 +70,11 @@ pub(crate) struct JobRec {
     /// producer exists or writes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) reserved: Option<ArtifactId>,
+    /// Opaque caller correlation (64 lowercase hex, a SHA-256 of caller-chosen
+    /// request identity). Journaled with the queued intent BEFORE the producer
+    /// or the id is exposed; never carries payload, URLs or credentials.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) correlation: Option<String>,
     #[serde(flatten)]
     pub(crate) state: Rec,
 }
@@ -120,6 +125,13 @@ impl Doc {
             }
         });
     }
+}
+
+/// A well-formed correlation token: exactly 64 lowercase hex digits.
+pub(crate) fn valid_correlation(t: &str) -> bool {
+    t.len() == 64
+        && t.bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
 
 fn corrupt() -> io::Error {

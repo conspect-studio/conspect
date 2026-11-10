@@ -179,6 +179,7 @@ impl Provider {
             &serde_json::to_vec(&body)
                 .map_err(|_| ControlError::Validation("capture body not serializable".into()))?,
         );
+        let token = correlation_token(&p.key_id, "submit", key, &digest);
         match self.ledger.reserve(&p.key_id, "submit", key, &digest) {
             Ok(Reserve::Replay(id)) => {
                 return Ok(Admission {
@@ -193,6 +194,23 @@ impl Provider {
                 ))
             }
             Err(false) => {
+                // A pending receipt may hide an exact job: the journaled
+                // correlation (token hash only) binds it. Completion records
+                // the id; the capture is never re-run. Unknown is NOT proof
+                // that nothing started, so it stays pending (fail closed).
+                if let Some(id) = correlated_job(service, &p.key_id, &body.fill_id, &token) {
+                    self.ledger
+                        .complete(&p.key_id, "submit", key, id)
+                        .map_err(|_| {
+                            ControlError::Repository(
+                                "idempotency record could not be persisted".into(),
+                            )
+                        })?;
+                    return Ok(Admission {
+                        job_id: id,
+                        fresh: false,
+                    });
+                }
                 if self.ledger.outcome_uncertain(&p.key_id, "submit", key) {
                     return Err(ControlError::CaptureOutcomeUncertain);
                 }
@@ -205,7 +223,7 @@ impl Provider {
         // service may already have accepted a job even if the final receipt
         // fsync failed. A retry must not allocate a second browser job. Only a
         // definite pre-acceptance failure durably abandons the reservation.
-        match self.admit(p, key, service, terms.as_ref(), body, capture) {
+        match self.admit(p, key, service, terms.as_ref(), (body, &token), capture) {
             Ok(admission) => Ok(admission),
             Err(AdmitError::Uncertain(e)) => Err(e),
             Err(AdmitError::Definite(e)) => {
@@ -222,7 +240,7 @@ impl Provider {
         key: &str,
         service: &Service,
         terms: &dyn TermsRepository,
-        body: &CaptureBody,
+        (body, token): (&CaptureBody, &str),
         capture: Capture,
     ) -> Result<Admission, AdmitError> {
         let accepted_at_unix = std::time::SystemTime::now()
@@ -247,10 +265,14 @@ impl Provider {
             maximum_bytes: 64 * 1024 * 1024,
             timeout: Duration::from_secs(120),
         };
-        let id = match service.submit(request) {
+        let id = match service.submit_correlated(request, token) {
             Ok(Submitted::Accepted(id) | Submitted::Coalesced(id)) => id.raw(),
             Err(e @ SubmitError::Persistence) => {
-                return Err(AdmitError::Uncertain(submit_error(e)))
+                // The journal may already hold the correlated intent: bind it.
+                match correlated_job(service, &p.key_id, &body.fill_id, token) {
+                    Some(id) => id,
+                    None => return Err(AdmitError::Uncertain(submit_error(e))),
+                }
             }
             Err(e) => return Err(AdmitError::Definite(submit_error(e))),
         };
@@ -374,6 +396,18 @@ impl Provider {
 enum AdmitError {
     Definite(ControlError),
     Uncertain(ControlError),
+}
+/// Unambiguous correlation: SHA-256 over a JSON array of actor, operation,
+/// key hash and body digest (no delimiter ambiguity; no key or payload bytes).
+fn correlation_token(actor: &str, op: &str, key: &str, body_digest: &str) -> String {
+    let doc = serde_json::json!([actor, op, digest_hex(key.as_bytes()), body_digest]);
+    digest_hex(&serde_json::to_vec(&doc).unwrap_or_default())
+}
+/// Existing job for a trusted, already-authorized owner+fill and token.
+fn correlated_job(service: &Service, owner: &str, fill: &str, token: &str) -> Option<u64> {
+    service
+        .lookup_correlated(owner, fill, token)
+        .map(|(id, _)| id.raw())
 }
 fn missing(id: u64) -> ControlError {
     ControlError::NotFound {

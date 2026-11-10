@@ -1461,3 +1461,80 @@ fn shutdown_after_durable_intent_is_uncertain_not_definite_refusal() {
     ));
     assert!(restarted.latest_good("o", "admission-race").is_none());
 }
+
+const TOKEN: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+#[test]
+fn correlated_submit_is_idempotent_across_finish_and_restart_without_payload_in_journal() {
+    let _g = SERIAL.lock().unwrap();
+    let d = Durable::new();
+    let service = d.start().unwrap();
+    let id = accepted(service.submit_correlated(request("f"), TOKEN).unwrap());
+    wait(&service, id, terminal);
+    assert_eq!(
+        service.submit_correlated(request("f"), TOKEN).unwrap(),
+        Submitted::Coalesced(id)
+    );
+    assert_eq!(service.lookup_correlated("o", "f", TOKEN).unwrap().0, id);
+    assert!(service.lookup_correlated("other", "f", TOKEN).is_none());
+    assert!(service.lookup_correlated("o", "g", TOKEN).is_none());
+    assert!(service.lookup_correlated("o", "f", "bad").is_none());
+    assert_eq!(
+        service.submit_correlated(request("f"), "bad").err(),
+        Some(SubmitError::Invalid)
+    );
+    service.shutdown();
+    drop(service);
+    let journal = std::fs::read_to_string(d.journal()).unwrap();
+    assert!(journal.contains(TOKEN));
+    assert!(!journal.contains(SECRET));
+    let service = d.start().unwrap();
+    assert_eq!(
+        service.submit_correlated(request("f"), TOKEN).unwrap(),
+        Submitted::Coalesced(id)
+    );
+    assert!(service.lookup_correlated("other", "f", TOKEN).is_none());
+    assert_eq!(runs_in(&d.work), 1);
+}
+
+#[test]
+fn correlation_survives_pause_after_queued_persist_and_restart_never_reruns() {
+    let _g = SERIAL.lock().unwrap();
+    let d = Durable::new();
+    // Syncs: 0 boot, 1 queued intent (correlated); fail the launch persist (2)
+    // so the job never reaches a producer. Then restart.
+    SYNCS.store(0, AtomicOrdering::SeqCst);
+    FAIL_AT.store(2, AtomicOrdering::SeqCst);
+    let service =
+        Service::start_durable_with_hook(d.tools(), d.store(), config(2, 8), &d.journal(), flaky)
+            .unwrap();
+    let id = accepted(service.submit_correlated(request("f"), TOKEN).unwrap());
+    wait(&service, id, terminal);
+    FAIL_AT.store(usize::MAX, AtomicOrdering::SeqCst);
+    service.shutdown();
+    drop(service);
+    let service = d.start().unwrap();
+    let (found, _state) = service.lookup_correlated("o", "f", TOKEN).unwrap();
+    assert_eq!(found, id);
+    assert_eq!(
+        service.submit_correlated(request("f"), TOKEN).unwrap(),
+        Submitted::Coalesced(id)
+    );
+    assert_eq!(runs_in(&d.work), 0);
+    assert!(service.lookup_correlated("o2", "f", TOKEN).is_none());
+}
+
+#[test]
+fn forged_duplicate_or_malformed_correlation_fails_closed_at_boot() {
+    let _g = SERIAL.lock().unwrap();
+    let d = Durable::new();
+    let service = d.start().unwrap();
+    let id = accepted(service.submit_correlated(request("f"), TOKEN).unwrap());
+    wait(&service, id, terminal);
+    service.shutdown();
+    drop(service);
+    forge(&d, |doc| {
+        doc["jobs"][0]["correlation"] = serde_json::json!("NOT-HEX");
+    });
+    assert!(d.start().is_err());
+}

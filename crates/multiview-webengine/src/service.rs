@@ -54,7 +54,7 @@
 //! ever grow, so they exceed every historic id and generation even when its
 //! artifact was removed or its job failed. No artifact is ever deleted here.
 use crate::service_journal::{
-    kind_from, kind_name, load, Doc, GoodRec, JobRec, Journal, JournalHook, Rec,
+    kind_from, kind_name, load, valid_correlation, Doc, GoodRec, JobRec, Journal, JournalHook, Rec,
 };
 use crate::{
     artifact::{Artifact, ArtifactId, ArtifactStore, Lease, Provenance},
@@ -336,6 +336,7 @@ struct Entry {
     progress: Option<FetchProgress>,
     resource: Option<ResourceSample>,
     meta: Option<FetchMeta>,
+    correlation: Option<String>,
 }
 struct Good {
     artifact: ArtifactId,
@@ -381,6 +382,20 @@ fn persist(inner: &Inner, change: impl FnOnce(&mut Doc)) -> io::Result<()> {
             .unwrap_or_else(PoisonError::into_inner)
             .update(change)
     })
+}
+fn state_of(rec: &Rec) -> State {
+    match rec {
+        Rec::Queued => State::Queued,
+        Rec::Running => State::Running,
+        Rec::Succeeded { artifact } => State::Succeeded {
+            artifact: artifact.clone(),
+        },
+        Rec::Failed { kind } => State::Failed {
+            kind: kind_from(kind),
+        },
+        Rec::Cancelled => State::Cancelled,
+        Rec::Uncertain => State::Uncertain,
+    }
 }
 fn set_job(doc: &mut Doc, id: u64, state: Rec) {
     if let Some(j) = doc.jobs.iter_mut().find(|j| j.id == id) {
@@ -653,7 +668,7 @@ impl Service {
         if request.capture.validate().is_err() {
             return Err(SubmitError::Invalid);
         }
-        self.enqueue(Payload::Capture(request))
+        self.enqueue(Payload::Capture(request), None)
     }
 
     /// Queue a URL fetch (same queue, fill coalescing, quota, cancellation and
@@ -665,7 +680,7 @@ impl Service {
         if !self.inner.fetch_enabled || request.fetch.validate().is_err() {
             return Err(SubmitError::Invalid);
         }
-        self.enqueue(Payload::Fetch(request))
+        self.enqueue(Payload::Fetch(request), None)
     }
 
     /// Source metadata (sanitised title/uploader/duration) of a retained fetch
@@ -681,7 +696,73 @@ impl Service {
             .and_then(|e| e.meta.clone())
     }
 
-    fn enqueue(&self, request: Payload) -> Result<Submitted, SubmitError> {
+    /// Like [`Service::submit`], but journals the opaque `correlation` (64
+    /// lowercase hex, e.g. a SHA-256 of caller identity + request digest) with
+    /// the queued intent BEFORE the id or producer is exposed. A repeat with the
+    /// same `(owner, fill, correlation)` returns the existing job (even when
+    /// finished, while retained) as `Coalesced`, never a second job. Only the
+    /// token hash is stored; the request payload is never journaled.
+    /// # Errors
+    /// As [`Service::submit`]; also `Invalid` for a malformed token.
+    pub fn submit_correlated(
+        &self,
+        request: Request,
+        correlation: &str,
+    ) -> Result<Submitted, SubmitError> {
+        if !valid_correlation(correlation) || request.capture.validate().is_err() {
+            return Err(SubmitError::Invalid);
+        }
+        self.enqueue(Payload::Capture(request), Some(correlation.to_owned()))
+    }
+
+    /// Read-only lookup of a retained job by correlation. `owner` and `fill`
+    /// must already be authorized by the caller; another owner/fill, an unknown
+    /// or pruned token yields `None` (which does NOT prove no job was started).
+    /// Briefly takes the journal mutex (no I/O under it).
+    #[must_use]
+    pub fn lookup_correlated(
+        &self,
+        owner: &str,
+        fill: &str,
+        correlation: &str,
+    ) -> Option<(JobId, State)> {
+        if !valid_correlation(correlation) {
+            return None;
+        }
+        let from_journal = self.inner.journal.as_ref().and_then(|j| {
+            let g = j.lock().unwrap_or_else(PoisonError::into_inner);
+            g.doc
+                .jobs
+                .iter()
+                .find(|r| {
+                    r.owner == owner
+                        && r.fill == fill
+                        && r.correlation.as_deref() == Some(correlation)
+                })
+                .map(|r| (JobId(r.id), r.state.clone()))
+        });
+        let shared = lock(&self.inner);
+        if let Some((id, rec)) = from_journal {
+            let state = shared
+                .jobs
+                .get(&id)
+                .map_or_else(|| state_of(&rec), |e| e.state.clone());
+            return Some((id, state));
+        }
+        shared
+            .jobs
+            .iter()
+            .find(|(_, e)| {
+                e.owner == owner && e.fill == fill && e.correlation.as_deref() == Some(correlation)
+            })
+            .map(|(id, e)| (*id, e.state.clone()))
+    }
+
+    fn enqueue(
+        &self,
+        request: Payload,
+        correlation: Option<String>,
+    ) -> Result<Submitted, SubmitError> {
         if bad_name(request.owner())
             || bad_name(request.fill())
             || request.maximum_bytes() == 0
@@ -699,6 +780,33 @@ impl Service {
         let shared = lock(&self.inner);
         if shared.shutdown {
             return Err(SubmitError::ShuttingDown);
+        }
+        if let Some(token) = correlation.as_deref() {
+            let durable = self.inner.journal.as_ref().and_then(|j| {
+                j.lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .doc
+                    .jobs
+                    .iter()
+                    .find(|r| {
+                        r.owner == req_owner
+                            && r.fill == req_fill
+                            && r.correlation.as_deref() == Some(token)
+                    })
+                    .map(|r| JobId(r.id))
+            });
+            let live = shared
+                .jobs
+                .iter()
+                .find(|(_, e)| {
+                    e.owner == req_owner
+                        && e.fill == req_fill
+                        && e.correlation.as_deref() == Some(token)
+                })
+                .map(|(id, _)| *id);
+            if let Some(id) = durable.or(live) {
+                return Ok(Submitted::Coalesced(id));
+            }
         }
         if let Some((id, _)) = shared.jobs.iter().find(|(_, e)| {
             e.owner == req_owner
@@ -739,6 +847,7 @@ impl Service {
         // while the state mutex is released for the journal I/O.
         drop(shared);
         let (o, f) = (req_owner.clone(), req_fill.clone());
+        let corr = correlation.clone();
         persist(&self.inner, |d| {
             d.job_high = d.job_high.max(after);
             d.jobs.push(JobRec {
@@ -747,6 +856,7 @@ impl Service {
                 fill: f,
                 generation: 0,
                 reserved: None,
+                correlation: corr,
                 state: Rec::Queued,
             });
         })
@@ -774,6 +884,7 @@ impl Service {
                 progress: None,
                 resource: None,
                 meta: None,
+                correlation,
             },
         );
         shared.queue.push_back(id);
@@ -1018,6 +1129,7 @@ fn worker(inner: &Inner, mut store: ArtifactStore, tools: &Tools, fetch: Option<
                             fill: f,
                             generation,
                             reserved: None,
+                            correlation: None,
                             state: Rec::Running,
                         });
                     }
@@ -1272,6 +1384,7 @@ fn recover(
         }
     }
     let mut seen = std::collections::BTreeSet::new();
+    let mut tokens = std::collections::BTreeSet::new();
     for j in &doc.jobs {
         if j.id == 0
             || j.id >= doc.job_high
@@ -1279,6 +1392,10 @@ fn recover(
             || !seen.insert(j.id)
             || bad_name(&j.owner)
             || bad_name(&j.fill)
+            || j.correlation.as_deref().is_some_and(|t| {
+                !valid_correlation(t)
+                    || !tokens.insert((j.owner.clone(), j.fill.clone(), t.to_owned()))
+            })
         {
             return Err(bad_journal());
         }
@@ -1421,6 +1538,7 @@ fn recover(
                 progress: None,
                 resource: None,
                 meta: None,
+                correlation: j.correlation.clone(),
             },
         );
         shared.finished.push_back(JobId(j.id));

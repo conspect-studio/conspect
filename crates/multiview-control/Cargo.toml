@@ -203,10 +203,6 @@ tokio-rustls = { version = "0.26", optional = true }
 # deterministic temp name allows. Permissive (MIT/Apache-2.0), already on the
 # deny.toml allowlist; pure Rust, stays in the CI-green default build.
 tempfile = "3"
-# `rustix::process::geteuid` — a SAFE wrapper (this crate forbids `unsafe`) used
-# to fail-closed when the `.multiview` state dir is owned by another uid
-# (ADR-W024 MAJOR-A). Permissive (Apache-2.0/MIT/BSD), already in the lock.
-rustix = { version = "1", features = ["process"] }
 
 # Control-plane TLS termination (TLS-0, ADR-W029; HTTP/1-only serve loop SEC-14 #126 R2 /
 # ADR-W031): OFF by default (`tls`). The `[control.tls]` schema + the plain-HTTP serve path
