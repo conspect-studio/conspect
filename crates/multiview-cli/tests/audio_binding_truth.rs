@@ -193,7 +193,7 @@ async fn program_audio_seam_reaches_the_sink() {
 
 /// An input `[audio]` ROUTING section with program audio NOT enabled: routing
 /// is an input-side fact, not a program-audio encode — the run must proceed
-/// VIDEO-ONLY (no phantom program track, no dispatcher InvalidConfig death),
+/// VIDEO-ONLY (no phantom program track, no dispatcher `InvalidConfig` death),
 /// with the implicit default's track 0 stripped.
 #[tokio::test(flavor = "current_thread")]
 async fn audio_routing_without_encode_is_video_only() {
@@ -275,23 +275,20 @@ async fn substituted_shed_tick_keeps_pts_contiguous_and_audio_exact() {
     let runner = move |rx: Receiver<EncodedPacket>| -> TestSinkOutcome {
         let mut frames = 0;
         while let Ok(packet) = rx.recv() {
-            match packet.kind() {
-                StreamKind::Video => {
-                    if let Some(pts) = packet.pts() {
-                        pts_in.lock().unwrap().push(pts);
-                    }
-                    frames += 1;
+            if packet.kind() == StreamKind::Video {
+                if let Some(pts) = packet.pts() {
+                    pts_in.lock().unwrap().push(pts);
                 }
-                _ => {
-                    if let Some(pts) = packet.pts() {
-                        let pts = u64::try_from(pts).unwrap_or(0);
-                        let prev = max_in.load(Ordering::Acquire);
-                        if pts > prev {
-                            max_in.store(pts, Ordering::Release);
-                        }
+                frames += 1;
+            } else {
+                if let Some(pts) = packet.pts() {
+                    let pts = u64::try_from(pts).unwrap_or(0);
+                    let prev = max_in.load(Ordering::Acquire);
+                    if pts > prev {
+                        max_in.store(pts, Ordering::Release);
                     }
-                    aud_in.fetch_add(1, Ordering::Release);
                 }
+                aud_in.fetch_add(1, Ordering::Release);
             }
         }
         TestSinkOutcome { frames }

@@ -77,13 +77,22 @@ impl AvcCopyBudget {
         }
     }
     fn reserve(&'static self, bytes: usize) -> Result<AvcCopyCharge, ConversionError> {
-        self.used
-            .try_update(
+        let mut used = self.used.load(std::sync::atomic::Ordering::Acquire);
+        loop {
+            let next = used
+                .checked_add(bytes)
+                .filter(|total| *total <= self.limit)
+                .ok_or(ConversionError::Budget)?;
+            match self.used.compare_exchange_weak(
+                used,
+                next,
                 std::sync::atomic::Ordering::AcqRel,
                 std::sync::atomic::Ordering::Acquire,
-                |used| used.checked_add(bytes).filter(|total| *total <= self.limit),
-            )
-            .map_err(|_| ConversionError::Budget)?;
+            ) {
+                Ok(_) => break,
+                Err(current) => used = current,
+            }
+        }
         Ok(AvcCopyCharge {
             budget: self,
             bytes,
@@ -103,9 +112,20 @@ impl Drop for AvcCopyCharge {
     }
 }
 
+struct Framed {
+    data: Vec<u8>,
+    _source: Bytes,
+    _charge: AvcCopyCharge,
+}
+impl AsRef<[u8]> for Framed {
+    fn as_ref(&self) -> &[u8] {
+        &self.data
+    }
+}
+
 /// Convert an Annex-B H.264 access unit to the four-byte NAL lengths required
-/// by an avcC WebCodecs description. This copies framing, never encodes media.
-/// The resulting owner retains its source bytes and therefore the BatchLease.
+/// by an avcC `WebCodecs` description. This copies framing, never encodes media.
+/// The resulting owner retains its source bytes and therefore the `BatchLease`.
 pub(crate) fn avcc_access_unit(source: Bytes) -> Result<Bytes, ConversionError> {
     avcc_access_unit_with_budget(source, &AVC_COPY_BUDGET)
 }
@@ -135,14 +155,15 @@ fn avcc_access_unit_with_budget(
             end += 1;
         }
         let mut nal_end = end;
-        while nal_end > begin && source[nal_end - 1] == 0 {
+        while nal_end > begin && source.get(nal_end - 1) == Some(&0) {
             nal_end -= 1;
         }
+        let header = *source.get(begin).ok_or(ConversionError::Stream)?;
+        let nal_type = header & 0x1f;
         if nal_end == begin
             || units.len() >= 512
-            || source[begin] & 0x80 != 0
-            || source[begin] & 0x1f == 0
-            || source[begin] & 0x1f > 23
+            || header & 0x80 != 0
+            || !(1..=23).contains(&nal_type)
         {
             return Err(ConversionError::Stream);
         }
@@ -162,16 +183,6 @@ fn avcc_access_unit_with_budget(
         return Err(ConversionError::Budget);
     }
     let charge = budget.reserve(size)?;
-    struct Framed {
-        data: Vec<u8>,
-        _source: Bytes,
-        _charge: AvcCopyCharge,
-    }
-    impl AsRef<[u8]> for Framed {
-        fn as_ref(&self) -> &[u8] {
-            &self.data
-        }
-    }
     let mut data = Vec::new();
     data.try_reserve_exact(size)
         .map_err(|_| ConversionError::Budget)?;
@@ -181,7 +192,7 @@ fn avcc_access_unit_with_budget(
                 .map_err(|_| ConversionError::Budget)?
                 .to_be_bytes(),
         );
-        data.extend_from_slice(&source[begin..end]);
+        data.extend_from_slice(source.get(begin..end).ok_or(ConversionError::Stream)?);
     }
     Ok(Bytes::from_owner(Framed {
         data,

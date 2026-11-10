@@ -117,7 +117,7 @@ async fn await_outgoing_start<F: std::future::Future>(
         let ready = tokio::select! {
             biased;
             _ = stopped.wait_for(|stop| *stop) => return None,
-            _ = tokio::time::sleep(Duration::from_millis(20)) => None,
+            () = tokio::time::sleep(Duration::from_millis(20)) => None,
             result = &mut future => Some(result),
         };
         if let Some(result) = ready {
@@ -215,15 +215,12 @@ impl DynamicRegistryFactory {
         let path =
             std::env::var("MULTIVIEW_MOQ_RELAY_URL_FILE").map_err(|_| MoqReject::Unavailable)?;
         let endpoint = read_relay_endpoint(std::path::Path::new(&path))?;
-        if std::env::var("MULTIVIEW_MOQ_RELAY_PROTECTED")
-            .ok()
-            .is_some_and(|value| value != "false")
-        {
+        if std::env::var("MULTIVIEW_MOQ_RELAY_PROTECTED").is_ok_and(|value| value != "false") {
             return Err(MoqReject::Unavailable);
         }
         let config = multiview_moq::provider::FamilyRelayConfig {
             endpoint,
-            connect: Default::default(),
+            connect: multiview_moq::provider::RelayConnectConfig::default(),
             overhead_bps: 0,
             send_window_bytes: 4 * 1024 * 1024,
             retained_bytes: 8 * 1024 * 1024,
@@ -240,14 +237,14 @@ impl DynamicRegistryFactory {
                     if keys.generation() != generation || tokio::time::Instant::now() >= deadline {
                         return;
                     }
-                    tokio::select! { _ = tokio::time::sleep(Duration::from_millis(20)) => {}, _ = stopped.wait_for(|stop| *stop) => return }
+                    tokio::select! { () = tokio::time::sleep(Duration::from_millis(20)) => {}, _ = stopped.wait_for(|stop| *stop) => return }
                 }
                 let scope = WhepScope::Output(output);
                 let Ok(current) = dynamic.current() else {
                     return;
                 };
                 let config_generation = current.subscriptions.generation();
-                let started = await_outgoing_start(
+                let started = Box::pin(await_outgoing_start(
                     dynamic.start_outgoing(&principal, &scope, config),
                     &mut stopped,
                     || {
@@ -257,13 +254,13 @@ impl DynamicRegistryFactory {
                                 current.subscriptions.generation() != config_generation
                             })
                     },
-                )
+                ))
                 .await;
                 let Some(Ok(mut publisher)) = started else {
                     return;
                 };
                 loop {
-                    tokio::select! { _ = tokio::time::sleep(Duration::from_millis(100)) => {}, _ = stopped.wait_for(|stop| *stop) => break }
+                    tokio::select! { () = tokio::time::sleep(Duration::from_millis(100)) => {}, _ = stopped.wait_for(|stop| *stop) => break }
                     if keys.generation() != generation || !dynamic.available() {
                         break;
                     }
@@ -487,85 +484,30 @@ impl RegistryFeedFactory {
         };
         let AuthorizedSharedFeed { mut feed, .. } = shared;
         feed.windows = windows;
-        match multiview_moq::provider::FamilyPublisher::start(feed, Some(config)).await {
-            Ok(publisher) => Ok(publisher),
-            Err(_) => {
-                sink.revoke();
-                Err(MoqReject::Unavailable)
-            }
-        }
-    }
-
-    /// Every admitted rendition of the ladder, in registry order.
-    #[must_use]
-    pub(crate) fn ladder(&self) -> &[RenditionFamily] {
-        &self.ladder
-    }
-
-    /// The typed alternatives handed to every admitted feed.
-    #[must_use]
-    pub(crate) fn renditions(&self) -> &[LadderRendition] {
-        &self.renditions
-    }
-}
-
-impl AuthorizedFeedFactory for RegistryFeedFactory {
-    fn available(&self) -> bool {
-        self.ready.load(Ordering::Acquire) && !self.prepared.is_empty()
-    }
-
-    fn attach_shared(
-        &self,
-        principal: &Principal,
-        scope: &WhepScope,
-        sink: Arc<Fence>,
-    ) -> Result<Option<AuthorizedSharedFeed>, MoqReject> {
-        let selected = self.subscriptions.resolve(scope).map_err(refusal)?;
-        let admitted = self.subscriptions.admitted();
-        let mut family = admitted
-            .iter()
-            .filter(|binding| {
-                binding.program_id == selected.program_id
-                    && binding.bus_id == selected.bus_id
-                    && binding.config_generation == selected.config_generation
-            })
-            .cloned()
-            .collect::<Vec<_>>();
-        if family.len() < 2 {
-            return Ok(None);
-        }
-        if family.iter().any(|binding| binding.audio != selected.audio) {
-            return Err(MoqReject::Codec);
-        }
-        family.sort_by_key(|binding| binding.video.bitrate_bps.unwrap_or(u64::MAX));
-        // Multiple physical outputs can share one identical encoded rendition.
-        // They are not an adaptive ladder and must not fabricate duplicate rungs.
-        if family
-            .windows(2)
-            .any(|pair| pair[0].video.bitrate_bps == pair[1].video.bitrate_bps)
+        if let Ok(publisher) =
+            multiview_moq::provider::FamilyPublisher::start(feed, Some(config)).await
         {
-            return Ok(None);
+            Ok(publisher)
+        } else {
+            sink.revoke();
+            Err(MoqReject::Unavailable)
         }
-        for binding in &family {
-            let dependencies = binding
-                .dependencies
-                .iter()
-                .map(typed_dependency)
-                .collect::<Vec<_>>();
-            metadata::authorize_dependencies(principal, &dependencies)?;
-            let sources = binding
-                .source_dependencies()
-                .map(str::to_owned)
-                .collect::<Vec<_>>();
-            metadata::authorize_binding(principal, scope, &binding.output_id, &sources)?;
-            factory_video(&binding.video)?;
-            if binding.video.cadence != selected.video.cadence {
-                return Err(MoqReject::Codec);
-            }
-        }
+    }
+
+    fn shared_metadata(
+        &self,
+        family: &[EffectiveBinding],
+        selected: &EffectiveBinding,
+    ) -> Result<
+        (
+            multiview_moq::ladder::SharedLadder,
+            Vec<multiview_control::moq::MoqVideoAlternative>,
+        ),
+        MoqReject,
+    > {
         let mut specs = Vec::new();
         let mut alternatives = Vec::new();
-        for binding in &family {
+        for binding in family {
             let prepared = self
                 .prepared
                 .get(&binding.output_id)
@@ -621,6 +563,78 @@ impl AuthorizedFeedFactory for RegistryFeedFactory {
             0,
         )
         .map_err(|_| MoqReject::Codec)?;
+        Ok((ladder, alternatives))
+    }
+
+    /// Every admitted rendition of the ladder, in registry order.
+    #[must_use]
+    pub(crate) fn ladder(&self) -> &[RenditionFamily] {
+        &self.ladder
+    }
+
+    /// The typed alternatives handed to every admitted feed.
+    #[must_use]
+    pub(crate) fn renditions(&self) -> &[LadderRendition] {
+        &self.renditions
+    }
+}
+
+impl AuthorizedFeedFactory for RegistryFeedFactory {
+    fn available(&self) -> bool {
+        self.ready.load(Ordering::Acquire) && !self.prepared.is_empty()
+    }
+
+    fn attach_shared(
+        &self,
+        principal: &Principal,
+        scope: &WhepScope,
+        sink: Arc<Fence>,
+    ) -> Result<Option<AuthorizedSharedFeed>, MoqReject> {
+        let selected = self.subscriptions.resolve(scope).map_err(refusal)?;
+        let admitted = self.subscriptions.admitted();
+        let mut family = admitted
+            .iter()
+            .filter(|binding| {
+                binding.program_id == selected.program_id
+                    && binding.bus_id == selected.bus_id
+                    && binding.config_generation == selected.config_generation
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        if family.len() < 2 {
+            return Ok(None);
+        }
+        if family.iter().any(|binding| binding.audio != selected.audio) {
+            return Err(MoqReject::Codec);
+        }
+        family.sort_by_key(|binding| binding.video.bitrate_bps.unwrap_or(u64::MAX));
+        // Multiple physical outputs can share one identical encoded rendition.
+        // They are not an adaptive ladder and must not fabricate duplicate rungs.
+        if family.windows(2).any(|pair| {
+            pair.first()
+                .zip(pair.get(1))
+                .is_some_and(|(left, right)| left.video.bitrate_bps == right.video.bitrate_bps)
+        }) {
+            return Ok(None);
+        }
+        for binding in &family {
+            let dependencies = binding
+                .dependencies
+                .iter()
+                .map(typed_dependency)
+                .collect::<Vec<_>>();
+            metadata::authorize_dependencies(principal, &dependencies)?;
+            let sources = binding
+                .source_dependencies()
+                .map(str::to_owned)
+                .collect::<Vec<_>>();
+            metadata::authorize_binding(principal, scope, &binding.output_id, &sources)?;
+            factory_video(&binding.video)?;
+            if binding.video.cadence != selected.video.cadence {
+                return Err(MoqReject::Codec);
+            }
+        }
+        let (ladder, alternatives) = self.shared_metadata(&family, &selected)?;
         // Failed grouped admission revokes the common producer boundary even
         // when bounded Attach commands have not yet reached the registry pump.
         let mut rollback = AdmissionRollback {
@@ -640,36 +654,43 @@ impl AuthorizedFeedFactory for RegistryFeedFactory {
                 .map_err(refusal)?;
             rungs.push(GroupRung {
                 subscription,
-                mapping: self.prepared[&binding.output_id].mapping.clone(),
+                mapping: self
+                    .prepared
+                    .get(&binding.output_id)
+                    .ok_or(MoqReject::Unavailable)?
+                    .mapping
+                    .clone(),
                 recovery: binding.video.recovery.ok_or(MoqReject::Codec)?,
                 pending: None,
             });
         }
-        let stop = Arc::new(AtomicBool::new(false));
-        let worker_stop = stop.clone();
         let generation = selected.config_generation;
-        let worker_sink = sink.clone();
-        let join = thread::Builder::new()
-            .name("moq-family-convert".into())
-            .spawn(move || {
-                run_group(&worker_sink, &worker_stop, generation, &mut rungs);
-            })
-            .map_err(|_| MoqReject::Unavailable)?;
+        let (stop, join) = spawn_group_worker(sink.clone(), generation, rungs)?;
         let (_unused, receiver) = tokio::sync::mpsc::channel(1);
         rollback.armed = false;
         Ok(Some(AuthorizedSharedFeed {
             feed: multiview_moq::provider::LadderFeed {
                 ladder,
                 capacity_bps: None,
-                config: Default::default(),
+                config: multiview_moq::uplink::UplinkConfig::default(),
                 windows: receiver,
                 demand: Box::new(GroupDemand {
                     stop,
                     join: Some(join),
                 }),
             },
-            video: self.prepared[&selected.output_id].video.clone(),
-            audio: self.prepared[&selected.output_id].audio.clone(),
+            video: self
+                .prepared
+                .get(&selected.output_id)
+                .ok_or(MoqReject::Unavailable)?
+                .video
+                .clone(),
+            audio: self
+                .prepared
+                .get(&selected.output_id)
+                .ok_or(MoqReject::Unavailable)?
+                .audio
+                .clone(),
             alternatives,
             clock_wall_micros: None,
         }))
@@ -763,6 +784,22 @@ impl Drop for AdmissionRollback {
         }
     }
 }
+fn spawn_group_worker(
+    sink: Arc<Fence>,
+    generation: u64,
+    mut rungs: Vec<GroupRung>,
+) -> Result<(Arc<AtomicBool>, JoinHandle<()>), MoqReject> {
+    let stop = Arc::new(AtomicBool::new(false));
+    let worker_stop = stop.clone();
+    let join = thread::Builder::new()
+        .name("moq-family-convert".into())
+        .spawn(move || {
+            run_group(&sink, &worker_stop, generation, &mut rungs);
+        })
+        .map_err(|_| MoqReject::Unavailable)?;
+    Ok((stop, join))
+}
+
 struct GroupRung {
     subscription: Subscription,
     mapping: TrackMapping,
@@ -781,15 +818,16 @@ impl Drop for GroupDemand {
         }
     }
 }
+struct ExitFence<'a>(&'a Fence);
+impl Drop for ExitFence<'_> {
+    fn drop(&mut self) {
+        self.0.revoke();
+    }
+}
+
 /// Bounded off-clock join: at most one whole converted window per rung. A
 /// missing producer cannot block the production clock or grow a backlog.
 fn run_group(sink: &Fence, stop: &AtomicBool, generation: u64, rungs: &mut [GroupRung]) {
-    struct ExitFence<'a>(&'a Fence);
-    impl Drop for ExitFence<'_> {
-        fn drop(&mut self) {
-            self.0.revoke();
-        }
-    }
     let _exit_fence = ExitFence(sink);
     let mut discontinuities = 0;
     while !stop.load(Ordering::Acquire) && !sink.revocation().is_revoked() {
@@ -860,20 +898,26 @@ fn run_group(sink: &Fence, stop: &AtomicBool, generation: u64, rungs: &mut [Grou
         let latest = starts.iter().flatten().max().copied();
         if starts.iter().any(|start| *start != latest) {
             for (index, rung) in rungs.iter_mut().enumerate() {
-                if starts[index] != latest {
+                if starts.get(index).copied().flatten() != latest {
                     rung.pending.take();
                     discontinuities |= 1 << index;
                 }
             }
             continue;
         }
-        let mut complete = rungs
+        let complete = rungs
             .iter_mut()
-            .map(|rung| rung.pending.take().unwrap())
-            .collect::<Vec<_>>();
+            .map(|rung| rung.pending.take())
+            .collect::<Option<Vec<_>>>();
+        let Some(mut complete) = complete else {
+            return;
+        };
         // All rungs carry the same admitted shared audio identity and clock.
         // Publish its first complete copy exactly once, outside the video index.
-        let audio = std::mem::take(&mut complete[0].audio);
+        let Some(first) = complete.first_mut() else {
+            return;
+        };
+        let audio = std::mem::take(&mut first.audio);
         let mut window = multiview_moq::publication::LadderWindow::new(
             generation,
             complete.into_iter().map(|window| window.video).collect(),
@@ -883,7 +927,7 @@ fn run_group(sink: &Fence, stop: &AtomicBool, generation: u64, rungs: &mut [Grou
         match sink.offer_ladder(window) {
             Ok(()) => discontinuities = 0,
             Err(multiview_moq::provider::OfferRefusal::Full(_)) => {
-                discontinuities = (1 << rungs.len()) - 1
+                discontinuities = (1 << rungs.len()) - 1;
             }
             Err(_) => return,
         }
@@ -2049,7 +2093,7 @@ mod tests {
             .map(|index| {
                 let mut binding = binding(&format!("rung-{index}"), index, GENERATION, 640, 360);
                 binding.audio.clear();
-                binding.video.bitrate_bps = Some(250_000 * (index as u64 + 1));
+                binding.video.bitrate_bps = Some(250_000 * (u64::try_from(index).unwrap() + 1));
                 binding
             })
             .collect::<Vec<_>>();

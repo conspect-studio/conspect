@@ -3,6 +3,8 @@
 /// file. Parsing uses the eventual config-owned serde type; this reader never
 /// creates profiles, guesses measurements, or opens an encoder.
 #[cfg(unix)]
+/// # Errors
+/// Returns unavailable for unsafe, oversized or invalid measured startup input.
 pub fn read_measured_startup<T: serde::de::DeserializeOwned>(
     path: &std::path::Path,
 ) -> Result<T, multiview_control::moq::MoqReject> {
@@ -568,6 +570,7 @@ pub struct MeasuredPreviewConfig {
 }
 impl MeasuredPreviewConfig {
     /// Validate without opening any encoder or exposing internal parent metadata.
+    #[must_use]
     pub fn into_startup(self) -> Option<crate::preview_vertical::PreviewStartup> {
         crate::preview_vertical::PreviewStartup::new(
             self.parent_output,
@@ -581,6 +584,8 @@ impl MeasuredPreviewConfig {
     }
 }
 /// Install only explicit measured configuration before the run starts.
+/// # Errors
+/// Returns unavailable when explicit measured configuration cannot be admitted.
 pub fn configure_optional_preview(
     pipeline: &mut crate::pipeline::Pipeline,
 ) -> Result<(), multiview_control::moq::MoqReject> {

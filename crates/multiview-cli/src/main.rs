@@ -116,7 +116,7 @@ async fn main() -> ExitCode {
     }
 
     let cli = Cli::parse();
-    match dispatch(cli).await {
+    match Box::pin(dispatch(cli)).await {
         Ok(code) => code,
         Err(err) => {
             tracing::error!(error = %format!("{err:#}"), "command failed");
@@ -158,7 +158,7 @@ fn init_tracing() -> anyhow::Result<()> {
 async fn dispatch(cli: Cli) -> anyhow::Result<ExitCode> {
     match cli.command {
         Command::Validate(args) => run_validate(&args),
-        Command::Run(args) => run_run(args).await,
+        Command::Run(args) => Box::pin(run_run(args)).await,
         Command::Node(args) => run_node(&args),
     }
 }

@@ -593,21 +593,18 @@ async fn rt8b_audio_tracks_every_tick_inside_the_envelope() {
     let runner = move |rx: Receiver<EncodedPacket>| -> TestSinkOutcome {
         let mut frames = 0_usize;
         while let Ok(packet) = rx.recv() {
-            match packet.kind() {
-                multiview_ffmpeg::StreamKind::Video => {
-                    vid_in.fetch_add(1, Ordering::Release);
-                    frames += 1;
-                }
-                _ => {
-                    if let Some(pts) = packet.pts() {
-                        let pts = u64::try_from(pts).unwrap_or(0);
-                        let prev = max_in.load(Ordering::Acquire);
-                        if pts > prev {
-                            max_in.store(pts, Ordering::Release);
-                        }
+            if packet.kind() == multiview_ffmpeg::StreamKind::Video {
+                vid_in.fetch_add(1, Ordering::Release);
+                frames += 1;
+            } else {
+                if let Some(pts) = packet.pts() {
+                    let pts = u64::try_from(pts).unwrap_or(0);
+                    let prev = max_in.load(Ordering::Acquire);
+                    if pts > prev {
+                        max_in.store(pts, Ordering::Release);
                     }
-                    aud_in.fetch_add(1, Ordering::Release);
                 }
+                aud_in.fetch_add(1, Ordering::Release);
             }
         }
         TestSinkOutcome { frames }
@@ -728,48 +725,6 @@ async fn beyond_envelope_shed_fails_visibly() {
     // The run stopped at a tick boundary via the fatal signal, not by running
     // the full budget of silent gaps.
     assert!(stop.is_stopped(), "the fatal signal must be raised");
-}
-
-/// The RT-8b decision: cumulative audio samples must track the TICK count, not the
-/// surviving-frame count. Splits out the post-run analysis so the driver test reads
-/// cleanly. `ticks` = output ticks emitted, `dropped` = ticks shed, `cumulative` =
-/// the max audio-packet sample position observed, `per_tick` = samples per tick.
-fn assert_audio_tracks_tick_index(ticks: u64, dropped: u64, cumulative: u64, per_tick: u64) {
-    let survivors = ticks.saturating_sub(dropped);
-    // The drift-free ideal: cumulative audio tracks the TICK count. The last
-    // surviving frame's catch-up `tick_to` brings the bus up to its tick index.
-    let tick_ideal = ticks.saturating_mul(per_tick);
-    let survivor_ceiling = survivors.saturating_mul(per_tick);
-
-    // The DECISIVE assertion: cumulative audio is FAR above what a per-surviving-
-    // frame `bus.tick()` could ever emit (`survivors * per_tick`). Under a heavy
-    // shed `survivors << ticks`, so the pre-RT-8b drift would land cumulative audio
-    // at/below the survivor ceiling; the tick-index driver lands it near the ideal.
-    assert!(
-        survivors < ticks,
-        "the test needs a real shed so the tick-vs-survivor gap exists (survivors {survivors}, \
-         ticks {ticks})"
-    );
-    assert!(
-        cumulative > survivor_ceiling.saturating_add(per_tick),
-        "RT-8b: cumulative audio {cumulative} must exceed the surviving-frame ceiling \
-         {survivor_ceiling} (a per-surviving-frame bus.tick() would trail there) — audio is \
-         drifting behind video under the shed"
-    );
-    // And it tracks the tick timeline within a BOUNDED in-flight tail: when `stop`
-    // lands, the last several emitted ticks are still buffered (hot queue cap + one
-    // in transit + the sink fan-out cap + the slow sink's small drain backlog) and
-    // their surviving frames' catch-up has not yet been fed. That tail is O(cap),
-    // independent of run length — generously bounded at 32 ticks (test (1) measures
-    // the analogous depth at ~9 and ceilings it at 24). The gap this forbids — the
-    // pre-RT-8b drift — is the WHOLE dropped span (hundreds of ticks), not a tail.
-    let tail_slack = 32_u64.saturating_mul(per_tick);
-    assert!(
-        cumulative.saturating_add(tail_slack) >= tick_ideal,
-        "RT-8b: cumulative audio {cumulative} must track the tick ideal {tick_ideal} \
-         (within a bounded {tail_slack}-sample in-flight tail) — the bus must catch up across \
-         every dropped tick, not trail by the dropped span"
-    );
 }
 
 // ===================== FATAL-CONSUMER REGRESSIONS (t63) =====================

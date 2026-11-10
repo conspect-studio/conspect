@@ -74,6 +74,7 @@ pub struct LadderFeed {
 
 /// Explicit outgoing publisher policy. Endpoint credentials stay private and this
 /// type deliberately has no Debug implementation. Protected mode fails closed.
+pub use moq_tokio::connect::Config as RelayConnectConfig;
 pub struct FamilyRelayConfig {
     pub endpoint: url::Url,
     pub connect: moq_tokio::connect::Config,
