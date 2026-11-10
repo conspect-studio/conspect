@@ -298,7 +298,7 @@ fn write_snapshot(path: &Path, bytes: &[u8]) -> io::Result<File> {
         rustix::fs::renameat(&dir, tmp.as_os_str(), &dir, name)?;
     }
     dir.sync_all()?;
-    let mut f = open_private_at(&dir, name, rustix::fs::OFlags::APPEND)?;
+    let f = open_private_at(&dir, name, rustix::fs::OFlags::APPEND)?;
     Ok(f)
 }
 /// Bounded actor+operation+key map. Pending reservations are never evicted.
