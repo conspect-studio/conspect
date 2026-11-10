@@ -19,9 +19,9 @@
 //! external token.
 #![allow(dead_code)] // reason: published registry + tap seam; the reviewed wiring is the single `WindowDelivery` wrap at the egress construction point (output-owner change in this series).
 
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender, TryRecvError, TrySendError};
-use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use ffmpeg_next as ffmpeg;
@@ -1395,7 +1395,7 @@ mod tests {
             .collect()
     }
     fn pointer(packet: &EncodedPacket) -> usize {
-        packet.payload().unwrap().as_ptr() as usize
+        packet.payload().unwrap().as_ptr().addr()
     }
 
     #[test]
@@ -1850,48 +1850,48 @@ mod tests {
         assert_eq!(registry.retained(), (0, 0));
     }
 
-    #[test]
-    fn tap_forwards_the_same_window_and_ends_subscriptions_on_finish() {
-        struct Spy {
-            offers: Vec<(usize, usize, usize)>,
-            finished: bool,
+    struct Spy {
+        offers: Vec<(usize, usize, usize)>,
+        finished: bool,
+    }
+    impl WindowDelivery for Spy {
+        fn offer_window(
+            &mut self,
+            output_index: usize,
+            _generation: u64,
+            packets: Vec<EncodedPacket>,
+            _media_span: Duration,
+            _now: Instant,
+        ) -> Result<(), multiview_output::batch::EmissionError> {
+            self.offers.push((
+                output_index,
+                packets.len(),
+                packets.first().map_or(0, pointer),
+            ));
+            Ok(())
         }
-        impl WindowDelivery for Spy {
-            fn offer_window(
-                &mut self,
-                output_index: usize,
-                _generation: u64,
-                packets: Vec<EncodedPacket>,
-                _media_span: Duration,
-                _now: Instant,
-            ) -> Result<(), multiview_output::batch::EmissionError> {
-                self.offers.push((
-                    output_index,
-                    packets.len(),
-                    packets.first().map_or(0, pointer),
-                ));
-                Ok(())
-            }
-            fn report_loss(&mut self, _output_index: usize, _reason: OfferError) {}
-            fn take_discontinuity(
-                &mut self,
-                _output_index: usize,
-            ) -> Option<multiview_output::batch::Discontinuity> {
-                None
-            }
-            fn generation(&self, _output_index: usize) -> u64 {
-                0
-            }
-            fn statuses(&self) -> Vec<crate::binding_delivery::BindingStatus> {
-                Vec::new()
-            }
-            fn finish(&mut self) {
-                self.finished = true;
-            }
-            fn abort(&mut self) {
-                self.finished = true;
-            }
+        fn report_loss(&mut self, _output_index: usize, _reason: OfferError) {}
+        fn take_discontinuity(
+            &mut self,
+            _output_index: usize,
+        ) -> Option<multiview_output::batch::Discontinuity> {
+            None
         }
+        fn generation(&self, _output_index: usize) -> u64 {
+            0
+        }
+        fn statuses(&self) -> Vec<crate::binding_delivery::BindingStatus> {
+            Vec::new()
+        }
+        fn finish(&mut self) {
+            self.finished = true;
+        }
+        fn abort(&mut self) {
+            self.finished = true;
+        }
+    }
+
+    fn assert_actual_metadata_forwarding() {
         // Exercise the actual no-extradata libx264 open/encode path, not a
         // desired codec token or an independently fabricated parameter record.
         let options = multiview_ffmpeg::CodecOptions::from_pairs(&[
@@ -1983,7 +1983,11 @@ mod tests {
             .unwrap();
         let received = subscribed.try_recv_window().unwrap().unwrap();
         assert_eq!(pointer(&received.permit.packets()[0]), pointer(&source));
+    }
 
+    #[test]
+    fn tap_forwards_the_same_window_and_ends_subscriptions_on_finish() {
+        assert_actual_metadata_forwarding();
         let mut invalid = binding("invalid", 0);
         invalid.video.config = None;
         invalid.video.codec = "H264".into();

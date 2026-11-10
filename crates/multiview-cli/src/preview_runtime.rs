@@ -328,8 +328,7 @@ mod actual_bridge_tests {
         sync::Arc,
         time::{Duration, Instant},
     };
-    #[test]
-    fn actual_factory_packets_reach_registry_subscriber_and_retire_independently() {
+    fn actual_preview_setup() -> (PreviewKey, ResourceCost, EffectiveBinding) {
         let key = PreviewKey {
             program: "main".into(),
             bus: "main".into(),
@@ -362,7 +361,7 @@ mod actual_bridge_tests {
             output_index: 42,
             config_generation: 7,
             video: VideoDescriptor::from_opened(
-                &production_encoder.codec_params(),
+                production_encoder.codec_params(),
                 production_encoder.time_base(),
                 crate::rendition_workers::ReorderBound::NoReorder,
                 key.cadence,
@@ -380,6 +379,11 @@ mod actual_bridge_tests {
                 },
             ],
         };
+        (key, cost, production)
+    }
+    #[test]
+    fn actual_factory_packets_reach_registry_subscriber_and_retire_independently() {
+        let (key, cost, production) = actual_preview_setup();
         let (mut registry, factory) = OutputWindowRegistry::bare(vec![production.clone()], 7);
         let factory = Arc::new(factory);
         let bridge = RuntimeRegistry::new(factory.clone(), "production".into()).unwrap();
