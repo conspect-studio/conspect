@@ -25,7 +25,7 @@
 //   * Every advanced field (input, channels, exact gain, discrete track,
 //     language, title, remove) stays reachable behind the strip's Details;
 //     the sample rate lives in "Bus setup". No function was removed.
-import { useRef, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import type { JSX, ReactNode } from 'react';
 import { Trans, useLingui } from '@lingui/react/macro';
 import { ChevronRight, Plus, Trash2, Undo2 } from 'lucide-react';
@@ -1012,6 +1012,15 @@ export function AudioPage(): JSX.Element {
   const focusedRoute = form === undefined ? undefined : form.routes[focused];
   const [overviewOpen, setOverviewOpen] = useState(false);
   const [bankExpanded, setBankExpanded] = useState(true);
+  const summaryRef = useRef<HTMLDivElement | null>(null);
+  const summaryFocusPending = useRef(false);
+  const [summaryNonce, setSummaryNonce] = useState(0);
+  useEffect(() => {
+    if (summaryFocusPending.current) {
+      summaryFocusPending.current = false;
+      summaryRef.current?.focus();
+    }
+  }, [summaryNonce]);
 
   /** The strip's display label: the managed source's name when known, the
    * raw input id otherwise, and a positional label for an unwritten route. */
@@ -1035,6 +1044,18 @@ export function AudioPage(): JSX.Element {
       if (validation.sampleRateHz !== undefined) {
         setBusSetupOpen(true);
       }
+      const firstBad = validation.routes.findIndex(
+        (routeErrors) => Object.keys(routeErrors).length > 0,
+      );
+      if (firstBad >= 0) {
+        // Make the failure visible in BOTH layouts: select the strip (phone/
+        // tablet focused strip), expand a collapsed desktop bank, then hand
+        // focus to the validation summary so it is announced.
+        setFocusedIndex(firstBad);
+        setBankExpanded(true);
+      }
+      summaryFocusPending.current = true;
+      setSummaryNonce((n) => n + 1);
       setOpenStrips((prev): ReadonlySet<number> => {
         const updated = new Set(prev);
         validation.routes.forEach((routeErrors, index) => {
@@ -1107,6 +1128,40 @@ export function AudioPage(): JSX.Element {
             <p role="alert" className="text-sm text-destructive">
               <FieldErrorMessage code={errors.program} />
             </p>
+          ) : null}
+
+          {errors !== undefined &&
+          errors.routes.some((r) => Object.keys(r).length > 0) ? (
+            <div
+              ref={summaryRef}
+              tabIndex={-1}
+              role="alert"
+              data-testid="audio-validation-summary"
+              className="rounded-md border border-destructive p-3 text-sm text-destructive"
+            >
+              <p className="font-medium">
+                <Trans>Fix these routes before saving:</Trans>
+              </p>
+              <ul className="mt-2 flex flex-wrap gap-2">
+                {errors.routes.map((routeErrors, index) =>
+                  Object.keys(routeErrors).length > 0 && form.routes[index] !== undefined ? (
+                    <li key={rowIds[index]}>
+                      <Button
+                        type="button"
+                        variant="outline"
+                        className="h-auto min-h-12 min-w-12 max-w-full whitespace-normal break-words"
+                        onClick={(): void => {
+                          setFocusedIndex(index);
+                          setBankExpanded(true);
+                        }}
+                      >
+                        {labelFor(form.routes[index], index + 1)}
+                      </Button>
+                    </li>
+                  ) : null,
+                )}
+              </ul>
+            </div>
           ) : null}
 
           {/* Touch-first surface (below xl): pinned chip picker + ONE

@@ -1,5 +1,5 @@
-import { describe, expect, it } from 'vitest';
-import { screen } from '@testing-library/react';
+import { afterEach, describe, expect, it, vi } from 'vitest';
+import { act, screen } from '@testing-library/react';
 
 import { renderWithProviders } from '../../test/render';
 import type { AudioLoudnessState } from '../../realtime/useAudioLoudness';
@@ -17,6 +17,7 @@ const none: AudioLoudnessState = {
 };
 const live: AudioLoudnessState = {
   ...none,
+  receivedAt: Date.now(),
   current: {
     program: 0,
     short_term: -17.84,
@@ -26,6 +27,60 @@ const live: AudioLoudnessState = {
     sampled_hz: 1,
   },
 };
+
+afterEach(() => {
+  vi.useRealTimers();
+});
+
+describe('loudness freshness', () => {
+  const sample = (over: object) => ({
+    program: 0,
+    target_lufs: -23,
+    ceiling_dbtp: -1,
+    tolerance_lu: 1,
+    sampled_hz: 1,
+    ...over,
+  });
+
+  it('shows Unknown after disconnect, not the last sample', () => {
+    const closed: AudioLoudnessState = { ...live, status: 'closed' };
+    renderWithProviders(<AudioPhoneMaster loudness={closed} />);
+    expect(screen.getByTestId('audio-phone-master')).toHaveTextContent('— LUFS');
+    expect(screen.getByTestId('audio-phone-master')).not.toHaveTextContent('-17.8');
+  });
+
+  it('goes Unknown when the stream stalls past the deadline', () => {
+    vi.useFakeTimers();
+    renderWithProviders(
+      <AudioSurface sub="sub" loudness={{ ...live, receivedAt: Date.now() }}>
+        <p>body</p>
+      </AudioSurface>,
+    );
+    expect(screen.getByTestId('audio-loudness-readout')).toHaveTextContent('-17.8 LUFS');
+    act(() => {
+      vi.advanceTimersByTime(7000);
+    });
+    expect(screen.getByTestId('audio-loudness-readout')).toHaveTextContent('— LUFS');
+  });
+
+  it('never shows momentary under the short-term label', () => {
+    const momentaryOnly: AudioLoudnessState = {
+      ...none,
+      receivedAt: Date.now(),
+      current: sample({ momentary: -20.2 }),
+    };
+    renderWithProviders(<AudioPhoneMaster loudness={momentaryOnly} />);
+    expect(screen.getByTestId('audio-phone-master')).toHaveTextContent('— LUFS');
+    renderWithProviders(
+      <AudioSurface sub="sub" loudness={momentaryOnly}>
+        <p>body</p>
+      </AudioSurface>,
+    );
+    const r = screen.getByTestId('audio-loudness-readout');
+    expect(r).toHaveTextContent(/short-term\)\s*— LUFS/);
+    expect(screen.getByTestId('audio-momentary-readout')).toHaveTextContent('-20.2 LUFS');
+  });
+});
 
 describe('AudioSurface', () => {
   it('is namespaced and shows an honest dash without loudness telemetry', () => {

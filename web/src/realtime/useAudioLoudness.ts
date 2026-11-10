@@ -242,6 +242,8 @@ export interface AudioLoudnessState {
   readonly displayMomentary: number | undefined;
   /** The held (max) true-peak since the meter mounted, dBTP. */
   readonly heldPeakDbtp: number | undefined;
+  /** Client receipt time (ms epoch) of `current`; undefined before the first. */
+  readonly receivedAt?: number;
 }
 
 /**
@@ -256,7 +258,13 @@ export function useAudioLoudness(): AudioLoudnessState {
     current: AudioLoudnessSample | undefined;
     displayMomentary: number | undefined;
     heldPeakDbtp: number | undefined;
-  }>({ current: undefined, displayMomentary: undefined, heldPeakDbtp: undefined });
+    receivedAt: number | undefined;
+  }>({
+    current: undefined,
+    displayMomentary: undefined,
+    heldPeakDbtp: undefined,
+    receivedAt: undefined,
+  });
 
   useEffect(() => {
     const ballistics = new LoudnessBallistics();
@@ -276,6 +284,7 @@ export function useAudioLoudness(): AudioLoudnessState {
           current: sample,
           displayMomentary: ballistics.displayMomentary(),
           heldPeakDbtp: ballistics.heldPeakDbtp(),
+          receivedAt: Date.now(),
         });
       },
       setStatus,
@@ -290,5 +299,6 @@ export function useAudioLoudness(): AudioLoudnessState {
     current: state.current,
     displayMomentary: state.displayMomentary,
     heldPeakDbtp: state.heldPeakDbtp,
+    receivedAt: state.receivedAt,
   };
 }

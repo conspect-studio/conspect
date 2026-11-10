@@ -4,18 +4,38 @@
 // desktop strip bank with a right-hand overview/master/monitor rail, and a
 // phone/tablet PROGRAM summary — and say plainly where the production control
 // plane has no capability (master gain/mute, headphone LISTEN/PFL).
+import { useEffect, useState } from 'react';
 import type { JSX, ReactNode } from 'react';
 import { Trans } from '@lingui/react/macro';
 
 import type { AudioLoudnessState } from '../../realtime/useAudioLoudness';
 import './audio-approved.css';
 
-/** Real short-term program loudness, or undefined (never a fabricated value). */
-function programLufs(state: AudioLoudnessState): number | undefined {
-  return state.current?.short_term ?? state.current?.momentary;
+/** A sample older than this is stale: the readout reverts to Unknown. */
+export const LOUDNESS_STALE_MS = 6000;
+
+/** Fresh live sample, or undefined when disconnected/stalled/never received. */
+function useFreshSample(
+  state: AudioLoudnessState,
+): AudioLoudnessState['current'] {
+  const [, setTick] = useState(0);
+  useEffect(() => {
+    const id = setInterval(() => {
+      setTick((n) => n + 1);
+    }, 1000);
+    return (): void => {
+      clearInterval(id);
+    };
+  }, []);
+  if (state.status !== 'open' || state.receivedAt === undefined) {
+    return undefined;
+  }
+  return Date.now() - state.receivedAt > LOUDNESS_STALE_MS
+    ? undefined
+    : state.current;
 }
 
-/** The PROGRAM LOUDNESS readout: live telemetry or an honest dash. */
+/** The PROGRAM LOUDNESS readout: live telemetry or an honest Unknown. */
 export function AudioLoudnessReadout({
   loudness,
   label,
@@ -23,7 +43,9 @@ export function AudioLoudnessReadout({
   readonly loudness: AudioLoudnessState;
   readonly label: ReactNode;
 }): JSX.Element {
-  const value = programLufs(loudness);
+  const sample = useFreshSample(loudness);
+  const value = sample?.short_term;
+  const momentary = sample?.momentary;
   return (
     <div className="audio-meta" data-testid="audio-loudness-readout">
       <span className="lbl">{label}</span>
@@ -32,9 +54,19 @@ export function AudioLoudnessReadout({
       </span>
       {value === undefined ? (
         <span className="sr-only">
-          <Trans>No loudness telemetry</Trans>
+          <Trans>Unknown: no current loudness telemetry</Trans>
         </span>
       ) : null}
+      {momentary === undefined ? null : (
+        <>
+          <span className="lbl">
+            <Trans>MOMENTARY</Trans>
+          </span>
+          <span className="clock-mono" data-testid="audio-momentary-readout">
+            {momentary.toFixed(1)} LUFS
+          </span>
+        </>
+      )}
     </div>
   );
 }
@@ -95,7 +127,7 @@ export function AudioPhoneMaster({
 }: {
   readonly loudness: AudioLoudnessState;
 }): JSX.Element {
-  const value = programLufs(loudness);
+  const value = useFreshSample(loudness)?.short_term;
   return (
     <div
       className="phone-master"

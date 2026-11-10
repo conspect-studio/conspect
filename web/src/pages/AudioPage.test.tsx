@@ -411,6 +411,39 @@ describe("AudioPage", () => {
     expect(screen.getByTestId("audio-bus-setup")).toHaveAttribute("open");
   });
 
+  it("selects the first invalid non-selected route and shows an alert summary (focused strip)", async () => {
+    const bad = { ...ROUTING_TWO, routing: { ...ROUTING_TWO.routing, routes: [
+      ROUTING.routing.routes[0],
+      { ...ROUTING_TWO.routing.routes[1], input_id: "" },
+    ] } };
+    server.use(http.get("*/api/v1/audio-routing", () => HttpResponse.json(bad, { headers: { ETag: 'W/"7"' } })));
+    renderAudio();
+    const { picker } = await console();
+    expect(within(picker).getAllByTestId("audio-strip-chip")[0]).toHaveAttribute("aria-pressed", "true");
+    await userEvent.click(screen.getByTestId("audio-save"));
+    const summary = await screen.findByTestId("audio-validation-summary");
+    expect(summary).toHaveAttribute("role", "alert");
+    expect(within(summary).getByRole("button", { name: /Route 2/ })).toBeInTheDocument();
+    expect(within(picker).getAllByTestId("audio-strip-chip")[1]).toHaveAttribute("aria-pressed", "true");
+    expect(summary).toHaveFocus();
+    expect(lastPut).toBeUndefined();
+  });
+
+  it("expands a collapsed desktop bank on invalid Save so the erroneous strip is visible", async () => {
+    const bad = { ...ROUTING_TWO, routing: { ...ROUTING_TWO.routing, routes: [
+      ROUTING.routing.routes[0],
+      { ...ROUTING_TWO.routing.routes[1], input_id: "" },
+    ] } };
+    server.use(http.get("*/api/v1/audio-routing", () => HttpResponse.json(bad, { headers: { ETag: 'W/"7"' } })));
+    renderAudio();
+    const { bank } = await console();
+    await userEvent.click(within(bank).getByRole("button", { name: /Show selected channel/i }));
+    expect(within(bank).getByRole("button", { name: /Show all channels/i })).toHaveAttribute("aria-expanded", "false");
+    await userEvent.click(screen.getByTestId("audio-save"));
+    expect(await screen.findByTestId("audio-validation-summary")).toBeInTheDocument();
+    expect(within(bank).getByRole("button", { name: /Show selected channel/i })).toHaveAttribute("aria-expanded", "true");
+  });
+
   it("saves the whole document with PUT + If-Match", async () => {
     renderAudio();
     const rate = await screen.findByLabelText(/sample rate/i);
