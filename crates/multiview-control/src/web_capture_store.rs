@@ -101,20 +101,25 @@ impl TermsRepository for DurableTerms {
 /// # Errors
 /// Unsafe or unwritable path.
 pub fn open_private(path: &Path) -> io::Result<File> {
-    match std::fs::symlink_metadata(path) {
-        Ok(m) if !m.file_type().is_file() => {
-            return Err(io::Error::other("capture store path is not a regular file"))
-        }
-        Ok(_) | Err(_) => {}
-    }
-    let mut o = OpenOptions::new();
-    o.create(true).append(true);
-    #[cfg(unix)]
+    let fd = rustix::fs::open(
+        path,
+        rustix::fs::OFlags::RDWR
+            | rustix::fs::OFlags::CREATE
+            | rustix::fs::OFlags::APPEND
+            | rustix::fs::OFlags::NOFOLLOW
+            | rustix::fs::OFlags::CLOEXEC,
+        rustix::fs::Mode::RUSR | rustix::fs::Mode::WUSR,
+    )?;
+    let stat = rustix::fs::fstat(&fd)?;
+    if rustix::fs::FileType::from_raw_mode(stat.st_mode) != rustix::fs::FileType::RegularFile
+        || stat.st_uid != rustix::process::geteuid().as_raw()
+        || stat.st_mode & 0o777 != 0o600
     {
-        use std::os::unix::fs::OpenOptionsExt;
-        o.mode(0o600);
+        return Err(io::Error::other(
+            "capture store must be an owner-private regular file",
+        ));
     }
-    o.open(path)
+    Ok(File::from(fd))
 }
 
 /// Fsync the parent directory so a create or rename survives power loss.
@@ -294,8 +299,7 @@ impl Ledger {
     pub fn durable(path: &Path) -> io::Result<Self> {
         let mut state = State::default();
         if std::fs::symlink_metadata(path).is_ok() {
-            drop(open_private(path)?); // validates regular file
-            let f = File::open(path)?;
+            let f = open_private(path)?; // read the same validated descriptor
             if f.metadata()?.len() > LEDGER_MAX_BYTES {
                 return Err(io::Error::other("capture idempotency journal is too large"));
             }

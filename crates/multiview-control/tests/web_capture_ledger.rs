@@ -125,3 +125,17 @@ fn oversize_journal_is_rejected() {
     std::fs::write(&file, vec![b' '; 4 * 1024 * 1024 + 1]).unwrap();
     assert!(Ledger::durable(&file).is_err());
 }
+
+#[test]
+fn capture_private_file_rejects_symlink_and_nonprivate_mode() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("ledger");
+    drop(multiview_control::web_capture_store::open_private(&file).unwrap());
+    std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o644)).unwrap();
+    assert!(multiview_control::web_capture_store::open_private(&file).is_err());
+    std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let link = dir.path().join("link");
+    std::os::unix::fs::symlink(&file, &link).unwrap();
+    assert!(multiview_control::web_capture_store::open_private(&link).is_err());
+}

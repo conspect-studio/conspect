@@ -13,6 +13,7 @@ publish = false
 
 [dependencies]
 multiview-webengine = { path = "../multiview-webengine" }
+rustix = { version = "1", features = ["fs", "process"] }
 multiview-moq = { path = "../multiview-moq", optional = true }
 multiview-cloudflare = { path = "../multiview-cloudflare" }
 multiview-credentials = { path = "../multiview-credentials" }
