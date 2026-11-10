@@ -25,6 +25,7 @@ let commandCount = 0;
 const server = setupServer(
   http.get('*/api/v1/switcher/me1', () => HttpResponse.json(state)),
   http.get('*/api/v1/layouts', () => HttpResponse.json([])),
+  http.get('*/api/v1/alarms', () => HttpResponse.json([])),
   http.get('*/api/v1/preview/capabilities', () => HttpResponse.json({ webrtc: false })),
   http.get('*/api/v1/sources', () => HttpResponse.json([])),
   http.post('*/api/v1/switcher/plan', () => HttpResponse.json({ can_take: true, class: 'cut', scene_version: 1 })),
@@ -51,6 +52,42 @@ function outcome(id: string, completed: boolean, error?: string) {
 
 // Tracker events are supplied as the shell-owned socket supplies them; no second socket.
 describe('ProductionDesk single-authority completion', () => {
+  it('keeps unsupported transitions disabled before the dominant CUT in DOM order', async () => {
+    const { container } = page();
+    await waitFor(() => { expect(screen.getByRole('button', { name: 'CUT' })).not.toBeDisabled(); });
+    const keys = [...container.querySelectorAll('.bd-takes button')];
+    expect(keys.map((key) => key.textContent)).toEqual(['MIX', 'WIPE', 'DIP', 'AUTO', 'CUT']);
+    for (const key of keys.slice(0, 4)) expect(key).toBeDisabled();
+    expect(screen.getByRole('button', { name: 'MIX' })).toHaveAttribute('aria-pressed', 'true');
+    expect(screen.getByRole('button', { name: 'AUTO' }).title).toContain('422');
+    expect(screen.getByRole('spinbutton', { name: 'Auto frames' })).toBeDisabled();
+    expect(commandCount).toBe(0);
+  });
+
+  it('reads only active system alarms and renders the truthful empty summary', async () => {
+    let filter = '';
+    server.use(http.get('*/api/v1/alarms', ({ request }) => { filter = new URL(request.url).search; return HttpResponse.json([]); }));
+    page();
+    await screen.findByText('No active system alarms reported');
+    expect(new URLSearchParams(filter).get('active')).toBe('true');
+    expect(new URLSearchParams(filter).get('scope')).toBe('system');
+    expect(screen.getByRole('region', { name: 'Active system alarm summary' })).not.toHaveTextContent('DEMO');
+    expect(screen.getByRole('link', { name: 'Open alarms' })).toHaveAttribute('href', '/alarms');
+  });
+
+  it('does not present failed alarm reads as an all-clear', async () => {
+    server.use(http.get('*/api/v1/alarms', () => HttpResponse.json({ title: 'Unavailable' }, { status: 503 })));
+    page();
+    await screen.findByText('Alarm summary unavailable');
+    expect(screen.queryByText('No active system alarms reported')).toBeNull();
+  });
+
+  it('shows at most three actual system alarm records without a synthetic count', async () => {
+    server.use(http.get('*/api/v1/alarms', () => HttpResponse.json(Array.from({ length: 4 }, (_, i) => ({ id: `alarm-${String(i)}`, kind: 'SignalLoss', severity: 'major', scope: { kind: 'system' }, ack: {}, dwell: 0, raised_at: 0, latched: false })))));
+    page();
+    await waitFor(() => { expect(screen.getAllByRole('listitem')).toHaveLength(3); });
+    expect(screen.getAllByText('major')).toHaveLength(3);
+  });
   it('does not clear awaiting state on unrelated topic, M/E, corr or media loading', async () => {
     const { client } = page();
     await waitFor(() => { expect(screen.getByRole('button', { name: 'CUT' })).not.toBeDisabled(); });
