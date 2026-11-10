@@ -456,34 +456,46 @@ pub fn avc_description_framing() -> NalFraming {
 mod tests {
     use super::*;
     fn real_rap() -> Vec<u8> {
-        let output = std::process::Command::new("ffmpeg")
-            .args([
-                "-v",
-                "error",
-                "-f",
-                "lavfi",
-                "-i",
-                "color=size=64x64:rate=25",
-                "-frames:v",
-                "1",
-                "-c:v",
-                "libx264",
-                "-preset",
-                "ultrafast",
-                "-tune",
-                "zerolatency",
-                "-f",
-                "h264",
-                "pipe:1",
-            ])
-            .output()
-            .expect("real libx264 encoder opens and emits");
-        assert!(
-            output.status.success(),
-            "{}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-        output.stdout
+        include_bytes!("../test-fixtures/codec-metadata/libx264-64x64-idr.h264").to_vec()
+    }
+
+    #[cfg(all(feature = "ffmpeg", feature = "gpl-codecs"))]
+    #[test]
+    fn native_libx264_encoder_emission_yields_actual_decoder_metadata() {
+        use ffmpeg_next::{format::Pixel, util::frame::Video};
+        let mut encoder = crate::VideoEncoder::new(&crate::VideoEncodeTarget {
+            codec_name: "libx264".into(),
+            width: 64,
+            height: 64,
+            format: Pixel::YUV420P,
+            time_base: multiview_core::time::Rational::new(1, 25),
+            bit_rate: 100_000,
+            gop: 25,
+            cuda_device: None,
+        })
+        .expect("actual native libx264 encoder opens");
+        let mut frame = Video::new(Pixel::YUV420P, 64, 64);
+        frame.set_pts(Some(0));
+        for plane in 0..3 {
+            frame
+                .data_mut(plane)
+                .fill(if plane == 0 { 16 } else { 128 });
+        }
+        encoder.send_frame(&frame).expect("encode actual frame");
+        encoder.send_eof().expect("flush actual encoder");
+        let mut found = false;
+        while let Some(packet) = encoder.receive_packet().expect("actual encoded packet") {
+            if let Some(payload) = packet.data() {
+                if let Some(config) = AvcDecoderConfig::from_initial_rap(payload) {
+                    assert_eq!(
+                        AvcDecoderConfig::from_extradata(&config.description),
+                        Some(config)
+                    );
+                    found = true;
+                }
+            }
+        }
+        assert!(found, "actual encoder must emit complete SPS/PPS and IDR");
     }
     #[test]
     fn real_libx264_annex_b_to_avcc_roundtrip() {
