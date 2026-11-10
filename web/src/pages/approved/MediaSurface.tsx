@@ -4,6 +4,7 @@
 // contract yet, so they render explicit, specific unavailable states.
 import { useState } from 'react';
 import type { JSX, ReactNode } from 'react';
+import { Link } from 'react-router-dom';
 import { Trans, useLingui } from '@lingui/react/macro';
 
 import { LibraryBrowser } from '../../components/broadcast/library';
@@ -38,6 +39,37 @@ export function CaptureUnavailable(): JSX.Element {
           <li><b><Trans>Interval capture</Trans></b><Trans>No capture scheduling API exists yet.</Trans></li>
           <li><b><Trans>Decoded-memory budget</Trans></b><Trans>No memory-budget report is exposed, so no usage figure is shown.</Trans></li>
         </ul>
+      </div>
+    </aside>
+  );
+}
+
+/**
+ * Graphics region of the Media tab: the real graphics (CG) workflow lives at
+ * /graphics (Playout / Library / Templates / Data). Linked, never simulated.
+ */
+export function GraphicsRegion(): JSX.Element {
+  const views: readonly { to: string; label: ReactNode }[] = [
+    { to: '/graphics', label: <Trans>Playout</Trans> },
+    { to: '/graphics/library', label: <Trans>Library</Trans> },
+    { to: '/graphics/templates', label: <Trans>Templates</Trans> },
+    { to: '/graphics/data', label: <Trans>Data</Trans> },
+  ];
+  return (
+    <aside className="media-side" data-testid="media-graphics-region">
+      <div className="cap-card">
+        <h2><Trans>Graphics</Trans></h2>
+        <p className="rail-note">
+          <Trans>
+            Graphics (CG) playout is a separate workflow: prepare items, cue them on preview and take
+            them to air on a graphics channel. Open it here; nothing is cued or taken from this tab.
+          </Trans>
+        </p>
+        <nav className="gfx-links" aria-label="Graphics workflow">
+          {views.map((v) => (
+            <Link key={v.to} to={v.to} className="gfx-link">{v.label}</Link>
+          ))}
+        </nav>
       </div>
     </aside>
   );
@@ -89,9 +121,9 @@ export function MediaSurface({ tab, onTabChange, transport }: MediaSurfaceProps)
     <div data-approved-page="media" data-mt={tab}>
       <div className="screen-head">
         <div>
-          <h1><Trans>Media · VT</Trans></h1>
+          <h1><Trans>Media · VT & graphics</Trans></h1>
           <p className="screen-sub">
-            <Trans>VT transport, capture and the clip library.</Trans>
+            <Trans>VT transport, graphics, capture and the clip library.</Trans>
             <button
               type="button"
               className="help-btn"
@@ -130,7 +162,10 @@ export function MediaSurface({ tab, onTabChange, transport }: MediaSurfaceProps)
           ))}
         </nav>
       </div>
-      {tab === 'transport' ? <div className="mt-panel mt-transport">{transport}</div> : null}
+      {tab === 'transport' ? <div className="mt-panel mt-transport">
+          <div className="mt-transport-main">{transport}</div>
+          <GraphicsRegion />
+        </div> : null}
       {tab === 'capture' ? <div className="mt-panel mt-capture"><CaptureUnavailable /></div> : null}
       {tab === 'library' ? <div className="mt-panel mt-library"><LibraryTab /></div> : null}
     </div>

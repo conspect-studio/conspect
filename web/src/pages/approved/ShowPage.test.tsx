@@ -18,4 +18,12 @@ describe('ShowPage', () => {
     expect(screen.getByTestId('show-zone').textContent).not.toBe('');
     expect(screen.queryByText('OVERRUN')).toBeNull();
   });
+
+  it('tones disabled controls with the design tokens and states the reason inline', () => {
+    renderWithProviders(<MemoryRouter><ShowPage /></MemoryRouter>);
+    expect(screen.getByRole('button', { name: 'Take next' })).toHaveClass('show-btn-take');
+    expect(screen.getByRole('button', { name: 'Stop live item' })).toHaveClass('show-btn-stop');
+    expect(screen.getByRole('button', { name: 'Arm cue' })).toHaveClass('show-btn-arm');
+    expect(screen.getByTestId('cue-unavailable')).toHaveTextContent('Unavailable');
+  });
 });

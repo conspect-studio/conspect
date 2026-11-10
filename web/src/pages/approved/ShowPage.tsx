@@ -25,8 +25,8 @@ export function ShowPage(): JSX.Element {
   const clock = localClock(now);
   const reason = t`No production rundown API exists, so there is no cue list to take, hold or skip.`;
   const dash = '—';
-  const btn = (label: string): JSX.Element => (
-    <button type="button" className="show-btn" disabled aria-disabled="true" title={reason}>{label}</button>
+  const btn = (label: string, tone: 'take' | 'stop' | 'arm' | 'plain'): JSX.Element => (
+    <button type="button" className={`show-btn show-btn-${tone}`} disabled aria-disabled="true" title={reason}>{label}</button>
   );
   return (
     <div data-approved-page="show">
@@ -66,8 +66,8 @@ export function ShowPage(): JSX.Element {
           <div className="nn-meta"><Trans>No planned cue.</Trans></div>
         </div>
         <div className="nn-actions">
-          {btn(t`Take next`)}
-          {btn(t`Stop live item`)}
+          {btn(t`Take next`, 'take')}
+          {btn(t`Stop live item`, 'stop')}
         </div>
         <p className="nn-note" role="status"><Trans>Unavailable:</Trans> {reason}</p>
       </div>
@@ -90,10 +90,11 @@ export function ShowPage(): JSX.Element {
               <div className="cue-line"><span><Trans>Planned</Trans></span><b>{dash}</b></div>
             </div>
             <div className="cue-actions">
-              {btn(t`Skip cue`)}
-              {btn(t`Hold cue`)}
-              {btn(t`Arm cue`)}
+              {btn(t`Skip cue`, 'plain')}
+              {btn(t`Hold cue`, 'plain')}
+              {btn(t`Arm cue`, 'arm')}
             </div>
+            <p className="nn-note" data-testid="cue-unavailable"><Trans>Unavailable: there is no cue list, so cue actions cannot run.</Trans></p>
           </div>
         </aside>
       </div>
