@@ -21387,7 +21387,8 @@ segment_ms = 1000
             runtime_gate: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             shared_budget: false,
             startup_delay,
-        }.with_admission_budget(&crate::preview_vertical::PreviewAdmissionBudget::new()));
+        }
+        .with_admission_budget(&crate::preview_vertical::PreviewAdmissionBudget::new()));
         pipeline
     }
 

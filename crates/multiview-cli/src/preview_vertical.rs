@@ -39,6 +39,7 @@ impl PreviewAdmissionBudget {
         Self::default()
     }
 
+    #[cfg(test)]
     pub(crate) fn acquire(&self) -> Option<Arc<RuntimePermit>> {
         RuntimePermit::acquire(self.0.clone())
     }
@@ -572,6 +573,13 @@ impl PreviewVertical {
             );
             let Ok(worker) = worker else {
                 alive.store(false, Ordering::Release);
+                // Partial startup owns real native leases too. Close their inputs
+                // and quarantine any hung flush under the same bounded reaper.
+                bounded_reap(permit.clone(), move || {
+                    for worker in workers {
+                        let _ = worker.join();
+                    }
+                });
                 return None;
             };
             workers.push(worker);
