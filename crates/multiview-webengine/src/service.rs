@@ -1013,8 +1013,13 @@ impl Service {
         }
         self.inner.wake.notify_all();
         receive
-            .recv()
-            .map_err(|_| io::Error::other("capture service stopped"))?
+            .recv_timeout(Duration::from_secs(5))
+            .map_err(|error| match error {
+                mpsc::RecvTimeoutError::Timeout => {
+                    io::Error::new(io::ErrorKind::TimedOut, "artifact pin deadline")
+                }
+                mpsc::RecvTimeoutError::Disconnected => io::Error::other("capture service stopped"),
+            })?
     }
 
     /// Cancel the active and queued jobs, stop the worker and join it. Idempotent.

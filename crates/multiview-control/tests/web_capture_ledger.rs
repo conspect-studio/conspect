@@ -135,6 +135,10 @@ fn capture_private_file_rejects_symlink_and_nonprivate_mode() {
     std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o644)).unwrap();
     assert!(multiview_control::web_capture_store::open_private(&file).is_err());
     std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let hardlink = dir.path().join("hardlink");
+    std::fs::hard_link(&file, &hardlink).unwrap();
+    assert!(multiview_control::web_capture_store::open_private(&file).is_err());
+    std::fs::remove_file(&hardlink).unwrap();
     let link = dir.path().join("link");
     std::os::unix::fs::symlink(&file, &link).unwrap();
     assert!(multiview_control::web_capture_store::open_private(&link).is_err());

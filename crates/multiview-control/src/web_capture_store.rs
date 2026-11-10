@@ -114,6 +114,7 @@ pub fn open_private(path: &Path) -> io::Result<File> {
     if rustix::fs::FileType::from_raw_mode(stat.st_mode) != rustix::fs::FileType::RegularFile
         || stat.st_uid != rustix::process::geteuid().as_raw()
         || stat.st_mode & 0o777 != 0o600
+        || stat.st_nlink != 1
     {
         return Err(io::Error::other(
             "capture store must be an owner-private regular file",

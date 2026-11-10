@@ -49,7 +49,7 @@ pub(crate) async fn capabilities(
         params(("Idempotency-Key" = String, Header, description = "Required; same key and body replays the same job.")),
         responses(
             (status = 202, description = "Capture job accepted."),
-            (status = 400, description = "Invalid body, terms or missing key.", body = crate::problem::Problem),
+            (status = 422, description = "Invalid body, terms or missing key.", body = crate::problem::Problem),
             (status = 403, description = "Not authorized.", body = crate::problem::Problem),
             (status = 404, description = "Unknown target player.", body = crate::problem::Problem),
             (status = 409, description = "Key reused with a different body.", body = crate::problem::Problem),
