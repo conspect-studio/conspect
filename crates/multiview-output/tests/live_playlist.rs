@@ -485,3 +485,34 @@ fn background_publish_recovers_without_skipping_the_failed_manifest() {
         );
     }
 }
+
+/// #220 review: dropping a background-published playlist (an errored sink) must
+/// not leave a writer that lands on the manifest path afterwards and races the
+/// next run's publication of the same file.
+#[test]
+fn dropping_a_background_playlist_quiesces_its_writer() {
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let manifest = dir.path().join("index.m3u8");
+    let mut live = LivePlaylist::new(manifest.clone(), 2);
+    let slow: multiview_output::hls::ManifestWriter = Arc::new(|path, bytes| {
+        std::thread::sleep(Duration::from_millis(200));
+        std::fs::write(path, bytes).map_err(|e| multiview_output::Error::Output(e.to_string()))
+    });
+    live.enable_background_publish_with(slow)
+        .expect("publisher");
+    let path = touch_segment(dir.path(), "seg0.ts");
+    live.push_closed_segment("seg0.ts", path, 2.0, 0)
+        .expect("close");
+    drop(live);
+    // The next run publishes the same path immediately after the drop.
+    std::fs::write(&manifest, b"#EXTM3U\n#NEXT-RUN\n").expect("next run");
+    std::thread::sleep(Duration::from_millis(400));
+    assert_eq!(
+        std::fs::read_to_string(&manifest).unwrap(),
+        "#EXTM3U\n#NEXT-RUN\n",
+        "a dropped run's publisher wrote after it was dropped"
+    );
+}

@@ -552,10 +552,19 @@ impl BackgroundPublisher {
 
 impl Drop for BackgroundPublisher {
     fn drop(&mut self) {
-        // An abandoned (never finalized) playlist: let the thread finish the
-        // pending publish and exit; do not wait on it here.
+        // An abandoned (never finalized) playlist — e.g. a sink that errored.
+        // Quiesce before returning: the thread finishes any pending publish and
+        // exits, so no write to this path can outlive the sink and race the next
+        // run's publication of the same file. Teardown only (never the packet
+        // path); bounded by one manifest write.
         lock(&self.shared.slot).finished = true;
         self.shared.wake.notify_one();
+        if let Some(thread) = self.thread.take() {
+            // A panicked publisher has nothing left to write; ignore it here.
+            match thread.join() {
+                Ok(()) | Err(_) => {}
+            }
+        }
     }
 }
 
