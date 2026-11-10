@@ -56,9 +56,9 @@
 .bd-monitor{margin:0;background:var(--bd-bg1);border:1px solid var(--bd-line2);border-radius:12px;overflow:hidden;min-width:0}
 .bd-monitor[data-tally=program]{border-color:var(--bd-red);box-shadow:0 0 0 1px var(--bd-red),0 0 24px #e5484d40}
 .bd-monitor[data-tally=preview]{border-color:var(--bd-amber)}
-.bd-picture{aspect-ratio:16/9;max-height:230px;width:100%;position:relative;overflow:hidden;background:radial-gradient(120% 90% at 30% 20%,#232b36 0%,#12151c 60%,#0c0f14 100%);display:flex;align-items:center;justify-content:center;font:13px monospace;color:var(--bd-muted);text-align:center}
+.bd-picture{aspect-ratio:16/9;max-height:none;width:100%;position:relative;overflow:hidden;background:radial-gradient(120% 90% at 30% 20%,#232b36 0%,#12151c 60%,#0c0f14 100%);display:flex;align-items:center;justify-content:center;font:13px monospace;color:var(--bd-muted);text-align:center}
 .bd-picture>div{width:100%}
-.bd-picture img,.bd-picture video,.bd-video{width:100%;height:100%;object-fit:contain;min-height:100px}
+.bd-picture img,.bd-picture video,.bd-video{width:100%;height:100%;object-fit:contain}
 .bd-monitor figcaption{display:flex;gap:10px;flex-wrap:wrap;padding:10px 12px;border-top:1px solid var(--bd-line);background:var(--bd-bg2);font-size:13px}
 .bd-monitor figcaption small{width:100%;font-size:12px;color:var(--bd-muted)}
 .bd-pgm figcaption b,.bd-red{color:var(--bd-red)}
@@ -122,7 +122,7 @@
 @media(max-width:1279px){.bd-bus>div{display:flex;flex-wrap:wrap}
 .bd-bus button{min-width:68px;max-width:150px}
 .bd-desk-grid{grid-template-columns:1.05fr 1fr;grid-template-areas:'pgm pvw' 'sw sw' 'mv mv' 'rail rail'}
-.bd-picture{max-height:128px}
+
 .bd-takes{order:-1;margin:0 0 8px}
 .bd-switcher h2{order:-2}
 .bd-takes label{width:auto}
@@ -149,7 +149,7 @@
 .bd-tick b{font-size:16px}
 .bd-operation{margin-bottom:10px}
 .bd-desk-grid{grid-template-columns:1fr 1fr;gap:10px;grid-template-areas:'pgm pgm' 'pvw pvw' 'sw sw' 'mv mv' 'rail rail'}
-.bd-picture{max-height:112px}
+
 .bd-monitor figcaption{padding:8px;gap:4px;font-size:12px}
 .bd-monitor figcaption small{font-size:12px}
 .bd-meter-note{font-size:12px;padding:6px 8px}
@@ -233,9 +233,24 @@
 .bd-tabs{gap:0}
 .bd-tabs a{padding:0 7px;font-size:13px;min-width:48px;justify-content:center}
 }
+
+/* Fix10: approved geometry. Monitors are independent 16:9 picture frames (never stretched to the
+   switcher column); wall sits directly under them in the left column, rail under the switcher. */
+.bd-heading-side{display:flex;align-items:center;gap:12px}
+.bd-heading-side .bd-alarm-btn{min-height:48px;min-width:48px;padding:0 12px;font-size:16px}
+.bd-left,.bd-right{display:contents}
+.bd-monitors{display:contents}
+.bd-jpeg{position:relative;width:100%;height:100%}
+.bd-jpeg img{position:absolute;inset:0}
+.bd-still-label{position:absolute;bottom:0;left:0;width:100%;margin:0;padding:4px 8px;font-size:12px;background:#0a0c0fcc;color:var(--bd-muted);text-align:left}
+.bd-picture{max-height:none}
 @media(min-width:1280px){
-.bd-desk-grid{align-items:stretch}
-.bd-pgm,.bd-pvw{display:flex;flex-direction:column}
-.bd-pgm .bd-picture,.bd-pvw .bd-picture{flex:1 1 auto;max-height:none;aspect-ratio:auto;min-height:150px}
-.bd-wall,.bd-rail{align-self:start}
+.bd-desk-grid{display:grid;grid-template-columns:minmax(0,3.7fr) minmax(340px,1.05fr);grid-template-areas:none;align-items:start}
+.bd-left,.bd-right{display:flex;flex-direction:column;gap:14px;min-width:0}
+.bd-monitors{display:grid;grid-template-columns:minmax(0,2.3fr) minmax(0,1.4fr);gap:14px;align-items:start}
+.bd-pgm,.bd-pvw{grid-area:auto;align-self:start}
+.bd-wall,.bd-rail,.bd-switcher{grid-area:auto;align-self:stretch}
+.bd-pgm,.bd-pvw{display:block}
+.bd-pgm .bd-picture,.bd-pvw .bd-picture{flex:none;aspect-ratio:16/9;max-height:none;min-height:0;height:auto}
 }
+@media(max-width:1279px){.bd-picture{aspect-ratio:16/9;max-height:none}}

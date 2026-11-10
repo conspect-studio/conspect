@@ -71,7 +71,7 @@ describe('ProductionDesk single-authority completion', { timeout: 15000 }, () =>
     const { container } = page();
     await waitFor(() => { expect(screen.getByRole('button', { name: 'CUT' })).not.toBeDisabled(); }, { timeout: 6000 });
     expect(screen.getByRole('button', { name: 'CUT' })).toHaveTextContent('CUT · cam-2');
-    expect(container.querySelector('.bd-cutrow .bd-alarm-btn')).toHaveAttribute('href', '/alarms');
+    expect(container.querySelector('.bd-heading-side .bd-alarm-btn')).toHaveAttribute('href', '/alarms');
     expect(container.querySelector('.bd-more')).toContainElement(screen.getByRole('spinbutton', { name: 'Auto frames' }));
     expect(container.querySelector('.bd-takes>label')).toBeNull();
   });
