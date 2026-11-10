@@ -284,6 +284,8 @@ reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"
 tokio-rustls = "0.26"
 
 [features]
+# External Chrome/FFmpeg proof runs in its required Linux CI leg.
+capture-browser-integration = []
 # Authenticated QUIC transport remains opt-in until a production feed factory is wired.
 moq-transport = ["dep:multiview-moq"]
 "default" = ["openapi"]

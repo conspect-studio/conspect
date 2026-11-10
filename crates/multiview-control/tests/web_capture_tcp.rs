@@ -48,6 +48,7 @@ fn json(response: &str) -> serde_json::Value {
 async fn actual_tcp_post_runs_service_and_returns_owner_scoped_artifact() {
     capture_flow(false).await;
 }
+#[cfg(feature = "capture-browser-integration")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn actual_browser_http_post_commits_decodable_artifact() {
     capture_flow(true).await;

@@ -151,6 +151,36 @@ jobs:
         # without it — so the lint build is deterministic.
         run: cargo clippy --locked --workspace --all-targets -- -D warnings
 
+  capture-browser:
+    name: required real-browser capture HTTP
+    needs: changes
+    if: ${{ github.event_name != 'pull_request' || needs.changes.outputs.code == 'true' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@1.99.1
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '22'
+      - name: provision required capture tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg
+          npx --yes --package=playwright@1.58.2 playwright install --with-deps chromium
+          echo "CONSPECT_WEB_NODE=$(command -v node)" >> "$GITHUB_ENV"
+          echo "CONSPECT_WEB_FFMPEG=$(command -v ffmpeg)" >> "$GITHUB_ENV"
+          browser=$(find "$HOME/.cache/ms-playwright" -type f -name chrome-headless-shell | head -n 1)
+          test -n "$browser"
+          echo "CONSPECT_WEB_BROWSER=$browser" >> "$GITHUB_ENV"
+      - name: require real browser HTTP test with positive count
+        shell: bash
+        run: |
+          set -o pipefail
+          cargo test --locked -p multiview-control --features capture-browser-integration --test web_capture_tcp actual_browser_http_post_commits_decodable_artifact -- --exact 2>&1 | tee capture-browser-proof.log
+          grep -F 'test result: ok. 1 passed; 0 failed;' capture-browser-proof.log
+
   test:
     name: check + test (${{ matrix.os }})
     # The long pole of CI: macOS check+test runs ~15min warm (the slowest leg);
@@ -169,42 +199,11 @@ jobs:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@1.99.1
       - uses: Swatinem/rust-cache@v2
-      # Capture tests invoke external tools, never link FFmpeg into the default build.
-      - uses: actions/setup-node@v6
-        with:
-          node-version: '22'
-      - name: provision required capture tools (Linux)
-        if: runner.os == 'Linux'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y ffmpeg
-          npx --yes --package=playwright@1.58.2 playwright install --with-deps chromium
-          echo "CONSPECT_WEB_NODE=$(command -v node)" >> "$GITHUB_ENV"
-          echo "CONSPECT_WEB_FFMPEG=$(command -v ffmpeg)" >> "$GITHUB_ENV"
-      - name: provision required capture tools (macOS)
-        if: runner.os == 'macOS'
-        run: |
-          brew install ffmpeg
-          npx --yes --package=playwright@1.58.2 playwright install chromium
-          echo "CONSPECT_WEB_NODE=$(command -v node)" >> "$GITHUB_ENV"
-          echo "CONSPECT_WEB_FFMPEG=$(command -v ffmpeg)" >> "$GITHUB_ENV"
-      - name: resolve required capture browser
-        shell: bash
-        run: |
-          browser=$(find "$HOME/.cache/ms-playwright" "$HOME/Library/Caches/ms-playwright" -type f \( -name chrome-headless-shell -o -name Chromium \) 2>/dev/null | head -n 1 || true)
-          test -n "$browser"
-          echo "CONSPECT_WEB_BROWSER=$browser" >> "$GITHUB_ENV"
       # Default features are pure-Rust (no FFmpeg/GPU), so CI needs no native libs.
       # --locked enforces the committed Cargo.lock — cargo ignores the lockfile
       # without it — so check + test are deterministic.
       - name: cargo check
         run: cargo check --locked --workspace
-      - name: required real-browser capture proof
-        shell: bash
-        run: |
-          set -o pipefail
-          cargo test --locked -p multiview-control --test web_capture_tcp actual_browser_http_post_commits_decodable_artifact -- --exact 2>&1 | tee capture-browser-proof.log
-          grep -F 'test result: ok. 1 passed; 0 failed;' capture-browser-proof.log
       - name: cargo test
         # Skip the compositor per-tick perf BUDGET test on shared CI runners: it
         # asserts a wall-clock ceiling only meaningful on consistent hardware
