@@ -199,6 +199,12 @@ jobs:
       # without it — so check + test are deterministic.
       - name: cargo check
         run: cargo check --locked --workspace
+      - name: required real-browser capture proof
+        shell: bash
+        run: |
+          set -o pipefail
+          cargo test --locked -p multiview-control --test web_capture_tcp actual_browser_http_post_commits_decodable_artifact -- --exact 2>&1 | tee capture-browser-proof.log
+          grep -F 'test result: ok. 1 passed; 0 failed;' capture-browser-proof.log
       - name: cargo test
         # Skip the compositor per-tick perf BUDGET test on shared CI runners: it
         # asserts a wall-clock ceiling only meaningful on consistent hardware
