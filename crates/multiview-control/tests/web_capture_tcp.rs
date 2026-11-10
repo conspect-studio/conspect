@@ -2,8 +2,10 @@
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
 mod support;
 use multiview_control::{
-    command_bus, web_capture::Provider,
-    web_capture_store::{DurableTerms, Ledger}, AppState, EngineStateSnapshot, InMemoryRepository,
+    command_bus,
+    web_capture::Provider,
+    web_capture_store::{DurableTerms, Ledger},
+    AppState, EngineStateSnapshot, InMemoryRepository,
 };
 use multiview_engine::EnginePublisher;
 use multiview_events::Event;
@@ -54,7 +56,7 @@ async fn actual_tcp_post_runs_service_and_returns_owner_scoped_artifact() {
     let store = ArtifactStore::open(
         &store_path,
         Limits {
-            bytes: 1_000_000,
+            bytes: 128 * 1024 * 1024,
             count: 20,
         },
     )
@@ -110,17 +112,49 @@ async fn actual_tcp_post_runs_service_and_returns_owner_scoped_artifact() {
     );
     let id = json(&response)["job_id"].as_u64().unwrap();
     // Same key + body replays the same job; divergent body is 409.
-    let replay = request_keyed(address, "POST", "/api/v1/media/captures", &body, support::OPERATOR_TOKEN, "get-key").await;
+    let replay = request_keyed(
+        address,
+        "POST",
+        "/api/v1/media/captures",
+        &body,
+        support::OPERATOR_TOKEN,
+        "get-key",
+    )
+    .await;
     assert_eq!(json(&replay)["job_id"].as_u64().unwrap(), id, "{replay}");
     let divergent = body.replace("\"frames\":2", "\"frames\":3");
-    let r = request_keyed(address, "POST", "/api/v1/media/captures", &divergent, support::OPERATOR_TOKEN, "get-key").await;
+    let r = request_keyed(
+        address,
+        "POST",
+        "/api/v1/media/captures",
+        &divergent,
+        support::OPERATOR_TOKEN,
+        "get-key",
+    )
+    .await;
     assert!(r.contains(" 409"), "{r}");
     // Missing key rejected.
-    let no_key = request_keyed(address, "POST", "/api/v1/media/captures", &body, support::OPERATOR_TOKEN, "").await;
-    assert!(no_key.contains(" 400"), "{no_key}");
+    let no_key = request_keyed(
+        address,
+        "POST",
+        "/api/v1/media/captures",
+        &body,
+        support::OPERATOR_TOKEN,
+        "",
+    )
+    .await;
+    assert!(no_key.contains(" 422"), "{no_key}");
     // Unknown target player rejected before allocation.
     let with_player = body.replace("\"view\"", "\"target_player\":\"no-such-player\",\"view\"");
-    let r = request_keyed(address, "POST", "/api/v1/media/captures", &with_player, support::OPERATOR_TOKEN, "k-player").await;
+    let r = request_keyed(
+        address,
+        "POST",
+        "/api/v1/media/captures",
+        &with_player,
+        support::OPERATOR_TOKEN,
+        "k-player",
+    )
+    .await;
     assert!(r.contains(" 404"), "{r}");
     // Terms acceptance durably recorded.
     let log = std::fs::read_to_string(root.path().join("terms.log")).unwrap();
@@ -134,6 +168,16 @@ async fn actual_tcp_post_runs_service_and_returns_owner_scoped_artifact() {
             if value["state"] == "succeeded" {
                 break value;
             }
+            assert_ne!(
+                value["state"],
+                "failed",
+                "{value}; {:?}",
+                service.status(
+                    "operator-key",
+                    multiview_webengine::service::JobId::from_raw(id)
+                )
+            );
+            assert_ne!(value["state"], "uncertain", "{value}");
             tokio::task::yield_now().await;
         }
     })
@@ -145,12 +189,35 @@ async fn actual_tcp_post_runs_service_and_returns_owner_scoped_artifact() {
     // A different key with the same Operator role must not see the job or artifact.
     let other = request(address, "GET", &path, "", support::ADMIN_TOKEN).await;
     assert!(other.contains(" 404"), "{other}");
-    let other = request(address, "GET", &format!("{path}/artifact"), "", support::ADMIN_TOKEN).await;
+    let other = request(
+        address,
+        "GET",
+        &format!("{path}/artifact"),
+        "",
+        support::ADMIN_TOKEN,
+    )
+    .await;
     assert!(other.contains(" 404"), "{other}");
     // Cancelling a finished job is 409; unknown job 404.
-    let r = request_keyed(address, "POST", &format!("{path}/cancel"), "", support::OPERATOR_TOKEN, "c1").await;
+    let r = request_keyed(
+        address,
+        "POST",
+        &format!("{path}/cancel"),
+        "",
+        support::OPERATOR_TOKEN,
+        "c1",
+    )
+    .await;
     assert!(r.contains(" 409"), "{r}");
-    let r = request_keyed(address, "POST", "/api/v1/media/captures/999999/cancel", "", support::OPERATOR_TOKEN, "c2").await;
+    let r = request_keyed(
+        address,
+        "POST",
+        "/api/v1/media/captures/999999/cancel",
+        "",
+        support::OPERATOR_TOKEN,
+        "c2",
+    )
+    .await;
     assert!(r.contains(" 404"), "{r}");
     stop.send(()).unwrap();
     server.await.unwrap().unwrap();

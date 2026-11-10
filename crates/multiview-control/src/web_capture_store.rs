@@ -6,7 +6,7 @@ use sha2::{Digest, Sha256};
 use std::{
     collections::{HashMap, VecDeque},
     fs::{File, OpenOptions},
-    io::{self, BufRead, Read, Write},
+    io::{self, Read, Write},
     path::{Path, PathBuf},
     sync::Mutex,
 };
@@ -311,7 +311,9 @@ impl Ledger {
             // Same order as runtime: oldest completed first, never pending.
             let limit = LEDGER_CAPACITY + 1;
             if !state.make_room(limit) {
-                return Err(io::Error::other("capture idempotency journal over capacity"));
+                return Err(io::Error::other(
+                    "capture idempotency journal over capacity",
+                ));
             }
             let snap = state.snapshot()?;
             drop(write_snapshot(path, &snap)?);

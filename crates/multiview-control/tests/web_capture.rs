@@ -4,8 +4,20 @@ mod support;
 use axum::http::StatusCode;
 use serde_json::json;
 use support::{
-    body_json, get, harness_with, post_json, send, OPERATOR_TOKEN, SCOPED_TOKEN, VIEWER_TOKEN,
+    body_json, get, harness_with, post_json as plain_post_json, send, OPERATOR_TOKEN, SCOPED_TOKEN,
+    VIEWER_TOKEN,
 };
+fn post_json(
+    path: &str,
+    token: &str,
+    body: &serde_json::Value,
+) -> axum::http::Request<axum::body::Body> {
+    let mut request = plain_post_json(path, token, body);
+    request
+        .headers_mut()
+        .insert("idempotency-key", "capture-test".parse().unwrap());
+    request
+}
 fn body() -> serde_json::Value {
     json!({"fill_id":"radar","target_player":null,"view":{"lat":-33.946,"lon":150.37,"zoom":10,"overlay":"radar","width":1280,"height":720,"fps":2,"frames":12,"public":true},"terms":{"accepted":true,"version":"windy-2023-09-01"}})
 }
@@ -24,7 +36,9 @@ async fn capture_routes_report_unavailable_without_creating_fake_jobs() {
         post_json("/api/v1/media/captures", OPERATOR_TOKEN, &body()),
     )
     .await;
-    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let status = response.status();
+    let details = body_json(response).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{details}");
 }
 #[tokio::test]
 async fn viewer_and_other_object_are_denied_before_provider_admission() {
@@ -68,7 +82,7 @@ async fn terms_and_untrusted_fields_are_rejected() {
         post_json("/api/v1/media/captures", OPERATOR_TOKEN, &input),
     )
     .await;
-    assert_eq!(r.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(r.status(), StatusCode::UNPROCESSABLE_ENTITY);
     let mut input = body();
     input["html"] = json!("<script>bad()</script>");
     let r = send(
