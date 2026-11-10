@@ -561,7 +561,9 @@ pub fn run_capture_observed(
     command
         .args([
             "-e",
-            &HOST.replace("/*WINDY_TEMPLATE*/", include_str!("template_windy.cjs")).replace("/*MOV_COLOR*/", include_str!("mov_color.cjs")),
+            &HOST
+                .replace("/*WINDY_TEMPLATE*/", include_str!("template_windy.cjs"))
+                .replace("/*MOV_COLOR*/", include_str!("mov_color.cjs")),
         ])
         .env_clear()
         .env("PATH", "/usr/bin:/bin")
