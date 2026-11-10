@@ -208,13 +208,12 @@ describe("AppLayout — unchanged shell behaviors", () => {
     expect(main).toHaveAttribute("tabindex", "-1");
   });
 
-  it("renders the routed outlet inside the main region and the desktop-only footer", () => {
+  it("renders the routed outlet inside the main region without an overlay footer", () => {
     renderShell("/a");
     const main = document.getElementById("main-content");
     expect(main).toContainElement(screen.getByRole("heading", { name: "Page A" }));
     const footer = document.querySelector("footer");
-    expect(footer).not.toBeNull();
-    expect(footer?.className).toMatch(/hidden/);
+    expect(footer).toBeNull();
   });
 
   it("moves focus to the main region on route change (SC 2.4.3)", async () => {
@@ -227,11 +226,12 @@ describe("AppLayout — unchanged shell behaviors", () => {
     expect(document.activeElement).toBe(main);
   });
 
-  it("renders the desktop navigation rail with the primary nav", () => {
+  it("renders six core links without a primary sidebar", () => {
     renderShell("/a");
-    const nav = screen.getByRole("navigation", { name: "Primary" });
-    expect(within(nav).getByText("Multiview")).toBeInTheDocument();
-    expect(within(nav).getByRole("link", { name: /outputs/i })).toBeInTheDocument();
+    const nav = screen.getByRole("navigation", { name: "Core screens" });
+    expect(within(nav).getAllByRole("link")).toHaveLength(6);
+    expect(within(nav).getByRole("link", { name: /Desk/ })).toHaveAttribute("href", "/");
+    expect(screen.queryByRole("navigation", { name: "Primary" })).toBeNull();
   });
 
   it("opens the mobile drawer from a 48px key and closes it on navigate", async () => {
@@ -239,10 +239,10 @@ describe("AppLayout — unchanged shell behaviors", () => {
     renderShell("/a");
     const trigger = screen.getByRole("button", { name: "Open navigation" });
     // The broadcast 48px touch floor: the key is 48×48, not the 36px icon size.
-    expect(trigger.className).toMatch(/size-12/);
+    expect(trigger.className).toMatch(/bd-icon/);
     expect(trigger.className).not.toMatch(/size-9/);
     await user.click(trigger);
-    const dialog = screen.getByRole("dialog", { name: "Navigation" });
+    const dialog = screen.getByRole("dialog", { name: "All screens" });
     await user.click(within(dialog).getByRole("link", { name: /outputs/i }));
     await waitFor(() => {
       expect(screen.queryByRole("dialog")).toBeNull();
@@ -257,7 +257,8 @@ describe("AppLayout — unchanged shell behaviors", () => {
     pending = [pendingAction()];
     mockHealth.current = { warnings: [warning()], status: "open" };
     renderShell("/a");
-    // Account-side chrome: the claimed licence chip links to the licence screen.
+    await userEvent.setup().click(screen.getByRole("button", { name: "Open navigation" }));
+    // Account controls remain accessible in All screens.
     const chip = await screen.findByRole("link", { name: /studio/i });
     expect(chip).toHaveAttribute("href", "/settings/licence");
     expect(chip.className).toContain("min-h-12");
@@ -279,49 +280,22 @@ describe("AppLayout — unchanged shell behaviors", () => {
       expect(screen.queryByTestId("pending-action-strip")).toBeNull();
     });
     expect(screen.queryByRole("alert")).toBeNull();
-    // The unclaimed licence chip still mounts and links to the account screen.
+    await userEvent.setup().click(screen.getByRole("button", { name: "Open navigation" }));
+    // The unclaimed licence chip remains accessible in All screens.
     expect(
       await screen.findByRole("link", { name: /unclaimed/i }),
     ).toHaveAttribute("href", "/settings/account");
   });
 });
 
-describe("AppLayout — touch-friendly responsive header", () => {
-  it("keeps every header row at least 48px tall and wraps instead of clipping", () => {
+describe("AppLayout — approved broadcast header", () => {
+  it("keeps account, locale and theme controls accessible in All screens", async () => {
     renderShell("/a");
-    const header = screen.getByRole("banner");
-    expect(header.className).toMatch(/min-h-14/);
-    expect(header.className).toMatch(/flex-wrap/);
-    // No fixed header height: a wrapped row must be able to grow, not clip.
-    expect(header.className).not.toMatch(/(?:^|\s)h-14(?:\s|$)/);
-    // The producer line takes its own full-width row at touch widths and
-    // becomes the flexible middle at md+; it can shrink and wrap.
-    const producerRow = document
-      .querySelector("[data-producer-badge]")
-      ?.closest(".basis-full");
-    expect(producerRow).not.toBeNull();
-    expect(producerRow?.className).toMatch(/order-last/);
-    expect(producerRow?.className).toMatch(/min-w-0/);
-    expect(producerRow?.className).toMatch(/md:flex-1/);
-  });
-
-  it("keeps the locale and theme controls mounted in the header cluster", () => {
-    renderShell("/a");
-    const language = screen.getByRole("combobox", { name: "Language" });
-    expect(language.className).toContain("min-h-12");
-    expect(language.className).toContain("max-w-full");
-    const cluster = language.parentElement;
-    expect(cluster?.className).toContain("flex-wrap");
-    expect(cluster?.className).toContain("min-w-0");
-    expect(screen.getByRole("button", { name: /theme/i }).className).toContain("size-12");
-    expect(screen.getByRole("main").className).toContain("min-w-0");
-    const footer = screen.getByRole("button", { name: "Open the system metrics page" });
-    expect(footer.className).toContain("min-h-12");
-    expect(footer.className).toContain("flex-wrap");
-    const exportButton = screen.getByRole("button", { name: "Export configuration" });
-    expect(exportButton.className).toContain("min-h-12");
-    expect(exportButton.className).toContain("whitespace-normal");
-    expect(exportButton.className).toContain("max-w-full");
+    expect(screen.getByRole("banner").className).toBe("bd-top");
+    await userEvent.setup().click(screen.getByRole("button", { name: "Open navigation" }));
+    expect(screen.getByRole("combobox", { name: "Language" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /theme/i })).toBeInTheDocument();
+    expect(screen.getByRole("link", { name: /Account/ })).toBeInTheDocument();
   });
 });
 

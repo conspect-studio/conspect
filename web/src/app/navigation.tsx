@@ -48,7 +48,8 @@ export interface NavItem {
 
 /** The primary navigation, in display order. */
 export const NAV_ITEMS: readonly NavItem[] = [
-  { path: "/", label: <Trans>Dashboard</Trans>, Icon: LayoutDashboard },
+  { path: "/", label: <Trans>Production desk</Trans>, Icon: PanelsTopLeft },
+  { path: "/dashboard", label: <Trans>Dashboard</Trans>, Icon: LayoutDashboard },
   { path: "/layouts", label: <Trans>Layouts</Trans>, Icon: LayoutGrid },
   { path: "/sources", label: <Trans>Sources</Trans>, Icon: Radio },
   { path: "/outputs", label: <Trans>Outputs</Trans>, Icon: Send },
