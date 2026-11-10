@@ -267,3 +267,25 @@
 @media(max-width:767px){.bd-desk-clock{padding:6px 10px;gap:8px}.bd-heading-side{flex-wrap:wrap;gap:8px}.bd-cell-na{padding:2px 6px}}
 @media(max-width:1279px){.bd-pgm .bd-picture,.bd-pvw .bd-picture{max-height:128px}}
 @media(max-width:767px){.bd-pgm .bd-picture,.bd-pvw .bd-picture{max-height:112px}}
+
+/* Fix14: approved two-line bus keys in a 4-column grid; wrapping secondary caption; phone heading stacks clock under title. */
+.bd-bus>div{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:6px}
+.bd-bus button{min-width:0;max-width:none;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:2px;padding:4px 6px}
+.bd-bus button .bd-key-name{display:block;max-width:100%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.bd-bus button .bd-idx{margin:0;padding:0;opacity:1;color:var(--bd-muted)}
+.bd-bus button[aria-pressed=true] .bd-idx{color:inherit}
+.bd-bus>div>span{grid-column:1/-1}
+.bd-monitor figcaption{display:block;padding:8px 12px}
+.bd-capline{display:flex;gap:4px 10px;flex-wrap:wrap;align-items:baseline}
+.bd-monitor figcaption small{display:block;width:auto;margin-top:2px;text-align:left;white-space:normal;overflow:visible;text-overflow:clip;line-height:1.35}
+.bd-meter-note{white-space:normal;overflow:visible;text-overflow:clip}
+@media(max-width:767px){
+.bd-heading{flex-direction:column;align-items:stretch;gap:8px}
+.bd-heading-side{flex-direction:row;align-items:stretch;flex-wrap:wrap}
+.bd-desk-clock{flex:1 1 100%;min-width:0}
+.bd-heading h1{white-space:nowrap}
+}
+.bd-bus>div{grid-auto-rows:48px}
+.broadcast-shell .bd-bus-preview button[aria-pressed=true]:disabled{color:#14100a}
+.broadcast-shell .bd-bus-program button[aria-pressed=true]:disabled{color:#1c0509}
+.bd-bus button .bd-key-name{color:inherit;padding:0;font-size:12px}

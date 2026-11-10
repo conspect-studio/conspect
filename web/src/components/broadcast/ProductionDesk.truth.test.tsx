@@ -52,9 +52,11 @@ describe('ProductionDesk truthful wall, indices and meters', () => {
   });
   it('shows real source-order index numerals on bus buttons', async () => {
     const { container } = page();
-    await screen.findAllByText('CAM D', { selector: '.bd-bus button' });
+    await screen.findAllByText('CAM D', { selector: '.bd-bus button .bd-key-name' });
     const first = container.querySelectorAll('.bd-bus-preview button');
     expect([...first].map((b) => b.querySelector('.bd-idx')?.textContent)).toEqual(['1', '2', '3', '4']);
+    // two-line key: name on line 1, index on line 2
+    expect([...first].map((b) => b.querySelector('.bd-key-name')?.textContent)).toEqual(['CAM A', 'CAM B', 'CAM C', 'CAM D']);
   });
   it('program meters are explicit unavailable without telemetry, real values with it', async () => {
     page();

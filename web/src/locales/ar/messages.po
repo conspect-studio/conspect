@@ -14,8 +14,12 @@ msgstr ""
 "Plural-Forms: \n"
 
 #: src/components/broadcast/ProductionDesk.tsx:38
-msgid " · Still preview (~1 fps), live video unavailable"
-msgstr ""
+#~ msgid " · Still preview (~1 fps) — live video is unavailable for this preview"
+#~ msgstr ""
+
+#: src/components/broadcast/ProductionDesk.tsx:38
+#~ msgid " · Still preview (~1 fps), live video unavailable"
+#~ msgstr ""
 
 #: src/pages/approved/SourcesSurface.tsx:219
 msgid "— dark"
@@ -10223,6 +10227,10 @@ msgstr ""
 
 #: src/pages/MonitoringPage.tsx:231
 msgid "Still preview (~1 fps)"
+msgstr ""
+
+#: src/components/broadcast/ProductionDesk.tsx:38
+msgid "Still preview (~1 fps) — live video is unavailable for this preview"
 msgstr ""
 
 #: src/preview/PreviewSurface.tsx:97
