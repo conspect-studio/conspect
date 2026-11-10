@@ -33,7 +33,8 @@ function PreviewMonitor({ program, source, fresh }: { readonly program: boolean;
   const caps = usePreviewCapabilities();
   const pvw = useJpegPreview('/api/v1/preview/switcher/me1/preview.jpg', 1000, !program);
   return <figure className={`bd-monitor ${program ? 'bd-pgm' : 'bd-pvw'}`} data-tally={fresh && source ? (program ? 'program' : 'preview') : 'unknown'}>
-    <div className="bd-picture">{program ? <PreviewSurface scope="program" whepEndpoint="/api/v1/preview/program/whep" jpegPath="/api/v1/preview/program.jpg" label={t`Program monitor`} capabilities={caps.data} className="bd-video" /> : pvw ? <div className="bd-jpeg"><img src={pvw} alt={t`Preview monitor`} /><p className="bd-still-label"><Trans>Still preview (~1 fps) — live video is unavailable for this preview.</Trans></p></div> : <span role="img" aria-label={t`Preview monitor`}><Trans>Waiting for a frame…</Trans></span>}</div>
+    <div className="bd-picture">{program ? <PreviewSurface scope="program" whepEndpoint="/api/v1/preview/program/whep" jpegPath="/api/v1/preview/program.jpg" label={t`Program monitor`} capabilities={caps.data} className="bd-video" /> : pvw ? <div className="bd-jpeg"><img src={pvw} alt={t`Preview monitor`} /></div> : <span role="img" aria-label={t`Preview monitor`}><Trans>Waiting for a frame…</Trans></span>}</div>
+    {!program && pvw && <p className="bd-still-label"><Trans>Still preview (~1 fps) — live video is unavailable for this preview.</Trans></p>}
     <figcaption><b>{program ? (fresh && source ? t`● ON AIR — PROGRAM` : t`○ PROGRAM — unconfirmed`) : (fresh && source ? t`▲ PREVIEW` : t`△ PREVIEW — unconfirmed`)}</b><span>{source ?? t`Unknown source`}</span><small>{fresh ? t`Engine-confirmed bus` : t`Unconfirmed / stale`}</small></figcaption>
     {program && <ProgramLevels />}
   </figure>;
