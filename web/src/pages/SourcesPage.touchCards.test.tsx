@@ -128,4 +128,23 @@ describe('Sources touch cards', () => {
     expect(await screen.findByRole('alert')).toHaveTextContent('Could not load sources:');
     expect(screen.queryByTestId('source-card-camera')).not.toBeInTheDocument();
   });
+
+  it('approved header: heading + Help toggle; apply-semantics callout lives behind Help', async () => {
+    renderSources();
+    expect(await screen.findByRole('heading', { level: 1, name: 'Sources & library' })).toBeVisible();
+    expect(screen.queryByText(/X-Multiview-Apply/)).not.toBeInTheDocument();
+    const help = screen.getByRole('button', { name: /Help/ });
+    expect(help).toHaveAttribute('aria-expanded', 'false');
+    await userEvent.click(help);
+    expect(help).toHaveAttribute('aria-expanded', 'true');
+    expect(screen.getByText(/X-Multiview-Apply/)).toBeVisible();
+    expect(screen.getByText('How configuration applies')).toBeVisible();
+    expect(screen.getByRole('button', { name: 'New source' })).toBeInTheDocument();
+  });
+
+  it('keeps On air unavailable when the switcher state is not confirmed', async () => {
+    renderSources();
+    await screen.findByTestId('source-card-camera');
+    expect(screen.getByRole('button', { name: 'On air' })).toHaveAttribute('aria-disabled', 'true');
+  });
 });

@@ -23,9 +23,10 @@ import { TileStateBadge } from '../../components/TileStateBadge';
 import { TouchAction } from '../../components/broadcast';
 import type { LiveTile } from '../../realtime/useEngineEvents';
 import type { SourceView } from '../../resources/types';
+import type { ProgramTally } from './useProgramTally';
 import './sources-approved.css';
 
-type Filter = 'all' | 'needs';
+type Filter = 'all' | 'needs' | 'onair';
 
 /** Tablet/desktop (>= 768px) get the table; phones get cards. */
 const TABLE_QUERY = '(min-width: 768px)';
@@ -61,6 +62,8 @@ export interface SourcesSurfaceProps {
   readonly linkFor: (sourceId: string) => LinkInfo | undefined;
   readonly onEdit: (row: SourceView) => void;
   readonly onDelete: (row: SourceView) => void;
+  /** Engine-confirmed program/preview bus ids; undefined = not confirmed (Unknown). */
+  readonly tally?: ProgramTally | undefined;
 }
 
 function Pill({ phase, children }: { readonly phase: string; readonly children: ReactNode }): JSX.Element {
@@ -81,6 +84,7 @@ export function SourcesSurface(props: SourcesSurfaceProps): JSX.Element {
     .map((row, index) => ({ row, index }))
     .filter(({ row }) => {
       if (filter === 'needs' && exceptionRank(demandOf(row.id)) > 1) return false;
+      if (filter === 'onair' && row.id !== props.tally?.program) return false;
       return (
         needle === '' ||
         [row.name, row.id, row.locator ?? ''].some((v) => v.toLowerCase().includes(needle))
@@ -164,11 +168,22 @@ export function SourcesSurface(props: SourcesSurfaceProps): JSX.Element {
     );
   };
 
-  const tally = (): JSX.Element => (
-    <span className="src-muted" title={t`Program tally is not available on this page, so it is not guessed.`}>
-      <Trans>Tally unknown</Trans>
-    </span>
-  );
+  const tally = (source: SourceView): JSX.Element => {
+    if (props.tally === undefined) {
+      return (
+        <span className="src-muted" title={t`Program tally is not confirmed right now (switcher state missing or stale), so it is not guessed.`}>
+          <Trans>Tally unknown</Trans>
+        </span>
+      );
+    }
+    if (source.id === props.tally.program) {
+      return <Pill phase="onair"><Trans>● RED — on air</Trans></Pill>;
+    }
+    if (source.id === props.tally.preview) {
+      return <Pill phase="preview"><Trans>● AMBER — preview</Trans></Pill>;
+    }
+    return <Pill phase="dark"><Trans>— dark</Trans></Pill>;
+  };
 
   const lifecycleActions = (source: SourceView): JSX.Element | null => {
     const d = demandOf(source.id);
@@ -244,21 +259,29 @@ export function SourcesSurface(props: SourcesSurfaceProps): JSX.Element {
           <button type="button" className="sf-chip" aria-pressed={filter === 'needs'} onClick={(): void => { setFilter('needs'); }}>
             <Trans>Needs me</Trans>
           </button>
-          <button
-            type="button"
-            className="sf-chip"
-            aria-pressed={false}
-            aria-disabled="true"
-            aria-describedby="src-onair-reason"
-            onClick={(e): void => { e.preventDefault(); }}
-          >
-            <Trans>On air</Trans>
-          </button>
+          {props.tally !== undefined ? (
+            <button type="button" className="sf-chip" aria-pressed={filter === 'onair'} onClick={(): void => { setFilter('onair'); }}>
+              <Trans>On air</Trans>
+            </button>
+          ) : (
+            <button
+              type="button"
+              className="sf-chip"
+              aria-pressed={false}
+              aria-disabled="true"
+              aria-describedby="src-onair-reason"
+              onClick={(e): void => { e.preventDefault(); }}
+            >
+              <Trans>On air</Trans>
+            </button>
+          )}
         </div>
       </div>
-      <p id="src-onair-reason" className="src-onair-reason">
-        <Trans>On air filter unavailable: program tally is not exposed to this page, so no source can be confirmed on air.</Trans>
-      </p>
+      {props.tally === undefined ? (
+        <p id="src-onair-reason" className="src-onair-reason">
+          <Trans>On air filter unavailable: the program bus is not confirmed right now (switcher state missing or stale), so no source can be confirmed on air.</Trans>
+        </p>
+      ) : null}
 
       <div className="src-summary" role="status">
         {count('ready') > 0 ? <span className="sum-chip"><b>{count('ready')}</b> <Trans>Ready</Trans></span> : null}
@@ -297,7 +320,7 @@ export function SourcesSurface(props: SourcesSurfaceProps): JSX.Element {
                     <td>{signal(source)}</td>
                     <td>{lifecycle(source)}</td>
                     <td>{activation(source)}</td>
-                    <td>{tally()}</td>
+                    <td>{tally(source)}</td>
                     <td>
                       <div className="src-actions-cell">
                         {lifecycleActions(source)}
@@ -329,7 +352,7 @@ export function SourcesSurface(props: SourcesSurfaceProps): JSX.Element {
                 <span className="lbl"><Trans>Signal</Trans></span>{signal(source)}
                 <span className="lbl"><Trans>Lifecycle</Trans></span>{lifecycle(source)}
                 <span className="lbl"><Trans>Activation</Trans></span>{activation(source)}
-                <span className="lbl"><Trans>Tally</Trans></span>{tally()}
+                <span className="lbl"><Trans>Tally</Trans></span>{tally(source)}
               </div>
               {lifecycleActions(source)}
               {crossLink(source)}

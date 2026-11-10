@@ -32,10 +32,10 @@ function setTable(matches: boolean): void {
 }
 afterEach(() => { vi.restoreAllMocks(); });
 
-function mount(onEdit = vi.fn(), onDelete = vi.fn()): void {
+function mount(onEdit = vi.fn(), onDelete = vi.fn(), tally?: { program: string; preview: string }): void {
   renderWithProviders(
     <MemoryRouter>
-      <SourcesSurface rows={rows} demand={status} tileFor={() => undefined} linkFor={() => undefined} onEdit={onEdit} onDelete={onDelete} />
+      <SourcesSurface rows={rows} demand={status} tileFor={() => undefined} linkFor={() => undefined} onEdit={onEdit} onDelete={onDelete} tally={tally} />
     </MemoryRouter>,
   );
 }
@@ -69,7 +69,7 @@ describe('SourcesSurface', () => {
     expect(screen.getAllByTestId(/^source-row-/)).toHaveLength(1);
     const onAir = screen.getByRole('button', { name: 'On air' });
     expect(onAir).toHaveAttribute('aria-disabled', 'true');
-    expect(onAir).toHaveAccessibleDescription(/program tally is not exposed/);
+    expect(onAir).toHaveAccessibleDescription(/program bus is not confirmed/);
   });
 
   it('table: Details reveals the retained Edit and Delete controls', async () => {
@@ -92,5 +92,18 @@ describe('SourcesSurface', () => {
     const cards = screen.getAllByTestId(/^source-card-/).map((c) => c.getAttribute('data-testid'));
     expect(cards[0]).toBe('source-card-bad');
     expect(within(screen.getByTestId('source-card-ok')).getByRole('button', { name: 'Edit source: Fine' })).toBeVisible();
+  });
+
+  it('confirmed program bus: On air filter works and tally shows red/amber/dark', async () => {
+    setTable(true);
+    mount(vi.fn(), vi.fn(), { program: 'ok', preview: 'wait' });
+    expect(within(screen.getByTestId('source-row-ok')).getByText('● RED — on air')).toBeVisible();
+    expect(within(screen.getByTestId('source-row-wait')).getByText('● AMBER — preview')).toBeVisible();
+    expect(within(screen.getByTestId('source-row-bad')).getByText('— dark')).toBeVisible();
+    const onAir = screen.getByRole('button', { name: 'On air' });
+    expect(onAir).not.toHaveAttribute('aria-disabled');
+    await userEvent.click(onAir);
+    expect(screen.getAllByTestId(/^source-row-/)).toHaveLength(1);
+    expect(screen.getByTestId('source-row-ok')).toBeVisible();
   });
 });
