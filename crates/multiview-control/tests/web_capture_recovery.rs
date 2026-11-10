@@ -15,6 +15,14 @@ use std::{os::unix::fs::PermissionsExt, sync::Arc, time::Duration};
 #[test]
 #[allow(clippy::too_many_lines)]
 fn recovered_http_pending_receipt_binds_existing_job_without_another_producer() {
+    recovery_case(false);
+}
+#[test]
+fn pruned_correlation_never_turns_a_pending_http_receipt_into_fresh_admission() {
+    recovery_case(true);
+}
+#[allow(clippy::too_many_lines)]
+fn recovery_case(prune: bool) {
     let root = tempfile::tempdir().unwrap();
     let tool = root.path().join("node");
     let marker = root.path().join("runs");
@@ -33,14 +41,14 @@ fn recovered_http_pending_receipt_binds_existing_job_without_another_producer() 
                 &store_dir,
                 Limits {
                     bytes: 128 * 1024 * 1024,
-                    count: 16,
+                    count: 64,
                 },
             )
             .unwrap(),
             Config {
                 queue_capacity: 2,
                 history: 8,
-                max_fills: 4,
+                max_fills: 32,
             },
             &root.path().join("jobs"),
         )
@@ -105,16 +113,67 @@ fn recovered_http_pending_receipt_binds_existing_job_without_another_producer() 
         Submitted::Accepted(id) | Submitted::Coalesced(id) => id,
     };
     // No Ledger.complete: model a killed HTTP worker after Service accepted.
+    if prune {
+        let finish = |job| {
+            let guard = std::time::Instant::now() + Duration::from_secs(10);
+            while matches!(
+                service.status(&actor.key_id, job).unwrap().state,
+                multiview_webengine::service::State::Queued
+                    | multiview_webengine::service::State::Running
+            ) {
+                assert!(std::time::Instant::now() < guard);
+                std::thread::yield_now();
+            }
+        };
+        finish(id);
+        for n in 0..12 {
+            let request = Request {
+                owner: actor.key_id.clone(),
+                fill: format!("other-{n}"),
+                capture: Capture {
+                    width: 1280,
+                    height: 720,
+                    fps: 2,
+                    frames: 2,
+                    document: "trusted fixture".into(),
+                    background: Background::Opaque,
+                    windy: None,
+                },
+                maximum_bytes: 1024,
+                timeout: Duration::from_secs(120),
+            };
+            let job = match service.submit(request).unwrap() {
+                Submitted::Accepted(id) | Submitted::Coalesced(id) => id,
+            };
+            finish(job);
+        }
+        assert!(service
+            .lookup_correlated(&actor.key_id, "radar", &token)
+            .is_none());
+    }
+    let runs_before_retry = std::fs::read(&marker).unwrap_or_default().len();
     let recovered = Arc::new(Ledger::durable(&ledger_path).unwrap());
     assert!(recovered.outcome_uncertain(&actor.key_id, "submit", key));
     let provider =
         Provider::configured(service.clone(), Arc::new(MemoryTerms::default()), recovered);
-    let result = provider.submit(&actor, key, &body).unwrap();
-    assert_eq!(result.job_id, id.raw());
-    assert!(!result.fresh);
+    if prune {
+        assert!(matches!(
+            provider.submit(&actor, key, &body),
+            Err(multiview_control::ControlError::CaptureOutcomeUncertain)
+        ));
+        assert_eq!(
+            std::fs::read(&marker).unwrap_or_default().len(),
+            runs_before_retry
+        );
+    } else {
+        let result = provider.submit(&actor, key, &body).unwrap();
+        assert_eq!(result.job_id, id.raw());
+        assert!(!result.fresh);
+    }
     service.shutdown();
     assert!(
-        std::fs::read(&marker).map_or(true, |runs| runs.len() <= 1),
+        std::fs::read(&marker).map_or(true, |runs| runs.len()
+            <= if prune { runs_before_retry } else { 1 }),
         "a recovered HTTP receipt must not launch another producer"
     );
 }
