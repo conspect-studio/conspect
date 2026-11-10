@@ -151,6 +151,12 @@ ARG CARGO_FEATURES=ffmpeg,nvidia,web
 # cacheable layer: it busts only when Cargo.{toml,lock} (→ recipe.json) change,
 # not on first-party source edits. `--locked` enforces the committed Cargo.lock.
 COPY --from=planner /build/recipe.json recipe.json
+# The workspace `[patch.crates-io]` points at path crates under vendor/
+# (Cargo.toml). recipe.json keeps the patch table but not the patched
+# sources, so the cook cannot resolve it without them ("patch location
+# ... does not contain packages"). vendor/ changes rarely, so the cook
+# layer stays cached across first-party edits.
+COPY vendor/ vendor/
 RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,target=/usr/local/cargo/git,sharing=locked \
     cargo chef cook --release --locked -p multiview-cli \
