@@ -16,6 +16,8 @@
     clippy::indexing_slicing
 )]
 
+use std::fmt::Write as _;
+
 use multiview_config::rendition::{
     plan_from_config, EncodeCapabilities, RenditionAudioCodec, RenditionPlanError,
     RenditionVideoCodec,
@@ -427,11 +429,13 @@ fn raw_taps_carry_no_encoded_rendition() {
 fn more_than_eight_distinct_video_renditions_is_rejected() {
     let mut outputs = String::new();
     for index in 0..9u32 {
-        outputs.push_str(&format!(
+        write!(
+            outputs,
             "[[outputs]]\nid = \"srt_{index}\"\nkind = \"srt\"\n\
              url = \"srt://[::1]:9{index:03}\"\ncodec = \"h264\"\n\
              gpu_pin = {{ vendor = \"nvidia\", stable_id = \"GPU-{index}\" }}\n\n"
-        ));
+        )
+        .expect("write video fixture to string");
     }
     let cfg = config(&outputs, "");
     let err = plan_from_config(&cfg, &all_capabilities()).expect_err("the ceiling is enforced");
@@ -459,10 +463,12 @@ mode = "auto"
 "#;
     let mut audio = String::from("[audio]\nsample_rate_hz = 48000\n\n");
     for index in 0..33u32 {
-        audio.push_str(&format!(
+        write!(
+            audio,
             "[[audio.routes]]\ninput_id = \"cam_{index}\"\n\
              channels = {{ kind = \"stereo\" }}\ntarget_track = \"trk_{index}\"\n\n"
-        ));
+        )
+        .expect("write audio fixture to string");
     }
     let cfg = config(outputs, &audio);
     let err = plan_from_config(&cfg, &all_capabilities()).expect_err("the ceiling is enforced");
