@@ -17,10 +17,11 @@
 use crate::artifact::ArtifactId;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use rustix::fs::{self, Mode, OFlags};
 use std::{
-    fs::{File, OpenOptions},
+    ffi::OsStr,
+    fs::File,
     io::{self, Read, Write},
-    os::unix::fs::OpenOptionsExt,
     path::{Path, PathBuf},
 };
 
@@ -176,18 +177,56 @@ pub(crate) fn kind_from(name: &str) -> io::ErrorKind {
     }
 }
 
+/// Pin the parent directory once; every later open, rename and fsync of the
+/// journal is relative to this descriptor, so a replaced path cannot redirect them.
+fn pin_parent(path: &Path) -> io::Result<(File, &OsStr)> {
+    let parent = match path.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p,
+        _ => Path::new("."),
+    };
+    let name = path.file_name().ok_or_else(corrupt)?;
+    let dir: File = fs::open(
+        parent,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    )?
+    .into();
+    Ok((dir, name))
+}
+/// `openat(NOFOLLOW)` then `fstat` the descriptor: regular, owned by this
+/// process, mode exactly 0600, one link. Nothing is read or published before this.
+fn open_private_at(dir: &File, name: &OsStr, flags: OFlags) -> io::Result<File> {
+    let file: File = fs::openat(
+        dir,
+        name,
+        flags | OFlags::NOFOLLOW | OFlags::CLOEXEC | OFlags::NONBLOCK,
+        Mode::RUSR | Mode::WUSR,
+    )?
+    .into();
+    let stat = fs::fstat(&file)?;
+    if fs::FileType::from_raw_mode(stat.st_mode) != fs::FileType::RegularFile
+        || stat.st_uid != rustix::process::geteuid().as_raw()
+        || stat.st_mode & 0o777 != 0o600
+        || stat.st_nlink != 1
+    {
+        return Err(corrupt());
+    }
+    Ok(file)
+}
+
 /// Read and verify the journal; `None` when it does not exist.
 pub(crate) fn load(path: &Path) -> io::Result<Option<Doc>> {
-    match std::fs::symlink_metadata(path) {
+    let (dir, name) = pin_parent(path)?;
+    let file = match open_private_at(&dir, name, OFlags::RDONLY) {
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
         Err(e) => return Err(e),
-        Ok(m) if !m.is_file() || m.len() > MAX_BYTES => return Err(corrupt()),
-        Ok(_) => {}
+        Ok(f) => f,
+    };
+    if file.metadata()?.len() > MAX_BYTES {
+        return Err(corrupt());
     }
     let mut raw = Vec::new();
-    File::open(path)?
-        .take(MAX_BYTES + 1)
-        .read_to_end(&mut raw)?;
+    file.take(MAX_BYTES + 1).read_to_end(&mut raw)?;
     if u64::try_from(raw.len()).map_or(true, |n| n > MAX_BYTES) {
         return Err(corrupt());
     }
@@ -215,31 +254,34 @@ fn write_atomic(path: &Path, doc: &Doc, hook: JournalHook) -> io::Result<()> {
             "capture journal too large",
         ));
     }
-    let mut temp = path.as_os_str().to_owned();
-    temp.push(".tmp");
-    let temp = PathBuf::from(temp);
-    match std::fs::remove_file(&temp) {
+    let (dir, name) = pin_parent(path)?;
+    let mut temp_name = name.to_owned();
+    temp_name.push(".tmp");
+    match fs::unlinkat(&dir, temp_name.as_os_str(), fs::AtFlags::empty()) {
         Ok(()) => {}
-        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-        Err(e) => return Err(e),
+        Err(e) if e == rustix::io::Errno::NOENT => {}
+        Err(e) => return Err(e.into()),
     }
-    let mut file = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(&temp)?;
+    // EXCL: only a brand-new inode; fstat proves no other link or owner exists
+    // before a single byte is written or the inode can be renamed into place.
+    let mut file = open_private_at(
+        &dir,
+        temp_name.as_os_str(),
+        OFlags::CREATE | OFlags::EXCL | OFlags::WRONLY,
+    )?;
     file.write_all(&bytes)?;
     hook(JournalBoundary::Sync)?;
     file.sync_all()?;
-    drop(file);
     hook(JournalBoundary::Publish)?;
-    std::fs::rename(&temp, path)?;
+    // Re-prove the same still-open inode immediately before publication: a link
+    // made after creation means the temp is refused, never renamed into place.
+    if fs::fstat(&file)?.st_nlink != 1 {
+        return Err(corrupt());
+    }
+    fs::renameat(&dir, temp_name.as_os_str(), &dir, name)?;
+    drop(file);
     hook(JournalBoundary::DirectorySync)?;
-    let parent = match path.parent() {
-        Some(p) if !p.as_os_str().is_empty() => p,
-        _ => Path::new("."),
-    };
-    File::open(parent)?.sync_all()
+    dir.sync_all()
 }
 
 /// The durable image plus its file. Memory equals the last fully durable write.

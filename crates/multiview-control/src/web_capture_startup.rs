@@ -80,29 +80,69 @@ pub fn reject_symlink(path: &std::path::Path) -> io::Result<()> {
     }
     Ok(())
 }
+/// Create (mode 0700) or adopt a capture directory without a path-based chmod:
+/// open it `O_DIRECTORY | O_NOFOLLOW`, then `fstat` that descriptor and require
+/// owner == this process and mode exactly 0700.
 fn private_dir(path: &std::path::Path) -> io::Result<()> {
+    use rustix::fs::{FileType, Mode, OFlags};
     reject_symlink(path)?;
-    match std::fs::symlink_metadata(path) {
-        Ok(m) if m.is_dir() => {}
-        Ok(_) => return Err(io::Error::other("capture directory is not a directory")),
-        Err(_) => {
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::DirBuilderExt;
-                std::fs::DirBuilder::new()
-                    .recursive(true)
-                    .mode(0o700)
-                    .create(path)?;
-            }
-            #[cfg(not(unix))]
-            std::fs::create_dir_all(path)?;
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        match std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(path)
+        {
+            Ok(()) => {}
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {}
+            Err(e) => return Err(e),
         }
     }
-    reject_symlink(path)?;
-    #[cfg(unix)]
+    let fd = rustix::fs::open(
+        path,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    )?;
+    let stat = rustix::fs::fstat(&fd)?;
+    if FileType::from_raw_mode(stat.st_mode) != FileType::Directory
+        || stat.st_uid != rustix::process::geteuid().as_raw()
+        || stat.st_mode & 0o777 != 0o700
     {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))?;
+        return Err(io::Error::other(
+            "capture directory must be an owner-private 0700 directory",
+        ));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used)]
+    use super::private_dir;
+    use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn creates_0700_and_adopts_only_an_exact_0700_owned_directory() {
+        let d = tempfile::tempdir().unwrap();
+        let p = d.path().join("a").join("b");
+        private_dir(&p).unwrap();
+        assert_eq!(std::fs::metadata(&p).unwrap().permissions().mode() & 0o777, 0o700);
+        // No silent chmod repair: a loose existing directory is refused.
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(private_dir(&p).is_err());
+        assert_eq!(std::fs::metadata(&p).unwrap().permissions().mode() & 0o777, 0o755);
+    }
+
+    #[test]
+    fn symlink_and_file_targets_are_refused() {
+        let d = tempfile::tempdir().unwrap();
+        let real = d.path().join("real");
+        private_dir(&real).unwrap();
+        let link = d.path().join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        assert!(private_dir(&link).is_err());
+        let file = d.path().join("file");
+        std::fs::write(&file, b"x").unwrap();
+        assert!(private_dir(&file).is_err());
+    }
 }

@@ -124,11 +124,23 @@ fn open(root: &File, name: &str, flags: OFlags) -> Result<File> {
     )?
     .into())
 }
-fn read_regular(root: &File, name: &str) -> Result<File> {
-    let file = open(root, name, OFlags::RDONLY)?;
-    if !file.metadata()?.is_file() {
+/// Validate an already-opened descriptor: regular, owned by this process, no
+/// group/other access, and exactly one directory entry. Every check is `fstat` on
+/// the fd, never a second path lookup.
+pub(crate) fn check_private(file: &File) -> Result<()> {
+    let stat = fs::fstat(file)?;
+    if fs::FileType::from_raw_mode(stat.st_mode) != fs::FileType::RegularFile
+        || stat.st_uid != rustix::process::geteuid().as_raw()
+        || stat.st_mode & 0o077 != 0
+        || stat.st_nlink != 1
+    {
         return Err(invalid());
     }
+    Ok(())
+}
+fn read_regular(root: &File, name: &str) -> Result<File> {
+    let file = open(root, name, OFlags::RDONLY)?;
+    check_private(&file)?;
     Ok(file)
 }
 impl ArtifactStore {
@@ -144,6 +156,7 @@ impl ArtifactStore {
         )?
         .into();
         let mut lock = open(&root, "lock", OFlags::CREATE | OFlags::RDWR)?;
+        check_private(&lock)?;
         fs::flock(&lock, fs::FlockOperation::NonBlockingLockExclusive)?;
         let mut watermark = String::new();
         Read::by_ref(&mut lock)
@@ -166,14 +179,17 @@ impl ArtifactStore {
             entries: BTreeMap::new(),
             hook: |_| Ok(()),
         };
-        // Directory enumeration supplies names only; every actual open is fd-relative,
-        // no-follow, and restricted to a single validated component.
-        for entry in std::fs::read_dir(path)? {
-            let name = entry?.file_name();
-            let Some(name) = name.to_str() else {
+        // Names come from the opened root fd (never a path walk); every actual open
+        // is fd-relative, no-follow, single-component, and `fstat`-validated.
+        let mut dir = fs::Dir::read_from(&store.root)?;
+        while let Some(entry) = dir.read() {
+            let entry = entry?;
+            let Ok(name) = entry.file_name().to_str() else {
                 return Err(invalid());
             };
-            if name == "lock" {
+            let name = name.to_owned();
+            let name = name.as_str();
+            if name == "." || name == ".." || name == "lock" {
                 continue;
             }
             let prefix = name.split('.').next().ok_or_else(invalid)?;

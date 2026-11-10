@@ -143,3 +143,39 @@ fn capture_private_file_rejects_symlink_and_nonprivate_mode() {
     std::os::unix::fs::symlink(&file, &link).unwrap();
     assert!(multiview_control::web_capture_store::open_private(&link).is_err());
 }
+
+#[test]
+fn snapshot_temp_symlink_and_hardlink_never_leak_or_publish() {
+    use std::os::unix::fs::{symlink, PermissionsExt};
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("ledger");
+    drop(Ledger::durable(&file).unwrap());
+    let victim = dir.path().join("victim");
+    std::fs::write(&victim, b"keep").unwrap();
+    std::fs::set_permissions(&victim, std::fs::Permissions::from_mode(0o600)).unwrap();
+    // Planted temp symlink: unlinked, never written through.
+    symlink(&victim, dir.path().join("ledger.tmp")).unwrap();
+    let ledger = Ledger::durable(&file).unwrap();
+    assert_eq!(ledger.reserve("a", "o", "k", "d"), Ok(Reserve::Fresh));
+    assert_eq!(std::fs::read(&victim).unwrap(), b"keep");
+    drop(ledger);
+    // A hard link to the live ledger makes startup fail closed before any read.
+    let alias = dir.path().join("alias");
+    std::fs::hard_link(&file, &alias).unwrap();
+    assert!(Ledger::durable(&file).is_err());
+}
+
+#[test]
+fn terms_log_refuses_hardlink_and_symlink() {
+    use multiview_control::web_capture_store::DurableTerms;
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("terms");
+    drop(DurableTerms::open(&file).unwrap());
+    let alias = dir.path().join("alias");
+    std::fs::hard_link(&file, &alias).unwrap();
+    assert!(DurableTerms::open(&file).is_err());
+    std::fs::remove_file(&alias).unwrap();
+    let link = dir.path().join("link");
+    std::os::unix::fs::symlink(&file, &link).unwrap();
+    assert!(DurableTerms::open(&link).is_err());
+}

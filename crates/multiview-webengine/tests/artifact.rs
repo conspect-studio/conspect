@@ -204,3 +204,50 @@ fn identity_never_reuses_deleted_content_and_lease_retains_root_lock() {
     assert!(ArtifactStore::open(dir.path(), limits()).is_ok());
     assert!(serde_json::from_str::<ArtifactId>("\"../escape\"").is_err());
 }
+
+#[test]
+fn hard_linked_committed_content_is_refused_at_pin_and_recovery() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut store = ArtifactStore::open(dir.path(), limits()).unwrap();
+    let artifact = commit(&mut store, 1);
+    let data = dir.path().join(format!("{}.data", artifact.id.as_str()));
+    let other = tempfile::tempdir().unwrap();
+    let alias = other.path().join("alias");
+    std::fs::hard_link(&data, &alias).unwrap();
+    // A second directory entry makes the content unreadable (nlink != 1).
+    assert!(store.pin(&artifact.id, "owner", |_| true).is_err());
+    drop(store);
+    assert!(ArtifactStore::open(dir.path(), limits()).is_err());
+    std::fs::remove_file(&alias).unwrap();
+    assert!(ArtifactStore::open(dir.path(), limits()).is_ok());
+}
+
+#[test]
+fn loose_mode_content_and_symlinked_lock_are_refused() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let mut store = ArtifactStore::open(dir.path(), limits()).unwrap();
+    let artifact = commit(&mut store, 1);
+    drop(store);
+    let data = dir.path().join(format!("{}.data", artifact.id.as_str()));
+    std::fs::set_permissions(&data, std::fs::Permissions::from_mode(0o644)).unwrap();
+    assert!(ArtifactStore::open(dir.path(), limits()).is_err());
+    std::fs::set_permissions(&data, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let lock = dir.path().join("lock");
+    let moved = dir.path().join("lock.real");
+    std::fs::rename(&lock, &moved).unwrap();
+    std::os::unix::fs::symlink(&moved, &lock).unwrap();
+    assert!(ArtifactStore::open(dir.path(), limits()).is_err());
+}
+
+#[test]
+fn enumeration_comes_from_the_opened_directory_not_the_path() {
+    // Replace the path with a different directory after the fd was opened is a
+    // race we cannot interleave deterministically; prove the observable half:
+    // a root path that is itself a symlink is refused (fd opened O_NOFOLLOW).
+    let real = tempfile::tempdir().unwrap();
+    let parent = tempfile::tempdir().unwrap();
+    let link = parent.path().join("root");
+    std::os::unix::fs::symlink(real.path(), &link).unwrap();
+    assert!(ArtifactStore::open(&link, limits()).is_err());
+}

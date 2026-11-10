@@ -5,7 +5,8 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
     collections::{HashMap, HashSet, VecDeque},
-    fs::{File, OpenOptions},
+    ffi::OsStr,
+    fs::File,
     io::{self, Read, Write},
     path::{Path, PathBuf},
     sync::Mutex,
@@ -66,11 +67,9 @@ impl DurableTerms {
     /// # Errors
     /// Unsafe or unwritable path.
     pub fn open(path: &Path) -> io::Result<Self> {
-        let existed = std::fs::symlink_metadata(path).is_ok();
-        let file = open_private(path)?;
-        if !existed {
-            sync_parent(path)?;
-        }
+        let (dir, name) = pin_parent(path)?;
+        let file = open_private_at(&dir, name, rustix::fs::OFlags::APPEND)?;
+        dir.sync_all()?; // a create must be durable; harmless when it existed
         let len = file.metadata()?.len();
         Ok(Self {
             file: Mutex::new((file, len)),
@@ -97,20 +96,49 @@ impl TermsRepository for DurableTerms {
     }
 }
 
-/// Open a 0600 append file, refusing a symlink or non-regular target.
-/// # Errors
-/// Unsafe or unwritable path.
-pub fn open_private(path: &Path) -> io::Result<File> {
-    let fd = rustix::fs::open(
-        path,
-        rustix::fs::OFlags::RDWR
-            | rustix::fs::OFlags::CREATE
-            | rustix::fs::OFlags::APPEND
+/// Open the parent directory once (`O_DIRECTORY | O_NOFOLLOW`); every later open,
+/// rename and fsync of a store file is relative to this descriptor, so replacing
+/// the parent path afterwards cannot redirect them.
+fn pin_parent(path: &Path) -> io::Result<(File, &OsStr)> {
+    let parent = match path.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p,
+        _ => Path::new("."),
+    };
+    let name = path
+        .file_name()
+        .ok_or_else(|| io::Error::other("capture store path has no file name"))?;
+    let dir = rustix::fs::open(
+        parent,
+        rustix::fs::OFlags::RDONLY
+            | rustix::fs::OFlags::DIRECTORY
             | rustix::fs::OFlags::NOFOLLOW
             | rustix::fs::OFlags::CLOEXEC,
+        rustix::fs::Mode::empty(),
+    )?;
+    Ok((File::from(dir), name))
+}
+
+/// `openat(NOFOLLOW)` a 0600 append file under `dir`, then `fstat` the descriptor:
+/// regular file, owned by this process, mode exactly 0600, one link. Nothing is
+/// read or published before these checks pass.
+fn open_private_at(dir: &File, name: &OsStr, extra: rustix::fs::OFlags) -> io::Result<File> {
+    let fd = rustix::fs::openat(
+        dir,
+        name,
+        rustix::fs::OFlags::RDWR
+            | rustix::fs::OFlags::CREATE
+            | rustix::fs::OFlags::NOFOLLOW
+            | rustix::fs::OFlags::CLOEXEC
+            | rustix::fs::OFlags::NONBLOCK
+            | extra,
         rustix::fs::Mode::RUSR | rustix::fs::Mode::WUSR,
     )?;
-    let stat = rustix::fs::fstat(&fd)?;
+    let file = File::from(fd);
+    check_private(&file)?;
+    Ok(file)
+}
+fn check_private(file: &File) -> io::Result<()> {
+    let stat = rustix::fs::fstat(file)?;
     if rustix::fs::FileType::from_raw_mode(stat.st_mode) != rustix::fs::FileType::RegularFile
         || stat.st_uid != rustix::process::geteuid().as_raw()
         || stat.st_mode & 0o777 != 0o600
@@ -120,34 +148,20 @@ pub fn open_private(path: &Path) -> io::Result<File> {
             "capture store must be an owner-private regular file",
         ));
     }
-    Ok(File::from(fd))
+    Ok(())
+}
+
+/// Open a 0600 append file, refusing a symlink or non-regular target.
+/// # Errors
+/// Unsafe or unwritable path.
+pub fn open_private(path: &Path) -> io::Result<File> {
+    let (dir, name) = pin_parent(path)?;
+    open_private_at(&dir, name, rustix::fs::OFlags::APPEND)
 }
 
 /// Fsync the parent directory so a create or rename survives power loss.
 fn sync_parent(path: &Path) -> io::Result<()> {
-    let parent = match path.parent() {
-        Some(p) if !p.as_os_str().is_empty() => p,
-        _ => Path::new("."),
-    };
-    File::open(parent)?.sync_all()
-}
-
-/// Create a fresh private temp file; an existing entry is removed first (a
-/// symlink is unlinked, never followed) and `create_new` (`O_EXCL`) fails closed.
-fn create_tmp(tmp: &Path) -> io::Result<File> {
-    match std::fs::remove_file(tmp) {
-        Ok(()) => {}
-        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-        Err(e) => return Err(e),
-    }
-    let mut o = OpenOptions::new();
-    o.write(true).create_new(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        o.mode(0o600);
-    }
-    o.open(tmp)
+    pin_parent(path)?.0.sync_all()
 }
 
 /// Hex SHA-256.
@@ -264,17 +278,28 @@ impl Log {
     }
 }
 /// Atomically replace `path` with `bytes` (fsync file, rename, fsync parent) and
-/// return a fresh append handle.
+/// return a fresh append handle. The parent is pinned once; the temp file is
+/// created `O_EXCL | O_NOFOLLOW`, `fstat`-validated before any byte is written and
+/// again before the rename, and everything is relative to the pinned directory.
 fn write_snapshot(path: &Path, bytes: &[u8]) -> io::Result<File> {
-    let tmp: PathBuf = path.with_extension("tmp");
+    let (dir, name) = pin_parent(path)?;
+    let mut tmp = name.to_owned();
+    tmp.push(".tmp");
+    match rustix::fs::unlinkat(&dir, tmp.as_os_str(), rustix::fs::AtFlags::empty()) {
+        Ok(()) => {}
+        Err(e) if e == rustix::io::Errno::NOENT => {}
+        Err(e) => return Err(e.into()),
+    }
     {
-        let mut t = create_tmp(&tmp)?;
+        let mut t = open_private_at(&dir, tmp.as_os_str(), rustix::fs::OFlags::EXCL)?;
         t.write_all(bytes)?;
         t.sync_all()?;
+        check_private(&t)?; // a link made while writing refuses publication
+        rustix::fs::renameat(&dir, tmp.as_os_str(), &dir, name)?;
     }
-    std::fs::rename(&tmp, path)?;
-    sync_parent(path)?;
-    open_private(path)
+    dir.sync_all()?;
+    let mut f = open_private_at(&dir, name, rustix::fs::OFlags::APPEND)?;
+    Ok(f)
 }
 /// Bounded actor+operation+key map. Pending reservations are never evicted.
 pub struct Ledger {

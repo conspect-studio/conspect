@@ -725,6 +725,12 @@ fn durable_counters_exceed_history_even_after_pruning() {
     assert!(std::fs::metadata(d.journal()).unwrap().len() < 2000);
 }
 
+fn put_private(path: &std::path::Path, bytes: &[u8]) {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::write(path, bytes).unwrap();
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).unwrap();
+}
+
 #[test]
 fn durable_corrupt_stale_or_missing_journal_fails_closed() {
     let _g = SERIAL.lock().unwrap();
@@ -742,25 +748,78 @@ fn durable_corrupt_stale_or_missing_journal_fails_closed() {
     let new = std::fs::read(d.journal()).unwrap();
     drop(service);
     // Stale: store holds an artifact above the old high-waters.
-    std::fs::write(d.journal(), &old).unwrap();
+    put_private(&d.journal(), &old);
     assert!(d.start().is_err());
     // Corrupt: flipped byte breaks the checksum; truncation and garbage too.
     let mut bad = new.clone();
     let last = bad.len() - 3;
     bad[last] ^= 1;
-    std::fs::write(d.journal(), &bad).unwrap();
+    put_private(&d.journal(), &bad);
     assert!(d.start().is_err());
-    std::fs::write(d.journal(), &new[..new.len() / 2]).unwrap();
+    put_private(&d.journal(), &new[..new.len() / 2]);
     assert!(d.start().is_err());
-    std::fs::write(d.journal(), b"garbage").unwrap();
+    put_private(&d.journal(), b"garbage");
     assert!(d.start().is_err());
     // Missing journal with a non-empty store.
     std::fs::remove_file(d.journal()).unwrap();
     assert!(d.start().is_err());
     // The genuine journal still recovers, and nothing was deleted.
-    std::fs::write(d.journal(), &new).unwrap();
+    put_private(&d.journal(), &new);
     let service = d.start().unwrap();
     assert!(service.latest_good("o", "f").is_some());
+}
+
+#[test]
+fn journal_symlink_hardlink_and_loose_mode_are_refused() {
+    use std::os::unix::fs::{symlink, PermissionsExt};
+    let _g = SERIAL.lock().unwrap();
+    let d = Durable::new();
+    let service = d.start().unwrap();
+    let a = accepted(service.submit(request("f")).unwrap());
+    wait(&service, a, terminal);
+    service.shutdown();
+    drop(service);
+    let real = d.dir.path().join("real");
+    std::fs::rename(d.journal(), &real).unwrap();
+    // Symlink at the final component: never followed.
+    symlink(&real, d.journal()).unwrap();
+    assert!(d.start().is_err());
+    std::fs::remove_file(d.journal()).unwrap();
+    // Hard link: a second directory entry is refused.
+    std::fs::hard_link(&real, d.journal()).unwrap();
+    assert!(d.start().is_err());
+    std::fs::remove_file(d.journal()).unwrap();
+    // Loose mode is refused.
+    std::fs::rename(&real, d.journal()).unwrap();
+    std::fs::set_permissions(d.journal(), std::fs::Permissions::from_mode(0o644)).unwrap();
+    assert!(d.start().is_err());
+    std::fs::set_permissions(d.journal(), std::fs::Permissions::from_mode(0o600)).unwrap();
+    assert!(d.start().is_ok());
+}
+
+#[test]
+fn journal_temp_swaps_cannot_be_published() {
+    use std::os::unix::fs::{symlink, PermissionsExt};
+    let _g = SERIAL.lock().unwrap();
+    let d = Durable::new();
+    let service = d.start().unwrap();
+    let a = accepted(service.submit(request("f")).unwrap());
+    wait(&service, a, terminal);
+    service.shutdown();
+    drop(service);
+    let before = std::fs::read(d.journal()).unwrap();
+    let victim = d.dir.path().join("victim");
+    std::fs::write(&victim, b"keep").unwrap();
+    std::fs::set_permissions(&victim, std::fs::Permissions::from_mode(0o600)).unwrap();
+    // A planted temp symlink is unlinked, never written through.
+    let tmp = d.dir.path().join("journal.tmp");
+    symlink(&victim, &tmp).unwrap();
+    let service = d.start().unwrap();
+    let b = accepted(service.submit(request("f")).unwrap());
+    wait(&service, b, terminal);
+    service.shutdown();
+    assert_eq!(std::fs::read(&victim).unwrap(), b"keep");
+    assert_ne!(std::fs::read(d.journal()).unwrap(), before);
 }
 
 #[test]
@@ -793,7 +852,7 @@ fn durable_unfinished_jobs_are_not_silently_successful_at_boot() {
     let body = serde_json::to_vec(&doc).unwrap();
     let mut out = format!("{:x}\n", Sha256::digest(&body)).into_bytes();
     out.extend(body);
-    std::fs::write(d.journal(), out).unwrap();
+    put_private(&d.journal(), &out);
     let service = d.start().unwrap();
     // The committed artifact is recovered by its trusted reserved identity.
     assert!(matches!(
@@ -892,7 +951,7 @@ fn forge(d: &Durable, edit: impl FnOnce(&mut serde_json::Value)) {
     let body = serde_json::to_vec(&doc).unwrap();
     let mut out = format!("{:x}\n", Sha256::digest(&body)).into_bytes();
     out.extend(body);
-    std::fs::write(d.journal(), out).unwrap();
+    put_private(&d.journal(), &out);
 }
 
 static ART_FAIL: AtomicUsize = AtomicUsize::new(0);
