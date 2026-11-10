@@ -390,3 +390,55 @@
   [data-approved-page="audio"] .audio-strip-keys { flex-wrap: nowrap; }
   [data-approved-page="audio"] .audio-strip-keys .audio-listen-key { flex: 1 1 0; }
 }
+
+/* ---- Fix13: compact strip (<=~380px at xl): chevron corner button, 3-cell key grid ---- */
+[data-approved-page="audio"] .audio-strip { position: relative; }
+[data-approved-page="audio"] .audio-strip-head { min-height: var(--tap); justify-content: center; padding-right: 52px; }
+[data-approved-page="audio"] .audio-strip-head [data-testid="audio-strip-name"] { text-align: left; }
+/* Channel details: the summary is a 48px chevron button in the strip's header corner; its text stays for assistive tech. */
+[data-approved-page="audio"] .audio-strip > .audio-details-compact > summary {
+  position: absolute; top: 4px; right: 4px; width: var(--tap); min-width: var(--tap); height: var(--tap); min-height: var(--tap);
+  padding: 0; font-size: 0; line-height: 0; justify-content: center; gap: 0;
+  border: 1px solid var(--line); border-radius: var(--r-sm); background: var(--bg-2);
+}
+[data-approved-page="audio"] .audio-strip > .audio-details-compact > summary svg { width: 20px; height: 20px; }
+[data-approved-page="audio"] .audio-strip > .audio-details-compact[open] > summary { border-color: var(--blue); }
+[data-approved-page="audio"] .audio-strip > .audio-details-compact[open] { margin: 0; padding: 0; }
+[data-approved-page="audio"] .audio-strip > .audio-details-compact[open] > div { margin-top: 0; padding-top: 4px; }
+[data-approved-page="audio"] .audio-strip-meta { gap: 2px; }
+@media (min-width: 1280px) {
+  [data-approved-page="audio"] .audio-fader-box { height: 186px; }
+  [data-approved-page="audio"] .strip-bank .meter-col { height: 186px; padding: 24px 0; }
+  [data-approved-page="audio"] .strip-bank [data-testid="audio-strip"] { gap: 4px; padding: 4px 3px; }
+  [data-approved-page="audio"] .audio-strip .audio-nudge-col { gap: 2px; }
+  [data-approved-page="audio"] .strip-bank [data-testid="audio-strip-essential"] {
+    display: grid; grid-template-columns: 1fr 1fr; gap: 4px; align-items: center;
+  }
+  [data-approved-page="audio"] .strip-bank [data-testid="audio-strip-essential"] > div:first-child { grid-column: 1 / -1; grid-row: 1; }
+  [data-approved-page="audio"] .strip-bank .audio-strip-keys { display: contents; }
+  [data-approved-page="audio"] .strip-bank .audio-strip-keys [data-testid="audio-mute"] { grid-column: 1; grid-row: 2; max-width: none; width: 100%; }
+  [data-approved-page="audio"] .strip-bank .audio-strip-keys [data-testid="audio-pgm"] { grid-column: 2; grid-row: 2; max-width: none; width: 100%; }
+  [data-approved-page="audio"] .strip-bank .audio-strip-keys .audio-listen-key { grid-column: 1; grid-row: 3; min-width: 0; width: 100%; padding: 0; }
+  [data-approved-page="audio"] .strip-bank .audio-strip-meta { grid-column: 2; grid-row: 3; min-width: 0; }
+  [data-approved-page="audio"] .strip-bank .audio-readout { justify-content: center; }
+  [data-approved-page="audio"] .strip-bank [data-testid="audio-strip-status"] { margin: 0; line-height: 1.2; }
+  [data-approved-page="audio"] .strip-bank .audio-undo-slot { margin: 0; }
+  /* status line rides in the header band beside the chevron corner button */
+  [data-approved-page="audio"] .strip-bank [data-testid="audio-strip-status"] {
+    position: absolute; top: 26px; left: 6px; right: 54px; text-align: left; font-size: 10px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  }
+  [data-approved-page="audio"] .strip-bank .audio-strip-head { justify-content: flex-start; padding-top: 6px; }
+  /* master rail: tighter, program strip stays on screen */
+  [data-approved-page="audio"] .master-col { gap: 8px; }
+  [data-approved-page="audio"] [data-testid="audio-mix-overview"] { padding: 8px 10px; }
+  [data-approved-page="audio"] [data-testid="audio-mix-overview"] ul { gap: 2px; margin-top: 6px; }
+  [data-approved-page="audio"] .master-fader-row .audio-fader-box { height: 186px; }
+  [data-approved-page="audio"] .strip-master { gap: 6px; padding: 6px; }
+}
+/* Phone toolbar: one or two clean rows (Add route + Save on one row; note beneath). */
+@media (max-width: 767px) {
+  [data-approved-page="audio"] [data-testid="audio-toolbar"] { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+  [data-approved-page="audio"] [data-testid="audio-toolbar"] > button { width: 100%; padding-left: 8px; padding-right: 8px; }
+  [data-approved-page="audio"] [data-testid="audio-toolbar"] .audio-draft-note { grid-column: 1 / -1; order: 5; margin: 0; }
+  [data-approved-page="audio"] [data-testid="audio-toolbar"] [data-testid="audio-bank-toggle"] { display: none; }
+}

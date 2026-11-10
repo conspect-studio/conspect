@@ -312,7 +312,7 @@ function ChannelStrip({
     <section
       data-testid="audio-strip"
       aria-label={t`Channel strip — ${label}`}
-      className="flex w-full min-w-0 flex-col gap-2 rounded-md border p-3"
+      className="audio-strip relative flex w-full min-w-0 flex-col gap-2 rounded-md border p-3"
     >
       <header className="audio-strip-head flex min-w-0 flex-col gap-1">
         <span
