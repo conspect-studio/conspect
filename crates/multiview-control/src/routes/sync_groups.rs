@@ -316,6 +316,7 @@ pub(crate) async fn measure_sync_group(
         },
     )?;
     let op = match state.idempotency.reserve(idem.0.as_deref()) {
+        Reservation::Capacity => return Err(ControlError::IdempotencyCapacity),
         Reservation::Fresh(op) | Reservation::Replay(op) => op,
     };
     state.audit(

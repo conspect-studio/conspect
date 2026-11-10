@@ -658,7 +658,7 @@ pub(crate) async fn set_mode(
             request.mode, plan.impact, plan.impact, plan.detail
         )));
     }
-    let op = reserve_operation(&state, &idem);
+    let op = reserve_operation(&state, &idem)?;
     state.audit(
         &principal.key_id,
         AuditAction::Command,
@@ -731,7 +731,7 @@ pub(crate) async fn reboot_device(
     principal.role.require(Action::Write)?;
     crate::auth::authorize_object(&principal, &id)?;
     require_device(&state, &id)?;
-    let op = reserve_operation(&state, &idem);
+    let op = reserve_operation(&state, &idem)?;
     state.audit(
         &principal.key_id,
         AuditAction::Command,
@@ -829,9 +829,13 @@ fn fire_and_forget(
 /// `device.mode`/outcome event on the realtime stream as the action runs. A
 /// retried `Idempotency-Key` returns the original id. Shared with the
 /// cast-session volume route.
-pub(crate) fn reserve_operation(state: &AppState, idem: &IdempotencyKey) -> OperationId {
+pub(crate) fn reserve_operation(
+    state: &AppState,
+    idem: &IdempotencyKey,
+) -> ControlResult<OperationId> {
     match state.idempotency.reserve(idem.0.as_deref()) {
-        Reservation::Fresh(op) | Reservation::Replay(op) => op,
+        Reservation::Capacity => return Err(ControlError::IdempotencyCapacity),
+        Reservation::Fresh(op) | Reservation::Replay(op) => Ok(op),
     }
 }
 

@@ -72,6 +72,10 @@ pub enum ControlError {
     #[error("engine command bus at capacity; request shed")]
     EngineBusy,
 
+    /// New idempotency keys cannot evict accepted reservations.
+    #[error("idempotency reservation store at capacity; new key refused")]
+    IdempotencyCapacity,
+
     /// The atomic rename became visible, but directory durability could not be
     /// confirmed. The caller must read the authoritative record before retrying.
     #[error("desired-state commit status is indeterminate: {0}")]
@@ -119,6 +123,14 @@ impl ControlError {
             }
             Self::EngineBusy => Problem::new(503, "engine-busy", "Engine command bus at capacity")
                 .with_detail("the control command queue is full; retry shortly"),
+            Self::IdempotencyCapacity => Problem::new(
+                503,
+                "idempotency-capacity",
+                "Idempotency reservation capacity exhausted",
+            )
+            .with_detail(
+                "existing keys still replay; a new distinct key cannot be safely reserved",
+            ),
             Self::CommitIndeterminate(msg) => Problem::new(
                 503,
                 "commit-indeterminate",

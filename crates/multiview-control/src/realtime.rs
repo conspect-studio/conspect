@@ -1196,6 +1196,9 @@ impl SessionStream {
             // answers (end-to-end): echo it directly. No registry, no queue — an
             // event with no id (adopt/reconnect convergence) stays uncorrelated.
             Event::DeviceMode(mode) => mode.operation_id.clone().map(OperationId::from_string),
+            Event::SwitcherOperation(outcome) => {
+                Some(OperationId::from_string(outcome.operation_id.clone()))
+            }
             _ => self.corr.as_ref().and_then(|registry| {
                 CorrKey::for_event(&event).and_then(|key| registry.resolve(&key, seq_event.seq))
             }),
@@ -1281,6 +1284,7 @@ pub fn event_scope_id(event: &Event) -> Option<String> {
         Event::TimingStatus(timing) => Some(timing.stream_id.clone()),
         // A media-player lifecycle event scopes by the player id (ADR-RT008), so
         // the `ids` filter narrows the coarse `switcher` topic to one player.
+        Event::SwitcherOperation(e) => Some(e.me.clone()),
         Event::MediaPlayerState(e) => Some(e.player.clone()),
         // A discovery row has no registry id yet (untrusted inventory): it is
         // correlated to its scan operation via `corr`, never a fabricated id.
@@ -1389,7 +1393,8 @@ pub fn topic_for_event(event: &Event) -> Topic {
         // The broadcast-switcher lifecycle lane (ADR-RT008): a media player's
         // discrete transport-state transition rides the lossless `switcher`
         // topic (scoped finer by the player `id`), NOT the `$control` catch-all.
-        Event::MediaPlayerState(_) => Topic::Switcher,
+        Event::SwitcherOperation(_) | Event::MediaPlayerState(_) => Topic::Switcher,
+
         _ => Topic::Control,
     }
 }

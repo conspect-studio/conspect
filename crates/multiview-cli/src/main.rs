@@ -325,6 +325,9 @@ fn persist_loaded_best_effort(boot_model: &multiview_control::boot_model::BootMo
 struct ControlPlaneWiring {
     /// The shared program-frame slot the run loop fills for previews.
     program_slot: multiview_cli::preview::ProgramSlot,
+    switcher_preview: Option<multiview_cli::preview::ProgramSlot>,
+    switcher: Option<multiview_engine::switcher_control::SwitcherControl>,
+    switcher_leases: Option<Arc<multiview_control::source_demand::SwitcherPreviewLeases>>,
     /// The per-source last-good stores (the preview provider's initial map).
     stores: std::collections::HashMap<String, Arc<multiview_framestore::TileStore<Nv12Image>>>,
     /// The per-source producer stop registry (shared with the live-source hub).
@@ -389,6 +392,11 @@ struct ControlPlaneWiring {
 // WebRTC protocol names — distinct transports, not a typo-similar pair; renaming
 // either would obscure the spec mapping.
 #[allow(clippy::similar_names)]
+#[allow(clippy::too_many_lines)]
+// reason: a flat, linear control-plane wiring sequence — one documented block per
+// optional surface (switcher M/E, WHEP preview, WHIP ingest, WHEP-serve output,
+// discovery, licence, mesh). The first-slice M/E wiring pushed it past the
+// ceiling; extracting one-use helpers would only scatter the wiring.
 async fn serve_control_plane(
     listen: &str,
     start: &multiview_cli::boot::StartConfig,
@@ -408,6 +416,9 @@ async fn serve_control_plane(
     let config = &start.running;
     let ControlPlaneWiring {
         program_slot,
+        switcher_preview,
+        switcher,
+        switcher_leases,
         stores,
         registry,
         ingest,
@@ -473,9 +484,11 @@ async fn serve_control_plane(
     let whep_output: Option<multiview_control::SharedWhepOutput> = None;
     // The live-preview provider reads the program slot the run loop fills + the
     // shared per-input store map — read-only for control (invariant #10).
-    let provider: multiview_control::SharedPreview = Arc::new(
-        multiview_cli::preview::CliPreviewProvider::new(program_slot, shared_stores),
-    );
+    let mut provider = multiview_cli::preview::CliPreviewProvider::new(program_slot, shared_stores);
+    if let Some(preview) = switcher_preview {
+        provider = provider.with_switcher_preview(preview);
+    }
+    let provider: multiview_control::SharedPreview = Arc::new(provider);
     // The Boot/Loaded/Running model (ADR-W024): Loaded is the immutable boot
     // snapshot; the model backs `GET /api/v1/config/boot-model` and the
     // revert-to-start/promote actions, and is the persister's target.
@@ -486,6 +499,8 @@ async fn serve_control_plane(
         Arc::clone(publisher),
         commands,
         provider,
+        switcher,
+        switcher_leases,
         whep,
         whip,
         whep_output,
@@ -544,6 +559,53 @@ async fn serve_control_plane(
     Ok((handle, command_rx, hub, watch, persist))
 }
 
+/// Attach the run's declared first-slice Program/Preview M/E (`[switcher]`) and
+/// relay its engine-owned outcomes onto the shared publisher. A refused boot
+/// lease is a warning, never a failure: Program, the output clock and every other
+/// output are unaffected, and Preview stays explicitly unavailable rather than
+/// silently copying Program. Returns `None` when the document declares no M/E
+/// (the legacy one-canvas run path, byte-identical to today).
+#[cfg(feature = "ffmpeg")]
+fn attach_run_switcher(
+    pipeline: &mut multiview_cli::pipeline::Pipeline,
+    demand: Option<multiview_control::SharedSourceDemand>,
+    publisher: &Arc<EnginePublisher<EngineStateSnapshot, Event>>,
+    stop: &StopSignal,
+) -> anyhow::Result<Option<multiview_cli::switcher_runtime::FirstSliceSwitcher>> {
+    let Some(attached) = multiview_cli::switcher_runtime::attach_first_slice(pipeline, demand)?
+    else {
+        return Ok(None);
+    };
+    if let Some(warning) = &attached.boot_warning {
+        tracing::warn!(
+            me = %attached.me_id,
+            program = %attached.program,
+            warning = %warning,
+            "switcher preview unavailable at boot"
+        );
+    }
+    tokio::spawn(
+        multiview_control::switcher_events::forward_switcher_outcomes(
+            attached.control.outcomes(),
+            Arc::clone(publisher),
+            attached.me_id.clone(),
+            attached.program.clone(),
+            Arc::clone(&attached.leases),
+        ),
+    );
+    // The correlated relay above is the primary lease resolver, but it can die
+    // or lag; this off-clock, bounded sweep reconciles any accepted-but-
+    // unresolved selection against the engine's own applied snapshot so a
+    // preview demand can never be leaked forever. It stops with the run.
+    tokio::spawn(multiview_control::switcher_events::sweep_switcher_leases(
+        attached.control.clone(),
+        Arc::clone(&attached.leases),
+        stop.clone(),
+        multiview_control::switcher_events::SWEEPER_INTERVAL,
+    ));
+    Ok(Some(attached))
+}
+
 /// Drive the ingest/composite/encode pipeline until Ctrl-C while **also**
 /// serving the control plane, the embedded web UI, and the live program/input
 /// previews from the SAME run (when `[control]` is configured) — ingestion,
@@ -567,8 +629,7 @@ async fn run_pipeline_until_ctrl_c(
     // below calls `pipeline.set_program_audio_preview`). Without that feature the
     // binding is never mutated, so the `mut` is conditional to stay
     // `unused_mut`-clean on the `ffmpeg`/`rist`-only feature legs.
-    #[cfg(feature = "webrtc-native")] mut pipeline: multiview_cli::pipeline::Pipeline,
-    #[cfg(not(feature = "webrtc-native"))] pipeline: multiview_cli::pipeline::Pipeline,
+    mut pipeline: multiview_cli::pipeline::Pipeline,
     start: &multiview_cli::boot::StartConfig,
     plane: &multiview_cli::licence::EntitlementPlane,
     config_path: &Path,
@@ -579,6 +640,28 @@ async fn run_pipeline_until_ctrl_c(
     let stop = StopSignal::new();
     let publisher = Arc::new(EnginePublisher::<EngineStateSnapshot, Event>::new(64));
     let preview_slot = multiview_cli::preview::program_slot();
+    // First-slice M/E wiring is installed once this run's demand provider exists
+    // (the switcher's warm-on-arm PVW lease must target the same manager the
+    // control plane serves), so the attach sits inside the control block below.
+    // The `else` arm after it keeps a control-less run with `[switcher]` on the
+    // same wiring minus the lease.
+    let mut switcher_leases = None;
+    let mut switcher_preview_slot = None;
+    let mut switcher_attached = false;
+    struct LeaseCleanup(
+        Option<Arc<multiview_control::source_demand::SwitcherPreviewLeases>>,
+        StopSignal,
+    );
+    impl Drop for LeaseCleanup {
+        fn drop(&mut self) {
+            self.1.stop();
+            if let Some(leases) = &self.0 {
+                leases.detach();
+            }
+        }
+    }
+    let mut lease_cleanup = LeaseCleanup(None, stop.clone());
+    let mut attached_switcher: Option<multiview_cli::switcher_runtime::FirstSliceSwitcher> = None;
     // The shared program-audio preview tap (ADR-P006 audio): wired ONLY when this
     // run carries program audio AND a live WHEP egress can consume it
     // (`webrtc-native`). The bake consumer pushes post-loudnorm program PCM into
@@ -639,6 +722,30 @@ async fn run_pipeline_until_ctrl_c(
         let live_apply = live_apply.with_audio_routing(
             multiview_cli::audio::routing_live_capability(pipeline.audio_route_slot()),
         );
+        // Demand (docs/architecture/demand-driven-sources.md): build the manager
+        // before the hub and drain so live edits catalogue instead of spawning,
+        // and every consumer below takes leases from the same manager.
+        let demand = pipeline.demand();
+        multiview_cli::source_demand::install_control_demand(Some(Arc::new(
+            multiview_cli::source_demand::ControlDemand::new(demand, pipeline.catalogue()),
+        )));
+        // The declared first-slice M/E is attached HERE, after the demand
+        // provider is installed, so its boot lease warms the configured PVW
+        // source through the manager this run actually serves. A lease refusal
+        // is a warning, never a startup failure: Program keeps composing.
+        if let Some(attached) = attach_run_switcher(
+            &mut pipeline,
+            multiview_cli::source_demand::installed_control_demand(),
+            &publisher,
+            &stop,
+        )? {
+            lease_cleanup.0 = Some(Arc::clone(&attached.leases));
+            switcher_leases = Some(Arc::clone(&attached.leases));
+            switcher_preview_slot = Some(Arc::clone(&attached.preview_slot));
+            switcher_attached = true;
+            attached_switcher = Some(attached);
+        }
+
         let (handle, command_rx, hub, watch, persist) = serve_control_plane(
             &cfg.listen,
             start,
@@ -646,6 +753,9 @@ async fn run_pipeline_until_ctrl_c(
             &publisher,
             ControlPlaneWiring {
                 program_slot: Arc::clone(&preview_slot),
+                switcher_preview: switcher_preview_slot.clone(),
+                switcher: pipeline.switcher_control(),
+                switcher_leases: switcher_leases.clone(),
                 stores: pipeline.preview_stores(),
                 registry: pipeline.stop_registry(),
                 // The real decoded-ingest spawner (ADR-W018 level 2):
@@ -709,6 +819,15 @@ async fn run_pipeline_until_ctrl_c(
             None,
         )
     };
+    // A run with `[switcher]` but no control listener still gets the same real
+    // M/E wiring — the frame hook drives Program exactly as the API-served run
+    // does, instead of silently falling back to a single bus. No lease owner or
+    // monitor tap is published because nothing serves them; the boot lease is
+    // skipped honestly (the configured PVW source is warmed by whoever selects
+    // it, which in this run means nobody).
+    if !switcher_attached {
+        attached_switcher = attach_run_switcher(&mut pipeline, None, &publisher, &stop)?;
+    }
 
     let stop_for_signal = stop.clone();
     let signal = tokio::spawn(async move {
@@ -827,6 +946,13 @@ async fn run_pipeline_until_ctrl_c(
     let report =
         drive_main_program_in_set(pipeline, cadence, &stop, &publisher, &preview_slot, drain)
             .await?;
+
+    // The run is over: release this generation's preview demand explicitly
+    // (the sweeper has stopped on the same signal, so nothing can re-adopt a
+    // cancelled selection), then tear the shared tenants down.
+    if let Some(attached) = &attached_switcher {
+        attached.leases.detach();
+    }
 
     // The pipeline loop returned; tear down every run tenant in one call.
     shutdown_run_tenants(RunTenants {
@@ -1031,6 +1157,9 @@ async fn run_software_until_ctrl_c(
             &publisher,
             ControlPlaneWiring {
                 program_slot: engine.program_preview(),
+                switcher_preview: None,
+                switcher: None,
+                switcher_leases: None,
                 stores: engine.preview_stores(),
                 registry: engine.stop_registry(),
                 // The software engine has no decoder: no ingest spawner, so

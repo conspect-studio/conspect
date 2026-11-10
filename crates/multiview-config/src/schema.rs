@@ -951,6 +951,9 @@ impl SourceKind {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[non_exhaustive]
 pub struct Source {
+    /// Start at boot by default, or wait for a consumer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub activation: Option<SourceActivation>,
     /// Stable input id (referenced by `cells.source.input_id`).
     pub id: String,
     /// Human-friendly display name.
@@ -2566,4 +2569,47 @@ impl Layout {
 /// Parse a list of track strings into [`Track`] values.
 fn parse_tracks(tracks: &[String]) -> Result<Vec<Track>, ConfigError> {
     tracks.iter().map(|t| t.parse::<Track>()).collect()
+}
+
+/// When a source starts.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SourceActivation {
+    /// Started at boot and kept running whether or not anything consumes it.
+    /// The default: every existing source behaves as it always has.
+    #[default]
+    AlwaysOn,
+    /// Idle (zero cost: no connection, decoder or thread) until something
+    /// consumes it, and stopped again `close after` its last consumer leaves.
+    OnDemand,
+}
+
+impl SourceActivation {
+    /// The stable wire token.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::AlwaysOn => "always_on",
+            Self::OnDemand => "on_demand",
+        }
+    }
+}
+
+impl Source {
+    /// Whether this source waits for a consumer.
+    #[must_use]
+    pub fn is_on_demand(&self) -> bool {
+        self.activation == Some(SourceActivation::OnDemand)
+    }
+    /// Whether two source definitions select the same media.
+    #[must_use]
+    pub fn same_media(&self, other: &Self) -> bool {
+        self.id == other.id
+            && self.kind == other.kind
+            && self.auth == other.auth
+            && self.color_override == other.color_override
+            && self.captions == other.captions
+            && self.gpu_pin == other.gpu_pin
+            && self.wallclock == other.wallclock
+    }
 }

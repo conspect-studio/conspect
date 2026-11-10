@@ -83,7 +83,7 @@ use multiview_framestore::TileStore;
 /// *metadata* (ADR-0030 §3). The live decode is sized at the **first** acquire (see
 /// [`SourceRegistry::acquire`]); the supremum tracks the largest request but does
 /// **not** resize a live store.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
 pub struct RequestedSize {
     /// Requested width in pixels.
     pub width: u32,

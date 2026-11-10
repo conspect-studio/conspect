@@ -870,6 +870,7 @@ pub(crate) async fn revert_to_start(
         ));
     };
     let op = match state.idempotency.reserve(idem.0.as_deref()) {
+        Reservation::Capacity => return Err(ControlError::IdempotencyCapacity),
         Reservation::Replay(op) => {
             // The original request already applied (or honestly no-op'd);
             // answer with its id without re-running anything.
@@ -1130,6 +1131,7 @@ pub(crate) async fn promote_to_boot(
         ));
     };
     let op = match state.idempotency.reserve(idem.0.as_deref()) {
+        Reservation::Capacity => return Err(ControlError::IdempotencyCapacity),
         Reservation::Replay(op) => {
             // The original promote already wrote + committed; a replay must
             // not rewrite the file or commit another revision.

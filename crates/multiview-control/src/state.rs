@@ -711,6 +711,14 @@ pub struct AppState {
     pub config_versions: Arc<dyn ConfigVersionStore>,
     /// The `Idempotency-Key` deduplication store.
     pub idempotency: Arc<IdempotencyStore>,
+    /// Real M/E frame-boundary handle; absent until dual-bus pipeline is wired.
+    /// Routes fail closed rather than pretending that an unwired switcher applied.
+    pub switcher: Option<multiview_engine::switcher_control::SwitcherControl>,
+    /// Bounded sustained PVW lease retained across requests; the previous lease
+    /// is released only after a new source lease is acquired.
+    pub switcher_preview_lease: Arc<crate::source_demand::SwitcherPreviewLeases>,
+    /// Run's demand provider; absent when no source rails exist.
+    pub source_demand: Option<crate::source_demand::SharedSourceDemand>,
     /// The command-outcome correlation registry: pairs each accepted command's
     /// [`OperationId`](crate::command::OperationId) with the realtime outcome
     /// event it will produce, so the outcome's envelope echoes the op id as
@@ -987,6 +995,9 @@ impl AppState {
             pending_actions: Arc::new(InMemoryPendingActions::new()),
             config_versions: Arc::new(InMemoryConfigVersionStore::new()),
             idempotency: Arc::new(IdempotencyStore::new()),
+            switcher: None,
+            switcher_preview_lease: Arc::new(crate::source_demand::SwitcherPreviewLeases::default()),
+            source_demand: None,
             // Bound the in-flight correlations: a generous ceiling for pending
             // command outcomes (drop-oldest beyond it, invariant #10). A backlog
             // this deep means outcomes are not being consumed; the oldest
@@ -1247,6 +1258,27 @@ impl AppState {
         provider: crate::source_events::SharedSourceEvents,
     ) -> Self {
         self.source_events = Some(provider);
+        self
+    }
+
+    /// Attach the source demand provider.
+    #[must_use]
+    pub fn with_source_demand(
+        mut self,
+        provider: crate::source_demand::SharedSourceDemand,
+    ) -> Self {
+        self.source_demand = Some(provider);
+        self
+    }
+
+    /// Attach only after the engine is actually composing PGM/PVW and the
+    /// configured output bus has a live frame provider.
+    #[must_use]
+    pub fn with_switcher(
+        mut self,
+        switcher: multiview_engine::switcher_control::SwitcherControl,
+    ) -> Self {
+        self.switcher = Some(switcher);
         self
     }
 

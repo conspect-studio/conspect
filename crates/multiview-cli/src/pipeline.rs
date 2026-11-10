@@ -85,8 +85,8 @@ use multiview_core::time::{MediaTime, Rational};
 use multiview_core::traits::SourceState;
 use multiview_engine::{
     CompositedFrame, CompositorDrive, EnginePublisher, MonotonicTimeSource, MultiviewProgram,
-    OutputClock, Pacer, RealtimePacer, RequestedSize, SourceHandle, SourceKey, SourceRegistry,
-    StopSignal, TimeSource,
+    OutputClock, Pacer, Rails, RealtimePacer, RequestedSize, SourceHandle, SourceKey,
+    SourceRegistry, StopSignal, TimeSource,
 };
 use multiview_events::Event;
 use multiview_ffmpeg::{
@@ -232,6 +232,39 @@ struct StreamPlan {
     /// can prove a frame was encoded while the engine was still ticking. `None`
     /// on the production paths.
     hot_tick_observer: Option<Arc<AtomicU64>>,
+}
+
+/// Is this document's canvas one the first slice can drive as a real M/E bus?
+///
+/// Exactly one full-canvas, fully opaque, unclipped, non-overlay cell bound to
+/// the declared `program_source` — the shape the engine treats as the
+/// source-agnostic bus canvas. An unsupported opted-in layout is refused with a
+/// typed error instead of silently replacing the operator's multiview.
+#[allow(clippy::float_cmp)]
+// reason: authored layout fractions compared against their exact canonical
+// values; an approximate comparison would admit a windowed/tiled canvas as
+// "full canvas" and change which sources the buses admit.
+fn first_slice_me_layout_supported(
+    layout: &Layout,
+    config: &MultiviewConfig,
+    me: &multiview_config::MixEffectsConfig,
+) -> bool {
+    layout.cells.len() == 1
+        && config.overlays.is_empty()
+        && !config.cells.first().is_some_and(|cell| {
+            cell.corner_radius.is_some()
+                || cell.border.is_some()
+                || cell.fit.as_deref().is_some_and(|fit| fit != "fill")
+                || cell.visible == Some(false)
+        })
+        && layout.cells.first().is_some_and(|cell| {
+            cell.x == 0.0 && cell.y == 0.0 && cell.w == 1.0 && cell.h == 1.0 && cell.opacity == 1.0
+        })
+        && config
+            .cells
+            .first()
+            .and_then(|cell| cell.source.input_id.as_deref())
+            == Some(me.program_source.as_str())
 }
 
 /// Errors building or running the libav\* pipeline.
@@ -1544,6 +1577,26 @@ impl RunnableOutput {
 
 /// A built, ready-to-run pipeline.
 pub struct Pipeline {
+    /// Every configured source's definition and frame store. A source with no
+    /// consumer costs this entry and nothing else.
+    catalogue: crate::source_rails::Catalogue,
+    /// The demand manager, built when the run starts.
+    demand: Option<multiview_engine::DemandManager<Nv12Image>>,
+    /// Linger and start concurrency for the manager.
+    demand_config: multiview_engine::DemandConfig,
+    /// What each booted source runs, for the manager to adopt.
+    boot_rails: std::collections::BTreeMap<String, Rails>,
+    /// Standing leases from source settings (always-on, armed automation),
+    /// as one complete set per owning source (review DMD-01).
+    boot_pins: Vec<(String, Vec<crate::source_demand::StandingPin>)>,
+    /// The boot audio routes' consumers.
+    boot_audio_routes: Vec<multiview_engine::SetItem>,
+    /// The layout and audio-route consumer sets, once the manager exists.
+    demand_sets: Option<(
+        multiview_engine::ConsumerSet<Nv12Image>,
+        multiview_engine::ConsumerSet<Nv12Image>,
+    )>,
+
     source_events: Arc<crate::source_event_runtime::Runtime>,
     /// The solved layout (canvas + normalized cells).
     layout: Arc<Layout>,
@@ -1558,6 +1611,14 @@ pub struct Pipeline {
     /// per-program context [`PipelineError`] carries. The `programs: Vec<…>`
     /// schema root + multi-program supervisor arrive in MP-1/MP-5.
     program_spec: multiview_config::ProgramSpec,
+    /// Optional first-slice M/E on this one program; absent preserves legacy
+    /// source/layout/encode behaviour byte-for-byte.
+    switcher_me: Option<multiview_config::MixEffectsConfig>,
+    /// Live control handle published only when the paired bus provider starts.
+    switcher_control: Option<multiview_engine::switcher_control::SwitcherControl>,
+    switcher_driver: Option<multiview_engine::switcher_control::SwitcherTickDriver>,
+    /// Separate PVW JPEG tap: never silently copy the PGM canvas here.
+    switcher_preview: Option<crate::preview::ProgramSlot>,
     /// Per-source native caption cue stores, keyed by source id. Each store is
     /// written by an isolated caption reader thread (HLS `WebVTT` rendition demux)
     /// and **sampled** at each output tick by the overlay baker, which burns the
@@ -2203,6 +2264,20 @@ impl Pipeline {
         #[cfg(feature = "aes67")]
         ensure_no_cell_binds_an_aes67_source(config)?;
         let layout = Arc::new(config.solve_layout()?);
+        let switcher_me = config
+            .switcher
+            .as_ref()
+            .and_then(|s| s.mix_effects.first())
+            .cloned();
+        // This slice admits a single real full-canvas source cell. A running
+        // legacy multiview with multiple cells remains untouched when the M/E
+        // block is absent; an opted-in unsupported layout fails loudly instead
+        // of replacing the operator's canvas with a guessed source.
+        if let Some(me) = &switcher_me {
+            if !first_slice_me_layout_supported(&layout, config, me) {
+                return Err(PipelineError::Engine("first-slice M/E requires one full-canvas source cell initially bound to program_source; multi-cell layouts are not replaced".into()));
+            }
+        }
         let cadence = config.canvas.fps.rational();
         let canvas_color = CanvasColor::default();
         let tag = canvas_color.output_tag();
@@ -2250,10 +2325,23 @@ impl Pipeline {
         #[cfg(feature = "overlay")]
         let mut caption_plans: Vec<crate::captions::CaptionPlan> = Vec::new();
 
+        // Demand (docs/architecture/demand-driven-sources.md): only sources a
+        // consumer needs at boot are built below. Every other configured source
+        // gets a catalogue entry (one empty store) and costs nothing until a
+        // consumer leases it: no probe, no plan, no thread, no connection.
+        let boot_demand = crate::source_demand::startup_demand(
+            config,
+            layout
+                .cells
+                .iter()
+                .filter_map(|cell| cell.source.as_deref()),
+        );
+        let wants = |id: &str| boot_demand.get(id).map_or(Rails::NONE, |d| d.rails);
+
         // Resolve every source's HLS WebVTT caption plan CONCURRENTLY, off the
         // serial build path (#48), indexed by id for the loop's cheap lookup.
         #[cfg(feature = "overlay")]
-        let mut prefetched_captions = prefetch_caption_plans(config);
+        let mut prefetched_captions = prefetch_caption_plans(config, |id| wants(id).video);
         #[cfg(feature = "overlay")]
         let audio_free_sources = Arc::new(multiview_framestore::SwapCell::from_pointee(
             config
@@ -2276,7 +2364,12 @@ impl Pipeline {
         let mut source_handles: Vec<SourceHandle<Nv12Image>> =
             Vec::with_capacity(config.sources.len());
 
+        let mut boot_rails = std::collections::BTreeMap::new();
         for source in &config.sources {
+            let rails = wants(&source.id);
+            if rails.is_empty() && !matches!(source.kind, SourceKind::Aes67 { .. }) {
+                continue;
+            }
             // #103: an AES67 / ST 2110-30 source is AUDIO-ONLY. It decodes no
             // pixels, so it takes NO video TileStore, NO SourceRegistry entry, and
             // NO layout tile — the MP-2 decode-once video seam (ADR-0030 §3) never
@@ -2301,6 +2394,18 @@ impl Pipeline {
                 });
                 continue;
             }
+            if !rails.video {
+                if let Some(audio_plan) = audio_ingest_plan_for(source) {
+                    audio_stores.insert(source.id.clone(), crate::audio::new_live_store());
+                    audio_ingest_plans.push(audio_plan);
+                    boot_rails.insert(source.id.clone(), Rails::AUDIO);
+                } else if tone_ingest_plan_for(source, cadence).is_some() {
+                    audio_stores.insert(source.id.clone(), crate::audio::new_tone_store());
+                    boot_rails.insert(source.id.clone(), Rails::AUDIO);
+                }
+                continue;
+            }
+            boot_rails.insert(source.id.clone(), rails);
             let (tile_w, tile_h) = cell_pixel_size(&layout, &source.id)
                 .unwrap_or((config.canvas.width, config.canvas.height));
             // The registry owns the shared store, sized to the per-axis supremum;
@@ -2548,7 +2653,7 @@ impl Pipeline {
         // published snapshot is the RT-3 read-only discovery surface. Synthetic /
         // live-URL / NDI sources (and the no-`ffmpeg` build) contribute nothing
         // and simply ride an empty map (inv #10 — never on the hot loop).
-        let inventories = build_input_inventories(config);
+        let inventories = build_input_inventories(config, |id| wants(id).video);
 
         // Desugar the legacy single-program config into one implicit `"main"`
         // `Multiview` program (ADR-0030 §6 / MP-0). The run path is driven through
@@ -2570,11 +2675,44 @@ impl Pipeline {
             .map(|plan| (plan.id.clone(), plan.lifecycle))
             .collect();
 
+        // Every configured source is catalogued, demanded or not; the stores of
+        // booted sources are shared so a later lease reuses them.
+        let catalogue = crate::source_rails::catalogue(
+            config
+                .sources
+                .iter()
+                .filter(|source| !matches!(source.kind, SourceKind::Aes67 { .. })),
+            &stores,
+        );
+        let demand_config = crate::source_demand::demand_config(config);
+        let boot_pins: Vec<(String, Vec<crate::source_demand::StandingPin>)> = config
+            .sources
+            .iter()
+            .map(|source| {
+                (
+                    source.id.clone(),
+                    crate::source_demand::standing_pins(source),
+                )
+            })
+            .filter(|(_, pins)| !pins.is_empty())
+            .collect();
+        let boot_audio_routes = crate::source_demand::audio_route_items(config.audio.as_ref());
         Ok(Self {
+            catalogue,
+            demand: None,
+            demand_config,
+            boot_rails,
+            boot_pins,
+            boot_audio_routes,
+            demand_sets: None,
             source_events,
             layout,
             cadence,
             program_spec,
+            switcher_me,
+            switcher_control: None,
+            switcher_driver: None,
+            switcher_preview: None,
             stores,
             source_registry,
             source_handles,
@@ -2812,7 +2950,11 @@ impl Pipeline {
     /// pinned to the running island's device — that placed the startup island.
     #[must_use]
     pub fn live_ingest_spawner(&self) -> Arc<dyn crate::live_sources::IngestSpawner> {
-        Arc::new(LiveIngestSpawner {
+        Arc::new(self.live_spawner())
+    }
+
+    fn live_spawner(&self) -> LiveIngestSpawner {
+        LiveIngestSpawner {
             source_events: Arc::clone(&self.source_events),
             layout: Arc::clone(&self.layout),
             canvas_color: self.canvas_color,
@@ -2829,7 +2971,95 @@ impl Pipeline {
             island: Arc::clone(&self.live_island),
             #[cfg(feature = "gpu")]
             load_source: crate::system_metrics::default_load_source(),
+        }
+    }
+
+    /// Every catalogued source's frame store, keyed by id.
+    fn catalogue_stores(&self) -> HashMapStores {
+        let mut stores: HashMapStores = self
+            .catalogue
+            .load()
+            .iter()
+            .map(|(id, entry)| (id.clone(), Arc::clone(entry.store())))
+            .collect();
+        // Media players and other boot-only stores ride along.
+        for (id, store) in &self.stores {
+            stores
+                .entry(id.clone())
+                .or_insert_with(|| Arc::clone(store));
+        }
+        stores
+    }
+
+    /// The demand manager for this run, built on first call, its consumers
+    /// seeded from boot and its boot-started rails adopted. Its worker starts
+    /// with the run. Live source edits retain main's existing hub path.
+    pub fn demand(&mut self) -> multiview_engine::DemandManager<Nv12Image> {
+        if let Some(demand) = &self.demand {
+            return demand.clone();
+        }
+        let spawner = DemandSpawner {
+            live: self.live_spawner(),
+            registry: Arc::clone(&self.stop_registry),
+        };
+        let rails = crate::source_rails::SourceRails::new(
+            Arc::clone(&self.catalogue),
+            Arc::clone(&self.stop_registry),
+            Arc::new(spawner),
+        );
+        let manager = multiview_engine::DemandManager::new(
+            Arc::clone(&self.source_registry),
+            Arc::new(rails),
+            self.demand_config,
+        );
+        // Boot consumers first, then adopt what boot already started, so
+        // nothing is started twice and nothing unneeded keeps running.
+        let layout = manager.consumer_set(multiview_engine::ConsumerClass::LayoutCell, Rails::ALL);
+        layout.seed(crate::source_demand::layout_items_for(&self.layout));
+        let audio = manager.consumer_set(multiview_engine::ConsumerClass::AudioRoute, Rails::AUDIO);
+        audio.seed(self.boot_audio_routes.clone());
+        // Keyed by the owning source, exactly as a runtime upsert keys them,
+        // so a later edit or removal replaces this very set.
+        for (owner, pins) in std::mem::take(&mut self.boot_pins) {
+            manager.set_pins(&owner, pins);
+        }
+        // Boot audio threads run only on a run with a program bus.
+        let bus = self.encode_cfg.audio.is_some();
+        for (id, rails) in &self.boot_rails {
+            let running = Rails {
+                video: rails.video,
+                audio: rails.audio && bus,
+            };
+            if !running.is_empty() {
+                manager.adopt(id, running);
+            }
+        }
+        // The pipeline's own boot references are superseded by the leases.
+        self.source_handles.clear();
+        self.demand_sets = Some((layout, audio));
+        self.demand = Some(manager.clone());
+        manager
+    }
+
+    /// The command drain's demand seam. `None` before [`Self::demand`].
+    #[must_use]
+    #[cfg(feature = "ffmpeg")]
+    pub fn drain_demand(&self) -> Option<crate::source_demand::DrainDemand<Nv12Image>> {
+        let manager = self.demand.clone()?;
+        let (layout, _) = self.demand_sets.clone()?;
+        Some(crate::source_demand::DrainDemand {
+            layout,
+            subtitles: manager
+                .consumer_set(multiview_engine::ConsumerClass::SubtitleRoute, Rails::VIDEO),
+            manager,
+            catalogue: Arc::clone(&self.catalogue),
         })
+    }
+
+    /// The configured-source catalogue.
+    #[must_use]
+    pub fn catalogue(&self) -> crate::source_rails::Catalogue {
+        Arc::clone(&self.catalogue)
     }
 
     /// Lock-free selected-frame event reader for the control plane.
@@ -3076,6 +3306,58 @@ impl Pipeline {
         Ok(out.report)
     }
 
+    /// Active first-slice program scene, validated at construction.
+    #[must_use]
+    pub fn switcher_program_layout(&self) -> Arc<Layout> {
+        Arc::clone(&self.layout)
+    }
+
+    /// A preview bus scene with the exact same canvas and alternate selected
+    /// source, prepared off-clock for admission and geometry validation.
+    #[must_use]
+    pub fn switcher_preview_layout(&self, source: &str) -> Arc<Layout> {
+        let mut scene = (*self.layout).clone();
+        if let Some(cell) = scene.cells.first_mut() {
+            cell.source = Some(source.to_owned());
+        }
+        Arc::new(scene)
+    }
+
+    /// Configured first-slice M/E descriptor for the launcher, if present.
+    #[must_use]
+    pub fn switcher_me(&self) -> Option<&multiview_config::MixEffectsConfig> {
+        self.switcher_me.as_ref()
+    }
+
+    /// Installed, real M/E handle for the management API.
+    #[must_use]
+    pub fn switcher_control(&self) -> Option<multiview_engine::switcher_control::SwitcherControl> {
+        self.switcher_control.clone()
+    }
+
+    /// Install a real first-slice M/E command handle and separate PVW tap. An
+    /// absent `[switcher]` block remains the unchanged legacy one-canvas path.
+    /// The caller must attach this pair BEFORE running or serving control.
+    ///
+    /// # Errors
+    /// Refuses an absent M/E or a config that cannot provide two actual buses.
+    pub fn attach_switcher(
+        &mut self,
+        handle: multiview_engine::switcher_control::SwitcherControl,
+        driver: multiview_engine::switcher_control::SwitcherTickDriver,
+        preview: crate::preview::ProgramSlot,
+    ) -> Result<(), PipelineError> {
+        if self.switcher_me.is_none() {
+            return Err(PipelineError::Engine(
+                "no first-slice M/E was declared".into(),
+            ));
+        }
+        self.switcher_control = Some(handle);
+        self.switcher_driver = Some(driver);
+        self.switcher_preview = Some(preview);
+        Ok(())
+    }
+
     /// The per-source frame stores, shared with the control plane's preview
     /// provider for the live per-input thumbnails.
     #[must_use]
@@ -3309,16 +3591,24 @@ impl Pipeline {
             runners,
             hot_tick_observer,
         } = plan;
+        let demand = self.demand();
         let clock =
             OutputClock::new(self.cadence).map_err(|e| PipelineError::Clock(e.to_string()))?;
         let drive = CompositorDrive::new(
             Arc::clone(&self.layout),
-            self.stores.clone(),
+            self.catalogue_stores(),
             self.nosignal_card.clone(),
             self.canvas_color,
             self.background,
         )
         .map_err(|e| PipelineError::Engine(e.to_string()))?;
+        // The first-slice M/E rebinds its existing one-cell PGM drive. The PVW
+        // tap is independent; the legacy no-M/E drive gets no new cell index.
+        let drive = if self.switcher_me.is_some() {
+            drive.with_cell_ids(vec![Some(self.program_spec.id.as_str().to_owned())])
+        } else {
+            drive
+        };
         // Under the opt-in `gpu` feature the run PREFERS the wgpu GPU
         // compositor. The device is chosen LOAD-AWARE at admission (ADR-0035
         // Tier-1, decide-once): poll NVML ONCE, score every visible GPU, and pin
@@ -3692,6 +3982,7 @@ impl Pipeline {
         let bake_ctx = self.bake_context();
         #[cfg(feature = "overlay")]
         let tile_spec_apply = Arc::clone(&self.tile_spec_apply);
+        demand.start();
         let (egress, hot_tx) = StreamEgress::spawn(
             bake_ctx,
             runners,
@@ -3996,16 +4287,42 @@ impl Pipeline {
         // `EngineRuntime` path — the run methods no longer take `stop`; the same
         // bounded (`run_for`) vs forever (`run`) split + the same publisher /
         // state/event projections / per-frame control hook are threaded verbatim.
-        let outcome = match max_ticks {
-            Some(max) => {
-                program
-                    .run_for_with_control(publisher, max, state_of, event_of, control)
-                    .await
+        let outcome = if let Some(mut switcher_driver) = self.switcher_driver.take() {
+            switcher_driver.set_prime_stores(self.catalogue_stores());
+            let Some(preview_slot) = self.switcher_preview.clone() else {
+                return Err(PipelineError::Engine("switcher preview tap missing".into()));
+            };
+            let mut hook = multiview_engine::switcher_hook::SwitcherFrameHook::new(
+                switcher_driver,
+                self.program_spec.id.as_str().to_owned(),
+                control,
+            );
+            hook.preview_slot = Some(preview_slot);
+            hook.preview_stores = Some(self.catalogue_stores());
+            match max_ticks {
+                Some(max) => {
+                    program
+                        .run_for_with_frame_control(publisher, max, state_of, event_of, hook)
+                        .await
+                }
+                None => {
+                    program
+                        .run_with_frame_control(publisher, state_of, event_of, hook)
+                        .await
+                }
             }
-            None => {
-                program
-                    .run_with_control(publisher, state_of, event_of, control)
-                    .await
+        } else {
+            match max_ticks {
+                Some(max) => {
+                    program
+                        .run_for_with_control(publisher, max, state_of, event_of, control)
+                        .await
+                }
+                None => {
+                    program
+                        .run_with_control(publisher, state_of, event_of, control)
+                        .await
+                }
             }
         }
         .map_err(|e| PipelineError::Engine(e.to_string()));
@@ -4013,6 +4330,7 @@ impl Pipeline {
         // The clock has stopped (bounded budget reached, or `stop` raised): tear
         // ingest down deterministically (signal + join), then close the egress and
         // finalise. The hot queue is already closed by this point — see below.
+        demand.stop_all();
         supervisor.shutdown();
         // Invalidate every startup producer, including any libav worker detached
         // after the bounded join. No old run may write into a later run's slot.
@@ -6973,7 +7291,7 @@ impl crate::live_sources::IngestSpawner for LiveIngestSpawner {
         let anchor_floor = live_anchor_slot(&source.id)
             .load()
             .map_or(0, |anchor| anchor.generation);
-        let produced = self.spawn_video(&source, store, registry, lifecycle);
+        let produced = self.spawn_video(&source, store, registry, lifecycle, None);
         if let Some(handle) = audio {
             let audio_store = produced.as_ref().and_then(|p| {
                 spawn_live_audio(&source, &p.stop, registry, lifecycle, anchor_floor)
@@ -7074,10 +7392,15 @@ impl LiveIngestSpawner {
         store: Arc<TileStore<Nv12Image>>,
         registry: &crate::live_sources::StopRegistry,
         lifecycle: u64,
+        size: Option<RequestedSize>,
     ) -> Option<crate::live_sources::SpawnedProducer> {
         let source = source.clone();
-        let (tile_w, tile_h) = cell_pixel_size(&self.layout, &source.id)
-            .unwrap_or((self.layout.canvas.width, self.layout.canvas.height));
+        let (tile_w, tile_h) = size
+            .map(|size| (size.width, size.height))
+            .unwrap_or_else(|| {
+                cell_pixel_size(&self.layout, &source.id)
+                    .unwrap_or((self.layout.canvas.width, self.layout.canvas.height))
+            });
         let mut plan = match ingest_plan_for(
             &source,
             tile_w,
@@ -7194,6 +7517,134 @@ impl LiveIngestSpawner {
         }
         spawn_ingest_producer(plan, registry)
             .map(|(stop, handle)| crate::live_sources::SpawnedProducer { stop, handle })
+    }
+}
+
+/// The demand driver's starter: the live-add construction, one rail at a time.
+struct DemandSpawner {
+    live: LiveIngestSpawner,
+    registry: crate::live_sources::StopRegistry,
+}
+
+impl crate::source_rails::RailSpawner for DemandSpawner {
+    fn start_video(
+        &self,
+        source: &Source,
+        store: &Arc<TileStore<Nv12Image>>,
+        size: Option<RequestedSize>,
+        with_audio: bool,
+    ) -> Result<Vec<JoinHandle<()>>, String> {
+        let _ = with_audio;
+        if let Some(kind) = crate::synth::SyntheticKind::from_source_kind(&source.kind) {
+            return self.start_generator(source, kind, store).map(|h| vec![h]);
+        }
+        // A fresh lifecycle fences any detached writer of a previous run.
+        let lifecycle = begin_live_lifecycle(&source.id);
+        let produced = self
+            .live
+            .spawn_video(source, Arc::clone(store), &self.registry, lifecycle, size)
+            .ok_or_else(|| "the source could not be started".to_owned())?;
+        Ok(vec![produced.handle])
+    }
+
+    fn start_audio(
+        &self,
+        source: &Source,
+        audio_only: bool,
+    ) -> Result<Vec<JoinHandle<()>>, String> {
+        let Some(route) = self.live.audio_route.load() else {
+            return Err("this run carries no program audio".to_owned());
+        };
+        if matches!(source.kind, SourceKind::Bars) {
+            let store = crate::audio::new_tone_store();
+            if !route.set_source_audio(&source.id, Some(store)) {
+                return Err("the program bus is closed".to_owned());
+            }
+            return Ok(Vec::new());
+        }
+        let Some(mut plan) = audio_ingest_plan_for(source) else {
+            return Err("this source kind has no audio".to_owned());
+        };
+        let lifecycle = live_lifecycle(&source.id);
+        plan.lifecycle = lifecycle;
+        // Retain main's anchored audio implementation; audio-only live sources
+        // still require a separate unanchored-audio integration.
+        let store = if plan.live {
+            crate::audio::new_live_store()
+        } else {
+            crate::audio::new_file_store()
+        };
+        if !audio_only {
+            plan.anchor_floor = 0;
+        }
+        let stop = crate::source_rails::register(&self.registry, &format!("{}/audio", source.id));
+        let thread_store = Arc::clone(&store);
+        let handle = std::thread::Builder::new()
+            .name(format!("multiview-audio-{}", source.id))
+            .spawn(move || {
+                let stop = stop;
+                crate::audio::audio_ingest_loop(&plan, &thread_store, &stop.stop);
+                drop(stop.exit);
+            })
+            .map_err(|_| "could not start the audio thread".to_owned())?;
+        if !route.set_source_audio(&source.id, Some(store)) {
+            return Err("the program bus is closed".to_owned());
+        }
+        Ok(vec![handle])
+    }
+
+    fn audio_stopped(&self, id: &str) {
+        if let Some(route) = self.live.audio_route.load() {
+            let _ = route.set_source_audio(id, None);
+        }
+    }
+
+    fn audio_available(&self) -> bool {
+        self.live.audio_route.load().is_some()
+    }
+}
+
+impl DemandSpawner {
+    /// Start a synthetic generator: the same fenced loop the startup and live
+    /// paths run, at the canvas size.
+    fn start_generator(
+        &self,
+        source: &Source,
+        kind: crate::synth::SyntheticKind,
+        store: &Arc<TileStore<Nv12Image>>,
+    ) -> Result<JoinHandle<()>, String> {
+        if kind.animated() && !cfg!(feature = "overlay") {
+            return Err("this build cannot render this source (needs overlay)".to_owned());
+        }
+        let id = source.id.clone();
+        let lifecycle = begin_live_lifecycle(&id);
+        let stop = crate::source_rails::register(&self.registry, &id);
+        let thread_store = Arc::clone(store);
+        let (width, height) = (
+            self.live.layout.canvas.width,
+            self.live.layout.canvas.height,
+        );
+        let canvas = self.live.canvas_color;
+        let cadence = self.live.cadence;
+        let thread_id = id.clone();
+        let handle = std::thread::Builder::new()
+            .name(format!("multiview-synth-{id}"))
+            .spawn(move || {
+                let stop = stop;
+                crate::synth::generator_loop_fenced(
+                    kind,
+                    &thread_store,
+                    width,
+                    height,
+                    canvas,
+                    cadence,
+                    &stop.stop,
+                    Some((&thread_id, lifecycle)),
+                );
+                drop(stop.exit);
+            })
+            .map_err(|_| "could not start the generator thread".to_owned())?;
+        Ok(handle)
     }
 }
 
@@ -10150,11 +10601,15 @@ fn copy_plane(
 #[cfg(feature = "ffmpeg")]
 fn build_input_inventories(
     config: &MultiviewConfig,
+    wanted: impl Fn(&str) -> bool,
 ) -> std::collections::BTreeMap<String, multiview_core::stream::StreamInventory> {
     use multiview_ffmpeg::Demuxer;
 
     let mut inventories = std::collections::BTreeMap::new();
     for source in &config.sources {
+        if !wanted(&source.id) {
+            continue;
+        }
         let SourceKind::File { path } = &source.kind else {
             continue;
         };
@@ -10181,6 +10636,7 @@ fn build_input_inventories(
 #[cfg(not(feature = "ffmpeg"))]
 fn build_input_inventories(
     _config: &MultiviewConfig,
+    _wanted: impl Fn(&str) -> bool,
 ) -> std::collections::BTreeMap<String, multiview_core::stream::StreamInventory> {
     std::collections::BTreeMap::new()
 }
@@ -10714,8 +11170,15 @@ fn caption_plan_for_generation(
 #[cfg(feature = "overlay")]
 fn prefetch_caption_plans(
     config: &MultiviewConfig,
+    wanted: impl Fn(&str) -> bool,
 ) -> std::collections::HashMap<String, crate::captions::CaptionPlan> {
-    crate::captions::resolve_caption_plans(&config.sources)
+    let sources: Vec<_> = config
+        .sources
+        .iter()
+        .filter(|source| wanted(&source.id))
+        .cloned()
+        .collect();
+    crate::captions::resolve_caption_plans(&sources)
         .into_iter()
         .map(|plan| (plan.id.clone(), plan))
         .collect()
@@ -18754,6 +19217,35 @@ segment_ms = 1000
             "cell_pixel_size must decode at the per-axis supremum across ALL binding \
              cells (ADR-0030 §3), not the first-found cell {first:?}"
         );
+    }
+
+    #[test]
+    fn cold_source_is_catalogued_without_a_boot_plan_and_can_start_video() {
+        let mut config = two_cells_one_source_config();
+        let mut cold = config.sources[0].clone();
+        cold.id = "cold-preview".into();
+        cold.activation = Some(multiview_config::SourceActivation::OnDemand);
+        config.sources.push(cold.clone());
+        let pipeline = Pipeline::build(&config).expect("pipeline builds");
+        assert!(!pipeline.stores.contains_key(&cold.id));
+        assert!(!pipeline.ingest_plans.iter().any(|plan| plan.id == cold.id));
+        assert!(!pipeline.boot_rails.contains_key(&cold.id));
+        let stores = pipeline.catalogue_stores();
+        let store = stores.get(&cold.id).expect("cold store is catalogued");
+        assert_eq!(store.sequence(), 0);
+        let spawner = DemandSpawner {
+            live: pipeline.live_spawner(),
+            registry: pipeline.stop_registry(),
+        };
+        let handles =
+            crate::source_rails::RailSpawner::start_video(&spawner, &cold, store, None, false)
+                .expect("cold synthetic video starts");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        while store.sequence() == 0 && std::time::Instant::now() < deadline {
+            std::thread::yield_now();
+        }
+        crate::live_sources::stop_rail(&spawner.registry, &cold.id, true, false, handles);
+        assert!(store.sequence() > 0, "cold source publishes a real picture");
     }
 
     #[test]

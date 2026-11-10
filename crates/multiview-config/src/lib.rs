@@ -48,6 +48,7 @@ pub mod program;
 pub mod routing;
 pub mod salvo;
 pub mod schema;
+pub mod switcher;
 pub mod sync_group;
 pub mod tally;
 pub mod timer;
@@ -88,7 +89,7 @@ pub use placement::{DevicePin, MigrationPolicy, PinVendor, PlacementConfig, Plac
 pub use probe::{DetectionZone, Dwell, LoudnessTarget, Probe, ProbeKind};
 pub use program::{ProgramId, ProgramKind, ProgramSpec};
 pub use routing::{
-    AudioCrosspoint, OutputCrosspoint, OutputRef, RoutingRefs, RoutingTable, StreamRef,
+    AudioCrosspoint, OutputBus, OutputCrosspoint, OutputRef, RoutingRefs, RoutingTable, StreamRef,
     StreamSelector, SubtitleCrosspoint, VideoCrosspoint, MAIN_PROGRAM,
 };
 pub use salvo::{Salvo, SourceRecall, TallyRecall, UmdRecall};
@@ -98,8 +99,10 @@ pub use schema::{
     OrientationMechanism, OrientationMode, OrientationTagCapability, Output, OutputFlip,
     OutputMetadata, OutputMetadataPlan, OutputOrientation, OutputTimedMetadata, Overlay, Rect,
     RistAesBits, RistEncryption, RistOptions, RistPeer, RistProfile, RistUrlError, Source,
-    SourceAuth, SourceKind, SrtBackend, SrtEncryption, SrtKeyLength, SrtMode, SrtOptions,
+    SourceActivation, SourceAuth, SourceKind, SrtBackend, SrtEncryption, SrtKeyLength, SrtMode,
+    SrtOptions,
 };
+pub use switcher::{MixEffectsConfig, SwitcherConfig};
 pub use sync_group::{SyncGroup, SyncGroupMode, SyncMember};
 pub use tally::{BitColor, IndexCell, TallyProfile};
 pub use timer::{
@@ -225,6 +228,9 @@ pub struct ControlConfig {
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SystemConfig {
+    /// Demand-manager lifecycle limits.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub demand: Option<DemandSettings>,
     /// The NDI® SDK runtime license-acceptance gate. Absent ⇒ NDI I/O is refused
     /// (`ndi_unlicensed`) and never started.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -296,6 +302,9 @@ pub struct MultiviewConfig {
     /// Output sinks/servers.
     #[serde(default)]
     pub outputs: Vec<Output>,
+    /// Program declarations; absent desugars to the legacy `main` program.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub programs: Vec<ProgramSpec>,
     /// Content-aware fault probes (black/freeze/silence/loudness), per cell.
     #[serde(default)]
     pub probes: Vec<Probe>,
@@ -353,6 +362,9 @@ pub struct MultiviewConfig {
     /// that consumes these routes is `multiview-audio` + the engine (AUD-3/AUD-4).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub audio: Option<AudioRouting>,
+    /// Typed Program/Preview M/E configuration; absent preserves legacy output.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub switcher: Option<SwitcherConfig>,
     /// The per-stream decoupled-routing crosspoint table (ADR-0034 / RT-4): the
     /// broadcast router/multiviewer model where inputs, layouts and outputs are
     /// independent resources wired by per-stream crosspoints. **Absent ⇒ the
@@ -463,6 +475,45 @@ impl MultiviewConfig {
         serde_json::to_string_pretty(self).map_err(|e| ConfigError::JsonSerialize(e.to_string()))
     }
 
+    /// Return declared programs, or the implicit legacy main program.
+    #[must_use]
+    pub fn effective_programs(&self) -> Vec<ProgramSpec> {
+        if self.programs.is_empty() {
+            vec![ProgramSpec::main_multiview(
+                self.canvas.clone(),
+                self.layout.clone(),
+                self.cells.clone(),
+                self.overlays.clone(),
+                self.outputs.clone(),
+            )]
+        } else {
+            self.programs.clone()
+        }
+    }
+
+    /// Keep the sole declared program consistent with live top-level edits.
+    pub fn refresh_single_program(&mut self) {
+        if let [program] = self.programs.as_mut_slice() {
+            let ProgramKind::Multiview {
+                canvas,
+                layout,
+                cells,
+                overlays,
+            } = &mut program.kind;
+            canvas.clone_from(&self.canvas);
+            layout.clone_from(&self.layout);
+            cells.clone_from(&self.cells);
+            overlays.clone_from(&self.overlays);
+            program.outputs.clone_from(&self.outputs);
+        }
+    }
+
+    /// Program audio is declared, never silently enabled for legacy configs.
+    #[must_use]
+    pub fn declares_program_audio(&self) -> bool {
+        self.audio.is_some() || self.switcher.is_some()
+    }
+
     /// Validate every semantic invariant this crate owns.
     ///
     /// Enforces, in addition to [`multiview_core::layout::Layout::validate`] on the
@@ -511,6 +562,7 @@ impl MultiviewConfig {
         self.validate_sources()?;
         self.validate_cell_bindings()?;
         self.validate_outputs()?;
+        self.validate_programs_and_switcher()?;
         self.validate_audio()?;
         self.validate_probes()?;
         self.validate_tally_profiles()?;
@@ -1059,6 +1111,46 @@ impl MultiviewConfig {
         Ok(())
     }
 
+    fn validate_programs_and_switcher(&self) -> Result<(), ConfigError> {
+        if self.programs.len() > 1 {
+            return Err(ConfigError::Validation(
+                "multiple programs require the MP-7 runtime; exactly one is supported".into(),
+            ));
+        }
+        if let [program] = self.programs.as_slice() {
+            let ProgramKind::Multiview {
+                canvas,
+                layout,
+                cells,
+                overlays,
+            } = &program.kind;
+            if canvas != &self.canvas
+                || layout != &self.layout
+                || cells != &self.cells
+                || overlays != &self.overlays
+                || program.outputs != self.outputs
+            {
+                return Err(ConfigError::Validation(format!(
+                    "declared program {:?} disagrees with the active legacy canvas/layout/cells/overlays/outputs",
+                    program.id
+                )));
+            }
+        }
+        if let Some(switcher) = &self.switcher {
+            let sources: Vec<_> = self
+                .sources
+                .iter()
+                .map(|source| source.id.as_str())
+                .collect();
+            let program_id = self
+                .programs
+                .first()
+                .map_or(ProgramId::MAIN, |p| p.id.as_str());
+            switcher.validate(&sources, &[program_id])?;
+        }
+        Ok(())
+    }
+
     /// Ensure outputs are sane (at least one; each with a non-empty codec where a
     /// codec applies; a non-empty, unique stable id — ADR-0034 / RT-12).
     ///
@@ -1209,13 +1301,16 @@ impl MultiviewConfig {
             }
         }
 
-        // OUTPUT: each declared output → an output crosspoint on the single
-        // "main" program (until ADR-0030's ProgramSet lands), addressed by the
-        // output's stable id (explicit operator id, or the derived label — RT-12).
+        // OUTPUT: all legacy outputs carry the sole on-air program bus.
+        let program = self
+            .programs
+            .first()
+            .map_or(MAIN_PROGRAM, |p| p.id.as_str());
         for output in &self.outputs {
             table.output.push(OutputCrosspoint {
                 output: output.id(),
-                program: MAIN_PROGRAM.to_owned(),
+                program: program.to_owned(),
+                bus: OutputBus::Program,
             });
         }
 
@@ -1240,6 +1335,29 @@ impl MultiviewConfig {
         let Some(table) = &self.routing else {
             return Ok(());
         };
+        let program = self
+            .programs
+            .first()
+            .map_or(ProgramId::MAIN, |p| p.id.as_str());
+        for xp in &table.output {
+            if xp.program != program {
+                return Err(ConfigError::Validation(format!(
+                    "output {:?} references undeclared program {:?}",
+                    xp.output, xp.program
+                )));
+            }
+            if xp.bus != OutputBus::Program
+                && self
+                    .switcher
+                    .as_ref()
+                    .is_none_or(|s| s.mix_effects.is_empty())
+            {
+                return Err(ConfigError::Validation(format!(
+                    "output {:?} selects a switcher bus without a declared M/E",
+                    xp.output
+                )));
+            }
+        }
 
         let tracks = self.selectable_tracks();
         let output_ids = self.output_ids();
@@ -1416,6 +1534,32 @@ fn parse_fit(fit: Option<&str>) -> FitMode {
         Some("fill") => FitMode::Fill,
         _ => FitMode::Contain,
     }
+}
+
+/// `[system.demand]`: how `on_demand` sources start and stop around their
+/// consumers.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DemandSettings {
+    /// "Close after": seconds an `on_demand` source keeps running after its
+    /// last consumer leaves. Default 30. (`linger_secs` is read as an alias.)
+    #[serde(
+        default,
+        alias = "linger_secs",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub close_after_secs: Option<u32>,
+    /// "Start timeout": seconds a start may take to its first media before the
+    /// source reads `failed`. Default 20.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub start_timeout_secs: Option<u32>,
+    /// How many sources may start at once. Default 8.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_concurrent_starts: Option<u32>,
+    /// How many timed-out source opens may still hold a thread before new
+    /// starts are refused. Default 8.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_stuck_opens: Option<u32>,
 }
 
 impl Source {

@@ -47,6 +47,7 @@ pub mod salvos;
 pub mod source_events;
 pub mod sources;
 pub mod support;
+pub mod switcher;
 pub mod sync_groups;
 pub mod system;
 pub mod tally;
@@ -464,6 +465,7 @@ pub(crate) fn submit_accepted_body(
     build: impl FnOnce(OperationId) -> ControlResult<Command>,
 ) -> ControlResult<AcceptedBody> {
     match state.idempotency.reserve(idem.0.as_deref()) {
+        Reservation::Capacity => return Err(ControlError::IdempotencyCapacity),
         Reservation::Replay(op) => {
             // A retried request with the same key: return the original id
             // without re-enqueuing the command (and without re-running
@@ -806,6 +808,7 @@ pub(crate) async fn cmd_apply_layout(
     // Reserve the idempotency key and a bounded engine slot before the disk
     // commit. A full bus cannot create an unacknowledged accepted selection.
     let op = match state.idempotency.reserve(idem.0.as_deref()) {
+        Reservation::Capacity => return Err(ControlError::IdempotencyCapacity),
         Reservation::Replay(op) => {
             return Ok((
                 StatusCode::ACCEPTED,
@@ -968,7 +971,7 @@ impl axum::extract::FromRequestParts<AppState> for Principal {
 }
 
 /// Resolve the request's [`Principal`] from its headers (synchronous).
-fn authenticate_principal(
+pub(crate) fn authenticate_principal(
     parts: &axum::http::request::Parts,
     state: &AppState,
 ) -> Result<Principal, ControlError> {
@@ -1278,6 +1281,9 @@ pub fn api_router() -> Router<AppState> {
             post(media_players::cancel_exit),
         )
         // Per-stream crosspoint routing (RT-11): classify (plan) + apply (take).
+        .route("/switcher/{me}", get(switcher::get_switcher))
+        .route("/switcher/plan", post(switcher::plan_switcher))
+        .route("/switcher/commands/{kind}", post(switcher::submit_switcher))
         .route("/routing/plan", post(routing::plan_route))
         .route("/routing/{kind}/take", post(routing::take_route))
         // Tally operator surface: read resolved state, profiles, manual override.
@@ -1300,6 +1306,7 @@ pub fn api_router() -> Router<AppState> {
         // preview-WHEP) live in `signalling_router`, which `crate::router` merges
         // **with its CORS layer** so the allow-list applies only to them.
         .route("/preview/program.jpg", get(preview::program_jpeg))
+        .route("/preview/switcher/{me}/preview.jpg", get(preview::switcher_preview_jpeg))
         .route("/preview/inputs", get(preview::list_input_ids))
         .route("/preview/inputs/{id}", get(preview::input_jpeg))
         // Read-only change audit log.
