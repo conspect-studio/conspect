@@ -317,6 +317,7 @@ export function SourcePicker({
   sources,
   selected,
   programSource,
+  programUnknown = false,
   status,
   onPick,
   hidden = false,
@@ -325,6 +326,8 @@ export function SourcePicker({
   readonly sources: readonly PickerSource[];
   readonly selected: string;
   readonly programSource: string | undefined;
+  /** PGM is unconfirmed (stale/never read): no source may claim a PGM state. */
+  readonly programUnknown?: boolean;
   readonly status: "pending" | "error" | "ready";
   readonly onPick: (id: string) => void;
 }): JSX.Element {
@@ -366,7 +369,11 @@ export function SourcePicker({
             >
               <b>{source.name}</b>
               <span className="rp-cur">{source.id}</span>
-              {programSource === source.id ? (
+              {programUnknown ? (
+                <span className="pill">
+                  <Trans>PGM: unconfirmed</Trans>
+                </span>
+              ) : programSource === source.id ? (
                 <span className="pill pill-live">
                   <Trans>● on PGM</Trans>
                 </span>

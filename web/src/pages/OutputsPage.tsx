@@ -167,8 +167,21 @@ function hasLiveLink(kind: OutputKind): boolean {
  */
 export function OutputLinkStatus({ id }: { readonly id: string }): JSX.Element | null {
   const { t } = useLingui();
-  const link = useOutputLink(id, true).data;
+  const linkQuery = useOutputLink(id, true);
+  const link = linkQuery.data;
+  // A failing poll keeps the last good snapshot in cache; never present it as
+  // the current link state.
+  const pollFailing = linkQuery.isError;
   if (link === undefined || link === null) {
+    if (pollFailing) {
+      return (
+        <div className="flex flex-col gap-0.5 text-xs" data-testid="output-link">
+          <span className="text-destructive" data-testid="output-link-unavailable">
+            <Trans>Link state unavailable — the status poll is failing.</Trans>
+          </span>
+        </div>
+      );
+    }
     return null;
   }
   const state = ((): string => {
@@ -199,6 +212,11 @@ export function OutputLinkStatus({ id }: { readonly id: string }): JSX.Element |
   return (
     <div className="flex flex-col gap-0.5 text-xs" data-testid="output-link">
       <span>{state}</span>
+      {pollFailing ? (
+        <span className="text-destructive" data-testid="output-link-stale">
+          <Trans>Stale — last successful poll; the status poll is failing.</Trans>
+        </span>
+      ) : null}
       {link.peers.map((peer) => (
         <code key={peer} className="text-muted-foreground" lang="" dir="auto">
           {peer}
