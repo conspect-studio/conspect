@@ -99,9 +99,10 @@ pub(crate) async fn artifact(
             }
         }
     });
-    let stream = futures_util::stream::unfold(rx, |mut receiver| async move {
-        receiver.recv().await.map(|chunk| (chunk, receiver))
-    });
+    let stream = async_stream::stream! {
+        let mut receiver = rx;
+        while let Some(chunk) = receiver.recv().await { yield chunk; }
+    };
     Response::builder()
         .status(StatusCode::OK)
         .header(header::CONTENT_TYPE, "video/quicktime")

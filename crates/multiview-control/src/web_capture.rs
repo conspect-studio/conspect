@@ -166,9 +166,6 @@ impl Provider {
             resources: s.resource.and_then(|r| serde_json::to_value(r).ok()),
         })
     }
-    /// Cancel an actor-owned, authorized job.
-    /// # Errors
-    /// Requires write permission on the job's fill.
     /// Obtain an immutable artifact lease after authenticating the owning job.
     /// Blocking hash verification belongs on a management blocking worker.
     /// # Errors
@@ -191,6 +188,9 @@ impl Provider {
             .map_err(|_| ControlError::EngineBusy)
     }
 
+    /// Cancel an actor-owned, authorized job.
+    /// # Errors
+    /// Requires write permission on the job's fill.
     pub fn cancel(&self, p: &Principal, id: u64) -> ControlResult<()> {
         p.role.require(Action::Write)?;
         let _ = self.status(p, id)?;
