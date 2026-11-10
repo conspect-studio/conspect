@@ -4,7 +4,7 @@
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::{HashMap, HashSet, VecDeque},
     fs::{File, OpenOptions},
     io::{self, Read, Write},
     path::{Path, PathBuf},
@@ -272,6 +272,7 @@ fn write_snapshot(path: &Path, bytes: &[u8]) -> io::Result<File> {
 }
 /// Bounded actor+operation+key map. Pending reservations are never evicted.
 pub struct Ledger {
+    recovered_pending: HashSet<Id>,
     inner: Mutex<State>,
     file: Option<Mutex<Log>>,
 }
@@ -280,6 +281,7 @@ impl Ledger {
     #[must_use]
     pub fn memory() -> Self {
         Self {
+            recovered_pending: HashSet::new(),
             inner: Mutex::default(),
             file: None,
         }
@@ -330,7 +332,14 @@ impl Ledger {
         }
         let file = open_private(path)?;
         let len = file.metadata()?.len();
+        let recovered_pending = state
+            .map
+            .iter()
+            .filter(|(_, r)| r.value.is_none())
+            .map(|(id, _)| id.clone())
+            .collect();
         Ok(Self {
+            recovered_pending,
             inner: Mutex::new(state),
             file: Some(Mutex::new(Log {
                 file,
@@ -338,6 +347,11 @@ impl Ledger {
                 path: path.to_owned(),
             })),
         })
+    }
+    /// Whether a pending request was recovered without a completed receipt.
+    #[must_use]
+    pub fn outcome_uncertain(&self, actor: &str, op: &str, key: &str) -> bool {
+        self.recovered_pending.contains(&Self::id(actor, op, key))
     }
     fn id(actor: &str, op: &str, key: &str) -> Id {
         (actor.to_owned(), op.to_owned(), digest_hex(key.as_bytes()))

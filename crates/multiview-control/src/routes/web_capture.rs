@@ -177,6 +177,7 @@ pub(crate) async fn artifact(
         .map_err(|_| ControlError::Repository("artifact pin worker failed".into()))??;
     // Bounded channel: no whole-clip allocation and no filesystem I/O on an async worker.
     let (tx, rx) = tokio::sync::mpsc::channel::<Result<Vec<u8>, std::io::Error>>(2);
+    let content_length = lease.artifact().bytes;
     let runtime = tokio::runtime::Handle::current();
     tokio::task::spawn_blocking(move || {
         use std::io::Read;
@@ -185,6 +186,10 @@ pub(crate) async fn artifact(
         let mut lease = lease;
         loop {
             if std::time::Instant::now() >= deadline {
+                let _ = tx.try_send(Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "artifact transfer deadline",
+                )));
                 break;
             }
             let mut chunk = vec![0; 64 * 1024];
@@ -198,6 +203,10 @@ pub(crate) async fn artifact(
                         runtime.block_on(send_chunk(&tx, Ok(chunk), wait)),
                         Ok(Ok(()))
                     ) {
+                        let _ = tx.try_send(Err(std::io::Error::new(
+                            std::io::ErrorKind::TimedOut,
+                            "artifact client idle timeout",
+                        )));
                         break;
                     }
                 }
@@ -215,6 +224,7 @@ pub(crate) async fn artifact(
     Response::builder()
         .status(StatusCode::OK)
         .header(header::CONTENT_TYPE, "video/quicktime")
+        .header(header::CONTENT_LENGTH, content_length)
         .header(header::CACHE_CONTROL, "no-store")
         .body(Body::from_stream(stream))
         .map_err(|_| ControlError::Repository("artifact response failed".into()))

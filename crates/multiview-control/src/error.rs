@@ -58,6 +58,10 @@ pub enum ControlError {
     #[error("conflict: {0}")]
     Conflict(String),
 
+    /// An earlier capture admission survived a crash without a proven receipt.
+    #[error("capture outcome is uncertain")]
+    CaptureOutcomeUncertain,
+
     /// Authentication failed: no credential, or an unrecognized API key.
     #[error("authentication required")]
     Unauthenticated,
@@ -110,6 +114,8 @@ impl ControlError {
             Self::Conflict(msg) => {
                 Problem::new(409, "conflict", "Conflict with current state").with_detail(msg)
             }
+            Self::CaptureOutcomeUncertain => Problem::new(409, "capture-outcome-uncertain", "Capture outcome is uncertain")
+                .with_detail("This request will not run again with the same Idempotency-Key. Check the fill and latest good artifact; use a new key only for an explicit rerun."),
             Self::Unauthenticated => {
                 Problem::new(401, "unauthenticated", "Authentication required")
                     .with_detail("a valid Bearer API key is required")

@@ -193,9 +193,12 @@ impl Provider {
                 ))
             }
             Err(false) => {
+                if self.ledger.outcome_uncertain(&p.key_id, "submit", key) {
+                    return Err(ControlError::CaptureOutcomeUncertain);
+                }
                 return Err(ControlError::Conflict(
                     "Idempotency-Key request already in progress".into(),
-                ))
+                ));
             }
         }
         // Keep the durable pending receipt on any indeterminate outcome. The
