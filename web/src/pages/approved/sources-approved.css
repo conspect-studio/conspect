@@ -260,3 +260,10 @@
 [data-approved-page="sources"] .src-table tr[data-phase="failed"]:not(.src-detail-row) > td { border-bottom: 0; }
 [data-approved-page="sources"] .src-table tr.src-fail-row > td { padding: 0 12px 10px; background: rgba(232,163,61,.04); }
 [data-approved-page="sources"] .src-table tr.src-fail-row .src-fail { margin: 0; display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+
+/* Help pill: compact icon pill on phones, inline beside the subtitle (accessible name "Help" kept). */
+@media (max-width:767px){
+  [data-approved-page] .help-btn{flex:none;width:48px;min-width:48px;height:48px;padding:0;justify-content:center;font-size:0;gap:0;margin-left:auto}
+  [data-approved-page] .help-btn svg{width:18px;height:18px;margin:0}
+  [data-approved-page] .screen-sub,[data-approved-page] .src-sub{flex-wrap:nowrap;justify-content:space-between;width:100%}
+}

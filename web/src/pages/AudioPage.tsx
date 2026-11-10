@@ -1378,12 +1378,12 @@ export function AudioPage(): JSX.Element {
             }
             rail={
           <>
-          <div className="xl:hidden">
+          <div className="lg:hidden">
             <Button type="button" variant="outline" className="h-auto min-h-12 min-w-12 max-w-full whitespace-normal break-words" aria-expanded={overviewOpen} onClick={(): void => { setOverviewOpen(!overviewOpen); }}>
               <Trans>Whole mix overview</Trans>
             </Button>
           </div>
-          <div className={overviewOpen ? '' : 'hidden xl:block'}>
+          <div className={overviewOpen ? '' : 'hidden lg:block'}>
           <MixOverview
             form={form}
             savedRows={form.routes.map((_, index) => savedRowFor(index))}
@@ -1435,7 +1435,7 @@ export function AudioPage(): JSX.Element {
 
           <PendingTrackWarning impacts={pendingImpacts} />
 
-          <div data-testid="audio-toolbar" className="order-first sticky top-0 z-10 flex flex-wrap items-center gap-2 border-b bg-background/95 py-2 xl:justify-end">
+          <div data-testid="audio-toolbar" className="order-first sticky top-0 z-10 flex flex-wrap items-center gap-2 border-b bg-background/95 py-2 lg:justify-end">
             <Button
               type="button"
               variant="outline"

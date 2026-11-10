@@ -150,3 +150,10 @@
   [data-approved-page="media"] .vt-scrub-note { white-space: normal; }
   [data-approved-page="media"] .vt-scrub { min-height: 32px; }
 }
+
+/* Help pill: compact icon pill on phones, inline beside the subtitle (accessible name "Help" kept). */
+@media (max-width:767px){
+  [data-approved-page] .help-btn{flex:none;width:48px;min-width:48px;height:48px;padding:0;justify-content:center;font-size:0;gap:0;margin-left:auto}
+  [data-approved-page] .help-btn svg{width:18px;height:18px;margin:0}
+  [data-approved-page] .screen-sub,[data-approved-page] .src-sub{flex-wrap:nowrap;justify-content:space-between;width:100%}
+}

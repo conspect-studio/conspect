@@ -304,7 +304,7 @@ msgstr ""
 msgid "{upstreamDrops} packets dropped upstream (queue full)"
 msgstr ""
 
-#: src/pages/approved/RoutingSurface.tsx:272
+#: src/pages/approved/RoutingSurface.tsx:294
 msgid "← Back"
 msgstr ""
 
@@ -457,7 +457,7 @@ msgstr ""
 msgid "● ON AIR — PROGRAM"
 msgstr ""
 
-#: src/pages/approved/RoutingSurface.tsx:420
+#: src/pages/approved/RoutingSurface.tsx:443
 msgid "● on PGM"
 msgstr ""
 
@@ -477,7 +477,7 @@ msgstr ""
 msgid "● Red — PROGRAM"
 msgstr ""
 
-#: src/pages/approved/RoutingSurface.tsx:264
+#: src/pages/approved/RoutingSurface.tsx:286
 msgid "1 — pick a destination"
 msgstr ""
 
@@ -497,7 +497,7 @@ msgstr ""
 msgid "12-hour clock"
 msgstr ""
 
-#: src/pages/approved/RoutingSurface.tsx:269
+#: src/pages/approved/RoutingSurface.tsx:291
 msgid "2 — pick the source for"
 msgstr ""
 
@@ -1216,7 +1216,7 @@ msgstr ""
 msgid "All screens"
 msgstr ""
 
-#: src/pages/RoutingPage.tsx:585
+#: src/pages/RoutingPage.tsx:590
 msgid "Allow a confirmed down/up-mix to the pinned layout"
 msgstr ""
 
@@ -1402,7 +1402,7 @@ msgstr ""
 
 #. placeholder {0}: outcome.applied.class
 #. placeholder {1}: outcome.applied.operation_id
-#: src/pages/RoutingPage.tsx:319
+#: src/pages/RoutingPage.tsx:324
 msgid "Applied as {0}. Operation {1}."
 msgstr ""
 
@@ -1562,7 +1562,7 @@ msgstr ""
 msgid "Audio mixer"
 msgstr ""
 
-#: src/pages/approved/RoutingSurface.tsx:177
+#: src/pages/approved/RoutingSurface.tsx:193
 msgid "Audio program / tracks"
 msgstr ""
 
@@ -1988,7 +1988,7 @@ msgstr ""
 #: src/pages/OutputsPage.tsx:1512
 #: src/pages/OutputsPage.tsx:1561
 #: src/pages/RelayManagementPage.tsx:80
-#: src/pages/RoutingPage.tsx:654
+#: src/pages/RoutingPage.tsx:659
 #: src/pages/SalvosPage.tsx:281
 #: src/pages/SalvosPage.tsx:395
 #: src/pages/SalvosPage.tsx:433
@@ -2180,6 +2180,11 @@ msgstr ""
 #: src/pages/ProbesPage.tsx:132
 #: src/pages/ProbesPage.tsx:424
 msgid "Cell"
+msgstr ""
+
+#. placeholder {0}: index + 1
+#: src/pages/RoutingPage.tsx:241
+msgid "Cell {0}"
 msgstr ""
 
 #: src/layout/components/GridLayoutEditor.tsx:658
@@ -2680,7 +2685,7 @@ msgstr ""
 msgid "Confirm"
 msgstr ""
 
-#: src/pages/RoutingPage.tsx:636
+#: src/pages/RoutingPage.tsx:641
 msgid "Confirm a program-affecting take?"
 msgstr ""
 
@@ -2689,7 +2694,7 @@ msgid "Confirm program change"
 msgstr ""
 
 #: src/components/broadcast/ProductionDesk.tsx:151
-#: src/pages/RoutingPage.tsx:657
+#: src/pages/RoutingPage.tsx:662
 msgid "Confirm take"
 msgstr ""
 
@@ -3107,7 +3112,7 @@ msgstr ""
 msgid "Could not measure"
 msgstr ""
 
-#: src/pages/RoutingPage.tsx:287
+#: src/pages/RoutingPage.tsx:292
 msgid "Could not plan the take"
 msgstr ""
 
@@ -3186,7 +3191,7 @@ msgstr ""
 msgid "Could not stop the cast session"
 msgstr ""
 
-#: src/pages/RoutingPage.tsx:330
+#: src/pages/RoutingPage.tsx:335
 msgid "Could not take"
 msgstr ""
 
@@ -3328,27 +3333,27 @@ msgstr ""
 msgid "Critical"
 msgstr ""
 
-#: src/pages/approved/RoutingSurface.tsx:432
+#: src/pages/approved/RoutingSurface.tsx:455
 msgid "Crosspoint state for video cells and audio targets is Unknown: the routing API has no readback. A take applies only from the plan panel."
 msgstr ""
 
-#: src/pages/approved/RoutingSurface.tsx:308
+#: src/pages/approved/RoutingSurface.tsx:331
 msgid "Crosspoint state is Unknown for every destination: the routing API has no readback."
 msgstr ""
 
-#: src/pages/approved/RoutingSurface.tsx:212
+#: src/pages/approved/RoutingSurface.tsx:228
 msgid "Crosspoint state Unknown — no readback"
 msgstr ""
 
-#: src/pages/approved/RoutingSurface.tsx:228
+#: src/pages/approved/RoutingSurface.tsx:244
 msgid "Crosspoint states: ? Unknown (no readback) · ◇ SEL selected · ? PLAN dry-run plan. A take applies only from the plan panel."
 msgstr ""
 
-#: src/pages/approved/RoutingSurface.tsx:302
+#: src/pages/approved/RoutingSurface.tsx:325
 msgid "Crosspoint: Unknown"
 msgstr ""
 
-#: src/pages/approved/RoutingSurface.tsx:454
+#: src/pages/approved/RoutingSurface.tsx:477
 msgid "Crosspoints"
 msgstr ""
 
@@ -3710,7 +3715,7 @@ msgstr ""
 msgid "Destination"
 msgstr ""
 
-#: src/pages/RoutingPage.tsx:538
+#: src/pages/RoutingPage.tsx:543
 msgid "destination id"
 msgstr ""
 
@@ -3721,7 +3726,7 @@ msgstr ""
 msgid "Destination URL"
 msgstr ""
 
-#: src/pages/approved/RoutingSurface.tsx:233
+#: src/pages/approved/RoutingSurface.tsx:249
 msgid "Destinations are layout cells and audio tracks because those are the only targets the routing API accepts (video cell, audio track / program bus, subtitle layer); output sinks (PGM, HLS …) are not crosspoint targets and are configured in the outputs panel."
 msgstr ""
 
@@ -3882,7 +3887,7 @@ msgstr ""
 msgid "Discrete track name (route {row})"
 msgstr ""
 
-#: src/pages/RoutingPage.tsx:551
+#: src/pages/RoutingPage.tsx:556
 msgid "Discrete-track channel count (optional)"
 msgstr ""
 
@@ -4084,7 +4089,7 @@ msgstr ""
 msgid "DVB teletext page"
 msgstr ""
 
-#: src/pages/RoutingPage.tsx:520
+#: src/pages/RoutingPage.tsx:525
 msgid "e.g. 0"
 msgstr ""
 
@@ -4093,7 +4098,7 @@ msgid "e.g. black-cam-1"
 msgstr ""
 
 #: src/devices/InputStreamsInspector.tsx:62
-#: src/pages/RoutingPage.tsx:463
+#: src/pages/RoutingPage.tsx:468
 #: src/pages/SourcesPage.tsx:1185
 msgid "e.g. cam-north"
 msgstr ""
@@ -4110,7 +4115,7 @@ msgstr ""
 msgid "e.g. cell-1"
 msgstr ""
 
-#: src/pages/RoutingPage.tsx:538
+#: src/pages/RoutingPage.tsx:543
 msgid "e.g. cell-a"
 msgstr ""
 
@@ -4122,7 +4127,7 @@ msgstr ""
 msgid "e.g. dev-foyer"
 msgstr ""
 
-#: src/pages/RoutingPage.tsx:517
+#: src/pages/RoutingPage.tsx:522
 msgid "e.g. eng"
 msgstr ""
 
@@ -4163,7 +4168,7 @@ msgstr ""
 msgid "e.g. Sydney"
 msgstr ""
 
-#: src/pages/RoutingPage.tsx:519
+#: src/pages/RoutingPage.tsx:524
 msgid "e.g. v/pid:256"
 msgstr ""
 
@@ -5729,7 +5734,7 @@ msgstr ""
 msgid "Language (route {row})"
 msgstr ""
 
-#: src/pages/RoutingPage.tsx:505
+#: src/pages/RoutingPage.tsx:510
 msgid "Language tag"
 msgstr ""
 
@@ -5903,7 +5908,7 @@ msgstr ""
 msgid "leave blank to require a Write API key"
 msgstr ""
 
-#: src/pages/RoutingPage.tsx:558
+#: src/pages/RoutingPage.tsx:563
 msgid "leave blank to route onto a program-bus channel"
 msgstr ""
 
@@ -6255,7 +6260,7 @@ msgstr ""
 msgid "Loading source events…"
 msgstr ""
 
-#: src/pages/approved/RoutingSurface.tsx:387
+#: src/pages/approved/RoutingSurface.tsx:410
 #: src/pages/SourcesPage.tsx:1097
 msgid "Loading sources…"
 msgstr ""
@@ -6335,6 +6340,10 @@ msgstr ""
 #: src/pages/SourcesPage.tsx:1116
 #~ msgid "Locator"
 #~ msgstr ""
+
+#: src/components/broadcast/BroadcastShell.tsx:44
+msgid "Locked"
+msgstr ""
 
 #: src/pages/docs/concepts/GlossaryPage.tsx:76
 msgid "Locking every device's frame timing to one shared reference signal so all frames start at the same instant across a facility. Classically an analog black-burst or tri-level signal; in IP facilities PTP carries the same role. Genlock aligns <0>phase</0>; timecode merely labels frames."
@@ -6652,7 +6661,7 @@ msgstr ""
 msgid "Metadata for one library asset."
 msgstr ""
 
-#: src/pages/RoutingPage.tsx:323
+#: src/pages/RoutingPage.tsx:328
 msgid "Migration accepted"
 msgstr ""
 
@@ -7191,11 +7200,11 @@ msgstr ""
 msgid "No confirmed frame"
 msgstr ""
 
-#: src/pages/approved/RoutingSurface.tsx:141
+#: src/pages/approved/RoutingSurface.tsx:156
 msgid "No crosspoint grid: it needs both configured sources and known destinations (layout cells, audio discrete tracks). Use the typed selectors below."
 msgstr ""
 
-#: src/pages/approved/RoutingSurface.tsx:280
+#: src/pages/approved/RoutingSurface.tsx:302
 msgid "No destinations known (no layout cells or discrete audio tracks). Use the typed selectors."
 msgstr ""
 
@@ -7460,7 +7469,7 @@ msgstr ""
 msgid "No sources available"
 msgstr ""
 
-#: src/pages/approved/RoutingSurface.tsx:397
+#: src/pages/approved/RoutingSurface.tsx:420
 #: src/pages/SourcesPage.tsx:1096
 msgid "No sources configured."
 msgstr ""
@@ -7934,7 +7943,7 @@ msgstr ""
 #. placeholder {0}: accepted.operation_id
 #. placeholder {0}: outcome.accepted.operation_id
 #: src/pages/DeviceDetailPage.tsx:910
-#: src/pages/RoutingPage.tsx:324
+#: src/pages/RoutingPage.tsx:329
 msgid "Operation {0}; the outcome arrives on the realtime stream."
 msgstr ""
 
@@ -8217,15 +8226,15 @@ msgstr ""
 msgid "PGM bus — direct taps always confirm"
 msgstr ""
 
-#: src/pages/approved/RoutingSurface.tsx:424
+#: src/pages/approved/RoutingSurface.tsx:447
 msgid "PGM: not this source"
 msgstr ""
 
-#: src/pages/approved/RoutingSurface.tsx:416
+#: src/pages/approved/RoutingSurface.tsx:439
 msgid "PGM: unconfirmed"
 msgstr ""
 
-#: src/pages/approved/RoutingSurface.tsx:341
+#: src/pages/approved/RoutingSurface.tsx:364
 msgid "Pick a destination and a source (or type them below) to plan a take. Plan and Take stay disabled until both are set."
 msgstr ""
 
@@ -8241,7 +8250,7 @@ msgstr ""
 msgid "Pick a rectangle of squares with the arrow keys (hold Shift to extend) or by click-dragging, then type a name and assign it. Every named area must form a contiguous rectangle."
 msgstr ""
 
-#: src/pages/approved/RoutingSurface.tsx:383
+#: src/pages/approved/RoutingSurface.tsx:406
 msgid "Pick a source"
 msgstr ""
 
@@ -8282,11 +8291,11 @@ msgstr ""
 msgid "Plain UDP has no recovery at all: a lost packet is a glitch on screen. That is acceptable on a managed facility LAN and wrong for the internet (use SRT there, which wraps the same transport stream in a recovering envelope). Multicast group management is IPv6-first: receivers join groups via MLDv2, with IPv4/IGMP as the legacy path."
 msgstr ""
 
-#: src/pages/approved/RoutingSurface.tsx:337
+#: src/pages/approved/RoutingSurface.tsx:360
 msgid "Plan — nothing selected"
 msgstr ""
 
-#: src/pages/RoutingPage.tsx:623
+#: src/pages/RoutingPage.tsx:628
 msgid "Plan (dry run)"
 msgstr ""
 
@@ -8301,7 +8310,7 @@ msgstr ""
 
 #. placeholder {0}: form.inputId.trim()
 #. placeholder {1}: form.target.trim()
-#: src/pages/RoutingPage.tsx:406
+#: src/pages/RoutingPage.tsx:411
 msgid "Plan: {0} → {1}"
 msgstr ""
 
@@ -9608,6 +9617,10 @@ msgstr ""
 msgid "Scoped API token"
 msgstr ""
 
+#: src/pages/approved/RoutingSurface.tsx:259
+msgid "Scroll sideways for more destinations →"
+msgstr ""
+
 #: src/pages/MediaPlayersPage.tsx:360
 msgid "Scrub position: unknown"
 msgstr ""
@@ -9689,7 +9702,7 @@ msgstr ""
 
 #. placeholder {0}: src.name
 #. placeholder {1}: d.label
-#: src/pages/approved/RoutingSurface.tsx:211
+#: src/pages/approved/RoutingSurface.tsx:227
 msgid "Select {0} to {1}"
 msgstr ""
 
@@ -9791,7 +9804,7 @@ msgstr ""
 msgid "Serves the canvas at a <0>mount</0> with a <1>latency_profile</1> hint."
 msgstr ""
 
-#: src/pages/RoutingPage.tsx:565
+#: src/pages/RoutingPage.tsx:570
 msgid "Set a channel count to route onto a discrete track; leave it blank to route onto the named program-bus channel."
 msgstr ""
 
@@ -9965,7 +9978,7 @@ msgstr ""
 msgid "Source"
 msgstr ""
 
-#: src/pages/approved/RoutingSurface.tsx:164
+#: src/pages/approved/RoutingSurface.tsx:180
 msgid "Source ↓ / Dest →"
 msgstr ""
 
@@ -10001,11 +10014,11 @@ msgstr ""
 msgid "source id"
 msgstr ""
 
-#: src/pages/RoutingPage.tsx:457
+#: src/pages/RoutingPage.tsx:462
 msgid "Source input id"
 msgstr ""
 
-#: src/pages/approved/RoutingSurface.tsx:391
+#: src/pages/approved/RoutingSurface.tsx:414
 msgid "Source list unavailable — type the source input id below."
 msgstr ""
 
@@ -10326,11 +10339,11 @@ msgstr ""
 msgid "Stream"
 msgstr ""
 
-#: src/pages/RoutingPage.tsx:507
+#: src/pages/RoutingPage.tsx:512
 msgid "Stream id"
 msgstr ""
 
-#: src/pages/RoutingPage.tsx:503
+#: src/pages/RoutingPage.tsx:508
 msgid "Stream index"
 msgstr ""
 
@@ -10338,7 +10351,7 @@ msgstr ""
 msgid "Stream removed"
 msgstr ""
 
-#: src/pages/RoutingPage.tsx:474
+#: src/pages/RoutingPage.tsx:479
 msgid "Stream selector"
 msgstr ""
 
@@ -10379,7 +10392,7 @@ msgstr ""
 msgid "Subsystem:"
 msgstr ""
 
-#: src/pages/approved/RoutingSurface.tsx:179
+#: src/pages/approved/RoutingSurface.tsx:195
 msgid "Subtitle layers"
 msgstr ""
 
@@ -10518,7 +10531,7 @@ msgstr ""
 msgid "Tags"
 msgstr ""
 
-#: src/pages/RoutingPage.tsx:627
+#: src/pages/RoutingPage.tsx:632
 #: src/pages/SalvosPage.tsx:269
 msgid "Take"
 msgstr ""
@@ -10527,7 +10540,7 @@ msgstr ""
 msgid "TAKE"
 msgstr ""
 
-#: src/pages/RoutingPage.tsx:318
+#: src/pages/RoutingPage.tsx:323
 msgid "Take applied"
 msgstr ""
 
@@ -10535,7 +10548,7 @@ msgstr ""
 msgid "Take exit"
 msgstr ""
 
-#: src/pages/RoutingPage.tsx:426
+#: src/pages/RoutingPage.tsx:431
 msgid "Take kind"
 msgstr ""
 
@@ -10556,7 +10569,7 @@ msgstr ""
 msgid "Take vamp exit on {0}"
 msgstr ""
 
-#: src/pages/RoutingPage.tsx:639
+#: src/pages/RoutingPage.tsx:644
 msgid "Takes are locked and this one changes what is on program (the current PGM source or the audio program bus). Confirm to apply it."
 msgstr ""
 
@@ -10566,9 +10579,11 @@ msgid "Takes effect at the next frame boundary."
 msgstr ""
 
 #: src/components/broadcast/BroadcastShell.tsx:44
+#: src/components/broadcast/BroadcastShell.tsx:44
 msgid "Takes locked"
 msgstr ""
 
+#: src/components/broadcast/BroadcastShell.tsx:46
 #: src/components/broadcast/BroadcastShell.tsx:46
 msgid "Takes unlocked"
 msgstr ""
@@ -10648,7 +10663,7 @@ msgstr ""
 msgid "Target mode"
 msgstr ""
 
-#: src/pages/RoutingPage.tsx:344
+#: src/pages/RoutingPage.tsx:349
 msgid "Target program-bus channel or discrete track"
 msgstr ""
 
@@ -10660,7 +10675,7 @@ msgstr ""
 msgid "Target skew (ms)"
 msgstr ""
 
-#: src/pages/RoutingPage.tsx:346
+#: src/pages/RoutingPage.tsx:351
 msgid "Target subtitle layer"
 msgstr ""
 
@@ -10668,7 +10683,7 @@ msgstr ""
 msgid "Target time of day"
 msgstr ""
 
-#: src/pages/RoutingPage.tsx:342
+#: src/pages/RoutingPage.tsx:347
 msgid "Target video cell"
 msgstr ""
 
@@ -11453,7 +11468,7 @@ msgstr ""
 msgid "This stored sidecar is not decoded per source. Use the legacy command-line subtitle option instead."
 msgstr ""
 
-#: src/pages/RoutingPage.tsx:605
+#: src/pages/RoutingPage.tsx:610
 msgid "This take would be coerced to Class-1 with degradation (a pinned-layout mix)."
 msgstr ""
 
@@ -11869,6 +11884,10 @@ msgstr ""
 msgid "Unlock time-critical takes?"
 msgstr ""
 
+#: src/components/broadcast/BroadcastShell.tsx:46
+msgid "Unlocked"
+msgstr ""
+
 #: src/preview/WhepPlayer.tsx:353
 msgid "Unmute {label}"
 msgstr ""
@@ -12033,7 +12052,7 @@ msgstr ""
 msgid "Video"
 msgstr ""
 
-#: src/pages/approved/RoutingSurface.tsx:175
+#: src/pages/approved/RoutingSurface.tsx:191
 msgid "Video cells"
 msgstr ""
 

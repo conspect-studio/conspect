@@ -3,7 +3,7 @@
 // is "On PGM" only when the switcher's authoritative program_source says so;
 // every other crosspoint state is Unknown (the routing API has no readback).
 import { Diamond, Info } from 'lucide-react';
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import type { JSX, ReactNode } from "react";
 import { Trans, useLingui } from "@lingui/react/macro";
 
@@ -135,6 +135,21 @@ export function CrosspointGrid({
   readonly onPick: (source: string, dest: RouteDest) => void;
 }): JSX.Element {
   const { t } = useLingui();
+  const wrapRef = useRef<HTMLDivElement>(null);
+  const [more, setMore] = useState<"none" | "end" | "mid">("none");
+  useEffect(() => {
+    const el = wrapRef.current;
+    if (el === null) return undefined;
+    const measure = (): void => {
+      const over = el.scrollWidth > el.clientWidth + 1;
+      setMore(!over ? "none" : el.scrollLeft + el.clientWidth >= el.scrollWidth - 1 ? "mid" : "end");
+    };
+    measure();
+    el.addEventListener("scroll", measure, { passive: true });
+    const ro = typeof ResizeObserver === "undefined" ? undefined : new ResizeObserver(measure);
+    ro?.observe(el);
+    return (): void => { el.removeEventListener("scroll", measure); ro?.disconnect(); };
+  }, [dests.length, sources.length]);
   if (dests.length === 0 || sources.length === 0) {
     return (
       <p className="rp-note patch-wrap" data-testid="crosspoint-empty">
@@ -156,7 +171,8 @@ export function CrosspointGrid({
     }
   }
   return (
-    <div className="patch-wrap" data-testid="crosspoint-grid">
+    <div className="patch-shell" data-more={more}>
+    <div className="patch-wrap" data-testid="crosspoint-grid" ref={wrapRef}>
       <table className="patch-table">
         <thead>
           <tr className="grp-row" data-testid="crosspoint-groups">
@@ -186,7 +202,7 @@ export function CrosspointGrid({
               <th
                 key={`${d.kind}:${d.id}`}
                 scope="col"
-                title={`${d.label} (${d.kind})`}
+                title={d.label === d.id ? `${d.label} (${d.kind})` : `${d.label} · ${d.id} (${d.kind})`}
                 className="dest-h"
               >
                 {d.label}
@@ -237,6 +253,12 @@ export function CrosspointGrid({
           crosspoint targets and are configured in the outputs panel.
         </Trans>
       </p>
+    </div>
+    {more === "none" ? null : (
+      <p className="patch-more" data-testid="crosspoint-scroll-hint" role="note">
+        <Trans>Scroll sideways for more destinations →</Trans>
+      </p>
+    )}
     </div>
   );
 }
@@ -297,6 +319,7 @@ export function DestinationPicker({
                 }}
               >
                 <b>{d.label}</b>
+                {d.label !== d.id ? <span className="rp-id" data-testid={`route-dest-id-${d.id}`}>{d.id}</span> : null}
                 <span className="rp-cur">{d.kind}</span>
                 <span className="sr-only">
                   <Trans>Crosspoint: Unknown</Trans>

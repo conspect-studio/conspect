@@ -28,7 +28,7 @@ import { createApiClient } from "../api/client";
 import { useLayouts } from "../api/queries";
 import { useTakeLock } from "../components/broadcast/BroadcastShell";
 import { useAudioRouting } from "../resources/audioRouting";
-import { cellIdsFromLayouts } from "../resources/forms";
+import { cellIdsFromLayouts, cellNamesFromLayouts } from "../resources/forms";
 import { Badge } from "../components/ui/badge";
 import type { BadgeProps } from "../components/ui/badge";
 import { Button } from "../components/ui/button";
@@ -233,14 +233,19 @@ export function RoutingPage(): JSX.Element {
   const layouts = useLayouts(client);
   const audio = useAudioRouting();
   const dests = useMemo<readonly RouteDest[]>(() => {
+    const names = cellNamesFromLayouts(layouts.data ?? []);
     const cells = cellIdsFromLayouts(layouts.data ?? []).map(
-      (id): RouteDest => ({ kind: "video", id, label: id }),
+      (id, index): RouteDest => ({
+        kind: "video",
+        id,
+        label: names.get(id) ?? t`Cell ${index + 1}`,
+      }),
     );
     const tracks = (audio.data?.state.selectable_tracks ?? [])
       .filter((track) => track !== "prog")
       .map((id): RouteDest => ({ kind: "audio", id, label: id }));
     return [...cells, ...tracks];
-  }, [layouts.data, audio.data]);
+  }, [layouts.data, audio.data, t]);
   const [phoneStep, setPhoneStep] = useState<1 | 2>(1);
   const [confirmTake, setConfirmTake] = useState(false);
   const { locked } = useTakeLock();

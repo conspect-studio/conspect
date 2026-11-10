@@ -2519,3 +2519,22 @@ export function cellIdsFromLayouts(
   }
   return out;
 }
+
+/** Operator-given cell names (`label`/`name`) by cell id; absent when the cell is unnamed or the name is just the id. */
+export function cellNamesFromLayouts(
+  layouts: readonly { readonly body: unknown }[],
+): ReadonlyMap<string, string> {
+  const out = new Map<string, string>();
+  for (const layout of layouts) {
+    const body = asRecord(layout.body);
+    if (body?.canvas === undefined) continue;
+    const cells = Array.isArray(body.cells) ? body.cells : [];
+    for (const cell of cells) {
+      const rec = asRecord(cell);
+      const id = asString(rec?.id);
+      const name = asString(rec?.label) ?? asString(rec?.name);
+      if (id !== undefined && name !== undefined && name !== '' && name !== id && !out.has(id)) out.set(id, name);
+    }
+  }
+  return out;
+}

@@ -37,7 +37,7 @@
 [data-approved-page="audio"] .mixer { display: grid; gap: 14px; grid-template-columns: minmax(0, 1fr); }
 [data-approved-page="audio"] .mixer-main { display: grid; grid-template-columns: minmax(0, 1fr); gap: 10px; min-width: 0; }
 [data-approved-page="audio"] .master-col { display: grid; gap: 12px; align-content: start; min-width: 0; }
-@media (min-width: 1280px) {
+@media (min-width: 1024px) {
   [data-approved-page="audio"] .mixer { grid-template-columns: minmax(0, 1fr) 240px; align-items: start; }
 }
 
@@ -267,7 +267,7 @@
 [data-approved-page="audio"] .mixer-main > * { min-width: 0; max-width: 100%; }
 [data-approved-page="audio"] .master-col > * { min-width: 0; max-width: 100%; }
 [data-approved-page="audio"] .strip-bank { overscroll-behavior-x: contain; }
-@media (min-width: 1280px) {
+@media (min-width: 1024px) {
   [data-approved-page="audio"] .mixer { grid-template-columns: minmax(0, 1fr) 240px; }
   [data-approved-page="audio"] .master-col { width: 240px; max-width: 240px; overflow: hidden; }
 }
@@ -277,7 +277,7 @@
 
 /* Round 5: 1440 bank fit — nudges are a 48px side stack BESIDE the fader (reference);
    ticks/track/meter are tightened so all 8 strips + the rail fit without clipping. */
-@media (min-width: 1280px) {
+@media (min-width: 1024px) {
   [data-approved-page="audio"] .mixer { grid-template-columns: minmax(0, 1fr) 200px; gap: 10px; }
   [data-approved-page="audio"] .master-col { width: 200px; max-width: 200px; overflow: visible; }
   [data-approved-page="audio"] .strip-bank { grid-auto-columns: minmax(0, 1fr); gap: 6px; }
@@ -307,13 +307,13 @@
 [data-approved-page="audio"] .strip-master > section [data-testid="loudness-integrated"] .text-2xl { font-size: 20px; }
 
 /* Fix9 — bank below xl: wrap into rows (no strip is ever cut mid-way). */
-@media (max-width: 1279px) {
+@media (max-width: 1023px) {
   [data-approved-page="audio"] .strip-bank {
     grid-auto-flow: row; grid-template-columns: repeat(auto-fill, minmax(176px, 1fr)); grid-auto-columns: auto; overflow-x: visible;
   }
 }
 /* Fix9 — xl+: a bank with more strips than fit scrolls with snap + a visible bar. */
-@media (min-width: 1280px) {
+@media (min-width: 1024px) {
   [data-approved-page="audio"] .strip-bank {
     scroll-snap-type: x mandatory; scrollbar-width: auto; scrollbar-color: var(--blue) var(--bg-3);
     grid-auto-columns: minmax(124px, 1fr);
@@ -323,7 +323,7 @@
   [data-approved-page="audio"] .mixer { grid-template-columns: minmax(0, 1fr) 232px; grid-template-rows: auto; column-gap: 12px; align-items: start; }
   [data-approved-page="audio"] .mixer-main { grid-column: 1; grid-row: 1; }
   [data-approved-page="audio"] .master-col { display: grid; width: 232px; max-width: 232px; grid-column: 2; grid-row: 1; gap: 10px; overflow: visible; }
-  [data-approved-page="audio"] .master-col > .hidden.xl\:block { display: block; }
+  [data-approved-page="audio"] .master-col > .hidden.lg\:block { display: block; }
   [data-approved-page="audio"] .strip-master > section .grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
 }
 /* Compact PROGRAM row in the whole-mix list. */
@@ -332,7 +332,7 @@
 [data-approved-page="audio"] [data-testid="audio-overview-program"] { min-height: 0; padding: 6px 10px; }
 [data-approved-page="audio"] .audio-nudge-btn:disabled { opacity: 1; background: var(--bg-1); color: var(--text-3); border-style: dashed; }
 [data-approved-page="audio"] [data-testid="audio-save"]:disabled { opacity: 1; background: var(--bg-2); color: var(--text-3); border: 1px dashed var(--line-2); }
-@media (min-width: 1280px) {
+@media (min-width: 1024px) {
   [data-approved-page="audio"] .strip-bank { grid-auto-columns: minmax(124px, 1fr); }
 }
 
@@ -369,7 +369,7 @@
 [data-approved-page="audio"] .master-keys { display: flex; justify-content: center; gap: 6px; }
 [data-approved-page="audio"] .strip-master > .master-keys button:disabled { opacity: 1; background: var(--bg-1); color: var(--text-3); border-style: dashed; font-weight: 900; }
 
-@media (min-width: 1280px) {
+@media (min-width: 1024px) {
   [data-approved-page="audio"] .audio-fader-box { height: 208px; }
   [data-approved-page="audio"] .strip-bank { grid-auto-columns: minmax(118px, 1fr); }
   [data-approved-page="audio"] .strip-bank [data-testid="audio-strip"] { gap: 6px; padding: 8px 2px; }
@@ -378,7 +378,7 @@
   [data-approved-page="audio"] .strip-master > section { padding: 6px; }
   [data-approved-page="audio"] .strip-master > section .text-2xl { font-size: 16px; }
 }
-@media (min-width: 768px) and (max-width: 1279px) {
+@media (min-width: 768px) and (max-width: 1023px) {
   [data-approved-page="audio"] .audio-fader-box { height: 208px; }
 }
 /* Approved key rows: MUTE + PGM side by side (48px), LISTEN placeholder on its own row below. */
@@ -406,7 +406,7 @@
 [data-approved-page="audio"] .audio-strip > .audio-details-compact[open] { margin: 0; padding: 0; }
 [data-approved-page="audio"] .audio-strip > .audio-details-compact[open] > div { margin-top: 0; padding-top: 4px; }
 [data-approved-page="audio"] .audio-strip-meta { gap: 2px; }
-@media (min-width: 1280px) {
+@media (min-width: 1024px) {
   [data-approved-page="audio"] .audio-fader-box { height: 186px; }
   [data-approved-page="audio"] .strip-bank .meter-col { height: 186px; padding: 24px 0; }
   [data-approved-page="audio"] .strip-bank [data-testid="audio-strip"] { gap: 4px; padding: 4px 3px; }
@@ -444,7 +444,7 @@
 }
 
 /* Fix14: compact right rail at desktop so Whole mix + PROGRAM + meters + loudness fit the first fold. */
-@media (min-width: 1280px) {
+@media (min-width: 1024px) {
   [data-approved-page="audio"] [data-testid="audio-mix-overview"] ul { gap: 2px; margin-top: 6px; }
   [data-approved-page="audio"] .mo-row { min-height: 32px; padding: 2px 8px; gap: 0 8px; flex-wrap: nowrap; }
   [data-approved-page="audio"] .mo-row .mo-name { width: 56px; }
@@ -459,7 +459,7 @@
   [data-approved-page="audio"] .strip-master > section .text-2xl { font-size: 16px; line-height: 1.2; }
   [data-approved-page="audio"] .strip-master > section p, [data-approved-page="audio"] .strip-master > section h3 { margin: 0; }
 }
-@media (min-width: 1280px) {
+@media (min-width: 1024px) {
   [data-approved-page="audio"] .master-col .strip-master > section { padding: 6px; border-radius: 6px; }
   [data-approved-page="audio"] .master-col .strip-master > section > header { display: block; }
   [data-approved-page="audio"] .master-col .strip-master > section > header + p, [data-approved-page="audio"] .master-col .strip-master > section [data-testid="loudness-integrated"] + * { margin-top: 4px; }
@@ -471,8 +471,50 @@
   [data-approved-page="audio"] .master-col .strip-master .mt-3, [data-approved-page="audio"] .master-col .strip-master .mt-2 { margin-top: 4px; }
   [data-approved-page="audio"] .master-col .strip-master > .strip-status { font-size: 10px; line-height: 1.25; }
 }
-@media (min-width: 1280px) {
+@media (min-width: 1024px) {
   [data-approved-page="audio"] .master-col .master-fader-row .audio-nudge-col { grid-template-columns: repeat(2, 48px); width: 100px; gap: 4px; }
   [data-approved-page="audio"] .master-col .master-fader-row .audio-fader-box { height: 104px; }
   [data-approved-page="audio"] .master-col .strip-master > .master-keys { margin: 0; }
+}
+
+/* ---- Final: rail no longer leaves an empty column. >=1280: Whole mix beside the bank (right),
+   PROGRAM strip + meters + loudness as one horizontal row UNDER the bank. <1280: compact 2-column block. ---- */
+[data-approved-page="audio"] .strip-master{align-items:stretch}
+@media (min-width:1024px){
+  [data-approved-page="audio"] .mixer{grid-template-columns:minmax(0,1fr) 232px;grid-template-rows:auto auto auto;align-items:start}
+  [data-approved-page="audio"] .master-col{display:contents}
+  [data-approved-page="audio"] .master-col>.hidden.lg\:block{grid-column:2;grid-row:1;display:block;min-width:0}
+  [data-approved-page="audio"] .master-col>.lg\:hidden{display:none}
+  [data-approved-page="audio"] .master-col>.strip-master{grid-column:1/-1;grid-row:2;width:auto;max-width:none}
+  [data-approved-page="audio"] .master-col>.mix-note{grid-column:1/-1;grid-row:3}
+  [data-approved-page="audio"] .mixer-main{grid-row:1}
+}
+@media (min-width:768px){
+  [data-approved-page="audio"] .master-col .strip-master{display:grid;grid-template-columns:minmax(200px,auto) minmax(0,1fr) minmax(0,1fr);grid-auto-flow:row;column-gap:14px;row-gap:4px;align-items:start;justify-items:center}
+  [data-approved-page="audio"] .master-col .strip-master>.strip-name{grid-column:1;grid-row:1}
+  [data-approved-page="audio"] .master-col .strip-master>.master-fader-row{grid-column:1;grid-row:2}
+  [data-approved-page="audio"] .master-col .strip-master>.master-keys{grid-column:1;grid-row:3}
+  [data-approved-page="audio"] .master-col .strip-master>.strip-status{grid-column:1;grid-row:4;max-width:220px}
+  [data-approved-page="audio"] .master-col .strip-master>section{grid-row:1/5;align-self:stretch;justify-self:stretch}
+  [data-approved-page="audio"] .master-col .strip-master>section:nth-of-type(1){grid-column:2}
+  [data-approved-page="audio"] .master-col .strip-master>section:nth-of-type(2){grid-column:3}
+  [data-approved-page="audio"] .master-col .master-fader-row .audio-fader-box{height:120px}
+}
+@media (min-width:768px) and (max-width:1023px){
+  [data-approved-page="audio"] .master-col{grid-template-columns:minmax(0,1fr);gap:8px}
+}
+/* 1024–1279: bank takes the full row; Whole mix, then PROGRAM/meters/loudness, sit under it. */
+@media (min-width:1024px) and (max-width:1279px){
+  [data-approved-page="audio"] .mixer{grid-template-columns:minmax(0,1fr)}
+  [data-approved-page="audio"] .mixer-main{grid-column:1;grid-row:1}
+  [data-approved-page="audio"] .master-col>.hidden.lg\:block{grid-column:1;grid-row:2}
+  [data-approved-page="audio"] .master-col>.strip-master{grid-row:3}
+  [data-approved-page="audio"] .master-col>.mix-note{grid-row:4}
+  [data-approved-page="audio"] .strip-bank [data-testid="audio-strip"]{min-width:0}
+  [data-approved-page="audio"] [data-testid="audio-mix-overview"] ul{grid-template-columns:repeat(3,minmax(0,1fr));gap:4px}
+  [data-approved-page="audio"] .mo-row{flex-wrap:nowrap;min-height:44px}
+  [data-approved-page="audio"] .mo-row .mo-name{width:56px}
+  [data-approved-page="audio"] .mo-row .mo-sub{position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0 0 0 0);white-space:nowrap;flex:none}
+  [data-approved-page="audio"] .mo-row{position:relative}
+  [data-approved-page="audio"] [data-testid="audio-mix-overview"]>p{display:none}
 }
