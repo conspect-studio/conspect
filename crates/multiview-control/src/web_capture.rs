@@ -139,7 +139,7 @@ impl Provider {
     /// # Errors
     /// Rejects unauthorized objects, stale terms, unsupported Premium, divergent
     /// idempotent replays, or full service.
-    pub fn submit(&self, p: &Principal, key: &str, body: CaptureBody) -> ControlResult<Admission> {
+    pub fn submit(&self, p: &Principal, key: &str, body: &CaptureBody) -> ControlResult<Admission> {
         p.role.require(Action::Write)?;
         authorize_object(p, &body.fill_id)?;
         if let Some(player) = &body.target_player {
@@ -202,17 +202,13 @@ impl Provider {
         // service may already have accepted a job even if the final receipt
         // fsync failed. A retry must not allocate a second browser job. Only a
         // definite pre-acceptance failure durably abandons the reservation.
-        match self.admit(p, key, service, terms.as_ref(), &body, capture) {
+        match self.admit(p, key, service, terms.as_ref(), body, capture) {
             Ok(admission) => Ok(admission),
             Err(AdmitError::Uncertain(e)) => Err(e),
             Err(AdmitError::Definite(e)) => {
-                self.ledger
-                    .abandon(&p.key_id, "submit", key)
-                    .map_err(|_| {
-                        ControlError::Repository(
-                            "idempotency reservation could not be released".into(),
-                        )
-                    })?;
+                self.ledger.abandon(&p.key_id, "submit", key).map_err(|_| {
+                    ControlError::Repository("idempotency reservation could not be released".into())
+                })?;
                 Err(e)
             }
         }

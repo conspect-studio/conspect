@@ -75,7 +75,7 @@ pub(crate) async fn create(
     let terms_version = body.terms.version.clone();
     let provider = state.web_capture.clone();
     let actor = principal.clone();
-    let admission = tokio::task::spawn_blocking(move || provider.submit(&actor, &key, body))
+    let admission = tokio::task::spawn_blocking(move || provider.submit(&actor, &key, &body))
         .await
         .map_err(|_| ControlError::Repository("capture admission worker failed".into()))??;
     let id = admission.job_id;

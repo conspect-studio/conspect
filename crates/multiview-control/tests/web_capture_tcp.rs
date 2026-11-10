@@ -43,6 +43,7 @@ async fn request_keyed(
 fn json(response: &str) -> serde_json::Value {
     serde_json::from_str(response.split_once("\r\n\r\n").unwrap().1).unwrap()
 }
+#[allow(clippy::too_many_lines)] // One server lifetime covers the complete authorized transaction.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn actual_tcp_post_runs_service_and_returns_owner_scoped_artifact() {
     let root = tempfile::tempdir().unwrap();

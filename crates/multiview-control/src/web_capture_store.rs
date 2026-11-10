@@ -85,7 +85,8 @@ impl TermsRepository for DurableTerms {
             .file
             .lock()
             .map_err(|_| io::Error::other("terms store poisoned"))?;
-        let next = f.1.saturating_add(line.len() as u64);
+        let next =
+            f.1.saturating_add(u64::try_from(line.len()).unwrap_or(u64::MAX));
         if next > TERMS_MAX_BYTES {
             return Err(storage_full("terms log"));
         }
@@ -126,7 +127,7 @@ fn sync_parent(path: &Path) -> io::Result<()> {
 }
 
 /// Create a fresh private temp file; an existing entry is removed first (a
-/// symlink is unlinked, never followed) and `create_new` (O_EXCL) fails closed.
+/// symlink is unlinked, never followed) and `create_new` (`O_EXCL`) fails closed.
 fn create_tmp(tmp: &Path) -> io::Result<File> {
     match std::fs::remove_file(tmp) {
         Ok(()) => {}
@@ -236,17 +237,23 @@ impl Log {
     fn append(&mut self, state: &State, rec: &Rec) -> io::Result<()> {
         let mut line = serde_json::to_vec(rec).map_err(io::Error::other)?;
         line.push(b'\n');
-        if self.len.saturating_add(line.len() as u64) > LEDGER_MAX_BYTES {
+        if self
+            .len
+            .saturating_add(u64::try_from(line.len()).unwrap_or(u64::MAX))
+            > LEDGER_MAX_BYTES
+        {
             let snap = state.snapshot()?;
-            if (snap.len() + line.len()) as u64 > LEDGER_MAX_BYTES {
+            if u64::try_from(snap.len().saturating_add(line.len())).unwrap_or(u64::MAX)
+                > LEDGER_MAX_BYTES
+            {
                 return Err(storage_full("idempotency journal"));
             }
             self.file = write_snapshot(&self.path, &snap)?;
-            self.len = snap.len() as u64;
+            self.len = u64::try_from(snap.len()).unwrap_or(u64::MAX);
         }
         self.file.write_all(&line)?;
         self.file.sync_all()?;
-        self.len += line.len() as u64;
+        self.len += u64::try_from(line.len()).unwrap_or(u64::MAX);
         Ok(())
     }
 }
@@ -295,7 +302,7 @@ impl Ledger {
             f.take(LEDGER_MAX_BYTES + 1)
                 .read_to_string(&mut text)
                 .map_err(|_| io::Error::other("capture idempotency journal is corrupt"))?;
-            if text.len() as u64 > LEDGER_MAX_BYTES {
+            if u64::try_from(text.len()).unwrap_or(u64::MAX) > LEDGER_MAX_BYTES {
                 return Err(io::Error::other("capture idempotency journal is too large"));
             }
             for line in text.lines() {
