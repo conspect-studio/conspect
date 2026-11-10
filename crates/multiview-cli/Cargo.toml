@@ -674,6 +674,13 @@ apple = [
     # would silently render no native captions/overlays.
     "overlay",
     "multiview-hal/videotoolbox",
+    # GPU compositing on Apple Silicon/Intel Macs runs through wgpu's Metal
+    # backend (the cli's `gpu` feature selects it at run time; without it the
+    # preset silently composited on the CPU). The compositor uploads NV12 as R8 +
+    # RG8 planes, so wgpu-on-Metal needs no native NV12 texture; GPU parity is
+    # verified on Metal hardware. `multiview-compositor/metal` below stays the
+    # reserved name for a future native Metal/IOSurface fast path (still empty).
+    "gpu",
     "multiview-compositor/metal",
     "multiview-ffmpeg/ffmpeg",
     "multiview-input/ffmpeg",
