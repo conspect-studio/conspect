@@ -429,3 +429,59 @@ fn background_publish_failure_surfaces_and_prunes_nothing() {
         "finalize reports the failed final publish"
     );
 }
+
+/// #220 review: after a failed background publish recovers, the first successful
+/// manifest must still list every URI the failed manifest listed (the failed one
+/// is retried, the close that surfaced the error is not committed).
+#[test]
+fn background_publish_recovers_without_skipping_the_failed_manifest() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let manifest = dir.path().join("index.m3u8");
+    let mut live = LivePlaylist::new(manifest.clone(), 2);
+    let calls = Arc::new(AtomicUsize::new(0));
+    let written: Arc<Mutex<Vec<String>>> = Arc::default();
+    let (c, w) = (Arc::clone(&calls), Arc::clone(&written));
+    let writer: multiview_output::hls::ManifestWriter = Arc::new(move |path, bytes| {
+        // The second publish fails once; every other publish succeeds.
+        if c.fetch_add(1, Ordering::SeqCst) == 1 {
+            return Err(multiview_output::Error::Output("injected".to_owned()));
+        }
+        w.lock()
+            .unwrap()
+            .push(String::from_utf8_lossy(bytes).into_owned());
+        std::fs::write(path, bytes).map_err(|e| multiview_output::Error::Output(e.to_string()))
+    });
+    live.enable_background_publish_with(writer)
+        .expect("publisher");
+
+    let mut failed_manifest_uris: Option<Vec<String>> = None;
+    for i in 0..8 {
+        let name = format!("seg{i}.ts");
+        let path = touch_segment(dir.path(), &name);
+        // Let the publisher drain so the injected failure is observed in order.
+        std::thread::sleep(std::time::Duration::from_millis(30));
+        if live
+            .push_closed_segment(name, path, 2.0, i64::from(i) * 2_000_000_000)
+            .is_err()
+        {
+            // The manifest that failed was the one committed before this close.
+            failed_manifest_uris =
+                Some((0..i).rev().take(2).map(|n| format!("seg{n}.ts")).collect());
+        }
+    }
+    live.finalize().expect("final publish");
+    let failed = failed_manifest_uris.expect("the injected failure must surface");
+    let published = written.lock().unwrap().clone();
+    let first_after_failure = published
+        .get(1)
+        .expect("a successful publish follows the failure");
+    for uri in &failed {
+        assert!(
+            first_after_failure.contains(uri.as_str()),
+            "first publish after recovery must still list {uri}: {first_after_failure}"
+        );
+    }
+}

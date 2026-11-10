@@ -223,7 +223,13 @@ impl LivePlaylist {
             // Off the packet path: surface an earlier publish failure, then hand
             // the newest manifest + the segments it retired to the publisher.
             if let Some(background) = self.background.as_ref() {
-                background.take_error()?;
+                if let Err(e) = background.take_error() {
+                    // Retry the manifest that failed (the committed one) so the
+                    // next successful publish still lists every URI it listed;
+                    // this close is not committed, as in the synchronous mode.
+                    background.submit(self.playlist.render(), Vec::new(), false);
+                    return Err(e);
+                }
             }
             let text = next_playlist.render();
             self.commit(next_playlist, next_generation, path);
@@ -519,14 +525,7 @@ impl BackgroundPublisher {
         let mut slot = lock(&self.shared.slot);
         slot.pending.text = Some(text);
         slot.pending.retired.extend(retired);
-        let overflow = slot
-            .pending
-            .retired
-            .len()
-            .saturating_sub(MAX_CARRIED_RETIRED);
-        if overflow > 0 {
-            slot.pending.retired.drain(..overflow);
-        }
+        cap_retired(&mut slot.pending.retired);
         slot.pending.last |= last;
         drop(slot);
         self.shared.wake.notify_one();
@@ -560,6 +559,15 @@ impl Drop for BackgroundPublisher {
     }
 }
 
+/// Keep at most [`MAX_CARRIED_RETIRED`] paths, dropping the oldest from the list
+/// (those files stay on disk; they are never unlinked by this).
+fn cap_retired(paths: &mut Vec<PathBuf>) {
+    let overflow = paths.len().saturating_sub(MAX_CARRIED_RETIRED);
+    if overflow > 0 {
+        paths.drain(..overflow);
+    }
+}
+
 /// Lock the slot, recovering from poisoning (the data is plain values; a panic
 /// elsewhere must not wedge publication).
 fn lock(m: &Mutex<Slot>) -> std::sync::MutexGuard<'_, Slot> {
@@ -589,6 +597,7 @@ fn publish_one(shared: &Shared, playlist_path: &Path, writer: &ManifestWriter, j
             // first) so nothing listed by the last good manifest is unlinked.
             let mut carried = job.retired;
             carried.append(&mut slot.pending.retired);
+            cap_retired(&mut carried);
             slot.pending.retired = carried;
             slot.error = Some(e.to_string());
         }
@@ -614,5 +623,50 @@ fn publisher_main(shared: &Shared, playlist_path: &Path, writer: &ManifestWriter
         if exit || last {
             return;
         }
+    }
+}
+
+/// A background publisher for a single static file (the rendition master
+/// playlist, #220): the write + fsync + rename run on an `hls-publish` thread so
+/// the packet path never waits on disk.
+#[derive(Debug)]
+pub struct BackgroundFile {
+    inner: BackgroundPublisher,
+}
+
+impl BackgroundFile {
+    /// Spawn the publisher for `path`.
+    ///
+    /// # Errors
+    /// Returns [`Error::Output`] if the thread cannot be spawned.
+    pub fn spawn(path: PathBuf) -> Result<Self> {
+        Ok(Self {
+            inner: BackgroundPublisher::spawn(
+                path,
+                Arc::new(|path: &Path, bytes: &[u8]| atomic_write(path, bytes)),
+            )?,
+        })
+    }
+
+    /// Queue `text` for publication (latest wins). Never blocks on I/O.
+    pub fn publish(&self, text: String) {
+        self.inner.submit(text, Vec::new(), false);
+    }
+
+    /// Report a failed background write, if any.
+    ///
+    /// # Errors
+    /// Returns the [`Error::Output`] of the failed write.
+    pub fn take_error(&self) -> Result<()> {
+        self.inner.take_error()
+    }
+
+    /// Publish `text` as the final content and wait for it to land.
+    ///
+    /// # Errors
+    /// Returns the [`Error::Output`] of a failed write.
+    pub fn finish(self, text: String) -> Result<()> {
+        self.inner.submit(text, Vec::new(), true);
+        self.inner.join()
     }
 }

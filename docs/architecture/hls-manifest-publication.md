@@ -41,8 +41,14 @@ successful publish, never unlink a segment any on-disk manifest still lists), bu
 5. `finalize` enqueues the `#EXT-X-ENDLIST` manifest and joins the publisher, returning
    any publish error. This blocks exactly as the synchronous finalize did (it runs at end of
    run, never per packet).
-6. The rendition master playlist is static for a run: it is now written once, when all its
-   media playlists first exist, instead of being re-`fsync`ed on every segment close.
+6. The rendition master playlist is static for a run: it is queued once, to its own
+   background writer, when all its media playlists first exist (never re-`fsync`ed per close
+   and never written inline). Pruning of the previous run's files still waits until the
+   on-disk master equals the new text; `finish` publishes the master if a short run closed
+   before its media writes landed, then reaps the prior generations.
+7. A surfaced publish error re-queues the committed (failed) manifest and does not commit
+   the close that observed it, so the next successful publish still lists every URI the
+   failed manifest listed. The carried retired list is re-capped after every merge.
 
 The synchronous mode (the default) is unchanged and keeps its existing tests: publish
 failure returns `Err` from the same call and leaves committed state untouched.

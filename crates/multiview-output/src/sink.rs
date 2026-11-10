@@ -50,7 +50,7 @@ use multiview_ffmpeg::{
 use crate::epoch::SharedEpoch;
 use crate::error::{Error, Result};
 use crate::hls::{
-    atomic_write, media_segment_references, media_segment_uris, AudioRendition, LivePlaylist,
+    media_segment_references, media_segment_uris, AudioRendition, BackgroundFile, LivePlaylist,
     MasterPlaylist, MediaPlaylist, Segment, SegmentType, VariantStream,
 };
 use crate::metadata::{DisplayMatrix, MetadataScope, MuxMetadata};
@@ -1878,9 +1878,11 @@ struct AudioRenditions<'a> {
     video: AudioRenditionState<'a>,
     master: PathBuf,
     master_text: Option<String>,
-    /// The master is static for a run: written once (#220), not re-fsynced on
-    /// every segment close.
+    /// The master is static for a run: queued once (#220) to an off-packet-path
+    /// publisher, never written + fsynced inline on a segment close.
     master_published: bool,
+    /// The off-packet-path writer for the master (spawned on first publish).
+    master_writer: Option<BackgroundFile>,
     retention_window: usize,
 }
 
@@ -2074,6 +2076,7 @@ impl<'a> SegmentState<'a> {
             master: parent.join("master.m3u8"),
             master_text: bandwidth.map(|_| master.render()),
             master_published: false,
+            master_writer: None,
             retention_window: window,
         });
         Ok(())
@@ -2473,7 +2476,13 @@ impl<'a> SegmentState<'a> {
                         .all(|state| state.live.playlist_path().exists())
                     && renditions.video.live.playlist_path().exists()
                 {
-                    atomic_write(&renditions.master, master_text.as_bytes())?;
+                    // Ordering is preserved: every media playlist exists before
+                    // the master is queued. Pruning of the previous run's files
+                    // still waits until the on-disk master equals this text
+                    // (`current_renditions_ready`).
+                    let writer = BackgroundFile::spawn(renditions.master.clone())?;
+                    writer.publish(master_text.clone());
+                    renditions.master_writer = Some(writer);
                     renditions.master_published = true;
                 }
             } else if renditions.video.live.playlist_path().exists() {
@@ -2543,6 +2552,46 @@ impl<'a> SegmentState<'a> {
                 .chain(std::iter::once(&mut renditions.video))
             {
                 state.live.finalize()?;
+            }
+            // Every media playlist is durable now (finalize joined each
+            // publisher). Publish the master if a close has not queued it yet
+            // (short runs close before the background media writes land).
+            if let Some(text) = renditions.master_text.clone() {
+                let writer = match renditions.master_writer.take() {
+                    Some(writer) => Some(writer),
+                    None if renditions
+                        .states
+                        .iter()
+                        .all(|state| state.live.playlist_path().exists())
+                        && renditions.video.live.playlist_path().exists() =>
+                    {
+                        Some(BackgroundFile::spawn(renditions.master.clone())?)
+                    }
+                    None => None,
+                };
+                if let Some(writer) = writer {
+                    writer.finish(text)?;
+                    renditions.master_published = true;
+                }
+            }
+        }
+        // The master is published off the packet path (#220), so a close may
+        // have run before it landed. Now that it is durable, reap the previous
+        // generations exactly as a later close would have.
+        if let Some(renditions) = self.renditions.as_ref() {
+            if current_renditions_ready(renditions) {
+                prune_prior_rendition_manifests(
+                    self.dir,
+                    renditions,
+                    self.seg_index
+                        .saturating_sub(segment_grace(renditions.retention_window)),
+                );
+                prune_prior_live_segments(
+                    self.dir,
+                    self.prefix,
+                    self.seg_index,
+                    renditions.retention_window,
+                );
             }
         }
         Ok(())

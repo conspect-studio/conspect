@@ -332,6 +332,7 @@ fn segment_packet_sink_splits_on_keyframes_and_writes_a_playlist() {
 }
 
 #[test]
+#[allow(clippy::too_many_lines)] // one end-to-end scenario with its assertions inline
 fn segment_live_publishes_rolling_playlist_bounded_window_and_prunes() {
     // HLS-0/1 (ADR-0032): the LIVE segment sink writes the `.m3u8` on disk on
     // every closed segment (not once-at-finalize), bounds the segment window, and
@@ -417,12 +418,20 @@ fn segment_live_publishes_rolling_playlist_bounded_window_and_prunes() {
                     .is_some_and(|n| n.starts_with("seg"))
         })
         .collect();
-    assert_eq!(
-        on_disk.len(),
-        WINDOW,
-        "disk must be bounded to the window: {} seg*.ts files remain, expected {WINDOW}",
+    // ADR-0032 / hls::live: the listed window plus one further client-grace
+    // window (at least three segments) stays on disk; older segments are pruned.
+    let bound = total_segments.min(WINDOW + WINDOW.max(3));
+    assert!(
+        on_disk.len() <= bound && on_disk.len() >= WINDOW,
+        "disk must be bounded to window + grace: {} seg*.ts files remain, expected {WINDOW}..={bound}",
         on_disk.len()
     );
+    for uri in &listed {
+        assert!(
+            dir.path().join(uri).is_file(),
+            "listed segment {uri} must exist"
+        );
+    }
 
     // No leftover `.tmp` files: every segment was renamed into place atomically.
     let tmp_left = std::fs::read_dir(dir.path())
