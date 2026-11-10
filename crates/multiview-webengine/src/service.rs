@@ -758,6 +758,7 @@ impl Service {
             .map(|(id, e)| (*id, e.state.clone()))
     }
 
+    #[allow(clippy::too_many_lines)] // One admission transaction preserves intent/exposure ordering.
     fn enqueue(
         &self,
         request: Payload,

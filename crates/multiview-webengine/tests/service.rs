@@ -1407,6 +1407,7 @@ fn queued_fetch_real_ffmpeg_rejects_non_media_and_accepts_real_mp4() {
 }
 
 static ADMISSION_PAUSE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+#[allow(clippy::unnecessary_wraps)] // JournalHook requires this exact fallible signature.
 fn pause_admitted(
     boundary: multiview_webengine::service_journal::JournalBoundary,
 ) -> std::io::Result<()> {
