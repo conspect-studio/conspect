@@ -14,7 +14,7 @@ source of truth for engineering behaviour. All other engineering docs, the agent
 - **Tagline:** Ingest, compose, mix, route and monitor live media on commodity hardware. Fixed-cadence output and input isolation are engineering design goals, not warranties.
 - **Edition / toolchain:** Rust edition **2021**, pinned via `rust-toolchain.toml` (stable `1.99.1`; CI `dtolnay/rust-toolchain` pins the same version). MSRV documented in the README.
 - **License:** Conspect's own code uses the **Conspect Source-Available Non-Commercial License, Version 2.0** (© Aperim Pty Ltd). **Not open source / not free software.** Free means personal, home, hobby and learning use plus the expressly limited exceptions; religious use and monetized content require paid licensing. Source access grants private study and authorized use, not general reproduction. See §7 and the operative [license](../../LICENSE).
-- **Platforms:** Linux (x86_64 + aarch64; NVIDIA via Container Toolkit, Intel/AMD via VAAPI) and macOS (Apple Silicon + Intel, native). **No Windows.**
+- **Platforms:** Linux (x86_64 + aarch64; NVIDIA via Container Toolkit, Intel/AMD via VAAPI) and macOS (Apple Silicon + Intel, native) and Windows (x86_64, native; in progress, [ADR-0011](../decisions/ADR-0011.md)).
 
 ---
 
