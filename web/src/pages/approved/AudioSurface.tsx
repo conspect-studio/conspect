@@ -116,7 +116,11 @@ export function AudioPhoneMaster({
 }
 
 /** Desktop master + monitor regions: visible, with specific unavailable reasons. */
-export function AudioMasterRegion(): JSX.Element {
+export function AudioMasterRegion({
+  children,
+}: {
+  readonly children?: ReactNode;
+}): JSX.Element {
   return (
     <>
       <section
@@ -133,6 +137,7 @@ export function AudioMasterRegion(): JSX.Element {
             only per-input gain and mute in the saved audio document.
           </Trans>
         </p>
+        {children}
       </section>
       <div className="mix-note">
         <p className="monitor-line" data-testid="audio-monitor-unavailable">

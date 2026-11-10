@@ -159,6 +159,8 @@ function DetailsDisclosure({
 /** The vertical pre-fader INPUT presence meter beside a strip's fader — REAL
  * `audio.meter` telemetry only. The bar is decorative; the numeric peak and
  * the Clip word carry the meaning. No level is ever derived from the draft. */
+const METER_SEGMENTS = 24;
+
 function InputMeterColumn({
   sample,
 }: {
@@ -171,14 +173,29 @@ function InputMeterColumn({
       <div
         aria-hidden="true"
         data-testid="audio-in-meter"
-        className="relative h-60 w-3 overflow-hidden rounded bg-muted"
+        className="meter-col"
       >
-        {peak !== undefined ? (
-          <div
-            className="absolute bottom-0 left-0 w-full bg-status-live"
-            style={{ height: `${String(meterFillPercent(peak))}%` }}
-          />
-        ) : null}
+        {Array.from({ length: METER_SEGMENTS }, (_, from) => {
+          const seg = METER_SEGMENTS - 1 - from;
+          const lit =
+            peak !== undefined &&
+            seg < Math.round((meterFillPercent(peak) / 100) * METER_SEGMENTS);
+          const segDb = -60 + ((seg + 1) / METER_SEGMENTS) * 60;
+          return (
+            <i
+              key={seg}
+              className={
+                lit
+                  ? segDb > -3
+                    ? 'meter-seg on-top'
+                    : segDb > -12
+                      ? 'meter-seg on-hi'
+                      : 'meter-seg on-lo'
+                  : 'meter-seg'
+              }
+            />
+          );
+        })}
       </div>
       <span className="text-xs text-muted-foreground">{t`IN`}</span>
       <span
@@ -326,7 +343,12 @@ function ChannelStrip({
             </span>
           ))}
         </div>
-        <div className="relative h-60 w-12">
+        <div className="fader-track relative h-60 w-14">
+          <span
+            aria-hidden="true"
+            className="fader-fill"
+            style={{ height: `calc(24px + (100% - 48px) * ${String(faderPos(faderDisplayDb(draftDb ?? 0)))})` }}
+          />
           <input
             type="range"
             ref={registerFader}
@@ -715,63 +737,51 @@ function OverviewRow({
         data-testid="audio-overview-row"
         aria-label={t`Ride ${label}`}
         onClick={onRide}
-        className="flex min-h-12 w-full flex-wrap items-center gap-x-3 gap-y-1 rounded-md border p-2 text-left transition-colors hover:bg-accent focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+        className={saved?.mute === true ? 'mo-row is-muted' : 'mo-row'}
       >
-        <span className="w-32 shrink-0 truncate text-sm font-medium">{label}</span>
-        {draft.targetTrack.trim() !== '' ? (
-          <span className="shrink-0 rounded bg-secondary px-1.5 font-mono text-xs text-secondary-foreground">
-            {draft.targetTrack.trim()}
+        <span className="mo-name" title={label}>{label}</span>
+        <span
+          aria-hidden="true"
+          data-testid="audio-overview-meter"
+          className="mo-bar"
+        >
+          {peak !== undefined ? (
+            <i style={{ width: `${String(meterFillPercent(peak))}%` }} />
+          ) : null}
+        </span>
+        <span className="mo-val">{peak === undefined ? '—' : peak.toFixed(1)}</span>
+        {peak === undefined ? (
+          <span className="sr-only">
+            <Trans>No input telemetry</Trans>
           </span>
         ) : null}
-        <span className="flex shrink-0 items-center gap-1">
-          <span
-            aria-hidden="true"
-            data-testid="audio-overview-meter"
-            className="h-2 w-20 overflow-hidden rounded bg-muted"
-          >
-            {peak !== undefined ? (
-              <span
-                className="block h-full bg-status-live"
-                style={{ width: `${String(meterFillPercent(peak))}%` }}
-              />
-            ) : null}
-          </span>
-          <span className="w-10 font-mono text-xs tabular-nums text-muted-foreground">
-            {peak === undefined ? '—' : peak.toFixed(1)}
-          </span>
-          {peak === undefined ? (
-            <span className="sr-only">
-              <Trans>No input telemetry</Trans>
+        <span className="mo-sub">
+          {draft.targetTrack.trim() !== '' ? (
+            <span className="font-mono">{draft.targetTrack.trim()}</span>
+          ) : null}
+          {saved === undefined ? (
+            <span>
+              <Trans>new</Trans>
+            </span>
+          ) : (
+            <>
+              <span className="font-mono tabular-nums">
+                {formatDb(parseGainDb(saved.gainDb) ?? 0)} dB
+              </span>
+              {saved.mute ? (
+                <span className="font-semibold text-destructive">
+                  <Trans>MUTED</Trans>
+                </span>
+              ) : null}
+              <span>{saved.includeInProgramBus ? t`in PGM` : t`off PGM`}</span>
+            </>
+          )}
+          {changed ? (
+            <span data-testid="audio-draft-mark" className="mo-edited">
+              <Trans>edited</Trans>
             </span>
           ) : null}
         </span>
-        {saved === undefined ? (
-          <span className="text-xs text-muted-foreground">
-            <Trans>new</Trans>
-          </span>
-        ) : (
-          <>
-            <span className="font-mono text-xs tabular-nums text-muted-foreground">
-              {formatDb(parseGainDb(saved.gainDb) ?? 0)} dB
-            </span>
-            {saved.mute ? (
-              <span className="text-xs font-semibold text-destructive">
-                <Trans>MUTED</Trans>
-              </span>
-            ) : null}
-            <span className="text-xs text-muted-foreground">
-              {saved.includeInProgramBus ? t`in PGM` : t`off PGM`}
-            </span>
-          </>
-        )}
-        {changed ? (
-          <span
-            data-testid="audio-draft-mark"
-            className="rounded border border-status-stale/60 bg-status-stale/15 px-1.5 text-xs font-medium"
-          >
-            <Trans>edited</Trans>
-          </span>
-        ) : null}
       </button>
     </li>
   );
@@ -833,7 +843,7 @@ function MixOverview({
             </Trans>
           </span>
           <span className="text-xs text-muted-foreground">
-            <Trans>Live program meters are rendered below the console.</Trans>
+            <Trans>Live program meters are in the PROGRAM region below.</Trans>
           </span>
         </li>
         {form.routes.length === 0 ? (
@@ -1146,9 +1156,9 @@ export function AudioPage(): JSX.Element {
                 </Trans>
               </p>
             ) : (
-              <div className="flex max-w-full gap-2 overflow-x-auto pb-2">
+              <div className="strip-bank">
                 {form.routes.map((route, index) => (
-                  <div key={rowIds[index]} className={bankExpanded || index === focused ? 'w-44 shrink-0' : 'hidden'}>
+                  <div key={rowIds[index]} className={bankExpanded || index === focused ? 'min-w-0' : 'hidden'}>
                     <ChannelStrip
                       route={route}
                       saved={savedRowFor(index)}
@@ -1237,7 +1247,13 @@ export function AudioPage(): JSX.Element {
             onRide={ride}
           />
           </div>
-          <AudioMasterRegion />
+          <AudioMasterRegion>
+            {/* Live program-bus meters (AUD-8): conflated `audio.meter` /
+                `audio.loudness` telemetry; M/S/I/LRA/dBTP against the
+                compliance target. UI-only (invariant #10). */}
+            <ProgramMeters />
+            <LoudnessMeter />
+          </AudioMasterRegion>
           </>
             }
           />
@@ -1272,7 +1288,7 @@ export function AudioPage(): JSX.Element {
 
           <PendingTrackWarning impacts={pendingImpacts} />
 
-          <div className="order-first sticky top-0 z-10 flex flex-wrap items-center gap-2 rounded-md border bg-background/95 p-2 shadow-sm">
+          <div data-testid="audio-toolbar" className="order-first sticky top-0 z-10 flex flex-wrap items-center gap-2 border-b bg-background/95 py-2 xl:justify-end">
             <Button
               type="button"
               variant="outline"
@@ -1410,14 +1426,6 @@ export function AudioPage(): JSX.Element {
           </DetailsDisclosure>
 
           <SelectableTracks form={form} />
-
-          {/* Live program-bus meters (AUD-8): subscribes to the engine's
-              conflated `audio.loudness` realtime topic and renders
-              M/S/I/LRA/dBTP against the compliance target, ballistics applied
-              client-side. UI-only — it consumes telemetry, never the engine
-              path (invariant #10). */}
-          <ProgramMeters />
-          <LoudnessMeter />
         </fieldset>
       )}
     </AudioSurface>

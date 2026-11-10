@@ -61,4 +61,15 @@ describe('AudioSurface', () => {
     expect(screen.queryByRole('button')).toBeNull();
     expect(screen.getByTestId('audio-phone-master')).toHaveTextContent(/master mute unavailable/);
   });
+
+  it('hosts the live program meters inside the PROGRAM region', () => {
+    renderWithProviders(
+      <AudioMasterRegion>
+        <p data-testid="hosted">meters</p>
+      </AudioMasterRegion>,
+    );
+    expect(screen.getByTestId('audio-master-region')).toContainElement(
+      screen.getByTestId('hosted'),
+    );
+  });
 });
