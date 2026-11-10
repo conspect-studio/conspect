@@ -108,7 +108,14 @@ describe('AudioSurface', () => {
     renderWithProviders(<AudioMasterRegion />);
     expect(screen.getByTestId('audio-master-unavailable')).toHaveTextContent(/unavailable/i);
     expect(screen.getByTestId('audio-monitor-unavailable')).toHaveTextContent(/LISTEN.*unavailable/i);
-    expect(screen.queryByRole('button')).toBeNull();
+    // The master strip is shown but every control is disabled (no invented function).
+    const buttons = screen.getAllByRole('button');
+    expect(buttons.length).toBeGreaterThan(0);
+    for (const b of buttons) expect(b).toBeDisabled();
+    expect(screen.getByTestId('audio-master-unavailable')).toHaveTextContent(
+      'Master gain/mute unavailable: control plane exposes only per-input gain and mute in the saved audio document',
+    );
+    expect(screen.getByTestId('audio-master-fader')).toHaveAttribute('aria-disabled', 'true');
   });
 
   it('phone master offers no invented mute control', () => {

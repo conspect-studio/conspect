@@ -6,7 +6,9 @@
 // plane has no capability (master gain/mute, headphone LISTEN/PFL).
 import { useEffect, useState } from 'react';
 import type { JSX, ReactNode } from 'react';
-import { Trans } from '@lingui/react/macro';
+import { Trans, useLingui } from '@lingui/react/macro';
+
+import { Button } from '../../components/ui/button';
 
 import type { AudioLoudnessState } from '../../realtime/useAudioLoudness';
 import './audio-approved.css';
@@ -147,12 +149,16 @@ export function AudioPhoneMaster({
   );
 }
 
-/** Desktop master + monitor regions: visible, with specific unavailable reasons. */
+/** Desktop master rail: the approved VERTICAL PROGRAM strip (fader track,
+ * nudges, MUTE, status) rendered DISABLED — the control plane has no master
+ * gain/mute — with the real program meters/loudness beneath (children). */
 export function AudioMasterRegion({
   children,
 }: {
   readonly children?: ReactNode;
 }): JSX.Element {
+  const { t } = useLingui();
+  const reason = t`Master gain/mute unavailable: control plane exposes only per-input gain and mute in the saved audio document`;
   return (
     <>
       <section
@@ -163,18 +169,30 @@ export function AudioMasterRegion({
         <h2 id="audio-master-heading" className="strip-name">
           <Trans>PROGRAM</Trans>
         </h2>
+        <div className="master-fader-row" title={reason}>
+          <div className="audio-fader-box fader-track master-track" data-testid="audio-master-fader" role="slider" aria-disabled="true" aria-orientation="vertical" aria-label={t`PROGRAM master gain`} aria-valuetext={t`unavailable`} aria-valuemin={-60} aria-valuemax={0} aria-valuenow={0} />
+          <div className="audio-nudge-col">
+            {(['+6', '+1', '−1', '−6'] as const).map((label) => (
+              <Button key={label} type="button" variant="outline" disabled className="audio-nudge-btn h-12 min-w-12 p-0 font-mono" aria-label={t`PROGRAM gain ${label} dB — unavailable`}>
+                {label}
+              </Button>
+            ))}
+          </div>
+        </div>
+        <div className="master-keys">
+          <Button type="button" variant="outline" disabled title={reason} aria-label={t`PROGRAM MUTE — unavailable`} className="h-12 min-w-12 px-3">
+            <Trans>MUTE</Trans>
+          </Button>
+        </div>
         <p className="strip-status" data-testid="audio-master-unavailable">
-          <Trans>
-            Master gain and mute are unavailable: the control plane exposes
-            only per-input gain and mute in the saved audio document.
-          </Trans>
+          {reason}.
         </p>
         {children}
       </section>
       <div className="mix-note">
         <p className="monitor-line" data-testid="audio-monitor-unavailable">
           <Trans>
-            Monitor / LISTEN (PFL) is unavailable: no headphone monitoring
+            MONITOR OUT — LISTEN (PFL) is unavailable: no headphone monitoring
             path exists on this control plane.
           </Trans>
         </p>

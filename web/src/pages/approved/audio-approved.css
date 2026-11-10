@@ -319,14 +319,12 @@
     grid-auto-columns: minmax(124px, 1fr);
   }
   [data-approved-page="audio"] .strip-bank > div { scroll-snap-align: start; }
-  /* Rail: overview on the right across both rows, PROGRAM/loudness UNDER the bank (no dead area). */
-  [data-approved-page="audio"] .mixer { grid-template-columns: minmax(0, 1fr) 210px; grid-template-rows: auto auto auto; column-gap: 14px; row-gap: 12px; }
+  /* Rail (approved shape): Whole mix, then the vertical PROGRAM strip, then the MONITOR OUT note. */
+  [data-approved-page="audio"] .mixer { grid-template-columns: minmax(0, 1fr) 232px; grid-template-rows: auto; column-gap: 12px; align-items: start; }
   [data-approved-page="audio"] .mixer-main { grid-column: 1; grid-row: 1; }
-  [data-approved-page="audio"] .master-col { display: contents; width: auto; max-width: none; }
-  [data-approved-page="audio"] .master-col > .hidden.xl\:block { display: block; grid-column: 2; grid-row: 1 / span 3; min-width: 0; align-self: start; }
-  [data-approved-page="audio"] .master-col > .strip-master { grid-column: 1; grid-row: 2; }
-  [data-approved-page="audio"] .master-col > .mix-note { grid-column: 1; grid-row: 3; }
-  [data-approved-page="audio"] .strip-master > section .grid { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+  [data-approved-page="audio"] .master-col { display: grid; width: 232px; max-width: 232px; grid-column: 2; grid-row: 1; gap: 10px; overflow: visible; }
+  [data-approved-page="audio"] .master-col > .hidden.xl\:block { display: block; }
+  [data-approved-page="audio"] .strip-master > section .grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
 }
 /* Compact PROGRAM row in the whole-mix list. */
 [data-approved-page="audio"] [data-testid="audio-overview-program"] > span:nth-child(2),
@@ -336,4 +334,59 @@
 [data-approved-page="audio"] [data-testid="audio-save"]:disabled { opacity: 1; background: var(--bg-2); color: var(--text-3); border: 1px dashed var(--line-2); }
 @media (min-width: 1280px) {
   [data-approved-page="audio"] .strip-bank { grid-auto-columns: minmax(124px, 1fr); }
+}
+
+/* ---- Fix10: approved geometry ---- */
+[data-approved-page="audio"] .screen-head { align-items: center; margin-bottom: 8px; }
+[data-approved-page="audio"] .screen-head h1 { margin: 0 0 2px; }
+[data-approved-page="audio"] [data-testid="audio-toolbar"] {
+  display: flex; flex-wrap: wrap; align-items: center; justify-content: flex-end; gap: 8px; margin-bottom: 6px;
+}
+[data-approved-page="audio"] [data-testid="audio-toolbar"] [role="status"]:empty { display: none; }
+[data-approved-page="audio"] [data-testid="audio-toolbar"] [role="status"] { flex: 1 1 100%; }
+[data-approved-page="audio"] .audio-draft-note { font-size: 12px; color: var(--text-3); order: -1; margin-right: auto; }
+[data-approved-page="audio"] [data-testid="audio-toolbar"] > button { padding-top: 0; padding-bottom: 0; }
+
+/* Strip header: name only; dB line + peak chip under the fader. */
+[data-approved-page="audio"] .audio-strip-head { align-items: center; }
+[data-approved-page="audio"] .audio-strip-meta { display: flex; flex-direction: column; align-items: center; gap: 2px; }
+[data-approved-page="audio"] .audio-peak-chip {
+  display: inline-flex; gap: 3px; align-items: baseline; padding: 1px 6px; border-radius: 4px;
+  background: var(--bg-3); border: 1px solid var(--line-2); font-size: 10px; font-weight: 700; color: var(--text-3);
+}
+[data-approved-page="audio"] .audio-readout { margin: 0; display: flex; align-items: center; gap: 6px; font-size: 12px; color: var(--text-2); }
+[data-approved-page="audio"] .audio-draft-pip {
+  font-size: 10px; font-weight: 800; color: var(--amber); border: 1px solid var(--amber); border-radius: 4px; padding: 0 4px; line-height: 14px;
+}
+[data-approved-page="audio"] .audio-strip-keys { display: flex; flex-wrap: wrap; justify-content: center; gap: 6px; }
+[data-approved-page="audio"] .audio-listen-key:disabled { opacity: 1; background: var(--bg-1); color: var(--text-3); border-style: dashed; font-size: 12px; font-weight: 900; }
+[data-approved-page="audio"] .audio-undo-slot:empty { display: none; }
+[data-approved-page="audio"] .audio-details-compact > summary { border: 0; min-height: var(--tap); justify-content: center; }
+
+/* Master rail strip (vertical, disabled) */
+[data-approved-page="audio"] .master-fader-row { display: flex; align-items: flex-end; justify-content: center; gap: 8px; }
+[data-approved-page="audio"] .master-track { width: 56px; flex: none; opacity: .55; border-style: dashed; position: relative; }
+[data-approved-page="audio"] .master-keys { display: flex; justify-content: center; gap: 6px; }
+[data-approved-page="audio"] .strip-master > .master-keys button:disabled { opacity: 1; background: var(--bg-1); color: var(--text-3); border-style: dashed; font-weight: 900; }
+
+@media (min-width: 1280px) {
+  [data-approved-page="audio"] .audio-fader-box { height: 208px; }
+  [data-approved-page="audio"] .strip-bank { grid-auto-columns: minmax(118px, 1fr); }
+  [data-approved-page="audio"] .strip-bank [data-testid="audio-strip"] { gap: 6px; padding: 8px 2px; }
+  [data-approved-page="audio"] .strip-bank .meter-col { height: 208px; }
+  [data-approved-page="audio"] .strip-master { padding: 8px 6px; }
+  [data-approved-page="audio"] .strip-master > section { padding: 6px; }
+  [data-approved-page="audio"] .strip-master > section .text-2xl { font-size: 16px; }
+}
+@media (min-width: 768px) and (max-width: 1279px) {
+  [data-approved-page="audio"] .audio-fader-box { height: 208px; }
+}
+/* Approved key rows: MUTE + PGM side by side (48px), LISTEN placeholder on its own row below. */
+[data-approved-page="audio"] .audio-strip-keys { flex-wrap: wrap; }
+[data-approved-page="audio"] .audio-strip-keys [data-testid="audio-mute"],
+[data-approved-page="audio"] .audio-strip-keys [data-testid="audio-pgm"] { flex: 1 1 0; min-width: 48px; max-width: 72px; padding-left: 0; padding-right: 0; }
+[data-approved-page="audio"] .audio-strip-keys .audio-listen-key { flex: 0 0 auto; min-width: 72px; }
+@media (max-width: 767px) {
+  [data-approved-page="audio"] .audio-strip-keys { flex-wrap: nowrap; }
+  [data-approved-page="audio"] .audio-strip-keys .audio-listen-key { flex: 1 1 0; }
 }
