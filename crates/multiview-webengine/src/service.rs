@@ -1576,7 +1576,9 @@ fn verify_good(store: &ArtifactStore, g: &GoodRec, doc: &Doc) -> io::Result<()> 
 
 // Own the receiver: timeout closes it, so a late worker reply drops its lease.
 fn receive_pin<T>(receive: mpsc::Receiver<io::Result<T>>, timeout: Duration) -> io::Result<T> {
-    receive.recv_timeout(timeout).map_err(|error| match error {
+    let result = receive.recv_timeout(timeout);
+    drop(receive); // Closing the owned receiver rejects and drops every late lease reply.
+    result.map_err(|error| match error {
         mpsc::RecvTimeoutError::Timeout => {
             io::Error::new(io::ErrorKind::TimedOut, "artifact pin deadline")
         }
