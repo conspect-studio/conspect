@@ -92,9 +92,11 @@ vi.mock("../realtime/useHealth", async (importOriginal) => {
 let licenceBody: LicenceResource = { licensed: false, status: null };
 let pending: PendingAction[] = [];
 
+let alarmRows: unknown[] = [];
 const server = setupServer(
   http.get("*/api/v1/licence", () => HttpResponse.json(licenceBody)),
   http.get("*/api/v1/actions/pending", () => HttpResponse.json(pending)),
+  http.get("*/api/v1/alarms", () => HttpResponse.json(alarmRows)),
 );
 
 beforeAll(() => {
@@ -327,5 +329,37 @@ describe("AppLayout — producer vs management truth separation", () => {
       expect(screen.getAllByText(new RegExp(word))).toHaveLength(1);
       view.unmount();
     }
+  });
+});
+
+describe("AppLayout — single header row", () => {
+  it("keeps health, lock pill, bell and menu inside the one top row", () => {
+    renderShell("/a");
+    const header = screen.getByRole("banner");
+    expect(within(header).getByText("Unknown")).toBeInTheDocument();
+    expect(within(header).getByText(/Management · Connected/)).toBeInTheDocument();
+    const lock = within(header).getByRole("button", { name: /Takes locked/ });
+    expect(lock).toHaveAttribute("aria-pressed", "true");
+    expect(lock.querySelector("svg")).not.toBeNull();
+    expect(document.querySelector(".bd-producer")).toBeNull();
+    expect(within(header).getByRole("button", { name: "Open navigation" })).not.toHaveTextContent("All screens");
+  });
+
+  it("shows a real alarm count badge and none while unknown/zero", async () => {
+    alarmRows = [{ id: "a1" }, { id: "a2" }, { id: "a3" }].map((r) => ({ ...r, kind: "SignalLoss", severity: "major", scope: { kind: "system" }, ack: {}, dwell: 0, raised_at: 0, latched: false }));
+    const view = renderShell("/a");
+    expect(await screen.findByTestId("alarm-count")).toHaveTextContent("3");
+    view.unmount();
+    alarmRows = [];
+    renderShell("/a");
+    await waitFor(() => { expect(screen.getByRole("link", { name: "Alarms and engine health" })).toBeInTheDocument(); });
+    expect(screen.queryByTestId("alarm-count")).toBeNull();
+  });
+
+  it("marks the active drawer item with the approved token, not an inverted fill", async () => {
+    renderShell("/a");
+    await userEvent.setup().click(screen.getByRole("button", { name: "Open navigation" }));
+    const dialog = screen.getByRole("dialog", { name: "All screens" });
+    expect(dialog.className).toContain("bd-drawer");
   });
 });

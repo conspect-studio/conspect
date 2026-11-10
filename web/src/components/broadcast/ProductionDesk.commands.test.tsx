@@ -56,12 +56,36 @@ describe('ProductionDesk single-authority completion', () => {
     const { container } = page();
     await waitFor(() => { expect(screen.getByRole('button', { name: 'CUT' })).not.toBeDisabled(); });
     const keys = [...container.querySelectorAll('.bd-takes button')];
-    expect(keys.map((key) => key.textContent)).toEqual(['MIX', 'WIPE', 'DIP', 'AUTO', 'CUT']);
+    expect(keys.map((key) => key.textContent)).toEqual(['MIX', 'WIPE', 'DIP', 'AUTO', 'CUT · cam-2']);
     for (const key of keys.slice(0, 4)) expect(key).toBeDisabled();
     expect(screen.getByRole('button', { name: 'MIX' })).toHaveAttribute('aria-pressed', 'true');
     expect(screen.getByRole('button', { name: 'AUTO' }).title).toContain('422');
     expect(screen.getByRole('spinbutton', { name: 'Auto frames' })).toBeDisabled();
     expect(commandCount).toBe(0);
+  });
+
+  it('pairs CUT with its real source and an alarm button; AUTO frames sit in a disclosure', async () => {
+    const { container } = page();
+    await waitFor(() => { expect(screen.getByRole('button', { name: 'CUT' })).not.toBeDisabled(); });
+    expect(screen.getByRole('button', { name: 'CUT' })).toHaveTextContent('CUT · cam-2');
+    expect(container.querySelector('.bd-cutrow .bd-alarm-btn')).toHaveAttribute('href', '/alarms');
+    expect(container.querySelector('.bd-more')).toContainElement(screen.getByRole('spinbutton', { name: 'Auto frames' }));
+    expect(container.querySelector('.bd-takes>label')).toBeNull();
+  });
+
+  it('marks ON AIR — PROGRAM only for engine-confirmed state; tally glyphs follow real buses', async () => {
+    server.use(http.get('*/api/v1/sources', () => HttpResponse.json([{ id: 'cam-1', name: 'CAM 1', body: { kind: 'srt', url: 'srt://[::1]:1' } }, { id: 'cam-2', name: 'CAM 2', body: { kind: 'srt', url: 'srt://[::1]:2' } }])));
+    page();
+    expect(screen.getByText('○ PROGRAM — unconfirmed')).toBeInTheDocument();
+    expect(screen.queryByText('● ON AIR — PROGRAM')).toBeNull();
+    await screen.findByText('● ON AIR — PROGRAM');
+    expect(screen.getByText('● PGM')).toBeInTheDocument();
+    expect(screen.getByText('▲ PVW')).toBeInTheDocument();
+  });
+
+  it('exposes Open alarms as a 48px button-class link', async () => {
+    page();
+    expect(await screen.findByRole('link', { name: 'Open alarms' })).toHaveClass('bd-btn');
   });
 
   it('reads only active system alarms and renders the truthful empty summary', async () => {
