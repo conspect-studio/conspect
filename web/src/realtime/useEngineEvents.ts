@@ -4,13 +4,12 @@
 // patch them; on `$resync` the UI REBUILDS (discards) the affected state rather
 // than merging. The hook NEVER blocks render — the socket lives in a ref, all
 // state lands via setState/Query-cache writes from event callbacks.
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useState } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import type { QueryClient } from "@tanstack/react-query";
 
-import { RealtimeConnection } from "./connection";
 import type { RealtimeStatus } from "./connection";
-import { mintWsTicket, realtimeWsBaseUrl } from "./ticket";
+import { subscribeRealtimeAll } from "./shared";
 import {
   CONTROL_TOPIC,
   parseDeviceDiscovered,
@@ -31,6 +30,8 @@ import type {
   MediaPlayerEvent,
 } from "./generated-types";
 import { resourceKeys } from "../resources/queries";
+import { getOperationTracker } from "../components/broadcast/operationTracker";
+import { getStoredToken } from "../api/token";
 // `LifecycleState` (LIVE/STALE/RECONNECTING/NO_SIGNAL) comes from the generated
 // AsyncAPI schema types — the canonical source of truth for tile lifecycle values
 // (resilience invariant #2). `envelope.ts` re-exports it as `TileState` for
@@ -234,6 +235,19 @@ function applyDeviceStatus(client: QueryClient, envelope: Envelope): void {
   );
 }
 
+/**
+ * Retire every latest-wins player state. Called on `$resync`, a sequence gap
+ * and a dropped/reconnecting socket: after any of those the cached transport
+ * state can no longer be confirmed, so the UI reads "no live state" (and the
+ * vamp-exit keys disarm) until a fresh `media.player_state` arrives.
+ */
+export function clearMediaPlayerState(client: QueryClient): void {
+  client.setQueryData<Record<string, MediaPlayerEvent>>(
+    MEDIA_PLAYER_STATE_QUERY_KEY,
+    {},
+  );
+}
+
 function applyMediaPlayerState(client: QueryClient, envelope: Envelope): void {
   const event = parseMediaPlayerEvent(envelope.data);
   if (event === undefined) {
@@ -325,17 +339,11 @@ export function useEngineEvents(): EngineEvents {
   const [status, setStatus] = useState<RealtimeStatus>("connecting");
   const [lastSeq, setLastSeq] = useState(0);
   const [gaps, setGaps] = useState(0);
-  const connectionRef = useRef<RealtimeConnection | null>(null);
-
   useEffect(() => {
-    const connection = new RealtimeConnection(realtimeWsBaseUrl(), {
-      onStatus: (next): void => {
-        setStatus(next);
-      },
-      onGap: (): void => {
-        setGaps((count) => count + 1);
-      },
-      onEnvelope: (envelope): void => {
+    const tracker = getOperationTracker(queryClient);
+    const unsubscribe = subscribeRealtimeAll((envelope): void => {
+        tracker.resetIdentity(getStoredToken());
+        tracker.onEnvelope(envelope);
         // Control frames may carry seq 0; only advance the displayed cursor for
         // real, sequenced frames so the indicator never regresses.
         if (envelope.seq > 0) {
@@ -365,6 +373,7 @@ export function useEngineEvents(): EngineEvents {
           if (envelope.t === "$resync") {
             queryClient.removeQueries({ queryKey: TILES_QUERY_KEY });
             clearDeviceCaches(queryClient);
+            clearMediaPlayerState(queryClient);
           }
           // $snapshot frames carry their topic in `topic`, not `$control`, per
           // §5; nothing else on $control mutates cached domain state here.
@@ -389,6 +398,12 @@ export function useEngineEvents(): EngineEvents {
             applyMediaPlayerState(queryClient, envelope);
             return;
           }
+          case "graphics.channel_state": {
+            // A graphics channel's PVW/PGM changed (any operator): refetch
+            // the channel list the Graphics playout view renders.
+            void queryClient.invalidateQueries({ queryKey: ["graphics", "channels"] });
+            return;
+          }
           case "device.adopted":
           case "device.removed":
           case "device.mode":
@@ -404,13 +419,21 @@ export function useEngineEvents(): EngineEvents {
             // Unknown event types are ignored (forward-compatible, §2).
             return;
         }
-      },
-    }, mintWsTicket);
-    connectionRef.current = connection;
-    connection.start();
+      }, (next): void => {
+        setStatus(next);
+        if (next === 'reconnecting' || next === 'closed') {
+          tracker.onGap();
+          clearMediaPlayerState(queryClient);
+        }
+      }, (): void => {
+        tracker.onGap();
+        clearMediaPlayerState(queryClient);
+        // Missed frames: refetch everything the stream feeds (resume failed).
+        setGaps((count) => count + 1);
+        void queryClient.invalidateQueries();
+      });
     return (): void => {
-      connection.stop();
-      connectionRef.current = null;
+      unsubscribe();
     };
   }, [queryClient]);
 

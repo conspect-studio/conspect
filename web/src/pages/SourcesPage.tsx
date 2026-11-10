@@ -6,9 +6,11 @@
 // (ADR-W015). The LIVE STATUS column reads the realtime tile map the WebSocket
 // hook mirrors into the Query cache; a source outside the running engine shows
 // "—" with an explanation, because honesty beats a fabricated state.
+import { M3uImportButton } from './M3uImportDialog';
+import { useState } from 'react';
 import type { JSX } from 'react';
+import { Link, useLocation } from 'react-router-dom';
 import { Trans, useLingui } from '@lingui/react/macro';
-import type { ColumnDef } from '@tanstack/react-table';
 
 import { useSources } from '../resources/queries';
 import type { SaveResourceVars } from '../resources/queries';
@@ -18,6 +20,7 @@ import {
   captionModesForValue,
   CLOCK_FACES,
   emptySourceForm,
+  EPG_MODES,
   IANA_TIMEZONES,
   PIN_VENDORS,
   sourceFormFromRecord,
@@ -34,6 +37,7 @@ import {
 import type {
   CaptionsMode,
   ClockFace,
+  EpgModeChoice,
   FieldErrors,
   PinVendor,
   RtspTransport,
@@ -44,11 +48,10 @@ import type {
   TimerFormat,
   TimerOnTarget,
   TimerTargetType,
+  SourceActivationChoice,
   WallClockChoice,
 } from '../resources/forms';
-import { CrudPage, KindCell, NameCell, RowActions } from '../resources/CrudPage';
-import { SourcePreviewButton } from '../preview/SourcePreviewButton';
-import { SourceEventsButton } from '../events/SourceEventsButton';
+import { CrudPage } from '../resources/CrudPage';
 import {
   AdvancedSection,
   ApplySemanticsCallout,
@@ -60,11 +63,20 @@ import {
   SelectField,
 } from '../resources/FormControls';
 import { whipPublishUrl } from '../resources/api';
+import type { CrudSeed } from '../resources/CrudPage';
 import { SourceFromDeviceSection } from '../devices/FromDevice';
 import { tileForSource, useLiveTiles } from '../resources/useLiveTiles';
 import type { LiveTile } from '../realtime/useEngineEvents';
+import { Button } from '../components/ui/button';
+import { useCatalogueLinks } from '../api/catalogueQueries';
+import { OriginPanel } from '../iptv/SourceLinks';
+import type { SourceFormState as SeedForm } from '../resources/forms';
 import { HelpLink } from '../components/HelpLink';
-import { TileStateBadge } from '../components/TileStateBadge';
+import { useSourceStatus } from '../api/sourceStatus';
+import { useSystemCapabilities } from '../api/systemQueries';
+import { Info, TriangleAlert } from 'lucide-react';
+import { SourcesSurface } from './approved/SourcesSurface';
+import { useProgramTally } from './approved/useProgramTally';
 
 /** The form-kind options offered in the picker (no legacy alias). */
 const FORM_KINDS: readonly SourceFormKind[] = SOURCE_KINDS.filter(
@@ -84,28 +96,55 @@ function fromTransportChoice(value: RtspTransportChoice): RtspTransport {
   return value === 'auto' ? '' : value;
 }
 const WALLCLOCK_CHOICES: readonly WallClockChoice[] = ['default', 'use', 'discard'];
+const ACTIVATION_CHOICES: readonly SourceActivationChoice[] = ['always_on', 'on_demand'];
 
-/** The realtime status cell: the tile badge, or an honest "not running" dash. */
-function SourceStatusCell({ tile }: { readonly tile: LiveTile | undefined }): JSX.Element {
-  const { t } = useLingui();
-  if (tile === undefined) {
-    return (
-      <span
-        className="text-sm text-muted-foreground"
-        title={t`This source is not part of the running engine, so it has no live state. Synthetic sources join live once a tile binds them; other kinds join after a config export + restart.`}
-      >
-        <span aria-hidden="true">—</span>
-        <span className="sr-only">
+/**
+ * The `youtube` source kind's live-only note + VT redirect, plus an honest
+ * capability warning when this server cannot actually resolve a YouTube URL
+ * right now (the `youtube` build feature off, or `yt-dlp` not found on the
+ * server). Rendered under the URL field so an operator sees both the scope
+ * limitation and the current server capability before saving.
+ */
+function YoutubeKindNote(): JSX.Element {
+  const { data: capabilities } = useSystemCapabilities();
+  const youtube = capabilities?.youtube ?? undefined;
+  return (
+    <div className="flex flex-col gap-2">
+      <p className="flex items-start gap-2 text-xs text-muted-foreground">
+        <Info className="mt-0.5 size-3.5 shrink-0" aria-hidden="true" />
+        <span>
           <Trans>
-            Not in the running engine — no live state. Synthetic sources join
-            live once a tile binds them; other kinds join after a config export
-            + restart.
+            Live streams only: this resolves a currently-broadcasting YouTube
+            URL, never a pre-recorded/past video. To play a pre-recorded video,
+            use a VT clip instead (not built yet).
           </Trans>
         </span>
-      </span>
-    );
-  }
-  return <TileStateBadge state={tile.state} />;
+      </p>
+      {youtube !== undefined && !youtube.available ? (
+        <p
+          role="note"
+          className="flex items-start gap-2 rounded-md border border-status-stale/40 bg-status-stale/15 p-2 text-xs"
+        >
+          <TriangleAlert className="mt-0.5 size-3.5 shrink-0" aria-hidden="true" />
+          <span>
+            {youtube.compiled ? (
+              <Trans>
+                This server cannot resolve YouTube sources right now: `yt-dlp`
+                was not found. A saved source will stay `NO_SIGNAL` until the
+                server operator installs it.
+              </Trans>
+            ) : (
+              <Trans>
+                This server build does not include YouTube live ingest. A
+                saved source will stay `NO_SIGNAL` until it is rebuilt with
+                the `youtube` feature.
+              </Trans>
+            )}
+          </span>
+        </p>
+      ) : null}
+    </div>
+  );
 }
 
 /** The kind-specific locator + parameter fields. */
@@ -146,11 +185,17 @@ function SourceKindFields({
           value={form.url}
           required
           placeholder={placeholder}
+          {...(form.kind === 'srt'
+            ? {
+                hint: t`To receive from a remote encoder, use srt://[::]:7001?mode=listener: one socket accepts an IPv6 or IPv4 caller, one at a time. 0.0.0.0 is IPv4 only.`,
+              }
+            : {})}
           error={errors.url}
           onChange={(next): void => {
             setForm({ ...form, url: next });
           }}
         />
+        {form.kind === 'youtube' ? <YoutubeKindNote /> : null}
         {form.kind === 'rtsp' ? (
           <SelectField<RtspTransportChoice>
             label={t`RTSP transport`}
@@ -640,6 +685,14 @@ function SourceAdvancedFields({
         return <Trans>Stored sidecar (not decoded per source)</Trans>;
     }
   };
+  const activationLabel = (choice: SourceActivationChoice): JSX.Element => {
+    switch (choice) {
+      case 'always_on':
+        return <Trans>Always on (started at boot)</Trans>;
+      case 'on_demand':
+        return <Trans>On demand (idle until something uses it)</Trans>;
+    }
+  };
   const wallclockLabel = (choice: WallClockChoice): JSX.Element => {
     switch (choice) {
       case 'default':
@@ -652,6 +705,29 @@ function SourceAdvancedFields({
   };
   return (
     <AdvancedSection summary={t`Advanced`}>
+      {form.kind === 'hls' ? (
+        <>
+          <FormField
+            id="source-user-agent"
+            label={t`User-Agent header (optional)`}
+            value={form.userAgent}
+            error={errors.userAgent}
+            hint={<Trans>Sent on every HLS request. Not a secret; exported with the config.</Trans>}
+            onChange={(next): void => {
+              setForm({ ...form, userAgent: next });
+            }}
+          />
+          <FormField
+            id="source-referrer"
+            label={t`Referer header (optional)`}
+            value={form.referrer}
+            error={errors.referrer}
+            onChange={(next): void => {
+              setForm({ ...form, referrer: next });
+            }}
+          />
+        </>
+      ) : null}
       <SelectField<CaptionsMode>
         label={t`Captions`}
         value={form.captionsMode}
@@ -795,6 +871,16 @@ function SourceAdvancedFields({
         </div>
       ) : null}
 
+      <SelectField<SourceActivationChoice>
+        label={t`Start`}
+        value={form.activation}
+        options={ACTIVATION_CHOICES}
+        optionLabel={activationLabel}
+        onChange={(next): void => {
+          setForm({ ...form, activation: next });
+        }}
+      />
+
       <SelectField<WallClockChoice>
         label={t`Wall-clock handling`}
         value={form.wallclock}
@@ -815,8 +901,131 @@ function SourceAdvancedFields({
           setForm({ ...form, authSecretRef: next });
         }}
       />
+
+      <div className="mt-2 flex flex-col gap-3 border-t pt-3">
+        <h4 className="text-sm font-medium">
+          <Trans>Upstream EPG (electronic programme guide)</Trans>
+        </h4>
+        <SelectField<EpgModeChoice>
+          label={t`EPG mode`}
+          value={form.epgMode}
+          options={EPG_MODES}
+          optionLabel={epgModeLabel}
+          onChange={(next): void => {
+            setForm({ ...form, epgMode: next });
+          }}
+        />
+        {form.epgMode !== 'disabled' ? (
+          <>
+            <FormField
+              id="source-epg-url"
+              label={t`XMLTV guide URL`}
+              value={form.epgUrl}
+              placeholder="https://guide.example.net/xmltv.xml"
+              error={errors.epgUrl}
+              required={form.epgMode === 'manual'}
+              hint={<Trans>Required in manual mode; credential-free http(s) only.</Trans>}
+              onChange={(next): void => {
+                setForm({ ...form, epgUrl: next });
+              }}
+            />
+            <FormField
+              id="source-epg-channel-id"
+              label={t`Provider channel id`}
+              value={form.epgChannelId}
+              placeholder="bbc1.uk"
+              error={errors.epgChannelId}
+              required={form.epgMode === 'manual'}
+              hint={<Trans>The exact channel id as it appears in the XMLTV feed.</Trans>}
+              onChange={(next): void => {
+                setForm({ ...form, epgChannelId: next });
+              }}
+            />
+          </>
+        ) : (
+          <p className="text-xs text-muted-foreground">
+            <Trans>Disabled — any previously configured URL/channel id is retained for later re-enable.</Trans>
+          </p>
+        )}
+      </div>
+
+      <div className="flex flex-col gap-3 border-t pt-3">
+        <h4 className="text-sm font-medium">
+          <Trans>IPTV playlist presentation</Trans>
+        </h4>
+        <div className="grid grid-cols-2 gap-3">
+          <FormField
+            id="source-meta-tvg-id"
+            label={t`tvg-id`}
+            value={form.metaTvgId}
+            placeholder="bbc1.uk"
+            onChange={(next): void => {
+              setForm({ ...form, metaTvgId: next });
+            }}
+          />
+          <FormField
+            id="source-meta-name"
+            label={t`Display name`}
+            value={form.metaName}
+            placeholder="BBC One"
+            error={errors.metaName}
+            onChange={(next): void => {
+              setForm({ ...form, metaName: next });
+            }}
+          />
+          <FormField
+            id="source-meta-logo"
+            label={t`Logo URL`}
+            value={form.metaLogo}
+            placeholder="https://logos.example.net/bbc1.png"
+            error={errors.metaLogo}
+            onChange={(next): void => {
+              setForm({ ...form, metaLogo: next });
+            }}
+          />
+          <FormField
+            id="source-meta-group"
+            label={t`Group / category`}
+            value={form.metaGroup}
+            placeholder="UK Terrestrial"
+            onChange={(next): void => {
+              setForm({ ...form, metaGroup: next });
+            }}
+          />
+        </div>
+      </div>
     </AdvancedSection>
   );
+}
+
+function epgModeLabel(mode: EpgModeChoice): JSX.Element {
+  switch (mode) {
+    case 'automatic':
+      return <Trans>Automatic (resolve the guide automatically)</Trans>;
+    case 'manual':
+      return <Trans>Manual (explicit XMLTV URL + channel id)</Trans>;
+    case 'disabled':
+      return <Trans>Disabled (no guide fetched for this source)</Trans>;
+  }
+}
+
+function isSourceFormState(value: unknown): value is SeedForm {
+  return typeof value === 'object' && value !== null && 'kind' in value && 'extra' in value;
+}
+
+/** Read the “Add as source” seed the IPTV-ORG browser leaves in router state. */
+function readIptvSeed(state: unknown): { ts: number; form: SeedForm } | undefined {
+  if (typeof state !== 'object' || state === null || !('iptvSeed' in state)) {
+    return undefined;
+  }
+  const seed = state.iptvSeed;
+  if (typeof seed !== 'object' || seed === null || !('ts' in seed) || !('form' in seed)) {
+    return undefined;
+  }
+  // The seed is produced by our own browser page (toSourceForm) in router state.
+  return typeof seed.ts === 'number' && isSourceFormState(seed.form)
+    ? { ts: seed.ts, form: seed.form }
+    : undefined;
 }
 
 /** Sources management (ingest). */
@@ -824,85 +1033,59 @@ export function SourcesPage(): JSX.Element {
   const { t } = useLingui();
   const sources = useSources();
   const tiles = useLiveTiles();
+  const demand = useSourceStatus();
+  const links = useCatalogueLinks();
+  const programTally = useProgramTally();
+  const [helpOpen, setHelpOpen] = useState(false);
+  const linkBySource = new Map((links.data?.links ?? []).map((l) => [l.source_id, l]));
+  // "Add as source" from /sources/iptv-org arrives as router state; each distinct
+  // timestamp opens the create dialog once, prefilled (nothing is saved yet).
+  const location = useLocation();
+  const [seed, setSeed] = useState<CrudSeed<SeedForm> | undefined>(undefined);
+  const [seenTs, setSeenTs] = useState<number | undefined>(undefined);
+  const incoming = readIptvSeed(location.state);
+  if (incoming !== undefined && incoming.ts !== seenTs) {
+    setSeenTs(incoming.ts);
+    setSeed({ key: incoming.ts, creating: true, form: incoming.form });
+  }
 
-  const columns = (
+  // The approved surface owns presentation only; the original action
+  // components, permissions, live status queries and mutations stay the
+  // source of truth.
+  const renderItems = (
+    rows: readonly SourceView[],
     onEdit: (row: SourceView) => void,
     onDelete: (row: SourceView) => void,
-  ): ColumnDef<SourceView>[] => [
-    {
-      accessorKey: 'name',
-      header: t`Name`,
-      cell: (ctx): JSX.Element => <NameCell value={ctx.row.original.name} />,
-    },
-    {
-      accessorKey: 'kind',
-      header: t`Kind`,
-      cell: (ctx): JSX.Element => <KindCell value={ctx.row.original.rawKind} />,
-    },
-    {
-      accessorKey: 'locator',
-      header: t`Locator`,
-      cell: (ctx): JSX.Element => (
-        <code className="text-xs text-muted-foreground" lang="" dir="auto">
-          {ctx.row.original.locator ?? '—'}
-        </code>
-      ),
-    },
-    {
-      id: 'status',
-      header: (): JSX.Element => (
-        <span className="inline-flex items-center gap-1.5">
-          <Trans>Live status</Trans>
-          <HelpLink
-            to="/help/concepts/resilience#tile-lifecycle"
-            label={t`About tile lifecycle states`}
-            compact
-          />
-        </span>
-      ),
-      cell: (ctx): JSX.Element => (
-        <SourceStatusCell tile={tileForSource(tiles, ctx.row.original.id)} />
-      ),
-    },
-    {
-      id: 'preview',
-      header: t`Preview`,
-      cell: (ctx): JSX.Element => <SourcePreviewButton id={ctx.row.original.id} name={ctx.row.original.name} />,
-    },
-    {
-      id: 'events',
-      header: t`Events`,
-      cell: (ctx): JSX.Element => <SourceEventsButton id={ctx.row.original.id} name={ctx.row.original.name} />,
-    },
-    {
-      id: 'actions',
-      header: t`Actions`,
-      cell: (ctx): JSX.Element => (
-        <RowActions
-          row={ctx.row.original}
-          name={ctx.row.original.name}
-          editLabel={t`Edit source`}
-          deleteLabel={t`Delete source`}
-          editDisabledReason={
-            ctx.row.original.editable
-              ? undefined
-              : t`kind "${ctx.row.original.rawKind}" isn't editable in this UI; the document is preserved as authored`
-          }
-          onEdit={onEdit}
-          onDelete={onDelete}
-        />
-      ),
-    },
-  ];
+  ): JSX.Element => (
+    <SourcesSurface
+      rows={rows}
+      demand={demand.data}
+      tileFor={(id): LiveTile | undefined => tileForSource(tiles, id)}
+      linkFor={(id): ReturnType<typeof linkBySource.get> => linkBySource.get(id)}
+      onEdit={onEdit}
+      onDelete={onDelete}
+      tally={programTally}
+    />
+  );
 
   return (
+    <div data-sources-touch="" data-approved-page="sources" className="src-page min-w-0 [&_button]:min-h-12 [&_button]:min-w-12 [&_button]:h-auto [&_button]:whitespace-normal [&_button]:break-words [&_button]:max-w-full [&_button>span]:min-w-0 [&_button>span]:whitespace-normal [&_button>span]:[overflow-wrap:anywhere] [&_a]:min-w-12 [&_a]:min-h-12 [&_a]:whitespace-normal [&_a]:break-words [&>div:first-child>div:last-child]:flex-wrap [&>div:first-child>div:last-child]:min-w-0 [&>div:first-child>div:last-child]:max-w-full">
     <CrudPage<SourceView, SourceFormState, SourceField>
       kind="sources"
-      title={<Trans>Sources</Trans>}
+      dialogClassName="[&_button]:min-h-12 [&_button]:min-w-12 [&_button]:h-auto [&_button]:whitespace-normal [&_button]:[overflow-wrap:anywhere] [&_summary]:min-h-12 [&_summary]:content-center [&_input]:min-h-12 [&_input]:min-w-12 [&_select:not([aria-hidden=true])]:min-h-12 [&_select:not([aria-hidden=true])]:min-w-12 [&_[role=combobox]]:min-h-12 [&_[role=combobox]]:min-w-12 [&_a]:min-h-12 [&_a]:min-w-12 [&_a]:inline-flex [&_a]:items-center [&_a]:whitespace-normal [&_a]:[overflow-wrap:anywhere] [&_*]:min-w-0"
+      title={<Trans>Sources &amp; library</Trans>}
       description={
-        <span className="inline-flex flex-wrap items-center gap-x-3 gap-y-1">
-          <Trans>Add and manage live ingest sources.</Trans>
-          <HelpLink to="/help/concepts/transports#choosing" label={t`About source transports`} />
+        <span className="src-sub">
+          <Trans>Live source lifecycle — exceptions sort first.</Trans>
+          <button
+            type="button"
+            className="help-btn"
+            aria-expanded={helpOpen}
+            aria-controls="src-help-panel"
+            onClick={(): void => { setHelpOpen((v) => !v); }}
+          >
+            <Trans>ⓘ Help</Trans>
+          </button>
         </span>
       }
       newLabel={t`New source`}
@@ -913,11 +1096,45 @@ export function SourcesPage(): JSX.Element {
       emptyMessage={<Trans>No sources configured.</Trans>}
       loadingMessage={<Trans>Loading sources…</Trans>}
       errorPrefix={<Trans>Could not load sources:</Trans>}
-      headerExtras={<ExportConfigButton compact />}
+      seed={seed}
+      headerExtras={
+        <details className="src-more">
+          <summary>
+            <Trans>More</Trans>
+          </summary>
+          <div className="src-more-menu">
+            <M3uImportButton />
+            <Button asChild variant="outline">
+              <Link to="/sources/iptv-org">
+                <Trans>Browse IPTV-ORG</Trans>
+              </Link>
+            </Button>
+            <ExportConfigButton compact />
+          </div>
+        </details>
+      }
       callout={
-        <ApplySemanticsCallout
-          helpTo="/help/config#sources"
-          helpLabel={t`How configuration applies`}
+        helpOpen ? (
+          <div className="help-panel" id="src-help-panel" role="region" aria-label={t`Sources help`}>
+            <p>
+              <Trans>
+                <b>Read the row:</b> Signal (frames arriving), Lifecycle (idle → starting → ready → failed),
+                Activation (always-on / on-demand) and Tally (red = on programme) are separate facts. Anything
+                this page cannot confirm reads Unknown.
+              </Trans>
+            </p>
+            <p>
+              <Trans>
+                <b>YouTube restream:</b> the inbound ingest and the outbound destination publishing (Routing)
+                are separate paths — one failing never means the other is broken.
+              </Trans>
+            </p>
+            <p>
+              <HelpLink to="/help/concepts/transports#choosing" label={t`About source transports`} />
+            </p>
+            <ApplySemanticsCallout
+              helpTo="/help/config#sources"
+              helpLabel={t`How configuration applies`}
           message={
             <Trans>
               Synthetic sources (bars, solid colour, clock, timer) apply to the
@@ -930,7 +1147,9 @@ export function SourcesPage(): JSX.Element {
               or restart).
             </Trans>
           }
-        />
+            />
+          </div>
+        ) : null
       }
       savedDescription={t`Stored. Synthetic sources (bars, solid colour, clock, timer) and — on a full-engine run — network/file sources apply to the running engine immediately; NDI / YouTube / AES67 (and any kind on the software engine) go live via config export + restart. The response header declares which applied.`}
       deletedDescription={t`Removed. The running engine drops the source immediately (the response header confirms) — tiles bound to it show the no-signal slate until re-routed.`}
@@ -938,7 +1157,8 @@ export function SourcesPage(): JSX.Element {
       isPending={sources.isPending}
       isError={sources.isError}
       errorMessage={sources.error?.message}
-      columns={columns}
+      columns={() => []}
+      renderItems={renderItems}
       rowId={(row): string => row.id}
       rowName={(row): string => row.name}
       emptyForm={emptySourceForm}
@@ -994,9 +1214,11 @@ export function SourcesPage(): JSX.Element {
             }}
           />
           <SourceKindFields form={form} setForm={setForm} errors={errors} />
+          <OriginPanel form={form} setForm={setForm} />
           <SourceAdvancedFields form={form} setForm={setForm} errors={errors} />
         </>
       )}
     />
+    </div>
   );
 }

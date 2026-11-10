@@ -27,6 +27,7 @@ export function ThemeToggle(): JSX.Element {
     <Button
       variant="ghost"
       size="icon"
+      className="size-12 shrink-0"
       aria-label={label}
       title={label}
       onClick={(): void => {

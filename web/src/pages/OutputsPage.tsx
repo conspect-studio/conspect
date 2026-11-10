@@ -4,29 +4,54 @@
 // (crates/multiview-config/src/schema.rs) via ../resources/forms. HONESTY:
 // `rtsp_server` and `ndi` outputs are accepted by the config but NOT yet
 // runnable — `build_outputs` in crates/multiview-cli/src/pipeline.rs warns and
-// skips them — so the table and the form flag those kinds with a clear,
+// skips them — so the card and the form flag those kinds with a clear,
 // non-alarming "Not yet runnable in this build" note (text + icon, never
 // colour alone). hls / ll_hls / rtmp / srt run today; `display` (the local
 // DRM/KMS head, DEV-B1/ADR-0044) runs only in a `display-kms` build and is
 // badged "Requires a display-kms build" (a default build fails the run with a
 // clear error rather than skipping the output).
+//
+// LIST (broadcast console UI, design round 3/4 adoption): the resource TABLE
+// is gone — one responsive TaskWorkspace card per output, with the concise
+// destination + link state + the actual configured facts (transport kind,
+// destination, codec) always visible in the fold, the per-card Edit/Delete
+// keys at the broadcast 48px touch floor (TouchAction), and the secondary
+// honesty notes behind the caller-controlled Details disclosure. A table
+// would have hidden the actions behind horizontal scroll on a phone; the
+// cards never do. ProducerStatus is deliberately NOT re-rendered per card:
+// the outputs source API exposes no producer/freshness/health fact per sink,
+// so there is nothing honest to badge — the shell already renders the one
+// honest app-wide "Unknown" producer line, and a per-card badge here would
+// either duplicate it or invent facts (a `written` counter is cumulative
+// output, never media health; a connected push link is a peer attached,
+// never "publishing decoded media"). The CRUD dialogs (create / edit with
+// GET prefill + `If-Match` ETag, delete confirmation) keep the exact
+// CrudPage flow and copy; they were lifted, not redesigned.
+import { useState } from 'react';
 import type { JSX } from 'react';
 import { Link } from 'react-router-dom';
 import { hlsPlaybackCollisionIds, hlsPlaybackPaths } from '../preview/outputPlayback';
 import { Trans, useLingui } from '@lingui/react/macro';
-import { CircleCheck, Hourglass, MonitorCog } from 'lucide-react';
-import type { ColumnDef } from '@tanstack/react-table';
+import { CircleCheck, Hourglass, MonitorCog, Pencil, Plus, Trash2 } from 'lucide-react';
 
 import { OutputFromDeviceSection } from '../devices/FromDevice';
-import { useOutputs } from '../resources/queries';
-import type { SaveResourceVars } from '../resources/queries';
-import type { OutputKind, OutputView } from '../resources/types';
+import { useAudioRouting } from '../resources/audioRouting';
+import { getResource, whepPlayUrl } from '../resources/api';
+import {
+  useDeleteResource,
+  useOutputLink,
+  useOutputs,
+  useSaveResource,
+} from '../resources/queries';
+import type { ResourceContext } from '../resources/queries';
 import { OUTPUT_KINDS } from '../resources/types';
+import type { OutputKind, OutputView } from '../resources/types';
 import {
   emptyOutputForm,
   OUTPUT_RUNNABLE,
   outputFormFromRecord,
   outputFormToBody,
+  parseTrackList,
   PIN_VENDORS,
   validateOutputForm,
 } from '../resources/forms';
@@ -38,19 +63,33 @@ import type {
   OutputFormState,
   PinVendor,
 } from '../resources/forms';
-import { CrudPage, KindCell, NameCell, RowActions } from '../resources/CrudPage';
 import {
   AdvancedSection,
   ApplySemanticsCallout,
   CheckboxField,
   DerivedUrlField,
   ExportConfigButton,
+  FieldErrorMessage,
   FormField,
+  PlaybackUrlRow,
   SecretField,
   SelectField,
 } from '../resources/FormControls';
-import { whepPlayUrl } from '../resources/api';
+import { useOutputPlayback } from '../resources/outputPlayback';
 import { HelpLink } from '../components/HelpLink';
+import { TaskWorkspace, TouchAction } from '../components/broadcast';
+import { PageHeader } from '../components/PageHeader';
+import { Badge } from '../components/ui/badge';
+import { Button } from '../components/ui/button';
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from '../components/ui/dialog';
+import { toast } from '../components/ui/use-toast';
 
 const AUDIO_CHOICES: readonly OutputAudioChoice[] = ['default', 'program', 'tracks'];
 
@@ -100,6 +139,134 @@ function RunnabilityNote({ kind }: { readonly kind: OutputKind }): JSX.Element {
         </span>
       );
   }
+}
+
+/** Output kinds that report a live network link. */
+function hasLiveLink(kind: OutputKind): boolean {
+  return kind === 'srt' || kind === 'rtmp' || kind === 'rist';
+}
+
+/**
+ * A push output's live link: whether a peer is attached, what is wrong *now*,
+ * and why packets were not delivered.
+ *
+ * HONESTY (issue #202): a listener waiting for a caller discards every encoded
+ * packet, which is expected — reporting that as "packets dropped" alongside an
+ * error from a previous session reads as a fault when the link is healthy. So
+ * (1) only `last_error` — current link health — is shown as an alarm;
+ * `last_session_error` is muted history from the previous session; and (2) the
+ * additive reason counters separate benign discards from real delivery
+ * failures. Benign is exactly two things: no caller attached, and a *fresh*
+ * session waiting for its first keyframe (nothing is wrong with the link, the
+ * decoder just has not been handed an IDR). A slow peer's queue overflow, and
+ * every packet held until that peer is re-admitted on the next keyframe — audio
+ * and non-IDR video alike — is delivery loss that peer caused, so it is counted
+ * as slow-peer loss and shown as an alarm (t10 / SRT-STATUS-01: the two causes
+ * share one keyframe gate and were once conflated here). Bodies from a server
+ * without the reason counters fall back to the one conflated total.
+ */
+export function OutputLinkStatus({ id }: { readonly id: string }): JSX.Element | null {
+  const { t } = useLingui();
+  const linkQuery = useOutputLink(id, true);
+  const link = linkQuery.data;
+  // A failing poll keeps the last good snapshot in cache; never present it as
+  // the current link state.
+  const pollFailing = linkQuery.isError;
+  if (link === undefined || link === null) {
+    if (pollFailing) {
+      return (
+        <div className="flex flex-col gap-0.5 text-xs" data-testid="output-link">
+          <span className="text-destructive" data-testid="output-link-unavailable">
+            <Trans>Link state unavailable — the status poll is failing.</Trans>
+          </span>
+        </div>
+      );
+    }
+    return null;
+  }
+  const state = ((): string => {
+    switch (link.state) {
+      case 'listening':
+        return t`Listening, no caller attached`;
+      case 'connected':
+        return t`Connected (${link.clients})`;
+      case 'connecting':
+        return t`Connecting`;
+      case 'reconnecting':
+        return t`Reconnecting`;
+      default:
+        return t`Idle`;
+    }
+  })();
+  // The reason counters are additive; an older server sends none of them and
+  // only its conflated `dropped` total, which we cannot honestly split.
+  const hasReasons =
+    link.discarded_no_client !== undefined &&
+    link.discarded_awaiting_keyframe !== undefined &&
+    link.dropped_slow_peer !== undefined &&
+    link.dropped_upstream !== undefined;
+  const discardedNoClient = link.discarded_no_client ?? 0;
+  const discardedKeyframe = link.discarded_awaiting_keyframe ?? 0;
+  const slowPeerDrops = link.dropped_slow_peer ?? 0;
+  const upstreamDrops = link.dropped_upstream ?? 0;
+  return (
+    <div className="flex flex-col gap-0.5 text-xs" data-testid="output-link">
+      <span>{state}</span>
+      {pollFailing ? (
+        <span className="text-destructive" data-testid="output-link-stale">
+          <Trans>Stale — last successful poll; the status poll is failing.</Trans>
+        </span>
+      ) : null}
+      {link.peers.map((peer) => (
+        <code key={peer} className="text-muted-foreground" lang="" dir="auto">
+          {peer}
+        </code>
+      ))}
+      {link.last_error !== undefined && link.last_error !== null ? (
+        <span className="text-destructive">{link.last_error}</span>
+      ) : null}
+      {link.last_session_error !== undefined &&
+      link.last_session_error !== null ? (
+        <span className="text-muted-foreground">
+          <Trans>Last session ended: {link.last_session_error}</Trans>
+        </span>
+      ) : null}
+      {hasReasons ? (
+        <>
+          {slowPeerDrops > 0 ? (
+            <span className="text-destructive">
+              <Trans>
+                {slowPeerDrops} packets dropped (slow peer, incl. keyframe resync)
+              </Trans>
+            </span>
+          ) : null}
+          {upstreamDrops > 0 ? (
+            <span className="text-destructive">
+              <Trans>{upstreamDrops} packets dropped upstream (queue full)</Trans>
+            </span>
+          ) : null}
+          {discardedNoClient > 0 ? (
+            <span className="text-muted-foreground">
+              <Trans>
+                {discardedNoClient} packets discarded while no caller was attached
+              </Trans>
+            </span>
+          ) : null}
+          {discardedKeyframe > 0 ? (
+            <span className="text-muted-foreground">
+              <Trans>
+                {discardedKeyframe} packets discarded waiting for the first keyframe
+              </Trans>
+            </span>
+          ) : null}
+        </>
+      ) : link.dropped > 0 ? (
+        <span className="text-destructive">
+          <Trans>{link.dropped} packets dropped</Trans>
+        </span>
+      ) : null}
+    </div>
+  );
 }
 
 /** The kind-specific destination + tuning fields. */
@@ -180,7 +347,7 @@ function OutputKindFields({
               setForm({ ...form, path: next });
             }}
           />
-          <div className="grid grid-cols-3 gap-3">
+          <div className="grid grid-cols-1 gap-3 sm:grid-cols-3">
             <FormField
               id="output-part-ms"
               label={t`Part target (ms)`}
@@ -253,6 +420,7 @@ function OutputKindFields({
           value={form.url}
           required
           placeholder="srt://[2001:db8::1]:7001"
+          hint={t`To let callers pull the program, use srt://[::]:7001?mode=listener: one socket serves up to 16 IPv6 and IPv4 callers. 0.0.0.0 is IPv4 only.`}
           error={errors.url}
           onChange={(next): void => {
             setForm({ ...form, url: next });
@@ -280,6 +448,37 @@ function OutputKindFields({
     case 'whip-push':
       return <WhipPushOutputFields form={form} setForm={setForm} errors={errors} />;
   }
+}
+
+/**
+ * The viewer **playback URL(s)** section (ADR-0101 — "a link to copy the
+ * actual URL to paste into a tool like VLC"): one {@link PlaybackUrlRow} per
+ * URL the server derives for this output (`GET
+ * /api/v1/outputs/{id}/playback`). Only rendered for a SAVED output (the
+ * route needs a real id); an unsaved (still-creating) output shows nothing
+ * here — there is nothing to derive yet.
+ */
+function PlaybackUrlsSection({ outputId }: { readonly outputId: string }): JSX.Element | null {
+  const { t } = useLingui();
+  const playback = useOutputPlayback(outputId === '' ? undefined : outputId);
+  if (outputId === '' || playback.data === undefined || playback.data.length === 0) {
+    return null;
+  }
+  return (
+    <div className="flex flex-col gap-2">
+      <p className="text-sm font-medium">{t`Playback URL`}</p>
+      {playback.data.map((entry, index) => (
+        <PlaybackUrlRow
+          key={`${entry.label}-${String(index)}`}
+          idPrefix={`output-playback-${outputId}-${String(index)}`}
+          label={entry.label}
+          url={entry.url ?? undefined}
+          vlcCommand={entry.vlc_command ?? undefined}
+          notes={entry.notes ?? []}
+        />
+      ))}
+    </div>
+  );
 }
 
 /**
@@ -459,7 +658,7 @@ function DisplayKindFields({
         }}
       />
       {form.displayModeChoice === 'auto' ? null : (
-        <div className="grid grid-cols-3 gap-3">
+        <div className="grid grid-cols-1 gap-3 sm:grid-cols-3">
           <FormField
             id="output-display-width"
             label={t`Width (px)`}
@@ -556,15 +755,111 @@ function CodecFields({
   );
 }
 
+/**
+ * The discrete-track picker for `audioMode = 'tracks'`: when the current
+ * audio-routing document's `selectable_tracks` are known, offer ONLY those as
+ * checkboxes (the Outputs page must never let an operator select a track
+ * that does not currently exist — AUD-9). A track this output already
+ * carries but the routing document no longer declares (stale after an
+ * external edit) is still shown, checked, so editing never silently drops it;
+ * it is clearly distinguished as unknown. Falls back to the legacy free-text
+ * comma list only while the routing document has not loaded yet.
+ */
+function AudioTracksField({
+  form,
+  setForm,
+  error,
+  selectableTracks,
+}: {
+  readonly form: OutputFormState;
+  readonly setForm: (next: OutputFormState) => void;
+  readonly error: FieldErrors<OutputField>['audioTracks'];
+  readonly selectableTracks: readonly string[] | undefined;
+}): JSX.Element {
+  const { t } = useLingui();
+  if (selectableTracks === undefined) {
+    return (
+      <FormField
+        id="output-audio-tracks"
+        label={t`Tracks (comma-separated)`}
+        value={form.audioTracks}
+        placeholder="prog, commentary"
+        error={error}
+        hint={
+          <Trans>
+            Names declared by the audio routing block; the program bus is
+            always available as "prog".
+          </Trans>
+        }
+        onChange={(next): void => {
+          setForm({ ...form, audioTracks: next });
+        }}
+      />
+    );
+  }
+  const selected = parseTrackList(form.audioTracks);
+  const unknownSelected = selected.filter((track) => !selectableTracks.includes(track));
+  const options = [...selectableTracks, ...unknownSelected];
+  const toggle = (track: string, checked: boolean): void => {
+    const next = checked
+      ? [...selected, track]
+      : selected.filter((existing) => existing !== track);
+    setForm({ ...form, audioTracks: next.join(', ') });
+  };
+  return (
+    <fieldset className="flex flex-col gap-1">
+      <legend className="text-sm font-medium">
+        <Trans>Tracks</Trans>
+      </legend>
+      {options.length === 0 ? (
+        <p className="text-xs text-muted-foreground">
+          <Trans>No tracks declared yet on the Audio page.</Trans>
+        </p>
+      ) : (
+        options.map((track) => (
+          <div key={track} className="flex items-center gap-2">
+            <CheckboxField
+              id={`output-audio-track-${track}`}
+              label={track}
+              checked={selected.includes(track)}
+              onChange={(checked): void => {
+                toggle(track, checked);
+              }}
+            />
+            {unknownSelected.includes(track) ? (
+              <span className="text-xs text-destructive">
+                <Trans>not currently declared</Trans>
+              </span>
+            ) : null}
+          </div>
+        ))
+      )}
+      {error !== undefined ? (
+        <p role="alert" className="text-sm text-destructive">
+          <FieldErrorMessage code={error} />
+        </p>
+      ) : null}
+      <p className="text-xs text-muted-foreground">
+        <Trans>
+          Names declared by the audio routing block; the program bus is
+          always available as "prog".
+        </Trans>
+      </p>
+    </fieldset>
+  );
+}
+
 /** The collapsible Advanced block (audio selection + GPU pin). */
 function OutputAdvancedFields({
   form,
   setForm,
   errors,
+  selectableTracks,
 }: {
   readonly form: OutputFormState;
   readonly setForm: (next: OutputFormState) => void;
   readonly errors: FieldErrors<OutputField>;
+  readonly selectableTracks: readonly string[] | undefined;
 }): JSX.Element {
   const { t } = useLingui();
   const audioLabel = (choice: OutputAudioChoice): JSX.Element => {
@@ -589,21 +884,11 @@ function OutputAdvancedFields({
         }}
       />
       {form.audioMode === 'tracks' ? (
-        <FormField
-          id="output-audio-tracks"
-          label={t`Tracks (comma-separated)`}
-          value={form.audioTracks}
-          placeholder="prog, commentary"
+        <AudioTracksField
+          form={form}
+          setForm={setForm}
           error={errors.audioTracks}
-          hint={
-            <Trans>
-              Names declared by the audio routing block; the program bus is
-              always available as "prog".
-            </Trans>
-          }
-          onChange={(next): void => {
-            setForm({ ...form, audioTracks: next });
-          }}
+          selectableTracks={selectableTracks}
         />
       ) : null}
       <CheckboxField
@@ -615,7 +900,7 @@ function OutputAdvancedFields({
         }}
       />
       {form.gpuPinEnabled ? (
-        <div className="grid grid-cols-2 gap-3">
+        <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
           <SelectField<PinVendor>
             label={t`GPU vendor`}
             value={form.gpuPinVendor}
@@ -641,182 +926,644 @@ function OutputAdvancedFields({
   );
 }
 
-/** Outputs management. */
+/**
+ * One output's compact broadcast card (TaskWorkspace): the transport kind,
+ * destination, codec and runnability facts stay in the phone fold with the
+ * 48px Edit/Delete keys; the secondary honesty notes sit behind the
+ * caller-controlled Details disclosure. Nothing here invents a live fact:
+ * every value shown is the CONFIGURED document (requested), never a claim
+ * about what the running engine currently serves.
+ */
+function OutputCard({
+  output,
+  playbackPath,
+  playbackCollision,
+  detailsOpen,
+  onDetailsToggle,
+  onEdit,
+  onDelete,
+  embedded = false,
+}: {
+  readonly embedded?: boolean;
+  readonly output: OutputView;
+  readonly playbackPath: string | undefined;
+  readonly playbackCollision: boolean;
+  readonly detailsOpen: boolean;
+  readonly onDetailsToggle: (open: boolean) => void;
+  readonly onEdit: (row: OutputView) => void;
+  readonly onDelete: (row: OutputView) => void;
+}): JSX.Element {
+  const { t } = useLingui();
+  // An unknown-kind document renders + deletes normally but Edit is refused —
+  // editing through a fold would silently rewrite the authored document.
+  // `aria-disabled` (not `disabled`) keeps the control focusable so the
+  // reason is discoverable by keyboard/SR users; the press is a guarded
+  // no-op and the stored document stays as authored.
+  const editRefused = !output.editable;
+  const editDisabledReason = editRefused
+    ? t`kind "${output.rawKind}" isn't editable in this UI; the document is preserved as authored`
+    : undefined;
+  if (embedded) {
+    // Approved Routing composition: Requested (config) beside Effective
+    // (measured). Only configured facts are shown as requested; effective and
+    // restart state have no readback in the API, so they are Unknown.
+    const unbuilt = output.editable && OUTPUT_RUNNABLE[output.kind] === 'unbuilt';
+    return (
+      <div className="out-card" data-testid={`output-card-${output.id}`}>
+        <div className="out-head">
+          <b lang="" dir="auto">{output.name}</b>
+          <span className="pill pill-idle" data-testid="output-kind-tag">{output.rawKind}</span>
+        </div>
+        <p className="out-sub">
+          <code lang="" dir="auto">{output.id}</code>
+          {output.target !== undefined ? (
+            <>
+              {' · '}
+              <span lang="" dir="auto" className="break-all">{output.target}</span>
+            </>
+          ) : null}
+        </p>
+        <div className="out-tx" data-testid="output-transmission">
+          {unbuilt ? (
+            <span className="pill pill-nosig"><Trans>⊘ Not available</Trans></span>
+          ) : (
+            <span className="pill pill-nosig"><Trans>Transmission: Unknown</Trans></span>
+          )}
+          {output.editable ? (
+            <span className="flex min-w-0 flex-col gap-1">
+              <RunnabilityNote kind={output.kind} />
+              {hasLiveLink(output.kind) ? <OutputLinkStatus id={output.id} /> : null}
+            </span>
+          ) : (
+            <span aria-hidden="true">—</span>
+          )}
+        </div>
+        <div className="req-eff">
+          <div data-testid="output-requested">
+            <span className="lbl"><Trans>Requested (config)</Trans></span>
+            <span className="mono">
+              {output.codec ?? <Trans>codec not set</Trans>}
+            </span>
+          </div>
+          <div data-testid="output-effective">
+            <span className="lbl"><Trans>Effective (measured)</Trans></span>
+            <span className="mono">
+              <Trans>Unknown — no measured readback</Trans>
+            </span>
+          </div>
+        </div>
+        <p className="out-flag" data-testid="output-restart">
+          <span className="pill pill-idle"><Trans>Restart: Unknown</Trans></span>
+          <span><Trans>The API exposes no per-output restart readback.</Trans></span>
+        </p>
+        <div className="out-flag">
+          <Link className="underline" to="/monitoring">
+            <Trans>Watch program</Trans>
+          </Link>
+          {playbackPath !== undefined ? (
+            <a className="underline" href={playbackPath} target="_blank" rel="noreferrer">
+              <Trans>Open HLS playlist</Trans>
+            </a>
+          ) : null}
+        </div>
+        {playbackCollision ? (
+          <p className="out-flag">
+            <Trans>
+              HLS link unavailable: output IDs resolve to colliding mounts; the
+              runtime mount depends on configuration order.
+            </Trans>
+          </p>
+        ) : null}
+        <p className="out-flag">
+          <Trans>Requires an active output; saved settings do not confirm playback.</Trans>
+        </p>
+        <button
+          type="button"
+          className="plan-tile"
+          aria-disabled="true"
+          data-testid="output-plan-tile"
+          title={t`Output sinks are not routing targets: the routing API accepts video cells, audio tracks and subtitle layers only.`}
+        >
+          <Trans>Plan a source → {output.name}</Trans>
+          <span className="plan-tile-why">
+            <Trans>Unavailable — no output routing target in the API</Trans>
+          </span>
+        </button>
+        <div className="out-actions">
+          <TouchAction
+            variant="outline"
+            aria-label={
+              editRefused
+                ? `${t`Edit output`}: ${output.name} — ${editDisabledReason ?? ''}`
+                : `${t`Edit output`}: ${output.name}`
+            }
+            aria-disabled={editRefused}
+            {...(editRefused ? { title: editDisabledReason } : {})}
+            {...(editRefused ? { className: 'cursor-not-allowed opacity-50' } : {})}
+            onPress={(): void => {
+              if (editRefused) {
+                return;
+              }
+              onEdit(output);
+            }}
+          >
+            <Pencil aria-hidden="true" />
+            <Trans>Edit</Trans>
+          </TouchAction>
+          <TouchAction
+            variant="ghost"
+            aria-label={`${t`Delete output`}: ${output.name}`}
+            onPress={(): void => {
+              onDelete(output);
+            }}
+          >
+            <Trash2 aria-hidden="true" />
+            <Trans>Delete</Trans>
+          </TouchAction>
+        </div>
+      </div>
+    );
+  }
+  return (
+    <div data-testid={`output-card-${output.id}`}>
+      <TaskWorkspace
+      title={
+        <span className="flex min-w-0 flex-wrap items-baseline gap-x-2 break-words">
+          <span lang="" dir="auto" className="font-medium">
+            {output.name}
+          </span>
+          <code className="min-w-0 break-all text-xs text-muted-foreground" lang="" dir="auto">{output.id}</code>
+        </span>
+      }
+      status={
+        <span className="flex min-w-0 flex-wrap items-center gap-x-3 gap-y-1 break-words">
+          <Badge variant="outline">{output.rawKind}</Badge>
+          <span className="min-w-0">
+            <Trans>Destination</Trans>:{' '}
+            {output.target !== undefined ? (
+              <code className="break-all rounded bg-muted px-1 py-0.5 font-mono" lang="" dir="auto">
+                {output.target}
+              </code>
+            ) : (
+              <span>—</span>
+            )}
+          </span>
+          {output.codec !== undefined ? (
+            <span>
+              <Trans>Codec</Trans>: <span className="font-mono">{output.codec}</span>
+            </span>
+          ) : null}
+          {output.editable ? (
+            <span className="flex min-w-0 flex-col gap-1">
+              <RunnabilityNote kind={output.kind} />
+              {hasLiveLink(output.kind) ? <OutputLinkStatus id={output.id} /> : null}
+            </span>
+          ) : (
+            // Runnability is defined for the kinds this build knows; an unknown
+            // kind gets an honest dash, never a claim about the folded kind.
+            <span aria-hidden="true">—</span>
+          )}
+        </span>
+      }
+      details={
+        <div className="grid gap-1 text-xs text-muted-foreground">
+          {playbackCollision ? (
+            <p className="break-words">
+              <Trans>
+                HLS link unavailable: output IDs resolve to colliding mounts; the
+                runtime mount depends on configuration order.
+              </Trans>
+            </p>
+          ) : null}
+          {playbackPath === undefined &&
+          !playbackCollision &&
+          (output.kind === 'hls' || output.kind === 'll-hls') ? (
+            <p className="break-words">
+              <Trans>
+                Output playback unavailable: the configured playlist path is
+                missing.
+              </Trans>
+            </p>
+          ) : null}
+          <p className="break-words">
+            <Trans>
+              Requires an active output; saved settings do not confirm playback.
+            </Trans>
+          </p>
+        </div>
+      }
+      detailsOpen={detailsOpen}
+      onDetailsToggle={onDetailsToggle}
+    >
+      <div className="grid gap-2">
+        <div className="flex flex-wrap items-center gap-3 text-sm">
+          <Link className="underline" to="/monitoring">
+            <Trans>Watch program</Trans>
+          </Link>
+          {playbackPath !== undefined ? (
+            <a className="underline" href={playbackPath} target="_blank" rel="noreferrer">
+              <Trans>Open HLS playlist</Trans>
+            </a>
+          ) : null}
+        </div>
+        <div className="flex flex-wrap items-start gap-2">
+          <TouchAction
+            variant="outline"
+            aria-label={
+              editRefused
+                ? `${t`Edit output`}: ${output.name} — ${editDisabledReason ?? ''}`
+                : `${t`Edit output`}: ${output.name}`
+            }
+            aria-disabled={editRefused}
+            {...(editRefused ? { title: editDisabledReason } : {})}
+            {...(editRefused ? { className: 'cursor-not-allowed opacity-50' } : {})}
+            onPress={(): void => {
+              if (editRefused) {
+                return;
+              }
+              onEdit(output);
+            }}
+          >
+            <Pencil aria-hidden="true" />
+            <Trans>Edit</Trans>
+          </TouchAction>
+          <TouchAction
+            variant="ghost"
+            aria-label={`${t`Delete output`}: ${output.name}`}
+            onPress={(): void => {
+              onDelete(output);
+            }}
+          >
+            <Trash2 aria-hidden="true" />
+            <Trans>Delete</Trans>
+          </TouchAction>
+        </div>
+      </div>
+    </TaskWorkspace>
+    </div>
+  );
+}
+
+const RESOURCE_CONTEXT: ResourceContext = {};
+
+const NO_ERRORS = {};
+
+/** Outputs management (standalone `/outputs` route). */
 export function OutputsPage(): JSX.Element {
+  return <OutputsSurface />;
+}
+
+/**
+ * The Outputs controller + cards. `embedded` renders it as the Routing page's
+ * "Output sinks" block (block heading + New action instead of the page
+ * header); the CRUD dialogs, ETag flows and cards are identical in both.
+ */
+export function OutputsSurface({
+  embedded = false,
+}: {
+  readonly embedded?: boolean;
+}): JSX.Element {
   const { t } = useLingui();
   const outputs = useOutputs();
+  const routing = useAudioRouting();
+  const selectableTracks = routing.data?.state.selectable_tracks;
   const playbackPaths = hlsPlaybackPaths(outputs.data ?? []);
   const playbackCollisions = hlsPlaybackCollisionIds(outputs.data ?? []);
+  const save = useSaveResource('outputs', RESOURCE_CONTEXT);
+  const remove = useDeleteResource('outputs', RESOURCE_CONTEXT);
 
-  const columns = (
-    onEdit: (row: OutputView) => void,
-    onDelete: (row: OutputView) => void,
-  ): ColumnDef<OutputView>[] => [
-    {
-      accessorKey: 'name',
-      header: t`Name`,
-      cell: (ctx): JSX.Element => <NameCell value={ctx.row.original.name} />,
-    },
-    {
-      accessorKey: 'kind',
-      header: t`Transport`,
-      cell: (ctx): JSX.Element => <KindCell value={ctx.row.original.rawKind} />,
-    },
-    {
-      accessorKey: 'target',
-      header: t`Destination`,
-      cell: (ctx): JSX.Element => (
-        <code className="text-xs text-muted-foreground" lang="" dir="auto">
-          {ctx.row.original.target ?? '—'}
-        </code>
-      ),
-    },
-    {
-      accessorKey: 'codec',
-      header: t`Codec`,
-      cell: (ctx): JSX.Element => (
-        <span className="text-sm text-muted-foreground">
-          {ctx.row.original.codec ?? '—'}
-        </span>
-      ),
-    },
-    {
-      id: 'runnability',
-      header: t`Status`,
-      cell: (ctx): JSX.Element =>
-        // Runnability is defined for the kinds this build knows; an unknown
-        // kind gets an honest dash, never a claim about the folded kind.
-        ctx.row.original.editable ? (
-          <RunnabilityNote kind={ctx.row.original.kind} />
-        ) : (
-          <span className="text-sm text-muted-foreground" aria-hidden="true">
-            —
-          </span>
-        ),
-    },
-    {
-      id: 'playback',
-      header: t`Playback`,
-      cell: (ctx): JSX.Element => {
-        const path = playbackPaths.get(ctx.row.original.id);
-        return <div className="flex flex-col gap-1 text-sm">
-          <Link className="underline" to="/monitoring"><Trans>Watch program</Trans></Link>
-          {path !== undefined ? <a className="underline" href={path} target="_blank" rel="noreferrer"><Trans>Open HLS playlist</Trans></a> : null}
-          {playbackCollisions.has(ctx.row.original.id) ? <span className="text-xs text-muted-foreground"><Trans>HLS link unavailable: output IDs resolve to colliding mounts; the runtime mount depends on configuration order.</Trans></span> : null}
-          {path === undefined && !playbackCollisions.has(ctx.row.original.id) && (ctx.row.original.kind === 'hls' || ctx.row.original.kind === 'll-hls') ? <span className="text-xs text-muted-foreground"><Trans>Output playback unavailable: the configured playlist path is missing.</Trans></span> : null}
-          <span className="text-xs text-muted-foreground"><Trans>Requires an active output; saved settings do not confirm playback.</Trans></span>
-        </div>;
-      },
-    },
-    {
-      id: 'actions',
-      header: t`Actions`,
-      cell: (ctx): JSX.Element => (
-        <RowActions
-          row={ctx.row.original}
-          name={ctx.row.original.name}
-          editLabel={t`Edit output`}
-          deleteLabel={t`Delete output`}
-          editDisabledReason={
-            ctx.row.original.editable
-              ? undefined
-              : t`kind "${ctx.row.original.rawKind}" isn't editable in this UI; the document is preserved as authored`
-          }
-          onEdit={onEdit}
-          onDelete={onDelete}
-        />
-      ),
-    },
-  ];
+  const [form, setForm] = useState<OutputFormState | null>(null);
+  const [creating, setCreating] = useState(true);
+  const [pendingDelete, setPendingDelete] = useState<OutputView | null>(null);
+  const [errors, setErrors] = useState<FieldErrors<OutputField>>(NO_ERRORS);
+  // Each card's Details disclosure is caller-owned state (the TaskWorkspace
+  // controlled-disclosure contract).
+  const [detailsOpen, setDetailsOpen] = useState<Record<string, boolean>>({});
 
-  return (
-    <CrudPage<OutputView, OutputFormState, OutputField>
-      kind="outputs"
-      title={<Trans>Outputs</Trans>}
-      description={
-        <span className="inline-flex flex-wrap items-center gap-x-3 gap-y-1">
-          <Trans>Configure output servers and renditions.</Trans>
-          <HelpLink
-            to="/help/concepts/latency#protocol-latency"
-            label={t`Latency & protocol guide`}
-          />
-        </span>
-      }
-      newLabel={t`New output`}
-      dialogCreateTitle={t`New output`}
-      dialogEditTitle={t`Edit output`}
-      dialogDescription={t`An output is a sink/server that publishes the program.`}
-      caption={t`Configured output sinks.`}
-      emptyMessage={<Trans>No outputs configured.</Trans>}
-      loadingMessage={<Trans>Loading outputs…</Trans>}
-      errorPrefix={<Trans>Could not load outputs:</Trans>}
-      headerExtras={<ExportConfigButton compact />}
-      callout={
-        <ApplySemanticsCallout
-          helpTo="/help/config#outputs"
-          helpLabel={t`How configuration applies`}
-        />
-      }
-      savedDescription={t`Stored. It goes live via config export + restart; the running engine is unchanged until then.`}
-      deletedDescription={t`Removed from the store. The running engine is unchanged until a config export + restart.`}
-      list={outputs.data ?? []}
-      isPending={outputs.isPending}
-      isError={outputs.isError}
-      errorMessage={outputs.error?.message}
-      columns={columns}
-      rowId={(row): string => row.id}
-      rowName={(row): string => row.name}
-      emptyForm={emptyOutputForm}
-      formFromRecord={outputFormFromRecord}
-      validate={validateOutputForm}
-      toSaveVars={(form, creating): SaveResourceVars => ({
+  const openCreate = (): void => {
+    setCreating(true);
+    setErrors(NO_ERRORS);
+    setForm(emptyOutputForm());
+  };
+
+  const openEdit = (row: OutputView): void => {
+    setCreating(false);
+    setErrors(NO_ERRORS);
+    void getResource('outputs', row.id, RESOURCE_CONTEXT)
+      .then((result): void => {
+        const parsed = outputFormFromRecord(result.record);
+        if (parsed === undefined) {
+          // Defensive backstop: the card's Edit is already refused for an
+          // unknown kind; never open a form that would rewrite the document.
+          toast({
+            title: t`Not editable in this UI`,
+            description: t`This entry's kind has no form here; the stored document is preserved as authored.`,
+          });
+          return;
+        }
+        setForm(parsed);
+      })
+      .catch((error: unknown): void => {
+        toast({
+          title: t`Could not load for editing`,
+          description: error instanceof Error ? error.message : String(error),
+          variant: 'destructive',
+        });
+      });
+  };
+
+  const closeForm = (): void => {
+    setForm(null);
+    setErrors(NO_ERRORS);
+  };
+
+  const submitForm = (): void => {
+    if (form === null) {
+      return;
+    }
+    const found = validateOutputForm(form, creating);
+    setErrors(found);
+    if (Object.keys(found).length > 0) {
+      return;
+    }
+    save.mutate(
+      {
         id: creating ? form.id.trim() : form.id,
         create: creating,
         input: { name: form.name.trim(), body: outputFormToBody(form) },
-      })}
-      renderFields={(form, setForm, creating, errors): JSX.Element => (
-        <>
-          {creating ? (
-            // Device decode targets (ADR-M009 facet (b)): picking one binds
-            // the new output to the device via device_ref.
-            <OutputFromDeviceSection form={form} setForm={setForm} />
-          ) : null}
-          <FormField
-            id="output-id"
-            label={t`Identifier`}
-            value={form.id}
-            disabled={!creating}
-            required={creating}
-            placeholder={t`e.g. program-hls`}
-            error={errors.id}
-            onChange={(next): void => {
-              setForm({ ...form, id: next });
-            }}
-          />
-          <FormField
-            id="output-name"
-            label={t`Name`}
-            value={form.name}
-            required
-            error={errors.name}
-            onChange={(next): void => {
-              setForm({ ...form, name: next });
-            }}
-          />
-          <SelectField<OutputKind>
-            label={t`Transport`}
-            value={form.kind}
-            options={OUTPUT_KINDS}
-            onChange={(next): void => {
-              setForm({ ...form, kind: next });
-            }}
-          />
-          <RunnabilityNote kind={form.kind} />
-          <OutputKindFields form={form} setForm={setForm} errors={errors} />
-          <CodecFields form={form} setForm={setForm} errors={errors} />
-          <OutputAdvancedFields form={form} setForm={setForm} errors={errors} />
-        </>
+      },
+      {
+        onSuccess: (): void => {
+          toast({
+            title: creating ? t`Created` : t`Saved`,
+            description: t`Stored. It goes live via config export + restart; the running engine is unchanged until then.`,
+          });
+          closeForm();
+        },
+        onError: (error): void => {
+          toast({
+            title: creating ? t`Could not create` : t`Could not save`,
+            description: error.message,
+            variant: 'destructive',
+          });
+        },
+      },
+    );
+  };
+
+  const confirmDelete = (): void => {
+    const target = pendingDelete;
+    if (target === null) {
+      return;
+    }
+    remove.mutate(target.id, {
+      onSuccess: (): void => {
+        toast({
+          title: t`Deleted`,
+          description: t`Removed from the store. The running engine is unchanged until a config export + restart.`,
+        });
+      },
+      onError: (error): void => {
+        toast({
+          title: t`Could not delete`,
+          description: error.message,
+          variant: 'destructive',
+        });
+      },
+    });
+    setPendingDelete(null);
+  };
+
+  const hasErrors = Object.keys(errors).length > 0;
+
+  return (
+    <>
+      {embedded ? (
+        <div className="block-head" data-testid="output-sinks-head">
+          <h2>
+            <Trans>Output sinks</Trans>
+          </h2>
+          <div data-testid="output-header-actions" className="flex min-w-0 max-w-full flex-wrap items-center gap-2">
+            <ExportConfigButton compact />
+            <Button data-testid="crud-new" className="h-auto min-h-12 min-w-12 max-w-full whitespace-normal break-words py-2" onClick={openCreate}>
+              <Plus aria-hidden="true" />
+              <Trans>New output</Trans>
+            </Button>
+          </div>
+        </div>
+      ) : (
+      <div
+        data-testid="output-page-header"
+        className="min-w-0 max-w-full [&>div>div]:min-w-0 [&>div>div]:max-w-full"
+      >
+      <PageHeader
+        title={<Trans>Outputs</Trans>}
+        description={
+          <span className="inline-flex flex-wrap items-center gap-x-3 gap-y-1">
+            <Trans>Configure output servers and renditions.</Trans>
+            <HelpLink
+              to="/help/concepts/latency#protocol-latency"
+              label={t`Latency & protocol guide`}
+            />
+          </span>
+        }
+        actions={
+          <div data-testid="output-header-actions" className="flex min-w-0 max-w-full flex-wrap items-center gap-2">
+            <ExportConfigButton compact />
+            <Button data-testid="crud-new" className="h-auto min-h-12 min-w-12 max-w-full whitespace-normal break-words py-2" onClick={openCreate}>
+              <Plus aria-hidden="true" />
+              <Trans>New output</Trans>
+            </Button>
+          </div>
+        }
+      />
+      </div>
       )}
-    />
+
+      <ApplySemanticsCallout
+        helpTo="/help/config#outputs"
+        helpLabel={t`How configuration applies`}
+      />
+
+      {outputs.isPending ? (
+        <p role="status" aria-live="polite" className="text-sm text-muted-foreground">
+          <Trans>Loading outputs…</Trans>
+        </p>
+      ) : outputs.isError ? (
+        <p role="alert" className="text-sm text-destructive">
+          <Trans>Could not load outputs:</Trans> {outputs.error.message}
+        </p>
+      ) : outputs.data.length === 0 ? (
+        <p className="text-sm text-muted-foreground">
+          <Trans>No outputs configured.</Trans>
+        </p>
+      ) : (
+        <div>
+          <p className="mb-3 text-xs text-muted-foreground">{t`Configured output sinks.`}</p>
+          <div className={embedded ? 'out-cards' : 'grid gap-4'}>
+            {outputs.data.map((output) => (
+              <OutputCard
+                key={output.id}
+                embedded={embedded}
+                output={output}
+                playbackPath={playbackPaths.get(output.id)}
+                playbackCollision={playbackCollisions.has(output.id)}
+                detailsOpen={detailsOpen[output.id] === true}
+                onDetailsToggle={(open: boolean): void => {
+                  setDetailsOpen((prev) => ({ ...prev, [output.id]: open }));
+                }}
+                onEdit={openEdit}
+                onDelete={(row: OutputView): void => {
+                  setPendingDelete(row);
+                }}
+              />
+            ))}
+          </div>
+        </div>
+      )}
+
+      <Dialog
+        open={form !== null}
+        onOpenChange={(open): void => {
+          if (!open) {
+            closeForm();
+          }
+        }}
+      >
+        <DialogContent touchScroll>
+          <DialogHeader>
+            <DialogTitle>
+              {creating ? <Trans>New output</Trans> : <Trans>Edit output</Trans>}
+            </DialogTitle>
+            <DialogDescription>
+              <Trans>An output is a sink/server that publishes the program.</Trans>
+            </DialogDescription>
+          </DialogHeader>
+          {form !== null ? (
+            <form
+              className="flex flex-col gap-4"
+              noValidate
+              onSubmit={(event): void => {
+                event.preventDefault();
+                submitForm();
+              }}
+            >
+              <div className="flex min-w-0 flex-col gap-4">
+                {creating ? (
+                  // Device decode targets (ADR-M009 facet (b)): picking one binds
+                  // the new output to the device via device_ref.
+                  <OutputFromDeviceSection form={form} setForm={setForm} />
+                ) : null}
+                <FormField
+                  id="output-id"
+                  label={t`Identifier`}
+                  value={form.id}
+                  disabled={!creating}
+                  required={creating}
+                  placeholder={t`e.g. program-hls`}
+                  error={errors.id}
+                  onChange={(next): void => {
+                    setForm({ ...form, id: next });
+                  }}
+                />
+                <FormField
+                  id="output-name"
+                  label={t`Name`}
+                  value={form.name}
+                  required
+                  error={errors.name}
+                  onChange={(next): void => {
+                    setForm({ ...form, name: next });
+                  }}
+                />
+                <SelectField<OutputKind>
+                  label={t`Transport`}
+                  value={form.kind}
+                  options={OUTPUT_KINDS}
+                  onChange={(next): void => {
+                    setForm({ ...form, kind: next });
+                  }}
+                />
+                <RunnabilityNote kind={form.kind} />
+                <OutputKindFields form={form} setForm={setForm} errors={errors} />
+                <CodecFields form={form} setForm={setForm} errors={errors} />
+                <OutputAdvancedFields
+                  form={form}
+                  setForm={setForm}
+                  errors={errors}
+                  selectableTracks={selectableTracks}
+                />
+                {!creating ? <PlaybackUrlsSection outputId={form.id} /> : null}
+              </div>
+              {hasErrors ? (
+                <p role="alert" className="text-sm text-destructive">
+                  <Trans>Fix the highlighted fields, then save again.</Trans>
+                </p>
+              ) : null}
+              <DialogFooter>
+                <TouchAction variant="outline" onPress={closeForm}>
+                  <Trans>Cancel</Trans>
+                </TouchAction>
+                <Button
+                  type="submit"
+                  className="h-12 min-w-12"
+                  disabled={save.isPending}
+                >
+                  {creating ? <Trans>Create</Trans> : <Trans>Save</Trans>}
+                </Button>
+              </DialogFooter>
+            </form>
+          ) : null}
+        </DialogContent>
+      </Dialog>
+
+      <Dialog
+        open={pendingDelete !== null}
+        onOpenChange={(open): void => {
+          if (!open) {
+            setPendingDelete(null);
+          }
+        }}
+      >
+        <DialogContent touchScroll>
+          <DialogHeader>
+            <DialogTitle>
+              <Trans>Delete this resource?</Trans>
+            </DialogTitle>
+            <DialogDescription>
+              <Trans>
+                This permanently removes the stored resource. The running
+                engine is not affected until a new configuration is applied.
+              </Trans>
+            </DialogDescription>
+          </DialogHeader>
+          {pendingDelete !== null ? (
+            <p className="text-sm">
+              <span lang="" dir="auto" className="font-medium">
+                {pendingDelete.name}
+              </span>
+            </p>
+          ) : null}
+          <DialogFooter>
+            <TouchAction
+              variant="outline"
+              onPress={(): void => {
+                setPendingDelete(null);
+              }}
+            >
+              <Trans>Cancel</Trans>
+            </TouchAction>
+            <Button
+              variant="destructive"
+              className="h-12 min-w-12"
+              disabled={remove.isPending}
+              onClick={confirmDelete}
+            >
+              <Trans>Delete</Trans>
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+    </>
   );
 }

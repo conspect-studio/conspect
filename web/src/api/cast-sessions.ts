@@ -16,6 +16,7 @@
 import {
   apiUrl,
   buildHeaders,
+  sendCommand,
   OperationApiError,
   readProblem,
 } from './operations';
@@ -166,11 +167,7 @@ export async function setCastVolume(
   request: CastVolumeRequest,
   options: RequestOptions = {},
 ): Promise<AcceptedBody> {
-  const response = await fetch(apiUrl(options, `${itemPath(id)}/volume`), {
-    method: 'POST',
-    headers: buildHeaders(options, true),
-    body: JSON.stringify(request),
-  });
+  const response = await sendCommand(`${itemPath(id)}/volume`, options, { body: request });
   if (!response.ok) {
     throw await readProblem(response);
   }

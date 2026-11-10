@@ -25,6 +25,10 @@ import { ConnectionStatus } from '../components/ConnectionStatus';
 import { HelpLink } from '../components/HelpLink';
 import { PageHeader } from '../components/PageHeader';
 import { TileStateBadge } from '../components/TileStateBadge';
+import { SourceDemandBadge } from '../components/SourceDemandBadge';
+import { SourceStartingNotice } from '../preview/SourceStartingNotice';
+import { useSourceStatus } from '../api/sourceStatus';
+import type { SourceDemand } from '../api/sourceStatus';
 import { Button } from '../components/ui/button';
 import { Card, CardContent } from '../components/ui/card';
 import {
@@ -34,9 +38,12 @@ import {
   DialogTitle,
 } from '../components/ui/dialog';
 import { PreviewSurface } from '../preview/PreviewSurface';
+import { SourceEventsButton } from '../events/SourceEventsButton';
 import { programFidelity, usePreviewCapabilities } from '../preview/capabilities';
 import type { ProgramFidelity } from '../preview/capabilities';
 import { useJpegPreview } from '../preview/useJpegPreview';
+import { PlaybackUrlRow } from '../resources/FormControls';
+import { useOutputPlayback } from '../resources/outputPlayback';
 import { useOutputs } from '../resources/queries';
 import { useLiveTiles } from '../resources/useLiveTiles';
 import { useEngineEvents } from '../realtime/useEngineEvents';
@@ -90,6 +97,33 @@ function ProgramStillPreview({ label }: { readonly label: string }): JSX.Element
   return <PreviewImage src={src} alt={label} className="aspect-video w-full bg-black object-contain" />;
 }
 
+/**
+ * The viewer playback URL(s) for the output currently selected as the
+ * program "Playback transport" (ADR-0101 — "a link to copy the actual URL to
+ * paste into a tool like VLC"). Renders nothing while no output is selected
+ * (the default WebRTC/still preview has no VLC-pasteable URL).
+ */
+function ProgramPlaybackUrls({ outputId }: { readonly outputId: string }): JSX.Element | null {
+  const playback = useOutputPlayback(outputId === '' ? undefined : outputId);
+  if (outputId === '' || playback.data === undefined || playback.data.length === 0) {
+    return null;
+  }
+  return (
+    <div className="flex flex-col gap-2">
+      {playback.data.map((entry, index) => (
+        <PlaybackUrlRow
+          key={`${entry.label}-${String(index)}`}
+          idPrefix={`monitoring-program-playback-${outputId}-${String(index)}`}
+          label={entry.label}
+          url={entry.url ?? undefined}
+          vlcCommand={entry.vlc_command ?? undefined}
+          notes={entry.notes ?? []}
+        />
+      ))}
+    </div>
+  );
+}
+
 /** The honest program fidelity label (ADR-P006), shown when WHEP is live. */
 function FidelityLabel({ fidelity }: { readonly fidelity: ProgramFidelity }): JSX.Element {
   switch (fidelity) {
@@ -115,6 +149,7 @@ export function MonitoringPage(): JSX.Element {
   const capabilities = usePreviewCapabilities();
   const inputIds = usePreviewInputIds();
   const tiles = useLiveTiles();
+  const demand = useSourceStatus();
   const outputs = useOutputs();
   const fidelity = programFidelity(capabilities.data);
   const playbackPaths = hlsPlaybackPaths(outputs.data ?? []);
@@ -190,6 +225,7 @@ export function MonitoringPage(): JSX.Element {
                 {(outputs.data ?? []).filter((output) => playbackPaths.has(output.id)).map((output) => <option key={output.id} value={output.id}>{t`HLS video (buffered)`}: {output.name}</option>)}
               </select>
             </label> : null}
+            <ProgramPlaybackUrls outputId={hlsOutput} />
             <div className="flex flex-wrap gap-3 text-sm underline"><Link to="/layouts"><Trans>Manage layouts</Trans></Link><Link to="/sources"><Trans>Manage sources</Trans></Link><Link to="/outputs"><Trans>Manage outputs</Trans></Link></div>
           </CardContent>
         </Card>
@@ -215,6 +251,8 @@ export function MonitoringPage(): JSX.Element {
                 key={id}
                 id={id}
                 tile={tiles.get(id)}
+                demand={demand.data?.get(id)}
+                demandKnown={demand.data !== undefined}
                 capabilities={capabilities.data}
                 open={focusedInput === id}
                 focusReady={readyInput === id}
@@ -260,6 +298,8 @@ export function MonitoringPage(): JSX.Element {
 function InputThumbnail(props: {
   readonly id: string;
   readonly tile: LiveTile | undefined;
+  readonly demand: SourceDemand | undefined;
+  readonly demandKnown: boolean;
   readonly capabilities: ReturnType<typeof usePreviewCapabilities>['data'];
   readonly open: boolean;
   readonly focusReady: boolean;
@@ -268,16 +308,35 @@ function InputThumbnail(props: {
   readonly onOpenChange: (open: boolean) => void;
 }): JSX.Element {
   const { t } = useLingui();
-  const src = useJpegPreview(`/api/v1/preview/inputs/${encodeURIComponent(props.id)}.jpg`, 1000, !props.open);
+  // A thumbnail is a viewer, not a consumer: it polls only while something
+  // else already runs the source, so opening Monitoring never starts 500
+  // sources. Opening the preview dialog is the explicit consumer.
+  const running =
+    !props.demandKnown ||
+    (props.demand !== undefined && props.demand.video_running && props.demand.consumers.length > 0);
+  const src = useJpegPreview(
+    `/api/v1/preview/inputs/${encodeURIComponent(props.id)}.jpg`,
+    1000,
+    !props.open && running,
+  );
   return (
     <li>
       <Card className="overflow-hidden">
         <div className="relative">
-          <PreviewImage
-            src={src}
-            alt={t`Preview of input ${props.id}`}
-            className="aspect-video w-full bg-black object-contain"
-          />
+          {running ? (
+            <PreviewImage
+              src={src}
+              alt={t`Preview of input ${props.id}`}
+              className="aspect-video w-full bg-black object-contain"
+            />
+          ) : (
+            <div
+              className="flex aspect-video w-full items-center justify-center bg-muted p-2 text-center text-xs text-muted-foreground"
+              data-testid="input-idle"
+            >
+              <Trans>Idle: not running because nothing consumes it. Open the preview to start it.</Trans>
+            </div>
+          )}
           <Button
             type="button"
             variant="secondary"
@@ -295,7 +354,11 @@ function InputThumbnail(props: {
           <code className="truncate text-xs" lang="" dir="auto">
             {props.id}
           </code>
-          {props.tile !== undefined ? <TileStateBadge state={props.tile.state} /> : null}
+          <div className="flex items-center gap-2">
+            {props.demandKnown ? <SourceDemandBadge demand={props.demand} /> : null}
+            {props.tile !== undefined && running ? <TileStateBadge state={props.tile.state} /> : null}
+            <SourceEventsButton id={props.id} name={props.id} />
+          </div>
         </CardContent>
       </Card>
 
@@ -306,6 +369,7 @@ function InputThumbnail(props: {
               <Trans>Preview — input {props.id}</Trans>
             </DialogTitle>
           </DialogHeader>
+          {props.open ? <SourceStartingNotice id={props.id} /> : null}
           {props.open && props.focusReady ? (
             <PreviewSurface
               scope="input"

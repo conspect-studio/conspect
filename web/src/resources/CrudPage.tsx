@@ -122,6 +122,8 @@ export interface CrudPageProps<View, Form, Field extends string> {
   readonly dialogEditTitle: string;
   readonly dialogDescription: string;
   readonly caption: string;
+  /** Opt-in control sizing for portalled resource dialogs; default pages are unchanged. */
+  readonly dialogClassName?: string;
   readonly emptyMessage: JSX.Element;
   readonly list: readonly View[];
   readonly isPending: boolean;
@@ -140,6 +142,12 @@ export interface CrudPageProps<View, Form, Field extends string> {
     onEdit: (row: View) => void,
     onDelete: (row: View) => void,
   ) => ColumnDef<View>[];
+  /** Optional list presentation; scaffold retains loading, error and empty states. */
+  readonly renderItems?: (
+    rows: readonly View[],
+    onEdit: (row: View) => void,
+    onDelete: (row: View) => void,
+  ) => ReactNode;
   /** A fresh, empty form for a create. */
   readonly emptyForm: () => Form;
   /**
@@ -324,6 +332,8 @@ export function CrudPage<View, Form, Field extends string>(
         <p role="alert" className="text-sm text-destructive">
           {props.errorPrefix} {props.errorMessage ?? ''}
         </p>
+      ) : props.renderItems !== undefined && props.list.length > 0 ? (
+        props.renderItems(props.list, openEdit, setPendingDelete)
       ) : (
         <ResourceTable
           rows={props.list}
@@ -341,7 +351,7 @@ export function CrudPage<View, Form, Field extends string>(
           }
         }}
       >
-        <DialogContent>
+        <DialogContent className={props.dialogClassName}>
           <DialogHeader>
             <DialogTitle>
               {creating ? props.dialogCreateTitle : props.dialogEditTitle}
@@ -386,7 +396,7 @@ export function CrudPage<View, Form, Field extends string>(
           }
         }}
       >
-        <DialogContent>
+        <DialogContent className={props.dialogClassName}>
           <DialogHeader>
             <DialogTitle>
               <Trans>Delete this resource?</Trans>

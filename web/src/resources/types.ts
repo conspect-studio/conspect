@@ -115,6 +115,14 @@ export interface SourceView {
    * alias), which carry no locator.
    */
   readonly locator: string | undefined;
+  /**
+   * Effective source-event observation status (ADR-0183), computed the SAME
+   * way the engine gates it: `'observing'` for an `hls`/`youtube` source whose
+   * `events.observe` is absent (default on) or explicitly `true`;
+   * `'disabled'` for an `hls`/`youtube` source with `events.observe: false`;
+   * `'not_supported'` for every other kind (there is no cue surface to watch).
+   */
+  readonly eventObservation: 'observing' | 'disabled' | 'not_supported';
 }
 
 /**

@@ -17,6 +17,7 @@
 import {
   apiUrl,
   buildHeaders,
+  sendCommand,
   OperationApiError,
   readProblem,
 } from './operations';
@@ -163,11 +164,7 @@ async function submitOverride(
   payload: Record<string, unknown>,
   options: RequestOptions,
 ): Promise<AcceptedBody> {
-  const response = await fetch(apiUrl(options, '/api/v1/tally/override'), {
-    method,
-    headers: buildHeaders(options, true),
-    body: JSON.stringify(payload),
-  });
+  const response = await sendCommand('/api/v1/tally/override', options, { method, body: payload });
   if (!response.ok) {
     throw await readProblem(response);
   }

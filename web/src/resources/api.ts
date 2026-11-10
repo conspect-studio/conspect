@@ -10,6 +10,7 @@
 // write ops — the calls go through `fetch` with EXPLICITLY-TYPED request/response
 // shapes and typed field guards. The opaque `body` is read with `stringField`/
 // `numberField`, never an `as`-cast of an untyped value.
+import type { components } from '../api/schema';
 import { getStoredToken } from '../api/token';
 import {
   parseOutputFormKind,
@@ -174,6 +175,72 @@ export async function getResource(
   }
   const etag = response.headers.get('ETag');
   return { record: body, etag: etag ?? undefined };
+}
+
+/** Live link state of a push output (`GET /api/v1/outputs/{id}/link`). */
+export type OutputLink = components['schemas']['OutputLinkDoc'];
+
+/**
+ * The additive drop/discard reason counters (issue #202) are part of the
+ * release that introduced them, so a browser running this bundle can meet a
+ * server that predates them and sends none of them. The generated schema types
+ * them required because the *current* server always emits them, and
+ * {@link isOutputLink} deliberately does not demand them for that reason; this
+ * alias is the web-facing read type, so consumers test for their presence
+ * instead of treating an older body's absence as impossible.
+ */
+export type LinkReasonCounter =
+  | 'discarded_no_client'
+  | 'discarded_awaiting_keyframe'
+  | 'dropped_slow_peer'
+  | 'dropped_upstream';
+
+/** {@link OutputLink} as this bundle must read it: reason counters optional. */
+export type OutputLinkWithReasons = Omit<OutputLink, LinkReasonCounter> &
+  Partial<Pick<OutputLink, LinkReasonCounter>>;
+
+/**
+ * Validate the fields the UI cannot render without; the reason counters are
+ * read through {@link OutputLinkWithReasons} and may be absent (older server).
+ */
+function isOutputLink(value: unknown): value is OutputLinkWithReasons {
+  return (
+    typeof value === 'object' &&
+    value !== null &&
+    'state' in value &&
+    typeof value.state === 'string' &&
+    'clients' in value &&
+    typeof value.clients === 'number' &&
+    'dropped' in value &&
+    typeof value.dropped === 'number' &&
+    'peers' in value &&
+    Array.isArray(value.peers)
+  );
+}
+
+/**
+ * Fetch a push output's live link state, or `null` when it has none (`404`:
+ * the program is not running, so there is no link to report).
+ */
+export async function getOutputLink(
+  id: string,
+  options: ResourceRequestOptions = {},
+): Promise<OutputLinkWithReasons | null> {
+  const response = await fetch(`${itemUrl('outputs', id, options)}/link`, {
+    method: 'GET',
+    headers: headersFor(options, false),
+  });
+  if (response.status === 404) {
+    return null;
+  }
+  if (!response.ok) {
+    throw await readProblem(response);
+  }
+  const body: unknown = await response.json();
+  if (!isOutputLink(body)) {
+    throw new ResourceApiError('The server returned an unexpected link body.');
+  }
+  return body;
 }
 
 /**
@@ -351,7 +418,27 @@ export function toSourceView(record: ResourceRecord): SourceView {
     rawKind: raw ?? kind,
     editable: parseSourceFormKind(raw) !== undefined,
     locator,
+    eventObservation: eventObservationFor(kind, record.body),
   };
+}
+
+/**
+ * Compute the effective source-event observation status (ADR-0183) THE SAME
+ * WAY the engine gates it (`source_events_enabled` in
+ * `multiview-cli/src/pipeline.rs`): only `hls`/`youtube` ever observe, and for
+ * those the `events.observe` boolean defaults `true` when the `events` table
+ * is absent or present without the key.
+ */
+function eventObservationFor(
+  kind: SourceKind,
+  body: Record<string, unknown>,
+): SourceView['eventObservation'] {
+  if (kind !== 'hls' && kind !== 'youtube') return 'not_supported';
+  const events = body.events;
+  if (events !== null && typeof events === 'object' && 'observe' in events && events.observe === false) {
+    return 'disabled';
+  }
+  return 'observing';
 }
 
 /** Project an output record's opaque body into the {@link OutputView}. */
