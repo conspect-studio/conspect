@@ -134,7 +134,7 @@ msgid "{0} completed; saved reference remains attached."
 msgstr "{0} completed; saved reference remains attached."
 
 #. placeholder {0}: formatDb(draftDb)
-#: src/pages/AudioPage.tsx:351
+#: src/pages/AudioPage.tsx:366
 msgid "{0} dB"
 msgstr "{0} dB"
 
@@ -205,28 +205,28 @@ msgstr "{hours} h ago"
 msgid "{label} copied to the clipboard."
 msgstr "{label} copied to the clipboard."
 
-#: src/pages/AudioPage.tsx:382
+#: src/pages/AudioPage.tsx:397
 msgid "{label} gain +{delta} dB"
 msgstr "{label} gain +{delta} dB"
 
 #. placeholder {0}: Math.abs(delta)
-#: src/pages/AudioPage.tsx:383
+#: src/pages/AudioPage.tsx:398
 msgid "{label} gain −{0} dB"
 msgstr "{label} gain −{0} dB"
 
-#: src/pages/AudioPage.tsx:345
+#: src/pages/AudioPage.tsx:360
 msgid "{label} gain fader (0 dB at the top, −60 dB at the bottom)"
 msgstr "{label} gain fader (0 dB at the top, −60 dB at the bottom)"
 
-#: src/pages/AudioPage.tsx:470
+#: src/pages/AudioPage.tsx:485
 msgid "{label} LISTEN — unavailable: no monitor path"
 msgstr "{label} LISTEN — unavailable: no monitor path"
 
-#: src/pages/AudioPage.tsx:443
+#: src/pages/AudioPage.tsx:458
 msgid "{label} MUTE"
 msgstr "{label} MUTE"
 
-#: src/pages/AudioPage.tsx:456
+#: src/pages/AudioPage.tsx:471
 msgid "{label} PGM (include in the program mix)"
 msgstr "{label} PGM (include in the program mix)"
 
@@ -755,8 +755,8 @@ msgstr "About managed devices"
 msgid "About output transports"
 msgstr "About output transports"
 
-#: src/pages/AudioPage.tsx:1144
-#: src/pages/AudioPage.tsx:1510
+#: src/pages/AudioPage.tsx:1159
+#: src/pages/AudioPage.tsx:1525
 msgid "About outputs and audio"
 msgstr "About outputs and audio"
 
@@ -981,7 +981,7 @@ msgstr "Add location"
 msgid "Add member"
 msgstr "Add member"
 
-#: src/pages/AudioPage.tsx:1434
+#: src/pages/AudioPage.tsx:1449
 msgid "Add route"
 msgstr "Add route"
 
@@ -1558,7 +1558,7 @@ msgstr "Audio mixer"
 msgid "audio route"
 msgstr "audio route"
 
-#: src/pages/AudioPage.tsx:1455
+#: src/pages/AudioPage.tsx:1470
 msgid "Audio routing changed on the server. Your draft is preserved; review the latest version before saving again."
 msgstr "Audio routing changed on the server. Your draft is preserved; review the latest version before saving again."
 
@@ -1932,7 +1932,7 @@ msgstr "Build feature compiled"
 msgid "Bus"
 msgstr "Bus"
 
-#: src/pages/AudioPage.tsx:1535
+#: src/pages/AudioPage.tsx:1550
 msgid "Bus setup"
 msgstr "Bus setup"
 
@@ -1948,7 +1948,7 @@ msgstr "Cadence not probed"
 msgid "cadence unknown"
 msgstr "cadence unknown"
 
-#: src/pages/AudioPage.tsx:609
+#: src/pages/AudioPage.tsx:624
 msgid "Camera 1"
 msgstr "Camera 1"
 
@@ -2250,23 +2250,23 @@ msgstr "Channel"
 msgid "Channel closed"
 msgstr "Channel closed"
 
-#: src/pages/AudioPage.tsx:529
+#: src/pages/AudioPage.tsx:544
 msgid "Channel details"
 msgstr "Channel details"
 
-#: src/pages/AudioPage.tsx:1248
+#: src/pages/AudioPage.tsx:1263
 msgid "Channel picker — tap a channel to ride its strip"
 msgstr "Channel picker — tap a channel to ride its strip"
 
-#: src/pages/AudioPage.tsx:1337
+#: src/pages/AudioPage.tsx:1352
 msgid "Channel strip"
 msgstr "Channel strip"
 
-#: src/pages/AudioPage.tsx:299
+#: src/pages/AudioPage.tsx:314
 msgid "Channel strip — {label}"
 msgstr "Channel strip — {label}"
 
-#: src/pages/AudioPage.tsx:562
+#: src/pages/AudioPage.tsx:577
 msgid "Channels (route {row})"
 msgstr "Channels (route {row})"
 
@@ -2294,7 +2294,7 @@ msgstr "Choose a data source…"
 msgid "Choose a source"
 msgstr "Choose a source"
 
-#: src/pages/AudioPage.tsx:540
+#: src/pages/AudioPage.tsx:555
 msgid "Choose an input"
 msgstr "Choose an input"
 
@@ -2416,7 +2416,7 @@ msgid "Cleared only"
 msgstr "Cleared only"
 
 #: src/components/broadcast/library/Chips.tsx:138
-#: src/pages/AudioPage.tsx:184
+#: src/pages/AudioPage.tsx:195
 #: src/pages/ProgramMeters.tsx:85
 msgid "Clip"
 msgstr "Clip"
@@ -3032,7 +3032,7 @@ msgstr "Could not load sync groups:"
 msgid "Could not load tally state:"
 msgstr "Could not load tally state:"
 
-#: src/pages/AudioPage.tsx:1151
+#: src/pages/AudioPage.tsx:1166
 msgid "Could not load the audio routing:"
 msgstr "Could not load the audio routing:"
 
@@ -3138,7 +3138,7 @@ msgstr "Could not save location"
 msgid "Could not save salvo"
 msgstr "Could not save salvo"
 
-#: src/pages/AudioPage.tsx:1499
+#: src/pages/AudioPage.tsx:1514
 msgid "Could not save the audio routing:"
 msgstr "Could not save the audio routing:"
 
@@ -3862,7 +3862,7 @@ msgstr "Discovery results are an untrusted inventory of mDNS hints — they are 
 msgid "Discovery scans are untrusted hints; adoption is always an explicit operator confirmation."
 msgstr "Discovery scans are untrusted hints; adoption is always an explicit operator confirmation."
 
-#: src/pages/AudioPage.tsx:588
+#: src/pages/AudioPage.tsx:603
 msgid "Discrete track name (route {row})"
 msgstr "Discrete track name (route {row})"
 
@@ -3944,31 +3944,31 @@ msgstr "Download the current stores (sources, outputs, overlays, layouts, canvas
 msgid "Downloads a salted challenge as a CBOR file. It carries no raw identifiers — only salted digests the licence server can verify."
 msgstr "Downloads a salted challenge as a CBOR file. It carries no raw identifiers — only salted digests the licence server can verify."
 
-#: src/pages/AudioPage.tsx:424
+#: src/pages/AudioPage.tsx:439
 msgid "draft"
 msgstr "draft"
 
-#: src/pages/AudioPage.tsx:405
+#: src/pages/AudioPage.tsx:420
 msgid "Draft"
 msgstr "Draft"
 
 #. placeholder {0}: formatDb(draftDb)
 #. placeholder {1}: formatDb(savedDb)
-#: src/pages/AudioPage.tsx:350
+#: src/pages/AudioPage.tsx:365
 msgid "draft {0} dB, saved {1} dB"
 msgstr "draft {0} dB, saved {1} dB"
 
 #. placeholder {0}: draftDiff.changedRouteCount
-#: src/pages/AudioPage.tsx:1401
+#: src/pages/AudioPage.tsx:1416
 msgid "Draft edits pending — channels changed: {0}; the sample rate changed too. Nothing reaches the bus until you save."
 msgstr "Draft edits pending — channels changed: {0}; the sample rate changed too. Nothing reaches the bus until you save."
 
 #. placeholder {0}: draftDiff.changedRouteCount
-#: src/pages/AudioPage.tsx:1412
+#: src/pages/AudioPage.tsx:1427
 msgid "Draft edits pending — channels changed: {0}. Nothing reaches the bus until you save."
 msgstr "Draft edits pending — channels changed: {0}. Nothing reaches the bus until you save."
 
-#: src/pages/AudioPage.tsx:1407
+#: src/pages/AudioPage.tsx:1422
 msgid "Draft edits pending — the sample rate changed. Nothing reaches the bus until you save."
 msgstr "Draft edits pending — the sample rate changed. Nothing reaches the bus until you save."
 
@@ -4082,7 +4082,7 @@ msgstr "e.g. black-cam-1"
 msgid "e.g. cam-north"
 msgstr "e.g. cam-north"
 
-#: src/pages/AudioPage.tsx:590
+#: src/pages/AudioPage.tsx:605
 msgid "e.g. cam1-clean"
 msgstr "e.g. cam1-clean"
 
@@ -4195,7 +4195,7 @@ msgstr "Each entry is a location that was masked — never the value."
 msgid "Each input continuously writes its newest decoded frame into a small per-tile store; the compositor reads the latest complete frame from that store at every output tick and never waits for an input. When a source hiccups, the store simply keeps handing out the most recent frame it has — the \"last good\" one. A brief network blip is therefore invisible: the tile holds a fraction-of-a-second-old picture until fresh frames resume."
 msgstr "Each input continuously writes its newest decoded frame into a small per-tile store; the compositor reads the latest complete frame from that store at every output tick and never waits for an input. When a source hiccups, the store simply keeps handing out the most recent frame it has — the \"last good\" one. A brief network blip is therefore invisible: the tile holds a fraction-of-a-second-old picture until fresh frames resume."
 
-#: src/pages/AudioPage.tsx:661
+#: src/pages/AudioPage.tsx:676
 msgid "Each output picks its audio from this set: “program” mode carries the prog mix; “tracks” mode selects any of the names above. Manage that per-output choice on the Outputs page."
 msgstr "Each output picks its audio from this set: “program” mode carries the prog mix; “tracks” mode selects any of the names above. Manage that per-output choice on the Outputs page."
 
@@ -4290,7 +4290,7 @@ msgstr "Edit source"
 msgid "Edit sync group"
 msgstr "Edit sync group"
 
-#: src/pages/AudioPage.tsx:813
+#: src/pages/AudioPage.tsx:828
 msgid "edited"
 msgstr "edited"
 
@@ -4298,7 +4298,7 @@ msgstr "edited"
 msgid "Edited locally"
 msgstr "Edited locally"
 
-#: src/pages/AudioPage.tsx:1451
+#: src/pages/AudioPage.tsx:1466
 msgid "Edits are drafts until saved"
 msgstr "Edits are drafts until saved"
 
@@ -4742,7 +4742,7 @@ msgstr "Fix the highlighted fields, then save again."
 msgid "Fix these before saving:"
 msgstr "Fix these before saving:"
 
-#: src/pages/AudioPage.tsx:1170
+#: src/pages/AudioPage.tsx:1185
 msgid "Fix these problems before saving:"
 msgstr "Fix these problems before saving:"
 
@@ -4849,7 +4849,7 @@ msgstr "Full content interpreted as limited: shadows <0>crush to solid black</0>
 msgid "Fully deterministic"
 msgstr "Fully deterministic"
 
-#: src/pages/AudioPage.tsx:572
+#: src/pages/AudioPage.tsx:587
 msgid "Gain in dB (route {row})"
 msgstr "Gain in dB (route {row})"
 
@@ -4919,7 +4919,7 @@ msgstr "Global API key and email"
 msgid "Glossary"
 msgstr "Glossary"
 
-#: src/pages/AudioPage.tsx:641
+#: src/pages/AudioPage.tsx:656
 msgid "Glossary: program bus and tracks"
 msgstr "Glossary: program bus and tracks"
 
@@ -5234,7 +5234,7 @@ msgstr "Host memory: ours / used / total"
 msgid "Hosts, IPv4 vs IPv6"
 msgstr "Hosts, IPv4 vs IPv6"
 
-#: src/pages/AudioPage.tsx:1516
+#: src/pages/AudioPage.tsx:1531
 #: src/pages/OutputsPage.tsx:1373
 #: src/pages/OverlaysPage.tsx:234
 #: src/pages/ProbesPage.tsx:496
@@ -5394,7 +5394,7 @@ msgstr "Imported {0} source(s)"
 
 #: src/components/broadcast/library/MetadataInspector.tsx:546
 #: src/components/broadcast/library/TranscriptRangeEditor.tsx:350
-#: src/pages/AudioPage.tsx:232
+#: src/pages/AudioPage.tsx:243
 msgid "IN"
 msgstr "IN"
 
@@ -5414,8 +5414,8 @@ msgstr "In a multiview chain there are two transports in the path: the one each 
 msgid "In break: replaced {swaps} since {since}"
 msgstr "In break: replaced {swaps} since {since}"
 
-#: src/pages/AudioPage.tsx:511
-#: src/pages/AudioPage.tsx:808
+#: src/pages/AudioPage.tsx:526
+#: src/pages/AudioPage.tsx:823
 msgid "in PGM"
 msgstr "in PGM"
 
@@ -5484,8 +5484,8 @@ msgstr "Inject test break end"
 msgid "Inject test break start (30s)"
 msgstr "Inject test break start (30s)"
 
-#: src/pages/AudioPage.tsx:537
-#: src/pages/AudioPage.tsx:551
+#: src/pages/AudioPage.tsx:552
+#: src/pages/AudioPage.tsx:566
 msgid "Input (route {row})"
 msgstr "Input (route {row})"
 
@@ -5510,7 +5510,7 @@ msgid "Inputs are sampled, never trusted to pace the output. A single fixed-cade
 msgstr "Inputs are sampled, never trusted to pace the output. A single fixed-cadence clock emits exactly one frame per tick. When a source drops, its tile holds its last good frame and shows a clear state while the engine reconnects in the background — the rest of the wall keeps running."
 
 #. placeholder {0}: form.routes.length
-#: src/pages/AudioPage.tsx:872
+#: src/pages/AudioPage.tsx:887
 msgid "inputs on the mix: {included} of {0} · muted: {muted}"
 msgstr "inputs on the mix: {included} of {0} · muted: {muted}"
 
@@ -5570,12 +5570,12 @@ msgstr "Internet / unmanaged links"
 msgid "Interval capture"
 msgstr "Interval capture"
 
-#: src/pages/AudioPage.tsx:406
-#: src/pages/AudioPage.tsx:420
+#: src/pages/AudioPage.tsx:421
+#: src/pages/AudioPage.tsx:435
 msgid "invalid gain"
 msgstr "invalid gain"
 
-#: src/pages/AudioPage.tsx:348
+#: src/pages/AudioPage.tsx:363
 msgid "invalid gain; edit exact gain in Details"
 msgstr "invalid gain; edit exact gain in Details"
 
@@ -5702,7 +5702,7 @@ msgstr "LAN / routed networks"
 msgid "Language"
 msgstr "Language"
 
-#: src/pages/AudioPage.tsx:598
+#: src/pages/AudioPage.tsx:613
 msgid "Language (route {row})"
 msgstr "Language (route {row})"
 
@@ -5982,7 +5982,7 @@ msgstr "Linked URL"
 msgid "List at least one track name (comma-separated)."
 msgstr "List at least one track name (comma-separated)."
 
-#: src/pages/AudioPage.tsx:474
+#: src/pages/AudioPage.tsx:489
 msgid "LISTEN"
 msgstr "LISTEN"
 
@@ -6040,7 +6040,7 @@ msgstr "Live preview is busy. Another viewer has the session."
 msgid "Live preview of input {0}"
 msgstr "Live preview of input {0}"
 
-#: src/pages/AudioPage.tsx:878
+#: src/pages/AudioPage.tsx:893
 msgid "Live program meters are in the PROGRAM region below."
 msgstr "Live program meters are in the PROGRAM region below."
 
@@ -6127,7 +6127,7 @@ msgstr "Loading alarm summary"
 msgid "Loading alarms…"
 msgstr "Loading alarms…"
 
-#: src/pages/AudioPage.tsx:1156
+#: src/pages/AudioPage.tsx:1171
 msgid "Loading audio routing…"
 msgstr "Loading audio routing…"
 
@@ -6668,7 +6668,7 @@ msgstr "Missing source:"
 msgid "MIX"
 msgstr "MIX"
 
-#: src/pages/AudioPage.tsx:1281
+#: src/pages/AudioPage.tsx:1296
 msgid "Mix bank"
 msgstr "Mix bank"
 
@@ -6865,7 +6865,7 @@ msgid "Mutable resources carry an <0>ETag</0>. Send it back as <1>If-Match</1> o
 msgstr "Mutable resources carry an <0>ETag</0>. Send it back as <1>If-Match</1> on a write; a stale tag is rejected with <2>412 Precondition Failed</2> so two editors never silently clobber each other."
 
 #: src/pages/approved/AudioSurface.tsx:184
-#: src/pages/AudioPage.tsx:449
+#: src/pages/AudioPage.tsx:464
 msgid "MUTE"
 msgstr "MUTE"
 
@@ -6873,8 +6873,8 @@ msgstr "MUTE"
 msgid "Mute {label}"
 msgstr "Mute {label}"
 
-#: src/pages/AudioPage.tsx:505
-#: src/pages/AudioPage.tsx:805
+#: src/pages/AudioPage.tsx:520
+#: src/pages/AudioPage.tsx:820
 msgid "MUTED"
 msgstr "MUTED"
 
@@ -7008,8 +7008,8 @@ msgstr "Network: {sourceName}"
 msgid "Never seen."
 msgstr "Never seen."
 
-#: src/pages/AudioPage.tsx:429
-#: src/pages/AudioPage.tsx:796
+#: src/pages/AudioPage.tsx:444
+#: src/pages/AudioPage.tsx:811
 msgid "new"
 msgstr "new"
 
@@ -7225,8 +7225,8 @@ msgstr "No host-memory sample."
 msgid "No inbound video RTP bytes were reported."
 msgstr "No inbound video RTP bytes were reported."
 
-#: src/pages/AudioPage.tsx:189
-#: src/pages/AudioPage.tsx:787
+#: src/pages/AudioPage.tsx:200
+#: src/pages/AudioPage.tsx:802
 msgid "No input telemetry"
 msgstr "No input telemetry"
 
@@ -7386,8 +7386,8 @@ msgstr "No reliable timing readout."
 msgid "No results."
 msgstr "No results."
 
-#: src/pages/AudioPage.tsx:883
-#: src/pages/AudioPage.tsx:1285
+#: src/pages/AudioPage.tsx:898
+#: src/pages/AudioPage.tsx:1300
 msgid "No routes yet — without routes the multiview carries no managed audio."
 msgstr "No routes yet — without routes the multiview carries no managed audio."
 
@@ -7578,7 +7578,7 @@ msgstr "Not probed yet."
 msgid "Not referenced by any slot"
 msgstr "Not referenced by any slot"
 
-#: src/pages/AudioPage.tsx:415
+#: src/pages/AudioPage.tsx:430
 msgid "not saved yet"
 msgstr "not saved yet"
 
@@ -7719,8 +7719,8 @@ msgstr "Off"
 msgid "Off (pinned off)"
 msgstr "Off (pinned off)"
 
-#: src/pages/AudioPage.tsx:511
-#: src/pages/AudioPage.tsx:808
+#: src/pages/AudioPage.tsx:526
+#: src/pages/AudioPage.tsx:823
 msgid "off PGM"
 msgstr "off PGM"
 
@@ -7824,7 +7824,7 @@ msgstr "Opacity (0–1)"
 msgid "Opacity must be between 0 and 1."
 msgstr "Opacity must be between 0 and 1."
 
-#: src/pages/AudioPage.tsx:508
+#: src/pages/AudioPage.tsx:523
 msgid "open"
 msgstr "open"
 
@@ -7997,12 +7997,12 @@ msgid "Output"
 msgstr "Output"
 
 #. placeholder {0}: impact.outputName
-#: src/pages/AudioPage.tsx:699
+#: src/pages/AudioPage.tsx:714
 msgid "Output \"{0}\" carries track {from}; it will be updated to {to}."
 msgstr "Output \"{0}\" carries track {from}; it will be updated to {to}."
 
 #. placeholder {0}: impact.outputName
-#: src/pages/AudioPage.tsx:707
+#: src/pages/AudioPage.tsx:722
 msgid "Output \"{0}\" carries track {track}; it will be removed from its selection."
 msgstr "Output \"{0}\" carries track {track}; it will be removed from its selection."
 
@@ -8172,7 +8172,7 @@ msgstr "Pending actions"
 msgid "Per-family result for {0}"
 msgstr "Per-family result for {0}"
 
-#: src/pages/AudioPage.tsx:462
+#: src/pages/AudioPage.tsx:477
 #: src/pages/graphics/PlayoutView.tsx:236
 #: src/pages/graphics/PlayoutView.tsx:398
 msgid "PGM"
@@ -8339,7 +8339,7 @@ msgstr "Position not reported"
 msgid "Pre-encode canvas approximation"
 msgstr "Pre-encode canvas approximation"
 
-#: src/pages/AudioPage.tsx:1560
+#: src/pages/AudioPage.tsx:1575
 msgid "Pre-fade listen (PFL / solo monitoring) is not available on this control plane — there is no monitoring path to configure, so the console carries no listen key."
 msgstr "Pre-fade listen (PFL / solo monitoring) is not available on this control plane — there is no monitoring path to configure, so the console carries no listen key."
 
@@ -8377,7 +8377,6 @@ msgstr "Preview — input {0}"
 msgid "Preview diagnostics"
 msgstr "Preview diagnostics"
 
-#: src/components/broadcast/ProductionDesk.tsx:36
 #: src/components/broadcast/ProductionDesk.tsx:36
 msgid "Preview monitor"
 msgstr "Preview monitor"
@@ -8506,7 +8505,7 @@ msgstr "Program"
 
 #: src/pages/approved/AudioSurface.tsx:140
 #: src/pages/approved/AudioSurface.tsx:170
-#: src/pages/AudioPage.tsx:866
+#: src/pages/AudioPage.tsx:881
 msgid "PROGRAM"
 msgstr "PROGRAM"
 
@@ -8514,7 +8513,7 @@ msgstr "PROGRAM"
 msgid "Program / Preview switcher"
 msgstr "Program / Preview switcher"
 
-#: src/pages/AudioPage.tsx:1140
+#: src/pages/AudioPage.tsx:1155
 msgid "Program bus and discrete tracks — edits stage a draft; Save audio routing stores the whole document."
 msgstr "Program bus and discrete tracks — edits stage a draft; Save audio routing stores the whole document."
 
@@ -8540,19 +8539,23 @@ msgid "PROGRAM LOUDNESS (short-term)"
 msgstr "PROGRAM LOUDNESS (short-term)"
 
 #: src/pages/approved/AudioSurface.tsx:173
-msgid "PROGRAM master gain"
-msgstr "PROGRAM master gain"
+#~ msgid "PROGRAM master gain"
+#~ msgstr "PROGRAM master gain"
+
+#: src/pages/approved/AudioSurface.tsx:173
+msgid "PROGRAM master gain — unavailable"
+msgstr "PROGRAM master gain — unavailable"
 
 #: src/pages/ProgramMeters.tsx:64
 #: src/pages/ProgramMeters.tsx:81
 msgid "Program meters"
 msgstr "Program meters"
 
-#: src/pages/AudioPage.tsx:1211
+#: src/pages/AudioPage.tsx:1226
 msgid "Program mix"
 msgstr "Program mix"
 
-#: src/pages/AudioPage.tsx:1518
+#: src/pages/AudioPage.tsx:1533
 msgid "Program mix gain, mute, and source membership apply on the next audio tick with a short fade. New, removed, or renamed discrete tracks can remain pending while the program mix applies live. A changed output sample rate or unknown mixed source requires a config export and restart. X-Multiview-Apply reports live, partial, or restart."
 msgstr "Program mix gain, mute, and source membership apply on the next audio tick with a short fade. New, removed, or renamed discrete tracks can remain pending while the program mix applies live. A changed output sample rate or unknown mixed source requires a config export and restart. X-Multiview-Apply reports live, partial, or restart."
 
@@ -8924,7 +8927,7 @@ msgstr "Relaying for us"
 msgid "Release this machine from its owner and return its lease. Program output is never interrupted by deactivation."
 msgstr "Release this machine from its owner and return its lease. Program output is never interrupted by deactivation."
 
-#: src/pages/AudioPage.tsx:1466
+#: src/pages/AudioPage.tsx:1481
 msgid "Reload latest routing (discard draft)"
 msgstr "Reload latest routing (discard draft)"
 
@@ -8974,7 +8977,7 @@ msgstr "Remove device"
 msgid "Remove member"
 msgstr "Remove member"
 
-#: src/pages/AudioPage.tsx:620
+#: src/pages/AudioPage.tsx:635
 msgid "Remove route {row}"
 msgstr "Remove route {row}"
 
@@ -9222,7 +9225,7 @@ msgstr "Revoke relay token"
 msgid "Revoke this token for this relay? New connections lose access. Existing connected sessions are not terminated."
 msgstr "Revoke this token for this relay? New connections lose access. Existing connected sessions are not terminated."
 
-#: src/pages/AudioPage.tsx:770
+#: src/pages/AudioPage.tsx:785
 msgid "Ride {label}"
 msgstr "Ride {label}"
 
@@ -9267,11 +9270,11 @@ msgid "Rotation must be between 0 and 359 degrees."
 msgstr "Rotation must be between 0 and 359 degrees."
 
 #. placeholder {0}: index + 1
-#: src/pages/AudioPage.tsx:897
+#: src/pages/AudioPage.tsx:912
 msgid "Route {0}"
 msgstr "Route {0}"
 
-#: src/pages/AudioPage.tsx:1064
+#: src/pages/AudioPage.tsx:1079
 msgid "Route {row}"
 msgstr "Route {row}"
 
@@ -9279,7 +9282,7 @@ msgstr "Route {row}"
 #~ msgid "Route a source elementary stream onto a destination. Plan classifies the take without applying it; Take applies it — a Class-2 migration is accepted asynchronously and its outcome arrives on the realtime stream."
 #~ msgstr "Route a source elementary stream onto a destination. Plan classifies the take without applying it; Take applies it — a Class-2 migration is accepted asynchronously and its outcome arrives on the realtime stream."
 
-#: src/pages/AudioPage.tsx:1507
+#: src/pages/AudioPage.tsx:1522
 msgid "Route each input's audio: program-mix membership and discrete tracks."
 msgstr "Route each input's audio: program-mix membership and discrete tracks."
 
@@ -9413,11 +9416,11 @@ msgstr "Salvos"
 msgid "Same machine, multiple outputs"
 msgstr "Same machine, multiple outputs"
 
-#: src/pages/AudioPage.tsx:1191
+#: src/pages/AudioPage.tsx:1206
 msgid "Sample rate"
 msgstr "Sample rate"
 
-#: src/pages/AudioPage.tsx:1542
+#: src/pages/AudioPage.tsx:1557
 msgid "Sample rate (Hz)"
 msgstr "Sample rate (Hz)"
 
@@ -9449,7 +9452,7 @@ msgstr "Save as a device"
 msgid "Save as device"
 msgstr "Save as device"
 
-#: src/pages/AudioPage.tsx:1448
+#: src/pages/AudioPage.tsx:1463
 msgid "Save audio routing"
 msgstr "Save audio routing"
 
@@ -9475,7 +9478,7 @@ msgstr "Save rule"
 msgid "Save stores this layout for later use. Save & apply stores it, then asks the running engine to use it now. Saved layouts are not separate live renderers."
 msgstr "Save stores this layout for later use. Save & apply stores it, then asks the running engine to use it now. Saved layouts are not separate live renderers."
 
-#: src/pages/AudioPage.tsx:410
+#: src/pages/AudioPage.tsx:425
 #: src/pages/OutputsPage.tsx:1286
 #: src/resources/CrudPage.tsx:272
 msgid "Saved"
@@ -9489,11 +9492,11 @@ msgid "Saved {0}"
 msgstr "Saved {0}"
 
 #. placeholder {0}: formatDb(savedDb)
-#: src/pages/AudioPage.tsx:423
+#: src/pages/AudioPage.tsx:438
 msgid "saved {0} dB"
 msgstr "saved {0} dB"
 
-#: src/pages/AudioPage.tsx:1473
+#: src/pages/AudioPage.tsx:1488
 msgid "Saved and applied live: the program mix is now following the new routing."
 msgstr "Saved and applied live: the program mix is now following the new routing."
 
@@ -9511,11 +9514,11 @@ msgstr "Saved as device"
 msgid "Saved asset {0}"
 msgstr "Saved asset {0}"
 
-#: src/pages/AudioPage.tsx:855
+#: src/pages/AudioPage.tsx:870
 msgid "Saved state with real input meters (pre-fader). Tap a channel to ride its strip."
 msgstr "Saved state with real input meters (pre-fader). Tap a channel to ride its strip."
 
-#: src/pages/AudioPage.tsx:1481
+#: src/pages/AudioPage.tsx:1496
 msgid "Saved: program mix gain, mute, and source routes apply live. New, removed, reordered, or renamed output tracks remain pending until output reconfiguration. The saved document is not fully live."
 msgstr "Saved: program mix gain, mute, and source routes apply live. New, removed, reordered, or renamed output tracks remain pending until output reconfiguration. The saved document is not fully live."
 
@@ -9523,7 +9526,7 @@ msgstr "Saved: program mix gain, mute, and source routes apply live. New, remove
 msgid "Saving an overlay through the API or this UI applies it to the running engine at the next frame where the build renders that kind — today an analog-face <0>clock</0> appears, moves, or disappears live. Kinds without a renderer are stored losslessly and take effect via config export + restart; every save response declares which happened in its X-Multiview-Apply header."
 msgstr "Saving an overlay through the API or this UI applies it to the running engine at the next frame where the build renders that kind — today an analog-face <0>clock</0> appears, moves, or disappears live. Kinds without a renderer are stored losslessly and take effect via config export + restart; every save response declares which happened in its X-Multiview-Apply header."
 
-#: src/pages/AudioPage.tsx:1470
+#: src/pages/AudioPage.tsx:1485
 msgid "Saving audio routing. Draft controls are locked until the save completes."
 msgstr "Saving audio routing. Draft controls are locked until the save completes."
 
@@ -9679,7 +9682,7 @@ msgstr "Select stream {title} for bulk add"
 msgid "Select…"
 msgstr "Select…"
 
-#: src/pages/AudioPage.tsx:638
+#: src/pages/AudioPage.tsx:653
 msgid "Selectable tracks"
 msgstr "Selectable tracks"
 
@@ -9809,7 +9812,7 @@ msgstr "Show a test notification"
 msgid "Show all {0}"
 msgstr "Show all {0}"
 
-#: src/pages/AudioPage.tsx:1438
+#: src/pages/AudioPage.tsx:1453
 msgid "Show all channels"
 msgstr "Show all channels"
 
@@ -9821,7 +9824,7 @@ msgstr "Show fewer"
 msgid "Show rundown"
 msgstr "Show rundown"
 
-#: src/pages/AudioPage.tsx:1438
+#: src/pages/AudioPage.tsx:1453
 msgid "Show selected channel"
 msgstr "Show selected channel"
 
@@ -9945,7 +9948,7 @@ msgstr "Source events"
 msgid "Source events could not be read."
 msgstr "Source events could not be read."
 
-#: src/pages/AudioPage.tsx:554
+#: src/pages/AudioPage.tsx:569
 msgid "source id"
 msgstr "source id"
 
@@ -10238,7 +10241,7 @@ msgstr "Stored credential reference:"
 msgid "Stored sidecar (not decoded per source)"
 msgstr "Stored sidecar (not decoded per source)"
 
-#: src/pages/AudioPage.tsx:1490
+#: src/pages/AudioPage.tsx:1505
 msgid "Stored, not applied live: this change needs a restart (for example a changed sample rate, or an input with no audio on this run). The running program mix is unchanged until then."
 msgstr "Stored, not applied live: this change needs a restart (for example a changed sample rate, or an input with no audio on this run). The running program mix is unchanged until then."
 
@@ -10846,7 +10849,7 @@ msgstr "The event journal is busy or unavailable. Try again shortly."
 msgid "The exact channel id as it appears in the XMLTV feed."
 msgstr "The exact channel id as it appears in the XMLTV feed."
 
-#: src/pages/AudioPage.tsx:577
+#: src/pages/AudioPage.tsx:592
 msgid "The exact program-bus gain for this input (any finite value; the strip fader covers −60…0 dB)."
 msgstr "The exact program-bus gain for this input (any finite value; the strip fader covers −60…0 dB)."
 
@@ -10946,8 +10949,8 @@ msgstr "The map could not start on this device. Use the place search and the lis
 msgid "The minimum monthly contact that keeps your entitlement live. This is the licensing keep-alive — not analytics — so it carries only what licensing needs."
 msgstr "The minimum monthly contact that keeps your entitlement live. This is the licensing keep-alive — not analytics — so it carries only what licensing needs."
 
-#: src/pages/AudioPage.tsx:653
-#: src/pages/AudioPage.tsx:869
+#: src/pages/AudioPage.tsx:668
+#: src/pages/AudioPage.tsx:884
 msgid "the mixed program bus, always available"
 msgstr "the mixed program bus, always available"
 
@@ -11172,7 +11175,7 @@ msgstr "The watch status is unavailable."
 msgid "The working color space. <0>profile</0> names a preset (e.g. <1>sdr-bt709-limited</1>); <2>custom</2> lets you set primaries, transfer, matrix, and range explicitly."
 msgstr "The working color space. <0>profile</0> names a preset (e.g. <1>sdr-bt709-limited</1>); <2>custom</2> lets you set primaries, transfer, matrix, and range explicitly."
 
-#: src/pages/AudioPage.tsx:1549
+#: src/pages/AudioPage.tsx:1564
 msgid "The working rate every input is resampled to (48000 is the broadcast default)."
 msgstr "The working rate every input is resampled to (48000 is the broadcast default)."
 
@@ -11220,7 +11223,7 @@ msgstr "This cell declares both an area and a rect — keep exactly one (the eng
 msgid "This cell references an area that is not in the grid."
 msgstr "This cell references an area that is not in the grid."
 
-#: src/pages/AudioPage.tsx:522
+#: src/pages/AudioPage.tsx:537
 msgid "This channel has draft errors — they are marked inside Details."
 msgstr "This channel has draft errors — they are marked inside Details."
 
@@ -11334,7 +11337,7 @@ msgstr "This playlist declares no guide URL."
 msgid "This requires licence-server connectivity (not yet wired in this build)."
 msgstr "This requires licence-server connectivity (not yet wired in this build)."
 
-#: src/pages/AudioPage.tsx:692
+#: src/pages/AudioPage.tsx:707
 msgid "This save will update the following outputs"
 msgstr "This save will update the following outputs"
 
@@ -11503,7 +11506,7 @@ msgstr "Top (%)"
 msgid "Track id or language tag"
 msgstr "Track id or language tag"
 
-#: src/pages/AudioPage.tsx:607
+#: src/pages/AudioPage.tsx:622
 msgid "Track title (route {row})"
 msgstr "Track title (route {row})"
 
@@ -11654,8 +11657,8 @@ msgid "Unacknowledged"
 msgstr "Unacknowledged"
 
 #: src/pages/approved/AudioSurface.tsx:173
-msgid "unavailable"
-msgstr "unavailable"
+#~ msgid "unavailable"
+#~ msgstr "unavailable"
 
 #: src/components/broadcast/ProductionDesk.tsx:141
 #: src/pages/approved/MediaSurface.tsx:29
@@ -11666,7 +11669,7 @@ msgstr "Unavailable"
 msgid "Unavailable:"
 msgstr "Unavailable:"
 
-#: src/pages/AudioPage.tsx:471
+#: src/pages/AudioPage.tsx:486
 msgid "unavailable: no monitor path"
 msgstr "unavailable: no monitor path"
 
@@ -11698,11 +11701,11 @@ msgstr "Under ceiling"
 msgid "Undo {operationLabel}"
 msgstr "Undo {operationLabel}"
 
-#: src/pages/AudioPage.tsx:497
+#: src/pages/AudioPage.tsx:512
 msgid "Undo draft edits"
 msgstr "Undo draft edits"
 
-#: src/pages/AudioPage.tsx:490
+#: src/pages/AudioPage.tsx:505
 msgid "Undo draft edits for {label}"
 msgstr "Undo draft edits for {label}"
 
@@ -11833,7 +11836,7 @@ msgstr "Upcoming"
 msgid "Update credentials"
 msgstr "Update credentials"
 
-#: src/pages/AudioPage.tsx:733
+#: src/pages/AudioPage.tsx:748
 msgid "Updated outputs:"
 msgstr "Updated outputs:"
 
@@ -12308,11 +12311,11 @@ msgstr "WHIP publish endpoint"
 msgid "Whole minutes between −720 and 840 (e.g. 600 = UTC+10)."
 msgstr "Whole minutes between −720 and 840 (e.g. 600 = UTC+10)."
 
-#: src/pages/AudioPage.tsx:852
+#: src/pages/AudioPage.tsx:867
 msgid "Whole mix"
 msgstr "Whole mix"
 
-#: src/pages/AudioPage.tsx:1368
+#: src/pages/AudioPage.tsx:1383
 msgid "Whole mix overview"
 msgstr "Whole mix overview"
 
