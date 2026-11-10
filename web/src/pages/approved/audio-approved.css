@@ -118,7 +118,7 @@
 
 /* strip bank: equal-width columns, scrolls horizontally inside itself */
 [data-approved-page="audio"] .strip-bank {
-  display: grid; grid-auto-flow: column; grid-auto-columns: minmax(124px, 1fr);
+  display: grid; grid-auto-flow: column; grid-auto-columns: minmax(120px, 1fr);
   gap: 8px; overflow-x: auto; padding-bottom: 8px; min-width: 0; max-width: 100%;
 }
 [data-approved-page="audio"] .strip-bank > div { min-width: 0; }
@@ -213,6 +213,7 @@
 [data-approved-page="audio"] .audio-nudge-btn:disabled { opacity: .4; }
 [data-approved-page="audio"] [data-testid="audio-strip"] [data-testid="audio-strip-essential"] > div:first-child { gap: 6px; }
 [data-approved-page="audio"] .strip-bank { grid-auto-columns: minmax(176px, 1fr); }
+[data-approved-page="audio"] .audio-listen-note { display: none; }
 [data-approved-page="audio"] [data-testid="audio-strip"] input[type="range"] { width: 240px; }
 
 /* PGM / MUTE: exact token fills; pressed state never brighter than the token. */
@@ -260,3 +261,40 @@
 [data-approved-page="audio"] .mo-row,[data-approved-page="audio"] [data-testid="audio-overview-row"],[data-approved-page="audio"] [data-testid="audio-overview-program"] { min-height: var(--tap); }
 [data-approved-page="audio"] a[href] { min-width: var(--tap); justify-content: center; }
 [data-approved-page="audio"] .strip-bank [data-testid="audio-strip"] { padding: 10px 4px; }
+
+/* Round 3: bank at tablet+ (>=768): strips keep the column layout inside the
+   bank (fader + nudges beside, keys under) and the bank scrolls inside itself. */
+[data-approved-page="audio"] .strip-bank [data-testid="audio-strip-essential"] {
+  display: flex; flex-direction: column; align-items: stretch;
+}
+[data-approved-page="audio"] .strip-bank [data-testid="audio-strip-essential"] > div { grid-row: auto; }
+[data-approved-page="audio"] .mixer-main > * { min-width: 0; max-width: 100%; }
+[data-approved-page="audio"] .master-col > * { min-width: 0; max-width: 100%; }
+[data-approved-page="audio"] .strip-bank { overscroll-behavior-x: contain; }
+@media (min-width: 1280px) {
+  [data-approved-page="audio"] .mixer { grid-template-columns: minmax(0, 1fr) 240px; }
+  [data-approved-page="audio"] .master-col { width: 240px; max-width: 240px; overflow: hidden; }
+}
+/* sr-only (absolute) children must be clipped by the bank, not the page. */
+[data-approved-page="audio"] .strip-bank { position: relative; }
+[data-approved-page="audio"] { position: relative; overflow-x: clip; }
+
+/* Round 3b: 1440 bank fit — nudges drop to a 2x2 block under the fader so a
+   strip is ~120px wide and all 8 strips + the 220px rail fit without clipping. */
+@media (min-width: 1280px) {
+  [data-approved-page="audio"] .mixer { grid-template-columns: minmax(0, 1fr) 220px; }
+  [data-approved-page="audio"] .master-col { width: 220px; max-width: 220px; overflow: visible; }
+  [data-approved-page="audio"] .strip-bank { grid-auto-columns: minmax(120px, 1fr); }
+  [data-approved-page="audio"] .strip-bank [data-testid="audio-strip-essential"] > div:first-child { flex-wrap: wrap; justify-content: flex-start; row-gap: 6px; }
+  [data-approved-page="audio"] .strip-bank .audio-nudge-col {
+    order: 5; flex: 1 1 100%; width: auto; grid-template-columns: repeat(2, minmax(48px, 1fr));
+  }
+  [data-approved-page="audio"] .strip-bank .audio-nudge-btn { width: 100%; }
+  [data-approved-page="audio"] .strip-bank [data-testid="audio-strip-essential"] > div:first-child .fader-track { flex: none; }
+}
+/* Phone (reference-audio-390): keys + LISTEN note above the fader, nudges beside it. */
+@media (max-width: 767px) {
+  [data-approved-page="audio"] [data-testid="audio-strip-essential"] .audio-strip-keys { order: -1; justify-content: center; }
+  [data-approved-page="audio"] .audio-listen-note { display: block; flex: 1 1 100%; text-align: center; }
+  [data-approved-page="audio"] [data-testid="audio-strip-essential"] { max-width: 100%; }
+}
