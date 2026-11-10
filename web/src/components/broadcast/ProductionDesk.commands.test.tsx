@@ -1,7 +1,7 @@
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from 'vitest';
 
 vi.mock('../../realtime/shared', () => ({ subscribeRealtime: () => () => undefined }));
-import { act, render, screen, waitFor } from '@testing-library/react';
+import { act, render, screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { http, HttpResponse } from 'msw';
 import { setupServer } from 'msw/node';
@@ -119,6 +119,32 @@ describe('ProductionDesk single-authority completion', { timeout: 15000 }, () =>
     expect(screen.getByRole('button', { name: 'CUT' })).toBeDisabled();
     expect(screen.queryByText(/Engine state confirmed/)).toBeNull();
     await userEvent.click(screen.getByRole('button', { name: 'CUT' }));
+    expect(commandCount).toBe(1);
+  });
+
+  it('two synchronous Confirm clicks in one act produce exactly one POST', async () => {
+    page();
+    await waitFor(() => { expect(screen.getByRole('button', { name: 'CUT' })).not.toBeDisabled(); }, { timeout: 6000 });
+    await userEvent.click(screen.getByRole('button', { name: 'CUT' }));
+    const confirm = screen.getByRole('button', { name: 'Confirm take' });
+    act(() => { confirm.click(); confirm.click(); });
+    await waitFor(() => { expect(commandCount).toBe(1); });
+    await new Promise((r) => setTimeout(r, 200));
+    expect(commandCount).toBe(1);
+  });
+
+  it('two synchronous source clicks produce exactly one POST', async () => {
+    server.use(
+      http.get('*/api/v1/sources', () => HttpResponse.json([{ id: 'cam-1', name: 'CAM 1', body: { kind: 'srt', url: 'srt://[::1]:1' } }])),
+      http.post('*/api/v1/switcher/commands/select_preview', () => { commandCount += 1; return HttpResponse.json({ operation_id: `op-${String(commandCount)}`, kind: 'select_preview' }, { status: 202 }); }),
+    );
+    page();
+    const pvw = await screen.findByRole('group', { name: 'PVW bus' });
+    const btn = await within(pvw).findByRole('button', { name: /CAM 1/ });
+    await waitFor(() => { expect(btn).not.toBeDisabled(); }, { timeout: 6000 });
+    act(() => { btn.click(); btn.click(); });
+    await waitFor(() => { expect(commandCount).toBe(1); });
+    await new Promise((r) => setTimeout(r, 200));
     expect(commandCount).toBe(1);
   });
 

@@ -1,5 +1,5 @@
 import { deskControlReason, tallyForSource } from './deskSafety';
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import type { JSX } from 'react';
 import { Trans, useLingui } from '@lingui/react/macro';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
@@ -105,24 +105,30 @@ export function ProductionDesk(): JSX.Element {
   const baseReason = deskControlReason(!!state.data, status === 'open', fresh, state.data?.in_flight ?? false, operationId !== undefined && !settled);
   const reason = baseReason ?? (inFlight ? 'Command in flight' : undefined);
   const mutate = useMutation({ mutationFn: async ({ action, source }: { action: SwitcherAction; source?: string }) => {
+    if (!lock.current) throw new Error('Command guard not held');
     if (baseReason) throw new Error(baseReason);
     const req: SwitcherRequest = { me: 'me1', program: 'main', action, ...(source ? { source } : {}), ...(action === 'auto' ? { duration_frames: Number(frames) } : {}) };
     const plan = await planSwitcher(req);
     if (!plan.can_take) throw new Error(t`The engine refused this plan`);
     return submit(() => commandSwitcher(action, req, { idempotencyKey: newIdempotencyKey() }), { topic: 'switcher', resource: 'me1', event: 'switcher.operation', terminal: { kind: 'switcher-operation', me: 'me1' } });
-  }, onSuccess: (result) => { setOperationId(result.operationId); setGuard(result.operationId); setError(undefined); setFailure(undefined); }, onError: (err: Error) => { setError(err.message); setGuard(undefined); } });
+  }, onSuccess: (result) => { setOperationId(result.operationId); setGuard(result.operationId); setError(undefined); setFailure(undefined); }, onError: (err: Error) => { setError(err.message); setGuard(undefined); lock.current = false; } });
   const disabled = !!reason || mutate.isPending || inFlight;
+  // Synchronous guard: state is not committed between two same-turn clicks, so a ref gates the second.
+  // Held from before mutate until the command is terminal; released by the effect below or on error.
+  const lock = useRef(false);
   const send = (command: { action: SwitcherAction; source?: string }): void => {
-    if (disabled) return;
+    if (lock.current || disabled) return;
+    lock.current = true;
     setGuard(SENDING);
     mutate.mutate(command);
   };
   const request = (action: SwitcherAction, source?: string): void => {
-    if (disabled) return;
+    if (lock.current || disabled) return;
     const command = { action, ...(source ? { source } : {}) };
     if (action === 'select_program' || (locked && (action === 'cut' || action === 'auto'))) setConfirm(command);
     else send(command);
   };
+  useEffect(() => { if (!inFlight && !mutate.isPending) lock.current = false; }, [inFlight, mutate.isPending]);
   const name = (id: string | undefined): string | undefined => sources.data?.find((s) => s.id === id)?.name ?? id;
   return <section className="production-desk" aria-label={t`Production desk`}>
     <div className="bd-heading"><div><h1><Trans>Production desk</Trans></h1><p><Trans>Switch PGM/PVW, watch the wall, feel the tally.</Trans></p></div><div className="bd-tick"><span><Trans>ENGINE TICK</Trans></span><b>{state.data?.tick ?? '—'}</b></div></div>

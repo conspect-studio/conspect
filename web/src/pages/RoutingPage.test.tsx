@@ -2,7 +2,7 @@
 // composed crosspoint to /routing/plan and shows the returned class banner, and
 // that Take POSTs to /routing/{kind}/take and surfaces a hot vs migration result.
 import { afterAll, afterEach, beforeAll, describe, expect, it } from 'vitest';
-import { screen, waitFor } from '@testing-library/react';
+import { act, screen, waitFor } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { http, HttpResponse } from 'msw';
 import { setupServer } from 'msw/node';
@@ -84,6 +84,25 @@ describe('RoutingPage', () => {
     });
     expect(lastTakeIdempotency).not.toBeNull();
     expect(lastTakeIdempotency).not.toBe('');
+  });
+
+  it('repeated Take submit and Confirm events produce exactly one request', async () => {
+    let takes = 0;
+    server.use(http.post('*/api/v1/routing/video/take', async () => {
+      takes += 1;
+      await new Promise((r) => setTimeout(r, 150));
+      return HttpResponse.json({ status: 'applied', applied: { class: 'hot', operation_id: 'op-1' } });
+    }));
+    const user = userEvent.setup();
+    renderWithProviders(<MemoryRouter><RoutingPage /></MemoryRouter>);
+    await user.type(screen.getByLabelText('Source input id'), 'cam-north');
+    await user.type(screen.getByLabelText('Target video cell'), 'cell-a');
+    await user.click(screen.getByRole('button', { name: 'Take' }));
+    const confirm = await screen.findByRole('button', { name: 'Confirm take' });
+    act(() => { confirm.click(); confirm.click(); });
+    await waitFor(() => { expect(takes).toBe(1); });
+    await new Promise((r) => setTimeout(r, 400));
+    expect(takes).toBe(1);
   });
 
   it('disables Plan and Take until an input and target are given', () => {
