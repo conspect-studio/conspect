@@ -70,6 +70,7 @@ pub(crate) async fn create(
         state.media_players.get(player)?;
     }
     let fill = body.fill_id.clone();
+    let terms_version = body.terms.version.clone();
     let provider = state.web_capture.clone();
     let actor = principal.clone();
     let admission = tokio::task::spawn_blocking(move || provider.submit(&actor, &key, body))
@@ -82,7 +83,7 @@ pub(crate) async fn create(
             crate::audit::AuditAction::Command,
             "capture-fill",
             &fill,
-            Some(serde_json::json!({"job_id":id})),
+            Some(serde_json::json!({"job_id":id,"terms_version":terms_version,"accepted_or_coalesced":true})),
         );
     }
     Ok((
