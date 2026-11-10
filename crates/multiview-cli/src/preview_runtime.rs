@@ -19,6 +19,7 @@ pub struct PreviewEncoderLease {
     producer: std::sync::OnceLock<crate::output_window_registry::OptionalWindowProducer>,
     pub(crate) initial_packets: Option<Vec<multiview_ffmpeg::EncodedPacket>>,
     initial_avc: Option<multiview_ffmpeg::codec_metadata::AvcDecoderConfig>,
+    _runtime_permit: Option<std::sync::Arc<crate::preview_vertical::RuntimePermit>>,
 }
 impl PreviewLease for PreviewEncoderLease {
     fn descriptor(&self) -> &OpenedPreview {
@@ -50,6 +51,9 @@ pub struct PreviewRuntimeOpener<R: OptionalRegistry> {
     measured: Vec<(PreviewKey, ResourceCost)>,
     registry: R,
     next_id: u64,
+    pub(crate) runtime_permit: Option<std::sync::Arc<crate::preview_vertical::RuntimePermit>>,
+    #[cfg(test)]
+    before_open: Option<Box<dyn FnOnce() + Send>>,
     pub(crate) first_canvas: Option<std::sync::Arc<multiview_compositor::pipeline::Nv12Image>>,
 }
 impl<R: OptionalRegistry> PreviewRuntimeOpener<R> {
@@ -61,6 +65,9 @@ impl<R: OptionalRegistry> PreviewRuntimeOpener<R> {
             registry,
             next_id: 0,
             first_canvas: None,
+            runtime_permit: None,
+            #[cfg(test)]
+            before_open: None,
         }
     }
 }
@@ -90,6 +97,10 @@ impl<R: OptionalRegistry> PreviewOpener for PreviewRuntimeOpener<R> {
             .ok()?
             .max(1);
         config.cuda_ordinal.clone_from(&requested.gpu_pin);
+        #[cfg(test)]
+        if let Some(hang) = self.before_open.take() {
+            hang();
+        }
         let mut encoder = VideoRenditionEncoder::new(&config).ok()?;
         let initial_packets = if let Some(canvas) = self.first_canvas.as_ref() {
             let mut frame = crate::pipeline::nv12_to_decoded(canvas).ok()?;
@@ -170,6 +181,7 @@ impl<R: OptionalRegistry> PreviewOpener for PreviewRuntimeOpener<R> {
             producer: std::sync::OnceLock::new(),
             initial_packets,
             initial_avc,
+            _runtime_permit: self.runtime_permit.clone(),
         })
     }
     fn publish(&mut self, staged: &[Self::Lease]) -> Option<Self::Registration> {
@@ -381,6 +393,41 @@ mod actual_bridge_tests {
         };
         (key, cost, production)
     }
+    #[test]
+    fn hung_native_open_blocks_newly_parsed_reloads_until_native_completion() {
+        let (key, cost, _) = actual_preview_setup();
+        let budget = crate::preview_vertical::PreviewAdmissionBudget::new();
+        let permit = budget.acquire().unwrap();
+        struct NoPublication;
+        impl OptionalRegistry for NoPublication {
+            type Registration = ();
+            fn publish_optional(&mut self, _: &[OpenedPreview]) -> Option<()> {
+                None
+            }
+        }
+        let mut opener = PreviewRuntimeOpener::new(vec![(key.clone(), cost)], NoPublication);
+        opener.runtime_permit = Some(permit);
+        let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(1);
+        let (release_tx, release_rx) = std::sync::mpsc::sync_channel(1);
+        opener.before_open = Some(Box::new(move || {
+            entered_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+        }));
+        let worker = std::thread::spawn(move || opener.open(&key).unwrap());
+        entered_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        for _ in 0..100 {
+            assert!(budget.acquire().is_none());
+        }
+        release_tx.send(()).unwrap();
+        let lease = worker.join().unwrap();
+        assert!(
+            budget.acquire().is_none(),
+            "opened lease must retain the slot"
+        );
+        drop(lease);
+        assert!(budget.acquire().is_some());
+    }
+
     #[test]
     fn actual_factory_packets_reach_registry_subscriber_and_retire_independently() {
         let (key, cost, production) = actual_preview_setup();

@@ -21384,8 +21384,10 @@ segment_ms = 1000
             audio_once_bps: 128_000,
             overhead_bps: 100_000,
             opened_parent: None,
+            runtime_gate: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            shared_budget: false,
             startup_delay,
-        });
+        }.with_admission_budget(&crate::preview_vertical::PreviewAdmissionBudget::new()));
         pipeline
     }
 
