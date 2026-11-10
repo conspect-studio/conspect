@@ -80,7 +80,13 @@ import {
 import type { RouteDraftDiff } from './audioPresentation';
 import { meterFillPercent, useAudioMeter } from '../realtime/useAudioMeter';
 import type { AudioMeterSample } from '../realtime/useAudioMeter';
-import { PageHeader } from '../components/PageHeader';
+import {
+  AudioMasterRegion,
+  AudioMixerLayout,
+  AudioPhoneMaster,
+  AudioSurface,
+} from './approved/AudioSurface';
+import { useAudioLoudness } from '../realtime/useAudioLoudness';
 import { Badge } from '../components/ui/badge';
 import { Button } from '../components/ui/button';
 
@@ -874,6 +880,7 @@ export function AudioPage(): JSX.Element {
   // The real pre-fader input meters (engine `audio.meter` telemetry) — one
   // subscription feeds the overview rows and every strip's IN column.
   const meter = useAudioMeter();
+  const loudness = useAudioLoudness();
 
   // Before the first edit the form follows the query. Once edited, the draft
   // and its original document/ETag stay bound through query invalidations;
@@ -986,7 +993,7 @@ export function AudioPage(): JSX.Element {
       : Math.min(focusedIndex, Math.max(0, form.routes.length - 1));
   const focusedRoute = form === undefined ? undefined : form.routes[focused];
   const [overviewOpen, setOverviewOpen] = useState(false);
-  const [bankExpanded, setBankExpanded] = useState(false);
+  const [bankExpanded, setBankExpanded] = useState(true);
 
   /** The strip's display label: the managed source's name when known, the
    * raw input id otherwise, and a positional label for an unwritten route. */
@@ -1053,9 +1060,18 @@ export function AudioPage(): JSX.Element {
   };
 
   return (
-    <div>
-      <PageHeader title={<Trans>Audio</Trans>} />
-
+    <AudioSurface
+      loudness={loudness}
+      sub={
+        <>
+          <Trans>
+            Program bus and discrete tracks — edits stage a draft; Save audio
+            routing stores the whole document.
+          </Trans>
+          <HelpLink to="/help/features#outputs" label={t`About outputs and audio`} />
+        </>
+      }
+    >
       {routing.isPending || form === undefined ? (
         routing.isError ? (
           <p role="alert" className="text-sm text-destructive">
@@ -1078,6 +1094,7 @@ export function AudioPage(): JSX.Element {
           {/* Touch-first surface (below xl): pinned chip picker + ONE
               focused strip — every channel stays one tap away in the
               overview below (designer round 4). */}
+          <AudioPhoneMaster loudness={loudness} />
           {form.routes.length > 0 ? (
             <div
               role="group"
@@ -1106,6 +1123,8 @@ export function AudioPage(): JSX.Element {
           {/* The console's strip surfaces render in parallel: the bank shows
               only at xl+, the focused strip only below — the SAME strip
               component, the same draft, the same honest readouts. */}
+          <AudioMixerLayout
+            bank={
           <section
             aria-labelledby="audio-bank-heading"
             data-testid="audio-bank"
@@ -1127,9 +1146,9 @@ export function AudioPage(): JSX.Element {
                 </Trans>
               </p>
             ) : (
-              <div className="flex max-w-full gap-4 overflow-x-auto pb-2">
+              <div className="flex max-w-full gap-2 overflow-x-auto pb-2">
                 {form.routes.map((route, index) => (
-                  <div key={rowIds[index]} className={bankExpanded || index === focused ? 'w-60 shrink-0' : 'hidden'}>
+                  <div key={rowIds[index]} className={bankExpanded || index === focused ? 'w-44 shrink-0' : 'hidden'}>
                     <ChannelStrip
                       route={route}
                       saved={savedRowFor(index)}
@@ -1164,8 +1183,9 @@ export function AudioPage(): JSX.Element {
               </div>
             )}
           </section>
-
-          {focusedRoute !== undefined ? (
+            }
+            focused={
+          focusedRoute !== undefined ? (
             <section
               aria-labelledby="audio-focused-heading"
               data-testid="audio-focused-strip"
@@ -1197,14 +1217,16 @@ export function AudioPage(): JSX.Element {
                 }}
               />
             </section>
-          ) : null}
-
-          <div>
+          ) : null
+            }
+            rail={
+          <>
+          <div className="xl:hidden">
             <Button type="button" variant="outline" className="h-auto min-h-12 min-w-12 max-w-full whitespace-normal break-words" aria-expanded={overviewOpen} onClick={(): void => { setOverviewOpen(!overviewOpen); }}>
               <Trans>Whole mix overview</Trans>
             </Button>
           </div>
-          <div className={overviewOpen ? '' : 'hidden'}>
+          <div className={overviewOpen ? '' : 'hidden xl:block'}>
           <MixOverview
             form={form}
             savedRows={form.routes.map((_, index) => savedRowFor(index))}
@@ -1215,6 +1237,10 @@ export function AudioPage(): JSX.Element {
             onRide={ride}
           />
           </div>
+          <AudioMasterRegion />
+          </>
+            }
+          />
 
           {/* The draft banner: what is pending, in the operator's words —
               never a claim that anything is applied. */}
@@ -1394,6 +1420,6 @@ export function AudioPage(): JSX.Element {
           <LoudnessMeter />
         </fieldset>
       )}
-    </div>
+    </AudioSurface>
   );
 }
