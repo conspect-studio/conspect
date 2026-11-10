@@ -315,7 +315,7 @@ fn background_publish_never_blocks_on_a_slow_manifest_write() {
     let dir = tempfile::tempdir().expect("tempdir");
     let manifest = dir.path().join("index.m3u8");
     let mut live = LivePlaylist::new(manifest.clone(), WINDOW);
-    let slow: multiview_output::hls::ManifestWriter = Arc::new(|path, bytes| {
+    let slow: multiview_output::hls::ManifestWriter = Arc::new(|path, bytes, _cancelled| {
         std::thread::sleep(Duration::from_millis(300));
         std::fs::write(path, bytes).map_err(|e| multiview_output::Error::Output(e.to_string()))
     });
@@ -388,15 +388,16 @@ fn background_publish_failure_surfaces_and_prunes_nothing() {
     let mut live = LivePlaylist::new(manifest, 1);
     let failing = Arc::new(AtomicBool::new(true));
     let gate = Arc::clone(&failing);
-    let writer: multiview_output::hls::ManifestWriter = Arc::new(move |_path, _bytes| {
-        if gate.load(Ordering::SeqCst) {
-            Err(multiview_output::Error::Output(
-                "injected disk failure".to_owned(),
-            ))
-        } else {
-            Ok(())
-        }
-    });
+    let writer: multiview_output::hls::ManifestWriter =
+        Arc::new(move |_path, _bytes, _cancelled| {
+            if gate.load(Ordering::SeqCst) {
+                Err(multiview_output::Error::Output(
+                    "injected disk failure".to_owned(),
+                ))
+            } else {
+                Ok(())
+            }
+        });
     live.enable_background_publish_with(writer)
         .expect("publisher");
 
@@ -444,7 +445,7 @@ fn background_publish_recovers_without_skipping_the_failed_manifest() {
     let calls = Arc::new(AtomicUsize::new(0));
     let written: Arc<Mutex<Vec<String>>> = Arc::default();
     let (c, w) = (Arc::clone(&calls), Arc::clone(&written));
-    let writer: multiview_output::hls::ManifestWriter = Arc::new(move |path, bytes| {
+    let writer: multiview_output::hls::ManifestWriter = Arc::new(move |path, bytes, _cancelled| {
         // The second publish fails once; every other publish succeeds.
         if c.fetch_add(1, Ordering::SeqCst) == 1 {
             return Err(multiview_output::Error::Output("injected".to_owned()));
@@ -497,8 +498,13 @@ fn dropping_a_background_playlist_quiesces_its_writer() {
     let dir = tempfile::tempdir().expect("tempdir");
     let manifest = dir.path().join("index.m3u8");
     let mut live = LivePlaylist::new(manifest.clone(), 2);
-    let slow: multiview_output::hls::ManifestWriter = Arc::new(|path, bytes| {
+    // A slow write that, like the production writer, checks the fence right
+    // before making the manifest visible.
+    let slow: multiview_output::hls::ManifestWriter = Arc::new(|path, bytes, cancelled| {
         std::thread::sleep(Duration::from_millis(200));
+        if cancelled() {
+            return Ok(());
+        }
         std::fs::write(path, bytes).map_err(|e| multiview_output::Error::Output(e.to_string()))
     });
     live.enable_background_publish_with(slow)
@@ -506,7 +512,12 @@ fn dropping_a_background_playlist_quiesces_its_writer() {
     let path = touch_segment(dir.path(), "seg0.ts");
     live.push_closed_segment("seg0.ts", path, 2.0, 0)
         .expect("close");
+    let dropped = std::time::Instant::now();
     drop(live);
+    assert!(
+        dropped.elapsed() < Duration::from_millis(50),
+        "dropping must not wait for the in-flight write (packet thread)"
+    );
     // The next run publishes the same path immediately after the drop.
     std::fs::write(&manifest, b"#EXTM3U\n#NEXT-RUN\n").expect("next run");
     std::thread::sleep(Duration::from_millis(400));

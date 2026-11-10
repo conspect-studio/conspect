@@ -104,9 +104,11 @@ impl LivePlaylist {
     /// # Errors
     /// Returns [`Error::Output`] if the publisher thread cannot be spawned.
     pub fn enable_background_publish(&mut self) -> Result<()> {
-        self.enable_background_publish_with(Arc::new(|path: &Path, bytes: &[u8]| {
-            atomic_write(path, bytes)
-        }))
+        self.enable_background_publish_with(Arc::new(
+            |path: &Path, bytes: &[u8], cancelled: &dyn Fn() -> bool| {
+                atomic_write_fenced(path, bytes, cancelled)
+            },
+        ))
     }
 
     /// [`enable_background_publish`](Self::enable_background_publish) with an
@@ -442,6 +444,38 @@ pub(crate) fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
     })
 }
 
+/// [`atomic_write`] for a background publisher: identical, except the final
+/// `rename` is skipped (and the temp removed) when `cancelled` reports the
+/// publisher was abandoned while the write + fsync ran. Closes the window in
+/// which an abandoned run could still replace the next run's manifest.
+fn atomic_write_fenced(path: &Path, bytes: &[u8], cancelled: &dyn Fn() -> bool) -> Result<()> {
+    let tmp = temp_path(path);
+    {
+        let mut file = std::fs::File::create(&tmp)
+            .map_err(|e| Error::Output(format!("creating temp file {}: {e}", tmp.display())))?;
+        file.write_all(bytes)
+            .map_err(|e| Error::Output(format!("writing temp file {}: {e}", tmp.display())))?;
+        file.sync_all()
+            .map_err(|e| Error::Output(format!("fsync temp file {}: {e}", tmp.display())))?;
+    }
+    if cancelled() {
+        match std::fs::remove_file(&tmp) {
+            Ok(()) | Err(_) => {}
+        }
+        return Ok(());
+    }
+    std::fs::rename(&tmp, path).map_err(|e| {
+        match std::fs::remove_file(&tmp) {
+            Ok(()) | Err(_) => {}
+        }
+        Error::Output(format!(
+            "renaming {} -> {}: {e}",
+            tmp.display(),
+            path.display()
+        ))
+    })
+}
+
 /// Derive the same-directory temp path for `path` by appending a `.tmp` suffix to
 /// its file name (e.g. `multiview.m3u8` -> `multiview.m3u8.tmp`). Keeping the temp
 /// in the same directory is what makes the subsequent `rename(2)` atomic and
@@ -460,7 +494,10 @@ fn temp_path(path: &Path) -> PathBuf {
 
 /// A manifest writer: `(path, bytes)` → durable atomic publish. Production uses
 /// [`atomic_write`]; tests inject slow or failing writers.
-pub type ManifestWriter = Arc<dyn Fn(&Path, &[u8]) -> Result<()> + Send + Sync>;
+///
+/// The third argument reports whether the publisher was abandoned; a writer
+/// must not make a new manifest visible once it returns `true`.
+pub type ManifestWriter = Arc<dyn Fn(&Path, &[u8], &dyn Fn() -> bool) -> Result<()> + Send + Sync>;
 
 /// The most retired segments a run of failed publishes may carry before the
 /// oldest are dropped from the list (left on disk, never unlinked) — keeps a
@@ -481,6 +518,8 @@ struct Slot {
     pending: Pending,
     error: Option<String>,
     finished: bool,
+    /// Set by `Drop` on an abandoned publisher: no further write may start.
+    cancelled: bool,
 }
 
 /// Latest-wins hand-off between the sink (producer) and the `hls-publish` thread.
@@ -552,19 +591,20 @@ impl BackgroundPublisher {
 
 impl Drop for BackgroundPublisher {
     fn drop(&mut self) {
-        // An abandoned (never finalized) playlist — e.g. a sink that errored.
-        // Quiesce before returning: the thread finishes any pending publish and
-        // exits, so no write to this path can outlive the sink and race the next
-        // run's publication of the same file. Teardown only (never the packet
-        // path); bounded by one manifest write.
-        lock(&self.shared.slot).finished = true;
+        // An abandoned (never finalized) playlist — e.g. a sink that errored on
+        // its packet thread. Never block here (the writer could be stuck in a
+        // slow fsync): fence instead. `cancelled` is checked under the slot lock
+        // immediately before every write, so once this returns no further write
+        // to this path can start; a write already in progress finishes on its
+        // own thread and is the only one that can still land.
+        let mut slot = lock(&self.shared.slot);
+        slot.finished = true;
+        slot.cancelled = true;
+        slot.pending = Pending::default();
+        drop(slot);
         self.shared.wake.notify_one();
-        if let Some(thread) = self.thread.take() {
-            // A panicked publisher has nothing left to write; ignore it here.
-            match thread.join() {
-                Ok(()) | Err(_) => {}
-            }
-        }
+        // Detach: the thread exits after its current (if any) write.
+        drop(self.thread.take());
     }
 }
 
@@ -588,7 +628,11 @@ fn lock(m: &Mutex<Slot>) -> std::sync::MutexGuard<'_, Slot> {
 /// publish keeps its retired segments for the next attempt and records the error.
 fn publish_one(shared: &Shared, playlist_path: &Path, writer: &ManifestWriter, job: Pending) {
     let Some(text) = job.text else { return };
-    match writer(playlist_path, text.as_bytes()) {
+    let cancelled = || lock(&shared.slot).cancelled;
+    if cancelled() {
+        return;
+    }
+    match writer(playlist_path, text.as_bytes(), &cancelled) {
         Ok(()) => {
             let references = playlist_path.parent().and_then(media_segment_references);
             if let Some(references) = references {
@@ -652,7 +696,9 @@ impl BackgroundFile {
         Ok(Self {
             inner: BackgroundPublisher::spawn(
                 path,
-                Arc::new(|path: &Path, bytes: &[u8]| atomic_write(path, bytes)),
+                Arc::new(|path: &Path, bytes: &[u8], cancelled: &dyn Fn() -> bool| {
+                    atomic_write_fenced(path, bytes, cancelled)
+                }),
             )?,
         })
     }
