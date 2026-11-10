@@ -3,6 +3,7 @@
 // renders an explicit fallback for every unknown/absent value. Rights are
 // the load-bearing case: an UNKNOWN or EXPIRED status is always visible as
 // such and is never silently presented as cleared (audit §9.3, §9.11).
+import { TriangleAlert } from 'lucide-react';
 import type { JSX } from 'react';
 import { useLingui } from '@lingui/react/macro';
 
@@ -57,14 +58,14 @@ export function RightsChip({
         data-testid="chip-rights"
         title={expiryLabel ?? undefined}
       >
-        <span aria-hidden="true">⚠</span>
+        <TriangleAlert aria-hidden="true" size={12} />
         {expiryLabel ? t`Rights expired — ${expiryLabel}` : t`Rights expired`}
       </Badge>
     );
   }
   return (
     <Badge variant="offline" data-testid="chip-rights">
-      <span aria-hidden="true">⚠</span>
+      <TriangleAlert aria-hidden="true" size={12} />
       {t`Rights unknown`}
     </Badge>
   );
@@ -97,7 +98,7 @@ export function TranscriptStateChip({
   if (state === 'failed') {
     return (
       <Badge variant="destructive" data-testid="chip-transcript">
-        <span aria-hidden="true">⚠</span>
+        <TriangleAlert aria-hidden="true" size={12} />
         {t`Transcript failed`}
       </Badge>
     );

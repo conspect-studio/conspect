@@ -2,6 +2,7 @@
 // (VT transport / Capture / Clip library). Presentation only: the page owns
 // all state and operations. Capture and Clip library have no backend
 // contract yet, so they render explicit, specific unavailable states.
+import { Info } from 'lucide-react';
 import { useState } from 'react';
 import type { JSX, ReactNode } from 'react';
 import { Link } from 'react-router-dom';
@@ -131,7 +132,7 @@ export function MediaSurface({ tab, onTabChange, transport }: MediaSurfaceProps)
               aria-controls="media-help"
               onClick={(): void => { setHelpOpen((open) => !open); }}
             >
-              ⓘ <Trans>Help</Trans>
+              <Info aria-hidden="true" size={14} className="mv-help-ico" /> <Trans>Help</Trans>
             </button>
           </p>
           <div className="help-panel" id="media-help" hidden={!helpOpen}>

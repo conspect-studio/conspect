@@ -2,6 +2,7 @@
 // rundown API: NOW/NEXT, the rundown and the cue card render empty with the
 // specific reason, and Take/Stop/Hold/Skip/Arm are disabled. Only the local
 // browser clock (with its zone) is real. Nothing here switches desk program.
+import { Info } from 'lucide-react';
 import { useEffect, useState } from 'react';
 import type { JSX } from 'react';
 import { Link } from 'react-router-dom';
@@ -37,7 +38,7 @@ export function ShowPage(): JSX.Element {
             <Trans>The running order as cue cards.</Trans>
             <button type="button" className="help-btn" aria-expanded={helpOpen} aria-controls="show-help"
               onClick={(): void => { setHelpOpen((o) => !o); }}>
-              ⓘ <Trans>Help</Trans>
+              <Info aria-hidden="true" size={14} className="mv-help-ico" /> <Trans>Help</Trans>
             </button>
           </p>
           <div className="help-panel" id="show-help" hidden={!helpOpen}>

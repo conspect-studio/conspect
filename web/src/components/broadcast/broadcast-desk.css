@@ -289,3 +289,18 @@
 .broadcast-shell .bd-bus-preview button[aria-pressed=true]:disabled{color:#14100a}
 .broadcast-shell .bd-bus-program button[aria-pressed=true]:disabled{color:#1c0509}
 .bd-bus button .bd-key-name{color:inherit;padding:0;font-size:12px}
+/* brand never collides with the first tab: fixed, non-shrinking; tabs shrink instead */
+.bd-brand{flex:none;min-width:max-content}
+.bd-tabs{min-width:0;margin-left:12px}
+.mv-help-ico{display:inline-block;vertical-align:-2px;margin-right:4px}
+.bd-alarm-btn svg{vertical-align:-3px}
+@media(min-width:768px) and (max-width:1279px){.bd-brand{min-width:48px}.bd-tabs{margin-left:4px}}
+@media(max-width:767px){.bd-brand{min-width:0}.bd-tabs{margin-left:0}}
+/* 1280–1599: tabs and health must never overlap — drop the "last tick" prose and tighten tabs. */
+.bd-tabs{overflow:hidden}
+.bd-health{flex:none}
+@media(min-width:1280px) and (max-width:1599px){
+.bd-health [role=status]>.text-muted-foreground{display:none}
+.bd-tabs a{padding:0 9px;gap:6px}
+.bd-tabs{gap:2px}
+}

@@ -1084,7 +1084,7 @@ export function SourcesPage(): JSX.Element {
             aria-controls="src-help-panel"
             onClick={(): void => { setHelpOpen((v) => !v); }}
           >
-            <Trans>ⓘ Help</Trans>
+            <Info aria-hidden="true" size={14} className="mv-help-ico" /><Trans>Help</Trans>
           </button>
         </span>
       }

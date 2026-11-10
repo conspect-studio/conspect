@@ -2,6 +2,7 @@
 // the page keeps every query/mutation. Nothing here invents a fact — a source
 // is "On PGM" only when the switcher's authoritative program_source says so;
 // every other crosspoint state is Unknown (the routing API has no readback).
+import { Diamond, Info } from 'lucide-react';
 import { useState } from "react";
 import type { JSX, ReactNode } from "react";
 import { Trans, useLingui } from "@lingui/react/macro";
@@ -90,7 +91,7 @@ export function RoutingHead(): JSX.Element {
               setOpen(!open);
             }}
           >
-            <Trans>ⓘ Help</Trans>
+            <Info aria-hidden="true" size={14} className="mv-help-ico" /><Trans>Help</Trans>
           </button>
         </p>
         <div className="help-panel" id="help-routing" hidden={!open}>
@@ -214,7 +215,7 @@ export function CrosspointGrid({
                         onPick(src.id, d);
                       }}
                     >
-                      {isSel ? (planned ? "? PLAN" : "◇ SEL") : "?"}
+                      {isSel ? (planned ? "? PLAN" : <><Diamond aria-hidden="true" size={11} /> SEL</>) : "?"}
                     </button>
                   </td>
                 );
