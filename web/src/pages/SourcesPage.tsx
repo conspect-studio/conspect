@@ -1098,15 +1098,20 @@ export function SourcesPage(): JSX.Element {
       errorPrefix={<Trans>Could not load sources:</Trans>}
       seed={seed}
       headerExtras={
-        <>
-          <M3uImportButton />
-          <Button asChild variant="outline">
-            <Link to="/sources/iptv-org">
-              <Trans>Browse IPTV-ORG</Trans>
-            </Link>
-          </Button>
-          <ExportConfigButton compact />
-        </>
+        <details className="src-more">
+          <summary>
+            <Trans>More</Trans>
+          </summary>
+          <div className="src-more-menu">
+            <M3uImportButton />
+            <Button asChild variant="outline">
+              <Link to="/sources/iptv-org">
+                <Trans>Browse IPTV-ORG</Trans>
+              </Link>
+            </Button>
+            <ExportConfigButton compact />
+          </div>
+        </details>
       }
       callout={
         helpOpen ? (

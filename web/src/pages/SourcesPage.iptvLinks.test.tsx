@@ -49,12 +49,15 @@ describe('Sources page IPTV-ORG integration', () => {
   it('shows a Browse button, the link status as text, and "—" for unlinked rows', async () => {
     renderWithProviders(<MemoryRouter><SourcesPage /></MemoryRouter>);
     expect(await screen.findByRole('link', { name: /browse iptv-org/i })).toHaveAttribute('href', '/sources/iptv-org');
+    await userEvent.click(await screen.findByRole('button', { name: /^details: kshb/i }));
     expect(await screen.findByText('Updated upstream')).toBeInTheDocument();
+    await userEvent.click(screen.getByRole('button', { name: /^details: plain/i }));
     expect(screen.getByText('Not linked to IPTV-ORG')).toBeInTheDocument();
   });
 
   it('Review changes shows the diff and Apply PUTs url/headers/labels with If-Match', async () => {
     renderWithProviders(<MemoryRouter><SourcesPage /></MemoryRouter>);
+    await userEvent.click(await screen.findByRole('button', { name: /^details: kshb/i }));
     await userEvent.click(await screen.findByRole('button', { name: /review changes: kshb/i }));
     const dialog = await screen.findByRole('dialog');
     expect(within(dialog).getByText('https://new.test/kshb.m3u8')).toBeInTheDocument();
@@ -69,6 +72,7 @@ describe('Sources page IPTV-ORG integration', () => {
 
   it('editing a linked source shows the read-only panel and round-trips origin', async () => {
     renderWithProviders(<MemoryRouter><SourcesPage /></MemoryRouter>);
+    await userEvent.click(await screen.findByRole('button', { name: /^details: kshb/i }));
     await userEvent.click(await screen.findByRole('button', { name: /edit source: kshb/i }));
     const dialog = await screen.findByRole('dialog');
     expect(await within(dialog).findByText('Linked to IPTV-ORG')).toBeInTheDocument();
