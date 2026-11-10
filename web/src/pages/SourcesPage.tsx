@@ -908,7 +908,7 @@ export function SourcesPage(): JSX.Element {
       newLabel={t`New source`}
       dialogCreateTitle={t`New source`}
       dialogEditTitle={t`Edit source`}
-      dialogDescription={t`A source is an ingest input bound into the multiview by id.`}
+      dialogDescription={t`A source is an ingest input referenced by id for production, routing, and monitoring.`}
       caption={t`Configured ingest sources.`}
       emptyMessage={<Trans>No sources configured.</Trans>}
       loadingMessage={<Trans>Loading sources…</Trans>}

@@ -1,6 +1,6 @@
 # Outputs & Sinks
 
-How Multiview publishes the composited program: the sink subsystem. One canvas is composited, encoded **once per rendition**, and the resulting packets are **fanned out** to every transport that can share them — RTSP server, HLS/LL-HLS packager, NDI out, and RTMP/SRT push. Per-output encode profiles, color tagging, multistream audio, segment/continuity settings, and failover are all managed declaratively and verified at runtime.
+How Conspect publishes the composited program: the sink subsystem. One canvas is composited, encoded **once per rendition**, and the resulting packets are **fanned out** to every transport that can share them — RTSP server, HLS/LL-HLS packager, NDI out, and RTMP/SRT push. Per-output encode profiles, color tagging, multistream audio, segment/continuity settings, and failover are all managed declaratively and verified at runtime.
 
 - **Crate:** [`multiview-output`](../architecture/conventions.md#3-canonical-crate-map) — *"Output sinks/servers: RTSP server, HLS/LL-HLS packager, NDI out, RTMP/SRT push; encode-once-mux-many fan-out."* Features: `ffmpeg`, `ndi`.
 - **Driven by:** [`multiview-engine`](../architecture/conventions.md#3-canonical-crate-map) (the protected output core: fixed-cadence output clock, supervisor, hot-reconfiguration).
@@ -74,7 +74,7 @@ appsrc (is-live=true, format=TIME, correct PTS/duration)
 
 ## 4. HLS / LL-HLS packager
 
-**CMAF-first, custom-built.** FFmpeg's `hls` muxer **cannot emit Apple LL-HLS** (`-lhls` is the legacy `EXT-X-PREFETCH` DASH variant), so Multiview owns the segmenter and origin.
+**CMAF-first, custom-built.** FFmpeg's `hls` muxer **cannot emit Apple LL-HLS** (`-lhls` is the legacy `EXT-X-PREFETCH` DASH variant), so Conspect owns the segmenter and origin.
 
 - Encode once into **fragmented MP4** via libav `movenc` (`-movflags cmaf+frag_custom+empty_moov+delay_moov`) and derive HLS, LL-HLS, and (optionally) DASH from **one** in-memory segment/part store.
 - **Tag layer** is reused from the `hls-playlist` crate (EXT-X-PART, PART-INF, SERVER-CONTROL with `CAN-BLOCK-RELOAD` + `PART-HOLD-BACK`, PRELOAD-HINT, RENDITION-REPORT, SKIP).

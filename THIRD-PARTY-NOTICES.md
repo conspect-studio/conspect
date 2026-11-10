@@ -1,20 +1,20 @@
 # Third-Party Notices
 
-Multiview's own source code is licensed under the **Multiview Source-Available
-Non-Commercial License, Version 1.0** (see the root [`LICENSE`](LICENSE) file;
+Conspect's own source code is licensed under the **Conspect Source-Available
+Non-Commercial License, Version 2.0** (see the root [`LICENSE`](LICENSE) file;
 commercial licensing is described in [`LICENSE-COMMERCIAL.md`](LICENSE-COMMERCIAL.md)).
-Multiview is **source-available**; it is **not** "open source" or "free software".
+Conspect is **source-available**; it is **not** "open source" or "free software".
 
 This file lists the **third-party components** that are distributed with, or linked
-or loaded by, the Multiview software. Those components are **not** covered by
-Multiview's license — each remains under **its own license**, and you must comply
+or loaded by, the Conspect software. Those components are **not** covered by
+Conspect's license — each remains under **its own license**, and you must comply
 with the terms of each component's license when you use, copy, or distribute
-Multiview. Where a component carries its own copyright and license notices, those
+Conspect. Where a component carries its own copyright and license notices, those
 notices are retained alongside the component (and where a component ships with
-Multiview, its license text accompanies it).
+Conspect, its license text accompanies it).
 
 Copyright © 2026 **Aperim Pty Ltd** (ABN 46 150 699 737), Suite 108, 9 Hutchinson
-Street, St Peters, NSW 2044, Australia, for the Multiview software itself. Each
+Street, St Peters, NSW 2044, Australia, for the Conspect software itself. Each
 third-party component below is copyright its respective authors.
 
 > The summaries below describe the **license families** of the load-bearing
@@ -26,47 +26,49 @@ third-party component below is copyright its respective authors.
 
 ## 1. FFmpeg / libav\* — LGPL-2.1 (dynamically linked)
 
-Multiview uses the **FFmpeg / libav\*** libraries (`libavcodec`, `libavformat`,
+Conspect uses the **FFmpeg / libav\*** libraries (`libavcodec`, `libavformat`,
 `libavutil`, `libavfilter`, `libswscale`, `libswresample`, and related) for
 container demux/mux and for software/hardware decode and encode. In the default
 build these libraries are used **under the GNU Lesser General Public License,
 version 2.1 (LGPL-2.1)**, by **dynamic linking**; they are not statically bundled
-into the Multiview binary and are not relicensed under Multiview's license.
+into the Conspect binary and are not relicensed under Conspect's license.
 
-Nothing in Multiview's license limits the rights the LGPL grants you with respect
-to these libraries — including the right to modify the Multiview software for your
+Nothing in Conspect's license limits the rights the LGPL grants you with respect
+to these libraries — including the right to modify the Conspect software for your
 own use, to reverse-engineer it for debugging such modifications, and to relink it
 against a modified version of the libraries, to the extent the LGPL requires (see
 [`LICENSE`](LICENSE) §9).
 
 - **Components:** FFmpeg / libav\* libraries.
 - **License:** GNU LGPL-2.1 (or later), as built and distributed.
-- **Linkage:** dynamic. The default Multiview build is kept LGPL-clean.
+- **Linkage:** dynamic. The default Conspect build is kept LGPL-clean.
 - **Upstream:** https://ffmpeg.org/ — license: https://ffmpeg.org/legal.html
 
-### 1a. Optional `gpl-codecs` build — GPL-2.0-or-later (NOT under Multiview's license)
+### 1a. Optional `gpl-codecs` build — GPL-2.0-or-later (NOT under Conspect's license)
 
-Multiview has an **optional, off-by-default** `gpl-codecs` build profile that links
+Conspect has an **optional, off-by-default** `gpl-codecs` build profile that links
 GPL-licensed encoders such as **x264** and **x265**. Those GPL codec components are
-**not licensed to you under Multiview's license** and are **not distributed by
-Aperim Pty Ltd under Multiview's license**. If you choose to build Multiview with
-`gpl-codecs`, the resulting **combined work is governed by the GNU GPL** (version 2
-or later, as applicable to those components), and Multiview's Source-Available
-Non-Commercial License does not apply to that combined work (see [`LICENSE`](LICENSE)
-§9). This profile is opt-in only; the default build never links these components.
+**not licensed to you under Conspect's license** and are **not distributed by
+Aperim Pty Ltd under Conspect's license**. If you choose to build Conspect with
+`gpl-codecs`, the feature does not relicense Conspect's own code under the GPL.
+Distribution of a combined work requires compliance with applicable GPL obligations
+and separate permission from Conspect's copyright holders; Conspect's license grants
+no such distribution permission (see [`LICENSE`](LICENSE) §9). The GPL components
+retain their own license rights. This profile is opt-in only; the default build
+never links these components.
 
 - **Components:** x264, x265 (and any other GPL-only codec enabled by the profile).
 - **License:** GNU GPL-2.0-or-later.
-- **Status:** opt-in; excluded from the default build and from Multiview's licence grant.
+- **Status:** opt-in; excluded from the default build and from Conspect's licence grant.
 
 ---
 
 ## 2. Bundled fonts — SIL Open Font License 1.1 (OFL)
 
-Multiview embeds a small set of fonts (used for timecode, labels, and the
+Conspect embeds a small set of fonts (used for timecode, labels, and the
 failure-path cards such as the "SIGNAL LOST" card) so that glyph metrics are
 deterministic with no dependency on host-installed fonts. These fonts are **not**
-covered by Multiview's license; they are redistributed under the **SIL Open Font
+covered by Conspect's license; they are redistributed under the **SIL Open Font
 License, Version 1.1 (OFL-1.1)**. The full OFL-1.1 text ships alongside each font
 file. See the root [`NOTICE`](NOTICE) file for the canonical attribution.
 
@@ -85,7 +87,7 @@ file. See the root [`NOTICE`](NOTICE) file for the canonical attribution.
 
 ## 3. Rust crate dependencies — predominantly MIT and/or Apache-2.0
 
-Multiview is built on the Rust crate ecosystem. The transitive dependency graph is
+Conspect is built on the Rust crate ecosystem. The transitive dependency graph is
 **predominantly dual-licensed `MIT OR Apache-2.0`**, with a minority under other
 permissive licenses. The license allow-list enforced by `cargo deny` (see
 [`deny.toml`](deny.toml)) for these dependencies is:
@@ -116,7 +118,7 @@ surprises.
 
 Two proprietary, professional-AV SDKs are supported **only** through off-by-default,
 license-isolating integrations. Neither SDK is **vendored, bundled, statically
-linked, or distributed** with Multiview, and neither is required to build or run the
+linked, or distributed** with Conspect, and neither is required to build or run the
 default product. Using these integrations requires **your own licence** for, and
 your own copy of, the respective SDK/runtime, supplied by its vendor under that
 vendor's terms.
@@ -133,22 +135,22 @@ with the SDK vendor.
 
 - **Vendor:** NDI® is a registered trademark of Vizrt Group (formerly NewTek, Inc.).
 - **License:** proprietary NDI SDK Licence Agreement (vendor-supplied; not granted by
-  Multiview).
+  Conspect).
 - **Distribution:** never vendored; runtime-loaded only. Mandatory NDI attribution
   applies when the feature is used.
 
 ### 4b. Audio over IP — AES67 / SMPTE ST 2110-30 (open standard, no proprietary SDK)
 
-Multiview transports audio over IP using **AES67 / SMPTE ST 2110-30** — open,
+Conspect transports audio over IP using **AES67 / SMPTE ST 2110-30** — open,
 royalty-free industry standards (RTP + L16/L24 PCM + SDP + SAP + PTP). This is
 included in the public build with **no proprietary SDK**. It is also Audinate's own
 licence-free bridge to Dante networks, so it interoperates with Dante devices that
 support Dante's AES67 mode. **Native Dante integration is NOT supported** (per
-[ADR-T010](docs/decisions/ADR-T010.md)); there is no Audinate SDK in any Multiview
+[ADR-T010](docs/decisions/ADR-T010.md)); there is no Audinate SDK in any Conspect
 build. References to Dante here are for interoperability and identification only.
 
 > Dante® and Audinate® are registered trademarks of Audinate Pty Ltd; other
-> Dante-family product names are trademarks of Audinate Pty Ltd. Multiview is an
+> Dante-family product names are trademarks of Audinate Pty Ltd. Conspect is an
 > independent project of Aperim Pty Ltd, not affiliated with, endorsed by, or
 > sponsored by Audinate; the marks are used nominatively, for identification only.
 
@@ -159,7 +161,7 @@ components (NDI) relate to a commercial deployment.
 
 ## 5. Web SPA dependencies — predominantly MIT (npm)
 
-The Multiview web UI (`web/`, a React + TypeScript SPA) depends on npm packages that
+The Conspect web UI (`web/`, a React + TypeScript SPA) depends on npm packages that
 are **predominantly MIT**, with a minority under Apache-2.0, BSD, and ISC. As with
 the Rust crates, each package remains under its own license; the authoritative
 listing is produced by the SPDX/npm tooling described below.
@@ -196,4 +198,4 @@ complete and current third-party attribution record.
 ---
 
 *This file must be kept intact and passed on with any copy or distribution of the
-Multiview software (see [`LICENSE`](LICENSE) §8).*
+Conspect software (see [`LICENSE`](LICENSE) §8).*

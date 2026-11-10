@@ -1,7 +1,7 @@
 # Changelog
 
-All notable changes to **Multiview** — an efficient, hardware-accelerated, Rust live video
-multiview generator — are documented in this file.
+All notable changes to **Conspect** — Rust software for live-media production, routing and
+monitoring — are documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
@@ -20,14 +20,19 @@ implementation will build against.
 
 ### Changed
 
-- **Relicensed from `MIT OR Apache-2.0` to the Multiview Source-Available Non-Commercial License,
-  Version 1.0** (© Aperim Pty Ltd, ABN 46 150 699 737). Multiview is now **source-available**, not
-  open-source/free-software: free for genuine personal/home and other non-commercial use, plus three
-  free exceptions (First Nations Owned Broadcasters; small Community Broadcasters; smaller Content
-  Creators). All other use is Commercial Use and requires a paid Commercial License
-  (licensing@aperim.com). See [`LICENSE`](LICENSE) and [`LICENSE-COMMERCIAL.md`](LICENSE-COMMERCIAL.md).
-  The dependency-licensing posture is unchanged (FFmpeg linked LGPL; `gpl-codecs` → GPL opt-in; NDI
-  proprietary, runtime-loaded).
+- **Conspect Source-Available Non-Commercial License, Version 2.0** now governs
+  copies supplied under those terms. Free use is personal, home, hobby and learning
+  use plus the named non-monetized exceptions; creators must have fewer than 55,000
+  aggregate audience members. Religious use and monetized Conspect content require
+  paid licensing, including sponsorships and promotional gifts. Free use excludes
+  paid/metered features and has no warranty, subject to statutory rights. Source
+  study and authorized-use copies do not grant general modification, reproduction
+  or redistribution rights. See [`LICENSE`](LICENSE).
+- **Historical Version 1.0 relicensing event:** the project, then named Multiview,
+  moved from `MIT OR Apache-2.0` to the Multiview Source-Available Non-Commercial
+  License (© Aperim Pty Ltd). That event's broader grants are not the current policy
+  for Version 2.0 copies. Earlier valid grants remain subject to their original terms.
+  Third-party rights remain intact; enabling GPL codecs does not relicense Conspect.
 
 ### Added
 
@@ -114,15 +119,16 @@ The verification-hardened deep briefs that back the implementation
 ### Notes
 
 - **Platforms:** Linux (x86_64 + aarch64) and macOS (Apple Silicon + Intel). **No Windows.**
-- **Default build is LGPL-clean and redistributable.** The `gpl-codecs` feature (x264/x265)
-  makes the build GPL and is opt-in only; the proprietary `ndi` feature is off by default and
-  runtime-loaded (never vendored). See the [licensing model][conventions].
+- **Default dependencies are LGPL-clean; this is not a Conspect redistribution grant.**
+  The opt-in `gpl-codecs` feature adds GPL dependencies and combined-work obligations,
+  not permission to relicense or distribute Conspect. The proprietary `ndi` feature
+  is off by default and runtime-loaded (never vendored). See the [licensing model][conventions].
 
 ---
 
 ## Versioning policy
 
-Multiview follows **[Semantic Versioning 2.0.0](https://semver.org/spec/v2.0.0.html)**
+Conspect follows **[Semantic Versioning 2.0.0](https://semver.org/spec/v2.0.0.html)**
 (`MAJOR.MINOR.PATCH`):
 
 - **MAJOR** — incompatible API changes (Rust public API across crates, and the

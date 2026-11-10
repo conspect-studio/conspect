@@ -1,4 +1,5 @@
-# Multiview — Bulletproof Output & Resilience
+<a id="multiview--bulletproof-output--resilience"></a>
+# Conspect — Bulletproof Output & Resilience
 
 > **Status:** Architecture overview. Authoritative depth lives in the deep brief
 > [`../research/resilience-and-av.md`](../research/resilience-and-av.md); the load-bearing
@@ -6,11 +7,11 @@
 > and [ADR-R009](../decisions/ADR-R009.md). Where this page and a brief differ, the
 > [canonical conventions](./conventions.md) win.
 
-Multiview exists to do one thing without compromise: **once an output session starts, it never
-falters.** Inputs may die, change resolution mid-stream, hang in a C library, or vanish entirely;
-the GPU may be reset out from under us; an encoder may leak itself to death. None of that is allowed
-to reach the wire. This document describes the mechanisms that make that guarantee provable rather
-than aspirational.
+Conspect's resilience design goal is continuous output despite input failures, not a warranty of
+uninterrupted service. The internal engineering requirement remains uncompromising: **once an
+output session starts, it never falters.** Inputs may die, change resolution mid-stream, hang in a
+C library, or vanish entirely; the GPU may reset; an encoder may leak. The mechanisms and probes
+below are designed to contain those faults and verify the output-clock invariant.
 
 ---
 

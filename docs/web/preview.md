@@ -1,4 +1,5 @@
-# Multiview — Preview Subsystem
+<a id="multiview--preview-subsystem"></a>
+# Conspect — Preview Subsystem
 
 The preview subsystem lets operators *see* what the engine is doing — every input, the composed
 program, and every real encoded output — from a web browser. It is a **strictly best-effort,

@@ -1,6 +1,6 @@
 # Layout & Configuration
 
-How Multiview describes **what to render**: the layered template model (Canvas → Layout → Cells →
+How Conspect describes **what to render**: the layered template model (Canvas → Layout → Cells →
 Overlays), the source-binding and hot-swap model, transitions, the named presets, and the
 **config-as-code** schema used for both human authoring (TOML) and the wire/API (JSON).
 
@@ -408,7 +408,7 @@ including the HDR canvas variant (`color.profile = "hdr-pq-bt2020"`, `pixel_form
 
 ## 9. Config-as-code (import / export)
 
-Multiview is config-as-code first: the entire engine state (sources + layouts + outputs + policy) is a
+Conspect is config-as-code first: the entire engine state (sources + layouts + outputs + policy) is a
 single declarative document that can be exported, version-controlled, diffed, and re-applied. TOML
 is for human authoring; JSON is the canonical over-the-wire form. Layered loading uses `figment`
 (TOML + JSON + env overrides). See [ADR-0010](../decisions/ADR-0010.md) and

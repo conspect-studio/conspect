@@ -1,25 +1,32 @@
-# Multiview Individual Contributor License Agreement (ICLA)
+# Conspect Individual Contributor License Agreement (ICLA)
 
-Version 1.0
+Version 1.0 (product-name clarification: Conspect, formerly Multiview)
+
+> This naming clarification does not revoke or narrow any grant already made under
+> this Agreement. Its grants concern the contributor's own Contribution, not a
+> general right to modify or reproduce the rest of Conspect. Obtain separate written
+> permission before modifying or distributing Conspect to prepare a contribution
+> where the applicable software license does not permit it. The current software
+> license is [Version 2.0](LICENSE); the CLA is not a substitute for that permission.
 
 > **Plain-English starting point — not legal advice.** This Agreement is a clear,
 > Apache-ICLA-style starting point provided for transparency. It is **not** a substitute for
 > legal advice; the parties should have it reviewed by counsel before relying on it. Where this
 > document and a separately signed agreement disagree, the signed agreement governs.
 
-Thank you for your interest in contributing to Multiview, a project of **Aperim Pty Ltd**
+Thank you for your interest in contributing to Conspect, a project of **Aperim Pty Ltd**
 (ABN 46 150 699 737), Suite 108, 9 Hutchinson Street, St Peters, NSW 2044, Australia ("Aperim",
 "we", "us", "our").
 
 This Contributor License Agreement ("Agreement") sets out the terms under which You make
-Contributions to Aperim. It exists so that Aperim can distribute Multiview under both its
+Contributions to Aperim. It exists so that Aperim can distribute Conspect under both its
 source-available non-commercial licence **and** paid commercial/proprietary licences — i.e. so
 your Contribution can be **dual-licensed**. You retain ownership of the copyright in your
 Contribution; you grant Aperim the licences set out below.
 
 By submitting a Contribution to the project (for example, by opening or updating a pull request,
 or by sending a patch), You accept and agree to the terms of this Agreement for all of Your
-present and future Contributions to Multiview.
+present and future Contributions to Conspect.
 
 ## 1. Definitions
 
@@ -30,11 +37,11 @@ present and future Contributions to Multiview.
   You contribute solely in Your individual capacity.
 - **"Contribution"** means any original work of authorship, including any modifications or
   additions to existing work, that You intentionally submit to Aperim for inclusion in, or
-  documentation of, Multiview. "Submit" means any form of electronic, verbal, or written
+  documentation of, Conspect. "Submit" means any form of electronic, verbal, or written
   communication sent to Aperim or its representatives — including pull requests, patches, issues,
   and code-review comments that contain code — but excludes communication that You conspicuously
   mark, in writing, as **"Not a Contribution"**.
-- **"Multiview"** / the **"project"** means the Multiview software and associated materials
+- **"Conspect"** / the **"project"** means the Conspect software and associated materials
   maintained by Aperim.
 
 ## 2. Grant of copyright licence
@@ -45,12 +52,15 @@ copyright licence to reproduce, prepare derivative works of, publicly display, p
 sublicense, and distribute Your Contribution and such derivative works.
 
 You further grant Aperim the right to **license and relicense Your Contribution (in whole or in
-part, alone or as part of Multiview) under any terms, including commercial, proprietary, and
+part, alone or as part of Conspect) under any terms, including commercial, proprietary, and
 closed-source terms**, and to do so on a non-exclusive basis through any number of tiers of
 sublicensees. You acknowledge that Aperim is under no obligation to use Your Contribution and may
 decide to include or remove it at its sole discretion.
 
-For clarity: **inbound = outbound, plus the right to license under other terms.** You retain all
+These are grants from You concerning Your Contribution, not permission from Aperim
+to modify or reproduce the rest of Conspect. Existing grants under this Agreement
+remain intact; they do not make the entire product available under those terms.
+You retain all
 right, title, and interest in and to Your Contribution; nothing in this Agreement transfers
 ownership of Your copyright to Aperim, and You remain free to use Your Contribution for any other
 purpose.
@@ -60,12 +70,12 @@ purpose.
 Subject to the terms of this Agreement, You hereby grant to Aperim and to recipients of software
 distributed by Aperim a **perpetual, worldwide, non-exclusive, royalty-free, irrevocable** (except
 as stated in this section) patent licence to make, have made, use, offer to sell, sell, import,
-and otherwise transfer Your Contribution and Multiview, where such licence applies only to those
+and otherwise transfer Your Contribution and Conspect, where such licence applies only to those
 patent claims licensable by You that are necessarily infringed by Your Contribution alone or by
-combination of Your Contribution with Multiview.
+combination of Your Contribution with Conspect.
 
 If any entity institutes patent litigation against You or any other entity (including a
-cross-claim or counterclaim in a lawsuit) alleging that Your Contribution, or Multiview to which
+cross-claim or counterclaim in a lawsuit) alleging that Your Contribution, or Conspect to which
 You have contributed, constitutes direct or contributory patent infringement, then any patent
 licences granted to that entity under this Agreement for that Contribution or work shall terminate
 as of the date such litigation is filed.

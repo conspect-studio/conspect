@@ -450,7 +450,7 @@ export function AudioPage(): JSX.Element {
                 <TableRow>
                   <TableCell colSpan={9} className="text-muted-foreground">
                     <Trans>
-                      No routes yet — without routes the multiview carries no
+                      No routes yet — without routes Conspect carries no
                       managed audio.
                     </Trans>
                   </TableCell>

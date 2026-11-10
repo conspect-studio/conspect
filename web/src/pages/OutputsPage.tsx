@@ -224,7 +224,7 @@ function OutputKindFields({
           label={t`NDI source name to advertise`}
           value={form.ndiName}
           required
-          placeholder={t`Multiview Program`}
+          placeholder={t`Conspect Program`}
           error={errors.ndiName}
           onChange={(next): void => {
             setForm({ ...form, ndiName: next });

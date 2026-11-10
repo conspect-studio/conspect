@@ -1,6 +1,7 @@
-# Multiview — Management Web App
+<a id="multiview--management-web-app"></a>
+# Conspect — Management Web App
 
-> The design of the **management SPA** that fully and completely operates the Multiview engine: its
+> The design of the **management SPA** that fully and completely operates the Conspect engine: its
 > stack, screens, the canvas layout editor, the typed-client-from-OpenAPI flow, and the UX,
 > accessibility, and theming principles that make it a polished broadcast control surface.
 >
@@ -16,8 +17,9 @@ HTTP/realtime API on the **same origin** — there is no second service to deplo
 
 ## 1. What the app is for
 
-Multiview is a GPU compositor that ingests many live sources, composites a templated multiview, and serves
-it over RTSP / HLS / NDI / RTMP / SRT with **bulletproof continuous output**. The management app is
+Conspect supports live-media production, routing and monitoring: ingesting sources, composing
+layouts, mixing audio, and serving outputs over RTSP / HLS / NDI / RTMP / SRT. Continuous output
+despite input failures is a design goal, not a warranty. The management app is
 the human surface over the whole control plane: every parameter the engine exposes is reachable
 through a `/api/v1` resource and surfaced in a named screen + control. The authoritative proof of
 completeness is the **[Management Capability Matrix](../research/management-capability-matrix.md)** —
@@ -137,7 +139,7 @@ Add / edit / test ingest of `rtsp | hls | ts | srt | rtmp | ndi | file | test`. 
 
 ### 4.3 Layout / Template Editor (react-konva + dnd-kit)
 
-The flagship, highest-polish surface and the reason React was chosen. Multiview is a free-form GPU
+The flagship, highest-polish surface and the reason React was chosen. Conspect is a free-form GPU
 compositor (overlap, z-order, rotation, sub-pixel placement) — **not** a strict grid — so the editor
 uses **react-konva** for the canvas and **dnd-kit** for accessible drag ([ADR-W004](../decisions/ADR-W004.md)).
 

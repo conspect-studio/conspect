@@ -560,7 +560,7 @@ export function ApplySemanticsCallout({
           <Trans>
             Changes saved here are stored, not yet live: the engine does not
             hot-add outputs. Apply them by exporting the configuration and
-            restarting Multiview. Layout apply, source swap, routing, and
+            restarting Conspect. Layout apply, source swap, routing, and
             salvos act on the running engine immediately.
           </Trans>
         )}{' '}
@@ -588,7 +588,7 @@ export function ExportConfigButton({
         downloadConfigExport(result);
         toast({
           title: t`Configuration exported`,
-          description: t`Saved as ${result.filename}. Restart Multiview with this file to apply stored changes.`,
+          description: t`Saved as ${result.filename}. Restart Conspect with this file to apply stored changes.`,
         });
       })
       .catch((error: unknown): void => {

@@ -1,10 +1,10 @@
 # Observability
 
-How to see what Multiview is doing: structured **tracing/logging**, **Prometheus metrics**
+How to see what Conspect is doing: structured **tracing/logging**, **Prometheus metrics**
 (per-tile FPS/drops/bitrate, encode time, GPU/VRAM, output gaps/jitter), **health endpoints**
 (`/livez`, `/readyz`), and how all of it relates to the realtime **event stream**.
 
-Observability in Multiview is owned by the [`multiview-telemetry`](../architecture/conventions.md#3-canonical-crate-map)
+Observability in Conspect is owned by the [`multiview-telemetry`](../architecture/conventions.md#3-canonical-crate-map)
 crate (`tracing` + Prometheus metrics + health). It is built on the same first-class
 [output-validity probe](../decisions/ADR-R009.md) that arbitrates the project's central
 [bulletproof-output invariant](../architecture/conventions.md#5-canonical-technical-invariants):

@@ -156,7 +156,7 @@
       },
       "DeviceMode": {
         "contentType": "application/json",
-        "description": "Carries the impact declared BEFORE apply per the instant-apply doctrine: vendor-decoder mode convergence is `dev`-class (the device pipeline restarts; Multiview program output is unaffected).",
+        "description": "Carries the impact declared BEFORE apply per the instant-apply doctrine: vendor-decoder mode convergence is `dev`-class (the device pipeline restarts; Conspect program output is unaffected).",
         "name": "DeviceMode",
         "payload": {
           "$ref": "#/components/schemas/DeviceMode"
@@ -768,7 +768,7 @@
             "type": "boolean"
           },
           "decode": {
-            "description": "The device can decode (receive a Multiview output).",
+            "description": "The device can decode (receive a Conspect output).",
             "type": "boolean"
           },
           "display": {
@@ -776,7 +776,7 @@
             "type": "boolean"
           },
           "encode": {
-            "description": "The device can encode (offers streams Multiview ingests as Sources).",
+            "description": "The device can encode (offers streams Conspect ingests as Sources).",
             "type": "boolean"
           },
           "firmware_update": {
@@ -997,7 +997,7 @@
             "type": "boolean"
           },
           "output_ref": {
-            "description": "The Multiview output this decode stream is bound to, if any.",
+            "description": "The Conspect output this decode stream is bound to, if any.",
             "type": "string"
           },
           "role": {
@@ -1250,7 +1250,7 @@
         "type": "object"
       },
       "ImpactClass": {
-        "description": "Declared impact class of a management change: cp (control-plane only), c1 (hot/seamless at a frame boundary), c2 (controlled reset via make-before-break), dev (the DEVICE pipeline restarts; Multiview program output is unaffected).",
+        "description": "Declared impact class of a management change: cp (control-plane only), c1 (hot/seamless at a frame boundary), c2 (controlled reset via make-before-break), dev (the DEVICE pipeline restarts; Conspect program output is unaffected).",
         "enum": [
           "cp",
           "c1",
@@ -2232,19 +2232,19 @@
   },
   "info": {
     "contact": {
-      "name": "The Multiview Authors",
+      "name": "The Conspect Authors",
       "url": "https://github.com/conspect-studio/conspect"
     },
-    "description": "WebSocket and SSE realtime event stream for the Multiview engine. Every message uses a single versioned envelope (ADR-RT002). Topics: tiles, inputs, outputs, audio.meters, alerts, alarms, tally, layout, config, logs, jobs, preview, system, capabilities, devices, switcher. The WebSocket endpoint (/api/v1/ws) is bidirectional (events + subscription control frames); the SSE endpoint (/api/v1/events) is server-to-client only.",
+    "description": "WebSocket and SSE realtime event stream for the Conspect engine. Every message uses a single versioned envelope (ADR-RT002). Topics: tiles, inputs, outputs, audio.meters, alerts, alarms, tally, layout, config, logs, jobs, preview, system, capabilities, devices, switcher. The WebSocket endpoint (/api/v1/ws) is bidirectional (events + subscription control frames); the SSE endpoint (/api/v1/events) is server-to-client only.",
     "externalDocs": {
       "description": "Realtime API reference",
       "url": "https://github.com/conspect-studio/conspect/blob/main/docs/api/realtime.md"
     },
     "license": {
-      "name": "Multiview Source-Available Non-Commercial License",
+      "name": "Conspect Source-Available Non-Commercial License v2",
       "url": "https://github.com/conspect-studio/conspect/blob/main/LICENSE"
     },
-    "title": "Multiview Realtime API",
+    "title": "Conspect Realtime API",
     "version": "1.0.0"
   },
   "operations": {
@@ -2284,7 +2284,7 @@
       "variables": {
         "host": {
           "default": "[::1]:8080",
-          "description": "Hostname and optional port of the Multiview daemon. IPv6-first: the default is the IPv6 loopback `[::1]`; override with your host."
+          "description": "Hostname and optional port of the Conspect daemon. IPv6-first: the default is the IPv6 loopback `[::1]`; override with your host."
         }
       }
     },
@@ -2296,7 +2296,7 @@
       "variables": {
         "host": {
           "default": "[::1]:8080",
-          "description": "Hostname and optional port of the Multiview daemon. IPv6-first: the default is the IPv6 loopback `[::1]`; override with your host."
+          "description": "Hostname and optional port of the Conspect daemon. IPv6-first: the default is the IPv6 loopback `[::1]`; override with your host."
         }
       }
     }

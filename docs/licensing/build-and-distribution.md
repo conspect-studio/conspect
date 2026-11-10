@@ -6,6 +6,14 @@
 > public, which must be private, why, and the CI work to enforce it.** It is engineering advice, not
 > legal advice.
 
+> **Version 2.0 clarification:** this historical engineering matrix concerns
+> **Aperim's own authorized distribution**, not permission for recipients to
+> redistribute Conspect. LGPL-clean dependencies do not grant source-reuse or
+> distribution rights over Conspect's own code. The current [license](../../LICENSE)
+> grants only private study and authorized product use with necessary copies;
+> separate written permission is required for other reproduction or distribution.
+> Third-party license rights remain intact.
+
 ## 1. Why there must be more than one build
 
 The public *source* is offered under the source-available non-commercial license (see the repo
@@ -46,7 +54,12 @@ on the open AES67 / ST 2110-30 path below, which is license-clean and public.)*
 deployment gets H.264/H.265 from the LGPL-clean build, so the `-gpl` artifact is a narrow niche
 (CPU-only H.264/H.265 on a GPU-less host). Keeping it private costs almost nothing.
 
-## 3. The build / distribution matrix
+## 3. Historical Aperim build / distribution matrix
+
+This records Aperim's distribution planning, not recipient grants. Neither an
+LGPL-clean build nor adding GPL dependencies authorizes recipients to redistribute
+Conspect. Current rights come from the applicable license, including its Section 9
+third-party protections. This table is not a mechanism to relicense Conspect.
 
 | Build / image | Cargo features | FFmpeg | Contents | Combined-work license | Channel |
 |---|---|---|---|---|---|
@@ -56,8 +69,10 @@ deployment gets H.264/H.265 from the LGPL-clean build, so the `-gpl` artifact is
 
 Notes that flow into the license model:
 
-- **GPL can't be public** — distributing a `libx264` build forces GPL terms, which grant recipients
-  full *commercial* freedom and erase the model. So it is never published. A paying H.264/H.265
+- **Do not publish an incompatible combined work.** Distribution of a `libx264`
+  combined build requires satisfying GPL obligations and having permission for
+  Conspect's own code; this license grants no such distribution permission. Adding
+  the dependency does not itself relicense Conspect or erase its restrictions. A paying H.264/H.265
   customer instead uses the **HW encoders** (no GPL at all), self-builds `gpl-codecs` for private
   internal use, or takes a **commercially-licensed** x264/x265 (x264 LLC / MulticoreWare) under their
   commercial agreement (+ MPEG-LA/Access Advance patent licensing, which is theirs to hold).

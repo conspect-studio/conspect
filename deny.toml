@@ -22,15 +22,15 @@ ignore = [
 [licenses]
 version = 2
 confidence-threshold = 0.9
-# Our own workspace crates carry a non-SPDX `license-file` (the Multiview
+# Our own workspace crates carry a non-SPDX `license-file` (the Conspect
 # Source-Available Non-Commercial License) and are all `publish = false`. This
-# license check gates THIRD-PARTY DEPENDENCIES, not Multiview's own code, so skip
+# license check gates THIRD-PARTY DEPENDENCIES, not Conspect's own code, so skip
 # our unpublished workspace members (otherwise cargo-deny cannot match the custom
 # license against the SPDX allowlist below and would fail by design).
 private = { ignore = true }
 # This allowlist gates the licenses of THIRD-PARTY DEPENDENCIES only; it does
-# not describe Multiview's own license. Multiview's own code is source-available,
-# non-commercial (the Multiview Source-Available Non-Commercial License v1.0,
+# not describe Conspect's own license. Conspect's own code is source-available,
+# non-commercial (the Conspect Source-Available Non-Commercial License v2,
 # © Aperim Pty Ltd; see LICENSE) — that is NOT one of the dependency licenses
 # below and is out of scope for cargo-deny. The default build must keep its
 # dependency closure permissively-licensed / LGPL-clean (FFmpeg linked LGPL).

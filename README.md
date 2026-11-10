@@ -1,9 +1,10 @@
-# Multiview
+# Conspect
 
-**Turn many live video feeds into one dependable multiviewer.** Multiview ingests your
-cameras, encoders and streams, composites them into a clean, templated wall on the GPU, and
-serves that wall out in the formats your facility already uses — engineered to run well on
-ordinary hardware and to **never drop a frame**.
+**Live media production, routing and monitoring on ordinary hardware.** Conspect
+ingests cameras, encoders and streams; composes video layouts; mixes audio; and
+serves outputs through multiple transports, with a web UI and automation API.
+A multiview is one use of Conspect, not the limit of the product. Its fixed-cadence
+output design aims to isolate input failures; this is a design goal, not a warranty.
 
 <!-- badges: CI / license / container — kept minimal on purpose -->
 [![License: Source-Available Non-Commercial](https://img.shields.io/badge/license-Source--Available%20Non--Commercial-blue.svg)](#licensing)
@@ -17,27 +18,28 @@ ordinary hardware and to **never drop a frame**.
 > **[FEATURES.md](FEATURES.md)** for the live, per-feature status matrix.
 
 > [!NOTE]
-> **New here?** [**WHY.md**](WHY.md) is the short story of why Multiview exists — a tool to help
+> **New here?** [**WHY.md**](WHY.md) is the short story of why Conspect exists — a tool to help
 > emerging artists and technicians get hands-on with live-production concepts on commodity hardware.
 
 ---
 
-## Why Multiview
+## Why Conspect
 
-- **Output that never falters.** A single fixed-cadence clock emits one valid, correctly-timed
-  frame every tick — *forever*, independent of any input. A dead camera shows a "no signal"
-  tile; it never freezes, stalls or corrupts the wall.
+- **Fixed-cadence output by design.** The engine's clock targets one valid,
+  correctly-timed frame per tick, independent of input cadence. Input-isolation and
+  "no signal" fallback paths aim to keep a failed camera from interrupting output.
+  These engineering objectives are not a guarantee of uninterrupted operation.
 - **Runs on commodity hardware.** NVIDIA, Intel, AMD or Apple Silicon — or pure software as a
-  universal fallback. Multiview decodes at display size, stays NV12 end-to-end, keeps frames on
+  universal fallback. Conspect decodes at display size, stays NV12 end-to-end, keeps frames on
   the GPU, and sheds load tile-by-tile under pressure before the program output is ever touched.
 - **Many sources in, many destinations out.** RTSP, HLS, MPEG-TS, SRT, RTMP, NDI, files and
   synthetic test patterns in; composite **once** and fan the same stream out to RTSP, HLS/LL-HLS,
   NDI, RTMP and SRT.
 - **Built to be operated.** Declarative TOML config, an embedded web UI, and a REST/WebSocket/SSE
   API with interactive OpenAPI docs — scriptable and automatable end to end.
-- **Source-available and license-clean.** Pure Rust under the **Multiview Source-Available
-  Non-Commercial License** — free for genuine personal/home and other non-commercial use (a
-  commercial licence is required otherwise) — with a default build that is LGPL-clean.
+- **Source-available and license-clean.** Pure Rust under the **Conspect Source-Available
+  Non-Commercial License** — limited free eligibility, no general source-reuse grant,
+  and paid licensing otherwise (see [Licensing](#licensing)) — with an LGPL-clean default build.
 
 ---
 
@@ -80,10 +82,10 @@ source and re-run `up -d`. Tear down with `docker compose -f deploy/compose.yaml
 
 ## What it does
 
-Multiview is a headless, scriptable compositor and router. It samples many independent live
+Conspect is a headless, scriptable compositor and router. It samples many independent live
 inputs into a fixed, templated canvas and encodes that canvas **once per rendition** — then fans
 the same packets to every transport. Inputs are *sampled*, never allowed to *pace* the output, so
-one misbehaving source can never warp or stall the wall.
+the design isolates a misbehaving source from the output clock.
 
 | Area | In brief |
 |------|----------|
@@ -121,13 +123,13 @@ with a universal software fallback. **No Windows.** Full matrix in
 
 ## Audio over IP — open standards, not Dante
 
-Multiview transports audio over IP using **[AES67](https://en.wikipedia.org/wiki/AES67)** and
+Conspect transports audio over IP using **[AES67](https://en.wikipedia.org/wiki/AES67)** and
 **SMPTE ST 2110-30** — open, royalty-free industry standards. Audio is announced and discovered
 with SAP/SDP and synchronised with PTP (IEEE 1588), so any AES67-compatible device on the network
-can send or receive a Multiview audio stream without a proprietary licence or controller.
+can send or receive a Conspect audio stream without a proprietary licence or controller.
 
 **This still reaches Dante® networks.** Dante devices that support **Dante's own AES67 mode** can
-discover (via SAP) and subscribe to Multiview's AES67 streams, and Multiview can receive theirs —
+discover (via SAP) and subscribe to Conspect's AES67 streams, and Conspect can receive theirs —
 that interop path is exactly what AES67 was created to provide between otherwise-incompatible
 audio-over-IP systems. So choosing open standards does not cut you off from a Dante facility; it
 meets it on the common, standardised ground.
@@ -140,7 +142,7 @@ guidance or support for integrating Dante functionality into open-source project
 
 We'll let that speak for itself. We were disappointed — especially to see an Australian company close
 the door on open, non-commercial, educational work. It's their call to make; ours is to build on open
-standards anyone can learn. Multiview therefore implements the open AES67 / SMPTE ST 2110-30
+standards anyone can learn. Conspect therefore implements the open AES67 / SMPTE ST 2110-30
 standards, which are free for anyone to use and still reach Dante networks through Dante's own AES67
 mode.
 
@@ -148,7 +150,7 @@ If Audinate's terms for open-source and community projects change, we would welc
 Dante support. We will update this section if and when that happens.
 
 > *Dante® and Audinate® are registered trademarks of Audinate Pty Ltd; other Dante-family names
-> (e.g. Dante AV, Dante Domain Manager) are trademarks of Audinate Pty Ltd. Multiview is an
+> (e.g. Dante AV, Dante Domain Manager) are trademarks of Audinate Pty Ltd. Conspect is an
 > independent project of Aperim Pty Ltd and is not affiliated with, endorsed by, or sponsored by
 > Audinate — the marks are used nominatively, to identify Audinate's products and the Dante
 > audio-networking standard only.*
@@ -157,19 +159,57 @@ Dante support. We will update this section if and when that happens.
 
 ## Licensing
 
-Project code is **source-available**, licensed under the **Multiview Source-Available
-Non-Commercial License** (see [`LICENSE`](LICENSE)) — © Aperim Pty Ltd. It is **free** for genuine
-personal, home, and other non-commercial use, plus three free exceptions (First Nations Owned
-Broadcasters; small Community Broadcasters; smaller Content Creators) defined in the License. All
-other use — businesses, education, government, productization/appliances, and streamers/creators —
-is Commercial Use and requires a paid Commercial License; see
-[`LICENSE-COMMERCIAL.md`](LICENSE-COMMERCIAL.md) (licensing@aperim.com). This is a source-available
-licence, **not** an open-source or free-software licence.
+Project code is **source-available**, under the **Conspect Source-Available
+Non-Commercial License, Version 2.0** ([`LICENSE`](LICENSE)) — © Aperim Pty Ltd.
+It is **not open source or free software**.
+
+- **Free means personal, home, hobby and learning use**, plus the explicit First
+  Nations Owned Broadcaster, Community Broadcaster and Content Creator exceptions
+  in the license. Creators must have **fewer than 55,000 aggregate audience members**
+  across their channels and **must not monetize their content in any way**.
+- **If you make money or receive commercial benefits from content produced in whole
+  or in part with Conspect, you must pay for commercial licensing.** This includes
+  YouTube and every other platform: ads, sponsorships, subscriptions, affiliate
+  income, content-linked tips or donations, and free products supplied for promotion.
+  There is no minimum income or profit threshold. These exclusions apply even if
+  you otherwise meet a free exception.
+- **Religious use is not free**, regardless of group size, income or charitable
+  status. This includes a one-person ministry or religious content creator who
+  would otherwise meet a Solo or creator size limit.
+- **Free use excludes paid and metered features**, services, credits and usage.
+  Qualifying for free product use does not waive their separate charges.
+- **Free use is provided “as is”, without any warranty**, including fitness for use
+  or for a particular purpose. Non-excludable statutory rights remain intact.
+
+All other use requires the applicable paid Commercial License; see
+[`LICENSE-COMMERCIAL.md`](LICENSE-COMMERCIAL.md) or contact licensing@aperim.com.
+Version 2.0 does not retroactively revoke rights validly granted for copies supplied
+under earlier terms; it governs copies supplied under Version 2.0.
+
+### Learn from the source; do not reproduce the product
+
+We publish the source so you can understand how a live-media system works, down to
+its code. You may read and privately study it, for example to understand output
+clocks, buffering, GPU composition and transport design. The license also permits
+the copies and unmodified builds necessary for authorized product use.
+
+**Source visibility is not permission to use or reproduce Conspect in whole or in
+part outside those express grants.** Copying its protected implementation into
+another application, porting it, or making a derivative product requires separate
+written permission. **Pointing an AI agent at this codebase and saying “reproduce
+this” to copy Conspect is a license violation**, not a learning exception. A paid
+operating license does not automatically grant source-reuse rights either.
+
+This does not claim ownership of general ideas or techniques, prohibit genuinely
+independent implementations, or override third-party licenses or rights that law
+cannot exclude. See Sections 2 and 9 of the license.
 
 The **default build remains LGPL-clean** (FFmpeg linked LGPL; all scaling/compositing in-house).
 Two capabilities are strictly opt-in and change the licensing of the resulting build:
 
-- **`gpl-codecs`** — adds x264/x265 → the build becomes **GPL**.
+- **`gpl-codecs`** — adds GPL-covered x264/x265. GPL obligations apply to a combined
+  work if distributed; adding the feature does not relicense Conspect's own code or
+  grant permission to distribute it. See Section 9 of the license.
 - **`ndi`** — uses the proprietary, runtime-loaded NDI SDK (never vendored) under its EULA with
   mandatory attribution: *NDI® is a registered trademark of Vizrt NDI AB.*
 
@@ -181,5 +221,8 @@ and [ADR-0012](docs/decisions/ADR-0012.md).
 
 ## Contributing
 
-Issues and PRs are welcome — please read [CONTRIBUTING.md](CONTRIBUTING.md) and the
-[Code of Conduct](CODE_OF_CONDUCT.md) first. Security reports: see [SECURITY.md](SECURITY.md).
+Issues and feedback are welcome. Before modifying or distributing Conspect for a
+patch or pull request, obtain separate written permission; the source license does
+not grant general modification or redistribution rights. Read
+[CONTRIBUTING.md](CONTRIBUTING.md) and the [Code of Conduct](CODE_OF_CONDUCT.md).
+Security reports: see [SECURITY.md](SECURITY.md).

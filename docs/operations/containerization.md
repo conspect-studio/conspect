@@ -1,6 +1,6 @@
 # Containerization
 
-How Multiview is packaged as a Linux container image: a **multi-stage build** that compiles an
+How Conspect is packaged as a Linux container image: a **multi-stage build** that compiles an
 **LGPL-clean FFmpeg** plus the `multiview` binary, then ships a lean runtime that relies on the
 **NVIDIA Container Toolkit** (NVENC/NVDEC) for discrete GPUs and **VAAPI `/dev/dri` passthrough**
 for Intel/AMD. The container assets will live under `deploy/` (Dockerfile, compose, entrypoint), added during
@@ -138,15 +138,19 @@ docker run \
 
 ## 4. Base image, dynamic linking & LGPL/GPL implications
 
-The licensing model is the [conventions](../architecture/conventions.md) §7 and
-[ADR-0012](../decisions/ADR-0012.md); the table below is just the container-specific view.
+The current [Conspect Source-Available Non-Commercial License Version 2.0](../../LICENSE)
+governs project code: private study and copies necessary for authorized use are permitted, not
+general modification, distribution or reproduction. Building an image does not authorize
+redistributing it. See [conventions](../architecture/conventions.md) §7; the historical
+[ADR-0012](../decisions/ADR-0012.md) describes dependency choices, not current project grants.
+The table below summarizes additional container dependency obligations.
 
 | Build profile | What it adds | Effect on the image |
 |---------------|-------------|----------------------|
-| **default** | LGPL-2.1 FFmpeg (dynamic), NVENC/NVDEC via MIT headers, native AAC + GnuTLS | **Redistributable, LGPL-clean** — the shippable image |
-| **`gpl-codecs`** | x264 / x265 | Whole artifact becomes **GPL-2.0-or-later**; opt-in only |
+| **default** | LGPL-2.1 FFmpeg (dynamic), NVENC/NVDEC via MIT headers, native AAC + GnuTLS | **LGPL-clean dependencies**; Conspect distribution requires separate permission |
+| **`gpl-codecs`** | x264 / x265 | GPL FFmpeg obligations; opt-in only, not permission to redistribute Conspect |
 | **`nonfree`** | libnpp / FDK-AAC / OpenSSL | **NOT redistributable** — internal/personal images only |
-| **`ndi`** | proprietary NDI runtime (runtime-loaded) | Permissive code + NDI EULA + mandatory attribution; SDK **never vendored** into the image |
+| **`ndi`** | proprietary NDI runtime (runtime-loaded) | Source-available project code + NDI EULA + mandatory attribution; SDK **never vendored** into the image |
 
 **Why dynamic linking matters in a container.** FFmpeg is linked **dynamically (LGPL-2.1)** so the
 LGPL relink right is preserved — a user can replace `libav*` inside the image. Keep that property:

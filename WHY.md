@@ -1,13 +1,15 @@
-# Why Multiview exists
+<a id="why-multiview-exists"></a>
+
+# Why Conspect exists
 
 *A note from the author.*
 
-I started Multiview as a side project while I was recovering from a health issue. I needed
+I started Conspect as a side project while I was recovering from a health issue. I needed
 something to point my mind at — a constructive outlet, something to build — and this is what I
 reached for. That's the honest origin: it began small, as a way to keep my hands busy and my
 head engaged while I got well.
 
-What it grew into is a tool I wish I'd had earlier.
+What it grew into is a live-media production, routing and monitoring tool I wish I'd had earlier.
 
 ## The problem I kept running into
 
@@ -28,10 +30,10 @@ A short, incomplete list of the things I mean:
   wall, in real time, without the picture falling apart.
 - **IP transport** — moving video around with RTSP, HLS, SRT, RTMP, NDI and friends.
 - **Audio over IP** — carrying broadcast-grade audio across a network using open standards.
-- **Resilient continuous output** — the unglamorous, load-bearing skill of *never dropping a
-  frame*, no matter how badly an input behaves.
+- **Resilient continuous output** — the unglamorous, load-bearing design goal of continuous
+  frame delivery despite misbehaving inputs — not a warranty of uninterrupted operation.
 
-That's the *space* Multiview explores, not a claim that it does all of it today: some of these you
+That's the *space* Conspect explores, not a claim that it does all of it today: some of these you
 can already exercise, and the most ambitious ones (native IP-broadcast transport and hardware
 reference-clock timing among them) are still on the roadmap — the [feature status
 matrix](FEATURES.md) is honest about which is which.
@@ -43,10 +45,12 @@ into precisely *because* the equipment is hard to get near.
 
 ## What I want it to be
 
-I want Multiview to be a great, genuinely *functional* tool — principally for non-commercial use —
+I want Conspect to be a great, genuinely *functional* tool — free for eligible personal,
+home, hobby and learning use and the three stated exceptions —
 that lets emerging artists and technicians get hands-on with these concepts on hardware they
 already own. A laptop, a spare mini-PC, a single GPU. Something you can run, break, read the source
-of, change, and run again.
+of, and run again within the license terms. Modifying the source requires separate written
+permission; source availability is not a general modification grant.
 
 It is **software for learning and practising**, and I want to be clear about what that means. It
 lets you *exercise* these ideas — composite a real multiview wall, watch what an output clock does
@@ -68,17 +72,18 @@ If you want to see the engineering reasoning, it's all written down in
 Two choices flow directly from that mission, and they're opinions I hold rather than neutral
 facts — so I'll own them as mine.
 
-**It should stay free for the people it's meant to serve.** Multiview is source-available under the
-**Multiview Source-Available Non-Commercial License**: free for genuine personal, home, hobby and
-other non-commercial use (with three defined free exceptions), while commercial use is licensed
-separately. I chose that deliberately. Keeping it free for learners and home users is the whole
-point; the commercial licence is what lets the project sustain itself without putting a price tag
-in front of the student, the hobbyist, or the artist who's just trying to understand how this works.
+**It should stay free for the people it's meant to serve.** Conspect is source-available under the
+**Conspect Source-Available Non-Commercial License v2**: limited free use for genuine personal,
+home, hobby and learning purposes, plus three defined exceptions, subject to the religious-use
+and monetization exclusions. Institutional education and other commercial use require a paid
+license; paid or metered features need separate authorization and payment. I chose that
+deliberately: eligible personal learning can remain accessible while commercial licensing
+helps sustain the project. Free use carries no warranty, subject to non-excludable legal rights.
 The full terms — and what counts as which — are in [the licensing section](README.md#licensing)
 and the [LICENSE](LICENSE).
 
 **It should favour open standards.** Where I can build on an openly-published standard, I do — so
-that what you learn here transfers, and so that Multiview can interoperate without forcing you
+that what you learn here transfers, and so that Conspect can interoperate without forcing you
 through gatekept, commercial-only SDKs. That's a learning argument as much as a technical one: open
 standards are the ones you can read, reason about, and carry with you to the next tool. You can see
 this preference play out in how the audio-over-IP path is approached — the specifics, with the
@@ -88,11 +93,12 @@ evidence behind them, live in the README's
 ## An invitation
 
 If you're an emerging tech, an artist, a student, or just someone curious about how live video
-actually gets made — this is for you. Clone it, run the
+actually gets made — this is for you. Check your eligibility under the [LICENSE](LICENSE), then run the
 [quick start](README.md#quick-start), point a tile at something, and poke at it. Read the source.
-Break it and tell me how. Open an issue or a pull request — the
-[contributing guide](CONTRIBUTING.md) and the [Code of Conduct](CODE_OF_CONDUCT.md) will get you
-started, and everyone is welcome here.
+Tell me what you discover. Open an issue; before modifying source or proposing a patch, read the
+permission requirements and unresolved contribution-policy notice in the
+[contributing guide](CONTRIBUTING.md). The [Code of Conduct](CODE_OF_CONDUCT.md) explains our
+community expectations, and everyone is welcome here.
 
 It started as a way to keep me going through a hard stretch. I'd be glad if it helped you get into
 a field that's worth getting into.

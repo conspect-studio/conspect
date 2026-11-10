@@ -60,7 +60,7 @@ impl ResourceCore {
     }
 }
 
-/// An IS-04 **Node**: the top-level host (a running Multiview instance).
+/// An IS-04 **Node**: the top-level host (a running Conspect instance).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 pub struct Node {
@@ -121,7 +121,7 @@ impl MediaFormat {
     }
 }
 
-/// An IS-04 **Sender**: an egress flow (a Multiview program/preview output).
+/// An IS-04 **Sender**: an egress flow (a Conspect program/preview output).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 pub struct Sender {
@@ -140,7 +140,7 @@ pub struct Sender {
     pub manifest_href: Option<String>,
 }
 
-/// An IS-04 **Receiver**: an ingress flow (a Multiview input).
+/// An IS-04 **Receiver**: an ingress flow (a Conspect input).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 pub struct Receiver {

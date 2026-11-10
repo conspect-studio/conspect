@@ -1,6 +1,6 @@
 # NDI — Network Device Interface (In & Out)
 
-Multiview treats **NDI as a first-class source and sink** for both ingest and output, but it is
+Conspect treats **NDI as a first-class source and sink** for both ingest and output, but it is
 **isolated** from the rest of the build: NDI is proprietary software, so it is off by default,
 runtime-loaded, and carries **mandatory licensing and attribution obligations** that this document
 makes prominent (see [§ Licensing](#licensing--redistribution--attribution-must-read)).
@@ -22,7 +22,7 @@ makes prominent (see [§ Licensing](#licensing--redistribution--attribution-must
 ## 1. What NDI is, and why it is special here
 
 NDI (Network Device Interface) is Vizrt's low-latency IP video transport widely used in
-broadcast/AV. Multiview supports:
+broadcast/AV. Conspect supports:
 
 - **NDI in** — discover sources on the LAN and receive video + audio (+ PTZ/tally/metadata),
   feeding each source into a tile like any other ingest.
@@ -32,7 +32,7 @@ The reason NDI gets its own document (rather than living alongside RTSP/SRT/HLS)
 
 1. **It cannot be vendored or statically linked into the permissive repo.** The SDK is proprietary
    and the binding links a dynamic library at build time — so NDI must be **feature-gated and
-   runtime-loaded** to keep the default build LGPL-clean and redistributable.
+   runtime-loaded** to keep the default build LGPL-clean (dependency status only).
 2. **NDI frames are host-memory.** There is no on-GPU zero-copy island for NDI; every NDI receive
    incurs a host→GPU upload and every NDI send incurs a GPU→host copy. This is an explicit,
    architecturally-acknowledged copy boundary ([ADR-0004](../decisions/ADR-0004.md)).
@@ -50,7 +50,7 @@ Finder/Receiver/Sender/FrameSync/audio/PTZ/tally plus Advanced-SDK hooks, with b
 is absent.** That means a plain `grafton-ndi` dependency would make the *whole build* require the
 proprietary SDK — unacceptable for a default open-source build.
 
-Multiview therefore uses **two layers** behind the `ndi` feature:
+Conspect therefore uses **two layers** behind the `ndi` feature:
 
 | Path | When | Mechanism | SDK required to build? |
 |---|---|---|---|
@@ -59,11 +59,11 @@ Multiview therefore uses **two layers** behind the `ndi` feature:
 
 > Note: NDI 6 uses **`NDIlib_v6_load`** (not the v5 symbol). The dynamic-load backend loads the
 > user-provided runtime at startup and resolves the function table; if the runtime is absent, the
-> `ndi` capability is simply reported unavailable and Multiview continues without it.
+> `ndi` capability is simply reported unavailable and Conspect continues without it.
 
 ```mermaid
 flowchart TB
-    DEF["Default build\n(no ndi feature)"] -->|no NDI symbols| NONE["NDI capability absent\nLGPL-clean, redistributable"]
+    DEF["Default build\n(no ndi feature)"] -->|no NDI symbols| NONE["NDI capability absent\nLGPL-clean dependencies"]
     FEAT["cargo build --features ndi"] --> CHOICE{"SDK present\nat build time?"}
     CHOICE -->|yes| LINK["grafton-ndi\nbuild-time linked"]
     CHOICE -->|no / runtime-optional| DLOPEN["NDIlib_v6_load()\nlibloading + MIT headers"]
@@ -101,7 +101,7 @@ NDI delivers and accepts frames in **host memory** in YUV/packed layouts — nev
 ### 3.1 NDI in (receive)
 
 - Common receive layouts: **UYVY** (8-bit 4:2:2 packed), **P216** (16-bit 4:2:2), **BGRA**.
-- Multiview reads the SDK-owned **borrowed** buffer directly into the host→GPU upload — "zero-extra-copy"
+- Conspect reads the SDK-owned **borrowed** buffer directly into the host→GPU upload — "zero-extra-copy"
   here means avoiding an *additional* CPU `memcpy`, **not** avoiding the unavoidable PCIe upload.
 - After upload, frames are converted in the compositor toward the canonical **NV12-throughout**
   internal representation; YUV→RGB and color conversion happen in-shader per the
@@ -248,10 +248,16 @@ These obligations appear in the **UI/About box and docs** as part of the `ndi` f
 not optional documentation niceties; the management surface ([web/API](../research/web-api-stack.md))
 must render them when NDI is enabled.
 
-### 7.3 How Multiview stays clean by default
+<a id="73-how-multiview-stays-clean-by-default"></a>
+### 7.3 How Conspect stays clean by default
+
+LGPL-clean describes dependencies, not permission to redistribute Conspect. The
+[Conspect Source-Available Non-Commercial License Version 2.0](../../LICENSE) permits private
+study and copies necessary for authorized use, not general modification, distribution or
+reproduction. NDI's own grants and obligations remain separate.
 
 - **The default build never contains NDI.** No SDK, no proprietary symbols, no obligations — the
-  default profile is **LGPL-clean and redistributable**
+  default profile is **LGPL-clean (dependency status only)**
   ([ADR-0012](../decisions/ADR-0012.md)).
 - The SDK/runtime is the **user's responsibility**: enabling `ndi` means *you* fetch the SDK
   (CI/Docker for the `ndi` image variant), and at runtime the resolvable dylib (or the
@@ -263,8 +269,8 @@ must render them when NDI is enabled.
 
 | Profile | Adds | Effective status |
 |---|---|---|
-| **default** | — | LGPL-clean, redistributable |
-| **+ndi** | proprietary NDI runtime (royalty-free) | Permissive code **+ NDI EULA + mandatory attribution/branding** |
+| **default** | — | LGPL-clean dependencies |
+| **+ndi** | proprietary NDI runtime (royalty-free) | Source-available project code **+ NDI EULA + mandatory attribution/branding** |
 | **+ndi-advanced** | NDI Advanced SDK (HX H.264/HEVC) | **Separate paid** commercial license + codec royalties |
 
 ### 7.5 Runtime license gate (required)
