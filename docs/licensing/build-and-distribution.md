@@ -25,7 +25,7 @@ is GPU-first, hardware H.264/H.265 stays in the public build.
 
 | Encumbrance | What it is in this repo | License | Public? |
 |---|---|---|---|
-| **`gpl-codecs`** | `libx264` (H.264) + `libx265` (H.265) **software** encoders — the *only* GPL trigger. Enabled by `--enable-gpl --enable-libx264 --enable-libx265` (`deploy/ffmpeg-build.sh:164–166`, `FF_LICENSE=gpl`) and selected at `crates/multiview-output/src/slate.rs:103`. | **GPL-2.0-or-later** | **NO** — `-gpl` images, private only |
+| **`gpl-codecs`** | `libx264` (H.264) + `libx265` (H.265) **software** encoders — the *only* GPL trigger. Enabled by `--enable-gpl --enable-libx264 --enable-libx265` (`deploy/ffmpeg-build.sh:164–166`, `FF_LICENSE=gpl`) and selected at `crates/multiview-output/src/slate.rs:103`. | **GPL-3.0-or-later** (the pinned build passes `--enable-version3`; x264/x265 are GPL-2.0-or-later and upgrade) | **NO** — `-gpl` images, private only |
 | **NDI** | Vizrt NDI SDK, runtime-`dlopen`'d (`NDIlib_v6_load`), never vendored; gated by `NDI_RUNTIME_DIR_V6` + EULA acceptance. | Proprietary (Vizrt) | **NO** — private only |
 *(Native Dante is **NOT supported** per [ADR-T010](../decisions/ADR-T010.md): it would require an
 Audinate SDK that, as conveyed to us, is not available to open-source/community projects without a paid
@@ -38,7 +38,7 @@ on the open AES67 / ST 2110-30 path below, which is license-clean and public.)*
 |---|---|---|
 | **HW encode** — NVENC, VAAPI, QSV, VideoToolbox | Not GPL (`nv-codec-headers` is MIT; the rest are vendor/driver SDKs). `work-schedule.md:871`: *"NVENC/VAAPI/QSV/VideoToolbox are not GPL — LGPL-default stays clean."* | **YES** |
 | **CPU fallback encode** — `mpeg2video` | LGPL. Why `pipeline.rs:326–345` falls back to MPEG-2 when `h264` is requested without `gpl-codecs`/GPU. | **YES** |
-| **FFmpeg/libav** (demux/decode/filters) | LGPL-2.1, **dynamically linked** (`ffmpeg-sys-next`/`pkg-config`; `libav*.so.*` shipped in the image) — see §4. | **YES** |
+| **FFmpeg/libav** (demux/decode/filters) | **LGPL-3.0-or-later** for the pinned `--enable-version3` build (upstream is LGPL-2.1-or-later), **dynamically linked** (`ffmpeg-sys-next`/`pkg-config`; `libav*.so.*` shipped in the image) — see §4. | **YES** |
 | **Dante audio via AES67 / ST 2110-30** | Open standard, royalty-free, **zero Audinate IP** — Audinate's own license-free bridge. Multiview already owns the depacketizer (`crates/multiview-input/src/st2110/v30.rs`) + PTP servo (ADR-T010). | **YES** |
 | **`libass`** subtitles | ISC-licensed — **not** a GPL trigger; off-by-default only for the C toolchain (`overlay-rendering.md:411`). | **YES** |
 
@@ -51,7 +51,7 @@ deployment gets H.264/H.265 from the LGPL-clean build, so the `-gpl` artifact is
 | Build / image | Cargo features | FFmpeg | Contents | Combined-work license | Channel |
 |---|---|---|---|---|---|
 | **`multiview` (public)** | `ffmpeg,linux-vaapi,web` / `ffmpeg,nvidia,web` | **LGPL** (no `--enable-gpl`) | + HW encoders (NVENC/QSV/VAAPI/VT), wgpu/sw compositor, AES67/ST 2110-30 audio | Your **source-available non-commercial** license (✅ LGPL-compatible, §4) | **Public** (ghcr public, GitHub Releases) |
-| **`multiview` + `-gpl`** | `…,gpl-codecs` | **GPL** (`FF_LICENSE=gpl`, +x264/x265) | + software H.264/H.265 | **GPL-2.0-or-later** — *cannot* carry the NC restriction (§4) | **Private** only / customer self-builds for private use |
+| **`multiview` + `-gpl`** | `…,gpl-codecs` | **GPL** (`FF_LICENSE=gpl`, +x264/x265) | + software H.264/H.265 | **GPL-3.0-or-later** — *cannot* carry the NC restriction (§4) | **Private** only / customer self-builds for private use |
 | **`multiview` + NDI** | `…,ndi` | LGPL | + NDI send/receive (SDK runtime-loaded) | NC license + Vizrt NDI EULA (separate, upstream) | **Private**, commercial channel |
 
 Notes that flow into the license model:
@@ -72,15 +72,21 @@ Notes that flow into the license model:
 
 ## 4. LGPL container hygiene (public images) — obligation that exists regardless of relicensing
 
-For the public images that bundle `libav*.so.*`, LGPL-2.1 §6 requires (advisory §6):
+For the public images and release tarballs that bundle `libav*.so.*` (the pinned build is
+LGPL-3.0-or-later, so the operative terms are LGPL-3 §4 together with GPL-3 §6), we must:
 
 1. **Dynamic linking** of FFmpeg (already true) so the user can replace the `.so` — satisfied in a
    container by the libs being separate shared objects in a layer the user can rebuild/override.
 2. The FFmpeg in the public image is compiled **without** `--enable-gpl`/`--enable-nonfree` and does
    **not** `apt install` `libx264`/`libx265` (the `deploy/ffmpeg-build.sh` guard hard-aborts on a GPL
    flag unless `FF_LICENSE=gpl`).
-3. Carry FFmpeg's LGPL-2.1 text + attribution (`THIRD-PARTY-NOTICES`); state the work uses libav.
-4. Neither the non-commercial **nor** the commercial EULA may forbid modifying/reverse-engineering the
+3. Ship the **LGPLv3 and GPLv3 texts** with the libraries (LGPL-3 §4(b)) plus attribution
+   (`THIRD-PARTY-NOTICES`); state the work uses libav. `deploy/ffmpeg-build.sh` installs them to
+   `share/licenses/ffmpeg/`; the images carry them at `/usr/share/licenses/ffmpeg/` and the release
+   tarballs at `licenses/ffmpeg/`, and both builds fail if they are missing.
+4. Point to the **corresponding source** (the pinned upstream tarball + our configure script) —
+   `THIRD-PARTY-NOTICES` §1.
+5. Neither the non-commercial **nor** the commercial EULA may forbid modifying/reverse-engineering the
    **FFmpeg portion** for debugging-and-relink (the most-missed LGPL trap — already carved out in
    the repo `LICENSE` §9).
 
@@ -90,7 +96,7 @@ For the public images that bundle `libav*.so.*`, LGPL-2.1 §6 requires (advisory
 |---|---|---|
 | `release.yml` | LGPL-clean release **binaries** (`--disable-gpl --disable-nonfree`), tar.gz + sha256 + provenance attestation. Comment line 10: *"the GPL `gpl-codecs` build is NOT a [release artifact]."* | **Public only** ✅ |
 | `docker.yml` | App images to `ghcr.io/conspect-studio/conspect` off `-lgpl`/`-nvidia` bases; features `ffmpeg,linux-vaapi,web` / `ffmpeg,nvidia,web`; provenance + SBOM + keyless cosign. | **Public only** ✅ |
-| `ffmpeg-base.yml` | FFmpeg base images via `FF_HWACCEL`+`FF_LICENSE`. Also pushes a `multiview-ffmpeg:8.1.1-gpl` **base** (FFmpeg-only, GPL upstream) — fine in itself; **must never be combined into the published app image** under NC terms. | Mixed base; app stays clean |
+| `ffmpeg-base.yml` | FFmpeg base images via `FF_HWACCEL`+`FF_LICENSE`. Also pushes a `multiview-ffmpeg:<version>-gpl` (currently `9.0.2-gpl`) **base** (FFmpeg-only, GPL upstream) — fine in itself; **must never be combined into the published app image** under NC terms. | Mixed base; app stays clean |
 | `ci.yml` | cargo-deny license gate where `gpl-codecs` *"fails the allowlist by design"* (line 170); `--all-features` deliberately avoided; NDI not a Cargo feature yet. | n/a |
 
 **The GPL/NDI app path exists at the Dockerfile/`ffmpeg-build.sh` level but is not wired to any

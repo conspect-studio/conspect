@@ -15,7 +15,7 @@ name: ffmpeg-base
 # Flavours (deploy/Dockerfile.ffmpeg selects via FF_HWACCEL + FF_LICENSE):
 #   * lgpl   — vaapi + Intel QSV/libvpl (amd64) + VAAPI; multi-arch; LGPL-clean.
 #   * nvidia — NVENC/NVDEC/cuvid/scale_cuda; amd64-only for now; still LGPL-clean.
-#   * gpl    — vaapi + x264/x265 (whole build GPLv2+); opt-in; multi-arch.
+#   * gpl    — vaapi + x264/x265 (whole build GPL-3.0-or-later via --enable-version3); opt-in; multi-arch.
 
 on:
   push:
@@ -23,12 +23,14 @@ on:
     paths:
       - "deploy/ffmpeg-build.sh"
       - "deploy/ffmpeg-fetch-source.sh"
+      - "deploy/ffmpeg-patches/**"
       - "deploy/Dockerfile.ffmpeg"
       - ".github/workflows/ffmpeg-base.yml"
   pull_request:
     paths:
       - "deploy/ffmpeg-build.sh"
       - "deploy/ffmpeg-fetch-source.sh"
+      - "deploy/ffmpeg-patches/**"
       - "deploy/Dockerfile.ffmpeg"
       - ".github/workflows/ffmpeg-base.yml"
   schedule:
@@ -49,11 +51,14 @@ env:
   # ghcr.io/aperim/multiview-ffmpeg until the owner's first publish lands
   # (scripts/resolve-ffmpeg-image.sh).
   IMAGE: ghcr.io/${{ github.repository_owner }}/multiview-ffmpeg
-  # FFmpeg source pin (ADR-0031 FF-0b) — libavcodec .so.62, matching the binding.
+  # FFmpeg source pin (ADR-0031 FF-0c) — libavcodec .so.63, matching the binding.
   # The SHA-256 + GPG key + nv-codec-headers commit are pinned in
   # deploy/Dockerfile.ffmpeg's ARGs; the build verifies BOTH the GPG signature
   # and the SHA-256 (either failing aborts).
-  FFMPEG_VERSION: "8.1.1"
+  # Must equal ARG FFMPEG_VERSION in deploy/Dockerfile.ffmpeg (bump checklist:
+  # Dockerfile.ffmpeg ARGs, this value, the :<ver>-* tags in ci.yml/docker.yml,
+  # and the Dockerfiles' FFMPEG_IMAGE defaults + soname asserts).
+  FFMPEG_VERSION: "9.0.2"
 
 permissions:
   contents: read

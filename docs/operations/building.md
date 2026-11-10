@@ -70,21 +70,28 @@ default build does **not** link FFmpeg — only feature presets that enable `ffm
 > FFmpeg may already be GPL or nonfree — verify before relying on the LGPL-clean guarantee
 > ([§6](#6-licensing--build-profiles)).
 
-#### macOS (Homebrew)
+#### Pinned version: FFmpeg 9.0.2
 
-```bash
-brew install ffmpeg pkg-config
-ffmpeg -version          # this dev box ships FFmpeg 8.1.1 (Homebrew)
-ffmpeg -hwaccels         # expect videotoolbox
-```
+Every platform links the **same** FFmpeg: **9.0.2** (libavcodec **63**), matching the
+`ffmpeg-next 9.0` / `ffmpeg-sys-next 9.0.1` binding in `Cargo.lock`. `deploy/ffmpeg-build.sh` is
+the single source of the configure allowlist, the GPG + SHA-256 source pin, and the soname
+assertion; the container images and the Linux release legs all build through it. A different
+FFmpeg major compiles the wrong binding `cfg` or fails outright.
+
+#### macOS
+
+Do **not** link Homebrew's `ffmpeg` formula: it is a different major from the pin and is built
+with `--enable-gpl` (x264/x265), so a binary linked against it is GPL and never the LGPL-clean
+artifact. A pinned macOS (VideoToolbox/AudioToolbox) profile for `deploy/ffmpeg-build.sh` is
+the next step of the macOS work; until it lands, `release.yml`'s macOS legs fail loudly instead of
+linking Homebrew's FFmpeg.
 
 > [!WARNING]
-> **Dev-box caveat:** the Homebrew FFmpeg on this machine is **8.1.1** built with
-> `--enable-gpl --enable-version3 --enable-libx264 --enable-libx265 --enable-openssl`. That is
-> **fine for local development and testing**, but a binary linked against it is **GPL** and is
-> **not** the LGPL-clean redistributable artifact. For release/redistribution, build FFmpeg
-> yourself with the LGPL flags (see [§6](#6-licensing--build-profiles)) and point Multiview at it via
-> `PKG_CONFIG_PATH`. VideoToolbox HW accel is present in this Homebrew build.
+> **bindgen picks up `LIBCLANG_PATH`.** `ffmpeg-sys-next` generates its bindings with bindgen,
+> which loads the libclang named by `LIBCLANG_PATH`. Embedded toolchains (for example
+> `espup`'s Xtensa clang) export that variable from shell profiles, and a cross-target libclang
+> fails with `Unsupported architecture` / a pointer-width assertion. Unset it for host builds:
+> `env -u LIBCLANG_PATH cargo build ...`.
 
 #### Linux (system libav)
 
@@ -281,8 +288,8 @@ source); the feature presets determine what third-party code gets linked. Full r
 
 | Profile / features | Composition | Effective status |
 |--------------------|-------------|------------------|
-| **default** (no `gpl-codecs`/`ndi-advanced`) | Source-available project code + dynamically-linked **LGPL-2.1** FFmpeg (no `--enable-gpl`, no `--enable-nonfree`; NVENC/NVDEC via MIT `nv-codec-headers`; `scale_cuda` not `scale_npp`; native AAC + GnuTLS) | **Redistributable, LGPL-clean** |
-| **+ `gpl-codecs`** | + x264/x265 (GPL FFmpeg) | Whole product **GPL-2.0-or-later** |
+| **default** (no `gpl-codecs`/`ndi-advanced`) | Source-available project code + dynamically-linked **LGPL** FFmpeg (LGPL-3.0-or-later for the pinned `--enable-version3` build) (no `--enable-gpl`, no `--enable-nonfree`; NVENC/NVDEC via MIT `nv-codec-headers`; `scale_cuda` not `scale_npp`; native AAC + GnuTLS) | **Redistributable, LGPL-clean** |
+| **+ `gpl-codecs`** | + x264/x265 (GPL FFmpeg) | Whole product **GPL-3.0-or-later** (pinned `--enable-version3` build) |
 | **+ nonfree** (libnpp / FDK-AAC / OpenSSL) | nonfree FFmpeg | **NOT redistributable** — internal/personal only |
 | **+ `ndi`** | + proprietary NDI runtime (royalty-free) | Source-available project code **+ NDI EULA + mandatory attribution/branding** |
 | **+ `ndi-advanced`** | + NDI Advanced SDK (HX H.264/HEVC) | Separate **paid** commercial license + codec royalties |
@@ -333,7 +340,7 @@ a separate obligation from software copyright and may apply regardless of build 
   `@rpath`/`@loader_path` install names, then **inside-out codesign** every dylib + the executable
   (hardened runtime, secure timestamp, consistent Team ID — `codesign --deep` is unreliable), and
   finally `notarytool` + `stapler`.
-- Verify HW: `ffmpeg -hwaccels` lists `videotoolbox`; the local Homebrew FFmpeg 8.1.1 has it.
+- Verify HW: `ffmpeg -hwaccels` on the pinned build lists `videotoolbox`.
 
 See [ADR-0011](../decisions/ADR-0011.md) for the full platform decision and consequences.
 

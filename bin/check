@@ -1,155 +1,18 @@
-#!/usr/bin/env python3
-"""Task-specific MoQ proportional local gate. CI still runs its full suite."""
-import hashlib
-import pathlib
-import re
-import subprocess
-import sys
-
-BASE = '22661b9f479fabc097e9f70eea844964a49a39f3'
-APPROVED = (
-    '45349ebf3b17bffc4c8cf788f1cbbc3efcad52d5',
-    '4c6c0613240b094ad32bfe98ed91d07fa8512141',
-    'edc6daa12fed4cba5184e053befe5205bc33b095',
-    '26dbbfd55b2edf2466e4f5c23b52d5c4dd21c6a6',
-    'fa4389cddeeeec80679fd88bbc5a51f174b43eee',
-    'c6654f1b5b3f7f6c4213b2004bf6020301660590',
-)
-REPAIR_PATH = 'crates/multiview-control/src/moq_provider.rs'
-REPAIR_BLOB = '2db829b472b1ecfa749704118bab85f82e7d253a'
-PRIOR_POLICY_BLOBS = {
-    'bin/check': '385591d8209531f89e736069afefe4bfb9f8515a',
-    'docs/development/moq-local-gate.md': 'cd36798fad0f56a677ff57560cd5fe993ca67256',
-}
-LOG_SHA256 = '594918d1d9dbeb0e559f26bc8ee2d54a4007042e8bff658976a5359ff5720969'
-POLICY_PATHS = {'bin/check', 'docs/development/moq-local-gate.md'}
-ROOT = pathlib.Path(__file__).resolve().parent.parent
-
-
-def require(condition, message):
-    if not condition:
-        raise RuntimeError(message)
-
-
-def git(*args):
-    return subprocess.check_output(['git', *args], cwd=ROOT, text=True).strip()
-
-
-def evidence(sha, status, log, expected_hash=LOG_SHA256):
-    require(sha.strip() == BASE, 'baseline evidence SHA mismatch')
-    require(status.strip() == '0', 'baseline suite did not exit zero')
-    require(hashlib.sha256(log).hexdigest() == expected_hash, 'baseline log digest mismatch')
-    text = log.decode('utf-8')
-    results = re.findall(r'^test result: .*$', text, re.MULTILINE)
-    require(results and all(re.search(r'^test result: ok\. .*; 0 failed; .*; 0 filtered out;', r) for r in results), 'baseline log has failed/filtered or missing results')
-    require('test tile_driven_meets_budget_9up_1080p ... ok' in text, 'required budget test not passed')
-    require(re.search(r'Doc-tests xtask\s+running 0 tests\s+test result: ok\. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in [^\n]+\s*\Z', text), 'baseline log completion missing')
-
-
-def policy_boundary(parents, changed_paths, repair_blob):
-    require(parents == [APPROVED[-1]], 'unexpected parent(s): obtain a new reviewed gate/budget decision')
-    require(set(changed_paths) == POLICY_PATHS, 'gate amendment contains unexpected changes')
-    require(repair_blob == REPAIR_BLOB, 'provider differs from exact reviewed lint repair')
-
-
-def validate():
-    require(not git('status', '--porcelain', '--untracked-files=all'), 'working tree must be clean, including untracked files')
-    require(git('rev-list', '--reverse', f'{BASE}..{APPROVED[-1]}').splitlines() == list(APPROVED), 'approved delta ancestry changed')
-    subprocess.run(['git', 'merge-base', '--is-ancestor', BASE, 'HEAD'], cwd=ROOT, check=True)
-    # Exactly one reviewed gate amendment atop the immutable lint repair.
-    # Require a single parent (not a merge) and bind the repaired runtime blob.
-    policy_boundary(git('show', '-s', '--format=%P', 'HEAD').split(),
-                    git('diff', '--name-only', APPROVED[-1], 'HEAD').splitlines(),
-                    git('rev-parse', f'HEAD:{REPAIR_PATH}'))
-    require(git('diff', '--name-only', APPROVED[-2], APPROVED[-1]).splitlines() == [REPAIR_PATH], 'lint repair changes unexpected paths')
-    for path, blob in PRIOR_POLICY_BLOBS.items():
-        require(git('rev-parse', f'{APPROVED[-1]}:{path}') == blob, 'historical gate policy blob mismatch')
-    directory = ROOT / 'target/moq-gates'
-    try:
-        evidence((directory / 'workspace-test.sha').read_text(),
-                 (directory / 'workspace-test.exit').read_text(),
-                 (directory / 'workspace-test.log').read_bytes())
-    except FileNotFoundError as error:
-        raise RuntimeError('missing dated local suite evidence; CI must run its normal full suite; no bypass') from error
-
-
-def self_test():
-    directory = ROOT / 'target/moq-gates'
-    sha = (directory / 'workspace-test.sha').read_text()
-    status = (directory / 'workspace-test.exit').read_text()
-    log = (directory / 'workspace-test.log').read_bytes()
-    evidence(sha, status, log)
-    cases = [('wrong SHA', '0'*40, status, log, LOG_SHA256),
-             ('failed suite', sha, '1', log, LOG_SHA256),
-             ('modified log', sha, status, log+b'x', LOG_SHA256)]
-    for label, transform in [('filtered suite', lambda b: b.replace(b'0 filtered out', b'1 filtered out', 1)),
-                             ('missing completion', lambda b: b[:b.rfind(b'Doc-tests xtask')]),
-                             ('budget test omitted', lambda b: b.replace(b'test tile_driven_meets_budget_9up_1080p ... ok', b'omitted'))]:
-        altered = transform(log)
-        cases.append((label, sha, status, altered, hashlib.sha256(altered).hexdigest()))
-    for label, s, exit_status, data, digest in cases:
-        try:
-            evidence(s, exit_status, data, digest)
-        except RuntimeError:
-            print('rejected:', label)
-        else:
-            raise RuntimeError('negative case accepted: '+label)
-    policy_boundary([APPROVED[-1]], POLICY_PATHS, REPAIR_BLOB)
-    for label, parents, paths, blob in [
-        ('extra unapproved commit', ['0'*40], POLICY_PATHS, REPAIR_BLOB),
-        ('merge parent', [APPROVED[-1], BASE], POLICY_PATHS, REPAIR_BLOB),
-        ('extra runtime path', [APPROVED[-1]], POLICY_PATHS | {REPAIR_PATH}, REPAIR_BLOB),
-        ('tampered provider blob', [APPROVED[-1]], POLICY_PATHS, '0'*40),
-    ]:
-        try:
-            policy_boundary(parents, paths, blob)
-        except RuntimeError:
-            print('rejected:', label)
-        else:
-            raise RuntimeError('negative policy case accepted: '+label)
-    print('evidence/policy positives and ten negative cases passed; no build/test suite executed')
-
-
-COMMANDS = [
-    ['cargo', 'fmt', '--all', '--', '--check'],
-    ['cargo', 'check', '--locked', '--workspace', '-j2'],
-    ['cargo', 'clippy', '--locked', '--workspace', '--all-targets', '-j2', '--', '-D', 'warnings'],
-    ['cargo', 'deny', 'check'],
-    ['cargo', 'check', '--locked', '-p', 'multiview-control', '--features', 'moq-transport', '-j2'],
-    ['cargo', 'clippy', '--locked', '-p', 'multiview-control', '--features', 'moq-transport', '--all-targets', '-j2', '--', '-D', 'warnings'],
-    ['cargo', 'test', '--locked', '-p', 'multiview-moq', '-j2'],
-    ['cargo', 'test', '--locked', '-p', 'multiview-cloudflare', '-p', 'multiview-credentials', '-j2'],
-    ['cargo', 'test', '--locked', '-p', 'multiview-control', 'cloudflare_management::tests', '--lib', '-j2'],
-    ['cargo', 'test', '--locked', '--manifest-path', 'tools/moq-fixture/Cargo.toml', '-j2'],
-    ['cargo', 'run', '--locked', '--manifest-path', 'tools/verify-moq-roots/Cargo.toml'],
-    ['npm', '--prefix', 'web', 'run', 'lint'],
-    ['npm', '--prefix', 'web', 'run', 'build'],
-    ['node', '--check', 'web/scripts/moq-cloudflare-probe.mjs'],
-]
-
-
-def main():
-    require(sys.argv[1:] in ([], ['--validate-only'], ['--self-test']), 'usage: bin/check [--validate-only|--self-test]')
-    if sys.argv[1:] == ['--self-test']:
-        self_test()
-        return
-    validate()
-    if sys.argv[1:] == ['--validate-only']:
-        print('dated evidence and exact reviewed delta verified; no current tests run')
-        return
-    head = git('rev-parse', 'HEAD')
-    print('Historical full suite:', BASE, '(NOT final-HEAD full-suite evidence)', flush=True)
-    for command in COMMANDS:
-        print('+', ' '.join(command), flush=True)
-        subprocess.run(command, cwd=ROOT, check=True)
-    validate()
-    require(git('rev-parse', 'HEAD') == head, 'HEAD changed during gate')
-    print('PASS proportional checks on', head, '; historical full suite remains at', BASE)
-
-
-if __name__ == '__main__':
-    try:
-        main()
-    except (RuntimeError, subprocess.CalledProcessError, OSError) as error:
-        print('MoQ local gate FAIL:', error, file=sys.stderr)
-        sys.exit(1)
+#!/usr/bin/env bash
+# Repository local gate: the full CI set documented in AGENTS.md
+# ("Commands" -> full CI set). The pre-push hook runs this through the DSH
+# local-gate wrapper; CI still runs its own full matrix.
+#
+# It replaces a task-specific MoQ branch gate that merged to main and could
+# only ever pass for that one branch's exact commit.
+set -euo pipefail
+cd "$(dirname "$0")/.."
+test -z "$(git status --porcelain --untracked-files=all)" || {
+  echo "bin/check: working tree must be clean" >&2; exit 1; }
+set -x
+cargo fmt --all -- --check
+cargo clippy --locked --workspace --all-targets -- -D warnings
+# tile_driven_meets_budget is a wall-clock budget test; ci.yml skips it on
+# shared runners for the same reason.
+cargo test --locked --workspace -- --skip tile_driven_meets_budget
+cargo deny check

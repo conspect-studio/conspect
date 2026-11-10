@@ -385,7 +385,7 @@ jobs:
           # is itself pure-Rust — it links NO ffmpeg — but its lint coverage rides
           # the same ffmpeg-equipped leg as the cli for one cohesive webrtc gate.)
           # Guarding the ffmpeg-linked cli surface needs the pinned FFmpeg base
-          # image (ghcr.io/<owner>/multiview-ffmpeg:8.1.1-lgpl, libavcodec .so.62) —
+          # image (ghcr.io/<owner>/multiview-ffmpeg:9.0.2-lgpl, libavcodec .so.63) —
           # that is the dedicated `feature-clippy-ffmpeg-webrtc` job below. The
           # crate leg here already guards the pure-str0m Session/egress API
           # surface that broke.
@@ -507,8 +507,8 @@ jobs:
   # built these features.
   #
   # This leg clippies them against the SAME pinned FFmpeg the deploy images link:
-  # ghcr.io/<owner>/multiview-ffmpeg:8.1.1-lgpl (libavcodec .so.62 — the soname
-  # `ffmpeg-sys-next 8.1.0` binds, NOT ubuntu apt's 6.x/so.60, which would
+  # ghcr.io/<owner>/multiview-ffmpeg:9.0.2-lgpl (libavcodec .so.63 — the soname
+  # `ffmpeg-sys-next 9.0.1` binds, NOT ubuntu apt's 6.x/so.60, which would
   # generate the WRONG bindings). That base image is `FROM scratch` (it ships
   # ONLY /opt/multiview-ffmpeg — no shell/apt, so it cannot be a job `container:`),
   # so we pull it and `docker cp` /opt/multiview-ffmpeg out onto the runner, then
@@ -520,7 +520,7 @@ jobs:
     # Pull the base image + a per-feature-scoped clippy build (str0m + aws-lc-rs
     # + ffmpeg-sys bindgen from cold). A cold cargo cache pushes this into the
     # several-minute range; 30min is generous headroom while capping a wedge.
-    timeout-minutes: 30
+    timeout-minutes: 45  # +15 covers the one-off FFmpeg source bootstrap (see extract step)
     needs: changes
     if: ${{ github.event_name != 'pull_request' || needs.changes.outputs.code == 'true' }}
     permissions:
@@ -528,16 +528,16 @@ jobs:
       # docker pull from GHCR needs a token to read the (private) base package.
       packages: read
     env:
-      # The pinned, LGPL-clean FFmpeg 8.1.1 base (libavcodec .so.62) — the same
+      # The pinned, LGPL-clean FFmpeg 9.0.2 base (libavcodec .so.63) — the same
       # image the docker app build COPYs /opt/multiview-ffmpeg from (ADR-0031 §5).
       # Only the TAG is fixed here; the extract step resolves the image via
       # scripts/resolve-ffmpeg-image.sh: this owner's ghcr.io/<owner>/multiview-ffmpeg
       # (published by ffmpeg-base.yml) when that tag exists, else the public
       # upstream ghcr.io/aperim/multiview-ffmpeg (before the owner's first publish).
-      FFMPEG_TAG: 8.1.1-lgpl
+      FFMPEG_TAG: 9.0.2-lgpl
       # Where we extract /opt/multiview-ffmpeg to on the runner. pkg-config + the
       # dynamic loader are pointed here so ffmpeg-sys-next's build.rs discovers
-      # FFmpeg 8.1.1 (detects ffmpeg_8_1 → libavcodec 62) and the link finds .so.62.
+      # FFmpeg 9.0.2 (detects ffmpeg_9_0 → libavcodec 63) and the link finds .so.63.
       FFMPEG_PREFIX: /opt/multiview-ffmpeg
     steps:
       - uses: actions/checkout@v7
@@ -562,7 +562,7 @@ jobs:
         # Installed BEFORE the extract step so the modversion assertion below has
         # a guaranteed pkg-config (the ubuntu image ships one, but don't rely on it).
         #
-        # The RUNTIME libs the pinned LGPL FFmpeg 8.1.1 links (per
+        # The RUNTIME libs the pinned LGPL FFmpeg 9.0.2 links (per
         # deploy/ffmpeg-build.sh: --enable-vaapi/--enable-libdrm, --enable-libopus,
         # --enable-libsrt [gnutls], --enable-libvpl): an ffmpeg-linked TEST binary
         # (the aes67 leg below) fails to LOAD with exit 127 without them on the bare
@@ -578,11 +578,11 @@ jobs:
         #
         # `ffmpeg` is the distro CLI, a fixture generator only: the audio lib
         # tests shell out to it for lavfi clips, which the pinned
-        # --disable-everything build cannot make. Nothing links it. It shares
-        # the libavcodec62 soname with the pinned build, so the LD_LIBRARY_PATH
-        # exported below would load the pinned libraries into it, and they have
-        # no lavfi. The wrapper on PATH runs it with that variable cleared; the
-        # test binaries still load the pinned libraries.
+        # --disable-everything build cannot make. Nothing links it. The wrapper on
+        # PATH runs it with LD_LIBRARY_PATH cleared so the pinned libraries
+        # (no lavfi) can never be loaded into it, whatever sonames the distro
+        # and the pinned build carry; the test binaries still load the pinned
+        # libraries.
         run: |
           set -euo pipefail
           sudo apt-get update
@@ -595,35 +595,53 @@ jobs:
           printf '#!/bin/sh\nexec env -u LD_LIBRARY_PATH /usr/bin/ffmpeg "$@"\n' > "${shim}/ffmpeg"
           chmod 0755 "${shim}/ffmpeg"
           echo "${shim}" >> "$GITHUB_PATH"
-      - name: Extract pinned FFmpeg 8.1.1 from the base image
+      - name: Extract pinned FFmpeg 9.0.2 from the base image
         # The base is `FROM scratch` (only /opt/multiview-ffmpeg), so we create a
         # (never-run) container from it and `docker cp` the prefix out — the same
         # libav* tree deploy/Dockerfile pulls via `COPY --from=ffmpeg`.
+        #
+        # Bootstrap: a change that bumps FFMPEG_TAG lands together with the new
+        # base pin, and ffmpeg-base.yml only publishes that tag after merge. When
+        # neither the owner nor the upstream image carries the tag yet, build the
+        # SAME pinned source with the SAME script instead (its own GPG + SHA-256
+        # verification and soname assertion apply), so the PR is still checked
+        # against the exact FFmpeg it pins. Every later run pulls the image.
         run: |
           set -euo pipefail
           FFMPEG_IMAGE="$(scripts/resolve-ffmpeg-image.sh "${{ github.repository_owner }}" "${FFMPEG_TAG}")"
-          docker pull "${FFMPEG_IMAGE}"
-          # `docker create` on a `FROM scratch` image with no CMD/ENTRYPOINT fails
-          # with "no command specified"; pass a dummy argv so the create succeeds.
-          # It is NEVER executed — `docker cp` only reads the container's rootfs,
-          # which already holds /opt/multiview-ffmpeg from the image layer.
-          cid="$(docker create "${FFMPEG_IMAGE}" /nonexistent)"
-          sudo mkdir -p "$(dirname "${FFMPEG_PREFIX}")"
-          # Copy the whole prefix ({lib,include,lib/pkgconfig}) to its canonical
-          # location so the .pc files' absolute prefix= paths resolve unchanged.
-          sudo docker cp "${cid}:${FFMPEG_PREFIX}" "${FFMPEG_PREFIX}"
-          docker rm "${cid}" >/dev/null
+          if docker pull "${FFMPEG_IMAGE}"; then
+            # `docker create` on a `FROM scratch` image with no CMD/ENTRYPOINT fails
+            # with "no command specified"; pass a dummy argv so the create succeeds.
+            # It is NEVER executed — `docker cp` only reads the container's rootfs,
+            # which already holds /opt/multiview-ffmpeg from the image layer.
+            cid="$(docker create "${FFMPEG_IMAGE}" /nonexistent)"
+            sudo mkdir -p "$(dirname "${FFMPEG_PREFIX}")"
+            # Copy the whole prefix ({lib,include,lib/pkgconfig}) to its canonical
+            # location so the .pc files' absolute prefix= paths resolve unchanged.
+            sudo docker cp "${cid}:${FFMPEG_PREFIX}" "${FFMPEG_PREFIX}"
+            docker rm "${cid}" >/dev/null
+          else
+            echo "::warning::${FFMPEG_IMAGE} is not published yet; building the pinned FFmpeg from source (bootstrap)."
+            sudo apt-get install -y --no-install-recommends \
+              build-essential xz-utils gnupg dirmngr patch \
+              libopus-dev libsrt-openssl-dev libgnutls28-dev libdrm-dev libva-dev libvpl-dev zlib1g-dev
+            pin() { sed -n "s/^ARG $1=//p" deploy/Dockerfile.ffmpeg | head -1; }
+            sudo env FF_PREFIX="${FFMPEG_PREFIX}" FF_LICENSE=lgpl FF_HWACCEL=vaapi TARGETARCH=amd64 \
+              FFMPEG_VERSION="$(pin FFMPEG_VERSION)" FFMPEG_SHA256="$(pin FFMPEG_SHA256)" \
+              FFMPEG_GIT_COMMIT="$(pin FFMPEG_GIT_COMMIT)" \
+              bash deploy/ffmpeg-build.sh
+          fi
           # Sanity: the extracted prefix must actually carry the .pc + the .so.
           test -f "${FFMPEG_PREFIX}/lib/pkgconfig/libavcodec.pc" \
             || { echo "::error::libavcodec.pc missing under ${FFMPEG_PREFIX}"; exit 1; }
-          # Assert we got the soname the binding targets (FFmpeg 8.1.x →
-          # libavcodec 62.x). A wrong major here would compile the wrong cfg and
+          # Assert we got the soname the binding targets (FFmpeg 9.0.x →
+          # libavcodec 63.x). A wrong major here would compile the wrong cfg and
           # link the wrong .so — fail loudly rather than silently mis-bind.
           MODVER="$(PKG_CONFIG_PATH="${FFMPEG_PREFIX}/lib/pkgconfig" pkg-config --modversion libavcodec)"
           echo "libavcodec modversion: ${MODVER}"
           case "${MODVER}" in
-            62.*) echo "FFmpeg 8.1.x confirmed (libavcodec ${MODVER})." ;;
-            *) echo "::error::Expected libavcodec 62.x (FFmpeg 8.1.x), got ${MODVER}"; exit 1 ;;
+            63.*) echo "FFmpeg 9.0.x confirmed (libavcodec ${MODVER})." ;;
+            *) echo "::error::Expected libavcodec 63.x (FFmpeg 9.0.x), got ${MODVER}"; exit 1 ;;
           esac
           # Export the discovery env for the clippy steps (build.rs probes these).
           {
@@ -714,6 +732,13 @@ jobs:
         # Lint the real libav decode/resample integration and its test targets
         # against the same pinned LGPL FFmpeg build used in production.
         run: cargo clippy --locked -p multiview-audio --features ffmpeg --all-targets -- -D warnings
+      - name: test multiview-ffmpeg avio_fetch against the pinned FFmpeg
+        # The HTTP fetch regression tests (chunked redirect -> chunked body must
+        # fetch; a truncated sized body must not) only mean something when they
+        # link the pinned build, carried patches included (ADR-0031 FF-0c). They
+        # fail on an unpatched 9.0.2, so this step enforces the carried patch.
+        timeout-minutes: 10
+        run: cargo test --locked -p multiview-ffmpeg --features ffmpeg --lib avio_fetch
       - name: test multiview-audio --features ffmpeg
         # Committed MOV/pcm_s16le fixtures need only the pinned build's demuxer
         # and decoder: no second system FFmpeg CLI or unavailable WAV demuxer.

@@ -43,8 +43,8 @@ use ffmpeg_next::util::frame::Video;
 use ffmpeg_next::ChannelLayout;
 use multiview_core::time::{rescale, MediaTime, Rational};
 use multiview_ffmpeg::{
-    AudioEncodeTarget, AudioEncoder, DecodedVideoFrame, EncodedPacket, Muxer, ScaleSpec, Scaler,
-    StreamCodecParameters, StreamKind, VideoEncodeTarget, VideoEncoder,
+    program_h264_options, AudioEncodeTarget, AudioEncoder, DecodedVideoFrame, EncodedPacket, Muxer,
+    ScaleSpec, Scaler, StreamCodecParameters, StreamKind, VideoEncodeTarget, VideoEncoder,
 };
 
 use crate::epoch::SharedEpoch;
@@ -400,6 +400,16 @@ impl EncodeConfig {
         Rational::new(self.cadence.den, self.cadence.num)
     }
 
+    /// Open the program video encoder for this configuration.
+    ///
+    /// Every program encode opens through here so they all carry the same
+    /// pinned stream-shaping options ([`program_h264_options`]) instead of
+    /// inheriting libav's version-dependent encoder defaults.
+    fn open_video_encoder(&self) -> Result<VideoEncoder> {
+        VideoEncoder::new_with_options(&self.target(), &program_h264_options(&self.codec_name))
+            .map_err(ff)
+    }
+
     /// Build the `multiview-ffmpeg` encode target for this configuration.
     fn target(&self) -> VideoEncodeTarget {
         VideoEncodeTarget {
@@ -559,7 +569,7 @@ impl ProgramEncoder {
     /// GOP) or the encoder cannot be opened for the named codec.
     pub fn new(config: &EncodeConfig) -> Result<Self> {
         config.validate()?;
-        let encoder = VideoEncoder::new(&config.target()).map_err(ff)?;
+        let encoder = config.open_video_encoder()?;
         let params = StreamCodecParameters::from_encoder(&encoder);
         let time_base = encoder.time_base();
         let audio = match &config.audio {
@@ -972,7 +982,7 @@ impl FileSink {
     /// Returns [`Error::Output`] if the encoder/muxer fails or the source errors.
     pub fn run<S: VideoFrameSource>(&self, source: &mut S) -> Result<EncodeStats> {
         self.config.validate()?;
-        let mut encoder = VideoEncoder::new(&self.config.target()).map_err(ff)?;
+        let mut encoder = self.config.open_video_encoder()?;
         let time_base = encoder.time_base();
         let mut muxer = Muxer::create(&self.path).map_err(ff)?;
         let stream_index = muxer
@@ -1206,9 +1216,9 @@ impl SegmentSink {
         // encoder is borrowed mutably to produce packets while the seed is
         // borrowed immutably into the segmentation state; both are the SAME fixed
         // codec, built once for the whole run (never per segment).
-        let seed = VideoEncoder::new(&self.config.target()).map_err(ff)?;
+        let seed = self.config.open_video_encoder()?;
         note_seed_encoder_built();
-        let mut encoder = VideoEncoder::new(&self.config.target()).map_err(ff)?;
+        let mut encoder = self.config.open_video_encoder()?;
         let time_base = encoder.time_base();
 
         let mut converter = FrameConverter::new(self.config.format);
@@ -1333,7 +1343,7 @@ impl PushSink {
     /// waiting for a peer beyond libav's own connect.
     pub fn run<S: VideoFrameSource>(&self, source: &mut S) -> Result<EncodeStats> {
         self.config.validate()?;
-        let mut encoder = VideoEncoder::new(&self.config.target()).map_err(ff)?;
+        let mut encoder = self.config.open_video_encoder()?;
         let time_base = encoder.time_base();
         // The URL is passed as a path; libav's avio resolves the scheme
         // (rtmp://, srt://, …) and the forced muxer name fixes the container.
