@@ -22,6 +22,7 @@ use crate::problem::Problem;
 use crate::repository::{Layout, LayoutInput, VersionedLayout, LAYOUT_KIND};
 use crate::state::AppState;
 
+pub(crate) mod web_capture;
 pub mod account;
 pub mod alarms;
 pub mod audio;
@@ -51,7 +52,6 @@ pub mod sync_groups;
 pub mod system;
 pub mod tally;
 pub mod telemetry;
-pub(crate) mod web_capture;
 pub mod whep_output;
 pub mod whip;
 
