@@ -1,0 +1,91 @@
+/* Approved Sources surface — exact round-4 rules, namespaced; tokens local. */
+[data-approved-page="sources"] {
+  --bg-0: #0a0c0f; --bg-1: #10131a; --bg-2: #161b23; --bg-3: #1d242e; --bg-4: #242d39;
+  --line: #232b36; --line-2: #2e3947;
+  --text-1: #e8ecf1; --text-2: #9aa4b2; --text-3: #8f99a8;
+  --red: #e5484d; --red-dim: #7a2b2e; --amber: #e8a33d; --amber-dim: #6e4d1d;
+  --green: #3dd68c; --green-dim: #1d5c41; --blue: #6aa6ff; --slate: #8b93a0;
+  --mono: ui-monospace, "SF Mono", SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
+  --r-sm: 4px; --r-md: 8px; --r-lg: 12px; --tap: 48px;
+  color: var(--text-1);
+}
+[data-approved-page="sources"] [hidden] { display: none !important; }
+[data-approved-page="sources"] h1 { font-size: 24px; font-weight: 800; letter-spacing: -.01em; }
+[data-approved-page="sources"] button:focus-visible,
+[data-approved-page="sources"] input:focus-visible,
+[data-approved-page="sources"] a:focus-visible { outline: 2px solid var(--blue); outline-offset: 2px; }
+
+[data-approved-page="sources"] .src-filter { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; margin-bottom: 12px; }
+[data-approved-page="sources"] .inp {
+  flex: 1 1 220px; min-width: 0; min-height: var(--tap); padding: 8px 12px;
+  background: var(--bg-1); color: var(--text-1); border: 1px solid var(--line-2); border-radius: var(--r-md);
+}
+[data-approved-page="sources"] .src-filter-chips { display: flex; gap: 6px; flex-wrap: wrap; }
+[data-approved-page="sources"] .sf-chip {
+  min-height: var(--tap); padding: 0 16px; border-radius: 999px;
+  border: 1px solid var(--line-2); background: var(--bg-2);
+  color: var(--text-2); font-size: 12px; font-weight: 800; white-space: nowrap;
+}
+[data-approved-page="sources"] .sf-chip[aria-pressed="true"] {
+  background: var(--bg-4); color: var(--text-1); box-shadow: inset 0 -2px 0 var(--blue); border-color: var(--blue);
+}
+[data-approved-page="sources"] .sf-chip[aria-disabled="true"] { opacity: .6; cursor: not-allowed; }
+[data-approved-page="sources"] .src-onair-reason { margin: 0 0 12px; font-size: 12px; color: var(--text-3); }
+
+[data-approved-page="sources"] .src-summary { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 14px; }
+[data-approved-page="sources"] .sum-chip {
+  display: inline-flex; align-items: center; gap: 8px; background: var(--bg-1);
+  border: 1px solid var(--line); border-radius: 999px; padding: 8px 14px; font-size: 12px; color: var(--text-2);
+}
+[data-approved-page="sources"] .sum-chip b { font-family: var(--mono); color: var(--text-1); }
+[data-approved-page="sources"] .sum-chip.warn { border-color: var(--amber-dim); color: var(--amber); }
+
+[data-approved-page="sources"] .src-table-wrap {
+  background: var(--bg-1); border: 1px solid var(--line); border-radius: var(--r-lg); overflow-x: auto;
+}
+[data-approved-page="sources"] .src-table { width: 100%; border-collapse: collapse; min-width: 860px; }
+[data-approved-page="sources"] .src-table th {
+  text-align: left; padding: 10px 12px; font-size: 12px; letter-spacing: .1em; text-transform: uppercase;
+  color: var(--text-3); border-bottom: 1px solid var(--line); white-space: nowrap;
+}
+[data-approved-page="sources"] .src-table td { padding: 10px 12px; border-bottom: 1px solid var(--line); vertical-align: middle; }
+[data-approved-page="sources"] .src-table tr:last-child td { border-bottom: 0; }
+[data-approved-page="sources"] .src-table tr.tr-exception td { background: rgba(232,163,61,.04); }
+[data-approved-page="sources"] .src-name { display: flex; flex-direction: column; gap: 2px; min-width: 180px; }
+[data-approved-page="sources"] .src-title { margin: 0; font-size: 14px; font-weight: 700; }
+[data-approved-page="sources"] .src-ep { font-family: var(--mono); font-size: 12px; color: var(--text-3); }
+[data-approved-page="sources"] .kind-chip {
+  display: inline-block; font-family: var(--mono); font-size: 12px; font-weight: 700;
+  padding: 2px 7px; border-radius: 3px; border: 1px solid var(--line-2); color: var(--text-2); width: fit-content;
+}
+[data-approved-page="sources"] .src-fail-reason { font-size: 12px; color: #ff8a8e; margin: 4px 0 0; }
+[data-approved-page="sources"] .src-muted { font-size: 12px; color: var(--text-3); }
+[data-approved-page="sources"] .src-activation { font-size: 13px; text-transform: uppercase; color: var(--text-2); }
+[data-approved-page="sources"] .src-actions-cell { display: flex; gap: 6px; flex-wrap: wrap; align-items: flex-start; }
+[data-approved-page="sources"] .act-btn {
+  min-height: 48px; padding: 0 14px; border-radius: var(--r-sm); font-size: 12px; font-weight: 800;
+  border: 1px solid var(--line-2); background: var(--bg-3); color: var(--blue);
+}
+[data-approved-page="sources"] .cross-link {
+  min-height: var(--tap); display: inline-flex; align-items: center; border: 1px solid #2c4a7d;
+  border-radius: var(--r-sm); background: #0d1420; color: var(--blue); font-size: 12px; font-weight: 700;
+  text-decoration: none; padding: 0 12px; width: fit-content; margin-top: 6px;
+}
+[data-approved-page="sources"] .src-detail-row td { background: var(--bg-2); }
+[data-approved-page="sources"] .src-detail-body { display: grid; gap: 12px; }
+[data-approved-page="sources"] .src-detail-actions { display: flex; flex-wrap: wrap; gap: 8px; align-items: flex-start; min-width: 0; }
+[data-approved-page="sources"] .src-detail-links { display: grid; gap: 8px; border-top: 1px solid var(--line); padding-top: 12px; font-size: 14px; }
+[data-approved-page="sources"] .src-empty { padding: 16px 14px; color: var(--text-2); }
+
+[data-approved-page="sources"] .src-cards { list-style: none; margin: 0; padding: 0; display: grid; gap: 10px; }
+[data-approved-page="sources"] .src-card {
+  background: var(--bg-1); border: 1px solid var(--line); border-radius: var(--r-lg);
+  padding: 12px; display: grid; gap: 10px; min-width: 0; overflow-wrap: anywhere;
+}
+[data-approved-page="sources"] .src-card.tr-exception { border-color: var(--amber-dim); }
+[data-approved-page="sources"] .sc-pills { display: flex; gap: 6px; flex-wrap: wrap; align-items: center; }
+[data-approved-page="sources"] .sc-pills .lbl { margin-right: 2px; font-size: 12px; color: var(--text-3); }
+
+@media (max-width: 767px) {
+  [data-approved-page="sources"] .src-table-wrap { display: none; }
+}
