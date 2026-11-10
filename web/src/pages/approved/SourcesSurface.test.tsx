@@ -106,4 +106,24 @@ describe('SourcesSurface', () => {
     expect(screen.getAllByTestId(/^source-row-/)).toHaveLength(1);
     expect(screen.getByTestId('source-row-ok')).toBeVisible();
   });
+
+  it('badges: unknown/failed/ready are pills with glyphs; summary counts per real state', () => {
+    setTable(true);
+    mount();
+    const chips = Array.from(document.querySelectorAll('.src-summary .sum-chip')).map((c) => c.textContent);
+    expect(chips).toEqual(expect.arrayContaining(['1 Ready', '1 Starting', '1 Failed', '1 Always on', '1 Unknown']));
+    const unk = screen.getByTestId('source-row-unk');
+    expect(unk.querySelectorAll('.src-pill svg').length).toBe(2);
+    expect(screen.getByTestId('source-row-bad')).toHaveAttribute('data-phase', 'failed');
+    expect(within(screen.getByTestId('source-row-ok')).getByText('Always on')).toHaveAttribute('data-activation', 'always_on');
+  });
+
+  it('failed row: inline reason plus Retry in the callout', () => {
+    setTable(true);
+    mount();
+    const box = screen.getByTestId('source-failure-box-bad');
+    expect(within(box).getByText('ingest ended remotely')).toBeVisible();
+    expect(within(box).getByRole('button', { name: 'Retry Broken' })).toBeVisible();
+    expect(within(screen.getByTestId('source-row-ok')).queryByRole('button', { name: /^Retry/ })).toBeNull();
+  });
 });

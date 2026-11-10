@@ -10,8 +10,9 @@ import { useState, useSyncExternalStore } from 'react';
 import type { JSX, ReactNode } from 'react';
 import { Link } from 'react-router-dom';
 import { Trans, useLingui } from '@lingui/react/macro';
-import { Pencil, Trash2 } from 'lucide-react';
+import { CircleHelp, CirclePause, Pencil, RotateCw, Trash2 } from 'lucide-react';
 
+import { useSourceAction } from '../../api/sourceStatus';
 import type { SourceDemand } from '../../api/sourceStatus';
 import type { LinkInfo } from '../../api/catalogue';
 import { LinkActions, LinkCell, SourceNetworkAction } from '../../iptv/SourceLinks';
@@ -64,6 +65,22 @@ export interface SourcesSurfaceProps {
   readonly onDelete: (row: SourceView) => void;
   /** Engine-confirmed program/preview bus ids; undefined = not confirmed (Unknown). */
   readonly tally?: ProgramTally | undefined;
+}
+
+function RetryButton({ id, name }: { readonly id: string; readonly name: string }): JSX.Element {
+  const { t } = useLingui();
+  const action = useSourceAction();
+  return (
+    <button
+      type="button"
+      className="act-btn retry"
+      disabled={action.isPending}
+      aria-label={t`Retry ${name}`}
+      onClick={(): void => { action.mutate({ id, action: 'start' }); }}
+    >
+      <RotateCw aria-hidden="true" /><Trans>Retry</Trans>
+    </button>
+  );
 }
 
 function Pill({ phase, children }: { readonly phase: string; readonly children: ReactNode }): JSX.Element {
@@ -124,9 +141,19 @@ export function SourcesSurface(props: SourcesSurfaceProps): JSX.Element {
 
   const failure = (source: SourceView): JSX.Element | null => {
     const d = demandOf(source.id);
-    return d?.phase === 'failed' && d.detail !== undefined && d.detail !== null && d.detail !== '' ? (
-      <p className="src-fail-reason" data-testid={`source-failure-${source.id}`}>{d.detail}</p>
-    ) : null;
+    if (d?.phase !== 'failed') return null;
+    const manual = d.consumers.some((c) => c.kind === 'manual');
+    const hasReason = d.detail !== undefined && d.detail !== null && d.detail !== '';
+    return (
+      <div className="src-fail" data-testid={`source-failure-box-${source.id}`}>
+        {hasReason ? (
+          <p className="src-fail-reason" data-testid={`source-failure-${source.id}`}>{d.detail}</p>
+        ) : (
+          <p className="src-fail-reason"><Trans>Failed — no reason reported.</Trans></p>
+        )}
+        {manual ? null : <RetryButton id={source.id} name={source.name} />}
+      </div>
+    );
   };
 
   const crossLink = (source: SourceView): JSX.Element | null =>
@@ -144,16 +171,21 @@ export function SourcesSurface(props: SourcesSurfaceProps): JSX.Element {
       return <Pill phase="signal"><TileStateBadge state={tile.state} /></Pill>;
     }
     return (
-      <span className="src-muted">
-        {d === undefined ? <Trans>Signal unknown</Trans> : <Trans>No live signal data</Trans>}
-      </span>
+      <Pill phase={d === undefined ? 'unknown' : 'nosignal'}>
+        <span className="src-pill">
+          {d === undefined ? <CircleHelp aria-hidden="true" /> : <CirclePause aria-hidden="true" />}
+          {d === undefined ? <Trans>Signal unknown</Trans> : <Trans>No live signal data</Trans>}
+        </span>
+      </Pill>
     );
   };
 
   const lifecycle = (source: SourceView): JSX.Element => {
     const d = demandOf(source.id);
     return d === undefined ? (
-      <span className="src-muted"><Trans>Status unknown</Trans></span>
+      <Pill phase="unknown">
+        <span className="src-pill"><CircleHelp aria-hidden="true" /><Trans>Status unknown</Trans></span>
+      </Pill>
     ) : (
       <Pill phase={d.phase}><SourceDemandBadge demand={d} /></Pill>
     );
@@ -162,7 +194,7 @@ export function SourcesSurface(props: SourcesSurfaceProps): JSX.Element {
   const activation = (source: SourceView): JSX.Element => {
     const a = demandOf(source.id)?.activation;
     return (
-      <span className="src-activation">
+      <span className="src-activation" data-activation={a ?? 'unknown'}>
         {a === 'always_on' ? <Trans>Always on</Trans> : a === 'on_demand' ? <Trans>On demand</Trans> : <Trans>Activation unknown</Trans>}
       </span>
     );
@@ -311,7 +343,7 @@ export function SourcesSurface(props: SourcesSurfaceProps): JSX.Element {
             <tbody>
               {visible.map((source) => (
                 <FragmentRows key={source.id}>
-                  <tr data-testid={`source-row-${source.id}`} className={isException(source) ? 'tr-exception' : undefined}>
+                  <tr data-testid={`source-row-${source.id}`} data-phase={demandOf(source.id)?.phase ?? 'unknown'} className={isException(source) ? 'tr-exception' : undefined}>
                     <td>
                       {identity(source, false)}
                       {failure(source)}
@@ -344,6 +376,7 @@ export function SourcesSurface(props: SourcesSurfaceProps): JSX.Element {
             <li
               key={source.id}
               data-testid={`source-card-${source.id}`}
+              data-phase={demandOf(source.id)?.phase ?? 'unknown'}
               className={isException(source) ? 'src-card tr-exception' : 'src-card'}
             >
               {identity(source, true)}
