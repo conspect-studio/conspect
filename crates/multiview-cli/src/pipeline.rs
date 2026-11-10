@@ -1096,6 +1096,7 @@ mod admission_target_tests {
     // -----------------------------------------------------------------------
 
     use super::{LiveIngestSpawner, LiveIsland};
+    use std::sync::Arc;
 
     fn island(uuid: &str, index: u32, ordinal: &str) -> LiveIsland {
         LiveIsland {
@@ -1294,6 +1295,18 @@ segment_ms = 1000
             cadence: Rational::new(25, 1),
             output_origin: crate::timing_status::anchor_slot(),
             audio_route: std::sync::Arc::new(multiview_framestore::SwapCell::empty()),
+            #[cfg(feature = "overlay")]
+            caption_stores: Arc::new(multiview_framestore::SwapCell::from_pointee(
+                std::collections::HashMap::new(),
+            )),
+            #[cfg(feature = "overlay")]
+            caption_generations: Arc::new(multiview_framestore::SwapCell::from_pointee(
+                std::collections::HashMap::new(),
+            )),
+            #[cfg(feature = "overlay")]
+            caption_display_times: Arc::new(multiview_framestore::SwapCell::from_pointee(
+                std::collections::HashMap::new(),
+            )),
             // EMPTY island slot — admission named no device.
             island: std::sync::Arc::new(multiview_framestore::SwapCell::empty()),
             load_source: Box::new(CountingLoadSource {
@@ -1409,6 +1422,18 @@ segment_ms = 1000
             cadence: Rational::new(25, 1),
             output_origin: crate::timing_status::anchor_slot(),
             audio_route: std::sync::Arc::new(multiview_framestore::SwapCell::empty()),
+            #[cfg(feature = "overlay")]
+            caption_stores: Arc::new(multiview_framestore::SwapCell::from_pointee(
+                std::collections::HashMap::new(),
+            )),
+            #[cfg(feature = "overlay")]
+            caption_generations: Arc::new(multiview_framestore::SwapCell::from_pointee(
+                std::collections::HashMap::new(),
+            )),
+            #[cfg(feature = "overlay")]
+            caption_display_times: Arc::new(multiview_framestore::SwapCell::from_pointee(
+                std::collections::HashMap::new(),
+            )),
             island: std::sync::Arc::new(multiview_framestore::SwapCell::from_some(island(
                 FakeTwoGpu::GPU1_UUID,
                 1,

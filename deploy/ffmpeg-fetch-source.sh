@@ -61,7 +61,12 @@ fetch_release_tarball() {
   fetch_release_file "${TARBALL}.asc" "${BASE_URL}/${TARBALL}.asc" || return 1
 
   # SHA-256 (defense-in-depth pin). A mismatch is fatal, never a fallback.
-  echo "${FFMPEG_SHA256}  ${TARBALL}" | sha256sum -c - || exit 4
+  # sha256sum (GNU) or shasum -a 256 (macOS); both read the same check line.
+  if command -v sha256sum >/dev/null 2>&1; then
+    echo "${FFMPEG_SHA256}  ${TARBALL}" | sha256sum -c - || exit 4
+  else
+    echo "${FFMPEG_SHA256}  ${TARBALL}" | shasum -a 256 -c - || exit 4
+  fi
 
   export GNUPGHOME="${WORK}/gnupg"
   mkdir -p "${GNUPGHOME}"

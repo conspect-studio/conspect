@@ -54,13 +54,30 @@ FF_HWACCEL="${FF_HWACCEL:-vaapi}"
 FF_PREFIX="${FF_PREFIX:-/opt/multiview-ffmpeg}"
 NVCODEC_COMMIT="${NVCODEC_COMMIT:-e844e5b26f46bb77479f063029595293aa8f812d}"
 TARGETARCH="${TARGETARCH:-amd64}"
+# Host OS: Linux builds the container/release prefix; Darwin builds the native
+# macOS prefix (FF_HWACCEL=apple). Shared libraries are named per platform.
+HOST_OS="$(uname -s)"
+cpu_count() { getconf _NPROCESSORS_ONLN 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 4; }
+# The installed major-versioned library for a libav component, e.g.
+# soname avcodec 63 -> libavcodec.so.63 (Linux) / libavcodec.63.dylib (macOS).
+soname() {
+  if [ "${HOST_OS}" = "Darwin" ]; then echo "lib$1.$2.dylib"; else echo "lib$1.so.$2"; fi
+}
+# Run a prefix binary with the prefix's libraries on the loader path.
+with_prefix_libs() {
+  if [ "${HOST_OS}" = "Darwin" ]; then
+    DYLD_LIBRARY_PATH="${FF_PREFIX}/lib:${DYLD_LIBRARY_PATH:-}" "$@"
+  else
+    LD_LIBRARY_PATH="${FF_PREFIX}/lib:${LD_LIBRARY_PATH:-}" "$@"
+  fi
+}
 
 # Run this independently in the image builder AND after installation, so a
 # cached build cannot publish an FFmpeg lacking the promised input/output IO.
 assert_features() {
   local ffmpeg="${FF_PREFIX}/bin/ffmpeg" listing kind name
   for kind in protocols demuxers muxers; do
-    listing="$(LD_LIBRARY_PATH="${FF_PREFIX}/lib:${LD_LIBRARY_PATH:-}" "${ffmpeg}" -hide_banner "-${kind}")"
+    listing="$(with_prefix_libs "${ffmpeg}" -hide_banner "-${kind}")"
     case "${kind}" in
       protocols)
         # SRT is bidirectional. RTSP and HLS are *demuxers*, not protocols.
@@ -306,8 +323,28 @@ case "${FF_HWACCEL}" in
       CONFIGURE_ARGS+=(--enable-libvpl)
     fi
     ;;
+  apple)
+    # Native macOS (ADR-0011): VideoToolbox encode/decode + AudioToolbox, all
+    # Apple system frameworks — LGPL-clean (no --enable-gpl/nonfree). Built
+    # natively on a Mac; containers cannot reach VideoToolbox. Names verified
+    # against the n9.0.2 source (libavcodec/allcodecs.c, hwaccels.h,
+    # libavfilter/allfilters.c). avfoundation is the macOS capture indev.
+    if [ "${HOST_OS}" != "Darwin" ]; then
+      echo "ffmpeg-build: FF_HWACCEL=apple must be built on macOS" >&2
+      exit 2
+    fi
+    # shellcheck disable=SC2054  # commas are FFmpeg list-value syntax (one word)
+    CONFIGURE_ARGS+=(
+      --enable-videotoolbox --enable-audiotoolbox
+      --enable-encoder=h264_videotoolbox,hevc_videotoolbox,prores_videotoolbox
+      --enable-hwaccel=h264_videotoolbox,hevc_videotoolbox,vp9_videotoolbox,av1_videotoolbox,prores_videotoolbox
+      --enable-filter=scale_vt
+      --enable-avfoundation --enable-indev=avfoundation --enable-avdevice
+      --enable-encoder=aac_at --enable-decoder=aac_at
+    )
+    ;;
   *)
-    echo "ffmpeg-build: unknown FF_HWACCEL='${FF_HWACCEL}' (want nvidia|vaapi)" >&2
+    echo "ffmpeg-build: unknown FF_HWACCEL='${FF_HWACCEL}' (want nvidia|vaapi|apple)" >&2
     exit 2
     ;;
 esac
@@ -369,7 +406,7 @@ for component in LIBSRT_PROTOCOL RTSP_DEMUXER HLS_DEMUXER WAV_DEMUXER \
     exit 5
   fi
 done
-make -j"$(nproc)"
+make -j"$(cpu_count)"
 make install
 
 # Licence texts travel WITH the libraries: every artifact that conveys these
@@ -386,10 +423,10 @@ install -m 0644 LICENSE.md COPYING.LGPLv3 COPYING.GPLv3 COPYING.LGPLv2.1 COPYING
 #    survived dependency resolution) and the FFmpeg 9.0.2 sonames. Fail the BUILD
 #    here rather than shipping an unusable image.
 # -----------------------------------------------------------------------------
-test -e "${FF_PREFIX}/lib/libavcodec.so.63"
-test -e "${FF_PREFIX}/lib/libavutil.so.61"
-test -e "${FF_PREFIX}/lib/libavformat.so.63"
+test -e "${FF_PREFIX}/lib/$(soname avcodec 63)"
+test -e "${FF_PREFIX}/lib/$(soname avutil 61)"
+test -e "${FF_PREFIX}/lib/$(soname avformat 63)"
 test -s "${FF_PREFIX}/share/licenses/ffmpeg/COPYING.LGPLv3"
 test -s "${FF_PREFIX}/share/licenses/ffmpeg/COPYING.GPLv3"
 assert_features
-echo "ffmpeg-build: OK — FFmpeg ${FFMPEG_VERSION} installed to ${FF_PREFIX} (libavcodec.so.63)."
+echo "ffmpeg-build: OK — FFmpeg ${FFMPEG_VERSION} installed to ${FF_PREFIX} ($(soname avcodec 63))."
