@@ -231,7 +231,7 @@
 .bd-wordmark{display:inline;font-size:13px;letter-spacing:.08em}
 .bd-brand{min-width:0;padding:0 6px 0 0;gap:6px}
 .bd-tabs{gap:0}
-.bd-tabs a{padding:0 7px;font-size:13px}
+.bd-tabs a{padding:0 7px;font-size:13px;min-width:48px;justify-content:center}
 }
 @media(min-width:1280px){
 .bd-desk-grid{align-items:stretch}
