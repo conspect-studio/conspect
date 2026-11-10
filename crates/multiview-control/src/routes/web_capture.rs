@@ -195,7 +195,7 @@ pub(crate) async fn artifact(
                     let remaining = deadline.saturating_duration_since(std::time::Instant::now());
                     let wait = remaining.min(std::time::Duration::from_secs(5));
                     if !matches!(
-                        runtime.block_on(tokio::time::timeout(wait, tx.send(Ok(chunk)))),
+                        runtime.block_on(send_chunk(&tx, Ok(chunk), wait)),
                         Ok(Ok(()))
                     ) {
                         break;
@@ -218,4 +218,28 @@ pub(crate) async fn artifact(
         .header(header::CACHE_CONTROL, "no-store")
         .body(Body::from_stream(stream))
         .map_err(|_| ControlError::Repository("artifact response failed".into()))
+}
+
+async fn send_chunk(
+    tx: &tokio::sync::mpsc::Sender<Result<Vec<u8>, std::io::Error>>,
+    chunk: Result<Vec<u8>, std::io::Error>,
+    wait: std::time::Duration,
+) -> Result<
+    Result<(), tokio::sync::mpsc::error::SendError<Result<Vec<u8>, std::io::Error>>>,
+    tokio::time::error::Elapsed,
+> {
+    tokio::time::timeout(wait, tx.send(chunk)).await
+}
+#[cfg(test)]
+mod transfer_tests {
+    #[tokio::test]
+    async fn a_full_channel_expires_without_waiting_for_a_client() {
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        assert!(tx.send(Ok(vec![1])).await.is_ok());
+        assert!(
+            super::send_chunk(&tx, Ok(vec![2]), std::time::Duration::ZERO)
+                .await
+                .is_err()
+        );
+    }
 }
