@@ -858,3 +858,20 @@ describe('MediaPlayersPage list honesty (preserved)', () => {
     expect(await screen.findByText(/Could not load media players:/)).toBeInTheDocument();
   });
 });
+
+describe('MediaPlayersPage approved VT rack', () => {
+  it('uses the vt-slot rack and shows timecode/scrub as Unknown (no cadence in the event)', async () => {
+    renderPage({
+      live: {
+        'vt-1': { player: 'vt-1', asset: 'live-clip', position_frames: 1250, state: { kind: 'playing' } },
+      },
+    });
+    const slot = await screen.findByTestId('vt-slot-vt-1');
+    expect(slot).toHaveClass('vt-slot', 'on');
+    expect(slot.querySelector('.vt-head')).not.toBeNull();
+    expect(slot.querySelector('.vt-transport')).not.toBeNull();
+    expect(within(slot).getByTestId('vt-scrub-vt-1')).toHaveTextContent(/Duration unknown/);
+    expect(within(slot).getByTestId('vt-tc-vt-1').textContent).not.toMatch(/\d{1,2}:\d{2}:\d{2}/);
+    expect(within(screen.getByTestId('vt-slot-vt-2')).getByTestId('vt-tc-vt-2')).toHaveTextContent('Unknown');
+  });
+});

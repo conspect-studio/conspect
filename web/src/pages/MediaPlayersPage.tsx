@@ -74,7 +74,8 @@ import type {
 } from '../api/media-playersQueries';
 import { useMediaPlayerStates } from '../realtime/useEngineEvents';
 import type { MediaPlayerEvent } from '../realtime/generated-types';
-import { OperationFeedback, TaskWorkspace, TouchAction } from '../components/broadcast';
+import { OperationFeedback, TouchAction } from '../components/broadcast';
+import { AssetDurationLabel } from '../components/broadcast/AssetDurationLabel';
 import { useSubmitTrackedOperation } from '../components/broadcast/useOperationFeedback';
 import { getOperationTracker, OPERATION_TRACKER_QUERY_KEY } from '../components/broadcast/operationTracker';
 import { createOperationOutcomeState } from '../components/broadcast/operationOutcomes';
@@ -205,17 +206,15 @@ function MediaPlayerCard({
     }
   };
 
-  return (
-    <TaskWorkspace
-      title={
+  const titleNode = (
         <span className="flex min-w-0 flex-wrap items-baseline gap-x-2 break-words">
           <span lang="" dir="auto" className="font-medium">
             {player.name}
           </span>
           <code className="text-xs text-muted-foreground">{player.id}</code>
         </span>
-      }
-      status={
+  );
+  const statusNode = (
         <span className="flex min-w-0 flex-wrap items-center gap-x-3 gap-y-1 break-words">
           {kind !== undefined ? (
             <Badge variant={stateVariant(kind)}>
@@ -244,10 +243,10 @@ function MediaPlayerCard({
             {live !== undefined ? `${String(live.position_frames)} ${t`frames`}` : '—'}
           </span>
         </span>
-      }
-      details={
+  );
+  const detailsNode = (
         <div className="grid gap-3">
-          <div className="flex flex-wrap items-start gap-2">
+          <div className="vt-transport vt-vamp">
             <TouchAction
               variant="outline"
               disabled={gates.arm !== undefined || keyBlocked('arm-exit')}
@@ -307,10 +306,37 @@ function MediaPlayerCard({
             ) : null}
           </div>
         </div>
-      }
-      detailsOpen={detailsOpen}
-      onDetailsToggle={onDetailsToggle}
+  );
+  const playing = kind === 'playing' || kind === 'vamping';
+  const detailsId = `vt-details-${player.id}`;
+
+  return (
+    <section
+      data-testid={`vt-slot-${player.id}`}
+      className={`vt-slot${focused ? ' focused' : ''}${playing ? ' on' : ''}`}
+      aria-label={player.name}
     >
+      <div className="vt-head">
+        <h3>{titleNode}</h3>
+        <span className="vt-tc mono" data-testid={`vt-tc-${player.id}`}>
+          {live !== undefined ? `${String(live.position_frames)} ${t`frames`}` : t`Unknown`}
+        </span>
+      </div>
+      <div data-testid="task-workspace-status" className="vt-status">{statusNode}</div>
+      <div className="vt-scrub" data-testid={`vt-scrub-${player.id}`} role="img"
+        aria-label={t`Scrub position: unknown`}>
+        <span className="vt-scrub-note">
+          <AssetDurationLabel asset={{}} />
+          {' · '}
+          <Trans>Timecode and scrub are unknown: the player event carries no cadence or asset duration.</Trans>
+        </span>
+      </div>
+      {configuredLoop(player) ? (
+        <p className="vt-loop">
+          <Repeat aria-hidden="true" className="size-3" />
+          <Trans>Loop default</Trans>
+        </p>
+      ) : null}
       {!focused ? (
         <TouchAction
           variant="outline"
@@ -325,7 +351,7 @@ function MediaPlayerCard({
         data-testid={`player-console-${player.id}`}
         className={focused ? 'block' : 'hidden md:block'}
       >
-          <div className="flex flex-wrap items-start gap-2">
+          <div className="vt-transport">
             <TouchAction
               variant="outline"
               disabled={keyBlocked('load')}
@@ -477,7 +503,19 @@ function MediaPlayerCard({
             )
           ) : null}
         </div>
-    </TaskWorkspace>
+      <TouchAction
+        variant="outline"
+        className="mt-2 md:hidden"
+        aria-expanded={detailsOpen}
+        aria-controls={detailsId}
+        onPress={(): void => { onDetailsToggle(!detailsOpen); }}
+      >
+        <Trans>Details</Trans>
+      </TouchAction>
+      <div id={detailsId} className={`vt-details ${detailsOpen ? 'block' : 'hidden md:block'}`}>
+        {detailsNode}
+      </div>
+    </section>
   );
 }
 
