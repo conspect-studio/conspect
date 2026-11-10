@@ -125,7 +125,7 @@ pub enum MoqReject {
 /// transport teardown and retained batch leases remain independently bounded.
 pub trait MoqFence: Send + Sync {
     /// Stop enqueue synchronously; never wait for network teardown. Implementations
-    /// must be bounded and nonpanicking. A failed/panicking fence is never ACKed.
+    /// must be bounded and nonpanicking. A failed/panicking fence is never acknowledged.
     fn revoke(&self);
 }
 /// Provider must authorize resolved dependencies before admission. It must never encode per viewer.
@@ -259,11 +259,9 @@ impl MoqRegistry {
                     tombstones.insert(id.clone(), (entry, now + Duration::from_secs(60)));
                     Some((fence, fenced))
                 })();
-                if let Some((fence, fenced)) = transition {
-                    if let Some(fence) = fence {
-                        fence.revoke();
-                        fenced.store(true, std::sync::atomic::Ordering::Release);
-                    }
+                if let Some((Some(fence), fenced)) = transition {
+                    fence.revoke();
+                    fenced.store(true, std::sync::atomic::Ordering::Release);
                 }
             }
         });
