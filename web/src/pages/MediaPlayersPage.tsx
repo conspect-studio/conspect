@@ -206,6 +206,23 @@ function MediaPlayerCard({
     }
   };
 
+  const vampAnyEnabled =
+    (gates.arm === undefined && !keyBlocked('arm-exit')) ||
+    (gates.take === undefined && !keyBlocked('take-exit')) ||
+    (gates.cancel === undefined && !keyBlocked('cancel-exit'));
+  const vampReasons = [
+    ...new Set(
+      [gates.arm, gates.take, gates.cancel]
+        .map((g) => gateReason(g))
+        .filter((r): r is string => r !== undefined),
+    ),
+  ];
+  const vampSummary = vampAnyEnabled
+    ? t`Exit keys available`
+    : vampReasons.length > 0
+      ? vampReasons.join(' · ')
+      : t`Exit keys unavailable`;
+
   const titleNode = (
         <span className="flex min-w-0 flex-wrap items-baseline gap-x-2 break-words">
           <span lang="" dir="auto" className="font-medium">
@@ -246,6 +263,19 @@ function MediaPlayerCard({
   );
   const detailsNode = (
         <div className="grid gap-3">
+          <details
+            className="vt-vamp-disclosure"
+            data-testid={`vamp-disclosure-${player.id}`}
+            open={vampAnyEnabled ? true : undefined}
+          >
+            <summary className="vt-vamp-summary">
+              <span className="vt-vamp-title">
+                <Trans>Vamp exit</Trans>
+              </span>
+              <span className="vt-vamp-why" data-testid={`vamp-why-${player.id}`}>
+                {vampSummary}
+              </span>
+            </summary>
           <div className="vt-transport vt-vamp">
             <TouchAction
               variant="outline"
@@ -287,6 +317,7 @@ function MediaPlayerCard({
               <Trans>Cancel exit</Trans>
             </TouchAction>
           </div>
+          </details>
           <div className="grid gap-1.5 text-xs text-muted-foreground">
             <p className="flex min-w-0 flex-wrap break-words">
               <Trans>Configured default</Trans>:{' '}
