@@ -416,7 +416,7 @@ function ChannelStrip({
 
       {/* The strip keys: MUTE and PGM (program-bus include) — draft toggles,
           pressed state visible by style AND text in the status line. */}
-      <div className="flex flex-wrap items-center gap-2">
+      <div className="audio-strip-keys flex flex-wrap items-center gap-2">
         <Button
           type="button"
           variant="outline"
@@ -443,6 +443,12 @@ function ChannelStrip({
         >
           {t`PGM`}
         </Button>
+        <span
+          data-testid="audio-strip-listen-note"
+          className="audio-listen-note text-xs text-muted-foreground"
+        >
+          {t`LISTEN: unavailable (no monitor path)`}
+        </span>
       </div>
 
       </div>
