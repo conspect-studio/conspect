@@ -755,7 +755,10 @@ impl Service {
         if shared.shutdown {
             drop(shared);
             let _ = persist(&self.inner, |d| set_job(d, id.raw(), Rec::Cancelled));
-            return Err(SubmitError::ShuttingDown);
+            // A durable intent already exists. Even when cancellation appears
+            // durable, a caller must retain its idempotency reservation until
+            // recovery proves the outcome; this is not a pre-admission refusal.
+            return Err(SubmitError::Persistence);
         }
         shared.next = after;
         shared.jobs.insert(
