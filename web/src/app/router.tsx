@@ -1,7 +1,7 @@
 // The client-side route table (react-router v7). The shell (AppLayout) is the
 // layout route; screens render into its <Outlet>.
+import { ShowPage } from "../pages/approved/ShowPage";
 import { createBrowserRouter, Navigate } from "react-router-dom";
-import { Trans } from "@lingui/react/macro";
 
 import { AppLayout } from "./AppLayout";
 import { RequireAuth } from "../auth/RequireAuth";
@@ -63,7 +63,7 @@ export const router = createBrowserRouter([
     children: [
       { index: true, element: <ProductionDesk /> },
       { path: "dashboard", element: <DashboardPage /> },
-      { path: "show", element: <section><h1><Trans>Show rundown</Trans></h1><p><Trans>Unavailable: no production rundown control contract exists. No video switch occurs here.</Trans></p></section> },
+      { path: "show", element: <ShowPage /> },
       { path: "layouts", element: <LayoutsPage /> },
       { path: "layouts/new", element: <LayoutEditorPage /> },
       { path: "layouts/:id", element: <LayoutEditorPage /> },
