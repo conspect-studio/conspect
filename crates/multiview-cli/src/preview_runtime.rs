@@ -536,15 +536,29 @@ mod actual_bridge_tests {
 
     #[test]
     fn actual_factory_packets_reach_registry_subscriber_and_retire_independently() {
+        fn register_independently(
+            opener: &mut PreviewRuntimeOpener<RuntimeRegistry>,
+            lease: &PreviewEncoderLease,
+        ) -> crate::optional_rendition::OptionalRegistration {
+            let mut ready = opener.publish(std::slice::from_ref(lease)).unwrap();
+            // This direct registry test drives activation itself. Production
+            // transfers the publisher once to PreviewDelivery, which activates
+            // after first windows; retain the same owner for independent guards.
+            assert!(ready.activate());
+            let registration = ready.registration.take().unwrap();
+            opener.registry.publisher = Some(ready.publisher);
+            registration
+        }
+
         let (key, cost, production) = actual_preview_setup();
         let (mut registry, factory) = OutputWindowRegistry::bare(vec![production.clone()], 7);
         let factory = Arc::new(factory);
         let bridge = RuntimeRegistry::new(factory.clone(), "production".into()).unwrap();
         let mut opener = PreviewRuntimeOpener::new(vec![(key.clone(), cost)], bridge);
         let mut first = opener.open(&key).unwrap();
-        let first_guard = opener.publish(std::slice::from_ref(&first)).unwrap();
+        let first_guard = register_independently(&mut opener, &first);
         let second = opener.open(&key).unwrap();
-        let second_guard = opener.publish(std::slice::from_ref(&second)).unwrap();
+        let second_guard = register_independently(&mut opener, &second);
         let scope = multiview_control::WhepScope::Output(first.descriptor.output_id.clone());
         let binding = factory.resolve(&scope).unwrap();
         assert_eq!(binding.output_index, 43);
@@ -610,7 +624,7 @@ mod actual_bridge_tests {
             multiview_control::WhepScope::Output(second.descriptor.output_id.clone());
         assert_eq!(factory.resolve(&second_scope).unwrap().output_index, 44);
         let third = opener.open(&key).unwrap();
-        let third_guard = opener.publish(std::slice::from_ref(&third)).unwrap();
+        let third_guard = register_independently(&mut opener, &third);
         assert_eq!(
             factory
                 .resolve(&multiview_control::WhepScope::Output(
