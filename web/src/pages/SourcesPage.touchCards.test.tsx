@@ -33,6 +33,9 @@ describe('Sources touch cards', () => {
     expect(within(card).getByRole('heading')).toHaveTextContent('Studio camera');
     expect(within(card).getByText('Studio camera')).toBeInTheDocument();
     expect(within(card).getByText('https://example.test/live.m3u8')).toHaveClass('break-all');
+    // Secondary controls live inside the Details expansion on phones.
+    expect(within(card).queryByRole('button', { name: /^edit source/i })).not.toBeInTheDocument();
+    await userEvent.click(within(card).getByRole('button', { name: /^details:/i }));
     expect(within(card).getByRole('button', { name: 'Edit source: Studio camera' })).toHaveClass('min-h-12');
     expect(within(card).getByRole('button', { name: 'Delete source: Studio camera' })).toBeInTheDocument();
     expect(within(card).getByRole('button', { name: /preview/i })).toBeInTheDocument();
@@ -50,6 +53,7 @@ describe('Sources touch cards', () => {
     renderSources();
     const card = await screen.findByTestId('source-card-future');
     expect(within(card).getByText('No locator configured')).toBeVisible();
+    await userEvent.click(within(card).getByRole('button', { name: /^details:/i }));
     expect(within(card).getByText('Not linked to IPTV-ORG')).toBeVisible();
     const edit = within(card).getByRole('button', { name: /edit source: future input/i });
     expect(edit).toHaveAttribute('aria-disabled', 'true');
@@ -107,6 +111,7 @@ describe('Sources touch cards', () => {
     }));
     renderSources();
     const card = await screen.findByTestId('source-card-camera');
+    await userEvent.click(within(card).getByRole('button', { name: /^details:/i }));
     await userEvent.click(within(card).getByRole('button', { name: 'Delete source: Studio camera' }));
     expect(deleted).toBe(false);
     const dialog = await screen.findByRole('dialog', { name: 'Delete this resource?' });

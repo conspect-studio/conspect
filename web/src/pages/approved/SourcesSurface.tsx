@@ -387,10 +387,13 @@ export function SourcesSurface(props: SourcesSurfaceProps): JSX.Element {
                 <span className="lbl"><Trans>Activation</Trans></span>{activation(source)}
                 <span className="lbl"><Trans>Tally</Trans></span>{tally(source)}
               </div>
-              {lifecycleActions(source)}
+              <div className="sc-actions">
+                {lifecycleActions(source)}
+                {detailToggle(source)}
+              </div>
               {crossLink(source)}
-              {/* Phones have no hover/selection: secondary controls stay inline. */}
-              {details(source)}
+              {/* Phones keep the primary action + Details; the rest is one tap away. */}
+              {open.has(source.id) ? <div id={`src-detail-${source.id}`}>{details(source)}</div> : null}
             </li>
           ))}
         </ul>

@@ -145,6 +145,7 @@ describe('Clock source form (ADR-0047)', () => {
   it('round-trips a stored dual-face clock into the edit dialog', async () => {
     renderSources();
     expect(await screen.findByText('Sydney')).toBeInTheDocument();
+    await userEvent.click(screen.getByRole('button', { name: 'Details: Sydney' }));
     await userEvent.click(screen.getByRole('button', { name: 'Edit source: Sydney' }));
     expect(await screen.findByRole('dialog')).toBeInTheDocument();
     // The metadata prefills from the stored body (each read by its label so the
@@ -187,6 +188,7 @@ describe('Timer source form (ADR-0047)', () => {
   it('round-trips a stored time-of-day timer into the edit dialog', async () => {
     renderSources();
     expect(await screen.findByText('On air in')).toBeInTheDocument();
+    await userEvent.click(screen.getByRole('button', { name: 'Details: On air in' }));
     await userEvent.click(screen.getByRole('button', { name: 'Edit source: On air in' }));
     const dialog = await screen.findByRole('dialog');
     // The target time-of-day, zone and label prefill.

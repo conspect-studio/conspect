@@ -85,13 +85,18 @@ describe('SourcesSurface', () => {
     expect(onDelete).toHaveBeenCalledWith(rows[0]);
   });
 
-  it('phone: cards with exceptions first and controls inline', () => {
+  it('phone: cards with exceptions first; secondary controls inside Details', async () => {
     setTable(false);
     mount();
     expect(screen.queryByRole('table')).toBeNull();
     const cards = screen.getAllByTestId(/^source-card-/).map((c) => c.getAttribute('data-testid'));
     expect(cards[0]).toBe('source-card-bad');
-    expect(within(screen.getByTestId('source-card-ok')).getByRole('button', { name: 'Edit source: Fine' })).toBeVisible();
+    const ok = within(screen.getByTestId('source-card-ok'));
+    expect(ok.queryByRole('button', { name: 'Edit source: Fine' })).toBeNull();
+    expect(ok.getByRole('button', { name: 'Details: Fine' })).toBeVisible();
+    await userEvent.click(ok.getByRole('button', { name: 'Details: Fine' }));
+    expect(ok.getByRole('button', { name: 'Edit source: Fine' })).toBeVisible();
+    expect(ok.getByRole('button', { name: 'Delete source: Fine' })).toBeVisible();
   });
 
   it('confirmed program bus: On air filter works and tally shows red/amber/dark', async () => {

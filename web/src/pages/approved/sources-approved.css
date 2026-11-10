@@ -204,3 +204,34 @@
 [data-approved-page="sources"] .src-table .src-actions-cell { flex-wrap: nowrap; align-items: center; }
 [data-approved-page="sources"] .src-table .src-actions-cell > span { flex-wrap: nowrap; }
 [data-approved-page="sources"] .src-table .src-actions-cell button { white-space: nowrap; }
+
+/* ROUND 3: 1024 fit without inner scroll; phone cards keep primary + Details. */
+@media (min-width: 1024px) {
+  [data-approved-page="sources"] .src-table { min-width: 0; table-layout: auto; }
+  [data-approved-page="sources"] .src-table-wrap { overflow-x: visible; }
+  [data-approved-page="sources"] .src-table th,
+  [data-approved-page="sources"] .src-table td { padding: 10px 8px; }
+  [data-approved-page="sources"] .src-table .src-name { min-width: 0; }
+  [data-approved-page="sources"] .src-table .src-actions-cell { flex-direction: column; flex-wrap: nowrap; align-items: stretch; }
+  [data-approved-page="sources"] .src-table .src-actions-cell > span,
+  [data-approved-page="sources"] .src-table .src-actions-cell > span > span { flex-direction: column; align-items: stretch; }
+  [data-approved-page="sources"] .src-table .src-pill-host > *,
+  [data-approved-page="sources"] .src-table .src-pill,
+  [data-approved-page="sources"] .src-table .src-activation { padding: 3px 8px; font-size: 11px; }
+  [data-approved-page="sources"] .src-table .src-pill-host[data-phase="onair"],
+  [data-approved-page="sources"] .src-table .src-pill-host[data-phase="preview"],
+  [data-approved-page="sources"] .src-table .src-pill-host[data-phase="dark"] { padding: 3px 8px; font-size: 11px; }
+  [data-approved-page="sources"] .src-table .src-muted { font-size: 11px; }
+  [data-approved-page="sources"] .src-table .th-actions { width: 1%; }
+}
+[data-approved-page="sources"] .sc-actions { display: flex; flex-wrap: wrap; gap: 6px; align-items: flex-start; }
+[data-approved-page="sources"] .sc-actions > span { width: auto; display: inline-flex; }
+[data-approved-page="sources"] .sc-actions > span > span { display: inline-flex; gap: 6px; }
+[data-approved-page="sources"] .sc-actions button:not(.act-btn) {
+  min-height: 48px; padding: 0 14px; border-radius: var(--r-sm); font-size: 12px; font-weight: 800;
+  border: 1px solid var(--line-2); background: var(--bg-3); color: var(--text-1); box-shadow: none;
+}
+[data-approved-page="sources"] .sc-actions button[aria-label^="Start"] { border-color: var(--green-dim); color: var(--green); }
+[data-approved-page="sources"] .sc-actions button[aria-label^="Stop"] { border-color: var(--red-dim); color: var(--red); }
+[data-approved-page="sources"] .sc-actions button svg:not(.act-btn svg) { display: none; }
+[data-approved-page="sources"] .src-card[data-phase="failed"] .sc-actions button[aria-label^="Start"] { display: none; }
