@@ -26,7 +26,11 @@
 //!   `select_encoder` skips it and falls through to the next candidate —
 //!   graceful degradation, never a crash.
 //!
-//! The ordering encodes the preference policy: hardware (NVENC, `cuda`) →
+//! * **`videotoolbox`** (macOS) — adds Apple's `h264_videotoolbox` /
+//!   `hevc_videotoolbox`, also ahead of software. A system framework, so the
+//!   build stays LGPL-clean.
+//!
+//! The ordering encodes the preference policy: hardware (`VideoToolbox`, NVENC) →
 //! GPL software (`gpl-codecs`) → LGPL software (always). Selection walks the
 //! list and returns the first encoder the build can actually open.
 
@@ -120,17 +124,43 @@ impl VideoCodec {
     }
 }
 
+impl VideoCodec {
+    /// This codec's Apple `VideoToolbox` hardware encoder short-name, present only
+    /// when the `videotoolbox` feature is enabled on macOS (otherwise [`None`]).
+    /// `VideoToolbox` is a system framework, so selecting it keeps the build
+    /// LGPL-clean; `select_encoder` still verifies the linked `FFmpeg` has it.
+    #[must_use]
+    pub const fn videotoolbox_encoder(self) -> Option<&'static str> {
+        #[cfg(all(feature = "videotoolbox", target_os = "macos"))]
+        {
+            match self {
+                Self::H264 => Some("h264_videotoolbox"),
+                Self::H265 => Some("hevc_videotoolbox"),
+                Self::Mpeg2Video | Self::Ffv1 | Self::Mjpeg | Self::Vp8 => None,
+            }
+        }
+        #[cfg(not(all(feature = "videotoolbox", target_os = "macos")))]
+        {
+            let _ = self;
+            None
+        }
+    }
+}
+
 /// The ordered preference list of concrete libav encoder short-names this build
 /// is allowed to use for `codec`, best first.
 ///
-/// Order is fixed policy: NVENC hardware (`cuda`) → GPL software (`gpl-codecs`)
-/// → LGPL software (always). Names absent from the compiled features are
+/// Order is fixed policy: hardware (`VideoToolbox` on macOS with `videotoolbox`,
+/// NVENC with `cuda`) → GPL software (`gpl-codecs`) → LGPL software (always). Names absent from the compiled features are
 /// omitted, so the default build's list contains only LGPL software encoders
 /// (and is empty for H.264/H.265). The result is pure compile-time data; no
 /// libav call happens here.
 #[must_use]
 pub fn candidate_encoders(codec: VideoCodec) -> Vec<&'static str> {
-    let mut candidates = Vec::with_capacity(3);
+    let mut candidates = Vec::with_capacity(4);
+    if let Some(name) = codec.videotoolbox_encoder() {
+        candidates.push(name);
+    }
     if let Some(name) = codec.nvenc_encoder() {
         candidates.push(name);
     }
@@ -293,9 +323,10 @@ mod tests {
     #[cfg(not(feature = "gpl-codecs"))]
     #[test]
     fn default_build_cannot_encode_h264_or_h265() {
-        // Without gpl-codecs (and without cuda) the H.264/H.265 candidate list
-        // is empty: the LGPL-clean build cannot reach a GPL/proprietary encoder.
-        #[cfg(not(feature = "cuda"))]
+        // Without gpl-codecs (and without a hardware encoder: cuda, or
+        // videotoolbox on macOS) the H.264/H.265 candidate list is empty: the
+        // LGPL-clean build cannot reach a GPL/proprietary encoder.
+        #[cfg(not(any(feature = "cuda", all(feature = "videotoolbox", target_os = "macos"))))]
         {
             assert_eq!(candidate_encoders(VideoCodec::H264), Vec::<&str>::new());
             assert_eq!(candidate_encoders(VideoCodec::H265), Vec::<&str>::new());

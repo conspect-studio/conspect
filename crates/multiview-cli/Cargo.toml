@@ -674,6 +674,7 @@ apple = [
     # would silently render no native captions/overlays.
     "overlay",
     "multiview-hal/videotoolbox",
+    "multiview-ffmpeg/videotoolbox",
     # GPU compositing on Apple Silicon/Intel Macs runs through wgpu's Metal
     # backend (the cli's `gpu` feature selects it at run time; without it the
     # preset silently composited on the CPU). The compositor uploads NV12 as R8 +
@@ -756,6 +757,7 @@ full = [
     # preset is refactored.
     "ntp",
     "multiview-hal/videotoolbox",
+    "multiview-ffmpeg/videotoolbox",
     "multiview-compositor/metal",
     # The cli `overlay` feature (the pure-Rust overlay/caption burn-in path) comes
     # transitively via `nvidia` + `linux-vaapi`; `multiview-overlay/libass` adds

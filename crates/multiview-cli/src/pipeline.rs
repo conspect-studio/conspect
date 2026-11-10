@@ -507,7 +507,9 @@ fn recovery_gate(codec: multiview_ffmpeg::VideoCodec) -> Option<RecoveryGate> {
 /// `libx265`, `ffv1`, `mjpeg`, …) take planar `YUV420P` as before — required, as
 /// they do not accept NV12 directly.
 fn encoder_input_format(name: &str) -> Pixel {
-    if name.ends_with("_nvenc") {
+    // VideoToolbox, like NVENC, ingests NV12 natively (it is the native
+    // CVPixelBuffer layout), so the canvas reaches it without a swscale.
+    if name.ends_with("_nvenc") || name.ends_with("_videotoolbox") {
         Pixel::NV12
     } else {
         Pixel::YUV420P
@@ -1540,6 +1542,13 @@ mod encoder_format_tests {
         // libswscale per tick).
         assert_eq!(encoder_input_format("h264_nvenc"), Pixel::NV12);
         assert_eq!(encoder_input_format("hevc_nvenc"), Pixel::NV12);
+    }
+
+    #[test]
+    fn videotoolbox_encoders_are_fed_nv12() {
+        // VideoToolbox's native CVPixelBuffer layout is NV12, like NVENC.
+        assert_eq!(encoder_input_format("h264_videotoolbox"), Pixel::NV12);
+        assert_eq!(encoder_input_format("hevc_videotoolbox"), Pixel::NV12);
     }
 
     #[test]

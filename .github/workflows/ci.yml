@@ -1032,10 +1032,20 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: macos-ffmpeg
-      - name: Build tools (LGPL deps only)
+      - name: Build tools (LGPL deps only) + fixture ffmpeg CLI
+        # Homebrew's `ffmpeg` is a FIXTURE GENERATOR only (lavfi clips the
+        # tests shell out for; the pinned --disable-everything build has no
+        # lavfi). Nothing links it: the wrapper clears DYLD_LIBRARY_PATH so it
+        # never loads the pinned libraries, and the linkage guard below proves
+        # the test binaries load OUR prefix.
         run: |
           set -euo pipefail
-          brew install pkg-config nasm opus srt gnutls
+          brew install pkg-config nasm opus srt gnutls ffmpeg
+          shim="${RUNNER_TEMP}/fixture-bin"
+          mkdir -p "${shim}"
+          printf '#!/bin/sh\nexec env -u DYLD_LIBRARY_PATH "%s" "$@"\n' "$(brew --prefix)/bin/ffmpeg" > "${shim}/ffmpeg"
+          chmod 0755 "${shim}/ffmpeg"
+          echo "${shim}" >> "$GITHUB_PATH"
       - name: Cache pinned FFmpeg prefix
         id: ffcache
         uses: actions/cache@v4
@@ -1069,8 +1079,17 @@ jobs:
         run: cargo clippy --locked -p multiview-cli --features ffmpeg,overlay,gpu --all-targets -- -D warnings
       - name: clippy multiview-cli --features webrtc-native
         run: cargo clippy --locked -p multiview-cli --features webrtc-native --all-targets -- -D warnings
-      - name: test multiview-ffmpeg --features ffmpeg
-        run: cargo test --locked --no-fail-fast -p multiview-ffmpeg --features ffmpeg
+      - name: test multiview-ffmpeg --features ffmpeg,videotoolbox
+        run: cargo test --locked --no-fail-fast -p multiview-ffmpeg --features ffmpeg,videotoolbox
+      - name: Assert the tests linked OUR prefix, not Homebrew's FFmpeg
+        # A wrong PKG_CONFIG_PATH silently falls back to any other libav on the
+        # pkg-config default path (e.g. Homebrew's GPL ffmpeg). Fail loudly.
+        run: |
+          set -euo pipefail
+          bin="$(ls -t target/debug/deps/multiview_ffmpeg-* | grep -vE '\.(d|rlib|rmeta)$' | head -1)"
+          otool -L "$bin" | grep libavformat
+          otool -L "$bin" | grep -q "${FF_PREFIX}/lib/libavformat" \
+            || { echo "::error::test binary is not linked against ${FF_PREFIX}"; exit 1; }
 
   # ── AsyncAPI 3.0 spec validation (SUR-6b follow-on, folded into IN-7) ────────
   # Validates docs/api/asyncapi.json against the AsyncAPI 3.0 JSON Schema using
