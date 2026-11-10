@@ -60,16 +60,50 @@ async fn capture_flow(real_browser: bool) {
     // Real Chrome/FFmpeg capture is proved by the runtime's required browser tests.
     std::fs::write(&producer,"#!/bin/sh\ncat >/dev/null\nprintf 'actual-producer-bytes'\nprintf '%s\\n' '{\"event\":\"capture_complete\",\"frames\":2}' >&2\n").unwrap();
     std::fs::set_permissions(&producer, std::fs::Permissions::from_mode(0o700)).unwrap();
-    let browser = std::path::PathBuf::from("/home/vscode/.cache/ms-playwright/chromium_headless_shell-1228/chrome-headless-shell-linux64/chrome-headless-shell");
+    let find_tool = |name: &str| {
+        std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())
+            .map(|dir| dir.join(name))
+            .find(|path| path.is_file())
+            .expect("required capture tool missing")
+    };
+    let browser = if real_browser {
+        std::env::var_os("CONSPECT_WEB_BROWSER")
+            .map(std::path::PathBuf::from)
+            .or_else(|| {
+                let cache = std::path::PathBuf::from(std::env::var_os("HOME")?)
+                    .join(".cache/ms-playwright");
+                let mut paths: Vec<_> = std::fs::read_dir(cache)
+                    .ok()?
+                    .flatten()
+                    .map(|entry| {
+                        entry
+                            .path()
+                            .join("chrome-headless-shell-linux64/chrome-headless-shell")
+                    })
+                    .filter(|path| path.is_file())
+                    .collect();
+                paths.sort();
+                paths.pop()
+            })
+            .expect("required real browser missing; set CONSPECT_WEB_BROWSER")
+    } else {
+        "/bin/sh".into()
+    };
     if real_browser {
         assert!(browser.is_file(), "required real browser missing");
-        // Test-only trusted adapter changes the source, never the production API.
-        std::fs::write(&producer, r#"#!/usr/bin/python3
+        let node = std::env::var_os("CONSPECT_WEB_NODE")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| find_tool("node"));
+        let script = format!(
+            r#"#!/usr/bin/env python3
 import json,subprocess,sys
 request=json.load(sys.stdin)
-request['source']={'kind':'html','document':'<body style="margin:0;background:red">HTTP capture proof</body>'}
-sys.exit(subprocess.run(['/usr/local/share/nvm/current/bin/node']+sys.argv[1:],input=json.dumps(request).encode()).returncode)
-"#).unwrap();
+request['source']={{'kind':'html','document':'<body style="margin:0;background:red">HTTP capture proof</body>'}}
+sys.exit(subprocess.run([{}]+sys.argv[1:],input=json.dumps(request).encode()).returncode)
+"#,
+            serde_json::to_string(&node.to_string_lossy()).unwrap()
+        );
+        std::fs::write(&producer, script).unwrap();
     }
     let store_path = root.path().join("store");
     std::fs::create_dir(&store_path).unwrap();
