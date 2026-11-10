@@ -389,6 +389,22 @@ struct ControlPlaneWiring {
 /// `expect_write` seam suppresses server-side writes). The hub shares the
 /// wiring's stop registry, so a live remove can tear down a startup producer
 /// (generator or ingest thread) too.
+#[cfg(feature = "moq-output")]
+async fn start_moq_listener(
+    factory: Option<Arc<dyn multiview_control::moq_provider::AuthorizedFeedFactory>>,
+) -> anyhow::Result<Option<Arc<multiview_control::moq::MoqRegistry>>> {
+    match multiview_control::moq_startup::MoqListenerConfig::from_env()
+        .map_err(|_| anyhow::anyhow!("invalid explicit MoQ listener configuration"))?
+    {
+        Some(config) => Ok(Some(
+            multiview_control::moq_startup::start(config, factory)
+                .await
+                .map_err(|_| anyhow::anyhow!("MoQ listener startup failed"))?,
+        )),
+        None => Ok(None),
+    }
+}
+
 // reason: `whep` (WHEP preview egress) and `whip` (WHIP ingest) are the canonical
 // WebRTC protocol names — distinct transports, not a typo-similar pair; renaming
 // either would obscure the spec mapping.
@@ -489,16 +505,7 @@ async fn serve_control_plane(
     // revert-to-start/promote actions, and is the persister's target.
     let boot_model = Arc::new(start.to_boot_model(config_path));
     #[cfg(feature = "moq-output")]
-    let moq = match multiview_control::moq_startup::MoqListenerConfig::from_env()
-        .map_err(|_| anyhow::anyhow!("invalid explicit MoQ listener configuration"))?
-    {
-        Some(config) => Some(
-            multiview_control::moq_startup::start(config, moq_factory)
-                .await
-                .map_err(|_| anyhow::anyhow!("MoQ listener startup failed"))?,
-        ),
-        None => None,
-    };
+    let moq = start_moq_listener(moq_factory).await?;
     #[cfg(feature = "moq-output")]
     let bind_control = control::bind_and_serve_with_moq;
     #[cfg(not(feature = "moq-output"))]
