@@ -108,3 +108,13 @@
 [data-approved-page="media"] .vt-transport button.vt-play:disabled { color: #5fbf93; }
 [data-approved-page="media"] .vt-vamp { grid-template-columns: 1fr; gap: 2px; }
 [data-approved-page="media"] .vt-vamp > p { margin: 0 0 8px; }
+/* Vamp-exit disclosure: one compact row per VT; gating reasons live in the summary. */
+[data-approved-page="media"] .vt-vamp-disclosure { border: 1px solid var(--line-2); border-radius: var(--r-md, 10px); background: var(--bg-1); }
+[data-approved-page="media"] .vt-vamp-summary { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 12px; min-height: var(--tap); padding: 6px 14px; cursor: pointer; list-style: none; }
+[data-approved-page="media"] .vt-vamp-summary::-webkit-details-marker { display: none; }
+[data-approved-page="media"] .vt-vamp-summary::before { content: "▸"; color: var(--text-3); }
+[data-approved-page="media"] .vt-vamp-disclosure[open] > .vt-vamp-summary::before { content: "▾"; }
+[data-approved-page="media"] .vt-vamp-title { font-size: 12px; font-weight: 800; letter-spacing: .1em; text-transform: uppercase; color: var(--text-2); }
+[data-approved-page="media"] .vt-vamp-why { font-size: 12px; color: var(--text-2); min-width: 0; overflow-wrap: anywhere; }
+[data-approved-page="media"] .vt-vamp-disclosure > .vt-vamp { padding: 0 10px 10px; grid-template-columns: repeat(3, 1fr); gap: 6px; }
+@media (max-width: 767px) { [data-approved-page="media"] .vt-vamp-disclosure > .vt-vamp { grid-template-columns: 1fr; } }

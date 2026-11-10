@@ -84,3 +84,14 @@
 [data-approved-page="routing"] .route-form>*{min-width:0}
 [data-approved-page="routing"] .route-form [role="combobox"],[data-approved-page="routing"] .route-form input:not([type="checkbox"]){width:100%}
 [data-approved-page="routing"] .patch-table th{white-space:nowrap}
+/* Crosspoint grid fits its column: flexible >=48px cells, wrapped headers; inner scroll only as a last resort. */
+[data-approved-page="routing"] .patch-table{table-layout:auto}
+[data-approved-page="routing"] .patch-table th{white-space:normal;overflow-wrap:anywhere;padding:6px 2px;font-size:11px;letter-spacing:.02em;max-width:84px}
+[data-approved-page="routing"] .patch-table th.patch-src{white-space:normal;max-width:96px;padding:6px 8px 6px 4px;font-size:12px}
+[data-approved-page="routing"] .patch-table th.src-h{max-width:96px;white-space:normal}
+[data-approved-page="routing"] .patch-table td{padding:2px}
+[data-approved-page="routing"] .xpt{width:100%;min-width:var(--tap);padding:0}
+[data-approved-page="routing"] .patch-block{overflow:hidden}
+[data-approved-page="routing"] input[type="checkbox"]{appearance:none;-webkit-appearance:none;display:inline-grid;place-content:center;flex:none;width:var(--tap);min-width:var(--tap);height:var(--tap);margin:0;border:0;background:transparent;cursor:pointer}
+[data-approved-page="routing"] input[type="checkbox"]::before{content:"";width:22px;height:22px;border:2px solid var(--line-2);border-radius:5px;background:var(--bg-2)}
+[data-approved-page="routing"] input[type="checkbox"]:checked::before{background:var(--blue);border-color:var(--blue);box-shadow:inset 0 0 0 4px var(--bg-2)}

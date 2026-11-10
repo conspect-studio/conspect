@@ -148,3 +148,21 @@ describe('RoutingSurface', () => {
     expect(await screen.findByText('Confirm a program-affecting take?')).toBeInTheDocument();
   });
 });
+
+describe('crosspoint destinations legend', () => {
+  it('states why output sinks are not crosspoint targets and keeps tap targets', () => {
+    renderWithProviders(
+      <CrosspointGrid
+        sources={[{ id: 'cam-a', name: 'Camera A' }]}
+        dests={[{ kind: 'video', id: 'c1', label: 'c1' }]}
+        selectedSource=""
+        selectedDest=""
+        planned={false}
+        onPick={(): void => undefined}
+      />,
+    );
+    expect(screen.getByText(/output sinks \(PGM, HLS …\) are not crosspoint targets/)).toBeInTheDocument();
+    expect(screen.getByTestId('xpt-cam-a-c1')).toBeInTheDocument();
+  });
+});
+

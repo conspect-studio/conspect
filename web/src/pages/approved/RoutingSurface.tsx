@@ -195,6 +195,13 @@ export function CrosspointGrid({
           Crosspoint states: ? Unknown (no readback) · ◇ SEL selected · ? PLAN
           dry-run plan. A take applies only from the plan panel.
         </Trans>
+        {" "}
+        <Trans>
+          Destinations are layout cells and audio tracks because those are the
+          only targets the routing API accepts (video cell, audio track /
+          program bus, subtitle layer); output sinks (PGM, HLS …) are not
+          crosspoint targets and are configured in the outputs panel.
+        </Trans>
       </p>
     </div>
   );

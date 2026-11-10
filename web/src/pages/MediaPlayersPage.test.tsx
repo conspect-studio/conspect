@@ -240,6 +240,18 @@ describe('MediaPlayersPage live truth vs configured default', () => {
     expect(screen.queryByText('Only while the player is vamping.')).toBeNull();
   });
 
+  it('collapses the vamp-exit rows into one disclosure whose summary carries the gating reason', async () => {
+    renderPage();
+    await screen.findByTestId('player-console-vt-1');
+    const disclosure = screen.getByTestId('vamp-disclosure-vt-1');
+    expect(disclosure).not.toHaveAttribute('open');
+    expect(screen.getByTestId('vamp-why-vt-1')).toHaveTextContent(
+      "No live state yet — the player's vamp status is unknown.",
+    );
+    // Keys stay in the DOM, guarded.
+    expect(screen.getByRole('button', { name: 'Take vamp exit: vt-1' })).toBeDisabled();
+  });
+
   it('gates the vamp-exit triad on the live state only', async () => {
     renderPage({
       live: {
