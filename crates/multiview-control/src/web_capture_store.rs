@@ -6,13 +6,22 @@ use sha2::{Digest, Sha256};
 use std::{
     collections::{HashMap, VecDeque},
     fs::{File, OpenOptions},
-    io::{self, BufRead, Write},
+    io::{self, BufRead, Read, Write},
     path::{Path, PathBuf},
     sync::Mutex,
 };
 
 /// Maximum retained idempotency records.
 pub const LEDGER_CAPACITY: usize = 1024;
+
+/// Maximum bytes of the terms acceptance log; further writes fail `StorageFull`.
+pub const TERMS_MAX_BYTES: u64 = 16 * 1024 * 1024;
+/// Maximum bytes of the idempotency journal accepted at startup or written at runtime.
+pub const LEDGER_MAX_BYTES: u64 = 4 * 1024 * 1024;
+
+fn storage_full(what: &str) -> io::Error {
+    io::Error::new(io::ErrorKind::StorageFull, format!("{what} is full"))
+}
 
 /// One durable actor acceptance of site terms, made before a job is accepted.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -50,15 +59,21 @@ impl TermsRepository for MemoryTerms {
 
 /// Append-only private file with fsync per record.
 pub struct DurableTerms {
-    file: Mutex<File>,
+    file: Mutex<(File, u64)>,
 }
 impl DurableTerms {
     /// Open or create a private regular file; symlinks are refused.
     /// # Errors
     /// Unsafe or unwritable path.
     pub fn open(path: &Path) -> io::Result<Self> {
+        let existed = std::fs::symlink_metadata(path).is_ok();
+        let file = open_private(path)?;
+        if !existed {
+            sync_parent(path)?;
+        }
+        let len = file.metadata()?.len();
         Ok(Self {
-            file: Mutex::new(open_private(path)?),
+            file: Mutex::new((file, len)),
         })
     }
 }
@@ -70,8 +85,14 @@ impl TermsRepository for DurableTerms {
             .file
             .lock()
             .map_err(|_| io::Error::other("terms store poisoned"))?;
-        f.write_all(&line)?;
-        f.sync_all()
+        let next = f.1.saturating_add(line.len() as u64);
+        if next > TERMS_MAX_BYTES {
+            return Err(storage_full("terms log"));
+        }
+        f.0.write_all(&line)?;
+        f.0.sync_all()?;
+        f.1 = next;
+        Ok(())
     }
 }
 
@@ -93,6 +114,33 @@ pub fn open_private(path: &Path) -> io::Result<File> {
         o.mode(0o600);
     }
     o.open(path)
+}
+
+/// Fsync the parent directory so a create or rename survives power loss.
+fn sync_parent(path: &Path) -> io::Result<()> {
+    let parent = match path.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p,
+        _ => Path::new("."),
+    };
+    File::open(parent)?.sync_all()
+}
+
+/// Create a fresh private temp file; an existing entry is removed first (a
+/// symlink is unlinked, never followed) and `create_new` (O_EXCL) fails closed.
+fn create_tmp(tmp: &Path) -> io::Result<File> {
+    match std::fs::remove_file(tmp) {
+        Ok(()) => {}
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e),
+    }
+    let mut o = OpenOptions::new();
+    o.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        o.mode(0o600);
+    }
+    o.open(tmp)
 }
 
 /// Hex SHA-256.
@@ -123,12 +171,102 @@ struct Rec {
     key: String,
     digest: String,
     value: Option<u64>,
+    /// Durable abandon marker: removes the pending reservation on replay.
+    #[serde(default)]
+    tombstone: bool,
 }
 type Id = (String, String, String);
-/// Bounded actor+operation+key map. No lock is held across the guarded operation.
+#[derive(Default)]
+struct State {
+    map: HashMap<Id, Rec>,
+    order: VecDeque<Id>,
+}
+impl State {
+    fn apply(&mut self, r: Rec) {
+        let id = (r.actor.clone(), r.op.clone(), r.key.clone());
+        if r.tombstone {
+            self.remove(&id);
+        } else if self.map.insert(id.clone(), r).is_none() {
+            self.order.push_back(id);
+        }
+    }
+    fn remove(&mut self, id: &Id) {
+        if self.map.remove(id).is_some() {
+            self.order.retain(|x| x != id);
+        }
+    }
+    fn pending(&self) -> usize {
+        self.map.values().filter(|r| r.value.is_none()).count()
+    }
+    /// Evict oldest completed records until `len() < limit`; never a pending one.
+    /// Returns false when only pending records remain above the limit.
+    fn make_room(&mut self, limit: usize) -> bool {
+        while self.order.len() >= limit {
+            let Some(pos) = self
+                .order
+                .iter()
+                .position(|id| self.map.get(id).is_some_and(|r| r.value.is_some()))
+            else {
+                return false;
+            };
+            if let Some(old) = self.order.remove(pos) {
+                self.map.remove(&old);
+            }
+        }
+        true
+    }
+    fn snapshot(&self) -> io::Result<Vec<u8>> {
+        let mut out = Vec::new();
+        for id in &self.order {
+            if let Some(r) = self.map.get(id) {
+                serde_json::to_writer(&mut out, r).map_err(io::Error::other)?;
+                out.push(b'\n');
+            }
+        }
+        Ok(out)
+    }
+}
+struct Log {
+    file: File,
+    len: u64,
+    path: PathBuf,
+}
+impl Log {
+    /// Durably append one record, compacting to `state` when the bound is reached.
+    fn append(&mut self, state: &State, rec: &Rec) -> io::Result<()> {
+        let mut line = serde_json::to_vec(rec).map_err(io::Error::other)?;
+        line.push(b'\n');
+        if self.len.saturating_add(line.len() as u64) > LEDGER_MAX_BYTES {
+            let snap = state.snapshot()?;
+            if (snap.len() + line.len()) as u64 > LEDGER_MAX_BYTES {
+                return Err(storage_full("idempotency journal"));
+            }
+            self.file = write_snapshot(&self.path, &snap)?;
+            self.len = snap.len() as u64;
+        }
+        self.file.write_all(&line)?;
+        self.file.sync_all()?;
+        self.len += line.len() as u64;
+        Ok(())
+    }
+}
+/// Atomically replace `path` with `bytes` (fsync file, rename, fsync parent) and
+/// return a fresh append handle.
+fn write_snapshot(path: &Path, bytes: &[u8]) -> io::Result<File> {
+    let tmp: PathBuf = path.with_extension("tmp");
+    {
+        let mut t = create_tmp(&tmp)?;
+        t.write_all(bytes)?;
+        t.sync_all()?;
+    }
+    std::fs::rename(&tmp, path)?;
+    sync_parent(path)?;
+    open_private(path)
+}
+/// Bounded actor+operation+key map. Pending reservations are never evicted.
 pub struct Ledger {
-    inner: Mutex<(HashMap<Id, Rec>, VecDeque<Id>)>,
-    file: Option<Mutex<File>>,
+    inner: Mutex<State>,
+    file: Option<Mutex<Log>>,
 }
 impl Ledger {
     /// Volatile ledger (tests).
@@ -139,57 +277,79 @@ impl Ledger {
             file: None,
         }
     }
-    /// Load, compact and reopen a private durable ledger.
+    /// Replay every record and tombstone, bound memory, compact and reopen a
+    /// private durable ledger. Lock order is always `inner` then `file`.
     /// # Errors
-    /// Unsafe path or I/O failure.
+    /// Unsafe path, corrupt or oversize journal, more than [`LEDGER_CAPACITY`]
+    /// pending reservations, or I/O failure.
     pub fn durable(path: &Path) -> io::Result<Self> {
-        let mut map = HashMap::new();
-        let mut order = VecDeque::new();
+        let mut state = State::default();
         if std::fs::symlink_metadata(path).is_ok() {
             drop(open_private(path)?); // validates regular file
-            for line in io::BufReader::new(File::open(path)?).lines() {
-                let r: Rec = serde_json::from_str(&line?)
+            let f = File::open(path)?;
+            if f.metadata()?.len() > LEDGER_MAX_BYTES {
+                return Err(io::Error::other("capture idempotency journal is too large"));
+            }
+            // Bounded read: the length check above plus `take` guard growth races.
+            let mut text = String::new();
+            f.take(LEDGER_MAX_BYTES + 1)
+                .read_to_string(&mut text)
+                .map_err(|_| io::Error::other("capture idempotency journal is corrupt"))?;
+            if text.len() as u64 > LEDGER_MAX_BYTES {
+                return Err(io::Error::other("capture idempotency journal is too large"));
+            }
+            for line in text.lines() {
+                let r: Rec = serde_json::from_str(line)
                     .map_err(|_| io::Error::other("capture idempotency journal is corrupt"))?;
-                let id = (r.actor.clone(), r.op.clone(), r.key.clone());
-                if map.insert(id.clone(), r).is_none() {
-                    order.push_back(id);
-                }
-                while order.len() > LEDGER_CAPACITY {
-                    if let Some(old) = order.pop_front() {
-                        map.remove(&old);
-                    }
-                }
+                state.apply(r);
             }
-            let tmp: PathBuf = path.with_extension("tmp");
-            let _ = std::fs::remove_file(&tmp);
-            {
-                let mut t = open_private(&tmp)?;
-                for id in &order {
-                    if let Some(r) = map.get(id) {
-                        let mut l = serde_json::to_vec(r).map_err(io::Error::other)?;
-                        l.push(b'\n');
-                        t.write_all(&l)?;
-                    }
-                }
-                t.sync_all()?;
+            if state.pending() > LEDGER_CAPACITY {
+                return Err(io::Error::other(
+                    "capture idempotency journal has more pending reservations than capacity",
+                ));
             }
-            std::fs::rename(&tmp, path)?;
+            // Same order as runtime: oldest completed first, never pending.
+            let limit = LEDGER_CAPACITY + 1;
+            if !state.make_room(limit) {
+                return Err(io::Error::other("capture idempotency journal over capacity"));
+            }
+            let snap = state.snapshot()?;
+            drop(write_snapshot(path, &snap)?);
+        } else {
+            drop(open_private(path)?);
+            sync_parent(path)?;
         }
+        let file = open_private(path)?;
+        let len = file.metadata()?.len();
         Ok(Self {
-            inner: Mutex::new((map, order)),
-            file: Some(Mutex::new(open_private(path)?)),
+            inner: Mutex::new(state),
+            file: Some(Mutex::new(Log {
+                file,
+                len,
+                path: path.to_owned(),
+            })),
         })
     }
     fn id(actor: &str, op: &str, key: &str) -> Id {
         (actor.to_owned(), op.to_owned(), digest_hex(key.as_bytes()))
     }
+    fn persist(&self, state: &State, rec: &Rec) -> io::Result<()> {
+        match &self.file {
+            Some(f) => f
+                .lock()
+                .map_err(|_| io::Error::other("ledger poisoned"))?
+                .append(state, rec),
+            None => Ok(()),
+        }
+    }
     /// Reserve `(actor, op, key)` for `digest`.
     /// # Errors
-    /// `Err(true)` divergent body for a used key; `Err(false)` same key in flight.
+    /// `Err(true)` divergent body for a used key; `Err(false)` same key in flight,
+    /// ledger full of pending reservations, or the reservation could not be stored.
     pub fn reserve(&self, actor: &str, op: &str, key: &str, digest: &str) -> Result<Reserve, bool> {
         let id = Self::id(actor, op, key);
         let mut g = self.inner.lock().map_err(|_| true)?;
-        if let Some(r) = g.0.get(&id) {
+        if let Some(r) = g.map.get(&id) {
             if r.digest != digest {
                 return Err(true);
             }
@@ -201,72 +361,67 @@ impl Ledger {
             key: id.2.clone(),
             digest: digest.to_owned(),
             value: None,
+            tombstone: false,
         };
-        // Never evict uncertain/in-flight intent: it may already have started a
-        // durable capture. Retrying such a key must fail closed, not duplicate it.
-        while g.1.len() >= LEDGER_CAPACITY {
-            let Some(position) =
-                g.1.iter()
-                    .position(|old| g.0.get(old).is_some_and(|r| r.value.is_some()))
-            else {
-                return Err(false);
+        // Never evict pending intent: it may already have started a durable
+        // capture. Completed records go oldest first, only if room is needed.
+        if g.order.len() >= LEDGER_CAPACITY {
+            let mut probe = State {
+                map: g.map.clone(),
+                order: g.order.clone(),
             };
-            let Some(old) = g.1.remove(position) else {
+            if !probe.make_room(LEDGER_CAPACITY) {
                 return Err(false);
-            };
-            g.0.remove(&old);
+            }
+            // Persist the reservation first (compaction sees the evicted view).
+            self.persist(&probe, &rec).map_err(|_| false)?;
+            *g = probe;
+        } else {
+            self.persist(&g, &rec).map_err(|_| false)?;
         }
-        if let Some(file) = &self.file {
-            let mut line = serde_json::to_vec(&rec).map_err(|_| false)?;
-            line.push(b'\n');
-            let mut file = file.lock().map_err(|_| false)?;
-            file.write_all(&line)
-                .and_then(|()| file.sync_all())
-                .map_err(|_| false)?;
-        }
-        g.1.push_back(id.clone());
-        g.0.insert(id, rec);
+        g.order.push_back(id.clone());
+        g.map.insert(id, rec);
         Ok(Reserve::Fresh)
     }
     /// Record the result durably before the caller acknowledges.
     /// # Errors
-    /// Durable write failure.
+    /// Missing reservation or durable write failure.
     pub fn complete(&self, actor: &str, op: &str, key: &str, value: u64) -> io::Result<()> {
         let id = Self::id(actor, op, key);
-        let rec = {
-            let mut g = self
-                .inner
-                .lock()
-                .map_err(|_| io::Error::other("ledger poisoned"))?;
-            let Some(r) = g.0.get(&id) else {
-                return Err(io::Error::other("idempotency reservation missing"));
-            };
-            let mut record = r.clone();
-            record.value = Some(value);
-            record
-        };
-        if let Some(f) = &self.file {
-            let mut l = serde_json::to_vec(&rec).map_err(io::Error::other)?;
-            l.push(b'\n');
-            let mut f = f.lock().map_err(|_| io::Error::other("ledger poisoned"))?;
-            f.write_all(&l)?;
-            f.sync_all()?;
-        }
-        self.inner
+        let mut g = self
+            .inner
             .lock()
-            .map_err(|_| io::Error::other("ledger poisoned"))?
-            .0
-            .insert(id, rec);
+            .map_err(|_| io::Error::other("ledger poisoned"))?;
+        let Some(r) = g.map.get(&id) else {
+            return Err(io::Error::other("idempotency reservation missing"));
+        };
+        let mut rec = r.clone();
+        rec.value = Some(value);
+        self.persist(&g, &rec)?;
+        g.map.insert(id, rec);
         Ok(())
     }
-    /// Drop an unfinished reservation so the client may retry.
-    pub fn abandon(&self, actor: &str, op: &str, key: &str) {
+    /// Durably drop an unfinished reservation so the client may retry. The
+    /// tombstone is fsynced BEFORE the in-memory removal; on error the
+    /// reservation stays pending (fail closed). Completed records are untouched.
+    /// # Errors
+    /// Durable write failure.
+    pub fn abandon(&self, actor: &str, op: &str, key: &str) -> io::Result<()> {
         let id = Self::id(actor, op, key);
-        if let Ok(mut g) = self.inner.lock() {
-            if g.0.get(&id).is_some_and(|r| r.value.is_none()) {
-                g.0.remove(&id);
-                g.1.retain(|x| *x != id);
-            }
+        let mut g = self
+            .inner
+            .lock()
+            .map_err(|_| io::Error::other("ledger poisoned"))?;
+        let Some(r) = g.map.get(&id) else {
+            return Ok(());
+        };
+        if r.value.is_some() {
+            return Ok(());
         }
+        let mut tomb = r.clone();
+        tomb.tombstone = true;
+        self.persist(&g, &tomb)?;
+        g.remove(&id);
+        Ok(())
     }
 }

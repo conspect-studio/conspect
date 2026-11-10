@@ -198,11 +198,24 @@ impl Provider {
                 ))
             }
         }
-        let outcome = self.admit(p, key, service, terms.as_ref(), &body, capture);
         // Keep the durable pending receipt on any indeterminate outcome. The
         // service may already have accepted a job even if the final receipt
-        // fsync failed. A retry must not allocate a second browser job.
-        outcome
+        // fsync failed. A retry must not allocate a second browser job. Only a
+        // definite pre-acceptance failure durably abandons the reservation.
+        match self.admit(p, key, service, terms.as_ref(), &body, capture) {
+            Ok(admission) => Ok(admission),
+            Err(AdmitError::Uncertain(e)) => Err(e),
+            Err(AdmitError::Definite(e)) => {
+                self.ledger
+                    .abandon(&p.key_id, "submit", key)
+                    .map_err(|_| {
+                        ControlError::Repository(
+                            "idempotency reservation could not be released".into(),
+                        )
+                    })?;
+                Err(e)
+            }
+        }
     }
     fn admit(
         &self,
@@ -212,7 +225,7 @@ impl Provider {
         terms: &dyn TermsRepository,
         body: &CaptureBody,
         capture: Capture,
-    ) -> ControlResult<Admission> {
+    ) -> Result<Admission, AdmitError> {
         let accepted_at_unix = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |d| d.as_secs());
@@ -224,7 +237,9 @@ impl Provider {
                 accepted_at_unix,
             })
             .map_err(|_| {
-                ControlError::Repository("terms acceptance could not be persisted".into())
+                AdmitError::Definite(ControlError::Repository(
+                    "terms acceptance could not be persisted".into(),
+                ))
             })?;
         let request = Request {
             owner: p.key_id.clone(),
@@ -233,17 +248,28 @@ impl Provider {
             maximum_bytes: 64 * 1024 * 1024,
             timeout: Duration::from_secs(120),
         };
-        let id = match service.submit(request).map_err(submit_error)? {
-            Submitted::Accepted(id) | Submitted::Coalesced(id) => id.raw(),
+        let id = match service.submit(request) {
+            Ok(Submitted::Accepted(id) | Submitted::Coalesced(id)) => id.raw(),
+            Err(e @ SubmitError::Persistence) => {
+                return Err(AdmitError::Uncertain(submit_error(e)))
+            }
+            Err(e) => return Err(AdmitError::Definite(submit_error(e))),
         };
         self.ledger
             .complete(&p.key_id, "submit", key, id)
             .map_err(|_| {
-                ControlError::Repository("idempotency record could not be persisted".into())
+                AdmitError::Uncertain(ControlError::Repository(
+                    "idempotency record could not be persisted".into(),
+                ))
             })?;
         Ok(Admission {
             job_id: id,
             fresh: true,
+        })
+    }
+    fn release(&self, actor: &str, op: &str, key: &str) -> ControlResult<()> {
+        self.ledger.abandon(actor, op, key).map_err(|_| {
+            ControlError::Repository("idempotency reservation could not be released".into())
         })
     }
     /// Fetch an actor-owned job after object authorization.
@@ -332,17 +358,23 @@ impl Provider {
                 Ok(CancelResult { fresh: true })
             }
             CancelOutcome::Finished => {
-                self.ledger.abandon(&p.key_id, op, key);
+                self.release(&p.key_id, op, key)?;
                 Err(ControlError::Conflict(
                     "capture job already finished".into(),
                 ))
             }
             CancelOutcome::Unknown => {
-                self.ledger.abandon(&p.key_id, op, key);
+                self.release(&p.key_id, op, key)?;
                 Err(missing(id))
             }
         }
     }
+}
+/// Stage outcome: `Definite` failed before acceptance (safe to release the
+/// reservation); `Uncertain` may have started a capture (keep it pending).
+enum AdmitError {
+    Definite(ControlError),
+    Uncertain(ControlError),
 }
 fn missing(id: u64) -> ControlError {
     ControlError::NotFound {
