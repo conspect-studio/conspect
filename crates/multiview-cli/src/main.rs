@@ -657,9 +657,6 @@ async fn run_pipeline_until_ctrl_c(
     // control plane serves), so the attach sits inside the control block below.
     // The `else` arm after it keeps a control-less run with `[switcher]` on the
     // same wiring minus the lease.
-    let mut switcher_leases = None;
-    let mut switcher_preview_slot = None;
-    let mut switcher_attached = false;
     struct LeaseCleanup(
         Option<Arc<multiview_control::source_demand::SwitcherPreviewLeases>>,
         StopSignal,
@@ -672,6 +669,9 @@ async fn run_pipeline_until_ctrl_c(
             }
         }
     }
+    let mut switcher_leases = None;
+    let mut switcher_preview_slot = None;
+    let mut switcher_attached = false;
     let mut lease_cleanup = LeaseCleanup(None, stop.clone());
     let mut attached_switcher: Option<multiview_cli::switcher_runtime::FirstSliceSwitcher> = None;
     // The shared program-audio preview tap (ADR-P006 audio): wired ONLY when this
