@@ -17,3 +17,5 @@ Length: 658 bytes. SHA-256:
 ```
 
 The feature-gated native integration test separately opens the repository's actual `VideoEncoder`, encodes a frame, and verifies the emitted SPS/PPS metadata. This fixture does not replace that native coverage.
+
+The native test passed locally when this fixture was introduced. CI execution is required separately: the explicit `AVC metadata native GPL encoder` job uses the published `8.1.1-gpl` image and rejects a zero-test result. The default parser tests do not require that image or a native executable. A local pass is not a CI pass.
