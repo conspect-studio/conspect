@@ -9,6 +9,25 @@ pub struct AvWindow {
     pub audio: BTreeMap<String, Vec<Packet>>,
 }
 
+impl crate::RetainedWindow for AvWindow {
+    fn generation(&self) -> u64 {
+        self.video.generation
+    }
+
+    /// Video packets first, then each audio track in name order: the same bounded order the
+    /// single-rendition fence always charged.
+    fn for_each_packet(&mut self, visit: &mut dyn FnMut(&mut Packet)) {
+        for packet in &mut self.video.packets {
+            visit(packet);
+        }
+        for packets in self.audio.values_mut() {
+            for packet in packets {
+                visit(packet);
+            }
+        }
+    }
+}
+
 struct AudioTrack {
     producer: moq_net::track::Producer,
     last_pts: Option<u64>,

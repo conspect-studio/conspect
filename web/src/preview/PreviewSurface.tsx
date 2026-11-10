@@ -151,7 +151,7 @@ export function PreviewSurface({
 
   if (moqFailed) return <div role="alert"><Trans>Live input preview failed.</Trans></div>;
   if (capabilities?.moq && !moqUnavailable) {
-    return <MoqPlayer api={moqApi} label={label} audio={audio} className={className}
+    return <MoqPlayer key={`${scope}:${whepEndpoint}`} api={moqApi} label={label} audio={audio} className={className}
       onUnavailable={() => { setMoqUnavailable(true); }} onFatal={() => { setMoqFailed(true); }}
       onLeaseState={(state) => { onLeaseState?.(state); if (state === 'released') onSessionReleased?.(); }} />;
   }

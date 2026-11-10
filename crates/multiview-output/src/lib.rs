@@ -53,6 +53,10 @@
 /// feature `aes67`) touches a socket.
 pub mod aes67;
 
+/// Atomic bounded encoded-window carrier for the opt-in libav output path.
+#[cfg(feature = "ffmpeg")]
+pub mod batch;
+
 /// DEV-B1 / ADR-0044 — local DRM/KMS display output: the raw-frame sink that
 /// scans the pre-encode NV12 canvas out to HDMI/DP glass via atomic page
 /// flips. The mailbox, mode policy (EDID/CVT-RB), flip state machine, and the
@@ -92,6 +96,9 @@ pub mod rtcp;
 /// packets so the muxer's interleaved write never aborts on non-monotonic DTS
 /// while B-frame reorder is preserved — distinct from the encoder path's
 /// `out_pts = f(tick)`. Pure `i64` arithmetic; always compiled (no `ffmpeg`).
+/// Lock-free live link state + reconnect back-off for resilient push outputs
+/// (SRT/RTMP/RIST): pure Rust, always compiled.
+pub mod push_link;
 pub mod restamp;
 pub mod rtsp;
 pub mod rtsp_server;
@@ -162,7 +169,7 @@ pub use guarded::{
 };
 #[cfg(feature = "ffmpeg")]
 pub use sink::{
-    AudioEncodeConfig, AudioSelection, EncodeConfig, EncodeStats, FileSink, MuxStream,
-    PacketMuxOutcome, PacketMuxSink, PacketSource, ProgramEncoder, PushProtocol, PushSink,
-    SegmentResult, SegmentSink, TrackSelection, VideoFrameSource,
+    AudioEncodeConfig, AudioRenditionEncoder, AudioSelection, EncodeConfig, EncodeStats, FileSink,
+    MuxStream, PacketMuxOutcome, PacketMuxSink, PacketSource, ProgramEncoder, PushProtocol,
+    PushSink, SegmentResult, SegmentSink, TrackSelection, VideoFrameSource, VideoRenditionEncoder,
 };

@@ -130,6 +130,75 @@ pub async fn bind_and_serve<F>(
 where
     F: Future<Output = ()> + Send + 'static,
 {
+    bind_and_serve_with_moq(
+        listen,
+        config,
+        publisher,
+        commands,
+        preview,
+        whep,
+        whip,
+        whep_output,
+        licence,
+        mesh,
+        live_apply,
+        live_sources,
+        boot_model,
+        source_events,
+        #[cfg(feature = "moq-output")]
+        None,
+        #[cfg(feature = "moq-output")]
+        None,
+        shutdown,
+    )
+    .await
+}
+
+/// Serve the control plane with an explicit run-scoped `MoQ` authority.
+/// # Errors
+/// Returns listener, seed-resource or control server initialization errors.
+#[allow(
+    clippy::too_many_arguments,
+    clippy::too_many_lines,
+    clippy::similar_names
+)]
+pub async fn bind_and_serve_with_moq<F>(
+    listen: &str,
+    config: &MultiviewConfig,
+    publisher: Arc<EnginePublisher<EngineStateSnapshot, Event>>,
+    commands: CommandSender,
+    preview: SharedPreview,
+    // The WHEP focus transport (ADR-P006), already cap-decorated. `None` keeps
+    // the default `NoWhep` (a pure build sheds every focus to the JPEG ladder).
+    whep: Option<multiview_control::SharedWhep>,
+    // The WHIP ingest provider (ADR-T014). `None` keeps the default `NoWhip`
+    // (every publish answers `503`; routes stay present + authz-enforced).
+    whip: Option<multiview_control::SharedWhip>,
+    whep_output: Option<multiview_control::SharedWhepOutput>,
+    licence: Option<multiview_control::LicenceState>,
+    mesh: Option<Arc<multiview_mesh::MeshState>>,
+    live_apply: multiview_control::LiveApplyCaps,
+    // The run-path live-apply capability (ADR-W018): which source kinds the
+    // RUNNING engine can take live. The binary derives it from the seams it
+    // actually wired (network kinds iff the hub has an ingest spawner), so
+    // the X-Multiview-Apply header never over-claims.
+    live_sources: multiview_control::LiveSourceCapability,
+    // The Boot/Loaded/Running model (ADR-W024): `Some` for a config-file run
+    // (backs `GET /config/boot-model` + the revert/promote actions); `None`
+    // for store-only/`--ticks` runs (those routes report `modeled: false`).
+    boot_model: Option<Arc<multiview_control::boot_model::BootModel>>,
+    // Read-only source event snapshots from the running pipeline. `None` keeps
+    // the default unavailable provider for run paths without an event runtime.
+    source_events: Option<crate::source_event_runtime::RuntimeReader>,
+    #[cfg(feature = "moq-output")] moq: Option<Arc<multiview_control::moq::MoqRegistry>>,
+    #[cfg(feature = "moq-output")] moq_slot: Option<
+        crate::output_window_registry::WindowSubscriptionSlot,
+    >,
+    shutdown: F,
+) -> std::io::Result<(SocketAddr, JoinHandle<std::io::Result<()>>, AppState)>
+where
+    F: Future<Output = ()> + Send + 'static,
+{
     let listener = TcpListener::bind(listen).await?;
     let addr = listener.local_addr()?;
 
@@ -221,11 +290,19 @@ where
     #[cfg(not(feature = "gpu"))]
     let compositor_adapter: Option<multiview_hal::AdapterReport> = None;
 
+    let api_keys = Arc::new(api_keys);
+    #[cfg(feature = "moq-output")]
+    let outgoing = match moq_slot {
+        Some(slot) => crate::moq_outputs::factory::DynamicRegistryFactory(slot)
+            .activate_from_env(api_keys.clone())
+            .map_err(|_| std::io::Error::other("MoQ relay activation rejected"))?,
+        None => None,
+    };
     let mut state = AppState::new(
         publisher,
         commands,
         Arc::new(InMemoryRepository::new()),
-        Arc::new(api_keys),
+        api_keys,
     )
     .with_seeded_resources(seeded)
     .with_base_document(
@@ -234,6 +311,10 @@ where
     )
     .with_preview(preview)
     .with_warning_store(warnings);
+    #[cfg(feature = "moq-output")]
+    if let Some(moq) = moq {
+        state = state.with_moq(moq);
+    }
     if let Some(reader) = source_events {
         state = state.with_source_events(Arc::new(reader));
     }
@@ -424,7 +505,13 @@ where
     // the server future is dropped, so no management task survives the server.
     let shutdown = async move {
         let _reconciler = reconciler;
+        #[cfg(feature = "moq-output")]
+        let outgoing = outgoing;
         shutdown.await;
+        #[cfg(feature = "moq-output")]
+        if let Some(outgoing) = outgoing {
+            outgoing.shutdown().await;
+        }
     };
     let mut app = multiview_control::router(state.clone());
     for mount in hls_mounts(config) {
@@ -1014,6 +1101,69 @@ pub fn insert_input_fragment(
         return;
     };
     obj.insert("inputs".to_owned(), fragment.clone());
+}
+
+/// Serialise the live push-output link records into the `outputs` snapshot
+/// fragment: `{ "<id>": { "link": { state, mode, transport, url, clients,
+/// sessions, dropped, discarded_no_client, discarded_awaiting_keyframe,
+/// dropped_slow_peer, dropped_upstream, written, peers, last_error?,
+/// last_session_error? } } }`, or `None` when the run has no push outputs.
+/// `dropped` is the total of the four reason counters; `last_error` is current
+/// link health, `last_session_error` is history. Reads atomics + lock-free
+/// cells only (inv #10).
+#[must_use]
+pub fn push_links_fragment(
+    links: &[(
+        String,
+        std::sync::Arc<multiview_output::push_link::PushLinkStatus>,
+    )],
+) -> Option<serde_json::Value> {
+    if links.is_empty() {
+        return None;
+    }
+    let mut outputs = serde_json::Map::with_capacity(links.len());
+    for (id, link) in links {
+        let snap = link.snapshot();
+        let mut obj = serde_json::json!({
+            "state": snap.state.as_str(),
+            "mode": snap.mode,
+            "transport": snap.transport,
+            "url": snap.url,
+            "clients": snap.clients,
+            "sessions": snap.sessions,
+            "dropped": snap.dropped,
+            "discarded_no_client": snap.discarded_no_client,
+            "discarded_awaiting_keyframe": snap.discarded_awaiting_keyframe,
+            "dropped_slow_peer": snap.dropped_slow_peer,
+            "dropped_upstream": snap.dropped_upstream,
+            "written": snap.written,
+            "peers": snap.peers,
+        });
+        if let Some(map) = obj.as_object_mut() {
+            if let Some(err) = snap.last_error {
+                map.insert("last_error".to_owned(), serde_json::Value::String(err));
+            }
+            if let Some(err) = snap.last_session_error {
+                map.insert(
+                    "last_session_error".to_owned(),
+                    serde_json::Value::String(err),
+                );
+            }
+        }
+        outputs.insert(id.clone(), serde_json::json!({ "link": obj }));
+    }
+    Some(serde_json::Value::Object(outputs))
+}
+
+/// Insert a pre-built [`push_links_fragment`] under `outputs` (no-op on `None`).
+pub fn insert_output_fragment(
+    snapshot: &mut EngineStateSnapshot,
+    fragment: Option<&serde_json::Value>,
+) {
+    let (Some(fragment), Some(obj)) = (fragment, snapshot.as_object_mut()) else {
+        return;
+    };
+    obj.insert("outputs".to_owned(), fragment.clone());
 }
 
 /// Fold each source's current lifecycle state into the conflated engine-state

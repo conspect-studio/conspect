@@ -1,0 +1,232 @@
+{
+  "scope": "Local exact production UI wrapper, actual control HTTP authority and real independent UDP shapers; immutable fixture packets, not engine production encoding and not Cloudflare",
+  "browserRevision": "20af1721",
+  "playbackSourceSha256": "7af119d37be42a4a9499de8e08d0760f48737ac3dd70a021a9786f822a38ae47",
+  "authorityRevision": "19412178 with provider b5baf11e and registry dbd8a212",
+  "ranAt": "2026-11-09T14:10:01.295Z",
+  "startupMs": 49071,
+  "readinessContract": "actual-high-stable-3s-deadline-60s",
+  "checks": [
+    {
+      "criterion": "both viewers render actual high stable for three seconds within 60-second readiness bound",
+      "passed": true
+    },
+    {
+      "criterion": "shaped consumer renders actual low after capacity reduction",
+      "passed": true
+    },
+    {
+      "criterion": "healthy consumer continues high during reduction",
+      "passed": true
+    },
+    {
+      "criterion": "restored consumer renders mid or high after restoration",
+      "passed": true
+    },
+    {
+      "criterion": "both viewers renew through real release acknowledgement before reacquire",
+      "passed": true
+    },
+    {
+      "criterion": "neither exact UI wrapper reports terminal failure",
+      "passed": true
+    },
+    {
+      "criterion": "three shaped cycles render actual low",
+      "passed": true
+    },
+    {
+      "criterion": "three restored cycles render actual mid or high",
+      "passed": true
+    },
+    {
+      "criterion": "healthy viewer keeps only high quality after warmup",
+      "passed": true
+    },
+    {
+      "criterion": "both wrappers remain live after all cycles",
+      "passed": true
+    },
+    {
+      "criterion": "assumed preview SLO: slow rendered gap at most 3000ms after readiness",
+      "passed": true
+    },
+    {
+      "criterion": "assumed preview SLO: healthy rendered gap at most 1000ms after readiness",
+      "passed": true
+    }
+  ],
+  "cycleMetrics": [
+    {
+      "shapedAfterMs": 49172,
+      "restoredAfterMs": 61588,
+      "firstLowLatencyMs": 3555,
+      "firstRestoredLatencyMs": 112,
+      "slowMaxRenderedGapMs": 2323,
+      "healthyMaxRenderedGapMs": 948,
+      "slowAdvancingPts": 1971,
+      "healthyAdvancingPts": 2320
+    },
+    {
+      "shapedAfterMs": 80739,
+      "restoredAfterMs": 92279,
+      "firstLowLatencyMs": 3211,
+      "firstRestoredLatencyMs": 904,
+      "slowMaxRenderedGapMs": 2323,
+      "healthyMaxRenderedGapMs": 948,
+      "slowAdvancingPts": 2685,
+      "healthyAdvancingPts": 3240
+    },
+    {
+      "shapedAfterMs": 112614,
+      "restoredAfterMs": 124831,
+      "firstLowLatencyMs": 2444,
+      "firstRestoredLatencyMs": 3465,
+      "slowMaxRenderedGapMs": 2323,
+      "healthyMaxRenderedGapMs": 948,
+      "slowAdvancingPts": 3370,
+      "healthyAdvancingPts": 4171
+    }
+  ],
+  "authorityCleanup": [
+    {
+      "status": "fulfilled",
+      "leaseEvents": [
+        {
+          "action": "acquired",
+          "tMs": 42,
+          "acquireStartedMs": 8,
+          "acquireFinishedMs": 41,
+          "expiresInMs": 49997,
+          "generation": 1,
+          "leaseIdHash": "ca39b966255865ea50d81f9ff590a440bfffb9553e2ce758c384ccc16d75d3a4"
+        },
+        {
+          "action": "revoked-ack",
+          "tMs": 45045,
+          "releaseStartedMs": 45016,
+          "generation": 1,
+          "leaseIdHash": "ca39b966255865ea50d81f9ff590a440bfffb9553e2ce758c384ccc16d75d3a4"
+        },
+        {
+          "action": "acquired",
+          "tMs": 45061,
+          "acquireStartedMs": 45045,
+          "acquireFinishedMs": 45061,
+          "expiresInMs": 49998,
+          "generation": 1,
+          "leaseIdHash": "bd96a466469d6dfa0e4e944a408ee76586f8dc4ab3369e8fb8f7cd5defee48ec"
+        },
+        {
+          "action": "revoked-ack",
+          "tMs": 90065,
+          "releaseStartedMs": 90048,
+          "generation": 1,
+          "leaseIdHash": "bd96a466469d6dfa0e4e944a408ee76586f8dc4ab3369e8fb8f7cd5defee48ec"
+        },
+        {
+          "action": "acquired",
+          "tMs": 90081,
+          "acquireStartedMs": 90066,
+          "acquireFinishedMs": 90081,
+          "expiresInMs": 49998,
+          "generation": 1,
+          "leaseIdHash": "4bc0fca8c672c29a705c18ae6f6ef298e96f992a91f7b1abfaed0a635b022d7c"
+        },
+        {
+          "action": "revoked-ack",
+          "tMs": 135087,
+          "releaseStartedMs": 135068,
+          "generation": 1,
+          "leaseIdHash": "4bc0fca8c672c29a705c18ae6f6ef298e96f992a91f7b1abfaed0a635b022d7c"
+        },
+        {
+          "action": "acquired",
+          "tMs": 135102,
+          "acquireStartedMs": 135089,
+          "acquireFinishedMs": 135101,
+          "expiresInMs": 49998,
+          "generation": 1,
+          "leaseIdHash": "e872a79fddaa3f46308994f3b6bdf87ed83b2b96213f3d6409b8bc512155e7d2"
+        },
+        {
+          "action": "revoked-ack",
+          "tMs": 145289,
+          "releaseStartedMs": 145275,
+          "generation": 1,
+          "leaseIdHash": "e872a79fddaa3f46308994f3b6bdf87ed83b2b96213f3d6409b8bc512155e7d2"
+        }
+      ]
+    },
+    {
+      "status": "fulfilled",
+      "leaseEvents": [
+        {
+          "action": "acquired",
+          "tMs": 26,
+          "acquireStartedMs": 5,
+          "acquireFinishedMs": 26,
+          "expiresInMs": 49998,
+          "generation": 1,
+          "leaseIdHash": "3bcd86a3ad8c779eb5ce17268542fed50234672f08ad2c5b30e2c98e88d3c8cb"
+        },
+        {
+          "action": "revoked-ack",
+          "tMs": 45044,
+          "releaseStartedMs": 45027,
+          "generation": 1,
+          "leaseIdHash": "3bcd86a3ad8c779eb5ce17268542fed50234672f08ad2c5b30e2c98e88d3c8cb"
+        },
+        {
+          "action": "acquired",
+          "tMs": 45064,
+          "acquireStartedMs": 45045,
+          "acquireFinishedMs": 45064,
+          "expiresInMs": 49998,
+          "generation": 1,
+          "leaseIdHash": "fd6906eb724f5269daa48acdb4424fee1790f2099dfc3279950ab641b004b3d0"
+        },
+        {
+          "action": "revoked-ack",
+          "tMs": 90066,
+          "releaseStartedMs": 90050,
+          "generation": 1,
+          "leaseIdHash": "fd6906eb724f5269daa48acdb4424fee1790f2099dfc3279950ab641b004b3d0"
+        },
+        {
+          "action": "acquired",
+          "tMs": 90082,
+          "acquireStartedMs": 90067,
+          "acquireFinishedMs": 90082,
+          "expiresInMs": 49998,
+          "generation": 1,
+          "leaseIdHash": "470bb3f827f4a9a26840471e1046949687d0dce768eb45ec96b31721062b2d65"
+        },
+        {
+          "action": "revoked-ack",
+          "tMs": 135084,
+          "releaseStartedMs": 135070,
+          "generation": 1,
+          "leaseIdHash": "470bb3f827f4a9a26840471e1046949687d0dce768eb45ec96b31721062b2d65"
+        },
+        {
+          "action": "acquired",
+          "tMs": 135099,
+          "acquireStartedMs": 135085,
+          "acquireFinishedMs": 135099,
+          "expiresInMs": 49998,
+          "generation": 1,
+          "leaseIdHash": "0bc0c720cb9afa5459c2cb0c6f7da8b108ddea38314d2de13522b6ed68a1e823"
+        },
+        {
+          "action": "revoked-ack",
+          "tMs": 145057,
+          "releaseStartedMs": 145038,
+          "generation": 1,
+          "leaseIdHash": "0bc0c720cb9afa5459c2cb0c6f7da8b108ddea38314d2de13522b6ed68a1e823"
+        }
+      ]
+    }
+  ],
+  "passed": true
+}

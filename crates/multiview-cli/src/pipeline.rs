@@ -72,6 +72,13 @@ use ffmpeg_next as ffmpeg;
 use ffmpeg_next::format::Pixel;
 use ffmpeg_next::util::frame::Video;
 
+use crate::binding_delivery::{
+    tick_span, BindingDelivery, BindingPolicy, DeliveryLimits, LeasedPacket, WindowDelivery,
+};
+use crate::rendition_dispatch::{BindingConfig, DispatchConfig, DtsTimeBase, RenditionDispatcher};
+use crate::rendition_workers::{
+    BakedTick, DispatchEvent, RenditionWorker, ReorderBound, VideoEncodeWorker,
+};
 use multiview_compositor::blend::LinearRgba;
 use multiview_compositor::pipeline::{CanvasColor, Nv12Image};
 #[cfg(feature = "rist")]
@@ -94,10 +101,12 @@ use multiview_ffmpeg::{
 };
 use multiview_framestore::{NoSignalPolicy, TileStore, TileThresholds};
 use multiview_input::srt::{KeyLength, SrtConfig, SrtError, SrtMode, StreamId};
+use multiview_output::batch::RecoveryGate;
 #[cfg(all(feature = "ndi", any(feature = "ndi-bindings", test)))]
 use multiview_output::ndi::NdiOutput;
 use multiview_output::sink::{
-    EncodeConfig, PacketMuxOutcome, PacketMuxSink, PacketSource, ProgramEncoder, PushProtocol,
+    AudioRenditionEncoder, EncodeConfig, PacketMuxOutcome, PacketMuxSink, PacketSource,
+    PushProtocol, VideoRenditionEncoder,
 };
 use multiview_output::{display_matrix, DisplayMatrix};
 
@@ -118,12 +127,6 @@ const OFFLINE_QUEUE_CAP: usize = 8;
 /// encoder is detected and shed promptly; the hot loop `try_send`s and drops on
 /// `Full` so the output clock can never stall (inv #1/#10).
 const LIVE_QUEUE_CAP: usize = 4;
-
-/// Bounded capacity of each consumer → sink fan-out queue. The consumer drives
-/// these with a bounded `send_timeout` (it is off the hot path, so blocking there
-/// is allowed — it can only back-pressure the *consumer*, never the engine), so a
-/// slow sink paces the consumer rather than dropping a baked frame.
-const SINK_QUEUE_CAP: usize = 4;
 
 /// The shed-event debounce window (output ticks) for the live drop-on-overload
 /// shed (invariant #9 emission). A sustained encode/egress overload sheds frames
@@ -220,18 +223,44 @@ fn shed_load_event(
     }))
 }
 
+/// The live push-output link records of the current run, keyed by output id.
+type PushLinkRegistry = Arc<
+    multiview_framestore::SwapCell<
+        Arc<Vec<(String, Arc<multiview_output::push_link::PushLinkStatus>)>>,
+    >,
+>;
+
+/// Refresh the push-link snapshot fragment every this many ticks (≈0.5 s at
+/// 30 fps): the per-tick projection then only clones a cached value.
+const PUSH_LINK_REFRESH_TICKS: u64 = 15;
+
 /// The egress plan for one [`Pipeline::drive_streaming`] call: the send
 /// policy, the per-sink runners, and an optional hot-loop tick observer (test
 /// only). Bundled so the streaming core keeps a small argument list.
 struct StreamPlan {
     /// How the hot loop hands ticks to the consumer (block vs drop-on-overload).
     policy: SendPolicy,
-    /// One runner per output sink, each driving its sink to completion off-hot.
-    runners: Vec<SinkRunner>,
+    /// One runner per output sink, each driving its sink to completion off-hot,
+    /// paired with how the consumer sends to it (bounded wait vs drop-when-full).
+    runners: Vec<(SinkRunner, SinkSendPolicy)>,
+    /// Fatal-consumer regression seam (issue #202/#203 follow-up): when set, the
+    /// bake consumer dies after successfully processing this many hot items —
+    /// replaying the production incident (a mid-stream encoder failure that used
+    /// to leave a healthy UI over dead outputs) deterministically. `None` on BOTH
+    /// production paths; only the `drive_streaming_for_test` seam sets it.
+    consumer_fault_after_ticks: Option<u64>,
+    /// Frame-substitution seam (test-only): drop the hot item at this tick
+    /// before the consumer, deterministically replaying one shed tick.
+    shed_at_tick: Option<u64>,
     /// Incremented once per emitted tick on the hot loop when present, so a test
     /// can prove a frame was encoded while the engine was still ticking. `None`
     /// on the production paths.
     hot_tick_observer: Option<Arc<AtomicU64>>,
+    /// The configured output id behind each runner, in **final runner order**
+    /// (`None` = an internal, never-subscribable sink such as the synthetic
+    /// `program.ts` anchor). Carried so the effective-output registry resolves a
+    /// WHEP/MoQ scope to the exact binding the dispatcher admits.
+    binding_ids: Vec<Option<String>>,
 }
 
 /// Errors building or running the libav\* pipeline.
@@ -364,50 +393,69 @@ struct ResolvedEncoder {
 }
 
 /// Map a config output `codec` token to a logical [`multiview_ffmpeg::VideoCodec`].
-/// Unknown / unsupported tokens fall back to MPEG-2 (the LGPL-clean default).
-fn logical_codec(token: &str) -> multiview_ffmpeg::VideoCodec {
+/// Unknown codec names are rejected, never silently replaced.
+fn logical_codec(token: &str) -> Result<multiview_ffmpeg::VideoCodec, PipelineError> {
     use multiview_ffmpeg::VideoCodec;
     match token.to_ascii_lowercase().as_str() {
-        "h264" | "avc" => VideoCodec::H264,
-        "h265" | "hevc" => VideoCodec::H265,
-        "ffv1" => VideoCodec::Ffv1,
-        "mjpeg" => VideoCodec::Mjpeg,
-        _ => VideoCodec::Mpeg2Video,
+        "h264" | "avc" | "libx264" | "h264_nvenc" => Ok(VideoCodec::H264),
+        "h265" | "hevc" | "libx265" | "hevc_nvenc" => Ok(VideoCodec::H265),
+        "ffv1" => Ok(VideoCodec::Ffv1),
+        "mjpeg" => Ok(VideoCodec::Mjpeg),
+        "mpeg2video" => Ok(VideoCodec::Mpeg2Video),
+        _ => Err(PipelineError::Codec {
+            codec: token.to_owned(),
+            reason: "unsupported codec".to_owned(),
+        }),
     }
 }
 
 /// Resolve the encoder to use for `codec_token`, honouring the compiled features
 /// (LGPL `mpeg2video` by default; `libx264`/`libx265` under `gpl-codecs`).
 ///
-/// If the requested codec cannot be encoded by this build (e.g. H.264 with no
-/// `gpl-codecs`), this falls back to MPEG-2 so a config that names `h264` still
-/// produces a real, playable file in an LGPL-clean build — and logs the
-/// substitution. Returns [`PipelineError::Codec`] only if even the fallback is
-/// somehow unavailable in the linked `FFmpeg`.
+/// An unavailable requested codec fails before the clock starts. No output
+/// silently changes its requested codec or substitutes MPEG-2.
 fn resolve_encoder(codec_token: &str) -> Result<ResolvedEncoder, PipelineError> {
-    use multiview_ffmpeg::{select_encoder, VideoCodec};
-    let requested = logical_codec(codec_token);
-    if let Some(name) = select_encoder(requested) {
-        return Ok(ResolvedEncoder {
-            name: name.to_owned(),
-            format: encoder_input_format(name),
-        });
-    }
-    // The requested codec is not encodable in this build; fall back to MPEG-2.
-    tracing::warn!(
-        requested = ?requested,
-        "requested output codec is not encodable in this build (need gpl-codecs/cuda); \
-         falling back to LGPL mpeg2video"
-    );
-    let fallback = select_encoder(VideoCodec::Mpeg2Video).ok_or_else(|| PipelineError::Codec {
+    use multiview_ffmpeg::select_encoder;
+    let requested = logical_codec(codec_token)?;
+    let name = select_encoder(requested).ok_or_else(|| PipelineError::Codec {
         codec: codec_token.to_owned(),
-        reason: "neither the requested codec nor the mpeg2video fallback is present in FFmpeg"
-            .to_owned(),
+        reason: "requested encoder is unavailable in this build or linked FFmpeg".to_owned(),
     })?;
     Ok(ResolvedEncoder {
-        name: fallback.to_owned(),
-        format: encoder_input_format(fallback),
+        name: name.to_owned(),
+        format: encoder_input_format(name),
     })
+}
+
+fn codec_for_encoder(name: &str) -> multiview_ffmpeg::VideoCodec {
+    match logical_codec(name) {
+        Ok(codec) => codec,
+        Err(_) => multiview_ffmpeg::VideoCodec::Mpeg2Video,
+    }
+}
+
+/// The recovery policy for one encoded elementary stream.
+///
+/// A strict-RAP gate is installed only for codecs whose random-access points are
+/// verifiable from the coded payload itself (H.264/HEVC Annex-B — the framing the
+/// libav encoders emit here). Any other codec (notably the LGPL `mpeg2video`
+/// fallback) gets no gate: after a delivery loss that binding fails closed and
+/// reports the discontinuity instead of resuming on an unverifiable keyframe
+/// flag. Losing a live binding is explicit; silently splicing an undecodable GOP
+/// is not permitted.
+fn recovery_gate(codec: multiview_ffmpeg::VideoCodec) -> Option<RecoveryGate> {
+    use multiview_ffmpeg::{CodecKind, NalFraming, VideoCodec};
+    match codec {
+        VideoCodec::H264 => Some(RecoveryGate::StrictRap {
+            codec: CodecKind::H264,
+            framing: NalFraming::AnnexB,
+        }),
+        VideoCodec::H265 => Some(RecoveryGate::StrictRap {
+            codec: CodecKind::Hevc,
+            framing: NalFraming::AnnexB,
+        }),
+        _ => None,
+    }
 }
 
 /// The pixel format to feed a resolved encoder, by its concrete libav name.
@@ -1447,6 +1495,9 @@ enum RunnableOutput {
         label: &'static str,
         /// The destination URL (for the run report + logs).
         url: String,
+        /// Live link state (listening / connected / reconnecting / drops) shared
+        /// with the consumer's never-block fan-out and the status snapshot.
+        link: Arc<multiview_output::push_link::PushLinkStatus>,
     },
     /// A WebRTC program output (`webrtc` WHEP-serve / `whip_push`): a **mux-free**
     /// sink that re-stamps each coded [`EncodedPacket`] into an
@@ -1617,6 +1668,10 @@ pub struct Pipeline {
     /// Frame-boundary tile geometry and bindings for the off-clock bake consumer.
     #[cfg(feature = "overlay")]
     tile_spec_apply: Arc<multiview_framestore::SwapCell<Arc<Vec<crate::overlays::TileSpec>>>>,
+    /// The current run's push-output link records (id → status), published by
+    /// [`Pipeline::build_sink_runners`] and projected into the engine-state
+    /// snapshot under `outputs.<id>.link` (read lock-free on the hot loop).
+    push_links: PushLinkRegistry,
     /// Source-kind audio applicability, refreshed at frame-boundary live edits.
     /// Missing PCM from a decoded source is unknown, not proof of no audio.
     #[cfg(feature = "overlay")]
@@ -1769,6 +1824,15 @@ pub struct Pipeline {
     /// [`ProgramEncoder`] from (invariant #7): the canvas is encoded ONCE per
     /// run and the same packets are fanned to every mux-only sink.
     encode_cfg: EncodeConfig,
+    /// Distinct concrete video encoders and one key per runnable output.
+    rendition_configs: Vec<EncodeConfig>,
+    output_video_keys: Vec<usize>,
+    output_audio_tracks: Vec<Vec<usize>>,
+    /// Outputs that EXPLICITLY declared an audio selection (per output: the id
+    /// and its full declared track list). Drives the run-time truthful binding:
+    /// a run without a program-audio encode strips the implicit default's
+    /// track 0, but an explicit declaration it cannot honor fails the run.
+    declared_audio_outputs: Vec<(String, Vec<usize>)>,
     /// The runnable outputs declared in the config.
     outputs: Vec<RunnableOutput>,
     /// The bake-consumer push handles for the configured AES67 outputs (#103),
@@ -1834,6 +1898,19 @@ pub struct Pipeline {
     /// the bake consumer thread — never the output-clock loop; a slow/absent WHEP
     /// consumer only loses the oldest blocks (inv #1/#10).
     program_audio_preview: Option<crate::preview::ProgramAudioSlot>,
+    /// The **effective-output subscription rendezvous** (t65): the bake consumer
+    /// publishes this run's
+    /// [`SubscriptionFactory`](crate::output_window_registry::SubscriptionFactory)
+    /// here once, off the output clock, and the control plane (WHEP / `MoQ`
+    /// startup) loads it lock-free to attach shared-rendition subscribers. The
+    /// cell exists from build time; the factory appears when the egress starts.
+    window_subscriptions: crate::output_window_registry::WindowSubscriptionSlot,
+    optional_preview: Option<crate::preview_vertical::PreviewStartup>,
+    /// The run's **real** authorization axes for every effective output (t65):
+    /// the implicit program the legacy config desugars to, plus each ingest
+    /// source a cell actually binds. Derived once from the configuration —
+    /// never invented — and cloned per binding with that binding's own output id.
+    window_dependencies: Arc<Vec<crate::output_window_registry::Dependency>>,
 }
 
 type HashMapStores = std::collections::HashMap<String, Arc<TileStore<Nv12Image>>>;
@@ -2447,8 +2524,9 @@ impl Pipeline {
             Nv12Image::solid(config.canvas.width, config.canvas.height, 16, 128, 128, tag)
                 .map_err(|e| PipelineError::Engine(e.to_string()))?;
 
-        // Resolve the encoder from the first output that names a codec (file/HLS
-        // share one encode — invariant #7). Default to MPEG-2 if none names one.
+        // Resolve each supported encoded output without changing its requested
+        // codec. The ordered key set opens one video encoder per distinct codec;
+        // compatible sinks share the encoded packet allocation.
         let codec_token = config
             .outputs
             .iter()
@@ -2509,6 +2587,75 @@ impl Pipeline {
         let discrete_track_inputs: Vec<String> =
             discrete_tracks.iter().map(|t| t.input_id.clone()).collect();
         apply_output_audio_selections(&mut outputs, &config.outputs, &discrete_tracks);
+        let mut rendition_configs = Vec::<EncodeConfig>::new();
+        let mut output_video_keys = Vec::with_capacity(outputs.len());
+        let mut output_audio_tracks = Vec::with_capacity(outputs.len());
+        let mut declared_audio_outputs: Vec<(String, Vec<usize>)> = Vec::new();
+        for output in &outputs {
+            let requested = config
+                .outputs
+                .iter()
+                .find(|item| item.id() == output.id())
+                .and_then(output_codec)
+                .unwrap_or("mpeg2video");
+            let concrete = resolve_encoder(requested)?;
+            let key = if let Some(index) = rendition_configs
+                .iter()
+                .position(|cfg| cfg.codec_name == concrete.name)
+            {
+                index
+            } else {
+                let mut video_cfg = cfg.clone();
+                video_cfg.codec_name = concrete.name;
+                video_cfg.format = concrete.format;
+                video_cfg.audio = None;
+                rendition_configs.push(video_cfg);
+                rendition_configs.len() - 1
+            };
+            output_video_keys.push(key);
+            let audio_selection = match output {
+                RunnableOutput::File { sink, .. }
+                | RunnableOutput::Hls { sink, .. }
+                | RunnableOutput::Push { sink, .. } => Some(sink.audio_selection()),
+                #[cfg(feature = "webrtc-native")]
+                RunnableOutput::WebRtc { .. } => None,
+                #[cfg(feature = "ndi-bindings")]
+                RunnableOutput::Ndi { .. } => None,
+                #[cfg(feature = "aes67")]
+                RunnableOutput::Aes67 { .. } => None,
+            };
+            let tracks = audio_selection.map_or_else(Vec::new, |selection| {
+                let mut indexes = Vec::with_capacity(selection.tracks.len() + 1);
+                if selection.program {
+                    indexes.push(0);
+                }
+                indexes.extend(
+                    selection
+                        .tracks
+                        .iter()
+                        .map(|track| usize::from(track.index) + 1),
+                );
+                indexes
+            });
+            output_audio_tracks.push(tracks.clone());
+            // Truthful audio binding (t62 finding): remember which outputs
+            // EXPLICITLY declared an audio selection (an `[[outputs.audio]]`
+            // block). At run time the binding is decided against the program
+            // audio encode that actually opens: an implicit default selection
+            // means "program audio if present" (track 0 is stripped from a
+            // video-only run), while an EXPLICIT declaration that the run
+            // cannot honor fails the run with a typed error — never a silent
+            // drop to video-only.
+            let explicit = config
+                .outputs
+                .iter()
+                .find(|item| item.id() == output.id())
+                .and_then(multiview_config::Output::audio)
+                .is_some();
+            if explicit && !tracks.is_empty() {
+                declared_audio_outputs.push((output.id().to_owned(), tracks));
+            }
+        }
 
         // Derive the PER-SOURCE per-tick audio-loudness timelines off the
         // build path: decode each file-backed source's OWN audio with
@@ -2623,6 +2770,10 @@ impl Pipeline {
             background: LinearRgba::opaque(0.02, 0.02, 0.05),
             encoder,
             encode_cfg: cfg,
+            rendition_configs,
+            output_video_keys,
+            output_audio_tracks,
+            declared_audio_outputs,
             outputs,
             #[cfg(feature = "display-kms")]
             display_plans: built.display,
@@ -2642,6 +2793,7 @@ impl Pipeline {
             tile_labels,
             #[cfg(feature = "overlay")]
             tile_spec_apply,
+            push_links: Arc::new(multiview_framestore::SwapCell::new(Arc::new(Vec::new()))),
             #[cfg(feature = "overlay")]
             audio_free_sources,
             #[cfg(feature = "overlay")]
@@ -2655,6 +2807,9 @@ impl Pipeline {
             epoch,
             epoch_anchor: crate::timing_status::anchor_slot(),
             program_audio_preview: None,
+            window_subscriptions: crate::output_window_registry::window_subscription_slot(),
+            optional_preview: None,
+            window_dependencies: Arc::new(window_dependency_axes(config)),
         })
     }
 
@@ -2937,6 +3092,51 @@ impl Pipeline {
         self.program_audio_preview = Some(slot);
     }
 
+    /// Opt in with an explicit finite platform-measured reservation request.
+    #[allow(dead_code)] // Explicit startup integration API; control owns request construction.
+    pub fn set_optional_preview(&mut self, request: crate::preview_vertical::PreviewStartup) {
+        self.optional_preview = Some(request);
+    }
+
+    /// The run's effective-output subscription rendezvous (t65): the SAME cell
+    /// the bake consumer publishes this run's
+    /// [`SubscriptionFactory`](crate::output_window_registry::SubscriptionFactory)
+    /// into. The control plane (WHEP / `MoQ` startup) loads it to attach
+    /// shared-rendition subscribers; an unloaded cell simply has no subscribers.
+    #[allow(dead_code)]
+    // reason: the control-plane consumer (MoQ/WHEP startup) wires in its own lane; the producer side is published and tested here.
+    #[must_use]
+    pub fn window_subscriptions(&self) -> crate::output_window_registry::WindowSubscriptionSlot {
+        Arc::clone(&self.window_subscriptions)
+    }
+
+    /// The control-plane adapter for this exact run's canonical registry slot.
+    #[cfg(feature = "moq-output")]
+    #[must_use]
+    pub fn moq_feed_factory(
+        &self,
+    ) -> Arc<dyn multiview_control::moq_provider::AuthorizedFeedFactory> {
+        Arc::new(crate::moq_outputs::factory::DynamicRegistryFactory(
+            self.window_subscriptions(),
+        ))
+    }
+
+    /// Start an explicitly configured outgoing family after this run publishes
+    /// its actual effective metadata. Call once per run/family, not per viewer.
+    #[cfg(feature = "moq-output")]
+    /// # Errors
+    /// Returns the authorization or publisher admission rejection.
+    pub async fn start_moq_family_relay(
+        &self,
+        principal: &multiview_control::auth::Principal,
+        scope: &multiview_control::WhepScope,
+        config: multiview_moq::provider::FamilyRelayConfig,
+    ) -> Result<multiview_moq::provider::FamilyPublisher, multiview_control::moq::MoqReject> {
+        crate::moq_outputs::factory::DynamicRegistryFactory(self.window_subscriptions())
+            .start_outgoing(principal, scope, config)
+            .await
+    }
+
     /// Run the engine for exactly `max_ticks` ticks under the realtime pacer,
     /// then encode the composited program once and fan it out to every
     /// configured sink.
@@ -2966,10 +3166,14 @@ impl Pipeline {
         let stop = StopSignal::new();
         // Offline render: block-for-exact so every tick is encoded (exact N). The
         // finite run also writes the bounded self-contained `program.ts` anchor.
+        let (runners, binding_ids) = self.build_sink_runners(false);
         let plan = StreamPlan {
             policy: SendPolicy::BlockForExact,
-            runners: self.build_sink_runners(false),
+            runners,
+            consumer_fault_after_ticks: None,
+            shed_at_tick: None,
             hot_tick_observer: None,
+            binding_ids,
         };
         let preview = crate::preview::program_slot();
         let out = self
@@ -3056,10 +3260,14 @@ impl Pipeline {
         // output clock (inv #1) or back-pressure the engine (inv #10). A live run
         // suppresses the `program.ts` anchor (HLS-2): the rolling HLS window is the
         // bounded on-disk artifact — an ever-growing `program.ts` is not written.
+        let (runners, binding_ids) = self.build_sink_runners(true);
         let plan = StreamPlan {
             policy: SendPolicy::DropOnOverload,
-            runners: self.build_sink_runners(true),
+            runners,
+            consumer_fault_after_ticks: None,
+            shed_at_tick: None,
             hot_tick_observer: tick_observer,
+            binding_ids,
         };
         let out = self
             .drive_streaming(
@@ -3180,16 +3388,60 @@ impl Pipeline {
     /// container), a live run (`true`) suppresses it so the run never writes an
     /// ever-growing `program.ts` (HLS-2, ADR-0032) — the rolling HLS window is the
     /// bounded on-disk artifact instead.
-    fn build_sink_runners(&mut self, live: bool) -> Vec<SinkRunner> {
-        let outputs = maybe_prepend_program_ts(std::mem::take(&mut self.outputs), live);
-        outputs
+    fn build_sink_runners(
+        &mut self,
+        live: bool,
+    ) -> (Vec<(SinkRunner, SinkSendPolicy)>, Vec<Option<String>>) {
+        let configured = std::mem::take(&mut self.outputs);
+        // Capture the configured ids BEFORE the anchor may be prepended: the
+        // registry indexes the FINAL runner order the dispatcher admits, and the
+        // synthetic `program.ts` sink is internal — no scope resolves to it.
+        let configured_ids: Vec<String> = configured
+            .iter()
+            .map(|output| output.id().to_owned())
+            .collect();
+        let hls_index = configured
+            .iter()
+            .position(|output| matches!(output, RunnableOutput::Hls { .. }));
+        let hls_key = hls_index.and_then(|index| self.output_video_keys.get(index).copied());
+        let hls_audio = hls_index.and_then(|index| self.output_audio_tracks.get(index).cloned());
+        let outputs = maybe_prepend_program_ts(configured, live);
+        if !live {
+            if let Some(hls_key) = hls_key {
+                self.output_video_keys.insert(0, hls_key);
+                self.output_audio_tracks
+                    .insert(0, hls_audio.unwrap_or_default());
+            }
+        }
+        // The prepended `program.ts` anchor occupies runner index 0 and is
+        // internal; every configured output keeps its id at its final index.
+        let mut binding_ids: Vec<Option<String>> = Vec::with_capacity(outputs.len());
+        if outputs.len() != configured_ids.len() {
+            binding_ids.push(None);
+        }
+        binding_ids.extend(configured_ids.into_iter().map(Some));
+        debug_assert_eq!(binding_ids.len(), outputs.len());
+        let mut links = Vec::new();
+        let runners = outputs
             .into_iter()
-            .map(|output| -> SinkRunner {
-                Box::new(move |rx, params, time_base, audio, tracks| {
+            .map(|output| -> (SinkRunner, SinkSendPolicy) {
+                let policy = match &output {
+                    RunnableOutput::Push { id, link, .. } => {
+                        links.push((id.clone(), Arc::clone(link)));
+                        SinkSendPolicy::DropWhenFull(Arc::clone(link))
+                    }
+                    _ => SinkSendPolicy::Bounded,
+                };
+                let runner: SinkRunner = Box::new(move |rx, params, time_base, audio, tracks| {
                     run_one_output(output, rx, &params, time_base, audio.as_ref(), &tracks)
-                })
+                });
+                (runner, policy)
             })
-            .collect()
+            .collect();
+        // Publish this run's push links to the status registry (read lock-free
+        // by the per-tick snapshot projection; replaced wholesale per run).
+        self.push_links.store(Arc::new(links));
+        (runners, binding_ids)
     }
 
     /// **Test seam** (ADR-0025): drive the streaming bake→encode→fan-out path
@@ -3222,16 +3474,27 @@ impl Pipeline {
             max_ticks,
             policy,
             runners,
+            consumer_fault_after_ticks,
+            shed_at_tick,
             hot_tick_observer,
         } = params;
-        let runners: Vec<SinkRunner> = runners
+        let runners: Vec<(SinkRunner, SinkSendPolicy)> = runners
             .into_iter()
             .map(|r| -> SinkRunner {
                 // The fake sink consumes the coded-packet fan-out channel; it does
                 // not mux, so the seeded codec params + time-base (and the audio
                 // params + time-base) are unused.
                 Box::new(move |rx, _params, _time_base, _audio, _tracks| {
-                    let outcome = r(rx);
+                    let (tx, plain_rx) = std::sync::mpsc::sync_channel(1);
+                    let bridge = std::thread::spawn(move || {
+                        while let Ok(leased) = rx.recv() {
+                            if tx.send(leased.packet).is_err() {
+                                break;
+                            }
+                        }
+                    });
+                    let outcome = r(plain_rx);
+                    let _ = bridge.join();
                     Ok(SinkRunOutcome {
                         line: format!("test sink: {} packet(s)", outcome.frames),
                         playlist: None,
@@ -3239,12 +3502,22 @@ impl Pipeline {
                     })
                 })
             })
+            .map(|runner| (runner, SinkSendPolicy::Bounded))
             .collect();
         let capacity = policy.queue_cap();
+        // The injected fakes stand in for real outputs; each keeps a distinct
+        // synthetic id so a test can resolve and subscribe to it. No anchor is
+        // prepended on this path (the fakes replace the real runners wholesale).
+        let binding_ids = (0..runners.len())
+            .map(|index| Some(format!("test-sink-{index}")))
+            .collect();
         let plan = StreamPlan {
             policy,
             runners,
+            consumer_fault_after_ticks,
+            shed_at_tick,
             hot_tick_observer,
+            binding_ids,
         };
         // The test seam serves no UI: throwaway publisher/preview + no-op control.
         let publisher = EnginePublisher::<EngineStateSnapshot, Event>::new(EVENT_CAPACITY);
@@ -3307,10 +3580,16 @@ impl Pipeline {
         let StreamPlan {
             policy,
             runners,
+            consumer_fault_after_ticks,
+            shed_at_tick,
             hot_tick_observer,
+            binding_ids,
         } = plan;
         let clock =
             OutputClock::new(self.cadence).map_err(|e| PipelineError::Clock(e.to_string()))?;
+        // The drive can sample every catalogued source: an idle source's store is
+        // empty, so a cell bound to it composites NO_SIGNAL until its first frame
+        // (inv #1: the clock never waits for a start).
         let drive = CompositorDrive::new(
             Arc::clone(&self.layout),
             self.stores.clone(),
@@ -3512,13 +3791,29 @@ impl Pipeline {
         // the bounded-wait rationale and the invariant-#1/#2 guarantees.
         self.prime_bound_tiles(ts.as_ref());
 
-        // Build the SINGLE program encoder (invariant #7) the consumer owns: the
-        // canvas is encoded once and the same packets fan to every mux-only sink.
-        let mut encoder =
-            ProgramEncoder::new(&self.encode_cfg).map_err(|e| PipelineError::Output {
-                kind: "encode",
-                reason: e.to_string(),
-            })?;
+        // Open each distinct video key independently before the clock starts.
+        // No output may borrow the codec parameters of another rendition.
+        let video_encoders: Vec<VideoRenditionEncoder> = self
+            .rendition_configs
+            .iter()
+            .map(|cfg| {
+                VideoRenditionEncoder::new(cfg).map_err(|e| PipelineError::Output {
+                    kind: "encode",
+                    reason: e.to_string(),
+                })
+            })
+            .collect::<Result<_, _>>()?;
+        let mut audio_encoder = self
+            .encode_cfg
+            .audio
+            .as_ref()
+            .map(|cfg| {
+                AudioRenditionEncoder::new(cfg).map_err(|e| PipelineError::Output {
+                    kind: "encode-audio",
+                    reason: e.to_string(),
+                })
+            })
+            .transpose()?;
         // #152: one encoder per declared discrete track, opened with the
         // program audio's settings. Tracks need the program-audio bus (their
         // pre-mix blocks come from it); without it they are reported, not faked.
@@ -3532,14 +3827,49 @@ impl Pipeline {
             Vec::new()
         } else {
             let count = u16::try_from(self.discrete_track_inputs.len()).unwrap_or(u16::MAX);
-            encoder
-                .open_audio_tracks(count)
+            audio_encoder
+                .as_mut()
+                .ok_or_else(|| PipelineError::Output {
+                    kind: "encode-audio",
+                    reason: "audio encoder unavailable".to_owned(),
+                })?
+                .open_tracks(count)
                 .map_err(|e| PipelineError::Output {
                     kind: "encode-audio",
                     reason: e.to_string(),
                 })?;
             self.discrete_track_inputs.clone()
         };
+
+        // Truthful program-audio binding (t62 finding: silent drop → explicit
+        // reject). The dispatcher assembles each binding window from the audio
+        // stream indexes the binding DECLARES, so the declared tracks must
+        // match the streams the run actually opens. The decision keys off the
+        // OPENED program-audio encoder — the ground truth — never the input
+        // routing section (a config may declare `[audio]` input routing with
+        // program audio off, and a seam may enable program audio with no
+        // routing section; both were previously mis-bound). An IMPLICIT
+        // default selection means "program audio if present": a run without a
+        // program-audio encode simply strips track 0 (video-only run). An
+        // EXPLICIT `[[outputs.audio]]` declaration the run cannot honor fails
+        // the run with a typed error — an operator asking for audio on an
+        // output must never silently get video-only (dead air).
+        let mut enforced_audio_tracks = self.output_audio_tracks.clone();
+        if audio_encoder.is_none() {
+            if let Some((id, _)) = self.declared_audio_outputs.first() {
+                return Err(PipelineError::Output {
+                    kind: "encode-audio",
+                    reason: format!(
+                        "output {id:?} explicitly declares an audio selection, but this run \
+                         carries no program-audio encoder; enable program audio or drop the \
+                         declaration — never silently air video-only"
+                    ),
+                });
+            }
+            for tracks in &mut enforced_audio_tracks {
+                tracks.retain(|track| *track != 0);
+            }
+        }
 
         // The program-audio bus (AUD-4): built ONLY when this run opted into audio
         // (`encode_cfg.audio` is `Some`). It mixes one block per output tick at the
@@ -3695,8 +4025,24 @@ impl Pipeline {
         let (egress, hot_tx) = StreamEgress::spawn(
             bake_ctx,
             runners,
+            binding_ids,
+            Arc::clone(&self.window_dependencies),
+            Arc::clone(&self.window_subscriptions),
+            self.optional_preview.clone(),
+            &self
+                .rendition_configs
+                .iter()
+                .map(|cfg| recovery_gate(codec_for_encoder(&cfg.codec_name)))
+                .collect::<Vec<_>>(),
+            tick_span(self.encode_cfg.cadence),
+            self.encode_cfg.cadence,
             policy,
-            encoder,
+            consumer_fault_after_ticks,
+            shed_at_tick,
+            video_encoders,
+            self.output_video_keys.clone(),
+            enforced_audio_tracks,
+            audio_encoder,
             audio_bus,
             self.audio_route.load(),
             audio_loudnorm,
@@ -3745,6 +4091,8 @@ impl Pipeline {
         let dropped = Arc::new(AtomicU64::new(0));
         let in_flight = Arc::clone(&egress.in_flight);
         let peak_occupancy = Arc::clone(&egress.peak_occupancy);
+        let egress_fatal = Arc::clone(&egress.fatal);
+        let egress_stop = stop.clone();
 
         let hot_dropped = Arc::clone(&dropped);
         // A read-only clone for the per-tick event projection: it samples this
@@ -3819,6 +4167,7 @@ impl Pipeline {
             publisher.publish_event(event);
         }
         let input_fragment = crate::control::input_inventories_fragment(&self.inventories);
+        let mut push_links = Box::new((Arc::clone(&self.push_links), None::<serde_json::Value>));
         // (The DRM/KMS display heads — and their DEV-B4 audio sinks — were
         // started above, before the egress spawn, so the bake consumer received
         // the audio publishers; `display_publishers` feeds the video mailboxes
@@ -3912,6 +4261,10 @@ impl Pipeline {
                 #[cfg(feature = "overlay")]
                 faults,
             };
+            // The output clock completes this tick; then the program owner
+            // joins the consumer and propagates its exact fatal cause. A UI
+            // that still answers HTTP must never mask stopped encoded media.
+            stop_on_egress_failure(&egress_fatal, &egress_stop, false);
             match policy {
                 SendPolicy::BlockForExact => {
                     // A blocking send back-pressures the OFFLINE renderer (not a
@@ -3919,6 +4272,9 @@ impl Pipeline {
                     // Disconnect only happens if the consumer died; nothing to do.
                     if hot_tx.send(item).is_ok() {
                         bump_occupancy(&in_flight, &peak_occupancy);
+                    } else {
+                        egress_fatal.store(true, Ordering::Release);
+                        egress_stop.stop();
                     }
                 }
                 SendPolicy::DropOnOverload => match hot_tx.try_send(item) {
@@ -3928,8 +4284,10 @@ impl Pipeline {
                         hot_dropped.fetch_add(1, Ordering::Release);
                     }
                     Err(TrySendError::Disconnected(_)) => {
-                        // The consumer ended (it cannot, mid-run, in normal
-                        // operation); count as a drop and keep ticking.
+                        // The output producer died. Stop at this tick boundary
+                        // rather than reporting a healthy UI over dead streams.
+                        egress_fatal.store(true, Ordering::Release);
+                        egress_stop.stop();
                         hot_dropped.fetch_add(1, Ordering::Release);
                     }
                 },
@@ -3949,6 +4307,11 @@ impl Pipeline {
             // seeded with the CURRENT tile states (the `tiles` `$snapshot`)
             // instead of waiting for the next sparse `tile.state` delta.
             crate::control::fold_tile_states(&mut snapshot, &frame.source_states);
+            let (links, fragment) = &mut *push_links;
+            if fragment.is_none() || frame.tick.index % PUSH_LINK_REFRESH_TICKS == 0 {
+                *fragment = crate::control::push_links_fragment(&links.load());
+            }
+            crate::control::insert_output_fragment(&mut snapshot, fragment.as_ref());
             snapshot
         };
         // Sparse tile-state events: emit at most one `tile.state` change per tick
@@ -4511,6 +4874,20 @@ struct SinkRunOutcome {
     frames: usize,
 }
 
+/// Request a tick-boundary stop if the shared encoded-output producer fails.
+/// Returns true only for a fatal producer fault, not a normal queue overload.
+fn stop_on_egress_failure(fatal: &AtomicBool, stop: &StopSignal, disconnected: bool) -> bool {
+    if disconnected {
+        fatal.store(true, Ordering::Release);
+    }
+    if fatal.load(Ordering::Acquire) {
+        stop.stop();
+        true
+    } else {
+        false
+    }
+}
+
 /// A boxed closure that drives ONE mux-only output sink to completion over its
 /// bounded fan-out channel of coded packets, run on its own thread by the
 /// [`StreamEgress`]. Production builds one per [`RunnableOutput`] (calling
@@ -4518,7 +4895,7 @@ struct SinkRunOutcome {
 /// encoder's [`StreamCodecParameters`] + time-base); the test seam injects fakes.
 type SinkRunner = Box<
     dyn FnOnce(
-            Receiver<EncodedPacket>,
+            Receiver<LeasedPacket>,
             StreamCodecParameters,
             Rational,
             Option<(StreamCodecParameters, Rational)>,
@@ -4569,6 +4946,20 @@ pub struct StreamTestParams<P> {
     pub policy: SendPolicy,
     /// One fake sink runner per output, run on its own off-hot-path thread.
     pub runners: Vec<TestSinkRunner>,
+    /// Fatal-consumer regression seam: when `Some(n)`, the bake consumer dies
+    /// after successfully processing `n` hot items, replaying a mid-stream
+    /// encoder failure deterministically (the run must then STOP at a tick
+    /// boundary and return the consumer's exact error instead of reporting a
+    /// healthy report over dead outputs). `None` (all existing uses) keeps the
+    /// consumer healthy for the whole run.
+    pub consumer_fault_after_ticks: Option<u64>,
+    /// Frame-substitution regression seam: when `Some(k)`, the seam DROPS the
+    /// hot item at tick index `k` before the consumer sees it — deterministically
+    /// replaying one hot-queue shed tick (a transient consumer stall). The
+    /// no-falter contract requires the consumer to SUBSTITUTE that missing tick
+    /// (last-good canvas restamped at `k`) so the muxed output still carries a
+    /// frame for EVERY tick. `None` (all existing uses) forwards everything.
+    pub shed_at_tick: Option<u64>,
     /// Optional hot-loop tick observer (incremented once per emitted tick).
     pub hot_tick_observer: Option<Arc<AtomicU64>>,
 }
@@ -4611,13 +5002,71 @@ fn bump_occupancy(in_flight: &AtomicI64, peak: &AtomicUsize) {
     }
 }
 
+/// The bake consumer's hot receive end: the real bounded channel, or — under
+/// the fatal-consumer regression seam (`StreamPlan::consumer_fault_after_ticks`)
+/// — a counting forwarder's channel that ends (and reports a fault) after the
+/// configured number of successfully processed items, replaying a mid-stream
+/// encoder failure deterministically.
+enum ConsumerHotSource {
+    /// The real hot queue (both production paths, and every test that keeps the
+    /// consumer healthy).
+    Real(Receiver<StreamItem>),
+    /// The forwarder's channel plus its completion flag: `true` means the
+    /// forwarder armed the fault (the consumer processed its budget of items
+    /// and then lost its input); `false` means the hot queue ended normally.
+    Faulted {
+        /// The forwarded receive end the consumer pulls instead.
+        hot: Receiver<StreamItem>,
+        /// Whether the seam fault fired (or the queue ended without faulting).
+        forwarder: JoinHandle<bool>,
+    },
+}
+
+impl ConsumerHotSource {
+    /// The receiver the consumer pulls: the real queue, or the forwarder's.
+    fn hot(&self) -> &Receiver<StreamItem> {
+        match self {
+            Self::Real(hot) | Self::Faulted { hot, .. } => hot,
+        }
+    }
+
+    /// Whether the fault seam fired for this source. `false` when the consumer
+    /// ran on the real queue (it can never fault synthetically).
+    fn faulted(self) -> bool {
+        match self {
+            Self::Real(_) => false,
+            Self::Faulted { hot, forwarder } => {
+                // Drop the forwarded receive end FIRST: if the consumer ended
+                // early (its own real failure) with items still queued, the
+                // forwarder may be blocked sending into this channel — dropping
+                // the receiver unblocks it (its send fails, reporting no fault)
+                // so this join can never wedge teardown and mask the consumer's
+                // real error with the bounded-teardown timeout.
+                drop(hot);
+                forwarder.join().unwrap_or(false)
+            }
+        }
+    }
+}
+
 /// The single off-hot-path egress: one bake-consumer thread (owns the
 /// [`StreamBaker`] built from the [`BakeContext`]) + one thread per sink. The
 /// consumer receives [`StreamItem`]s over the bounded hot queue, bakes each into
 /// an `Arc<Nv12Image>`, and fans it (blocking send — off the hot path, so it can
 /// only pace the consumer, never the engine) to each sink's bounded channel.
+struct WindowSlotGuard(crate::output_window_registry::WindowSubscriptionSlot);
+impl Drop for WindowSlotGuard {
+    fn drop(&mut self) {
+        self.0.store(None);
+    }
+}
+
 struct StreamEgress {
-    consumer: JoinHandle<Result<(), PipelineError>>,
+    consumer: JoinHandle<Result<Vec<crate::binding_delivery::BindingStatus>, PipelineError>>,
+    /// The consumer sets this before it drops the hot receiver on a fatal error.
+    /// The engine reads one atomic bit per tick and requests a clean tick-boundary
+    /// stop; the owner then propagates the exact joined error to its supervisor.
+    fatal: Arc<AtomicBool>,
     sinks: Vec<JoinHandle<Result<SinkRunOutcome, PipelineError>>>,
     /// Frames currently queued in the hot-loop → consumer channel (bumped by the
     /// hot loop on send, decremented by the consumer on recv).
@@ -4633,6 +5082,7 @@ struct StreamEgress {
 
 /// The folded outcome of joining the egress threads: the report lines (in sink
 /// order), the peak queue occupancy, and the per-sink frame counts.
+#[derive(Debug)]
 struct EgressOutcome {
     lines: Vec<String>,
     peak_occupancy: usize,
@@ -4645,12 +5095,28 @@ impl StreamEgress {
     /// on. Dropping that sender (when the engine loop ends) closes the hot queue
     /// → the consumer drains, fans the remainder, drops the sink senders → each
     /// sink sees end-of-program and finalises → [`StreamEgress::join`] folds stats.
-    #[allow(clippy::too_many_arguments)] // reason: the bake consumer threads the encode, the audio bus + loudnorm + loudness meter, and the publisher — each a distinct, irreducible owned input to the off-hot-path consumer.
+    #[allow(
+        clippy::too_many_arguments,
+        clippy::too_many_lines,
+        clippy::needless_pass_by_value
+    )] // Each distinct owned startup input transfers into one egress lifecycle.
     fn spawn(
         ctx: BakeContext,
-        runners: Vec<SinkRunner>,
+        runners: Vec<(SinkRunner, SinkSendPolicy)>,
+        binding_ids: Vec<Option<String>>,
+        dependency_axes: Arc<Vec<crate::output_window_registry::Dependency>>,
+        window_subscriptions: crate::output_window_registry::WindowSubscriptionSlot,
+        optional_preview: Option<crate::preview_vertical::PreviewStartup>,
+        gates: &[Option<RecoveryGate>],
+        media_span: Duration,
+        cadence: Rational,
         policy: SendPolicy,
-        encoder: ProgramEncoder,
+        consumer_fault_after_ticks: Option<u64>,
+        shed_at_tick: Option<u64>,
+        video_encoders: Vec<VideoRenditionEncoder>,
+        output_video_keys: Vec<usize>,
+        output_audio_tracks: Vec<Vec<usize>>,
+        audio_encoder: Option<AudioRenditionEncoder>,
         audio_bus: Option<multiview_audio::program::ProgramBus>,
         audio_route: Option<Arc<crate::audio::AudioControlHandle>>,
         audio_loudnorm: Option<multiview_audio::LoudnormProcessor>,
@@ -4666,44 +5132,152 @@ impl StreamEgress {
         let in_flight = Arc::new(AtomicI64::new(0));
         let peak_occupancy = Arc::new(AtomicUsize::new(0));
 
-        // The codec parameters + time-base every mux sink seeds its stream from
-        // are snapshotted ONCE from the single encoder (invariant #7); the encoder
-        // itself moves into the bake consumer below to do the one encode.
-        let params = encoder.codec_params().clone();
-        let time_base = encoder.time_base();
-        // The program-audio stream's params + time-base, snapshotted the same way
-        // when (and only when) the encoder carries an audio encoder (AUD-4). Paired
-        // SAFELY (no unwrap) by `zip`: `Some` only when BOTH the params and the
-        // time-base are present, which the encoder guarantees together. `None` for
-        // a video-only run, so every sink registers a single video stream exactly
-        // as before. Cloned per runner below, like `params`.
-        let audio: Option<(StreamCodecParameters, Rational)> = encoder
-            .audio_codec_params()
-            .cloned()
-            .zip(encoder.audio_time_base());
-        // The discrete audio tracks' (#152) params + time-bases, by track index.
-        let track_streams = encoder.audio_track_streams();
+        // Opened codec metadata belongs to the selected video key, never the
+        // first output. Audio is a single independent shared encoder.
+        let video_params: Vec<_> = video_encoders
+            .iter()
+            .map(|encoder| (encoder.codec_params().clone(), encoder.time_base()))
+            .collect();
+        let audio: Option<(StreamCodecParameters, Rational)> = audio_encoder
+            .as_ref()
+            .map(|encoder| (encoder.codec_params().clone(), encoder.time_base()));
+        let track_streams = audio_encoder
+            .as_ref()
+            .map_or_else(Vec::new, AudioRenditionEncoder::track_streams);
+        // Effective-output metadata for the shared-rendition registry: the opened
+        // encoders' own snapshots, their verified reorder proofs, the running
+        // audio-bus format and the declared track identities. Nothing here is
+        // inferred from the requested output configuration.
+        let video_reorder: Vec<crate::rendition_workers::ReorderBound> = video_encoders
+            .iter()
+            .map(|encoder| {
+                if encoder.no_reorder_proven() {
+                    crate::rendition_workers::ReorderBound::NoReorder
+                } else {
+                    crate::rendition_workers::ReorderBound::Unknown
+                }
+            })
+            .collect();
+        let bus_format = audio_bus
+            .as_ref()
+            .map(multiview_audio::program::ProgramBus::format);
+        let declared_track_ids = track_inputs.load();
+        // One effective-configuration generation per egress build: a subscriber
+        // resolved against a previous build is refused by this registry.
+        let window_generation = crate::output_window_registry::next_run_generation();
 
-        // One bounded fan-out channel of coded packets + thread per sink. The sink
-        // thread drives `PacketMuxSink::run` (or a test fake) over a
-        // `StreamingPacketSource` — muxing the SAME packets the single encoder
-        // produced, never re-encoding (encode-once-mux-many).
-        let mut sink_txs: Vec<SyncSender<EncodedPacket>> = Vec::with_capacity(runners.len());
+        // One independently bounded delivery per binding + thread per sink. The
+        // sink thread drives `PacketMuxSink::run` (or a test fake) over a
+        // `StreamingPacketSource` fed by that binding's pump — muxing the SAME
+        // packets the program encoder produced, never re-encoding
+        // (encode-once-mux-many). The consumer only ever stages a whole tick and
+        // admits it atomically; it never waits on a sink.
+        let policies: Vec<BindingPolicy> = runners
+            .iter()
+            .map(|(_, send_policy)| match send_policy {
+                SinkSendPolicy::DropWhenFull(link) => BindingPolicy::Push(Arc::clone(link)),
+                SinkSendPolicy::Bounded => BindingPolicy::Bounded,
+            })
+            .collect();
+        let binding_gates: Vec<_> = output_video_keys
+            .iter()
+            .map(|&key| gates.get(key).copied().flatten())
+            .collect();
+        let (delivery, receivers) =
+            BindingDelivery::new(policies, DeliveryLimits::default(), binding_gates);
+        // Wrap the physical delivery exactly once: every complete window the
+        // dispatcher admits is mirrored into the effective-output registry
+        // BEFORE (and independently of) the physical binding's own admission, so
+        // a stalled or failed SRT/HLS sink can never starve a MoQ/WHEP
+        // subscriber. The factory is published off-clock here — before any window
+        // and before the sink threads start — so a control-plane subscriber
+        // cannot race the first admission.
+        let opened = crate::output_window_registry::OpenedRenditions {
+            binding_ids: &binding_ids,
+            video_keys: &output_video_keys,
+            video: &video_params,
+            cadence,
+            video_reorder: &video_reorder,
+            audio: audio.as_ref(),
+            audio_tracks: &track_streams,
+            bus: bus_format,
+            declared_tracks: declared_track_ids.as_ref(),
+            dependencies: dependency_axes.as_ref(),
+            generation: window_generation,
+        };
+        let opened_bindings = opened.bindings();
+        let optional_preview = optional_preview.map(|mut request| {
+            request.opened_parent = opened_bindings
+                .iter()
+                .find(|b| b.output_id == request.parent_output)
+                .cloned();
+            request
+        });
+        let (delivery, factory) = crate::output_window_registry::OutputWindowTap::new(
+            delivery,
+            opened_bindings,
+            window_generation,
+        );
+        // Check reservations against ALL opened production encoders, including
+        // outputs that cannot enter the subscriber catalog (for example FFV1).
+        let optional_preview = optional_preview.filter(|request| {
+            request.production.len() == binding_ids.iter().flatten().count()
+                && binding_ids.iter().enumerate().all(|(index, id)| {
+                    let Some(id) = id else {
+                        return true;
+                    };
+                    let Some((params, _)) = output_video_keys
+                        .get(index)
+                        .and_then(|key| video_params.get(*key))
+                    else {
+                        return false;
+                    };
+                    request.production.iter().any(|reservation| {
+                        reservation.output_id == *id
+                            && params.video_dimensions()
+                                == Some((reservation.key.width, reservation.key.height))
+                            && reservation.key.cadence == cadence
+                            && reservation
+                                .key
+                                .codec
+                                .eq_ignore_ascii_case(&format!("{:?}", params.codec_id()))
+                            && params
+                                .opened_bit_rate()
+                                .is_some_and(|rate| rate > 0 && rate == reservation.key.bitrate_bps)
+                    })
+                })
+        });
+        let factory = Arc::new(factory);
+        window_subscriptions.store(Some(factory.clone()));
+        let mut receivers = receivers.into_iter();
         let mut sinks = Vec::with_capacity(runners.len());
-        for (i, runner) in runners.into_iter().enumerate() {
-            let (tx, rx) = std::sync::mpsc::sync_channel::<EncodedPacket>(SINK_QUEUE_CAP);
-            sink_txs.push(tx);
+        for (i, (runner, _send_policy)) in runners.into_iter().enumerate() {
+            // A binding whose receiver could not be built simply has no sink: the
+            // delivery drops its windows and reports it, matching the old
+            // dropped-sender behaviour.
+            let Some(rx) = receivers.next() else {
+                let reason = "delivery receiver missing".to_owned();
+                sinks.push(spawn_failed_sink(reason));
+                continue;
+            };
             let builder = std::thread::Builder::new().name(format!("multiview-sink-{i}"));
-            let params = params.clone();
+            let Some((params, time_base)) = output_video_keys
+                .get(i)
+                .and_then(|&key| video_params.get(key))
+                .cloned()
+            else {
+                sinks.push(spawn_failed_sink("missing opened video key".to_owned()));
+                continue;
+            };
             let audio = audio.clone();
             let tracks = track_streams.clone();
             match builder.spawn(move || runner(rx, params, time_base, audio, tracks)) {
                 Ok(handle) => sinks.push(handle),
                 Err(e) => {
                     // A sink thread that cannot spawn is a real failure (we cannot
-                    // produce its artifact); drop its sender so nothing wedges, and
-                    // record a thread that immediately returns the spawn error.
-                    sink_txs.pop();
+                    // produce its artifact); its receiver was moved into the failed
+                    // closure and is dropped, so the binding fails visibly rather
+                    // than wedging, and we record a thread that returns the error.
                     let reason = e.to_string();
                     sinks.push(spawn_failed_sink(reason));
                 }
@@ -4712,18 +5286,82 @@ impl StreamEgress {
 
         let (hot_tx, hot_rx) = std::sync::mpsc::sync_channel::<StreamItem>(policy.queue_cap());
         let consumer_in_flight = Arc::clone(&in_flight);
+        let fatal = Arc::new(AtomicBool::new(false));
+        let consumer_fatal = Arc::clone(&fatal);
         // Keep a guard outside the spawn closure too: a failed thread spawn
         // drops its captured guard and wakes any hub producer already waiting.
         let consumer_guard = audio_route.as_ref().map(|route| route.consumer_guard());
         let builder = std::thread::Builder::new().name("multiview-bake-consumer".to_owned());
+        let window_slot_guard = WindowSlotGuard(window_subscriptions);
         let consumer = builder
             .spawn(move || {
+                let _window_slot_guard = window_slot_guard;
                 let _consumer_guard = consumer_guard;
-                consumer_main(
+                // The hot receive end the consumer pulls: the real bounded queue,
+                // or — under the fatal-consumer regression seam — a counting
+                // forwarder's channel that ends (and reports a fault) after the
+                // configured number of successfully processed items.
+                let hot_source = match (consumer_fault_after_ticks, shed_at_tick) {
+                    (None, None) => ConsumerHotSource::Real(hot_rx),
+                    (fault_after, shed_at) => {
+                        let after = fault_after.unwrap_or(u64::MAX);
+                        // Replay a mid-stream encoder failure: forward `after`
+                        // items so the consumer provably produces real output
+                        // first, then drop the real queue end (the consumer loses
+                        // its input exactly like a dead encoder) and report the
+                        // fault through the forwarder's completion flag.
+                        let (fwd_tx, fwd_rx) =
+                            std::sync::mpsc::sync_channel::<StreamItem>(policy.queue_cap());
+                        let forwarder = std::thread::Builder::new()
+                            .name("multiview-bake-fault".to_owned())
+                            .spawn(move || {
+                                let mut forwarded = 0u64;
+                                while let Ok(item) = hot_rx.recv() {
+                                    // Frame-substitution seam: DETERMINISTICALLY
+                                    // drop this one tick before the consumer —
+                                    // the exact replay of a transient hot-queue
+                                    // shed. The consumer must substitute it.
+                                    if shed_at == Some(item.tick_index) {
+                                        continue;
+                                    }
+                                    if forwarded >= after {
+                                        return true;
+                                    }
+                                    forwarded += 1;
+                                    if fwd_tx.send(item).is_err() {
+                                        // The consumer went away first (its own
+                                        // real failure): not a seam fault.
+                                        return false;
+                                    }
+                                }
+                                false
+                            })
+                            .unwrap_or_else(|_| {
+                                // The forwarder owns the real hot queue end; if
+                                // its thread could not spawn, that end is dropped
+                                // and the consumer sees end-of-input at once.
+                                // Report the fault rather than a silently
+                                // healthy short run.
+                                std::thread::spawn(|| true)
+                            });
+                        ConsumerHotSource::Faulted {
+                            hot: fwd_rx,
+                            forwarder,
+                        }
+                    }
+                };
+                let result = consumer_main(
                     ctx,
-                    &hot_rx,
-                    sink_txs,
-                    encoder,
+                    hot_source.hot(),
+                    delivery,
+                    media_span,
+                    cadence,
+                    video_encoders,
+                    audio_encoder,
+                    output_video_keys,
+                    output_audio_tracks,
+                    optional_preview,
+                    factory,
                     audio_bus,
                     audio_route,
                     audio_loudnorm,
@@ -4735,19 +5373,46 @@ impl StreamEgress {
                     #[cfg(feature = "aes67")]
                     aes67_send_handles,
                     &consumer_in_flight,
-                )
+                );
+                // The seam's fault fires only when the consumer itself finished
+                // healthy on its (shortened) input: its real outcome is replaced
+                // by the fatal error the run must propagate. A consumer that
+                // failed on its own keeps its exact original error.
+                let result = if hot_source.faulted() && result.is_ok() {
+                    Err(PipelineError::Output {
+                        kind: "bake-consumer",
+                        reason: format!(
+                            "test consumer fault after {} hot item(s)",
+                            consumer_fault_after_ticks.unwrap_or(0),
+                        ),
+                    })
+                } else {
+                    result
+                };
+                if let Err(error) = &result {
+                    tracing::error!(error = %error, "fatal encoded-output consumer failure");
+                    consumer_fatal.store(true, Ordering::Release);
+                }
+                result
             })
             .unwrap_or_else(|_| {
                 // Spawning the consumer failed: fall back to a thread that does
                 // nothing. The `hot_rx`/`sink_txs` moved into the failed closure
                 // drop, closing the channels so the hot loop sees Disconnected and
                 // each sink sees end-of-program — nothing wedges.
-                std::thread::spawn(|| Ok(()))
+                fatal.store(true, Ordering::Release);
+                std::thread::spawn(|| {
+                    Err(PipelineError::Output {
+                        kind: "bake-consumer",
+                        reason: "failed to spawn encoded-output consumer".to_owned(),
+                    })
+                })
             });
 
         (
             Self {
                 consumer,
+                fatal,
                 sinks,
                 in_flight,
                 peak_occupancy,
@@ -4776,11 +5441,54 @@ impl StreamEgress {
     /// Returns a [`PipelineError`] if the consumer panicked, or a sink that DID
     /// finish errored/panicked (a detached wedged sink is reported, not errored).
     fn join(self) -> Result<EgressOutcome, PipelineError> {
-        self.consumer
+        // A fatal native encoder can wedge in libav without returning an error.
+        // Do not let shutdown wait forever: systemd owns a fresh-process restart
+        // after this bounded error, and the detached thread cannot poison a new
+        // in-process encoder generation.
+        let deadline = Instant::now() + SINK_WEDGE_GRACE;
+        while !self.consumer.is_finished() && Instant::now() < deadline {
+            std::thread::park_timeout(Duration::from_millis(10));
+        }
+        if !self.consumer.is_finished() {
+            return Err(PipelineError::Output {
+                kind: "bake-consumer",
+                reason: "encoder consumer failed to stop within bounded teardown".to_owned(),
+            });
+        }
+        let bindings = self
+            .consumer
             .join()
             .map_err(|_| PipelineError::Engine("bake consumer thread panicked".to_owned()))??;
-        let mut lines = Vec::with_capacity(self.sinks.len());
+        let mut lines = Vec::with_capacity(self.sinks.len() + bindings.len());
         let mut frames = Vec::with_capacity(self.sinks.len());
+        // Per-binding delivery truth, emitted BEFORE the sink lines so a lost or
+        // failed binding is visible even when its sink thread produced a file.
+        for (index, binding) in bindings.iter().enumerate() {
+            lines.push(format!(
+                "binding {index}: {} windows / {} packets admitted, {} windows lost \
+                 ({} packets), generation {}, queued {}, in-flight {}/{} bytes{}",
+                binding.admitted_batches,
+                binding.admitted_packets,
+                binding.rejected_batches,
+                binding.rejected_packets,
+                binding.generation,
+                binding.queued_windows,
+                binding.reserved_packets,
+                binding.reserved_bytes,
+                match binding.last_rejection {
+                    Some(reason) => format!(
+                        ", last loss: {}{}",
+                        reason.label(),
+                        if binding.failed {
+                            " (binding failed)"
+                        } else {
+                            ""
+                        }
+                    ),
+                    None => String::new(),
+                }
+            ));
+        }
         // A shared teardown budget: healthy sinks finish in milliseconds; only a
         // genuinely wedged sink consumes the grace before being detached.
         let deadline = Instant::now() + SINK_WEDGE_GRACE;
@@ -4833,6 +5541,173 @@ fn spawn_failed_sink(reason: String) -> JoinHandle<Result<SinkRunOutcome, Pipeli
             reason: format!("could not spawn sink thread: {reason}"),
         })
     })
+}
+
+/// Fatal-consumer health-propagation regressions (issue #202/#203 follow-up):
+/// the atomic fatal bit, the tick-boundary stop it raises, and the bounded
+/// teardown that hands a wedged consumer to systemd's restart instead of
+/// hanging `stop` forever.
+#[cfg(test)]
+mod egress_fatal_tests {
+    use super::{stop_on_egress_failure, PipelineError, StreamEgress, SINK_WEDGE_GRACE};
+    use multiview_engine::StopSignal;
+    use std::sync::atomic::{AtomicBool, AtomicI64, AtomicUsize, Ordering};
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+
+    /// Build an egress around a given consumer thread handle (unit-level: no
+    /// encoders, no sinks — `join`'s own bounds are what these tests pin).
+    fn egress_with_consumer(
+        consumer: std::thread::JoinHandle<
+            Result<Vec<crate::binding_delivery::BindingStatus>, PipelineError>,
+        >,
+        fatal: bool,
+    ) -> StreamEgress {
+        StreamEgress {
+            consumer,
+            fatal: Arc::new(AtomicBool::new(fatal)),
+            sinks: Vec::new(),
+            in_flight: Arc::new(AtomicI64::new(0)),
+            peak_occupancy: Arc::new(AtomicUsize::new(0)),
+        }
+    }
+
+    /// The per-tick hot-loop check: a healthy consumer leaves the run running;
+    /// only a fatal consumer (flagged by the consumer itself, or a disconnected
+    /// hot queue) raises the stop and reports the fault.
+    #[test]
+    fn stop_on_egress_failure_only_stops_on_fatal() {
+        // Healthy: no fatal bit, no disconnection — no stop, keep ticking.
+        let fatal = AtomicBool::new(false);
+        let stop = StopSignal::new();
+        assert!(!stop_on_egress_failure(&fatal, &stop, false));
+        assert!(
+            !stop.is_stopped(),
+            "a healthy consumer must never stop the run"
+        );
+        assert!(!fatal.load(Ordering::Acquire));
+
+        // A disconnected hot queue (the consumer died and dropped its end)
+        // IS fatal: the bit is set, the stop is raised, and the fault is
+        // reported — never a silent healthy UI over dead outputs.
+        assert!(stop_on_egress_failure(&fatal, &stop, true));
+        assert!(fatal.load(Ordering::Acquire));
+        assert!(stop.is_stopped());
+
+        // Once the consumer flagged fatal, every later tick re-checks the bit
+        // and keeps the stop raised (idempotent).
+        let fatal2 = AtomicBool::new(true);
+        let stop2 = StopSignal::new();
+        assert!(stop_on_egress_failure(&fatal2, &stop2, false));
+        assert!(stop2.is_stopped());
+
+        // The normal overload path (queue full, shed) never trips this gate:
+        // a non-fatal, non-disconnected check on a fresh run stops nothing.
+        let fatal3 = AtomicBool::new(false);
+        let stop3 = StopSignal::new();
+        assert!(!stop_on_egress_failure(&fatal3, &stop3, false));
+        assert!(!stop3.is_stopped());
+    }
+
+    /// A consumer that finished healthy still joins clean — the bounded wait
+    /// adds no regression to the normal teardown path.
+    #[test]
+    fn join_returns_outcome_for_finished_healthy_consumer() {
+        let consumer = std::thread::spawn(|| Ok(Vec::new()));
+        let egress = egress_with_consumer(consumer, false);
+        let outcome = egress.join().expect("healthy consumer joins clean");
+        assert_eq!(outcome.sink_frames, Vec::<usize>::new());
+        assert_eq!(outcome.peak_occupancy, 0);
+    }
+
+    /// A consumer whose exact error already failed (fatal native encoder that
+    /// returned an error) propagates that EXACT error through `join` — the
+    /// supervisor (systemd) restarts on the real cause, never a generic one.
+    #[test]
+    fn join_propagates_the_exact_consumer_error() {
+        let consumer = std::thread::spawn(|| {
+            Err::<Vec<crate::binding_delivery::BindingStatus>, PipelineError>(
+                PipelineError::Output {
+                    kind: "bake-consumer",
+                    reason: "encoder rejected the rendition".to_owned(),
+                },
+            )
+        });
+        let egress = egress_with_consumer(consumer, true);
+        match egress.join() {
+            Err(PipelineError::Output { kind, reason }) => {
+                assert_eq!(kind, "bake-consumer");
+                assert_eq!(reason, "encoder rejected the rendition");
+            }
+            other => panic!("consumer failure must surface as a typed output error, got {other:?}"),
+        }
+    }
+
+    /// A consumer that WEDGED (a fatal native encoder can hang inside libav
+    /// without returning) must not hang `stop` forever: teardown is bounded by
+    /// [`SINK_WEDGE_GRACE`], after which the run returns a typed failure so
+    /// systemd's `Restart=always` owns a fresh process (the atomic signal).
+    #[test]
+    fn join_bounds_a_wedged_consumer_to_the_teardown_grace() {
+        let started = Instant::now();
+        // A consumer that never finishes: parked forever, like an encoder
+        // wedged inside a libav call.
+        let consumer = std::thread::Builder::new()
+            .name("test-wedged-consumer".to_owned())
+            .spawn(|| {
+                loop {
+                    std::thread::park();
+                }
+                #[allow(unreachable_code)]
+                Ok(Vec::new())
+            })
+            .expect("spawn wedged consumer");
+        let egress = egress_with_consumer(consumer, true);
+        match egress.join() {
+            Err(PipelineError::Output { kind, reason }) => {
+                assert_eq!(kind, "bake-consumer");
+                assert!(
+                    reason.contains("bounded teardown"),
+                    "the wedge error must name the bounded teardown, got {reason:?}"
+                );
+            }
+            other => panic!("wedged consumer must surface as a typed output error, got {other:?}"),
+        }
+        // Bounded: well past the 2 s grace the wait is over — and this test
+        // itself returning proves teardown never hung.
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed >= SINK_WEDGE_GRACE,
+            "the grace must actually be waited out, elapsed {elapsed:?}"
+        );
+        assert!(
+            elapsed < SINK_WEDGE_GRACE + Duration::from_secs(10),
+            "teardown must be bounded, elapsed {elapsed:?}"
+        );
+    }
+
+    /// The failed-consumer-spawn fallback thread is fatal by construction: its
+    /// error text is the exact cause the run reports (the hot loop also sees
+    /// Disconnected and stops at the next tick).
+    #[test]
+    fn failed_consumer_spawn_falls_back_to_a_fatal_error_thread() {
+        let consumer = std::thread::spawn(|| {
+            Err::<Vec<crate::binding_delivery::BindingStatus>, PipelineError>(
+                PipelineError::Output {
+                    kind: "bake-consumer",
+                    reason: "failed to spawn encoded-output consumer".to_owned(),
+                },
+            )
+        });
+        let egress = egress_with_consumer(consumer, true);
+        match egress.join() {
+            Err(PipelineError::Output { kind, reason }) => {
+                assert_eq!(kind, "bake-consumer");
+                assert_eq!(reason, "failed to spawn encoded-output consumer");
+            }
+            other => panic!("spawn failure must surface as a typed output error, got {other:?}"),
+        }
+    }
 }
 
 /// Build the program-audio bus (AUD-4) from the run's [`AudioEncodeConfig`] and
@@ -4974,6 +5849,74 @@ fn drive_audio_for_item(
     bus.tick_to(tick_index.saturating_add(1))
 }
 
+/// The concrete encoder owned exclusively by one bounded rendition worker.
+struct PipelineVideoWorker(VideoRenditionEncoder);
+
+impl VideoEncodeWorker for PipelineVideoWorker {
+    fn encode(&mut self, item: BakedTick) -> Result<Vec<EncodedPacket>, PipelineError> {
+        let frame = nv12_to_decoded(&item.canvas)?;
+        self.0
+            .encode_frame_at(frame, item.tick)
+            .map_err(|e| PipelineError::Output {
+                kind: "encode",
+                reason: e.to_string(),
+            })
+    }
+
+    fn reorder_bound(&self) -> ReorderBound {
+        if self.0.no_reorder_proven() {
+            ReorderBound::NoReorder
+        } else {
+            ReorderBound::Unknown
+        }
+    }
+
+    fn finish(&mut self) -> Result<Vec<EncodedPacket>, PipelineError> {
+        self.0.finish().map_err(|e| PipelineError::Output {
+            kind: "encode",
+            reason: e.to_string(),
+        })
+    }
+}
+
+/// The per-item frame-substitution limit: the maximum number of consecutive
+/// output ticks a single received item may fill by substitution (the hot
+/// queue's capacity — in the admitted real-time envelope a transient consumer
+/// stall can shed at most a queue's worth of ticks). A larger gap means the
+/// consumer fell behind by more than a full queue drain horizon — beyond the
+/// real-time envelope — and fails the run explicitly rather than silently
+/// stamping a fast-forward jump into the encoded stream.
+const FRAME_SUBSTITUTION_LIMIT: u64 = 8;
+
+/// The tick indexes a received item must FILL before its own tick so the
+/// encoded stream never misses a tick (no-falter): every tick between the last
+/// processed tick and this item's tick is substituted with the last good baked
+/// canvas, restamped at the missing tick's index — fixed cadence output, frame
+/// substitution when input is unavailable, never a missing encoded tick.
+///
+/// # Errors
+/// Returns a typed error when the gap exceeds [`FRAME_SUBSTITUTION_LIMIT`] —
+/// the consumer is beyond the admitted envelope; the fatal signal stops the
+/// run and the supervisor restarts a fresh process (visible failure, never a
+/// silent timestamp jump).
+fn missing_ticks_before(
+    last_tick: Option<u64>,
+    current_tick: u64,
+) -> Result<std::ops::Range<u64>, PipelineError> {
+    let start = last_tick.map_or(current_tick, |last| last.saturating_add(1));
+    if current_tick.saturating_sub(start) > FRAME_SUBSTITUTION_LIMIT {
+        return Err(PipelineError::Output {
+            kind: "video-worker",
+            reason: format!(
+                "output fell {gap} ticks behind the clock (beyond the admitted envelope of \
+                 {FRAME_SUBSTITUTION_LIMIT}): the encoder cannot keep the fixed cadence",
+                gap = current_tick.saturating_sub(start)
+            ),
+        });
+    }
+    Ok(start..current_tick)
+}
+
 /// The single bake-consumer thread body (encode-once-mux-many, invariant #7):
 /// build the [`StreamBaker`] from the owned [`BakeContext`] and own the single
 /// [`ProgramEncoder`], then loop receiving [`StreamItem`]s — bake each into an
@@ -4996,11 +5939,18 @@ fn drive_audio_for_item(
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 // reason: the consumer owns each pipeline tail input distinctly (encode, audio bus + loudnorm + loudness meter + publisher, display feed, in-flight counter); bundling them would only obscure the data flow.
 #[allow(clippy::needless_pass_by_value)] // reason: `loudness_publisher` is owned BY VALUE so it lives in the consumer thread's frame for the whole run (it cannot borrow from `drive_streaming`, which returns before this thread joins); the body only needs `&` access but the ownership is load-bearing.
-fn consumer_main(
+fn consumer_main<D: WindowDelivery>(
     ctx: BakeContext,
     hot_rx: &Receiver<StreamItem>,
-    sink_txs: Vec<SyncSender<EncodedPacket>>,
-    mut encoder: ProgramEncoder,
+    mut delivery: D,
+    media_span: Duration,
+    cadence: Rational,
+    video_encoders: Vec<VideoRenditionEncoder>,
+    mut audio_encoder: Option<AudioRenditionEncoder>,
+    output_video_keys: Vec<usize>,
+    output_audio_tracks: Vec<Vec<usize>>,
+    optional_preview: Option<crate::preview_vertical::PreviewStartup>,
+    factory: Arc<crate::output_window_registry::SubscriptionFactory>,
     mut audio_bus: Option<multiview_audio::program::ProgramBus>,
     audio_route: Option<Arc<crate::audio::AudioControlHandle>>,
     mut audio_loudnorm: Option<multiview_audio::LoudnormProcessor>,
@@ -5011,8 +5961,91 @@ fn consumer_main(
     track_inputs: &multiview_framestore::SwapCell<Arc<Vec<String>>>,
     #[cfg(feature = "aes67")] aes67_send_handles: Vec<multiview_output::aes67::Aes67SenderHandle>,
     in_flight: &AtomicI64,
-) -> Result<(), PipelineError> {
+) -> Result<Vec<crate::binding_delivery::BindingStatus>, PipelineError> {
     let mut baker = StreamBaker::new(ctx)?;
+    let (event_tx, event_rx) = std::sync::mpsc::sync_channel::<DispatchEvent>(256);
+    if video_encoders.is_empty() {
+        return Err(PipelineError::Output {
+            kind: "encode",
+            reason: "no video rendition".to_owned(),
+        });
+    }
+    let mut workers = Vec::with_capacity(video_encoders.len());
+    let video_bases: Vec<_> = video_encoders
+        .iter()
+        .map(|v| DtsTimeBase {
+            num: v.time_base().num,
+            den: v.time_base().den,
+        })
+        .collect();
+    for (key, encoder) in video_encoders.into_iter().enumerate() {
+        let base = encoder.time_base();
+        let tx = event_tx.clone();
+        let worker = RenditionWorker::spawn(
+            key,
+            cadence,
+            base,
+            Box::new(PipelineVideoWorker(encoder)),
+            move |event| {
+                tx.send(event).map_err(|e| PipelineError::Output {
+                    kind: "video-worker",
+                    reason: e.to_string(),
+                })
+            },
+        )?;
+        workers.push(worker);
+    }
+    let audio_specs = audio_encoder
+        .as_ref()
+        .map_or_else(Vec::new, AudioRenditionEncoder::watermark_streams);
+    let audio_bases = audio_encoder.as_ref().map_or_else(Vec::new, |encoder| {
+        let base = encoder.time_base();
+        std::iter::repeat_n(
+            DtsTimeBase {
+                num: base.num,
+                den: base.den,
+            },
+            encoder.track_streams().len() + 1,
+        )
+        .collect()
+    });
+    let optional = optional_preview.and_then(|request| {
+        let tracks = request
+            .opened_parent
+            .as_ref()
+            .and_then(|b| output_audio_tracks.get(b.output_index))
+            .cloned()
+            .unwrap_or_default();
+        crate::preview_vertical::PreviewIngress::spawn(
+            request,
+            factory,
+            cadence,
+            audio_bases.clone(),
+            tracks,
+        )
+    });
+    let bindings = output_video_keys
+        .iter()
+        .enumerate()
+        .map(|(index, &key)| BindingConfig {
+            output_index: index,
+            video_key: Some(key),
+            audio_tracks: output_audio_tracks.get(index).cloned().unwrap_or_default(),
+        })
+        .collect();
+    let mut dispatcher = RenditionDispatcher::new(DispatchConfig {
+        video_count: video_bases.len(),
+        audio_count: audio_bases.len(),
+        video_time_base: video_bases,
+        audio_time_base: audio_bases.clone(),
+        bindings,
+        first_tick: 0,
+        cadence,
+    })
+    .map_err(|e| PipelineError::Output {
+        kind: "dispatch",
+        reason: format!("{e:?}"),
+    })?;
     // A monotonic clock for rate-bounding the loudness emit, sampled OFF the hot
     // loop (this is the bake-consumer thread). The epoch is the consumer start;
     // the conflator only ever sees a non-decreasing `now_ns`.
@@ -5037,14 +6070,52 @@ fn consumer_main(
     let mut av_meter = audio_bus
         .as_ref()
         .map(|bus| crate::av_sync::AvMeter::new(bus.cadence(), bus.format().sample_rate()));
-    // Track which sinks are still live (their receiver has not hung up) so a sink
-    // that ended early does not wedge or repeatedly error the consumer.
-    let mut live: Vec<bool> = vec![true; sink_txs.len()];
+    // The encoder-work admission horizon (no-falter): the consumer may wait
+    // for a momentarily-full worker queue up to ONE hot-queue drain horizon —
+    // cadence-derived, fixed — so the hot queue keeps absorbing engine ticks
+    // while the consumer waits and nothing is shed. Beyond the horizon the
+    // encoder is wedged past the real-time envelope and fails explicitly.
+    let offer_horizon = media_span.saturating_mul(4);
+    // The last processed tick and the last good BAKED canvas — the source for
+    // frame substitution (no-falter: a transient consumer stall sheds ticks
+    // from the hot queue; the encoded stream still gets a restamped frame for
+    // every one of them, duplicated content over the gap, never a missing
+    // tick and never a timestamp jump).
+    let mut last_tick: Option<u64> = None;
+    let mut last_baked: Option<Arc<Nv12Image>> = None;
     // `recv()` returns `Err` only when the hot sender drops = end-of-program
     // (clean stop / EOF), which ends the loop.
     while let Ok(item) = hot_rx.recv() {
         // One frame left the queue.
         in_flight.fetch_sub(1, Ordering::AcqRel);
+        // Admit the previously encoded tick's complete packet set (its video,
+        // program audio and every discrete track) as ONE atomic transaction per
+        // binding. Never waits: a full or stale binding loses that whole window
+        // with an explicit reason while every other binding and this consumer
+        // continue (invariants #1/#10, no queue-size-only bandaid).
+        while let Ok(event) = event_rx.try_recv() {
+            if let Err(e) = dispatcher.dispatch(event, Instant::now(), &mut delivery) {
+                if !matches!(
+                    e,
+                    crate::rendition_dispatch::DispatchError::Admission { .. }
+                ) {
+                    return Err(PipelineError::Output {
+                        kind: "dispatch",
+                        reason: format!("{e:?}"),
+                    });
+                }
+            }
+        }
+        dispatcher
+            .watchdog(Instant::now(), &mut delivery)
+            .map_err(|e| PipelineError::Output {
+                kind: "dispatch",
+                reason: format!("{e:?}"),
+            })?;
+        // Every output tick hands any admitted-but-undelivered tail to its
+        // transport, so a quiet encoder cannot strand an admitted window behind a
+        // subscriber's bounded handoff. Off-clock, never waits on a peer.
+        delivery.pump(Instant::now());
         // Freeze the declared track selection before this tick samples the bus.
         // A concurrent routing PUT changes only the following tick's selection.
         let selected_tracks = track_inputs.load();
@@ -5075,18 +6146,55 @@ fn consumer_main(
             None
         };
         let overlaid = baker.bake(&item)?;
-        // Bridge once + encode once (invariant #7): the canvas is encoded a SINGLE
-        // time here, never once per sink.
-        let frame = nv12_to_decoded(&overlaid)?;
-        // Stamp video at the absolute output tick, the clock the program audio is
-        // driven by (`drive_audio_for_item`), so shed ticks cannot drift A/V.
-        let packets = encoder
-            .encode_frame_at(frame, item.tick_index)
-            .map_err(|e| PipelineError::Output {
-                kind: "encode",
-                reason: e.to_string(),
-            })?;
-        fan_packets(&sink_txs, &mut live, packets);
+        // NO-FALTER: fill any ticks this consumer missed (a transient stall
+        // shed them from the hot queue) with frame substitution — the last
+        // good baked canvas restamped at each missing tick's index. The
+        // encoder therefore sees a STRICTLY consecutive tick sequence (its
+        // deployed continuity contract is untouched) and the muxed stream has
+        // a frame for EVERY output tick. A gap beyond the admitted envelope
+        // fails the run explicitly (never silently skips forward).
+        for missing in missing_ticks_before(last_tick, item.tick_index)? {
+            let canvas = last_baked.as_ref().unwrap_or(&overlaid);
+            for worker in &workers {
+                worker
+                    .offer_within(
+                        BakedTick {
+                            tick: missing,
+                            canvas: Arc::clone(canvas),
+                        },
+                        offer_horizon,
+                    )
+                    .map_err(|e| PipelineError::Output {
+                        kind: "video-worker",
+                        reason: format!("{e:?}"),
+                    })?;
+            }
+        }
+        // One immutable baked allocation is offered to each independent video
+        // rendition. A momentarily-full worker queue back-pressures this
+        // consumer for up to one queue drain horizon (the hot queue keeps
+        // absorbing engine ticks meanwhile — nothing is shed inside the
+        // envelope); only a worker wedged beyond the horizon fails
+        // explicitly, never pacing the program clock.
+        for worker in &workers {
+            worker
+                .offer_within(
+                    BakedTick {
+                        tick: item.tick_index,
+                        canvas: Arc::clone(&overlaid),
+                    },
+                    offer_horizon,
+                )
+                .map_err(|e| PipelineError::Output {
+                    kind: "video-worker",
+                    reason: format!("{e:?}"),
+                })?;
+        }
+        if let Some(preview) = optional.as_ref() {
+            preview.offer(item.tick_index, &overlaid);
+        }
+        last_tick = Some(item.tick_index);
+        last_baked = Some(Arc::clone(&overlaid));
         // Program audio (AUD-4 + RT-8b), OFF the engine hot loop: when the bus is
         // present, mix program audio up to THIS frame's output tick index — catching
         // up the samples for any ticks `DropOnOverload` shed since the last surviving
@@ -5207,13 +6315,18 @@ fn consumer_main(
                 // intentionally ignore here (drop-oldest; inv #10).
                 let _ = slot.push(block.clone());
             }
-            let audio_packets = encoder
-                .encode_audio_interleaved(block.interleaved(), block.frame_count())
+            let audio = audio_encoder
+                .as_mut()
+                .ok_or_else(|| PipelineError::Output {
+                    kind: "encode-audio",
+                    reason: "audio bus has no encoder".to_owned(),
+                })?;
+            let mut audio_packets = audio
+                .encode_interleaved(block.interleaved(), block.frame_count())
                 .map_err(|e| PipelineError::Output {
                     kind: "encode-audio",
                     reason: e.to_string(),
                 })?;
-            fan_packets(&sink_txs, &mut live, audio_packets);
             // #152: discrete tracks, same tick, same sample budget (inv #3).
             if !selected_tracks.is_empty() {
                 #[cfg(feature = "overlay")]
@@ -5223,13 +6336,54 @@ fn consumer_main(
                 #[cfg(not(feature = "overlay"))]
                 let track_bus = bus;
                 let packets = encode_discrete_tracks(
-                    &mut encoder,
+                    audio,
                     track_bus,
                     &selected_tracks,
                     block.frame_count(),
                 )?;
-                fan_packets(&sink_txs, &mut live, packets);
+                audio_packets.extend(packets);
             }
+            let mut watermarks = Vec::with_capacity(audio_bases.len());
+            for stream in 0..audio_bases.len() {
+                let pts = audio_packets
+                    .iter()
+                    .rev()
+                    .find(|p| match p.kind() {
+                        multiview_ffmpeg::StreamKind::Audio => stream == 0,
+                        multiview_ffmpeg::StreamKind::AudioTrack(i) => stream == usize::from(i) + 1,
+                        _ => false,
+                    })
+                    .and_then(EncodedPacket::pts);
+                watermarks.push(pts.and_then(|p| {
+                    audio_specs
+                        .get(stream)
+                        .and_then(|&(frame_samples, sample_rate)| {
+                            crate::rendition_workers::next_frame_lower_bound_ns(
+                                p,
+                                frame_samples,
+                                sample_rate,
+                            )
+                        })
+                }));
+            }
+            let audio_event = DispatchEvent::Audio {
+                tick: item.tick_index,
+                timebases: audio_bases
+                    .iter()
+                    .map(|tb| Rational::new(tb.num, tb.den))
+                    .collect(),
+                packets: audio_packets,
+                watermarks,
+            };
+            if let Some(preview) = optional.as_ref() {
+                preview.audio(&audio_event);
+            }
+            event_tx
+                .send(audio_event)
+                .map_err(|e| PipelineError::Output {
+                    kind: "audio-dispatch",
+                    reason: e.to_string(),
+                })?;
         } else if let Some(bus) = display_audio.dedicated_bus.as_mut() {
             // A video-only run with audio-enabled display heads: drive the
             // dedicated display bus by the same absolute tick index (RT-8b —
@@ -5242,15 +6396,50 @@ fn consumer_main(
             }
         }
     }
-    // End-of-program: flush the encoder and fan its trailing packets, then drop
-    // the sink senders so each sink sees end-of-program and finalises.
-    let tail = encoder.finish().map_err(|e| PipelineError::Output {
-        kind: "encode",
-        reason: e.to_string(),
-    })?;
-    fan_packets(&sink_txs, &mut live, tail);
-    drop(sink_txs);
-    Ok(())
+    // Join the independently admitted video encoders and drain their terminal
+    // events before finalizing the shared program audio and binding windows.
+    for worker in workers {
+        worker.join()?;
+    }
+    if let Some(audio) = audio_encoder.as_mut() {
+        let tail = audio.finish().map_err(|e| PipelineError::Output {
+            kind: "encode-audio",
+            reason: e.to_string(),
+        })?;
+        let event = DispatchEvent::FinishAudio { packets: tail };
+        if let Some(preview) = optional.as_ref() {
+            preview.audio(&event);
+        }
+        event_tx.send(event).map_err(|e| PipelineError::Output {
+            kind: "audio-dispatch",
+            reason: e.to_string(),
+        })?;
+    }
+    drop(event_tx);
+    while let Ok(event) = event_rx.recv() {
+        if let Err(e) = dispatcher.dispatch(event, Instant::now(), &mut delivery) {
+            if !matches!(
+                e,
+                crate::rendition_dispatch::DispatchError::Admission { .. }
+            ) {
+                return Err(PipelineError::Output {
+                    kind: "dispatch",
+                    reason: format!("{e:?}"),
+                });
+            }
+        }
+    }
+    if !dispatcher.is_finished() {
+        return Err(PipelineError::Output {
+            kind: "dispatch",
+            reason: "incomplete final window".to_owned(),
+        });
+    }
+    delivery.finish();
+    // The per-binding delivery truth travels with the run: a healthy clock plus
+    // a binding that lost windows (or failed) is an output failure, never a
+    // silent success.
+    Ok(delivery.statuses())
 }
 
 /// Encode one tick of every discrete track (#152) from its source's pre-mix
@@ -5259,7 +6448,7 @@ fn consumer_main(
 /// block this tick (or a block of another length) encodes silence; the track's
 /// clock never skips.
 fn encode_discrete_tracks(
-    encoder: &mut ProgramEncoder,
+    encoder: &mut AudioRenditionEncoder,
     bus: &multiview_audio::program::ProgramBus,
     track_inputs: &[String],
     frames: usize,
@@ -5284,87 +6473,20 @@ fn encode_discrete_tracks(
     }
     Ok(out)
 }
-
-/// Fan each coded packet to every still-live sink as an independently-owned copy
-/// (so each muxer's in-place stream-index set + rescale is sound even though the
-/// same packet feeds many muxers — invariant #7). The copy **preserves the
-/// packet's [`StreamKind`]** (cloning the [`EncodedPacket`] wrapper, not
-/// re-wrapping the raw packet) so an audio packet stays tagged audio and routes
-/// to the muxer's audio stream — AUD-4; a video-default re-wrap mis-routed audio
-/// onto the video stream, corrupting its DTS. A blocking send paces the CONSUMER
-/// to the slowest sink, never the engine (the engine already handed the frame
-/// off); a hung-up receiver (the sink ended) marks that sink dead for the rest
-/// of the run.
-fn fan_packets(
-    sink_txs: &[SyncSender<EncodedPacket>],
-    live: &mut [bool],
-    packets: Vec<EncodedPacket>,
-) {
-    for packet in packets {
-        for (i, tx) in sink_txs.iter().enumerate() {
-            if !live.get(i).copied().unwrap_or(false) {
-                continue;
-            }
-            // Bounded send: a healthy sink drains within the grace, so this
-            // succeeds (near-)instantly; a sink that has hung up OR has wedged and
-            // stopped draining for `SINK_WEDGE_GRACE` marks the sink dead for the
-            // rest of the run, so a wedged sink can never stall the consumer
-            // forever (ENG-1, inv #1).
-            // `packet.clone()` is a ref-counted, independently-writable copy that
-            // KEEPS the kind tag (unlike `from_packet`, which forces video).
-            if !send_bounded(tx, packet.clone()) {
-                if let Some(flag) = live.get_mut(i) {
-                    *flag = false;
-                }
-            }
-        }
-    }
+#[derive(Clone)]
+enum SinkSendPolicy {
+    /// Bounded wait ([`send_bounded`]): a file/HLS sink must not lose a packet,
+    /// so a full queue paces the consumer up to [`SINK_WEDGE_GRACE`].
+    Bounded,
+    /// Never wait ([`send_or_drop`]): a resilient live push drops + counts on
+    /// a full queue (its link status records the drop).
+    DropWhenFull(Arc<multiview_output::push_link::PushLinkStatus>),
 }
-
-/// Send `packet` on `tx`, waiting at most [`SINK_WEDGE_GRACE`] for a slot. Returns
-/// `true` once enqueued; `false` if the receiver hung up (`Disconnected`) or the
-/// sink stopped draining for the whole grace (wedged) — the caller then marks the
-/// sink dead. `std`'s `SyncSender` has no stable `send_timeout`, so this polls a
-/// non-blocking `try_send` with a short sleep (off the hot path; a healthy sink
-/// takes the first `try_send`, never the sleep).
-fn send_bounded(tx: &SyncSender<EncodedPacket>, packet: EncodedPacket) -> bool {
-    let deadline = Instant::now() + SINK_WEDGE_GRACE;
-    let mut packet = packet;
-    loop {
-        match tx.try_send(packet) {
-            Ok(()) => return true,
-            Err(TrySendError::Full(returned)) => {
-                if Instant::now() >= deadline {
-                    return false;
-                }
-                packet = returned;
-                std::thread::sleep(Duration::from_millis(1));
-            }
-            Err(TrySendError::Disconnected(_)) => return false,
-        }
-    }
-}
-
-/// Drive one runnable output to completion over its bounded fan-out channel,
-/// reusing the existing, tested `multiview_output` sink `run()` VERBATIM over a
-/// [`StreamingFrameSource`] (ADR-0025). The HLS playlist text is returned for the
-/// egress to write once the encode completes (so the on-disk playlist is written
-/// off the sink thread, keeping the sink path identical to the batch one).
-///
-/// # Errors
-/// Returns [`PipelineError::Output`] if a **file or HLS** sink's encode/mux fails
-/// (those write a local artifact a failed run must surface). A **push** sink whose
-/// peer is unreachable, by contrast, never fails the run: it is reported and
-/// dropped so the program's local outputs still complete (invariants #1/#10 — a
-/// dead remote consumer must not back-pressure or fail the program).
-#[allow(clippy::too_many_lines)]
-// reason: a flat dispatch `match` over every runnable output kind (file / HLS /
-// push / WebRTC / NDI / AES67), each arm a short delegation to that kind's runner;
-// its value is reading the whole per-kind mapping in one place. Splitting it would
 // scatter the dispatch without reducing complexity.
+#[allow(clippy::too_many_lines)] // Each sink variant seeds its independent mux and transport state.
 fn run_one_output(
     output: RunnableOutput,
-    rx: Receiver<EncodedPacket>,
+    rx: Receiver<LeasedPacket>,
     params: &StreamCodecParameters,
     time_base: Rational,
     audio: Option<&(StreamCodecParameters, Rational)>,
@@ -5470,10 +6592,12 @@ fn run_one_output(
             sink,
             label,
             url,
+            link,
         } => Ok(run_push_output(
             &sink,
             label,
             &url,
+            &link,
             rx,
             multiview_output::MuxStream::new(params, time_base),
             (audio, &track_mux),
@@ -5541,7 +6665,7 @@ fn run_aes67_output(
     local: std::net::SocketAddr,
     dest: std::net::SocketAddr,
     interface: multiview_output::aes67::transport::MulticastInterface,
-    eop: Receiver<EncodedPacket>,
+    eop: Receiver<LeasedPacket>,
     label: &str,
 ) -> SinkRunOutcome {
     use multiview_output::aes67::transport::Aes67UdpSender;
@@ -5623,7 +6747,7 @@ fn run_aes67_output(
 fn run_webrtc_output(
     sink: &multiview_webrtc::egress::EgressSink,
     label: &str,
-    rx: Receiver<EncodedPacket>,
+    rx: Receiver<LeasedPacket>,
     time_base: Rational,
 ) -> SinkRunOutcome {
     use multiview_ffmpeg::StreamKind;
@@ -5639,7 +6763,8 @@ fn run_webrtc_output(
     let mut dropped = 0u64;
     // Block on each fanned packet; the iterator ends when the channel closes
     // (end-of-program), consuming `rx` so it is dropped here.
-    for packet in rx {
+    for leased in rx {
+        let packet = leased.packet;
         delivered += 1;
         let Some(bytes) = packet.payload() else {
             continue;
@@ -5819,24 +6944,22 @@ where
     }
 }
 
-/// Run a live push sink (RTMP / SRT) over its fan-out channel, tolerating an
-/// unreachable peer. **Infallible** by design (returns a [`SinkRunOutcome`], never
-/// an error): a push that cannot be delivered must not fail the program.
+/// Run a live push sink (SRT / RTMP / RIST / UDP) over its fan-out channel.
+/// **Infallible** by design (returns a [`SinkRunOutcome`], never an error).
 ///
-/// [`PushSink::run`] connects when it opens the muxer; with a reachable peer it
-/// streams the encoded program (the same encode-once-mux-many drive loop the file
-/// sink uses) and reports the packet/keyframe counts. A connect failure (no peer)
-/// is **logged and the sink dropped** — never an error that fails the run: the
-/// caller drops the [`Receiver`] when this returns, so the bake consumer's next
-/// fan-out send to this sink fails and it marks the sink dead for the rest of the
-/// run, while the program's file/HLS outputs keep producing (invariants #1/#10). A
-/// push that connected and then errored mid-stream is reported the same tolerant
-/// way.
+/// Drives [`PacketMuxSink::run_push_resilient`]: the sink thread drains its
+/// fan-out queue as fast as packets arrive and never blocks on the network — a
+/// listener waiting for a caller or a caller reconnecting drops (and counts)
+/// packets instead of filling the queue, so the consumer never marks this sink
+/// wedged (invariants #1/#10). Connect / listen / write failures are retried
+/// with back-off for the whole run; an SRT listener accepts multiple callers
+/// and re-listens after each disconnect. State is published through `link`.
 fn run_push_output(
     sink: &PacketMuxSink,
     label: &'static str,
     url: &str,
-    rx: Receiver<EncodedPacket>,
+    link: &Arc<multiview_output::push_link::PushLinkStatus>,
+    rx: Receiver<LeasedPacket>,
     video: multiview_output::MuxStream<'_>,
     (audio, tracks): (
         Option<&(StreamCodecParameters, Rational)>,
@@ -5845,26 +6968,21 @@ fn run_push_output(
 ) -> SinkRunOutcome {
     let mut source = StreamingPacketSource::new(rx);
     let audio_mux = audio.map(|(p, tb)| multiview_output::MuxStream::new(p, *tb));
-    match sink.run_av_tracks(&mut source, video, audio_mux, tracks) {
-        Ok(outcome) => {
-            let (packets, keyframes) = match &outcome {
-                PacketMuxOutcome::Single(s) => (s.packets, s.keyframes),
-                PacketMuxOutcome::Segment(s) => (s.stats.packets, s.stats.keyframes),
-            };
-            SinkRunOutcome {
-                line: format!("{label} push {url}: {packets} packet(s), {keyframes} keyframe(s)"),
-                playlist: None,
-                frames: source.delivered,
-            }
-        }
+    match sink.run_push_resilient(&mut source, video, audio_mux, tracks, link) {
+        Ok(report) => SinkRunOutcome {
+            line: format!(
+                "{label} push {url}: {} session(s), {} packet(s) received, {} dropped",
+                report.sessions, report.received, report.dropped
+            ),
+            playlist: None,
+            frames: source.delivered,
+        },
         Err(e) => {
-            // A push peer that is unreachable / drops must never fail the program.
             tracing::warn!(
                 transport = label,
                 url,
                 error = %e,
-                "live push could not be delivered (peer unreachable or dropped); \
-                 the program's other outputs are unaffected"
+                "live push ended with an error; the program's other outputs are unaffected"
             );
             SinkRunOutcome {
                 line: format!("{label} push {url}: not delivered ({e})"),
@@ -9244,6 +10362,24 @@ fn build_hls_output(
     })
 }
 
+/// A fresh link-status record for a push sink: listener mode is read from the
+/// sink's real (lowered) URL; only [`redact_target`](multiview_output::push_link::redact_target)'s
+/// credential-free form is stored, because the link is served to read-role users.
+fn push_link_for(
+    label: &'static str,
+    sink: &PacketMuxSink,
+    redacted: &str,
+) -> Arc<multiview_output::push_link::PushLinkStatus> {
+    let listener = sink
+        .push_target()
+        .is_some_and(|(url, _)| multiview_output::sink::is_srt_listener_url(url));
+    Arc::new(multiview_output::push_link::PushLinkStatus::new(
+        label,
+        listener,
+        multiview_output::push_link::redact_target(redacted),
+    ))
+}
+
 /// Build a live push sink ([`RunnableOutput::Push`]) for an RTMP/SRT output: the
 /// muxer targeting `url` over `protocol`, carrying the output's declarative
 /// metadata (ADR-0088), fed the SAME encode-once packets as every other transport
@@ -9255,9 +10391,11 @@ fn build_push_output(
     label: &'static str,
 ) -> RunnableOutput {
     let (meta, matrix) = output_mux_meta(output);
+    let sink = PacketMuxSink::push(protocol, url.to_owned()).with_output_metadata(meta, matrix);
     RunnableOutput::Push {
         id: output.id(),
-        sink: PacketMuxSink::push(protocol, url.to_owned()).with_output_metadata(meta, matrix),
+        link: push_link_for(label, &sink, url),
+        sink,
         label,
         url: url.to_owned(),
     }
@@ -9362,10 +10500,12 @@ fn build_outputs(
                 })?;
                 tracing::info!(transport = "srt", url = %redacted, "wiring srt push output");
                 let (meta, matrix) = output_mux_meta(output);
+                let sink = PacketMuxSink::push(PushProtocol::Srt, lowered)
+                    .with_output_metadata(meta, matrix);
                 runnable.push(RunnableOutput::Push {
                     id: output.id(),
-                    sink: PacketMuxSink::push(PushProtocol::Srt, lowered)
-                        .with_output_metadata(meta, matrix),
+                    link: push_link_for("srt", &sink, &redacted),
+                    sink,
                     label: "srt",
                     url: redacted,
                 });
@@ -9896,6 +11036,34 @@ struct DeclaredTrack {
     title: Option<String>,
 }
 
+/// The **real** authorization axes of one run's effective outputs (t65): the
+/// implicit program the legacy top-level block desugars to (ADR-0030 §6), plus
+/// every ingest source a cell actually binds. A `Source` axis exists only
+/// because the configuration names it on a cell — never invented, so a
+/// subscriber's per-object authorization cannot be widened by a guess.
+fn window_dependency_axes(
+    config: &MultiviewConfig,
+) -> Vec<crate::output_window_registry::Dependency> {
+    use crate::output_window_registry::{Dependency, DependencyKind};
+    let mut dependencies = vec![Dependency {
+        kind: DependencyKind::Program,
+        id: multiview_config::MAIN_PROGRAM.to_owned(),
+    }];
+    let mut seen = std::collections::HashSet::new();
+    for cell in &config.cells {
+        let Some(input_id) = cell.source.input_id.as_deref() else {
+            continue;
+        };
+        if seen.insert(input_id.to_owned()) {
+            dependencies.push(Dependency {
+                kind: DependencyKind::Source,
+                id: input_id.to_owned(),
+            });
+        }
+    }
+    dependencies
+}
+
 /// The document's declared discrete tracks, in route order (track index = the
 /// position here). Bounded to `u16` indices.
 fn declared_discrete_tracks(
@@ -10012,14 +11180,20 @@ fn hls_paths(path: &Path) -> (PathBuf, String, PathBuf) {
 /// muxer rescales them) — nothing re-stamps here (invariant #3 was applied at
 /// encode).
 struct StreamingPacketSource {
-    rx: Receiver<EncodedPacket>,
+    rx: Receiver<LeasedPacket>,
+    /// Keep the last batch lease until its packet write returns and the next pull starts.
+    current_permit: Option<Arc<multiview_output::batch::BatchLease>>,
     /// How many packets this source delivered (for the per-sink report count).
     delivered: usize,
 }
 
 impl StreamingPacketSource {
-    fn new(rx: Receiver<EncodedPacket>) -> Self {
-        Self { rx, delivered: 0 }
+    fn new(rx: Receiver<LeasedPacket>) -> Self {
+        Self {
+            rx,
+            current_permit: None,
+            delivered: 0,
+        }
     }
 }
 
@@ -10027,11 +11201,13 @@ impl PacketSource for StreamingPacketSource {
     fn next_packet(&mut self) -> multiview_output::Result<Option<EncodedPacket>> {
         // Block until the consumer fans the next coded packet, or the channel
         // closes (end-of-program). This is the sink's pull, off the hot path.
-        let Ok(packet) = self.rx.recv() else {
+        self.current_permit = None;
+        let Ok(leased) = self.rx.recv() else {
             return Ok(None);
         };
+        self.current_permit = Some(leased.permit);
         self.delivered = self.delivered.saturating_add(1);
-        Ok(Some(packet))
+        Ok(Some(leased.packet))
     }
 }
 
@@ -10041,7 +11217,7 @@ impl PacketSource for StreamingPacketSource {
 /// placeholder. The consumer calls this once per baked frame, before the single
 /// encode (invariant #7) — the bridge that used to run once *per sink* now runs
 /// once *per frame*.
-fn nv12_to_decoded(image: &Nv12Image) -> Result<DecodedVideoFrame, PipelineError> {
+pub(crate) fn nv12_to_decoded(image: &Nv12Image) -> Result<DecodedVideoFrame, PipelineError> {
     let frame = nv12_to_video(image)?;
     let meta = FrameMeta {
         pts: MediaTime::ZERO,
@@ -10294,7 +11470,7 @@ fn ingest_plan_for(
             return Err(PipelineError::Ingest {
                 id: source.id.clone(),
                 reason: "RIST ingest requires the `rist` feature (off by default)".to_owned(),
-            })
+            });
         }
         // A YouTube live source is a thin wrapper over HLS (ADR-0015): bound by its
         // watch URL, resolved to a fresh `*.googlevideo.com` HLS master on every
@@ -10325,7 +11501,7 @@ fn ingest_plan_for(
             return Err(PipelineError::Ingest {
                 id: source.id.clone(),
                 reason: "NDI ingest requires the `ndi` feature (off by default)".to_owned(),
-            })
+            });
         }
         // A WHIP ingest (`kind = "webrtc"`) source: Multiview is the server, so
         // there is nothing to dial — `live` so the drive loop runs forever
@@ -10341,7 +11517,7 @@ fn ingest_plan_for(
                 id: source.id.clone(),
                 reason: "WHIP ingest requires the `webrtc-native` feature (off by default)"
                     .to_owned(),
-            })
+            });
         }
         // `SourceKind` is `#[non_exhaustive]`; a future kind is unsupported here
         // until explicitly wired (never silently mishandled).
@@ -10349,7 +11525,7 @@ fn ingest_plan_for(
             return Err(PipelineError::Ingest {
                 id: source.id.clone(),
                 reason: "unsupported source kind for the CLI pipeline".to_owned(),
-            })
+            });
         }
     };
 
@@ -12463,21 +13639,21 @@ fn open_and_stream(
         // Unreachable: `ingest_loop` routes synthetic sources to the generator
         // before opening any media. Guarded so the match stays exhaustive.
         SourceLocation::Synthetic(_) => {
-            return Err("synthetic source has no media to open".to_owned())
+            return Err("synthetic source has no media to open".to_owned());
         }
         // Unreachable: `ingest_loop` routes NDI sources to `drive_ndi` (a
         // host-memory receive) before reaching `open_and_stream`. Guarded so the
         // match stays exhaustive.
         #[cfg(feature = "ndi")]
         SourceLocation::Ndi { .. } => {
-            return Err("ndi source has no libav media to open".to_owned())
+            return Err("ndi source has no libav media to open".to_owned());
         }
         // Unreachable: `ingest_loop` routes WHIP sources to `drive_webrtc` (str0m
         // surfaces RTP; the drive loop decodes per-packet) before reaching
         // `open_and_stream`. Guarded so the match stays exhaustive.
         #[cfg(feature = "webrtc-native")]
         SourceLocation::Webrtc { .. } => {
-            return Err("webrtc source has no libav media to open".to_owned())
+            return Err("webrtc source has no libav media to open".to_owned());
         }
     };
 
@@ -16652,8 +17828,10 @@ mod srt_wiring_tests {
             "oheadbw_pct": 25, "maxbw": 0, "conn_timeout_ms": 3000,
         }))
         .unwrap();
-        assert_eq!(srt_resolved_url(base, Some(&opts), false).unwrap(),
-            "srt://[::1]:9000?mode=listener&latency=200000&streamid=%23%21%3A%3Ar%3Dlive&oheadbw=25&maxbw=0&connect_timeout=3000&transtype=live");
+        assert_eq!(
+            srt_resolved_url(base, Some(&opts), false).unwrap(),
+            "srt://[::1]:9000?mode=listener&latency=200000&streamid=%23%21%3A%3Ar%3Dlive&oheadbw=25&maxbw=0&connect_timeout=3000&transtype=live"
+        );
     }
 
     #[test]
@@ -20010,6 +21188,906 @@ mod packet_reader_tests {
         assert!(
             wait_until(Duration::from_secs(2), || done.load(Ordering::SeqCst)),
             "reader thread (and the Input it owns) must be released"
+        );
+    }
+}
+
+#[cfg(all(test, feature = "ffmpeg"))]
+mod window_subscription_pipeline_tests {
+    #![allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::indexing_slicing
+    )]
+    use super::*;
+    use crate::output_window_registry::{SubscribeError, SubscriptionWindow};
+    use multiview_engine::{CooperativePacer, ManualTimeSource, StopSignal, TimeSource};
+
+    /// Three packet outputs over TWO opened video encoders: outputs A and B
+    /// share one rendition (same requested codec → same concrete encoder), C
+    /// opens its own. One `test` source is bound to the single cell, so the
+    /// effective bindings' authorization axes are checkable.
+    fn three_outputs_two_encodes() -> String {
+        r##"
+schema_version = 1
+
+[canvas]
+width = 64
+height = 64
+fps = "25/1"
+pixel_format = "nv12"
+background = "#101014"
+[canvas.color]
+profile = "sdr-bt709-limited"
+
+[layout]
+kind = "grid"
+columns = ["1fr"]
+rows = ["1fr"]
+areas = ["a"]
+
+[[sources]]
+id = "in_a"
+kind = "test"
+
+[[cells]]
+id = "cell_a"
+area = "a"
+[cells.source]
+input_id = "in_a"
+
+[[outputs]]
+kind = "hls"
+path = "/tmp/multiview-t65-a/index.m3u8"
+codec = "mpeg2video"
+segment_ms = 1000
+
+[[outputs]]
+kind = "hls"
+path = "/tmp/multiview-t65-b/index.m3u8"
+codec = "mpeg2video"
+segment_ms = 1000
+
+[[outputs]]
+kind = "hls"
+path = "/tmp/multiview-t65-c/index.m3u8"
+codec = "ffv1"
+segment_ms = 1000
+"##
+        .to_owned()
+    }
+
+    #[cfg(feature = "gpl-codecs")]
+    #[test]
+    fn actual_pipeline_optional_h264_shares_audio_and_preserves_production_ticks() {
+        optional_pipeline_case(Duration::ZERO, 1, "mpeg2video");
+    }
+
+    #[cfg(feature = "gpl-codecs")]
+    #[test]
+    fn actual_pipeline_slow_optional_startup_never_stalls_production() {
+        optional_pipeline_case(Duration::from_millis(500), 1, "mpeg2video");
+    }
+
+    #[cfg(feature = "gpl-codecs")]
+    #[test]
+    fn actual_pipeline_three_finite_optional_profiles() {
+        optional_pipeline_case(Duration::ZERO, 3, "mpeg2video");
+    }
+
+    #[cfg(feature = "gpl-codecs")]
+    #[test]
+    fn actual_pipeline_h264_production_with_optional_h264() {
+        optional_pipeline_case(Duration::ZERO, 1, "libx264");
+    }
+
+    #[cfg(feature = "gpl-codecs")]
+    #[test]
+    fn actual_pipeline_hevc_production_with_optional_h264() {
+        optional_pipeline_case(Duration::ZERO, 1, "libx265");
+    }
+
+    #[cfg(feature = "gpl-codecs")]
+    fn optional_preview_pipeline(
+        startup_delay: Duration,
+        profiles: usize,
+        production_codec: &str,
+    ) -> Pipeline {
+        use multiview_config::preview_ladder::{
+            PreviewKey, PreviewRequest, ProductionReservation, ResourceCost,
+        };
+        let config_text = three_outputs_two_encodes().replace(
+            "codec = \"mpeg2video\"",
+            &format!("codec = \"{production_codec}\""),
+        );
+        let config_text = config_text.replace("segment_ms = 1000", "segment_ms = 1000\n[outputs.audio]\nmode = \"tracks\"\ntracks = [\"main\", \"selected\"]") + "\n[audio]\nsample_rate_hz = 48000\n[[audio.routes]]\ninput_id = \"in_a\"\nchannels = { kind = \"stereo\" }\ntarget_track = \"selected\"\ninclude_in_program_bus = true\n";
+        let config = MultiviewConfig::load_from_toml(&config_text).unwrap();
+        let mut pipeline = Pipeline::build(&config).unwrap();
+        pipeline.enable_program_audio();
+        let key = PreviewKey {
+            program: "main".into(),
+            bus: "main".into(),
+            codec: "mpeg2video".into(),
+            encoder_name: "mpeg2video".into(),
+            width: 64,
+            height: 64,
+            cadence: Rational::new(25, 1),
+            bitrate_bps: 4_000_000,
+            codec_profile: None,
+            pixel_format: "nv12".into(),
+            color: "bt709-limited".into(),
+            gpu_pin: None,
+            codec_config: None,
+        };
+        let mut optional_key = key.clone();
+        optional_key.codec = "h264".into();
+        optional_key.encoder_name = "libx264".into();
+        optional_key.bitrate_bps = 100_000;
+        let cost = ResourceCost {
+            encoder_sessions: 1,
+            cpu_units: 1,
+            memory_bytes: 1_048_576,
+            ..ResourceCost::default()
+        };
+        // Measurements are supplied by this explicit software test admission,
+        // never a runtime default or a claim about a GPU's capacity.
+        let mut production = Vec::new();
+        for (i, codec) in ["mpeg2video", "mpeg2video", "ffv1"].iter().enumerate() {
+            let mut k = key.clone();
+            let codec = if *codec == "mpeg2video" {
+                production_codec
+            } else {
+                codec
+            };
+            k.codec = match codec {
+                "libx264" => "h264",
+                "libx265" => "hevc",
+                other => other,
+            }
+            .into();
+            k.encoder_name = codec.into();
+            production.push(ProductionReservation {
+                output_id: format!("test-sink-{i}"),
+                key: k,
+                cost,
+            });
+        }
+        let keys: Vec<_> = (0..profiles)
+            .map(|i| {
+                let mut key = optional_key.clone();
+                key.bitrate_bps += u64::try_from(i).unwrap() * 50_000;
+                key.width = 64 - u32::try_from(i).unwrap() * 16;
+                key.height = key.width;
+                key
+            })
+            .collect();
+        pipeline.set_optional_preview(crate::preview_vertical::PreviewStartup {
+            parent_output: "test-sink-0".into(),
+            production,
+            requests: keys
+                .iter()
+                .enumerate()
+                .map(|(i, key)| PreviewRequest {
+                    profile_id: format!("profile-{i}"),
+                    key: key.clone(),
+                })
+                .collect(),
+            capacity: Some(ResourceCost {
+                encoder_sessions: 6,
+                cpu_units: 6,
+                memory_bytes: 8_388_608,
+                uplink_bps: 20_000_000,
+                ..ResourceCost::default()
+            }),
+            measured: keys.into_iter().map(|key| (key, cost)).collect(),
+            audio_once_bps: 128_000,
+            overhead_bps: 100_000,
+            opened_parent: None,
+            startup_delay,
+        });
+        pipeline
+    }
+
+    #[cfg(feature = "gpl-codecs")]
+    type OptionalObservations =
+        Arc<std::sync::Mutex<(Vec<i64>, Vec<(i64, usize)>, Vec<(i64, usize)>, bool)>>;
+    #[cfg(feature = "gpl-codecs")]
+    fn optional_preview_runner(
+        slot: crate::output_window_registry::WindowSubscriptionSlot,
+        observed: OptionalObservations,
+        profiles: usize,
+        startup_delay: Duration,
+    ) -> TestSinkRunner {
+        let runner: TestSinkRunner = Box::new(move |rx| {
+            let factory = slot.load().unwrap();
+            let mut sub = None;
+            let mut stalled = None;
+            let mut frames = 0;
+            while let Ok(packet) = rx.recv() {
+                frames += 1;
+                let mut o = observed.lock().unwrap();
+                if packet.kind() == multiview_ffmpeg::StreamKind::Video {
+                    o.0.push(packet.pts().unwrap());
+                }
+                if packet.kind() == multiview_ffmpeg::StreamKind::AudioTrack(0) {
+                    o.1.push((
+                        packet.pts().unwrap(),
+                        packet.payload().unwrap().as_ptr().addr(),
+                    ));
+                }
+                if sub.is_none() {
+                    if let Some(binding) = factory
+                        .effective()
+                        .iter()
+                        .find(|b| b.output_id.starts_with("preview:"))
+                    {
+                        let ready = factory.effective();
+                        assert_eq!(
+                            ready
+                                .iter()
+                                .filter(|b| b.output_id.starts_with("preview:"))
+                                .count(),
+                            profiles
+                        );
+                        o.3 = !binding.audio.is_empty() && binding.video.codec.starts_with("avc1.");
+                        stalled = Some(
+                            factory
+                                .subscribe(
+                                    &multiview_control::WhepScope::Output(
+                                        binding.output_id.clone(),
+                                    ),
+                                    factory.generation(),
+                                )
+                                .unwrap(),
+                        );
+                        sub = Some(
+                            factory
+                                .subscribe(
+                                    &multiview_control::WhepScope::Output(
+                                        binding.output_id.clone(),
+                                    ),
+                                    factory.generation(),
+                                )
+                                .unwrap(),
+                        );
+                    }
+                }
+                if let Some(sub) = sub.as_ref() {
+                    while let Ok(Some(window)) = sub.try_recv_window() {
+                        for p in window.permit.packets() {
+                            if p.kind() == multiview_ffmpeg::StreamKind::AudioTrack(0) {
+                                o.2.push((p.pts().unwrap(), p.payload().unwrap().as_ptr().addr()));
+                            }
+                        }
+                    }
+                }
+            }
+            if startup_delay.is_zero() {
+                assert!(
+                    stalled.is_some(),
+                    "second optional peer stays stalled for the run"
+                );
+            }
+            TestSinkOutcome { frames }
+        });
+        runner
+    }
+
+    #[cfg(feature = "gpl-codecs")]
+    fn optional_pipeline_case(startup_delay: Duration, profiles: usize, production_codec: &str) {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let mut pipeline = optional_preview_pipeline(startup_delay, profiles, production_codec);
+            let slot = pipeline.window_subscriptions();
+            let observations = Arc::new(std::sync::Mutex::new((
+                Vec::<i64>::new(),
+                Vec::<(i64, usize)>::new(),
+                Vec::<(i64, usize)>::new(),
+                false,
+            )));
+            let observed = observations.clone();
+            let runner = optional_preview_runner(slot, observed, profiles, startup_delay);
+            let count = || -> TestSinkRunner {
+                Box::new(|rx| TestSinkOutcome {
+                    frames: rx.iter().count(),
+                })
+            };
+            let clock = Arc::new(ManualTimeSource::new());
+            let driver_stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            spawn_clock_driver(clock.clone(), driver_stop.clone());
+            let result = pipeline
+                .drive_streaming_for_test(
+                    StreamTestParams {
+                        time: clock,
+                        pacer: CooperativePacer,
+                        max_ticks: Some(40),
+                        policy: SendPolicy::BlockForExact,
+                        runners: vec![runner, count(), count()],
+                        hot_tick_observer: None,
+                        consumer_fault_after_ticks: None,
+                        shed_at_tick: None,
+                    },
+                    &StopSignal::new(),
+                )
+                .await
+                .unwrap();
+            driver_stop.store(true, Ordering::Release);
+            assert_eq!(result.report.frames, 40);
+            let o = observations.lock().unwrap();
+            assert_eq!(o.0, (0..40).collect::<Vec<_>>());
+            if !startup_delay.is_zero() {
+                // The fixed ingress bound retires a startup that cannot catch
+                // up; it never waits for native open or grows to hide the delay.
+                assert!(!o.3, "slow optional startup must remain unavailable");
+                return;
+            }
+            assert!(o.3, "actual opened optional metadata must be published");
+            assert!(
+                !o.2.is_empty(),
+                "actual optional whole AV windows must arrive"
+            );
+            assert!(
+                o.2.iter().any(|audio| o.1.contains(audio)),
+                "optional audio must share production payload references"
+            );
+        });
+    }
+
+    fn build_pipeline() -> Pipeline {
+        let config = MultiviewConfig::load_from_toml(&three_outputs_two_encodes())
+            .expect("parse t65 config");
+        config.validate().expect("t65 config validates");
+        let mut pipeline = Pipeline::build(&config).expect("build real pipeline");
+        // Exercise whole video + program-audio leases, using the binary's
+        // `--program-audio` path rather than a video-only fixture.
+        pipeline.enable_program_audio();
+        pipeline
+    }
+
+    /// Pace the manual clock at real time within the live admission envelope.
+    fn spawn_clock_driver(clock: Arc<ManualTimeSource>, stop: Arc<std::sync::atomic::AtomicBool>) {
+        std::thread::spawn(move || {
+            while !stop.load(Ordering::Acquire) {
+                std::thread::sleep(std::time::Duration::from_millis(40));
+                clock.advance(std::time::Duration::from_millis(40));
+            }
+        });
+    }
+
+    #[cfg(all(feature = "moq-output", feature = "gpl-codecs"))]
+    async fn pipeline_http_request(
+        address: std::net::SocketAddr,
+        method: &str,
+        path: &str,
+    ) -> (u16, serde_json::Value) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let mut socket = tokio::net::TcpStream::connect(address).await.unwrap();
+        socket.write_all(format!("{method} {path} HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer test.test-secret\r\nConnection: close\r\nContent-Length: 0\r\n\r\n").as_bytes()).await.unwrap();
+        let mut bytes = Vec::new();
+        socket.read_to_end(&mut bytes).await.unwrap();
+        let response = String::from_utf8(bytes).unwrap();
+        let (headers, body) = response.split_once("\r\n\r\n").unwrap();
+        let status = headers.split_whitespace().nth(1).unwrap().parse().unwrap();
+        (status, serde_json::from_str(body).unwrap())
+    }
+
+    #[cfg(all(feature = "moq-output", feature = "gpl-codecs"))]
+    async fn pipeline_http_authority(
+        factory: Arc<dyn multiview_control::moq_provider::AuthorizedFeedFactory>,
+    ) -> (
+        tokio::task::JoinHandle<Result<(), std::io::Error>>,
+        std::net::SocketAddr,
+    ) {
+        use multiview_control::{
+            auth::{ApiKeyStore, Principal, Role},
+            moq_provider::WebTransportProvider,
+        };
+        let dir = std::env::temp_dir().join(format!("moq-pipeline-http-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let cert = dir.join("cert.pem");
+        let key = dir.join("key.pem");
+        assert!(std::process::Command::new("openssl")
+            .args([
+                "req",
+                "-x509",
+                "-newkey",
+                "rsa:2048",
+                "-nodes",
+                "-days",
+                "1",
+                "-subj",
+                "/CN=localhost",
+                "-keyout"
+            ])
+            .arg(&key)
+            .arg("-out")
+            .arg(&cert)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .unwrap()
+            .success());
+        let transport = multiview_moq::provider::Runtime::listen_files(
+            "[::1]:0".parse().unwrap(),
+            "https://localhost".into(),
+            "moq-transport-16",
+            cert,
+            key,
+        )
+        .await
+        .unwrap();
+        let authority = Arc::new(multiview_control::moq::MoqRegistry::new(
+            Arc::new(WebTransportProvider::new(transport, factory.clone())),
+            Duration::from_secs(30),
+            4,
+        ));
+        let principal = Principal {
+            key_id: "test".into(),
+            role: Role::Admin,
+            scoped_object_ids: None,
+            scoped_output_ids: None,
+            scoped_discovery_domains: None,
+        };
+        let mut keys = ApiKeyStore::new(b"test-pepper".to_vec());
+        keys.register("test", "test-secret", principal);
+        let publisher = Arc::new(multiview_engine::EnginePublisher::<
+            multiview_control::EngineStateSnapshot,
+            multiview_events::Event,
+        >::new(8));
+        let (commands, _rx) = multiview_control::command_bus(8);
+        let state = multiview_control::AppState::new(
+            publisher,
+            commands,
+            Arc::new(multiview_control::InMemoryRepository::new()),
+            Arc::new(keys),
+        )
+        .with_moq(authority);
+        let socket = tokio::net::TcpListener::bind("[::1]:0").await.unwrap();
+        let address = socket.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            multiview_control::serve(socket, state, std::future::pending::<()>()).await
+        });
+        (server, address)
+    }
+
+    /// Actual opened libx264 output -> canonical run slot -> HTTP `MoQ` authority.
+    #[cfg(all(feature = "moq-output", feature = "gpl-codecs"))]
+    #[test]
+    fn actual_h264_pipeline_http_authority_fences_unused_ticket_after_run() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let config = MultiviewConfig::load_from_toml(
+                &three_outputs_two_encodes()
+                    .replace("mpeg2video", "h264")
+                    .replace("ffv1", "h264"),
+            )
+            .unwrap();
+            let mut pipeline = Pipeline::build(&config).unwrap();
+            let factory = pipeline.moq_feed_factory();
+            assert!(!factory.available());
+            let slot = pipeline.window_subscriptions();
+            let (server, address) = pipeline_http_authority(factory.clone()).await;
+            let runners = (0..3)
+                .map(|_| -> TestSinkRunner {
+                    Box::new(|rx: Receiver<EncodedPacket>| {
+                        let mut frames = 0;
+                        while rx.recv().is_ok() {
+                            frames += 1;
+                        }
+                        TestSinkOutcome { frames }
+                    })
+                })
+                .collect();
+            let driver = std::thread::spawn(move || {
+                let clock = Arc::new(ManualTimeSource::new());
+                let stop_driver = Arc::new(AtomicBool::new(false));
+                spawn_clock_driver(clock.clone(), stop_driver.clone());
+                let runner = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap();
+                let result = runner.block_on(pipeline.drive_streaming_for_test(
+                    StreamTestParams {
+                        time: clock,
+                        pacer: CooperativePacer,
+                        max_ticks: Some(50),
+                        policy: SendPolicy::BlockForExact,
+                        runners,
+                        hot_tick_observer: None,
+                        consumer_fault_after_ticks: None,
+                        shed_at_tick: None,
+                    },
+                    &StopSignal::new(),
+                ));
+                stop_driver.store(true, Ordering::Release);
+                result
+            });
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+            while !factory.available() {
+                assert!(
+                    !driver.is_finished(),
+                    "pipeline ended before availability: {:?}",
+                    driver.join().unwrap()
+                );
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "factory unavailable with opened descriptors: {:?}",
+                    slot.load().as_ref().map(|factory| factory.admitted())
+                );
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            let output = slot.load().unwrap().admitted()[0].output_id.clone();
+            let path = format!("/api/v1/preview/outputs/{output}/moq");
+            let (status, lease) = pipeline_http_request(address, "POST", &path).await;
+            assert_eq!(status, 201, "{lease}");
+            assert!(lease["url"].as_str().unwrap().contains("ticket="));
+            let id = lease["lease_id"].as_str().unwrap();
+            let generation = lease["generation"].as_u64().unwrap();
+            let (status, _) = pipeline_http_request(
+                address,
+                "DELETE",
+                &format!("{path}/{id}?generation={generation}"),
+            )
+            .await;
+            assert_eq!(status, 200);
+            assert!(driver.join().unwrap().is_ok());
+            assert!(!factory.available());
+            server.abort();
+        });
+    }
+
+    /// One subscribed window observed on the live pipeline, with the frame
+    /// held so its payload allocation stays alive while the pointer is used.
+    struct ObservedWindow {
+        output_id: String,
+        payload: usize,
+        window: SubscriptionWindow,
+    }
+    #[derive(Default)]
+    struct Observations {
+        windows: Vec<ObservedWindow>,
+        live_leases: usize,
+        received_while_physical_held: bool,
+        /// (`output_id`, `codec_id`, codec, width, height) per admitted binding.
+        descriptors: Vec<(String, String, String, u32, u32)>,
+        /// (`output_id`, dependency kind label, id) per admitted binding.
+        dependencies: Vec<(String, String, String)>,
+        generations: Vec<u64>,
+        /// The revoked binding reported a definite producer end.
+        revoked_ended: bool,
+        /// The revoked binding's subscription rejected further windows.
+        revoked_then_delivered: bool,
+        /// Bindings whose opened encoder proves no PTS-only mapping: typed refusal.
+        refused: Vec<String>,
+    }
+
+    fn assert_subscription_observations(observed: &Observations) {
+        assert!(
+            !observed.windows.is_empty(),
+            "the live pipeline must deliver subscribed windows"
+        );
+        // Every delivered window is a WHOLE admitted lease (its packets are
+        // still retained) at the binding's effective generation.
+        for delivered in &observed.windows {
+            assert!(!delivered.window.permit.packets().is_empty());
+            assert!(delivered.window.config_generation > 0);
+            // Shutdown revokes the run; retained leases must fail closed.
+            assert!(!delivered.window.permit.is_current());
+        }
+        assert!(
+            observed.live_leases >= 3,
+            "whole leases are current during the live run"
+        );
+        assert!(
+            observed.received_while_physical_held,
+            "subscriber is independent of a slow physical peer"
+        );
+        assert_eq!(observed.generations.len(), 3);
+        assert!(
+            observed
+                .generations
+                .iter()
+                .all(|generation| *generation > 0),
+            "every admitted binding carries its effective generation"
+        );
+        for (output_id, codec_id, codec, width, height) in &observed.descriptors {
+            assert_ne!(output_id, "");
+            assert!(
+                !codec_id.is_empty(),
+                "opened codec identity must be present"
+            );
+            assert_ne!(codec, "");
+            assert!(*width > 0 && *height > 0);
+        }
+        // Three outputs over TWO opened encoders: outputs A and B share the
+        // mpeg2video rendition, C opens its own ffv1 encoder. Exactly two coded
+        // payload allocations may reach the subscriber (invariant #7 — no
+        // per-output, per-viewer or per-transport re-encode).
+        let mut payloads = std::collections::BTreeMap::new();
+        for window in &observed.windows {
+            payloads
+                .entry(window.output_id.clone())
+                .or_insert(window.payload);
+        }
+        assert_eq!(payloads.len(), 3, "all three outputs delivered");
+        let distinct: std::collections::BTreeSet<usize> = payloads.values().copied().collect();
+        assert_eq!(
+            distinct.len(),
+            2,
+            "three outputs must share TWO encode allocations, got {distinct:?}"
+        );
+        // The real authorization axes: the implicit program, this binding's
+        // output, and the source the cell actually binds.
+        let axes: std::collections::BTreeSet<(String, String)> = observed
+            .dependencies
+            .iter()
+            .map(|(_, kind, id)| (kind.clone(), id.clone()))
+            .collect();
+        assert!(axes.contains(&("program".to_owned(), "main".to_owned())));
+        assert!(axes.contains(&("source".to_owned(), "in_a".to_owned())));
+        for output_id in payloads.keys() {
+            assert!(axes.contains(&("output".to_owned(), output_id.clone())));
+        }
+        // The revoked subscription ended and never received again, while the
+        // surviving subscriptions kept delivering.
+        assert!(
+            observed.revoked_ended,
+            "the revoked subscription sees a definite end"
+        );
+        assert!(!observed.revoked_then_delivered);
+    }
+
+    fn observed_subscriptions(
+        factory: &crate::output_window_registry::SubscriptionFactory,
+        subscriber_observed: &Arc<std::sync::Mutex<Observations>>,
+    ) -> Vec<(String, crate::output_window_registry::Subscription)> {
+        let generation = factory.generation();
+        let admitted = factory.admitted();
+        let mut subs = Vec::new();
+        {
+            let mut observed = subscriber_observed.lock().expect("observed");
+            for binding in admitted.iter() {
+                let scope = multiview_control::WhepScope::Output(binding.output_id.clone());
+                let sub = match factory.subscribe(&scope, generation) {
+                    Ok(sub) => sub,
+                    Err(error) => {
+                        observed
+                            .refused
+                            .push(format!("{}:{error:?}", binding.output_id));
+                        continue;
+                    }
+                };
+                assert_eq!(binding.video.cadence, Rational::new(25, 1));
+                assert!(binding.video.bitrate_bps.is_none_or(|rate| rate > 0));
+                observed.descriptors.push((
+                    binding.output_id.clone(),
+                    binding.video.codec_id.clone(),
+                    binding.video.codec.clone(),
+                    binding.video.coded_width,
+                    binding.video.coded_height,
+                ));
+                for dependency in &binding.dependencies {
+                    let kind = match dependency.kind {
+                        crate::output_window_registry::DependencyKind::Source => "source",
+                        crate::output_window_registry::DependencyKind::Output => "output",
+                        crate::output_window_registry::DependencyKind::Program => "program",
+                        crate::output_window_registry::DependencyKind::MixEffect => "mix",
+                    };
+                    observed.dependencies.push((
+                        binding.output_id.clone(),
+                        kind.to_owned(),
+                        dependency.id.clone(),
+                    ));
+                }
+                observed.generations.push(binding.config_generation);
+                subs.push((binding.output_id.clone(), sub));
+            }
+        }
+        subs
+    }
+
+    fn subscription_test_runner(
+        subscriber_slot: crate::output_window_registry::WindowSubscriptionSlot,
+        subscriber_observed: Arc<std::sync::Mutex<Observations>>,
+        physical_released: Arc<std::sync::atomic::AtomicBool>,
+    ) -> TestSinkRunner {
+        let subscriber: TestSinkRunner = Box::new(move |rx: Receiver<EncodedPacket>| {
+            let factory = subscriber_slot
+                .load()
+                .expect("the run publishes its factory before any sink thread starts");
+            let subs = observed_subscriptions(&factory, &subscriber_observed);
+            let mut revoked: Option<String> = None;
+            let mut frames = 0usize;
+            while let Ok(_packet) = rx.recv() {
+                frames += 1;
+                let mut observed = subscriber_observed.lock().expect("observed");
+                for (id, sub) in &subs {
+                    loop {
+                        match sub.try_recv_window() {
+                            Ok(Some(window)) => {
+                                if window.permit.is_current() {
+                                    observed.live_leases += 1;
+                                }
+                                if !physical_released.load(Ordering::Acquire) {
+                                    observed.received_while_physical_held = true;
+                                }
+                                if revoked.as_deref() == Some(id.as_str()) {
+                                    observed.revoked_then_delivered = true;
+                                }
+                                observed.windows.push(ObservedWindow {
+                                    output_id: sub.output_id().to_owned(),
+                                    payload: window.permit.packets()[0]
+                                        .payload()
+                                        .expect("coded payload")
+                                        .as_ptr()
+                                        .addr(),
+                                    window,
+                                });
+                            }
+                            Err(SubscribeError::ProducerEnded) => {
+                                if revoked.as_deref() == Some(id.as_str()) {
+                                    observed.revoked_ended = true;
+                                }
+                                break;
+                            }
+                            Ok(None) | Err(_) => break,
+                        }
+                    }
+                }
+                // Once windows are flowing, revoke the last binding's
+                // subscription mid-run: the producer must keep ticking and the
+                // survivors must keep receiving (invariants #1/#10).
+                if revoked.is_none() && observed.windows.len() >= 3 {
+                    if let Some((_, last)) = subs.last() {
+                        last.revoke();
+                        revoked = Some(last.output_id().to_owned());
+                    }
+                }
+                drop(observed);
+            }
+            // Final drain after end-of-program.
+            let mut observed = subscriber_observed.lock().expect("observed");
+            for (id, sub) in &subs {
+                while let Ok(Some(window)) = sub.try_recv_window() {
+                    observed.windows.push(ObservedWindow {
+                        output_id: id.clone(),
+                        payload: window.permit.packets()[0]
+                            .payload()
+                            .expect("coded payload")
+                            .as_ptr()
+                            .addr(),
+                        window,
+                    });
+                }
+                if revoked.as_deref() == Some(id.as_str())
+                    && matches!(sub.try_recv_window(), Err(SubscribeError::ProducerEnded))
+                {
+                    observed.revoked_ended = true;
+                }
+            }
+            drop(observed);
+            // Keep the subscriptions alive until the physical fan-out ends.
+            drop(subs);
+            TestSinkOutcome { frames }
+        });
+        subscriber
+    }
+
+    /// The acceptance bar: a REAL subscriber attached through the run's own
+    /// rendezvous receives whole admitted leases from the live pipeline, with
+    /// the opened codec identity and the run's authorization axes — while a
+    /// slow physical sink remains held for the first ten output ticks.
+    #[test]
+    fn actual_pipeline_delivers_subscribed_windows_with_codec_and_auth_metadata() {
+        const TICKS: u64 = 25;
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("tokio runtime");
+        runtime.block_on(async {
+            let mut pipeline = build_pipeline();
+            let slot = pipeline.window_subscriptions();
+            let observations = Arc::new(std::sync::Mutex::new(Observations::default()));
+
+            // Hold a physical peer while the independent subscriber receives.
+            let physical_released = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let release = Arc::clone(&physical_released);
+            let physical: TestSinkRunner = Box::new(move |rx: Receiver<EncodedPacket>| {
+                std::thread::sleep(std::time::Duration::from_millis(400));
+                release.store(true, Ordering::Release);
+                let mut frames = 0usize;
+                while rx.recv().is_ok() {
+                    frames += 1;
+                }
+                TestSinkOutcome { frames }
+            });
+            // Sink 1: the MoQ/WHEP subscriber. It attaches through the published
+            // factory, drains whole windows for every admitted binding, revokes
+            // one subscription mid-run, and keeps consuming its own physical
+            // fan-out so this binding itself stays healthy.
+            let subscriber_slot = Arc::clone(&slot);
+            let subscriber_observed = Arc::clone(&observations);
+            let subscriber =
+                subscription_test_runner(subscriber_slot, subscriber_observed, physical_released);
+            let counting: TestSinkRunner = Box::new(|rx: Receiver<EncodedPacket>| {
+                let mut frames = 0usize;
+                while rx.recv().is_ok() {
+                    frames += 1;
+                }
+                TestSinkOutcome { frames }
+            });
+
+            let clock = Arc::new(ManualTimeSource::new());
+            let driver_stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            spawn_clock_driver(Arc::clone(&clock), Arc::clone(&driver_stop));
+            let ts: Arc<dyn TimeSource> = clock.clone();
+            let stop = StopSignal::new();
+            let result = pipeline
+                .drive_streaming_for_test(
+                    StreamTestParams {
+                        time: ts,
+                        pacer: CooperativePacer,
+                        max_ticks: Some(TICKS),
+                        policy: SendPolicy::BlockForExact,
+                        runners: vec![physical, subscriber, counting],
+                        hot_tick_observer: None,
+                        consumer_fault_after_ticks: None,
+                        shed_at_tick: None,
+                    },
+                    &stop,
+                )
+                .await
+                .expect("drive streaming");
+            driver_stop.store(true, Ordering::Release);
+
+            // The engine emitted every tick: a revoked subscription never blocked
+            // the producer (invariant #1).
+            assert_eq!(result.report.frames, TICKS);
+
+            let observed = match Arc::try_unwrap(observations) {
+                Ok(cell) => cell.into_inner().expect("observations"),
+                Err(error) => panic!(
+                    "no outstanding observation handle after the run: {}",
+                    Arc::strong_count(&error)
+                ),
+            };
+            assert_subscription_observations(&observed);
+        });
+    }
+
+    /// The registry indexes the FINAL runner order: the synthetic `program.ts`
+    /// anchor is internal (never subscribable) and every configured output keeps
+    /// its own id at its final index.
+    #[test]
+    fn build_sink_runners_marks_the_program_ts_anchor_internal_in_final_order() {
+        let mut pipeline = build_pipeline();
+        let (runners, ids) = pipeline.build_sink_runners(false);
+        assert_eq!(runners.len(), ids.len());
+        assert_eq!(
+            ids.len(),
+            4,
+            "three configured outputs + the program.ts anchor"
+        );
+        assert_eq!(ids[0], None, "the synthetic anchor is internal");
+        let configured: Vec<String> = ids[1..]
+            .iter()
+            .map(|id| id.clone().expect("configured output id"))
+            .collect();
+        assert_eq!(configured.len(), 3);
+        assert!(configured.iter().all(|id| !id.is_empty()));
+        assert_eq!(
+            configured
+                .iter()
+                .collect::<std::collections::BTreeSet<_>>()
+                .len(),
+            3
         );
     }
 }

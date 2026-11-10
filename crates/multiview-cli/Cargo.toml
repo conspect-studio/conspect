@@ -54,6 +54,9 @@ wgpu = { version = "30", default-features = false, features = [
   "std",
 ], optional = true }
 multiview-ffmpeg = { workspace = true }
+multiview-moq = { path = "../multiview-moq", optional = true }
+bytes = { version = "1", optional = true }
+hang = { version = "=0.21.22", optional = true }
 multiview-input = { workspace = true }
 multiview-output = { workspace = true }
 multiview-audio = { workspace = true }
@@ -267,6 +270,8 @@ required-features = ["webrtc-native"]
 # the vendor toolchains/SDKs installed); they exist so a release build can opt
 # in with one flag.
 [features]
+# Real existing-output conversion only; never opens a viewer encoder.
+moq-output = ["ffmpeg", "dep:multiview-moq", "dep:bytes", "dep:hang", "dep:url", "dep:rustix", "multiview-control/moq-transport"]
 default = ["software"]
 
 # Software-only reference path (always available).
@@ -463,6 +468,12 @@ ffmpeg = [
     "multiview-output/ffmpeg",
     "multiview-audio/ffmpeg",
 ]
+
+# Opt-in dual-stack SRT listener output: enable the actual runtime-loaded
+# libsrt backend, not only the CLI test cfg. Implies the CLI's libav pipeline;
+# plain ffmpeg and all existing presets remain unchanged and LGPL-clean.
+# The output crate owns the native leaf; this curated CLI has no direct SRT FFI.
+srt-libsrt = ["ffmpeg", "multiview-output/srt-libsrt"]
 
 # RIST (Reliable Internet Stream Transport, VSF TR-06) ingest + egress
 # (ADR-0095 Tier-0): wire a `rist` source through the libav `rist://` demuxer and
