@@ -53,6 +53,8 @@ pub(crate) async fn capabilities(
             (status = 403, description = "Not authorized.", body = crate::problem::Problem),
             (status = 404, description = "Unknown target player.", body = crate::problem::Problem),
             (status = 409, description = "Key reused with a different body.", body = crate::problem::Problem),
+            (status = 401, description = "Missing or invalid credentials.", body = crate::problem::Problem),
+            (status = 503, description = "Capture unavailable or queue full.", body = crate::problem::Problem),
         ),
     )
 )]
@@ -99,7 +101,7 @@ pub(crate) async fn create(
         tag = "media-captures",
         params(("id" = u64, Path, description = "Capture job id.")),
         responses(
-            (status = 200, description = "Job status."),
+            (status = 200, description = "Job status.", body = crate::web_capture::JobView),
             (status = 404, description = "Unknown or not owned.", body = crate::problem::Problem),
         ),
     )
