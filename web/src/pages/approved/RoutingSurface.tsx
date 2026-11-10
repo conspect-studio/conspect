@@ -20,6 +20,8 @@ export function RoutingFrame({
 export interface PgmReadout {
   /** Authoritative program source id, or undefined when unreadable. */
   readonly programSource: string | undefined;
+  /** Friendly name of the program source when the source list carries one. */
+  readonly programName?: string | undefined;
   readonly loading: boolean;
 }
 
@@ -36,9 +38,17 @@ export function RouteTruthStrip({
           <Trans>On PGM out now</Trans>
         </span>
         <b>
-          {pgm.programSource ??
+          {pgm.programName ??
+            pgm.programSource ??
             (pgm.loading ? <Trans>Reading…</Trans> : <Trans>Unknown</Trans>)}
         </b>
+        {pgm.programSource !== undefined &&
+        pgm.programName !== undefined &&
+        pgm.programName !== pgm.programSource ? (
+          <span className="rp-cur" data-testid="pgm-readout-id">
+            {pgm.programSource}
+          </span>
+        ) : null}
       </div>
       <span className="pending-summary" data-testid="pending-summary">
         <Trans>

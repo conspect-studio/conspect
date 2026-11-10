@@ -331,7 +331,12 @@ export function RoutingPage(): JSX.Element {
     <RoutingFrame>
       <RoutingHead />
 
-      <RouteTruthStrip pgm={{ programSource, loading: switcher.isPending }} />
+      <RouteTruthStrip pgm={{
+          programSource,
+          programName: (sources.data ?? []).find((x) => x.id === programSource)
+            ?.name,
+          loading: switcher.isPending,
+        }} />
       <RouteGrid
         patch={
           <>

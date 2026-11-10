@@ -39,6 +39,13 @@ afterAll(() => {
 });
 
 describe('RoutingSurface', () => {
+  it('shows the friendly source name with the raw id secondary, never the id alone when a name exists', () => {
+    renderWithProviders(<RouteTruthStrip pgm={{ programSource: 's0', programName: 'CAM 1', loading: false }} />);
+    const readout = screen.getByTestId('pgm-readout');
+    expect(within(readout).getByText('CAM 1')).toBeInTheDocument();
+    expect(within(readout).getByTestId('pgm-readout-id')).toHaveTextContent('s0');
+  });
+
   it('reads PGM only from the switcher and never fabricates restart state', () => {
     renderWithProviders(<RouteTruthStrip pgm={{ programSource: undefined, loading: false }} />);
     expect(within(screen.getByTestId('pgm-readout')).getByText('Unknown')).toBeInTheDocument();

@@ -202,3 +202,61 @@
 
 /* toolbar: borderless, right-aligned on desktop */
 [data-approved-page="audio"] [data-testid="audio-toolbar"] { border-color: var(--line); background: var(--bg-0); }
+
+/* Round 2: nudge side-stack (4×48px) beside the fader, like the reference. */
+[data-approved-page="audio"] .audio-nudge-col { display: grid; gap: 4px; width: 52px; flex: none; align-content: end; }
+[data-approved-page="audio"] .audio-nudge-btn {
+  height: var(--tap); min-height: var(--tap); width: 52px; min-width: 48px; padding: 0;
+  background: var(--bg-3); border: 1px solid var(--line-2); border-radius: var(--r-sm);
+  color: var(--text-1); font-size: 12px; font-weight: 700;
+}
+[data-approved-page="audio"] .audio-nudge-btn:disabled { opacity: .4; }
+[data-approved-page="audio"] [data-testid="audio-strip"] [data-testid="audio-strip-essential"] > div:first-child { gap: 6px; }
+[data-approved-page="audio"] .strip-bank { grid-auto-columns: minmax(176px, 1fr); }
+[data-approved-page="audio"] [data-testid="audio-strip"] input[type="range"] { width: 240px; }
+
+/* PGM / MUTE: exact token fills; pressed state never brighter than the token. */
+[data-approved-page="audio"] [data-testid="audio-mute"],
+[data-approved-page="audio"] [data-testid="audio-pgm"] { height: var(--tap); min-height: var(--tap); min-width: var(--tap); }
+[data-approved-page="audio"] [data-testid="audio-pgm"][aria-pressed="true"] {
+  background: var(--green); border-color: var(--green); color: var(--green-ink);
+}
+
+/* Channel details: a quiet inline row, not a bordered 48px+ card in each strip. */
+[data-approved-page="audio"] .audio-details-compact { border: 0; padding: 0; background: transparent; }
+[data-approved-page="audio"] .audio-details-compact > summary {
+  min-height: var(--tap); padding: 0 8px; border-radius: var(--r-sm); justify-content: center;
+  font-size: 12px; font-weight: 700; color: var(--text-2); border: 1px solid var(--line);
+}
+[data-approved-page="audio"] .audio-details-compact > summary:hover { background: var(--bg-2); color: var(--text-1); }
+[data-approved-page="audio"] .audio-details-compact[open] { margin: 0 -6px; padding: 0 6px 6px; }
+[data-approved-page="audio"] .audio-details-compact input,
+[data-approved-page="audio"] .audio-details-compact [role="combobox"] { min-height: var(--tap); }
+
+/* Single approved toolbar: one slim right-aligned row, muted tokens. */
+[data-approved-page="audio"] [data-testid="audio-toolbar"] {
+  position: static; border: 0; padding: 0; margin-bottom: 4px; background: transparent;
+  justify-content: flex-end;
+}
+[data-approved-page="audio"] [data-testid="audio-add-route"] {
+  background: var(--bg-2); border: 1px solid var(--line-2); color: var(--text-1); border-radius: var(--r-md); font-weight: 700;
+}
+[data-approved-page="audio"] [data-testid="audio-save"] {
+  background: var(--blue); border: 1px solid transparent; color: #0b1220; border-radius: var(--r-md); font-weight: 800;
+}
+[data-approved-page="audio"] [data-testid="audio-save"]:disabled { opacity: .45; }
+[data-approved-page="audio"] [data-testid="audio-toolbar"] [role="status"] { flex: 1 1 100%; text-align: right; }
+
+/* Tablet/phone: program loudness lives in the PROGRAM summary only (no dual readouts). */
+@media (max-width: 1279px) {
+  [data-approved-page="audio"] .audio-meta { display: none; }
+}
+[data-approved-page="audio"] .phone-master .lbl { margin-right: 4px; }
+
+/* 48px: links in page chrome + all text/number inputs on this page. */
+[data-approved-page="audio"] a[href] { display: inline-flex; align-items: center; min-height: var(--tap); }
+[data-approved-page="audio"] input:not([type="range"]):not([type="checkbox"]) { min-height: var(--tap); }
+[data-approved-page="audio"] [data-testid="audio-strip-name"],[data-approved-page="audio"] [data-testid="audio-strip-readout"] { overflow-wrap: anywhere; }
+[data-approved-page="audio"] .mo-row,[data-approved-page="audio"] [data-testid="audio-overview-row"],[data-approved-page="audio"] [data-testid="audio-overview-program"] { min-height: var(--tap); }
+[data-approved-page="audio"] a[href] { min-width: var(--tap); justify-content: center; }
+[data-approved-page="audio"] .strip-bank [data-testid="audio-strip"] { padding: 10px 4px; }
