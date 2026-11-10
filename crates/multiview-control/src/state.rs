@@ -1860,6 +1860,15 @@ impl AppState {
     }
 }
 
+impl AppState {
+    /// Attach a real capture service created by the binary management startup.
+    #[must_use]
+    pub fn with_web_capture(mut self, provider: crate::web_capture::Provider) -> Self {
+        self.web_capture = provider;
+        self
+    }
+}
+
 #[cfg(test)]
 mod seed_tests {
     #![allow(
@@ -2088,14 +2097,5 @@ areas = ["a"]
             2,
             "both authored cells mirrored into the layout"
         );
-    }
-}
-
-impl AppState {
-    /// Attach a real capture service created by the binary management startup.
-    #[must_use]
-    pub fn with_web_capture(mut self, provider: crate::web_capture::Provider) -> Self {
-        self.web_capture = provider;
-        self
     }
 }
