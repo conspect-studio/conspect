@@ -148,9 +148,8 @@ impl Ledger {
         if std::fs::symlink_metadata(path).is_ok() {
             drop(open_private(path)?); // validates regular file
             for line in io::BufReader::new(File::open(path)?).lines() {
-                let Ok(r) = serde_json::from_str::<Rec>(&line?) else {
-                    continue;
-                };
+                let r: Rec = serde_json::from_str(&line?)
+                    .map_err(|_| io::Error::other("capture idempotency journal is corrupt"))?;
                 let id = (r.actor.clone(), r.op.clone(), r.key.clone());
                 if map.insert(id.clone(), r).is_none() {
                     order.push_back(id);
