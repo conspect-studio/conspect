@@ -5463,9 +5463,9 @@ mod switcher_shed_audio_tests {
     fn switcher_shed_gap_keeps_pre_cut_tone_and_stale_item_cannot_change_gain() {
         let format = AudioFormat::new(48_000, ChannelLayout::Stereo);
         let tone = |hz: f32| -> Vec<f32> {
-            (0..24_000)
+            (0..24_000_u16)
                 .flat_map(|n| {
-                    let sample = 0.2 * (std::f32::consts::TAU * hz * n as f32 / 48_000.0).sin();
+                    let sample = 0.2 * (std::f32::consts::TAU * hz * f32::from(n) / 48_000.0).sin();
                     [sample, sample]
                 })
                 .collect()

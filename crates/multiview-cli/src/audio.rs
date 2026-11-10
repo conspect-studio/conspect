@@ -731,9 +731,9 @@ mod route_seam_tests {
         let a = Arc::new(AudioStore::timeline(format, 16_000));
         let b = Arc::new(AudioStore::timeline(format, 16_000));
         let tone = |hz: f32| -> Vec<f32> {
-            (0..12_000)
+            (0..12_000_u16)
                 .flat_map(|n| {
-                    let sample = 0.2 * (std::f32::consts::TAU * hz * n as f32 / 48_000.0).sin();
+                    let sample = 0.2 * (std::f32::consts::TAU * hz * f32::from(n) / 48_000.0).sin();
                     [sample, sample]
                 })
                 .collect()
