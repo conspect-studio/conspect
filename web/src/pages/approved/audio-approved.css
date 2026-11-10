@@ -143,27 +143,23 @@
   background: linear-gradient(180deg, rgba(106,166,255,.35), rgba(106,166,255,.08));
   border-radius: var(--r-sm) var(--r-sm) 0 0;
 }
-[data-approved-page="audio"] [data-testid="audio-fader"] {
-  -webkit-appearance: none; appearance: none; background: transparent;
+/* Custom pointer-event fader (Fader.tsx): the whole 56 px-wide track is the
+   grab area, touch-action:none (also inline) so a drag never scrolls the page. */
+[data-approved-page="audio"] .audio-fader-hit {
+  position: absolute; inset: 0; touch-action: none; cursor: pointer;
+  user-select: none; -webkit-user-select: none; -webkit-touch-callout: none;
+  -webkit-tap-highlight-color: transparent;
 }
-[data-approved-page="audio"] [data-testid="audio-fader"]::-webkit-slider-runnable-track { background: transparent; height: 48px; }
-[data-approved-page="audio"] [data-testid="audio-fader"]::-moz-range-track { background: transparent; height: 48px; }
-[data-approved-page="audio"] [data-testid="audio-fader"]::-webkit-slider-thumb {
-  -webkit-appearance: none; appearance: none; width: 48px; height: 48px; border-radius: 6px;
+[data-approved-page="audio"] .audio-fader-knob {
+  position: absolute; left: 4px; right: 4px; height: 48px; pointer-events: none;
+  border-radius: 6px; box-sizing: border-box;
   background: linear-gradient(180deg, #4b5563, #2b323d); border: 1px solid var(--line-2);
-  box-shadow: 0 4px 10px rgba(0,0,0,.5); box-sizing: border-box;
+  box-shadow: 0 4px 10px rgba(0,0,0,.5);
 }
-[data-approved-page="audio"] [data-testid="audio-fader"]::-moz-range-thumb {
-  width: 48px; height: 48px; border-radius: 6px; box-sizing: border-box;
-  background: linear-gradient(180deg, #4b5563, #2b323d); border: 1px solid var(--line-2);
-}
-[data-approved-page="audio"] [data-testid="audio-fader"][data-staged="true"]::-webkit-slider-thumb {
+[data-approved-page="audio"] .audio-fader-hit[data-staged="true"] .audio-fader-knob {
   border-color: var(--amber); box-shadow: 0 0 0 2px rgba(232,163,61,.35);
 }
-[data-approved-page="audio"] [data-testid="audio-fader"][data-staged="true"]::-moz-range-thumb {
-  border-color: var(--amber); box-shadow: 0 0 0 2px rgba(232,163,61,.35);
-}
-[data-approved-page="audio"] [data-testid="audio-fader"]:focus-visible { outline: 2px solid var(--blue); outline-offset: 2px; }
+[data-approved-page="audio"] .audio-fader-hit:focus-visible { outline: 2px solid var(--blue); outline-offset: 2px; }
 
 /* compact overview rows (approved mo-row) */
 [data-approved-page="audio"] [data-testid="audio-mix-overview"] ul { display: grid; gap: 4px; list-style: none; margin: 8px 0 0; padding: 0; }
