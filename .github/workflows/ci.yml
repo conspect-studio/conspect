@@ -537,16 +537,6 @@ jobs:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-      - name: Install native GPL test toolchain and runtime dependencies
-        # Explicit opt-in job only. Defaults and the LGPL test image stay unchanged.
-        # Development packages select this runner's codec runtimes; ldd below
-        # rejects any mismatch with the pinned image instead of guessing a soname.
-        run: |
-          set -euo pipefail
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            pkg-config clang libclang-dev nasm libva2 libva-drm2 libopus0 \
-            libsrt1.5-openssl libvpl2 libx264-dev libx265-dev
       - name: Extract the published pinned GPL FFmpeg image
         run: |
           set -euo pipefail
@@ -556,21 +546,42 @@ jobs:
           trap 'docker rm "${cid}" >/dev/null' EXIT
           sudo mkdir -p "$(dirname "${FFMPEG_PREFIX}")"
           sudo docker cp "${cid}:${FFMPEG_PREFIX}" "${FFMPEG_PREFIX}"
-          version="$(PKG_CONFIG_PATH="${FFMPEG_PREFIX}/lib/pkgconfig" pkg-config --modversion libavcodec)"
-          case "${version}" in 62.*) ;; *) echo "::error::Expected pinned libavcodec 62.x"; exit 1 ;; esac
-          if LD_LIBRARY_PATH="${FFMPEG_PREFIX}/lib" ldd "${FFMPEG_PREFIX}/lib/libavcodec.so" | grep 'not found'; then
-            echo "::error::Pinned GPL image runtime dependency mismatch"
-            exit 1
-          fi
-          echo "PKG_CONFIG_PATH=${FFMPEG_PREFIX}/lib/pkgconfig" >> "$GITHUB_ENV"
-          echo "LD_LIBRARY_PATH=${FFMPEG_PREFIX}/lib" >> "$GITHUB_ENV"
-      - name: Run the actual native encoder metadata test (exactly one)
+      - name: Run actual encoder metadata in the matching Trixie runtime
+        # The GPL prefix is built on Debian Trixie, not the Ubuntu runner ABI.
+        # Use the same pinned Debian base as deploy/Dockerfile.ffmpeg. Mount the
+        # selected Rust toolchain and cache, but resolve native libraries here.
         run: |
           set -euo pipefail
+          docker run --rm -i \
+            -v "$PWD:$PWD" -w "$PWD" \
+            -v "$HOME/.cargo:/cargo" -v "$HOME/.rustup:/rustup:ro" \
+            -v "${FFMPEG_PREFIX}:${FFMPEG_PREFIX}:ro" \
+            -e CARGO_HOME=/cargo -e RUSTUP_HOME=/rustup \
+            -e PATH=/cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
+            -e FFMPEG_PREFIX="${FFMPEG_PREFIX}" \
+            debian:trixie@sha256:9c6e381421d0f48d1b8133e573f33c185ee16cbf505eda9c4a8a4791b25ea8a6 \
+            bash -s <<'TRIXIE'
+          set -euo pipefail
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            ca-certificates build-essential pkg-config clang libclang-dev nasm \
+            libva2 libva-drm2 libopus0 libsrt1.5-openssl libvpl2 libx264-dev libx265-dev
+          export PKG_CONFIG_PATH="${FFMPEG_PREFIX}/lib/pkgconfig"
+          export LD_LIBRARY_PATH="${FFMPEG_PREFIX}/lib"
+          version="$(pkg-config --modversion libavcodec)"
+          case "${version}" in 62.*) ;; *) echo "::error::Expected pinned libavcodec 62.x"; exit 1 ;; esac
+          for library in "${FFMPEG_PREFIX}"/lib/lib*.so; do
+            dependencies="$(ldd "${library}")" || { echo "::error::ldd failed"; exit 1; }
+            if grep -q 'not found' <<< "${dependencies}"; then
+              echo "::error::Pinned GPL image runtime dependency mismatch"
+              exit 1
+            fi
+          done
           cargo test --locked -p multiview-ffmpeg --features ffmpeg,gpl-codecs --lib \
             codec_metadata::tests::native_libx264_encoder_emission_yields_actual_decoder_metadata -- --exact \
             2>&1 | tee native-avc-metadata.log
           grep -Eq '^test result: ok\. 1 passed; 0 failed;' native-avc-metadata.log
+          TRIXIE
 
   feature-clippy-ffmpeg-webrtc:
     name: ffmpeg-linked webrtc clippy
