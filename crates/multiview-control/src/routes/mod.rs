@@ -1267,6 +1267,7 @@ pub fn api_router() -> Router<AppState> {
         .route("/media/captures/capabilities", get(web_capture::capabilities))
         .route("/media/captures", post(web_capture::create))
         .route("/media/captures/{id}", get(web_capture::get))
+        .route("/media/captures/{id}/artifact", get(web_capture::artifact))
         .route("/media/captures/{id}/cancel", post(web_capture::cancel))
         .route("/media/players", get(media_players::list_players))
         .route("/media/players/{id}", get(media_players::get_player))

@@ -169,6 +169,28 @@ impl Provider {
     /// Cancel an actor-owned, authorized job.
     /// # Errors
     /// Requires write permission on the job's fill.
+    /// Obtain an immutable artifact lease after authenticating the owning job.
+    /// Blocking hash verification belongs on a management blocking worker.
+    /// # Errors
+    /// Rejects unknown, cross-owner, unready or unavailable artifacts.
+    pub fn pin(
+        &self,
+        p: &Principal,
+        id: u64,
+    ) -> ControlResult<multiview_webengine::artifact::Lease> {
+        let job = self.status(p, id)?;
+        let artifact = job
+            .artifact_id
+            .ok_or_else(|| ControlError::Conflict("capture has no completed artifact".into()))?;
+        let artifact = multiview_webengine::artifact::ArtifactId::parse(&artifact)
+            .map_err(|_| ControlError::Repository("invalid capture artifact identity".into()))?;
+        self.service
+            .as_ref()
+            .ok_or(ControlError::EngineBusy)?
+            .pin(&artifact, &p.key_id)
+            .map_err(|_| ControlError::EngineBusy)
+    }
+
     pub fn cancel(&self, p: &Principal, id: u64) -> ControlResult<()> {
         p.role.require(Action::Write)?;
         let _ = self.status(p, id)?;

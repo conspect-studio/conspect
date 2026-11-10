@@ -1,0 +1,60 @@
+//! Capture route authorization and honest unavailable behavior.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
+mod support;
+use axum::http::StatusCode;
+use serde_json::json;
+use support::{
+    body_json, get, harness_with, post_json, send, OPERATOR_TOKEN, SCOPED_TOKEN, VIEWER_TOKEN,
+};
+fn body() -> serde_json::Value {
+    json!({"fill_id":"radar","target_player":null,"view":{"lat":-33.946,"lon":150.37,"zoom":10,"overlay":"radar","width":1280,"height":720,"fps":2,"frames":12,"public":true},"terms":{"accepted":true,"version":"windy-2023-09-01"}})
+}
+#[tokio::test]
+async fn capture_routes_report_unavailable_without_creating_fake_jobs() {
+    let h = harness_with(|s| s);
+    let response = send(
+        &h.router,
+        get("/api/v1/media/captures/capabilities", VIEWER_TOKEN),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(body_json(response).await["capture_available"], false);
+    let response = send(
+        &h.router,
+        post_json("/api/v1/media/captures", OPERATOR_TOKEN, &body()),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+}
+#[tokio::test]
+async fn viewer_and_other_object_are_denied_before_provider_admission() {
+    let h = harness_with(|s| s);
+    for token in [VIEWER_TOKEN, SCOPED_TOKEN] {
+        let r = send(
+            &h.router,
+            post_json("/api/v1/media/captures", token, &body()),
+        )
+        .await;
+        assert_eq!(r.status(), StatusCode::FORBIDDEN);
+    }
+}
+#[tokio::test]
+async fn terms_and_untrusted_fields_are_rejected() {
+    let h = harness_with(|s| s);
+    let mut input = body();
+    input["terms"]["accepted"] = json!(false);
+    let r = send(
+        &h.router,
+        post_json("/api/v1/media/captures", OPERATOR_TOKEN, &input),
+    )
+    .await;
+    assert_eq!(r.status(), StatusCode::BAD_REQUEST);
+    let mut input = body();
+    input["html"] = json!("<script>bad()</script>");
+    let r = send(
+        &h.router,
+        post_json("/api/v1/media/captures", OPERATOR_TOKEN, &input),
+    )
+    .await;
+    assert!(r.status().is_client_error());
+}
