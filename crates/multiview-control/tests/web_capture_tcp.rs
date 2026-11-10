@@ -92,8 +92,7 @@ async fn capture_flow(real_browser: bool) {
     if real_browser {
         assert!(browser.is_file(), "required real browser missing");
         let node = std::env::var_os("CONSPECT_WEB_NODE")
-            .map(std::path::PathBuf::from)
-            .unwrap_or_else(|| find_tool("node"));
+            .map_or_else(|| find_tool("node"), std::path::PathBuf::from);
         let script = format!(
             r#"#!/usr/bin/env python3
 import json,subprocess,sys
