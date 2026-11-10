@@ -297,6 +297,86 @@ mod tests {
         }
     }
 
+    /// Serve one scripted raw HTTP/1.1 response per accepted connection on a
+    /// loopback port. `script` receives the bound port (for `Location`).
+    fn serve_raw(script: impl FnOnce(u16) -> Vec<String> + Send + 'static) -> u16 {
+        use std::io::{BufRead, BufReader, Write};
+        let listener = std::net::TcpListener::bind("[::1]:0").expect("bind loopback");
+        let port = listener.local_addr().expect("addr").port();
+        std::thread::spawn(move || {
+            for response in script(port) {
+                let Ok((mut stream, _)) = listener.accept() else {
+                    return;
+                };
+                let mut reader = BufReader::new(stream.try_clone().expect("clone"));
+                let mut line = String::new();
+                while reader.read_line(&mut line).is_ok_and(|n| n > 0) && line != "\r\n" {
+                    line.clear();
+                }
+                let _ = stream.write_all(response.as_bytes());
+            }
+        });
+        port
+    }
+
+    fn chunked(body: &str) -> String {
+        format!("{:x}\r\n{body}\r\n0\r\n\r\n", body.len())
+    }
+
+    #[test]
+    fn a_complete_chunked_body_after_a_chunked_redirect_fetches() {
+        // The jmp2.uk -> pluto.tv shape FFmpeg 9.0.2 misread as a broken
+        // connection (EIO after the last chunk): a chunked 302, then a chunked
+        // 200 read to its end, each on its own `Connection: close` socket.
+        let body = "#EXTM3U\n#EXT-X-VERSION:5\nvariant.m3u8\n";
+        let port = serve_raw(move |port| {
+            vec![
+                format!(
+                    "HTTP/1.1 302 Found\r\nLocation: http://[::1]:{port}/final.m3u8\r\n\
+                     Transfer-Encoding: chunked\r\nConnection: close\r\n\r\n{}",
+                    chunked("moved")
+                ),
+                format!(
+                    "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\
+                     Connection: close\r\n\r\n{}",
+                    chunked(body)
+                ),
+            ]
+        });
+        let fetched = fetch_url_text(
+            &format!("http://[::1]:{port}/start.m3u8"),
+            64 * 1024,
+            "http,tcp",
+        )
+        .expect("a fully received chunked body must fetch");
+        assert_eq!(fetched.body, body);
+        assert!(
+            fetched.url.ends_with("/final.m3u8"),
+            "effective URL: {}",
+            fetched.url
+        );
+    }
+
+    #[test]
+    fn a_sized_body_cut_short_is_still_an_error() {
+        // The guard the fix must keep: a Content-Length reply that ends early.
+        let port = serve_raw(|_| {
+            vec![
+                "HTTP/1.1 200 OK\r\nContent-Length: 100\r\nConnection: close\r\n\r\n#EXTM3U\nshort"
+                    .to_owned(),
+            ]
+        });
+        let result = fetch_url_text(
+            &format!("http://[::1]:{port}/x.m3u8"),
+            64 * 1024,
+            "http,tcp",
+        );
+        assert!(
+            result.is_err(),
+            "a truncated sized body must not fetch: {result:?}"
+        );
+    }
+
     #[test]
     fn rejects_a_non_utf8_body() {
         let path = temp("multiview_avio_fetch_binary.bin");

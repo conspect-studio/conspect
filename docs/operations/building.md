@@ -71,22 +71,30 @@ default build does **not** link FFmpeg — only feature presets that enable `ffm
 > FFmpeg may already be GPL or nonfree — verify before relying on the LGPL-clean guarantee
 > ([§6](#6-licensing--build-profiles)).
 
-#### macOS (Homebrew)
+#### Pinned version: FFmpeg 9.0.2
 
-```bash
-brew install ffmpeg pkg-config
-ffmpeg -version          # this dev box ships FFmpeg 8.1.1 (Homebrew)
-ffmpeg -hwaccels         # expect videotoolbox
-```
+Every platform links the **same** FFmpeg: **9.0.2** (libavcodec **63**), matching the
+`ffmpeg-next 9.0` / `ffmpeg-sys-next 9.0.1` binding in `Cargo.lock`. `deploy/ffmpeg-build.sh` is
+the single source of the configure allowlist, the GPG + SHA-256 source pin, and the soname
+assertion; the container images and the Linux release legs all build through it. A different
+FFmpeg major compiles the wrong binding `cfg` or fails outright.
+
+#### macOS
+
+Do **not** link Homebrew's `ffmpeg` formula: it is a different major from the pin and is built
+with `--enable-gpl` (x264/x265), so linking against it introduces applicable GPL combined-work
+obligations and is never the LGPL-clean artifact. This does not relicense Conspect or grant
+permission to distribute it; local development and testing must also stay within your applicable
+Conspect permissions. A pinned macOS (VideoToolbox/AudioToolbox) profile for `deploy/ffmpeg-build.sh` is
+the next step of the macOS work; until it lands, `release.yml`'s macOS legs fail loudly instead of
+linking Homebrew's FFmpeg.
 
 > [!WARNING]
-> **Dev-box caveat:** the Homebrew FFmpeg on this machine is **8.1.1** built with
-> `--enable-gpl --enable-version3 --enable-libx264 --enable-libx265 --enable-openssl`. That is
-> **not** an LGPL-clean dependency build. A linked binary carries GPL combined-work
-> obligations; this does not relicense Conspect or grant distribution rights. Local
-> development and testing must also stay within your applicable Conspect permissions. For an authorized release/distribution, build FFmpeg
-> yourself with the LGPL flags (see [§6](#6-licensing--build-profiles)) and point Conspect at it via
-> `PKG_CONFIG_PATH`. VideoToolbox HW accel is present in this Homebrew build.
+> **bindgen picks up `LIBCLANG_PATH`.** `ffmpeg-sys-next` generates its bindings with bindgen,
+> which loads the libclang named by `LIBCLANG_PATH`. Embedded toolchains (for example
+> `espup`'s Xtensa clang) export that variable from shell profiles, and a cross-target libclang
+> fails with `Unsupported architecture` / a pointer-width assertion. Unset it for host builds:
+> `env -u LIBCLANG_PATH cargo build ...`.
 
 #### Linux (system libav)
 
@@ -283,13 +291,16 @@ limited to the purposes and exceptions in that license; religious use and moneti
 excluded, and paid/metered features require separate authorization. The former $1M sponsorship
 threshold is not a current free-use entitlement. Free use carries no warranty, subject to
 non-excludable rights. Feature presets determine additional third-party obligations, not a grant
-to redistribute Conspect. Full rationale:
+to redistribute Conspect. Third-party components retain their own license rights; these project
+restrictions do not limit mandatory LGPL rights, including modification for own use, reverse
+engineering to debug such modifications, and relinking with modified libraries to the extent
+required by the LGPL (see `LICENSE` §9). Full rationale:
 [ADR-0012](../decisions/ADR-0012.md) and [conventions §7](../architecture/conventions.md#7-licensing-model-build-profiles).
 
 | Profile / features | Composition | Effective status |
 |--------------------|-------------|------------------|
-| **default** (no `gpl-codecs`/`ndi-advanced`) | Source-available project code + dynamically-linked **LGPL-2.1** FFmpeg (no `--enable-gpl`, no `--enable-nonfree`; NVENC/NVDEC via MIT `nv-codec-headers`; `scale_cuda` not `scale_npp`; native AAC + GnuTLS) | **LGPL-clean dependencies**; Conspect distribution requires separate permission |
-| **+ `gpl-codecs`** | + x264/x265 (GPL FFmpeg) | GPL FFmpeg obligations; no automatic relicensing or distribution grant for Conspect |
+| **default** (no `gpl-codecs`/`ndi-advanced`) | Source-available project code + dynamically-linked **LGPL** FFmpeg (LGPL-3.0-or-later for the pinned `--enable-version3` build) (no `--enable-gpl`, no `--enable-nonfree`; NVENC/NVDEC via MIT `nv-codec-headers`; `scale_cuda` not `scale_npp`; native AAC + GnuTLS) | **LGPL-clean dependencies**; Conspect distribution requires separate permission |
+| **+ `gpl-codecs`** | + x264/x265 (GPL FFmpeg) | GPL-3.0-or-later obligations for the pinned `--enable-version3` FFmpeg build; combined distribution requires applicable GPL compliance and separate Conspect permission, not automatic relicensing |
 | **+ nonfree** (libnpp / FDK-AAC / OpenSSL) | nonfree FFmpeg | **NOT redistributable** — internal/personal only |
 | **+ `ndi`** | + proprietary NDI runtime (royalty-free) | Source-available project code **+ NDI EULA + mandatory attribution/branding** |
 | **+ `ndi-advanced`** | + NDI Advanced SDK (HX H.264/HEVC) | Separate **paid** commercial license + codec royalties |
@@ -340,7 +351,7 @@ a separate obligation from software copyright and may apply regardless of build 
   `@rpath`/`@loader_path` install names, then **inside-out codesign** every dylib + the executable
   (hardened runtime, secure timestamp, consistent Team ID — `codesign --deep` is unreliable), and
   finally `notarytool` + `stapler`.
-- Verify HW: `ffmpeg -hwaccels` lists `videotoolbox`; the local Homebrew FFmpeg 8.1.1 has it.
+- Verify HW: `ffmpeg -hwaccels` on the pinned build lists `videotoolbox`.
 
 See [ADR-0011](../decisions/ADR-0011.md) for the full platform decision and consequences.
 

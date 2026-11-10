@@ -1,0 +1,32 @@
+From: Multiview <operations+codex@aperim.com>
+Subject: [PATCH] avformat/http: a closed chunked reply of unknown size ends with EOF
+
+FFmpeg 9.0 (62006041cc, "don't return EOF unless we actually read all
+bytes") returns EIO from http_read_stream() whenever the connection is gone
+and s->off < s->filesize. For a chunked reply filesize is UINT64_MAX, so a
+reply whose last chunk was received and whose connection was then closed
+("Last chunk received, closing conn") is reported as an I/O error instead of
+EOF. Seen on chunked 302 -> chunked 200 playlist redirects (jmp2.uk ->
+pluto.tv). Only report EIO when the size is actually known. A sized reply
+that is cut short still returns EIO.
+
+Not fixed by upstream 5db1e097dc/ca5300c9f4 (requested_end() still yields
+UINT64_MAX for chunked replies). Drop when the pin moves to a release that
+handles this.
+---
+diff --git a/libavformat/http.c b/libavformat/http.c
+index 35f886f..3b80b70 100644
+--- a/libavformat/http.c
++++ b/libavformat/http.c
+@@ -1838,8 +1838,10 @@ static int http_read_stream(URLContext *h, uint8_t *buf, int size)
+     int reconnect_delay_total = 0;
+     int conn_attempts = 1;
+ 
++    /* A chunked reply has no known size: once its last chunk closed the
++     * connection, the end of the data is a clean EOF, not a short read. */
+     if (!s->hd)
+-        return s->off < s->filesize ? AVERROR(EIO) : AVERROR_EOF;
++        return s->filesize != UINT64_MAX && s->off < s->filesize ? AVERROR(EIO) : AVERROR_EOF;
+ 
+     if (s->end_chunked_post && !s->end_header) {
+         err = http_read_header(h);

@@ -2,7 +2,7 @@
 # Resolve which pinned FFmpeg base image (ADR-0031 §5) a workflow should consume.
 #
 # Usage: scripts/resolve-ffmpeg-image.sh <owner> <tag>
-#   e.g. scripts/resolve-ffmpeg-image.sh conspect-studio 8.1.1-lgpl
+#   e.g. scripts/resolve-ffmpeg-image.sh conspect-studio 9.0.2-lgpl
 #
 # Prefers this repository owner's own published base
 # (ghcr.io/<owner>/multiview-ffmpeg:<tag>, written by ffmpeg-base.yml). Until

@@ -211,6 +211,37 @@ pub fn preview_vp8_options(fps: Rational) -> CodecOptions {
         .push_literal("error-resilient", "default")
 }
 
+/// The H.264 profile the program (multiview canvas) encoder always requests.
+///
+/// Pinned rather than inherited: libav's per-encoder default profile is a
+/// version-dependent detail (`FFmpeg` 9.0 moved `h264_nvenc` from Main to High),
+/// and the program stream's profile is an output contract, not something an
+/// `FFmpeg` bump may change silently. High is the deliberate default: universally
+/// decodable by current players, better quality per bit than Main for a few
+/// percent more encoder time.
+pub const PROGRAM_H264_PROFILE: &str = "high";
+
+/// The pinned `AVOption` set for the program encoder, by resolved encoder name.
+///
+/// H.264 encoder families get an explicit [`PROGRAM_H264_PROFILE`]; every other
+/// codec (HEVC, MPEG-2, FFV1, …) gets no pair, because a `profile` value is
+/// codec-specific and an H.264 name must never be applied to another codec.
+/// User-defined per-output encoder settings are a separate, later surface; this
+/// only removes the dependence on libav's defaults.
+#[must_use]
+pub fn program_h264_options(encoder_name: &str) -> CodecOptions {
+    let is_h264 = encoder_name == "libx264"
+        || (encoder_name.starts_with("h264_")
+            && ["_nvenc", "_vaapi", "_qsv", "_videotoolbox"]
+                .iter()
+                .any(|family| encoder_name.ends_with(family)));
+    if is_h264 {
+        CodecOptions::new().push_literal("profile", PROGRAM_H264_PROFILE)
+    } else {
+        CodecOptions::new()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]

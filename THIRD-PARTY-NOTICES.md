@@ -24,13 +24,14 @@ third-party component below is copyright its respective authors.
 
 ---
 
-## 1. FFmpeg / libav\* — LGPL-2.1 (dynamically linked)
+## 1. FFmpeg / libav\* — LGPL (dynamically linked)
 
 Conspect uses the **FFmpeg / libav\*** libraries (`libavcodec`, `libavformat`,
 `libavutil`, `libavfilter`, `libswscale`, `libswresample`, and related) for
 container demux/mux and for software/hardware decode and encode. In the default
-build these libraries are used **under the GNU Lesser General Public License,
-version 2.1 (LGPL-2.1)**, by **dynamic linking**; they are not statically bundled
+build these libraries are used **under the GNU Lesser General Public License**
+(FFmpeg is LGPL-2.1-or-later; the pinned build Conspect ships is configured with
+`--enable-version3`, so those binaries are **LGPL-3.0-or-later**), by **dynamic linking**; they are not statically bundled
 into the Conspect binary and are not relicensed under Conspect's license.
 
 Nothing in Conspect's license limits the rights the LGPL grants you with respect
@@ -40,11 +41,23 @@ against a modified version of the libraries, to the extent the LGPL requires (se
 [`LICENSE`](LICENSE) §9).
 
 - **Components:** FFmpeg / libav\* libraries.
-- **License:** GNU LGPL-2.1 (or later), as built and distributed.
+- **License:** GNU LGPL-2.1-or-later upstream; the pinned build (`--enable-version3`,
+  no `--enable-gpl`/`--enable-nonfree`) is distributed under **LGPL-3.0-or-later**.
 - **Linkage:** dynamic. The default Conspect build is kept LGPL-clean.
+- **Release archives:** the Linux release tarballs ship these shared libraries,
+  built from the pinned, GPG- and SHA-256-verified FFmpeg source with an LGPL-only
+  configure (`deploy/ffmpeg-build.sh`), in the archive's `lib/` directory. The binary
+  finds them through an `$ORIGIN/lib` run path, so you can replace them with your own
+  build of the same FFmpeg major. The LGPLv3 and GPLv3 texts ship with them in
+  `licenses/ffmpeg/` (container images: `/usr/share/licenses/ffmpeg/`); the archive's
+  `RUNTIME-DEPENDENCIES.txt` lists the distro packages the libraries need.
+- **Corresponding source:** the unmodified upstream release named by
+  `FFMPEG_VERSION` in `deploy/Dockerfile.ffmpeg` (`https://ffmpeg.org/releases/ffmpeg-<version>.tar.xz`,
+  with its SHA-256 and signing key pinned there), configured exactly as
+  `deploy/ffmpeg-build.sh` does, both in the source tree of the same tag.
 - **Upstream:** https://ffmpeg.org/ — license: https://ffmpeg.org/legal.html
 
-### 1a. Optional `gpl-codecs` build — GPL-2.0-or-later (NOT under Conspect's license)
+### 1a. Optional `gpl-codecs` build — GPL-3.0-or-later (NOT under Conspect's license)
 
 Conspect has an **optional, off-by-default** `gpl-codecs` build profile that links
 GPL-licensed encoders such as **x264** and **x265**. Those GPL codec components are
@@ -58,7 +71,8 @@ retain their own license rights. This profile is opt-in only; the default build
 never links these components.
 
 - **Components:** x264, x265 (and any other GPL-only codec enabled by the profile).
-- **License:** GNU GPL-2.0-or-later.
+- **License:** pinned GPL-enabled FFmpeg build: GNU GPL-3.0-or-later
+  (`--enable-version3`); x264 and x265 themselves: GPL-2.0-or-later.
 - **Status:** opt-in; excluded from the default build and from Conspect's licence grant.
 
 ---
@@ -110,7 +124,9 @@ outside the allow-list above, so the default build stays free of copyleft-by-lin
 surprises.
 
 > Note: the LGPL applies to the **FFmpeg / libav\* C libraries** (§1), not to the
-> Rust **bindings** that wrap them — those bindings are themselves MIT/Apache-2.0.
+> Rust **bindings** that wrap them — those bindings (`ffmpeg-next`, `ffmpeg-sys-next`) are
+> themselves WTFPL, a permissive public-domain-equivalent licence (`deny.toml` allows it for
+> exactly those two crates).
 
 ---
 

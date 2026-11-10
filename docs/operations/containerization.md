@@ -143,16 +143,19 @@ governs project code: private study and copies necessary for authorized use are 
 general modification, distribution or reproduction. Building an image does not authorize
 redistributing it. See [conventions](../architecture/conventions.md) §7; the historical
 [ADR-0012](../decisions/ADR-0012.md) describes dependency choices, not current project grants.
-The table below summarizes additional container dependency obligations.
+Third-party components retain their own license rights. These project restrictions do not limit
+mandatory LGPL rights, including modification for own use, reverse engineering to debug such
+modifications, and relinking with modified libraries to the extent required by the LGPL (see
+`LICENSE` §9). The table below summarizes additional container dependency obligations.
 
 | Build profile | What it adds | Effect on the image |
 |---------------|-------------|----------------------|
-| **default** | LGPL-2.1 FFmpeg (dynamic), NVENC/NVDEC via MIT headers, native AAC + GnuTLS | **LGPL-clean dependencies**; Conspect distribution requires separate permission |
-| **`gpl-codecs`** | x264 / x265 | GPL FFmpeg obligations; opt-in only, not permission to redistribute Conspect |
+| **default** | LGPL FFmpeg (dynamic; LGPL-3.0-or-later for the pinned `--enable-version3` build), NVENC/NVDEC via MIT headers, native AAC + GnuTLS | **LGPL-clean dependencies**; Conspect distribution requires separate permission |
+| **`gpl-codecs`** | x264 / x265 | GPL-3.0-or-later obligations for the pinned `--enable-version3` FFmpeg build; opt-in only, with applicable GPL compliance and separate Conspect permission required for combined distribution, not automatic relicensing |
 | **`nonfree`** | libnpp / FDK-AAC / OpenSSL | **NOT redistributable** — internal/personal images only |
 | **`ndi`** | proprietary NDI runtime (runtime-loaded) | Source-available project code + NDI EULA + mandatory attribution; SDK **never vendored** into the image |
 
-**Why dynamic linking matters in a container.** FFmpeg is linked **dynamically (LGPL-2.1)** so the
+**Why dynamic linking matters in a container.** FFmpeg is linked **dynamically (LGPL)** so the
 LGPL relink right is preserved — a user can replace `libav*` inside the image. Keep that property:
 do not statically fold libav into the binary, and do not strip the dynamic libs out
 ([core-engine](../research/core-engine.md) §17, [ADR-0012](../decisions/ADR-0012.md)).

@@ -1,6 +1,6 @@
 # Conspect Version 2 license clarity and product naming
 
-- Status: Proposed; operator confirmation required before merge/release (R3).
+- Status: Accepted for PR and merge delivery by the operator on 2026-11-11; deployment remains separate (R3).
 - Date: 2026-11-10
 - Scope: license policy and documentation/UI copy; no enforcement or media-path changes.
 - Supersedes: ADR-0043 eligibility and source-reuse guidance for copies supplied under Version 2.0 only.
@@ -26,7 +26,7 @@ licenses and mandatory rights remain outside the restriction.
 2. Revise the operative license as Version 2.0 and align current summaries/notices.
 3. Coordinate the separate website repository through a new remote session.
 4. Regenerate translations and run focused UI checks; review three R3 lenses.
-5. Obtain explicit operator confirmation before outward merge/release.
+5. Deliver reviewed PRs, resolve CI and merge. The operator explicitly directs end-to-end delivery without further PR-permission prompts; deployment remains separate.
 
 ## Migration, alternatives and recovery
 
@@ -57,4 +57,5 @@ test applies: this task changes no output-clock or isolation behaviour.
   required LGPL rights; prohibit income from unrelated content; revoke prior CLA grants.
   These contradict the approved copy allowance, third-party protections or migration boundary.
 - These are engineering consistency reviews, not legal sign-off. Final commit/check/PR
-  evidence belongs in the PR; approval and website reconciliation remain pending.
+  evidence belongs in the PR. The operator confirmed end-to-end PR/merge delivery on
+  2026-11-11; remote CI and final website reconciliation remain delivery gates.
