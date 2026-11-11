@@ -210,12 +210,11 @@ impl BindingJournal {
         if claim() {
             return Ok(true);
         }
-        match prior {
-            Some(bytes) => self.write_bytes(&bytes)?,
-            None => {
-                std::fs::remove_file(&self.path)?;
-                std::fs::File::open(self.path.parent().unwrap_or(Path::new(".")))?.sync_all()?;
-            }
+        if let Some(bytes) = prior {
+            self.write_bytes(&bytes)?;
+        } else {
+            std::fs::remove_file(&self.path)?;
+            std::fs::File::open(self.path.parent().unwrap_or(Path::new(".")))?.sync_all()?;
         }
         Ok(false)
     }
