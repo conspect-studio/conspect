@@ -88,21 +88,24 @@ describe('WallStreamProvider', () => {
     const next: WallGeometry = { ...geometry, generation: 2, cells: [{ source: 'a', x: 320, y: 0, w: 320, h: 180 }] };
     let answer = geometry;
     const d = deps({ fetchWall: vi.fn(() => Promise.resolve(answer)) });
-    const frames: VideoFrame[] = [];
-    const play = d.value.play;
-    d.value = { ...d.value, play: (async (o: Parameters<WallDeps['play']>[0]) => {
-      const frame = { displayWidth: 640, displayHeight: 360, clone() { return this; }, close: vi.fn() } as unknown as VideoFrame;
-      frames.push(frame);
-      return play({ ...o, onFrame: (f) => { o.onFrame?.(f === undefined ? f : frame); } });
-    }) as unknown as WallDeps['play'] };
+    const closes: ReturnType<typeof vi.fn>[] = [];
+    const inner = d.value.play;
+    const play = (o: Parameters<WallDeps['play']>[0]): ReturnType<WallDeps['play']> => {
+      const close = vi.fn();
+      closes.push(close);
+      const frame = { displayWidth: 640, displayHeight: 360, clone: () => frame, close } as unknown as VideoFrame;
+      const forward = o.onFrame;
+      return inner({ ...o, onFrame: () => { forward?.(frame); } });
+    };
+    d.value = { ...d.value, play };
     render(<WallStreamProvider deps={d.value}><Probe id="a" /></WallStreamProvider>);
     await act(async () => { await vi.advanceTimersByTimeAsync(100); });
     expect(screen.getByTestId('crop-a')).toBeTruthy();
     answer = next;
     await act(async () => { await vi.advanceTimersByTimeAsync(2100); });
-    expect(frames[0]?.close).toHaveBeenCalled();
+    expect(closes[0]).toHaveBeenCalled();
     expect(d.lease).toHaveBeenCalledTimes(2);
-    expect(frames).toHaveLength(2);
+    expect(closes).toHaveLength(2);
   });
 
   it('backs off instead of polling every 2 s when the wall is off', async () => {

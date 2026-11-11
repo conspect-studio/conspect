@@ -899,6 +899,7 @@ segment_ms = 1000
     /// receive the same H.264 windows, and the encoder count never changes.
     #[cfg(feature = "gpl-codecs")]
     #[test]
+    #[allow(clippy::too_many_lines)] // One real-encoder scenario: two viewers, then a layout change.
     fn one_wall_encode_serves_two_subscribers() {
         use crate::output_window_registry::{EffectiveBinding, OutputWindowRegistry};
         let color = ColorInfo::default().resolve_defaults(64, 36);
