@@ -20,22 +20,31 @@ authority. Data-plane rules are in [data-plane-safety](../architecture/data-plan
 | Tests while working | none | focused crate (`cargo test -p <crate>`) | focused crate | focused crate |
 | Full suite | CI only | CI only | before PR, and CI | before PR, and CI |
 | Independent review | no | diff-only, single cross-vendor pass | scoped context, cross-vendor | 3-lens cross-vendor panel |
-| Human review | no | no | operator override retained | operator approval before the outward action |
+| Human review | no | no | none; the operator may veto or revert afterwards | none; the operator may veto or revert afterwards |
 | Docs updated | no | only if the change makes existing docs wrong | required for behaviour change | required |
 | ADR | no | no | only if it constrains future changes | required |
-| Merge | auto on green | agent merges on green | agent merges on green | operator confirms, then merge |
+| Merge | auto on green | agent merges on green | agent merges on green | agent merges on green, once every R3 gate above is met |
 | Batching | many per PR | related changes per PR | one logical change | one logical change |
 
 **Green** = every reporting CI check passes. `main` currently has no branch protection, so no check
 is *required* in the GitHub sense — that makes green a discipline, not a mechanism (Part C, "not
 enforced").
 
-**On the human-review row.** [ADR-G005](../decisions/ADR-G005.md) (Accepted) delegates routine final
-approval **and merge** to the agent; the mandatory cross-vendor review still gates the merge and the
-operator retains ultimate authority. R2 therefore does not reinstate a per-PR human gate — that
-would contradict an Accepted decision. R3's outward-facing actions (public release, infrastructure
-deletion, force-push, external communication, key handling) are the ones G005 reserves to the
-operator.
+**No class waits for the operator.** [ADR-G005](../decisions/ADR-G005.md) delegates final approval
+**and merge** to the agent, and [ADR-G009](../decisions/ADR-G009.md) removes the last exception: an
+R3 change is merged by the agent too. What R3 adds is engineering work, not a permission step: the
+design note or ADR, the 3-lens cross-vendor panel, and the chaos/soak or rehearsed recovery gate.
+When those are met and CI is green, merge. The agent also owns everything around the merge: fixing
+CI, rerunning a flaky job after reading its log, closing superseded PRs, deploying to the test
+server and rolling it back. A PR that waits for "operator confirmation" is unfinished work.
+
+The agent **reports** decisions it took (PR `## Concerns`, the final report). A report is not a
+question. What still goes to the operator is unchanged and narrow, and none of it is a merge:
+the outward-facing actions [ADR-G005](../decisions/ADR-G005.md) reserves (a public release,
+deleting infrastructure, a force-push of `main`, external communication, key handling) and the
+four stops in `AGENTS.md` "Obstacles". That list does not grow by analogy. Infrastructure that
+another team owns (estate firewall, DNS) is not a question for the operator either: use that
+team's change process, or work around it.
 
 **A change that risks invariant #1 (output-clock) or #10 (isolation) is R3 regardless of its path** —
 stop, write a design note, add a chaos/soak test. Those gates never relax
@@ -168,7 +177,8 @@ open `target/`, `node_modules/`, `dist/` or `.multiview-build/`.
 The operator accepts risk. An exception is recorded in the PR that relies on it, states what it
 covers and when it expires, and is re-raised rather than renewed silently. **An exception may never
 conceal a failed check, fabricate evidence, or bypass the cross-vendor review.** If a gate cannot be
-satisfied honestly, say so and stop — those are the only two options.
+satisfied honestly, say so in the PR and do not merge that change; continue with the rest of the
+work. Reporting it is not a request for permission to skip the gate.
 
 ---
 

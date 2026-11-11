@@ -80,7 +80,7 @@ classify_one() {
     # A per-directory CLAUDE.md is agent instruction, not the code it annotates,
     # so it is R2 even inside an R3 crate. Without this arm, editing
     # crates/multiview-licence/CLAUDE.md would inherit that crate's R3 and put
-    # operator approval on a docs tweak — disproportionate, and exactly the
+    # the 3-lens panel on a docs tweak — disproportionate, and exactly the
     # ceremony this matrix exists to remove.
     AGENTS.md | CLAUDE.md | */CLAUDE.md | docs/standards/* | .claude/* | scripts/classify.sh)
       echo R2
@@ -203,7 +203,7 @@ R2 — data plane, security surface, deps, CI/CD, agent policy, or a publish tri
              cargo deny check                (if dependencies changed)
   review     scoped-context cross-vendor pass (never self-performed by the author's vendor)
   docs       required for a behaviour change  ADR  only if it constrains future changes
-  merge      agent merges on green; operator override retained (ADR-G005)
+  merge      agent merges on green (ADR-G005); the operator may veto or revert afterwards
   batching   one logical change per PR
 EOF
     ;;
@@ -215,8 +215,8 @@ R3 — keys, licence enforcement, legal or public action, release publishing,
   plan       required                        ADR  required
   review     3-lens cross-vendor panel
   gates      chaos/soak for an invariant #1/#10 change; rehearsed recovery path
-  approval   explicit operator approval before the outward-facing action
-  merge      operator confirms, then merge
+  merge      agent merges on green once every gate above is met; no class waits for the
+             operator (ADR-G005, ADR-G009). Report what you decided; do not ask.
 EOF
     ;;
 esac
