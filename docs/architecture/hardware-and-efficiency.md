@@ -77,7 +77,7 @@ Conspect treats each GPU vendor as a **zero-copy island** and budgets an explici
 | Path | Status | Note |
 |---|---|---|
 | NVDEC → CUDA composite → NVENC | **Zero-copy** | One shared CUDA context; keep `AV_PIX_FMT_CUDA` end-to-end (skip `av_hwframe_transfer_data`) to avoid the ~2× PCIe penalty |
-| VideoToolbox → Metal → VideoToolbox | **Zero-copy** (lowest risk) | IOSurface-backed `CVPixelBuffer` via `CVMetalTextureCache`; keep IOSurface use-counts |
+| VideoToolbox → Metal → VideoToolbox | **Zero-copy possible** (lowest risk; not built yet, [ADR-0105](../decisions/ADR-0105.md)) | IOSurface-backed `CVPixelBuffer` via `CVMetalTextureCache`; keep IOSurface use-counts |
 | VAAPI/QSV → Vulkan via DRM-PRIME/dma-buf | **Zero-copy, fragile** | Modifier + cross-API sync sensitive; validate per driver; keep copy fallback |
 | Any cross-vendor (e.g. VAAPI decode → NVENC) | **Copy** | Host round-trip; importing a foreign dma_buf into CUDA is Tegra-Thor-only |
 | CUDA → wgpu(Vulkan) | **Copy** | wgpu has no stable external-memory import → prefer a CUDA-native compositor on NVIDIA |
@@ -95,10 +95,10 @@ The negotiator's per-platform priority and zero-copy reality. macOS has **no** C
 |---|---|---|---|---|
 | **Linux NVIDIA** | NVDEC (cuda hwaccel) → CPU | **Custom CUDA kernels** (fused convert+scale+place) | NVENC → x264/SVT-AV1 (`gpl-codecs`/sw) | **Yes** — NVDEC→CUDA→NVENC, single CUDA context |
 | **Linux Intel/AMD** | VAAPI / QSV (oneVPL, Gen12+) → CPU | **wgpu / Vulkan(ash) / libplacebo** via dma-buf | VAAPI (`low_power`) / QSV → x264/SVT-AV1 | **Yes within VAAPI/Vulkan** via dma-buf (modifier + sync sensitive) |
-| **macOS (Apple Silicon + Intel)** | VideoToolbox → CPU | **Metal compute** (IOSurface via `CVMetalTextureCache`) | VideoToolbox → x264/SVT-AV1 | **Yes** — VT→IOSurface→Metal→VT (cleanest) |
+| **macOS (Apple Silicon + Intel)** | VideoToolbox → CPU | **wgpu on Metal** (R8+RG8 NV12 planes, [ADR-0105](../decisions/ADR-0105.md)); native IOSurface path deferred | VideoToolbox → x264/SVT-AV1 | **Not yet** — VT decode/encode use host NV12; VT→IOSurface→Metal→VT is the deferred native path |
 | **CPU / software (any)** | native libav / dav1d | wgpu portable or CPU/SIMD | x264 / SVT-AV1 / native AAC | N/A (host memory) |
 
-Feature flags (canonical, [conventions §4](./conventions.md#4-feature-flag-taxonomy-canonical)): codec backends `cuda`, `videotoolbox`, `vaapi`, `qsv`, `software` (always on); compositor backends `wgpu` (default), `metal`, `cuda`; umbrella presets `nvidia` / `apple` / `linux-vaapi` / `full`. NV12 is unsupported on the wgpu **Metal** backend, which is *why* macOS uses native Metal for the fast path.
+Feature flags (canonical, [conventions §4](./conventions.md#4-feature-flag-taxonomy-canonical)): codec backends `cuda`, `videotoolbox`, `vaapi`, `qsv`, `software` (always on); compositor backends `wgpu` (default), `metal`, `cuda`; umbrella presets `nvidia` / `apple` / `linux-vaapi` / `full`. wgpu's **Metal** backend has no native NV12 texture format, but the compositor never needs one: it binds NV12 as `r8unorm` + `rg8unorm` planes, so macOS runs the same wgpu compositor ([ADR-0105](../decisions/ADR-0105.md)). `metal` is a reserved, empty name for a future native IOSurface fast path.
 
 ---
 

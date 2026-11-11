@@ -288,6 +288,7 @@ Decisions from the 2026-06-13 operator feature-request intake (all **Proposed**)
 - [ADR-0104](ADR-0104.md) — Switcher slice 2: any configured source on Preview/Program, AUTO mix inside the one Program drive, fresh-frame take gate
 - [ADR-0102](ADR-0102.md) — Web engine (supervised headless browser host, security boundary, GPU placement, per-job accounting)
 - [ADR-0103](ADR-0103.md) — Shared monitor wall: compose once, encode once, one MoQ stream for Preview and source tiles
+- [ADR-0105](ADR-0105.md) — macOS GPU compositing on wgpu's Metal backend; native IOSurface path deferred until a measured copy-bound workload
 - [ADR-0100](ADR-0100.md) — VT clip jobs (web capture and URL fetch fill media assets; slot storage on Disk or Memory)
 - [ADR-0101](ADR-0101.md) — Web site templates (declarative site definitions, Windy first, operator acceptance of site terms)
 - [ADR-0084](ADR-0084.md) — SIP/SIPS + SRTP stack & seam (inbound call = source, outbound = output/return)
