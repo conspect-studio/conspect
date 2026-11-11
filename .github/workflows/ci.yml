@@ -779,6 +779,18 @@ jobs:
           --features ffmpeg,aes67
           --all-targets
           -- -D warnings
+      - name: clippy + test multiview-cli --features rist
+        # The RIST push wiring (`build_rist_push`) sits behind
+        # `#[cfg(feature = "rist")]`, and `rist` implies `ffmpeg`, so the
+        # libav-free `feature-clippy` matrix cannot build it. Every shipped
+        # preset (`nvidia`, `linux-vaapi`, `apple`) enables `rist`, yet no PR
+        # leg compiled it: a missing field in that initializer reached main
+        # CI-green on 2026-11-09 and broke every `docker` image build and the
+        # macOS `apple` preset until 2026-11-11. This leg compiles and tests
+        # the feature against the SAME pinned FFmpeg env set up above.
+        run: |
+          cargo clippy --locked -p multiview-cli --features rist --all-targets -- -D warnings
+          cargo test --locked -p multiview-cli --features rist --lib rist_
       - name: Assert the pinned-FFmpeg runtime libs all resolve
         # Fail fast BEFORE the test if any pinned-FFmpeg .so has an unresolved
         # runtime dependency on this bare runner — prints the exact missing soname,
