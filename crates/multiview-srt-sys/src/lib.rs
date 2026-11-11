@@ -495,7 +495,7 @@ fn sockaddr_v6(addr: SocketAddr) -> sa::SockaddrIn6 {
     };
     // SAFETY: `sockaddr_in6` is plain-old-data; all-zero is a valid value.
     let mut sa: sa::SockaddrIn6 = unsafe { std::mem::zeroed() };
-    sa.sin6_family = sa::AF_INET6_FAMILY;
+    sa.sin6_family = sa::af_inet6_family();
     sa.sin6_port = port.to_be();
     sa.sin6_addr.s6_addr = ip.octets();
     sa.sin6_scope_id = scope;

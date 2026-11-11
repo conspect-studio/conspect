@@ -21,8 +21,10 @@ thiserror = { workspace = true }
 # `unsafe_code`, which a downstream manifest cannot relax, so this crate restates
 # the workspace lint set with `unsafe_code = "deny"` (every block justified by a
 # `// SAFETY:` note). Keep in sync with the root Cargo.toml lints.
-# Only for the unix layout-equality test (sockaddr layouts are local, see sa.rs).
-[target.'cfg(unix)'.dev-dependencies]
+
+# Unix sockaddr layouts come from libc (see src/sa.rs); Windows uses local
+# <ws2ipdef.h> definitions because libc has no Winsock types.
+[target.'cfg(unix)'.dependencies]
 libc = "0.2.186"
 
 [lints.rust]
