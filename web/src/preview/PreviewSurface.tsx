@@ -203,8 +203,17 @@ export function PreviewSurface({
   // Refs, not memo values: React may discard a memo, and these must not change.
   const shownKey = useRef<string | undefined>(undefined);
   const leftAt = useRef<{ readonly key: string; readonly starts: number } | undefined>(undefined);
+  const currentSession = (): boolean => {
+    const record = surfaces.get(surfaceKey);
+    const left = leftAt.current;
+    return shownKey.current === surfaceKey
+      || (shownKey.current === undefined && left?.key === surfaceKey
+        && record?.live === 0 && record.starts === left.starts);
+  };
   useEffect(() => {
     shownKey.current = surfaceKey;
+    heldMoq.current = false;
+    whepReleased.current = false;
     return (): void => {
       shownKey.current = undefined;
       leftAt.current = { key: surfaceKey, starts: surfaces.get(surfaceKey)?.starts ?? 0 };
@@ -276,12 +285,7 @@ export function PreviewSurface({
         // still the consumer's, but only while no surface for this source is
         // live and none has gone live since this one left. A surface that now
         // shows another source drops the old source's report.
-        const record = surfaces.get(surfaceKey);
-        const left = leftAt.current;
-        const current = shownKey.current === surfaceKey
-          || (shownKey.current === undefined && left?.key === surfaceKey
-            && record?.live === 0 && record.starts === left.starts);
-        if (!current) return;
+        if (!currentSession()) return;
         if (state === 'released' && heldMoq.current) {
           heldMoq.current = false;
           // Do not release the consumer's combined lease while fallback WHEP
@@ -372,10 +376,12 @@ export function PreviewSurface({
       {...(rtcConfig !== undefined ? { rtcConfig } : {})}
       {...(fetchImpl !== undefined ? { fetchImpl } : {})}
       onSessionReleased={(): void => {
+        if (!currentSession()) return;
         whepReleased.current = true;
         if (!heldMoq.current) leaseRef.current.onSessionReleased?.();
       }}
       onLeaseState={(state): void => {
+        if (!currentSession()) return;
         setReleased(state === 'released');
         whepReleased.current = state === 'released';
         if (state !== 'released' || !heldMoq.current) leaseRef.current.onLeaseState?.(state);

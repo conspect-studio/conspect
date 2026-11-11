@@ -132,6 +132,31 @@ describe('unacknowledged MoQ release', () => {
     expect(releasedCalls(onLeaseState)).toBe(1);
   });
 
+  it('ignores a late old WHEP release after a new Program session mounts', async () => {
+    vi.useFakeTimers();
+    mocks.start.mockReset();
+    mocks.start.mockRejectedValueOnce(new mocks.Unacknowledged('not acknowledged'))
+      .mockImplementationOnce((options: { onActive: () => void }) => {
+        options.onActive();
+        return new Promise<void>(() => { /* new Program remains active */ });
+      });
+    const onLease = vi.fn();
+    const view = renderWithProviders(<Consumer onLease={onLease} />);
+    await advance(0);
+    expect(view.getByTestId('whep')).toBeInTheDocument();
+    const oldWhepRelease = whep.release;
+    fireEvent.click(view.getByText('toggle'));
+    await advance(MOQ_UNACKNOWLEDGED_HOLD_MS);
+    expect(releasedCalls(onLease)).toBe(0);
+    fireEvent.click(view.getByText('toggle'));
+    await advance(0);
+    expect(onLease).toHaveBeenLastCalledWith('active');
+    const before = onLease.mock.calls.length;
+    act(() => { oldWhepRelease?.(); });
+    expect(onLease.mock.calls.slice(before)).toEqual([]);
+    expect(onLease).toHaveBeenLastCalledWith('active');
+  });
+
   it('does not let the old hold mark a new session released when the surface is mounted again within the hold', async () => {
     vi.useFakeTimers();
     mocks.start.mockReset();
