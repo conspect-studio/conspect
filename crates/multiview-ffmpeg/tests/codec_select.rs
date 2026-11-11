@@ -33,6 +33,8 @@ use ffmpeg::format::Pixel;
 use ffmpeg::util::frame::Video;
 use ffmpeg_next as ffmpeg;
 use multiview_core::time::Rational;
+#[cfg(all(feature = "videotoolbox", target_os = "macos"))]
+use multiview_ffmpeg::candidate_encoders;
 use multiview_ffmpeg::{select_encoder, Muxer, VideoCodec, VideoEncodeTarget, VideoEncoder};
 use tempfile::TempDir;
 
@@ -180,6 +182,7 @@ fn select_encoder_resolves_lgpl_mpeg2video_and_encodes_a_probeable_ts() {
 
 #[cfg(not(feature = "gpl-codecs"))]
 #[cfg(not(feature = "cuda"))]
+#[cfg(not(feature = "videotoolbox"))]
 #[test]
 fn lgpl_clean_build_cannot_select_an_h264_encoder() {
     // Without gpl-codecs / cuda the build genuinely cannot encode H.264/H.265:
@@ -240,5 +243,92 @@ fn select_encoder_resolves_libx264_and_encodes_a_probeable_mp4() {
     assert!(
         mp4_frames >= u64::try_from(FRAMES).unwrap() - 1,
         "the mp4 decodes essentially every frame (got {mp4_frames})"
+    );
+}
+
+/// macOS (ADR-0011): with `videotoolbox`, H.264 / H.265 resolve to Apple's
+/// hardware encoders — system frameworks, so the build stays LGPL-clean — and the
+/// result is a probeable H.264 stream. Runs only on a Mac with the pinned
+/// `FF_HWACCEL=apple` FFmpeg (the macOS CI job and the macOS test host).
+#[cfg(all(
+    feature = "videotoolbox",
+    target_os = "macos",
+    not(feature = "gpl-codecs")
+))]
+#[test]
+fn videotoolbox_build_selects_the_apple_encoders_and_encodes_probeable_h264() {
+    assert_eq!(
+        candidate_encoders(VideoCodec::H264).first().copied(),
+        Some("h264_videotoolbox"),
+        "VideoToolbox is the preferred H.264 encoder on macOS"
+    );
+    assert_eq!(select_encoder(VideoCodec::H264), Some("h264_videotoolbox"));
+    assert_eq!(select_encoder(VideoCodec::H265), Some("hevc_videotoolbox"));
+
+    let dir = TempDir::new().unwrap();
+    let ts = dir.path().join("vt.ts");
+    let packets = encode_to_container("h264_videotoolbox", "mpegts", &ts);
+    assert!(packets > 0, "VideoToolbox produced no packets");
+    let (codec, w, h, frames) = probe_video(&ts);
+    assert_eq!(codec, "h264");
+    assert_eq!((w, h), (W, H));
+    assert_eq!(
+        frames,
+        u64::try_from(FRAMES).unwrap(),
+        "every frame decodes back"
+    );
+}
+
+/// Review VT-OPEN-FALLBACK: a hardware encoder that is registered but does not
+/// open (VM without `VideoToolbox`, GPU without NVENC sessions) must not be
+/// selected; selection falls through to the next permitted candidate, so the
+/// program still encodes. Software candidates are never probed.
+#[test]
+fn an_unusable_hardware_encoder_falls_through_to_the_next_candidate() {
+    use multiview_ffmpeg::{is_hardware_encoder, select_usable_encoder};
+    for codec in [VideoCodec::H264, VideoCodec::H265, VideoCodec::Mpeg2Video] {
+        let mut probed = Vec::new();
+        let picked = select_usable_encoder(codec, &mut |name| {
+            probed.push(name);
+            false // every hardware encoder "fails to open"
+        });
+        assert!(
+            picked.is_none_or(|name| !is_hardware_encoder(name)),
+            "{codec:?}: an unusable hardware encoder was selected: {picked:?}"
+        );
+        assert!(
+            probed.iter().all(|name| is_hardware_encoder(name)),
+            "only hardware candidates are probed: {probed:?}"
+        );
+        // With a working probe, the result equals plain registry selection.
+        assert_eq!(
+            select_usable_encoder(codec, &mut |_| true),
+            select_encoder(codec)
+        );
+    }
+}
+
+/// On macOS with `VideoToolbox`, the real probe opens `h264_videotoolbox`, and a
+/// failing probe yields no H.264 encoder on the LGPL build (no software H.264)
+/// — the pipeline then takes its mpeg2video fallback rather than a dead output.
+#[cfg(all(
+    feature = "videotoolbox",
+    target_os = "macos",
+    not(feature = "gpl-codecs")
+))]
+#[test]
+fn videotoolbox_real_probe_opens_and_a_failed_probe_falls_back() {
+    use multiview_ffmpeg::{probe_encoder_opens, select_usable_encoder};
+    assert!(
+        probe_encoder_opens("h264_videotoolbox"),
+        "VT must open on the Mac test host"
+    );
+    assert_eq!(
+        select_usable_encoder(VideoCodec::H264, &mut |n| probe_encoder_opens(n)),
+        Some("h264_videotoolbox")
+    );
+    assert_eq!(
+        select_usable_encoder(VideoCodec::H264, &mut |_| false),
+        None
     );
 }

@@ -453,12 +453,18 @@ fn logical_codec(token: &str) -> Result<multiview_ffmpeg::VideoCodec, PipelineEr
 /// An unavailable requested codec fails before the clock starts. No output
 /// silently changes its requested codec or substitutes MPEG-2.
 fn resolve_encoder(codec_token: &str) -> Result<ResolvedEncoder, PipelineError> {
-    use multiview_ffmpeg::select_encoder;
+    use multiview_ffmpeg::{probe_encoder_opens, select_usable_encoder};
     let requested = logical_codec(codec_token)?;
-    let name = select_encoder(requested).ok_or_else(|| PipelineError::Codec {
-        codec: codec_token.to_owned(),
-        reason: "requested encoder is unavailable in this build or linked FFmpeg".to_owned(),
-    })?;
+    // A registered hardware encoder (VideoToolbox/NVENC) is used only if it
+    // actually opens here; otherwise the next permitted candidate is taken.
+    let name =
+        select_usable_encoder(requested, &mut |n| probe_encoder_opens(n)).ok_or_else(|| {
+            PipelineError::Codec {
+                codec: codec_token.to_owned(),
+                reason: "requested encoder is unavailable in this build or linked FFmpeg"
+                    .to_owned(),
+            }
+        })?;
     Ok(ResolvedEncoder {
         name: name.to_owned(),
         format: encoder_input_format(name),
@@ -507,7 +513,9 @@ fn recovery_gate(codec: multiview_ffmpeg::VideoCodec) -> Option<RecoveryGate> {
 /// `libx265`, `ffv1`, `mjpeg`, …) take planar `YUV420P` as before — required, as
 /// they do not accept NV12 directly.
 fn encoder_input_format(name: &str) -> Pixel {
-    if name.ends_with("_nvenc") {
+    // VideoToolbox, like NVENC, ingests NV12 natively (it is the native
+    // CVPixelBuffer layout), so the canvas reaches it without a swscale.
+    if name.ends_with("_nvenc") || name.ends_with("_videotoolbox") {
         Pixel::NV12
     } else {
         Pixel::YUV420P
@@ -1515,6 +1523,13 @@ mod encoder_format_tests {
         // libswscale per tick).
         assert_eq!(encoder_input_format("h264_nvenc"), Pixel::NV12);
         assert_eq!(encoder_input_format("hevc_nvenc"), Pixel::NV12);
+    }
+
+    #[test]
+    fn videotoolbox_encoders_are_fed_nv12() {
+        // VideoToolbox's native CVPixelBuffer layout is NV12, like NVENC.
+        assert_eq!(encoder_input_format("h264_videotoolbox"), Pixel::NV12);
+        assert_eq!(encoder_input_format("hevc_videotoolbox"), Pixel::NV12);
     }
 
     #[test]

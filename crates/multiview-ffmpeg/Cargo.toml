@@ -57,6 +57,9 @@ name = "log_flood"
 # libav); on a box with no GPU the NVENC name simply fails to resolve and the
 # selector falls through to software (graceful degradation).
 "cuda" = []
+# Apple VideoToolbox H.264/H.265 encoders (macOS system framework; LGPL-clean).
+# Selected ahead of the software encoders when the linked FFmpeg has them.
+"videotoolbox" = []
 # Test-only DVB-sub MPEG-TS fixture generator (`test_fixtures` module). The
 # Debian/CI FFmpeg CLI cannot transcode a text subtitle into a bitmap `dvbsub`
 # stream, so the cross-crate DVB-sub caption tests build the fixture directly
