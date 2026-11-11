@@ -292,10 +292,11 @@ impl<T> LoadCoordinator<T> {
     /// never supersedes this generation (it commits, then the newer one loads).
     /// The gate is held for a few atomics only, never across I/O.
     pub fn claim_commit(&self, generation: Generation) -> bool {
-        let _gate = self
-            .gate
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _gate = match self.gate.try_lock() {
+            Ok(gate) => gate,
+            Err(TryLockError::Poisoned(error)) => error.into_inner(),
+            Err(TryLockError::WouldBlock) => return false,
+        };
         if self.claimed.load(Ordering::Acquire) == generation.0 {
             return true;
         }
@@ -724,5 +725,22 @@ mod tests {
         let taken = c.try_take(&audio).unwrap();
         assert_eq!((taken.generation, taken.clip), (last, 9_999));
         assert!(c.try_take(&audio).is_none());
+    }
+}
+
+#[cfg(test)]
+mod commit_contention_tests {
+    #[test]
+    fn contended_claim_defers_without_waiting_on_management_admission() {
+        let coordinator = super::LoadCoordinator::<()>::new();
+        let generation =
+            coordinator.submit(super::ClipSpec::new("test", crate::player::LoadThen::Cue));
+        let gate = coordinator
+            .gate
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert!(!coordinator.claim_commit(generation));
+        drop(gate);
+        assert!(coordinator.claim_commit(generation));
     }
 }
