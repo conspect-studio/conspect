@@ -116,7 +116,8 @@ The complete capability/status matrix is in **[FEATURES.md](FEATURES.md)**.
 
 Linux (x86_64 + aarch64, containerised) and macOS (Apple Silicon + Intel, native). Hardware
 acceleration via NVIDIA (NVDEC/NVENC/CUDA), Intel/AMD (VAAPI/QSV), and Apple (VideoToolbox/Metal),
-with a universal software fallback. **No Windows.** Full matrix in
+with a universal software fallback. Native Windows (x86_64) is in progress and not yet shipped
+([ADR-0011](docs/decisions/ADR-0011.md)). Full matrix in
 [docs/architecture/hardware-and-efficiency.md](docs/architecture/hardware-and-efficiency.md).
 
 ---

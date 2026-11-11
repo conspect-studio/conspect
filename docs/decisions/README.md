@@ -14,7 +14,7 @@ These ADRs capture the load-bearing decisions for the Multiview engine. 169 ADRs
 - [ADR-0008](ADR-0008.md) — NDI first-class but feature-gated, dynamically loaded, with attribution
 - [ADR-0009](ADR-0009.md) — Hybrid concurrency: dedicated-thread data plane + Tokio control/IO plane
 - [ADR-0010](ADR-0010.md) — Declarative layered config: TOML/JSON + serde adjacently-tagged enums + JSON Schema
-- [ADR-0011](ADR-0011.md) — Cross-platform targets: Linux containers (NVIDIA + VAAPI) and macOS native universal2
+- [ADR-0011](ADR-0011.md) — Cross-platform targets: Linux containers (NVIDIA + VAAPI), macOS native, Windows native (amended 2026-11-10)
 - [ADR-0012](ADR-0012.md) — LGPL-clean default build; GPL/nonfree/NDI strictly opt-in; project dual MIT OR Apache-2.0
 - [ADR-0013](ADR-0013.md) — Deadline-driven compositor with per-tile FrameSync and continuous drift correction
 - [ADR-0014](ADR-0014.md) — Encode the multiview once per output; size density to physical NVENC chips

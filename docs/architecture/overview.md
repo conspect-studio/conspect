@@ -27,8 +27,8 @@ It is a **hybrid engine**: FFmpeg/libav handles demux/decode/encode (where libav
 differentiators. It targets **commodity hardware** (entry GPUs, Intel iGPUs, AMD APUs, base Apple
 silicon, low-RAM boxes) and aims for **continuous output despite input failures** — a design goal,
 not a warranty. The internal output-clock invariant remains the engineering requirement. Platforms: **Linux**
-(NVIDIA via the Container Toolkit; Intel/AMD via VAAPI) and **macOS** (Apple Silicon + Intel, native).
-**No Windows.**
+(NVIDIA via the Container Toolkit; Intel/AMD via VAAPI), **macOS** (Apple Silicon + Intel, native)
+and **Windows** (x86_64, native; in progress — [ADR-0011](../decisions/ADR-0011.md)).
 
 The decisive design conclusions (verification-hardened) are captured in the deep briefs; the
 one-line versions:

@@ -2,7 +2,8 @@
 # Building Conspect from Source
 
 This guide covers building the `multiview` binary (and its web UI) from source on **Linux** and
-**macOS** — the only supported platforms. **There is no Windows build.**
+**macOS**. Native **Windows** (x86_64) support is being added ([ADR-0011](../decisions/ADR-0011.md)); its
+build steps land with the Windows FFmpeg profile.
 
 Conspect is a Cargo workspace. The **default build is pure-Rust, LGPL-clean, and needs no native
 libraries** (`cargo check` is green in GPU-free CI). Everything that links FFmpeg/libav, touches a

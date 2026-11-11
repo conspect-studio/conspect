@@ -51,8 +51,9 @@ changes (including new architecture decisions).
 
 ## Development environment
 
-Conspect targets **Linux** (x86_64 + aarch64) and **macOS** (Apple Silicon + Intel). There
-is **no Windows support**. The default build is **pure-Rust, LGPL-clean, and has no native
+Conspect targets **Linux** (x86_64 + aarch64) and **macOS** (Apple Silicon + Intel). Native
+Windows (x86_64) support is in progress and not yet shipped
+([ADR-0011](docs/decisions/ADR-0011.md)); do not assume Windows parity yet. The default build is **pure-Rust, LGPL-clean, and has no native
 dependencies** — you can build and run the full software pipeline with nothing but a Rust
 toolchain.
 
