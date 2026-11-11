@@ -156,7 +156,19 @@ struct EgressSession {
     /// production the live driver's `Instant::now()` is always ≥ birth, so the
     /// clamp is a no-op there; it only hardens the seam against clock skew.
     created_at: Instant,
+    /// When the session was closed (tombstoned), for bounded tombstone eviction
+    /// by [`WhepEgress::reap_dead`]. `None` while live.
+    closed_at: Option<Instant>,
 }
+
+/// How long a closed session's tombstone is kept (so a late `DELETE` still sees
+/// it) before [`WhepEgress::reap_dead`] evicts it from the table.
+pub const TOMBSTONE_TTL: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// How long a session that has **never connected** (ICE/DTLS incomplete) may sit
+/// before it is reaped as abandoned. Longer than the connected silence bound
+/// because a TURN-relayed handshake legitimately takes several seconds.
+pub const UNCONNECTED_GRACE: std::time::Duration = std::time::Duration::from_secs(20);
 
 /// A native WHEP egress transport backed by the crate's single str0m
 /// [`Session`]. Implements `multiview_preview::whep::transport::WhepTransport`.
@@ -374,6 +386,7 @@ impl WhepEgress {
             audio,
             sent_video_keyframe: false,
             created_at,
+            closed_at: None,
         };
         match self.sessions.lock() {
             Ok(mut map) => {
@@ -552,6 +565,56 @@ impl WhepEgress {
             .unwrap_or(now)
     }
 
+    /// Liveness sweep: close every live session whose peer has vanished and evict
+    /// expired tombstones, returning the ids closed by **this** call.
+    ///
+    /// A session is dead when its `Rtc` is no longer alive, or when no inbound
+    /// datagram (STUN consent check, DTLS, SRTP/RTCP) was accepted for
+    /// `silence_timeout` once connected — or for [`UNCONNECTED_GRACE`] if it never
+    /// connected. A browser that exits, crashes or loses its network never sends
+    /// `DELETE`, so this is the only signal that the peer is gone. Pure over the
+    /// injected `now` (no wall-clock reads), so it is deterministic under test.
+    /// Bounded: the table shrinks by every reaped tombstone ([`TOMBSTONE_TTL`]).
+    pub fn reap_dead(&self, now: Instant, silence_timeout: std::time::Duration) -> Vec<SessionId> {
+        let Ok(mut map) = self.sessions.lock() else {
+            return Vec::new();
+        };
+        let mut reaped = Vec::new();
+        for (id, entry) in map.iter_mut() {
+            let Some(session) = entry.session.as_ref() else {
+                continue;
+            };
+            let reference = session.last_rx().unwrap_or(entry.created_at);
+            let limit = if session.is_connected() {
+                silence_timeout
+            } else {
+                UNCONNECTED_GRACE.max(silence_timeout)
+            };
+            let silent = now.saturating_duration_since(reference) >= limit;
+            if silent || !session.is_alive() {
+                entry.handle.close();
+                if let Some(mut s) = entry.session.take() {
+                    s.disconnect();
+                }
+                entry.video = None;
+                entry.audio = None;
+                entry.closed_at = Some(now);
+                reaped.push(id.clone());
+            }
+        }
+        map.retain(|_, e| {
+            e.closed_at
+                .is_none_or(|t| now.saturating_duration_since(t) < TOMBSTONE_TTL)
+        });
+        reaped
+    }
+
+    /// The number of tracked sessions, live and tombstoned (for leak assertions).
+    #[must_use]
+    pub fn tracked_sessions(&self) -> usize {
+        self.sessions.lock().map_or(0, |m| m.len())
+    }
+
     /// The ids of every tracked session (live + closed tombstones), for the
     /// endpoint driver to iterate and pump.
     #[must_use]
@@ -644,6 +707,7 @@ impl WhepTransport for WhepEgress {
                 }
                 entry.video = None;
                 entry.audio = None;
+                entry.closed_at.get_or_insert_with(Instant::now);
             }
             // Absent session is not an error (idempotent DELETE).
         }

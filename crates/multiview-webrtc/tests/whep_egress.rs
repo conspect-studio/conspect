@@ -652,3 +652,94 @@ fn learn_relay_is_idempotent_and_de_duplicates() {
         answer.transport.candidates
     );
 }
+
+#[test]
+fn reap_dead_closes_a_silent_session_and_evicts_the_tombstone() {
+    let media = FakeMediaSource::video_only(PreviewCodec::H264, 4);
+    let egress = WhepEgress::new();
+    let ta = egress
+        .accept(VIDEO_OFFER, PreviewCodec::H264, &media)
+        .expect("accept");
+    let t0 = Instant::now();
+    let timeout = Duration::from_secs(8);
+    // Within the (never-connected) grace nothing is reaped.
+    assert_eq!(
+        egress.reap_dead(t0 + Duration::from_secs(5), timeout),
+        Vec::new()
+    );
+    assert_eq!(
+        egress.session_state(&ta.session_id),
+        Some(SessionState::Created)
+    );
+    // Past the grace, with no inbound datagram ever: reaped (injected clock).
+    let dead = egress.reap_dead(t0 + Duration::from_secs(30), timeout);
+    assert_eq!(dead, vec![ta.session_id.clone()]);
+    assert_eq!(
+        egress.session_state(&ta.session_id),
+        Some(SessionState::Closed)
+    );
+    // Reaped once only; the tombstone is then evicted: bounded, no leak.
+    assert_eq!(
+        egress.reap_dead(t0 + Duration::from_secs(31), timeout),
+        Vec::new()
+    );
+    assert_eq!(egress.tracked_sessions(), 1);
+    let _ = egress.reap_dead(t0 + Duration::from_secs(200), timeout);
+    assert_eq!(egress.tracked_sessions(), 0);
+}
+
+#[test]
+fn abandoned_sessions_do_not_accumulate() {
+    let egress = WhepEgress::new();
+    let t0 = Instant::now();
+    for _ in 0..25 {
+        let media = FakeMediaSource::video_only(PreviewCodec::H264, 4);
+        egress
+            .accept(VIDEO_OFFER, PreviewCodec::H264, &media)
+            .expect("accept");
+    }
+    let _ = egress.reap_dead(t0 + Duration::from_secs(40), Duration::from_secs(8));
+    let _ = egress.reap_dead(t0 + Duration::from_secs(300), Duration::from_secs(8));
+    assert_eq!(egress.tracked_sessions(), 0);
+}
+
+#[test]
+fn a_connected_peer_that_goes_silent_is_reaped_after_the_timeout() {
+    let media = FakeMediaSource::video_only(PreviewCodec::H264, 8);
+    let egress_addr: SocketAddr = "[::1]:50001".parse().unwrap();
+    let peer_addr: SocketAddr = "[::1]:50002".parse().unwrap();
+    let mut peer = Session::new(&SessionConfig::default(), Instant::now());
+    peer.add_host_candidate(peer_addr).unwrap();
+    let offer = peer.create_recv_offer(&[MediaKind::Video]).unwrap();
+    let egress = WhepEgress::with_host_candidate(egress_addr);
+    let ta = egress
+        .accept_session(&offer, PreviewCodec::H264, &media)
+        .unwrap();
+    let id = ta.transport.session_id.clone();
+    peer.accept_answer(&ta.sdp_answer).unwrap();
+    let clock = Instant::now();
+    assert!(pump_until(
+        &egress,
+        &id,
+        egress_addr,
+        &mut peer,
+        peer_addr,
+        clock,
+        |_e, p| { p.is_connected() }
+    ));
+    let timeout = Duration::from_secs(8);
+    // The last datagram the session accepted anchors liveness. Shortly after the
+    // handshake the peer is alive; a sweep never reaps it.
+    let soon = clock + Duration::from_secs(60 * 60);
+    // (The pump advanced a synthetic clock only a few seconds at most.)
+    assert_eq!(
+        egress.reap_dead(clock + Duration::from_secs(1), timeout),
+        Vec::new()
+    );
+    assert_eq!(egress.session_state(&id), Some(SessionState::Connected));
+    // The peer vanishes: nothing more is fed to the egress. Past the timeout the
+    // sweep closes the session and frees it (no DELETE involved).
+    let dead = egress.reap_dead(soon, timeout);
+    assert_eq!(dead, vec![id.clone()]);
+    assert_eq!(egress.session_state(&id), Some(SessionState::Closed));
+}
