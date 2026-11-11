@@ -30,7 +30,7 @@ vi.mock('@moq/watch', async () => {
   } };
 });
 vi.mock('./moqConnection', async (original) => ({ ...await original<typeof ConnectionModule>(), connectMoq: mocks.connect }));
-import { MoqUnavailable, startMoqPlayback, startMoqPlaybackWithRefresh, type MoqLease } from './moqPlayback';
+import { MoqUnavailable, startMoqPlayback, startMoqPlaybackWithRefresh, type MoqLease, MoqReleaseUnacknowledged } from './moqPlayback';
 import { AbrController } from './moqAbr';
 const lease: MoqLease = { lease_id: 'a', generation: 1, expires_at: new Date(Date.now()+60000).toISOString(), expires_in_ms: 60000, url: 'https://relay.example', broadcast:'program', protocol:'moq-transport-18', video:{codec:'vp8', coded_width:320, coded_height:180}, audio:[],video_alternatives:[] };
 afterEach(() => {
@@ -57,7 +57,9 @@ describe('MoQ playback lease ownership', () => {
  });
  it('does not permit fallback when release fails', async () => {
   const {options,api} = setup(false); api.release.mockRejectedValue(new Error('not revoked'));
-  await expect(startMoqPlayback(options)).rejects.toThrow('not revoked');
+  const failed = startMoqPlayback(options);
+  await expect(failed).rejects.toThrow('not revoked');
+  await expect(failed).rejects.toBeInstanceOf(MoqReleaseUnacknowledged);
  });
  it('does not classify authorization or capacity as unavailable', async () => {
   const {options,api} = setup(); api.acquire.mockRejectedValue(new Error('forbidden'));

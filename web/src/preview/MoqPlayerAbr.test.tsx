@@ -6,9 +6,11 @@ import { waitFor } from '@testing-library/react';
 import { renderWithProviders } from '../test/render';
 import type { AbrState } from './moqAbr';
 
-const mocks = vi.hoisted(() => ({ start: vi.fn() }));
+const mocks = vi.hoisted(() => ({ start: vi.fn(), Unacknowledged: class extends Error {} }));
 vi.mock('./moqPlayback', () => ({
   MoqUnavailable: class extends Error {},
+  MoqReleaseUnacknowledged: mocks.Unacknowledged,
+  MoqLeaseRefused: class extends Error { reason = 'moq-unavailable'; status = 503; },
   startMoqPlaybackWithRefresh: mocks.start,
 }));
 import { MoqPlayer } from './MoqPlayer';
@@ -53,12 +55,29 @@ describe('MoQ player ABR exposure', () => {
     renderWithProviders(<MoqPlayer api={{ acquire: vi.fn(), release: vi.fn() }}
       label="second" onUnavailable={vi.fn()} onFatal={vi.fn()} />);
     await waitFor(() => { expect(mocks.start).toHaveBeenCalledTimes(2); });
-    fail(new Error('release not acknowledged'));
+    fail(new mocks.Unacknowledged('release not acknowledged'));
     await waitFor(() => { expect(onFatal).toHaveBeenCalledTimes(1); });
     first.unmount();
     renderWithProviders(<MoqPlayer api={{ acquire: vi.fn(), release: vi.fn() }}
       label="third" onUnavailable={vi.fn()} onFatal={vi.fn()} />);
     await waitFor(() => { expect(mocks.start).toHaveBeenCalledTimes(3); });
+  });
+
+  it('reports released after a failed session whose release was acknowledged, and keeps the lease state when it was not', async () => {
+    mocks.start.mockReset();
+    mocks.start.mockRejectedValueOnce(new Error('MoQ session ended'));
+    const clean = { onUnavailable: vi.fn(), onFatal: vi.fn(), onLeaseState: vi.fn() };
+    renderWithProviders(<MoqPlayer api={{ acquire: vi.fn(), release: vi.fn() }} label="clean" {...clean} />);
+    await waitFor(() => { expect(clean.onUnavailable).toHaveBeenCalledWith('session-failed'); });
+    expect(clean.onLeaseState.mock.calls.map(([state]) => state as string)).toEqual(['negotiating', 'released']);
+    expect(clean.onFatal).not.toHaveBeenCalled();
+
+    mocks.start.mockRejectedValueOnce(new mocks.Unacknowledged('release not acknowledged'));
+    const held = { onUnavailable: vi.fn(), onFatal: vi.fn(), onLeaseState: vi.fn() };
+    renderWithProviders(<MoqPlayer api={{ acquire: vi.fn(), release: vi.fn() }} label="held" {...held} />);
+    await waitFor(() => { expect(held.onUnavailable).toHaveBeenCalledWith('release-unacknowledged'); });
+    expect(held.onLeaseState.mock.calls.map(([state]) => state as string)).toEqual(['negotiating']);
+    expect(held.onFatal).toHaveBeenCalledTimes(1);
   });
 
   it('waits for release acknowledgement before a replacement acquires and carries adaptation', async () => {
