@@ -374,6 +374,25 @@ describe('MoQ playback lease ownership', () => {
    await done;
    expect(log.filter((e) => e === 'release L2')).toHaveLength(1);
   }));
+  it('opens no third lease while a failed renewal attempt may still be held', () => withClock(async () => {
+   const { options, api, controller, log } = harness();
+   api.release.mockImplementation((l: MoqLease) => {
+    log.push('release ' + l.lease_id);
+    return l.lease_id === 'L2' ? Promise.reject(new Error('no ack')) : Promise.resolve();
+   });
+   const playback = startMoqPlaybackWithRefresh(options);
+   const done = expect(playback).rejects.toBeInstanceOf(MoqReleaseUnacknowledged);
+   await vi.advanceTimersByTimeAsync(0);
+   mocks.connect.mockRejectedValueOnce(new Error('connect failed'));
+   await run(26000);
+   // L2 was acquired, its connect failed and its release was not acknowledged: no L3 while
+   // L1 plays on, and L1 is neither closed nor released.
+   expect(log.filter((e) => e.startsWith('acquire'))).toEqual(['acquire L1', 'acquire L2']);
+   expect(log).not.toContain('close S1');
+   controller.abort();
+   await vi.advanceTimersByTimeAsync(0);
+   await done;
+  }));
   it('carries ABR adaptation across the switch', () => withClock(async () => {
    const { options, controller } = harness();
    const restore = vi.spyOn(AbrController.prototype, 'restore');

@@ -248,6 +248,9 @@ export async function startMoqPlayback(options: {
 
   /** Acquire, connect, build the player. On failure everything acquired is released first. */
   const openLeg = async (target: HTMLCanvasElement | undefined, visible: boolean): Promise<Leg> => {
+    // The first leg's failure is the caller's error as before; only a renewal attempt's
+    // unacknowledged release is remembered as a possibly-held extra lease.
+    const renewing = !visible;
     // Do not cancel an in-flight allocation: its response is needed to release it.
     const acquireStartedAt = performance.now();
     const lease = await api.acquire(AbortSignal.timeout(10000));
@@ -312,8 +315,14 @@ export async function startMoqPlayback(options: {
       binding?.close();
       player?.close();
       origin.close();
-      // A failed close or release must prevent fallback and any replacement lease.
-      await acknowledged(owned ? owned.close() : api.release(lease));
+      // A failed close or release must prevent fallback and any replacement lease. Remember the
+      // lease's true deadline so no further lease is opened while it may still be held.
+      try {
+        await acknowledged(owned ? owned.close() : api.release(lease));
+      } catch (unacknowledged) {
+        if (renewing) heldUntil = Math.max(heldUntil, deadline);
+        throw unacknowledged;
+      }
       throw error;
     }
   };
@@ -371,29 +380,27 @@ export async function startMoqPlayback(options: {
     const hidden = document.createElement('canvas');
     // The old session is stopped (with a small margin) before its deadline; stay inside that.
     const latest = cur.deadline - Math.min(5000, cur.lease.expires_in_ms * 0.1);
-    while (!cancelled() && st.active === cur && latest - performance.now() > RENEWAL_MIN_WINDOW_MS) {
-      let next: Leg | undefined;
+    while (!cancelled() && st.active === cur && heldUntil <= performance.now() && latest - performance.now() > RENEWAL_MIN_WINDOW_MS) {
+      const attempt: { leg: Leg | undefined } = { leg: undefined };
       try {
-        next = await openLeg(hidden, false);
+        const next = await openLeg(hidden, false);
+        attempt.leg = next;
+        const closedFlag = { value: false };
         const ready = new Promise<boolean>((resolve) => {
-          void next?.binding.firstFrame.then(() => { resolve(true); });
-          void next?.session.closed.then(() => { resolve(false); }, () => { resolve(false); });
+          void next.binding.firstFrame.then(() => { resolve(true); });
+          void next.session.closed.then(() => { closedFlag.value = true; resolve(false); }, () => { closedFlag.value = true; resolve(false); });
           void sleep(Math.max(0, latest - performance.now()), legSignal).then(() => { resolve(false); });
         });
-        if (await ready && !cancelled() && st.active === cur && !cur.expired && !cur.gap) {
+        if (await ready && !closedFlag.value && !cancelled() && st.active === cur && !cur.expired && !cur.gap) {
           switchTo(next);
           return;
         }
         throw new Error('MoQ renewal session did not present');
-      } catch (error) {
-        if (next) {
-          // Also reached when the attempt's own release is unacknowledged; remember it.
-          const failed = next;
+      } catch {
+        if (attempt.leg) {
+          // A connected attempt that did not present: release it; remember it if not ACKed.
+          const failed = attempt.leg;
           await stopLeg(failed).catch(() => { heldUntil = Math.max(heldUntil, failed.deadline); });
-        } else if (error instanceof MoqReleaseUnacknowledged) {
-          // openLeg released its own partial attempt and the ACK failed. Its deadline is at
-          // most one TTL away, which is not known here; assume the full renewal window.
-          heldUntil = Math.max(heldUntil, performance.now() + MOQ_RENEWAL_LEAD_MS);
         }
         if (cancelled()) return;
         await sleep(RENEWAL_RETRY_MS, legSignal);
