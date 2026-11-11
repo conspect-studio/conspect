@@ -6696,6 +6696,140 @@ mod switcher_shed_audio_tests {
         assert_pcm(&next, &pcm_b, 7 * 1920);
     }
 
+    /// Records each encoded job's tick and program PCM; the first encode waits
+    /// on a gate so later jobs (including a CUT) sit in the worker queue.
+    struct GatedRecorder {
+        gate: Option<std::sync::mpsc::Receiver<()>>,
+        seen: Arc<std::sync::Mutex<Vec<(u64, Vec<f32>)>>>,
+    }
+    impl crate::rendition_workers::AudioEncodeWork for GatedRecorder {
+        fn encode(
+            &mut self,
+            job: &crate::rendition_workers::AudioJob,
+        ) -> Result<Vec<EncodedPacket>, PipelineError> {
+            if let Some(gate) = self.gate.take() {
+                let _ = gate.recv();
+            }
+            self.seen
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push((job.tick, job.program.clone()));
+            Ok(Vec::new())
+        }
+        fn finish(&mut self) -> Result<Vec<EncodedPacket>, PipelineError> {
+            Ok(Vec::new())
+        }
+    }
+
+    /// Audio worker × switcher (production-line-convergence.md): the selector is
+    /// resolved on the bake consumer from the tick's own composed item, and the
+    /// worker encodes owned PCM. A CUT mixed while earlier jobs are still queued
+    /// behind a stalled encoder can therefore neither leak the new source into
+    /// pre-CUT ticks nor leave old-source audio on post-CUT ticks, and every
+    /// job's packets are re-associated with the tick it was mixed for.
+    #[test]
+    fn queued_audio_jobs_keep_the_selection_of_their_own_tick_across_a_cut() {
+        let format = AudioFormat::new(48_000, ChannelLayout::Stereo);
+        let tone = |hz: f32| -> Vec<f32> {
+            (0..24_000_u16)
+                .flat_map(|n| {
+                    let sample = 0.2 * (std::f32::consts::TAU * hz * f32::from(n) / 48_000.0).sin();
+                    [sample, sample]
+                })
+                .collect()
+        };
+        let pcm_a = tone(400.0);
+        let pcm_b = tone(1000.0);
+        let a = Arc::new(AudioStore::timeline(format, 24_000));
+        let b = Arc::new(AudioStore::timeline(format, 24_000));
+        a.publish_window(0, &pcm_a).expect("A tone");
+        b.publish_window(0, &pcm_b).expect("B tone");
+        let mut bus = ProgramBus::new(format, Rational::new(25, 1));
+        let pa = bus.add_source("a", Arc::clone(&a), 1.0);
+        let pb = bus.add_source("b", Arc::clone(&b), 1.0);
+        let handle = crate::audio::AudioControlHandle::from_sources(
+            [("a".into(), a), ("b".into(), b)].into_iter().collect(),
+            [("a".into(), pa), ("b".into(), pb)].into_iter().collect(),
+        );
+        let (release, gate) = std::sync::mpsc::channel();
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let dispatched = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = Arc::clone(&dispatched);
+        let worker = crate::rendition_workers::AudioEncodeWorker::spawn(
+            GatedRecorder {
+                gate: Some(gate),
+                seen: Arc::clone(&seen),
+            },
+            move |tick, _packets| {
+                sink.lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .push(tick);
+                Ok(())
+            },
+            |_| Ok(()),
+        )
+        .expect("worker");
+        // Ticks 0..4 on A, CUT to B at tick 4, then B: each mixed block is
+        // offered while the worker is still stalled on tick 0, so the CUT job
+        // and the jobs after it sit in the queue behind the pre-CUT jobs.
+        let mut last = None;
+        for tick in 0..7_u64 {
+            let source = if tick < 4 { "a" } else { "b" };
+            let block = drive_selected_audio_for_item(
+                &mut bus,
+                Some(&handle),
+                &item(tick, source),
+                &mut last,
+            )
+            .expect("audio");
+            worker
+                .offer_within(
+                    crate::rendition_workers::AudioJob {
+                        tick,
+                        frames: block.frame_count(),
+                        program: block.interleaved().to_vec(),
+                        tracks: Vec::new(),
+                    },
+                    std::time::Duration::from_secs(5),
+                )
+                .expect("queue slot");
+        }
+        assert!(
+            seen.lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .is_empty(),
+            "the CUT was mixed while every job was still queued"
+        );
+        release.send(()).expect("release the encoder");
+        worker.join().expect("worker joined");
+        let seen = seen
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        assert_eq!(
+            seen.iter().map(|(tick, _)| *tick).collect::<Vec<_>>(),
+            (0..7).collect::<Vec<_>>()
+        );
+        for (tick, program) in &seen {
+            let expected = if *tick < 4 { &pcm_a } else { &pcm_b };
+            let start = usize::try_from(*tick).expect("tick") * 1920 * 2;
+            assert_eq!(program.len(), 1920 * 2, "tick {tick} exact budget");
+            for (actual, expected) in program.iter().zip(&expected[start..]) {
+                assert!(
+                    (actual - expected).abs() < 1e-5,
+                    "tick {tick} must carry the source composed for tick {tick}"
+                );
+            }
+        }
+        assert_eq!(
+            *dispatched
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+            (0..7).collect::<Vec<_>>(),
+            "packets re-associate with their own tick"
+        );
+    }
+
     fn assert_pcm(block: &multiview_audio::format::AudioBlock, expected: &[f32], start: usize) {
         assert_eq!(block.frame_count(), 1920, "exact current-tick PCM budget");
         for (actual, expected) in block.interleaved().iter().zip(&expected[start * 2..]) {
