@@ -1,6 +1,6 @@
 # Accessibility (WCAG 2.2 AA)
 
-The Multiview management web app targets **WCAG 2.1 and 2.2 Level AA**. This document is the
+The Conspect management web app targets **WCAG 2.1 and 2.2 Level AA**. This document is the
 conformance plan: the per-area approach, the hard surfaces (the react-konva layout editor and the
 realtime multiviewer), and the testing/CI gate that holds the bar.
 

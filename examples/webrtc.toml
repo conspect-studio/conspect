@@ -131,4 +131,7 @@ advertised_addresses = ["2001:db8::15", "192.0.2.15"]
 max_sessions = 64                  # preview + output-viewer pool only;
                                    # ingest/push are admitted outside it
 session_idle_timeout = "30s"       # no media/STUN for 30 s => session GC
+preview_max_focus = 4              # concurrent WHEP preview encodes, server-wide
+preview_max_focus_per_scope = 3    # ... per program/input/output scope
+preview_session_timeout = "8s"     # silent viewer (no STUN/RTCP) => slot freed
 cors_allow_origins = ["*"]         # media-signalling routes only

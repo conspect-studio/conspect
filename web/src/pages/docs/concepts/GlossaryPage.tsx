@@ -16,7 +16,7 @@ export function GlossaryPage(): JSX.Element {
         title={<Trans>Glossary</Trans>}
         description={
           <Trans>
-            Broadcast and streaming terms used across Multiview, alphabetized.
+            Broadcast and streaming terms used across Conspect, alphabetized.
             Use the documentation search to jump straight to a term.
           </Trans>
         }
@@ -42,7 +42,7 @@ export function GlossaryPage(): JSX.Element {
               exploiting the eye's lower sensitivity to color detail. Written
               as ratios: 4:4:4 keeps full color, 4:2:2 halves it horizontally
               (production quality), and 4:2:0 quarters it (virtually all
-              delivery video). Almost every stream Multiview ingests and emits
+              delivery video). Almost every stream Conspect ingests and emits
               is 4:2:0.
             </Trans>
           </Prose>
@@ -63,7 +63,7 @@ export function GlossaryPage(): JSX.Element {
         <DocSection id="display-node" title={<Trans>Display node</Trans>}>
           <Prose>
             <Trans>
-              A small computer running Multiview's own playout software,
+              A small computer running Conspect's own playout software,
               driving one or more physical displays as a managed device.
               Enrolled by keypair identity, display nodes reach the
               frame-accurate sync tier — the class used for video walls.
@@ -126,7 +126,7 @@ export function GlossaryPage(): JSX.Element {
             <Trans>
               A small receive-side buffer that absorbs the uneven arrival of
               network packets so frames can be consumed smoothly. Deeper
-              buffers ride out worse networks but add latency. Each Multiview
+              buffers ride out worse networks but add latency. Each Conspect
               input has its own bounded buffering; an overflowing input drops
               its oldest data rather than growing without limit.
             </Trans>
@@ -137,7 +137,7 @@ export function GlossaryPage(): JSX.Element {
           <Prose>
             <Trans>
               The most recent valid frame a tile has received, held on screen
-              whenever its source hiccups so a brief dropout is invisible.
+              when its source hiccups, to help mask a brief dropout.
               Tiles escalate from holding the last-good frame to a
               reconnect indicator and finally a "no signal" slate if the
               source stays away.
@@ -159,11 +159,11 @@ export function GlossaryPage(): JSX.Element {
         <DocSection id="managed-device" title={<Trans>Managed device</Trans>}>
           <Prose>
             <Trans>
-              Hardware Multiview supervises as declarative desired state: a
+              Hardware Conspect supervises as declarative desired state: a
               decoder, display node, or cast target adopted by the operator.
               A compiled-in driver probes and converges the device, and its
               streams bind as ordinary sources/outputs annotated with
-              device_ref. Program output never depends on any device.
+              device_ref. The design isolates program-output timing from devices.
             </Trans>
           </Prose>
         </DocSection>
@@ -175,7 +175,7 @@ export function GlossaryPage(): JSX.Element {
               receiver uses to tell the network which multicast groups (and,
               with source-specific multicast, which senders) it wants. It is
               the IPv6 successor to IPv4's IGMP and the primary group-join
-              mechanism in Multiview's IPv6-first multicast support.
+              mechanism in Conspect's IPv6-first multicast support.
             </Trans>
           </Prose>
         </DocSection>
@@ -222,7 +222,7 @@ export function GlossaryPage(): JSX.Element {
               The 8-bit 4:2:0 pixel layout (full-resolution brightness plane
               plus interleaved half-resolution color plane, 1.5 bytes per
               pixel) that GPUs and hardware codecs natively produce and
-              consume. It is Multiview's working pixel format end to end —
+              consume. It is Conspect's working pixel format end to end —
               frames stay NV12 through the pipeline and color conversion
               happens on the GPU at tile size.
             </Trans>
@@ -245,7 +245,7 @@ export function GlossaryPage(): JSX.Element {
           <Prose>
             <Trans>
               The timestamp on each frame saying when it should be shown.
-              Real-world streams wrap, jump, and reset their PTS, so Multiview
+              Real-world streams wrap, jump, and reset their PTS, so Conspect
               normalizes every input's timestamps onto one internal timeline
               and stamps its output purely from its own output clock — raw
               input timestamps never reach the output.
@@ -361,7 +361,7 @@ export function GlossaryPage(): JSX.Element {
             <Trans>
               The open standard for playing a WebRTC stream from a browser: the
               player POSTs an SDP offer to a single URL and receives the answer,
-              then media flows over the peer connection. Multiview serves WHEP
+              then media flows over the peer connection. Conspect serves WHEP
               for <Code>webrtc</Code> outputs and for the sub-second in-app live
               preview.
             </Trans>
@@ -373,7 +373,7 @@ export function GlossaryPage(): JSX.Element {
             <Trans>
               The open standard for publishing a WebRTC stream into a server: a
               browser or encoder POSTs an SDP offer to a single URL and receives
-              the answer, then sends media over the peer connection. A Multiview{" "}
+              the answer, then sends media over the peer connection. A Conspect{" "}
               <Code>webrtc</Code> source is published to over WHIP.
             </Trans>
           </Prose>

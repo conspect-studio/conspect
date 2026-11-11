@@ -132,9 +132,9 @@ export function LatencyPage(): JSX.Element {
             </li>
             <li>
               <Trans>
-                Multiview itself never trades the output cadence away: under
-                load it degrades the cheapest tiles first and keeps the
-                program output's timing intact.
+                Conspect is designed to preserve output cadence under load by
+                degrading the cheapest tiles first. This is a design objective,
+                not a guarantee for every workload or host.
               </Trans>
             </li>
           </DocList>

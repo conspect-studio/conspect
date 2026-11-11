@@ -46,12 +46,13 @@ impl FocusCaps {
 }
 
 impl Default for FocusCaps {
-    /// Conservative defaults: a single concurrent focus, server-wide and
-    /// per-scope (ADR-P002: one focus at a time; base Apple silicon = 1 encode
-    /// engine). Deployments raise these via config once the HAL has probed the
-    /// real per-system encode-session ceiling.
+    /// Defaults: 4 concurrent focus sessions server-wide, 3 per scope. Every
+    /// focus is its own preview encode (<= 1280 px / 15 fps / 1.5 Mbit/s), so the
+    /// cap bounds encoder sessions: a few operators plus a reload overlap fit,
+    /// while program outputs keep their headroom. Configurable via
+    /// `webrtc.preview_max_focus*`.
     fn default() -> Self {
-        Self::new(1, 1)
+        Self::new(4, 3)
     }
 }
 
@@ -184,6 +185,12 @@ where
             scope,
             released: false,
         })
+    }
+
+    /// The configured caps (reported by the capabilities document).
+    #[must_use]
+    pub fn caps(&self) -> FocusCaps {
+        self.inner.lock().map_or(FocusCaps::new(0, 0), |g| g.caps)
     }
 
     /// The number of live focus sessions server-wide.

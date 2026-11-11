@@ -1,6 +1,6 @@
 # Timing & Synchronization Model
 
-> **Runbook scope.** This is the single, authoritative description of how Multiview keeps time: the
+> **Runbook scope.** This is the single, authoritative description of how Conspect keeps time: the
 > monotonic output clock, per-input PTS normalization and rebasing, the
 > `input-PTS → normalized-time → output-frame-index` algorithm, NTSC `1001` handling, HLS ingest
 > pacing, and long-run clock-drift correction (video frame-select + audio soft resampling). It is

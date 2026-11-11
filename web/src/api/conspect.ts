@@ -21,7 +21,7 @@
 // the engine.
 import { apiUrl, buildHeaders, OperationApiError, readProblem } from './operations';
 import type { RequestOptions } from './operations';
-import type { components } from './schema';
+import type { components } from './types';
 
 export { OperationApiError } from './operations';
 export type { RequestOptions } from './operations';

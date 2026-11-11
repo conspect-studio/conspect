@@ -36,7 +36,7 @@ TDD-first: failing test committed separately, then green without touching the te
   reuse) follow MC-3 independently; MC-12 (docs) follows MC-6.
 - **The two media gaps the SAP layer depends on:** SAP **bind-to-Source** consumes **MC-3**
   (raw-UDP-TS ingest); SAP **announce** consumes **MC-4** (`Output::Udp` egress — there is no point
-  announcing a stream Multiview cannot emit). The SAP backlog declares those cross-deps.
+  announcing a stream Conspect cannot emit). The SAP backlog declares those cross-deps.
 - **Out of scope this cycle (named, not stubbed):** uncompressed ST 2110-20; a manual `socket2`
   SSM `IP_ADD_SOURCE_MEMBERSHIP` path (libav `sources=` suffices for single-path SSM); full IPv6
   SSM fidelity beyond libav delegation; `SO_RCVBUFFORCE` (behind a `CAP_NET_ADMIN` opt-in);

@@ -16,8 +16,8 @@ import type { SourceView } from '../../resources/types';
 import { renderWithProviders } from '../../test/render';
 
 const SOURCES: readonly SourceView[] = [
-  { id: 'in_a', name: 'Source A', kind: 'test', rawKind: 'test', editable: true, locator: '' },
-  { id: 'in_x', name: 'Source X', kind: 'rtsp', rawKind: 'rtsp', editable: true, locator: 'rtsp://x' },
+  { id: 'in_a', name: 'Source A', kind: 'test', rawKind: 'test', editable: true, locator: '', eventObservation: 'not_supported' },
+  { id: 'in_x', name: 'Source X', kind: 'rtsp', rawKind: 'rtsp', editable: true, locator: 'rtsp://x', eventObservation: 'not_supported' },
 ];
 
 /** The frigate demo working-layout body (the seeded 2x2 grid). */

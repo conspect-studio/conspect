@@ -118,6 +118,13 @@ export function FieldErrorMessage({ code }: { readonly code: FormErrorCode }): J
       return <Trans>Add at least one member device to the group.</Trans>;
     case 'duplicate-member':
       return <Trans>This device is already a member of the group.</Trans>;
+    case 'header-invalid':
+      return (
+        <Trans>
+          A header value must be printable, with no line breaks, and at most
+          1024 characters.
+        </Trans>
+      );
   }
 }
 
@@ -392,6 +399,59 @@ export function DerivedUrlField({
   );
 }
 
+/**
+ * One derived viewer **playback URL** row (ADR-0101 — "a link to copy the
+ * actual URL to paste into a tool like VLC"): the URL itself (via
+ * {@link DerivedUrlField}'s existing copy-to-clipboard field) plus an "Open in
+ * VLC" row that copies the server-derived {@link vlcCommand} text (NOT a
+ * rebuilt `vlc <url>` — an SRT row's correct VLC form is
+ * `vlc --srt-latency=<ms> srt://host:port`, since VLC's `srt://` access does
+ * not read the ffmpeg-style `latency=`/`streamid=` URL query the way
+ * ffmpeg/ffplay do; every other kind's `vlcCommand` is plain `vlc <url>`),
+ * and any operator-facing notes (a passphrase reminder, a redacted push
+ * destination, a missing-public-host explanation). When this entry carries no
+ * URL (a push destination, or an unresolvable listener), only the notes
+ * render.
+ */
+export function PlaybackUrlRow({
+  idPrefix,
+  label,
+  url,
+  vlcCommand,
+  notes,
+}: {
+  readonly idPrefix: string;
+  readonly label: string;
+  readonly url: string | undefined;
+  /** The server-derived `vlc …` command (ADR-0101); `undefined` when `url` is. */
+  readonly vlcCommand: string | undefined;
+  readonly notes: readonly string[];
+}): JSX.Element {
+  const { t } = useLingui();
+  return (
+    <div className="flex flex-col gap-2 rounded-md border border-border p-3">
+      {url !== undefined ? (
+        <>
+          <DerivedUrlField id={`${idPrefix}-url`} label={label} value={url} />
+          <DerivedUrlField
+            id={`${idPrefix}-vlc-command`}
+            label={t`Open in VLC`}
+            value={vlcCommand ?? `vlc ${url}`}
+            hint={<Trans>Paste this command into a terminal to open the stream in VLC.</Trans>}
+          />
+        </>
+      ) : (
+        <p className="text-sm font-medium">{label}</p>
+      )}
+      {notes.map((note, index) => (
+        <p key={index} className="text-xs text-muted-foreground">
+          {note}
+        </p>
+      ))}
+    </div>
+  );
+}
+
 /** A labelled <Select> over fixed string options, with optional display text. */
 export function SelectField<Option extends string>({
   label,
@@ -560,7 +620,7 @@ export function ApplySemanticsCallout({
           <Trans>
             Changes saved here are stored, not yet live: the engine does not
             hot-add outputs. Apply them by exporting the configuration and
-            restarting Multiview. Layout apply, source swap, routing, and
+            restarting Conspect. Layout apply, source swap, routing, and
             salvos act on the running engine immediately.
           </Trans>
         )}{' '}
@@ -588,7 +648,7 @@ export function ExportConfigButton({
         downloadConfigExport(result);
         toast({
           title: t`Configuration exported`,
-          description: t`Saved as ${result.filename}. Restart Multiview with this file to apply stored changes.`,
+          description: t`Saved as ${result.filename}. Restart Conspect with this file to apply stored changes.`,
         });
       })
       .catch((error: unknown): void => {
@@ -608,7 +668,11 @@ export function ExportConfigButton({
       });
   };
   return (
-    <Button variant={compact ? 'outline' : 'default'} onClick={exportNow}>
+    <Button
+      variant={compact ? 'outline' : 'default'}
+      className="h-auto min-h-12 min-w-12 max-w-full whitespace-normal"
+      onClick={exportNow}
+    >
       <Download aria-hidden="true" />
       <Trans>Export configuration</Trans>
     </Button>

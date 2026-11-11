@@ -571,7 +571,10 @@ pub struct MeasuredPreviewConfig {
 impl MeasuredPreviewConfig {
     /// Validate without opening any encoder or exposing internal parent metadata.
     #[must_use]
-    pub fn into_startup(self) -> Option<crate::preview_vertical::PreviewStartup> {
+    pub fn into_startup(
+        self,
+        budget: &crate::preview_vertical::PreviewAdmissionBudget,
+    ) -> Option<crate::preview_vertical::PreviewStartup> {
         crate::preview_vertical::PreviewStartup::new(
             self.parent_output,
             self.production,
@@ -581,6 +584,7 @@ impl MeasuredPreviewConfig {
             self.audio_once_bps,
             self.overhead_bps,
         )
+        .map(|startup| startup.with_admission_budget(budget))
     }
 }
 /// Install only explicit measured configuration before the run starts.
@@ -588,6 +592,7 @@ impl MeasuredPreviewConfig {
 /// Returns unavailable when explicit measured configuration cannot be admitted.
 pub fn configure_optional_preview(
     pipeline: &mut crate::pipeline::Pipeline,
+    budget: &crate::preview_vertical::PreviewAdmissionBudget,
 ) -> Result<(), multiview_control::moq::MoqReject> {
     let Some(path) = std::env::var("MULTIVIEW_MOQ_PREVIEW_CONFIG_FILE").ok() else {
         return Ok(());
@@ -601,7 +606,7 @@ pub fn configure_optional_preview(
     };
     pipeline.set_optional_preview(
         config
-            .into_startup()
+            .into_startup(budget)
             .ok_or(multiview_control::moq::MoqReject::Unavailable)?,
     );
     Ok(())
@@ -619,8 +624,38 @@ mod measured_config_tests {
     fn absent_capacity_and_measurements_fail_engine_constructor() {
         let source = r#"{"parent_output":"out","production":[],"requests":[],"capacity":null,"measured":[],"audio_once_bps":0,"overhead_bps":0}"#;
         let config: MeasuredPreviewConfig = serde_json::from_str(source).unwrap();
-        assert!(config.into_startup().is_none());
+        assert!(config
+            .into_startup(&crate::preview_vertical::PreviewAdmissionBudget::new())
+            .is_none());
     }
+    #[test]
+    fn separately_parsed_reload_requests_keep_the_run_budget() {
+        let key = serde_json::json!({"program":"main","bus":"main","codec":"h264",
+            "encoder_name":"libx264","width":64,"height":64,"cadence":{"num":30,"den":1},
+            "bitrate_bps":100_000,"codec_profile":null,"pixel_format":"nv12",
+            "color":"sdr-bt709-limited","gpu_pin":null,"codec_config":null});
+        let cost = serde_json::json!({"encoder_sessions":1,"cpu_units":1,"gpu_units":0,
+            "memory_bytes":1024,"uplink_bps":100_000});
+        let source = serde_json::json!({"parent_output":"out",
+            "production":[{"output_id":"out","key":key,"cost":cost}],
+            "requests":[{"profile_id":"p","key":key}],"capacity":cost,
+            "measured":[[key,cost]],"audio_once_bps":0,"overhead_bps":0})
+        .to_string();
+        let budget = crate::preview_vertical::PreviewAdmissionBudget::new();
+        let native = budget.acquire().unwrap();
+        for _ in 0..100 {
+            let parsed: MeasuredPreviewConfig = serde_json::from_str(&source).unwrap();
+            let request = parsed.into_startup(&budget).unwrap();
+            assert!(
+                crate::preview_vertical::RuntimePermit::acquire(request.runtime_gate).is_none()
+            );
+        }
+        drop(native);
+        let parsed: MeasuredPreviewConfig = serde_json::from_str(&source).unwrap();
+        let request = parsed.into_startup(&budget).unwrap();
+        assert!(crate::preview_vertical::RuntimePermit::acquire(request.runtime_gate).is_some());
+    }
+
     #[test]
     fn malformed_typed_cadence_is_not_interpreted_as_default() {
         let source = r#"{"profile_id":"p","key":{"program":"main","bus":"main","codec":"h264","encoder_name":"libx264","width":64,"height":64,"cadence":"invalid","bitrate_bps":100000,"codec_profile":null,"pixel_format":"yuv420p","color":"sdr-bt709-limited","gpu_pin":null,"codec_config":null}}"#;

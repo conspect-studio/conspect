@@ -1,6 +1,14 @@
 # Research & Design Briefs
 
-Deep, verification-hardened design records that back the Multiview implementation. Each was produced by a multi-agent research workflow that fanned out, adversarially verified its load-bearing claims, and synthesized an authoritative brief. Canonical naming is in [../architecture](../architecture/); decisions in [../decisions](../decisions/).
+> **Historical records:** briefs retain the product name Multiview and dated implementation or
+> licensing assumptions where used at the time. The product is now Conspect. These records are
+> not current license grants: see [LICENSE](../../LICENSE) for the Conspect Source-Available
+> Non-Commercial License Version 2.0. Private study and copies necessary for authorized use are
+> permitted, not general modification, redistribution or reproduction; older broad free-use,
+> sponsorship-threshold or redistribution statements do not describe current eligibility.
+> Earlier grants remain governed by their original terms. Technical identifiers are unchanged.
+
+Deep, verification-hardened design records that back the Conspect implementation. Each was produced by a multi-agent research workflow that fanned out, adversarially verified its load-bearing claims, and synthesized an authoritative brief. Canonical naming is in [../architecture](../architecture/); decisions in [../decisions](../decisions/).
 
 - [Core Engine Architecture](core-engine.md) — Core Engine
 - [Bulletproof Output, Resilience & A/V](resilience-and-av.md) — Resilience & A/V

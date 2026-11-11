@@ -35,11 +35,22 @@ export type WhepPlayerStatus = 'connecting' | 'playing' | 'failed';
 /** How long to wait for ICE gathering to complete before POSTing anyway. */
 const GATHER_TIMEOUT_MS = 2000;
 
+/** Max wait for an earlier session's DELETE before offering anyway. */
+const RELEASE_WAIT_MS = 5000;
+
 /** How long inbound bytes may stay flat after connect before we call it stalled. */
 const STALL_TIMEOUT_MS = 6000;
 
 /** The watchdog poll cadence. */
 const STATS_POLL_MS = 1000;
+
+/**
+ * Releases (DELETE) still in flight from earlier players in this page. The
+ * engine admits one live viewer and frees the slot only on DELETE, so a new
+ * offer must never overlap this client's previous session's release (a
+ * remount / strict-mode double effect otherwise gets a 503 from itself).
+ */
+const pendingReleases = new Set<Promise<void>>();
 
 /**
  * Wait for ICE gathering to complete, or `GATHER_TIMEOUT_MS`, whichever first —
@@ -105,7 +116,8 @@ export function WhepPlayer({
   readonly onSessionReleased?: (() => void) | undefined;
   /** Reports the negotiation barrier and actual lease lifecycle. */
   readonly onLeaseState?: ((state: 'negotiating' | 'active' | 'released') => void) | undefined;
-  readonly onBusy?: (() => void) | undefined;
+  /** Called on a 503; `capacity` is true for the `whep-capacity` problem type. */
+  readonly onBusy?: ((capacity: boolean) => void) | undefined;
 }): JSX.Element {
   const { t } = useLingui();
   const videoRef = useRef<HTMLVideoElement>(null);
@@ -151,11 +163,15 @@ export function WhepPlayer({
       }
       return response;
     };
+    // Only releases begun BEFORE this player existed (never a later one: that
+    // would deadlock against its own wait on us).
+    const earlierReleases = [...pendingReleases];
     const pc = pcFactory(rtcConfig ?? {});
     onLeaseState?.('negotiating');
     let releaseStarted: Promise<void> | undefined;
     const release = (): Promise<void> => {
-      releaseStarted ??= (async (): Promise<void> => {
+      if (releaseStarted !== undefined) return releaseStarted;
+      const run = (async (): Promise<void> => {
         if (sessionUrl === undefined) await negotiationDone;
         if (sessionUrl !== undefined) {
           const url = sessionUrl;
@@ -165,7 +181,10 @@ export function WhepPlayer({
         onLeaseState?.('released');
         onSessionReleased?.();
       })();
-      return releaseStarted;
+      releaseStarted = run;
+      pendingReleases.add(run);
+      void run.finally(() => { pendingReleases.delete(run); });
+      return run;
     };
 
     const setStatusOnce = (next: WhepPlayerStatus): void => {
@@ -281,6 +300,12 @@ export function WhepPlayer({
       const offer = await pc.createOffer();
       await pc.setLocalDescription(offer);
       await awaitIceGathering(pc);
+      // Serialise: wait for any earlier session's DELETE (not our own).
+      // Bounded: a wedged earlier release must not block live video forever.
+      await Promise.race([
+        Promise.all(earlierReleases),
+        new Promise<void>((resolve) => { window.setTimeout(resolve, RELEASE_WAIT_MS); }),
+      ]);
       if (aborted()) {
         return;
       }
@@ -302,7 +327,7 @@ export function WhepPlayer({
 
     const negotiationDone = negotiate().catch((error: unknown) => {
       if (error instanceof WhepSignalingError && error.status === 503 && !aborted()) {
-        onBusyRef.current?.();
+        onBusyRef.current?.(error.isCapacity);
       }
       fail(httpStatus === 503 ? 'http-capacity' : httpStatus !== null && (httpStatus < 200 || httpStatus >= 300) ? 'http-error' : 'signaling');
     });

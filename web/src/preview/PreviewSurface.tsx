@@ -9,7 +9,8 @@
 //     (non-2xx POST incl. 503 capacity, connectionState=failed, or the stats
 //     stall watchdog) with a VISIBLE "Fallback — still preview" badge and a
 //     "retry live preview" affordance (a fresh WHEP attempt), never a hot loop.
-import { useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
+import { createPortal } from 'react-dom';
 import { MoqPlayer } from './MoqPlayer';
 import { createMoqLeaseApi } from './moqLeaseApi';
 import type { JSX } from 'react';
@@ -19,6 +20,7 @@ import { RotateCw, Wifi } from 'lucide-react';
 import { Button } from '../components/ui/button';
 import { whepAvailable } from './capabilities';
 import type { PreviewCapabilities, PreviewScope } from './capabilities';
+import { capacityRetryDelayMs } from './capacityBackoff';
 import { useJpegPreview } from './useJpegPreview';
 import { PreviewDiagnostics } from './PreviewDiagnostics';
 import type { PreviewDiagnostics as Diagnostics } from './diagnostics';
@@ -55,6 +57,7 @@ function JpegRung({
   label,
   className,
   degraded,
+  capacity = false,
   onRetry,
 }: {
   readonly jpegPath: string;
@@ -62,6 +65,8 @@ function JpegRung({
   readonly className?: string | undefined;
   /** True when this rung is a DEGRADATION from WHEP (shows the badge). */
   readonly degraded: boolean;
+  /** True when the engine refused live video because another viewer holds the slot. */
+  readonly capacity?: boolean;
   readonly onRetry?: (() => void) | undefined;
 }): JSX.Element {
   const { t } = useLingui();
@@ -71,24 +76,29 @@ function JpegRung({
       <JpegImage src={src} label={label} className={className} />
       {degraded ? (
         <div
-          className="absolute left-2 top-2 flex items-center gap-2 rounded-md bg-background/85 px-2 py-1 text-xs"
+          className="absolute left-2 top-2 flex max-w-[calc(100%-1rem)] flex-nowrap items-center gap-2 rounded-md bg-background/85 px-2 py-1 text-xs"
           role="status"
           data-testid="fallback-badge"
         >
           <Wifi className="size-3.5 text-muted-foreground" aria-hidden="true" />
-          <span>
-            <Trans>Fallback — still preview (~1 fps)</Trans>
+          <span data-testid="fallback-reason" className="ps-reason min-w-0 truncate">
+            {capacity ? (
+              <Trans>Live video in use by another viewer — showing stills</Trans>
+            ) : (
+              <Trans>Fallback — still preview (~1 fps)</Trans>
+            )}
           </span>
           {onRetry !== undefined ? (
             <Button
               type="button"
               variant="ghost"
               size="sm"
-              className="h-6 gap-1 px-1.5"
+              className="h-6 shrink-0 gap-1 px-1.5"
+              aria-label={t`Retry live preview`}
               onClick={onRetry}
             >
               <RotateCw className="size-3.5" aria-hidden="true" />
-              <span>{t`Retry live preview`}</span>
+              <span className="ps-retry-label">{t`Retry live preview`}</span>
             </Button>
           ) : null}
         </div>
@@ -118,6 +128,7 @@ export function PreviewSurface({
   fetchImpl,
   onSessionReleased,
   onLeaseState,
+  diagnosticsHost,
 }: {
   readonly scope: PreviewScope;
   /** The WHEP endpoint for this scope (e.g. `/api/v1/preview/program/whep`). */
@@ -134,6 +145,8 @@ export function PreviewSurface({
   readonly fetchImpl?: typeof fetch | undefined;
   readonly onSessionReleased?: (() => void) | undefined;
   readonly onLeaseState?: ((state: 'negotiating' | 'active' | 'released') => void) | undefined;
+  /** When set, the fallback diagnostics + busy note render into this element (below the picture) behind one disclosure. */
+  readonly diagnosticsHost?: HTMLElement | null | undefined;
 }): JSX.Element {
   // A monotonically-increasing attempt id: bumping it remounts <WhepPlayer> for
   // a fresh negotiation (the "retry live preview" affordance). `degraded` flips
@@ -142,12 +155,48 @@ export function PreviewSurface({
   const [degraded, setDegraded] = useState(false);
   const [diagnostics, setDiagnostics] = useState<Diagnostics>();
   const [busy, setBusy] = useState(false);
+  const [capacity, setCapacity] = useState(false);
+  const refusals = useRef(0);
   const [released, setReleased] = useState(true);
 
   const [moqUnavailable, setMoqUnavailable] = useState(false);
   const [moqFailed, setMoqFailed] = useState(false);
   const moqApi = useMemo(() => createMoqLeaseApi(scope, whepEndpoint), [scope, whepEndpoint]);
   const canWhep = whepAvailable(capabilities, scope);
+  const retryNow = (): void => {
+    setBusy(false);
+    setCapacity(false);
+    setDegraded(false);
+    setAttempt((n) => n + 1);
+  };
+  const retryRef = useRef(retryNow);
+  useEffect(() => { retryRef.current = retryNow; });
+
+  // After a `whep-capacity` refusal retry on a bounded backoff, once our own
+  // previous session is released, and never while the tab is hidden.
+  const autoRetry = degraded && capacity && released;
+  useEffect(() => {
+    if (!autoRetry) return;
+    let timer: number | undefined;
+    const arm = (): void => {
+      timer = window.setTimeout(() => {
+        if (document.visibilityState === 'hidden') return; // resume on visibilitychange
+        retryRef.current();
+      }, capacityRetryDelayMs(Math.max(refusals.current - 1, 0)));
+    };
+    const onVisible = (): void => {
+      if (document.visibilityState === 'visible' && timer !== undefined) {
+        window.clearTimeout(timer);
+        retryRef.current();
+      }
+    };
+    arm();
+    document.addEventListener('visibilitychange', onVisible);
+    return (): void => {
+      window.clearTimeout(timer);
+      document.removeEventListener('visibilitychange', onVisible);
+    };
+  }, [autoRetry, attempt]);
 
   if (moqFailed) return <div role="alert"><Trans>Live input preview failed.</Trans></div>;
   if (capabilities?.moq && !moqUnavailable) {
@@ -173,20 +222,37 @@ export function PreviewSurface({
   // retry that re-arms a fresh WHEP attempt.
   if (degraded) {
     if (scope === 'input') {
-      return <div role="alert" className="px-3 py-2 text-sm" data-testid="input-preview-unavailable">{busy ? <Trans>Live input preview is busy. Another viewer has the session.</Trans> : <Trans>Live input preview failed.</Trans>}{released ? <Button type="button" onClick={(): void => { setBusy(false); setDegraded(false); setAttempt((n) => n + 1); }}>Retry live preview</Button> : null}{diagnostics ? <PreviewDiagnostics diagnostics={diagnostics} /> : null}</div>;
+      return <div role="alert" className="px-3 py-2 text-sm" data-testid="input-preview-unavailable">{busy ? <Trans>Live input preview is busy. Another viewer has the session.</Trans> : <Trans>Live input preview failed.</Trans>}{released ? <Button type="button" onClick={retryNow}>Retry live preview</Button> : null}{diagnostics ? <PreviewDiagnostics diagnostics={diagnostics} /> : null}</div>;
     }
+    const busyNote = busy && !capacity ? <p role="alert"><Trans>Live preview is busy. Another viewer has the session.</Trans></p> : null;
+    const details = diagnostics ? <PreviewDiagnostics diagnostics={diagnostics} flat={diagnosticsHost != null} /> : null;
     return (
-      <><JpegRung
-        jpegPath={jpegPath}
-        label={label}
-        degraded
-        className={className}
-        {...(released ? { onRetry: (): void => {
-          setBusy(false);
-          setDegraded(false);
-          setAttempt((n) => n + 1);
-        } } : {})}
-      />{busy ? <p role="alert"><Trans>Live preview is busy. Another viewer has the session.</Trans></p> : null}{diagnostics ? <PreviewDiagnostics diagnostics={diagnostics} /> : null}</>
+      <>
+        <JpegRung
+          jpegPath={jpegPath}
+          label={label}
+          degraded
+          capacity={capacity}
+          className={className}
+          {...(released ? { onRetry: retryNow } : {})}
+        />
+        {diagnosticsHost ? (
+          createPortal(
+            <>
+              {busyNote}
+              {details ? (
+                <details className="ps-diagnostics" data-testid="fallback-diagnostics">
+                  <summary><Trans>Why live preview failed</Trans></summary>
+                  {details}
+                </details>
+              ) : null}
+            </>,
+            diagnosticsHost,
+          )
+        ) : (
+          <>{busyNote}{details}</>
+        )}
+      </>
     );
   }
 
@@ -205,7 +271,11 @@ export function PreviewSurface({
         setReleased(state === 'released');
         onLeaseState?.(state);
       }}
-      onBusy={(): void => { setBusy(true); }}
+      onStatus={(status): void => { if (status === 'playing') refusals.current = 0; }}
+      onBusy={(isCapacity): void => {
+        setBusy(true);
+        if (isCapacity) { refusals.current += 1; setCapacity(true); }
+      }}
       onFatal={(details): void => {
         setDiagnostics(details);
         setDegraded(true);

@@ -71,7 +71,7 @@ function driverLabel(driver: DeviceDriver): JSX.Element {
     case 'zowietek':
       return <Trans>ZowieBox-class decoder/encoder (zowietek)</Trans>;
     case 'displaynode':
-      return <Trans>Multiview display node (displaynode)</Trans>;
+      return <Trans>Conspect display node (displaynode)</Trans>;
     case 'cast':
       return <Trans>Cast device (cast)</Trans>;
   }

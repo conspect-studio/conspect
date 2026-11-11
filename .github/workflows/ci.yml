@@ -852,6 +852,17 @@ jobs:
         # fail on an unpatched 9.0.2, so this step enforces the carried patch.
         timeout-minutes: 10
         run: cargo test --locked -p multiview-ffmpeg --features ffmpeg --lib avio_fetch
+      - name: test multiview-ffmpeg + multiview-output against the pinned FFmpeg
+        # #215: the full ffmpeg-feature suites of the libav-owning crates (caption
+        # decoders, bitstream filters, containers, HLS live sink) on the exact
+        # pinned build. Before this, they ran nowhere in CI and 15 tests had
+        # silently failed for weeks because components were missing from the
+        # --disable-everything allowlist.
+        timeout-minutes: 20
+        run: >
+          cargo test --locked --no-fail-fast
+          -p multiview-ffmpeg -p multiview-output
+          --features multiview-ffmpeg/ffmpeg,multiview-output/ffmpeg
       - name: test multiview-audio --features ffmpeg
         # Committed MOV/pcm_s16le fixtures need only the pinned build's demuxer
         # and decoder: no second system FFmpeg CLI or unavailable WAV demuxer.
@@ -1265,3 +1276,42 @@ jobs:
             echo "::error::i18n catalogs are stale. Run 'npm --prefix web run i18n:extract -- --clean && npm --prefix web run i18n:compile' and commit web/src/locales/**."
             exit 1
           fi
+
+  # ── standalone Live Feed Exchange engine client (#205/#388) ──────────────────
+  # tools/media-crypto and tools/native-exchange-runtime are standalone crates
+  # (own [workspace], own Cargo.lock, own target/), so the workspace jobs above
+  # never build them. This job gates both with fmt, strict clippy and their
+  # tests. The native connected tests generate real HEVC + AAC fixtures with the
+  # runner's ffmpeg/ffprobe CLI (a test-time tool only: nothing is linked or
+  # vendored, the default workspace build stays LGPL-clean and GPU-free).
+  native-exchange:
+    name: native exchange client (media-crypto + native-exchange-runtime)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    needs: changes
+    if: ${{ github.event_name != 'pull_request' || needs.changes.outputs.code == 'true' }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@1.99.1
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            tools/media-crypto -> target
+            tools/native-exchange-runtime -> target
+      - name: install ffmpeg (libx265 + aac test fixtures)
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends ffmpeg
+      - name: rustfmt
+        run: |
+          cargo fmt --manifest-path tools/media-crypto/Cargo.toml -- --check
+          cargo fmt --manifest-path tools/native-exchange-runtime/Cargo.toml -- --check
+      - name: clippy
+        run: |
+          cargo clippy --locked --manifest-path tools/media-crypto/Cargo.toml --all-targets -- -D warnings
+          cargo clippy --locked --manifest-path tools/native-exchange-runtime/Cargo.toml --all-targets -- -D warnings
+      - name: test media-crypto
+        run: cargo test --locked --manifest-path tools/media-crypto/Cargo.toml
+      - name: test native-exchange-runtime
+        # Wall-clock TLS scenarios with real 5 s epochs: one at a time.
+        run: cargo test --locked --manifest-path tools/native-exchange-runtime/Cargo.toml -- --test-threads=1

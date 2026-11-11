@@ -1,14 +1,16 @@
-Multiview Source-Available Non-Commercial License
-Version 1.0
+Conspect Source-Available Non-Commercial License
+Version 2.0
 
 Copyright © 2026 Aperim Pty Ltd (ABN 46 150 699 737), Suite 108, 9 Hutchinson
 Street, St Peters, NSW 2044, Australia. All rights reserved except as expressly
 granted in this License.
 
-PLAIN-LANGUAGE SUMMARY (not part of the License). The source of Multiview is made
-available to you. You may use, modify, and share it FOR FREE for genuine personal,
-home, hobby, and other non-commercial use, and under the three free exceptions in
-Section 5. ALL OTHER USE — including by businesses, educational institutions,
+PLAIN-LANGUAGE SUMMARY (not part of the License). The source of Conspect is made
+available for reading and learning, not as a general permission to copy, modify,
+redistribute, or reproduce it. Free product use is limited to personal, home, hobby
+and learning use and the three express exceptions in Section 5, subject to the
+religious-use and monetization exclusions below. Free use excludes paid and metered
+features and comes with no warranty, subject to non-excludable legal rights. ALL OTHER USE — including by businesses, educational institutions,
 governments, product/appliance makers, and content creators/streamers — is
 Commercial Use and requires a paid Commercial License from us. This is a
 source-available license; it is NOT an open-source or free-software license.
@@ -18,16 +20,16 @@ License 1.0.0 (https://polyformproject.org/licenses/noncommercial/1.0.0).
 
 ---
 
-## Multiview Source-Available Non-Commercial License
+## Conspect Source-Available Non-Commercial License
 
 Licensor: Aperim Pty Ltd (ABN 46 150 699 737) ("we", "us", "our").
-Software: the Multiview software and any files distributed with this License ("the
+Software: the Conspect software and any files distributed with this License ("the
 software").
 
 ### 0. Purpose and intent (recital)
 
 We make the source of the software available and grant free use for genuine
-personal, home, hobby, and non-commercial purposes, together with three specific
+personal, home, hobby, and learning purposes, together with three specific
 free exceptions defined below. All other use is commercial use and requires a
 separate Commercial License from us. We deliberately treat use by businesses,
 educational institutions, governments, product/appliance makers, and content
@@ -43,19 +45,41 @@ anything with the software that triggers a rule you cannot or will not follow.
 
 ### 2. Grant of free use
 
-We grant you a copyright license to use, copy, modify, and distribute the software,
-for free, but only for a Permitted Purpose (Section 3) and subject to the rules and
-notices below. This License does not grant rights in any third-party material except
-as that material's own license allows (Section 9).
+We grant you a limited copyright license to run the software for a Permitted
+Purpose (Section 3), and to download, build without modification, install, and make
+copies reasonably necessary for that authorized use. You may read and study the
+source privately to learn how the system works, including making copies reasonably
+necessary for that private study. These grants are subject to the rules below.
+
+No general right to modify, distribute, sublicense, or reproduce the software in
+whole or in part is granted. Creating a copy, port, fork, derivative product, or
+reimplementation that reproduces protected code or other protected expression
+requires separate written permission, whether done manually or with an AI agent.
+For example, pointing an agent at this codebase and instructing it to "reproduce
+this" to copy Conspect, in whole or in part, is not authorized and violates this
+License. Reading code to understand an output clock or media pipeline is permitted;
+copying that implementation into another product is not. A paid license to operate
+Conspect does not itself grant source-reuse rights unless it expressly says so.
+
+This restriction does not claim ownership of ideas, facts, general techniques, or
+independently developed implementations that do not reproduce protected expression.
+It does not restrict rights that applicable law cannot exclude, or third-party
+rights under Section 9.
+
+Free use grants no entitlement to paid or metered features, services, credits, or
+usage. These require their applicable separate authorization and payment even when
+your underlying product use qualifies as free. Free use carries no warranty of any
+kind, including fitness for use or for a particular purpose (Section 13).
 
 ### 3. Permitted Purpose (free use)
 
 A Permitted Purpose is only one of the following:
 
-3.1 Personal / home use. Use unconnected with any trade, business, or profession of
-the user — that is, for private study, private entertainment, hobby projects,
-amateur pursuits, experiment, and testing — by a natural person acting in a personal
-capacity, without any anticipated commercial application. Eligibility under this
+3.1 Personal / home use. Personal, home, hobby, or private learning use by a natural
+person acting in a personal capacity, unconnected with any trade, business, or
+profession, without any current or anticipated commercial application and not
+excluded by Section 4(g) or 4(h). Private study, entertainment, experimentation and
+testing qualify only within those purposes, not as independent exceptions. Eligibility under this
 clause turns on the capacity in which the software is used, not on the user's status:
 a person who is a sole trader, business owner, employee, teacher, public servant, or
 content creator may still use the software under this clause for genuinely personal
@@ -82,9 +106,10 @@ third party, and whether or not you further distribute it. Running or otherwise 
 the software — as supplied by us or as modified, and whether standalone or
 incorporated into anything else — for any purpose that is not a Permitted Purpose is
 Commercial Use and requires a Commercial License. Building a product, service, fork,
-or derivative on the software does not escape this License: a fork or derivative is
-licensed to its recipients only on these same terms, and any commercial use of it (or
-of the unmodified software) is Commercial Use.
+or derivative on the software does not escape these restrictions. Section 2 does
+not authorize creating or distributing a fork or derivative; separate written
+permission is required. Receiving an unauthorized copy grants no additional rights.
+Any commercial use of an authorized copy also requires a Commercial License.
 
 For the avoidance of doubt and without limitation, Commercial Use includes:
 
@@ -111,7 +136,7 @@ supplied or offered to any third party, whether or not for charge ("productizati
 
 (e) use by a streamer, content creator, influencer, journalist, or media producer to
 create, produce, or distribute content, except as permitted by the Content Creator
-Exception (5.3);
+Exception (5.3) and not excluded by Section 4(g) or 4(h);
 
 (f) any use directly or indirectly intended for or directed towards commercial
 advantage, revenue, sponsorship, audience-building for gain, or monetary
@@ -120,9 +145,26 @@ compensation.
 A user's status as a non-profit, charity, or not-for-profit does not by itself make a
 use a Permitted Purpose.
 
+(g) use by, for, or in connection with a religious group, organisation, ministry,
+congregation, or religious content-production activity, regardless of size, revenue,
+charitable status, or whether it is operated by one person. This includes a solo
+religious content creator who would otherwise satisfy the Content Creator Exception's
+size limit. Such use cannot claim any free exception in Section 5. A person's
+religious beliefs alone do not disqualify their unrelated personal use;
+
+(h) use to produce or distribute content, in whole or in part with Conspect, from
+which the user receives or seeks any income or other commercial benefit. This
+includes advertising, sponsored posts, subscriptions, paid access, affiliate income,
+content-linked donations or tips, and free or discounted goods or services supplied
+in return for promotion. It applies on YouTube and every other platform, regardless
+of audience size, amount earned, profitability, or whether the benefit is cash or
+in kind. No free exception overrides this exclusion.
+
 ### 5. The three free exceptions
 
-Each exception applies only to the exempt entity's own activities. It does not permit
+Each exception is subject to Sections 4(g) and 4(h): religious use and monetized
+content are not eligible, even if all other exception criteria are met. Each
+exception applies only to the exempt entity's own activities. It does not permit
 any non-exempt third party (including an integrator, contractor, agent, or commercial
 service provider) to operate the software as, or as part of, a commercial product or
 service by relying on the exception (the "no-conduit rule"). Where two or more
@@ -161,24 +203,15 @@ rights, or any similar means, regardless of formal ownership percentages.
 Broadcaster, meaning an entity that (a) holds a community broadcasting licence (or an
 equivalent community or non-profit broadcasting licence class issued by a national
 broadcasting regulator), is operated on a not-for-profit basis, and is not controlled
-by a government or political party; and (b) whose total Sponsorship Revenue in its
-most recently completed financial year did not exceed USD $1,000,000.
-
-"Sponsorship Revenue" means the gross aggregate amount received or receivable, in
-money or money's worth, by the entity and its related and commonly-controlled
-entities in that financial year as consideration for broadcasting, streaming, or
-publishing sponsorship announcements, acknowledgements of financial support, or
-equivalent paid acknowledgements (in Australia, "sponsorship" within the meaning of
-the Broadcasting Services Act 1992 (Cth) and the ACMA Community Broadcasting
-Sponsorship Guidelines), before deduction of any costs, agency fees, or commissions.
-It excludes genuine grants, donations, and membership subscriptions that are not
-consideration for a sponsorship announcement. Amounts in a substance equivalent to
-sponsorship are counted even if labelled otherwise (e.g. "underwriting" or
-"partnership fees").
+by a government or political party; and (b) does not monetize content produced or
+distributed in whole or in part with Conspect. The former USD $1,000,000 sponsorship
+threshold does not authorize monetization under this version.
 
 5.3 Content Creator Exception. Free use is permitted by a natural person, or a group
 of natural persons acting together, who uses the software to produce or distribute
-their own content and whose total Audience Count is fewer than 55,000.
+their own content, whose total Audience Count is fewer than 55,000, and who do not
+monetize that content in any way, including the cash and non-cash benefits described
+in Section 4(h). This exception never covers religious use under Section 4(g).
 
 "Channel" means any account, page, feed, profile, show, list, or comparable presence
 operated by the user (or under their control or in their name) on any platform
@@ -214,11 +247,8 @@ the notice period, or you have materially misrepresented eligibility, you are tr
 as having made Commercial Use without a license from the date the misrepresentation
 began, and you must obtain a Commercial License (and may owe back-fees).
 
-7.2 Currency conversion. Where an amount is in a currency other than US dollars, it is
-converted to US dollars at the exchange rate published by the Reserve Bank of
-Australia (or, where the entity is outside Australia, the principal central bank of
-the entity's home country) on the last day of the relevant financial year (or the most
-recent prior published rate).
+7.2 No monetary threshold. Monetization under Section 4(h) has no minimum amount
+or currency threshold. Non-cash promotional benefits also count.
 
 7.3 Growing out of an exception (transition). If you qualified for an exception and
 later cease to qualify (by exceeding a threshold, losing not-for-profit status, or
@@ -227,6 +257,16 @@ using under that exception for a transition period of 90 days after the first
 quarterly assessment date on which you cease to qualify. After that, continued use —
 and any upgrade, new version, or new installation — requires a Commercial License.
 Later falling back below a threshold does not retroactively restore the exception.
+This transition does not authorize religious use, monetized content, or access to
+paid or metered features: obtain the required paid authorization before such use.
+
+7.4 Earlier versions. Version 2.0 applies to software supplied under Version 2.0.
+It does not retroactively revoke rights validly granted for copies previously
+supplied under an earlier license. Those copies remain subject to their applicable
+terms, including any broader modification, redistribution, or eligibility rights
+those terms granted. Version 2.0 neither reclaims nor expands those earlier rights.
+An earlier grant does not grant rights to a new version supplied only under these
+terms.
 
 ### 8. Notices
 
@@ -251,15 +291,19 @@ the LGPL or any other applicable open-source license of a third-party component.
 
 GPL codecs are excluded. The software's optional GPL-licensed codec components (e.g. a
 "gpl-codecs" build linking x264/x265) are not licensed to you under this License and
-are not distributed by us under this License. If you choose to build the software with
-those GPL components, the resulting combined work is governed by the GNU GPL, and this
-License does not apply to that combined work.
+are not distributed by us under this License. Adding GPL components does not grant
+you permission to relicense Conspect's own code under the GPL. Distribution of a
+combined work would require compliance with all applicable GPL obligations and
+separate permission from the holders of Conspect's copyright; this License does not
+grant that distribution permission. Do not distribute an incompatible combined
+work. Rights in the third-party GPL components themselves remain governed by their
+own licenses.
 
 ### 10. No other rights; reservation of the Licensor's rights
 
 These terms do not allow you to sublicense or transfer any of your licenses to anyone
 else, or prevent us from licensing the software to anyone else. They do not grant you
-any trademark, branding, or naming rights; the Multiview and Aperim names and logos
+any trademark, branding, or naming rights; the Conspect and Aperim names and logos
 are reserved and governed by our separate trademark policy. This License does not
 grant rights in our patents except as necessary to exercise the express copyright
 permissions for a Permitted Purpose.

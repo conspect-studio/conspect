@@ -469,11 +469,25 @@ fn segment_live_publishes_rolling_playlist_bounded_window_and_prunes() {
         decode_frame_count(&dir.path().join(listed[0])) > 0,
         "a windowed segment must be independently decodable"
     );
-    // Sanity: the run still reports the full segment set it produced.
+    // The live run report is deliberately bounded (`bound_live_report`, so an
+    // infinite live run cannot grow it): it holds exactly the newest `WINDOW`
+    // segments, in order, ending at the newest one.
     assert_eq!(
         result.segments.len(),
-        total_segments,
-        "the run report must record every segment produced, not just the windowed ones"
+        WINDOW,
+        "the live run report is bounded to the newest window"
+    );
+    let reported: Vec<String> = result
+        .segments
+        .iter()
+        .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+        .collect();
+    let expected: Vec<String> = (total_segments - WINDOW..total_segments)
+        .map(|i| format!("seg{i}.ts"))
+        .collect();
+    assert_eq!(
+        reported, expected,
+        "the report lists the newest segments in order"
     );
 }
 

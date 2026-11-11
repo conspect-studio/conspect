@@ -1,7 +1,7 @@
 # Example & Test Streams
 
 A curated catalog of synthetic and license-clean public sources for **developing, demoing, and
-testing** Multiview. These double as a deliberately diverse **gotcha test matrix** — between them
+testing** Conspect. These double as a deliberately diverse **gotcha test matrix** — between them
 they exercise mismatched frame rates (25 / 29.92 / 29.97 / 30 / 50 / 60 fps), multiple codecs
 (H.264, HEVC), tagged vs untagged color, an oddball mixed-primaries tag, three audio sample rates
 (22.05 / 44.1 / 48 kHz), WebVTT subtitles, multivariant playlists, and both live and VOD.
@@ -118,7 +118,7 @@ and is bandwidth-heavy by design. To test NDI in/out:
 - Install **NDI Tools** (free) and run **Test Pattern** (a sender) and **Studio Monitor** / **Video Monitor**
   (a receiver) on the same LAN.
 - Or use the NDI SDK example senders/receivers.
-- Multiview's NDI support is **feature-gated and runtime-optional** (proprietary SDK) — see the NDI docs.
+- Conspect's NDI support is **feature-gated and runtime-optional** (proprietary SDK) — see the NDI docs.
 
 ---
 
@@ -144,12 +144,12 @@ Coverage achieved: **fps** {25, 29.92, 29.97, 30, 50, 60} · **codecs** {H.264, 
 
 ## Synthetic & reproducible sources
 
-For CI and for reproducing a specific failure mode **on demand and offline**. Multiview should ship
+For CI and for reproducing a specific failure mode **on demand and offline**. Conspect should ship
 test fixtures built on these. (`testsrc2` = moving test pattern with timecode; `smptebars` = color
 bars; `sine` = audio tone.)
 
 > The lavfi recipes below produce **external** streams (with chosen fps/codec/color tags) to exercise
-> the libav *decode* path. They are distinct from Multiview's **in-process** synthetic source kinds —
+> the libav *decode* path. They are distinct from Conspect's **in-process** synthetic source kinds —
 > `bars`, `solid`, and `clock` — which render in pure Rust with no libav and no subprocess
 > ([ADR-0027](../decisions/ADR-0027.md)); see [`examples/synthetic-sources.toml`](../../examples/synthetic-sources.toml).
 > Use the in-process kinds for a self-contained picture; use the recipes when you need a specific
@@ -212,7 +212,7 @@ ffmpeg -re -f lavfi -i "testsrc2=size=1280x720:rate=30" \
 
 When ingesting live HLS, a player/ingester that downloads several buffered segments at once will
 play them **too fast** unless paced to wall-clock by PTS. To reproduce: point the ingest at a VOD
-HLS (e.g. Mux BBB) and observe it racing ahead with no pacer; then enable Multiview's input pacer and
+HLS (e.g. Mux BBB) and observe it racing ahead with no pacer; then enable Conspect's input pacer and
 confirm it locks to real-time. (See the streaming-gotchas runbook for the pacing design.)
 
 ---

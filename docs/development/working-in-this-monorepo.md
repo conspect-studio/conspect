@@ -1,6 +1,6 @@
 # Working in this monorepo (for agents)
 
-Orientation for any coding agent working in Multiview: a 23-crate Cargo workspace under `crates/`,
+Orientation for any coding agent working in Conspect: a 23-crate Cargo workspace under `crates/`,
 a React/TypeScript SPA under `web/`, dev automation in `xtask/`, and a large `docs/` tree
 (architecture, 56 research briefs, 236 ADRs). This page is **how to move through it without
 drowning your context window**, plus the operational hazards that have actually bitten here.
@@ -111,6 +111,12 @@ the task, not just after an ENOSPC failure.
   Otherwise do not start another large build, dependency install or fan-out. Reclaim verified
   disposable task artifacts, reduce concurrency, or arrange capacity first. Recheck during long
   runs and between waves.
+- The local push gate (`bin/check`) enforces its own hard floor, `MIN_FREE` = 300 GiB free, and a
+  15 GiB cap on its own targets. That floor is deliberately lower than the planning rule above
+  (owner decision, 2026-11-11): the build host disk is shared with other repositories, whose
+  activity moved free space by more than 60 GiB within an hour and aborted gates mid-run. The
+  planning rule still applies before any fan-out or several concurrent build lanes; run gates
+  one at a time.
 - Keep Cargo's per-worktree `target/` isolation. Never override `CARGO_TARGET_DIR`, share a sibling's
   cache, or move build output to `/tmp` or another filesystem to evade the capacity check. See
   [`devcontainer-cargo-target.md`](../runbooks/devcontainer-cargo-target.md) for the I/O-storm history.

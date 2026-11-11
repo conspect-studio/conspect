@@ -15,7 +15,10 @@ import time
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 GIB = 1024 ** 3
-MIN_FREE = 360 * GIB
+# The build host disk is shared with other repositories' containers, which move free
+# space by tens of GiB within minutes. A floor inside that noise aborts every gate
+# mid-run, so it sits below it. One gate grows its targets by at most MAX_TARGET.
+MIN_FREE = 300 * GIB
 # Authoring stays <=2 GiB; this proposed execution cap needs separate review.
 MAX_TARGET = 15 * GIB
 
@@ -133,7 +136,8 @@ def target_bytes():
 
 
 def resources():
-    require(shutil.disk_usage(ROOT).free >= MIN_FREE, 'free disk below 360 GiB floor')
+    require(shutil.disk_usage(ROOT).free >= MIN_FREE,
+            f'free disk below {MIN_FREE // GIB} GiB floor')
     total = target_bytes()
     require(total <= MAX_TARGET, 'combined local targets exceed 15 GiB; stop and inspect owned artifacts')
     return total

@@ -228,10 +228,16 @@ async fn per_scope_caps_are_independent() {
     let router = router_with_caps(Arc::new(UncappedWhep::default()), FocusCaps::new(4, 1));
     // First program focus: admitted.
     let _ = open_focus(&router, "/api/v1/preview/program/whep").await;
-    // A SECOND program focus hits the per-scope cap of 1 → shed.
+    // A SECOND program focus from a DIFFERENT owner hits the per-scope cap of 1 →
+    // shed. (The same owner re-offering would replace its own stale session; see
+    // `preview_whep_lease.rs`.)
     let second_program = send(
         &router,
-        post_sdp("/api/v1/preview/program/whep", OPERATOR_TOKEN, H264_OFFER),
+        post_sdp(
+            "/api/v1/preview/program/whep",
+            "admin-key.admin-secret-abc",
+            H264_OFFER,
+        ),
     )
     .await;
     assert_eq!(

@@ -11,7 +11,7 @@ import {
   readProblem,
 } from './operations';
 import type { RequestOptions } from './operations';
-import type { components } from './schema';
+import type { components } from './types';
 
 /** One immutable audit-log entry. */
 export type AuditEntry = components['schemas']['AuditEntry'];

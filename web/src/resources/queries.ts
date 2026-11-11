@@ -20,7 +20,9 @@ import type {
   UseQueryResult,
 } from '@tanstack/react-query';
 
+import { BackendUnavailableError } from '../api/operations';
 import {
+  getOutputLink,
   deleteResource,
   getResource,
   listResources,
@@ -31,6 +33,7 @@ import {
   toSourceView,
   writeResource,
 } from './api';
+import type { OutputLinkWithReasons } from './api';
 import type { ResourceWithEtag } from './api';
 import type {
   OutputView,
@@ -56,7 +59,15 @@ export class ApiError extends Error {
   }
 }
 
+/** A pending-backend route the server does not serve (404/405/501). */
+export class BackendUnavailableApiError extends ApiError {
+  readonly unavailable = true as const;
+}
+
 function toApiError(error: unknown): ApiError {
+  if (error instanceof BackendUnavailableError) {
+    return new BackendUnavailableApiError(error.message, error.status);
+  }
   if (error instanceof ResourceApiError) {
     return new ApiError(error.message, error.status);
   }
@@ -146,6 +157,29 @@ export const useSources = makeListHook<SourceView>('sources', toSourceView);
 
 /** List the configured outputs, projected to {@link OutputView}. */
 export const useOutputs = makeListHook<OutputView>('outputs', toOutputView);
+
+/** How often the Outputs page refreshes a push output's live link state. */
+const OUTPUT_LINK_REFRESH_MS = 2000;
+
+/** Poll a push output's live link state; `null` while the program is stopped. */
+export function useOutputLink(
+  id: string,
+  enabled: boolean,
+  context: ResourceContext = {},
+): UseQueryResult<OutputLinkWithReasons | null, ApiError> {
+  return useQuery<OutputLinkWithReasons | null, ApiError>({
+    queryKey: ['outputs', id, 'link'],
+    enabled,
+    refetchInterval: OUTPUT_LINK_REFRESH_MS,
+    queryFn: async (): Promise<OutputLinkWithReasons | null> => {
+      try {
+        return await getOutputLink(id, requestOptions(context));
+      } catch (error) {
+        throw toApiError(error);
+      }
+    },
+  });
+}
 
 /** List the configured overlays, projected to {@link OverlayView}. */
 export const useOverlays = makeListHook<OverlayView>('overlays', toOverlayView);

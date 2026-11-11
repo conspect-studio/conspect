@@ -8,7 +8,7 @@
 // time. Do NOT hand-write request/response types here.
 import createClient from 'openapi-fetch';
 
-import type { paths } from './schema';
+import type { AllPaths } from './types';
 import { getStoredToken } from './token';
 
 /** Options for constructing a {@link MultiviewApiClient}. */
@@ -28,7 +28,7 @@ export interface ApiClientOptions {
 }
 
 /** A typed openapi-fetch client bound to the control-plane `paths`. */
-export type MultiviewApiClient = ReturnType<typeof createClient<paths>>;
+export type MultiviewApiClient = ReturnType<typeof createClient<AllPaths>>;
 
 /**
  * Build a typed API client. The returned client's `GET`/`POST`/… methods only
@@ -42,7 +42,7 @@ export function createApiClient(options: ApiClientOptions = {}): MultiviewApiCli
   if (token !== undefined && token !== '') {
     headers.Authorization = `Bearer ${token}`;
   }
-  return createClient<paths>({
+  return createClient<AllPaths>({
     // Same-origin by default, as the explicit origin rather than ''. The two
     // are identical in the browser ('/api/v1/…' is root-relative), but
     // openapi-fetch builds a `new Request(url)` itself and a relative URL is

@@ -20,12 +20,13 @@
 import {
   apiUrl,
   buildHeaders,
+  sendCommand,
   OperationApiError,
   readProblem,
   submitOperation,
 } from './operations';
 import type { AcceptedBody, RequestOptions } from './operations';
-import type { components } from './schema';
+import type { components } from './types';
 
 /** A configured media player, exactly as the control plane returns it. */
 export type MediaPlayer = components['schemas']['Resource'];
@@ -111,11 +112,7 @@ async function submitTransport(
   body: TransportBody,
   options: RequestOptions = {},
 ): Promise<AcceptedBody> {
-  const response = await fetch(apiUrl(options, path), {
-    method: 'POST',
-    headers: buildHeaders(options, true),
-    body: JSON.stringify(body),
-  });
+  const response = await sendCommand(path, options, { body });
   if (!response.ok) {
     throw await readProblem(response);
   }

@@ -166,7 +166,7 @@ pub use pending_actions::{
     DEFAULT_PENDING_ACTION_CAPACITY, PENDING_ACTION_KIND,
 };
 pub use preview::{
-    no_preview, no_whep, FocusCaps, GatedWhep, NoPreview, NoWhep, PreviewCapabilities,
+    no_preview, no_whep, FocusCaps, FocusLimits, GatedWhep, NoPreview, NoWhep, PreviewCapabilities,
     PreviewProvider, ProgramFidelity, ScopeCapabilities, ScopeCapability, SharedPreview,
     SharedWhep, WhepAnswer, WhepProvider, WhepReject, WhepScope,
 };

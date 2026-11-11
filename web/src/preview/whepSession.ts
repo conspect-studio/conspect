@@ -22,8 +22,17 @@ export class WhepSignalingError extends Error {
    */
   readonly fallbackHinted: boolean;
 
-  constructor(message: string, status?: number, fallbackHinted = false) {
+  /** RFC 9457 `type` of the refusal body, when one was readable. */
+  readonly problemType: string | undefined;
+
+  /** True for the engine's single-live-viewer refusal (`type` ends `whep-capacity`). */
+  get isCapacity(): boolean {
+    return this.status === 503 && (this.problemType?.endsWith('whep-capacity') ?? false);
+  }
+
+  constructor(message: string, status?: number, fallbackHinted = false, problemType?: string) {
     super(message);
+    this.problemType = problemType;
     this.name = 'WhepSignalingError';
     this.status = status;
     this.fallbackHinted = fallbackHinted;
@@ -87,8 +96,13 @@ export async function postWhepOffer(
   });
   if (!response.ok) {
     let hinted = false;
+    let problemType: string | undefined;
     try {
-      hinted = bodyHintsFallback(await response.clone().json());
+      const body: unknown = await response.clone().json();
+      hinted = bodyHintsFallback(body);
+      if (typeof body === 'object' && body !== null && 'type' in body && typeof body.type === 'string') {
+        problemType = body.type;
+      }
     } catch {
       // No/!JSON body — a status-only failure, no fallback hint.
     }
@@ -96,6 +110,7 @@ export async function postWhepOffer(
       `WHEP offer rejected (${String(response.status)})`,
       response.status,
       hinted,
+      problemType,
     );
   }
   const location = response.headers.get('Location');

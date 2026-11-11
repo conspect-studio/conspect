@@ -17,7 +17,7 @@ export function ResiliencePage(): JSX.Element {
         description={
           <Trans>
             What the LIVE, STALE, RECONNECTING, and NO SIGNAL badges mean, and
-            why the output never stalls on a bad input.
+            how the design isolates output timing from a bad input.
           </Trans>
         }
       />
@@ -82,17 +82,17 @@ export function ResiliencePage(): JSX.Element {
               frame from that store at every output tick and never waits for
               an input. When a source hiccups, the store simply keeps handing
               out the most recent frame it has — the "last good" one. A brief
-              network blip is therefore invisible: the tile holds a
+              network blip can therefore be masked: the tile holds a
               fraction-of-a-second-old picture until fresh frames resume.
             </Trans>
           </Prose>
           <Prose>
             <Trans>
-              This is also why one bad source can never take down the wall:
-              the disturbance is contained to that tile's rectangle. The
-              output keeps emitting a complete, valid frame every tick
-              regardless — even if every source died at once, the canvas
-              would show slates and a still-ticking clock, not stop.
+              The design objective is to contain a bad source to its tile,
+              keeping output independent of input failures. The output-clock
+              invariant requires a complete, valid frame every tick, using
+              slates when sources are unavailable. This is an engineering
+              requirement, not a warranty of uninterrupted operation.
             </Trans>
           </Prose>
         </DocSection>
@@ -103,8 +103,8 @@ export function ResiliencePage(): JSX.Element {
               Source connections are supervised. A stalled read times out
               rather than hanging forever; the supervisor then reconnects with
               exponential backoff (so a dead camera is not hammered) and keeps
-              trying indefinitely — sources recover without operator action
-              whenever the far end comes back. Mid-stream surprises that
+              trying indefinitely, with the aim of recovering without operator
+              action when the far end becomes usable again. Mid-stream surprises that
               normally break players, like a camera changing resolution or a
               stream resetting its timestamps, are absorbed inside the tile:
               the decoder re-initializes behind the frame store while the

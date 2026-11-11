@@ -782,3 +782,26 @@ fn webrtc_ice_server_empty_url_rejected() {
         "an empty ICE-server URL must fail validation"
     );
 }
+
+#[test]
+fn preview_focus_caps_default_parse_and_validate() {
+    let d = multiview_config::WebrtcConfig::default();
+    assert_eq!((d.preview_max_focus, d.preview_max_focus_per_scope), (4, 3));
+    assert_eq!(d.preview_session_timeout.millis(), 8_000);
+    assert!(d.is_default());
+    let t: multiview_config::WebrtcConfig = toml::from_str(
+        "preview_max_focus = 9\npreview_max_focus_per_scope = 2\npreview_session_timeout = \"5s\"\n",
+    )
+    .unwrap();
+    assert_eq!((t.preview_max_focus, t.preview_max_focus_per_scope), (9, 2));
+    assert_eq!(t.preview_session_timeout.millis(), 5_000);
+    assert!(t.validate().is_ok());
+    for bad in [
+        "preview_max_focus = 0",
+        "preview_max_focus_per_scope = 0",
+        "preview_session_timeout = \"1s\"",
+    ] {
+        let c: multiview_config::WebrtcConfig = toml::from_str(bad).unwrap();
+        assert!(c.validate().is_err(), "{bad}");
+    }
+}

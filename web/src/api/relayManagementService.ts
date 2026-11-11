@@ -1,6 +1,6 @@
 import { z } from "zod";
 import { createApiClient, type MultiviewApiClient } from "./client";
-import type { components } from "./schema";
+import type { components } from "./types";
 import { validateRelayConfig, type CredentialView, type RelayManagementService } from "../pages/relayManagementModel";
 
 // The generated envelope deliberately exposes unknown JSON. Validate data at

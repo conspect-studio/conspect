@@ -5,6 +5,7 @@ import { act, fireEvent, waitFor } from '@testing-library/react';
 
 import { renderWithProviders } from '../test/render';
 import { PreviewSurface } from './PreviewSurface';
+import { capacityRetryDelayMs } from './capacityBackoff';
 import type { PreviewCapabilities } from './capabilities';
 
 function caps(over: Partial<PreviewCapabilities> = {}): PreviewCapabilities {
@@ -157,6 +158,28 @@ describe('<PreviewSurface>', () => {
     expect(queryByTestId('jpeg-rung')).toBeNull();
   });
 
+  it('renders fallback diagnostics into the supplied host behind one disclosure, not beside the picture', async () => {
+    const host = document.createElement('div');
+    document.body.appendChild(host);
+    const { getByTestId } = renderWithProviders(
+      <PreviewSurface
+        scope="program"
+        whepEndpoint="/api/v1/preview/program/whep"
+        jpegPath="/api/v1/preview/program.jpg"
+        label="Program"
+        capabilities={caps()}
+        diagnosticsHost={host}
+        pcFactory={() => new IdlePeerConnection() as unknown as RTCPeerConnection}
+        fetchImpl={(): Promise<Response> => Promise.resolve(rejectSdp())}
+      />,
+    );
+    await waitFor(() => { expect(getByTestId('fallback-badge')).toBeInTheDocument(); });
+    await waitFor(() => { expect(host.querySelector('[data-testid="fallback-diagnostics"]')).not.toBeNull(); });
+    expect(host.querySelectorAll('details.ps-diagnostics')).toHaveLength(1);
+    expect(getByTestId('jpeg-rung').querySelector('[data-testid="fallback-diagnostics"]')).toBeNull();
+    host.remove();
+  });
+
   it('degrades WHEP→JPEG WITH the honest badge on a fatal session error, and retries', async () => {
     const { getByTestId, queryByTestId, getByRole } = renderWithProviders(
       <PreviewSurface
@@ -182,5 +205,60 @@ describe('<PreviewSurface>', () => {
     });
     expect(getByTestId('whep-player')).toBeInTheDocument();
     expect(queryByTestId('fallback-badge')).toBeNull();
+  });
+
+  function capacityRefusal(): Response {
+    return {
+      ok: false,
+      status: 503,
+      url: 'https://h/api/v1/preview/program/whep',
+      headers: new Headers(),
+      text: (): Promise<string> => Promise.resolve(''),
+      clone(): Response {
+        return { json: (): Promise<unknown> => Promise.resolve({ type: 'urn:conspect:problem:whep-capacity', fallback: 'jpeg' }) } as unknown as Response;
+      },
+    } as unknown as Response;
+  }
+
+  it('says why live video is unavailable on a whep-capacity refusal, then retries on a ~10 s backoff, not while hidden', async () => {
+    vi.useFakeTimers();
+    try {
+      const fetchImpl = vi.fn((): Promise<Response> => Promise.resolve(capacityRefusal()));
+      const { getByTestId } = renderWithProviders(
+        <PreviewSurface
+          scope="program"
+          whepEndpoint="/api/v1/preview/program/whep"
+          jpegPath="/api/v1/preview/program.jpg"
+          label="Program"
+          capabilities={caps()}
+          pcFactory={() => new IdlePeerConnection() as unknown as RTCPeerConnection}
+          fetchImpl={fetchImpl}
+        />,
+      );
+      await act(async () => { await vi.advanceTimersByTimeAsync(100); });
+      expect(getByTestId('fallback-reason')).toHaveTextContent('Live video in use by another viewer — showing stills');
+      expect(fetchImpl).toHaveBeenCalledTimes(1);
+      await act(async () => { await vi.advanceTimersByTimeAsync(9000); });
+      expect(fetchImpl).toHaveBeenCalledTimes(1);
+      await act(async () => { await vi.advanceTimersByTimeAsync(1500); });
+      expect(fetchImpl).toHaveBeenCalledTimes(2); // ~10 s
+      // Second refusal backs off further (15 s) and is capped at 30 s.
+      await act(async () => { await vi.advanceTimersByTimeAsync(100); });
+      let visibility: DocumentVisibilityState = 'hidden';
+      vi.spyOn(document, 'visibilityState', 'get').mockImplementation(() => visibility);
+      await act(async () => { await vi.advanceTimersByTimeAsync(60_000); });
+      expect(fetchImpl).toHaveBeenCalledTimes(2); // hidden: no retry storm
+      visibility = 'visible';
+      await act(async () => { document.dispatchEvent(new Event('visibilitychange')); await vi.advanceTimersByTimeAsync(100); });
+      expect(fetchImpl).toHaveBeenCalledTimes(3);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('caps the capacity backoff', () => {
+    expect(capacityRetryDelayMs(0)).toBe(10_000);
+    expect(capacityRetryDelayMs(1)).toBe(15_000);
+    expect(capacityRetryDelayMs(20)).toBe(30_000);
   });
 });

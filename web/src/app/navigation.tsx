@@ -12,7 +12,9 @@ import {
   LayoutGrid,
   Radio,
   Route,
+  PanelsTopLeft,
   Send,
+  Tv,
   Layers,
   Logs,
   Clapperboard,
@@ -30,6 +32,7 @@ import {
   UserCircle,
   ListChecks,
   LifeBuoy,
+  Captions,
 } from "lucide-react";
 import type { LucideIcon } from "lucide-react";
 
@@ -45,20 +48,24 @@ export interface NavItem {
 
 /** The primary navigation, in display order. */
 export const NAV_ITEMS: readonly NavItem[] = [
-  { path: "/", label: <Trans>Dashboard</Trans>, Icon: LayoutDashboard },
+  { path: "/", label: <Trans>Production desk</Trans>, Icon: PanelsTopLeft },
+  { path: "/dashboard", label: <Trans>Dashboard</Trans>, Icon: LayoutDashboard },
   { path: "/layouts", label: <Trans>Layouts</Trans>, Icon: LayoutGrid },
   { path: "/sources", label: <Trans>Sources</Trans>, Icon: Radio },
   { path: "/outputs", label: <Trans>Outputs</Trans>, Icon: Send },
+  { path: "/iptv", label: <Trans>IPTV playlist</Trans>, Icon: Tv },
   { path: "/overlays", label: <Trans>Overlays</Trans>, Icon: Layers },
   { path: "/audio", label: <Trans>Audio</Trans>, Icon: Volume2 },
   // Devices sits between Outputs and Monitoring (managed-devices.md §9).
   { path: "/devices", label: <Trans>Devices</Trans>, Icon: HardDrive },
   { path: "/cast", label: <Trans>Cast</Trans>, Icon: Cast },
   { path: "/routing", label: <Trans>Routing</Trans>, Icon: Route },
+  { path: "/switcher", label: <Trans>Switcher</Trans>, Icon: PanelsTopLeft },
   { path: "/monitoring", label: <Trans>Monitoring</Trans>, Icon: MonitorPlay },
   { path: "/tally", label: <Trans>Tally</Trans>, Icon: CircleDot },
   { path: "/salvos", label: <Trans>Salvos</Trans>, Icon: Zap },
   { path: "/media-players", label: <Trans>Media players</Trans>, Icon: Clapperboard },
+  { path: "/graphics", label: <Trans>Graphics</Trans>, Icon: Captions },
   { path: "/probes", label: <Trans>Probes</Trans>, Icon: ShieldAlert },
   { path: "/alarms", label: <Trans>Alarms</Trans>, Icon: Bell },
   { path: "/system", label: <Trans>System</Trans>, Icon: Activity },

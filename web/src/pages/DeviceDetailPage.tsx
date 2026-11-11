@@ -97,9 +97,10 @@ function ContinuityNote(): JSX.Element {
   return (
     <p role="note" className="mb-4 rounded-md border bg-muted/40 p-3 text-sm">
       <Trans>
-        Program output never depends on this device: if it fails, bound
-        sources ride the tile ladder and outputs ride their failover policy —
-        the multiview keeps running.
+        Program-output timing is designed to remain independent of this
+        device: if it fails, bound sources ride the tile ladder and outputs
+        ride their failover policy. Continuity is a design objective, not an
+        uptime warranty.
       </Trans>
     </p>
   );
@@ -819,8 +820,8 @@ export function DeviceDetailPage(): JSX.Element {
               <Trans>
                 Long-running actions are accepted with an operation id and
                 their outcome arrives on the realtime stream — watch the
-                Events tab. None of them can interrupt Multiview program
-                output.
+                Events tab. These actions are designed to remain isolated from
+                Conspect program-output timing.
               </Trans>
             </p>
           </div>
@@ -886,8 +887,8 @@ export function DeviceDetailPage(): JSX.Element {
             <DialogDescription>
               <Trans>
                 The device restarts and is unreachable while it boots. Bound
-                sources ride the tile ladder; Multiview program output is not
-                interrupted.
+                sources ride the tile ladder; Conspect is designed to maintain
+                program-output timing independently.
               </Trans>
             </DialogDescription>
           </DialogHeader>
@@ -930,8 +931,8 @@ export function DeviceDetailPage(): JSX.Element {
             <DialogDescription>
               <Trans>
                 Changing the mode restarts the device's own pipeline: its
-                bound sources ride the tile ladder until it returns. No
-                Multiview program output is interrupted.
+                bound sources ride the tile ladder until it returns. Conspect
+                is designed to maintain program-output timing independently.
               </Trans>
             </DialogDescription>
           </DialogHeader>

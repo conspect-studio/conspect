@@ -206,7 +206,7 @@ Who reviews what, and when, is the class matrix in
 
 ### C.2 Reviewer brief (scope to avoid manufactured findings)
 
-> Report **only** defects in correctness, security, spec/requirements conformance, and the Multiview
+> Report **only** defects in correctness, security, spec/requirements conformance, and the Conspect
 > typing & test guardrails. Do **not** report style, naming, or speculative defence-in-depth. Ignore
 > lockfiles/generated/minified files. If you find nothing, name the highest-residual-risk area and
 > why it is acceptable.

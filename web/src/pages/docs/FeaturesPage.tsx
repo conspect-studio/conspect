@@ -16,7 +16,7 @@ export function FeaturesPage(): JSX.Element {
         title={<Trans>Feature guide</Trans>}
         description={
           <Trans>
-            The building blocks of a Multiview deployment, and what each one does.
+            The building blocks of a Conspect deployment, and what each one does.
           </Trans>
         }
       />

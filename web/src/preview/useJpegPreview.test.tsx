@@ -1,13 +1,15 @@
 import { act, renderHook } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
-import { useJpegPreview } from './useJpegPreview';
+import { staleAfterMs, useJpegPreview, useJpegStill } from './useJpegPreview';
 
 vi.mock('../api/token', () => ({ getStoredToken: () => undefined }));
 
+interface FakeResp { ok: boolean; status?: number; headers?: Headers; blob: () => Promise<Blob> }
+
 interface PendingRequest {
   signal: AbortSignal | undefined;
-  resolve: (response: { ok: boolean; blob: () => Promise<Blob> }) => void;
+  resolve: (response: FakeResp) => void;
   finishBlob: (() => void) | undefined;
 }
 
@@ -16,7 +18,7 @@ let createdUrls: string[];
 let revokedUrls: string[];
 let nextUrl: number;
 
-function deferredResponse(signal: AbortSignal | undefined): Promise<{ ok: boolean; blob: () => Promise<Blob> }> {
+function deferredResponse(signal: AbortSignal | undefined): Promise<FakeResp> {
   return new Promise((resolve) => {
     requests.push({ signal, resolve, finishBlob: undefined });
   });
@@ -25,6 +27,7 @@ function deferredResponse(signal: AbortSignal | undefined): Promise<{ ok: boolea
 function resolveResponse(request: PendingRequest | undefined, value: string): void {
   request?.resolve({
     ok: true,
+    headers: new Headers({ 'content-type': 'image/jpeg' }),
     blob: () => new Promise((resolve) => {
       request.finishBlob = () => {
         resolve(new Blob([value]));
@@ -146,5 +149,71 @@ describe('useJpegPreview', () => {
       await Promise.resolve();
     });
     expect(result.current).toBe('blob:preview-1');
+  });
+
+  async function settle(i: number, value: string): Promise<void> {
+    await act(async () => {
+      resolveResponse(requests[i], value);
+      await Promise.resolve();
+      requests[i]?.finishBlob?.();
+      await Promise.resolve();
+    });
+  }
+  async function fail(i: number, status: number, contentType?: string): Promise<void> {
+    await act(async () => {
+      requests[i]?.resolve({
+        ok: status >= 200 && status < 300,
+        status,
+        headers: new Headers(contentType ? { 'content-type': contentType } : {}),
+        blob: () => Promise.resolve(new Blob(['<html>'])),
+      });
+      await Promise.resolve();
+    });
+  }
+
+  it('treats a 200 text/html (SPA index) as unavailable and never exposes a frame', async () => {
+    const { result } = renderHook(() => useJpegStill('/preview/a.jpg', 1000));
+    await fail(0, 200, 'text/html');
+    expect(result.current.url).toBeUndefined();
+    expect(result.current.state).toBe('unavailable');
+    expect(createdUrls).toHaveLength(0);
+  });
+
+  it('drops a previous frame when the route turns out not to be served', async () => {
+    const { result } = renderHook(() => useJpegStill('/preview/a.jpg', 1000));
+    await settle(0, 'good');
+    expect(result.current.state).toBe('fresh');
+    await act(async () => { await vi.advanceTimersByTimeAsync(1000); });
+    await fail(1, 200, 'text/html');
+    expect(result.current).toEqual({ url: undefined, state: 'unavailable' });
+  });
+
+  it('keeps the last good frame across failed polls and goes stale only after the bounded age', async () => {
+    const { result } = renderHook(() => useJpegStill('/preview/a.jpg', 2000));
+    await settle(0, 'good');
+    expect(result.current).toEqual({ url: 'blob:preview-0', state: 'fresh' });
+    // 503 polls every 2 s: the frame stays, still fresh within the bound.
+    for (let i = 1; i <= 3; i += 1) {
+      await act(async () => { await vi.advanceTimersByTimeAsync(2000); });
+      await fail(i, 503, 'application/problem+json');
+      expect(result.current).toEqual({ url: 'blob:preview-0', state: 'fresh' });
+    }
+    expect(staleAfterMs(2000)).toBe(10_000);
+    await act(async () => { await vi.advanceTimersByTimeAsync(4000); });
+    expect(result.current.state).toBe('stale');
+    expect(result.current.url).toBe('blob:preview-0');
+    // A new good frame clears staleness.
+    const next = requests.length - 1;
+    await settle(next, 'again');
+    expect(result.current.state).toBe('fresh');
+  });
+
+  it('re-probes an unserved route only slowly (30 s), not every poll', async () => {
+    renderHook(() => useJpegStill('/preview/a.jpg', 1000));
+    await fail(0, 200, 'text/html');
+    await act(async () => { await vi.advanceTimersByTimeAsync(20_000); });
+    expect(requests).toHaveLength(1);
+    await act(async () => { await vi.advanceTimersByTimeAsync(11_000); });
+    expect(requests).toHaveLength(2);
   });
 });

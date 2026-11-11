@@ -16,6 +16,7 @@ export type {
   CompositorCapability,
   BuildInfo,
   EffectiveLicense,
+  YoutubeCapability,
 } from './system';
 export { OperationApiError } from './operations';
 

@@ -40,7 +40,7 @@ export function ColorPage(): JSX.Element {
               and every pixel is still "valid" — just subtly wrong: greens and
               reds shift, skin tones look off. Because many real-world feeds
               (especially IP cameras) ship with no color tags at all,
-              Multiview detects what is signaled, fills the gaps with the same
+              Conspect detects what is signaled, fills the gaps with the same
               resolution-based rules real players use, converts every tile to
               the canvas color space before compositing, and tags the output
               so downstream players decode it correctly. A per-source override
@@ -77,7 +77,7 @@ export function ColorPage(): JSX.Element {
           <Prose>
             <Trans>
               This is one of the most common picture-quality bugs in any video
-              chain. Multiview expands each tile's range exactly once on
+              chain. Conspect expands each tile's range exactly once on
               ingest, composites in a common working space, and compresses
               exactly once on output — and tags the result, because an
               untagged-but-correct stream still gets guessed wrong by some
@@ -100,7 +100,7 @@ export function ColorPage(): JSX.Element {
           </Prose>
           <Prose>
             <Trans>
-              Multiview tone-maps HDR tiles into an SDR canvas (anchored so
+              Conspect tone-maps HDR tiles into an SDR canvas (anchored so
               normal "reference white" content stays at a sensible
               brightness rather than scaling everything down), and only
               treats a stream as HDR when it is explicitly tagged as such —
