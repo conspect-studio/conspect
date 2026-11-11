@@ -49,6 +49,7 @@ use crate::state::AppState;
 /// needs no body (`play`/`pause`/`stop`, or `cue`/`seek` to the in-point) may
 /// carry an empty body.
 #[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 pub struct TransportBody {
     /// The media-library asset id (required for `load`, ignored otherwise).
@@ -64,6 +65,17 @@ pub struct TransportBody {
     /// Native commit landing intent; defaults to cue.
     #[serde(default)]
     pub then: crate::player_load::LoadThen,
+}
+
+/// Wire responses of the legacy command and explicit native artifact load.
+#[derive(serde::Serialize)]
+#[serde(untagged)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+pub enum LoadResponse {
+    /// Existing command-bus receipt, not proof of native adoption.
+    Legacy(crate::routes::AcceptedBody),
+    /// Native operation and its actual adoption state.
+    Artifact(crate::player_load::LoadOperation),
 }
 
 /// Parse an optional transport body: an **empty** request body yields the
@@ -188,7 +200,7 @@ pub(crate) async fn get_player(
         params(("id" = String, Path, description = "Media-player id.")),
         request_body = TransportBody,
         responses(
-            (status = 202, description = "Load accepted; outcome on the realtime stream.", body = crate::routes::AcceptedBody),
+            (status = 202, description = "Legacy load returns an accepted command; artifactRef load returns an operation whose completion requires native video and audio adoption.", body = LoadResponse),
             (status = 401, description = "Missing or invalid credentials.", body = crate::problem::Problem),
             (status = 403, description = "Not authorized.", body = crate::problem::Problem),
             (status = 404, description = "No media player with that id.", body = crate::problem::Problem),
@@ -234,9 +246,10 @@ pub(crate) async fn load_player(
         })
         .await
         .map_err(|_| ControlError::EngineBusy)??;
-        return Ok(
-            axum::response::IntoResponse::into_response((axum::http::StatusCode::ACCEPTED, Json(result))),
-        );
+        return Ok(axum::response::IntoResponse::into_response((
+            axum::http::StatusCode::ACCEPTED,
+            Json(result),
+        )));
     }
     let asset = parsed.asset.ok_or_else(|| {
         ControlError::Validation("media player load requires an `asset` id".to_owned())

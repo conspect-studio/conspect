@@ -94,6 +94,10 @@ async fn artifact_load_requires_real_capture_and_rejects_ambiguous_selectors() {
             json!({"artifactRef":{"captureJobId":1,"artifactId":"missing","path":"/etc/passwd"}}),
             StatusCode::UNPROCESSABLE_ENTITY,
         ),
+        (
+            json!({"artifactRef":{"captureJobId":1,"artifactId":"missing"},"path":"/etc/passwd"}),
+            StatusCode::UNPROCESSABLE_ENTITY,
+        ),
     ] {
         let req = Request::builder()
             .method("POST")
