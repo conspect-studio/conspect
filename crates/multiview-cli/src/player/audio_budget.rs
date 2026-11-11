@@ -110,7 +110,7 @@ pub fn player_audio_budget() -> &'static AudioDeckBudget {
 /// [`player_audio_budget`], whose production cap and semantics stay untouched.
 /// Hold the guard for the whole test; poisoning is ignored so one failure does
 /// not cascade.
-#[cfg(test)]
+#[cfg(all(test, feature = "ffmpeg"))]
 pub(crate) fn budget_test_guard() -> std::sync::MutexGuard<'static, ()> {
     static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
     LOCK.lock()

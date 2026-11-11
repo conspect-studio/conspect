@@ -42,7 +42,7 @@ pub struct DetachTicket {
     pub request: DetachRequest,
     result: SwapCell<Option<Arc<DetachAck>>>,
     /// A boot intent is not a retirement acknowledgement.
-    pub(crate) recovery_generation: Option<Generation>,
+    pub recovery_generation: Option<Generation>,
 }
 impl DetachTicket {
     /// Poll without a lock or a wait.
@@ -119,6 +119,7 @@ impl DetachPort {
         Ok(ticket)
     }
     /// Ingest-side nonblocking take. No native owner crosses this seam.
+    #[cfg(any(feature = "ffmpeg", test))]
     pub(crate) fn take(&self) -> Option<Arc<DetachTicket>> {
         let mut state = self.state.try_lock().ok()?;
         if state.taken {
@@ -128,6 +129,7 @@ impl DetachPort {
         state.ticket.clone()
     }
     /// Terminalize any accepted request on executor exit, including a taken ticket.
+    #[cfg(any(feature = "ffmpeg", test))]
     pub(crate) fn stopped(&self, generation: Generation) {
         let mut state = self
             .state
@@ -141,6 +143,7 @@ impl DetachPort {
         state.taken = true;
         state.stopped = true;
     }
+    #[cfg(any(feature = "ffmpeg", test))]
     pub(crate) fn finish(ticket: &DetachTicket, ack: DetachAck) {
         ticket.result.store(Some(Arc::new(ack)));
     }

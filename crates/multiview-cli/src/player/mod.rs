@@ -52,7 +52,7 @@ mod pacer;
 mod probe;
 mod transport;
 
-#[cfg(test)]
+#[cfg(all(test, feature = "ffmpeg"))]
 pub(crate) use audio_budget::budget_test_guard;
 pub use audio_budget::{
     player_audio_budget, AudioDeckBudget, AudioDeckLease, PLAYER_PCM_BUDGET_BYTES,
@@ -60,7 +60,7 @@ pub use audio_budget::{
 pub use clip::{ClipSpec, ImmutableArtifactLease, SlotReference, SlotSnapshot};
 pub use control::{Adoption, AudioTransport, EpochAdopter, PlayerControl, PlayerControlBus};
 pub use detach::{DetachAck, DetachAdmissionError, DetachPort, DetachRequest, DetachTicket};
-pub use handle::PlayerHandle;
+pub use handle::{PlayerFault, PlayerHandle, PlayerStatus};
 pub use load::{
     AudioCommitSlot, Generation, LoadCoordinator, LoadRequest, Staged, RETIRE_CAPACITY,
 };
@@ -73,7 +73,7 @@ pub use transport::{
 };
 
 #[cfg(feature = "ffmpeg")]
-pub use handle::{publish_status, PlayerFault, PlayerRuntime, PlayerStatus};
+pub use handle::{publish_status, PlayerRuntime};
 #[cfg(feature = "ffmpeg")]
 pub use journal::BindingJournal;
 #[cfg(feature = "ffmpeg")]
