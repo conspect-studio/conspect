@@ -48,6 +48,16 @@ function deps(over: Partial<WallDeps> & { frames?: boolean } = {}) {
 }
 
 beforeEach(() => { vi.useFakeTimers(); HTMLCanvasElement.prototype.getContext = vi.fn(() => ({ drawImage: vi.fn() })) as never; });
+
+/** Records every 2D drawImage call: whole-frame conversions (3 args) and cell crops (9 args). */
+function recordDraws() {
+  const calls: unknown[][] = [];
+  HTMLCanvasElement.prototype.getContext = vi.fn(() => ({ drawImage: (...args: unknown[]) => { calls.push(args); } })) as never;
+  return {
+    conversions: () => calls.filter((call) => call.length === 3),
+    crops: () => calls.filter((call) => call.length === 9),
+  };
+}
 afterEach(() => { vi.useRealTimers(); });
 
 describe('WallStreamProvider', () => {
@@ -86,28 +96,71 @@ describe('WallStreamProvider', () => {
     expect(screen.getByTestId('still-a')).toBeTruthy();
   });
 
-  it('drops the old-layout frame on a generation change and reopens one lease', async () => {
+  it('drops the old-layout picture on a generation change and reopens one lease', async () => {
     const next: WallGeometry = { ...geometry, generation: 2, cells: [{ source: 'a', x: 320, y: 0, w: 320, h: 180 }] };
     let answer = geometry;
     const d = deps({ fetchWall: vi.fn(() => Promise.resolve(answer)) });
-    const closes: ReturnType<typeof vi.fn>[] = [];
+    const draws = recordDraws();
+    // Each session gets its own frame. Only the first session delivers one at once;
+    // the second waits, so the test can see what surfaces show in between.
+    const clones: ReturnType<typeof vi.fn>[] = [];
+    const feeds: (() => void)[] = [];
     const inner = d.value.play;
     const play = (o: Parameters<WallDeps['play']>[0]): ReturnType<WallDeps['play']> => {
-      const close = vi.fn();
-      closes.push(close);
-      const frame = { displayWidth: 640, displayHeight: 360, clone: () => frame, close } as unknown as VideoFrame;
+      const clone = vi.fn();
+      clones.push(clone);
+      const frame = { displayWidth: 640, displayHeight: 360, clone, close: vi.fn() } as unknown as VideoFrame;
       const forward = o.onFrame;
-      return inner({ ...o, onFrame: () => { forward?.(frame); } });
+      const first = feeds.length === 0;
+      feeds.push(() => { forward?.(frame); });
+      return inner({ ...o, onFrame: () => { if (first) forward?.(frame); } });
     };
     d.value = { ...d.value, play };
     render(<WallStreamProvider deps={d.value}><Probe id="a" /></WallStreamProvider>);
     await act(async () => { await vi.advanceTimersByTimeAsync(100); });
     expect(screen.getByTestId('crop-a')).toBeTruthy();
+    expect(draws.crops().at(-1)?.slice(1, 5)).toEqual([0, 0, 320, 180]);
+    const before = draws.crops().length;
     answer = next;
     await act(async () => { await vi.advanceTimersByTimeAsync(2100); });
-    expect(closes[0]).toHaveBeenCalled();
+    // The old session is retired and a second lease is open, but no frame of the new
+    // layout has arrived: the surface is back on its still and nothing was cropped
+    // from the old picture with the new cell.
     expect(d.lease).toHaveBeenCalledTimes(2);
-    expect(closes).toHaveLength(2);
+    expect(feeds).toHaveLength(2);
+    expect(screen.getByTestId('still-a')).toBeTruthy();
+    expect(draws.crops()).toHaveLength(before);
+    // The first frame of the new session brings the surface back, cropped with the new cell.
+    await act(async () => { feeds[1]?.(); await vi.advanceTimersByTimeAsync(600); });
+    expect(screen.getByTestId('crop-a')).toBeTruthy();
+    expect(draws.crops().at(-1)?.slice(1, 5)).toEqual([320, 0, 320, 180]);
+    // The store keeps no decoded frame: it never clones one, so there is none to leak.
+    for (const clone of clones) expect(clone).not.toHaveBeenCalled();
+  });
+
+  it('converts each decoded frame once, however many surfaces crop it', async () => {
+    const d = deps({ frames: false });
+    const draws = recordDraws();
+    let feed: (() => void) | undefined;
+    const inner = d.value.play;
+    const frame = { displayWidth: 640, displayHeight: 360, clone: vi.fn(), close: vi.fn() } as unknown as VideoFrame;
+    const play = (o: Parameters<WallDeps['play']>[0]): ReturnType<WallDeps['play']> => {
+      feed = () => { o.onFrame?.(frame); };
+      return inner(o);
+    };
+    d.value = { ...d.value, play };
+    render(<WallStreamProvider deps={d.value}><Probe id="a" /><Probe id="b" /><Probe id="a" /></WallStreamProvider>);
+    await act(async () => { await vi.advanceTimersByTimeAsync(100); });
+    await act(async () => { feed?.(); await vi.advanceTimersByTimeAsync(600); });
+    expect(screen.getAllByTestId(/^crop-/)).toHaveLength(3);
+    // One whole-frame conversion; each surface then copies its cell from that canvas.
+    expect(draws.conversions()).toHaveLength(1);
+    expect(draws.conversions()[0]?.[0]).toBe(frame);
+    expect(draws.crops()).toHaveLength(3);
+    for (const crop of draws.crops()) expect(crop[0]).toBeInstanceOf(HTMLCanvasElement);
+    await act(async () => { feed?.(); await Promise.resolve(); });
+    expect(draws.conversions()).toHaveLength(2);
+    expect(draws.crops()).toHaveLength(6);
   });
 
   it('backs off instead of polling every 2 s when the wall is off', async () => {

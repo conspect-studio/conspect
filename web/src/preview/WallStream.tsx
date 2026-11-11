@@ -55,9 +55,11 @@ export function WallCrop({ source, label, className, testId }: {
     if (!store || !target || x === undefined || y === undefined || w === undefined || h === undefined) return;
     const ctx = target.getContext('2d');
     if (!ctx) return;
-    return store.subscribeFrames((frame) => {
-      const rect = cropRect({ source, x, y, w, h }, frame.displayWidth, frame.displayHeight);
-      if (rect) ctx.drawImage(frame, rect[0], rect[1], rect[2], rect[3], 0, 0, target.width, target.height);
+    // `picture` is the store's canvas, already converted from the decoded frame:
+    // a crop from it is a small copy, not another whole-frame conversion.
+    return store.subscribeFrames((picture) => {
+      const rect = cropRect({ source, x, y, w, h }, picture.width, picture.height);
+      if (rect) ctx.drawImage(picture, rect[0], rect[1], rect[2], rect[3], 0, 0, target.width, target.height);
     });
   }, [store, source, x, y, w, h]);
   return <canvas ref={canvas} width={w ?? 0} height={h ?? 0} role="img" aria-label={label} className={className} data-wall-live="1" data-testid={testId ?? 'wall-crop'} />;
