@@ -40,17 +40,17 @@ describe('established session ownership', () => {
     expect(release).toHaveBeenCalledOnce();
   });
 
-  it('bounds a stalled close and permits retry after transport confirmation', async () => {
+  it('sends DELETE after a stalled WebTransport close without waiting for UDP', async () => {
     vi.useFakeTimers();
     try {
       let finish!: () => void;
       const closed = new Promise<null>((resolve) => { finish = () => { resolve(null); }; });
       const release = vi.fn(() => Promise.resolve());
       const owned = ownMoqSession({ close: vi.fn(), closed }, new AbortController().signal, release, 50);
-      const failed = expect(owned.close()).rejects.toThrow('closure deadline');
+      const closing = owned.close();
       await vi.advanceTimersByTimeAsync(50);
-      await failed;
-      expect(release).not.toHaveBeenCalled();
+      await closing;
+      expect(release).toHaveBeenCalledOnce();
       finish();
       await owned.close();
       expect(release).toHaveBeenCalledOnce();
