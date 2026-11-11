@@ -464,6 +464,8 @@ fn every_static_stat_fixture_is_a_real_kernel_line() {
     }
 }
 
+// The host's real /proc exists only on Linux (the platform this sampler serves).
+#[cfg(target_os = "linux")]
 #[test]
 fn the_real_proc_self_stat_line_parses_through_a_root_of_slash() {
     // The one deliberate read of the host's real /proc: a fixture can drift from

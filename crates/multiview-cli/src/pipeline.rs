@@ -8818,8 +8818,9 @@ struct LiveIngestSpawner {
         crate::source_rails::Catalogue,
         multiview_engine::DemandManager<Nv12Image>,
     )>,
-    /// First-slice switcher runs retire a removed source's store pixels so
-    /// a later re-add can never resolve stale media through the M/E.
+    /// First-slice switcher runs fail closed on a live media edit and retire a
+    /// removed or edited source's store pixels, so the M/E can never resolve
+    /// stale media (PR 224). Policy-only edits still apply live.
     clear_on_remove: bool,
     source_events: Arc<crate::source_event_runtime::Runtime>,
     /// The solved startup layout: the pinned canvas, which a live layout swap
@@ -8895,6 +8896,17 @@ impl crate::live_sources::IngestSpawner for LiveIngestSpawner {
             crate::source_demand::standing_pins(&spawn.source),
         );
         manager.restart(&spawn.source.id);
+        true
+    }
+
+    fn invalidate_live_edit(&self, id: &str) -> bool {
+        if !self.clear_on_remove || self.demand.is_none() {
+            return false;
+        }
+        // Invalidate before reconciliation can resolve a stale configured rail.
+        // Fencing also excludes any detached old producer's late publications.
+        self.source_removed(id);
+        tracing::warn!(source = %id, "switcher source edit requires restart; stale demand catalogue entry invalidated");
         true
     }
 
@@ -21776,7 +21788,7 @@ segment_ms = 1000
     }
 
     #[test]
-    fn switcher_removal_cannot_resolve_stale_media() {
+    fn switcher_live_edits_and_removal_cannot_resolve_stale_media() {
         use crate::live_sources::IngestSpawner;
         use multiview_engine::RailDriver;
 
@@ -21784,6 +21796,13 @@ segment_ms = 1000
         let mut pipeline = Pipeline::build(&config).expect("pipeline builds");
         // Build the run's demand manager so the live spawner owns the catalogue.
         let _manager = pipeline.demand();
+        let legacy = pipeline.live_spawner();
+        assert!(
+            !legacy.invalidate_live_edit("cam1"),
+            "legacy edits stay live"
+        );
+        let mut guarded = pipeline.live_spawner();
+        guarded.clear_on_remove = true;
         let rails = crate::source_rails::SourceRails::new(
             pipeline.catalogue(),
             pipeline.stop_registry(),
@@ -21792,19 +21811,8 @@ segment_ms = 1000
                 registry: pipeline.stop_registry(),
             }),
         );
-        // A non-switcher run removes the source but leaves the store alone
-        // (other holders keep their last-good picture, as before).
-        let legacy = pipeline.live_spawner();
-        assert!(
-            !legacy.clear_on_remove,
-            "legacy runs keep removal semantics"
-        );
-        // An opted-in switcher run additionally retires the removed store's
-        // pixels: a later re-add can never resolve the old media.
-        let mut guarded = pipeline.live_spawner();
-        guarded.clear_on_remove = true;
         let retained = rails.store("cam1").expect("boot store exists");
-        guarded.source_removed("cam1");
+        assert!(guarded.invalidate_live_edit("cam1"));
         assert!(retained.read_at(MediaTime::from_nanos(0)).frame().is_none());
         assert_eq!(rails.resolve("cam1", Rails::VIDEO), Rails::NONE);
         assert!(rails.store("cam1").is_none());

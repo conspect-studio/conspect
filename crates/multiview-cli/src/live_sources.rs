@@ -233,6 +233,12 @@ pub trait IngestSpawner: Send + Sync {
         false
     }
 
+    /// Invalidate a demand-managed source before a live edit. Returns true when
+    /// the replacement must wait for restart rather than spawn outside demand.
+    fn invalidate_live_edit(&self, _id: &str) -> bool {
+        false
+    }
+
     /// A source now running without decoded audio. Hub worker only.
     fn source_without_audio(&self, _id: &str) {}
 
@@ -484,6 +490,10 @@ fn worker_loop(
                 // store (the drain reused it, so the tile holds last-good).
                 teardown(&spawn.id, &mut owned, registry);
                 if let Some(ingest) = ingest {
+                    if ingest.invalidate_live_edit(&spawn.id) {
+                        preview_remove(preview, &spawn.id);
+                        continue;
+                    }
                     ingest.source_without_audio(&spawn.id);
                 }
                 spawn_synth(spawn, &mut owned, registry, preview);
@@ -498,6 +508,10 @@ fn worker_loop(
                 // producer first, then spawn the replacement ingest thread
                 // into the SAME reused store (the tile holds last-good).
                 teardown(&spawn.source.id, &mut owned, registry);
+                if ingest.is_some_and(|ingest| ingest.invalidate_live_edit(&spawn.source.id)) {
+                    preview_remove(preview, &spawn.source.id);
+                    continue;
+                }
                 spawn_decoded(*spawn, ingest, &mut owned, registry, preview);
             }
             HubRequest::Teardown { id } => {
