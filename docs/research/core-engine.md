@@ -55,7 +55,7 @@ The multiview's own controllable latency budget is ~50–250 ms; the output prot
 - Redistributable LGPL-clean default build; GPL/nonfree/NDI strictly opt-in.
 
 ### Non-Goals
-- Windows support.
+- Windows support. *(Superseded 2026-11-10: the ADR-0011 amendment admits native Windows; this brief is kept as originally written.)*
 - Sub-second WebRTC output in v1 (WebRTC is the only sub-second protocol; deferred, architecture leaves room).
 - Cross-vendor on-GPU zero-copy (proven not to exist on desktop — explicitly out of scope).
 - Per-tile re-encode/ABR-per-tile (session-cap and bandwidth hostile).
