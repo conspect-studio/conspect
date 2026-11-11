@@ -13,7 +13,7 @@ import { messages } from '../../locales/en/messages';
 import { ProductionDesk } from './ProductionDesk';
 vi.mock('../../realtime/useEngineEvents', () => ({ useEngineEvents: () => ({ status: 'open' }), TILES_QUERY_KEY: ['tiles'] }));
 vi.mock('../../preview/PreviewSurface', () => ({ PreviewSurface: () => null }));
-vi.mock('../../preview/useJpegPreview', () => ({ useJpegPreview: () => undefined }));
+vi.mock('../../preview/useJpegPreview', () => ({ useJpegPreview: () => undefined, useJpegStill: () => ({ url: undefined, state: 'loading' }) }));
 import { getOperationTracker } from './operationTracker';
 import type { Envelope } from '../../realtime/envelope';
 

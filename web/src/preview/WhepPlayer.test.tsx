@@ -415,4 +415,54 @@ describe('<WhepPlayer>', () => {
     const deleteCall = fetchImpl.mock.calls.find((call) => call[1]?.method === 'DELETE');
     expect(deleteCall).toBeDefined();
   });
+
+  const pcf = (): RTCPeerConnection => new FakePeerConnection() as unknown as RTCPeerConnection;
+
+  it('DELETEs with keepalive on pagehide, once, and not again on unmount', async () => {
+    const fetchImpl = makeFetch(() => sdpResponse(201, 'sessions/abc'));
+    const { unmount } = renderWithProviders(
+      <WhepPlayer endpoint="/api/v1/preview/program/whep" label="Program" pcFactory={pcf} fetchImpl={fetchImpl} />,
+    );
+    await act(async () => { await vi.runOnlyPendingTimersAsync(); });
+    await act(async () => { window.dispatchEvent(new Event('pagehide')); await Promise.resolve(); });
+    const deletes = (): unknown[][] => fetchImpl.mock.calls.filter((c) => c[1]?.method === 'DELETE');
+    expect(deletes()).toHaveLength(1);
+    expect(deletes()[0]?.[1]).toMatchObject({ method: 'DELETE', keepalive: true });
+    unmount();
+    expect(deletes()).toHaveLength(1);
+  });
+
+  it('DELETEs with keepalive on unmount', async () => {
+    const fetchImpl = makeFetch(() => sdpResponse(201, 'sessions/abc'));
+    const { unmount } = renderWithProviders(
+      <WhepPlayer endpoint="/api/v1/preview/program/whep" label="Program" pcFactory={pcf} fetchImpl={fetchImpl} />,
+    );
+    await act(async () => { await vi.runOnlyPendingTimersAsync(); });
+    unmount();
+    const del = fetchImpl.mock.calls.find((c) => c[1]?.method === 'DELETE');
+    expect(del?.[0]).toBe('https://host.example/api/v1/preview/program/sessions/abc');
+    expect(del?.[1]).toMatchObject({ keepalive: true });
+  });
+
+  it('never POSTs a new offer while the previous session is still being released', async () => {
+    let finishDelete: (() => void) | undefined;
+    const fetchImpl = vi.fn<typeof fetch>().mockImplementation((_url, init) =>
+      init?.method === 'DELETE'
+        ? new Promise<Response>((resolve) => { finishDelete = () => { resolve(sdpResponse(204)); }; })
+        : Promise.resolve(sdpResponse(201, 'sessions/abc')),
+    );
+    const first = renderWithProviders(
+      <WhepPlayer endpoint="/api/v1/preview/program/whep" label="Program" pcFactory={pcf} fetchImpl={fetchImpl} />,
+    );
+    await act(async () => { await vi.runOnlyPendingTimersAsync(); });
+    first.unmount();
+    renderWithProviders(
+      <WhepPlayer endpoint="/api/v1/preview/program/whep" label="Program" pcFactory={pcf} fetchImpl={fetchImpl} />,
+    );
+    await act(async () => { await vi.advanceTimersByTimeAsync(5000); });
+    const posts = (): number => fetchImpl.mock.calls.filter((c) => c[1]?.method === 'POST').length;
+    expect(posts()).toBe(1); // the second offer is held back
+    await act(async () => { finishDelete?.(); await vi.advanceTimersByTimeAsync(10); });
+    expect(posts()).toBe(2);
+  });
 });
