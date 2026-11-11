@@ -29,6 +29,9 @@ dist/
 
 # Logs / runtime
 *.log
+# Committed MoQ interoperability evidence (see web/src/preview/MOQ-RETAINED-REGRESSION.md).
+# A file that is both tracked and ignored makes release-plz refuse to run.
+!web/src/preview/moq-*.log
 /data/
 *.sqlite
 *.sqlite-wal
