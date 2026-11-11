@@ -23,7 +23,7 @@ export function ContainerPage(): JSX.Element {
         title={<Trans>Running in containers</Trans>}
         description={
           <Trans>
-            Run Multiview with Docker — single container or the compose stack —
+            Run Conspect with Docker — single container or the compose stack —
             with optional GPU access, persistent volumes, and healthchecks.
           </Trans>
         }
@@ -57,8 +57,10 @@ export function ContainerPage(): JSX.Element {
             <Trans>
               The default image encodes <Code>mpeg2video</Code> (plays in VLC or
               ffplay). For browser-friendly H.264 or H.265 output, use the{" "}
-              <Code>-gpl</Code> image variant — note that H.264 / H.265 make the
-              build GPL.
+              <Code>-gpl</Code> image variant for GPL software encoders. GPL
+              dependency obligations do not relicense Conspect's own code or
+              grant permission to redistribute it. Hardware encoding does not
+              itself require those GPL software encoders.
             </Trans>
           </Prose>
         </DocSection>

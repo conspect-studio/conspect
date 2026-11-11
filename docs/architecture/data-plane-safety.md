@@ -90,7 +90,9 @@ the output *and* verify with `ffprobe`. ([color](color.md),
 
 Keep the default build **LGPL-clean**. Do scaling/compositing in-house — `scale_cuda` (LGPL,
 JIT-compiled via `--enable-cuda-llvm`), **never `scale_npp`** (`--enable-nonfree` ⇒ not
-redistributable). `gpl-codecs` (x264/x265) makes the whole build GPL — opt-in only. Never vendor the
+redistributable). `gpl-codecs` (x264/x265) introduces GPL dependency obligations — opt-in only;
+it does not relicense Conspect or grant distribution rights. Project permissions remain governed
+by the [Conspect Source-Available Non-Commercial License Version 2.0](../../LICENSE). Never vendor the
 proprietary NDI SDK; the `ndi` feature runtime-loads (`NDIlib_v6_load()`), stays inert until the
 operator accepts the license, and carries mandatory trademark attribution. `deploy/ffmpeg-build.sh`
 hard-rejects the forbidden configure flags, and CI `cargo deny` gates licenses and advisories.

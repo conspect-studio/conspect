@@ -1,13 +1,13 @@
 {
   "openapi": "3.1.0",
   "info": {
-    "title": "Multiview Control API",
-    "description": "REST + WebSocket + SSE management API for the Multiview engine.",
+    "title": "Conspect Control API",
+    "description": "REST + WebSocket + SSE management API for the Conspect engine.",
     "contact": {
-      "name": "The Multiview Authors"
+      "name": "The Conspect Authors"
     },
     "license": {
-      "name": "Multiview Source-Available Non-Commercial License",
+      "name": "Conspect Source-Available Non-Commercial License v2",
       "url": "https://github.com/conspect-studio/conspect/blob/main/LICENSE"
     },
     "version": "1.0.0"
@@ -1971,7 +1971,7 @@
           "devices"
         ],
         "summary": "`POST /api/v1/devices/{id}/set-mode` — converge the device to a mode\n(role: write; `202` + operation id + declared DEV-class impact).",
-        "description": "The device-side impact is **declared in the body before apply** (ADR-M009):\nthe device restarts its pipeline; bound sources ride the tile ladder to\n`NO_SIGNAL` during the switch; no Multiview output is interrupted. The route\nmints the operation id, `202`s, and **dispatches** the convergence to the\ndevice's running driver poller (DEV-A4), which records the requested mode as\nits desired mode, runs `plan_mode_convergence` → `converge_mode`\n(close-before-open), and publishes the `device.mode` outcome on the realtime\nstream; a failed apply is re-converged on the poller's next adopt/reconnect\npass. When no live poller is running (the default build / a device with no\nspawned driver), the `202` still declares the impact but nothing applies the\nchange: the device's configured `desired_mode` is what a later-spawned\npoller converges onto when its adopt/reconnect reaches `ONLINE`.",
+        "description": "The device-side impact is **declared in the body before apply** (ADR-M009):\nthe device restarts its pipeline; bound sources ride the tile ladder to\n`NO_SIGNAL` during the switch; no Conspect output is interrupted. The route\nmints the operation id, `202`s, and **dispatches** the convergence to the\ndevice's running driver poller (DEV-A4), which records the requested mode as\nits desired mode, runs `plan_mode_convergence` → `converge_mode`\n(close-before-open), and publishes the `device.mode` outcome on the realtime\nstream; a failed apply is re-converged on the poller's next adopt/reconnect\npass. When no live poller is running (the default build / a device with no\nspawned driver), the `202` still declares the impact but nothing applies the\nchange: the device's configured `desired_mode` is what a later-spawned\npoller converges onto when its adopt/reconnect reaches `ONLINE`.",
         "operationId": "set_mode",
         "parameters": [
           {
@@ -9133,7 +9133,7 @@
         "operationId": "get_self",
         "responses": {
           "200": {
-            "description": "The Multiview NMOS node resource.",
+            "description": "The Conspect NMOS node resource.",
             "content": {
               "application/json": {
                 "schema": {
@@ -9969,7 +9969,7 @@
           },
           "redistributable": {
             "type": "boolean",
-            "description": "Whether the artifact is redistributable. `true` for every shippable\nMultiview build: the default is LGPL-clean, `gpl-codecs` is GPL\n(redistributable under copyleft), and NDI is runtime-loaded (never\nvendored/linked) — there is no non-redistributable `--enable-nonfree`\nclosure (no `nonfree` Cargo feature exists)."
+            "description": "Dependency-build metadata, not permission to redistribute Conspect.\n`true` indicates the dependency build has no `--enable-nonfree` closure\n(no `nonfree` Cargo feature exists): the default is LGPL-clean,\n`gpl-codecs` enables GPL codec dependencies, and NDI is runtime-loaded\n(never vendored/linked). Enabling GPL codecs does not relicense Conspect\nproject code. This value does not authorize redistribution of Conspect;\nthe project licence and applicable dependency terms still govern."
           }
         }
       },
@@ -12566,7 +12566,7 @@
             }
           }
         ],
-        "description": "An IS-04 **Node**: the top-level host (a running Multiview instance)."
+        "description": "An IS-04 **Node**: the top-level host (a running Conspect instance)."
       },
       "OperationId": {
         "type": "string",
@@ -13930,7 +13930,7 @@
             }
           }
         ],
-        "description": "An IS-04 **Receiver**: an ingress flow (a Multiview input)."
+        "description": "An IS-04 **Receiver**: an ingress flow (a Conspect input)."
       },
       "ReconnectPolicyDoc": {
         "type": "object",
@@ -14669,7 +14669,7 @@
             }
           }
         ],
-        "description": "An IS-04 **Sender**: an egress flow (a Multiview program/preview output)."
+        "description": "An IS-04 **Sender**: an egress flow (a Conspect program/preview output)."
       },
       "SetModeAccepted": {
         "type": "object",
@@ -14686,7 +14686,7 @@
           },
           "impact": {
             "type": "string",
-            "description": "The declared impact class: a device-side (`dev`) impact — the device\nrestarts its pipeline; Multiview program output is never interrupted."
+            "description": "The declared impact class: a device-side (`dev`) impact — the device\nrestarts its pipeline; Conspect program output is never interrupted."
           },
           "operation_id": {
             "type": "string",

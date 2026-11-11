@@ -1,6 +1,7 @@
-# Multiview — Native Caption / Subtitle Ingest
+<a id="multiview--native-caption--subtitle-ingest"></a>
+# Conspect — Native Caption / Subtitle Ingest
 
-Multiview ingests captions **from the source stream itself** — every way they arrive — and treats them
+Conspect ingests captions **from the source stream itself** — every way they arrive — and treats them
 like an audio track: a **`CaptionTrack`** discovered during demux, decoded **in the same demux pass**
 (no second open, no sidecar staging for stream captions), normalised onto the one internal nanosecond
 timeline, **sampled** into a per-tile last-good **cue store**, and burned in by the existing overlay

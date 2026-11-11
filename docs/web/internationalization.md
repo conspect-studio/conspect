@@ -1,6 +1,6 @@
 # Internationalization & Localization (i18n / l10n)
 
-The Multiview management web app is **greenfield** for i18n: `/web` is a bare React 19 + Vite 6 + TS
+The Conspect management web app is **greenfield** for i18n: `/web` is a bare React 19 + Vite 6 + TS
 scaffold (no i18n, Tailwind, shadcn, or konva installed yet), so this is designed in from the start
 rather than retrofitted. This document fixes the library, formatting, workflow, multi-timezone +
 timecode handling, RTL (including the canvas editor), locale negotiation, API error policy, and the

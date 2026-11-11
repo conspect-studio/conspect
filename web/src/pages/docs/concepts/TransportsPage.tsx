@@ -69,7 +69,7 @@ export function TransportsPage(): JSX.Element {
               H.265 — so the picture quality and bitrate are set at the
               camera. It has no built-in recovery beyond TCP retransmission;
               on flaky links a stream simply stalls and must reconnect, which
-              Multiview handles per tile without disturbing the rest of the
+              Conspect handles per tile without disturbing the rest of the
               wall.
             </Trans>
           </Prose>
@@ -133,7 +133,7 @@ export function TransportsPage(): JSX.Element {
               platforms still ingest it. Classic RTMP carries H.264 video and
               AAC audio only; newer "enhanced" endpoints negotiate H.265 and
               AV1. As an input it appears when an encoder or app pushes to
-              Multiview; as an output it is how Multiview pushes the composed
+              Conspect; as an output it is how Conspect pushes the composed
               canvas to a platform.
             </Trans>
           </Prose>
@@ -163,7 +163,7 @@ export function TransportsPage(): JSX.Element {
           <Prose>
             <Trans>
               As an input, HLS arrives in bursts (whole segments at a time),
-              so Multiview paces it back to real time internally before it is
+              so Conspect paces it back to real time internally before it is
               sampled onto the wall. As an output it is the easiest way to let
               many people open the multiview in a browser or player.
             </Trans>
@@ -198,7 +198,7 @@ export function TransportsPage(): JSX.Element {
           <Prose>
             <Trans>
               WebRTC carries sub-second video and audio straight to and from a
-              browser with no plugin. Multiview speaks the two open HTTP
+              browser with no plugin. Conspect speaks the two open HTTP
               signalling profiles built on it: <strong>WHIP</strong> (WebRTC-HTTP
               Ingestion Protocol) for a browser or encoder to publish a feed into
               a <Code>webrtc</Code> source, and <strong>WHEP</strong> (WebRTC-HTTP

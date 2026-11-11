@@ -1,5 +1,13 @@
 # Multiview — Implementation Roadmap
 
+> **Historical plan:** this greenfield-era milestone plan retains the former name Multiview and
+> its original status assumptions. The product is now Conspect, a live-media production, routing
+> and monitoring platform; current delivery status is in [ROADMAP.md](../ROADMAP.md).
+> Redistribution statements below are historical, not current grants. Current project permissions
+> are governed by [LICENSE](../LICENSE), the Conspect Source-Available Non-Commercial License
+> Version 2.0: private study and copies necessary for authorized use, not general modification,
+> distribution or reproduction. Earlier grants retain their original terms.
+
 > Top-level summary + status table: [`../ROADMAP.md`](../ROADMAP.md). Per-feature capability/status
 > matrix: [`../FEATURES.md`](../FEATURES.md). This page is the detailed per-milestone plan.
 

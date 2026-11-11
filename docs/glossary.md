@@ -1,6 +1,7 @@
-# Multiview — Glossary
+<a id="multiview--glossary"></a>
+# Conspect — Glossary
 
-Domain terms used across the Multiview documentation, alphabetised. Each entry is a single
+Domain terms used across the Conspect documentation, alphabetised. Each entry is a single
 paragraph; cross-links point to the deep research briefs in [`research/`](research/), the
 decision records in [`decisions/`](decisions/), and the architecture docs in
 [`architecture/`](architecture/). The canonical names, crate map, feature flags, and
@@ -66,7 +67,7 @@ any one wrong silently corrupts output on some players. Modeled by `ColorInfo` i
 [ADR-C001](decisions/ADR-C001.md).
 
 **Compositor** — The custom GPU stage that scales, places, color-converts, and blends every
-tile into the canvas. Multiview deliberately owns this (rather than using FFmpeg filter graphs)
+tile into the canvas. Conspect deliberately owns this (rather than using FFmpeg filter graphs)
 because no FFmpeg/GStreamer stack filter does per-cell fit/cover/crop. Implemented as
 `CudaCompositor` / `MetalCompositor` / `VulkanCompositor` (with wgpu as the portable
 baseline). See [`architecture/pipeline.md`](architecture/pipeline.md) and the
@@ -95,7 +96,7 @@ counterpart to admission. See [`architecture/hardware-and-efficiency.md`](archit
 and [`architecture/conventions.md`](architecture/conventions.md) §5.9.
 
 **DTS (Decode TimeStamp)** — The timestamp telling the decoder/muxer *when to decode* a
-packet, which differs from PTS (display order) whenever B-frames reorder frames. Multiview
+packet, which differs from PTS (display order) whenever B-frames reorder frames. Conspect
 schedules by `best_effort_timestamp` (display order) on input and lets libavcodec assign DTS
 on the encoded output; any stream-copy path must clamp `dts = max(dts, last+1)` because
 `av_interleaved_write_frame` aborts on the first non-monotonic DTS. See
@@ -110,7 +111,7 @@ meters are sampled/conflated (~10–30 Hz) before going to clients so the realti
 back-pressures the engine. See [`architecture/conventions.md`](architecture/conventions.md) §3.
 
 **EBU R37** — The lip-sync tolerance window (audio +40 ms ahead / −60 ms behind video).
-Multiview biases audio slightly behind video because audio-ahead is more perceptible, and uses
+Conspect biases audio slightly behind video because audio-ahead is more perceptible, and uses
 this window as a soak-test acceptance criterion. See the
 [streaming-gotchas brief](research/streaming-gotchas.md) §5, §7.
 
@@ -161,7 +162,7 @@ owns capability detection, the backend registry, and the cost-model planner. See
 
 **hwaccel** — The generic FFmpeg path in which a software-named decoder delegates to hardware
 via an `AVHWDeviceContext` plus a `get_format` callback, yielding GPU-resident frames and
-supporting automatic software fallback. Multiview prefers this generic path over the `*_cuvid` /
+supporting automatic software fallback. Conspect prefers this generic path over the `*_cuvid` /
 `*_qsv` wrapper decoders precisely because only it offers uniform negotiation and fallback.
 See the [core-engine brief](research/core-engine.md) §6.5.
 
@@ -185,7 +186,7 @@ axes). See the [color brief](research/color-management.md) §1–2 and [ADR-C002
 **LL-HLS (Low-Latency HLS)** — Apple's low-latency HLS: partial segments (`EXT-X-PART`),
 preload hints, `EXT-X-SERVER-CONTROL` with `CAN-BLOCK-RELOAD`/`PART-HOLD-BACK`, and blocking
 playlist reload (`_HLS_msn`/`_HLS_part`) over HTTP/2. FFmpeg's `hls` muxer **cannot** emit it
-(its `-lhls` is the unrelated `EXT-X-PREFETCH` variant), so Multiview builds a custom CMAF
+(its `-lhls` is the unrelated `EXT-X-PREFETCH` variant), so Conspect builds a custom CMAF
 segmenter + blocking-reload origin in `multiview-output`, reusing the `hls-playlist` crate for the
 tag layer. Target latency ~2–5 s. See [`io/outputs.md`](io/outputs.md), the
 [streaming-gotchas brief](research/streaming-gotchas.md) §4, and the
@@ -199,7 +200,7 @@ gamma/YUV space causes dark fringing on edges and wrong mids. The canvas working
 
 ## M
 
-**MediaTime** — Multiview's internal monotonic timeline value, carried as i64 nanoseconds (NTSC
+**MediaTime** — Conspect's internal monotonic timeline value, carried as i64 nanoseconds (NTSC
 `1001` rates kept as exact rationals/ns, never float fps). Per-input PTS is normalized and
 rebased onto this single timeline, and the output re-stamps all PTS/DTS from the tick counter.
 Defined in `multiview-core`. See [`architecture/timing-and-sync.md`](architecture/timing-and-sync.md).
@@ -224,7 +225,7 @@ See the [core-engine brief](research/core-engine.md) §6.3, [ADR-0003](decisions
 and [ADR-E008](decisions/ADR-E008.md).
 
 **NV12 / P010** — YUV pixel layouts. **NV12** is 8-bit 4:2:0 semi-planar (1.5 B/px) and is
-Multiview's canonical pixel format — frames stay NV12 throughout and YUV→RGB happens in-shader at
+Conspect's canonical pixel format — frames stay NV12 throughout and YUV→RGB happens in-shader at
 tile size; RGBA is never materialised per tile. **P010** is the 10-bit equivalent (10 bits
 stored in the high bits of 16-bit words; descale before normalizing). Related host layouts:
 P216 (16-bit 4:2:2), UYVY (packed 4:2:2). See
@@ -291,7 +292,7 @@ STALE/RECONNECTING, and a placeholder card at NO_SIGNAL. Lives in `multiview-fra
 [`architecture/conventions.md`](architecture/conventions.md) §5.2.
 
 **Timebase** — The rational unit (e.g. `1/90000`, `1/1000000000`) in which a stream's
-timestamps are counted. Multiview rescales every input timebase to its internal ns timeline via
+timestamps are counted. Conspect rescales every input timebase to its internal ns timeline via
 `av_rescale_q` and carries NTSC `1001`-family cadences as exact rationals — never float fps,
 which drifts ~3.6 s/hour. See the [streaming-gotchas brief](research/streaming-gotchas.md) §2.
 

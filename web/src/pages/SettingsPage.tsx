@@ -243,7 +243,7 @@ export function SettingsPage(): JSX.Element {
               <Trans>
                 Download the current stores (sources, outputs, overlays,
                 layouts, canvas) as multiview.toml. Stored UI edits take effect
-                when Multiview restarts with this file; live actions (apply
+                when Conspect restarts with this file; live actions (apply
                 layout, swap, routing, salvos) act on the running engine
                 immediately.
               </Trans>

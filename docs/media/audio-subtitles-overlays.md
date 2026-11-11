@@ -1,6 +1,6 @@
 # Audio, Subtitles & Overlays
 
-How Multiview handles the *secondary essences* that ride alongside the composited
+How Conspect handles the *secondary essences* that ride alongside the composited
 video canvas: **audio** (discrete per-input tracks + a program bus + EBU R128
 metering), **subtitles/captions** (ingest, burn-in, and discrete passthrough),
 and **overlays** (labels, clocks, logos, meters, alert cards composited on the

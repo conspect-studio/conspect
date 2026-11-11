@@ -31,7 +31,7 @@ export function DevicesAdoptHelpPage(): JSX.Element {
               few seconds and lists what answered. Anything on the network can
               answer a broadcast, so the results are an untrusted inventory of
               hints: they are not devices, they carry no credentials, and
-              Multiview never adopts them automatically. Every adoption is an
+              Conspect never adopts them automatically. Every adoption is an
               explicit operator confirmation — the row's Adopt button only
               prefills the dialog; nothing exists until you confirm it.
             </Trans>

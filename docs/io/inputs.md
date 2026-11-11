@@ -1,4 +1,5 @@
-# Multiview — Input / Source Subsystem
+<a id="multiview--input--source-subsystem"></a>
+# Conspect — Input / Source Subsystem
 
 The input subsystem ingests every live (and file/test) source, normalises its timing and
 colour, and hands frames to the compositor through per-tile last-good-frame stores. It is
@@ -222,7 +223,7 @@ timestamps.
 | Rationals | NTSC `1001` rates carried as exact rationals / ns — never float fps (drifts ~3.6 s/hour). |
 
 > **No single FFmpeg flag "just works."** `+genpts`, `avoid_negative_ts`, `correct_ts_overflow`,
-> and `use_wallclock_as_timestamps` each handle only one slice of the problem. Multiview **owns the
+> and `use_wallclock_as_timestamps` each handle only one slice of the problem. Conspect **owns the
 > timeline** and tests past the wrap boundary. Full algorithm in
 > [Streaming Gotchas §0, §2](../research/streaming-gotchas.md).
 

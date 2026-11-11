@@ -1,10 +1,10 @@
 # YouTube Live — ingest via an external runtime-discovered resolver
 
-Multiview can ingest a **live YouTube** stream as a source by treating a YouTube watch/live URL as
+Conspect can ingest a **live YouTube** stream as a source by treating a YouTube watch/live URL as
 something to be **resolved**, not demuxed directly. A new `youtube` source kind runs a small
 **resolver** that invokes an external **`yt-dlp`** binary (discovered at runtime, never vendored)
 to turn the watch/live URL into a concrete, FFmpeg-readable **HLS master-playlist URL** on
-`*.googlevideo.com`. From there the stream flows through Multiview's **existing HLS ingest path** —
+`*.googlevideo.com`. From there the stream flows through Conspect's **existing HLS ingest path** —
 the libav demux/decode worker, the custom HLS **input pacer**, PTS normalisation, jitter buffer,
 and supervised reconnect — exactly like any other `hls` source. The only new machinery is the
 resolver and a **periodic re-resolution** loop that refreshes the URL before it expires.
@@ -46,7 +46,7 @@ media lives behind YouTube's private **InnerTube `player` API**. To obtain a med
 
 This is a large, **fragile, frequently-changing** surface. YouTube rotates the player JS, the n-sig
 algorithm, client requirements, and PO-token policy on no fixed schedule; an extraction approach that
-worked last month can break this week. Re-implementing it inside Multiview would put a brittle,
+worked last month can break this week. Re-implementing it inside Conspect would put a brittle,
 high-maintenance scraper on the critical path of a product whose entire premise is *bulletproof
 continuous output*. The pragmatic, well-trodden answer — used by Streamlink, OBS plugins, and
 countless media tools — is to delegate extraction to **`yt-dlp`**, the de-facto reference
@@ -66,7 +66,8 @@ implementation that the open-source community keeps current, and consume only it
 
 ---
 
-## 2. Where it fits in Multiview
+<a id="2-where-it-fits-in-multiview"></a>
+## 2. Where it fits in Conspect
 
 ### 2.1 A new `youtube` source kind
 
@@ -123,12 +124,12 @@ actor; nothing about resolution touches the compositor or the output clock.
 
 ### 2.3 yt-dlp as an OPTIONAL runtime dependency (the NDI precedent)
 
-`yt-dlp` is **not vendored, not linked, and not built into Multiview.** It is an external executable the
-operator installs and Multiview discovers at runtime — directly mirroring the
+`yt-dlp` is **not vendored, not linked, and not built into Conspect.** It is an external executable the
+operator installs and Conspect discovers at runtime — directly mirroring the
 [NDI runtime-load posture](ndi.md#2-the-feature-gated--runtime-load-model):
 
 - The **default build never contains or requires `yt-dlp`.** The `youtube` feature is off by default.
-- Even in a `youtube`-enabled build, the capability is **probed at runtime**: Multiview resolves the
+- Even in a `youtube`-enabled build, the capability is **probed at runtime**: Conspect resolves the
   binary on `PATH` (or `youtube.yt_dlp_path`), checks `yt-dlp --version`, and surfaces the result
   through the same `CapabilityReport` gate used everywhere else ([ADR-M007](../decisions/ADR-M007.md)).
   If the binary is absent, the `youtube` capability is reported **unavailable** — never crashed-on —
@@ -136,15 +137,15 @@ operator installs and Multiview discovers at runtime — directly mirroring the
 - The operator owns the binary's lifecycle: installation, **keeping it current** (see [§5](#5-anti-bot-po-tokens-n-sig--operational-fragility)),
   and any cookies/PO-token configuration.
 
-> **Why this matters for licensing:** Multiview invokes `yt-dlp` as a **separate out-of-process
+> **Why this matters for licensing:** Conspect invokes `yt-dlp` as a **separate out-of-process
 > subprocess** — it does not link, embed, or import `yt-dlp`'s code. `yt-dlp` is released into the
 > **public domain (the Unlicense)**, so even the source imposes no copyleft/linking obligation; the
-> subprocess boundary makes the question moot regardless. The default Multiview build stays
+> subprocess boundary makes the question moot regardless. The default Conspect build stays
 > **LGPL-clean and dependency-free** ([ADR-0012](../decisions/ADR-0012.md)). Source: yt-dlp `LICENSE`
 > (Unlicense — "free and unencumbered software released into the public domain", unlicense.org).
 > Caveat: a self-contained PyInstaller-bundled `yt-dlp` release packages its own dependencies under
 > their respective licenses; an operator who *redistributes* a bundled binary should review those —
-> but Multiview neither ships nor bundles it.
+> but Conspect neither ships nor bundles it.
 
 ---
 
@@ -167,12 +168,12 @@ Key resolver rules, derived from yt-dlp's behaviour:
   `n`-sig and appends any PO-token path segment; its emitted manifest URL is ready to fetch, the raw
   `streamingData` URL is not.
 - **Prefer the live HLS master manifest.** For a true "join the live edge now" tile, select an HLS
-  format (`protocol == "m3u8_native"`); its `manifest_url` is the master playlist Multiview feeds to
+  format (`protocol == "m3u8_native"`); its `manifest_url` is the master playlist Conspect feeds to
   libav. The default `web_safari` client returns pre-merged video+audio HLS renditions
   (144p/240p/360p/720p/1080p), so a single master URL covers the standard ladder.
 - **Do NOT pass `--live-from-start`.** That flag (experimental; YouTube/Twitch/TVer only) downloads
   from the broadcast's beginning using DASH/adaptive `is_from_start` processing — the opposite of
-  Multiview's live-edge use case. Omit it to tail the live edge in real time.
+  Conspect's live-edge use case. Omit it to tail the live edge in real time.
 - **DASH is the fallback** (`prefer = "dash"`): yt-dlp can emit a DASH MPD (`protocol ==
   "http_dash_segments"`) that libav can also read, but for live the HLS master from `web_safari` is
   the simpler, PO-token-free path (see [§5](#5-anti-bot-po-tokens-n-sig--operational-fragility)).
@@ -230,7 +231,7 @@ actively changes the player surface and adds anti-automation friction.
 
 - **The player JS / n-sig changes frequently.** yt-dlp solves an embedded JavaScript `n`-signature
   challenge to make URLs fetchable; when YouTube rotates the algorithm, an **out-of-date `yt-dlp`
-  breaks** until updated. Operational rule: **keep `yt-dlp` current** (it releases often). Multiview
+  breaks** until updated. Operational rule: **keep `yt-dlp` current** (it releases often). Conspect
   should record the resolver's `--version` and surface a "resolver out of date / extraction failing"
   alarm rather than letting a tile silently sit at NO_SIGNAL.
 - **PO tokens (Proof-of-Origin).** Many VOD `https`/DASH formats now require a **GVS PO token**, which
@@ -239,7 +240,7 @@ actively changes the player surface and adds anti-automation friction.
   *"HLS live streams do not require a PO Token (excluding the `ios` client)."* The GVS PO-token policy
   for HLS on `web_safari` / `tv_simply` is `required = false, recommended = true`. So a **live YouTube
   HLS master from the default `web_safari` client is typically obtainable and fetchable without a PO
-  token** — which is precisely why Multiview should:
+  token** — which is precisely why Conspect should:
   - **Pin `player_client = "web_safari"`** (a current default client that yields PO-token-free live
     HLS), and
   - **avoid the `ios` client** for live HLS — `ios` is the documented exception (`required = true`,
@@ -251,7 +252,7 @@ actively changes the player surface and adds anti-automation friction.
   cookies. Support an optional `youtube.cookies_ref` resolved from the **secret store** (never
   inlined; [ADR-M006](../decisions/ADR-M006.md)) and passed to `yt-dlp --cookies`. Cookies are
   sensitive credentials — handle them as secrets and scope them tightly.
-- **Implication for Multiview's resilience contract:** because extraction is best-effort, the resolver
+- **Implication for Conspect's resilience contract:** because extraction is best-effort, the resolver
   is treated as a **fallible supervised subtask**. Its failure is *expected and handled*: the tile
   degrades, an operator-visible alarm fires, and the output never falters. The resolver must have a
   hard timeout and run under the standard supervision/backoff
@@ -288,15 +289,15 @@ actively changes the player surface and adds anti-automation friction.
 ## 7. Legal / Terms-of-Service note (operator responsibility)
 
 Ingesting YouTube content can implicate **YouTube's Terms of Service**, the content owner's rights,
-and local law. Multiview provides the *mechanism*; **using it lawfully is the operator's
+and local law. Conspect provides the *mechanism*; **using it lawfully is the operator's
 responsibility.**
 
-- Multiview does **not** bundle, distribute, or endorse circumventing access controls. The `youtube`
+- Conspect does **not** bundle, distribute, or endorse circumventing access controls. The `youtube`
   feature is off by default and the resolver binary is operator-supplied.
 - The management UI/docs should carry a clear notice when the `youtube` source is configured:
   *the operator is responsible for ensuring they have the right to ingest and redistribute the
   source, and for compliance with YouTube's Terms of Service and applicable law.* This mirrors how
-  Multiview surfaces the [NDI license/attribution obligations](ndi.md#7-licensing-redistribution--attribution-must-read)
+  Conspect surfaces the [NDI license/attribution obligations](ndi.md#7-licensing-redistribution--attribution-must-read)
   — an explicit, operator-facing acknowledgement rather than a buried footnote.
 - This is vendor-neutral plumbing built on a public-domain tool over an open(-ish) HLS manifest; it
   copies no proprietary feature or trademarked design ([CODE_OF_CONDUCT.md](../../CODE_OF_CONDUCT.md)).
@@ -310,14 +311,14 @@ A pure-Rust resolver would avoid the external-binary dependency. The trade-offs:
 | Approach | Pros | Cons |
 |---|---|---|
 | **External `yt-dlp` subprocess** (chosen) | Reference implementation; community keeps n-sig/PO-token/player-client current; public-domain; zero linking obligation; isolates the fragile scraper in another process | External binary the operator must install + keep updated; per-resolve process spawn; output-format coupling |
-| **`rustypipe`** (Rust YouTube client) | Pure Rust, no external binary, no subprocess | Smaller maintainer base than yt-dlp; must independently track YouTube's player/n-sig/PO-token changes; if it lags, **every** YouTube tile breaks in-process (the fragility moves onto Multiview's release cadence); live-HLS coverage + PO-token handling must be verified |
-| **Direct InnerTube re-implementation in Multiview** | No third-party extractor at all | We would own the entire n-sig solver, PO-token logic, and per-client quirks — the single highest-maintenance, most-breakage-prone code in the product, on a *bulletproof-output* engine. Strongly discouraged |
+| **`rustypipe`** (Rust YouTube client) | Pure Rust, no external binary, no subprocess | Smaller maintainer base than yt-dlp; must independently track YouTube's player/n-sig/PO-token changes; if it lags, **every** YouTube tile breaks in-process (the fragility moves onto Conspect's release cadence); live-HLS coverage + PO-token handling must be verified |
+| **Direct InnerTube re-implementation in Conspect** | No third-party extractor at all | We would own the entire n-sig solver, PO-token logic, and per-client quirks — the single highest-maintenance, most-breakage-prone code in the product, on a *bulletproof-output* engine. Strongly discouraged |
 | **Vendoring `yt-dlp`'s Python** | Pinned version | Pulls a Python runtime + its dependency licenses into the product; defeats the LGPL-clean default; still needs updating for n-sig churn |
 
 **Recommendation:** ship the **external-subprocess resolver** first (lowest risk, isolates the
 fragility, licensing-clean). Keep a **Rust-native resolver (e.g. `rustypipe`) as a future
 alternative backend** behind the same `youtube` source kind — a `youtube.resolver = yt_dlp |
-rustypipe` knob — so Multiview can adopt a pure-Rust path once it is proven to track YouTube's changes
+rustypipe` knob — so Conspect can adopt a pure-Rust path once it is proven to track YouTube's changes
 as reliably as yt-dlp. The decision is recorded in [ADR-0015](../decisions/ADR-0015.md).
 
 ---
@@ -326,7 +327,7 @@ as reliably as yt-dlp. The decision is recorded in [ADR-0015](../decisions/ADR-0
 
 - **Extraction breakage cadence.** How aggressively must operators update `yt-dlp`? Needs a
   documented "supported `yt-dlp` minimum version" and a CI/runtime check that warns on staleness.
-- **JS runtime requirement.** Should Multiview detect/recommend (or, in container images, ship) a JS
+- **JS runtime requirement.** Should Conspect detect/recommend (or, in container images, ship) a JS
   engine (Deno) for reliable n-sig solving, given that `web_safari` n-sig solving wants one?
 - **Exact live-HLS expiry window.** The ~6 h figure is a 2021 data point; the implementation must
   parse the real `expire` timestamp and treat the constant only as an upper-bound guard.

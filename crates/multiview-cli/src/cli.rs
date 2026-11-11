@@ -8,7 +8,7 @@ use std::path::PathBuf;
 
 use clap::{Args, Parser, Subcommand};
 
-/// The `multiview` live video multiview engine — command-line interface.
+/// Conspect live media production, routing, and monitoring — command-line interface.
 ///
 /// The default build is pure-software (no GPU, no `FFmpeg`); hardware backends are
 /// compiled in via the `nvidia` / `apple` / `linux-vaapi` / `full` feature
@@ -52,7 +52,7 @@ pub enum Command {
     /// clock for `--ticks` ticks (or until Ctrl-C) and reports cadence/frames.
     Run(RunArgs),
     /// Run as a **display node** (DEV-B5, ADR-0045): a small box that ingests
-    /// one stream from a central Multiview, hardware-decodes it, and presents
+    /// one stream from a central Conspect instance, hardware-decodes it, and presents
     /// the single-source canvas straight to an attached HDMI/DisplayPort head
     /// via the `display-kms` scanout sink + ALSA HDMI audio.
     ///

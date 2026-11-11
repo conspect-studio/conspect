@@ -1,4 +1,5 @@
-# Multiview — Data-Plane Pipeline
+<a id="multiview--data-plane-pipeline"></a>
+# Conspect — Data-Plane Pipeline
 
 The **data plane** is the media hot path: from raw bytes on the wire to encoded packets
 fanned out to every transport. It runs on **dedicated OS threads** (never Tokio workers —
@@ -182,7 +183,7 @@ if media_time <= last_media_time_i: media_time = last_media_time_i + 1   # monot
 ### 2.5 Convert (color + format)
 
 Because the **custom GPU compositor deliberately bypasses swscale**, libav does **no** implicit
-color conversion — Multiview owns color end-to-end. Conversion is **fused into the composite kernel**
+color conversion — Conspect owns color end-to-end. Conversion is **fused into the composite kernel**
 (no separate RGBA materialization), but the *detection* logic lives at the ingest seam:
 
 - **Resolve all four color axes** per tile, per frame, to a **never-`UNSPECIFIED`** 4-tuple

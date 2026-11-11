@@ -1,4 +1,5 @@
-# Multiview codebase map (one screen)
+<a id="multiview-codebase-map-one-screen"></a>
+# Conspect codebase map (one screen)
 
 A fast orientation for agents. Authoritative detail lives in
 [`docs/architecture/conventions.md`](../architecture/conventions.md) (source of truth); the working

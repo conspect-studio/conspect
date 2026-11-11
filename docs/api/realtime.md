@@ -5,7 +5,7 @@
 > AsyncAPI document at `/asyncapi.json` (rendered at `/docs/events`). This page is a stable, skimmable
 > map of that contract — where it differs from generated specs, the generated specs win.
 
-Multiview exposes **two complementary control-plane surfaces** on the same axum router in `multiview-control`
+Conspect exposes **two complementary control-plane surfaces** on the same axum router in `multiview-control`
 under `/api/v1`:
 
 - **REST** (OpenAPI 3.1, docs at `/docs`) — synchronous **commands / CRUD**. See the

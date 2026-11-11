@@ -1,6 +1,6 @@
 # Features
 
-The full capability matrix for Multiview: every planned feature, its current status, the milestone it
+The full capability matrix for Conspect: every planned feature, its current status, the milestone it
 lands in ([ROADMAP.md](ROADMAP.md)), and the design doc that specifies it. This is the living
 support matrix — update a row's status as it is implemented.
 
@@ -140,7 +140,7 @@ support matrix — update a row's status as it is implemented.
 
 ## Broadcast multiviewer (proposed — established, standards-based capabilities)
 
-Standards-based broadcast-multiviewer capabilities mapped to Multiview — see [research/broadcast-multiviewer-features.md](docs/research/broadcast-multiviewer-features.md) and milestones **M10–M12** in [ROADMAP.md](ROADMAP.md). Every capability is anchored in an open industry standard/protocol. Legend: 📋 planned · ✅ already designed (enhance).
+Standards-based broadcast-multiviewer capabilities mapped to Conspect — see [research/broadcast-multiviewer-features.md](docs/research/broadcast-multiviewer-features.md) and milestones **M10–M12** in [ROADMAP.md](ROADMAP.md). Every capability is anchored in an open industry standard/protocol. Legend: 📋 planned · ✅ already designed (enhance).
 
 ### Layouts & display modes
 

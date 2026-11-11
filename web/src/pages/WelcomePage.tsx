@@ -28,10 +28,11 @@ export function WelcomePage(): JSX.Element {
   return (
     <>
       <PageHeader
-        title={<Trans>Welcome to Multiview</Trans>}
+        title={<Trans>Welcome to Conspect</Trans>}
         description={
           <Trans>
-            A quick first step: license this machine so it is ready to run.
+            Live-media production, routing, and monitoring. Start by licensing
+            this machine.
           </Trans>
         }
       />

@@ -1,6 +1,6 @@
 # Hardware Abstraction & Commodity-Hardware Efficiency
 
-How Multiview stays fast and bounded on real hardware: the **Hardware Abstraction Layer (HAL)**, per-stage backend **negotiation** and **cost model**, and the **commodity-first efficiency strategy** (decode-at-display-resolution, NV12-throughout, encode-once-mux-many, frame pooling, and resource-adaptive degradation).
+How Conspect stays fast and bounded on real hardware: the **Hardware Abstraction Layer (HAL)**, per-stage backend **negotiation** and **cost model**, and the **commodity-first efficiency strategy** (decode-at-display-resolution, NV12-throughout, encode-once-mux-many, frame pooling, and resource-adaptive degradation).
 
 > Canonical names, crate boundaries, feature flags, and invariants live in [`conventions.md`](./conventions.md) — that document wins on any naming conflict. This page links to the deep briefs at [`../research/core-engine.md`](../research/core-engine.md) and [`../research/efficiency.md`](../research/efficiency.md) rather than duplicating them.
 
@@ -72,7 +72,7 @@ plan(stream):
 
 ### 2.3 Zero-copy islands, costed seams
 
-Multiview treats each GPU vendor as a **zero-copy island** and budgets an explicit `av_hwframe_transfer_data` (host) copy at every seam ([ADR-0004](../decisions/ADR-0004.md)). **Cross-vendor on-GPU zero-copy does not exist on desktop** — never architect for it.
+Conspect treats each GPU vendor as a **zero-copy island** and budgets an explicit `av_hwframe_transfer_data` (host) copy at every seam ([ADR-0004](../decisions/ADR-0004.md)). **Cross-vendor on-GPU zero-copy does not exist on desktop** — never architect for it.
 
 | Path | Status | Note |
 |---|---|---|

@@ -1,9 +1,10 @@
-# Building Multiview from Source
+<a id="building-multiview-from-source"></a>
+# Building Conspect from Source
 
 This guide covers building the `multiview` binary (and its web UI) from source on **Linux** and
 **macOS** — the only supported platforms. **There is no Windows build.**
 
-Multiview is a Cargo workspace. The **default build is pure-Rust, LGPL-clean, and needs no native
+Conspect is a Cargo workspace. The **default build is pure-Rust, LGPL-clean, and needs no native
 libraries** (`cargo check` is green in GPU-free CI). Everything that links FFmpeg/libav, touches a
 GPU, or loads the NDI SDK is **behind off-by-default Cargo features**. You opt into hardware and
 codecs with umbrella feature presets at build time, and the engine then **auto-negotiates** the
@@ -64,7 +65,7 @@ The media crates ([`multiview-ffmpeg`](../architecture/conventions.md#3-canonica
 default build does **not** link FFmpeg — only feature presets that enable `ffmpeg` do.
 
 > [!IMPORTANT]
-> **The default Multiview build is LGPL-clean.** That means FFmpeg must be built **`--enable-shared`
+> **The default Conspect build is LGPL-clean.** That means FFmpeg must be built **`--enable-shared`
 > without `--enable-gpl` and without `--enable-nonfree`** (NVENC/NVDEC come from MIT
 > `nv-codec-headers`; scaling is in-house via `scale_cuda`, never `scale_npp`). A distro/Homebrew
 > FFmpeg may already be GPL or nonfree — verify before relying on the LGPL-clean guarantee
@@ -81,8 +82,10 @@ FFmpeg major compiles the wrong binding `cfg` or fails outright.
 #### macOS
 
 Do **not** link Homebrew's `ffmpeg` formula: it is a different major from the pin and is built
-with `--enable-gpl` (x264/x265), so a binary linked against it is GPL and never the LGPL-clean
-artifact. A pinned macOS (VideoToolbox/AudioToolbox) profile for `deploy/ffmpeg-build.sh` is
+with `--enable-gpl` (x264/x265), so linking against it introduces applicable GPL combined-work
+obligations and is never the LGPL-clean artifact. This does not relicense Conspect or grant
+permission to distribute it; local development and testing must also stay within your applicable
+Conspect permissions. A pinned macOS (VideoToolbox/AudioToolbox) profile for `deploy/ffmpeg-build.sh` is
 the next step of the macOS work; until it lands, `release.yml`'s macOS legs fail loudly instead of
 linking Homebrew's FFmpeg.
 
@@ -132,7 +135,7 @@ Enable only the backend your hardware has; the planner falls back to CPU if abse
 ### 2.4 NDI SDK (optional, proprietary — never vendored)
 
 NDI is **feature-gated (`ndi`) and off by default**. The SDK is **proprietary (royalty-free,
-attribution required, redistribution restricted)** and is **never vendored into the repo**. Multiview
+attribution required, redistribution restricted)** and is **never vendored into the repo**. Conspect
 uses a **runtime dynamic-load** path (`NDIlib_v6_load()`), so you build *with* the `ndi` feature but
 provide the runtime yourself.
 
@@ -232,13 +235,13 @@ cargo build --release -p multiview-cli --features apple
 # Linux Intel/AMD (VAAPI + QSV + wgpu + FFmpeg)
 cargo build --release -p multiview-cli --features linux-vaapi
 
-# Everything non-GPL (still LGPL-clean / redistributable)
+# Everything non-GPL (still LGPL-clean dependencies; no Conspect redistribution grant)
 cargo build --release -p multiview-cli --features full
 
 # Add proprietary NDI (runtime-loaded SDK) on top of any preset
 cargo build --release -p multiview-cli --features "nvidia,ndi"
 
-# Opt into GPL codecs (x264/x265) — makes the whole build GPL
+# Opt into GPL dependencies (x264/x265); no Conspect relicensing/distribution grant
 cargo build --release -p multiview-cli --features "linux-vaapi,gpl-codecs"
 
 # Embed the prebuilt web UI into the binary (single deployable)
@@ -264,7 +267,7 @@ cargo build --release -p multiview-cli --features "apple,embed-web"
 | `cuda` / `vaapi` / `qsv` / `videotoolbox` | Per-stage HW codec backends (runtime-negotiated) | off |
 | `wgpu` | Default cross-platform compositor backend | on (default) |
 | `metal` / `cuda` | Vendor fast-path compositor backends | off |
-| `gpl-codecs` | x264/x265 → **build becomes GPL** | off |
+| `gpl-codecs` | GPL-covered x264/x265; combined-work obligations, not a Conspect relicensing or distribution grant | off |
 | `ndi` | NDI in/out via runtime `NDIlib_v6_load()` (proprietary SDK) | off |
 | `ndi-advanced` | NDI HX (compressed) — separate **paid** SDK | off |
 | `libass` | Subtitle ingest/render | off |
@@ -281,21 +284,29 @@ cargo build --release -p multiview-cli --features "apple,embed-web"
 
 ## 6. Licensing & build profiles
 
-The **effective license of the artifact depends on the features you enable.** Project code is under the
-**Multiview Source-Available Non-Commercial License, Version 1.0** (source-available, **not** open
-source); the feature presets determine what third-party code gets linked. Full rationale:
+Project code is under the [**Conspect Source-Available Non-Commercial License Version 2.0**](../../LICENSE)
+(source-available, **not** open source). It permits private source study and copies reasonably
+necessary for authorized use, not general modification, distribution or reproduction. Free use is
+limited to the purposes and exceptions in that license; religious use and monetized content are
+excluded, and paid/metered features require separate authorization. The former $1M sponsorship
+threshold is not a current free-use entitlement. Free use carries no warranty, subject to
+non-excludable rights. Feature presets determine additional third-party obligations, not a grant
+to redistribute Conspect. Third-party components retain their own license rights; these project
+restrictions do not limit mandatory LGPL rights, including modification for own use, reverse
+engineering to debug such modifications, and relinking with modified libraries to the extent
+required by the LGPL (see `LICENSE` §9). Full rationale:
 [ADR-0012](../decisions/ADR-0012.md) and [conventions §7](../architecture/conventions.md#7-licensing-model-build-profiles).
 
 | Profile / features | Composition | Effective status |
 |--------------------|-------------|------------------|
-| **default** (no `gpl-codecs`/`ndi-advanced`) | Source-available project code + dynamically-linked **LGPL** FFmpeg (LGPL-3.0-or-later for the pinned `--enable-version3` build) (no `--enable-gpl`, no `--enable-nonfree`; NVENC/NVDEC via MIT `nv-codec-headers`; `scale_cuda` not `scale_npp`; native AAC + GnuTLS) | **Redistributable, LGPL-clean** |
-| **+ `gpl-codecs`** | + x264/x265 (GPL FFmpeg) | Whole product **GPL-3.0-or-later** (pinned `--enable-version3` build) |
+| **default** (no `gpl-codecs`/`ndi-advanced`) | Source-available project code + dynamically-linked **LGPL** FFmpeg (LGPL-3.0-or-later for the pinned `--enable-version3` build) (no `--enable-gpl`, no `--enable-nonfree`; NVENC/NVDEC via MIT `nv-codec-headers`; `scale_cuda` not `scale_npp`; native AAC + GnuTLS) | **LGPL-clean dependencies**; Conspect distribution requires separate permission |
+| **+ `gpl-codecs`** | + x264/x265 (GPL FFmpeg) | GPL-3.0-or-later obligations for the pinned `--enable-version3` FFmpeg build; combined distribution requires applicable GPL compliance and separate Conspect permission, not automatic relicensing |
 | **+ nonfree** (libnpp / FDK-AAC / OpenSSL) | nonfree FFmpeg | **NOT redistributable** — internal/personal only |
 | **+ `ndi`** | + proprietary NDI runtime (royalty-free) | Source-available project code **+ NDI EULA + mandatory attribution/branding** |
 | **+ `ndi-advanced`** | + NDI Advanced SDK (HX H.264/HEVC) | Separate **paid** commercial license + codec royalties |
 
 **Build-your-own LGPL FFmpeg (release path).** Because distro/Homebrew FFmpeg is frequently GPL,
-compile an LGPL-clean FFmpeg yourself and link Multiview against it. Key flags and verification:
+compile an LGPL-clean FFmpeg yourself and link Conspect against it. Key flags and verification:
 
 ```bash
 # Illustrative LGPL-clean configure (NVIDIA example):
