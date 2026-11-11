@@ -136,7 +136,13 @@ impl Provider {
     /// Honest runtime capabilities, including the disabled URL download boundary.
     #[must_use]
     pub fn capabilities(&self) -> serde_json::Value {
-        serde_json::json!({"capture_available":self.service.is_some(),"premium_available":false,"url_fetch_available":false,"url_fetch_reason":"enforced download boundary not provisioned","accounting":"process_tree_estimated","kernel_limits":false})
+        let accounting = match multiview_webengine::service::Accounting::current() {
+            multiview_webengine::service::Accounting::Unavailable => "unavailable",
+            multiview_webengine::service::Accounting::ProcessTreeEstimated => {
+                "process_tree_estimated"
+            }
+        };
+        serde_json::json!({"capture_available":self.service.is_some(),"premium_available":false,"url_fetch_available":false,"url_fetch_reason":"enforced download boundary not provisioned","accounting":accounting,"kernel_limits":false})
     }
     /// Authorize all named objects before allocating a background job. Blocking.
     /// # Errors

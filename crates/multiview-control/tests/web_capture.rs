@@ -55,9 +55,10 @@ async fn viewer_and_other_object_are_denied_before_provider_admission() {
 #[test]
 fn symlink_root_is_rejected_at_startup() {
     let d = tempfile::tempdir().unwrap();
-    let real = d.path().join("real");
+    let root = std::fs::canonicalize(d.path()).unwrap();
+    let real = root.join("real");
     std::fs::create_dir(&real).unwrap();
-    let link = d.path().join("link");
+    let link = root.join("link");
     std::os::unix::fs::symlink(&real, &link).unwrap();
     assert!(multiview_control::web_capture_startup::reject_symlink(&link).is_err());
     assert!(multiview_control::web_capture_startup::reject_symlink(&real.join("new")).is_ok());

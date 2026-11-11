@@ -124,7 +124,7 @@ mod tests {
     #[test]
     fn creates_0700_and_adopts_only_an_exact_0700_owned_directory() {
         let d = tempfile::tempdir().unwrap();
-        let p = d.path().join("a").join("b");
+        let p = std::fs::canonicalize(d.path()).unwrap().join("a").join("b");
         private_dir(&p).unwrap();
         assert_eq!(
             std::fs::metadata(&p).unwrap().permissions().mode() & 0o777,
@@ -142,12 +142,13 @@ mod tests {
     #[test]
     fn symlink_and_file_targets_are_refused() {
         let d = tempfile::tempdir().unwrap();
-        let real = d.path().join("real");
+        let root = std::fs::canonicalize(d.path()).unwrap();
+        let real = root.join("real");
         private_dir(&real).unwrap();
-        let link = d.path().join("link");
+        let link = root.join("link");
         std::os::unix::fs::symlink(&real, &link).unwrap();
         assert!(private_dir(&link).is_err());
-        let file = d.path().join("file");
+        let file = root.join("file");
         std::fs::write(&file, b"x").unwrap();
         assert!(private_dir(&file).is_err());
     }

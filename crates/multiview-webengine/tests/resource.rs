@@ -117,6 +117,7 @@ fn exe(path: &Path, body: &str) {
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
 }
 
+#[cfg(target_os = "linux")]
 #[test]
 fn real_producer_descendant_cpu_reaches_observer() {
     let _g = SERIAL.lock().unwrap();
@@ -193,6 +194,7 @@ fn real_producer_descendant_cpu_reaches_observer() {
     assert!(s.gpu.is_none());
 }
 
+#[cfg(target_os = "linux")]
 #[test]
 fn service_status_exposes_descendant_sample_while_running() {
     let _g = SERIAL.lock().unwrap();
@@ -476,4 +478,14 @@ fn large_io_rate_is_not_clamped_to_u32() {
     let r = b.read_bytes_per_sec.unwrap();
     assert!((r - TEN_GIB_F / 2.0).abs() < 1.0, "{r}");
     assert!((b.write_bytes_per_sec.unwrap() - TEN_GIB_F).abs() < 1.0);
+}
+
+#[cfg(not(target_os = "linux"))]
+#[test]
+fn process_accounting_is_explicitly_unavailable_off_linux() {
+    assert_eq!(
+        multiview_webengine::service::Accounting::current(),
+        multiview_webengine::service::Accounting::Unavailable
+    );
+    assert!(multiview_webengine::resource::Tracker::new(std::process::id()).is_none());
 }

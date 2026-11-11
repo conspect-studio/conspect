@@ -251,13 +251,29 @@ pub struct Status {
 /// Honest accounting capability; never label a process-tree sum as kernel exact.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Accounting {
+    /// Process-tree sampling is unavailable on this host.
+    Unavailable,
     /// Process-tree CPU and proportional-memory estimate, GPU unknown.
     ProcessTreeEstimated,
+}
+
+impl Accounting {
+    /// Current platform capability, not a promise that every sample succeeds.
+    #[must_use]
+    pub fn current() -> Self {
+        if cfg!(target_os = "linux") && std::fs::read_to_string("/proc/self/stat").is_ok() {
+            Self::ProcessTreeEstimated
+        } else {
+            Self::Unavailable
+        }
+    }
 }
 
 /// Runtime limitations that a control application must surface as health warnings.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Capabilities {
+    /// Actual process-accounting availability.
+    pub accounting: Accounting,
     /// This service currently uses the process-tree fallback, even if the host
     /// could delegate a subtree. Kernel hard limits are not applied by it.
     pub process_tree_fallback: bool,
@@ -900,6 +916,7 @@ impl Service {
     #[must_use]
     pub fn capabilities(&self) -> Capabilities {
         Capabilities {
+            accounting: Accounting::current(),
             process_tree_fallback: true,
             delegation_unavailable: crate::resource::delegation_unavailable(),
             fetch_configured: self.inner.fetch_enabled,
@@ -922,7 +939,7 @@ impl Service {
             finished_age: e.finished.map(|f| now.saturating_duration_since(f)),
             progress: e.progress,
             resource: e.resource.clone(),
-            accounting: Accounting::ProcessTreeEstimated,
+            accounting: Accounting::current(),
         })
     }
 
