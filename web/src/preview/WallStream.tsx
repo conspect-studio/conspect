@@ -15,7 +15,7 @@ export function WallStreamProvider({ children, deps }: { readonly children: Reac
   return <WallContext.Provider value={store}>{children}</WallContext.Provider>;
 }
 
-const NONE: WallSnapshot = { geometry: undefined };
+const NONE: WallSnapshot = { geometry: undefined, transport: 'stills' };
 const noopSubscribe = (): (() => void) => () => undefined;
 
 export interface WallSurface {
@@ -27,10 +27,10 @@ export interface WallSurface {
 
 /** Whole-wall state for the desk note: live, or the reason surfaces show stills. */
 // eslint-disable-next-line react-refresh/only-export-components -- hook colocated with its context
-export function useWallStatus(): { readonly live: boolean; readonly reason: string | undefined } {
+export function useWallStatus(): { readonly live: boolean; readonly reason: string | undefined; readonly transport: WallSnapshot['transport'] } {
   const store = useContext(WallContext);
   const snapshot = useSyncExternalStore(store?.subscribeState ?? noopSubscribe, store?.getSnapshot ?? (() => NONE));
-  return { live: snapshot.geometry !== undefined, reason: snapshot.reason };
+  return { live: snapshot.geometry !== undefined, reason: snapshot.reason, transport: snapshot.transport };
 }
 
 /** Live state of one surface: true only when the wall is streaming and the cell exists. */

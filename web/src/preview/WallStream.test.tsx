@@ -173,10 +173,62 @@ describe('WallStreamProvider', () => {
     expect(screen.getByTestId('still-a')).toBeTruthy();
   });
 
+  it('uses one WebRTC video for all surfaces after MoQ fails and releases it on unmount', async () => {
+    const d = deps({ frames: false });
+    const draws = recordDraws();
+    const failed = vi.fn(() => Promise.reject(new Error('MoQ transport unavailable')));
+    let videoFrame: (() => void) | undefined;
+    let released = false;
+    const whep = vi.fn(async (o: Parameters<NonNullable<WallDeps['playWhep']>>[0]) => {
+      o.onActive();
+      const video = document.createElement('video');
+      Object.defineProperties(video, { videoWidth: { value: 640 }, videoHeight: { value: 360 } });
+      videoFrame = () => { o.onFrame(video); };
+      await new Promise<void>((resolve) => { o.signal.addEventListener('abort', () => { released = true; resolve(); }, { once: true }); });
+    });
+    d.value = { ...d.value, play: failed, playWhep: whep };
+    const app = render(<WallStreamProvider deps={d.value}><Probe id="a" /><Probe id="b" /><Probe id="a" /></WallStreamProvider>);
+    await act(async () => { await vi.advanceTimersByTimeAsync(100); videoFrame?.(); await Promise.resolve(); });
+    expect(failed).toHaveBeenCalledTimes(1);
+    expect(whep).toHaveBeenCalledTimes(1);
+    expect(screen.getAllByTestId(/^crop-/)).toHaveLength(3);
+    expect(draws.conversions()).toHaveLength(1);
+    expect(draws.crops()).toHaveLength(3);
+    app.unmount();
+    expect(released).toBe(true);
+  });
+
+  it('drops old-layout video before accepting new-generation WebRTC frames', async () => {
+    let layout = geometry;
+    const d = deps({ fetchWall: vi.fn(() => Promise.resolve(layout)) });
+    const draws = recordDraws();
+    const frames: (() => void)[] = [];
+    const whep = vi.fn(async (o: Parameters<NonNullable<WallDeps['playWhep']>>[0]) => {
+      const video = document.createElement('video');
+      Object.defineProperties(video, { videoWidth: { value: 640 }, videoHeight: { value: 360 } });
+      frames.push(() => { o.onFrame(video); });
+      await new Promise<void>((resolve) => { o.signal.addEventListener('abort', () => { resolve(); }, { once: true }); });
+    });
+    d.value = { ...d.value, play: vi.fn(() => Promise.reject(new Error('no WebTransport'))), playWhep: whep };
+    render(<WallStreamProvider deps={d.value}><Probe id="a" /></WallStreamProvider>);
+    await act(async () => { await vi.advanceTimersByTimeAsync(100); frames[0]?.(); await Promise.resolve(); });
+    expect(screen.getByTestId('crop-a')).toBeTruthy();
+    const before = draws.crops().length;
+    layout = { ...geometry, generation: 2, cells: [{ source: 'a', x: 320, y: 0, w: 320, h: 180 }] };
+    await act(async () => { await vi.advanceTimersByTimeAsync(2100); });
+    expect(whep).toHaveBeenCalledTimes(2);
+    await act(async () => { frames[0]?.(); await Promise.resolve(); });
+    expect(screen.getByTestId('still-a')).toBeTruthy();
+    expect(draws.crops()).toHaveLength(before);
+    await act(async () => { frames[1]?.(); await Promise.resolve(); });
+    expect(screen.getByTestId('crop-a')).toBeTruthy();
+    expect(draws.crops().at(-1)?.slice(1, 5)).toEqual([320, 0, 320, 180]);
+  });
+
   it('states why the wall is on stills when the live session fails', async () => {
     const d = deps();
     const failing = (() => Promise.reject(new Error('remote error: 2 (unauthorized)'))) as unknown as WallDeps['play'];
-    d.value = { ...d.value, play: failing };
+    d.value = { ...d.value, play: failing, playWhep: vi.fn(() => Promise.reject(new Error('WHEP 503'))) };
     function Reason() { const w = useWallStatus(); return <span data-testid="reason">{w.live ? 'live' : w.reason ?? ''}</span>; }
     render(<WallStreamProvider deps={d.value}><Reason /></WallStreamProvider>);
     await act(async () => { await vi.advanceTimersByTimeAsync(100); });

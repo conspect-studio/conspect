@@ -33,6 +33,15 @@ pub type ProgramSlot = Arc<multiview_framestore::SwapCell<Option<Arc<Nv12Image>>
 pub type WallSlot =
     Arc<multiview_framestore::SwapCell<Option<Arc<multiview_control::preview::WallGeometry>>>>;
 
+/// Wait-free latest composed wall picture, never the Program picture.
+pub type WallPictureSlot = ProgramSlot;
+
+/// Shared newest composed wall picture; read without a lock by WHEP encoders.
+#[must_use]
+pub fn wall_picture_slot() -> WallPictureSlot {
+    program_slot()
+}
+
 /// Create an empty wall-geometry slot.
 #[must_use]
 pub fn wall_slot() -> WallSlot {

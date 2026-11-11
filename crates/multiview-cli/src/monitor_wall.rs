@@ -269,10 +269,11 @@ impl Drop for WallWorker {
 
 /// Clears the published geometry when the worker thread ends for any reason,
 /// including a panic unwinding the thread, so the route answers 503.
-struct GeometryGuard(WallSlot);
+struct GeometryGuard(WallSlot, crate::preview::WallPictureSlot);
 impl Drop for GeometryGuard {
     fn drop(&mut self) {
         self.0.store(None);
+        self.1.store(None);
     }
 }
 
@@ -290,6 +291,7 @@ pub fn spawn(
     stores: SharedStores,
     slot: WindowSubscriptionSlot,
     geometry: WallSlot,
+    picture: crate::preview::WallPictureSlot,
 ) -> std::io::Result<WallWorker> {
     spawn_inner(
         config,
@@ -297,6 +299,7 @@ pub fn spawn(
         stores,
         slot,
         geometry,
+        picture,
         #[cfg(test)]
         None,
     )
@@ -308,6 +311,7 @@ fn spawn_inner(
     stores: SharedStores,
     slot: WindowSubscriptionSlot,
     geometry: WallSlot,
+    picture: crate::preview::WallPictureSlot,
     #[cfg(test)] hook: Option<FrameHook>,
 ) -> std::io::Result<WallWorker> {
     let stop = Arc::new(AtomicBool::new(false));
@@ -315,7 +319,7 @@ fn spawn_inner(
     std::thread::Builder::new()
         .name("moq-wall".into())
         .spawn(move || {
-            let _guard = GeometryGuard(geometry.clone());
+            let _guard = GeometryGuard(geometry.clone(), picture.clone());
             let cadence = config.cadence(production_cadence);
             let mut run = Run {
                 publisher: None,
@@ -323,6 +327,7 @@ fn spawn_inner(
                 cadence,
                 stores,
                 geometry,
+                picture,
                 generation: 0,
                 cells: Vec::new(),
                 live_changed: false,
@@ -346,6 +351,7 @@ struct Run {
     cadence: Rational,
     stores: SharedStores,
     geometry: WallSlot,
+    picture: crate::preview::WallPictureSlot,
     generation: u64,
     cells: Vec<WallCell>,
     /// A cell's `live` flag changed since the last published geometry.
@@ -397,6 +403,7 @@ impl Run {
             let Some(factory) = current.as_ref() else {
                 session = None;
                 self.geometry.store(None);
+                self.picture.store(None);
                 continue;
             };
             if session
@@ -405,6 +412,7 @@ impl Run {
             {
                 session = None;
                 self.geometry.store(None);
+                self.picture.store(None);
             }
             // A changed cell set never changes the running encode: the session
             // (and its registration, whose dependencies are exactly the encoded
@@ -413,6 +421,7 @@ impl Run {
             // old registration; the UI reopens on the generation change.
             if self.refresh_cells() && session.take().is_some() {
                 self.geometry.store(None);
+                self.picture.store(None);
                 failed_for = None;
             }
             let Some(picture) = compose(&self.config, &self.cells, &self.stores) else {
@@ -432,6 +441,7 @@ impl Run {
                             "monitor wall encoder opened once for this run"
                         );
                         session = Some(opened);
+                        self.picture.store(Some(Arc::new(picture)));
                         self.publish_geometry();
                     }
                     Err(reason) => {
@@ -449,8 +459,12 @@ impl Run {
                 failed_for = Some(Arc::as_ptr(&active.factory).addr());
                 session = None;
                 self.geometry.store(None);
+                self.picture.store(None);
                 continue;
             }
+            // Publish after a successful encode; a stalled WHEP peer only samples
+            // this wait-free latest value and cannot delay this worker.
+            self.picture.store(Some(Arc::new(picture)));
             self.publish_geometry();
         }
     }
@@ -709,6 +723,7 @@ mod tests {
             cadence: config.cadence(Rational::new(30_000, 1001)),
             stores: crate::live_sources::shared_stores(std::collections::HashMap::new()),
             geometry: crate::preview::wall_slot(),
+            picture: crate::preview::wall_picture_slot(),
             generation: 0,
             cells: Vec::new(),
             live_changed: false,
@@ -797,6 +812,7 @@ mod tests {
             cadence: Rational::new(15, 1),
             stores: crate::live_sources::shared_stores(map),
             geometry: crate::preview::wall_slot(),
+            picture: crate::preview::wall_picture_slot(),
             generation: 0,
             cells: Vec::new(),
             live_changed: false,
@@ -827,7 +843,7 @@ mod tests {
     fn a_dead_worker_withdraws_the_geometry() {
         let geometry = crate::preview::wall_slot();
         {
-            let _guard = GeometryGuard(geometry.clone());
+            let _guard = GeometryGuard(geometry.clone(), crate::preview::wall_picture_slot());
             geometry.store(Some(Arc::new(WallGeometry {
                 generation: 1,
                 width: 2,
@@ -896,6 +912,7 @@ segment_ms = 1000
             stores,
             pipeline.window_subscriptions(),
             geometry.clone(),
+            crate::preview::wall_picture_slot(),
             Some(hook),
         )
         .unwrap();
@@ -999,6 +1016,7 @@ segment_ms = 1000
         let factory = Arc::new(factory);
         slot.store(Some(factory.clone()));
         let geometry = crate::preview::wall_slot();
+        let picture = crate::preview::wall_picture_slot();
         let wall = WallConfig {
             columns: 2,
             rows: 1,
@@ -1008,7 +1026,15 @@ segment_ms = 1000
             bitrate_bps: 500_000,
             encoder: "libx264".to_owned(),
         };
-        let _worker = spawn(wall, Rational::new(25, 1), stores, slot, geometry.clone()).unwrap();
+        let _worker = spawn(
+            wall,
+            Rational::new(25, 1),
+            stores,
+            slot,
+            geometry.clone(),
+            picture.clone(),
+        )
+        .unwrap();
         let deadline = Instant::now() + Duration::from_secs(10);
         while geometry.load().is_none() {
             assert!(Instant::now() < deadline, "wall never became ready");
@@ -1016,6 +1042,9 @@ segment_ms = 1000
             std::thread::sleep(Duration::from_millis(10));
         }
         let published = geometry.load().unwrap();
+        let composed = picture.load().expect("wall WHEP samples composed NV12");
+        assert_eq!((composed.width(), composed.height()), (128, 36));
+        assert_eq!(composed.y_plane()[0], 120, "wall cell, not Program pixels");
         // Production runner 0 is not yet effective here (as with an H.264 output
         // still awaiting its first keyframe); the wall must not take its index.
         let wall_index = factory

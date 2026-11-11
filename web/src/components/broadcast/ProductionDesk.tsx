@@ -86,7 +86,7 @@ export function ProductionDesk(): JSX.Element {
 
 function WallNote() {
   const wall = useWallStatus();
-  if (wall.live) return <p className="bd-still-note" data-testid="wall-live-note"><Trans>Wall tiles are live video from one shared MoQ stream; a tile without a live cell shows its still.</Trans></p>;
+  if (wall.live) return <p className="bd-still-note" data-testid="wall-live-note">{wall.transport === 'moq' ? <Trans>Wall tiles are live video from one shared MoQ stream; a tile without a live cell shows its still.</Trans> : <Trans>Wall tiles are live video from one shared WebRTC session; a tile without a live cell shows its still.</Trans>}</p>;
   return <p className="bd-still-note" data-testid="wall-still-note"><Trans>Wall tiles are still previews refreshed every ~2 s — not live video.</Trans>{wall.reason ? <> <span data-testid="wall-still-reason">({wall.reason})</span></> : null}</p>;
 }
 

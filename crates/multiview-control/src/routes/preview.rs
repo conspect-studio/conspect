@@ -400,6 +400,37 @@ fn release_whep(
     }
 }
 
+/// Open the video-only whole-system wall focus (Write + unscoped principal).
+#[cfg_attr(feature = "openapi", utoipa::path(post, path = "/api/v1/preview/wall/whep", tag = "preview", request_body(content = String, description = "SDP offer", content_type = "application/sdp"), responses((status = 201, description = "Wall focus opened; SDP answer and Location.", content_type = "application/sdp"), (status = 401, description = "Missing credentials", body = crate::problem::Problem), (status = 403, description = "Scoped or read-only principal", body = crate::problem::Problem), (status = 415, description = "Unsupported codec", body = crate::problem::Problem), (status = 503, description = "Wall unavailable or focus capacity exhausted", body = crate::problem::Problem))))]
+pub(crate) async fn wall_whep_open(
+    State(state): State<AppState>,
+    principal: Principal,
+    offer: String,
+) -> Response {
+    if let Err(err) = principal.role.require(Action::Write) {
+        return err.into_response();
+    }
+    if let Err(err) = authorize_whep_scope(&principal, &WhepScope::Wall) {
+        return err.into_response();
+    }
+    if state.preview.wall().is_none() || !state.whep.wall_available() {
+        return Problem::new(503, "wall-unavailable", "monitor wall unavailable")
+            .with_instance(whep_base_path(&WhepScope::Wall))
+            .into_response();
+    }
+    negotiate_whep(&state, &principal, &WhepScope::Wall, &offer)
+}
+
+/// Release the whole-system wall WHEP session.
+#[cfg_attr(feature = "openapi", utoipa::path(delete, path = "/api/v1/preview/wall/whep/{session_id}", tag = "preview", params(("session_id" = String, Path, description = "WHEP session id")), responses((status = 204, description = "Wall focus released"), (status = 401, description = "Missing credentials", body = crate::problem::Problem), (status = 403, description = "Scoped or read-only principal", body = crate::problem::Problem), (status = 404, description = "No such session", body = crate::problem::Problem))))]
+pub(crate) async fn wall_whep_close(
+    State(state): State<AppState>,
+    principal: Principal,
+    Path(session_id): Path<String>,
+) -> Response {
+    release_whep(&state, &principal, &WhepScope::Wall, &session_id)
+}
+
 /// `POST /api/v1/preview/program/whep` — open a WHEP focus on the program
 /// canvas (role: write). SDP offer in, `201` + answer SDP + `Location` out.
 #[cfg_attr(

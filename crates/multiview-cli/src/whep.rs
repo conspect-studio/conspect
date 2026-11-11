@@ -497,6 +497,8 @@ pub struct CliWhepProvider {
     state: Arc<Mutex<DriverState>>,
     program: ProgramSlot,
     stores: SharedStores,
+    /// Composed wall source; absent when its off-clock worker is not configured.
+    wall: Option<crate::preview::WallPictureSlot>,
     /// Leases a source's demand for an input session.
     demand: Option<multiview_control::SharedSourceDemand>,
     /// The shared **program-audio preview tap** (ADR-P006 audio): the single drop-
@@ -557,6 +559,7 @@ impl CliWhepProvider {
                     state,
                     program,
                     stores,
+                    wall: None,
                     program_audio,
                     available: false,
                     silence_timeout: DEFAULT_SILENCE_TIMEOUT,
@@ -596,6 +599,7 @@ impl CliWhepProvider {
             state,
             program,
             stores,
+            wall: None,
             demand: None,
             program_audio,
             available: true,
@@ -628,11 +632,19 @@ impl CliWhepProvider {
             state,
             program,
             stores,
+            wall: None,
             demand: None,
             program_audio,
             available: true,
             silence_timeout: DEFAULT_SILENCE_TIMEOUT,
         }
+    }
+
+    /// Supply the wall worker's latest picture slot, without a Program fallback.
+    #[must_use]
+    pub fn with_wall(mut self, wall: Option<crate::preview::WallPictureSlot>) -> Self {
+        self.wall = wall;
+        self
     }
 
     /// Take a source demand lease for each input session.
@@ -668,10 +680,13 @@ impl CliWhepProvider {
         scope: &WhepScope,
         codec: PreviewCodec,
         opus: bool,
-    ) -> (
-        Arc<SlotMediaSource>,
-        Option<crate::preview::ProgramAudioSlot>,
-    ) {
+    ) -> Result<
+        (
+            Arc<SlotMediaSource>,
+            Option<crate::preview::ProgramAudioSlot>,
+        ),
+        WhepReject,
+    > {
         let (reader, audio_scope) = match scope {
             WhepScope::Input(id) => (
                 SlotReader::Input {
@@ -681,12 +696,22 @@ impl CliWhepProvider {
                 },
                 false,
             ),
-            // Program, Output, and any future scope sample the program/preview
-            // slot (the canvas-approx tap; the real-rendition fan-out is the
-            // ADR-P006 PRV-5b upgrade) and carry the program audio.
-            WhepScope::Program | WhepScope::Output(_) | _ => {
+            WhepScope::Wall => {
+                let wall = self
+                    .wall
+                    .as_ref()
+                    .filter(|slot| slot.load().is_some())
+                    .ok_or(WhepReject::CapacityExceeded {
+                        fallback: "jpeg".to_owned(),
+                    })?;
+                (SlotReader::Program(Arc::clone(wall)), false)
+            }
+            // The Program and Output canvas approximation carries program audio.
+            WhepScope::Program | WhepScope::Output(_) => {
                 (SlotReader::Program(Arc::clone(&self.program)), true)
             }
+            // Non-exhaustive API: new scopes must explicitly opt in to media.
+            _ => return Err(WhepReject::UnknownEntity),
         };
         // A per-session program-PCM ring, only when the offer negotiated Opus AND
         // this run has program audio AND the scope carries audio.
@@ -698,7 +723,7 @@ impl CliWhepProvider {
             session_tap.clone(),
             opus,
         ));
-        (media, session_tap)
+        Ok((media, session_tap))
     }
 }
 
@@ -714,7 +739,7 @@ impl WhepProvider for CliWhepProvider {
         // The offer may negotiate Opus; program audio reaches the peer when this
         // run has a program-audio tap and the scope carries audio (ADR-P006).
         let opus = offer_has_opus(offer);
-        let (media, audio_tap) = self.media_for(scope, codec, opus);
+        let (media, audio_tap) = self.media_for(scope, codec, opus)?;
         let answer = self
             .egress
             .accept_session(offer, codec, media.as_ref())
@@ -785,6 +810,10 @@ impl WhepProvider for CliWhepProvider {
 
     fn webrtc_available(&self) -> bool {
         self.available && self.egress.has_candidates()
+    }
+
+    fn wall_available(&self) -> bool {
+        self.wall.as_ref().is_some_and(|wall| wall.load().is_some())
     }
 }
 
@@ -1369,6 +1398,7 @@ mod tests {
                 std::collections::HashMap::new(),
             ))),
             program_audio: None,
+            wall: None,
             available: true,
             silence_timeout: super::DEFAULT_SILENCE_TIMEOUT,
         };
@@ -1378,6 +1408,49 @@ mod tests {
             Err(WhepReject::CapacityExceeded { .. })
         ));
         assert_eq!(provider.active_sessions(), 0);
+    }
+
+    #[test]
+    fn wall_media_reads_composed_picture_not_program_and_has_no_audio() {
+        use multiview_compositor::pipeline::Nv12Image;
+        use multiview_control::{WhepProvider, WhepReject, WhepScope};
+        use multiview_preview::whep::transport::PreviewMediaSource;
+        use multiview_preview::whep::PreviewCodec;
+        use std::sync::{Arc, Mutex};
+        let color = multiview_core::color::ColorInfo::default();
+        let program = crate::preview::program_slot();
+        program.store(Some(Arc::new(
+            Nv12Image::solid(64, 36, 16, 128, 128, color).unwrap(),
+        )));
+        let wall = crate::preview::wall_picture_slot();
+        wall.store(Some(Arc::new(
+            Nv12Image::solid(64, 36, 120, 128, 128, color).unwrap(),
+        )));
+        let provider = super::CliWhepProvider {
+            demand: None,
+            egress: Arc::new(WhepEgress::new()),
+            state: Arc::new(Mutex::new(super::DriverState::default())),
+            program,
+            stores: Arc::new(multiview_framestore::SwapCell::new(Arc::new(
+                std::collections::HashMap::new(),
+            ))),
+            wall: Some(wall.clone()),
+            program_audio: None,
+            available: true,
+            silence_timeout: super::DEFAULT_SILENCE_TIMEOUT,
+        };
+        let (media, audio) = provider
+            .media_for(&WhepScope::Wall, PreviewCodec::H264, true)
+            .unwrap();
+        assert!(audio.is_none());
+        assert!(media.audio_feed().is_none());
+        assert_eq!(media.slot.load().unwrap().y_plane()[0], 120);
+        wall.store(None);
+        assert!(!provider.wall_available());
+        assert!(matches!(
+            provider.media_for(&WhepScope::Wall, PreviewCodec::H264, false),
+            Err(WhepReject::CapacityExceeded { .. })
+        ));
     }
 
     /// A WHEP offer carrying a recvonly H.264 video m-line (str0m needs real ICE

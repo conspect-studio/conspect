@@ -56,6 +56,7 @@ pub fn spawn_unified_webrtc(
     webrtc_registry: WhipRegistry,
     egress_registry: &EgressRegistry,
     demand: Option<multiview_control::SharedSourceDemand>,
+    #[cfg(feature = "moq-output")] wall: Option<crate::preview::WallPictureSlot>,
 ) -> UnifiedWebrtc {
     let endpoint_config = endpoint_config_from(config);
     let builder = match UnifiedEndpoint::bind(endpoint_config) {
@@ -114,6 +115,16 @@ pub fn spawn_unified_webrtc(
         program_audio,
     )
     .with_demand(demand)
+    .with_wall({
+        #[cfg(feature = "moq-output")]
+        {
+            wall
+        }
+        #[cfg(not(feature = "moq-output"))]
+        {
+            None
+        }
+    })
     .with_silence_timeout(std::time::Duration::from_millis(
         config.webrtc.preview_session_timeout.millis(),
     ));
