@@ -17,11 +17,19 @@ test('source preview is opt-in and clearly identifies still fallback', async ({ 
   await page.goto('/sources');
   await expect(page.getByText('North camera')).toBeVisible();
   expect(polls).toBe(0);
+  await page.getByRole('button', { name: 'Details: North camera' }).click();
   await page.getByRole('button', { name: 'Preview: North camera' }).click();
   await expect(page.getByRole('dialog')).toBeVisible();
   await expect(page.getByText(/Still preview \(~1 fps\)/)).toBeVisible();
   await expect.poll(() => polls).toBeGreaterThan(0);
+  await expect(page.getByRole('dialog')).toBeVisible();
+  // Phone width: the approved responsive layout may remount rows on resize, so
+  // close and reopen the preview from the Details panel.
+  await page.keyboard.press('Escape');
   await page.setViewportSize({ width: 390, height: 844 });
+  const phoneDetails = page.getByRole('button', { name: 'Details: North camera' });
+  if ((await phoneDetails.getAttribute('aria-expanded')) !== 'true') await phoneDetails.click();
+  await page.getByRole('button', { name: 'Preview: North camera' }).click();
   await expect(page.getByRole('dialog')).toBeVisible();
   await page.screenshot({ path: '../../.scratch/webui-live-workflows/source-preview-mobile.png', fullPage: true });
   await page.keyboard.press('Escape');

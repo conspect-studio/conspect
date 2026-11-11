@@ -17,11 +17,12 @@
 import {
   apiUrl,
   buildHeaders,
+  sendCommand,
   OperationApiError,
   readProblem,
 } from './operations';
 import type { AcceptedBody, RequestOptions } from './operations';
-import type { components } from './schema';
+import type { components } from './types';
 
 /** One resolved tally entry (target + lamp state). */
 export type TallyEntry = components['schemas']['TallyEntryDoc'];
@@ -163,11 +164,7 @@ async function submitOverride(
   payload: Record<string, unknown>,
   options: RequestOptions,
 ): Promise<AcceptedBody> {
-  const response = await fetch(apiUrl(options, '/api/v1/tally/override'), {
-    method,
-    headers: buildHeaders(options, true),
-    body: JSON.stringify(payload),
-  });
+  const response = await sendCommand('/api/v1/tally/override', options, { method, body: payload });
   if (!response.ok) {
     throw await readProblem(response);
   }

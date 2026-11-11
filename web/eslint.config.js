@@ -22,6 +22,8 @@ export default tseslint.config(
       'coverage/**',
       'src/api/generated/**',
       'src/api/schema.ts',
+      'src/api/pending/schema.pending.ts',
+      'src/realtime/pending/events.pending.ts',
       '*.config.js',
       // Standalone Node tooling (e.g. the Playwright screenshot harness) lives
       // outside the typed `src/` TS project, so the type-aware lint rules can't

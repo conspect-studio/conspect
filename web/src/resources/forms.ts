@@ -67,7 +67,8 @@ export type FormErrorCode =
   | 'time-of-day'
   | 'date-time'
   | 'members-required'
-  | 'duplicate-member';
+  | 'duplicate-member'
+  | 'header-invalid';
 
 /** Per-field validation errors keyed by form-state field name. */
 export type FieldErrors<Field extends string> = Partial<Record<Field, FormErrorCode>>;
@@ -365,6 +366,17 @@ export function captionModesForValue(value: CaptionsMode): readonly CaptionsMode
 }
 
 /** The wall-clock verb (schema `WallClockUse`), plus 'default' = omit. */
+/** When a source starts. */
+export type SourceActivationChoice = 'always_on' | 'on_demand';
+
+/** A stored body's activation, reading the legacy `demand.always_on` alias. */
+function activationOf(body: Record<string, unknown>): SourceActivationChoice {
+  if (body.activation === 'on_demand') return 'on_demand';
+  if (body.activation === 'always_on') return 'always_on';
+  const legacy = asRecord(body.demand);
+  return legacy?.always_on === false ? 'on_demand' : 'always_on';
+}
+
 export type WallClockChoice = 'default' | 'use' | 'discard';
 
 /** The editable state behind the source form (numbers kept as input strings). */
@@ -442,6 +454,11 @@ export interface SourceFormState {
   readonly gpuPinStableId: string;
   /** Wall-clock verb ('default' = no `wallclock` block). */
   readonly wallclock: WallClockChoice;
+  /**
+   * When the source starts: 'always_on' (the default; started at boot) or
+   * 'on_demand' (idle until something uses it).
+   */
+  readonly activation: SourceActivationChoice;
   /** `auth.secret_ref` ('' = no `auth` block; never a plaintext secret). */
   readonly authSecretRef: string;
   /**
@@ -454,8 +471,78 @@ export interface SourceFormState {
    * (schema default true). `false` answers the audio m-line `inactive`.
    */
   readonly webrtcAudio: boolean;
+  /**
+   * EPG acquisition mode ('automatic' omits `epg` entirely unless another EPG
+   * field is set, matching the schema default — ADR epg-playlist).
+   */
+  readonly epgMode: EpgModeChoice;
+  /** `epg.url`: the XMLTV feed URL (required in 'manual' mode). */
+  readonly epgUrl: string;
+  /** `epg.channel_id`: the exact provider channel id (required in 'manual'). */
+  readonly epgChannelId: string;
+  /** `playlist_metadata.tvg_id`. */
+  readonly metaTvgId: string;
+  /** `playlist_metadata.name`. */
+  readonly metaName: string;
+  /** `playlist_metadata.logo`. */
+  readonly metaLogo: string;
+  /** `playlist_metadata.group`. */
+  readonly metaGroup: string;
+  /** HLS `user_agent` request header ('' = omit; HLS only, iptv-org ADR-M015). */
+  readonly userAgent: string;
+  /** HLS `referrer` request header ('' = omit; HLS only). */
+  readonly referrer: string;
+  /** Catalogue provenance (`origin`, any kind); `undefined` = not linked. */
+  readonly origin: SourceOrigin | undefined;
   /** Unmanaged body fields preserved verbatim across an edit. */
   readonly extra: Readonly<Record<string, unknown>>;
+}
+
+/** The editable `epg.mode` choices (mirrors the config `EpgMode` enum). */
+export type EpgModeChoice = 'automatic' | 'manual' | 'disabled';
+
+/** The `epg.mode` choices offered in the UI, in display order. */
+export const EPG_MODES: readonly EpgModeChoice[] = ['automatic', 'manual', 'disabled'];
+
+/** How a linked source follows upstream catalogue changes (§2.4). */
+export type OriginFollow = 'manual' | 'notify' | 'auto';
+
+/** All follow modes, for building selectors. */
+export const ORIGIN_FOLLOWS: readonly OriginFollow[] = ['manual', 'notify', 'auto'];
+
+/** The `origin` provenance block on a source body (docs/io/iptv-org.md §2.3). */
+export interface SourceOrigin {
+  readonly provider: string;
+  readonly channel?: string;
+  readonly feed?: string;
+  readonly stream_url: string;
+  readonly labels: readonly string[];
+  readonly linked_at: string;
+  readonly follow: OriginFollow;
+}
+
+/** Parse an opaque `origin` value; `undefined` when absent or malformed. */
+export function parseSourceOrigin(value: unknown): SourceOrigin | undefined {
+  const o = asRecord(value);
+  const provider = asString(o?.provider);
+  const streamUrl = asString(o?.stream_url);
+  if (o === undefined || provider === undefined || streamUrl === undefined) {
+    return undefined;
+  }
+  const channel = asString(o.channel);
+  const feed = asString(o.feed);
+  const follow = ORIGIN_FOLLOWS.find((f) => f === asString(o.follow)) ?? 'notify';
+  return {
+    provider,
+    ...(channel !== undefined ? { channel } : {}),
+    ...(feed !== undefined ? { feed } : {}),
+    stream_url: streamUrl,
+    labels: Array.isArray(o.labels)
+      ? o.labels.filter((l): l is string => typeof l === 'string')
+      : [],
+    linked_at: asString(o.linked_at) ?? '',
+    follow,
+  };
 }
 
 /** The source-form fields that can carry a validation error. */
@@ -475,7 +562,13 @@ export type SourceField =
   | 'captionsTrack'
   | 'captionsField'
   | 'captionsPath'
-  | 'gpuPinStableId';
+  | 'gpuPinStableId'
+  | 'epgUrl'
+  | 'epgChannelId'
+  | 'metaName'
+  | 'metaLogo'
+  | 'userAgent'
+  | 'referrer';
 
 /** Default fill colour for a fresh `solid` source. */
 export const SOLID_DEFAULT_COLOR = '#101014';
@@ -524,9 +617,20 @@ export function emptySourceForm(): SourceFormState {
     gpuPinVendor: 'nvidia',
     gpuPinStableId: '',
     wallclock: 'default',
+    activation: 'always_on',
     authSecretRef: '',
     webrtcToken: '',
     webrtcAudio: true,
+    epgMode: 'automatic',
+    epgUrl: '',
+    epgChannelId: '',
+    metaTvgId: '',
+    metaName: '',
+    metaLogo: '',
+    metaGroup: '',
+    userAgent: '',
+    referrer: '',
+    origin: undefined,
     extra: {},
   };
 }
@@ -564,9 +668,21 @@ const SOURCE_MANAGED_KEYS: readonly string[] = [
   'captions',
   'gpu_pin',
   'wallclock',
+  // Lifecycle (`activation`, plus the read-only legacy `demand` alias it
+  // replaces: a save writes `activation` and drops `demand`).
+  'activation',
+  'demand',
   // `webrtc` (WHIP ingest) source keys.
   'token',
   'audio',
+  // EPG + IPTV playlist presentation (epg-playlist): presentation only, never
+  // media identity.
+  'epg',
+  'playlist_metadata',
+  // HLS request headers + catalogue provenance (iptv-org, ADR-M015).
+  'user_agent',
+  'referrer',
+  'origin',
 ];
 
 /** Whether a source kind's locator is its `url`. */
@@ -696,6 +812,14 @@ export function sourceFormToBody(form: SourceFormState): Record<string, unknown>
     // `rist` options block (when present in the stored body) round-trips through
     // `form.extra` until a dedicated options sub-form lands (ADR-0095).
     case 'hls':
+      body.url = form.url.trim();
+      if (form.userAgent.trim() !== '') {
+        body.user_agent = form.userAgent.trim();
+      }
+      if (form.referrer.trim() !== '') {
+        body.referrer = form.referrer.trim();
+      }
+      break;
     case 'youtube':
     case 'ts':
     case 'srt':
@@ -725,6 +849,17 @@ export function sourceFormToBody(form: SourceFormState): Record<string, unknown>
       break;
     }
   }
+  if (form.origin !== undefined) {
+    body.origin = {
+      provider: form.origin.provider,
+      ...(form.origin.channel !== undefined ? { channel: form.origin.channel } : {}),
+      ...(form.origin.feed !== undefined ? { feed: form.origin.feed } : {}),
+      stream_url: form.origin.stream_url,
+      labels: [...form.origin.labels],
+      linked_at: form.origin.linked_at,
+      follow: form.origin.follow,
+    };
+  }
   if (form.authSecretRef.trim() !== '') {
     body.auth = { secret_ref: form.authSecretRef.trim() };
   }
@@ -746,7 +881,73 @@ export function sourceFormToBody(form: SourceFormState): Record<string, unknown>
   if (form.wallclock !== 'default') {
     body.wallclock = { use: form.wallclock };
   }
+  if (form.activation === 'on_demand') {
+    body.activation = 'on_demand';
+  }
+  const epg = epgBody(form);
+  if (epg !== undefined) {
+    body.epg = epg;
+  }
+  const playlistMetadata = playlistMetadataBody(form);
+  if (playlistMetadata !== undefined) {
+    body.playlist_metadata = playlistMetadata;
+  }
   return body;
+}
+
+/**
+ * Build the `epg` block, or `undefined` to omit it entirely (the schema
+ * default: no EPG configured). Omitted whenever every field is at its default
+ * (automatic mode, no url/channel_id) so an untouched source round-trips with
+ * no new key — otherwise every set field is written, letting `disabled` mode
+ * retain previously authored url/channel_id (schema: EpgMode::Disabled keeps
+ * them for a later re-enable).
+ */
+function epgBody(form: SourceFormState): Record<string, unknown> | undefined {
+  const url = form.epgUrl.trim();
+  const channelId = form.epgChannelId.trim();
+  if (form.epgMode === 'automatic' && url === '' && channelId === '') {
+    return undefined;
+  }
+  const epg: Record<string, unknown> = {};
+  if (form.epgMode !== 'automatic') {
+    epg.mode = form.epgMode;
+  }
+  if (url !== '') {
+    epg.url = url;
+  }
+  if (channelId !== '') {
+    epg.channel_id = channelId;
+  }
+  return epg;
+}
+
+/**
+ * Build the `playlist_metadata` block, or `undefined` to omit it (no
+ * presentation metadata authored).
+ */
+function playlistMetadataBody(form: SourceFormState): Record<string, unknown> | undefined {
+  const tvgId = form.metaTvgId.trim();
+  const name = form.metaName.trim();
+  const logo = form.metaLogo.trim();
+  const group = form.metaGroup.trim();
+  if (tvgId === '' && name === '' && logo === '' && group === '') {
+    return undefined;
+  }
+  const meta: Record<string, unknown> = {};
+  if (tvgId !== '') {
+    meta.tvg_id = tvgId;
+  }
+  if (name !== '') {
+    meta.name = name;
+  }
+  if (logo !== '') {
+    meta.logo = logo;
+  }
+  if (group !== '') {
+    meta.group = group;
+  }
+  return meta;
 }
 
 /** The internally-tagged `CaptionSelector` payload, or `undefined` to omit. */
@@ -819,6 +1020,8 @@ export function sourceFormFromRecord(record: ResourceRecord): SourceFormState | 
   const gpuPin = asRecord(body.gpu_pin);
   const wallclock = asRecord(body.wallclock);
   const wallclockUse = asString(wallclock?.use);
+  const epg = asRecord(body.epg);
+  const playlistMetadata = asRecord(body.playlist_metadata);
 
   const captionsMode: CaptionsMode =
     captions === undefined
@@ -875,13 +1078,30 @@ export function sourceFormFromRecord(record: ResourceRecord): SourceFormState | 
     gpuPinVendor: asPinVendor(gpuPin?.vendor),
     gpuPinStableId: asString(gpuPin?.stable_id) ?? '',
     wallclock: wallclockUse === 'use' || wallclockUse === 'discard' ? wallclockUse : 'default',
+    activation: activationOf(body),
     authSecretRef: asString(auth?.secret_ref) ?? '',
     webrtcToken: kind === 'webrtc' ? (asString(body.token) ?? '') : '',
     // The schema default accepts publisher audio (`audio: true`); an absent key
     // means "accept", so only an explicit `false` clears the toggle.
     webrtcAudio: kind === 'webrtc' ? body.audio !== false : true,
+    epgMode: EPG_MODES.find((mode) => mode === asString(epg?.mode)) ?? 'automatic',
+    epgUrl: asString(epg?.url) ?? '',
+    epgChannelId: asString(epg?.channel_id) ?? '',
+    metaTvgId: asString(playlistMetadata?.tvg_id) ?? '',
+    metaName: asString(playlistMetadata?.name) ?? '',
+    metaLogo: asString(playlistMetadata?.logo) ?? '',
+    metaGroup: asString(playlistMetadata?.group) ?? '',
+    userAgent: kind === 'hls' ? (asString(body.user_agent) ?? '') : '',
+    referrer: kind === 'hls' ? (asString(body.referrer) ?? '') : '',
+    origin: parseSourceOrigin(body.origin),
     extra: extraOf(body, SOURCE_MANAGED_KEYS),
   };
+}
+
+/** A header value: printable, no CR/LF, ≤ 1 KiB (docs/io/iptv-org.md §2.3). */
+export function isValidHeaderValue(value: string): boolean {
+  // eslint-disable-next-line no-control-regex
+  return value.length <= 1024 && !/[\u0000-\u001f\u007f]/.test(value);
 }
 
 /** Validate a source form, returning per-field machine codes. */
@@ -1029,6 +1249,29 @@ export function validateSourceForm(
   }
   if (form.gpuPinEnabled && form.gpuPinStableId.trim() === '') {
     errors.gpuPinStableId = 'required';
+  }
+  if (form.epgMode === 'manual') {
+    if (form.epgUrl.trim() === '') {
+      errors.epgUrl = 'required';
+    } else if (!isValidUrl(form.epgUrl, ['http', 'https'])) {
+      errors.epgUrl = 'scheme-http';
+    }
+    if (form.epgChannelId.trim() === '') {
+      errors.epgChannelId = 'required';
+    }
+  } else if (form.epgUrl.trim() !== '' && !isValidUrl(form.epgUrl, ['http', 'https'])) {
+    errors.epgUrl = 'scheme-http';
+  }
+  if (form.metaLogo.trim() !== '' && !isValidUrl(form.metaLogo, ['http', 'https'])) {
+    errors.metaLogo = 'scheme-http';
+  }
+  if (form.kind === 'hls') {
+    if (!isValidHeaderValue(form.userAgent)) {
+      errors.userAgent = 'header-invalid';
+    }
+    if (!isValidHeaderValue(form.referrer)) {
+      errors.referrer = 'header-invalid';
+    }
   }
   return errors;
 }
@@ -2272,6 +2515,25 @@ export function cellIdsFromLayouts(
       if (id !== undefined && id !== '' && !out.includes(id)) {
         out.push(id);
       }
+    }
+  }
+  return out;
+}
+
+/** Operator-given cell names (`label`/`name`) by cell id; absent when the cell is unnamed or the name is just the id. */
+export function cellNamesFromLayouts(
+  layouts: readonly { readonly body: unknown }[],
+): ReadonlyMap<string, string> {
+  const out = new Map<string, string>();
+  for (const layout of layouts) {
+    const body = asRecord(layout.body);
+    if (body?.canvas === undefined) continue;
+    const cells = Array.isArray(body.cells) ? body.cells : [];
+    for (const cell of cells) {
+      const rec = asRecord(cell);
+      const id = asString(rec?.id);
+      const name = asString(rec?.label) ?? asString(rec?.name);
+      if (id !== undefined && name !== undefined && name !== '' && name !== id && !out.has(id)) out.set(id, name);
     }
   }
   return out;

@@ -272,3 +272,85 @@ export function validateAudioForm(form: AudioFormState): AudioFormErrors {
     hasErrors,
   };
 }
+
+/** One output whose currently-selected track would be renamed/removed by a
+ * routing save (mirrors the server's `diff_track_changes` / ADR-R005 §4.3,
+ * computed client-side so the warning is inline BEFORE the operator saves). */
+export interface PendingTrackImpact {
+  /** The affected output's id. */
+  readonly outputId: string;
+  /** The affected output's operator label. */
+  readonly outputName: string;
+  /** Track names this output currently selects that the save would remove
+   * outright (no equivalent rename). */
+  readonly removed: readonly string[];
+  /** `(old, new)` pairs this output currently selects that the save would
+   * rename. */
+  readonly renamed: readonly (readonly [string, string])[];
+}
+
+/** One output's current audio selection, as read from its raw body (see
+ * `useOutputAudioSelections`) — the minimal shape this computation needs. */
+export interface OutputTrackSelection {
+  readonly id: string;
+  readonly name: string;
+  readonly tracks: readonly string[];
+}
+
+/**
+ * Compute, BEFORE saving, which currently-selectable outputs would lose or
+ * have renamed a discrete track the saved form declares differently from the
+ * document currently on the server (`serverForm`). Mirrors the server's
+ * rename/removal propagation (`multiview_config::diff_track_changes`): a
+ * rename is a route whose `inputId` is unchanged but whose `targetTrack`
+ * differs; a removal is a track that existed before but has no surviving
+ * route with that exact name (and is not the target of a rename).
+ */
+export function pendingTrackImpacts(
+  serverForm: AudioFormState,
+  editedForm: AudioFormState,
+  outputs: readonly OutputTrackSelection[],
+): readonly PendingTrackImpact[] {
+  const renamed: (readonly [string, string])[] = [];
+  for (const oldRoute of serverForm.routes) {
+    const oldTrack = oldRoute.targetTrack.trim();
+    if (oldTrack === '') {
+      continue;
+    }
+    const newRoute = editedForm.routes.find((route) => route.inputId.trim() === oldRoute.inputId.trim());
+    if (newRoute === undefined) {
+      continue;
+    }
+    const newTrack = newRoute.targetTrack.trim();
+    if (newTrack !== '' && newTrack !== oldTrack) {
+      renamed.push([oldTrack, newTrack] as const);
+    }
+  }
+  const renamedFrom = new Set(renamed.map(([from]) => from));
+  const newTargets = new Set(
+    editedForm.routes.map((route) => route.targetTrack.trim()).filter((t) => t !== ''),
+  );
+  const removed = serverForm.routes
+    .map((route) => route.targetTrack.trim())
+    .filter((track) => track !== '' && !newTargets.has(track) && !renamedFrom.has(track));
+
+  if (renamed.length === 0 && removed.length === 0) {
+    return [];
+  }
+
+  const impacts: PendingTrackImpact[] = [];
+  for (const output of outputs) {
+    const thisRemoved = removed.filter((track) => output.tracks.includes(track));
+    const thisRenamed = renamed.filter(([from]) => output.tracks.includes(from));
+    if (thisRemoved.length === 0 && thisRenamed.length === 0) {
+      continue;
+    }
+    impacts.push({
+      outputId: output.id,
+      outputName: output.name,
+      removed: thisRemoved,
+      renamed: thisRenamed,
+    });
+  }
+  return impacts;
+}

@@ -19,7 +19,7 @@
 // (conventions section 6, ADR-W008). `submitOperation` returns that body so the
 // caller can surface the id. `ETag`/`If-Match` optimistic concurrency is honoured
 // on the version-stamped mutations (alarm ack, salvo/profile replace + delete).
-import type { components } from './schema';
+import type { components } from './types';
 import { getStoredToken } from './token';
 
 /** An RFC 9457 problem document, as modelled in the spec. */
@@ -27,6 +27,14 @@ export type Problem = components['schemas']['Problem'];
 
 /** The `202 Accepted` body the command endpoints return. */
 export type AcceptedBody = components['schemas']['AcceptedBody'];
+
+/** Compatibility shape: completion is never armed without a command-specific expectation. */
+export type AcceptedOperation = AcceptedBody & { readonly completion?: undefined };
+
+/** Preserve existing caller shape while leaving the shared tracker as the only matcher. */
+export function trackAccepted(body: AcceptedBody): AcceptedOperation {
+  return { ...body };
+}
 
 /** A failed operator-surface call, normalized to a message + status (+ detail). */
 export class OperationApiError extends Error {
@@ -95,6 +103,82 @@ export async function readProblem(response: Response): Promise<OperationApiError
   );
 }
 
+/**
+ * HTTP statuses a server answers with for a route it does not serve: 404 (no
+ * such route), 405 (route exists without this method) and 501 (not
+ * implemented). For PENDING-BACKEND routes (see `api/pending/`) these mean
+ * "the backend is not deployed", never a generic failure and never success.
+ */
+export const BACKEND_UNAVAILABLE_STATUSES: readonly number[] = [404, 405, 501];
+
+/** True when `status` means the backend does not serve this route. */
+export function isUnavailableStatus(status: number | undefined): boolean {
+  return status !== undefined && BACKEND_UNAVAILABLE_STATUSES.includes(status);
+}
+
+/** Typed "unavailable (backend not deployed)" state for a pending route. */
+export class BackendUnavailableError extends OperationApiError {
+  /** Always true; lets callers branch without `instanceof` across bundles. */
+  readonly unavailable = true as const;
+
+  constructor(status: number, route?: string) {
+    super(
+      `Unavailable: this server does not provide ${route ?? 'this feature'} (backend not deployed)`,
+      status,
+    );
+    this.name = 'BackendUnavailableError';
+  }
+}
+
+/** True for a {@link BackendUnavailableError}. */
+export function isBackendUnavailable(error: unknown): error is BackendUnavailableError {
+  return error instanceof BackendUnavailableError;
+}
+
+/**
+ * Error for a non-2xx response from a PENDING-BACKEND route: 404/405/501
+ * become a {@link BackendUnavailableError}; everything else keeps the RFC 9457
+ * problem handling of {@link readProblem}.
+ */
+export async function readPendingProblem(
+  response: Response,
+  route?: string,
+  resourceLevel404 = false,
+): Promise<OperationApiError> {
+  if (isUnavailableStatus(response.status)) {
+    // A deployed backend answers a missing *resource* with an RFC 9457 problem
+    // body; a missing *route* has none. Only routes whose 404 can legitimately
+    // mean "no such resource" opt in with `resourceLevel404`.
+    if (response.status !== 404 || !resourceLevel404 || !(await hasProblemBody(response))) {
+      return new BackendUnavailableError(response.status, route);
+    }
+  }
+  return readProblem(response);
+}
+
+export async function hasProblemBody(response: Response): Promise<boolean> {
+  try {
+    return isProblem(await response.clone().json());
+  } catch {
+    return false;
+  }
+}
+
+/** For openapi-fetch callers: build the error for a failed pending-route response. */
+export async function pendingFailure(
+  response: Response,
+  message: string,
+  route?: string,
+  resourceLevel404 = false,
+): Promise<OperationApiError> {
+  if (isUnavailableStatus(response.status)) {
+    if (response.status !== 404 || !resourceLevel404 || !(await hasProblemBody(response))) {
+      return new BackendUnavailableError(response.status, route);
+    }
+  }
+  return new OperationApiError(message, response.status);
+}
+
 /** Build the request headers, injecting the bearer token and `If-Match`. */
 export function buildHeaders(options: RequestOptions, withJsonBody: boolean): Headers {
   const headers = new Headers();
@@ -129,25 +213,71 @@ function isAcceptedBody(value: unknown): value is AcceptedBody {
   );
 }
 
+/** Options for {@link sendCommand}. */
+export interface CommandRequest {
+  /** HTTP method (defaults to `POST`). */
+  readonly method?: 'POST' | 'PUT' | 'DELETE';
+  /** JSON body; omitted for body-less commands. */
+  readonly body?: unknown;
+}
+
 /**
- * `POST` a long-running command and return its `202 Accepted` body. The
- * command's outcome arrives later on the realtime stream, never in this response
- * (conventions section 6).
+ * A fresh RFC 4122 v4 UUID. `crypto.randomUUID` only exists in secure contexts, so
+ * over plain HTTP on a non-loopback host it is undefined; fall back to building
+ * one from `crypto.getRandomValues` (never `Math.random`).
  */
-export async function submitOperation(
+export function newIdempotencyKey(): string {
+  if (typeof crypto.randomUUID === 'function') {
+    return crypto.randomUUID();
+  }
+  const bytes = new Uint8Array(16);
+  crypto.getRandomValues(bytes);
+  bytes[6] = ((bytes[6] ?? 0) & 0x0f) | 0x40;
+  bytes[8] = ((bytes[8] ?? 0) & 0x3f) | 0x80;
+  const hex = Array.from(bytes, (b) => b.toString(16).padStart(2, '0')).join('');
+  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
+}
+
+/**
+ * The single place every 202 command request is sent: mints the default
+ * `crypto.randomUUID` `Idempotency-Key` (an explicit `options.idempotencyKey`
+ * wins) and applies the JSON body, if any. Returns the raw response so callers
+ * with a non-standard success shape (route take 200/202, set-mode, scan) can
+ * parse it themselves; non-2xx responses throw the RFC 9457 problem.
+ */
+export async function sendCommand(
   path: string,
   options: RequestOptions = {},
-): Promise<AcceptedBody> {
+  request: CommandRequest = {},
+): Promise<Response> {
+  const idempotencyKey = options.idempotencyKey ?? newIdempotencyKey();
+  const hasBody = request.body !== undefined;
   const response = await fetch(apiUrl(options, path), {
-    method: 'POST',
-    headers: buildHeaders(options, false),
+    method: request.method ?? 'POST',
+    headers: buildHeaders({ ...options, idempotencyKey }, hasBody),
+    ...(hasBody ? { body: JSON.stringify(request.body) } : {}),
   });
   if (!response.ok) {
     throw await readProblem(response);
   }
+  return response;
+}
+
+/**
+ * Send a long-running command (optionally with a JSON body) and return its `202
+ * Accepted` body. The outcome arrives later on the realtime stream, never in this
+ * response (conventions section 6); consumers that need evidence must submit
+ * through the shared tracker with a command-specific terminal expectation.
+ */
+export async function submitOperation(
+  path: string,
+  options: RequestOptions = {},
+  request: CommandRequest = {},
+): Promise<AcceptedOperation> {
+  const response = await sendCommand(path, options, request);
   const body: unknown = await response.json();
   if (!isAcceptedBody(body)) {
     throw new OperationApiError('The server returned an unexpected command body.');
   }
-  return body;
+  return trackAccepted(body);
 }

@@ -4,7 +4,7 @@ import type { Player, Video } from '@moq/watch';
 import { connectMoq, ownMoqSession } from './moqConnection';
 import { AbrSampler, abrSnapshot, authorizeRenditions, type AbrPersistedState, type AbrSource, type AbrState } from './moqAbr';
 
-import type { components } from '../api/schema';
+import type { components } from '../api/types';
 export type MoqLease = components['schemas']['MoqLease'];
 export interface MoqLeaseApi {
   acquire(signal: AbortSignal): Promise<MoqLease>;
