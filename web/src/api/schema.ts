@@ -618,7 +618,7 @@ export interface paths {
          *     (role: write; `202` + operation id + declared DEV-class impact).
          * @description The device-side impact is **declared in the body before apply** (ADR-M009):
          *     the device restarts its pipeline; bound sources ride the tile ladder to
-         *     `NO_SIGNAL` during the switch; no Multiview output is interrupted. The route
+         *     `NO_SIGNAL` during the switch; no Conspect output is interrupted. The route
          *     mints the operation id, `202`s, and **dispatches** the convergence to the
          *     device's running driver poller (DEV-A4), which records the requested mode as
          *     its desired mode, runs `plan_mode_convergence` → `converge_mode`
@@ -2970,11 +2970,13 @@ export interface components {
              */
             ndi: boolean;
             /**
-             * @description Whether the artifact is redistributable. `true` for every shippable
-             *     Multiview build: the default is LGPL-clean, `gpl-codecs` is GPL
-             *     (redistributable under copyleft), and NDI is runtime-loaded (never
-             *     vendored/linked) — there is no non-redistributable `--enable-nonfree`
-             *     closure (no `nonfree` Cargo feature exists).
+             * @description Dependency-build metadata, not permission to redistribute Conspect.
+             *     `true` indicates the dependency build has no `--enable-nonfree` closure
+             *     (no `nonfree` Cargo feature exists): the default is LGPL-clean,
+             *     `gpl-codecs` enables GPL codec dependencies, and NDI is runtime-loaded
+             *     (never vendored/linked). Enabling GPL codecs does not relicense Conspect
+             *     project code. This value does not authorize redistribution of Conspect;
+             *     the project licence and applicable dependency terms still govern.
              */
             redistributable: boolean;
         };
@@ -4403,7 +4405,7 @@ export interface components {
             /** @description The token-format version (e.g. `"1.0"`). */
             version?: string;
         };
-        /** @description An IS-04 **Node**: the top-level host (a running Multiview instance). */
+        /** @description An IS-04 **Node**: the top-level host (a running Conspect instance). */
         Node: components["schemas"]["ResourceCore"] & {
             /** @description The hostname the node advertises. */
             hostname?: string | null;
@@ -4891,7 +4893,7 @@ export interface components {
             /** @description The operator-supplied subject line. */
             subject: string;
         };
-        /** @description An IS-04 **Receiver**: an ingress flow (a Multiview input). */
+        /** @description An IS-04 **Receiver**: an ingress flow (a Conspect input). */
         Receiver: components["schemas"]["ResourceCore"] & {
             /** @description The id of the device this receiver belongs to. */
             device_id: string;
@@ -5287,7 +5289,7 @@ export interface components {
             /** @description Whether a WHEP focus can be opened on this scope. */
             whep: boolean;
         };
-        /** @description An IS-04 **Sender**: an egress flow (a Multiview program/preview output). */
+        /** @description An IS-04 **Sender**: an egress flow (a Conspect program/preview output). */
         Sender: components["schemas"]["ResourceCore"] & {
             /** @description The id of the device this sender belongs to. */
             device_id: string;
@@ -5308,7 +5310,7 @@ export interface components {
             detail: string;
             /**
              * @description The declared impact class: a device-side (`dev`) impact — the device
-             *     restarts its pipeline; Multiview program output is never interrupted.
+             *     restarts its pipeline; Conspect program output is never interrupted.
              */
             impact: string;
             /**
@@ -13903,7 +13905,7 @@ export interface operations {
         };
         requestBody?: never;
         responses: {
-            /** @description The Multiview NMOS node resource. */
+            /** @description The Conspect NMOS node resource. */
             200: {
                 headers: {
                     [name: string]: unknown;
