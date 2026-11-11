@@ -311,6 +311,7 @@ fn spawn_inner(
             let _guard = GeometryGuard(geometry.clone());
             let cadence = config.cadence(production_cadence);
             let mut run = Run {
+                publisher: None,
                 config,
                 cadence,
                 stores,
@@ -326,6 +327,13 @@ fn spawn_inner(
 }
 
 struct Run {
+    /// One optional publisher per factory lifetime (the claim is one-shot) and
+    /// the next never-reused output index for a reopened wall rendition.
+    publisher: Option<(
+        Arc<SubscriptionFactory>,
+        crate::optional_rendition::OptionalRegistryPublisher,
+        usize,
+    )>,
     config: WallConfig,
     cadence: Rational,
     stores: SharedStores,
@@ -388,7 +396,15 @@ impl Run {
                 session = None;
                 self.geometry.store(None);
             }
-            self.refresh_cells();
+            // A changed cell set never changes the running encode: the session
+            // (and its registration, whose dependencies are exactly the encoded
+            // cells) retires, and the next frame reopens one encoder with the
+            // new layout under a new generation. Viewers' leases end with the
+            // old registration; the UI reopens on the generation change.
+            if self.refresh_cells() && session.take().is_some() {
+                self.geometry.store(None);
+                failed_for = None;
+            }
             let Some(picture) = compose(&self.config, &self.cells, &self.stores) else {
                 continue;
             };
@@ -429,13 +445,16 @@ impl Run {
         }
     }
 
-    fn refresh_cells(&mut self) {
+    /// Returns true when the cell assignment changed.
+    fn refresh_cells(&mut self) -> bool {
         let ids: Vec<String> = self.stores.load().keys().cloned().collect();
         let cells = assign_cells(&self.config, &ids);
-        if cells != self.cells {
-            self.cells = cells;
-            self.generation = self.generation.wrapping_add(1);
+        if cells == self.cells {
+            return false;
         }
+        self.cells = cells;
+        self.generation = self.generation.wrapping_add(1);
+        true
     }
 
     fn publish_geometry(&self) {
@@ -479,7 +498,7 @@ impl Run {
     /// Open the encoder, encode the first picture to learn the opened AVC
     /// configuration, register the one optional rendition, then offer it.
     fn open(
-        &self,
+        &mut self,
         factory: Arc<SubscriptionFactory>,
         first: &Nv12Image,
     ) -> Result<Session, String> {
@@ -525,15 +544,25 @@ impl Run {
             codec: multiview_ffmpeg::CodecKind::H264,
             framing: video.framing,
         });
-        let publisher = OptionalRegistryPublisher::new(factory.clone())
-            .map_err(|e| format!("optional registry already owned: {e:?}"))?;
-        let index = factory
-            .effective()
-            .iter()
-            .map(|b| b.output_index)
-            .max()
-            .map_or(Some(0), |i| i.checked_add(1))
-            .ok_or("output index overflow")?;
+        if !self
+            .publisher
+            .as_ref()
+            .is_some_and(|(owner, _, _)| Arc::ptr_eq(owner, &factory))
+        {
+            let publisher = OptionalRegistryPublisher::new(factory.clone())
+                .map_err(|e| format!("optional registry already owned: {e:?}"))?;
+            let first = factory
+                .effective()
+                .iter()
+                .map(|b| b.output_index)
+                .max()
+                .map_or(Some(0), |i| i.checked_add(1))
+                .ok_or("output index overflow")?;
+            self.publisher = Some((factory.clone(), publisher, first));
+        }
+        let (_, publisher, next_index) = self.publisher.as_mut().ok_or("no publisher")?;
+        let index = *next_index;
+        *next_index = index.checked_add(1).ok_or("output index overflow")?;
         let producer = factory.optional_producer(index, factory.generation());
         let dependencies = self
             .cells
@@ -644,6 +673,7 @@ mod tests {
             Rational::new(30_000, 2002)
         );
         let run_period = Run {
+            publisher: None,
             config: config.clone(),
             cadence: config.cadence(Rational::new(30_000, 1001)),
             stores: crate::live_sources::shared_stores(std::collections::HashMap::new()),
@@ -882,6 +912,7 @@ segment_ms = 1000
         let mut map = std::collections::HashMap::new();
         map.insert("a".to_owned(), store);
         let stores = crate::live_sources::shared_stores(map);
+        let stores_handle = stores.clone();
         let (mut registry, factory) = OutputWindowRegistry::bare(Vec::<EffectiveBinding>::new(), 7);
         let slot = crate::output_window_registry::window_subscription_slot();
         let factory = Arc::new(factory);
@@ -941,6 +972,48 @@ segment_ms = 1000
                 .count(),
             1,
             "two viewers, one registered wall encode"
+        );
+        // A new source changes the layout: the running encode retires (its
+        // registration's dependencies were exactly the old cells) and one new
+        // encode registers under a new generation with the new dependency set.
+        let old_generation = published.generation;
+        let old_index = binding.output_index;
+        let added = Arc::new(multiview_framestore::TileStore::<Nv12Image>::with_defaults(
+            "b",
+        ));
+        stores_handle.rcu(|map| {
+            let mut next = (**map).clone();
+            next.insert("b".to_owned(), added.clone());
+            next
+        });
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            assert!(Instant::now() < deadline, "layout change never republished");
+            registry.pump(Instant::now());
+            if let Some(next) = geometry.load() {
+                if next.generation != old_generation {
+                    assert_eq!(next.cells.len(), 2);
+                    break;
+                }
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let rebound = factory.resolve(&scope).unwrap();
+        assert!(
+            rebound.output_index > old_index,
+            "never reuses a routed index"
+        );
+        assert!(rebound
+            .dependencies
+            .iter()
+            .any(|d| d.kind == DependencyKind::Source && d.id == "b"));
+        assert_eq!(
+            factory
+                .effective()
+                .iter()
+                .filter(|b| b.output_id == WALL_OUTPUT_ID)
+                .count(),
+            1
         );
     }
 }

@@ -108,6 +108,8 @@ export class WallStore {
   }
 
   private onFrame = (incoming: VideoFrame): void => {
+    // A frame from a session of another layout generation is never shown.
+    if (this.playingGeneration === undefined || this.playingGeneration !== this.geometry?.generation) return;
     const now = performance.now();
     if (this.lastFrameAt !== undefined) {
       const gap = now - this.lastFrameAt;
@@ -127,29 +129,45 @@ export class WallStore {
     for (const listener of [...this.frameListeners]) listener(next);
   };
 
+  private dropFrame(): void {
+    this.frame?.close();
+    this.frame = undefined;
+    this.lastFrameAt = undefined;
+  }
+
   private async pollLoop(signal: AbortSignal): Promise<void> {
+    let unavailable = 0;
     while (!signal.aborted) {
       try {
         const next = await this.deps.fetchWall(signal);
         if (isAborted(signal)) return;
-        const changed = this.isPlaying() && next.generation !== this.playingGeneration;
+        unavailable = 0;
+        if (this.geometry !== undefined && next.generation !== this.geometry.generation) {
+          // New layout: never crop a frame of the old layout with new cells. Drop
+          // the old frame and session first; surfaces show stills until a frame
+          // of the new session arrives.
+          this.session?.abort();
+          this.dropFrame();
+        }
         this.geometry = next;
         this.wake?.();
-        if (changed) this.session?.abort();
         this.publish();
       } catch {
         if (isAborted(signal)) return;
-        // Wall unavailable: surfaces fall back to stills; the session loop is stopped.
+        // Wall unavailable (off, scoped, starting): stills, and back off so a
+        // server without a wall is not polled every two seconds forever.
         this.geometry = undefined;
         this.session?.abort();
+        this.dropFrame();
         this.publish();
+        unavailable += 1;
       }
-      await sleep(WALL_POLL_MS, signal);
+      const backoff = unavailable === 0 ? WALL_POLL_MS : WALL_BACKOFF_MS[Math.min(unavailable - 1, WALL_BACKOFF_MS.length - 1)] ?? 30000;
+      await sleep(backoff, signal);
     }
   }
 
   private playingGeneration: number | undefined;
-  private isPlaying(): boolean { return this.session !== undefined && this.playingGeneration !== undefined; }
 
   private isAborted(c: AbortController): boolean { return c.signal.aborted; }
   private currentGeometry(): WallGeometry | undefined { return this.geometry; }

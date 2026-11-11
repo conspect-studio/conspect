@@ -83,4 +83,35 @@ describe('WallStreamProvider', () => {
     await act(async () => { await vi.advanceTimersByTimeAsync(3000); });
     expect(screen.getByTestId('still-a')).toBeTruthy();
   });
+
+  it('drops the old-layout frame on a generation change and reopens one lease', async () => {
+    const next: WallGeometry = { ...geometry, generation: 2, cells: [{ source: 'a', x: 320, y: 0, w: 320, h: 180 }] };
+    let answer = geometry;
+    const d = deps({ fetchWall: vi.fn(() => Promise.resolve(answer)) });
+    const frames: VideoFrame[] = [];
+    const play = d.value.play;
+    d.value = { ...d.value, play: (async (o: Parameters<WallDeps['play']>[0]) => {
+      const frame = { displayWidth: 640, displayHeight: 360, clone() { return this; }, close: vi.fn() } as unknown as VideoFrame;
+      frames.push(frame);
+      return play({ ...o, onFrame: (f) => { o.onFrame?.(f === undefined ? f : frame); } });
+    }) as unknown as WallDeps['play'] };
+    render(<WallStreamProvider deps={d.value}><Probe id="a" /></WallStreamProvider>);
+    await act(async () => { await vi.advanceTimersByTimeAsync(100); });
+    expect(screen.getByTestId('crop-a')).toBeTruthy();
+    answer = next;
+    await act(async () => { await vi.advanceTimersByTimeAsync(2100); });
+    expect(frames[0]?.close).toHaveBeenCalled();
+    expect(d.lease).toHaveBeenCalledTimes(2);
+    expect(frames).toHaveLength(2);
+  });
+
+  it('backs off instead of polling every 2 s when the wall is off', async () => {
+    const fetchWall = vi.fn(() => Promise.reject(new WallUnavailable('off')));
+    const d = deps({ fetchWall });
+    render(<WallStreamProvider deps={d.value}><Probe id="a" /></WallStreamProvider>);
+    await act(async () => { await vi.advanceTimersByTimeAsync(20_000); });
+    // 0 s, +5 s, +10 s: three probes in 20 s, not ten.
+    expect(fetchWall.mock.calls.length).toBeLessThanOrEqual(3);
+    expect(screen.getByTestId('still-a')).toBeTruthy();
+  });
 });
