@@ -6,12 +6,21 @@ import type { PreviewScope } from './capabilities';
 export function moqRefusalReason(error: unknown): string {
   if (typeof error !== 'object' || error === null) return 'unknown';
   const record = error as { readonly code?: unknown; readonly type?: unknown };
-  if (typeof record.code === 'string' && record.code !== '') return record.code;
+  if (typeof record.code === 'string' && record.code !== '') return boundedReason(record.code);
   if (typeof record.type === 'string') {
     const last = record.type.split('/').pop();
-    if (last !== undefined && last !== '') return last;
+    if (last !== undefined && last !== '') return boundedReason(last);
   }
   return 'unknown';
+}
+
+/**
+ * The reason is shown to the user and written to a DOM attribute, so it is a
+ * short problem token (`moq-capacity`, `forbidden`) or `unknown`, never
+ * arbitrary server text.
+ */
+function boundedReason(value: string): string {
+  return /^[a-z0-9][a-z0-9-]{0,39}$/.test(value) ? value : 'unknown';
 }
 
 export function createMoqLeaseApi(scope: PreviewScope, whepEndpoint: string): MoqLeaseApi {

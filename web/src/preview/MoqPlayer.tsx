@@ -2,9 +2,16 @@ import { useEffect, useRef, type JSX } from 'react';
 import { MoqLeaseRefused, MoqReleaseUnacknowledged, MoqUnavailable, startMoqPlaybackWithRefresh, type MoqLeaseApi } from './moqPlayback';
 import { abrDatasetEntries, abrSnapshot, type AbrPersistedState, type AbrState } from './moqAbr';
 
+/**
+ * After an unacknowledged release the server may hold the lease until its
+ * deadline (the server clamps a lease to 60 s). 'released' is reported this
+ * long after the failure, never earlier.
+ */
+export const MOQ_UNACKNOWLEDGED_HOLD_MS = 60_000;
+
 // Serialize replacements, including React StrictMode's effect cleanup/remount.
-// A failed release intentionally poisons this lane until page reload.
-// Each mounted consumer owns its lane. A failed release must not poison another player.
+// Each mounted consumer owns its lane. A failed release keeps THIS lane closed
+// for the hold below and never blocks another player.
 
 export function MoqPlayer({ api, label, audio = false, className, onUnavailable, onFatal, onLeaseState, onAbr, abrResume }: {
   readonly api: MoqLeaseApi;
@@ -63,11 +70,15 @@ export function MoqPlayer({ api, label, audio = false, className, onUnavailable,
           : error instanceof MoqReleaseUnacknowledged ? 'release-unacknowledged'
           : 'session-failed';
         // Only an unacknowledged release can leave a lease on the server. Say so
-        // (onFatal), do not claim 'released', and keep this lane closed: the
-        // surface must not open a replacement before the lease deadline.
+        // (onFatal) and do not claim 'released' until the server's lease
+        // deadline has certainly passed. The hold belongs to this task, not to
+        // the component: it survives an unmount, so a consumer that waits for
+        // 'released' (for example to open another preview) always gets it.
         if (reason === 'release-unacknowledged') {
           if (!isAborted()) { callbacks.current.onFatal?.(); callbacks.current.onUnavailable(reason); }
-          throw error;
+          await new Promise<void>((resolve) => { setTimeout(resolve, MOQ_UNACKNOWLEDGED_HOLD_MS); });
+          callbacks.current.onLeaseState?.('released');
+          return;
         }
         // Every other failure holds no lease (refused, unsupported, or the
         // release was acknowledged after the session failed).

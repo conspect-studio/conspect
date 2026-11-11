@@ -118,13 +118,6 @@ function JpegRung({
 /** The transport rung a surface is using. The ladder is MoQ, then WebRTC, then stills. */
 export type PreviewTransport = 'moq' | 'webrtc' | 'jpeg';
 
-/**
- * After an unacknowledged MoQ release the server may hold the lease until its
- * deadline (the server clamps a lease to 60 s). The surface shows stills for
- * this long before it opens WebRTC, so two live sessions never overlap.
- */
-export const MOQ_UNACKNOWLEDGED_HOLD_MS = 60_000;
-
 export function PreviewSurface({
   scope,
   whepEndpoint,
@@ -182,17 +175,11 @@ export function PreviewSurface({
   const [moqFallback, setMoqFallback] = useState<{ readonly key: string; readonly reason: string; readonly held: boolean }>();
   const moqReason = moqFallback?.key === surfaceKey ? moqFallback.reason : undefined;
   const moqHeld = moqFallback?.key === surfaceKey && moqFallback.held;
+  // The MoQ player reports 'released' after it is unmounted (a late release
+  // acknowledgement, or the end of an unacknowledged-release hold), so the
+  // report goes to the consumer's latest callbacks.
   const leaseRef = useRef({ onLeaseState, onSessionReleased });
   useEffect(() => { leaseRef.current = { onLeaseState, onSessionReleased }; });
-  useEffect(() => {
-    if (!moqHeld) return;
-    const timer = window.setTimeout(() => {
-      setMoqFallback((current) => (current?.key === surfaceKey ? { ...current, held: false } : current));
-      leaseRef.current.onLeaseState?.('released');
-      leaseRef.current.onSessionReleased?.();
-    }, MOQ_UNACKNOWLEDGED_HOLD_MS);
-    return (): void => { window.clearTimeout(timer); };
-  }, [moqHeld, surfaceKey]);
   const moqApi = useMemo(() => createMoqLeaseApi(scope, whepEndpoint), [scope, whepEndpoint]);
   const canWhep = whepAvailable(capabilities, scope);
   const retryNow = (): void => {
@@ -242,7 +229,13 @@ export function PreviewSurface({
         setMoqFallback({ key: surfaceKey, reason, held: reason === 'release-unacknowledged' });
         onTransportUnavailable?.();
       }}
-      onLeaseState={(state) => { onLeaseState?.(state); if (state === 'released') onSessionReleased?.(); }} />;
+      onLeaseState={(state) => {
+        leaseRef.current.onLeaseState?.(state);
+        if (state !== 'released') return;
+        // The lease is certainly gone: stills may now give way to WebRTC.
+        setMoqFallback((current) => (current?.key === surfaceKey && current.held ? { ...current, held: false } : current));
+        leaseRef.current.onSessionReleased?.();
+      }} />;
   }
   // The user sees why MoQ is not in use. Two reasons are the normal state and
   // get no note: a browser without MoQ support, and a server that does not
@@ -270,7 +263,8 @@ export function PreviewSurface({
   if (!canWhep) {
     return withNote(<JpegRung jpegPath={jpegPath} label={label} degraded={false} className={className} />);
   }
-  // The MoQ lease may still be held: stills only, until the hold ends.
+  // The MoQ lease may still be held: stills only, until the player reports
+  // 'released' at the end of its hold (MOQ_UNACKNOWLEDGED_HOLD_MS).
   if (moqHeld) {
     return withNote(<JpegRung jpegPath={jpegPath} label={label} degraded className={className} />);
   }
