@@ -2275,7 +2275,7 @@ mod tests {
         binding.audio.clear();
         let (mut registry, factory) = OutputWindowRegistry::new(vec![binding], GENERATION).unwrap();
         slot.store(Some(Arc::new(factory)));
-        assert!(!dynamic.available()); // Explicit Program binding is not yet selected.
+        assert!(dynamic.available()); // This is global output readiness, not Program-specific.
         assert!(dynamic.current().is_ok()); // Output scope remains available.
         slot.store(None);
         registry.close();
