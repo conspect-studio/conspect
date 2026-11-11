@@ -21781,7 +21781,9 @@ segment_ms = 1000
         use multiview_engine::RailDriver;
 
         let config = two_cells_one_source_config();
-        let pipeline = Pipeline::build(&config).expect("pipeline builds");
+        let mut pipeline = Pipeline::build(&config).expect("pipeline builds");
+        // Build the run's demand manager so the live spawner owns the catalogue.
+        let _manager = pipeline.demand();
         let rails = crate::source_rails::SourceRails::new(
             pipeline.catalogue(),
             pipeline.stop_registry(),
