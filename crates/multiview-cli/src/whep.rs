@@ -1263,9 +1263,19 @@ mod tests {
             return;
         }
         let enc = super::PreviewVideoEncoder::new(PreviewCodec::H264);
-        for (w, h) in [(1920u32, 1080u32), (1280, 720), (3840, 2160)] {
+        let mut last_ts = None;
+        for (w, h, dims) in [
+            (1920u32, 1080u32, (1280u32, 720u32)),
+            (1080, 1920, (720, 1280)),
+            (1920, 1080, (1280, 720)),
+        ] {
             let sample = enc.encode(&quadrant_image(w, h)).expect("sample");
-            assert!(sample.keyframe, "{w}x{h} starts with a keyframe");
+            assert!(sample.keyframe, "{w}x{h} reopen starts with a keyframe");
+            assert_eq!(super::PreviewVideoEncoder::bounded_dims(w, h, true), dims);
+            if let Some(prev) = last_ts {
+                assert!(sample.rtp_timestamp > prev, "rtp timestamp monotonic");
+            }
+            last_ts = Some(sample.rtp_timestamp);
         }
     }
 
