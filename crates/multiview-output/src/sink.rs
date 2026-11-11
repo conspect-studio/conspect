@@ -3440,6 +3440,7 @@ mod tests {
                 Ok(self.0.next())
             }
         }
+        let _counter_guard = counter_guard();
         let dir = tempfile::tempdir().unwrap();
         let encoder = VideoEncoder::new(&EncodeConfig::mpeg2(WIDTH, HEIGHT).target()).unwrap();
         let params = StreamCodecParameters::from_encoder(&encoder);
@@ -3507,6 +3508,7 @@ mod tests {
                 Ok(Some(EncodedPacket::from_packet(packet)))
             }
         }
+        let _counter_guard = counter_guard();
         let dir = tempfile::tempdir().unwrap();
         let encoder = VideoEncoder::new(&EncodeConfig::mpeg2(WIDTH, HEIGHT).target()).unwrap();
         let mut state = SegmentState::new(
@@ -3540,6 +3542,7 @@ mod tests {
                 Ok(self.0.next())
             }
         }
+        let _counter_guard = counter_guard();
         let dir = tempfile::tempdir().unwrap();
         let encoder = VideoEncoder::new(&EncodeConfig::mpeg2(WIDTH, HEIGHT).target()).unwrap();
         let params = StreamCodecParameters::from_encoder(&encoder);
@@ -3580,6 +3583,7 @@ mod tests {
         use crate::hls::LivePlaylist;
         use ffmpeg::codec::packet::{Flags, Packet};
         use multiview_ffmpeg::{EncodedPacket, StreamCodecParameters, VideoEncoder};
+        let _counter_guard = counter_guard();
         let dir = tempfile::tempdir().unwrap();
         let encoder = VideoEncoder::new(&EncodeConfig::mpeg2(WIDTH, HEIGHT).target()).unwrap();
         let params = StreamCodecParameters::from_encoder(&encoder);
@@ -3855,11 +3859,23 @@ mod tests {
         assert_eq!(mono.channel_layout, ChannelLayout::MONO);
     }
 
-    /// Serializes the counter-based tests: the seed/finalize counters are
-    /// process-global statics, and both tests exercise both counters (opening
-    /// segments increments finalizes; each segment build increments seed
-    /// builds), so they must not interleave or they pollute each other's reads.
+    /// Serializes every test that touches the process-global seed/finalize
+    /// counters (the two counter-reading tests and the `SegmentState`-driving
+    /// tests, which close segments), so none interleaves with another's
+    /// reset-and-read window.
     static COUNTER_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Take [`COUNTER_LOCK`], tolerating poison from an earlier failed test.
+    /// Every test that can reach `note_segment_finalized` or
+    /// `note_seed_encoder_built` (anything that opens/closes a segment or
+    /// builds a seed encoder) must hold this for its whole duration, not only
+    /// the tests that read the counters: an unlocked test that closes a segment
+    /// between a reader's reset and read inflates its count.
+    fn counter_guard() -> std::sync::MutexGuard<'static, ()> {
+        COUNTER_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
 
     fn generate_clip(path: &Path, seconds: u32, fps: u32) {
         let status = Command::new("ffmpeg")
@@ -3998,9 +4014,7 @@ mod tests {
         // 3 seconds @ 30 fps, 1-second GOP => up to 3 GOP-aligned segments.
         generate_clip(&src, 3, 30);
 
-        let _guard = COUNTER_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _guard = counter_guard();
         SEGMENT_FINALIZES.store(0, Ordering::Relaxed);
         let sink = SegmentSink::new(config(30, 30), dir.path(), "seg");
         // Yield ~2.5 GOPs so at least one full segment plus a partial one are
@@ -4042,9 +4056,7 @@ mod tests {
         // 3 seconds @ 30 fps, 1-second GOP => 3 GOP-aligned segments.
         generate_clip(&src, 3, 30);
 
-        let _guard = COUNTER_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _guard = counter_guard();
         SEED_ENCODER_BUILDS.store(0, Ordering::Relaxed);
         let sink = SegmentSink::new(config(30, 30), dir.path(), "seg");
         let mut source = DecodeSource::open(&src);

@@ -338,14 +338,22 @@ impl Drop for Subscription {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum AudioSelection {
+    All,
+    ProgramMix,
+}
+
 struct Attach {
     binding: EffectiveBinding,
+    audio_selection: AudioSelection,
     tx: SyncSender<SubscriptionWindow>,
     own_revoked: Arc<AtomicBool>,
     external: ExternalCancellation,
 }
 struct Peer {
     binding: EffectiveBinding,
+    audio_selection: AudioSelection,
     output_index: usize,
     generation: u64,
     queue: BoundedBatchQueue,
@@ -530,11 +538,43 @@ impl SubscriptionFactory {
     ) -> Result<Subscription, SubscribeError> {
         self.subscribe_with_close_boundary(scope, generation, external_cancelled, || {})
     }
+    /// Program previews reserve only the mixed audio stream. Output subscriptions
+    /// use the unfiltered path above and keep every discrete track.
+    pub(crate) fn subscribe_program_with_revocation(
+        &self,
+        scope: &WhepScope,
+        generation: u64,
+        external_cancelled: Arc<AtomicBool>,
+    ) -> Result<Subscription, SubscribeError> {
+        self.subscribe_selected(
+            scope,
+            generation,
+            external_cancelled,
+            AudioSelection::ProgramMix,
+            || {},
+        )
+    }
     fn subscribe_with_close_boundary(
         &self,
         scope: &WhepScope,
         generation: u64,
         external_cancelled: Arc<AtomicBool>,
+        before_enqueue: impl FnOnce(),
+    ) -> Result<Subscription, SubscribeError> {
+        self.subscribe_selected(
+            scope,
+            generation,
+            external_cancelled,
+            AudioSelection::All,
+            before_enqueue,
+        )
+    }
+    fn subscribe_selected(
+        &self,
+        scope: &WhepScope,
+        generation: u64,
+        external_cancelled: Arc<AtomicBool>,
+        audio_selection: AudioSelection,
         before_enqueue: impl FnOnce(),
     ) -> Result<Subscription, SubscribeError> {
         let binding = self.resolve(scope)?;
@@ -561,6 +601,7 @@ impl SubscriptionFactory {
         self.commands
             .try_send(Attach {
                 binding: binding.clone(),
+                audio_selection,
                 tx,
                 own_revoked: Arc::clone(&own_revoked),
                 external: external.clone(),
@@ -788,6 +829,7 @@ impl OutputWindowRegistry {
             debug_assert!(self.peers.len() < MAX_PEERS);
             self.peers.push(Peer {
                 binding: attach.binding.clone(),
+                audio_selection: attach.audio_selection,
                 output_index: attach.binding.output_index,
                 generation: attach.binding.config_generation,
                 queue: match attach.binding.video.recovery {
@@ -851,6 +893,11 @@ impl OutputWindowRegistry {
             let mut owned = Vec::with_capacity(window.len());
             let mut failed = false;
             for packet in window {
+                if peer.audio_selection == AudioSelection::ProgramMix
+                    && matches!(packet.kind(), StreamKind::AudioTrack(_))
+                {
+                    continue;
+                }
                 if let Ok(copy) = packet.clone_shared_ref() {
                     owned.push(copy);
                 } else {
