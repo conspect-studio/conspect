@@ -171,13 +171,20 @@ impl Drop for SrtLib {
     }
 }
 
-/// SONAMEs tried in order: the upstream name, then the Debian flavours.
-const SONAMES: [&str; 4] = [
+/// Library names tried in order, per platform: Linux the upstream SONAME then
+/// the Debian flavours; macOS the Homebrew/upstream install names; Windows the
+/// vcpkg/upstream DLL.
+#[cfg(not(any(target_os = "macos", windows)))]
+const SONAMES: &[&str] = &[
     "libsrt.so.1.5",
     "libsrt-openssl.so.1.5",
     "libsrt-gnutls.so.1.5",
     "libsrt.so",
 ];
+#[cfg(target_os = "macos")]
+const SONAMES: &[&str] = &["libsrt.1.5.dylib", "libsrt.dylib"];
+#[cfg(windows)]
+const SONAMES: &[&str] = &["srt.dll", "libsrt.dll"];
 
 static SHARED: OnceLock<std::result::Result<Arc<SrtLib>, String>> = OnceLock::new();
 
@@ -195,7 +202,7 @@ impl SrtLib {
     }
 
     fn load() -> Result<Self> {
-        Self::load_from(&SONAMES)
+        Self::load_from(SONAMES)
     }
 
     /// `dlopen` the first SONAME in `names` that resolves. Factored out of
