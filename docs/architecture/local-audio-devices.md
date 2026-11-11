@@ -75,7 +75,11 @@ device callback ──push──▶ [SPSC ring, ~200 ms] ──pop──▶ pump
   minutes. The pump therefore re-anchors itself:
   - If its own wake-up gap exceeds 50 ms, or the ring's overflow counter moved, everything in the
     ring is stale: the pump pops and discards it, resets the servo and resampler phase, and
-    re-primes from fresh callback frames.
+    re-primes from fresh callback frames. Before its first fresh publish it bumps the store's
+    `discontinuity` counter (an atomic); a consumer that sees a new value moves its cursor to the
+    live edge minus the target before it reads, so retained pre-stall samples are never played
+    once the store is fresh again. Test: a 3 s pump stall with unread retained samples; the first
+    non-silent sample read afterwards is post-stall.
   - If the program bus pauses, the pump **keeps publishing fresh frames**. The store's 1 s
     drop-oldest window slides, so its head is always current audio. While `unread_frames` is above
     target + Q + 20 ms (Q is the run's tick quantum, for example 40 ms at 25 fps), the servo is
@@ -124,6 +128,10 @@ program bus ──push (wait-free)──▶ [engine→drain SPSC ring, ~200 ms] 
   the device allows it (`BufferSize::Fixed`), otherwise the device default. The actual callback
   period P is measured from the first callbacks. Outputs whose P exceeds 40 ms are refused with a
   latched `unsupported_buffer` warning (they cannot meet the latency budget).
+- **Device-ring sizing:** target = max(2 × P, 20 ms), capacity = target + 40 ms. So the target is
+  always at least one callback plus one drain wake ahead of the callback (with P ≤ 40 ms: target
+  ≤ 80 ms, capacity ≤ 120 ms). The end-to-end budget uses this target. A test at P = 10, 20 and
+  40 ms asserts zero steady-state underruns.
 - **Engine side:** each tick pushes its program audio into the engine→drain ring. Wait-free. If the
   ring is full (the drain is stalled), the new block is dropped and `engine_drop_frames` counts it.
   The engine never takes a lock.
