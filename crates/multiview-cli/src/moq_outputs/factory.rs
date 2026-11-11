@@ -437,20 +437,18 @@ impl RegistryFeedFactory {
         let mut ladder = Vec::new();
         let mut renditions = Vec::new();
         for binding in effective.iter() {
-            let audio = match binding
+            let Ok(audio) = binding
                 .audio
                 .iter()
                 .map(factory_audio)
                 .collect::<Result<Vec<_>, _>>()
-            {
-                Ok(audio) => audio,
-                Err(_) => continue,
+            else {
+                continue;
             };
-            let metadata = match factory_video(&binding.video)
-                .and_then(|video| metadata::prepare(&video, &audio))
-            {
-                Ok(metadata) => metadata,
-                Err(_) => continue,
+            let Ok(metadata) =
+                factory_video(&binding.video).and_then(|video| metadata::prepare(&video, &audio))
+            else {
+                continue;
             };
             renditions.push(LadderRendition {
                 track: binding.output_id.clone(),
@@ -632,6 +630,7 @@ impl AuthorizedFeedFactory for RegistryFeedFactory {
         self.ready.load(Ordering::Acquire) && !self.prepared.is_empty()
     }
 
+    #[allow(clippy::too_many_lines)] // Keep one authorized family admission boundary atomic.
     fn attach_shared(
         &self,
         principal: &Principal,
