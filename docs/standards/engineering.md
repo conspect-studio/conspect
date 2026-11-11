@@ -33,10 +33,11 @@ enforced").
 **No class waits for the operator.** [ADR-G005](../decisions/ADR-G005.md) delegates final approval
 **and merge** to the agent, and [ADR-G009](../decisions/ADR-G009.md) removes the last exception: an
 R3 change is merged by the agent too. What R3 adds is engineering work, not a permission step: the
-design note or ADR, the 3-lens cross-vendor panel, and the chaos/soak or rehearsed recovery gate.
+design note or ADR, the 3-lens cross-vendor panel, a rehearsed recovery path, and, for any
+change that risks invariant #1 or #10, the chaos/soak test (always; it has no substitute).
 When those are met and CI is green, merge. The agent also owns everything around the merge: fixing
-CI, rerunning a flaky job after reading its log, closing superseded PRs, deploying to the test
-server and rolling it back. A PR that waits for "operator confirmation" is unfinished work.
+CI, rerunning a flaky job after reading its log, keeping a PR current with `main`, and closing
+superseded PRs. A PR that waits for "operator confirmation" is unfinished work.
 
 The agent **reports** decisions it took (PR `## Concerns`, the final report). A report is not a
 question. What still goes to the operator is unchanged and narrow, and none of it is a merge:

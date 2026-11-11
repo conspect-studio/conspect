@@ -29,11 +29,12 @@ own standard contradicted its always-loaded instructions.
    green, once every R3 gate above is met".
 2. **R3 stays the highest bar; the bar is engineering work, not permission.** An R3 change still
    owes a governing issue, a plan, a design note or ADR, failing tests first, the 3-lens
-   cross-vendor panel, and the chaos/soak or rehearsed-recovery gate for an invariant #1/#10 risk.
+   cross-vendor panel, a rehearsed recovery path, and the chaos/soak test for any invariant #1/#10
+   risk. The chaos/soak test is mandatory for that risk and has no substitute.
    None of that is relaxed. The agent does that work and then merges.
 3. **The agent owns everything around the merge:** fixing red CI (read the log, fix the cause, or
-   rerun a tracked flaky job), keeping a PR up to date with `main`, closing superseded PRs,
-   deploying to the test server and rolling it back, and deciding between options it can measure.
+   rerun a tracked flaky job), keeping a PR up to date with `main`, closing superseded PRs, and
+   deciding between engineering options it can measure.
 4. **Report, do not ask.** Decisions are recorded in the PR (`## Concerns`) and in the final report.
    The operator may veto, revert or re-open anything afterwards (G005 §3 stands).
 5. **What still goes to the operator is unchanged and is not a merge:** the outward-facing actions
@@ -47,6 +48,10 @@ own standard contradicted its always-loaded instructions.
 
 ## What this ADR does NOT change
 
+- **Deployment is not decided here.** The directive covers PRs, CI fixes and merging. Deploying to
+  a test server is governed, as before, by the estate rules in `AGENTS.md` (a disposable,
+  revertable environment) and by the operator's instructions for the run. This ADR neither grants
+  nor removes that authority. A public release stays reserved to the operator (G005).
 - The cross-vendor review of [ADR-G003](ADR-G003.md) stays mandatory, in a fresh context, never
   performed by the authoring vendor.
 - Never merge on a failing check; never `--admin` or bypass; never weaken, skip or delete a test.

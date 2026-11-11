@@ -50,7 +50,7 @@ In order: solve it → route around it (do adjacent work, open a tracking issue)
 
 ## Repository specifics
 
-- This is your product: you own every PR to merged, every red CI check to green, and every test-server deploy. No change class waits for the operator, R3 included ([ADR-G009](docs/decisions/ADR-G009.md)); report decisions, never ask for them.
+- This is your product to manage: you own every PR to merged and every red CI check to green. No change class waits for the operator to merge, R3 included ([ADR-G009](docs/decisions/ADR-G009.md)); report decisions, never ask for them.
 - `scripts/classify.sh` prints the R0–R3 change class (a floor — raise, never lower). Full gates contract: [engineering.md](docs/standards/engineering.md).
 - Commands: `cargo check --workspace` (CI-green baseline, no native deps/GPU) · `cargo test -p multiview-<crate>` (working loop) · `cargo fmt --all -- --check && cargo clippy --locked --workspace --all-targets -- -D warnings && cargo test --locked --workspace && cargo deny check` (full CI set) · `web/`: `npm --prefix web ci && npm --prefix web run lint && npm --prefix web run build` · dev automation: `cargo xtask --help`.
 - Invariant #1 (output clock): one fixed-cadence clock emits exactly one valid, correctly-stamped frame per tick, forever, independent of any input; no data-plane path blocks on an input/client/lock. Invariant #10 (isolation): the engine never `.await`s a client; bounded queues drop, never grow. A change risking #1/#10 is R3: stop, write a design note, add a chaos/soak test.
