@@ -58,6 +58,10 @@ pub struct WallCell {
     pub w: u32,
     /// Height in coded pixels.
     pub h: u32,
+    /// Whether this cell currently carries a picture. A cell without one is
+    /// black in the wall; its surface shows the source's own still instead.
+    /// Excluded from layout identity: it changes without a new generation.
+    pub live: bool,
 }
 
 /// Exact wall cadence; never a float frame rate.

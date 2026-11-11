@@ -23215,7 +23215,8 @@
           "x",
           "y",
           "w",
-          "h"
+          "h",
+          "live"
         ],
         "properties": {
           "h": {
@@ -23223,6 +23224,10 @@
             "format": "int32",
             "description": "Height in coded pixels.",
             "minimum": 0
+          },
+          "live": {
+            "type": "boolean",
+            "description": "Whether this cell currently carries a picture. A cell without one is\nblack in the wall; its surface shows the source's own still instead.\nExcluded from layout identity: it changes without a new generation."
           },
           "source": {
             "type": "string",
