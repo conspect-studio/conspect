@@ -10338,9 +10338,13 @@ fn build_rist_push(
     // OUTMETA: RIST carries MPEG-TS, so the SDT/PMT metadata applies (no
     // rotation tag — pixels-only orientation is the compositor's concern).
     let (meta, matrix) = output_mux_meta(output);
+    let sink = PacketMuxSink::push(PushProtocol::Rist, lowered).with_output_metadata(meta, matrix);
     Ok(RunnableOutput::Push {
         id: output.id(),
-        sink: PacketMuxSink::push(PushProtocol::Rist, lowered).with_output_metadata(meta, matrix),
+        // Link state for the never-block fan-out and the status snapshot, like
+        // every other push output. Built from the credential-free URL only.
+        link: push_link_for("rist", &sink, &redacted),
+        sink,
         label: "rist",
         url: redacted,
     })
@@ -17911,6 +17915,23 @@ buffer_ms = 700
             .filter(|r| matches!(r, RunnableOutput::Push { label, .. } if *label == "rist"))
             .count();
         assert_eq!(push_count, 1, "exactly one rist push runnable is built");
+        // The rist push carries live link state like every other push output:
+        // the consumer's never-block fan-out and the status API both read it.
+        let link = built
+            .packet
+            .iter()
+            .find_map(|r| match r {
+                RunnableOutput::Push { label, link, .. } if *label == "rist" => Some(link),
+                _ => None,
+            })
+            .expect("the rist push runnable carries a link");
+        let snapshot = link.snapshot();
+        assert_eq!(snapshot.transport, "rist");
+        assert_eq!(
+            snapshot.mode, "caller",
+            "a rist:// push is not an SRT listener"
+        );
+        assert_eq!(snapshot.clients, 0);
     }
 }
 
