@@ -77,8 +77,8 @@ device callback ──push──▶ [SPSC ring, ~200 ms] ──pop──▶ pump
     ring is stale: the pump pops and discards it, resets the servo and resampler phase, and
     re-primes from fresh callback frames. Its first fresh publish carries a **discontinuity
     boundary**: the absolute frame index of the first post-stall frame and a generation number,
-    stored **inside the same immutable window snapshot** as the samples (one `SwapCell` swap
-    publishes both). `read` loads that snapshot once and makes every decision (boundary, skip,
+    stored **inside the same immutable window snapshot** as the samples, together with the
+    publish instant used by the 50 ms freshness rule (one `SwapCell` swap publishes all three). `read` loads that snapshot once and makes every decision (boundary, skip,
     prebuffer, copy) on it, so the boundary and the samples it guards are always consistent. The
     consumer, on a new generation, clamps its cursor to `max(cursor, boundary)` and reads silence until at least
     `target` frames exist after the boundary (the live prebuffer rule, applied from the boundary),
@@ -102,7 +102,7 @@ device callback ──push──▶ [SPSC ring, ~200 ms] ──pop──▶ pump
     the newest captured audio, plus the pump's publish interval (10 ms): ≈130 ms at 25 fps,
     ≈118 ms at 60 fps. Routine reads never skip.
   - If the pump itself has not published for over 50 ms (pump stall, device stall), the head is
-    not current. The pump records its last publish instant in the store (an atomic); the consumer
+    not current. The publish instant is part of the window snapshot (above); the consumer
     returns silence instead of retained audio when that instant is older than 50 ms, until the pump
     publishes fresh frames again.
   - Test: continuous playback at 23.976, 25, 29.97, 50 and 60 fps for 10 simulated minutes with
@@ -139,7 +139,9 @@ program bus ──push (wait-free)──▶ [engine→drain SPSC ring, ~200 ms] 
   the device allows it (`BufferSize::Fixed`), otherwise the device default. The actual callback
   period P is measured from the first callbacks. Outputs whose P exceeds 40 ms are refused with a
   latched `unsupported_buffer` warning (they cannot meet the latency budget).
-- **Device-ring sizing:** target = max(2 × P, 20 ms), capacity = target + 40 ms. So the target is
+- **Device-ring sizing:** target = max(2 × P, 20 ms), capacity = 120 ms (the size needed for the
+  largest accepted P of 40 ms), so a soft reroute to a device with a longer period never needs a
+  new ring; only the target is recomputed from the new P. So the target is
   always at least one callback plus one drain wake ahead of the callback (with P ≤ 40 ms: target
   ≤ 80 ms, capacity ≤ 120 ms). The end-to-end budget uses this target. A test at P = 10, 20 and
   40 ms asserts zero steady-state underruns.
@@ -232,10 +234,11 @@ program bus ──push (wait-free)──▶ [engine→drain SPSC ring, ~200 ms] 
     - macOS input: cpal 0.18 has no default-input monitor. The lifecycle helper (which owns all
       cpal calls, with its deadline and stuck-state rules) reads `default_input_device()`'s id
       every 2 s, and requests a reopen on a change. The pump never makes OS calls.
-  - **Pump/drain supervision:** the lifecycle helper also watches the pump's (or drain's) loop
-    counter. If it has not advanced for 1 s while the device is open, the device goes to the
-    latched `device_call_stuck` state (telemetry stops saying `open`); the source reads silence
-    because publishes have stopped.
+  - **Supervision:** one process-wide supervisor thread (never blocked: it only reads atomics and
+    sleeps) watches each device's pump/drain loop counter and helper call-start instant. If a pump
+    or drain has not advanced for 1 s, or a helper call (open, close, poll) has run past its
+    deadline, it sets the device state to the latched `device_call_stuck` (telemetry stops saying
+    `open`) and the source reads silence. It starts no replacement threads.
   - A physical device literally named "default" is selected by its `device_id`.
   - Every open logs the name and id that were bound.
 - **One lifecycle helper per device**, a long-lived thread that owns the cpal `Stream`. Open and
@@ -349,6 +352,8 @@ own clock.
    budget met; P_in over 40 ms is refused into the latched `unsupported_buffer` state with zero
    frames published and no reopen loop. A blocked default-device poll or a wedged pump leaves
    `open` for `device_call_stuck` and the source reads silence.
+4b. Soft reroute: `DeviceChanged` from P = 10 ms to 20 and 40 ms reaches steady state with no
+   persistent underrun, using the same ring.
 4a. Underrun storm: a callback that chronically short-fills outside pre-roll. Assert no underrun
    is counted while the pre-roll flag is set, re-anchors follow the capped backoff (1 s → 30 s),
    and each storm costs one bounded pre-roll (no loop). A `DeviceChanged` onto a device with a
