@@ -1132,14 +1132,14 @@ jobs:
           path-type: inherit
           install: make diffutils pkgconf nasm patch tar xz gnupg git
       - uses: ilammy/msvc-dev-cmd@v1
-      - name: vcpkg deps (LGPL/BSD only)
+      - name: "vcpkg deps (permissive only: opus BSD, libsrt MPL-2.0 + OpenSSL Apache-2.0, zlib)"
         run: |
           & "$env:VCPKG_ROOT\vcpkg.exe" install --triplet x64-windows opus libsrt zlib
       - name: Cache pinned FFmpeg prefix
         id: ffcache
         uses: actions/cache@v4
         with:
-          path: ${{ github.workspace }}\..\multiview-ffmpeg
+          path: ${{ runner.workspace }}\multiview-ffmpeg
           key: ffmpeg-windows-${{ hashFiles('deploy/ffmpeg-build.sh', 'deploy/ffmpeg-fetch-source.sh', 'deploy/ffmpeg-patches/**', 'deploy/Dockerfile.ffmpeg', '.github/workflows/ci.yml') }}
       - name: Build pinned FFmpeg (windows profile)
         if: steps.ffcache.outputs.cache-hit != 'true'
@@ -1150,12 +1150,18 @@ jobs:
           deps="$(cygpath -u "$FF_WIN_DEPS_WIN")"
           export PKG_CONFIG_PATH="$deps/lib/pkgconfig" FF_WIN_DEPS="$deps"
           export INCLUDE="$FF_WIN_DEPS_WIN\include;$INCLUDE" LIB="$FF_WIN_DEPS_WIN\lib;$LIB"
-          FF_PREFIX="$(cygpath -u "$GITHUB_WORKSPACE")/../multiview-ffmpeg" FF_LICENSE=lgpl FF_HWACCEL=windows TARGETARCH=amd64 \
+          FF_PREFIX="$(cygpath -u "$RUNNER_WORKSPACE")/multiview-ffmpeg" FF_LICENSE=lgpl FF_HWACCEL=windows TARGETARCH=amd64 \
             FFMPEG_VERSION="$(pin FFMPEG_VERSION)" FFMPEG_SHA256="$(pin FFMPEG_SHA256)" \
             FFMPEG_GIT_COMMIT="$(pin FFMPEG_GIT_COMMIT)" bash deploy/ffmpeg-build.sh
+      - name: Re-assert the IO allowlist (cache hits included)
+        shell: msys2 {0}
+        run: |
+          set -euo pipefail
+          FF_PREFIX="$(cygpath -u "$RUNNER_WORKSPACE")/multiview-ffmpeg" FF_HWACCEL=windows \
+            FF_WIN_DEPS="$(cygpath -u "$FF_WIN_DEPS_WIN")" bash deploy/ffmpeg-build.sh --assert-features
       - name: Assert LGPL-only, NVENC/D3D11VA present, soname 63; export env
         run: |
-          $prefix = Resolve-Path "$env:GITHUB_WORKSPACE\..\multiview-ffmpeg"
+          $prefix = "$env:RUNNER_WORKSPACE\multiview-ffmpeg"
           $env:PATH = "$prefix\bin;$env:FF_WIN_DEPS_WIN\bin;$env:PATH"
           if (-not (Test-Path "$prefix\bin\avcodec-63.dll")) { throw "avcodec-63.dll missing" }
           if (-not (ffmpeg -hide_banner -encoders | Select-String "h264_nvenc")) { throw "h264_nvenc missing" }

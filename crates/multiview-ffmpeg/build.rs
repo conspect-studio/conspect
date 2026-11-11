@@ -91,9 +91,20 @@ fn libav_include_dirs() -> Result<Vec<PathBuf>, Box<dyn Error>> {
         }
     }
 
+    // 3. FFMPEG_DIR — the prefix ffmpeg-sys-next itself links from when it is
+    //    set (the MSVC/Windows path, where pkg-config is often absent). Only
+    //    accepted if it really contains the header.
+    println!("cargo:rerun-if-env-changed=FFMPEG_DIR");
+    if let Some(dir) = std::env::var_os("FFMPEG_DIR") {
+        let include = PathBuf::from(dir).join("include");
+        if include.join("libavutil").join("log.h").is_file() {
+            return Ok(vec![include]);
+        }
+    }
+
     Err(
         "multiview-ffmpeg: could not find the libav include path for <libavutil/log.h>. \
-         Tried pkg-config (libavutil) and DEP_FFMPEG_INCLUDE. Install libavutil's \
+         Tried pkg-config (libavutil), DEP_FFMPEG_INCLUDE and FFMPEG_DIR/include. Install libavutil's \
          development headers and/or set PKG_CONFIG_PATH so the log-callback C shim can compile."
             .into(),
     )
