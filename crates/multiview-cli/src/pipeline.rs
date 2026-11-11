@@ -21362,30 +21362,35 @@ segment_ms = 1000
                 key
             })
             .collect();
-        pipeline.set_optional_preview(crate::preview_vertical::PreviewStartup {
-            parent_output: "test-sink-0".into(),
-            production,
-            requests: keys
-                .iter()
-                .enumerate()
-                .map(|(i, key)| PreviewRequest {
-                    profile_id: format!("profile-{i}"),
-                    key: key.clone(),
-                })
-                .collect(),
-            capacity: Some(ResourceCost {
-                encoder_sessions: 6,
-                cpu_units: 6,
-                memory_bytes: 8_388_608,
-                uplink_bps: 20_000_000,
-                ..ResourceCost::default()
-            }),
-            measured: keys.into_iter().map(|key| (key, cost)).collect(),
-            audio_once_bps: 128_000,
-            overhead_bps: 100_000,
-            opened_parent: None,
-            startup_delay,
-        });
+        pipeline.set_optional_preview(
+            crate::preview_vertical::PreviewStartup {
+                parent_output: "test-sink-0".into(),
+                production,
+                requests: keys
+                    .iter()
+                    .enumerate()
+                    .map(|(i, key)| PreviewRequest {
+                        profile_id: format!("profile-{i}"),
+                        key: key.clone(),
+                    })
+                    .collect(),
+                capacity: Some(ResourceCost {
+                    encoder_sessions: 6,
+                    cpu_units: 6,
+                    memory_bytes: 8_388_608,
+                    uplink_bps: 20_000_000,
+                    ..ResourceCost::default()
+                }),
+                measured: keys.into_iter().map(|key| (key, cost)).collect(),
+                audio_once_bps: 128_000,
+                overhead_bps: 100_000,
+                opened_parent: None,
+                runtime_gate: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                shared_budget: false,
+                startup_delay,
+            }
+            .with_admission_budget(&crate::preview_vertical::PreviewAdmissionBudget::new()),
+        );
         pipeline
     }
 
