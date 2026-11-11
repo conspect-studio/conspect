@@ -1,6 +1,6 @@
 // Real MonitoringPage → PreviewSurface → WhepPlayer lifecycle integration.
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { act, fireEvent, screen, waitFor } from '@testing-library/react';
+import { act, cleanup, fireEvent, screen, waitFor } from '@testing-library/react';
 import { MemoryRouter } from 'react-router-dom';
 import { renderWithProviders } from '../test/render';
 import { MonitoringPage } from './MonitoringPage';
@@ -73,7 +73,21 @@ beforeEach(() => {
   vi.stubGlobal('MediaStream', class { addTrack(): void { /* no track */ } });
   fetchMock.mockClear();
 });
-afterEach(() => { vi.unstubAllGlobals(); });
+afterEach(async () => {
+  // Unmount while the fetch stub is still installed. A player releases its
+  // session on unmount; that DELETE must be answered here. If the stub is
+  // removed first, the DELETE goes to the real network, stays pending into the
+  // next test (whose player waits for earlier releases), and its late failure
+  // calls into React after this file's environment is gone.
+  cleanup();
+  for (let quiet = 0; quiet < 3;) {
+    const pending = deletes.splice(0);
+    for (const done of pending) done();
+    quiet = pending.length === 0 ? quiet + 1 : 0;
+    await new Promise<void>((resolve) => { setTimeout(resolve, 0); });
+  }
+  vi.unstubAllGlobals();
+});
 describe('real single-focus lease handoff', () => {
   it('program 503 fallback lets source open without waiting for a nonexistent lease', async () => {
     programReject = true;
