@@ -8,79 +8,94 @@ export interface WallWhepOptions {
   onActive: () => void;
 }
 
+/** One off-DOM video: present each decoded frame to the store's shared canvas. */
 export async function playWallWhep({ signal, onFrame, onActive }: WallWhepOptions): Promise<void> {
+  if (signal.aborted) return;
   const pc = defaultPcFactory({});
   const video = document.createElement('video');
   video.muted = true;
   video.playsInline = true;
+  video.autoplay = true;
   pc.addTransceiver('video', { direction: 'recvonly' });
   let sessionUrl: string | undefined;
   let callback: number | undefined;
-  let timeout: ReturnType<typeof setTimeout> | undefined;
-  let connectTimeout: ReturnType<typeof setTimeout> | undefined;
-  const progress = { lastFrame: performance.now() };
+  let gatherTimer: ReturnType<typeof setTimeout> | undefined;
   let watchdog: ReturnType<typeof setInterval> | undefined;
+  let lastFrame = performance.now();
+  let trackAttached = false;
+  let done = false;
   const stream = new MediaStream();
-  const release = (): void => {
+  let resolveEnd: (() => void) | undefined;
+  let rejectEnd: ((reason: Error) => void) | undefined;
+  const ended = new Promise<void>((resolve, reject) => { resolveEnd = resolve; rejectEnd = reject; });
+  // Catch an early peer failure even when signaling is still in progress.
+  void ended.catch(() => undefined);
+  const dispose = (): void => {
+    if (done) return;
+    done = true;
     if (callback !== undefined) video.cancelVideoFrameCallback(callback);
-    if (timeout !== undefined) clearTimeout(timeout);
-    if (connectTimeout !== undefined) clearTimeout(connectTimeout);
+    if (gatherTimer !== undefined) clearTimeout(gatherTimer);
     if (watchdog !== undefined) clearInterval(watchdog);
+    pc.ontrack = null;
     pc.onconnectionstatechange = null;
     pc.close();
-    if (sessionUrl) { const url = sessionUrl; sessionUrl = undefined; void releaseWhepSession(url); }
     video.srcObject = null;
+    if (sessionUrl) { const url = sessionUrl; sessionUrl = undefined; void releaseWhepSession(url); }
   };
-  let failPeer: ((error: Error) => void) | undefined;
-  const stop = new Promise<void>((resolve, reject) => {
-    failPeer = reject;
-    signal.addEventListener('abort', () => { release(); resolve(); }, { once: true });
-    pc.onconnectionstatechange = () => {
-      if (!signal.aborted && (pc.connectionState === 'failed' || pc.connectionState === 'closed')) reject(new Error(`wall WebRTC ${pc.connectionState}`));
-    };
-  });
-  // Observe a peer failure even when it arrives before the signaling steps end.
-  void stop.catch(() => undefined);
+  const abort = (): void => { dispose(); resolveEnd?.(); };
+  signal.addEventListener('abort', abort, { once: true });
+  const fail = (error: Error): void => { if (!signal.aborted && !done) rejectEnd?.(error); };
+  pc.onconnectionstatechange = () => {
+    if (pc.connectionState === 'failed' || pc.connectionState === 'closed') fail(new Error(`wall WebRTC ${pc.connectionState}`));
+  };
+  const onPresentedFrame = (): void => {
+    if (signal.aborted || done) return;
+    lastFrame = performance.now();
+    onFrame(video);
+    callback = video.requestVideoFrameCallback(onPresentedFrame);
+  };
+  pc.ontrack = (event): void => {
+    if (event.track.kind !== 'video' || done || trackAttached) return;
+    trackAttached = true;
+    stream.addTrack(event.track);
+    video.srcObject = stream;
+    void video.play().then(() => {
+      if (!done && !signal.aborted) callback = video.requestVideoFrameCallback(onPresentedFrame);
+    }, (error: unknown) => { fail(error instanceof Error ? error : new Error('wall WebRTC autoplay refused')); });
+  };
   const aborted = (): boolean => signal.aborted;
-  const play = async (): Promise<void> => {
-    try {
-      if (aborted()) return;
-      pc.ontrack = (event) => { if (event.track.kind === 'video') { stream.addTrack(event.track); video.srcObject = stream; } };
-      const offer = await pc.createOffer();
-      if (aborted()) return;
-      await pc.setLocalDescription(offer);
-      if (pc.iceGatheringState !== 'complete') {
-        await new Promise<void>((resolve) => {
-          const done = (): void => { pc.removeEventListener('icegatheringstatechange', check); if (timeout !== undefined) clearTimeout(timeout); resolve(); };
-          const check = (): void => { if (pc.iceGatheringState === 'complete' || signal.aborted) done(); };
-          pc.addEventListener('icegatheringstatechange', check);
-          timeout = setTimeout(done, 2000);
-          check();
-        });
-      }
-      if (aborted() || !pc.localDescription) return;
-      const answer = await postWhepOffer('/api/v1/preview/wall/whep', pc.localDescription.sdp);
-      sessionUrl = answer.sessionUrl;
-      if (aborted()) return;
-      await pc.setRemoteDescription({ type: 'answer', sdp: answer.answerSdp });
-      if (aborted()) return;
-      connectTimeout = setTimeout(() => { failPeer?.(new Error('wall WebRTC media timeout')); }, 15000);
-      watchdog = setInterval(() => {
-        if (!signal.aborted && performance.now() - progress.lastFrame > 6000) failPeer?.(new Error('wall WebRTC frame stalled'));
-      }, 1000);
-      // The browser may need the media track before play resolves.
-      void video.play().catch((error: unknown) => { failPeer?.(error instanceof Error ? error : new Error('wall WebRTC autoplay refused')); });
-      onActive();
-      const frame = (): void => {
-        if (aborted()) return;
-        progress.lastFrame = performance.now();
-        if (connectTimeout !== undefined) { clearTimeout(connectTimeout); connectTimeout = undefined; }
-        onFrame(video);
-        callback = video.requestVideoFrameCallback(frame);
-      };
-      callback = video.requestVideoFrameCallback(frame);
-      await stop;
-    } finally { release(); }
-  };
-  await play();
+  try {
+    const offer = await pc.createOffer();
+    if (aborted()) return;
+    await pc.setLocalDescription(offer);
+    if (pc.iceGatheringState !== 'complete') {
+      await new Promise<void>((resolve) => {
+        const finish = (): void => {
+          pc.removeEventListener('icegatheringstatechange', check);
+          signal.removeEventListener('abort', finish);
+          if (gatherTimer !== undefined) clearTimeout(gatherTimer);
+          resolve();
+        };
+        const check = (): void => { if (pc.iceGatheringState === 'complete') finish(); };
+        pc.addEventListener('icegatheringstatechange', check);
+        signal.addEventListener('abort', finish, { once: true });
+        gatherTimer = setTimeout(finish, 2000);
+        check();
+      });
+    }
+    if (aborted() || !pc.localDescription) return;
+    const answer = await postWhepOffer('/api/v1/preview/wall/whep', pc.localDescription.sdp);
+    sessionUrl = answer.sessionUrl;
+    if (aborted()) return;
+    await pc.setRemoteDescription({ type: 'answer', sdp: answer.answerSdp });
+    if (aborted()) return;
+    onActive();
+    watchdog = setInterval(() => {
+      if (!aborted() && performance.now() - lastFrame > 6000) fail(new Error('wall WebRTC frame stalled'));
+    }, 1000);
+    await ended;
+  } finally {
+    signal.removeEventListener('abort', abort);
+    dispose();
+  }
 }
