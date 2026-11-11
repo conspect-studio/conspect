@@ -601,3 +601,29 @@ async fn denied_reference_never_acquires_a_preview_lease_or_opens_a_source() {
     );
     assert_eq!(leases.pending_count(), 0);
 }
+
+#[tokio::test]
+async fn configured_pair_rejects_unwarmed_third_source_before_enqueue() {
+    let (handle, mut driver) = runtime();
+    let h = harness_with(|state| {
+        state.with_switcher(handle).with_base_document(json!({
+        "switcher": {"mix_effects": [{"id":"me1", "program":"main", "program_source":"a", "preview_source":"b"}]}
+    }))
+    });
+    let response = send(
+        &h.router,
+        post_with_key(
+            "/api/v1/switcher/commands/select_preview",
+            OPERATOR_TOKEN,
+            request("select_preview", Some("third")),
+            "third-refused",
+        ),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    driver.drain_at_tick(Tick {
+        index: 1,
+        pts: MediaTime::ZERO,
+    });
+    assert_eq!(driver.selections().1.as_str(), "b");
+}

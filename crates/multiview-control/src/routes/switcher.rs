@@ -166,6 +166,30 @@ fn verb(req: &SwitcherRequest, kind: &str) -> ControlResult<SwitcherVerb> {
     }
 }
 
+/// The first slice admits only its configured source pair. Both members have
+/// bounded warm rails; a third source needs a new scene admission, not a take.
+fn validate_source_pair(state: &AppState, req: &SwitcherRequest) -> ControlResult<()> {
+    let Some(source) = req.source.as_deref() else {
+        return Ok(());
+    };
+    let Some(document) = state.base_document.as_ref() else {
+        return Ok(());
+    };
+    let me = document
+        .pointer("/switcher/mix_effects/0")
+        .ok_or_else(|| ControlError::Conflict("no configured first-slice source pair".into()))?;
+    if ["program_source", "preview_source"]
+        .iter()
+        .any(|key| me[*key].as_str() == Some(source))
+    {
+        Ok(())
+    } else {
+        Err(ControlError::Validation(
+            "first-slice source is outside the configured Program/Preview pair".into(),
+        ))
+    }
+}
+
 /// Read authoritative state; no runtime means an explicit 409, never fake PGM.
 #[cfg_attr(feature = "openapi", utoipa::path(get, path = "/api/v1/switcher/{me}", tag = "switcher", params(("me" = String, Path)), responses((status = 200, body = SwitcherStateResponse), (status = 403, body = crate::problem::Problem), (status = 409, body = crate::problem::Problem))))]
 pub(crate) async fn get_switcher(
@@ -207,6 +231,7 @@ pub(crate) async fn plan_switcher(
 ) -> ControlResult<Response> {
     principal.role.require(Action::Read)?;
     authorize_refs(&principal, &req)?;
+    validate_source_pair(&state, &req)?;
     validate_first_slice(&req, &req.action)?;
     let handle = engine(&state)?;
     if req.action == "auto" && !handle.supports_auto() {
@@ -239,6 +264,7 @@ pub(crate) async fn submit_switcher(
 ) -> ControlResult<Response> {
     principal.role.require(Action::Write)?;
     authorize_refs(&principal, &req)?;
+    validate_source_pair(&state, &req)?;
     if req.action != kind {
         return Err(ControlError::Validation(
             "switcher action disagrees with command path".into(),

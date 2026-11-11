@@ -1288,6 +1288,7 @@ segment_ms = 1000
                 ))),
                 None,
             ),
+            clear_on_remove: false,
             layout: std::sync::Arc::new(layout),
             canvas_color: CanvasColor::default(),
             cadence: Rational::new(25, 1),
@@ -1402,6 +1403,7 @@ segment_ms = 1000
                 ))),
                 None,
             ),
+            clear_on_remove: false,
             layout: std::sync::Arc::new(layout),
             canvas_color: CanvasColor::default(),
             cadence: Rational::new(25, 1),
@@ -1689,6 +1691,7 @@ pub struct Pipeline {
     boot_pins: Vec<(String, Vec<crate::source_demand::StandingPin>)>,
     /// The boot audio routes' consumers.
     boot_audio_routes: Vec<multiview_engine::SetItem>,
+    switcher_audio_warm: Option<multiview_engine::ConsumerSet<Nv12Image>>,
     /// The layout and audio-route consumer sets, once the manager exists.
     demand_sets: Option<(
         multiview_engine::ConsumerSet<Nv12Image>,
@@ -2951,6 +2954,7 @@ impl Pipeline {
             boot_rails,
             boot_pins,
             boot_audio_routes,
+            switcher_audio_warm: None,
             demand_sets: None,
             source_events,
             layout,
@@ -3285,6 +3289,25 @@ impl Pipeline {
         }
         // The pipeline's own boot references are superseded by the leases.
         self.source_handles.clear();
+        if self.encode_cfg.audio.is_some() {
+            if let Some(me) = &self.switcher_me {
+                let warm =
+                    manager.consumer_set(multiview_engine::ConsumerClass::AudioRoute, Rails::ALL);
+                warm.seed(vec![
+                    multiview_engine::SetItem {
+                        id: me.program_source.clone().into(),
+                        label: "switcher-pgm-audio".into(),
+                        size: None,
+                    },
+                    multiview_engine::SetItem {
+                        id: me.preview_source.clone().into(),
+                        label: "switcher-pvw-audio".into(),
+                        size: None,
+                    },
+                ]);
+                self.switcher_audio_warm = Some(warm);
+            }
+        }
         self.demand_sets = Some((layout, audio));
         self.demand = Some(manager.clone());
         manager
@@ -3317,6 +3340,7 @@ impl Pipeline {
                 .clone()
                 .map(|manager| (Arc::clone(&self.catalogue), manager)),
             source_events: Arc::clone(&self.source_events),
+            clear_on_remove: self.switcher_me.is_some(),
             layout: Arc::clone(&self.layout),
             display: DisplayFollow::new(
                 Arc::clone(&self.display_layout),
@@ -3396,6 +3420,63 @@ impl Pipeline {
     /// canonical program format).
     pub fn enable_program_audio(&mut self) {
         self.encode_cfg.audio = Some(multiview_output::AudioEncodeConfig::aac(48_000, 2, 128_000));
+        if let Some(me) = &self.switcher_me {
+            for id in [&me.program_source, &me.preview_source] {
+                if self.audio_stores.contains_key(id) {
+                    continue;
+                }
+                let entry = self.catalogue.load().get(id).cloned();
+                let Some(entry) = entry else {
+                    continue;
+                };
+                let lifecycle = if self.ingest_plans.iter().any(|plan| plan.id == *id) {
+                    live_lifecycle(id)
+                } else {
+                    let lifecycle = begin_live_lifecycle(id);
+                    match ingest_plan_for(
+                        entry.source(),
+                        self.layout.canvas.width,
+                        self.layout.canvas.height,
+                        Arc::clone(entry.store()),
+                        self.canvas_color,
+                        self.cadence,
+                    ) {
+                        Ok(mut plan) => {
+                            plan.lifecycle = lifecycle;
+                            plan.source_events = self.source_events.activate(id, lifecycle);
+                            self.ingest_plans.push(plan);
+                            self.stores.insert(id.clone(), Arc::clone(entry.store()));
+                            self.boot_rails.insert(id.clone(), Rails::VIDEO);
+                        }
+                        Err(error) => {
+                            tracing::warn!(source = %id, %error, "switcher audio warm video could not be planned");
+                        }
+                    }
+                    lifecycle
+                };
+                if let Some(mut plan) = audio_ingest_plan_for(entry.source()) {
+                    plan.lifecycle = lifecycle;
+                    let store = if plan.live {
+                        crate::audio::new_live_store()
+                    } else {
+                        crate::audio::new_file_store()
+                    };
+                    self.audio_stores.insert(id.clone(), store);
+                    self.audio_ingest_plans.push(plan);
+                    self.boot_rails
+                        .entry(id.clone())
+                        .and_modify(|rails| rails.audio = true)
+                        .or_insert(Rails::AUDIO);
+                } else if matches!(entry.source().kind, SourceKind::Bars) {
+                    self.audio_stores
+                        .insert(id.clone(), crate::audio::new_tone_store());
+                    self.boot_rails
+                        .entry(id.clone())
+                        .and_modify(|rails| rails.audio = true)
+                        .or_insert(Rails::AUDIO);
+                }
+            }
+        }
     }
 
     /// Whether this run carries **program audio** (`enable_program_audio` was
@@ -4625,6 +4706,7 @@ impl Pipeline {
         // and hands it to the bake consumer over the bounded queue per `policy`:
         // blocking send offline (exact-N back-pressure on the renderer), wait-free
         // `try_send` + drop-and-count live (the engine never blocks — inv #1/#10).
+        let switcher_audio_enabled = self.switcher_me.is_some();
         let source_event_reader = self.source_events.reader();
         let state_of = move |frame: &CompositedFrame| -> EngineStateSnapshot {
             // RT-10b: sample the per-layer subtitle router (drains any pending
@@ -4692,6 +4774,10 @@ impl Pipeline {
             #[cfg(not(feature = "overlay"))]
             let _ = events;
             let item = StreamItem {
+                switcher_audio: switcher_audio_enabled
+                    .then(|| frame.source_states.keys().next().cloned())
+                    .flatten(),
+                switcher_audio_enabled,
                 #[cfg(feature = "overlay")]
                 events,
                 canvas: Arc::clone(&canvas),
@@ -5359,6 +5445,8 @@ impl StreamBaker {
 /// loop this tick (captions/faults must be sampled now, before the small live
 /// cue window evicts them). The bake *render* runs on the consumer thread.
 struct StreamItem {
+    switcher_audio: Option<String>,
+    switcher_audio_enabled: bool,
     #[cfg(feature = "overlay")]
     events: std::collections::HashMap<String, multiview_core::event_overlay::EventOverlay>,
     /// The composited canvas the protected output core emitted this tick.
@@ -6661,6 +6749,9 @@ fn consumer_main<D: WindowDelivery>(
         let early_audio_block = if let Some(bus) = audio_bus.as_mut() {
             if let Some(handle) = audio_route.as_ref() {
                 handle.apply_pending(bus);
+                if item.switcher_audio_enabled {
+                    handle.select_program_source(bus, item.switcher_audio.as_deref());
+                }
             }
             if bus.live_strip_count() != av_strips {
                 av_strips = bus.live_strip_count();
@@ -6752,6 +6843,9 @@ fn consumer_main<D: WindowDelivery>(
             #[cfg(not(feature = "overlay"))]
             if let Some(handle) = audio_route.as_ref() {
                 handle.apply_pending(bus);
+                if item.switcher_audio_enabled {
+                    handle.select_program_source(bus, item.switcher_audio.as_deref());
+                }
             }
             #[cfg(not(feature = "overlay"))]
             if bus.live_strip_count() != av_strips {
@@ -8563,6 +8657,9 @@ struct LiveIngestSpawner {
         crate::source_rails::Catalogue,
         multiview_engine::DemandManager<Nv12Image>,
     )>,
+    /// First-slice switcher runs retire a removed source's store pixels so
+    /// a later re-add can never resolve stale media through the M/E.
+    clear_on_remove: bool,
     source_events: Arc<crate::source_event_runtime::Runtime>,
     /// The solved startup layout: the pinned canvas, which a live layout swap
     /// cannot change. Tile sizes come from `display`. Read by the GPU
@@ -8708,13 +8805,21 @@ impl crate::live_sources::IngestSpawner for LiveIngestSpawner {
     }
 
     fn source_removed(&self, id: &str) {
-        if let Some((catalogue, manager)) = &self.demand {
+        let retired_store = self.demand.as_ref().and_then(|(catalogue, manager)| {
+            let store = catalogue
+                .load()
+                .get(id)
+                .map(|entry| Arc::clone(entry.store()));
             crate::source_rails::catalogue_remove(catalogue, id);
             // Every pin it owns (standing and an operator Start) and every
             // timed lease on it (review DMD-05).
             manager.remove_source(id);
-        }
+            store.filter(|_| self.clear_on_remove)
+        });
         let lifecycle = remove_live_lifecycle(id);
+        if let Some(store) = retired_store {
+            store.clear();
+        }
         if let Some(lease) = self.source_events.activate(id, lifecycle) {
             lease.retire();
         }
@@ -20054,6 +20159,8 @@ mod live_overlay_bake_tests {
     fn item(tick_index: u64) -> StreamItem {
         let tag = CanvasColor::default().output_tag();
         StreamItem {
+            switcher_audio: None,
+            switcher_audio_enabled: false,
             #[cfg(feature = "overlay")]
             events: std::collections::HashMap::new(),
             canvas: Arc::new(Nv12Image::solid(320, 180, 16, 128, 128, tag).expect("solid")),
@@ -21505,6 +21612,43 @@ segment_ms = 1000
         // Following a live layout swap updates the registry record downwards.
         follow.record("news", (320, 180));
         assert_eq!(size("news"), Some(req((320, 180))));
+    }
+
+    #[test]
+    fn switcher_removal_cannot_resolve_stale_media() {
+        use crate::live_sources::IngestSpawner;
+        use multiview_engine::RailDriver;
+
+        let config = two_cells_one_source_config();
+        let pipeline = Pipeline::build(&config).expect("pipeline builds");
+        let rails = crate::source_rails::SourceRails::new(
+            pipeline.catalogue(),
+            pipeline.stop_registry(),
+            Arc::new(DemandSpawner {
+                live: pipeline.live_spawner(),
+                registry: pipeline.stop_registry(),
+            }),
+        );
+        // A non-switcher run removes the source but leaves the store alone
+        // (other holders keep their last-good picture, as before).
+        let legacy = pipeline.live_spawner();
+        assert!(
+            !legacy.clear_on_remove,
+            "legacy runs keep removal semantics"
+        );
+        // An opted-in switcher run additionally retires the removed store's
+        // pixels: a later re-add can never resolve the old media.
+        let mut guarded = pipeline.live_spawner();
+        guarded.clear_on_remove = true;
+        let retained = rails.store("cam1").expect("boot store exists");
+        guarded.source_removed("cam1");
+        assert!(retained.read_at(MediaTime::from_nanos(0)).frame().is_none());
+        assert_eq!(rails.resolve("cam1", Rails::VIDEO), Rails::NONE);
+        assert!(rails.store("cam1").is_none());
+        crate::source_rails::catalogue_upsert(&pipeline.catalogue(), &config.sources[0]);
+        guarded.source_removed("cam1");
+        assert_eq!(rails.resolve("cam1", Rails::VIDEO), Rails::NONE);
+        assert!(rails.store("cam1").is_none());
     }
 
     #[test]

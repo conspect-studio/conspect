@@ -106,6 +106,21 @@ async fn await_shutdown_signal() -> &'static str {
 /// output-clock loop and must be non-blocking (invariants #1 + #10).
 type ControlDrain = Box<dyn FnMut(&mut CompositorDrive<Nv12Image>) + Send>;
 
+#[cfg(feature = "ffmpeg")]
+struct LeaseCleanup(
+    Option<Arc<multiview_control::source_demand::SwitcherPreviewLeases>>,
+    StopSignal,
+);
+#[cfg(feature = "ffmpeg")]
+impl Drop for LeaseCleanup {
+    fn drop(&mut self) {
+        self.1.stop();
+        if let Some(leases) = &self.0 {
+            leases.detach();
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() -> ExitCode {
     if let Err(err) = init_tracing() {
@@ -650,24 +665,6 @@ fn attach_run_switcher(
         multiview_control::switcher_events::SWEEPER_INTERVAL,
     ));
     Ok(Some(attached))
-}
-
-/// Drop guard for the first-slice switcher's preview leases: stops the run
-/// signal and detaches the leases on every exit path of
-/// [`run_pipeline_until_ctrl_c`].
-#[cfg(feature = "ffmpeg")]
-struct LeaseCleanup(
-    Option<Arc<multiview_control::source_demand::SwitcherPreviewLeases>>,
-    StopSignal,
-);
-#[cfg(feature = "ffmpeg")]
-impl Drop for LeaseCleanup {
-    fn drop(&mut self) {
-        self.1.stop();
-        if let Some(leases) = &self.0 {
-            leases.detach();
-        }
-    }
 }
 
 /// Drive the ingest/composite/encode pipeline until Ctrl-C while **also**
