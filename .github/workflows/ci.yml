@@ -1131,10 +1131,13 @@ jobs:
           msystem: MSYS
           path-type: inherit
           install: make diffutils pkgconf nasm patch tar xz gnupg git
-      - uses: ilammy/msvc-dev-cmd@v1
+      # Before msvc-dev-cmd: it repoints VCPKG_ROOT at the Visual Studio-bundled
+      # vcpkg, which has no classic mode. Use the runner's C:\vcpkg explicitly.
       - name: "vcpkg deps (permissive only: opus BSD, libsrt MPL-2.0 + OpenSSL Apache-2.0, zlib)"
         run: |
-          & "$env:VCPKG_ROOT\vcpkg.exe" install --triplet x64-windows opus libsrt zlib
+          $env:VCPKG_ROOT = 'C:\vcpkg'
+          & 'C:\vcpkg\vcpkg.exe' install --classic --triplet x64-windows opus libsrt zlib
+      - uses: ilammy/msvc-dev-cmd@v1
       - name: FFmpeg prefix outside the checkout (no `..`; actions/cache rejects it)
         run: '"FF_PREFIX_WIN=$env:RUNNER_WORKSPACE\multiview-ffmpeg" | Out-File -Append $env:GITHUB_ENV'
       - name: Cache pinned FFmpeg prefix
