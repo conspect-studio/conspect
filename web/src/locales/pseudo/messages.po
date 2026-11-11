@@ -6838,7 +6838,7 @@ msgstr ""
 msgid "MUTE"
 msgstr ""
 
-#: src/preview/WhepPlayer.tsx:371
+#: src/preview/WhepPlayer.tsx:378
 msgid "Mute {label}"
 msgstr ""
 
@@ -11818,7 +11818,7 @@ msgstr ""
 msgid "Unlocked"
 msgstr ""
 
-#: src/preview/WhepPlayer.tsx:371
+#: src/preview/WhepPlayer.tsx:378
 msgid "Unmute {label}"
 msgstr ""
 
