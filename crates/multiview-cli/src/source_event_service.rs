@@ -69,19 +69,40 @@ struct Generation {
     active: AtomicBool,
     overflow: AtomicU64,
     degraded: AtomicBool,
+    /// Operator test-occurrence sequence for this generation.
+    test_sequence: AtomicU64,
     snapshot: SwapCell<Arc<SourceEventSnapshot>>,
 }
+/// Process-unique opaque service identity (S2): a read from one service can
+/// never validate against another service that registered the same source id.
+static NEXT_SERVICE_ID: AtomicU64 = AtomicU64::new(1);
 struct Shared {
+    /// Opaque identity of this service instance, never an external source id.
+    id: u64,
     slots: SwapCell<Arc<BTreeMap<String, Arc<Generation>>>>,
     stopped: AtomicBool,
     finished: AtomicBool,
+    /// Shared with [`RegistrationController`]/[`SourceEventProducer`] so a
+    /// registry reader can submit an administrator-injected test observation
+    /// (ADR-0183 operator test aid) through the SAME bounded worker queue and
+    /// per-generation epoch check as ordinary evidence, without handing out a
+    /// full [`SourceEventProducer`] capability.
+    test_tx: SyncSender<(Arc<Generation>, SourceEventObservation)>,
+    max_string_bytes: usize,
     #[cfg(test)]
     publication_hook: Mutex<Option<(Arc<std::sync::Barrier>, Arc<std::sync::Barrier>)>>,
 }
 /// Constant-size acquired view. Loss metadata is sampled separately from immutable
 /// evidence, so repeated fail-closed reads never copy the retained event vector.
-#[derive(Debug, Clone)]
+///
+/// A read is bound to its opaque service instance and exact registry
+/// generation (S2), and to the exact published evidence it carries (S1):
+/// [`SourceEventRegistry::is_current`] fails once any newer evidence (a
+/// cancellation, revision or new boundary) is published, or loss is latched.
+#[derive(Clone)]
 pub struct SourceEventRead {
+    service: u64,
+    generation: Arc<Generation>,
     /// Shared immutable worker evidence; its loss counters may lag this read.
     pub evidence: Arc<SourceEventSnapshot>,
     /// Registered service epoch sampled for this read.
@@ -90,6 +111,17 @@ pub struct SourceEventRead {
     pub degraded: bool,
     /// Latest sampled saturating queue loss count.
     pub queue_overflow: u64,
+}
+impl std::fmt::Debug for SourceEventRead {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SourceEventRead")
+            .field("service", &self.service)
+            .field("source", &self.evidence.source_id)
+            .field("epoch", &self.epoch)
+            .field("degraded", &self.degraded)
+            .field("queue_overflow", &self.queue_overflow)
+            .finish_non_exhaustive()
+    }
 }
 impl std::ops::Deref for SourceEventRead {
     type Target = SourceEventSnapshot;
@@ -116,6 +148,8 @@ impl SourceEventRegistry {
             return None;
         }
         Some(SourceEventRead {
+            service: self.0.id,
+            generation: Arc::clone(generation),
             evidence,
             epoch: generation.epoch,
             degraded,
@@ -124,10 +158,37 @@ impl SourceEventRegistry {
     }
     /// Validate a delayed view at use time. This is an identity check, not an
     /// authorization lease: retirement may still race subsequent consumer work.
+    ///
+    /// Current means ALL of: the same opaque service instance (S2), the same
+    /// registry generation object (not merely an equal source id/epoch), the
+    /// exact same published evidence (no later cancel/revision/boundary, S1),
+    /// and no evidence loss latched since acquisition (S1). This is still a
+    /// point-in-time check: callers revalidate immediately before any effect,
+    /// and a queued (unpublished) cancellation cannot be observed here.
     #[must_use]
     pub fn is_current(&self, acquired: &SourceEventRead) -> bool {
-        self.snapshot(&acquired.source_id)
-            .is_some_and(|current| current.epoch == acquired.epoch)
+        if acquired.service != self.0.id {
+            return false;
+        }
+        self.snapshot(&acquired.source_id).is_some_and(|current| {
+            Arc::ptr_eq(&current.generation, &acquired.generation)
+                && current.epoch == acquired.epoch
+                && Arc::ptr_eq(&current.evidence, &acquired.evidence)
+                && !current.degraded
+                && !acquired.degraded
+                && current.queue_overflow == acquired.queue_overflow
+        })
+    }
+    /// Identity-only check (S2): same service instance and same live registry
+    /// generation. Evidence may have advanced; use ONLY for observational
+    /// display, never for automation eligibility (use [`Self::is_current`]).
+    #[must_use]
+    pub fn same_generation(&self, acquired: &SourceEventRead) -> bool {
+        acquired.service == self.0.id
+            && self.snapshot(&acquired.source_id).is_some_and(|current| {
+                Arc::ptr_eq(&current.generation, &acquired.generation)
+                    && current.epoch == acquired.epoch
+            })
     }
     /// Stop was requested; no snapshots remain usable from this registry.
     #[must_use]
@@ -138,6 +199,59 @@ impl SourceEventRegistry {
     #[must_use]
     pub fn worker_finished(&self) -> bool {
         self.0.finished.load(Ordering::Acquire)
+    }
+    /// Operator test aid (ADR-0183 item 5): submit a synthetic observation
+    /// against this source's CURRENT active generation and epoch, through the
+    /// SAME bounded worker queue and validation [`SourceEventProducer::try_observe`]
+    /// uses, so a test event clears/overlays/automates exactly like real
+    /// evidence and never bypasses capacity or payload bounds. Requires an
+    /// already-active (live or previously connected) generation — this never
+    /// allocates a new source identity or epoch, so it cannot be used to probe
+    /// unknown source ids.
+    ///
+    /// # Errors
+    /// `None` when the source has no active generation (unknown or retired).
+    #[must_use]
+    pub fn inject_test_observation(
+        &self,
+        source: &str,
+        boundary: crate::source_event_test_inject::TestBoundary,
+    ) -> Option<SubmitOutcome> {
+        let slots = self.0.slots.load();
+        let generation = slots.get(source)?;
+        if !generation.active.load(Ordering::Acquire) || self.is_stopped() {
+            return None;
+        }
+        let epoch = generation.epoch;
+        let sequence = match boundary {
+            crate::source_event_test_inject::TestBoundary::Start { .. } => {
+                generation.test_sequence.fetch_add(1, Ordering::AcqRel) + 1
+            }
+            crate::source_event_test_inject::TestBoundary::End => {
+                generation.test_sequence.load(Ordering::Acquire).max(1)
+            }
+        };
+        let observation = boundary.into_numbered_observation(source.to_owned(), epoch, sequence);
+        if observation.key.event_id.is_empty()
+            || observation.key.event_id.len() > self.0.max_string_bytes
+        {
+            generation.degraded.store(true, Ordering::Release);
+            return Some(SubmitOutcome::Invalid);
+        }
+        Some(
+            match self
+                .0
+                .test_tx
+                .try_send((Arc::clone(generation), observation))
+            {
+                Ok(()) => SubmitOutcome::Queued,
+                Err(TrySendError::Full(_)) => {
+                    generation.degraded.store(true, Ordering::Release);
+                    SubmitOutcome::Overflow
+                }
+                Err(TrySendError::Disconnected(_)) => SubmitOutcome::Retired,
+            },
+        )
     }
 }
 /// Nonblocking submission result. Queued is not proof of accepted evidence.
@@ -287,14 +401,17 @@ impl SourceEventService {
     /// # Errors
     /// Returns the OS thread creation error if the worker cannot start.
     pub fn new(limits: ServiceLimits) -> std::io::Result<Self> {
+        let (tx, rx) = mpsc::sync_channel(limits.queue_capacity);
         let shared = Arc::new(Shared {
+            id: NEXT_SERVICE_ID.fetch_add(1, Ordering::Relaxed),
             slots: SwapCell::new(Arc::new(BTreeMap::new())),
             stopped: AtomicBool::new(false),
             finished: AtomicBool::new(false),
+            test_tx: tx.clone(),
+            max_string_bytes: limits.tracker.max_string_bytes,
             #[cfg(test)]
             publication_hook: Mutex::new(None),
         });
-        let (tx, rx) = mpsc::sync_channel(limits.queue_capacity);
         let worker_shared = Arc::clone(&shared);
         let worker = thread::Builder::new()
             .name("source-events".into())
@@ -373,6 +490,7 @@ impl RegistrationController {
             active: AtomicBool::new(true),
             overflow: AtomicU64::new(0),
             degraded: AtomicBool::new(false),
+            test_sequence: AtomicU64::new(0),
             snapshot: SwapCell::new(Arc::new(SourceEventSnapshot {
                 source_id: source.into(),
                 epoch,
@@ -483,6 +601,7 @@ mod tests {
             },
             correlation_id: None,
             asset_id: None,
+            descriptor: None,
         }
     }
     // Pause after the worker's final active check, exercising the actual stale
@@ -525,6 +644,113 @@ mod tests {
         service.shutdown().unwrap();
         assert_eq!(generation.snapshot.load().events.len(), 1);
         assert!(!generation.active.load(Ordering::Acquire));
+    }
+    fn wait_until(
+        view: &SourceEventRegistry,
+        pred: impl Fn(&SourceEventRead) -> bool,
+    ) -> SourceEventRead {
+        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        loop {
+            if let Some(read) = view.snapshot("a") {
+                if pred(&read) {
+                    return read;
+                }
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "evidence never published"
+            );
+            thread::yield_now();
+        }
+    }
+    fn with_boundary(
+        mut o: SourceEventObservation,
+        boundary: EventBoundary,
+        revision: u64,
+    ) -> SourceEventObservation {
+        o.boundary = boundary;
+        o.revision = revision;
+        o
+    }
+    /// S1 regression: a read acquired on a Start must stop being current once a
+    /// same-epoch Cancel, a revised boundary, or evidence loss is published.
+    #[test]
+    fn obsolete_evidence_is_not_current_after_cancel_revision_or_loss() {
+        let service = SourceEventService::new(ServiceLimits::default()).unwrap();
+        let view = service.registry();
+        let producer = service.register("a", 1).unwrap();
+        assert_eq!(producer.try_observe(observation(1)), SubmitOutcome::Queued);
+        let start = wait_until(&view, |r| r.events.len() == 1);
+        assert!(view.is_current(&start));
+        assert!(!start.degraded);
+        // Cancellation published after acquisition.
+        assert_eq!(
+            producer.try_observe(with_boundary(observation(1), EventBoundary::Cancel, 1)),
+            SubmitOutcome::Queued
+        );
+        let cancelled = wait_until(&view, |r| !Arc::ptr_eq(&r.evidence, &start.evidence));
+        assert!(
+            !view.is_current(&start),
+            "pre-cancel read must not stay current"
+        );
+        assert!(view.is_current(&cancelled));
+        assert!(view.same_generation(&start));
+        // Revision of a boundary published after acquisition.
+        let revised = with_boundary(
+            observation(1),
+            EventBoundary::Start {
+                pts_ns: Some(20),
+                duration_ns: None,
+            },
+            2,
+        );
+        assert_eq!(producer.try_observe(revised), SubmitOutcome::Queued);
+        let after = wait_until(&view, |r| !Arc::ptr_eq(&r.evidence, &cancelled.evidence));
+        assert!(!view.is_current(&cancelled));
+        assert!(view.is_current(&after));
+        // Loss latched after acquisition.
+        producer.mark_degraded();
+        assert!(!view.is_current(&after), "loss must invalidate prior reads");
+        let degraded = view.snapshot("a").unwrap();
+        assert!(
+            !view.is_current(&degraded),
+            "degraded evidence is never current"
+        );
+        service.shutdown().unwrap();
+    }
+    /// S2 regression: two private services registering the same id/epoch
+    /// with different evidence never validate each other's reads, including
+    /// after teardown/reconnect of one of them.
+    #[test]
+    fn cross_service_same_id_reads_are_not_current() {
+        let a = SourceEventService::new(ServiceLimits::default()).unwrap();
+        let b = SourceEventService::new(ServiceLimits::default()).unwrap();
+        let (va, vb) = (a.registry(), b.registry());
+        let pa = a.register("a", 1).unwrap();
+        let pb = b.register("a", 1).unwrap();
+        assert_eq!(pa.try_observe(observation(1)), SubmitOutcome::Queued);
+        let ra = wait_until(&va, |r| r.events.len() == 1);
+        let rb = vb.snapshot("a").unwrap();
+        assert!(va.is_current(&ra));
+        assert!(vb.is_current(&rb));
+        assert!(!vb.is_current(&ra), "B must reject A's read");
+        assert!(!va.is_current(&rb), "A must reject B's read");
+        assert!(!vb.same_generation(&ra));
+        // Different cancellation state on B leaves A untouched.
+        assert_eq!(
+            pb.try_observe(with_boundary(observation(1), EventBoundary::Cancel, 1)),
+            SubmitOutcome::Queued
+        );
+        let _ = wait_until(&vb, |r| r.events.len() == 1);
+        assert!(va.is_current(&ra));
+        // Teardown and reconnect on A at a newer epoch: old read is obsolete.
+        drop(pa);
+        assert!(!va.is_current(&ra));
+        let _pa2 = a.register("a", 2).unwrap();
+        assert!(!va.is_current(&ra));
+        assert!(!va.same_generation(&ra));
+        a.shutdown().unwrap();
+        b.shutdown().unwrap();
     }
     #[test]
     fn repeated_overflow_reads_reuse_evidence_arc() {
@@ -603,6 +829,7 @@ mod source_event_stress {
             },
             correlation_id: None,
             asset_id: Some("stress-asset".into()),
+            descriptor: None,
         }
     }
 

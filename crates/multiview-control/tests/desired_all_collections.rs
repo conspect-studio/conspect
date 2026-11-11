@@ -163,7 +163,7 @@ async fn delete(router: &Router, uri: &str) {
 
 #[tokio::test]
 async fn overlay_edits_survive_restart_and_unrelated_commits() {
-    let (_dir, path, router) = running_with_desired().await;
+    let (_dir, path, router) = Box::pin(running_with_desired()).await;
     let uri = "/api/v1/overlays/ov_clock";
     upsert(
         &router,
@@ -195,7 +195,7 @@ async fn overlay_edits_survive_restart_and_unrelated_commits() {
 
 #[tokio::test]
 async fn probe_edits_survive_restart_and_unrelated_commits() {
-    let (_dir, path, router) = running_with_desired().await;
+    let (_dir, path, router) = Box::pin(running_with_desired()).await;
     let uri = "/api/v1/probes/probe-1";
     let probe = |threshold: u32| {
         json!({"name": "p", "body": {
@@ -217,7 +217,7 @@ async fn probe_edits_survive_restart_and_unrelated_commits() {
 
 #[tokio::test]
 async fn device_and_sync_group_edits_survive_restart_and_unrelated_commits() {
-    let (_dir, path, router) = running_with_desired().await;
+    let (_dir, path, router) = Box::pin(running_with_desired()).await;
     for (id, octet) in [("dev-left", "41"), ("dev-right", "42")] {
         upsert(
             &router,
@@ -265,7 +265,7 @@ async fn device_and_sync_group_edits_survive_restart_and_unrelated_commits() {
 
 #[tokio::test]
 async fn salvo_and_tally_profile_edits_survive_restart_and_unrelated_commits() {
-    let (_dir, path, router) = running_with_desired().await;
+    let (_dir, path, router) = Box::pin(running_with_desired()).await;
     let salvo = |name: &str| json!({"id": "wide", "display_name": name, "tally": [{"cell": "cell_a", "color": "Red"}]});
     upsert(&router, "/api/v1/salvos/wide", true, &salvo("Wide")).await;
     upsert(&router, "/api/v1/salvos/wide", true, &salvo("Wide v2")).await;
@@ -341,7 +341,7 @@ async fn etag_survives_restart(
 
 #[tokio::test]
 async fn resource_names_survive_restart() {
-    let (_dir, path, router) = running_with_desired().await;
+    let (_dir, path, router) = Box::pin(running_with_desired()).await;
     let uri = "/api/v1/overlays/ov_clock";
     let body = json!({"kind": "clock", "target": "canvas"});
     upsert(&router, uri, false, &json!({"name": "first", "body": body})).await;
@@ -359,7 +359,7 @@ async fn resource_names_survive_restart() {
 
 #[tokio::test]
 async fn resource_etags_survive_restart_for_every_family() {
-    let (_dir, path, router) = running_with_desired().await;
+    let (_dir, path, router) = Box::pin(running_with_desired()).await;
     etag_survives_restart(
         &router,
         &path,
@@ -395,7 +395,7 @@ async fn resource_etags_survive_restart_for_every_family() {
 /// reference before anything is stored, rather than poisoning the envelope.
 #[tokio::test]
 async fn a_dangling_reference_is_refused_before_any_durable_write() {
-    let (_dir, path, router) = running_with_desired().await;
+    let (_dir, path, router) = Box::pin(running_with_desired()).await;
     let before = std::fs::read(path.parent().unwrap().join(".multiview/desired.json")).unwrap();
     let response = send(
         &router,

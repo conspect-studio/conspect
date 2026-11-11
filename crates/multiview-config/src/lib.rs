@@ -31,33 +31,43 @@
 
 pub mod api;
 pub mod audio;
+pub mod catalogues;
 pub mod device;
 pub mod diff;
 pub mod discovery;
 pub mod error;
 pub mod failover;
+pub mod graphics;
 pub mod grid;
+pub mod iptv;
 pub mod layout_doc;
 pub mod limits;
 pub mod media;
+pub mod media_fill;
 pub mod multicast;
+pub mod network_diagnostics;
 pub mod origin;
 pub mod placement;
+pub mod playback;
 pub mod probe;
 pub mod program;
+pub mod rendition;
 pub mod routing;
 pub mod salvo;
 pub mod schema;
+pub mod switcher;
 pub mod sync_group;
 pub mod tally;
 pub mod timer;
 pub mod timing;
 pub mod tls;
 pub mod wall;
+pub mod weather;
 pub mod webrtc;
 
 use std::collections::{HashMap, HashSet};
 
+use chrono::{DateTime, Utc};
 use multiview_core::layout::{
     Canvas as CoreCanvas, Cell as CoreCell, FitMode, Layout as CoreLayout,
 };
@@ -66,28 +76,46 @@ use multiview_core::stream::StreamKind as CoreStreamKind;
 pub use api::{ApiConfig, ApiKeyConfig, ApiKeyRole};
 use audio::PROGRAM_TRACK as PROGRAM_TRACK_NAME;
 pub use audio::{
-    AudioChannels, AudioRoute, AudioRouting, OutputAudio, OutputAudioCapability, OutputAudioMode,
-    TrackCapacity, TrackDelivery, PROGRAM_TRACK,
+    diff_track_changes, propagate_routing_change, AudioChannels, AudioRoute, AudioRouting,
+    OutputAudio, OutputAudioCapability, OutputAudioMode, OutputAudioUpdate, TrackCapacity,
+    TrackDelivery, PROGRAM_TRACK,
 };
+pub use catalogues::{CataloguesConfig, IptvOrgConfig};
 pub use device::{Device, DeviceAuth, DeviceDisplay, DeviceDriver, DisplayAssign, ReconnectPolicy};
 pub use diff::{ConfigDiff, OverlayChange, SourceChange};
 pub use discovery::DiscoveryConfig;
 pub use error::ConfigError;
 pub use failover::{default_failover_slate, FailoverSlate};
+pub use graphics::{
+    DataKind, DataProviderKind, GraphicsBus, GraphicsChannel, GraphicsConfig, GraphicsDataSource,
+    GraphicsItem, GraphicsStyle, TemplateSpec, Transition, TransitionKind,
+};
+pub use iptv::{
+    IptvConfig, IptvEntry, IptvEntryKind, DEFAULT_GUIDE_REFRESH_MINUTES, MAX_GUIDE_REFRESH_MINUTES,
+    MAX_IPTV_ENTRIES, MIN_GUIDE_REFRESH_MINUTES,
+};
 pub use layout_doc::{LayoutCanvas, LayoutDocument};
 pub use media::{
     frames_for_ms, EofPolicy, MediaAsset, MediaAssetKind, MediaLibrary, MediaPlayer,
     MediaPlayerAudio,
 };
+pub use media_fill::{
+    CaptureMode, DuringRefresh, FillRefresh, FrameTiming, MediaFill, MediaFillKind, ParamValue,
+    SlotStorage, TemplateConstraints, TermsAcceptance, ViewBackground, WebCaptureView,
+};
 pub use multicast::{
     classify, MulticastClass, MulticastGroup, MulticastIface, PacketCount, RejectReason,
     RejectedGroup,
 };
+pub use network_diagnostics::NetworkDiagnosticsConfig;
 pub use origin::{Origin, OriginParseError};
 pub use placement::{DevicePin, MigrationPolicy, PinVendor, PlacementConfig, PlacementWeights};
+pub use playback::{
+    hls_mount_segment, host_header_hostname, is_ip_literal, resolve_hls_mounts,
+    resolve_public_scheme, HlsMountRoute, PlaybackContext, PlaybackUrl,
+};
 pub use probe::{DetectionZone, Dwell, LoudnessTarget, Probe, ProbeKind};
 pub use program::{ProgramId, ProgramKind, ProgramSpec};
-pub mod rendition;
 pub use rendition::{
     plan_from_config, AudioRenditionKey, AudioTrackId, EncodeCapabilities, MuxBinding,
     OutputTransport, RenditionAudioCodec, RenditionColorKey, RenditionPlan, RenditionPlanError,
@@ -95,18 +123,21 @@ pub use rendition::{
     MAX_VIDEO_RENDITIONS_PER_PROGRAM,
 };
 pub use routing::{
-    AudioCrosspoint, OutputCrosspoint, OutputRef, RoutingRefs, RoutingTable, StreamRef,
+    AudioCrosspoint, OutputBus, OutputCrosspoint, OutputRef, RoutingRefs, RoutingTable, StreamRef,
     StreamSelector, SubtitleCrosspoint, VideoCrosspoint, MAIN_PROGRAM,
 };
 pub use salvo::{Salvo, SourceRecall, TallyRecall, UmdRecall};
 pub use schema::{
     lower_rist_url, Border, Canvas, CanvasColor, Cell, CellQos, CellSource, ClockFaceConfig,
-    ColorOverride, DisplayModeSpec, Fps, Layout, MetadataCapability, MetadataField,
-    OrientationMechanism, OrientationMode, OrientationTagCapability, Output, OutputFlip,
-    OutputMetadata, OutputMetadataPlan, OutputOrientation, OutputTimedMetadata, Overlay, Rect,
-    RistAesBits, RistEncryption, RistOptions, RistPeer, RistProfile, RistUrlError, Source,
-    SourceAuth, SourceKind, SrtBackend, SrtEncryption, SrtKeyLength, SrtMode, SrtOptions,
+    ColorOverride, DisplayModeSpec, EpgMode, EpgSource, EventsConfig, Fps, Layout,
+    MetadataCapability, MetadataField, OrientationMechanism, OrientationMode,
+    OrientationTagCapability, OriginFollow, Output, OutputFlip, OutputMetadata, OutputMetadataPlan,
+    OutputOrientation, OutputTimedMetadata, Overlay, PlaylistMetadata, Rect, RistAesBits,
+    RistEncryption, RistOptions, RistPeer, RistProfile, RistUrlError, Source, SourceActivation,
+    SourceAuth, SourceKind, SourceOrigin, SrtBackend, SrtEncryption, SrtKeyLength, SrtMode,
+    SrtOptions,
 };
+pub use switcher::{MixEffectsConfig, SwitcherConfig};
 pub use sync_group::{SyncGroup, SyncGroupMode, SyncMember};
 pub use tally::{BitColor, IndexCell, TallyProfile};
 pub use timer::{
@@ -116,6 +147,7 @@ pub use timer::{
 pub use timing::{TimingConfig, MAX_LINK_OFFSET_MS, MAX_PTP_UTC_OFFSET_S};
 pub use tls::TlsConfig;
 pub use wall::{HeadConfig, WallBezel, WallConfig};
+pub use weather::{WeatherBackground, WeatherConfig, WeatherLocation, WeatherTemplate};
 pub use webrtc::{DurationString, IceServerConfig, IceServerKindConfig, WebrtcConfig};
 
 /// The cold-start policy (ADR-W024): where `multiview run` takes its starting
@@ -175,6 +207,32 @@ pub struct ControlConfig {
     /// are refused).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cast_media_base: Option<String>,
+    /// The externally-reachable **hostname** (no scheme, no port) viewer
+    /// playback URLs are derived against (`GET
+    /// /api/v1/outputs/{id}/playback`): substituted for a wildcard/loopback
+    /// listener bind when building an `srt://`/`rist://` caller URL, and the
+    /// host of an absolute `/hls/{mount}` playlist URL. Absent ⇒ the
+    /// control plane falls back to the request's own `Host` header (an nginx
+    /// reverse proxy passes `Host` through unchanged, so this is usually
+    /// unnecessary); when neither is available the playback route returns an
+    /// honest "no public host known" note instead of a guessed URL. Unlike
+    /// [`cast_media_base`](Self::cast_media_base) this is a **bare
+    /// hostname/IP literal**, no scheme and no port (every output's own port
+    /// is substituted in per-URL).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub public_host: Option<String>,
+    /// An explicit override for the scheme (`"http"` or `"https"`) used to
+    /// build an absolute viewer URL (the HLS playlist, the WHEP play URL) —
+    /// see [`multiview_config::resolve_public_scheme`] for the full
+    /// priority order. Absent ⇒ the per-request `X-Forwarded-Proto` header
+    /// decides, falling back to `"https"` when
+    /// [`public_host`](Self::public_host) is configured, else `"http"`. Set
+    /// this only when the front end does NOT set `X-Forwarded-Proto` (the
+    /// production nginx config does, so this override is normally
+    /// unnecessary). Validated as exactly `"http"` or `"https"` by
+    /// [`MultiviewConfig::validate`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub public_scheme: Option<String>,
     /// The outbound-dial SSRF allowlist (SEC-02/SEC-04, CWE-918, ADR-M013): the
     /// operator CIDRs the managed-device poller and Cast session actor lock their
     /// outbound dial to. IPv6-first (e.g. `["fd00:db8::/32", "192.168.0.0/16"]`);
@@ -232,10 +290,61 @@ pub struct ControlConfig {
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SystemConfig {
+    /// Source demand lifecycle tuning. Absent means the defaults.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub demand: Option<DemandSettings>,
     /// The NDI® SDK runtime license-acceptance gate. Absent ⇒ NDI I/O is refused
     /// (`ndi_unlicensed`) and never started.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ndi: Option<NdiSystemConfig>,
+    /// `YouTube` live-ingest resolver settings (ADR-0015). Absent ⇒ `yt-dlp` is
+    /// discovered on `PATH` only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub youtube: Option<YoutubeSystemConfig>,
+}
+
+/// Process-wide `YouTube` resolver settings (ADR-0015 §6).
+///
+/// `yt-dlp` is discovered at runtime, never vendored. The service user's `PATH`
+/// may not include where an operator installed it (e.g. `~/.local/bin`), so this
+/// lets an operator pin an explicit path. The `MULTIVIEW_YOUTUBE_YT_DLP_PATH`
+/// environment variable (12-factor; matches the existing `MULTIVIEW_*` env
+/// pattern) takes precedence over this config field when both are set, mirroring
+/// how other `MULTIVIEW_*` overrides are read directly from the process
+/// environment rather than only from config.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct YoutubeSystemConfig {
+    /// An explicit path to the `yt-dlp` binary. Absent ⇒ resolved on `PATH` as
+    /// `"yt-dlp"`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub yt_dlp_path: Option<String>,
+}
+
+/// `[system.demand]`: how `on_demand` sources start and stop around their
+/// consumers.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DemandSettings {
+    /// "Close after": seconds an `on_demand` source keeps running after its
+    /// last consumer leaves. Default 30. (`linger_secs` is read as an alias.)
+    #[serde(
+        default,
+        alias = "linger_secs",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub close_after_secs: Option<u32>,
+    /// "Start timeout": seconds a start may take to its first media before the
+    /// source reads `failed`. Default 20.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub start_timeout_secs: Option<u32>,
+    /// How many sources may start at once. Default 8.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_concurrent_starts: Option<u32>,
+    /// How many timed-out source opens may still hold a thread before new
+    /// starts are refused. Default 8.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_stuck_opens: Option<u32>,
 }
 
 /// The operator's NDI® SDK runtime license acceptance (ADR-0008 §7.5).
@@ -303,6 +412,9 @@ pub struct MultiviewConfig {
     /// Output sinks/servers.
     #[serde(default)]
     pub outputs: Vec<Output>,
+    /// Program declarations; absent desugars to the legacy `main` program.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub programs: Vec<ProgramSpec>,
     /// Content-aware fault probes (black/freeze/silence/loudness), per cell.
     #[serde(default)]
     pub probes: Vec<Probe>,
@@ -332,6 +444,12 @@ pub struct MultiviewConfig {
     /// Absent ⇒ only the built-in Cast + NDI types are browsed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub discovery: Option<DiscoveryConfig>,
+    /// External source catalogues (`[catalogues.iptv_org]`, ADR-M015).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub catalogues: Option<CataloguesConfig>,
+    /// Network-path diagnostics (`[network_diagnostics]`, docs/io/iptv-org.md §3a).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub network_diagnostics: Option<NetworkDiagnosticsConfig>,
     /// The management control-plane listener. When present, `multiview run`
     /// serves the API + docs (+ web UI) alongside the engine; absent ⇒ headless.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -360,6 +478,9 @@ pub struct MultiviewConfig {
     /// that consumes these routes is `multiview-audio` + the engine (AUD-3/AUD-4).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub audio: Option<AudioRouting>,
+    /// Typed Program/Preview M/E configuration; absent preserves legacy output.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub switcher: Option<SwitcherConfig>,
     /// The per-stream decoupled-routing crosspoint table (ADR-0034 / RT-4): the
     /// broadcast router/multiviewer model where inputs, layouts and outputs are
     /// independent resources wired by per-stream crosspoints. **Absent ⇒ the
@@ -393,6 +514,47 @@ pub struct MultiviewConfig {
     /// Bound onto the canvas by [`SourceKind::MediaPlayer`].
     #[serde(default)]
     pub media_players: Vec<MediaPlayer>,
+    /// Declarative VT clip fills (ADR-0100 Decision 1, authored as
+    /// `[[media_fill]]`): the desired state for how a media player's clip is
+    /// produced — a `web_capture` of a site template or a `url_fetch`. Each fill
+    /// binds exactly one declared [`MediaPlayer`]. A fill edit is **job intent**,
+    /// not an engine-topology change: [`ConfigDiff`] reports it as the separate
+    /// live-applicable `media_fills` section, never as restart-class `media`.
+    /// Absent ⇒ no fills (the key is not emitted). The job runner, clip manifest
+    /// and API surface live outside this crate.
+    #[serde(default, rename = "media_fill", skip_serializing_if = "Vec::is_empty")]
+    pub media_fills: Vec<MediaFill>,
+    /// BOM weather locations (`[weather]`): the forecast/observation products
+    /// the management-plane poller fetches and `weather` sources render.
+    /// Absent ⇒ no locations (nothing is fetched).
+    #[serde(default, skip_serializing_if = "WeatherConfig::is_empty")]
+    pub weather: WeatherConfig,
+    /// Managed IPTV playlist + XMLTV guide publication (epg-playlist). Absent ⇒
+    /// nothing is published (`/iptv/*` answers 404). Presentation only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub iptv: Option<IptvConfig>,
+    /// The Graphics (CG) module (`[graphics]`): typed data sources, prepared
+    /// items and playout channels. Absent ⇒ empty. Legacy `[weather]`
+    /// locations remain effective `bom_weather` data sources.
+    ///
+    /// Boxed: one pointer in the (often moved/cloned) config document.
+    #[serde(default, skip_serializing_if = "graphics::is_empty_boxed")]
+    pub graphics: Box<GraphicsConfig>,
+    /// `[events]`: retention bounds of the raw marker journal.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub events: Option<EventsConfig>,
+}
+
+/// Shape-check the id a weather / graphics source references.
+fn graphics_kind_refs(source_id: &str, kind: &SourceKind) -> Result<(), ConfigError> {
+    match kind {
+        SourceKind::Weather { location, .. } => weather::validate_source_ref(source_id, location),
+        SourceKind::Graphic { item: target }
+        | SourceKind::GraphicsChannel {
+            channel: target, ..
+        } => graphics::validate_source_ref(source_id, "target", target),
+        _ => Ok(()),
+    }
 }
 
 /// Parse a `#RGB` / `#RRGGBB` hex color into its `(r, g, b)` bytes.
@@ -470,6 +632,45 @@ impl MultiviewConfig {
         serde_json::to_string_pretty(self).map_err(|e| ConfigError::JsonSerialize(e.to_string()))
     }
 
+    /// Return declared programs, or the implicit legacy main program.
+    #[must_use]
+    pub fn effective_programs(&self) -> Vec<ProgramSpec> {
+        if self.programs.is_empty() {
+            vec![ProgramSpec::main_multiview(
+                self.canvas.clone(),
+                self.layout.clone(),
+                self.cells.clone(),
+                self.overlays.clone(),
+                self.outputs.clone(),
+            )]
+        } else {
+            self.programs.clone()
+        }
+    }
+
+    /// Keep the sole declared program consistent with live top-level edits.
+    pub fn refresh_single_program(&mut self) {
+        if let [program] = self.programs.as_mut_slice() {
+            let ProgramKind::Multiview {
+                canvas,
+                layout,
+                cells,
+                overlays,
+            } = &mut program.kind;
+            canvas.clone_from(&self.canvas);
+            layout.clone_from(&self.layout);
+            cells.clone_from(&self.cells);
+            overlays.clone_from(&self.overlays);
+            program.outputs.clone_from(&self.outputs);
+        }
+    }
+
+    /// Program audio is declared, never silently enabled for legacy configs.
+    #[must_use]
+    pub fn declares_program_audio(&self) -> bool {
+        self.audio.is_some() || self.switcher.is_some()
+    }
+
     /// Validate every semantic invariant this crate owns.
     ///
     /// Enforces, in addition to [`multiview_core::layout::Layout::validate`] on the
@@ -496,13 +697,47 @@ impl MultiviewConfig {
     ///   (`_name._tcp` / `_name._udp`, optionally `.local.`-suffixed);
     /// - the `[webrtc]` section (ADR-0048 §9) carries a usable non-zero media
     ///   port, session pool, idle-GC horizon, advertised addresses and CORS
-    ///   origins.
+    ///   origins;
+    /// - every `[[media_fill]]` id/template id is well-shaped, its kind payload
+    ///   is consistent, and its view, parameters, URL and terms block pass
+    ///   [`MediaFill::validate_with`] — including any template capture
+    ///   constraint supplied through [`TemplateConstraints`], and (under an
+    ///   injected clock) a `terms.accepted_at` that is not in the future.
+    ///
+    /// This is the clock-free, constraint-free form: see
+    /// [`validate_with`](Self::validate_with) for the deterministic form used by
+    /// callers that own a clock or the template registry.
     ///
     /// # Errors
     ///
     /// Returns [`ConfigError::Validation`] (or a more specific variant from the
     /// grid solver / cadence parse) naming the first violated invariant.
     pub fn validate(&self) -> Result<(), ConfigError> {
+        self.validate_with(None, None)
+    }
+
+    /// [`validate`](Self::validate) with an optional [`TemplateConstraints`]
+    /// hook and an optional injected `now` (ADR-0101 Decisions 1/7).
+    ///
+    /// `constraints` supplies the per-template capture rules the generic config
+    /// schema deliberately does not know — `multiview-webengine` provides the
+    /// concrete implementation once templates land (ADR-0101 Decision 1);
+    /// `None` applies none. `now` is the clock a media fill's
+    /// `terms.accepted_at` is checked against; `None` skips that check because
+    /// the default build carries no clock (the API stamps the timestamp and the
+    /// runner enforces the terms-version match — see [`TermsAcceptance`]).
+    ///
+    /// Every other invariant is enforced identically in all three forms.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ConfigError::Validation`] (or a more specific variant from the
+    /// grid solver / cadence parse) naming the first violated invariant.
+    pub fn validate_with(
+        &self,
+        constraints: Option<&dyn TemplateConstraints>,
+        now: Option<DateTime<Utc>>,
+    ) -> Result<(), ConfigError> {
         if self.schema_version == 0 {
             return Err(ConfigError::Validation(
                 "schema_version must be >= 1".to_owned(),
@@ -510,6 +745,12 @@ impl MultiviewConfig {
         }
 
         self.validate_unique_ids()?;
+        if let Some(iptv) = &self.iptv {
+            // Structural only: references are resolved when the publication is
+            // edited and again when it is served, so deleting a published
+            // source/output is never blocked — it simply drops out.
+            iptv.validate(None, None)?;
+        }
         if self.sources.len() > MAX_ADMITTED_SOURCES {
             return Err(ConfigError::Validation(format!(
                 "sources exceeds the live source capacity of {MAX_ADMITTED_SOURCES}"
@@ -518,6 +759,7 @@ impl MultiviewConfig {
         self.validate_sources()?;
         self.validate_cell_bindings()?;
         self.validate_outputs()?;
+        self.validate_programs_and_switcher()?;
         self.validate_audio()?;
         self.validate_probes()?;
         self.validate_tally_profiles()?;
@@ -526,13 +768,18 @@ impl MultiviewConfig {
         self.validate_devices()?;
         self.validate_sync_groups()?;
         self.validate_discovery()?;
+        if let Some(iptv) = self.catalogues.as_ref().and_then(|c| c.iptv_org.as_ref()) {
+            iptv.validate()?;
+        }
         self.validate_api()?;
         self.validate_control()?;
         self.validate_webrtc()?;
         self.validate_system()?;
         self.validate_placement()?;
         self.validate_routing()?;
-        self.validate_media()?;
+        self.validate_media_with(constraints, now)?;
+        self.weather.validate()?;
+        self.graphics.validate(&self.weather)?;
         if let Some(timing) = &self.timing {
             timing.validate()?;
         }
@@ -546,6 +793,17 @@ impl MultiviewConfig {
         })?;
 
         Ok(())
+    }
+
+    /// [`validate`](Self::validate) with a deterministic injected `now`
+    /// (ADR-0101 Decision 7): a media fill's `terms.accepted_at` may not lead
+    /// `now` by more than five minutes. No template constraints are applied.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ConfigError::Validation`] naming the first violated invariant.
+    pub fn validate_with_now(&self, now: DateTime<Utc>) -> Result<(), ConfigError> {
+        self.validate_with(None, Some(now))
     }
 
     /// Validate per-source kind-specific fields so a config that validates cannot
@@ -691,8 +949,17 @@ impl MultiviewConfig {
     /// - every player `default` resolves to a declared asset, and every
     ///   [`SourceKind::Still`] / [`SourceKind::MediaPlayer`] binding resolves to a
     ///   declared asset / player;
-    /// - the MVP bound of **at most two** media players is respected.
-    fn validate_media(&self) -> Result<(), ConfigError> {
+    /// - the MVP bound of **at most two** media players is respected;
+    /// - every [`MediaFill`] id is unique, its `player` is a declared player,
+    ///   at most one fill targets each player, and the fill itself passes
+    ///   [`MediaFill::validate_with`] under the caller's optional template
+    ///   constraints and injected clock (ADR-0100 Decision 1, ADR-0101
+    ///   Decision 7).
+    fn validate_media_with(
+        &self,
+        constraints: Option<&dyn TemplateConstraints>,
+        now: Option<DateTime<Utc>>,
+    ) -> Result<(), ConfigError> {
         // Asset ids (also the resolution set for `Still`/player `default` refs).
         let mut asset_ids: HashSet<&str> = HashSet::new();
         if let Some(library) = &self.media_library {
@@ -732,6 +999,36 @@ impl MultiviewConfig {
                         player.id
                     )));
                 }
+            }
+        }
+
+        // Declarative VT clip fills (ADR-0100 Decision 1): ids are unique, the
+        // bound `player` is a declared player, and at most one fill targets each
+        // player (two fills would fight over one slot). Per-fill rules (kind,
+        // durations, URL, terms, alpha) live in `MediaFill::validate`.
+        let mut fill_ids: HashSet<&str> = HashSet::with_capacity(self.media_fills.len());
+        let mut filled_players: HashMap<&str, &str> =
+            HashMap::with_capacity(self.media_fills.len());
+        for fill in &self.media_fills {
+            fill.validate_with(constraints, now)?;
+            if !fill_ids.insert(fill.id.as_str()) {
+                return Err(ConfigError::Validation(format!(
+                    "duplicate media fill id {:?}",
+                    fill.id
+                )));
+            }
+            if !player_ids.contains(fill.player.as_str()) {
+                return Err(ConfigError::Validation(format!(
+                    "media fill {:?} references unknown media player {:?}",
+                    fill.id, fill.player
+                )));
+            }
+            if let Some(previous) = filled_players.insert(fill.player.as_str(), fill.id.as_str()) {
+                return Err(ConfigError::Validation(format!(
+                    "media player {:?} is targeted by media fills {previous:?} and {:?}: at most \
+                     one fill per player (ADR-0100 decision 1)",
+                    fill.player, fill.id
+                )));
             }
         }
 
@@ -827,6 +1124,40 @@ impl MultiviewConfig {
                     return Err(ConfigError::Validation(format!(
                         "control.cast_media_base {base:?} must be an http:// or https:// base \
                          URL (Cast receivers fetch HLS over HTTP)"
+                    )));
+                }
+            }
+            if let Some(host) = &control.public_host {
+                // A bare hostname/IP literal: non-empty, no scheme, no path/query,
+                // no port (every output's own port is substituted in per-URL). A
+                // bracketed IPv6 literal is accepted and kept bracketed.
+                if host.is_empty() {
+                    return Err(ConfigError::Validation(
+                        "control.public_host is empty (omit the field to fall back to the \
+                         request Host header)"
+                            .to_owned(),
+                    ));
+                }
+                if host.contains("://") {
+                    return Err(ConfigError::Validation(format!(
+                        "control.public_host {host:?} must be a bare hostname/IP literal, not a \
+                         URL (no scheme)"
+                    )));
+                }
+                let unbracketed = host.strip_prefix('[').and_then(|s| s.strip_suffix(']'));
+                let is_valid_ipv6_literal =
+                    unbracketed.is_some_and(|inner| inner.parse::<std::net::Ipv6Addr>().is_ok());
+                if host.contains(['/', '?', '#', ':']) && !is_valid_ipv6_literal {
+                    return Err(ConfigError::Validation(format!(
+                        "control.public_host {host:?} must be a bare hostname/IP literal (no \
+                         path, query, or port) — bracket an IPv6 literal as [::1]"
+                    )));
+                }
+            }
+            if let Some(scheme) = &control.public_scheme {
+                if scheme != "http" && scheme != "https" {
+                    return Err(ConfigError::Validation(format!(
+                        "control.public_scheme {scheme:?} must be exactly \"http\" or \"https\""
                     )));
                 }
             }
@@ -1066,6 +1397,46 @@ impl MultiviewConfig {
         Ok(())
     }
 
+    fn validate_programs_and_switcher(&self) -> Result<(), ConfigError> {
+        if self.programs.len() > 1 {
+            return Err(ConfigError::Validation(
+                "multiple programs require the MP-7 runtime; exactly one is supported".into(),
+            ));
+        }
+        if let [program] = self.programs.as_slice() {
+            let ProgramKind::Multiview {
+                canvas,
+                layout,
+                cells,
+                overlays,
+            } = &program.kind;
+            if canvas != &self.canvas
+                || layout != &self.layout
+                || cells != &self.cells
+                || overlays != &self.overlays
+                || program.outputs != self.outputs
+            {
+                return Err(ConfigError::Validation(format!(
+                    "declared program {:?} disagrees with the active legacy canvas/layout/cells/overlays/outputs",
+                    program.id
+                )));
+            }
+        }
+        if let Some(switcher) = &self.switcher {
+            let sources: Vec<_> = self
+                .sources
+                .iter()
+                .map(|source| source.id.as_str())
+                .collect();
+            let program_id = self
+                .programs
+                .first()
+                .map_or(ProgramId::MAIN, |p| p.id.as_str());
+            switcher.validate(&sources, &[program_id])?;
+        }
+        Ok(())
+    }
+
     /// Ensure outputs are sane (at least one; each with a non-empty codec where a
     /// codec applies; a non-empty, unique stable id — ADR-0034 / RT-12).
     ///
@@ -1216,13 +1587,16 @@ impl MultiviewConfig {
             }
         }
 
-        // OUTPUT: each declared output → an output crosspoint on the single
-        // "main" program (until ADR-0030's ProgramSet lands), addressed by the
-        // output's stable id (explicit operator id, or the derived label — RT-12).
+        // OUTPUT: all legacy outputs carry the sole on-air program bus.
+        let program = self
+            .programs
+            .first()
+            .map_or(MAIN_PROGRAM, |p| p.id.as_str());
         for output in &self.outputs {
             table.output.push(OutputCrosspoint {
                 output: output.id(),
-                program: MAIN_PROGRAM.to_owned(),
+                program: program.to_owned(),
+                bus: OutputBus::Program,
             });
         }
 
@@ -1247,6 +1621,29 @@ impl MultiviewConfig {
         let Some(table) = &self.routing else {
             return Ok(());
         };
+        let program = self
+            .programs
+            .first()
+            .map_or(ProgramId::MAIN, |p| p.id.as_str());
+        for xp in &table.output {
+            if xp.program != program {
+                return Err(ConfigError::Validation(format!(
+                    "output {:?} references undeclared program {:?}",
+                    xp.output, xp.program
+                )));
+            }
+            if xp.bus != OutputBus::Program
+                && self
+                    .switcher
+                    .as_ref()
+                    .is_none_or(|s| s.mix_effects.is_empty())
+            {
+                return Err(ConfigError::Validation(format!(
+                    "output {:?} selects a switcher bus without a declared M/E",
+                    xp.output
+                )));
+            }
+        }
 
         let tracks = self.selectable_tracks();
         let output_ids = self.output_ids();
@@ -1425,7 +1822,59 @@ fn parse_fit(fit: Option<&str>) -> FitMode {
     }
 }
 
+/// Validate an HTTP header value carried in config: non-empty, printable
+/// (no control characters, so no CR/LF), at most 1 KiB.
+fn validate_header_value(v: &str) -> Result<(), String> {
+    if v.is_empty() {
+        return Err("must not be empty".to_owned());
+    }
+    if v.len() > 1024 {
+        return Err("must be at most 1024 bytes".to_owned());
+    }
+    if v.chars().any(char::is_control) {
+        return Err("must be printable (no CR/LF or control characters)".to_owned());
+    }
+    Ok(())
+}
+
 impl Source {
+    /// Validate the optional `events.automation` rule bounds (ADR-0183).
+    fn validate_automation(&self) -> Result<(), ConfigError> {
+        if let Some(rule) = self.events.as_ref().and_then(|e| e.automation.as_ref()) {
+            rule.validate(&self.id).map_err(|e| {
+                ConfigError::Validation(format!("source {:?} events.automation: {e}", self.id))
+            })?;
+        }
+        Ok(())
+    }
+
+    /// Provenance block and HLS request-header checks (IPTV-ORG, ADR-M015).
+    fn validate_origin_and_headers(&self) -> Result<(), ConfigError> {
+        if let Some(origin) = &self.origin {
+            if origin.provider.trim().is_empty() || origin.provider.len() > 64 {
+                return Err(ConfigError::Validation(format!(
+                    "source {:?} origin.provider must be 1..=64 characters",
+                    self.id
+                )));
+            }
+        }
+        if let SourceKind::Hls {
+            user_agent,
+            referrer,
+            ..
+        } = &self.kind
+        {
+            for (name, value) in [("user_agent", user_agent), ("referrer", referrer)] {
+                if let Some(v) = value {
+                    validate_header_value(v).map_err(|e| {
+                        ConfigError::Validation(format!("source {:?} {name}: {e}", self.id))
+                    })?;
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Validate this source's per-item semantics — the same checks
     /// [`MultiviewConfig::validate`] applies per source (id non-empty, GPU pin,
     /// solid hex colour, clock timezone bounds). Document-level rules
@@ -1434,17 +1883,23 @@ impl Source {
     /// # Errors
     ///
     /// Returns [`ConfigError::Validation`] naming the violated rule.
+    #[allow(clippy::too_many_lines)]
+    // reason: one exhaustive per-kind match (every SourceKind must be classified
+    // here, so a new kind cannot skip validation); splitting it would hide that.
     pub fn validate(&self) -> Result<(), ConfigError> {
         if self.id.is_empty() {
             return Err(ConfigError::Validation(
                 "a source has an empty id".to_owned(),
             ));
         }
+        graphics_kind_refs(&self.id, &self.kind)?;
         if let Some(pin) = &self.gpu_pin {
             pin.validate().map_err(|e| {
                 ConfigError::Validation(format!("source {:?} gpu_pin: {e}", self.id))
             })?;
         }
+        self.validate_automation()?;
+        self.validate_origin_and_headers()?;
         match &self.kind {
             SourceKind::Solid { color } => {
                 if parse_hex_color(color).is_none() {
@@ -1503,33 +1958,7 @@ impl Source {
                 target,
                 on_target,
                 ..
-            } => {
-                // The target's `at` must parse and any IANA `timezone` must be a
-                // known id (typed error, never a panic — ADR-0047 §5.2).
-                target.validate().map_err(|e| {
-                    ConfigError::Validation(format!("source {:?}: {e}", self.id))
-                })?;
-                // `recur` is only meaningful for a recurring time-of-day target;
-                // reject it on a `date_time` or a non-recurring time-of-day so the
-                // configuration is unambiguous (it would otherwise silently
-                // degrade to `hold`).
-                if matches!(on_target, crate::timer::TimerOnTarget::Recur) {
-                    let recurs = matches!(
-                        target,
-                        crate::timer::TimerTarget::TimeOfDay {
-                            recur_daily: true,
-                            ..
-                        }
-                    );
-                    if !recurs {
-                        return Err(ConfigError::Validation(format!(
-                            "source {:?}: on_target = \"recur\" requires a time_of_day target \
-                             with recur_daily = true",
-                            self.id
-                        )));
-                    }
-                }
-            }
+            } => validate_timer_source(&self.id, target, *on_target)?,
             // RIST (ADR-0095): the typed options validate structurally here — a
             // non-empty bonding list is rejected on the Tier-0 build (FFmpeg's
             // protocol is single-peer; honest capability reporting, never a
@@ -1550,6 +1979,9 @@ impl Source {
             // ingest by an external `yt-dlp` (ADR-0015), so like the other URL
             // kinds it is accepted as-is at config time.
             SourceKind::Bars
+            | SourceKind::Weather { .. }
+            | SourceKind::Graphic { .. }
+            | SourceKind::GraphicsChannel { .. }
             | SourceKind::Rtsp { .. }
             | SourceKind::Hls { .. }
             | SourceKind::Youtube { .. }
@@ -1567,6 +1999,24 @@ impl Source {
             // AES67's binding (SDP / multicast group / PTP domain) is a runtime
             // ingest concern, like the network URL kinds — accepted as authored.
             | SourceKind::Aes67 { .. } => {}
+        }
+        self.validate_presentation()?;
+        Ok(())
+    }
+
+    /// Structural validation for the presentation-only blocks (EPG and IPTV
+    /// playlist metadata) — a separate helper to keep [`Source::validate`]
+    /// readable.
+    ///
+    /// Both blocks are ordinary authored config, checked here so document-level
+    /// `validate()` covers them; neither participates in media identity or the
+    /// ingest path.
+    fn validate_presentation(&self) -> Result<(), ConfigError> {
+        if let Some(epg) = &self.epg {
+            epg.validate(&self.id)?;
+        }
+        if let Some(metadata) = &self.playlist_metadata {
+            metadata.validate(&self.id)?;
         }
         Ok(())
     }
@@ -1930,3 +2380,32 @@ fn validate_display_output(
 
 /// Explicit finite platform-measured preview admission.
 pub mod preview_ladder;
+/// Timer-source structural checks (ADR-0047 §5.2): the target must parse and
+/// `recur` is only valid on a recurring time-of-day target.
+fn validate_timer_source(
+    id: &str,
+    target: &crate::timer::TimerTarget,
+    on_target: crate::timer::TimerOnTarget,
+) -> Result<(), ConfigError> {
+    target
+        .validate()
+        .map_err(|e| ConfigError::Validation(format!("source {id:?}: {e}")))?;
+    // `recur` is only meaningful for a recurring time-of-day target; reject it
+    // on a `date_time` or a non-recurring time-of-day so the configuration is
+    // unambiguous (it would otherwise silently degrade to `hold`).
+    if matches!(on_target, crate::timer::TimerOnTarget::Recur)
+        && !matches!(
+            target,
+            crate::timer::TimerTarget::TimeOfDay {
+                recur_daily: true,
+                ..
+            }
+        )
+    {
+        return Err(ConfigError::Validation(format!(
+            "source {id:?}: on_target = \"recur\" requires a time_of_day target \
+             with recur_daily = true"
+        )));
+    }
+    Ok(())
+}

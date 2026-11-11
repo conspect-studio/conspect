@@ -494,6 +494,17 @@ fn insert_store_backed_sections(
     state: &AppState,
     accepted: bool,
 ) -> ControlResult<()> {
+    // `[graphics]`, its `[weather]` mirror and `[iptv]` have no resource store:
+    // the accepted envelope owns them. They come from the in-memory accepted
+    // snapshot (review R3-03: no `desired.json` read per compose), for BOTH
+    // splits: these families have no requested-vs-adopted divergence (the
+    // graphics hub is installed synchronously from each commit and IPTV has
+    // no runtime store), so the accepted envelope IS their live state, while
+    // the hub would add a synthesized default channel and merged legacy
+    // weather sources that are not authored config. Reading the startup base
+    // here would drop accepted edits from export, `active.toml` and promote,
+    // and hide them from the revert diff.
+    insert_section_families(doc, state)?;
     // Review R3-01 (`accepted = true` only, used by export/promote): the SAME
     // accepted envelope GET serves (`accepted_audio`/`accepted_salvos`/
     // `accepted_profiles`), not straight from a store whose projection write
@@ -562,6 +573,64 @@ fn insert_store_backed_sections(
             crate::error::ControlError::Repository(format!("serializing the tally profiles: {e}"))
         })?,
     );
+    Ok(())
+}
+
+/// Overlay `[graphics]`, `[weather]` and `[iptv]` from the accepted snapshot
+/// (absent sections are removed). A run without an envelope keeps the base.
+fn insert_section_families(
+    doc: &mut serde_json::Map<String, serde_json::Value>,
+    state: &AppState,
+) -> ControlResult<()> {
+    let Some(model) = &state.boot_model else {
+        return Ok(());
+    };
+    let Some(desired) = model
+        .accepted()
+        .map_err(crate::error::ControlError::Repository)?
+    else {
+        return Ok(());
+    };
+    let to_value = |value: serde_json::Result<serde_json::Value>| {
+        value.map_err(|e| {
+            crate::error::ControlError::Repository(format!(
+                "serializing the accepted configuration: {e}"
+            ))
+        })
+    };
+    let config = &desired.config;
+    let sections = [
+        (
+            "graphics",
+            (!config.graphics.is_empty())
+                .then(|| to_value(serde_json::to_value(&*config.graphics)))
+                .transpose()?,
+        ),
+        (
+            "weather",
+            (!config.weather.is_empty())
+                .then(|| to_value(serde_json::to_value(&config.weather)))
+                .transpose()?,
+        ),
+        (
+            "iptv",
+            config
+                .iptv
+                .as_ref()
+                .map(|iptv| to_value(serde_json::to_value(iptv)))
+                .transpose()?,
+        ),
+    ];
+    for (key, section) in sections {
+        match section {
+            Some(section) => {
+                doc.insert(key.to_owned(), section);
+            }
+            None => {
+                doc.remove(key);
+            }
+        }
+    }
     Ok(())
 }
 
@@ -870,6 +939,7 @@ pub(crate) async fn revert_to_start(
         ));
     };
     let op = match state.idempotency.reserve(idem.0.as_deref()) {
+        Reservation::Capacity => return Err(ControlError::IdempotencyCapacity),
         Reservation::Replay(op) => {
             // The original request already applied (or honestly no-op'd);
             // answer with its id without re-running anything.
@@ -1130,6 +1200,7 @@ pub(crate) async fn promote_to_boot(
         ));
     };
     let op = match state.idempotency.reserve(idem.0.as_deref()) {
+        Reservation::Capacity => return Err(ControlError::IdempotencyCapacity),
         Reservation::Replay(op) => {
             // The original promote already wrote + committed; a replay must
             // not rewrite the file or commit another revision.

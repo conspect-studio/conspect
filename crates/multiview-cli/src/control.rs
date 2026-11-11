@@ -103,6 +103,8 @@ pub async fn bind_and_serve<F>(
     publisher: Arc<EnginePublisher<EngineStateSnapshot, Event>>,
     commands: CommandSender,
     preview: SharedPreview,
+    switcher: Option<multiview_engine::switcher_control::SwitcherControl>,
+    switcher_leases: Option<Arc<multiview_control::source_demand::SwitcherPreviewLeases>>,
     // The WHEP focus transport (ADR-P006), already cap-decorated. `None` keeps
     // the default `NoWhep` (a pure build sheds every focus to the JPEG ladder).
     whep: Option<multiview_control::SharedWhep>,
@@ -136,6 +138,8 @@ where
         publisher,
         commands,
         preview,
+        switcher,
+        switcher_leases,
         whep,
         whip,
         whep_output,
@@ -168,6 +172,8 @@ pub async fn bind_and_serve_with_moq<F>(
     publisher: Arc<EnginePublisher<EngineStateSnapshot, Event>>,
     commands: CommandSender,
     preview: SharedPreview,
+    switcher: Option<multiview_engine::switcher_control::SwitcherControl>,
+    switcher_leases: Option<Arc<multiview_control::source_demand::SwitcherPreviewLeases>>,
     // The WHEP focus transport (ADR-P006), already cap-decorated. `None` keeps
     // the default `NoWhep` (a pure build sheds every focus to the JPEG ladder).
     whep: Option<multiview_control::SharedWhep>,
@@ -290,6 +296,44 @@ where
     #[cfg(not(feature = "gpu"))]
     let compositor_adapter: Option<multiview_hal::AdapterReport> = None;
 
+    // Probe `yt-dlp --version` once at startup for the `youtube` capability
+    // report (ADR-0015 §6 / ADR-W030): the SAME explicit path precedence
+    // (`MULTIVIEW_YOUTUBE_YT_DLP_PATH` else `[system.youtube] yt_dlp_path`) the
+    // per-source resolver uses. Logged at INFO on success so an operator can
+    // confirm the discovered path/version without reading the capability API.
+    // Absent/failed ⇒ `None` — the capability honestly reports unavailable
+    // (mirrors the NDI runtime-probe posture), never a startup failure.
+    #[cfg(feature = "youtube")]
+    let youtube_probe = {
+        let resolver_config = match crate::youtube_resolver_path(config) {
+            Some(path) => multiview_input::youtube::ResolverConfig::new(
+                path,
+                multiview_input::youtube::ResolverConfig::default().timeout,
+            ),
+            None => multiview_input::youtube::ResolverConfig::default(),
+        };
+        match multiview_input::youtube::probe_version(&resolver_config).await {
+            Ok(version) => {
+                tracing::info!(
+                    yt_dlp_path = %resolver_config.yt_dlp_path,
+                    yt_dlp_version = %version,
+                    "discovered yt-dlp for youtube live ingest (ADR-0015)"
+                );
+                Some(version)
+            }
+            Err(e) => {
+                tracing::info!(
+                    yt_dlp_path = %resolver_config.yt_dlp_path,
+                    error = %e,
+                    "yt-dlp not found/usable; youtube sources will report unavailable until it is installed"
+                );
+                None
+            }
+        }
+    };
+    #[cfg(not(feature = "youtube"))]
+    let youtube_probe: Option<String> = None;
+
     let api_keys = Arc::new(api_keys);
     #[cfg(feature = "moq-output")]
     let outgoing = match moq_slot {
@@ -315,17 +359,38 @@ where
     if let Some(moq) = moq {
         state = state.with_moq(moq);
     }
+    if let Some(switcher) = switcher {
+        state = state.with_switcher(switcher);
+    }
+    if let Some(leases) = switcher_leases {
+        state.switcher_preview_lease = leases;
+    }
+    let mut break_provider: Option<multiview_control::source_events::SharedSourceBreakProvider> =
+        None;
+    if let Some(demand) = crate::source_demand::installed_control_demand() {
+        state = state.with_source_demand(demand);
+    }
     if let Some(reader) = source_events {
-        state = state.with_source_events(Arc::new(reader));
+        let reader = Arc::new(reader);
+        let provider: Arc<dyn multiview_control::source_events::SourceEventProvider> =
+            reader.clone();
+        break_provider = Some(reader.clone());
+        let injector: Arc<dyn multiview_control::source_events::SourceEventTestInjector> = reader;
+        state = state
+            .with_source_events(provider)
+            .with_source_event_test_injector(injector);
+    }
+    if let Some(reader) = crate::event_journal::reader() {
+        state = state.with_event_journal(reader);
     }
     // Stored layouts persist across restarts (#176): seeding installs a fresh
     // in-memory store holding the config's working layout; move that layout into
     // the persistent store (if any) and serve from it.
     state.repository = persist_layouts(&state.repository, boot_model.as_deref()).await;
     if let Some(model) = boot_model.as_ref() {
-        if let Some(desired) = multiview_control::boot_model::load_desired(model.boot_path())
-            .map_err(std::io::Error::other)?
-        {
+        // `accepted()` loads the envelope once and keeps it as the in-memory
+        // snapshot every later read serves (review R3-03).
+        if let Some(desired) = model.accepted().map_err(std::io::Error::other)? {
             // Names and ETags continue from accepted intent; reseeding would
             // restart every counter at 1 and let a stale tag match again.
             state = multiview_control::boot_model::restore_accepted_stores(state, &desired)
@@ -368,6 +433,23 @@ where
     // map `[webrtc].cors_allow_origins` (default `["*"]`) onto the control plane
     // so a browser served from a web origin can WHIP-publish / WHEP-play.
     .with_cors_allow_origins(config.webrtc.cors_allow_origins.clone())
+    // Viewer playback URL derivation (ADR-0101): map `control.public_host`
+    // (absent ⇒ the route falls back to the request Host header) through.
+    .with_public_host(
+        config
+            .control
+            .as_ref()
+            .and_then(|control| control.public_host.clone()),
+    )
+    // The `[control] public_scheme` override (ADR-0101 scheme derivation):
+    // only needed when a front end does NOT set `X-Forwarded-Proto` (the
+    // production nginx config does).
+    .with_public_scheme(
+        config
+            .control
+            .as_ref()
+            .and_then(|control| control.public_scheme.clone()),
+    )
     .with_live_apply(live_apply)
     // The run-path live-apply capability (ADR-W018): which source kinds the
     // running engine can take live — synthetic always, network/file only when
@@ -380,14 +462,26 @@ where
     // engine channel (invariant #10).
     .with_capabilities(crate::system_capabilities::resolve_system_capabilities(
         compositor_adapter.as_ref(),
+        youtube_probe,
     ))
     // The `[discovery]` browse configuration: the operator-configured
     // zowietek-control service type (the vendor's type is unverified — only a
     // configured string is ever recognised) plus any extra DNS-SD types.
-    .with_discovery_config(config.discovery.clone().unwrap_or_default());
+    .with_discovery_config(config.discovery.clone().unwrap_or_default())
+    // BOM weather: the management-plane poller (a tokio task, never an engine
+    // thread) publishing into the process-global snapshot store the weather
+    // source workers read. Idle until a location is configured.
+    .with_weather(crate::weather_source::spawn_weather_service(config))
+    // Graphics (CG): the process-global hub the graphics generators read,
+    // seeded with the effective `[graphics]` (legacy `[weather]` locations
+    // folded in as bom_weather data sources), plus the off-clock thumbnailer.
+    .with_graphics(crate::graphics_source::seed_global_hub(config))
+    .with_graphics_thumbnails(std::sync::Arc::new(crate::graphics_source::CliThumbnailer));
     // The Boot/Loaded/Running model (ADR-W024): installed for a config-file
     // run so the boot-model/revert/promote routes are live; absent ⇒ those
     // routes honestly report `modeled: false`.
+    #[cfg(feature = "catalogue")]
+    let catalogue_boot_path = boot_model.as_ref().map(|m| m.boot_path().to_path_buf());
     if let Some(boot_model) = boot_model {
         state = state.with_boot_model(boot_model);
     }
@@ -414,6 +508,26 @@ where
     if let Some(whep_output) = whep_output {
         state = state.with_whep_output(whep_output);
     }
+
+    // IPTV-ORG source browser (ADR-M015): catalogue sync, link tracker and the
+    // bounded deep probe, all on the control plane (invariants #1/#10). Wired only
+    // when the `catalogue` feature is built; `[catalogues.iptv_org] enabled = false`
+    // keeps the routes (answering "disabled") but spawns no sync task.
+    #[cfg(feature = "catalogue")]
+    let state = multiview_control::catalogue::install(
+        state,
+        &config
+            .catalogues
+            .as_ref()
+            .and_then(|c| c.iptv_org.clone())
+            .unwrap_or_default(),
+        catalogue_boot_path.as_deref(),
+        std::env::var("HOSTNAME").unwrap_or_else(|_| "this-server".to_owned()),
+        config
+            .network_diagnostics
+            .as_ref()
+            .is_none_or(|n| n.egress_lookup),
+    );
 
     // Install the real mDNS browser when the `discovery` feature is built, so
     // `POST /api/v1/discovery/devices/scan` browses the LAN for Cast / NDI /
@@ -463,7 +577,7 @@ where
     // `/api/v1/mesh/*` renders + toggles the live discovery state. `None` keeps the
     // empty always-on default (a store-only run / test). Control-plane only; the
     // store holds no engine handle and can never back-pressure the engine (inv #10).
-    let state = match mesh {
+    let mut state = match mesh {
         Some(mesh) => state.with_mesh(mesh),
         None => state,
     };
@@ -492,6 +606,16 @@ where
         // Boot is a repair point: a fault that outlived the last run heals here.
         multiview_control::layout_projection::request(&state);
     }
+    // ADR-0183 ad-break automation executor: a management-plane tokio task that
+    // polls the source-event service and issues ordinary bounded bus commands.
+    // It never runs on (or blocks) the output clock; every rule is disarmed
+    // until an operator arms it.
+    if let Some(provider) = break_provider {
+        state = start_event_automation(state, provider);
+    }
+    // IPTV guide refresher (epg-playlist): one control-plane task that only
+    // fetches while `[iptv] enabled`; never touches the engine (inv #1/#10).
+    drop(multiview_control::iptv::spawn_refresher(state.clone()));
     let cloudflare = configured_cloudflare()?;
     let reconciler = cloudflare
         .as_ref()
@@ -769,6 +893,39 @@ fn device_poller_registry(
 /// unparseable entry logs a warning and falls back — fail-closed — to denying
 /// every allowlistable range (globally-routable hosts only), never silently
 /// widening back to the LAN default the operator was tightening away from.
+/// Build, bind and spawn the ADR-0183 automation executor; returns the state
+/// carrying it so the routes can read status and trigger manual restores.
+fn start_event_automation(
+    state: AppState,
+    provider: multiview_control::source_events::SharedSourceBreakProvider,
+) -> AppState {
+    use multiview_control::automation::{
+        http_webhook_sink, AutomationExecutor, CommandSink, StateConfigProvider,
+    };
+    let config = Arc::new(StateConfigProvider::new());
+    config.bind(state.clone());
+    let audit_state = state.clone();
+    let audit: multiview_control::automation::AuditSink = Arc::new(move |id, detail| {
+        audit_state.audit(
+            "automation",
+            multiview_control::audit::AuditAction::Command,
+            "source",
+            id,
+            Some(detail),
+        );
+    });
+    let sink: Arc<dyn CommandSink> = Arc::new(state.commands.clone());
+    let executor = Arc::new(AutomationExecutor::new(
+        provider,
+        sink,
+        config,
+        audit,
+        Some(http_webhook_sink(Arc::clone(&state.dial_policy))),
+    ));
+    let _task = executor.spawn();
+    state.with_automation(executor)
+}
+
 fn device_dial_policy(
     control: Option<&multiview_config::ControlConfig>,
 ) -> Arc<multiview_config::device::net_guard::DialPolicy> {
@@ -878,44 +1035,48 @@ pub struct HlsMount {
 /// usable becomes `out`). Distinct resolved ids that collide *after*
 /// sanitisation are deduplicated with a deterministic `-2`, `-3`, … suffix in
 /// declaration order, so every configured output stays reachable.
+///
+/// Delegates the segment/dedup/playlist resolution to
+/// [`multiview_config::playback::resolve_hls_mounts`] — the SAME function the
+/// control-plane's `GET /api/v1/outputs/{id}/playback` route uses (ADR-0101),
+/// so a viewer playback URL can never name a mount this router does not
+/// actually serve.
 #[must_use]
 pub fn hls_mounts(config: &MultiviewConfig) -> Vec<HlsMount> {
     use multiview_config::Output;
-    let mut taken = std::collections::HashSet::new();
-    let mut mounts = Vec::new();
-    for output in &config.outputs {
-        let (Output::Hls { path, .. } | Output::LlHls { path, .. }) = output else {
-            continue;
-        };
-        let dir = match std::path::Path::new(path).parent() {
-            Some(parent) if !parent.as_os_str().is_empty() => parent.to_path_buf(),
-            // A bare filename (or a root path): serve the process working dir
-            // (where such a playlist would be written).
-            _ => std::path::PathBuf::from("."),
-        };
-        let mut segment = sanitize_mount_segment(&output.id());
-        if !taken.insert(segment.clone()) {
-            // Deterministic suffix dedupe; bounded by the output count.
-            let mut n: u32 = 2;
-            segment = loop {
-                let candidate = format!("{segment}-{n}");
-                if taken.insert(candidate.clone()) {
-                    break candidate;
-                }
-                n = n.saturating_add(1);
+    let hls_outputs: Vec<(String, &str)> = config
+        .outputs
+        .iter()
+        .filter_map(|output| match output {
+            Output::Hls { path, .. } | Output::LlHls { path, .. } => {
+                Some((output.id(), path.as_str()))
+            }
+            _ => None,
+        })
+        .collect();
+    let refs: Vec<(&str, &str)> = hls_outputs
+        .iter()
+        .map(|(id, path)| (id.as_str(), *path))
+        .collect();
+    let resolved = multiview_config::playback::resolve_hls_mounts(&refs);
+    hls_outputs
+        .into_iter()
+        .filter_map(|(output_id, path)| {
+            let route = resolved.get(&output_id)?;
+            let dir = match std::path::Path::new(path).parent() {
+                Some(parent) if !parent.as_os_str().is_empty() => parent.to_path_buf(),
+                // A bare filename (or a root path): serve the process working dir
+                // (where such a playlist would be written).
+                _ => std::path::PathBuf::from("."),
             };
-        }
-        let playlist = std::path::Path::new(path)
-            .file_name()
-            .map(|name| name.to_string_lossy().into_owned());
-        mounts.push(HlsMount {
-            route: format!("/hls/{segment}"),
-            dir,
-            output_id: output.id(),
-            playlist,
-        });
-    }
-    mounts
+            Some(HlsMount {
+                route: route.route.clone(),
+                dir,
+                output_id,
+                playlist: route.playlist.clone(),
+            })
+        })
+        .collect()
 }
 
 /// Build the Cast **delivery map** (DEV-D2, ADR-M011): the validated
@@ -991,26 +1152,6 @@ pub fn cast_delivery(
         );
     }
     Some(std::sync::Arc::new(delivery))
-}
-
-/// Map an output id to a URL-segment-safe mount name (see [`hls_mounts`]).
-fn sanitize_mount_segment(id: &str) -> String {
-    let segment: String = id
-        .chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '~') {
-                c
-            } else {
-                '-'
-            }
-        })
-        .collect();
-    // `.`/`..`/empty are not usable URL path segments.
-    if segment.is_empty() || segment.chars().all(|c| c == '.') {
-        "out".to_owned()
-    } else {
-        segment
-    }
 }
 
 /// Project a composited program frame into the compact JSON snapshot the control
@@ -1196,6 +1337,10 @@ pub fn fold_tile_states<S: std::hash::BuildHasher>(
         .collect();
     entries.sort_unstable_by(|a, b| a.0.cmp(b.0));
     let offsets = crate::av_sync::offsets();
+    // The last `youtube` resolve-failure reason per source (ADR-0015), empty on
+    // a build without the `youtube` feature or when nothing has ever failed.
+    #[cfg(feature = "youtube")]
+    let youtube_reasons = crate::youtube_status::last_errors();
     let tiles: Vec<serde_json::Value> = entries
         .into_iter()
         .map(|(id, state)| {
@@ -1211,6 +1356,16 @@ pub fn fold_tile_states<S: std::hash::BuildHasher>(
             // measured.
             if let (Some(o), Some(obj)) = (offsets.get(id), tile.as_object_mut()) {
                 obj.insert("av_offset_ms".to_owned(), serde_json::json!(o));
+            }
+            // The honest `youtube` resolve-failure reason (e.g. "not a live
+            // stream (status: upcoming)", "yt-dlp not found on the server"),
+            // under the documented `reason` field (realtime-api.md §3's tiles
+            // `$snapshot`) — the same field name a client already defensively
+            // parses. Absent for every non-`youtube` source and for a healthy
+            // one.
+            #[cfg(feature = "youtube")]
+            if let (Some(reason), Some(obj)) = (youtube_reasons.get(id), tile.as_object_mut()) {
+                obj.insert("reason".to_owned(), serde_json::json!(reason));
             }
             tile
         })
@@ -1422,8 +1577,10 @@ pub fn command_drain_with_audio_and_players(
     audio_route: Arc<multiview_framestore::SwapCell<Option<Arc<crate::audio::AudioControlHandle>>>>,
     live: crate::live_sources::LiveSourceHandle,
     player_mailboxes: std::collections::HashMap<String, Arc<crate::player::TransportMailbox>>,
+    display_layout: crate::display_size::DisplayLayoutSlot,
 ) -> impl FnMut(&mut CompositorDrive<Nv12Image>) {
     let mut drain = CommandDrain::new(commands, config, publisher)
+        .with_display_layout(display_layout)
         .with_audio_route(audio_route)
         .with_live_sources(live)
         .with_player_mailboxes(player_mailboxes);
@@ -1494,8 +1651,10 @@ pub fn command_drain_with_seams(
         String,
         std::sync::Arc<crate::player::TransportMailbox>,
     >,
+    display_layout: crate::display_size::DisplayLayoutSlot,
 ) -> impl FnMut(&mut CompositorDrive<Nv12Image>) {
     let mut drain = CommandDrain::new(commands, config, publisher)
+        .with_display_layout(display_layout)
         .with_subtitle_route(subtitle_route)
         .with_audio_route(audio_route)
         .with_live_overlays(overlays)
@@ -1503,6 +1662,83 @@ pub fn command_drain_with_seams(
         .with_audio_free_sources(audio_free)
         .with_live_sources(live)
         .with_player_mailboxes(player_mailboxes);
+    move |drive: &mut CompositorDrive<Nv12Image>| {
+        let _applied = drain.apply(drive);
+    }
+}
+
+/// [`command_drain_with_seams`] plus the demand seam, so binding changes take
+/// and release source leases. The production `overlay` run path wires this.
+#[cfg(all(feature = "ffmpeg", feature = "overlay"))]
+#[allow(clippy::too_many_arguments, clippy::implicit_hasher)]
+pub fn command_drain_with_demand(
+    commands: CommandReceiver,
+    config: MultiviewConfig,
+    publisher: Arc<EnginePublisher<EngineStateSnapshot, Event>>,
+    subtitle_route: Arc<
+        multiview_framestore::SwapCell<Option<Arc<crate::captions::SubtitleRouteHandle>>>,
+    >,
+    audio_route: Arc<multiview_framestore::SwapCell<Option<Arc<crate::audio::AudioControlHandle>>>>,
+    overlays: crate::live_overlays::OverlayApplySlot,
+    tiles: Arc<multiview_framestore::SwapCell<Arc<Vec<crate::overlays::TileSpec>>>>,
+    audio_free: crate::pipeline::AudioFreeSources,
+    live: crate::live_sources::LiveSourceHandle,
+    player_mailboxes: std::collections::HashMap<String, Arc<crate::player::TransportMailbox>>,
+    display_layout: crate::display_size::DisplayLayoutSlot,
+    demand: Option<crate::source_demand::DrainDemand<Nv12Image>>,
+) -> impl FnMut(&mut CompositorDrive<Nv12Image>) {
+    let mut drain = CommandDrain::new(commands, config, publisher)
+        .with_display_layout(display_layout)
+        .with_subtitle_route(subtitle_route)
+        .with_audio_route(audio_route)
+        .with_live_overlays(overlays)
+        .with_tile_spec_apply(tiles)
+        .with_audio_free_sources(audio_free)
+        .with_live_sources(live)
+        .with_player_mailboxes(player_mailboxes)
+        .with_demand(demand);
+    move |drive: &mut CompositorDrive<Nv12Image>| {
+        let _applied = drain.apply(drive);
+    }
+}
+
+/// [`command_drain_with_live_sources`] plus the demand seam.
+#[cfg(feature = "ffmpeg")]
+pub fn command_drain_with_live_sources_and_demand(
+    commands: CommandReceiver,
+    config: MultiviewConfig,
+    publisher: Arc<EnginePublisher<EngineStateSnapshot, Event>>,
+    live: crate::live_sources::LiveSourceHandle,
+    demand: Option<crate::source_demand::DrainDemand<Nv12Image>>,
+) -> impl FnMut(&mut CompositorDrive<Nv12Image>) {
+    let mut drain = CommandDrain::new(commands, config, publisher)
+        .with_live_sources(live)
+        .with_demand(demand);
+    move |drive: &mut CompositorDrive<Nv12Image>| {
+        let _applied = drain.apply(drive);
+    }
+}
+
+/// [`command_drain_with_audio_and_players`] plus the demand seam (the
+/// non-overlay production run path).
+#[cfg(feature = "ffmpeg")]
+#[allow(clippy::implicit_hasher, clippy::too_many_arguments)]
+pub fn command_drain_with_audio_players_and_demand(
+    commands: CommandReceiver,
+    config: MultiviewConfig,
+    publisher: Arc<EnginePublisher<EngineStateSnapshot, Event>>,
+    audio_route: Arc<multiview_framestore::SwapCell<Option<Arc<crate::audio::AudioControlHandle>>>>,
+    live: crate::live_sources::LiveSourceHandle,
+    player_mailboxes: std::collections::HashMap<String, Arc<crate::player::TransportMailbox>>,
+    display_layout: crate::display_size::DisplayLayoutSlot,
+    demand: Option<crate::source_demand::DrainDemand<Nv12Image>>,
+) -> impl FnMut(&mut CompositorDrive<Nv12Image>) {
+    let mut drain = CommandDrain::new(commands, config, publisher)
+        .with_display_layout(display_layout)
+        .with_audio_route(audio_route)
+        .with_live_sources(live)
+        .with_player_mailboxes(player_mailboxes)
+        .with_demand(demand);
     move |drive: &mut CompositorDrive<Nv12Image>| {
         let _applied = drain.apply(drive);
     }
@@ -1602,6 +1838,16 @@ pub struct CommandDrain {
     /// spawn/teardown + the preview registry. `None` ⇒ `UpsertSource`/
     /// `RemoveSource` are surfaced held actions (never a silent drop).
     live_sources: Option<crate::live_sources::LiveSourceHandle>,
+    /// The APPLIED producer identity per source id (review R4-01): the source
+    /// document whose producer the hub actually accepted (or the startup path
+    /// spawned), never merely the requested mirror in `config`. Absent means
+    /// unknown. One entry per admitted source (bounded by the source cap);
+    /// cleared on remove.
+    applied_media: std::collections::HashMap<String, multiview_config::Source>,
+    /// Sources whose latest producer submission was shed (`Full`/`Gone`): the
+    /// mirror runs ahead of the producer, so no upsert may be judged
+    /// policy-only until a submission lands. Bounded like `applied_media`.
+    unapplied: std::collections::HashSet<String>,
     /// The live overlay working-set seam (ADR-W022), when wired
     /// ([`command_drain_with_live_overlays`] / [`command_drain_with_seams`]):
     /// the lock-free slot the bake consumer re-derives its overlay render
@@ -1625,8 +1871,21 @@ pub struct CommandDrain {
     /// commands are surfaced held (warned), never a silent drop.
     player_mailboxes:
         std::collections::HashMap<String, std::sync::Arc<crate::player::TransportMailbox>>,
+    /// Where the live layout is published for the decode threads to follow.
+    /// `None` on runs with no decoders.
+    display_layout: Option<crate::display_size::DisplayLayoutSlot>,
     /// One-shot: the drive's cell-id → index map is established the first tick.
     cell_ids_set: bool,
+    /// The demand seam (docs/architecture/demand-driven-sources.md): the drain
+    /// republishes the layout consumers when bindings change. Wait-free.
+    #[cfg(feature = "ffmpeg")]
+    demand: Option<crate::source_demand::DrainDemand<Nv12Image>>,
+    /// The drive's layout generation the demand seam last published for.
+    #[cfg(feature = "ffmpeg")]
+    demand_generation: Option<u64>,
+    /// The subtitle routes applied so far (layer → source), for demand.
+    #[cfg(all(feature = "ffmpeg", feature = "overlay"))]
+    subtitle_routes: std::collections::BTreeMap<String, String>,
     /// Test-only spy counting how many times this drain calls `solve_layout`.
     #[cfg(test)]
     resolve_spy: Option<Arc<std::sync::atomic::AtomicUsize>>,
@@ -1641,6 +1900,12 @@ impl CommandDrain {
         config: MultiviewConfig,
         publisher: Arc<EnginePublisher<EngineStateSnapshot, Event>>,
     ) -> Self {
+        // The startup path spawned every declared source's producer.
+        let applied_media = config
+            .sources
+            .iter()
+            .map(|source| (source.id.clone(), source.clone()))
+            .collect();
         Self {
             commands,
             config,
@@ -1653,13 +1918,22 @@ impl CommandDrain {
             #[cfg(feature = "ffmpeg")]
             audio_route: None,
             live_sources: None,
+            applied_media,
+            unapplied: std::collections::HashSet::new(),
             live_overlays: None,
             #[cfg(all(feature = "ffmpeg", feature = "overlay"))]
             tile_spec_apply: None,
             #[cfg(all(feature = "ffmpeg", feature = "overlay"))]
             audio_free_sources: None,
             player_mailboxes: std::collections::HashMap::new(),
+            display_layout: None,
             cell_ids_set: false,
+            #[cfg(feature = "ffmpeg")]
+            demand: None,
+            #[cfg(feature = "ffmpeg")]
+            demand_generation: None,
+            #[cfg(all(feature = "ffmpeg", feature = "overlay"))]
+            subtitle_routes: std::collections::BTreeMap::new(),
             #[cfg(test)]
             resolve_spy: None,
         }
@@ -1679,6 +1953,14 @@ impl CommandDrain {
         >,
     ) -> Self {
         self.player_mailboxes = mailboxes;
+        self
+    }
+
+    /// Publish every applied layout change to `slot` for the decode threads.
+    #[cfg(any(feature = "ffmpeg", test))]
+    #[must_use]
+    fn with_display_layout(mut self, slot: crate::display_size::DisplayLayoutSlot) -> Self {
+        self.display_layout = Some(slot);
         self
     }
 
@@ -1746,6 +2028,48 @@ impl CommandDrain {
         self
     }
 
+    /// Thread in the demand seam so binding changes take and release source
+    /// leases (new before old).
+    #[cfg(feature = "ffmpeg")]
+    #[must_use]
+    fn with_demand(mut self, demand: Option<crate::source_demand::DrainDemand<Nv12Image>>) -> Self {
+        self.demand = demand;
+        self
+    }
+
+    /// Publish the active layout's consumers when its bindings changed. One
+    /// integer compare per tick; on change a bounded vector build and a wait-free
+    /// publish, never a rail start (the demand worker does that off-clock).
+    #[cfg(feature = "ffmpeg")]
+    fn publish_demand(&mut self, drive: &CompositorDrive<Nv12Image>) -> bool {
+        let Some(demand) = &self.demand else {
+            return false;
+        };
+        let generation = drive.layout_generation();
+        if self.demand_generation == Some(generation) {
+            return false;
+        }
+        self.demand_generation = Some(generation);
+        demand
+            .layout
+            .publish(crate::source_demand::layout_items_for(drive.layout()));
+        true
+    }
+
+    /// Make sure a catalogued source has a store in the drive before a cell
+    /// binds it. A catalogued source's store exists even while it is idle.
+    #[cfg(feature = "ffmpeg")]
+    fn ensure_store(&self, id: &str, drive: &mut CompositorDrive<Nv12Image>) {
+        if drive.store(id).is_some() {
+            return;
+        }
+        if let Some(demand) = &self.demand {
+            if let Some(entry) = demand.catalogue.load().get(id) {
+                drive.insert_store(id.to_owned(), Arc::clone(entry.store()));
+            }
+        }
+    }
+
     /// Attach a test spy that counts every `solve_layout` re-solve the drain does.
     #[cfg(test)]
     #[must_use]
@@ -1788,7 +2112,9 @@ impl CommandDrain {
         // bounded); every other command is applied immediately as before.
         #[cfg(all(feature = "ffmpeg", feature = "overlay"))]
         let mut tile_binding_changed = false;
+        let mut layout_applied = false;
         for command in self.commands.try_drain() {
+            layout_applied |= matches!(&command, Command::ApplyLayout { .. });
             #[cfg(all(feature = "ffmpeg", feature = "overlay"))]
             {
                 tile_binding_changed |= matches!(
@@ -1815,6 +2141,10 @@ impl CommandDrain {
             let Some(intent) = self.pending.pop_front() else {
                 break;
             };
+            #[cfg(feature = "ffmpeg")]
+            if let RouteIntent::Video { source, .. } = &intent {
+                self.ensure_store(&source.input_id, drive);
+            }
             let mut route_applier = RouteApplier::new(&self.resolution);
             if let Err(e) = route_applier.apply_video(drive, std::slice::from_ref(&intent)) {
                 // An honest route error (unknown cell / source with no store): the
@@ -1827,7 +2157,29 @@ impl CommandDrain {
         if tile_binding_changed || applied != 0 {
             self.publish_tile_specs(drive);
         }
+        // The demand seam republishes the layout consumer set when the drive's
+        // layout generation moves; the NVDEC relayout hook follows the same
+        // republish so a newly consumed or re-sized source re-picks its decode
+        // size (display_size.rs) on the same frame boundary.
+        #[cfg(feature = "ffmpeg")]
+        let consumers_republished = self.publish_demand(drive);
+        #[cfg(not(feature = "ffmpeg"))]
+        let consumers_republished = false;
+        if layout_applied || applied != 0 || consumers_republished {
+            self.publish_display_layout(drive);
+        }
         applied
+    }
+
+    /// Hand the active layout to the decode threads. Only runs after a layout
+    /// or route command: O(cells) plus one wait-free store, and the decoders do
+    /// all the resulting work on their own threads (inv #1/#10).
+    fn publish_display_layout(&self, drive: &CompositorDrive<Nv12Image>) {
+        if let Some(slot) = &self.display_layout {
+            if *slot.load() != *drive.layout() {
+                slot.store(Arc::new(drive.layout().clone()));
+            }
+        }
     }
 
     /// Publish only when the active placements differ from the baker's snapshot.
@@ -1934,6 +2286,16 @@ impl CommandDrain {
             return;
         }
         let cells = resolved.solved.cells.len();
+        #[cfg(feature = "ffmpeg")]
+        for id in resolved
+            .solved
+            .cells
+            .iter()
+            .filter_map(|cell| cell.source.clone())
+            .collect::<Vec<_>>()
+        {
+            self.ensure_store(&id, drive);
+        }
         match drive.set_layout(Arc::new(resolved.solved)) {
             Ok(()) => {
                 drive.set_cell_ids(resolved.document.cell_ids());
@@ -2282,6 +2644,9 @@ impl CommandDrain {
             );
             return;
         }
+        if self.policy_only_upsert(source, drive) {
+            return;
+        }
         let id = source.id.clone();
         // Reuse the registered store on an edit-by-id so the tile holds
         // last-good while the hub swaps the producer behind it.
@@ -2303,6 +2668,9 @@ impl CommandDrain {
         // below gives the hub a head start on stopping a replaced producer,
         // shrinking the bounded window in which old and new frames can
         // interleave in the reused store on an edit (ADR-W018 §5).
+        // Demand-managed runs catalogue every kind and start it only when consumed.
+        #[cfg(feature = "ffmpeg")]
+        let synthetic = synthetic.filter(|_| self.demand.is_none());
         let submitted = match synthetic {
             Some(kind) => seam.request_spawn_synth(crate::live_sources::SynthSpawn {
                 id: id.clone(),
@@ -2318,6 +2686,14 @@ impl CommandDrain {
                 store: Arc::clone(&store),
             }),
         };
+        // Only an ACCEPTED submission changes which media the producer runs
+        // (review R4-01); a shed one leaves the mirror ahead of the producer.
+        if submitted == crate::live_sources::HubSubmit::Accepted {
+            self.applied_media.insert(id.clone(), source.clone());
+            self.unapplied.remove(&id);
+        } else {
+            self.unapplied.insert(id.clone());
+        }
         match submitted {
             crate::live_sources::HubSubmit::Accepted => {}
             crate::live_sources::HubSubmit::Full => {
@@ -2356,6 +2732,9 @@ impl CommandDrain {
                 source.kind,
                 multiview_config::SourceKind::Clock { .. }
                     | multiview_config::SourceKind::Timer { .. }
+                    | multiview_config::SourceKind::Weather { .. }
+                    | multiview_config::SourceKind::Graphic { .. }
+                    | multiview_config::SourceKind::GraphicsChannel { .. }
                     | multiview_config::SourceKind::Solid { .. }
             ) {
                 audio_free.insert(id);
@@ -2364,6 +2743,54 @@ impl CommandDrain {
             }
             slot.store(Arc::new(audio_free));
         }
+    }
+
+    /// An upsert that changes only presentation or standing policy
+    /// ([`multiview_config::Source::same_media`]) of a running source, on a run
+    /// with no demand manager: there are no leases to re-read, so the running
+    /// producer is left alone and only the working-config mirror follows
+    /// (review R3-03). Returns `true` when it handled the upsert.
+    ///
+    /// The judgment is made against the APPLIED producer identity, never the
+    /// requested mirror (review R4-01), and the producer is respawned when:
+    /// * the source's latest submission was shed (`Full`/`Gone`) — its
+    ///   recovery upsert must reach the producer;
+    /// * the applied identity is unknown or differs in media;
+    /// * the upsert is an explicit **retry**: byte-identical to the requested
+    ///   config the drain already holds, i.e. nothing new was requested, so
+    ///   the only reason to send it is to re-apply (the documented retry).
+    ///
+    /// A demand-managed run returns `false`: its hub re-reads the pins and
+    /// keeps the producer (`update_policy`).
+    fn policy_only_upsert(
+        &mut self,
+        source: &multiview_config::Source,
+        drive: &CompositorDrive<Nv12Image>,
+    ) -> bool {
+        #[cfg(feature = "ffmpeg")]
+        if self.demand.is_some() {
+            return false;
+        }
+        if drive.store(&source.id).is_none() || self.unapplied.contains(&source.id) {
+            return false;
+        }
+        if !self
+            .applied_media
+            .get(&source.id)
+            .is_some_and(|applied| applied.same_media(source))
+        {
+            return false;
+        }
+        match self.config.sources.iter_mut().find(|s| s.id == source.id) {
+            Some(slot) if *slot == *source => return false,
+            Some(slot) => slot.clone_from(source),
+            None => self.config.sources.push(source.clone()),
+        }
+        tracing::debug!(
+            source = %source.id,
+            "upsert_source: policy/presentation-only edit; the producer keeps running"
+        );
+        true
     }
 
     /// Apply a `RemoveSource` (ADR-W018 live remove) at the frame boundary:
@@ -2407,6 +2834,8 @@ impl CommandDrain {
             tracing::info!(source = %id, "remove_source: no registered store under that id");
         }
         self.config.sources.retain(|s| s.id != id);
+        self.applied_media.remove(id);
+        self.unapplied.remove(id);
         #[cfg(all(feature = "ffmpeg", feature = "overlay"))]
         if let Some(slot) = &self.audio_free_sources {
             let mut audio_free = (*slot.load()).clone();
@@ -2625,7 +3054,7 @@ impl CommandDrain {
     /// source is the run-side caption-track work; identity-by-source is today's
     /// per-source caption model).
     #[cfg(all(feature = "ffmpeg", feature = "overlay"))]
-    fn route_subtitle(&self, layer: &str, source: &multiview_config::routing::StreamRef) {
+    fn route_subtitle(&mut self, layer: &str, source: &multiview_config::routing::StreamRef) {
         let Some(slot) = self.subtitle_route.as_ref() else {
             tracing::warn!(
                 layer = %layer,
@@ -2643,6 +3072,26 @@ impl CommandDrain {
             return;
         };
         handle.request_repoint(layer, &source.input_id);
+        if let Some(demand) = &self.demand {
+            // A subtitle layer routed to another source consumes that source's
+            // captions, which ride its video rail.
+            if layer == source.input_id {
+                self.subtitle_routes.remove(layer);
+            } else {
+                self.subtitle_routes
+                    .insert(layer.to_owned(), source.input_id.clone());
+            }
+            demand.subtitles.publish(
+                self.subtitle_routes
+                    .iter()
+                    .map(|(layer, source)| multiview_engine::SetItem {
+                        id: source.as_str().into(),
+                        label: layer.as_str().into(),
+                        size: None,
+                    })
+                    .collect(),
+            );
+        }
     }
 
     /// Without `ffmpeg`+`overlay` the run renders no subtitles, so a `RouteSubtitle`
@@ -3001,6 +3450,134 @@ input_id = "in_b"
     /// The matching canvas for `TWO_CELL_DOC` (64x64 @ 25/1).
     fn matching_canvas() -> serde_json::Value {
         serde_json::json!({ "width": 64, "height": 64, "fps": "25/1" })
+    }
+
+    /// The production fault: a boot layout that binds only some sources, then a
+    /// stored layout applied live. The drain must hand the active layout to the
+    /// decoders, and a decoder bound to a smaller cell must plan an NVDEC reopen
+    /// at the new tile size, while a source the layout drops goes to the small
+    /// unbound size, never the full canvas.
+    #[test]
+    fn applying_a_smaller_layout_makes_the_decoders_reopen_at_the_new_size() {
+        use crate::display_size::{
+            display_size, plan_display_change, DecoderState, DisplayChange, DisplayFollow,
+            DisplayFollower, DISPLAY_SETTLE, UNBOUND_DISPLAY_SIZE,
+        };
+        use multiview_ffmpeg::TileSize;
+
+        let config = test_config();
+        let boot = Arc::new(config.solve_layout().expect("boot layout"));
+        let slot = Arc::new(multiview_framestore::SwapCell::new(Arc::clone(&boot)));
+        let publisher = Arc::new(EnginePublisher::<EngineStateSnapshot, Event>::new(16));
+        let (sender, receiver) = command_bus(8);
+        let mut drain =
+            CommandDrain::new(receiver, config, publisher).with_display_layout(Arc::clone(&slot));
+        let mut drive = test_drive(&test_config());
+
+        // Both sources decode at their 32x64 boot cells.
+        let boot_size = display_size(&boot, "in_a");
+        assert_eq!(boot_size, (32, 64));
+        let source = TileSize::new(1920, 1080);
+        let opened = DecoderState {
+            source,
+            hardware: true,
+            resize: multiview_ffmpeg::nvdec_resize_target(
+                source,
+                TileSize::new(boot_size.0, boot_size.1),
+                None,
+            ),
+        };
+        let mut follower_a = DisplayFollower::new(
+            DisplayFollow::new(Arc::clone(&slot), None),
+            "in_a",
+            boot_size,
+        );
+        let mut follower_b = DisplayFollower::new(
+            DisplayFollow::new(Arc::clone(&slot), None),
+            "in_b",
+            boot_size,
+        );
+        let t0 = std::time::Instant::now();
+        assert_eq!(follower_a.due(t0), None, "the boot layout needs no change");
+
+        // A stored layout with in_a in a quarter cell and in_b dropped.
+        let body = serde_json::json!({
+            "canvas": matching_canvas(),
+            "layout": { "kind": "absolute" },
+            "cells": [
+                { "id": "small", "rect": { "x": 0.0, "y": 0.0, "w": 0.25, "h": 0.25 },
+                  "source": { "input_id": "in_a" } }
+            ]
+        });
+        let document = multiview_config::LayoutDocument::from_body(&body).expect("stored doc");
+        let solved = document.solve_named("small").expect("stored layout");
+        sender
+            .try_submit(Command::ApplyLayout {
+                op: OperationId::new(),
+                layout: "small".to_owned(),
+                document: Some(Box::new(multiview_control::ResolvedLayout::new(
+                    solved, document,
+                ))),
+            })
+            .expect("apply layout");
+        let before_apply = slot.load();
+        drain.apply(&mut drive);
+        assert!(
+            !Arc::ptr_eq(&before_apply, &slot.load()),
+            "the drain must publish the applied layout"
+        );
+        assert_eq!(*slot.load(), *drive.layout());
+
+        // Debounced, then due at the new sizes.
+        assert_eq!(follower_a.due(t0), None);
+        let settled = t0 + DISPLAY_SETTLE;
+        let to_a = follower_a.due(settled).expect("in_a must resize");
+        assert_eq!(to_a, (16, 16));
+        assert_eq!(
+            plan_display_change(opened, boot_size, to_a, None),
+            DisplayChange::Reopen {
+                resize: Some(TileSize::new(16, 16))
+            },
+            "a running NVDEC decode must reopen at the new resize target"
+        );
+        let unbound = (
+            UNBOUND_DISPLAY_SIZE.0.min(64) & !1,
+            UNBOUND_DISPLAY_SIZE.1.min(64) & !1,
+        );
+        let _first = follower_b.due(t0);
+        assert_eq!(follower_b.due(settled), Some(unbound));
+
+        // A frame boundary with no layout change publishes nothing.
+        let current = slot.load();
+        drain.apply(&mut drive);
+        assert!(Arc::ptr_eq(&current, &slot.load()));
+    }
+
+    /// A video route moves a source between cells without a layout command;
+    /// the decoders must still see the new binding.
+    #[test]
+    fn a_video_route_republishes_the_active_layout() {
+        let config = test_config();
+        let boot = Arc::new(config.solve_layout().expect("boot layout"));
+        let slot = Arc::new(multiview_framestore::SwapCell::new(boot));
+        let publisher = Arc::new(EnginePublisher::<EngineStateSnapshot, Event>::new(16));
+        let (sender, receiver) = command_bus(8);
+        let mut drain =
+            CommandDrain::new(receiver, config, publisher).with_display_layout(Arc::clone(&slot));
+        let mut drive = test_drive(&test_config());
+        sender
+            .try_submit(Command::SwapSource {
+                op: OperationId::new(),
+                tile: "cell_b".to_owned(),
+                source: "in_a".to_owned(),
+            })
+            .expect("route");
+        drain.apply(&mut drive);
+        assert_eq!(
+            crate::display_size::cell_pixel_size(&slot.load(), "in_b"),
+            None,
+            "in_b is no longer bound anywhere"
+        );
     }
 
     /// A stored NewsOne-like layout replaces the boot tile chrome, not just the
@@ -3611,6 +4188,35 @@ input_id = "in_b"
         assert_eq!(snap["tick"], 7);
     }
 
+    /// A `youtube` source's recorded resolve-failure reason (ADR-0015) rides
+    /// the same `reason` field a client already defensively parses
+    /// (realtime-api.md §3), and clears once the source resolves again.
+    #[cfg(feature = "youtube")]
+    #[test]
+    fn fold_tile_states_carries_the_youtube_resolve_failure_reason() {
+        let id = "control-test-youtube-reason-tile";
+        crate::youtube_status::record(id, Some("not a live stream (status: upcoming)"));
+
+        let mut states = std::collections::HashMap::new();
+        states.insert(id.to_owned(), multiview_core::traits::SourceState::NoSignal);
+        let mut snap = state_snapshot(1, 0, 64, 64);
+        fold_tile_states(&mut snap, &states);
+
+        let tiles = snap["tiles"].as_array().expect("tiles array");
+        assert_eq!(tiles.len(), 1);
+        assert_eq!(
+            tiles[0]["reason"],
+            serde_json::json!("not a live stream (status: upcoming)")
+        );
+
+        // A later successful resolve clears the stored reason, so a fresh fold
+        // never carries a stale one forward.
+        crate::youtube_status::record(id, None);
+        let mut snap2 = state_snapshot(2, 0, 64, 64);
+        fold_tile_states(&mut snap2, &states);
+        assert!(snap2["tiles"][0].get("reason").is_none());
+    }
+
     #[test]
     fn fold_tile_states_empty_map_yields_an_empty_tiles_array() {
         // A run with no sources still publishes `tiles: []` so a connected
@@ -3761,6 +4367,8 @@ input_id = "in_b"
             publisher,
             commands,
             multiview_control::no_preview(),
+            None, // switcher: absent unless a real paired bus is attached
+            None, // switcher lease owner absent
             // whep: the default (no native transport) — a pure build path.
             None,
             None,
@@ -3842,6 +4450,8 @@ input_id = "in_b"
             publisher,
             commands,
             multiview_control::no_preview(),
+            None, // switcher absent (legacy path)
+            None, // switcher lease owner absent
             None,
             None,
             None,
@@ -3938,6 +4548,8 @@ input_id = "in_b"
             publisher,
             commands,
             multiview_control::no_preview(),
+            None, // switcher absent (legacy path)
+            None, // switcher lease owner absent
             None,
             None,
             None,
@@ -4074,7 +4686,7 @@ input_id = "in_a"
     fn unusable_ids_fall_back_to_out() {
         for id in ["..", "", "..."] {
             assert_eq!(
-                sanitize_mount_segment(id),
+                multiview_config::hls_mount_segment(id),
                 "out",
                 "id {id:?} must map to the `out` fallback"
             );
@@ -4098,7 +4710,69 @@ input_id = "in_a"
     #[test]
     fn already_safe_ids_pass_through_unchanged() {
         for id in ["program", "low-latency_1.0~alt", "ABC123"] {
-            assert_eq!(sanitize_mount_segment(id), id);
+            assert_eq!(multiview_config::hls_mount_segment(id), id);
         }
+    }
+}
+
+/// Regression tests for the push-output link fragment (issue #202): every
+/// non-delivery is attributed to its own reason, and a peer session ending is
+/// history — never current link health.
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
+mod push_links_tests {
+    use std::sync::Arc;
+
+    use super::push_links_fragment;
+    use multiview_output::push_link::PushLinkStatus;
+
+    #[test]
+    fn every_non_delivery_is_attributed_and_a_session_end_is_history() {
+        let link = Arc::new(PushLinkStatus::new("srt", true, "srt://[::]:9000"));
+        link.discard_no_client();
+        link.discard_no_client();
+        link.discard_awaiting_keyframe();
+        link.drop_slow_peer();
+        link.set_session_error("Input/output error");
+
+        let links = vec![("srt-main".to_owned(), Arc::clone(&link))];
+        let fragment = push_links_fragment(&links).expect("a non-empty fragment");
+        let out = &fragment["srt-main"]["link"];
+        assert_eq!(out["discarded_no_client"], 2, "waiting for a caller: {out}");
+        assert_eq!(out["discarded_awaiting_keyframe"], 1, "{out}");
+        assert_eq!(out["dropped_slow_peer"], 1, "{out}");
+        assert_eq!(out["dropped_upstream"], 0, "{out}");
+        assert_eq!(
+            out["dropped"], 4,
+            "the total is the sum of the reasons: {out}"
+        );
+        assert_eq!(
+            out["last_session_error"], "Input/output error",
+            "a session ending is carried as history: {out}"
+        );
+        assert!(
+            out.get("last_error").is_none(),
+            "a session ending is NOT current link health: {out}"
+        );
+        assert_eq!(out["state"], "idle", "the fragment is a pure projection");
+    }
+
+    #[test]
+    fn a_link_error_is_current_health_while_a_session_end_is_not() {
+        let link = Arc::new(PushLinkStatus::new("srt", true, "srt://[::]:9000"));
+        link.set_error("bind failed");
+        let links = vec![("srt-main".to_owned(), Arc::clone(&link))];
+        let fragment = push_links_fragment(&links).expect("fragment");
+        let out = &fragment["srt-main"]["link"];
+        assert_eq!(out["last_error"], "bind failed", "{out}");
+        assert!(
+            out.get("last_session_error").is_none(),
+            "no session has ended: {out}"
+        );
+    }
+
+    #[test]
+    fn no_push_outputs_means_no_fragment() {
+        assert!(push_links_fragment(&[]).is_none());
     }
 }

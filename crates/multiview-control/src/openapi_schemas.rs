@@ -586,6 +586,8 @@ pub enum WarningCodeDoc {
     GpuPresentNoVulkanAdapter,
     /// Multicast is configured inside a container without host networking.
     ContainerNoHostNetworking,
+    /// Sources linked to an IPTV-ORG catalogue entry need attention.
+    CatalogueLinkAttention,
 }
 
 /// `OpenAPI` mirror of [`multiview_events::HealthWarning`] (SA-0).
@@ -870,6 +872,39 @@ pub enum TimerTargetDoc {
     },
 }
 
+/// `OpenAPI` mirror of `multiview_config::WeatherTemplate`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum WeatherTemplateDoc {
+    /// Seven daily columns.
+    #[default]
+    SevenDay,
+    /// Today's detail + latest observation.
+    Today,
+}
+
+/// `OpenAPI` mirror of `multiview_config::WeatherBackground`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum WeatherBackgroundDoc {
+    /// Opaque dark gradient.
+    #[default]
+    Gradient,
+    /// Transparent background, translucent panels (NV12 + alpha).
+    Transparent,
+}
+
+/// `OpenAPI` mirror of `multiview_config::GraphicsBus`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum GraphicsBusDoc {
+    /// What is on air (transparent when clear).
+    #[default]
+    Program,
+    /// What is cued.
+    Preview,
+}
+
 /// `OpenAPI` mirror of `multiview_config::SourceKind` (tagged by `kind`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -936,6 +971,30 @@ pub enum SourceKindDoc {
         #[serde(default = "default_true")]
         overrun_badge: bool,
     },
+    /// A BOM weather graphic for one `[weather]` location.
+    Weather {
+        /// The weather location id.
+        location: String,
+        /// `seven_day` (default) or `today`.
+        #[serde(default)]
+        template: WeatherTemplateDoc,
+        /// `gradient` (default, opaque) or `transparent` (alpha panels).
+        #[serde(default)]
+        background: WeatherBackgroundDoc,
+    },
+    /// One prepared graphics item rendered full-time.
+    Graphic {
+        /// The `[[graphics.items]]` id.
+        item: String,
+    },
+    /// A graphics playout channel output (program or preview bus).
+    GraphicsChannel {
+        /// The `[[graphics.channels]]` id.
+        channel: String,
+        /// `program` (default) or `preview`.
+        #[serde(default)]
+        bus: GraphicsBusDoc,
+    },
     /// RTSP pull.
     Rtsp {
         /// Source URL.
@@ -945,6 +1004,12 @@ pub enum SourceKindDoc {
     Hls {
         /// Playlist URL.
         url: String,
+        /// Optional `User-Agent` header (printable, no CR/LF, <= 1 KiB).
+        #[serde(default)]
+        user_agent: Option<String>,
+        /// Optional `Referer` header (printable, no CR/LF, <= 1 KiB).
+        #[serde(default)]
+        referrer: Option<String>,
     },
     /// `YouTube` live, resolved to HLS at runtime.
     Youtube {
@@ -1024,6 +1089,119 @@ pub struct SourceWallClockDoc {
     pub use_: WallClockUseDoc,
 }
 
+/// `OpenAPI` mirror of `multiview_config::EpgMode` (epg-playlist).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum EpgModeDoc {
+    /// Resolve the guide automatically. The default.
+    #[default]
+    Automatic,
+    /// Use the explicitly authored `url` and `channel_id`.
+    Manual,
+    /// Do not fetch a guide for this source (retains any configured url/id).
+    Disabled,
+}
+
+/// `OpenAPI` mirror of `multiview_config::EpgSource` (epg-playlist):
+/// a source's optional per-source EPG (XMLTV) acquisition block.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+#[non_exhaustive]
+pub struct EpgSourceDoc {
+    /// How the guide is obtained. Defaults to `automatic`.
+    #[serde(default)]
+    pub mode: EpgModeDoc,
+    /// Optional HTTP(S) XMLTV feed URL (credential-free).
+    #[serde(default)]
+    pub url: Option<String>,
+    /// Optional exact provider channel id (as it appears in the XMLTV feed).
+    #[serde(default)]
+    pub channel_id: Option<String>,
+    /// Optional secret-manager reference for the feed's credentials.
+    #[serde(default)]
+    pub secret_ref: Option<String>,
+    /// Whether the feed may resolve to a private/link-local network address.
+    #[serde(default)]
+    pub allow_private_network: bool,
+}
+
+/// `OpenAPI` mirror of `multiview_config::PlaylistMetadata` (epg-playlist):
+/// optional IPTV playlist presentation metadata for a source.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+#[non_exhaustive]
+pub struct PlaylistMetadataDoc {
+    /// Optional `tvg-id`: the EPG channel id this entry presents.
+    #[serde(default)]
+    pub tvg_id: Option<String>,
+    /// Optional `tvg-name`: the channel name an IPTV playlist displays.
+    #[serde(default)]
+    pub name: Option<String>,
+    /// Optional `tvg-logo`: a credential-free HTTP(S) URL to a logo image.
+    #[serde(default)]
+    pub logo: Option<String>,
+    /// Optional `group-title`: the playlist section this entry appears under.
+    #[serde(default)]
+    pub group: Option<String>,
+}
+
+/// `OpenAPI` mirror of `multiview_config::IptvEntryKind`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum IptvEntryKindDoc {
+    /// A configured HLS/LL-HLS output, published at its `/hls/…` URL.
+    Output,
+    /// A configured source, published at its upstream URL (userinfo removed).
+    Source,
+}
+
+/// `OpenAPI` mirror of `multiview_config::IptvEntry`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[non_exhaustive]
+pub struct IptvEntryDoc {
+    /// Whether `ref` names an output or a source.
+    pub kind: IptvEntryKindDoc,
+    /// The referenced output id or source id.
+    #[serde(rename = "ref")]
+    pub reference: String,
+    /// Published `tvg-id` override (also the guide channel id).
+    #[serde(default)]
+    pub tvg_id: Option<String>,
+    /// Display-name override.
+    #[serde(default)]
+    pub name: Option<String>,
+    /// `tvg-logo` override (credential-free http(s) URL).
+    #[serde(default)]
+    pub logo: Option<String>,
+    /// `group-title` override.
+    #[serde(default)]
+    pub group: Option<String>,
+    /// Explicit permission to publish a source's upstream URL (required for sources).
+    #[serde(default)]
+    pub allow_direct_source_url: bool,
+}
+
+/// `OpenAPI` mirror of `multiview_config::IptvConfig` (`[iptv]`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[non_exhaustive]
+pub struct IptvConfigDoc {
+    /// Whether `/iptv/playlist.m3u8` and `/iptv/guide.xml` are served (default false).
+    #[serde(default)]
+    pub enabled: bool,
+    /// Optional absolute public base URL for playlist links (default: request Host).
+    #[serde(default)]
+    pub public_base_url: Option<String>,
+    /// Published entries in playlist order.
+    #[serde(default)]
+    pub entries: Vec<IptvEntryDoc>,
+    /// Minutes between background guide refreshes while publication is
+    /// enabled (default 30, 5..=1440).
+    #[serde(default)]
+    pub guide_refresh_minutes: Option<u32>,
+}
+
 /// `OpenAPI` mirror of `multiview_config::Source` — the body accepted by
 /// `POST`/`PUT /api/v1/sources/{id}`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
@@ -1053,6 +1231,59 @@ pub struct SourceBodyDoc {
     /// Wall-clock Use/Discard verb.
     #[serde(default)]
     pub wallclock: Option<SourceWallClockDoc>,
+    /// Optional per-source EPG (XMLTV) acquisition block (epg-playlist).
+    #[serde(default)]
+    pub epg: Option<EpgSourceDoc>,
+    /// Optional IPTV playlist presentation metadata (epg-playlist).
+    #[serde(default)]
+    pub playlist_metadata: Option<PlaylistMetadataDoc>,
+    /// When the source starts: `always_on` (default; started at boot) or
+    /// `on_demand` (idle until something consumes it).
+    #[serde(default)]
+    pub activation: Option<crate::source_demand::SourceActivationView>,
+    /// Catalogue provenance (IPTV-ORG link).
+    #[serde(default)]
+    pub origin: Option<SourceOriginDoc>,
+}
+
+/// `OpenAPI` mirror of `multiview_config::OriginFollow`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum OriginFollowDoc {
+    /// Never act on upstream changes.
+    Manual,
+    /// Notify the operator (default).
+    #[default]
+    Notify,
+    /// Auto-apply same-channel URL/header updates.
+    Auto,
+}
+
+/// `OpenAPI` mirror of `multiview_config::SourceOrigin`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[non_exhaustive]
+pub struct SourceOriginDoc {
+    /// Catalogue provider id (e.g. `iptv-org`).
+    pub provider: String,
+    /// Channel id; absent for no-metadata streams.
+    #[serde(default)]
+    pub channel: Option<String>,
+    /// Feed id.
+    #[serde(default)]
+    pub feed: Option<String>,
+    /// Stream URL as linked.
+    #[serde(default)]
+    pub stream_url: Option<String>,
+    /// Catalogue labels at link time.
+    #[serde(default)]
+    pub labels: Vec<String>,
+    /// RFC 3339 link timestamp.
+    #[serde(default)]
+    pub linked_at: Option<String>,
+    /// Follow mode.
+    #[serde(default)]
+    pub follow: OriginFollowDoc,
 }
 
 /// `OpenAPI` mirror of `multiview_config::audio::OutputAudioMode`.
@@ -1248,6 +1479,33 @@ pub struct AudioRoutingDoc {
     pub routes: Vec<AudioRouteDoc>,
 }
 
+/// One discrete-track rename a routing `PUT`'s propagation applied to an
+/// output (ADR-R005 §4.3).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[non_exhaustive]
+pub struct RenamedTrackDoc {
+    /// The track name the output's selection carried before the replace.
+    pub from: String,
+    /// The name it now carries.
+    pub to: String,
+}
+
+/// One output a routing `PUT`'s rename/removal propagation rewrote
+/// (ADR-R005 §4.3): a renamed or removed discrete `target_track` the output's
+/// `mode = "tracks"` selection carried is rewritten in the SAME atomic commit
+/// as the routing replace — never left dangling, never requiring a
+/// hand-staged intermediate PUT.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[non_exhaustive]
+pub struct OutputsUpdatedEntryDoc {
+    /// The output's stable REST id (`/api/v1/outputs/{id}`).
+    pub output: String,
+    /// Track names dropped from this output's selection.
+    pub removed: Vec<String>,
+    /// Discrete tracks this output's selection now follows under a new name.
+    pub renamed: Vec<RenamedTrackDoc>,
+}
+
 /// The response envelope of `GET`/`PUT /api/v1/audio-routing`.
 ///
 /// The GET is **404-free**: an unconfigured deployment answers
@@ -1263,6 +1521,10 @@ pub struct AudioRoutingStateDoc {
     /// `"prog"` + every declared discrete track, in declaration order — the
     /// set per-output `audio.tracks` selections resolve against.
     pub selectable_tracks: Vec<String>,
+    /// Outputs a successful `PUT`'s rename/removal propagation rewrote
+    /// (ADR-R005 §4.3), in output order. Always empty on `GET`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub outputs_updated: Vec<OutputsUpdatedEntryDoc>,
 }
 
 /// `OpenAPI` mirror of `multiview_config::Output` (tagged by `kind`) — the body
@@ -2155,4 +2417,123 @@ pub struct LogRecordDoc {
     /// summary.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub repeated: Option<u64>,
+}
+
+/// `OpenAPI` mirror of `multiview_config::schema::EventAutomationRule` (ADR-0183).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct EventAutomationRuleDoc {
+    /// Whether the rule acts (default `false`). Use the arm/disarm routes.
+    #[serde(default)]
+    pub armed: bool,
+    /// What to take at break start.
+    pub on_break_start: BreakStartActionDoc,
+    /// Restore the pre-break routing at the confirmed end (default `true`).
+    #[serde(default)]
+    pub restore_on_end: Option<bool>,
+    /// Watchdog seconds (1..=86400, default 600).
+    #[serde(default)]
+    pub max_duration_s: Option<u32>,
+    /// Optional `http://` hook that receives a `POST` on break start/end.
+    #[serde(default)]
+    pub webhook_url: Option<String>,
+}
+/// `OpenAPI` mirror of `multiview_config::schema::BreakStartAction`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct BreakStartActionDoc {
+    /// `swap_cell` (cells only) or `route_program` (cells + program audio).
+    pub action: BreakActionKindDoc,
+    /// A source id, or `bars` / `bars_tone`.
+    pub target: String,
+    /// Cells to replace; absent = every cell showing the source.
+    #[serde(default)]
+    pub cells: Option<Vec<String>>,
+}
+/// `OpenAPI` mirror of `multiview_config::schema::BreakActionKind`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum BreakActionKindDoc {
+    /// Swap the cell(s) showing the source.
+    SwapCell,
+    /// Swap the cell(s) and re-point the source's program-bus audio.
+    RouteProgram,
+}
+
+/// `OpenAPI` mirror of [`multiview_config::playback::PlaybackUrl`] — one
+/// viewer playback URL (or no-URL note) for an output
+/// (`GET /api/v1/outputs/{id}/playback`, ADR-0101).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct PlaybackUrlDoc {
+    /// Short human label, e.g. `"SRT (caller)"` or `"HLS playlist"`.
+    pub label: String,
+    /// The URL a viewer pastes into VLC/ffplay/a browser. Absent when this
+    /// output has no viewer-reachable address — see `notes` for why.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub url: Option<String>,
+    /// Extra operator-facing notes: an encryption-passphrase reminder, a
+    /// redacted push destination, a missing-host explanation. Never a secret.
+    #[serde(default)]
+    pub notes: Vec<String>,
+    /// The exact shell command an operator pastes to open this URL in VLC
+    /// (`None` when [`url`](Self::url) is `None`). For an SRT row this is
+    /// VLC's own `vlc --srt-latency=<ms> srt://host:port` form — NOT
+    /// `vlc <url>` — because VLC's `srt://` access does not read the
+    /// ffmpeg-style `latency=`/`streamid=` URL query options; every other
+    /// kind uses `vlc <url>`.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub vlc_command: Option<String>,
+}
+
+/// `OpenAPI` mirror of the `GET /api/v1/outputs/{id}/playback` response body.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct OutputPlaybackResponseDoc {
+    /// This output's viewer playback URL(s) (one or more; a push-only
+    /// transport returns a single no-URL entry with an explanatory note).
+    pub urls: Vec<PlaybackUrlDoc>,
+}
+
+/// Live link state of a push output (SRT / RTMP / RIST / UDP) — the body of
+/// `GET /api/v1/outputs/{id}/link`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct OutputLinkDoc {
+    /// `idle` / `connecting` / `listening` / `connected` / `reconnecting`.
+    pub state: String,
+    /// `caller` or `listener`.
+    pub mode: String,
+    /// `srt` / `rtmp` / `rist` / `udp`.
+    pub transport: String,
+    /// The (redacted) destination or bind URL.
+    pub url: String,
+    /// Peers attached right now.
+    pub clients: u64,
+    /// Peer sessions established this run.
+    pub sessions: u64,
+    /// Packets dropped for this output, for any reason: the sum of the four
+    /// reason counters below.
+    pub dropped: u64,
+    /// Packets discarded because no peer was attached (a listener waiting for a
+    /// caller, or a caller between sessions). Expected and benign.
+    pub discarded_no_client: u64,
+    /// Packets discarded while a fresh session waited for its first video
+    /// keyframe. Expected and benign: the link is fine, the decoder is simply
+    /// not started yet.
+    pub discarded_awaiting_keyframe: u64,
+    /// Packets lost to a slow peer: its bounded-queue overflow, plus every
+    /// packet held until it is re-admitted on the next video keyframe (audio
+    /// and non-IDR video alike). A real delivery failure.
+    pub dropped_slow_peer: u64,
+    /// Packets dropped upstream of the distributor (the producer shed a packet
+    /// or held its post-loss gate).
+    pub dropped_upstream: u64,
+    /// Packets written to peers.
+    pub written: u64,
+    /// The current link error, if any since the last successful connect. Never
+    /// a peer session ending (that is `last_session_error`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_error: Option<String>,
+    /// How the most recent peer session ended, when it ended with an error and
+    /// no newer peer is attached. Historical context, not current link health.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_session_error: Option<String>,
+    /// Attached peer addresses: an SRT listener's callers, or a caller's target.
+    pub peers: Vec<String>,
 }

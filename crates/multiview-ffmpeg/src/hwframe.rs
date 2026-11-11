@@ -235,6 +235,21 @@ pub fn is_cuda_frame(frame: &ffmpeg::frame::Video) -> bool {
     frame.format() == Pixel::CUDA
 }
 
+/// The coded `(width, height)` a demuxed stream's codec parameters declare, or
+/// `(0, 0)` when unknown/negative. Read before opening a decoder so the NVDEC
+/// fused resize can be planned (inv #6).
+#[must_use]
+pub(crate) fn parameters_size(params: &ffmpeg::codec::Parameters) -> (u32, u32) {
+    // SAFETY: `params` owns (or borrows from its stream) a valid
+    // `AVCodecParameters` for the borrow's lifetime; `width`/`height` are plain
+    // `int` scalar reads with no ownership or aliasing effects.
+    let (w, h) = unsafe {
+        let raw = params.as_ptr();
+        ((*raw).width, (*raw).height)
+    };
+    (u32::try_from(w).unwrap_or(0), u32::try_from(h).unwrap_or(0))
+}
+
 /// Download a hardware (e.g. CUDA/NVDEC) `src` frame into the host `dst` frame
 /// via `av_hwframe_transfer_data` — the **budgeted CPU↔GPU copy** at the decode
 /// boundary (core-engine §8.1). `dst` is left as a host frame in the surface

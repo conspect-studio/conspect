@@ -362,3 +362,324 @@ async fn non_admin_rollback_response_redacts_inline_secret() {
         "the rollback masked only the response view; the stored secret is intact: {rev}"
     );
 }
+
+// ── SRT-03-R2: credential-bearing URLs in the RESOURCE BODY (outputs + sources) ──
+//
+// Round-2 SRT review (review-srt-round2.md): `GET /outputs`, `GET /outputs/{id}`,
+// `GET /sources` and `GET /sources/{id}` return the stored resource body through
+// `redact_inline_secrets_for_read`, which masked secret-NAMED keys but, before
+// this fix, left every `url`/`peers` value untouched — so a credential embedded
+// IN the url (an rtmp stream key, an SRT passphrase/streamid, a RIST secret or
+// userinfo, or an HLS/TS query-string access token) reached a read-role viewer
+// even though the engine LINK snapshot (`/outputs/{id}/link`, SRT-03 round 1) was
+// already masked. These tests store the raw credential-bearing URL in the
+// RESOURCE BODY itself (not just the link snapshot) and read it back as a
+// read-role (Viewer) principal for every named transport/kind, asserting the
+// secret never appears anywhere in the response — including the list response.
+
+/// Every (field, raw-url-with-a-credential) case the brief names: rtmp (full and
+/// single-segment), srt passphrase+streamid, rist secret+userinfo, and a query-
+/// string access token on hls/ts. The literal plaintext secret for each case is
+/// asserted absent from the full response body text.
+fn srt03_r2_url_cases() -> Vec<(&'static str, &'static str)> {
+    vec![
+        (
+            "rtmp-multi-segment",
+            "rtmp://live.example/app/sk_live_SECRET_MULTI",
+        ),
+        (
+            "rtmp-single-segment",
+            "rtmp://live.example/sk_live_SECRET_SINGLE",
+        ),
+        (
+            "srt-passphrase-streamid",
+            "srt://[2001:db8::1]:9000?mode=caller&passphrase=SECRET_SRT_PASS&streamid=SECRET_SRT_SID",
+        ),
+        (
+            "rist-secret-userinfo",
+            "rist://ristuser:SECRET_RIST_USERINFO@[2001:db8::2]:8000?secret=SECRET_RIST_PSK",
+        ),
+        (
+            "hls-query-token",
+            "https://cdn.example/live/master.m3u8?token=SECRET_HLS_TOKEN",
+        ),
+        (
+            "ts-query-token",
+            "https://cdn.example/live/stream.ts?auth=SECRET_TS_TOKEN",
+        ),
+        (
+            "rtsp-userinfo",
+            "rtsp://camuser:SECRET_RTSP_PASS@[2001:db8::3]:554/main",
+        ),
+    ]
+}
+
+/// One secret marker per case, used only to assert absence (never asserted
+/// present — the whole point is that it must never appear).
+fn secret_marker_for(case: &str) -> &'static str {
+    match case {
+        "rtmp-multi-segment" => "SECRET_MULTI",
+        "rtmp-single-segment" => "SECRET_SINGLE",
+        "srt-passphrase-streamid" => "SECRET_SRT",
+        "rist-secret-userinfo" => "SECRET_RIST",
+        "hls-query-token" => "SECRET_HLS_TOKEN",
+        "ts-query-token" => "SECRET_TS_TOKEN",
+        "rtsp-userinfo" => "SECRET_RTSP_PASS",
+        other => panic!("unlisted case: {other}"),
+    }
+}
+
+#[tokio::test]
+async fn viewer_get_and_list_outputs_never_disclose_a_credential_in_the_stored_url() {
+    for (case, raw_url) in srt03_r2_url_cases() {
+        // rtsp is not a valid output transport; this case is sources-only.
+        if case == "rtsp-userinfo" {
+            continue;
+        }
+        let h = harness();
+        let id = format!("out-{case}");
+        let kind = if case.starts_with("rtmp") {
+            "rtmp"
+        } else if case.starts_with("srt") {
+            "srt"
+        } else if case.starts_with("rist") {
+            "rist"
+        } else {
+            // hls/ts query-token cases: exercised on an rtmp-shaped output body
+            // is wrong (rtmp requires codec + rtmp url shape); these two cases
+            // are output-irrelevant (HLS/TS are pull-only Source kinds, not
+            // documented Output push kinds), so only emit them for sources.
+            continue;
+        };
+        let resp = send(
+            &h.router,
+            post_json(
+                &format!("/api/v1/outputs/{id}"),
+                OPERATOR_TOKEN,
+                &json!({
+                    "name": case,
+                    "body": { "kind": kind, "id": id, "url": raw_url, "codec": "h264" }
+                }),
+            ),
+        )
+        .await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::CREATED,
+            "{case}: output seed must land: {:?}",
+            body_json(resp).await
+        );
+
+        let marker = secret_marker_for(case);
+
+        // GET /outputs/{id}
+        let resp = send(
+            &h.router,
+            get(&format!("/api/v1/outputs/{id}"), VIEWER_TOKEN),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = body_bytes(resp).await;
+        let text = String::from_utf8(bytes).unwrap();
+        assert!(
+            !text.contains(marker),
+            "{case}: the credential leaked in GET /outputs/{{id}}: {text}"
+        );
+
+        // GET /outputs (list)
+        let resp = send(&h.router, get("/api/v1/outputs", VIEWER_TOKEN)).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = body_bytes(resp).await;
+        let text = String::from_utf8(bytes).unwrap();
+        assert!(
+            !text.contains(marker),
+            "{case}: the credential leaked in GET /outputs (list): {text}"
+        );
+
+        // An admin still sees the raw credential (operational parity; the
+        // stored document itself is untouched).
+        let resp = send(
+            &h.router,
+            get(&format!("/api/v1/outputs/{id}"), ADMIN_TOKEN),
+        )
+        .await;
+        let out = body_json(resp).await;
+        assert_eq!(
+            out["body"]["url"], raw_url,
+            "{case}: an admin reads the stored URL verbatim: {out}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn viewer_get_and_list_sources_never_disclose_a_credential_in_the_stored_url() {
+    for (case, raw_url) in srt03_r2_url_cases() {
+        let h = harness();
+        let id = format!("src-{case}");
+        let kind = if case.starts_with("rtmp") {
+            "rtmp"
+        } else if case.starts_with("srt") {
+            "srt"
+        } else if case.starts_with("rist") {
+            "rist"
+        } else if case == "rtsp-userinfo" {
+            "rtsp"
+        } else {
+            "hls"
+        };
+        let resp = send(
+            &h.router,
+            post_json(
+                &format!("/api/v1/sources/{id}"),
+                OPERATOR_TOKEN,
+                &json!({
+                    "name": case,
+                    "body": { "kind": kind, "id": id, "url": raw_url }
+                }),
+            ),
+        )
+        .await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::CREATED,
+            "{case}: source seed must land: {:?}",
+            body_json(resp).await
+        );
+
+        let marker = secret_marker_for(case);
+
+        // GET /sources/{id}
+        let resp = send(
+            &h.router,
+            get(&format!("/api/v1/sources/{id}"), VIEWER_TOKEN),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = body_bytes(resp).await;
+        let text = String::from_utf8(bytes).unwrap();
+        assert!(
+            !text.contains(marker),
+            "{case}: the credential leaked in GET /sources/{{id}}: {text}"
+        );
+
+        // GET /sources (list)
+        let resp = send(&h.router, get("/api/v1/sources", VIEWER_TOKEN)).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = body_bytes(resp).await;
+        let text = String::from_utf8(bytes).unwrap();
+        assert!(
+            !text.contains(marker),
+            "{case}: the credential leaked in GET /sources (list): {text}"
+        );
+
+        // An admin still sees the raw credential (operational parity; the
+        // stored document itself is untouched).
+        let resp = send(
+            &h.router,
+            get(&format!("/api/v1/sources/{id}"), ADMIN_TOKEN),
+        )
+        .await;
+        let out = body_json(resp).await;
+        assert_eq!(
+            out["body"]["url"], raw_url,
+            "{case}: an admin reads the stored URL verbatim: {out}"
+        );
+    }
+}
+
+/// Export (`GET /api/v1/config/export`, admin-only whole-system artifact) keeps
+/// its established config-as-code posture: real URLs survive so the exported
+/// document stays reimportable. This is NOT a regression target — the brief
+/// requires export to keep full URLs; this test pins that it still does after
+/// the read-route fix (the two code paths must not have been conflated).
+#[tokio::test]
+async fn export_still_keeps_the_real_transport_url_for_config_as_code() {
+    let h = harness();
+    let resp = send(
+        &h.router,
+        post_json(
+            "/api/v1/layouts/working",
+            OPERATOR_TOKEN,
+            &json!({
+                "name": "working",
+                "body": {
+                    "canvas": {
+                        "width": 1920, "height": 1080, "fps": "30/1",
+                        "pixel_format": "nv12", "background": "#101014",
+                        "color": { "profile": "sdr-bt709-limited" }
+                    },
+                    "layout": { "kind": "absolute" },
+                    "cells": [
+                        {
+                            "id": "a",
+                            "rect": { "x": 0.0, "y": 0.0, "w": 0.5, "h": 0.5 },
+                            "source": { "input_id": "export-cam" }
+                        }
+                    ]
+                }
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::CREATED,
+        "{:?}",
+        body_json(resp).await
+    );
+
+    let resp = send(
+        &h.router,
+        post_json(
+            "/api/v1/sources/export-cam",
+            OPERATOR_TOKEN,
+            &json!({
+                "name": "Export cam",
+                "body": {
+                    "kind": "rtsp", "id": "export-cam",
+                    "url": "rtsp://camuser:EXPORT_PASS@[2001:db8::20]:554/main"
+                }
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::CREATED,
+        "{:?}",
+        body_json(resp).await
+    );
+
+    let resp = send(
+        &h.router,
+        post_json(
+            "/api/v1/outputs/export-out",
+            OPERATOR_TOKEN,
+            &json!({
+                "name": "LL-HLS",
+                "body": {
+                    "id": "export-out", "kind": "ll_hls",
+                    "path": "/var/lib/multiview/hls", "codec": "h264"
+                }
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::CREATED,
+        "{:?}",
+        body_json(resp).await
+    );
+
+    let resp = send(&h.router, get("/api/v1/config/export", ADMIN_TOKEN)).await;
+    let status = resp.status();
+    let bytes = body_bytes(resp).await;
+    let toml = String::from_utf8(bytes).unwrap();
+    assert_eq!(status, StatusCode::OK, "export failed: {toml}");
+    assert!(
+        toml.contains("rtsp://camuser:EXPORT_PASS@[2001:db8::20]:554/main")
+            || toml.contains("[2001:db8::20]:554/main"),
+        "export must keep the real transport URL for config-as-code: {toml}"
+    );
+}

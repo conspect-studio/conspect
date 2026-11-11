@@ -737,6 +737,14 @@ pub enum SourceKind {
     Hls {
         /// Playlist URL.
         url: String,
+        /// Optional `User-Agent` request header (printable, no CR/LF, <= 1 KiB).
+        /// Passed to libav as the `user_agent` `AVOption`. Not a secret.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        user_agent: Option<String>,
+        /// Optional `Referer` request header (printable, no CR/LF, <= 1 KiB).
+        /// Passed to libav as the `referer` `AVOption`. Not a secret.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        referrer: Option<String>,
     },
     /// `YouTube` live, bound by a watch/live/channel URL (ADR-0015).
     ///
@@ -765,6 +773,11 @@ pub enum SourceKind {
     /// yet — that is SRT-2 (#58).
     Srt {
         /// Source URL (`srt://host:port`, IPv6-first: bracket IPv6 literals).
+        ///
+        /// With `mode=listener`, `srt://[::]:port` (or an empty host) is one
+        /// dual-stack socket that accepts IPv6 and IPv4 callers, one caller at a
+        /// time. `0.0.0.0` is IPv4 only; a specific address binds only that
+        /// address.
         url: String,
         /// Optional typed SRT options: mode, latency, `AES` encryption via a
         /// passphrase reference, stream id, listener, `oheadbw_pct`, `maxbw`,
@@ -854,6 +867,37 @@ pub enum SourceKind {
         /// `media_players`.
         player: String,
     },
+    /// A BOM weather graphic (seven-day outlook or today's detail) rendered
+    /// in-process from the management-plane weather cache — a synthetic source
+    /// like `clock`. `location` references a `[weather]` location id; an
+    /// unknown/unfetched location renders an honest "unavailable" card.
+    Weather {
+        /// The `[[weather.locations]]` id to draw.
+        location: String,
+        /// `seven_day` (default) or `today`.
+        #[serde(default)]
+        template: crate::weather::WeatherTemplate,
+        /// `gradient` (default, opaque) or `transparent` (alpha panels for
+        /// layering over a looped media cell).
+        #[serde(default)]
+        background: crate::weather::WeatherBackground,
+    },
+    /// One prepared graphics item (`[[graphics.items]]`) rendered full-time —
+    /// re-rendered only when the item or its bound data changes.
+    Graphic {
+        /// The `[[graphics.items]]` id.
+        item: String,
+    },
+    /// A graphics playout channel's output: whatever is on its program bus
+    /// (transparent when clear), or its preview bus for monitoring. Layer it
+    /// in a cell above video; TAKE/CLEAR/MIX drive it live.
+    GraphicsChannel {
+        /// The `[[graphics.channels]]` id.
+        channel: String,
+        /// `program` (default) or `preview`.
+        #[serde(default)]
+        bus: crate::graphics::GraphicsBus,
+    },
     /// AES67 / SMPTE ST 2110-30 PCM-audio RTP input (open-audio over IP).
     ///
     /// Tier 0 binding is a static SDP session (RFC 4566/8866) pasted or fetched
@@ -904,6 +948,13 @@ const fn is_true(value: &bool) -> bool {
     *value
 }
 
+/// Skip-serializing predicate for a default-`false` bool field (so an unset
+/// flag never appears in the canonical JSON/TOML wire form).
+#[allow(clippy::trivially_copy_pass_by_ref)]
+const fn is_false(value: &bool) -> bool {
+    !*value
+}
+
 impl SourceKind {
     /// Whether this kind is produced **in-process** (`bars`/`solid`/`clock`,
     /// ADR-0027) rather than decoded from external media.
@@ -916,7 +967,13 @@ impl SourceKind {
     pub const fn is_synthetic(&self) -> bool {
         matches!(
             self,
-            Self::Bars | Self::Solid { .. } | Self::Clock { .. } | Self::Timer { .. }
+            Self::Bars
+                | Self::Solid { .. }
+                | Self::Clock { .. }
+                | Self::Timer { .. }
+                | Self::Weather { .. }
+                | Self::Graphic { .. }
+                | Self::GraphicsChannel { .. }
         )
     }
 
@@ -948,7 +1005,12 @@ impl SourceKind {
 
 /// A managed input: a stable `id`, a display name, the kind-specific payload,
 /// and optional auth/color overrides.
+///
+/// Serialisation is canonical: a legacy `demand = { always_on = .. }` alias is
+/// written back as the `activation` it means (review DMD-10), so a read/write
+/// round trip never changes what starts at boot.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(remote = "Self")]
 #[non_exhaustive]
 pub struct Source {
     /// Stable input id (referenced by `cells.source.input_id`).
@@ -987,6 +1049,649 @@ pub struct Source {
     /// trust *tier* is measured at runtime, never authored. See [`SourceWallClock`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub wallclock: Option<SourceWallClock>,
+    /// Per-source event observation opt-in (ADR-0183).
+    ///
+    /// Absent means the default posture: observation runs for HLS sources
+    /// (`observe` defaults `true`) because the HLS cue/DATERANGE/SCTE-35/ID3
+    /// watcher is read-only metadata parsing already present on the existing
+    /// fetch/demux path — it adds no extra network or disk IO and a bounded,
+    /// off-clock parse cost (see [`SourceEventsConfig::observe`]). Non-HLS
+    /// kinds never observe regardless of this field (there is no cue carriage
+    /// to watch). Automation remains disarmed independently of this flag; see
+    /// `multiview_control::event_automation`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub events: Option<SourceEventsConfig>,
+    /// When the source starts (`docs/architecture/demand-driven-sources.md`).
+    /// Absent means [`SourceActivation::AlwaysOn`]: it starts at boot whether
+    /// or not anything consumes it, exactly as before this setting existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub activation: Option<SourceActivation>,
+    /// Deserialise-only alias for documents written while this setting was
+    /// `demand = { always_on = bool }`. Folded into [`Source::activation`] by
+    /// [`Source::effective_activation`]; never written back.
+    #[serde(default, skip_serializing)]
+    pub demand: Option<SourceDemandPolicy>,
+    /// Optional per-source **EPG** (XMLTV) acquisition block.
+    ///
+    /// Absent means no EPG is configured for this source (the existing,
+    /// pre-EPG documents deserialize and re-serialize byte-identically). See
+    /// [`EpgSource`]. The block is **presentation only**: it never changes the
+    /// source's media identity or the ingest path.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub epg: Option<EpgSource>,
+    /// Optional IPTV **playlist presentation** metadata.
+    ///
+    /// Absent means no playlist metadata is authored. See [`PlaylistMetadata`].
+    /// **Presentation only** — it never affects the source's media identity,
+    /// ingest, or decode path.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub playlist_metadata: Option<PlaylistMetadata>,
+    /// Optional provenance: the external catalogue entry this source was linked
+    /// from (IPTV-ORG, ADR-M015). Purely informational to the engine.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin: Option<SourceOrigin>,
+}
+
+/// Per-source event observation configuration (ADR-0183).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SourceEventsConfig {
+    /// Whether HLS cue/DATERANGE/SCTE-35/ID3 observation runs for this source.
+    /// Defaults to `true`: for an HLS source, observation is read-only parsing
+    /// of metadata the fetch/demux path already receives (no extra network
+    /// request, no extra disk write), so the default is ON. Set `false` to
+    /// opt out explicitly. This flag never arms automation.
+    #[serde(default = "default_observe")]
+    pub observe: bool,
+    /// Optional ad-break automation rule. Absent means no automation; present
+    /// but `armed = false` (the default) means configured but inert.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub automation: Option<EventAutomationRule>,
+}
+impl Default for SourceEventsConfig {
+    fn default() -> Self {
+        Self {
+            observe: true,
+            automation: None,
+        }
+    }
+}
+
+/// When a source starts.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SourceActivation {
+    /// Started at boot and kept running whether or not anything consumes it.
+    /// The default: every existing source behaves as it always has.
+    #[default]
+    AlwaysOn,
+    /// Idle (zero cost: no connection, decoder or thread) until something
+    /// consumes it, and stopped again `close after` its last consumer leaves.
+    OnDemand,
+}
+
+impl SourceActivation {
+    /// The stable wire token.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::AlwaysOn => "always_on",
+            Self::OnDemand => "on_demand",
+        }
+    }
+}
+
+/// Legacy `demand = { always_on = bool }` block, accepted on read only.
+///
+/// `journal_events` is accepted and ignored: event observation now runs
+/// whenever the source is ready, so an `always_on` source keeps its history.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+#[non_exhaustive]
+pub struct SourceDemandPolicy {
+    /// `true` meant always on; `false` meant on demand.
+    #[serde(default)]
+    pub always_on: Option<bool>,
+    /// Ignored (see the type docs).
+    #[serde(default)]
+    pub journal_events: Option<bool>,
+}
+
+impl Serialize for Source {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        if self.activation.is_none() && self.demand.and_then(|d| d.always_on).is_some() {
+            let mut canonical = self.clone();
+            canonical.activation = Some(self.effective_activation());
+            return Source::serialize(&canonical, serializer);
+        }
+        Source::serialize(self, serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for Source {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        Source::deserialize(deserializer)
+    }
+}
+
+impl Source {
+    /// The source's activation, folding in the legacy `demand.always_on`
+    /// alias. An explicit `activation` wins.
+    #[must_use]
+    pub fn effective_activation(&self) -> SourceActivation {
+        if let Some(activation) = self.activation {
+            return activation;
+        }
+        match self.demand.and_then(|d| d.always_on) {
+            Some(false) => SourceActivation::OnDemand,
+            _ => SourceActivation::AlwaysOn,
+        }
+    }
+
+    /// Whether the source idles until consumed.
+    #[must_use]
+    pub fn is_on_demand(&self) -> bool {
+        self.effective_activation() == SourceActivation::OnDemand
+    }
+
+    /// Whether `self` and `other` define the same **media**: they differ at
+    /// most in the fields that never touch the producer —
+    /// presentation (`epg`, `playlist_metadata`) and standing policy
+    /// (`events.automation`, `activation` and its legacy `demand` alias).
+    /// This is the one definition of "media-affecting" that the control plane
+    /// (guide-only edits), the engine drain and the demand hub all share
+    /// (reviews DMD-09, R2-02, R3-02). `events.observe` stays media.
+    #[must_use]
+    pub fn same_media(&self, other: &Self) -> bool {
+        // Compare field by field; no clone of either document.
+        let observe = |s: &Self| s.events.as_ref().is_none_or(|events| events.observe);
+        let Self {
+            id,
+            display_name,
+            kind,
+            auth,
+            color_override,
+            captions,
+            gpu_pin,
+            wallclock,
+            // Presentation and policy: never media.
+            events: _,
+            activation: _,
+            demand: _,
+            epg: _,
+            playlist_metadata: _,
+            // Catalogue provenance/follow metadata (IPTV-ORG), never media.
+            origin: _,
+        } = self;
+        *id == other.id
+            && *display_name == other.display_name
+            && *kind == other.kind
+            && *auth == other.auth
+            && *color_override == other.color_override
+            && *captions == other.captions
+            && *gpu_pin == other.gpu_pin
+            && *wallclock == other.wallclock
+            // An absent events block and a default one observe the same way;
+            // `automation` is policy (review R2-02).
+            && observe(self) == observe(other)
+    }
+}
+
+/// `[events]`: retention bounds of the raw marker journal. Absent means the
+/// defaults. A change applies at the next restart.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct EventsConfig {
+    /// Days of journal history kept.
+    #[serde(default = "default_journal_retention_days")]
+    pub journal_retention_days: u32,
+    /// Total journal bytes kept across all sources.
+    #[serde(default = "default_journal_max_bytes")]
+    pub journal_max_bytes: u64,
+}
+impl Default for EventsConfig {
+    fn default() -> Self {
+        Self {
+            journal_retention_days: default_journal_retention_days(),
+            journal_max_bytes: default_journal_max_bytes(),
+        }
+    }
+}
+const fn default_journal_retention_days() -> u32 {
+    14
+}
+const fn default_journal_max_bytes() -> u64 {
+    256 * 1024 * 1024
+}
+
+/// Upper bound for [`EventAutomationRule::max_duration_s`] (24 h).
+pub const MAX_AUTOMATION_DURATION_S: u32 = 86_400;
+/// Upper bound on [`BreakStartAction::cells`] entries.
+pub const MAX_AUTOMATION_CELLS: usize = 64;
+/// Upper bound on a webhook URL's length in bytes.
+pub const MAX_WEBHOOK_URL_BYTES: usize = 2048;
+
+/// Per-source ad-break automation (ADR-0183): when this source enters a
+/// confirmed break, take a replacement; restore at break end. Disarmed by
+/// default; every effect goes through the management-plane executor.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EventAutomationRule {
+    /// Whether the rule acts. Defaults to `false` (disarmed).
+    #[serde(default)]
+    pub armed: bool,
+    /// What to take when a break starts.
+    pub on_break_start: BreakStartAction,
+    /// Restore the pre-break routing at the confirmed break end (default `true`).
+    #[serde(default = "default_true")]
+    pub restore_on_end: bool,
+    /// Watchdog: restore after this many seconds even without an end (default 600).
+    #[serde(default = "default_max_duration_s")]
+    pub max_duration_s: u32,
+    /// Optional `http://` hook that receives a small JSON `POST` on break start/end,
+    /// so external VT/automation systems can react. Dialled through the SSRF
+    /// guard with bounded timeouts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub webhook_url: Option<String>,
+}
+
+/// The replacement taken at break start.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BreakStartAction {
+    /// Where the replacement goes.
+    pub action: BreakActionKind,
+    /// A source id, or the reserved `"bars"` / `"bars_tone"` targets, which use
+    /// the first configured `bars` source (`bars_tone` also routes its 1 kHz
+    /// line-up tone onto this source's program-bus audio).
+    pub target: String,
+    /// Cells to replace; absent means every cell currently showing the source.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cells: Option<Vec<String>>,
+}
+
+/// Break-start action kind.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BreakActionKind {
+    /// Swap the video of the cell(s) showing this source.
+    SwapCell,
+    /// Swap the cell(s) AND re-point this source's program-bus audio.
+    RouteProgram,
+}
+
+impl EventAutomationRule {
+    /// Validate bounds; does not resolve ids (they may be created later).
+    ///
+    /// # Errors
+    /// A message naming the violated rule.
+    pub fn validate(&self, source_id: &str) -> Result<(), String> {
+        let target = self.on_break_start.target.as_str();
+        if target.is_empty() || target.len() > 256 || target.chars().any(char::is_control) {
+            return Err("automation target must be a non-empty id".into());
+        }
+        if target == source_id {
+            return Err("automation target must differ from the source itself".into());
+        }
+        if !(1..=MAX_AUTOMATION_DURATION_S).contains(&self.max_duration_s) {
+            return Err(format!(
+                "automation max_duration_s must be 1..={MAX_AUTOMATION_DURATION_S}"
+            ));
+        }
+        if let Some(cells) = &self.on_break_start.cells {
+            if cells.len() > MAX_AUTOMATION_CELLS
+                || cells
+                    .iter()
+                    .any(|c| c.is_empty() || c.len() > 256 || c.chars().any(char::is_control))
+            {
+                return Err("automation cells must be at most 64 non-empty ids".into());
+            }
+        }
+        if let Some(url) = &self.webhook_url {
+            let lower = url.to_ascii_lowercase();
+            if url.len() > MAX_WEBHOOK_URL_BYTES
+                || !lower.starts_with("http://")
+                || url.chars().any(|c| c.is_control() || c.is_whitespace())
+            {
+                return Err("automation webhook_url must be an http:// URL".into());
+            }
+        }
+        Ok(())
+    }
+}
+fn default_max_duration_s() -> u32 {
+    600
+}
+fn default_observe() -> bool {
+    true
+}
+
+/// How a source's EPG (electronic programme guide) is obtained.
+///
+/// Serializes as a snake-case string (`"automatic"` / `"manual"` /
+/// `"disabled"`). `#[non_exhaustive]` for forward compatibility.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum EpgMode {
+    /// Resolve the guide automatically (the default; no `url` is required).
+    #[default]
+    Automatic,
+    /// Use the explicitly authored [`EpgSource::url`] **and**
+    /// [`EpgSource::channel_id`] — both are required in this mode.
+    Manual,
+    /// Do not fetch a guide for this source.
+    ///
+    /// Previously authored `url`/`channel_id`/`secret_ref` values are
+    /// **retained** (never used, never an error) so an operator can re-enable
+    /// the guide without re-typing them.
+    Disabled,
+}
+
+/// Optional per-source EPG (XMLTV) acquisition block.
+///
+/// This is **configuration only** — it carries no acquisition, caching or
+/// scheduling behaviour, and it never alters the source's media identity or
+/// ingest: two documents differing only in this block describe the same media.
+///
+/// Credentials are **references**: [`EpgSource::secret_ref`] names a
+/// secret-manager entry (e.g. `op://…` or `env:VAR`); a raw credential in the
+/// URL (`https://user:pass@…`) is rejected by [`EpgSource::validate`].
+///
+/// The whole block is optional on [`Source`], so pre-EPG documents are
+/// unaffected; `#[non_exhaustive]` for forward compatibility.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+#[non_exhaustive]
+pub struct EpgSource {
+    /// How the guide is obtained. Defaults to [`EpgMode::Automatic`].
+    #[serde(default)]
+    pub mode: EpgMode,
+    /// Optional HTTP(S) URL of an XMLTV feed.
+    ///
+    /// Must be `http://` or `https://` with a non-empty host and no embedded
+    /// credentials. Omitted from the wire form when unset.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+    /// Optional **exact** provider channel id (the id as it appears in the
+    /// XMLTV feed, e.g. `bbc1.uk`) — never a display name or a fuzzy match.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub channel_id: Option<String>,
+    /// Optional secret-manager reference for the feed's credentials (e.g.
+    /// `op://Servers/epg/credentials` or `env:EPG_TOKEN`). **Never** a raw
+    /// credential: the value is a reference the runtime resolves.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub secret_ref: Option<String>,
+    /// Whether the feed may resolve to a private/link-local network address
+    /// (e.g. a guide served from the LAN). Defaults to `false` — an operator
+    /// must opt in explicitly. This task carries the flag only; no resolution
+    /// or fetch policy is enforced here.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub allow_private_network: bool,
+}
+
+impl EpgSource {
+    /// Maximum accepted byte length of [`EpgSource::url`].
+    pub const URL_MAX_BYTES: usize = 2048;
+    /// Maximum accepted byte length of [`EpgSource::channel_id`].
+    pub const CHANNEL_ID_MAX_BYTES: usize = 512;
+    /// Maximum accepted byte length of [`EpgSource::secret_ref`].
+    pub const SECRET_REF_MAX_BYTES: usize = 512;
+
+    /// Validate this EPG block for the source named `owner`.
+    ///
+    /// Every present string is bounded in bytes and free of control
+    /// characters; `url` must be a credential-free HTTP(S) URL; in
+    /// [`EpgMode::Manual`] both `url` and `channel_id` are required;
+    /// [`EpgMode::Disabled`] retains configured settings without requiring
+    /// them.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ConfigError::Validation`] naming the violated rule.
+    pub fn validate(&self, owner: &str) -> Result<(), ConfigError> {
+        if let Some(url) = &self.url {
+            validate_http_url("epg.url", owner, url, Self::URL_MAX_BYTES)?;
+        }
+        if let Some(id) = &self.channel_id {
+            require_bounded_text("epg.channel_id", owner, id, Self::CHANNEL_ID_MAX_BYTES)?;
+            if id.trim().is_empty() {
+                return Err(ConfigError::Validation(format!(
+                    "source {owner:?}: epg.channel_id is blank — it must be the exact provider \
+                     channel id from the XMLTV feed"
+                )));
+            }
+        }
+        if let Some(secret_ref) = &self.secret_ref {
+            require_bounded_text(
+                "epg.secret_ref",
+                owner,
+                secret_ref,
+                Self::SECRET_REF_MAX_BYTES,
+            )?;
+            if secret_ref.trim().is_empty() {
+                return Err(ConfigError::Validation(format!(
+                    "source {owner:?}: epg.secret_ref is blank — it is a secret-manager reference \
+                     (e.g. `op://Servers/epg/credentials` or `env:EPG_TOKEN`); it is never a \
+                     raw credential"
+                )));
+            }
+        }
+        match self.mode {
+            EpgMode::Manual => {
+                if self.url.is_none() {
+                    return Err(ConfigError::Validation(format!(
+                        "source {owner:?}: epg.mode is \"manual\" but epg.url is unset — a manual \
+                         EPG requires an explicit XMLTV url as well as a channel_id"
+                    )));
+                }
+                if self.channel_id.is_none() {
+                    return Err(ConfigError::Validation(format!(
+                        "source {owner:?}: epg.mode is \"manual\" but epg.channel_id is unset — a \
+                         manual EPG requires the exact provider channel id as well as the url"
+                    )));
+                }
+            }
+            // Neither requires a url; `disabled` deliberately keeps whatever
+            // was authored (already structurally validated above).
+            EpgMode::Automatic | EpgMode::Disabled => {}
+        }
+        Ok(())
+    }
+}
+
+/// Optional IPTV **playlist presentation** metadata for a source.
+///
+/// Mirrors the presentation fields an M3U/IPTV playlist exposes (`tvg-id`,
+/// `tvg-name`, `tvg-logo`, `group-title`) so a source can be exported/imported
+/// without losing how it is displayed. **Presentation only**: it never affects
+/// the source's media identity, ingest, decode or output — the engine's
+/// pipeline bases its decisions on [`Source::id`] and [`Source::kind`] alone.
+///
+/// The whole block is optional on [`Source`], so pre-EPG documents are
+/// unaffected; `#[non_exhaustive]` for forward compatibility.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+#[non_exhaustive]
+pub struct PlaylistMetadata {
+    /// Optional `tvg-id`: the EPG channel id this entry presents. Distinct from
+    /// [`EpgSource::channel_id`] (the id used to *fetch* the guide).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tvg_id: Option<String>,
+    /// Optional `tvg-name`: the channel name an IPTV playlist displays.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    /// Optional `tvg-logo`: a credential-free HTTP(S) URL to a logo image.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub logo: Option<String>,
+    /// Optional `group-title`: the playlist section this entry appears under.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group: Option<String>,
+}
+
+impl PlaylistMetadata {
+    /// Maximum accepted byte length of [`PlaylistMetadata::tvg_id`].
+    pub const TVG_ID_MAX_BYTES: usize = 512;
+    /// Maximum accepted byte length of [`PlaylistMetadata::name`].
+    pub const NAME_MAX_BYTES: usize = 256;
+    /// Maximum accepted byte length of [`PlaylistMetadata::logo`].
+    pub const LOGO_URL_MAX_BYTES: usize = 2048;
+    /// Maximum accepted byte length of [`PlaylistMetadata::group`].
+    pub const GROUP_MAX_BYTES: usize = 256;
+
+    /// Validate this presentation block for the source named `owner`.
+    ///
+    /// Presentation fields are optional, but when present each is bounded in
+    /// bytes, free of control characters, non-blank, and `logo` must be a
+    /// credential-free HTTP(S) URL.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ConfigError::Validation`] naming the violated rule.
+    pub fn validate(&self, owner: &str) -> Result<(), ConfigError> {
+        let text_fields = [
+            (
+                "playlist_metadata.tvg_id",
+                self.tvg_id.as_deref(),
+                Self::TVG_ID_MAX_BYTES,
+            ),
+            (
+                "playlist_metadata.name",
+                self.name.as_deref(),
+                Self::NAME_MAX_BYTES,
+            ),
+            (
+                "playlist_metadata.group",
+                self.group.as_deref(),
+                Self::GROUP_MAX_BYTES,
+            ),
+        ];
+        for (field, value, max_bytes) in text_fields {
+            let Some(value) = value else { continue };
+            require_bounded_text(field, owner, value, max_bytes)?;
+            if value.trim().is_empty() {
+                return Err(ConfigError::Validation(format!(
+                    "source {owner:?}: {field} is blank — omit the field instead of setting it \
+                     to whitespace"
+                )));
+            }
+        }
+        if let Some(logo) = &self.logo {
+            validate_http_url(
+                "playlist_metadata.logo",
+                owner,
+                logo,
+                Self::LOGO_URL_MAX_BYTES,
+            )?;
+        }
+        Ok(())
+    }
+}
+
+/// Reject control characters and over-long values for an authored string.
+///
+/// `field` is the document-path label (e.g. `epg.url`) used in the message;
+/// `owner` is the owning source id.
+fn require_bounded_text(
+    field: &str,
+    owner: &str,
+    value: &str,
+    max_bytes: usize,
+) -> Result<(), ConfigError> {
+    if let Some(ch) = value.chars().find(|c| c.is_control()) {
+        return Err(ConfigError::Validation(format!(
+            "source {owner:?}: {field} contains a control character (U+{:04X}) — authored text \
+             must be printable",
+            u32::from(ch)
+        )));
+    }
+    if value.len() > max_bytes {
+        return Err(ConfigError::Validation(format!(
+            "source {owner:?}: {field} is {} bytes, over the {max_bytes}-byte limit",
+            value.len()
+        )));
+    }
+    Ok(())
+}
+
+/// Validate a credential-free HTTP(S) URL: bounded, no control characters or
+/// whitespace, an `http`/`https` scheme, a non-empty host, and no `userinfo@`
+/// (credentials belong in a `secret_ref`, never in the URL).
+fn validate_http_url(
+    field: &str,
+    owner: &str,
+    value: &str,
+    max_bytes: usize,
+) -> Result<(), ConfigError> {
+    require_bounded_text(field, owner, value, max_bytes)?;
+    let scheme_ok = value.split_once("://").is_some_and(|(scheme, _)| {
+        scheme.eq_ignore_ascii_case("http") || scheme.eq_ignore_ascii_case("https")
+    });
+    if !scheme_ok {
+        return Err(ConfigError::Validation(format!(
+            "source {owner:?}: {field} {value:?} must be an http(s) URL (https recommended)"
+        )));
+    }
+    let authority = value
+        .split_once("://")
+        .map_or("", |(_, rest)| rest)
+        .split(['/', '?', '#'])
+        .next()
+        .unwrap_or("");
+    if authority.contains('@') {
+        return Err(ConfigError::Validation(format!(
+            "source {owner:?}: {field} must not embed credentials (userinfo) — put them behind \
+             `secret_ref` instead"
+        )));
+    }
+    if value.chars().any(char::is_whitespace) {
+        return Err(ConfigError::Validation(format!(
+            "source {owner:?}: {field} {value:?} contains whitespace — an http(s) URL cannot \
+             contain spaces or tabs"
+        )));
+    }
+    let host = authority.split(':').next().unwrap_or("");
+    if host.is_empty() {
+        return Err(ConfigError::Validation(format!(
+            "source {owner:?}: {field} {value:?} has no host"
+        )));
+    }
+    Ok(())
+}
+
+/// How a linked source follows upstream catalogue changes (ADR-M015).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OriginFollow {
+    /// Never act on upstream changes.
+    Manual,
+    /// Notify the operator (default).
+    #[default]
+    Notify,
+    /// Automatically apply same-channel URL/header updates.
+    Auto,
+}
+
+/// Provenance block recording the catalogue entry a source was linked from.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct SourceOrigin {
+    /// Catalogue provider id (e.g. `iptv-org`).
+    pub provider: String,
+    /// Channel id (`NBC.us`); absent for streams without metadata.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub channel: Option<String>,
+    /// Feed id (`KSHBTV`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub feed: Option<String>,
+    /// The stream URL as linked.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stream_url: Option<String>,
+    /// Catalogue labels at link time (e.g. `Geo-blocked`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub labels: Vec<String>,
+    /// RFC 3339 link timestamp.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub linked_at: Option<String>,
+    /// How to follow upstream changes.
+    #[serde(default)]
+    pub follow: OriginFollow,
 }
 
 /// Per-source wall-clock configuration (ADR-0038, SYNC-0): the operator's
@@ -1811,6 +2516,11 @@ pub enum Output {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         id: Option<String>,
         /// Destination URL (`srt://host:port`, IPv6-first: bracket IPv6 literals).
+        ///
+        /// With `mode=listener` this is the bind address and callers pull the
+        /// program: `srt://[::]:port` (or an empty host) is one dual-stack socket
+        /// serving up to 16 simultaneous IPv6 and IPv4 callers. `0.0.0.0` is IPv4
+        /// only; a specific address binds only that address.
         url: String,
         /// Video codec.
         codec: String,
@@ -2247,6 +2957,26 @@ impl Output {
             | Output::WhipPush { audio, .. }
             | Output::Aes67 { audio, .. }
             | Output::Display { audio, .. } => audio.as_ref(),
+        }
+    }
+
+    /// Mutable access to the per-output audio selection (ADR-R005 §4.3: a
+    /// routing rename/removal must rewrite every referencing output's
+    /// selection in the SAME atomic commit — see
+    /// `multiview_config::audio::propagate_routing_change`).
+    pub fn audio_mut(&mut self) -> &mut Option<OutputAudio> {
+        match self {
+            Output::RtspServer { audio, .. }
+            | Output::LlHls { audio, .. }
+            | Output::Hls { audio, .. }
+            | Output::Ndi { audio, .. }
+            | Output::Rtmp { audio, .. }
+            | Output::Srt { audio, .. }
+            | Output::Rist { audio, .. }
+            | Output::Webrtc { audio, .. }
+            | Output::WhipPush { audio, .. }
+            | Output::Aes67 { audio, .. }
+            | Output::Display { audio, .. } => audio,
         }
     }
 

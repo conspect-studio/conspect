@@ -4,9 +4,10 @@ use crate::source_event_service::{
     ServiceLimits, SourceEventProducer, SourceEventRegistry, SourceEventService,
 };
 use multiview_control::source_events::{
-    SourceEventAvailability, SourceEventDto, SourceEventLabel, SourceEventLifecycle,
-    SourceEventOrigin, SourceEventProvider, SourceEventTimer, SourceEventTimerKind,
-    SourceEventsDto,
+    ActiveBreak, BreakStatus, SourceBreakProvider, SourceEventAvailability, SourceEventDto,
+    SourceEventLabel, SourceEventLifecycle, SourceEventOrigin, SourceEventProvider,
+    SourceEventTestInjector, SourceEventTimer, SourceEventTimerKind, SourceEventsDto,
+    TestEventBoundary, TestEventOutcome,
 };
 use multiview_core::{
     event_overlay::{
@@ -208,7 +209,7 @@ impl SourceEventProvider for RuntimeReader {
                 read.as_ref().is_some_and(|read| {
                     read.epoch == sample.epoch
                         && context.matches(read, sample.frame)
-                        && self.registry.is_current(read)
+                        && self.registry.same_generation(read)
                 })
             })
             .map_or_else(Vec::new, |sample| {
@@ -241,7 +242,7 @@ impl SourceEventProvider for RuntimeReader {
                     })
                     .collect()
             });
-        Some(SourceEventsDto::new(
+        let snapshot = SourceEventsDto::new(
             id,
             epoch,
             if valid {
@@ -251,7 +252,87 @@ impl SourceEventProvider for RuntimeReader {
             },
             read.as_ref().is_some_and(|read| read.degraded),
             rows,
-        ))
+        );
+        Some(match crate::event_journal::live_summary(id) {
+            Some(live) => snapshot.with_decoded(live.clock.clone(), live.markers.clone()),
+            None => snapshot,
+        })
+    }
+}
+impl SourceBreakProvider for RuntimeReader {
+    /// Fresh acquisition every call (S1). Only explicit, non-vendor evidence
+    /// counts: a timed start must be presented on the latched frame clock; an
+    /// untimed start counts only for external/operator evidence. Cancelled,
+    /// ended, superseded or uncertain occurrences are never "in break".
+    fn break_status(&self, id: &str) -> Option<BreakStatus> {
+        use multiview_core::source_event::{EventBoundary, EventLifecycle, EventOrigin};
+        let context = self.context(id)?;
+        let read = self.registry.snapshot(id)?;
+        let samples = self.sampled.load();
+        let position = samples.get(id).and_then(|sample| {
+            (sample.presented
+                && sample.epoch == read.epoch
+                && sample.sampled_at.elapsed() < std::time::Duration::from_secs(1)
+                && context.matches(&read, sample.frame))
+            .then(|| sample.frame.pts.as_nanos())
+        });
+        let clock = position.map_or(PresentationClock::Unknown, |position_ns| {
+            PresentationClock::Fresh {
+                source_id: id.to_owned(),
+                epoch: read.epoch,
+                position_ns,
+            }
+        });
+        let active = read.events.iter().find_map(|event| {
+            if matches!(event.key.origin, EventOrigin::VendorMarker { .. })
+                || event.key.epoch != read.epoch
+            {
+                return None;
+            }
+            let mut start = None;
+            let mut ended = false;
+            for o in event.observations() {
+                match o.boundary {
+                    EventBoundary::Start { pts_ns, .. } => start = Some(pts_ns),
+                    EventBoundary::End { .. } | EventBoundary::Cancel => ended = true,
+                    _ => {}
+                }
+            }
+            let in_break = match start? {
+                Some(_) => event.project(&clock).lifecycle == EventLifecycle::Active,
+                None => matches!(event.key.origin, EventOrigin::External) && !ended,
+            };
+            in_break.then(|| ActiveBreak {
+                event_id: event.key.event_id.clone(),
+                test: event.key.event_id.starts_with("test:"),
+            })
+        });
+        // Anything published between acquisition and here makes this answer
+        // obsolete: report degraded so no NEW action starts on it this tick.
+        let degraded = read.degraded || !self.registry.is_current(&read);
+        Some(BreakStatus {
+            epoch: read.epoch,
+            active,
+            degraded,
+        })
+    }
+}
+impl SourceEventTestInjector for RuntimeReader {
+    fn inject_test_event(&self, id: &str, boundary: TestEventBoundary) -> TestEventOutcome {
+        let boundary = match boundary {
+            TestEventBoundary::Start { duration_ns } => {
+                crate::source_event_test_inject::TestBoundary::Start { duration_ns }
+            }
+            TestEventBoundary::End => crate::source_event_test_inject::TestBoundary::End,
+        };
+        match self.registry.inject_test_observation(id, boundary) {
+            None => TestEventOutcome::Unknown,
+            Some(
+                crate::source_event_service::SubmitOutcome::Queued
+                | crate::source_event_service::SubmitOutcome::Invalid,
+            ) => TestEventOutcome::Queued,
+            Some(_) => TestEventOutcome::Overflow,
+        }
     }
 }
 fn event_priority(
@@ -339,6 +420,7 @@ fn event_dto(
         lifecycle: projection.lifecycle,
         label: OverlayLabel::Uncertain,
         timer: None,
+        descriptor: event.descriptor().cloned(),
     };
     let mut row = dto(overlay.as_ref().unwrap_or(&fallback));
     if overlay.is_none() {
@@ -398,6 +480,9 @@ fn dto(overlay: &EventOverlay) -> SourceEventDto {
         }),
         asset_id: None,
         correlation_id: None,
+        marker_name: overlay.descriptor.as_ref().map(|d| d.name.clone()),
+        marker_type_id: overlay.descriptor.as_ref().and_then(|d| d.type_id.clone()),
+        marker_detail: overlay.descriptor.as_ref().and_then(|d| d.detail.clone()),
     }
 }
 
@@ -471,6 +556,11 @@ impl NativeEvents {
             self.mark_degraded();
             return;
         };
+        // Per-segment clock stamps are a clock reference, not event evidence:
+        // the journal keeps them and the panel shows them as the source clock.
+        if multiview_input::id3::is_clock_only(&tag) {
+            return;
+        }
         if self.id3.contains(&tag) {
             return;
         }
@@ -493,6 +583,10 @@ impl NativeEvents {
             return;
         };
         while self.id3_published < self.id3.len() {
+            let descriptor = self
+                .id3
+                .get(self.id3_published)
+                .and_then(multiview_input::id3::marker_descriptor);
             let observation = SourceEventObservation {
                 key: SourceEventKey {
                     source_id: self.source.clone(),
@@ -504,6 +598,7 @@ impl NativeEvents {
                 boundary: EventBoundary::MarkerObserved,
                 asset_id: None,
                 correlation_id: None,
+                descriptor,
             };
             let _ = producer.try_observe(observation);
             self.id3_published += 1;
@@ -542,6 +637,21 @@ impl NativeEvents {
         while self.untimed_scte_published < self.untimed_scte.len() {
             // Section occurrence namespace is independent of trusted insert/seg IDs.
             // One evidence row per validated section, never an invented break instance.
+            let descriptor = self
+                .untimed_scte
+                .get(self.untimed_scte_published)
+                .and_then(|cues| cues.first())
+                .and_then(|cue| {
+                    cue.segmentation.as_ref().and_then(|d| {
+                        let type_id = d.segmentation_type_id?;
+                        let name = multiview_input::scte::segmentation_type_name(type_id)?;
+                        Some(multiview_core::source_event::MarkerDescriptor {
+                            name: name.to_owned(),
+                            type_id: Some(format!("0x{type_id:02X}")),
+                            detail: None,
+                        })
+                    })
+                });
             let observation = SourceEventObservation {
                 key: SourceEventKey {
                     source_id: self.source.clone(),
@@ -553,6 +663,7 @@ impl NativeEvents {
                 boundary: EventBoundary::MarkerObserved,
                 asset_id: None,
                 correlation_id: None,
+                descriptor,
             };
             let _ = producer.try_observe(observation);
             self.untimed_scte_published += 1;
@@ -694,6 +805,27 @@ mod tests {
         native.ingest_hls();
         native.mapping(None);
         assert!(native.hls.is_none());
+        runtime.shutdown().expect("join");
+    }
+    #[test]
+    fn id3_clock_stamps_are_not_event_evidence() {
+        let runtime = Runtime::new().expect("worker");
+        let lease = runtime.activate("s", 1).expect("lease");
+        let mut native = NativeEvents::new("s".into(), &lease).expect("connection");
+        let mut payload = multiview_input::id3::ELEMENTAL_UTC_OWNER
+            .as_bytes()
+            .to_vec();
+        payload.push(0);
+        payload.extend_from_slice(b"2026-11-03T21:14:58Z");
+        let frame = u8::try_from(payload.len()).expect("frame");
+        let total = u8::try_from(payload.len() + 10).expect("tag");
+        let mut tag = b"ID3\x04\x00\x00\x00\x00\x00".to_vec();
+        tag.push(total);
+        tag.extend_from_slice(&[b'P', b'R', b'I', b'V', 0, 0, 0, frame, 0, 0]);
+        tag.extend_from_slice(&payload);
+        native.observe_id3(&tag);
+        assert_eq!(native.id3.len(), 0);
+        assert!(!native.loss.get());
         runtime.shutdown().expect("join");
     }
     #[test]
@@ -915,6 +1047,7 @@ mod tests {
                 boundary,
                 asset_id: Some("asset".into()),
                 correlation_id: Some("correlation".into()),
+                descriptor: None,
             });
         }
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
@@ -990,6 +1123,7 @@ mod tests {
                 },
                 asset_id: None,
                 correlation_id: None,
+                descriptor: None,
             });
         }
         let clock = PresentationClock::Fresh {

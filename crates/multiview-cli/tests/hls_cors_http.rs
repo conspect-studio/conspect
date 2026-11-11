@@ -154,6 +154,8 @@ async fn control_listener_serves_hls_outputs_with_cors() {
         publisher,
         commands,
         multiview_control::no_preview(),
+        None, // switcher: absent unless a real paired bus is attached
+        None, // switcher lease owner absent
         None, // whep
         None, // whip
         None, // whep_output

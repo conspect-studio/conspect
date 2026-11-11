@@ -294,3 +294,29 @@ fn salvo_taken_without_head_is_object_scoped() {
     let e = Event::SalvoTaken(SalvoEvent::new("preset-a", SalvoPhase::Taken));
     assert_eq!(e.authz_scope(), AuthzScope::Object("preset-a"));
 }
+
+#[test]
+fn input_lifecycle_is_object_scoped_and_round_trips() {
+    use multiview_events::{InputLifecycle, LeaseHolder, SourceLifecycle};
+    let body = InputLifecycle::new(
+        "cam2",
+        3,
+        SourceLifecycle::Starting,
+        SourceLifecycle::Ready,
+        "media arrived",
+        1_700_000_000_000,
+        vec![LeaseHolder {
+            kind: "layout_cell".into(),
+            label: "cell-1".into(),
+            object_id: None,
+        }],
+    );
+    let e = Event::InputLifecycle(body.clone());
+    assert_eq!(e.authz_scope(), AuthzScope::Object("cam2"));
+    let wire = serde_json::to_value(&e).unwrap();
+    assert_eq!(wire["t"], json!("input.lifecycle"));
+    let back: InputLifecycle =
+        serde_json::from_value(serde_json::to_value(&body).unwrap()).unwrap();
+    assert_eq!(back, body);
+    assert_eq!(serde_json::to_value(&body).unwrap()["to"], json!("ready"));
+}

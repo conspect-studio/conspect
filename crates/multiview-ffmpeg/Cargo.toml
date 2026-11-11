@@ -33,10 +33,22 @@ ffmpeg-next = { version = "9.0", optional = true }
 # already in the dependency tree via `ffmpeg-sys-next`, so this adds no new
 # native/license surface. MIT OR Apache-2.0.
 libc = { version = "0.2", optional = true }
+# Bounded temp file the IPTV-ORG probe demuxes downloaded segments from (media_probe).
+tempfile = { version = "3", optional = true }
+
+# Host-side cost of the source-size decode + swscale tile path vs the NVDEC
+# fused-resize identity path (perf evidence for decode-at-display-size).
+[[example]]
+name = "tile_scale_cost"
+required-features = ["ffmpeg"]
+
+# Emitted-line count + suppressor cost for an HLS reconnect log flood.
+[[example]]
+name = "log_flood"
 
 [features]
 "default" = []
-"ffmpeg" = ["dep:ffmpeg-next", "dep:libc"]
+"ffmpeg" = ["dep:ffmpeg-next", "dep:libc", "dep:tempfile"]
 "gpl-codecs" = []
 # NVENC hardware-encoder selection (h264_nvenc / hevc_nvenc). Compile-only here:
 # the NVENC encoders live in the linked libavcodec, so this gates only which

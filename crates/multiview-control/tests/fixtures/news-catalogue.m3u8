@@ -1,0 +1,27 @@
+#EXTM3U url-tvg="https://epg.example.test/guide.xml.gz"
+#######################################################################
+# SYNTHETIC fixture shaped like the curated "verified news streams" gist:
+# a banner comment block, section comments, tvg-id/tvg-logo/group-title
+# attributes, an entry without a logo, and a commented-out appendix.
+# All hosts are reserved example/test names.
+#######################################################################
+
+# ================= US NEWS =================
+
+#EXTINF:-1 tvg-id="CNN.us" tvg-logo="https://logos.example.test/CNN.png" group-title="US News",CNN US (1080p)
+https://cdn.example.test/v1/master/abc/cnn/index.m3u8
+
+#EXTINF:-1 tvg-id="CNN.us" tvg-logo="https://logos.example.test/CNN.png" group-title="US News",CNN US backup (1080p HEVC — starved)
+http://relay.example.test:8080/cnn/index.m3u8
+
+#EXTINF:-1 tvg-id="FoxNewsChannel.us" group-title="US News",Fox News official preview (240p)
+http://preview.example.test/hls/live/2020027/primary.m3u8
+
+#EXTINF:-1 tvg-id="Example.au" tvg-logo="https://logos.example.test/ex.png" group-title="AU News",Example — em dash, comma (720p)
+https://au.example.test/live/playlist.m3u8?token=test
+
+# ================= APPENDIX: EXOTIC PROTOCOLS (UNVALIDATED) ==============
+# SRT:
+#   srt://192.0.2.10:4001
+# RTMP:
+#   rtmp://192.0.2.11/live/stream

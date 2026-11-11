@@ -168,6 +168,11 @@ pub(crate) struct SurfacePool {
     pub y_array: Option<CachedTexture>,
     /// Tile interleaved UV planes (`Rg8Unorm` texture-array, half-res).
     pub uv_array: Option<CachedTexture>,
+    /// Straight per-pixel alpha planes (`R8Unorm` texture-array, full-res) for
+    /// NV12+A tiles only (ADR-0058). Grow-only on the max ALPHA-tile extent and
+    /// alpha-tile count; an all-opaque frame needs only the 1x1x1 placeholder
+    /// the bind group requires, so opaque frames never upload alpha bytes.
+    pub a_array: Option<CachedTexture>,
 
     // --- canvas-sized surfaces (exact-match reuse, resize is rare) ----------
     /// Linear `Rgba16Float` composite canvas.

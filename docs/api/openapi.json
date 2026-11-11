@@ -968,6 +968,489 @@
         }
       }
     },
+    "/api/v1/catalogues/iptv-org/import": {
+      "post": {
+        "tags": [
+          "catalogue"
+        ],
+        "summary": "`POST /api/v1/catalogues/iptv-org/import` — offline bundle import (administer).",
+        "operationId": "import_catalogue",
+        "requestBody": {
+          "description": "A JSON object keyed by upstream file name (`streams`, `channels`, `feeds`, `logos`, `cities`, `countries`, `subdivisions`, `regions`, `blocklist`, `categories`, `languages`), optionally gzip'd. Replaces the named files; the rest stay as persisted.",
+          "content": {
+            "application/json": {
+              "schema": {}
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "`{outcome, changed[]}`.",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "403": {
+            "description": "Requires administer.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Bundle is malformed.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/catalogues/iptv-org/index": {
+      "get": {
+        "tags": [
+          "catalogue"
+        ],
+        "summary": "`GET /api/v1/catalogues/iptv-org/index` — the joined stream index.",
+        "operationId": "get_catalogue_index",
+        "responses": {
+          "200": {
+            "description": "`{schema, generated_at, categories[], languages[], streams[]}`; gzip when accepted; identical for every caller (`already_added` is computed by the web).",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "304": {
+            "description": "If-None-Match matched ."
+          },
+          "401": {
+            "description": "Missing or invalid credentials.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "No snapshot yet; refresh or import first.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/catalogues/iptv-org/links": {
+      "get": {
+        "tags": [
+          "catalogue"
+        ],
+        "summary": "`GET /api/v1/catalogues/iptv-org/links` — per-source link status (caller-scoped).",
+        "operationId": "list_catalogue_links",
+        "responses": {
+          "200": {
+            "description": "`{links: [{source_id, status, checked_at, upstream, replaced_by, alternatives}]}` — status, upstream target and ranked alternatives (with cached probe verdict), only for sources the caller may see.",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid credentials.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Catalogue not configured.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/catalogues/iptv-org/logos/{k}": {
+      "get": {
+        "tags": [
+          "catalogue"
+        ],
+        "summary": "`GET /api/v1/catalogues/iptv-org/logos/{k}` — persistent server-side logo cache.",
+        "operationId": "get_catalogue_logo",
+        "parameters": [
+          {
+            "name": "k",
+            "in": "path",
+            "description": "Logo key `l:<hex>` from an index row.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The logo image (PNG/JPEG/WebP/GIF/SVG), size-capped, cached on disk for 30 days. `Cache-Control: private, max-age=2592000, immutable` and a strong `ETag`.",
+            "content": {
+              "image/*": {}
+            }
+          },
+          "204": {
+            "description": "No logo: unknown key, upstream missing/failing, oversized or not an image (`Cache-Control: private, max-age=86400`), or the upstream fetch queue was busy (`Cache-Control: no-store`; retry later). Never an error status."
+          },
+          "304": {
+            "description": "`If-None-Match` matched the logo's `ETag`."
+          },
+          "409": {
+            "description": "Catalogue not configured.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/catalogues/iptv-org/places": {
+      "get": {
+        "tags": [
+          "catalogue"
+        ],
+        "summary": "`GET /api/v1/catalogues/iptv-org/places` — the gazetteer with stream counts.",
+        "operationId": "get_catalogue_places",
+        "responses": {
+          "200": {
+            "description": "`{schema, places[{id, kind, name, alt, country, subdivision, lat, lon, flag, members, streams, streams_within}]}`; `id` is prefixed like a row's `area`.",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "304": {
+            "description": "If-None-Match matched."
+          },
+          "401": {
+            "description": "Missing or invalid credentials.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "No snapshot yet.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/catalogues/iptv-org/probes": {
+      "post": {
+        "tags": [
+          "catalogue"
+        ],
+        "summary": "`POST /api/v1/catalogues/iptv-org/probes` — start a probe job (operate).",
+        "operationId": "create_catalogue_probe",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ProbeBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "202": {
+            "description": "The probe job `{id, state: queued|running|done|failed, results[], error}`; poll `GET probes/{id}`. A 15-minute cache hit completes immediately.",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "403": {
+            "description": "Requires operate (write), or a `source_ids` entry the caller may not use.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Unknown key or source id.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "`keys` + `source_ids` must hold 1..=50 entries.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "Per-principal rate (60/min) or the global queue (64) is exhausted.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "No probe service on this node.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/catalogues/iptv-org/probes/{id}": {
+      "get": {
+        "tags": [
+          "catalogue"
+        ],
+        "summary": "`GET /api/v1/catalogues/iptv-org/probes/{id}` — a probe job.",
+        "operationId": "get_catalogue_probe",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Probe job id.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The probe job and its finished results (verdict, facts, events).",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "404": {
+            "description": "Unknown job.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/catalogues/iptv-org/refresh": {
+      "post": {
+        "tags": [
+          "catalogue"
+        ],
+        "summary": "`POST /api/v1/catalogues/iptv-org/refresh` — sync now (administer).",
+        "operationId": "refresh_catalogue",
+        "responses": {
+          "200": {
+            "description": "`{outcome: unchanged|updated, changed[]}`; a failed sync keeps the previous snapshot.",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "403": {
+            "description": "Requires administer.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Disabled / not configured.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "502": {
+            "description": "Upstream sync failed.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/catalogues/iptv-org/sources": {
+      "post": {
+        "tags": [
+          "catalogue"
+        ],
+        "summary": "`POST /api/v1/catalogues/iptv-org/sources` — bulk-create sources (write).",
+        "operationId": "create_catalogue_sources",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/BulkAddBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "description": "Every source was created; per-item results in request order.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BulkAddResponse"
+                }
+              }
+            }
+          },
+          "207": {
+            "description": "A durable write failed part-way: earlier items are created, the failed item and the rest are reported.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BulkAddResponse"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Requires write, or an id is outside the caller's scope.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "More than 200 sources in one bulk add; or more than 8 with an entry that leaves its `activation` implicit; or an entry is invalid or duplicated. Nothing was created.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/catalogues/iptv-org/status": {
+      "get": {
+        "tags": [
+          "catalogue"
+        ],
+        "summary": "`GET /api/v1/catalogues/iptv-org/status`.",
+        "operationId": "get_catalogue_status",
+        "responses": {
+          "200": {
+            "description": "Sync state, counts, ETags, last error and the caller-scoped link-status tally.",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid credentials.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Catalogue not configured.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/v1/cloudflare/credentials": {
       "post": {
         "tags": [
@@ -2486,6 +2969,1089 @@
         }
       }
     },
+    "/api/v1/events/journal.jsonl": {
+      "get": {
+        "tags": [
+          "inputs"
+        ],
+        "operationId": "get_event_journal_export",
+        "parameters": [
+          {
+            "name": "from",
+            "in": "query",
+            "description": "Earliest receive time, RFC 3339.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "to",
+            "in": "query",
+            "description": "Latest receive time, RFC 3339.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "origin",
+            "in": "query",
+            "description": "`scte35`, `id3` or `hls`.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "description": "Page size, at most 500.",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "minimum": 0
+            }
+          },
+          {
+            "name": "cursor",
+            "in": "query",
+            "description": "`next_cursor` of the previous page.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Streamed JSONL of every source (unscoped administrators only).",
+            "content": {
+              "application/x-ndjson": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid filter",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid credentials",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Requires an unscoped administrator",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Journal unavailable or busy",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ]
+      }
+    },
+    "/api/v1/graphics/channels": {
+      "get": {
+        "tags": [
+          "graphics"
+        ],
+        "summary": "`GET /api/v1/graphics/channels` (role: read; scoped rows only).",
+        "operationId": "list_channels",
+        "responses": {
+          "200": {
+            "description": "In-scope channels with PVW/PGM.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/ChannelView"
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/graphics/channels/{id}": {
+      "get": {
+        "tags": [
+          "graphics"
+        ],
+        "summary": "`GET /api/v1/graphics/channels/{id}` — status (role: read; per-object).",
+        "operationId": "get_channel",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Channel id.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The channel with PVW/PGM.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ChannelView"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Out of scope.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Unknown id.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/graphics/channels/{id}/clear": {
+      "post": {
+        "tags": [
+          "graphics"
+        ],
+        "summary": "`POST /api/v1/graphics/channels/{id}/clear` — program off air (role:\nwrite; per-object).",
+        "operationId": "clear",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Channel id.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PlayoutInput"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "The channel after the clear.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ChannelView"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Unknown channel.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/graphics/channels/{id}/cue": {
+      "post": {
+        "tags": [
+          "graphics"
+        ],
+        "summary": "`POST /api/v1/graphics/channels/{id}/cue` (role: write; per-object on the\nchannel and the item).",
+        "operationId": "cue",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Channel id.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CueInput"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "The channel after the cue.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ChannelView"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Not authorized.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Unknown channel or item.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/graphics/channels/{id}/next": {
+      "post": {
+        "tags": [
+          "graphics"
+        ],
+        "summary": "`POST /api/v1/graphics/channels/{id}/next` — cue the next rundown entry\n(role: write; per-object).",
+        "operationId": "next",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Channel id.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PlayoutInput"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "The channel after the cue.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ChannelView"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Unknown channel.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "End of rundown.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/graphics/channels/{id}/rundown": {
+      "get": {
+        "tags": [
+          "graphics"
+        ],
+        "summary": "`GET /api/v1/graphics/channels/{id}/rundown` (same as the channel status).",
+        "operationId": "get_rundown",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Channel id.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The channel with its rundown.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ChannelView"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Unknown id.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        }
+      },
+      "put": {
+        "tags": [
+          "graphics"
+        ],
+        "summary": "`PUT /api/v1/graphics/channels/{id}/rundown` — replace the rundown (and\noptionally the transition preset / name); creates the channel when new\n(role: write; per-object on the channel and every listed item).",
+        "operationId": "put_rundown",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Channel id.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RundownInput"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "The channel.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ChannelView"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Not authorized.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "412": {
+            "description": "A sent If-Match is stale.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Unknown item / invalid preset.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/graphics/channels/{id}/take": {
+      "post": {
+        "tags": [
+          "graphics"
+        ],
+        "summary": "`POST /api/v1/graphics/channels/{id}/take` — preview to air (role: write;\nper-object).",
+        "operationId": "take",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Channel id.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PlayoutInput"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "The channel after the take.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ChannelView"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Unknown channel.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Nothing cued.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/graphics/data-sources": {
+      "get": {
+        "tags": [
+          "graphics"
+        ],
+        "summary": "`GET /api/v1/graphics/data-sources` (role: read; scoped rows only).",
+        "operationId": "list_data_sources",
+        "responses": {
+          "200": {
+            "description": "In-scope data sources with status.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/DataSourceView"
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid credentials.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/graphics/data-sources/{id}": {
+      "get": {
+        "tags": [
+          "graphics"
+        ],
+        "summary": "`GET /api/v1/graphics/data-sources/{id}` (role: read; per-object).",
+        "operationId": "get_data_source",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Data source id.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The data source.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DataSourceView"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Out of scope.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Unknown id.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        }
+      },
+      "put": {
+        "tags": [
+          "graphics"
+        ],
+        "summary": "`PUT /api/v1/graphics/data-sources/{id}` (role: write; per-object).",
+        "operationId": "put_data_source",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Data source id.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/DataSourceInput"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Replaced.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DataSourceView"
+                }
+              }
+            }
+          },
+          "201": {
+            "description": "Created.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DataSourceView"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Not authorized.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "412": {
+            "description": "A sent If-Match is stale.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Invalid body.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        }
+      },
+      "delete": {
+        "tags": [
+          "graphics"
+        ],
+        "summary": "`DELETE /api/v1/graphics/data-sources/{id}` (role: administer; per-object).",
+        "operationId": "delete_data_source",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Data source id.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Deleted."
+          },
+          "403": {
+            "description": "Not authorized.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Unknown id.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Still bound by an item.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "412": {
+            "description": "A sent If-Match is stale.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/graphics/items": {
+      "get": {
+        "tags": [
+          "graphics"
+        ],
+        "summary": "`GET /api/v1/graphics/items` (role: read; scoped rows only).",
+        "operationId": "list_items",
+        "responses": {
+          "200": {
+            "description": "In-scope items.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/ItemDoc"
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/graphics/items/{id}": {
+      "get": {
+        "tags": [
+          "graphics"
+        ],
+        "summary": "`GET /api/v1/graphics/items/{id}` (role: read; per-object).",
+        "operationId": "get_item",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Item id.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The item.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ItemDoc"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Out of scope.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Unknown id.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        }
+      },
+      "put": {
+        "tags": [
+          "graphics"
+        ],
+        "summary": "`PUT /api/v1/graphics/items/{id}` (role: write; per-object on the item and\nits data source).",
+        "operationId": "put_item",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Item id.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ItemInput"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Replaced.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ItemDoc"
+                }
+              }
+            }
+          },
+          "201": {
+            "description": "Created.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ItemDoc"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Not authorized.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "412": {
+            "description": "A sent If-Match is stale.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Invalid body.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        }
+      },
+      "delete": {
+        "tags": [
+          "graphics"
+        ],
+        "summary": "`DELETE /api/v1/graphics/items/{id}` (role: administer; per-object). The\nitem leaves every rundown; if it is on air it is cut to clear.",
+        "operationId": "delete_item",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Item id.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Deleted."
+          },
+          "403": {
+            "description": "Not authorized.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Unknown id.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "412": {
+            "description": "A sent If-Match is stale.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/graphics/items/{id}/thumbnail.jpg": {
+      "get": {
+        "tags": [
+          "graphics"
+        ],
+        "summary": "`GET /api/v1/graphics/items/{id}/thumbnail.jpg` (role: read; per-object).",
+        "operationId": "item_thumbnail",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Item id.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "JPEG thumbnail.",
+            "content": {
+              "image/jpeg": {}
+            }
+          },
+          "404": {
+            "description": "Unknown id.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Rendering unavailable in this build."
+          }
+        }
+      }
+    },
+    "/api/v1/graphics/templates": {
+      "get": {
+        "tags": [
+          "graphics"
+        ],
+        "summary": "`GET /api/v1/graphics/templates` (role: read).",
+        "operationId": "list_templates",
+        "responses": {
+          "200": {
+            "description": "Built-in templates.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/TemplateDoc"
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/graphics/templates/{id}/sample.jpg": {
+      "get": {
+        "tags": [
+          "graphics"
+        ],
+        "summary": "`GET /api/v1/graphics/templates/{id}/sample.jpg` — a sample render bound\nto the first in-scope data source of the right kind (role: read).",
+        "operationId": "template_sample",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Template id.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "JPEG sample.",
+            "content": {
+              "image/jpeg": {}
+            }
+          },
+          "404": {
+            "description": "Unknown template.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Rendering unavailable in this build."
+          }
+        }
+      }
+    },
     "/api/v1/health": {
       "get": {
         "tags": [
@@ -2620,6 +4186,744 @@
         ]
       }
     },
+    "/api/v1/inputs/{id}/events/automation": {
+      "get": {
+        "tags": [
+          "inputs"
+        ],
+        "summary": "`GET /api/v1/inputs/{id}/events/automation` — rule, live status and log.",
+        "operationId": "get_automation",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Exact source identity",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Automation rule, live status and bounded action log.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AutomationView"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid credentials",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Source outside principal scope",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Unknown source",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ]
+      },
+      "put": {
+        "tags": [
+          "inputs"
+        ],
+        "summary": "`PUT /api/v1/inputs/{id}/events/automation` — replace (or remove) the rule,\npersisted through the canonical durable source path. Never arms: a new or\nedited rule keeps the CURRENT armed state (disarmed if new).",
+        "operationId": "put_automation",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Exact source identity",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AutomationPut"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "The stored rule and live status.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AutomationView"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid credentials",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Source, target or cell outside principal scope, or insufficient role",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Unknown source",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Invalid rule",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ]
+      }
+    },
+    "/api/v1/inputs/{id}/events/automation/arm": {
+      "post": {
+        "tags": [
+          "inputs"
+        ],
+        "summary": "`POST /api/v1/inputs/{id}/events/automation/arm` — arm the stored rule.",
+        "operationId": "post_automation_arm",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Exact source identity",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Armed; rule and live status.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AutomationView"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid credentials",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Source, target or cell outside principal scope, or insufficient role",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Unknown source",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "No rule configured",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ]
+      }
+    },
+    "/api/v1/inputs/{id}/events/automation/disarm": {
+      "post": {
+        "tags": [
+          "inputs"
+        ],
+        "summary": "`POST /api/v1/inputs/{id}/events/automation/disarm` — disarm. A break in\nprogress is restored by the executor on its next tick.",
+        "operationId": "post_automation_disarm",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Exact source identity",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Disarmed; rule and live status.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AutomationView"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid credentials",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Source outside principal scope, or insufficient role",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Unknown source",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "No rule configured",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ]
+      }
+    },
+    "/api/v1/inputs/{id}/events/automation/restore": {
+      "post": {
+        "tags": [
+          "inputs"
+        ],
+        "summary": "`POST /api/v1/inputs/{id}/events/automation/restore` — restore now.",
+        "operationId": "post_automation_restore",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Exact source identity",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Restore dispatched; rule and live status.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AutomationView"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid credentials",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Source outside principal scope, or insufficient role",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Unknown source",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Nothing to restore, or an operator change already took over",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Executor unavailable or command bus busy",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ]
+      }
+    },
+    "/api/v1/inputs/{id}/events/journal": {
+      "get": {
+        "tags": [
+          "inputs"
+        ],
+        "operationId": "get_event_journal",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Exact source identity",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "from",
+            "in": "query",
+            "description": "Earliest receive time, RFC 3339.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "to",
+            "in": "query",
+            "description": "Latest receive time, RFC 3339.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "origin",
+            "in": "query",
+            "description": "`scte35`, `id3` or `hls`.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "description": "Page size, at most 500.",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "minimum": 0
+            }
+          },
+          {
+            "name": "cursor",
+            "in": "query",
+            "description": "`next_cursor` of the previous page.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "One newest-first page of raw marker observations.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/JournalPage"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid filter or cursor",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid credentials",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Source outside principal scope",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Unknown source",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Journal unavailable or busy",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ]
+      }
+    },
+    "/api/v1/inputs/{id}/events/journal.jsonl": {
+      "get": {
+        "tags": [
+          "inputs"
+        ],
+        "operationId": "get_event_journal_dump",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Exact source identity",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "from",
+            "in": "query",
+            "description": "Earliest receive time, RFC 3339.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "to",
+            "in": "query",
+            "description": "Latest receive time, RFC 3339.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "origin",
+            "in": "query",
+            "description": "`scte35`, `id3` or `hls`.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "description": "Page size, at most 500.",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "minimum": 0
+            }
+          },
+          {
+            "name": "cursor",
+            "in": "query",
+            "description": "`next_cursor` of the previous page.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Streamed JSONL, oldest first; `repeat` lines fold into the record they name.",
+            "content": {
+              "application/x-ndjson": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid filter",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid credentials",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Source outside principal scope",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Unknown source",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Journal unavailable or busy",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ]
+      }
+    },
+    "/api/v1/inputs/{id}/events/test": {
+      "post": {
+        "tags": [
+          "inputs"
+        ],
+        "summary": "`POST /api/v1/inputs/{id}/events/test` — inject a clearly-labelled synthetic\nevent for operator/automation testing (ADR-0183 item 5; role: administer).",
+        "description": "This can only affect a source that already has an ACTIVE event-tracking\ngeneration (a source the running engine has ingested, live or previously\nconnected) — it never allocates a new source identity or epoch, and the\ninjected evidence is tagged `origin: \"external\"` with a `test:` event id\nprefix so it is unmistakably distinguishable from real evidence in the\nAPI/UI. It never bypasses the bounded worker queue or payload limits real\nevidence uses.",
+        "operationId": "post_source_event_test",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Exact source identity; no suffix normalization",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/TestEventRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "202": {
+            "description": "Synthetic observation accepted into the bounded worker queue."
+          },
+          "401": {
+            "description": "Missing or invalid credentials",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Source outside principal scope, or insufficient role",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Unknown or never-active source",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Source event test-injection adapter unavailable, or the queue is full",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ]
+      }
+    },
     "/api/v1/inputs/{id}/streams": {
       "get": {
         "tags": [
@@ -2671,7 +4975,137 @@
             }
           },
           "404": {
-            "description": "No such input, or it has not been probed yet.",
+            "description": "No such input.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Not probed yet: the input is idle (nothing consumes it) or still starting. Its streams are read when a consumer starts it; preview it to start it.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/iptv": {
+      "get": {
+        "tags": [
+          "iptv"
+        ],
+        "summary": "`GET /api/v1/iptv` — the publication document and status (role: read).",
+        "operationId": "get_iptv",
+        "responses": {
+          "200": {
+            "description": "The IPTV publication (ETag in the response header). Entries are filtered to the caller's object scope.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/IptvState"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid credentials.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Not authorized to read.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        }
+      },
+      "put": {
+        "tags": [
+          "iptv"
+        ],
+        "summary": "`PUT /api/v1/iptv` — replace the publication (role: write; `If-Match`).",
+        "operationId": "put_iptv",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/IptvConfigDoc"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "The replaced publication (new ETag). Applies live: the playlist/guide are served from accepted intent.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/IptvState"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid credentials.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Not authorized to write, or an entry references an object outside the caller's scope.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "412": {
+            "description": "If-Match precondition failed.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Invalid document: unknown output/source reference, a non-HLS output, a source entry without allow_direct_source_url, or a structural error.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "428": {
+            "description": "No If-Match precondition was sent.",
             "content": {
               "application/json": {
                 "schema": {
@@ -4562,6 +6996,132 @@
           },
           "412": {
             "description": "If-Match precondition failed.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/outputs/{id}/link": {
+      "get": {
+        "tags": [
+          "outputs"
+        ],
+        "summary": "`GET /api/v1/outputs/{id}/link` — the live link state of a push output\n(role: read; per-object authz).",
+        "description": "Projects `outputs.<id>.link` out of the cached off-engine snapshot (inv\n#10: never touches the engine). `404` when the output has no live push link\n(not a push output, or the program is not running).",
+        "operationId": "get_output_link",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Output id.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The output's live push-link state.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OutputLinkDoc"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid credentials.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Not authorized to read this output.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No live push link for this output.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/outputs/{id}/playback": {
+      "get": {
+        "tags": [
+          "outputs"
+        ],
+        "summary": "`GET /api/v1/outputs/{id}/playback` — derive this output's viewer\nplayback URL(s) (ADR-0101: \"a link to copy the actual URL to paste into a\ntool like VLC\"). Role: read; per-object authz (BOLA) identical to\n`get_output`.",
+        "description": "Never returns a secret: an SRT/RIST pre-shared key is never read here (it\nis a `secret_ref`, resolved only at the engine's run path) — an encrypted\nlistener instead carries an operator-facing note that a passphrase is\nrequired out-of-band.",
+        "operationId": "get_output_playback",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Output id.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "This output's viewer playback URL(s).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OutputPlaybackResponseDoc"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid credentials.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Not authorized to read this output.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No output with that id.",
             "content": {
               "application/json": {
                 "schema": {
@@ -6739,6 +9299,112 @@
         }
       }
     },
+    "/api/v1/sources/import/m3u": {
+      "post": {
+        "tags": [
+          "sources"
+        ],
+        "summary": "`POST /api/v1/sources/import/m3u` — parse a catalogue into source\ncandidates (role: write). Creates nothing: the client creates the selected\ncandidates through `POST /api/v1/sources/{id}`.",
+        "operationId": "import_m3u",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/M3uImportRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "The parsed catalogue: header guide URL(s) and candidates.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/M3uCatalogue"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid credentials.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Not authorized to write.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Neither/both of url and text, a refused URL, a failed fetch, or an unparseable/oversized catalogue.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/sources/status": {
+      "get": {
+        "tags": [
+          "sources"
+        ],
+        "summary": "Every source's lifecycle state (role: read; per-object row visibility).",
+        "description": "`idle` means the source is not started, so it costs nothing; it is not a\nfault. An `always_on` source (the default) is started at boot; an\n`on_demand` source starts when something consumes it. It reads `starting`,\nthen `ready`, or `failed` while it retries with backoff.",
+        "operationId": "list_source_status",
+        "responses": {
+          "200": {
+            "description": "Every configured source's demand state, id-sorted.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/SourceDemandView"
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid credentials.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Authenticated but not authorized to read.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/v1/sources/{id}": {
       "get": {
         "tags": [
@@ -7013,6 +9679,294 @@
           },
           "412": {
             "description": "If-Match precondition failed.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/sources/{id}/network": {
+      "post": {
+        "tags": [
+          "catalogue"
+        ],
+        "summary": "`POST /api/v1/sources/{id}/network` — the §3a network-path report for any\nexisting source (operate; per-object authorization).",
+        "operationId": "create_source_network_report",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Source id.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "`NetworkReport {egress, hosts, hops, request_headers, assessment, curl}`; userinfo and query strings are redacted.",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "403": {
+            "description": "Requires operate (write), or the source is outside the caller's scope.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Unknown source.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Diagnostics are not available on this node.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "The source has no http(s) URL.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "The probe queue is full.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/sources/{id}/start": {
+      "post": {
+        "tags": [
+          "sources"
+        ],
+        "summary": "Start a source now (role: write; per-object authz; audited).",
+        "description": "Holds the source `ready` until Stop, whatever its activation. Never waits\nfor the source: the response is the state right after the request\n(normally `starting`).",
+        "operationId": "start_source",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Source id.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "202": {
+            "description": "Start requested; the body is the source's state.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SourceDemandView"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid credentials.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Not authorized to operate this source.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No such source.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "This run cannot start sources.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/sources/{id}/status": {
+      "get": {
+        "tags": [
+          "sources"
+        ],
+        "summary": "One source's demand state (role: read; per-object authz).",
+        "operationId": "get_source_status",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Source id.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The source's demand state.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SourceDemandView"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid credentials.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Not authorized to read this source.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No such source.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/sources/{id}/stop": {
+      "post": {
+        "tags": [
+          "sources"
+        ],
+        "summary": "Stop a source now (role: write; per-object authz; audited).",
+        "description": "Refused with 409 while anything else uses the source; the problem detail\nnames every consumer (an `always_on` setting counts). Set the source\n`on_demand` to let it stop.",
+        "operationId": "stop_source",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Source id.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "202": {
+            "description": "Stop requested; the body is the source's state.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SourceDemandView"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid credentials.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Not authorized to operate this source.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No such source.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Still in use; the detail names every consumer.",
             "content": {
               "application/json": {
                 "schema": {
@@ -7610,6 +10564,199 @@
           },
           "409": {
             "description": "The ticket is closed — replies are refused.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/switcher/commands/{kind}": {
+      "post": {
+        "tags": [
+          "switcher"
+        ],
+        "summary": "Enqueue a checked verb; a 202 never asserts frame application.",
+        "operationId": "submit_switcher",
+        "parameters": [
+          {
+            "name": "kind",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SwitcherRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "202": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SwitcherAccepted"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/switcher/plan": {
+      "post": {
+        "tags": [
+          "switcher"
+        ],
+        "summary": "Dry-run command admission, including BOLA on every referenced object.",
+        "operationId": "plan_switcher",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SwitcherRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SwitcherPlan"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/switcher/{me}": {
+      "get": {
+        "tags": [
+          "switcher"
+        ],
+        "summary": "Read authoritative state; no runtime means an explicit 409, never fake PGM.",
+        "operationId": "get_switcher",
+        "parameters": [
+          {
+            "name": "me",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SwitcherStateResponse"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "",
             "content": {
               "application/json": {
                 "schema": {
@@ -8470,6 +11617,265 @@
           },
           "403": {
             "description": "Authenticated but not authorized to read.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/weather/locations": {
+      "get": {
+        "tags": [
+          "weather"
+        ],
+        "summary": "`GET /api/v1/weather/locations` — every in-scope location with its latest\ndata (role: read).",
+        "operationId": "list_locations",
+        "responses": {
+          "200": {
+            "description": "All in-scope locations with freshness, id-sorted.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/WeatherLocationView"
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid credentials.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Not authorized to read.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/weather/locations/{id}": {
+      "get": {
+        "tags": [
+          "weather"
+        ],
+        "summary": "`GET /api/v1/weather/locations/{id}` — one location (role: read;\nper-object authz).",
+        "operationId": "get_location",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Location id.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The location with normalized forecast days, latest observation and freshness.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WeatherLocationView"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid credentials.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Not authorized to read this location.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No location with that id.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        }
+      },
+      "put": {
+        "tags": [
+          "weather"
+        ],
+        "summary": "`PUT /api/v1/weather/locations/{id}` — create or replace a location\n(role: write; per-object authz).",
+        "operationId": "put_location",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Location id.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/WeatherLocationInput"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "The location was replaced.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WeatherLocationView"
+                }
+              }
+            }
+          },
+          "201": {
+            "description": "The location was created.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WeatherLocationView"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid credentials.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Not authorized to write this location.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "412": {
+            "description": "A sent If-Match is stale.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "The body is not a valid location (detail names the field).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        }
+      },
+      "delete": {
+        "tags": [
+          "weather"
+        ],
+        "summary": "`DELETE /api/v1/weather/locations/{id}` — remove a location (role:\nadminister; per-object authz). Weather sources bound to it then render an\nhonest \"unavailable\" card.",
+        "operationId": "delete_location",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Location id.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "The location was deleted."
+          },
+          "401": {
+            "description": "Missing or invalid credentials.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Not authorized to administer this location.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No location with that id.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "412": {
+            "description": "A sent If-Match is stale.",
             "content": {
               "application/json": {
                 "schema": {
@@ -9695,6 +13101,13 @@
             "type": "boolean",
             "description": "Whether an audio-routing document is configured."
           },
+          "outputs_updated": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/OutputsUpdatedEntryDoc"
+            },
+            "description": "Outputs a successful `PUT`'s rename/removal propagation rewrote\n(ADR-R005 §4.3), in output order. Always empty on `GET`."
+          },
           "routing": {
             "oneOf": [
               {
@@ -9760,6 +13173,152 @@
           "object_kind": {
             "type": "string",
             "description": "The resource collection the object belongs to (e.g. `layout`)."
+          }
+        }
+      },
+      "AutomationLogEntry": {
+        "type": "object",
+        "description": "One action-log row.",
+        "required": [
+          "at_unix_ms",
+          "action",
+          "detail"
+        ],
+        "properties": {
+          "action": {
+            "type": "string",
+            "description": "Short machine action (`take`, `restore`, `watchdog`, ...)."
+          },
+          "at_unix_ms": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Unix milliseconds."
+          },
+          "detail": {
+            "type": "string",
+            "description": "Human-readable detail."
+          }
+        }
+      },
+      "AutomationPut": {
+        "type": "object",
+        "description": "Request body for `PUT .../events/automation`: the rule, or `null` to remove it.",
+        "properties": {
+          "rule": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/EventAutomationRuleDoc",
+                "description": "Replacement rule; `null` deletes it. `armed` here is ignored unless the\nrule is already armed — arm with `POST .../arm` (explicit confirmation)."
+              }
+            ]
+          }
+        }
+      },
+      "AutomationStatus": {
+        "type": "object",
+        "description": "Public status of one source's automation.",
+        "required": [
+          "phase",
+          "armed",
+          "test",
+          "replaced"
+        ],
+        "properties": {
+          "armed": {
+            "type": "boolean",
+            "description": "Whether the rule is armed."
+          },
+          "audio_replaced": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Whether the source's program-bus audio was re-pointed."
+          },
+          "event_id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Break occurrence being handled."
+          },
+          "last_error": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Last refusal/failure, if any."
+          },
+          "phase": {
+            "$ref": "#/components/schemas/Phase",
+            "description": "Current phase."
+          },
+          "replaced": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ReplacedCell"
+            },
+            "description": "Cells currently replaced."
+          },
+          "since_unix_ms": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "Unix milliseconds the replacement was taken."
+          },
+          "test": {
+            "type": "boolean",
+            "description": "Whether that occurrence is operator test evidence."
+          }
+        }
+      },
+      "AutomationView": {
+        "type": "object",
+        "description": "Automation rule + live status for one source (ADR-0183).",
+        "required": [
+          "status",
+          "log",
+          "bars_sources",
+          "executor_running"
+        ],
+        "properties": {
+          "bars_sources": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Ids of configured `bars` sources (used by the `bars`/`bars_tone` targets)."
+          },
+          "executor_running": {
+            "type": "boolean",
+            "description": "Whether the executor is running in this process."
+          },
+          "log": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/AutomationLogEntry"
+            },
+            "description": "Bounded action log, newest first."
+          },
+          "rule": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/EventAutomationRuleDoc",
+                "description": "The configured rule (absent when none is configured)."
+              }
+            ]
+          },
+          "status": {
+            "$ref": "#/components/schemas/AutomationStatus",
+            "description": "Live executor status."
           }
         }
       },
@@ -9942,6 +13501,42 @@
           }
         }
       },
+      "BreakActionKindDoc": {
+        "type": "string",
+        "description": "`OpenAPI` mirror of `multiview_config::schema::BreakActionKind`.",
+        "enum": [
+          "swap_cell",
+          "route_program"
+        ]
+      },
+      "BreakStartActionDoc": {
+        "type": "object",
+        "description": "`OpenAPI` mirror of `multiview_config::schema::BreakStartAction`.",
+        "required": [
+          "action",
+          "target"
+        ],
+        "properties": {
+          "action": {
+            "$ref": "#/components/schemas/BreakActionKindDoc",
+            "description": "`swap_cell` (cells only) or `route_program` (cells + program audio)."
+          },
+          "cells": {
+            "type": [
+              "array",
+              "null"
+            ],
+            "items": {
+              "type": "string"
+            },
+            "description": "Cells to replace; absent = every cell showing the source."
+          },
+          "target": {
+            "type": "string",
+            "description": "A source id, or `bars` / `bars_tone`."
+          }
+        }
+      },
       "BuildInfo": {
         "type": "object",
         "description": "The build-profile compliance surface: effective licence, redistributability,\nthe compiled feature set, and whether NDI is present.",
@@ -9970,6 +13565,98 @@
           "redistributable": {
             "type": "boolean",
             "description": "Dependency-build metadata, not permission to redistribute Conspect.\n`true` indicates the dependency build has no `--enable-nonfree` closure\n(no `nonfree` Cargo feature exists): the default is LGPL-clean,\n`gpl-codecs` enables GPL codec dependencies, and NDI is runtime-loaded\n(never vendored/linked). Enabling GPL codecs does not relicense Conspect\nproject code. This value does not authorize redistribution of Conspect;\nthe project licence and applicable dependency terms still govern."
+          }
+        }
+      },
+      "BulkAddBody": {
+        "type": "object",
+        "description": "Request body of `POST /catalogues/iptv-org/sources`.",
+        "required": [
+          "sources"
+        ],
+        "properties": {
+          "sources": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/BulkAddEntry"
+            },
+            "description": "1..=200 sources to create. Above 8 every entry must state its own\n`activation` (`always_on` | `on_demand`)."
+          }
+        }
+      },
+      "BulkAddEntry": {
+        "type": "object",
+        "description": "One entry of a bulk add: the same `{name, body}` a single create takes, plus\nthe source id (the `{id}` of `POST /sources/{id}`).",
+        "required": [
+          "id",
+          "body"
+        ],
+        "properties": {
+          "body": {
+            "description": "The source document (`multiview_config::Source`)."
+          },
+          "id": {
+            "type": "string",
+            "description": "Source id."
+          },
+          "name": {
+            "type": "string",
+            "description": "Human-friendly name."
+          }
+        }
+      },
+      "BulkAddItem": {
+        "type": "object",
+        "description": "One per-item result of a bulk add.",
+        "required": [
+          "id",
+          "status"
+        ],
+        "properties": {
+          "apply": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "How the create takes effect: `live` or `restart`."
+          },
+          "error": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Why the item failed."
+          },
+          "etag": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "`ETag` of the created source."
+          },
+          "id": {
+            "type": "string",
+            "description": "Source id."
+          },
+          "status": {
+            "type": "string",
+            "description": "`created`, `failed` or `skipped` (not attempted after an earlier failure)."
+          }
+        }
+      },
+      "BulkAddResponse": {
+        "type": "object",
+        "description": "Response of `POST /catalogues/iptv-org/sources`.",
+        "required": [
+          "results"
+        ],
+        "properties": {
+          "results": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/BulkAddItem"
+            },
+            "description": "One result per requested source, in request order."
           }
         }
       },
@@ -10399,6 +14086,68 @@
           }
         }
       },
+      "ChannelView": {
+        "type": "object",
+        "description": "A channel with its live PVW/PGM state.",
+        "required": [
+          "id",
+          "name",
+          "rundown",
+          "transition",
+          "seq",
+          "program_source",
+          "preview_source"
+        ],
+        "properties": {
+          "id": {
+            "type": "string",
+            "description": "Channel id."
+          },
+          "name": {
+            "type": "string",
+            "description": "Operator-facing name."
+          },
+          "preview": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Cued item id."
+          },
+          "preview_source": {
+            "type": "string",
+            "description": "Suggested source id carrying the preview bus (`<channel>-preview`)."
+          },
+          "program": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "On-air item id."
+          },
+          "program_source": {
+            "type": "string",
+            "description": "Suggested source id carrying the program bus (`<channel>`)."
+          },
+          "rundown": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Ordered item ids."
+          },
+          "seq": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Increments on every program change.",
+            "minimum": 0
+          },
+          "transition": {
+            "$ref": "#/components/schemas/TransitionDoc",
+            "description": "Transition preset."
+          }
+        }
+      },
       "ClearOverrideRequestDoc": {
         "type": "object",
         "description": "`OpenAPI` mirror of [`crate::routes::tally::ClearOverrideRequest`].",
@@ -10796,6 +14545,20 @@
         },
         "additionalProperties": false
       },
+      "CueInput": {
+        "type": "object",
+        "description": "`POST cue` body.",
+        "required": [
+          "item"
+        ],
+        "properties": {
+          "item": {
+            "type": "string",
+            "description": "The item to put on preview."
+          }
+        },
+        "additionalProperties": false
+      },
       "DataKindDoc": {
         "type": "string",
         "description": "`OpenAPI` mirror of [`multiview_core::stream::DataKind`].",
@@ -10858,6 +14621,141 @@
           "denied",
           "expired"
         ]
+      },
+      "DataSourceDoc": {
+        "type": "object",
+        "description": "A data source document (`[[graphics.data_sources]]`).",
+        "required": [
+          "id",
+          "name",
+          "kind"
+        ],
+        "properties": {
+          "aac": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "BOM forecast area code (`bom_weather`)."
+          },
+          "forecast_product": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "BOM forecast product id (`bom_weather`)."
+          },
+          "id": {
+            "type": "string",
+            "description": "Data source id."
+          },
+          "kind": {
+            "type": "string",
+            "description": "Provider kind (`bom_weather`)."
+          },
+          "name": {
+            "type": "string",
+            "description": "Display name."
+          },
+          "observation_product": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "BOM observation product id (`bom_weather`)."
+          },
+          "station_wmo": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Observation station WMO id (`bom_weather`)."
+          }
+        }
+      },
+      "DataSourceInput": {
+        "type": "object",
+        "description": "`PUT` body for a data source.",
+        "required": [
+          "name",
+          "kind"
+        ],
+        "properties": {
+          "aac": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "BOM forecast area code."
+          },
+          "forecast_product": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "BOM forecast product id."
+          },
+          "kind": {
+            "type": "string",
+            "description": "Provider kind (`bom_weather`)."
+          },
+          "name": {
+            "type": "string",
+            "description": "Display name."
+          },
+          "observation_product": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "BOM observation product id."
+          },
+          "station_wmo": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Observation station WMO id."
+          }
+        },
+        "additionalProperties": false
+      },
+      "DataSourceView": {
+        "type": "object",
+        "description": "A data source with its live status.",
+        "required": [
+          "source",
+          "status",
+          "used_by"
+        ],
+        "properties": {
+          "source": {
+            "$ref": "#/components/schemas/DataSourceDoc",
+            "description": "The configured source."
+          },
+          "status": {
+            "type": "string",
+            "description": "`ok` | `pending` | `error` | `expired`."
+          },
+          "used_by": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Item ids bound to this source."
+          },
+          "weather": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/WeatherLocationView",
+                "description": "Weather data + freshness (`bom_weather` only)."
+              }
+            ]
+          }
+        }
       },
       "DetectionZoneDoc": {
         "type": "object",
@@ -11376,6 +15274,147 @@
           "unlicensed-build"
         ]
       },
+      "EpgModeDoc": {
+        "type": "string",
+        "description": "`OpenAPI` mirror of `multiview_config::EpgMode` (epg-playlist).",
+        "enum": [
+          "automatic",
+          "manual",
+          "disabled"
+        ]
+      },
+      "EpgSourceDoc": {
+        "type": "object",
+        "description": "`OpenAPI` mirror of `multiview_config::EpgSource` (epg-playlist):\na source's optional per-source EPG (XMLTV) acquisition block.",
+        "properties": {
+          "allow_private_network": {
+            "type": "boolean",
+            "description": "Whether the feed may resolve to a private/link-local network address."
+          },
+          "channel_id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Optional exact provider channel id (as it appears in the XMLTV feed)."
+          },
+          "mode": {
+            "$ref": "#/components/schemas/EpgModeDoc",
+            "description": "How the guide is obtained. Defaults to `automatic`."
+          },
+          "secret_ref": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Optional secret-manager reference for the feed's credentials."
+          },
+          "url": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Optional HTTP(S) XMLTV feed URL (credential-free)."
+          }
+        },
+        "additionalProperties": false
+      },
+      "EventAutomationRuleDoc": {
+        "type": "object",
+        "description": "`OpenAPI` mirror of `multiview_config::schema::EventAutomationRule` (ADR-0183).",
+        "required": [
+          "on_break_start"
+        ],
+        "properties": {
+          "armed": {
+            "type": "boolean",
+            "description": "Whether the rule acts (default `false`). Use the arm/disarm routes."
+          },
+          "max_duration_s": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32",
+            "description": "Watchdog seconds (1..=86400, default 600).",
+            "minimum": 0
+          },
+          "on_break_start": {
+            "$ref": "#/components/schemas/BreakStartActionDoc",
+            "description": "What to take at break start."
+          },
+          "restore_on_end": {
+            "type": [
+              "boolean",
+              "null"
+            ],
+            "description": "Restore the pre-break routing at the confirmed end (default `true`)."
+          },
+          "webhook_url": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Optional `http://` hook that receives a `POST` on break start/end."
+          }
+        }
+      },
+      "FeedStatus": {
+        "type": "object",
+        "description": "One feed's operator-visible status.",
+        "required": [
+          "url",
+          "channels",
+          "programmes"
+        ],
+        "properties": {
+          "channels": {
+            "type": "integer",
+            "description": "Channels kept from this feed.",
+            "minimum": 0
+          },
+          "error": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The last error, if the last attempt failed."
+          },
+          "last_attempt": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "Unix seconds of the last attempt."
+          },
+          "last_success": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "Unix seconds of the last successful fetch (or 304)."
+          },
+          "next_attempt": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "Unix seconds of the next scheduled attempt."
+          },
+          "programmes": {
+            "type": "integer",
+            "description": "Programmes kept from this feed.",
+            "minimum": 0
+          },
+          "url": {
+            "type": "string",
+            "description": "The feed URL with credentials and query removed."
+          }
+        }
+      },
       "FiredBody": {
         "type": "object",
         "description": "The `202` body of a successful salvo fire.",
@@ -11433,6 +15472,33 @@
           }
         }
       },
+      "FreshnessDoc": {
+        "type": "object",
+        "description": "Fetch freshness of one product.",
+        "properties": {
+          "attempted_at": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Last attempt, good or bad (RFC 3339 UTC)."
+          },
+          "error": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Last error (cleared on success)."
+          },
+          "fetched_at": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Last successful fetch (RFC 3339 UTC)."
+          }
+        }
+      },
       "GpuLimitDoc": {
         "oneOf": [
           {
@@ -11474,6 +15540,14 @@
           }
         ],
         "description": "`OpenAPI` mirror of [`multiview_licence::GpuLimit`].\n\nSerde-equivalent: adjacently tagged on `kind`, value under `value`,\n`snake_case` tags (`{\"kind\":\"unlimited\"}` / `{\"kind\":\"limited\",\"value\":2}`)."
+      },
+      "GraphicsBusDoc": {
+        "type": "string",
+        "description": "`OpenAPI` mirror of `multiview_config::GraphicsBus`.",
+        "enum": [
+          "program",
+          "preview"
+        ]
       },
       "HardwareClassDoc": {
         "type": "string",
@@ -11627,6 +15701,144 @@
           }
         }
       },
+      "IptvConfigDoc": {
+        "type": "object",
+        "description": "`OpenAPI` mirror of `multiview_config::IptvConfig` (`[iptv]`).",
+        "properties": {
+          "enabled": {
+            "type": "boolean",
+            "description": "Whether `/iptv/playlist.m3u8` and `/iptv/guide.xml` are served (default false)."
+          },
+          "entries": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/IptvEntryDoc"
+            },
+            "description": "Published entries in playlist order."
+          },
+          "guide_refresh_minutes": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32",
+            "description": "Minutes between background guide refreshes while publication is\nenabled (default 30, 5..=1440).",
+            "minimum": 0
+          },
+          "public_base_url": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Optional absolute public base URL for playlist links (default: request Host)."
+          }
+        }
+      },
+      "IptvEntryDoc": {
+        "type": "object",
+        "description": "`OpenAPI` mirror of `multiview_config::IptvEntry`.",
+        "required": [
+          "kind",
+          "ref"
+        ],
+        "properties": {
+          "allow_direct_source_url": {
+            "type": "boolean",
+            "description": "Explicit permission to publish a source's upstream URL (required for sources)."
+          },
+          "group": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "`group-title` override."
+          },
+          "kind": {
+            "$ref": "#/components/schemas/IptvEntryKindDoc",
+            "description": "Whether `ref` names an output or a source."
+          },
+          "logo": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "`tvg-logo` override (credential-free http(s) URL)."
+          },
+          "name": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Display-name override."
+          },
+          "ref": {
+            "type": "string",
+            "description": "The referenced output id or source id."
+          },
+          "tvg_id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Published `tvg-id` override (also the guide channel id)."
+          }
+        }
+      },
+      "IptvEntryKindDoc": {
+        "type": "string",
+        "description": "`OpenAPI` mirror of `multiview_config::IptvEntryKind`.",
+        "enum": [
+          "output",
+          "source"
+        ]
+      },
+      "IptvState": {
+        "type": "object",
+        "description": "The `GET`/`PUT /api/v1/iptv` response envelope.",
+        "required": [
+          "config",
+          "entries",
+          "feeds",
+          "playlist_path",
+          "guide_path"
+        ],
+        "properties": {
+          "config": {
+            "$ref": "#/components/schemas/IptvConfigDoc",
+            "description": "The publication document (entries filtered to the caller's scope)."
+          },
+          "entries": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ResolvedEntry"
+            },
+            "description": "Every entry resolved against the current configuration."
+          },
+          "feeds": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/FeedStatus"
+            },
+            "description": "Per upstream XMLTV feed refresh status."
+          },
+          "guide_generated_at": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "Unix seconds the current guide snapshot was assembled, if any."
+          },
+          "guide_path": {
+            "type": "string",
+            "description": "Server path of the published guide."
+          },
+          "playlist_path": {
+            "type": "string",
+            "description": "Server path of the published playlist."
+          }
+        }
+      },
       "Is10Claims": {
         "type": "object",
         "description": "An IS-10 JWT **claims set** (the decoded token body).\n\nCarries the registered claims IS-10 mandates plus the NMOS `x-nmos-api`\nclaim. Times are Unix seconds (the JWT `NumericDate`).",
@@ -11665,6 +15877,416 @@
           "x-nmos-api": {
             "$ref": "#/components/schemas/NmosApiClaim",
             "description": "The NMOS per-API access grant — `x-nmos-api`."
+          }
+        }
+      },
+      "ItemDoc": {
+        "type": "object",
+        "description": "A graphics item.",
+        "required": [
+          "id",
+          "name",
+          "template"
+        ],
+        "properties": {
+          "data_source": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Bound data source id."
+          },
+          "id": {
+            "type": "string",
+            "description": "Item id."
+          },
+          "key": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Provider-specific key."
+          },
+          "name": {
+            "type": "string",
+            "description": "Operator-facing name."
+          },
+          "style": {
+            "$ref": "#/components/schemas/StyleDoc",
+            "description": "Style options."
+          },
+          "template": {
+            "type": "string",
+            "description": "Template id."
+          }
+        }
+      },
+      "ItemInput": {
+        "type": "object",
+        "description": "`PUT` body for an item.",
+        "required": [
+          "name",
+          "template"
+        ],
+        "properties": {
+          "data_source": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Bound data source id."
+          },
+          "key": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Provider-specific key."
+          },
+          "name": {
+            "type": "string",
+            "description": "Operator-facing name."
+          },
+          "style": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/StyleDoc",
+                "description": "Style options."
+              }
+            ]
+          },
+          "template": {
+            "type": "string",
+            "description": "Template id."
+          }
+        },
+        "additionalProperties": false
+      },
+      "JournalClockSource": {
+        "type": "string",
+        "description": "Which clock produced a wall-clock prediction.",
+        "enum": [
+          "pdt",
+          "id3_utc",
+          "receive_time"
+        ]
+      },
+      "JournalOrigin": {
+        "type": "string",
+        "description": "Where a marker was carried.",
+        "enum": [
+          "scte35",
+          "id3",
+          "hls"
+        ]
+      },
+      "JournalPage": {
+        "type": "object",
+        "description": "One newest-first page.",
+        "required": [
+          "source_id",
+          "records",
+          "stats"
+        ],
+        "properties": {
+          "next_cursor": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Pass as `cursor` for the next older page; absent on the last page."
+          },
+          "records": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/JournalRecord"
+            },
+            "description": "Records, newest first."
+          },
+          "source_id": {
+            "type": "string",
+            "description": "Exact source identity."
+          },
+          "stats": {
+            "$ref": "#/components/schemas/JournalStats",
+            "description": "Journal counters; `dropped` above zero means the history has gaps."
+          }
+        }
+      },
+      "JournalRecord": {
+        "type": "object",
+        "description": "One raw observation with its full decode.",
+        "required": [
+          "source_id",
+          "received_at",
+          "received_ns",
+          "origin",
+          "name",
+          "summary",
+          "transport",
+          "raw_encoding",
+          "raw"
+        ],
+        "properties": {
+          "clock_reference": {
+            "type": "boolean",
+            "description": "Whether this is a clock stamp rather than an event."
+          },
+          "decoded": {
+            "description": "The full decode."
+          },
+          "error": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Why the payload could not be fully decoded."
+          },
+          "last_seen_at": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "When the last identical sighting arrived."
+          },
+          "name": {
+            "type": "string",
+            "description": "Short name."
+          },
+          "origin": {
+            "$ref": "#/components/schemas/JournalOrigin",
+            "description": "Carrier."
+          },
+          "raw": {
+            "type": "string",
+            "description": "The raw payload."
+          },
+          "raw_encoding": {
+            "type": "string",
+            "description": "`base64` for binary payloads, `text` for HLS tag lines."
+          },
+          "received_at": {
+            "type": "string",
+            "description": "Host receive time, UTC."
+          },
+          "received_ns": {
+            "type": "string",
+            "description": "Host receive time, decimal nanoseconds past the Unix epoch."
+          },
+          "record_id": {
+            "type": "string",
+            "description": "Sortable identity, assigned by the writer; also the page cursor."
+          },
+          "repeats": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Identical sightings after this record.",
+            "minimum": 0
+          },
+          "source_id": {
+            "type": "string",
+            "description": "Exact source identity."
+          },
+          "source_pts": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "90 kHz time of the carrying packet. SCTE-35 sections have no PES header, so\nthe demuxer reports the last PCR, which trails video PTS by the mux delay.",
+            "minimum": 0
+          },
+          "summary": {
+            "type": "string",
+            "description": "One-line decoded summary."
+          },
+          "timing": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/JournalTiming",
+                "description": "Derived times."
+              }
+            ]
+          },
+          "transport": {
+            "$ref": "#/components/schemas/JournalTransport",
+            "description": "Transport context."
+          }
+        }
+      },
+      "JournalStats": {
+        "type": "object",
+        "description": "Counter snapshot.",
+        "required": [
+          "dropped",
+          "written",
+          "repeats",
+          "write_errors"
+        ],
+        "properties": {
+          "dropped": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Observations dropped because the bounded queue was full.",
+            "minimum": 0
+          },
+          "repeats": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Exact repeats folded into a counter since start.",
+            "minimum": 0
+          },
+          "write_errors": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Failed disk writes since start.",
+            "minimum": 0
+          },
+          "written": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Records written since start.",
+            "minimum": 0
+          }
+        }
+      },
+      "JournalTiming": {
+        "type": "object",
+        "description": "Times derived for one marker. Predictions, never engine state.",
+        "required": [
+          "class"
+        ],
+        "properties": {
+          "airs_at": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Predicted instant the splice reaches this multiview's output, UTC."
+          },
+          "airs_end_at": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Predicted instant the break end reaches this multiview's output, UTC."
+          },
+          "class": {
+            "$ref": "#/components/schemas/JournalTimingClass",
+            "description": "How the time was derived."
+          },
+          "clock_source": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/JournalClockSource",
+                "description": "Clock used for the wall-clock fields."
+              }
+            ]
+          },
+          "duration_ms": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "Declared duration.",
+            "minimum": 0
+          },
+          "end_at": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Predicted break end on the source, UTC."
+          },
+          "pre_roll_ms": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "Splice point minus carrying packet time; negative means already past."
+          },
+          "splice_pts": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "Splice point on the source timeline, 90 kHz, after `pts_adjustment`.",
+            "minimum": 0
+          },
+          "start_at": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Predicted splice wall-clock on the source, UTC."
+          },
+          "uncertainty_ms": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "Estimated uncertainty of that clock.",
+            "minimum": 0
+          }
+        }
+      },
+      "JournalTimingClass": {
+        "type": "string",
+        "description": "How a marker's time was derived.",
+        "enum": [
+          "scheduled",
+          "immediate",
+          "none"
+        ]
+      },
+      "JournalTransport": {
+        "type": "object",
+        "description": "Transport context of one observation.",
+        "properties": {
+          "media_sequence": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "HLS media sequence of the carrying segment.",
+            "minimum": 0
+          },
+          "pid": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32",
+            "description": "Transport PID.",
+            "minimum": 0
+          },
+          "program_date_time": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "That segment's `EXT-X-PROGRAM-DATE-TIME`."
+          },
+          "segment_uri": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Carrying segment URI, without query or credentials."
           }
         }
       },
@@ -12123,6 +16745,107 @@
         ],
         "description": "`OpenAPI` mirror of `multiview_config::LoudnessTarget` (tagged by `kind`,\n`snake_case`)."
       },
+      "M3uCatalogue": {
+        "type": "object",
+        "description": "A parsed catalogue.",
+        "required": [
+          "url_tvg",
+          "entries",
+          "skipped"
+        ],
+        "properties": {
+          "entries": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/M3uEntry"
+            },
+            "description": "The entries, in file order."
+          },
+          "skipped": {
+            "type": "integer",
+            "description": "Lines skipped because they were malformed (e.g. a URL without a usable\nscheme) — informational.",
+            "minimum": 0
+          },
+          "url_tvg": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "The header's XMLTV guide URL(s) (`url-tvg` / `x-tvg-url`; a\ncomma-separated value is split), in declaration order."
+          }
+        }
+      },
+      "M3uEntry": {
+        "type": "object",
+        "description": "One catalogue candidate.",
+        "required": [
+          "name",
+          "url"
+        ],
+        "properties": {
+          "group": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "`group-title`, if present."
+          },
+          "name": {
+            "type": "string",
+            "description": "The display name (text after the `#EXTINF` comma), or the URL when absent."
+          },
+          "tvg_id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "`tvg-id`, if present."
+          },
+          "tvg_logo": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "`tvg-logo`, if present."
+          },
+          "tvg_name": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "`tvg-name`, if present."
+          },
+          "url": {
+            "type": "string",
+            "description": "The absolute stream URL."
+          }
+        }
+      },
+      "M3uImportRequest": {
+        "type": "object",
+        "description": "`POST /api/v1/sources/import/m3u` request body: exactly one of `url`/`text`.",
+        "properties": {
+          "allow_private_network": {
+            "type": "boolean",
+            "description": "Permit a catalogue on a private/LAN address (loopback, link-local and\nmetadata addresses are always refused)."
+          },
+          "text": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Pasted catalogue text (at most 2 MiB)."
+          },
+          "url": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "An http(s) URL of an extended-M3U catalogue to fetch (bounded, SSRF-screened)."
+          }
+        },
+        "additionalProperties": false
+      },
       "MediaFormat": {
         "type": "string",
         "description": "The media format of a sender/receiver (the IS-04 `format` URN family).",
@@ -12579,6 +17302,15 @@
           "auto",
           "tag",
           "pixels"
+        ]
+      },
+      "OriginFollowDoc": {
+        "type": "string",
+        "description": "`OpenAPI` mirror of `multiview_config::OriginFollow`.",
+        "enum": [
+          "manual",
+          "notify",
+          "auto"
         ]
       },
       "OutputAudioDoc": {
@@ -13282,6 +18014,112 @@
           "vertical"
         ]
       },
+      "OutputLinkDoc": {
+        "type": "object",
+        "description": "Live link state of a push output (SRT / RTMP / RIST / UDP) — the body of\n`GET /api/v1/outputs/{id}/link`.",
+        "required": [
+          "state",
+          "mode",
+          "transport",
+          "url",
+          "clients",
+          "sessions",
+          "dropped",
+          "discarded_no_client",
+          "discarded_awaiting_keyframe",
+          "dropped_slow_peer",
+          "dropped_upstream",
+          "written",
+          "peers"
+        ],
+        "properties": {
+          "clients": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Peers attached right now.",
+            "minimum": 0
+          },
+          "discarded_awaiting_keyframe": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Packets discarded while a fresh session waited for its first video\nkeyframe. Expected and benign: the link is fine, the decoder is simply\nnot started yet.",
+            "minimum": 0
+          },
+          "discarded_no_client": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Packets discarded because no peer was attached (a listener waiting for a\ncaller, or a caller between sessions). Expected and benign.",
+            "minimum": 0
+          },
+          "dropped": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Packets dropped for this output, for any reason: the sum of the four\nreason counters below.",
+            "minimum": 0
+          },
+          "dropped_slow_peer": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Packets lost to a slow peer: its bounded-queue overflow, plus every\npacket held until it is re-admitted on the next video keyframe (audio\nand non-IDR video alike). A real delivery failure.",
+            "minimum": 0
+          },
+          "dropped_upstream": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Packets dropped upstream of the distributor (the producer shed a packet\nor held its post-loss gate).",
+            "minimum": 0
+          },
+          "last_error": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The current link error, if any since the last successful connect. Never\na peer session ending (that is `last_session_error`)."
+          },
+          "last_session_error": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "How the most recent peer session ended, when it ended with an error and\nno newer peer is attached. Historical context, not current link health."
+          },
+          "mode": {
+            "type": "string",
+            "description": "`caller` or `listener`."
+          },
+          "peers": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Attached peer addresses: an SRT listener's callers, or a caller's target."
+          },
+          "sessions": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Peer sessions established this run.",
+            "minimum": 0
+          },
+          "state": {
+            "type": "string",
+            "description": "`idle` / `connecting` / `listening` / `connected` / `reconnecting`."
+          },
+          "transport": {
+            "type": "string",
+            "description": "`srt` / `rtmp` / `rist` / `udp`."
+          },
+          "url": {
+            "type": "string",
+            "description": "The (redacted) destination or bind URL."
+          },
+          "written": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Packets written to peers.",
+            "minimum": 0
+          }
+        }
+      },
       "OutputMetadataDoc": {
         "type": "object",
         "description": "`OpenAPI` mirror of `multiview_config::OutputMetadata` (ADR-0088): per-output\ndeclarative metadata intent, projected onto whatever the transport can carry.",
@@ -13356,6 +18194,22 @@
         },
         "additionalProperties": false
       },
+      "OutputPlaybackResponseDoc": {
+        "type": "object",
+        "description": "`OpenAPI` mirror of the `GET /api/v1/outputs/{id}/playback` response body.",
+        "required": [
+          "urls"
+        ],
+        "properties": {
+          "urls": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/PlaybackUrlDoc"
+            },
+            "description": "This output's viewer playback URL(s) (one or more; a push-only\ntransport returns a single no-URL entry with an explanatory note)."
+          }
+        }
+      },
       "OutputResourceInputDoc": {
         "type": "object",
         "description": "The request envelope for `POST`/`PUT /api/v1/outputs/{id}` (`name` + body).",
@@ -13413,6 +18267,35 @@
           }
         },
         "additionalProperties": false
+      },
+      "OutputsUpdatedEntryDoc": {
+        "type": "object",
+        "description": "One output a routing `PUT`'s rename/removal propagation rewrote\n(ADR-R005 §4.3): a renamed or removed discrete `target_track` the output's\n`mode = \"tracks\"` selection carried is rewritten in the SAME atomic commit\nas the routing replace — never left dangling, never requiring a\nhand-staged intermediate PUT.",
+        "required": [
+          "output",
+          "removed",
+          "renamed"
+        ],
+        "properties": {
+          "output": {
+            "type": "string",
+            "description": "The output's stable REST id (`/api/v1/outputs/{id}`)."
+          },
+          "removed": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Track names dropped from this output's selection."
+          },
+          "renamed": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/RenamedTrackDoc"
+            },
+            "description": "Discrete tracks this output's selection now follows under a new name."
+          }
+        }
       },
       "OverlayBodyDoc": {
         "type": "object",
@@ -13550,6 +18433,17 @@
           "Critical"
         ]
       },
+      "Phase": {
+        "type": "string",
+        "description": "Live automation phase of one source.",
+        "enum": [
+          "disarmed",
+          "idle",
+          "in_break",
+          "restoring",
+          "manual_override"
+        ]
+      },
       "PinVendorDoc": {
         "type": "string",
         "description": "`OpenAPI` mirror of `multiview_config::placement::PinVendor`.",
@@ -13568,6 +18462,93 @@
           "composite",
           "encode"
         ]
+      },
+      "PlaybackUrlDoc": {
+        "type": "object",
+        "description": "`OpenAPI` mirror of [`multiview_config::playback::PlaybackUrl`] — one\nviewer playback URL (or no-URL note) for an output\n(`GET /api/v1/outputs/{id}/playback`, ADR-0101).",
+        "required": [
+          "label"
+        ],
+        "properties": {
+          "label": {
+            "type": "string",
+            "description": "Short human label, e.g. `\"SRT (caller)\"` or `\"HLS playlist\"`."
+          },
+          "notes": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Extra operator-facing notes: an encryption-passphrase reminder, a\nredacted push destination, a missing-host explanation. Never a secret."
+          },
+          "url": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The URL a viewer pastes into VLC/ffplay/a browser. Absent when this\noutput has no viewer-reachable address — see `notes` for why."
+          },
+          "vlc_command": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The exact shell command an operator pastes to open this URL in VLC\n(`None` when [`url`](Self::url) is `None`). For an SRT row this is\nVLC's own `vlc --srt-latency=<ms> srt://host:port` form — NOT\n`vlc <url>` — because VLC's `srt://` access does not read the\nffmpeg-style `latency=`/`streamid=` URL query options; every other\nkind uses `vlc <url>`."
+          }
+        }
+      },
+      "PlaylistMetadataDoc": {
+        "type": "object",
+        "description": "`OpenAPI` mirror of `multiview_config::PlaylistMetadata` (epg-playlist):\noptional IPTV playlist presentation metadata for a source.",
+        "properties": {
+          "group": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Optional `group-title`: the playlist section this entry appears under."
+          },
+          "logo": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Optional `tvg-logo`: a credential-free HTTP(S) URL to a logo image."
+          },
+          "name": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Optional `tvg-name`: the channel name an IPTV playlist displays."
+          },
+          "tvg_id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Optional `tvg-id`: the EPG channel id this entry presents."
+          }
+        },
+        "additionalProperties": false
+      },
+      "PlayoutInput": {
+        "type": "object",
+        "description": "`POST take|clear|next` body (all fields optional; send `{}`).",
+        "properties": {
+          "transition": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/TransitionDoc",
+                "description": "One-shot transition override (the channel preset otherwise)."
+              }
+            ]
+          }
+        },
+        "additionalProperties": false
       },
       "PreviewCapabilities": {
         "type": "object",
@@ -13605,6 +18586,26 @@
           "webrtc": {
             "type": "boolean",
             "description": "Whether this build can serve WHEP/WebRTC at all (a native transport is\nwired). `false` on a pure / negotiation-only build."
+          }
+        }
+      },
+      "ProbeBody": {
+        "type": "object",
+        "description": "Request body of `POST .../probes` (the web contract's `ProbeRequest`).\n\nThe browser never supplies a URL: it names index rows (`keys`) and/or linked\nsources (`source_ids`); the server resolves URL, headers and quality.",
+        "properties": {
+          "keys": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Index row keys (`s:<hex>`)."
+          },
+          "source_ids": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Linked source ids (per-object authorised)."
           }
         }
       },
@@ -14012,6 +19013,47 @@
         },
         "additionalProperties": false
       },
+      "RenamedTrackDoc": {
+        "type": "object",
+        "description": "One discrete-track rename a routing `PUT`'s propagation applied to an\noutput (ADR-R005 §4.3).",
+        "required": [
+          "from",
+          "to"
+        ],
+        "properties": {
+          "from": {
+            "type": "string",
+            "description": "The track name the output's selection carried before the replace."
+          },
+          "to": {
+            "type": "string",
+            "description": "The name it now carries."
+          }
+        }
+      },
+      "ReplacedCell": {
+        "type": "object",
+        "description": "One replaced cell.",
+        "required": [
+          "cell",
+          "original",
+          "replacement"
+        ],
+        "properties": {
+          "cell": {
+            "type": "string",
+            "description": "Cell id."
+          },
+          "original": {
+            "type": "string",
+            "description": "Source the cell showed before the break (restored at the end)."
+          },
+          "replacement": {
+            "type": "string",
+            "description": "Source taken into the cell."
+          }
+        }
+      },
       "ReplyRequest": {
         "type": "object",
         "description": "The `POST /api/v1/support/tickets/{id}/reply` request body.",
@@ -14022,6 +19064,67 @@
           "body": {
             "type": "string",
             "description": "The reply text to append to the thread."
+          }
+        }
+      },
+      "ResolvedEntry": {
+        "type": "object",
+        "description": "One published playlist entry, resolved against the current configuration.",
+        "required": [
+          "kind",
+          "ref",
+          "tvg_id",
+          "name",
+          "group"
+        ],
+        "properties": {
+          "epg_feed": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The upstream XMLTV feed (redacted) this entry's guide comes from."
+          },
+          "group": {
+            "type": "string",
+            "description": "Group title."
+          },
+          "kind": {
+            "type": "string",
+            "description": "`output` or `source`."
+          },
+          "logo": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Logo URL, if any."
+          },
+          "name": {
+            "type": "string",
+            "description": "Display name."
+          },
+          "ref": {
+            "type": "string",
+            "description": "The referenced id."
+          },
+          "tvg_id": {
+            "type": "string",
+            "description": "Published `tvg-id` (also the guide channel id)."
+          },
+          "unavailable": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Why the entry is not published right now."
+          },
+          "url": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The playable URL: an absolute URL for sources, a server path\n(`/hls/…`) for outputs. `None` when not playable (see `unavailable`)."
           }
         }
       },
@@ -14450,6 +19553,41 @@
         ],
         "description": "`OpenAPI` mirror of [`multiview_control::routing::RouteTarget`] (RT-11).\n\nThe destination a crosspoint take re-points — internally tagged on `kind`,\n`snake_case`, never `untagged`."
       },
+      "RundownInput": {
+        "type": "object",
+        "description": "`PUT /channels/{id}/rundown` body.",
+        "required": [
+          "rundown"
+        ],
+        "properties": {
+          "name": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "New channel name (unchanged when absent; required to create)."
+          },
+          "rundown": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Ordered item ids (full replacement)."
+          },
+          "transition": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/TransitionDoc",
+                "description": "New transition preset (unchanged when absent)."
+              }
+            ]
+          }
+        },
+        "additionalProperties": false
+      },
       "SalvoDoc": {
         "type": "object",
         "description": "`OpenAPI` mirror of [`multiview_config::Salvo`].\n\nSerde-equivalent field-for-field; the optional fields skip when empty/absent\nexactly as the config type does.",
@@ -14766,6 +19904,14 @@
           "ready"
         ]
       },
+      "SourceActivationView": {
+        "type": "string",
+        "description": "When a source starts (`sources[].activation`).",
+        "enum": [
+          "always_on",
+          "on_demand"
+        ]
+      },
       "SourceAuthDoc": {
         "type": "object",
         "description": "`OpenAPI` mirror of `multiview_config::SourceAuth` (reference-only secret).",
@@ -14788,6 +19934,17 @@
           {
             "type": "object",
             "properties": {
+              "activation": {
+                "oneOf": [
+                  {
+                    "type": "null"
+                  },
+                  {
+                    "$ref": "#/components/schemas/SourceActivationView",
+                    "description": "When the source starts: `always_on` (default; started at boot) or\n`on_demand` (idle until something consumes it)."
+                  }
+                ]
+              },
               "auth": {
                 "oneOf": [
                   {
@@ -14828,6 +19985,17 @@
                 ],
                 "description": "Human-friendly display name."
               },
+              "epg": {
+                "oneOf": [
+                  {
+                    "type": "null"
+                  },
+                  {
+                    "$ref": "#/components/schemas/EpgSourceDoc",
+                    "description": "Optional per-source EPG (XMLTV) acquisition block (epg-playlist)."
+                  }
+                ]
+              },
               "gpu_pin": {
                 "oneOf": [
                   {
@@ -14845,6 +20013,28 @@
                   "null"
                 ],
                 "description": "Stable input id; may be omitted (the path id is injected)."
+              },
+              "origin": {
+                "oneOf": [
+                  {
+                    "type": "null"
+                  },
+                  {
+                    "$ref": "#/components/schemas/SourceOriginDoc",
+                    "description": "Catalogue provenance (IPTV-ORG link)."
+                  }
+                ]
+              },
+              "playlist_metadata": {
+                "oneOf": [
+                  {
+                    "type": "null"
+                  },
+                  {
+                    "$ref": "#/components/schemas/PlaylistMetadataDoc",
+                    "description": "Optional IPTV playlist presentation metadata (epg-playlist)."
+                  }
+                ]
               },
               "wallclock": {
                 "oneOf": [
@@ -14889,6 +20079,141 @@
               "null"
             ],
             "description": "The served URL, IPv6-first where known. `None` when the vendor does not\ndocument its mount path — the operator supplies it and it is flagged\n[`unverified`](SourceCandidate::unverified)."
+          }
+        }
+      },
+      "SourceClockDto": {
+        "type": "object",
+        "description": "The source's embedded wall clock. A clock reference, never an event.",
+        "required": [
+          "utc",
+          "offset_ms",
+          "clock_source",
+          "observed_at"
+        ],
+        "properties": {
+          "clock_source": {
+            "$ref": "#/components/schemas/JournalClockSource",
+            "description": "Which embedded clock this is."
+          },
+          "observed_at": {
+            "type": "string",
+            "description": "Host time of that reading."
+          },
+          "offset_ms": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Source clock minus host receive time, in milliseconds. Includes the\nstream's delivery delay, so a live source reads negative."
+          },
+          "utc": {
+            "type": "string",
+            "description": "Latest decoded source UTC time."
+          }
+        }
+      },
+      "SourceConsumerView": {
+        "type": "object",
+        "description": "One consumer of a source.",
+        "required": [
+          "kind",
+          "label"
+        ],
+        "properties": {
+          "kind": {
+            "type": "string",
+            "description": "`layout_cell`, `audio_route`, `subtitle_route`, `preview`, `hls_session`,\n`event_automation`, `always_on` or `manual` (an operator Start)."
+          },
+          "label": {
+            "type": "string",
+            "description": "The consumer's identity within its kind (a cell, a route target, ...).\n`restricted` when it names an object the caller may not read."
+          }
+        }
+      },
+      "SourceDemandPhase": {
+        "type": "string",
+        "description": "A source's lifecycle state. A separate axis from the tile signal state\n(`LIVE` / `STALE` / `NO_SIGNAL`) and from tally.",
+        "enum": [
+          "idle",
+          "starting",
+          "ready",
+          "failed"
+        ]
+      },
+      "SourceDemandView": {
+        "type": "object",
+        "description": "One source's demand state. Flat booleans keep the wire shape simple for\nthe SPA (one per rail per direction).",
+        "required": [
+          "id",
+          "phase",
+          "video_wanted",
+          "audio_wanted",
+          "video_running",
+          "audio_running",
+          "consumers",
+          "activation"
+        ],
+        "properties": {
+          "activation": {
+            "$ref": "#/components/schemas/SourceActivationView",
+            "description": "The source's configured activation. Filled by the API from the\naccepted document; providers may leave the default."
+          },
+          "audio_running": {
+            "type": "boolean",
+            "description": "Whether its audio rail is running."
+          },
+          "audio_wanted": {
+            "type": "boolean",
+            "description": "Whether consumers want its audio."
+          },
+          "consumers": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/SourceConsumerView"
+            },
+            "description": "Who is consuming it."
+          },
+          "deadline_in_ms": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "While `starting`: milliseconds left before the start timeout.",
+            "minimum": 0
+          },
+          "detail": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Why it is failed. Operator-safe: never a URL or credential."
+          },
+          "id": {
+            "type": "string",
+            "description": "The source id."
+          },
+          "phase": {
+            "$ref": "#/components/schemas/SourceDemandPhase",
+            "description": "The phase."
+          },
+          "starting_phase": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/SourceStartingPhase",
+                "description": "While `starting`: where it is."
+              }
+            ]
+          },
+          "video_running": {
+            "type": "boolean",
+            "description": "Whether its video rail is running (a lingering rail runs with no consumer)."
+          },
+          "video_wanted": {
+            "type": "boolean",
+            "description": "Whether consumers want its video."
           }
         }
       },
@@ -14949,6 +20274,30 @@
           "lifecycle": {
             "$ref": "#/components/schemas/SourceEventLifecycle",
             "description": "Observational lifecycle, not an automation command."
+          },
+          "marker_detail": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Short additional detail (segment ordinal, break duration, UPID\nsuffix), consistent with `marker_name`.",
+            "maxLength": 48
+          },
+          "marker_name": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Short human-readable marker name (e.g. \"Program Start\", \"Ad break\"),\nwhen the evidence carried enough identity to name it. Absent means\nthis marker is honestly unidentified, not that it was omitted.",
+            "maxLength": 48
+          },
+          "marker_type_id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Raw wire type token the name was derived from (e.g. `\"0x22\"`,\n`\"splice_insert\"`, `\"PRIV\"`, `\"asset\"`).",
+            "maxLength": 32
           },
           "origin": {
             "$ref": "#/components/schemas/SourceEventOrigin",
@@ -15070,6 +20419,28 @@
             },
             "description": "Bounded structured event history; an empty list is valid.",
             "maxItems": 256
+          },
+          "markers": {
+            "type": [
+              "array",
+              "null"
+            ],
+            "items": {
+              "$ref": "#/components/schemas/SourceMarkerDto"
+            },
+            "description": "Newest decoded markers first, with predicted times.",
+            "maxItems": 32
+          },
+          "source_clock": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/SourceClockDto",
+                "description": "The source's latest embedded wall clock, when it carries one."
+              }
+            ]
           },
           "source_id": {
             "type": "string",
@@ -15229,6 +20600,78 @@
           },
           {
             "type": "object",
+            "description": "A BOM weather graphic for one `[weather]` location.",
+            "required": [
+              "location",
+              "kind"
+            ],
+            "properties": {
+              "background": {
+                "$ref": "#/components/schemas/WeatherBackgroundDoc",
+                "description": "`gradient` (default, opaque) or `transparent` (alpha panels)."
+              },
+              "kind": {
+                "type": "string",
+                "enum": [
+                  "weather"
+                ]
+              },
+              "location": {
+                "type": "string",
+                "description": "The weather location id."
+              },
+              "template": {
+                "$ref": "#/components/schemas/WeatherTemplateDoc",
+                "description": "`seven_day` (default) or `today`."
+              }
+            }
+          },
+          {
+            "type": "object",
+            "description": "One prepared graphics item rendered full-time.",
+            "required": [
+              "item",
+              "kind"
+            ],
+            "properties": {
+              "item": {
+                "type": "string",
+                "description": "The `[[graphics.items]]` id."
+              },
+              "kind": {
+                "type": "string",
+                "enum": [
+                  "graphic"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "description": "A graphics playout channel output (program or preview bus).",
+            "required": [
+              "channel",
+              "kind"
+            ],
+            "properties": {
+              "bus": {
+                "$ref": "#/components/schemas/GraphicsBusDoc",
+                "description": "`program` (default) or `preview`."
+              },
+              "channel": {
+                "type": "string",
+                "description": "The `[[graphics.channels]]` id."
+              },
+              "kind": {
+                "type": "string",
+                "enum": [
+                  "graphics_channel"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
             "description": "RTSP pull.",
             "required": [
               "url",
@@ -15261,9 +20704,23 @@
                   "hls"
                 ]
               },
+              "referrer": {
+                "type": [
+                  "string",
+                  "null"
+                ],
+                "description": "Optional `Referer` header (printable, no CR/LF, <= 1 KiB)."
+              },
               "url": {
                 "type": "string",
                 "description": "Playlist URL."
+              },
+              "user_agent": {
+                "type": [
+                  "string",
+                  "null"
+                ],
+                "description": "Optional `User-Agent` header (printable, no CR/LF, <= 1 KiB)."
               }
             }
           },
@@ -15473,6 +20930,152 @@
         ],
         "description": "`OpenAPI` mirror of `multiview_config::SourceKind` (tagged by `kind`)."
       },
+      "SourceMarkerDto": {
+        "type": "object",
+        "description": "One decoded marker with predicted times. Display evidence only: lifecycle\nand automation stay on [`SourceEventDto`].",
+        "required": [
+          "record_id",
+          "name",
+          "received_at"
+        ],
+        "properties": {
+          "airs_at": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Predicted instant the splice reaches this multiview's output, UTC."
+          },
+          "airs_end_at": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Predicted instant the break end reaches this multiview's output, UTC."
+          },
+          "clock_source": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/JournalClockSource",
+                "description": "Clock used for the wall-clock fields."
+              }
+            ]
+          },
+          "duration_ms": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "Declared duration.",
+            "minimum": 0
+          },
+          "end_at": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Predicted break end on the source, UTC."
+          },
+          "event_id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "`splice_event_id` or `segmentation_event_id`."
+          },
+          "name": {
+            "type": "string",
+            "description": "Short name."
+          },
+          "received_at": {
+            "type": "string",
+            "description": "Host receive time."
+          },
+          "record_id": {
+            "type": "string",
+            "description": "Journal record holding the full decode."
+          },
+          "start_at": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Predicted splice wall-clock on the source, UTC."
+          },
+          "uncertainty_ms": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "Estimated uncertainty of that clock.",
+            "minimum": 0
+          },
+          "upid": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Decoded UPID with its type name."
+          }
+        }
+      },
+      "SourceOriginDoc": {
+        "type": "object",
+        "description": "`OpenAPI` mirror of `multiview_config::SourceOrigin`.",
+        "required": [
+          "provider"
+        ],
+        "properties": {
+          "channel": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Channel id; absent for no-metadata streams."
+          },
+          "feed": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Feed id."
+          },
+          "follow": {
+            "$ref": "#/components/schemas/OriginFollowDoc",
+            "description": "Follow mode."
+          },
+          "labels": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Catalogue labels at link time."
+          },
+          "linked_at": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "RFC 3339 link timestamp."
+          },
+          "provider": {
+            "type": "string",
+            "description": "Catalogue provider id (e.g. `iptv-org`)."
+          },
+          "stream_url": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Stream URL as linked."
+          }
+        }
+      },
       "SourceRecallDoc": {
         "type": "object",
         "description": "`OpenAPI` mirror of [`multiview_config::SourceRecall`].",
@@ -15508,6 +21111,15 @@
             "description": "Human-friendly name."
           }
         }
+      },
+      "SourceStartingPhase": {
+        "type": "string",
+        "description": "Where a `starting` source is.",
+        "enum": [
+          "queued",
+          "opening",
+          "awaiting_media"
+        ]
       },
       "SourceWallClockDoc": {
         "type": "object",
@@ -15979,6 +21591,30 @@
         ],
         "description": "`OpenAPI` mirror of [`multiview_config::routing::StreamSelector`] (RT-4).\n\nSerde-equivalent: internally tagged on `by`, `snake_case` tags — never\n`untagged` (ADR-0010). Picks **which** elementary stream of a kind a\n[`StreamRefDoc`] addresses."
       },
+      "StyleDoc": {
+        "type": "object",
+        "description": "Item style.",
+        "properties": {
+          "accent": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Accent colour `#RRGGBB`."
+          },
+          "background": {
+            "type": "string",
+            "description": "`gradient` (opaque) or `transparent`."
+          },
+          "theme": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Theme name (reserved)."
+          }
+        }
+      },
       "SupportEntitlement": {
         "type": "object",
         "description": "The full entitlement-routing answer the `GET /support/entitlement` endpoint\nreturns: whether the machine is eligible for entitled support, the route, and\nthe SLA token (a quiet line for the free tier).",
@@ -16035,6 +21671,132 @@
           "tile": {
             "type": "string",
             "description": "The tile/cell id whose source binding changes."
+          }
+        }
+      },
+      "SwitcherAccepted": {
+        "type": "object",
+        "description": "A 202 means queued, not yet on-air; operation completion arrives on a\ncorrelated engine outcome at its actual tick.",
+        "required": [
+          "operation_id",
+          "kind"
+        ],
+        "properties": {
+          "kind": {
+            "type": "string",
+            "description": "Verb name, never `applied`."
+          },
+          "operation_id": {
+            "type": "string",
+            "description": "Correlation id, echoed by the real tick driver's outcome."
+          }
+        }
+      },
+      "SwitcherPlan": {
+        "type": "object",
+        "description": "A dry-run result, including the scene generation the take must recheck.",
+        "required": [
+          "class",
+          "scene_version",
+          "can_take"
+        ],
+        "properties": {
+          "can_take": {
+            "type": "boolean",
+            "description": "Plan is valid only when a real engine bus is attached."
+          },
+          "class": {
+            "type": "string",
+            "description": "First-slice admission classification."
+          },
+          "scene_version": {
+            "type": "integer",
+            "format": "int64",
+            "description": "The exact immutable scene generation the caller may submit against.",
+            "minimum": 0
+          }
+        }
+      },
+      "SwitcherRequest": {
+        "type": "object",
+        "description": "One source-select, take or output-binding request. References are checked\nindependently; absent references never authorize implicitly.",
+        "required": [
+          "me",
+          "program",
+          "action"
+        ],
+        "properties": {
+          "action": {
+            "type": "string",
+            "description": "Action to classify on `/plan`, one of `select_program`, `select_preview`,\n`cut`, `auto`; the action is part of the same validated request."
+          },
+          "duration_frames": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32",
+            "description": "AUTO duration at the output's exact cadence; no floating milliseconds.",
+            "minimum": 0
+          },
+          "layout": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Referenced stored layout, when selecting an authored scene."
+          },
+          "me": {
+            "type": "string",
+            "description": "M/E identity (`me1` for the first slice)."
+          },
+          "output": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Referenced output to bind; all output reads/writes require output BOLA."
+          },
+          "program": {
+            "type": "string",
+            "description": "Program identity (`main` for the first slice)."
+          },
+          "source": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Referenced source for `select_program`/`select_preview`."
+          }
+        }
+      },
+      "SwitcherStateResponse": {
+        "type": "object",
+        "description": "Engine-owned bus selection and current tick, never guessed from request.",
+        "required": [
+          "tick",
+          "program_source",
+          "preview_source",
+          "in_flight"
+        ],
+        "properties": {
+          "in_flight": {
+            "type": "boolean",
+            "description": "Active AUTO status."
+          },
+          "preview_source": {
+            "type": "string",
+            "description": "Actual PVW source id."
+          },
+          "program_source": {
+            "type": "string",
+            "description": "Actual PGM source id."
+          },
+          "tick": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Applied output tick.",
+            "minimum": 0
           }
         }
       },
@@ -16143,6 +21905,17 @@
               {
                 "$ref": "#/components/schemas/NdiAttribution",
                 "description": "The mandatory NDI attribution — present iff `ndi` is compiled."
+              }
+            ]
+          },
+          "youtube": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/YoutubeCapability",
+                "description": "Whether this build can resolve a `youtube` source (ADR-0015): the\n`youtube` Cargo feature compiled in AND a `yt-dlp` binary found +\nprobed at startup. `None` on a build without the `youtube` feature at\nall (the capability does not exist, as opposed to existing-but-\nunavailable) — mirrors how [`ndi_attribution`](Self::ndi_attribution)\ndistinguishes \"not compiled\" from \"compiled but inert\"."
               }
             ]
           }
@@ -16359,6 +22132,86 @@
             "description": "The schema version (stable across machine + portal)."
           }
         }
+      },
+      "TemplateDoc": {
+        "type": "object",
+        "description": "A built-in template.",
+        "required": [
+          "id",
+          "family",
+          "name",
+          "description",
+          "fields",
+          "style_options"
+        ],
+        "properties": {
+          "data_kind": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The data kind it binds (`weather`), or null."
+          },
+          "description": {
+            "type": "string",
+            "description": "What it draws."
+          },
+          "family": {
+            "type": "string",
+            "description": "Template family (`weather`)."
+          },
+          "fields": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Data fields it reads."
+          },
+          "id": {
+            "type": "string",
+            "description": "Template id (`family.variant`)."
+          },
+          "name": {
+            "type": "string",
+            "description": "Display name."
+          },
+          "style_options": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Style options it honours."
+          }
+        }
+      },
+      "TestEventRequest": {
+        "type": "object",
+        "description": "Request body for the operator test-injection aid.",
+        "required": [
+          "boundary"
+        ],
+        "properties": {
+          "boundary": {
+            "$ref": "#/components/schemas/TestEventRequestBoundary",
+            "description": "`\"start\"` or `\"end\"` — see [`TestEventBoundary`]."
+          },
+          "duration_ns": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "Declared break duration in nanoseconds (only meaningful for `\"start\"`)."
+          }
+        }
+      },
+      "TestEventRequestBoundary": {
+        "type": "string",
+        "description": "Wire boundary selector, internally tagged (never untagged).",
+        "enum": [
+          "start",
+          "end"
+        ]
       },
       "Ticket": {
         "type": "object",
@@ -16646,6 +22499,26 @@
         ],
         "description": "`OpenAPI` mirror of `multiview_config::timer::TimerTarget` (tagged by\n`target`; flattened into the `Timer` source variant alongside `kind`)."
       },
+      "TransitionDoc": {
+        "type": "object",
+        "description": "A transition preset.",
+        "required": [
+          "kind",
+          "frames"
+        ],
+        "properties": {
+          "frames": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Mix duration in output frames (1–600).",
+            "minimum": 0
+          },
+          "kind": {
+            "type": "string",
+            "description": "`cut` or `mix`."
+          }
+        }
+      },
       "TransportBody": {
         "type": "object",
         "description": "The optional JSON body a transport verb may carry: an `asset` (for `load`)\nand/or a `frame` (for `cue`/`seek`). All fields are optional so a verb that\nneeds no body (`play`/`pause`/`stop`, or `cue`/`seek` to the in-point) may\ncarry an empty body.",
@@ -16753,7 +22626,8 @@
         "description": "`OpenAPI` mirror of [`multiview_events::WarningCode`] (SA-0 catalog).\n\nSerde-equivalent: a unit enum rendered as its `kebab-case` variant name.",
         "enum": [
           "gpu-present-no-vulkan-adapter",
-          "container-no-host-networking"
+          "container-no-host-networking",
+          "catalogue-link-attention"
         ]
       },
       "WarningSeverityDoc": {
@@ -16841,6 +22715,155 @@
           }
         }
       },
+      "WeatherBackgroundDoc": {
+        "type": "string",
+        "description": "`OpenAPI` mirror of `multiview_config::WeatherBackground`.",
+        "enum": [
+          "gradient",
+          "transparent"
+        ]
+      },
+      "WeatherLocationDoc": {
+        "type": "object",
+        "description": "A configured location (the `[[weather.locations]]` document).",
+        "required": [
+          "id",
+          "name",
+          "forecast_product",
+          "aac"
+        ],
+        "properties": {
+          "aac": {
+            "type": "string",
+            "description": "BOM forecast area code (e.g. `NSW_PT131`)."
+          },
+          "forecast_product": {
+            "type": "string",
+            "description": "BOM forecast product id (e.g. `IDN11060`)."
+          },
+          "id": {
+            "type": "string",
+            "description": "Location id (`[A-Za-z0-9_-]`, 1–64)."
+          },
+          "name": {
+            "type": "string",
+            "description": "Display name drawn on the graphic."
+          },
+          "observation_product": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "BOM observation product id (e.g. `IDN60920`)."
+          },
+          "station_wmo": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Observation station WMO id (e.g. `94768`)."
+          }
+        }
+      },
+      "WeatherLocationInput": {
+        "type": "object",
+        "description": "The `PUT` body: the location without its id (the id is the path).",
+        "required": [
+          "name",
+          "forecast_product",
+          "aac"
+        ],
+        "properties": {
+          "aac": {
+            "type": "string",
+            "description": "BOM forecast area code."
+          },
+          "forecast_product": {
+            "type": "string",
+            "description": "BOM forecast product id."
+          },
+          "name": {
+            "type": "string",
+            "description": "Display name."
+          },
+          "observation_product": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "BOM observation product id."
+          },
+          "station_wmo": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Observation station WMO id."
+          }
+        },
+        "additionalProperties": false
+      },
+      "WeatherLocationView": {
+        "type": "object",
+        "description": "One location with its latest data and freshness.",
+        "required": [
+          "location",
+          "status",
+          "forecast_freshness",
+          "attribution"
+        ],
+        "properties": {
+          "attribution": {
+            "type": "string",
+            "description": "Required on-screen attribution."
+          },
+          "forecast": {
+            "type": [
+              "object",
+              "null"
+            ],
+            "description": "Normalized forecast: `{product, aac, area_name, issued_utc,\nissued_local, expires_utc, days: [{date, weekday, icon_code, max_c,\nmin_c, precis, rain_chance, rain_range, start_local}]}` or `null`."
+          },
+          "forecast_freshness": {
+            "$ref": "#/components/schemas/FreshnessDoc",
+            "description": "Forecast product freshness."
+          },
+          "location": {
+            "$ref": "#/components/schemas/WeatherLocationDoc",
+            "description": "The configured location."
+          },
+          "observation": {
+            "type": [
+              "object",
+              "null"
+            ],
+            "description": "Latest observation: `{station_name, wmo_id, time_local, time_display,\nair_temp_c, apparent_temp_c, rel_humidity_pct, wind_dir, wind_kmh,\ngust_kmh, pressure_hpa, rain_since_9am_mm}` or `null`."
+          },
+          "observation_freshness": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/FreshnessDoc",
+                "description": "Observation product freshness (`null` when not configured)."
+              }
+            ]
+          },
+          "status": {
+            "type": "string",
+            "description": "`ok` | `pending` (no data yet) | `error` (last fetch failed, may still\nhold last-good data) | `expired` (forecast past its expiry)."
+          }
+        }
+      },
+      "WeatherTemplateDoc": {
+        "type": "string",
+        "description": "`OpenAPI` mirror of `multiview_config::WeatherTemplate`.",
+        "enum": [
+          "seven_day",
+          "today"
+        ]
+      },
       "WsTicketResponse": {
         "type": "object",
         "description": "The `POST /api/v1/ws/ticket` response: a short-lived, single-use realtime auth\nticket the browser passes as `?ticket=` on the WS/SSE upgrade (ADR-RT011).",
@@ -16858,6 +22881,31 @@
           "ticket": {
             "type": "string",
             "description": "The opaque single-use ticket. Present it once as `?ticket=` within\n`expires_in_secs`; it is consumed on the first WS/SSE upgrade."
+          }
+        }
+      },
+      "YoutubeCapability": {
+        "type": "object",
+        "description": "The `youtube` source kind's resolve capability (ADR-0015): whether this\nbuild can actually resolve a live `YouTube` URL right now.",
+        "required": [
+          "compiled",
+          "available"
+        ],
+        "properties": {
+          "available": {
+            "type": "boolean",
+            "description": "Whether a `yt-dlp` binary was found and successfully probed\n(`yt-dlp --version`) at startup. Always `false` when\n[`compiled`](Self::compiled) is `false`."
+          },
+          "compiled": {
+            "type": "boolean",
+            "description": "Whether the `youtube` Cargo feature is compiled into this binary. A\n`false` here means the build simply cannot run the resolver at all,\nregardless of whether `yt-dlp` is installed."
+          },
+          "version": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The probed `yt-dlp --version` output — present only when\n[`available`](Self::available) is `true`."
           }
         }
       }
@@ -16878,6 +22926,14 @@
     {
       "name": "sources",
       "description": "Source (managed input) resource CRUD"
+    },
+    {
+      "name": "iptv",
+      "description": "Managed IPTV playlist + XMLTV guide publication"
+    },
+    {
+      "name": "graphics",
+      "description": "Graphics (CG): data sources, templates, items and playout channels (cue / take / clear / next)"
     },
     {
       "name": "inputs",
@@ -16942,6 +22998,10 @@
     {
       "name": "telemetry",
       "description": "Telemetry pipe (Conspect): the opt-in daily-pipe consent (off by default, last-writer-wins), the published schema (sent + never-sent), and the §4.2 diagnostics snapshot (logs + engine state, never media). DISTINCT from the licensing heartbeat (under /licensing) — the two pipes are never co-mingled. Consent gates no local route; control-plane only."
+    },
+    {
+      "name": "catalogue",
+      "description": "IPTV-ORG source browser (ADR-M015): synced catalogue index + place gazetteer, offline import, deep stream probe, and per-source link tracking. Control plane only; probes are bounded (4 concurrent, queue 64, 20 s, 16 MiB, 60/min/principal) and every dial is SSRF-screened."
     },
     {
       "name": "salvos",

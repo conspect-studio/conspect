@@ -20,6 +20,27 @@ fn generated_doc() -> Value {
 }
 
 #[test]
+fn output_run_state_schema_matches_wire_states() {
+    use multiview_events::OutputRunState;
+
+    let states = [
+        OutputRunState::Idle,
+        OutputRunState::Starting,
+        OutputRunState::Running,
+        OutputRunState::Migrating,
+        OutputRunState::Error,
+    ];
+    let wire_states: Vec<Value> = states
+        .into_iter()
+        .map(|state| serde_json::to_value(state).unwrap())
+        .collect();
+    assert_eq!(
+        generated_doc().pointer("/components/schemas/OutputRunState/enum"),
+        Some(&Value::Array(wire_states))
+    );
+}
+
+#[test]
 fn asyncapi_version_is_3_0_0() {
     let doc = generated_doc();
     assert_eq!(

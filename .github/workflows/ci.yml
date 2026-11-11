@@ -657,6 +657,10 @@ jobs:
         # (no lavfi) can never be loaded into it, whatever sonames the distro
         # and the pinned build carry; the test binaries still load the pinned
         # libraries.
+        #   `ffmpeg` (the CLI) too: the `srt-libsrt` leg below drives real SRT
+        #   caller/listener peers through it (push_resilient_srt.rs /
+        #   push_pipeline.rs's srt_listener_* tests), independent of the pinned
+        #   libav* this leg links into the Rust test binary.
         run: |
           set -euo pipefail
           sudo apt-get update
@@ -889,6 +893,82 @@ jobs:
           -p multiview-cli
           --features ffmpeg,aes67
           --lib hls_fetch
+      - name: clippy multiview-cli --features ffmpeg,srt-libsrt
+        # Dual-stack SRT listener leaf (ADR-0039 decision 10, amended): off by
+        # default, NOT implied by plain `ffmpeg`, so — exactly like
+        # `webrtc-native`/`aes67` above — the libav-free `feature-clippy` matrix
+        # physically cannot build it (links libav AND the native-but-dlopen-only
+        # `multiview-srt-sys` leaf) and a clippy break here would reach main
+        # CI-green. --locked enforces Cargo.lock; -D warnings mirrors the
+        # default `lint` gate; --all-targets also lints the srt test binaries.
+        run: >
+          cargo clippy
+          --locked
+          -p multiview-cli
+          --features ffmpeg,srt-libsrt
+          --all-targets
+          -- -D warnings
+      - name: clippy multiview-output --features ffmpeg,srt-libsrt
+        # The listener-mode push sink (`sink::push::listener_main` et al.) lives
+        # entirely behind `srt-libsrt`; same rationale as the cli leg above.
+        run: >
+          cargo clippy
+          --locked
+          -p multiview-output
+          --features ffmpeg,srt-libsrt
+          --all-targets
+          -- -D warnings
+      - name: test multiview-output --features ffmpeg,srt-libsrt (SRT push, real libsrt loopback)
+        # push_resilient_srt.rs drives REAL libsrt caller/listener peers (the
+        # apt `ffmpeg` CLI installed above) over loopback: sequential/simultaneous
+        # callers, caller-mode reconnect, the never-block drop policy, bounded
+        # teardown while blocked in `srt_accept`, and passphrase rejection.
+        # `--test-threads=1`: the tests share a per-process port-allocation
+        # counter and bind real sockets — serialized avoids port collisions.
+        # `required-features` is not set on this target (matches the crate's
+        # existing `#![cfg(feature = ...)]`-gated test convention), so this
+        # `--features` selection is what makes the file compile at all.
+        run: >
+          cargo test
+          --locked
+          -p multiview-output
+          --features ffmpeg,srt-libsrt
+          --test push_resilient_srt
+          --
+          --test-threads=1
+      - name: test multiview-srt-sys (dual-stack bind + missing-library)
+        # The leaf's own suite: libsrt URL/option parsing, the v4-mapped-v6
+        # sockaddr round-trip, the missing-library fail-closed path (an
+        # injected, deliberately-unresolvable SONAME list), and the real
+        # `[::]` dual-stack bind accepting both an IPv6 and an IPv4 `ffmpeg`
+        # CLI caller. `--test-threads=1`: the dual-stack test binds a real
+        # port.
+        run: cargo test --locked -p multiview-srt-sys -- --test-threads=1
+      - name: test multiview-cli --features ffmpeg,srt-libsrt (srt listener wiring, pure)
+        # `srt_wiring_tests` covers the pure URL-resolution fail-closed/pass-
+        # through logic (no sockets). A single cargo invocation that also
+        # selected `--test push_pipeline` would apply this SAME name filter to
+        # that binary too (cargo's positional TESTNAME is shared across every
+        # selected target) and silently run zero of its tests, so it is its
+        # own step below instead.
+        run: >
+          cargo test
+          --locked
+          -p multiview-cli
+          --features ffmpeg,srt-libsrt
+          --lib srt_wiring
+      - name: test multiview-cli --features ffmpeg,srt-libsrt (srt listener pipeline, real libsrt)
+        # The two `tests/push_pipeline.rs` SRT tests drive the REAL multiview
+        # pipeline end-to-end over a `[::]` listener with the apt `ffmpeg` CLI
+        # as the caller/peer. `--test-threads=1` avoids port collisions.
+        run: >
+          cargo test
+          --locked
+          -p multiview-cli
+          --features ffmpeg,srt-libsrt
+          --test push_pipeline
+          --
+          --test-threads=1
 
   # ── AsyncAPI 3.0 spec validation (SUR-6b follow-on, folded into IN-7) ────────
   # Validates docs/api/asyncapi.json against the AsyncAPI 3.0 JSON Schema using

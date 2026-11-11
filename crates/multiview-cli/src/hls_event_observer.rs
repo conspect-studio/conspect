@@ -1,7 +1,7 @@
 //! Bounded HLS presence evidence. No receipt clock, splice inference or global registry.
 use crate::source_event_service::{SourceEventProducer, SubmitOutcome};
 use multiview_core::source_event::{
-    EventBoundary, EventOrigin, SourceEventKey, SourceEventObservation,
+    EventBoundary, EventOrigin, MarkerDescriptor, SourceEventKey, SourceEventObservation,
 };
 use multiview_input::hls::{CueMetadata, PlaylistCueMetadata, PlaylistCueObservation};
 use std::collections::BTreeMap;
@@ -181,6 +181,17 @@ impl HlsEventObserver {
         }
     }
     fn emit(&mut self, asset: &str, label: &str, id: &str, boundary: EventBoundary) -> bool {
+        // "Asset <caid>" names reusable asset identity, never a break boundary
+        // (CAID presence is not proof the next segment airs an ad).
+        let descriptor = matches!(boundary, EventBoundary::MarkerObserved).then(|| {
+            let mut name = format!("Asset {label}");
+            name.truncate(48);
+            MarkerDescriptor {
+                name,
+                type_id: Some("asset".to_owned()),
+                detail: None,
+            }
+        });
         let accepted = self.sink.try_observe(SourceEventObservation {
             key: SourceEventKey {
                 source_id: self.source.clone(),
@@ -194,6 +205,7 @@ impl HlsEventObserver {
             boundary,
             correlation_id: Some(asset.into()),
             asset_id: Some(label.into()),
+            descriptor,
         });
         if !accepted {
             self.mark_degraded();

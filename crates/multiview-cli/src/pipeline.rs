@@ -75,6 +75,10 @@ use ffmpeg_next::util::frame::Video;
 use crate::binding_delivery::{
     tick_span, BindingDelivery, BindingPolicy, DeliveryLimits, LeasedPacket, WindowDelivery,
 };
+use crate::display_size::{
+    cell_pixel_size, display_size, DecoderState, DisplayDriver, DisplayFollow, DisplayLayoutSlot,
+    DisplayStep, HandoverDecoder, SkipThrough,
+};
 use crate::rendition_dispatch::{BindingConfig, DispatchConfig, DtsTimeBase, RenditionDispatcher};
 use crate::rendition_workers::{
     BakedTick, DispatchEvent, RenditionWorker, ReorderBound, VideoEncodeWorker,
@@ -86,10 +90,11 @@ use multiview_config::{lower_rist_url, RistOptions};
 use multiview_config::{MultiviewConfig, Output, Source, SourceKind, SrtBackend, SrtOptions};
 use multiview_control::EngineStateSnapshot;
 use multiview_core::frame::FrameMeta;
-use multiview_core::layout::{Cell, Layout};
+use multiview_core::layout::Layout;
 use multiview_core::pixel::PixelFormat;
 use multiview_core::time::{MediaTime, Rational};
 use multiview_core::traits::SourceState;
+use multiview_engine::Rails;
 use multiview_engine::{
     CompositedFrame, CompositorDrive, EnginePublisher, MonotonicTimeSource, MultiviewProgram,
     OutputClock, Pacer, RealtimePacer, RequestedSize, SourceHandle, SourceKey, SourceRegistry,
@@ -261,6 +266,39 @@ struct StreamPlan {
     /// `program.ts` anchor). Carried so the effective-output registry resolves a
     /// WHEP/MoQ scope to the exact binding the dispatcher admits.
     binding_ids: Vec<Option<String>>,
+}
+
+/// Is this document's canvas one the first slice can drive as a real M/E bus?
+///
+/// Exactly one full-canvas, fully opaque, unclipped, non-overlay cell bound to
+/// the declared `program_source` — the shape the engine treats as the
+/// source-agnostic bus canvas. An unsupported opted-in layout is refused with a
+/// typed error instead of silently replacing the operator's multiview.
+#[allow(clippy::float_cmp)]
+// reason: authored layout fractions compared against their exact canonical
+// values; an approximate comparison would admit a windowed/tiled canvas as
+// "full canvas" and change which sources the buses admit.
+fn first_slice_me_layout_supported(
+    layout: &Layout,
+    config: &MultiviewConfig,
+    me: &multiview_config::MixEffectsConfig,
+) -> bool {
+    layout.cells.len() == 1
+        && config.overlays.is_empty()
+        && !config.cells.first().is_some_and(|cell| {
+            cell.corner_radius.is_some()
+                || cell.border.is_some()
+                || cell.fit.as_deref().is_some_and(|fit| fit != "fill")
+                || cell.visible == Some(false)
+        })
+        && layout.cells.first().is_some_and(|cell| {
+            cell.x == 0.0 && cell.y == 0.0 && cell.w == 1.0 && cell.h == 1.0 && cell.opacity == 1.0
+        })
+        && config
+            .cells
+            .first()
+            .and_then(|cell| cell.source.input_id.as_deref())
+            == Some(me.program_source.as_str())
 }
 
 /// Errors building or running the libav\* pipeline.
@@ -1228,7 +1266,29 @@ segment_ms = 1000
 
         let polls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let spawner = LiveIngestSpawner {
-            source_events: Arc::new(crate::source_event_runtime::Runtime::new().expect("events")),
+            demand: None,
+            source_events: std::sync::Arc::new(
+                crate::source_event_runtime::Runtime::new().expect("events"),
+            ),
+            #[cfg(feature = "overlay")]
+            caption_stores: std::sync::Arc::new(multiview_framestore::SwapCell::from_pointee(
+                std::collections::HashMap::default(),
+            )),
+            #[cfg(feature = "overlay")]
+            caption_generations: std::sync::Arc::new(multiview_framestore::SwapCell::from_pointee(
+                std::collections::HashMap::default(),
+            )),
+            #[cfg(feature = "overlay")]
+            caption_display_times: std::sync::Arc::new(
+                multiview_framestore::SwapCell::from_pointee(std::collections::HashMap::default()),
+            ),
+            display: super::DisplayFollow::new(
+                std::sync::Arc::new(multiview_framestore::SwapCell::new(std::sync::Arc::new(
+                    layout.clone(),
+                ))),
+                None,
+            ),
+            clear_on_remove: false,
             layout: std::sync::Arc::new(layout),
             canvas_color: CanvasColor::default(),
             cadence: Rational::new(25, 1),
@@ -1321,7 +1381,29 @@ segment_ms = 1000
 
         let polls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let spawner = LiveIngestSpawner {
-            source_events: Arc::new(crate::source_event_runtime::Runtime::new().expect("events")),
+            demand: None,
+            source_events: std::sync::Arc::new(
+                crate::source_event_runtime::Runtime::new().expect("events"),
+            ),
+            #[cfg(feature = "overlay")]
+            caption_stores: std::sync::Arc::new(multiview_framestore::SwapCell::from_pointee(
+                std::collections::HashMap::default(),
+            )),
+            #[cfg(feature = "overlay")]
+            caption_generations: std::sync::Arc::new(multiview_framestore::SwapCell::from_pointee(
+                std::collections::HashMap::default(),
+            )),
+            #[cfg(feature = "overlay")]
+            caption_display_times: std::sync::Arc::new(
+                multiview_framestore::SwapCell::from_pointee(std::collections::HashMap::default()),
+            ),
+            display: super::DisplayFollow::new(
+                std::sync::Arc::new(multiview_framestore::SwapCell::new(std::sync::Arc::new(
+                    layout.clone(),
+                ))),
+                None,
+            ),
+            clear_on_remove: false,
             layout: std::sync::Arc::new(layout),
             canvas_color: CanvasColor::default(),
             cadence: Rational::new(25, 1),
@@ -1595,9 +1677,32 @@ impl RunnableOutput {
 
 /// A built, ready-to-run pipeline.
 pub struct Pipeline {
+    /// Every configured source's definition and frame store. A source with no
+    /// consumer costs this entry and nothing else.
+    catalogue: crate::source_rails::Catalogue,
+    /// The demand manager, built when the run starts.
+    demand: Option<multiview_engine::DemandManager<Nv12Image>>,
+    /// Linger and start concurrency for the manager.
+    demand_config: multiview_engine::DemandConfig,
+    /// What each booted source runs, for the manager to adopt.
+    boot_rails: std::collections::BTreeMap<String, Rails>,
+    /// Standing leases from source settings (always-on, armed automation),
+    /// as one complete set per owning source (review DMD-01).
+    boot_pins: Vec<(String, Vec<crate::source_demand::StandingPin>)>,
+    /// The boot audio routes' consumers.
+    boot_audio_routes: Vec<multiview_engine::SetItem>,
+    switcher_audio_warm: Option<multiview_engine::ConsumerSet<Nv12Image>>,
+    /// The layout and audio-route consumer sets, once the manager exists.
+    demand_sets: Option<(
+        multiview_engine::ConsumerSet<Nv12Image>,
+        multiview_engine::ConsumerSet<Nv12Image>,
+    )>,
     source_events: Arc<crate::source_event_runtime::Runtime>,
     /// The solved layout (canvas + normalized cells).
     layout: Arc<Layout>,
+    /// The live layout the decodes size themselves from; the control drain
+    /// publishes every applied change here.
+    display_layout: DisplayLayoutSlot,
     /// The fixed output cadence (exact rational).
     cadence: Rational,
     /// The single program this pipeline runs (ADR-0030 MP-0). The legacy
@@ -1609,6 +1714,14 @@ pub struct Pipeline {
     /// per-program context [`PipelineError`] carries. The `programs: Vec<…>`
     /// schema root + multi-program supervisor arrive in MP-1/MP-5.
     program_spec: multiview_config::ProgramSpec,
+    /// Optional first-slice M/E on this one program; absent preserves legacy
+    /// source/layout/encode behaviour byte-for-byte.
+    switcher_me: Option<multiview_config::MixEffectsConfig>,
+    /// Live control handle published only when the paired bus provider starts.
+    switcher_control: Option<multiview_engine::switcher_control::SwitcherControl>,
+    switcher_driver: Option<multiview_engine::switcher_control::SwitcherTickDriver>,
+    /// Separate PVW JPEG tap: never silently copy the PGM canvas here.
+    switcher_preview: Option<crate::preview::ProgramSlot>,
     /// Per-source native caption cue stores, keyed by source id. Each store is
     /// written by an isolated caption reader thread (HLS `WebVTT` rendition demux)
     /// and **sampled** at each output tick by the overlay baker, which burns the
@@ -1975,6 +2088,9 @@ struct IngestPlan {
     id: String,
     /// Where the media lives.
     location: SourceLocation,
+    /// Operator-set HLS request headers (`user_agent` / `referrer`, IPTV-ORG
+    /// slice A). Empty for every other kind.
+    http_headers: HttpHeaders,
     /// When `Some`, this source is a **media-player channel** (ADR-0057 /
     /// ADR-0097): [`open_and_stream`] runs the transport-driven decode loop
     /// ([`stream_player`]) instead of the plain pace-and-publish pump — it
@@ -1990,6 +2106,10 @@ struct IngestPlan {
     tile_w: u32,
     /// The destination tile height.
     tile_h: u32,
+    /// When `Some`, the decode follows the live layout and `tile_w`/`tile_h` are
+    /// only the size at plan time. `None` for producers with a fixed output
+    /// size (see [`decode_follows_layout`]).
+    display: Option<DisplayFollow>,
     /// The store to publish decoded frames into (shared with the drive loop).
     store: Arc<TileStore<Nv12Image>>,
     /// The run's output-clock origin (time source + tick-0 seed), published
@@ -2087,6 +2207,12 @@ struct IngestPlan {
     /// [`IngestSupervisor::start`].
     #[cfg(feature = "youtube")]
     youtube_url_slot: Option<Arc<multiview_framestore::SwapCell<Option<Arc<String>>>>>,
+    /// An explicit `yt-dlp` binary path for this run (ADR-0015 §6), stamped
+    /// from the `MULTIVIEW_YOUTUBE_YT_DLP_PATH` environment variable or else
+    /// `[system.youtube] yt_dlp_path` after build (like `ndi_accept_license`).
+    /// `None` ⇒ `yt-dlp` is resolved on `PATH` (the resolver's default).
+    #[cfg(feature = "youtube")]
+    youtube_yt_dlp_path: Option<String>,
 }
 
 /// Everything one AES67 / ST 2110-30 audio source needs to be received on its own
@@ -2280,6 +2406,20 @@ impl Pipeline {
         #[cfg(feature = "aes67")]
         ensure_no_cell_binds_an_aes67_source(config)?;
         let layout = Arc::new(config.solve_layout()?);
+        let switcher_me = config
+            .switcher
+            .as_ref()
+            .and_then(|s| s.mix_effects.first())
+            .cloned();
+        // This slice admits a single real full-canvas source cell. A running
+        // legacy multiview with multiple cells remains untouched when the M/E
+        // block is absent; an opted-in unsupported layout fails loudly instead
+        // of replacing the operator's canvas with a guessed source.
+        if let Some(me) = &switcher_me {
+            if !first_slice_me_layout_supported(&layout, config, me) {
+                return Err(PipelineError::Engine("first-slice M/E requires one full-canvas source cell initially bound to program_source; multi-cell layouts are not replaced".into()));
+            }
+        }
         let cadence = config.canvas.fps.rational();
         let canvas_color = CanvasColor::default();
         let tag = canvas_color.output_tag();
@@ -2327,10 +2467,23 @@ impl Pipeline {
         #[cfg(feature = "overlay")]
         let mut caption_plans: Vec<crate::captions::CaptionPlan> = Vec::new();
 
-        // Resolve every source's HLS WebVTT caption plan CONCURRENTLY, off the
-        // serial build path (#48), indexed by id for the loop's cheap lookup.
+        // Demand (docs/architecture/demand-driven-sources.md): only sources a
+        // consumer needs at boot are built below. Every other configured source
+        // gets a catalogue entry (one empty store) and costs nothing until a
+        // consumer leases it: no probe, no plan, no thread, no connection.
+        let boot_demand = crate::source_demand::startup_demand(
+            config,
+            layout
+                .cells
+                .iter()
+                .filter_map(|cell| cell.source.as_deref()),
+        );
+        let wants = |id: &str| boot_demand.get(id).map_or(Rails::NONE, |d| d.rails);
+
+        // Resolve every demanded source's HLS WebVTT caption plan CONCURRENTLY,
+        // off the serial build path (#48), indexed by id for the loop's lookup.
         #[cfg(feature = "overlay")]
-        let mut prefetched_captions = prefetch_caption_plans(config);
+        let mut prefetched_captions = prefetch_caption_plans(config, |id| wants(id).video);
         #[cfg(feature = "overlay")]
         let audio_free_sources = Arc::new(multiview_framestore::SwapCell::from_pointee(
             config
@@ -2350,10 +2503,22 @@ impl Pipeline {
         // (no decode actor to own yet). Holding each handle keeps its entry alive for
         // the pipeline's lifetime (the program's reference); dropping it releases.
         let source_registry = SourceRegistry::<Nv12Image>::new();
+        // The rails each booted source runs; the demand manager adopts these.
+        let mut boot_rails: std::collections::BTreeMap<String, Rails> =
+            std::collections::BTreeMap::new();
+        let display_layout: DisplayLayoutSlot =
+            Arc::new(multiview_framestore::SwapCell::new(Arc::clone(&layout)));
         let mut source_handles: Vec<SourceHandle<Nv12Image>> =
             Vec::with_capacity(config.sources.len());
 
         for source in &config.sources {
+            let rails = wants(&source.id);
+            // AES67 stays as it was: it is a local multicast join with no
+            // catalogue entry, so demand does not manage it.
+            if rails.is_empty() && !matches!(source.kind, SourceKind::Aes67 { .. }) {
+                // Unconsumed: its catalogue entry is its whole cost.
+                continue;
+            }
             // #103: an AES67 / ST 2110-30 source is AUDIO-ONLY. It decodes no
             // pixels, so it takes NO video TileStore, NO SourceRegistry entry, and
             // NO layout tile — the MP-2 decode-once video seam (ADR-0030 §3) never
@@ -2378,8 +2543,30 @@ impl Pipeline {
                 });
                 continue;
             }
-            let (tile_w, tile_h) = cell_pixel_size(&layout, &source.id)
-                .unwrap_or((config.canvas.width, config.canvas.height));
+            if !rails.video {
+                // Audio-only demand (an audio route on an unbound source, the
+                // production msnow shape): no picture is decoded at all.
+                if let Some(mut audio_plan) = audio_ingest_plan_for(source) {
+                    audio_plan.audio_only = true;
+                    audio_stores.insert(source.id.clone(), crate::audio::new_audio_only_store());
+                    audio_ingest_plans.push(audio_plan);
+                    boot_rails.insert(source.id.clone(), Rails::AUDIO);
+                } else if tone_ingest_plan_for(source, cadence).is_some() {
+                    audio_stores
+                        .entry(source.id.clone())
+                        .or_insert_with(crate::audio::new_tone_store);
+                    boot_rails.insert(source.id.clone(), Rails::AUDIO);
+                }
+                continue;
+            }
+            boot_rails.insert(
+                source.id.clone(),
+                Rails {
+                    video: true,
+                    audio: rails.audio,
+                },
+            );
+            let (tile_w, tile_h) = planned_tile_size(&layout, source);
             // The registry owns the shared store, sized to the per-axis supremum;
             // `stores` + the ingest plan below hold Arc clones (lock-free readers).
             let source_handle = source_registry.acquire_store(
@@ -2398,7 +2585,6 @@ impl Pipeline {
             )?;
             let store = Arc::clone(source_handle.store());
             source_handles.push(source_handle);
-            #[cfg_attr(not(feature = "overlay"), allow(unused_mut))]
             let mut plan = ingest_plan_for(
                 source,
                 tile_w,
@@ -2407,10 +2593,18 @@ impl Pipeline {
                 canvas_color,
                 cadence,
             )?;
+            plan.display = decode_follows_layout(&source.kind).then(|| {
+                DisplayFollow::new(
+                    Arc::clone(&display_layout),
+                    Some(Arc::clone(&source_registry)),
+                )
+            });
             // Reserve the authoritative epoch before either startup rail starts.
             // Old detached publishers from a previous run retain their old token.
             plan.lifecycle = begin_live_lifecycle(&source.id);
-            plan.source_events = source_events.activate(&source.id, plan.lifecycle);
+            plan.source_events = source_events_enabled(source)
+                .then(|| source_events.activate(&source.id, plan.lifecycle))
+                .flatten();
 
             // Stamp this source's NDI license acceptance from `[system.ndi]`
             // (ADR-0008 §7.5), like `cuda_ordinal` below — the per-source drive
@@ -2424,6 +2618,18 @@ impl Pipeline {
                     accepted_by: ndi.accepted_by.clone().unwrap_or_default(),
                     accepted_at: ndi.accepted_at.clone().unwrap_or_default(),
                 };
+            }
+
+            // Stamp this source's explicit `yt-dlp` path (ADR-0015 §6), like
+            // `ndi_accept_license` above: the service user's `PATH` may not
+            // include where an operator installed it (e.g. `~/.local/bin`), so
+            // an explicit override is read from `MULTIVIEW_YOUTUBE_YT_DLP_PATH`
+            // (takes precedence, matching the existing `MULTIVIEW_*` override
+            // pattern) or else `[system.youtube] yt_dlp_path`. `None` ⇒ resolve
+            // on `PATH` (the resolver's own default).
+            #[cfg(feature = "youtube")]
+            {
+                plan.youtube_yt_dlp_path = crate::youtube_resolver_path(config);
             }
 
             // Wire this source's native captions (HLS WebVTT rendition thread +/or
@@ -2451,7 +2657,7 @@ impl Pipeline {
             // source yields `None` (no audio thread; it rides silence on the bus).
             // The store is built per audio-bearing source so the bus can route it;
             // it stays empty (silence-filling) until the decode thread fills it.
-            if let Some(mut audio_plan) = audio_ingest_plan_for(source) {
+            if let Some(mut audio_plan) = audio_ingest_plan_for(source).filter(|_| rails.audio) {
                 audio_plan.lifecycle = lifecycle;
                 audio_plan.anchor_floor = anchor_floor;
                 // A live network source arrives on its own clock: give it the
@@ -2469,7 +2675,8 @@ impl Pipeline {
             // colour-bars companion), so it contributes a real audio store on the
             // bus rather than silence. Its pure tone store is pulled by the bake
             // consumer, without a producer thread. Other synthetic sources stay silent.
-            if let Some(_tone_plan) = tone_ingest_plan_for(source, cadence) {
+            if let Some(_tone_plan) = tone_ingest_plan_for(source, cadence).filter(|_| rails.audio)
+            {
                 audio_stores
                     .entry(source.id.clone())
                     .or_insert_with(crate::audio::new_tone_store);
@@ -2665,7 +2872,8 @@ impl Pipeline {
         // rides its floor — no fabricated constant). This never touches the hot
         // path: it is computed once at build time.
         #[cfg(feature = "overlay")]
-        let (meter_db_timelines, meter_channel_timelines) = build_meter_timelines(config, cadence);
+        let (meter_db_timelines, meter_channel_timelines) =
+            build_meter_timelines(config, cadence, |id| wants(id).video);
         #[cfg(feature = "overlay")]
         let tile_labels = config
             .sources
@@ -2695,7 +2903,7 @@ impl Pipeline {
         // published snapshot is the RT-3 read-only discovery surface. Synthetic /
         // live-URL / NDI sources (and the no-`ffmpeg` build) contribute nothing
         // and simply ride an empty map (inv #10 — never on the hot loop).
-        let inventories = build_input_inventories(config);
+        let inventories = build_input_inventories(config, |id| wants(id).video);
 
         // Desugar the legacy single-program config into one implicit `"main"`
         // `Multiview` program (ADR-0030 §6 / MP-0). The run path is driven through
@@ -2717,11 +2925,46 @@ impl Pipeline {
             .map(|plan| (plan.id.clone(), plan.lifecycle))
             .collect();
 
+        // Every configured source is catalogued, demanded or not; the stores of
+        // booted sources are shared so a later lease reuses them.
+        let catalogue = crate::source_rails::catalogue(
+            config
+                .sources
+                .iter()
+                .filter(|source| !matches!(source.kind, SourceKind::Aes67 { .. })),
+            &stores,
+        );
+        let demand_config = crate::source_demand::demand_config(config);
+        let boot_pins: Vec<(String, Vec<crate::source_demand::StandingPin>)> = config
+            .sources
+            .iter()
+            .map(|source| {
+                (
+                    source.id.clone(),
+                    crate::source_demand::standing_pins(source),
+                )
+            })
+            .filter(|(_, pins)| !pins.is_empty())
+            .collect();
+        let boot_audio_routes = crate::source_demand::audio_route_items(config.audio.as_ref());
         Ok(Self {
+            catalogue,
+            demand: None,
+            demand_config,
+            boot_rails,
+            boot_pins,
+            boot_audio_routes,
+            switcher_audio_warm: None,
+            demand_sets: None,
             source_events,
             layout,
+            display_layout,
             cadence,
             program_spec,
+            switcher_me,
+            switcher_control: None,
+            switcher_driver: None,
+            switcher_preview: None,
             stores,
             source_registry,
             source_handles,
@@ -2913,6 +3156,19 @@ impl Pipeline {
         self.stores.len()
     }
 
+    /// The number of configured sources, consumed or not.
+    #[must_use]
+    pub fn configured_source_count(&self) -> usize {
+        self.catalogue.load().len()
+    }
+
+    /// The rails each source started at boot. A configured source absent here
+    /// costs nothing until a consumer leases it.
+    #[must_use]
+    pub fn boot_rails(&self) -> &std::collections::BTreeMap<String, Rails> {
+        &self.boot_rails
+    }
+
     /// The number of layout tiles (cells) the canvas composites — the decode-stage
     /// demand magnitude the placement controller admits against (GPU-5c).
     #[must_use]
@@ -2967,9 +3223,129 @@ impl Pipeline {
     /// pinned to the running island's device — that placed the startup island.
     #[must_use]
     pub fn live_ingest_spawner(&self) -> Arc<dyn crate::live_sources::IngestSpawner> {
-        Arc::new(LiveIngestSpawner {
+        Arc::new(self.live_spawner())
+    }
+
+    /// Every catalogued source's frame store, keyed by id.
+    fn catalogue_stores(&self) -> HashMapStores {
+        let mut stores: HashMapStores = self
+            .catalogue
+            .load()
+            .iter()
+            .map(|(id, entry)| (id.clone(), Arc::clone(entry.store())))
+            .collect();
+        // Media players and other boot-only stores ride along.
+        for (id, store) in &self.stores {
+            stores
+                .entry(id.clone())
+                .or_insert_with(|| Arc::clone(store));
+        }
+        stores
+    }
+
+    /// The demand manager for this run, built on first call, its consumers
+    /// seeded from boot and its boot-started rails adopted. Its worker starts
+    /// with the run. Call before [`Self::live_ingest_spawner`] so live source
+    /// edits go through the catalogue instead of spawning eagerly.
+    pub fn demand(&mut self) -> multiview_engine::DemandManager<Nv12Image> {
+        if let Some(demand) = &self.demand {
+            return demand.clone();
+        }
+        let spawner = DemandSpawner {
+            live: self.live_spawner(),
+            registry: Arc::clone(&self.stop_registry),
+        };
+        let rails = crate::source_rails::SourceRails::new(
+            Arc::clone(&self.catalogue),
+            Arc::clone(&self.stop_registry),
+            Arc::new(spawner),
+        );
+        let manager = multiview_engine::DemandManager::new(
+            Arc::clone(&self.source_registry),
+            Arc::new(rails),
+            self.demand_config,
+        );
+        // Boot consumers first, then adopt what boot already started, so
+        // nothing is started twice and nothing unneeded keeps running.
+        let layout = manager.consumer_set(multiview_engine::ConsumerClass::LayoutCell, Rails::ALL);
+        layout.seed(crate::source_demand::layout_items_for(&self.layout));
+        let audio = manager.consumer_set(multiview_engine::ConsumerClass::AudioRoute, Rails::AUDIO);
+        audio.seed(self.boot_audio_routes.clone());
+        // Keyed by the owning source, exactly as a runtime upsert keys them,
+        // so a later edit or removal replaces this very set.
+        for (owner, pins) in std::mem::take(&mut self.boot_pins) {
+            manager.set_pins(&owner, pins);
+        }
+        // Boot audio threads run only on a run with a program bus.
+        let bus = self.encode_cfg.audio.is_some();
+        for (id, rails) in &self.boot_rails {
+            let running = Rails {
+                video: rails.video,
+                audio: rails.audio && bus,
+            };
+            if !running.is_empty() {
+                manager.adopt(id, running);
+            }
+        }
+        // The pipeline's own boot references are superseded by the leases.
+        self.source_handles.clear();
+        if self.encode_cfg.audio.is_some() {
+            if let Some(me) = &self.switcher_me {
+                let warm =
+                    manager.consumer_set(multiview_engine::ConsumerClass::AudioRoute, Rails::ALL);
+                warm.seed(vec![
+                    multiview_engine::SetItem {
+                        id: me.program_source.clone().into(),
+                        label: "switcher-pgm-audio".into(),
+                        size: None,
+                    },
+                    multiview_engine::SetItem {
+                        id: me.preview_source.clone().into(),
+                        label: "switcher-pvw-audio".into(),
+                        size: None,
+                    },
+                ]);
+                self.switcher_audio_warm = Some(warm);
+            }
+        }
+        self.demand_sets = Some((layout, audio));
+        self.demand = Some(manager.clone());
+        manager
+    }
+
+    /// The command drain's demand seam. `None` before [`Self::demand`].
+    #[must_use]
+    pub fn drain_demand(&self) -> Option<crate::source_demand::DrainDemand<Nv12Image>> {
+        let manager = self.demand.clone()?;
+        let (layout, _) = self.demand_sets.clone()?;
+        Some(crate::source_demand::DrainDemand {
+            layout,
+            subtitles: manager
+                .consumer_set(multiview_engine::ConsumerClass::SubtitleRoute, Rails::VIDEO),
+            manager,
+            catalogue: Arc::clone(&self.catalogue),
+        })
+    }
+
+    /// The configured-source catalogue.
+    #[must_use]
+    pub fn catalogue(&self) -> crate::source_rails::Catalogue {
+        Arc::clone(&self.catalogue)
+    }
+
+    fn live_spawner(&self) -> LiveIngestSpawner {
+        LiveIngestSpawner {
+            demand: self
+                .demand
+                .clone()
+                .map(|manager| (Arc::clone(&self.catalogue), manager)),
             source_events: Arc::clone(&self.source_events),
+            clear_on_remove: self.switcher_me.is_some(),
             layout: Arc::clone(&self.layout),
+            display: DisplayFollow::new(
+                Arc::clone(&self.display_layout),
+                Some(Arc::clone(&self.source_registry)),
+            ),
             canvas_color: self.canvas_color,
             cadence: self.cadence,
             output_origin: Arc::clone(&self.epoch_anchor),
@@ -2984,7 +3360,14 @@ impl Pipeline {
             island: Arc::clone(&self.live_island),
             #[cfg(feature = "gpu")]
             load_source: crate::system_metrics::default_load_source(),
-        })
+        }
+    }
+
+    /// The slot the control drain publishes the live layout into, for
+    /// [`command_drain_with_seams`](crate::control::command_drain_with_seams).
+    #[must_use]
+    pub fn display_layout_slot(&self) -> DisplayLayoutSlot {
+        Arc::clone(&self.display_layout)
     }
 
     /// Lock-free selected-frame event reader for the control plane.
@@ -3037,6 +3420,63 @@ impl Pipeline {
     /// canonical program format).
     pub fn enable_program_audio(&mut self) {
         self.encode_cfg.audio = Some(multiview_output::AudioEncodeConfig::aac(48_000, 2, 128_000));
+        if let Some(me) = &self.switcher_me {
+            for id in [&me.program_source, &me.preview_source] {
+                if self.audio_stores.contains_key(id) {
+                    continue;
+                }
+                let entry = self.catalogue.load().get(id).cloned();
+                let Some(entry) = entry else {
+                    continue;
+                };
+                let lifecycle = if self.ingest_plans.iter().any(|plan| plan.id == *id) {
+                    live_lifecycle(id)
+                } else {
+                    let lifecycle = begin_live_lifecycle(id);
+                    match ingest_plan_for(
+                        entry.source(),
+                        self.layout.canvas.width,
+                        self.layout.canvas.height,
+                        Arc::clone(entry.store()),
+                        self.canvas_color,
+                        self.cadence,
+                    ) {
+                        Ok(mut plan) => {
+                            plan.lifecycle = lifecycle;
+                            plan.source_events = self.source_events.activate(id, lifecycle);
+                            self.ingest_plans.push(plan);
+                            self.stores.insert(id.clone(), Arc::clone(entry.store()));
+                            self.boot_rails.insert(id.clone(), Rails::VIDEO);
+                        }
+                        Err(error) => {
+                            tracing::warn!(source = %id, %error, "switcher audio warm video could not be planned");
+                        }
+                    }
+                    lifecycle
+                };
+                if let Some(mut plan) = audio_ingest_plan_for(entry.source()) {
+                    plan.lifecycle = lifecycle;
+                    let store = if plan.live {
+                        crate::audio::new_live_store()
+                    } else {
+                        crate::audio::new_file_store()
+                    };
+                    self.audio_stores.insert(id.clone(), store);
+                    self.audio_ingest_plans.push(plan);
+                    self.boot_rails
+                        .entry(id.clone())
+                        .and_modify(|rails| rails.audio = true)
+                        .or_insert(Rails::AUDIO);
+                } else if matches!(entry.source().kind, SourceKind::Bars) {
+                    self.audio_stores
+                        .insert(id.clone(), crate::audio::new_tone_store());
+                    self.boot_rails
+                        .entry(id.clone())
+                        .and_modify(|rails| rails.audio = true)
+                        .or_insert(Rails::AUDIO);
+                }
+            }
+        }
     }
 
     /// Whether this run carries **program audio** (`enable_program_audio` was
@@ -3284,11 +3724,63 @@ impl Pipeline {
         Ok(out.report)
     }
 
+    /// Active first-slice program scene, validated at construction.
+    #[must_use]
+    pub fn switcher_program_layout(&self) -> Arc<Layout> {
+        Arc::clone(&self.layout)
+    }
+
+    /// A preview bus scene with the exact same canvas and alternate selected
+    /// source, prepared off-clock for admission and geometry validation.
+    #[must_use]
+    pub fn switcher_preview_layout(&self, source: &str) -> Arc<Layout> {
+        let mut scene = (*self.layout).clone();
+        if let Some(cell) = scene.cells.first_mut() {
+            cell.source = Some(source.to_owned());
+        }
+        Arc::new(scene)
+    }
+
+    /// Configured first-slice M/E descriptor for the launcher, if present.
+    #[must_use]
+    pub fn switcher_me(&self) -> Option<&multiview_config::MixEffectsConfig> {
+        self.switcher_me.as_ref()
+    }
+
+    /// Installed, real M/E handle for the management API.
+    #[must_use]
+    pub fn switcher_control(&self) -> Option<multiview_engine::switcher_control::SwitcherControl> {
+        self.switcher_control.clone()
+    }
+
+    /// Install a real first-slice M/E command handle and separate PVW tap. An
+    /// absent `[switcher]` block remains the unchanged legacy one-canvas path.
+    /// The caller must attach this pair BEFORE running or serving control.
+    ///
+    /// # Errors
+    /// Refuses an absent M/E or a config that cannot provide two actual buses.
+    pub fn attach_switcher(
+        &mut self,
+        handle: multiview_engine::switcher_control::SwitcherControl,
+        driver: multiview_engine::switcher_control::SwitcherTickDriver,
+        preview: crate::preview::ProgramSlot,
+    ) -> Result<(), PipelineError> {
+        if self.switcher_me.is_none() {
+            return Err(PipelineError::Engine(
+                "no first-slice M/E was declared".into(),
+            ));
+        }
+        self.switcher_control = Some(handle);
+        self.switcher_driver = Some(driver);
+        self.switcher_preview = Some(preview);
+        Ok(())
+    }
+
     /// The per-source frame stores, shared with the control plane's preview
     /// provider for the live per-input thumbnails.
     #[must_use]
     pub fn preview_stores(&self) -> HashMapStores {
-        self.stores.clone()
+        self.catalogue_stores()
     }
 
     /// The source registry that owns this pipeline's per-source shared stores +
@@ -3592,12 +4084,19 @@ impl Pipeline {
         // (inv #1: the clock never waits for a start).
         let drive = CompositorDrive::new(
             Arc::clone(&self.layout),
-            self.stores.clone(),
+            self.catalogue_stores(),
             self.nosignal_card.clone(),
             self.canvas_color,
             self.background,
         )
         .map_err(|e| PipelineError::Engine(e.to_string()))?;
+        // The first-slice M/E rebinds its existing one-cell PGM drive. The PVW
+        // tap is independent; the legacy no-M/E drive gets no new cell index.
+        let drive = if self.switcher_me.is_some() {
+            drive.with_cell_ids(vec![Some(self.program_spec.id.as_str().to_owned())])
+        } else {
+            drive
+        };
         // Under the opt-in `gpu` feature the run PREFERS the wgpu GPU
         // compositor. The device is chosen LOAD-AWARE at admission (ADR-0035
         // Tier-1, decide-once): poll NVML ONCE, score every visible GPU, and pin
@@ -3785,6 +4284,11 @@ impl Pipeline {
             supervisor
         };
 
+        // Boot audio rails report progress to the demand manager like on-demand ones.
+        for (id, store) in &self.audio_stores {
+            set_audio_progress_store(id, Some(store));
+        }
+
         // Prime the first frame per tile BEFORE constructing the runtime (whose
         // `new` seeds tick 0 to "now") and therefore before the output clock's
         // first tick (#40 startup-hold fix). See [`Self::prime_bound_tiles`] for
@@ -3887,6 +4391,10 @@ impl Pipeline {
         // audio at all, so the run is byte-identical to the video-only path.
         let live_track_inputs =
             Arc::new(multiview_framestore::SwapCell::from_pointee(track_inputs));
+        // The demand manager: built now if the binary did not build it, started
+        // once the audio bus (if any) exists so audio rails have somewhere to go.
+        let demand = self.demand();
+        let route_demand = self.demand_sets.as_ref().map(|(_, audio)| audio.clone());
         let audio_bus = self.encode_cfg.audio.as_ref().map(|cfg| {
             let mut bus = program_audio_bus(cfg, self.cadence);
             // Route every per-source store onto the program bus at unity gain. The
@@ -3908,7 +4416,13 @@ impl Pipeline {
             self.audio_route.store(Some(Arc::new(
                 crate::audio::AudioControlHandle::from_sources(self.audio_stores.clone(), channels)
                     .with_sample_rate(cfg.sample_rate)
-                    .with_startup(self.audio_routing.as_ref(), self.stores.keys().cloned())
+                    // Every configured source may be routed live: routing one
+                    // is what makes it a consumer.
+                    .with_startup(
+                        self.audio_routing.as_ref(),
+                        self.catalogue.load().keys().cloned(),
+                    )
+                    .with_route_demand(route_demand.clone())
                     .with_declared_tracks(
                         self.audio_routing.as_ref(),
                         Arc::clone(&live_track_inputs),
@@ -4022,6 +4536,7 @@ impl Pipeline {
         let bake_ctx = self.bake_context();
         #[cfg(feature = "overlay")]
         let tile_spec_apply = Arc::clone(&self.tile_spec_apply);
+        demand.start();
         let (egress, hot_tx) = StreamEgress::spawn(
             bake_ctx,
             runners,
@@ -4166,7 +4681,19 @@ impl Pipeline {
         for event in crate::control::input_streams_events(&self.inventories) {
             publisher.publish_event(event);
         }
-        let input_fragment = crate::control::input_inventories_fragment(&self.inventories);
+        // Boot inventories seed the live map; a source started on demand adds
+        // its own when its rail starts (it was never probed while idle).
+        for (id, inventory) in &self.inventories {
+            set_live_inventory(id, Some(inventory));
+        }
+        let inventory_cell = live_inventories();
+        let mut inventory_seen = Arc::clone(&inventory_cell.load());
+        let mut input_fragment = crate::control::input_inventories_fragment(&inventory_seen);
+        // Push-output link states (listening / connected / reconnecting /
+        // drops), re-serialised every `PUSH_LINK_REFRESH_TICKS` from atomics +
+        // a lock-free load and otherwise cloned (a handful of small objects).
+        // Boxed: the per-tick closure lives in the run's future, which must stay
+        // under clippy's `large_futures` bound.
         let mut push_links = Box::new((Arc::clone(&self.push_links), None::<serde_json::Value>));
         // (The DRM/KMS display heads — and their DEV-B4 audio sinks — were
         // started above, before the egress spawn, so the bake consumer received
@@ -4179,6 +4706,7 @@ impl Pipeline {
         // and hands it to the bake consumer over the bounded queue per `policy`:
         // blocking send offline (exact-N back-pressure on the renderer), wait-free
         // `try_send` + drop-and-count live (the engine never blocks — inv #1/#10).
+        let switcher_audio_enabled = self.switcher_me.is_some();
         let source_event_reader = self.source_events.reader();
         let state_of = move |frame: &CompositedFrame| -> EngineStateSnapshot {
             // RT-10b: sample the per-layer subtitle router (drains any pending
@@ -4246,6 +4774,10 @@ impl Pipeline {
             #[cfg(not(feature = "overlay"))]
             let _ = events;
             let item = StreamItem {
+                switcher_audio: switcher_audio_enabled
+                    .then(|| frame.source_states.keys().next().cloned())
+                    .flatten(),
+                switcher_audio_enabled,
                 #[cfg(feature = "overlay")]
                 events,
                 canvas: Arc::clone(&canvas),
@@ -4302,6 +4834,13 @@ impl Pipeline {
             // the control plane's read-only `GET /inputs/{id}/streams` can show
             // every stream (RT-3). The fragment is pre-built (a tiny static clone
             // per tick); a `None` fragment (no inputs probed) is a no-op.
+            // Re-fold only when a demand start changed the map (a pointer compare
+            // per tick; the rebuild is rare and off every input).
+            let latest = inventory_cell.load();
+            if !Arc::ptr_eq(&latest, &inventory_seen) {
+                input_fragment = crate::control::input_inventories_fragment(&latest);
+                inventory_seen = latest;
+            }
             crate::control::insert_input_fragment(&mut snapshot, input_fragment.as_ref());
             // And the per-tile lifecycle states, so a connecting client is
             // seeded with the CURRENT tile states (the `tiles` `$snapshot`)
@@ -4359,16 +4898,42 @@ impl Pipeline {
         // `EngineRuntime` path — the run methods no longer take `stop`; the same
         // bounded (`run_for`) vs forever (`run`) split + the same publisher /
         // state/event projections / per-frame control hook are threaded verbatim.
-        let outcome = match max_ticks {
-            Some(max) => {
-                program
-                    .run_for_with_control(publisher, max, state_of, event_of, control)
-                    .await
+        let outcome = if let Some(mut switcher_driver) = self.switcher_driver.take() {
+            switcher_driver.set_prime_stores(self.catalogue_stores());
+            let Some(preview_slot) = self.switcher_preview.clone() else {
+                return Err(PipelineError::Engine("switcher preview tap missing".into()));
+            };
+            let mut hook = multiview_engine::switcher_hook::SwitcherFrameHook::new(
+                switcher_driver,
+                self.program_spec.id.as_str().to_owned(),
+                control,
+            );
+            hook.preview_slot = Some(preview_slot);
+            hook.preview_stores = Some(self.catalogue_stores());
+            match max_ticks {
+                Some(max) => {
+                    program
+                        .run_for_with_frame_control(publisher, max, state_of, event_of, hook)
+                        .await
+                }
+                None => {
+                    program
+                        .run_with_frame_control(publisher, state_of, event_of, hook)
+                        .await
+                }
             }
-            None => {
-                program
-                    .run_with_control(publisher, state_of, event_of, control)
-                    .await
+        } else {
+            match max_ticks {
+                Some(max) => {
+                    program
+                        .run_for_with_control(publisher, max, state_of, event_of, control)
+                        .await
+                }
+                None => {
+                    program
+                        .run_with_control(publisher, state_of, event_of, control)
+                        .await
+                }
             }
         }
         .map_err(|e| PipelineError::Engine(e.to_string()));
@@ -4376,6 +4941,7 @@ impl Pipeline {
         // The clock has stopped (bounded budget reached, or `stop` raised): tear
         // ingest down deterministically (signal + join), then close the egress and
         // finalise. The hot queue is already closed by this point — see below.
+        demand.stop_all();
         supervisor.shutdown();
         // Invalidate every startup producer, including any libav worker detached
         // after the bounded join. No old run may write into a later run's slot.
@@ -4524,6 +5090,10 @@ impl Pipeline {
             canvas_width: self.layout.canvas.width,
             canvas_height: self.layout.canvas.height,
             overlay_apply: Some(Arc::clone(&self.overlay_apply)),
+            activity: self
+                .demand
+                .as_ref()
+                .map(|manager| (manager.activity_reader(), Arc::clone(&self.catalogue))),
         }
     }
 
@@ -4582,6 +5152,15 @@ struct BakeContext {
     /// live seam (the boot-derived overlay set stands for the whole run).
     #[cfg(feature = "overlay")]
     overlay_apply: Option<crate::live_overlays::OverlayApplySlot>,
+    /// Source lifecycle for the tile status chip (IDLE / STARTING / FAILED).
+    /// One wait-free load per frame; the map changes only on a transition.
+    /// Only catalogued (lifecycle-managed) sources can read idle; a media
+    /// player or other unmanaged tile keeps its signal state.
+    #[cfg(feature = "overlay")]
+    activity: Option<(
+        multiview_engine::ActivityReader,
+        crate::source_rails::Catalogue,
+    )>,
 }
 
 impl BakeContext {
@@ -4613,6 +5192,37 @@ impl BakeContext {
         } else {
             Some(cue.lines.clone())
         }
+    }
+}
+
+/// The chip lifecycle for `id`. Absent from the map is idle when a demand
+/// manager is wired; with no manager every tile is ready (signal state only).
+#[cfg(feature = "overlay")]
+fn tile_activity(
+    managed: Option<(
+        &multiview_engine::ActivityMap,
+        &std::collections::HashMap<String, Arc<crate::source_rails::CatalogEntry>>,
+    )>,
+    id: &str,
+) -> crate::overlays::TileActivity {
+    use crate::overlays::{StartPhase, TileActivity};
+    use multiview_engine::{DemandPhase, StartingPhase};
+    let Some((map, catalogue)) = managed else {
+        return TileActivity::Ready;
+    };
+    match map.get(id) {
+        None if catalogue.contains_key(id) => TileActivity::Idle,
+        None => TileActivity::Ready,
+        Some(activity) => match activity.phase {
+            DemandPhase::Idle => TileActivity::Idle,
+            DemandPhase::Ready => TileActivity::Ready,
+            DemandPhase::Failed => TileActivity::Failed,
+            DemandPhase::Starting => TileActivity::Starting(match activity.starting {
+                Some(StartingPhase::Opening) => StartPhase::Opening,
+                Some(StartingPhase::AwaitingMedia) => StartPhase::AwaitingMedia,
+                Some(StartingPhase::Queued) | None => StartPhase::Queued,
+            }),
+        },
     }
 }
 
@@ -4745,7 +5355,18 @@ impl StreamBaker {
         // a small live window); the in-memory sidecar track has no eviction, so it
         // is sampled here at `pts`. Native wins on overlap.
         let mut captions: std::collections::HashMap<String, Vec<String>> = item.captions.clone();
+        let activity = self
+            .meter
+            .activity
+            .as_ref()
+            .and_then(|(reader, catalogue)| Some((reader.load()?, catalogue.load())));
         for spec in self.baker.tiles() {
+            let activity = tile_activity(
+                activity
+                    .as_ref()
+                    .map(|(map, catalogue)| (map.as_ref(), catalogue.as_ref())),
+                &spec.source_id,
+            );
             let state = item
                 .source_states
                 .get(&spec.source_id)
@@ -4778,6 +5399,7 @@ impl StreamBaker {
                         .unwrap_or(crate::overlays::MeterChannels::EMPTY),
                     state,
                     fault,
+                    activity,
                 },
             );
             if !captions.contains_key(&spec.source_id) {
@@ -4823,6 +5445,8 @@ impl StreamBaker {
 /// loop this tick (captions/faults must be sampled now, before the small live
 /// cue window evicts them). The bake *render* runs on the consumer thread.
 struct StreamItem {
+    switcher_audio: Option<String>,
+    switcher_audio_enabled: bool,
     #[cfg(feature = "overlay")]
     events: std::collections::HashMap<String, multiview_core::event_overlay::EventOverlay>,
     /// The composited canvas the protected output core emitted this tick.
@@ -5917,6 +6541,314 @@ fn missing_ticks_before(
     Ok(start..current_tick)
 }
 
+/// The owned encode job for one surviving item: the tick it was composed for and
+/// the PCM already mixed under that item's switcher selection. The audio worker
+/// receives only this (no bus, selector or routing), so queue depth can delay
+/// the encode but never change which source a tick carries.
+fn program_audio_job(
+    item: &StreamItem,
+    block: &multiview_audio::format::AudioBlock,
+    tracks: Vec<Option<Vec<f32>>>,
+) -> crate::rendition_workers::AudioJob {
+    crate::rendition_workers::AudioJob {
+        tick: item.tick_index,
+        frames: block.frame_count(),
+        program: block.interleaved().to_vec(),
+        tracks,
+    }
+}
+
+/// Mix one survivor without assigning its selection to earlier, shed ticks.
+fn drive_selected_audio_for_item(
+    bus: &mut multiview_audio::program::ProgramBus,
+    handle: Option<&crate::audio::AudioControlHandle>,
+    item: &StreamItem,
+    last_tick: &mut Option<u64>,
+) -> Result<multiview_audio::format::AudioBlock, PipelineError> {
+    if last_tick.is_some_and(|last| item.tick_index <= last) {
+        // A stale item must neither read PCM again nor change the next tick's gains.
+        return Ok(multiview_audio::format::AudioBlock::silence(
+            bus.format(),
+            0,
+        ));
+    }
+    // tick_to is exclusive: current_tick catches up ONLY the preceding ticks.
+    // Preserve the previous selection and routing for that entire shed interval.
+    let preceding = if item.switcher_audio_enabled && last_tick.is_some() {
+        Some(bus.tick_to(item.tick_index))
+    } else {
+        None
+    };
+    if let Some(handle) = handle {
+        handle.apply_pending(bus);
+        if item.switcher_audio_enabled {
+            handle.select_program_source(bus, item.switcher_audio.as_deref());
+        }
+    }
+    let current = drive_audio_for_item(bus, item.tick_index);
+    *last_tick = Some(item.tick_index);
+    match preceding {
+        Some(preceding) if preceding.frame_count() != 0 => {
+            let mut samples =
+                Vec::with_capacity(preceding.interleaved().len() + current.interleaved().len());
+            samples.extend_from_slice(preceding.interleaved());
+            samples.extend_from_slice(current.interleaved());
+            multiview_audio::format::AudioBlock::from_interleaved(current.format(), samples)
+                .map_err(|error| PipelineError::Engine(format!("audio catch-up: {error}")))
+        }
+        _ => Ok(current),
+    }
+}
+
+#[cfg(test)]
+mod switcher_shed_audio_tests {
+    use super::*;
+    use multiview_audio::{
+        format::AudioFormat, program::ProgramBus, store::AudioStore, ChannelLayout,
+    };
+    #[cfg(feature = "overlay")]
+    use std::collections::HashMap;
+
+    fn item(tick_index: u64, source: &str) -> StreamItem {
+        StreamItem {
+            switcher_audio: Some(source.into()),
+            switcher_audio_enabled: true,
+            #[cfg(feature = "overlay")]
+            events: HashMap::new(),
+            canvas: Arc::new(
+                Nv12Image::solid(16, 16, 16, 128, 128, CanvasColor::default().output_tag())
+                    .expect("canvas"),
+            ),
+            tick_index,
+            #[cfg(feature = "overlay")]
+            source_states: HashMap::new(),
+            #[cfg(feature = "overlay")]
+            tile_specs: Arc::new(Vec::new()),
+            #[cfg(feature = "overlay")]
+            captions: HashMap::new(),
+            #[cfg(feature = "overlay")]
+            caption_bitmaps: HashMap::new(),
+            #[cfg(feature = "overlay")]
+            faults: HashMap::new(),
+        }
+    }
+
+    #[test]
+    fn switcher_shed_gap_keeps_pre_cut_tone_and_stale_item_cannot_change_gain() {
+        let format = AudioFormat::new(48_000, ChannelLayout::Stereo);
+        let tone = |hz: f32| -> Vec<f32> {
+            (0..24_000_u16)
+                .flat_map(|n| {
+                    let sample = 0.2 * (std::f32::consts::TAU * hz * f32::from(n) / 48_000.0).sin();
+                    [sample, sample]
+                })
+                .collect()
+        };
+        let pcm_a = tone(400.0);
+        let pcm_b = tone(1000.0);
+        let a = Arc::new(AudioStore::timeline(format, 24_000));
+        let b = Arc::new(AudioStore::timeline(format, 24_000));
+        a.publish_window(0, &pcm_a).expect("A tone");
+        b.publish_window(0, &pcm_b).expect("B tone");
+        let mut bus = ProgramBus::new(format, Rational::new(25, 1));
+        let pa = bus.add_source("a", Arc::clone(&a), 1.0);
+        let pb = bus.add_source("b", Arc::clone(&b), 1.0);
+        let handle = crate::audio::AudioControlHandle::from_sources(
+            [("a".into(), a), ("b".into(), b)].into_iter().collect(),
+            [("a".into(), pa), ("b".into(), pb)].into_iter().collect(),
+        );
+        // The production live queue is genuinely filled: ticks 4 and 5 are shed.
+        let (tx, rx) = std::sync::mpsc::sync_channel(LIVE_QUEUE_CAP);
+        for tick in 0..4 {
+            tx.try_send(item(tick, "a")).expect("queue capacity");
+        }
+        for tick in 4..6 {
+            assert!(matches!(
+                tx.try_send(item(tick, "a")),
+                Err(std::sync::mpsc::TrySendError::Full(_))
+            ));
+        }
+        let mut last = None;
+        for tick in 0..4 {
+            let survivor = rx.recv().expect("A survivor");
+            let block =
+                drive_selected_audio_for_item(&mut bus, Some(&handle), &survivor, &mut last)
+                    .expect("audio");
+            assert_eq!(block.frame_count(), 1920);
+            assert_pcm(&block, &pcm_a, tick * 1920);
+        }
+        tx.try_send(item(6, "b")).expect("CUT survivor");
+        let block = drive_selected_audio_for_item(
+            &mut bus,
+            Some(&handle),
+            &rx.recv().expect("CUT"),
+            &mut last,
+        )
+        .expect("audio");
+        assert_eq!(
+            block.frame_count(),
+            3 * 1920,
+            "two shed ticks plus the current tick, no lost or double-read samples"
+        );
+        for (i, actual) in block.interleaved().iter().enumerate() {
+            let expected = if i < 2 * 1920 * 2 { &pcm_a } else { &pcm_b };
+            assert!(
+                (actual - expected[4 * 1920 * 2 + i]).abs() < 1e-5,
+                "tick {} must retain its composited source",
+                4 + i / (1920 * 2)
+            );
+        }
+        let stale =
+            drive_selected_audio_for_item(&mut bus, Some(&handle), &item(5, "a"), &mut last)
+                .expect("stale audio");
+        assert_eq!(stale.frame_count(), 0);
+        assert_eq!(
+            bus.program_gain(pa),
+            Some(0.0),
+            "stale item must not switch back to A"
+        );
+        assert_eq!(bus.program_gain(pb), Some(1.0));
+        let next = drive_selected_audio_for_item(&mut bus, Some(&handle), &item(7, "b"), &mut last)
+            .expect("next audio");
+        assert_pcm(&next, &pcm_b, 7 * 1920);
+    }
+
+    /// Records each encoded job's tick and program PCM; the first encode waits
+    /// on a gate so later jobs (including a CUT) sit in the worker queue.
+    type EncodedTicks = Arc<std::sync::Mutex<Vec<(u64, Vec<f32>)>>>;
+
+    struct GatedRecorder {
+        gate: Option<std::sync::mpsc::Receiver<()>>,
+        seen: EncodedTicks,
+    }
+    impl crate::rendition_workers::AudioEncodeWork for GatedRecorder {
+        fn encode(
+            &mut self,
+            job: &crate::rendition_workers::AudioJob,
+        ) -> Result<Vec<EncodedPacket>, PipelineError> {
+            if let Some(gate) = self.gate.take() {
+                let _ = gate.recv();
+            }
+            self.seen
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push((job.tick, job.program.clone()));
+            Ok(Vec::new())
+        }
+        fn finish(&mut self) -> Result<Vec<EncodedPacket>, PipelineError> {
+            Ok(Vec::new())
+        }
+    }
+
+    /// Audio worker × switcher (production-line-convergence.md): the selector is
+    /// resolved on the bake consumer from the tick's own composed item, and the
+    /// worker encodes owned PCM. A CUT mixed while earlier jobs are still queued
+    /// behind a stalled encoder can therefore neither leak the new source into
+    /// pre-CUT ticks nor leave old-source audio on post-CUT ticks, and every
+    /// job's packets are re-associated with the tick it was mixed for.
+    #[test]
+    fn queued_audio_jobs_keep_the_selection_of_their_own_tick_across_a_cut() {
+        let format = AudioFormat::new(48_000, ChannelLayout::Stereo);
+        let tone = |hz: f32| -> Vec<f32> {
+            (0..24_000_u16)
+                .flat_map(|n| {
+                    let sample = 0.2 * (std::f32::consts::TAU * hz * f32::from(n) / 48_000.0).sin();
+                    [sample, sample]
+                })
+                .collect()
+        };
+        let pcm_a = tone(400.0);
+        let pcm_b = tone(1000.0);
+        let a = Arc::new(AudioStore::timeline(format, 24_000));
+        let b = Arc::new(AudioStore::timeline(format, 24_000));
+        a.publish_window(0, &pcm_a).expect("A tone");
+        b.publish_window(0, &pcm_b).expect("B tone");
+        let mut bus = ProgramBus::new(format, Rational::new(25, 1));
+        let pa = bus.add_source("a", Arc::clone(&a), 1.0);
+        let pb = bus.add_source("b", Arc::clone(&b), 1.0);
+        let handle = crate::audio::AudioControlHandle::from_sources(
+            [("a".into(), a), ("b".into(), b)].into_iter().collect(),
+            [("a".into(), pa), ("b".into(), pb)].into_iter().collect(),
+        );
+        let (release, gate) = std::sync::mpsc::channel();
+        let seen: EncodedTicks = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let dispatched = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = Arc::clone(&dispatched);
+        let worker = crate::rendition_workers::AudioEncodeWorker::spawn(
+            GatedRecorder {
+                gate: Some(gate),
+                seen: Arc::clone(&seen),
+            },
+            move |tick, _packets| {
+                sink.lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .push(tick);
+                Ok(())
+            },
+            |_| Ok(()),
+        )
+        .expect("worker");
+        // Ticks 0..4 on A, CUT to B at tick 4, then B: each mixed block is
+        // offered while the worker is still stalled on tick 0, so the CUT job
+        // and the jobs after it sit in the queue behind the pre-CUT jobs.
+        let mut last = None;
+        for tick in 0..7_u64 {
+            let source = if tick < 4 { "a" } else { "b" };
+            let survivor = item(tick, source);
+            let block =
+                drive_selected_audio_for_item(&mut bus, Some(&handle), &survivor, &mut last)
+                    .expect("audio");
+            worker
+                .offer_within(
+                    program_audio_job(&survivor, &block, Vec::new()),
+                    std::time::Duration::from_secs(5),
+                )
+                .expect("queue slot");
+        }
+        assert!(
+            seen.lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .is_empty(),
+            "the CUT was mixed while every job was still queued"
+        );
+        release.send(()).expect("release the encoder");
+        worker.join().expect("worker joined");
+        let seen = seen
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        assert_eq!(
+            seen.iter().map(|(tick, _)| *tick).collect::<Vec<_>>(),
+            (0..7).collect::<Vec<_>>()
+        );
+        for (tick, program) in &seen {
+            let expected = if *tick < 4 { &pcm_a } else { &pcm_b };
+            let start = usize::try_from(*tick).expect("tick") * 1920 * 2;
+            assert_eq!(program.len(), 1920 * 2, "tick {tick} exact budget");
+            for (actual, expected) in program.iter().zip(&expected[start..]) {
+                assert!(
+                    (actual - expected).abs() < 1e-5,
+                    "tick {tick} must carry the source composed for tick {tick}"
+                );
+            }
+        }
+        assert_eq!(
+            *dispatched
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+            (0..7).collect::<Vec<_>>(),
+            "the dispatch callback receives each job's own tick"
+        );
+    }
+
+    fn assert_pcm(block: &multiview_audio::format::AudioBlock, expected: &[f32], start: usize) {
+        assert_eq!(block.frame_count(), 1920, "exact current-tick PCM budget");
+        for (actual, expected) in block.interleaved().iter().zip(&expected[start * 2..]) {
+            assert!((actual - expected).abs() < 1e-5, "selected PCM sample");
+        }
+    }
+}
+
 /// The single bake-consumer thread body (encode-once-mux-many, invariant #7):
 /// build the [`StreamBaker`] from the owned [`BakeContext`] and own the single
 /// [`ProgramEncoder`], then loop receiving [`StreamItem`]s — bake each into an
@@ -6123,6 +7055,7 @@ fn consumer_main<D: WindowDelivery>(
     // tick and never a timestamp jump).
     let mut last_tick: Option<u64> = None;
     let mut last_baked: Option<Arc<Nv12Image>> = None;
+    let mut last_audio_tick = None;
     // `recv()` returns `Err` only when the hot sender drops = end-of-program
     // (clean stop / EOF), which ends the loop.
     while let Ok(item) = hot_rx.recv() {
@@ -6163,15 +7096,17 @@ fn consumer_main<D: WindowDelivery>(
         // bars represent the same output instant, never the preceding frame.
         #[cfg(feature = "overlay")]
         let early_audio_block = if let Some(bus) = audio_bus.as_mut() {
-            if let Some(handle) = audio_route.as_ref() {
-                handle.apply_pending(bus);
-            }
             if bus.live_strip_count() != av_strips {
                 av_strips = bus.live_strip_count();
                 av_ids = bus.timeline_source_ids();
             }
             let tick_frame = bus.position_at(item.tick_index);
-            let input_block = drive_audio_for_item(bus, item.tick_index);
+            let input_block = drive_selected_audio_for_item(
+                bus,
+                audio_route.as_deref(),
+                &item,
+                &mut last_audio_tick,
+            )?;
             if let Some(meter) = av_meter.as_mut() {
                 meter.sample(&av_ids, item.tick_index, tick_frame);
             }
@@ -6254,10 +7189,6 @@ fn consumer_main<D: WindowDelivery>(
             // advancing the absolute tick clock. A stalled consumer merely sheds
             // bounded pending commands; it never holds the output clock (#1/#10).
             #[cfg(not(feature = "overlay"))]
-            if let Some(handle) = audio_route.as_ref() {
-                handle.apply_pending(bus);
-            }
-            #[cfg(not(feature = "overlay"))]
             if bus.live_strip_count() != av_strips {
                 av_strips = bus.live_strip_count();
                 av_ids = bus.timeline_source_ids();
@@ -6267,7 +7198,12 @@ fn consumer_main<D: WindowDelivery>(
             #[cfg(not(feature = "overlay"))]
             let tick_frame = bus.position_at(item.tick_index);
             #[cfg(not(feature = "overlay"))]
-            let block = drive_audio_for_item(bus, item.tick_index);
+            let block = drive_selected_audio_for_item(
+                bus,
+                audio_route.as_deref(),
+                &item,
+                &mut last_audio_tick,
+            )?;
             #[cfg(feature = "overlay")]
             let block = early_audio_block.ok_or_else(|| {
                 PipelineError::Engine(
@@ -6378,15 +7314,7 @@ fn consumer_main<D: WindowDelivery>(
             let offered = audio_worker.as_ref().map_or(
                 Err(crate::rendition_workers::OfferRejection::Ended),
                 |worker| {
-                    worker.offer_within(
-                        crate::rendition_workers::AudioJob {
-                            tick: item.tick_index,
-                            frames: block.frame_count(),
-                            program: block.interleaved().to_vec(),
-                            tracks,
-                        },
-                        offer_horizon,
-                    )
+                    worker.offer_within(program_audio_job(&item, &block, tracks), offer_horizon)
                 },
             );
             match offered {
@@ -7256,7 +8184,12 @@ pub(crate) type AudioFreeSources =
 fn is_intentionally_audio_free(kind: &SourceKind) -> bool {
     matches!(
         kind,
-        SourceKind::Clock { .. } | SourceKind::Timer { .. } | SourceKind::Solid { .. }
+        SourceKind::Clock { .. }
+            | SourceKind::Timer { .. }
+            | SourceKind::Solid { .. }
+            | SourceKind::Weather { .. }
+            | SourceKind::Graphic { .. }
+            | SourceKind::GraphicsChannel { .. }
     )
 }
 
@@ -7819,6 +8752,7 @@ impl IngestSupervisor {
                 if let Some(slot) = plan.youtube_url_slot.clone() {
                     let id = plan.id.clone();
                     let watch_url = watch_url.clone();
+                    let yt_dlp_path = plan.youtube_yt_dlp_path.clone();
                     let rr_stop = Arc::new(AtomicBool::new(false));
                     let rr_exited = crate::live_sources::register_stop(
                         registry,
@@ -7835,7 +8769,12 @@ impl IngestSupervisor {
                         std::thread::Builder::new().name(format!("multiview-yt-reresolve-{id}"));
                     match rr_builder.spawn(move || {
                         let _exit = rr_exit_guard;
-                        youtube_reresolve_thread(&watch_url, &slot, &rr_thread_stop);
+                        youtube_reresolve_thread(
+                            &watch_url,
+                            yt_dlp_path.as_deref(),
+                            &slot,
+                            &rr_thread_stop,
+                        );
                     }) {
                         Ok(handle) => producers.push((rr_stop, handle)),
                         Err(e) => {
@@ -8120,13 +9059,24 @@ fn spawn_ingest_producer(
 /// spawns the same supervised [`ingest_loop`]. Runs on the hub worker thread
 /// only — heavy/blocking work never touches the output clock (inv #1).
 struct LiveIngestSpawner {
+    /// When set, a live add/edit updates the catalogue and restarts the source
+    /// if it is consumed; nothing is spawned for an unconsumed source.
+    demand: Option<(
+        crate::source_rails::Catalogue,
+        multiview_engine::DemandManager<Nv12Image>,
+    )>,
+    /// First-slice switcher runs fail closed on a live media edit and retire a
+    /// removed or edited source's store pixels, so the M/E can never resolve
+    /// stale media (PR 224). Policy-only edits still apply live.
+    clear_on_remove: bool,
     source_events: Arc<crate::source_event_runtime::Runtime>,
-    /// The solved startup layout: tile geometry for a bound cell, the canvas
-    /// fallback for an unbound one — the same sizing rule the startup build
-    /// applies (a freshly added source is typically unbound until the
-    /// follow-up route, so it decodes at canvas size, exactly like an unbound
-    /// startup source).
+    /// The solved startup layout: the pinned canvas, which a live layout swap
+    /// cannot change. Tile sizes come from `display`. Read by the GPU
+    /// placement consult only.
+    #[cfg_attr(not(feature = "gpu"), allow(dead_code))]
     layout: Arc<Layout>,
+    /// The live layout, so a respawned producer starts at the active size.
+    display: DisplayFollow,
     /// The canvas colour the source's frames are tagged in.
     canvas_color: CanvasColor,
     /// The output cadence (generator pacing / plan metadata).
@@ -8183,6 +9133,50 @@ impl LiveIngestSpawner {
 }
 
 impl crate::live_sources::IngestSpawner for LiveIngestSpawner {
+    fn catalogue(&self, spawn: &crate::live_sources::SourceSpawn) -> bool {
+        let Some((catalogue, manager)) = &self.demand else {
+            return false;
+        };
+        crate::source_rails::catalogue_upsert_with(catalogue, &spawn.source, &spawn.store);
+        manager.set_pins(
+            &spawn.source.id,
+            crate::source_demand::standing_pins(&spawn.source),
+        );
+        manager.restart(&spawn.source.id);
+        true
+    }
+
+    fn invalidate_live_edit(&self, id: &str) -> bool {
+        if !self.clear_on_remove || self.demand.is_none() {
+            return false;
+        }
+        // Invalidate before reconciliation can resolve a stale configured rail.
+        // Fencing also excludes any detached old producer's late publications.
+        self.source_removed(id);
+        tracing::warn!(source = %id, "switcher source edit requires restart; stale demand catalogue entry invalidated");
+        true
+    }
+
+    fn update_policy(&self, spawn: &crate::live_sources::SourceSpawn) -> bool {
+        let Some((catalogue, manager)) = &self.demand else {
+            return false;
+        };
+        let unchanged = catalogue
+            .load()
+            .get(&spawn.source.id)
+            .is_some_and(|entry| crate::source_demand::same_media(entry.source(), &spawn.source));
+        if !unchanged {
+            return false;
+        }
+        // Keep the catalogued store: the running producer publishes into it.
+        let _ = crate::source_rails::catalogue_upsert(catalogue, &spawn.source);
+        manager.set_pins(
+            &spawn.source.id,
+            crate::source_demand::standing_pins(&spawn.source),
+        );
+        true
+    }
+
     #[allow(clippy::too_many_lines)]
     // reason: the hub worker configures separate native caption forms and the
     // video producer together; no part of this runs on the output clock.
@@ -8201,7 +9195,7 @@ impl crate::live_sources::IngestSpawner for LiveIngestSpawner {
         let anchor_floor = live_anchor_slot(&source.id)
             .load()
             .map_or(0, |anchor| anchor.generation);
-        let produced = self.spawn_video(&source, store, registry, lifecycle);
+        let produced = self.spawn_video(&source, store, registry, lifecycle, None);
         if let Some(handle) = audio {
             let audio_store = produced.as_ref().and_then(|p| {
                 spawn_live_audio(&source, &p.stop, registry, lifecycle, anchor_floor)
@@ -8231,7 +9225,21 @@ impl crate::live_sources::IngestSpawner for LiveIngestSpawner {
     }
 
     fn source_removed(&self, id: &str) {
+        let retired_store = self.demand.as_ref().and_then(|(catalogue, manager)| {
+            let store = catalogue
+                .load()
+                .get(id)
+                .map(|entry| Arc::clone(entry.store()));
+            crate::source_rails::catalogue_remove(catalogue, id);
+            // Every pin it owns (standing and an operator Start) and every
+            // timed lease on it (review DMD-05).
+            manager.remove_source(id);
+            store.filter(|_| self.clear_on_remove)
+        });
         let lifecycle = remove_live_lifecycle(id);
+        if let Some(store) = retired_store {
+            store.clear();
+        }
         if let Some(lease) = self.source_events.activate(id, lifecycle) {
             lease.retire();
         }
@@ -8302,10 +9310,23 @@ impl LiveIngestSpawner {
         store: Arc<TileStore<Nv12Image>>,
         registry: &crate::live_sources::StopRegistry,
         lifecycle: u64,
+        size: Option<RequestedSize>,
     ) -> Option<crate::live_sources::SpawnedProducer> {
         let source = source.clone();
-        let (tile_w, tile_h) = cell_pixel_size(&self.layout, &source.id)
-            .unwrap_or((self.layout.canvas.width, self.layout.canvas.height));
+        // A demand start knows its largest consumer; otherwise the display
+        // follower's size (layout supremum, or the small unbound size).
+        let (tile_w, tile_h) = size
+            .filter(|size| size.width >= 2 && size.height >= 2)
+            .map_or_else(
+                || {
+                    if decode_follows_layout(&source.kind) {
+                        self.display.size_for(&source.id)
+                    } else {
+                        self.display.fixed_size_for(&source.id)
+                    }
+                },
+                |size| (size.width & !1, size.height & !1),
+            );
         let mut plan = match ingest_plan_for(
             &source,
             tile_w,
@@ -8326,8 +9347,11 @@ impl LiveIngestSpawner {
             }
         };
         plan.output_origin = Arc::clone(&self.output_origin);
+        plan.display = decode_follows_layout(&source.kind).then(|| self.display.clone());
         plan.lifecycle = lifecycle;
-        plan.source_events = self.source_events.activate(&source.id, lifecycle);
+        plan.source_events = source_events_enabled(&source)
+            .then(|| self.source_events.activate(&source.id, lifecycle))
+            .flatten();
         #[cfg(feature = "overlay")]
         {
             // The hub worker stopped old readers. Use the SAME lifecycle token
@@ -8422,6 +9446,142 @@ impl LiveIngestSpawner {
         }
         spawn_ingest_producer(plan, registry)
             .map(|(stop, handle)| crate::live_sources::SpawnedProducer { stop, handle })
+    }
+}
+
+/// The demand driver's starter: the live-add construction, one rail at a time.
+struct DemandSpawner {
+    live: LiveIngestSpawner,
+    registry: crate::live_sources::StopRegistry,
+}
+
+impl crate::source_rails::RailSpawner for DemandSpawner {
+    fn start_video(
+        &self,
+        source: &Source,
+        store: &Arc<TileStore<Nv12Image>>,
+        size: Option<RequestedSize>,
+        with_audio: bool,
+    ) -> Result<Vec<JoinHandle<()>>, String> {
+        let _ = with_audio;
+        if let Some(kind) = crate::synth::SyntheticKind::from_source_kind(&source.kind) {
+            return self.start_generator(source, kind, store).map(|h| vec![h]);
+        }
+        probe_on_start(source);
+        // A fresh lifecycle fences any detached writer of a previous run.
+        let lifecycle = begin_live_lifecycle(&source.id);
+        let produced = self
+            .live
+            .spawn_video(source, Arc::clone(store), &self.registry, lifecycle, size)
+            .ok_or_else(|| "the source could not be started".to_owned())?;
+        Ok(vec![produced.handle])
+    }
+
+    fn start_audio(
+        &self,
+        source: &Source,
+        audio_only: bool,
+    ) -> Result<Vec<JoinHandle<()>>, String> {
+        let Some(route) = self.live.audio_route.load() else {
+            return Err("this run carries no program audio".to_owned());
+        };
+        if matches!(source.kind, SourceKind::Bars) {
+            let store = crate::audio::new_tone_store();
+            route.allow_unrouted_unity(&source.id);
+            if !route.set_source_audio(&source.id, Some(store)) {
+                return Err("the program bus is closed".to_owned());
+            }
+            return Ok(Vec::new());
+        }
+        let Some(mut plan) = audio_ingest_plan_for(source) else {
+            return Err("this source kind has no audio".to_owned());
+        };
+        let lifecycle = live_lifecycle(&source.id);
+        plan.lifecycle = lifecycle;
+        plan.audio_only = audio_only;
+        // Live audio locks to its own video's anchors. With no video, nothing
+        // stamps that timeline, so it buffers on its own clock instead.
+        let store = if audio_only && plan.live {
+            crate::audio::new_audio_only_store()
+        } else if plan.live {
+            crate::audio::new_live_store()
+        } else {
+            crate::audio::new_file_store()
+        };
+        if !audio_only {
+            plan.anchor_floor = 0;
+        }
+        let stop = crate::source_rails::register(&self.registry, &format!("{}/audio", source.id));
+        let thread_store = Arc::clone(&store);
+        let handle = std::thread::Builder::new()
+            .name(format!("multiview-audio-{}", source.id))
+            .spawn(move || {
+                let stop = stop;
+                crate::audio::audio_ingest_loop(&plan, &thread_store, &stop.stop);
+                drop(stop.exit);
+            })
+            .map_err(|_| "could not start the audio thread".to_owned())?;
+        set_audio_progress_store(&source.id, Some(&store));
+        route.allow_unrouted_unity(&source.id);
+        if !route.set_source_audio(&source.id, Some(store)) {
+            return Err("the program bus is closed".to_owned());
+        }
+        Ok(vec![handle])
+    }
+
+    fn audio_stopped(&self, id: &str) {
+        set_audio_progress_store(id, None);
+        if let Some(route) = self.live.audio_route.load() {
+            let _ = route.set_source_audio(id, None);
+        }
+    }
+
+    fn audio_available(&self) -> bool {
+        self.live.audio_route.load().is_some()
+    }
+}
+
+impl DemandSpawner {
+    /// Start a synthetic generator: the same fenced loop the startup and live
+    /// paths run, at the canvas size.
+    fn start_generator(
+        &self,
+        source: &Source,
+        kind: crate::synth::SyntheticKind,
+        store: &Arc<TileStore<Nv12Image>>,
+    ) -> Result<JoinHandle<()>, String> {
+        if kind.animated() && !cfg!(feature = "overlay") {
+            return Err("this build cannot render this source (needs overlay)".to_owned());
+        }
+        let id = source.id.clone();
+        let lifecycle = begin_live_lifecycle(&id);
+        let stop = crate::source_rails::register(&self.registry, &id);
+        let thread_store = Arc::clone(store);
+        let (width, height) = (
+            self.live.layout.canvas.width,
+            self.live.layout.canvas.height,
+        );
+        let canvas = self.live.canvas_color;
+        let cadence = self.live.cadence;
+        let thread_id = id.clone();
+        let handle = std::thread::Builder::new()
+            .name(format!("multiview-synth-{id}"))
+            .spawn(move || {
+                let stop = stop;
+                crate::synth::generator_loop_fenced(
+                    kind,
+                    &thread_store,
+                    width,
+                    height,
+                    canvas,
+                    cadence,
+                    &stop.stop,
+                    Some((&thread_id, lifecycle)),
+                );
+                drop(stop.exit);
+            })
+            .map_err(|_| "could not start the generator thread".to_owned())?;
+        Ok(handle)
     }
 }
 
@@ -9490,58 +10650,6 @@ fn duration_from_nanos(nanos: i64) -> Duration {
     Duration::from_nanos(u64::try_from(nanos.max(0)).unwrap_or(u64::MAX))
 }
 
-/// The decode size for `source_id`: the **per-axis supremum** of the pixel sizes
-/// of every cell that binds it, or [`None`] if no cell binds it.
-///
-/// A source can tile into several cells of different sizes (e.g. a big PGM cell
-/// plus a small PIP). Decoding once at the per-axis max satisfies the largest
-/// consumer on each axis (ADR-0030 §3); each cell then scales down at composite.
-/// Taking the FIRST binding cell would under-decode every larger tile bound to
-/// the same source.
-fn cell_pixel_size(layout: &Layout, source_id: &str) -> Option<(u32, u32)> {
-    layout
-        .cells
-        .iter()
-        .filter(|c| c.source.as_deref() == Some(source_id))
-        .map(|c| cell_dims(c, layout.canvas.width, layout.canvas.height))
-        .reduce(|(aw, ah), (bw, bh)| (aw.max(bw), ah.max(bh)))
-}
-
-/// Convert a cell's normalized `w`/`h` into even pixel dimensions (NV12 needs
-/// even extents), clamped to at least 2x2.
-fn cell_dims(cell: &Cell, canvas_w: u32, canvas_h: u32) -> (u32, u32) {
-    let to_even_px = |frac: f32, extent: u32| -> u32 {
-        let raw = frac_to_px(frac, extent);
-        let even = raw & !1; // round down to even
-        even.max(2)
-    };
-    (to_even_px(cell.w, canvas_w), to_even_px(cell.h, canvas_h))
-}
-
-/// Convert a normalized fraction in `[0,1]` to a pixel count in `[0, extent]`,
-/// `as`-cast-free (the guardrails deny `as_conversions`).
-fn frac_to_px(frac: f32, extent: u32) -> u32 {
-    if !frac.is_finite() || frac <= 0.0 {
-        return 0;
-    }
-    let target = f64::from(frac) * f64::from(extent);
-    if target >= f64::from(extent) {
-        return extent;
-    }
-    // Largest u32 candidate whose lossless f64 widening is <= target.
-    let mut lo: u32 = 0;
-    let mut hi: u32 = extent;
-    while lo < hi {
-        let mid = lo.saturating_add((hi - lo).saturating_add(1) / 2);
-        if f64::from(mid) <= target {
-            lo = mid;
-        } else {
-            hi = mid.saturating_sub(1);
-        }
-    }
-    lo
-}
-
 /// Resolve source-bound cells into canvas-space tile chrome, in cell order.
 #[cfg(feature = "overlay")]
 pub(crate) fn tile_specs_for_layout(
@@ -9578,11 +10686,11 @@ pub(crate) fn tile_specs_for_layout(
 
 /// Convert a normalized fraction in `[0,1]` to a pixel coordinate `f32` against
 /// `extent`, `as`-cast-free, for placing the per-tile overlay surface. Reuses the
-/// exact integer [`frac_to_px`] then widens losslessly (overlay sizes are well
+/// exact integer [`crate::display_size::frac_to_px`] then widens losslessly (overlay sizes are well
 /// under 2^24).
 #[cfg(feature = "overlay")]
 fn norm_to_px_f32(frac: f32, extent: u32) -> f32 {
-    let px = frac_to_px(frac, extent);
+    let px = crate::display_size::frac_to_px(frac, extent);
     let high = u16::try_from(px >> 16).unwrap_or(u16::MAX);
     let low = u16::try_from(px & 0xFFFF).unwrap_or(u16::MAX);
     f32::from(high) * 65_536.0 + f32::from(low)
@@ -9616,13 +10724,14 @@ fn ticks_per_second(cadence: Rational) -> u32 {
 fn build_meter_timelines(
     config: &MultiviewConfig,
     cadence: Rational,
+    wanted: impl Fn(&str) -> bool,
 ) -> (
     std::collections::HashMap<String, Vec<f64>>,
     std::collections::HashMap<String, Vec<crate::overlays::MeterChannels>>,
 ) {
     let mut scalar = std::collections::HashMap::new();
     let mut channels = std::collections::HashMap::new();
-    for source in &config.sources {
+    for source in config.sources.iter().filter(|source| wanted(&source.id)) {
         let path = match &source.kind {
             SourceKind::File { path } => PathBuf::from(path),
             _ => continue,
@@ -9811,7 +10920,7 @@ fn i32_to_f32(value: i32) -> f32 {
 
 /// Round a finite `f64` config measure to the nearest `i32` (saturating to the
 /// `i32` range), no `as` cast: handle the sign, then a bounded binary search over
-/// the unsigned magnitude (mirrors [`frac_to_px`]'s `u64`-bounded search).
+/// the unsigned magnitude (mirrors [`crate::display_size::frac_to_px`]'s `u64`-bounded search).
 #[cfg(feature = "overlay")]
 fn round_f64_to_i32(v: f64) -> i32 {
     if !v.is_finite() {
@@ -10184,11 +11293,22 @@ fn srt_resolved_url(
     srt: Option<&SrtOptions>,
     redact: bool,
 ) -> Result<String, SrtError> {
+    // Every wildcard listener spelling normalises to dual-stack `[::]`, which
+    // `multiview-srt-sys` binds natively (FFmpeg's libsrt cannot). Specific
+    // hosts pass through. Without `srt-libsrt` (ADR-0039 decision 10, amended)
+    // NO listener role is runnable — not just the wildcard — so fail closed
+    // before ever handing libav a URL it would reject with an opaque "Bad
+    // parameters" (or, for a specific-host listener, silently never re-accept
+    // after one caller).
     let Some(opts) = srt else {
+        if !cfg!(feature = "srt-libsrt") && multiview_output::sink::is_srt_listener_url(base_url) {
+            return Err(SrtError::ListenerRequiresNativeLeaf);
+        }
+        let lowered = multiview_input::srt::lower_listener_url(base_url);
         return Ok(if redact {
-            redact_srt_url(base_url)
+            redact_srt_url(&lowered)
         } else {
-            base_url.to_owned()
+            lowered
         });
     };
     if matches!(opts.backend, Some(backend) if backend != SrtBackend::Ffmpeg) {
@@ -10221,6 +11341,13 @@ fn srt_resolved_url(
     {
         return Err(SrtError::Parameter("listener and mode conflict"));
     }
+    // Listener mode needs the native leaf regardless of host (ADR-0039
+    // decision 10, amended): FFmpeg's libsrt listener always blocks its
+    // calling thread in `srt_accept`, which is unworkable even for a specific
+    // (non-wildcard) bind.
+    if !cfg!(feature = "srt-libsrt") && mode == SrtMode::Listener {
+        return Err(SrtError::ListenerRequiresNativeLeaf);
+    }
     let (key_length, passphrase) = if let Some(enc) = &opts.encryption {
         let reference = enc
             .passphrase_ref
@@ -10230,6 +11357,13 @@ fn srt_resolved_url(
         (KeyLength::from_bytes(enc.key_length.bytes())?, Some(secret))
     } else {
         (KeyLength::None, None)
+    };
+    // Normalise a wildcard listener host BEFORE validation so an empty host
+    // (`srt://:9000`) is accepted and bound dual-stack.
+    let host = if mode == SrtMode::Listener {
+        multiview_input::srt::listener_bind_host(host)
+    } else {
+        host
     };
     let config = SrtConfig {
         mode,
@@ -10291,7 +11425,7 @@ fn srt_resolved_url(
             lowered.push_str(pair);
         }
     }
-    Ok(lowered)
+    Ok(multiview_input::srt::lower_listener_url(&lowered))
 }
 
 /// Mask any passphrase already present in an opaque legacy URL for diagnostics.
@@ -11440,11 +12574,12 @@ fn copy_plane(
 #[cfg(feature = "ffmpeg")]
 fn build_input_inventories(
     config: &MultiviewConfig,
+    wanted: impl Fn(&str) -> bool,
 ) -> std::collections::BTreeMap<String, multiview_core::stream::StreamInventory> {
     use multiview_ffmpeg::Demuxer;
 
     let mut inventories = std::collections::BTreeMap::new();
-    for source in &config.sources {
+    for source in config.sources.iter().filter(|source| wanted(&source.id)) {
         let SourceKind::File { path } = &source.kind else {
             continue;
         };
@@ -11471,6 +12606,7 @@ fn build_input_inventories(
 #[cfg(not(feature = "ffmpeg"))]
 fn build_input_inventories(
     _config: &MultiviewConfig,
+    _wanted: impl Fn(&str) -> bool,
 ) -> std::collections::BTreeMap<String, multiview_core::stream::StreamInventory> {
     std::collections::BTreeMap::new()
 }
@@ -11510,6 +12646,105 @@ fn youtube_url_slot_for(
 /// synthetic source with invalid parameters. (Opening/decoding errors surface on
 /// the ingest thread later — they must never fail the *build* of a never-ending
 /// live source.)
+/// Whether this kind's producer runs the [`open_and_stream`] pump, which resizes
+/// to follow the layout. Generators and the NDI/WHIP drives keep the size they
+/// were planned at for their whole life, so they must keep the larger fallback:
+/// a small unbound size would leave them soft once routed to a big tile.
+fn decode_follows_layout(kind: &SourceKind) -> bool {
+    !matches!(
+        kind,
+        SourceKind::Bars
+            | SourceKind::Solid { .. }
+            | SourceKind::Clock { .. }
+            | SourceKind::Timer { .. }
+            | SourceKind::Weather { .. }
+            | SourceKind::Graphic { .. }
+            | SourceKind::GraphicsChannel { .. }
+            | SourceKind::Ndi { .. }
+            | SourceKind::Webrtc { .. }
+    )
+}
+
+/// The size `source` is planned at under `layout`.
+fn planned_tile_size(layout: &Layout, source: &Source) -> (u32, u32) {
+    if decode_follows_layout(&source.kind) {
+        display_size(layout, &source.id)
+    } else {
+        crate::display_size::fixed_size(layout, &source.id)
+    }
+}
+
+/// The height to pick an HLS variant for on this connection.
+fn variant_height(plan: &IngestPlan) -> u32 {
+    plan.display
+        .as_ref()
+        .map_or(plan.tile_h, |display| display.variant_height(&plan.id))
+}
+
+impl HandoverDecoder for StreamVideoDecoder {
+    type Packet = ffmpeg::codec::packet::Packet;
+    type Frame = DecodedVideoFrame;
+
+    fn send(&mut self, packet: &Self::Packet) -> Result<(), String> {
+        self.send_packet(packet).map_err(|e| e.to_string())
+    }
+
+    fn receive(&mut self) -> Result<Option<Self::Frame>, String> {
+        self.receive_frame().map_err(|e| e.to_string())
+    }
+
+    fn is_key(packet: &Self::Packet) -> bool {
+        packet.is_key()
+    }
+
+    fn packet_pts(packet: &Self::Packet) -> Option<i64> {
+        packet.pts()
+    }
+
+    fn frame_pts(frame: &Self::Frame) -> Option<i64> {
+        frame.raw_pts
+    }
+}
+
+/// Everything needed to open a replacement decoder off the decode thread.
+struct DecoderOpenArgs {
+    id: String,
+    params: ffmpeg::codec::Parameters,
+    time_base: Rational,
+    declared_fps: Rational,
+    cuda_ordinal: Option<String>,
+    /// Open in software: only a test rehearsal of the reopen path sets this.
+    rehearsal: bool,
+}
+
+impl DecoderOpenArgs {
+    /// Open NVDEC at `resize`. Unlike a connection open this refuses to degrade:
+    /// a software or unresized replacement is worse than the running decoder.
+    fn open(
+        self,
+        resize: Option<multiview_ffmpeg::TileSize>,
+    ) -> Result<StreamVideoDecoder, String> {
+        let _resource = ingest_resource_scope(&self.id);
+        if self.rehearsal {
+            return StreamVideoDecoder::new(self.params, self.time_base)
+                .map(|decoder| decoder.with_declared_fps(Some(self.declared_fps)))
+                .map_err(|e| e.to_string());
+        }
+        let (decoder, used_hw) = StreamVideoDecoder::new_preferring_hw_at(
+            self.params,
+            self.time_base,
+            true,
+            self.cuda_ordinal.as_deref(),
+            resize,
+        )
+        .map_err(|e| e.to_string())?;
+        if !used_hw || decoder.hw_resize() != resize {
+            return Err("NVDEC refused the new resize".to_owned());
+        }
+        Ok(decoder.with_declared_fps(Some(self.declared_fps)))
+    }
+}
+
 // A flat, one-arm-per-`SourceKind` dispatch plus the single feature-gated
 // `IngestPlan` struct literal: inherently long and clearer kept whole than split
 // across helpers (adding the `player` field tipped it one line over the 100 bound).
@@ -11529,7 +12764,10 @@ fn ingest_plan_for(
         SourceKind::Bars
         | SourceKind::Solid { .. }
         | SourceKind::Clock { .. }
-        | SourceKind::Timer { .. } => {
+        | SourceKind::Timer { .. }
+        | SourceKind::Weather { .. }
+        | SourceKind::Graphic { .. }
+        | SourceKind::GraphicsChannel { .. } => {
             let kind =
                 crate::synth::SyntheticKind::from_source_kind(&source.kind).ok_or_else(|| {
                     PipelineError::Ingest {
@@ -11541,7 +12779,7 @@ fn ingest_plan_for(
         }
         SourceKind::File { path } => (SourceLocation::Path(PathBuf::from(path)), false),
         SourceKind::Rtsp { url, .. }
-        | SourceKind::Hls { url }
+        | SourceKind::Hls { url, .. }
         | SourceKind::Ts { url }
         | SourceKind::Rtmp { url } => (SourceLocation::Url(url.clone()), true),
         SourceKind::Srt { url, srt } => {
@@ -11652,10 +12890,12 @@ fn ingest_plan_for(
         source_events: None,
         id: source.id.clone(),
         location,
+        http_headers: http_headers_for(&source.kind),
         // Not a media-player channel (those are built from `config.media_players`).
         player: None,
         tile_w,
         tile_h,
+        display: None,
         store,
         output_origin: crate::timing_status::anchor_slot(),
         live_anchor: live_anchor_slot(&source.id),
@@ -11691,6 +12931,8 @@ fn ingest_plan_for(
         },
         #[cfg(feature = "youtube")]
         youtube_url_slot,
+        #[cfg(feature = "youtube")]
+        youtube_yt_dlp_path: None,
     })
 }
 
@@ -11859,9 +13101,11 @@ fn build_media_player_boot(
             source_events: None,
             id: player.id.clone(),
             location: SourceLocation::Path(path),
+            http_headers: HttpHeaders::default(),
             player: Some(handle),
             tile_w,
             tile_h,
+            display: None,
             store,
             output_origin: crate::timing_status::anchor_slot(),
             live_anchor: Arc::new(multiview_framestore::SwapCell::empty()),
@@ -11890,6 +13134,8 @@ fn build_media_player_boot(
             },
             #[cfg(feature = "youtube")]
             youtube_url_slot: None,
+            #[cfg(feature = "youtube")]
+            youtube_yt_dlp_path: None,
         });
         tracing::info!(
             player = %player.id, asset = %asset_id,
@@ -11920,10 +13166,13 @@ fn audio_ingest_plan_for(source: &Source) -> Option<crate::audio::AudioIngestPla
         SourceKind::Bars
         | SourceKind::Solid { .. }
         | SourceKind::Clock { .. }
-        | SourceKind::Timer { .. } => return None,
+        | SourceKind::Timer { .. }
+        | SourceKind::Weather { .. }
+        | SourceKind::Graphic { .. }
+        | SourceKind::GraphicsChannel { .. } => return None,
         SourceKind::File { path } => (path.clone(), false),
         SourceKind::Rtsp { url, .. }
-        | SourceKind::Hls { url }
+        | SourceKind::Hls { url, .. }
         | SourceKind::Ts { url }
         | SourceKind::Rtmp { url } => (url.clone(), true),
         SourceKind::Srt { url, srt } => match srt_resolved_url(url, srt.as_ref(), false) {
@@ -11955,7 +13204,27 @@ fn audio_ingest_plan_for(source: &Source) -> Option<crate::audio::AudioIngestPla
         live,
         lifecycle: 0,
         anchor_floor: 0,
+        audio_only: false,
+        http_headers: http_headers_for(&source.kind).to_ffmpeg(),
     })
+}
+
+/// Whether source-linked event observation (ADR-0183) should activate for this
+/// source: only HLS/`YouTube` (an HLS wrapper, ADR-0015) carry the cue
+/// surfaces this tracker understands (`EXT-X-DATERANGE`, SCTE-35, timed ID3,
+/// vendor `EXT-X-ASSET`), so every other kind never activates regardless of
+/// the per-source `events` config. For an HLS/`YouTube` source, `observe`
+/// defaults to `true`: the watcher only reads metadata the fetch/demux path
+/// already receives on this branch (no extra network request, no extra disk
+/// write, bounded off-clock parse cost per the ADR-0183 ledger's stress
+/// numbers) — not a default cost, so default-on is the honest posture.
+/// Automation stays disarmed independently of this flag.
+fn source_events_enabled(source: &Source) -> bool {
+    let hls_like = matches!(
+        source.kind,
+        SourceKind::Hls { .. } | SourceKind::Youtube { .. }
+    );
+    hls_like && source.events.as_ref().is_none_or(|events| events.observe)
 }
 
 /// Resolve a `bars` synthetic source's **line-up tone** plan (AUD-5): the source
@@ -11976,6 +13245,64 @@ fn tone_ingest_plan_for(
             cadence,
         }),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod source_events_enabled_tests {
+    use super::{source_events_enabled, Source};
+
+    /// Build a `Source` via serde (the type is `#[non_exhaustive]`, so a struct
+    /// literal is not available cross-module — config is produced by
+    /// deserialization anyway).
+    fn source(json: serde_json::Value) -> Source {
+        serde_json::from_value(json).expect("source deserializes")
+    }
+
+    #[test]
+    fn hls_defaults_to_observing_when_events_is_absent() {
+        let s = source(serde_json::json!({
+            "id": "s", "kind": "hls", "url": "https://example.com/index.m3u8",
+        }));
+        assert!(source_events_enabled(&s));
+    }
+
+    #[test]
+    fn hls_respects_an_explicit_opt_out() {
+        let s = source(serde_json::json!({
+            "id": "s", "kind": "hls", "url": "https://example.com/index.m3u8",
+            "events": { "observe": false },
+        }));
+        assert!(!source_events_enabled(&s));
+    }
+
+    #[test]
+    fn hls_respects_an_explicit_opt_in() {
+        let s = source(serde_json::json!({
+            "id": "s", "kind": "hls", "url": "https://example.com/index.m3u8",
+            "events": { "observe": true },
+        }));
+        assert!(source_events_enabled(&s));
+    }
+
+    #[test]
+    fn non_hls_kinds_never_observe_even_with_an_explicit_opt_in() {
+        let bars = source(serde_json::json!({
+            "id": "s", "kind": "bars", "events": { "observe": true },
+        }));
+        assert!(!source_events_enabled(&bars));
+        let solid = source(serde_json::json!({
+            "id": "s", "kind": "solid", "color": "#000000", "events": { "observe": true },
+        }));
+        assert!(!source_events_enabled(&solid));
+    }
+
+    #[test]
+    fn youtube_defaults_to_observing_as_an_hls_wrapper() {
+        let s = source(serde_json::json!({
+            "id": "s", "kind": "youtube", "url": "https://www.youtube.com/watch?v=abcdEFGH123",
+        }));
+        assert!(source_events_enabled(&s));
     }
 }
 
@@ -12004,8 +13331,15 @@ fn caption_plan_for_generation(
 #[cfg(feature = "overlay")]
 fn prefetch_caption_plans(
     config: &MultiviewConfig,
+    wanted: impl Fn(&str) -> bool,
 ) -> std::collections::HashMap<String, crate::captions::CaptionPlan> {
-    crate::captions::resolve_caption_plans(&config.sources)
+    let demanded: Vec<multiview_config::Source> = config
+        .sources
+        .iter()
+        .filter(|source| wanted(&source.id))
+        .cloned()
+        .collect();
+    crate::captions::resolve_caption_plans(&demanded)
         .into_iter()
         .map(|plan| (plan.id.clone(), plan))
         .collect()
@@ -12155,6 +13489,56 @@ fn resolve_incontainer_sub_route(
         },
         store,
     ))
+}
+
+/// Operator-set HTTP request headers for an HLS source (libav `user_agent` /
+/// `referer` `AVOption`s). Not secrets.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct HttpHeaders {
+    user_agent: Option<String>,
+    referer: Option<String>,
+}
+
+impl HttpHeaders {
+    fn is_empty(&self) -> bool {
+        self.user_agent.is_none() && self.referer.is_none()
+    }
+
+    /// The same headers for the in-process fetchers (loopback segment fetcher,
+    /// variant-pin master fetch); control characters are dropped there.
+    fn request_headers(&self) -> crate::hls_fetch::RequestHeaders {
+        crate::hls_fetch::RequestHeaders::new(self.user_agent.as_deref(), self.referer.as_deref())
+    }
+
+    /// The same headers as the libav-level value the audio rail opens with.
+    fn to_ffmpeg(&self) -> multiview_ffmpeg::HttpHeaders {
+        multiview_ffmpeg::HttpHeaders::new(self.user_agent.as_deref(), self.referer.as_deref())
+    }
+
+    /// Set the headers as libav open options on `opts`.
+    fn apply(&self, opts: &mut ffmpeg::Dictionary<'_>) {
+        if let Some(ua) = &self.user_agent {
+            opts.set("user_agent", ua);
+        }
+        if let Some(r) = &self.referer {
+            opts.set("referer", r);
+        }
+    }
+}
+
+/// The headers an HLS source carries (empty for every other kind).
+fn http_headers_for(kind: &SourceKind) -> HttpHeaders {
+    match kind {
+        SourceKind::Hls {
+            user_agent,
+            referrer,
+            ..
+        } => HttpHeaders {
+            user_agent: user_agent.clone(),
+            referer: referrer.clone(),
+        },
+        _ => HttpHeaders::default(),
+    }
 }
 
 /// Where a source's media lives.
@@ -12445,11 +13829,27 @@ pub(crate) fn resolve_hls_variant_url(
 /// outran real time and starved the audio (~40-60 % audible). A pinned media
 /// playlist also carries no `WebVTT` rendition (ADR-T011). Best-effort: `None`
 /// opens the original URL.
-pub(crate) fn resolve_hls_audio_url(master_url: &str) -> Option<String> {
-    resolve_hls_audio_url_with(master_url, &crate::captions::LibavFetcher)
+///
+/// The master fetch carries the source's operator `User-Agent`/`Referer`
+/// (a source with none uses the libav fetcher).
+pub(crate) fn resolve_hls_audio_url_with_headers(
+    master_url: &str,
+    headers: &multiview_ffmpeg::HttpHeaders,
+) -> Option<String> {
+    if headers.is_empty() {
+        return resolve_hls_audio_url_with(master_url, &crate::captions::LibavFetcher);
+    }
+    tracing::debug!("audio pin: master fetch carries operator request headers");
+    resolve_hls_audio_url_with(
+        master_url,
+        &HeaderPlaylistFetcher(crate::hls_fetch::RequestHeaders::new(
+            headers.user_agent(),
+            headers.referer(),
+        )),
+    )
 }
 
-/// [`resolve_hls_audio_url`] with an injectable fetcher (offline tests).
+/// [`resolve_hls_audio_url_with_headers`] with an injectable fetcher (offline tests).
 fn resolve_hls_audio_url_with(
     master_url: &str,
     fetcher: &dyn crate::captions::PlaylistFetcher,
@@ -12521,11 +13921,36 @@ fn resolve_hls_variant_url_with(
 /// original `url` is returned unchanged. Best-effort: this never fails the open
 /// (invariants #1/#10) — a fall-through to the original URL still has the post-open
 /// discard + reconnect bracket as guards.
-fn main_demuxer_open_url(url: &str, location: &SourceLocation, tile_h: u32) -> String {
+fn main_demuxer_open_url(
+    url: &str,
+    location: &SourceLocation,
+    tile_h: u32,
+    headers: &HttpHeaders,
+) -> String {
     if !is_hls_location(location) {
         return url.to_owned();
     }
-    resolve_hls_variant_url(url, Some(tile_h)).unwrap_or_else(|| url.to_owned())
+    let resolved = if headers.is_empty() {
+        resolve_hls_variant_url(url, Some(tile_h))
+    } else {
+        resolve_hls_variant_url_with(
+            url,
+            Some(tile_h),
+            &HeaderPlaylistFetcher(headers.request_headers()),
+        )
+    };
+    resolved.unwrap_or_else(|| url.to_owned())
+}
+
+/// Master-playlist fetcher for the variant pin that carries the source's
+/// operator `User-Agent`/`Referer` (control/IO plane, bounded, best-effort).
+pub(crate) struct HeaderPlaylistFetcher(pub(crate) crate::hls_fetch::RequestHeaders);
+
+impl crate::captions::PlaylistFetcher for HeaderPlaylistFetcher {
+    fn fetch(&self, url: &str) -> Result<crate::captions::FetchedPlaylist, String> {
+        crate::hls_fetch::fetch_text(&self.0, url, 8 * 1024 * 1024)
+            .map(|(url, body)| crate::captions::FetchedPlaylist { url, body })
+    }
 }
 
 /// The per-source streaming-ingest loop, run on a dedicated thread (BUG-2 fix).
@@ -12610,6 +14035,18 @@ fn ingest_loop(plan: &IngestPlan, stop: &AtomicBool) {
         drive_ndi(plan, name, stop);
         return;
     }
+    // Hold an SRT listener across reconnects so its port never closes between
+    // attempts; `open_and_stream` reports a bad URL through the retry bracket.
+    // Without `srt-libsrt` no `plan.location` can be a listener URL —
+    // `ingest_plan_for`'s `srt_resolved_url` already failed the build closed
+    // for one (ADR-0039 decision 10, amended) — so this is unreachable there.
+    #[cfg(feature = "srt-libsrt")]
+    let _srt_listener = match &plan.location {
+        SourceLocation::Url(url) if multiview_output::sink::is_srt_listener_url(url) => {
+            crate::srt_ingest::acquire(url).ok()
+        }
+        _ => None,
+    };
     let tag = CanvasColor::default().output_tag();
     let mut attempt: u32 = 0;
     let mut jitter = JitterRng::seeded(&plan.id);
@@ -13488,12 +14925,31 @@ fn timeline_pts(
     normalizer.normalize(raw_pts, 0).unwrap_or(fallback)
 }
 
+/// Build the [`ResolverConfig`](multiview_input::youtube::ResolverConfig) this
+/// run's `yt-dlp` invocations use: an explicit `yt_dlp_path` (from
+/// [`IngestPlan::youtube_yt_dlp_path`], itself stamped from the
+/// `MULTIVIEW_YOUTUBE_YT_DLP_PATH` environment variable or else `[system.youtube]
+/// yt_dlp_path`, ADR-0015 §6) when configured, else the default (`"yt-dlp"` on
+/// `PATH`) — because the service user's `PATH` may not include where an operator
+/// installed it (e.g. `~/.local/bin`).
+#[cfg(feature = "youtube")]
+fn youtube_resolver_config(yt_dlp_path: Option<&str>) -> multiview_input::youtube::ResolverConfig {
+    match yt_dlp_path {
+        Some(path) if !path.is_empty() => multiview_input::youtube::ResolverConfig::new(
+            path,
+            multiview_input::youtube::ResolverConfig::default().timeout,
+        ),
+        _ => multiview_input::youtube::ResolverConfig::default(),
+    }
+}
+
 /// Resolve a `YouTube` **watch** URL to a fresh live HLS master URL (ADR-0015),
 /// for opening by the standard HLS ingest path.
 ///
 /// This is the CLI's wiring seam onto [`multiview_input::youtube`]: it spawns the
-/// runtime-discovered `yt-dlp` resolver under its hard timeout and returns the
-/// resolved `*.googlevideo.com` manifest URL ([`ingest_url`](multiview_input::youtube::reresolve::ingest_url)).
+/// runtime-discovered `yt-dlp` resolver (at `yt_dlp_path`, see
+/// [`youtube_resolver_config`]) under its hard timeout and returns the resolved
+/// `*.googlevideo.com` manifest URL ([`ingest_url`](multiview_input::youtube::reresolve::ingest_url)).
 /// It runs on the calling **ingest thread** (a `std::thread`, the control/IO
 /// plane), so it spins up a small current-thread Tokio runtime to drive the async
 /// resolver; the output data plane is never involved (invariants #1/#10). A
@@ -13501,20 +14957,21 @@ fn timeline_pts(
 /// live) is returned as a `String` error — the caller's reconnect bracket backs
 /// off and retries while the tile degrades; it is never a panic.
 #[cfg(feature = "youtube")]
-fn resolve_youtube_master(watch_url: &str) -> Result<String, String> {
+fn resolve_youtube_master(watch_url: &str, yt_dlp_path: Option<&str>) -> Result<String, String> {
     use multiview_input::youtube::reresolve::{ingest_url, ProcessResolver, Resolver};
 
     // A dedicated current-thread runtime for this one resolve. `yt-dlp`'s own hard
-    // timeout (ResolverConfig::default) bounds the await, so this never blocks the
-    // ingest thread indefinitely; the reconnect backoff bounds retry frequency.
+    // timeout (within `youtube_resolver_config`) bounds the await, so this never
+    // blocks the ingest thread indefinitely; the reconnect backoff bounds retry
+    // frequency.
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .map_err(|e| format!("youtube resolver runtime: {e}"))?;
-    let process = ProcessResolver::default();
+    let process = ProcessResolver::new(youtube_resolver_config(yt_dlp_path));
     let master = runtime
         .block_on(process.resolve(watch_url))
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| e.operator_message())?;
     Ok(ingest_url(&master).to_owned())
 }
 
@@ -13574,6 +15031,7 @@ where
 #[cfg(feature = "youtube")]
 fn youtube_reresolve_thread(
     watch_url: &str,
+    yt_dlp_path: Option<&str>,
     slot: &Arc<multiview_framestore::SwapCell<Option<Arc<String>>>>,
     stop: &AtomicBool,
 ) {
@@ -13600,7 +15058,7 @@ fn youtube_reresolve_thread(
         }
     };
 
-    let resolver = ProcessResolver::default();
+    let resolver = ProcessResolver::new(youtube_resolver_config(yt_dlp_path));
     let clock = SystemUnixClock;
     let swap_slot = Arc::clone(slot);
     let outcome = runtime.block_on(run_reresolve_loop(
@@ -13660,19 +15118,26 @@ fn open_and_stream(
     #[cfg(feature = "youtube")]
     let resolved_youtube_url = match &plan.location {
         SourceLocation::Youtube { watch_url } => {
-            Some(youtube_open_url(plan.youtube_url_slot.as_deref(), || {
-                resolve_youtube_master(watch_url)
-            })?)
+            let resolved = youtube_open_url(plan.youtube_url_slot.as_deref(), || {
+                resolve_youtube_master(watch_url, plan.youtube_yt_dlp_path.as_deref())
+            });
+            crate::youtube_status::record(&plan.id, resolved.as_ref().err().map(String::as_str));
+            Some(resolved?)
         }
         _ => None,
     };
 
     // Network sources open with an `rw_timeout` so a dead live source fails fast
     // instead of hanging this decode thread on open or a blocking read (#45).
-    let opts = ingest_open_options(&plan.location);
+    let mut opts = ingest_open_options(&plan.location);
+    plan.http_headers.apply(&mut opts);
     // Kept alive for this connection: the loopback server libav reads from.
     let mut hls_fetcher: Option<crate::hls_fetch::HlsFetcher> = None;
     let mut hls_event_bridge = None;
+    // An SRT listener's private in-process stream (`pipe:<fd>`), declared
+    // before `input` so libav closes its duplicate first.
+    #[cfg(feature = "srt-libsrt")]
+    let mut _srt_reader: Option<crate::srt_ingest::SrtReader> = None;
     let mut input = match &plan.location {
         SourceLocation::Path(p) => {
             ffmpeg::format::input_with_dictionary(p, opts).map_err(|e| e.to_string())?
@@ -13687,7 +15152,28 @@ fn open_and_stream(
             // best-effort — a fetch/parse miss falls back to the original URL with
             // the post-open discard + reconnect bracket as the remaining guards
             // (invariants #1/#10). A non-master / non-HLS URL is unchanged.
-            let open_url = main_demuxer_open_url(u.as_str(), &plan.location, plan.tile_h);
+            // Operator `user_agent`/`referrer` headers ride the variant-pin
+            // request and the loopback fetcher (and libav's own opts).
+            let open_url = main_demuxer_open_url(
+                u.as_str(),
+                &plan.location,
+                variant_height(plan),
+                &plan.http_headers,
+            );
+            // libav cannot bind a dual-stack SRT listener: read the shared
+            // bridge through a private socketpair (no listening socket). Without `srt-libsrt` a listener URL never reaches here —
+            // `ingest_plan_for`'s `srt_resolved_url` already failed the build
+            // closed for one (ADR-0039 decision 10, amended) — so this branch
+            // is unreachable in that build and compiled out.
+            #[cfg(feature = "srt-libsrt")]
+            let open_url = if multiview_output::sink::is_srt_listener_url(&open_url) {
+                let reader = crate::srt_ingest::acquire(&open_url)?.open_reader()?;
+                let url = reader.url().to_owned();
+                _srt_reader = Some(reader);
+                url
+            } else {
+                open_url
+            };
             // A live HLS media playlist is fetched by our parallel-range segment
             // fetcher and read by libav from loopback memory (see `hls_fetch`);
             // anything it cannot serve (VOD, encrypted, fMP4) opens directly.
@@ -13707,16 +15193,24 @@ fn open_and_stream(
                 } else {
                     (None, None)
                 };
+                let fetch_headers = plan.http_headers.request_headers();
                 let start_result = if observer.is_some() {
                     crate::hls_fetch::HlsFetcher::start_with_observer(
                         &plan.id,
                         &open_url,
+                        &fetch_headers,
                         stop,
                         plan.lifecycle,
                         observer,
                     )
                 } else {
-                    crate::hls_fetch::HlsFetcher::start(&plan.id, &open_url, stop, plan.lifecycle)
+                    crate::hls_fetch::HlsFetcher::start(
+                        &plan.id,
+                        &open_url,
+                        &fetch_headers,
+                        stop,
+                        plan.lifecycle,
+                    )
                 };
                 match start_result {
                     Ok(fetcher) => {
@@ -13746,7 +15240,12 @@ fn open_and_stream(
             let Some(url) = resolved_youtube_url.as_deref() else {
                 return Err("youtube source did not resolve a manifest url".to_owned());
             };
-            let open_url = main_demuxer_open_url(url, &plan.location, plan.tile_h);
+            let open_url = main_demuxer_open_url(
+                url,
+                &plan.location,
+                variant_height(plan),
+                &plan.http_headers,
+            );
             ffmpeg::format::input_with_dictionary(&open_url.as_str(), opts)
                 .map_err(|e| e.to_string())?
         }
@@ -13794,9 +15293,35 @@ fn open_and_stream(
     // the tile keeps running (invariants #1/#2).
     let nvdec_env = std::env::var(multiview_ffmpeg::NVDEC_DISABLE_ENV).ok();
     let (want_hw, cuda_ordinal) = decoder_open_args(&plan.decode_placement, nvdec_env.as_deref());
-    let (decoder, used_hw) =
-        StreamVideoDecoder::new_preferring_hw(params, time_base, want_hw, cuda_ordinal)
-            .map_err(|e| e.to_string())?;
+    // Inv #6 (decode near display size): on NVDEC, ask the ASIC to emit at the
+    // tile size (`*_cuvid -resize`) so the host download and the CPU tile scale
+    // shrink from the source to the tile. A pure downscale only. Every connection
+    // opens at the live size; a layout change on a running connection goes through
+    // the `DisplayDriver` below, because cuvid fixes its resize at open.
+    let tile = plan
+        .display
+        .as_ref()
+        .map_or((plan.tile_w, plan.tile_h), |display| {
+            display.size_for(&plan.id)
+        });
+    let (src_w, src_h) = StreamVideoDecoder::coded_size(&params);
+    let source_size = multiview_ffmpeg::TileSize::new(src_w, src_h);
+    let resize_env = std::env::var(multiview_ffmpeg::NVDEC_RESIZE_DISABLE_ENV).ok();
+    let display_resize = multiview_ffmpeg::nvdec_resize_target(
+        source_size,
+        multiview_ffmpeg::TileSize::new(tile.0, tile.1),
+        resize_env.as_deref(),
+    );
+    let reopen_params = params.clone();
+    let reopen_ordinal = cuda_ordinal.map(str::to_owned);
+    let (decoder, used_hw) = StreamVideoDecoder::new_preferring_hw_at(
+        params,
+        time_base,
+        want_hw,
+        cuda_ordinal,
+        display_resize,
+    )
+    .map_err(|e| e.to_string())?;
     // Feed the declared cadence so the decoder's genpts fallback advances at the
     // source's true rate (PAL 25, film 24, …) rather than an NTSC-shaped guess;
     // an unusable rate is ignored inside `with_declared_fps` (invariant #3).
@@ -13805,9 +15330,18 @@ fn open_and_stream(
         source = %plan.id,
         hardware = used_hw,
         decoder = decoder.hw_decoder_name().unwrap_or("software"),
+        nvdec_resize = ?decoder.hw_resize(),
         "opened video decoder"
     );
-    let mut to_tile = TileScaler::new(plan.tile_w, plan.tile_h);
+    let mut to_tile = TileScaler::new(tile.0, tile.1);
+    let mut display = plan.display.clone().map(|follow| {
+        let state = DecoderState {
+            source: source_size,
+            hardware: used_hw || follow.rehearses_reopen(),
+            resize: decoder.hw_resize(),
+        };
+        DisplayDriver::<StreamVideoDecoder>::new(follow, &plan.id, tile, state, resize_env)
+    });
 
     // Per-input PTS normalizer (invariant #3, the unified timing model): unwrap a
     // 33-bit MPEG-TS wrap, synthesize a genpts fallback from the declared cadence
@@ -13851,7 +15385,11 @@ fn open_and_stream(
     // recognized but remains unavailable until its native adapter is wired.
     let metadata_streams: std::collections::HashMap<
         usize,
-        (crate::source_event_packet::MetadataKind, ffmpeg::Rational),
+        (
+            crate::source_event_packet::MetadataKind,
+            ffmpeg::Rational,
+            Option<u16>,
+        ),
     > = input
         .streams()
         .filter_map(|stream| match stream.parameters().id() {
@@ -13860,6 +15398,7 @@ fn open_and_stream(
                 (
                     crate::source_event_packet::MetadataKind::Scte35,
                     stream.time_base(),
+                    u16::try_from(stream.id()).ok().filter(|pid| *pid != 0),
                 ),
             )),
             ffmpeg::codec::Id::TIMED_ID3 => Some((
@@ -13867,6 +15406,7 @@ fn open_and_stream(
                 (
                     crate::source_event_packet::MetadataKind::Id3,
                     stream.time_base(),
+                    u16::try_from(stream.id()).ok().filter(|pid| *pid != 0),
                 ),
             )),
             _ => None,
@@ -13919,6 +15459,20 @@ fn open_and_stream(
     if let (Some(events), Some(bridge)) = (source_events.as_mut(), hls_event_bridge.take()) {
         let _ = events.attach_hls(bridge);
     }
+    // Raw evidence goes to the off-clock journal from the demux thread, ahead of
+    // the provenance gate, so an untrusted or oversized packet is still recorded.
+    let event_journal = source_events
+        .as_ref()
+        .and_then(|_| crate::event_journal::feed());
+    let journal_source = plan.id.clone();
+    if event_journal.is_some() && plan.live {
+        let anchor = Arc::clone(&plan.live_anchor);
+        let origin = Arc::clone(&plan.output_origin);
+        crate::event_journal::register_output(
+            &plan.id,
+            Arc::new(move || journal_output_anchor(&anchor, &origin)),
+        );
+    }
     // Metadata has a separate fixed budget: never consume video read-ahead slots.
     let (metadata_tx, metadata_rx) =
         std::sync::mpsc::sync_channel::<crate::source_event_packet::MetadataPacket>(32);
@@ -13934,8 +15488,31 @@ fn open_and_stream(
                 Some(ReadItem::Packet((video_fence, packet)))
             }
             Ok(()) => {
-                if let Some(&(kind, tb)) = metadata_streams.get(&packet.stream()) {
+                if let Some(&(kind, tb, pid)) = metadata_streams.get(&packet.stream()) {
                     if let Some(bytes) = packet.data() {
+                        if let Some(journal) = &event_journal {
+                            journal.offer(crate::event_journal::Observation::Packet {
+                                source: journal_source.clone(),
+                                kind: match kind {
+                                    crate::source_event_packet::MetadataKind::Scte35 => {
+                                        crate::event_journal::PacketKind::Scte35
+                                    }
+                                    crate::source_event_packet::MetadataKind::Id3 => {
+                                        crate::event_journal::PacketKind::Id3
+                                    }
+                                },
+                                bytes: bytes.to_vec(),
+                                pid,
+                                pts_90k: packet.pts().and_then(|pts| {
+                                    crate::event_journal::to_90k(
+                                        pts,
+                                        tb.numerator(),
+                                        tb.denominator(),
+                                    )
+                                }),
+                                received_ns: crate::event_journal::wall_now_ns(),
+                            });
+                        }
                         if bytes.len() <= 4096 {
                             if metadata_tx
                                 .try_send(crate::source_event_packet::MetadataPacket {
@@ -13985,11 +15562,23 @@ fn open_and_stream(
 
     // Pump packets, publishing each decoded+scaled frame into the store.
     let mut drained = false;
+    // A decoder handover: warm-up frames to publish first, the time the new
+    // decoder must pass before its frames count, and the old decoder's position.
+    let mut carried = std::collections::VecDeque::new();
+    let mut skip = SkipThrough::default();
+    let mut last_raw_pts: Option<i64> = None;
     loop {
         if stop.load(Ordering::Acquire) {
             return Ok(());
         }
-        while let Some(decoded) = decoder.receive_frame().map_err(|e| e.to_string())? {
+        while let Some(decoded) = match carried.pop_front() {
+            Some(frame) => Some(frame),
+            None => decoder.receive_frame().map_err(|e| e.to_string())?,
+        } {
+            if skip.drops(decoded.raw_pts) {
+                continue;
+            }
+            last_raw_pts = decoded.raw_pts.or(last_raw_pts);
             // Embedded CEA-608: feed this frame's A53 cc-data side data (extracted
             // off the RAW decoded frame before NV12 conversion) to `cc_dec`,
             // anchored at the frame's raw stream PTS. Most frames carry none (a
@@ -14099,6 +15688,49 @@ fn open_and_stream(
         if drained {
             return Ok(());
         }
+        // Follow the live layout. Off the clock: this is the decode thread, and
+        // the blocking decoder open runs on the driver's helper thread.
+        if let Some(driver) = display.as_mut() {
+            let display_step = driver.poll(last_raw_pts, Instant::now(), |resize| {
+                let args = DecoderOpenArgs {
+                    id: plan.id.clone(),
+                    params: reopen_params.clone(),
+                    time_base,
+                    declared_fps,
+                    cuda_ordinal: reopen_ordinal.clone(),
+                    rehearsal: plan
+                        .display
+                        .as_ref()
+                        .is_some_and(DisplayFollow::rehearses_reopen),
+                };
+                let counted = plan.display.clone();
+                move || {
+                    if let Some(follow) = &counted {
+                        follow.note_open();
+                    }
+                    args.open(resize)
+                }
+            });
+            match display_step {
+                DisplayStep::Idle => {}
+                DisplayStep::Retarget((w, h)) => to_tile = TileScaler::new(w, h),
+                DisplayStep::Cutover {
+                    decoder: replacement,
+                    frames,
+                    skip_through,
+                    tile: (w, h),
+                } => {
+                    decoder = replacement;
+                    carried = frames;
+                    skip.arm(skip_through);
+                    to_tile = TileScaler::new(w, h);
+                    if let Some(follow) = &plan.display {
+                        follow.note_cutover();
+                    }
+                    continue;
+                }
+            }
+        }
         // Wait in short slices so `stop` stays responsive while the origin is
         // slow; a dead read still surfaces within `rw_timeout` as an error.
         let Some(item) = pending
@@ -14112,6 +15744,9 @@ fn open_and_stream(
                 if packet.stream() == stream_index {
                     packet_gate.submitted(fence, packet.pts());
                     decoder.send_packet(&packet).map_err(|e| e.to_string())?;
+                    if let Some(driver) = display.as_mut() {
+                        driver.on_packet(&packet);
+                    }
                 } else {
                     // A non-video packet: route it to the in-container subtitle
                     // decoder (DVB-sub bitmap or text) if it belongs to that
@@ -15259,6 +16894,94 @@ pub struct LiveAnchor {
 /// thread, read by anyone (audio) without blocking (invariants #1/#10).
 pub type LiveAnchorSlot = Arc<multiview_framestore::SwapCell<Option<Arc<LiveAnchor>>>>;
 
+/// The input stream inventories known to the running pipeline: boot-probed
+/// sources plus sources probed when demand started them.
+type InventoryMap =
+    Arc<std::collections::BTreeMap<String, multiview_core::stream::StreamInventory>>;
+
+fn live_inventories() -> &'static multiview_framestore::SwapCell<InventoryMap> {
+    static CELL: std::sync::OnceLock<multiview_framestore::SwapCell<InventoryMap>> =
+        std::sync::OnceLock::new();
+    CELL.get_or_init(|| {
+        multiview_framestore::SwapCell::from_pointee(std::collections::BTreeMap::new())
+    })
+}
+
+/// Record (or with `None` forget) `id`'s inventory.
+pub(crate) fn set_live_inventory(
+    id: &str,
+    inventory: Option<&multiview_core::stream::StreamInventory>,
+) {
+    live_inventories().rcu(|current| {
+        let mut next = current.as_ref().clone();
+        match &inventory {
+            Some(inventory) => {
+                next.insert(id.to_owned(), (*inventory).clone());
+            }
+            None => {
+                next.remove(id);
+            }
+        }
+        next
+    });
+}
+
+/// Probe a file source's inventory when demand starts it, off the clock on the
+/// demand rail thread. Network sources are inventoried by their own ingest.
+fn probe_on_start(source: &Source) {
+    if let SourceKind::File { path } = &source.kind {
+        match multiview_ffmpeg::Demuxer::open(std::path::Path::new(path)) {
+            Ok(demux) => set_live_inventory(
+                &source.id,
+                Some(&demux.inventory().with_input_id(source.id.clone())),
+            ),
+            Err(error) => {
+                tracing::warn!(source = %source.id, %error, "could not probe stream inventory on start");
+            }
+        }
+    }
+}
+
+/// The audio stores each running audio rail publishes into, for the demand
+/// manager's progress check. Written when a rail starts or stops, read wait-free.
+type AudioProgressMap =
+    Arc<std::collections::HashMap<String, Arc<multiview_audio::store::AudioStore>>>;
+
+fn audio_progress_slots() -> &'static multiview_framestore::SwapCell<AudioProgressMap> {
+    static SLOTS: std::sync::OnceLock<multiview_framestore::SwapCell<AudioProgressMap>> =
+        std::sync::OnceLock::new();
+    SLOTS.get_or_init(|| {
+        multiview_framestore::SwapCell::from_pointee(std::collections::HashMap::new())
+    })
+}
+
+/// Record (or with `None` forget) the store `id`'s audio rail publishes into.
+pub(crate) fn set_audio_progress_store(
+    id: &str,
+    store: Option<&Arc<multiview_audio::store::AudioStore>>,
+) {
+    audio_progress_slots().rcu(|current| {
+        let mut next = current.as_ref().clone();
+        match &store {
+            Some(store) => {
+                next.insert(id.to_owned(), Arc::clone(*store));
+            }
+            None => {
+                next.remove(id);
+            }
+        }
+        next
+    });
+}
+
+/// How many times `id`'s audio rail has published. Wait-free.
+pub(crate) fn audio_publishes(id: &str) -> u64 {
+    audio_progress_slots()
+        .load()
+        .get(id)
+        .map_or(0, |store| store.publish_count())
+}
+
 /// The process-wide [`LiveAnchorSlot`] for source `id` — the same `Arc` for
 /// every caller, so the audio rail can look up the slot the video rail writes.
 /// Takes a mutex only to find/create the entry (plan build, control plane);
@@ -15524,6 +17247,22 @@ fn publish_live_frame_for(
         publish_live_anchor(slot, (at, pts), raw);
     }
     true
+}
+
+/// Which source PTS reaches the output at which host wall-clock, from the
+/// anchor the stamper published. Two lock-free loads; runs on the journal thread.
+fn journal_output_anchor(
+    anchor: &LiveAnchorSlot,
+    origin: &crate::timing_status::EpochAnchorSlot,
+) -> Option<crate::event_journal::OutputAnchor> {
+    let run = origin.load()?;
+    let live = anchor.load()?;
+    crate::event_journal::output_anchor_now(
+        live.raw_pts0_ns?,
+        live.out0.as_nanos(),
+        run.time().now_nanos().saturating_sub(run.seed_nanos()),
+        crate::event_journal::wall_now_ns(),
+    )
 }
 
 /// Publish a fresh anchor into `slot`, bumping its generation.
@@ -15977,6 +17716,7 @@ mod fault_detector_tests {
     use super::*;
     use crate::overlays::TileFault;
     use multiview_audio::{AudioBlock, AudioFormat, ChannelLayout};
+    use multiview_core::layout::Cell;
 
     /// A 25/1 fps cadence (40 ms per tick), so the dwell windows below convert to
     /// a small, deterministic number of ticks.
@@ -17577,13 +19317,18 @@ mod youtube_tests {
     }
 
     impl multiview_input::youtube::reresolve::Resolver for FakeResolver {
-        async fn resolve(&self, _url: &str) -> Result<ResolvedHls, YoutubeError> {
+        fn resolve(
+            &self,
+            _url: &str,
+        ) -> impl std::future::Future<Output = Result<ResolvedHls, YoutubeError>> + Send {
             self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            self.results
-                .lock()
-                .expect("lock")
-                .pop_front()
-                .unwrap_or(Err(YoutubeError::Unavailable("exhausted".to_owned())))
+            std::future::ready(
+                self.results
+                    .lock()
+                    .expect("lock")
+                    .pop_front()
+                    .unwrap_or(Err(YoutubeError::Unavailable("exhausted".to_owned()))),
+            )
         }
     }
 
@@ -17937,9 +19682,11 @@ buffer_ms = 700
 
 #[cfg(test)]
 mod srt_wiring_tests {
+    #[cfg(feature = "srt-libsrt")]
+    use super::audio_ingest_plan_for;
     use super::{
-        audio_ingest_plan_for, build_outputs, ingest_plan_for, srt_resolved_url, PipelineError,
-        RunnableOutput, SourceLocation,
+        build_outputs, ingest_plan_for, srt_resolved_url, PipelineError, RunnableOutput,
+        SourceLocation,
     };
     use multiview_compositor::pipeline::CanvasColor;
     use multiview_config::{Output, Source};
@@ -17959,12 +19706,85 @@ mod srt_wiring_tests {
             "oheadbw_pct": 25, "maxbw": 0, "conn_timeout_ms": 3000,
         }))
         .unwrap();
+        // Listener-mode lowering needs the native leaf (ADR-0039 decision 10,
+        // amended): without `srt-libsrt` this specific-host (`[::1]`) listener
+        // still fails closed, covered by `unsupported_srt_backend_and_peer_timeout_fail_closed`'s
+        // sibling assertions and the dedicated feature-gated test below.
+        #[cfg(not(feature = "srt-libsrt"))]
+        assert!(matches!(
+            srt_resolved_url(base, Some(&opts), false).unwrap_err(),
+            SrtError::ListenerRequiresNativeLeaf
+        ));
+        #[cfg(feature = "srt-libsrt")]
+        assert_eq!(srt_resolved_url(base, Some(&opts), false).unwrap(),
+            "srt://[::1]:9000?mode=listener&latency=200000&streamid=%23%21%3A%3Ar%3Dlive&oheadbw=25&maxbw=0&connect_timeout=3000&transtype=live");
+    }
+
+    /// Listener resolution — including the dual-stack normalisation and the
+    /// redaction path — needs the native leaf (ADR-0039 decision 10, amended).
+    #[cfg(feature = "srt-libsrt")]
+    #[test]
+    fn srt_wildcard_listener_stays_dual_stack_specific_hosts_pass_through() {
+        let listener = serde_json::from_value(serde_json::json!({"mode": "listener"})).unwrap();
+        let legacy = serde_json::from_value(serde_json::json!({"listener": true})).unwrap();
+        for (base, opts, want) in [
+            (
+                "srt://[::]:9000?mode=listener",
+                None,
+                "srt://[::]:9000?mode=listener",
+            ),
+            (
+                "srt://:9000?mode=listener",
+                None,
+                "srt://[::]:9000?mode=listener",
+            ),
+            (
+                "srt://[::]:9000",
+                Some(&listener),
+                "srt://[::]:9000?mode=listener",
+            ),
+            (
+                "srt://:9000",
+                Some(&listener),
+                "srt://[::]:9000?mode=listener",
+            ),
+            (
+                "srt://[::]:9000?latency=1000",
+                Some(&legacy),
+                "srt://[::]:9000?mode=listener&latency=1000",
+            ),
+            (
+                "srt://[2001:db8::10]:9000",
+                Some(&listener),
+                "srt://[2001:db8::10]:9000?mode=listener",
+            ),
+            (
+                "srt://0.0.0.0:9000",
+                Some(&listener),
+                "srt://0.0.0.0:9000?mode=listener",
+            ),
+            (
+                "srt://[::1]:9000?mode=caller",
+                None,
+                "srt://[::1]:9000?mode=caller",
+            ),
+        ] {
+            assert_eq!(srt_resolved_url(base, opts, false).unwrap(), want, "{base}");
+        }
         assert_eq!(
-            srt_resolved_url(base, Some(&opts), false).unwrap(),
-            "srt://[::1]:9000?mode=listener&latency=200000&streamid=%23%21%3A%3Ar%3Dlive&oheadbw=25&maxbw=0&connect_timeout=3000&transtype=live"
+            srt_resolved_url(
+                "srt://:9000?mode=listener&passphrase=abcdefghijk",
+                None,
+                true
+            )
+            .unwrap(),
+            "srt://[::]:9000?mode=listener&passphrase=***"
         );
     }
 
+    /// Needs `srt-libsrt`: listener-mode lowering fails closed without it
+    /// (ADR-0039 decision 10, amended), covered separately below.
+    #[cfg(feature = "srt-libsrt")]
     #[test]
     fn srt_audio_plan_uses_the_same_lowered_url_as_video() {
         let source: Source = serde_json::from_value(serde_json::json!({
@@ -18081,6 +19901,76 @@ mod srt_wiring_tests {
             ),
             Err(PipelineError::Ingest { .. })
         ));
+    }
+
+    /// Without `srt-libsrt` (ADR-0039 decision 10, amended) EVERY SRT listener
+    /// URL — wildcard or a specific host — fails closed with a clear,
+    /// actionable error, never libav's opaque "Bad parameters": both the
+    /// legacy opaque-URL path (`srt` absent) and the typed `SrtOptions` path,
+    /// for both an ingest source and a push output.
+    #[cfg(not(feature = "srt-libsrt"))]
+    #[test]
+    fn srt_listener_fails_closed_without_the_native_leaf() {
+        for base in [
+            "srt://[::]:9000?mode=listener",
+            "srt://[::1]:9000?mode=listener",
+        ] {
+            assert!(matches!(
+                srt_resolved_url(base, None, false).unwrap_err(),
+                SrtError::ListenerRequiresNativeLeaf
+            ));
+        }
+        let typed = serde_json::from_value(serde_json::json!({"mode": "listener"})).unwrap();
+        assert!(matches!(
+            srt_resolved_url("srt://[::1]:9000", Some(&typed), false).unwrap_err(),
+            SrtError::ListenerRequiresNativeLeaf
+        ));
+        let source: Source = serde_json::from_value(serde_json::json!({
+            "id": "srt-in", "kind": "srt", "url": "srt://[::]:9000?mode=listener"
+        }))
+        .unwrap();
+        let store = Arc::new(TileStore::new(
+            source.id.clone(),
+            TileThresholds::default(),
+            NoSignalPolicy::HoldForever,
+        ));
+        let result = ingest_plan_for(
+            &source,
+            320,
+            180,
+            store,
+            CanvasColor::default(),
+            Rational::new(30, 1),
+        );
+        match result {
+            Err(err @ PipelineError::Ingest { .. }) => {
+                assert!(err.to_string().contains("srt-libsrt"), "{err}");
+            }
+            Ok(_) => panic!("expected an Ingest error naming srt-libsrt, got Ok"),
+            Err(other) => panic!("expected an Ingest error naming srt-libsrt, got {other:?}"),
+        }
+        let output: Output = serde_json::from_value(serde_json::json!({
+            "kind": "srt", "id": "srt-out", "url": "srt://[::]:9000?mode=listener", "codec": "mpeg2video"
+        }))
+        .unwrap();
+        let epoch = multiview_output::SharedEpoch::default();
+        #[cfg(feature = "webrtc-native")]
+        let sinks = std::collections::HashMap::new();
+        let result = build_outputs(
+            &[output],
+            &epoch,
+            #[cfg(feature = "webrtc-native")]
+            &sinks,
+            None,
+            Rational::new(30, 1),
+        );
+        match result {
+            Err(err @ PipelineError::Output { .. }) => {
+                assert!(err.to_string().contains("srt-libsrt"), "{err}");
+            }
+            Ok(_) => panic!("expected an Output error naming srt-libsrt, got Ok"),
+            Err(other) => panic!("expected an Output error naming srt-libsrt, got {other:?}"),
+        }
     }
 }
 
@@ -18528,6 +20418,7 @@ input_id = "net1"
     #[test]
     fn caption_reader_registers_a_prefixed_stop_flag() {
         let plan = crate::captions::CaptionPlan {
+            http_headers: multiview_ffmpeg::HttpHeaders::default(),
             id: "net1".to_owned(),
             rendition_url: "http://[::1]:1/never/subs.m3u8".to_owned(),
             store: Arc::new(crate::captions::CueStore::new()),
@@ -18699,6 +20590,7 @@ mod live_overlay_bake_tests {
             canvas_width: 320,
             canvas_height: 180,
             overlay_apply: Some(Arc::clone(slot)),
+            activity: None,
         }
     }
 
@@ -18706,6 +20598,8 @@ mod live_overlay_bake_tests {
     fn item(tick_index: u64) -> StreamItem {
         let tag = CanvasColor::default().output_tag();
         StreamItem {
+            switcher_audio: None,
+            switcher_audio_enabled: false,
             #[cfg(feature = "overlay")]
             events: std::collections::HashMap::new(),
             canvas: Arc::new(Nv12Image::solid(320, 180, 16, 128, 128, tag).expect("solid")),
@@ -18742,6 +20636,7 @@ mod live_overlay_bake_tests {
             },
             asset_id: None,
             correlation_id: None,
+            descriptor: None,
         });
         let reader = runtime.reader();
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
@@ -19378,9 +21273,11 @@ mod media_player_loop_tests {
             source_events: None,
             id: "player-test".to_owned(),
             location: super::SourceLocation::Path(clip.clone()),
+            http_headers: super::HttpHeaders::default(),
             player: Some(handle),
             tile_w,
             tile_h,
+            display: None,
             store: Arc::clone(&store),
             output_origin: crate::timing_status::anchor_slot(),
             live_anchor: Arc::new(multiview_framestore::SwapCell::empty()),
@@ -19406,6 +21303,8 @@ mod media_player_loop_tests {
             },
             #[cfg(feature = "youtube")]
             youtube_url_slot: None,
+            #[cfg(feature = "youtube")]
+            youtube_yt_dlp_path: None,
         };
 
         // A recorder thread snapshots the published tile's (stamp, fingerprint)
@@ -19546,9 +21445,11 @@ mod media_player_loop_tests {
             source_events: None,
             id: "vt-bad".to_owned(),
             location: super::SourceLocation::Path(clip.clone()),
+            http_headers: super::HttpHeaders::default(),
             player: Some(handle),
             tile_w: 160,
             tile_h: 120,
+            display: None,
             store: Arc::clone(&store),
             output_origin: crate::timing_status::anchor_slot(),
             live_anchor: Arc::new(multiview_framestore::SwapCell::empty()),
@@ -19574,6 +21475,8 @@ mod media_player_loop_tests {
             },
             #[cfg(feature = "youtube")]
             youtube_url_slot: None,
+            #[cfg(feature = "youtube")]
+            youtube_yt_dlp_path: None,
         };
 
         // Drive the player WITHOUT ever setting `stop`: the fail-safe must end the
@@ -19658,9 +21561,11 @@ mod media_player_loop_tests {
             source_events: None,
             id: "vt-bframe".to_owned(),
             location: super::SourceLocation::Path(clip.clone()),
+            http_headers: super::HttpHeaders::default(),
             player: Some(handle),
             tile_w,
             tile_h,
+            display: None,
             store: Arc::clone(&store),
             output_origin: crate::timing_status::anchor_slot(),
             live_anchor: Arc::new(multiview_framestore::SwapCell::empty()),
@@ -19686,6 +21591,8 @@ mod media_player_loop_tests {
             },
             #[cfg(feature = "youtube")]
             youtube_url_slot: None,
+            #[cfg(feature = "youtube")]
+            youtube_yt_dlp_path: None,
         };
 
         // Capture every distinct published frame fingerprint across the run.
@@ -19988,6 +21895,7 @@ mod mp2_slice2_registry_adoption {
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
     use super::*;
+    use crate::display_size::cell_dims;
 
     /// A 2x2 grid where source `cam1` is bound by two cells of DIFFERENT sizes:
     /// area `a` = 400x480 and area `d` = 800x240 on a 1200x720 canvas. The
@@ -20063,6 +21971,121 @@ segment_ms = 1000
             "cell_pixel_size must decode at the per-axis supremum across ALL binding \
              cells (ADR-0030 §3), not the first-found cell {first:?}"
         );
+    }
+
+    /// A network source the boot layout does not bind is planned at the small
+    /// unbound size, not the full canvas, and its plan follows the live layout.
+    /// A generator, which cannot resize later, keeps the canvas fallback.
+    #[test]
+    fn an_unbound_network_source_is_not_planned_at_the_full_canvas() {
+        let doc = r##"schema_version = 1
+[canvas]
+width = 1920
+height = 1080
+fps = "25/1"
+pixel_format = "nv12"
+background = "#101014"
+[canvas.color]
+profile = "sdr-bt709-limited"
+[layout]
+kind = "grid"
+columns = ["1fr"]
+rows = ["1fr"]
+areas = ["main"]
+[[sources]]
+id = "boot"
+kind = "bars"
+[[sources]]
+id = "news"
+kind = "hls"
+url = "http://[::1]:9/news.m3u8"
+[[sources]]
+id = "spare"
+kind = "bars"
+[[cells]]
+id = "main"
+area = "main"
+[cells.source]
+input_id = "boot"
+[[outputs]]
+kind = "hls"
+path = "/tmp/nvdec-unbound.m3u8"
+codec = "mpeg2video"
+segment_ms = 1000
+"##;
+        let config = multiview_config::MultiviewConfig::load_from_toml(doc).expect("parses");
+        let pipeline = Pipeline::build(&config).expect("pipeline builds");
+        let size = |id: &str| {
+            pipeline
+                .source_registry
+                .requested_supremum(&multiview_engine::SourceKey::from_canonical(id))
+        };
+        let req = |(width, height): (u32, u32)| multiview_engine::RequestedSize { width, height };
+        assert_eq!(
+            size("news"),
+            Some(req(crate::display_size::UNBOUND_DISPLAY_SIZE))
+        );
+        assert_eq!(size("spare"), Some(req((1920, 1080))));
+        let news = pipeline
+            .ingest_plans
+            .iter()
+            .find(|plan| plan.id == "news")
+            .expect("news plan");
+        assert_eq!((news.tile_w, news.tile_h), (640, 360));
+        let follow = news
+            .display
+            .as_ref()
+            .expect("a network decode follows the layout");
+        assert_eq!(
+            follow.variant_height("news"),
+            1080,
+            "an unbound HLS source still pins a canvas-height variant"
+        );
+        let spare = pipeline
+            .ingest_plans
+            .iter()
+            .find(|plan| plan.id == "spare")
+            .expect("spare plan");
+        assert!(spare.display.is_none());
+
+        // Following a live layout swap updates the registry record downwards.
+        follow.record("news", (320, 180));
+        assert_eq!(size("news"), Some(req((320, 180))));
+    }
+
+    #[test]
+    fn switcher_live_edits_and_removal_cannot_resolve_stale_media() {
+        use crate::live_sources::IngestSpawner;
+        use multiview_engine::RailDriver;
+
+        let config = two_cells_one_source_config();
+        let mut pipeline = Pipeline::build(&config).expect("pipeline builds");
+        // Build the run's demand manager so the live spawner owns the catalogue.
+        let _manager = pipeline.demand();
+        let legacy = pipeline.live_spawner();
+        assert!(
+            !legacy.invalidate_live_edit("cam1"),
+            "legacy edits stay live"
+        );
+        let mut guarded = pipeline.live_spawner();
+        guarded.clear_on_remove = true;
+        let rails = crate::source_rails::SourceRails::new(
+            pipeline.catalogue(),
+            pipeline.stop_registry(),
+            Arc::new(DemandSpawner {
+                live: pipeline.live_spawner(),
+                registry: pipeline.stop_registry(),
+            }),
+        );
+        let retained = rails.store("cam1").expect("boot store exists");
+        assert!(guarded.invalidate_live_edit("cam1"));
+        assert!(retained.read_at(MediaTime::from_nanos(0)).frame().is_none());
+        assert_eq!(rails.resolve("cam1", Rails::VIDEO), Rails::NONE);
+        assert!(rails.store("cam1").is_none());
+        crate::source_rails::catalogue_upsert(&pipeline.catalogue(), &config.sources[0]);
+        guarded.source_removed("cam1");
+        assert_eq!(rails.resolve("cam1", Rails::VIDEO), Rails::NONE);
+        assert!(rails.store("cam1").is_none());
     }
 
     #[test]
@@ -22225,5 +24248,473 @@ segment_ms = 1000
                 .len(),
             3
         );
+    }
+}
+
+#[cfg(test)]
+mod http_headers_tests {
+    use super::{
+        audio_ingest_plan_for, ffmpeg, http_headers_for, resolve_hls_audio_url_with_headers,
+        SourceKind,
+    };
+    use multiview_config::Source;
+
+    #[test]
+    fn audio_plan_carries_hls_headers_and_other_kinds_carry_none() {
+        let mut hls: Source = serde_json::from_value(serde_json::json!({
+            "id": "a", "kind": "hls", "url": "https://o.test/m.m3u8",
+            "user_agent": "UA/1", "referrer": "https://r.test/",
+        }))
+        .expect("hls");
+        let plan = audio_ingest_plan_for(&hls).expect("hls audio plan");
+        assert_eq!(plan.http_headers.user_agent(), Some("UA/1"));
+        assert_eq!(plan.http_headers.referer(), Some("https://r.test/"));
+        let opts = plan.http_headers.open_options();
+        assert_eq!(opts[0], ("user_agent", "UA/1".to_owned()));
+        assert_eq!(opts[1], ("referer", "https://r.test/".to_owned()));
+        let ts: Source = serde_json::from_value(serde_json::json!({
+            "id": "t", "kind": "ts", "url": "udp://[::1]:1234",
+        }))
+        .expect("ts");
+        assert!(audio_ingest_plan_for(&ts)
+            .expect("ts plan")
+            .http_headers
+            .is_empty());
+        if let SourceKind::Hls {
+            user_agent,
+            referrer,
+            ..
+        } = &mut hls.kind
+        {
+            *user_agent = Some("bad\r\nX: 1".to_owned());
+            *referrer = None;
+        }
+        assert!(audio_ingest_plan_for(&hls)
+            .expect("plan")
+            .http_headers
+            .is_empty());
+    }
+
+    #[test]
+    fn audio_master_pin_fetch_sends_the_operator_headers() {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("[::1]:0").expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            if let Ok((mut conn, _)) = listener.accept() {
+                let mut buf = [0_u8; 4096];
+                let n = conn.read(&mut buf).unwrap_or(0);
+                let _ = tx.send(String::from_utf8_lossy(&buf[..n]).into_owned());
+                let body = "#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=1,CODECS=\"avc1.4d401f,mp4a.40.2\"\nv/a.m3u8\n";
+                let _ = write!(
+                    conn,
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+            }
+        });
+        let headers =
+            multiview_ffmpeg::HttpHeaders::new(Some("Opera/Test 9"), Some("https://ref.example/"));
+        let url = format!("http://{addr}/master.m3u8");
+        let pinned = resolve_hls_audio_url_with_headers(&url, &headers);
+        let head = rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("request seen")
+            .to_ascii_lowercase();
+        assert!(head.contains("user-agent: opera/test 9"), "{head}");
+        assert!(head.contains("referer: https://ref.example/"), "{head}");
+        assert!(pinned.is_some_and(|u| u.ends_with("/v/a.m3u8")));
+    }
+
+    #[test]
+    fn hls_headers_become_libav_user_agent_and_referer_options() {
+        let kind = SourceKind::Hls {
+            url: "https://h/x.m3u8".to_owned(),
+            user_agent: Some("UA/1".to_owned()),
+            referrer: Some("https://r/".to_owned()),
+        };
+        let headers = http_headers_for(&kind);
+        assert!(!headers.is_empty());
+        let mut opts = ffmpeg::Dictionary::new();
+        headers.apply(&mut opts);
+        assert_eq!(opts.get("user_agent"), Some("UA/1"));
+        assert_eq!(opts.get("referer"), Some("https://r/"));
+        let none = http_headers_for(&SourceKind::Bars);
+        assert!(none.is_empty());
+    }
+}
+
+/// The follow-the-layout path over real libav decoders and a real demux. There
+/// is no GPU here, so these prove the wiring and the timestamp contract the
+/// handover relies on; `*_cuvid` itself needs the host.
+#[cfg(all(test, feature = "ffmpeg"))]
+mod display_follow_tests {
+    #![allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::indexing_slicing
+    )]
+
+    use std::path::Path;
+    use std::process::Command;
+    use std::sync::atomic::{AtomicBool, AtomicUsize};
+    use std::time::{Duration, Instant};
+
+    use multiview_ffmpeg::StreamVideoDecoder;
+    use multiview_framestore::{NoSignalPolicy, SwapCell, TileStore, TileThresholds};
+
+    use super::*;
+    use crate::display_size::{Handover, HandoverPermit, HandoverPoll};
+
+    /// An MPEG-2 clip with B-frames and open GOPs: the leading pictures after a
+    /// keyframe are what a mid-stream start cannot decode.
+    fn clip(path: &Path, seconds: u32) {
+        let status = Command::new("ffmpeg")
+            .args([
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-y",
+                "-f",
+                "lavfi",
+                "-i",
+            ])
+            .arg(format!("testsrc=size=320x240:rate=25:duration={seconds}"))
+            .args(["-pix_fmt", "yuv420p", "-c:v", "mpeg2video"])
+            .args(["-bf", "2", "-g", "12", "-f", "mpegts"])
+            .arg(path)
+            .status()
+            .expect("spawn ffmpeg");
+        assert!(status.success());
+    }
+
+    fn config(path: &Path, cell_w: f32) -> multiview_config::MultiviewConfig {
+        let doc = format!(
+            r##"schema_version = 1
+[canvas]
+width = 320
+height = 240
+fps = "25/1"
+pixel_format = "nv12"
+background = "#101014"
+[canvas.color]
+profile = "sdr-bt709-limited"
+[layout]
+kind = "absolute"
+[[sources]]
+id = "clip"
+kind = "file"
+path = "{}"
+[[cells]]
+id = "main"
+rect = {{ x = 0.0, y = 0.0, w = {cell_w}, h = {cell_w} }}
+[cells.source]
+input_id = "clip"
+[[outputs]]
+kind = "hls"
+path = "/tmp/display-follow.m3u8"
+codec = "mpeg2video"
+segment_ms = 1000
+"##,
+            path.display()
+        );
+        multiview_config::MultiviewConfig::load_from_toml(&doc).expect("config parses")
+    }
+
+    #[test]
+    fn a_running_ingest_follows_a_published_layout_without_a_respawn() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("clip.ts");
+        clip(&path, 10);
+        let boot = config(&path, 1.0);
+        let layout = boot.solve_layout().unwrap();
+        let slot: DisplayLayoutSlot = Arc::new(SwapCell::new(Arc::new(layout)));
+        let store = Arc::new(TileStore::new(
+            "clip",
+            TileThresholds::default(),
+            NoSignalPolicy::HoldForever,
+        ));
+        let mut plan = ingest_plan_for(
+            &boot.sources[0],
+            320,
+            240,
+            Arc::clone(&store),
+            CanvasColor::default(),
+            Rational::new(25, 1),
+        )
+        .unwrap();
+        plan.display = Some(DisplayFollow::new(Arc::clone(&slot), None));
+        let stop = AtomicBool::new(false);
+        let width = || {
+            store
+                .read_at(MediaTime::from_nanos(i64::MAX))
+                .frame()
+                .map(|frame| (frame.width(), frame.height()))
+        };
+        let wait_for = |want: (u32, u32)| {
+            let end = Instant::now() + Duration::from_secs(6);
+            while Instant::now() < end {
+                if width() == Some(want) {
+                    return true;
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            false
+        };
+        std::thread::scope(|scope| {
+            scope.spawn(|| ingest_loop(&plan, &stop));
+            let started = wait_for((320, 240));
+            slot.store(Arc::new(config(&path, 0.25).solve_layout().unwrap()));
+            let followed = wait_for((80, 60));
+            stop.store(true, Ordering::Release);
+            assert!(started, "the decode must start at the boot tile size");
+            assert!(followed, "the running decode must follow the new layout");
+        });
+    }
+
+    /// The production decode loop itself takes the reopen: a helper-thread open,
+    /// a cutover in `open_and_stream`, and frames still flowing afterwards.
+    #[test]
+    fn the_decode_loop_cuts_over_to_a_reopened_decoder_and_keeps_publishing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("clip.ts");
+        clip(&path, 12);
+        let boot = config(&path, 1.0);
+        let slot: DisplayLayoutSlot =
+            Arc::new(SwapCell::new(Arc::new(boot.solve_layout().unwrap())));
+        let store = Arc::new(TileStore::new(
+            "clip",
+            TileThresholds::default(),
+            NoSignalPolicy::HoldForever,
+        ));
+        let mut plan = ingest_plan_for(
+            &boot.sources[0],
+            320,
+            240,
+            Arc::clone(&store),
+            CanvasColor::default(),
+            Rational::new(25, 1),
+        )
+        .unwrap();
+        let rehearsal = Arc::new(crate::display_size::Rehearsal::default());
+        plan.display =
+            Some(DisplayFollow::new(Arc::clone(&slot), None).rehearsing(Arc::clone(&rehearsal)));
+        let stop = AtomicBool::new(false);
+        let count = |counter: &AtomicUsize| counter.load(Ordering::Acquire);
+        let wait = |done: &dyn Fn() -> bool| {
+            let end = Instant::now() + Duration::from_secs(8);
+            while Instant::now() < end {
+                if done() {
+                    return true;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            false
+        };
+        std::thread::scope(|scope| {
+            scope.spawn(|| ingest_loop(&plan, &stop));
+            let started = wait(&|| store.sequence() > 0);
+            slot.store(Arc::new(config(&path, 0.25).solve_layout().unwrap()));
+            let cut = wait(&|| count(&rehearsal.cutovers) == 1);
+            let at_cut = store.sequence();
+            let flowing = wait(&|| store.sequence() >= at_cut + 10);
+            let size = store
+                .read_at(MediaTime::from_nanos(i64::MAX))
+                .frame()
+                .map(|frame| (frame.width(), frame.height()));
+            stop.store(true, Ordering::Release);
+            assert!(started, "the decode must start");
+            assert!(
+                cut,
+                "the loop must cut over, not fall back to the host scaler"
+            );
+            assert_eq!(
+                count(&rehearsal.opens),
+                1,
+                "one reopen for one layout change"
+            );
+            assert!(flowing, "frames must keep flowing after the cutover");
+            assert_eq!(size, Some((80, 60)));
+        });
+    }
+
+    /// FNV-1a over the visible luma, so a frame with the right timestamp but a
+    /// damaged picture fails the comparison.
+    fn picture_hash(frame: &Video) -> u64 {
+        let width = usize::try_from(frame.width()).unwrap();
+        let height = usize::try_from(frame.height()).unwrap();
+        let stride = frame.stride(0);
+        let plane = frame.data(0);
+        let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+        for row in 0..height {
+            for &byte in &plane[row * stride..row * stride + width] {
+                hash ^= u64::from(byte);
+                hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+            }
+        }
+        hash
+    }
+
+    /// Decode `path`, handing over to a fresh decoder after `cut` packets when
+    /// given, with the decode loop's ordering. Returns the frames taken, in order.
+    fn decode(path: &Path, cut: Option<usize>) -> Vec<(i64, u64)> {
+        multiview_ffmpeg::ensure_initialized().unwrap();
+        let mut input = ffmpeg::format::input(&path).unwrap();
+        let (stream_index, params, time_base, _fps) = best_video_stream_params(&input).unwrap();
+        let mut decoder = StreamVideoDecoder::new(params.clone(), time_base).unwrap();
+        let mut handover: Option<Handover<StreamVideoDecoder>> = None;
+        let mut carried = std::collections::VecDeque::new();
+        let mut skip = SkipThrough::default();
+        let mut seen = Vec::new();
+        let mut cut_over = false;
+        let mut sent = 0_usize;
+        let mut eof = false;
+        loop {
+            while let Some(frame) = match carried.pop_front() {
+                Some(frame) => Some(frame),
+                None => decoder.receive_frame().unwrap(),
+            } {
+                if !skip.drops(frame.raw_pts) {
+                    let pts = frame.raw_pts.expect("clip frames carry a timestamp");
+                    seen.push((pts, picture_hash(&frame.frame)));
+                }
+            }
+            if eof {
+                assert_eq!(cut.is_some(), cut_over, "the handover must have completed");
+                return seen;
+            }
+            if let Some(running) = handover.as_mut() {
+                match running.poll(seen.last().map(|(pts, _)| *pts), Instant::now()) {
+                    HandoverPoll::Pending => {}
+                    HandoverPoll::Abandoned(reason) => panic!("handover abandoned: {reason}"),
+                    HandoverPoll::Ready {
+                        decoder: replacement,
+                        frames,
+                        skip_through,
+                    } => {
+                        decoder = replacement;
+                        carried = frames;
+                        skip.arm(skip_through);
+                        handover = None;
+                        cut_over = true;
+                        continue;
+                    }
+                }
+            }
+            let mut packet = ffmpeg::codec::packet::Packet::empty();
+            match packet.read(&mut input) {
+                Ok(()) if packet.stream() == stream_index => {
+                    decoder.send_packet(&packet).unwrap();
+                    if let Some(running) = handover.as_mut() {
+                        running.on_packet(&packet);
+                    }
+                    sent += 1;
+                    if Some(sent) == cut {
+                        let permit = loop {
+                            if let Some(permit) = HandoverPermit::try_acquire() {
+                                break permit;
+                            }
+                            std::thread::yield_now();
+                        };
+                        let fresh = params.clone();
+                        let open = move || {
+                            StreamVideoDecoder::new(fresh, time_base).map_err(|e| e.to_string())
+                        };
+                        let mut started =
+                            Handover::spawn("test".to_owned(), permit, Instant::now(), open)
+                                .unwrap();
+                        // The open is asynchronous; wait so the cut point is exact.
+                        while matches!(started.poll(None, Instant::now()), HandoverPoll::Pending)
+                            && !started.is_open()
+                        {
+                            std::thread::yield_now();
+                        }
+                        handover = Some(started);
+                    }
+                }
+                Ok(()) => {}
+                Err(ffmpeg::Error::Eof) => {
+                    decoder.send_eof().unwrap();
+                    eof = true;
+                }
+                Err(other) => panic!("read failed: {other}"),
+            }
+        }
+    }
+
+    fn h264_clip(path: &Path, open_gop: bool, seconds: u32) {
+        let params = format!(
+            "keyint=12:min-keyint=12:scenecut=0:bframes=3:b-pyramid=normal:open-gop={}",
+            u8::from(open_gop)
+        );
+        let status = Command::new("ffmpeg")
+            .args([
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-y",
+                "-f",
+                "lavfi",
+                "-i",
+            ])
+            .arg(format!("testsrc=size=320x240:rate=25:duration={seconds}"))
+            .args(["-pix_fmt", "yuv420p", "-c:v", "libx264", "-x264-params"])
+            .arg(params)
+            .args(["-f", "mpegts"])
+            .arg(path)
+            .status()
+            .expect("spawn ffmpeg");
+        assert!(status.success());
+    }
+
+    #[test]
+    fn a_real_h264_closed_gop_handover_is_seamless() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("clip.ts");
+        h264_clip(&path, false, 4);
+        let reference = decode(&path, None);
+        assert!(reference.len() > 80);
+        for cut in 20..33 {
+            assert_eq!(
+                decode(&path, Some(cut)),
+                reference,
+                "a cutover after packet {cut} must not drop, repeat or reorder a frame"
+            );
+        }
+    }
+
+    #[test]
+    fn a_real_h264_open_gop_handover_is_seamless() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("clip.ts");
+        h264_clip(&path, true, 4);
+        let reference = decode(&path, None);
+        assert!(reference.len() > 80);
+        for cut in 20..33 {
+            assert_eq!(
+                decode(&path, Some(cut)),
+                reference,
+                "a cutover after packet {cut} must not drop, repeat or reorder a frame"
+            );
+        }
+    }
+
+    #[test]
+    fn a_real_handover_shows_every_frame_exactly_once_in_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("clip.ts");
+        clip(&path, 4);
+        let reference = decode(&path, None);
+        assert!(reference.len() > 80, "the clip must decode");
+        // Every phase of the GOP, so cuts land on I, P and B positions.
+        for cut in 20..33 {
+            assert_eq!(
+                decode(&path, Some(cut)),
+                reference,
+                "a cutover after packet {cut} must not drop, repeat or reorder a frame"
+            );
+        }
     }
 }

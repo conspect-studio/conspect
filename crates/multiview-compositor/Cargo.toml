@@ -179,6 +179,17 @@ workspace = true
 name = "overlay_bake_overlap"
 required-features = ["overlay"]
 
+# The band-parallel overlay subpass exactness test (perf(overlay): band-parallel
+# exact overlay subpass) needs only `overlay`.
+[[test]]
+name = "overlay_parallel_bands"
+required-features = ["overlay"]
+
+# Exactness of the overlay bake colour memos (decode table, encode cache).
+[[test]]
+name = "overlay_color_memo"
+required-features = ["overlay"]
+
 [[example]]
 name = "matched_bake"
 required-features = ["overlay"]

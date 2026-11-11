@@ -229,6 +229,8 @@ async fn software_run_serves_the_control_api_while_running() {
         Arc::clone(&publisher),
         commands,
         multiview_control::no_preview(),
+        None, // switcher: absent unless a real paired bus is attached
+        None, // switcher lease owner absent
         None, // whep
         None, // whip
         None, // whep_output

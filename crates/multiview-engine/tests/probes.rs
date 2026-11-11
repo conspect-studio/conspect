@@ -286,3 +286,88 @@ proptest! {
         prop_assert!(probe.detect(&va, &vb).condition_present);
     }
 }
+
+/// The per-sample reference the row-slice luma metrics replaced: f64
+/// accumulation via `LumaView::sample`, one bounds-checked read per pixel.
+fn reference_mean(v: &LumaView<'_>, zone: DetectionZone) -> f64 {
+    let (x0, y0, x1, y1) = zone.pixel_bounds(v.width(), v.height());
+    let (mut sum, mut count) = (0.0_f64, 0.0_f64);
+    for y in y0..y1 {
+        for x in x0..x1 {
+            if let Some(s) = v.sample(x, y) {
+                sum += f64::from(s);
+                count += 1.0;
+            }
+        }
+    }
+    if count == 0.0 {
+        0.0
+    } else {
+        sum / count
+    }
+}
+
+fn reference_changed(cur: &LumaView<'_>, prev: &LumaView<'_>, zone: DetectionZone, tol: u8) -> f64 {
+    if cur.width() != prev.width() || cur.height() != prev.height() {
+        return 1.0;
+    }
+    let (x0, y0, x1, y1) = zone.pixel_bounds(cur.width(), cur.height());
+    let (mut changed, mut count) = (0.0_f64, 0.0_f64);
+    for y in y0..y1 {
+        for x in x0..x1 {
+            match (cur.sample(x, y), prev.sample(x, y)) {
+                (Some(c), Some(p)) => {
+                    if c.abs_diff(p) > tol {
+                        changed += 1.0;
+                    }
+                }
+                _ => changed += 1.0,
+            }
+            count += 1.0;
+        }
+    }
+    if count == 0.0 {
+        1.0
+    } else {
+        changed / count
+    }
+}
+
+proptest! {
+    /// The row-slice `mean_luma` / `changed_fraction` are bit-identical to the
+    /// per-sample reference for any plane, padded stride, zone and tolerance —
+    /// the probe semantics (and every dwell decision built on them) are
+    /// unchanged; only the per-pixel bounds checks are gone.
+    #[test]
+    fn row_slice_luma_metrics_equal_the_per_sample_reference(
+        w in 1_u32..40,
+        h in 1_u32..24,
+        pad in 0_u32..5,
+        seed in any::<u64>(),
+        zx in 0.0_f32..0.9,
+        zy in 0.0_f32..0.9,
+        tol in any::<u8>(),
+    ) {
+        let stride = w + pad;
+        let n = px(stride * h);
+        let mut state = seed | 1;
+        let mut gen = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state.to_le_bytes()[0]
+        };
+        let a: Vec<u8> = (0..n).map(|_| gen()).collect();
+        let b: Vec<u8> = a.iter().map(|&v| if gen() < 64 { gen() } else { v }).collect();
+        let cur = LumaView::new(&a, w, h, stride).unwrap();
+        let prev = LumaView::new(&b, w, h, stride).unwrap();
+        let zone = DetectionZone::new(zx, zy, (1.0 - zx) / 2.0, (1.0 - zy) / 2.0).unwrap();
+        for z in [DetectionZone::FULL, zone] {
+            prop_assert_eq!(cur.mean_luma(z).to_bits(), reference_mean(&cur, z).to_bits());
+            prop_assert_eq!(
+                cur.changed_fraction(&prev, z, tol).to_bits(),
+                reference_changed(&cur, &prev, z, tol).to_bits()
+            );
+        }
+    }
+}

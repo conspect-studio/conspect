@@ -1134,7 +1134,8 @@ fn parse_decimal_seconds_ns(s: &str) -> Option<i64> {
 /// (no float, no `chrono`) using the days-from-civil algorithm (Howard Hinnant);
 /// the result is ns past 1970-01-01T00:00:00Z. Returns `None` on any malformed
 /// field or out-of-range value.
-fn parse_rfc3339_ns(s: &str) -> Option<i64> {
+#[must_use]
+pub fn parse_rfc3339_ns(s: &str) -> Option<i64> {
     let s = s.trim();
     // Split date and time on 'T' (or a space).
     let (date, rest) = s

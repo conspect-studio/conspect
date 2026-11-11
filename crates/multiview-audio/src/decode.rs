@@ -91,10 +91,29 @@ impl AudioFileDecoder {
     ///
     /// As [`open`](Self::open).
     pub fn open_live(path: impl AsRef<std::path::Path>, layout: ChannelLayout) -> Result<Self> {
+        Self::open_live_with_headers(path, layout, &multiview_ffmpeg::HttpHeaders::default())
+    }
+
+    /// [`open_live`](Self::open_live) sending operator HTTP `headers`
+    /// (`User-Agent` / `Referer`) on every request libav makes for the input.
+    ///
+    /// # Errors
+    ///
+    /// As [`open`](Self::open).
+    pub fn open_live_with_headers(
+        path: impl AsRef<std::path::Path>,
+        layout: ChannelLayout,
+        headers: &multiview_ffmpeg::HttpHeaders,
+    ) -> Result<Self> {
         let channels = u16::try_from(layout.channel_count())
             .map_err(|_| AudioError::InvalidFormat("channel count exceeds u16"))?;
-        let inner = FfDecoder::open_live(path.as_ref(), AudioFormat::CANONICAL_RATE, channels)
-            .map_err(|e| map_ffmpeg_error(&e))?;
+        let inner = FfDecoder::open_live_with_headers(
+            path.as_ref(),
+            AudioFormat::CANONICAL_RATE,
+            channels,
+            headers,
+        )
+        .map_err(|e| map_ffmpeg_error(&e))?;
         Ok(Self {
             inner,
             format: AudioFormat::new(AudioFormat::CANONICAL_RATE, layout),

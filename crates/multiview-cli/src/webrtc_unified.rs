@@ -55,6 +55,7 @@ pub fn spawn_unified_webrtc(
     program_audio: Option<crate::preview::ProgramAudioSlot>,
     webrtc_registry: WhipRegistry,
     egress_registry: &EgressRegistry,
+    demand: Option<multiview_control::SharedSourceDemand>,
 ) -> UnifiedWebrtc {
     let endpoint_config = endpoint_config_from(config);
     let builder = match UnifiedEndpoint::bind(endpoint_config) {
@@ -112,6 +113,7 @@ pub fn spawn_unified_webrtc(
         shared_stores,
         program_audio,
     )
+    .with_demand(demand)
     .with_silence_timeout(std::time::Duration::from_millis(
         config.webrtc.preview_session_timeout.millis(),
     ));

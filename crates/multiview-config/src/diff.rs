@@ -5,9 +5,22 @@
 //! against a **next** (just-loaded) one and reports, per section, exactly what
 //! changed — the unit the config-file watcher turns into apply actions: source
 //! changes ride the live `UpsertSource`/`RemoveSource` machinery, a
-//! layout/cells change rides the apply-layout path, a pinned-canvas change is
-//! Class-2 (restart), and every other changed section is named for the
-//! reseed + requires-restart surface.
+//! layout/cells change rides the apply-layout path, an overlay change rides the
+//! live `UpsertOverlay`/`RemoveOverlay` path, a pinned-canvas change is Class-2
+//! (restart), and every other changed section is named so a file edit is never
+//! silently dropped. [`ConfigDiff::changed_sections`] is the per-section
+//! **reporting** surface, not a restart verdict: the apply layer decides
+//! live-follow vs restart per section — the management-plane sections
+//! (`graphics`, `weather`, `iptv`) take effect without an engine restart, while
+//! the remaining sections are restart-pending today.
+//!
+//! `media_fills` is kept **separate from `media`** (a fill edit is job intent,
+//! ADR-0100 Decision 1) so the control plane CAN apply a fill edit live once a
+//! fill store exists. Until that store lands (ADR-0100 delivery step 1, the
+//! job-runner slice) nothing follows a fill edit from the file:
+//! `multiview-control`'s file watcher puts every changed section except
+//! `overlays` into its restart set, so a fill edit is still reported as
+//! restart-pending.
 //!
 //! Pure and total: no I/O, no clocks, no allocation beyond the reported
 //! changes. Comparison is over the typed schema (`PartialEq`), so semantic
@@ -135,7 +148,16 @@ pub struct ConfigDiff {
     /// Every other changed section, by its authored TOML name (`outputs`,
     /// `overlays`, `probes`, `audio`, `control`, `placement`, `salvos`,
     /// `tally_profiles`, `walls`, `devices`, `sync_groups`, `routing`,
-    /// `discovery`, `timing`, `webrtc`, `schema_version`). Sorted + deduplicated.
+    /// `discovery`, `timing`, `webrtc`, `schema_version`, `media`,
+    /// `media_fills`). Sorted + deduplicated.
+    ///
+    /// This is the per-section **reporting** surface, not a restart verdict:
+    /// the apply layer classifies each name. In particular `media` holds only
+    /// the restart-class media library / player set, while a fill edit is
+    /// reported separately as `media_fills` — job intent (ADR-0100 Decision 1)
+    /// that never joins the media restart class, and that the control plane CAN
+    /// apply live once the fill store lands. Until it does, a fill edit is
+    /// still counted restart-pending by the file watcher (see the module docs).
     pub changed_sections: BTreeSet<&'static str>,
 }
 
@@ -161,6 +183,7 @@ impl ConfigDiff {
             cells: running_cells,
             overlays: running_overlays,
             outputs: running_outputs,
+            programs: running_programs,
             probes: running_probes,
             tally_profiles: running_tally_profiles,
             salvos: running_salvos,
@@ -171,13 +194,21 @@ impl ConfigDiff {
             api: running_api,
             placement: running_placement,
             audio: running_audio,
+            switcher: running_switcher,
             routing: running_routing,
             discovery: running_discovery,
+            catalogues: running_catalogues,
+            network_diagnostics: running_network_diagnostics,
             timing: running_timing,
             webrtc: running_webrtc,
             system: running_system,
             media_library: running_media_library,
             media_players: running_media_players,
+            media_fills: running_media_fills,
+            weather: running_weather,
+            iptv: running_iptv,
+            graphics: running_graphics,
+            events: running_events,
         } = running;
         let MultiviewConfig {
             schema_version: next_schema_version,
@@ -187,6 +218,7 @@ impl ConfigDiff {
             cells: next_cells,
             overlays: next_overlays,
             outputs: next_outputs,
+            programs: next_programs,
             probes: next_probes,
             tally_profiles: next_tally_profiles,
             salvos: next_salvos,
@@ -197,13 +229,21 @@ impl ConfigDiff {
             api: next_api,
             placement: next_placement,
             audio: next_audio,
+            switcher: next_switcher,
             routing: next_routing,
             discovery: next_discovery,
+            catalogues: next_catalogues,
+            network_diagnostics: next_network_diagnostics,
             timing: next_timing,
             webrtc: next_webrtc,
             system: next_system,
             media_library: next_media_library,
             media_players: next_media_players,
+            media_fills: next_media_fills,
+            weather: next_weather,
+            iptv: next_iptv,
+            graphics: next_graphics,
+            events: next_events,
         } = next;
 
         // Canvas: the pinned signal is geometry + cadence BY VALUE (the
@@ -221,17 +261,32 @@ impl ConfigDiff {
 
         // Media library + player channels (ADR-0057): a restart-class section.
         // The live load/cue/play/vamp verbs are command-bus actions (ADR-0097),
-        // not a document-diff apply, so a change to the declared set is a
-        // controlled reset, never a silent hot-swap.
+        // and neither the declared asset set nor the declared player set is
+        // applied by the config-file diff, so a change to either is a controlled
+        // reset, never a silent hot-swap.
+        //
+        // The declarative VT clip fills bound to those players (ADR-0100
+        // Decision 1) are deliberately NOT in `media`: a fill edit is
+        // job-intent, not an engine-topology change, so it is kept separate so
+        // the control plane CAN apply it live without touching the media
+        // library/player restart class. It is surfaced as its own `media_fills`
+        // section (the same shape the other management-plane sections below
+        // use) so a file edit is never silently dropped. Until the fill store
+        // lands (ADR-0100 delivery step 1, the job-runner slice) no consumer
+        // follows the file, and `multiview-control`'s file watcher — which puts
+        // every changed section except `overlays` into its restart set — still
+        // reports a fill edit as restart-pending.
         let media_changed = running_media_library != next_media_library
             || running_media_players != next_media_players;
         let mut changed_sections = BTreeSet::new();
-        let sectioned: [(&'static str, bool); 19] = [
+        let sectioned: [(&'static str, bool); 28] = [
             (
                 "schema_version",
                 running_schema_version != next_schema_version,
             ),
             ("outputs", running_outputs != next_outputs),
+            ("programs", running_programs != next_programs),
+            ("switcher", running_switcher != next_switcher),
             // Order-sensitive (`Vec` compares by position): a pure overlay
             // REORDER sets this so the file-watch overlay apply (`apply_overlay_
             // changes`) still reseeds the store to the new declaration order — the
@@ -261,6 +316,14 @@ impl ConfigDiff {
             ("sync_groups", running_sync_groups != next_sync_groups),
             ("routing", running_routing != next_routing),
             ("discovery", running_discovery != next_discovery),
+            // Catalogue sync/probe settings are control-plane only; a change is a
+            // restart-class section (the sync task is spawned once at boot).
+            ("catalogues", running_catalogues != next_catalogues),
+            // The diagnostics collector is built once at boot.
+            (
+                "network_diagnostics",
+                running_network_diagnostics != next_network_diagnostics,
+            ),
             ("timing", running_timing != next_timing),
             ("webrtc", running_webrtc != next_webrtc),
             // A change to `[system.ndi]` license acceptance is restart-class: full
@@ -269,6 +332,24 @@ impl ConfigDiff {
             // as a changed section (controlled reset) rather than claiming hot-apply.
             ("system", running_system != next_system),
             ("media", media_changed),
+            // A fill edit is job intent (ADR-0100 Decision 1), never part of
+            // the media restart class: it is reported as its own `media_fills`
+            // section so the control plane CAN pick a fill edit up live once the
+            // fill store lands, while a library/player edit still reports
+            // `media`. Until the store lands the watcher still counts a fill
+            // edit restart-pending, because no consumer follows the file yet.
+            ("media_fills", running_media_fills != next_media_fills),
+            // Weather locations are management-plane data (the poller re-reads
+            // them); no engine restart is needed, but the change is surfaced.
+            ("weather", running_weather != next_weather),
+            // Publication-only (epg-playlist): served from accepted intent at
+            // request time; surfaced so a file edit is never silently dropped.
+            ("iptv", running_iptv != next_iptv),
+            // Graphics definitions are management-plane data read by the
+            // graphics generators live; surfaced, never an engine rebuild.
+            ("graphics", running_graphics != next_graphics),
+            // Read once when the journal starts, so a change waits for a restart.
+            ("events", running_events != next_events),
         ];
         for (name, changed) in sectioned {
             if changed {

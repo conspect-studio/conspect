@@ -7,7 +7,10 @@
 //! 1. **composite** — upload each tile's NV12 (Y plane R8, interleaved UV plane
 //!    Rg8) into a texture array, then per canvas pixel run range-expand ->
 //!    YUV->RGB -> linearize -> primaries convert -> premultiplied-alpha blend in
-//!    a linear `Rgba16Float` canvas.
+//!    a linear `Rgba16Float` canvas. NV12+A tiles (ADR-0058) also upload their
+//!    straight full-resolution alpha into a pooled `R8` texture-array (one layer
+//!    per alpha tile only); the shader multiplies it into the tile opacity at
+//!    the single premultiply step, so alpha is premultiplied exactly once.
 //! 2. **encode** — per canvas pixel run canvas OETF -> RGB->YUV -> range
 //!    compress, writing an `R8` Y plane and a half-res `Rg8` interleaved UV
 //!    plane, read back as an [`Nv12Image`] (invariant #5: stays NV12).
@@ -80,6 +83,9 @@ pub struct GpuCompositor {
     /// ticks). Present only with the `overlay` feature.
     #[cfg(feature = "overlay")]
     overlay: std::sync::Mutex<OverlayResources>,
+    /// Frames the run backend re-composited on the CPU after a genuine GPU
+    /// failure (observability; see `RunBackend::gpu_cpu_fallback_frames`).
+    cpu_fallback_frames: std::sync::atomic::AtomicU64,
 }
 
 /// The overlay sub-pass, its content-keyed image-texture cache, and the
@@ -98,16 +104,30 @@ struct OverlayResources {
     images: wgpu::Texture,
 }
 
-/// Reject alpha before any GPU allocation or submission. The run backend
-/// catches this typed error and composites the frame on the CPU instead.
+/// Extent of the pooled R8 alpha texture-array one composite needs (ADR-0058).
 ///
-/// # Errors
-/// Returns [`Error::GpuAlphaUnsupported`] for any tile with an alpha plane.
-pub fn reject_alpha_tiles(tiles: &[Tile<'_>]) -> Result<()> {
-    if tiles.iter().any(|tile| tile.image.alpha_plane().is_some()) {
-        return Err(Error::GpuAlphaUnsupported);
+/// Only tiles that carry an alpha plane consume a layer, so an all-opaque frame
+/// needs nothing beyond the 1x1x1 placeholder the bind group requires (and
+/// uploads no alpha bytes). The layer count is rounded up to a power of two
+/// (capped at [`MAX_TILES`]) so a scene that gains alpha tiles one at a time
+/// grows the grow-only array O(log n) times, not once per added tile.
+#[must_use]
+pub(crate) fn alpha_array_need(tiles: &[Tile<'_>]) -> Dim3 {
+    let mut count = 0_u32;
+    let mut width = 1_u32;
+    let mut height = 1_u32;
+    for tile in tiles {
+        if tile.image.alpha_plane().is_some() {
+            count = count.saturating_add(1);
+            width = width.max(tile.image.width());
+            height = height.max(tile.image.height());
+        }
     }
-    Ok(())
+    Dim3 {
+        width,
+        height,
+        layers: count.max(1).next_power_of_two().min(MAX_TILES),
+    }
 }
 
 impl GpuCompositor {
@@ -227,7 +247,23 @@ impl GpuCompositor {
             pool: std::sync::Mutex::new(SurfacePool::default()),
             #[cfg(feature = "overlay")]
             overlay,
+            cpu_fallback_frames: std::sync::atomic::AtomicU64::new(0),
         })
+    }
+
+    /// Count one frame the run backend re-composited on the CPU after a GPU
+    /// failure; returns the new total (always `>= 1`).
+    pub(crate) fn record_cpu_fallback(&self) -> u64 {
+        self.cpu_fallback_frames
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            .saturating_add(1)
+    }
+
+    /// Frames re-composited on the CPU after a genuine GPU failure.
+    #[must_use]
+    pub fn cpu_fallback_frames(&self) -> u64 {
+        self.cpu_fallback_frames
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// The number of GPU buffer/texture allocations the surface pool has made
@@ -681,7 +717,6 @@ impl GpuCompositor {
         background: LinearRgba,
         tiles: &[Tile<'_>],
     ) -> Result<()> {
-        reject_alpha_tiles(tiles)?;
         require_even_positive(canvas_w, canvas_h, "canvas")?;
         let tile_count = u32::try_from(tiles.len())
             .map_err(|_| Error::GpuLimit(format!("tile count {} overflows u32", tiles.len())))?;
@@ -699,10 +734,13 @@ impl GpuCompositor {
         let max_w = tiles.iter().map(|t| t.image.width()).max().unwrap_or(2);
         let max_h = tiles.iter().map(|t| t.image.height()).max().unwrap_or(2);
         let mut tile_params: Vec<TileParams> = Vec::with_capacity(tiles.len());
+        // Alpha layers are assigned densely to the alpha tiles only, in slice
+        // order; opaque tiles keep `has_alpha = 0` and never sample the array.
+        let mut next_alpha_layer = 0_u32;
         for tile in tiles {
             let img = tile.image;
             require_even_positive(img.width(), img.height(), "tile")?;
-            tile_params.push(TileParams::build(
+            let params = TileParams::build(
                 tile.dst_x,
                 tile.dst_y,
                 tile.dst_w,
@@ -712,7 +750,30 @@ impl GpuCompositor {
                 tile.opacity,
                 img.color(),
                 canvas,
-            )?);
+            )?;
+            let params = match img.alpha_plane() {
+                Some(alpha) => {
+                    // `AlphaPlanePool::attach` already enforces this; re-check
+                    // so a malformed plane is a typed error, never a wgpu panic.
+                    let expected = usize::try_from(img.width())
+                        .ok()
+                        .zip(usize::try_from(img.height()).ok())
+                        .and_then(|(w, h)| w.checked_mul(h));
+                    if expected != Some(alpha.len()) {
+                        return Err(Error::Geometry(format!(
+                            "alpha plane length {} != {}x{}",
+                            alpha.len(),
+                            img.width(),
+                            img.height()
+                        )));
+                    }
+                    let layer = next_alpha_layer;
+                    next_alpha_layer = next_alpha_layer.saturating_add(1);
+                    params.with_alpha_layer(layer)
+                }
+                None => params,
+            };
+            tile_params.push(params);
         }
         // The texture array must have at least one layer even with zero tiles;
         // pad the params buffer so the storage binding is non-empty (the shader
@@ -728,6 +789,7 @@ impl GpuCompositor {
             alloc_count,
             y_array,
             uv_array,
+            a_array,
             canvas_lin,
             comp_uniform,
             tile_buf,
@@ -768,7 +830,38 @@ impl GpuCompositor {
         });
         let uv_array_view = uv_tex.create_view(&wgpu::TextureViewDescriptor::default());
 
-        // --- upload each tile's NV12 planes into its layer -------------------
+        // Straight R8 alpha array (ADR-0058): grow-only on the max ALPHA-tile
+        // extent + alpha-tile count; a 1x1x1 placeholder while every tile is
+        // opaque (the bind group must be complete, the shader never samples it).
+        let a_tex = SurfacePool::grow_texture(a_array, alloc_count, alpha_array_need(tiles), |d| {
+            tile_plane_texture(
+                device,
+                "multiview tile alpha planes",
+                d,
+                wgpu::TextureFormat::R8Unorm,
+            )
+        });
+        // Explicit `D2Array`: the 1-layer placeholder's default view would be `D2`
+        // and fail the bind-group layout (caught on a real adapter).
+        let a_array_view = a_tex.create_view(&wgpu::TextureViewDescriptor {
+            dimension: Some(wgpu::TextureViewDimension::D2Array),
+            ..wgpu::TextureViewDescriptor::default()
+        });
+
+        // --- upload each tile's NV12 (+ alpha, when present) planes ----------
+        for (params, tile) in tile_params.iter().zip(tiles) {
+            if let (Some(layer), Some(alpha)) = (params.alpha_layer(), tile.image.alpha_plane()) {
+                write_tile_plane(
+                    queue,
+                    a_tex,
+                    layer,
+                    tile.image.width(),
+                    tile.image.height(),
+                    1,
+                    alpha,
+                );
+            }
+        }
         for (layer, tile) in tiles.iter().enumerate() {
             let img = tile.image;
             let layer_u32 = u32::try_from(layer)
@@ -852,6 +945,10 @@ impl GpuCompositor {
                 wgpu::BindGroupEntry {
                     binding: 4,
                     resource: wgpu::BindingResource::TextureView(&canvas_lin_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 5,
+                    resource: wgpu::BindingResource::TextureView(&a_array_view),
                 },
             ],
         });
@@ -1361,6 +1458,17 @@ fn composite_bind_group_layout(device: &wgpu::Device) -> wgpu::BindGroupLayout {
                 },
                 count: None,
             },
+            // Straight R8 per-pixel alpha layers for NV12+A tiles (ADR-0058).
+            wgpu::BindGroupLayoutEntry {
+                binding: 5,
+                visibility: wgpu::ShaderStages::COMPUTE,
+                ty: wgpu::BindingType::Texture {
+                    sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                    view_dimension: wgpu::TextureViewDimension::D2Array,
+                    multisampled: false,
+                },
+                count: None,
+            },
         ],
     })
 }
@@ -1412,4 +1520,108 @@ fn encode_bind_group_layout(device: &wgpu::Device) -> wgpu::BindGroupLayout {
             },
         ],
     })
+}
+
+#[cfg(test)]
+mod alpha_tests {
+    use std::sync::Arc;
+
+    use multiview_core::color::{
+        ColorInfo, ColorPrimaries, ColorRange, MatrixCoefficients, TransferCharacteristic,
+    };
+
+    use super::{alpha_array_need, Dim3, MAX_TILES};
+    use crate::gpu::uniforms::TileParams;
+    use crate::pipeline::{AlphaPlanePool, CanvasColor, Nv12Image, Tile};
+
+    fn color() -> ColorInfo {
+        ColorInfo {
+            primaries: ColorPrimaries::Bt709,
+            transfer: TransferCharacteristic::Bt709,
+            matrix: MatrixCoefficients::Bt709,
+            range: ColorRange::Limited,
+        }
+    }
+
+    fn opaque(w: u32, h: u32) -> Nv12Image {
+        Nv12Image::solid(w, h, 180, 128, 128, color()).expect("solid")
+    }
+
+    #[test]
+    fn opaque_frame_needs_only_the_placeholder_layer() {
+        let a = opaque(64, 32);
+        let b = opaque(16, 16);
+        let tiles = [Tile::placed(&a, 0, 0, 1.0), Tile::placed(&b, 0, 0, 0.5)];
+        assert_eq!(
+            alpha_array_need(&tiles),
+            Dim3 {
+                width: 1,
+                height: 1,
+                layers: 1
+            }
+        );
+        assert_eq!(
+            alpha_array_need(&[]),
+            Dim3 {
+                width: 1,
+                height: 1,
+                layers: 1
+            }
+        );
+    }
+
+    #[test]
+    fn alpha_need_covers_only_alpha_tiles_and_rounds_layers() {
+        let pool = Arc::new(AlphaPlanePool::default());
+        let big_opaque = opaque(128, 128);
+        let alpha_a = pool
+            .attach(opaque(32, 16), &[128; 32 * 16])
+            .expect("alpha a");
+        let alpha_b = pool.attach(opaque(8, 24), &[64; 8 * 24]).expect("alpha b");
+        let alpha_c = pool
+            .attach(opaque(2, 2), &[0, 255, 0, 255])
+            .expect("alpha c");
+        let tiles = [
+            Tile::placed(&big_opaque, 0, 0, 1.0),
+            Tile::placed(&alpha_a, 0, 0, 1.0),
+            Tile::placed(&alpha_b, 0, 0, 1.0),
+            Tile::placed(&alpha_c, 0, 0, 1.0),
+        ];
+        // The opaque 128x128 tile does not inflate the alpha array; three alpha
+        // tiles round up to four layers (grow O(log n), never per added tile).
+        assert_eq!(
+            alpha_array_need(&tiles),
+            Dim3 {
+                width: 32,
+                height: 24,
+                layers: 4
+            }
+        );
+    }
+
+    #[test]
+    fn alpha_layer_count_is_capped_at_max_tiles() {
+        let pool = Arc::new(AlphaPlanePool::default());
+        let imgs: Vec<Nv12Image> = (0..MAX_TILES)
+            .map(|_| pool.attach(opaque(2, 2), &[255; 4]).expect("alpha"))
+            .collect();
+        let tiles: Vec<Tile<'_>> = imgs.iter().map(|i| Tile::placed(i, 0, 0, 1.0)).collect();
+        assert_eq!(alpha_array_need(&tiles).layers, MAX_TILES);
+    }
+
+    #[test]
+    fn tile_params_carry_alpha_in_spare_lanes_without_touching_geometry() {
+        let base = TileParams::build(4, 6, 20, 10, 8, 8, 0.75, color(), CanvasColor::default())
+            .expect("params");
+        assert_eq!(base.alpha_layer(), None);
+        assert_eq!(base.dst_size, [20, 10, 0, 0]);
+        let with = base.with_alpha_layer(3);
+        assert_eq!(with.alpha_layer(), Some(3));
+        assert_eq!(with.dst_size, [20, 10, 1, 3]);
+        // Layer 0 is a real layer, distinct from "opaque".
+        assert_eq!(base.with_alpha_layer(0).alpha_layer(), Some(0));
+        assert_eq!(with.placement, base.placement);
+        assert_eq!(with.opacity_transfer, base.opacity_transfer);
+        assert_eq!(core::mem::size_of::<TileParams>(), 160, "no struct growth");
+    }
 }

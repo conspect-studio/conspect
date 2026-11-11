@@ -249,3 +249,130 @@ async fn authored_output_ids_preserve_rest_identity_and_ambiguous_file_edits_fai
         ["new-output", "operator-output"]
     );
 }
+
+#[tokio::test]
+async fn weather_locations_commit_to_the_desired_record() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("boot.toml");
+    std::fs::write(&path, BOOT).unwrap();
+    let config = MultiviewConfig::load_from_toml(BOOT).unwrap();
+    let seeded = multiview_control::seed_resources(&config).unwrap();
+    let publisher = Arc::new(EnginePublisher::<EngineStateSnapshot, Event>::new(64));
+    let (sender, _receiver) = command_bus(64);
+    let state = AppState::new(
+        publisher,
+        sender,
+        Arc::new(InMemoryRepository::new()),
+        Arc::new(support::seeded_keys()),
+    )
+    .with_seeded_resources(seeded)
+    .with_base_document(serde_json::to_value(&config).unwrap())
+    .with_boot_model(Arc::new(BootModel::new(
+        path.clone(),
+        config.clone(),
+        config,
+        StartMode::Boot,
+        false,
+        None,
+    )));
+    let router = multiview_control::router(state);
+    let body = json!({
+        "name": "Sydney",
+        "forecast_product": "IDN11060",
+        "aac": "NSW_PT131",
+        "observation_product": "IDN60920",
+        "station_wmo": "94768"
+    });
+    let resp = send(
+        &router,
+        put_json("/api/v1/weather/locations/sydney", ADMIN_TOKEN, None, &body),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let desired = load_desired(&path).unwrap().unwrap();
+    let saved = desired.config.weather.location("sydney").unwrap();
+    assert_eq!(saved.aac, "NSW_PT131");
+    assert_eq!(saved.station_wmo.as_deref(), Some("94768"));
+    // A later unrelated source commit keeps the weather section.
+    let src = json!({"name":"S", "body":{"id":"in_b", "kind":"bars"}});
+    let resp = send(
+        &router,
+        support::post_json("/api/v1/sources/in_b", ADMIN_TOKEN, &src),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let desired = load_desired(&path).unwrap().unwrap();
+    assert!(desired.config.weather.location("sydney").is_some());
+}
+
+#[tokio::test]
+async fn graphics_section_commits_to_the_desired_record() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("boot.toml");
+    std::fs::write(&path, BOOT).unwrap();
+    let config = MultiviewConfig::load_from_toml(BOOT).unwrap();
+    let seeded = multiview_control::seed_resources(&config).unwrap();
+    let publisher = Arc::new(EnginePublisher::<EngineStateSnapshot, Event>::new(64));
+    let (sender, _receiver) = command_bus(64);
+    let state = AppState::new(
+        publisher,
+        sender,
+        Arc::new(InMemoryRepository::new()),
+        Arc::new(support::seeded_keys()),
+    )
+    .with_seeded_resources(seeded)
+    .with_base_document(serde_json::to_value(&config).unwrap())
+    .with_boot_model(Arc::new(BootModel::new(
+        path.clone(),
+        config.clone(),
+        config,
+        StartMode::Boot,
+        false,
+        None,
+    )))
+    .with_graphics(multiview_graphics::GraphicsHub::default());
+    let router = multiview_control::router(state);
+    let ds = json!({"name":"Sydney","kind":"bom_weather","forecast_product":"IDN11060","aac":"NSW_PT131"});
+    let resp = send(
+        &router,
+        put_json(
+            "/api/v1/graphics/data-sources/sydney",
+            ADMIN_TOKEN,
+            None,
+            &ds,
+        ),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let item = json!({"name":"Syd","template":"weather.seven_day","data_source":"sydney"});
+    let resp = send(
+        &router,
+        put_json("/api/v1/graphics/items/syd7", ADMIN_TOKEN, None, &item),
+    )
+    .await;
+    let status = resp.status();
+    assert_eq!(
+        status,
+        StatusCode::CREATED,
+        "{}",
+        support::body_json(resp).await
+    );
+    let resp = send(
+        &router,
+        put_json(
+            "/api/v1/graphics/channels/gfx-channel-1/rundown",
+            ADMIN_TOKEN,
+            None,
+            &json!({"rundown":["syd7"]}),
+        ),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let desired = load_desired(&path).unwrap().unwrap();
+    let g = &desired.config.graphics;
+    assert_eq!(g.data_sources[0].provider.tag(), "bom_weather");
+    assert_eq!(g.items[0].id, "syd7");
+    assert_eq!(g.channels[0].rundown, vec!["syd7".to_owned()]);
+    // Mirrored for rollback compatibility.
+    assert!(desired.config.weather.location("sydney").is_some());
+}
