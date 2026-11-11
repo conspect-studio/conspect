@@ -1054,7 +1054,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ${{ env.FF_PREFIX }}
-          key: ffmpeg-apple-${{ runner.arch }}-${{ steps.brewdeps.outputs.v }}-${{ hashFiles('deploy/ffmpeg-build.sh', 'deploy/ffmpeg-fetch-source.sh', 'deploy/ffmpeg-patches/**', 'deploy/Dockerfile.ffmpeg', '.github/workflows/ci.yml') }}
+          key: ffmpeg-apple-${{ runner.arch }}-${{ steps.brewdeps.outputs.v }}-${{ hashFiles('deploy/ffmpeg-build.sh', 'deploy/ffmpeg-fetch-source.sh', 'deploy/ffmpeg-signing-key.asc', 'deploy/ffmpeg-patches/**', 'deploy/Dockerfile.ffmpeg', '.github/workflows/ci.yml') }}
       - name: Build pinned FFmpeg (apple profile)
         if: steps.ffcache.outputs.cache-hit != 'true'
         run: |
