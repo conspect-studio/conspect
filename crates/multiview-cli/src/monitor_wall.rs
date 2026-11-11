@@ -169,6 +169,7 @@ pub fn assign_cells(config: &WallConfig, ids: &[String]) -> Vec<WallCell> {
             y: (index / config.columns) * config.cell_height,
             w: config.cell_width,
             h: config.cell_height,
+            live: false,
         })
         .collect()
 }
@@ -324,6 +325,7 @@ fn spawn_inner(
                 geometry,
                 generation: 0,
                 cells: Vec::new(),
+                live_changed: false,
                 #[cfg(test)]
                 hook,
             };
@@ -346,6 +348,8 @@ struct Run {
     geometry: WallSlot,
     generation: u64,
     cells: Vec<WallCell>,
+    /// A cell's `live` flag changed since the last published geometry.
+    live_changed: bool,
     #[cfg(test)]
     hook: Option<FrameHook>,
 }
@@ -453,18 +457,28 @@ impl Run {
 
     /// Returns true when the cell assignment changed.
     fn refresh_cells(&mut self) -> bool {
-        // Only sources that have ever produced a frame get a cell: a source with
-        // no picture keeps its own still/"starting" surface on the desk rather
-        // than a black live tile.
-        let ids: Vec<String> = self
-            .stores
-            .load()
-            .iter()
-            .filter(|(_, store)| store.slot().load().is_some())
-            .map(|(id, _)| id.clone())
-            .collect();
-        let cells = assign_cells(&self.config, &ids);
-        if cells == self.cells {
+        // The layout is every configured source, so a source that warms up or
+        // idles never reshapes the wall (which would reopen the encoder and end
+        // every viewer's lease). Whether a cell has a picture is published per
+        // cell as `live`, without a new generation.
+        let snapshot = self.stores.load();
+        let ids: Vec<String> = snapshot.keys().cloned().collect();
+        let mut cells = assign_cells(&self.config, &ids);
+        for cell in &mut cells {
+            cell.live = snapshot
+                .get(&cell.source)
+                .is_some_and(|store| store.slot().load().is_some());
+        }
+        let layout_changed = cells.len() != self.cells.len()
+            || cells
+                .iter()
+                .zip(&self.cells)
+                .any(|(a, b)| (&a.source, a.x, a.y, a.w, a.h) != (&b.source, b.x, b.y, b.w, b.h));
+        if !layout_changed {
+            if cells != self.cells {
+                self.cells = cells;
+                self.live_changed = true;
+            }
             return false;
         }
         self.cells = cells;
@@ -472,11 +486,12 @@ impl Run {
         true
     }
 
-    fn publish_geometry(&self) {
-        let fresh = self
-            .geometry
-            .load()
-            .is_none_or(|current| current.generation != self.generation);
+    fn publish_geometry(&mut self) {
+        let fresh = std::mem::take(&mut self.live_changed)
+            || self
+                .geometry
+                .load()
+                .is_none_or(|current| current.generation != self.generation);
         if fresh {
             self.geometry.store(Some(Arc::new(WallGeometry {
                 generation: self.generation,
@@ -696,6 +711,7 @@ mod tests {
             geometry: crate::preview::wall_slot(),
             generation: 0,
             cells: Vec::new(),
+            live_changed: false,
             hook: None,
         }
         .frame_period();
@@ -760,7 +776,7 @@ mod tests {
     }
 
     #[test]
-    fn a_source_without_any_frame_gets_no_cell() {
+    fn a_cold_source_keeps_its_cell_and_warming_up_never_reshapes_the_wall() {
         let color = ColorInfo::default().resolve_defaults(64, 36);
         let live = Arc::new(multiview_framestore::TileStore::<Nv12Image>::with_defaults(
             "live",
@@ -769,14 +785,12 @@ mod tests {
             Nv12Image::solid(64, 36, 90, 128, 128, color).unwrap(),
             multiview_core::time::MediaTime::ZERO,
         );
+        let cold = Arc::new(multiview_framestore::TileStore::<Nv12Image>::with_defaults(
+            "cold",
+        ));
         let mut map = std::collections::HashMap::new();
         map.insert("live".to_owned(), live);
-        map.insert(
-            "cold".to_owned(),
-            Arc::new(multiview_framestore::TileStore::<Nv12Image>::with_defaults(
-                "cold",
-            )),
-        );
+        map.insert("cold".to_owned(), cold.clone());
         let mut run = Run {
             publisher: None,
             config: WallConfig::default(),
@@ -785,15 +799,28 @@ mod tests {
             geometry: crate::preview::wall_slot(),
             generation: 0,
             cells: Vec::new(),
+            live_changed: false,
             hook: None,
         };
-        assert!(run.refresh_cells());
-        let sources: Vec<&str> = run.cells.iter().map(|c| c.source.as_str()).collect();
-        assert_eq!(
-            sources,
-            vec!["live"],
-            "a cold source keeps its still, not a black tile"
+        assert!(run.refresh_cells(), "first layout");
+        let generation = run.generation;
+        let flags: Vec<(&str, bool)> = run
+            .cells
+            .iter()
+            .map(|c| (c.source.as_str(), c.live))
+            .collect();
+        assert_eq!(flags, vec![("cold", false), ("live", true)]);
+        // The cold source produces its first frame: same layout, same
+        // generation (no encoder reopen, no lease churn), only `live` flips.
+        cold.publish(
+            Nv12Image::solid(64, 36, 90, 128, 128, color).unwrap(),
+            multiview_core::time::MediaTime::ZERO,
         );
+        assert!(!run.refresh_cells(), "warming up is not a layout change");
+        assert_eq!(run.generation, generation);
+        assert!(run.cells.iter().all(|c| c.live));
+        run.publish_geometry();
+        assert!(run.geometry.load().unwrap().cells.iter().all(|c| c.live));
     }
 
     #[test]

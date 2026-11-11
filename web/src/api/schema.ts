@@ -8215,6 +8215,12 @@ export interface components {
              * @description Height in coded pixels.
              */
             h: number;
+            /**
+             * @description Whether this cell currently carries a picture. A cell without one is
+             *     black in the wall; its surface shows the source's own still instead.
+             *     Excluded from layout identity: it changes without a new generation.
+             */
+            live: boolean;
             /** @description Source (input) id whose newest frame fills this rectangle. */
             source: string;
             /**

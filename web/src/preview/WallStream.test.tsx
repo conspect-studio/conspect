@@ -15,6 +15,8 @@ describe('wall geometry helpers', () => {
     expect(findCell(geometry, 'zzz')).toBeUndefined();
     expect(findCell(geometry, null)).toBeUndefined();
     expect(findCell(undefined, 'a')).toBeUndefined();
+    const cold = { ...geometry, cells: [{ source: 'a', x: 0, y: 0, w: 320, h: 180, live: false }] };
+    expect(findCell(cold, 'a')).toBeUndefined();
   });
   it('computes and clamps the crop rectangle', () => {
     expect(cropRect(geometry.cells[1]!, 640, 360)).toEqual([320, 0, 320, 180]);
