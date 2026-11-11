@@ -25,6 +25,14 @@ export interface WallSurface {
   readonly previewSource: string | null;
 }
 
+/** Whole-wall state for the desk note: live, or the reason surfaces show stills. */
+// eslint-disable-next-line react-refresh/only-export-components -- hook colocated with its context
+export function useWallStatus(): { readonly live: boolean; readonly reason: string | undefined } {
+  const store = useContext(WallContext);
+  const snapshot = useSyncExternalStore(store?.subscribeState ?? noopSubscribe, store?.getSnapshot ?? (() => NONE));
+  return { live: snapshot.geometry !== undefined, reason: snapshot.reason };
+}
+
 /** Live state of one surface: true only when the wall is streaming and the cell exists. */
 // eslint-disable-next-line react-refresh/only-export-components -- hook colocated with its context
 export function useWallSurface(source: string | null | undefined): WallSurface {

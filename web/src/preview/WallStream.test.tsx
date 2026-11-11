@@ -1,6 +1,6 @@
 import { act, render, screen } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { WallStreamProvider, WallCrop, useWallSurface } from './WallStream';
+import { WallStreamProvider, WallCrop, useWallStatus, useWallSurface } from './WallStream';
 import type { WallDeps } from './wallStore';
 import { WallUnavailable, cropRect, findCell, type WallGeometry } from './wallApi';
 
@@ -116,5 +116,15 @@ describe('WallStreamProvider', () => {
     // 0 s, +5 s, +10 s: three probes in 20 s, not ten.
     expect(fetchWall.mock.calls.length).toBeLessThanOrEqual(3);
     expect(screen.getByTestId('still-a')).toBeTruthy();
+  });
+
+  it('states why the wall is on stills when the live session fails', async () => {
+    const d = deps();
+    const failing = (() => Promise.reject(new Error('remote error: 2 (unauthorized)'))) as unknown as WallDeps['play'];
+    d.value = { ...d.value, play: failing };
+    function Reason() { const w = useWallStatus(); return <span data-testid="reason">{w.live ? 'live' : w.reason ?? ''}</span>; }
+    render(<WallStreamProvider deps={d.value}><Reason /></WallStreamProvider>);
+    await act(async () => { await vi.advanceTimersByTimeAsync(100); });
+    expect(screen.getByTestId('reason').textContent).toContain('unauthorized');
   });
 });

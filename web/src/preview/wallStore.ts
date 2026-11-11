@@ -36,6 +36,8 @@ const DEFAULT_DEPS: WallDeps = { fetchWall, play: startMoqPlaybackWithRefresh, c
 export interface WallSnapshot {
   /** Geometry is only exposed while frames are flowing; undefined means "use stills". */
   readonly geometry: WallGeometry | undefined;
+  /** Why surfaces show stills (undefined while live or still connecting). */
+  readonly reason?: string | undefined;
 }
 
 export function isAborted(s: AbortSignal): boolean { return s.aborted; }
@@ -61,6 +63,7 @@ export class WallStore {
   private wake: (() => void) | undefined;
   private watch: ReturnType<typeof setInterval> | undefined;
   private failures = 0;
+  private reason: string | undefined;
   readonly stats: WallStats = { frames: 0, lastFrameAt: 0, sessions: 0, decoders: 0, gapsOver500ms: 0, maxGapMs: 0 };
 
   constructor(private readonly deps: WallDeps = DEFAULT_DEPS) {}
@@ -104,8 +107,9 @@ export class WallStore {
   private publish(): void {
     const live = this.geometry !== undefined && this.lastFrameAt !== undefined && performance.now() - this.lastFrameAt <= WALL_STALE_MS;
     const geometry = live ? this.geometry : undefined;
-    if (geometry === this.snapshot.geometry) return;
-    this.snapshot = { geometry };
+    const reason = live ? undefined : this.reason;
+    if (geometry === this.snapshot.geometry && reason === this.snapshot.reason) return;
+    this.snapshot = { geometry, reason };
     for (const listener of [...this.stateListeners]) listener();
   }
 
@@ -119,6 +123,7 @@ export class WallStore {
       if (gap > this.stats.maxGapMs) this.stats.maxGapMs = gap;
     }
     this.lastFrameAt = now;
+    this.reason = undefined;
     this.stats.frames += 1;
     this.stats.lastFrameAt = Date.now();
     this.failures = 0;
@@ -144,6 +149,7 @@ export class WallStore {
         const next = await this.deps.fetchWall(signal);
         if (isAborted(signal)) return;
         unavailable = 0;
+        if (this.reason?.startsWith('wall unavailable')) this.reason = undefined;
         if (this.geometry !== undefined && next.generation !== this.geometry.generation) {
           // New layout: never crop a frame of the old layout with new cells. Drop
           // the old frame and session first; surfaces show stills until a frame
@@ -154,8 +160,9 @@ export class WallStore {
         this.geometry = next;
         this.wake?.();
         this.publish();
-      } catch {
+      } catch (error) {
         if (isAborted(signal)) return;
+        this.reason = error instanceof Error ? error.message : 'wall unavailable';
         // Wall unavailable (off, scoped, starting): stills, and back off so a
         // server without a wall is not polled every two seconds forever.
         this.geometry = undefined;
@@ -198,7 +205,10 @@ export class WallStore {
         });
       } catch (error) {
         failed = !isAborted(aborted);
-        if (failed) this.stats.lastError = error instanceof Error ? `${error.name}: ${error.message}` : String(error);
+        if (failed) {
+          this.stats.lastError = error instanceof Error ? `${error.name}: ${error.message}` : String(error);
+          this.reason = `live stream failed (${this.stats.lastError})`;
+        }
       }
       this.session = undefined;
       this.playingGeneration = undefined;

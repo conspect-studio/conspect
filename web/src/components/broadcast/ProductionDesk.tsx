@@ -21,7 +21,7 @@ import { meterFillPercent, useAudioMeter } from '../../realtime/useAudioMeter';
 import { usePreviewCapabilities, whepAvailable } from '../../preview/capabilities';
 import { PreviewSurface } from '../../preview/PreviewSurface';
 import { useJpegStill } from '../../preview/useJpegPreview';
-import { WallCrop, WallStreamProvider, useWallSurface } from '../../preview/WallStream';
+import { WallCrop, WallStreamProvider, useWallStatus, useWallSurface } from '../../preview/WallStream';
 import { Dialog, DialogContent, DialogTitle } from '../ui/dialog';
 import { useOperationFeedback, useSubmitTrackedOperation } from './useOperationFeedback';
 import { OperationFeedback } from './OperationFeedback';
@@ -81,6 +81,12 @@ function SourcePicture({ id }: { readonly id: string }): JSX.Element {
 /** Real bus state and correlated commands inside the approved desk composition. */
 export function ProductionDesk(): JSX.Element {
   return <WallStreamProvider><ProductionDeskBody /></WallStreamProvider>;
+}
+
+function WallNote() {
+  const wall = useWallStatus();
+  if (wall.live) return <p className="bd-still-note" data-testid="wall-live-note"><Trans>Wall tiles are live video from one shared MoQ stream; a tile without a live cell shows its still.</Trans></p>;
+  return <p className="bd-still-note" data-testid="wall-still-note"><Trans>Wall tiles are still previews refreshed every ~2 s — not live video.</Trans>{wall.reason ? <> <span data-testid="wall-still-reason">({wall.reason})</span></> : null}</p>;
 }
 
 function ProductionDeskBody(): JSX.Element {
@@ -156,7 +162,7 @@ function ProductionDeskBody(): JSX.Element {
     <div className="bd-desk-grid">
       <PreviewMonitor program source={name(state.data?.program_source)} fresh={fresh && status === 'open'} />
       <PreviewMonitor program={false} source={name(state.data?.preview_source)} fresh={fresh && status === 'open'} />
-      <section className="bd-wall"><h2><Trans>Multiview wall</Trans></h2><div className="bd-wall-grid">{sources.data?.map((source) => <div className="bd-wall-tile" key={source.id} data-tile-state={tileForSource(tiles, source.id)?.state ?? 'unknown'} data-tally={tallyForSource(source.id, state.data, fresh && status === 'open')}><SourcePicture id={source.id} /><small>{tallyGlyph(tallyForSource(source.id, state.data, fresh && status === 'open'))}</small><b>{source.name}</b><span><TileLabel tile={tileForSource(tiles, source.id)} /></span></div>)}</div><p className="bd-still-note" data-testid="wall-still-note"><Trans>Wall tiles are still previews refreshed every ~2 s — not live video.</Trans></p><p>{sources.isError ? t`Source catalog unavailable` : !sources.data?.length ? t`No source catalog available` : t`Tally follows the engine bus IDs; source presence does not prove signal.`}</p><p><Trans>Layouts</Trans>: {layouts.isError ? t`Unavailable` : layouts.data?.length ?? '—'} · <Trans>Observed tiles</Trans>: {tilesKnown ? tiles.size : '—'} · <Link className="bd-link48" to="/monitoring"><Trans>Open live monitoring</Trans></Link></p></section>
+      <section className="bd-wall"><h2><Trans>Multiview wall</Trans></h2><div className="bd-wall-grid">{sources.data?.map((source) => <div className="bd-wall-tile" key={source.id} data-tile-state={tileForSource(tiles, source.id)?.state ?? 'unknown'} data-tally={tallyForSource(source.id, state.data, fresh && status === 'open')}><SourcePicture id={source.id} /><small>{tallyGlyph(tallyForSource(source.id, state.data, fresh && status === 'open'))}</small><b>{source.name}</b><span><TileLabel tile={tileForSource(tiles, source.id)} /></span></div>)}</div><WallNote /><p>{sources.isError ? t`Source catalog unavailable` : !sources.data?.length ? t`No source catalog available` : t`Tally follows the engine bus IDs; source presence does not prove signal.`}</p><p><Trans>Layouts</Trans>: {layouts.isError ? t`Unavailable` : layouts.data?.length ?? '—'} · <Trans>Observed tiles</Trans>: {tilesKnown ? tiles.size : '—'} · <Link className="bd-link48" to="/monitoring"><Trans>Open live monitoring</Trans></Link></p></section>
       <section className="bd-switcher"><h2><Trans>M/E 1 — Switcher</Trans></h2>
         <div className="bd-buses">{(['preview', 'program'] as const).map((bus) => <div className={`bd-bus bd-bus-${bus}`} key={bus} role="group" aria-label={bus === 'program' ? t`PGM bus — direct taps always confirm` : t`PVW bus`}><b>{bus === 'program' ? 'PGM' : 'PVW'}</b><div>{sources.data?.map((source, index) => <button key={source.id} disabled={disabled} title={reason ? `${source.name} — ${reason}` : source.name} aria-pressed={tallyForSource(source.id, state.data, fresh && status === 'open') === bus} onClick={() => { request(bus === 'program' ? 'select_program' : 'select_preview', source.id); }}><span className="bd-key-name">{source.name}</span><i className="bd-idx" aria-hidden="true">{index + 1}</i></button>)}{!sources.data?.length && <span><Trans>No sources available</Trans></span>}</div></div>)}</div>
         <div className="bd-takes"><div className="bd-transitions" role="group" aria-label={t`Transition type — unavailable`}><button disabled aria-pressed="true" title={t`AUTO unavailable: the current engine rejects AUTO with HTTP 422`}>MIX</button><button disabled title={t`WIPE and DIP have no supported control contract`}>WIPE</button><button disabled title={t`WIPE and DIP have no supported control contract`}>DIP</button></div><button className="bd-auto" disabled title={t`AUTO unavailable: the current engine rejects AUTO with HTTP 422`} onClick={() => { request('auto'); }}>AUTO</button><div className="bd-cutrow"><button className="bd-cut" disabled={disabled} aria-describedby="bd-cut-src" onClick={() => { request('cut'); }}>CUT<span aria-hidden="true" className="bd-cut-src"> · {name(state.data?.preview_source) ?? t`source unknown`}</span></button><span id="bd-cut-src" className="sr-only">{t`Cuts to`} {name(state.data?.preview_source) ?? t`unknown source`}</span></div></div>

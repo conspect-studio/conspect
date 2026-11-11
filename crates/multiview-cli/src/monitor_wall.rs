@@ -453,7 +453,16 @@ impl Run {
 
     /// Returns true when the cell assignment changed.
     fn refresh_cells(&mut self) -> bool {
-        let ids: Vec<String> = self.stores.load().keys().cloned().collect();
+        // Only sources that have ever produced a frame get a cell: a source with
+        // no picture keeps its own still/"starting" surface on the desk rather
+        // than a black live tile.
+        let ids: Vec<String> = self
+            .stores
+            .load()
+            .iter()
+            .filter(|(_, store)| store.slot().load().is_some())
+            .map(|(id, _)| id.clone())
+            .collect();
         let cells = assign_cells(&self.config, &ids);
         if cells == self.cells {
             return false;
@@ -751,6 +760,43 @@ mod tests {
     }
 
     #[test]
+    fn a_source_without_any_frame_gets_no_cell() {
+        let color = ColorInfo::default().resolve_defaults(64, 36);
+        let live = Arc::new(multiview_framestore::TileStore::<Nv12Image>::with_defaults(
+            "live",
+        ));
+        live.publish(
+            Nv12Image::solid(64, 36, 90, 128, 128, color).unwrap(),
+            multiview_core::time::MediaTime::ZERO,
+        );
+        let mut map = std::collections::HashMap::new();
+        map.insert("live".to_owned(), live);
+        map.insert(
+            "cold".to_owned(),
+            Arc::new(multiview_framestore::TileStore::<Nv12Image>::with_defaults(
+                "cold",
+            )),
+        );
+        let mut run = Run {
+            publisher: None,
+            config: WallConfig::default(),
+            cadence: Rational::new(15, 1),
+            stores: crate::live_sources::shared_stores(map),
+            geometry: crate::preview::wall_slot(),
+            generation: 0,
+            cells: Vec::new(),
+            hook: None,
+        };
+        assert!(run.refresh_cells());
+        let sources: Vec<&str> = run.cells.iter().map(|c| c.source.as_str()).collect();
+        assert_eq!(
+            sources,
+            vec!["live"],
+            "a cold source keeps its still, not a black tile"
+        );
+    }
+
+    #[test]
     fn a_dead_worker_withdraws_the_geometry() {
         let geometry = crate::preview::wall_slot();
         {
@@ -1001,6 +1047,10 @@ segment_ms = 1000
         let added = Arc::new(multiview_framestore::TileStore::<Nv12Image>::with_defaults(
             "b",
         ));
+        added.publish(
+            Nv12Image::solid(64, 36, 60, 128, 128, color).unwrap(),
+            multiview_core::time::MediaTime::ZERO,
+        );
         stores_handle.rcu(|map| {
             let mut next = (**map).clone();
             next.insert("b".to_owned(), added.clone());
