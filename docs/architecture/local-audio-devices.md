@@ -58,13 +58,27 @@ device callback ──push──▶ [SPSC ring, ~200 ms] ──pop──▶ pump
   - Reset: on open, reopen or a store re-sync (unread jumps by more than 100 ms), the servo
     integrator and the resampler phase reset, and the pump re-primes the prebuffer.
   - Result: a device crystal that is fast or slow against the output clock is absorbed, and the
-    store neither drains nor overflows. A stall drains the cushion to silence (gap-free read);
-    the burst after it is dropped down to the target by the store's drop-oldest bound.
+    store neither drains nor overflows.
+- **Stale audio is never published (re-anchor).** The store's drop-oldest bound (1 s) is far
+  above the target, so it does not shed a post-stall burst, and a ±500 ppm servo would take
+  minutes. The pump therefore re-anchors itself:
+  - If its own wake-up gap exceeds 50 ms, or the ring's overflow counter moved, everything in the
+    ring is stale: the pump pops and discards it, resets the servo and resampler phase, and
+    re-primes from fresh callback frames.
+  - If `unread_frames` exceeds target + 100 ms (for example, the program bus paused reading), the
+    pump discards incoming frames until unread is back at the target, then resets the servo.
+  - Discarded frames are counted (`stale_discard_frames`). Only the pump does this; the store's
+    read cursor stays owned by the consumer.
+  - Test: after a pump stall of 50 ms to 5 s, the age of the first published sample is under
+    target + 20 ms, and the budget below holds again within 100 ms.
 - **Latency budget:** device buffer (≈10 ms) + pump wake-up (≤5 ms) + servo target (80 ms) ≈
   95 ms constant from microphone to program bus, with ±10 ms variance. It is compensated with the
   existing per-source audio offset trim where the source is paired with video; a dedicated
   automatic lip-sync is not in scope.
-- **Store:** `AudioStore::live(48 kHz, capacity ≈ 1 s, prebuffer ≈ 60 ms)`. A read is gap-free:
+- **Store:** `AudioStore::live(48 kHz, capacity ≈ 1 s, prebuffer ≈ 60 ms)`. The pump publishes at
+  most every 10 ms (two pump wakes per publish); each publish copies the retained window once
+  (copy-on-write). The simulated-device tests measure the pump's CPU time and allocation rate at
+  this cadence. A read is gap-free:
   silence for anything not written. A stalled or lost device reads as silence, and the picture and
   the tick do not change.
 
@@ -78,19 +92,29 @@ program bus ──push (wait-free)──▶ [engine→drain SPSC ring, ~200 ms] 
 - **Engine side:** each tick pushes its program audio into the engine→drain ring. Wait-free. If the
   ring is full (the drain is stalled), the new block is dropped and `engine_drop_frames` counts it.
   The engine never takes a lock.
+- **The engine→drain ring is long-lived:** one per output, created at output start and never
+  replaced. The device callback never touches it, so stream generations do not affect it, and the
+  engine's push target never changes. During close, backoff and reopen, the drain keeps popping it
+  and discards what it pops (the device is not playing), so the engine push stays bounded and drops
+  nothing on its side. Only the device ring is per generation (section 4).
 - **Drain** (a new loop in `multiview-audio-device`; it reuses `BufferServo`, `AdaptiveResampler`
   and `ChannelMatrix`, not the HDMI `drain_loop`, which depends on a PCM that blocks to pace it):
   - It is **device-paced**: it wakes every 5 ms (bounded sleep, stop-flag aware, so stall detection
     and stop are always reachable), and tops the device ring up to its target only when the fill
     is below it. The callback pop rate is the pace, so the drain cannot over-produce, whatever its
     own wake-up jitter.
-  - **Stale backlog is dropped, oldest first.** The engine push drops only as an isolation safety
-    valve (ring full). On any engine drop, or when the engine→drain fill exceeds target + 100 ms,
-    the drain pops and discards the oldest frames down to the target and resets the servo, so a
-    transient drain stall never leaves audio late against picture (the same policy as the HDMI
-    FIFO: a late reader gets fresh audio, not backlog).
-  - The servo holds the engine→drain ring's fill near its target, so the engine clock and the
-    device clock are matched within ±500 ppm (the sign and reset rules are those of section 2).
+  - **Stale backlog is never played (re-anchor).** The engine push drops only as an isolation
+    safety valve (ring full), and what it drops is the newest audio. So on any engine drop, or a
+    drain wake-up gap over 50 ms, everything in the engine→drain ring and the pending partial output
+    is stale: the drain discards all of it, resets the servo and resampler phase, and re-primes from
+    the next fresh engine frames. When the fill exceeds target + 100 ms without an engine drop (a
+    slow drift or burst), the drain discards the oldest frames down to the target. Discards are
+    counted (`stale_discard_frames`).
+  - Test: after a drain stall of 50 ms to 5 s, the first frame played after recovery is from the
+    current program time (content check with a tick-stamped test signal), not from before the stall.
+  - The servo holds the engine→drain ring's fill near its target of 60 ms (ring capacity 200 ms),
+    so the engine clock and the device clock are matched within ±500 ppm (the sign and reset rules
+    are those of section 2).
   - Partial pushes are kept for the next round. Nothing is dropped while the device consumes.
 - **Callback:** pop up to the requested frames in `CHUNK`-sized pieces, convert to the device
   format, and fill any shortfall with silence. It counts `underrun_frames` and stores a monotonic
@@ -112,13 +136,19 @@ program bus ──push (wait-free)──▶ [engine→drain SPSC ring, ~200 ms] 
 - **Discovery and identity.** `multiview devices audio` lists the host's input and output devices
   with cpal name, stable id, host API, the default flag, channel counts and supported rates. The
   stable id is cpal's `DeviceId` (`DeviceTrait::id`, a safe API): the CoreAudio device UID on macOS,
-  the WASAPI endpoint id on Windows. It survives reboots and re-plugs.
+  the WASAPI endpoint id on Windows. cpal documents it as stable where possible; for these two backends it survives reboots and
+  re-plugs in practice.
   - Config binds by `device_id` (preferred) or by exact `device` name. A name that matches more
     than one device is refused at open with a latched error that lists the matching ids. The name
     form never picks one by enumeration order.
-  - `device = "default"` is the OS default and follows it: when the OS default changes, the stream
-    reopens on the new default and the change is logged. A physical device literally named
-    "default" is selected by its `device_id`.
+  - `device = "default"` is the OS default and follows it, and the change is logged:
+    - Windows (input and output) and macOS output: cpal reports the default change. On macOS
+      output cpal reroutes the running stream itself; that `DeviceChanged` event is handled as a
+      soft event (keep the stream, log, reset the servo), not as *lost*.
+    - macOS input: cpal 0.18 has no default-input monitor. The pump compares
+      `default_input_device()`'s id with the bound id every 2 s (on the pump thread, outside the
+      callback) and reopens on a change.
+  - A physical device literally named "default" is selected by its `device_id`.
   - Every open logs the name and id that were bound.
 - **One lifecycle helper per device**, a long-lived thread that owns the cpal `Stream`. Open and
   close requests go to it through a 1-slot channel (single flight). The requester waits at most
@@ -152,7 +182,7 @@ program bus ──push (wait-free)──▶ [engine→drain SPSC ring, ~200 ms] 
   - *No callbacks* is detected as *stalled* (section 4) and reported as
     `stalled (permission or device)`.
   - *Exact zeros* are reported as `input_silent` only.
-  - **Known limit:** the leaf crate has no unsafe code, and cpal does not expose the TCC
+  - **Known limit:** the leaf crate is `#![forbid(unsafe_code)]`, and cpal does not expose the TCC
     authorization status, so on macOS the source cannot tell a denied microphone from a silent
     one. It never reports `permission_denied` on macOS; the `input_silent` and `stalled` messages
     name microphone permission as one possible cause. Reading `AVCaptureDevice.authorizationStatus`
@@ -233,7 +263,15 @@ state.
 - CI adds a `cargo deny check --features audio-device` run for `aarch64-apple-darwin` and
   `x86_64-pc-windows-msvc` (the default graph check uses `all-features = false` and does not cover
   this feature), plus feature builds on the macOS and Windows legs. The full transitive licence
-  result is recorded in the implementing PR. Linux and the default build pull none of it.
+  result is recorded in the implementing PR.
+- `cargo deny` checks licence compatibility only. The implementing PR also checks every new
+  transitive crate for a NOTICE file and adds the required attribution to `THIRD-PARTY-NOTICES.md`
+  (Apache-2.0 §4(d)). (Legal files such as `NOTICE` and `LICENSE*` are not edited as engineering
+  work.)
+- The cpal dependency is a target-specific dependency
+  (`[target.'cfg(any(target_os = "macos", target_os = "windows"))'.dependencies]`). On Linux the
+  `audio-device` feature compiles to a stub that refuses `audio_device` with a clear error, and
+  pulls no libasound. Linux and the default build pull none of it.
 
 ## 8. Not in scope
 
