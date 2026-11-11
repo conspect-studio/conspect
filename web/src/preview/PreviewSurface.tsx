@@ -187,9 +187,12 @@ export function PreviewSurface({
   // playing). The record carries its key, so a surface that is reused for a
   // different source starts at MoQ again and never reports a stale reason.
   const surfaceKey = `${scope}:${whepEndpoint}`;
-  const [moqFallback, setMoqFallback] = useState<{ readonly key: string; readonly reason: string; readonly held: boolean }>();
+  const [moqFallback, setMoqFallback] = useState<{ readonly key: string; readonly reason: string }>();
   const moqReason = moqFallback?.key === surfaceKey ? moqFallback.reason : undefined;
-  const moqHeld = moqFallback?.key === surfaceKey && moqFallback.held;
+  // A fallback WHEP session can run while the old MoQ lease is held. A consumer
+  // sees 'released' only after BOTH its WHEP session and that MoQ lease end.
+  const heldMoq = useRef(false);
+  const whepReleased = useRef(false);
   // The MoQ player reports 'released' after it is unmounted (a late release
   // acknowledgement, or the end of an unacknowledged-release hold), so the
   // report goes to the consumer's latest callbacks.
@@ -200,8 +203,17 @@ export function PreviewSurface({
   // Refs, not memo values: React may discard a memo, and these must not change.
   const shownKey = useRef<string | undefined>(undefined);
   const leftAt = useRef<{ readonly key: string; readonly starts: number } | undefined>(undefined);
+  const currentSession = (): boolean => {
+    const record = surfaces.get(surfaceKey);
+    const left = leftAt.current;
+    return shownKey.current === surfaceKey
+      || (shownKey.current === undefined && left?.key === surfaceKey
+        && record?.live === 0 && record.starts === left.starts);
+  };
   useEffect(() => {
     shownKey.current = surfaceKey;
+    heldMoq.current = false;
+    whepReleased.current = false;
     return (): void => {
       shownKey.current = undefined;
       leftAt.current = { key: surfaceKey, starts: surfaces.get(surfaceKey)?.starts ?? 0 };
@@ -245,7 +257,7 @@ export function PreviewSurface({
   }, [autoRetry, attempt]);
 
   const transport: PreviewTransport = capabilities?.moq && moqReason === undefined ? 'moq'
-    : canWhep && !degraded && !moqHeld ? 'webrtc' : 'jpeg';
+    : canWhep && !degraded ? 'webrtc' : 'jpeg';
   const transportRef = useRef(onTransport);
   useEffect(() => { transportRef.current = onTransport; });
   useEffect(() => { transportRef.current?.(transport, moqReason); }, [transport, moqReason]);
@@ -263,7 +275,9 @@ export function PreviewSurface({
   if (capabilities?.moq && moqReason === undefined) {
     return <MoqPlayer key={surfaceKey} api={moqApi} label={label} audio={audio} className={className}
       onUnavailable={(reason) => {
-        setMoqFallback({ key: surfaceKey, reason, held: reason === 'release-unacknowledged' });
+        heldMoq.current = reason === 'release-unacknowledged';
+        whepReleased.current = !canWhep || degraded;
+        setMoqFallback({ key: surfaceKey, reason });
         onTransportUnavailable?.();
       }}
       onLeaseState={(state) => {
@@ -271,17 +285,15 @@ export function PreviewSurface({
         // still the consumer's, but only while no surface for this source is
         // live and none has gone live since this one left. A surface that now
         // shows another source drops the old source's report.
-        const record = surfaces.get(surfaceKey);
-        const left = leftAt.current;
-        const current = shownKey.current === surfaceKey
-          || (shownKey.current === undefined && left?.key === surfaceKey
-            && record?.live === 0 && record.starts === left.starts);
-        if (!current) return;
+        if (!currentSession()) return;
+        if (state === 'released' && heldMoq.current) {
+          heldMoq.current = false;
+          // Do not release the consumer's combined lease while fallback WHEP
+          // is negotiating or active. WHEP reports its own release below.
+          if (!whepReleased.current) return;
+        }
         leaseRef.current.onLeaseState?.(state);
-        if (state !== 'released') return;
-        // The lease is certainly gone: stills may now give way to WebRTC.
-        setMoqFallback((current) => (current?.key === surfaceKey && current.held ? { ...current, held: false } : current));
-        leaseRef.current.onSessionReleased?.();
+        if (state === 'released') leaseRef.current.onSessionReleased?.();
       }} />;
   }
   // The user sees why MoQ is not in use. Two reasons are the normal state and
@@ -310,12 +322,6 @@ export function PreviewSurface({
   if (!canWhep) {
     return withNote(<JpegRung jpegPath={jpegPath} label={label} degraded={false} className={className} />);
   }
-  // The MoQ lease may still be held: stills only, until the player reports
-  // 'released' at the end of its hold (MOQ_UNACKNOWLEDGED_HOLD_MS).
-  if (moqHeld) {
-    return withNote(<JpegRung jpegPath={jpegPath} label={label} degraded className={className} />);
-  }
-
   // WHEP was attempted and failed: degrade to JPEG with the honest badge + a
   // retry that re-arms a fresh WHEP attempt.
   if (degraded) {
@@ -369,10 +375,16 @@ export function PreviewSurface({
       {...(pcFactory !== undefined ? { pcFactory } : {})}
       {...(rtcConfig !== undefined ? { rtcConfig } : {})}
       {...(fetchImpl !== undefined ? { fetchImpl } : {})}
-      onSessionReleased={onSessionReleased}
+      onSessionReleased={(): void => {
+        if (!currentSession()) return;
+        whepReleased.current = true;
+        if (!heldMoq.current) leaseRef.current.onSessionReleased?.();
+      }}
       onLeaseState={(state): void => {
+        if (!currentSession()) return;
         setReleased(state === 'released');
-        onLeaseState?.(state);
+        whepReleased.current = state === 'released';
+        if (state !== 'released' || !heldMoq.current) leaseRef.current.onLeaseState?.(state);
       }}
       onStatus={(status): void => { if (status === 'playing') refusals.current = 0; }}
       onBusy={(isCapacity): void => {

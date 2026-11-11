@@ -2,9 +2,9 @@ import { Connection, type Origin } from '@moq/net';
 
 /**
  * Own an established session separately from its handshake AbortSignal.
- * Callers must await `released` before opening a fallback lease. A failed
- * release rejects that promise; it never grants permission to overlap leases.
- * The control-plane release callback must have its own bounded deadline.
+ * Callers must await `released` before counting the MoQ lease as gone. A
+ * failed release rejects that promise. The independent control-plane release
+ * callback has its own bounded deadline, even if transport close stalls.
  */
 export function ownMoqSession(
   session: Pick<Connection.Established, 'close' | 'closed'>,
@@ -35,6 +35,10 @@ export function ownMoqSession(
             timer = setTimeout(() => { reject(new Error('MoQ closure deadline exceeded')); }, closeTimeoutMs);
           }),
         ]);
+      } catch {
+        // A blocked UDP path can leave WebTransport.closed pending forever.
+        // Still send the independent control-plane DELETE, which revokes the
+        // lease even when transport termination cannot be confirmed.
       } finally {
         if (timer !== undefined) clearTimeout(timer);
       }

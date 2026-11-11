@@ -6050,15 +6050,15 @@ msgstr "Live ephemeral cast sessions."
 msgid "Live host and accelerator utilisation streaming from the engine."
 msgstr "Live host and accelerator utilisation streaming from the engine."
 
-#: src/preview/PreviewSurface.tsx:326
+#: src/preview/PreviewSurface.tsx:332
 msgid "Live input preview failed."
 msgstr "Live input preview failed."
 
-#: src/preview/PreviewSurface.tsx:326
+#: src/preview/PreviewSurface.tsx:332
 msgid "Live input preview is busy. Another viewer has the session."
 msgstr "Live input preview is busy. Another viewer has the session."
 
-#: src/preview/PreviewSurface.tsx:330
+#: src/preview/PreviewSurface.tsx:336
 msgid "Live preview is busy. Another viewer has the session."
 msgstr "Live preview is busy. Another viewer has the session."
 
@@ -6753,11 +6753,11 @@ msgstr "Monitoring cameras where they are installed: RTSP."
 msgid "Mono"
 msgstr "Mono"
 
-#: src/preview/PreviewSurface.tsx:294
+#: src/preview/PreviewSurface.tsx:306
 msgid "MoQ video is not in use ({moqReason}). Showing the next available preview."
 msgstr "MoQ video is not in use ({moqReason}). Showing the next available preview."
 
-#: src/preview/PreviewSurface.tsx:293
+#: src/preview/PreviewSurface.tsx:305
 msgid "MoQ video was refused: this account has no access to it. Showing the next available preview."
 msgstr "MoQ video was refused: this account has no access to it. Showing the next available preview."
 
@@ -12382,7 +12382,7 @@ msgstr "Whole mix"
 msgid "Whole mix overview"
 msgstr "Whole mix overview"
 
-#: src/preview/PreviewSurface.tsx:348
+#: src/preview/PreviewSurface.tsx:354
 msgid "Why live preview failed"
 msgstr "Why live preview failed"
 
