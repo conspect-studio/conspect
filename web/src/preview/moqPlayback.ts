@@ -11,10 +11,33 @@ export interface MoqLeaseApi {
   release(lease: MoqLease): Promise<void>;
 }
 export class MoqUnavailable extends Error {}
+/** The server refused the MoQ lease; `reason` is its typed problem (e.g. `moq-unavailable`, `moq-capacity`). */
+export class MoqLeaseRefused extends Error {
+  constructor(readonly reason: string, readonly status: number) {
+    super(`MoQ lease refused: ${reason}`);
+  }
+}
 /** A local presentation watchdog expired; a fresh authorized session may recover it. */
 export class MoqPresentationGap extends Error {}
 /** The server's lease deadline elapsed; renewal still requires an acknowledged release. */
 export class MoqLeaseExpired extends Error {}
+/**
+ * The session closed but the server did not acknowledge the lease release, so
+ * the lease may still be held until its deadline. Every other playback error
+ * means no lease is held.
+ */
+export class MoqReleaseUnacknowledged extends Error {
+  constructor(cause: unknown) {
+    super(`MoQ lease release not acknowledged: ${cause instanceof Error ? cause.message : 'unknown'}`, { cause });
+  }
+}
+async function acknowledged(release: Promise<void>): Promise<void> {
+  try {
+    await release;
+  } catch (error) {
+    throw new MoqReleaseUnacknowledged(error);
+  }
+}
 
 /** Serialize fresh leases only after the previous playback's close and release ACK finish. */
 export async function startMoqPlaybackWithRefresh(options: Parameters<typeof startMoqPlayback>[0]): Promise<void> {
@@ -229,7 +252,6 @@ export async function startMoqPlayback(options: {
     player?.close();
     origin.close();
     // A failed close or release must prevent fallback and any replacement lease.
-    if (owned) await owned.close();
-    else await api.release(lease);
+    await acknowledged(owned ? owned.close() : api.release(lease));
   }
 }

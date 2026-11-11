@@ -1,18 +1,30 @@
 import { useEffect, useRef, type JSX } from 'react';
-import { MoqUnavailable, startMoqPlaybackWithRefresh, type MoqLeaseApi } from './moqPlayback';
+import { MoqLeaseRefused, MoqReleaseUnacknowledged, MoqUnavailable, startMoqPlaybackWithRefresh, type MoqLeaseApi } from './moqPlayback';
 import { abrDatasetEntries, abrSnapshot, type AbrPersistedState, type AbrState } from './moqAbr';
 
+/**
+ * After an unacknowledged release the server may hold the lease until its
+ * deadline (the server clamps a lease to 60 s). 'released' is reported this
+ * long after the failure, never earlier.
+ */
+export const MOQ_UNACKNOWLEDGED_HOLD_MS = 60_000;
+
 // Serialize replacements, including React StrictMode's effect cleanup/remount.
-// A failed release intentionally poisons this lane until page reload.
-// Each mounted consumer owns its lane. A failed release must not poison another player.
+// Each mounted consumer owns its lane. A failed release keeps THIS lane closed
+// for the hold below and never blocks another player.
 
 export function MoqPlayer({ api, label, audio = false, className, onUnavailable, onFatal, onLeaseState, onAbr, abrResume }: {
   readonly api: MoqLeaseApi;
   readonly label: string;
   readonly audio?: boolean;
   readonly className?: string | undefined;
-  readonly onUnavailable: () => void;
-  readonly onFatal: () => void;
+  /**
+   * MoQ cannot play here: `reason` says why (`unsupported`, a typed lease refusal,
+   * `session-failed`, or `release-unacknowledged`).
+   */
+  readonly onUnavailable: (reason: string) => void;
+  /** The lease release was NOT acknowledged: the server may hold the lease until its deadline. */
+  readonly onFatal?: (() => void) | undefined;
   readonly onLeaseState?: ((state: 'negotiating' | 'active' | 'released') => void) | undefined;
   /** Per-consumer ABR state: requested vs effective rendition and the reason. */
   readonly onAbr?: ((state: AbrState) => void) | undefined;
@@ -50,17 +62,32 @@ export function MoqPlayer({ api, label, audio = false, className, onUnavailable,
           } });
         callbacks.current.onLeaseState?.('released');
       } catch (error) {
-        if (error instanceof MoqUnavailable) {
+        // The transport ladder is MoQ → WebRTC → stills. EVERY MoQ failure hands
+        // the surface a reason and lets it try the next transport; none ends in a
+        // dead view. The surface shows the reason to the user.
+        const reason = error instanceof MoqLeaseRefused ? error.reason
+          : error instanceof MoqUnavailable ? 'unsupported'
+          : error instanceof MoqReleaseUnacknowledged ? 'release-unacknowledged'
+          : 'session-failed';
+        // Only an unacknowledged release can leave a lease on the server. Say so
+        // (onFatal) and do not claim 'released' until the server's lease
+        // deadline has certainly passed. The hold belongs to this task, not to
+        // the component: it survives an unmount, so a consumer that waits for
+        // 'released' (for example to open another preview) always gets it.
+        if (reason === 'release-unacknowledged') {
+          if (!isAborted()) { callbacks.current.onFatal?.(); callbacks.current.onUnavailable(reason); }
+          await new Promise<void>((resolve) => { setTimeout(resolve, MOQ_UNACKNOWLEDGED_HOLD_MS); });
           callbacks.current.onLeaseState?.('released');
-          if (!isAborted()) callbacks.current.onUnavailable();
           return;
         }
-        if (!isAborted()) callbacks.current.onFatal();
-        throw error;
+        // Every other failure holds no lease (refused, unsupported, or the
+        // release was acknowledged after the session failed).
+        callbacks.current.onLeaseState?.('released');
+        if (!isAborted()) callbacks.current.onUnavailable(reason);
       }
     });
     lane.current = task;
-    void task.catch(() => { /* No retries or fallback on unclassified failure. */ });
+    void task.catch(() => { /* reported through onUnavailable above */ });
     return () => { controller.abort(); };
   }, [api, audio, abrResume]);
   return <canvas ref={canvas} aria-label={label} role="img" className={className} data-testid="moq-player" />;
