@@ -49,7 +49,7 @@ done
 - **Classes gate the work; the caller decides dispatch.** A lane classifies its own diff with
   [`scripts/classify.sh`](../../scripts/classify.sh) to learn which gates it owes; the
   orchestrator decides what to *dispatch* — an R0 prose item owes no review at all, R1/R2 one
-  cross-vendor pass, R3 the 3-lens panel plus chaos/soak and operator approval. No script
+  cross-vendor pass, R3 the 3-lens panel plus chaos/soak; the agent merges every class. No script
   lowers a class. Contract: [engineering.md](../../docs/standards/engineering.md).
 
 ## Current scripts

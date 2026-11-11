@@ -51,6 +51,7 @@ RUN apt-get update \
  && apt-get install -y --no-install-recommends ca-certificates curl gnupg dirmngr git xz-utils \
  && rm -rf /var/lib/apt/lists/*
 COPY deploy/ffmpeg-fetch-source.sh /usr/local/bin/ffmpeg-fetch-source.sh
+COPY deploy/ffmpeg-signing-key.asc /usr/local/bin/ffmpeg-signing-key.asc
 RUN chmod 0755 /usr/local/bin/ffmpeg-fetch-source.sh \
  && FFMPEG_VERSION="${FFMPEG_VERSION}" \
     FFMPEG_SHA256="${FFMPEG_SHA256}" \

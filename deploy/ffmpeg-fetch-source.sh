@@ -61,13 +61,29 @@ fetch_release_tarball() {
   fetch_release_file "${TARBALL}.asc" "${BASE_URL}/${TARBALL}.asc" || return 1
 
   # SHA-256 (defense-in-depth pin). A mismatch is fatal, never a fallback.
-  echo "${FFMPEG_SHA256}  ${TARBALL}" | sha256sum -c - || exit 4
+  # sha256sum (GNU) or shasum -a 256 (macOS); both read the same check line.
+  if command -v sha256sum >/dev/null 2>&1; then
+    echo "${FFMPEG_SHA256}  ${TARBALL}" | sha256sum -c - || exit 4
+  else
+    echo "${FFMPEG_SHA256}  ${TARBALL}" | shasum -a 256 -c - || exit 4
+  fi
 
   export GNUPGHOME="${WORK}/gnupg"
   mkdir -p "${GNUPGHOME}"
   chmod 700 "${GNUPGHOME}"
   gpg_recv_ok=0
+  # The FFmpeg release-signing key is vendored next to this script (from
+  # https://ffmpeg.org/ffmpeg-devel.asc); it is imported only if it carries the
+  # pinned fingerprint, so keyservers are a fallback, not a single point of
+  # failure (they are frequently unreachable from CI runners).
+  key_file="$(cd "$(dirname "$0")" && pwd -P)/ffmpeg-signing-key.asc"
+  if [ -f "${key_file}" ] && gpg --batch --import "${key_file}" 2>/dev/null \
+      && gpg --batch --with-colons --fingerprint "${FFMPEG_GPG_KEY}" 2>/dev/null \
+         | awk -F: -v want="${FFMPEG_GPG_KEY}" '$1 == "fpr" && $10 == want { found=1 } END { exit !found }'; then
+    gpg_recv_ok=1
+  fi
   for ks in hkps://keyserver.ubuntu.com hkps://keys.openpgp.org hkps://pgp.mit.edu; do
+    [ "${gpg_recv_ok}" -eq 1 ] && break
     if gpg --batch --keyserver "${ks}" --recv-keys "${FFMPEG_GPG_KEY}"; then
       gpg_recv_ok=1
       break

@@ -149,12 +149,12 @@ pub use encode_options::{
 };
 
 pub use codec::{
-    can_encode, can_encode_audio, candidate_audio_encoders, candidate_encoders, AudioCodec,
-    VideoCodec,
+    can_encode, can_encode_audio, candidate_audio_encoders, candidate_encoders,
+    is_hardware_encoder, AudioCodec, VideoCodec,
 };
 
 #[cfg(feature = "ffmpeg")]
-pub use codec::{select_audio_encoder, select_encoder};
+pub use codec::{probe_encoder_opens, select_audio_encoder, select_encoder, select_usable_encoder};
 
 #[cfg(feature = "ffmpeg")]
 pub use avio_fetch::{fetch_url_text, FetchedText};
