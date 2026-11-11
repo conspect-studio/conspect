@@ -174,8 +174,10 @@ program bus ──push (wait-free)──▶ [engine→drain SPSC ring, ~200 ms] 
   - Test: after a drain stall of 50 ms to 5 s, the first frame played after recovery is from the
     current program time (content check with a tick-stamped test signal), not from before the stall.
   - The servo holds the engine→drain ring's fill near its target of 60 ms (ring capacity 200 ms),
-    so the engine clock and the device clock are matched within ±500 ppm (the sign and reset rules
-    are those of section 2).
+    so the engine clock and the device clock are matched within ±500 ppm. The polarity is the
+    opposite of the input servo: high engine→drain fill → emit more frames (positive ppm, drain
+    faster); low fill → fewer. (This is the HDMI `drain_ratio` convention.) Reset rules are those of
+    section 2. Test: device clock ±300 ppm against the engine, both directions, fill stays bounded.
   - Partial pushes are kept for the next round. Nothing is dropped while the device consumes.
 - **Callback:** pop up to the requested frames in `CHUNK`-sized pieces, convert to the device
   format, and fill any shortfall with silence. It counts `underrun_frames` and stores a monotonic
@@ -235,10 +237,15 @@ program bus ──push (wait-free)──▶ [engine→drain SPSC ring, ~200 ms] 
       cpal calls, with its deadline and stuck-state rules) reads `default_input_device()`'s id
       every 2 s, and requests a reopen on a change. The pump never makes OS calls.
   - **Supervision:** one process-wide supervisor thread (never blocked: it only reads atomics and
-    sleeps) watches each device's pump/drain loop counter and helper call-start instant. If a pump
-    or drain has not advanced for 1 s, or a helper call (open, close, poll) has run past its
+    sleeps) watches each device's pump/drain loop counter (outer-loop iterations; the pump and the
+    drain both keep looping through close, backoff and reopen, so the counter advances in every
+    healthy state) and helper call-start instant. If a pump or drain counter has not advanced for
+    1 s, or a helper call (open, close, poll) has run past its
     deadline, it sets the device state to the latched `device_call_stuck` (telemetry stops saying
-    `open`) and the source reads silence. It starts no replacement threads.
+    `open`) and the source reads silence. It starts no replacement threads. The state clears when
+    the counter advances again or the helper call returns; the device then goes back to whatever
+    its own state machine says (`open`, backoff, …). Test: a wedged-then-recovered pump returns to
+    `open`.
   - A physical device literally named "default" is selected by its `device_id`.
   - Every open logs the name and id that were bound.
 - **One lifecycle helper per device**, a long-lived thread that owns the cpal `Stream`. Open and
