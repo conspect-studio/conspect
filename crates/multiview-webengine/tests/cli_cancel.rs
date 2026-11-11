@@ -16,7 +16,8 @@ fn cli_sigterm_reaps_active_producer_without_committing() {
     std::fs::write(
         &script,
         format!(
-            "#!/bin/sh\necho $$ > '{}'\ncat >/dev/null\nexec sleep 60\n",
+            // Publish the pid atomically: `ready` must never be seen empty.
+            "#!/bin/sh\necho $$ > '{0}.tmp' && mv '{0}.tmp' '{0}'\ncat >/dev/null\nexec sleep 60\n",
             ready.display()
         ),
     )
