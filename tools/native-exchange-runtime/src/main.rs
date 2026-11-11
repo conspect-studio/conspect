@@ -45,8 +45,13 @@ fn accept_plain(
 }
 /// A parked object can never open once its epoch is behind the receiver's, its
 /// grant lapsed without a successor, or it is too old for the replay window.
+fn wire_epoch(wire: &[u8]) -> Option<u64> {
+    Some(u64::from_be_bytes(wire.get(52..60)?.try_into().ok()?))
+}
 fn stale(receiver: &ReceiverRuntime, p: &Parked, now_ms: u64) -> bool {
-    let epoch = u64::from_be_bytes(p.wire[52..60].try_into().unwrap_or([0; 8]));
+    let Some(epoch) = wire_epoch(&p.wire) else {
+        return false;
+    };
     epoch < receiver.epoch()
         || (epoch == receiver.epoch() && receiver.grant_lapsed(now_ms))
         || now_ms.saturating_sub(p.id.captured_ms) >= 4500
@@ -67,7 +72,9 @@ fn drain_parked(
             queue.stale += 1;
             continue;
         }
-        let epoch = u64::from_be_bytes(p.wire[52..60].try_into().unwrap_or([0; 8]));
+        let Some(epoch) = wire_epoch(&p.wire) else {
+            return Err("decrypt");
+        };
         if epoch > receiver.epoch() {
             // Grant still not accepted: keep this and everything after it, in order.
             queue.requeue(p);
@@ -539,8 +546,7 @@ fn connected(
                     let wire = copy(tx, rx, &frame.payload)?;
                     let mut slot = slots[i].lock().map_err(|_| "receiver lock")?;
                     let (receiver, output) = &mut *slot;
-                    let wire_epoch =
-                        u64::from_be_bytes(wire[52..60].try_into().map_err(|_| "wire")?);
+                    let object_epoch = wire_epoch(&wire).ok_or("decrypt")?;
                     let denied_here = (cutoff && (i == 0 || scenario == "withdraw"))
                         || (exhausted && i == 0)
                         || (scenario == "credit-cutoff"
@@ -549,7 +555,7 @@ fn connected(
                     if !denied_here
                         && !receiver.is_denied()
                         && (!parked[i].is_empty()
-                            || wire_epoch > receiver.epoch()
+                            || object_epoch > receiver.epoch()
                             || receiver.grant_lapsed(now()))
                     {
                         // Grant for this epoch not accepted yet: hold in order, bounded.
@@ -562,7 +568,7 @@ fn connected(
                         continue;
                     }
                     let plain = receiver.open(&wire, &id, now(), output);
-                    if plain.is_err()
+                    if matches!(plain, Err(conspect_media_crypto::Error::Expired))
                         && !denied_here
                         && !receiver.is_denied()
                         && receiver.grant_lapsed(now())

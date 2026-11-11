@@ -435,6 +435,12 @@ fn scenario(scenario: &'static str, slow: bool, deny_renew: bool, variant: &'sta
                     .windows(2)
                     .all(|w| w[1].duration_since(w[0]) <= std::time::Duration::from_secs(30)));
             }
+        } else if variant == "late-b-grants" {
+            assert!(delayed_grants > 0, "the mock never delayed a B grant");
+            assert!(boundary_denials > 0);
+            assert_eq!(extensions[0].len(), 1);
+            assert!(!extensions[1].is_empty(), "B must extend with 201");
+            assert!(receipts > 0);
         } else if late_fragment {
             // No media may be produced for A's elapsed window: no receipts.
             assert_eq!(receipts, 0, "no media may follow a late fragment");
@@ -559,6 +565,23 @@ fn scenario(scenario: &'static str, slow: bool, deny_renew: bool, variant: &'sta
         String::from_utf8_lossy(&output.stderr)
     );
     assert!(String::from_utf8_lossy(&output.stdout).contains("two takers"));
+    if variant == "late-b-grants" {
+        // The parked path must actually have run: objects parked and later opened.
+        let out = String::from_utf8_lossy(&output.stdout);
+        let report = out
+            .lines()
+            .find(|l| l.starts_with("credit-cutoff B late-grant report:"))
+            .expect("late-grant report");
+        let field = |name: &str| -> u64 {
+            report
+                .split_whitespace()
+                .find_map(|w| w.strip_prefix(name))
+                .and_then(|v| v.parse().ok())
+                .unwrap()
+        };
+        assert!(field("parked=") > 0, "no B object was parked: {report}");
+        assert!(field("drained=") > 0, "no parked B object opened: {report}");
+    }
     if scenario == "withdraw" {
         assert!(
             String::from_utf8_lossy(&output.stdout)
