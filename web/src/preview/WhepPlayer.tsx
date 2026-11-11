@@ -35,6 +35,9 @@ export type WhepPlayerStatus = 'connecting' | 'playing' | 'failed';
 /** How long to wait for ICE gathering to complete before POSTing anyway. */
 const GATHER_TIMEOUT_MS = 2000;
 
+/** Max wait for an earlier session's DELETE before offering anyway. */
+const RELEASE_WAIT_MS = 5000;
+
 /** How long inbound bytes may stay flat after connect before we call it stalled. */
 const STALL_TIMEOUT_MS = 6000;
 
@@ -298,7 +301,11 @@ export function WhepPlayer({
       await pc.setLocalDescription(offer);
       await awaitIceGathering(pc);
       // Serialise: wait for any earlier session's DELETE (not our own).
-      await Promise.all(earlierReleases);
+      // Bounded: a wedged earlier release must not block live video forever.
+      await Promise.race([
+        Promise.all(earlierReleases),
+        new Promise<void>((resolve) => { window.setTimeout(resolve, RELEASE_WAIT_MS); }),
+      ]);
       if (aborted()) {
         return;
       }

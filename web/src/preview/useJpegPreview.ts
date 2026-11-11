@@ -24,6 +24,9 @@ export interface JpegStill {
   readonly state: StillState;
 }
 
+/** Re-probe interval for a route found not served (HTML 200 / 404 / 405 / 501). */
+export const UNAVAILABLE_REPROBE_MS = 30_000;
+
 /** A still older than max(5 polls, 10 s) without a new good frame is stale. */
 export function staleAfterMs(refreshMs: number): number {
   return Math.max(refreshMs * 5, 10_000);
@@ -48,6 +51,7 @@ export function useJpegStill(path: string, refreshMs: number, enabled = true): J
     let inFlight = false;
     let controller: AbortController | undefined;
     let staleTimer: number | undefined;
+    let unavailableAt: number | undefined;
 
     const revoke = (): void => {
       if (current.current !== undefined) {
@@ -58,6 +62,10 @@ export function useJpegStill(path: string, refreshMs: number, enabled = true): J
 
     const tick = async (): Promise<void> => {
       if (inFlight || document.visibilityState === 'hidden') {
+        return;
+      }
+      // A route that is not served is re-probed slowly, not every poll.
+      if (unavailableAt !== undefined && Date.now() - unavailableAt < UNAVAILABLE_REPROBE_MS) {
         return;
       }
       inFlight = true;
@@ -84,6 +92,7 @@ export function useJpegStill(path: string, refreshMs: number, enabled = true): J
           revoke();
           current.current = next;
           setFrame({ path, url: next });
+          unavailableAt = undefined;
           setStatus({ path, state: 'fresh' });
           window.clearTimeout(staleTimer);
           staleTimer = window.setTimeout(() => {
@@ -97,6 +106,7 @@ export function useJpegStill(path: string, refreshMs: number, enabled = true): J
           window.clearTimeout(staleTimer);
           revoke();
           setFrame(undefined);
+          unavailableAt = Date.now();
           setStatus({ path, state: 'unavailable' });
         }
         // Any other failure (503, 5xx, 401…) is transient: keep the last frame.

@@ -207,4 +207,13 @@ describe('useJpegPreview', () => {
     await settle(next, 'again');
     expect(result.current.state).toBe('fresh');
   });
+
+  it('re-probes an unserved route only slowly (30 s), not every poll', async () => {
+    renderHook(() => useJpegStill('/preview/a.jpg', 1000));
+    await fail(0, 200, 'text/html');
+    await act(async () => { await vi.advanceTimersByTimeAsync(20_000); });
+    expect(requests).toHaveLength(1);
+    await act(async () => { await vi.advanceTimersByTimeAsync(11_000); });
+    expect(requests).toHaveLength(2);
+  });
 });

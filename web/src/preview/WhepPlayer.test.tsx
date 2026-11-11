@@ -459,10 +459,26 @@ describe('<WhepPlayer>', () => {
     renderWithProviders(
       <WhepPlayer endpoint="/api/v1/preview/program/whep" label="Program" pcFactory={pcf} fetchImpl={fetchImpl} />,
     );
-    await act(async () => { await vi.advanceTimersByTimeAsync(5000); });
+    await act(async () => { await vi.advanceTimersByTimeAsync(4000); });
     const posts = (): number => fetchImpl.mock.calls.filter((c) => c[1]?.method === 'POST').length;
     expect(posts()).toBe(1); // the second offer is held back
     await act(async () => { finishDelete?.(); await vi.advanceTimersByTimeAsync(10); });
     expect(posts()).toBe(2);
+  });
+
+  it('offers anyway after a bounded wait if the earlier release never completes', async () => {
+    const fetchImpl = vi.fn<typeof fetch>().mockImplementation((_url, init) =>
+      init?.method === 'DELETE' ? new Promise<Response>(() => undefined) : Promise.resolve(sdpResponse(201, 'sessions/abc')),
+    );
+    const first = renderWithProviders(
+      <WhepPlayer endpoint="/api/v1/preview/program/whep" label="Program" pcFactory={pcf} fetchImpl={fetchImpl} />,
+    );
+    await act(async () => { await vi.runOnlyPendingTimersAsync(); });
+    first.unmount();
+    renderWithProviders(
+      <WhepPlayer endpoint="/api/v1/preview/program/whep" label="Program" pcFactory={pcf} fetchImpl={fetchImpl} />,
+    );
+    await act(async () => { await vi.advanceTimersByTimeAsync(6000); });
+    expect(fetchImpl.mock.calls.filter((c) => c[1]?.method === 'POST')).toHaveLength(2);
   });
 });
