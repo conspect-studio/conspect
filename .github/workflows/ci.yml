@@ -1046,12 +1046,15 @@ jobs:
           printf '#!/bin/sh\nexec env -u DYLD_LIBRARY_PATH "%s" "$@"\n' "$(brew --prefix)/bin/ffmpeg" > "${shim}/ffmpeg"
           chmod 0755 "${shim}/ffmpeg"
           echo "${shim}" >> "$GITHUB_PATH"
+      - name: Record build-dep versions (cache key input)
+        id: brewdeps
+        run: echo "v=$(brew list --versions opus srt gnutls | tr ' \n' '-_')" >> "$GITHUB_OUTPUT"
       - name: Cache pinned FFmpeg prefix
         id: ffcache
         uses: actions/cache@v4
         with:
           path: ${{ env.FF_PREFIX }}
-          key: ffmpeg-apple-${{ runner.arch }}-${{ hashFiles('deploy/ffmpeg-build.sh', 'deploy/ffmpeg-fetch-source.sh', 'deploy/ffmpeg-patches/**', 'deploy/Dockerfile.ffmpeg') }}
+          key: ffmpeg-apple-${{ runner.arch }}-${{ steps.brewdeps.outputs.v }}-${{ hashFiles('deploy/ffmpeg-build.sh', 'deploy/ffmpeg-fetch-source.sh', 'deploy/ffmpeg-patches/**', 'deploy/Dockerfile.ffmpeg', '.github/workflows/ci.yml') }}
       - name: Build pinned FFmpeg (apple profile)
         if: steps.ffcache.outputs.cache-hit != 'true'
         run: |
@@ -1071,12 +1074,19 @@ jobs:
           if "${FF_PREFIX}/bin/ffmpeg" -hide_banner -buildconf | grep -qE 'enable-gpl|enable-nonfree|libx26[45]'; then
             echo "::error::GPL/nonfree component in the macOS FFmpeg"; exit 1
           fi
+          # The script's own post-install IO allowlist check (same as Docker).
+          FF_PREFIX="${FF_PREFIX}" bash deploy/ffmpeg-build.sh --assert-features
           {
             echo "PKG_CONFIG_PATH=${FF_PREFIX}/lib/pkgconfig"
             echo "DYLD_LIBRARY_PATH=${FF_PREFIX}/lib"
           } >> "$GITHUB_ENV"
+          # The pinned build's ffprobe verifies outputs (invariant #8); the
+          # fixture shim keeps `ffmpeg` resolving to the lavfi generator.
+          ln -sf "${FF_PREFIX}/bin/ffprobe" "${RUNNER_TEMP}/fixture-bin/ffprobe"
       - name: clippy multiview-cli --features ffmpeg,overlay,gpu
         run: cargo clippy --locked -p multiview-cli --features ffmpeg,overlay,gpu --all-targets -- -D warnings
+      - name: clippy multiview-cli --features apple (VideoToolbox code paths)
+        run: cargo clippy --locked -p multiview-cli --features apple --all-targets -- -D warnings
       - name: clippy multiview-cli --features webrtc-native
         run: cargo clippy --locked -p multiview-cli --features webrtc-native --all-targets -- -D warnings
       - name: test multiview-ffmpeg --features ffmpeg,videotoolbox

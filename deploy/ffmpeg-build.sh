@@ -406,6 +406,17 @@ for component in LIBSRT_PROTOCOL RTSP_DEMUXER HLS_DEMUXER WAV_DEMUXER \
     exit 5
   fi
 done
+if [ "${FF_HWACCEL}" = "apple" ]; then
+  # The apple profile's own components must survive dependency resolution too.
+  for component in AVFOUNDATION_INDEV H264_VIDEOTOOLBOX_ENCODER HEVC_VIDEOTOOLBOX_ENCODER \
+                   H264_VIDEOTOOLBOX_HWACCEL HEVC_VIDEOTOOLBOX_HWACCEL SCALE_VT_FILTER \
+                   AAC_AT_ENCODER AAC_AT_DECODER; do
+    if ! awk -v n="CONFIG_${component}" '$1 == "#define" && $2 == n && $3 == "1" { found=1 } END { exit !found }' config_components.h; then
+      echo "ffmpeg-build: apple profile component ${component} did not survive configure" >&2
+      exit 5
+    fi
+  done
+fi
 make -j"$(cpu_count)"
 make install
 
