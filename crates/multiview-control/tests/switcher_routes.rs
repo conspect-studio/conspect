@@ -919,7 +919,7 @@ async fn cold_program_punch_keeps_its_lease_through_the_hold_and_releases_it_aft
         64,
     );
     assert_eq!(leases.pending_count(), 1, "the held punch keeps its lease");
-    assert!(log.dropped().is_empty());
+    assert_eq!(log.dropped(), Vec::<String>::new());
     // The source primes; the punch applies on the next fresh tick.
     cold.publish(
         Nv12Image::solid(
@@ -939,7 +939,11 @@ async fn cold_program_punch_keeps_its_lease_through_the_hold_and_releases_it_aft
     assert!(outcome.event.completed, "{:?}", outcome.event.error);
     leases.resolve(&outcome.event.operation_id, true);
     assert!(leases.has_current_program());
-    assert!(log.dropped().is_empty(), "the applied punch keeps c wanted");
+    assert_eq!(
+        log.dropped(),
+        Vec::<String>::new(),
+        "the applied punch keeps c wanted"
+    );
     assert!(!leases.sweep_program(Some("c")), "Program still on c");
     // Program moves away (a CUT to b); the bridge lease is released.
     assert!(leases.sweep_program(Some("b")));
