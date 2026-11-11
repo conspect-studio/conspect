@@ -165,6 +165,10 @@ fn scenario(scenario: &'static str, slow: bool, deny_renew: bool) {
                 if deny_renew && renewals.len() >= 8 {
                     status = 403;
                 }
+                // Contract: a global withdrawal also revokes the lease route.
+                if scenario == "withdraw" && denied {
+                    status = 404;
+                }
                 // Frozen renewal contract: metadata only, the token is neither
                 // rotated nor echoed, so the client must retain the acquired one.
                 assert!(
@@ -173,6 +177,9 @@ fn scenario(scenario: &'static str, slow: bool, deny_renew: bool) {
                 );
                 json!({"generation":793,"leaseExpiresAtMs":now()+10000,"notBeforeMs":1})
             } else if path.ends_with("/lease/release") {
+                if scenario == "withdraw" && denied {
+                    status = 404;
+                }
                 json!({})
             } else if path.ends_with("/exchange/bookings") {
                 status = 201;
@@ -455,4 +462,11 @@ fn scenario(scenario: &'static str, slow: bool, deny_renew: bool) {
         String::from_utf8_lossy(&output.stderr)
     );
     assert!(String::from_utf8_lossy(&output.stdout).contains("two takers"));
+    if scenario == "withdraw" {
+        assert!(
+            String::from_utf8_lossy(&output.stdout)
+                .contains("withdraw report: publisher lease revoked (renew 404)"),
+            "withdraw must prove the terminal lease cutoff"
+        );
+    }
 }

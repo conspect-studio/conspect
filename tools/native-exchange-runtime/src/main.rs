@@ -124,6 +124,11 @@ fn run() -> Result<()> {
         scenario,
     );
     let released = release.release();
+    if scenario == "withdraw" && result.is_ok() {
+        // The lease was proven revoked by the withdrawal; the release answer for
+        // a revoked lease is a refusal by contract and confers nothing.
+        return result;
+    }
     result.and(released)
 }
 // The connected scope drops its control coordinator before this guard releases
@@ -585,7 +590,8 @@ fn connected(
             match scenario {
                 "release" => state.booking_release(t, 0)?,
                 "withdraw" => {
-                    state.withdraw(t, m["scenario"]["storyId"].as_str().ok_or("storyId")?)?
+                    state.withdraw(t, m["scenario"]["storyId"].as_str().ok_or("storyId")?)?;
+                    cutoff_at = now();
                 }
                 _ => {}
             };
@@ -610,6 +616,11 @@ fn connected(
             if output.pending() != 0 {
                 return Err("pending media after deny");
             }
+        }
+        if scenario == "withdraw" && cutoff {
+            // A global withdrawal also revokes the publisher lease route by
+            // contract: stop sealing at once; the lease must now die (below).
+            break;
         }
         if scenario == "credit-cutoff" {
             std::thread::sleep(Duration::from_millis(100));
@@ -637,6 +648,27 @@ fn connected(
     }
     if scenario != "withdraw" && intervals[1].iter().any(|n| *n < 4) {
         return Err("second receiver did not continue");
+    }
+    if scenario == "withdraw" {
+        // Terminal publisher cutoff: the next renew must be refused with exactly
+        // 404 (the withdrawn story's lease route). Any other denial, or a lease
+        // that stays alive, fails the run; arbitrary renew denials are not ignored.
+        let withdrawn_at = cutoff_at;
+        let until = Instant::now() + Duration::from_secs(6);
+        while control.healthy() {
+            if Instant::now() >= until {
+                return Err("withdrawal did not revoke the publisher lease");
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let (_, status) = state.publisher_lease()?.last_failure();
+        if status != 404 {
+            return Err("publisher lease ended for a reason other than the withdrawal 404");
+        }
+        println!(
+            "withdraw report: publisher lease revoked (renew 404) {} ms after the withdrawal was acknowledged",
+            now().saturating_sub(withdrawn_at)
+        );
     }
     if scenario == "credit-cutoff" {
         // Measured, non-secret report: Unix ms and counts only.
