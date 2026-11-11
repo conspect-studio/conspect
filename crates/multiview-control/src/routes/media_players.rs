@@ -197,7 +197,8 @@ pub(crate) async fn get_player(
         post,
         path = "/api/v1/media/players/{id}/load",
         tag = "media-players",
-        params(("id" = String, Path, description = "Media-player id.")),
+        params(("id" = String, Path, description = "Media-player id."),
+               ("Idempotency-Key" = String, Header, description = "Required for artifactRef; stable actor-scoped retry key.")),
         request_body = TransportBody,
         responses(
             (status = 202, description = "Legacy load returns an accepted command; artifactRef load returns an operation whose completion requires native video and audio adoption.", body = LoadResponse),
@@ -234,6 +235,14 @@ pub(crate) async fn load_player(
         let key = idem.0.ok_or_else(|| {
             ControlError::Validation("artifact load requires Idempotency-Key".into())
         })?;
+        if key.is_empty() || key.len() > 256 || !key.is_ascii() {
+            return Err(ControlError::Validation(
+                "invalid artifact load Idempotency-Key".into(),
+            ));
+        }
+        let audit_player = id.clone();
+        let audit_actor = principal.key_id.clone();
+        let audit_state = state.clone();
         let result = tokio::task::spawn_blocking(move || {
             let lease = state.web_capture.pin_for_player(
                 &principal,
@@ -246,6 +255,8 @@ pub(crate) async fn load_player(
         })
         .await
         .map_err(|_| ControlError::EngineBusy)??;
+        audit_state.audit(&audit_actor, crate::audit::AuditAction::Command, "media-player", &audit_player,
+            Some(serde_json::json!({"kind":"artifact_load", "operation":result.operation, "state":result.state})));
         return Ok(axum::response::IntoResponse::into_response((
             axum::http::StatusCode::ACCEPTED,
             Json(result),
