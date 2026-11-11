@@ -247,7 +247,7 @@
 .bd-jpeg{position:relative;width:100%;height:100%}
 .bd-jpeg img{position:absolute;inset:0}
 .bd-pgm,.bd-pvw{align-self:start;display:block}
-.bd-pgm .bd-picture,.bd-pvw .bd-picture{aspect-ratio:16/9;margin-inline:auto;width:100%;height:auto;min-height:0}
+.bd-pgm .bd-picture,.bd-pvw .bd-picture{aspect-ratio:16/9;max-height:230px;margin-inline:auto;width:100%;height:auto;min-height:0}
 .bd-wall,.bd-rail,.bd-switcher{align-self:start}
 .bd-picture [data-testid=still-preview-label]{display:none}
 .bd-monitor figcaption{align-items:center;gap:8px 10px}
@@ -267,6 +267,9 @@
 .bd-desk-clock .bd-tick{text-align:left}
 .bd-desk-clock .bd-tick b{font-size:20px}
 @media(max-width:767px){.bd-desk-clock{padding:6px 10px;gap:8px}.bd-heading-side{flex-wrap:wrap;gap:8px}.bd-cell-na{padding:2px 6px}}
+
+@media(max-width:1279px){.bd-pgm .bd-picture,.bd-pvw .bd-picture{max-height:128px}}
+@media(max-width:767px){.bd-pgm .bd-picture,.bd-pvw .bd-picture{max-height:112px}}
 
 /* Fix14: approved two-line bus keys in a 4-column grid; wrapping secondary caption; phone heading stacks clock under title. */
 .bd-bus>div{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:6px}
@@ -381,3 +384,4 @@
 .bd-diag-slot section{padding:4px 0 0!important;overflow-wrap:anywhere}
 .bd-diag-slot pre{overflow-wrap:anywhere}
 @media(max-width:767px){.bd-picture .ps-retry-label{display:none}.bd-picture [data-testid=fallback-badge]{font-size:11px;padding:2px 6px}}
+.bd-picture [data-testid=fallback-badge]{padding:2px 6px}.bd-picture [data-testid=fallback-badge] button{min-height:28px;min-width:28px;height:28px;padding:0 6px}

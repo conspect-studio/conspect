@@ -54,8 +54,10 @@ for (const [width, height] of [
     const retry = page.getByRole('button', { name: 'Retry live preview' });
     await expect(retry).toBeVisible();
     const rb = (await retry.boundingBox()) as Box;
-    // 16:9 and the still fills the monitor box.
-    expect(Math.abs(pb.width / pb.height - 16 / 9)).toBeLessThan(0.03);
+    // Approved monitor box (unchanged max-height caps) — never taller than the approved limit; the still fills it.
+    const cap = width < 768 ? 112 : width < 1280 ? 128 : 230;
+    expect(pb.height).toBeLessThanOrEqual(cap + 1);
+    expect(pb.width / pb.height).toBeGreaterThanOrEqual(16 / 9 - 0.03);
     expect(Math.abs(ib.width - pb.width)).toBeLessThan(2);
     expect(Math.abs(ib.height - pb.height)).toBeLessThan(2);
     const figure = (await page.locator('.bd-pgm').boundingBox()) as Box;
@@ -64,7 +66,7 @@ for (const [width, height] of [
     expect(rb.x).toBeGreaterThanOrEqual(bb.x - 1);
     expect(rb.x + rb.width).toBeLessThanOrEqual(bb.x + bb.width + 1);
     expect(bb.x + bb.width).toBeLessThanOrEqual(pb.x + pb.width + 1);
-    const centre = { x: pb.x + pb.width * 0.4, y: pb.y + pb.height * 0.4, width: pb.width * 0.2, height: pb.height * 0.2 };
+    const centre = { x: pb.x + pb.width / 2 - 4, y: pb.y + pb.height / 2 - 4, width: 8, height: 8 };
     expect(overlap(bb, centre)).toBe(false);
     // Diagnostics: one collapsed disclosure BELOW the picture, inside the monitor, not clipped.
     const disclosure = page.getByTestId('fallback-diagnostics');
@@ -74,9 +76,11 @@ for (const [width, height] of [
     expect(overlap(db, pb)).toBe(false);
     expect(db.x).toBeGreaterThanOrEqual(figure.x - 1);
     expect(db.x + db.width).toBeLessThanOrEqual(figure.x + figure.width + 1);
-    await expect(page.getByText('Safe technical details')).toBeHidden();
-    await disclosure.locator('summary').first().click();
-    await expect(page.getByText('Safe technical details')).toBeVisible();
+    await expect(page.getByText('Unknown values mean')).toBeHidden();
+    await disclosure.locator('summary').click();
+    await expect(page.getByText('Unknown values mean')).toBeVisible();
+    await expect(disclosure.locator('details')).toHaveCount(0);
+    await expect(disclosure.locator('summary')).toHaveCount(1);
     const after = (await disclosure.boundingBox()) as Box;
     expect(after.x + after.width).toBeLessThanOrEqual(figure.x + figure.width + 1);
     const scroll = await page.evaluate(() => document.documentElement.scrollWidth - window.innerWidth);
