@@ -73,3 +73,14 @@ pub use usage::{
     attribute, cpu_cores, monotonic_total, type_cpu_seconds, usage_from_cgroup, Accounting,
     ResourceUsage, Sampler, CPU_CORES_CAP,
 };
+
+// Browser capture runtime and immutable artifact service.
+pub mod artifact;
+pub mod capture;
+pub mod cdp_wire;
+pub mod fetch;
+pub mod resource;
+pub mod runner;
+pub mod scheduler;
+pub mod service;
+pub mod service_journal;

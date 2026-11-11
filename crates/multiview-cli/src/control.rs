@@ -355,6 +355,7 @@ where
     )
     .with_preview(preview)
     .with_warning_store(warnings);
+    state = state.with_web_capture(multiview_control::web_capture_startup::from_environment()?);
     #[cfg(feature = "moq-output")]
     if let Some(moq) = moq {
         state = state.with_moq(moq);

@@ -151,6 +151,45 @@ jobs:
         # without it — so the lint build is deterministic.
         run: cargo clippy --locked --workspace --all-targets -- -D warnings
 
+  capture-browser:
+    name: required real-browser capture HTTP
+    needs: changes
+    if: ${{ github.event_name != 'pull_request' || needs.changes.outputs.code == 'true' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@1.99.1
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '22'
+      - name: provision required capture tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg
+          npx --yes --package=playwright@1.58.2 playwright install --with-deps chromium
+          echo "CONSPECT_WEB_NODE=$(command -v node)" >> "$GITHUB_ENV"
+          echo "CONSPECT_WEB_FFMPEG=$(command -v ffmpeg)" >> "$GITHUB_ENV"
+          browser=$(find "$HOME/.cache/ms-playwright" -type f -name chrome-headless-shell | head -n 1)
+          test -n "$browser"
+          echo "CONSPECT_WEB_BROWSER=$browser" >> "$GITHUB_ENV"
+      # Disposable Ubuntu runner only: permit Chromium to create its user namespace.
+      # Chromium's own sandbox stays enabled; never add --no-sandbox to the producer.
+      - name: allow sandboxed browser user namespace on the disposable runner
+        run: |
+          if sysctl kernel.apparmor_restrict_unprivileged_userns >/dev/null 2>&1; then
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          fi
+          timeout 20 "$CONSPECT_WEB_BROWSER" --headless --disable-dev-shm-usage --dump-dom about:blank
+          "$CONSPECT_WEB_FFMPEG" -hide_banner -version
+      - name: require real browser HTTP test with positive count
+        shell: bash
+        run: |
+          set -o pipefail
+          cargo test --locked -p multiview-control --features capture-browser-integration --test web_capture_tcp actual_browser_http_post_commits_decodable_artifact -- --exact 2>&1 | tee capture-browser-proof.log
+          grep -F 'test result: ok. 1 passed; 0 failed;' capture-browser-proof.log
+
   test:
     name: check + test (${{ matrix.os }})
     # The long pole of CI: macOS check+test runs ~15min warm (the slowest leg);
