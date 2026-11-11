@@ -1,6 +1,6 @@
 # R3 causal chaos proof log (player adoption)
 
-Command: `cargo test --locked -p multiview-cli --features ffmpeg --lib player_adoption_chaos_tests -- --test-threads=1` — 6 passed.
+Command: `cargo test --locked -p multiview-cli --features ffmpeg --lib player_adoption_chaos_tests -- --test-threads=1` — initial six passed; the revised suite at ed1cb565 has nine passing tests. These results predate the final commit/close race correction and must be rerun after that correction.
 
 Tests live in `pipeline.rs` `player_adoption_chaos_tests`. Production change: none; only a `#[cfg(all(test, feature="ffmpeg"))]` per-runtime barrier (`seek_barrier`, keyed by the runtime's opener `Arc` address) called `#[cfg(test)]` before the native seek in the worker's Seek/Cue handlers. Seek stays on the worker; ordering unchanged.
 
