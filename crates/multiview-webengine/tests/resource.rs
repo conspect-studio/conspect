@@ -1,3 +1,4 @@
+#![cfg(unix)]
 //! Process-tree resource accounting: declared procfs fixtures plus a real fake
 //! producer whose descendant burns CPU. No success depends on wall-clock timing;
 //! deadlines are hang guards only.

@@ -1070,6 +1070,8 @@ where
 
 pub mod web_capture;
 
+#[cfg(unix)]
 pub mod web_capture_startup;
 
+#[cfg(unix)]
 pub mod web_capture_store;

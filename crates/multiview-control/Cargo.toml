@@ -12,7 +12,6 @@ authors.workspace = true
 publish = false
 
 [dependencies]
-multiview-webengine = { path = "../multiview-webengine" }
 rustix = { version = "1", features = ["fs", "process"] }
 multiview-moq = { path = "../multiview-moq", optional = true }
 multiview-cloudflare = { path = "../multiview-cloudflare" }
@@ -246,6 +245,12 @@ tempfile = "3"
 # (the `tokio-rustls`/`reqwest`/`ring` posture already documented above).
 rustls = { version = "0.23", optional = true }
 rustls-pki-types = { version = "1", features = ["std"], optional = true }
+
+
+# The browser-capture runtime is unix-only (process groups, openat-pinned files).
+# Other platforms build a provider that reports capture unavailable.
+[target.'cfg(unix)'.dependencies]
+multiview-webengine = { path = "../multiview-webengine" }
 
 [dev-dependencies]
 hang = "=0.21.22"

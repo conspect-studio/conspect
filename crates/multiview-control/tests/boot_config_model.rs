@@ -30,7 +30,7 @@ use axum::http::{header, Request, StatusCode};
 use axum::Router;
 use multiview_config::{ConfigDiff, MultiviewConfig, StartMode};
 use multiview_control::boot_model::{
-    finish_running_persist, load_desired, load_resume_config, persist_loaded, persist_running_now,
+    finish_running_persist, load_desired, load_resume_config, persist_running_now,
     spawn_running_persist, write_active_serialized, write_atomic, BootModel,
 };
 use multiview_control::config_watch::{
@@ -1833,7 +1833,7 @@ async fn first_persist_writes_state_files_0600_in_a_0700_dir() {
     let r = rig(BOOT_DOC);
     // A fresh deployment: no .multiview dir yet.
     let model = r.state.boot_model.clone().expect("rig wires a boot model");
-    persist_loaded(&model).expect("persist loaded");
+    multiview_control::boot_model::persist_loaded(&model).expect("persist loaded");
     persist_running_now(&r.state)
         .await
         .expect("persist running");

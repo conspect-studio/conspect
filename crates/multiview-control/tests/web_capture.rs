@@ -1,3 +1,4 @@
+#![cfg(unix)]
 //! Capture route authorization and honest unavailable behavior.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
 mod support;

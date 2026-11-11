@@ -19,9 +19,12 @@ serde = { workspace = true }
 thiserror = { workspace = true }
 serde_json = { workspace = true }
 sha2 = "0.10"
-rustix = { workspace = true, features = ["event", "fs", "process", "param"] }
 # Rust-owned private job root (profile/HOME/TMPDIR) removed after all children are dead.
 tempfile = "3"
+
+# The capture runtime modules are unix-only (see lib.rs).
+[target.'cfg(unix)'.dependencies]
+rustix = { workspace = true, features = ["event", "fs", "process", "param"] }
 
 [dev-dependencies]
 # Asserting the wire shape of the published record, in particular that an

@@ -1,3 +1,4 @@
+#![cfg(unix)]
 //! Deterministic fetch tests: the REAL embedded `fetch_host.cjs` under real node,
 //! with fake `yt-dlp` and fake egress-wrapper executables. No network.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::print_stderr)]
