@@ -1135,11 +1135,13 @@ jobs:
       - name: "vcpkg deps (permissive only: opus BSD, libsrt MPL-2.0 + OpenSSL Apache-2.0, zlib)"
         run: |
           & "$env:VCPKG_ROOT\vcpkg.exe" install --triplet x64-windows opus libsrt zlib
+      - name: FFmpeg prefix outside the checkout (no `..`; actions/cache rejects it)
+        run: '"FF_PREFIX_WIN=$env:RUNNER_WORKSPACE\multiview-ffmpeg" | Out-File -Append $env:GITHUB_ENV'
       - name: Cache pinned FFmpeg prefix
         id: ffcache
         uses: actions/cache@v4
         with:
-          path: ${{ runner.workspace }}\multiview-ffmpeg
+          path: ${{ env.FF_PREFIX_WIN }}
           key: ffmpeg-windows-${{ hashFiles('deploy/ffmpeg-build.sh', 'deploy/ffmpeg-fetch-source.sh', 'deploy/ffmpeg-patches/**', 'deploy/Dockerfile.ffmpeg', '.github/workflows/ci.yml') }}
       - name: Build pinned FFmpeg (windows profile)
         if: steps.ffcache.outputs.cache-hit != 'true'
