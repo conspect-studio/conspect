@@ -544,3 +544,66 @@ fn dropping_a_background_playlist_quiesces_its_writer() {
         "a dropped run's publisher wrote after it was dropped"
     );
 }
+
+/// #253: on a failed run the sink flushes before dropping the publisher, so a
+/// manifest that is already being written (slow disk) still lands.
+#[test]
+fn flush_best_effort_lands_an_in_flight_manifest() {
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let manifest = dir.path().join("index.m3u8");
+    let mut live = LivePlaylist::new(manifest.clone(), 2);
+    let slow: multiview_output::hls::ManifestWriter =
+        Arc::new(|path, bytes, fence: &multiview_output::hls::PublishFence| {
+            std::thread::sleep(Duration::from_millis(150));
+            fence
+                .commit(&mut || {
+                    std::fs::write(path, bytes)
+                        .map_err(|e| multiview_output::Error::Output(e.to_string()))
+                })
+                .map(|_| ())
+        });
+    live.enable_background_publish_with(slow)
+        .expect("publisher");
+    let seg = touch_segment(dir.path(), "seg0.ts");
+    live.push_closed_segment("seg0.ts", seg, 2.0, 0)
+        .expect("close");
+    live.flush_best_effort(Duration::from_secs(2));
+    drop(live);
+    let text = std::fs::read_to_string(&manifest).expect("the committed manifest landed");
+    assert!(text.contains("seg0.ts"), "{text}");
+}
+
+/// #253: the flush is bounded — a writer that never returns cannot hold the
+/// failing run's teardown past the bound.
+#[test]
+fn flush_best_effort_is_bounded_by_a_wedged_writer() {
+    use std::sync::{mpsc, Arc, Mutex};
+    use std::time::{Duration, Instant};
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut live = LivePlaylist::new(dir.path().join("index.m3u8"), 2);
+    let (_hold, gate) = mpsc::channel::<()>();
+    let gate = Arc::new(Mutex::new(gate));
+    let wedged: multiview_output::hls::ManifestWriter = Arc::new(
+        move |_path, _bytes, _fence: &multiview_output::hls::PublishFence| {
+            let _ = gate.lock().unwrap().recv_timeout(Duration::from_secs(30));
+            Ok(())
+        },
+    );
+    live.enable_background_publish_with(wedged)
+        .expect("publisher");
+    let seg = touch_segment(dir.path(), "seg0.ts");
+    live.push_closed_segment("seg0.ts", seg, 2.0, 0)
+        .expect("close");
+    let started = Instant::now();
+    live.flush_best_effort(Duration::from_millis(200));
+    drop(live);
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "flush waited {:?} on a wedged writer",
+        started.elapsed()
+    );
+}

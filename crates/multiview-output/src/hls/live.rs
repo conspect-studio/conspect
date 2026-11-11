@@ -280,6 +280,18 @@ impl LivePlaylist {
         Ok(())
     }
 
+    /// Error-path teardown (#253): let a background publisher land the
+    /// manifest it was already given, waiting at most `bound`, then drop it.
+    /// The committed manifest (every segment it lists is on disk) thus
+    /// survives a failed run instead of racing the drop's fence. Never
+    /// re-renders or adds `ENDLIST` (the run did not finish); synchronous
+    /// playlists already published inline, so this is a no-op for them.
+    pub fn flush_best_effort(&mut self, bound: std::time::Duration) {
+        if let Some(background) = self.background.take() {
+            background.drain_within(bound);
+        }
+    }
+
     /// Finalize the live playlist at end-of-run: mark it finished
     /// (`#EXT-X-ENDLIST`) and publish the final manifest atomically. After this a
     /// player sees a terminated VOD-style playlist of the last window of segments.
@@ -597,12 +609,16 @@ struct Slot {
     pending: Pending,
     error: Option<String>,
     finished: bool,
+    /// A job is being written right now (taken from `pending`).
+    busy: bool,
 }
 
 /// Latest-wins hand-off between the sink (producer) and the `hls-publish` thread.
 struct Shared {
     slot: Mutex<Slot>,
     wake: Condvar,
+    /// Signalled whenever the publisher finishes a job (for `drain_within`).
+    idle: Condvar,
     fence: PublishFence,
 }
 
@@ -624,6 +640,7 @@ impl BackgroundPublisher {
         let shared = Arc::new(Shared {
             slot: Mutex::new(Slot::default()),
             wake: Condvar::new(),
+            idle: Condvar::new(),
             fence: PublishFence::default(),
         });
         let worker = Arc::clone(&shared);
@@ -655,6 +672,27 @@ impl BackgroundPublisher {
             Some(e) => Err(Error::Output(e)),
             None => Ok(()),
         }
+    }
+
+    /// Wait up to `bound` for the pending manifest (if any) to be written,
+    /// then drop (fence + detach) the publisher.
+    fn drain_within(self, bound: std::time::Duration) {
+        let deadline = std::time::Instant::now() + bound;
+        let mut slot = lock(&self.shared.slot);
+        while slot.pending.text.is_some() || slot.busy {
+            let now = std::time::Instant::now();
+            if now >= deadline {
+                break;
+            }
+            let (next, _) = self
+                .shared
+                .idle
+                .wait_timeout(slot, deadline - now)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            slot = next;
+        }
+        drop(slot);
+        // Drop: fences any further write and detaches.
     }
 
     /// Wait for the final manifest to be published and the thread to exit.
@@ -748,10 +786,13 @@ fn publisher_main(shared: &Shared, playlist_path: &Path, writer: &ManifestWriter
             }
             let job = std::mem::take(&mut slot.pending);
             let exit = job.last || (slot.finished && job.text.is_none());
+            slot.busy = job.text.is_some();
             (job, exit)
         };
         let last = job.last;
         publish_one(shared, playlist_path, writer, job);
+        lock(&shared.slot).busy = false;
+        shared.idle.notify_all();
         if exit || last {
             return;
         }
@@ -767,6 +808,12 @@ pub struct BackgroundFile {
 }
 
 impl BackgroundFile {
+    /// Error-path teardown (#253): let the queued write land, waiting at most
+    /// `bound`, then drop the publisher (fence + detach).
+    pub fn flush_best_effort(self, bound: std::time::Duration) {
+        self.inner.drain_within(bound);
+    }
+
     /// Spawn the publisher for `path`.
     ///
     /// # Errors

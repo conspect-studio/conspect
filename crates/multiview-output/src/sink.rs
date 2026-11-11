@@ -1365,11 +1365,19 @@ fn finish_segments(
 ) -> Result<SegmentResult> {
     if let Err(err) = driven {
         state.finalize_open_segment_best_effort();
+        // Land the last committed manifest(s) before the publishers are dropped
+        // (#253): a failed run keeps its previous playlist valid on disk.
+        state.flush_published_best_effort(std::time::Duration::from_secs(2));
         return Err(err);
     }
     let frame_ns = rescale(1, time_base, Rational::new(1, NANOS_PER_SEC));
     let mut playlist = MediaPlaylist::new(SegmentType::MpegTs);
-    state.finish(&mut playlist, frame_ns)?;
+    if let Err(err) = state.finish(&mut playlist, frame_ns) {
+        // A failed finalize (e.g. the main playlist's final publish) must not
+        // drop the renditions' pending manifests either (#253).
+        state.flush_published_best_effort(std::time::Duration::from_secs(2));
+        return Err(err);
+    }
     // TARGETDURATION must be >= the longest EXTINF, as an integer.
     playlist.recompute_target_duration();
     playlist.set_finished(true);
@@ -2834,6 +2842,34 @@ impl<'a> SegmentState<'a> {
         }
         if let Some(live) = self.live.as_mut() {
             live.set_initial_discontinuity();
+        }
+    }
+
+    /// Error path: give every background playlist publisher (main and
+    /// renditions) up to `bound` to land the manifest it already holds.
+    fn flush_published_best_effort(&mut self, bound: std::time::Duration) {
+        // One shared deadline across every publisher: they write in parallel
+        // (each on its own thread), so the total wait is `bound`, not
+        // `bound` x renditions.
+        let deadline = std::time::Instant::now() + bound;
+        let left = || deadline.saturating_duration_since(std::time::Instant::now());
+        if let Some(live) = self.live.as_mut() {
+            live.flush_best_effort(left());
+        }
+        if let Some(renditions) = self.renditions.as_mut() {
+            for state in renditions
+                .states
+                .iter_mut()
+                .chain(std::iter::once(&mut renditions.video))
+            {
+                state.live.flush_best_effort(left());
+            }
+            // The master is queued only once every media playlist exists, so
+            // landing it after them keeps the ordering; without this a failed
+            // run could leave flushed renditions with no discoverable master.
+            if let Some(master) = renditions.master_writer.take() {
+                master.flush_best_effort(left());
+            }
         }
     }
 
