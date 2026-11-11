@@ -1,7 +1,19 @@
 //! Encoded-video adapter seam. Call only from an off-clock bounded consumer task.
 //! Admission, global retained-allocation accounting and authorization are external.
+/// Family-scoped retained allocation lifetime accounting.
+pub mod allocation;
 pub mod av;
+/// Experimental genuine-delivery controller (not production wired).
+pub mod delivery;
+/// Shared multi-rendition ladder: exact admitted specs, one catalog, one clock.
+pub mod ladder;
 pub mod provider;
+/// Real multi-track publication of one admitted shared ladder.
+pub mod publication;
+/// Opt-in outgoing publisher sharing one canonical admitted family.
+pub mod relay;
+/// Publisher-side uplink budgeting and bounded peer subscription tracking.
+pub mod uplink;
 use bytes::Bytes;
 use std::time::Duration;
 
@@ -18,6 +30,18 @@ pub struct Packet {
 pub struct Window {
     pub generation: u64,
     pub packets: Vec<Packet>,
+}
+
+/// A bounded, already admitted window shape that a subscription fence may carry.
+///
+/// The fence charges and wraps exactly the packets this visits, in a bounded deterministic
+/// order, so one fence — one queue bound, one charge account, one revocation identity —
+/// serves both the single-rendition and the shared-ladder shapes. There is no second fence.
+pub trait RetainedWindow: Send + 'static {
+    /// The configuration generation this window was admitted under.
+    fn generation(&self) -> u64;
+    /// Visit every retained packet mutably. Bounded by construction, never parallel.
+    fn for_each_packet(&mut self, visit: &mut dyn FnMut(&mut Packet));
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -37,7 +61,9 @@ pub enum Reject {
 pub struct VideoAdapter {
     track: moq_net::track::Producer,
     group: Option<moq_net::group::Producer>,
+    cancel_groups: Option<std::collections::VecDeque<moq_net::group::Producer>>,
     generation: u64,
+    allocation: Option<allocation::AllocationBudget>,
     revoked: bool,
     needs_rap: bool,
     last_pts: Option<u64>,
@@ -52,11 +78,18 @@ impl VideoAdapter {
         Self {
             track,
             group: None,
+            cancel_groups: None,
             generation,
+            allocation: None,
             revoked: false,
             needs_rap: true,
             last_pts: None,
         }
+    }
+
+    pub fn with_allocation_budget(mut self, budget: allocation::AllocationBudget) -> Self {
+        self.allocation = Some(budget);
+        self
     }
 
     pub fn track_info() -> moq_net::track::Info {
@@ -69,6 +102,27 @@ impl VideoAdapter {
     pub fn revoke(&mut self) {
         self.revoked = true;
         self.group.take();
+    }
+
+    /// Opt into bounded cancellation ownership for experimental publisher trials.
+    pub fn enable_trial_cancellation(&mut self) {
+        if self.cancel_groups.is_none() {
+            self.cancel_groups = Some(Default::default());
+        }
+    }
+
+    /// Abort the current incomplete group when a publisher-prefix trial is canceled.
+    /// Completed older group streams still follow their transport completion/expiry.
+    pub fn abort_group(&mut self) {
+        if let Some(groups) = &mut self.cancel_groups {
+            for group in groups.drain(..) {
+                let _ = group.abort(moq_net::Error::Cancel);
+            }
+        }
+        if let Some(group) = self.group.take() {
+            let _ = group.abort(moq_net::Error::Cancel);
+        }
+        self.needs_rap = true;
     }
 
     /// Signal loss before accepting the next complete window.
@@ -122,9 +176,17 @@ impl VideoAdapter {
             self.discontinuity();
             return Err(error);
         }
-        for packet in &window.packets {
-            if let Err(error) = self.publish_packet(packet) {
-                self.discontinuity();
+        // Reserve/serialize the ENTIRE window before mutating any group or PTS.
+        let prepared = window
+            .packets
+            .iter()
+            .map(|packet| provider::serialized_frame_in(packet, self.allocation.as_ref()))
+            .collect::<Result<Vec<_>, _>>()?;
+        for (packet, serialized) in window.packets.iter().zip(prepared) {
+            if let Err(error) = self.publish_packet(packet, serialized) {
+                // Transport mutation cannot be rolled back; make this adapter terminal.
+                self.abort_group();
+                self.revoked = true;
                 return Err(error);
             }
             self.last_pts = Some(packet.pts_us);
@@ -132,17 +194,24 @@ impl VideoAdapter {
         Ok(())
     }
 
-    fn publish_packet(&mut self, packet: &Packet) -> Result<(), Reject> {
+    fn publish_packet(&mut self, packet: &Packet, serialized: bytes::Bytes) -> Result<(), Reject> {
+        let timestamp = moq_net::Timestamp::new(packet.pts_us, moq_net::Timescale::MICRO)
+            .map_err(|_| Reject::Timestamp)?;
         if packet.verified_rap {
             if let Some(previous) = self.group.take() {
                 previous.finish().map_err(|_| Reject::Transport)?;
+                if let Some(groups) = &mut self.cancel_groups {
+                    groups.push_back(previous);
+                    if groups.len() > 4
+                        && let Some(old) = groups.pop_front()
+                    {
+                        let _ = old.abort(moq_net::Error::Old);
+                    }
+                }
             }
             self.group = Some(self.track.append_group().map_err(|_| Reject::Transport)?);
             self.needs_rap = false;
         }
-        let timestamp = moq_net::Timestamp::new(packet.pts_us, moq_net::Timescale::MICRO)
-            .map_err(|_| Reject::Timestamp)?;
-        let serialized = provider::serialized_frame(packet)?;
         self.group
             .as_mut()
             .ok_or(Reject::NeedsRap)?
@@ -172,6 +241,54 @@ mod tests {
                 verified_rap: rap,
             }],
         }
+    }
+    #[test]
+    fn second_packet_budget_failure_preserves_video_group_and_pts() {
+        let budget = allocation::AllocationBudget::new(12).unwrap();
+        let mut adapter = adapter().with_allocation_budget(budget.clone());
+        let mut window = window(0, true);
+        window.packets.push(Packet {
+            payload: Bytes::from_static(&[0, 1]),
+            pts_us: 1,
+            verified_rap: false,
+        });
+        assert_eq!(adapter.publish(&window), Err(Reject::Budget));
+        assert!(adapter.group.is_none());
+        assert_eq!(adapter.last_pts, None);
+        assert_eq!(budget.retained_bytes(), 0);
+        assert!(!adapter.revoked);
+    }
+    #[test]
+    fn trial_retention_is_bounded_and_opt_in_is_idempotent() {
+        let mut adapter = adapter();
+        assert!(adapter.cancel_groups.is_none());
+        adapter.enable_trial_cancellation();
+        for tick in 0..8 {
+            adapter.publish(&window(tick * 33_333, true)).unwrap();
+        }
+        assert_eq!(adapter.cancel_groups.as_ref().unwrap().len(), 4);
+        adapter.enable_trial_cancellation();
+        assert_eq!(adapter.cancel_groups.as_ref().unwrap().len(), 4);
+        adapter.abort_group();
+        assert!(adapter.group.is_none());
+        assert!(adapter.cancel_groups.as_ref().unwrap().is_empty());
+        assert!(adapter.needs_rap);
+    }
+    #[test]
+    fn finished_groups_remain_abortable_for_trial_cancellation() {
+        let broadcast = moq_net::broadcast::Producer::new(Default::default());
+        let track = broadcast
+            .create_track("trial", VideoAdapter::track_info())
+            .unwrap();
+        let mut group = track.append_group().unwrap();
+        group
+            .write_frame(
+                moq_net::Timestamp::from_millis(0).unwrap(),
+                Bytes::from_static(b"test"),
+            )
+            .unwrap();
+        group.finish().unwrap();
+        assert!(group.abort(moq_net::Error::Cancel).is_ok());
     }
     #[test]
     fn revocation_and_generation_never_publish() {

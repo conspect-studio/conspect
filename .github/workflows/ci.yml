@@ -514,6 +514,80 @@ jobs:
   # so we pull it and `docker cp` /opt/multiview-ffmpeg out onto the runner, then
   # point pkg-config + the loader at it — the identical mechanism deploy/Dockerfile
   # uses (`COPY --from=ffmpeg /opt/multiview-ffmpeg` + PKG_CONFIG_PATH, ADR-0031).
+  avc-metadata-native-gpl:
+    name: AVC metadata native GPL encoder
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    needs: changes
+    if: ${{ github.event_name != 'pull_request' || needs.changes.outputs.code == 'true' }}
+    permissions:
+      contents: read
+      packages: read
+    env:
+      FFMPEG_TAG: 9.0.2-gpl
+      FFMPEG_PREFIX: /opt/multiview-ffmpeg
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@1.99.1
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: avc-metadata-native-gpl
+      - uses: docker/login-action@v4.4.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Extract the published pinned GPL FFmpeg image
+        run: |
+          set -euo pipefail
+          image="$(scripts/resolve-ffmpeg-image.sh "${{ github.repository_owner }}" "${FFMPEG_TAG}")"
+          docker pull "${image}"
+          cid="$(docker create "${image}" /nonexistent)"
+          trap 'docker rm "${cid}" >/dev/null' EXIT
+          sudo mkdir -p "$(dirname "${FFMPEG_PREFIX}")"
+          sudo docker cp "${cid}:${FFMPEG_PREFIX}" "${FFMPEG_PREFIX}"
+      - name: Run actual encoder metadata in the matching Trixie runtime
+        # The GPL prefix is built on Debian Trixie, not the Ubuntu runner ABI.
+        # Use the same pinned Debian base as deploy/Dockerfile.ffmpeg. Mount the
+        # selected Rust toolchain and cache, but resolve native libraries here.
+        run: |
+          set -euo pipefail
+          toolchain_bin="$(dirname "$(rustup which cargo)")"
+          "${toolchain_bin}/rustc" -vV
+          "${toolchain_bin}/cargo" --version
+          docker run --rm -i \
+            -v "$PWD:$PWD" -w "$PWD" \
+            -v "$HOME/.cargo:/cargo" -v "$HOME/.rustup:/rustup:ro" \
+            -v "${FFMPEG_PREFIX}:${FFMPEG_PREFIX}:ro" \
+            -e CARGO_HOME=/cargo -e RUSTUP_HOME=/rustup \
+            -v "$(dirname "${toolchain_bin}"):/selected-rust:ro" \
+            -e PATH=/selected-rust/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
+            -e FFMPEG_PREFIX="${FFMPEG_PREFIX}" \
+            debian:trixie@sha256:9c6e381421d0f48d1b8133e573f33c185ee16cbf505eda9c4a8a4791b25ea8a6 \
+            bash -s <<'TRIXIE'
+          set -euo pipefail
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            ca-certificates build-essential pkg-config clang libclang-dev nasm \
+            libva2 libva-drm2 libopus0 libsrt1.5-openssl libvpl2 libx264-dev libx265-dev \
+            libnuma1 libdrm2 libgnutls30t64
+          export PKG_CONFIG_PATH="${FFMPEG_PREFIX}/lib/pkgconfig"
+          export LD_LIBRARY_PATH="${FFMPEG_PREFIX}/lib"
+          version="$(pkg-config --modversion libavcodec)"
+          case "${version}" in 63.*) ;; *) echo "::error::Expected pinned libavcodec 63.x (FFmpeg 9.0.2)"; exit 1 ;; esac
+          for library in "${FFMPEG_PREFIX}"/lib/lib*.so; do
+            dependencies="$(ldd "${library}")" || { echo "::error::ldd failed"; exit 1; }
+            if grep -q 'not found' <<< "${dependencies}"; then
+              echo "::error::Pinned GPL image runtime dependency mismatch"
+              exit 1
+            fi
+          done
+          cargo test --locked -p multiview-ffmpeg --features ffmpeg,gpl-codecs --lib \
+            codec_metadata::tests::native_libx264_encoder_emission_yields_actual_decoder_metadata -- --exact \
+            2>&1 | tee native-avc-metadata.log
+          grep -Eq '^test result: ok\. 1 passed; 0 failed;' native-avc-metadata.log
+          TRIXIE
+
   feature-clippy-ffmpeg-webrtc:
     name: ffmpeg-linked webrtc clippy
     runs-on: ubuntu-latest

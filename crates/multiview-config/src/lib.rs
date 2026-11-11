@@ -87,6 +87,13 @@ pub use origin::{Origin, OriginParseError};
 pub use placement::{DevicePin, MigrationPolicy, PinVendor, PlacementConfig, PlacementWeights};
 pub use probe::{DetectionZone, Dwell, LoudnessTarget, Probe, ProbeKind};
 pub use program::{ProgramId, ProgramKind, ProgramSpec};
+pub mod rendition;
+pub use rendition::{
+    plan_from_config, AudioRenditionKey, AudioTrackId, EncodeCapabilities, MuxBinding,
+    OutputTransport, RenditionAudioCodec, RenditionColorKey, RenditionPlan, RenditionPlanError,
+    RenditionVideoCodec, VideoRenditionKey, MAX_AUDIO_RENDITIONS_PER_PROGRAM,
+    MAX_VIDEO_RENDITIONS_PER_PROGRAM,
+};
 pub use routing::{
     AudioCrosspoint, OutputCrosspoint, OutputRef, RoutingRefs, RoutingTable, StreamRef,
     StreamSelector, SubtitleCrosspoint, VideoCrosspoint, MAIN_PROGRAM,
@@ -1920,3 +1927,6 @@ fn validate_display_output(
     }
     Ok(())
 }
+
+/// Explicit finite platform-measured preview admission.
+pub mod preview_ladder;

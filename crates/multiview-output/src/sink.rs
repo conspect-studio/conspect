@@ -50,10 +50,13 @@ use multiview_ffmpeg::{
 use crate::epoch::SharedEpoch;
 use crate::error::{Error, Result};
 use crate::hls::{
-    atomic_write, media_segment_references, media_segment_uris, AudioRendition, LivePlaylist,
+    media_segment_references, media_segment_uris, AudioRendition, BackgroundFile, LivePlaylist,
     MasterPlaylist, MediaPlaylist, Segment, SegmentType, VariantStream,
 };
 use crate::metadata::{DisplayMatrix, MetadataScope, MuxMetadata};
+
+mod push;
+pub use push::{is_srt_listener_url, PushRunReport};
 
 /// Nanoseconds in one second (the internal timeline unit, invariant #3).
 const NANOS_PER_SEC: i64 = 1_000_000_000;
@@ -257,6 +260,32 @@ fn stream_index_for(
             "unsupported stream kind for this mux sink".to_owned(),
         )),
     }
+}
+
+/// Apply OUTMETA metadata + the optional display matrix to `muxer` before its
+/// header (shared by [`PacketMuxSink`] and the resilient push writers).
+fn apply_mux_metadata(
+    muxer: &mut Muxer,
+    metadata: &MuxMetadata,
+    display_matrix: Option<DisplayMatrix>,
+    video_index: usize,
+) -> Result<()> {
+    for entry in metadata.entries() {
+        match entry.scope {
+            MetadataScope::Format => muxer
+                .set_format_metadata(&entry.key, &entry.value)
+                .map_err(ff)?,
+            MetadataScope::Stream { index } => muxer
+                .set_stream_metadata(index, &entry.key, &entry.value)
+                .map_err(ff)?,
+        }
+    }
+    if let Some(matrix) = display_matrix {
+        muxer
+            .set_stream_display_matrix(video_index, matrix)
+            .map_err(ff)?;
+    }
+    Ok(())
 }
 
 /// Map a `multiview-ffmpeg` error onto this crate's output error taxonomy.
@@ -527,6 +556,286 @@ struct AudioState {
     /// The stream kind every produced packet is tagged with: the program
     /// ([`StreamKind::Audio`]) or a discrete track ([`StreamKind::AudioTrack`]).
     kind: StreamKind,
+}
+
+/// One independently admitted video rendition. Shares the baked canvas with
+/// sibling renditions; it never opens or duplicates a program-audio encoder.
+pub struct VideoRenditionEncoder {
+    encoder: VideoEncoder,
+    converter: FrameConverter,
+    params: StreamCodecParameters,
+    time_base: Rational,
+    tick: i64,
+    finished: bool,
+    no_reorder: bool,
+}
+
+impl VideoRenditionEncoder {
+    /// Open one video-only encoder with the exact requested configuration.
+    ///
+    /// # Errors
+    /// Returns an error if the video encoder is unavailable or invalid.
+    pub fn new(config: &EncodeConfig) -> Result<Self> {
+        config.validate()?;
+        let pairs: &[(&str, &str)] =
+            if config.codec_name == "libx264" || config.codec_name == "libx265" {
+                &[("tune", "zerolatency"), ("bf", "0")]
+            } else if config.codec_name.ends_with("_nvenc") {
+                &[
+                    ("tune", "ull"),
+                    ("zerolatency", "1"),
+                    ("delay", "0"),
+                    ("bf", "0"),
+                ]
+            } else {
+                &[("bf", "0")]
+            };
+        let options = multiview_ffmpeg::CodecOptions::from_pairs(pairs)
+            .map_err(|e| Error::Output(e.to_string()))?;
+        let encoder = VideoEncoder::new_with_options(&config.target(), &options).map_err(ff)?;
+        let params = StreamCodecParameters::from_encoder(&encoder);
+        let time_base = encoder.time_base();
+        let no_reorder = encoder.no_reorder_proven();
+        Ok(Self {
+            encoder,
+            converter: FrameConverter::new(config.format),
+            params,
+            time_base,
+            tick: 0,
+            finished: false,
+            no_reorder,
+        })
+    }
+
+    /// True only when the opened encoder is proven never to reorder (no B
+    /// frames configured). NOT a zero-delay claim: a delayed-but-ordered
+    /// encoder (e.g. mpeg2video's fixed one-frame delay) still proves this
+    /// true, and its drained packets are re-stamped `DTS := PTS` (see
+    /// [`Self::drain`]); the emission order is pinned empirically by tests.
+    #[must_use]
+    pub const fn no_reorder_proven(&self) -> bool {
+        self.no_reorder
+    }
+
+    /// Codec parameters for all bindings to this rendition.
+    #[must_use]
+    pub fn codec_params(&self) -> &StreamCodecParameters {
+        &self.params
+    }
+
+    /// The output cadence reciprocal used for encoder timestamps.
+    #[must_use]
+    pub fn time_base(&self) -> Rational {
+        self.time_base
+    }
+
+    /// Encode one immutable baked canvas at the absolute output tick.
+    ///
+    /// # Errors
+    /// Returns an error for an invalid frame or an encoder failure.
+    pub fn encode_frame_at(
+        &mut self,
+        frame: DecodedVideoFrame,
+        tick: u64,
+    ) -> Result<Vec<EncodedPacket>> {
+        if self.finished {
+            return Err(Error::Output(
+                "video rendition encoder is finished".to_owned(),
+            ));
+        }
+        let pts = i64::try_from(tick)
+            .map_err(|_| Error::Output("video tick exceeds i64 PTS".to_owned()))?;
+        if pts != self.tick {
+            return Err(Error::Output(format!(
+                "video tick discontinuity: expected {}, got {pts}",
+                self.tick
+            )));
+        }
+        let prepared = self.converter.prepare(frame.frame, pts)?;
+        self.encoder.send_frame(&prepared).map_err(ff)?;
+        self.tick = pts.saturating_add(1);
+        self.drain()
+    }
+
+    /// Flush any delayed coded frames after the last input tick.
+    ///
+    /// # Errors
+    /// Returns an error if encoder EOF or packet receive fails.
+    pub fn finish(&mut self) -> Result<Vec<EncodedPacket>> {
+        if self.finished {
+            return Ok(Vec::new());
+        }
+        self.finished = true;
+        self.encoder.send_eof().map_err(ff)?;
+        self.drain()
+    }
+
+    fn drain(&mut self) -> Result<Vec<EncodedPacket>> {
+        let mut packets = Vec::new();
+        while let Some(packet) = self.encoder.receive_packet().map_err(ff)? {
+            packets.push(EncodedPacket::from_packet(packet));
+        }
+        // A proven no-reorder encoder emits packets in frame order, so this
+        // packet's PTS is its frame's tick and decode order equals
+        // presentation order: re-stamp DTS := PTS (the output-clock rule —
+        // timestamps come from the tick counter, never from a floating encoder
+        // artifact). This cancels the one-frame DTS lag of delayed-but-ordered
+        // encoders (e.g. mpeg2video's fixed `delay = 1`, whose first packet
+        // would otherwise carry DTS one tick below zero and fall outside the
+        // dispatcher's tick-window protocol). Reordering encoders keep
+        // libav's DTS untouched: their decode order genuinely differs from
+        // presentation order. The per-codec emission order this relies on is
+        // PINNED EMPIRICALLY by the emission-order tests below, not by doc.
+        if self.no_reorder {
+            for packet in &mut packets {
+                packet.set_dts_to_pts();
+            }
+        }
+        Ok(packets)
+    }
+}
+
+/// One shared program-audio rendition, independent of all video keys.
+pub struct AudioRenditionEncoder {
+    audio: AudioState,
+    tracks: Vec<AudioState>,
+    config: AudioEncodeConfig,
+    finished: bool,
+}
+
+impl AudioRenditionEncoder {
+    /// Open the program audio exactly once, independent of video rendition count.
+    ///
+    /// # Errors
+    /// Returns an error when its audio codec cannot open.
+    pub fn new(config: &AudioEncodeConfig) -> Result<Self> {
+        Ok(Self {
+            audio: AudioState::open(config, StreamKind::Audio)?,
+            tracks: Vec::new(),
+            config: config.clone(),
+            finished: false,
+        })
+    }
+
+    /// Open separately identified discrete tracks with the shared audio format.
+    ///
+    /// # Errors
+    /// Returns an error when the requested track codec cannot open.
+    pub fn open_tracks(&mut self, count: u16) -> Result<()> {
+        if self.finished || !self.tracks.is_empty() || self.audio.audio_pts != 0 {
+            return Err(Error::Output(
+                "audio tracks must open before encoding".to_owned(),
+            ));
+        }
+        for index in 0..count {
+            self.tracks.push(AudioState::open(
+                &self.config,
+                StreamKind::AudioTrack(index),
+            )?);
+        }
+        Ok(())
+    }
+
+    /// Program-audio encoder frame size in exact samples (AAC is typically 1024).
+    #[must_use]
+    pub fn frame_samples(&self) -> Option<u32> {
+        u32::try_from(self.audio.frame_size).ok()
+    }
+
+    /// Per-track sample rate and frame size from the actual opened encoder.
+    #[must_use]
+    pub fn watermark_streams(&self) -> Vec<(u32, u32)> {
+        std::iter::once(&self.audio)
+            .chain(self.tracks.iter())
+            .filter_map(|state| {
+                Some((
+                    u32::try_from(state.frame_size).ok()?,
+                    u32::try_from(state.time_base.den).ok()?,
+                ))
+            })
+            .collect()
+    }
+
+    /// Program-audio stream parameters and sample-clock time base.
+    #[must_use]
+    pub fn codec_params(&self) -> &StreamCodecParameters {
+        &self.audio.params
+    }
+
+    /// Program-audio sample-clock time base.
+    #[must_use]
+    pub fn time_base(&self) -> Rational {
+        self.audio.time_base
+    }
+
+    /// Discrete tracks in stable stream-index order.
+    #[must_use]
+    pub fn track_streams(&self) -> Vec<(StreamCodecParameters, Rational)> {
+        self.tracks
+            .iter()
+            .map(|track| (track.params.clone(), track.time_base))
+            .collect()
+    }
+
+    /// Encode a mixed program block once for all video renditions.
+    ///
+    /// # Errors
+    /// Returns an error after finish or if encoder input is invalid.
+    pub fn encode_interleaved(
+        &mut self,
+        samples: &[f32],
+        frames: usize,
+    ) -> Result<Vec<EncodedPacket>> {
+        if self.finished {
+            return Err(Error::Output(
+                "audio rendition encoder is finished".to_owned(),
+            ));
+        }
+        self.audio.encode_interleaved(samples, frames)
+    }
+
+    /// Encode one discrete track from a source block or matching silence.
+    ///
+    /// # Errors
+    /// Returns an error after finish, for an unknown track, or encoder failure.
+    pub fn encode_track_interleaved(
+        &mut self,
+        index: usize,
+        samples: Option<&[f32]>,
+        frames: usize,
+    ) -> Result<Vec<EncodedPacket>> {
+        if self.finished {
+            return Err(Error::Output(
+                "audio rendition encoder is finished".to_owned(),
+            ));
+        }
+        let track = self
+            .tracks
+            .get_mut(index)
+            .ok_or_else(|| Error::Output(format!("unknown discrete audio track {index}")))?;
+        let needed = frames.saturating_mul(track.fifo.len());
+        if let Some(samples) = samples.filter(|samples| samples.len() >= needed) {
+            track.encode_interleaved(samples, frames)
+        } else {
+            track.encode_interleaved(&vec![0.0; needed], frames)
+        }
+    }
+
+    /// Flush every audio track and the program once.
+    ///
+    /// # Errors
+    /// Returns an error if an audio encoder cannot flush.
+    pub fn finish(&mut self) -> Result<Vec<EncodedPacket>> {
+        if self.finished {
+            return Ok(Vec::new());
+        }
+        self.finished = true;
+        let mut packets = self.audio.finish()?;
+        for track in &mut self.tracks {
+            packets.extend(track.finish()?);
+        }
+        Ok(packets)
+    }
 }
 
 /// The single **encode-once** program producer.
@@ -1130,6 +1439,16 @@ struct SingleRoutes<'r> {
     tracks: &'r TrackIndices,
 }
 
+/// The muxer stream `packet` writes to under `routes`, or `None` when this sink
+/// does not carry it (an unselected discrete track / deselected program audio).
+fn route_packet(routes: &SingleRoutes<'_>, packet: &EncodedPacket) -> Result<Option<usize>> {
+    match packet.kind() {
+        StreamKind::AudioTrack(track) => Ok(track_stream_index(routes.tracks, track)),
+        StreamKind::Audio if routes.drop_program_audio => Ok(None),
+        kind => stream_index_for(kind, routes.video, routes.audio).map(Some),
+    }
+}
+
 fn drive_packets_to_single_muxer<P: PacketSource>(
     muxer: &mut Muxer,
     routes: &SingleRoutes<'_>,
@@ -1137,13 +1456,8 @@ fn drive_packets_to_single_muxer<P: PacketSource>(
 ) -> Result<EncodeStats> {
     let mut stats = EncodeStats::default();
     while let Some(packet) = source.next_packet()? {
-        let index = match packet.kind() {
-            StreamKind::AudioTrack(track) => match track_stream_index(routes.tracks, track) {
-                Some(index) => index,
-                None => continue,
-            },
-            StreamKind::Audio if routes.drop_program_audio => continue,
-            kind => stream_index_for(kind, routes.video, routes.audio)?,
+        let Some(index) = route_packet(routes, &packet)? else {
+            continue;
         };
         // Keyframe stats track the VIDEO GOP only; AAC packets are all flagged
         // key, which would otherwise inflate the count.
@@ -1448,6 +1762,9 @@ pub struct PacketMuxSink {
     display_matrix: Option<DisplayMatrix>,
     /// Which audio this sink carries (#151/#152). Default: program only.
     audio_selection: AudioSelection,
+    /// The rendition-master writer (production: fenced atomic publish). A test
+    /// seam to inject a failing master write; see `with_master_writer`.
+    master_writer: Option<crate::hls::ManifestWriter>,
 }
 
 /// The two `PacketMuxSink` flavours (private; the public surface is the
@@ -1491,6 +1808,7 @@ impl PacketMuxSink {
             metadata: MuxMetadata::new(),
             display_matrix: None,
             audio_selection: AudioSelection::default(),
+            master_writer: None,
         }
     }
 
@@ -1506,6 +1824,7 @@ impl PacketMuxSink {
             metadata: MuxMetadata::new(),
             display_matrix: None,
             audio_selection: AudioSelection::default(),
+            master_writer: None,
         }
     }
 
@@ -1526,7 +1845,17 @@ impl PacketMuxSink {
             metadata: MuxMetadata::new(),
             display_matrix: None,
             audio_selection: AudioSelection::default(),
+            master_writer: None,
         }
+    }
+
+    /// Replace the rendition-master writer (test seam: inject a failing or slow
+    /// master publish). Production uses the fenced atomic writer.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn with_master_writer(mut self, writer: crate::hls::ManifestWriter) -> Self {
+        self.master_writer = Some(writer);
+        self
     }
 
     /// A **rolling live** segmented (HLS) sink (HLS-0/1, ADR-0032): like
@@ -1559,6 +1888,7 @@ impl PacketMuxSink {
             metadata: MuxMetadata::new(),
             display_matrix: None,
             audio_selection: AudioSelection::default(),
+            master_writer: None,
         }
     }
 
@@ -1606,22 +1936,7 @@ impl PacketMuxSink {
     /// stream-scoped entries their stream. Shared by the single-mux and the
     /// per-segment paths so every container of a run carries the same metadata.
     fn apply_metadata(&self, muxer: &mut Muxer, video_index: usize) -> Result<()> {
-        for entry in self.metadata.entries() {
-            match entry.scope {
-                MetadataScope::Format => muxer
-                    .set_format_metadata(&entry.key, &entry.value)
-                    .map_err(ff)?,
-                MetadataScope::Stream { index } => muxer
-                    .set_stream_metadata(index, &entry.key, &entry.value)
-                    .map_err(ff)?,
-            }
-        }
-        if let Some(matrix) = self.display_matrix {
-            muxer
-                .set_stream_display_matrix(video_index, matrix)
-                .map_err(ff)?;
-        }
-        Ok(())
+        apply_mux_metadata(muxer, &self.metadata, self.display_matrix, video_index)
     }
 
     /// Mux the whole `source` packet stream, seeding every muxer stream from
@@ -1748,6 +2063,9 @@ impl PacketMuxSink {
                 );
                 state.set_meta(&self.metadata, self.display_matrix);
                 state.set_tracks(&self.audio_selection, track_streams);
+                if let Some(writer) = self.master_writer.as_ref() {
+                    state.master_writer = std::sync::Arc::clone(writer);
+                }
                 // The rolling-live driver: each closed segment is published into a
                 // windowed `.m3u8` on disk (atomic) and the evicted `.ts` pruned,
                 // PDT-stamped from the shared outbound epoch (ADR-M010).
@@ -1760,6 +2078,8 @@ impl PacketMuxSink {
                 if next != 0 {
                     live.set_initial_discontinuity();
                 }
+                // #220: manifest write + fsync + rename off the packet path.
+                live.enable_background_publish()?;
                 state.seg_index = next;
                 state.live = Some(live);
                 state.set_audio_renditions(
@@ -1769,7 +2089,7 @@ impl PacketMuxSink {
                     video,
                     audio,
                     track_streams,
-                );
+                )?;
                 let driven = state.drive_from_packets(source);
                 finish_segments(state, driven, video.time_base)
                     .map(|result| PacketMuxOutcome::Segment(Box::new(result)))
@@ -1806,18 +2126,31 @@ impl StreamSeed<'_> {
 }
 
 /// Per-run segmentation state: the open segment, completed segments, and stats.
+///
+/// ## One long-lived muxer per run (continuity counters, root-caused)
+/// [`current`](Self::current) holds exactly **one** [`Muxer`] for the entire
+/// run (opened lazily by the first keyframe), not one muxer per segment. A
+/// segment boundary calls [`Muxer::redirect_output`] to point the SAME
+/// `AVFormatContext` at the next segment's file; it never calls
+/// `Muxer::create_as` again. This is required because libav's `mpegtsenc`
+/// keeps PAT/PMT/SDT/ES continuity counters (`cc`) as per-PID state on the
+/// `AVFormatContext`: a fresh muxer per segment restarted every `cc` at 0,
+/// which a player demuxing the HLS output as one continuous MPEG-TS reports as
+/// a continuity-counter discontinuity at every segment cut (see the
+/// [`Muxer::redirect_output`] doc for the libav-source cross-reference). The
+/// discrete per-rendition audio muxers ([`AudioRenditionState::current`])
+/// carry the identical one-muxer-per-rendition-for-the-run fix.
 struct SegmentState<'a> {
     dir: &'a Path,
     prefix: &'a str,
     time_base: Rational,
-    /// The **single** run-wide codec-parameter seed. Each new segment muxer
-    /// copies the same codec parameters from this; the codec is fixed across the
-    /// encode (invariant #7), so the seed is borrowed once — never per segment.
+    /// The **single** run-wide codec-parameter seed. The one long-lived video
+    /// muxer's stream is registered from this ONCE, at first open; the codec is
+    /// fixed across the encode (invariant #7).
     seed: StreamSeed<'a>,
-    /// The optional program-audio stream registered into every segment muxer
-    /// alongside the video (AUD-4). `None` for the encoder-fed (video-only)
-    /// [`SegmentSink`]; the codec is fixed for the run so this too is borrowed
-    /// once and reused per segment.
+    /// The optional program-audio stream registered on the long-lived video
+    /// muxer alongside the video (AUD-4), once at first open. `None` for the
+    /// encoder-fed (video-only) [`SegmentSink`].
     audio: Option<MuxStream<'a>>,
     current: Option<OpenSegment>,
     /// Completed `(path, duration_seconds)` in order. For the batch flavour this
@@ -1828,6 +2161,17 @@ struct SegmentState<'a> {
     done: Vec<(PathBuf, f64)>,
     /// PTS of the most recently written packet (the running segment edge).
     last_pts: MediaTime,
+    /// A failed live muxer is discarded. Resume only at a video keyframe.
+    recovering: bool,
+    /// Inject one packet-write failure in the real segment driver (unit test only).
+    #[cfg(test)]
+    fail_packet_write_once: bool,
+    /// Consecutive failed reopen attempts; terminal errors reach the supervisor.
+    recovery_failures: u8,
+    /// A close/playlist publication failure must reach the caller, not hide.
+    publication_failed: bool,
+    #[cfg(test)]
+    fail_playlist_publish_once: Option<()>,
     stats: EncodeStats,
     /// The optional rolling **live** playlist driver (HLS-0/1, ADR-0032). `None`
     /// is the historical **batch** behaviour: segments mux in place and the
@@ -1842,23 +2186,31 @@ struct SegmentState<'a> {
     /// historical `done.len()`-derived names.
     seg_index: u64,
     /// OUTMETA (ADR-0088/0089): the per-output metadata + tag-path display
-    /// matrix to apply to **every** segment muxer before its header is written
-    /// (the codec/stream layout is fixed for the run, invariant #7). `None`
-    /// (the default, and always for the encoder-fed `SegmentSink`) ⇒ no metadata
-    /// to apply, byte-identical to before this field existed.
+    /// matrix applied to the long-lived video muxer ONCE, before its first
+    /// `write_header` (the codec/stream layout is fixed for the run, invariant
+    /// #7). `None` (the default, and always for the encoder-fed `SegmentSink`)
+    /// ⇒ no metadata to apply, byte-identical to before this field existed.
     meta: Option<(&'a MuxMetadata, Option<DisplayMatrix>)>,
     /// Audio-only rendition muxers mirror video GOP boundaries off the hot path.
     renditions: Option<AudioRenditions<'a>>,
-    /// The discrete tracks (#152) registered into every segment muxer after
-    /// the program audio, plus the per-track seeds. Empty ⇒ unchanged layout.
+    /// The discrete tracks (#152) registered on the long-lived video muxer
+    /// ONCE, after the program audio, plus the per-track seeds. Empty ⇒
+    /// unchanged layout.
     tracks: Option<(&'a AudioSelection, &'a [MuxStream<'a>])>,
+    /// The rendition-master writer (production default; tests may inject one).
+    master_writer: crate::hls::ManifestWriter,
 }
 
-/// One audio-only MPEG-TS muxer, opened at the same video GOP boundary.
+/// One audio-only MPEG-TS muxer, opened ONCE at the run's first video keyframe
+/// and redirected (never rebuilt) to a new file at every later GOP boundary —
+/// same continuity-counter-preserving fix as [`OpenSegment`].
 struct AudioSegment {
     muxer: Muxer,
     stream_index: usize,
+    /// The **final** path the current segment is published under.
     path: PathBuf,
+    /// The path the muxer is currently redirected to (the live flavour's
+    /// same-directory `<seg>.tmp`, renamed onto `path` on close).
     write_path: PathBuf,
     packets: u64,
 }
@@ -1876,26 +2228,34 @@ struct AudioRenditions<'a> {
     video: AudioRenditionState<'a>,
     master: PathBuf,
     master_text: Option<String>,
+    /// The master is static for a run: queued once (#220) to an off-packet-path
+    /// publisher, never written + fsynced inline on a segment close.
+    master_published: bool,
+    /// The off-packet-path writer for the master (spawned on first publish).
+    master_writer: Option<BackgroundFile>,
     retention_window: usize,
 }
 
-/// An in-progress segment: its muxer, registered stream index, file path, and
-/// the PTS of its first frame (for duration computation).
+/// The one long-lived segment muxer's state: its (never rebuilt) `Muxer`, its
+/// registered stream indices, the current segment's file path, and the PTS of
+/// its first frame (for duration computation). A segment boundary redirects
+/// [`Self::muxer`] to a new file in place — it never replaces this struct's
+/// `muxer` with a fresh one.
 struct OpenSegment {
     muxer: Muxer,
     stream_index: usize,
-    /// The audio stream index registered on this segment muxer, if the run
-    /// carries program audio (AUD-4); `None` for a video-only run.
+    /// The audio stream index registered on the muxer, if the run carries
+    /// program audio (AUD-4); `None` for a video-only run.
     audio_index: Option<usize>,
-    /// `(track index, stream index)` of each discrete track on this segment.
+    /// `(track index, stream index)` of each discrete track, registered once.
     track_indices: TrackIndices,
-    /// The **final** path the closed segment is published under (referenced by
-    /// the playlist).
+    /// The **final** path the current segment is published under (referenced
+    /// by the playlist).
     path: PathBuf,
-    /// The path the muxer actually writes to while the segment is open. For the
-    /// **live** flavour this is a same-directory `<path>.tmp` that is renamed onto
-    /// `path` only after `Muxer::finish` (HLS-1 atomic publish); for the batch
-    /// flavour it equals `path` (mux in place, byte-identical to before).
+    /// The path the muxer is currently redirected to. For the **live** flavour
+    /// this is a same-directory `<path>.tmp` that is renamed onto `path` only
+    /// after the segment closes (HLS-1 atomic publish); for the batch flavour
+    /// it equals `path` (mux in place, byte-identical to before).
     write_path: PathBuf,
     start_pts: MediaTime,
 }
@@ -1921,12 +2281,20 @@ impl<'a> SegmentState<'a> {
             current: None,
             done: Vec::new(),
             last_pts: MediaTime::ZERO,
+            recovering: false,
+            #[cfg(test)]
+            fail_packet_write_once: false,
+            recovery_failures: 0,
+            publication_failed: false,
+            #[cfg(test)]
+            fail_playlist_publish_once: None,
             stats: EncodeStats::default(),
             live: None,
             seg_index: 0,
             meta: None,
             tracks: None,
             renditions: None,
+            master_writer: crate::hls::default_writer(),
         }
     }
 
@@ -1942,7 +2310,7 @@ impl<'a> SegmentState<'a> {
         video: MuxStream<'a>,
         audio: Option<MuxStream<'a>>,
         tracks: &'a [MuxStream<'a>],
-    ) {
+    ) -> Result<()> {
         let default_selection = AudioSelection::default();
         let selection = self
             .tracks
@@ -1956,6 +2324,7 @@ impl<'a> SegmentState<'a> {
                 let uri = format!("audio-program-g{generation}.m3u8");
                 let mut live = LivePlaylist::new(parent.join(&uri), window);
                 live.set_epoch_source(epoch.clone());
+                live.enable_background_publish()?;
                 live.set_media_sequence(self.seg_index);
                 if self.seg_index != 0 {
                     live.set_initial_discontinuity();
@@ -1983,6 +2352,7 @@ impl<'a> SegmentState<'a> {
             let uri = format!("audio-track{}-g{generation}.m3u8", track.index);
             let mut live = LivePlaylist::new(parent.join(&uri), window);
             live.set_epoch_source(epoch.clone());
+            live.enable_background_publish()?;
             live.set_media_sequence(self.seg_index);
             if self.seg_index != 0 {
                 live.set_initial_discontinuity();
@@ -2007,6 +2377,7 @@ impl<'a> SegmentState<'a> {
         let video_uri = format!("video-g{generation}.m3u8");
         let mut video_live = LivePlaylist::new(parent.join(&video_uri), window);
         video_live.set_epoch_source(epoch);
+        video_live.enable_background_publish()?;
         video_live.set_media_sequence(self.seg_index);
         if self.seg_index != 0 {
             video_live.set_initial_discontinuity();
@@ -2065,10 +2436,20 @@ impl<'a> SegmentState<'a> {
             },
             master: parent.join("master.m3u8"),
             master_text: bandwidth.map(|_| master.render()),
+            master_published: false,
+            master_writer: None,
             retention_window: window,
         });
+        Ok(())
     }
 
+    /// Open or redirect every audio-only rendition muxer to segment `index`'s
+    /// file. The FIRST call per rendition builds its one long-lived `Muxer`
+    /// (registers its stream, writes the header); every later call
+    /// [`Muxer::redirect_output`]s the SAME muxer to the new file instead of
+    /// rebuilding it — preserving that rendition's own PAT/PMT/SDT/ES
+    /// continuity counters across segment boundaries (identical fix to the
+    /// video muxer; see [`SegmentState`]'s doc).
     fn open_audio_segments(&mut self, index: u64) -> Result<()> {
         let Some(renditions) = self.renditions.as_mut() else {
             return Ok(());
@@ -2080,18 +2461,25 @@ impl<'a> SegmentState<'a> {
         {
             let path = self.dir.join(format!("{}{index}.ts", state.prefix));
             let write_path = segment_temp_path(&path);
-            let mut muxer = Muxer::create_as(&write_path, "mpegts").map_err(ff)?;
-            let stream_index = muxer
-                .add_stream_from_parameters(state.stream.params, state.stream.time_base)
-                .map_err(ff)?;
-            muxer.write_header().map_err(ff)?;
-            state.current = Some(AudioSegment {
-                muxer,
-                stream_index,
-                path,
-                write_path,
-                packets: 0,
-            });
+            if let Some(segment) = state.current.as_mut() {
+                segment.muxer.redirect_output(&write_path).map_err(ff)?;
+                segment.path = path;
+                segment.write_path = write_path;
+                segment.packets = 0;
+            } else {
+                let mut muxer = Muxer::create_as(&write_path, "mpegts").map_err(ff)?;
+                let stream_index = muxer
+                    .add_stream_from_parameters(state.stream.params, state.stream.time_base)
+                    .map_err(ff)?;
+                muxer.write_header().map_err(ff)?;
+                state.current = Some(AudioSegment {
+                    muxer,
+                    stream_index,
+                    path,
+                    write_path,
+                    packets: 0,
+                });
+            }
         }
         Ok(())
     }
@@ -2109,15 +2497,29 @@ impl<'a> SegmentState<'a> {
             return Ok(());
         };
         if let Some(segment) = state.current.as_mut() {
+            // Shared-ref header copy: the HLS segmenter never mutates coded
+            // payload bytes, so the mux gets independent AVPacket metadata over
+            // the SAME immutable payload the other bindings are muxing. The old
+            // `to_owned_packet()` did `av_packet_ref` + `av_packet_make_writable`,
+            // i.e. one full coded-payload copy per HLS write.
             segment
                 .muxer
-                .write_packet(segment.stream_index, packet.to_owned_packet())
+                .write_packet(
+                    segment.stream_index,
+                    packet.to_owned_packet_shared_ref().map_err(ff)?,
+                )
                 .map_err(ff)?;
             segment.packets = segment.packets.saturating_add(1);
         }
         Ok(())
     }
 
+    /// Publish each rendition's just-finished segment (rename `<seg>.tmp` onto
+    /// its final name, push it into the rendition's rolling playlist) WITHOUT
+    /// finishing (trailer-writing) the muxer — it stays open and gets
+    /// [`Muxer::redirect_output`]ed to the next file by the following
+    /// [`SegmentState::open_audio_segments`] call. [`Self::finish_audio_segments`]
+    /// is the true end-of-run (or error-path) trailer write.
     fn close_audio_segments(&mut self, duration: f64, start_pts_ns: i64) -> Result<()> {
         let Some(renditions) = self.renditions.as_mut() else {
             return Ok(());
@@ -2127,10 +2529,9 @@ impl<'a> SegmentState<'a> {
             .iter_mut()
             .chain(std::iter::once(&mut renditions.video))
         {
-            let Some(mut segment) = state.current.take() else {
+            let Some(segment) = state.current.as_mut() else {
                 continue;
             };
-            segment.muxer.finish().map_err(ff)?;
             if segment.packets == 0 {
                 match std::fs::remove_file(&segment.write_path) {
                     Ok(()) | Err(_) => {}
@@ -2138,6 +2539,12 @@ impl<'a> SegmentState<'a> {
                 // Never list an empty audio segment as a playable rendition.
                 continue;
             }
+            // Flush every buffered byte of THIS segment onto `write_path`
+            // before renaming it into place — `redirect_output` (called next,
+            // from `SegmentState::open_audio_segments`) also flushes, but that
+            // is too late for an atomic rename of the file we are about to
+            // retire.
+            segment.muxer.flush().map_err(ff)?;
             std::fs::rename(&segment.write_path, &segment.path)
                 .map_err(|e| Error::Output(format!("publishing audio segment: {e}")))?;
             let uri = segment
@@ -2150,6 +2557,51 @@ impl<'a> SegmentState<'a> {
                 .push_closed_segment(uri, segment.path.clone(), duration, start_pts_ns)?;
         }
         Ok(())
+    }
+
+    /// True end-of-run (or best-effort error-path) finalize: write the trailer
+    /// on every rendition's long-lived muxer and drop it. Must run AFTER the
+    /// final [`Self::close_audio_segments`] (the publish/rename for the last
+    /// segment) — mirrors the video muxer's split between
+    /// [`SegmentState::publish_current_segment`] (bookkeeping, muxer stays
+    /// open) and the real `finish()` here.
+    fn finish_audio_segments(&mut self) -> Result<()> {
+        let Some(renditions) = self.renditions.as_mut() else {
+            return Ok(());
+        };
+        for state in renditions
+            .states
+            .iter_mut()
+            .chain(std::iter::once(&mut renditions.video))
+        {
+            if let Some(mut segment) = state.current.take() {
+                segment.muxer.finish().map_err(ff)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Best-effort finalize of every rendition's long-lived muxer on the
+    /// mid-run error path: writes the trailer (closing the container
+    /// structurally) and drops it, WITHOUT publishing/renaming the in-flight
+    /// segment (it is left at its `.tmp`/direct write path, matching the
+    /// video muxer's [`SegmentState::finalize_open_segment_best_effort`]).
+    /// Any finish failure is swallowed — the original drive error wins.
+    fn finalize_audio_segments_best_effort(&mut self) {
+        let Some(renditions) = self.renditions.as_mut() else {
+            return;
+        };
+        for state in renditions
+            .states
+            .iter_mut()
+            .chain(std::iter::once(&mut renditions.video))
+        {
+            if let Some(mut segment) = state.current.take() {
+                match segment.muxer.finish() {
+                    Ok(()) | Err(_) => {}
+                }
+            }
+        }
     }
 
     /// Attach the discrete-track selection + seeds (#152) every segment muxer
@@ -2238,67 +2690,160 @@ impl<'a> SegmentState<'a> {
     /// File and a Segment sink fed the SAME packets produce the SAME media.
     fn drive_from_packets<P: PacketSource>(&mut self, source: &mut P) -> Result<()> {
         while let Some(packet) = source.next_packet()? {
-            let pts = pts_from_packet(packet.pts(), self.stats.packets, self.time_base);
-            match packet.kind() {
-                StreamKind::Video => {
-                    // Only a VIDEO keyframe rotates a segment (the GOP boundary —
-                    // invariant #7); the first packet is always a keyframe.
-                    let is_key = packet.is_keyframe();
-                    if is_key {
-                        self.start_segment(pts)?;
-                    }
-                    self.write_audio_rendition(&packet)?;
-                    let owned = packet.into_owned_packet();
-                    let (muxer, index) = self.current_muxer()?;
-                    muxer.write_packet(index, owned).map_err(ff)?;
-                    self.record(is_key, pts);
-                }
-                StreamKind::AudioTrack(track) => {
-                    self.write_audio_rendition(&packet)?;
-                    // A discrete track joins the current segment like program
-                    // audio; a track this sink does not carry is dropped.
-                    let index = self
-                        .current
-                        .as_ref()
-                        .and_then(|s| track_stream_index(&s.track_indices, track));
-                    let Some(index) = index else {
-                        continue;
-                    };
-                    let owned = packet.into_owned_packet();
-                    if let Some(segment) = self.current.as_mut() {
-                        segment.muxer.write_packet(index, owned).map_err(ff)?;
-                    }
-                    self.record(false, pts);
-                }
-                StreamKind::Audio => {
-                    self.write_audio_rendition(&packet)?;
-                    // Audio never rotates a segment — it joins the current one.
-                    // Audio that arrives before the first video keyframe (no
-                    // segment open yet) or for a video-only run (no audio stream
-                    // registered) is skipped rather than mis-routed.
-                    let audio_index = self.current.as_ref().and_then(|s| s.audio_index);
-                    let Some(audio_index) = audio_index else {
-                        continue;
-                    };
-                    let owned = packet.into_owned_packet();
-                    if let Some(segment) = self.current.as_mut() {
-                        segment.muxer.write_packet(audio_index, owned).map_err(ff)?;
-                    }
-                    self.record(false, pts);
-                }
-                // `StreamKind` is `#[non_exhaustive]`: skip a future kind this
-                // segmenter registers no stream for rather than mis-route it.
-                _ => {}
+            // A damaged muxer cannot be reused. Drain the source until a fresh
+            // decoder-ready video access point; never publish its partial TS.
+            if self.recovering
+                && !(packet.kind() == StreamKind::Video
+                    && packet.is_keyframe()
+                    && match self.seed {
+                        StreamSeed::Params(params) => params.is_decoder_ready_rap(&packet),
+                        StreamSeed::Encoder(_) => false,
+                    })
+            {
+                continue;
             }
+            let pts = pts_from_packet(packet.pts(), self.stats.packets, self.time_base);
+            let boundary = packet.kind() == StreamKind::Video && packet.is_keyframe();
+            if let Err(error) = self.write_source_packet(packet, pts) {
+                // A segment-boundary failure can be a playlist publication or
+                // file-system fault, not a damaged muxer. Let the supervisor
+                // handle it rather than silently hide a stale live playlist.
+                if self.live.is_none() || self.publication_failed {
+                    self.abandon_incomplete_segments();
+                    return Err(error);
+                }
+                self.abandon_incomplete_segments();
+                // Unsupported codecs and encoder-seeded live sinks have no
+                // decoder-ready RAP classifier. Fail now rather than silently
+                // draining an unbounded live packet source forever.
+                let supported = match self.seed {
+                    StreamSeed::Params(params) => params.supports_decoder_ready_rap(),
+                    StreamSeed::Encoder(_) => false,
+                };
+                if !supported {
+                    return Err(Error::Output(format!(
+                        "HLS muxer recovery unsupported for this video codec: {error}"
+                    )));
+                }
+                if self.recovering && boundary {
+                    self.recovery_failures = self.recovery_failures.saturating_add(1);
+                    if self.recovery_failures >= 3 {
+                        return Err(error);
+                    }
+                }
+                self.recovering = true;
+            } else if self.recovering {
+                self.recovering = false;
+                self.recovery_failures = 0;
+            }
+        }
+        if self.recovering {
+            return Err(Error::Output(
+                "HLS muxer did not recover before the packet source ended".to_owned(),
+            ));
         }
         Ok(())
     }
 
+    fn write_source_packet(&mut self, packet: EncodedPacket, pts: MediaTime) -> Result<()> {
+        match packet.kind() {
+            StreamKind::Video => {
+                // Only a VIDEO keyframe rotates a segment (the GOP boundary —
+                // invariant #7); the first packet is always a keyframe.
+                let is_key = packet.is_keyframe();
+                if is_key {
+                    self.start_segment(pts)?;
+                }
+                self.write_audio_rendition(&packet)?;
+                #[cfg(test)]
+                if std::mem::take(&mut self.fail_packet_write_once) {
+                    return Err(Error::Output("injected packet write failure".to_owned()));
+                }
+                let owned = packet.into_owned_packet();
+                let (muxer, index) = self.current_muxer()?;
+                muxer.write_packet(index, owned).map_err(ff)?;
+                self.record(is_key, pts);
+            }
+            StreamKind::AudioTrack(track) => {
+                self.write_audio_rendition(&packet)?;
+                // A discrete track joins the current segment like program
+                // audio; a track this sink does not carry is dropped.
+                let index = self
+                    .current
+                    .as_ref()
+                    .and_then(|s| track_stream_index(&s.track_indices, track));
+                let Some(index) = index else {
+                    return Ok(());
+                };
+                let owned = packet.into_owned_packet();
+                if let Some(segment) = self.current.as_mut() {
+                    segment.muxer.write_packet(index, owned).map_err(ff)?;
+                }
+                self.record(false, pts);
+            }
+            StreamKind::Audio => {
+                self.write_audio_rendition(&packet)?;
+                // Audio never rotates a segment — it joins the current one.
+                // Audio that arrives before the first video keyframe (no
+                // segment open yet) or for a video-only run (no audio stream
+                // registered) is skipped rather than mis-routed.
+                let audio_index = self.current.as_ref().and_then(|s| s.audio_index);
+                let Some(audio_index) = audio_index else {
+                    return Ok(());
+                };
+                let owned = packet.into_owned_packet();
+                if let Some(segment) = self.current.as_mut() {
+                    segment.muxer.write_packet(audio_index, owned).map_err(ff)?;
+                }
+                self.record(false, pts);
+            }
+            // `StreamKind` is `#[non_exhaustive]`: skip a future kind this
+            // segmenter registers no stream for rather than mis-route it.
+            _ => {}
+        }
+        Ok(())
+    }
+
+    /// Drop every damaged in-flight file and muxer before reopening at a RAP.
+    /// Never put a partial segment into any media playlist.
+    fn abandon_incomplete_segments(&mut self) {
+        if let Some(segment) = self.current.take() {
+            let is_unpublished = segment.write_path != segment.path;
+            let write_path = segment.write_path.clone();
+            drop(segment);
+            if is_unpublished {
+                let _ = std::fs::remove_file(write_path);
+            }
+        }
+        if let Some(renditions) = self.renditions.as_mut() {
+            for state in renditions
+                .states
+                .iter_mut()
+                .chain(std::iter::once(&mut renditions.video))
+            {
+                if let Some(segment) = state.current.take() {
+                    let is_unpublished = segment.write_path != segment.path;
+                    let write_path = segment.write_path.clone();
+                    drop(segment);
+                    if is_unpublished {
+                        let _ = std::fs::remove_file(write_path);
+                    }
+                }
+                state.live.set_initial_discontinuity();
+            }
+        }
+        if let Some(live) = self.live.as_mut() {
+            live.set_initial_discontinuity();
+        }
+    }
+
     /// Best-effort finalize of the currently-open segment on the error path: the
-    /// open segment muxer's trailer is written (so its container is structurally
-    /// closed) and the segment dropped. Any finish failure is intentionally
-    /// swallowed — the original drive error is the one that propagates. Idempotent
-    /// (`close_current` no-ops once `current` is taken).
+    /// long-lived segment muxer's trailer is written (so its container is
+    /// structurally closed) and the segment dropped — WITHOUT publishing the
+    /// in-flight segment (the last file it was redirected to is left exactly as
+    /// written, matching [`finalize_audio_segments_best_effort`]). Any finish
+    /// failure is intentionally swallowed — the original drive error is the one
+    /// that propagates. Idempotent (no-ops once `current` is taken).
     fn finalize_open_segment_best_effort(&mut self) {
         let Some(mut segment) = self.current.take() else {
             return;
@@ -2309,13 +2854,21 @@ impl<'a> SegmentState<'a> {
             Ok(()) | Err(_) => {}
         }
         note_segment_finalized();
+        self.finalize_audio_segments_best_effort();
     }
 
-    /// Close the current segment (if any) and open a new MPEG-TS segment muxer
-    /// starting at `start_pts`. Called on every keyframe so segments are
-    /// GOP-aligned and each begins on a keyframe.
+    /// Close the current segment (if any — published, muxer kept open and
+    /// redirected rather than rebuilt) and start a new one at `start_pts`.
+    /// Called on every keyframe so segments are GOP-aligned and each begins on
+    /// a keyframe. The one long-lived video [`Muxer`] (and each audio
+    /// rendition's own long-lived muxer) is built on the FIRST call only; every
+    /// later call redirects it in place — see [`SegmentState`]'s doc for why
+    /// this is the continuity-counter fix, not an optimization.
     fn start_segment(&mut self, start_pts: MediaTime) -> Result<()> {
-        self.close_current(start_pts)?;
+        if let Err(error) = self.close_current(start_pts) {
+            self.publication_failed = true;
+            return Err(error);
+        }
         // Filename index: the live flavour uses a monotonic counter (so a name is
         // never reused even though older segments are pruned from the window),
         // while the batch flavour keeps its historical `done.len()` (byte-identical
@@ -2334,49 +2887,61 @@ impl<'a> SegmentState<'a> {
         };
         let path = self.dir.join(format!("{}{index}.ts", self.prefix));
         // Atomic publish (HLS-1, live only): the muxer writes to a same-directory
-        // `<seg>.tmp` and is renamed onto `path` after `Muxer::finish`. The batch
+        // `<seg>.tmp` and is renamed onto `path` once the segment closes. The batch
         // flavour muxes in place (`write_path == path`), unchanged.
         let write_path = if self.live.is_some() {
             segment_temp_path(&path)
         } else {
             path.clone()
         };
-        // The run's single seed encoder only seeds the muxer stream's codec
-        // parameters; the actual packets all come from the shared encoder in the
-        // drive loop (one *encode* — invariant #7), while each segment file is
-        // its own self-contained MPEG-TS container. The seed is reused for every
-        // segment — never rebuilt per segment.
-        let mut muxer = Muxer::create_as(&write_path, "mpegts").map_err(ff)?;
-        // Register video then audio BEFORE the header — every segment carries the
-        // same pinned two-stream layout (ADR-R005 §3.3, AUD-4).
-        let stream_index = self.seed.add_stream(&mut muxer, self.time_base)?;
-        let audio_index = match self.audio {
-            Some(a) => Some(
-                muxer
-                    .add_stream_from_parameters(a.params, a.time_base)
-                    .map_err(ff)?,
-            ),
-            None => None,
-        };
-        let track_indices = match self.tracks {
-            Some((selection, streams)) => add_track_streams(&mut muxer, selection, streams)?,
-            None => Vec::new(),
-        };
-        // OUTMETA: tag every segment's container/streams (SDT/PMT, …) before its
-        // header (ADR-0088 §3); the display matrix is `None` for MPEG-TS (no
-        // rotation tag — validated at config time) so it is a no-op here.
-        self.apply_segment_meta(&mut muxer, stream_index)?;
-        muxer.write_header().map_err(ff)?;
         self.open_audio_segments(index)?;
-        self.current = Some(OpenSegment {
-            muxer,
-            stream_index,
-            audio_index,
-            track_indices,
-            path,
-            write_path,
-            start_pts,
-        });
+        if let Some(segment) = self.current.as_mut() {
+            // Redirect the SAME long-lived muxer to the new file. Every
+            // PID's continuity counter, PCR bookkeeping, etc. on this
+            // `AVFormatContext` carries over unbroken (the fix: see
+            // `Muxer::redirect_output`'s doc). `mpegts_flags=resend_headers`
+            // (set inside `redirect_output`) makes the new file
+            // independently decodable (fresh PAT/PMT/SDT at its start).
+            segment.muxer.redirect_output(&write_path).map_err(ff)?;
+            segment.path = path;
+            segment.write_path = write_path;
+            segment.start_pts = start_pts;
+        } else {
+            // First segment of the run: build the ONE long-lived muxer +
+            // register its streams. Never rebuilt for a later segment.
+            let mut muxer = Muxer::create_as(&write_path, "mpegts").map_err(ff)?;
+            // Register video then audio BEFORE the header — every segment
+            // carries the same pinned two-stream layout (ADR-R005 §3.3,
+            // AUD-4).
+            let stream_index = self.seed.add_stream(&mut muxer, self.time_base)?;
+            let audio_index = match self.audio {
+                Some(a) => Some(
+                    muxer
+                        .add_stream_from_parameters(a.params, a.time_base)
+                        .map_err(ff)?,
+                ),
+                None => None,
+            };
+            let track_indices = match self.tracks {
+                Some((selection, streams)) => add_track_streams(&mut muxer, selection, streams)?,
+                None => Vec::new(),
+            };
+            // OUTMETA: tag the container/streams (SDT/PMT, …) once before the
+            // header (ADR-0088 §3); the display matrix is `None` for MPEG-TS
+            // (no rotation tag — validated at config time) so it is a no-op
+            // here.
+            self.apply_segment_meta(&mut muxer, stream_index)?;
+            muxer.write_header().map_err(ff)?;
+            self.current = Some(OpenSegment {
+                muxer,
+                stream_index,
+                audio_index,
+                track_indices,
+                path,
+                write_path,
+                start_pts,
+            });
+        }
         Ok(())
     }
 
@@ -2403,30 +2968,53 @@ impl<'a> SegmentState<'a> {
         }
     }
 
-    /// Finalize the current segment (if any), recording its duration as the gap
-    /// from its start PTS to `end_pts`, bounded below by one frame.
+    /// Publish the current segment (if any), recording its duration as the gap
+    /// from its start PTS to `end_pts`, bounded below by one frame. The
+    /// long-lived video muxer (and every audio rendition's own long-lived
+    /// muxer) is **kept open** — its trailer is NOT written here, so it can be
+    /// [`Muxer::redirect_output`]ed to the next segment's file by the
+    /// following [`Self::start_segment`] call without ever restarting a
+    /// continuity counter. [`Self::finish`] is where the final open segment's
+    /// muxer(s) actually get a trailer.
     ///
-    /// For the **live** flavour this is also where atomic publish happens: after
-    /// `Muxer::finish` writes the trailer, the `<seg>.tmp` is renamed onto its
-    /// final path (so a fronting server never sees a half-written segment), then
-    /// the closed segment is pushed into the rolling [`LivePlaylist`] (which
-    /// re-publishes the windowed `.m3u8` atomically and prunes the evicted `.ts`).
-    /// The batch flavour leaves the muxed-in-place file untouched and only records
-    /// it for the finalize-time playlist render — byte-identical to before.
+    /// For the **live** flavour this is also where atomic publish happens: the
+    /// `<seg>.tmp` is renamed onto its final path (so a fronting server never
+    /// sees a half-written segment) once every buffered byte has landed
+    /// (`redirect_output`'s own flush, run by the caller before this), then the
+    /// closed segment is pushed into the rolling [`LivePlaylist`] (which
+    /// re-publishes the windowed `.m3u8` atomically and prunes the evicted
+    /// `.ts`). The batch flavour leaves the muxed-in-place file untouched and
+    /// only records it for the finalize-time playlist render — byte-identical
+    /// to before.
     fn close_current(&mut self, end_pts: MediaTime) -> Result<()> {
-        let Some(mut segment) = self.current.take() else {
+        let Some(segment) = self.current.as_mut() else {
             return Ok(());
         };
-        segment.muxer.finish().map_err(ff)?;
         note_segment_finalized();
         let span_ns = end_pts
             .as_nanos()
             .saturating_sub(segment.start_pts.as_nanos());
         let frame_ns = rescale(1, self.time_base, Rational::new(1, NANOS_PER_SEC));
         let duration = seconds_from_ns(span_ns.max(frame_ns));
-        self.close_audio_segments(duration, segment.start_pts.as_nanos())?;
-        // Live atomic publish: the muxer wrote to `<seg>.tmp`; rename it onto its
-        // final path now that the trailer is durable, then roll the playlist.
+        let start_pts_ns = segment.start_pts.as_nanos();
+        self.close_audio_segments(duration, start_pts_ns)?;
+        let Some(segment) = self.current.as_mut() else {
+            return Ok(());
+        };
+        // Live atomic publish: flush every buffered byte of THIS segment onto
+        // `write_path` before renaming it into place — the following
+        // `start_segment` call's `redirect_output` also flushes, but that is
+        // too late for an atomic rename of the file we are about to retire.
+        if self.live.is_some() && segment.write_path != segment.path {
+            segment.muxer.flush().map_err(ff)?;
+        }
+        let segment = &*segment;
+        #[cfg(test)]
+        if self.fail_playlist_publish_once.take().is_some() {
+            return Err(Error::Output(
+                "injected playlist publication failure".to_owned(),
+            ));
+        }
         if let Some(live) = self.live.as_mut() {
             if segment.write_path != segment.path {
                 std::fs::rename(&segment.write_path, &segment.path).map_err(|e| {
@@ -2451,18 +3039,29 @@ impl<'a> SegmentState<'a> {
                 segment.start_pts.as_nanos(),
             )?;
         }
-        if let Some(renditions) = self.renditions.as_ref() {
+        if let Some(renditions) = self.renditions.as_mut() {
             // Publish master last, after video and every audio playlist exist.
             // A run without valid video bitrate metadata still serves the legacy
             // index and media playlists, but never publishes a false BANDWIDTH.
             if let Some(master_text) = renditions.master_text.as_ref() {
-                if renditions
-                    .states
-                    .iter()
-                    .all(|state| state.live.playlist_path().exists())
+                if !renditions.master_published
+                    && renditions
+                        .states
+                        .iter()
+                        .all(|state| state.live.playlist_path().exists())
                     && renditions.video.live.playlist_path().exists()
                 {
-                    atomic_write(&renditions.master, master_text.as_bytes())?;
+                    // Ordering is preserved: every media playlist exists before
+                    // the master is queued. Pruning of the previous run's files
+                    // still waits until the on-disk master equals this text
+                    // (`current_renditions_ready`).
+                    let writer = BackgroundFile::spawn_with(
+                        renditions.master.clone(),
+                        self.master_writer.clone(),
+                    )?;
+                    writer.publish(master_text.clone());
+                    renditions.master_writer = Some(writer);
+                    renditions.master_published = true;
                 }
             } else if renditions.video.live.playlist_path().exists() {
                 // No trustworthy BANDWIDTH: retire the previous master only once
@@ -2496,11 +3095,24 @@ impl<'a> SegmentState<'a> {
                 );
             }
         }
-        self.done.push((segment.path, duration));
+        let Some(segment) = self.current.as_ref() else {
+            return Ok(());
+        };
+        self.done.push((segment.path.clone(), duration));
+        // Live media history lives in the bounded playlist, not this batch
+        // report. Keep at most one manifest window here for a finite result.
+        if let Some(live) = self.live.as_ref() {
+            bound_live_report(&mut self.done, live.window_size());
+        }
         Ok(())
     }
 
     /// Finalize the final open segment and append every segment to `playlist`.
+    ///
+    /// Publishes the last segment ([`Self::close_current`], muxers still open),
+    /// THEN writes the trailer on the long-lived video muxer and every audio
+    /// rendition's long-lived muxer ([`Self::finish_audio_segments`]) — the
+    /// true end-of-run close, now that nothing will redirect them again.
     ///
     /// For the **live** flavour this also finalizes the on-disk rolling playlist
     /// (`#EXT-X-ENDLIST` + a last atomic publish): the `LivePlaylist` owns the
@@ -2511,6 +3123,10 @@ impl<'a> SegmentState<'a> {
             .last_pts
             .saturating_add(MediaTime::from_nanos(frame_ns));
         self.close_current(end)?;
+        if let Some(mut segment) = self.current.take() {
+            segment.muxer.finish().map_err(ff)?;
+        }
+        self.finish_audio_segments()?;
         for (path, duration) in &self.done {
             let uri = path
                 .file_name()
@@ -2532,6 +3148,49 @@ impl<'a> SegmentState<'a> {
             {
                 state.live.finalize()?;
             }
+            // Every media playlist is durable now (finalize joined each
+            // publisher). Publish the master if a close has not queued it yet
+            // (short runs close before the background media writes land).
+            if let Some(text) = renditions.master_text.clone() {
+                let writer = match renditions.master_writer.take() {
+                    Some(writer) => Some(writer),
+                    None if renditions
+                        .states
+                        .iter()
+                        .all(|state| state.live.playlist_path().exists())
+                        && renditions.video.live.playlist_path().exists() =>
+                    {
+                        Some(BackgroundFile::spawn_with(
+                            renditions.master.clone(),
+                            self.master_writer.clone(),
+                        )?)
+                    }
+                    None => None,
+                };
+                if let Some(writer) = writer {
+                    writer.finish(text)?;
+                    renditions.master_published = true;
+                }
+            }
+        }
+        // The master is published off the packet path (#220), so a close may
+        // have run before it landed. Now that it is durable, reap the previous
+        // generations exactly as a later close would have.
+        if let Some(renditions) = self.renditions.as_ref() {
+            if current_renditions_ready(renditions) {
+                prune_prior_rendition_manifests(
+                    self.dir,
+                    renditions,
+                    self.seg_index
+                        .saturating_sub(segment_grace(renditions.retention_window)),
+                );
+                prune_prior_live_segments(
+                    self.dir,
+                    self.prefix,
+                    self.seg_index,
+                    renditions.retention_window,
+                );
+            }
         }
         Ok(())
     }
@@ -2540,6 +3199,12 @@ impl<'a> SegmentState<'a> {
     fn into_segment_paths(self) -> Vec<PathBuf> {
         self.done.into_iter().map(|(path, _)| path).collect()
     }
+}
+
+/// Keep the finite run report bounded while the live playlist owns media history.
+fn bound_live_report(done: &mut Vec<(PathBuf, f64)>, window: usize) {
+    let excess = done.len().saturating_sub(window);
+    done.drain(..excess);
 }
 
 fn current_renditions_ready(renditions: &AudioRenditions<'_>) -> bool {
@@ -2753,14 +3418,372 @@ mod tests {
     use multiview_ffmpeg::{DecodedVideoFrame, StreamVideoDecoder};
 
     use super::{
-        prune_prior_live_segments, prune_prior_rendition_manifests_inactive, AudioEncodeConfig,
-        EncodeConfig, Result, SegmentSink, VideoFrameSource, SEED_ENCODER_BUILDS,
-        SEGMENT_FINALIZES,
+        bound_live_report, prune_prior_live_segments, prune_prior_rendition_manifests_inactive,
+        AudioEncodeConfig, EncodeConfig, Result, SegmentSink, VideoFrameSource,
+        SEED_ENCODER_BUILDS, SEGMENT_FINALIZES,
     };
     use crate::error::Error;
 
     const WIDTH: u32 = 160;
     const HEIGHT: u32 = 120;
+
+    #[test]
+    fn packet_write_failure_discards_partial_and_resumes_at_rap() {
+        use super::{PacketSource, SegmentState, StreamSeed};
+        use crate::hls::LivePlaylist;
+        use ffmpeg::codec::packet::{Flags, Packet};
+        use multiview_ffmpeg::{EncodedPacket, StreamCodecParameters, VideoEncoder};
+
+        struct Packets(std::vec::IntoIter<EncodedPacket>);
+        impl PacketSource for Packets {
+            fn next_packet(&mut self) -> Result<Option<EncodedPacket>> {
+                Ok(self.0.next())
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let encoder = VideoEncoder::new(&EncodeConfig::mpeg2(WIDTH, HEIGHT).target()).unwrap();
+        let params = StreamCodecParameters::from_encoder(&encoder);
+        let time_base = encoder.time_base();
+        let mut state = SegmentState::new(
+            StreamSeed::Params(&params),
+            time_base,
+            None,
+            dir.path(),
+            "seg",
+        );
+        state.live = Some(LivePlaylist::new(dir.path().join("index.m3u8"), 3));
+        let mut packets = Vec::new();
+        for index in 0..5 {
+            let mut packet = Packet::copy(&[0, 0, 1, 0, 0, 8, 0, 0]);
+            packet.set_flags(if index == 0 || index == 3 {
+                Flags::KEY
+            } else {
+                Flags::empty()
+            });
+            packet.set_pts(Some(index));
+            packet.set_dts(Some(index));
+            packets.push(EncodedPacket::from_packet(packet));
+        }
+        // The initial access unit is written into the live .tmp file. The
+        // next write fails and must not advertise that partial file.
+        let first = packets.remove(0);
+        state
+            .write_source_packet(first, multiview_core::time::MediaTime::ZERO)
+            .unwrap();
+        state.fail_packet_write_once = true;
+        state
+            .drive_from_packets(&mut Packets(packets.into_iter()))
+            .unwrap();
+        let mut report = crate::hls::MediaPlaylist::new(crate::hls::SegmentType::MpegTs);
+        state.finish(&mut report, 33_333_333).unwrap();
+        assert!(!dir.path().join("seg0.ts.tmp").exists());
+        let playlist = std::fs::read_to_string(dir.path().join("index.m3u8")).unwrap();
+        assert!(!playlist.contains("seg0.ts"));
+        assert!(playlist.contains("#EXT-X-DISCONTINUITY\n"));
+        assert!(playlist.contains("seg1.ts"));
+    }
+
+    #[test]
+    fn unsupported_recovery_fails_before_live_source_can_drain() {
+        use super::{PacketSource, SegmentState, StreamSeed};
+        use crate::hls::LivePlaylist;
+        use ffmpeg::codec::packet::{Flags, Packet};
+        use multiview_ffmpeg::{EncodedPacket, VideoEncoder};
+        struct Endless {
+            pulls: usize,
+        }
+        impl PacketSource for Endless {
+            fn next_packet(&mut self) -> Result<Option<EncodedPacket>> {
+                self.pulls += 1;
+                assert!(
+                    self.pulls <= 2,
+                    "unsupported recovery must not drain the live source"
+                );
+                let mut packet = Packet::copy(&[0, 0, 1, 0, 0, 8, 0, 0]);
+                packet.set_flags(Flags::KEY);
+                let pts = i64::try_from(self.pulls).expect("bounded test pull count");
+                packet.set_pts(Some(pts));
+                packet.set_dts(Some(pts));
+                Ok(Some(EncodedPacket::from_packet(packet)))
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let encoder = VideoEncoder::new(&EncodeConfig::mpeg2(WIDTH, HEIGHT).target()).unwrap();
+        let mut state = SegmentState::new(
+            StreamSeed::Encoder(&encoder),
+            encoder.time_base(),
+            None,
+            dir.path(),
+            "seg",
+        );
+        state.live = Some(LivePlaylist::new(dir.path().join("index.m3u8"), 3));
+        state.fail_packet_write_once = true;
+        let mut source = Endless { pulls: 0 };
+        let error = state
+            .drive_from_packets(&mut source)
+            .expect_err("unsupported recovery must fail");
+        assert!(error.to_string().contains("recovery unsupported"));
+        assert_eq!(source.pulls, 1);
+        assert!(!dir.path().join("seg0.ts.tmp").exists());
+        assert!(!dir.path().join("index.m3u8").exists());
+    }
+
+    #[test]
+    fn source_end_during_recovery_returns_error_instead_of_stale_success() {
+        use super::{PacketSource, SegmentState, StreamSeed};
+        use crate::hls::LivePlaylist;
+        use ffmpeg::codec::packet::{Flags, Packet};
+        use multiview_ffmpeg::{EncodedPacket, StreamCodecParameters, VideoEncoder};
+        struct Packets(std::vec::IntoIter<EncodedPacket>);
+        impl PacketSource for Packets {
+            fn next_packet(&mut self) -> Result<Option<EncodedPacket>> {
+                Ok(self.0.next())
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let encoder = VideoEncoder::new(&EncodeConfig::mpeg2(WIDTH, HEIGHT).target()).unwrap();
+        let params = StreamCodecParameters::from_encoder(&encoder);
+        let mut state = SegmentState::new(
+            StreamSeed::Params(&params),
+            encoder.time_base(),
+            None,
+            dir.path(),
+            "seg",
+        );
+        state.live = Some(LivePlaylist::new(dir.path().join("index.m3u8"), 3));
+        let mut packet = Packet::copy(&[0, 0, 1, 0, 0, 8, 0, 0]);
+        packet.set_flags(Flags::KEY);
+        packet.set_pts(Some(0));
+        packet.set_dts(Some(0));
+        state
+            .write_source_packet(
+                EncodedPacket::from_packet(packet),
+                multiview_core::time::MediaTime::ZERO,
+            )
+            .unwrap();
+        state.fail_packet_write_once = true;
+        let mut bad = Packet::copy(&[0, 0, 1, 0, 0, 8, 0, 0]);
+        bad.set_pts(Some(1));
+        bad.set_dts(Some(1));
+        let mut source = Packets(vec![EncodedPacket::from_packet(bad)].into_iter());
+        let error = state
+            .drive_from_packets(&mut source)
+            .expect_err("unrecovered source end");
+        assert!(error.to_string().contains("did not recover"));
+        assert!(!dir.path().join("seg0.ts.tmp").exists());
+        assert!(!dir.path().join("index.m3u8").exists());
+    }
+
+    #[test]
+    fn playlist_publication_fault_is_terminal_and_keeps_prior_manifest() {
+        use super::{SegmentState, StreamSeed};
+        use crate::hls::LivePlaylist;
+        use ffmpeg::codec::packet::{Flags, Packet};
+        use multiview_ffmpeg::{EncodedPacket, StreamCodecParameters, VideoEncoder};
+        let dir = tempfile::tempdir().unwrap();
+        let encoder = VideoEncoder::new(&EncodeConfig::mpeg2(WIDTH, HEIGHT).target()).unwrap();
+        let params = StreamCodecParameters::from_encoder(&encoder);
+        let mut state = SegmentState::new(
+            StreamSeed::Params(&params),
+            encoder.time_base(),
+            None,
+            dir.path(),
+            "seg",
+        );
+        state.live = Some(LivePlaylist::new(dir.path().join("index.m3u8"), 3));
+        let make_packet = |pts| {
+            let mut packet = Packet::copy(&[0, 0, 1, 0, 0, 8, 0, 0]);
+            packet.set_flags(Flags::KEY);
+            packet.set_pts(Some(pts));
+            packet.set_dts(Some(pts));
+            EncodedPacket::from_packet(packet)
+        };
+        state
+            .write_source_packet(make_packet(0), multiview_core::time::MediaTime::ZERO)
+            .unwrap();
+        state
+            .write_source_packet(
+                make_packet(1),
+                multiview_core::time::MediaTime::from_nanos(33_333_333),
+            )
+            .unwrap();
+        let previous = std::fs::read_to_string(dir.path().join("index.m3u8")).unwrap();
+        assert!(previous.contains("seg0.ts"));
+        state.fail_playlist_publish_once = Some(());
+        let failure = state.start_segment(multiview_core::time::MediaTime::from_nanos(66_666_666));
+        assert!(failure.is_err());
+        assert!(state.publication_failed);
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("index.m3u8")).unwrap(),
+            previous
+        );
+        assert!(!previous.contains("seg1.ts"));
+        state.abandon_incomplete_segments();
+        assert!(dir.path().join("seg0.ts").exists());
+        assert!(!dir.path().join("seg1.ts.tmp").exists());
+    }
+
+    #[test]
+    fn live_report_stays_bounded_across_many_segment_cuts() {
+        let mut done = Vec::new();
+        for index in 0..10_000 {
+            done.push((format!("seg{index}.ts").into(), 1.0));
+            bound_live_report(&mut done, 6);
+            assert!(done.len() <= 6);
+        }
+        assert_eq!(done.len(), 6);
+        assert_eq!(done[0].0, Path::new("seg9994.ts"));
+    }
+
+    /// EMPIRICAL per-codec emission proof (t70 causal 2 / t62 finding: the
+    /// no-reorder claim must be codec-EMPIRICAL, never a doc assertion). For
+    /// every encodable LGPL/GPL codec in this build, encode a strictly
+    /// consecutive tick sequence through the REAL rendition encoder and PIN:
+    /// (1) EMISSION ORDER equals submission order — the i-th emitted packet's
+    /// PTS is exactly the i-th submitted tick, across interleaved
+    /// `encode_frame_at` calls AND the EOF `finish()` tail (a single
+    /// reordering packet fails the test); (2) the restamped DTS equals PTS on
+    /// every packet (the output-clock rule; decode order == presentation order
+    /// for these proven encoders); (3) every submitted tick is emitted exactly
+    /// once — no frame lost inside the encoder, none duplicated. This is the
+    /// proof the `DTS := PTS` restamp and the emission-keyed dispatcher
+    /// watermark rely on; mpeg2video's one-frame DELAY is thereby proven
+    /// compatible (delayed but strictly ordered), not assumed.
+    #[test]
+    fn proven_codecs_emit_in_submission_order_with_restamped_dts() {
+        use multiview_core::frame::FrameMeta;
+        use multiview_core::pixel::PixelFormat;
+        use multiview_core::time::MediaTime;
+        const WIDTH: u32 = 64;
+        const HEIGHT: u32 = 48;
+        const TICKS: u64 = 12;
+
+        // mpeg2video is the LGPL default (always present). libx264/libx265 are
+        // probed and skipped when the build lacks gpl-codecs.
+        let mut codecs = vec!["mpeg2video"];
+        for optional in ["libx264", "libx265"] {
+            if ffmpeg::encoder::find_by_name(optional).is_some() {
+                codecs.push(optional);
+            }
+        }
+        for codec in codecs {
+            let mut config = EncodeConfig::mpeg2(WIDTH, HEIGHT);
+            config.codec_name = codec.to_owned();
+            config.gop = 30;
+            config.cadence = Rational::FPS_29_97;
+            let mut rendition = super::VideoRenditionEncoder::new(&config)
+                .unwrap_or_else(|e| panic!("{codec} must open: {e}"));
+
+            let mut emitted: Vec<(i64, i64)> = Vec::new();
+            for tick in 0..TICKS {
+                let frame = DecodedVideoFrame {
+                    frame: ffmpeg::util::frame::Video::new(
+                        ffmpeg::format::Pixel::YUV420P,
+                        WIDTH,
+                        HEIGHT,
+                    ),
+                    meta: FrameMeta {
+                        pts: MediaTime::ZERO,
+                        width: WIDTH,
+                        height: HEIGHT,
+                        format: PixelFormat::Nv12,
+                        color: multiview_core::color::ColorInfo::default(),
+                    },
+                    raw_pts: None,
+                    a53_cc: None,
+                };
+                for packet in rendition
+                    .encode_frame_at(frame, tick)
+                    .unwrap_or_else(|e| panic!("{codec} tick {tick}: {e}"))
+                {
+                    let (pts, dts) = (packet.pts(), packet.dts());
+                    emitted.push((
+                        pts.expect("encoder stamps PTS"),
+                        dts.expect("encoder stamps DTS"),
+                    ));
+                }
+            }
+            for packet in rendition
+                .finish()
+                .unwrap_or_else(|e| panic!("{codec} finish: {e}"))
+            {
+                let (pts, dts) = (packet.pts(), packet.dts());
+                emitted.push((pts.expect("tail stamps PTS"), dts.expect("tail stamps DTS")));
+            }
+
+            assert_eq!(
+                emitted.len(),
+                usize::try_from(TICKS).unwrap(),
+                "{codec}: every submitted tick must be emitted exactly once (delayed emission                  is fine; loss or duplication is not), got {:?}",
+                emitted
+            );
+            for (index, (pts, dts)) in emitted.iter().enumerate() {
+                let expected = i64::try_from(index).unwrap();
+                assert_eq!(
+                    *pts, expected,
+                    "{codec}: emission order must equal submission order — packet {index} has                      PTS {pts}, a reordering encoder is NOT proven no-reorder"
+                );
+                assert_eq!(
+                    *dts, *pts,
+                    "{codec}: the restamped DTS must equal PTS (decode order == presentation                      order for proven no-reorder encoders), packet {index}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn concrete_rendition_opens_zero_latency_and_emits_every_tick() {
+        use multiview_core::frame::FrameMeta;
+        use multiview_core::pixel::PixelFormat;
+        use multiview_core::time::MediaTime;
+        for codec in ["libx264", "libx265"] {
+            if ffmpeg::encoder::find_by_name(codec).is_none() {
+                continue;
+            }
+            let mut config = EncodeConfig::mpeg2(WIDTH, HEIGHT);
+            config.codec_name = codec.to_owned();
+            config.gop = 30;
+            config.cadence = Rational::FPS_29_97;
+            let mut rendition = super::VideoRenditionEncoder::new(&config).unwrap();
+            assert!(
+                rendition.no_reorder_proven(),
+                "{codec} opened reorder/delay"
+            );
+            for tick in 0..65_u64 {
+                let frame = DecodedVideoFrame {
+                    frame: ffmpeg::util::frame::Video::new(
+                        ffmpeg::format::Pixel::YUV420P,
+                        WIDTH,
+                        HEIGHT,
+                    ),
+                    meta: FrameMeta {
+                        pts: MediaTime::ZERO,
+                        width: WIDTH,
+                        height: HEIGHT,
+                        format: PixelFormat::Nv12,
+                        color: multiview_core::color::ColorInfo::default(),
+                    },
+                    raw_pts: None,
+                    a53_cc: None,
+                };
+                let packets = rendition.encode_frame_at(frame, tick).unwrap();
+                assert!(
+                    !packets.is_empty(),
+                    "{codec} buffered input tick {tick} despite zero-latency proof"
+                );
+                assert!(
+                    packets
+                        .iter()
+                        .all(|packet| packet.dts() == Some(i64::try_from(tick).unwrap_or(i64::MAX))),
+                    "{codec} emitted delayed DTS for tick {tick}"
+                );
+            }
+            assert!(
+                rendition.finish().unwrap().is_empty(),
+                "{codec} hid delayed frames at EOF"
+            );
+        }
+    }
 
     #[test]
     fn prior_rendition_retirement_and_ts_reaper_preserve_uri_references() {

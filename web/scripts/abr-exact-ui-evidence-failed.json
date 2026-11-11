@@ -1,0 +1,187 @@
+{
+  "source": "85fa16f1 browser-abr-recovery",
+  "scope": "Exact production UI wrapper; real local control HTTP authority; shared immutable fixture packets; one shaped cycle only; not Cloudflare; NOT PASS",
+  "ranAt": "2026-11-09T10:10:58.218Z",
+  "checks": [
+    {
+      "criterion": "exact production wrapper renders baseline high in both viewers",
+      "passed": true
+    },
+    {
+      "criterion": "shaped consumer renders actual low after capacity reduction",
+      "passed": false
+    },
+    {
+      "criterion": "healthy consumer continues high during reduction",
+      "passed": true
+    },
+    {
+      "criterion": "restored consumer renders mid or high after restoration",
+      "passed": true
+    },
+    {
+      "criterion": "both viewers renew through real release acknowledgement before reacquire",
+      "passed": true
+    },
+    {
+      "criterion": "neither exact UI wrapper reports terminal failure",
+      "passed": true
+    }
+  ],
+  "authorityCleanup": [
+    {
+      "status": "fulfilled",
+      "leaseEvents": [
+        {
+          "action": "acquired",
+          "tMs": 30,
+          "generation": 1
+        },
+        {
+          "action": "revoked-ack",
+          "tMs": 50019,
+          "generation": 1
+        },
+        {
+          "action": "acquired",
+          "tMs": 50032,
+          "generation": 1
+        },
+        {
+          "action": "revoked-ack",
+          "tMs": 55204,
+          "generation": 1
+        }
+      ]
+    },
+    {
+      "status": "fulfilled",
+      "leaseEvents": [
+        {
+          "action": "acquired",
+          "tMs": 20,
+          "generation": 1
+        },
+        {
+          "action": "revoked-ack",
+          "tMs": 49795,
+          "generation": 1
+        },
+        {
+          "action": "acquired",
+          "tMs": 49807,
+          "generation": 1
+        },
+        {
+          "action": "revoked-ack",
+          "tMs": 54977,
+          "generation": 1
+        }
+      ]
+    }
+  ],
+  "gaps": {
+    "slow": 9037,
+    "healthy": 171
+  },
+  "productionPolicy": [
+    {
+      "tMs": 24112,
+      "reason": "steady",
+      "arrivalBps": 2254059.997001348,
+      "requested": "video-high",
+      "effective": "video-high"
+    },
+    {
+      "tMs": 25112,
+      "reason": "downshift-bandwidth",
+      "arrivalBps": 1868573.998500674,
+      "requested": "video-mid",
+      "effective": "video-high"
+    },
+    {
+      "tMs": 26112,
+      "reason": "hold-pending",
+      "arrivalBps": 934286.999250337,
+      "requested": "video-mid",
+      "effective": "video-high"
+    },
+    {
+      "tMs": 27112,
+      "reason": "hold-pending",
+      "arrivalBps": 467143.4996251685,
+      "requested": "video-mid",
+      "effective": "video-high"
+    },
+    {
+      "tMs": 28112,
+      "reason": "hold-pending",
+      "arrivalBps": 233571.74981258425,
+      "requested": "video-mid",
+      "effective": "video-high"
+    },
+    {
+      "tMs": 29112,
+      "reason": "hold-pending",
+      "arrivalBps": 116785.87490629213,
+      "requested": "video-mid",
+      "effective": "video-high"
+    },
+    {
+      "tMs": 30112,
+      "reason": "hold-pending",
+      "arrivalBps": 58392.93745314606,
+      "requested": "video-mid",
+      "effective": "video-high"
+    },
+    {
+      "tMs": 31112,
+      "reason": "hold-pending",
+      "arrivalBps": 29196.46872657303,
+      "requested": "video-mid",
+      "effective": "video-high"
+    },
+    {
+      "tMs": 32112,
+      "reason": "hold-pending",
+      "arrivalBps": 14598.234363286516,
+      "requested": "video-mid",
+      "effective": "video-high"
+    },
+    {
+      "tMs": 33112,
+      "reason": "hold-pending",
+      "arrivalBps": 7299.117181643258,
+      "requested": "video-mid",
+      "effective": "video-high"
+    },
+    {
+      "tMs": 34112,
+      "reason": "hold-settle",
+      "arrivalBps": 63525.55859082163,
+      "requested": "video-mid",
+      "effective": "video-mid"
+    },
+    {
+      "tMs": 35112,
+      "reason": "downshift-bandwidth",
+      "arrivalBps": 45889.36663665564,
+      "requested": "video-low",
+      "effective": "video-mid"
+    },
+    {
+      "tMs": 36112,
+      "reason": "hold-pending",
+      "arrivalBps": 78914.28027810721,
+      "requested": "video-low",
+      "effective": "video-mid"
+    },
+    {
+      "tMs": 37112,
+      "reason": "hold-settle",
+      "arrivalBps": 122905.1401390536,
+      "requested": "video-low",
+      "effective": "video-low"
+    }
+  ]
+}

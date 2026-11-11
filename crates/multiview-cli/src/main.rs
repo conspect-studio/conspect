@@ -116,7 +116,7 @@ async fn main() -> ExitCode {
     }
 
     let cli = Cli::parse();
-    match dispatch(cli).await {
+    match Box::pin(dispatch(cli)).await {
         Ok(code) => code,
         Err(err) => {
             tracing::error!(error = %format!("{err:#}"), "command failed");
@@ -158,7 +158,7 @@ fn init_tracing() -> anyhow::Result<()> {
 async fn dispatch(cli: Cli) -> anyhow::Result<ExitCode> {
     match cli.command {
         Command::Validate(args) => run_validate(&args),
-        Command::Run(args) => run_run(args).await,
+        Command::Run(args) => Box::pin(run_run(args)).await,
         Command::Node(args) => run_node(&args),
     }
 }
@@ -323,6 +323,10 @@ fn persist_loaded_best_effort(boot_model: &multiview_control::boot_model::BootMo
 /// shared producer stop registry, and supported live-apply capabilities.
 /// Only the binary knows both compiled features and the selected run path.
 struct ControlPlaneWiring {
+    #[cfg(feature = "moq-output")]
+    moq_factory: Option<Arc<dyn multiview_control::moq_provider::AuthorizedFeedFactory>>,
+    #[cfg(feature = "moq-output")]
+    moq_slot: Option<multiview_cli::output_window_registry::WindowSubscriptionSlot>,
     /// The shared program-frame slot the run loop fills for previews.
     program_slot: multiview_cli::preview::ProgramSlot,
     /// The per-source last-good stores (the preview provider's initial map).
@@ -385,6 +389,22 @@ struct ControlPlaneWiring {
 /// `expect_write` seam suppresses server-side writes). The hub shares the
 /// wiring's stop registry, so a live remove can tear down a startup producer
 /// (generator or ingest thread) too.
+#[cfg(feature = "moq-output")]
+async fn start_moq_listener(
+    factory: Option<Arc<dyn multiview_control::moq_provider::AuthorizedFeedFactory>>,
+) -> anyhow::Result<Option<Arc<multiview_control::moq::MoqRegistry>>> {
+    match multiview_control::moq_startup::MoqListenerConfig::from_env()
+        .map_err(|_| anyhow::anyhow!("invalid explicit MoQ listener configuration"))?
+    {
+        Some(config) => Ok(Some(
+            multiview_control::moq_startup::start(config, factory)
+                .await
+                .map_err(|_| anyhow::anyhow!("MoQ listener startup failed"))?,
+        )),
+        None => Ok(None),
+    }
+}
+
 // reason: `whep` (WHEP preview egress) and `whip` (WHIP ingest) are the canonical
 // WebRTC protocol names — distinct transports, not a typo-similar pair; renaming
 // either would obscure the spec mapping.
@@ -407,6 +427,10 @@ async fn serve_control_plane(
     // boot file stays the watch + promote target (ADR-W024).
     let config = &start.running;
     let ControlPlaneWiring {
+        #[cfg(feature = "moq-output")]
+        moq_factory,
+        #[cfg(feature = "moq-output")]
+        moq_slot,
         program_slot,
         stores,
         registry,
@@ -480,7 +504,13 @@ async fn serve_control_plane(
     // snapshot; the model backs `GET /api/v1/config/boot-model` and the
     // revert-to-start/promote actions, and is the persister's target.
     let boot_model = Arc::new(start.to_boot_model(config_path));
-    let (addr, handle, state) = control::bind_and_serve(
+    #[cfg(feature = "moq-output")]
+    let moq = start_moq_listener(moq_factory).await?;
+    #[cfg(feature = "moq-output")]
+    let bind_control = control::bind_and_serve_with_moq;
+    #[cfg(not(feature = "moq-output"))]
+    let bind_control = control::bind_and_serve;
+    let (addr, handle, state) = bind_control(
         listen,
         config,
         Arc::clone(publisher),
@@ -495,6 +525,10 @@ async fn serve_control_plane(
         live_capability,
         Some(Arc::clone(&boot_model)),
         source_events,
+        #[cfg(feature = "moq-output")]
+        moq,
+        #[cfg(feature = "moq-output")]
+        moq_slot,
         async move {
             let _ = shutdown_rx.await;
         },
@@ -530,18 +564,26 @@ async fn serve_control_plane(
     // startup window where a promote skips suppression. `bind_and_serve`
     // installs it for every config-file run (a boot model is wired), so it is
     // present here.
+    let watch = start_config_watch(start, config_path, &state);
+    Ok((handle, command_rx, hub, watch, persist))
+}
+
+fn start_config_watch(
+    start: &multiview_cli::boot::StartConfig,
+    config_path: &Path,
+    state: &multiview_control::AppState,
+) -> multiview_cli::config_watch::ConfigWatchHandle {
     let mut watch_options = multiview_cli::config_watch::WatchOptions::default()
         .with_initial_observed(start.boot_text.clone());
     if let Some(installed) = state.watch_handle() {
         watch_options = watch_options.with_handle(installed);
     }
-    let watch = multiview_cli::config_watch::spawn(
+    multiview_cli::config_watch::spawn(
         config_path.to_path_buf(),
-        config.clone(),
+        start.running.clone(),
         state.clone(),
         watch_options,
-    );
-    Ok((handle, command_rx, hub, watch, persist))
+    )
 }
 
 /// Drive the ingest/composite/encode pipeline until Ctrl-C while **also**
@@ -567,8 +609,10 @@ async fn run_pipeline_until_ctrl_c(
     // below calls `pipeline.set_program_audio_preview`). Without that feature the
     // binding is never mutated, so the `mut` is conditional to stay
     // `unused_mut`-clean on the `ffmpeg`/`rist`-only feature legs.
-    #[cfg(feature = "webrtc-native")] mut pipeline: multiview_cli::pipeline::Pipeline,
-    #[cfg(not(feature = "webrtc-native"))] pipeline: multiview_cli::pipeline::Pipeline,
+    #[cfg(any(feature = "webrtc-native", feature = "moq-output"))]
+    mut pipeline: multiview_cli::pipeline::Pipeline,
+    #[cfg(not(any(feature = "webrtc-native", feature = "moq-output")))]
+    pipeline: multiview_cli::pipeline::Pipeline,
     start: &multiview_cli::boot::StartConfig,
     plane: &multiview_cli::licence::EntitlementPlane,
     config_path: &Path,
@@ -639,12 +683,19 @@ async fn run_pipeline_until_ctrl_c(
         let live_apply = live_apply.with_audio_routing(
             multiview_cli::audio::routing_live_capability(pipeline.audio_route_slot()),
         );
+        #[cfg(feature = "moq-output")]
+        multiview_cli::moq_outputs::metadata::configure_optional_preview(&mut pipeline)
+            .map_err(|_| anyhow::anyhow!("explicit measured MoQ preview configuration rejected"))?;
         let (handle, command_rx, hub, watch, persist) = serve_control_plane(
             &cfg.listen,
             start,
             config_path,
             &publisher,
             ControlPlaneWiring {
+                #[cfg(feature = "moq-output")]
+                moq_factory: Some(pipeline.moq_feed_factory()),
+                #[cfg(feature = "moq-output")]
+                moq_slot: Some(pipeline.window_subscriptions()),
                 program_slot: Arc::clone(&preview_slot),
                 stores: pipeline.preview_stores(),
                 registry: pipeline.stop_registry(),
@@ -1030,6 +1081,10 @@ async fn run_software_until_ctrl_c(
             config_path,
             &publisher,
             ControlPlaneWiring {
+                #[cfg(feature = "moq-output")]
+                moq_factory: None,
+                #[cfg(feature = "moq-output")]
+                moq_slot: None,
                 program_slot: engine.program_preview(),
                 stores: engine.preview_stores(),
                 registry: engine.stop_registry(),

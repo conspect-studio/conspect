@@ -185,12 +185,25 @@ pub mod synth;
 /// executor in [`pipeline`] performs the [`player::PlayerAction`]s it returns.
 pub mod player;
 
+#[cfg(feature = "ffmpeg")]
+mod binding_delivery;
+/// Existing encoded output conversion and authorized MoQ family adapter.
+#[cfg(feature = "moq-output")]
+pub mod moq_outputs;
+#[cfg(feature = "ffmpeg")]
+pub mod output_window_registry;
 /// The full libav\* end-to-end `multiview run` pipeline (ingest → composite →
 /// encode-once → fan out to file/HLS sinks). Behind the off-by-default `ffmpeg`
 /// feature so the baseline build stays pure-Rust; software H.264/H.265 needs
 /// `gpl-codecs` on top.
 #[cfg(feature = "ffmpeg")]
 pub mod pipeline;
+#[cfg(feature = "ffmpeg")]
+mod rendition_dispatch;
+// Planning uses compile-feature probes only and needs no native FFmpeg linkage.
+pub mod rendition_plan;
+#[cfg(feature = "ffmpeg")]
+pub mod rendition_workers;
 
 /// Live HLS segment fetcher: parallel byte-range segment downloads served to
 /// the libav demuxer from memory over loopback, so a source whose single TCP
@@ -251,3 +264,12 @@ pub mod webrtc_outputs;
 /// bind hit `EADDRINUSE` and silently degraded. Behind `webrtc-native`.
 #[cfg(feature = "webrtc-native")]
 pub mod webrtc_unified;
+
+#[cfg(feature = "ffmpeg")]
+pub(crate) mod optional_rendition;
+#[cfg(feature = "ffmpeg")]
+pub(crate) mod preview_fanout;
+#[cfg(feature = "ffmpeg")]
+pub mod preview_runtime;
+#[cfg(feature = "ffmpeg")]
+pub mod preview_vertical;

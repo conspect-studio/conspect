@@ -104,6 +104,9 @@ pub mod log_bridge;
 /// `demux::ReadPacket::is_idr` wires it to a demuxed packet.
 pub mod idr;
 
+/// Actual-byte AVC decoder descriptions and RFC 6381 codec identifiers.
+pub mod codec_metadata;
+
 /// Host-side hardware-decode planning. The [`hwdecode::HwDeviceKind`] enum, the
 /// per-backend decode-resize strategy, the content-sized surface-pool geometry,
 /// and the logical-codec -> `*_cuvid` name mapping are pure (always compiled,
@@ -315,7 +318,7 @@ pub use hwframe::{
 };
 
 #[cfg(feature = "ffmpeg")]
-pub use mux::Muxer;
+pub use mux::{IoBudget, Muxer, PacketWriter};
 
 #[cfg(feature = "ffmpeg")]
 pub use opus::{
