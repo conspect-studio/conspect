@@ -234,8 +234,9 @@ pub(crate) async fn load_player(
         })
         .await
         .map_err(|_| ControlError::EngineBusy)??;
-        use axum::response::IntoResponse;
-        return Ok((axum::http::StatusCode::ACCEPTED, Json(result)).into_response());
+        return Ok(
+            axum::response::IntoResponse::into_response((axum::http::StatusCode::ACCEPTED, Json(result))),
+        );
     }
     let asset = parsed.asset.ok_or_else(|| {
         ControlError::Validation("media player load requires an `asset` id".to_owned())
@@ -250,6 +251,21 @@ pub(crate) async fn load_player(
 }
 
 /// Read one actor- and player-scoped native load operation.
+#[cfg_attr(feature = "openapi", utoipa::path(
+    get,
+    path = "/api/v1/media/players/{id}/load-operations/{operation}",
+    operation_id = "get_player_load_operation",
+    tag = "media-players",
+    params(("id" = String, Path, description = "Authorized player identity."),
+           ("operation" = u64, Path, description = "Native load generation.")),
+    responses(
+        (status = 200, description = "Actual native load outcome.", body = crate::player_load::LoadOperation),
+        (status = 401, description = "Authentication required.", body = crate::problem::Problem),
+        (status = 403, description = "Player access denied.", body = crate::problem::Problem),
+        (status = 404, description = "Operation is unknown or belongs to another actor.", body = crate::problem::Problem),
+        (status = 503, description = "Native player provider unavailable.", body = crate::problem::Problem)
+    )
+))]
 pub(crate) async fn load_operation(
     State(state): State<AppState>,
     principal: Principal,
