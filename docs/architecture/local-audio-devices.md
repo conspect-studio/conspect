@@ -38,6 +38,9 @@ device callback ──push──▶ [SPSC ring, ~200 ms] ──pop──▶ pump
 - **Callback:** convert the device sample format to `f32` in place in a preallocated scratch
   buffer, then `push` as many frames as fit. If the ring is full, the rest is dropped and
   `ring_overflow_frames` is incremented (atomic). The callback never waits.
+- **Heartbeat:** the input callback increments a monotonic callback counter (atomic). The pump
+  declares the stream *stalled* when the counter has not moved for 2 s while open, and the
+  lifecycle helper reopens it (section 4).
 - **Fill signal:** the servo measures **unread** frames: `head_frame − read_cursor`, clamped to
   `0..=capacity`, through a new wait-free `AudioStore::unread_frames()`. (`buffered_frames` is the
   retained window length; it does not fall when the bus reads, so it cannot be the servo input.)
@@ -57,6 +60,10 @@ device callback ──push──▶ [SPSC ring, ~200 ms] ──pop──▶ pump
   - Result: a device crystal that is fast or slow against the output clock is absorbed, and the
     store neither drains nor overflows. A stall drains the cushion to silence (gap-free read);
     the burst after it is dropped down to the target by the store's drop-oldest bound.
+- **Latency budget:** device buffer (≈10 ms) + pump wake-up (≤5 ms) + servo target (80 ms) ≈
+  95 ms constant from microphone to program bus, with ±10 ms variance. It is compensated with the
+  existing per-source audio offset trim where the source is paired with video; a dedicated
+  automatic lip-sync is not in scope.
 - **Store:** `AudioStore::live(48 kHz, capacity ≈ 1 s, prebuffer ≈ 60 ms)`. A read is gap-free:
   silence for anything not written. A stalled or lost device reads as silence, and the picture and
   the tick do not change.
@@ -73,9 +80,15 @@ program bus ──push (wait-free)──▶ [engine→drain SPSC ring, ~200 ms] 
   The engine never takes a lock.
 - **Drain** (a new loop in `multiview-audio-device`; it reuses `BufferServo`, `AdaptiveResampler`
   and `ChannelMatrix`, not the HDMI `drain_loop`, which depends on a PCM that blocks to pace it):
-  - It is **device-paced**: it sleeps until the device ring's fill drops below its target, then
-    tops the ring up to the target. The callback pop rate is the pace, so the drain cannot
-    over-produce, whatever its own wake-up jitter.
+  - It is **device-paced**: it wakes every 5 ms (bounded sleep, stop-flag aware, so stall detection
+    and stop are always reachable), and tops the device ring up to its target only when the fill
+    is below it. The callback pop rate is the pace, so the drain cannot over-produce, whatever its
+    own wake-up jitter.
+  - **Stale backlog is dropped, oldest first.** The engine push drops only as an isolation safety
+    valve (ring full). On any engine drop, or when the engine→drain fill exceeds target + 100 ms,
+    the drain pops and discards the oldest frames down to the target and resets the servo, so a
+    transient drain stall never leaves audio late against picture (the same policy as the HDMI
+    FIFO: a late reader gets fresh audio, not backlog).
   - The servo holds the engine→drain ring's fill near its target, so the engine clock and the
     device clock are matched within ±500 ppm (the sign and reset rules are those of section 2).
   - Partial pushes are kept for the next round. Nothing is dropped while the device consumes.
@@ -86,8 +99,9 @@ program bus ──push (wait-free)──▶ [engine→drain SPSC ring, ~200 ms] 
   - *underrun* (callback found the ring short): counted; the servo re-anchors; no reopen.
   - *ring full* (device not consuming but heartbeat advancing): normal, the drain waits.
   - *stalled* (heartbeat has not advanced for 2 s while open) or *lost* (error callback): the drain
-    leaves the steady loop, closes the stream through the lifecycle helper, resets both rings and
-    the servo, and reopens with backoff.
+    leaves the steady loop and asks the lifecycle helper to close the stream. Rings are reset or
+    reused only after the close is confirmed (section 4, quiescence). Then servo reset and reopen
+    with backoff.
 - **Rates and channels:** the stream opens at 48 kHz. Channel negotiation is device-specific, not
   the HDMI ELD rule: the drain uses the device's own channel count from its supported configs
   (mono, stereo or multichannel) and folds or upmixes with `ChannelMatrix`. A device without a
@@ -96,13 +110,26 @@ program bus ──push (wait-free)──▶ [engine→drain SPSC ring, ~200 ms] 
 ## 4. Device lifecycle and errors
 
 - **Discovery and identity.** `multiview devices audio` lists the host's input and output devices
-  with cpal name, host API, the default flag, channel counts and supported rates. A device is
-  configured by exact name, plus an optional `index` among devices with the same name (duplicates
-  are numbered in OS enumeration order). `default` follows the OS default: when the OS default
-  changes, the stream is reopened on the new default, and the change is logged.
+  with cpal name, stable id, host API, the default flag, channel counts and supported rates. The
+  stable id is cpal's `DeviceId` (`DeviceTrait::id`, a safe API): the CoreAudio device UID on macOS,
+  the WASAPI endpoint id on Windows. It survives reboots and re-plugs.
+  - Config binds by `device_id` (preferred) or by exact `device` name. A name that matches more
+    than one device is refused at open with a latched error that lists the matching ids. The name
+    form never picks one by enumeration order.
+  - `device = "default"` is the OS default and follows it: when the OS default changes, the stream
+    reopens on the new default and the change is logged. A physical device literally named
+    "default" is selected by its `device_id`.
+  - Every open logs the name and id that were bound.
 - **One lifecycle helper per device**, a long-lived thread that owns the cpal `Stream`. Open and
   close requests go to it through a 1-slot channel (single flight). The requester waits at most
   2 s for the reply, then treats the attempt as failed and moves to backoff.
+- **Quiescence.** One stream and one callback own a ring at a time. After a stall or loss, a ring
+  is reset or given to a new stream only when the helper confirms that the old stream was
+  dropped (cpal stops the callback when the `Stream` is dropped). If the close does not complete
+  within its deadline, the old generation keeps its ring and stream, no replacement stream is
+  started, and the device goes to `device_call_stuck` until the close returns. Each new stream
+  gets its rings fresh from a per-device pool of two, so a confirmed-closed generation's rings are
+  reused only after confirmation.
 - **Late results.** A reply that arrives after its deadline carries the request's generation
   number. The helper drops any stream whose generation is not current, so a late successful open
   is closed, not used.
@@ -110,7 +137,8 @@ program bus ──push (wait-free)──▶ [engine→drain SPSC ring, ~200 ms] 
   new helper is started (the thread budget is one per device). The device goes to the latched
   `device_call_stuck` state, its source reads silence (input) or its output drops (output), and a
   warning is raised. When the call returns, the helper resumes and normal backoff continues.
-  Teardown at shutdown waits at most 2 s per helper, then detaches it. The process exit takes it.
+  At shutdown all helpers are told to stop at once and are awaited in parallel against one 2 s
+  deadline; any still stuck is detached and the process exit takes it.
 - The cpal error callback sets an atomic `lost` flag and records the error kind. It does nothing
   else. Stalled/lost detection is in sections 2 and 3. Reopen uses capped exponential backoff
   (250 ms → 10 s).
@@ -123,12 +151,13 @@ program bus ──push (wait-free)──▶ [engine→drain SPSC ring, ~200 ms] 
   the grant survives updates. Without consent CoreAudio may deliver zeros or no callbacks.
   - *No callbacks* is detected as *stalled* (section 4) and reported as
     `stalled (permission or device)`.
-  - *Exact zeros* are reported as `input_silent` only. Silence is never treated as proof of
-    denial, because a muted or idle microphone gives the same signal.
-  - Where the OS exposes it, the source also reads the authorization status
-    (`AVCaptureDevice.authorizationStatus(for: .audio)` through cpal's dependencies or a small
-    `objc2` call in the leaf crate), and reports `permission_denied` only when that says
-    denied/restricted.
+  - *Exact zeros* are reported as `input_silent` only.
+  - **Known limit:** the leaf crate has no unsafe code, and cpal does not expose the TCC
+    authorization status, so on macOS the source cannot tell a denied microphone from a silent
+    one. It never reports `permission_denied` on macOS; the `input_silent` and `stalled` messages
+    name microphone permission as one possible cause. Reading `AVCaptureDevice.authorizationStatus`
+    would need an Objective-C call in a separate FFI crate; that is a later change if operators
+    need it.
   - The operator runbook says how to grant or reset consent (System Settings → Privacy & Security
     → Microphone; `tccutil reset Microphone <bundle-id>`).
 - **Windows:** the per-app microphone privacy setting. A denied open fails with an access error,
@@ -141,7 +170,8 @@ program bus ──push (wait-free)──▶ [engine→drain SPSC ring, ~200 ms] 
 [[sources]]
 id = "desk-mic"
 kind = "audio_device"
-device = "USB Advanced Audio Device"   # exact cpal device name, or "default"
+device_id = "CoreAudio:AppleUSBAudioEngine:...:1"   # stable id from `multiview devices audio` (preferred)
+# device = "USB Advanced Audio Device"            # or an exact, unique name, or "default"
 channels = 1                           # optional; device default otherwise
 # the stream always opens at 48 kHz (section 2)
 
@@ -159,6 +189,10 @@ device = "default"
   promotion/reversion and adoption of persisted desired state. Delete of a file-configured device
   resource is also refused. A remote client cannot cause a device open or reopen. Tests cover each
   route, and each resource id is still checked per object (BOLA).
+- **Read path:** the control API lists `audio_device` sources and outputs and their state to an
+  authenticated client with read access to that resource (per-object authorization applies, as for
+  every resource). Device ids and names are shown only to clients with the operator role; other
+  readers see the source id and state only.
 - **Telemetry and alerts:** per device `state` (`open`, `stalled`, `lost`, `device_call_stuck`,
   `permission_denied`, `unsupported_rate`), `input_silent`, `ring_overflow_frames`,
   `underrun_frames`, `engine_drop_frames`, `reopens`, `servo_ppm` and `unread_ms`. Alerts: any
