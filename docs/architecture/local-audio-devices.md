@@ -284,7 +284,7 @@ device = "default"
   every resource). Device ids and names are shown only to clients with the operator role; other
   readers see the source id and state only.
 - **Telemetry and alerts:** per device `state` (`open`, `stalled`, `lost`, `device_call_stuck`,
-  `permission_denied`, `unsupported_rate`), `input_silent`, `ring_overflow_frames`,
+  `permission_denied`, `unsupported_rate`, `unsupported_buffer`, `config_error`), `input_silent`, `ring_overflow_frames`,
   `underrun_frames`, `engine_drop_frames`, `reopens`, `servo_ppm` and `unread_ms`. Alerts: any
   state other than `open` for 10 s, and drops or underruns above 0.1 % of frames over 1 min.
 
@@ -303,6 +303,10 @@ own clock.
 4. Chaos: callbacks stall for 3 s (no error), burst 500 ms at once, send errors, and stop for good.
    Stalled and lost are detected, reopen happens, a late successful open is discarded, and a
    permanently stuck open leaves one helper and the `device_call_stuck` state, not more threads.
+4a. Underrun storm: a callback that chronically short-fills outside pre-roll. Assert no underrun
+   is counted while the pre-roll flag is set, re-anchors follow the capped backoff (1 s → 30 s),
+   and each storm costs one bounded pre-roll (no loop). A `DeviceChanged` onto a device with a
+   period over 40 ms goes to *lost* and `unsupported_buffer`.
 5. Isolation, on the real engine clock path: a pipeline with a synthetic video source plus
    simulated audio devices runs at 25, 29.97 and 60 fps while the devices stall, burst, die and
    are reopened 100 times. Assert: one frame per tick, PTS from the tick counter, no tick late
