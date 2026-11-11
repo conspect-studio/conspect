@@ -1,5 +1,5 @@
 import { useEffect, useRef, type JSX } from 'react';
-import { MoqLeaseRefused, MoqUnavailable, startMoqPlaybackWithRefresh, type MoqLeaseApi } from './moqPlayback';
+import { MoqLeaseRefused, MoqReleaseUnacknowledged, MoqUnavailable, startMoqPlaybackWithRefresh, type MoqLeaseApi } from './moqPlayback';
 import { abrDatasetEntries, abrSnapshot, type AbrPersistedState, type AbrState } from './moqAbr';
 
 // Serialize replacements, including React StrictMode's effect cleanup/remount.
@@ -11,9 +11,13 @@ export function MoqPlayer({ api, label, audio = false, className, onUnavailable,
   readonly label: string;
   readonly audio?: boolean;
   readonly className?: string | undefined;
-  /** MoQ cannot play here (unsupported browser/codec, lease refused, or the session failed): `reason` says which. */
+  /**
+   * MoQ cannot play here: `reason` says why (`unsupported`, a typed lease refusal,
+   * `session-failed`, or `release-unacknowledged`).
+   */
   readonly onUnavailable: (reason: string) => void;
-  readonly onFatal: () => void;
+  /** The lease release was NOT acknowledged: the server may hold the lease until its deadline. */
+  readonly onFatal?: (() => void) | undefined;
   readonly onLeaseState?: ((state: 'negotiating' | 'active' | 'released') => void) | undefined;
   /** Per-consumer ABR state: requested vs effective rendition and the reason. */
   readonly onAbr?: ((state: AbrState) => void) | undefined;
@@ -53,18 +57,20 @@ export function MoqPlayer({ api, label, audio = false, className, onUnavailable,
       } catch (error) {
         // The transport ladder is MoQ → WebRTC → stills. EVERY MoQ failure hands
         // the surface a reason and lets it try the next transport; none ends in a
-        // dead view. An authorization failure repeats on the next transport and
-        // is reported there.
+        // dead view. The surface shows the reason to the user.
         const reason = error instanceof MoqLeaseRefused ? error.reason
           : error instanceof MoqUnavailable ? 'unsupported'
+          : error instanceof MoqReleaseUnacknowledged ? 'release-unacknowledged'
           : 'session-failed';
-        // A refused lease or an unsupported browser holds no server session, so
-        // it is released now. A failed SESSION may not have had its release
-        // acknowledged: say so (onFatal) and do not claim 'released'.
-        if (reason === 'session-failed') {
-          if (!isAborted()) { callbacks.current.onFatal(); callbacks.current.onUnavailable(reason); }
+        // Only an unacknowledged release can leave a lease on the server. Say so
+        // (onFatal), do not claim 'released', and keep this lane closed: the
+        // surface must not open a replacement before the lease deadline.
+        if (reason === 'release-unacknowledged') {
+          if (!isAborted()) { callbacks.current.onFatal?.(); callbacks.current.onUnavailable(reason); }
           throw error;
         }
+        // Every other failure holds no lease (refused, unsupported, or the
+        // release was acknowledged after the session failed).
         callbacks.current.onLeaseState?.('released');
         if (!isAborted()) callbacks.current.onUnavailable(reason);
       }

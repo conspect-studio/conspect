@@ -118,6 +118,13 @@ function JpegRung({
 /** The transport rung a surface is using. The ladder is MoQ, then WebRTC, then stills. */
 export type PreviewTransport = 'moq' | 'webrtc' | 'jpeg';
 
+/**
+ * After an unacknowledged MoQ release the server may hold the lease until its
+ * deadline (the server clamps a lease to 60 s). The surface shows stills for
+ * this long before it opens WebRTC, so two live sessions never overlap.
+ */
+export const MOQ_UNACKNOWLEDGED_HOLD_MS = 60_000;
+
 export function PreviewSurface({
   scope,
   whepEndpoint,
@@ -168,8 +175,24 @@ export function PreviewSurface({
   const refusals = useRef(0);
   const [released, setReleased] = useState(true);
 
-  // Why MoQ is not in use for this surface (undefined = not tried or playing).
-  const [moqReason, setMoqReason] = useState<string>();
+  // Why MoQ is not in use for THIS scope and endpoint (undefined = not tried or
+  // playing). The record carries its key, so a surface that is reused for a
+  // different source starts at MoQ again and never reports a stale reason.
+  const surfaceKey = `${scope}:${whepEndpoint}`;
+  const [moqFallback, setMoqFallback] = useState<{ readonly key: string; readonly reason: string; readonly held: boolean }>();
+  const moqReason = moqFallback?.key === surfaceKey ? moqFallback.reason : undefined;
+  const moqHeld = moqFallback?.key === surfaceKey && moqFallback.held;
+  const leaseRef = useRef({ onLeaseState, onSessionReleased });
+  useEffect(() => { leaseRef.current = { onLeaseState, onSessionReleased }; });
+  useEffect(() => {
+    if (!moqHeld) return;
+    const timer = window.setTimeout(() => {
+      setMoqFallback((current) => (current?.key === surfaceKey ? { ...current, held: false } : current));
+      leaseRef.current.onLeaseState?.('released');
+      leaseRef.current.onSessionReleased?.();
+    }, MOQ_UNACKNOWLEDGED_HOLD_MS);
+    return (): void => { window.clearTimeout(timer); };
+  }, [moqHeld, surfaceKey]);
   const moqApi = useMemo(() => createMoqLeaseApi(scope, whepEndpoint), [scope, whepEndpoint]);
   const canWhep = whepAvailable(capabilities, scope);
   const retryNow = (): void => {
@@ -208,16 +231,33 @@ export function PreviewSurface({
   }, [autoRetry, attempt]);
 
   const transport: PreviewTransport = capabilities?.moq && moqReason === undefined ? 'moq'
-    : canWhep && !degraded ? 'webrtc' : 'jpeg';
+    : canWhep && !degraded && !moqHeld ? 'webrtc' : 'jpeg';
   const transportRef = useRef(onTransport);
   useEffect(() => { transportRef.current = onTransport; });
   useEffect(() => { transportRef.current?.(transport, moqReason); }, [transport, moqReason]);
 
   if (capabilities?.moq && moqReason === undefined) {
-    return <MoqPlayer key={`${scope}:${whepEndpoint}`} api={moqApi} label={label} audio={audio} className={className}
-      onUnavailable={(reason) => { setMoqReason(reason); onTransportUnavailable?.(); }} onFatal={() => { /* reason arrives via onUnavailable */ }}
+    return <MoqPlayer key={surfaceKey} api={moqApi} label={label} audio={audio} className={className}
+      onUnavailable={(reason) => {
+        setMoqFallback({ key: surfaceKey, reason, held: reason === 'release-unacknowledged' });
+        onTransportUnavailable?.();
+      }}
       onLeaseState={(state) => { onLeaseState?.(state); if (state === 'released') onSessionReleased?.(); }} />;
   }
+  // The user sees why MoQ is not in use. Two reasons are the normal state and
+  // get no note: a browser without MoQ support, and a server that does not
+  // offer MoQ for this scope.
+  const moqNote = moqReason === undefined || moqReason === 'unsupported' || moqReason === 'moq-unavailable' ? null : (
+    <p role="status" className="px-3 py-1 text-xs text-muted-foreground" data-testid="moq-fallback-note" data-reason={moqReason}>
+      {moqReason === 'forbidden'
+        ? <Trans>MoQ video was refused: this account has no access to it. Showing the next available preview.</Trans>
+        : <Trans>MoQ video is not in use ({moqReason}). Showing the next available preview.</Trans>}
+    </p>
+  );
+  const withNote = (rung: JSX.Element): JSX.Element => {
+    if (moqNote === null) return rung;
+    return <>{rung}{diagnosticsHost ? createPortal(moqNote, diagnosticsHost) : moqNote}</>;
+  };
   // No WebRTC for this scope/build: JPEG is the honest primary — NO badge.
   // This applies to every scope, including `input`: a build with no WebRTC at
   // all (the LGPL-clean/GPU-free default, `webrtc: false`) must still offer
@@ -228,23 +268,27 @@ export function PreviewSurface({
   // failed/was busy) keeps the explicit "Live input preview failed" state for
   // `input`, per the real WHEP-failure case this distinction exists for.
   if (!canWhep) {
-    return <JpegRung jpegPath={jpegPath} label={label} degraded={false} className={className} />;
+    return withNote(<JpegRung jpegPath={jpegPath} label={label} degraded={false} className={className} />);
+  }
+  // The MoQ lease may still be held: stills only, until the hold ends.
+  if (moqHeld) {
+    return withNote(<JpegRung jpegPath={jpegPath} label={label} degraded className={className} />);
   }
 
   // WHEP was attempted and failed: degrade to JPEG with the honest badge + a
   // retry that re-arms a fresh WHEP attempt.
   if (degraded) {
     if (scope === 'input') {
-      return (
+      return withNote(
         <>
           <JpegRung jpegPath={jpegPath} label={label} degraded={false} className={className} />
           <div role="alert" className="px-3 py-2 text-sm" data-testid="input-preview-unavailable">{busy ? <Trans>Live input preview is busy. Another viewer has the session.</Trans> : <Trans>Live input preview failed.</Trans>}{released ? <Button type="button" onClick={retryNow}>Retry live preview</Button> : null}{diagnostics ? <PreviewDiagnostics diagnostics={diagnostics} /> : null}</div>
-        </>
+        </>,
       );
     }
     const busyNote = busy && !capacity ? <p role="alert"><Trans>Live preview is busy. Another viewer has the session.</Trans></p> : null;
     const details = diagnostics ? <PreviewDiagnostics diagnostics={diagnostics} flat={diagnosticsHost != null} /> : null;
-    return (
+    return withNote(
       <>
         <JpegRung
           jpegPath={jpegPath}
@@ -270,11 +314,11 @@ export function PreviewSurface({
         ) : (
           <>{busyNote}{details}</>
         )}
-      </>
+      </>,
     );
   }
 
-  return (
+  return withNote(
     <WhepPlayer
       key={attempt}
       endpoint={whepEndpoint}
@@ -298,6 +342,6 @@ export function PreviewSurface({
         setDiagnostics(details);
         setDegraded(true);
       }}
-    />
+    />,
   );
 }

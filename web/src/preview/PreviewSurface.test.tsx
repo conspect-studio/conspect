@@ -180,6 +180,24 @@ describe('<PreviewSurface>', () => {
     host.remove();
   });
 
+  it('keeps the still under the alert when a live input preview is refused (never a text-only view)', async () => {
+    const { getByTestId } = renderWithProviders(
+      <PreviewSurface
+        scope="input"
+        whepEndpoint="/api/v1/preview/inputs/cam1/whep"
+        jpegPath="/api/v1/preview/inputs/cam1.jpg"
+        label="Input cam1"
+        capabilities={caps()}
+        pcFactory={() => new IdlePeerConnection() as unknown as RTCPeerConnection}
+        fetchImpl={(): Promise<Response> => Promise.resolve(rejectSdp())}
+      />,
+    );
+    await waitFor(() => { expect(getByTestId('input-preview-unavailable')).toBeInTheDocument(); });
+    // The fixture refuses with a capacity answer, so the alert is the busy one.
+    expect(getByTestId('input-preview-unavailable')).toHaveTextContent('Live input preview is busy.');
+    expect(getByTestId('jpeg-rung')).toBeInTheDocument();
+  });
+
   it('degrades WHEP→JPEG WITH the honest badge on a fatal session error, and retries', async () => {
     const { getByTestId, queryByTestId, getByRole } = renderWithProviders(
       <PreviewSurface
