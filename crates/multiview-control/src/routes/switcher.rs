@@ -166,27 +166,48 @@ fn verb(req: &SwitcherRequest, kind: &str) -> ControlResult<SwitcherVerb> {
     }
 }
 
-/// The first slice admits only its configured source pair. Both members have
-/// bounded warm rails; a third source needs a new scene admission, not a take.
-fn validate_source_pair(state: &AppState, req: &SwitcherRequest) -> ControlResult<()> {
+/// ADR-0104 §1: a referenced source must be a source of the running
+/// configuration (the accepted document's sources, the same list
+/// `GET /api/v1/sources` serves). Authorization of the id itself is
+/// `authorize_refs`, which runs first; this check never widens it.
+fn validate_source_configured(state: &AppState, req: &SwitcherRequest) -> ControlResult<()> {
     let Some(source) = req.source.as_deref() else {
         return Ok(());
     };
-    let Some(document) = state.base_document.as_ref() else {
-        return Ok(());
-    };
-    let me = document
-        .pointer("/switcher/mix_effects/0")
-        .ok_or_else(|| ControlError::Conflict("no configured first-slice source pair".into()))?;
-    if ["program_source", "preview_source"]
+    let known = crate::boot_model::accepted_resources(state, "sources")?
+        .map_or_else(|| state.sources.list(), Ok)?
         .iter()
-        .any(|key| me[*key].as_str() == Some(source))
-    {
+        .any(|v| v.resource.id == source);
+    if known {
         Ok(())
     } else {
         Err(ControlError::Validation(
-            "first-slice source is outside the configured Program/Preview pair".into(),
+            "source is not in the running configuration".into(),
         ))
+    }
+}
+
+/// #247: a take or a PVW selection that cannot change the picture is refused
+/// up front with a typed reason. The engine re-checks at the tick.
+fn validate_buses(handle: &SwitcherControl, req: &SwitcherRequest) -> ControlResult<()> {
+    let Some(snapshot) = handle.snapshot() else {
+        return Ok(());
+    };
+    let program = snapshot.program.as_str();
+    match req.action.as_str() {
+        "select_preview" if req.source.as_deref() == Some(program) => Err(
+            ControlError::Validation(multiview_engine::switcher_control::REFUSE_SAME_SOURCE.into()),
+        ),
+        "select_program" if req.source.as_deref() == Some(program) => Err(
+            ControlError::Validation("source is already on program".into()),
+        ),
+        "cut" | "auto" if snapshot.preview == snapshot.program => Err(ControlError::Validation(
+            multiview_engine::switcher_control::REFUSE_SAME_SOURCE.into(),
+        )),
+        "auto" if snapshot.in_flight => Err(ControlError::Validation(
+            "cannot start a second AUTO during an active take".into(),
+        )),
+        _ => Ok(()),
     }
 }
 
@@ -231,7 +252,7 @@ pub(crate) async fn plan_switcher(
 ) -> ControlResult<Response> {
     principal.role.require(Action::Read)?;
     authorize_refs(&principal, &req)?;
-    validate_source_pair(&state, &req)?;
+    validate_source_configured(&state, &req)?;
     validate_first_slice(&req, &req.action)?;
     let handle = engine(&state)?;
     if req.action == "auto" && !handle.supports_auto() {
@@ -239,6 +260,7 @@ pub(crate) async fn plan_switcher(
             "AUTO requires a same-epoch preview compositor and admitted transition budget".into(),
         ));
     }
+    validate_buses(handle, &req)?;
     let version = handle
         .scene_version()
         .ok_or_else(|| ControlError::Conflict("switcher has no active scene".into()))?;
@@ -264,7 +286,7 @@ pub(crate) async fn submit_switcher(
 ) -> ControlResult<Response> {
     principal.role.require(Action::Write)?;
     authorize_refs(&principal, &req)?;
-    validate_source_pair(&state, &req)?;
+    validate_source_configured(&state, &req)?;
     if req.action != kind {
         return Err(ControlError::Validation(
             "switcher action disagrees with command path".into(),
@@ -277,6 +299,7 @@ pub(crate) async fn submit_switcher(
             "AUTO requires a same-epoch preview compositor and admitted transition budget".into(),
         ));
     }
+    validate_buses(handle, &req)?;
     let scene_version = handle
         .scene_version()
         .ok_or_else(|| ControlError::Conflict("switcher has no active scene".into()))?;
@@ -294,14 +317,19 @@ pub(crate) async fn submit_switcher(
         Reservation::Capacity => return Err(ControlError::IdempotencyCapacity),
         Reservation::Replay(op) => op,
         Reservation::Fresh(op) => {
-            let lease = if req.action == "select_preview" {
+            let program_bus = req.action == "select_program";
+            let lease = if req.action == "select_preview" || program_bus {
                 match (demand.as_ref(), req.source.as_ref()) {
                     (Some(demand), Some(source)) => {
-                        let Some(lease) = demand.preview_lease(source, "switcher:me1:pvw") else {
+                        let label = if program_bus {
+                            "switcher:me1:pgm"
+                        } else {
+                            "switcher:me1:pvw"
+                        };
+                        let Some(lease) = demand.switcher_preview_lease(source, label) else {
                             state.idempotency.release(Some(key), &op);
                             return Err(ControlError::Conflict(
-                                "preview source lease unavailable (unknown source or lease limit)"
-                                    .into(),
+                                "source lease unavailable (unknown source or lease limit)".into(),
                             ));
                         };
                         Some((
@@ -324,13 +352,17 @@ pub(crate) async fn submit_switcher(
                 verb,
             };
             let admitted = if let Some((target, lease)) = lease {
-                state
-                    .switcher_preview_lease
-                    .admit(op.to_string(), target, lease, handle, || {
-                        handle.try_send(command).map_err(|_| ())?;
-                        Ok(handle.composed_count())
-                    })
-                    .is_ok()
+                let enqueue = || {
+                    handle.try_send(command).map_err(|_| ())?;
+                    Ok(handle.composed_count())
+                };
+                let owner = &state.switcher_preview_lease;
+                if program_bus {
+                    owner.admit_program(op.to_string(), target, lease, handle, enqueue)
+                } else {
+                    owner.admit(op.to_string(), target, lease, handle, enqueue)
+                }
+                .is_ok()
             } else {
                 handle.try_send(command).is_ok()
             };

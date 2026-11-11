@@ -52,6 +52,21 @@ fn scene_admits_source(scene: &Layout, source: &str) -> bool {
 /// Maximum queued commands, including unresponsive data-plane scenarios.
 pub const COMMAND_CAPACITY: usize = 64;
 
+/// Output ticks a take may wait for its incoming source's first fresh frame
+/// before it is refused (ADR-0104). The clock never waits; the take does.
+pub const TAKE_PRIME_DEADLINE_TICKS: u64 = 50;
+
+/// Typed refusal: the incoming source had no fresh frame before the deadline.
+pub const REFUSE_NO_FRESH_FRAME: &str =
+    "incoming source was not primed with a fresh frame before the bounded take deadline; Program is unchanged";
+/// Typed refusal: the AUTO's incoming source lost its fresh frame before the
+/// terminal tick (review SW2-02). Program keeps the outgoing source.
+pub const REFUSE_LOST_DURING_AUTO: &str =
+    "incoming source lost its fresh frame during AUTO; the take was aborted and Program kept the outgoing source";
+/// Typed refusal: Preview already carries the Program source (#247).
+pub const REFUSE_SAME_SOURCE: &str =
+    "preview and program carry the same source; select a different preview source";
+
 /// An operator verb, already authorized and reference-validated on admission.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SwitcherVerb {
@@ -115,6 +130,7 @@ pub struct SwitcherControl {
     readiness: LatestState<ProviderStatus>,
     applied_tick: Arc<std::sync::atomic::AtomicU64>,
     composed_count: Arc<std::sync::atomic::AtomicU64>,
+    auto_capable: Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// Actual paired-bus frame capability, published after the rendering provider
@@ -163,6 +179,7 @@ impl SwitcherControl {
             readiness: LatestState::new(),
             applied_tick: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             composed_count: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            auto_capable: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         };
         let driver = SwitcherTickDriver {
             rx,
@@ -173,6 +190,7 @@ impl SwitcherControl {
             readiness: handle.readiness.clone(),
             applied_tick: Arc::clone(&handle.applied_tick),
             composed_count: Arc::clone(&handle.composed_count),
+            auto_capable: Arc::clone(&handle.auto_capable),
             active_auto: None,
             active_auto_scenes: None,
             primed_stores: None,
@@ -255,11 +273,11 @@ impl SwitcherControl {
         self.provider_status().is_some()
     }
 
-    /// Never admit an AUTO until a same-epoch precomposed PVW tap and its
-    /// measured admission budget are wired. Cut/Punch remain independently safe.
+    /// `true` only once the frame hook that renders the AUTO dissolve inside
+    /// the Program drive is installed (ADR-0104 §3); never at config load.
     #[must_use]
     pub fn supports_auto(&self) -> bool {
-        false
+        self.auto_capable.load(std::sync::atomic::Ordering::Acquire)
     }
 
     /// Scene generation presently available for command admission. This is
@@ -291,12 +309,22 @@ pub struct SwitcherTickDriver {
     readiness: LatestState<ProviderStatus>,
     applied_tick: Arc<std::sync::atomic::AtomicU64>,
     composed_count: Arc<std::sync::atomic::AtomicU64>,
+    auto_capable: Arc<std::sync::atomic::AtomicBool>,
     primed_stores: Option<HashMap<String, Arc<TileStore<Nv12Image>>>>,
     pending_take: Option<(SwitcherCommand, u64)>,
     last_tick: u64,
     staged_success: Vec<String>,
     spare_success: Vec<String>,
-    before_staged: Option<SwitcherState>,
+    before_staged: Option<Staged>,
+}
+
+/// Everything a rejected tick must restore (review SW2-03): the machine and
+/// the AUTO bookkeeping that lives beside it.
+#[derive(Debug)]
+struct Staged {
+    machine: SwitcherState,
+    active_auto: Option<String>,
+    active_auto_scenes: Option<Arc<ScenePair>>,
 }
 
 impl SwitcherTickDriver {
@@ -304,6 +332,114 @@ impl SwitcherTickDriver {
     /// starts. Only `is_primed` is sampled on a tick; ingest remains off-clock.
     pub fn set_prime_stores(&mut self, stores: HashMap<String, Arc<TileStore<Nv12Image>>>) {
         self.primed_stores = Some(stores);
+    }
+
+    /// Advertise AUTO. Called only by the frame hook that renders the
+    /// dissolve inside the Program drive (ADR-0104 §3).
+    pub fn advertise_auto(&self) {
+        self.auto_capable
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    /// Whether `source` has a fresh frame at this tick, by the compositor's own
+    /// latch-and-classify rule (ADR-0104 §2). `None` when no store map is
+    /// installed. Wait-free: atomic loads and a ring snapshot, no allocation.
+    fn fresh_at(&self, source: &str, tick: Tick) -> Option<bool> {
+        let stores = self.primed_stores.as_ref()?;
+        Some(
+            stores
+                .get(source)
+                .is_some_and(|store| store.state_at(tick.pts).is_live()),
+        )
+    }
+
+    /// Snapshot the state a rejected tick restores, once per tick.
+    fn stage(&mut self) {
+        if self.before_staged.is_none() {
+            self.before_staged = Some(Staged {
+                machine: self.machine.clone(),
+                active_auto: self.active_auto.clone(),
+                active_auto_scenes: self.active_auto_scenes.clone(),
+            });
+        }
+    }
+
+    /// The running AUTO got its terminal outcome on this tick: a rejected
+    /// frame restores the buses but must not resurrect or refuse it again.
+    fn forget_staged_auto(&mut self) {
+        if let Some(staged) = self.before_staged.as_mut() {
+            staged.active_auto = None;
+            staged.active_auto_scenes = None;
+            staged.machine.abort();
+        }
+    }
+
+    /// The source a take verb puts on Program.
+    fn incoming<'a>(&'a self, verb: &'a SwitcherVerb) -> &'a str {
+        match verb {
+            SwitcherVerb::SelectProgram(source) => source.as_str(),
+            _ => self.machine.preview().as_str(),
+        }
+    }
+
+    /// Apply a take whose incoming source has a fresh frame now.
+    fn apply_take(
+        &mut self,
+        verb: &SwitcherVerb,
+        scenes: Option<&Arc<ScenePair>>,
+        tick: Tick,
+    ) -> Result<SwitcherProjection, String> {
+        match verb {
+            SwitcherVerb::SelectProgram(source) => Ok(self.machine.punch(source.clone())),
+            SwitcherVerb::Cut => self.machine.cut().map_err(|e| e.to_string()),
+            SwitcherVerb::Auto(rate) => {
+                if self.machine.is_in_flight() {
+                    return Err("cannot start a second AUTO during an active take".into());
+                }
+                let Some(pair) = scenes else {
+                    return Err("no active PGM/PVW scene provider".into());
+                };
+                validate_mix(&pair.program, &pair.preview)
+                    .map_err(|e| e.to_string())
+                    .and_then(|()| {
+                        self.machine
+                            .set_transition(TransitionDescriptor::Mix { rate: *rate })
+                            .map_err(|e| e.to_string())
+                    })
+                    .and_then(|()| self.machine.auto(tick).map_err(|e| e.to_string()))
+            }
+            SwitcherVerb::SelectPreview(_) => Err("not a take".into()),
+        }
+    }
+
+    /// Stage a successful take result: AUTO stays active until completion; an
+    /// on-air verb interrupts an active AUTO.
+    fn stage_take(
+        &mut self,
+        operation_id: String,
+        verb: &SwitcherVerb,
+        next: SwitcherProjection,
+        scenes: Option<Arc<ScenePair>>,
+        tick: Tick,
+    ) {
+        if matches!(verb, SwitcherVerb::Auto(_)) && !next.completed {
+            self.active_auto_scenes = scenes;
+            self.active_auto = Some(operation_id);
+            return;
+        }
+        if matches!(verb, SwitcherVerb::Cut | SwitcherVerb::SelectProgram(_)) {
+            if let Some(old) = self.active_auto.take() {
+                self.active_auto_scenes = None;
+                self.forget_staged_auto();
+                self.publish_outcome(
+                    old,
+                    tick.index,
+                    false,
+                    Some("AUTO interrupted by a new on-air operation".into()),
+                );
+            }
+        }
+        self.staged_success.push(operation_id);
     }
 
     /// Immutable scene pair pinned for the duration of the active AUTO, if any.
@@ -356,6 +492,12 @@ impl SwitcherTickDriver {
         }
     }
 
+    /// The active AUTO's anchor tick and duration (ADR-0104 §3/§4), if any.
+    #[must_use]
+    pub fn auto_window(&self) -> Option<(i128, FrameCount)> {
+        self.machine.auto_window()
+    }
+
     /// Authoritative post-command selected sources for the same output tick.
     #[must_use]
     pub fn selections(&self) -> (&SourceRef, &SourceRef) {
@@ -384,36 +526,51 @@ impl SwitcherTickDriver {
     // helpers and hide the single-tick atomicity this test set pins.
     pub fn drain_at_tick(&mut self, tick: Tick) -> SwitcherProjection {
         self.last_tick = tick.index;
-        let mut projection = self.machine.sample(tick);
-        if let Some((command, deadline)) = self.pending_take.take() {
-            let selected = self.machine.preview().as_str();
-            let primed = self
-                .primed_stores
-                .as_ref()
-                .and_then(|stores| stores.get(selected))
-                .is_some_and(|store| store.is_primed());
-            if primed {
-                if self.before_staged.is_none() {
-                    self.before_staged = Some(self.machine.clone());
-                }
-                match self.machine.cut() {
-                    Ok(next) => {
-                        projection = next;
-                        self.staged_success.push(command.operation_id);
-                    }
-                    Err(err) => self.publish_outcome(
-                        command.operation_id,
+        // An AUTO in flight can complete (swap buses) on this tick: snapshot
+        // first so a rejected frame restores the whole flight (SW2-03).
+        if self.machine.is_in_flight() {
+            self.stage();
+        }
+        // SW2-02: never complete an AUTO onto a source without a fresh frame.
+        if let Some((start, rate)) = self.machine.auto_window() {
+            let terminal = i128::from(tick.index) - start >= i128::from(rate.get());
+            let preview = self.machine.preview().as_str().to_owned();
+            if terminal && self.fresh_at(&preview, tick) == Some(false) {
+                self.machine.abort();
+                if let Some(operation_id) = self.active_auto.take() {
+                    self.active_auto_scenes = None;
+                    // Already terminal: a rejected frame must not refuse it twice.
+                    self.forget_staged_auto();
+                    self.publish_outcome(
+                        operation_id,
                         tick.index,
                         false,
-                        Some(err.to_string()),
-                    ),
+                        Some(REFUSE_LOST_DURING_AUTO.into()),
+                    );
+                }
+            }
+        }
+        let mut projection = self.machine.sample(tick);
+        if let Some((command, deadline)) = self.pending_take.take() {
+            let incoming = self.incoming(&command.verb).to_owned();
+            if self.fresh_at(&incoming, tick) == Some(true) {
+                self.stage();
+                let scenes = self.scenes.latest();
+                match self.apply_take(&command.verb, scenes.as_ref(), tick) {
+                    Ok(next) => {
+                        projection = next;
+                        self.stage_take(command.operation_id, &command.verb, next, scenes, tick);
+                    }
+                    Err(err) => {
+                        self.publish_outcome(command.operation_id, tick.index, false, Some(err));
+                    }
                 }
             } else if tick.index >= deadline {
                 self.publish_outcome(
                     command.operation_id,
                     tick.index,
                     false,
-                    Some("preview source was not primed before bounded take deadline".into()),
+                    Some(REFUSE_NO_FRESH_FRAME.into()),
                 );
             } else {
                 self.pending_take = Some((command, deadline));
@@ -430,116 +587,61 @@ impl SwitcherTickDriver {
                 break;
             };
             let scenes = self.scenes.latest();
-            if self.before_staged.is_none()
-                && matches!(
-                    command.verb,
-                    SwitcherVerb::SelectProgram(_)
-                        | SwitcherVerb::Cut
-                        | SwitcherVerb::Auto(_)
-                        | SwitcherVerb::SelectPreview(_)
-                )
-            {
-                self.before_staged = Some(self.machine.clone());
-            }
-            let result: Result<SwitcherProjection, String> = if scenes
+            self.stage();
+            let take = matches!(
+                command.verb,
+                SwitcherVerb::SelectProgram(_) | SwitcherVerb::Cut | SwitcherVerb::Auto(_)
+            );
+            let result: Result<Option<SwitcherProjection>, String> = if scenes
                 .as_ref()
                 .is_some_and(|pair| pair.version != command.scene_version)
             {
                 Err("scene version changed before the frame boundary; re-plan the operation".into())
-            } else {
-                match &command.verb {
-                    SwitcherVerb::SelectPreview(source) => {
-                        if let Some(pair) = &scenes {
-                            if scene_admits_source(&pair.preview, source.as_str()) {
-                                self.machine
-                                    .set_preview(source.clone())
-                                    .map(|()| self.machine.sample(tick))
-                                    .map_err(|e| e.to_string())
-                            } else {
-                                Err("preview source is absent from the active scene".into())
-                            }
-                        } else {
-                            Err("no active PGM/PVW scene provider".into())
-                        }
-                    }
-                    SwitcherVerb::SelectProgram(source) => {
-                        if let Some(pair) = &scenes {
-                            if scene_admits_source(&pair.program, source.as_str()) {
-                                Ok(self.machine.punch(source.clone()))
-                            } else {
-                                Err("program source is absent from the active scene".into())
-                            }
-                        } else {
-                            Err("no active PGM/PVW scene provider".into())
-                        }
-                    }
-                    SwitcherVerb::Cut => {
-                        if scenes.is_none() {
-                            Err("no active PGM/PVW scene provider".into())
-                        } else if self.pending_take.is_some() {
-                            Err("a take is already held waiting for source prime".into())
-                        } else if self
-                            .primed_stores
-                            .as_ref()
-                            .and_then(|stores| stores.get(self.machine.preview().as_str()))
-                            .is_some_and(|store| store.is_primed())
-                        {
-                            self.machine.cut().map_err(|e| e.to_string())
-                        } else if self.primed_stores.is_some() {
-                            self.pending_take =
-                                Some((command.clone(), tick.index.saturating_add(50)));
-                            Ok(self.machine.sample(tick))
-                        } else {
-                            Err("switcher source prime provider is unavailable".into())
-                        }
-                    }
-                    SwitcherVerb::Auto(rate) => {
-                        if self.machine.is_in_flight() {
-                            Err("cannot start a second AUTO during an active take".into())
-                        } else if let Some(pair) = &scenes {
-                            validate_mix(&pair.program, &pair.preview)
-                                .map_err(|e| e.to_string())
-                                .and_then(|()| {
-                                    self.machine
-                                        .set_transition(TransitionDescriptor::Mix { rate: *rate })
-                                        .map_err(|e| e.to_string())
-                                })
-                                .and_then(|()| self.machine.auto(tick).map_err(|e| e.to_string()))
-                        } else {
-                            Err("no active PGM/PVW scene provider".into())
-                        }
-                    }
+            } else if scenes.is_none() {
+                Err("no active PGM/PVW scene provider".into())
+            } else if self.pending_take.is_some() {
+                // One held take at a time; a PVW change would retarget it.
+                Err("a take is already held waiting for source prime".into())
+            } else if let SwitcherVerb::SelectPreview(source) = &command.verb {
+                if !scenes
+                    .as_ref()
+                    .is_some_and(|pair| scene_admits_source(&pair.preview, source.as_str()))
+                {
+                    Err("preview source is absent from the active scene".into())
+                } else if source == self.machine.program() {
+                    Err(REFUSE_SAME_SOURCE.into())
+                } else {
+                    self.machine
+                        .set_preview(source.clone())
+                        .map(|()| Some(self.machine.sample(tick)))
+                        .map_err(|e| e.to_string())
                 }
+            } else if matches!(command.verb, SwitcherVerb::Auto(_)) && self.machine.is_in_flight() {
+                Err("cannot start a second AUTO during an active take".into())
+            } else if let SwitcherVerb::SelectProgram(source) = &command.verb {
+                if source == self.machine.program() {
+                    Err("source is already on program".into())
+                } else if scenes
+                    .as_ref()
+                    .is_some_and(|pair| scene_admits_source(&pair.program, source.as_str()))
+                {
+                    self.gate_take(&command, scenes.as_ref(), tick)
+                } else {
+                    Err("program source is absent from the active scene".into())
+                }
+            } else if self.machine.preview() == self.machine.program() {
+                Err(REFUSE_SAME_SOURCE.into())
+            } else {
+                self.gate_take(&command, scenes.as_ref(), tick)
             };
             match result {
-                Ok(next)
-                    if self
-                        .pending_take
-                        .as_ref()
-                        .is_some_and(|(held, _)| held.operation_id == command.operation_id) =>
-                {
-                    projection = next; // held: never claim success before prime
-                }
-                Ok(next) => {
+                // Held: never claim success before the incoming source is fresh.
+                Ok(None) => {}
+                Ok(Some(next)) => {
                     projection = next;
-                    if matches!(command.verb, SwitcherVerb::Auto(_)) && !next.completed {
-                        self.active_auto_scenes = scenes;
-                        self.active_auto = Some(command.operation_id);
+                    if take {
+                        self.stage_take(command.operation_id, &command.verb, next, scenes, tick);
                     } else {
-                        if matches!(
-                            command.verb,
-                            SwitcherVerb::Cut | SwitcherVerb::SelectProgram(_)
-                        ) {
-                            if let Some(old) = self.active_auto.take() {
-                                self.active_auto_scenes = None;
-                                self.publish_outcome(
-                                    old,
-                                    tick.index,
-                                    false,
-                                    Some("AUTO interrupted by a new on-air operation".into()),
-                                );
-                            }
-                        }
                         self.staged_success.push(command.operation_id);
                     }
                 }
@@ -549,6 +651,28 @@ impl SwitcherTickDriver {
             }
         }
         projection
+    }
+
+    /// Apply a take now if its incoming source is fresh, else hold it (one slot,
+    /// bounded deadline). `Ok(None)` means held.
+    fn gate_take(
+        &mut self,
+        command: &SwitcherCommand,
+        scenes: Option<&Arc<ScenePair>>,
+        tick: Tick,
+    ) -> Result<Option<SwitcherProjection>, String> {
+        let incoming = self.incoming(&command.verb).to_owned();
+        match self.fresh_at(&incoming, tick) {
+            Some(true) => self.apply_take(&command.verb, scenes, tick).map(Some),
+            Some(false) => {
+                self.pending_take = Some((
+                    command.clone(),
+                    tick.index.saturating_add(TAKE_PRIME_DEADLINE_TICKS),
+                ));
+                Ok(None)
+            }
+            None => Err("switcher source prime provider is unavailable".into()),
+        }
     }
 
     /// End the public snapshot stream at this tick if the output loop is about
@@ -591,11 +715,29 @@ impl SwitcherTickDriver {
 
     /// Never claim on-air success when the bus frame could not be rendered.
     pub fn reject_composed_tick(&mut self, tick: Tick, reason: &str) {
+        // The AUTO admitted or running on this tick, if any: it gets exactly
+        // one terminal refusal, never a later second outcome (SW2-03).
+        let staged_auto = self.active_auto.take();
         if let Some(previous) = self.before_staged.take() {
-            self.machine = previous;
+            self.machine = previous.machine;
+            self.active_auto = previous.active_auto;
+            self.active_auto_scenes = previous.active_auto_scenes;
         }
+        // A rejected frame aborts any AUTO: Program stays on the source the
+        // restored machine names, which the hook re-binds.
+        if self.machine.is_in_flight() {
+            self.machine.abort();
+        }
+        let restored_auto = self.active_auto.take();
+        self.active_auto_scenes = None;
         self.spare_success.clear();
         std::mem::swap(&mut self.staged_success, &mut self.spare_success);
+        for operation_id in [staged_auto, restored_auto].into_iter().flatten() {
+            if !self.spare_success.contains(&operation_id) {
+                self.spare_success.push(operation_id);
+            }
+        }
+        self.spare_success.dedup();
         while let Some(operation_id) = self.spare_success.pop() {
             self.publish_outcome(operation_id, tick.index, false, Some(reason.to_owned()));
         }

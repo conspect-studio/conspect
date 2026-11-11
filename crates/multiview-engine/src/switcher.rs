@@ -134,6 +134,14 @@ impl SwitcherState {
     pub fn is_in_flight(&self) -> bool {
         self.flight.is_some()
     }
+    /// The active AUTO's anchor tick and duration, if an AUTO is in flight.
+    #[must_use]
+    pub fn auto_window(&self) -> Option<(i128, FrameCount)> {
+        match self.flight {
+            Some(Flight::Auto { start, rate, .. }) => Some((start, rate)),
+            _ => None,
+        }
+    }
     /// Total completed takes, useful to correlate completion edges.
     #[must_use]
     pub fn completion_count(&self) -> u64 {

@@ -89,18 +89,20 @@ pub fn attach_first_slice(
         .map_err(PipelineError::Engine)?;
     let leases = Arc::new(SwitcherPreviewLeases::default());
     let boot_warning = match demand {
-        Some(demand) => match demand.preview_lease(&me.preview_source, "switcher:me1:pvw:boot") {
-            Some(lease) => {
-                leases.seed(SwitcherPreviewLease::new(lease));
-                None
-            }
-            None => Some(format!(
-                "switcher preview source {:?} could not take a warm-on-arm lease at boot; \
+        Some(demand) => {
+            match demand.switcher_preview_lease(&me.preview_source, "switcher:me1:pvw:boot") {
+                Some(lease) => {
+                    leases.seed(SwitcherPreviewLease::new(lease));
+                    None
+                }
+                None => Some(format!(
+                    "switcher preview source {:?} could not take a warm-on-arm lease at boot; \
                  Preview stays explicitly unavailable until an operator selects it \
                  (Program and every other output are unaffected)",
-                me.preview_source
-            )),
-        },
+                    me.preview_source
+                )),
+            }
+        }
         None => None,
     };
     pipeline.attach_switcher(control.clone(), driver, Arc::clone(&preview_slot))?;

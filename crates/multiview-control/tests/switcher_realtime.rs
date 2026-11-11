@@ -33,6 +33,26 @@ fn scene(source: &str) -> Arc<Layout> {
         }],
     })
 }
+fn fresh_b() -> std::collections::HashMap<
+    String,
+    Arc<multiview_framestore::TileStore<multiview_compositor::pipeline::Nv12Image>>,
+> {
+    let b = Arc::new(multiview_framestore::TileStore::with_defaults("b"));
+    b.publish(
+        multiview_compositor::pipeline::Nv12Image::solid(
+            64,
+            64,
+            128,
+            128,
+            128,
+            multiview_core::color::ColorInfo::default().resolve_defaults(64, 64),
+        )
+        .unwrap(),
+        MediaTime::ZERO,
+    );
+    std::collections::HashMap::from([("b".to_owned(), b)])
+}
+
 #[tokio::test]
 async fn terminal_only_corr_and_dual_scope_survive_bounded_relay() {
     let (control, mut driver) = SwitcherControl::new(SwitcherState::new(
@@ -47,6 +67,8 @@ async fn terminal_only_corr_and_dual_scope_survive_bounded_relay() {
             preview: scene("b"),
         })
         .unwrap();
+    // ADR-0104 §2: every take, AUTO included, needs a fresh incoming frame.
+    driver.set_prime_stores(fresh_b());
     let publisher = Arc::new(EnginePublisher::<EngineStateSnapshot, Event>::new(64));
     let mut allowed = SessionStream::new(publisher.subscribe(), "operator", None).with_scopes(
         Some(vec!["me1".into()]),

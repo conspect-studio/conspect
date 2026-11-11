@@ -16,7 +16,7 @@ use std::sync::Arc;
 
 fn primed_stores() -> HashMap<String, Arc<TileStore<Nv12Image>>> {
     let thresholds = TileThresholds::from_millis(500, 2_000, 10_000).unwrap();
-    ["a", "b"]
+    ["a", "b", "c"]
         .into_iter()
         .map(|id| {
             let store = Arc::new(TileStore::new(id, thresholds, NoSignalPolicy::Slate));

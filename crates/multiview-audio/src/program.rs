@@ -334,6 +334,12 @@ impl ProgramBus {
         Ok(())
     }
 
+    /// The in-flight program-gain ramp of a route, if one is running.
+    #[must_use]
+    pub fn program_gain_ramp(&self, point: RoutePoint) -> Option<crate::mixer::GainRamp> {
+        self.mixer.gain_ramp(point)
+    }
+
     /// The steady program gain of a route (the endpoint any in-flight ramp
     /// settles at is applied on completion), or `None` for an unknown route.
     #[must_use]

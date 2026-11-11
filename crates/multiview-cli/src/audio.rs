@@ -195,6 +195,9 @@ pub struct AudioControlHandle {
     /// the bake consumer (after it changed the bus); read by the control side.
     channels:
         Arc<std::sync::RwLock<std::collections::HashMap<String, multiview_audio::RoutePoint>>>,
+    /// The AUTO crossfade `(outgoing, incoming)` already started on the bus
+    /// (ADR-0104 §4). Touched only by the bake consumer; never the clock.
+    crossfade: Arc<std::sync::Mutex<Option<CrossfadeKey>>>,
     /// Publishes the audio-route consumers whenever a routing document applies
     /// live, so a newly routed source starts and an unrouted one stops.
     route_demand: Option<multiview_engine::ConsumerSet<multiview_compositor::pipeline::Nv12Image>>,
@@ -259,6 +262,10 @@ fn map_remove<V: Clone>(cell: &SharedMap<V>, id: &str) {
     }
 }
 
+/// `(outgoing, incoming, flight start tick)` of the AUTO crossfade already
+/// started on the bus. The start tick tells two same-pair flights apart.
+type CrossfadeKey = (Option<String>, String, i128);
+
 impl AudioControlHandle {
     /// Create an empty mailbox; route resolution is installed at run startup.
     #[must_use]
@@ -289,6 +296,7 @@ impl AudioControlHandle {
             )),
             sources: shared_map(sources),
             channels: Arc::new(std::sync::RwLock::new(channels)),
+            crossfade: Arc::new(std::sync::Mutex::new(None)),
             known: shared_map(known),
             route_demand: None,
             routing: Arc::new(multiview_framestore::SwapCell::empty()),
@@ -753,6 +761,60 @@ impl AudioControlHandle {
         applied
     }
 
+    /// ADR-0104 §4: crossfade Program audio from `outgoing` to `incoming` over
+    /// the `remaining_ticks` output ticks that end the AUTO dissolve, starting
+    /// at `tick`. Equal-power per-sample ramps whose length is the exact
+    /// cumulative sample budget of those ticks (ADR-0059), so the ramp ends on
+    /// the completion tick. Started once per dissolve; later items of the same
+    /// dissolve leave the running ramps alone. Bake consumer only.
+    pub(crate) fn crossfade_program_source(
+        &self,
+        bus: &mut multiview_audio::program::ProgramBus,
+        outgoing: Option<&str>,
+        incoming: &str,
+        flight: i128,
+        tick: u64,
+        remaining_ticks: u64,
+    ) {
+        let key = (outgoing.map(str::to_owned), incoming.to_owned(), flight);
+        {
+            let mut active = self
+                .crossfade
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if active.as_ref() == Some(&key) {
+                return;
+            }
+            *active = Some(key);
+        }
+        let clock =
+            multiview_audio::cadence::SampleClock::new(bus.format().sample_rate(), bus.cadence());
+        let samples = clock
+            .total_at(tick.saturating_add(remaining_ticks))
+            .saturating_sub(clock.total_at(tick));
+        let ramp = usize::try_from(samples).unwrap_or(usize::MAX);
+        let channels = self
+            .channels
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let routing = self.routing.load();
+        let gain_of = |id: &str| {
+            crate::pipeline::program_bus_gains(std::iter::once(id), routing.as_deref())
+                .first()
+                .map_or(0.0, |(_, gain)| *gain)
+        };
+        for (id, point) in channels.iter() {
+            let (gain, frames) = if id == incoming {
+                (gain_of(id), ramp)
+            } else if outgoing == Some(id.as_str()) {
+                (0.0, ramp)
+            } else {
+                (0.0, 0)
+            };
+            let _ = bus.set_program_gain_ramped(*point, gain, frames);
+        }
+    }
+
     /// Select the source rendered into this exact switcher output frame.
     /// Called only on the bake consumer, after membership/routing updates.
     pub(crate) fn select_program_source(
@@ -760,6 +822,10 @@ impl AudioControlHandle {
         bus: &mut multiview_audio::program::ProgramBus,
         selected: Option<&str>,
     ) {
+        *self
+            .crossfade
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
         let channels = self
             .channels
             .read()
@@ -849,6 +915,60 @@ mod route_seam_tests {
             }
             assert_eq!(block.frame_count(), 1920);
         }
+    }
+
+    /// ADR-0104 §4: an AUTO crossfade ramps PGM out and PVW in over exactly
+    /// the sample budget of the remaining dissolve ticks, starts once per
+    /// dissolve, and a later CUT-style selection is an immediate set.
+    #[test]
+    fn auto_crossfade_ramps_over_the_exact_tick_budget_and_starts_once() {
+        let a = new_store();
+        let b = new_store();
+        let mut bus = ProgramBus::new(canonical_format(), Rational::new(30_000, 1_001));
+        let pa = bus.add_source("a", Arc::clone(&a), 1.0);
+        let pb = bus.add_source("b", Arc::clone(&b), 0.0);
+        let handle = AudioControlHandle::from_sources(
+            [("a".into(), a), ("b".into(), b)].into_iter().collect(),
+            [("a".into(), pa), ("b".into(), pb)].into_iter().collect(),
+        );
+        handle.select_program_source(&mut bus, Some("a"));
+        handle.crossfade_program_source(&mut bus, Some("a"), "b", 100, 100, 30);
+        // 30 ticks at 30000/1001 from tick 100: the exact cumulative budget.
+        let clock =
+            multiview_audio::cadence::SampleClock::new(48_000, Rational::new(30_000, 1_001));
+        let budget = usize::try_from(clock.total_at(130) - clock.total_at(100)).unwrap();
+        assert_eq!(
+            budget, 48_048,
+            "30 ticks at 30000/1001 = 30 x 1601.6 samples, never 30 x 1600"
+        );
+        let ramp_b = bus.program_gain_ramp(pb).expect("incoming ramps");
+        assert_eq!(ramp_b.frames_total, budget);
+        assert_eq!(
+            bus.program_gain_ramp(pa)
+                .expect("outgoing ramps")
+                .frames_total,
+            budget
+        );
+        assert_eq!(bus.program_gain(pb), Some(1.0));
+        // The next items of the same dissolve do not restart the ramp.
+        let _ = bus.tick();
+        let done = bus.program_gain_ramp(pb).map(|r| r.frames_done);
+        handle.crossfade_program_source(&mut bus, Some("a"), "b", 100, 101, 29);
+        assert_eq!(bus.program_gain_ramp(pb).map(|r| r.frames_done), done);
+        // SW2-04: a NEW same-pair flight (completion item dropped by the bake
+        // queue, so no non-mix item reset the key) still starts its ramps.
+        let _ = bus.tick();
+        handle.crossfade_program_source(&mut bus, Some("a"), "b", 140, 140, 10);
+        let fresh = bus.program_gain_ramp(pb).expect("second flight ramps");
+        assert_eq!(fresh.frames_done, 0);
+        assert_eq!(
+            fresh.frames_total,
+            usize::try_from(clock.total_at(150) - clock.total_at(140)).unwrap()
+        );
+        // Completion: Program is b; an immediate set leaves only b audible.
+        handle.select_program_source(&mut bus, Some("b"));
+        assert_eq!(bus.program_gain(pa), Some(0.0));
+        assert_eq!(bus.program_gain(pb), Some(1.0));
     }
 
     #[test]

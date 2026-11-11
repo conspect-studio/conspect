@@ -1,4 +1,4 @@
-import { deskControlReason, tallyForSource } from './deskSafety';
+import { busKeyReason, deskControlReason, tallyForSource } from './deskSafety';
 import { Info, TriangleAlert } from 'lucide-react';
 import { useEffect, useMemo, useRef, useState } from 'react';
 import type { JSX } from 'react';
@@ -12,6 +12,7 @@ import { createApiClient } from '../../api/client';
 import { useLayouts } from '../../api/queries';
 import { useAlarms } from '../../api/alarmsQueries';
 import { useSources } from '../../resources/queries';
+import { useSourceStatus } from '../../api/sourceStatus';
 import { subscribeRealtime } from '../../realtime/shared';
 import { useEngineEvents } from '../../realtime/useEngineEvents';
 import type { LiveTile } from '../../realtime/useEngineEvents';
@@ -96,6 +97,7 @@ function ProductionDeskBody(): JSX.Element {
   const { locked } = useTakeLock();
   const state = useQuery({ queryKey: STATE_KEY, queryFn: () => getSwitcher(), retry: false, refetchInterval: 2000 });
   const sources = useSources();
+  const demand = useSourceStatus();
   // Existing alarm contract: active system alarms only, not a whole-engine health verdict.
   const alarms = useAlarms({ active: true, scope: 'system' });
   const client = useMemo(() => createApiClient(), []);
@@ -109,7 +111,7 @@ function ProductionDeskBody(): JSX.Element {
   const [error, setError] = useState<string>();
   const [failure, setFailure] = useState<string>();
   const [confirm, setConfirm] = useState<{ action: SwitcherAction; source?: string }>();
-  const [frames, setFrames] = useState('25');
+  const [frames, setFrames] = useState('30');
   const [help, setHelp] = useState(false);
   const [now, setNow] = useState(Date.now);
   // 'sending' from click until the tracker record is terminal; then the operation id.
@@ -139,6 +141,9 @@ function ProductionDeskBody(): JSX.Element {
     return submit(() => commandSwitcher(action, req, { idempotencyKey: newIdempotencyKey() }), { topic: 'switcher', resource: 'me1', event: 'switcher.operation', terminal: { kind: 'switcher-operation', me: 'me1' } });
   }, onSuccess: (result) => { setOperationId(result.operationId); setGuard(result.operationId); setError(undefined); setFailure(undefined); }, onError: (err: Error) => { setError(err.message); setGuard(undefined); lock.current = false; } });
   const disabled = !!reason || mutate.isPending || inFlight;
+  const sameBuses = state.data !== undefined && state.data.preview_source === state.data.program_source;
+  const framesValid = /^[0-9]+$/.test(frames) && Number(frames) >= 1 && Number(frames) <= 1000;
+  const autoReason = sameBuses ? t`Preview and Program carry the same source` : !framesValid ? t`Enter 1–1000 frames` : undefined;
   // Synchronous guard: state is not committed between two same-turn clicks, so a ref gates the second.
   // Held from before mutate until the command is terminal; released by the effect below or on error.
   const lock = useRef(false);
@@ -164,9 +169,9 @@ function ProductionDeskBody(): JSX.Element {
       <PreviewMonitor program={false} source={name(state.data?.preview_source)} fresh={fresh && status === 'open'} />
       <section className="bd-wall"><h2><Trans>Multiview wall</Trans></h2><div className="bd-wall-grid">{sources.data?.map((source) => <div className="bd-wall-tile" key={source.id} data-tile-state={tileForSource(tiles, source.id)?.state ?? 'unknown'} data-tally={tallyForSource(source.id, state.data, fresh && status === 'open')}><SourcePicture id={source.id} /><small>{tallyGlyph(tallyForSource(source.id, state.data, fresh && status === 'open'))}</small><b>{source.name}</b><span><TileLabel tile={tileForSource(tiles, source.id)} /></span></div>)}</div><WallNote /><p>{sources.isError ? t`Source catalog unavailable` : !sources.data?.length ? t`No source catalog available` : t`Tally follows the engine bus IDs; source presence does not prove signal.`}</p><p><Trans>Layouts</Trans>: {layouts.isError ? t`Unavailable` : layouts.data?.length ?? '—'} · <Trans>Observed tiles</Trans>: {tilesKnown ? tiles.size : '—'} · <Link className="bd-link48" to="/monitoring"><Trans>Open live monitoring</Trans></Link></p></section>
       <section className="bd-switcher"><h2><Trans>M/E 1 — Switcher</Trans></h2>
-        <div className="bd-buses">{(['preview', 'program'] as const).map((bus) => <div className={`bd-bus bd-bus-${bus}`} key={bus} role="group" aria-label={bus === 'program' ? t`PGM bus — direct taps always confirm` : t`PVW bus`}><b>{bus === 'program' ? 'PGM' : 'PVW'}</b><div>{sources.data?.map((source, index) => <button key={source.id} disabled={disabled} title={reason ? `${source.name} — ${reason}` : source.name} aria-pressed={tallyForSource(source.id, state.data, fresh && status === 'open') === bus} onClick={() => { request(bus === 'program' ? 'select_program' : 'select_preview', source.id); }}><span className="bd-key-name">{source.name}</span><i className="bd-idx" aria-hidden="true">{index + 1}</i></button>)}{!sources.data?.length && <span><Trans>No sources available</Trans></span>}</div></div>)}</div>
-        <div className="bd-takes"><div className="bd-transitions" role="group" aria-label={t`Transition type — unavailable`}><button disabled aria-pressed="true" title={t`AUTO unavailable: the current engine rejects AUTO with HTTP 422`}>MIX</button><button disabled title={t`WIPE and DIP have no supported control contract`}>WIPE</button><button disabled title={t`WIPE and DIP have no supported control contract`}>DIP</button></div><button className="bd-auto" disabled title={t`AUTO unavailable: the current engine rejects AUTO with HTTP 422`} onClick={() => { request('auto'); }}>AUTO</button><div className="bd-cutrow"><button className="bd-cut" disabled={disabled} aria-describedby="bd-cut-src" onClick={() => { request('cut'); }}>CUT<span aria-hidden="true" className="bd-cut-src"> · {name(state.data?.preview_source) ?? t`source unknown`}</span></button><span id="bd-cut-src" className="sr-only">{t`Cuts to`} {name(state.data?.preview_source) ?? t`unknown source`}</span></div></div>
-        <details className="bd-more"><summary><Trans>Why AUTO is unavailable · transition options</Trans></summary><p className="bd-unsupported"><Trans>AUTO unavailable: the current engine rejects AUTO with HTTP 422.</Trans></p><label><Trans>AUTO frames</Trans><input aria-label={t`Auto frames`} value={frames} type="number" min="1" max="1000" disabled onChange={(e) => { setFrames(e.target.value); }} /></label></details>
+        <div className="bd-buses">{(['preview', 'program'] as const).map((bus) => <div className={`bd-bus bd-bus-${bus}`} key={bus} role="group" aria-label={bus === 'program' ? t`PGM bus — direct taps always confirm` : t`PVW bus`}><b>{bus === 'program' ? 'PGM' : 'PVW'}</b><div>{sources.data?.map((source, index) => { const keyReason = reason ?? busKeyReason(bus, source.id, state.data, demand.data?.get(source.id)?.phase); return <button key={source.id} disabled={disabled || keyReason !== undefined} data-key-reason={keyReason} title={keyReason ? `${source.name} — ${keyReason}` : source.name} aria-pressed={tallyForSource(source.id, state.data, fresh && status === 'open') === bus} onClick={() => { request(bus === 'program' ? 'select_program' : 'select_preview', source.id); }}><span className="bd-key-name">{source.name}</span><i className="bd-idx" aria-hidden="true">{index + 1}</i></button>; })}{!sources.data?.length && <span><Trans>No sources available</Trans></span>}</div></div>)}</div>
+        <div className="bd-takes"><div className="bd-transitions" role="group" aria-label={t`Transition type`}><button disabled aria-pressed="true" title={t`MIX is the only supported transition`}>MIX</button><button disabled title={t`WIPE and DIP have no supported control contract`}>WIPE</button><button disabled title={t`WIPE and DIP have no supported control contract`}>DIP</button></div><button className="bd-auto" disabled={disabled || autoReason !== undefined} title={autoReason ? `AUTO — ${autoReason}` : t`AUTO mix over ${frames} frames`} onClick={() => { request('auto'); }}>AUTO</button><div className="bd-cutrow"><button className="bd-cut" disabled={disabled || sameBuses} title={sameBuses ? t`CUT — Preview and Program carry the same source` : undefined} aria-describedby="bd-cut-src" onClick={() => { request('cut'); }}>CUT<span aria-hidden="true" className="bd-cut-src"> · {name(state.data?.preview_source) ?? t`source unknown`}</span></button><span id="bd-cut-src" className="sr-only">{t`Cuts to`} {name(state.data?.preview_source) ?? t`unknown source`}</span></div></div>
+        <details className="bd-more"><summary><Trans>AUTO rate · transition options</Trans></summary><label><Trans>AUTO frames</Trans><input aria-label={t`Auto frames`} value={frames} type="number" min="1" max="1000" disabled={disabled} onChange={(e) => { setFrames(e.target.value); }} /></label></details>
         <details><summary><Trans>More keys — unavailable</Trans></summary><p><Trans>WIPE, DIP, USK, DSK and AUX have no supported control contract.</Trans></p></details>
       </section>
       <aside className="bd-rail"><section><h2><Trans>Tally legend</Trans></h2><p className="bd-red"><Trans>● Red — PROGRAM</Trans></p><p className="bd-amber"><Trans>● Amber — PREVIEW</Trans></p><p><Trans>○ Dark — neither bus</Trans></p><small><Trans>Tally is separate from signal and output transmission.</Trans></small></section><section><h2><Trans>Alarms & engine health</Trans></h2><div className="bd-alarm-summary" role="region" aria-label={t`Active system alarm summary`}><p><Trans>Active system alarms only</Trans></p>{alarms.isError ? <p><Trans>Alarm summary unavailable</Trans></p> : alarms.isPending ? <p><Trans>Loading alarm summary</Trans></p> : alarms.data.length === 0 ? <p><Trans>No active system alarms reported</Trans></p> : <ul>{alarms.data.slice(0, 3).map((alarm) => <li key={alarm.id} title={`${alarm.severity} · ${alarm.kind}`}><span>{alarm.severity}</span> · {alarm.kind}</li>)}</ul>}</div><Link className="bd-btn" to="/alarms"><Trans>Open alarms</Trans></Link></section></aside>

@@ -339,6 +339,23 @@ impl multiview_control::SourceDemandProvider for ControlDemand {
         ))))
     }
 
+    fn switcher_preview_lease(
+        &self,
+        id: &str,
+        label: &str,
+    ) -> Option<Box<dyn multiview_control::SourceDemandLease>> {
+        if !self.catalogue.load().contains_key(id) {
+            return None;
+        }
+        let tag = ConsumerTag::new(ConsumerClass::Preview, label);
+        Some(Box::new(HeldLease(self.manager.acquire(
+            id,
+            Rails::ALL,
+            tag,
+            None,
+        ))))
+    }
+
     fn session_lease(
         &self,
         id: &str,

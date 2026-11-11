@@ -1717,6 +1717,10 @@ pub struct Pipeline {
     /// Optional first-slice M/E on this one program; absent preserves legacy
     /// source/layout/encode behaviour byte-for-byte.
     switcher_me: Option<multiview_config::MixEffectsConfig>,
+    /// The id of the one config cell the first-slice M/E drives (#245). The
+    /// live drain addresses cells by their config ids, so the switcher hook and
+    /// the drive's id map must use this id, never the program id.
+    switcher_cell_id: Option<String>,
     /// Live control handle published only when the paired bus provider starts.
     switcher_control: Option<multiview_engine::switcher_control::SwitcherControl>,
     switcher_driver: Option<multiview_engine::switcher_control::SwitcherTickDriver>,
@@ -2420,6 +2424,9 @@ impl Pipeline {
                 return Err(PipelineError::Engine("first-slice M/E requires one full-canvas source cell initially bound to program_source; multi-cell layouts are not replaced".into()));
             }
         }
+        let switcher_cell_id = switcher_me
+            .as_ref()
+            .and_then(|_| config.cells.first().map(|cell| cell.id.clone()));
         let cadence = config.canvas.fps.rational();
         let canvas_color = CanvasColor::default();
         let tag = canvas_color.output_tag();
@@ -2962,6 +2969,7 @@ impl Pipeline {
             cadence,
             program_spec,
             switcher_me,
+            switcher_cell_id,
             switcher_control: None,
             switcher_driver: None,
             switcher_preview: None,
@@ -4092,10 +4100,9 @@ impl Pipeline {
         .map_err(|e| PipelineError::Engine(e.to_string()))?;
         // The first-slice M/E rebinds its existing one-cell PGM drive. The PVW
         // tap is independent; the legacy no-M/E drive gets no new cell index.
-        let drive = if self.switcher_me.is_some() {
-            drive.with_cell_ids(vec![Some(self.program_spec.id.as_str().to_owned())])
-        } else {
-            drive
+        let drive = match &self.switcher_cell_id {
+            Some(cell_id) => drive.with_cell_ids(vec![Some(cell_id.clone())]),
+            None => drive,
         };
         // Under the opt-in `gpu` feature the run PREFERS the wgpu GPU
         // compositor. The device is chosen LOAD-AWARE at admission (ADR-0035
@@ -4778,6 +4785,11 @@ impl Pipeline {
                     .then(|| frame.source_states.keys().next().cloned())
                     .flatten(),
                 switcher_audio_enabled,
+                switcher_mix: if switcher_audio_enabled {
+                    frame.mix.clone()
+                } else {
+                    None
+                },
                 #[cfg(feature = "overlay")]
                 events,
                 canvas: Arc::clone(&canvas),
@@ -4903,9 +4915,14 @@ impl Pipeline {
             let Some(preview_slot) = self.switcher_preview.clone() else {
                 return Err(PipelineError::Engine("switcher preview tap missing".into()));
             };
+            let Some(cell_id) = self.switcher_cell_id.clone() else {
+                return Err(PipelineError::Engine(
+                    "switcher Program cell id missing".into(),
+                ));
+            };
             let mut hook = multiview_engine::switcher_hook::SwitcherFrameHook::new(
                 switcher_driver,
-                self.program_spec.id.as_str().to_owned(),
+                cell_id,
                 control,
             );
             hook.preview_slot = Some(preview_slot);
@@ -5447,6 +5464,9 @@ impl StreamBaker {
 struct StreamItem {
     switcher_audio: Option<String>,
     switcher_audio_enabled: bool,
+    /// ADR-0104 §4: the AUTO dissolve on this frame, so Program audio
+    /// crossfades over exactly the same output ticks.
+    switcher_mix: Option<multiview_engine::MixOverlay>,
     #[cfg(feature = "overlay")]
     events: std::collections::HashMap<String, multiview_core::event_overlay::EventOverlay>,
     /// The composited canvas the protected output core emitted this tick.
@@ -6582,7 +6602,20 @@ fn drive_selected_audio_for_item(
     if let Some(handle) = handle {
         handle.apply_pending(bus);
         if item.switcher_audio_enabled {
-            handle.select_program_source(bus, item.switcher_audio.as_deref());
+            match &item.switcher_mix {
+                Some(mix) => {
+                    let remaining = u64::from(mix.duration.saturating_sub(mix.elapsed));
+                    handle.crossfade_program_source(
+                        bus,
+                        item.switcher_audio.as_deref(),
+                        &mix.source,
+                        mix.start,
+                        item.tick_index,
+                        remaining,
+                    );
+                }
+                None => handle.select_program_source(bus, item.switcher_audio.as_deref()),
+            }
         }
     }
     let current = drive_audio_for_item(bus, item.tick_index);
@@ -6613,6 +6646,7 @@ mod switcher_shed_audio_tests {
         StreamItem {
             switcher_audio: Some(source.into()),
             switcher_audio_enabled: true,
+            switcher_mix: None,
             #[cfg(feature = "overlay")]
             events: HashMap::new(),
             canvas: Arc::new(
@@ -20600,6 +20634,7 @@ mod live_overlay_bake_tests {
         StreamItem {
             switcher_audio: None,
             switcher_audio_enabled: false,
+            switcher_mix: None,
             #[cfg(feature = "overlay")]
             events: std::collections::HashMap::new(),
             canvas: Arc::new(Nv12Image::solid(320, 180, 16, 128, 128, tag).expect("solid")),
