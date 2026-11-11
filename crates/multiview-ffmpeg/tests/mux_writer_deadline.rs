@@ -61,15 +61,27 @@ fn big_packet(enc: &mut VideoEncoder) -> ffmpeg::codec::packet::Packet {
 
 /// Mux one large packet through a writer that SUCCEEDS on every callback but
 /// takes `SLOW` each; returns how long header+packet+trailer took and how many
-/// callbacks ran. `stop_after` raises the stop flag from another thread.
+/// callbacks ran. `stop_after` raises the stop flag at the start of the first
+/// callback that begins at least that long after arming. The flag is the
+/// shared one any thread would raise; raising it from the writer removes the
+/// stopper thread's own oversleep (macOS timer coalescing on shared CI VMs,
+/// #265) from a bound that is about the MUXER's reaction, not that sleep.
 fn run_slow(deadline: Option<Duration>, stop_after: Option<Duration>) -> (Duration, usize) {
     let mut enc = encoder();
     let packet = big_packet(&mut enc);
     let params = multiview_ffmpeg::StreamCodecParameters::from_encoder(&enc);
     let calls = Arc::new(AtomicUsize::new(0));
-    let stop = Arc::new(AtomicBool::new(false));
     let calls_in = Arc::clone(&calls);
+    let stop = Arc::new(AtomicBool::new(false));
+    let stop_in = Arc::clone(&stop);
+    let armed_at = Arc::new(std::sync::OnceLock::<Instant>::new());
+    let armed_in = Arc::clone(&armed_at);
     let writer: PacketWriter = make_writer(move |_data: &[u8]| {
+        if let (Some(after), Some(armed)) = (stop_after, armed_in.get()) {
+            if armed.elapsed() >= after {
+                stop_in.store(true, Ordering::Release);
+            }
+        }
         calls_in.fetch_add(1, Ordering::Relaxed);
         std::thread::sleep(SLOW);
         true
@@ -79,21 +91,12 @@ fn run_slow(deadline: Option<Duration>, stop_after: Option<Duration>) -> (Durati
         .add_stream_from_parameters(&params, enc.time_base())
         .unwrap();
     muxer.write_header().unwrap();
-    let stopper = stop_after.map(|after| {
-        let stop = Arc::clone(&stop);
-        std::thread::spawn(move || {
-            std::thread::sleep(after);
-            stop.store(true, Ordering::Release);
-        })
-    });
     let started = Instant::now();
+    armed_at.set(started).unwrap();
     muxer.arm_io_deadline(deadline);
     let _ = muxer.write_packet(index, packet);
     let _ = muxer.finish();
     let elapsed = started.elapsed();
-    if let Some(stopper) = stopper {
-        stopper.join().unwrap();
-    }
     (elapsed, calls.load(Ordering::Relaxed))
 }
 
@@ -114,6 +117,13 @@ fn a_slow_but_successful_writer_cannot_outlive_the_io_deadline() {
 
 #[test]
 fn stop_aborts_a_slow_but_successful_writer() {
+    // Unbounded, the packet would run far past the stop point (so this is an
+    // abort, not an early finish).
+    let (_, unbounded_calls) = run_slow(None, None);
+    assert!(
+        unbounded_calls > 40,
+        "packet too small: {unbounded_calls} callbacks"
+    );
     let (elapsed, calls) = run_slow(None, Some(Duration::from_millis(300)));
     assert!(
         elapsed < Duration::from_millis(300) + SLOW * 3,
