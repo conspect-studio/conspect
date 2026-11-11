@@ -3626,6 +3626,27 @@ export interface components {
          */
         FirstLine: "partner" | "conspect" | "community";
         /**
+         * @description Focus caps and occupancy, surfaced by `GET /api/v1/preview/capabilities` so the
+         *     UI can tell the truth about how many live viewers the server admits.
+         */
+        FocusLimits: {
+            /**
+             * Format: int32
+             * @description Focus sessions live right now.
+             */
+            active: number;
+            /**
+             * Format: int32
+             * @description Maximum concurrent focus (WHEP) sessions server-wide.
+             */
+            max: number;
+            /**
+             * Format: int32
+             * @description Maximum concurrent focus sessions per scope.
+             */
+            max_per_scope: number;
+        };
+        /**
          * @description `OpenAPI` mirror of [`multiview_licence::GpuLimit`].
          *
          *     Serde-equivalent: adjacently tagged on `kind`, value under `value`,
@@ -4612,6 +4633,7 @@ export interface components {
              *     fallback literal everywhere — ADR-P006 move 6).
              */
             fallback: string;
+            focus?: null | components["schemas"]["FocusLimits"];
             /** @description True only when an authorized `MoQ` transport provider is ready. */
             moq: boolean;
             /** @description Per-scope WHEP availability + the program fidelity label. */
