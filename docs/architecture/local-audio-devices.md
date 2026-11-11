@@ -67,10 +67,15 @@ device callback ──push──▶ [SPSC ring, ~200 ms] ──pop──▶ pump
     re-primes from fresh callback frames.
   - If `unread_frames` exceeds target + 100 ms (for example, the program bus paused reading), the
     pump discards incoming frames until unread is back at the target, then resets the servo.
-  - Discarded frames are counted (`stale_discard_frames`). Only the pump does this; the store's
-    read cursor stays owned by the consumer.
-  - Test: after a pump stall of 50 ms to 5 s, the age of the first published sample is under
-    target + 20 ms, and the budget below holds again within 100 ms.
+  - Already-published audio is handled by the consumer: the store gets a `max_lag` (target +
+    100 ms) for this source kind. On `read`, if `head − cursor` exceeds it (the program bus paused or
+    stopped reading), the reader itself skips its cursor to `head − prebuffer` before reading. This
+    is the existing consumer-owned re-sync logic in `AudioStore::read`, extended with one bound; it
+    stays wait-free and only the consumer moves the cursor.
+  - Discarded frames are counted (`stale_discard_frames`, `consumer_skip_frames`).
+  - Test: after a pump stall of 50 ms to 5 s, and after a consumer pause of 50 ms to 5 s, the age
+    of the first sample read is under target + 20 ms, and the budget below holds again within
+    100 ms.
 - **Latency budget:** device buffer (≈10 ms) + pump wake-up (≤5 ms) + servo target (80 ms) ≈
   95 ms constant from microphone to program bus, with ±10 ms variance. It is compensated with the
   existing per-source audio offset trim where the source is paired with video; a dedicated
@@ -119,6 +124,13 @@ program bus ──push (wait-free)──▶ [engine→drain SPSC ring, ~200 ms] 
 - **Callback:** pop up to the requested frames in `CHUNK`-sized pieces, convert to the device
   format, and fill any shortfall with silence. It counts `underrun_frames` and stores a monotonic
   heartbeat (callback count) in an atomic.
+- **Short callback stalls.** The device ring's read side belongs to the callback, so the drain
+  cannot clear it. Instead the drain watches the heartbeat: if it has not advanced for 50 ms
+  (about five normal callback periods), the drain increments an atomic `flush_epoch`, discards the
+  engine→drain backlog and re-primes. The callback, when it sees a new `flush_epoch`, skips all
+  frames in its ring (consumer-side skip, wait-free) before it plays the next fresh frames.
+  Test: callback stalls of 50 ms to 2 s with a tick-stamped signal; the first frame played after
+  each is from current program time.
 - **Distinct states,** each with its own transition:
   - *underrun* (callback found the ring short): counted; the servo re-anchors; no reopen.
   - *ring full* (device not consuming but heartbeat advancing): normal, the drain waits.
@@ -169,8 +181,15 @@ program bus ──push (wait-free)──▶ [engine→drain SPSC ring, ~200 ms] 
   warning is raised. When the call returns, the helper resumes and normal backoff continues.
   At shutdown all helpers are told to stop at once and are awaited in parallel against one 2 s
   deadline; any still stuck is detached and the process exit takes it.
-- The cpal error callback sets an atomic `lost` flag and records the error kind. It does nothing
-  else. Stalled/lost detection is in sections 2 and 3. Reopen uses capped exponential backoff
+- The cpal error callback only stores the error kind in an atomic. The pump or drain maps it:
+  - `DeviceChanged` (macOS default-output reroute by cpal): soft event; keep the stream, log,
+    reset the servo.
+  - `Xrun`: non-fatal; count it and re-anchor the servo; no reopen.
+  - `PermissionDenied`: the latched `permission_denied` state; close, retry on the slow cadence
+    (section 5).
+  - `RealtimeDenied`: log once; the stream keeps running at normal priority.
+  - `DeviceNotAvailable`, `StreamInvalidated`, `DeviceBusy`, `BackendError`, `Other` and any
+    other kind: *lost*; close and reopen with backoff. Stalled/lost detection is in sections 2 and 3. Reopen uses capped exponential backoff
   (250 ms → 10 s).
 - Every warning is latched (logged once per state change), never per poll.
 
