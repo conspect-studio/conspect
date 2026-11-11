@@ -22,6 +22,25 @@ use multiview_framestore::{NoSignalPolicy, TileStore, TileThresholds};
 use serde_json::json;
 use std::collections::HashMap;
 use std::sync::Arc;
+
+/// The running configuration's sources (ADR-0104 §1: a switcher command may
+/// reference only a configured source the principal may read).
+fn configured_sources(ids: &[&str]) -> Arc<dyn multiview_control::ResourceRepository> {
+    let store = multiview_control::InMemorySourceStore::new();
+    for id in ids {
+        multiview_control::ResourceRepository::create(
+            &store,
+            id,
+            multiview_control::ResourceInput {
+                name: (*id).to_owned(),
+                body: json!({ "id": id, "kind": "solid" }),
+            },
+        )
+        .unwrap();
+    }
+    Arc::new(store)
+}
+
 fn primed_stores() -> HashMap<String, Arc<TileStore<Nv12Image>>> {
     let thresholds = TileThresholds::from_millis(500, 2_000, 10_000).unwrap();
     ["a", "b"]
@@ -134,7 +153,11 @@ async fn unwired_routes_never_report_applied_or_accept_a_command() {
 async fn real_handle_returns_202_then_tick_exact_correlated_completion() {
     let (handle, mut driver) = runtime();
     let mut events = handle.outcomes();
-    let h = harness_with(|state| state.with_switcher(handle));
+    let h = harness_with(|state| {
+        state
+            .with_sources_store(configured_sources(&["a", "b"]))
+            .with_switcher(handle)
+    });
     let response = send(
         &h.router,
         post_with_key(
@@ -198,7 +221,9 @@ async fn full_idempotency_store_rejects_switcher_command_without_enqueue() {
                 Reservation::Fresh(_)
             ));
         }
-        state.with_switcher(handle)
+        state
+            .with_sources_store(configured_sources(&["a", "b"]))
+            .with_switcher(handle)
     });
     let response = send(
         &h.router,
@@ -335,7 +360,7 @@ impl SourceDemandProvider for LeaseDemand {
         Vec::new()
     }
     fn preview_lease(&self, id: &str, _label: &str) -> Option<Box<dyn SourceDemandLease>> {
-        if !matches!(id, "a" | "b") {
+        if !matches!(id, "a" | "b" | "c") {
             return None;
         }
         self.log.acquired.lock().unwrap().push(id.to_owned());
@@ -401,6 +426,7 @@ async fn preview_lease_replacement_is_make_before_break_and_a_rejection_keeps_th
     let leases_for_state = Arc::clone(&leases);
     let h = harness_with(move |state| {
         let mut state = state
+            .with_sources_store(configured_sources(&["a", "b", "c"]))
             .with_switcher(handle_for_state)
             .with_source_demand(demand);
         state.switcher_preview_lease = leases_for_state;
@@ -413,7 +439,7 @@ async fn preview_lease_replacement_is_make_before_break_and_a_rejection_keeps_th
         post_with_key(
             "/api/v1/switcher/commands/select_preview",
             OPERATOR_TOKEN,
-            preview_request("a"),
+            preview_request("c"),
             "pv-a",
         ),
     )
@@ -423,7 +449,7 @@ async fn preview_lease_replacement_is_make_before_break_and_a_rejection_keeps_th
         .as_str()
         .unwrap()
         .to_owned();
-    assert_eq!(log.acquired(), vec!["a".to_owned()]);
+    assert_eq!(log.acquired(), vec!["c".to_owned()]);
     assert!(
         log.dropped().is_empty(),
         "the boot lease must survive admission of its replacement"
@@ -436,14 +462,14 @@ async fn preview_lease_replacement_is_make_before_break_and_a_rejection_keeps_th
         post_with_key(
             "/api/v1/switcher/commands/select_preview",
             OPERATOR_TOKEN,
-            preview_request("a"),
+            preview_request("c"),
             "pv-a",
         ),
     )
     .await;
     assert_eq!(response.status(), StatusCode::ACCEPTED);
     assert_eq!(body_json(response).await["operation_id"], op_a);
-    assert_eq!(log.acquired(), vec!["a".to_owned()]);
+    assert_eq!(log.acquired(), vec!["c".to_owned()]);
 
     // 3. The engine's applied receipt releases the boot lease (old after new).
     driver.drain_at_tick(Tick {
@@ -460,7 +486,7 @@ async fn preview_lease_replacement_is_make_before_break_and_a_rejection_keeps_th
     .await;
     assert_eq!(leases.pending_count(), 0);
 
-    // 4. The next selection is held, and the now-live `a` lease is still held:
+    // 4. The next selection is held, and the now-live `c` lease is still held:
     //    acquired-before-released.
     let response = send(
         &h.router,
@@ -473,11 +499,11 @@ async fn preview_lease_replacement_is_make_before_break_and_a_rejection_keeps_th
     )
     .await;
     assert_eq!(response.status(), StatusCode::ACCEPTED);
-    assert_eq!(log.acquired(), vec!["a".to_owned(), "b".to_owned()]);
+    assert_eq!(log.acquired(), vec!["c".to_owned(), "b".to_owned()]);
     assert_eq!(
         log.dropped(),
         vec!["boot".to_owned()],
-        "the live `a` lease must still be held while its replacement is pending"
+        "the live `c` lease must still be held while its replacement is pending"
     );
     assert_eq!(leases.pending_count(), 1);
 
@@ -514,9 +540,9 @@ async fn preview_lease_replacement_is_make_before_break_and_a_rejection_keeps_th
     // 6. The rejected selection never changed the effective PVW bus.
     let response = send(&h.router, get("/api/v1/switcher/me1", OPERATOR_TOKEN)).await;
     assert_eq!(response.status(), StatusCode::OK);
-    assert_eq!(body_json(response).await["preview_source"], "a");
+    assert_eq!(body_json(response).await["preview_source"], "c");
 
-    // 7. A later selection that IS applied releases `a` only after its receipt.
+    // 7. A later selection that IS applied releases `c` only after its receipt.
     let response = send(
         &h.router,
         post_with_key(
@@ -543,7 +569,7 @@ async fn preview_lease_replacement_is_make_before_break_and_a_rejection_keeps_th
     });
     until(
         "the applied replacement releases the previous live lease",
-        || log.dropped() == vec!["boot".to_owned(), "b".to_owned(), "a".to_owned()],
+        || log.dropped() == vec!["boot".to_owned(), "b".to_owned(), "c".to_owned()],
     )
     .await;
     assert_eq!(leases.pending_count(), 0);
@@ -562,7 +588,10 @@ async fn denied_reference_never_acquires_a_preview_lease_or_opens_a_source() {
     });
     let leases_for_state = Arc::clone(&leases);
     let h = harness_with(move |state| {
-        let mut state = state.with_switcher(handle).with_source_demand(demand);
+        let mut state = state
+            .with_sources_store(configured_sources(&["a", "b"]))
+            .with_switcher(handle)
+            .with_source_demand(demand);
         state.switcher_preview_lease = leases_for_state;
         Arc::get_mut(&mut state.api_keys)
             .expect("the harness key store is uniquely owned before the router is built")
@@ -602,28 +631,147 @@ async fn denied_reference_never_acquires_a_preview_lease_or_opens_a_source() {
     assert_eq!(leases.pending_count(), 0);
 }
 
+/// ADR-0104 §1 replaces the first slice's "outside the configured pair → 422"
+/// rule: any configured source is admissible, a source that is not in the
+/// running configuration is refused before enqueue, and a source the principal
+/// may not read is 403 (BOLA) before the configuration is even consulted.
 #[tokio::test]
-async fn configured_pair_rejects_unwarmed_third_source_before_enqueue() {
+async fn any_configured_source_is_admitted_and_an_unconfigured_one_is_refused_before_enqueue() {
     let (handle, mut driver) = runtime();
     let h = harness_with(|state| {
-        state.with_switcher(handle).with_base_document(json!({
-        "switcher": {"mix_effects": [{"id":"me1", "program":"main", "program_source":"a", "preview_source":"b"}]}
-    }))
+        state
+            .with_sources_store(configured_sources(&["a", "b", "third"]))
+            .with_switcher(handle)
+            .with_base_document(json!({
+                "switcher": {"mix_effects": [{"id":"me1", "program":"main", "program_source":"a", "preview_source":"b"}]}
+            }))
     });
     let response = send(
         &h.router,
         post_with_key(
             "/api/v1/switcher/commands/select_preview",
             OPERATOR_TOKEN,
-            request("select_preview", Some("third")),
-            "third-refused",
+            request("select_preview", Some("ghost")),
+            "ghost-refused",
         ),
     )
     .await;
     assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    assert!(body_json(response).await["detail"]
+        .as_str()
+        .unwrap()
+        .contains("not in the running configuration"));
+    let response = send(
+        &h.router,
+        post_with_key(
+            "/api/v1/switcher/commands/select_preview",
+            OPERATOR_TOKEN,
+            request("select_preview", Some("third")),
+            "third-admitted",
+        ),
+    )
+    .await;
+    assert_eq!(
+        response.status(),
+        StatusCode::ACCEPTED,
+        "a configured source outside the boot pair is admitted"
+    );
     driver.drain_at_tick(Tick {
         index: 1,
         pts: MediaTime::ZERO,
     });
-    assert_eq!(driver.selections().1.as_str(), "b");
+    driver.commit_composed_tick(Tick {
+        index: 1,
+        pts: MediaTime::ZERO,
+    });
+    assert_eq!(driver.selections().1.as_str(), "third");
+}
+
+/// #247: Preview may not carry the Program source, and a take with identical
+/// buses is refused by `/plan` and by the command route with a typed reason.
+#[tokio::test]
+async fn preview_equal_to_program_is_refused_by_plan_and_command() {
+    let (handle, mut driver) = runtime();
+    driver.drain_at_tick(Tick {
+        index: 0,
+        pts: MediaTime::ZERO,
+    });
+    driver.commit_composed_tick(Tick {
+        index: 0,
+        pts: MediaTime::ZERO,
+    });
+    let h = harness_with(|state| {
+        state
+            .with_sources_store(configured_sources(&["a", "b"]))
+            .with_switcher(handle)
+    });
+    for path in [
+        "/api/v1/switcher/plan",
+        "/api/v1/switcher/commands/select_preview",
+    ] {
+        let response = send(
+            &h.router,
+            post_with_key(
+                path,
+                OPERATOR_TOKEN,
+                request("select_preview", Some("a")),
+                path,
+            ),
+        )
+        .await;
+        assert_eq!(
+            response.status(),
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "{path}"
+        );
+        assert!(
+            body_json(response).await["detail"]
+                .as_str()
+                .unwrap()
+                .contains("same source"),
+            "{path}"
+        );
+    }
+}
+
+/// The engine re-checks #247 at the tick: a CUT with identical buses (state
+/// reached before admission could see it) is refused, never a no-op 202
+/// completion.
+#[test]
+fn engine_refuses_cut_with_identical_buses() {
+    let (handle, mut driver) = SwitcherControl::new(SwitcherState::new(
+        SourceRef::new("a"),
+        SourceRef::new("a"),
+        vec![],
+    ));
+    handle
+        .set_scenes(ScenePair {
+            version: 1,
+            program: scene("a"),
+            preview: scene("a"),
+        })
+        .unwrap();
+    driver.set_prime_stores(primed_stores());
+    let mut outcomes = handle.outcomes();
+    handle
+        .try_send(multiview_engine::switcher_control::SwitcherCommand {
+            operation_id: "noop".into(),
+            scene_version: 1,
+            verb: multiview_engine::switcher_control::SwitcherVerb::Cut,
+        })
+        .unwrap();
+    let tick = Tick {
+        index: 0,
+        pts: MediaTime::ZERO,
+    };
+    driver.drain_at_tick(tick);
+    driver.commit_composed_tick(tick);
+    let outcome = outcomes.try_recv().unwrap();
+    assert!(!outcome.event.completed);
+    assert!(outcome
+        .event
+        .error
+        .as_deref()
+        .unwrap()
+        .contains("same source"));
 }

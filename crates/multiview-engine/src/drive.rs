@@ -77,6 +77,36 @@ pub struct CompositedFrame {
     /// work on repeats and reuse its last result: the canvas did not change, and
     /// paying the cost on every catch-up tick is what starved the loop (#143).
     pub repeat: bool,
+    /// ADR-0104 §3/§4: the AUTO dissolve drawn into this frame, if any — the
+    /// incoming source and `(elapsed, duration)` output ticks. Program audio
+    /// derives its crossfade from it; tally and `source_states` do not.
+    pub mix: Option<MixOverlay>,
+}
+
+/// One AUTO dissolve step: `source` drawn full-canvas at `elapsed / duration`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MixOverlay {
+    /// The incoming (Preview) source.
+    pub source: String,
+    /// Ticks since the AUTO started (`0..duration`).
+    pub elapsed: u32,
+    /// The AUTO duration in output ticks (`>= 1`).
+    pub duration: u32,
+}
+
+impl MixOverlay {
+    /// The incoming tile's opacity for this frame.
+    #[must_use]
+    pub fn opacity(&self) -> f32 {
+        let Ok(duration) = multiview_core::switcher::FrameCount::try_from(self.duration.max(1))
+        else {
+            return 1.0;
+        };
+        multiview_core::switcher::kernel::opacity(multiview_core::switcher::Progress::new(
+            self.elapsed.min(self.duration),
+            duration,
+        ))
+    }
 }
 
 impl CompositedFrame {
@@ -164,6 +194,10 @@ pub struct CompositorDrive<T> {
     /// monomorphic over [`Nv12Image`]); a non-`Nv12Image` drive simply never
     /// borrows it.
     scratch: RefCell<ComposeScratch>,
+    /// ADR-0104 §3: the incoming source of an AUTO dissolve and its opacity,
+    /// drawn as one extra full-canvas tile above every layout cell in the SAME
+    /// composite pass. `None` outside a dissolve (the steady state).
+    mix_overlay: Option<MixOverlay>,
 }
 
 impl<T> CompositorDrive<T> {
@@ -198,7 +232,52 @@ impl<T> CompositorDrive<T> {
             background,
             backend: RunBackend::cpu(),
             scratch: RefCell::new(ComposeScratch::default()),
+            mix_overlay: None,
         })
+    }
+
+    /// Draw `source` as one full-canvas tile at `elapsed / duration` above
+    /// the layout in the next composites (an AUTO dissolve, ADR-0104 §3), or
+    /// clear it with `None`. Pure state: no wait, no re-solve; the id is
+    /// allocated once per dissolve, not per tick. The overlay source is not
+    /// reported in `source_states` — tally and program audio selection follow
+    /// the layout's cells, never the incoming tile.
+    ///
+    /// # Errors
+    /// [`Error::Rebind`] if `source` has no registered store; the overlay is
+    /// then cleared, never drawn from a guessed store.
+    pub fn set_mix_overlay(&mut self, overlay: Option<(&str, u32, u32)>) -> Result<()> {
+        let Some((source, elapsed, duration)) = overlay else {
+            self.mix_overlay = None;
+            return Ok(());
+        };
+        if !self.stores.contains_key(source) {
+            self.mix_overlay = None;
+            return Err(Error::Rebind(format!(
+                "mix source {source:?} has no registered store"
+            )));
+        }
+        let duration = duration.max(1);
+        match &mut self.mix_overlay {
+            Some(mix) if mix.source == source => {
+                mix.elapsed = elapsed;
+                mix.duration = duration;
+            }
+            slot => {
+                *slot = Some(MixOverlay {
+                    source: source.to_owned(),
+                    elapsed,
+                    duration,
+                });
+            }
+        }
+        Ok(())
+    }
+
+    /// The active mix overlay, if any.
+    #[must_use]
+    pub fn mix_overlay(&self) -> Option<&MixOverlay> {
+        self.mix_overlay.as_ref()
     }
 
     /// The cumulative number of times the per-tick resolve **scratch pool** has
@@ -478,7 +557,7 @@ impl CompositorDrive<Nv12Image> {
         // never stalls the clock (invariant #1).
         let mut scratch = self.scratch.borrow_mut();
         let cell_count = self.layout.cells.len();
-        scratch.begin(cell_count);
+        scratch.begin(cell_count + usize::from(self.mix_overlay.is_some()));
         let ComposeScratch {
             held,
             placements,
@@ -516,6 +595,24 @@ impl CompositorDrive<Nv12Image> {
                 dst_h,
                 opacity: cell.opacity,
             });
+        }
+        // The AUTO dissolve's incoming picture: one full-canvas tile on top, in
+        // this same pass. A missing frame is skipped (the outgoing picture shows
+        // through), never a slate blended into Program.
+        if let Some(mix) = &self.mix_overlay {
+            if let Some(store) = self.stores.get(&mix.source) {
+                if let Some(frame) = store.read_at(now).frame() {
+                    held.push(Arc::clone(frame));
+                    placements.push(Placement {
+                        image_index: held.len().saturating_sub(1),
+                        dst_x: 0,
+                        dst_y: 0,
+                        dst_w: canvas.width,
+                        dst_h: canvas.height,
+                        opacity: mix.opacity(),
+                    });
+                }
+            }
         }
 
         // Borrow the held images for the compositor's `Tile` slice. This slice is
@@ -574,6 +671,7 @@ impl CompositorDrive<Nv12Image> {
             source_states,
             source_times,
             repeat: false,
+            mix: self.mix_overlay.clone(),
         })
     }
 

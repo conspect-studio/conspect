@@ -105,6 +105,24 @@ impl SourceDemandProvider for LeaseDemand {
     }
 }
 
+/// The running configuration's sources (ADR-0104 §1: a switcher command may
+/// reference only a configured source the principal may read).
+fn configured_sources(ids: &[&str]) -> Arc<dyn multiview_control::ResourceRepository> {
+    let store = multiview_control::InMemorySourceStore::new();
+    for id in ids {
+        multiview_control::ResourceRepository::create(
+            &store,
+            id,
+            multiview_control::ResourceInput {
+                name: (*id).to_owned(),
+                body: json!({ "id": id, "kind": "solid" }),
+            },
+        )
+        .unwrap();
+    }
+    Arc::new(store)
+}
+
 fn scene(id: &str, sources: &[&str]) -> Arc<Layout> {
     Arc::new(Layout {
         name: id.into(),
@@ -233,7 +251,10 @@ async fn pending_storm_is_bounded_and_one_sweep_drains_it_without_losing_the_liv
         let leases = Arc::clone(&leases);
         move |state| {
             let demand: SharedSourceDemand = Arc::new(LeaseDemand { log });
-            let mut state = state.with_switcher(handle).with_source_demand(demand);
+            let mut state = state
+                .with_sources_store(configured_sources(&["a", "b", "c", "d", "e"]))
+                .with_switcher(handle)
+                .with_source_demand(demand);
             state.switcher_preview_lease = leases;
             state
         }
@@ -346,6 +367,7 @@ async fn a_dead_relay_still_reconciles_applied_and_rejected_selections() {
         move |state| {
             let demand: SharedSourceDemand = Arc::new(LeaseDemand { log });
             let mut state = state
+                .with_sources_store(configured_sources(&["a", "b", "c", "d", "e"]))
                 .with_switcher(engine.clone())
                 .with_source_demand(demand);
             state.switcher_preview_lease = leases;
@@ -374,7 +396,7 @@ async fn a_dead_relay_still_reconciles_applied_and_rejected_selections() {
         post_with_key(
             "/api/v1/switcher/commands/select_preview",
             OPERATOR_TOKEN,
-            request("select_preview", Some("a")),
+            request("select_preview", Some("d")),
             "applied-unaware",
         ),
     )
@@ -383,7 +405,7 @@ async fn a_dead_relay_still_reconciles_applied_and_rejected_selections() {
     advance(&mut driver, 3, 8);
     assert_eq!(
         handle.snapshot().unwrap().preview.as_str(),
-        "a",
+        "d",
         "the engine applied the selection"
     );
     assert_eq!(
@@ -439,7 +461,7 @@ async fn a_dead_relay_still_reconciles_applied_and_rejected_selections() {
     advance(&mut driver, 11, 8);
     assert_eq!(
         handle.snapshot().unwrap().preview.as_str(),
-        "a",
+        "d",
         "a rejected selection never airs (the effective preview is unchanged)"
     );
     let report = leases.sweep(
@@ -488,7 +510,10 @@ async fn detach_cancels_pending_so_a_later_sweep_cannot_adopt_them() {
         let leases = Arc::clone(&leases);
         move |state| {
             let demand: SharedSourceDemand = Arc::new(LeaseDemand { log });
-            let mut state = state.with_switcher(handle).with_source_demand(demand);
+            let mut state = state
+                .with_sources_store(configured_sources(&["a", "b", "c", "d", "e"]))
+                .with_switcher(handle)
+                .with_source_demand(demand);
             state.switcher_preview_lease = leases;
             state
         }
@@ -566,6 +591,7 @@ async fn the_offclock_sweep_loop_reconciles_without_any_relay() {
         move |state| {
             let demand: SharedSourceDemand = Arc::new(LeaseDemand { log });
             let mut state = state
+                .with_sources_store(configured_sources(&["a", "b", "c", "d", "e"]))
                 .with_switcher(engine.clone())
                 .with_source_demand(demand);
             state.switcher_preview_lease = leases;
@@ -585,7 +611,7 @@ async fn the_offclock_sweep_loop_reconciles_without_any_relay() {
         post_with_key(
             "/api/v1/switcher/commands/select_preview",
             OPERATOR_TOKEN,
-            request("select_preview", Some("a")),
+            request("select_preview", Some("d")),
             "loop-reconcile",
         ),
     )
@@ -702,7 +728,11 @@ fn repeated_boots_release_every_lease_and_reject_late_admission() {
 async fn cold_take_failure_never_swaps_program() {
     let (handle, mut driver) = runtime();
     let engine = handle.clone();
-    let h = harness_with(move |state| state.with_switcher(engine));
+    let h = harness_with(move |state| {
+        state
+            .with_sources_store(configured_sources(&["a", "b", "c", "d", "e", "cold"]))
+            .with_switcher(engine)
+    });
     for (action, source, key) in [
         ("select_preview", Some("cold"), "cold-pvw"),
         ("cut", None, "cold-cut"),

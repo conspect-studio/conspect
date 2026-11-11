@@ -21,6 +21,8 @@ pub struct SwitcherFrameHook<C> {
     pub legacy: C,
     last_program: Option<SourceRef>,
     failed_tick: Option<u64>,
+    /// Last logged rebind failure, so a persistent failure logs once (#245).
+    last_error: Option<String>,
     /// Off-clock PVW monitor slot; `None` until a real PVW source frame exists.
     pub preview_slot: Option<Arc<SwapCell<Option<Arc<Nv12Image>>>>>,
     /// Shared store map, reused rather than decoding the preview source twice.
@@ -33,12 +35,16 @@ impl<C> SwitcherFrameHook<C> {
     /// Create the hook with a live source id in one addressable cell.
     #[must_use]
     pub fn new(driver: SwitcherTickDriver, cell_id: String, legacy: C) -> Self {
+        // This hook renders the AUTO dissolve inside the Program drive
+        // (ADR-0104 §3), so AUTO becomes admissible only once it exists.
+        driver.advertise_auto();
         Self {
             driver,
             cell_id,
             legacy,
             last_program: None,
             failed_tick: None,
+            last_error: None,
             preview_slot: None,
             preview_stores: None,
             fps_num: 0,
@@ -53,14 +59,39 @@ impl<C: FnMut(&mut CompositorDrive<Nv12Image>)> FrameControl for SwitcherFrameHo
         self.fps_den = drive.layout().canvas.fps_den;
         (self.legacy)(drive);
         self.driver.drain_at_tick(tick);
-        let (program, _) = self.driver.selections();
+        let (program, preview) = self.driver.selections();
+        let mut failure = None;
         if self.last_program.as_ref() != Some(program) {
-            if let Err(error) = drive.rebind_cell(&self.cell_id, program.as_str()) {
-                self.failed_tick = Some(tick.index);
-                self.driver.reject_composed_tick(tick, &error.to_string());
-            } else {
-                self.last_program = Some(program.clone());
+            match drive.rebind_cell(&self.cell_id, program.as_str()) {
+                Ok(()) => self.last_program = Some(program.clone()),
+                Err(error) => failure = Some(error.to_string()),
             }
+        }
+        // AUTO dissolve: the outgoing source stays in the Program cell, the
+        // incoming one is drawn above it at elapsed/duration in this same pass.
+        // At the terminal tick the machine has swapped and the window is gone.
+        let mix = self.driver.auto_window().map(|(start, rate)| {
+            let elapsed = (i128::from(tick.index) - start).clamp(0, i128::from(rate.get()));
+            (u32::try_from(elapsed).unwrap_or(rate.get()), rate.get())
+        });
+        let result = match mix {
+            Some((elapsed, duration)) => {
+                drive.set_mix_overlay(Some((preview.as_str(), elapsed, duration)))
+            }
+            None if drive.mix_overlay().is_some() => drive.set_mix_overlay(None),
+            None => Ok(()),
+        };
+        if let (None, Err(error)) = (&failure, result) {
+            failure = Some(error.to_string());
+        }
+        if let Some(error) = failure {
+            if self.last_error.as_deref() != Some(error.as_str()) {
+                tracing::warn!(cell = %self.cell_id, %error, "switcher frame rejected: Program cell could not be bound");
+                self.last_error = Some(error.clone());
+            }
+            self.failed_tick = Some(tick.index);
+            self.driver.reject_composed_tick(tick, &error);
+            let _ = drive.set_mix_overlay(None);
         }
     }
 

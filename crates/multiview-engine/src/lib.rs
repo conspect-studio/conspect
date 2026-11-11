@@ -137,7 +137,7 @@ pub use demand::{
     DEFAULT_CLOSE_AFTER, DEFAULT_MAX_CONCURRENT_STARTS, DEFAULT_START_TIMEOUT,
     MAX_PENDING_RESTARTS, MAX_TIMED_LEASES,
 };
-pub use drive::{CompositedFrame, CompositorDrive};
+pub use drive::{CompositedFrame, CompositorDrive, MixOverlay};
 pub use epoch::{
     clock_quality_of, clock_source_of, EpochAnchor, EpochPolicy, EpochSampler, EpochSamplerConfig,
     EpochStatus, EpochTracker, EpochUpdate, SystemWallSampler, WallClockSampler, WallSample,

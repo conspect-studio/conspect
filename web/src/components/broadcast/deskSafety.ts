@@ -10,3 +10,22 @@ export function deskControlReason(available: boolean, connected: boolean, fresh:
   if (unresolved) return 'Operation outcome pending or unknown';
   return undefined;
 }
+/**
+ * Why one bus key cannot be taken, from the engine-confirmed buses and the
+ * source's demand phase (ADR-0104). `undefined` means the key works. A source
+ * that is idle or starting is still selectable: the engine starts it and the
+ * take waits (bounded) for its first fresh frame.
+ */
+export function busKeyReason(
+  bus: 'program' | 'preview',
+  id: string,
+  state: { program_source: string; preview_source: string } | undefined,
+  phase: string | undefined,
+): string | undefined {
+  if (!state) return undefined;
+  if (bus === 'preview' && id === state.program_source) return 'Already on Program — Preview must differ';
+  if (bus === 'preview' && id === state.preview_source) return 'Already on Preview';
+  if (bus === 'program' && id === state.program_source) return 'Already on Program';
+  if (phase === 'failed') return 'Source failed — not producing frames';
+  return undefined;
+}

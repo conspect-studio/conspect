@@ -404,6 +404,14 @@ pub trait SourceDemandProvider: Send + Sync {
     /// `None` when `id` is not a configured source.
     fn preview_lease(&self, id: &str, label: &str) -> Option<Box<dyn SourceDemandLease>>;
 
+    /// Take a lease on `id`'s video and audio for the M/E Preview bus
+    /// (ADR-0104 §4), so an on-demand source has audio before it reaches
+    /// Program and an AUTO can crossfade it. `None` when `id` is unknown. The
+    /// default falls back to a video-only [`Self::preview_lease`].
+    fn switcher_preview_lease(&self, id: &str, label: &str) -> Option<Box<dyn SourceDemandLease>> {
+        self.preview_lease(id, label)
+    }
+
     /// Take a lease on `id`'s video and audio for an on-demand HLS session
     /// labelled `label` (`feat/rc-on-demand-hls` calls this). `None` when `id`
     /// is not a configured source. The default refuses, for providers without

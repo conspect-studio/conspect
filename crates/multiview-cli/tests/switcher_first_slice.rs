@@ -151,7 +151,17 @@ async fn attached_control_cut_changes_received_program_and_separate_pvw_monitor(
             .unwrap()
             .unwrap();
         assert!(done.event.completed, "Cut reaches actual frame");
-        let after = captured_preview.load().unwrap().sample(8, 8).unwrap().0;
+        // The outcome is published in `after_compose`, just before the same
+        // tick's canvas reaches the Program slot (`state_of`); give the slot a
+        // bounded moment to carry that frame instead of racing it.
+        let mut after = captured_preview.load().unwrap().sample(8, 8).unwrap().0;
+        for _ in 0..100 {
+            if after != before {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            after = captured_preview.load().unwrap().sample(8, 8).unwrap().0;
+        }
         assert_ne!(before, after, "received program pixel changes");
         assert_eq!(after, pvw_before, "PGM now shows prior PVW");
         assert_eq!(provider.program_jpeg(80).unwrap().first(), Some(&0xff));
@@ -170,6 +180,71 @@ async fn attached_control_cut_changes_received_program_and_separate_pvw_monitor(
     assert!(!report.faltered);
     watchdog.abort();
     relay.await.unwrap();
+}
+
+/// #245: the Program cell id (`pgm`) is not the program id (`main`). The live
+/// command drain re-keys the drive by the config cell ids on its first tick;
+/// the switcher must still bind its cell and become ready.
+#[tokio::test(flavor = "multi_thread")]
+async fn program_cell_id_differing_from_program_id_still_becomes_ready() {
+    let _serial = SERIAL.lock().await;
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = config(&dir.path().join("index.m3u8"));
+    assert_ne!(cfg.cells[0].id, "main");
+    let mut pipeline = Pipeline::build(&cfg).unwrap();
+    let preview = program_slot();
+    let pvw = program_slot();
+    let (handle, mut driver) = SwitcherControl::new(SwitcherState::new(
+        SourceRef::new("a"),
+        SourceRef::new("b"),
+        vec![],
+    ));
+    driver.set_prime_stores(pipeline.preview_stores());
+    handle
+        .set_scenes(ScenePair {
+            version: 1,
+            program: pipeline.switcher_program_layout(),
+            preview: pipeline.switcher_preview_layout("b"),
+        })
+        .unwrap();
+    pipeline
+        .attach_switcher(handle.clone(), driver, Arc::clone(&pvw))
+        .unwrap();
+    let publisher = EnginePublisher::<EngineStateSnapshot, Event>::new(64);
+    let stop = StopOnDrop::new();
+    let watchdog_stop = stop.signal();
+    let watchdog = tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_secs(30)).await;
+        watchdog_stop.stop();
+    });
+    let probe_stop = stop.signal();
+    let probe = tokio::spawn(async move {
+        for _ in 0..1500 {
+            if handle.is_ready() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        probe_stop.stop();
+        handle.is_ready()
+    });
+    let cell_ids: Vec<Option<String>> = cfg.cells.iter().map(|c| Some(c.id.clone())).collect();
+    let run_stop = stop.signal();
+    pipeline
+        .run_until_serving(
+            &run_stop,
+            &publisher,
+            &preview,
+            // Exactly what the production drain does on its first tick.
+            move |drive: &mut CompositorDrive<Nv12Image>| drive.set_cell_ids(cell_ids.clone()),
+        )
+        .await
+        .unwrap();
+    watchdog.abort();
+    assert!(
+        probe.await.unwrap(),
+        "the switcher binds the config Program cell and becomes ready"
+    );
 }
 
 // ---------------------------------------------------------------------------

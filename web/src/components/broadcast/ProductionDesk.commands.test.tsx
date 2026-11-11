@@ -55,16 +55,50 @@ function outcome(id: string, completed: boolean, error?: string) {
 // Tracker events are supplied as the shell-owned socket supplies them; no second socket.
 // Confirmation needs two polls with an advancing tick (2 s refetch), hence the longer waits.
 describe('ProductionDesk single-authority completion', { timeout: 15000 }, () => {
-  it('keeps unsupported transitions disabled before the dominant CUT in DOM order', async () => {
+  it('keeps unsupported transitions disabled before the dominant CUT in DOM order; AUTO works', async () => {
     const { container } = page();
     await waitFor(() => { expect(screen.getByRole('button', { name: 'CUT' })).not.toBeDisabled(); }, { timeout: 6000 });
     const keys = [...container.querySelectorAll('.bd-takes button')];
     expect(keys.map((key) => key.textContent)).toEqual(['MIX', 'WIPE', 'DIP', 'AUTO', 'CUT · cam-2']);
-    for (const key of keys.slice(0, 4)) expect(key).toBeDisabled();
+    for (const key of keys.slice(0, 3)) expect(key).toBeDisabled();
     expect(screen.getByRole('button', { name: 'MIX' })).toHaveAttribute('aria-pressed', 'true');
-    expect(screen.getByRole('button', { name: 'AUTO' }).title).toContain('422');
-    expect(screen.getByRole('spinbutton', { name: 'Auto frames' })).toBeDisabled();
+    expect(screen.getByRole('button', { name: 'AUTO' })).not.toBeDisabled();
+    expect(screen.getByRole('button', { name: 'AUTO' }).title).toContain('30 frames');
+    expect(screen.getByRole('spinbutton', { name: 'Auto frames' })).not.toBeDisabled();
     expect(commandCount).toBe(0);
+  });
+
+  it('AUTO sends duration_frames from the rate field, after a passing plan', async () => {
+    let body: unknown;
+    server.use(http.post('*/api/v1/switcher/commands/auto', async ({ request }) => { body = await request.json(); commandCount += 1; return HttpResponse.json({ operation_id: 'op-auto', kind: 'auto' }, { status: 202 }); }));
+    page();
+    const auto = screen.getByRole('button', { name: 'AUTO' });
+    await waitFor(() => { expect(auto).not.toBeDisabled(); }, { timeout: 6000 });
+    await userEvent.click(auto);
+    // The take lock is on by default: AUTO confirms once, like CUT.
+    await userEvent.click(await screen.findByRole('button', { name: 'Confirm take' }));
+    await waitFor(() => { expect(commandCount).toBe(1); });
+    expect(body).toMatchObject({ me: 'me1', program: 'main', action: 'auto', duration_frames: 30 });
+  });
+
+  it('disables every key the engine would refuse, with the reason', async () => {
+    server.use(
+      http.get('*/api/v1/sources', () => HttpResponse.json([{ id: 'cam-1', name: 'CAM 1', body: { kind: 'srt', url: 'srt://[::1]:1' } }, { id: 'cam-2', name: 'CAM 2', body: { kind: 'srt', url: 'srt://[::1]:2' } }, { id: 'cam-3', name: 'CAM 3', body: { kind: 'srt', url: 'srt://[::1]:3' } }, { id: 'cam-4', name: 'CAM 4', body: { kind: 'srt', url: 'srt://[::1]:4' } }])),
+      http.get('*/api/v1/sources/status', () => HttpResponse.json([{ id: 'cam-4', phase: 'failed', video_wanted: true, audio_wanted: false, video_running: false, audio_running: false, consumers: [], activation: 'on_demand' }, { id: 'cam-3', phase: 'idle', video_wanted: false, audio_wanted: false, video_running: false, audio_running: false, consumers: [], activation: 'on_demand' }])),
+    );
+    page();
+    const pvw = await screen.findByRole('group', { name: 'PVW bus' });
+    const pgm = screen.getByRole('group', { name: /PGM bus/ });
+    await waitFor(() => { expect(within(pvw).getByRole('button', { name: /CAM 3/ })).not.toBeDisabled(); }, { timeout: 6000 });
+    expect(within(pvw).getByRole('button', { name: /CAM 1/ }).title).toContain('Already on Program');
+    expect(within(pvw).getByRole('button', { name: /CAM 1/ })).toBeDisabled();
+    expect(within(pvw).getByRole('button', { name: /CAM 2/ })).toBeDisabled();
+    expect(within(pgm).getByRole('button', { name: /CAM 1/ })).toBeDisabled();
+    expect(within(pgm).getByRole('button', { name: /CAM 2/ })).not.toBeDisabled();
+    // An idle on-demand source is selectable (the engine starts it); a failed one is not.
+    expect(within(pgm).getByRole('button', { name: /CAM 3/ })).not.toBeDisabled();
+    await waitFor(() => { expect(within(pvw).getByRole('button', { name: /CAM 4/ })).toBeDisabled(); });
+    expect(within(pvw).getByRole('button', { name: /CAM 4/ }).title).toContain('Source failed');
   });
 
   it('pairs CUT with its real source and an alarm button; AUTO frames sit in a disclosure', async () => {
@@ -135,12 +169,14 @@ describe('ProductionDesk single-authority completion', { timeout: 15000 }, () =>
 
   it('two synchronous source clicks produce exactly one POST', async () => {
     server.use(
-      http.get('*/api/v1/sources', () => HttpResponse.json([{ id: 'cam-1', name: 'CAM 1', body: { kind: 'srt', url: 'srt://[::1]:1' } }])),
+      // cam-1 is on Program, so its PVW key is (honestly) disabled; cam-3 is a legal PVW pick.
+      http.get('*/api/v1/sources', () => HttpResponse.json([{ id: 'cam-1', name: 'CAM 1', body: { kind: 'srt', url: 'srt://[::1]:1' } }, { id: 'cam-3', name: 'CAM 3', body: { kind: 'srt', url: 'srt://[::1]:3' } }])),
       http.post('*/api/v1/switcher/commands/select_preview', () => { commandCount += 1; return HttpResponse.json({ operation_id: `op-${String(commandCount)}`, kind: 'select_preview' }, { status: 202 }); }),
     );
     page();
     const pvw = await screen.findByRole('group', { name: 'PVW bus' });
-    const btn = await within(pvw).findByRole('button', { name: /CAM 1/ });
+    expect(await within(pvw).findByRole('button', { name: /CAM 1/ })).toBeDisabled();
+    const btn = await within(pvw).findByRole('button', { name: /CAM 3/ });
     await waitFor(() => { expect(btn).not.toBeDisabled(); }, { timeout: 6000 });
     act(() => { btn.click(); btn.click(); });
     await waitFor(() => { expect(commandCount).toBe(1); });
