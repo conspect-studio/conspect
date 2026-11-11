@@ -10,7 +10,7 @@ wait on a device (invariant #10).
 
 | Thread | Owner | May touch | Must never |
 | ------ | ----- | --------- | ---------- |
-| Device callback (OS real-time) | cpal | its own SPSC ring (push for input, pop for output); atomics for counters | lock, allocate, log, block, call into the engine |
+| Device callback (OS real-time) | cpal | its own SPSC ring (push for input, pop for output); atomics for counters | lock, allocate, log, block, call into the engine, **panic** |
 | Input pump (normal priority) | `multiview-audio-device` | ring (pop), resampler, servo, `AudioStore::publish` | wait for the engine; wait without a bound for the device |
 | Output drain (normal priority) | `multiview-audio-device` (a device-paced drain, section 3) | engine→drain SPSC ring (pop), resampler, servo, device ring (push) | wait on the engine |
 | Lifecycle helper | `multiview-audio-device` | cpal open/close, with a deadline | run on the engine or pump thread |
@@ -19,6 +19,17 @@ wait on a device (invariant #10).
 All rings are preallocated `rtrb` SPSC rings. Push and pop are wait-free on both sides. No mutex is
 shared between the engine and any device-side thread. (The HDMI `DisplayAudioPublisher` takes a
 short mutex; this path deliberately does not reuse it.)
+
+**No panic across the FFI boundary** (data-plane-safety §4). cpal 0.18 calls the closure directly
+from CoreAudio's render proc and from its WASAPI worker without `catch_unwind`. So the closure body
+is wrapped in `std::panic::catch_unwind` (safe Rust); on a panic it fills silence, sets a latched
+`callback_panicked` flag that the pump or drain reports and turns into *lost* (close and reopen),
+and returns. The closure also uses checked or saturating arithmetic and no indexing that can fail.
+A test injects a panic into a simulated callback and asserts silence, no unwind, and a reopen.
+
+**Real-time priority.** CoreAudio runs the callback on its own real-time thread. On Windows, cpal
+raises its WASAPI worker's priority only with its `realtime` feature; the crate enables it
+(target-gated with the dependency). `RealtimeDenied` (section 4) is the report when the OS refuses.
 
 **Callback buffers.** The callback converts in fixed chunks of at most `CHUNK = 1024` frames
 through a preallocated scratch of `CHUNK × channels` samples, or writes straight into ring slots
@@ -65,17 +76,24 @@ device callback ──push──▶ [SPSC ring, ~200 ms] ──pop──▶ pump
   - If its own wake-up gap exceeds 50 ms, or the ring's overflow counter moved, everything in the
     ring is stale: the pump pops and discards it, resets the servo and resampler phase, and
     re-primes from fresh callback frames.
-  - If `unread_frames` exceeds target + Q + 20 ms (Q is the run's tick quantum, for example
-    40 ms at 25 fps; the program bus paused reading), the pump discards incoming frames until
-    unread is back at the target, then resets the servo. This threshold sits just above the
-    steady sawtooth peak, so there is no dead zone left for the slow servo to drain.
+  - If the program bus pauses, the pump **keeps publishing fresh frames**. The store's 1 s
+    drop-oldest window slides, so its head is always current audio. While `unread_frames` is above
+    target + Q + 20 ms (Q is the run's tick quantum, for example 40 ms at 25 fps), the servo is
+    frozen (no wind-up) instead of chasing the lag; the consumer skip below removes the lag on
+    resume, and the servo restarts from zero.
   - Already-published audio is handled by the consumer, **before** it copies the block. Unread
     fill normally peaks at about target + Q/2 + 10 ms just before a read. If the pre-read lag
     `head − cursor` exceeds target + Q/2 + 20 ms (the program bus paused or stopped reading, even
     briefly), the reader first moves its cursor to `head − target − Q/2` and then reads, so the
     block it returns starts at that point.
-  - Freshness bound this gives: the oldest sample in any returned block is at most
-    target + Q/2 + 20 ms old (≈120 ms at 25 fps, ≈108 ms at 60 fps). Routine reads never skip.
+  - Freshness bound this gives: because the head is always current (the pump never stops
+    publishing), the oldest sample in any returned block is at most target + Q/2 + 20 ms behind
+    the newest captured audio, plus the pump's publish interval (10 ms): ≈130 ms at 25 fps,
+    ≈118 ms at 60 fps. Routine reads never skip.
+  - If the pump itself has not published for over 50 ms (pump stall, device stall), the head is
+    not current. The pump records its last publish instant in the store (an atomic); the consumer
+    returns silence instead of retained audio when that instant is older than 50 ms, until the pump
+    publishes fresh frames again.
   - Test: continuous playback at 23.976, 25, 29.97, 50 and 60 fps for 10 simulated minutes with
     ±300 ppm drift gives zero consumer skips. This
     is the existing consumer-owned re-sync logic in `AudioStore::read`, extended with one bound; it
@@ -293,7 +311,8 @@ device = "default"
 CI, no hardware, over a **simulated device**: a thread that calls the same callback closure on its
 own clock.
 
-1. Ring adapters: push/pop bounds, overflow and underrun counts, silence fill, chunking of a
+1. Ring adapters: a panic injected into the callback is caught (silence, `callback_panicked`,
+   reopen); push/pop bounds, overflow and underrun counts, silence fill, chunking of a
    callback larger than `CHUNK`, and zero allocations and zero locks on the callback path
    (counting allocator).
 2. Input servo: devices at +300 and −300 ppm against a simulated output clock for 10 simulated
@@ -323,7 +342,7 @@ state.
 ## 7a. Dependencies and licences
 
 - `cpal` and `rtrb` are pinned to exact versions in `Cargo.toml` (`=x.y.z`), optional, and pulled
-  only by `audio-device`.
+  only by `audio-device`. cpal is built with its `realtime` feature (Windows callback priority).
 - CI adds a `cargo deny check --features audio-device` run for `aarch64-apple-darwin` and
   `x86_64-pc-windows-msvc` (the default graph check uses `all-features = false` and does not cover
   this feature), plus feature builds on the macOS and Windows legs. The full transitive licence
