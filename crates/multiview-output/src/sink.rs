@@ -1372,7 +1372,12 @@ fn finish_segments(
     }
     let frame_ns = rescale(1, time_base, Rational::new(1, NANOS_PER_SEC));
     let mut playlist = MediaPlaylist::new(SegmentType::MpegTs);
-    state.finish(&mut playlist, frame_ns)?;
+    if let Err(err) = state.finish(&mut playlist, frame_ns) {
+        // A failed finalize (e.g. the main playlist's final publish) must not
+        // drop the renditions' pending manifests either (#253).
+        state.flush_published_best_effort(std::time::Duration::from_secs(2));
+        return Err(err);
+    }
     // TARGETDURATION must be >= the longest EXTINF, as an integer.
     playlist.recompute_target_duration();
     playlist.set_finished(true);
@@ -2840,18 +2845,16 @@ impl<'a> SegmentState<'a> {
         }
     }
 
-    /// Best-effort finalize of the currently-open segment on the error path: the
-    /// long-lived segment muxer's trailer is written (so its container is
-    /// structurally closed) and the segment dropped — WITHOUT publishing the
-    /// in-flight segment (the last file it was redirected to is left exactly as
-    /// written, matching [`finalize_audio_segments_best_effort`]). Any finish
-    /// failure is intentionally swallowed — the original drive error is the one
-    /// that propagates. Idempotent (no-ops once `current` is taken).
     /// Error path: give every background playlist publisher (main and
     /// renditions) up to `bound` to land the manifest it already holds.
     fn flush_published_best_effort(&mut self, bound: std::time::Duration) {
+        // One shared deadline across every publisher: they write in parallel
+        // (each on its own thread), so the total wait is `bound`, not
+        // `bound` x renditions.
+        let deadline = std::time::Instant::now() + bound;
+        let left = || deadline.saturating_duration_since(std::time::Instant::now());
         if let Some(live) = self.live.as_mut() {
-            live.flush_best_effort(bound);
+            live.flush_best_effort(left());
         }
         if let Some(renditions) = self.renditions.as_mut() {
             for state in renditions
@@ -2859,11 +2862,18 @@ impl<'a> SegmentState<'a> {
                 .iter_mut()
                 .chain(std::iter::once(&mut renditions.video))
             {
-                state.live.flush_best_effort(bound);
+                state.live.flush_best_effort(left());
             }
         }
     }
 
+    /// Best-effort finalize of the currently-open segment on the error path: the
+    /// long-lived segment muxer's trailer is written (so its container is
+    /// structurally closed) and the segment dropped — WITHOUT publishing the
+    /// in-flight segment (the last file it was redirected to is left exactly as
+    /// written, matching [`finalize_audio_segments_best_effort`]). Any finish
+    /// failure is intentionally swallowed — the original drive error is the one
+    /// that propagates. Idempotent (no-ops once `current` is taken).
     fn finalize_open_segment_best_effort(&mut self) {
         let Some(mut segment) = self.current.take() else {
             return;
