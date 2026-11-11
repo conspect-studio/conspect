@@ -120,7 +120,7 @@ mod artifact_tests {
         let mut store = ArtifactStore::open(
             root.path(),
             Limits {
-                bytes: 100000,
+                bytes: 100_000,
                 count: 100,
             },
         )

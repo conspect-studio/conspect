@@ -35,8 +35,10 @@ pub struct PlayerHandle {
     /// the audio `player_audio_loop` SAMPLES it and follows — so both rails wrap/
     /// exit on the same instant by construction (ADR-T019 §1).
     pub control_bus: Arc<PlayerControlBus>,
+    /// Native load runtime shared with the control provider, when booted.
     #[cfg(feature = "ffmpeg")]
     pub runtime: Option<PlayerRuntime>,
+    /// Pre-rendered N/A picture shown when no clip is loaded.
     pub na_image: Option<Arc<multiview_compositor::pipeline::Nv12Image>>,
 }
 
@@ -77,6 +79,7 @@ impl PlayerHandle {
     }
 }
 
+/// Latest published player status (committed epoch and any fault).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize)]
 pub struct PlayerStatus {
     /// Committed load generation (`0` before the first clip commits).
@@ -160,6 +163,7 @@ impl PlayerFault {
     }
 }
 
+/// Atomically replace the published status with `update(current)`.
 #[cfg(feature = "ffmpeg")]
 pub fn publish_status(
     slot: &multiview_framestore::SwapCell<Arc<PlayerStatus>>,
@@ -168,6 +172,7 @@ pub fn publish_status(
     slot.store(Arc::new(update(*slot.load())));
 }
 
+/// Shared handles of one player's native load runtime (opener, slot, journal).
 #[cfg(feature = "ffmpeg")]
 #[derive(Clone)]
 pub struct PlayerRuntime {

@@ -162,7 +162,7 @@ impl AudioFileDecoder {
         path: &Path,
         target_rate: u32,
         target_channels: u16,
-        options: DemuxOptions,
+        options: &DemuxOptions,
         token: CancelToken,
     ) -> Result<Self> {
         Self::from_demuxer(

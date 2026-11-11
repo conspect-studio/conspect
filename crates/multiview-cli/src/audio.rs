@@ -1922,6 +1922,9 @@ fn decode_vamp_window_48k(path: &std::path::Path, in_sample: usize, want_end: us
 /// not a streamed decode: the loop seam is sample-exact and click-free
 /// (ADR-T019), which a per-lap container seek (no audio IDR) could not be.
 #[cfg(feature = "ffmpeg")]
+#[allow(clippy::too_many_lines)]
+// reason: one sequential real-time loop whose deck/lease owners must share a
+// single scope for a defined unwind drop order; splitting would scatter it.
 pub(crate) fn player_audio_loop(plan: &PlayerAudioPlan, store: &AudioStore, stop: &AtomicBool) {
     use multiview_audio::loopdeck::{
         LoopDeck, DEFAULT_CROSSFADE_FRAMES, MAX_LOOP_SECONDS, SAMPLE_RATE,
@@ -1997,9 +2000,9 @@ pub(crate) fn player_audio_loop(plan: &PlayerAudioPlan, store: &AudioStore, stop
     // loops from the first block even before that first sample.
     let mut last_control_gen: u64 = 0;
     let mut adopter = crate::player::EpochAdopter::new();
-    let mut _active_lease: Option<crate::player::AudioDeckLease> = None;
+    let mut active_lease: Option<crate::player::AudioDeckLease> = None;
     let mut retired_epoch = crate::player::Generation::NONE;
-    let mut _artifact_owner = None;
+    let mut artifact_owner = None;
     // Keep the displaced capability until the store tail retirement ACK below.
     let mut retired_artifact_owner = None;
 
@@ -2027,17 +2030,17 @@ pub(crate) fn player_audio_loop(plan: &PlayerAudioPlan, store: &AudioStore, stop
                     // Destroy old deck and release its actual PCM charge on the
                     // audio thread; no libav or large Vec free on ingest.
                     deck = staged.deck;
-                    _active_lease = staged.lease;
-                    retired_artifact_owner = _artifact_owner.take();
-                    _artifact_owner = staged.artifact_lease;
+                    active_lease = staged.lease;
+                    retired_artifact_owner = artifact_owner.take();
+                    artifact_owner = staged.artifact_lease;
                     slot.acknowledge_adoption(epoch);
                     deck.stop();
                     last_control_gen = 0;
                 }
                 crate::player::Adoption::Silence { epoch } => {
                     deck = LoopDeck::empty(canonical_format());
-                    _active_lease = None;
-                    retired_artifact_owner = _artifact_owner.take();
+                    active_lease = None;
+                    retired_artifact_owner = artifact_owner.take();
                     // Explicit silence adoption: a proven audio-absent clip
                     // acknowledges its generation so the load can complete.
                     slot.acknowledge_adoption(epoch);
@@ -2050,8 +2053,8 @@ pub(crate) fn player_audio_loop(plan: &PlayerAudioPlan, store: &AudioStore, stop
         if let Some(epoch) = retirement.filter(|epoch| *epoch > retired_epoch) {
             // Drop active and not-yet-adopted owners before the retirement ACK.
             deck = LoopDeck::empty(canonical_format());
-            _active_lease = None;
-            retired_artifact_owner = _artifact_owner.take();
+            active_lease = None;
+            retired_artifact_owner = artifact_owner.take();
             if let Some(slot) = &plan.commit {
                 drop(slot.take());
             }
@@ -2116,7 +2119,7 @@ pub(crate) fn player_audio_loop(plan: &PlayerAudioPlan, store: &AudioStore, stop
         }
     }
     drop(deck);
-    drop(_active_lease);
+    drop(active_lease);
     if let Some(slot) = &plan.commit {
         let _ = slot.close();
     }

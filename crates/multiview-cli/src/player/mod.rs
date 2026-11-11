@@ -52,6 +52,8 @@ mod pacer;
 mod probe;
 mod transport;
 
+#[cfg(test)]
+pub(crate) use audio_budget::budget_test_guard;
 pub use audio_budget::{
     player_audio_budget, AudioDeckBudget, AudioDeckLease, PLAYER_PCM_BUDGET_BYTES,
 };

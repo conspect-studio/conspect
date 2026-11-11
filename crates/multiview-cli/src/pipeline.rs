@@ -2389,15 +2389,20 @@ impl Pipeline {
     /// source's clip cannot be generated, an NDI/unsupported source kind is
     /// declared, no runnable output is declared, or the encoder cannot be
     /// resolved.
-    #[allow(clippy::too_many_lines)]
-    // reason: a sequential constructor that solves the layout, builds one store +
-    // ingest plan per source, wires native captions, and assembles the outputs —
-    // each step is in-scope and splitting it would only scatter the wiring.
     pub fn build(config: &MultiviewConfig) -> Result<Self, PipelineError> {
         Self::build_with_player_state(config, None)
     }
 
     /// Build with exclusive durable player runtime ownership.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::build`], plus a refusal when the durable player journal is
+    /// already owned by another runtime.
+    #[allow(clippy::too_many_lines)]
+    // reason: a sequential constructor that solves the layout, builds one store +
+    // ingest plan per source, wires native captions, and assembles the outputs —
+    // each step is in-scope and splitting it would only scatter the wiring.
     pub fn build_with_player_state(
         config: &MultiviewConfig,
         player_state: Option<&Path>,
@@ -13231,7 +13236,7 @@ fn build_media_player_boot_with_state(
         #[cfg(feature = "ffmpeg")]
         let runtime_owner = match journal
             .as_ref()
-            .map(|journal| journal.claim_runtime())
+            .map(super::player::BindingJournal::claim_runtime)
             .transpose()
         {
             Ok(owner) => owner,
@@ -13246,7 +13251,7 @@ fn build_media_player_boot_with_state(
             .and_then(|journal| journal.recover().ok().flatten())
             .and_then(|(_, operation)| operation);
         #[cfg(feature = "ffmpeg")]
-        let recovered = journal.as_ref().map(|journal| journal.load());
+        let recovered = journal.as_ref().map(super::player::BindingJournal::load);
         #[cfg(feature = "ffmpeg")]
         let boot_asset = match &recovered {
             Some(Ok(Some(snapshot))) => match &snapshot.reference {
@@ -13337,7 +13342,7 @@ fn build_media_player_boot_with_state(
             let mut recovered_snapshot = recovered
                 .as_ref()
                 .and_then(|r| r.as_ref().ok())
-                .and_then(|s| s.clone())
+                .and_then(Clone::clone)
                 .unwrap_or_default();
             if recovered_snapshot.reference.is_some() && default.is_none() {
                 // A durable identity is not proof of an available decoder/pin.
@@ -14682,7 +14687,7 @@ fn player_runtime_body(
                         let anchor =
                             player.rebind(staged.clip.geometry, staged.clip.then, commit_tick);
                         let Some(staged) = pending_stage.take() else {
-                            unreachable!()
+                            continue;
                         };
                         let old = current.replace(staged.clip);
                         if let Some(old) = old {
@@ -14723,12 +14728,10 @@ fn player_runtime_body(
                                     operation: epoch.0,
                                     generation: epoch.0,
                                     source_id: match &clip.reference {
-                                        Some(crate::player::SlotReference::Artifact {
-                                            id, ..
-                                        })
-                                        | Some(crate::player::SlotReference::Asset { id }) => {
-                                            id.clone()
-                                        }
+                                        Some(
+                                            crate::player::SlotReference::Artifact { id, .. }
+                                            | crate::player::SlotReference::Asset { id },
+                                        ) => id.clone(),
                                         None => String::new(),
                                     },
                                     duration_frames: clip.probed.frames,
@@ -14768,9 +14771,10 @@ fn player_runtime_body(
             }
         }
         #[cfg(test)]
-        if current.is_some() && runtime.panic_after_commit.swap(false, Ordering::AcqRel) {
-            panic!("injected player panic after native commit");
-        }
+        assert!(
+            !(current.is_some() && runtime.panic_after_commit.swap(false, Ordering::AcqRel)),
+            "injected player panic after native commit"
+        );
         // Control verbs must reach the audio rail even while the next video
         // picture is stamped in the future and decode admission waits. This
         // transition is operator-rate and independent of output tick emission.
@@ -22831,6 +22835,7 @@ loop_default = true
         use std::sync::atomic::{AtomicBool, Ordering};
         use std::sync::Arc;
         use std::time::{Duration, Instant};
+        let _budget = crate::player::budget_test_guard();
 
         let mut config = config_with_player();
         config.media_players[0].default = None;
@@ -26114,6 +26119,7 @@ loop_default = true
         use multiview_ffmpeg::test_fixtures::{
             generate_player_clip, write_corrupt_clip, PlayerClipSpec,
         };
+        let _budget = crate::player::budget_test_guard();
         let cfg = config();
         let layout = cfg.solve_layout().unwrap();
         let cadence = cfg.canvas.fps.rational();
@@ -26125,10 +26131,10 @@ loop_default = true
         let dir = tempfile::tempdir().unwrap();
         let mut a_spec = PlayerClipSpec::ffv1(cadence, 25, 30);
         a_spec.audio_level = Some(0.25);
-        let a = dir.path().join("a.mov");
-        generate_player_clip(&a, &a_spec).unwrap();
-        let b = dir.path().join("b.mov");
-        generate_player_clip(&b, &PlayerClipSpec::ffv1(cadence, 25, 140)).unwrap();
+        let clip_a = dir.path().join("a.mov");
+        generate_player_clip(&clip_a, &a_spec).unwrap();
+        let clip_b = dir.path().join("b.mov");
+        generate_player_clip(&clip_b, &PlayerClipSpec::ffv1(cadence, 25, 140)).unwrap();
         let bad = dir.path().join("bad.mov");
         write_corrupt_clip(&bad, 4096).unwrap();
 
@@ -26176,7 +26182,7 @@ loop_default = true
             let _ = &mk_service;
             // Single service, producer picks the artifact named by a control file.
             let selector = dir.path().join("selected.mov");
-            std::fs::copy(&a, &selector).unwrap();
+            std::fs::copy(&clip_a, &selector).unwrap();
             let node = producer(dir.path(), "node", &selector);
             let service = mk_service("store", node);
             let mut keys = ApiKeyStore::new(b"pepper-xyz".to_vec());
@@ -26320,7 +26326,7 @@ loop_default = true
 
             // --- B: video-only artifact -> explicit silence ---
             clock.set(1_000_000_000 + anchor_a.as_nanos() + MediaTime::from_tick(2, cadence).as_nanos());
-            std::fs::copy(&b, &selector).unwrap();
+            std::fs::copy(&clip_b, &selector).unwrap();
             let (job_b, art_b) = produce("fill-b").await;
             let (code, v, raw) = http(addr, "POST", &format!("/api/v1/media/players/{PLAYER}/load"), &load_body(job_b, &art_b), OWNER, "load-b").await;
             assert_eq!(code, 202, "{raw}");

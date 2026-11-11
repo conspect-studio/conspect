@@ -578,7 +578,7 @@ impl Demuxer {
     /// * [`FfmpegError::OpenInput`] — the container could not be opened/probed.
     pub fn open_cancellable(
         path: &Path,
-        options: DemuxOptions,
+        options: &DemuxOptions,
         token: CancelToken,
     ) -> Result<Self> {
         ensure_initialized()?;
@@ -1512,7 +1512,7 @@ mod interrupt_logic_tests {
         let stop = Arc::new(AtomicBool::new(false));
         let err = Demuxer::open_cancellable(
             Path::new("/nonexistent/never-opened.mov"),
-            DemuxOptions::new(),
+            &DemuxOptions::new(),
             token(&current, 4, &stop),
         )
         .err()
@@ -1529,7 +1529,7 @@ mod interrupt_logic_tests {
         let stop = Arc::new(AtomicBool::new(false));
         let err = Demuxer::open_cancellable(
             Path::new("/nonexistent/missing.mov"),
-            DemuxOptions::new(),
+            &DemuxOptions::new(),
             token(&current, 1, &stop),
         )
         .err()
@@ -1543,7 +1543,7 @@ mod interrupt_logic_tests {
         let stop = Arc::new(AtomicBool::new(true));
         let err = Demuxer::open_cancellable(
             Path::new("/nonexistent/x.mov"),
-            DemuxOptions::new(),
+            &DemuxOptions::new(),
             token(&current, 1, &stop),
         )
         .err()

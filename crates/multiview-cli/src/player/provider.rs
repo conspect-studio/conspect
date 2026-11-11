@@ -24,6 +24,7 @@ struct Record {
     generation: Generation,
     terminal: Option<LoadOperation>,
 }
+/// The process-wide native load provider handed to the control plane.
 pub fn runtime_provider() -> Arc<RuntimeProvider> {
     static INSTANCE: OnceLock<Arc<RuntimeProvider>> = OnceLock::new();
     Arc::clone(INSTANCE.get_or_init(|| Arc::new(RuntimeProvider::default())))

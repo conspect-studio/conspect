@@ -106,6 +106,16 @@ pub fn player_audio_budget() -> &'static AudioDeckBudget {
     BUDGET.get_or_init(|| AudioDeckBudget::new(PLAYER_PCM_BUDGET_BYTES))
 }
 
+/// Serialises every test that charges or observes the real process-wide
+/// [`player_audio_budget`], whose production cap and semantics stay untouched.
+/// Hold the guard for the whole test; poisoning is ignored so one failure does
+/// not cascade.
+#[cfg(test)]
+pub(crate) fn budget_test_guard() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]

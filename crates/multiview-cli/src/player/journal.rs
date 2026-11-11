@@ -32,6 +32,10 @@ pub struct BindingJournal {
 impl BindingJournal {
     /// Hold the stable lock inode until all native/audio owners have exited.
     /// Never unlink this file: doing so would let two boots lock different inodes.
+    ///
+    /// # Errors
+    /// Returns the I/O error when the owner file cannot be created or is
+    /// already locked by another runtime.
     pub fn claim_runtime(&self) -> io::Result<std::sync::Arc<std::fs::File>> {
         let parent = self
             .path
@@ -49,23 +53,33 @@ impl BindingJournal {
         Ok(std::sync::Arc::new(file))
     }
     /// Encode identity as hex, never as a caller-controlled path component.
+    #[must_use]
     pub fn new(root: &Path, player: &str) -> Self {
-        let key: String = player
+        let key = player
             .as_bytes()
             .iter()
-            .map(|byte| format!("{byte:02x}"))
-            .collect();
+            .fold(String::new(), |mut acc, byte| {
+                use std::fmt::Write as _;
+                let _ = write!(acc, "{byte:02x}");
+                acc
+            });
         Self {
             path: root.join("player-bindings").join(format!("{key}.json")),
             player: player.to_owned(),
         }
     }
     /// Absence alone permits the configured default. Every other error fails closed.
+    ///
+    /// # Errors
+    /// Returns the I/O or decode error for an unreadable or invalid journal.
     pub fn load(&self) -> io::Result<Option<SlotSnapshot>> {
         self.recover()
             .map(|record| record.map(|(snapshot, _)| snapshot))
     }
     /// Recover the binding plus the detach identity whose intent survived a crash.
+    ///
+    /// # Errors
+    /// Returns the I/O or decode error for an unreadable or invalid journal.
     pub fn recover(&self) -> io::Result<Option<(SlotSnapshot, Option<super::DetachRequest>)>> {
         let bytes = match std::fs::read(&self.path) {
             Ok(bytes) => bytes,
@@ -97,10 +111,16 @@ impl BindingJournal {
         )))
     }
     /// Atomic durable precommit record. Failure leaves the live slot untouched.
+    ///
+    /// # Errors
+    /// Returns the I/O error when the record cannot be durably written.
     pub fn store(&self, snapshot: &SlotSnapshot, operation: Option<u64>) -> io::Result<()> {
         self.store_intent(snapshot, operation, None)
     }
     /// Store an unload intent with its exact CAS identity for duplicate recovery.
+    ///
+    /// # Errors
+    /// Returns the I/O error when the record cannot be durably written.
     pub fn store_detach(
         &self,
         snapshot: &SlotSnapshot,

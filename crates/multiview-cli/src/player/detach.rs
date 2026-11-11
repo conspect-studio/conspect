@@ -63,6 +63,7 @@ pub struct DetachPort {
 }
 impl DetachPort {
     /// Restore pending intent only. The runtime must prove boot quiescence.
+    #[must_use]
     pub fn recovered(request: DetachRequest, generation: Generation) -> Self {
         let ticket = Arc::new(DetachTicket {
             request,
@@ -78,6 +79,10 @@ impl DetachPort {
         }
     }
     /// Admit exactly one operation; retain the last result for duplicate retry.
+    ///
+    /// # Errors
+    /// Returns [`DetachAdmissionError`] when another operation is in flight or
+    /// the port has stopped.
     pub fn submit(
         &self,
         request: DetachRequest,

@@ -539,7 +539,7 @@ fn open_one(
     let options = DemuxOptions::new()
         .with_open_timeout(config.open_timeout)
         .with_rw_timeout(config.read_timeout);
-    let mut demuxer = Demuxer::open_cancellable(&request.spec.path, options, token)
+    let mut demuxer = Demuxer::open_cancellable(&request.spec.path, &options, token)
         .map_err(|error| classify_open_error(&request.spec.path, &error))?;
     let facts = probe_facts(&demuxer)?;
     if stop.load(Ordering::Acquire) || coordinator.is_superseded(generation) {
@@ -724,7 +724,7 @@ fn stage_audio(
         &request.spec.path,
         u32::try_from(SAMPLE_RATE).unwrap_or(48_000),
         2,
-        options,
+        &options,
         token,
     )
     .map_err(|error| classify_open_error(&request.spec.path, &error))?;
@@ -1094,7 +1094,7 @@ mod tests {
         let mut store = ArtifactStore::open(
             root.path(),
             Limits {
-                bytes: 1000000,
+                bytes: 1_000_000,
                 count: 100,
             },
         )
@@ -1107,7 +1107,7 @@ mod tests {
                     job: "j".into(),
                     generation: 1,
                 },
-                bytes.len() as u64,
+                u64::try_from(bytes.len()).unwrap(),
                 |_| true,
             )
             .unwrap();
@@ -1157,6 +1157,7 @@ mod tests {
 
     #[test]
     fn advertised_audio_is_staged_with_the_video_and_charged_until_drop() {
+        let _budget = crate::player::budget_test_guard();
         let fixture = Fixture::new(CADENCE);
         let path = fixture.dir.path().join("audio.mov");
         let mut spec = PlayerClipSpec::ffv1(CADENCE, 25, 30);
