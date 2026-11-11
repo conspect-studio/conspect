@@ -311,7 +311,8 @@ pub use decode_stream::{
 
 #[cfg(feature = "ffmpeg")]
 pub use demux::{
-    discard_unrouted_subtitles, DemuxOptions, Demuxer, HttpHeaders, ReadPacket, StreamParams,
+    discard_unrouted_subtitles, CancelToken, DemuxOptions, Demuxer, HttpHeaders, ReadPacket,
+    StreamParams,
 };
 
 #[cfg(feature = "ffmpeg")]

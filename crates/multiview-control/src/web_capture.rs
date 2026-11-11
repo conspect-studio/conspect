@@ -359,6 +359,34 @@ impl Provider {
         Ok((lease, permit))
     }
 
+    /// Resolve an exact completed capture for native playback through this service.
+    /// No download-stream permit survives this call. Call off the output clock.
+    /// # Errors
+    /// Rejects foreign jobs/fills, mismatched identity and unavailable pin capacity.
+    pub fn pin_for_player(
+        &self,
+        p: &Principal,
+        job_id: u64,
+        artifact_id: &str,
+    ) -> ControlResult<multiview_webengine::artifact::Lease> {
+        p.role.require(Action::Write)?;
+        let job = self.status(p, job_id)?;
+        if job.state != "succeeded" || job.artifact_id.as_deref() != Some(artifact_id) {
+            return Err(ControlError::Conflict(
+                "capture artifact does not match completed job".into(),
+            ));
+        }
+        let artifact = multiview_webengine::artifact::ArtifactId::parse(artifact_id)
+            .map_err(|_| ControlError::Conflict("invalid capture artifact identity".into()))?;
+        self.with_pin_request(|| {
+            self.service
+                .as_ref()
+                .ok_or(ControlError::EngineBusy)?
+                .pin(&artifact, &p.key_id)
+                .map_err(|_| ControlError::EngineBusy)
+        })
+    }
+
     fn with_pin_request<T>(&self, pin: impl FnOnce() -> ControlResult<T>) -> ControlResult<T> {
         let _request = self
             .pin_requests

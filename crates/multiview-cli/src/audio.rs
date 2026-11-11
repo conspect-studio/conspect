@@ -1795,6 +1795,8 @@ pub(crate) struct PlayerAudioPlan {
     /// each block and follows the video's published transport state, so
     /// vamp/arm-exit/stop land on the same boundary as the video by construction.
     pub(crate) control_bus: Arc<crate::player::PlayerControlBus>,
+    #[cfg(feature = "ffmpeg")]
+    pub(crate) commit: Option<Arc<crate::player::AudioCommitSlot<crate::player::StagedAudio>>>,
 }
 
 /// Retain **only** the vamp window `[in_sample, want_end)` from a forward stream of
@@ -1925,6 +1927,16 @@ pub(crate) fn player_audio_loop(plan: &PlayerAudioPlan, store: &AudioStore, stop
         LoopDeck, DEFAULT_CROSSFADE_FRAMES, MAX_LOOP_SECONDS, SAMPLE_RATE,
     };
 
+    // Construct before all deck owners: unwind drops them before closing the slot.
+    struct CloseOnExit<'a>(&'a PlayerAudioPlan);
+    impl Drop for CloseOnExit<'_> {
+        fn drop(&mut self) {
+            if let Some(slot) = &self.0.commit {
+                drop(slot.close());
+            }
+        }
+    }
+    let _close = CloseOnExit(plan);
     let channels = canonical_format().channel_count();
     // Prime (ADR-T019 §5 — CRITICAL-3): decode ONLY the vamp window
     // `[vamp_in, vamp_out + W)` and retain ONLY that span — the pre-`vamp_in` head is
@@ -1937,9 +1949,11 @@ pub(crate) fn player_audio_loop(plan: &PlayerAudioPlan, store: &AudioStore, stop
     let body_frames = plan.vamp_out_frames.saturating_sub(plan.vamp_in_frames);
     let body_samples = frames_to_samples(body_frames, plan.cadence);
     let xfade = DEFAULT_CROSSFADE_FRAMES;
-    let mut deck = if body_samples == 0
-        || body_samples > MAX_LOOP_SECONDS.saturating_mul(SAMPLE_RATE)
-    {
+    let mut deck = if plan.commit.is_some() {
+        // The opener decodes and budget-admits the complete deck before the video
+        // commits. Never independently reopen the default file on this thread.
+        LoopDeck::empty(canonical_format())
+    } else if body_samples == 0 || body_samples > MAX_LOOP_SECONDS.saturating_mul(SAMPLE_RATE) {
         if body_samples > 0 {
             tracing::warn!(
                 player = %plan.id,
@@ -1982,6 +1996,12 @@ pub(crate) fn player_audio_loop(plan: &PlayerAudioPlan, store: &AudioStore, stop
     // samples below; the deck starts vamping by default so a boot-vamping player
     // loops from the first block even before that first sample.
     let mut last_control_gen: u64 = 0;
+    let mut adopter = crate::player::EpochAdopter::new();
+    let mut _active_lease: Option<crate::player::AudioDeckLease> = None;
+    let mut retired_epoch = crate::player::Generation::NONE;
+    let mut _artifact_owner = None;
+    // Keep the displaced capability until the store tail retirement ACK below.
+    let mut retired_artifact_owner = None;
 
     // CRITICAL-2 (rule 22): a SINGLE reusable scratch buffer for the read path,
     // sized once to the maximum window and filled IN PLACE every block — no
@@ -1997,6 +2017,43 @@ pub(crate) fn player_audio_loop(plan: &PlayerAudioPlan, store: &AudioStore, stop
         // a real transition, apply it to the deck — so the window we (re)publish this
         // block reflects the CURRENT transport state (ADR-T019 §2.3). vamp/arm-exit/
         // stop therefore land on the same boundary as the video by construction.
+        if let Some(slot) = &plan.commit {
+            let control = plan.control_bus.load();
+            match adopter.poll(&control, slot) {
+                crate::player::Adoption::Adopt {
+                    deck: staged,
+                    epoch,
+                } => {
+                    // Destroy old deck and release its actual PCM charge on the
+                    // audio thread; no libav or large Vec free on ingest.
+                    deck = staged.deck;
+                    _active_lease = staged.lease;
+                    retired_artifact_owner = _artifact_owner.take();
+                    _artifact_owner = staged.artifact_lease;
+                    slot.acknowledge_adoption(epoch);
+                    deck.stop();
+                    last_control_gen = 0;
+                }
+                crate::player::Adoption::Silence { .. } => {
+                    deck = LoopDeck::empty(canonical_format());
+                    _active_lease = None;
+                    retired_artifact_owner = _artifact_owner.take();
+                    last_control_gen = 0;
+                }
+                crate::player::Adoption::Unchanged => {}
+            }
+        }
+        let retirement = plan.commit.as_ref().map(|slot| slot.retirement_requested());
+        if let Some(epoch) = retirement.filter(|epoch| *epoch > retired_epoch) {
+            // Drop active and not-yet-adopted owners before the retirement ACK.
+            deck = LoopDeck::empty(canonical_format());
+            _active_lease = None;
+            retired_artifact_owner = _artifact_owner.take();
+            if let Some(slot) = &plan.commit {
+                drop(slot.take());
+            }
+            retired_epoch = epoch;
+        }
         follow_video_control(&plan.control_bus, &mut deck, &mut last_control_gen);
 
         // The publish-horizon contract (ADR-T019 §2.3): REPLACE the unplayed window
@@ -2031,10 +2088,34 @@ pub(crate) fn player_audio_loop(plan: &PlayerAudioPlan, store: &AudioStore, stop
                 }
             }
         }
+        if let Some(slot) = &plan.commit {
+            // The unplayed store tail now contains silence, not the old deck.
+            slot.acknowledge_retirement(retired_epoch);
+        }
+        // PCM owners and the old unplayed tail have retired; release the pin last.
+        drop(retired_artifact_owner.take());
         // Once the exit has fully settled to silence, the store silence-fills the
         // unplayed tail on its own — nothing more to publish until a fresh transport
         // verb (which `follow_video_control` will pick up next wakeup).
-        sleep_interruptible(poll, stop);
+        if plan.commit.is_some() {
+            // Adoption must beat the first video tick at the commit anchor.
+            // Poll once per output period rather than the normal ten-tick refill.
+            let period = Duration::from_nanos(
+                u64::try_from(
+                    multiview_core::time::MediaTime::from_tick(1, plan.output_cadence).as_nanos(),
+                )
+                .unwrap_or(20_000_000)
+                .max(5_000_000),
+            );
+            sleep_interruptible(poll.min(period), stop);
+        } else {
+            sleep_interruptible(poll, stop);
+        }
+    }
+    drop(deck);
+    drop(_active_lease);
+    if let Some(slot) = &plan.commit {
+        let _ = slot.close();
     }
 }
 
@@ -2229,6 +2310,7 @@ mod player_audio_tests {
             cadence: Rational::new(48, 1),
             output_cadence: Rational::new(48, 1),
             control_bus: Arc::clone(&control_bus),
+            commit: None,
         };
 
         // Run the driver on its own thread (the data-plane peer of the video
@@ -2302,6 +2384,7 @@ mod player_audio_tests {
             cadence: Rational::new(48, 1),
             output_cadence: Rational::new(48, 1),
             control_bus,
+            commit: None,
         };
         let loop_store = Arc::clone(&store);
         let loop_stop = Arc::clone(&stop);
@@ -2347,6 +2430,7 @@ mod player_audio_tests {
             cadence: Rational::new(48, 1),
             output_cadence: Rational::new(48, 1),
             control_bus,
+            commit: None,
         };
         let loop_store = Arc::clone(&store);
         let loop_stop = Arc::clone(&stop);
@@ -2403,6 +2487,7 @@ mod player_audio_tests {
             cadence: Rational::new(48, 1),
             output_cadence: Rational::new(48, 1),
             control_bus: Arc::clone(&control_bus),
+            commit: None,
         };
         let loop_store = Arc::clone(&store);
         let loop_stop = Arc::clone(&stop);
@@ -2483,6 +2568,7 @@ mod player_audio_tests {
             cadence: Rational::new(48, 1),
             output_cadence: Rational::new(48, 1),
             control_bus: Arc::clone(&control_bus),
+            commit: None,
         };
         let loop_store = Arc::clone(&store);
         let loop_stop = Arc::clone(&stop);
@@ -2543,6 +2629,7 @@ mod player_audio_tests {
             cadence: Rational::new(48, 1),
             output_cadence: Rational::new(48, 1),
             control_bus: Arc::clone(&control_bus),
+            commit: None,
         };
         let loop_store = Arc::clone(&store);
         let loop_stop = Arc::clone(&stop);
@@ -2602,6 +2689,7 @@ mod player_audio_tests {
             cadence: Rational::new(48, 1),
             output_cadence: Rational::new(48, 1),
             control_bus,
+            commit: None,
         };
         let loop_store = Arc::clone(&store);
         let loop_stop = Arc::clone(&stop);

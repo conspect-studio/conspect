@@ -299,7 +299,8 @@ async fn run_pipeline(
     // Wire the wait-free tile-watermark signal (S3) into the pipeline's overlay
     // bake (a no-op without the `overlay` feature). The bake samples it off the
     // hot loop; it can never stall the output clock (invariant #1).
-    let mut pipeline = Pipeline::build(config)
+    let player_state = start.to_boot_model(&args.config).state_dir();
+    let mut pipeline = Pipeline::build_with_player_state(config, Some(&player_state))
         .context("building the pipeline")?
         .with_watermark_signal(plane.signal.clone());
     if let Some(subs) = &args.subtitles {

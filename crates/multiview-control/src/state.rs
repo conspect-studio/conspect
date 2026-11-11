@@ -544,6 +544,8 @@ impl Default for LiveSourceCapability {
 pub struct AppState {
     /// Optional real background browser capture service.
     pub web_capture: crate::web_capture::Provider,
+    /// Off-clock native artifact-load executor, unavailable by default.
+    pub player_load: Arc<dyn crate::player_load::PlayerLoadProvider>,
     /// The engine's outbound publisher (state slot + event broadcast).
     pub engine: Arc<EnginePublisher<EngineStateSnapshot, Event>>,
     /// The inbound, bounded, non-blocking command bus sender.
@@ -1070,6 +1072,7 @@ impl AppState {
             whep: crate::preview::no_whep(),
             moq: Arc::new(crate::moq::MoqRegistry::default()),
             web_capture: crate::web_capture::Provider::default(),
+            player_load: Arc::new(crate::player_load::UnavailablePlayerLoad),
             cloudflare: None,
             whip: crate::whip::no_whip(),
             whep_output: crate::whep_output::no_whep_output(),

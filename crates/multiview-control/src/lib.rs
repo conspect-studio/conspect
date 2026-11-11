@@ -72,6 +72,7 @@ pub mod moq_startup;
 pub mod nmos;
 pub mod notify;
 pub mod pending_actions;
+pub mod player_load;
 pub mod preview;
 pub mod problem;
 pub mod realtime;

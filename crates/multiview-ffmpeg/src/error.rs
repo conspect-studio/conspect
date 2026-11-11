@@ -45,6 +45,16 @@ pub enum FfmpegError {
         timeout_ms: u64,
     },
 
+    /// An open or read was aborted by its [`CancelToken`](crate::demux::CancelToken):
+    /// a newer load superseded it, or its owner is stopping. Not a fault of the
+    /// input.
+    #[cfg(feature = "ffmpeg")]
+    #[error("input {path:?} open/read cancelled")]
+    Cancelled {
+        /// The input path whose open/read was cancelled.
+        path: String,
+    },
+
     /// A live input keeps delivering packets but none for any audio stream: the
     /// source lost its audio mid-connection. Reconnect to pick up whatever it
     /// carries now; waiting would ride silence with no error.

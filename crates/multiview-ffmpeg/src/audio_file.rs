@@ -38,7 +38,7 @@ use multiview_core::time::MediaTime;
 
 use crate::convert::MediaKind;
 use crate::decode_stream::StreamAudioDecoder;
-use crate::demux::{DemuxOptions, Demuxer, HttpHeaders};
+use crate::demux::{CancelToken, DemuxOptions, Demuxer, HttpHeaders};
 use crate::error::{FfmpegError, Result};
 use crate::resample::{ResampleSpec, Resampler};
 
@@ -149,6 +149,33 @@ impl AudioFileDecoder {
     ///   stream parameters could not be resolved.
     pub fn open(path: &Path, target_rate: u32, target_channels: u16) -> Result<Self> {
         Self::from_demuxer(Demuxer::open(path)?, target_rate, target_channels)
+    }
+
+    /// Open a player clip's audio with the same cancellable, deadline-bound
+    /// demux ownership as its video. The caller checks its generation between
+    /// decoded blocks; the token aborts libav reads that poll the callback.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::open`], plus cancellation and per-read timeout.
+    pub fn open_cancellable(
+        path: &Path,
+        target_rate: u32,
+        target_channels: u16,
+        options: DemuxOptions,
+        token: CancelToken,
+    ) -> Result<Self> {
+        Self::from_demuxer(
+            Demuxer::open_cancellable(path, options, token)?,
+            target_rate,
+            target_channels,
+        )
+    }
+
+    /// Disarm the load generation before this context becomes a committed
+    /// audio source. The source remains stop- and deadline-interruptible.
+    pub fn disarm_cancel(&self) {
+        self.demuxer.disarm_cancel();
     }
 
     /// [`open`](Self::open) for a live network source: a stalled open or read
