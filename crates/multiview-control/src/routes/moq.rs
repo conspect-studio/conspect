@@ -29,7 +29,9 @@ fn reject(error: MoqReject) -> Response {
 fn authorize(principal: &Principal, scope: &WhepScope) -> Result<(), crate::error::ControlError> {
     principal.role.require(Action::Write)?;
     match scope {
-        WhepScope::Program => crate::routes::require_unscoped_for_whole_system(principal),
+        WhepScope::Program | WhepScope::Wall => {
+            crate::routes::require_unscoped_for_whole_system(principal)
+        }
         WhepScope::Input(id) => crate::auth::authorize_object(principal, id),
         WhepScope::Output(id) => crate::auth::authorize_output(principal, id),
     }
@@ -88,6 +90,30 @@ pub(crate) async fn program_close(
         &state,
         &principal,
         WhepScope::Program,
+        lease_id,
+        query.generation,
+    )
+}
+#[cfg_attr(feature="openapi", utoipa::path(post,path="/api/v1/preview/wall/moq",tag="preview",responses((status=201,description="MoQ lease result",body=crate::moq::MoqLease),(status=403,description="Forbidden",body=crate::problem::Problem),(status=415,description="Unsupported codec",body=crate::problem::Problem),(status=503,description="Unavailable or capacity",body=crate::problem::Problem))))]
+pub(crate) async fn wall_open(State(state): State<AppState>, principal: Principal) -> Response {
+    open(
+        &state,
+        &principal,
+        WhepScope::Wall,
+        "/api/v1/preview/wall/moq".to_owned(),
+    )
+}
+#[cfg_attr(feature="openapi", utoipa::path(delete,path="/api/v1/preview/wall/moq/{lease_id}",tag="preview",params(("generation" = u64, Query, description="Exact admitted generation")),responses((status=200,description="MoQ lease result",body=crate::moq::MoqRevoked),(status=403,description="Forbidden",body=crate::problem::Problem),(status=404,description="Unknown lease",body=crate::problem::Problem),(status=409,description="Generation mismatch",body=crate::problem::Problem))))]
+pub(crate) async fn wall_close(
+    State(state): State<AppState>,
+    principal: Principal,
+    Path(lease_id): Path<String>,
+    Query(query): Query<Generation>,
+) -> Response {
+    close(
+        &state,
+        &principal,
+        WhepScope::Wall,
         lease_id,
         query.generation,
     )
@@ -168,6 +194,7 @@ mod tests {
             let p = principal(role);
             for scope in [
                 WhepScope::Program,
+                WhepScope::Wall,
                 WhepScope::Input("a".into()),
                 WhepScope::Output("a".into()),
             ] {
@@ -177,11 +204,16 @@ mod tests {
         let mut p = principal(Role::Operator);
         p.scoped_object_ids = Some(vec!["a".into()]);
         assert!(authorize(&p, &WhepScope::Program).is_err());
+        assert!(authorize(&p, &WhepScope::Wall).is_err());
         assert!(authorize(&p, &WhepScope::Input("a".into())).is_ok());
         assert!(authorize(&p, &WhepScope::Input("b".into())).is_err());
         p.scoped_output_ids = Some(vec!["out".into()]);
         assert!(authorize(&p, &WhepScope::Output("out".into())).is_ok());
         assert!(authorize(&p, &WhepScope::Output("a".into())).is_err());
+    }
+    #[test]
+    fn unscoped_operator_may_lease_the_wall() {
+        assert!(authorize(&principal(Role::Operator), &WhepScope::Wall).is_ok());
     }
     #[test]
     fn generation_query_is_required_and_integer() {

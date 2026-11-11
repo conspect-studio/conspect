@@ -224,7 +224,7 @@ pub fn authorize_binding(
         .require(Action::Write)
         .map_err(|_| MoqReject::Forbidden)?;
     match scope {
-        WhepScope::Program => {
+        WhepScope::Program | WhepScope::Wall => {
             if principal.scoped_object_ids.is_some()
                 || principal.scoped_output_ids.is_some()
                 || principal.scoped_discovery_domains.is_some()
@@ -239,6 +239,13 @@ pub fn authorize_binding(
             authorize_output(principal, id).map_err(|_| MoqReject::Forbidden)?;
         }
         _ => return Err(MoqReject::Forbidden),
+    }
+    // The shared monitor wall (ADR-0103) carries every source's pixels and its
+    // cell set changes at run time, so it is whole-system by its RESOLVED
+    // identity: whatever scope was requested (`Wall`, or `Output("wall")` on
+    // the generic output route), a scoped principal never attaches to it.
+    if resolved_output == crate::monitor_wall::WALL_OUTPUT_ID && !principal.is_global() {
+        return Err(MoqReject::Forbidden);
     }
     authorize_output(principal, resolved_output).map_err(|_| MoqReject::Forbidden)?;
     for id in source_dependencies {
@@ -528,6 +535,19 @@ mod tests {
         assert!(authorize_binding(&p, &scope, "other", &[]).is_err());
         assert!(authorize_binding(&p, &scope, "effective", &["secret-source".into()]).is_err());
         assert!(authorize_binding(&p, &WhepScope::Program, "effective", &[]).is_err());
+        let mut wall_grant = p.clone();
+        wall_grant.scoped_output_ids = Some(vec![crate::monitor_wall::WALL_OUTPUT_ID.into()]);
+        wall_grant.scoped_object_ids = None;
+        assert!(
+            authorize_binding(
+                &wall_grant,
+                &WhepScope::Output(crate::monitor_wall::WALL_OUTPUT_ID.into()),
+                crate::monitor_wall::WALL_OUTPUT_ID,
+                &[],
+            )
+            .is_err(),
+            "the generic output route cannot reach the wall with a scoped grant"
+        );
         assert!(
             authorize_binding(&p, &WhepScope::Input("other".into()), "effective", &[]).is_err()
         );

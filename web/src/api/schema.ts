@@ -2357,6 +2357,61 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/preview/wall": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * `GET /api/v1/preview/wall` — the shared monitor-wall geometry (ADR-0103).
+         * @description Whole-system read: the wall carries every source's pixels, so only an
+         *     unscoped principal may read it (a scoped one gets `403` and keeps stills).
+         *     Each read renews the short preview-demand lease of every cell source, the
+         *     same lease a still poll takes, so a watched wall keeps its sources warm.
+         */
+        get: operations["wall_geometry"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/preview/wall/moq": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post: operations["wall_open"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/preview/wall/moq/{lease_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post?: never;
+        delete: operations["wall_close"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/probes": {
         parameters: {
             query?: never;
@@ -8140,11 +8195,76 @@ export interface components {
              */
             zoom: number;
         };
+        /** @description Exact wall cadence; never a float frame rate. */
+        WallCadence: {
+            /**
+             * Format: int64
+             * @description Seconds denominator.
+             */
+            den: number;
+            /**
+             * Format: int64
+             * @description Frames numerator.
+             */
+            num: number;
+        };
+        /** @description One source's rectangle inside the shared wall picture, in coded pixels. */
+        WallCell: {
+            /**
+             * Format: int32
+             * @description Height in coded pixels.
+             */
+            h: number;
+            /** @description Source (input) id whose newest frame fills this rectangle. */
+            source: string;
+            /**
+             * Format: int32
+             * @description Width in coded pixels.
+             */
+            w: number;
+            /**
+             * Format: int32
+             * @description Left edge in coded pixels.
+             */
+            x: number;
+            /**
+             * Format: int32
+             * @description Top edge in coded pixels.
+             */
+            y: number;
+        };
         /**
          * @description `OpenAPI` mirror of `multiview_config::WallClockUse` (ADR-0038 verb).
          * @enum {string}
          */
         WallClockUseDoc: "use" | "discard";
+        /** @description `GET /api/v1/preview/wall`: the one shared monitor-wall picture's layout. */
+        WallGeometry: {
+            /** @description Wall frame cadence. */
+            cadence: components["schemas"]["WallCadence"];
+            /** @description Source rectangles, sorted by source id. */
+            cells: components["schemas"]["WallCell"][];
+            /**
+             * Format: int64
+             * @description Changes whenever the cell assignment changes.
+             */
+            generation: number;
+            /**
+             * Format: int32
+             * @description Coded picture height.
+             */
+            height: number;
+            /**
+             * @description The live Preview-bus source, when a switcher is attached. Filled by the
+             *     route from the switcher state, never by the engine worker.
+             */
+            preview_source?: string | null;
+            /**
+             * Format: int32
+             * @description Coded picture width.
+             */
+            width: number;
+        };
         /**
          * @description `OpenAPI` mirror of [`multiview_events::WarningCode`] (SA-0 catalog).
          *
@@ -15168,6 +15288,143 @@ export interface operations {
             };
             /** @description No such live focus session. */
             404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
+    wall_geometry: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Wall geometry */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["WallGeometry"];
+                };
+            };
+            /** @description Scoped principal */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description No wall configured or not ready */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
+    wall_open: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description MoQ lease result */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MoqLease"];
+                };
+            };
+            /** @description Forbidden */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Unsupported codec */
+            415: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Unavailable or capacity */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
+    wall_close: {
+        parameters: {
+            query: {
+                /** @description Exact admitted generation */
+                generation: number;
+            };
+            header?: never;
+            path: {
+                lease_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description MoQ lease result */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MoqRevoked"];
+                };
+            };
+            /** @description Forbidden */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Unknown lease */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Generation mismatch */
+            409: {
                 headers: {
                     [name: string]: unknown;
                 };

@@ -101,7 +101,7 @@ export async function moqSupported(lease?: MoqLease, audio = false): Promise<boo
  * `selection()` is the pinned selector's verdict. The player is read lazily because the
  * source is constructed before the first sample and the player closes on teardown.
  */
-function abrSource(session: Connection.Established, player: () => Player | undefined, canvas: HTMLCanvasElement | undefined, frameBase = 0): { source: AbrSource; close: () => void; firstFrame: Promise<void>; publish: (to: HTMLCanvasElement | undefined, base: number) => void; total: () => number } {
+function abrSource(session: Connection.Established, player: () => Player | undefined, canvas: HTMLCanvasElement | undefined, frameBase = 0, onFrame?: (frame: VideoFrame) => void): { source: AbrSource; close: () => void; firstFrame: Promise<void>; publish: (to: HTMLCanvasElement | undefined, base: number) => void; total: () => number } {
   // Per-consumer render observation: this player's own decoded-output signal, not a global
   // instrument on the page's WebCodecs and not the received-payload counter in `out.stats`.
   const presented = { frames: 0, timestamp: -Infinity };
@@ -124,6 +124,9 @@ function abrSource(session: Connection.Established, player: () => Player | undef
       presented.timestamp = frame.timestamp;
       presented.frames += 1;
       last = { width: frame.displayWidth, height: frame.displayHeight };
+      // Only the session on screen feeds the per-frame hook; a renewal leg still
+      // connecting is observed but never emits a second stream of frames.
+      if (publishTo) onFrame?.(frame);
       write();
       seen();
     }
@@ -228,6 +231,8 @@ export async function startMoqPlayback(options: {
   resume?: AbrPersistedState | undefined;
   /** One consumer's progress deadline, retained across lease renewal. */
   presentation?: { advancedAt: number } | undefined;
+  /** Optional synchronous per-decoded-frame callback; the frame is library-owned (clone to keep it). */
+  onFrame?: ((frame: VideoFrame) => void) | undefined;
 }): Promise<void> {
   const { api, canvas, signal, audio, onActive } = options;
   const presentation = options.presentation ?? { advancedAt: performance.now() };
@@ -287,7 +292,7 @@ export async function startMoqPlayback(options: {
         announced: false, paused: false, muted, volume: 1, visible: 'always',
         probe: session.probe, target: abrTarget });
       const livePlayer = player;
-      binding = abrSource(session, () => livePlayer, visible ? canvas : undefined);
+      binding = abrSource(session, () => livePlayer, visible ? canvas : undefined, 0, options.onFrame);
       const flags = { live: visible };
       abr = new AbrSampler({
         target: abrTarget,

@@ -21,6 +21,7 @@ import { meterFillPercent, useAudioMeter } from '../../realtime/useAudioMeter';
 import { usePreviewCapabilities, whepAvailable } from '../../preview/capabilities';
 import { PreviewSurface } from '../../preview/PreviewSurface';
 import { useJpegStill } from '../../preview/useJpegPreview';
+import { WallCrop, WallStreamProvider, useWallStatus, useWallSurface } from '../../preview/WallStream';
 import { Dialog, DialogContent, DialogTitle } from '../ui/dialog';
 import { useOperationFeedback, useSubmitTrackedOperation } from './useOperationFeedback';
 import { OperationFeedback } from './OperationFeedback';
@@ -32,14 +33,17 @@ const SENDING = '\u0000sending';
 function PreviewMonitor({ program, source, fresh }: { readonly program: boolean; readonly source: string | undefined; readonly fresh: boolean }): JSX.Element {
   const { t } = useLingui();
   const caps = usePreviewCapabilities();
-  const pvwStill = useJpegStill('/api/v1/preview/switcher/me1/preview.jpg', 1000, !program);
+  // Shared wall: the preview cell is whatever source the wall currently shows on preview.
+  const wallPreview = useWallSurface(useWallSurface(undefined).previewSource);
+  const pvwLive = !program && wallPreview.live && wallPreview.cell !== undefined;
+  const pvwStill = useJpegStill('/api/v1/preview/switcher/me1/preview.jpg', 1000, !program && !pvwLive);
   const pvw = pvwStill.url;
-  const pvwUnavailable = !program && pvwStill.state === 'unavailable';
+  const pvwUnavailable = !program && !pvwLive && pvwStill.state === 'unavailable';
   const [diagHost, setDiagHost] = useState<HTMLDivElement | null>(null);
   const [transportUnavailable, setTransportUnavailable] = useState(false);
-  const still = program ? (!whepAvailable(caps.data, 'program') && (!caps.data?.moq || transportUnavailable)) : pvw !== undefined;
+  const still = program ? (!whepAvailable(caps.data, 'program') && (!caps.data?.moq || transportUnavailable)) : !pvwLive && pvw !== undefined;
   return <figure className={`bd-monitor ${program ? 'bd-pgm' : 'bd-pvw'}`} data-tally={fresh && source ? (program ? 'program' : 'preview') : 'unknown'}>
-    <div className="bd-picture">{program ? <PreviewSurface scope="program" whepEndpoint="/api/v1/preview/program/whep" jpegPath="/api/v1/preview/program.jpg" label={t`Program monitor`} capabilities={caps.data} className="bd-video" diagnosticsHost={diagHost} onTransportUnavailable={() => { setTransportUnavailable(true); }} /> : pvwUnavailable ? <span role="status" data-testid="preview-unavailable"><Trans>Preview unavailable — switcher backend not deployed</Trans></span> : pvw ? <div className="bd-jpeg"><img src={pvw} alt={t`Preview monitor`} />{pvwStill.state === 'stale' ? <em className="bd-stale" data-testid="preview-stale"><Trans>Stale</Trans></em> : null}</div> : <span><Trans>Waiting for a frame…</Trans></span>}</div>
+    <div className="bd-picture">{program ? <PreviewSurface scope="program" whepEndpoint="/api/v1/preview/program/whep" jpegPath="/api/v1/preview/program.jpg" label={t`Program monitor`} capabilities={caps.data} className="bd-video" diagnosticsHost={diagHost} onTransportUnavailable={() => { setTransportUnavailable(true); }} /> : pvwLive && wallPreview.previewSource ? <WallCrop source={wallPreview.previewSource} label={t`Preview monitor`} className="bd-video" testId="preview-wall" /> : pvwUnavailable ? <span role="status" data-testid="preview-unavailable"><Trans>Preview unavailable — switcher backend not deployed</Trans></span> : pvw ? <div className="bd-jpeg"><img src={pvw} alt={t`Preview monitor`} />{pvwStill.state === 'stale' ? <em className="bd-stale" data-testid="preview-stale"><Trans>Stale</Trans></em> : null}</div> : <span><Trans>Waiting for a frame…</Trans></span>}</div>
     {program ? <div className="bd-diag-slot" ref={setDiagHost} data-testid="desk-fallback-slot" /> : null}
     <figcaption><div className="bd-capline"><b>{program ? (fresh && source ? t`● ON AIR — PROGRAM` : t`○ PROGRAM — unconfirmed`) : (fresh && source ? t`▲ PREVIEW` : t`△ PREVIEW — unconfirmed`)}</b><span>{source ?? t`Unknown source`}</span></div><small>{fresh ? t`Engine-confirmed bus` : t`Unconfirmed / stale`}{pvwUnavailable ? null : still ? <> · {t`Still preview (~1 fps) — live video is unavailable for this preview`}</> : null}</small></figcaption>
     {program && <ProgramLevels />}
@@ -68,12 +72,24 @@ function tallyGlyph(tally: string): string {
 function SourcePicture({ id }: { readonly id: string }): JSX.Element {
   const { t } = useLingui();
   // Keeps the last good frame across failed polls; stale only after a bounded age (max(5 polls,10 s)).
-  const { url, state } = useJpegStill(`/api/v1/preview/inputs/${encodeURIComponent(id)}.jpg`, 2000);
+  const wall = useWallSurface(id);
+  const { url, state } = useJpegStill(`/api/v1/preview/inputs/${encodeURIComponent(id)}.jpg`, 2000, !wall.live);
+  if (wall.live) return <WallCrop source={id} label={t`Source live preview`} className="bd-source-picture" />;
   return url ? <><img className="bd-source-picture" src={url} alt={t`Source still preview`} data-still-state={state} />{state === 'stale' ? <em className="bd-stale" data-testid="tile-stale"><Trans>Stale frame</Trans></em> : null}</> : <span><Trans>No confirmed frame</Trans></span>;
 }
 
 /** Real bus state and correlated commands inside the approved desk composition. */
 export function ProductionDesk(): JSX.Element {
+  return <WallStreamProvider><ProductionDeskBody /></WallStreamProvider>;
+}
+
+function WallNote() {
+  const wall = useWallStatus();
+  if (wall.live) return <p className="bd-still-note" data-testid="wall-live-note"><Trans>Wall tiles are live video from one shared MoQ stream; a tile without a live cell shows its still.</Trans></p>;
+  return <p className="bd-still-note" data-testid="wall-still-note"><Trans>Wall tiles are still previews refreshed every ~2 s — not live video.</Trans>{wall.reason ? <> <span data-testid="wall-still-reason">({wall.reason})</span></> : null}</p>;
+}
+
+function ProductionDeskBody(): JSX.Element {
   const { t } = useLingui();
   const qc = useQueryClient();
   const { status } = useEngineEvents();
@@ -146,7 +162,7 @@ export function ProductionDesk(): JSX.Element {
     <div className="bd-desk-grid">
       <PreviewMonitor program source={name(state.data?.program_source)} fresh={fresh && status === 'open'} />
       <PreviewMonitor program={false} source={name(state.data?.preview_source)} fresh={fresh && status === 'open'} />
-      <section className="bd-wall"><h2><Trans>Multiview wall</Trans></h2><div className="bd-wall-grid">{sources.data?.map((source) => <div className="bd-wall-tile" key={source.id} data-tile-state={tileForSource(tiles, source.id)?.state ?? 'unknown'} data-tally={tallyForSource(source.id, state.data, fresh && status === 'open')}><SourcePicture id={source.id} /><small>{tallyGlyph(tallyForSource(source.id, state.data, fresh && status === 'open'))}</small><b>{source.name}</b><span><TileLabel tile={tileForSource(tiles, source.id)} /></span></div>)}</div><p className="bd-still-note" data-testid="wall-still-note"><Trans>Wall tiles are still previews refreshed every ~2 s — not live video.</Trans></p><p>{sources.isError ? t`Source catalog unavailable` : !sources.data?.length ? t`No source catalog available` : t`Tally follows the engine bus IDs; source presence does not prove signal.`}</p><p><Trans>Layouts</Trans>: {layouts.isError ? t`Unavailable` : layouts.data?.length ?? '—'} · <Trans>Observed tiles</Trans>: {tilesKnown ? tiles.size : '—'} · <Link className="bd-link48" to="/monitoring"><Trans>Open live monitoring</Trans></Link></p></section>
+      <section className="bd-wall"><h2><Trans>Multiview wall</Trans></h2><div className="bd-wall-grid">{sources.data?.map((source) => <div className="bd-wall-tile" key={source.id} data-tile-state={tileForSource(tiles, source.id)?.state ?? 'unknown'} data-tally={tallyForSource(source.id, state.data, fresh && status === 'open')}><SourcePicture id={source.id} /><small>{tallyGlyph(tallyForSource(source.id, state.data, fresh && status === 'open'))}</small><b>{source.name}</b><span><TileLabel tile={tileForSource(tiles, source.id)} /></span></div>)}</div><WallNote /><p>{sources.isError ? t`Source catalog unavailable` : !sources.data?.length ? t`No source catalog available` : t`Tally follows the engine bus IDs; source presence does not prove signal.`}</p><p><Trans>Layouts</Trans>: {layouts.isError ? t`Unavailable` : layouts.data?.length ?? '—'} · <Trans>Observed tiles</Trans>: {tilesKnown ? tiles.size : '—'} · <Link className="bd-link48" to="/monitoring"><Trans>Open live monitoring</Trans></Link></p></section>
       <section className="bd-switcher"><h2><Trans>M/E 1 — Switcher</Trans></h2>
         <div className="bd-buses">{(['preview', 'program'] as const).map((bus) => <div className={`bd-bus bd-bus-${bus}`} key={bus} role="group" aria-label={bus === 'program' ? t`PGM bus — direct taps always confirm` : t`PVW bus`}><b>{bus === 'program' ? 'PGM' : 'PVW'}</b><div>{sources.data?.map((source, index) => <button key={source.id} disabled={disabled} title={reason ? `${source.name} — ${reason}` : source.name} aria-pressed={tallyForSource(source.id, state.data, fresh && status === 'open') === bus} onClick={() => { request(bus === 'program' ? 'select_program' : 'select_preview', source.id); }}><span className="bd-key-name">{source.name}</span><i className="bd-idx" aria-hidden="true">{index + 1}</i></button>)}{!sources.data?.length && <span><Trans>No sources available</Trans></span>}</div></div>)}</div>
         <div className="bd-takes"><div className="bd-transitions" role="group" aria-label={t`Transition type — unavailable`}><button disabled aria-pressed="true" title={t`AUTO unavailable: the current engine rejects AUTO with HTTP 422`}>MIX</button><button disabled title={t`WIPE and DIP have no supported control contract`}>WIPE</button><button disabled title={t`WIPE and DIP have no supported control contract`}>DIP</button></div><button className="bd-auto" disabled title={t`AUTO unavailable: the current engine rejects AUTO with HTTP 422`} onClick={() => { request('auto'); }}>AUTO</button><div className="bd-cutrow"><button className="bd-cut" disabled={disabled} aria-describedby="bd-cut-src" onClick={() => { request('cut'); }}>CUT<span aria-hidden="true" className="bd-cut-src"> · {name(state.data?.preview_source) ?? t`source unknown`}</span></button><span id="bd-cut-src" className="sr-only">{t`Cuts to`} {name(state.data?.preview_source) ?? t`unknown source`}</span></div></div>

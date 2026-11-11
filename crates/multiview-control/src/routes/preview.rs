@@ -149,6 +149,37 @@ pub(crate) async fn input_jpeg(
     response
 }
 
+/// `GET /api/v1/preview/wall` — the shared monitor-wall geometry (ADR-0103).
+///
+/// Whole-system read: the wall carries every source's pixels, so only an
+/// unscoped principal may read it (a scoped one gets `403` and keeps stills).
+/// Each read renews the short preview-demand lease of every cell source, the
+/// same lease a still poll takes, so a watched wall keeps its sources warm.
+#[cfg_attr(feature = "openapi", utoipa::path(get, path = "/api/v1/preview/wall", tag = "preview", responses((status = 200, description = "Wall geometry", body = crate::preview::WallGeometry), (status = 403, description = "Scoped principal", body = crate::problem::Problem), (status = 503, description = "No wall configured or not ready", body = crate::problem::Problem))))]
+pub(crate) async fn wall_geometry(State(state): State<AppState>, principal: Principal) -> Response {
+    if let Err(err) = principal.role.require(Action::Read) {
+        return err.into_response();
+    }
+    if let Err(err) = crate::routes::require_unscoped_for_whole_system(&principal) {
+        return err.into_response();
+    }
+    let Some(mut wall) = state.preview.wall() else {
+        return crate::problem::Problem::new(503, "wall-unavailable", "monitor wall unavailable")
+            .into_response();
+    };
+    if let Some(demand) = state.source_demand.as_ref() {
+        for cell in &wall.cells {
+            let _ = demand.touch_preview(&cell.source);
+        }
+    }
+    wall.preview_source = state
+        .switcher
+        .as_ref()
+        .and_then(multiview_engine::switcher_control::SwitcherControl::snapshot)
+        .map(|snapshot| snapshot.preview.as_str().to_owned());
+    ([(header::CACHE_CONTROL, "no-store")], Json(wall)).into_response()
+}
+
 /// `GET /api/v1/preview/inputs` — the ids of inputs that can be previewed
 /// (role: read), for the UI to enumerate thumbnails.
 pub(crate) async fn list_input_ids(
@@ -179,6 +210,7 @@ fn whep_base_path(scope: &WhepScope) -> String {
         WhepScope::Program => "/api/v1/preview/program/whep".to_owned(),
         WhepScope::Input(id) => format!("/api/v1/preview/inputs/{id}/whep"),
         WhepScope::Output(id) => format!("/api/v1/preview/outputs/{id}/whep"),
+        WhepScope::Wall => "/api/v1/preview/wall/whep".to_owned(),
     }
 }
 
@@ -265,7 +297,9 @@ fn authorize_whep_scope(
     scope: &WhepScope,
 ) -> Result<(), crate::error::ControlError> {
     match scope {
-        WhepScope::Program => crate::routes::require_unscoped_for_whole_system(principal),
+        WhepScope::Program | WhepScope::Wall => {
+            crate::routes::require_unscoped_for_whole_system(principal)
+        }
         WhepScope::Input(id) => crate::auth::authorize_object(principal, id),
         WhepScope::Output(id) => crate::auth::authorize_output(principal, id),
     }

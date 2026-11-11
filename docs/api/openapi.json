@@ -8572,6 +8572,169 @@
         }
       }
     },
+    "/api/v1/preview/wall": {
+      "get": {
+        "tags": [
+          "preview"
+        ],
+        "summary": "`GET /api/v1/preview/wall` — the shared monitor-wall geometry (ADR-0103).",
+        "description": "Whole-system read: the wall carries every source's pixels, so only an\nunscoped principal may read it (a scoped one gets `403` and keeps stills).\nEach read renews the short preview-demand lease of every cell source, the\nsame lease a still poll takes, so a watched wall keeps its sources warm.",
+        "operationId": "wall_geometry",
+        "responses": {
+          "200": {
+            "description": "Wall geometry",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WallGeometry"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Scoped principal",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "No wall configured or not ready",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/preview/wall/moq": {
+      "post": {
+        "tags": [
+          "preview"
+        ],
+        "operationId": "wall_open",
+        "responses": {
+          "201": {
+            "description": "MoQ lease result",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MoqLease"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Forbidden",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "415": {
+            "description": "Unsupported codec",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Unavailable or capacity",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/preview/wall/moq/{lease_id}": {
+      "delete": {
+        "tags": [
+          "preview"
+        ],
+        "operationId": "wall_close",
+        "parameters": [
+          {
+            "name": "generation",
+            "in": "query",
+            "description": "Exact admitted generation",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "format": "int64",
+              "minimum": 0
+            }
+          },
+          {
+            "name": "lease_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "MoQ lease result",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MoqRevoked"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Forbidden",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Unknown lease",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Generation mismatch",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/v1/probes": {
       "get": {
         "tags": [
@@ -23024,6 +23187,67 @@
         },
         "additionalProperties": false
       },
+      "WallCadence": {
+        "type": "object",
+        "description": "Exact wall cadence; never a float frame rate.",
+        "required": [
+          "num",
+          "den"
+        ],
+        "properties": {
+          "den": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Seconds denominator."
+          },
+          "num": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Frames numerator."
+          }
+        }
+      },
+      "WallCell": {
+        "type": "object",
+        "description": "One source's rectangle inside the shared wall picture, in coded pixels.",
+        "required": [
+          "source",
+          "x",
+          "y",
+          "w",
+          "h"
+        ],
+        "properties": {
+          "h": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Height in coded pixels.",
+            "minimum": 0
+          },
+          "source": {
+            "type": "string",
+            "description": "Source (input) id whose newest frame fills this rectangle."
+          },
+          "w": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Width in coded pixels.",
+            "minimum": 0
+          },
+          "x": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Left edge in coded pixels.",
+            "minimum": 0
+          },
+          "y": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Top edge in coded pixels.",
+            "minimum": 0
+          }
+        }
+      },
       "WallClockUseDoc": {
         "type": "string",
         "description": "`OpenAPI` mirror of `multiview_config::WallClockUse` (ADR-0038 verb).",
@@ -23031,6 +23255,55 @@
           "use",
           "discard"
         ]
+      },
+      "WallGeometry": {
+        "type": "object",
+        "description": "`GET /api/v1/preview/wall`: the one shared monitor-wall picture's layout.",
+        "required": [
+          "generation",
+          "width",
+          "height",
+          "cadence",
+          "cells"
+        ],
+        "properties": {
+          "cadence": {
+            "$ref": "#/components/schemas/WallCadence",
+            "description": "Wall frame cadence."
+          },
+          "cells": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/WallCell"
+            },
+            "description": "Source rectangles, sorted by source id."
+          },
+          "generation": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Changes whenever the cell assignment changes.",
+            "minimum": 0
+          },
+          "height": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Coded picture height.",
+            "minimum": 0
+          },
+          "preview_source": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The live Preview-bus source, when a switcher is attached. Filled by the\nroute from the switcher state, never by the engine worker."
+          },
+          "width": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Coded picture width.",
+            "minimum": 0
+          }
+        }
       },
       "WarningCodeDoc": {
         "type": "string",

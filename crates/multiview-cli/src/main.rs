@@ -550,6 +550,25 @@ async fn serve_control_plane(
     if let Some(preview) = switcher_preview {
         provider = provider.with_switcher_preview(preview);
     }
+    // The shared monitor wall (ADR-0103): off unless `MULTIVIEW_MOQ_WALL=1`.
+    // One off-clock worker composes and encodes it once for every viewer.
+    #[cfg(feature = "moq-output")]
+    if let (Some(wall), Some(slot)) = (
+        multiview_cli::monitor_wall::WallConfig::from_env(),
+        moq_slot.clone(),
+    ) {
+        let geometry = multiview_cli::preview::wall_slot();
+        match multiview_cli::monitor_wall::spawn(
+            wall,
+            config.canvas.fps.rational(),
+            provider.stores(),
+            slot,
+            Arc::clone(&geometry),
+        ) {
+            Ok(worker) => provider = provider.with_wall(geometry, Box::new(worker)),
+            Err(error) => tracing::warn!(%error, "monitor wall worker could not start"),
+        }
+    }
     let provider: multiview_control::SharedPreview = Arc::new(provider);
     // The Boot/Loaded/Running model (ADR-W024): Loaded is the immutable boot
     // snapshot; the model backs `GET /api/v1/config/boot-model` and the

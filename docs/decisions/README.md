@@ -286,6 +286,7 @@ Decisions from the 2026-06-13 operator feature-request intake (all **Proposed**)
 - [ADR-0082](ADR-0082.md) — Render-to-VT (bake an HTML graphic to a media asset)
 - [ADR-0083](ADR-0083.md) — URL-as-input SourceKind (headless web page: JS-on-load/event, interval + conditional refresh)
 - [ADR-0102](ADR-0102.md) — Web engine (supervised headless browser host, security boundary, GPU placement, per-job accounting)
+- [ADR-0103](ADR-0103.md) — Shared monitor wall: compose once, encode once, one MoQ stream for Preview and source tiles
 - [ADR-0100](ADR-0100.md) — VT clip jobs (web capture and URL fetch fill media assets; slot storage on Disk or Memory)
 - [ADR-0101](ADR-0101.md) — Web site templates (declarative site definitions, Windy first, operator acceptance of site terms)
 - [ADR-0084](ADR-0084.md) — SIP/SIPS + SRTP stack & seam (inbound call = source, outbound = output/return)

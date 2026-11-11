@@ -492,6 +492,19 @@ impl RegistryFeedFactory {
                 Ok(WhepScope::Output(id.clone()))
             }
             WhepScope::Output(id) => Ok(WhepScope::Output(id.clone())),
+            // The shared monitor wall (ADR-0103) is one registered optional
+            // rendition on its own bus; viewers only subscribe to it.
+            WhepScope::Wall => {
+                let wall = crate::monitor_wall::WALL_OUTPUT_ID;
+                let binding = self
+                    .subscriptions
+                    .resolve(&WhepScope::Output(wall.to_owned()))
+                    .map_err(refusal)?;
+                if binding.bus_id != crate::monitor_wall::WALL_BUS_ID {
+                    return Err(MoqReject::Unavailable);
+                }
+                Ok(WhepScope::Output(wall.to_owned()))
+            }
             _ => Err(MoqReject::Unavailable),
         }
     }
@@ -633,7 +646,7 @@ impl AuthorizedFeedFactory for RegistryFeedFactory {
             .subscriptions
             .resolve(&self.output_scope(scope)?)
             .map_err(refusal)?;
-        if matches!(scope, WhepScope::Program) {
+        if matches!(scope, WhepScope::Program | WhepScope::Wall) {
             // Program intentionally reuses only the explicitly selected output;
             // a family of separate production outputs is never implicit consent.
             return Ok(None);
@@ -838,7 +851,7 @@ impl AuthorizedFeedFactory for RegistryFeedFactory {
             catalog: metadata.catalog.clone(),
             video: metadata.video.clone(),
             audio: metadata.audio.clone(),
-            ladder: if matches!(scope, WhepScope::Program) {
+            ladder: if matches!(scope, WhepScope::Program | WhepScope::Wall) {
                 self.renditions
                     .iter()
                     .filter(|rung| rung.track == binding.output_id)
@@ -1647,6 +1660,50 @@ mod tests {
         assert_eq!(authorized.generation, GENERATION);
         assert_eq!(authorized.ladder.len(), 1);
         assert_eq!(authorized.ladder[0].track, "h264-program");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn wall_scope_attaches_only_the_registered_wall_for_unscoped_principals() {
+        let mut program = binding("restream", 0, GENERATION, 1280, 720);
+        program.program_id = multiview_config::MAIN_PROGRAM.into();
+        program.bus_id = multiview_config::MAIN_PROGRAM.into();
+        let (_registry, subscriptions) =
+            OutputWindowRegistry::new(vec![program.clone()], GENERATION).unwrap();
+        let factory = RegistryFeedFactory::from_subscriptions(subscriptions).unwrap();
+        let (sink, _) = Fence::channel(4);
+        assert!(
+            matches!(
+                factory.attach(&global(), &WhepScope::Wall, sink),
+                Err(MoqReject::Unavailable)
+            ),
+            "no wall registered: never falls back to Program"
+        );
+        let mut wall = binding(
+            crate::monitor_wall::WALL_OUTPUT_ID,
+            1,
+            GENERATION,
+            1280,
+            720,
+        );
+        wall.program_id = multiview_config::MAIN_PROGRAM.into();
+        wall.bus_id = crate::monitor_wall::WALL_BUS_ID.into();
+        let (_registry, subscriptions) =
+            OutputWindowRegistry::new(vec![program, wall], GENERATION).unwrap();
+        let factory = RegistryFeedFactory::from_subscriptions(subscriptions).unwrap();
+        let scoped = operator(Some(vec!["camera-a".into()]), None);
+        let (sink, _) = Fence::channel(4);
+        assert!(matches!(
+            factory.attach(&scoped, &WhepScope::Wall, sink),
+            Err(MoqReject::Forbidden)
+        ));
+        let (sink, _) = Fence::channel(4);
+        assert!(factory
+            .attach_shared(&global(), &WhepScope::Wall, sink.clone())
+            .unwrap()
+            .is_none());
+        let feed = factory.attach(&global(), &WhepScope::Wall, sink).unwrap();
+        assert_eq!(feed.ladder.len(), 1);
+        assert_eq!(feed.ladder[0].track, crate::monitor_wall::WALL_OUTPUT_ID);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
