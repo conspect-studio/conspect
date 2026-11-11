@@ -423,6 +423,272 @@ impl RenditionWorker {
     }
 }
 
+/// The program-audio encode worker's bounded queue depth, in ticks. Larger than
+/// the video queue because an audio job is a few KB and the AAC encoder emits a
+/// frame every ~21 ms, so short bursts are normal.
+pub const AUDIO_WORKER_QUEUE_TICKS: usize = 8;
+
+/// One tick of program audio to encode, owned (the bake consumer has moved on):
+/// the post-loudnorm program block's interleaved samples and, per selected
+/// discrete track, that source's interleaved block (or `None` = silence).
+/// `frames` is the tick's exact sample budget, shared by every stream so each
+/// stream's sample counter (its PTS) stays locked to the tick counter.
+#[derive(Debug, Clone)]
+pub struct AudioJob {
+    /// The output tick this audio belongs to.
+    pub tick: u64,
+    /// Samples per channel in this tick.
+    pub frames: usize,
+    /// Interleaved post-loudnorm program samples.
+    pub program: Vec<f32>,
+    /// Per selected discrete track: interleaved samples, or `None` for silence.
+    pub tracks: Vec<Option<Vec<f32>>>,
+}
+
+/// The encode side of the audio worker: encode one job's streams, flush at EOF.
+/// Production wraps `AudioRenditionEncoder`; tests use a fake.
+pub trait AudioEncodeWork: Send + 'static {
+    /// Encode the program and every track of `job`, in that order.
+    ///
+    /// # Errors
+    /// A concrete encoder failure.
+    fn encode(&mut self, job: &AudioJob) -> Result<Vec<EncodedPacket>, PipelineError>;
+
+    /// Flush every stream. Called once on the worker thread at end of run.
+    ///
+    /// # Errors
+    /// A concrete encoder flush failure.
+    fn finish(&mut self) -> Result<Vec<EncodedPacket>, PipelineError>;
+}
+
+/// The program-audio encode worker (design note
+/// `docs/architecture/audio-encode-worker.md`): AAC-encodes program + discrete
+/// tracks OFF the bake consumer, strictly in tick order, and hands each tick's
+/// packets to `on_packets(tick, packets)` (which builds and sends the dispatch
+/// event). At EOF it flushes and calls `on_finish(tail)`.
+pub struct AudioEncodeWorker {
+    input: SyncSender<AudioJob>,
+    thread: JoinHandle<Result<(), PipelineError>>,
+}
+
+impl AudioEncodeWorker {
+    /// Spawn the worker thread.
+    ///
+    /// # Errors
+    /// Returns [`PipelineError::Output`] if the thread cannot be spawned.
+    pub fn spawn(
+        mut work: impl AudioEncodeWork,
+        mut on_packets: impl FnMut(u64, Vec<EncodedPacket>) -> Result<(), PipelineError>
+            + Send
+            + 'static,
+        on_finish: impl FnOnce(Vec<EncodedPacket>) -> Result<(), PipelineError> + Send + 'static,
+    ) -> Result<Self, PipelineError> {
+        let (input, receiver) = mpsc::sync_channel::<AudioJob>(AUDIO_WORKER_QUEUE_TICKS);
+        let thread = thread::Builder::new()
+            .name("multiview-audio-encode".to_owned())
+            .spawn(move || {
+                while let Ok(job) = receiver.recv() {
+                    let packets = work.encode(&job)?;
+                    on_packets(job.tick, packets)?;
+                }
+                let tail = work.finish()?;
+                on_finish(tail)
+            })
+            .map_err(|err| PipelineError::Output {
+                kind: "audio-worker",
+                reason: err.to_string(),
+            })?;
+        Ok(Self { input, thread })
+    }
+
+    /// Offer one tick's audio, waiting up to `bound` for a queue slot — the
+    /// same cadence-derived horizon as the video workers. Audio cannot be shed
+    /// (a missing block would break the PTS-from-tick lock), so a worker that
+    /// cannot drain within the horizon fails the run explicitly; it never
+    /// waits without bound (invariants #1/#10).
+    ///
+    /// # Errors
+    /// [`OfferRejection::Overloaded`] when the bound elapsed, or
+    /// [`OfferRejection::Ended`] when the worker ended (its error surfaces at
+    /// [`join`](Self::join)).
+    pub fn offer_within(
+        &self,
+        mut job: AudioJob,
+        bound: std::time::Duration,
+    ) -> Result<(), OfferRejection> {
+        let deadline = std::time::Instant::now() + bound;
+        loop {
+            match self.input.try_send(job) {
+                Ok(()) => return Ok(()),
+                Err(TrySendError::Full(returned)) => {
+                    job = returned;
+                    if std::time::Instant::now() >= deadline {
+                        return Err(OfferRejection::Overloaded);
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+                Err(TrySendError::Disconnected(_)) => return Err(OfferRejection::Ended),
+            }
+        }
+    }
+
+    /// Close the input, wait for the flush and the terminal callback, and
+    /// surface the worker's error.
+    ///
+    /// # Errors
+    /// The encoder's failure, or an error if the worker panicked.
+    pub fn join(self) -> Result<(), PipelineError> {
+        drop(self.input);
+        self.thread.join().map_err(|_| PipelineError::Output {
+            kind: "audio-worker",
+            reason: "audio encode worker panicked".to_owned(),
+        })?
+    }
+}
+
+#[cfg(test)]
+mod audio_worker_tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
+    use super::{AudioEncodeWork, AudioEncodeWorker, AudioJob, OfferRejection};
+    use crate::pipeline::PipelineError;
+    use multiview_ffmpeg::EncodedPacket;
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+
+    /// Records the (tick, frames, track count) of every job in arrival order.
+    struct Recorder {
+        seen: Arc<Mutex<Vec<(u64, usize, usize)>>>,
+        current: u64,
+        stall: Option<Arc<std::sync::Barrier>>,
+    }
+    impl AudioEncodeWork for Recorder {
+        fn encode(&mut self, job: &AudioJob) -> Result<Vec<EncodedPacket>, PipelineError> {
+            if let Some(b) = self.stall.take() {
+                b.wait();
+            }
+            self.current = job.tick;
+            self.seen
+                .lock()
+                .unwrap()
+                .push((job.tick, job.frames, job.tracks.len()));
+            Ok(Vec::new())
+        }
+        fn finish(&mut self) -> Result<Vec<EncodedPacket>, PipelineError> {
+            self.seen.lock().unwrap().push((u64::MAX, 0, 0));
+            Ok(Vec::new())
+        }
+    }
+
+    fn job(tick: u64) -> AudioJob {
+        AudioJob {
+            tick,
+            frames: 1602,
+            program: vec![0.0; 1602 * 2],
+            tracks: vec![Some(vec![0.0; 1602 * 2]), None],
+        }
+    }
+
+    #[test]
+    fn jobs_encode_strictly_in_tick_order_then_flush_once() {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let dispatched = Arc::new(Mutex::new(Vec::new()));
+        let d = Arc::clone(&dispatched);
+        let finished = Arc::new(Mutex::new(false));
+        let f = Arc::clone(&finished);
+        let worker = AudioEncodeWorker::spawn(
+            Recorder {
+                seen: Arc::clone(&seen),
+                current: 0,
+                stall: None,
+            },
+            move |tick, _| {
+                d.lock().unwrap().push(tick);
+                Ok(())
+            },
+            move |_| {
+                *f.lock().unwrap() = true;
+                Ok(())
+            },
+        )
+        .unwrap();
+        for tick in 0..100 {
+            worker
+                .offer_within(job(tick), Duration::from_secs(5))
+                .unwrap();
+        }
+        worker.join().unwrap();
+        let seen = seen.lock().unwrap().clone();
+        assert_eq!(seen.len(), 101, "100 jobs then one flush");
+        for (i, (tick, frames, tracks)) in seen.iter().take(100).enumerate() {
+            assert_eq!(*tick, u64::try_from(i).unwrap(), "strict tick order");
+            assert_eq!((*frames, *tracks), (1602, 2));
+        }
+        assert_eq!(seen.last().unwrap().0, u64::MAX, "flush comes last");
+        assert_eq!(*dispatched.lock().unwrap(), (0..100).collect::<Vec<_>>());
+        assert!(*finished.lock().unwrap(), "terminal callback ran");
+    }
+
+    #[test]
+    fn a_wedged_worker_fails_the_offer_within_the_bound_never_waits_forever() {
+        let gate = Arc::new(std::sync::Barrier::new(2));
+        let worker = AudioEncodeWorker::spawn(
+            Recorder {
+                seen: Arc::new(Mutex::new(Vec::new())),
+                current: 0,
+                stall: Some(Arc::clone(&gate)),
+            },
+            |_, _| Ok(()),
+            |_| Ok(()),
+        )
+        .unwrap();
+        // The worker takes job 0 and wedges; the queue fills behind it.
+        let mut outcome = Ok(());
+        let started = std::time::Instant::now();
+        for tick in 0..=u64::try_from(super::AUDIO_WORKER_QUEUE_TICKS).unwrap() + 1 {
+            outcome = worker.offer_within(job(tick), Duration::from_millis(50));
+            if outcome.is_err() {
+                break;
+            }
+        }
+        assert_eq!(outcome, Err(OfferRejection::Overloaded));
+        assert!(started.elapsed() < Duration::from_secs(2), "bounded wait");
+        gate.wait(); // release the worker so it can drain and exit
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn an_encoder_error_surfaces_at_join_and_ends_further_offers() {
+        struct Failing;
+        impl AudioEncodeWork for Failing {
+            fn encode(&mut self, _: &AudioJob) -> Result<Vec<EncodedPacket>, PipelineError> {
+                Err(PipelineError::Output {
+                    kind: "encode-audio",
+                    reason: "boom".to_owned(),
+                })
+            }
+            fn finish(&mut self) -> Result<Vec<EncodedPacket>, PipelineError> {
+                Ok(Vec::new())
+            }
+        }
+        let worker = AudioEncodeWorker::spawn(Failing, |_, _| Ok(()), |_| Ok(())).unwrap();
+        worker.offer_within(job(0), Duration::from_secs(1)).unwrap();
+        // The thread exits on the error; later offers see Ended (or fill-then-Ended).
+        let mut ended = false;
+        for tick in 1..50 {
+            if worker.offer_within(job(tick), Duration::from_millis(20))
+                == Err(OfferRejection::Ended)
+            {
+                ended = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(ended, "a dead worker reports Ended");
+        assert!(worker.join().is_err(), "the encoder error surfaces at join");
+    }
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]

@@ -101,7 +101,9 @@ enum Input {
     Audio(DispatchEvent),
 }
 /// Nonblocking production-facing handle. Encoder startup never runs on the
-/// production consumer, including first-frame metadata discovery.
+/// production consumer, including first-frame metadata discovery. Cloneable:
+/// the program-audio encode worker holds its own handle (same channel).
+#[derive(Clone)]
 pub(crate) struct PreviewIngress {
     tx: SyncSender<Input>,
     alive: Arc<AtomicBool>,
