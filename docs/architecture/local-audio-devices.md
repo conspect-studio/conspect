@@ -67,9 +67,10 @@ device callback ──push──▶ [SPSC ring, ~200 ms] ──pop──▶ pump
     re-primes from fresh callback frames.
   - If `unread_frames` exceeds target + 100 ms (for example, the program bus paused reading), the
     pump discards incoming frames until unread is back at the target, then resets the servo.
-  - Already-published audio is handled by the consumer: the store gets a `max_lag` (target +
-    100 ms) for this source kind. On `read`, if `head − cursor` exceeds it (the program bus paused or
-    stopped reading), the reader itself skips its cursor to `head − prebuffer` before reading. This
+  - Already-published audio is handled by the consumer: the store gets a `max_lag` of target +
+    15 ms for this source kind. On `read`, if `head − cursor` exceeds it (the program bus paused or
+    stopped reading, even briefly), the reader itself skips its cursor to `head − target` before
+    reading. (The servo keeps normal lag within ±10 ms of the target, below this bound.) This
     is the existing consumer-owned re-sync logic in `AudioStore::read`, extended with one bound; it
     stays wait-free and only the consumer moves the cursor.
   - Discarded frames are counted (`stale_discard_frames`, `consumer_skip_frames`).
@@ -124,13 +125,18 @@ program bus ──push (wait-free)──▶ [engine→drain SPSC ring, ~200 ms] 
 - **Callback:** pop up to the requested frames in `CHUNK`-sized pieces, convert to the device
   format, and fill any shortfall with silence. It counts `underrun_frames` and stores a monotonic
   heartbeat (callback count) in an atomic.
-- **Short callback stalls.** The device ring's read side belongs to the callback, so the drain
-  cannot clear it. Instead the drain watches the heartbeat: if it has not advanced for 50 ms
-  (about five normal callback periods), the drain increments an atomic `flush_epoch`, discards the
-  engine→drain backlog and re-primes. The callback, when it sees a new `flush_epoch`, skips all
-  frames in its ring (consumer-side skip, wait-free) before it plays the next fresh frames.
-  Test: callback stalls of 50 ms to 2 s with a tick-stamped signal; the first frame played after
-  each is from current program time.
+- **Freshness in the callback.** The device ring's read side belongs to the callback, so the
+  callback itself rejects old audio, without waiting for the drain:
+  - The drain writes each chunk into the device ring with a header: the monotonic time it was
+    written (an integer from `Instant`, taken on the drain thread) and the current `flush_epoch`.
+  - The callback reads the monotonic clock once per call (a vDSO / `mach_absolute_time` read, no
+    syscall or lock) and skips every chunk older than the device-ring target + 30 ms, or from an
+    older `flush_epoch`, before it plays. Skipped frames are counted.
+  - The drain increments `flush_epoch` on every re-anchor (engine drop, drain stall, heartbeat gap
+    of 50 ms), so a drain-side re-anchor also invalidates what is already in the device ring.
+  - Test: both interleavings (callback resumes before the drain notices; drain stalls while the
+    callback runs) with a tick-stamped signal; the first frame played after each stall of 50 ms to
+    2 s is from current program time within target + 30 ms.
 - **Distinct states,** each with its own transition:
   - *underrun* (callback found the ring short): counted; the servo re-anchors; no reopen.
   - *ring full* (device not consuming but heartbeat advancing): normal, the drain waits.
@@ -188,8 +194,14 @@ program bus ──push (wait-free)──▶ [engine→drain SPSC ring, ~200 ms] 
   - `PermissionDenied`: the latched `permission_denied` state; close, retry on the slow cadence
     (section 5).
   - `RealtimeDenied`: log once; the stream keeps running at normal priority.
-  - `DeviceNotAvailable`, `StreamInvalidated`, `DeviceBusy`, `BackendError`, `Other` and any
-    other kind: *lost*; close and reopen with backoff. Stalled/lost detection is in sections 2 and 3. Reopen uses capped exponential backoff
+  - `InvalidInput`, `UnsupportedConfig`, `UnsupportedOperation`, `Other` (cpal documents `Other`
+    as permanent): the latched `config_error` state with the message; no automatic reopen. A config
+    reload or a device change event (hot-plug, default change) clears it and allows one new
+    attempt.
+  - `DeviceNotAvailable`, `StreamInvalidated`, `DeviceBusy`, `ResourceExhausted`,
+    `HostUnavailable`, `BackendError`: *lost*; close and reopen with backoff.
+  - The same mapping applies to errors returned by device lookup and stream build/play, not only
+    to the stream's error callback. Stalled/lost detection is in sections 2 and 3. Reopen uses capped exponential backoff
   (250 ms → 10 s).
 - Every warning is latched (logged once per state change), never per poll.
 
