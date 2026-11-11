@@ -108,6 +108,17 @@ fn malformed_device_options_are_rejected_at_config_time() {
 }
 
 #[test]
+fn the_rational_fps_bound_is_inclusive() {
+    let toml = config_with(
+        "id = \"cam\"\nkind = \"device\"\nbackend = \"avfoundation\"\ndevice = \"0\"\nfps = \"1000/1\"",
+    );
+    MultiviewConfig::load_from_toml(&toml)
+        .expect("parses")
+        .validate()
+        .expect("1000/1 is at the bound and valid");
+}
+
+#[test]
 fn backends_lower_to_their_libavdevice_format_and_device_string() {
     assert_eq!(DeviceBackend::Avfoundation.input_format(), "avfoundation");
     assert_eq!(DeviceBackend::Avfoundation.device_url("0"), "0:none");

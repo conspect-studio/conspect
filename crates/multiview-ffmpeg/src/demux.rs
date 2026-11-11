@@ -202,8 +202,10 @@ pub fn open_device_input(
 ) -> Result<ffmpeg::format::context::Input> {
     // libav keeps the interrupt callback's opaque pointer for the context's
     // whole life, so it must outlive the returned Input: a single process-wide
-    // deadline that is never armed (the `rw_timeout` device option bounds the
-    // open; the caller owns read supervision).
+    // deadline that is never armed. Device demuxers (AVFMT_NOFILE) ignore both
+    // `rw_timeout` and the callback during open, so the open is unbounded in
+    // libav: the CALLER must bound it (the pipeline runs it on a helper thread
+    // with a deadline) and owns read supervision.
     static NEVER_ARMED: std::sync::OnceLock<ReadDeadline> = std::sync::OnceLock::new();
     ensure_initialized()?;
     ensure_devices_registered();
@@ -452,9 +454,10 @@ impl Demuxer {
     /// (`avfoundation` on macOS, `dshow` on Windows): `device` is the device
     /// string that format expects (e.g. `"0"` or `"0:none"` for avfoundation,
     /// `"video=Name"` for dshow), and `options` are the device's open options
-    /// (`video_size`, `framerate`, `pixel_format`). The open is bounded by the
-    /// same interrupt deadline as network inputs (`options.rw_timeout`), because
-    /// a permission prompt or a busy device can block indefinitely.
+    /// (`video_size`, `framerate`, `pixel_format`). The open itself is NOT
+    /// bounded inside libav (device demuxers ignore `rw_timeout` and the
+    /// interrupt callback during open), so callers that must not block run it
+    /// under their own deadline; `options.rw_timeout` arms per-read deadlines.
     ///
     /// # Errors
     /// * [`FfmpegError::Init`] — global libav init failed.

@@ -54,8 +54,10 @@ A `device` source opens this host's cameras and capture cards — the same trust
 source reading a host path, and more sensitive (people in the room). The control API therefore
 **refuses** `kind = "device"`: device sources are configured in the config file only, by whoever
 already controls the host. Validation also refuses avfoundation's non-camera selectors — `none`
-("no video device") and `Capture screen N` (screen capture, gated by a separate OS grant) — so a
-device source can only ever name a camera or capture card. "Device" here means a *local capture
+("no video device") and `Capture screen N` (screen capture, gated by a separate OS grant). Caveat:
+avfoundation's numeric index range continues past the cameras into the screens, so an index beyond
+the camera count still selects a screen; that is a config-file author's choice, still gated by the
+OS Screen Recording grant. Prefer exact device names. "Device" here means a *local capture
 device*; it is unrelated to the control plane's tally/sync/NMOS **device** resources.
 
 ## Open is truly bounded

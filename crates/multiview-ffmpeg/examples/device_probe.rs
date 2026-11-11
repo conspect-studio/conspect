@@ -23,6 +23,7 @@ fn main() {
     let mut demux = match Demuxer::open_device(
         &format,
         &device,
+        // Per-read deadline only; the open itself is not bounded by libav.
         DemuxOptions::new().with_rw_timeout(Duration::from_secs(5)),
         &opts,
     ) {
