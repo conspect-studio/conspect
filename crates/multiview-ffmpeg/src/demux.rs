@@ -466,7 +466,7 @@ impl Demuxer {
     pub fn open_device(
         input_format: &str,
         device: &str,
-        options: DemuxOptions,
+        options: &DemuxOptions,
         device_options: &[(String, String)],
     ) -> Result<Self> {
         ensure_initialized()?;
