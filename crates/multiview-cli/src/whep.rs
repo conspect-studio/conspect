@@ -69,6 +69,66 @@ const DRIVER_TICK: Duration = Duration::from_millis(20);
 /// `webrtc.preview_session_timeout`).
 const DEFAULT_SILENCE_TIMEOUT: Duration = Duration::from_secs(8);
 
+/// The mutable encode state behind [`PreviewVideoEncoder`]'s mutex.
+#[derive(Default)]
+struct PreviewEncodeState {
+    encoder: Option<VideoEncoder>,
+    /// The size `encoder` was opened at.
+    encoder_dims: (u32, u32),
+    fitter: FrameFitter,
+}
+
+/// Fits a native-size NV12 frame to the encoder's size (whole frame, no crop).
+///
+/// * At or under the cap (`image` already at `dst`) no scaler exists and the frame
+///   is only repackaged — the common small-canvas case pays nothing for scaling.
+/// * Otherwise one libswscale NV12→NV12 context is built per source geometry and
+///   reused across frames; it is rebuilt only when the source or target geometry
+///   changes (e.g. a layout change). Bilinear (not Lanczos, the wrapper default)
+///   because this runs per viewer per tick on a shared box: it is a cheap two-tap
+///   filter that still averages the 1.5–3× downscale (unlike point sampling or
+///   fast-bilinear's aliasing), which is plenty for a ≤1.5 Mbit/s monitor.
+/// * Colour is passed through untouched: source and destination are both NV12 with
+///   libswscale's default (identical) range on both sides, so no range/matrix
+///   conversion is implied and no RGB round trip happens.
+///
+/// A scaler fault yields `None` (best-effort preview), never a panic.
+#[derive(Default)]
+struct FrameFitter {
+    scaler: Option<multiview_ffmpeg::Scaler>,
+}
+
+impl FrameFitter {
+    fn fit(
+        &mut self,
+        image: &Nv12Image,
+        dst: (u32, u32),
+    ) -> Option<ffmpeg_next::util::frame::Video> {
+        use ffmpeg_next::format::Pixel;
+        use multiview_ffmpeg::ScaleSpec;
+        let video = nv12_to_video(image).ok()?;
+        if (image.width(), image.height()) == dst {
+            self.scaler = None;
+            return Some(video);
+        }
+        let src = ScaleSpec::new(Pixel::NV12, image.width(), image.height());
+        let want = ScaleSpec::new(Pixel::NV12, dst.0, dst.1);
+        let stale = self
+            .scaler
+            .as_ref()
+            .is_none_or(|s| s.source() != src || s.destination() != want);
+        if stale {
+            self.scaler = multiview_ffmpeg::Scaler::with_flags(
+                src,
+                want,
+                ffmpeg_next::software::scaling::Flags::BILINEAR,
+            )
+            .ok();
+        }
+        self.scaler.as_mut()?.run(&video).ok()
+    }
+}
+
 /// A real preview video encoder (H.264 preferred, VP8 fallback) behind a mutex so
 /// the `&self` `PreviewMediaSource` pump can drive its `&mut`-only libav context.
 ///
@@ -76,8 +136,7 @@ const DEFAULT_SILENCE_TIMEOUT: Duration = Duration::from_secs(8);
 /// the preview longest-edge cap and re-stamped on the 90 kHz RTP clock.
 struct PreviewVideoEncoder {
     codec: PreviewCodec,
-    /// The open encoder and the frame size it was opened for.
-    inner: Mutex<Option<(VideoEncoder, (u32, u32))>>,
+    inner: Mutex<PreviewEncodeState>,
     /// The next 90 kHz RTP timestamp to stamp (monotonic; one step per frame).
     rtp_ts: AtomicU32,
     /// Whether the first emitted access unit (the keyframe) has been produced.
@@ -88,7 +147,7 @@ impl PreviewVideoEncoder {
     fn new(codec: PreviewCodec) -> Self {
         Self {
             codec,
-            inner: Mutex::new(None),
+            inner: Mutex::new(PreviewEncodeState::default()),
             rtp_ts: AtomicU32::new(0),
             first_done: AtomicBool::new(false),
         }
@@ -122,22 +181,30 @@ impl PreviewVideoEncoder {
     }
 
     /// Encode one NV12 frame into an [`EncodedSample`] (or `None` if the encoder
-    /// buffered it). The frame is fed at its native size; the encoder's configured
-    /// output size handles the scale. A source's frames change size when its
-    /// decode follows a layout change, and a libav encoder cannot take a frame
-    /// of another size, so that reopens the encoder (which starts on a keyframe).
-    /// Best-effort: an encode fault yields `None` (preview never propagates a
-    /// failure).
+    /// buffered it). libav encoders do **not** scale: the frame handed to the
+    /// encoder must already be at the encoder's configured size, so a frame larger
+    /// than the preview cap is first scaled (whole frame, aspect preserved) to
+    /// [`Self::target_dims`] by [`FrameFitter`]. Best-effort: an open, scale or
+    /// encode fault yields `None` (preview never propagates a failure).
+    ///
+    /// Runs on the `whep-encode-pump` thread (`spawn_encode_pump` →
+    /// `SlotMediaSource::pump_once`), once per viewer per preview tick — never on
+    /// the output-clock/frame thread.
     fn encode(&self, image: &Nv12Image) -> Option<EncodedSample> {
         let Ok(mut guard) = self.inner.lock() else {
             return None;
         };
-        let size = (image.width(), image.height());
-        if guard.as_ref().is_none_or(|(_, opened)| *opened != size) {
-            *guard = self.open(image).map(|encoder| (encoder, size));
+        let state = &mut *guard;
+        let dims = self.target_dims(image);
+        if state.encoder.is_none() || state.encoder_dims != dims {
+            // First frame, or the layout changed to a different capped size:
+            // reopen at the new size (the new stream starts with a keyframe).
+            state.encoder = self.open(dims);
+            state.encoder_dims = dims;
+            self.first_done.store(false, Ordering::Release);
         }
-        let (encoder, _) = guard.as_mut()?;
-        let video = nv12_to_video(image).ok()?;
+        let video = state.fitter.fit(image, dims)?;
+        let encoder = state.encoder.as_mut()?;
         encoder.send_frame(&video).ok()?;
         let packet = encoder.receive_packet().ok()??;
         let data = packet.data()?;
@@ -154,10 +221,9 @@ impl PreviewVideoEncoder {
     /// Open the libav encoder for `image`'s (scaled) geometry with the fixed
     /// low-latency preview profile (zerolatency, B-frames off, repeat-headers,
     /// 2 s GOP — ADR-P006), choosing a runtime-resolved encoder.
-    fn open(&self, image: &Nv12Image) -> Option<VideoEncoder> {
+    fn open(&self, (w, h): (u32, u32)) -> Option<VideoEncoder> {
         use ffmpeg_next::format::Pixel;
         use multiview_core::time::Rational;
-        let (w, h) = self.target_dims(image);
         // The preview cadence as an exact rational (invariant #3: never float fps).
         let fps = Rational::new(i64::from(PREVIEW_FPS), 1);
         let (encoder_name, options) = match self.codec {
@@ -1070,6 +1136,7 @@ mod tests {
     use multiview_webrtc::whep_egress::WhepEgress;
 
     use super::pump_turn_relays;
+    use multiview_ffmpeg::codec::VideoCodec;
 
     /// A source's frames change size when its decode follows a layout change. A
     /// live preview must reopen on the new size, not feed a stale encoder.
@@ -1084,12 +1151,8 @@ mod tests {
         let frame =
             |w, h| Nv12Image::solid(w, h, 16, 128, 128, ColorInfo::default()).expect("nv12");
         let opened = || {
-            encoder
-                .inner
-                .lock()
-                .expect("encoder lock")
-                .as_ref()
-                .map(|(_, size)| *size)
+            let state = encoder.inner.lock().expect("encoder lock");
+            state.encoder.as_ref().map(|_| state.encoder_dims)
         };
         let _first = encoder.encode(&frame(64, 48));
         if opened().is_none() {
@@ -1131,6 +1194,166 @@ mod tests {
             super::PreviewVideoEncoder::bounded_dims(1080, 1920, true),
             (720, 1280)
         );
+    }
+
+    /// A synthetic NV12 frame with four visibly different quadrants
+    /// (TL/TR/BL/BR luma 40/100/160/220, distinct chroma).
+    fn quadrant_image(w: u32, h: u32) -> multiview_compositor::pipeline::Nv12Image {
+        let (wu, hu) = (usize::try_from(w).unwrap(), usize::try_from(h).unwrap());
+        let luma = [[40u8, 100], [160, 220]];
+        let chroma = [[(90u8, 100u8), (110, 120)], [(130, 140), (150, 160)]];
+        let mut y = vec![0u8; wu * hu];
+        for r in 0..hu {
+            for c in 0..wu {
+                y[r * wu + c] = luma[usize::from(r >= hu / 2)][usize::from(c >= wu / 2)];
+            }
+        }
+        let mut uv = vec![0u8; wu * hu / 2];
+        for r in 0..hu / 2 {
+            for c in 0..wu / 2 {
+                let (cb, cr) = chroma[usize::from(r >= hu / 4)][usize::from(c >= wu / 4)];
+                uv[r * wu + 2 * c] = cb;
+                uv[r * wu + 2 * c + 1] = cr;
+            }
+        }
+        multiview_compositor::pipeline::Nv12Image::new(
+            w,
+            h,
+            y,
+            uv,
+            multiview_core::color::ColorInfo::default(),
+        )
+        .unwrap()
+    }
+
+    fn luma_at(frame: &ffmpeg_next::util::frame::Video, x: usize, y: usize) -> u8 {
+        frame.data(0)[y * frame.stride(0) + x]
+    }
+
+    fn assert_quadrants(frame: &ffmpeg_next::util::frame::Video, tol: u8) {
+        let (w, h) = (
+            usize::try_from(frame.width()).unwrap(),
+            usize::try_from(frame.height()).unwrap(),
+        );
+        for (x, y, want) in [
+            (w / 4, h / 4, 40u8),
+            (3 * w / 4, h / 4, 100),
+            (w / 4, 3 * h / 4, 160),
+            (3 * w / 4, 3 * h / 4, 220),
+        ] {
+            let got = luma_at(frame, x, y);
+            assert!(
+                got.abs_diff(want) <= tol,
+                "quadrant at ({x},{y}) of {w}x{h}: luma {got}, want {want}"
+            );
+        }
+    }
+
+    #[test]
+    fn oversize_frame_is_scaled_whole_not_cropped() {
+        let image = quadrant_image(1920, 1080);
+        let dims = super::PreviewVideoEncoder::bounded_dims(1920, 1080, true);
+        assert_eq!(dims, (1280, 720));
+        let mut fitter = super::FrameFitter::default();
+        let frame = fitter.fit(&image, dims).expect("scaled frame");
+        assert_eq!((frame.width(), frame.height()), (1280, 720));
+        assert_eq!(frame.format(), ffmpeg_next::format::Pixel::NV12);
+        assert_quadrants(&frame, 3);
+    }
+
+    #[test]
+    fn scaling_passes_range_through_unconverted() {
+        // A range/matrix conversion would move 0 and 255 (limited<->full) and
+        // shift mid grey; a pass-through scale of flat planes preserves them.
+        for (y, c) in [(0u8, 128u8), (16, 128), (128, 128), (235, 128), (255, 128)] {
+            let image = multiview_compositor::pipeline::Nv12Image::solid(
+                1920,
+                1080,
+                y,
+                c,
+                c,
+                multiview_core::color::ColorInfo::default(),
+            )
+            .unwrap();
+            let mut fitter = super::FrameFitter::default();
+            let frame = fitter.fit(&image, (1280, 720)).unwrap();
+            assert_eq!(luma_at(&frame, 640, 360), y, "luma {y} must survive");
+            assert_eq!(
+                frame.data(1)[(180) * frame.stride(1) + 640],
+                c,
+                "chroma {c}"
+            );
+        }
+    }
+
+    #[test]
+    fn frame_at_or_under_cap_is_passed_through_without_a_scaler() {
+        let image = quadrant_image(1280, 720);
+        let mut fitter = super::FrameFitter::default();
+        let frame = fitter.fit(&image, (1280, 720)).unwrap();
+        assert!(fitter.scaler.is_none(), "no scaler for an in-cap frame");
+        assert_eq!((frame.width(), frame.height()), (1280, 720));
+        assert_quadrants(&frame, 0);
+        let small = quadrant_image(640, 360);
+        let frame = fitter.fit(&small, (640, 360)).unwrap();
+        assert!(fitter.scaler.is_none());
+        assert_eq!((frame.width(), frame.height()), (640, 360));
+    }
+
+    #[test]
+    fn geometry_changes_rebuild_or_drop_the_scaler_without_panic() {
+        let mut fitter = super::FrameFitter::default();
+        for (w, h) in [(1920u32, 1080u32), (1280, 720), (3840, 2160), (1920, 1080)] {
+            let dims = super::PreviewVideoEncoder::bounded_dims(w, h, true);
+            let frame = fitter.fit(&quadrant_image(w, h), dims).unwrap();
+            assert_eq!((frame.width(), frame.height()), dims);
+            assert_eq!(dims, (1280, 720));
+            assert_quadrants(&frame, 3);
+            assert_eq!(fitter.scaler.is_some(), (w, h) != dims);
+        }
+    }
+
+    #[test]
+    fn oversize_frame_encodes_to_a_decodable_whole_frame() {
+        use multiview_ffmpeg::H264PacketDecoder;
+        if !multiview_ffmpeg::codec::can_encode(VideoCodec::H264) {
+            return;
+        }
+        let enc = super::PreviewVideoEncoder::new(PreviewCodec::H264);
+        let image = quadrant_image(1920, 1080);
+        let sample = enc
+            .encode(&image)
+            .expect("first frame yields a keyframe AU");
+        assert!(sample.keyframe);
+        let mut dec = H264PacketDecoder::new(multiview_core::time::Rational::new(1, 90_000))
+            .expect("h264 decoder");
+        dec.push(&sample.data, Some(0)).unwrap();
+        dec.send_eof().unwrap();
+        let decoded = dec.receive_frame().unwrap().expect("decoded frame");
+        assert_eq!((decoded.frame.width(), decoded.frame.height()), (1280, 720));
+        assert_quadrants(&decoded.frame, 12);
+    }
+
+    #[test]
+    fn encoder_reopens_when_the_layout_size_changes() {
+        if !multiview_ffmpeg::codec::can_encode(VideoCodec::H264) {
+            return;
+        }
+        let enc = super::PreviewVideoEncoder::new(PreviewCodec::H264);
+        let mut last_ts = None;
+        for (w, h, dims) in [
+            (1920u32, 1080u32, (1280u32, 720u32)),
+            (1080, 1920, (720, 1280)),
+            (1920, 1080, (1280, 720)),
+        ] {
+            let sample = enc.encode(&quadrant_image(w, h)).expect("sample");
+            assert!(sample.keyframe, "{w}x{h} reopen starts with a keyframe");
+            assert_eq!(super::PreviewVideoEncoder::bounded_dims(w, h, true), dims);
+            if let Some(prev) = last_ts {
+                assert!(sample.rtp_timestamp > prev, "rtp timestamp monotonic");
+            }
+            last_ts = Some(sample.rtp_timestamp);
+        }
     }
 
     #[test]

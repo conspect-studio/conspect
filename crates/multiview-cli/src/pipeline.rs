@@ -11475,6 +11475,8 @@ fn build_rist_push(
     let sink = PacketMuxSink::push(PushProtocol::Rist, lowered).with_output_metadata(meta, matrix);
     Ok(RunnableOutput::Push {
         id: output.id(),
+        // Link state for the never-block fan-out and the status snapshot, like
+        // every other push output. Built from the credential-free URL only.
         link: push_link_for("rist", &sink, &redacted),
         sink,
         label: "rist",
@@ -19658,6 +19660,23 @@ buffer_ms = 700
             .filter(|r| matches!(r, RunnableOutput::Push { label, .. } if *label == "rist"))
             .count();
         assert_eq!(push_count, 1, "exactly one rist push runnable is built");
+        // The rist push carries live link state like every other push output:
+        // the consumer's never-block fan-out and the status API both read it.
+        let link = built
+            .packet
+            .iter()
+            .find_map(|r| match r {
+                RunnableOutput::Push { label, link, .. } if *label == "rist" => Some(link),
+                _ => None,
+            })
+            .expect("the rist push runnable carries a link");
+        let snapshot = link.snapshot();
+        assert_eq!(snapshot.transport, "rist");
+        assert_eq!(
+            snapshot.mode, "caller",
+            "a rist:// push is not an SRT listener"
+        );
+        assert_eq!(snapshot.clients, 0);
     }
 }
 
