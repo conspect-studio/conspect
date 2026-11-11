@@ -65,22 +65,25 @@ device callback ──push──▶ [SPSC ring, ~200 ms] ──pop──▶ pump
   - If its own wake-up gap exceeds 50 ms, or the ring's overflow counter moved, everything in the
     ring is stale: the pump pops and discards it, resets the servo and resampler phase, and
     re-primes from fresh callback frames.
-  - If `unread_frames` exceeds target + 100 ms (for example, the program bus paused reading), the
-    pump discards incoming frames until unread is back at the target, then resets the servo.
-  - Already-published audio is handled by the consumer. Unread fill normally swings by one tick
-    quantum (40 ms at 25 fps) around the target, so the bound is applied to the lag **left after
-    this read**: if `head − cursor − frames` exceeds the target + 20 ms (the program bus paused or
-    stopped reading, even briefly), the reader itself skips its cursor so that exactly the target
-    remains after the read. In steady playback the remaining lag is about target − quantum/2 ± the
-    servo's 10 ms, always below the bound, so routine reads never skip.
+  - If `unread_frames` exceeds target + Q + 20 ms (Q is the run's tick quantum, for example
+    40 ms at 25 fps; the program bus paused reading), the pump discards incoming frames until
+    unread is back at the target, then resets the servo. This threshold sits just above the
+    steady sawtooth peak, so there is no dead zone left for the slow servo to drain.
+  - Already-published audio is handled by the consumer, **before** it copies the block. Unread
+    fill normally peaks at about target + Q/2 + 10 ms just before a read. If the pre-read lag
+    `head − cursor` exceeds target + Q/2 + 20 ms (the program bus paused or stopped reading, even
+    briefly), the reader first moves its cursor to `head − target − Q/2` and then reads, so the
+    block it returns starts at that point.
+  - Freshness bound this gives: the oldest sample in any returned block is at most
+    target + Q/2 + 20 ms old (≈120 ms at 25 fps, ≈108 ms at 60 fps). Routine reads never skip.
   - Test: continuous playback at 23.976, 25, 29.97, 50 and 60 fps for 10 simulated minutes with
     ±300 ppm drift gives zero consumer skips. This
     is the existing consumer-owned re-sync logic in `AudioStore::read`, extended with one bound; it
     stays wait-free and only the consumer moves the cursor.
   - Discarded frames are counted (`stale_discard_frames`, `consumer_skip_frames`).
   - Test: after a pump stall of 50 ms to 5 s, and after a consumer pause of 50 ms to 5 s, the age
-    of the first sample read is under target + 20 ms, and the budget below holds again within
-    100 ms.
+    of the first sample read is at most target + Q/2 + 20 ms at 23.976, 25, 29.97, 50 and 60 fps,
+    and the steady budget holds again within one tick.
 - **Latency budget:** device buffer (≈10 ms) + pump wake-up (≤5 ms) + servo target (80 ms) ≈
   95 ms constant from microphone to program bus, with ±10 ms variance. It is compensated with the
   existing per-source audio offset trim where the source is paired with video; a dedicated
@@ -99,6 +102,10 @@ program bus ──push (wait-free)──▶ [engine→drain SPSC ring, ~200 ms] 
                                                                               └──push──▶ [device ring, ~60 ms] ──pop──▶ device callback
 ```
 
+- **Buffer size:** the output stream requests a fixed device buffer of 480 frames (10 ms) where
+  the device allows it (`BufferSize::Fixed`), otherwise the device default. The actual callback
+  period P is measured from the first callbacks. Outputs whose P exceeds 40 ms are refused with a
+  latched `unsupported_buffer` warning (they cannot meet the latency budget).
 - **Engine side:** each tick pushes its program audio into the engine→drain ring. Wait-free. If the
   ring is full (the drain is stalled), the new block is dropped and `engine_drop_frames` counts it.
   The engine never takes a lock.
@@ -113,11 +120,16 @@ program bus ──push (wait-free)──▶ [engine→drain SPSC ring, ~200 ms] 
     and stop are always reachable), and tops the device ring up to its target only when the fill
     is below it. The callback pop rate is the pace, so the drain cannot over-produce, whatever its
     own wake-up jitter.
+  - **Pre-roll.** At output start and after every re-anchor the drain is in *pre-roll*: it lets
+    the engine→drain ring fill to its 60 ms target while the callback plays silence, then fills the
+    device ring to its target and releases. Steady state then starts with both cushions full, so a
+    re-anchor costs one bounded gap of silence, not minutes of underruns.
   - **Stale backlog is never played (re-anchor).** The engine push drops only as an isolation
-    safety valve (ring full), and what it drops is the newest audio. So on any engine drop, or a
-    drain wake-up gap over 50 ms, everything in the engine→drain ring and the pending partial output
-    is stale: the drain discards all of it, resets the servo and resampler phase, and re-primes from
-    the next fresh engine frames. When the fill exceeds target + 100 ms without an engine drop (a
+    safety valve (ring full), and what it drops is the newest audio. On any engine drop, or a drain
+    wake-up gap over 50 ms, the drain discards the engine→drain backlog down to its target (oldest
+    first), drops any pending partial output, bumps `flush_epoch`, resets the servo and resampler
+    phase, and enters pre-roll. Content older than the end-to-end budget is also skipped by the
+    callback itself (below). When the fill exceeds target + 100 ms without an engine drop (a
     slow drift or burst), the drain discards the oldest frames down to the target. Discards are
     counted (`stale_discard_frames`).
   - Test: after a drain stall of 50 ms to 5 s, the first frame played after recovery is from the
@@ -140,13 +152,16 @@ program bus ──push (wait-free)──▶ [engine→drain SPSC ring, ~200 ms] 
     budget (engine→drain target 60 ms + device-ring target + 30 ms), or from an older
     `flush_epoch`, before it plays. Skipped frames are counted.
   - The drain increments `flush_epoch` on every re-anchor (engine drop, drain stall, heartbeat gap
-    of 50 ms), so a drain-side re-anchor also invalidates what is already in the device ring.
+    of max(50 ms, 4 × P)), so a drain-side re-anchor also invalidates what is already in the device
+    ring. The heartbeat threshold scales with the measured callback period, so a device with a long
+    period is never mistaken for a stalled one.
   - Test: both interleavings (callback resumes before the drain notices, with an engine backlog
     below overflow; drain stalls while the callback runs) with a tick-stamped signal; the first
     frame played after each stall of 50 ms to 2 s is within the end-to-end budget of current
     program time.
 - **Distinct states,** each with its own transition:
-  - *underrun* (callback found the ring short): counted; the servo re-anchors; no reopen.
+  - *underrun* (callback found the ring short): counted and continued. Only persistent underrun
+    (more than 10 % of callbacks over 1 s) triggers a re-anchor and pre-roll.
   - *ring full* (device not consuming but heartbeat advancing): normal, the drain waits.
   - *stalled* (heartbeat has not advanced for 2 s while open) or *lost* (error callback): the drain
     leaves the steady loop and asks the lifecycle helper to close the stream. Rings are reset or
