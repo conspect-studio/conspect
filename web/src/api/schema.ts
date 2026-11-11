@@ -4247,12 +4247,25 @@ export interface components {
         };
         /** @description Secret-bearing admission response. Deliberately does not implement Debug. */
         MoqLease: {
-            /** @description Independent audio decoder configurations. */
+            /** @description Independent audio decoder configurations, shared by every alternative. */
             audio: components["schemas"]["MoqAudio"][];
             /** @description Authorized broadcast namespace. */
             broadcast: string;
+            /**
+             * Format: int64
+             * @description PTS-zero wall time in microseconds, when the pipeline supplied the epoch.
+             *     `None` when no validated epoch is available on this seam — never a
+             *     fabricated `0`, which would silently claim all renditions start at the
+             *     Unix epoch.
+             */
+            clock_wall_micros?: number | null;
             /** @description Server-enforced expiry in RFC3339 format. */
             expires_at: string;
+            /**
+             * Format: int64
+             * @description Conservative remaining server lifetime at response construction.
+             */
+            expires_in_ms: number;
             /**
              * Format: int64
              * @description Immutable binding generation.
@@ -4264,8 +4277,14 @@ export interface components {
             protocol: string;
             /** @description Short-lived authorized transport URL; never log. */
             url: string;
-            /** @description Video decoder configuration. */
+            /** @description Video decoder configuration of the selected rendition. */
             video: components["schemas"]["MoqVideo"];
+            /**
+             * @description Every authorized video alternative of this lease's ladder, in registry
+             *     order. Empty for a single-rendition lease; the selected [`Self::video`]
+             *     stays populated for back-compatible consumers.
+             */
+            video_alternatives: components["schemas"]["MoqVideoAlternative"][];
         };
         /** @description Acknowledges a synchronous stop-enqueue fence, not transport shutdown. */
         MoqRevoked: {
@@ -4295,6 +4314,49 @@ export interface components {
             coded_width: number;
             /** @description Base64 decoder initialization bytes, when required. */
             description?: string | null;
+        };
+        /**
+         * @description One selectable video alternative of an authorized ladder, on the HTTP wire.
+         *
+         *     `description` stays **base64**, exactly like [`MoqVideo::description`]; the
+         *     Hang catalog's hexadecimal form is a different, internal encoding and must
+         *     never be substituted here. A published alternative always carries an exact
+         *     rational cadence and a positive verified bitrate: a rung whose cadence or
+         *     bitrate is not verified is omitted (`video_alternatives` stays empty) rather
+         *     than fabricated or emitted as `0`.
+         */
+        MoqVideoAlternative: {
+            /**
+             * Format: int64
+             * @description Verified bitrate in bits per second; never `0` and never a guess.
+             */
+            bitrate_bps: number;
+            /**
+             * Format: int32
+             * @description Exact cadence denominator; never a float frame rate.
+             */
+            cadence_denominator: number;
+            /**
+             * Format: int32
+             * @description Exact cadence numerator (frames per `cadence_denominator`).
+             */
+            cadence_numerator: number;
+            /** @description `WebCodecs` codec identifier from the opened encoder. */
+            codec: string;
+            /**
+             * Format: int32
+             * @description Encoded height in pixels.
+             */
+            coded_height: number;
+            /**
+             * Format: int32
+             * @description Encoded width in pixels.
+             */
+            coded_width: number;
+            /** @description Base64 decoder initialization bytes, when the encoder supplied them. */
+            description?: string | null;
+            /** @description Stable rendition identity inside the family (the published track name). */
+            track: string;
         };
         /**
          * @description The mandatory NDI attribution (AGENTS.md §G) — present iff the `ndi` feature

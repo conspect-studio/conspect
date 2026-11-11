@@ -203,6 +203,7 @@ tokio-rustls = { version = "0.26", optional = true }
 # deterministic temp name allows. Permissive (MIT/Apache-2.0), already on the
 # deny.toml allowlist; pure Rust, stays in the CI-green default build.
 tempfile = "3"
+# The rustix fs/process dependency above also secures boot-model ownership.
 
 # Control-plane TLS termination (TLS-0, ADR-W029; HTTP/1-only serve loop SEC-14 #126 R2 /
 # ADR-W031): OFF by default (`tls`). The `[control.tls]` schema + the plain-HTTP serve path
@@ -221,6 +222,10 @@ rustls = { version = "0.23", optional = true }
 rustls-pki-types = { version = "1", features = ["std"], optional = true }
 
 [dev-dependencies]
+hang = "=0.21.22"
+url = "2"
+moq-net = "=0.3.21"
+moq-tokio = { version = "=0.19.34", default-features = false, features = ["noq", "ring"] }
 multiview-cloudflare = { path = "../multiview-cloudflare", features = ["testing"] }
 # Self dev-dependency: the canonical way to enable a TEST-ONLY feature for this
 # crate's OWN tests without pulling it into the default build or a downstream
@@ -287,7 +292,7 @@ tokio-rustls = "0.26"
 # External Chrome/FFmpeg proof runs in its required Linux CI leg.
 capture-browser-integration = []
 # Authenticated QUIC transport remains opt-in until a production feed factory is wired.
-moq-transport = ["dep:multiview-moq"]
+moq-transport = ["dep:multiview-moq", "dep:url"]
 "default" = ["openapi"]
 "openapi" = ["dep:utoipa", "dep:utoipa-axum", "dep:utoipa-scalar"]
 "embed-web" = ["dep:rust-embed", "dep:mime_guess"]
@@ -364,6 +369,12 @@ moq-transport = ["dep:multiview-moq"]
 # The TLS-0 serve e2e needs the rustls termination path compiled in.
 name = "tls_serve"
 required-features = ["tls"]
+
+[[example]]
+# The real authority fixture imports the optional native MoQ provider.
+# Its feature-enabled unit tests remain required by the main draft gate.
+name = "abr_authority"
+required-features = ["moq-transport"]
 
 [lints]
 workspace = true

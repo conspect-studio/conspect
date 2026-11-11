@@ -12606,10 +12606,12 @@
           "lease_id",
           "generation",
           "expires_at",
+          "expires_in_ms",
           "url",
           "broadcast",
           "protocol",
           "video",
+          "video_alternatives",
           "audio"
         ],
         "properties": {
@@ -12618,15 +12620,30 @@
             "items": {
               "$ref": "#/components/schemas/MoqAudio"
             },
-            "description": "Independent audio decoder configurations."
+            "description": "Independent audio decoder configurations, shared by every alternative."
           },
           "broadcast": {
             "type": "string",
             "description": "Authorized broadcast namespace."
           },
+          "clock_wall_micros": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "PTS-zero wall time in microseconds, when the pipeline supplied the epoch.\n`None` when no validated epoch is available on this seam — never a\nfabricated `0`, which would silently claim all renditions start at the\nUnix epoch.",
+            "minimum": 0
+          },
           "expires_at": {
             "type": "string",
             "description": "Server-enforced expiry in RFC3339 format."
+          },
+          "expires_in_ms": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Conservative remaining server lifetime at response construction.",
+            "minimum": 0
           },
           "generation": {
             "type": "integer",
@@ -12648,7 +12665,14 @@
           },
           "video": {
             "$ref": "#/components/schemas/MoqVideo",
-            "description": "Video decoder configuration."
+            "description": "Video decoder configuration of the selected rendition."
+          },
+          "video_alternatives": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/MoqVideoAlternative"
+            },
+            "description": "Every authorized video alternative of this lease's ladder, in registry\norder. Empty for a single-rendition lease; the selected [`Self::video`]\nstays populated for back-compatible consumers."
           }
         }
       },
@@ -12708,6 +12732,66 @@
               "null"
             ],
             "description": "Base64 decoder initialization bytes, when required."
+          }
+        }
+      },
+      "MoqVideoAlternative": {
+        "type": "object",
+        "description": "One selectable video alternative of an authorized ladder, on the HTTP wire.\n\n`description` stays **base64**, exactly like [`MoqVideo::description`]; the\nHang catalog's hexadecimal form is a different, internal encoding and must\nnever be substituted here. A published alternative always carries an exact\nrational cadence and a positive verified bitrate: a rung whose cadence or\nbitrate is not verified is omitted (`video_alternatives` stays empty) rather\nthan fabricated or emitted as `0`.",
+        "required": [
+          "track",
+          "codec",
+          "coded_width",
+          "coded_height",
+          "cadence_numerator",
+          "cadence_denominator",
+          "bitrate_bps"
+        ],
+        "properties": {
+          "bitrate_bps": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Verified bitrate in bits per second; never `0` and never a guess.",
+            "minimum": 0
+          },
+          "cadence_denominator": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Exact cadence denominator; never a float frame rate.",
+            "minimum": 0
+          },
+          "cadence_numerator": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Exact cadence numerator (frames per `cadence_denominator`).",
+            "minimum": 0
+          },
+          "codec": {
+            "type": "string",
+            "description": "`WebCodecs` codec identifier from the opened encoder."
+          },
+          "coded_height": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Encoded height in pixels.",
+            "minimum": 0
+          },
+          "coded_width": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Encoded width in pixels.",
+            "minimum": 0
+          },
+          "description": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Base64 decoder initialization bytes, when the encoder supplied them."
+          },
+          "track": {
+            "type": "string",
+            "description": "Stable rendition identity inside the family (the published track name)."
           }
         }
       },

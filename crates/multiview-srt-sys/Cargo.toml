@@ -1,0 +1,51 @@
+[package]
+name = "multiview-srt-sys"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license-file.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Minimal runtime-loaded libsrt (MPL-2.0) FFI leaf: a dual-stack [::] SRT listener (SRTO_IPV6ONLY=0), which FFmpeg's libsrt protocol cannot bind. libsrt is dlopen-resolved at run time, never linked or vendored."
+# Workspace-internal implementation crate; never published to crates.io.
+publish = false
+
+[dependencies]
+# Runtime `dlopen`/`dlsym` of the host libsrt (`libsrt.so.1.5` / the gnutls
+# flavour). No build-time link, never vendored, so the default build compiles
+# WITHOUT libsrt present (the multiview-rist-sys pattern, ADR-0028).
+libloading = { workspace = true }
+thiserror = { workspace = true }
+# `sockaddr_in6` / `sockaddr_storage` layouts for srt_bind / srt_accept.
+libc = "0.2.186"
+
+# FFI crate exception (see multiview-rist-sys): the workspace forbids
+# `unsafe_code`, which a downstream manifest cannot relax, so this crate restates
+# the workspace lint set with `unsafe_code = "deny"` (every block justified by a
+# `// SAFETY:` note). Keep in sync with the root Cargo.toml lints.
+[lints.rust]
+unsafe_code = "deny"
+unreachable_pub = "warn"
+rust_2018_idioms = { level = "warn", priority = -1 }
+
+[lints.clippy]
+all      = { level = "deny",  priority = -2 }
+pedantic = { level = "warn",  priority = -1 }
+unwrap_used      = "deny"
+expect_used      = "deny"
+panic            = "deny"
+todo             = "deny"
+unimplemented    = "deny"
+unreachable      = "deny"
+get_unwrap       = "deny"
+indexing_slicing = "deny"
+as_conversions   = "deny"
+exit             = "deny"
+mem_forget       = "deny"
+dbg_macro        = "deny"
+print_stdout     = "deny"
+print_stderr     = "deny"
+str_to_string    = "deny"
+missing_errors_doc = "warn"
+missing_panics_doc = "warn"
+must_use_candidate = "warn"

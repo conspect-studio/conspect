@@ -1,0 +1,1262 @@
+use std::collections::HashMap;
+
+use bytes::Buf;
+use num_enum::{FromPrimitive, IntoPrimitive};
+
+use crate::coding::*;
+
+use super::Location;
+use super::Version;
+
+const MAX_PARAMS: u64 = 64;
+/// Maximum byte value length in Key-Value-Pairs per spec Section 1.4.3.
+const MAX_KVP_VALUE_LEN: usize = (1 << 16) - 1;
+
+// ---- Setup Parameters (used in CLIENT_SETUP/SERVER_SETUP) ----
+
+#[derive(Debug, Copy, Clone, FromPrimitive, IntoPrimitive, Eq, Hash, PartialEq)]
+#[repr(u64)]
+pub enum ParameterVarInt {
+	/// Removed in draft-17; only used in draft-14/15/16.
+	MaxRequestId = 2,
+	MaxAuthTokenCacheSize = 4,
+	/// HOP_ID, from the MoQ Cluster extension.
+	HopId = super::cluster::HOP_ID,
+	/// RELAY_COST, from the MoQ Cluster extension.
+	RelayCost = super::cluster::RELAY_COST,
+	/// SOLICIT, from the MoQ Solicit extension.
+	Solicit = super::solicit::SOLICIT,
+	/// HIDDEN, from the MoQ Hidden extension.
+	Hidden = super::hidden::HIDDEN,
+	#[num_enum(catch_all)]
+	Unknown(u64),
+}
+
+impl ParameterVarInt {
+	/// Whether `version` defines this option. Only defined options must be unique.
+	fn defined(self, version: Version) -> bool {
+		match self {
+			Self::MaxRequestId => matches!(version, Version::Draft14 | Version::Draft15 | Version::Draft16),
+			Self::HopId | Self::RelayCost => super::cluster::supported(version),
+			Self::Unknown(_) => false,
+			Self::MaxAuthTokenCacheSize | Self::Solicit | Self::Hidden => true,
+		}
+	}
+}
+
+#[derive(Debug, Copy, Clone, FromPrimitive, IntoPrimitive, Eq, Hash, PartialEq)]
+#[repr(u64)]
+pub enum ParameterBytes {
+	Path = 1,
+	AuthorizationToken = 3,
+	Authority = 5,
+	Implementation = 7,
+	#[num_enum(catch_all)]
+	Unknown(u64),
+}
+
+#[derive(Default, Clone)]
+pub struct Parameters {
+	vars: HashMap<ParameterVarInt, u64>,
+	bytes: HashMap<ParameterBytes, Vec<u8>>,
+}
+
+impl std::fmt::Debug for Parameters {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		f.debug_struct("Parameters")
+			.field("vars", &self.vars)
+			// Values can carry credentials, so only their lengths.
+			.field(
+				"bytes",
+				&self
+					.bytes
+					.iter()
+					.map(|(kind, value)| (kind, value.len()))
+					.collect::<Vec<_>>(),
+			)
+			.finish()
+	}
+}
+
+impl Decode<Version> for Parameters {
+	fn decode<R: bytes::Buf>(mut r: &mut R, version: Version) -> Result<Self, DecodeError> {
+		let mut vars = HashMap::new();
+		let mut bytes = HashMap::new();
+
+		match version {
+			Version::Draft14 | Version::Draft15 | Version::Draft16 => {
+				let count = u64::decode(r, version)?;
+
+				if count > MAX_PARAMS {
+					return Err(DecodeError::TooMany);
+				}
+
+				let mut prev_type: u64 = 0;
+
+				for i in 0..count {
+					let kind = match version {
+						Version::Draft16 => {
+							let delta = u64::decode(r, version)?;
+							let abs = if i == 0 {
+								delta
+							} else {
+								prev_type.checked_add(delta).ok_or(DecodeError::BoundsExceeded)?
+							};
+							prev_type = abs;
+							abs
+						}
+						Version::Draft14 | Version::Draft15 => u64::decode(r, version)?,
+						_ => unreachable!("handled above"),
+					};
+
+					if kind % 2 == 0 {
+						let kind = ParameterVarInt::from(kind);
+						// Unknown SETUP options may repeat, but their values must still decode.
+						if kind.defined(version) && vars.contains_key(&kind) {
+							return Err(DecodeError::Duplicate);
+						}
+						vars.insert(kind, u64::decode(&mut r, version)?);
+					} else {
+						let kind = ParameterBytes::from(kind);
+						let val = Vec::<u8>::decode(&mut r, version)?;
+						if val.len() > MAX_KVP_VALUE_LEN {
+							return Err(DecodeError::BoundsExceeded);
+						}
+						if !matches!(kind, ParameterBytes::Unknown(_)) && bytes.contains_key(&kind) {
+							return Err(DecodeError::Duplicate);
+						}
+						bytes.insert(kind, val);
+					}
+				}
+			}
+			_ => {
+				// Draft17+: no count prefix, read Key-Value-Pairs until buffer empty.
+				// Delta-encoded types, even = varint value, odd = length-prefixed bytes.
+				let mut prev_type: u64 = 0;
+				let mut i = 0u64;
+				while r.has_remaining() {
+					if i >= MAX_PARAMS {
+						return Err(DecodeError::TooMany);
+					}
+					let delta = u64::decode(&mut r, version)?;
+					let abs = if i == 0 {
+						delta
+					} else {
+						prev_type.checked_add(delta).ok_or(DecodeError::BoundsExceeded)?
+					};
+					prev_type = abs;
+					i += 1;
+
+					if abs % 2 == 0 {
+						let kind = ParameterVarInt::from(abs);
+						// Unknown SETUP options may repeat, but their values must still decode.
+						if kind.defined(version) && vars.contains_key(&kind) {
+							return Err(DecodeError::Duplicate);
+						}
+						vars.insert(kind, u64::decode(&mut r, version)?);
+					} else {
+						let kind = ParameterBytes::from(abs);
+						let val = Vec::<u8>::decode(&mut r, version)?;
+						if val.len() > MAX_KVP_VALUE_LEN {
+							return Err(DecodeError::BoundsExceeded);
+						}
+						if !matches!(kind, ParameterBytes::Unknown(_)) && bytes.contains_key(&kind) {
+							return Err(DecodeError::Duplicate);
+						}
+						bytes.insert(kind, val);
+					}
+				}
+			}
+		}
+
+		Ok(Parameters { vars, bytes })
+	}
+}
+
+impl Encode<Version> for Parameters {
+	fn encode<W: bytes::BufMut>(&self, w: &mut W, version: Version) -> Result<(), EncodeError> {
+		let count = self.vars.len() + self.bytes.len();
+		if count as u64 > MAX_PARAMS {
+			return Err(EncodeError::TooMany);
+		}
+
+		match version {
+			Version::Draft14 | Version::Draft15 => {
+				count.encode(w, version)?;
+
+				for (kind, value) in self.vars.iter() {
+					u64::from(*kind).encode(w, version)?;
+					value.encode(w, version)?;
+				}
+
+				for (kind, value) in self.bytes.iter() {
+					if value.len() > MAX_KVP_VALUE_LEN {
+						return Err(EncodeError::BoundsExceeded);
+					}
+					u64::from(*kind).encode(w, version)?;
+					value.encode(w, version)?;
+				}
+			}
+			_ => {
+				// Draft16: count prefix + delta encoding
+				// Draft17+: NO count prefix + delta encoding
+				if matches!(version, Version::Draft16) {
+					count.encode(w, version)?;
+				}
+
+				// Collect all keys, sort, encode deltas
+				enum ParamRef<'a> {
+					Var(&'a u64),
+					Bytes(&'a Vec<u8>),
+				}
+				let mut all: Vec<(u64, ParamRef)> = Vec::new();
+				for (k, v) in self.vars.iter() {
+					all.push((u64::from(*k), ParamRef::Var(v)));
+				}
+				for (k, v) in self.bytes.iter() {
+					all.push((u64::from(*k), ParamRef::Bytes(v)));
+				}
+				all.sort_by_key(|(k, _)| *k);
+
+				let mut prev_type: u64 = 0;
+				for (idx, (kind, val)) in all.iter().enumerate() {
+					let delta = if idx == 0 { *kind } else { kind - prev_type };
+					prev_type = *kind;
+					delta.encode(w, version)?;
+
+					match val {
+						ParamRef::Var(v) => v.encode(w, version)?,
+						ParamRef::Bytes(v) => {
+							if v.len() > MAX_KVP_VALUE_LEN {
+								return Err(EncodeError::BoundsExceeded);
+							}
+							v.encode(w, version)?;
+						}
+					}
+				}
+			}
+		}
+
+		Ok(())
+	}
+}
+
+impl Parameters {
+	/// Consume a draft-14 message parameter block without interpreting it.
+	///
+	/// Draft-14 section 9.2 has a receiver ignore unrecognized parameters and allow their
+	/// duplicates, and lets AUTHORIZATION TOKEN repeat. We act on none of these, so unlike
+	/// [`Parameters::decode`], which SETUP uses, a repeat is not refused.
+	pub fn skip<R: bytes::Buf>(r: &mut R, version: Version) -> Result<(), DecodeError> {
+		let count = u64::decode(r, version)?;
+		if count > MAX_PARAMS {
+			return Err(DecodeError::TooMany);
+		}
+
+		for _ in 0..count {
+			// Parity frames a Key-Value-Pair: even is one varint, odd is length prefixed.
+			match u64::decode(r, version)? % 2 {
+				0 => {
+					u64::decode(r, version)?;
+				}
+				_ => {
+					let len = usize::try_from(u64::decode(r, version)?).map_err(|_| DecodeError::BoundsExceeded)?;
+					if len > MAX_KVP_VALUE_LEN {
+						return Err(DecodeError::BoundsExceeded);
+					}
+					if r.remaining() < len {
+						return Err(DecodeError::Short);
+					}
+					r.advance(len);
+				}
+			}
+		}
+
+		Ok(())
+	}
+
+	pub fn get_varint(&self, kind: ParameterVarInt) -> Option<u64> {
+		self.vars.get(&kind).copied()
+	}
+
+	pub fn set_varint(&mut self, kind: ParameterVarInt, value: u64) {
+		self.vars.insert(kind, value);
+	}
+
+	pub fn get_bytes(&self, kind: ParameterBytes) -> Option<&[u8]> {
+		self.bytes.get(&kind).map(|v| v.as_slice())
+	}
+
+	pub fn set_bytes(&mut self, kind: ParameterBytes, value: Vec<u8>) {
+		self.bytes.insert(kind, value);
+	}
+}
+
+// ---- Message Parameter Value Encoding ----
+
+/// Trait for encoding/decoding parameter values with version-specific formats.
+///
+/// Parameter encoding differs from field encoding:
+/// - Draft-14/15/16: u8 and bool are encoded as varints (cast to u64)
+/// - Draft-17: type-specific encoding (u8 as raw byte, bool as raw byte, etc.)
+///
+/// Use `_ =>` for the newest draft behavior so future versions default forward.
+pub trait Param: Sized {
+	fn param_encode<W: bytes::BufMut>(&self, w: &mut W, version: Version) -> Result<(), EncodeError>;
+	fn param_decode<R: bytes::Buf>(r: &mut R, version: Version) -> Result<Self, DecodeError>;
+
+	/// Whether this parameter should be encoded. Returns false to skip.
+	fn param_present(&self) -> bool {
+		true
+	}
+
+	/// Fold a repeat of this parameter into the value already decoded.
+	///
+	/// A parameter may appear once unless its definition says otherwise, so the default
+	/// refuses the repeat.
+	fn param_repeat(self, _next: Self) -> Result<Self, DecodeError> {
+		Err(DecodeError::Duplicate)
+	}
+}
+
+impl Param for u8 {
+	fn param_encode<W: bytes::BufMut>(&self, w: &mut W, version: Version) -> Result<(), EncodeError> {
+		match version {
+			// Draft-14/15/16: u8 encoded as varint (cast to u64)
+			Version::Draft14 | Version::Draft15 | Version::Draft16 => (*self as u64).encode(w, version),
+			_ => Encode::encode(self, w, version),
+		}
+	}
+
+	fn param_decode<R: bytes::Buf>(r: &mut R, version: Version) -> Result<Self, DecodeError> {
+		match version {
+			Version::Draft14 | Version::Draft15 | Version::Draft16 => {
+				let v = u64::decode(r, version)?;
+				u8::try_from(v).map_err(|_| DecodeError::InvalidValue)
+			}
+			_ => u8::decode(r, version),
+		}
+	}
+}
+
+impl Param for bool {
+	fn param_encode<W: bytes::BufMut>(&self, w: &mut W, version: Version) -> Result<(), EncodeError> {
+		match version {
+			// Draft-14/15/16: bool encoded as varint (cast to u64)
+			Version::Draft14 | Version::Draft15 | Version::Draft16 => (*self as u64).encode(w, version),
+			_ => Encode::encode(self, w, version),
+		}
+	}
+
+	fn param_decode<R: bytes::Buf>(r: &mut R, version: Version) -> Result<Self, DecodeError> {
+		match version {
+			Version::Draft14 | Version::Draft15 | Version::Draft16 => {
+				let v = u64::decode(r, version)?;
+				match v {
+					0 => Ok(false),
+					1 => Ok(true),
+					_ => Err(DecodeError::InvalidValue),
+				}
+			}
+			_ => bool::decode(r, version),
+		}
+	}
+}
+
+impl Param for u64 {
+	fn param_encode<W: bytes::BufMut>(&self, w: &mut W, version: Version) -> Result<(), EncodeError> {
+		self.encode(w, version)
+	}
+
+	fn param_decode<R: bytes::Buf>(r: &mut R, version: Version) -> Result<Self, DecodeError> {
+		u64::decode(r, version)
+	}
+}
+
+/// A Location parameter value, such as LARGEST_OBJECT (0x09).
+///
+/// Draft-16 section 9.2 serializes every Message Parameter as a Key-Value-Pair, and section
+/// 9.2.2.7 calls LARGEST_OBJECT "a length-prefixed Location structure", so the two varints
+/// sit inside a byte string there. Draft-17 section 9.3, and section 10.2 from draft-18 on,
+/// redefines a Message Parameter as `{ Type Delta (vi64), Value (..) }` with no Length at
+/// all, and lists "Location: Two consecutive varints (Group, Object)" as its own value
+/// encoding beside Length-prefixed. So from draft-17 the two varints are written bare.
+impl Param for Location {
+	fn param_encode<W: bytes::BufMut>(&self, w: &mut W, version: Version) -> Result<(), EncodeError> {
+		match version {
+			Version::Draft14 | Version::Draft15 | Version::Draft16 => {
+				// The drafts before 17 pin the inner varints to the draft-15 encoding,
+				// matching the other length-prefixed parameters.
+				let mut buf = Vec::new();
+				self.group.encode(&mut buf, Version::Draft15)?;
+				self.object.encode(&mut buf, Version::Draft15)?;
+				buf.encode(w, version)
+			}
+			_ => {
+				self.group.encode(w, version)?;
+				self.object.encode(w, version)
+			}
+		}
+	}
+
+	fn param_decode<R: bytes::Buf>(r: &mut R, version: Version) -> Result<Self, DecodeError> {
+		match version {
+			Version::Draft14 | Version::Draft15 | Version::Draft16 => {
+				let data = Vec::<u8>::decode(r, version)?;
+				let mut buf = bytes::Bytes::from(data);
+				let group = u64::decode(&mut buf, Version::Draft15)?;
+				let object = u64::decode(&mut buf, Version::Draft15)?;
+				if buf.has_remaining() {
+					return Err(DecodeError::TrailingBytes);
+				}
+				Ok(Location { group, object })
+			}
+			_ => {
+				let group = u64::decode(r, version)?;
+				let object = u64::decode(r, version)?;
+				Ok(Location { group, object })
+			}
+		}
+	}
+}
+
+impl<T: Param> Param for Option<T> {
+	fn param_present(&self) -> bool {
+		self.is_some()
+	}
+
+	fn param_repeat(self, next: Self) -> Result<Self, DecodeError> {
+		match (self, next) {
+			(Some(prev), Some(next)) => Ok(Some(prev.param_repeat(next)?)),
+			_ => Err(DecodeError::Duplicate),
+		}
+	}
+
+	fn param_encode<W: bytes::BufMut>(&self, w: &mut W, version: Version) -> Result<(), EncodeError> {
+		match self {
+			Some(v) => v.param_encode(w, version),
+			None => Ok(()),
+		}
+	}
+
+	fn param_decode<R: bytes::Buf>(r: &mut R, version: Version) -> Result<Self, DecodeError> {
+		Ok(Some(T::param_decode(r, version)?))
+	}
+}
+
+/// A parameter whose definition lets it repeat, such as AUTHORIZATION TOKEN (0x03) or a
+/// Range Filter (0x25-0x29). Every instance is kept, in wire order.
+impl<T: Param> Param for Vec<T> {
+	fn param_present(&self) -> bool {
+		!self.is_empty()
+	}
+
+	fn param_encode<W: bytes::BufMut>(&self, w: &mut W, version: Version) -> Result<(), EncodeError> {
+		// `encode_params!` writes the key once, so only a single instance fits behind it.
+		match self.as_slice() {
+			[value] => value.param_encode(w, version),
+			_ => Err(EncodeError::Unsupported),
+		}
+	}
+
+	fn param_decode<R: bytes::Buf>(r: &mut R, version: Version) -> Result<Self, DecodeError> {
+		Ok(vec![T::param_decode(r, version)?])
+	}
+
+	fn param_repeat(mut self, next: Self) -> Result<Self, DecodeError> {
+		self.extend(next);
+		Ok(self)
+	}
+}
+
+/// A length-prefixed parameter value, consumed without being interpreted.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Opaque(pub Vec<u8>);
+
+impl Param for Opaque {
+	fn param_encode<W: bytes::BufMut>(&self, w: &mut W, version: Version) -> Result<(), EncodeError> {
+		self.0.encode(w, version)
+	}
+
+	fn param_decode<R: bytes::Buf>(r: &mut R, version: Version) -> Result<Self, DecodeError> {
+		Ok(Self(Vec::<u8>::decode(r, version)?))
+	}
+}
+
+/// Encode message parameters with compile-time sorted keys.
+///
+/// Keys must be listed in ascending order (enforced at compile time).
+/// `Option<T>` values are skipped when `None`.
+///
+/// ```ignore
+/// encode_params!(w, version,
+///     0x10 => self.forward,
+///     0x20 => self.subscriber_priority,
+/// );
+/// ```
+macro_rules! encode_params {
+	($w:expr, $version:expr, $($key:expr => $val:expr),* $(,)?) => {{
+		#[allow(unused_imports)]
+		use $crate::coding::Encode as _;
+
+		#[allow(unused)]
+		const _: () = {
+			let _keys: &[u64] = &[$($key),*];
+			let mut _i = 1;
+			while _i < _keys.len() {
+				assert!(_keys[_i - 1] < _keys[_i], "parameter keys must be in ascending order");
+				_i += 1;
+			}
+		};
+
+		let _version: $crate::ietf::Version = $version;
+
+		#[allow(unused_mut)]
+		let mut _count: usize = 0;
+		$(_count += if $crate::ietf::Param::param_present(&$val) { 1 } else { 0 };)*
+		_count.encode($w, _version)?;
+
+		#[allow(unused_mut, unused_assignments)]
+		let mut _prev_key: u64 = 0;
+		#[allow(unused_mut, unused_assignments)]
+		let mut _first: bool = true;
+		$(
+			if $crate::ietf::Param::param_present(&$val) {
+				let _key: u64 = $key;
+				match _version {
+					$crate::ietf::Version::Draft14 | $crate::ietf::Version::Draft15 => {
+						_key.encode($w, _version)?;
+					}
+					_ => {
+						let _delta = if _first { _key } else { _key - _prev_key };
+						_delta.encode($w, _version)?;
+					}
+				}
+				_prev_key = _key;
+				_first = false;
+				$crate::ietf::Param::param_encode(&$val, $w, _version)?;
+			}
+		)*
+	}};
+}
+
+/// Decode message parameters with compile-time sorted keys.
+///
+/// The declared type is the final type of each variable. Use `Option<T>` for
+/// optional parameters (defaults to `None` when absent) and bare types like `u8`
+/// for parameters where `T::default()` is an acceptable fallback.
+///
+/// Unknown parameters are ignored in drafts 14/15 and otherwise cause `DecodeError::InvalidValue`.
+/// A false `where` gate treats a declared key as unknown before decoding its value.
+/// Duplicate parameters cause `DecodeError::Duplicate`, unless the type allows a repeat
+/// (see [`Param::param_repeat`]), such as `Vec<T>`.
+///
+/// ```ignore
+/// decode_params!(r, version,
+///     0x10 => forward: Option<bool>,
+///     0x20 => subscriber_priority: Option<u8>,
+/// );
+/// // forward: Option<bool> and subscriber_priority: Option<u8> are now in scope
+/// let subscriber_priority = subscriber_priority.unwrap_or(128);
+/// ```
+macro_rules! decode_params {
+	($r:expr, $version:expr, $($key:expr => $name:ident: $ty:ty $(where $gate:expr)?),* $(,)?) => {
+		#[allow(unused)]
+		const _: () = {
+			let _keys: &[u64] = &[$($key),*];
+			let mut _i = 1;
+			while _i < _keys.len() {
+				assert!(_keys[_i - 1] < _keys[_i], "parameter keys must be in ascending order");
+				_i += 1;
+			}
+		};
+
+		// Use internal Option wrapper for duplicate detection, then shadow with Default.
+		$(#[allow(unused_mut, non_snake_case)] let mut $name: Option<$ty> = None;)*
+
+		{
+			#[allow(unused_imports)]
+			use $crate::coding::Decode as _;
+
+			let _version: $crate::ietf::Version = $version;
+			let _count = <u64 as $crate::coding::Decode<$crate::ietf::Version>>::decode($r, _version)?;
+			if _count > 64 {
+				return Err($crate::coding::DecodeError::TooMany);
+			}
+
+			#[allow(unused_mut, unused_assignments)]
+			let mut _prev_key: u64 = 0;
+			for _i in 0.._count {
+				let _key: u64 = match _version {
+					$crate::ietf::Version::Draft14 | $crate::ietf::Version::Draft15 => {
+						<u64 as $crate::coding::Decode<$crate::ietf::Version>>::decode($r, _version)?
+					}
+					_ => {
+						let _delta = <u64 as $crate::coding::Decode<$crate::ietf::Version>>::decode($r, _version)?;
+						let _abs = if _i == 0 {
+							_delta
+						} else {
+							_prev_key.checked_add(_delta).ok_or($crate::coding::DecodeError::BoundsExceeded)?
+						};
+						_prev_key = _abs;
+						_abs
+					}
+				};
+
+				// An if-chain rather than a `match`, so a key can be a named constant:
+				// the macro captures it as an expression, which is not a legal pattern.
+				$(
+					if _key == $key $( && ($gate) )? {
+						let _value = <$ty as $crate::ietf::Param>::param_decode($r, _version)?;
+						$name = Some(match $name.take() {
+							None => _value,
+							Some(_prev) => $crate::ietf::Param::param_repeat(_prev, _value)?,
+						});
+						continue;
+					}
+				)*
+				// Drafts 14 and 15 use Key-Value-Pairs and require unknown ids to be ignored.
+				if matches!(_version, $crate::ietf::Version::Draft14 | $crate::ietf::Version::Draft15) {
+					if _key % 2 == 0 {
+						<u64 as $crate::coding::Decode<$crate::ietf::Version>>::decode($r, _version)?;
+					} else {
+						let _value = <Vec<u8> as $crate::coding::Decode<$crate::ietf::Version>>::decode($r, _version)?;
+						if _value.len() > (1 << 16) - 1 { return Err($crate::coding::DecodeError::BoundsExceeded); }
+					}
+					continue;
+				}
+				return Err($crate::coding::DecodeError::InvalidValue);
+			}
+		}
+
+		// Shadow with unwrap_or_default: Option<T> defaults to None, T defaults to T::default()
+		$(#[allow(unused_variables)] let $name: $ty = $name.unwrap_or_default();)*
+	};
+}
+
+#[cfg(test)]
+mod tests {
+	use super::super::Filter;
+	use super::*;
+	use bytes::{Buf, Bytes, BytesMut};
+
+	const SETUP_VERSIONS: [Version; 9] = [
+		Version::Draft14,
+		Version::Draft15,
+		Version::Draft16,
+		Version::Draft17,
+		Version::Draft18,
+		Version::Draft19,
+		Version::Draft20,
+		Version::Draft21,
+		Version::Draft22,
+	];
+
+	fn legacy(version: Version) -> bool {
+		matches!(version, Version::Draft14 | Version::Draft15 | Version::Draft16)
+	}
+
+	/// A SETUP block carrying the option `kind` twice.
+	fn repeated_setup_option(kind: u64, version: Version) -> Vec<u8> {
+		let mut buf = Vec::new();
+		if legacy(version) {
+			2u64.encode(&mut buf, version).unwrap();
+		}
+		kind.encode(&mut buf, version).unwrap();
+		for i in 0..2 {
+			if i > 0 {
+				let next = if matches!(version, Version::Draft14 | Version::Draft15) {
+					kind
+				} else {
+					0
+				};
+				next.encode(&mut buf, version).unwrap();
+			}
+			if kind.is_multiple_of(2) {
+				1u64.encode(&mut buf, version).unwrap();
+			} else {
+				vec![1u8].encode(&mut buf, version).unwrap();
+			}
+		}
+		buf
+	}
+
+	#[test]
+	fn setup_only_defined_options_must_be_unique() {
+		// Whether the option must be unique on a given draft.
+		type Unique = fn(Version) -> bool;
+		let cases: [(u64, Unique); 11] = [
+			(0x20, |_| false),
+			(0x21, |_| false),
+			(0x9d, |_| false),
+			(0x11c, |_| false),
+			(ParameterVarInt::MaxRequestId.into(), legacy),
+			(ParameterVarInt::HopId.into(), |v| !legacy(v)),
+			(ParameterVarInt::RelayCost.into(), |v| !legacy(v)),
+			(ParameterVarInt::MaxAuthTokenCacheSize.into(), |_| true),
+			(ParameterVarInt::Solicit.into(), |_| true),
+			(ParameterVarInt::Hidden.into(), |_| true),
+			(ParameterBytes::Implementation.into(), |_| true),
+		];
+		for version in SETUP_VERSIONS {
+			for (kind, unique) in cases {
+				let buf = repeated_setup_option(kind, version);
+				let result = Parameters::decode(&mut buf.as_slice(), version);
+				if unique(version) {
+					assert!(
+						matches!(result, Err(DecodeError::Duplicate)),
+						"{kind:#x} on {version:?}"
+					);
+				} else {
+					result.unwrap_or_else(|err| panic!("{kind:#x} on {version:?}: {err:?}"));
+				}
+			}
+		}
+	}
+
+	#[test]
+	fn setup_repeated_options_require_valid_values() {
+		for version in [
+			Version::Draft17,
+			Version::Draft18,
+			Version::Draft19,
+			Version::Draft20,
+			Version::Draft21,
+			Version::Draft22,
+		] {
+			assert!(Parameters::decode(&mut &[0x21, 1, b'a', 0, 2, b'b'][..], version).is_err());
+		}
+	}
+
+	// ---- Setup Parameters tests (unchanged) ----
+
+	#[test]
+	fn test_parameters_v16_delta_round_trip() {
+		let mut params = Parameters::default();
+		params.set_bytes(ParameterBytes::Path, b"/test".to_vec());
+		params.set_varint(ParameterVarInt::MaxRequestId, 100);
+		params.set_bytes(ParameterBytes::Implementation, b"test-impl".to_vec());
+
+		let mut buf = BytesMut::new();
+		params.encode(&mut buf, Version::Draft16).unwrap();
+
+		let mut bytes = buf.freeze();
+		let decoded = Parameters::decode(&mut bytes, Version::Draft16).unwrap();
+
+		assert_eq!(decoded.get_bytes(ParameterBytes::Path), Some(b"/test".as_ref()));
+		assert_eq!(decoded.get_varint(ParameterVarInt::MaxRequestId), Some(100));
+		assert_eq!(
+			decoded.get_bytes(ParameterBytes::Implementation),
+			Some(b"test-impl".as_ref())
+		);
+	}
+
+	#[test]
+	fn test_parameters_v15_round_trip() {
+		let mut params = Parameters::default();
+		params.set_bytes(ParameterBytes::Path, b"/test".to_vec());
+		params.set_varint(ParameterVarInt::MaxRequestId, 100);
+
+		let mut buf = BytesMut::new();
+		params.encode(&mut buf, Version::Draft15).unwrap();
+
+		let mut bytes = buf.freeze();
+		let decoded = Parameters::decode(&mut bytes, Version::Draft15).unwrap();
+
+		assert_eq!(decoded.get_bytes(ParameterBytes::Path), Some(b"/test".as_ref()));
+		assert_eq!(decoded.get_varint(ParameterVarInt::MaxRequestId), Some(100));
+	}
+
+	#[test]
+	fn test_parameters_v17_round_trip() {
+		let mut params = Parameters::default();
+		params.set_bytes(ParameterBytes::Path, b"/test".to_vec());
+		params.set_varint(ParameterVarInt::MaxAuthTokenCacheSize, 4096);
+		params.set_bytes(ParameterBytes::Implementation, b"test-impl".to_vec());
+
+		let mut buf = BytesMut::new();
+		params.encode(&mut buf, Version::Draft17).unwrap();
+
+		let mut bytes = buf.freeze();
+		let decoded = Parameters::decode(&mut bytes, Version::Draft17).unwrap();
+
+		assert_eq!(decoded.get_bytes(ParameterBytes::Path), Some(b"/test".as_ref()));
+		assert_eq!(decoded.get_varint(ParameterVarInt::MaxAuthTokenCacheSize), Some(4096));
+		assert_eq!(
+			decoded.get_bytes(ParameterBytes::Implementation),
+			Some(b"test-impl".as_ref())
+		);
+		assert!(!bytes.has_remaining());
+	}
+
+	#[test]
+	fn test_parameters_v17_no_count_prefix() {
+		let mut params = Parameters::default();
+		params.set_bytes(ParameterBytes::Path, b"/x".to_vec());
+
+		let mut buf15 = BytesMut::new();
+		params.encode(&mut buf15, Version::Draft15).unwrap();
+
+		let mut buf17 = BytesMut::new();
+		params.encode(&mut buf17, Version::Draft17).unwrap();
+
+		assert!(buf17.len() < buf15.len());
+	}
+
+	// ---- Message Parameter (encode_params!/decode_params!) tests ----
+
+	fn round_trip_params(
+		version: Version,
+		encode_fn: impl FnOnce(&mut BytesMut, Version) -> Result<(), EncodeError>,
+		decode_fn: impl FnOnce(&mut bytes::Bytes, Version) -> Result<(), DecodeError>,
+	) {
+		let mut buf = BytesMut::new();
+		encode_fn(&mut buf, version).unwrap();
+		let mut bytes = buf.freeze();
+		decode_fn(&mut bytes, version).unwrap();
+		assert!(!bytes.has_remaining(), "buffer not fully consumed for {version}");
+	}
+
+	#[test]
+	fn test_param_u8_all_versions() {
+		for version in [
+			Version::Draft14,
+			Version::Draft15,
+			Version::Draft16,
+			Version::Draft17,
+			Version::Draft18,
+		] {
+			round_trip_params(
+				version,
+				|w, v| {
+					encode_params!(w, v, 0x20 => 200u8);
+					Ok(())
+				},
+				|r, v| {
+					decode_params!(r, v, 0x20 => val: Option<u8>);
+					assert_eq!(val, Some(200));
+					Ok(())
+				},
+			);
+		}
+	}
+
+	#[test]
+	fn test_param_u8_wire_vectors() -> Result<(), EncodeError> {
+		for (version, expected) in [
+			(Version::Draft16, &[0x01, 0x20, 0x40, 0xff][..]),
+			(Version::Draft17, &[0x01, 0x20, 0xff][..]),
+			(Version::Draft18, &[0x01, 0x20, 0xff][..]),
+			(Version::Draft19, &[0x01, 0x20, 0xff][..]),
+		] {
+			let mut buf = BytesMut::new();
+			encode_params!(&mut buf, version, 0x20 => u8::MAX);
+			assert_eq!(&buf[..], expected, "{version}");
+
+			let mut encoded = Bytes::copy_from_slice(expected);
+			let decoded = (|| -> Result<Option<u8>, DecodeError> {
+				decode_params!(&mut encoded, version, 0x20 => value: Option<u8>);
+				Ok(value)
+			})()
+			.expect("fixed uint8 vector should decode");
+			assert_eq!(decoded, Some(u8::MAX), "{version}");
+			assert!(!encoded.has_remaining(), "{version}");
+		}
+		Ok(())
+	}
+
+	#[test]
+	fn test_param_bool_all_versions() {
+		for version in [
+			Version::Draft14,
+			Version::Draft15,
+			Version::Draft16,
+			Version::Draft17,
+			Version::Draft18,
+		] {
+			round_trip_params(
+				version,
+				|w, v| {
+					encode_params!(w, v, 0x10 => true);
+					Ok(())
+				},
+				|r, v| {
+					decode_params!(r, v, 0x10 => val: Option<bool>);
+					assert_eq!(val, Some(true));
+					Ok(())
+				},
+			);
+		}
+	}
+
+	#[test]
+	fn test_param_location_all_versions() {
+		let loc = Location { group: 5, object: 3 };
+		for version in [
+			Version::Draft14,
+			Version::Draft15,
+			Version::Draft16,
+			Version::Draft17,
+			Version::Draft18,
+		] {
+			round_trip_params(
+				version,
+				|w, v| {
+					encode_params!(w, v, 0x09 => loc.clone());
+					Ok(())
+				},
+				|r, v| {
+					decode_params!(r, v, 0x09 => val: Option<Location>);
+					assert_eq!(val, Some(Location { group: 5, object: 3 }));
+					Ok(())
+				},
+			);
+		}
+	}
+
+	#[test]
+	fn test_param_location_wire_vectors() -> Result<(), EncodeError> {
+		let location = Location {
+			group: 255,
+			object: 128,
+		};
+		// Draft-16 wraps the two varints in a Key-Value-Pair Length; from draft-17 a
+		// Message Parameter has no Length and a Location value is two bare varints. The
+		// inner format differs too: QUIC-style before draft-17, leading-ones after.
+		for (version, expected) in [
+			(Version::Draft16, &[0x01, 0x09, 0x04, 0x40, 0xff, 0x40, 0x80][..]),
+			(Version::Draft17, &[0x01, 0x09, 0x80, 0xff, 0x80, 0x80][..]),
+			(Version::Draft18, &[0x01, 0x09, 0x80, 0xff, 0x80, 0x80][..]),
+			(Version::Draft19, &[0x01, 0x09, 0x80, 0xff, 0x80, 0x80][..]),
+			(Version::Draft20, &[0x01, 0x09, 0x80, 0xff, 0x80, 0x80][..]),
+		] {
+			let mut buf = BytesMut::new();
+			encode_params!(&mut buf, version, 0x09 => location.clone());
+			assert_eq!(&buf[..], expected, "{version}");
+
+			let mut encoded = Bytes::copy_from_slice(expected);
+			let decoded = (|| -> Result<Option<Location>, DecodeError> {
+				decode_params!(&mut encoded, version, 0x09 => value: Option<Location>);
+				Ok(value)
+			})()
+			.expect("fixed Location vector should decode");
+			assert_eq!(decoded, Some(location), "{version}");
+			assert!(!encoded.has_remaining(), "{version}");
+		}
+		Ok(())
+	}
+
+	#[test]
+	fn test_param_filter_all_versions() {
+		for version in [
+			Version::Draft14,
+			Version::Draft15,
+			Version::Draft16,
+			Version::Draft17,
+			Version::Draft18,
+		] {
+			round_trip_params(
+				version,
+				|w, v| {
+					encode_params!(w, v, 0x21 => Filter::NextObject);
+					Ok(())
+				},
+				|r, v| {
+					decode_params!(r, v, 0x21 => val: Option<Filter>);
+					assert_eq!(val, Some(Filter::NextObject));
+					Ok(())
+				},
+			);
+		}
+	}
+
+	#[test]
+	fn test_param_multiple_delta_encoding() {
+		for version in [
+			Version::Draft14,
+			Version::Draft15,
+			Version::Draft16,
+			Version::Draft17,
+			Version::Draft18,
+		] {
+			round_trip_params(
+				version,
+				|w, v| {
+					encode_params!(w, v,
+						0x10 => true,
+						0x20 => 200u8,
+						0x21 => Filter::NextObject,
+						0x22 => 2u8,
+					);
+					Ok(())
+				},
+				|r, v| {
+					decode_params!(r, v,
+						0x10 => forward: Option<bool>,
+						0x20 => sub_pri: Option<u8>,
+						0x21 => filter: Option<Filter>,
+						0x22 => group_order: Option<u8>,
+					);
+					assert_eq!(forward, Some(true));
+					assert_eq!(sub_pri, Some(200));
+					assert_eq!(filter, Some(Filter::NextObject));
+					assert_eq!(group_order, Some(2));
+					Ok(())
+				},
+			);
+		}
+	}
+
+	#[test]
+	fn test_param_empty_set() {
+		for version in [
+			Version::Draft14,
+			Version::Draft15,
+			Version::Draft16,
+			Version::Draft17,
+			Version::Draft18,
+		] {
+			round_trip_params(
+				version,
+				|w, v| {
+					encode_params!(w, v,);
+					Ok(())
+				},
+				|r, v| {
+					decode_params!(r, v,);
+					Ok(())
+				},
+			);
+		}
+	}
+
+	#[test]
+	fn test_param_option_skip_none() {
+		for version in [
+			Version::Draft14,
+			Version::Draft15,
+			Version::Draft16,
+			Version::Draft17,
+			Version::Draft18,
+		] {
+			round_trip_params(
+				version,
+				|w, v| {
+					let loc: Option<Location> = None;
+					encode_params!(w, v,
+						0x09 => loc,
+						0x10 => true,
+					);
+					Ok(())
+				},
+				|r, v| {
+					decode_params!(r, v,
+						0x09 => loc: Option<Location>,
+						0x10 => forward: Option<bool>,
+					);
+					assert_eq!(loc, None);
+					assert_eq!(forward, Some(true));
+					Ok(())
+				},
+			);
+		}
+	}
+
+	#[test]
+	fn test_param_option_encode_some() {
+		for version in [
+			Version::Draft14,
+			Version::Draft15,
+			Version::Draft16,
+			Version::Draft17,
+			Version::Draft18,
+		] {
+			round_trip_params(
+				version,
+				|w, v| {
+					let loc = Some(Location { group: 10, object: 5 });
+					encode_params!(w, v,
+						0x09 => loc,
+						0x10 => true,
+					);
+					Ok(())
+				},
+				|r, v| {
+					decode_params!(r, v,
+						0x09 => loc: Option<Location>,
+						0x10 => forward: Option<bool>,
+					);
+					assert_eq!(loc, Some(Location { group: 10, object: 5 }));
+					assert_eq!(forward, Some(true));
+					Ok(())
+				},
+			);
+		}
+	}
+
+	#[test]
+	fn test_param_bare_type_defaults() {
+		// Bare types use T::default() when the parameter is absent
+		for version in [
+			Version::Draft14,
+			Version::Draft15,
+			Version::Draft16,
+			Version::Draft17,
+			Version::Draft18,
+		] {
+			round_trip_params(
+				version,
+				|w, v| {
+					// Encode only 0x10, not 0x20
+					encode_params!(w, v, 0x10 => true);
+					Ok(())
+				},
+				|r, v| {
+					decode_params!(r, v,
+						0x10 => forward: bool,
+						0x20 => priority: u8,
+					);
+					assert!(forward);
+					assert_eq!(priority, 0); // u8::default()
+					Ok(())
+				},
+			);
+		}
+	}
+
+	#[test]
+	fn test_param_unknown_rejected() {
+		// Manually encode one param at key 0x10, try to decode expecting key 0x20
+		for version in [
+			Version::Draft14,
+			Version::Draft15,
+			Version::Draft16,
+			Version::Draft17,
+			Version::Draft18,
+		] {
+			let mut buf = BytesMut::new();
+			1usize.encode(&mut buf, version).unwrap();
+			0x10u64.encode(&mut buf, version).unwrap();
+			true.param_encode(&mut buf, version).unwrap();
+
+			let mut bytes = buf.freeze();
+			let result: Result<(), DecodeError> = (|| {
+				decode_params!(&mut bytes, version, 0x20 => val: Option<u8>);
+				let _ = val;
+				Ok(())
+			})();
+			if matches!(version, Version::Draft14 | Version::Draft15) {
+				result.unwrap();
+				assert!(!bytes.has_remaining());
+			} else {
+				assert!(matches!(result, Err(DecodeError::InvalidValue)), "{version}");
+			}
+		}
+	}
+
+	#[test]
+	fn legacy_unknown_parameter_is_ignored() {
+		for version in [Version::Draft14, Version::Draft15] {
+			for data in [
+				&[2, 0x3e, 1, 0x20, 7][..],
+				&[2, 0x3d, 1, 42, 0x20, 7][..],
+				// Unknown ids may repeat.
+				&[3, 0x3e, 1, 0x3e, 2, 0x20, 7][..],
+				&[3, 0x3d, 1, 42, 0x3d, 1, 43, 0x20, 7][..],
+			] {
+				let mut bytes = data;
+				let result: Result<Option<u8>, DecodeError> = (|| {
+					decode_params!(&mut bytes, version, 0x20 => priority: Option<u8>);
+					Ok(priority)
+				})();
+				assert_eq!(result.unwrap(), Some(7));
+				assert!(bytes.is_empty());
+			}
+		}
+	}
+
+	#[test]
+	fn test_param_duplicate_rejected() {
+		// Manually construct a buffer with duplicate key 0x20
+		for version in [
+			Version::Draft14,
+			Version::Draft15,
+			Version::Draft16,
+			Version::Draft17,
+			Version::Draft18,
+		] {
+			let mut buf = BytesMut::new();
+			// Encode count = 2
+			2usize.encode(&mut buf, version).unwrap();
+			match version {
+				Version::Draft14 | Version::Draft15 => {
+					// Plain (non-delta) keys: first key=0x20, second key=0x20
+					0x20u64.encode(&mut buf, version).unwrap();
+					100u8.param_encode(&mut buf, version).unwrap();
+					0x20u64.encode(&mut buf, version).unwrap();
+					200u8.param_encode(&mut buf, version).unwrap();
+				}
+				_ => {
+					// Delta-encoded: first delta=0x20 (abs=0x20), second delta=0 (abs=0x20)
+					0x20u64.encode(&mut buf, version).unwrap();
+					100u8.param_encode(&mut buf, version).unwrap();
+					0u64.encode(&mut buf, version).unwrap();
+					200u8.param_encode(&mut buf, version).unwrap();
+				}
+			}
+
+			let mut bytes = buf.freeze();
+			let result: Result<(), DecodeError> = (|| {
+				decode_params!(&mut bytes, version, 0x20 => val: Option<u8>);
+				let _ = val;
+				Ok(())
+			})();
+			assert!(
+				matches!(result, Err(DecodeError::Duplicate)),
+				"expected Duplicate for {version}"
+			);
+		}
+	}
+
+	/// A parameter the draft lets repeat, such as AUTHORIZATION TOKEN, keeps every
+	/// instance instead of failing the message as a duplicate.
+	#[test]
+	fn test_param_repeat_allowed() {
+		for version in [Version::Draft15, Version::Draft16, Version::Draft17, Version::Draft20] {
+			let mut buf = BytesMut::new();
+			2usize.encode(&mut buf, version).unwrap();
+			0x03u64.encode(&mut buf, version).unwrap();
+			Opaque(vec![0xAA]).param_encode(&mut buf, version).unwrap();
+			// The second key: absolute before draft-16, a zero delta after.
+			let second: u64 = if version == Version::Draft15 { 0x03 } else { 0 };
+			second.encode(&mut buf, version).unwrap();
+			Opaque(vec![0xBB]).param_encode(&mut buf, version).unwrap();
+
+			let mut bytes = buf.freeze();
+			let tokens = (|| -> Result<Vec<Opaque>, DecodeError> {
+				decode_params!(&mut bytes, version, 0x03 => tokens: Vec<Opaque>);
+				Ok(tokens)
+			})()
+			.unwrap_or_else(|e| panic!("{version}: {e}"));
+			assert_eq!(tokens, vec![Opaque(vec![0xAA]), Opaque(vec![0xBB])], "{version}");
+			assert!(!bytes.has_remaining(), "{version}");
+		}
+	}
+
+	/// Draft-14 lets AUTHORIZATION TOKEN repeat and has unknown parameters, duplicates
+	/// included, ignored. The block is consumed whole either way.
+	#[test]
+	fn test_skip_allows_draft14_repeats() {
+		#[rustfmt::skip]
+		let block = [
+			0x04, // Number of Parameters
+			0x03, 0x01, 0xAA, // AUTHORIZATION TOKEN
+			0x03, 0x01, 0xBB, // and again
+			0x3E, 0x05, // an unknown varint parameter
+			0x3E, 0x06, // and again
+		];
+		let mut buf = &block[..];
+		Parameters::skip(&mut buf, Version::Draft14).unwrap();
+		assert!(buf.is_empty());
+	}
+}

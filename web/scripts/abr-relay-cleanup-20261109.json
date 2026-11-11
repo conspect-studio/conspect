@@ -1,0 +1,13 @@
+{
+  "checkedAt": "2026-11-09T05:25:00Z",
+  "ownedRelayId": "479b5479594d5398a738dd0538a44711",
+  "accountDiscoveryHttpStatus": 200,
+  "exactRelayGetHttpStatus": 404,
+  "relayListHttpStatus": 200,
+  "relayListSuccess": true,
+  "relayListTotalCount": 0,
+  "ownedRelayPresent": false,
+  "deleteIssued": false,
+  "reason": "Already absent after host restart; no active local probe process observed.",
+  "newRelayCreated": false
+}

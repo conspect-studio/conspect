@@ -1,9 +1,14 @@
 [patch.crates-io]
+web-transport-trait = { path = "vendor/web-transport-trait" }
+moq-tokio = { path = "vendor/moq-tokio" }
+moq-net = { path = "vendor/moq-net" }
+web-transport-moq = { path = "vendor/web-transport-moq" }
 rustls-platform-verifier = { path = "vendor/rustls-platform-verifier" }
 
 [workspace]
 resolver = "2"
 members = ["crates/*", "xtask"]
+exclude = ["vendor/moq-net", "vendor/web-transport-moq", "vendor/web-transport-trait", "vendor/moq-tokio"]
 
 [workspace.package]
 version = "0.1.0"
@@ -105,6 +110,7 @@ multiview-ntpsys = { path = "crates/multiview-ntpsys" }
 multiview-i915pmu = { path = "crates/multiview-i915pmu" }
 multiview-ndi-sys = { path = "crates/multiview-ndi-sys" }
 multiview-rist-sys = { path = "crates/multiview-rist-sys" }
+multiview-srt-sys = { path = "crates/multiview-srt-sys" }
 multiview-cli = { path = "crates/multiview-cli" }
 
 [profile.release]
