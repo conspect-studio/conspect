@@ -335,7 +335,8 @@ pub struct ScopeCapabilities {
     /// The per-output rendition scope.
     pub outputs: ScopeCapability,
     /// Whole-system composed wall; available only while its worker is ready.
-    pub wall: ScopeCapability,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub wall: Option<ScopeCapability>,
 }
 
 /// The `GET /api/v1/preview/capabilities` response (ADR-P006 move 6): what preview
@@ -382,10 +383,10 @@ impl PreviewCapabilities {
                     whep: webrtc,
                     fidelity: None,
                 },
-                wall: ScopeCapability {
+                wall: Some(ScopeCapability {
                     whep: webrtc && provider.wall_available(),
                     fidelity: None,
-                },
+                }),
             },
             focus: provider.focus_limits(),
             fallback: "jpeg".to_owned(),

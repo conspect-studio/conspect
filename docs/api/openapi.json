@@ -20341,8 +20341,7 @@
         "required": [
           "program",
           "inputs",
-          "outputs",
-          "wall"
+          "outputs"
         ],
         "properties": {
           "inputs": {
@@ -20358,8 +20357,15 @@
             "description": "The composited program canvas scope."
           },
           "wall": {
-            "$ref": "#/components/schemas/ScopeCapability",
-            "description": "Whole-system composed wall; available only while its worker is ready."
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/ScopeCapability",
+                "description": "Whole-system composed wall; available only while its worker is ready."
+              }
+            ]
           }
         }
       },

@@ -6989,8 +6989,7 @@ export interface components {
             outputs: components["schemas"]["ScopeCapability"];
             /** @description The composited program canvas scope. */
             program: components["schemas"]["ScopeCapability"];
-            /** @description Whole-system composed wall; available only while its worker is ready. */
-            wall: components["schemas"]["ScopeCapability"];
+            wall?: null | components["schemas"]["ScopeCapability"];
         };
         /** @description Per-scope WHEP availability (plus the program scope's fidelity label). */
         ScopeCapability: {

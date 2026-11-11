@@ -118,11 +118,15 @@ export class WallStore {
     this.root = root;
     window.__wallStats = this.stats;
     this.watch = setInterval(() => { this.publish(); }, 500);
+    window.addEventListener('pagehide', this.onPageHide);
     void this.pollLoop(root.signal);
     void this.playLoop(root.signal);
   }
 
+  private readonly onPageHide = (): void => { this.stop(); };
+
   stop(): void {
+    window.removeEventListener('pagehide', this.onPageHide);
     this.root?.abort();
     this.root = undefined;
     this.session?.abort();
@@ -213,9 +217,7 @@ export class WallStore {
   private currentGeometry(): WallGeometry | undefined { return this.geometry; }
 
   private async playLoop(signal: AbortSignal): Promise<void> {
-    const onPageHide = (): void => { this.session?.abort(); };
-    window.addEventListener('pagehide', onPageHide);
-    try { while (!signal.aborted) {
+    while (!signal.aborted) {
       const geometry = this.currentGeometry();
       if (!geometry) {
         await new Promise<void>((resolve) => {
@@ -267,7 +269,7 @@ export class WallStore {
         if (delay) await sleep(delay, signal);
       }
       // A generation change (session aborted by the poller) reopens immediately.
-    } } finally { window.removeEventListener('pagehide', onPageHide); }
+    }
   }
 }
 
