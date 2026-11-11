@@ -345,6 +345,18 @@ fn live_renditions_prune_and_restart_without_stale_segment_urls() {
     }
 }
 
+/// A master writer that always fails (the publish of the restarted run's master
+/// must not replace the previous master, and its media must survive).
+fn failing_master() -> multiview_output::hls::ManifestWriter {
+    std::sync::Arc::new(
+        |_path, _bytes, _fence: &multiview_output::hls::PublishFence| {
+            Err(multiview_output::Error::Output(
+                "injected master publish failure".to_owned(),
+            ))
+        },
+    )
+}
+
 fn master_media_uris(master: &str) -> Vec<String> {
     master
         .lines()
@@ -603,8 +615,7 @@ fn failed_master_publish_keeps_old_master_and_all_cached_media() {
     .run_av_tracks(&mut source, MuxStream::new(&params, tb), None, &[])
     .unwrap();
     let old_master = std::fs::read_to_string(dir.path().join("master.m3u8")).unwrap();
-    // Block the atomic publisher after the new rendition has been written.
-    std::fs::create_dir(dir.path().join("master.m3u8.tmp")).unwrap();
+    // Fail the master publish of the restarted run (after its renditions exist).
     let (video, params, tb) = encode_video_at(850_000);
     let mut source = VecPackets {
         packets: video.into_iter(),
@@ -616,6 +627,7 @@ fn failed_master_publish_keeps_old_master_and_all_cached_media() {
         2,
         SharedEpoch::new()
     )
+    .with_master_writer(failing_master())
     .run_av_tracks(&mut source, MuxStream::new(&params, tb), None, &[])
     .is_err());
     assert_eq!(
@@ -704,7 +716,6 @@ fn failed_master_publish_preserves_sparse_audio_reference() {
     )
     .unwrap();
     let master = std::fs::read_to_string(dir.path().join("master.m3u8")).unwrap();
-    std::fs::create_dir(dir.path().join("master.m3u8.tmp")).unwrap();
     let (video, v_params, v_tb) = encode_video_frames(850_000, 4 * 35);
     let mut source = VecPackets {
         packets: video.into_iter(),
@@ -716,6 +727,7 @@ fn failed_master_publish_preserves_sparse_audio_reference() {
         2,
         SharedEpoch::new()
     )
+    .with_master_writer(failing_master())
     .run_av_tracks(&mut source, MuxStream::new(&v_params, v_tb), None, &[])
     .is_err());
     assert_eq!(
