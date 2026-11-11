@@ -206,6 +206,10 @@ pub struct Session {
     received_rtp_total: u64,
     /// Pending keyframe requests (PLI/FIR) from the remote peer, coalesced.
     keyframe_requested: bool,
+    /// The instant of the last inbound datagram this session *accepted* (STUN
+    /// consent check, DTLS, SRTP/RTCP). The preview egress reads it to detect a
+    /// peer that vanished without signalling (liveness, not a client `DELETE`).
+    last_rx: Option<Instant>,
 }
 
 /// A decrypted media frame surfaced from the remote peer.
@@ -306,7 +310,15 @@ impl Session {
             received_rtp: VecDeque::new(),
             received_rtp_total: 0,
             keyframe_requested: false,
+            last_rx: None,
         }
+    }
+
+    /// The instant of the last inbound datagram this session accepted, or `None`
+    /// if the peer has never been heard from.
+    #[must_use]
+    pub fn last_rx(&self) -> Option<Instant> {
+        self.last_rx
     }
 
     /// Drive the engine: drain `poll_output` **fully** in one pass — `Transmit`
@@ -547,6 +559,7 @@ impl Session {
         self.rtc
             .handle_input(input)
             .map_err(|e| WebRtcError::Transport(format!("handle_input: {e}")))?;
+        self.last_rx = Some(now);
         self.drive(now);
         Ok(())
     }

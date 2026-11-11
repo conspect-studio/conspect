@@ -141,6 +141,36 @@ const DEFAULT_MAX_SESSIONS: u32 = 64;
 /// session (§8).
 const DEFAULT_SESSION_IDLE_TIMEOUT: DurationString = DurationString::from_millis(30_000);
 
+/// Default `webrtc.preview_max_focus`: concurrent WHEP preview (focus) sessions
+/// server-wide. Each is its own preview encode (<= 1280 px, 15 fps, 1.5 Mbit/s),
+/// so the cap bounds encoder sessions; 4 leaves NVENC/CPU headroom for the
+/// program outputs, which are never shed for preview.
+const DEFAULT_PREVIEW_MAX_FOCUS: u32 = 4;
+
+/// Default `webrtc.preview_max_focus_per_scope`: per program/input/output scope.
+const DEFAULT_PREVIEW_MAX_FOCUS_PER_SCOPE: u32 = 3;
+
+/// Default `webrtc.preview_session_timeout`: a preview viewer silent this long
+/// (no STUN consent / RTCP / SRTP) is reaped and its focus slot freed. Browsers
+/// send RTCP about once a second and RFC 7675 consent checks every ~5 s, so 8 s
+/// tolerates a lost burst while keeping the slot-reuse delay under ~10 s.
+const DEFAULT_PREVIEW_SESSION_TIMEOUT: DurationString = DurationString::from_millis(8_000);
+
+/// Default `webrtc.preview_max_focus` (serde shape).
+const fn default_preview_max_focus() -> u32 {
+    DEFAULT_PREVIEW_MAX_FOCUS
+}
+
+/// Default `webrtc.preview_max_focus_per_scope` (serde shape).
+const fn default_preview_max_focus_per_scope() -> u32 {
+    DEFAULT_PREVIEW_MAX_FOCUS_PER_SCOPE
+}
+
+/// Default `webrtc.preview_session_timeout` (serde shape).
+const fn default_preview_session_timeout() -> DurationString {
+    DEFAULT_PREVIEW_SESSION_TIMEOUT
+}
+
 /// Default `webrtc.udp_port` (serde shape).
 const fn default_udp_port() -> u16 {
     DEFAULT_UDP_PORT
@@ -185,6 +215,24 @@ fn is_default_max_sessions(sessions: &u32) -> bool {
 #[allow(clippy::trivially_copy_pass_by_ref)]
 fn is_default_session_idle_timeout(timeout: &DurationString) -> bool {
     *timeout == DEFAULT_SESSION_IDLE_TIMEOUT
+}
+
+// serde's `skip_serializing_if` contract (see `is_default_udp_port`).
+#[allow(clippy::trivially_copy_pass_by_ref)]
+fn is_default_preview_max_focus(n: &u32) -> bool {
+    *n == DEFAULT_PREVIEW_MAX_FOCUS
+}
+
+// serde's `skip_serializing_if` contract (see `is_default_udp_port`).
+#[allow(clippy::trivially_copy_pass_by_ref)]
+fn is_default_preview_max_focus_per_scope(n: &u32) -> bool {
+    *n == DEFAULT_PREVIEW_MAX_FOCUS_PER_SCOPE
+}
+
+// serde's `skip_serializing_if` contract (see `is_default_udp_port`).
+#[allow(clippy::trivially_copy_pass_by_ref)]
+fn is_default_preview_session_timeout(t: &DurationString) -> bool {
+    *t == DEFAULT_PREVIEW_SESSION_TIMEOUT
 }
 
 /// Skip-serializing predicate for the default `cors_allow_origins` (`["*"]`).
@@ -237,6 +285,29 @@ pub struct WebrtcConfig {
         skip_serializing_if = "is_default_session_idle_timeout"
     )]
     pub session_idle_timeout: DurationString,
+    /// Maximum concurrent WHEP **preview (focus)** sessions server-wide. Each is
+    /// its own preview encode, so this bounds preview encoder sessions. Reported
+    /// by `GET /api/v1/preview/capabilities`. Default `4`.
+    #[serde(
+        default = "default_preview_max_focus",
+        skip_serializing_if = "is_default_preview_max_focus"
+    )]
+    pub preview_max_focus: u32,
+    /// Maximum concurrent preview sessions for any single scope (program, one
+    /// input, one output). Default `3`.
+    #[serde(
+        default = "default_preview_max_focus_per_scope",
+        skip_serializing_if = "is_default_preview_max_focus_per_scope"
+    )]
+    pub preview_max_focus_per_scope: u32,
+    /// A preview viewer that sends nothing (STUN consent / RTCP / SRTP) for this
+    /// long is considered gone and its focus slot is freed without a client
+    /// `DELETE`. Explicit-unit duration (`"8s"`). Default `"8s"`.
+    #[serde(
+        default = "default_preview_session_timeout",
+        skip_serializing_if = "is_default_preview_session_timeout"
+    )]
+    pub preview_session_timeout: DurationString,
     /// CORS allow-list applied **only** to the media-signalling routes (WHIP,
     /// WHEP, preview-WHEP, capabilities), with `Access-Control-Allow-Headers:
     /// authorization, content-type` and `Access-Control-Expose-Headers:
@@ -343,6 +414,9 @@ impl Default for WebrtcConfig {
             advertised_addresses: Vec::new(),
             max_sessions: DEFAULT_MAX_SESSIONS,
             session_idle_timeout: DEFAULT_SESSION_IDLE_TIMEOUT,
+            preview_max_focus: DEFAULT_PREVIEW_MAX_FOCUS,
+            preview_max_focus_per_scope: DEFAULT_PREVIEW_MAX_FOCUS_PER_SCOPE,
+            preview_session_timeout: DEFAULT_PREVIEW_SESSION_TIMEOUT,
             cors_allow_origins: default_cors_allow_origins(),
             ice_servers: Vec::new(),
         }
@@ -384,6 +458,19 @@ impl WebrtcConfig {
             return Err(ConfigError::Validation(
                 "webrtc.session_idle_timeout must be non-zero (a zero horizon would GC every \
                  session immediately)"
+                    .to_owned(),
+            ));
+        }
+        if self.preview_max_focus == 0 || self.preview_max_focus_per_scope == 0 {
+            return Err(ConfigError::Validation(
+                "webrtc.preview_max_focus and webrtc.preview_max_focus_per_scope must be >= 1"
+                    .to_owned(),
+            ));
+        }
+        if self.preview_session_timeout.millis() < 3_000 {
+            return Err(ConfigError::Validation(
+                "webrtc.preview_session_timeout must be >= 3s (browsers send consent checks \
+                 every ~5 s; a shorter horizon would reap live viewers)"
                     .to_owned(),
             ));
         }
