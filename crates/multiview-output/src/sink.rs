@@ -50,7 +50,7 @@ use multiview_ffmpeg::{
 use crate::epoch::SharedEpoch;
 use crate::error::{Error, Result};
 use crate::hls::{
-    atomic_write, media_segment_references, media_segment_uris, AudioRendition, LivePlaylist,
+    media_segment_references, media_segment_uris, AudioRendition, BackgroundFile, LivePlaylist,
     MasterPlaylist, MediaPlaylist, Segment, SegmentType, VariantStream,
 };
 use crate::metadata::{DisplayMatrix, MetadataScope, MuxMetadata};
@@ -1762,6 +1762,9 @@ pub struct PacketMuxSink {
     display_matrix: Option<DisplayMatrix>,
     /// Which audio this sink carries (#151/#152). Default: program only.
     audio_selection: AudioSelection,
+    /// The rendition-master writer (production: fenced atomic publish). A test
+    /// seam to inject a failing master write; see `with_master_writer`.
+    master_writer: Option<crate::hls::ManifestWriter>,
 }
 
 /// The two `PacketMuxSink` flavours (private; the public surface is the
@@ -1805,6 +1808,7 @@ impl PacketMuxSink {
             metadata: MuxMetadata::new(),
             display_matrix: None,
             audio_selection: AudioSelection::default(),
+            master_writer: None,
         }
     }
 
@@ -1820,6 +1824,7 @@ impl PacketMuxSink {
             metadata: MuxMetadata::new(),
             display_matrix: None,
             audio_selection: AudioSelection::default(),
+            master_writer: None,
         }
     }
 
@@ -1840,7 +1845,17 @@ impl PacketMuxSink {
             metadata: MuxMetadata::new(),
             display_matrix: None,
             audio_selection: AudioSelection::default(),
+            master_writer: None,
         }
+    }
+
+    /// Replace the rendition-master writer (test seam: inject a failing or slow
+    /// master publish). Production uses the fenced atomic writer.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn with_master_writer(mut self, writer: crate::hls::ManifestWriter) -> Self {
+        self.master_writer = Some(writer);
+        self
     }
 
     /// A **rolling live** segmented (HLS) sink (HLS-0/1, ADR-0032): like
@@ -1873,6 +1888,7 @@ impl PacketMuxSink {
             metadata: MuxMetadata::new(),
             display_matrix: None,
             audio_selection: AudioSelection::default(),
+            master_writer: None,
         }
     }
 
@@ -2047,6 +2063,9 @@ impl PacketMuxSink {
                 );
                 state.set_meta(&self.metadata, self.display_matrix);
                 state.set_tracks(&self.audio_selection, track_streams);
+                if let Some(writer) = self.master_writer.as_ref() {
+                    state.master_writer = std::sync::Arc::clone(writer);
+                }
                 // The rolling-live driver: each closed segment is published into a
                 // windowed `.m3u8` on disk (atomic) and the evicted `.ts` pruned,
                 // PDT-stamped from the shared outbound epoch (ADR-M010).
@@ -2059,6 +2078,8 @@ impl PacketMuxSink {
                 if next != 0 {
                     live.set_initial_discontinuity();
                 }
+                // #220: manifest write + fsync + rename off the packet path.
+                live.enable_background_publish()?;
                 state.seg_index = next;
                 state.live = Some(live);
                 state.set_audio_renditions(
@@ -2068,7 +2089,7 @@ impl PacketMuxSink {
                     video,
                     audio,
                     track_streams,
-                );
+                )?;
                 let driven = state.drive_from_packets(source);
                 finish_segments(state, driven, video.time_base)
                     .map(|result| PacketMuxOutcome::Segment(Box::new(result)))
@@ -2176,6 +2197,8 @@ struct SegmentState<'a> {
     /// ONCE, after the program audio, plus the per-track seeds. Empty ⇒
     /// unchanged layout.
     tracks: Option<(&'a AudioSelection, &'a [MuxStream<'a>])>,
+    /// The rendition-master writer (production default; tests may inject one).
+    master_writer: crate::hls::ManifestWriter,
 }
 
 /// One audio-only MPEG-TS muxer, opened ONCE at the run's first video keyframe
@@ -2205,6 +2228,11 @@ struct AudioRenditions<'a> {
     video: AudioRenditionState<'a>,
     master: PathBuf,
     master_text: Option<String>,
+    /// The master is static for a run: queued once (#220) to an off-packet-path
+    /// publisher, never written + fsynced inline on a segment close.
+    master_published: bool,
+    /// The off-packet-path writer for the master (spawned on first publish).
+    master_writer: Option<BackgroundFile>,
     retention_window: usize,
 }
 
@@ -2266,6 +2294,7 @@ impl<'a> SegmentState<'a> {
             meta: None,
             tracks: None,
             renditions: None,
+            master_writer: crate::hls::default_writer(),
         }
     }
 
@@ -2281,7 +2310,7 @@ impl<'a> SegmentState<'a> {
         video: MuxStream<'a>,
         audio: Option<MuxStream<'a>>,
         tracks: &'a [MuxStream<'a>],
-    ) {
+    ) -> Result<()> {
         let default_selection = AudioSelection::default();
         let selection = self
             .tracks
@@ -2295,6 +2324,7 @@ impl<'a> SegmentState<'a> {
                 let uri = format!("audio-program-g{generation}.m3u8");
                 let mut live = LivePlaylist::new(parent.join(&uri), window);
                 live.set_epoch_source(epoch.clone());
+                live.enable_background_publish()?;
                 live.set_media_sequence(self.seg_index);
                 if self.seg_index != 0 {
                     live.set_initial_discontinuity();
@@ -2322,6 +2352,7 @@ impl<'a> SegmentState<'a> {
             let uri = format!("audio-track{}-g{generation}.m3u8", track.index);
             let mut live = LivePlaylist::new(parent.join(&uri), window);
             live.set_epoch_source(epoch.clone());
+            live.enable_background_publish()?;
             live.set_media_sequence(self.seg_index);
             if self.seg_index != 0 {
                 live.set_initial_discontinuity();
@@ -2346,6 +2377,7 @@ impl<'a> SegmentState<'a> {
         let video_uri = format!("video-g{generation}.m3u8");
         let mut video_live = LivePlaylist::new(parent.join(&video_uri), window);
         video_live.set_epoch_source(epoch);
+        video_live.enable_background_publish()?;
         video_live.set_media_sequence(self.seg_index);
         if self.seg_index != 0 {
             video_live.set_initial_discontinuity();
@@ -2404,8 +2436,11 @@ impl<'a> SegmentState<'a> {
             },
             master: parent.join("master.m3u8"),
             master_text: bandwidth.map(|_| master.render()),
+            master_published: false,
+            master_writer: None,
             retention_window: window,
         });
+        Ok(())
     }
 
     /// Open or redirect every audio-only rendition muxer to segment `index`'s
@@ -3004,18 +3039,29 @@ impl<'a> SegmentState<'a> {
                 segment.start_pts.as_nanos(),
             )?;
         }
-        if let Some(renditions) = self.renditions.as_ref() {
+        if let Some(renditions) = self.renditions.as_mut() {
             // Publish master last, after video and every audio playlist exist.
             // A run without valid video bitrate metadata still serves the legacy
             // index and media playlists, but never publishes a false BANDWIDTH.
             if let Some(master_text) = renditions.master_text.as_ref() {
-                if renditions
-                    .states
-                    .iter()
-                    .all(|state| state.live.playlist_path().exists())
+                if !renditions.master_published
+                    && renditions
+                        .states
+                        .iter()
+                        .all(|state| state.live.playlist_path().exists())
                     && renditions.video.live.playlist_path().exists()
                 {
-                    atomic_write(&renditions.master, master_text.as_bytes())?;
+                    // Ordering is preserved: every media playlist exists before
+                    // the master is queued. Pruning of the previous run's files
+                    // still waits until the on-disk master equals this text
+                    // (`current_renditions_ready`).
+                    let writer = BackgroundFile::spawn_with(
+                        renditions.master.clone(),
+                        self.master_writer.clone(),
+                    )?;
+                    writer.publish(master_text.clone());
+                    renditions.master_writer = Some(writer);
+                    renditions.master_published = true;
                 }
             } else if renditions.video.live.playlist_path().exists() {
                 // No trustworthy BANDWIDTH: retire the previous master only once
@@ -3101,6 +3147,49 @@ impl<'a> SegmentState<'a> {
                 .chain(std::iter::once(&mut renditions.video))
             {
                 state.live.finalize()?;
+            }
+            // Every media playlist is durable now (finalize joined each
+            // publisher). Publish the master if a close has not queued it yet
+            // (short runs close before the background media writes land).
+            if let Some(text) = renditions.master_text.clone() {
+                let writer = match renditions.master_writer.take() {
+                    Some(writer) => Some(writer),
+                    None if renditions
+                        .states
+                        .iter()
+                        .all(|state| state.live.playlist_path().exists())
+                        && renditions.video.live.playlist_path().exists() =>
+                    {
+                        Some(BackgroundFile::spawn_with(
+                            renditions.master.clone(),
+                            self.master_writer.clone(),
+                        )?)
+                    }
+                    None => None,
+                };
+                if let Some(writer) = writer {
+                    writer.finish(text)?;
+                    renditions.master_published = true;
+                }
+            }
+        }
+        // The master is published off the packet path (#220), so a close may
+        // have run before it landed. Now that it is durable, reap the previous
+        // generations exactly as a later close would have.
+        if let Some(renditions) = self.renditions.as_ref() {
+            if current_renditions_ready(renditions) {
+                prune_prior_rendition_manifests(
+                    self.dir,
+                    renditions,
+                    self.seg_index
+                        .saturating_sub(segment_grace(renditions.retention_window)),
+                );
+                prune_prior_live_segments(
+                    self.dir,
+                    self.prefix,
+                    self.seg_index,
+                    renditions.retention_window,
+                );
             }
         }
         Ok(())
