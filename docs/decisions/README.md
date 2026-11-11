@@ -22,6 +22,7 @@ These ADRs capture the load-bearing decisions for the Multiview engine. 169 ADRs
 - [ADR-0016](ADR-0016.md) — Efficient overlay rendering: GPU glyph-atlas text + libass subtitles + cached/dirty-region compositing *(Proposed)*
 - [ADR-0019](ADR-0019.md) — Native multi-form caption ingest: unified cue model decoded in-demux into a per-tile sampled cue store *(Proposed)*
 - [ADR-0024](ADR-0024.md) — Native caption master-fetch over libav avio (no `curl`, no HTTP dep) + bounded retry; fetcher seam for offline tests *(Accepted)*
+- [ADR-0105](ADR-0105.md) — macOS GPU compositing on wgpu's Metal backend (NV12 as R8+RG8 planes); native IOSurface path deferred until a measured copy-bound workload; amends ADR-0004's rationale *(Accepted)*
 - [ADR-0044](ADR-0044.md) — Local display output via DRM/KMS: the off-by-default `display-kms` raw-frame sink (drm-rs + gbm), mailbox flip policy, scanout affinity *(Accepted)*
 - [ADR-0045](ADR-0045.md) — Display-node mode: `multiview node` subcommand, enrollment/pairing, node presentation discipline, display-locked clock option *(Accepted)*
 - [ADR-0048](ADR-0048.md) — WebRTC transport endpoint: new leaf crate `multiview-webrtc` (feature `native`, str0m =0.16.2 pinned) owning ALL native WebRTC transport (relocated from `multiview-preview`'s `webrtc-native`) — ONE dual-stack `[::]` UDP socket (default 8189) muxing every session (WHIP ingest · WHEP preview · WHEP output viewers · WHIP push) by ICE-ufrag/learned-addr, full-ICE (never ice-lite) with IPv6-first host candidates + `webrtc.advertised_addresses`, per-run self-signed DTLS cert, one bounded driver task the engine never awaits (inv #10), session GC + `max_sessions` *(Proposed)*
@@ -288,7 +289,6 @@ Decisions from the 2026-06-13 operator feature-request intake (all **Proposed**)
 - [ADR-0104](ADR-0104.md) — Switcher slice 2: any configured source on Preview/Program, AUTO mix inside the one Program drive, fresh-frame take gate
 - [ADR-0102](ADR-0102.md) — Web engine (supervised headless browser host, security boundary, GPU placement, per-job accounting)
 - [ADR-0103](ADR-0103.md) — Shared monitor wall: compose once, encode once, one MoQ stream for Preview and source tiles
-- [ADR-0105](ADR-0105.md) — macOS GPU compositing on wgpu's Metal backend; native IOSurface path deferred until a measured copy-bound workload
 - [ADR-0100](ADR-0100.md) — VT clip jobs (web capture and URL fetch fill media assets; slot storage on Disk or Memory)
 - [ADR-0101](ADR-0101.md) — Web site templates (declarative site definitions, Windy first, operator acceptance of site terms)
 - [ADR-0084](ADR-0084.md) — SIP/SIPS + SRTP stack & seam (inbound call = source, outbound = output/return)
