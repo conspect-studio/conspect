@@ -53,14 +53,32 @@ from `moq-noq-udp`, already a dependency), and classifies each datagram: 0-3 STU
 64-127 and 192-255 go to the QUIC lane (64-79 to the TURN client instead when the source is a TURN
 server it allocated on); 4-19 are dropped. The QUIC endpoint is built with
 `EndpointConfig::grease_quic_bit(false)`: RFC 9443 sections 1 and 3 require a multiplexing endpoint
-not to send `grease_quic_bit` (RFC 9287), and only then is 128-191 never QUIC. Each lane has two
-bounded queues (established flows 1024, new flows 256, new flows behind a per-source token bucket),
-fed by `try_send`; full means drop and count. Sends bypass the dispatcher and go straight to the
-socket with GSO. The QUIC stack sees the socket only through `AsyncUdpSocket`/`UdpSender`.
+not to send `grease_quic_bit` (RFC 9287); then compliant v1/v2 packets never use 128-191 (a Version
+Negotiation packet, which fixes only its top bit per RFC 8999 section 5.3, or a noncompliant packet
+with the fixed bit cleared, is dropped, never delivered to QUIC). Each lane has two bounded queues:
+established (4-tuples the consumers mark only after validation: ICE connected with STUN
+MESSAGE-INTEGRITY, or a confirmed QUIC handshake; bounded by the session caps, never cleared by
+traffic) and new (behind a per-source token bucket with LRU eviction and a global budget). All fed
+by `try_send`; full means drop and count. Version Negotiation and stateless resets, which noq sends
+outside the 3x amplification limit, pass the new-flow limits, and the endpoint-wide
+`min_reset_interval` is set explicitly. Sends bypass the dispatcher and go straight to the socket
+with GSO. The QUIC stack sees the socket only through `AsyncUdpSocket`/`UdpSender`. The whole front
+door runs on its own Tokio runtime (`network.workers` OS threads), never on the runtime that drives
+the output clock: today that clock is a `tokio::spawn`ed task on the main runtime
+(`crates/multiview-engine/src/programset.rs:546`, `runtime.rs:125`, `crates/multiview-cli/src/main.rs:124`).
+On Linux, validated flows are steered to their own socket in a `SO_REUSEPORT` group, so a flood of
+unvalidated traffic fills a kernel queue no paying viewer shares.
 
 B. **HTTP/3 for the site: the engine terminates TLS (shape 1).** One QUIC endpoint (ALPN `h3`, the
-same ACME certificate as TCP) serves both the site/API and MoQ. Per request it routes extended CONNECT
-`:protocol=webtransport` under `/moq/` to MoQ and everything else to the existing axum router. This
+same ACME certificate as TCP) serves both the site/API and MoQ. Browsers do not pool WebTransport
+with page requests by default (Chromium `allow_pooling = false`; the MoQ client sets
+`allowPooling: false`), so in practice MoQ and the page use separate connections to the same
+endpoint; the connection driver still serves page requests and several WebTransport sessions on one
+connection when a client pools. Per request it routes extended CONNECT `:protocol=webtransport` under
+`/moq/` to MoQ and everything else to the existing axum router. The h3 settings are set explicitly
+(extended CONNECT, H3_DATAGRAM, WebTransport sessions, `max_field_section_size` 16 KiB; h3's
+defaults are off or unbounded). The WebTransport draft version emitted is pinned and measured per
+browser. This
 needs hyperium `h3` 0.0.8 + `h3-webtransport` 0.1.2 + `h3-datagram` 0.0.2 (MIT, pure Rust) and a noq
 adapter (h3-quinn 0.0.10 ported with three edits, vendored as `multiview-h3`), because the vendored
 `web-transport-moq` accepts only a CONNECT on a connection (its docs send same-port HTTP/3 to
@@ -72,31 +90,37 @@ sent only in the `serving` state (Decision H).
 C. **WebRTC on 443.** Host candidates on UDP 443 from the shared socket, plus ICE-TCP passive
 candidates (RFC 6544) on TCP 443 using str0m's `Protocol::Tcp` with RFC 4571 framing done by the
 front door. The TCP 443 listener tells ICE-TCP from TLS by the first byte: 0x16 is a TLS record,
-0x00-0x05 is an RFC 4571 length prefix of a frame no longer than 1535 bytes, anything else closes.
+0x00-0x05 is an RFC 4571 length prefix whose first frame (a STUN Binding Request for a live ufrag,
+within 5 s) is at most 1535 bytes, later frames up to the RFC 4571 maximum of 65 535; anything else
+closes.
 
 D. **Built-in TURN: yes, minimal, and last.** A TURN-over-TLS server on TCP 443, routed by SNI
 `turn.<host>`, implementing the RFC 8656 subset Allocate/Refresh/CreatePermission/Send/Data/ChannelBind
 over the TLS stream, relaying **only** in process to the engine's own WebRTC endpoint (synthetic
-relayed address; CreatePermission for any other peer is 403), with REST ephemeral credentials bound
-to one authenticated preview lease (MESSAGE-INTEGRITY and FINGERPRINT checked before any state; a
-stateless 401 nonce). No TURN over UDP. Reusing the existing codecs in `turn/message.rs`.
+relayed address; CreatePermission for any other peer is 403), with REST ephemeral credentials whose
+expiry is the preview lease's own and which die with the lease. Long-term credential flow per RFC
+8489 section 9.2 / RFC 8656 section 7.2 (401 with REALM and a stateless NONCE, 438 on a stale nonce,
+MESSAGE-INTEGRITY on every authenticated request, FINGERPRINT verified when present). The
+certificate carries the `turn.<host>` SAN, added to the ACME order when TURN is enabled. No TURN over UDP. Reusing the existing codecs in `turn/message.rs`.
 
 E. **TCP 443 demux bounds.** Global and per-IP connection caps enforced at accept, before the first
 byte; 5 s first-byte deadline; one-byte `peek` classification; 10 s TLS handshake deadline;
-ClientHello routing by SNI then ALPN (`acme-tls/1`, `http/1.1`, later `h2`); the ADR-W031
-header-read floor; ICE-TCP frames capped at 1535 bytes and the first frame must be a STUN Binding
-Request for a live ufrag within 5 s.
+ClientHello routing: ALPN exactly `acme-tls/1` to the TLS-ALPN-01 responder, SNI `turn.<host>` to
+TURN, else the site (`http/1.1`, later `h2`); the ADR-W031 header-read floor; the ICE-TCP first-frame
+rule above. `behind_proxy` mode trusts PROXY v2 only from `trusted_proxies` and fails closed.
 
 F. **Operations.** Linux: `conspect.socket` (`ListenStream=[::]:443`, `[::]:80`,
 `ListenDatagram=[::]:443`, `BindIPv6Only=both`, `ReceiveBuffer=8M`); the service keeps
 `User=operations`, `AmbientCapabilities=CAP_NET_BIND_SERVICE` is the fallback. Sockets survive an
 engine restart. One `[network]` config section replaces `webrtc.udp_port`,
-`webrtc.advertised_addresses` and the `MULTIVIEW_MOQ_BIND/_ENDPOINT/_CERTIFICATE/_PRIVATE_KEY`
-variables. Those warn for one release and are then rejected. Defaults: 443/80 on, legacy ports off.
-`/api/v1/capabilities` reports `network.udp443 = reachable | unverified | unreachable`, from a passive
-check (first completed QUIC handshake from an external address) and an optional external probe hook.
-The UI shows a banner while UDP 443 is unverified for 15 minutes, and the MoQ rung is not offered
-while it is unreachable.
+`webrtc.advertised_addresses` and the `MULTIVIEW_MOQ_BIND/_ENDPOINT` variables (warned for one
+release, then rejected). `MULTIVIEW_MOQ_CERTIFICATE/_PRIVATE_KEY` and `[control.tls] mode = "static"`
+stay until #282 is decided (Decision H). Defaults: 443/80 on, legacy ports off.
+`/api/v1/capabilities` reports `network.udp443 = reachable | unverified | unreachable`: `reachable`
+while an external QUIC handshake or an external probe succeeded within the last 24 h, then back to
+`unverified`; `unreachable` only from a failed external probe. Changes are pushed on the realtime
+channel. The UI shows a banner while UDP 443 is not `reachable` 15 minutes after startup; `Alt-Svc`
+and the MoQ rung are withheld only while it is `unreachable`.
 
 G. **Fallback.** The matrix in the design note, section 12, is normative. Targets: MoQ in <= 1.5 s
 where UDP 443 passes; WebRTC over TCP in <= 3 s where it does not (today: 4 s MoQ timeout, then a 60 s
@@ -121,7 +145,8 @@ the detail. In short:
   everything else answers 503 `/problems/tls-setup-required`, no HSTS. If the config already holds a
   complete ACME setup, issuance starts at boot with no UI step. `serving`: the ACME certificate,
   everything on. `setup` -> `serving` is a hot swap; `serving` never falls back to the bootstrap
-  certificate. The output clock, inputs and outputs run in both states.
+  certificate. The output clock, inputs and outputs run in both states. The bootstrap key is new on
+  every boot and its SAN is the public host only.
 - Challenges: `DNS-01` (Cloudflare first, API token or global key, behind a four-call provider
   interface: validate, publish, confirm at the authoritative servers, remove) and `TLS-ALPN-01` (RFC
   8737, answered on TCP 443 for ALPN `acme-tls/1` in both states). `HTTP-01` is not supported.
@@ -129,8 +154,9 @@ the detail. In short:
   URL, optional EAB, a PEM trust anchor for the directory; never an accept-invalid switch). Account
   per directory. ARI (RFC 9773) where offered, else one third of lifetime remaining.
 - Secrets are never in the TOML (env-var names, or a CLI-written 0600 file), never logged, never in
-  an API response. A credential typed into the setup page is accepted only after the operator has
-  compared the bootstrap fingerprint.
+  an API response, and never typed into the setup page: on the bootstrap certificate an interceptor
+  could read them. The page chooses non-secret settings and starts issuance against credentials
+  already stored on the host. TLS-ALPN-01 needs no secret.
 - Renewal failure keeps the current certificate and alarms at 50% and 25% of remaining lifetime.
   After expiry the front door keeps serving the expired certificate and reports `expired`; recovery
   works entirely by CLI and config (an HSTS host cannot be clicked through).
@@ -148,13 +174,14 @@ Chrome for Testing 149.0.7827.55, curl 8.14.1 (nghttp3), a native `web-transport
 
 | Claim | Proof |
 | --- | --- |
-| One UDP socket can carry HTTP/3, WebTransport and WebRTC at once with the vendored QUIC stack | Chrome loaded a page over h3 (`nextHopProtocol=h3`), opened WebTransport (ready 5.7-20.6 ms), and opened a str0m WebRTC datachannel signalled over WT (ICE+DTLS+SCTP in 23-49 ms), all on one port; 400/400 WT and 400/400 DC echoes interleaved, 3/3 runs, IPv4 and IPv6. curl `--http3-only`: 200 in 8 ms |
+| One UDP socket can carry HTTP/3, WebTransport and WebRTC at once with the vendored QUIC stack | Chrome loaded a page over h3 (`nextHopProtocol=h3`), opened WebTransport (ready 5.7-20.6 ms), and opened a str0m WebRTC datachannel signalled over WT (ICE+DTLS+SCTP in 23-49 ms), all on one port (page and WebTransport on separate QUIC connections; the pooled case is a slice 2 acceptance, not spike evidence); 400/400 WT and 400/400 DC echoes interleaved, 3/3 runs, IPv4 and IPv6. curl `--http3-only`: 200 in 8 ms |
 | The vendored stack needs no fork for socket injection | the spike used `noq::Endpoint::new_with_abstract_socket` with its own `AsyncUdpSocket` (receive from a bounded queue) and `UdpSender` (GSO send), the same seam as `vendor/moq-tokio/src/noq.rs:572-637` |
 | `web-transport-moq` cannot serve the site | its server reads the first bidirectional stream as CONNECT and fails otherwise (`vendor/web-transport-moq/src/connect.rs`, `Connecting::accept`); its crate docs point same-port HTTP/3 to `h3-webtransport` (`vendor/web-transport-moq/src/lib.rs`) |
 | h3 over noq is cheap | h3-quinn 0.0.10 compiled against moq-noq 1.3.5 after 3 edits and served both GET and WebTransport in the spike |
 | Misrouted packets are dropped, not mis-delivered | one datagram per first byte 0-255: STUN 4, DTLS 44, RTP 64, QUIC 128, dropped 16; str0m rejected every non-session datagram; noq created 0 connections |
-| Flood state stays bounded | single source at about 600 k datagrams/s for 12 s, five packet shapes: per-source bucket dropped 99.7%; noq allocated no state for random Initials; RSS flat at 9.4-12 MB; an established WT session kept 1000/1000 echoes |
-| The kernel queue is the weak point | in the same flood, `Udp RcvbufErrors` rose by 2.83 M of 3.80 M sent (rmem_max 212 992): new handshakes took 1.2-13 s and established flows saw stalls up to 4.5 s. Hence the pre-socket controls in slice 3 (nftables per-source meter, `ReceiveBuffer` via systemd, optional reuseport steering) |
+| Flood state stays bounded | single source at about 600 k datagrams/s for 12 s, five packet shapes: per-source bucket dropped 99.7%; noq allocated no state for random supported-version Initials; RSS flat at 9.4-12 MB; an established WT session kept 1000/1000 echoes. Not covered by the spike: multi-source and spoofed floods, unsupported-version Initials (VN replies), short headers with well-formed unknown CIDs (stateless resets); these are slice 3 chaos cases |
+| The kernel queue is the weak point | in the same flood, `Udp RcvbufErrors` rose by 2.83 M of 3.80 M sent (rmem_max 212 992): new handshakes took 1.2-13 s and established flows saw stalls up to 4.5 s. Hence slice 3: validated-flow steering to a separate socket (the only layer that also holds against spoofed floods), nftables per-source meter (stops real sources only), `ReceiveBuffer` via systemd; public UDP 443 opens only after slice 3 |
+| The output clock is exposed to CPU contention | a 60 Hz std thread in the spike process: late > 2 ms 15-42 idle vs 17-80 under flood per 15 s, max 4.6-8.8 ms vs 7.5-23.7 ms, on a host at load ~75. The production clock is a Tokio task on the shared main runtime, so the front door gets its own runtime and slice 3 must show no increase in "ticks behind" under flood |
 | ICE-TCP on the TLS port works in Chrome | answer with only `tcptype passive` candidates on the shared TCP port: DC open 42-54 ms, 100/100 echo, v4 and v6; `openssl s_client` on the same port classified as TLS |
 | ICE-TCP covers plain HTTP proxies, not TLS-only ones | Chrome behind a CONNECT proxy reached the ICE-TCP candidate through the proxy (Chromium routes P2P TCP through `ProxyResolvingClientSocketFactory`, `services/network/p2p/socket_tcp.cc`) with both `default` and `disable_non_proxied_udp` policies; through a proxy that passes only TLS the tunnel's first byte was 0x00, it was dropped, ICE failed |
 | TURN-TLS passes a TLS-only proxy, and must be routed by SNI | Chrome 149's `turns:` ClientHello went through the TLS-only proxy; it carries SNI and **no ALPN extension** |
@@ -171,8 +198,8 @@ Chrome for Testing 149.0.7827.55, curl 8.14.1 (nghttp3), a native `web-transport
 ## Rationale
 
 - **Why engine-owned UDP 443 is forced.** MoQ is WebTransport, which is HTTP/3. Site HTTP/3 is also
-  HTTP/3, on the same port, certificate and ALPN. A browser pools them by origin, and only one
-  process can own the UDP port. nginx cannot proxy WebTransport, so that process is the engine, and
+  HTTP/3, on the same port, certificate and ALPN, and only one process can own the UDP port (even
+  though browsers usually give WebTransport its own connection). nginx cannot proxy WebTransport, so that process is the engine, and
   for HTTP/3 to work for the site the engine must answer site requests over HTTP/3 too. Doing TCP 443
   in the engine as well then removes the only reason for nginx (one certificate, one limiter keyed
   on the real client, one place for ACME TLS-ALPN-01) and is what ICE-TCP and TURN-TLS need.
@@ -214,10 +241,15 @@ Chrome for Testing 149.0.7827.55, curl 8.14.1 (nghttp3), a native `web-transport
 - `webrtc.udp_port`, `MULTIVIEW_MOQ_BIND`, `MULTIVIEW_MOQ_ENDPOINT`, `MULTIVIEW_MOQ_CERTIFICATE`,
   `MULTIVIEW_MOQ_PRIVATE_KEY` are deprecated (warn one release, then rejected). Operators move
   firewall rules from UDP 8189/4443/9001 to UDP 443.
-- A line-rate flood from one source can still fill the kernel receive queue it shares with paying
-  viewers. The design bounds every userspace structure and puts per-source limits before the socket
-  (slice 3). Paying viewers' media continuity under such a flood is a measured slice 3 acceptance,
-  not a guarantee of this ADR.
+- A volumetric flood can still exhaust the host's network capacity; the engine cannot fix that and
+  says so. What the design does guarantee: the engine is not an amplifier, every userspace structure
+  is bounded and cannot be flushed by traffic, unvalidated traffic cannot reach the kernel queue of
+  validated flows on Linux, and the front door shares no runtime with the output clock. Paying
+  viewers' media continuity under a spoofed flood is a measured slice 3 acceptance, and public UDP
+  443 waits for it.
+- Browser coverage is measured with Chrome 149 only. Firefox, Safari, ICE-TCP through proxies other
+  than the test proxy, and the WebTransport draft each browser speaks are office-matrix acceptances
+  in slices 2, 4 and 8; every row of the fallback matrix ends at stills, never at no picture.
 - The ADR-W031 HTTP/1-only floor stays until slice 7.
 - Issues #167-#172 are re-cut into slice 5 (the design note lists what stands and what changes in
   each). The first TLS slice ships all three CA profiles and both challenges.
