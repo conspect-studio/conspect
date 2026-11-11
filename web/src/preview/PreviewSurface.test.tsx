@@ -158,6 +158,28 @@ describe('<PreviewSurface>', () => {
     expect(queryByTestId('jpeg-rung')).toBeNull();
   });
 
+  it('renders fallback diagnostics into the supplied host behind one disclosure, not beside the picture', async () => {
+    const host = document.createElement('div');
+    document.body.appendChild(host);
+    const { getByTestId } = renderWithProviders(
+      <PreviewSurface
+        scope="program"
+        whepEndpoint="/api/v1/preview/program/whep"
+        jpegPath="/api/v1/preview/program.jpg"
+        label="Program"
+        capabilities={caps()}
+        diagnosticsHost={host}
+        pcFactory={() => new IdlePeerConnection() as unknown as RTCPeerConnection}
+        fetchImpl={(): Promise<Response> => Promise.resolve(rejectSdp())}
+      />,
+    );
+    await waitFor(() => { expect(getByTestId('fallback-badge')).toBeInTheDocument(); });
+    await waitFor(() => { expect(host.querySelector('[data-testid="fallback-diagnostics"]')).not.toBeNull(); });
+    expect(host.querySelectorAll('details.ps-diagnostics')).toHaveLength(1);
+    expect(getByTestId('jpeg-rung').querySelector('[data-testid="fallback-diagnostics"]')).toBeNull();
+    host.remove();
+  });
+
   it('degrades WHEP→JPEG WITH the honest badge on a fatal session error, and retries', async () => {
     const { getByTestId, queryByTestId, getByRole } = renderWithProviders(
       <PreviewSurface

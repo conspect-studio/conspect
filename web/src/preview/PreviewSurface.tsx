@@ -10,6 +10,7 @@
 //     stall watchdog) with a VISIBLE "Fallback — still preview" badge and a
 //     "retry live preview" affordance (a fresh WHEP attempt), never a hot loop.
 import { useEffect, useMemo, useRef, useState } from 'react';
+import { createPortal } from 'react-dom';
 import { MoqPlayer } from './MoqPlayer';
 import { createMoqLeaseApi } from './moqLeaseApi';
 import type { JSX } from 'react';
@@ -75,7 +76,7 @@ function JpegRung({
       <JpegImage src={src} label={label} className={className} />
       {degraded ? (
         <div
-          className="absolute left-2 top-2 flex items-center gap-2 rounded-md bg-background/85 px-2 py-1 text-xs"
+          className="absolute left-2 top-2 flex max-w-[calc(100%-1rem)] flex-wrap items-center gap-x-2 gap-y-0.5 rounded-md bg-background/85 px-2 py-1 text-xs"
           role="status"
           data-testid="fallback-badge"
         >
@@ -126,6 +127,7 @@ export function PreviewSurface({
   fetchImpl,
   onSessionReleased,
   onLeaseState,
+  diagnosticsHost,
 }: {
   readonly scope: PreviewScope;
   /** The WHEP endpoint for this scope (e.g. `/api/v1/preview/program/whep`). */
@@ -142,6 +144,8 @@ export function PreviewSurface({
   readonly fetchImpl?: typeof fetch | undefined;
   readonly onSessionReleased?: (() => void) | undefined;
   readonly onLeaseState?: ((state: 'negotiating' | 'active' | 'released') => void) | undefined;
+  /** When set, the fallback diagnostics + busy note render into this element (below the picture) behind one disclosure. */
+  readonly diagnosticsHost?: HTMLElement | null | undefined;
 }): JSX.Element {
   // A monotonically-increasing attempt id: bumping it remounts <WhepPlayer> for
   // a fresh negotiation (the "retry live preview" affordance). `degraded` flips
@@ -219,15 +223,35 @@ export function PreviewSurface({
     if (scope === 'input') {
       return <div role="alert" className="px-3 py-2 text-sm" data-testid="input-preview-unavailable">{busy ? <Trans>Live input preview is busy. Another viewer has the session.</Trans> : <Trans>Live input preview failed.</Trans>}{released ? <Button type="button" onClick={retryNow}>Retry live preview</Button> : null}{diagnostics ? <PreviewDiagnostics diagnostics={diagnostics} /> : null}</div>;
     }
+    const busyNote = busy && !capacity ? <p role="alert"><Trans>Live preview is busy. Another viewer has the session.</Trans></p> : null;
+    const details = diagnostics ? <PreviewDiagnostics diagnostics={diagnostics} /> : null;
     return (
-      <><JpegRung
-        jpegPath={jpegPath}
-        label={label}
-        degraded
-        capacity={capacity}
-        className={className}
-        {...(released ? { onRetry: retryNow } : {})}
-      />{busy && !capacity ? <p role="alert"><Trans>Live preview is busy. Another viewer has the session.</Trans></p> : null}{diagnostics ? <PreviewDiagnostics diagnostics={diagnostics} /> : null}</>
+      <>
+        <JpegRung
+          jpegPath={jpegPath}
+          label={label}
+          degraded
+          capacity={capacity}
+          className={className}
+          {...(released ? { onRetry: retryNow } : {})}
+        />
+        {diagnosticsHost ? (
+          createPortal(
+            <>
+              {busyNote}
+              {details ? (
+                <details className="ps-diagnostics" data-testid="fallback-diagnostics">
+                  <summary><Trans>Why live preview failed</Trans></summary>
+                  {details}
+                </details>
+              ) : null}
+            </>,
+            diagnosticsHost,
+          )
+        ) : (
+          <>{busyNote}{details}</>
+        )}
+      </>
     );
   }
 
