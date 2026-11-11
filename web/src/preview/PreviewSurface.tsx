@@ -118,6 +118,18 @@ function JpegRung({
 /** The transport rung a surface is using. The ladder is MoQ, then WebRTC, then stills. */
 export type PreviewTransport = 'moq' | 'webrtc' | 'jpeg';
 
+/**
+ * The newest surface that mounted for each scope and endpoint.
+ *
+ * A MoQ lease report can arrive after its surface is gone: a late release
+ * acknowledgement, or the end of an unacknowledged-release hold. The consumer
+ * still needs that report (it may wait for 'released' to open another
+ * preview), unless a newer surface for the same scope and endpoint has mounted
+ * since. From that moment the newer surface owns the lease state, and a report
+ * from the older one must not overwrite it.
+ */
+const newestSurface = new Map<string, symbol>();
+
 export function PreviewSurface({
   scope,
   whepEndpoint,
@@ -180,6 +192,15 @@ export function PreviewSurface({
   // report goes to the consumer's latest callbacks.
   const leaseRef = useRef({ onLeaseState, onSessionReleased });
   useEffect(() => { leaseRef.current = { onLeaseState, onSessionReleased }; });
+  // One identity for this surface showing this source. `shown` is that
+  // identity while the surface is mounted with this source, else undefined.
+  const identity = useMemo(() => Symbol(surfaceKey), [surfaceKey]);
+  const shown = useRef<symbol | undefined>(undefined);
+  useEffect(() => {
+    shown.current = identity;
+    newestSurface.set(surfaceKey, identity);
+    return (): void => { shown.current = undefined; };
+  }, [surfaceKey, identity]);
   const moqApi = useMemo(() => createMoqLeaseApi(scope, whepEndpoint), [scope, whepEndpoint]);
   const canWhep = whepAvailable(capabilities, scope);
   const retryNow = (): void => {
@@ -230,6 +251,12 @@ export function PreviewSurface({
         onTransportUnavailable?.();
       }}
       onLeaseState={(state) => {
+        // Mounted with this source: the report is current. Unmounted: it is
+        // still the consumer's, unless a newer surface took this source over.
+        // (A surface that now shows another source drops the old report.)
+        const current = shown.current === identity
+          || (shown.current === undefined && newestSurface.get(surfaceKey) === identity);
+        if (!current) return;
         leaseRef.current.onLeaseState?.(state);
         if (state !== 'released') return;
         // The lease is certainly gone: stills may now give way to WebRTC.
