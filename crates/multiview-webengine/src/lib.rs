@@ -76,8 +76,8 @@ pub use usage::{
 
 // Browser capture runtime and immutable artifact service.
 pub mod artifact;
-pub mod cdp_wire;
 pub mod capture;
+pub mod cdp_wire;
 pub mod fetch;
 pub mod resource;
 pub mod runner;
