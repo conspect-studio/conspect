@@ -996,7 +996,10 @@ impl Runtime {
                     Some(_) = sessions.join_next(), if !sessions.is_empty() => {},
                     request = listener.accept() => {
                         let Some(request) = request else { break };
-                        let token = request.url().and_then(|url| url.query_pairs().find(|(k, _)| k == "ticket").map(|(_, v)| v.into_owned()));
+                        // The WebTransport backend can carry its request target as an
+                        // in-band path rather than a parsed URL. Request::query covers
+                        // both cases; URL-only extraction rejects valid browser tickets.
+                        let token = request.query().and_then(|query| url::form_urlencoded::parse(query.as_bytes()).find(|(k, _)| k == "ticket").map(|(_, v)| v.into_owned()));
                         let admitted = token.and_then(|token| {
                             let mut entries = state.entries.lock().ok()?;
                             let entry = entries.get_mut(&token)?;
@@ -1140,7 +1143,10 @@ impl Runtime {
                     _ = &mut expiry => break,
                     _ = cancel.wait_for(|value| *value) => break,
                     window = feed.windows.recv() => match window {
-                        Some(window) => { if adapter.publish(&window).is_err() { break } },
+                        Some(window) => match adapter.publish(&window) {
+                            Ok(()) | Err(crate::Reject::NeedsRap) => {},
+                            Err(_) => break,
+                        },
                         None => break,
                     }
                 }
