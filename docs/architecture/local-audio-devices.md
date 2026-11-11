@@ -76,14 +76,17 @@ device callback ──push──▶ [SPSC ring, ~200 ms] ──pop──▶ pump
   - If its own wake-up gap exceeds 50 ms, or the ring's overflow counter moved, everything in the
     ring is stale: the pump pops and discards it, resets the servo and resampler phase, and
     re-primes from fresh callback frames. Its first fresh publish carries a **discontinuity
-    boundary**: the absolute frame index of the first post-stall frame, stored in the store with
-    a generation counter (atomics, written before the publish's swap). The consumer, on a new
-    generation, clamps its cursor to `max(cursor, boundary)` and reads silence until at least
+    boundary**: the absolute frame index of the first post-stall frame and a generation number,
+    stored **inside the same immutable window snapshot** as the samples (one `SwapCell` swap
+    publishes both). `read` loads that snapshot once and makes every decision (boundary, skip,
+    prebuffer, copy) on it, so the boundary and the samples it guards are always consistent. The
+    consumer, on a new generation, clamps its cursor to `max(cursor, boundary)` and reads silence until at least
     `target` frames exist after the boundary (the live prebuffer rule, applied from the boundary),
     then plays from `head − target` (never before the boundary). Retained pre-stall samples are
     never played, whatever the size of the first fresh publish. Test: a 3 s pump stall with unread
     retained samples, with first fresh publishes both shorter and longer than the target; the
-    first non-silent sample read afterwards is post-stall.
+    first non-silent sample read afterwards is post-stall. Interleaving tests cover reads racing
+    the first post-stall publish and a ring overflow with recent publishes.
   - If the program bus pauses, the pump **keeps publishing fresh frames**. The store's 1 s
     drop-oldest window slides, so its head is always current audio. While `unread_frames` is above
     target + Q + 20 ms (Q is the run's tick quantum, for example 40 ms at 25 fps), the servo is
@@ -226,9 +229,13 @@ program bus ──push (wait-free)──▶ [engine→drain SPSC ring, ~200 ms] 
       measured again from the new device's callbacks (heartbeat thresholds use the new P); if it
       exceeds 40 ms, the stream is treated as *lost* and the reopen path applies the
       `unsupported_buffer` rule.
-    - macOS input: cpal 0.18 has no default-input monitor. The pump compares
-      `default_input_device()`'s id with the bound id every 2 s (on the pump thread, outside the
-      callback) and reopens on a change.
+    - macOS input: cpal 0.18 has no default-input monitor. The lifecycle helper (which owns all
+      cpal calls, with its deadline and stuck-state rules) reads `default_input_device()`'s id
+      every 2 s, and requests a reopen on a change. The pump never makes OS calls.
+  - **Pump/drain supervision:** the lifecycle helper also watches the pump's (or drain's) loop
+    counter. If it has not advanced for 1 s while the device is open, the device goes to the
+    latched `device_call_stuck` state (telemetry stops saying `open`); the source reads silence
+    because publishes have stopped.
   - A physical device literally named "default" is selected by its `device_id`.
   - Every open logs the name and id that were bound.
 - **One lifecycle helper per device**, a long-lived thread that owns the cpal `Stream`. Open and
@@ -338,6 +345,10 @@ own clock.
 4. Chaos: callbacks stall for 3 s (no error), burst 500 ms at once, send errors, and stop for good.
    Stalled and lost are detected, reopen happens, a late successful open is discarded, and a
    permanently stuck open leaves one helper and the `device_call_stuck` state, not more threads.
+3a. Input period: P_in = 10, 20 and 40 ms are accepted with the expected ring capacity and the
+   budget met; P_in over 40 ms is refused into the latched `unsupported_buffer` state with zero
+   frames published and no reopen loop. A blocked default-device poll or a wedged pump leaves
+   `open` for `device_call_stuck` and the source reads silence.
 4a. Underrun storm: a callback that chronically short-fills outside pre-roll. Assert no underrun
    is counted while the pre-roll flag is set, re-anchors follow the capped backoff (1 s → 30 s),
    and each storm costs one bounded pre-roll (no loop). A `DeviceChanged` onto a device with a
