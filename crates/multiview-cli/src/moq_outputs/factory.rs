@@ -299,7 +299,8 @@ impl DynamicRegistryFactory {
 }
 impl AuthorizedFeedFactory for DynamicRegistryFactory {
     fn available(&self) -> bool {
-        self.current().is_ok_and(|factory| !factory.prepared.is_empty())
+        self.current()
+            .is_ok_and(|factory| !factory.prepared.is_empty())
     }
     fn attach(
         &self,
