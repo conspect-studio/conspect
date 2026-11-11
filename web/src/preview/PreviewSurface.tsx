@@ -76,12 +76,12 @@ function JpegRung({
       <JpegImage src={src} label={label} className={className} />
       {degraded ? (
         <div
-          className="absolute left-2 top-2 flex max-w-[calc(100%-1rem)] flex-wrap items-center gap-x-2 gap-y-0.5 rounded-md bg-background/85 px-2 py-1 text-xs"
+          className="absolute left-2 top-2 flex max-w-[calc(100%-1rem)] flex-nowrap items-center gap-2 rounded-md bg-background/85 px-2 py-1 text-xs"
           role="status"
           data-testid="fallback-badge"
         >
           <Wifi className="size-3.5 text-muted-foreground" aria-hidden="true" />
-          <span data-testid="fallback-reason">
+          <span data-testid="fallback-reason" className="ps-reason min-w-0 truncate">
             {capacity ? (
               <Trans>Live video in use by another viewer — showing stills</Trans>
             ) : (
@@ -93,11 +93,12 @@ function JpegRung({
               type="button"
               variant="ghost"
               size="sm"
-              className="h-6 gap-1 px-1.5"
+              className="h-6 shrink-0 gap-1 px-1.5"
+              aria-label={t`Retry live preview`}
               onClick={onRetry}
             >
               <RotateCw className="size-3.5" aria-hidden="true" />
-              <span>{t`Retry live preview`}</span>
+              <span className="ps-retry-label">{t`Retry live preview`}</span>
             </Button>
           ) : null}
         </div>

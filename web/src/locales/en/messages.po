@@ -6003,16 +6003,16 @@ msgstr "Live ephemeral cast sessions."
 msgid "Live host and accelerator utilisation streaming from the engine."
 msgstr "Live host and accelerator utilisation streaming from the engine."
 
-#: src/preview/PreviewSurface.tsx:200
-#: src/preview/PreviewSurface.tsx:224
+#: src/preview/PreviewSurface.tsx:201
+#: src/preview/PreviewSurface.tsx:225
 msgid "Live input preview failed."
 msgstr "Live input preview failed."
 
-#: src/preview/PreviewSurface.tsx:224
+#: src/preview/PreviewSurface.tsx:225
 msgid "Live input preview is busy. Another viewer has the session."
 msgstr "Live input preview is busy. Another viewer has the session."
 
-#: src/preview/PreviewSurface.tsx:226
+#: src/preview/PreviewSurface.tsx:227
 msgid "Live preview is busy. Another viewer has the session."
 msgstr "Live preview is busy. Another viewer has the session."
 
@@ -9184,7 +9184,8 @@ msgstr "Retry {name}"
 msgid "Retry detach (same operation)"
 msgstr "Retry detach (same operation)"
 
-#: src/preview/PreviewSurface.tsx:100
+#: src/preview/PreviewSurface.tsx:97
+#: src/preview/PreviewSurface.tsx:101
 msgid "Retry live preview"
 msgstr "Retry live preview"
 
@@ -10182,7 +10183,7 @@ msgstr "Still preview (~1 fps)"
 msgid "Still preview (~1 fps) — live video is unavailable for this preview"
 msgstr "Still preview (~1 fps) — live video is unavailable for this preview"
 
-#: src/preview/PreviewSurface.tsx:106
+#: src/preview/PreviewSurface.tsx:107
 msgid "Still preview (~1 fps) — live video is unavailable for this preview."
 msgstr "Still preview (~1 fps) — live video is unavailable for this preview."
 
@@ -12353,7 +12354,7 @@ msgstr "Whole mix overview"
 msgid "Why AUTO is unavailable · transition options"
 msgstr "Why AUTO is unavailable · transition options"
 
-#: src/preview/PreviewSurface.tsx:244
+#: src/preview/PreviewSurface.tsx:245
 msgid "Why live preview failed"
 msgstr "Why live preview failed"
 
