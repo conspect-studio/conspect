@@ -127,10 +127,19 @@ class GateTests(unittest.TestCase):
             pid = int(pidfile.read_text())
             # A killed child can briefly remain a zombie until its reaper runs.
             stat = pathlib.Path(f'/proc/{pid}/stat')
+
+            def gone_or_zombie():
+                # The process can be reaped between an existence check and the
+                # read. A vanished entry is the "gone" outcome, not an error.
+                try:
+                    return stat.read_text().split()[2] == 'Z'
+                except (FileNotFoundError, ProcessLookupError):
+                    return True
+
             deadline = time.monotonic() + 1
-            while stat.exists() and stat.read_text().split()[2] != 'Z' and time.monotonic() < deadline:
+            while not gone_or_zombie() and time.monotonic() < deadline:
                 time.sleep(0.01)
-            self.assertTrue(not stat.exists() or stat.read_text().split()[2] == 'Z')
+            self.assertTrue(gone_or_zombie())
             record = json.loads((directory / 'commands.jsonl').read_text())
             self.assertEqual(record['status'], 'failed')
             self.assertIn('wall timeout', record['error'])
