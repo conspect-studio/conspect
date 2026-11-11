@@ -124,3 +124,7 @@ str_to_string    = "deny"
 missing_errors_doc = "warn"
 missing_panics_doc = "warn"
 must_use_candidate = "warn"
+
+[[example]]
+name = "device_probe"
+required-features = ["ffmpeg"]

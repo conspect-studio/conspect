@@ -264,7 +264,8 @@ CONFIGURE_ARGS=(
   --enable-shared --disable-static --enable-version3
   --disable-doc --disable-ffplay --disable-debug --disable-autodetect
   # ffprobe is KEPT (invariant #8: verify output with ffprobe); ffplay dropped.
-  --enable-decoder=h264,hevc,av1,vp9,mpeg2video,mjpeg,ffv1,aac,opus,mp2,ac3,pcm_s16le,pcm_s24le,pcm_f32le,flac
+  # rawvideo: local capture devices (avfoundation/dshow/v4l2) deliver raw frames.
+  --enable-decoder=h264,hevc,av1,vp9,mpeg2video,mjpeg,ffv1,rawvideo,aac,opus,mp2,ac3,pcm_s16le,pcm_s24le,pcm_f32le,flac
   # Caption/subtitle decoders the caption pipeline opens by name
   # (multiview-ffmpeg caption_decode: cc_dec=ccaption, webvtt, subrip, mov_text=movtext, ass).
   --enable-decoder=ccaption,webvtt,subrip,movtext,ass
@@ -408,7 +409,7 @@ for component in LIBSRT_PROTOCOL RTSP_DEMUXER HLS_DEMUXER WAV_DEMUXER \
 done
 if [ "${FF_HWACCEL}" = "apple" ]; then
   # The apple profile's own components must survive dependency resolution too.
-  for component in AVFOUNDATION_INDEV H264_VIDEOTOOLBOX_ENCODER HEVC_VIDEOTOOLBOX_ENCODER \
+  for component in AVFOUNDATION_INDEV RAWVIDEO_DECODER H264_VIDEOTOOLBOX_ENCODER HEVC_VIDEOTOOLBOX_ENCODER \
                    H264_VIDEOTOOLBOX_HWACCEL HEVC_VIDEOTOOLBOX_HWACCEL SCALE_VT_FILTER \
                    AAC_AT_ENCODER AAC_AT_DECODER; do
     if ! awk -v n="CONFIG_${component}" '$1 == "#define" && $2 == n && $3 == "1" { found=1 } END { exit !found }' config_components.h; then

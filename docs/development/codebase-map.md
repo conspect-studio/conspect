@@ -159,8 +159,8 @@ Indexes: [`research/README.md`](../research/README.md), [`decisions/README.md`](
 7 encode-once-mux-many · 8 fixed color pipeline order · 9 resource-adaptive degradation ·
 10 isolation (control/preview never back-pressure the engine) · 11 live-apply classification.
 
-**#1 and #10 are the heart of the product. A change that risks either is R3** — stop, write a design
-note, add a chaos/soak test, and get explicit operator approval
+**#1 and #10 are the heart of the product. A change that risks either is R3** — write a design
+note first, add a chaos/soak test, get the 3-lens cross-vendor panel, then merge it yourself
 ([engineering.md](../standards/engineering.md) Part A).
 
 How to work here without exhausting context:

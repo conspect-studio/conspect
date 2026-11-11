@@ -12827,6 +12827,33 @@ fn ingest_plan_for(
             (SourceLocation::Synthetic(kind), true)
         }
         SourceKind::File { path } => (SourceLocation::Path(PathBuf::from(path)), false),
+        SourceKind::Device {
+            backend,
+            device,
+            size,
+            fps,
+            pixel_format,
+        } => {
+            let mut options = Vec::new();
+            if let Some(size) = size {
+                options.push(("video_size".to_owned(), size.clone()));
+            }
+            if let Some(fps) = fps {
+                options.push(("framerate".to_owned(), fps.clone()));
+            }
+            if let Some(pf) = pixel_format {
+                options.push(("pixel_format".to_owned(), pf.clone()));
+            }
+            (
+                SourceLocation::Device {
+                    format: backend.input_format(),
+                    device: backend.device_url(device),
+                    options,
+                },
+                // Live: a device that stops reconnects with backoff forever.
+                true,
+            )
+        }
         SourceKind::Rtsp { url, .. }
         | SourceKind::Hls { url, .. }
         | SourceKind::Ts { url }
@@ -13481,7 +13508,10 @@ fn resolve_incontainer_sub_route(
     // source is decoded by the URL ingest path and is out of this MVP's scope.
     let path = match location {
         SourceLocation::Path(p) => p.as_path(),
-        SourceLocation::Url(_) | SourceLocation::Synthetic(_) => return None,
+        // A capture device has no in-container subtitles.
+        SourceLocation::Url(_) | SourceLocation::Synthetic(_) | SourceLocation::Device { .. } => {
+            return None
+        }
         #[cfg(feature = "youtube")]
         SourceLocation::Youtube { .. } => return None,
         // NDI ingest carries no in-container subtitle stream (it is a raw
@@ -13590,12 +13620,110 @@ fn http_headers_for(kind: &SourceKind) -> HttpHeaders {
     }
 }
 
+/// How long a capture device may deliver no frame before its read is treated as
+/// a failure (so the reconnect supervisor reopens it).
+const DEVICE_NO_FRAME_DEADLINE: Duration = Duration::from_secs(5);
+
+/// The longest a capture-device open may block before the attempt is abandoned.
+/// libavdevice's avfoundation/dshow demuxers are `AVFMT_NOFILE`: they neither
+/// poll the interrupt callback nor honour `rw_timeout` during open, and a
+/// permission prompt or a busy device can block indefinitely.
+const DEVICE_OPEN_DEADLINE: Duration = Duration::from_secs(10);
+
+/// Open a capture device with a real deadline: the open runs on a helper
+/// thread and this (ingest) thread waits at most [`DEVICE_OPEN_DEADLINE`]. A
+/// stuck open is abandoned — its helper is detached and reaped at process
+/// exit, owning only its own libav context — so the source fails visibly and
+/// the reconnect supervisor retries with backoff. At most one blocked open per
+/// device is outstanding: a new attempt is refused until the previous helper
+/// finishes, so a wedged device cannot accumulate threads.
+fn open_device_bounded(
+    format: &'static str,
+    device: &str,
+    options: &[(String, String)],
+) -> Result<ffmpeg::format::context::Input, String> {
+    let owned_device = device.to_owned();
+    let owned_options = options.to_vec();
+    open_device_bounded_with(device, DEVICE_OPEN_DEADLINE, move || {
+        multiview_ffmpeg::open_device_input(format, &owned_device, &owned_options).map_err(|e| {
+            // macOS TCC / Windows privacy denials surface as an open error;
+            // say so instead of a bare libav code.
+            format!(
+                "{e} (a camera needs the OS camera permission for this process: \
+                 run it in the user's desktop session)"
+            )
+        })
+    })
+}
+
+/// Device keys with an open still in flight (at most one per device).
+static DEVICE_OPENS_IN_FLIGHT: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
+/// [`open_device_bounded`] with an injectable opener and deadline (tests).
+fn open_device_bounded_with<T: Send + 'static>(
+    device: &str,
+    deadline: Duration,
+    open: impl FnOnce() -> Result<T, String> + Send + 'static,
+) -> Result<T, String> {
+    let lock = || {
+        DEVICE_OPENS_IN_FLIGHT
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    };
+    {
+        let mut in_flight = lock();
+        if in_flight.iter().any(|d| d == device) {
+            return Err(format!(
+                "capture device {device:?}: a previous open is still blocked; not stacking another"
+            ));
+        }
+        in_flight.push(device.to_owned());
+    }
+    let release = |key: &str| lock().retain(|d| d != key);
+    let (tx, rx) = std::sync::mpsc::sync_channel(1);
+    let key = device.to_owned();
+    let spawned = std::thread::Builder::new()
+        .name("multiview-device-open".to_owned())
+        .spawn(move || {
+            let result = open();
+            DEVICE_OPENS_IN_FLIGHT
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .retain(|d| d != &key);
+            // If the waiter gave up, the send fails and the opened context is
+            // dropped (closed) here on the helper thread.
+            let _ = tx.send(result);
+        });
+    if let Err(e) = spawned {
+        release(device);
+        return Err(format!("spawn device open thread: {e}"));
+    }
+    match rx.recv_timeout(deadline) {
+        Ok(result) => result,
+        Err(_) => Err(format!(
+            "capture device {device:?} did not open within {deadline:?} \
+             (permission prompt, busy or wedged device); retrying"
+        )),
+    }
+}
+
 /// Where a source's media lives.
 enum SourceLocation {
     /// A local filesystem path.
     Path(PathBuf),
     /// A libav-openable URL (rtsp/hls/ts/srt/rtmp).
     Url(String),
+    /// A local capture device opened through libavdevice
+    /// (docs/architecture/local-capture-devices.md): the input format, the
+    /// device string, and the device open options.
+    Device {
+        /// libavdevice input format (`avfoundation`, `dshow`).
+        format: &'static str,
+        /// The device string that format expects.
+        device: String,
+        /// Device open options (`video_size`, `framerate`, `pixel_format`).
+        options: Vec<(String, String)>,
+    },
     /// An in-process synthetic source (bars/solid/clock) — no media to open;
     /// rendered by [`crate::synth::generator_loop`] on the ingest thread.
     Synthetic(crate::synth::SyntheticKind),
@@ -13777,7 +13905,9 @@ fn ingest_open_options(location: &SourceLocation) -> ffmpeg::Dictionary<'static>
         // loop decodes per-packet), so it gets no libav open options.
         #[cfg(feature = "webrtc-native")]
         SourceLocation::Webrtc { .. } => false,
-        SourceLocation::Path(_) | SourceLocation::Synthetic(_) => false,
+        SourceLocation::Path(_) | SourceLocation::Synthetic(_) | SourceLocation::Device { .. } => {
+            false
+        }
     };
     if is_network {
         // `rw_timeout` is expressed in microseconds; libav copies the strings.
@@ -13828,7 +13958,7 @@ fn is_hls_location(location: &SourceLocation) -> bool {
         // WHIP ingest opens no libav input, so it is never an HLS master.
         #[cfg(feature = "webrtc-native")]
         SourceLocation::Webrtc { .. } => return false,
-        SourceLocation::Synthetic(_) => return false,
+        SourceLocation::Synthetic(_) | SourceLocation::Device { .. } => return false,
     };
     // An `.m3u8` (with or without a query string) is an HLS playlist.
     let base = url.split(['?', '#']).next().unwrap_or(url);
@@ -15191,6 +15321,14 @@ fn open_and_stream(
         SourceLocation::Path(p) => {
             ffmpeg::format::input_with_dictionary(p, opts).map_err(|e| e.to_string())?
         }
+        SourceLocation::Device {
+            format,
+            device,
+            options,
+        } => {
+            drop(opts);
+            open_device_bounded(format, device, options)?
+        }
         SourceLocation::Url(u) => {
             // HLS WebVTT-rendition isolation (ADR-T011, FFmpeg-8.x-robust): if this
             // is an HLS master, pin the main demuxer to one VIDEO VARIANT media
@@ -15527,10 +15665,29 @@ fn open_and_stream(
         std::sync::mpsc::sync_channel::<crate::source_event_packet::MetadataPacket>(32);
     let metadata_overflow = Arc::new(AtomicBool::new(false));
     let demux_overflow = Arc::clone(&metadata_overflow);
+    // Capture devices are non-blocking: EAGAIN is "no frame yet", never an
+    // error (docs/architecture/local-capture-devices.md).
+    let is_device = matches!(plan.location, SourceLocation::Device { .. });
+    let mut last_device_frame = Instant::now();
     let reader = spawn_packet_reader(&plan.id, READ_AHEAD_PACKETS, move || {
         let mut packet = ffmpeg::codec::packet::Packet::empty();
         match packet.read(&mut input) {
+            Err(ffmpeg::Error::Other { errno })
+                if is_device && errno == ffmpeg::util::error::EAGAIN =>
+            {
+                // A device that stops delivering frames (unplugged, revoked,
+                // asleep) must not idle here forever: past the no-frame
+                // deadline it is an error and the reconnect supervisor runs.
+                if last_device_frame.elapsed() >= DEVICE_NO_FRAME_DEADLINE {
+                    return Some(ReadItem::Error(format!(
+                        "capture device delivered no frame for {DEVICE_NO_FRAME_DEADLINE:?}"
+                    )));
+                }
+                std::thread::sleep(Duration::from_millis(2));
+                None
+            }
             Ok(()) if packet.stream() == stream_index || Some(packet.stream()) == sub_index => {
+                last_device_frame = Instant::now();
                 if packet.stream() == stream_index {
                     video_fence = video_fence.saturating_add(1);
                 }
@@ -24766,5 +24923,66 @@ segment_ms = 1000
                 "a cutover after packet {cut} must not drop, repeat or reorder a frame"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod device_open_tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+    use super::open_device_bounded_with;
+    use std::sync::mpsc;
+    use std::time::{Duration, Instant};
+
+    /// Chaos (design note local-capture-devices.md): an open that blocks (a
+    /// permission prompt, a wedged device) is abandoned at the deadline, and a
+    /// second attempt while the first is still blocked is refused instead of
+    /// stacking another thread. Once the blocked open finishes, the device can
+    /// be opened again.
+    #[test]
+    fn a_blocking_device_open_times_out_and_never_stacks() {
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let started = Instant::now();
+        let first = open_device_bounded_with("chaos-dev", Duration::from_millis(100), move || {
+            let _ = release_rx.recv(); // blocks until released
+            Ok::<u32, String>(1)
+        });
+        assert!(first.is_err(), "a blocked open must time out");
+        assert!(started.elapsed() < Duration::from_secs(2), "bounded wait");
+
+        let second = open_device_bounded_with("chaos-dev", Duration::from_millis(100), || {
+            Ok::<u32, String>(2)
+        });
+        assert!(
+            second.unwrap_err().contains("still blocked"),
+            "no second helper while the first is blocked"
+        );
+
+        release_tx.send(()).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let third = loop {
+            match open_device_bounded_with("chaos-dev", Duration::from_secs(1), || {
+                Ok::<u32, String>(3)
+            }) {
+                Err(e) if e.contains("still blocked") && Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                other => break other,
+            }
+        };
+        assert_eq!(third, Ok(3), "the device reopens once the stuck open ends");
+    }
+
+    #[test]
+    fn a_healthy_device_open_returns_its_result_and_errors_pass_through() {
+        assert_eq!(
+            open_device_bounded_with("ok-dev", Duration::from_secs(1), || Ok::<u32, String>(7)),
+            Ok(7)
+        );
+        assert_eq!(
+            open_device_bounded_with("bad-dev", Duration::from_secs(1), || {
+                Err::<u32, String>("denied".to_owned())
+            }),
+            Err("denied".to_owned())
+        );
     }
 }
