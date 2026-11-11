@@ -180,7 +180,7 @@ impl Coordinator {
                         && !denied.swap(true, Ordering::AcqRel)
                     {
                         eprintln!(
-                            "local lease deadline reached at {} without a successful renew",
+                            "local seal permit closed at {} (lease deadline passed or permit withheld)",
                             crate::wall_ms()
                         );
                     }

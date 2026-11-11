@@ -555,6 +555,8 @@ pub struct PublisherLease {
     /// Static, non-secret classification of the last failed lease call, for
     /// operator diagnostics only. Never carries a token, body or status text.
     last_failure: Mutex<&'static str>,
+    /// Status of the authority answer that revoked this lease (0 = none/local).
+    revoked_by: Mutex<u16>,
 }
 
 impl PublisherLease {
@@ -605,6 +607,7 @@ impl PublisherLease {
             state: Mutex::new(LeaseState::default()),
             calls: Mutex::new(()),
             last_failure: Mutex::new(""),
+            revoked_by: Mutex::new(0),
         })
     }
 
@@ -656,6 +659,14 @@ impl PublisherLease {
     /// the record and for a new boot nonce. Later `renew`, `release` and root
     /// requests are refused; only a fresh process may acquire again.
     pub fn revoke(&self) {
+        self.revoke_with_status(0);
+    }
+
+    /// [`revoke`](Self::revoke), recording the authoritative non-secret HTTP
+    /// status that revoked the lease (e.g. the root route's 404/409), so an
+    /// operator can tell an authority revocation from a local failure.
+    pub fn revoke_with_status(&self, status: u16) {
+        *lock(&self.revoked_by) = status;
         let mut state = lock(&self.state);
         state.released = true;
         state.token = Zeroizing::new(String::new());
@@ -742,6 +753,13 @@ impl PublisherLease {
             };
         }
         result
+    }
+
+    /// Status of the authority answer that revoked this lease via
+    /// [`revoke_with_status`](Self::revoke_with_status) (0 = not revoked that way).
+    #[must_use]
+    pub fn revoked_by(&self) -> u16 {
+        *lock(&self.revoked_by)
     }
 
     /// The static classification of the last failed acquire/renew, if any, and
@@ -1425,14 +1443,14 @@ impl AuthorityRootProvider for HttpAuthorityRootProvider {
             (409, _) => {
                 // `lease_required`: this process has no valid lease for the
                 // route. Close the local fence rather than retrying.
-                lease.revoke();
+                lease.revoke_with_status(409);
                 return Err(Error::Denied);
             }
             (404, _) => {
                 // Stale lease / superseded generation: authoritative, so the
                 // lease is dead here too. A new process (and boot nonce) is
                 // needed; never re-acquire implicitly in this one.
-                lease.revoke();
+                lease.revoke_with_status(404);
                 return Err(Error::Denied);
             }
             _ => return Err(Error::Denied),

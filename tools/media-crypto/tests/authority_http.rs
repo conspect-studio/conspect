@@ -905,6 +905,11 @@ fn a_lease_required_or_stale_lease_answer_closes_the_local_fence() {
         assert!(LeaseFence::permit(lease.as_ref(), 102001).is_none());
         assert!(lease.lease_headers().is_none());
         assert_eq!(lease.renew().unwrap_err(), Error::Denied);
+        assert_eq!(
+            lease.revoked_by(),
+            status,
+            "the revoking status is recorded"
+        );
         assert_eq!(mock.call_count(), 2, "one fetch, no retry after revocation");
         assert_eq!(
             p.current_epoch_root(&request()).unwrap_err(),

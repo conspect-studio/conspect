@@ -208,6 +208,11 @@ fn scenario(scenario: &'static str, slow: bool, deny_renew: bool) {
                 }
                 json!({"id":id,"created_at":created,"expires_at":expiry[i]})
             } else if path.contains("/current-epoch?") {
+                // No seal may follow a withdrawal: the engine must stop at once.
+                assert!(
+                    !(scenario == "withdraw" && denied),
+                    "root fetched after the withdrawal (sealing continued)"
+                );
                 roots += 1;
                 let mut dto = json!({"versionId":"ver_test","publisherMachineId":"mac_pub","generation":793,"epoch":now()/5000,"epochStartMs":now()/5000*5000,"epochEndMs":(now()/5000+1)*5000,"feedCryptoId":URL_SAFE_NO_PAD.encode([9;16]),"versionCryptoId":URL_SAFE_NO_PAD.encode([3;16]),"publisherMachineCryptoId":URL_SAFE_NO_PAD.encode([5;16]),"contributorOrgCryptoId":URL_SAFE_NO_PAD.encode([10;16]),"rootKeyBase64":STANDARD.encode([11;32])});
                 if scenario == "raw-mismatch" {

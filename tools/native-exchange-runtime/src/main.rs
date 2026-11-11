@@ -348,51 +348,64 @@ fn connected(
                     return Err("expiry queues not empty");
                 }
             }
-            if now() % 5000 > 3500 {
-                std::thread::sleep(Duration::from_millis(5000 - now() % 5000));
-            }
-            if publisher.bound_scope().epoch != now() / 5000 {
-                publisher = Publisher::from_authority(
-                    provider.as_ref(),
-                    &mut guard,
-                    contributor,
-                    b.version,
-                    b.feed,
-                    b.publisher,
-                    publisher_instance,
-                    now(),
-                    Box::new(
-                        DurableCounterJournal::open(
-                            &durable.join(format!("nonces-{}", now() / 5000)),
-                        )
-                        .map_err(|_| "epoch journal")?,
-                    ),
-                )
-                .map_err(|_| "epoch authority publisher")?;
-                captured = now();
-            }
-            // The independent bounded grant worker installs the current epoch before media resumes.
-            let ready_until = Instant::now() + Duration::from_secs(3);
-            loop {
-                let mut ready = true;
-                for (i, slot) in slots.iter().enumerate() {
-                    if (cutoff && (i == 0 || scenario == "withdraw")) || (exhausted && i == 0) {
-                        continue;
-                    }
-                    let mut slot = slot.lock().map_err(|_| "receiver lock")?;
-                    let (receiver, output) = &mut *slot;
-                    let permitted = receiver.fence(now(), output).is_ok();
-                    if !(scenario == "credit-cutoff" && i == 0) {
-                        ready &= permitted;
-                    }
+            // The grant-ready wait can outlast the epoch tail under load: re-check
+            // after it and redo the bounded cycle, so a track is never sealed
+            // across an epoch boundary (bounded: at most three cycles).
+            let mut admitted = false;
+            for _ in 0..3 {
+                if now() % 5000 > 3500 {
+                    std::thread::sleep(Duration::from_millis(5000 - now() % 5000));
                 }
-                if ready {
+                if publisher.bound_scope().epoch != now() / 5000 {
+                    publisher = Publisher::from_authority(
+                        provider.as_ref(),
+                        &mut guard,
+                        contributor,
+                        b.version,
+                        b.feed,
+                        b.publisher,
+                        publisher_instance,
+                        now(),
+                        Box::new(
+                            DurableCounterJournal::open(
+                                &durable.join(format!("nonces-{}", now() / 5000)),
+                            )
+                            .map_err(|_| "epoch journal")?,
+                        ),
+                    )
+                    .map_err(|_| "epoch authority publisher")?;
+                    captured = now();
+                }
+                // The independent bounded grant worker installs the current epoch before media resumes.
+                let ready_until = Instant::now() + Duration::from_secs(3);
+                loop {
+                    let mut ready = true;
+                    for (i, slot) in slots.iter().enumerate() {
+                        if (cutoff && (i == 0 || scenario == "withdraw")) || (exhausted && i == 0) {
+                            continue;
+                        }
+                        let mut slot = slot.lock().map_err(|_| "receiver lock")?;
+                        let (receiver, output) = &mut *slot;
+                        let permitted = receiver.fence(now(), output).is_ok();
+                        if !(scenario == "credit-cutoff" && i == 0) {
+                            ready &= permitted;
+                        }
+                    }
+                    if ready {
+                        break;
+                    }
+                    if !control.healthy() || Instant::now() >= ready_until {
+                        return Err("current epoch grant unavailable");
+                    }
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                if publisher.bound_scope().epoch == now() / 5000 && now() % 5000 <= 3500 {
+                    admitted = true;
                     break;
                 }
-                if !control.healthy() || Instant::now() >= ready_until {
-                    return Err("current epoch grant unavailable");
-                }
-                std::thread::sleep(Duration::from_millis(10));
+            }
+            if !admitted {
+                return Err("epoch admission for sealing not reached");
             }
             let split = f.packets.len() / 2;
             let range = if phase % 2 == 0 {
@@ -661,12 +674,17 @@ fn connected(
             }
             std::thread::sleep(Duration::from_millis(10));
         }
-        let (_, status) = state.publisher_lease()?.last_failure();
-        if status != 404 {
-            return Err("publisher lease ended for a reason other than the withdrawal 404");
-        }
+        // The withdrawn story's lease ends with exactly a 404: either the next
+        // renew answer, or the root route's 404 that latched the lease first
+        // (the grant worker may reach the revoked route before the renew thread).
+        let lease = state.publisher_lease()?;
+        let route = match (lease.last_failure().1, lease.revoked_by()) {
+            (404, _) => "renew 404",
+            (_, 404) => "root-route 404",
+            _ => return Err("publisher lease ended for a reason other than the withdrawal 404"),
+        };
         println!(
-            "withdraw report: publisher lease revoked (renew 404) {} ms after the withdrawal was acknowledged",
+            "withdraw report: publisher lease revoked ({route}) {} ms after the withdrawal was acknowledged",
             now().saturating_sub(withdrawn_at)
         );
     }
