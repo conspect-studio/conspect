@@ -691,6 +691,10 @@ impl PublisherLease {
         let body = {
             let mut state = lock(&self.state);
             if state.released {
+                // Still bump the latch: an acquire may be in flight (acquire only
+                // starts while released), and its answer must not install a lease
+                // after this release() returned.
+                state.latch_epoch = state.latch_epoch.wrapping_add(1);
                 return Ok(());
             }
             let body = json!({

@@ -1245,6 +1245,8 @@ fn a_renewal_that_rotates_the_token_latches_the_fence_closed() {
 /// release/revoke can run while the renew is on the wire (R1).
 struct Gated {
     inner: Mock,
+    /// The lease route whose answer is parked (`/lease/renew` or `/lease/acquire`).
+    parked: &'static str,
     entered: std::sync::mpsc::SyncSender<()>,
     go: Mutex<std::sync::mpsc::Receiver<()>>,
 }
@@ -1254,9 +1256,9 @@ impl AuthorityHttpTransport for Gated {
         request: AuthorityHttpRequest,
         credential: &OrganisationCsk,
     ) -> conspect_media_crypto::Result<AuthorityHttpResponse> {
-        let renewing = request.url.ends_with("/lease/renew");
+        let parked = request.url.ends_with(self.parked);
         let answer = self.inner.send(request, credential);
-        if renewing {
+        if parked {
             self.entered.send(()).unwrap();
             self.go.lock().unwrap().recv().unwrap();
         }
@@ -1278,6 +1280,7 @@ fn race_release_against_an_in_flight_renew(use_revoke: bool) {
     let (go_tx, go_rx) = std::sync::mpsc::sync_channel(1);
     let gated = Arc::new(Gated {
         inner: Mock::new(replies),
+        parked: "/lease/renew",
         entered: entered_tx,
         go: Mutex::new(go_rx),
     });
@@ -1334,6 +1337,46 @@ fn race_release_against_an_in_flight_renew(use_revoke: bool) {
         assert_eq!(routes, ["acquire", "renew", "release"]);
         assert_eq!(calls[2].body.as_ref().unwrap()["leaseToken"], token());
     }
+}
+
+#[test]
+fn release_racing_an_in_flight_acquire_never_installs_the_lease() {
+    // An acquire only starts while released, so release() takes its early path.
+    // That path must still invalidate the in-flight acquire's answer.
+    let clock = Clock::new(102001);
+    let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(1);
+    let (go_tx, go_rx) = std::sync::mpsc::sync_channel(1);
+    let gated = Arc::new(Gated {
+        inner: Mock::new(vec![reply(201, lease_body(9, 112001, 101000))]),
+        parked: "/lease/acquire",
+        entered: entered_tx,
+        go: Mutex::new(go_rx),
+    });
+    let lease = Arc::new(
+        PublisherLease::with_transport(
+            "https://authority.test",
+            ids(),
+            CRYPTO,
+            OrganisationCsk::new("organisation-csk-secret".into()).unwrap(),
+            gated.clone(),
+            clock.lease_clock(),
+        )
+        .unwrap(),
+    );
+    let acquirer = {
+        let lease = lease.clone();
+        std::thread::spawn(move || lease.acquire())
+    };
+    entered_rx.recv().unwrap();
+    lease.release().unwrap();
+    go_tx.send(()).unwrap();
+    assert_eq!(acquirer.join().unwrap().unwrap_err(), Error::Denied);
+    assert_eq!(lease.generation(), None);
+    assert!(lease.lease_headers().is_none());
+    assert!(LeaseFence::permit(lease.as_ref(), 102001).is_none());
+    assert_eq!(lease.renew().unwrap_err(), Error::Denied);
+    // Only the acquire reached the wire: no release (nothing was held) and no retry.
+    assert_eq!(gated.inner.call_count(), 1);
 }
 
 #[test]

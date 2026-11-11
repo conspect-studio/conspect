@@ -881,12 +881,40 @@ impl Bootstrap {
         Ok(Value::Null)
     }
     /// Verify the released booking-lifetime route, not a synthetic exhaustion cause.
+    /// The probe is admitted out of the epoch tail and clamped to the epoch end
+    /// exactly like a real grant, so its 404 cannot be the near-boundary denial.
+    /// One request, never retried.
     pub fn assert_expired_grant(&self, t: &dyn AuthorityHttpTransport) -> Result<()> {
         if !self.profile.funded || now()? < self.booking_expiry()? {
             return Err("booking still live");
         }
+        let wall = admitted_wall(self.admission_clock.as_ref())?;
+        if wall < self.booking_expiry()? {
+            return Err("booking still live");
+        }
+        let requested = wall
+            .saturating_add(4000)
+            .min(epoch_end(wall)?.saturating_sub(1));
+        if requested <= wall.saturating_add(CLOCK_UNCERTAINTY_MS) {
+            return Err("grant near boundary");
+        }
         let b = &self.bookings.as_ref().ok_or("no bookings")?[0];
-        let r = t.send_grant(AuthorityHttpRequest { method:"POST", url:self.booking_action(0,b,"grants")?, body:Some(serde_json::to_vec(&json!({"machineId":self.takers[0].machine,"requestedExpiryMs":now()?+4000})).map_err(|_| "grant JSON")?), lease_headers:None }, &self.takers[0].csk).map_err(|_| "grant transport")?;
+        let r = t
+            .send_grant(
+                AuthorityHttpRequest {
+                    method: "POST",
+                    url: self.booking_action(0, b, "grants")?,
+                    body: Some(
+                        serde_json::to_vec(
+                            &json!({"machineId":self.takers[0].machine,"requestedExpiryMs":requested}),
+                        )
+                        .map_err(|_| "grant JSON")?,
+                    ),
+                    lease_headers: None,
+                },
+                &self.takers[0].csk,
+            )
+            .map_err(|_| "grant transport")?;
         if r.status != 404 {
             return Err("expired grant must return 404");
         }
