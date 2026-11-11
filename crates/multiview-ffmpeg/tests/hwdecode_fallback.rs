@@ -228,3 +228,42 @@ fn a_pinned_cuda_ordinal_still_falls_back_gracefully_on_a_gpu_free_box() {
         "the software fallback must still decode every frame with a pinned ordinal"
     );
 }
+
+/// A fused NVDEC resize request (inv #6) must never cost the decode: on a
+/// GPU-free box the cuvid open (with and without the resize) fails and the
+/// software decoder comes back at the SOURCE size, reporting no live resize; the
+/// coded size the planner keys on is read from the stream parameters.
+#[test]
+fn nvdec_resize_request_degrades_to_source_size_software_decode() {
+    multiview_ffmpeg::ensure_initialized().expect("init libav");
+    let dir = tempfile::tempdir().expect("tempdir");
+    let clip = generate_mpeg2_clip(dir.path());
+    let (params, time_base, vidx) = video_params(&clip);
+    assert_eq!(StreamVideoDecoder::coded_size(&params), (W, H));
+    let target = multiview_ffmpeg::nvdec_resize_target(
+        multiview_ffmpeg::TileSize::new(W, H),
+        multiview_ffmpeg::TileSize::new(W / 2, H / 2),
+        None,
+    );
+    assert_eq!(target, Some(multiview_ffmpeg::TileSize::new(W / 2, H / 2)));
+
+    let (mut decoder, used_hw) =
+        StreamVideoDecoder::new_preferring_hw_at(params, time_base, true, None, target)
+            .expect("software fallback");
+    assert!(!used_hw);
+    assert_eq!(decoder.hw_resize(), None, "software never reports a resize");
+
+    let mut demux = Demuxer::open(&clip).expect("open clip for demux");
+    let mut frames = 0u32;
+    while let Some(pkt) = demux.read_packet().expect("read packet") {
+        if pkt.stream_index != vidx {
+            continue;
+        }
+        decoder.send_packet(&pkt.packet).expect("send packet");
+        while let Some(decoded) = decoder.receive_frame().expect("receive frame") {
+            assert_eq!((decoded.meta.width, decoded.meta.height), (W, H));
+            frames += 1;
+        }
+    }
+    assert!(frames > 0, "the software fallback decodes frames");
+}

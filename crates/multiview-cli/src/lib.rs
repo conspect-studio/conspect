@@ -37,6 +37,79 @@
 /// ~2000 structured records are retained for `GET /api/v1/logs`, drop-oldest.
 pub const LOG_RING_CAPACITY: usize = 2000;
 
+/// The environment variable naming an explicit `yt-dlp` binary path (ADR-0015
+/// §6), taking precedence over `[system.youtube] yt_dlp_path` — the service
+/// user's `PATH` may not include where an operator installed it (e.g.
+/// `~/.local/bin`). Matches the existing `MULTIVIEW_*` override naming pattern
+/// (`MULTIVIEW_CONTROL_TOKEN`, `MULTIVIEW_LICENCE_*`, …).
+#[cfg(feature = "youtube")]
+pub const YOUTUBE_YT_DLP_PATH_ENV: &str = "MULTIVIEW_YOUTUBE_YT_DLP_PATH";
+
+/// Resolve the effective explicit `yt-dlp` path for this run: the
+/// [`YOUTUBE_YT_DLP_PATH_ENV`] environment variable when set and non-empty,
+/// else `[system.youtube] yt_dlp_path` from `config`, else `None` (resolve on
+/// `PATH`). Pure over its inputs except for the one environment read, so the
+/// precedence is unit-testable without mutating process-global config.
+#[cfg(feature = "youtube")]
+#[must_use]
+pub fn youtube_resolver_path(config: &multiview_config::MultiviewConfig) -> Option<String> {
+    youtube_resolver_path_from(
+        std::env::var(YOUTUBE_YT_DLP_PATH_ENV).ok(),
+        config
+            .system
+            .as_ref()
+            .and_then(|s| s.youtube.as_ref())
+            .and_then(|y| y.yt_dlp_path.clone()),
+    )
+}
+
+/// The pure precedence rule behind [`youtube_resolver_path`]: the env value
+/// wins when set and non-empty, else the config value when set and non-empty,
+/// else `None`.
+#[cfg(feature = "youtube")]
+#[must_use]
+fn youtube_resolver_path_from(env: Option<String>, config: Option<String>) -> Option<String> {
+    env.filter(|s| !s.is_empty())
+        .or_else(|| config.filter(|s| !s.is_empty()))
+}
+
+#[cfg(all(test, feature = "youtube"))]
+mod youtube_resolver_path_tests {
+    use super::youtube_resolver_path_from;
+
+    #[test]
+    fn env_takes_precedence_over_config() {
+        assert_eq!(
+            youtube_resolver_path_from(
+                Some("/opt/yt-dlp/yt-dlp".to_owned()),
+                Some("/usr/local/bin/yt-dlp".to_owned())
+            ),
+            Some("/opt/yt-dlp/yt-dlp".to_owned())
+        );
+    }
+
+    #[test]
+    fn config_is_used_when_env_is_absent() {
+        assert_eq!(
+            youtube_resolver_path_from(None, Some("/usr/local/bin/yt-dlp".to_owned())),
+            Some("/usr/local/bin/yt-dlp".to_owned())
+        );
+    }
+
+    #[test]
+    fn an_empty_env_value_falls_back_to_config() {
+        assert_eq!(
+            youtube_resolver_path_from(Some(String::new()), Some("/opt/yt-dlp".to_owned())),
+            Some("/opt/yt-dlp".to_owned())
+        );
+    }
+
+    #[test]
+    fn neither_set_resolves_on_path() {
+        assert_eq!(youtube_resolver_path_from(None, None), None);
+    }
+}
+
 /// The process-global log-tail ring, set once by the binary's `init_tracing`
 /// (which installs the telemetry capture layer feeding the same `Arc`) and read
 /// by the control-plane wiring ([`log_ring`]). A `OnceLock` so the singleton is
@@ -77,6 +150,11 @@ pub mod cli;
 /// the Web/API uses; an invalid file changes nothing (warn + health event).
 pub mod config_watch;
 pub mod control;
+/// Decode size follows the active layout: the size decisions, debounce and the
+/// make-before-break decoder handover. Feature-independent; `pipeline` wires it
+/// to libav.
+pub mod display_size;
+pub mod event_journal;
 pub mod hls_event_observer;
 /// The Conspect entitlement-plane wiring for the cli (CONSPECT-2b/10, ADR-0050):
 /// the shared lease store, the published [`licence::WatermarkSignal`] the engine
@@ -123,11 +201,14 @@ pub mod outputs;
 pub mod placement;
 pub mod preview;
 pub mod run;
+#[cfg(test)]
+mod source_event_automation_e2e;
 pub mod source_event_hls_bridge;
 pub mod source_event_ingest;
 pub mod source_event_packet;
 pub mod source_event_runtime;
 pub mod source_event_service;
+pub mod source_event_test_inject;
 /// Map the HAL probe + compiled features + resolved compositor adapter onto the
 /// [`multiview_control::system::SystemCapabilities`] DTO for
 /// `GET /api/v1/system/capabilities` (ADR-W030). A static startup snapshot
@@ -177,6 +258,18 @@ pub mod wallclock;
 /// renderer needs the `overlay` feature.
 pub mod synth;
 
+/// The BOM weather synthetic source: render worker side + poller spawn.
+pub mod weather_source;
+
+/// Process-wide last-resolve-failure registry for `youtube` sources
+/// (ADR-0015): mirrors `av_sync`'s pattern so the honest `yt-dlp` resolve
+/// failure reason reaches the status API/UI, not just the `tracing` log.
+#[cfg(feature = "youtube")]
+pub mod youtube_status;
+
+/// Graphics (CG) sources: prepared items and playout channel buses.
+pub mod graphics_source;
+
 /// The **media-player transport** state machine (ADR-0057 + ADR-0097): the
 /// pure, deterministic playout core (load/cue/play/pause/stop/seek, in-place
 /// loop, and the vamp-and-exit extension) that drives a pre-declared
@@ -205,11 +298,34 @@ pub mod rendition_plan;
 #[cfg(feature = "ffmpeg")]
 pub mod rendition_workers;
 
+/// Which configured sources have a consumer, derived from the document
+/// (`docs/architecture/demand-driven-sources.md`).
+pub mod source_demand;
+
+/// First-slice Program/Preview launcher wiring: the real M/E handle, its bounded
+/// PVW demand-lease owner and the separate preview monitor tap, in one place the
+/// production run path and the CLI integration test share. Behind `ffmpeg` with
+/// the pipeline it attaches to.
+#[cfg(feature = "ffmpeg")]
+pub mod switcher_runtime;
+
+/// The run's demand rail driver: starts and stops a source's video and audio
+/// rails as consumers come and go. Behind `ffmpeg` (it spawns real ingest).
+#[cfg(feature = "ffmpeg")]
+pub mod source_rails;
+
 /// Live HLS segment fetcher: parallel byte-range segment downloads served to
 /// the libav demuxer from memory over loopback, so a source whose single TCP
 /// flow delivers below real time still plays. Behind the `ffmpeg` feature.
 #[cfg(feature = "ffmpeg")]
 pub mod hls_fetch;
+/// Dual-stack SRT listener input: one native socket per listener URL, relayed
+/// to libav over loopback. Behind the off-by-default `srt-libsrt` feature
+/// (ADR-0039 decision 10, amended): the native `multiview-srt-sys` leaf is a
+/// separate opt-in from plain `ffmpeg`, since only a `[::]`/wildcard listener
+/// URL needs it (caller/rendezvous SRT stays on `FFmpeg`'s own `srt://`).
+#[cfg(feature = "srt-libsrt")]
+pub mod srt_ingest;
 
 /// Per-source **runtime audio ingest** (AUD-2): the audio peer of the video
 /// decode thread. Opens + decodes each file/URL source's audio on its own

@@ -44,7 +44,9 @@ pub mod alarm_store;
 pub mod audio_routing;
 pub mod audit;
 pub mod auth;
+pub mod automation;
 pub mod boot_model;
+pub mod catalogue;
 pub mod cloudflare_management;
 pub mod command;
 pub mod concurrency;
@@ -54,6 +56,7 @@ pub mod cors;
 pub mod devices;
 pub mod error;
 pub mod event_automation;
+pub mod iptv;
 pub mod is07;
 pub mod jwt;
 pub mod layout_projection;
@@ -86,6 +89,7 @@ mod serve_stream;
 pub mod state;
 pub mod support_bundle;
 pub mod support_store;
+pub mod switcher_events;
 pub mod system;
 pub mod tally_ingest;
 pub mod tally_state;
@@ -98,9 +102,15 @@ pub mod watch_status;
 pub mod whep_output;
 pub mod whip;
 
+pub mod event_journal;
+pub mod source_demand;
 pub mod source_events;
 #[cfg(feature = "embed-web")]
 pub mod spa;
+pub use source_demand::{
+    SharedSourceDemand, SourceActivationView, SourceConsumerView, SourceDemandLease,
+    SourceDemandPhase, SourceDemandProvider, SourceDemandView, SourceStartingPhase, StopRefusal,
+};
 pub use source_events::{SharedSourceEvents, SourceEventProvider, SourceEventsDto};
 
 #[cfg(feature = "openapi")]
@@ -148,7 +158,9 @@ pub use is07::{
     Is07EventType, Is07Message, Is07Payload, Is07Subscription, Is07Timing,
 };
 pub use jwt::{JwtError, JwtValidator, SignatureAlgorithm};
-pub use live_apply::{AudioRoutingLiveCapability, LiveApplyCaps, OverlayLiveCapability};
+pub use live_apply::{
+    AudioRoutingApplyResult, AudioRoutingLiveCapability, LiveApplyCaps, OverlayLiveCapability,
+};
 pub use nmos::is04::{Device, MediaFormat, Node, Receiver, Registration, ResourceCore, Sender};
 pub use nmos::is05::{
     parse_sdp_transport, Activation, ActivationMode, ConnectionRequest, ConnectionState,
@@ -300,7 +312,10 @@ pub fn router(state: AppState) -> Router {
         .nest("/api/v1", api)
         // The NMOS Node API lives under its own standardised `/x-nmos` base, not
         // under `/api/v1` — it is a separate, AMWA-specified surface.
-        .merge(nmos::nmos_router());
+        .merge(nmos::nmos_router())
+        // Public IPTV playlist + guide (epg-playlist): outside `/api/v1`, the
+        // same unauthenticated delivery model as the `/hls/{output}` mounts.
+        .merge(routes::iptv::public_router());
 
     #[cfg(feature = "openapi")]
     let app = app.merge(openapi::openapi_router());

@@ -591,6 +591,130 @@ pub enum SubmitError {
 pub struct CommandSender {
     tx: tokio::sync::mpsc::Sender<Command>,
     capacity: usize,
+    ledger: std::sync::Arc<RoutingLedger>,
+}
+
+/// Bound on distinct routing destinations the ledger tracks; beyond it the
+/// ledger resets to a new generation floor (conservative: every destination
+/// then reads as changed, which only ever cancels an automatic restore).
+pub const MAX_LEDGER_DESTINATIONS: usize = 4096;
+
+/// Control-plane record of routing commands accepted onto the bus (ADR-0183).
+///
+/// Every routing-affecting command that lands on the bus — from any route,
+/// salvo, layout apply or the event-automation executor — bumps a monotonic
+/// generation for the destination(s) it touches. The automation executor
+/// compares these generations to detect a manual operator change during a
+/// break (compare-and-restore), and reads the last routed source per cell to
+/// know what a cell currently shows. Never touched by the engine.
+#[derive(Debug, Default)]
+pub struct RoutingLedger {
+    inner: std::sync::Mutex<LedgerInner>,
+}
+#[derive(Debug, Default)]
+struct LedgerInner {
+    counter: u64,
+    floor: u64,
+    generations: std::collections::HashMap<String, u64>,
+    bound: std::collections::HashMap<String, String>,
+    /// After a layout change: whether `bound` fully describes the new layout.
+    layout_known: bool,
+}
+impl RoutingLedger {
+    fn lock(&self) -> std::sync::MutexGuard<'_, LedgerInner> {
+        self.inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+    /// Ledger key of a layout cell's video crosspoint.
+    #[must_use]
+    pub fn cell_key(cell: &str) -> String {
+        format!("cell:{cell}")
+    }
+    /// Ledger key of a program-bus audio channel/track.
+    #[must_use]
+    pub fn audio_key(target: &str) -> String {
+        format!("audio:{target}")
+    }
+    /// Record one accepted command.
+    pub fn observe(&self, command: &Command) {
+        let mut inner = self.lock();
+        inner.counter = inner.counter.saturating_add(1);
+        let generation = inner.counter;
+        let (key, bound) = match command {
+            Command::SwapSource { tile, source, .. } => {
+                (Self::cell_key(tile), Some(source.clone()))
+            }
+            Command::RouteVideo { cell, source, .. } => {
+                (Self::cell_key(cell), Some(source.input_id.clone()))
+            }
+            Command::RouteAudio { target, .. } => (Self::audio_key(target), None),
+            Command::ApplyLayout { document, .. } => {
+                // A whole-layout change: every destination is now different.
+                inner.floor = generation;
+                inner.generations.clear();
+                inner.bound.clear();
+                if let Some(resolved) = document {
+                    for cell in &resolved.document.cells {
+                        if let Some(input) = &cell.source.input_id {
+                            inner.bound.insert(Self::cell_key(&cell.id), input.clone());
+                        }
+                    }
+                }
+                inner.layout_known = document.is_some();
+                return;
+            }
+            Command::TakeSalvo { .. } => {
+                inner.floor = generation;
+                inner.generations.clear();
+                inner.bound.clear();
+                inner.layout_known = false;
+                return;
+            }
+            _ => return,
+        };
+        if inner.generations.len() >= MAX_LEDGER_DESTINATIONS
+            && !inner.generations.contains_key(&key)
+        {
+            inner.floor = generation;
+            inner.generations.clear();
+            inner.bound.clear();
+        }
+        if let Some(source) = bound {
+            inner.bound.insert(key.clone(), source);
+        }
+        inner.generations.insert(key, generation);
+    }
+    /// Current generation of a destination key.
+    #[must_use]
+    pub fn generation(&self, key: &str) -> u64 {
+        let inner = self.lock();
+        inner
+            .generations
+            .get(key)
+            .copied()
+            .unwrap_or(0)
+            .max(inner.floor)
+    }
+    /// Last source routed to `cell` since the latest layout change, if known.
+    #[must_use]
+    pub fn bound_source(&self, cell: &str) -> Option<String> {
+        self.lock().bound.get(&Self::cell_key(cell)).cloned()
+    }
+    /// Whether a layout-wide change with UNKNOWN bindings happened since the
+    /// ledger started (then the configured bindings no longer apply).
+    #[must_use]
+    pub fn layout_changed(&self) -> bool {
+        let inner = self.lock();
+        inner.floor != 0 && !inner.layout_known
+    }
+    /// Whether a layout-wide change with known bindings happened (then `bound`
+    /// is authoritative and unrouted cells are unbound).
+    #[must_use]
+    pub fn layout_replaced(&self) -> bool {
+        let inner = self.lock();
+        inner.floor != 0 && inner.layout_known
+    }
 }
 
 /// The engine-side drainable consumer half of the command bus.
@@ -613,7 +737,14 @@ pub struct CommandReceiver {
 pub fn command_bus(capacity: usize) -> (CommandSender, CommandReceiver) {
     let capacity = capacity.max(1);
     let (tx, rx) = tokio::sync::mpsc::channel(capacity);
-    (CommandSender { tx, capacity }, CommandReceiver { rx })
+    (
+        CommandSender {
+            tx,
+            capacity,
+            ledger: std::sync::Arc::new(RoutingLedger::default()),
+        },
+        CommandReceiver { rx },
+    )
 }
 
 impl CommandSender {
@@ -629,11 +760,18 @@ impl CommandSender {
     /// [`SubmitError::Closed`] when the receiver was dropped.
     pub fn try_submit(&self, command: Command) -> Result<OperationId, SubmitError> {
         let op = command.operation_id().clone();
-        match self.tx.try_send(command) {
-            Ok(()) => Ok(op),
-            Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => Err(SubmitError::Full),
-            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => Err(SubmitError::Closed),
-        }
+        // Reserve first, then record in the routing ledger BEFORE the engine
+        // can drain it, so a shed command never bumps a generation.
+        let permit = match self.tx.try_reserve() {
+            Ok(permit) => permit,
+            Err(tokio::sync::mpsc::error::TrySendError::Full(())) => return Err(SubmitError::Full),
+            Err(tokio::sync::mpsc::error::TrySendError::Closed(())) => {
+                return Err(SubmitError::Closed)
+            }
+        };
+        self.ledger.observe(&command);
+        permit.send(command);
+        Ok(op)
     }
 
     /// Reserve a bounded queue slot before a durable control-plane commit.
@@ -647,6 +785,17 @@ impl CommandSender {
             Err(tokio::sync::mpsc::error::TrySendError::Full(())) => Err(SubmitError::Full),
             Err(tokio::sync::mpsc::error::TrySendError::Closed(())) => Err(SubmitError::Closed),
         }
+    }
+
+    /// The shared routing ledger (ADR-0183 automation compare-and-restore).
+    #[must_use]
+    pub fn ledger(&self) -> &std::sync::Arc<RoutingLedger> {
+        &self.ledger
+    }
+
+    /// Record a command sent through a [`Self::try_reserve`] permit.
+    pub fn observe(&self, command: &Command) {
+        self.ledger.observe(command);
     }
 
     /// The bounded queue depth (the maximum number of un-drained commands).

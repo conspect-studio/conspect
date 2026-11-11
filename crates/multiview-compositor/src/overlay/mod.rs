@@ -28,6 +28,7 @@
 //! `text → atlas → bitmap` engine and its API only.
 
 pub mod atlas;
+pub mod color_memo;
 mod fonts;
 pub mod meters;
 pub mod subpass;

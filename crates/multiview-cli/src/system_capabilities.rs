@@ -11,6 +11,7 @@
 use multiview_control::system::{
     BackendCapability, BackendKind, BackendResolution, BuildInfo, CompositorCapability,
     CompositorClass, CompositorDeviceType, NdiAttribution, PipelineStage, SystemCapabilities,
+    YoutubeCapability,
 };
 use multiview_hal::{AdapterClass, AdapterReport, BackendKind as HalKind, Stage};
 
@@ -19,10 +20,20 @@ use multiview_hal::{AdapterClass, AdapterReport, BackendKind as HalKind, Stage};
 /// [`crate::capability_warn::read_compositor_adapter`]; `None` when no adapter
 /// resolves — the CPU composite path).
 ///
+/// `youtube_probe` is the `yt-dlp --version` output the caller already probed at
+/// startup (see [`crate::control::bind_and_serve`]), `Some(version)` on a
+/// successful probe or `None` on a failed/absent binary **or** a build without
+/// the `youtube` feature (the caller only probes when the feature is compiled,
+/// so a non-`youtube` build always passes `None` here, and [`YoutubeCapability`]
+/// still distinguishes the two cases via `cfg!(feature = "youtube")`).
+///
 /// Graceful by construction: an absent/failing backend probes to
 /// `available = false` and never panics at startup.
 #[must_use]
-pub fn resolve_system_capabilities(adapter: Option<&AdapterReport>) -> SystemCapabilities {
+pub fn resolve_system_capabilities(
+    adapter: Option<&AdapterReport>,
+    youtube_probe: Option<String>,
+) -> SystemCapabilities {
     SystemCapabilities {
         backends: probe_backends(),
         compositor: compositor_capability(adapter),
@@ -32,6 +43,8 @@ pub fn resolve_system_capabilities(adapter: Option<&AdapterReport>) -> SystemCap
             compiled_features(),
         ),
         ndi_attribution: cfg!(feature = "ndi").then(NdiAttribution::required),
+        youtube: cfg!(feature = "youtube")
+            .then(|| YoutubeCapability::compiled_with_probe(youtube_probe)),
     }
 }
 
@@ -219,7 +232,7 @@ mod tests {
 
     #[test]
     fn software_backends_are_available_on_the_default_build() {
-        let caps = resolve_system_capabilities(None);
+        let caps = resolve_system_capabilities(None, None);
         assert!(has_available(
             &caps,
             BackendKind::Software,
@@ -239,7 +252,7 @@ mod tests {
 
     #[test]
     fn resolved_capabilities_report_the_compiled_build_profile() {
-        let caps = resolve_system_capabilities(None);
+        let caps = resolve_system_capabilities(None, None);
 
         // `effective_license` is the codec-linking BUILD-PROFILE licence (AGENTS.md §G /
         // ADR-0012): linking x264/x265 via `gpl-codecs` makes the whole build GPL; the
@@ -272,7 +285,7 @@ mod tests {
             driver: "test-driver".to_owned(),
             is_gl_backend: false,
         };
-        let caps = resolve_system_capabilities(Some(&report));
+        let caps = resolve_system_capabilities(Some(&report), None);
         // A resolved adapter is classified (not `None`) and its device/driver
         // flow through unchanged.
         assert_ne!(caps.compositor.class, CompositorClass::None);
@@ -281,5 +294,47 @@ mod tests {
             Some(CompositorDeviceType::DiscreteGpu)
         );
         assert_eq!(caps.compositor.driver.as_deref(), Some("test-driver"));
+    }
+
+    /// A build without the `youtube` feature reports `youtube: None` — the
+    /// capability does not exist at all, distinct from "compiled but the
+    /// binary is absent".
+    #[cfg(not(feature = "youtube"))]
+    #[test]
+    fn youtube_capability_is_absent_when_the_feature_is_not_compiled() {
+        let caps = resolve_system_capabilities(None, Some("yt-dlp 2026.01.01".to_owned()));
+        assert!(
+            caps.youtube.is_none(),
+            "a non-youtube build must report no youtube capability at all"
+        );
+    }
+
+    /// With the `youtube` feature compiled, a successful probe reports
+    /// `compiled: true, available: true` and carries the version string.
+    #[cfg(feature = "youtube")]
+    #[test]
+    fn youtube_capability_reports_available_on_a_successful_probe() {
+        let caps = resolve_system_capabilities(None, Some("yt-dlp 2026.01.01".to_owned()));
+        let youtube = caps
+            .youtube
+            .expect("a youtube-feature build must report the capability");
+        assert!(youtube.compiled);
+        assert!(youtube.available);
+        assert_eq!(youtube.version.as_deref(), Some("yt-dlp 2026.01.01"));
+    }
+
+    /// With the `youtube` feature compiled but no probe result (the binary
+    /// absent/unusable), the capability reports `compiled: true,
+    /// available: false` — still distinguishable from "not compiled".
+    #[cfg(feature = "youtube")]
+    #[test]
+    fn youtube_capability_reports_unavailable_when_the_probe_failed() {
+        let caps = resolve_system_capabilities(None, None);
+        let youtube = caps
+            .youtube
+            .expect("a youtube-feature build must report the capability");
+        assert!(youtube.compiled, "the feature IS compiled");
+        assert!(!youtube.available, "but no yt-dlp was found/probed");
+        assert!(youtube.version.is_none());
     }
 }

@@ -101,6 +101,7 @@ fn splice_storeless_sections(
     running.placement.clone_from(&boot.placement);
     running.walls.clone_from(&boot.walls);
     running.routing.clone_from(&boot.routing);
+    running.events = boot.events;
     running
 }
 

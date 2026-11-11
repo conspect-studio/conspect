@@ -494,6 +494,178 @@ impl TrackCapacity {
     }
 }
 
+/// One output's audio selection as rewritten by [`propagate_routing_change`]:
+/// which discrete tracks were dropped (a route removed its `target_track`, or
+/// the whole route disappeared) and which were renamed (the same `input_id`
+/// kept a route but `target_track` changed name).
+///
+/// `output_index` is the output's position in the `outputs` slice
+/// [`propagate_routing_change`] was called with — the caller (the control
+/// plane, which alone knows the stable REST output id for that slot) maps it
+/// onto whatever identity its report should name.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[non_exhaustive]
+pub struct OutputAudioUpdate {
+    /// This output's position in the `outputs` slice passed to
+    /// [`propagate_routing_change`].
+    pub output_index: usize,
+    /// Track names this output's selection no longer carries (dropped from
+    /// `tracks`, with no equivalent rename).
+    pub removed: Vec<String>,
+    /// `(old_name, new_name)` pairs this output's selection was rewritten to
+    /// follow.
+    pub renamed: Vec<(String, String)>,
+}
+
+/// Compute the discrete-track renames and removals a routing-document replace
+/// implies, relative to the document it replaces.
+///
+/// A **rename** is a route whose `input_id` is unchanged between `old` and
+/// `new` but whose `target_track` differs (both present). A **removal** is a
+/// discrete track name that existed in `old`'s declared tracks but has no
+/// surviving route in `new` with that exact name as its `target_track` (the
+/// route lost its track, changed `input_id`, or the route itself was
+/// removed) **and** is not the target of a rename (a renamed source is not
+/// also counted as a bare removal of its old name).
+///
+/// `old` is `None` for a first-ever routing document (nothing to rename or
+/// remove relative to).
+#[must_use]
+pub fn diff_track_changes(
+    old: Option<&AudioRouting>,
+    new: &AudioRouting,
+) -> (Vec<(String, String)>, Vec<String>) {
+    let Some(old) = old else {
+        return (Vec::new(), Vec::new());
+    };
+
+    let mut renamed: Vec<(String, String)> = Vec::new();
+    for old_route in &old.routes {
+        let Some(old_track) = &old_route.target_track else {
+            continue;
+        };
+        if let Some(new_route) = new
+            .routes
+            .iter()
+            .find(|route| route.input_id == old_route.input_id)
+        {
+            if let Some(new_track) = &new_route.target_track {
+                if new_track != old_track {
+                    renamed.push((old_track.clone(), new_track.clone()));
+                }
+            }
+        }
+    }
+
+    let new_targets: HashSet<&str> = new
+        .routes
+        .iter()
+        .filter_map(|route| route.target_track.as_deref())
+        .collect();
+    let renamed_old: HashSet<&str> = renamed.iter().map(|(old, _)| old.as_str()).collect();
+    let removed: Vec<String> = old
+        .routes
+        .iter()
+        .filter_map(|route| route.target_track.as_deref())
+        .filter(|track| !new_targets.contains(track) && !renamed_old.contains(track))
+        .map(ToOwned::to_owned)
+        .collect();
+
+    (renamed, removed)
+}
+
+/// Apply a set of renames/removals to one output's explicit `tracks` list
+/// (mode `tracks` only — `auto`/`program` carry no explicit list to rewrite).
+/// Returns the rewritten list and whether anything actually changed.
+///
+/// A track renamed to a name the list already carries collapses (no
+/// duplicate); an emptied `tracks` list falls back to `[PROGRAM_TRACK]`
+/// (ADR-R005 §4.3: an output must always resolve to *something* audible)
+/// rather than landing an invalid `mode = "tracks"` selection with no tracks.
+fn rewrite_tracks(
+    tracks: &[String],
+    renamed: &[(String, String)],
+    removed: &[String],
+) -> (Vec<String>, bool) {
+    let mut changed = false;
+    let mut next: Vec<String> = Vec::with_capacity(tracks.len());
+    for track in tracks {
+        if removed.iter().any(|r| r == track) {
+            changed = true;
+            continue;
+        }
+        let mapped = renamed
+            .iter()
+            .find(|(old, _)| old == track)
+            .map_or_else(|| track.clone(), |(_, new)| new.clone());
+        if &mapped != track {
+            changed = true;
+        }
+        if next.contains(&mapped) {
+            changed = true;
+        } else {
+            next.push(mapped);
+        }
+    }
+    if next.is_empty() && !tracks.is_empty() {
+        changed = true;
+        next.push(PROGRAM_TRACK.to_owned());
+    }
+    (next, changed)
+}
+
+/// Rewrite every output's `mode = "tracks"` selection to follow a routing
+/// replace's renames/removals, **in place**, returning one
+/// [`OutputAudioUpdate`] per output actually changed (ADR-R005 §4.3: the
+/// preferred fix for the rename/remove deadlock — the atomic commit updates
+/// BOTH the routing document and every referencing output's selection
+/// together, instead of requiring the operator to stage an intermediate
+/// state by hand).
+///
+/// `outputs` is addressed by its index; the caller maps `output_index` back
+/// onto the stable REST/API identity for that slot.
+pub fn propagate_routing_change(
+    old: Option<&AudioRouting>,
+    new: &AudioRouting,
+    outputs: &mut [crate::Output],
+) -> Vec<OutputAudioUpdate> {
+    let (renamed, removed) = diff_track_changes(old, new);
+    if renamed.is_empty() && removed.is_empty() {
+        return Vec::new();
+    }
+
+    let mut updates = Vec::new();
+    for (output_index, output) in outputs.iter_mut().enumerate() {
+        let Some(selection) = output.audio_mut().as_mut() else {
+            continue;
+        };
+        if selection.mode != OutputAudioMode::Tracks {
+            continue;
+        }
+        let (next_tracks, changed) = rewrite_tracks(&selection.tracks, &renamed, &removed);
+        if !changed {
+            continue;
+        }
+        let this_removed: Vec<String> = removed
+            .iter()
+            .filter(|track| selection.tracks.contains(track))
+            .cloned()
+            .collect();
+        let this_renamed: Vec<(String, String)> = renamed
+            .iter()
+            .filter(|(old_track, _)| selection.tracks.contains(old_track))
+            .cloned()
+            .collect();
+        selection.tracks = next_tracks;
+        updates.push(OutputAudioUpdate {
+            output_index,
+            removed: this_removed,
+            renamed: this_renamed,
+        });
+    }
+    updates
+}
+
 /// The **per-output audio capability** — the verified ADR-R005 §4.2 matrix as a
 /// first-class, machine-readable value (the brief: "a first-class data
 /// structure, not scattered conditionals").

@@ -172,7 +172,7 @@ async fn program_audio_seam_reaches_the_sink() {
     let mut pipeline = build_pipeline(false, false);
     pipeline.enable_program_audio();
 
-    let (result, video, audio) = drive_counting(pipeline, 40).await;
+    let (result, video, audio) = Box::pin(drive_counting(pipeline, 40)).await;
     let out = result.expect("program audio must flow through the real seam");
     assert_eq!(video, 40, "every FFV1 frame reaches the sink");
     assert!(
@@ -198,7 +198,7 @@ async fn program_audio_seam_reaches_the_sink() {
 #[tokio::test(flavor = "current_thread")]
 async fn audio_routing_without_encode_is_video_only() {
     let pipeline = build_pipeline(true, false);
-    let (result, video, audio) = drive_counting(pipeline, 40).await;
+    let (result, video, audio) = Box::pin(drive_counting(pipeline, 40)).await;
     let out = result.expect("routing without program-audio encode must run video-only");
     assert_eq!(video, 40, "every FFV1 frame reaches the sink");
     assert_eq!(audio, 0, "no program-audio encode: no audio packets");
@@ -219,7 +219,7 @@ async fn audio_routing_without_encode_is_video_only() {
 #[tokio::test(flavor = "current_thread")]
 async fn declared_program_audio_without_encode_rejects_explicitly() {
     let pipeline = build_pipeline(false, true);
-    let (result, _video, _audio) = drive_counting(pipeline, 10).await;
+    let (result, _video, _audio) = Box::pin(drive_counting(pipeline, 10)).await;
     let err = result.expect_err("a declared audio selection must not silently air video-only");
     match &err {
         multiview_cli::pipeline::PipelineError::Output { kind, reason } => {
@@ -240,7 +240,7 @@ async fn declared_program_audio_without_encode_rejects_explicitly() {
 async fn declared_program_audio_with_encode_flows() {
     let mut pipeline = build_pipeline(false, true);
     pipeline.enable_program_audio();
-    let (result, video, audio) = drive_counting(pipeline, 40).await;
+    let (result, video, audio) = Box::pin(drive_counting(pipeline, 40)).await;
     result.expect("declared + enabled must run");
     assert_eq!(video, 40);
     assert!(audio >= 40, "declared program audio must flow, got {audio}");

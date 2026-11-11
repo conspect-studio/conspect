@@ -99,36 +99,48 @@ impl fmt::Debug for OverlayLiveCapability {
     }
 }
 
+/// Components of an audio-routing mutation accepted by the running engine.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AudioRoutingApplyResult {
+    /// The program mix and all discrete track wiring changed live.
+    Live,
+    /// The program mix changed live; discrete track topology needs reconfiguration.
+    ProgramLiveTracksDeferred,
+    /// No component changed in the running engine.
+    Restart,
+}
+
 /// The audio-routing live-apply capability: a binary-injected **apply** hook
 /// over a validated `[audio]` document.
 ///
 /// The hook hands the document to the running program bus's bounded,
 /// consumer-polled control mailbox (never the bus itself — the bake consumer
-/// applies it at its next tick, ramped) and returns whether the running engine
-/// can honour it live. `false` (no program bus running, a changed sample rate,
-/// a mixed input with no audio store) ⇒ the stored document waits for a
-/// restart and the response says `restart`. The hook must be wait-free: it is
-/// called from an HTTP handler and must never block or await the engine
-/// (invariant #10).
+/// applies it at its next tick, ramped). `partial` means the program bus
+/// accepted the new mix while output track topology remains startup-pinned.
+/// `restart` means no part applied (no bus, changed rate, or unknown mixed
+/// input). The hook must never await or block the engine (invariant #10).
 #[derive(Clone)]
 pub struct AudioRoutingLiveCapability {
-    apply: Arc<dyn Fn(&multiview_config::AudioRouting) -> bool + Send + Sync>,
+    apply: Arc<dyn Fn(&multiview_config::AudioRouting) -> AudioRoutingApplyResult + Send + Sync>,
 }
 
 impl AudioRoutingLiveCapability {
     /// Wrap the binary's apply hook.
     #[must_use]
     pub fn new(
-        apply: impl Fn(&multiview_config::AudioRouting) -> bool + Send + Sync + 'static,
+        apply: impl Fn(&multiview_config::AudioRouting) -> AudioRoutingApplyResult
+            + Send
+            + Sync
+            + 'static,
     ) -> Self {
         Self {
             apply: Arc::new(apply),
         }
     }
 
-    /// Hand `routing` to the running engine; `true` iff it applies live.
+    /// Publish `routing` and report the components the running engine accepts.
     #[must_use]
-    pub fn apply(&self, routing: &multiview_config::AudioRouting) -> bool {
+    pub fn apply(&self, routing: &multiview_config::AudioRouting) -> AudioRoutingApplyResult {
         (self.apply)(routing)
     }
 }

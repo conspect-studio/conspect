@@ -100,6 +100,7 @@ pub mod caption_store;
 pub mod dash;
 pub mod error;
 pub mod hls;
+pub mod hls_journal;
 pub mod id3;
 pub mod inventory;
 pub mod jitter;

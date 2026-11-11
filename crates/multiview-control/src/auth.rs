@@ -296,6 +296,10 @@ pub fn scope_permits(scopes: &AuthzScopes<'_>, scope: AuthzScope<'_>) -> bool {
         AuthzScope::Object(id) => allowlist_permits(scopes.objects, Some(id)),
         AuthzScope::Output(id) => output_scope_permits(scopes.outputs, id),
         AuthzScope::Program(id) => program_scope_permits(scopes.outputs, id),
+        AuthzScope::ObjectAndProgram { object, program } => {
+            allowlist_permits(scopes.objects, Some(object))
+                && program_scope_permits(scopes.outputs, program)
+        }
         AuthzScope::DiscoveryDomain(domain) => allowlist_permits(scopes.discovery_domains, domain),
         AuthzScope::ObjectAndOutput { object, output } => {
             allowlist_permits(scopes.objects, Some(object))

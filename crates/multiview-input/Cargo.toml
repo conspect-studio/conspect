@@ -45,12 +45,15 @@ socket2 = { version = "0.6", optional = true }
 # libav directly (it forbids `unsafe`); it only calls multiview-ffmpeg's safe API.
 multiview-ffmpeg = { workspace = true }
 
-# JSON info-dict parser + derive for the YouTube resolver (the `youtube`
-# feature). Pulled in only behind that off-by-default feature; the default build
-# stays without them. Pure-Rust, no native deps — the crate stays
+# Serialize derive for the full SCTE-35 / ID3 journal decode, and Deserialize for
+# the YouTube resolver. Pure-Rust, no native deps — the crate stays
 # `unsafe_code = forbid`.
-serde = { workspace = true, optional = true }
+serde = { workspace = true }
+# JSON info-dict parser for the YouTube resolver (the `youtube` feature). Pulled in
+# only behind that off-by-default feature.
 serde_json = { workspace = true, optional = true }
+# Decodes base64 SCTE-35 cue payloads for the journal. Pure Rust, already locked.
+base64 = "0.22"
 
 # NDI® ingest (the off-by-default `ndi` feature, ADR-0008 / IN-3). This is the
 # OUT-3 runtime-load FFI leaf crate: it resolves the operator-provided NDI runtime
@@ -146,7 +149,7 @@ tokio = { workspace = true, features = ["test-util", "macros", "rt"] }
 # script (no libavutil.pc) on that runner. `serde_json` parses the `yt-dlp -J`
 # output; `tokio/process` spawns the binary with a hard timeout. No native deps in
 # THIS crate, no FFI — it stays `unsafe_code = forbid`.
-"youtube" = ["dep:serde", "dep:serde_json", "tokio/process", "tokio/io-util"]
+"youtube" = ["dep:serde_json", "tokio/process", "tokio/io-util"]
 
 [lints]
 workspace = true

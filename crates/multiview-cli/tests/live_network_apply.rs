@@ -235,15 +235,14 @@ async fn live_added_file_source_goes_live_then_remove_slates_never_faltering() {
         (went_live, went_dark)
     });
 
-    let report = pipeline
-        .run_until_serving(
-            &stop,
-            publisher.as_ref(),
-            &preview_slot,
-            move |drive: &mut CompositorDrive<Nv12Image>| drain(drive),
-        )
-        .await
-        .expect("serving run with live network add/remove");
+    let report = Box::pin(pipeline.run_until_serving(
+        &stop,
+        publisher.as_ref(),
+        &preview_slot,
+        move |drive: &mut CompositorDrive<Nv12Image>| drain(drive),
+    ))
+    .await
+    .expect("serving run with live network add/remove");
     let (went_live, went_dark) = driver.await.expect("driver task");
     hub.shutdown();
 

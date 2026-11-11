@@ -99,6 +99,10 @@ pub struct SpliceInsert {
     pub break_duration_90k: Option<u64>,
     /// Whether the break auto-returns to the network feed at duration end.
     pub auto_return: bool,
+    /// `program_splice_flag`: `true` for a whole-program splice. `false` means
+    /// component mode — only the listed elementary streams splice, so the cue
+    /// must never be projected as a whole-source break boundary (F4).
+    pub program_splice: bool,
 }
 
 /// A decoded `time_signal` command (a bare `splice_time`).
@@ -145,6 +149,12 @@ pub struct SegmentationDescriptor {
     pub duration_90k: Option<u64>,
     /// Absent on cancellation.
     pub upid: Option<SegmentationUpid>,
+    /// 1-based ordinal of this segment within a multi-part sequence (e.g. a
+    /// chapter), absent on cancellation.
+    pub segment_num: Option<u8>,
+    /// Total expected segments in the sequence `segment_num` belongs to,
+    /// absent on cancellation.
+    pub segments_expected: Option<u8>,
 }
 
 /// Rich projection retaining segmentation identity alongside the legacy cue.
@@ -502,6 +512,8 @@ fn parse_splice_insert(reader: &mut BitReader<'_>) -> Result<SpliceInsert, ScteE
             pts_time_90k: None,
             break_duration_90k: None,
             auto_return: false,
+            // A cancel withdraws the whole event id regardless of mode.
+            program_splice: true,
         });
     }
     let out_of_network = reader.flag()?;
@@ -546,6 +558,7 @@ fn parse_splice_insert(reader: &mut BitReader<'_>) -> Result<SpliceInsert, ScteE
         pts_time_90k,
         break_duration_90k,
         auto_return,
+        program_splice,
     })
 }
 
@@ -667,6 +680,8 @@ fn parse_segmentation(bytes: &[u8]) -> Result<SegmentationDescriptor, ScteError>
         segmentation_type_id: None,
         duration_90k: None,
         upid: None,
+        segment_num: None,
+        segments_expected: None,
     };
     if !cancel {
         let program = reader.flag()?;
@@ -692,7 +707,8 @@ fn parse_segmentation(bytes: &[u8]) -> Result<SegmentationDescriptor, ScteError>
         descriptor.upid = Some(SegmentationUpid { upid_type, value });
         let kind = read_byte(&mut reader)?;
         descriptor.segmentation_type_id = Some(kind);
-        reader.skip(16)?; // segment_num + segments_expected
+        descriptor.segment_num = Some(read_byte(&mut reader)?);
+        descriptor.segments_expected = Some(read_byte(&mut reader)?);
         if matches!(kind, 0x34 | 0x36 | 0x38 | 0x3a) {
             reader.skip(16)?; // sub_segment_num + sub_segments_expected
         }

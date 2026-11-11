@@ -72,10 +72,20 @@ pub enum ControlError {
     #[error("engine command bus at capacity; request shed")]
     EngineBusy,
 
+    /// The bounded idempotency reservation store is full. Existing keys still
+    /// replay, but a new key cannot be accepted without risking duplicate work.
+    #[error("idempotency reservation store at capacity; new key refused")]
+    IdempotencyCapacity,
+
     /// The atomic rename became visible, but directory durability could not be
     /// confirmed. The caller must read the authoritative record before retrying.
     #[error("desired-state commit status is indeterminate: {0}")]
     CommitIndeterminate(String),
+
+    /// A bounded control-plane queue or per-principal rate is exhausted (the deep
+    /// probe's queue/rate limit); the request is shed with `429`, never blocked.
+    #[error("too many requests: {0}")]
+    TooManyRequests(String),
 
     /// A persistence/repository fault.
     #[error("repository error: {0}")]
@@ -119,6 +129,12 @@ impl ControlError {
             }
             Self::EngineBusy => Problem::new(503, "engine-busy", "Engine command bus at capacity")
                 .with_detail("the control command queue is full; retry shortly"),
+            Self::IdempotencyCapacity => Problem::new(
+                503,
+                "idempotency-capacity",
+                "Idempotency reservation capacity exhausted",
+            )
+            .with_detail("the process cannot safely reserve another distinct idempotency key; existing keys still replay"),
             Self::CommitIndeterminate(msg) => Problem::new(
                 503,
                 "commit-indeterminate",
@@ -127,6 +143,9 @@ impl ControlError {
             .with_detail(format!(
                 "{msg}; read the current resource and its ETag before a retry"
             )),
+            Self::TooManyRequests(msg) => {
+                Problem::new(429, "too-many-requests", "Too many requests").with_detail(msg)
+            }
             Self::Repository(msg) => {
                 Problem::new(500, "repository", "Internal repository error").with_detail(msg)
             }
