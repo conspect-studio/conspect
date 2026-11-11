@@ -50,8 +50,11 @@ worker thread, the same shape as the existing video rendition workers:
 
 ## Evidence required
 
-- Unit: jobs encode in order and the emitted program/track PTS sequence equals the inline path
-  for the same input; a wedged worker fails the offer within the horizon (no unbounded wait).
+- Unit: jobs encode strictly in tick order with a single flush; a wedged worker fails the offer
+  within the horizon (no unbounded wait); an encoder error surfaces at join; joining while the
+  consumer drains a bounded event channel completes (the EOF shape). Packet/PTS equivalence with
+  the former inline path is proven end to end (identical encoder inputs and order; the
+  `discrete_audio_tracks` suite decodes every rendition), not by a unit fake.
 - Pipeline: an existing A/V lock test (tracks + program) passes unchanged.
 - Hardware: on the production host, the instrumented consumer's audio stage drops to < 1 ms and
   there are no "fell behind" exits over a soak.

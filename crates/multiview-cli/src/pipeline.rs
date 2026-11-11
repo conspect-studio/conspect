@@ -6056,7 +6056,7 @@ fn consumer_main<D: WindowDelivery>(
     // The program-audio encode worker owns the AAC encoder: it encodes program +
     // discrete tracks OFF this consumer, in tick order, computes the watermarks
     // and dispatches (design note docs/architecture/audio-encode-worker.md).
-    let audio_worker = match audio_encoder.take() {
+    let mut audio_worker = match audio_encoder.take() {
         Some(encoder) => {
             let tx = event_tx.clone();
             let tail_tx = event_tx.clone();
@@ -6355,10 +6355,12 @@ fn consumer_main<D: WindowDelivery>(
                 // intentionally ignore here (drop-oldest; inv #10).
                 let _ = slot.push(block.clone());
             }
-            let worker = audio_worker.as_ref().ok_or_else(|| PipelineError::Output {
-                kind: "encode-audio",
-                reason: "audio bus has no encoder".to_owned(),
-            })?;
+            if audio_worker.is_none() {
+                return Err(PipelineError::Output {
+                    kind: "encode-audio",
+                    reason: "audio bus has no encoder".to_owned(),
+                });
+            }
             // #152: discrete tracks, same tick, same sample budget (inv #3). The
             // per-track blocks are copied into the owned job; the encode runs on
             // the worker.
@@ -6373,20 +6375,46 @@ fn consumer_main<D: WindowDelivery>(
                 let track_bus = bus;
                 discrete_track_samples(track_bus, &selected_tracks, block.frame_count())
             };
-            worker
-                .offer_within(
-                    crate::rendition_workers::AudioJob {
-                        tick: item.tick_index,
-                        frames: block.frame_count(),
-                        program: block.interleaved().to_vec(),
-                        tracks,
-                    },
-                    offer_horizon,
-                )
-                .map_err(|e| PipelineError::Output {
-                    kind: "audio-worker",
-                    reason: format!("{e:?}"),
-                })?;
+            let offered = audio_worker.as_ref().map_or(
+                Err(crate::rendition_workers::OfferRejection::Ended),
+                |worker| {
+                    worker.offer_within(
+                        crate::rendition_workers::AudioJob {
+                            tick: item.tick_index,
+                            frames: block.frame_count(),
+                            program: block.interleaved().to_vec(),
+                            tracks,
+                        },
+                        offer_horizon,
+                    )
+                },
+            );
+            match offered {
+                Ok(()) => {}
+                // The worker died: join it to surface its concrete encoder
+                // error (the inline path reported the FFmpeg reason directly).
+                Err(crate::rendition_workers::OfferRejection::Ended) => {
+                    let ended = PipelineError::Output {
+                        kind: "audio-worker",
+                        reason: "Ended".to_owned(),
+                    };
+                    return Err(
+                        match audio_worker
+                            .take()
+                            .map(crate::rendition_workers::AudioEncodeWorker::join)
+                        {
+                            Some(Err(e)) => e,
+                            _ => ended,
+                        },
+                    );
+                }
+                Err(e) => {
+                    return Err(PipelineError::Output {
+                        kind: "audio-worker",
+                        reason: format!("{e:?}"),
+                    })
+                }
+            }
         } else if let Some(bus) = display_audio.dedicated_bus.as_mut() {
             // A video-only run with audio-enabled display heads: drive the
             // dedicated display bus by the same absolute tick index (RT-8b —

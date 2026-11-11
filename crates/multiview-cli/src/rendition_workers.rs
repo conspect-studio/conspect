@@ -657,6 +657,55 @@ mod audio_worker_tests {
         worker.join().unwrap();
     }
 
+    /// EOF contract (review AW-1): joining while the consumer is still
+    /// draining a bounded event channel must not deadlock — the worker's tail
+    /// send blocks until the drainer takes it.
+    #[test]
+    fn join_completes_while_a_bounded_event_channel_is_drained_concurrently() {
+        let (tx, rx) = std::sync::mpsc::sync_channel::<u64>(1);
+        let tail_tx = tx.clone();
+        let worker = AudioEncodeWorker::spawn(
+            Recorder {
+                seen: Arc::new(Mutex::new(Vec::new())),
+                current: 0,
+                stall: None,
+            },
+            move |tick, _| {
+                tx.send(tick).map_err(|_| PipelineError::Output {
+                    kind: "audio-dispatch",
+                    reason: "closed".to_owned(),
+                })
+            },
+            move |_| {
+                tail_tx.send(u64::MAX).map_err(|_| PipelineError::Output {
+                    kind: "audio-dispatch",
+                    reason: "closed".to_owned(),
+                })
+            },
+        )
+        .unwrap();
+        for tick in 0..6 {
+            worker
+                .offer_within(job(tick), Duration::from_secs(5))
+                .unwrap();
+        }
+        // Join on a helper while this thread drains (the pipeline's EOF shape).
+        let joiner = std::thread::spawn(move || worker.join());
+        let mut got = Vec::new();
+        while let Ok(v) = rx.recv_timeout(Duration::from_secs(5)) {
+            got.push(v);
+            if v == u64::MAX {
+                break;
+            }
+        }
+        joiner.join().unwrap().unwrap();
+        assert_eq!(
+            got,
+            vec![0, 1, 2, 3, 4, 5, u64::MAX],
+            "every tick then the tail"
+        );
+    }
+
     #[test]
     fn an_encoder_error_surfaces_at_join_and_ends_further_offers() {
         struct Failing;
