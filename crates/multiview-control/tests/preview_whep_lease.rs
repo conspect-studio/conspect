@@ -235,3 +235,15 @@ async fn cap_plus_one_gets_the_503_problem_shape() {
     assert_eq!(p["type"], "/problems/whep-capacity");
     assert_eq!(p["fallback"], "jpeg");
 }
+
+#[tokio::test]
+async fn a_session_cannot_be_released_through_another_scope() {
+    let sim = Arc::new(SimWhep::default());
+    let gated = Arc::new(GatedWhep::new(sim.clone(), FocusCaps::new(2, 2), "jpeg"));
+    let _ = send(&router_for(gated.clone()), post(PROGRAM, OPERATOR_TOKEN)).await;
+    assert!(!gated.release(&WhepScope::Input("cam-1".to_owned()), "sess-0"));
+    assert_eq!(sim.live(), 1);
+    assert_eq!(gated.active_sessions(), 1);
+    assert!(gated.release(&WhepScope::Program, "sess-0"));
+    assert_eq!(gated.active_sessions(), 0);
+}

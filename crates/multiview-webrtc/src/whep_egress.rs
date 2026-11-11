@@ -615,13 +615,19 @@ impl WhepEgress {
         self.sessions.lock().map_or(0, |m| m.len())
     }
 
-    /// The ids of every tracked session (live + closed tombstones), for the
+    /// The ids of every **live** session (closed tombstones are excluded so the
+    /// driver's per-tick scans never grow with offer churn), for the
     /// endpoint driver to iterate and pump.
     #[must_use]
     pub fn session_ids(&self) -> Vec<SessionId> {
         self.sessions
             .lock()
-            .map(|m| m.keys().cloned().collect())
+            .map(|m| {
+                m.iter()
+                    .filter(|(_, e)| e.session.is_some())
+                    .map(|(id, _)| id.clone())
+                    .collect()
+            })
             .unwrap_or_default()
     }
 

@@ -540,6 +540,17 @@ impl WhepProvider for GatedWhep {
     }
 
     fn release(&self, scope: &WhepScope, session_id: &str) -> bool {
+        // A session id is only releasable through the scope it was opened on (a
+        // key authorised for one scope must not close another scope's session).
+        let mismatch = self
+            .leases
+            .lock()
+            .ok()
+            .and_then(|l| l.by_session.get(session_id).map(|h| &h.scope != scope))
+            .unwrap_or(false);
+        if mismatch {
+            return false;
+        }
         let freed = self.inner.release(scope, session_id);
         // Drop the lease even when the transport already forgot the session (it
         // may have been reaped): the slot must never outlive the session.

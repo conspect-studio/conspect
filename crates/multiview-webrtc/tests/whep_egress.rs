@@ -743,3 +743,17 @@ fn a_connected_peer_that_goes_silent_is_reaped_after_the_timeout() {
     assert_eq!(dead, vec![id.clone()]);
     assert_eq!(egress.session_state(&id), Some(SessionState::Closed));
 }
+
+#[test]
+fn closed_tombstones_are_not_scanned_by_the_driver() {
+    let egress = WhepEgress::new();
+    for _ in 0..10 {
+        let media = FakeMediaSource::video_only(PreviewCodec::H264, 4);
+        let ta = egress
+            .accept(VIDEO_OFFER, PreviewCodec::H264, &media)
+            .unwrap();
+        egress.close(&ta.session_id).unwrap();
+    }
+    assert_eq!(egress.session_ids().len(), 0);
+    assert_eq!(egress.tracked_sessions(), 10);
+}
