@@ -6399,16 +6399,27 @@ fn consumer_main<D: WindowDelivery>(
             }
         }
     }
-    // Join the independently admitted video encoders and drain their terminal
-    // events before finalizing the shared program audio and binding windows.
-    for worker in workers {
-        worker.join()?;
-    }
-    if let Some(worker) = audio_worker {
-        // Flushes the encoder and sends FinishAudio from the worker thread.
-        worker.join()?;
-    }
+    // End of run: close every worker's input and let them flush. The workers
+    // and this thread share `event_tx`/`event_rx` (bounded); a worker blocked
+    // sending its tail into a full channel would deadlock a plain `join` here,
+    // so the joins run on a helper thread while this thread keeps draining.
+    // Video workers join before the audio worker (terminal ordering preserved).
     drop(event_tx);
+    let joiner = std::thread::Builder::new()
+        .name("multiview-worker-join".to_owned())
+        .spawn(move || -> Result<(), PipelineError> {
+            for worker in workers {
+                worker.join()?;
+            }
+            if let Some(worker) = audio_worker {
+                worker.join()?;
+            }
+            Ok(())
+        })
+        .map_err(|e| PipelineError::Output {
+            kind: "worker-join",
+            reason: e.to_string(),
+        })?;
     while let Ok(event) = event_rx.recv() {
         if let Err(e) = dispatcher.dispatch(event, Instant::now(), &mut delivery) {
             if !matches!(
@@ -6422,6 +6433,10 @@ fn consumer_main<D: WindowDelivery>(
             }
         }
     }
+    joiner.join().map_err(|_| PipelineError::Output {
+        kind: "worker-join",
+        reason: "worker join thread panicked".to_owned(),
+    })??;
     if !dispatcher.is_finished() {
         return Err(PipelineError::Output {
             kind: "dispatch",
