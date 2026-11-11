@@ -14451,6 +14451,10 @@ pub(crate) mod seek_barrier {
     }
 }
 
+/// Attempts at the durable precommit before a generation is retired.
+#[cfg(feature = "ffmpeg")]
+const PRECOMMIT_MAX_ATTEMPTS: u32 = 3;
+
 #[cfg(feature = "ffmpeg")]
 #[allow(clippy::too_many_lines)]
 fn player_runtime_body(
@@ -14492,6 +14496,14 @@ fn player_runtime_body(
     let mut eof_drained_frames = 0_u64;
     let mut first = true;
     let mut journal_refusal = None;
+    // Generation whose audio deck is parked in the commit slot (two-phase
+    // PREPARE sent, COMMIT not yet done). Ingest-local; never crosses threads.
+    let mut prepared_audio: Option<crate::player::Generation> = None;
+    // Bounded precommit retry: (generation, failed attempts).
+    let mut precommit_failures: (crate::player::Generation, u32) =
+        (crate::player::Generation::NONE, 0);
+    // A taken detach ticket whose cancellation was deferred by a held gate.
+    let mut deferred_detach: Option<Arc<crate::player::DetachTicket>> = None;
     let mut warmup_packets = 0_u32;
     let mut warmup_started = None;
     let mut last_audio_control = None;
@@ -14522,7 +14534,7 @@ fn player_runtime_body(
         }
         player.catch_up(pacer.min_tick(run_now));
         if detaching.is_none() {
-            if let Some(ticket) = runtime.detach.take() {
+            if let Some(ticket) = deferred_detach.take().or_else(|| runtime.detach.take()) {
                 let binding = runtime.binding.load();
                 if ticket.recovery_generation == Some(binding.generation)
                     && binding.reference.is_none()
@@ -14570,7 +14582,14 @@ fn player_runtime_body(
                             std::thread::park();
                         }
                     }
-                    let generation = coordinator.cancel_pending();
+                    let Some(generation) = coordinator.try_cancel_pending() else {
+                        // Gate held by a management submit: keep the durable
+                        // intent and the taken ticket; retry next tick.
+                        deferred_detach = Some(ticket);
+                        sleep_interruptible(period, stop);
+                        continue;
+                    };
+                    prepared_audio = None;
                     audio_slot.request_retirement(generation);
                     player = match crate::player::MediaPlayer::idle(cadence, handle.eof_policy) {
                         Ok(player) => player,
@@ -14704,9 +14723,27 @@ fn player_runtime_body(
                 .as_ref()
                 .is_some_and(|s| coordinator.is_superseded(s.generation))
         {
-            if let Some(stale) = pending_stage.take() {
-                *pending_retire = coordinator.retire(stale.clip).err();
-                opener.wake();
+            let reclaimed = match pending_stage.as_mut() {
+                Some(stale) if prepared_audio == Some(stale.generation) => {
+                    match audio_slot.reclaim(stale.generation) {
+                        Ok(deck) => {
+                            if let Some(deck) = deck {
+                                stale.clip.audio = deck.deck;
+                                stale.clip.audio_lease = deck.lease;
+                            }
+                            true
+                        }
+                        Err(()) => false,
+                    }
+                }
+                _ => true,
+            };
+            if reclaimed {
+                prepared_audio = None;
+                if let Some(stale) = pending_stage.take() {
+                    *pending_retire = coordinator.retire(stale.clip).err();
+                    opener.wake();
+                }
             }
         }
         if detaching.is_none() && pending_retire.is_none() {
@@ -14720,12 +14757,15 @@ fn player_runtime_body(
                 };
                 let mut superseded_in_flight = false;
                 let audio_unavailable = audio_slot.is_closed() && staged.clip.probed.has_audio;
+                let already_prepared = prepared_audio == Some(snapshot.generation);
                 let refusal = if audio_unavailable {
                     // Fail closed BEFORE any durable write: an audio-bearing clip
                     // with a dead audio rail can never satisfy the A/V contract.
                     Some(crate::player::PlayerFault::AudioUnavailable {
                         generation: snapshot.generation.0,
                     })
+                } else if already_prepared {
+                    None
                 } else {
                     runtime.journal.as_ref().and_then(|journal| {
                         if snapshot.reference.is_none() {
@@ -14762,6 +14802,7 @@ fn player_runtime_body(
                     Some(crate::player::PlayerFault::AudioUnavailable { .. })
                 ) {
                     // Terminal for this generation: retire the clip, keep the old one.
+                    prepared_audio = None;
                     if let Some(fault) = refusal {
                         tracing::warn!(player = %plan.id, ?fault, "audio-bearing load refused: audio rail closed; live binding unchanged");
                         runtime.status.store(Arc::new(crate::player::PlayerStatus {
@@ -14776,6 +14817,25 @@ fn player_runtime_body(
                     continue;
                 }
                 if let Some(fault) = refusal {
+                    if precommit_failures.0 != snapshot.generation {
+                        precommit_failures = (snapshot.generation, 0);
+                    }
+                    precommit_failures.1 += 1;
+                    if precommit_failures.1 >= PRECOMMIT_MAX_ATTEMPTS {
+                        // Bounded: terminal fault, retire the clip, accept no
+                        // further writes for this generation. Binding unchanged.
+                        tracing::error!(player = %plan.id, ?fault, "player load precommit failed terminally; clip retired");
+                        runtime.status.store(Arc::new(crate::player::PlayerStatus {
+                            clip_epoch: runtime.binding.load().generation.0,
+                            fault: Some(fault),
+                        }));
+                        journal_refusal = Some(fault);
+                        if let Some(stale) = pending_stage.take() {
+                            *pending_retire = coordinator.retire(stale.clip).err();
+                            opener.wake();
+                        }
+                        continue;
+                    }
                     if journal_refusal != Some(fault) {
                         tracing::warn!(player = %plan.id, ?fault, "player load precommit refused; live binding unchanged");
                         runtime.status.store(Arc::new(crate::player::PlayerStatus {
@@ -14788,29 +14848,63 @@ fn player_runtime_body(
                     sleep_interruptible(period, stop);
                     continue;
                 }
-                // This gate is still true at the moment of insertion. On lock
-                // contention, keep the entire native clip in pending_stage and
-                // try next tick: no video epoch advances and no audio is freed.
-                let audio = crate::player::StagedAudio {
-                    deck: std::mem::replace(
-                        &mut staged.clip.audio,
-                        multiview_audio::LoopDeck::empty(crate::audio::canonical_format()),
-                    ),
-                    lease: staged.clip.audio_lease.take(),
-                    artifact_lease: staged.clip.artifact_lease.clone(),
-                };
+                // Two-phase joint A/V commit. Audio-bearing clips: PREPARE parks
+                // the deck in the slot (video and old audio untouched); COMMIT
+                // (video swap + epoch publish) runs only after the live audio
+                // rail acknowledged PREPARE, polled nonblockingly on later
+                // iterations. A rail closed before COMMIT fails the load with A
+                // retained (refusal path above). Audio-less clips commit at once.
                 let epoch = staged.generation;
-                let audio_result = if audio_slot.is_closed() {
-                    // Keep unused PCM with the native clip; the opener retires it.
-                    // No adopter exists, and no large PCM free belongs on ingest.
-                    staged.clip.audio = audio.deck;
-                    staged.clip.audio_lease = audio.lease;
+                let has_audio = staged.clip.probed.has_audio;
+                let audio_result: Result<(), crate::player::StagedAudio> = if has_audio {
+                    if audio_slot.is_closed() {
+                        // Raced a close: next tick takes the fail-closed refusal.
+                        continue;
+                    }
+                    if prepared_audio == Some(epoch) {
+                        if audio_slot.is_prepared(epoch) {
+                            Ok(())
+                        } else {
+                            sleep_interruptible(period, stop);
+                            continue;
+                        }
+                    } else {
+                        let audio = crate::player::StagedAudio {
+                            deck: std::mem::replace(
+                                &mut staged.clip.audio,
+                                multiview_audio::LoopDeck::empty(crate::audio::canonical_format()),
+                            ),
+                            lease: staged.clip.audio_lease.take(),
+                            artifact_lease: staged.clip.artifact_lease.clone(),
+                        };
+                        match audio_slot.put(epoch, audio) {
+                            Ok(()) => {
+                                prepared_audio = Some(epoch);
+                                sleep_interruptible(period, stop);
+                            }
+                            Err(returned) => {
+                                staged.clip.audio = returned.deck;
+                                staged.clip.audio_lease = returned.lease;
+                            }
+                        }
+                        continue;
+                    }
+                } else if audio_slot.is_closed() {
                     Ok(())
                 } else {
+                    let audio = crate::player::StagedAudio {
+                        deck: std::mem::replace(
+                            &mut staged.clip.audio,
+                            multiview_audio::LoopDeck::empty(crate::audio::canonical_format()),
+                        ),
+                        lease: staged.clip.audio_lease.take(),
+                        artifact_lease: staged.clip.artifact_lease.clone(),
+                    };
                     audio_slot.put(epoch, audio)
                 };
                 match audio_result {
                     Ok(()) => {
+                        prepared_audio = None;
                         let commit_tick = pacer.min_tick(run_now);
                         let anchor =
                             player.rebind(staged.clip.geometry, staged.clip.then, commit_tick);
@@ -27023,6 +27117,198 @@ loop_default = true
         );
         drop(rig.shutdown());
         drop(silent);
+    }
+
+    /// Causal joint-A/V barrier: B's deck is parked and the audio rail has not
+    /// acknowledged PREPARE, so video stays on A. The rail then closes after
+    /// `put` and before adoption: B fails terminally, A's video/control/binding
+    /// are retained, and nothing stays pending.
+    #[test]
+    fn audio_close_after_put_before_adopt_fails_b_and_retains_a() {
+        use crate::player::PlayerFault;
+        let _budget = crate::player::budget_test_guard();
+        let dir = tempfile::tempdir().unwrap();
+        let a = clip(dir.path(), "a.mov", 30, Some(0.25));
+        let b = clip(dir.path(), "b.mov", 140, Some(0.25));
+        let rig = Rig::start(&plain_config(), None).unwrap();
+        rig.runtime
+            .opener
+            .request(ClipSpec::new(&a, LoadThen::Cue))
+            .unwrap();
+        wait("A committed and adopted", &|| {
+            rig.handle.control_bus.load().clip_epoch.0 >= 1
+                && rig
+                    .runtime
+                    .audio_commit
+                    .has_adopted(rig.handle.control_bus.load().clip_epoch)
+        });
+        let a_epoch = rig.handle.control_bus.load().clip_epoch;
+        let anchor = rig.handle.control_bus.load().start_anchor.unwrap();
+        let a_center = center(&rig.store, anchor);
+        rig.runtime.audio_commit.hold_prepare_for_test(true);
+        let b_gen = rig
+            .runtime
+            .opener
+            .request(ClipSpec::new(&b, LoadThen::Cue))
+            .unwrap();
+        wait("B deck parked (PREPARE sent)", &|| {
+            rig.runtime.audio_commit.pending_generation() == b_gen
+        });
+        // PREPARE unacknowledged: video must not have swapped, over many ticks.
+        let first = rig.first_tick_after_anchor();
+        for (_, luma) in rig.drive(first, 30) {
+            assert_eq!(luma, a_center, "A video retained while B only prepared");
+        }
+        assert_eq!(rig.handle.control_bus.load().clip_epoch, a_epoch);
+        // Rail dies after put, before adopt.
+        drop(rig.runtime.audio_commit.close());
+        wait("B failed closed", &|| {
+            matches!(
+                rig.runtime.status.load().fault,
+                Some(PlayerFault::AudioUnavailable { generation }) if generation == b_gen.0
+            )
+        });
+        for (_, luma) in rig.drive(first + 30, 30) {
+            assert_eq!(luma, a_center, "A video retained after B failed");
+        }
+        assert_eq!(rig.handle.control_bus.load().clip_epoch, a_epoch);
+        assert_eq!(rig.runtime.binding.load().generation, a_epoch);
+        assert_eq!(
+            rig.runtime.native.load().as_ref().unwrap().generation,
+            a_epoch.0
+        );
+        assert!(
+            rig.runtime.coordinator.is_superseded(b_gen)
+                || rig.runtime.coordinator.latest() == b_gen
+        );
+        assert!(rig.shutdown().is_none());
+    }
+
+    /// A persistently failing durable precommit retires the generation after a
+    /// bounded number of attempts; no further writes are accepted for it.
+    #[test]
+    fn persistent_journal_failure_is_terminal_and_retires_clip() {
+        use crate::player::PlayerFault;
+        use std::os::unix::fs::PermissionsExt;
+        let _budget = crate::player::budget_test_guard();
+        let dir = tempfile::tempdir().unwrap();
+        let state = dir.path().join("state");
+        let a = clip(dir.path(), "a.mov", 30, None);
+        let b = clip(dir.path(), "b.mov", 140, None);
+        let rig = Rig::start(&plain_config(), Some(&state)).unwrap();
+        let mut spec = ClipSpec::new(&a, LoadThen::Cue);
+        spec.reference = Some(SlotReference::Asset { id: "a".into() });
+        rig.runtime.opener.request(spec).unwrap();
+        wait("A committed", &|| {
+            rig.runtime.binding.load().reference.is_some()
+        });
+        let a_epoch = rig.runtime.binding.load().generation;
+        let bindings = state.join("player-bindings");
+        wait("A journal finalized", &|| {
+            std::fs::read_dir(&bindings).is_ok_and(|mut d| {
+                d.any(|e| {
+                    let p = e.unwrap().path();
+                    p.extension().is_some_and(|x| x == "json")
+                        && std::fs::read_to_string(p).is_ok_and(|t| {
+                            t.contains("\"prepared\":null")
+                                && t.contains("\"committed_present\":true")
+                        })
+                })
+            })
+        });
+        let record = std::fs::read(
+            std::fs::read_dir(&bindings)
+                .unwrap()
+                .map(|e| e.unwrap().path())
+                .find(|p| p.extension().is_some_and(|x| x == "json"))
+                .unwrap(),
+        )
+        .unwrap();
+        std::fs::set_permissions(&bindings, std::fs::Permissions::from_mode(0o500)).unwrap();
+        let mut spec = ClipSpec::new(&b, LoadThen::Cue);
+        spec.reference = Some(SlotReference::Asset { id: "b".into() });
+        let b_gen = rig.runtime.opener.request(spec).unwrap();
+        wait("terminal journal fault", &|| {
+            matches!(
+                rig.runtime.status.load().fault,
+                Some(PlayerFault::LoadJournalFailed { generation }) if generation == b_gen.0
+            )
+        });
+        // Clip retired: nothing staged for the failed generation keeps retrying.
+        // The fault is first published on attempt 1; the generation is retired
+        // after PRECOMMIT_MAX_ATTEMPTS ticks (40 ms each). Keep the journal
+        // failing well past that, so only a retry-forever bug could succeed later.
+        std::thread::sleep(Duration::from_millis(1000));
+        wait("retired queue drained", &|| {
+            rig.runtime.coordinator.retired_len() == 0
+        });
+        std::fs::set_permissions(&bindings, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::thread::sleep(Duration::from_millis(400));
+        let after = std::fs::read(
+            std::fs::read_dir(&bindings)
+                .unwrap()
+                .map(|e| e.unwrap().path())
+                .find(|p| p.extension().is_some_and(|x| x == "json"))
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(after, record, "no write accepted for the failed generation");
+        assert_eq!(rig.runtime.binding.load().generation, a_epoch, "A retained");
+        assert_eq!(rig.handle.control_bus.load().clip_epoch, a_epoch);
+        drop(rig.shutdown());
+    }
+
+    /// The ingest thread never waits on the commit/request gate: a held gate
+    /// defers (never loses) the taken detach ticket; it retires once released.
+    #[test]
+    fn detach_with_held_gate_defers_without_blocking_then_retires() {
+        use crate::player::{DetachAck, DetachRequest};
+        let _budget = crate::player::budget_test_guard();
+        let dir = tempfile::tempdir().unwrap();
+        let state = dir.path().join("state");
+        let a = clip(dir.path(), "a.mov", 30, Some(0.25));
+        let rig = Rig::start(&plain_config(), Some(&state)).unwrap();
+        let mut spec = ClipSpec::new(&a, LoadThen::Cue);
+        spec.reference = Some(SlotReference::Asset { id: "a".into() });
+        rig.runtime.opener.request(spec).unwrap();
+        wait("A committed", &|| {
+            rig.runtime.binding.load().reference.is_some()
+        });
+        wait("A adopted", &|| {
+            rig.runtime
+                .audio_commit
+                .has_adopted(rig.runtime.binding.load().generation)
+        });
+        let a_epoch = rig.runtime.binding.load().generation;
+        let held = rig.runtime.coordinator.hold_gate_for_test();
+        let ticket = rig
+            .runtime
+            .detach
+            .submit(DetachRequest {
+                operation: 9,
+                expected: a_epoch,
+            })
+            .unwrap();
+        std::thread::sleep(Duration::from_millis(500));
+        assert!(
+            ticket.acknowledgement().is_none(),
+            "deferred, not lost or acked"
+        );
+        assert_eq!(rig.runtime.binding.load().generation, a_epoch, "A retained");
+        assert!(
+            !rig.worker.as_ref().unwrap().is_finished(),
+            "ingest not blocked or dead"
+        );
+        // Output keeps producing while the gate is held.
+        assert_eq!(rig.drive(25, 10).len(), 10);
+        drop(held);
+        wait("detach retired", &|| ticket.acknowledgement().is_some());
+        assert!(matches!(
+            ticket.acknowledgement(),
+            Some(DetachAck::Retired(_))
+        ));
+        assert!(rig.runtime.binding.load().reference.is_none());
+        drop(rig.shutdown());
     }
 
     /// The boot sentinel geometry (0,1) is legitimate; the REAL geometry comes from

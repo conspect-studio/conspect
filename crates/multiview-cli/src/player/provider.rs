@@ -43,6 +43,7 @@ pub fn runtime_provider() -> Arc<RuntimeProvider> {
     Arc::clone(INSTANCE.get_or_init(|| Arc::new(RuntimeProvider::default())))
 }
 /// Observed facts for one load generation.
+#[allow(clippy::struct_excessive_bools)] // reason: independent observed facts feeding a pure rule
 #[derive(Clone, Copy)]
 struct Facts {
     acked: bool,

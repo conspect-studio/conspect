@@ -2021,6 +2021,18 @@ pub(crate) fn player_audio_loop(plan: &PlayerAudioPlan, store: &AudioStore, stop
         // block reflects the CURRENT transport state (ADR-T019 §2.3). vamp/arm-exit/
         // stop therefore land on the same boundary as the video by construction.
         if let Some(slot) = &plan.commit {
+            // PREPARE phase of the joint commit: acknowledge a parked deck so the
+            // video may COMMIT. Nothing is swapped; the old deck keeps playing.
+            let parked = slot.pending_generation();
+            if parked != crate::player::Generation::NONE && !slot.is_prepared(parked) {
+                #[cfg(test)]
+                let held = slot.prepare_held();
+                #[cfg(not(test))]
+                let held = false;
+                if !held {
+                    slot.acknowledge_prepared(parked);
+                }
+            }
             let control = plan.control_bus.load();
             match adopter.poll(&control, slot) {
                 crate::player::Adoption::Adopt {

@@ -59,6 +59,13 @@ pub struct AudioCommitSlot<A> {
     retire_requested: AtomicU64,
     retire_complete: AtomicU64,
     adopted: AtomicU64,
+    /// Generation of the deck currently parked in `slot` (0 = none).
+    parked: AtomicU64,
+    /// Newest generation the live audio thread has acknowledged as PREPARED
+    /// (deck observed parked by a running adopter; the old deck still plays).
+    prepared: AtomicU64,
+    #[cfg(all(test, feature = "ffmpeg"))]
+    hold_prepare: AtomicBool,
     runtime_owner: std::sync::OnceLock<Arc<std::fs::File>>,
 }
 
@@ -71,12 +78,60 @@ impl<A> Default for AudioCommitSlot<A> {
             retire_requested: AtomicU64::new(0),
             retire_complete: AtomicU64::new(0),
             adopted: AtomicU64::new(0),
+            parked: AtomicU64::new(0),
+            prepared: AtomicU64::new(0),
+            #[cfg(all(test, feature = "ffmpeg"))]
+            hold_prepare: AtomicBool::new(false),
             runtime_owner: std::sync::OnceLock::new(),
         }
     }
 }
 
 impl<A> AudioCommitSlot<A> {
+    /// Generation of the parked, not yet adopted deck (`NONE` when empty).
+    #[must_use]
+    pub fn pending_generation(&self) -> Generation {
+        Generation(self.parked.load(Ordering::Acquire))
+    }
+    /// Audio thread, phase 1 (PREPARE): a live adopter saw the parked deck for
+    /// `generation`. The previous deck keeps playing; nothing is swapped.
+    pub fn acknowledge_prepared(&self, generation: Generation) {
+        self.prepared.store(generation.0, Ordering::Release);
+    }
+    /// Whether the live audio rail acknowledged PREPARE for exactly `generation`.
+    #[must_use]
+    pub fn is_prepared(&self, generation: Generation) -> bool {
+        self.prepared.load(Ordering::Acquire) == generation.0
+    }
+    /// Ingest side, nonblocking: take back the parked deck of exactly
+    /// `generation` so the caller can hand it to the opener for teardown.
+    ///
+    /// # Errors
+    /// `Err(())` when the slot lock is contended; the caller retries next tick.
+    #[allow(clippy::result_unit_err)]
+    pub fn reclaim(&self, generation: Generation) -> Result<Option<A>, ()> {
+        let mut guard = match self.slot.try_lock() {
+            Ok(guard) => guard,
+            Err(TryLockError::Poisoned(p)) => p.into_inner(),
+            Err(TryLockError::WouldBlock) => return Err(()),
+        };
+        if guard.as_ref().is_some_and(|(g, _)| *g == generation) {
+            self.parked.store(0, Ordering::Release);
+            self.occupied.store(false, Ordering::Release);
+            return Ok(guard.take().map(|(_, deck)| deck));
+        }
+        Ok(None)
+    }
+    #[cfg(all(test, feature = "ffmpeg"))]
+    pub(crate) fn hold_prepare_for_test(&self, hold: bool) {
+        self.hold_prepare.store(hold, Ordering::Release);
+    }
+    /// Test seam: the audio thread withholds PREPARE acknowledgements.
+    #[cfg(all(test, feature = "ffmpeg"))]
+    #[must_use]
+    pub(crate) fn prepare_held(&self) -> bool {
+        self.hold_prepare.load(Ordering::Acquire)
+    }
     /// Publish only after the matching deck replaces the prior generation.
     pub fn acknowledge_adoption(&self, generation: Generation) {
         self.adopted.store(generation.0, Ordering::Release);
@@ -141,6 +196,7 @@ impl<A> AudioCommitSlot<A> {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         self.closed.store(true, Ordering::Release);
         let leftover = guard.take();
+        self.parked.store(0, Ordering::Release);
         self.occupied.store(false, Ordering::Release);
         drop(guard);
         leftover
@@ -163,6 +219,7 @@ impl<A> AudioCommitSlot<A> {
             return Err(deck);
         }
         *guard = Some((generation, deck));
+        self.parked.store(generation.0, Ordering::Release);
         self.occupied.store(true, Ordering::Release);
         Ok(())
     }
@@ -175,6 +232,7 @@ impl<A> AudioCommitSlot<A> {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let taken = guard.take();
+        self.parked.store(0, Ordering::Release);
         self.occupied.store(false, Ordering::Release);
         taken
     }
@@ -432,11 +490,34 @@ impl<T> LoadCoordinator<T> {
         self.retire_completed.load(Ordering::Acquire) >= barrier
     }
     /// Cancel pending/opening loads and reserve an unloaded binding generation.
+    /// Blocks on the gate: management/test use only, never the ingest thread
+    /// (which uses [`Self::try_cancel_pending`]).
     pub fn cancel_pending(&self) -> Generation {
-        let _gate = self
+        let gate = self
             .gate
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.cancel_locked(&gate)
+    }
+    /// Ingest side: as [`Self::cancel_pending`] but `try_lock` only. `None`
+    /// means the gate is held (a management submit is mid-publication); nothing
+    /// changed and the caller must retain its intent and retry next tick.
+    pub fn try_cancel_pending(&self) -> Option<Generation> {
+        let gate = match self.gate.try_lock() {
+            Ok(gate) => gate,
+            Err(TryLockError::Poisoned(error)) => error.into_inner(),
+            Err(TryLockError::WouldBlock) => return None,
+        };
+        Some(self.cancel_locked(&gate))
+    }
+    /// Test seam: hold the commit/request gate like a mid-publication submit.
+    #[cfg(test)]
+    pub(crate) fn hold_gate_for_test(&self) -> std::sync::MutexGuard<'_, ()> {
+        self.gate
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+    fn cancel_locked(&self, _gate: &std::sync::MutexGuard<'_, ()>) -> Generation {
         let generation = Generation(self.next_gen.fetch_add(1, Ordering::Relaxed));
         self.cancel_gen.store(generation.0, Ordering::Release);
         self.claimed.store(0, Ordering::Release);
@@ -585,6 +666,44 @@ mod tests {
         let audio = AudioCommitSlot::<u8>::new();
         assert!(c.stage(r.generation, 7).is_none());
         assert_eq!(c.try_take(&audio).unwrap().clip, 7, "newest stages");
+    }
+
+    #[test]
+    fn try_cancel_pending_never_waits_on_a_held_gate_and_changes_nothing() {
+        let c = LoadCoordinator::<u8>::new();
+        let g = c.submit(spec("/a"));
+        {
+            let _held = c.hold_gate_for_test();
+            assert_eq!(
+                c.try_cancel_pending(),
+                None,
+                "contended: no wait, no effect"
+            );
+            assert_eq!(c.latest(), g, "cancel_gen untouched");
+            assert!(c.take_request().is_some(), "pending request untouched");
+        }
+        let n = c.try_cancel_pending().expect("free gate cancels");
+        assert!(n > g);
+        assert_eq!(c.latest(), n);
+    }
+
+    #[test]
+    fn two_phase_slot_tracks_parked_prepared_reclaim_and_close() {
+        let a = AudioCommitSlot::<&str>::new();
+        assert_eq!(a.pending_generation(), Generation::NONE);
+        a.put(Generation(4), "d").unwrap();
+        assert_eq!(a.pending_generation(), Generation(4));
+        assert!(!a.is_prepared(Generation(4)));
+        a.acknowledge_prepared(Generation(4));
+        assert!(a.is_prepared(Generation(4)));
+        assert!(!a.has_adopted(Generation(4)), "prepared is not adopted");
+        assert_eq!(a.reclaim(Generation(5)), Ok(None), "wrong generation");
+        assert_eq!(a.reclaim(Generation(4)), Ok(Some("d")));
+        assert_eq!(a.pending_generation(), Generation::NONE);
+        assert!(a.ready_for_commit());
+        a.put(Generation(6), "e").unwrap();
+        assert!(a.close().is_some());
+        assert_eq!(a.pending_generation(), Generation::NONE);
     }
 
     #[test]
