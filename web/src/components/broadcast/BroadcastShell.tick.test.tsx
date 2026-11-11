@@ -5,7 +5,7 @@ const meter = vi.hoisted(() => ({ current: undefined as undefined | { peak_db: n
 vi.mock('../../realtime/useAudioMeter', () => ({ useAudioMeter: () => ({ status: 'open', current: meter.current, inputs: [] }), meterFillPercent: () => 50 }));
 vi.mock('../../realtime/useEngineEvents', () => ({ useEngineEvents: () => ({ status: 'open' }), TILES_QUERY_KEY: ['tiles'] }));
 vi.mock('../../preview/PreviewSurface', () => ({ PreviewSurface: () => null }));
-vi.mock('../../preview/useJpegPreview', () => ({ useJpegPreview: () => undefined }));
+vi.mock('../../preview/useJpegPreview', () => ({ useJpegPreview: () => undefined, useJpegStill: () => ({ url: undefined, state: 'loading' }) }));
 import { render, screen } from '@testing-library/react';
 import { http, HttpResponse } from 'msw';
 import { setupServer } from 'msw/node';

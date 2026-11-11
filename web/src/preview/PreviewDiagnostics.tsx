@@ -3,7 +3,7 @@ import { Trans, useLingui } from '@lingui/react/macro';
 import { Button } from '../components/ui/button';
 import type { PreviewDiagnostics as Diagnostics } from './diagnostics';
 
-export function PreviewDiagnostics({ diagnostics }: { readonly diagnostics: Diagnostics }) {
+export function PreviewDiagnostics({ diagnostics, flat = false }: { readonly diagnostics: Diagnostics; readonly flat?: boolean }) {
   const { t } = useLingui();
   const [copy, setCopy] = useState<'idle' | 'ok' | 'failed'>('idle');
   const explanations = {
@@ -25,7 +25,7 @@ export function PreviewDiagnostics({ diagnostics }: { readonly diagnostics: Diag
   return <section className="space-y-2 px-3 py-2 text-xs" aria-label={t`Preview diagnostics`}>
     <p>{explanations[diagnostics.stage]}</p>
     <p><Trans>Unknown values mean the browser did not provide evidence. Network blocking is not established.</Trans></p>
-    <details><summary><Trans>Safe technical details</Trans></summary><pre className="max-h-64 overflow-auto whitespace-pre-wrap">{text}</pre></details>
+    {flat ? <pre aria-label={t`Safe technical details`} className="max-h-64 overflow-auto whitespace-pre-wrap">{text}</pre> : <details><summary><Trans>Safe technical details</Trans></summary><pre className="max-h-64 overflow-auto whitespace-pre-wrap">{text}</pre></details>}
     <Button type="button" size="sm" variant="secondary" onClick={(): void => {
       void (async () => {
         try { await navigator.clipboard.writeText(text); setCopy('ok'); }

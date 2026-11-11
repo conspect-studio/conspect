@@ -817,6 +817,17 @@ jobs:
         # fail on an unpatched 9.0.2, so this step enforces the carried patch.
         timeout-minutes: 10
         run: cargo test --locked -p multiview-ffmpeg --features ffmpeg --lib avio_fetch
+      - name: test multiview-ffmpeg + multiview-output against the pinned FFmpeg
+        # #215: the full ffmpeg-feature suites of the libav-owning crates (caption
+        # decoders, bitstream filters, containers, HLS live sink) on the exact
+        # pinned build. Before this, they ran nowhere in CI and 15 tests had
+        # silently failed for weeks because components were missing from the
+        # --disable-everything allowlist.
+        timeout-minutes: 20
+        run: >
+          cargo test --locked --no-fail-fast
+          -p multiview-ffmpeg -p multiview-output
+          --features multiview-ffmpeg/ffmpeg,multiview-output/ffmpeg
       - name: test multiview-audio --features ffmpeg
         # Committed MOV/pcm_s16le fixtures need only the pinned build's demuxer
         # and decoder: no second system FFmpeg CLI or unavailable WAV demuxer.
