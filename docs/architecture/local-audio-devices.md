@@ -75,11 +75,15 @@ device callback ──push──▶ [SPSC ring, ~200 ms] ──pop──▶ pump
   minutes. The pump therefore re-anchors itself:
   - If its own wake-up gap exceeds 50 ms, or the ring's overflow counter moved, everything in the
     ring is stale: the pump pops and discards it, resets the servo and resampler phase, and
-    re-primes from fresh callback frames. Before its first fresh publish it bumps the store's
-    `discontinuity` counter (an atomic); a consumer that sees a new value moves its cursor to the
-    live edge minus the target before it reads, so retained pre-stall samples are never played
-    once the store is fresh again. Test: a 3 s pump stall with unread retained samples; the first
-    non-silent sample read afterwards is post-stall.
+    re-primes from fresh callback frames. Its first fresh publish carries a **discontinuity
+    boundary**: the absolute frame index of the first post-stall frame, stored in the store with
+    a generation counter (atomics, written before the publish's swap). The consumer, on a new
+    generation, clamps its cursor to `max(cursor, boundary)` and reads silence until at least
+    `target` frames exist after the boundary (the live prebuffer rule, applied from the boundary),
+    then plays from `head − target` (never before the boundary). Retained pre-stall samples are
+    never played, whatever the size of the first fresh publish. Test: a 3 s pump stall with unread
+    retained samples, with first fresh publishes both shorter and longer than the target; the
+    first non-silent sample read afterwards is post-stall.
   - If the program bus pauses, the pump **keeps publishing fresh frames**. The store's 1 s
     drop-oldest window slides, so its head is always current audio. While `unread_frames` is above
     target + Q + 20 ms (Q is the run's tick quantum, for example 40 ms at 25 fps), the servo is
@@ -106,7 +110,11 @@ device callback ──push──▶ [SPSC ring, ~200 ms] ──pop──▶ pump
   - Test: after a pump stall of 50 ms to 5 s, and after a consumer pause of 50 ms to 5 s, the age
     of the first sample read is at most target + Q/2 + 20 ms at 23.976, 25, 29.97, 50 and 60 fps,
     and the steady budget holds again within one tick.
-- **Latency budget:** device buffer (≈10 ms) + pump wake-up (≤5 ms) + servo target (80 ms) ≈
+- **Input callback period:** the pump measures the input callback period P_in from the first
+  callbacks (as the output does). The ring capacity is max(200 ms, 4 × P_in). Inputs with P_in over
+  40 ms are refused with the latched `unsupported_buffer` state (they cannot meet the budget below).
+  The input stream requests a fixed 480-frame (10 ms) buffer where the device allows it.
+- **Latency budget:** device buffer (P_in, ≈10 ms requested, at most 40 ms) + pump wake-up (≤5 ms) + servo target (80 ms) ≈
   95 ms constant from microphone to program bus, with ±10 ms variance. It is compensated with the
   existing per-source audio offset trim where the source is paired with video; a dedicated
   automatic lip-sync is not in scope.
