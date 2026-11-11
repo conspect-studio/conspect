@@ -33,4 +33,11 @@ describe('transport ladder: MoQ, then WebRTC, then stills',()=>{
   fireEvent.click(view.getByText('session-failed'));
   expect(view.queryByText('Live input preview failed.')).toBeNull();
  });
+ it('tells the monitor that MoQ is unavailable, so a still fallback is labelled honestly',()=>{
+  const onTransportUnavailable=vi.fn();
+  const view=renderWithProviders(<PreviewSurface scope="program" whepEndpoint="/api/v1/preview/program/whep" jpegPath="/jpeg" label="preview" capabilities={moqOnly} onTransportUnavailable={onTransportUnavailable}/>);
+  fireEvent.click(view.getByText('moq-unavailable'));
+  expect(onTransportUnavailable).toHaveBeenCalledOnce();
+  expect(view.getByTestId('jpeg-rung')).toBeInTheDocument();
+ });
 });

@@ -133,6 +133,7 @@ export function PreviewSurface({
   onLeaseState,
   onTransport,
   diagnosticsHost,
+  onTransportUnavailable,
 }: {
   readonly scope: PreviewScope;
   /** The WHEP endpoint for this scope (e.g. `/api/v1/preview/program/whep`). */
@@ -148,6 +149,8 @@ export function PreviewSurface({
   readonly rtcConfig?: RTCConfiguration | undefined;
   readonly fetchImpl?: typeof fetch | undefined;
   readonly onSessionReleased?: (() => void) | undefined;
+  /** Reports an unavailable MoQ path so a parent can label the resulting JPEG honestly. */
+  readonly onTransportUnavailable?: (() => void) | undefined;
   readonly onLeaseState?: ((state: 'negotiating' | 'active' | 'released') => void) | undefined;
   /** Reports the rung in use (`moq`, `webrtc` or `jpeg`) and, after a MoQ fallback, why MoQ is not in use. */
   readonly onTransport?: ((transport: PreviewTransport, moqFallbackReason?: string) => void) | undefined;
@@ -212,7 +215,7 @@ export function PreviewSurface({
 
   if (capabilities?.moq && moqReason === undefined) {
     return <MoqPlayer key={`${scope}:${whepEndpoint}`} api={moqApi} label={label} audio={audio} className={className}
-      onUnavailable={(reason) => { setMoqReason(reason); }} onFatal={() => { /* reason arrives via onUnavailable */ }}
+      onUnavailable={(reason) => { setMoqReason(reason); onTransportUnavailable?.(); }} onFatal={() => { /* reason arrives via onUnavailable */ }}
       onLeaseState={(state) => { onLeaseState?.(state); if (state === 'released') onSessionReleased?.(); }} />;
   }
   // No WebRTC for this scope/build: JPEG is the honest primary — NO badge.
