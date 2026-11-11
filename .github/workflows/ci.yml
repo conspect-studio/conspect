@@ -1023,7 +1023,8 @@ jobs:
     needs: changes
     if: ${{ github.event_name != 'pull_request' || needs.changes.outputs.code == 'true' }}
     env:
-      FF_PREFIX: ${{ github.workspace }}/../multiview-ffmpeg
+      # runner.workspace is the checkout's parent; no `..` (actions/cache rejects it).
+      FF_PREFIX: ${{ runner.workspace }}/multiview-ffmpeg
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@1.99.1
