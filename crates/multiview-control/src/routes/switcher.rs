@@ -317,15 +317,19 @@ pub(crate) async fn submit_switcher(
         Reservation::Capacity => return Err(ControlError::IdempotencyCapacity),
         Reservation::Replay(op) => op,
         Reservation::Fresh(op) => {
-            let lease = if req.action == "select_preview" {
+            let program_bus = req.action == "select_program";
+            let lease = if req.action == "select_preview" || program_bus {
                 match (demand.as_ref(), req.source.as_ref()) {
                     (Some(demand), Some(source)) => {
-                        let Some(lease) = demand.switcher_preview_lease(source, "switcher:me1:pvw")
-                        else {
+                        let label = if program_bus {
+                            "switcher:me1:pgm"
+                        } else {
+                            "switcher:me1:pvw"
+                        };
+                        let Some(lease) = demand.switcher_preview_lease(source, label) else {
                             state.idempotency.release(Some(key), &op);
                             return Err(ControlError::Conflict(
-                                "preview source lease unavailable (unknown source or lease limit)"
-                                    .into(),
+                                "source lease unavailable (unknown source or lease limit)".into(),
                             ));
                         };
                         Some((
@@ -348,13 +352,17 @@ pub(crate) async fn submit_switcher(
                 verb,
             };
             let admitted = if let Some((target, lease)) = lease {
-                state
-                    .switcher_preview_lease
-                    .admit(op.to_string(), target, lease, handle, || {
-                        handle.try_send(command).map_err(|_| ())?;
-                        Ok(handle.composed_count())
-                    })
-                    .is_ok()
+                let enqueue = || {
+                    handle.try_send(command).map_err(|_| ())?;
+                    Ok(handle.composed_count())
+                };
+                let owner = &state.switcher_preview_lease;
+                if program_bus {
+                    owner.admit_program(op.to_string(), target, lease, handle, enqueue)
+                } else {
+                    owner.admit(op.to_string(), target, lease, handle, enqueue)
+                }
+                .is_ok()
             } else {
                 handle.try_send(command).is_ok()
             };

@@ -59,6 +59,10 @@ pub const TAKE_PRIME_DEADLINE_TICKS: u64 = 50;
 /// Typed refusal: the incoming source had no fresh frame before the deadline.
 pub const REFUSE_NO_FRESH_FRAME: &str =
     "incoming source was not primed with a fresh frame before the bounded take deadline; Program is unchanged";
+/// Typed refusal: the AUTO's incoming source lost its fresh frame before the
+/// terminal tick (review SW2-02). Program keeps the outgoing source.
+pub const REFUSE_LOST_DURING_AUTO: &str =
+    "incoming source lost its fresh frame during AUTO; the take was aborted and Program kept the outgoing source";
 /// Typed refusal: Preview already carries the Program source (#247).
 pub const REFUSE_SAME_SOURCE: &str =
     "preview and program carry the same source; select a different preview source";
@@ -311,7 +315,16 @@ pub struct SwitcherTickDriver {
     last_tick: u64,
     staged_success: Vec<String>,
     spare_success: Vec<String>,
-    before_staged: Option<SwitcherState>,
+    before_staged: Option<Staged>,
+}
+
+/// Everything a rejected tick must restore (review SW2-03): the machine and
+/// the AUTO bookkeeping that lives beside it.
+#[derive(Debug)]
+struct Staged {
+    machine: SwitcherState,
+    active_auto: Option<String>,
+    active_auto_scenes: Option<Arc<ScenePair>>,
 }
 
 impl SwitcherTickDriver {
@@ -338,6 +351,17 @@ impl SwitcherTickDriver {
                 .get(source)
                 .is_some_and(|store| store.state_at(tick.pts).is_live()),
         )
+    }
+
+    /// Snapshot the state a rejected tick restores, once per tick.
+    fn stage(&mut self) {
+        if self.before_staged.is_none() {
+            self.before_staged = Some(Staged {
+                machine: self.machine.clone(),
+                active_auto: self.active_auto.clone(),
+                active_auto_scenes: self.active_auto_scenes.clone(),
+            });
+        }
     }
 
     /// The source a take verb puts on Program.
@@ -491,13 +515,39 @@ impl SwitcherTickDriver {
     // helpers and hide the single-tick atomicity this test set pins.
     pub fn drain_at_tick(&mut self, tick: Tick) -> SwitcherProjection {
         self.last_tick = tick.index;
+        // An AUTO in flight can complete (swap buses) on this tick: snapshot
+        // first so a rejected frame restores the whole flight (SW2-03).
+        if self.machine.is_in_flight() {
+            self.stage();
+        }
+        // SW2-02: never complete an AUTO onto a source without a fresh frame.
+        if let Some((start, rate)) = self.machine.auto_window() {
+            let terminal = i128::from(tick.index) - start >= i128::from(rate.get());
+            let preview = self.machine.preview().as_str().to_owned();
+            if terminal && self.fresh_at(&preview, tick) == Some(false) {
+                self.machine.abort();
+                if let Some(operation_id) = self.active_auto.take() {
+                    self.active_auto_scenes = None;
+                    // Already terminal: a rejected frame must not refuse it twice.
+                    if let Some(staged) = self.before_staged.as_mut() {
+                        staged.active_auto = None;
+                        staged.active_auto_scenes = None;
+                        staged.machine.abort();
+                    }
+                    self.publish_outcome(
+                        operation_id,
+                        tick.index,
+                        false,
+                        Some(REFUSE_LOST_DURING_AUTO.into()),
+                    );
+                }
+            }
+        }
         let mut projection = self.machine.sample(tick);
         if let Some((command, deadline)) = self.pending_take.take() {
             let incoming = self.incoming(&command.verb).to_owned();
             if self.fresh_at(&incoming, tick) == Some(true) {
-                if self.before_staged.is_none() {
-                    self.before_staged = Some(self.machine.clone());
-                }
+                self.stage();
                 let scenes = self.scenes.latest();
                 match self.apply_take(&command.verb, scenes.as_ref(), tick) {
                     Ok(next) => {
@@ -530,9 +580,7 @@ impl SwitcherTickDriver {
                 break;
             };
             let scenes = self.scenes.latest();
-            if self.before_staged.is_none() {
-                self.before_staged = Some(self.machine.clone());
-            }
+            self.stage();
             let take = matches!(
                 command.verb,
                 SwitcherVerb::SelectProgram(_) | SwitcherVerb::Cut | SwitcherVerb::Auto(_)
@@ -660,11 +708,29 @@ impl SwitcherTickDriver {
 
     /// Never claim on-air success when the bus frame could not be rendered.
     pub fn reject_composed_tick(&mut self, tick: Tick, reason: &str) {
+        // The AUTO admitted or running on this tick, if any: it gets exactly
+        // one terminal refusal, never a later second outcome (SW2-03).
+        let staged_auto = self.active_auto.take();
         if let Some(previous) = self.before_staged.take() {
-            self.machine = previous;
+            self.machine = previous.machine;
+            self.active_auto = previous.active_auto;
+            self.active_auto_scenes = previous.active_auto_scenes;
         }
+        // A rejected frame aborts any AUTO: Program stays on the source the
+        // restored machine names, which the hook re-binds.
+        if self.machine.is_in_flight() {
+            self.machine.abort();
+        }
+        let restored_auto = self.active_auto.take();
+        self.active_auto_scenes = None;
         self.spare_success.clear();
         std::mem::swap(&mut self.staged_success, &mut self.spare_success);
+        for operation_id in [staged_auto, restored_auto].into_iter().flatten() {
+            if !self.spare_success.contains(&operation_id) {
+                self.spare_success.push(operation_id);
+            }
+        }
+        self.spare_success.dedup();
         while let Some(operation_id) = self.spare_success.pop() {
             self.publish_outcome(operation_id, tick.index, false, Some(reason.to_owned()));
         }

@@ -6609,6 +6609,7 @@ fn drive_selected_audio_for_item(
                         bus,
                         item.switcher_audio.as_deref(),
                         &mix.source,
+                        mix.start,
                         item.tick_index,
                         remaining,
                     );

@@ -196,6 +196,8 @@ impl SwitcherPreviewLease {
 struct PendingPreviewLease {
     lease: SwitcherPreviewLease,
     target: String,
+    /// `true` for a direct Program punch (review SW2-01), else a PVW select.
+    program: bool,
     accepted_tick: u64,
     accepted_at: std::time::Instant,
 }
@@ -220,6 +222,10 @@ struct PreviewLeaseState {
     control: Option<multiview_engine::switcher_control::SwitcherControl>,
     generation: u64,
     current: Option<SwitcherPreviewLease>,
+    /// The last applied direct Program punch's lease. Held until the next
+    /// punch replaces it, so the Program layout demand takes over before it
+    /// is released (make-before-break).
+    current_program: Option<SwitcherPreviewLease>,
     pending: std::collections::BTreeMap<String, PendingPreviewLease>,
 }
 
@@ -261,6 +267,34 @@ impl SwitcherPreviewLeases {
         control: &multiview_engine::switcher_control::SwitcherControl,
         enqueue: impl FnOnce() -> Result<u64, ()>,
     ) -> Result<(), SwitcherPreviewLease> {
+        self.admit_bus(id, target, false, lease, control, enqueue)
+    }
+
+    /// [`Self::admit`] for a direct Program punch (review SW2-01): the
+    /// incoming source is wanted while the take waits for its first fresh
+    /// frame, so an on-demand source can start.
+    /// # Errors
+    /// Returns the lease if closed, full, duplicate, or enqueue fails.
+    pub fn admit_program(
+        &self,
+        id: String,
+        target: String,
+        lease: SwitcherPreviewLease,
+        control: &multiview_engine::switcher_control::SwitcherControl,
+        enqueue: impl FnOnce() -> Result<u64, ()>,
+    ) -> Result<(), SwitcherPreviewLease> {
+        self.admit_bus(id, target, true, lease, control, enqueue)
+    }
+
+    fn admit_bus(
+        &self,
+        id: String,
+        target: String,
+        program: bool,
+        lease: SwitcherPreviewLease,
+        control: &multiview_engine::switcher_control::SwitcherControl,
+        enqueue: impl FnOnce() -> Result<u64, ()>,
+    ) -> Result<(), SwitcherPreviewLease> {
         let mut state = self
             .state
             .lock()
@@ -280,6 +314,7 @@ impl SwitcherPreviewLeases {
             PendingPreviewLease {
                 lease,
                 target,
+                program,
                 accepted_tick,
                 accepted_at: std::time::Instant::now(),
             },
@@ -295,13 +330,15 @@ impl SwitcherPreviewLeases {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         if let Some(entry) = state.pending.remove(id) {
-            if applied
-                && state
-                    .control
-                    .as_ref()
-                    .and_then(multiview_engine::switcher_control::SwitcherControl::snapshot)
-                    .is_some_and(|s| s.preview.as_str() == entry.target)
-            {
+            let snapshot = state
+                .control
+                .as_ref()
+                .and_then(multiview_engine::switcher_control::SwitcherControl::snapshot);
+            if entry.program {
+                if applied && snapshot.is_some_and(|s| s.program.as_str() == entry.target) {
+                    state.current_program = Some(entry.lease);
+                }
+            } else if applied && snapshot.is_some_and(|s| s.preview.as_str() == entry.target) {
                 state.current = Some(entry.lease);
             }
         }
@@ -338,7 +375,12 @@ impl SwitcherPreviewLeases {
                 continue;
             };
             if let Some(entry) = state.pending.remove(&id) {
-                if entry.target == preview {
+                if entry.program {
+                    // A punch's own outcome normally resolves it; a lost one
+                    // is dropped here (the Program layout demand covers an
+                    // applied punch).
+                    report.dropped += 1;
+                } else if entry.target == preview {
                     state.current = Some(entry.lease);
                     report.adopted += 1;
                 } else {
@@ -361,6 +403,7 @@ impl SwitcherPreviewLeases {
         let cancelled = state.pending.len();
         state.pending.clear();
         state.current = None;
+        state.current_program = None;
         cancelled
     }
 

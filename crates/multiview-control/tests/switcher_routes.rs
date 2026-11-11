@@ -775,3 +775,70 @@ fn engine_refuses_cut_with_identical_buses() {
         .unwrap()
         .contains("same source"));
 }
+
+/// Review SW2-01: a direct Program punch takes a demand lease on the incoming
+/// source before enqueue (so an on-demand source starts while the take waits
+/// for its first fresh frame), and the lease is held once the punch applies.
+#[tokio::test]
+async fn program_punch_takes_a_lease_before_enqueue_and_keeps_it_when_applied() {
+    let (handle, mut driver) = runtime();
+    let log = Arc::new(LeaseLog::default());
+    let leases = Arc::new(multiview_control::source_demand::SwitcherPreviewLeases::default());
+    let demand: SharedSourceDemand = Arc::new(LeaseDemand {
+        log: Arc::clone(&log),
+    });
+    let publisher = Arc::new(EnginePublisher::<EngineStateSnapshot, Event>::new(64));
+    tokio::spawn(
+        multiview_control::switcher_events::forward_switcher_outcomes(
+            handle.outcomes(),
+            Arc::clone(&publisher),
+            "me1".into(),
+            "main".into(),
+            Arc::clone(&leases),
+        ),
+    );
+    let handle_for_state = handle.clone();
+    let leases_for_state = Arc::clone(&leases);
+    let h = harness_with(move |state| {
+        let mut state = state
+            .with_sources_store(configured_sources(&["a", "b", "c"]))
+            .with_switcher(handle_for_state)
+            .with_source_demand(demand);
+        state.switcher_preview_lease = leases_for_state;
+        state
+    });
+    let response = send(
+        &h.router,
+        post_with_key(
+            "/api/v1/switcher/commands/select_program",
+            OPERATOR_TOKEN,
+            request("select_program", Some("b")),
+            "punch-b",
+        ),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+    assert_eq!(
+        log.acquired(),
+        vec!["b".to_owned()],
+        "leased before enqueue"
+    );
+    assert_eq!(leases.pending_count(), 1);
+    driver.drain_at_tick(Tick {
+        index: 1,
+        pts: MediaTime::ZERO,
+    });
+    driver.commit_composed_tick(Tick {
+        index: 1,
+        pts: MediaTime::ZERO,
+    });
+    until("the applied punch resolves its lease", || {
+        leases.pending_count() == 0
+    })
+    .await;
+    assert!(
+        log.dropped().is_empty(),
+        "the applied punch keeps its source wanted"
+    );
+    assert_eq!(handle.snapshot().unwrap().program.as_str(), "b");
+}

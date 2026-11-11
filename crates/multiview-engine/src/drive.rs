@@ -92,6 +92,9 @@ pub struct MixOverlay {
     pub elapsed: u32,
     /// The AUTO duration in output ticks (`>= 1`).
     pub duration: u32,
+    /// The tick the AUTO started on: identifies one flight, so two
+    /// consecutive AUTOs between the same sources are distinct (SW2-04).
+    pub start: i128,
 }
 
 impl MixOverlay {
@@ -246,8 +249,8 @@ impl<T> CompositorDrive<T> {
     /// # Errors
     /// [`Error::Rebind`] if `source` has no registered store; the overlay is
     /// then cleared, never drawn from a guessed store.
-    pub fn set_mix_overlay(&mut self, overlay: Option<(&str, u32, u32)>) -> Result<()> {
-        let Some((source, elapsed, duration)) = overlay else {
+    pub fn set_mix_overlay(&mut self, overlay: Option<(&str, u32, u32, i128)>) -> Result<()> {
+        let Some((source, elapsed, duration, start)) = overlay else {
             self.mix_overlay = None;
             return Ok(());
         };
@@ -262,12 +265,14 @@ impl<T> CompositorDrive<T> {
             Some(mix) if mix.source == source => {
                 mix.elapsed = elapsed;
                 mix.duration = duration;
+                mix.start = start;
             }
             slot => {
                 *slot = Some(MixOverlay {
                     source: source.to_owned(),
                     elapsed,
                     duration,
+                    start,
                 });
             }
         }
@@ -601,7 +606,10 @@ impl CompositorDrive<Nv12Image> {
         // through), never a slate blended into Program.
         if let Some(mix) = &self.mix_overlay {
             if let Some(store) = self.stores.get(&mix.source) {
-                if let Some(frame) = store.read_at(now).frame() {
+                // Only a fresh incoming frame is blended (SW2-02): a held
+                // stale frame or a slate never fades into Program.
+                let read = store.read_at(now);
+                if let (true, Some(frame)) = (read.state().is_live(), read.frame()) {
                     held.push(Arc::clone(frame));
                     placements.push(Placement {
                         image_index: held.len().saturating_sub(1),

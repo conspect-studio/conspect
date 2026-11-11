@@ -262,8 +262,9 @@ fn map_remove<V: Clone>(cell: &SharedMap<V>, id: &str) {
     }
 }
 
-/// `(outgoing, incoming)` of the AUTO crossfade already started on the bus.
-type CrossfadeKey = (Option<String>, String);
+/// `(outgoing, incoming, flight start tick)` of the AUTO crossfade already
+/// started on the bus. The start tick tells two same-pair flights apart.
+type CrossfadeKey = (Option<String>, String, i128);
 
 impl AudioControlHandle {
     /// Create an empty mailbox; route resolution is installed at run startup.
@@ -771,10 +772,11 @@ impl AudioControlHandle {
         bus: &mut multiview_audio::program::ProgramBus,
         outgoing: Option<&str>,
         incoming: &str,
+        flight: i128,
         tick: u64,
         remaining_ticks: u64,
     ) {
-        let key = (outgoing.map(str::to_owned), incoming.to_owned());
+        let key = (outgoing.map(str::to_owned), incoming.to_owned(), flight);
         {
             let mut active = self
                 .crossfade
@@ -930,7 +932,7 @@ mod route_seam_tests {
             [("a".into(), pa), ("b".into(), pb)].into_iter().collect(),
         );
         handle.select_program_source(&mut bus, Some("a"));
-        handle.crossfade_program_source(&mut bus, Some("a"), "b", 100, 30);
+        handle.crossfade_program_source(&mut bus, Some("a"), "b", 100, 100, 30);
         // 30 ticks at 30000/1001 from tick 100: the exact cumulative budget.
         let clock =
             multiview_audio::cadence::SampleClock::new(48_000, Rational::new(30_000, 1_001));
@@ -951,8 +953,18 @@ mod route_seam_tests {
         // The next items of the same dissolve do not restart the ramp.
         let _ = bus.tick();
         let done = bus.program_gain_ramp(pb).map(|r| r.frames_done);
-        handle.crossfade_program_source(&mut bus, Some("a"), "b", 101, 29);
+        handle.crossfade_program_source(&mut bus, Some("a"), "b", 100, 101, 29);
         assert_eq!(bus.program_gain_ramp(pb).map(|r| r.frames_done), done);
+        // SW2-04: a NEW same-pair flight (completion item dropped by the bake
+        // queue, so no non-mix item reset the key) still starts its ramps.
+        let _ = bus.tick();
+        handle.crossfade_program_source(&mut bus, Some("a"), "b", 140, 140, 10);
+        let fresh = bus.program_gain_ramp(pb).expect("second flight ramps");
+        assert_eq!(fresh.frames_done, 0);
+        assert_eq!(
+            fresh.frames_total,
+            usize::try_from(clock.total_at(150) - clock.total_at(140)).unwrap()
+        );
         // Completion: Program is b; an immediate set leaves only b audible.
         handle.select_program_source(&mut bus, Some("b"));
         assert_eq!(bus.program_gain(pa), Some(0.0));

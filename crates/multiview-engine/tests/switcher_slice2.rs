@@ -356,3 +356,167 @@ async fn auto_to_a_source_that_never_produces_loses_zero_ticks_and_never_blends_
     assert!(!auto.completed);
     assert_eq!(auto.tick, 3 + TAKE_PRIME_DEADLINE_TICKS);
 }
+
+/// Review SW2-02: the incoming source dies during the AUTO. Program never
+/// blends or swaps to a stale/slate picture; the AUTO is aborted with a typed
+/// reason and Program keeps the outgoing source. No tick is lost.
+#[tokio::test]
+async fn incoming_source_lost_mid_auto_aborts_and_program_keeps_the_outgoing_source() {
+    let a = Arc::new(TileStore::<Nv12Image>::with_defaults("a"));
+    let b = Arc::new(TileStore::<Nv12Image>::with_defaults("b"));
+    let ticks = 80;
+    feed(&a, A_Y, ticks);
+    // b is live only until tick 8; the AUTO runs ticks 5..=35 (N=30), and the
+    // default hold is 500 ms (12.5 ticks), so b is not fresh at completion.
+    feed(&b, B_Y, 8);
+    let stores = HashMap::from([("a".into(), a), ("b".into(), b)]);
+    let run = run(
+        stores,
+        "a",
+        "b",
+        ticks,
+        vec![(5, SwitcherVerb::Auto(FrameCount::try_from(30).unwrap()))],
+    )
+    .await;
+    assert_every_tick(&run.frames, ticks);
+    for (index, y) in &run.frames {
+        if *index >= 35 {
+            assert_eq!(*y, A_Y, "tick {index}: Program keeps the outgoing source");
+        }
+        // While b was fresh the dissolve ran; once b went stale it is not blended.
+        if *index >= 22 {
+            assert_eq!(
+                *y, A_Y,
+                "tick {index}: a stale incoming frame never fades in"
+            );
+        }
+    }
+    assert_eq!(run.outcomes.len(), 1, "exactly one terminal outcome");
+    let auto = &run.outcomes[0];
+    assert!(!auto.completed);
+    assert_eq!(auto.tick, 35);
+    assert!(auto
+        .error
+        .as_deref()
+        .unwrap()
+        .contains("lost its fresh frame"));
+    let snapshot = run.handle.snapshot().unwrap();
+    assert_eq!(snapshot.program.as_str(), "a");
+    assert_eq!(snapshot.preview.as_str(), "b");
+    assert!(!snapshot.in_flight);
+}
+
+/// Review SW2-03: a frame rejected on the AUTO's completion tick restores the
+/// buses and the flight bookkeeping, and the AUTO gets exactly one refusal.
+#[test]
+fn rejected_completion_tick_rolls_back_the_auto_and_refuses_it_once() {
+    use multiview_engine::clock::Tick;
+    let a = Arc::new(TileStore::<Nv12Image>::with_defaults("a"));
+    let b = Arc::new(TileStore::<Nv12Image>::with_defaults("b"));
+    feed(&a, A_Y, 20);
+    feed(&b, B_Y, 20);
+    let (handle, mut driver) = SwitcherControl::new(SwitcherState::new(
+        SourceRef::new("a"),
+        SourceRef::new("b"),
+        vec![],
+    ));
+    driver.set_prime_stores(HashMap::from([("a".into(), a), ("b".into(), b)]));
+    handle
+        .set_scenes(ScenePair {
+            version: 1,
+            program: layout("a"),
+            preview: layout("b"),
+        })
+        .unwrap();
+    let mut events = handle.outcomes();
+    let tick = |index: u64| Tick {
+        index,
+        pts: MediaTime::from_nanos(i64::try_from(index).unwrap() * TICK_NS),
+    };
+    handle
+        .try_send(SwitcherCommand {
+            operation_id: "auto".into(),
+            scene_version: 1,
+            verb: SwitcherVerb::Auto(FrameCount::try_from(3).unwrap()),
+        })
+        .unwrap();
+    for index in 0..3 {
+        driver.drain_at_tick(tick(index));
+        driver.commit_composed_tick(tick(index));
+    }
+    assert!(handle.snapshot().unwrap().in_flight);
+    // Completion tick: the machine swaps, then the frame is rejected.
+    driver.drain_at_tick(tick(3));
+    driver.reject_composed_tick(tick(3), "forced render failure");
+    let (program, preview) = driver.selections();
+    assert_eq!(
+        (program.as_str(), preview.as_str()),
+        ("a", "b"),
+        "buses restored"
+    );
+    assert!(
+        driver.auto_window().is_none(),
+        "the flight is aborted, not resumed"
+    );
+    let outcome = events.try_recv().unwrap();
+    assert_eq!(outcome.event.operation_id, "auto");
+    assert!(!outcome.event.completed);
+    for index in 4..10 {
+        driver.drain_at_tick(tick(index));
+        driver.commit_composed_tick(tick(index));
+    }
+    assert!(
+        events.try_recv().is_err(),
+        "no second outcome for the same AUTO"
+    );
+    let snapshot = handle.snapshot().unwrap();
+    assert_eq!(snapshot.program.as_str(), "a");
+    assert!(!snapshot.in_flight);
+}
+
+/// Review SW2-03: a frame rejected on the AUTO's START tick refuses it once and
+/// leaves no active flight behind.
+#[test]
+fn rejected_start_tick_refuses_the_auto_once_and_leaves_no_flight() {
+    use multiview_engine::clock::Tick;
+    let a = Arc::new(TileStore::<Nv12Image>::with_defaults("a"));
+    let b = Arc::new(TileStore::<Nv12Image>::with_defaults("b"));
+    feed(&a, A_Y, 20);
+    feed(&b, B_Y, 20);
+    let (handle, mut driver) = SwitcherControl::new(SwitcherState::new(
+        SourceRef::new("a"),
+        SourceRef::new("b"),
+        vec![],
+    ));
+    driver.set_prime_stores(HashMap::from([("a".into(), a), ("b".into(), b)]));
+    handle
+        .set_scenes(ScenePair {
+            version: 1,
+            program: layout("a"),
+            preview: layout("b"),
+        })
+        .unwrap();
+    let mut events = handle.outcomes();
+    let tick = |index: u64| Tick {
+        index,
+        pts: MediaTime::from_nanos(i64::try_from(index).unwrap() * TICK_NS),
+    };
+    handle
+        .try_send(SwitcherCommand {
+            operation_id: "auto".into(),
+            scene_version: 1,
+            verb: SwitcherVerb::Auto(FrameCount::try_from(5).unwrap()),
+        })
+        .unwrap();
+    driver.drain_at_tick(tick(0));
+    driver.reject_composed_tick(tick(0), "forced render failure");
+    assert!(driver.auto_window().is_none());
+    let outcome = events.try_recv().unwrap();
+    assert!(!outcome.event.completed);
+    for index in 1..10 {
+        driver.drain_at_tick(tick(index));
+        driver.commit_composed_tick(tick(index));
+    }
+    assert!(events.try_recv().is_err(), "exactly one outcome");
+    assert_eq!(handle.snapshot().unwrap().program.as_str(), "a");
+}

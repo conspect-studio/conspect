@@ -72,11 +72,15 @@ impl<C: FnMut(&mut CompositorDrive<Nv12Image>)> FrameControl for SwitcherFrameHo
         // At the terminal tick the machine has swapped and the window is gone.
         let mix = self.driver.auto_window().map(|(start, rate)| {
             let elapsed = (i128::from(tick.index) - start).clamp(0, i128::from(rate.get()));
-            (u32::try_from(elapsed).unwrap_or(rate.get()), rate.get())
+            (
+                u32::try_from(elapsed).unwrap_or(rate.get()),
+                rate.get(),
+                start,
+            )
         });
         let result = match mix {
-            Some((elapsed, duration)) => {
-                drive.set_mix_overlay(Some((preview.as_str(), elapsed, duration)))
+            Some((elapsed, duration, start)) => {
+                drive.set_mix_overlay(Some((preview.as_str(), elapsed, duration, start)))
             }
             None if drive.mix_overlay().is_some() => drive.set_mix_overlay(None),
             None => Ok(()),
@@ -92,6 +96,14 @@ impl<C: FnMut(&mut CompositorDrive<Nv12Image>)> FrameControl for SwitcherFrameHo
             self.failed_tick = Some(tick.index);
             self.driver.reject_composed_tick(tick, &error);
             let _ = drive.set_mix_overlay(None);
+            // Keep the drive coherent with the restored machine (SW2-03): if
+            // this tick re-pointed the cell before failing, point it back.
+            let (restored, _) = self.driver.selections();
+            if self.last_program.as_ref() != Some(restored)
+                && drive.rebind_cell(&self.cell_id, restored.as_str()).is_ok()
+            {
+                self.last_program = Some(restored.clone());
+            }
         }
     }
 
