@@ -475,6 +475,15 @@ if [ "${FF_HWACCEL}" = "apple" ]; then
 fi
 make -j"$(cpu_count)"
 make install
+if [ "${FF_HWACCEL}" = "windows" ]; then
+  # MSYS writes POSIX paths (/s/...) into the .pc files; native consumers
+  # (pkg-config-rs under MSVC, cargo build scripts) need S:/... form.
+  # MSVC builds install the import libraries (avcodec.lib, ...) next to the
+  # DLLs in bin/; Rust's ffmpeg-sys (FFMPEG_DIR) and pkg-config look in lib/.
+  cp "${FF_PREFIX}"/bin/*.lib "${FF_PREFIX}/lib/"
+  win_prefix="$(cygpath -m "${FF_PREFIX}")"
+  sed -i "s#$(printf '%s' "${FF_PREFIX}" | sed 's/[#&]/\\&/g')#${win_prefix}#g" "${FF_PREFIX}"/lib/pkgconfig/*.pc
+fi
 
 # Licence texts travel WITH the libraries: every artifact that conveys these
 # libav* binaries (app images, release tarballs) copies ${FF_PREFIX}/share/licenses.

@@ -16,13 +16,15 @@ publish = false
 # WITHOUT libsrt present (the multiview-rist-sys pattern, ADR-0028).
 libloading = { workspace = true }
 thiserror = { workspace = true }
-# `sockaddr_in6` / `sockaddr_storage` layouts for srt_bind / srt_accept.
-libc = "0.2.186"
 
 # FFI crate exception (see multiview-rist-sys): the workspace forbids
 # `unsafe_code`, which a downstream manifest cannot relax, so this crate restates
 # the workspace lint set with `unsafe_code = "deny"` (every block justified by a
 # `// SAFETY:` note). Keep in sync with the root Cargo.toml lints.
+# Only for the unix layout-equality test (sockaddr layouts are local, see sa.rs).
+[target.'cfg(unix)'.dev-dependencies]
+libc = "0.2.186"
+
 [lints.rust]
 unsafe_code = "deny"
 unreachable_pub = "warn"

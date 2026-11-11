@@ -91,7 +91,9 @@ pub mod strategy;
 #[cfg(feature = "display-kms")]
 pub mod kms;
 
-pub use canvas::{nv12_to_xrgb, CanvasError, DisplayCanvas, DmabufImage, DmabufPlane};
+pub use canvas::{nv12_to_xrgb, CanvasError, DisplayCanvas};
+#[cfg(unix)]
+pub use canvas::{DmabufImage, DmabufPlane};
 pub use device::{
     ConnectorDesc, ConnectorSelector, DisplayError, FlipEvent, HeadSetup, KmsBackend, SubmitError,
 };

@@ -39,6 +39,8 @@ use std::time::Instant;
 
 use libloading::Library;
 
+mod sa;
+
 /// libsrt socket handle (`SRTSOCKET`, an `int32_t`).
 type SrtSock = i32;
 
@@ -118,9 +120,9 @@ struct EpollEvent {
 
 type FnVoid = unsafe extern "C" fn() -> c_int;
 type FnCreate = unsafe extern "C" fn() -> SrtSock;
-type FnBind = unsafe extern "C" fn(SrtSock, *const libc::sockaddr, c_int) -> c_int;
+type FnBind = unsafe extern "C" fn(SrtSock, *const sa::Sockaddr, c_int) -> c_int;
 type FnListen = unsafe extern "C" fn(SrtSock, c_int) -> c_int;
-type FnAccept = unsafe extern "C" fn(SrtSock, *mut libc::sockaddr, *mut c_int) -> SrtSock;
+type FnAccept = unsafe extern "C" fn(SrtSock, *mut sa::Sockaddr, *mut c_int) -> SrtSock;
 type FnClose = unsafe extern "C" fn(SrtSock) -> c_int;
 type FnSetFlag = unsafe extern "C" fn(SrtSock, c_int, *const c_void, c_int) -> c_int;
 type FnSend = unsafe extern "C" fn(SrtSock, *const c_char, c_int, c_int, c_int) -> c_int;
@@ -486,14 +488,14 @@ unsafe impl Sync for SrtListener {}
 
 /// Encode `addr` as a `sockaddr_in6` (IPv4 addresses become v4-mapped), the
 /// only family an `IPV6ONLY = 0` socket accepts for a dual-stack bind.
-fn sockaddr_v6(addr: SocketAddr) -> libc::sockaddr_in6 {
+fn sockaddr_v6(addr: SocketAddr) -> sa::SockaddrIn6 {
     let (ip, port, scope) = match addr {
         SocketAddr::V6(v6) => (*v6.ip(), v6.port(), v6.scope_id()),
         SocketAddr::V4(v4) => (v4.ip().to_ipv6_mapped(), v4.port(), 0),
     };
     // SAFETY: `sockaddr_in6` is plain-old-data; all-zero is a valid value.
-    let mut sa: libc::sockaddr_in6 = unsafe { std::mem::zeroed() };
-    sa.sin6_family = libc::sa_family_t::try_from(libc::AF_INET6).unwrap_or(10);
+    let mut sa: sa::SockaddrIn6 = unsafe { std::mem::zeroed() };
+    sa.sin6_family = sa::AF_INET6_FAMILY;
     sa.sin6_port = port.to_be();
     sa.sin6_addr.s6_addr = ip.octets();
     sa.sin6_scope_id = scope;
@@ -501,13 +503,12 @@ fn sockaddr_v6(addr: SocketAddr) -> libc::sockaddr_in6 {
 }
 
 /// Decode a peer address libsrt wrote into a `sockaddr_storage`.
-fn decode_sockaddr(storage: &libc::sockaddr_storage) -> Option<SocketAddr> {
+fn decode_sockaddr(storage: &sa::SockaddrStorage) -> Option<SocketAddr> {
     match c_int::from(storage.ss_family) {
-        libc::AF_INET6 => {
+        sa::AF_INET6 => {
             // SAFETY: the family says the storage holds a `sockaddr_in6`, which
             // fits in `sockaddr_storage` (its whole purpose) and is POD.
-            let sa: libc::sockaddr_in6 =
-                unsafe { std::ptr::read(std::ptr::from_ref(storage).cast()) };
+            let sa: sa::SockaddrIn6 = unsafe { std::ptr::read(std::ptr::from_ref(storage).cast()) };
             let ip = Ipv6Addr::from(sa.sin6_addr.s6_addr);
             let port = u16::from_be(sa.sin6_port);
             Some(match ip.to_ipv4_mapped() {
@@ -515,10 +516,9 @@ fn decode_sockaddr(storage: &libc::sockaddr_storage) -> Option<SocketAddr> {
                 None => SocketAddr::V6(SocketAddrV6::new(ip, port, 0, sa.sin6_scope_id)),
             })
         }
-        libc::AF_INET => {
+        sa::AF_INET => {
             // SAFETY: as above for `sockaddr_in`.
-            let sa: libc::sockaddr_in =
-                unsafe { std::ptr::read(std::ptr::from_ref(storage).cast()) };
+            let sa: sa::SockaddrIn = unsafe { std::ptr::read(std::ptr::from_ref(storage).cast()) };
             Some(SocketAddr::new(
                 IpAddr::from(u32::from_be(sa.sin_addr.s_addr).to_be_bytes()),
                 u16::from_be(sa.sin_port),
@@ -590,7 +590,7 @@ impl SrtListener {
             }
         }
         let sa = sockaddr_v6(addr);
-        let sa_len = c_int::try_from(std::mem::size_of::<libc::sockaddr_in6>()).unwrap_or(28);
+        let sa_len = c_int::try_from(std::mem::size_of::<sa::SockaddrIn6>()).unwrap_or(28);
         // SAFETY: `sa` is a fully-initialised `sockaddr_in6` of `sa_len` bytes.
         if unsafe { (lib.bind)(sock, std::ptr::from_ref(&sa).cast(), sa_len) } == SRT_ERROR {
             return Err(lib.call_error("srt_bind"));
@@ -651,9 +651,9 @@ impl SrtListener {
                 continue;
             }
             // SAFETY: `sockaddr_storage` is POD; all-zero is valid.
-            let mut storage: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
+            let mut storage: sa::SockaddrStorage = unsafe { std::mem::zeroed() };
             let mut len =
-                c_int::try_from(std::mem::size_of::<libc::sockaddr_storage>()).unwrap_or(128);
+                c_int::try_from(std::mem::size_of::<sa::SockaddrStorage>()).unwrap_or(128);
             // SAFETY: `storage` has `len` bytes for libsrt to write the peer.
             let sock = unsafe {
                 (self.lib.accept)(
@@ -837,7 +837,7 @@ mod tests {
     #[test]
     fn v4_binds_as_mapped_v6() {
         let sa = sockaddr_v6("127.0.0.1:9000".parse().unwrap());
-        assert_eq!(c_int::from(sa.sin6_family), libc::AF_INET6);
+        assert_eq!(c_int::from(sa.sin6_family), sa::AF_INET6);
         assert_eq!(u16::from_be(sa.sin6_port), 9000);
         assert_eq!(
             Ipv6Addr::from(sa.sin6_addr.s6_addr).to_ipv4_mapped(),
@@ -871,12 +871,12 @@ mod tests {
     fn mapped_peer_decodes_as_v4() {
         let sa = sockaddr_v6("127.0.0.1:4000".parse().unwrap());
         // SAFETY (test): copy the sockaddr_in6 into a zeroed storage.
-        let mut storage: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
+        let mut storage: sa::SockaddrStorage = unsafe { std::mem::zeroed() };
         unsafe {
             std::ptr::copy_nonoverlapping(
                 std::ptr::from_ref(&sa).cast::<u8>(),
                 std::ptr::from_mut(&mut storage).cast::<u8>(),
-                std::mem::size_of::<libc::sockaddr_in6>(),
+                std::mem::size_of::<sa::SockaddrIn6>(),
             );
         }
         assert_eq!(
