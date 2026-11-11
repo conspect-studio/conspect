@@ -39,7 +39,7 @@ impl PreviewAdmissionBudget {
         Self::default()
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, any(feature = "moq-output", feature = "gpl-codecs")))]
     pub(crate) fn acquire(&self) -> Option<Arc<RuntimePermit>> {
         RuntimePermit::acquire(self.0.clone())
     }
