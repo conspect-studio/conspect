@@ -1,6 +1,6 @@
 # Architecture Decision Records
 
-These ADRs capture the load-bearing decisions for the Multiview engine. 169 ADRs total. Most are **Proposed** — derived from the design briefs in [../research](../research/). The [Implementation Build-out](#implementation-build-out) series (`ADR-I*`) records decisions **Accepted** during the foundation build-out (the as-built state, which may deliberately and temporarily diverge from a Proposed ADR or from [conventions](../architecture/conventions.md) with a tracked follow-up).
+These ADRs capture the load-bearing decisions for the Multiview engine. 170 ADRs total. Most are **Proposed** — derived from the design briefs in [../research](../research/). The [Implementation Build-out](#implementation-build-out) series (`ADR-I*`) records decisions **Accepted** during the foundation build-out (the as-built state, which may deliberately and temporarily diverge from a Proposed ADR or from [conventions](../architecture/conventions.md) with a tracked follow-up).
 
 ## Core Engine
 
@@ -27,6 +27,7 @@ These ADRs capture the load-bearing decisions for the Multiview engine. 169 ADRs
 - [ADR-0048](ADR-0048.md) — WebRTC transport endpoint: new leaf crate `multiview-webrtc` (feature `native`, str0m =0.16.2 pinned) owning ALL native WebRTC transport (relocated from `multiview-preview`'s `webrtc-native`) — ONE dual-stack `[::]` UDP socket (default 8189) muxing every session (WHIP ingest · WHEP preview · WHEP output viewers · WHIP push) by ICE-ufrag/learned-addr, full-ICE (never ice-lite) with IPv6-first host candidates + `webrtc.advertised_addresses`, per-run self-signed DTLS cert, one bounded driver task the engine never awaits (inv #10), session GC + `max_sessions` *(Proposed)*
 - [ADR-0049](ADR-0049.md) — WebRTC program outputs: `Output::Webrtc` (WHEP serve of the REAL H.264 program rendition to ≤`max_viewers` — fanout `PacketSink` route()+1, encode-once inv #7, B-frames-off validated at config time, SPS/PPS prepend at IDR, rate-limited force-IDR seam) + `Output::WhipPush` (RFC 9725 client publish: Bearer, 307-redirect-follow, supervised reconnect like RTMP/SRT push) + ONE program Opus rendition embedded for all WebRTC consumers; engine-protected real outputs, never shed by the preview ladder, bounded per-viewer drop-oldest rings *(Proposed)*
 - [ADR-0105](ADR-0105.md) — macOS GPU compositing on wgpu's Metal backend (NV12 as R8+RG8 planes); native IOSurface path deferred until a measured copy-bound workload; amends ADR-0004's rationale *(Accepted)*
+- [ADR-0107](ADR-0107-single-front-door-443.md) — Single network front door: the engine owns TCP 443 and UDP 443; one UDP socket demultiplexed by first byte (RFC 9443, QUIC-bit greasing off) carries HTTP/3 for the site + MoQ (one QUIC endpoint, h3 + h3-webtransport) and WebRTC; one TCP listener demultiplexes TLS (h1, later h2) from ICE-TCP; built-in TURN-over-TLS (SNI-routed, lease-bound, in-process relay only) for TLS-only proxies; nginx optional (`behind_proxy` mode); `[network]` replaces `webrtc.udp_port` and `MULTIVIEW_MOQ_BIND/_ENDPOINT` *(Accepted)*
 
 ## Account / Conspect (account-side subsystem)
 
