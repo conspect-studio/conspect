@@ -1365,6 +1365,9 @@ fn finish_segments(
 ) -> Result<SegmentResult> {
     if let Err(err) = driven {
         state.finalize_open_segment_best_effort();
+        // Land the last committed manifest(s) before the publishers are dropped
+        // (#253): a failed run keeps its previous playlist valid on disk.
+        state.flush_published_best_effort(std::time::Duration::from_secs(2));
         return Err(err);
     }
     let frame_ns = rescale(1, time_base, Rational::new(1, NANOS_PER_SEC));
@@ -2844,6 +2847,23 @@ impl<'a> SegmentState<'a> {
     /// written, matching [`finalize_audio_segments_best_effort`]). Any finish
     /// failure is intentionally swallowed — the original drive error is the one
     /// that propagates. Idempotent (no-ops once `current` is taken).
+    /// Error path: give every background playlist publisher (main and
+    /// renditions) up to `bound` to land the manifest it already holds.
+    fn flush_published_best_effort(&mut self, bound: std::time::Duration) {
+        if let Some(live) = self.live.as_mut() {
+            live.flush_best_effort(bound);
+        }
+        if let Some(renditions) = self.renditions.as_mut() {
+            for state in renditions
+                .states
+                .iter_mut()
+                .chain(std::iter::once(&mut renditions.video))
+            {
+                state.live.flush_best_effort(bound);
+            }
+        }
+    }
+
     fn finalize_open_segment_best_effort(&mut self) {
         let Some(mut segment) = self.current.take() else {
             return;
