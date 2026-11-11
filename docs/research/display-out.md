@@ -506,7 +506,7 @@ The published table (normative in [ADR-M010](../decisions/ADR-M010.md); device t
   master, full stop. Incumbent desktop stacks are disabled, not coexisted with.
 - **No canvas spanning across CRTCs** — one canvas per head; walls are per-head sinks over
   `WallConfig`.
-- **No Windows** (repo non-goal).
+- **Windows** was a repo non-goal when this was written; ADR-0011 (amended) now admits native Windows.
 
 ## Decision records
 
