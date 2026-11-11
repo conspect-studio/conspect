@@ -441,7 +441,11 @@ impl Run {
                             "monitor wall encoder opened once for this run"
                         );
                         session = Some(opened);
-                        self.picture.store(Some(Arc::new(picture)));
+                        self.picture
+                            .store(Some(Arc::new(crate::preview::WallPicture {
+                                generation: self.generation,
+                                image: Arc::new(picture),
+                            })));
                         self.publish_geometry();
                     }
                     Err(reason) => {
@@ -464,7 +468,11 @@ impl Run {
             }
             // Publish after a successful encode; a stalled WHEP peer only samples
             // this wait-free latest value and cannot delay this worker.
-            self.picture.store(Some(Arc::new(picture)));
+            self.picture
+                .store(Some(Arc::new(crate::preview::WallPicture {
+                    generation: self.generation,
+                    image: Arc::new(picture),
+                })));
             self.publish_geometry();
         }
     }
@@ -1043,8 +1051,12 @@ segment_ms = 1000
         }
         let published = geometry.load().unwrap();
         let composed = picture.load().expect("wall WHEP samples composed NV12");
-        assert_eq!((composed.width(), composed.height()), (128, 36));
-        assert_eq!(composed.y_plane()[0], 120, "wall cell, not Program pixels");
+        assert_eq!((composed.image.width(), composed.image.height()), (128, 36));
+        assert_eq!(
+            composed.image.y_plane()[0],
+            120,
+            "wall cell, not Program pixels"
+        );
         // Production runner 0 is not yet effective here (as with an H.264 output
         // still awaiting its first keyframe); the wall must not take its index.
         let wall_index = factory

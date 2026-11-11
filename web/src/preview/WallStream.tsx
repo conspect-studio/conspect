@@ -10,7 +10,7 @@ export function WallStreamProvider({ children, deps }: { readonly children: Reac
   const [store] = useState(() => new WallStore(deps));
   useEffect(() => {
     store.start();
-    return () => { store.stop(); };
+    return () => { store.stop(); store.dispose(); };
   }, [store]);
   return <WallContext.Provider value={store}>{children}</WallContext.Provider>;
 }

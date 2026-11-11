@@ -100,14 +100,18 @@ export class WallStore {
     const width = frame instanceof HTMLVideoElement ? frame.videoWidth : frame.displayWidth;
     const height = frame instanceof HTMLVideoElement ? frame.videoHeight : frame.displayHeight;
     if (!width || !height) return false;
-    if (picture.width !== width || picture.height !== height) {
-      picture.width = width;
-      picture.height = height;
+    // WHEP may downscale the wall to its preview encode cap. Restore the
+    // authored geometry before subscribers crop in authored cell coordinates.
+    const outputWidth = frame instanceof HTMLVideoElement ? this.geometry?.width ?? width : width;
+    const outputHeight = frame instanceof HTMLVideoElement ? this.geometry?.height ?? height : height;
+    if (picture.width !== outputWidth || picture.height !== outputHeight) {
+      picture.width = outputWidth;
+      picture.height = outputHeight;
       this.pictureContext = undefined;
     }
     const context = this.pictureContext ?? (this.pictureContext = picture.getContext('2d') ?? undefined);
     if (!context) return false;
-    context.drawImage(frame, 0, 0);
+    context.drawImage(frame, 0, 0, outputWidth, outputHeight);
     this.hasPicture = true;
     return true;
   }
@@ -119,11 +123,13 @@ export class WallStore {
     window.__wallStats = this.stats;
     this.watch = setInterval(() => { this.publish(); }, 500);
     window.addEventListener('pagehide', this.onPageHide);
+    window.addEventListener('pageshow', this.onPageShow);
     void this.pollLoop(root.signal);
     void this.playLoop(root.signal);
   }
 
   private readonly onPageHide = (): void => { this.stop(); };
+  private readonly onPageShow = (event: PageTransitionEvent): void => { if (event.persisted) this.start(); };
 
   stop(): void {
     window.removeEventListener('pagehide', this.onPageHide);
@@ -137,6 +143,12 @@ export class WallStore {
     this.lastFrameAt = undefined;
     this.transport = 'stills';
     this.publish();
+  }
+
+  /** Remove bfcache lifecycle listeners when the desk itself unmounts. */
+  dispose(): void {
+    this.stop();
+    window.removeEventListener('pageshow', this.onPageShow);
   }
 
   /** Re-derive the snapshot: live only with geometry and a frame no older than WALL_STALE_MS. */

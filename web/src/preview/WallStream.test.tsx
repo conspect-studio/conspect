@@ -49,12 +49,12 @@ function deps(over: Partial<WallDeps> & { frames?: boolean } = {}) {
 
 beforeEach(() => { vi.useFakeTimers(); HTMLCanvasElement.prototype.getContext = vi.fn(() => ({ drawImage: vi.fn() })) as never; });
 
-/** Records every 2D drawImage call: whole-frame conversions (3 args) and cell crops (9 args). */
+/** Records every 2D drawImage call: whole-frame paints (5 args) and cell crops (9 args). */
 function recordDraws() {
   const calls: unknown[][] = [];
   HTMLCanvasElement.prototype.getContext = vi.fn(() => ({ drawImage: (...args: unknown[]) => { calls.push(args); } })) as never;
   return {
-    conversions: () => calls.filter((call) => call.length === 3),
+    conversions: () => calls.filter((call) => call.length === 5),
     crops: () => calls.filter((call) => call.length === 9),
   };
 }
@@ -156,6 +156,7 @@ describe('WallStreamProvider', () => {
     // One whole-frame conversion; each surface then copies its cell from that canvas.
     expect(draws.conversions()).toHaveLength(1);
     expect(draws.conversions()[0]?.[0]).toBe(frame);
+    expect(draws.conversions()[0]?.slice(1)).toEqual([0, 0, 640, 360]);
     expect(draws.crops()).toHaveLength(3);
     for (const crop of draws.crops()) expect(crop[0]).toBeInstanceOf(HTMLCanvasElement);
     await act(async () => { feed?.(); await Promise.resolve(); });
@@ -223,6 +224,47 @@ describe('WallStreamProvider', () => {
     await act(async () => { frames[1]?.(); await Promise.resolve(); });
     expect(screen.getByTestId('crop-a')).toBeTruthy();
     expect(draws.crops().at(-1)?.slice(1, 5)).toEqual([320, 0, 320, 180]);
+  });
+
+  it('resizes a downscaled WebRTC frame to authored wall geometry before cropping', async () => {
+    const large: WallGeometry = { ...geometry, width: 1920, height: 1080,
+      cells: [{ source: 'a', x: 960, y: 0, w: 480, h: 270 }] };
+    const d = deps({ fetchWall: vi.fn(() => Promise.resolve(large)) });
+    const draws = recordDraws();
+    d.value = { ...d.value,
+      play: vi.fn(() => Promise.reject(new Error('MoQ unavailable'))),
+      playWhep: async (options) => {
+        const video = document.createElement('video');
+        Object.defineProperties(video, { videoWidth: { value: 1280 }, videoHeight: { value: 720 } });
+        options.onFrame(video);
+        await new Promise<void>((resolve) => { options.signal.addEventListener('abort', () => { resolve(); }, { once: true }); });
+      },
+    };
+    render(<WallStreamProvider deps={d.value}><Probe id="a" /></WallStreamProvider>);
+    await act(async () => { await vi.advanceTimersByTimeAsync(100); });
+    expect(screen.getByTestId('crop-a')).toBeTruthy();
+    expect(draws.conversions()[0]?.slice(1)).toEqual([0, 0, 1920, 1080]);
+    expect(draws.crops().at(-1)?.slice(1, 5)).toEqual([960, 0, 480, 270]);
+  });
+
+  it('releases and restores the wall across pagehide and bfcache pageshow', async () => {
+    const d = deps();
+    let released = 0;
+    const whep = vi.fn(async (options: Parameters<NonNullable<WallDeps['playWhep']>>[0]) => {
+      await new Promise<void>((resolve) => { options.signal.addEventListener('abort', () => { released += 1; resolve(); }, { once: true }); });
+    });
+    d.value = { ...d.value,
+      playWhep: whep,
+      play: vi.fn(() => Promise.reject(new Error('MoQ unavailable'))),
+    };
+    const app = render(<WallStreamProvider deps={d.value}><Probe id="a" /></WallStreamProvider>);
+    await act(async () => { await vi.advanceTimersByTimeAsync(100); });
+    await act(async () => { window.dispatchEvent(new Event('pagehide')); await Promise.resolve(); });
+    expect(released).toBe(1);
+    expect(screen.getByTestId('still-a')).toBeTruthy();
+    await act(async () => { window.dispatchEvent(new PageTransitionEvent('pageshow', { persisted: true })); await vi.advanceTimersByTimeAsync(100); });
+    expect(whep).toHaveBeenCalledTimes(2);
+    app.unmount();
   });
 
   it('states why the wall is on stills when the live session fails', async () => {

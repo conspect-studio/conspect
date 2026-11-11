@@ -380,6 +380,11 @@ enum SlotReader {
         id: String,
         clock: MonotonicTimeSource,
     },
+    /// Generation-fenced whole-system wall. A changed layout ends this focus.
+    Wall {
+        slot: crate::preview::WallPictureSlot,
+        generation: u64,
+    },
 }
 
 impl SlotReader {
@@ -387,6 +392,10 @@ impl SlotReader {
     fn load(&self) -> Option<Arc<Nv12Image>> {
         match self {
             Self::Program(slot) => slot.load(),
+            Self::Wall { slot, generation } => slot
+                .load()
+                .filter(|picture| picture.generation == *generation)
+                .map(|picture| Arc::clone(&picture.image)),
             Self::Input { stores, id, clock } => {
                 let stores = stores.load();
                 let store = stores.get(id)?;
@@ -714,11 +723,17 @@ impl CliWhepProvider {
                 let wall = self
                     .wall
                     .as_ref()
-                    .filter(|slot| slot.load().is_some())
+                    .and_then(|slot| slot.load().map(|picture| (slot, picture)))
                     .ok_or(WhepReject::CapacityExceeded {
                         fallback: "jpeg".to_owned(),
                     })?;
-                (SlotReader::Program(Arc::clone(wall)), false)
+                (
+                    SlotReader::Wall {
+                        slot: Arc::clone(wall.0),
+                        generation: wall.1.generation,
+                    },
+                    false,
+                )
             }
             // The Program and Output canvas approximation carries program audio.
             WhepScope::Program | WhepScope::Output(_) => {
@@ -1495,9 +1510,10 @@ mod tests {
             Nv12Image::solid(64, 36, 16, 128, 128, color).unwrap(),
         )));
         let wall = crate::preview::wall_picture_slot();
-        wall.store(Some(Arc::new(
-            Nv12Image::solid(64, 36, 120, 128, 128, color).unwrap(),
-        )));
+        wall.store(Some(Arc::new(crate::preview::WallPicture {
+            generation: 1,
+            image: Arc::new(Nv12Image::solid(64, 36, 120, 128, 128, color).unwrap()),
+        })));
         let provider = super::CliWhepProvider {
             demand: None,
             egress: Arc::new(WhepEgress::new()),
@@ -1517,6 +1533,14 @@ mod tests {
         assert!(audio.is_none());
         assert!(media.audio_feed().is_none());
         assert_eq!(media.slot.load().unwrap().y_plane()[0], 120);
+        wall.store(Some(Arc::new(crate::preview::WallPicture {
+            generation: 2,
+            image: Arc::new(Nv12Image::solid(64, 36, 200, 128, 128, color).unwrap()),
+        })));
+        assert!(
+            media.slot.load().is_none(),
+            "old-generation viewer cannot see new-layout pixels"
+        );
         wall.store(None);
         assert!(!provider.wall_available());
         assert!(matches!(

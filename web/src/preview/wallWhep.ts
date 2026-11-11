@@ -24,6 +24,11 @@ export async function playWallWhep({ signal, onFrame, onActive }: WallWhepOption
   let lastFrame = performance.now();
   let trackAttached = false;
   let done = false;
+  // Keep a visual video element in the DOM so every target browser presents
+  // frames to requestVideoFrameCallback (a detached video may be throttled).
+  video.style.cssText = 'position:fixed;left:-2px;top:-2px;width:1px;height:1px;opacity:0;pointer-events:none';
+  video.setAttribute('aria-hidden', 'true');
+  document.body.appendChild(video);
   const stream = new MediaStream();
   let resolveEnd: (() => void) | undefined;
   let rejectEnd: ((reason: Error) => void) | undefined;
@@ -40,6 +45,7 @@ export async function playWallWhep({ signal, onFrame, onActive }: WallWhepOption
     pc.onconnectionstatechange = null;
     pc.close();
     video.srcObject = null;
+    video.remove();
     if (sessionUrl) { const url = sessionUrl; sessionUrl = undefined; void releaseWhepSession(url); }
   };
   const abort = (): void => { dispose(); resolveEnd?.(); };
@@ -86,7 +92,13 @@ export async function playWallWhep({ signal, onFrame, onActive }: WallWhepOption
     if (aborted() || !pc.localDescription) return;
     const answer = await postWhepOffer('/api/v1/preview/wall/whep', pc.localDescription.sdp);
     sessionUrl = answer.sessionUrl;
-    if (aborted()) return;
+    // Abort may have disposed the player while the POST was in flight. Its
+    // late answer still owns a focus slot, so release it before returning.
+    if (aborted()) {
+      void releaseWhepSession(answer.sessionUrl);
+      sessionUrl = undefined;
+      return;
+    }
     await pc.setRemoteDescription({ type: 'answer', sdp: answer.answerSdp });
     if (aborted()) return;
     onActive();
