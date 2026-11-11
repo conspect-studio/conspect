@@ -9,7 +9,7 @@ import { useQuery } from '@tanstack/react-query';
 import type { UseQueryResult } from '@tanstack/react-query';
 
 import { createApiClient } from '../api/client';
-import type { components } from '../api/schema';
+import type { components } from '../api/types';
 
 /** The capabilities document (`PreviewCapabilities`, the generated schema type). */
 export type PreviewCapabilities = components['schemas']['PreviewCapabilities'];

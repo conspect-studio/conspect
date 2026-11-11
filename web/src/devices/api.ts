@@ -9,10 +9,11 @@
 // inventory, ADR-0041). Request/response shapes reuse the generated
 // `components['schemas']` types from ../api/schema — never hand-written
 // duplicates — through the shared helpers in ../api/operations.
-import type { components } from '../api/schema';
+import type { components } from '../api/types';
 import {
   apiUrl,
   buildHeaders,
+  sendCommand,
   readProblem,
   submitOperation,
 } from '../api/operations';
@@ -204,13 +205,10 @@ export async function setDeviceMode(
   mode: string,
   options: RequestOptions = {},
 ): Promise<SetModeAccepted> {
-  const response = await fetch(
-    apiUrl(options, `/api/v1/devices/${encodeURIComponent(id)}/set-mode`),
-    {
-      method: 'POST',
-      headers: buildHeaders(options, true),
-      body: JSON.stringify({ mode }),
-    },
+  const response = await sendCommand(
+    `/api/v1/devices/${encodeURIComponent(id)}/set-mode`,
+    options,
+    { body: { mode } },
   );
   if (!response.ok) {
     throw await readProblem(response);

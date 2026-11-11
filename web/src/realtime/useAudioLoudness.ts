@@ -14,9 +14,8 @@
 // per-sample reference (target ± tolerance, dBTP ceiling).
 import { useEffect, useState } from "react";
 
-import { RealtimeConnection } from "./connection";
 import type { RealtimeStatus } from "./connection";
-import { mintWsTicket, realtimeWsBaseUrl } from "./ticket";
+import { subscribeRealtime } from "./shared";
 
 /** A program-bus EBU R128 loudness sample (mirrors the Rust `AudioLoudness`). */
 export interface AudioLoudnessSample {
@@ -227,6 +226,13 @@ export class LoudnessBallistics {
     return this.#latest;
   }
 
+  /** Forget every reading (disconnect/resync): a fresh sample must rebuild them. */
+  reset(): void {
+    this.#latest = undefined;
+    this.#displayMomentary = undefined;
+    this.#heldPeak = undefined;
+  }
+
   /** Clear the peak hold (e.g. an operator "reset peak" action). */
   resetPeak(): void {
     this.#heldPeak = undefined;
@@ -234,6 +240,15 @@ export class LoudnessBallistics {
 }
 
 /** A point-in-time view the meter widget renders. */
+export const LOUDNESS_EXPIRY_MS = 6000;
+
+const EMPTY = {
+  current: undefined,
+  displayMomentary: undefined,
+  heldPeakDbtp: undefined,
+  receivedAt: undefined,
+};
+
 export interface AudioLoudnessState {
   /** Coarse realtime connection status. */
   readonly status: RealtimeStatus;
@@ -243,6 +258,8 @@ export interface AudioLoudnessState {
   readonly displayMomentary: number | undefined;
   /** The held (max) true-peak since the meter mounted, dBTP. */
   readonly heldPeakDbtp: number | undefined;
+  /** Client receipt time (ms epoch) of `current`; undefined before the first. */
+  readonly receivedAt?: number | undefined;
 }
 
 /**
@@ -257,15 +274,35 @@ export function useAudioLoudness(): AudioLoudnessState {
     current: AudioLoudnessSample | undefined;
     displayMomentary: number | undefined;
     heldPeakDbtp: number | undefined;
-  }>({ current: undefined, displayMomentary: undefined, heldPeakDbtp: undefined });
+    receivedAt: number | undefined;
+  }>({
+    current: undefined,
+    displayMomentary: undefined,
+    heldPeakDbtp: undefined,
+    receivedAt: undefined,
+  });
+
+  // Expire a sample that stopped arriving: stale numbers must never read as live.
+  useEffect(() => {
+    const id = setInterval(() => {
+      setState((prev) =>
+        prev.receivedAt !== undefined && Date.now() - prev.receivedAt > LOUDNESS_EXPIRY_MS ? EMPTY : prev,
+      );
+    }, 1000);
+    return (): void => {
+      clearInterval(id);
+    };
+  }, []);
 
   useEffect(() => {
     const ballistics = new LoudnessBallistics();
-    const connection: RealtimeConnection = new RealtimeConnection(realtimeWsBaseUrl(), {
-      onStatus: (next): void => {
-        setStatus(next);
-      },
-      onEnvelope: (envelope): void => {
+    const invalidate = (): void => {
+      ballistics.reset();
+      setState(EMPTY);
+    };
+    const unsubscribe = subscribeRealtime(
+      AUDIO_LOUDNESS_TOPIC,
+      (envelope): void => {
         // Only fold our topic's loudness samples; everything else is ignored.
         if (envelope.t !== AUDIO_LOUDNESS_EVENT) {
           return;
@@ -279,12 +316,20 @@ export function useAudioLoudness(): AudioLoudnessState {
           current: sample,
           displayMomentary: ballistics.displayMomentary(),
           heldPeakDbtp: ballistics.heldPeakDbtp(),
+          receivedAt: Date.now(),
         });
       },
-    }, mintWsTicket);
-    connection.start();
+      (next): void => {
+        setStatus(next);
+        // Disconnect/reconnecting: drop the sample; a fresh one is required after reconnect.
+        if (next !== "open") {
+          invalidate();
+        }
+      },
+      invalidate,
+    );
     return (): void => {
-      connection.stop();
+      unsubscribe();
     };
   }, []);
 
@@ -293,5 +338,6 @@ export function useAudioLoudness(): AudioLoudnessState {
     current: state.current,
     displayMomentary: state.displayMomentary,
     heldPeakDbtp: state.heldPeakDbtp,
+    receivedAt: state.receivedAt,
   };
 }

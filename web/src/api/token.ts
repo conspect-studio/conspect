@@ -11,6 +11,20 @@
 /** The `localStorage` key the bearer token is persisted under. */
 const TOKEN_KEY = "multiview.apiToken";
 
+// Same-document storage writes do not emit a browser `storage` event. Keep
+// notifications payload-free: subscribers re-read their own guarded snapshot.
+const tokenSubscribers = new Set<() => void>();
+
+/** Subscribe to same-document writes; use `storage` for other documents. */
+export function subscribeStoredToken(notify: () => void): () => void {
+  tokenSubscribers.add(notify);
+  return () => { tokenSubscribers.delete(notify); };
+}
+
+function notifyTokenSubscribers(): void {
+  for (const notify of tokenSubscribers) notify();
+}
+
 /**
  * The stored bearer token, or `undefined` when none is set (or storage is
  * unavailable, e.g. private-browsing). An empty string is treated as unset.
@@ -36,13 +50,10 @@ export function setStoredToken(token: string): void {
   } catch {
     // localStorage unavailable; the token simply will not persist this session.
   }
+  notifyTokenSubscribers();
 }
 
 /** Remove any stored bearer token. */
 export function clearStoredToken(): void {
-  try {
-    window.localStorage.removeItem(TOKEN_KEY);
-  } catch {
-    // localStorage unavailable; nothing to clear.
-  }
+  setStoredToken("");
 }

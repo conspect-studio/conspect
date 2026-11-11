@@ -1,14 +1,17 @@
 // The client-side route table (react-router v7). The shell (AppLayout) is the
 // layout route; screens render into its <Outlet>.
-import { createBrowserRouter } from "react-router-dom";
+import { ShowPage } from "../pages/approved/ShowPage";
+import { createBrowserRouter, Navigate } from "react-router-dom";
 
 import { AppLayout } from "./AppLayout";
 import { RequireAuth } from "../auth/RequireAuth";
 import { DashboardPage } from "../pages/DashboardPage";
+import { ProductionDesk } from "../components/broadcast/ProductionDesk";
 import { LayoutsPage } from "../pages/LayoutsPage";
 import { LayoutEditorPage } from "../pages/LayoutEditorPage";
 import { CastPage } from "../pages/CastPage";
 import { RoutingPage } from "../pages/RoutingPage";
+import { SwitcherPage } from "../pages/SwitcherPage";
 import { LogsPage } from "../pages/LogsPage";
 import { NotFoundPage } from "../pages/NotFoundPage";
 import { MonitoringPage } from "../pages/MonitoringPage";
@@ -17,10 +20,12 @@ import { SalvosPage } from "../pages/SalvosPage";
 import { MediaPlayersPage } from "../pages/MediaPlayersPage";
 import { AlarmsPage } from "../pages/AlarmsPage";
 import { AudioPage } from "../pages/AudioPage";
+import { IptvPage } from "../pages/IptvPage";
 import { DeviceDetailPage } from "../pages/DeviceDetailPage";
 import { DevicesPage } from "../pages/DevicesPage";
 import { ProbesPage } from "../pages/ProbesPage";
 import { SyncGroupsPage } from "../pages/SyncGroupsPage";
+import { GraphicsPage } from "../pages/GraphicsPage";
 import { AuditPage } from "../pages/AuditPage";
 import { SystemPage } from "../pages/SystemPage";
 import { CapabilitiesPage } from "../pages/CapabilitiesPage";
@@ -56,19 +61,35 @@ export const router = createBrowserRouter([
       </RequireAuth>
     ),
     children: [
-      { index: true, element: <DashboardPage /> },
+      { index: true, element: <ProductionDesk /> },
+      { path: "dashboard", element: <DashboardPage /> },
+      { path: "show", element: <ShowPage /> },
       { path: "layouts", element: <LayoutsPage /> },
       { path: "layouts/new", element: <LayoutEditorPage /> },
       { path: "layouts/:id", element: <LayoutEditorPage /> },
       { path: "sources", element: <SourcesPage /> },
+      {
+        // A sub-page of Sources (no nav item): lazy so maplibre-gl stays out of
+        // the main bundle.
+        path: "sources/iptv-org",
+        lazy: async () => ({
+          Component: (await import("../iptv/IptvOrgPage")).IptvOrgPage,
+        }),
+      },
       { path: "outputs", element: <OutputsPage /> },
       { path: "overlays", element: <OverlaysPage /> },
       { path: "audio", element: <AudioPage /> },
+      { path: "iptv", element: <IptvPage /> },
       { path: "devices", element: <DevicesPage /> },
       { path: "devices/:id", element: <DeviceDetailPage /> },
       { path: "cast", element: <CastPage /> },
       { path: "routing", element: <RoutingPage /> },
+      { path: "switcher", element: <SwitcherPage /> },
       { path: "sync-groups", element: <SyncGroupsPage /> },
+      { path: "graphics", element: <GraphicsPage /> },
+      { path: "graphics/:view", element: <GraphicsPage /> },
+      // The former Weather page now lives in Graphics → Data.
+      { path: "weather", element: <Navigate to="/graphics/data" replace /> },
       { path: "probes", element: <ProbesPage /> },
       { path: "monitoring", element: <MonitoringPage /> },
       { path: "tally", element: <TallyPage /> },

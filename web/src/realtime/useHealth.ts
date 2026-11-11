@@ -10,9 +10,8 @@
 // grows past the number of distinct catalog codes.
 import { useEffect, useState } from "react";
 
-import { RealtimeConnection } from "./connection";
 import type { RealtimeStatus } from "./connection";
-import { mintWsTicket, realtimeWsBaseUrl } from "./ticket";
+import { subscribeRealtime } from "./shared";
 
 /** The severity classes a health warning carries (mirrors `WarningSeverity`). */
 export type WarningSeverity = "info" | "warning" | "critical";
@@ -164,23 +163,13 @@ export function useHealth(): HealthState {
 
   useEffect(() => {
     const map = new HealthWarningMap();
-    const connection = new RealtimeConnection(
-      realtimeWsBaseUrl(),
-      {
-        onStatus: (next): void => {
-          setStatus(next);
-        },
-        onEnvelope: (envelope): void => {
-          if (map.applyEnvelope(envelope.t, envelope.data)) {
-            setWarnings(map.active());
-          }
-        },
-      },
-      mintWsTicket,
-    );
-    connection.start();
+    const unsubscribe = subscribeRealtime("alerts", (envelope): void => {
+      if (map.applyEnvelope(envelope.t, envelope.data)) {
+        setWarnings(map.active());
+      }
+    }, setStatus);
     return (): void => {
-      connection.stop();
+      unsubscribe();
     };
   }, []);
 

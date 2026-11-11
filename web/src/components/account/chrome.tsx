@@ -35,9 +35,9 @@ export function LicenceChip(): JSX.Element | null {
     return (
       <Link
         to="/settings/account"
-        className="inline-flex min-h-[44px] items-center rounded-md px-1"
+        className="inline-flex min-h-12 min-w-12 max-w-full items-center rounded-md px-1 [&>span]:min-w-0 [&>span]:whitespace-normal [&>span]:break-words"
       >
-        <Badge variant="stale">
+        <Badge variant="stale" className="border-[#e8a33d] bg-[#3a2a0e] text-[#ffe2b0]">
           <Trans>Unclaimed</Trans>
         </Badge>
       </Link>
@@ -47,7 +47,7 @@ export function LicenceChip(): JSX.Element | null {
   return (
     <Link
       to="/settings/licence"
-      className="inline-flex min-h-[44px] items-center rounded-md px-1"
+      className="inline-flex min-h-12 min-w-12 max-w-full items-center rounded-md px-1 [&>span]:min-w-0 [&>span]:whitespace-normal [&>span]:break-words"
       aria-label={status.tier}
     >
       <Badge variant={variant}>{status.tier}</Badge>

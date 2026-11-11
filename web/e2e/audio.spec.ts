@@ -60,7 +60,9 @@ test("the audio routing page edits rows and saves with If-Match without crashing
 
   // The document loads into the form: one route row + the tracks list with
   // the program bus and the declared discrete track.
-  await expect(page.getByTestId("audio-route-row")).toHaveCount(1);
+  await expect(page.getByRole("region", { name: "Mix bank" }).getByTestId("audio-strip")).toHaveCount(1);
+  // The track list lives in the collapsed "Bus setup" disclosure of the approved screen.
+  await page.getByTestId("audio-bus-setup").locator("summary").click();
   const tracks = page.getByTestId("audio-tracks-list");
   await expect(tracks).toContainText("prog");
   await expect(tracks).toContainText("cam1-clean");
@@ -68,13 +70,11 @@ test("the audio routing page edits rows and saves with If-Match without crashing
   // Add a row (renders another set of Radix Selects over the table), then
   // remove it from the keyboard-reachable per-row control.
   await page.getByTestId("audio-add-route").click();
-  await expect(page.getByTestId("audio-route-row")).toHaveCount(2);
-  await page
-    .getByTestId("audio-route-row")
-    .nth(1)
-    .getByTestId("audio-remove-route")
-    .click();
-  await expect(page.getByTestId("audio-route-row")).toHaveCount(1);
+  await expect(page.getByRole("region", { name: "Mix bank" }).getByTestId("audio-strip")).toHaveCount(2);
+  const second = page.getByRole("region", { name: "Mix bank" }).getByTestId("audio-strip").nth(1);
+  await second.getByTestId("audio-strip-details").locator("summary").click();
+  await second.getByTestId("audio-remove-route").click();
+  await expect(page.getByRole("region", { name: "Mix bank" }).getByTestId("audio-strip")).toHaveCount(1);
 
   // Save replaces the whole document conditionally.
   const putRequest = page.waitForRequest(
