@@ -62,7 +62,8 @@ pub use control::{Adoption, AudioTransport, EpochAdopter, PlayerControl, PlayerC
 pub use detach::{DetachAck, DetachAdmissionError, DetachPort, DetachRequest, DetachTicket};
 pub use handle::{PlayerFault, PlayerHandle, PlayerStatus};
 pub use load::{
-    AudioCommitSlot, Generation, LoadCoordinator, LoadRequest, Staged, RETIRE_CAPACITY,
+    AudioCommitSlot, ClaimRefusal, CommitClaim, Generation, LoadCoordinator, LoadRequest, Staged,
+    RETIRE_CAPACITY,
 };
 pub use mailbox::{TransportMailbox, TransportVerb};
 pub use pacer::{OriginPacer, STAMP_LEAD_TICKS};

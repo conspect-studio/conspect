@@ -66,6 +66,10 @@ pub struct AudioCommitSlot<A> {
     prepared: AtomicU64,
     #[cfg(all(test, feature = "ffmpeg"))]
     hold_prepare: AtomicBool,
+    /// Test seam: runs once at the top of [`Self::try_claim_commit`], before the
+    /// gate is taken (deterministic "close after PREPARE ack, before claim").
+    #[cfg(test)]
+    before_claim: Mutex<Option<ClaimHook>>,
     runtime_owner: std::sync::OnceLock<Arc<std::fs::File>>,
 }
 
@@ -82,9 +86,39 @@ impl<A> Default for AudioCommitSlot<A> {
             prepared: AtomicU64::new(0),
             #[cfg(all(test, feature = "ffmpeg"))]
             hold_prepare: AtomicBool::new(false),
+            #[cfg(test)]
+            before_claim: Mutex::new(None),
             runtime_owner: std::sync::OnceLock::new(),
         }
     }
+}
+
+/// Test-only one-shot hook with a `Debug` face.
+#[cfg(test)]
+struct ClaimHook(Box<dyn FnOnce() + Send>);
+#[cfg(test)]
+impl std::fmt::Debug for ClaimHook {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("ClaimHook")
+    }
+}
+
+/// Why [`AudioCommitSlot::try_claim_commit`] refused.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClaimRefusal {
+    /// The gate is momentarily held (close/take/put); retry next tick.
+    Contended,
+    /// The audio rail closed first: the load fails with the old clip retained.
+    Closed,
+    /// No deck of this generation is parked, or PREPARE is not acknowledged.
+    NotPrepared,
+}
+
+/// RAII proof that the joint commit won the audio gate. Holding it blocks
+/// `close`/`take`/`put`; hold it only across atomics and pointer swaps.
+#[must_use = "dropping the claim releases the gate"]
+pub struct CommitClaim<'a, A> {
+    _guard: std::sync::MutexGuard<'a, Option<(Generation, A)>>,
 }
 
 impl<A> AudioCommitSlot<A> {
@@ -102,6 +136,67 @@ impl<A> AudioCommitSlot<A> {
     #[must_use]
     pub fn is_prepared(&self, generation: Generation) -> bool {
         self.prepared.load(Ordering::Acquire) == generation.0
+    }
+    /// Ingest side, nonblocking: claim the joint A/V commit for `generation`.
+    ///
+    /// The returned guard IS the slot gate that [`Self::close`] and
+    /// [`Self::take`] also take, so while it is held the audio rail cannot be
+    /// closed: the checks (`!closed`, deck of `generation` parked, PREPARE
+    /// acknowledged) and the caller's epoch publication are one linearization
+    /// point. A `close` that wins first makes this refuse (`Closed`); a claim
+    /// that wins makes `close` wait the few atomic/pointer operations until the
+    /// guard drops, after which the epoch is visible and a closed rail is a
+    /// runtime failure, not a failed load.
+    ///
+    /// The caller must hold the guard only across atomics and pointer swaps
+    /// (no fsync, native drop, scaler or opener work) and drop it right after
+    /// publishing the epoch. `try_lock` only: never waits.
+    ///
+    /// # Errors
+    /// See [`ClaimRefusal`].
+    pub fn try_claim_commit(
+        &self,
+        generation: Generation,
+    ) -> Result<CommitClaim<'_, A>, ClaimRefusal> {
+        #[cfg(test)]
+        {
+            let hook = self
+                .before_claim
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take();
+            if let Some(hook) = hook {
+                (hook.0)();
+            }
+        }
+        let guard = match self.slot.try_lock() {
+            Ok(guard) => guard,
+            Err(TryLockError::Poisoned(p)) => p.into_inner(),
+            Err(TryLockError::WouldBlock) => return Err(ClaimRefusal::Contended),
+        };
+        if self.closed.load(Ordering::Acquire) {
+            return Err(ClaimRefusal::Closed);
+        }
+        let parked = guard.as_ref().is_some_and(|(g, _)| *g == generation);
+        if !parked || !self.is_prepared(generation) {
+            return Err(ClaimRefusal::NotPrepared);
+        }
+        Ok(CommitClaim { _guard: guard })
+    }
+    /// Test seam: install the one-shot hook run before a claim takes the gate.
+    #[cfg(all(test, feature = "ffmpeg"))]
+    pub(crate) fn before_claim_for_test(&self, hook: Box<dyn FnOnce() + Send>) {
+        *self
+            .before_claim
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(ClaimHook(hook));
+    }
+    /// Test seam: hold the slot gate (as a management/audio-side reader would).
+    #[cfg(test)]
+    pub(crate) fn hold_gate_for_test(&self) -> std::sync::MutexGuard<'_, Option<(Generation, A)>> {
+        self.slot
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
     /// Ingest side, nonblocking: take back the parked deck of exactly
     /// `generation` so the caller can hand it to the opener for teardown.
@@ -844,6 +939,89 @@ mod tests {
         let taken = c.try_take(&audio).unwrap();
         assert_eq!((taken.generation, taken.clip), (last, 9_999));
         assert!(c.try_take(&audio).is_none());
+    }
+}
+
+#[cfg(test)]
+mod commit_claim_tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    fn prepared_slot() -> Arc<AudioCommitSlot<&'static str>> {
+        let slot = Arc::new(AudioCommitSlot::new());
+        slot.put(Generation(2), "b").unwrap();
+        slot.acknowledge_prepared(Generation(2));
+        slot
+    }
+
+    #[test]
+    fn close_before_claim_refuses_even_with_a_stale_prepared_flag() {
+        let slot = prepared_slot();
+        assert!(slot.is_prepared(Generation(2)));
+        let _ = slot.close();
+        assert!(slot.is_prepared(Generation(2)), "flag is stale-true");
+        assert!(matches!(
+            slot.try_claim_commit(Generation(2)),
+            Err(ClaimRefusal::Closed)
+        ));
+    }
+
+    #[test]
+    fn claim_requires_the_exact_parked_and_prepared_generation() {
+        let slot = Arc::new(AudioCommitSlot::<&str>::new());
+        assert!(matches!(
+            slot.try_claim_commit(Generation(2)),
+            Err(ClaimRefusal::NotPrepared)
+        ));
+        slot.put(Generation(2), "b").unwrap();
+        assert!(matches!(
+            slot.try_claim_commit(Generation(2)),
+            Err(ClaimRefusal::NotPrepared)
+        ));
+        slot.acknowledge_prepared(Generation(2));
+        assert!(matches!(
+            slot.try_claim_commit(Generation(3)),
+            Err(ClaimRefusal::NotPrepared)
+        ));
+        assert!(slot.try_claim_commit(Generation(2)).is_ok());
+    }
+
+    #[test]
+    fn close_waits_for_a_held_claim_and_epoch_is_visible_before_close() {
+        let slot = prepared_slot();
+        let epoch = Arc::new(AtomicU64::new(0));
+        let claim = slot.try_claim_commit(Generation(2)).unwrap();
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let closer = {
+            let (slot, epoch) = (Arc::clone(&slot), Arc::clone(&epoch));
+            std::thread::spawn(move || {
+                started_tx.send(()).unwrap();
+                let _ = slot.close();
+                // close linearized after the epoch publication.
+                epoch.load(Ordering::Acquire)
+            })
+        };
+        started_rx.recv().unwrap();
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(!slot.is_closed(), "close blocked behind the claim");
+        epoch.store(2, Ordering::Release);
+        drop(claim);
+        assert_eq!(closer.join().unwrap(), 2, "close observed the epoch");
+        assert!(slot.is_closed());
+    }
+
+    #[test]
+    fn contended_claim_never_waits() {
+        let slot = prepared_slot();
+        let gate = slot.hold_gate_for_test();
+        let t0 = Instant::now();
+        assert!(matches!(
+            slot.try_claim_commit(Generation(2)),
+            Err(ClaimRefusal::Contended)
+        ));
+        assert!(t0.elapsed() < Duration::from_millis(50));
+        drop(gate);
+        assert!(slot.try_claim_commit(Generation(2)).is_ok());
     }
 }
 

@@ -14879,17 +14879,30 @@ fn player_runtime_body(
                 // retained (refusal path above). Audio-less clips commit at once.
                 let epoch = staged.generation;
                 let has_audio = staged.clip.probed.has_audio;
+                // Held from the closed/prepared validation until the epoch is
+                // published (atomics and pointer swaps only): `close` cannot
+                // interleave, so close-after-claim is a runtime failure and
+                // close-before-claim fails B with A retained.
+                let mut commit_claim = None;
                 let audio_result: Result<(), crate::player::StagedAudio> = if has_audio {
                     if audio_slot.is_closed() {
                         // Raced a close: next tick takes the fail-closed refusal.
                         continue;
                     }
                     if prepared_audio == Some(epoch) {
-                        if audio_slot.is_prepared(epoch) {
-                            Ok(())
-                        } else {
-                            sleep_interruptible(period, stop);
-                            continue;
+                        match audio_slot.try_claim_commit(epoch) {
+                            Ok(claim) => {
+                                commit_claim = Some(claim);
+                                Ok(())
+                            }
+                            Err(crate::player::ClaimRefusal::Closed) => {
+                                // Next tick takes the fail-closed refusal.
+                                continue;
+                            }
+                            Err(_) => {
+                                sleep_interruptible(period, stop);
+                                continue;
+                            }
                         }
                     } else {
                         let audio = crate::player::StagedAudio {
@@ -14967,6 +14980,9 @@ fn player_runtime_body(
                             epoch,
                             MediaTime::from_tick(anchor, cadence),
                         );
+                        // Epoch visible: the audio gate is released before any
+                        // native/journal work.
+                        drop(commit_claim.take());
                         if let Some(clip) = current.as_ref() {
                             runtime.native.store(Some(Arc::new(
                                 multiview_control::player_load::NativeLoadAck {
@@ -27215,6 +27231,113 @@ loop_default = true
             rig.runtime.coordinator.is_superseded(b_gen)
                 || rig.runtime.coordinator.latest() == b_gen
         );
+        assert!(rig.shutdown().is_none());
+    }
+
+    /// Deterministic interleave: the rail closes AFTER the PREPARE ack and
+    /// BEFORE the claim returns. The stale prepared flag must not commit B's
+    /// video without audio: B fails closed, A is retained everywhere.
+    #[test]
+    fn audio_close_after_prepare_ack_before_claim_fails_b_and_retains_a() {
+        use crate::player::PlayerFault;
+        let _budget = crate::player::budget_test_guard();
+        let dir = tempfile::tempdir().unwrap();
+        let a = clip(dir.path(), "a.mov", 30, Some(0.25));
+        let b = clip(dir.path(), "b.mov", 140, Some(0.25));
+        let rig = Rig::start(&plain_config(), None).unwrap();
+        rig.runtime
+            .opener
+            .request(ClipSpec::new(&a, LoadThen::Cue))
+            .unwrap();
+        wait("A committed and adopted", &|| {
+            rig.handle.control_bus.load().clip_epoch.0 >= 1
+                && rig
+                    .runtime
+                    .audio_commit
+                    .has_adopted(rig.handle.control_bus.load().clip_epoch)
+        });
+        let a_epoch = rig.handle.control_bus.load().clip_epoch;
+        let anchor = rig.handle.control_bus.load().start_anchor.unwrap();
+        let a_center = center(&rig.store, anchor);
+        let slot = Arc::clone(&rig.runtime.audio_commit);
+        let closer = Arc::clone(&slot);
+        slot.before_claim_for_test(Box::new(move || {
+            assert!(
+                closer.is_prepared(closer.pending_generation()),
+                "closed after the PREPARE ack"
+            );
+            drop(closer.close());
+        }));
+        let b_gen = rig
+            .runtime
+            .opener
+            .request(ClipSpec::new(&b, LoadThen::Cue))
+            .unwrap();
+        wait("B failed closed", &|| {
+            matches!(
+                rig.runtime.status.load().fault,
+                Some(PlayerFault::AudioUnavailable { generation }) if generation == b_gen.0
+            )
+        });
+        let first = rig.first_tick_after_anchor();
+        for (_, luma) in rig.drive(first, 30) {
+            assert_eq!(luma, a_center, "A video retained; B never committed");
+        }
+        assert_eq!(rig.handle.control_bus.load().clip_epoch, a_epoch);
+        assert_eq!(rig.runtime.binding.load().generation, a_epoch);
+        assert_eq!(
+            rig.runtime.native.load().as_ref().unwrap().generation,
+            a_epoch.0
+        );
+        assert!(rig.shutdown().is_none());
+    }
+
+    /// While the audio gate is held (a contending close/take), the ingest claim
+    /// defers without waiting: the output clock ticks exactly, every frame is
+    /// valid and still A; once released B commits jointly.
+    #[test]
+    fn contended_claim_gate_never_stalls_the_output_clock() {
+        let _budget = crate::player::budget_test_guard();
+        let dir = tempfile::tempdir().unwrap();
+        let a = clip(dir.path(), "a.mov", 30, Some(0.25));
+        let b = clip(dir.path(), "b.mov", 140, Some(0.25));
+        let rig = Rig::start(&plain_config(), None).unwrap();
+        rig.runtime
+            .opener
+            .request(ClipSpec::new(&a, LoadThen::Cue))
+            .unwrap();
+        wait("A committed and adopted", &|| {
+            rig.handle.control_bus.load().clip_epoch.0 >= 1
+                && rig
+                    .runtime
+                    .audio_commit
+                    .has_adopted(rig.handle.control_bus.load().clip_epoch)
+        });
+        let a_epoch = rig.handle.control_bus.load().clip_epoch;
+        let anchor = rig.handle.control_bus.load().start_anchor.unwrap();
+        let a_center = center(&rig.store, anchor);
+        let gate = rig.runtime.audio_commit.hold_gate_for_test();
+        let b_gen = rig
+            .runtime
+            .opener
+            .request(ClipSpec::new(&b, LoadThen::Cue))
+            .unwrap();
+        // put() is contended too, so B waits unparked; the clock must not care.
+        let first = rig.first_tick_after_anchor();
+        let ticks = rig.drive(first, 60);
+        for (i, (tick, luma)) in ticks.iter().enumerate() {
+            assert_eq!(
+                tick.index,
+                first + u64::try_from(i).unwrap(),
+                "clock ticks exact"
+            );
+            assert_eq!(*luma, a_center, "A video while the gate is contended");
+        }
+        assert_eq!(rig.handle.control_bus.load().clip_epoch, a_epoch);
+        drop(gate);
+        wait("B committed after release", &|| {
+            rig.handle.control_bus.load().clip_epoch == b_gen
+        });
         assert!(rig.shutdown().is_none());
     }
 
