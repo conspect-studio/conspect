@@ -6541,6 +6541,23 @@ fn missing_ticks_before(
     Ok(start..current_tick)
 }
 
+/// The owned encode job for one surviving item: the tick it was composed for and
+/// the PCM already mixed under that item's switcher selection. The audio worker
+/// receives only this (no bus, selector or routing), so queue depth can delay
+/// the encode but never change which source a tick carries.
+fn program_audio_job(
+    item: &StreamItem,
+    block: &multiview_audio::format::AudioBlock,
+    tracks: Vec<Option<Vec<f32>>>,
+) -> crate::rendition_workers::AudioJob {
+    crate::rendition_workers::AudioJob {
+        tick: item.tick_index,
+        frames: block.frame_count(),
+        program: block.interleaved().to_vec(),
+        tracks,
+    }
+}
+
 /// Mix one survivor without assigning its selection to earlier, shed ticks.
 fn drive_selected_audio_for_item(
     bus: &mut multiview_audio::program::ProgramBus,
@@ -6777,21 +6794,13 @@ mod switcher_shed_audio_tests {
         let mut last = None;
         for tick in 0..7_u64 {
             let source = if tick < 4 { "a" } else { "b" };
-            let block = drive_selected_audio_for_item(
-                &mut bus,
-                Some(&handle),
-                &item(tick, source),
-                &mut last,
-            )
-            .expect("audio");
+            let survivor = item(tick, source);
+            let block =
+                drive_selected_audio_for_item(&mut bus, Some(&handle), &survivor, &mut last)
+                    .expect("audio");
             worker
                 .offer_within(
-                    crate::rendition_workers::AudioJob {
-                        tick,
-                        frames: block.frame_count(),
-                        program: block.interleaved().to_vec(),
-                        tracks: Vec::new(),
-                    },
+                    program_audio_job(&survivor, &block, Vec::new()),
                     std::time::Duration::from_secs(5),
                 )
                 .expect("queue slot");
@@ -6828,7 +6837,7 @@ mod switcher_shed_audio_tests {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner),
             (0..7).collect::<Vec<_>>(),
-            "packets re-associate with their own tick"
+            "the dispatch callback receives each job's own tick"
         );
     }
 
@@ -7305,15 +7314,7 @@ fn consumer_main<D: WindowDelivery>(
             let offered = audio_worker.as_ref().map_or(
                 Err(crate::rendition_workers::OfferRejection::Ended),
                 |worker| {
-                    worker.offer_within(
-                        crate::rendition_workers::AudioJob {
-                            tick: item.tick_index,
-                            frames: block.frame_count(),
-                            program: block.interleaved().to_vec(),
-                            tracks,
-                        },
-                        offer_horizon,
-                    )
+                    worker.offer_within(program_audio_job(&item, &block, tracks), offer_horizon)
                 },
             );
             match offered {

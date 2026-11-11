@@ -116,11 +116,20 @@ per-tick frame budget, catch-up blocks included.
 **Proof.**
 
 - `pipeline::switcher_shed_audio_tests::queued_audio_jobs_keep_the_selection_of_their_own_tick_across_a_cut`
-  (new): drives the real `drive_selected_audio_for_item` + `AudioEncodeWorker`
-  with the encoder stalled on tick 0 so the CUT job and all later jobs sit in
-  the queue; asserts every encoded tick carries exactly the PCM of the source
-  composed for that tick (400 Hz before, 1 kHz from the CUT on), in tick order,
-  and packets dispatch under their own tick.
+  (new): drives the production helpers `drive_selected_audio_for_item` and
+  `program_audio_job` (the consumer builds its worker job with the same
+  helper) into a real `AudioEncodeWorker` whose encoder is stalled on tick 0,
+  so the CUT job and all later jobs sit in the queue; asserts every encoded
+  tick carries exactly the PCM of the source composed for that tick (400 Hz
+  before, 1 kHz from the CUT on), in tick order, and that the dispatch
+  callback receives each job's own tick.
+- Structural guarantee: `AudioEncodeWork::encode` receives only `&AudioJob`
+  (owned PCM); it has no access to the bus, the selector or routing, so a
+  selection cannot move onto the worker without changing that trait.
+- Not covered by a unit test: packet-to-video-window admission in the
+  dispatcher (`RenditionDispatcher`, main's PR 237 tests) and the full
+  consumer loop, which the native `switcher_audio` tone test exercises
+  end to end.
 - `switcher_shed_gap_keeps_pre_cut_tone_and_stale_item_cannot_change_gain`
   (PR 224's forced four-deep hot-queue regression), `audio_worker_tests::*`
   (PR 237: order, bounded wedge, error at join, concurrent drain), and the
