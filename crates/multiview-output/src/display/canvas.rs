@@ -25,7 +25,9 @@ use std::os::fd::BorrowedFd;
 
 use thiserror::Error;
 
-use super::strategy::{CanvasDelivery, DrmFormat};
+use super::strategy::CanvasDelivery;
+#[cfg(unix)]
+use super::strategy::DrmFormat;
 
 /// One plane of an importable dmabuf-backed canvas: the borrowed prime fd plus
 /// where that plane starts and how wide its rows are. Borrowed for the
