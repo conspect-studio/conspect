@@ -14373,6 +14373,84 @@ fn player_runtime_loop(
     exceptional
 }
 
+/// Test-only deterministic barrier in the player worker's seek handler, keyed per
+/// runtime (by its opener `Arc` address — never a process-global switch, so
+/// parallel tests cannot race). Production code is untouched: the call sites are
+/// `#[cfg(test)]` and the seek/flush ordering is unchanged.
+#[cfg(all(test, feature = "ffmpeg"))]
+pub(crate) mod seek_barrier {
+    use std::collections::HashMap;
+    use std::sync::{Arc, Condvar, Mutex, OnceLock};
+    use std::time::{Duration, Instant};
+
+    /// One runtime's barrier: the worker parks in `pause_before_seek` until released.
+    #[derive(Default)]
+    pub(crate) struct Gate {
+        state: Mutex<(bool, bool, bool)>, // (entered, released, passed)
+        cv: Condvar,
+    }
+
+    impl Gate {
+        fn wait_flag(&self, pick: fn(&(bool, bool, bool)) -> bool, what: &str) {
+            let deadline = Instant::now() + Duration::from_secs(20);
+            let mut g = self.state.lock().unwrap();
+            while !pick(&g) {
+                let left = deadline.saturating_duration_since(Instant::now());
+                assert!(!left.is_zero(), "hang deadline: {what}");
+                g = self.cv.wait_timeout(g, left).unwrap().0;
+            }
+        }
+        /// Block until the worker is parked before its actual seek.
+        pub(crate) fn wait_entered(&self) {
+            self.wait_flag(|s| s.0, "worker never reached the seek barrier");
+        }
+        /// Whether the worker is parked and has NOT yet seeked.
+        pub(crate) fn blocked(&self) -> bool {
+            let g = self.state.lock().unwrap();
+            g.0 && !g.1
+        }
+        /// Let the native seek/flush proceed.
+        pub(crate) fn release(&self) {
+            self.state.lock().unwrap().1 = true;
+            self.cv.notify_all();
+        }
+        /// Block until the worker has resumed past the barrier.
+        pub(crate) fn wait_passed(&self) {
+            self.wait_flag(|s| s.2, "worker never resumed after release");
+        }
+    }
+
+    fn registry() -> &'static Mutex<HashMap<usize, Arc<Gate>>> {
+        static R: OnceLock<Mutex<HashMap<usize, Arc<Gate>>>> = OnceLock::new();
+        R.get_or_init(Mutex::default)
+    }
+
+    fn key(runtime: &crate::player::PlayerRuntime) -> usize {
+        Arc::as_ptr(&runtime.opener) as usize
+    }
+
+    /// Arm a barrier for exactly this runtime.
+    pub(crate) fn arm(runtime: &crate::player::PlayerRuntime) -> Arc<Gate> {
+        let gate = Arc::new(Gate::default());
+        registry()
+            .lock()
+            .unwrap()
+            .insert(key(runtime), Arc::clone(&gate));
+        gate
+    }
+
+    /// Worker side: park before the actual seek if this runtime is armed.
+    pub(crate) fn pause_before_seek(runtime: &crate::player::PlayerRuntime) {
+        let gate = registry().lock().unwrap().remove(&key(runtime));
+        let Some(gate) = gate else { return };
+        gate.state.lock().unwrap().0 = true;
+        gate.cv.notify_all();
+        gate.wait_flag(|s| s.1, "barrier never released");
+        gate.state.lock().unwrap().2 = true;
+        gate.cv.notify_all();
+    }
+}
+
 #[cfg(feature = "ffmpeg")]
 #[allow(clippy::too_many_lines)]
 fn player_runtime_body(
@@ -14534,6 +14612,8 @@ fn player_runtime_body(
                 TransportVerb::Cue { frame } => {
                     let target = frame.unwrap_or(player.geometry().in_point());
                     if let Some(clip) = current.as_mut() {
+                        #[cfg(test)]
+                        seek_barrier::pause_before_seek(runtime);
                         let micros = multiview_core::time::rescale(
                             i64::try_from(target).unwrap_or(i64::MAX),
                             Rational::new(cadence.den, cadence.num),
@@ -14560,6 +14640,8 @@ fn player_runtime_body(
                 }
                 TransportVerb::Seek { frame } => {
                     if let Some(clip) = current.as_mut() {
+                        #[cfg(test)]
+                        seek_barrier::pause_before_seek(runtime);
                         let micros = multiview_core::time::rescale(
                             i64::try_from(frame).unwrap_or(i64::MAX),
                             Rational::new(cadence.den, cadence.num),
@@ -26534,5 +26616,517 @@ loop_default = true
         audio_worker.join().unwrap();
         stop.store(true, Ordering::Release);
         assert!(worker.join().unwrap().is_none());
+    }
+}
+
+/// R3 causal chaos proofs for explicit artifact player adoption (invariants #1/#10).
+///
+/// Every test drives the ACTUAL output-clock path — [`OutputClock`] ticks into the
+/// production [`CompositorDrive::compose`] over the SAME `TileStore` the real native
+/// player worker publishes into — while a real native worker thread is deliberately
+/// held (deterministic per-runtime barrier, never a wall-clock sleep) or stressed.
+/// A hang deadline is the only wall-clock use, and it fails, never passes.
+#[cfg(all(test, feature = "ffmpeg"))]
+mod player_adoption_chaos_tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
+    use super::*;
+    use crate::player::{ClipSpec, LoadThen, SlotReference, TransportVerb};
+    use multiview_compositor::pipeline::CanvasColor;
+    use multiview_config::MultiviewConfig;
+    use multiview_engine::{ManualTimeSource, OutputClock, TimeSource};
+    use multiview_ffmpeg::test_fixtures::{generate_player_clip, PlayerClipSpec};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::{Duration, Instant};
+
+    const PLAYER: &str = "vt-1";
+
+    fn config_doc(library: &str, asset: &str, default: bool) -> String {
+        format!(
+            r##"schema_version = 1
+[canvas]
+width = 64
+height = 48
+fps = "25/1"
+pixel_format = "nv12"
+background = "#101014"
+[canvas.color]
+profile = "sdr-bt709-limited"
+[layout]
+kind = "grid"
+columns = ["1fr"]
+rows = ["1fr"]
+areas = ["a"]
+[[cells]]
+id = "cell_a"
+area = "a"
+[cells.source]
+input_id = "{PLAYER}"
+{library}
+{asset}
+[[media_players]]
+id = "{PLAYER}"
+loop_default = true
+{}
+"##,
+            if default { "default = \"dflt\"" } else { "" }
+        )
+    }
+
+    fn plain_config() -> MultiviewConfig {
+        MultiviewConfig::load_from_toml(&config_doc("", "", false)).unwrap()
+    }
+
+    fn wait(what: &str, condition: &dyn Fn() -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while !condition() {
+            assert!(Instant::now() < deadline, "hang deadline: {what}");
+            std::thread::yield_now();
+        }
+    }
+
+    fn clip(dir: &std::path::Path, name: &str, luma: u8, audio: Option<f32>) -> PathBuf {
+        let path = dir.join(name);
+        let mut spec = PlayerClipSpec::ffv1(Rational::new(25, 1), 25, luma);
+        spec.audio_level = audio;
+        generate_player_clip(&path, &spec).unwrap();
+        path
+    }
+
+    /// A real boot + real player worker + real audio rail on threads, with the
+    /// output origin on a manual clock.
+    struct Rig {
+        handle: crate::player::PlayerHandle,
+        runtime: crate::player::PlayerRuntime,
+        clock: Arc<ManualTimeSource>,
+        store: Arc<TileStore<Nv12Image>>,
+        layout: Layout,
+        cadence: Rational,
+        stop: Arc<AtomicBool>,
+        worker: Option<std::thread::JoinHandle<Option<[Option<crate::player::StagedClip>; 3]>>>,
+        audio_stop: Arc<AtomicBool>,
+        audio_worker: Option<std::thread::JoinHandle<()>>,
+    }
+
+    impl Rig {
+        fn start(config: &MultiviewConfig, state: Option<&std::path::Path>) -> Option<Self> {
+            let layout = config.solve_layout().unwrap();
+            let cadence = config.canvas.fps.rational();
+            let boot = build_media_player_boot_with_state(
+                config,
+                &layout,
+                cadence,
+                CanvasColor::default(),
+                state,
+            );
+            let plan = boot.plans.into_iter().next()?;
+            let handle = plan.player.as_ref().unwrap().clone();
+            let runtime = handle.runtime.as_ref().unwrap().clone();
+            let clock = Arc::new(ManualTimeSource::new());
+            clock.set(1_000_000_000);
+            let source: Arc<dyn TimeSource> = clock.clone();
+            plan.output_origin
+                .store(Some(Arc::new(multiview_engine::epoch::EpochAnchor::new(
+                    source,
+                    1_000_000_000,
+                ))));
+            let store = Arc::clone(&boot.stores[0].1);
+            let audio_store = Arc::clone(&boot.audio_stores[0].1);
+            let audio_plan = boot.audio_plans.into_iter().next().unwrap();
+            let audio_stop = Arc::new(AtomicBool::new(false));
+            let a_stop = Arc::clone(&audio_stop);
+            let audio_worker = std::thread::spawn(move || {
+                crate::audio::player_audio_loop(&audio_plan, &audio_store, &a_stop);
+            });
+            let stop = Arc::new(AtomicBool::new(false));
+            let w_stop = Arc::clone(&stop);
+            let worker = std::thread::spawn(move || {
+                player_runtime_loop(&plan, plan.player.as_ref().unwrap(), &w_stop)
+            });
+            Some(Self {
+                handle,
+                runtime,
+                clock,
+                store,
+                layout,
+                cadence,
+                stop,
+                worker: Some(worker),
+                audio_stop,
+                audio_worker: Some(audio_worker),
+            })
+        }
+
+        /// Run the ACTUAL output clock + production compositor for `count` ticks
+        /// beginning at tick `first`. Returns `(tick, canvas centre luma)` per tick.
+        /// Advances the shared manual time to each tick's deadline.
+        fn drive(&self, first: u64, count: u64) -> Vec<(multiview_engine::Tick, u8)> {
+            let (w, h) = (self.layout.canvas.width, self.layout.canvas.height);
+            let mut stores = std::collections::HashMap::new();
+            stores.insert(PLAYER.to_owned(), Arc::clone(&self.store));
+            let card = multiview_engine::slate::failover_slate_image(
+                multiview_engine::slate::FailoverSlate::NoSignal,
+                w,
+                h,
+                CanvasColor::default(),
+            )
+            .unwrap();
+            let drive = CompositorDrive::new(
+                Arc::new(self.layout.clone()),
+                stores,
+                card,
+                CanvasColor::default(),
+                LinearRgba::TRANSPARENT,
+            )
+            .unwrap();
+            let mut clock = OutputClock::new(self.cadence).unwrap();
+            clock.skip_to(first);
+            (0..count)
+                .map(|_| {
+                    let tick = clock.tick();
+                    self.clock.set(1_000_000_000 + tick.pts.as_nanos());
+                    let frame = drive.compose(tick).expect("a valid frame every tick");
+                    assert_eq!(frame.tick, tick);
+                    assert_eq!(frame.canvas.width(), w);
+                    assert_eq!(frame.canvas.height(), h);
+                    let centre = usize::try_from(h / 2 * w + w / 2).unwrap();
+                    (tick, frame.canvas.y_plane()[centre])
+                })
+                .collect()
+        }
+
+        fn first_tick_after_anchor(&self) -> u64 {
+            let anchor = self.handle.control_bus.load().start_anchor.unwrap();
+            let t = (0_i64..)
+                .find(|i| MediaTime::from_tick(*i, self.cadence) >= anchor)
+                .unwrap();
+            u64::try_from(t).unwrap()
+        }
+
+        fn shutdown(mut self) -> Option<[Option<crate::player::StagedClip>; 3]> {
+            self.audio_stop.store(true, Ordering::Release);
+            self.audio_worker.take().unwrap().join().unwrap();
+            self.stop.store(true, Ordering::Release);
+            self.worker.take().unwrap().join().unwrap()
+        }
+    }
+
+    fn center(store: &TileStore<Nv12Image>, at: MediaTime) -> u8 {
+        use multiview_framestore::tile::TileRead;
+        match store.read_at(at) {
+            TileRead::Fresh { frame } | TileRead::Held { frame, .. } => {
+                let (w, h) = (frame.width(), frame.height());
+                frame.y_plane()[usize::try_from(h / 2 * w + w / 2).unwrap()]
+            }
+            _ => 0,
+        }
+    }
+
+    /// #1/#10: the worker is parked deterministically BEFORE its actual native
+    /// seek/flush after A committed. The real output clock + compositor keeps
+    /// emitting exactly N valid, tick-derived frames holding A. No success is
+    /// inferred from wall time: the worker is proven still blocked afterwards.
+    #[test]
+    fn output_clock_emits_exact_ticks_while_player_worker_is_blocked_before_native_seek() {
+        let _budget = crate::player::budget_test_guard();
+        let dir = tempfile::tempdir().unwrap();
+        let a = clip(dir.path(), "a.mov", 30, Some(0.25));
+        let rig = Rig::start(&plain_config(), None).unwrap();
+        rig.runtime
+            .opener
+            .request(ClipSpec::new(&a, LoadThen::Cue))
+            .unwrap();
+        wait("A committed", &|| {
+            rig.handle.control_bus.load().clip_epoch.0 >= 1
+                && rig.runtime.native.load().is_some()
+                && rig.runtime.audio_commit.ready_for_commit()
+        });
+        let first = rig.first_tick_after_anchor();
+        let anchor = rig.handle.control_bus.load().start_anchor.unwrap();
+        let a_center = center(&rig.store, anchor);
+        let na_center = rig.runtime.na_image.y_plane()[usize::try_from(
+            rig.runtime.na_image.height() / 2 * rig.runtime.na_image.width()
+                + rig.runtime.na_image.width() / 2,
+        )
+        .unwrap()];
+        assert_ne!(a_center, na_center, "A must be distinguishable from NA");
+
+        // Arm the per-runtime barrier, then ask the REAL worker to seek.
+        let gate = seek_barrier::arm(&rig.runtime);
+        rig.handle.mailbox.submit(TransportVerb::Seek { frame: 3 });
+        gate.wait_entered();
+        assert!(gate.blocked());
+
+        // Output clock + compositor while the worker cannot make progress.
+        const N: u64 = 120;
+        let frames = rig.drive(first, N);
+        assert!(gate.blocked(), "worker stayed blocked for every tick");
+        assert_eq!(frames.len(), 120);
+        for (i, (tick, luma)) in frames.iter().enumerate() {
+            let i = u64::try_from(i).unwrap();
+            assert_eq!(tick.index, first + i);
+            assert_eq!(
+                tick.pts,
+                MediaTime::from_tick(i64::try_from(first + i).unwrap(), rig.cadence)
+            );
+            assert_eq!(*luma, a_center, "tick {i} must hold committed A, not NA");
+        }
+
+        // Release: the actual native seek/flush then proceeds and the worker lives.
+        gate.release();
+        gate.wait_passed();
+        assert!(
+            rig.runtime.status.load().fault.is_none(),
+            "seek completed without fault"
+        );
+        let more = rig.drive(first + N, 5);
+        assert_eq!(more.len(), 5);
+        assert!(
+            rig.shutdown().is_none(),
+            "clean handoff after barrier release"
+        );
+    }
+
+    /// 10k load requests against the actual opener + worker while the output
+    /// clock runs: staging/retirement stay bounded, the clock is exact, and the
+    /// last-committed picture is a legitimate clip frame (never NA).
+    #[test]
+    fn load_storm_through_real_opener_stays_bounded_and_clock_exact() {
+        let _budget = crate::player::budget_test_guard();
+        let dir = tempfile::tempdir().unwrap();
+        let a = clip(dir.path(), "a.mov", 30, None);
+        let b = clip(dir.path(), "b.mov", 140, None);
+        let rig = Rig::start(&plain_config(), None).unwrap();
+        rig.runtime
+            .opener
+            .request(ClipSpec::new(&a, LoadThen::Cue))
+            .unwrap();
+        wait("A committed", &|| {
+            rig.handle.control_bus.load().clip_epoch.0 >= 1
+        });
+        let first = rig.first_tick_after_anchor();
+        let mut last = rig
+            .runtime
+            .opener
+            .request(ClipSpec::new(&a, LoadThen::Cue))
+            .unwrap();
+        for i in 0..10_000u32 {
+            let path = if i % 2 == 0 { &a } else { &b };
+            last = rig
+                .runtime
+                .opener
+                .request(ClipSpec::new(path, LoadThen::Cue))
+                .unwrap();
+            if i % 500 == 0 {
+                assert!(
+                    rig.runtime.coordinator.retired_len() <= 2,
+                    "retirement bound"
+                );
+                let f = rig.drive(first + u64::from(i), 2);
+                assert_eq!(f[1].0.index, f[0].0.index + 1);
+            }
+        }
+        assert_eq!(rig.runtime.coordinator.latest(), last);
+        wait("storm settled", &|| {
+            rig.runtime.opener.status().finished >= last
+        });
+        assert!(rig.runtime.coordinator.retired_len() <= 2);
+        let frames = rig.drive(first + 20_000, 50);
+        assert!(frames.iter().all(|(_, l)| *l != 0));
+        assert!(rig.shutdown().is_none());
+    }
+
+    /// A native panic after commit is contained: the clock/compositor is unaffected
+    /// while the worker dies, owners transfer to the opener (no bundle returned).
+    #[test]
+    fn worker_panic_after_commit_isolated_from_output_clock() {
+        let _budget = crate::player::budget_test_guard();
+        let dir = tempfile::tempdir().unwrap();
+        let a = clip(dir.path(), "a.mov", 30, None);
+        let rig = Rig::start(&plain_config(), None).unwrap();
+        rig.runtime
+            .panic_after_commit
+            .store(true, Ordering::Release);
+        rig.runtime
+            .opener
+            .request(ClipSpec::new(&a, LoadThen::Cue))
+            .unwrap();
+        wait("worker panicked and handed off", &|| {
+            rig.worker.as_ref().unwrap().is_finished()
+        });
+        let anchor = rig.handle.control_bus.load().start_anchor.unwrap();
+        let first = (0_i64..)
+            .find(|i| MediaTime::from_tick(*i, rig.cadence) >= anchor)
+            .map(|t| u64::try_from(t).unwrap())
+            .unwrap();
+        let frames = rig.drive(first, 60);
+        for (i, (tick, _)) in frames.iter().enumerate() {
+            assert_eq!(tick.index, first + u64::try_from(i).unwrap());
+        }
+        assert!(
+            crate::player::runtime_provider().is_registered(PLAYER) == false,
+            "panicked worker unregistered its runtime"
+        );
+        drop(rig.shutdown());
+    }
+
+    /// A stuck opener (peer accepts and never answers HTTP) cannot stall the
+    /// output clock, and a newer load cancels it via the owned interrupt token.
+    #[test]
+    fn stuck_http_opener_never_stalls_clock_and_newer_load_cancels_it() {
+        let _budget = crate::player::budget_test_guard();
+        let dir = tempfile::tempdir().unwrap();
+        let a = clip(dir.path(), "a.mov", 30, None);
+        let listener = std::net::TcpListener::bind("[::1]:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let silent = std::thread::spawn(move || {
+            let mut held = Vec::new();
+            listener.set_nonblocking(false).unwrap();
+            while let Ok((s, _)) = listener.accept() {
+                held.push(s);
+                if held.len() >= 4 {
+                    break;
+                }
+            }
+            std::thread::sleep(Duration::from_secs(8));
+        });
+        let rig = Rig::start(&plain_config(), None).unwrap();
+        let g = rig
+            .runtime
+            .opener
+            .request(ClipSpec::new(
+                format!("http://[::1]:{port}/x.mov"),
+                LoadThen::Cue,
+            ))
+            .unwrap();
+        wait("opener entered the stuck open", &|| {
+            rig.runtime.opener.status().open_in_progress == g
+        });
+        let frames = rig.drive(0, 100);
+        assert_eq!(frames.len(), 100);
+        assert_eq!(
+            rig.runtime.opener.status().open_in_progress,
+            g,
+            "still stuck, clock exact"
+        );
+        let t0 = Instant::now();
+        rig.runtime
+            .opener
+            .request(ClipSpec::new(&a, LoadThen::Cue))
+            .unwrap();
+        wait("A committed after cancelling stuck open", &|| {
+            rig.handle.control_bus.load().clip_epoch.0 >= 1
+        });
+        assert!(
+            t0.elapsed() < Duration::from_secs(4),
+            "cancel beat the 5 s open deadline"
+        );
+        drop(rig.shutdown());
+        drop(silent);
+    }
+
+    /// The boot sentinel geometry (0,1) is legitimate; the REAL geometry comes from
+    /// the probed default asset and is carried by the native acknowledgement.
+    #[test]
+    fn default_asset_probe_adopts_real_geometry() {
+        let _budget = crate::player::budget_test_guard();
+        let dir = tempfile::tempdir().unwrap();
+        clip(dir.path(), "d.mov", 90, Some(0.25));
+        let doc = config_doc(
+            &format!("[media_library]\nroot = \"{}\"", dir.path().display()),
+            "[[media_library.assets]]\nid = \"dflt\"\nkind = \"clip\"\npath = \"d.mov\"\n",
+            true,
+        );
+        let config = MultiviewConfig::load_from_toml(&doc).unwrap();
+        let rig = Rig::start(&config, None).unwrap();
+        assert_eq!(rig.handle.geometry.out_point(), 1, "sentinel until probed");
+        wait("default adopted", &|| rig.runtime.native.load().is_some());
+        let ack = rig.runtime.native.load().clone().unwrap();
+        assert_eq!(ack.duration_frames, Some(25));
+        assert_eq!((ack.cadence_num, ack.cadence_den), (25, 1));
+        assert_eq!((ack.width, ack.height), (64, 48));
+        assert!(ack.has_audio);
+        assert_eq!(ack.source_id, "dflt");
+        assert_eq!(ack.duration_ns, Some(1_000_000_000));
+        let anchor = rig.handle.control_bus.load().start_anchor.unwrap();
+        assert!(center(&rig.store, anchor) > 0, "first primed image adopted");
+        assert!(rig.shutdown().is_none());
+    }
+
+    /// Killed-child flock recovery on the CURRENT code path: a child process
+    /// journals a detach intent then parks at the precommit hook; the parent
+    /// proves the live owner excludes a second boot, SIGKILLs it, then recovers
+    /// the pending detach and requires fresh opener+audio quiescence to retire.
+    #[test]
+    fn killed_child_flock_recovery_requires_boot_quiescence() {
+        use crate::player::{DetachAck, DetachRequest, Generation};
+        let _budget = crate::player::budget_test_guard();
+        let child_root = std::env::var_os("MULTIVIEW_TEST_RECOVERY_CHILD");
+        let is_child = child_root.is_some();
+        let tmp = child_root.is_none().then(|| tempfile::tempdir().unwrap());
+        let directory = child_root
+            .map(PathBuf::from)
+            .unwrap_or_else(|| tmp.as_ref().unwrap().path().to_owned());
+        let state = directory.join("state");
+        let marker = directory.join("precommit");
+        let config = plain_config();
+        let request = DetachRequest {
+            operation: 701,
+            expected: Generation(1),
+        };
+        if !is_child {
+            clip(&directory, "fixture.mov", 30, Some(0.25));
+            let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "pipeline::player_adoption_chaos_tests::killed_child_flock_recovery_requires_boot_quiescence",
+                    "--nocapture",
+                ])
+                .env("MULTIVIEW_TEST_RECOVERY_CHILD", &directory)
+                .env("MULTIVIEW_TEST_CRASH_AT_DETACH_PRECOMMIT", &marker)
+                .spawn()
+                .unwrap();
+            let deadline = Instant::now() + Duration::from_secs(40);
+            while !marker.exists() {
+                if child.try_wait().unwrap().is_some() || Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    panic!("child failed to reach durable precommit");
+                }
+                std::thread::yield_now();
+            }
+            assert!(
+                Rig::start(&config, Some(&state)).is_none(),
+                "live process still owns the journal flock"
+            );
+            child.kill().unwrap();
+            assert!(!child.wait().unwrap().success());
+        }
+        let rig = Rig::start(&config, Some(&state)).expect("boot after owner exit");
+        if is_child {
+            let mut spec = ClipSpec::new(directory.join("fixture.mov"), LoadThen::Cue);
+            spec.reference = Some(SlotReference::Asset { id: "a".into() });
+            rig.runtime.opener.request(spec).unwrap();
+            wait("child committed", &|| {
+                rig.runtime.binding.load().reference.is_some()
+            });
+            wait("audio ready", &|| {
+                rig.runtime.audio_commit.ready_for_commit()
+            });
+            rig.runtime.detach.submit(request).unwrap();
+            loop {
+                std::thread::park();
+            }
+        }
+        let ticket = rig.runtime.detach.submit(request).unwrap();
+        assert_eq!(ticket.acknowledgement(), None, "no pre-quiescence proof");
+        wait("recovered detach retired", &|| {
+            ticket.acknowledgement().is_some()
+        });
+        let retired = rig.runtime.binding.load().generation;
+        assert_eq!(ticket.acknowledgement(), Some(DetachAck::Retired(retired)));
+        assert!(rig.runtime.coordinator.is_quiescent(retired));
+        assert!(rig.runtime.audio_commit.retirement_complete(retired));
+        drop(rig.shutdown());
     }
 }
