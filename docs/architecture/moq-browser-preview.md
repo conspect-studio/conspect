@@ -1,6 +1,6 @@
 # MoQ-first browser preview — implementation design
 
-Status: proposed; not production-wired. This document describes the acceptance contract, not existing support.
+Status: production-wired on main through shared encoded output windows and authenticated HTTP leases; live host activation is tracked in issue #241. The sections below preserve the original acceptance design, including unresolved Cloudflare and ABR requirements. A Program MoQ monitor selects one explicitly configured already-open production output via `MULTIVIEW_MOQ_PROGRAM_OUTPUT`, without a second encoder; the selected output still undergoes whole-Program authorization. The browser decodes the production H.264 track `video` with WebCodecs over QUIC; it does not treat the HEVC SRT output as a second rendition. The lease advertises a nonadaptive single rendition. The live readiness flag requires the selected output's decoder-ready metadata.
 
 ## Goal and ownership
 

@@ -104,6 +104,11 @@ describe('MoQ playback lease ownership', () => {
    expect(observed.mock.calls.at(-1)?.[0].presentedFrames).toBe(0);
    mocks.signals?.frame.set({ timestamp: 1000, displayWidth: 320, displayHeight: 180 });
    await vi.advanceTimersByTimeAsync(0);
+   expect(options.canvas.dataset.effectiveTransport).toBe('moq-webtransport');
+   expect(options.canvas.dataset.moqFrames).toBe('1');
+   expect(options.canvas.dataset.moqWidth).toBe('320');
+   expect(options.canvas.dataset.moqHeight).toBe('180');
+   await vi.advanceTimersByTimeAsync(0);
    mocks.signals?.frame.set(undefined);
    await vi.advanceTimersByTimeAsync(0);
    mocks.signals?.frame.set({ timestamp: 1000, displayWidth: 320, displayHeight: 180 });

@@ -292,12 +292,23 @@ impl DynamicRegistryFactory {
         let factory = self.0.load();
         let snapshot = factory.as_ref();
         let factory = snapshot.as_ref().ok_or(MoqReject::Unavailable)?;
-        RegistryFeedFactory::from_subscriptions((***factory).clone())
+        let mut feed = RegistryFeedFactory::from_subscriptions((***factory).clone())?;
+        feed.program_output = std::env::var("MULTIVIEW_MOQ_PROGRAM_OUTPUT").ok();
+        Ok(feed)
     }
 }
 impl AuthorizedFeedFactory for DynamicRegistryFactory {
     fn available(&self) -> bool {
-        self.current().is_ok()
+        self.current().is_ok_and(|factory| {
+            factory
+                .output_scope(&WhepScope::Program)
+                .is_ok_and(|scope| {
+                    factory
+                        .subscriptions
+                        .resolve(&scope)
+                        .is_ok_and(|binding| factory.prepared.contains_key(&binding.output_id))
+                })
+        })
     }
     fn attach(
         &self,
@@ -327,6 +338,9 @@ pub(crate) struct RegistryFeedFactory {
     /// `video`/`audio` fields stay the resolved rendition for back-compat).
     renditions: Vec<LadderRendition>,
     ready: Arc<AtomicBool>,
+    /// Explicit production rendition used by the Program monitor. Never guess
+    /// one from output order or open a second encoder for this scope.
+    program_output: Option<String>,
 }
 
 impl RegistryFeedFactory {
@@ -405,6 +419,7 @@ impl RegistryFeedFactory {
                 ladder,
                 renditions,
                 ready: Arc::new(AtomicBool::new(true)),
+                program_output: None,
             },
         ))
     }
@@ -422,12 +437,21 @@ impl RegistryFeedFactory {
         let mut ladder = Vec::new();
         let mut renditions = Vec::new();
         for binding in effective.iter() {
-            let audio = binding
+            let audio = match binding
                 .audio
                 .iter()
                 .map(factory_audio)
-                .collect::<Result<Vec<_>, _>>()?;
-            let metadata = metadata::prepare(&factory_video(&binding.video)?, &audio)?;
+                .collect::<Result<Vec<_>, _>>()
+            {
+                Ok(audio) => audio,
+                Err(_) => continue,
+            };
+            let metadata = match factory_video(&binding.video)
+                .and_then(|video| metadata::prepare(&video, &audio))
+            {
+                Ok(metadata) => metadata,
+                Err(_) => continue,
+            };
             renditions.push(LadderRendition {
                 track: binding.output_id.clone(),
                 codec: metadata.video.codec.clone(),
@@ -455,7 +479,31 @@ impl RegistryFeedFactory {
             ladder,
             renditions,
             ready: Arc::new(AtomicBool::new(true)),
+            program_output: None,
         })
+    }
+
+    /// Resolve Program through an explicitly configured, already-opened output.
+    /// The selected scope remains Program for authorization; only the registry
+    /// subscription uses its effective output identity.
+    fn output_scope(&self, scope: &WhepScope) -> Result<WhepScope, MoqReject> {
+        match scope {
+            WhepScope::Program => {
+                let id = self.program_output.as_ref().ok_or(MoqReject::Unavailable)?;
+                let binding = self
+                    .subscriptions
+                    .resolve(&WhepScope::Output(id.clone()))
+                    .map_err(refusal)?;
+                if binding.program_id != multiview_config::MAIN_PROGRAM
+                    || binding.bus_id != multiview_config::MAIN_PROGRAM
+                {
+                    return Err(MoqReject::Unavailable);
+                }
+                Ok(WhepScope::Output(id.clone()))
+            }
+            WhepScope::Output(id) => Ok(WhepScope::Output(id.clone())),
+            _ => Err(MoqReject::Unavailable),
+        }
     }
 
     /// Start the one outgoing publisher from this canonical registry snapshot.
@@ -590,7 +638,10 @@ impl AuthorizedFeedFactory for RegistryFeedFactory {
         scope: &WhepScope,
         sink: Arc<Fence>,
     ) -> Result<Option<AuthorizedSharedFeed>, MoqReject> {
-        let selected = self.subscriptions.resolve(scope).map_err(refusal)?;
+        let selected = self
+            .subscriptions
+            .resolve(&self.output_scope(scope)?)
+            .map_err(refusal)?;
         let admitted = self.subscriptions.admitted();
         let mut family = admitted
             .iter()
@@ -601,6 +652,11 @@ impl AuthorizedFeedFactory for RegistryFeedFactory {
             })
             .cloned()
             .collect::<Vec<_>>();
+        if matches!(scope, WhepScope::Program) {
+            // A distinct HEVC SRT output is not a second H.264 Program quality.
+            // Keep only actual opened renditions of the selected codec.
+            family.retain(|binding| binding.video.codec_id == selected.video.codec_id);
+        }
         if family.len() < 2 {
             return Ok(None);
         }
@@ -707,7 +763,8 @@ impl AuthorizedFeedFactory for RegistryFeedFactory {
         }
         // 1. Resolve the effective immutable binding. This allocates no peer
         //    slot, acquires no source demand and opens no codec.
-        let binding = self.subscriptions.resolve(scope).map_err(refusal)?;
+        let output_scope = self.output_scope(scope)?;
+        let binding = self.subscriptions.resolve(&output_scope).map_err(refusal)?;
         let prepared = self
             .prepared
             .get(&binding.output_id)
@@ -742,7 +799,7 @@ impl AuthorizedFeedFactory for RegistryFeedFactory {
         //    instant it fences the transport.
         let subscription = self
             .subscriptions
-            .subscribe_with_revocation(scope, binding.config_generation, revocation.flag())
+            .subscribe_with_revocation(&output_scope, binding.config_generation, revocation.flag())
             .map_err(refusal)?;
         // 4. One off-clock worker per subscription, never on the output clock.
         let handle = subscription.revoke_handle();
@@ -1529,6 +1586,40 @@ mod tests {
             std::thread::sleep(Duration::from_millis(5));
         }
         predicate()
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn program_reuses_only_explicit_opened_output_with_program_authorization() {
+        let mut existing = binding("h264-program", 0, GENERATION, 1280, 720);
+        existing.bus_id = multiview_config::MAIN_PROGRAM.to_owned();
+        existing.program_id = multiview_config::MAIN_PROGRAM.to_owned();
+        let registry = FeedRegistry::new(&[existing]).unwrap();
+        let mut factory =
+            RegistryFeedFactory::from_subscriptions(registry.factory.subscriptions.clone())
+                .unwrap();
+        let (sink, _windows) = Fence::channel(4);
+        assert!(matches!(
+            factory.attach(&global(), &WhepScope::Program, sink.clone()),
+            Err(MoqReject::Unavailable)
+        ));
+        factory.program_output = Some("missing".into());
+        assert!(matches!(
+            factory.attach(&global(), &WhepScope::Program, sink.clone()),
+            Err(MoqReject::Unavailable)
+        ));
+        factory.program_output = Some("h264-program".into());
+        let scoped = operator(
+            Some(vec!["camera-a".into()]),
+            Some(vec!["h264-program".into()]),
+        );
+        assert!(matches!(
+            factory.attach(&scoped, &WhepScope::Program, sink.clone()),
+            Err(MoqReject::Forbidden)
+        ));
+        let authorized = factory
+            .attach(&global(), &WhepScope::Program, sink)
+            .expect("reuse existing encoded stream");
+        assert_eq!(authorized.generation, GENERATION);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

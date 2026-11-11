@@ -36,7 +36,7 @@ function PreviewMonitor({ program, source, fresh }: { readonly program: boolean;
   const pvw = pvwStill.url;
   const pvwUnavailable = !program && pvwStill.state === 'unavailable';
   const [diagHost, setDiagHost] = useState<HTMLDivElement | null>(null);
-  const still = program ? !whepAvailable(caps.data, 'program') : pvw !== undefined;
+  const still = program ? !caps.data?.moq && !whepAvailable(caps.data, 'program') : pvw !== undefined;
   return <figure className={`bd-monitor ${program ? 'bd-pgm' : 'bd-pvw'}`} data-tally={fresh && source ? (program ? 'program' : 'preview') : 'unknown'}>
     <div className="bd-picture">{program ? <PreviewSurface scope="program" whepEndpoint="/api/v1/preview/program/whep" jpegPath="/api/v1/preview/program.jpg" label={t`Program monitor`} capabilities={caps.data} className="bd-video" diagnosticsHost={diagHost} /> : pvwUnavailable ? <span role="status" data-testid="preview-unavailable"><Trans>Preview unavailable — switcher backend not deployed</Trans></span> : pvw ? <div className="bd-jpeg"><img src={pvw} alt={t`Preview monitor`} />{pvwStill.state === 'stale' ? <em className="bd-stale" data-testid="preview-stale"><Trans>Stale</Trans></em> : null}</div> : <span><Trans>Waiting for a frame…</Trans></span>}</div>
     {program ? <div className="bd-diag-slot" ref={setDiagHost} data-testid="desk-fallback-slot" /> : null}
