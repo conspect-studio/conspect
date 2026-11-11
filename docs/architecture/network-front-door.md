@@ -185,17 +185,22 @@ them apart per connection, after the h3 SETTINGS exchange: an extended CONNECT w
 becomes a MoQ session (`moq-net` accepts any `web_transport_trait::Session`); every other request
 goes to the same axum `Router` that serves HTTP/1.1, through a small `h3` -> `http::Request` adapter.
 
-Pooled connections (one connection carrying page requests and one or more WebTransport sessions,
+Pooled connections (one connection carrying page requests and WebTransport sessions,
 draft-ietf-webtrans-http3 sections 1 and 2.2) must still be handled correctly, because a browser
-may pool when it is allowed to. `h3-webtransport 0.1.2` takes the whole `h3::server::Connection`
-by value when a session is accepted (`server.rs`, `WebTransportSession::accept`), and the session's
-`accept_bi` returns further page requests as `AcceptedBi::Request`. The front door's connection
-driver therefore keeps accepting on the session object and dispatches each `AcceptedBi::Request` to
-the router and each new CONNECT to MoQ, so page requests and several sessions coexist on one
-connection. The spike did **not** prove this: its driver returned on the first CONNECT (review
-finding), and Chrome's page load and WebTransport sessions used separate connections. Slice 2's
-acceptance includes concurrent GET + two WebTransport sessions on one connection, driven by a
-native client that pools, with per-session teardown leaving the connection and the other session up.
+may pool when it is allowed to. `h3-webtransport 0.1.2` takes the whole `h3::server::Connection` by
+value when a session is accepted (`server.rs`, `WebTransportSession::accept`) and keeps it inside
+that session, so a second independent session on the same connection cannot be built with its API
+(review finding). The front door therefore advertises **one WebTransport session per connection**
+(`max_webtransport_sessions(1)`; the WebTransport max-sessions setting tells a pooling client to open
+another connection for the next session). On a connection that carries a session, the driver keeps
+accepting through the session's `accept_bi`: `AcceptedBi::Request` page requests go to the router,
+and any further extended CONNECT is answered `429` with the stream closed, never left hanging.
+Several sessions per connection would need a connection-wide session manager (a fork or an upstream
+change to h3-webtransport); that is not designed here because no fallback-matrix row needs it. The
+spike did **not** prove the pooled case: its driver returned on the first CONNECT, and Chrome's page
+load and WebTransport session used separate connections. Slice 2's acceptance: a native client that
+pools sends GETs before, during and after one WebTransport session on one connection; a second
+CONNECT on it gets `429`; closing the session leaves the connection serving GETs.
 
 The vendored `web-transport-moq` cannot serve the site on that endpoint. Its `Server::accept` treats
 the first bidirectional stream as a CONNECT and errors on anything else
@@ -212,8 +217,7 @@ session then needs a `web_transport_trait::Session` implementation over
 h3 server settings, explicit (h3 0.0.8 defaults are all off or unbounded, `config.rs`):
 `enable_extended_connect(true)` (SETTINGS_ENABLE_CONNECT_PROTOCOL, RFC 9220 section 3),
 `enable_datagram(true)` (H3_DATAGRAM, RFC 9297 section 2.1.1, plus the QUIC `max_datagram_frame_size`
-transport parameter, RFC 9221), `enable_webtransport(true)`, `max_webtransport_sessions(N)` with
-N = the per-connection MoQ session cap (4), and `max_field_section_size(16384)` because the default
+transport parameter, RFC 9221), `enable_webtransport(true)`, `max_webtransport_sessions(1)` (above), and `max_field_section_size(16384)` because the default
 is `VarInt::MAX` and the QPACK decoder allocates each field before checking the total. A test sends
 an oversized header block and expects a stream error, not an allocation.
 
@@ -456,7 +460,9 @@ own WebRTC endpoint, in process, and is never a general relay:
   (WHEP session id). CreatePermission and ChannelBind for any peer except that lease's server
   candidates is rejected with 403. The allocation dies with the lease.
 * Quotas: one allocation per lease, at most 4 per source IP, global cap equal to
-  `webrtc.max_sessions` (default 64), lifetime 600 s maximum (RFC 8656 default), refresh required.
+  `webrtc.max_sessions` (default 64). Allocation lifetime is the lease's remaining lifetime, capped
+  at 600 s (RFC 8656 default); a Refresh extends it only while the lease is live, and a lease
+  refresh is what makes a longer allocation possible.
 * ICE servers handed to the browser: the WHEP lease response carries
   `iceServers: [{urls: "turns:turn.<host>:443?transport=tcp", username, credential}]` only when
   slice 8 is enabled. `WhepPlayer` already accepts an `rtcConfig` (`web/src/preview/WhepPlayer.tsx:108`).
@@ -706,8 +712,10 @@ How the UI skips a dead rung fast:
    15 minutes; after that, or when the realtime channel pushes a capability change, the next
    picture tries MoQ again. (A viewer's own network can block UDP while the server's is fine, so a
    server-side `reachable` alone does not clear it.)
-5. Every row below assumes the ladder's last rung: if MoQ and WebRTC both fail, the surface shows
-   stills with a caption naming the reason. No row ends at "no picture".
+5. Every row for a front door in `serving` with a valid certificate assumes the ladder's last rung:
+   if MoQ and WebRTC both fail, the surface shows stills with a caption naming the reason; none of
+   those rows ends at "no picture". The `setup` and expired-certificate rows are the deliberate
+   exceptions: there the site itself is not usable and recovery is by the operator.
 
 ## 13. Invariants
 
@@ -737,9 +745,9 @@ How the UI skips a dead rung fast:
 | --- | --- | --- |
 | Demux unit | every first byte 0-255 has exactly one class; 64-79 depends only on the TURN-server set | `multiview-frontdoor` unit test (spike version: `every_first_byte_has_exactly_one_class`) |
 | Demux property | random datagrams never reach noq as a new connection unless they are valid Initials; never reach str0m unless STUN/DTLS/RTP | proptest |
-| Fuzz | `cargo fuzz` targets: UDP classifier + str0m `Receive::new`; TCP first-byte + RFC 4571 deframer; TURN server request parser (slice 8) | `fuzz/` (nightly job, not the PR gate) |
+| Fuzz | `cargo fuzz` targets: UDP classifier + str0m `Receive::new`; TCP first-byte + RFC 4571 deframer; TURN server request parser (slice 8); the vendored h3 adapter and h3 request path (slice 2) | `fuzz/` (nightly job, not the PR gate) |
 | Integration, unprivileged | the front door on `[::1]:0` (TCP and UDP): h3 GET via a native h3 client, WebTransport MoQ subscribe via `web-transport-moq`, str0m-to-str0m WebRTC over UDP and over ICE-TCP, TLS h1 on the same TCP port | `cargo test -p multiview-frontdoor`; the existing str0m loopback harness in `multiview-webrtc` |
-| Browser, CI | headless Chrome on loopback: S3/S8 above as a test (WT + DC + h3); a native pooling client sends GET + two WT sessions on one connection | web e2e job (puppeteer-core is already used by lead probes) |
+| Browser, CI | headless Chrome on loopback: S3/S8 above as a test (WT + DC + h3); a native pooling client sends GETs around one WT session on one connection; a second CONNECT gets 429 | web e2e job (puppeteer-core is already used by lead probes) |
 | Flood/chaos (#1, #10) | S5 floods from one source, from many spoofed sources and from rotating IPv6 /64s (garbage, Initial, unsupported-version Initial, short header with well-formed CIDs, STUN, RTP, ICE-TCP SYN flood, slowloris on TCP 443, half-open TLS, TURN Allocate flood) against a running engine with a live output: assert 0 "ticks behind", output PTS delta constant (`ffprobe`), an established WebRTC viewer keeps >= 95% of frames, RSS bounded | `crates/multiview-engine/tests/` chaos suite + a scripted soak |
 | Soak | 24 h with 50 viewers mixed MoQ/WebRTC-UDP/WebRTC-TCP and a 10-minute flood every hour | mda001-class host, after slice 3 |
 | Network matrix, office | from mst001 desktop Chrome, Safari and Firefox: (a) normal; (b) block UDP except 443 (pf rule); (c) block all UDP; (d) through a CONNECT proxy; (e) through a TLS-only proxy; (f) through a TLS-intercepting proxy (mitmproxy). Record rung and time-to-picture per row | `lead/officeprobe.sh` + `ladderprobe-remote.mjs`; `lead/quicvn.py` for raw QUIC reachability |
@@ -752,7 +760,7 @@ How the UI skips a dead rung fast:
 | 2 | HTTP/3 for the site: vendored h3 adapter (`multiview-h3`), h3 request -> axum adapter, MoQ moved to h3-webtransport sessions on the same endpoint; Alt-Svc gated on reachability | R3 | `multiview-h3`, `multiview-frontdoor`, `multiview-control`, `multiview-moq` | office Chrome loads the UI with `nextHopProtocol=h3`; MoQ works on the same connection; site still works over h1 when UDP is blocked |
 | 3 | Flood hardening and soak: per-source buckets, Retry policy, rcvbuf sizing and clamp warning, optional SO_REUSEPORT steering, nftables runbook, the chaos suite | R3 | `multiview-frontdoor`, `multiview-engine` tests, runbook | chaos suite green incl. multi-source and IPv6 /64-rotating floods; 24 h soak 0 ticks behind with 50 legitimate viewers (MoQ, WebRTC-UDP, WebRTC-TCP) plus a 10-minute flood each hour; established viewer >= 95% frames under a 600k pps spoofed flood **with validated-flow steering on**; legitimate aggregate of at least 200k datagrams/s sustained with 0 kernel drops. Gate for opening public UDP 443 |
 | 4 | Engine TCP 443 listener: rustls with the first-byte demux, ICE-TCP passive candidates (RFC 4571 deframer to str0m), TCP 80 redirect, `behind_proxy` mode with PROXY v2 (fail closed). Certificate until slice 5: the existing `[control.tls] mode = "static"` files through the `CertificateSource` seam; nginx stays on mda001 until slice 5 issues by ACME | R3 | `multiview-frontdoor`, `multiview-control`, `multiview-webrtc`, `multiview-config` | office Chrome with all UDP blocked plays WebRTC over TCP 443; Firefox too; Safari result recorded; nginx no longer needed on mda001 |
-| 5 | ACME certificates for the front door (re-cut #167-#172): `CertificateSource` seam, setup/serving states, bootstrap certificate, setup authentication, instant-acme engine with Let's Encrypt, Google (EAB) and custom (trust anchor) profiles, DNS-01 Cloudflare (token and global key) and TLS-ALPN-01, ARI renewal, CLI `tls status`/`setup-code`/`set-credential`, Pebble CI job, runbook. Slice 1 keeps the stopgap certificate on mda001 until this lands | R3 | `multiview-frontdoor`, `multiview-control` (`acme/`), `multiview-config`, `multiview-cli`, CI, runbook | fresh mda001-class host: `setup` page reachable only with the setup code; DNS-01 via Cloudflare token issues from Let's Encrypt staging and production and swaps to `serving` with no restart; Pebble job green for both challenges, EAB and a private root; output ticks throughout |
+| 5 | ACME certificates for the front door (re-cut #167-#172): `CertificateSource` seam, setup/serving states, bootstrap certificate, setup authentication, instant-acme engine with Let's Encrypt, Google (EAB) and custom (trust anchor) profiles, DNS-01 Cloudflare (token and global key) and TLS-ALPN-01, ARI renewal, CLI `tls status`/`setup-code`/`set-credential`, Pebble CI job, runbook. Until this lands, the static certificate path named in slice 4 (and the MoQ certificate files) keeps serving, so slices 1-4 are not blocked | R3 | `multiview-frontdoor`, `multiview-control` (`acme/`), `multiview-config`, `multiview-cli`, CI, runbook | fresh mda001-class host: `setup` page reachable only with the setup code; DNS-01 via Cloudflare token issues from Let's Encrypt staging and production and swaps to `serving` with no restart; Pebble job green for both challenges, EAB and a private root; output ticks throughout |
 | 6 | HLS and static serving without nginx: zero-copy segment body, Range/206, cache headers, embedded UI by default; mda001 cutover runbook (nginx removed, systemd socket activation) | R2 | `multiview-control`, `deploy/`, runbook | segment TTFB within 2 ms of nginx's; mda001 serves TCP 443/80 and UDP 443 from the engine |
 | 7 | HTTP/2 on TCP 443 with an h2 floor (max streams, header-list size, PING timeout, first-HEADERS deadline) | R2 | `multiview-control` | h2 slowloris test drops at the deadline; ALPN `h2` negotiated |
 | 8 | Built-in TURN-over-TLS (SNI `turn.<host>`), lease-bound REST credentials, in-process relay, ICE server list in the WHEP lease | R3 | `multiview-webrtc` (server role on `turn/message.rs`), `multiview-frontdoor`, `multiview-control`, `web/` | office Chrome through a TLS-only proxy plays WebRTC; no allocation without a lease; open-relay test (CreatePermission to a third-party address) gets 403 |

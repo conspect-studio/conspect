@@ -73,10 +73,12 @@ B. **HTTP/3 for the site: the engine terminates TLS (shape 1).** One QUIC endpoi
 same ACME certificate as TCP) serves both the site/API and MoQ. Browsers do not pool WebTransport
 with page requests by default (Chromium `allow_pooling = false`; the MoQ client sets
 `allowPooling: false`), so in practice MoQ and the page use separate connections to the same
-endpoint; the connection driver still serves page requests and several WebTransport sessions on one
-connection when a client pools. Per request it routes extended CONNECT `:protocol=webtransport` under
+endpoint. When a client does pool, the connection keeps serving page requests alongside one
+WebTransport session; the server advertises one session per connection and refuses a second CONNECT
+on it (h3-webtransport 0.1.2 owns the connection per session, so more would need a fork that no
+fallback row requires). Per request it routes extended CONNECT `:protocol=webtransport` under
 `/moq/` to MoQ and everything else to the existing axum router. The h3 settings are set explicitly
-(extended CONNECT, H3_DATAGRAM, WebTransport sessions, `max_field_section_size` 16 KiB; h3's
+(extended CONNECT, H3_DATAGRAM, one WebTransport session per connection, `max_field_section_size` 16 KiB; h3's
 defaults are off or unbounded). The WebTransport draft version emitted is pinned and measured per
 browser. This
 needs hyperium `h3` 0.0.8 + `h3-webtransport` 0.1.2 + `h3-datagram` 0.0.2 (MIT, pure Rust) and a noq
@@ -249,7 +251,8 @@ Chrome for Testing 149.0.7827.55, curl 8.14.1 (nghttp3), a native `web-transport
   443 waits for it.
 - Browser coverage is measured with Chrome 149 only. Firefox, Safari, ICE-TCP through proxies other
   than the test proxy, and the WebTransport draft each browser speaks are office-matrix acceptances
-  in slices 2, 4 and 8; every row of the fallback matrix ends at stills, never at no picture.
+  in slices 2, 4 and 8; every `serving` row of the fallback matrix ends at stills at worst, never at
+  no picture.
 - The ADR-W031 HTTP/1-only floor stays until slice 7.
 - Issues #167-#172 are re-cut into slice 5 (the design note lists what stands and what changes in
   each). The first TLS slice ships all three CA profiles and both challenges.
