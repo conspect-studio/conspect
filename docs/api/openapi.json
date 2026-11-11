@@ -8735,6 +8735,129 @@
         }
       }
     },
+    "/api/v1/preview/wall/whep": {
+      "post": {
+        "tags": [
+          "preview"
+        ],
+        "summary": "Open the video-only whole-system wall focus (Write + unscoped principal).",
+        "operationId": "wall_whep_open",
+        "requestBody": {
+          "description": "SDP offer",
+          "content": {
+            "application/sdp": {
+              "schema": {
+                "type": "string"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "description": "Wall focus opened; SDP answer and Location.",
+            "content": {
+              "application/sdp": {}
+            }
+          },
+          "401": {
+            "description": "Missing credentials",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Scoped or read-only principal",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "415": {
+            "description": "Unsupported codec",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Wall unavailable or focus capacity exhausted",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/preview/wall/whep/{session_id}": {
+      "delete": {
+        "tags": [
+          "preview"
+        ],
+        "summary": "Release the whole-system wall WHEP session.",
+        "operationId": "wall_whep_close",
+        "parameters": [
+          {
+            "name": "session_id",
+            "in": "path",
+            "description": "WHEP session id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Wall focus released"
+          },
+          "401": {
+            "description": "Missing credentials",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Scoped or read-only principal",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No such session",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/v1/probes": {
       "get": {
         "tags": [
@@ -20232,6 +20355,17 @@
           "program": {
             "$ref": "#/components/schemas/ScopeCapability",
             "description": "The composited program canvas scope."
+          },
+          "wall": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/ScopeCapability",
+                "description": "Whole-system composed wall; available only while its worker is ready."
+              }
+            ]
           }
         }
       },

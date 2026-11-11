@@ -12146,6 +12146,10 @@ msgstr ""
 msgid "Wall tiles are live video from one shared MoQ stream; a tile without a live cell shows its still."
 msgstr ""
 
+#: src/components/broadcast/ProductionDesk.tsx:89
+msgid "Wall tiles are live video from one shared WebRTC session; a tile without a live cell shows its still."
+msgstr ""
+
 #: src/components/broadcast/ProductionDesk.tsx:90
 msgid "Wall tiles are still previews refreshed every ~2 s — not live video."
 msgstr ""

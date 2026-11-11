@@ -1494,6 +1494,8 @@ pub fn signalling_router() -> Router<AppState> {
         .route("/preview/outputs/{id}/moq/{lease_id}", axum::routing::delete(moq::output_close))
         // WHEP focus sessions (sub-second WebRTC preview) per scope: SDP offer
         // in -> 201 + answer SDP + Location; DELETE the resource to release.
+        .route("/preview/wall/whep", post(preview::wall_whep_open))
+        .route("/preview/wall/whep/{session_id}", axum::routing::delete(preview::wall_whep_close))
         .route("/preview/program/whep", post(preview::program_whep_open))
         .route(
             "/preview/program/whep/{session_id}",
