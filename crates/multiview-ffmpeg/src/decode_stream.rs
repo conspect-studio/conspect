@@ -92,6 +92,8 @@ pub struct StreamVideoDecoder {
     /// download. Freed synchronously in `Drop` on the decode thread (CLAUDE.md
     /// §7), never an async destructor. [`None`] on the software path.
     hw_device: Option<crate::hwframe::HwDeviceContext>,
+    /// The NVDEC fused-resize target this decoder was opened with, when live.
+    hw_resize: Option<crate::hwdecode::TileSize>,
 }
 
 impl StreamVideoDecoder {
@@ -121,6 +123,7 @@ impl StreamVideoDecoder {
             fallback_step_ns: Self::DEFAULT_FALLBACK_STEP_NS,
             hw_decoder_name: None,
             hw_device: None,
+            hw_resize: None,
         })
     }
 
@@ -139,6 +142,7 @@ impl StreamVideoDecoder {
             fallback_step_ns: Self::DEFAULT_FALLBACK_STEP_NS,
             hw_decoder_name: None,
             hw_device: None,
+            hw_resize: None,
         }
     }
 
@@ -179,8 +183,51 @@ impl StreamVideoDecoder {
         want_hw: bool,
         cuda_device: Option<&str>,
     ) -> Result<(Self, bool)> {
+        Self::new_preferring_hw_at(parameters, time_base, want_hw, cuda_device, None)
+    }
+
+    /// [`Self::new_preferring_hw`], additionally asking NVDEC to emit frames at
+    /// `display_resize` via the `*_cuvid` fused `resize` option (inv #6: decode
+    /// near display size). The caller plans the target with
+    /// [`nvdec_resize_target`](crate::hwdecode::nvdec_resize_target) (a pure
+    /// downscale to the even tile size, or `None`).
+    ///
+    /// Ignored on the software path. If the cuvid open rejects the resize it is
+    /// retried once without it before degrading to software, so the resize can
+    /// never cost a working hardware decode. [`Self::hw_resize`] reports whether
+    /// it is live.
+    ///
+    /// # Errors
+    /// As [`Self::new_preferring_hw`].
+    pub fn new_preferring_hw_at(
+        parameters: ffmpeg::codec::Parameters,
+        time_base: Rational,
+        want_hw: bool,
+        cuda_device: Option<&str>,
+        display_resize: Option<crate::hwdecode::TileSize>,
+    ) -> Result<(Self, bool)> {
         if let Some(name) = crate::hwdecode::select_decoder_for_id(parameters.id(), want_hw) {
-            match Self::try_open_cuvid(parameters.clone(), time_base, name, cuda_device) {
+            let opened = match display_resize {
+                Some(target) => Self::try_open_cuvid(
+                    parameters.clone(),
+                    time_base,
+                    name,
+                    cuda_device,
+                    Some(target),
+                )
+                .or_else(|err| {
+                    tracing::warn!(
+                        decoder = name,
+                        error = %err,
+                        "NVDEC fused resize rejected; retrying NVDEC at source size"
+                    );
+                    Self::try_open_cuvid(parameters.clone(), time_base, name, cuda_device, None)
+                }),
+                None => {
+                    Self::try_open_cuvid(parameters.clone(), time_base, name, cuda_device, None)
+                }
+            };
+            match opened {
                 Ok(decoder) => return Ok((decoder, true)),
                 Err(err) => {
                     // Graceful degradation: a driver/library mismatch or no usable
@@ -214,6 +261,7 @@ impl StreamVideoDecoder {
         time_base: Rational,
         name: &'static str,
         cuda_device: Option<&str>,
+        resize: Option<crate::hwdecode::TileSize>,
     ) -> Result<Self> {
         let codec =
             ffmpeg::decoder::find_by_name(name).ok_or(FfmpegError::CodecNotFound("cuvid"))?;
@@ -235,9 +283,15 @@ impl StreamVideoDecoder {
 
         // Open as the cuvid codec specifically (not the context's own software
         // codec id), then take the video decoder.
+        // The fused NVDEC resize (`-resize WxH`): the ASIC scales during decode,
+        // so the host download and the CPU tile scale shrink to the tile size.
+        let mut options = ffmpeg::Dictionary::new();
+        if let Some(target) = resize {
+            options.set("resize", &crate::hwdecode::cuvid_resize_option(target));
+        }
         let opened = ctx
             .decoder()
-            .open_as(codec)
+            .open_as_with(codec, options)
             .map_err(FfmpegError::OpenDecoder)?;
         let decoder = opened.video().map_err(FfmpegError::OpenDecoder)?;
 
@@ -249,7 +303,22 @@ impl StreamVideoDecoder {
             fallback_step_ns: Self::DEFAULT_FALLBACK_STEP_NS,
             hw_decoder_name: Some(name),
             hw_device: Some(device),
+            hw_resize: resize,
         })
+    }
+
+    /// The NVDEC fused-resize target this decoder emits at, or [`None`] when
+    /// it decodes at the source size (software, or no resize requested).
+    #[must_use]
+    pub fn hw_resize(&self) -> Option<crate::hwdecode::TileSize> {
+        self.hw_resize
+    }
+
+    /// The coded `(width, height)` declared by demuxed stream `parameters`
+    /// (`(0, 0)` when unknown) — the source size the resize is planned from.
+    #[must_use]
+    pub fn coded_size(parameters: &ffmpeg::codec::Parameters) -> (u32, u32) {
+        crate::hwframe::parameters_size(parameters)
     }
 
     /// The concrete NVDEC `*_cuvid` decoder name this is running on (e.g.

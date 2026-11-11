@@ -31,21 +31,172 @@ fn parse_stored_source(body: &serde_json::Value) -> Option<multiview_config::Sou
     serde_json::from_value(body.clone()).ok()
 }
 
-/// Compare media configuration without cloning arbitrary source documents.
-/// Only EPG and IPTV presentation metadata may bypass the engine command path.
+/// Whether an edit changes no media-affecting field: only presentation (EPG,
+/// playlist metadata) and standing policy (`events.automation`, activation)
+/// differ. Uses the one shared definition, [`multiview_config::Source::same_media`],
+/// the engine also applies (review R3-02), so control and engine never
+/// disagree about what restarts a producer. Such an edit bypasses the media
+/// upsert; a policy part is forwarded separately as a pins-only update.
 fn guide_only_change(previous: &serde_json::Value, next: &serde_json::Value) -> bool {
-    let (Some(previous), Some(next)) = (previous.as_object(), next.as_object()) else {
-        return false;
-    };
     if previous == next {
         // An unchanged body is not a guide edit; it keeps the canonical path.
         return false;
     }
-    let media_field = |key: &str| key != "epg" && key != "playlist_metadata";
-    previous
-        .iter()
-        .filter(|(key, _)| media_field(key))
-        .eq(next.iter().filter(|(key, _)| media_field(key)))
+    match (parse_stored_source(previous), parse_stored_source(next)) {
+        (Some(previous), Some(next)) => previous.same_media(&next),
+        // A document that does not parse keeps the canonical path.
+        _ => false,
+    }
+}
+
+/// Whether standing policy (automation rule or effective activation) differs:
+/// what keeps a source, or its replacement, running under demand.
+fn policy_changed(previous: &serde_json::Value, next: &serde_json::Value) -> bool {
+    let activation = |body: &serde_json::Value| {
+        parse_stored_source(body).map(|source| source.effective_activation())
+    };
+    automation_changed(previous, next) || activation(previous) != activation(next)
+}
+
+/// Whether `events.automation` differs between two stored source bodies.
+fn automation_changed(previous: &serde_json::Value, next: &serde_json::Value) -> bool {
+    let automation = |body: &serde_json::Value| {
+        body.get("events")
+            .and_then(|events| events.get("automation"))
+            .cloned()
+    };
+    automation(previous) != automation(next)
+}
+
+/// The automation rule a stored or submitted source body carries, if any.
+fn automation_rule(
+    body: &serde_json::Value,
+) -> ControlResult<Option<multiview_config::schema::EventAutomationRule>> {
+    body.get("events")
+        .and_then(|events| events.get("automation"))
+        .filter(|rule| !rule.is_null())
+        .map(|rule| {
+            serde_json::from_value(rule.clone()).map_err(|error| {
+                crate::error::ControlError::Validation(format!("events.automation: {error}"))
+            })
+        })
+        .transpose()
+}
+
+/// Per-object authorization of the automation a generic source mutation
+/// writes (review R3-01): a rule that is new or changed (including arming it)
+/// must name only a target and cells the principal may act on — the same guard
+/// the dedicated automation routes apply. Runs before anything is committed
+/// or submitted. An unchanged rule (an edit of other fields) re-asserts what
+/// an authorized principal configured and is not re-checked.
+fn authorize_written_automation(
+    principal: &Principal,
+    previous: Option<&serde_json::Value>,
+    next: &serde_json::Value,
+) -> ControlResult<()> {
+    let Some(rule) = automation_rule(next)? else {
+        return Ok(());
+    };
+    if let Some(previous) = previous {
+        if !automation_changed(previous, next) {
+            return Ok(());
+        }
+    }
+    crate::routes::source_events::authorize_rule_targets(principal, &rule)
+}
+
+/// Tell the running engine a source's standing policy (armed automation)
+/// changed. On a demand-managed run the hub re-reads the owner's complete pin
+/// set and leaves the producer alone. A kind the run cannot apply live, or a
+/// shed submit, applies on restart and says so.
+fn submit_policy_update(state: &AppState, next: Option<multiview_config::Source>) -> ApplyMode {
+    let Some(next) = next else {
+        return ApplyMode::Restart;
+    };
+    if !state.live_sources.is_live(&next.kind) {
+        return ApplyMode::Restart;
+    }
+    let submitted = state
+        .commands
+        .try_submit(Command::UpsertSource {
+            op: OperationId::new(),
+            source: Box::new(next),
+        })
+        .is_ok();
+    if submitted {
+        ApplyMode::Live
+    } else {
+        ApplyMode::Restart
+    }
+}
+
+/// Persist an `events.automation` change to one source through the canonical
+/// durable path (`commit_resource` → store → audit), never restarting ingest
+/// (ADR-0183). `mutate` edits the stored body; returns the new body.
+///
+/// # Errors
+/// Unknown source (404), invalid resulting document (422) or commit failure.
+pub(crate) async fn update_source_automation(
+    state: &AppState,
+    actor: &str,
+    id: &str,
+    mutate: impl FnOnce(&mut serde_json::Map<String, serde_json::Value>) -> ControlResult<()>,
+) -> ControlResult<serde_json::Value> {
+    let _mutation = state.lock_config_mutation().await;
+    let current = accepted_source(state, id)?;
+    let mut body = current.resource.body.clone();
+    let object = body.as_object_mut().ok_or_else(|| {
+        crate::error::ControlError::Validation("stored source body is not an object".into())
+    })?;
+    mutate(object)?;
+    let input = ResourceInput {
+        name: current.resource.name.clone(),
+        body: validated_body(TypedCollection::Sources, id, &body)?,
+    };
+    crate::boot_model::commit_resource(
+        state,
+        "sources",
+        id,
+        Some(input.body.clone()),
+        Some(input.name.clone()),
+    )
+    .await?;
+    if let Err(error) = state.sources.update(id, input) {
+        if state.boot_model.is_none() {
+            return Err(error);
+        }
+        tracing::warn!(source = %id, %error, "accepted automation committed; store projection failed");
+    }
+    let versioned = accepted_source(state, id)?;
+    if let (Some(model), Some(next)) = (
+        state.boot_model.as_ref(),
+        parse_stored_source(&versioned.resource.body),
+    ) {
+        if model.adopted_sources().iter().any(|source| source.id == id) {
+            model.adopt_source(next);
+        }
+    }
+    // Arming or disarming changes what keeps a source (and its replacement)
+    // running under demand. Tell the running engine; on a demand-managed run
+    // the hub sees the media definition is unchanged and only re-reads the
+    // source's standing leases: the producer is never restarted (review
+    // DMD-09). Best-effort: a shed submit applies on restart.
+    if let Some(next) = parse_stored_source(&versioned.resource.body) {
+        if state.live_sources.is_live(&next.kind) {
+            let _ = state.commands.try_submit(Command::UpsertSource {
+                op: OperationId::new(),
+                source: Box::new(next),
+            });
+        }
+    }
+    state.audit(
+        actor,
+        AuditAction::Update,
+        SOURCE_KIND,
+        id,
+        Some(serde_json::json!({ "events": versioned.resource.body.get("events") })),
+    );
+    Ok(versioned.resource.body)
 }
 
 #[cfg(test)]
@@ -64,6 +215,36 @@ mod guide_change_tests {
         assert!(guide_only_change(&next, &source));
         next["url"] = json!("https://example.com/other");
         assert!(!guide_only_change(&source, &next));
+        let mut armed = source.clone();
+        armed["events"] = json!({"automation": {"armed": true,
+            "on_break_start": {"action": "swap_cell", "target": "bars"}}});
+        assert!(
+            guide_only_change(&source, &armed),
+            "automation is control-plane only"
+        );
+        // Presentation and policy in ONE edit are still not media (R3-02).
+        let mut combined = armed.clone();
+        combined["playlist_metadata"] = json!({"name":"News"});
+        combined["activation"] = json!("on_demand");
+        assert!(guide_only_change(&source, &combined));
+        let mut moved = combined.clone();
+        moved["url"] = json!("https://example.com/other");
+        assert!(!guide_only_change(&combined, &moved), "a url edit is media");
+        let mut origin = source.clone();
+        origin["origin"] = json!({"provider":"iptv-org","channel":"A.us","follow":"notify"});
+        assert!(guide_only_change(&source, &origin), "origin is metadata");
+        let mut ua = source.clone();
+        ua["user_agent"] = json!("UA/9");
+        assert!(!guide_only_change(&source, &ua), "user_agent is media");
+        let mut rf = source.clone();
+        rf["referrer"] = json!("https://r/");
+        assert!(!guide_only_change(&source, &rf), "referrer is media");
+        let mut observe = source.clone();
+        observe["events"] = json!({"observe": false});
+        assert!(
+            !guide_only_change(&source, &observe),
+            "observe restarts ingest"
+        );
     }
 
     #[test]
@@ -193,10 +374,48 @@ fn live_apply_remove(state: &AppState, id: &str) -> ApplyMode {
     }
 }
 
+/// The parsed sources the caller may see (per-object BOLA filter) — the catalogue
+/// routes use it for `already_added` and link status so neither can reveal a source
+/// the caller could not `GET`.
+pub(crate) fn visible_sources(
+    state: &AppState,
+    principal: &Principal,
+) -> ControlResult<Vec<multiview_config::Source>> {
+    Ok(accepted_sources(state)?
+        .into_iter()
+        .filter(|v| crate::auth::authorize_object(principal, &v.resource.id).is_ok())
+        .filter_map(|v| parse_stored_source(&v.resource.body))
+        .collect())
+}
+
+/// Every accepted source, parsed (system view for server-side bookkeeping).
+pub(crate) fn accepted_sources_system(state: &AppState) -> Vec<multiview_config::Source> {
+    accepted_sources(state)
+        .map(|all| {
+            all.into_iter()
+                .filter_map(|v| parse_stored_source(&v.resource.body))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// One accepted source with its version (system view).
+pub(crate) fn accepted_sources_system_versioned(
+    state: &AppState,
+    id: &str,
+) -> Option<VersionedResource> {
+    accepted_source(state, id).ok()
+}
+
 /// Read accepted intent rather than a lagging, fallible SQLite projection.
-fn accepted_sources(state: &AppState) -> ControlResult<Vec<VersionedResource>> {
+pub(crate) fn accepted_sources(state: &AppState) -> ControlResult<Vec<VersionedResource>> {
     crate::boot_model::accepted_resources(state, "sources")?
         .map_or_else(|| state.sources.list(), Ok)
+}
+
+/// Whether `id` names an accepted source.
+pub(crate) fn accepted_source_exists(state: &AppState, id: &str) -> bool {
+    accepted_source(state, id).is_ok()
 }
 
 fn accepted_source(state: &AppState, id: &str) -> ControlResult<VersionedResource> {
@@ -320,18 +539,41 @@ pub(crate) async fn create_source(
         name: input.name,
         body: validated_body(TypedCollection::Sources, &id, &input.body)?,
     };
+    authorize_written_automation(&principal, None, &input.body)?;
     // ADR-W024 MAJOR-B round 4: hold the config-mutation lock across the whole
     // store-write → submit → adopt-snapshot sequence, so the persister (which
     // takes the same lock) can never compose mid-mutation and the adopted
     // snapshot advances atomically with the engine submit.
-    let _mutation = state.lock_config_mutation().await;
-    if accepted_sources(&state)?.len() >= multiview_config::MAX_ADMITTED_SOURCES {
+    let mutation = state.lock_config_mutation().await;
+    let (versioned, mode) =
+        create_source_locked(&state, &mutation, &principal.key_id, &id, input).await?;
+    Ok(with_apply(
+        mode,
+        source_response(StatusCode::CREATED, &versioned),
+    ))
+}
+
+/// The canonical durable source create: capacity and duplicate checks,
+/// `commit_resource`, store projection, audit and live apply.
+///
+/// The caller must hold `lock_config_mutation` — the `_mutation` guard is the
+/// proof — and must already have authorised `id` and validated `input.body`
+/// (see [`validated_body`]). Shared by `POST /sources/{id}` and the catalogue
+/// bulk add so both go through one path.
+pub(crate) async fn create_source_locked(
+    state: &AppState,
+    _mutation: &tokio::sync::OwnedMutexGuard<()>,
+    actor: &str,
+    id: &str,
+    input: ResourceInput,
+) -> ControlResult<(VersionedResource, ApplyMode)> {
+    if accepted_sources(state)?.len() >= multiview_config::MAX_ADMITTED_SOURCES {
         return Err(crate::error::ControlError::Validation(format!(
             "sources exceeds the live source capacity of {}",
             multiview_config::MAX_ADMITTED_SOURCES
         )));
     }
-    if accepted_sources(&state)?
+    if accepted_sources(state)?
         .iter()
         .any(|entry| entry.resource.id == id)
     {
@@ -340,36 +582,49 @@ pub(crate) async fn create_source(
         )));
     }
     crate::boot_model::commit_resource(
-        &state,
+        state,
         "sources",
-        &id,
+        id,
         Some(input.body.clone()),
         Some(input.name.clone()),
     )
     .await?;
-    if let Err(error) = state.sources.create(&id, input) {
+    if let Err(error) = state.sources.create(id, input) {
         if state.boot_model.is_none() {
             return Err(error);
         }
         tracing::warn!(source = %id, %error, "accepted source committed; store projection failed");
     }
-    let versioned = accepted_source(&state, &id).map_err(|error| {
+    let versioned = accepted_source(state, id).map_err(|error| {
         crate::error::ControlError::CommitIndeterminate(format!(
             "source {id:?} was committed, but its accepted representation could not be reread; GET before retrying: {error}"
         ))
     })?;
     state.audit(
-        &principal.key_id,
+        actor,
         AuditAction::Create,
         SOURCE_KIND,
-        &id,
+        id,
         Some(versioned.resource.body.clone()),
     );
-    let mode = live_apply_upsert(&state, parse_stored_source(&versioned.resource.body), None);
-    Ok(with_apply(
-        mode,
-        source_response(StatusCode::CREATED, &versioned),
-    ))
+    let mode = live_apply_upsert(state, parse_stored_source(&versioned.resource.body), None);
+    Ok((versioned, mode))
+}
+
+/// The number of accepted sources and their ids (for bulk pre-validation).
+pub(crate) fn accepted_source_ids(state: &AppState) -> ControlResult<Vec<String>> {
+    Ok(accepted_sources(state)?
+        .into_iter()
+        .map(|entry| entry.resource.id)
+        .collect())
+}
+
+/// Validate a source body for create (public wrapper for the bulk path).
+pub(crate) fn validate_source_body(
+    id: &str,
+    body: &serde_json::Value,
+) -> ControlResult<serde_json::Value> {
+    validated_body(TypedCollection::Sources, id, body)
 }
 
 /// `PUT /api/v1/sources/{id}` — replace a source (role: write; If-Match → 412).
@@ -403,40 +658,84 @@ pub(crate) async fn update_source(
     // ADR-W024 MAJOR-B round 4: hold the config-mutation lock across the whole
     // precondition → store-write → submit → adopt-snapshot sequence.
     let _mutation = state.lock_config_mutation().await;
+    // Review R3-01: a written automation rule's targets and cells are
+    // authorized against the caller. The catalogue's system auto-follow never
+    // changes `events.automation`, so it shares `apply_source_update` without
+    // this check.
+    if let Ok(current) = accepted_source(&state, &id) {
+        authorize_written_automation(&principal, Some(&current.resource.body), &input.body)?;
+    }
+    let (mode, versioned) =
+        apply_source_update(&state, &principal.key_id, &id, Some(&if_match), input)
+            .await?
+            .into_applied();
+    Ok(with_apply(
+        mode,
+        source_response(StatusCode::OK, &versioned),
+    ))
+}
+
+/// The result of a source update (kept as a struct so callers destructure it).
+pub(crate) struct AppliedUpdate {
+    mode: ApplyMode,
+    versioned: VersionedResource,
+}
+
+impl AppliedUpdate {
+    fn into_applied(self) -> (ApplyMode, VersionedResource) {
+        (self.mode, self.versioned)
+    }
+}
+
+/// The shared update sequence behind `PUT /sources/{id}` and the catalogue's
+/// `follow = auto` apply: precondition (`If-Match` when `Some`, the current version
+/// when `None` for system callers who just read it under the same lock) →
+/// typed validation → durable commit → store write → audit → live apply.
+///
+/// The caller MUST hold `state.lock_config_mutation()`.
+pub(crate) async fn apply_source_update(
+    state: &AppState,
+    actor: &str,
+    id: &str,
+    if_match: Option<&IfMatch>,
+    input: ResourceInput,
+) -> ControlResult<AppliedUpdate> {
     // Preconditions are evaluated before request content (RFC 9110 §13.2.2):
     // a stale `If-Match` (or a missing resource) is reported even when the
     // submitted body is itself invalid.
-    let current = accepted_source(&state, &id)?;
-    if_match.require(SOURCE_KIND, &id, current.version)?;
+    let current = accepted_source(state, id)?;
+    if let Some(m) = if_match {
+        m.require(SOURCE_KIND, id, current.version)?;
+    }
     let input = ResourceInput {
         name: input.name,
-        body: validated_body(TypedCollection::Sources, &id, &input.body)?,
+        body: validated_body(TypedCollection::Sources, id, &input.body)?,
     };
     let previous = parse_stored_source(&current.resource.body);
     crate::boot_model::commit_resource(
-        &state,
+        state,
         "sources",
-        &id,
+        id,
         Some(input.body.clone()),
         Some(input.name.clone()),
     )
     .await?;
-    if let Err(error) = state.sources.update(&id, input) {
+    if let Err(error) = state.sources.update(id, input) {
         if state.boot_model.is_none() {
             return Err(error);
         }
         tracing::warn!(source = %id, %error, "accepted source committed; store projection failed");
     }
-    let versioned = accepted_source(&state, &id).map_err(|error| {
+    let versioned = accepted_source(state, id).map_err(|error| {
         crate::error::ControlError::CommitIndeterminate(format!(
             "source {id:?} was committed, but its accepted representation could not be reread; GET before retrying: {error}"
         ))
     })?;
     state.audit(
-        &principal.key_id,
+        actor,
         AuditAction::Update,
         SOURCE_KIND,
-        &id,
+        id,
         Some(versioned.resource.body.clone()),
     );
     let next = parse_stored_source(&versioned.resource.body);
@@ -448,14 +747,18 @@ pub(crate) async fn update_source(
                 model.adopt_source(next.clone());
             }
         }
-        ApplyMode::Live
+        if policy_changed(&current.resource.body, &versioned.resource.body) {
+            // A policy edit changes which sources its rule keeps running:
+            // the same pins-only path the automation routes use (review
+            // R2-01). The hub sees unchanged media and never restarts it.
+            submit_policy_update(state, next)
+        } else {
+            ApplyMode::Live
+        }
     } else {
-        live_apply_upsert(&state, next, previous.as_ref())
+        live_apply_upsert(state, next, previous.as_ref())
     };
-    Ok(with_apply(
-        mode,
-        source_response(StatusCode::OK, &versioned),
-    ))
+    Ok(AppliedUpdate { mode, versioned })
 }
 
 /// `DELETE /api/v1/sources/{id}` — delete a source (role: administer; If-Match).
@@ -504,4 +807,266 @@ pub(crate) async fn delete_source(
     );
     let mode = live_apply_remove(&state, &id);
     Ok(with_apply(mode, StatusCode::NO_CONTENT.into_response()))
+}
+
+/// Every source's lifecycle state (role: read; per-object row visibility).
+///
+/// `idle` means the source is not started, so it costs nothing; it is not a
+/// fault. An `always_on` source (the default) is started at boot; an
+/// `on_demand` source starts when something consumes it. It reads `starting`,
+/// then `ready`, or `failed` while it retries with backoff.
+#[cfg_attr(
+    feature = "openapi",
+    utoipa::path(
+        get,
+        path = "/api/v1/sources/status",
+        tag = "sources",
+        responses(
+            (status = 200, description = "Every configured source's demand state, id-sorted.", body = [crate::source_demand::SourceDemandView]),
+            (status = 401, description = "Missing or invalid credentials.", body = crate::problem::Problem),
+            (status = 403, description = "Authenticated but not authorized to read.", body = crate::problem::Problem),
+        ),
+    )
+)]
+pub(crate) async fn list_source_status(
+    State(state): State<AppState>,
+    principal: Principal,
+) -> ControlResult<Json<Vec<crate::source_demand::SourceDemandView>>> {
+    principal.role.require(Action::Read)?;
+    let sources: Vec<(String, crate::source_demand::SourceActivationView)> =
+        accepted_sources(&state)?
+            .into_iter()
+            .filter(|v| crate::auth::authorize_object(&principal, &v.resource.id).is_ok())
+            .map(|v| (v.resource.id.clone(), activation_of(&v.resource)))
+            .collect();
+    Ok(Json(source_status_views(&state, &principal, sources)))
+}
+
+/// One source's demand state (role: read; per-object authz).
+#[cfg_attr(
+    feature = "openapi",
+    utoipa::path(
+        get,
+        path = "/api/v1/sources/{id}/status",
+        tag = "sources",
+        params(("id" = String, Path, description = "Source id.")),
+        responses(
+            (status = 200, description = "The source's demand state.", body = crate::source_demand::SourceDemandView),
+            (status = 401, description = "Missing or invalid credentials.", body = crate::problem::Problem),
+            (status = 403, description = "Not authorized to read this source.", body = crate::problem::Problem),
+            (status = 404, description = "No such source.", body = crate::problem::Problem),
+        ),
+    )
+)]
+pub(crate) async fn get_source_status(
+    State(state): State<AppState>,
+    principal: Principal,
+    Path(id): Path<String>,
+) -> ControlResult<Json<crate::source_demand::SourceDemandView>> {
+    principal.role.require(Action::Read)?;
+    crate::auth::authorize_object(&principal, &id)?;
+    let source = accepted_source(&state, &id)?;
+    let activation = activation_of(&source.resource);
+    Ok(Json(
+        source_status_views(&state, &principal, vec![(id, activation)])
+            .pop()
+            .unwrap_or_else(|| crate::source_demand::SourceDemandView::idle("")),
+    ))
+}
+
+/// The activation a stored source document declares. Reads only the two
+/// keys, so a document that fails full parsing still reports its setting.
+fn activation_of(
+    resource: &crate::resource_store::Resource,
+) -> crate::source_demand::SourceActivationView {
+    #[derive(serde::Deserialize)]
+    struct Keys {
+        #[serde(default)]
+        activation: Option<multiview_config::SourceActivation>,
+        #[serde(default)]
+        demand: Option<LegacyDemand>,
+    }
+    #[derive(serde::Deserialize)]
+    struct LegacyDemand {
+        #[serde(default)]
+        always_on: Option<bool>,
+    }
+    let keys: Option<Keys> = serde_json::from_value(resource.body.clone()).ok();
+    match keys {
+        Some(Keys {
+            activation: Some(activation),
+            ..
+        }) => activation.into(),
+        Some(Keys {
+            demand: Some(LegacyDemand {
+                always_on: Some(false),
+            }),
+            ..
+        }) => crate::source_demand::SourceActivationView::OnDemand,
+        _ => crate::source_demand::SourceActivationView::AlwaysOn,
+    }
+}
+
+/// Start a source now (role: write; per-object authz; audited).
+///
+/// Holds the source `ready` until Stop, whatever its activation. Never waits
+/// for the source: the response is the state right after the request
+/// (normally `starting`).
+#[cfg_attr(
+    feature = "openapi",
+    utoipa::path(
+        post,
+        path = "/api/v1/sources/{id}/start",
+        tag = "sources",
+        params(("id" = String, Path, description = "Source id.")),
+        responses(
+            (status = 202, description = "Start requested; the body is the source's state.", body = crate::source_demand::SourceDemandView),
+            (status = 401, description = "Missing or invalid credentials.", body = crate::problem::Problem),
+            (status = 403, description = "Not authorized to operate this source.", body = crate::problem::Problem),
+            (status = 404, description = "No such source.", body = crate::problem::Problem),
+            (status = 409, description = "This run cannot start sources.", body = crate::problem::Problem),
+        ),
+    )
+)]
+pub(crate) async fn start_source(
+    State(state): State<AppState>,
+    principal: Principal,
+    Path(id): Path<String>,
+) -> ControlResult<Response> {
+    principal.role.require(Action::Write)?;
+    crate::auth::authorize_object(&principal, &id)?;
+    let source = accepted_source(&state, &id)?;
+    let started = state
+        .source_demand
+        .as_ref()
+        .is_some_and(|demand| demand.start_source(&id));
+    if !started {
+        return Err(crate::error::ControlError::Conflict(
+            "this run cannot start sources on request".to_owned(),
+        ));
+    }
+    state.audit(
+        &principal.key_id,
+        AuditAction::Command,
+        SOURCE_KIND,
+        &id,
+        Some(serde_json::json!({"command": "start"})),
+    );
+    let activation = activation_of(&source.resource);
+    let view = source_status_views(&state, &principal, vec![(id, activation)])
+        .pop()
+        .unwrap_or_else(|| crate::source_demand::SourceDemandView::idle(""));
+    Ok((StatusCode::ACCEPTED, Json(view)).into_response())
+}
+
+/// Stop a source now (role: write; per-object authz; audited).
+///
+/// Refused with 409 while anything else uses the source; the problem detail
+/// names every consumer (an `always_on` setting counts). Set the source
+/// `on_demand` to let it stop.
+#[cfg_attr(
+    feature = "openapi",
+    utoipa::path(
+        post,
+        path = "/api/v1/sources/{id}/stop",
+        tag = "sources",
+        params(("id" = String, Path, description = "Source id.")),
+        responses(
+            (status = 202, description = "Stop requested; the body is the source's state.", body = crate::source_demand::SourceDemandView),
+            (status = 401, description = "Missing or invalid credentials.", body = crate::problem::Problem),
+            (status = 403, description = "Not authorized to operate this source.", body = crate::problem::Problem),
+            (status = 404, description = "No such source.", body = crate::problem::Problem),
+            (status = 409, description = "Still in use; the detail names every consumer.", body = crate::problem::Problem),
+        ),
+    )
+)]
+pub(crate) async fn stop_source(
+    State(state): State<AppState>,
+    principal: Principal,
+    Path(id): Path<String>,
+) -> ControlResult<Response> {
+    principal.role.require(Action::Write)?;
+    crate::auth::authorize_object(&principal, &id)?;
+    let source = accepted_source(&state, &id)?;
+    let outcome = state.source_demand.as_ref().map_or(
+        Err(crate::source_demand::StopRefusal::Unsupported),
+        |demand| demand.stop_source(&id),
+    );
+    match outcome {
+        Ok(()) => {}
+        Err(crate::source_demand::StopRefusal::InUse(mut consumers)) => {
+            redact_holders(&principal, &mut consumers);
+            let names: Vec<String> = consumers
+                .iter()
+                .map(|c| format!("{} {}", c.kind, c.label))
+                .collect();
+            return Err(crate::error::ControlError::Conflict(format!(
+                "source {id:?} is in use by: {}",
+                names.join(", ")
+            )));
+        }
+        Err(crate::source_demand::StopRefusal::Unsupported) => {
+            return Err(crate::error::ControlError::Conflict(
+                "this run cannot stop sources on request".to_owned(),
+            ));
+        }
+    }
+    state.audit(
+        &principal.key_id,
+        AuditAction::Command,
+        SOURCE_KIND,
+        &id,
+        Some(serde_json::json!({"command": "stop"})),
+    );
+    let activation = activation_of(&source.resource);
+    let view = source_status_views(&state, &principal, vec![(id, activation)])
+        .pop()
+        .unwrap_or_else(|| crate::source_demand::SourceDemandView::idle(""));
+    Ok((StatusCode::ACCEPTED, Json(view)).into_response())
+}
+
+/// The demand views of `ids`, in id order. Without a demand provider (a run
+/// path with no manager) the status is unknown, reported idle with no consumers.
+/// Hide every holder label that names an object `principal` may not read
+/// (review DMD-04): the source row is authorized, but an automation holder
+/// names its owning source, which is authorized on its own.
+fn redact_holders(
+    principal: &Principal,
+    consumers: &mut [crate::source_demand::SourceConsumerView],
+) {
+    for consumer in consumers {
+        consumer.redact_unless(|object| crate::auth::authorize_object(principal, object).is_ok());
+    }
+}
+
+fn source_status_views(
+    state: &AppState,
+    principal: &Principal,
+    mut sources: Vec<(String, crate::source_demand::SourceActivationView)>,
+) -> Vec<crate::source_demand::SourceDemandView> {
+    sources.sort_by(|a, b| a.0.cmp(&b.0));
+    sources.dedup_by(|a, b| a.0 == b.0);
+    let active: std::collections::HashMap<String, crate::source_demand::SourceDemandView> = state
+        .source_demand
+        .as_ref()
+        .map(|demand| {
+            demand
+                .active()
+                .into_iter()
+                .map(|view| (view.id.clone(), view))
+                .collect()
+        })
+        .unwrap_or_default();
+    sources
+        .into_iter()
+        .map(|(id, activation)| {
+            let mut view = active
+                .get(&id)
+                .cloned()
+                .unwrap_or_else(|| crate::source_demand::SourceDemandView::idle(&id));
+            view.activation = activation;
+            redact_holders(principal, &mut view.consumers);
+            view
+        })
+        .collect()
 }

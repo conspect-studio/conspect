@@ -189,6 +189,16 @@ impl MoqProvider for WebTransportProvider {
             fence.revoke();
             return Err(MoqReject::Unavailable);
         };
+        let alternatives = feed
+            .ladder
+            .iter()
+            .filter_map(wire_alternative)
+            .take(1)
+            .map(|mut rung| {
+                rung.track = "video".into();
+                rung
+            })
+            .collect();
         Ok((
             MoqLease {
                 lease_id: subscription_id.into(),
@@ -199,7 +209,10 @@ impl MoqProvider for WebTransportProvider {
                 broadcast: admitted.broadcast,
                 protocol: admitted.protocol,
                 video: feed.video,
-                video_alternatives: feed.ladder.iter().filter_map(wire_alternative).collect(),
+                // Single-rendition publication uses the actual wire track `video`,
+                // not the effective production output ID. Advertise only that
+                // selected rendition; unrelated outputs are not ABR alternatives.
+                video_alternatives: alternatives,
                 audio: feed.audio,
                 // The engine epoch is not available on this seam; a fabricated
                 // zero would claim every rung starts at the Unix epoch.

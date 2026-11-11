@@ -1213,7 +1213,17 @@ async fn commit_watched_desired(
     let output_ids = crate::boot_model::output_ids_for_config(state, next)?;
     let selected = crate::boot_model::selected_layout_id(state, next, &layouts)?;
     crate::boot_model::commit_desired_document(state, next.clone(), layouts, selected, output_ids)
-        .await
+        .await?;
+    // A file commit replaces the whole envelope, including graphics the file
+    // diff does not name. The hub is the base of the next graphics mutation, so
+    // it follows the envelope here or that mutation would resurrect dropped
+    // content.
+    let graphics = crate::routes::graphics::effective_graphics(next);
+    state
+        .weather
+        .set_locations(crate::routes::graphics::weather_specs(&graphics));
+    state.graphics.set_config(graphics);
+    Ok(())
 }
 
 /// What one document apply did: the human summary, the restart-only sections,
@@ -1368,6 +1378,15 @@ pub fn apply_document_diff(
             // `active.toml` composes it straight from the store.
             "salvos" => resync_salvos(state, actor, next),
             "tally_profiles" => resync_tally_profiles(state, actor, next),
+            // Graphics/weather definitions are management-plane data: the
+            // hub + poller follow the file (generators pick it up live).
+            "graphics" | "weather" => {
+                let g = crate::routes::graphics::effective_graphics(next);
+                state
+                    .weather
+                    .set_locations(crate::routes::graphics::weather_specs(&g));
+                state.graphics.set_config(g);
+            }
             // No store is boot-seeded for these; the file itself is the
             // durable truth and the restart warning names them.
             _ => {}

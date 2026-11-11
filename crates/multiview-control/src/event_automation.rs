@@ -21,6 +21,37 @@ use std::collections::BTreeMap;
 pub const MAX_ID_BYTES: usize = 256;
 /// Hard ceiling for both ledger and lease capacity.
 pub const MAX_CAPACITY: usize = 4096;
+/// Bounded in-flight window for a restore acknowledgement on the host
+/// monotonic clock (F2). After it the adapter must reconcile the destination.
+pub const RESTORE_ACK_TIMEOUT_NS: u64 = 5_000_000_000;
+/// Maximum restore dispatches per lease before automatic restore is revoked
+/// (F2): an unknown outcome never becomes an unbounded blind retry.
+pub const MAX_RESTORE_ATTEMPTS: u32 = 3;
+
+/// What the trusted adapter observed at the destination while reconciling a
+/// stalled restore (F2). It must compare against its own saved snapshot and
+/// ownership generation, never guess.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RestoreObservation {
+    /// Destination still shows our owned replacement at our generation: the
+    /// restore dispatch was lost before application.
+    Unchanged,
+    /// Destination already shows the saved pre-replacement state: the
+    /// restore applied but its acknowledgement was lost.
+    Restored,
+    /// Destination shows anything else (a manual operator change).
+    Changed,
+}
+/// Result of reconciling a stalled restore.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Reconciled {
+    /// Restore confirmed; the lease is released.
+    Finished,
+    /// The lease is eligible for one more compare-and-restore.
+    Retry,
+    /// Automatic restore permanently revoked (manual change or attempts exhausted).
+    Revoked,
+}
 
 /// Explicit execution posture; construction is always disarmed.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -291,6 +322,10 @@ struct Lease {
     expires_ns: u64,
     revoked: bool,
     restoring: bool,
+    /// Host-monotonic dispatch time of the outstanding restore (F2).
+    restore_started_ns: u64,
+    /// Restore dispatches so far (F2), bounded by [`MAX_RESTORE_ATTEMPTS`].
+    attempts: u32,
 }
 /// Single-source, bounded control-plane state; no IO, threads, or hidden clocks.
 /// Scope collisions are model-local: the executor MUST coordinate ownership across
@@ -339,6 +374,11 @@ impl SafetyModel {
             entries: BTreeMap::new(),
             next_id: 1,
         })
+    }
+    /// Current presentation epoch.
+    #[must_use]
+    pub fn epoch(&self) -> u64 {
+        self.epoch
     }
     /// Trusted control-plane posture change. Disarm never silently restores.
     pub fn set_mode(&mut self, mode: Mode) {
@@ -443,6 +483,8 @@ impl SafetyModel {
                     .ok_or(Rejection::Invalid)?,
                 revoked: false,
                 restoring: false,
+                restore_started_ns: 0,
+                attempts: 0,
             })
         } else {
             None
@@ -523,16 +565,37 @@ impl SafetyModel {
             .collect()
     }
     /// Explicit emergency/end/maximum-hold restore, available even disarmed.
-    /// A mismatch permanently revokes automatic restore. The returned generation
-    /// MUST still be compared atomically at apply, closing the manual-change race.
+    /// Equivalent to [`Self::restore_at`] with a dispatch time of zero, so a
+    /// stalled acknowledgement is immediately reconcilable.
     ///
     /// # Errors
-    /// Rejects unknown, unapplied, revoked or already-restoring leases, generation
-    /// mismatches and insufficient current resource permissions.
+    /// See [`Self::restore_at`].
     pub fn restore(
         &mut self,
         id: u64,
         current_generation: u64,
+        auth: &impl Authorization,
+    ) -> Result<ActionPlan, Rejection> {
+        self.restore_at(id, current_generation, 0, auth)
+    }
+    /// Explicit emergency/end/maximum-hold restore, available even disarmed.
+    /// A mismatch permanently revokes automatic restore. The returned generation
+    /// MUST still be compared atomically at apply, closing the manual-change race.
+    ///
+    /// Owned cleanup is authorized against the CURRENT destination permissions
+    /// and existence, never the trigger rule/source (F1): deleting the rule or
+    /// the source that caused the replacement must not strand it. `now_ns` is the
+    /// host monotonic dispatch time used for the bounded ack window (F2).
+    ///
+    /// # Errors
+    /// Rejects unknown, unapplied, revoked or already-restoring leases, generation
+    /// mismatches and insufficient current destination permissions. An
+    /// authorization denial leaves the lease intact for a later authorized restore.
+    pub fn restore_at(
+        &mut self,
+        id: u64,
+        current_generation: u64,
+        now_ns: u64,
         auth: &impl Authorization,
     ) -> Result<ActionPlan, Rejection> {
         let entry = self.entry_mut(id)?;
@@ -561,9 +624,65 @@ impl SafetyModel {
                 expected_generation: generation,
             },
         };
-        authorize_plan(&plan, auth)?;
+        authorize_owned_restore(&lease.scope, auth)?;
         lease.restoring = true;
+        lease.restore_started_ns = now_ns;
+        lease.attempts = lease.attempts.saturating_add(1);
         Ok(plan)
+    }
+    /// Restores whose acknowledgement has been outstanding for at least
+    /// [`RESTORE_ACK_TIMEOUT_NS`] (F2). The adapter must observe the destination
+    /// and call [`Self::reconcile_restore`]; it must never blindly redispatch.
+    #[must_use]
+    pub fn stalled_restores(&self, monotonic_ns: u64) -> Vec<u64> {
+        self.entries
+            .values()
+            .filter(|e| {
+                e.lease.as_ref().is_some_and(|l| {
+                    l.restoring
+                        && monotonic_ns.saturating_sub(l.restore_started_ns)
+                            >= RESTORE_ACK_TIMEOUT_NS
+                })
+            })
+            .map(|e| e.id)
+            .collect()
+    }
+    /// Reconcile an outstanding restore against what the trusted adapter
+    /// observed at the destination (F2). Idempotent compare-and-restore:
+    /// `Restored` finishes, `Changed` revokes, `Unchanged` re-arms exactly one
+    /// more restore until [`MAX_RESTORE_ATTEMPTS`] is exhausted, then revokes.
+    ///
+    /// # Errors
+    /// `NotApplied` when the lease has no outstanding restore.
+    pub fn reconcile_restore(
+        &mut self,
+        id: u64,
+        observed: RestoreObservation,
+    ) -> Result<Reconciled, Rejection> {
+        let entry = self.entry_mut(id)?;
+        let lease = entry.lease.as_mut().ok_or(Rejection::NotApplied)?;
+        if !lease.restoring {
+            return Err(Rejection::NotApplied);
+        }
+        match observed {
+            RestoreObservation::Restored => {
+                entry.revoked = false;
+                entry.lease = None;
+                Ok(Reconciled::Finished)
+            }
+            RestoreObservation::Unchanged if lease.attempts < MAX_RESTORE_ATTEMPTS => {
+                lease.restoring = false;
+                // Due immediately on the watchdog: a lost dispatch must not
+                // wait for another full hold window.
+                lease.expires_ns = 0;
+                Ok(Reconciled::Retry)
+            }
+            RestoreObservation::Unchanged | RestoreObservation::Changed => {
+                entry.revoked = true;
+                entry.lease = None;
+                Ok(Reconciled::Revoked)
+            }
+        }
     }
     /// Correlated atomic restore result. A failed compare permanently revokes
     /// restoration; it must never be retried against a newer manual generation.
@@ -614,6 +733,34 @@ fn object(id: &str, auth: &impl Authorization) -> Result<(), Rejection> {
     }
     authorize_object(auth.principal(), id).map_err(|_| Rejection::Unauthorized)?;
     if !auth.resource_exists(&Resource::Object(id.to_owned())) {
+        return Err(Rejection::MissingResource);
+    }
+    Ok(())
+}
+/// Authorize owned cleanup of an applied replacement (F1): the principal needs
+/// write role plus CURRENT permission on, and existence of, the destination it
+/// is restoring. The trigger rule/source are deliberately not required.
+fn authorize_owned_restore(scope: &Scope, auth: &impl Authorization) -> Result<(), Rejection> {
+    auth.principal()
+        .role
+        .require(AuthAction::Write)
+        .map_err(|_| Rejection::Unauthorized)?;
+    let id = match scope {
+        Scope::Tile(id) | Scope::Output(id) | Scope::Program(id) => id,
+    };
+    if !valid_id(id) {
+        return Err(Rejection::Invalid);
+    }
+    authorize_object(auth.principal(), id).map_err(|_| Rejection::Unauthorized)?;
+    match scope {
+        Scope::Tile(_) => {}
+        Scope::Output(id) => {
+            authorize_output(auth.principal(), id).map_err(|_| Rejection::Unauthorized)?;
+        }
+        Scope::Program(id) => authorize_scope(auth.principal(), AuthzScope::Program(id))
+            .map_err(|_| Rejection::Unauthorized)?,
+    }
+    if !auth.resource_exists(&Resource::Destination(scope.clone())) {
         return Err(Rejection::MissingResource);
     }
     Ok(())

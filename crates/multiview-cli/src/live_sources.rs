@@ -46,6 +46,22 @@ pub struct ProducerStop {
     exited: Arc<AtomicBool>,
 }
 
+impl ProducerStop {
+    /// Whether `self` and `other` are the registration of the SAME producer
+    /// thread (a teardown + respawn registers a new one). Lets a caller prove
+    /// an edit left the running producer alone (review R3-03).
+    #[must_use]
+    pub fn is_same_producer(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.exited, &other.exited)
+    }
+
+    /// Whether this producer has been asked to stop.
+    #[must_use]
+    pub fn stop_requested(&self) -> bool {
+        self.stop.load(Ordering::Acquire)
+    }
+}
+
 /// The per-source producer teardown handles, keyed by source id.
 ///
 /// Registered at spawn (startup supervisors and the hub alike) and consumed by
@@ -202,6 +218,27 @@ pub trait IngestSpawner: Send + Sync {
     /// rides the slate honestly).
     fn spawn(&self, spawn: SourceSpawn, registry: &StopRegistry) -> Option<SpawnedProducer>;
 
+    /// Record a decoded source's definition for demand-driven start instead of
+    /// spawning it. Returns `true` when the run manages sources by demand, in
+    /// which case the hub spawns nothing. Hub worker only.
+    fn catalogue(&self, _spawn: &SourceSpawn) -> bool {
+        false
+    }
+
+    /// Apply an upsert that changes only standing policy (armed automation,
+    /// activation) without touching the producer. Returns `true` when it was
+    /// applied that way, so the hub neither tears down nor respawns (review
+    /// DMD-09). Hub worker only.
+    fn update_policy(&self, _spawn: &SourceSpawn) -> bool {
+        false
+    }
+
+    /// Invalidate a demand-managed source before a live edit. Returns true when
+    /// the replacement must wait for restart rather than spawn outside demand.
+    fn invalidate_live_edit(&self, _id: &str) -> bool {
+        false
+    }
+
     /// A source now running without decoded audio. Hub worker only.
     fn source_without_audio(&self, _id: &str) {}
 
@@ -260,14 +297,63 @@ pub enum HubSubmit {
 #[derive(Clone)]
 pub struct LiveSourceHandle {
     tx: SyncSender<HubRequest>,
+    /// Test seam: a forced submission outcome ([`SubmitFault`]). `None` on
+    /// every production handle.
+    fault: Option<SubmitFault>,
+}
+
+/// A shared switch that forces a [`LiveSourceHandle`]'s submissions to be shed
+/// as [`HubSubmit::Full`] or [`HubSubmit::Gone`] without touching the real
+/// hub, so tests can drive the drain's shed-and-recover paths
+/// deterministically (review R4-01). Not used by any run path.
+#[doc(hidden)]
+#[derive(Clone, Default)]
+pub struct SubmitFault(Arc<std::sync::atomic::AtomicU8>);
+
+impl SubmitFault {
+    /// Let submissions through to the real hub.
+    pub fn clear(&self) {
+        self.0.store(0, Ordering::Release);
+    }
+    /// Shed every submission as [`HubSubmit::Full`].
+    pub fn full(&self) {
+        self.0.store(1, Ordering::Release);
+    }
+    /// Shed every submission as [`HubSubmit::Gone`].
+    pub fn gone(&self) {
+        self.0.store(2, Ordering::Release);
+    }
+    fn forced(&self) -> Option<HubSubmit> {
+        match self.0.load(Ordering::Acquire) {
+            1 => Some(HubSubmit::Full),
+            2 => Some(HubSubmit::Gone),
+            _ => None,
+        }
+    }
 }
 
 impl LiveSourceHandle {
+    /// Test seam: route this handle's submissions through `fault`.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn with_fault(mut self, fault: SubmitFault) -> Self {
+        self.fault = Some(fault);
+        self
+    }
+
+    /// The forced outcome when the test seam sheds this submission.
+    fn forced(&self) -> Option<HubSubmit> {
+        self.fault.as_ref().and_then(SubmitFault::forced)
+    }
+
     /// Request a synthetic producer spawn (or replacement). Never blocks; a
     /// shed request is reported as [`HubSubmit::Full`]/[`HubSubmit::Gone`]
     /// (the tile rides the slate).
     #[must_use]
     pub fn request_spawn_synth(&self, spawn: SynthSpawn) -> HubSubmit {
+        if let Some(forced) = self.forced() {
+            return forced;
+        }
         Self::submit_outcome(&self.tx.try_send(HubRequest::SpawnSynth(spawn)))
     }
 
@@ -276,6 +362,9 @@ impl LiveSourceHandle {
     /// [`HubSubmit::Full`]/[`HubSubmit::Gone`] (the tile rides the slate).
     #[must_use]
     pub fn request_spawn_source(&self, spawn: SourceSpawn) -> HubSubmit {
+        if let Some(forced) = self.forced() {
+            return forced;
+        }
         let request = HubRequest::SpawnSource(Box::new(spawn));
         Self::submit_outcome(&self.tx.try_send(request))
     }
@@ -286,6 +375,9 @@ impl LiveSourceHandle {
     /// [`HubSubmit::Full`]/[`HubSubmit::Gone`].
     #[must_use]
     pub fn request_teardown(&self, id: &str) -> HubSubmit {
+        if let Some(forced) = self.forced() {
+            return forced;
+        }
         let request = HubRequest::Teardown { id: id.to_owned() };
         Self::submit_outcome(&self.tx.try_send(request))
     }
@@ -349,6 +441,7 @@ impl LiveSourceHub {
     pub fn handle(&self) -> LiveSourceHandle {
         LiveSourceHandle {
             tx: self.tx.clone(),
+            fault: None,
         }
     }
 
@@ -397,15 +490,28 @@ fn worker_loop(
                 // store (the drain reused it, so the tile holds last-good).
                 teardown(&spawn.id, &mut owned, registry);
                 if let Some(ingest) = ingest {
+                    if ingest.invalidate_live_edit(&spawn.id) {
+                        preview_remove(preview, &spawn.id);
+                        continue;
+                    }
                     ingest.source_without_audio(&spawn.id);
                 }
                 spawn_synth(spawn, &mut owned, registry, preview);
+            }
+            HubRequest::SpawnSource(spawn)
+                if ingest.is_some_and(|ingest| ingest.update_policy(&spawn)) =>
+            {
+                // Same media definition: the running producer stays untouched.
             }
             HubRequest::SpawnSource(spawn) => {
                 // The decoded-kind edit mirror of SpawnSynth: stop the old
                 // producer first, then spawn the replacement ingest thread
                 // into the SAME reused store (the tile holds last-good).
                 teardown(&spawn.source.id, &mut owned, registry);
+                if ingest.is_some_and(|ingest| ingest.invalidate_live_edit(&spawn.source.id)) {
+                    preview_remove(preview, &spawn.source.id);
+                    continue;
+                }
                 spawn_decoded(*spawn, ingest, &mut owned, registry, preview);
             }
             HubRequest::Teardown { id } => {
@@ -450,6 +556,10 @@ fn spawn_decoded(
         return;
     };
     preview_insert(preview, &id, &spawn.store);
+    if spawner.catalogue(&spawn) {
+        // Demand-managed: the source starts when (and only while) consumed.
+        return;
+    }
     match spawner.spawn(spawn, registry) {
         Some(SpawnedProducer { stop, handle }) => {
             owned.insert(id, Producer { stop, handle });
@@ -588,6 +698,47 @@ fn teardown(id: &str, owned: &mut HashMap<String, Producer>, registry: &StopRegi
     await_exits(id, &registered);
 }
 
+/// Stop one rail of source `id` and bounded-wait for it to leave, off the
+/// output clock. The video rail is `id` plus every `{id}/` companion except the
+/// audio decode; the audio rail is `{id}/audio`. `owned` handles are joined
+/// bounded. Producers that overrun the grace window are detached and warned.
+pub fn stop_rail(
+    registry: &StopRegistry,
+    id: &str,
+    video: bool,
+    audio: bool,
+    owned: Vec<JoinHandle<()>>,
+) {
+    let prefix = format!("{id}/");
+    let audio_key = format!("{id}/audio");
+    let registered: Vec<ProducerStop> = match registry.lock() {
+        Ok(mut map) => {
+            let keys: Vec<String> = map
+                .keys()
+                .filter(|key| {
+                    let is_audio = **key == audio_key;
+                    let is_video = !is_audio && (*key == id || key.starts_with(&prefix));
+                    (video && is_video) || (audio && is_audio)
+                })
+                .cloned()
+                .collect();
+            keys.iter().filter_map(|key| map.remove(key)).collect()
+        }
+        Err(poisoned) => {
+            tracing::warn!(source = %id, "stop registry poisoned during a rail stop");
+            drop(poisoned);
+            Vec::new()
+        }
+    };
+    for producer in &registered {
+        producer.stop.store(true, Ordering::Release);
+    }
+    for handle in owned {
+        join_bounded(id, handle);
+    }
+    await_exits(id, &registered);
+}
+
 /// Bounded-wait until every producer's `exited` latch is set (it left), so a
 /// replacement never races a still-writing predecessor on a reused store.
 fn await_exits(id: &str, producers: &[ProducerStop]) {
@@ -622,6 +773,11 @@ fn join_bounded(id: &str, handle: JoinHandle<()>) {
     if handle.join().is_err() {
         tracing::error!(source = %id, "live producer thread panicked");
     }
+}
+
+/// Make `id`'s store previewable (a started source).
+pub fn preview_insert_shared(preview: &SharedStores, id: &str, store: &Arc<TileStore<Nv12Image>>) {
+    preview_insert(preview, id, store);
 }
 
 /// RCU-insert `id → store` into the shared preview map.
@@ -778,10 +934,12 @@ mod tests {
         let registry = stop_registry();
         let preview = shared_stores(HashMap::new());
         let hub = LiveSourceHub::start(Arc::clone(&registry), Arc::clone(&preview));
-        let store = Arc::new(TileStore::<Nv12Image>::with_defaults("s1"));
+        // Lifecycle tokens are process-wide per source id: a parallel test that
+        // spawns the same id would fence this producer out. Keep ids unique.
+        let store = Arc::new(TileStore::<Nv12Image>::with_defaults("s-shutdown"));
         assert!(matches!(
             hub.handle().request_spawn_synth(SynthSpawn {
-                id: "s1".to_owned(),
+                id: "s-shutdown".to_owned(),
                 kind: SyntheticKind::Bars,
                 store: Arc::clone(&store),
                 width: 64,

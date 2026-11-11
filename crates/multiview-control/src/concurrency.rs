@@ -134,19 +134,48 @@ impl<S: Sync> FromRequestParts<S> for IfMatch {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IdempotencyKey(pub Option<String>);
 
-impl<S: Sync> FromRequestParts<S> for IdempotencyKey {
-    type Rejection = std::convert::Infallible;
+/// Maximum bytes in one client-supplied idempotency token.
+pub const MAX_IDEMPOTENCY_KEY_BYTES: usize = 256;
+
+impl FromRequestParts<crate::state::AppState> for IdempotencyKey {
+    type Rejection = ControlError;
 
     fn from_request_parts(
         parts: &mut Parts,
-        _state: &S,
+        state: &crate::state::AppState,
     ) -> impl std::future::Future<Output = Result<Self, Self::Rejection>> + Send {
-        let key = parts
-            .headers
-            .get("idempotency-key")
-            .and_then(|v| v.to_str().ok())
-            .map(str::to_owned);
-        std::future::ready(Ok(Self(key)))
+        let result = (|| {
+            let Some(raw) = parts.headers.get("idempotency-key") else {
+                return Ok(Self(None));
+            };
+            let key = raw.to_str().map_err(|_| {
+                ControlError::Validation("Idempotency-Key must be valid header text".into())
+            })?;
+            if key.is_empty() || key.len() > MAX_IDEMPOTENCY_KEY_BYTES {
+                return Err(ControlError::Validation(format!(
+                    "Idempotency-Key must contain 1..={MAX_IDEMPOTENCY_KEY_BYTES} bytes"
+                )));
+            }
+            let principal = crate::routes::authenticate_principal(parts, state)?;
+            let method = parts.method.as_str();
+            let path = parts.uri.path();
+            // Explicit length prefixes make this namespace unambiguous even if
+            // a client puts colons in its token or an API key id contains one.
+            // Exact resource paths keep a key on one object/action from replaying
+            // an unrelated operation; do not key on the query string.
+            let scope = format!(
+                "{}:{method}:{}:{}:{}:{}:{}:{}",
+                method.len(),
+                principal.key_id.len(),
+                principal.key_id,
+                path.len(),
+                path,
+                key.len(),
+                key
+            );
+            Ok(Self(Some(scope)))
+        })();
+        std::future::ready(result)
     }
 }
 
@@ -158,16 +187,25 @@ pub enum Reservation {
     /// This key was already used: `op` is the original id; do **not** re-enqueue
     /// the command — return the original `202` outcome.
     Replay(OperationId),
+    /// The bounded reservation store cannot admit a new distinct key. Existing
+    /// keys still replay; the caller must return a typed capacity response.
+    Capacity,
 }
+
+/// Maximum distinct idempotency keys admitted per process. No reservation is
+/// evicted without an explicit release, even when this cap is reached.
+pub const MAX_IDEMPOTENCY_RESERVATIONS: usize = 4096;
 
 /// An in-memory store mapping `Idempotency-Key` values to the operation id that
 /// was minted for the first request bearing that key.
 ///
 /// A retried start/stop/swap with the same key returns the original
 /// [`OperationId`] ([`Reservation::Replay`]) so the engine is never asked to
-/// apply the command twice. The store is a plain `Mutex<HashMap>` — it is **not**
-/// on the engine's data plane (control-only state), so guarding it with a lock
-/// cannot back-pressure the engine.
+/// apply the command twice. Reservation count is capped; a fresh distinct key
+/// at capacity fails closed rather than evicting a possibly active operation.
+/// No completion signal exists here, so accepted reservations cannot expire
+/// safely by time alone. A future completed-operation hook must supply expiry.
+/// The control-only mutex cannot back-pressure the engine.
 #[derive(Debug, Default)]
 pub struct IdempotencyStore {
     seen: Mutex<HashMap<String, OperationId>>,
@@ -180,11 +218,24 @@ impl IdempotencyStore {
         Self::default()
     }
 
+    /// The current number of retained reservations and the fixed process cap.
+    /// This is a control-plane operational gauge, not an engine clock metric.
+    #[must_use]
+    pub fn usage(&self) -> (usize, usize) {
+        let guard = self
+            .seen
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        (guard.len(), MAX_IDEMPOTENCY_RESERVATIONS)
+    }
+
     /// Reserve an operation id for `key`.
     ///
     /// If `key` is `None`, every call is [`Reservation::Fresh`] (no dedupe). If
     /// `key` was seen before, returns [`Reservation::Replay`] with the original
-    /// id; otherwise records and returns a [`Reservation::Fresh`] id.
+    /// id; otherwise records and returns a [`Reservation::Fresh`] id. A new
+    /// distinct key at the finite cap returns [`Reservation::Capacity`] without
+    /// minting or executing an operation; existing-key replay still succeeds.
     #[must_use]
     pub fn reserve(&self, key: Option<&str>) -> Reservation {
         let Some(key) = key else {
@@ -199,6 +250,9 @@ impl IdempotencyStore {
         };
         if let Some(existing) = guard.get(key) {
             return Reservation::Replay(existing.clone());
+        }
+        if guard.len() >= MAX_IDEMPOTENCY_RESERVATIONS {
+            return Reservation::Capacity;
         }
         let op = OperationId::new();
         guard.insert(key.to_owned(), op.clone());
@@ -317,6 +371,101 @@ mod tests {
             matches!(store.reserve(key), Reservation::Replay(op) if op == running),
             "a stale rebind never clobbers the live mapping"
         );
+    }
+
+    #[test]
+    fn reservation_capacity_fails_closed_without_evicting_replay_or_unkeyed_calls() {
+        let store = IdempotencyStore::new();
+        let mut first = None;
+        for i in 0..super::MAX_IDEMPOTENCY_RESERVATIONS {
+            let Reservation::Fresh(op) = store.reserve(Some(&format!("key-{i}"))) else {
+                panic!("new key {i} must be admitted before the cap");
+            };
+            if i == 0 {
+                first = Some(op);
+            }
+        }
+        let first = first.unwrap();
+        assert_eq!(
+            store.usage(),
+            (
+                super::MAX_IDEMPOTENCY_RESERVATIONS,
+                super::MAX_IDEMPOTENCY_RESERVATIONS
+            )
+        );
+        for i in 0..512 {
+            assert_eq!(
+                store.reserve(Some(&format!("excess-{i}"))),
+                Reservation::Capacity
+            );
+        }
+        assert_eq!(
+            store.reserve(Some("key-0")),
+            Reservation::Replay(first.clone())
+        );
+        assert!(matches!(store.reserve(None), Reservation::Fresh(_)));
+        store.release(Some("key-0"), &first);
+        assert_eq!(store.usage().0, super::MAX_IDEMPOTENCY_RESERVATIONS - 1);
+        assert!(matches!(store.reserve(Some("new")), Reservation::Fresh(_)));
+        assert_eq!(store.reserve(Some("excess-0")), Reservation::Capacity);
+    }
+
+    #[test]
+    fn a_flood_cannot_evict_an_inflight_reservation_and_release_is_idempotent() {
+        let store = IdempotencyStore::new();
+        let Reservation::Fresh(active) = store.reserve(Some("active")) else {
+            panic!("fresh active reservation");
+        };
+        for i in 1..super::MAX_IDEMPOTENCY_RESERVATIONS {
+            assert!(matches!(
+                store.reserve(Some(&format!("key-{i}"))),
+                Reservation::Fresh(_)
+            ));
+        }
+        assert_eq!(
+            store.reserve(Some("active")),
+            Reservation::Replay(active.clone())
+        );
+        store.release(Some("active"), &active);
+        store.release(Some("active"), &active);
+        assert!(matches!(
+            store.reserve(Some("replacement")),
+            Reservation::Fresh(_)
+        ));
+    }
+
+    #[test]
+    fn concurrent_reservation_is_single_flight_at_capacity() {
+        let store = std::sync::Arc::new(IdempotencyStore::new());
+        for i in 0..super::MAX_IDEMPOTENCY_RESERVATIONS - 1 {
+            assert!(matches!(
+                store.reserve(Some(&format!("pre-{i}"))),
+                Reservation::Fresh(_)
+            ));
+        }
+        let workers: Vec<_> = (0..16)
+            .map(|_| {
+                let store = std::sync::Arc::clone(&store);
+                std::thread::spawn(move || store.reserve(Some("concurrent")))
+            })
+            .collect();
+        let results: Vec<_> = workers
+            .into_iter()
+            .map(|thread| thread.join().unwrap())
+            .collect();
+        let fresh: Vec<_> = results
+            .iter()
+            .filter_map(|result| match result {
+                Reservation::Fresh(op) => Some(op),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(fresh.len(), 1, "one request gets the final slot");
+        assert!(results.iter().all(|result| match result {
+            Reservation::Fresh(op) | Reservation::Replay(op) => op == fresh[0],
+            Reservation::Capacity => false,
+        }));
+        assert_eq!(store.reserve(Some("other")), Reservation::Capacity);
     }
 
     #[test]

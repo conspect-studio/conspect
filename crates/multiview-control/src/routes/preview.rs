@@ -69,6 +69,40 @@ pub(crate) async fn program_jpeg(State(state): State<AppState>, principal: Princ
     }
 }
 
+/// `GET /api/v1/preview/switcher/{me}/preview.jpg` — an actual PVW tap,
+/// never a silent copy of the PGM monitor. M/E+program authorization applies.
+pub(crate) async fn switcher_preview_jpeg(
+    State(state): State<AppState>,
+    principal: Principal,
+    Path(me): Path<String>,
+) -> Response {
+    if let Err(err) = principal.role.require(Action::Read) {
+        return err.into_response();
+    }
+    if let Err(err) = crate::auth::authorize_object(&principal, &me) {
+        return err.into_response();
+    }
+    if let Err(err) =
+        crate::auth::authorize_scope(&principal, multiview_events::AuthzScope::Program("main"))
+    {
+        return err.into_response();
+    }
+    if me != "me1" {
+        return crate::error::ControlError::NotFound {
+            kind: "mix_effects",
+            id: me,
+        }
+        .into_response();
+    }
+    if state.switcher.is_none() {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    }
+    match state.preview.switcher_preview_jpeg(PREVIEW_QUALITY) {
+        Some(bytes) => jpeg_response(bytes),
+        None => StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    }
+}
+
 /// `GET /api/v1/preview/inputs/{id}.jpg` — the latest frame of input `id`
 /// (role: read). `503` when the input is unknown or has produced no frame.
 pub(crate) async fn input_jpeg(
@@ -89,10 +123,30 @@ pub(crate) async fn input_jpeg(
     if let Err(err) = crate::auth::authorize_object(&principal, id) {
         return err.into_response();
     }
-    match state.preview.input_jpeg(id, PREVIEW_QUALITY) {
-        Some(bytes) => jpeg_response(bytes),
-        None => StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    // Polling a preview is a consumer: a short lease, extended by each poll,
+    // starts an idle source off-clock. Until its first frame this answers 503
+    // with `X-Multiview-Source-State: starting` so the UI can say so.
+    let phase = state
+        .source_demand
+        .as_ref()
+        .and_then(|demand| demand.touch_preview(id));
+    if let Some(bytes) = state.preview.input_jpeg(id, PREVIEW_QUALITY) {
+        return jpeg_response(bytes);
     }
+    let mut response = StatusCode::SERVICE_UNAVAILABLE.into_response();
+    if let Some(phase) = phase {
+        let token = match phase {
+            crate::source_demand::SourceDemandPhase::Idle
+            | crate::source_demand::SourceDemandPhase::Starting => "starting",
+            crate::source_demand::SourceDemandPhase::Ready => "ready",
+            crate::source_demand::SourceDemandPhase::Failed => "failed",
+        };
+        response.headers_mut().insert(
+            "x-multiview-source-state",
+            header::HeaderValue::from_static(token),
+        );
+    }
+    response
 }
 
 /// `GET /api/v1/preview/inputs` — the ids of inputs that can be previewed

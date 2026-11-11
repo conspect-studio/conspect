@@ -1178,7 +1178,8 @@ impl SessionStream {
             return None;
         }
         let seq = self.issue_seq();
-        let event = (*seq_event.event).clone();
+        let mut event = (*seq_event.event).clone();
+        self.redact_embedded_objects(&mut event);
         let topic = topic_for_event(&event);
         // Resource scope (the tile/input/output id) the client keys this delta
         // by — read before the event is moved into the envelope.
@@ -1196,6 +1197,9 @@ impl SessionStream {
             // answers (end-to-end): echo it directly. No registry, no queue — an
             // event with no id (adopt/reconnect convergence) stays uncorrelated.
             Event::DeviceMode(mode) => mode.operation_id.clone().map(OperationId::from_string),
+            Event::SwitcherOperation(outcome) => {
+                Some(OperationId::from_string(outcome.operation_id.clone()))
+            }
             _ => self.corr.as_ref().and_then(|registry| {
                 CorrKey::for_event(&event).and_then(|key| registry.resolve(&key, seq_event.seq))
             }),
@@ -1229,6 +1233,25 @@ impl SessionStream {
     /// allocation, never touches the engine publish path (invariant #10).
     fn event_in_scope(&self, event: &Event) -> bool {
         scope_permits(&self.scopes(), event.authz_scope())
+    }
+
+    /// Hide identities an event names besides the object it is authorized
+    /// under (review DMD-04): an `input.lifecycle` holder can name another
+    /// source (an automation pin's owner), redacted unless that source is in
+    /// scope. Live and replayed deltas both pass through here.
+    fn redact_embedded_objects(&self, event: &mut Event) {
+        if let Event::InputLifecycle(lifecycle) = event {
+            for holder in &mut lifecycle.lease_holders {
+                if holder
+                    .object_id
+                    .as_deref()
+                    .is_some_and(|object| !self.id_in_object_scope(object))
+                {
+                    crate::source_demand::RESTRICTED_LABEL.clone_into(&mut holder.label);
+                    holder.object_id = None;
+                }
+            }
+        }
     }
 
     /// Whether an object `id` is visible to this session's principal (BOLA
@@ -1281,7 +1304,11 @@ pub fn event_scope_id(event: &Event) -> Option<String> {
         Event::TimingStatus(timing) => Some(timing.stream_id.clone()),
         // A media-player lifecycle event scopes by the player id (ADR-RT008), so
         // the `ids` filter narrows the coarse `switcher` topic to one player.
+        Event::SwitcherOperation(e) => Some(e.me.clone()),
         Event::MediaPlayerState(e) => Some(e.player.clone()),
+        Event::GraphicsChannelState(e) => Some(e.channel.clone()),
+        // A catalogue link status scopes by the linked source id.
+        Event::CatalogueLinkStatus(e) => Some(e.source_id.clone()),
         // A discovery row has no registry id yet (untrusted inventory): it is
         // correlated to its scan operation via `corr`, never a fabricated id.
         _ => None,
@@ -1360,7 +1387,10 @@ pub fn topic_for_event(event: &Event) -> Topic {
         // Both input connection state AND elementary-stream inventory deltas ride
         // the existing `inputs` lane (RT-3: `input.streams` is a delta on
         // re-probe / PMT-version bump, not a new topic).
-        Event::InputConnection(_) | Event::InputStreams(_) => Topic::Inputs,
+        Event::InputConnection(_)
+        | Event::InputStreams(_)
+        | Event::InputLifecycle(_)
+        | Event::CatalogueLinkStatus(_) => Topic::Inputs,
         Event::JobProgress(_) => Topic::Jobs,
         // Broadcast monitoring/control events ride their own topics so a client
         // can subscribe to the alarm or tally firehose independently.
@@ -1389,7 +1419,9 @@ pub fn topic_for_event(event: &Event) -> Topic {
         // The broadcast-switcher lifecycle lane (ADR-RT008): a media player's
         // discrete transport-state transition rides the lossless `switcher`
         // topic (scoped finer by the player `id`), NOT the `$control` catch-all.
-        Event::MediaPlayerState(_) => Topic::Switcher,
+        Event::SwitcherOperation(_)
+        | Event::MediaPlayerState(_)
+        | Event::GraphicsChannelState(_) => Topic::Switcher,
         _ => Topic::Control,
     }
 }

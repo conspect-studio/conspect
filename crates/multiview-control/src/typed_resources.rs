@@ -28,6 +28,8 @@ pub(crate) const APPLY_HEADER: HeaderName = HeaderName::from_static("x-multiview
 pub(crate) enum ApplyMode {
     /// The mutation was enqueued for the running engine's frame-boundary drain.
     Live,
+    /// The program mix changed live, but the discrete track topology did not.
+    Partial,
     /// The stored document takes effect via config export + restart.
     Restart,
 }
@@ -37,6 +39,7 @@ impl ApplyMode {
     const fn header_value(self) -> HeaderValue {
         match self {
             Self::Live => HeaderValue::from_static("live"),
+            Self::Partial => HeaderValue::from_static("partial"),
             Self::Restart => HeaderValue::from_static("restart"),
         }
     }

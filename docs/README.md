@@ -72,6 +72,7 @@ Getting media in and out across many transports, robustly.
 | [inputs.md](io/inputs.md) | Ingest sources (rtsp/hls/ts/srt/rtmp/ndi/file/test), the input pacer, jitter buffers, and supervised reconnect. |
 | [outputs.md](io/outputs.md) | Output sinks/servers: RTSP, HLS/LL-HLS, NDI out, RTMP/SRT push, and encode-once-mux-many fan-out. |
 | [ndi.md](io/ndi.md) | NDI input & output: the feature-gated runtime-load model, frame formats, framesync, and the licensing/attribution constraints. |
+| [iptv-org.md](io/iptv-org.md) | IPTV-ORG Source Browser: server-side catalogue sync, map-first place search, source provenance + link tracking, and the deep stream probe. |
 
 ### Media (`media/`)
 The audio/visual feature path. (Decode and the GPU compositor are covered in

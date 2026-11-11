@@ -306,6 +306,7 @@ async fn run_capturing(
         pipeline.audio_free_sources_slot(),
         live_hub.handle(),
         pipeline.player_mailboxes(),
+        pipeline.display_layout_slot(),
     );
 
     // The capture/relay task: wait for the run to publish frames, snapshot the
@@ -341,15 +342,14 @@ async fn run_capturing(
         Captured { before, after }
     });
 
-    let report = pipeline
-        .run_until_serving(
-            &stop,
-            publisher.as_ref(),
-            &preview_slot,
-            move |drive: &mut CompositorDrive<Nv12Image>| drain(drive),
-        )
-        .await
-        .expect("serving run");
+    let report = Box::pin(pipeline.run_until_serving(
+        &stop,
+        publisher.as_ref(),
+        &preview_slot,
+        move |drive: &mut CompositorDrive<Nv12Image>| drain(drive),
+    ))
+    .await
+    .expect("serving run");
     assert!(
         !report.faltered,
         "the route take must not falter the output"
@@ -441,6 +441,7 @@ async fn run_command_to_hls(pipeline: &mut Pipeline, config: &MultiviewConfig, c
         pipeline.audio_free_sources_slot(),
         live_hub.handle(),
         pipeline.player_mailboxes(),
+        pipeline.display_layout_slot(),
     );
 
     let stop_for_relay = stop.clone();
@@ -456,15 +457,14 @@ async fn run_command_to_hls(pipeline: &mut Pipeline, config: &MultiviewConfig, c
         stop_for_relay.stop();
     });
 
-    let report = pipeline
-        .run_until_serving(
-            &stop,
-            publisher.as_ref(),
-            &preview_slot,
-            move |drive: &mut CompositorDrive<Nv12Image>| drain(drive),
-        )
-        .await
-        .expect("serving run");
+    let report = Box::pin(pipeline.run_until_serving(
+        &stop,
+        publisher.as_ref(),
+        &preview_slot,
+        move |drive: &mut CompositorDrive<Nv12Image>| drain(drive),
+    ))
+    .await
+    .expect("serving run");
     assert!(
         !report.faltered,
         "the route take must not falter the output"

@@ -116,6 +116,8 @@ async fn put_routing(
     slot: Arc<multiview_framestore::SwapCell<Option<Arc<AudioControlHandle>>>>,
     body: &serde_json::Value,
 ) -> (String, Option<String>) {
+    #[cfg(feature = "gpu")]
+    static GPU_PROBE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
     std::env::set_var("MULTIVIEW_CONTROL_TOKEN", "test-secret");
     let cfg = config();
     let publisher = Arc::new(EnginePublisher::<EngineStateSnapshot, Event>::new(8));
@@ -123,12 +125,20 @@ async fn put_routing(
     let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
     let caps = multiview_control::LiveApplyCaps::default()
         .with_audio_routing(routing_live_capability(slot));
+    // `nvidia` enables GPU capability discovery in bind_and_serve. Each test
+    // creates its own server, and concurrent wgpu adapter probes can stall the
+    // host GPU driver. Serialize only server startup, not HTTP requests or the
+    // audio bus: the independent routing tests still run concurrently.
+    #[cfg(feature = "gpu")]
+    let gpu_probe = GPU_PROBE.lock().await;
     let (addr, server, _state) = control::bind_and_serve(
         "[::1]:0",
         &cfg,
         publisher,
         commands,
         multiview_control::no_preview(),
+        None, // switcher absent (legacy path)
+        None, // switcher lease owner absent
         None,
         None,
         None,
@@ -144,6 +154,8 @@ async fn put_routing(
     )
     .await
     .expect("control server binds");
+    #[cfg(feature = "gpu")]
+    drop(gpu_probe);
     let body = serde_json::to_string(body).unwrap();
     let req = format!(
         "PUT /api/v1/audio-routing HTTP/1.0\r\nHost: {addr}\r\nAuthorization: Bearer admin.test-secret\r\nIf-Match: W/\"1\"\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
@@ -179,6 +191,53 @@ fn swap_doc(rate: u32) -> serde_json::Value {
             { "input_id": "bbc", "channels": { "kind": "stereo" }, "include_in_program_bus": true, "gain_db": 3.0 }
         ]
     })
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_new_discrete_track_defers_only_tracks_and_changes_audible_program() {
+    let mut run = running_bus();
+    let live_tracks = Arc::new(multiview_framestore::SwapCell::from_pointee(
+        Vec::<String>::new(),
+    ));
+    let startup: multiview_config::AudioRouting =
+        serde_json::from_value(serde_json::json!({"sample_rate_hz": 48000, "routes": []}))
+            .expect("startup routing");
+    let handle = Arc::new(
+        AudioControlHandle::from_sources(
+            std::collections::HashMap::new(),
+            std::collections::HashMap::from([
+                ("cnn".to_owned(), run.cnn),
+                ("bbc".to_owned(), run.bbc),
+            ]),
+        )
+        .with_startup(Some(&startup), ["cnn".to_owned(), "bbc".to_owned()])
+        .with_declared_tracks(Some(&startup), Arc::clone(&live_tracks)),
+    );
+    run.slot.store(Some(Arc::clone(&handle)));
+    run.handle = handle;
+    let before = run.bus.tick_to(1);
+    assert!((before.interleaved()[0] - 0.2).abs() < 1e-4);
+    let mut doc = swap_doc(48_000);
+    doc["routes"][1]["target_track"] = serde_json::json!("bbc-clean");
+    let (status, header) = put_routing(Arc::clone(&run.slot), &doc).await;
+    assert!(status.contains(" 200"), "{status}");
+    assert_eq!(header.as_deref(), Some("partial"));
+    assert!(
+        live_tracks.load().is_empty(),
+        "new output track must not rebind encoder"
+    );
+    assert!(run.handle.apply_pending(&mut run.bus) >= 2);
+    for tick in 2..=4 {
+        let frame = run.bus.tick_to(tick);
+        if tick == 4 {
+            let expected = 0.4 * 10f64.powf(3.0 / 20.0);
+            let actual = f64::from(*frame.interleaved().last().unwrap());
+            assert!(
+                (actual - expected).abs() < 1e-3,
+                "audible program {actual} != {expected}"
+            );
+        }
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

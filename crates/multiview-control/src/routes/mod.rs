@@ -27,12 +27,15 @@ pub mod alarms;
 pub mod audio;
 pub mod audit;
 pub mod cast_sessions;
+pub(crate) mod catalogue;
 pub mod cloudflare;
 pub mod config;
 pub mod devices;
 pub mod discovery;
+pub mod graphics;
 pub mod health;
 pub mod inputs;
+pub mod iptv;
 pub mod licence;
 pub mod logs;
 pub mod media_players;
@@ -47,10 +50,12 @@ pub mod salvos;
 pub mod source_events;
 pub mod sources;
 pub mod support;
+pub mod switcher;
 pub mod sync_groups;
 pub mod system;
 pub mod tally;
 pub mod telemetry;
+pub mod weather;
 pub(crate) mod web_capture;
 pub mod whep_output;
 pub mod whip;
@@ -465,6 +470,7 @@ pub(crate) fn submit_accepted_body(
     build: impl FnOnce(OperationId) -> ControlResult<Command>,
 ) -> ControlResult<AcceptedBody> {
     match state.idempotency.reserve(idem.0.as_deref()) {
+        Reservation::Capacity => Err(ControlError::IdempotencyCapacity),
         Reservation::Replay(op) => {
             // A retried request with the same key: return the original id
             // without re-enqueuing the command (and without re-running
@@ -807,6 +813,7 @@ pub(crate) async fn cmd_apply_layout(
     // Reserve the idempotency key and a bounded engine slot before the disk
     // commit. A full bus cannot create an unacknowledged accepted selection.
     let op = match state.idempotency.reserve(idem.0.as_deref()) {
+        Reservation::Capacity => return Err(ControlError::IdempotencyCapacity),
         Reservation::Replay(op) => {
             return Ok((
                 StatusCode::ACCEPTED,
@@ -890,6 +897,7 @@ pub(crate) async fn cmd_apply_layout(
         document: Some(Box::new(resolved)),
     };
     let corr_key = crate::realtime::CorrKey::for_command(&command);
+    state.commands.observe(&command);
     permit.send(command);
     if let Some(key) = corr_key {
         state.corr.record(key, op.clone());
@@ -969,7 +977,7 @@ impl axum::extract::FromRequestParts<AppState> for Principal {
 }
 
 /// Resolve the request's [`Principal`] from its headers (synchronous).
-fn authenticate_principal(
+pub(crate) fn authenticate_principal(
     parts: &axum::http::request::Parts,
     state: &AppState,
 ) -> Result<Principal, ControlError> {
@@ -1001,6 +1009,10 @@ fn header_value(headers: &HeaderMap, name: header::HeaderName) -> Option<String>
 /// config-as-code stores: sources, outputs, overlays, probes) and the
 /// read-only input stream inventory. Split from [`api_router`] so each stays
 /// a readable size.
+#[expect(
+    clippy::too_many_lines,
+    reason = "one flat route table per resource family reads best as a single list"
+)]
 fn resource_router() -> Router<AppState> {
     Router::new()
         .route("/layouts", get(list_layouts))
@@ -1011,8 +1023,34 @@ fn resource_router() -> Router<AppState> {
                 .put(update_layout)
                 .delete(delete_layout),
         )
+        // IPTV-ORG source browser (ADR-M015): status/index/places/links/logos/probes
+        // (read), probes POST (write), refresh/import (administer). All per-caller
+        // scoped; control plane only.
+        .route("/catalogues/iptv-org/status", get(catalogue::get_status))
+        .route("/catalogues/iptv-org/index", get(catalogue::get_index))
+        .route("/catalogues/iptv-org/places", get(catalogue::get_places))
+        .route("/catalogues/iptv-org/links", get(catalogue::get_links))
+        .route("/catalogues/iptv-org/logos/{k}", get(catalogue::get_logo))
+        .route("/catalogues/iptv-org/refresh", post(catalogue::post_refresh))
+        .route(
+            "/catalogues/iptv-org/import",
+            post(catalogue::post_import)
+                .layer(axum::extract::DefaultBodyLimit::max(catalogue::IMPORT_BODY_LIMIT)),
+        )
+        .route("/catalogues/iptv-org/probes", post(catalogue::post_probe))
+        .route("/catalogues/iptv-org/probes/{id}", get(catalogue::get_probe))
+        .route(
+            "/catalogues/iptv-org/sources",
+            post(catalogue::post_bulk_sources),
+        )
         // Sources resource CRUD (managed inputs), mirroring layouts.
         .route("/sources", get(sources::list_sources))
+        .route("/sources/status", get(sources::list_source_status))
+        .route("/sources/{id}/status", get(sources::get_source_status))
+        .route("/sources/{id}/start", post(sources::start_source))
+        .route("/sources/{id}/stop", post(sources::stop_source))
+        .route("/sources/import/m3u", post(iptv::import_m3u))
+        .route("/iptv", get(iptv::get_iptv).put(iptv::put_iptv))
         .route(
             "/sources/{id}",
             get(sources::get_source)
@@ -1020,10 +1058,85 @@ fn resource_router() -> Router<AppState> {
                 .put(sources::update_source)
                 .delete(sources::delete_source),
         )
+        .route("/sources/{id}/network", post(catalogue::post_source_network))
+        // Graphics (CG): data sources, templates, items, playout channels.
+        .route("/graphics/data-sources", get(graphics::list_data_sources))
+        .route(
+            "/graphics/data-sources/{id}",
+            get(graphics::get_data_source)
+                .put(graphics::put_data_source)
+                .delete(graphics::delete_data_source),
+        )
+        .route("/graphics/templates", get(graphics::list_templates))
+        .route(
+            "/graphics/templates/{id}/sample.jpg",
+            get(graphics::template_sample),
+        )
+        .route("/graphics/items", get(graphics::list_items))
+        .route(
+            "/graphics/items/{id}",
+            get(graphics::get_item)
+                .put(graphics::put_item)
+                .delete(graphics::delete_item),
+        )
+        .route(
+            "/graphics/items/{id}/thumbnail.jpg",
+            get(graphics::item_thumbnail),
+        )
+        .route("/graphics/channels", get(graphics::list_channels))
+        .route("/graphics/channels/{id}", get(graphics::get_channel))
+        .route(
+            "/graphics/channels/{id}/rundown",
+            get(graphics::get_rundown).put(graphics::put_rundown),
+        )
+        .route("/graphics/channels/{id}/cue", post(graphics::cue))
+        .route("/graphics/channels/{id}/take", post(graphics::take))
+        .route("/graphics/channels/{id}/clear", post(graphics::clear))
+        .route("/graphics/channels/{id}/next", post(graphics::next))
+        // BOM weather locations (management-plane poller + normalized data).
+        .route("/weather/locations", get(weather::list_locations))
+        .route(
+            "/weather/locations/{id}",
+            get(weather::get_location)
+                .put(weather::put_location)
+                .delete(weather::delete_location),
+        )
         // Read-only input elementary-stream inventory (RT-3): every stream an
         // input offers, projected from the off-engine cached snapshot (inv #10).
         .route("/inputs/{id}/streams", get(inputs::get_input_streams))
         .route("/inputs/{id}/events", get(source_events::get_source_events))
+        .route(
+            "/inputs/{id}/events/journal",
+            get(source_events::get_event_journal),
+        )
+        .route(
+            "/inputs/{id}/events/journal.jsonl",
+            get(source_events::get_event_journal_dump),
+        )
+        .route(
+            "/events/journal.jsonl",
+            get(source_events::get_event_journal_export),
+        )
+        .route(
+            "/inputs/{id}/events/test",
+            post(source_events::post_source_event_test),
+        )
+        .route(
+            "/inputs/{id}/events/automation",
+            get(source_events::get_automation).put(source_events::put_automation),
+        )
+        .route(
+            "/inputs/{id}/events/automation/arm",
+            post(source_events::post_automation_arm),
+        )
+        .route(
+            "/inputs/{id}/events/automation/disarm",
+            post(source_events::post_automation_disarm),
+        )
+        .route(
+            "/inputs/{id}/events/automation/restore",
+            post(source_events::post_automation_restore),
+        )
         // Outputs resource CRUD (managed sinks/servers), mirroring layouts.
         .route("/outputs", get(outputs::list_outputs))
         .route(
@@ -1033,6 +1146,12 @@ fn resource_router() -> Router<AppState> {
                 .put(outputs::update_output)
                 .delete(outputs::delete_output),
         )
+        // Viewer playback URL derivation (ADR-0101): "a link to copy the
+        // actual URL to paste into a tool like VLC".
+        .route("/outputs/{id}/playback", get(outputs::get_output_playback))
+        // Live push-link state (listening / connected / reconnecting / drops),
+        // projected from the off-engine snapshot (inv #10).
+        .route("/outputs/{id}/link", get(outputs::get_output_link))
         // The audio-routing singleton document (program-bus + discrete tracks).
         .route(
             "/audio-routing",
@@ -1293,6 +1412,9 @@ pub fn api_router() -> Router<AppState> {
             post(media_players::cancel_exit),
         )
         // Per-stream crosspoint routing (RT-11): classify (plan) + apply (take).
+        .route("/switcher/{me}", get(switcher::get_switcher))
+        .route("/switcher/plan", post(switcher::plan_switcher))
+        .route("/switcher/commands/{kind}", post(switcher::submit_switcher))
         .route("/routing/plan", post(routing::plan_route))
         .route("/routing/{kind}/take", post(routing::take_route))
         // Tally operator surface: read resolved state, profiles, manual override.
@@ -1315,6 +1437,7 @@ pub fn api_router() -> Router<AppState> {
         // preview-WHEP) live in `signalling_router`, which `crate::router` merges
         // **with its CORS layer** so the allow-list applies only to them.
         .route("/preview/program.jpg", get(preview::program_jpeg))
+        .route("/preview/switcher/{me}/preview.jpg", get(preview::switcher_preview_jpeg))
         .route("/preview/inputs", get(preview::list_input_ids))
         .route("/preview/inputs/{id}", get(preview::input_jpeg))
         // Read-only change audit log.

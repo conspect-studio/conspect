@@ -14,8 +14,8 @@ use axum::body::Body;
 use axum::http::{header, Request, StatusCode};
 use serde_json::json;
 use support::{
-    body_json, harness, harness_with_capacity, post_json, send, OPERATOR_TOKEN, SCOPED_TOKEN,
-    VIEWER_TOKEN,
+    body_json, harness, harness_with_capacity, post_json, send, ADMIN_TOKEN, OPERATOR_TOKEN,
+    SCOPED_TOKEN, VIEWER_TOKEN,
 };
 
 #[tokio::test]
@@ -81,6 +81,112 @@ async fn idempotency_key_replay_returns_original_op_and_enqueues_once() {
         1,
         "the command was enqueued exactly once despite two submissions"
     );
+}
+
+#[tokio::test]
+async fn idempotency_keys_are_scoped_to_principal_and_action_path() {
+    let mut h = harness();
+    let req = |token: &str, path: &str| {
+        Request::builder()
+            .method("POST")
+            .uri(path)
+            .header(header::AUTHORIZATION, format!("Bearer {token}"))
+            .header(header::CONTENT_TYPE, "application/json")
+            .header("idempotency-key", "same-token")
+            .body(Body::from("{}"))
+            .unwrap()
+    };
+    let first = send(&h.router, req(OPERATOR_TOKEN, "/api/v1/commands/start")).await;
+    assert_eq!(first.status(), StatusCode::ACCEPTED);
+    let first_op = body_json(first).await["operation_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let other_principal = send(&h.router, req(ADMIN_TOKEN, "/api/v1/commands/start")).await;
+    assert_eq!(other_principal.status(), StatusCode::ACCEPTED);
+    let admin_op = body_json(other_principal).await["operation_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let other_action = send(&h.router, req(OPERATOR_TOKEN, "/api/v1/commands/stop")).await;
+    assert_eq!(other_action.status(), StatusCode::ACCEPTED);
+    let stop_op = body_json(other_action).await["operation_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert_ne!(first_op, admin_op);
+    assert_ne!(first_op, stop_op);
+    let replay = send(&h.router, req(OPERATOR_TOKEN, "/api/v1/commands/start")).await;
+    assert_eq!(body_json(replay).await["operation_id"], first_op);
+    assert_eq!(
+        h.commands.try_drain().len(),
+        3,
+        "one per principal/action, no replay enqueue"
+    );
+}
+
+#[tokio::test]
+async fn exhausted_reservations_return_typed_503_but_existing_key_replays() {
+    let store = std::sync::Arc::new(multiview_control::IdempotencyStore::new());
+    let mut h = support::harness_with({
+        let store = std::sync::Arc::clone(&store);
+        move |mut state| {
+            state.idempotency = store;
+            state
+        }
+    });
+    let req = |key: &str| {
+        Request::builder()
+            .method("POST")
+            .uri("/api/v1/commands/start")
+            .header(header::AUTHORIZATION, format!("Bearer {OPERATOR_TOKEN}"))
+            .header(header::CONTENT_TYPE, "application/json")
+            .header("idempotency-key", key)
+            .body(Body::from("{}"))
+            .unwrap()
+    };
+    let first = send(&h.router, req("existing")).await;
+    let first_op = body_json(first).await["operation_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    for i in 1..multiview_control::concurrency::MAX_IDEMPOTENCY_RESERVATIONS {
+        assert!(matches!(
+            store.reserve(Some(&format!("filler-{i}"))),
+            multiview_control::Reservation::Fresh(_)
+        ));
+    }
+    let refusal = send(&h.router, req("new-key")).await;
+    assert_eq!(refusal.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(
+        body_json(refusal).await["type"],
+        "/problems/idempotency-capacity"
+    );
+    let replay = send(&h.router, req("existing")).await;
+    assert_eq!(replay.status(), StatusCode::ACCEPTED);
+    assert_eq!(body_json(replay).await["operation_id"], first_op);
+    assert_eq!(
+        h.commands.try_drain().len(),
+        1,
+        "capacity refusal did not enqueue"
+    );
+}
+
+#[tokio::test]
+async fn invalid_idempotency_tokens_are_rejected_not_treated_as_missing() {
+    let h = harness();
+    for token in ["", &"x".repeat(257)] {
+        let req = Request::builder()
+            .method("POST")
+            .uri("/api/v1/commands/start")
+            .header(header::AUTHORIZATION, format!("Bearer {OPERATOR_TOKEN}"))
+            .header(header::CONTENT_TYPE, "application/json")
+            .header("idempotency-key", token)
+            .body(Body::from("{}"))
+            .unwrap();
+        let resp = send(&h.router, req).await;
+        assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    }
 }
 
 #[tokio::test]

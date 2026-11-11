@@ -1,6 +1,6 @@
 # MoQ aggregate integration status
 
-This branch is unfinished. It is not a production deployment or a full ABR delivery claim.
+This document records the earlier aggregate integration. Main now carries the listener, encoded output-window feed, leases and browser player; issue #241 tracks actual mda001 activation and 120-second evidence. A single explicit Program H.264 production output uses the existing encoder, without a measured optional ladder or an extra NVENC session. The required feature set is `nvidia,web,moq-output`; `gpl-codecs` remains off on the test host. This is not a Cloudflare relay or full ABR delivery claim.
 
 ## Source boundaries
 

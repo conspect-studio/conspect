@@ -164,6 +164,9 @@ pub struct AudioStore {
     /// The consumer's absolute read cursor (next frame to be read). Only the
     /// single consumer advances it.
     read_frame: AtomicI64,
+    /// Bumped on every publish, so a supervisor can tell a producing source from
+    /// a silent one without reading samples.
+    publishes: std::sync::atomic::AtomicU64,
     /// Whether the producer is a live **appender** ([`publish`](AudioStore::publish)).
     /// Only then may a read re-sync a cursor stranded behind the dropped window;
     /// a window-placing producer ([`publish_window`](AudioStore::publish_window))
@@ -284,6 +287,7 @@ impl AudioStore {
                 covered: Vec::new(),
             }),
             read_frame: AtomicI64::new(0),
+            publishes: std::sync::atomic::AtomicU64::new(0),
             live_append: std::sync::atomic::AtomicBool::new(false),
             prebuffer_frames: 0,
             buffering: std::sync::atomic::AtomicBool::new(true),
@@ -386,6 +390,12 @@ impl AudioStore {
     pub fn window_backing_capacity_frames(&self) -> usize {
         let channels = self.format.channel_count().max(1);
         self.window.load().samples.capacity() / channels
+    }
+
+    /// How many publishes this store has taken. Wait-free.
+    #[must_use]
+    pub fn publish_count(&self) -> u64 {
+        self.publishes.load(Ordering::Relaxed)
     }
 
     /// The reader's current **absolute** frame position — the next absolute
@@ -518,6 +528,7 @@ impl AudioStore {
                 covered.push((appended_start, head));
             }
         }
+        self.publishes.fetch_add(1, Ordering::Relaxed);
         self.window.store(Arc::new(RingSnapshot {
             base_frame,
             samples: next,
@@ -632,6 +643,7 @@ impl AudioStore {
             }
             joined.push((start, end));
         }
+        self.publishes.fetch_add(1, Ordering::Relaxed);
         self.window.store(Arc::new(RingSnapshot {
             base_frame: new_base,
             samples: merged,
@@ -669,6 +681,9 @@ impl AudioStore {
     /// multiple of the store's channel count (so the ring never tears mid-frame).
     pub fn publish_window(&self, base_frame: i64, samples: &[f32]) -> Result<()> {
         self.live_append.store(false, Ordering::Relaxed);
+        if !samples.is_empty() {
+            self.publishes.fetch_add(1, Ordering::Relaxed);
+        }
         let channels = self.format.channel_count();
         if channels == 0 {
             return Ok(());
@@ -1017,11 +1032,68 @@ pub fn audio_decode_loop(
     store: &AudioStore,
     stop: &std::sync::atomic::AtomicBool,
 ) {
+    audio_decode_loop_with_headers(
+        path,
+        layout,
+        store,
+        stop,
+        &multiview_ffmpeg::HttpHeaders::default(),
+    );
+}
+
+/// [`audio_decode_loop`] for a live network source opened with operator HTTP
+/// `headers` (same bounded-stall open as the anchored loop). Control/IO plane
+/// thread only.
+#[cfg(feature = "ffmpeg")]
+pub fn audio_decode_loop_with_headers(
+    path: impl AsRef<std::path::Path>,
+    layout: crate::format::ChannelLayout,
+    store: &AudioStore,
+    stop: &std::sync::atomic::AtomicBool,
+    headers: &multiview_ffmpeg::HttpHeaders,
+) {
     // Honour an already-raised stop before doing any (potentially blocking) open.
     if stop.load(Ordering::Acquire) {
         return;
     }
-    let mut decoder = match crate::decode::AudioFileDecoder::open(path.as_ref(), layout) {
+    let opened = if headers.is_empty() {
+        crate::decode::AudioFileDecoder::open(path.as_ref(), layout)
+    } else {
+        crate::decode::AudioFileDecoder::open_live_with_headers(path.as_ref(), layout, headers)
+    };
+    let mut decoder = match opened {
+        Ok(decoder) => decoder,
+        Err(error) => {
+            tracing::warn!(%error, "audio decode loop: open failed; source rides silence");
+            return;
+        }
+    };
+    paced_publish_loop(
+        || {
+            decoder
+                .next_decoded()
+                .map(|unit| unit.map(|u| (u.block, u.pts)))
+        },
+        store,
+        stop,
+        PUBLISH_LEAD,
+        MAX_QUEUED_AUDIO,
+    );
+}
+
+/// [`audio_decode_loop`] for a LIVE source with no video to lock to. A stalled
+/// open or read aborts instead of hanging this thread, so a stop stays prompt.
+#[cfg(feature = "ffmpeg")]
+pub fn audio_decode_loop_live(
+    path: impl AsRef<std::path::Path>,
+    layout: crate::format::ChannelLayout,
+    store: &AudioStore,
+    stop: &std::sync::atomic::AtomicBool,
+) {
+    if stop.load(Ordering::Acquire) {
+        return;
+    }
+    let mut decoder = match crate::decode::AudioFileDecoder::open_live(path.as_ref(), layout) {
         Ok(decoder) => decoder,
         Err(error) => {
             tracing::warn!(%error, "audio decode loop: open failed; source rides silence");
@@ -1102,6 +1174,7 @@ pub const TIMELINE_CAPACITY: usize = 1_440_000;
 /// should be an [`AudioStore::timeline`] store. See
 /// [`anchored_publish_loop`].
 #[cfg(feature = "ffmpeg")]
+#[allow(clippy::too_many_arguments)] // the HLS request headers ride beside the existing anchor inputs
 pub fn audio_decode_loop_anchored(
     path: impl AsRef<std::path::Path>,
     layout: crate::format::ChannelLayout,
@@ -1110,11 +1183,16 @@ pub fn audio_decode_loop_anchored(
     anchor: &(dyn Fn() -> Option<PtsAnchor> + Sync),
     log: Option<std::sync::Arc<crate::sync_log::SyncLog>>,
     source: &str,
+    headers: &multiview_ffmpeg::HttpHeaders,
 ) {
     if stop.load(Ordering::Acquire) {
         return;
     }
-    let mut decoder = match crate::decode::AudioFileDecoder::open_live(path.as_ref(), layout) {
+    let mut decoder = match crate::decode::AudioFileDecoder::open_live_with_headers(
+        path.as_ref(),
+        layout,
+        headers,
+    ) {
         Ok(decoder) => decoder,
         Err(error) => {
             tracing::warn!(%error, "audio decode loop: open failed; source rides silence");

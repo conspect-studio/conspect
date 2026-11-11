@@ -291,3 +291,45 @@ fn revised_raw_timing_increments_only_its_boundary() {
         .unwrap()
         .is_empty());
 }
+
+/// A CRC-valid component-mode `splice_insert` (`program_splice_flag = 0`) with
+/// one component carrying its own `splice_time`.
+fn component_insert(id: u32, out: bool) -> Vec<u8> {
+    let mut b = vec![0xfc, 0x30, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xf0, 17, 5];
+    b.extend(id.to_be_bytes());
+    b.push(0x7f);
+    b.push(if out { 0x8f } else { 0x0f });
+    b.extend([1, 0x42, 0xfe, 0, 0, 0, 9]);
+    b.extend([0, 0, 0, 0]);
+    b.extend([0, 0]);
+    finish(b)
+}
+
+/// F4 regression: a component-only splice must never be promoted to a
+/// whole-source break boundary; program splices keep working.
+#[test]
+fn component_only_splice_is_not_a_whole_source_boundary() {
+    use multiview_input::scte::splice35::{SpliceCommand, SpliceInfoSection};
+    let bytes = component_insert(77, true);
+    let section = SpliceInfoSection::parse(&bytes).unwrap();
+    let SpliceCommand::Insert(cmd) = section.command else {
+        panic!("expected splice_insert");
+    };
+    assert!(!cmd.program_splice);
+    assert!(cmd.out_of_network);
+    let mut a = adapter();
+    assert!(a.ingest_section(&bytes, 0, None).unwrap().is_empty());
+    assert!(a
+        .ingest_section(&component_insert(77, false), 0, None)
+        .unwrap()
+        .is_empty());
+    assert_eq!(a.diagnostics().unsupported, 2);
+    // Program-splice compatibility: still a whole-source start.
+    let program = a.ingest_section(&insert(5), 0, None).unwrap();
+    assert_eq!(program.len(), 1);
+    assert!(matches!(program[0].boundary, EventBoundary::Start { .. }));
+    // Re-stamp keeps the component section structurally intact.
+    let restamped = section.reserialize_with_pts_adjustment(1234).unwrap();
+    let again = SpliceInfoSection::parse(&restamped).unwrap();
+    assert_eq!(again.command, section.command);
+}

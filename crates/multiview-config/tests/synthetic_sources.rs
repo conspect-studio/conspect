@@ -506,3 +506,162 @@ fn timer_recur_requires_a_recurring_time_of_day_target() {
     let cfg3 = MultiviewConfig::load_from_toml(&ok).expect("parse");
     cfg3.validate().expect("recur with recur_daily is valid");
 }
+
+#[test]
+fn weather_source_and_locations_round_trip_toml_and_json() {
+    let doc = config_with_source(
+        "kind = \"weather\"\nlocation = \"sydney\"\ntemplate = \"today\"\nbackground = \"transparent\"",
+    ) + r#"
+[[weather.locations]]
+id = "sydney"
+name = "Sydney"
+forecast_product = "IDN11060"
+aac = "NSW_PT131"
+observation_product = "IDN60920"
+station_wmo = "94768"
+"#;
+    let cfg = MultiviewConfig::load_from_toml(&doc).unwrap();
+    cfg.validate().unwrap();
+    assert!(matches!(
+        &cfg.sources[0].kind,
+        SourceKind::Weather {
+            location,
+            template: multiview_config::WeatherTemplate::Today,
+            background: multiview_config::WeatherBackground::Transparent,
+        } if location == "sydney"
+    ));
+    assert!(cfg.sources[0].kind.is_synthetic());
+    assert_eq!(
+        cfg.weather.locations[0].station_wmo.as_deref(),
+        Some("94768")
+    );
+    let again = MultiviewConfig::load_from_toml(&cfg.to_toml().unwrap()).unwrap();
+    assert_eq!(again, cfg);
+    let json: MultiviewConfig =
+        serde_json::from_value(serde_json::to_value(&cfg).unwrap()).unwrap();
+    assert_eq!(json, cfg);
+
+    // Defaults: template seven_day, background gradient; no [weather] section
+    // still loads (and is not serialized back).
+    let plain = MultiviewConfig::load_from_toml(&config_with_source(
+        "kind = \"weather\"\nlocation = \"sydney\"",
+    ))
+    .unwrap();
+    plain.validate().unwrap();
+    assert!(matches!(
+        &plain.sources[0].kind,
+        SourceKind::Weather {
+            template: multiview_config::WeatherTemplate::SevenDay,
+            background: multiview_config::WeatherBackground::Gradient,
+            ..
+        }
+    ));
+    assert!(!plain.to_toml().unwrap().contains("[weather"));
+}
+
+#[test]
+fn weather_rejects_bad_location_id_and_bad_product() {
+    let bad = MultiviewConfig::load_from_toml(&config_with_source(
+        "kind = \"weather\"\nlocation = \"../x\"",
+    ))
+    .unwrap();
+    assert!(bad.validate().is_err());
+    let doc = config_with_source("kind = \"bars\"")
+        + "\n[[weather.locations]]\nid = \"x\"\nname = \"X\"\nforecast_product = \"http://evil\"\naac = \"NSW_PT131\"\n";
+    let cfg = MultiviewConfig::load_from_toml(&doc).unwrap();
+    assert!(cfg.validate().is_err());
+}
+
+#[test]
+fn graphics_section_and_sources_round_trip_and_legacy_weather_still_loads() {
+    // Legacy document: `[weather] locations` + a `kind = "weather"` source and
+    // no `[graphics]` — must load, validate and treat the location as an
+    // effective bom_weather data source.
+    let legacy = config_with_source("kind = \"weather\"\nlocation = \"sydney\"")
+        + r#"
+[[weather.locations]]
+id = "sydney"
+name = "Sydney"
+forecast_product = "IDN11060"
+aac = "NSW_PT131"
+"#;
+    let cfg = MultiviewConfig::load_from_toml(&legacy).unwrap();
+    cfg.validate().unwrap();
+    assert!(cfg.graphics.is_empty());
+    let eff = multiview_config::graphics::effective_data_sources(&cfg.graphics, &cfg.weather);
+    assert_eq!(eff[0].id, "sydney");
+    assert!(!cfg.to_toml().unwrap().contains("[graphics"));
+
+    // New document: data sources, an item bound to a legacy location, a
+    // channel rundown, and both graphics source kinds.
+    let doc = config_with_source("kind = \"graphics_channel\"\nchannel = \"gfx-channel-1\"")
+        + r##"
+[[sources]]
+id = "pvw"
+kind = "graphics_channel"
+channel = "gfx-channel-1"
+bus = "preview"
+
+[[sources]]
+id = "one"
+kind = "graphic"
+item = "syd7"
+
+[[weather.locations]]
+id = "sydney"
+name = "Sydney"
+forecast_product = "IDN11060"
+aac = "NSW_PT131"
+
+[[graphics.data_sources]]
+id = "melbourne"
+name = "Melbourne"
+kind = "bom_weather"
+forecast_product = "IDV10753"
+aac = "VIC_PT042"
+
+[[graphics.items]]
+id = "syd7"
+name = "Sydney 7-day"
+template = "weather.seven_day"
+data_source = "sydney"
+[graphics.items.style]
+accent = "#ffc94a"
+background = "transparent"
+
+[[graphics.channels]]
+id = "gfx-channel-1"
+name = "Channel 1"
+rundown = ["syd7"]
+[graphics.channels.transition]
+kind = "mix"
+frames = 15
+"##;
+    let cfg = MultiviewConfig::load_from_toml(&doc).unwrap();
+    cfg.validate().unwrap();
+    assert!(matches!(
+        &cfg.sources[1].kind,
+        SourceKind::GraphicsChannel {
+            bus: multiview_config::GraphicsBus::Preview,
+            ..
+        }
+    ));
+    assert!(cfg.sources[2].kind.is_synthetic());
+    assert_eq!(cfg.graphics.data_sources[0].provider.tag(), "bom_weather");
+    assert_eq!(
+        cfg.graphics.channels[0].transition.kind,
+        multiview_config::TransitionKind::Mix
+    );
+    let again = MultiviewConfig::load_from_toml(&cfg.to_toml().unwrap()).unwrap();
+    assert_eq!(again, cfg);
+    let json: MultiviewConfig =
+        serde_json::from_value(serde_json::to_value(&cfg).unwrap()).unwrap();
+    assert_eq!(json, cfg);
+
+    // An item bound to an unknown data source is rejected.
+    let bad = doc.replace("data_source = \"sydney\"", "data_source = \"nowhere\"");
+    assert!(MultiviewConfig::load_from_toml(&bad)
+        .unwrap()
+        .validate()
+        .is_err());
+}

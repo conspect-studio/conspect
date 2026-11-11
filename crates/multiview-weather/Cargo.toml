@@ -9,9 +9,16 @@ authors.workspace = true
 publish = false
 
 [dependencies]
-chrono = { workspace = true, features = ["std"] }
+chrono = { workspace = true, features = ["std", "serde", "now"] }
+serde = { workspace = true }
 thiserror = { workspace = true }
 quick-xml = { version = "0.41", features = ["serialize", "encoding"] }
+# The anonymous passive-FTP product fetch (management plane only).
+tokio = { workspace = true, features = ["net", "io-util", "time", "sync", "rt"] }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["net", "io-util", "time", "rt-multi-thread", "macros"] }
 
 [lints]
 workspace = true

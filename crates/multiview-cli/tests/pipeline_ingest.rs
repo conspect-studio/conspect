@@ -503,6 +503,8 @@ async fn pipeline_serves_control_api_and_live_preview_while_ingesting() {
         Arc::clone(&publisher),
         commands,
         Arc::clone(&provider),
+        None, // switcher: absent unless a real paired bus is attached
+        None, // switcher lease owner absent
         None, // whep
         None, // whip
         None, // whep_output

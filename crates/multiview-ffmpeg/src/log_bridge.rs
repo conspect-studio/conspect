@@ -157,6 +157,33 @@ pub fn sanitize_line(raw: &str) -> String {
     out
 }
 
+/// `line` with every libav context address (`@ 0x` followed by hex digits, the
+/// `[component @ 0x…]` prefix `av_log_format_line2` renders) replaced by
+/// `@ 0x?`, for use as a suppression key. Borrowed (no allocation) when the
+/// line carries no address. Only the key is normalised; the emitted text keeps
+/// the real address of the first occurrence.
+#[must_use]
+pub fn normalize_context_address(line: &str) -> std::borrow::Cow<'_, str> {
+    const MARK: &str = "@ 0x";
+    if !line.contains(MARK) {
+        return std::borrow::Cow::Borrowed(line);
+    }
+    let mut out = String::with_capacity(line.len());
+    let mut rest = line;
+    while let Some(at) = rest.find(MARK) {
+        let (head, tail) = rest.split_at(at);
+        out.push_str(head);
+        out.push_str("@ 0x?");
+        let after = tail.get(MARK.len()..).unwrap_or("");
+        let hex_len = after
+            .find(|c: char| !c.is_ascii_hexdigit())
+            .unwrap_or(after.len());
+        rest = after.get(hex_len..).unwrap_or("");
+    }
+    out.push_str(rest);
+    std::borrow::Cow::Owned(out)
+}
+
 /// The decision the [`Suppressor`] reaches for one observed message.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
@@ -288,6 +315,12 @@ impl Suppressor {
         let tick = self.clock.wrapping_add(1);
         self.clock = tick;
 
+        // Key on the address-normalised text: libav's `[tls @ 0x55…]` prefix
+        // carries the per-context pointer, which is new on every reconnect, so
+        // keying on the raw line never coalesced reconnect noise (the TLS EOF
+        // flood). Distinct message text is still a distinct key.
+        let normalized = normalize_context_address(message);
+        let message = normalized.as_ref();
         if let Some(idx) = self.find(level, resource, message) {
             // Borrow the matched entry mutably for the window check.
             if let Some(entry) = self.entries.get_mut(idx) {

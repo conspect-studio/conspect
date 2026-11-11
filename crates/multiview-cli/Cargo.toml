@@ -23,6 +23,8 @@ path = "src/main.rs"
 multiview-core = { workspace = true }
 multiview-engine = { workspace = true }
 multiview-control = { workspace = true }
+multiview-weather = { workspace = true }
+multiview-graphics = { workspace = true }
 multiview-config = { workspace = true }
 multiview-events = { workspace = true }
 # The local entitlement plane (Conspect, ADR-0050): the cli reads the published
@@ -59,6 +61,9 @@ bytes = { version = "1", optional = true }
 hang = { version = "=0.21.22", optional = true }
 multiview-input = { workspace = true }
 multiview-output = { workspace = true }
+# Dual-stack SRT listener input (`srt_ingest`). Runtime-loaded and link-free, so
+# it adds no native build dependency.
+multiview-srt-sys = { workspace = true, optional = true }
 multiview-audio = { workspace = true }
 multiview-overlay = { workspace = true }
 multiview-preview = { workspace = true }
@@ -269,6 +274,12 @@ required-features = ["webrtc-native"]
 # in docs/architecture/conventions.md §4. They are NOT built in CI (they need
 # the vendor toolchains/SDKs installed); they exist so a release build can opt
 # in with one flag.
+# Release-mode cost of a synthetic clock/timer render and of the steady-state
+# generator loop (perf evidence for the reused per-thread renderer).
+[[example]]
+name = "synth_render_cost"
+required-features = ["overlay"]
+
 [features]
 # Real existing-output conversion only; never opens a viewer encoder.
 moq-output = ["ffmpeg", "dep:multiview-moq", "dep:bytes", "dep:hang", "dep:url", "dep:rustix", "multiview-control/moq-transport"]
@@ -334,7 +345,7 @@ qsv = ["multiview-hal/qsv"]
 # Pure Rust (rust-embed); requires the web build (`npm --prefix web run build`)
 # to have produced `web/dist` first. GPU-free and LGPL-clean, so a software
 # build can serve the full management UI: `run --features web,overlay`.
-web = ["multiview-control/embed-web"]
+web = ["multiview-control/embed-web", "multiview-control/iptv-net"]
 
 # Persist stored layouts to `<config-dir>/.multiview/layouts.db` (SQLite) so they
 # survive a restart. Off by default; on in the platform presets.
@@ -365,6 +376,12 @@ discovery = ["multiview-control/discovery"]
 # OFF by default so the baseline build stays pure-Rust/socket-free and
 # CI-green; forwards `multiview-control/devices-net` (= `zowietek` + `cast`).
 devices-net = ["multiview-control/devices-net"]
+
+# IPTV-ORG source browser (ADR-M015): catalogue sync + link tracker + deep probe on
+# the control plane. Pure-Rust (reqwest + rustls). `catalogue-ffmpeg` adds the
+# probe's decode stage (needs libav, so it rides the `ffmpeg` presets only).
+catalogue = ["multiview-control/catalogue"]
+catalogue-ffmpeg = ["catalogue", "multiview-control/catalogue-ffmpeg"]
 
 # Overlay rasterization: bakes the configured overlays (clock/labels, dB
 # meters, safe-area graticules, tally borders, burned-in SRT/VTT subtitles) into
@@ -451,6 +468,12 @@ ptp = ["multiview-engine/ptp"]
 # (LGPL `mpeg2video` by default) -> fan out to the file + HLS output sinks. Wires
 # the owning sub-crates' `ffmpeg` features and pulls `ffmpeg-next` only to name
 # its SAFE value types (no FFI in this crate). LGPL-clean: never escalates to GPL.
+# Deliberately does NOT pull `multiview-srt-sys` (ADR-0039 decision 10): the
+# dual-stack SRT listener leaf is a SEPARATE opt-in — see the `srt-libsrt`
+# feature below. A plain `ffmpeg` build still demuxes/muxes SRT in caller mode
+# through `FFmpeg`'s own `srt://` protocol; only a `[::]`/wildcard **listener**
+# needs the native leaf, and without it such a URL fails closed with a clear
+# "requires srt-libsrt" error (never libsrt's opaque "Bad parameters").
 ffmpeg = [
     "dep:ffmpeg-next",
     "dep:tempfile",
@@ -469,11 +492,12 @@ ffmpeg = [
     "multiview-audio/ffmpeg",
 ]
 
-# Opt-in dual-stack SRT listener output: enable the actual runtime-loaded
-# libsrt backend, not only the CLI test cfg. Implies the CLI's libav pipeline;
-# plain ffmpeg and all existing presets remain unchanged and LGPL-clean.
-# The output crate owns the native leaf; this curated CLI has no direct SRT FFI.
-srt-libsrt = ["ffmpeg", "multiview-output/srt-libsrt"]
+# Opt-in dual-stack SRT listener output and input: enable the actual
+# runtime-loaded libsrt backend in the output crate (main, PR 217) and the
+# CLI's own `srt_ingest` listener input via the owned `multiview-srt-sys`
+# binding (ADR-0039 decision 10). Both are `dlopen`-resolved, never linked or
+# vendored, so plain ffmpeg and all existing presets stay LGPL-clean.
+srt-libsrt = ["ffmpeg", "dep:multiview-srt-sys", "multiview-output/srt-libsrt"]
 
 # RIST (Reliable Internet Stream Transport, VSF TR-06) ingest + egress
 # (ADR-0095 Tier-0): wire a `rist` source through the libav `rist://` demuxer and
@@ -566,6 +590,15 @@ nvidia = [
     # forwarded the dependency crates' ffmpeg but not the cli's, so a `--features
     # nvidia` binary could not run a pipeline — surfaced by the on-hardware run).
     "ffmpeg",
+    # Dual-stack SRT listener leaf (ADR-0039 decision 10, amended): the operator
+    # requires IPv6-first `[::]` SRT listening for both the SRT input and output
+    # roles, which `FFmpeg`'s `libsrt` protocol cannot bind. Without this the
+    # deploy image's SRT listeners would fail closed with a clear "requires
+    # srt-libsrt" error instead of serving the production dual-stack listener.
+    "srt-libsrt",
+    # IPTV-ORG source browser (ADR-M015): catalogue sync + link tracker + deep probe
+    # (decode stage via the safe libav wrappers). Pure-Rust network I/O, LGPL-clean.
+    "catalogue-ffmpeg",
     # Native overlay / caption burn-in. The native HLS-WebVTT caption ingest +
     # per-tile burn-in path (the `#47` fix) is entirely `#[cfg(feature =
     # "overlay")]`-gated (`prefetch_caption_plans` / `wire_source_captions` / the
@@ -610,6 +643,13 @@ nvidia = [
     # shipped deploy image takes/delivers `rist://` feeds (the deployed FFmpeg is
     # built `--enable-librist`). LGPL-clean (librist is BSD-2-Clause).
     "rist",
+    # YouTube live ingest (ADR-0015): the shipped deploy image can resolve + ride
+    # a `youtube` source via the runtime-discovered `yt-dlp` resolver. The build
+    # still stays LGPL-clean (yt-dlp runs out-of-process; see the standalone
+    # `youtube` feature docs above for the full rationale) — before this, the web
+    # UI advertised a `youtube` source kind that no shipped build could actually
+    # run (every shipped build must carry whatever the UI advertises).
+    "youtube",
     # Live local-mesh discovery (Conspect, ADR-0051 §6): the shipped deploy image
     # runs the real mDNS announce/browse loop.
     "mesh-mdns",
@@ -626,6 +666,9 @@ apple = [
     "tls",
     "sqlite",
     "ffmpeg",
+    # IPTV-ORG source browser (ADR-M015): catalogue sync + link tracker + deep probe
+    # (decode stage via the safe libav wrappers). Pure-Rust network I/O, LGPL-clean.
+    "catalogue-ffmpeg",
     # Native overlay / caption burn-in (see the `nvidia` preset note). GPU-free,
     # LGPL-clean pure-Rust text engine; without it the shipped Apple deploy image
     # would silently render no native captions/overlays.
@@ -641,6 +684,8 @@ apple = [
     "webrtc-native",
     # RIST ingest + egress (ADR-0095): LGPL-clean (librist BSD-2-Clause).
     "rist",
+    # YouTube live ingest (ADR-0015): LGPL-clean (yt-dlp runs out-of-process).
+    "youtube",
     # Live local-mesh discovery (Conspect, ADR-0051 §6).
     "mesh-mdns",
     # Conspect device-licensing heartbeat client (CONSPECT-3, ADR-0096).
@@ -655,6 +700,9 @@ linux-vaapi = [
     "tls",
     "sqlite",
     "ffmpeg",
+    # IPTV-ORG source browser (ADR-M015): catalogue sync + link tracker + deep probe
+    # (decode stage via the safe libav wrappers). Pure-Rust network I/O, LGPL-clean.
+    "catalogue-ffmpeg",
     # Native overlay / caption burn-in (see the `nvidia` preset note). GPU-free,
     # LGPL-clean pure-Rust text engine; without it the shipped VAAPI deploy image
     # would silently render no native captions/overlays.
@@ -682,6 +730,8 @@ linux-vaapi = [
     "webrtc-native",
     # RIST ingest + egress (ADR-0095): LGPL-clean (librist BSD-2-Clause).
     "rist",
+    # YouTube live ingest (ADR-0015): LGPL-clean (yt-dlp runs out-of-process).
+    "youtube",
     # Live local-mesh discovery (Conspect, ADR-0051 §6).
     "mesh-mdns",
     # Conspect device-licensing heartbeat client (CONSPECT-3, ADR-0096).
@@ -721,10 +771,17 @@ full = [
     # HTTP backend. LGPL-clean (reqwest + rustls, no native lib), so it belongs
     # in the non-GPL `full` build.
     "devices-net",
+    # IPTV-ORG source browser: catalogue sync, link tracker, deep probe (with the
+    # libav decode stage). Pure-Rust network I/O + the safe ffmpeg wrappers.
+    "catalogue-ffmpeg",
     # RIST ingest + egress (ADR-0095): comes transitively via the presets above;
     # named explicitly so the everything-non-GPL build keeps it on a refactor.
     # LGPL-clean (librist BSD-2-Clause).
     "rist",
+    # YouTube live ingest (ADR-0015): comes transitively via the presets above;
+    # named explicitly so the everything-non-GPL build keeps it on a refactor.
+    # LGPL-clean (yt-dlp runs out-of-process, never vendored/linked).
+    "youtube",
     # Control-plane HTTPS (TLS-0, ADR-W029): comes transitively via `nvidia` +
     # `linux-vaapi`; named explicitly so `full` keeps it on a preset refactor.
     "tls",

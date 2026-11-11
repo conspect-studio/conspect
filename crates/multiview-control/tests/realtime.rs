@@ -578,3 +578,50 @@ async fn scoped_session_filters_tiles_snapshot_to_the_allowlist() {
         ]
     );
 }
+
+/// Review DMD-04: an `input.lifecycle` delta for an in-scope source redacts a
+/// holder that names an out-of-scope source (an automation pin's owner), live
+/// and on resume replay; an unscoped session sees it.
+#[tokio::test]
+async fn scoped_session_redacts_lifecycle_holders_naming_other_sources() {
+    use multiview_events::{InputLifecycle, LeaseHolder, SourceLifecycle};
+    let engine: Arc<Publisher> = Arc::new(EnginePublisher::new(64));
+    let lifecycle = || {
+        Event::InputLifecycle(InputLifecycle::new(
+            "mine",
+            1,
+            SourceLifecycle::Idle,
+            SourceLifecycle::Starting,
+            "a consumer needs it",
+            0,
+            vec![
+                LeaseHolder::new("event_automation", "secret-watcher")
+                    .naming(Some("secret-watcher")),
+                LeaseHolder::new("layout_cell", "cell-1"),
+            ],
+        ))
+    };
+    let labels = |frame: &multiview_control::RealtimeFrame| match &frame.envelope.payload {
+        Event::InputLifecycle(e) => e
+            .lease_holders
+            .iter()
+            .map(|h| h.label.clone())
+            .collect::<Vec<_>>(),
+        other => panic!("expected input.lifecycle, got {other:?}"),
+    };
+    let mut scoped = SessionStream::new(engine.subscribe(), "scoped", None)
+        .with_object_scope(Some(vec!["mine".to_owned()]));
+    let mut open = SessionStream::new(engine.subscribe(), "open", None);
+    // A resuming scoped client replays from the ring past its cursor.
+    let mut resumed = SessionStream::new(engine.subscribe(), "resumed", Some(0))
+        .with_object_scope(Some(vec!["mine".to_owned()]));
+    engine.publish_event(lifecycle());
+    let frame = scoped.next_delta().await.unwrap().expect("in scope");
+    assert_eq!(labels(&frame), vec!["restricted", "cell-1"]);
+    let wire = serde_json::to_string(&frame.envelope).unwrap();
+    assert!(!wire.contains("secret-watcher"), "{wire}");
+    let frame = open.next_delta().await.unwrap().expect("unscoped");
+    assert_eq!(labels(&frame), vec!["secret-watcher", "cell-1"]);
+    let frame = resumed.next_delta().await.unwrap().expect("replayed");
+    assert_eq!(labels(&frame), vec!["restricted", "cell-1"]);
+}

@@ -672,7 +672,7 @@ pub(crate) async fn set_cast_volume(
             request.level_percent
         )));
     }
-    let op = super::devices::reserve_operation(&state, &idem);
+    let op = super::devices::reserve_operation(&state, &idem)?;
     // Non-blocking dispatch to the running actor (invariant #10): a full
     // control channel or a reconnecting session sheds the command — the 202
     // stands either way (the actor is best-effort by design, ADR-M011).

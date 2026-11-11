@@ -630,6 +630,11 @@ pub struct AppState {
     /// derived and the cast-session routes refuse with an honest `409`.
     /// Read-only control-plane state (invariant #10).
     pub cast_delivery: Option<Arc<CastDelivery>>,
+    /// The IPTV-ORG source-browser catalogue (ADR-M015): sync state, joined index,
+    /// link tracker. `None` when not wired (routes answer an honest `503`).
+    pub catalogue: Option<Arc<crate::catalogue::Catalogue>>,
+    /// The IPTV-ORG deep-probe service (bounded; control plane only).
+    pub catalogue_probe: Option<Arc<crate::catalogue::probe::ProbeService>>,
     /// The outbound-dial SSRF policy (SEC-02/SEC-04, CWE-918) the managed-device
     /// poller and Cast session actor screen each resolved dial IP against. The
     /// non-breaking default
@@ -640,6 +645,18 @@ pub struct AppState {
     /// operator `control.device_dial_allow` allowlist tightens the dial to its own
     /// device subnet(s). Read-only control-plane state (invariant #10).
     pub dial_policy: Arc<multiview_config::device::net_guard::DialPolicy>,
+    /// The outbound-dial policy for **catalogue egress** (IPTV-ORG sync, logo
+    /// fetches, deep probe incl. every redirect/playlist hop, and
+    /// `POST /sources/{id}/network`). Always public-only
+    /// ([`DialPolicy::deny_all_allowlistable`](multiview_config::device::net_guard::DialPolicy::deny_all_allowlistable)):
+    /// it is deliberately NOT `dial_policy` (the managed-device policy that permits
+    /// RFC1918/ULA/CGNAT), has no setter and is not configurable, so catalogue
+    /// content can never reach an internal service (SSRF).
+    pub catalogue_dial_policy: Arc<multiview_config::device::net_guard::DialPolicy>,
+    /// The IPTV publication runtime (epg-playlist): guide feed cache, the
+    /// atomically swapped guide snapshot and the refresher wake signal.
+    /// Control-plane only (invariant #10).
+    pub iptv: Arc<crate::iptv::IptvService>,
     /// The runtime store of **ephemeral** cast sessions (DEV-D2, ADR-M011):
     /// runtime-only records that never enter the devices store, so a config
     /// export can never emit them. "Save as device" promotes one into a
@@ -713,6 +730,12 @@ pub struct AppState {
     pub config_versions: Arc<dyn ConfigVersionStore>,
     /// The `Idempotency-Key` deduplication store.
     pub idempotency: Arc<IdempotencyStore>,
+    /// Real M/E frame-boundary handle; absent until dual-bus pipeline is wired.
+    /// Routes fail closed rather than pretending that an unwired switcher applied.
+    pub switcher: Option<multiview_engine::switcher_control::SwitcherControl>,
+    /// Bounded sustained PVW lease retained across requests; the previous lease
+    /// is released only after a new source lease is acquired.
+    pub switcher_preview_lease: Arc<crate::source_demand::SwitcherPreviewLeases>,
     /// The command-outcome correlation registry: pairs each accepted command's
     /// [`OperationId`](crate::command::OperationId) with the realtime outcome
     /// event it will produce, so the outcome's envelope echoes the op id as
@@ -727,6 +750,17 @@ pub struct AppState {
     pub preview: crate::preview::SharedPreview,
     /// Optional read-only source-event adapter; absent until wired by the binary.
     pub source_events: Option<crate::source_events::SharedSourceEvents>,
+    /// Source demand status and preview leases. `None` on run paths with no
+    /// demand manager: every source then reports as running at boot did.
+    pub source_demand: Option<crate::source_demand::SharedSourceDemand>,
+    /// Optional raw marker journal reader; absent until wired by the binary.
+    pub event_journal: Option<crate::event_journal::JournalReader>,
+    /// Optional operator test-injection adapter (ADR-0183 item 5); absent
+    /// until wired by the binary. Administer-only; never a general evidence
+    /// submission surface.
+    pub source_event_test_injector: Option<crate::source_events::SharedSourceEventTestInjector>,
+    /// ADR-0183 ad-break automation executor (management plane), if running.
+    pub automation: Option<Arc<crate::automation::AutomationExecutor>>,
     /// The WHEP focus transport seam (sub-second WebRTC focus per scope). The
     /// default ([`NoWhep`](crate::preview::NoWhep)) refuses every focus with an
     /// honest `503 fallback`; the binary swaps in a transport-backed provider
@@ -784,6 +818,20 @@ pub struct AppState {
     /// or realtime surfaces — and only to requests that carry an `Origin` (a
     /// non-browser publisher/player sees no CORS headers). Default `["*"]`.
     pub cors_allow_origins: Arc<Vec<String>>,
+    /// The externally-reachable **hostname** (no scheme, no port) viewer
+    /// playback URLs are derived against (`[control] public_host`, ADR-0101).
+    /// `None` ⇒ `GET /api/v1/outputs/{id}/playback` falls back to the
+    /// request's own `Host` header (nginx passes it through unchanged) and,
+    /// failing that, returns an honest "no public host known" note instead of
+    /// a guessed URL. Read-only control-plane state (invariant #10).
+    pub public_host: Option<Arc<str>>,
+    /// An explicit `[control] public_scheme` override (`"http"` or
+    /// `"https"`) for the scheme used to build an absolute viewer URL, when
+    /// the per-request `X-Forwarded-Proto` header is absent/invalid — see
+    /// [`multiview_config::resolve_public_scheme`]. `None` ⇒ no override (the
+    /// `X-Forwarded-Proto` header, else the `public_host`-configured default,
+    /// decides). Read-only control-plane state (invariant #10).
+    pub public_scheme: Option<Arc<str>>,
     /// The complete configuration document loaded at startup (serialized
     /// verbatim), used as the baseline for `GET /api/v1/config/export` so
     /// sections the resource stores do not carry (control, placement, audio,
@@ -904,6 +952,16 @@ pub struct AppState {
     /// software-engine truth); the full-pipeline run upgrades to
     /// [`LiveSourceCapability::synthetic_and_network`].
     pub live_sources: LiveSourceCapability,
+    /// The management-plane BOM weather poller handle (locations in, freshness
+    /// and the shared snapshot store out). Defaults to an unspawned service
+    /// over a private store; the binary installs the global one.
+    pub weather: multiview_weather::service::WeatherService,
+    /// The Graphics (CG) runtime: effective `[graphics]` config + per-channel
+    /// PVW/PGM playout state. Defaults to a private hub; the binary installs
+    /// the process-global one its graphics generators read.
+    pub graphics: multiview_graphics::GraphicsHub,
+    /// Off-clock item/template thumbnail renderer (none by default).
+    pub graphics_thumbnails: crate::routes::graphics::SharedThumbnailer,
     /// The static system capability + licence snapshot served by
     /// `GET /api/v1/system/capabilities` (ADR-W030): which codec/compositor
     /// backends are available, the compositor class, the effective build-profile
@@ -963,10 +1021,16 @@ impl AppState {
             device_drivers: Arc::new(DeviceDriverRegistry::new()),
             device_pollers: Arc::new(DevicePollerRegistry::new()),
             cast_delivery: None,
+            catalogue: None,
+            catalogue_probe: None,
             // Non-breaking default: LAN devices (private/ULA/carrier) stay
             // dialable, never-legitimate ranges stay blocked. An operator
             // `control.device_dial_allow` allowlist tightens it (SEC-02/SEC-04).
             dial_policy: Arc::new(multiview_config::device::net_guard::DialPolicy::allow_lan()),
+            catalogue_dial_policy: Arc::new(
+                multiview_config::device::net_guard::DialPolicy::deny_all_allowlistable(),
+            ),
+            iptv: Arc::new(crate::iptv::IptvService::default()),
             cast_sessions: Arc::new(CastSessionStore::new()),
             audio_routing: Arc::new(AudioRoutingStore::new()),
             alarms: Arc::new(InMemoryAlarmStore::new()),
@@ -989,6 +1053,8 @@ impl AppState {
             pending_actions: Arc::new(InMemoryPendingActions::new()),
             config_versions: Arc::new(InMemoryConfigVersionStore::new()),
             idempotency: Arc::new(IdempotencyStore::new()),
+            switcher: None,
+            switcher_preview_lease: Arc::new(crate::source_demand::SwitcherPreviewLeases::default()),
             // Bound the in-flight correlations: a generous ceiling for pending
             // command outcomes (drop-oldest beyond it, invariant #10). A backlog
             // this deep means outcomes are not being consumed; the oldest
@@ -997,6 +1063,10 @@ impl AppState {
             ack_clock: Arc::new(system_ack_clock),
             preview: crate::preview::no_preview(),
             source_events: None,
+            source_demand: None,
+            event_journal: None,
+            source_event_test_injector: None,
+            automation: None,
             whep: crate::preview::no_whep(),
             moq: Arc::new(crate::moq::MoqRegistry::default()),
             web_capture: crate::web_capture::Provider::default(),
@@ -1019,6 +1089,13 @@ impl AppState {
             // §9): a browser served from any web origin can WHIP-publish /
             // WHEP-play. The binary narrows this from `webrtc.cors_allow_origins`.
             cors_allow_origins: Arc::new(vec!["*".to_owned()]),
+            // No configured public_host by default: the playback route falls
+            // back to the request Host header, then an honest note.
+            public_host: None,
+            // No configured public_scheme override by default:
+            // X-Forwarded-Proto, then the public_host-configured default,
+            // decides.
+            public_scheme: None,
             // Empty + unpinned by default: the licence resource reports
             // unlicensed data and the install path refuses until the binary
             // pins an issuer key + wires a store (CONSPECT-10). Never off air.
@@ -1063,6 +1140,9 @@ impl AppState {
             // kinds live-apply. The binary upgrades this per run path
             // (`with_live_sources`) — the header never over-claims.
             live_sources: LiveSourceCapability::synthetic_only(),
+            weather: multiview_weather::service::WeatherService::default(),
+            graphics: multiview_graphics::GraphicsHub::default(),
+            graphics_thumbnails: std::sync::Arc::new(crate::routes::graphics::NoThumbnails),
             // The coarse honest software-only capability surface until the binary
             // maps the real HAL probe + compiled features (`with_capabilities`,
             // ADR-W030). A static snapshot (inv #10).
@@ -1201,6 +1281,30 @@ impl AppState {
         self
     }
 
+    /// Install the graphics hub (seeded with the effective `[graphics]`).
+    #[must_use]
+    pub fn with_graphics(mut self, graphics: multiview_graphics::GraphicsHub) -> Self {
+        self.graphics = graphics;
+        self
+    }
+
+    /// Install the off-clock graphics thumbnail renderer.
+    #[must_use]
+    pub fn with_graphics_thumbnails(
+        mut self,
+        thumbs: crate::routes::graphics::SharedThumbnailer,
+    ) -> Self {
+        self.graphics_thumbnails = thumbs;
+        self
+    }
+
+    /// Install the BOM weather poller handle (locations + snapshot store).
+    #[must_use]
+    pub fn with_weather(mut self, weather: multiview_weather::service::WeatherService) -> Self {
+        self.weather = weather;
+        self
+    }
+
     /// Declare which source kinds the running engine can apply live
     /// (ADR-W018): the binary sets this per run path so the
     /// `X-Multiview-Apply` header answers from the engine's real runtime
@@ -1253,6 +1357,51 @@ impl AppState {
         self
     }
 
+    /// Attach the source demand provider.
+    #[must_use]
+    pub fn with_source_demand(
+        mut self,
+        provider: crate::source_demand::SharedSourceDemand,
+    ) -> Self {
+        self.source_demand = Some(provider);
+        self
+    }
+
+    /// Attach the raw marker journal reader.
+    #[must_use]
+    pub fn with_event_journal(mut self, reader: crate::event_journal::JournalReader) -> Self {
+        self.event_journal = Some(reader);
+        self
+    }
+
+    /// Attach the ADR-0183 ad-break automation executor.
+    #[must_use]
+    pub fn with_automation(mut self, executor: Arc<crate::automation::AutomationExecutor>) -> Self {
+        self.automation = Some(executor);
+        self
+    }
+
+    /// Attach the operator test-injection adapter (ADR-0183 item 5).
+    #[must_use]
+    pub fn with_source_event_test_injector(
+        mut self,
+        injector: crate::source_events::SharedSourceEventTestInjector,
+    ) -> Self {
+        self.source_event_test_injector = Some(injector);
+        self
+    }
+
+    /// Attach only after the engine is actually composing PGM/PVW and the
+    /// configured output bus has a live frame provider.
+    #[must_use]
+    pub fn with_switcher(
+        mut self,
+        switcher: multiview_engine::switcher_control::SwitcherControl,
+    ) -> Self {
+        self.switcher = Some(switcher);
+        self
+    }
+
     /// Replace the live-preview provider (the binary wires an engine-backed one;
     /// the default yields no frames).
     #[must_use]
@@ -1300,6 +1449,27 @@ impl AppState {
     #[must_use]
     pub fn with_cors_allow_origins(mut self, origins: Vec<String>) -> Self {
         self.cors_allow_origins = Arc::new(origins);
+        self
+    }
+
+    /// Set the externally-reachable `[control] public_host` viewer playback
+    /// URLs are derived against (ADR-0101). The binary maps
+    /// `config.control.public_host` through here; `None`/absent keeps the
+    /// request-`Host`-header fallback.
+    #[must_use]
+    pub fn with_public_host(mut self, public_host: Option<String>) -> Self {
+        self.public_host = public_host.map(Arc::from);
+        self
+    }
+
+    /// Set the `[control] public_scheme` override (ADR-0101 scheme
+    /// derivation) for the scheme used to build an absolute viewer URL. The
+    /// binary maps `config.control.public_scheme` through here; `None`/absent
+    /// keeps the `X-Forwarded-Proto`-header-then-`public_host`-default
+    /// derivation.
+    #[must_use]
+    pub fn with_public_scheme(mut self, public_scheme: Option<String>) -> Self {
+        self.public_scheme = public_scheme.map(Arc::from);
         self
     }
 
@@ -1693,6 +1863,18 @@ impl AppState {
         policy: Arc<multiview_config::device::net_guard::DialPolicy>,
     ) -> Self {
         self.dial_policy = policy;
+        self
+    }
+
+    /// Install the IPTV-ORG catalogue and deep-probe services (ADR-M015).
+    #[must_use]
+    pub fn with_catalogue(
+        mut self,
+        catalogue: Arc<crate::catalogue::Catalogue>,
+        probe: Arc<crate::catalogue::probe::ProbeService>,
+    ) -> Self {
+        self.catalogue = Some(catalogue);
+        self.catalogue_probe = Some(probe);
         self
     }
 
