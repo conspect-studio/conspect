@@ -14379,6 +14379,7 @@ fn player_runtime_loop(
 /// `#[cfg(test)]` and the seek/flush ordering is unchanged.
 #[cfg(all(test, feature = "ffmpeg"))]
 pub(crate) mod seek_barrier {
+    #![allow(clippy::expect_used)] // Test-only barrier poisoning is a fixture failure.
     use std::collections::HashMap;
     use std::sync::{Arc, Condvar, Mutex, OnceLock};
     use std::time::{Duration, Instant};
@@ -14393,11 +14394,18 @@ pub(crate) mod seek_barrier {
     impl Gate {
         fn wait_flag(&self, pick: fn(&(bool, bool, bool)) -> bool, what: &str) {
             let deadline = Instant::now() + Duration::from_secs(20);
-            let mut g = self.state.lock().unwrap();
+            let mut g = self
+                .state
+                .lock()
+                .expect("test barrier must not be poisoned");
             while !pick(&g) {
                 let left = deadline.saturating_duration_since(Instant::now());
                 assert!(!left.is_zero(), "hang deadline: {what}");
-                g = self.cv.wait_timeout(g, left).unwrap().0;
+                g = self
+                    .cv
+                    .wait_timeout(g, left)
+                    .expect("test barrier must not be poisoned")
+                    .0;
             }
         }
         /// Block until the worker is parked before its actual seek.
@@ -14406,12 +14414,18 @@ pub(crate) mod seek_barrier {
         }
         /// Whether the worker is parked and has NOT yet seeked.
         pub(crate) fn blocked(&self) -> bool {
-            let g = self.state.lock().unwrap();
+            let g = self
+                .state
+                .lock()
+                .expect("test barrier must not be poisoned");
             g.0 && !g.1
         }
         /// Let the native seek/flush proceed.
         pub(crate) fn release(&self) {
-            self.state.lock().unwrap().1 = true;
+            self.state
+                .lock()
+                .expect("test barrier must not be poisoned")
+                .1 = true;
             self.cv.notify_all();
         }
         /// Block until the worker has resumed past the barrier.
@@ -14426,7 +14440,7 @@ pub(crate) mod seek_barrier {
     }
 
     fn key(runtime: &crate::player::PlayerRuntime) -> usize {
-        Arc::as_ptr(&runtime.opener) as usize
+        Arc::as_ptr(&runtime.opener).addr()
     }
 
     /// Arm a barrier for exactly this runtime.
@@ -14434,19 +14448,28 @@ pub(crate) mod seek_barrier {
         let gate = Arc::new(Gate::default());
         registry()
             .lock()
-            .unwrap()
+            .expect("test barrier must not be poisoned")
             .insert(key(runtime), Arc::clone(&gate));
         gate
     }
 
     /// Worker side: park before the actual seek if this runtime is armed.
     pub(crate) fn pause_before_seek(runtime: &crate::player::PlayerRuntime) {
-        let gate = registry().lock().unwrap().remove(&key(runtime));
+        let gate = registry()
+            .lock()
+            .expect("test barrier must not be poisoned")
+            .remove(&key(runtime));
         let Some(gate) = gate else { return };
-        gate.state.lock().unwrap().0 = true;
+        gate.state
+            .lock()
+            .expect("test barrier must not be poisoned")
+            .0 = true;
         gate.cv.notify_all();
         gate.wait_flag(|s| s.1, "barrier never released");
-        gate.state.lock().unwrap().2 = true;
+        gate.state
+            .lock()
+            .expect("test barrier must not be poisoned")
+            .2 = true;
         gate.cv.notify_all();
     }
 }
@@ -23125,7 +23148,7 @@ loop_default = true
                 TileRead::NoSignal
             )
         });
-        let store = Arc::clone(&boot.stores[0].1);
+        let store = Arc::clone(&boot.stores.first().expect("player fixture store").1);
         let na_y = match store.read_at(MediaTime::ZERO) {
             TileRead::Fresh { frame } | TileRead::Held { frame, .. } => frame.y_plane()[0],
             _ => 0,
@@ -26518,7 +26541,7 @@ loop_default = true
         let worker = std::thread::spawn(move || {
             super::player_runtime_loop(&plan, plan.player.as_ref().unwrap(), &s2)
         });
-        let store = Arc::clone(&boot.stores[0].1);
+        let store = Arc::clone(&boot.stores.first().expect("player fixture store").1);
 
         let rt = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
@@ -26824,8 +26847,9 @@ loop_default = true
                     source,
                     1_000_000_000,
                 ))));
-            let store = Arc::clone(&boot.stores[0].1);
-            let audio_store = Arc::clone(&boot.audio_stores[0].1);
+            let store = Arc::clone(&boot.stores.first().expect("player fixture store").1);
+            let audio_store =
+                Arc::clone(&boot.audio_stores.first().expect("audio fixture store").1);
             let audio_plan = boot.audio_plans.into_iter().next().unwrap();
             let audio_stop = Arc::new(AtomicBool::new(false));
             let a_stop = Arc::clone(&audio_stop);
@@ -26884,14 +26908,21 @@ loop_default = true
                     assert_eq!(frame.canvas.width(), w);
                     assert_eq!(frame.canvas.height(), h);
                     let centre = usize::try_from(h / 2 * w + w / 2).unwrap();
-                    (tick, frame.canvas.y_plane()[centre])
+                    (
+                        tick,
+                        *frame
+                            .canvas
+                            .y_plane()
+                            .get(centre)
+                            .expect("canvas centre pixel"),
+                    )
                 })
                 .collect()
         }
 
         fn first_tick_after_anchor(&self) -> u64 {
             let anchor = self.handle.control_bus.load().start_anchor.unwrap();
-            let t = (0_i64..)
+            let t = (0_i64..1_000_000)
                 .find(|i| MediaTime::from_tick(*i, self.cadence) >= anchor)
                 .unwrap();
             u64::try_from(t).unwrap()
@@ -26910,7 +26941,10 @@ loop_default = true
         match store.read_at(at) {
             TileRead::Fresh { frame } | TileRead::Held { frame, .. } => {
                 let (w, h) = (frame.width(), frame.height());
-                frame.y_plane()[usize::try_from(h / 2 * w + w / 2).unwrap()]
+                *frame
+                    .y_plane()
+                    .get(usize::try_from(h / 2 * w + w / 2).unwrap())
+                    .expect("frame centre pixel")
             }
             _ => 0,
         }
@@ -26952,8 +26986,8 @@ loop_default = true
         assert!(gate.blocked());
 
         // Output clock + compositor while the worker cannot make progress.
-        const N: u64 = 120;
-        let frames = rig.drive(first, N);
+        let n: u64 = 120;
+        let frames = rig.drive(first, n);
         assert!(gate.blocked(), "worker stayed blocked for every tick");
         assert_eq!(frames.len(), 120);
         for (i, (tick, luma)) in frames.iter().enumerate() {
@@ -26973,7 +27007,7 @@ loop_default = true
             rig.runtime.status.load().fault.is_none(),
             "seek completed without fault"
         );
-        let more = rig.drive(first + N, 5);
+        let more = rig.drive(first + n, 5);
         assert_eq!(more.len(), 5);
         assert!(
             rig.shutdown().is_none(),
@@ -27049,7 +27083,7 @@ loop_default = true
             rig.worker.as_ref().unwrap().is_finished()
         });
         let anchor = rig.handle.control_bus.load().start_anchor.unwrap();
-        let first = (0_i64..)
+        let first = (0_i64..1_000_000)
             .find(|i| MediaTime::from_tick(*i, rig.cadence) >= anchor)
             .map(|t| u64::try_from(t).unwrap())
             .unwrap();
@@ -27058,7 +27092,7 @@ loop_default = true
             assert_eq!(tick.index, first + u64::try_from(i).unwrap());
         }
         assert!(
-            crate::player::runtime_provider().is_registered(PLAYER) == false,
+            !crate::player::runtime_provider().is_registered(PLAYER),
             "panicked worker unregistered its runtime"
         );
         drop(rig.shutdown());
@@ -27350,9 +27384,8 @@ loop_default = true
         let child_root = std::env::var_os("MULTIVIEW_TEST_RECOVERY_CHILD");
         let is_child = child_root.is_some();
         let tmp = child_root.is_none().then(|| tempfile::tempdir().unwrap());
-        let directory = child_root
-            .map(PathBuf::from)
-            .unwrap_or_else(|| tmp.as_ref().unwrap().path().to_owned());
+        let directory =
+            child_root.map_or_else(|| tmp.as_ref().unwrap().path().to_owned(), PathBuf::from);
         let state = directory.join("state");
         let marker = directory.join("precommit");
         let config = plain_config();
