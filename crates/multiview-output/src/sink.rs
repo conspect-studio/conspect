@@ -3429,7 +3429,6 @@ mod tests {
 
     #[test]
     fn packet_write_failure_discards_partial_and_resumes_at_rap() {
-        let _counter_guard = counter_guard();
         use super::{PacketSource, SegmentState, StreamSeed};
         use crate::hls::LivePlaylist;
         use ffmpeg::codec::packet::{Flags, Packet};
@@ -3441,6 +3440,7 @@ mod tests {
                 Ok(self.0.next())
             }
         }
+        let _counter_guard = counter_guard();
         let dir = tempfile::tempdir().unwrap();
         let encoder = VideoEncoder::new(&EncodeConfig::mpeg2(WIDTH, HEIGHT).target()).unwrap();
         let params = StreamCodecParameters::from_encoder(&encoder);
@@ -3486,7 +3486,6 @@ mod tests {
 
     #[test]
     fn unsupported_recovery_fails_before_live_source_can_drain() {
-        let _counter_guard = counter_guard();
         use super::{PacketSource, SegmentState, StreamSeed};
         use crate::hls::LivePlaylist;
         use ffmpeg::codec::packet::{Flags, Packet};
@@ -3509,6 +3508,7 @@ mod tests {
                 Ok(Some(EncodedPacket::from_packet(packet)))
             }
         }
+        let _counter_guard = counter_guard();
         let dir = tempfile::tempdir().unwrap();
         let encoder = VideoEncoder::new(&EncodeConfig::mpeg2(WIDTH, HEIGHT).target()).unwrap();
         let mut state = SegmentState::new(
@@ -3532,7 +3532,6 @@ mod tests {
 
     #[test]
     fn source_end_during_recovery_returns_error_instead_of_stale_success() {
-        let _counter_guard = counter_guard();
         use super::{PacketSource, SegmentState, StreamSeed};
         use crate::hls::LivePlaylist;
         use ffmpeg::codec::packet::{Flags, Packet};
@@ -3543,6 +3542,7 @@ mod tests {
                 Ok(self.0.next())
             }
         }
+        let _counter_guard = counter_guard();
         let dir = tempfile::tempdir().unwrap();
         let encoder = VideoEncoder::new(&EncodeConfig::mpeg2(WIDTH, HEIGHT).target()).unwrap();
         let params = StreamCodecParameters::from_encoder(&encoder);
@@ -3579,11 +3579,11 @@ mod tests {
 
     #[test]
     fn playlist_publication_fault_is_terminal_and_keeps_prior_manifest() {
-        let _counter_guard = counter_guard();
         use super::{SegmentState, StreamSeed};
         use crate::hls::LivePlaylist;
         use ffmpeg::codec::packet::{Flags, Packet};
         use multiview_ffmpeg::{EncodedPacket, StreamCodecParameters, VideoEncoder};
+        let _counter_guard = counter_guard();
         let dir = tempfile::tempdir().unwrap();
         let encoder = VideoEncoder::new(&EncodeConfig::mpeg2(WIDTH, HEIGHT).target()).unwrap();
         let params = StreamCodecParameters::from_encoder(&encoder);
