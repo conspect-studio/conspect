@@ -6698,9 +6698,11 @@ mod switcher_shed_audio_tests {
 
     /// Records each encoded job's tick and program PCM; the first encode waits
     /// on a gate so later jobs (including a CUT) sit in the worker queue.
+    type EncodedTicks = Arc<std::sync::Mutex<Vec<(u64, Vec<f32>)>>>;
+
     struct GatedRecorder {
         gate: Option<std::sync::mpsc::Receiver<()>>,
-        seen: Arc<std::sync::Mutex<Vec<(u64, Vec<f32>)>>>,
+        seen: EncodedTicks,
     }
     impl crate::rendition_workers::AudioEncodeWork for GatedRecorder {
         fn encode(
@@ -6752,7 +6754,7 @@ mod switcher_shed_audio_tests {
             [("a".into(), pa), ("b".into(), pb)].into_iter().collect(),
         );
         let (release, gate) = std::sync::mpsc::channel();
-        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen: EncodedTicks = Arc::new(std::sync::Mutex::new(Vec::new()));
         let dispatched = Arc::new(std::sync::Mutex::new(Vec::new()));
         let sink = Arc::clone(&dispatched);
         let worker = crate::rendition_workers::AudioEncodeWorker::spawn(

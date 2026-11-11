@@ -934,10 +934,12 @@ mod tests {
         let registry = stop_registry();
         let preview = shared_stores(HashMap::new());
         let hub = LiveSourceHub::start(Arc::clone(&registry), Arc::clone(&preview));
-        let store = Arc::new(TileStore::<Nv12Image>::with_defaults("s1"));
+        // Lifecycle tokens are process-wide per source id: a parallel test that
+        // spawns the same id would fence this producer out. Keep ids unique.
+        let store = Arc::new(TileStore::<Nv12Image>::with_defaults("s-shutdown"));
         assert!(matches!(
             hub.handle().request_spawn_synth(SynthSpawn {
-                id: "s1".to_owned(),
+                id: "s-shutdown".to_owned(),
                 kind: SyntheticKind::Bars,
                 store: Arc::clone(&store),
                 width: 64,
