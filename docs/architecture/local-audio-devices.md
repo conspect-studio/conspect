@@ -67,10 +67,14 @@ device callback ──push──▶ [SPSC ring, ~200 ms] ──pop──▶ pump
     re-primes from fresh callback frames.
   - If `unread_frames` exceeds target + 100 ms (for example, the program bus paused reading), the
     pump discards incoming frames until unread is back at the target, then resets the servo.
-  - Already-published audio is handled by the consumer: the store gets a `max_lag` of target +
-    15 ms for this source kind. On `read`, if `head − cursor` exceeds it (the program bus paused or
-    stopped reading, even briefly), the reader itself skips its cursor to `head − target` before
-    reading. (The servo keeps normal lag within ±10 ms of the target, below this bound.) This
+  - Already-published audio is handled by the consumer. Unread fill normally swings by one tick
+    quantum (40 ms at 25 fps) around the target, so the bound is applied to the lag **left after
+    this read**: if `head − cursor − frames` exceeds the target + 20 ms (the program bus paused or
+    stopped reading, even briefly), the reader itself skips its cursor so that exactly the target
+    remains after the read. In steady playback the remaining lag is about target − quantum/2 ± the
+    servo's 10 ms, always below the bound, so routine reads never skip.
+  - Test: continuous playback at 23.976, 25, 29.97, 50 and 60 fps for 10 simulated minutes with
+    ±300 ppm drift gives zero consumer skips. This
     is the existing consumer-owned re-sync logic in `AudioStore::read`, extended with one bound; it
     stays wait-free and only the consumer moves the cursor.
   - Discarded frames are counted (`stale_discard_frames`, `consumer_skip_frames`).
@@ -127,16 +131,20 @@ program bus ──push (wait-free)──▶ [engine→drain SPSC ring, ~200 ms] 
   heartbeat (callback count) in an atomic.
 - **Freshness in the callback.** The device ring's read side belongs to the callback, so the
   callback itself rejects old audio, without waiting for the drain:
-  - The drain writes each chunk into the device ring with a header: the monotonic time it was
-    written (an integer from `Instant`, taken on the drain thread) and the current `flush_epoch`.
+  - The engine stamps each pushed block with the monotonic instant of its tick (program time).
+    The drain carries that stamp, plus the offset of the chunk's first frame, into every
+    device-ring chunk header, together with the current `flush_epoch`. The age a chunk carries is
+    therefore the age of its program content, not the time it was written to the device ring.
   - The callback reads the monotonic clock once per call (a vDSO / `mach_absolute_time` read, no
-    syscall or lock) and skips every chunk older than the device-ring target + 30 ms, or from an
-    older `flush_epoch`, before it plays. Skipped frames are counted.
+    syscall or lock) and skips every chunk whose program content is older than the end-to-end
+    budget (engine→drain target 60 ms + device-ring target + 30 ms), or from an older
+    `flush_epoch`, before it plays. Skipped frames are counted.
   - The drain increments `flush_epoch` on every re-anchor (engine drop, drain stall, heartbeat gap
     of 50 ms), so a drain-side re-anchor also invalidates what is already in the device ring.
-  - Test: both interleavings (callback resumes before the drain notices; drain stalls while the
-    callback runs) with a tick-stamped signal; the first frame played after each stall of 50 ms to
-    2 s is from current program time within target + 30 ms.
+  - Test: both interleavings (callback resumes before the drain notices, with an engine backlog
+    below overflow; drain stalls while the callback runs) with a tick-stamped signal; the first
+    frame played after each stall of 50 ms to 2 s is within the end-to-end budget of current
+    program time.
 - **Distinct states,** each with its own transition:
   - *underrun* (callback found the ring short): counted; the servo re-anchors; no reopen.
   - *ring full* (device not consuming but heartbeat advancing): normal, the drain waits.
