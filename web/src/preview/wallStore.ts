@@ -17,6 +17,8 @@ export interface WallStats {
   decoders: number;
   gapsOver500ms: number;
   maxGapMs: number;
+  /** Last session failure, for diagnostics only (never shown as an operator error). */
+  lastError?: string | undefined;
 }
 
 declare global {
@@ -194,8 +196,9 @@ export class WallStore {
           onActive: () => { this.stats.sessions += 1; this.stats.decoders += 1; },
           onFrame: this.onFrame,
         });
-      } catch {
+      } catch (error) {
         failed = !isAborted(aborted);
+        if (failed) this.stats.lastError = error instanceof Error ? `${error.name}: ${error.message}` : String(error);
       }
       this.session = undefined;
       this.playingGeneration = undefined;

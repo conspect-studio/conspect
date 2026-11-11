@@ -27,6 +27,12 @@ use std::time::{Duration, Instant};
 pub const WALL_OUTPUT_ID: &str = "wall";
 /// The bus identity the wall registers under, distinct from every program bus.
 pub const WALL_BUS_ID: &str = "wall";
+/// First registry routing index the wall may use. Production windows are routed
+/// by runner index, and a production H.264 output is absent from the effective
+/// snapshot until its first keyframe proves its decoder metadata, so "one past
+/// the highest effective index" can collide with a real runner. The wall uses a
+/// range no runner index reaches.
+pub(crate) const WALL_INDEX_BASE: usize = 1 << 20;
 
 /// Operator configuration. Off unless `MULTIVIEW_MOQ_WALL=1`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -557,7 +563,8 @@ impl Run {
                 .map(|b| b.output_index)
                 .max()
                 .map_or(Some(0), |i| i.checked_add(1))
-                .ok_or("output index overflow")?;
+                .ok_or("output index overflow")?
+                .max(WALL_INDEX_BASE);
             self.publisher = Some((factory.clone(), publisher, first));
         }
         let (_, publisher, next_index) = self.publisher.as_mut().ok_or("no publisher")?;
@@ -936,6 +943,18 @@ segment_ms = 1000
             std::thread::sleep(Duration::from_millis(10));
         }
         let published = geometry.load().unwrap();
+        // Production runner 0 is not yet effective here (as with an H.264 output
+        // still awaiting its first keyframe); the wall must not take its index.
+        let wall_index = factory
+            .resolve(&multiview_control::WhepScope::Output(
+                WALL_OUTPUT_ID.to_owned(),
+            ))
+            .unwrap()
+            .output_index;
+        assert!(
+            wall_index >= WALL_INDEX_BASE,
+            "wall index {wall_index} collides with runner indexes"
+        );
         assert_eq!((published.width, published.height), (128, 36));
         assert_eq!(published.cells.len(), 1);
         let scope = multiview_control::WhepScope::Output(WALL_OUTPUT_ID.to_owned());
