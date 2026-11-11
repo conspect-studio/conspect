@@ -21,6 +21,7 @@ import { meterFillPercent, useAudioMeter } from '../../realtime/useAudioMeter';
 import { usePreviewCapabilities, whepAvailable } from '../../preview/capabilities';
 import { PreviewSurface } from '../../preview/PreviewSurface';
 import { useJpegStill } from '../../preview/useJpegPreview';
+import { WallCrop, WallStreamProvider, useWallSurface } from '../../preview/WallStream';
 import { Dialog, DialogContent, DialogTitle } from '../ui/dialog';
 import { useOperationFeedback, useSubmitTrackedOperation } from './useOperationFeedback';
 import { OperationFeedback } from './OperationFeedback';
@@ -32,14 +33,17 @@ const SENDING = '\u0000sending';
 function PreviewMonitor({ program, source, fresh }: { readonly program: boolean; readonly source: string | undefined; readonly fresh: boolean }): JSX.Element {
   const { t } = useLingui();
   const caps = usePreviewCapabilities();
-  const pvwStill = useJpegStill('/api/v1/preview/switcher/me1/preview.jpg', 1000, !program);
+  // Shared wall: the preview cell is whatever source the wall currently shows on preview.
+  const wallPreview = useWallSurface(useWallSurface(undefined).previewSource);
+  const pvwLive = !program && wallPreview.live && wallPreview.cell !== undefined;
+  const pvwStill = useJpegStill('/api/v1/preview/switcher/me1/preview.jpg', 1000, !program && !pvwLive);
   const pvw = pvwStill.url;
-  const pvwUnavailable = !program && pvwStill.state === 'unavailable';
+  const pvwUnavailable = !program && !pvwLive && pvwStill.state === 'unavailable';
   const [diagHost, setDiagHost] = useState<HTMLDivElement | null>(null);
   const [transportUnavailable, setTransportUnavailable] = useState(false);
-  const still = program ? (!whepAvailable(caps.data, 'program') && (!caps.data?.moq || transportUnavailable)) : pvw !== undefined;
+  const still = program ? (!whepAvailable(caps.data, 'program') && (!caps.data?.moq || transportUnavailable)) : !pvwLive && pvw !== undefined;
   return <figure className={`bd-monitor ${program ? 'bd-pgm' : 'bd-pvw'}`} data-tally={fresh && source ? (program ? 'program' : 'preview') : 'unknown'}>
-    <div className="bd-picture">{program ? <PreviewSurface scope="program" whepEndpoint="/api/v1/preview/program/whep" jpegPath="/api/v1/preview/program.jpg" label={t`Program monitor`} capabilities={caps.data} className="bd-video" diagnosticsHost={diagHost} onTransportUnavailable={() => { setTransportUnavailable(true); }} /> : pvwUnavailable ? <span role="status" data-testid="preview-unavailable"><Trans>Preview unavailable — switcher backend not deployed</Trans></span> : pvw ? <div className="bd-jpeg"><img src={pvw} alt={t`Preview monitor`} />{pvwStill.state === 'stale' ? <em className="bd-stale" data-testid="preview-stale"><Trans>Stale</Trans></em> : null}</div> : <span><Trans>Waiting for a frame…</Trans></span>}</div>
+    <div className="bd-picture">{program ? <PreviewSurface scope="program" whepEndpoint="/api/v1/preview/program/whep" jpegPath="/api/v1/preview/program.jpg" label={t`Program monitor`} capabilities={caps.data} className="bd-video" diagnosticsHost={diagHost} onTransportUnavailable={() => { setTransportUnavailable(true); }} /> : pvwLive && wallPreview.previewSource ? <WallCrop source={wallPreview.previewSource} label={t`Preview monitor`} className="bd-video" testId="preview-wall" /> : pvwUnavailable ? <span role="status" data-testid="preview-unavailable"><Trans>Preview unavailable — switcher backend not deployed</Trans></span> : pvw ? <div className="bd-jpeg"><img src={pvw} alt={t`Preview monitor`} />{pvwStill.state === 'stale' ? <em className="bd-stale" data-testid="preview-stale"><Trans>Stale</Trans></em> : null}</div> : <span><Trans>Waiting for a frame…</Trans></span>}</div>
     {program ? <div className="bd-diag-slot" ref={setDiagHost} data-testid="desk-fallback-slot" /> : null}
     <figcaption><div className="bd-capline"><b>{program ? (fresh && source ? t`● ON AIR — PROGRAM` : t`○ PROGRAM — unconfirmed`) : (fresh && source ? t`▲ PREVIEW` : t`△ PREVIEW — unconfirmed`)}</b><span>{source ?? t`Unknown source`}</span></div><small>{fresh ? t`Engine-confirmed bus` : t`Unconfirmed / stale`}{pvwUnavailable ? null : still ? <> · {t`Still preview (~1 fps) — live video is unavailable for this preview`}</> : null}</small></figcaption>
     {program && <ProgramLevels />}
@@ -68,12 +72,18 @@ function tallyGlyph(tally: string): string {
 function SourcePicture({ id }: { readonly id: string }): JSX.Element {
   const { t } = useLingui();
   // Keeps the last good frame across failed polls; stale only after a bounded age (max(5 polls,10 s)).
-  const { url, state } = useJpegStill(`/api/v1/preview/inputs/${encodeURIComponent(id)}.jpg`, 2000);
+  const wall = useWallSurface(id);
+  const { url, state } = useJpegStill(`/api/v1/preview/inputs/${encodeURIComponent(id)}.jpg`, 2000, !wall.live);
+  if (wall.live) return <WallCrop source={id} label={t`Source live preview`} className="bd-source-picture" />;
   return url ? <><img className="bd-source-picture" src={url} alt={t`Source still preview`} data-still-state={state} />{state === 'stale' ? <em className="bd-stale" data-testid="tile-stale"><Trans>Stale frame</Trans></em> : null}</> : <span><Trans>No confirmed frame</Trans></span>;
 }
 
 /** Real bus state and correlated commands inside the approved desk composition. */
 export function ProductionDesk(): JSX.Element {
+  return <WallStreamProvider><ProductionDeskBody /></WallStreamProvider>;
+}
+
+function ProductionDeskBody(): JSX.Element {
   const { t } = useLingui();
   const qc = useQueryClient();
   const { status } = useEngineEvents();

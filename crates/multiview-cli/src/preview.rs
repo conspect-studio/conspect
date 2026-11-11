@@ -28,6 +28,17 @@ use crate::live_sources::SharedStores;
 /// (writer) and the provider (reader); neither blocks the other.
 pub type ProgramSlot = Arc<multiview_framestore::SwapCell<Option<Arc<Nv12Image>>>>;
 
+/// The wait-free slot the monitor-wall worker (ADR-0103) publishes its current
+/// geometry into; `None` while the wall is off, starting, or failed.
+pub type WallSlot =
+    Arc<multiview_framestore::SwapCell<Option<Arc<multiview_control::preview::WallGeometry>>>>;
+
+/// Create an empty wall-geometry slot.
+#[must_use]
+pub fn wall_slot() -> WallSlot {
+    Arc::new(multiview_framestore::SwapCell::empty())
+}
+
 /// Create an empty program slot (no frame published yet).
 #[must_use]
 pub fn program_slot() -> ProgramSlot {
@@ -119,6 +130,10 @@ pub struct CliPreviewProvider {
     stores: SharedStores,
     encoder: Nv12JpegEncoder,
     clock: MonotonicTimeSource,
+    wall: Option<WallSlot>,
+    /// Keeps the wall worker running for the control plane's lifetime.
+    #[allow(dead_code)] // Owned only to keep the wall worker alive.
+    wall_owner: Option<Box<dyn std::any::Any + Send + Sync>>,
 }
 
 impl CliPreviewProvider {
@@ -132,7 +147,28 @@ impl CliPreviewProvider {
             stores,
             encoder: Nv12JpegEncoder::new(),
             clock: MonotonicTimeSource::new(),
+            wall: None,
+            wall_owner: None,
         }
+    }
+
+    /// Serve the monitor-wall geometry from `slot`, keeping `owner` (the wall
+    /// worker handle) alive as long as this provider.
+    #[must_use]
+    pub fn with_wall(
+        mut self,
+        slot: WallSlot,
+        owner: Box<dyn std::any::Any + Send + Sync>,
+    ) -> Self {
+        self.wall = Some(slot);
+        self.wall_owner = Some(owner);
+        self
+    }
+
+    /// The shared per-source store map this provider reads.
+    #[must_use]
+    pub fn stores(&self) -> SharedStores {
+        Arc::clone(&self.stores)
     }
 
     /// Attach a genuinely separate preview bus tap; no tap means PVW is
@@ -175,6 +211,13 @@ impl PreviewProvider for CliPreviewProvider {
         let read = store.read_at(now);
         let frame = read.frame()?;
         self.encode(frame, quality)
+    }
+
+    fn wall(&self) -> Option<multiview_control::preview::WallGeometry> {
+        self.wall
+            .as_ref()?
+            .load()
+            .map(|geometry| (*geometry).clone())
     }
 
     fn input_ids(&self) -> Vec<String> {

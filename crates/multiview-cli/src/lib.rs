@@ -381,6 +381,9 @@ pub mod webrtc_outputs;
 #[cfg(feature = "webrtc-native")]
 pub mod webrtc_unified;
 
+/// The shared monitor wall (ADR-0103): one composed, once-encoded MoQ stream.
+#[cfg(feature = "moq-output")]
+pub mod monitor_wall;
 #[cfg(feature = "ffmpeg")]
 pub(crate) mod optional_rendition;
 #[cfg(feature = "ffmpeg")]

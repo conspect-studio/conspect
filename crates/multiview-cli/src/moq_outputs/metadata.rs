@@ -224,7 +224,7 @@ pub fn authorize_binding(
         .require(Action::Write)
         .map_err(|_| MoqReject::Forbidden)?;
     match scope {
-        WhepScope::Program => {
+        WhepScope::Program | WhepScope::Wall => {
             if principal.scoped_object_ids.is_some()
                 || principal.scoped_output_ids.is_some()
                 || principal.scoped_discovery_domains.is_some()

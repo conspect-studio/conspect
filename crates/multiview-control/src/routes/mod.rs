@@ -1424,6 +1424,7 @@ pub fn api_router() -> Router<AppState> {
         .route("/preview/program.jpg", get(preview::program_jpeg))
         .route("/preview/switcher/{me}/preview.jpg", get(preview::switcher_preview_jpeg))
         .route("/preview/inputs", get(preview::list_input_ids))
+        .route("/preview/wall", get(preview::wall_geometry))
         .route("/preview/inputs/{id}", get(preview::input_jpeg))
         // Read-only change audit log.
         .route("/audit", get(audit::list_audit))
@@ -1470,6 +1471,8 @@ pub fn signalling_router() -> Router<AppState> {
         .route("/preview/capabilities", get(preview::capabilities))
         .route("/preview/program/moq", post(moq::program_open))
         .route("/preview/program/moq/{lease_id}", axum::routing::delete(moq::program_close))
+        .route("/preview/wall/moq", post(moq::wall_open))
+        .route("/preview/wall/moq/{lease_id}", axum::routing::delete(moq::wall_close))
         .route("/preview/inputs/{id}/moq", post(moq::input_open))
         .route("/preview/inputs/{id}/moq/{lease_id}", axum::routing::delete(moq::input_close))
         .route("/preview/outputs/{id}/moq", post(moq::output_open))

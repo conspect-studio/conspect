@@ -35,6 +35,58 @@ pub trait PreviewProvider: Send + Sync {
     fn switcher_preview_jpeg(&self, _quality: u8) -> Option<Vec<u8>> {
         None
     }
+
+    /// The current shared monitor-wall geometry (ADR-0103), or `None` when no
+    /// wall is configured or it has not produced a picture yet. Wait-free: the
+    /// implementation loads a published snapshot and never touches the engine.
+    fn wall(&self) -> Option<WallGeometry> {
+        None
+    }
+}
+
+/// One source's rectangle inside the shared wall picture, in coded pixels.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+pub struct WallCell {
+    /// Source (input) id whose newest frame fills this rectangle.
+    pub source: String,
+    /// Left edge in coded pixels.
+    pub x: u32,
+    /// Top edge in coded pixels.
+    pub y: u32,
+    /// Width in coded pixels.
+    pub w: u32,
+    /// Height in coded pixels.
+    pub h: u32,
+}
+
+/// Exact wall cadence; never a float frame rate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+pub struct WallCadence {
+    /// Frames numerator.
+    pub num: i64,
+    /// Seconds denominator.
+    pub den: i64,
+}
+
+/// `GET /api/v1/preview/wall`: the one shared monitor-wall picture's layout.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+pub struct WallGeometry {
+    /// Changes whenever the cell assignment changes.
+    pub generation: u64,
+    /// Coded picture width.
+    pub width: u32,
+    /// Coded picture height.
+    pub height: u32,
+    /// Wall frame cadence.
+    pub cadence: WallCadence,
+    /// Source rectangles, sorted by source id.
+    pub cells: Vec<WallCell>,
+    /// The live Preview-bus source, when a switcher is attached. Filled by the
+    /// route from the switcher state, never by the engine worker.
+    pub preview_source: Option<String>,
 }
 
 /// The default provider used when the binary wires no live preview (e.g. the
@@ -78,6 +130,9 @@ pub enum WhepScope {
     Input(String),
     /// One program output/rendition, by its output id.
     Output(String),
+    /// The one shared monitor wall (ADR-0103): every source composed once and
+    /// encoded once. Whole-system scope: it embeds every source's pixels.
+    Wall,
 }
 
 impl WhepScope {
@@ -88,6 +143,7 @@ impl WhepScope {
             Self::Program => "program".to_owned(),
             Self::Input(id) => format!("input:{id}"),
             Self::Output(id) => format!("output:{id}"),
+            Self::Wall => "wall".to_owned(),
         }
     }
 }

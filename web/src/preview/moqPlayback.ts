@@ -78,7 +78,7 @@ export async function moqSupported(lease?: MoqLease, audio = false): Promise<boo
  * `selection()` is the pinned selector's verdict. The player is read lazily because the
  * source is constructed before the first sample and the player closes on teardown.
  */
-function abrSource(session: Connection.Established, player: () => Player | undefined, canvas: HTMLCanvasElement): { source: AbrSource; close: () => void } {
+function abrSource(session: Connection.Established, player: () => Player | undefined, canvas: HTMLCanvasElement, onFrame?: (frame: VideoFrame) => void): { source: AbrSource; close: () => void } {
   // Per-consumer render observation: this player's own decoded-output signal, not a global
   // instrument on the page's WebCodecs and not the received-payload counter in `out.stats`.
   const presented = { frames: 0, timestamp: -Infinity };
@@ -86,6 +86,7 @@ function abrSource(session: Connection.Established, player: () => Player | undef
     if (frame !== undefined && Number.isFinite(frame.timestamp) && frame.timestamp > presented.timestamp) {
       presented.timestamp = frame.timestamp;
       presented.frames += 1;
+      onFrame?.(frame);
       canvas.dataset.moqFrames = String(presented.frames);
       canvas.dataset.moqWidth = String(frame.displayWidth);
       canvas.dataset.moqHeight = String(frame.displayHeight);
@@ -135,6 +136,8 @@ export async function startMoqPlayback(options: {
   resume?: AbrPersistedState | undefined;
   /** One consumer's progress deadline, retained across lease renewal. */
   presentation?: { advancedAt: number } | undefined;
+  /** Optional synchronous per-decoded-frame callback; the frame is library-owned (clone to keep it). */
+  onFrame?: ((frame: VideoFrame) => void) | undefined;
 }): Promise<void> {
   const { api, canvas, signal, audio, onActive } = options;
   const presentation = options.presentation ?? { advancedAt: performance.now() };
@@ -182,7 +185,7 @@ export async function startMoqPlayback(options: {
     player = new Player({ origin, name: Path.from(lease.broadcast), canvas, enabled: true,
       announced: false, paused: false, muted: !audio, volume: 1, visible: 'always',
       probe: session.probe, target: abrTarget });
-    abrBinding = abrSource(session, () => player, canvas);
+    abrBinding = abrSource(session, () => player, canvas, options.onFrame);
     abr = new AbrSampler({
       target: abrTarget,
       authorized: lease.video_alternatives.length > 0
