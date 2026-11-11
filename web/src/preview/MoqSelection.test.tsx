@@ -11,6 +11,14 @@ describe('MoQ-first selection',()=>{
   expect(view.getByTestId('moq')).toBeInTheDocument(); expect(view.queryByTestId('whep')).toBeNull();
   fireEvent.click(view.getByText('unavailable')); expect(view.getByTestId('whep')).toBeInTheDocument();
  });
+ it('reports typed MoQ unavailability to the monitor when JPEG is the fallback',()=>{
+  const onTransportUnavailable=vi.fn();
+  const noWhep={...capabilities,webrtc:false,scopes:{...capabilities.scopes,program:{whep:false}}};
+  const view=renderWithProviders(<PreviewSurface scope="program" whepEndpoint="/api/v1/preview/program/whep" jpegPath="/jpeg" label="preview" capabilities={noWhep} onTransportUnavailable={onTransportUnavailable}/>);
+  fireEvent.click(view.getByText('unavailable'));
+  expect(onTransportUnavailable).toHaveBeenCalledOnce();
+  expect(view.getByTestId('jpeg-rung')).toBeInTheDocument();
+ });
  it('keeps authorization/capacity failure visible without WHEP',()=>{
   const view=renderWithProviders(<PreviewSurface scope="program" whepEndpoint="/api/v1/preview/program/whep" jpegPath="/jpeg" label="preview" capabilities={capabilities}/>);
   fireEvent.click(view.getByText('forbidden')); expect(view.getByRole('alert')).toBeInTheDocument(); expect(view.queryByTestId('whep')).toBeNull();

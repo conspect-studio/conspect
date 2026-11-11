@@ -129,6 +129,7 @@ export function PreviewSurface({
   onSessionReleased,
   onLeaseState,
   diagnosticsHost,
+  onTransportUnavailable,
 }: {
   readonly scope: PreviewScope;
   /** The WHEP endpoint for this scope (e.g. `/api/v1/preview/program/whep`). */
@@ -144,6 +145,8 @@ export function PreviewSurface({
   readonly rtcConfig?: RTCConfiguration | undefined;
   readonly fetchImpl?: typeof fetch | undefined;
   readonly onSessionReleased?: (() => void) | undefined;
+  /** Reports an unavailable MoQ path so a parent can label the resulting JPEG honestly. */
+  readonly onTransportUnavailable?: (() => void) | undefined;
   readonly onLeaseState?: ((state: 'negotiating' | 'active' | 'released') => void) | undefined;
   /** When set, the fallback diagnostics + busy note render into this element (below the picture) behind one disclosure. */
   readonly diagnosticsHost?: HTMLElement | null | undefined;
@@ -201,7 +204,7 @@ export function PreviewSurface({
   if (moqFailed) return <div role="alert"><Trans>Live input preview failed.</Trans></div>;
   if (capabilities?.moq && !moqUnavailable) {
     return <MoqPlayer key={`${scope}:${whepEndpoint}`} api={moqApi} label={label} audio={audio} className={className}
-      onUnavailable={() => { setMoqUnavailable(true); }} onFatal={() => { setMoqFailed(true); }}
+      onUnavailable={() => { setMoqUnavailable(true); onTransportUnavailable?.(); }} onFatal={() => { setMoqFailed(true); }}
       onLeaseState={(state) => { onLeaseState?.(state); if (state === 'released') onSessionReleased?.(); }} />;
   }
 
