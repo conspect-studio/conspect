@@ -119,16 +119,19 @@ function JpegRung({
 export type PreviewTransport = 'moq' | 'webrtc' | 'jpeg';
 
 /**
- * The newest surface that mounted for each scope and endpoint.
+ * For each scope and endpoint: how many mounted surfaces are on a live rung
+ * (MoQ or WebRTC) now, and a count that rises each time one starts.
  *
  * A MoQ lease report can arrive after its surface is gone: a late release
  * acknowledgement, or the end of an unacknowledged-release hold. The consumer
  * still needs that report (it may wait for 'released' to open another
- * preview), unless a newer surface for the same scope and endpoint has mounted
- * since. From that moment the newer surface owns the lease state, and a report
- * from the older one must not overwrite it.
+ * preview). It must not get it when another surface for the same source is
+ * live, or has gone live since: that surface's session is then the one the
+ * consumer's lease state describes. A surface that shows stills holds no
+ * session and reports no lease state, so it does not take the source over.
+ * One small record per distinct source; the records are not removed.
  */
-const newestSurface = new Map<string, symbol>();
+const surfaces = new Map<string, { live: number; starts: number }>();
 
 export function PreviewSurface({
   scope,
@@ -192,15 +195,18 @@ export function PreviewSurface({
   // report goes to the consumer's latest callbacks.
   const leaseRef = useRef({ onLeaseState, onSessionReleased });
   useEffect(() => { leaseRef.current = { onLeaseState, onSessionReleased }; });
-  // One identity for this surface showing this source. `shown` is that
-  // identity while the surface is mounted with this source, else undefined.
-  const identity = useMemo(() => Symbol(surfaceKey), [surfaceKey]);
-  const shown = useRef<symbol | undefined>(undefined);
+  // `shownKey` is the source this surface shows while it is mounted. `leftAt`
+  // is the source it showed last and that source's start count at that time.
+  // Refs, not memo values: React may discard a memo, and these must not change.
+  const shownKey = useRef<string | undefined>(undefined);
+  const leftAt = useRef<{ readonly key: string; readonly starts: number } | undefined>(undefined);
   useEffect(() => {
-    shown.current = identity;
-    newestSurface.set(surfaceKey, identity);
-    return (): void => { shown.current = undefined; };
-  }, [surfaceKey, identity]);
+    shownKey.current = surfaceKey;
+    return (): void => {
+      shownKey.current = undefined;
+      leftAt.current = { key: surfaceKey, starts: surfaces.get(surfaceKey)?.starts ?? 0 };
+    };
+  }, [surfaceKey]);
   const moqApi = useMemo(() => createMoqLeaseApi(scope, whepEndpoint), [scope, whepEndpoint]);
   const canWhep = whepAvailable(capabilities, scope);
   const retryNow = (): void => {
@@ -243,6 +249,16 @@ export function PreviewSurface({
   const transportRef = useRef(onTransport);
   useEffect(() => { transportRef.current = onTransport; });
   useEffect(() => { transportRef.current?.(transport, moqReason); }, [transport, moqReason]);
+  // Count this surface for its source while it is on a live rung (see `surfaces`).
+  const live = transport !== 'jpeg';
+  useEffect(() => {
+    if (!live) return;
+    const record = surfaces.get(surfaceKey) ?? { live: 0, starts: 0 };
+    surfaces.set(surfaceKey, record);
+    record.live += 1;
+    record.starts += 1;
+    return (): void => { record.live -= 1; };
+  }, [surfaceKey, live]);
 
   if (capabilities?.moq && moqReason === undefined) {
     return <MoqPlayer key={surfaceKey} api={moqApi} label={label} audio={audio} className={className}
@@ -252,10 +268,14 @@ export function PreviewSurface({
       }}
       onLeaseState={(state) => {
         // Mounted with this source: the report is current. Unmounted: it is
-        // still the consumer's, unless a newer surface took this source over.
-        // (A surface that now shows another source drops the old report.)
-        const current = shown.current === identity
-          || (shown.current === undefined && newestSurface.get(surfaceKey) === identity);
+        // still the consumer's, but only while no surface for this source is
+        // live and none has gone live since this one left. A surface that now
+        // shows another source drops the old source's report.
+        const record = surfaces.get(surfaceKey);
+        const left = leftAt.current;
+        const current = shownKey.current === surfaceKey
+          || (shownKey.current === undefined && left?.key === surfaceKey
+            && record?.live === 0 && record.starts === left.starts);
         if (!current) return;
         leaseRef.current.onLeaseState?.(state);
         if (state !== 'released') return;

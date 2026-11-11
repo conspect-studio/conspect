@@ -19,6 +19,7 @@ import { MOQ_UNACKNOWLEDGED_HOLD_MS } from './MoqPlayer';
 import { PreviewSurface } from './PreviewSurface';
 
 const both = { moq: true, webrtc: true, fallback: 'jpeg', scopes: { program: { whep: true }, inputs: { whep: true }, outputs: { whep: true } } };
+const stillsOnly = { moq: false, webrtc: false, fallback: 'jpeg', scopes: { program: { whep: false }, inputs: { whep: false }, outputs: { whep: false } } };
 const advance = (ms: number): Promise<void> => act(async () => { await vi.advanceTimersByTimeAsync(ms); });
 const releasedCalls = (spy: ReturnType<typeof vi.fn>): number => spy.mock.calls.filter(([state]) => state === 'released').length;
 const seen: { transport: string; reason: string | undefined }[] = [];
@@ -27,13 +28,31 @@ const surface = (onLeaseState: (state: string) => void) => { seen.length = 0; re
     capabilities={both} onLeaseState={onLeaseState}
     onTransport={(transport, reason) => { seen.push({ transport, reason }); }} />); };
 
+const programSurface = (onLease: (state: string) => void): JSX.Element => (
+  <PreviewSurface scope="program" whepEndpoint="/api/v1/preview/program/whep" jpegPath="/jpeg" label="preview"
+    capabilities={both} onLeaseState={onLease} />);
+
+/** Two surfaces for one source that report to one lease state; each can be hidden. */
+function Pair({ onLease }: { readonly onLease: (state: string) => void }): JSX.Element {
+  const [first, setFirst] = useState(true);
+  const [second, setSecond] = useState(false);
+  return <>
+    <button type="button" onClick={() => { setFirst((value) => !value); }}>first</button>
+    <button type="button" onClick={() => { setSecond((value) => !value); }}>second</button>
+    {first ? programSurface(onLease) : null}
+    {second ? programSurface(onLease) : null}
+  </>;
+}
+
 /** A consumer like the monitoring page: it shows or hides one Program surface and keeps its lease state. */
 function Consumer({ onLease }: { readonly onLease: (state: string) => void }): JSX.Element {
   const [shown, setShown] = useState(true);
+  const [capabilities, setCapabilities] = useState(both);
   return <>
     <button type="button" onClick={() => { setShown((value) => !value); }}>toggle</button>
+    <button type="button" onClick={() => { setCapabilities(stillsOnly); }}>stills only</button>
     {shown ? <PreviewSurface scope="program" whepEndpoint="/api/v1/preview/program/whep" jpegPath="/jpeg" label="preview"
-      capabilities={both} onLeaseState={onLease} onSessionReleased={() => { onLease('session-released'); }} /> : null}
+      capabilities={capabilities} onLeaseState={onLease} onSessionReleased={() => { onLease('session-released'); }} /> : null}
   </>;
 }
 
@@ -100,5 +119,54 @@ describe('unacknowledged MoQ release', () => {
     // The old session's hold ended. The new session is active, and stays so for the consumer.
     expect(onLease.mock.calls.slice(before)).toEqual([]);
     expect(onLease).toHaveBeenLastCalledWith('active');
+  });
+
+  it('still reports the old release when the surface comes back on stills and holds no session', async () => {
+    vi.useFakeTimers();
+    mocks.start.mockReset();
+    let acknowledge!: () => void;
+    // Active until unmounted; the release is acknowledged late.
+    mocks.start.mockImplementation((options: { onActive: () => void; signal: AbortSignal }) => {
+      options.onActive();
+      return new Promise<void>((resolve) => { options.signal.addEventListener('abort', () => { acknowledge = resolve; }); });
+    });
+    const onLease = vi.fn();
+    const view = renderWithProviders(<Consumer onLease={onLease} />);
+    await advance(0);
+    expect(onLease).toHaveBeenLastCalledWith('active');
+    fireEvent.click(view.getByText('toggle')); // hidden: the release is in flight
+    fireEvent.click(view.getByText('stills only')); // the server now offers stills only
+    fireEvent.click(view.getByText('toggle')); // shown again, on stills: no session, no lease reports
+    await advance(0);
+    expect(view.getByTestId('jpeg-rung')).toBeInTheDocument();
+    expect(mocks.start).toHaveBeenCalledTimes(1);
+    expect(releasedCalls(onLease)).toBe(0);
+    acknowledge();
+    await advance(0);
+    // Without this report the consumer would believe the old lease is active for ever.
+    expect(releasedCalls(onLease)).toBe(1);
+  });
+
+  it('with two surfaces for one source, a release reaches the consumer only when the last one is gone', async () => {
+    vi.useFakeTimers();
+    mocks.start.mockReset();
+    // Each session is active until its surface is unmounted; its release is then acknowledged.
+    mocks.start.mockImplementation((options: { onActive: () => void; signal: AbortSignal }) => {
+      options.onActive();
+      return new Promise<void>((resolve) => { options.signal.addEventListener('abort', () => { resolve(); }); });
+    });
+    const onLease = vi.fn();
+    const view = renderWithProviders(<Pair onLease={onLease} />);
+    await advance(0);
+    fireEvent.click(view.getByText('second')); // a second surface for the same source mounts
+    await advance(0);
+    expect(mocks.start).toHaveBeenCalledTimes(2);
+    fireEvent.click(view.getByText('second')); // and is hidden again; the first is still active
+    await advance(0);
+    expect(releasedCalls(onLease)).toBe(0);
+    expect(onLease).toHaveBeenLastCalledWith('active');
+    fireEvent.click(view.getByText('first')); // now the last surface goes
+    await advance(0);
+    expect(releasedCalls(onLease)).toBe(1);
   });
 });
