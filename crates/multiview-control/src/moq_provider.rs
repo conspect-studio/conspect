@@ -192,11 +192,6 @@ impl MoqProvider for WebTransportProvider {
         let alternatives = feed
             .ladder
             .iter()
-            .filter(|rung| {
-                rung.codec == feed.video.codec
-                    && rung.coded_width == feed.video.coded_width
-                    && rung.coded_height == feed.video.coded_height
-            })
             .filter_map(wire_alternative)
             .take(1)
             .map(|mut rung| {
