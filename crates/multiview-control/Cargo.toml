@@ -12,6 +12,10 @@ authors.workspace = true
 publish = false
 
 [dependencies]
+# The capture runtime inside is unix-only (process groups, openat-pinned
+# files); on other platforms only its portable request model is built and the
+# control plane reports capture unavailable.
+multiview-webengine = { path = "../multiview-webengine" }
 rustix = { version = "1", features = ["fs", "process"] }
 multiview-moq = { path = "../multiview-moq", optional = true }
 multiview-cloudflare = { path = "../multiview-cloudflare" }
@@ -247,10 +251,6 @@ rustls = { version = "0.23", optional = true }
 rustls-pki-types = { version = "1", features = ["std"], optional = true }
 
 
-# The browser-capture runtime is unix-only (process groups, openat-pinned files).
-# Other platforms build a provider that reports capture unavailable.
-[target.'cfg(unix)'.dependencies]
-multiview-webengine = { path = "../multiview-webengine" }
 
 [dev-dependencies]
 hang = "=0.21.22"

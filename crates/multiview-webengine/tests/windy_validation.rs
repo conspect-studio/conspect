@@ -1,4 +1,3 @@
-#![cfg(unix)]
 use multiview_webengine::capture::{Background, Capture, WindyView};
 fn view() -> WindyView {
     WindyView {

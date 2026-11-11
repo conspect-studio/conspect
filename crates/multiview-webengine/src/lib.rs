@@ -78,7 +78,6 @@ pub use usage::{
 // relies on process groups, signals and openat-pinned private files.
 #[cfg(unix)]
 pub mod artifact;
-#[cfg(unix)]
 pub mod capture;
 #[cfg(unix)]
 pub mod cdp_wire;

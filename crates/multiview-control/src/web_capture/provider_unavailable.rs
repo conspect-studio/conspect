@@ -3,11 +3,12 @@
 //! `openat`-pinned files, so it is not built here. The HTTP surface stays the
 //! same and reports capture as unavailable: capabilities say so, and every job
 //! operation answers as an unconfigured provider does on unix.
-use super::{Admission, CancelResult, CaptureBody, JobView, ARTIFACT_STREAMS};
+use super::{Admission, CancelResult, CaptureBody, JobView, ARTIFACT_STREAMS, WINDY_TERMS_VERSION};
 use crate::{
     auth::{authorize_object, Action, Principal},
     error::{ControlError, ControlResult},
 };
+use multiview_webengine::capture::{Background, Capture, WindyView};
 use tokio::sync::OwnedSemaphorePermit;
 
 /// The capture provider: never configured on this platform.
@@ -59,6 +60,36 @@ impl Provider {
         if let Some(player) = &body.target_player {
             authorize_object(p, player)?;
         }
+        // Same validation, in the same order, as the unix provider, so a bad
+        // request gets the same answer on every platform.
+        if !body.terms.accepted || body.terms.version != WINDY_TERMS_VERSION {
+            return Err(ControlError::Validation(
+                "current Windy terms acceptance required".into(),
+            ));
+        }
+        if !body.view.public {
+            return Err(ControlError::Conflict("authenticated Windy capture is unavailable until the account resolver is configured".into()));
+        }
+        let capture = Capture {
+            width: body.view.width,
+            height: body.view.height,
+            fps: body.view.fps,
+            frames: body.view.frames,
+            document: String::new(),
+            background: Background::Opaque,
+            windy: Some(WindyView {
+                lat: body.view.lat,
+                lon: body.view.lon,
+                zoom: body.view.zoom,
+                overlay: body.view.overlay.clone(),
+                terms_accepted: true,
+                require_premium: false,
+                credentials: None,
+            }),
+        };
+        capture
+            .validate()
+            .map_err(|_| ControlError::Validation("invalid capture view".into()))?;
         Err(ControlError::EngineBusy)
     }
 
