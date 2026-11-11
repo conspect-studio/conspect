@@ -98,6 +98,17 @@ impl<R: OptionalRegistry> PreviewRuntimeOpener<R> {
         }
     }
 }
+fn preview_codec_name(codec_id: ffmpeg_next::codec::Id) -> Option<&'static str> {
+    match codec_id {
+        ffmpeg_next::codec::Id::MPEG2VIDEO => Some("mpeg2video"),
+        ffmpeg_next::codec::Id::H264 => Some("h264"),
+        ffmpeg_next::codec::Id::HEVC => Some("hevc"),
+        ffmpeg_next::codec::Id::MJPEG => Some("mjpeg"),
+        ffmpeg_next::codec::Id::FFV1 => Some("ffv1"),
+        _ => None,
+    }
+}
+
 impl<R: OptionalRegistry> PreviewOpener for PreviewRuntimeOpener<R> {
     type Lease = PreviewEncoderLease;
     type Registration = R::Registration;
@@ -158,14 +169,7 @@ impl<R: OptionalRegistry> PreviewOpener for PreviewRuntimeOpener<R> {
                 .find_map(multiview_ffmpeg::codec_metadata::AvcDecoderConfig::from_initial_rap)
         });
         let params = encoder.codec_params();
-        let codec = match params.codec_id() {
-            ffmpeg_next::codec::Id::MPEG2VIDEO => "mpeg2video",
-            ffmpeg_next::codec::Id::H264 => "h264",
-            ffmpeg_next::codec::Id::HEVC => "hevc",
-            ffmpeg_next::codec::Id::MJPEG => "mjpeg",
-            ffmpeg_next::codec::Id::FFV1 => "ffv1",
-            _ => return None,
-        };
+        let codec = preview_codec_name(params.codec_id())?;
         if codec != requested.codec {
             return None;
         }
@@ -371,6 +375,14 @@ mod actual_bridge_tests {
         sync::Arc,
         time::{Duration, Instant},
     };
+    struct NoPublication;
+    impl OptionalRegistry for NoPublication {
+        type Registration = ();
+        fn publish_optional(&mut self, _: &[OpenedPreview]) -> Option<()> {
+            None
+        }
+    }
+
     fn actual_preview_setup() -> (PreviewKey, ResourceCost, EffectiveBinding) {
         let key = PreviewKey {
             program: "main".into(),
@@ -429,13 +441,6 @@ mod actual_bridge_tests {
         let (key, cost, _) = actual_preview_setup();
         let budget = crate::preview_vertical::PreviewAdmissionBudget::new();
         let permit = budget.acquire().unwrap();
-        struct NoPublication;
-        impl OptionalRegistry for NoPublication {
-            type Registration = ();
-            fn publish_optional(&mut self, _: &[OpenedPreview]) -> Option<()> {
-                None
-            }
-        }
         let mut opener = PreviewRuntimeOpener::new(vec![(key.clone(), cost)], NoPublication);
         opener.runtime_permit = Some(permit);
         let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(1);
@@ -461,13 +466,6 @@ mod actual_bridge_tests {
 
     fn assert_native_worker_hang_quarantines_budget(flush: bool) {
         let (key, cost, _) = actual_preview_setup();
-        struct NoPublication;
-        impl OptionalRegistry for NoPublication {
-            type Registration = ();
-            fn publish_optional(&mut self, _: &[OpenedPreview]) -> Option<()> {
-                None
-            }
-        }
         let budget = crate::preview_vertical::PreviewAdmissionBudget::new();
         let mut opener = PreviewRuntimeOpener::new(vec![(key.clone(), cost)], NoPublication);
         opener.runtime_permit = Some(budget.acquire().unwrap());

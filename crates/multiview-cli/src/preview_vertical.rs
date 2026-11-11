@@ -169,75 +169,6 @@ fn bounded_reap_with(
     let _ = done_rx.recv_timeout(std::time::Duration::from_millis(250));
 }
 
-#[cfg(test)]
-mod lifecycle_tests {
-    use super::*;
-    #[test]
-    fn hung_reaper_bounds_shutdown_and_blocks_replacements_until_completion() {
-        use std::time::{Duration, Instant};
-        let gate = Arc::new(AtomicBool::new(false));
-        let permit = RuntimePermit::acquire(gate.clone()).unwrap();
-        let (release, wait) = sync_channel(1);
-        let (done, completed) = sync_channel(1);
-        let start = Instant::now();
-        bounded_reap(permit, move || {
-            wait.recv().unwrap();
-            done.send(()).unwrap();
-        });
-        assert!(start.elapsed() < Duration::from_secs(1));
-        for _ in 0..100 {
-            assert!(RuntimePermit::acquire(gate.clone()).is_none());
-        }
-        release.send(()).unwrap();
-        completed.recv_timeout(Duration::from_secs(1)).unwrap();
-        let deadline = Instant::now() + Duration::from_secs(1);
-        while gate.load(Ordering::Acquire) {
-            assert!(Instant::now() < deadline);
-            std::thread::yield_now();
-        }
-        assert!(RuntimePermit::acquire(gate).is_some());
-    }
-
-    #[test]
-    fn failed_reaper_spawn_does_not_join_or_release_a_native_lease() {
-        let gate = Arc::new(AtomicBool::new(false));
-        let permit = RuntimePermit::acquire(gate.clone()).unwrap();
-        let native = permit.clone();
-        bounded_reap_with(
-            permit,
-            || panic!("must not join"),
-            |task| {
-                drop(task);
-                Err(std::io::Error::other("injected spawn failure"))
-            },
-        );
-        assert!(RuntimePermit::acquire(gate.clone()).is_none());
-        drop(native);
-        assert!(RuntimePermit::acquire(gate).is_some());
-    }
-
-    #[test]
-    fn independently_created_requests_share_the_run_quarantine_slot() {
-        let budget = PreviewAdmissionBudget::new();
-        let first = RuntimePermit::acquire(budget.0.clone()).expect("first native owner");
-        let replacement_budget = budget.clone();
-        assert!(RuntimePermit::acquire(replacement_budget.0.clone()).is_none());
-        drop(first);
-        assert!(RuntimePermit::acquire(replacement_budget.0).is_some());
-    }
-
-    #[test]
-    fn native_lease_quarantines_request_until_last_owner_releases() {
-        let gate = Arc::new(AtomicBool::new(false));
-        let permit = RuntimePermit::acquire(gate.clone()).expect("first runtime");
-        let native = permit.clone();
-        drop(permit);
-        assert!(RuntimePermit::acquire(gate.clone()).is_none());
-        drop(native);
-        assert!(RuntimePermit::acquire(gate).is_some());
-    }
-}
-
 enum Input {
     Frame(u64, Arc<multiview_compositor::pipeline::Nv12Image>),
     Audio(DispatchEvent),
@@ -398,7 +329,7 @@ pub(crate) struct PreviewVertical {
 }
 impl PreviewVertical {
     fn finish(mut self) {
-        let workers = self.workers.drain(..).collect::<Vec<_>>();
+        let workers = std::mem::take(&mut self.workers);
         let alive = self.alive.clone();
         bounded_reap(self.permit.clone(), move || {
             for worker in workers {
@@ -734,4 +665,73 @@ impl WindowDelivery for PreviewDelivery {
     }
     fn finish(&mut self) {}
     fn abort(&mut self) {}
+}
+
+#[cfg(test)]
+mod lifecycle_tests {
+    use super::*;
+    #[test]
+    fn hung_reaper_bounds_shutdown_and_blocks_replacements_until_completion() {
+        use std::time::{Duration, Instant};
+        let gate = Arc::new(AtomicBool::new(false));
+        let permit = RuntimePermit::acquire(gate.clone()).unwrap();
+        let (release, wait) = sync_channel(1);
+        let (done, completed) = sync_channel(1);
+        let start = Instant::now();
+        bounded_reap(permit, move || {
+            wait.recv().unwrap();
+            done.send(()).unwrap();
+        });
+        assert!(start.elapsed() < Duration::from_secs(1));
+        for _ in 0..100 {
+            assert!(RuntimePermit::acquire(gate.clone()).is_none());
+        }
+        release.send(()).unwrap();
+        completed.recv_timeout(Duration::from_secs(1)).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while gate.load(Ordering::Acquire) {
+            assert!(Instant::now() < deadline);
+            std::thread::yield_now();
+        }
+        assert!(RuntimePermit::acquire(gate).is_some());
+    }
+
+    #[test]
+    fn failed_reaper_spawn_does_not_join_or_release_a_native_lease() {
+        let gate = Arc::new(AtomicBool::new(false));
+        let permit = RuntimePermit::acquire(gate.clone()).unwrap();
+        let native = permit.clone();
+        bounded_reap_with(
+            permit,
+            || panic!("must not join"),
+            |task| {
+                drop(task);
+                Err(std::io::Error::other("injected spawn failure"))
+            },
+        );
+        assert!(RuntimePermit::acquire(gate.clone()).is_none());
+        drop(native);
+        assert!(RuntimePermit::acquire(gate).is_some());
+    }
+
+    #[test]
+    fn independently_created_requests_share_the_run_quarantine_slot() {
+        let budget = PreviewAdmissionBudget::new();
+        let first = RuntimePermit::acquire(budget.0.clone()).expect("first native owner");
+        let replacement_budget = budget.clone();
+        assert!(RuntimePermit::acquire(replacement_budget.0.clone()).is_none());
+        drop(first);
+        assert!(RuntimePermit::acquire(replacement_budget.0).is_some());
+    }
+
+    #[test]
+    fn native_lease_quarantines_request_until_last_owner_releases() {
+        let gate = Arc::new(AtomicBool::new(false));
+        let permit = RuntimePermit::acquire(gate.clone()).expect("first runtime");
+        let native = permit.clone();
+        drop(permit);
+        assert!(RuntimePermit::acquire(gate.clone()).is_none());
+        drop(native);
+        assert!(RuntimePermit::acquire(gate).is_some());
+    }
 }

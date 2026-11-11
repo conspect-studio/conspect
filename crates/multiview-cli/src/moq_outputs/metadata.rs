@@ -632,10 +632,10 @@ mod measured_config_tests {
     fn separately_parsed_reload_requests_keep_the_run_budget() {
         let key = serde_json::json!({"program":"main","bus":"main","codec":"h264",
             "encoder_name":"libx264","width":64,"height":64,"cadence":{"num":30,"den":1},
-            "bitrate_bps":100000,"codec_profile":null,"pixel_format":"nv12",
+            "bitrate_bps":100_000,"codec_profile":null,"pixel_format":"nv12",
             "color":"sdr-bt709-limited","gpu_pin":null,"codec_config":null});
         let cost = serde_json::json!({"encoder_sessions":1,"cpu_units":1,"gpu_units":0,
-            "memory_bytes":1024,"uplink_bps":100000});
+            "memory_bytes":1024,"uplink_bps":100_000});
         let source = serde_json::json!({"parent_output":"out",
             "production":[{"output_id":"out","key":key,"cost":cost}],
             "requests":[{"profile_id":"p","key":key}],"capacity":cost,
