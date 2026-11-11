@@ -42,6 +42,34 @@ pub fn runtime_provider() -> Arc<RuntimeProvider> {
     static INSTANCE: OnceLock<Arc<RuntimeProvider>> = OnceLock::new();
     Arc::clone(INSTANCE.get_or_init(|| Arc::new(RuntimeProvider::default())))
 }
+/// Observed facts for one load generation.
+#[derive(Clone, Copy)]
+struct Facts {
+    acked: bool,
+    ack_has_audio: bool,
+    adopted: bool,
+    audio_closed: bool,
+    fault_refused: bool,
+    opener_failed: bool,
+    superseded: bool,
+}
+/// Pure terminal-state rule. A native ACK alone never completes an
+/// audio-bearing load: the audio rail must have adopted that exact generation.
+/// A closed rail with an audio-bearing, unadopted ACK is terminal `failed`
+/// (the closed deck cannot be restored; never reported completed or pending).
+fn classify(f: Facts) -> &'static str {
+    let completed = f.acked && (f.adopted || (!f.ack_has_audio && f.audio_closed));
+    let stranded = f.acked && f.ack_has_audio && f.audio_closed && !f.adopted;
+    if completed {
+        "completed"
+    } else if f.fault_refused || f.opener_failed || stranded {
+        "failed"
+    } else if f.superseded && !f.acked {
+        "superseded"
+    } else {
+        "pending"
+    }
+}
 impl RuntimeProvider {
     pub fn register(&self, id: String, runtime: PlayerRuntime) {
         self.players
@@ -124,29 +152,28 @@ impl RuntimeProvider {
     fn view(runtime: &PlayerRuntime, generation: Generation) -> LoadOperation {
         let native = runtime.native.load();
         let ack = native.as_ref().filter(|a| a.generation == generation.0);
-        let completed = ack.is_some_and(|a| {
-            runtime.audio_commit.has_adopted(generation)
-                || (!a.has_audio && runtime.audio_commit.is_closed())
-        });
-        let audio_refused = matches!(
+        let fault_refused = matches!(
             runtime.status.load().fault,
-            Some(super::PlayerFault::AudioUnavailable { generation: g }) if g == generation.0
+            Some(
+                super::PlayerFault::AudioUnavailable { generation: g }
+                | super::PlayerFault::LoadJournalFailed { generation: g }
+                | super::PlayerFault::LoadReferenceMissing { generation: g }
+            ) if g == generation.0
         );
-        let failed = audio_refused
-            || runtime
+        let state = classify(Facts {
+            acked: ack.is_some(),
+            ack_has_audio: ack.is_some_and(|a| a.has_audio),
+            adopted: runtime.audio_commit.has_adopted(generation),
+            audio_closed: runtime.audio_commit.is_closed(),
+            fault_refused,
+            opener_failed: runtime
                 .opener
                 .status()
                 .last_failure
-                .is_some_and(|f| f.generation == generation);
-        let state = if completed {
-            "completed"
-        } else if failed {
-            "failed"
-        } else if runtime.coordinator.is_superseded(generation) && ack.is_none() {
-            "superseded"
-        } else {
-            "pending"
-        };
+                .is_some_and(|f| f.generation == generation),
+            superseded: runtime.coordinator.is_superseded(generation),
+        });
+        let completed = state == "completed";
         LoadOperation {
             operation: generation.0,
             state,
@@ -278,6 +305,77 @@ impl PlayerLoadProvider for RuntimeProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+    const BASE: Facts = Facts {
+        acked: false,
+        ack_has_audio: false,
+        adopted: false,
+        audio_closed: false,
+        fault_refused: false,
+        opener_failed: false,
+        superseded: false,
+    };
+    #[test]
+    fn rail_closed_after_put_before_adopt_is_failed_not_pending_or_completed() {
+        let slot = crate::player::AudioCommitSlot::<u8>::new();
+        slot.put(Generation(7), 1).unwrap();
+        assert!(slot.close().is_some());
+        let f = Facts {
+            acked: true,
+            ack_has_audio: true,
+            adopted: slot.has_adopted(Generation(7)),
+            audio_closed: slot.is_closed(),
+            ..BASE
+        };
+        assert_eq!(classify(f), "failed");
+    }
+    #[test]
+    fn audio_ack_needs_adoption_and_video_only_completes_on_closed_rail() {
+        let ack = Facts {
+            acked: true,
+            ack_has_audio: true,
+            ..BASE
+        };
+        assert_eq!(classify(ack), "pending");
+        assert_eq!(
+            classify(Facts {
+                adopted: true,
+                ..ack
+            }),
+            "completed"
+        );
+        assert_eq!(
+            classify(Facts {
+                adopted: true,
+                audio_closed: true,
+                ..ack
+            }),
+            "completed"
+        );
+        let v = Facts {
+            acked: true,
+            audio_closed: true,
+            ..BASE
+        };
+        assert_eq!(classify(v), "completed");
+    }
+    #[test]
+    fn journal_and_reference_refusals_are_terminal_failed() {
+        assert_eq!(
+            classify(Facts {
+                fault_refused: true,
+                ..BASE
+            }),
+            "failed"
+        );
+        assert_eq!(
+            classify(Facts {
+                superseded: true,
+                ..BASE
+            }),
+            "superseded"
+        );
+        assert_eq!(classify(BASE), "pending");
+    }
     fn rec(player: &str, n: u64, terminal: bool) -> Record {
         Record {
             player: player.into(),
