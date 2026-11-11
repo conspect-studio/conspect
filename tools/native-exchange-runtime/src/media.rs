@@ -41,6 +41,52 @@ impl Output {
         self.encoded.len() + self.decoded.len() + self.render.len() + self.audio.len()
     }
 }
+/// Encrypted objects whose epoch grant is not accepted yet. Bounded: the oldest
+/// is dropped on overflow and every drop is counted. It holds ciphertext only.
+pub struct ParkQueue<T> {
+    queue: VecDeque<T>,
+    cap: usize,
+    pub dropped: usize,
+    pub parked_total: usize,
+    pub drained: usize,
+    pub stale: usize,
+}
+impl<T> ParkQueue<T> {
+    pub fn new(cap: usize) -> Self {
+        Self {
+            queue: VecDeque::new(),
+            cap,
+            dropped: 0,
+            parked_total: 0,
+            drained: 0,
+            stale: 0,
+        }
+    }
+    pub fn park(&mut self, item: T) {
+        if self.queue.len() >= self.cap {
+            self.queue.pop_front();
+            self.dropped += 1;
+        }
+        self.queue.push_back(item);
+        self.parked_total += 1;
+    }
+    /// Put an item back at the tail without counting it as newly parked.
+    pub fn requeue(&mut self, item: T) {
+        self.queue.push_back(item);
+    }
+    pub fn len(&self) -> usize {
+        self.queue.len()
+    }
+    pub fn is_empty(&self) -> bool {
+        self.queue.is_empty()
+    }
+    pub fn take_all(&mut self) -> Vec<T> {
+        self.queue.drain(..).collect()
+    }
+    pub fn clear(&mut self) {
+        self.queue.clear();
+    }
+}
 impl Flush for Output {
     fn flush(&mut self) {
         self.flushed += self.pending();
@@ -228,4 +274,18 @@ pub fn decode(
         return Err("insufficient advancing decoded frames");
     }
     Ok(times)
+}
+
+#[cfg(test)]
+mod park_tests {
+    use super::ParkQueue;
+    #[test]
+    fn park_queue_drops_oldest_and_counts() {
+        let mut q = ParkQueue::new(2);
+        for n in 0..5 {
+            q.park(n);
+        }
+        assert_eq!((q.dropped, q.parked_total, q.len()), (3, 5, 2));
+        assert_eq!(q.take_all(), vec![3, 4]);
+    }
 }
