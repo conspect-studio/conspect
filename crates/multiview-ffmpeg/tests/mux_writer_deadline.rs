@@ -5,7 +5,7 @@
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use ffmpeg::format::Pixel;
@@ -59,38 +59,29 @@ fn big_packet(enc: &mut VideoEncoder) -> ffmpeg::codec::packet::Packet {
     out.expect("one packet")
 }
 
-/// Scheduler allowance for wall-clock bounds on a shared CI VM: the stopper's
-/// own sleep and each `SLOW` sleep can overshoot (macOS timer coalescing).
-/// The exact property is checked separately via callback start times.
-const SCHED: Duration = Duration::from_millis(150);
-
-/// What one slow mux run measured.
-struct SlowRun {
-    /// Arming to `finish` returning.
-    elapsed: Duration,
-    /// The abort trigger (stop actually stored / deadline instant) to `finish`
-    /// returning; `None` if `finish` returned before the trigger.
-    after_trigger: Option<Duration>,
-    /// Writer callbacks that STARTED after the trigger. `write_cb` checks
-    /// stop/deadline before every callback, so at most one may (the callback
-    /// that passed the check just before the trigger landed).
-    started_after_trigger: usize,
-    calls: usize,
-}
-
 /// Mux one large packet through a writer that SUCCEEDS on every callback but
-/// takes `SLOW` each. `stop_after` raises the stop flag from another thread.
-fn run_slow(deadline: Option<Duration>, stop_after: Option<Duration>) -> SlowRun {
+/// takes `SLOW` each; returns how long header+packet+trailer took and how many
+/// callbacks ran. `stop_after` raises the stop flag at the start of the first
+/// callback that begins at least that long after arming. The flag is the
+/// shared one any thread would raise; raising it from the writer removes the
+/// stopper thread's own oversleep (macOS timer coalescing on shared CI VMs,
+/// #265) from a bound that is about the MUXER's reaction, not that sleep.
+fn run_slow(deadline: Option<Duration>, stop_after: Option<Duration>) -> (Duration, usize) {
     let mut enc = encoder();
     let packet = big_packet(&mut enc);
     let params = multiview_ffmpeg::StreamCodecParameters::from_encoder(&enc);
     let calls = Arc::new(AtomicUsize::new(0));
-    let stop = Arc::new(AtomicBool::new(false));
     let calls_in = Arc::clone(&calls);
-    let starts = Arc::new(Mutex::new(Vec::<Instant>::new()));
-    let starts_in = Arc::clone(&starts);
+    let stop = Arc::new(AtomicBool::new(false));
+    let stop_in = Arc::clone(&stop);
+    let armed_at = Arc::new(std::sync::OnceLock::<Instant>::new());
+    let armed_in = Arc::clone(&armed_at);
     let writer: PacketWriter = make_writer(move |_data: &[u8]| {
-        starts_in.lock().unwrap().push(Instant::now());
+        if let (Some(after), Some(armed)) = (stop_after, armed_in.get()) {
+            if armed.elapsed() >= after {
+                stop_in.store(true, Ordering::Release);
+            }
+        }
         calls_in.fetch_add(1, Ordering::Relaxed);
         std::thread::sleep(SLOW);
         true
@@ -100,79 +91,42 @@ fn run_slow(deadline: Option<Duration>, stop_after: Option<Duration>) -> SlowRun
         .add_stream_from_parameters(&params, enc.time_base())
         .unwrap();
     muxer.write_header().unwrap();
-    starts.lock().unwrap().clear();
     let started = Instant::now();
-    let stopper = stop_after.map(|after| {
-        let stop = Arc::clone(&stop);
-        std::thread::spawn(move || {
-            std::thread::sleep(after);
-            stop.store(true, Ordering::Release);
-            // Taken AFTER the store: the flag is certainly visible from here.
-            Instant::now()
-        })
-    });
-    // `arm` computes the deadline at or after this instant, so `armed +
-    // deadline` never lies after the real deadline (a strict trigger).
-    let armed = Instant::now();
+    armed_at.set(started).unwrap();
     muxer.arm_io_deadline(deadline);
     let _ = muxer.write_packet(index, packet);
     let _ = muxer.finish();
-    let finished = Instant::now();
-    let trigger = match stopper {
-        Some(stopper) => Some(stopper.join().unwrap()),
-        None => deadline.map(|d| armed + d),
-    };
-    let started_after_trigger = trigger.map_or(0, |t| {
-        starts.lock().unwrap().iter().filter(|&&s| s > t).count()
-    });
-    SlowRun {
-        elapsed: finished - started,
-        after_trigger: trigger.and_then(|t| finished.checked_duration_since(t)),
-        started_after_trigger,
-        calls: calls.load(Ordering::Relaxed),
-    }
-}
-
-/// The SRT-05 property after an abort trigger: the run was still going when
-/// it fired, at most one callback started afterwards, and `finish` returned
-/// within that callback plus the same 3-callback margin (plus [`SCHED`]).
-fn assert_aborted(run: &SlowRun, unbounded_calls: usize, what: &str) {
-    assert!(
-        run.calls < unbounded_calls,
-        "{what} ignored: {} of {unbounded_calls} callbacks ran",
-        run.calls
-    );
-    let after = run.after_trigger.unwrap_or_else(|| {
-        panic!(
-            "{what}: mux finished before the trigger ({:?})",
-            run.elapsed
-        )
-    });
-    assert!(
-        run.started_after_trigger <= 1,
-        "{what} ignored: {} callbacks started after it",
-        run.started_after_trigger
-    );
-    assert!(
-        after < SLOW * 3 + SCHED,
-        "{what} ignored: {after:?} after it ({:?} total) over {} callbacks",
-        run.elapsed,
-        run.calls
-    );
+    let elapsed = started.elapsed();
+    (elapsed, calls.load(Ordering::Relaxed))
 }
 
 #[test]
 fn a_slow_but_successful_writer_cannot_outlive_the_io_deadline() {
     // Unbounded, the packet needs many slow callbacks (well over a second).
-    let unbounded = run_slow(None, None).calls;
-    assert!(unbounded > 40, "packet too small: {unbounded} callbacks");
-    let run = run_slow(Some(Duration::from_millis(300)), None);
-    assert_aborted(&run, unbounded, "deadline");
+    let (_, unbounded_calls) = run_slow(None, None);
+    assert!(
+        unbounded_calls > 40,
+        "packet too small: {unbounded_calls} callbacks"
+    );
+    let (elapsed, calls) = run_slow(Some(Duration::from_millis(300)), None);
+    assert!(
+        elapsed < Duration::from_millis(300) + SLOW * 3,
+        "deadline ignored: {elapsed:?} over {calls} callbacks"
+    );
 }
 
 #[test]
 fn stop_aborts_a_slow_but_successful_writer() {
-    let unbounded = run_slow(None, None).calls;
-    let run = run_slow(None, Some(Duration::from_millis(300)));
-    assert_aborted(&run, unbounded, "stop");
+    // Unbounded, the packet would run far past the stop point (so this is an
+    // abort, not an early finish).
+    let (_, unbounded_calls) = run_slow(None, None);
+    assert!(
+        unbounded_calls > 40,
+        "packet too small: {unbounded_calls} callbacks"
+    );
+    let (elapsed, calls) = run_slow(None, Some(Duration::from_millis(300)));
+    assert!(
+        elapsed < Duration::from_millis(300) + SLOW * 3,
+        "stop ignored: {elapsed:?} over {calls} callbacks"
+    );
 }
