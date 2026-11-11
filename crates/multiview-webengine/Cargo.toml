@@ -11,11 +11,17 @@ authors.workspace = true
 # exempt the intra-workspace path deps while still denying real "*" version
 # wildcards.
 publish = false
-description = "Web-engine resource scopes, process-tree/cgroup accounting sampler and the clip-job state model (ADR-0102, ADR-0100)."
+description = "Web-engine resource scopes, process-tree/cgroup accounting sampler and the clip-job state model (ADR-0099, ADR-0100)."
 
 [dependencies]
+tokio = { workspace = true, features = ["signal"] }
 serde = { workspace = true }
 thiserror = { workspace = true }
+serde_json = { workspace = true }
+sha2 = "0.10"
+rustix = { workspace = true, features = ["event", "fs", "process", "param"] }
+# Rust-owned private job root (profile/HOME/TMPDIR) removed after all children are dead.
+tempfile = "3"
 
 [dev-dependencies]
 # Asserting the wire shape of the published record, in particular that an
@@ -23,10 +29,6 @@ thiserror = { workspace = true }
 # dependency.
 serde_json = { workspace = true }
 # Declared-file fixtures for the /proc and /sys walks (never the real ones) and
-# for the temporary cgroup trees the delegation probe is exercised against.
-# Already in the workspace graph (a dev-dependency of most crates); MIT/Apache-2.0,
-# `cargo deny`-clean, no native deps.
-tempfile = "3"
 
 [lints]
 workspace = true
