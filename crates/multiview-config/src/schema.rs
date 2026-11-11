@@ -843,6 +843,27 @@ pub enum SourceKind {
         /// Filesystem path.
         path: String,
     },
+    /// A local capture device — a camera or capture card on this host
+    /// (design note `docs/architecture/local-capture-devices.md`). Opened
+    /// through the pinned `FFmpeg`'s libavdevice and then handled exactly like
+    /// any other decoded source (last-good, NO SIGNAL, supervised reconnect).
+    Device {
+        /// The capture backend: `avfoundation` (macOS) or `dshow` (Windows).
+        backend: DeviceBackend,
+        /// The device: a backend index (`"0"`) or the exact device name.
+        device: String,
+        /// Requested capture size, `WIDTHxHEIGHT` (the device default if
+        /// absent).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        size: Option<String>,
+        /// Requested capture rate as an exact rational, e.g. `30000/1001`
+        /// (never a float).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        fps: Option<String>,
+        /// Requested capture pixel format (e.g. `nv12`, `uyvy422`).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pixel_format: Option<String>,
+    },
     /// A still image bound by a media-library asset id (ADR-0057 Decision 1).
     ///
     /// The single decoded frame of the referenced
@@ -931,6 +952,38 @@ pub enum SourceKind {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         ptp_domain: Option<u8>,
     },
+}
+
+/// The capture backend of a [`SourceKind::Device`] source.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum DeviceBackend {
+    /// macOS `AVFoundation` (libavdevice `avfoundation`).
+    Avfoundation,
+    /// Windows `DirectShow` (libavdevice `dshow`).
+    Dshow,
+}
+
+impl DeviceBackend {
+    /// The libavdevice input-format name.
+    #[must_use]
+    pub const fn input_format(self) -> &'static str {
+        match self {
+            Self::Avfoundation => "avfoundation",
+            Self::Dshow => "dshow",
+        }
+    }
+
+    /// The libavdevice device string for a video-only capture of `device`.
+    #[must_use]
+    pub fn device_url(self, device: &str) -> String {
+        match self {
+            // "<video>:<audio>"; audio is a separate source (CoreAudio).
+            Self::Avfoundation => format!("{device}:none"),
+            Self::Dshow => format!("video={device}"),
+        }
+    }
 }
 
 /// Default for [`SourceKind::Webrtc`] `audio`: accept the publisher's Opus

@@ -12827,6 +12827,38 @@ fn ingest_plan_for(
             (SourceLocation::Synthetic(kind), true)
         }
         SourceKind::File { path } => (SourceLocation::Path(PathBuf::from(path)), false),
+        SourceKind::Device {
+            backend,
+            device,
+            size,
+            fps,
+            pixel_format,
+        } => {
+            let mut options = Vec::new();
+            if let Some(size) = size {
+                options.push(("video_size".to_owned(), size.clone()));
+            }
+            if let Some(fps) = fps {
+                options.push(("framerate".to_owned(), fps.clone()));
+            }
+            if let Some(pf) = pixel_format {
+                options.push(("pixel_format".to_owned(), pf.clone()));
+            }
+            // Bound the open: a permission prompt or a busy device can block.
+            options.push((
+                "rw_timeout".to_owned(),
+                INGEST_RW_TIMEOUT.as_micros().to_string(),
+            ));
+            (
+                SourceLocation::Device {
+                    format: backend.input_format(),
+                    device: backend.device_url(device),
+                    options,
+                },
+                // Live: a device that stops reconnects with backoff forever.
+                true,
+            )
+        }
         SourceKind::Rtsp { url, .. }
         | SourceKind::Hls { url, .. }
         | SourceKind::Ts { url }
@@ -13481,7 +13513,10 @@ fn resolve_incontainer_sub_route(
     // source is decoded by the URL ingest path and is out of this MVP's scope.
     let path = match location {
         SourceLocation::Path(p) => p.as_path(),
-        SourceLocation::Url(_) | SourceLocation::Synthetic(_) => return None,
+        // A capture device has no in-container subtitles.
+        SourceLocation::Url(_) | SourceLocation::Synthetic(_) | SourceLocation::Device { .. } => {
+            return None
+        }
         #[cfg(feature = "youtube")]
         SourceLocation::Youtube { .. } => return None,
         // NDI ingest carries no in-container subtitle stream (it is a raw
@@ -13596,6 +13631,17 @@ enum SourceLocation {
     Path(PathBuf),
     /// A libav-openable URL (rtsp/hls/ts/srt/rtmp).
     Url(String),
+    /// A local capture device opened through libavdevice
+    /// (docs/architecture/local-capture-devices.md): the input format, the
+    /// device string, and the device open options.
+    Device {
+        /// libavdevice input format (`avfoundation`, `dshow`).
+        format: &'static str,
+        /// The device string that format expects.
+        device: String,
+        /// Device open options (`video_size`, `framerate`, `pixel_format`).
+        options: Vec<(String, String)>,
+    },
     /// An in-process synthetic source (bars/solid/clock) — no media to open;
     /// rendered by [`crate::synth::generator_loop`] on the ingest thread.
     Synthetic(crate::synth::SyntheticKind),
@@ -13777,7 +13823,9 @@ fn ingest_open_options(location: &SourceLocation) -> ffmpeg::Dictionary<'static>
         // loop decodes per-packet), so it gets no libav open options.
         #[cfg(feature = "webrtc-native")]
         SourceLocation::Webrtc { .. } => false,
-        SourceLocation::Path(_) | SourceLocation::Synthetic(_) => false,
+        SourceLocation::Path(_) | SourceLocation::Synthetic(_) | SourceLocation::Device { .. } => {
+            false
+        }
     };
     if is_network {
         // `rw_timeout` is expressed in microseconds; libav copies the strings.
@@ -13828,7 +13876,7 @@ fn is_hls_location(location: &SourceLocation) -> bool {
         // WHIP ingest opens no libav input, so it is never an HLS master.
         #[cfg(feature = "webrtc-native")]
         SourceLocation::Webrtc { .. } => return false,
-        SourceLocation::Synthetic(_) => return false,
+        SourceLocation::Synthetic(_) | SourceLocation::Device { .. } => return false,
     };
     // An `.m3u8` (with or without a query string) is an HLS playlist.
     let base = url.split(['?', '#']).next().unwrap_or(url);
@@ -15191,6 +15239,21 @@ fn open_and_stream(
         SourceLocation::Path(p) => {
             ffmpeg::format::input_with_dictionary(p, opts).map_err(|e| e.to_string())?
         }
+        SourceLocation::Device {
+            format,
+            device,
+            options,
+        } => {
+            drop(opts);
+            multiview_ffmpeg::open_device_input(format, device, options).map_err(|e| {
+                // macOS TCC / Windows privacy denials surface as an open error;
+                // say so instead of a bare libav code.
+                format!(
+                    "{e} (a camera needs the OS camera permission for this process: \
+                     run it in the user's desktop session)"
+                )
+            })?
+        }
         SourceLocation::Url(u) => {
             // HLS WebVTT-rendition isolation (ADR-T011, FFmpeg-8.x-robust): if this
             // is an HLS master, pin the main demuxer to one VIDEO VARIANT media
@@ -15527,9 +15590,18 @@ fn open_and_stream(
         std::sync::mpsc::sync_channel::<crate::source_event_packet::MetadataPacket>(32);
     let metadata_overflow = Arc::new(AtomicBool::new(false));
     let demux_overflow = Arc::clone(&metadata_overflow);
+    // Capture devices are non-blocking: EAGAIN is "no frame yet", never an
+    // error (docs/architecture/local-capture-devices.md).
+    let is_device = matches!(plan.location, SourceLocation::Device { .. });
     let reader = spawn_packet_reader(&plan.id, READ_AHEAD_PACKETS, move || {
         let mut packet = ffmpeg::codec::packet::Packet::empty();
         match packet.read(&mut input) {
+            Err(ffmpeg::Error::Other { errno })
+                if is_device && errno == ffmpeg::util::error::EAGAIN =>
+            {
+                std::thread::sleep(Duration::from_millis(2));
+                None
+            }
             Ok(()) if packet.stream() == stream_index || Some(packet.stream()) == sub_index => {
                 if packet.stream() == stream_index {
                     video_fence = video_fence.saturating_add(1);

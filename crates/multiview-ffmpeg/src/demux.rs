@@ -185,6 +185,39 @@ fn should_interrupt(now_ns: u64, deadline_ns: u64) -> bool {
     deadline_ns != DEADLINE_DISARMED && now_ns >= deadline_ns
 }
 
+/// Open a local capture device as a raw libav input context (for callers that
+/// drive their own decode loop over `ffmpeg_next`'s `Input`, such as the
+/// pipeline's ingest). Same semantics as [`Demuxer::open_device`] minus the
+/// read deadline: `device_options` carry the device open options and the
+/// usual libav `rw_timeout`. The format must be registered in the linked
+/// `FFmpeg` (libavdevice).
+///
+/// # Errors
+/// [`FfmpegError::Init`] or [`FfmpegError::OpenInput`] (format unavailable,
+/// device missing/busy, permission denied).
+pub fn open_device_input(
+    input_format: &str,
+    device: &str,
+    device_options: &[(String, String)],
+) -> Result<ffmpeg::format::context::Input> {
+    // libav keeps the interrupt callback's opaque pointer for the context's
+    // whole life, so it must outlive the returned Input: a single process-wide
+    // deadline that is never armed (the `rw_timeout` device option bounds the
+    // open; the caller owns read supervision).
+    static NEVER_ARMED: std::sync::OnceLock<ReadDeadline> = std::sync::OnceLock::new();
+    ensure_initialized()?;
+    ensure_devices_registered();
+    let deadline = NEVER_ARMED.get_or_init(ReadDeadline::new);
+    open_input_with_format(
+        Path::new(device),
+        Some(input_format),
+        deadline,
+        None,
+        &[],
+        device_options,
+    )
+}
+
 /// Options for [`Demuxer::open_with_interrupt`] (GP-0, ADR-0030).
 ///
 /// A live passthrough opens its demuxer with a read/write timeout so a stalled
@@ -338,6 +371,9 @@ pub struct Demuxer {
     rw_timeout: Option<Duration>,
     /// The opened path/URL, for timeout error reporting.
     source: String,
+    /// Opened through a libavdevice input format: EAGAIN ("no frame yet") is
+    /// retried within the read deadline instead of failing the read.
+    device: bool,
 }
 
 impl Demuxer {
@@ -359,6 +395,7 @@ impl Demuxer {
             deadline: None,
             rw_timeout: None,
             source: path.display().to_string(),
+            device: false,
         })
     }
 
@@ -407,6 +444,54 @@ impl Demuxer {
             deadline: Some(deadline),
             rw_timeout,
             source,
+            device: false,
+        })
+    }
+
+    /// Open a local capture device through a libavdevice input format
+    /// (`avfoundation` on macOS, `dshow` on Windows): `device` is the device
+    /// string that format expects (e.g. `"0"` or `"0:none"` for avfoundation,
+    /// `"video=Name"` for dshow), and `options` are the device's open options
+    /// (`video_size`, `framerate`, `pixel_format`). The open is bounded by the
+    /// same interrupt deadline as network inputs (`options.rw_timeout`), because
+    /// a permission prompt or a busy device can block indefinitely.
+    ///
+    /// # Errors
+    /// * [`FfmpegError::Init`] — global libav init failed.
+    /// * [`FfmpegError::OpenInput`] — the format is not in the linked `FFmpeg`,
+    ///   or the device could not be opened (missing, busy, permission denied).
+    pub fn open_device(
+        input_format: &str,
+        device: &str,
+        options: DemuxOptions,
+        device_options: &[(String, String)],
+    ) -> Result<Self> {
+        ensure_initialized()?;
+        ensure_devices_registered();
+        let path = Path::new(device);
+        let source = device.to_owned();
+        let rw_timeout = options.rw_timeout();
+        let deadline = Box::new(ReadDeadline::new());
+        if let Some(timeout) = rw_timeout {
+            deadline.arm(timeout);
+        }
+        let input = open_input_with_format(
+            path,
+            Some(input_format),
+            deadline.as_ref(),
+            rw_timeout,
+            options.extra(),
+            device_options,
+        )?;
+        deadline.disarm();
+        let registration = register_format_context(&input);
+        Ok(Self {
+            registration,
+            input,
+            deadline: Some(deadline),
+            rw_timeout,
+            source,
+            device: true,
         })
     }
 
@@ -625,7 +710,27 @@ impl Demuxer {
             deadline.arm(timeout);
         }
         let mut packet = ffmpeg::codec::packet::Packet::empty();
-        let outcome = packet.read(&mut self.input);
+        // Device demuxers (avfoundation, dshow) are non-blocking: EAGAIN means
+        // "no frame yet", not failure. Retry it, bounded by the armed read
+        // deadline (or a short fixed budget when none is armed), so a wedged
+        // device still surfaces as a timeout rather than a busy loop.
+        let again_budget = std::time::Instant::now() + Duration::from_secs(2);
+        let outcome = loop {
+            match packet.read(&mut self.input) {
+                Err(ffmpeg::Error::Other { errno })
+                    if self.device && errno == ffmpeg::util::error::EAGAIN =>
+                {
+                    let expired = self.deadline.as_ref().is_some_and(|d| d.expired());
+                    let budget_spent =
+                        self.rw_timeout.is_none() && std::time::Instant::now() >= again_budget;
+                    if expired || budget_spent {
+                        break Err(ffmpeg::Error::Other { errno });
+                    }
+                    std::thread::sleep(Duration::from_millis(2));
+                }
+                other => break other,
+            }
+        };
         let expired = self.deadline.as_ref().is_some_and(|d| d.expired());
         if let Some(deadline) = self.deadline.as_ref() {
             deadline.disarm();
@@ -871,6 +976,18 @@ mod ffi_open {
     use std::time::Duration;
 
     use ffmpeg::ffi;
+
+    /// Register libavdevice's input devices (avfoundation, dshow, …) once. A
+    /// build without libavdevice registers nothing; `open_device` then reports
+    /// the format as unavailable.
+    pub(super) fn ensure_devices_registered() {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| {
+            // SAFETY: avdevice_register_all only populates libav's static device
+            // registry; it is idempotent and has no preconditions.
+            unsafe { ffi::avdevice_register_all() };
+        });
+    }
     use ffmpeg_next as ffmpeg;
     use libc::{c_int, c_void};
 
@@ -907,6 +1024,24 @@ mod ffi_open {
         rw_timeout: Option<Duration>,
         extra: &[(&'static str, &'static str)],
         headers: &[(&'static str, String)],
+    ) -> Result<ffmpeg::format::context::Input> {
+        let owned: Vec<(String, String)> = headers
+            .iter()
+            .map(|(k, v)| ((*k).to_owned(), v.clone()))
+            .collect();
+        open_input_with_format(path, None, deadline, rw_timeout, extra, &owned)
+    }
+
+    /// [`open_input_with_interrupt`] with an explicit input format (a
+    /// libavdevice demuxer such as `avfoundation` / `dshow`, which cannot be
+    /// probed from a URL) and owned runtime options.
+    pub(super) fn open_input_with_format(
+        path: &std::path::Path,
+        input_format: Option<&str>,
+        deadline: &ReadDeadline,
+        rw_timeout: Option<Duration>,
+        extra: &[(&'static str, &'static str)],
+        owned: &[(String, String)],
     ) -> Result<ffmpeg::format::context::Input> {
         let source = path.display().to_string();
         let curl = CString::new(source.as_str())
@@ -947,12 +1082,12 @@ mod ffi_open {
             }
         }
 
-        let extra_all = extra
+        for (key, value) in extra
             .iter()
-            .map(|(k, v)| (*k, (*v).to_owned()))
-            .chain(headers.iter().map(|(k, v)| (*k, v.clone())));
-        for (key, value) in extra_all {
-            if set_option(&mut opts, key, &value).is_err() {
+            .map(|(k, v)| (*k, *v))
+            .chain(owned.iter().map(|(k, v)| (k.as_str(), v.as_str())))
+        {
+            if set_option(&mut opts, key, value).is_err() {
                 // SAFETY: as above, both are still owned here.
                 unsafe {
                     ffi::av_dict_free(&raw mut opts);
@@ -962,11 +1097,42 @@ mod ffi_open {
             }
         }
 
+        // An explicit input format (libavdevice) is looked up by name; a name
+        // the linked FFmpeg does not register is an open error, not a probe.
+        let format_ptr = match input_format {
+            None => ptr::null(),
+            Some(name) => {
+                let Ok(cname) = CString::new(name) else {
+                    // SAFETY: both still owned here.
+                    unsafe {
+                        ffi::av_dict_free(&raw mut opts);
+                        ffi::avformat_close_input(&raw mut ps_io);
+                    }
+                    return Err(open_err(&source, "input format has an interior NUL"));
+                };
+                // SAFETY: av_find_input_format reads a valid C string and returns
+                // a static registry entry or null.
+                let found = unsafe { ffi::av_find_input_format(cname.as_ptr()) };
+                if found.is_null() {
+                    // SAFETY: both still owned here.
+                    unsafe {
+                        ffi::av_dict_free(&raw mut opts);
+                        ffi::avformat_close_input(&raw mut ps_io);
+                    }
+                    return Err(open_err(
+                        &source,
+                        "input format is not available in the linked FFmpeg",
+                    ));
+                }
+                found
+            }
+        };
         // SAFETY: `ps_io` is our allocated context; `curl` is a valid CString for
-        // the call; `opts` is our live dict (or null). On success libav adopts
-        // the context (we wrap it); on failure it frees and nulls it.
+        // the call; `format_ptr` is null or a static registry entry; `opts` is
+        // our live dict (or null). On success libav adopts the context (we wrap
+        // it); on failure it frees and nulls it.
         let open = unsafe {
-            ffi::avformat_open_input(&raw mut ps_io, curl.as_ptr(), ptr::null(), &raw mut opts)
+            ffi::avformat_open_input(&raw mut ps_io, curl.as_ptr(), format_ptr, &raw mut opts)
         };
         // SAFETY: av_dict_free is null-safe; frees any entries open_input left.
         unsafe { ffi::av_dict_free(&raw mut opts) };
@@ -1035,7 +1201,7 @@ mod ffi_open {
     }
 }
 
-use ffi_open::open_input_with_interrupt;
+use ffi_open::{ensure_devices_registered, open_input_with_format, open_input_with_interrupt};
 
 /// Read the NAL framing of an H.264 / HEVC stream from its codec extradata.
 ///

@@ -129,7 +129,7 @@ pub use routing::{
 pub use salvo::{Salvo, SourceRecall, TallyRecall, UmdRecall};
 pub use schema::{
     lower_rist_url, Border, Canvas, CanvasColor, Cell, CellQos, CellSource, ClockFaceConfig,
-    ColorOverride, DisplayModeSpec, EpgMode, EpgSource, EventsConfig, Fps, Layout,
+    ColorOverride, DeviceBackend, DisplayModeSpec, EpgMode, EpgSource, EventsConfig, Fps, Layout,
     MetadataCapability, MetadataField, OrientationMechanism, OrientationMode,
     OrientationTagCapability, OriginFollow, Output, OutputFlip, OutputMetadata, OutputMetadataPlan,
     OutputOrientation, OutputTimedMetadata, Overlay, PlaylistMetadata, Rect, RistAesBits,
@@ -1973,6 +1973,7 @@ impl Source {
             // stream-id 512-byte cap + passphrase-reference consistency; the
             // URL's reachability is a runtime concern.
             SourceKind::Srt { srt: Some(opts), .. } => validate_srt_options(&self.id, opts)?,
+            SourceKind::Device { .. } => validate_device_kind(&self.id, &self.kind)?,
             // Network/synthetic kinds carry no kind-specific field that can be
             // validated structurally here (a URL's reachability is a runtime
             // concern, not a config one). The `youtube` URL is resolved at
@@ -2265,6 +2266,71 @@ fn validate_rist_options(
                 "rist {owner:?}: encryption is configured but secret_ref is empty (the PSK is a \
                  secret-manager reference, e.g. `op://…` or `env:VAR`; it is never a plaintext key)"
             )));
+        }
+    }
+    Ok(())
+}
+
+/// Dispatch a [`SourceKind::Device`] to [`validate_device_source`].
+fn validate_device_kind(owner: &str, kind: &SourceKind) -> Result<(), ConfigError> {
+    if let SourceKind::Device {
+        device,
+        size,
+        fps,
+        pixel_format,
+        ..
+    } = kind
+    {
+        validate_device_source(
+            owner,
+            device,
+            size.as_deref(),
+            fps.as_deref(),
+            pixel_format.as_deref(),
+        )?;
+    }
+    Ok(())
+}
+
+/// Structural validation of a local capture device source: a non-empty device,
+/// `WIDTHxHEIGHT` size, an exact positive rational fps (never a float), and a
+/// plain pixel-format token. Device presence/permission is a runtime concern.
+fn validate_device_source(
+    owner: &str,
+    device: &str,
+    size: Option<&str>,
+    fps: Option<&str>,
+    pixel_format: Option<&str>,
+) -> Result<(), ConfigError> {
+    let bad = |what: &str| ConfigError::Validation(format!("source {owner:?}: device {what}"));
+    if device.trim().is_empty() || device.contains(':') || device.contains('\0') {
+        return Err(bad("must be a non-empty index or name without ':'"));
+    }
+    if let Some(size) = size {
+        let ok = size.split_once('x').is_some_and(|(w, h)| {
+            w.parse::<u32>().is_ok_and(|w| (16..=16384).contains(&w))
+                && h.parse::<u32>().is_ok_and(|h| (16..=16384).contains(&h))
+        });
+        if !ok {
+            return Err(bad("size must be WIDTHxHEIGHT (16..=16384)"));
+        }
+    }
+    if let Some(fps) = fps {
+        let ok = match fps.split_once('/') {
+            Some((n, d)) => {
+                n.parse::<u32>().is_ok_and(|n| n > 0) && d.parse::<u32>().is_ok_and(|d| d > 0)
+            }
+            None => fps.parse::<u32>().is_ok_and(|n| (1..=1000).contains(&n)),
+        };
+        if !ok {
+            return Err(bad(
+                "fps must be an exact rational like 30000/1001 or an integer",
+            ));
+        }
+    }
+    if let Some(pf) = pixel_format {
+        if pf.is_empty() || !pf.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_') {
+            return Err(bad("pixel_format must be a plain token such as nv12"));
         }
     }
     Ok(())
