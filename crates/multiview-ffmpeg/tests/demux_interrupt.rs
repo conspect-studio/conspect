@@ -109,6 +109,52 @@ fn open_with_interrupt_still_opens_a_healthy_local_file() {
     );
 }
 
+/// A parameters snapshot must not retain the input's native destructor. Otherwise
+/// the input can close after Demuxer's interrupt callback state has been freed.
+#[test]
+#[cfg(target_os = "linux")]
+fn audio_parameters_do_not_defer_interrupted_input_teardown() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let clip = dir.path().join("ownership.wav");
+    let samples = 4800_u32;
+    let data_len = samples * 2;
+    let mut wav = Vec::new();
+    wav.extend_from_slice(b"RIFF");
+    wav.extend_from_slice(&(36 + data_len).to_le_bytes());
+    wav.extend_from_slice(b"WAVEfmt \x10\0\0\0\x01\0\x01\0");
+    wav.extend_from_slice(&48000_u32.to_le_bytes());
+    wav.extend_from_slice(&96000_u32.to_le_bytes());
+    wav.extend_from_slice(b"\x02\0\x10\0data");
+    wav.extend_from_slice(&data_len.to_le_bytes());
+    wav.resize(44 + usize::try_from(data_len).unwrap(), 0);
+    std::fs::write(&clip, wav).unwrap();
+
+    let holds_file = || {
+        std::fs::read_dir("/proc/self/fd")
+            .unwrap()
+            .flatten()
+            .any(|fd| std::fs::read_link(fd.path()).is_ok_and(|target| target == clip))
+    };
+    let opts = DemuxOptions::new().with_rw_timeout(Duration::from_secs(5));
+    let demux = Demuxer::open_with_interrupt(&clip, &opts).expect("open PCM audio");
+    let parameters = demux.stream_parameters(0).expect("audio parameters");
+    assert!(
+        holds_file(),
+        "fixture must expose an open native file handle"
+    );
+    drop(demux);
+    assert!(
+        !holds_file(),
+        "an owned parameters snapshot must not defer native input close beyond callback state"
+    );
+    let decoder = multiview_ffmpeg::StreamAudioDecoder::new(
+        parameters,
+        multiview_core::time::Rational::new(1, 48000),
+    )
+    .expect("snapshot remains valid after demuxer closes");
+    assert_eq!(decoder.sample_rate(), 48000);
+}
+
 #[test]
 fn read_packet_on_a_healthy_file_returns_packets_under_the_interrupt_path() {
     let dir = tempfile::TempDir::new().unwrap();
