@@ -160,8 +160,11 @@ program bus ──push (wait-free)──▶ [engine→drain SPSC ring, ~200 ms] 
     frame played after each stall of 50 ms to 2 s is within the end-to-end budget of current
     program time.
 - **Distinct states,** each with its own transition:
-  - *underrun* (callback found the ring short): counted and continued. Only persistent underrun
-    (more than 10 % of callbacks over 1 s) triggers a re-anchor and pre-roll.
+  - *underrun* (callback found the ring short outside pre-roll): counted and continued. Only
+    persistent underrun (more than 10 % of callbacks over 1 s) triggers a re-anchor and pre-roll.
+    Planned pre-roll silence is not an underrun (the callback reads a pre-roll flag), the 1 s window
+    restarts after every pre-roll, and these re-anchors are rate-limited with capped backoff
+    (1 s → 30 s), so one underrun storm costs one bounded pre-roll, never a loop.
   - *ring full* (device not consuming but heartbeat advancing): normal, the drain waits.
   - *stalled* (heartbeat has not advanced for 2 s while open) or *lost* (error callback): the drain
     leaves the steady loop and asks the lifecycle helper to close the stream. Rings are reset or
@@ -185,7 +188,10 @@ program bus ──push (wait-free)──▶ [engine→drain SPSC ring, ~200 ms] 
   - `device = "default"` is the OS default and follows it, and the change is logged:
     - Windows (input and output) and macOS output: cpal reports the default change. On macOS
       output cpal reroutes the running stream itself; that `DeviceChanged` event is handled as a
-      soft event (keep the stream, log, reset the servo), not as *lost*.
+      soft event (keep the stream, log, reset the servo), not as *lost*. The callback period P is
+      measured again from the new device's callbacks (heartbeat thresholds use the new P); if it
+      exceeds 40 ms, the stream is treated as *lost* and the reopen path applies the
+      `unsupported_buffer` rule.
     - macOS input: cpal 0.18 has no default-input monitor. The pump compares
       `default_input_device()`'s id with the bound id every 2 s (on the pump thread, outside the
       callback) and reopens on a change.
@@ -212,7 +218,7 @@ program bus ──push (wait-free)──▶ [engine→drain SPSC ring, ~200 ms] 
   deadline; any still stuck is detached and the process exit takes it.
 - The cpal error callback only stores the error kind in an atomic. The pump or drain maps it:
   - `DeviceChanged` (macOS default-output reroute by cpal): soft event; keep the stream, log,
-    reset the servo.
+    reset the servo, re-measure P (section 4, identity).
   - `Xrun`: non-fatal; count it and re-anchor the servo; no reopen.
   - `PermissionDenied`: the latched `permission_denied` state; close, retry on the slow cadence
     (section 5).
