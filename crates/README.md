@@ -1,7 +1,7 @@
 # `crates/` — Rust workspace
 
 > [!NOTE]
-> **Early scaffold — implementation in progress.** This is the real Multiview engine workspace, at an
+> **Early scaffold — implementation in progress.** This is the real Conspect engine workspace, at an
 > early stage. The crate boundaries are established (per the
 > [canonical crate map](../docs/architecture/conventions.md#3-canonical-crate-map)) and the
 > workspace compiles (`cargo check`/`clippy`/`fmt` green), but most crate bodies are trait/type

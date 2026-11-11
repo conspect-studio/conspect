@@ -6811,6 +6811,9 @@ fn consumer_main<D: WindowDelivery>(
             tracks,
         )
     });
+    // Program-audio encode worker (design note audio-encode-worker.md): the AAC
+    // encode of the program + discrete tracks runs OFF this consumer. Spawned
+    // after the dispatch channel exists (below) — see `audio_worker`.
     let bindings = output_video_keys
         .iter()
         .enumerate()
@@ -6837,6 +6840,43 @@ fn consumer_main<D: WindowDelivery>(
     // loop (this is the bake-consumer thread). The epoch is the consumer start;
     // the conflator only ever sees a non-decreasing `now_ns`.
     let loudness_epoch = Instant::now();
+    // The program-audio encode worker owns the AAC encoder: it encodes program +
+    // discrete tracks OFF this consumer, in tick order, computes the watermarks
+    // and dispatches (design note docs/architecture/audio-encode-worker.md).
+    let mut audio_worker = match audio_encoder.take() {
+        Some(encoder) => {
+            let tx = event_tx.clone();
+            let tail_tx = event_tx.clone();
+            let preview = optional.clone();
+            let tail_preview = optional.clone();
+            let specs = audio_specs.clone();
+            let bases = audio_bases.clone();
+            Some(crate::rendition_workers::AudioEncodeWorker::spawn(
+                ProgramAudioWork { encoder },
+                move |tick, packets| {
+                    let event = audio_dispatch_event(tick, packets, &specs, &bases);
+                    if let Some(preview) = preview.as_ref() {
+                        preview.audio(&event);
+                    }
+                    tx.send(event).map_err(|e| PipelineError::Output {
+                        kind: "audio-dispatch",
+                        reason: e.to_string(),
+                    })
+                },
+                move |tail| {
+                    let event = DispatchEvent::FinishAudio { packets: tail };
+                    if let Some(preview) = tail_preview.as_ref() {
+                        preview.audio(&event);
+                    }
+                    tail_tx.send(event).map_err(|e| PipelineError::Output {
+                        kind: "audio-dispatch",
+                        reason: e.to_string(),
+                    })
+                },
+            )?)
+        }
+        None => None,
+    };
     // Program-bus peak/RMS meter (`audio.meter`, ~30 Hz conflated; AUD-8 / SW-14),
     // built lazily from the first emitted block's channel count. Same thread and
     // same non-blocking drop-oldest publisher as the loudness lane (inv #10).
@@ -7106,75 +7146,66 @@ fn consumer_main<D: WindowDelivery>(
                 // intentionally ignore here (drop-oldest; inv #10).
                 let _ = slot.push(block.clone());
             }
-            let audio = audio_encoder
-                .as_mut()
-                .ok_or_else(|| PipelineError::Output {
+            if audio_worker.is_none() {
+                return Err(PipelineError::Output {
                     kind: "encode-audio",
                     reason: "audio bus has no encoder".to_owned(),
-                })?;
-            let mut audio_packets = audio
-                .encode_interleaved(block.interleaved(), block.frame_count())
-                .map_err(|e| PipelineError::Output {
-                    kind: "encode-audio",
-                    reason: e.to_string(),
-                })?;
-            // #152: discrete tracks, same tick, same sample budget (inv #3).
-            if !selected_tracks.is_empty() {
+                });
+            }
+            // #152: discrete tracks, same tick, same sample budget (inv #3). The
+            // per-track blocks are copied into the owned job; the encode runs on
+            // the worker.
+            let tracks = if selected_tracks.is_empty() {
+                Vec::new()
+            } else {
                 #[cfg(feature = "overlay")]
                 let track_bus = audio_bus
                     .as_mut()
                     .ok_or_else(|| PipelineError::Engine("audio track bus missing".to_owned()))?;
                 #[cfg(not(feature = "overlay"))]
                 let track_bus = bus;
-                let packets = encode_discrete_tracks(
-                    audio,
-                    track_bus,
-                    &selected_tracks,
-                    block.frame_count(),
-                )?;
-                audio_packets.extend(packets);
-            }
-            let mut watermarks = Vec::with_capacity(audio_bases.len());
-            for stream in 0..audio_bases.len() {
-                let pts = audio_packets
-                    .iter()
-                    .rev()
-                    .find(|p| match p.kind() {
-                        multiview_ffmpeg::StreamKind::Audio => stream == 0,
-                        multiview_ffmpeg::StreamKind::AudioTrack(i) => stream == usize::from(i) + 1,
-                        _ => false,
-                    })
-                    .and_then(EncodedPacket::pts);
-                watermarks.push(pts.and_then(|p| {
-                    audio_specs
-                        .get(stream)
-                        .and_then(|&(frame_samples, sample_rate)| {
-                            crate::rendition_workers::next_frame_lower_bound_ns(
-                                p,
-                                frame_samples,
-                                sample_rate,
-                            )
-                        })
-                }));
-            }
-            let audio_event = DispatchEvent::Audio {
-                tick: item.tick_index,
-                timebases: audio_bases
-                    .iter()
-                    .map(|tb| Rational::new(tb.num, tb.den))
-                    .collect(),
-                packets: audio_packets,
-                watermarks,
+                discrete_track_samples(track_bus, &selected_tracks, block.frame_count())
             };
-            if let Some(preview) = optional.as_ref() {
-                preview.audio(&audio_event);
+            let offered = audio_worker.as_ref().map_or(
+                Err(crate::rendition_workers::OfferRejection::Ended),
+                |worker| {
+                    worker.offer_within(
+                        crate::rendition_workers::AudioJob {
+                            tick: item.tick_index,
+                            frames: block.frame_count(),
+                            program: block.interleaved().to_vec(),
+                            tracks,
+                        },
+                        offer_horizon,
+                    )
+                },
+            );
+            match offered {
+                Ok(()) => {}
+                // The worker died: join it to surface its concrete encoder
+                // error (the inline path reported the FFmpeg reason directly).
+                Err(crate::rendition_workers::OfferRejection::Ended) => {
+                    let ended = PipelineError::Output {
+                        kind: "audio-worker",
+                        reason: "Ended".to_owned(),
+                    };
+                    return Err(
+                        match audio_worker
+                            .take()
+                            .map(crate::rendition_workers::AudioEncodeWorker::join)
+                        {
+                            Some(Err(e)) => e,
+                            _ => ended,
+                        },
+                    );
+                }
+                Err(e) => {
+                    return Err(PipelineError::Output {
+                        kind: "audio-worker",
+                        reason: format!("{e:?}"),
+                    })
+                }
             }
-            event_tx
-                .send(audio_event)
-                .map_err(|e| PipelineError::Output {
-                    kind: "audio-dispatch",
-                    reason: e.to_string(),
-                })?;
         } else if let Some(bus) = display_audio.dedicated_bus.as_mut() {
             // A video-only run with audio-enabled display heads: drive the
             // dedicated display bus by the same absolute tick index (RT-8b —
@@ -7187,26 +7218,27 @@ fn consumer_main<D: WindowDelivery>(
             }
         }
     }
-    // Join the independently admitted video encoders and drain their terminal
-    // events before finalizing the shared program audio and binding windows.
-    for worker in workers {
-        worker.join()?;
-    }
-    if let Some(audio) = audio_encoder.as_mut() {
-        let tail = audio.finish().map_err(|e| PipelineError::Output {
-            kind: "encode-audio",
-            reason: e.to_string(),
-        })?;
-        let event = DispatchEvent::FinishAudio { packets: tail };
-        if let Some(preview) = optional.as_ref() {
-            preview.audio(&event);
-        }
-        event_tx.send(event).map_err(|e| PipelineError::Output {
-            kind: "audio-dispatch",
-            reason: e.to_string(),
-        })?;
-    }
+    // End of run: close every worker's input and let them flush. The workers
+    // and this thread share `event_tx`/`event_rx` (bounded); a worker blocked
+    // sending its tail into a full channel would deadlock a plain `join` here,
+    // so the joins run on a helper thread while this thread keeps draining.
+    // Video workers join before the audio worker (terminal ordering preserved).
     drop(event_tx);
+    let joiner = std::thread::Builder::new()
+        .name("multiview-worker-join".to_owned())
+        .spawn(move || -> Result<(), PipelineError> {
+            for worker in workers {
+                worker.join()?;
+            }
+            if let Some(worker) = audio_worker {
+                worker.join()?;
+            }
+            Ok(())
+        })
+        .map_err(|e| PipelineError::Output {
+            kind: "worker-join",
+            reason: e.to_string(),
+        })?;
     while let Ok(event) = event_rx.recv() {
         if let Err(e) = dispatcher.dispatch(event, Instant::now(), &mut delivery) {
             if !matches!(
@@ -7220,6 +7252,10 @@ fn consumer_main<D: WindowDelivery>(
             }
         }
     }
+    joiner.join().map_err(|_| PipelineError::Output {
+        kind: "worker-join",
+        reason: "worker join thread panicked".to_owned(),
+    })??;
     if !dispatcher.is_finished() {
         return Err(PipelineError::Output {
             kind: "dispatch",
@@ -7233,36 +7269,110 @@ fn consumer_main<D: WindowDelivery>(
     Ok(delivery.statuses())
 }
 
-/// Encode one tick of every discrete track (#152) from its source's pre-mix
-/// block, with exactly the program block's `frames`, so each track's sample
-/// counter (its PTS) equals the program's — locked to vision. A source with no
-/// block this tick (or a block of another length) encodes silence; the track's
-/// clock never skips.
-fn encode_discrete_tracks(
-    encoder: &mut AudioRenditionEncoder,
+/// Copy one tick of every selected discrete track (#152) from its source's
+/// pre-mix block, with exactly the program block's `frames`. A source with no
+/// block this tick (or a block of another length) yields `None` = silence, so the
+/// track's clock never skips.
+fn discrete_track_samples(
     bus: &multiview_audio::program::ProgramBus,
     track_inputs: &[String],
     frames: usize,
-) -> Result<Vec<EncodedPacket>, PipelineError> {
+) -> Vec<Option<Vec<f32>>> {
     let inputs = bus.input_tracks();
-    let mut out = Vec::new();
-    for (index, input_id) in track_inputs.iter().enumerate() {
-        let samples = inputs
-            .iter()
-            .find(|(id, _)| *id == input_id.as_str())
-            .map(|(_, b)| *b)
-            .filter(|b| b.frame_count() == frames)
-            .map(multiview_audio::format::AudioBlock::interleaved);
-        out.append(
-            &mut encoder
-                .encode_track_interleaved(index, samples, frames)
-                .map_err(|e| PipelineError::Output {
-                    kind: "encode-audio-track",
-                    reason: e.to_string(),
-                })?,
-        );
+    track_inputs
+        .iter()
+        .map(|input_id| {
+            inputs
+                .iter()
+                .find(|(id, _)| *id == input_id.as_str())
+                .map(|(_, b)| *b)
+                .filter(|b| b.frame_count() == frames)
+                .map(|b| b.interleaved().to_vec())
+        })
+        .collect()
+}
+
+/// The production [`AudioEncodeWork`](crate::rendition_workers::AudioEncodeWork):
+/// the program AAC stream then each discrete track, exactly as the inline path
+/// encoded them.
+struct ProgramAudioWork {
+    encoder: AudioRenditionEncoder,
+}
+
+impl crate::rendition_workers::AudioEncodeWork for ProgramAudioWork {
+    fn encode(
+        &mut self,
+        job: &crate::rendition_workers::AudioJob,
+    ) -> Result<Vec<EncodedPacket>, PipelineError> {
+        let mut packets = self
+            .encoder
+            .encode_interleaved(&job.program, job.frames)
+            .map_err(|e| PipelineError::Output {
+                kind: "encode-audio",
+                reason: e.to_string(),
+            })?;
+        for (index, samples) in job.tracks.iter().enumerate() {
+            packets.append(
+                &mut self
+                    .encoder
+                    .encode_track_interleaved(index, samples.as_deref(), job.frames)
+                    .map_err(|e| PipelineError::Output {
+                        kind: "encode-audio-track",
+                        reason: e.to_string(),
+                    })?,
+            );
+        }
+        Ok(packets)
     }
-    Ok(out)
+
+    fn finish(&mut self) -> Result<Vec<EncodedPacket>, PipelineError> {
+        self.encoder.finish().map_err(|e| PipelineError::Output {
+            kind: "encode-audio",
+            reason: e.to_string(),
+        })
+    }
+}
+
+/// Build the per-tick audio dispatch event: the packets plus, per stream, the
+/// DTS watermark from its newest packet (program = stream 0, track i = i + 1).
+fn audio_dispatch_event(
+    tick: u64,
+    packets: Vec<EncodedPacket>,
+    audio_specs: &[(u32, u32)],
+    audio_bases: &[DtsTimeBase],
+) -> DispatchEvent {
+    let mut watermarks = Vec::with_capacity(audio_bases.len());
+    for stream in 0..audio_bases.len() {
+        let pts = packets
+            .iter()
+            .rev()
+            .find(|p| match p.kind() {
+                multiview_ffmpeg::StreamKind::Audio => stream == 0,
+                multiview_ffmpeg::StreamKind::AudioTrack(i) => stream == usize::from(i) + 1,
+                _ => false,
+            })
+            .and_then(EncodedPacket::pts);
+        watermarks.push(pts.and_then(|p| {
+            audio_specs
+                .get(stream)
+                .and_then(|&(frame_samples, sample_rate)| {
+                    crate::rendition_workers::next_frame_lower_bound_ns(
+                        p,
+                        frame_samples,
+                        sample_rate,
+                    )
+                })
+        }));
+    }
+    DispatchEvent::Audio {
+        tick,
+        timebases: audio_bases
+            .iter()
+            .map(|tb| Rational::new(tb.num, tb.den))
+            .collect(),
+        packets,
+        watermarks,
+    }
 }
 #[derive(Clone)]
 enum SinkSendPolicy {
@@ -23250,30 +23360,35 @@ segment_ms = 1000
                 key
             })
             .collect();
-        pipeline.set_optional_preview(crate::preview_vertical::PreviewStartup {
-            parent_output: "test-sink-0".into(),
-            production,
-            requests: keys
-                .iter()
-                .enumerate()
-                .map(|(i, key)| PreviewRequest {
-                    profile_id: format!("profile-{i}"),
-                    key: key.clone(),
-                })
-                .collect(),
-            capacity: Some(ResourceCost {
-                encoder_sessions: 6,
-                cpu_units: 6,
-                memory_bytes: 8_388_608,
-                uplink_bps: 20_000_000,
-                ..ResourceCost::default()
-            }),
-            measured: keys.into_iter().map(|key| (key, cost)).collect(),
-            audio_once_bps: 128_000,
-            overhead_bps: 100_000,
-            opened_parent: None,
-            startup_delay,
-        });
+        pipeline.set_optional_preview(
+            crate::preview_vertical::PreviewStartup {
+                parent_output: "test-sink-0".into(),
+                production,
+                requests: keys
+                    .iter()
+                    .enumerate()
+                    .map(|(i, key)| PreviewRequest {
+                        profile_id: format!("profile-{i}"),
+                        key: key.clone(),
+                    })
+                    .collect(),
+                capacity: Some(ResourceCost {
+                    encoder_sessions: 6,
+                    cpu_units: 6,
+                    memory_bytes: 8_388_608,
+                    uplink_bps: 20_000_000,
+                    ..ResourceCost::default()
+                }),
+                measured: keys.into_iter().map(|key| (key, cost)).collect(),
+                audio_once_bps: 128_000,
+                overhead_bps: 100_000,
+                opened_parent: None,
+                runtime_gate: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                shared_budget: false,
+                startup_delay,
+            }
+            .with_admission_budget(&crate::preview_vertical::PreviewAdmissionBudget::new()),
+        );
         pipeline
     }
 

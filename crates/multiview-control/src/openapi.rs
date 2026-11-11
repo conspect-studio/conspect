@@ -67,11 +67,12 @@ const ASYNCAPI_JSON: &str = include_str!("../../../docs/api/asyncapi.json");
 #[derive(OpenApi)]
 #[openapi(
     info(
-        title = "Multiview Control API",
+        title = "Conspect Control API",
         version = "1.0.0",
-        description = "REST + WebSocket + SSE management API for the Multiview engine.",
+        description = "REST + WebSocket + SSE management API for the Conspect engine.",
+        contact(name = "The Conspect Authors"),
         license(
-            name = "Multiview Source-Available Non-Commercial License",
+            name = "Conspect Source-Available Non-Commercial License v2",
             url = "https://github.com/conspect-studio/conspect/blob/main/LICENSE",
         ),
     ),

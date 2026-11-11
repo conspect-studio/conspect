@@ -896,7 +896,7 @@ function MixOverview({
         {form.routes.length === 0 ? (
           <li className="p-2 text-sm text-muted-foreground">
             <Trans>
-              No routes yet — without routes the multiview carries no managed
+              No routes yet — without routes Conspect carries no managed
               audio.
             </Trans>
           </li>
@@ -1298,7 +1298,7 @@ export function AudioPage(): JSX.Element {
             {form.routes.length === 0 ? (
               <p className="text-sm text-muted-foreground">
                 <Trans>
-                  No routes yet — without routes the multiview carries no
+                  No routes yet — without routes Conspect carries no
                   managed audio.
                 </Trans>
               </p>

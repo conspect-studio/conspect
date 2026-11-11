@@ -1,11 +1,11 @@
-# Multiview — management web app
+# Conspect — management web app
 
 > [!NOTE]
-> **Early scaffold — implementation in progress.** This will be the real Multiview management app; the
+> **Early scaffold — implementation in progress.** This will be the real Conspect management app; the
 > full design is in [`../docs/web/management-app.md`](../docs/web/management-app.md). Right now it is
 > a minimal compiling skeleton being built out against that design.
 
-The polished management console for Multiview. This is a **scaffold**: a minimal
+The polished management console for Conspect. This is a **scaffold**: a minimal
 React 19 + TypeScript + Vite app that builds today. The full stack described in
 [`../docs/web/management-app.md`](../docs/web/management-app.md) is layered in
 during implementation:

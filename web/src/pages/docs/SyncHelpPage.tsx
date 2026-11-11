@@ -28,7 +28,7 @@ export function SyncHelpPage(): JSX.Element {
           <Prose>
             <Trans>
               Different hardware can only achieve different sync quality, and
-              Multiview reports the tier it MEASURES rather than the one a
+              Conspect reports the tier it MEASURES rather than the one a
               datasheet promises:
             </Trans>
           </Prose>
@@ -87,8 +87,8 @@ export function SyncHelpPage(): JSX.Element {
               The achieved tier shown on devices and groups comes from
               measurements (and is absent until one exists). Program output
               timing is never paced by any device: sync alignment is applied
-              at the presentation edge, and a failed or drifting member can
-              never stall the multiview itself.
+              at the presentation edge. This separation is designed to protect
+              program timing from failed or drifting members.
             </Trans>
           </Prose>
           <HelpLink to="/help/display-nodes" label={t`About display nodes`} />

@@ -112,7 +112,6 @@ impl Encoder {
                 })?;
         }
         self.lease
-            .encoder
             .encode_frame_at(frame, tick)
             .map_err(|e| PipelineError::Output {
                 kind: "optional-preview",
@@ -147,13 +146,10 @@ impl VideoEncodeWorker for Encoder {
         }
     }
     fn finish(&mut self) -> Result<Vec<EncodedPacket>, PipelineError> {
-        self.lease
-            .encoder
-            .finish()
-            .map_err(|e| PipelineError::Output {
-                kind: "optional-preview",
-                reason: e.to_string(),
-            })
+        self.lease.finish().map_err(|e| PipelineError::Output {
+            kind: "optional-preview",
+            reason: e.to_string(),
+        })
     }
 }
 

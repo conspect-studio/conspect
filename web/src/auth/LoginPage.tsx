@@ -65,7 +65,7 @@ export function LoginPage({ onAuthenticated }: LoginPageProps): JSX.Element {
           </CardTitle>
           <CardDescription>
             <Trans>
-              This Multiview control plane requires an API key. Paste your admin
+              This Conspect control plane requires an API key. Paste your admin
               or operator key to continue.
             </Trans>
           </CardDescription>

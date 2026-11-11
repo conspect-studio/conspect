@@ -153,7 +153,8 @@ pub enum EffectiveLicense {
     /// The default build: `FFmpeg` linked LGPL, no x264/x265, redistributable.
     #[serde(rename = "LGPL-clean")]
     LgplClean,
-    /// `gpl-codecs` is compiled (x264/x265) → the whole product is GPL.
+    /// `gpl-codecs` is compiled (x264/x265): GPL dependency-build metadata,
+    /// not a relicensing of Conspect project code.
     #[serde(rename = "GPL")]
     Gpl,
 }
@@ -165,11 +166,13 @@ pub enum EffectiveLicense {
 pub struct BuildInfo {
     /// The effective codec-linking licence of this artifact.
     pub effective_license: EffectiveLicense,
-    /// Whether the artifact is redistributable. `true` for every shippable
-    /// Multiview build: the default is LGPL-clean, `gpl-codecs` is GPL
-    /// (redistributable under copyleft), and NDI is runtime-loaded (never
-    /// vendored/linked) — there is no non-redistributable `--enable-nonfree`
-    /// closure (no `nonfree` Cargo feature exists).
+    /// Dependency-build metadata, not permission to redistribute Conspect.
+    /// `true` indicates the dependency build has no `--enable-nonfree` closure
+    /// (no `nonfree` Cargo feature exists): the default is LGPL-clean,
+    /// `gpl-codecs` enables GPL codec dependencies, and NDI is runtime-loaded
+    /// (never vendored/linked). Enabling GPL codecs does not relicense Conspect
+    /// project code. This value does not authorize redistribution of Conspect;
+    /// the project licence and applicable dependency terms still govern.
     pub redistributable: bool,
     /// The compiled, capability/licence-relevant Cargo features.
     pub features: Vec<String>,
@@ -184,8 +187,9 @@ impl BuildInfo {
     /// `cfg!(feature = "gpl-codecs")` / `cfg!(feature = "ndi")` and the compiled
     /// feature list.
     ///
-    /// Pinned to AGENTS.md §G / ADR-0012: `gpl-codecs` ⇒ the whole product is
-    /// GPL; otherwise LGPL-clean. Every shippable build is redistributable.
+    /// Reports GPL dependency-build metadata for `gpl-codecs`, otherwise
+    /// LGPL-clean. Neither this label nor `redistributable` grants permission
+    /// to redistribute Conspect or relicenses the project code.
     #[must_use]
     pub fn resolve(gpl_codecs: bool, ndi: bool, features: Vec<String>) -> Self {
         // `gpl-codecs` (x264/x265) relicenses the whole product GPL; otherwise

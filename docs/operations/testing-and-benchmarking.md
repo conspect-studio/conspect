@@ -1,7 +1,7 @@
 # Testing & Benchmarking
 
-How Multiview proves it is **bulletproof** and **efficient on commodity hardware** — the two
-load-bearing promises of the project. This page is the operational map of the test strategy: what we
+How Conspect tests its **continuous-output resilience** and **efficiency on commodity hardware**
+design goals — engineering targets, not warranties. This page is the operational map of the test strategy: what we
 test, how we inject faults, the numeric SLOs that gate "never falters," the density/perf benchmarks
 that gate efficiency regressions, and how almost all of it runs **without a GPU** on every PR.
 
@@ -169,7 +169,7 @@ flowchart LR
       DEV["device.destroy() / Xid-class\nGPU device loss"]
       PBT["proptest-state-machine\nrandomized live config/layout commands"]
     end
-    INJECT --> PIPE["Running Multiview pipeline"]
+    INJECT --> PIPE["Running Conspect pipeline"]
     PIPE --> PROBE["Always-on output-validity probe (SLOs)"]
     PROBE --> GATE{"No-falter gate"}
 ```

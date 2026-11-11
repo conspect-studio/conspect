@@ -20,7 +20,7 @@
 //! to a JSON-Schema `oneOf` within each message's payload schema.
 use serde_json::{json, Value};
 
-/// Generate the complete `AsyncAPI` 3.0 document for the Multiview realtime API
+/// Generate the complete `AsyncAPI` 3.0 document for the Conspect realtime API
 /// as a pretty-printed JSON string.
 ///
 /// The output is **deterministic**: calling this function twice with no
@@ -78,10 +78,10 @@ fn build_document() -> Value {
 
 fn build_info() -> Value {
     json!({
-        "title": "Multiview Realtime API",
+        "title": "Conspect Realtime API",
         "version": "1.0.0",
         "description": concat!(
-            "WebSocket and SSE realtime event stream for the Multiview engine. ",
+            "WebSocket and SSE realtime event stream for the Conspect engine. ",
             "Every message uses a single versioned envelope (ADR-RT002). ",
             "Topics: tiles, inputs, outputs, audio.meters, alerts, alarms, tally, ",
             "layout, config, logs, jobs, preview, system, capabilities, devices, switcher. ",
@@ -89,11 +89,11 @@ fn build_info() -> Value {
             "control frames); the SSE endpoint (/api/v1/events) is server-to-client only.",
         ),
         "license": {
-            "name": "Multiview Source-Available Non-Commercial License",
+            "name": "Conspect Source-Available Non-Commercial License v2",
             "url": "https://github.com/conspect-studio/conspect/blob/main/LICENSE"
         },
         "contact": {
-            "name": "The Multiview Authors",
+            "name": "The Conspect Authors",
             "url": "https://github.com/conspect-studio/conspect"
         },
         "externalDocs": {
@@ -113,7 +113,7 @@ fn build_servers() -> Value {
             "description": "WebSocket endpoint (bidirectional). Primary transport.",
             "variables": {
                 "host": {
-                    "description": "Hostname and optional port of the Multiview daemon. IPv6-first: the default is the IPv6 loopback `[::1]`; override with your host.",
+                    "description": "Hostname and optional port of the Conspect daemon. IPv6-first: the default is the IPv6 loopback `[::1]`; override with your host.",
                     "default": "[::1]:8080"
                 }
             }
@@ -125,7 +125,7 @@ fn build_servers() -> Value {
             "description": "Server-Sent Events endpoint (server→client only). Fallback transport.",
             "variables": {
                 "host": {
-                    "description": "Hostname and optional port of the Multiview daemon. IPv6-first: the default is the IPv6 loopback `[::1]`; override with your host.",
+                    "description": "Hostname and optional port of the Conspect daemon. IPv6-first: the default is the IPv6 loopback `[::1]`; override with your host.",
                     "default": "[::1]:8080"
                 }
             }
@@ -548,7 +548,7 @@ fn build_messages_device_events() -> serde_json::Map<String, Value> {
         "description": concat!(
             "Carries the impact declared BEFORE apply per the instant-apply doctrine: ",
             "vendor-decoder mode convergence is `dev`-class (the device pipeline ",
-            "restarts; Multiview program output is unaffected).",
+            "restarts; Conspect program output is unaffected).",
         ),
         "contentType": "application/json",
         "payload": { "$ref": "#/components/schemas/DeviceMode" }
@@ -1736,8 +1736,8 @@ fn device_capabilities_schema() -> Value {
         "description": "Fixed probed capability flags — a driver maps its device into exactly this shape.",
         "required": ["encode", "decode", "display", "sync", "audio", "reboot", "firmware_update"],
         "properties": {
-            "encode": { "type": "boolean", "description": "The device can encode (offers streams Multiview ingests as Sources)." },
-            "decode": { "type": "boolean", "description": "The device can decode (receive a Multiview output)." },
+            "encode": { "type": "boolean", "description": "The device can encode (offers streams Conspect ingests as Sources)." },
+            "decode": { "type": "boolean", "description": "The device can decode (receive a Conspect output)." },
             "display": { "type": "boolean", "description": "The device drives a physical display." },
             "sync": { "$ref": "#/components/schemas/SyncCapability" },
             "audio": { "type": "boolean", "description": "The device handles audio." },
@@ -1758,7 +1758,7 @@ fn device_stream_status_schema() -> Value {
                 "enum": ["encode", "decode"],
                 "description": "Whether the device is encoding or decoding this stream."
             },
-            "output_ref": { "type": "string", "description": "The Multiview output this decode stream is bound to, if any." },
+            "output_ref": { "type": "string", "description": "The Conspect output this decode stream is bound to, if any." },
             "bitrate_bps": { "type": "integer", "format": "uint64", "description": "Device-reported stream bitrate (bits/sec), if reported." },
             "fps": { "type": "number", "format": "float", "description": "Device-reported stream rate (fps), if reported." },
             "healthy": { "type": "boolean", "description": "Whether the device reports this stream as healthy." }
@@ -1881,7 +1881,7 @@ fn impact_class_schema() -> Value {
         "description": concat!(
             "Declared impact class of a management change: cp (control-plane only), ",
             "c1 (hot/seamless at a frame boundary), c2 (controlled reset via ",
-            "make-before-break), dev (the DEVICE pipeline restarts; Multiview ",
+            "make-before-break), dev (the DEVICE pipeline restarts; Conspect ",
             "program output is unaffected).",
         ),
         "enum": ["cp", "c1", "c2", "dev"]

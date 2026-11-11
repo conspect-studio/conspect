@@ -229,7 +229,16 @@ async fn run_run(args: RunArgs) -> anyhow::Result<ExitCode> {
         return run_software(&start, &args).await;
     }
 
-    Box::pin(run_pipeline(&start, &args)).await
+    // Run-owned: retain across configuration parses and replacement pipelines.
+    #[cfg(feature = "moq-output")]
+    let preview_budget = multiview_cli::preview_vertical::PreviewAdmissionBudget::new();
+    Box::pin(run_pipeline(
+        &start,
+        &args,
+        #[cfg(feature = "moq-output")]
+        &preview_budget,
+    ))
+    .await
 }
 
 /// The FFmpeg-free software run: the output-clock + CPU compositor driving the
@@ -274,6 +283,8 @@ async fn run_software(
 async fn run_pipeline(
     start: &multiview_cli::boot::StartConfig,
     args: &RunArgs,
+    #[cfg(feature = "moq-output")]
+    preview_budget: &multiview_cli::preview_vertical::PreviewAdmissionBudget,
 ) -> anyhow::Result<ExitCode> {
     use multiview_cli::pipeline::Pipeline;
 
@@ -319,7 +330,15 @@ async fn run_pipeline(
         // MP-1 (ADR-0030 §2.2): the daemon run path builds an engine `ProgramSet`
         // and drives this single program (id "main") through it — move the owned
         // pipeline in (the set spawns it on its own supervised task).
-        run_pipeline_until_ctrl_c(pipeline, start, &plane, &args.config).await?
+        run_pipeline_until_ctrl_c(
+            pipeline,
+            start,
+            &plane,
+            &args.config,
+            #[cfg(feature = "moq-output")]
+            preview_budget,
+        )
+        .await?
     };
 
     println!("{}", report.render());
@@ -693,6 +712,8 @@ async fn run_pipeline_until_ctrl_c(
     start: &multiview_cli::boot::StartConfig,
     plane: &multiview_cli::licence::EntitlementPlane,
     config_path: &Path,
+    #[cfg(feature = "moq-output")]
+    preview_budget: &multiview_cli::preview_vertical::PreviewAdmissionBudget,
 ) -> anyhow::Result<multiview_cli::pipeline::PipelineReport> {
     // The Running document seeds the stores/drain; the boot file (config_path)
     // stays the watch + promote target (ADR-W024).
@@ -779,8 +800,11 @@ async fn run_pipeline_until_ctrl_c(
             multiview_cli::audio::routing_live_capability(pipeline.audio_route_slot()),
         );
         #[cfg(feature = "moq-output")]
-        multiview_cli::moq_outputs::metadata::configure_optional_preview(&mut pipeline)
-            .map_err(|_| anyhow::anyhow!("explicit measured MoQ preview configuration rejected"))?;
+        multiview_cli::moq_outputs::metadata::configure_optional_preview(
+            &mut pipeline,
+            preview_budget,
+        )
+        .map_err(|_| anyhow::anyhow!("explicit measured MoQ preview configuration rejected"))?;
         // Demand (docs/architecture/demand-driven-sources.md): build the manager
         // before the hub and drain so live edits catalogue instead of spawning,
         // and every consumer below takes leases from the same manager.

@@ -1,5 +1,14 @@
 ## ⚠️ NOT LEGAL ADVICE
 
+> **Historical Version 1.0 research, not current eligibility or reuse permission.**
+> The product is now Conspect. [Version 2.0](../../LICENSE) supersedes this advisory's
+> proposed free-use and source-reuse grants for copies supplied under Version 2.0.
+> Religious use and monetized content are excluded from free eligibility; paid and
+> metered features are not free. The creator threshold alone is insufficient.
+> Source access permits learning, not general modification or reproduction.
+> Earlier valid grants remain subject to their original terms. See the
+> [current policy](README.md#current-policy--version-20).
+
 **This is research and engineering advice to inform a decision and to brief a lawyer. It is explicitly NOT legal advice and creates no lawyer–client relationship.** A qualified software-licensing lawyer — ideally one who drafts source-available licenses (e.g. Heather Meeker / Kyle Mitchell, authors of PolyForm) and who also handles **Australian** trademark and media-regulation matters — must draft and review the final public license, the commercial license, the CLA, and the three bespoke exceptions before your first public release. License drafting is a domain where small wording errors create large, sometimes unfixable problems; do not ship a hand-rolled license. Throughout, facts are cited to primary sources; opinions are flagged.
 
 ---

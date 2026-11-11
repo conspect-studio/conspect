@@ -1,14 +1,23 @@
-# Contributing to Multiview
+<a id="contributing-to-multiview"></a>
 
-Thanks for your interest in **Multiview** — an efficient, hardware-accelerated, Rust live
-video multiview generator. This guide covers everything you need to get a dev environment
+# Contributing to Conspect
+
+Thanks for your interest in **Conspect** — Rust software for live-media production, routing
+and monitoring. This guide covers everything you need to get a dev environment
 running, build and test the workspace, follow our coding/feature conventions, and propose
 changes (including new architecture decisions).
 
+> **Contribution-policy conflict — unresolved:** The [LICENSE](LICENSE) v2 does not grant a
+> general right to modify or distribute the source. The development and pull-request workflow
+> below is not permission to do so: obtain separate written permission from Aperim before
+> modifying or distributing project code. The CLA and DCO do not themselves resolve this
+> outbound-permission gap. Maintainers must clarify the contribution policy.
+
 > **Read this first:** the single source of truth for naming, structure, feature flags,
-> invariants, and licensing is
+> invariants, and dependency build profiles is
 > [`docs/architecture/conventions.md`](docs/architecture/conventions.md). Where any other
-> doc disagrees, **conventions wins**, and the Rust code is the ultimate authority. Deep
+> engineering doc disagrees, **conventions wins**, and the Rust code is the implementation authority.
+> Operative licensing rights are governed by [LICENSE](LICENSE), not code or this guide. Deep
 > design rationale lives in the briefs under [`docs/research/`](docs/research/) and the
 > decisions under [`docs/decisions/`](docs/decisions/).
 
@@ -42,7 +51,7 @@ changes (including new architecture decisions).
 
 ## Development environment
 
-Multiview targets **Linux** (x86_64 + aarch64) and **macOS** (Apple Silicon + Intel). There
+Conspect targets **Linux** (x86_64 + aarch64) and **macOS** (Apple Silicon + Intel). There
 is **no Windows support**. The default build is **pure-Rust, LGPL-clean, and has no native
 dependencies** — you can build and run the full software pipeline with nothing but a Rust
 toolchain.
@@ -224,7 +233,7 @@ cargo xtask --help # build web, regenerate OpenAPI/AsyncAPI, lint, etc.
 
 ## Feature-flag conventions
 
-Feature flags are how Multiview stays LGPL-clean and GPU-free by default while still shipping
+Feature flags are how Conspect stays LGPL-clean and GPU-free by default while still shipping
 full hardware acceleration. The taxonomy is canonical in
 [conventions §4](docs/architecture/conventions.md). Rules:
 
@@ -236,7 +245,7 @@ full hardware acceleration. The taxonomy is canonical in
  alter type signatures, only swap in a backend impl behind a trait.
 - **Feature names are `kebab-case`** (e.g. `gpl-codecs`, `embed-web`).
 - **License-escalating features are opt-in only:**
- - `gpl-codecs` (x264/x265) makes the resulting build **GPL** — off by default.
+ - `gpl-codecs` adds GPL-covered x264/x265 — off by default. Distribution of a combined work entails GPL obligations; the flag does not relicense Conspect or grant distribution permission.
  - `ndi` pulls the proprietary, runtime-loaded NDI path — off by default.
 - **Umbrella presets live in `multiview-cli`** (`nvidia`, `apple`, `linux-vaapi`, `full` =
  everything non-GPL). Don't scatter platform presets across leaf crates.
@@ -248,7 +257,7 @@ Quick reference:
 | Codec backends | `cuda`, `videotoolbox`, `vaapi`, `qsv`, `software` (always on) |
 | Compositor backends | `wgpu` (default), `metal`, `cuda` |
 | Media engine | `ffmpeg` (links libav) |
-| Codec licensing | `gpl-codecs` (→ GPL build) |
+| Codec licensing | `gpl-codecs` (GPL dependencies; no Conspect relicensing or distribution grant) |
 | NDI | `ndi` (proprietary, runtime-loaded) |
 | Subtitles | `libass` |
 | Web/API | `openapi` (default), `embed-web`, `webrtc` |
@@ -384,20 +393,20 @@ template):
 
 ### Project license
 
-Multiview is **source-available, not open source**: it is published under the
-**Multiview Source-Available Non-Commercial License** (see [`LICENSE`](LICENSE)), with a
+Conspect is **source-available, not open source**: it is published under the
+**Conspect Source-Available Non-Commercial License v2** (see [`LICENSE`](LICENSE)), with a
 paid path for commercial use (see [`LICENSE-COMMERCIAL.md`](LICENSE-COMMERCIAL.md)). The
 Licensor and copyright holder is **Aperim Pty Ltd** (ABN 46 150 699 737).
 
 ### Contributor License Agreement (CLA) — required
 
-Because Multiview is dual-licensed (a free source-available licence **plus** a paid
+Because Conspect is dual-licensed (a free source-available licence **plus** a paid
 commercial/proprietary licence), every contribution must come with a **Contributor License
 Agreement (CLA)** before it can be merged. You keep the copyright in your contribution; the
 CLA grants Aperim Pty Ltd a broad, perpetual, irrevocable licence to use your contribution
 **and to relicense it under any terms — including commercial and proprietary terms**. This
-"inbound = outbound, plus the right to license under other terms" arrangement is what makes
-the dual-license model work: without it, your contribution could not be offered to
+inbound licensing arrangement supports
+the dual-license model: without it, your contribution could not be offered to
 commercial licensees.
 
 Read and agree to [`CONTRIBUTOR-LICENSE-AGREEMENT.md`](CONTRIBUTOR-LICENSE-AGREEMENT.md). The
@@ -406,14 +415,15 @@ CLA — both are needed.
 
 ### Build profiles & redistributability
 
-The **default build is LGPL-clean and redistributable**. Some features change the effective
-license of the resulting artifact — keep this in mind for any dependency you add:
+The **default dependency build is LGPL-clean**. This is not a grant to redistribute Conspect:
+project-code rights remain subject to [LICENSE](LICENSE) and separate written permission.
+The following describes dependency obligations, not a replacement license for the whole product:
 
-| Profile | Effective status |
+| Profile | Dependency obligations |
 |---|---|
-| **default** | Permissive / LGPL-clean, redistributable |
-| **+`gpl-codecs`** | Whole build becomes **GPL-2.0-or-later** |
-| **+`ndi`** | Permissive code + NDI EULA + mandatory attribution |
+| **default** | Permissive / LGPL-clean dependencies; no project redistribution grant |
+| **+`gpl-codecs`** | GPL obligations apply; do not assume compatibility or permission to distribute |
+| **+`ndi`** | NDI EULA + mandatory attribution; no project redistribution grant |
 | **nonfree** (libnpp/FDK-AAC/OpenSSL) | **NOT redistributable** — internal use only |
 
 Full matrix and rules: [conventions §7](docs/architecture/conventions.md) and
@@ -429,9 +439,11 @@ update `deny.toml` (with justification) as part of the change.
 ### Developer Certificate of Origin (DCO)
 
 We require a **DCO sign-off** on every commit. By signing off you certify the
-[Developer Certificate of Origin](https://developercertificate.org/) — i.e. that you wrote
-the code or have the right to submit it under the project license. Sign off by adding a
-trailer to each commit:
+[Developer Certificate of Origin](https://developercertificate.org/) under its actual
+terms. A sign-off records origin and submission authority; it does not create
+permission to modify or distribute Conspect. Obtain the separate written permission
+required by the applicable software license first, and sign only if you can truthfully
+make the DCO certification. Add a trailer to each commit:
 
 ```
 Signed-off-by: Your Name <you@example.com>
@@ -454,4 +466,4 @@ DCO check is tracked as a gap in
 Questions that aren't answered here usually are in
 [`docs/architecture/conventions.md`](docs/architecture/conventions.md) (the source of
 truth), the briefs in [`docs/research/`](docs/research/), or the decisions in
-[`docs/decisions/`](docs/decisions/). Thanks for contributing to Multiview!
+[`docs/decisions/`](docs/decisions/). Thanks for contributing to Conspect!

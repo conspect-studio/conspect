@@ -16,7 +16,7 @@ export function DisplayNodesHelpPage(): JSX.Element {
         title={<Trans>Display nodes</Trans>}
         description={
           <Trans>
-            Multiview's own playout endpoints: small computers that turn
+            Conspect's own playout endpoints: small computers that turn
             ordinary displays into managed, frame-accurate wall heads.
           </Trans>
         }
@@ -27,7 +27,7 @@ export function DisplayNodesHelpPage(): JSX.Element {
           <Prose>
             <Trans>
               A display node is a single-board computer or spare PC running
-              Multiview's node software, driving one or more physical
+              Conspect's node software, driving one or more physical
               displays. Nodes are adopted as managed devices with the{" "}
               <Code>displaynode</Code> driver and present the program, a
               declared output, or one head of a video wall. Because the node
@@ -57,10 +57,10 @@ export function DisplayNodesHelpPage(): JSX.Element {
         <DocSection id="display-node-resilience" title={<Trans>Resilience</Trans>}>
           <Prose>
             <Trans>
-              A node inherits the product's output doctrine: if its feed
-              stops, it holds the last good frame, then shows its local slate
-              — it never blanks mid-show because of a network blip, and the
-              multiview program itself is never affected by a node's fate.
+              A node is designed to hold the last good frame, then show its
+              local slate if its feed stops. The objective is to avoid blank
+              displays during network interruptions and isolate program timing
+              from node failures, not to guarantee uninterrupted operation.
             </Trans>
           </Prose>
           <HelpLink to="/help/sync" label={t`About sync tiers`} />

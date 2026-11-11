@@ -4,13 +4,13 @@
 > **Deep reference:** [`../research/color-management.md`](../research/color-management.md).
 > **Decisions:** [ADR-C001](../decisions/ADR-C001.md) … [ADR-C006](../decisions/ADR-C006.md).
 
-Multiview composites **heterogeneous** sources — each tile can carry different primaries,
+Conspect composites **heterogeneous** sources — each tile can carry different primaries,
 transfer function, YUV↔RGB matrix, and range — into **one** canvas. Because the
 [`multiview-compositor`](./conventions.md) runs a **custom GPU compositor and deliberately
 bypasses swscale/FFmpeg filters**, libav performs **no** implicit color conversion for us.
 We own correctness end-to-end: **detect → convert → composite in linear light → encode →
 tag → verify**. Get any axis wrong and the output is *silently, visibly* wrong on some
-players with zero errors. This is the bug class Multiview has repeatedly been burned by.
+players with zero errors. This is the bug class Conspect has repeatedly been burned by.
 
 ---
 
@@ -108,7 +108,7 @@ not a hardcoded matrix.
 (RTSP/SRT/TS, IP cameras, webcams) ship **untagged**, and every consumer guesses
 *differently*. swscale silently uses **index-0 = BT.601** for an unspecified matrix
 **regardless of resolution**; players/libplacebo/mpv use a **resolution heuristic** instead.
-**Multiview must reproduce the PLAYER behavior, not swscale's** — otherwise the multiview disagrees
+**Conspect must reproduce the PLAYER behavior, not swscale's** — otherwise the multiview disagrees
 with how a source looks in a real player. ([ADR-C002](../decisions/ADR-C002.md).)
 
 ### 3.1 Detection precedence (per tile, every frame)

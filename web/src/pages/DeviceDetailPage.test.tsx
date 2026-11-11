@@ -90,7 +90,7 @@ describe('DeviceDetailPage tabs', () => {
     renderDetail();
     expect(await screen.findByText('Foyer box')).toBeInTheDocument();
     expect(
-      screen.getByText(/program output never depends on this device/i),
+      screen.getByText(/program-output timing is designed to remain independent of this device/i),
     ).toBeInTheDocument();
   });
 
@@ -224,7 +224,7 @@ describe('DeviceDetailPage maintenance verbs', () => {
     expect(posted).toBeUndefined();
     expect(within(dialog).getByText(/restarts the device/i)).toBeInTheDocument();
     expect(
-      within(dialog).getByText(/No Multiview program output is interrupted/i),
+      within(dialog).getByText(/Conspect is designed to maintain program-output timing independently/i),
     ).toBeInTheDocument();
     await userEvent.click(
       within(dialog).getByRole('button', { name: /apply mode: encoder/i }),

@@ -1,10 +1,11 @@
-# Multiview Documentation
+<a id="multiview-documentation"></a>
+# Conspect Documentation
 
-**Multiview** is an efficient, hardware-accelerated, Rust live video multiview generator: ingest many
-live sources, composite a templated multiview on the GPU, and serve it robustly. It is built to run
-great on **commodity hardware** and to produce **bulletproof, continuous output** — at every tick
-of one fixed internal clock, the engine emits exactly one valid frame, **forever**, independent of
-any input.
+**Conspect** is a Rust platform for **live-media production, routing and monitoring** on
+**commodity hardware**: ingest live sources, compose video layouts, mix audio, and serve outputs
+through multiple transports. Multiview composition is one capability, not the product's limit.
+Continuous output despite input failures is a design goal, not a warranty; the fixed-cadence
+output-clock invariant below defines the engineering requirement.
 
 This is the documentation portal — the single navigational entrypoint. Start with the
 [Conventions](architecture/conventions.md) (the source of truth) and the
@@ -26,7 +27,7 @@ For the implementation plan and per-feature status, see [ROADMAP.md](../ROADMAP.
 |---|---|
 | **Binary / daemon** | `multiview` |
 | **Language / edition** | Rust 2021 (stable, pinned via `rust-toolchain.toml`) |
-| **License (project)** | Multiview Source-Available Non-Commercial License, Version 1.0 (source-available, **not** open source) — see [Licensing model](architecture/conventions.md#7-licensing-model-build-profiles) |
+| **License (project)** | [Conspect Source-Available Non-Commercial License Version 2.0](../LICENSE) (source-available, **not** open source): private study and copies necessary for authorized use, not general modification, redistribution or reproduction; see [Licensing model](architecture/conventions.md#7-licensing-model-build-profiles) |
 | **Platforms** | Linux (x86_64 + aarch64; NVIDIA, Intel/AMD VAAPI) and macOS (Apple Silicon + Intel). **No Windows.** |
 | **GPU compositor** | Custom, wgpu baseline with vendor fast paths (see [pipeline](architecture/pipeline.md)) |
 | **Default build** | Pure-Rust, LGPL-clean, no native deps; GPU/codec/NDI behind opt-in features |
@@ -108,7 +109,7 @@ The management single-page app embedded in the binary.
 | [internationalization.md](web/internationalization.md) | i18n/l10n: library, ICU MessageFormat, Intl date/time/number, multi-timezone clocks, RTL, and the localization policy. |
 
 ### Operations (`operations/`)
-Building, deploying, and running Multiview.
+Building, deploying, and running Conspect.
 
 | Doc | Description |
 |-----|-------------|

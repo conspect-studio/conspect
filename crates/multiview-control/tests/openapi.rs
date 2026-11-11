@@ -268,7 +268,7 @@ async fn openapi_json_is_served() {
     assert_eq!(resp.status(), StatusCode::OK);
     let doc = body_json(resp).await;
     assert!(doc["openapi"].as_str().unwrap().starts_with("3.1"));
-    assert_eq!(doc["info"]["title"], "Multiview Control API");
+    assert_eq!(doc["info"]["title"], "Conspect Control API");
 }
 
 #[tokio::test]

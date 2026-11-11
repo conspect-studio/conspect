@@ -1,6 +1,7 @@
-# Multiview — REST API
+<a id="multiview--rest-api"></a>
+# Conspect — REST API
 
-The Multiview control plane is a single [axum](../decisions/ADR-W001.md) HTTP service inside the
+The Conspect control plane is a single [axum](../decisions/ADR-W001.md) HTTP service inside the
 `multiview` binary. It exposes a **versioned, resource-oriented REST API** for all CRUD and command
 operations, an [OpenAPI 3.1](../decisions/ADR-W002.md) contract, and interactive docs. Realtime
 state (snapshots, deltas, meters, the *result* of async operations) flows over a separate

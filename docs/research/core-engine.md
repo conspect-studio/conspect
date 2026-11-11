@@ -2,6 +2,13 @@
 
 ---
 
+> **Historical naming and licensing:** this 2026-06-02 record retains the former product name
+> Multiview and the licensing assumptions of its time. The product is now Conspect. Its license
+> summaries and redistribution claims are not current grants; the [Conspect Source-Available
+> Non-Commercial License Version 2.0](../../LICENSE) governs current copies, permitting private
+> study and copies necessary for authorized use, not general modification, distribution or
+> reproduction. Third-party license rights remain separate. Earlier grants retain their terms.
+
 # MULTIVIEW — Architecture Brief
 
 **Project:** Multiview — an efficient, hardware-accelerated, Rust-based live video multiview generator

@@ -1,5 +1,11 @@
 # Runbook — Conspect device licensing (heartbeat + device-PoP)
 
+> **Eligibility is separate from issuance.** A free-tier lease or omitted claim
+> code is not evidence that a use is permitted. The applicable [license](../../LICENSE)
+> governs eligibility: Version 2.0 excludes religious use and monetized
+> Conspect-produced content, and free use excludes paid/metered features. This
+> runbook describes protocol behaviour, not a broader license grant.
+
 ## What it is and why
 
 The `multiview` binary's **device-licensing client** phones home to the Conspect

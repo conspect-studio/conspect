@@ -72,8 +72,10 @@ docker compose -f deploy/compose.yaml down -v`}
           <Prose>
             <Trans>
               The default image encodes <Code>mpeg2video</Code>, which plays in
-              VLC and ffplay. For browser playback, switch to the GPL image and an
-              H.264 codec (see the config section).
+              VLC and ffplay. For browser playback, configure a supported H.264
+              encoder (see the config section). Software-encoder images may carry
+              GPL dependency obligations; these do not relicense Conspect's own
+              code or grant permission to redistribute it.
             </Trans>
           </Prose>
         </DocSection>

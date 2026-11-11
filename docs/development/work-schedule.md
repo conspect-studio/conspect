@@ -1,5 +1,9 @@
 # Multiview — Work Schedule & Fanout Plan
 
+> **Naming note:** this dated plan and its shipped-work records retain the former product name
+> Multiview; the product is now Conspect. `Multiview` program kinds and other technical identifiers
+> remain unchanged.
+
 Every remaining incomplete / stubbed / future item, planned to completion with acceptance
 criteria, then sequenced for a **dependency‑ and conflict‑aware parallel fanout**. Generated
 2026‑06‑05 from an 8‑stream architecture pass (`docs/decisions/` + the live scaffold).

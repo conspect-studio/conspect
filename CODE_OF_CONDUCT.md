@@ -51,15 +51,15 @@ The goal is a project that is welcoming to everyone, always.
 
 ## Original work & third-party intellectual property
 
-Multiview is built from **open industry standards and original engineering** — never by copying
+Conspect is built from **open industry standards and original engineering** — never by copying
 others' work. Contributors must **not**:
 
 - Copy, paste, or closely paraphrase **proprietary or copyrighted** code, designs, UI, or
   documentation from any third party, product, or competitor.
 - Replicate a specific commercial product's distinctive **feature set, workflow, or branding**, or
   present **trademarked product/feature names** as our own.
-- Add code or assets whose **license is incompatible** with the project (the Multiview
-  Source-Available Non-Commercial License), or that you do not have the right to contribute.
+- Add code or assets whose **license is incompatible** with the project (the Conspect
+  Source-Available Non-Commercial License v2), or that you do not have the right to contribute.
 
 Instead:
 

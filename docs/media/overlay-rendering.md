@@ -1,5 +1,11 @@
 # Efficient Overlay Rendering — Design Brief
 
+> **Historical record (2026-06-03):** Multiview below is the former name of Conspect.
+> The dated design and license references are retained as history, not current grants.
+> Current project permissions are in the [Conspect Source-Available Non-Commercial License
+> Version 2.0](../../LICENSE): private study and copies necessary for authorized use, not general
+> modification, redistribution or reproduction. Third-party license rights remain separate.
+
 > **Area:** Media / Compositor · Overlays
 > **Status:** Verification-hardened design brief (no code this phase)
 > **Date:** 2026-06-03

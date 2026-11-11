@@ -24,7 +24,7 @@ export function ConfigPage(): JSX.Element {
         title={<Trans>Config-as-code</Trans>}
         description={
           <Trans>
-            A Multiview deployment is one declarative document. It is authored as
+            A Conspect deployment is one declarative document. It is authored as
             TOML and round-trips losslessly to JSON (the API wire form).
           </Trans>
         }
