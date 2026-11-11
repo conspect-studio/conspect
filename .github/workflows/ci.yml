@@ -1009,6 +1009,98 @@ jobs:
           --
           --test-threads=1
 
+  # ── macOS: pinned LGPL FFmpeg (VideoToolbox) + ffmpeg-feature build/tests ────
+  # The macOS counterpart of feature-clippy-ffmpeg-webrtc (ADR-0011, ADR-0031).
+  # Builds OUR pinned FFmpeg natively with FF_HWACCEL=apple (VideoToolbox +
+  # AudioToolbox, LGPL only) through deploy/ffmpeg-build.sh, caches the prefix
+  # keyed on the build inputs, then clippies the ffmpeg presets and runs the
+  # multiview-ffmpeg suite against it. Homebrew's own `ffmpeg` (GPL, different
+  # major) is never used.
+  macos-ffmpeg:
+    name: macOS pinned-FFmpeg clippy + test
+    runs-on: macos-15
+    timeout-minutes: 75
+    needs: changes
+    if: ${{ github.event_name != 'pull_request' || needs.changes.outputs.code == 'true' }}
+    steps:
+      - name: FFmpeg prefix outside the checkout (no `..`; actions/cache rejects it)
+        run: echo "FF_PREFIX=${RUNNER_WORKSPACE}/multiview-ffmpeg" >> "$GITHUB_ENV"
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@1.99.1
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: macos-ffmpeg
+      - name: Build tools (LGPL deps only) + fixture ffmpeg CLI
+        # Homebrew's `ffmpeg` is a FIXTURE GENERATOR only (lavfi clips the
+        # tests shell out for; the pinned --disable-everything build has no
+        # lavfi). Nothing links it: the wrapper clears DYLD_LIBRARY_PATH so it
+        # never loads the pinned libraries, and the linkage guard below proves
+        # the test binaries load OUR prefix.
+        run: |
+          set -euo pipefail
+          brew install pkg-config nasm opus srt gnutls ffmpeg
+          shim="${RUNNER_TEMP}/fixture-bin"
+          mkdir -p "${shim}"
+          printf '#!/bin/sh\nexec env -u DYLD_LIBRARY_PATH "%s" "$@"\n' "$(brew --prefix)/bin/ffmpeg" > "${shim}/ffmpeg"
+          chmod 0755 "${shim}/ffmpeg"
+          echo "${shim}" >> "$GITHUB_PATH"
+      - name: Record build-dep versions (cache key input)
+        id: brewdeps
+        run: echo "v=$(brew list --versions opus srt gnutls | tr ' \n' '-_')" >> "$GITHUB_OUTPUT"
+      - name: Cache pinned FFmpeg prefix
+        id: ffcache
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.FF_PREFIX }}
+          key: ffmpeg-apple-${{ runner.arch }}-${{ steps.brewdeps.outputs.v }}-${{ hashFiles('deploy/ffmpeg-build.sh', 'deploy/ffmpeg-fetch-source.sh', 'deploy/ffmpeg-signing-key.asc', 'deploy/ffmpeg-patches/**', 'deploy/Dockerfile.ffmpeg', '.github/workflows/ci.yml') }}
+      - name: Build pinned FFmpeg (apple profile)
+        if: steps.ffcache.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          pin() { sed -n "s/^ARG $1=//p" deploy/Dockerfile.ffmpeg | head -1; }
+          export PKG_CONFIG_PATH="$(brew --prefix)/lib/pkgconfig"
+          FF_LICENSE=lgpl FF_HWACCEL=apple TARGETARCH=arm64 \
+            FFMPEG_VERSION="$(pin FFMPEG_VERSION)" FFMPEG_SHA256="$(pin FFMPEG_SHA256)" \
+            FFMPEG_GIT_COMMIT="$(pin FFMPEG_GIT_COMMIT)" \
+            bash deploy/ffmpeg-build.sh
+      - name: Assert LGPL-only, VideoToolbox present, soname 63
+        run: |
+          set -euo pipefail
+          export DYLD_LIBRARY_PATH="${FF_PREFIX}/lib"
+          test -e "${FF_PREFIX}/lib/libavcodec.63.dylib"
+          "${FF_PREFIX}/bin/ffmpeg" -hide_banner -encoders | grep -q h264_videotoolbox
+          if "${FF_PREFIX}/bin/ffmpeg" -hide_banner -buildconf | grep -qE 'enable-gpl|enable-nonfree|libx26[45]'; then
+            echo "::error::GPL/nonfree component in the macOS FFmpeg"; exit 1
+          fi
+          # The script's own post-install IO allowlist check (same as Docker).
+          FF_PREFIX="${FF_PREFIX}" bash deploy/ffmpeg-build.sh --assert-features
+          {
+            echo "PKG_CONFIG_PATH=${FF_PREFIX}/lib/pkgconfig"
+            echo "DYLD_LIBRARY_PATH=${FF_PREFIX}/lib"
+          } >> "$GITHUB_ENV"
+          # The pinned build's ffprobe verifies outputs (invariant #8); the
+          # fixture shim keeps `ffmpeg` resolving to the lavfi generator.
+          ln -sf "${FF_PREFIX}/bin/ffprobe" "${RUNNER_TEMP}/fixture-bin/ffprobe"
+      - name: clippy multiview-cli --features ffmpeg,overlay,gpu
+        run: cargo clippy --locked -p multiview-cli --features ffmpeg,overlay,gpu --all-targets -- -D warnings
+      - name: clippy multiview-cli --features apple (VideoToolbox code paths)
+        run: cargo clippy --locked -p multiview-cli --features apple --all-targets -- -D warnings
+      - name: clippy multiview-cli --features webrtc-native
+        run: cargo clippy --locked -p multiview-cli --features webrtc-native --all-targets -- -D warnings
+      - name: test multiview-ffmpeg --features ffmpeg,videotoolbox
+        run: cargo test --locked --no-fail-fast -p multiview-ffmpeg --features ffmpeg,videotoolbox
+      - name: Assert the tests linked OUR prefix, not Homebrew's FFmpeg
+        # A wrong PKG_CONFIG_PATH silently falls back to any other libav on the
+        # pkg-config default path (e.g. Homebrew's GPL ffmpeg). Fail loudly.
+        run: |
+          set -euo pipefail
+          bin="$(ls -t target/debug/deps/multiview_ffmpeg-* | grep -vE '\.(d|rlib|rmeta)$' | head -1)"
+          otool -L "$bin" | grep libavformat
+          otool -L "$bin" | grep -q "${FF_PREFIX}/lib/libavformat" \
+            || { echo "::error::test binary is not linked against ${FF_PREFIX}"; exit 1; }
+
   # ── AsyncAPI 3.0 spec validation (SUR-6b follow-on, folded into IN-7) ────────
   # Validates docs/api/asyncapi.json against the AsyncAPI 3.0 JSON Schema using
   # the official @asyncapi/cli. The spec is generated by `cargo xtask gen-asyncapi`

@@ -141,6 +141,9 @@ struct PreviewVideoEncoder {
     rtp_ts: AtomicU32,
     /// Whether the first emitted access unit (the keyframe) has been produced.
     first_done: AtomicBool,
+    /// Set when the encoder failed to open: the session stays video-less
+    /// instead of re-opening a libav encoder on every preview tick.
+    open_failed: AtomicBool,
 }
 
 impl PreviewVideoEncoder {
@@ -150,6 +153,7 @@ impl PreviewVideoEncoder {
             inner: Mutex::new(PreviewEncodeState::default()),
             rtp_ts: AtomicU32::new(0),
             first_done: AtomicBool::new(false),
+            open_failed: AtomicBool::new(false),
         }
     }
 
@@ -197,10 +201,20 @@ impl PreviewVideoEncoder {
         let state = &mut *guard;
         let dims = self.target_dims(image);
         if state.encoder.is_none() || state.encoder_dims != dims {
+            // A failed open is sticky for these dimensions (never re-opened per
+            // tick); a layout change to another size re-arms one attempt.
+            if state.encoder.is_none()
+                && state.encoder_dims == dims
+                && self.open_failed.load(Ordering::Acquire)
+            {
+                return None;
+            }
             // First frame, or the layout changed to a different capped size:
             // reopen at the new size (the new stream starts with a keyframe).
             state.encoder = self.open(dims);
             state.encoder_dims = dims;
+            self.open_failed
+                .store(state.encoder.is_none(), Ordering::Release);
             self.first_done.store(false, Ordering::Release);
         }
         let video = state.fitter.fit(image, dims)?;
@@ -228,11 +242,11 @@ impl PreviewVideoEncoder {
         let fps = Rational::new(i64::from(PREVIEW_FPS), 1);
         let (encoder_name, options) = match self.codec {
             PreviewCodec::H264 => {
-                let name = multiview_ffmpeg::codec::select_encoder(VideoCodec::H264)?;
+                let name = preview_encoder(VideoCodec::H264)?;
                 (name, preview_h264_options(name, fps))
             }
             PreviewCodec::Vp8 => {
-                let name = multiview_ffmpeg::codec::select_encoder(VideoCodec::Vp8)?;
+                let name = preview_encoder(VideoCodec::Vp8)?;
                 (name, preview_vp8_options(fps))
             }
             // A future preview codec with no encoder wired here yields no encoder
@@ -1055,12 +1069,44 @@ fn select_offer_codec(offer: &str) -> Result<PreviewCodec, WhepReject> {
             }
         }
     }
-    if has_h264 && multiview_ffmpeg::codec::can_encode(VideoCodec::H264) {
+    choose_offer_codec(has_h264, has_vp8, |codec| preview_encoder(codec).is_some())
+}
+
+/// Pure negotiation rule: H.264 when offered and an encoder is USABLE here,
+/// else VP8 when offered and usable, else reject (review WHEP-VT-OPEN-FALLBACK:
+/// a registered but unusable hardware H.264 encoder must not win the
+/// negotiation and leave the session without video).
+fn choose_offer_codec(
+    has_h264: bool,
+    has_vp8: bool,
+    usable: impl Fn(VideoCodec) -> bool,
+) -> Result<PreviewCodec, WhepReject> {
+    if has_h264 && usable(VideoCodec::H264) {
         Ok(PreviewCodec::H264)
-    } else if has_vp8 && multiview_ffmpeg::codec::can_encode(VideoCodec::Vp8) {
+    } else if has_vp8 && usable(VideoCodec::Vp8) {
         Ok(PreviewCodec::Vp8)
     } else {
         Err(WhepReject::UnsupportedCodec)
+    }
+}
+
+/// The preview encoder for `codec` that actually opens on this host, resolved
+/// ONCE per process (hardware candidates are probed with a real session open;
+/// see `multiview_ffmpeg::select_usable_encoder`). Never probed per tick or per
+/// session.
+fn preview_encoder(codec: VideoCodec) -> Option<&'static str> {
+    use std::sync::OnceLock;
+    static H264: OnceLock<Option<&'static str>> = OnceLock::new();
+    static VP8: OnceLock<Option<&'static str>> = OnceLock::new();
+    let resolve = || {
+        multiview_ffmpeg::select_usable_encoder(codec, &mut |n| {
+            multiview_ffmpeg::probe_encoder_opens(n)
+        })
+    };
+    match codec {
+        VideoCodec::H264 => *H264.get_or_init(resolve),
+        VideoCodec::Vp8 => *VP8.get_or_init(resolve),
+        _ => None,
     }
 }
 
@@ -1155,6 +1201,32 @@ mod tests {
         clippy::panic,
         clippy::indexing_slicing
     )]
+
+    /// Review WHEP-VT-OPEN-FALLBACK: an offered H.264 whose encoder cannot open
+    /// here must not win; VP8 is chosen when offered and usable, else reject.
+    #[test]
+    fn an_unusable_h264_encoder_negotiates_vp8_or_rejects() {
+        use super::choose_offer_codec;
+        use multiview_ffmpeg::VideoCodec;
+        use multiview_preview::whep::PreviewCodec;
+        let all = |_: VideoCodec| true;
+        let no_h264 = |c: VideoCodec| c != VideoCodec::H264;
+        let none = |_: VideoCodec| false;
+        assert_eq!(
+            choose_offer_codec(true, true, all).ok(),
+            Some(PreviewCodec::H264)
+        );
+        assert_eq!(
+            choose_offer_codec(true, true, no_h264).ok(),
+            Some(PreviewCodec::Vp8)
+        );
+        assert!(choose_offer_codec(true, false, no_h264).is_err());
+        assert!(choose_offer_codec(true, true, none).is_err());
+        assert_eq!(
+            choose_offer_codec(false, true, all).ok(),
+            Some(PreviewCodec::Vp8)
+        );
+    }
 
     use std::net::SocketAddr;
     use std::time::Instant;
