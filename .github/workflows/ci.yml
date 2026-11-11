@@ -1160,6 +1160,10 @@ jobs:
           if (-not (Test-Path "$prefix\bin\avcodec-63.dll")) { throw "avcodec-63.dll missing" }
           if (-not (ffmpeg -hide_banner -encoders | Select-String "h264_nvenc")) { throw "h264_nvenc missing" }
           if (ffmpeg -hide_banner -buildconf | Select-String "enable-gpl|enable-nonfree|libx26") { throw "GPL/nonfree component in the Windows FFmpeg" }
+          # ffmpeg-sys-next on MSVC links from FFMPEG_DIR (import libs in lib/);
+          # bindgen needs libclang (LLVM is preinstalled on windows-2022).
+          "FFMPEG_DIR=$prefix" | Out-File -Append $env:GITHUB_ENV
+          "LIBCLANG_PATH=C:\Program Files\LLVM\bin" | Out-File -Append $env:GITHUB_ENV
           "PKG_CONFIG_PATH=$prefix\lib\pkgconfig" | Out-File -Append $env:GITHUB_ENV
           "$prefix\bin" | Out-File -Append $env:GITHUB_PATH
           "$env:FF_WIN_DEPS_WIN\bin" | Out-File -Append $env:GITHUB_PATH
