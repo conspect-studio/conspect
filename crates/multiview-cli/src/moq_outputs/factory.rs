@@ -1763,8 +1763,8 @@ mod tests {
             } else {
                 inter_with_key_flag(tick)
             }];
-            let current_audio = ((tick + 1) * 48_000 / (30 * 1024)) as i64;
-            let previous_audio = (tick * 48_000 / (30 * 1024)) as i64;
+            let current_audio = (tick + 1) * 48_000 / (30 * 1024);
+            let previous_audio = tick * 48_000 / (30 * 1024);
             for sample in previous_audio..current_audio {
                 for kind in
                     std::iter::once(StreamKind::Audio).chain((0..4).map(StreamKind::AudioTrack))
@@ -1781,7 +1781,7 @@ mod tests {
                 GENERATION,
                 &packets,
                 Duration::from_millis(33),
-                now + Duration::from_millis(tick as u64 * 33),
+                now + Duration::from_millis(u64::try_from(tick).unwrap() * 33),
             );
             if let Some(window) = recv_within(&mut windows, Duration::from_secs(2)) {
                 retained.push(window);
