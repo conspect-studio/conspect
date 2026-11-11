@@ -6043,16 +6043,15 @@ msgstr ""
 msgid "Live host and accelerator utilisation streaming from the engine."
 msgstr ""
 
-#: src/preview/PreviewSurface.tsx:201
-#: src/preview/PreviewSurface.tsx:225
+#: src/preview/PreviewSurface.tsx:238
 msgid "Live input preview failed."
 msgstr ""
 
-#: src/preview/PreviewSurface.tsx:225
+#: src/preview/PreviewSurface.tsx:238
 msgid "Live input preview is busy. Another viewer has the session."
 msgstr ""
 
-#: src/preview/PreviewSurface.tsx:227
+#: src/preview/PreviewSurface.tsx:242
 msgid "Live preview is busy. Another viewer has the session."
 msgstr ""
 
@@ -12355,7 +12354,7 @@ msgstr ""
 msgid "Why AUTO is unavailable · transition options"
 msgstr ""
 
-#: src/preview/PreviewSurface.tsx:245
+#: src/preview/PreviewSurface.tsx:260
 msgid "Why live preview failed"
 msgstr ""
 

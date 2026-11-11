@@ -1,6 +1,18 @@
 import { createApiClient } from '../api/client';
-import { MoqUnavailable, type MoqLeaseApi } from './moqPlayback';
+import { MoqLeaseRefused, type MoqLeaseApi } from './moqPlayback';
 import type { PreviewScope } from './capabilities';
+
+/** The typed refusal reason of a MoQ lease problem body (`unknown` when absent). */
+export function moqRefusalReason(error: unknown): string {
+  if (typeof error !== 'object' || error === null) return 'unknown';
+  const record = error as { readonly code?: unknown; readonly type?: unknown };
+  if (typeof record.code === 'string' && record.code !== '') return record.code;
+  if (typeof record.type === 'string') {
+    const last = record.type.split('/').pop();
+    if (last !== undefined && last !== '') return last;
+  }
+  return 'unknown';
+}
 
 export function createMoqLeaseApi(scope: PreviewScope, whepEndpoint: string): MoqLeaseApi {
   const id = /\/preview\/(?:inputs|outputs)\/([^/]+)\/whep$/.exec(whepEndpoint)?.[1];
@@ -14,11 +26,10 @@ export function createMoqLeaseApi(scope: PreviewScope, whepEndpoint: string): Mo
           ? await client.POST('/api/v1/preview/inputs/{id}/moq', { params: { path: { id: resourceId } }, signal })
           : await client.POST('/api/v1/preview/outputs/{id}/moq', { params: { path: { id: resourceId } }, signal });
       if (!result.data) {
-        // Only the explicit availability code permits a different transport.
-        const error: unknown = result.error;
-        if (result.response.status === 503 && typeof error === 'object' && error !== null &&
-          'code' in error && error.code === 'moq-unavailable') throw new MoqUnavailable('MoQ unavailable');
-        throw new Error('MoQ lease request failed');
+        // The server answers RFC 9457 problems: the reason is the last segment of
+        // `type` (`/problems/moq-unavailable`); `code` is the legacy field. Every
+        // refusal is typed so the surface can name it AND try the next transport.
+        throw new MoqLeaseRefused(moqRefusalReason(result.error), result.response.status);
       }
       return result.data;
     },

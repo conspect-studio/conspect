@@ -9,6 +9,7 @@ import type { AbrState } from './moqAbr';
 const mocks = vi.hoisted(() => ({ start: vi.fn() }));
 vi.mock('./moqPlayback', () => ({
   MoqUnavailable: class extends Error {},
+  MoqLeaseRefused: class extends Error { reason = 'moq-unavailable'; status = 503; },
   startMoqPlaybackWithRefresh: mocks.start,
 }));
 import { MoqPlayer } from './MoqPlayer';

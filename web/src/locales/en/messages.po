@@ -6043,16 +6043,15 @@ msgstr "Live ephemeral cast sessions."
 msgid "Live host and accelerator utilisation streaming from the engine."
 msgstr "Live host and accelerator utilisation streaming from the engine."
 
-#: src/preview/PreviewSurface.tsx:201
-#: src/preview/PreviewSurface.tsx:225
+#: src/preview/PreviewSurface.tsx:238
 msgid "Live input preview failed."
 msgstr "Live input preview failed."
 
-#: src/preview/PreviewSurface.tsx:225
+#: src/preview/PreviewSurface.tsx:238
 msgid "Live input preview is busy. Another viewer has the session."
 msgstr "Live input preview is busy. Another viewer has the session."
 
-#: src/preview/PreviewSurface.tsx:227
+#: src/preview/PreviewSurface.tsx:242
 msgid "Live preview is busy. Another viewer has the session."
 msgstr "Live preview is busy. Another viewer has the session."
 
@@ -12355,7 +12354,7 @@ msgstr "Whole mix overview"
 msgid "Why AUTO is unavailable · transition options"
 msgstr "Why AUTO is unavailable · transition options"
 
-#: src/preview/PreviewSurface.tsx:245
+#: src/preview/PreviewSurface.tsx:260
 msgid "Why live preview failed"
 msgstr "Why live preview failed"
 

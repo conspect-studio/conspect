@@ -11,6 +11,12 @@ export interface MoqLeaseApi {
   release(lease: MoqLease): Promise<void>;
 }
 export class MoqUnavailable extends Error {}
+/** The server refused the MoQ lease; `reason` is its typed problem (e.g. `moq-unavailable`, `moq-capacity`). */
+export class MoqLeaseRefused extends Error {
+  constructor(readonly reason: string, readonly status: number) {
+    super(`MoQ lease refused: ${reason}`);
+  }
+}
 /** A local presentation watchdog expired; a fresh authorized session may recover it. */
 export class MoqPresentationGap extends Error {}
 /** The server's lease deadline elapsed; renewal still requires an acknowledged release. */

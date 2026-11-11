@@ -115,6 +115,9 @@ function JpegRung({
  * A preview surface for one scope. Picks WHEP vs JPEG from the capabilities
  * document, and degrades WHEP→JPEG (with a badge) on a fatal session error.
  */
+/** The transport rung a surface is using. The ladder is MoQ, then WebRTC, then stills. */
+export type PreviewTransport = 'moq' | 'webrtc' | 'jpeg';
+
 export function PreviewSurface({
   scope,
   whepEndpoint,
@@ -128,6 +131,7 @@ export function PreviewSurface({
   fetchImpl,
   onSessionReleased,
   onLeaseState,
+  onTransport,
   diagnosticsHost,
 }: {
   readonly scope: PreviewScope;
@@ -145,6 +149,8 @@ export function PreviewSurface({
   readonly fetchImpl?: typeof fetch | undefined;
   readonly onSessionReleased?: (() => void) | undefined;
   readonly onLeaseState?: ((state: 'negotiating' | 'active' | 'released') => void) | undefined;
+  /** Reports the rung in use (`moq`, `webrtc` or `jpeg`) and, after a MoQ fallback, why MoQ is not in use. */
+  readonly onTransport?: ((transport: PreviewTransport, moqFallbackReason?: string) => void) | undefined;
   /** When set, the fallback diagnostics + busy note render into this element (below the picture) behind one disclosure. */
   readonly diagnosticsHost?: HTMLElement | null | undefined;
 }): JSX.Element {
@@ -159,8 +165,8 @@ export function PreviewSurface({
   const refusals = useRef(0);
   const [released, setReleased] = useState(true);
 
-  const [moqUnavailable, setMoqUnavailable] = useState(false);
-  const [moqFailed, setMoqFailed] = useState(false);
+  // Why MoQ is not in use for this surface (undefined = not tried or playing).
+  const [moqReason, setMoqReason] = useState<string>();
   const moqApi = useMemo(() => createMoqLeaseApi(scope, whepEndpoint), [scope, whepEndpoint]);
   const canWhep = whepAvailable(capabilities, scope);
   const retryNow = (): void => {
@@ -198,13 +204,17 @@ export function PreviewSurface({
     };
   }, [autoRetry, attempt]);
 
-  if (moqFailed) return <div role="alert"><Trans>Live input preview failed.</Trans></div>;
-  if (capabilities?.moq && !moqUnavailable) {
+  const transport: PreviewTransport = capabilities?.moq && moqReason === undefined ? 'moq'
+    : canWhep && !degraded ? 'webrtc' : 'jpeg';
+  const transportRef = useRef(onTransport);
+  useEffect(() => { transportRef.current = onTransport; });
+  useEffect(() => { transportRef.current?.(transport, moqReason); }, [transport, moqReason]);
+
+  if (capabilities?.moq && moqReason === undefined) {
     return <MoqPlayer key={`${scope}:${whepEndpoint}`} api={moqApi} label={label} audio={audio} className={className}
-      onUnavailable={() => { setMoqUnavailable(true); }} onFatal={() => { setMoqFailed(true); }}
+      onUnavailable={(reason) => { setMoqReason(reason); }} onFatal={() => { /* reason arrives via onUnavailable */ }}
       onLeaseState={(state) => { onLeaseState?.(state); if (state === 'released') onSessionReleased?.(); }} />;
   }
-
   // No WebRTC for this scope/build: JPEG is the honest primary — NO badge.
   // This applies to every scope, including `input`: a build with no WebRTC at
   // all (the LGPL-clean/GPU-free default, `webrtc: false`) must still offer
@@ -222,7 +232,12 @@ export function PreviewSurface({
   // retry that re-arms a fresh WHEP attempt.
   if (degraded) {
     if (scope === 'input') {
-      return <div role="alert" className="px-3 py-2 text-sm" data-testid="input-preview-unavailable">{busy ? <Trans>Live input preview is busy. Another viewer has the session.</Trans> : <Trans>Live input preview failed.</Trans>}{released ? <Button type="button" onClick={retryNow}>Retry live preview</Button> : null}{diagnostics ? <PreviewDiagnostics diagnostics={diagnostics} /> : null}</div>;
+      return (
+        <>
+          <JpegRung jpegPath={jpegPath} label={label} degraded={false} className={className} />
+          <div role="alert" className="px-3 py-2 text-sm" data-testid="input-preview-unavailable">{busy ? <Trans>Live input preview is busy. Another viewer has the session.</Trans> : <Trans>Live input preview failed.</Trans>}{released ? <Button type="button" onClick={retryNow}>Retry live preview</Button> : null}{diagnostics ? <PreviewDiagnostics diagnostics={diagnostics} /> : null}</div>
+        </>
+      );
     }
     const busyNote = busy && !capacity ? <p role="alert"><Trans>Live preview is busy. Another viewer has the session.</Trans></p> : null;
     const details = diagnostics ? <PreviewDiagnostics diagnostics={diagnostics} flat={diagnosticsHost != null} /> : null;

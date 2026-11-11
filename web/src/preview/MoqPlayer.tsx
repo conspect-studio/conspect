@@ -1,5 +1,5 @@
 import { useEffect, useRef, type JSX } from 'react';
-import { MoqUnavailable, startMoqPlaybackWithRefresh, type MoqLeaseApi } from './moqPlayback';
+import { MoqLeaseRefused, MoqUnavailable, startMoqPlaybackWithRefresh, type MoqLeaseApi } from './moqPlayback';
 import { abrDatasetEntries, abrSnapshot, type AbrPersistedState, type AbrState } from './moqAbr';
 
 // Serialize replacements, including React StrictMode's effect cleanup/remount.
@@ -11,7 +11,8 @@ export function MoqPlayer({ api, label, audio = false, className, onUnavailable,
   readonly label: string;
   readonly audio?: boolean;
   readonly className?: string | undefined;
-  readonly onUnavailable: () => void;
+  /** MoQ cannot play here (unsupported browser/codec, lease refused, or the session failed): `reason` says which. */
+  readonly onUnavailable: (reason: string) => void;
   readonly onFatal: () => void;
   readonly onLeaseState?: ((state: 'negotiating' | 'active' | 'released') => void) | undefined;
   /** Per-consumer ABR state: requested vs effective rendition and the reason. */
@@ -50,17 +51,26 @@ export function MoqPlayer({ api, label, audio = false, className, onUnavailable,
           } });
         callbacks.current.onLeaseState?.('released');
       } catch (error) {
-        if (error instanceof MoqUnavailable) {
-          callbacks.current.onLeaseState?.('released');
-          if (!isAborted()) callbacks.current.onUnavailable();
-          return;
+        // The transport ladder is MoQ → WebRTC → stills. EVERY MoQ failure hands
+        // the surface a reason and lets it try the next transport; none ends in a
+        // dead view. An authorization failure repeats on the next transport and
+        // is reported there.
+        const reason = error instanceof MoqLeaseRefused ? error.reason
+          : error instanceof MoqUnavailable ? 'unsupported'
+          : 'session-failed';
+        // A refused lease or an unsupported browser holds no server session, so
+        // it is released now. A failed SESSION may not have had its release
+        // acknowledged: say so (onFatal) and do not claim 'released'.
+        if (reason === 'session-failed') {
+          if (!isAborted()) { callbacks.current.onFatal(); callbacks.current.onUnavailable(reason); }
+          throw error;
         }
-        if (!isAborted()) callbacks.current.onFatal();
-        throw error;
+        callbacks.current.onLeaseState?.('released');
+        if (!isAborted()) callbacks.current.onUnavailable(reason);
       }
     });
     lane.current = task;
-    void task.catch(() => { /* No retries or fallback on unclassified failure. */ });
+    void task.catch(() => { /* reported through onUnavailable above */ });
     return () => { controller.abort(); };
   }, [api, audio, abrResume]);
   return <canvas ref={canvas} aria-label={label} role="img" className={className} data-testid="moq-player" />;
