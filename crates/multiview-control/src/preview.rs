@@ -189,6 +189,47 @@ pub trait WhepProvider: Send + Sync {
     fn program_fidelity(&self) -> ProgramFidelity {
         ProgramFidelity::PreEncodeCanvasApprox
     }
+
+    /// Liveness sweep at the injected instant `now`: close every session whose
+    /// peer has vanished (ICE failed, DTLS closed, silent) and return the ids it
+    /// ended. The default is a no-op (a transport with no liveness signal).
+    fn reap_dead(&self, _now: std::time::Instant) -> Vec<String> {
+        Vec::new()
+    }
+
+    /// The configured focus caps and live count, if this provider enforces any.
+    fn focus_limits(&self) -> Option<FocusLimits> {
+        None
+    }
+
+    /// Like [`Self::negotiate`], naming the `owner` (the authenticated key id)
+    /// making the offer. A provider that caps sessions may use it to replace the
+    /// same owner's stale session on a re-offer. Defaults to ignoring the owner.
+    ///
+    /// # Errors
+    ///
+    /// See [`Self::negotiate`].
+    fn negotiate_for(
+        &self,
+        scope: &WhepScope,
+        offer: &str,
+        _owner: &str,
+    ) -> Result<WhepAnswer, WhepReject> {
+        self.negotiate(scope, offer)
+    }
+}
+
+/// Focus caps and occupancy, surfaced by `GET /api/v1/preview/capabilities` so the
+/// UI can tell the truth about how many live viewers the server admits.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+pub struct FocusLimits {
+    /// Maximum concurrent focus (WHEP) sessions server-wide.
+    pub max: u32,
+    /// Maximum concurrent focus sessions per scope.
+    pub max_per_scope: u32,
+    /// Focus sessions live right now.
+    pub active: u32,
 }
 
 /// The fidelity a **program** WHEP focus would carry (ADR-P005/P006). Serialized
@@ -243,6 +284,9 @@ pub struct PreviewCapabilities {
     pub moq: bool,
     /// Per-scope WHEP availability + the program fidelity label.
     pub scopes: ScopeCapabilities,
+    /// WHEP focus caps and occupancy (absent when the provider enforces none).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub focus: Option<FocusLimits>,
     /// The always-available fallback transport literal: `"jpeg"` (the one
     /// fallback literal everywhere — ADR-P006 move 6).
     pub fallback: String,
@@ -272,6 +316,7 @@ impl PreviewCapabilities {
                     fidelity: None,
                 },
             },
+            focus: provider.focus_limits(),
             fallback: "jpeg".to_owned(),
         }
     }
@@ -318,49 +363,58 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 
 pub use multiview_preview::focus::FocusCaps;
-use multiview_preview::focus::{FocusGate, FocusLease};
+use multiview_preview::focus::{FocusDenied, FocusGate, FocusLease};
+
+/// One held focus slot plus who/what/when, so a death sweep, a same-owner
+/// re-offer and the scope caps can all find it.
+struct Held {
+    _lease: FocusLease<String>,
+    scope: WhepScope,
+    owner: String,
+    /// Monotonic admission order (oldest = smallest).
+    seq: u64,
+}
+
+#[derive(Default)]
+struct Leases {
+    by_session: HashMap<String, Held>,
+    next_seq: u64,
+}
 
 /// A [`WhepProvider`] decorator that enforces the **concurrent-focus caps** in
-/// front of any inner transport (PRV-3).
-///
-/// Click-to-focus is the one expensive preview transport (a real preview-encode
-/// session), so the number of concurrent focus sessions must be bounded
-/// deterministically — a server-wide cap plus an independent per-scope cap
-/// (brief §3 "CAP CONCURRENCY", ADR-P002). `GatedWhep` wraps the inner
-/// [`WhepProvider`] with a [`FocusGate`]:
+/// front of any inner transport (PRV-3) and releases a slot when its session
+/// ends **for any reason**.
 ///
 /// * **Admission on `POST`.** [`Self::negotiate`] acquires a [`FocusLease`]
 ///   *before* delegating to the inner transport. When a cap is full the focus is
-///   **rejected** with [`WhepReject::CapacityExceeded`] carrying the configured
-///   `fallback` transport hint (the existing `503 fallback: jpeg` shape) — it
-///   is never queued and never able to starve or stall the engine (invariant
-///   #10). If the inner transport then refuses the (admitted) offer, the lease is
-///   dropped so the slot is freed immediately.
-/// * **Release on `DELETE`/expiry.** [`Self::release`] drops the lease keyed by
-///   the freed `session_id`, returning the slot to the gate.
+///   **rejected** with [`WhepReject::CapacityExceeded`] (the `503 fallback`
+///   shape) — never queued, never able to stall the engine (invariant #10). If
+///   the inner transport refuses the offer the lease is dropped immediately.
+/// * **Release on `DELETE`.** [`Self::release`] drops the lease.
+/// * **Release on death.** [`Self::reap_dead`] (driven by a periodic sweep)
+///   asks the transport which sessions ended — a viewer that vanishes never
+///   sends `DELETE` — and drops exactly those leases.
+/// * **Re-offer.** When the caps are full and the *same owner* (key id) already
+///   holds a session **on the same scope**, that owner's oldest such session is
+///   released to make room: a reload or remount replaces its own stale session
+///   instead of being locked out. An owner can never evict another owner's, or a
+///   different scope's, session; with cap headroom nothing is evicted.
 ///
-/// ## Isolation (invariant #10)
+/// ## Isolation (invariants #1 / #10)
 ///
-/// The gate and the session→lease map are **the decorator's own counters only**,
-/// behind short-lived `Mutex`es the engine never touches. `GatedWhep` holds no
-/// engine handle and no command bus; an unadmitted or released focus changes
-/// nothing on the protected output path.
+/// The gate and the lease map are the decorator's own counters, behind
+/// short-lived `Mutex`es the engine never touches. No lock is held across the
+/// inner transport call, and `GatedWhep` holds no engine handle or command bus.
 pub struct GatedWhep {
     inner: SharedWhep,
     gate: FocusGate<String>,
-    /// The transport the client should fall back to when a cap is full (the
-    /// honest `503` hint; e.g. `"jpeg"`).
+    /// The transport the client should fall back to when a cap is full.
     fallback: String,
-    /// Live focus leases keyed by the inner transport's `session_id`, so a
-    /// `DELETE`/expiry frees exactly the right slot. The decorator's own state.
-    leases: Mutex<HashMap<String, FocusLease<String>>>,
+    leases: Mutex<Leases>,
 }
 
 impl std::fmt::Debug for GatedWhep {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        // The inner transport object and the live-lease map are omitted (the
-        // former has no useful Debug, the latter could be large); the live
-        // `active` count and the fallback hint are the diagnostic fields.
         f.debug_struct("GatedWhep")
             .field("active", &self.gate.active())
             .field("fallback", &self.fallback)
@@ -377,54 +431,136 @@ impl GatedWhep {
             inner,
             gate: FocusGate::new(caps),
             fallback: fallback.into(),
-            leases: Mutex::new(HashMap::new()),
+            leases: Mutex::new(Leases::default()),
         }
     }
 
-    /// Wrap `inner` with conservative default caps ([`FocusCaps::default`] — one
-    /// focus server-wide and per scope) and the `jpeg` fallback hint.
+    /// Wrap `inner` with the default caps ([`FocusCaps::default`]) and the `jpeg`
+    /// fallback hint.
     #[must_use]
     pub fn with_defaults(inner: SharedWhep) -> Self {
         Self::new(inner, FocusCaps::default(), "jpeg")
+    }
+
+    /// Drop the leases of `ids` (sessions the transport has ended).
+    fn drop_leases(&self, ids: &[String]) {
+        if ids.is_empty() {
+            return;
+        }
+        // Collect under the lock, drop (which re-locks the gate) after releasing it.
+        let dropped: Vec<Held> = self.leases.lock().map_or_else(
+            |_| Vec::new(),
+            |mut l| {
+                ids.iter()
+                    .filter_map(|id| l.by_session.remove(id))
+                    .collect()
+            },
+        );
+        drop(dropped);
+    }
+
+    /// Release the owner's oldest session **in the same scope** to make room for
+    /// a re-offer. Returns whether one was released.
+    fn evict_own(&self, owner: &str, scope: &WhepScope) -> bool {
+        let victim = self.leases.lock().ok().and_then(|l| {
+            l.by_session
+                .iter()
+                .filter(|(_, h)| h.owner == owner && &h.scope == scope)
+                .min_by_key(|(_, h)| h.seq)
+                .map(|(id, _)| id.clone())
+        });
+        let Some(id) = victim else {
+            return false;
+        };
+        // Tear the transport session down first (no lock held), then free the slot.
+        let _ = self.inner.release(scope, &id);
+        self.drop_leases(&[id]);
+        true
+    }
+
+    fn admit(
+        &self,
+        scope: &WhepScope,
+        owner: Option<&str>,
+    ) -> Result<FocusLease<String>, WhepReject> {
+        let shed = || WhepReject::CapacityExceeded {
+            fallback: self.fallback.clone(),
+        };
+        match self.gate.try_acquire(scope.label()) {
+            Ok(lease) => Ok(lease),
+            Err(FocusDenied::Suspended) => Err(shed()),
+            Err(_full) => {
+                let replaced = owner.is_some_and(|o| self.evict_own(o, scope));
+                if !replaced {
+                    return Err(shed());
+                }
+                self.gate.try_acquire(scope.label()).map_err(|_| shed())
+            }
+        }
+    }
+
+    fn negotiate_inner(
+        &self,
+        scope: &WhepScope,
+        offer: &str,
+        owner: Option<&str>,
+    ) -> Result<WhepAnswer, WhepReject> {
+        // Admit FIRST: the lease reserves the slot before the expensive inner
+        // negotiation. If the inner transport refuses, dropping `lease` frees it.
+        let lease = self.admit(scope, owner)?;
+        let answer = match owner {
+            Some(o) => self.inner.negotiate_for(scope, offer, o)?,
+            None => self.inner.negotiate(scope, offer)?,
+        };
+        if let Ok(mut l) = self.leases.lock() {
+            l.next_seq = l.next_seq.wrapping_add(1);
+            let seq = l.next_seq;
+            l.by_session.insert(
+                answer.session_id.clone(),
+                Held {
+                    _lease: lease,
+                    scope: scope.clone(),
+                    owner: owner.unwrap_or_default().to_owned(),
+                    seq,
+                },
+            );
+        }
+        // A poisoned map drops `lease` here instead, freeing the slot at once:
+        // the session is admitted but no longer cap-tracked (preview-only).
+        Ok(answer)
     }
 }
 
 impl WhepProvider for GatedWhep {
     fn negotiate(&self, scope: &WhepScope, offer: &str) -> Result<WhepAnswer, WhepReject> {
-        // Admit against the cap FIRST: acquiring the lease reserves the slot
-        // before the (expensive) inner negotiation runs. A full cap sheds
-        // honestly to the JPEG fallback (the existing `503 fallback` shape) —
-        // never queued, never able to stall the engine (invariant #10).
-        let lease = self.gate.try_acquire(scope.label()).map_err(|_denied| {
-            WhepReject::CapacityExceeded {
-                fallback: self.fallback.clone(),
-            }
-        })?;
-        // The slot is reserved; delegate the actual SDP/ICE negotiation. If the
-        // inner transport refuses the offer, dropping `lease` here frees the slot
-        // immediately so a refused focus never leaks capacity.
-        let answer = self.inner.negotiate(scope, offer)?;
-        // Success: keep the lease alive, keyed by the transport's session id, so
-        // the matching DELETE/expiry releases exactly this slot.
-        if let Ok(mut leases) = self.leases.lock() {
-            leases.insert(answer.session_id.clone(), lease);
-        }
-        // If the lease-map lock were poisoned (only reachable after a panic in
-        // another thread while it was held), `lease` is dropped here instead and
-        // its slot is freed immediately — the session is admitted but stops being
-        // cap-tracked. This is preview-only bookkeeping (never the engine); the
-        // worst case is one extra concurrent focus, not a stalled output path.
-        Ok(answer)
+        self.negotiate_inner(scope, offer, None)
+    }
+
+    fn negotiate_for(
+        &self,
+        scope: &WhepScope,
+        offer: &str,
+        owner: &str,
+    ) -> Result<WhepAnswer, WhepReject> {
+        self.negotiate_inner(scope, offer, Some(owner))
     }
 
     fn release(&self, scope: &WhepScope, session_id: &str) -> bool {
-        let freed = self.inner.release(scope, session_id);
-        if freed {
-            if let Ok(mut leases) = self.leases.lock() {
-                // Dropping the lease returns the slot to the gate.
-                leases.remove(session_id);
-            }
+        // A session id is only releasable through the scope it was opened on (a
+        // key authorised for one scope must not close another scope's session).
+        let mismatch = self
+            .leases
+            .lock()
+            .ok()
+            .and_then(|l| l.by_session.get(session_id).map(|h| &h.scope != scope))
+            .unwrap_or(false);
+        if mismatch {
+            return false;
         }
+        let freed = self.inner.release(scope, session_id);
+        // Drop the lease even when the transport already forgot the session (it
+        // may have been reaped): the slot must never outlive the session.
+        self.drop_leases(&[session_id.to_owned()]);
         freed
     }
 
@@ -433,8 +569,27 @@ impl WhepProvider for GatedWhep {
     }
 
     fn webrtc_available(&self) -> bool {
-        // The gate is a thin cap decorator; whether WebRTC can be served is the
-        // inner transport's truth.
         self.inner.webrtc_available()
+    }
+
+    fn program_fidelity(&self) -> ProgramFidelity {
+        self.inner.program_fidelity()
+    }
+
+    fn reap_dead(&self, now: std::time::Instant) -> Vec<String> {
+        let ended = self.inner.reap_dead(now);
+        self.drop_leases(&ended);
+        // Also drop leases whose session the transport no longer tracks at all.
+        ended
+    }
+
+    fn focus_limits(&self) -> Option<FocusLimits> {
+        let caps = self.gate.caps();
+        let to = |n: usize| u32::try_from(n).unwrap_or(u32::MAX);
+        Some(FocusLimits {
+            max: to(caps.global),
+            max_per_scope: to(caps.per_scope),
+            active: to(self.gate.active()),
+        })
     }
 }

@@ -25,8 +25,9 @@ import { fileURLToPath } from "node:url";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = resolve(__dirname, "../..");
-const ASYNCAPI_PATH = resolve(REPO_ROOT, "docs/api/asyncapi.json");
-const OUT_PATH = resolve(__dirname, "../src/realtime/generated-types.ts");
+// Optional overrides (used by gen-pending-events.mjs): <asyncapi.json> <out.ts>.
+const ASYNCAPI_PATH = process.argv[2] ? resolve(process.argv[2]) : resolve(REPO_ROOT, "docs/api/asyncapi.json");
+const OUT_PATH = process.argv[3] ? resolve(process.argv[3]) : resolve(__dirname, "../src/realtime/generated-types.ts");
 
 // --- Load the AsyncAPI document ---
 

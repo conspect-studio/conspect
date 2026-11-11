@@ -171,12 +171,39 @@ describe('useSources', () => {
       rawKind: 'rtsp',
       editable: true,
       locator: 'rtsp://h/s',
+      // rtsp carries no source-event cue surface (ADR-0183): never observed.
+      eventObservation: 'not_supported',
     });
     // NDI binds by source name; file by path — both projected onto `locator`.
     expect(result.current.data?.[1]?.locator).toBe('STUDIO (CAM 1)');
     expect(result.current.data?.[2]?.locator).toBe('/media/clip.mp4');
     expect(result.current.data?.[3]?.kind).toBe('test');
     expect(result.current.data?.[3]?.locator).toBeUndefined();
+  });
+
+  it('computes effective event-observation status per source (ADR-0183)', async () => {
+    sources = [
+      { id: 'hls-default', name: 'A', body: { kind: 'hls', url: 'https://e/x.m3u8' } },
+      { id: 'hls-on', name: 'B', body: { kind: 'hls', url: 'https://e/x.m3u8', events: { observe: true } } },
+      { id: 'hls-off', name: 'C', body: { kind: 'hls', url: 'https://e/x.m3u8', events: { observe: false } } },
+      { id: 'yt', name: 'D', body: { kind: 'youtube', url: 'https://www.youtube.com/watch?v=abcdEFGH123' } },
+      { id: 'ndi', name: 'E', body: { kind: 'ndi', name: 'x' } },
+    ];
+    const qc = newClient();
+    const { result } = renderHook(() => useSources({ baseUrl: BASE }), {
+      wrapper: wrapper(qc),
+    });
+    await waitFor(() => {
+      expect(result.current.isSuccess).toBe(true);
+    });
+    const byId = Object.fromEntries((result.current.data ?? []).map((s) => [s.id, s.eventObservation]));
+    expect(byId).toEqual({
+      'hls-default': 'observing',
+      'hls-on': 'observing',
+      'hls-off': 'disabled',
+      yt: 'observing',
+      ndi: 'not_supported',
+    });
   });
 
   it('surfaces an RFC 9457 problem as an ApiError with its status', async () => {

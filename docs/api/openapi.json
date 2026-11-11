@@ -15443,6 +15443,35 @@
           "community"
         ]
       },
+      "FocusLimits": {
+        "type": "object",
+        "description": "Focus caps and occupancy, surfaced by `GET /api/v1/preview/capabilities` so the\nUI can tell the truth about how many live viewers the server admits.",
+        "required": [
+          "max",
+          "max_per_scope",
+          "active"
+        ],
+        "properties": {
+          "active": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Focus sessions live right now.",
+            "minimum": 0
+          },
+          "max": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Maximum concurrent focus (WHEP) sessions server-wide.",
+            "minimum": 0
+          },
+          "max_per_scope": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Maximum concurrent focus sessions per scope.",
+            "minimum": 0
+          }
+        }
+      },
       "FreshnessDoc": {
         "type": "object",
         "description": "Fetch freshness of one product.",
@@ -18534,6 +18563,17 @@
           "fallback": {
             "type": "string",
             "description": "The always-available fallback transport literal: `\"jpeg\"` (the one\nfallback literal everywhere — ADR-P006 move 6)."
+          },
+          "focus": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/FocusLimits",
+                "description": "WHEP focus caps and occupancy (absent when the provider enforces none)."
+              }
+            ]
           },
           "moq": {
             "type": "boolean",

@@ -314,6 +314,7 @@ const ASYNCAPI_JSON: &str = include_str!("../../../docs/api/asyncapi.json");
         crate::preview::ScopeCapabilities,
         crate::preview::ScopeCapability,
         crate::preview::ProgramFidelity,
+        crate::preview::FocusLimits,
         // System capability + licence surface (ADR-W030).
         crate::system::SystemCapabilities,
         crate::system::BackendCapability,

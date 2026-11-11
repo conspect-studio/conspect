@@ -65,6 +65,9 @@ const VIDEO_TS_STEP: u32 = 90_000 / PREVIEW_FPS;
 /// The driver tick: ≤ preview cadence, so a session pumps at least per frame and
 /// ICE/DTLS timers advance promptly.
 const DRIVER_TICK: Duration = Duration::from_millis(20);
+/// Default silence horizon for a connected preview viewer (see
+/// `webrtc.preview_session_timeout`).
+const DEFAULT_SILENCE_TIMEOUT: Duration = Duration::from_secs(8);
 
 /// A real preview video encoder (H.264 preferred, VP8 fallback) behind a mutex so
 /// the `&self` `PreviewMediaSource` pump can drive its `&mut`-only libav context.
@@ -441,6 +444,9 @@ pub struct CliWhepProvider {
     /// `false` the provider sheds every focus to the JPEG fallback and the
     /// capabilities endpoint advertises `webrtc: false`.
     available: bool,
+    /// Silence horizon after which a viewer is considered gone (see
+    /// [`WhepEgress::reap_dead`]).
+    silence_timeout: Duration,
 }
 
 impl std::fmt::Debug for CliWhepProvider {
@@ -487,6 +493,7 @@ impl CliWhepProvider {
                     stores,
                     program_audio,
                     available: false,
+                    silence_timeout: DEFAULT_SILENCE_TIMEOUT,
                 };
             }
         };
@@ -526,6 +533,7 @@ impl CliWhepProvider {
             demand: None,
             program_audio,
             available: true,
+            silence_timeout: DEFAULT_SILENCE_TIMEOUT,
         }
     }
 
@@ -557,6 +565,7 @@ impl CliWhepProvider {
             demand: None,
             program_audio,
             available: true,
+            silence_timeout: DEFAULT_SILENCE_TIMEOUT,
         }
     }
 
@@ -564,6 +573,13 @@ impl CliWhepProvider {
     #[must_use]
     pub fn with_demand(mut self, demand: Option<multiview_control::SharedSourceDemand>) -> Self {
         self.demand = demand;
+        self
+    }
+
+    /// Set the viewer silence horizon (`webrtc.preview_session_timeout`).
+    #[must_use]
+    pub fn with_silence_timeout(mut self, timeout: Duration) -> Self {
+        self.silence_timeout = timeout;
         self
     }
 
@@ -675,6 +691,30 @@ impl WhepProvider for CliWhepProvider {
 
     fn active_sessions(&self) -> usize {
         self.state.lock().map_or(0, |s| s.sessions.len())
+    }
+
+    fn reap_dead(&self, now: Instant) -> Vec<String> {
+        // The transport decides who is dead (no lock shared with the engine).
+        let ended: Vec<String> = self
+            .egress
+            .reap_dead(now, self.silence_timeout)
+            .into_iter()
+            .map(|id| id.as_str().to_owned())
+            .collect();
+        if !ended.is_empty() {
+            // Stop pumping/encoding for them; dropping the media frees the encoder.
+            let dropped: Vec<LiveSession> = self.state.lock().map_or_else(
+                |_| Vec::new(),
+                |mut st| {
+                    ended
+                        .iter()
+                        .filter_map(|id| st.sessions.remove(id))
+                        .collect()
+                },
+            );
+            drop(dropped);
+        }
+        ended
     }
 
     fn webrtc_available(&self) -> bool {
@@ -1107,6 +1147,7 @@ mod tests {
             ))),
             program_audio: None,
             available: true,
+            silence_timeout: super::DEFAULT_SILENCE_TIMEOUT,
         };
         assert!(!provider.webrtc_available());
         assert!(matches!(

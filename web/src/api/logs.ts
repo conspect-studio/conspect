@@ -14,7 +14,7 @@ import {
   readProblem,
 } from './operations';
 import type { RequestOptions } from './operations';
-import type { components } from './schema';
+import type { components } from './types';
 
 /** One buffered structured log record. */
 export type LogRecord = components['schemas']['LogRecordDoc'];

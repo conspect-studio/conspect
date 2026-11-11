@@ -1,0 +1,540 @@
+/* Approved Audio mixer (round 4) — scoped to [data-approved-page="audio"].
+   Tokens are declared locally; nothing here touches the shell or globals. */
+[data-approved-page="audio"] {
+  --bg-0: #0a0c0f; --bg-1: #10131a; --bg-2: #161b23; --bg-3: #1d242e; --bg-4: #242d39;
+  --line: #232b36; --line-2: #2e3947;
+  --text-1: #e8ecf1; --text-2: #9aa4b2; --text-3: #8f99a8;
+  --red: #e5484d; --red-ink: #1c0509; --amber: #e8a33d;
+  --green: #3dd68c; --green-ink: #062015; --blue: #6aa6ff;
+  --mono: ui-monospace, "SF Mono", SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
+  --r-sm: 4px; --r-md: 8px; --r-lg: 12px; --tap: 48px;
+  min-width: 0;
+}
+[data-approved-page="audio"] .screen-head {
+  display: flex; flex-wrap: wrap; align-items: flex-start; justify-content: space-between;
+  gap: 12px; margin-bottom: 14px;
+}
+[data-approved-page="audio"] .screen-head h1 {
+  margin: 0 0 4px; font-size: 24px; font-weight: 800; letter-spacing: -.01em;
+}
+[data-approved-page="audio"] .screen-sub {
+  margin: 0; color: var(--text-2); font-size: 13px;
+  display: flex; gap: 8px; align-items: center; flex-wrap: wrap;
+}
+[data-approved-page="audio"] .lbl {
+  font-size: 11px; font-weight: 800; letter-spacing: .1em; color: var(--text-3);
+}
+[data-approved-page="audio"] .clock-mono {
+  font-family: var(--mono); font-weight: 700; letter-spacing: .04em; color: var(--text-1);
+}
+[data-approved-page="audio"] .audio-meta {
+  display: flex; align-items: center; gap: 14px; padding: 8px 14px;
+  background: var(--bg-1); border: 1px solid var(--line); border-radius: var(--r-md);
+}
+[data-approved-page="audio"] .audio-meta .clock-mono { font-size: 18px; }
+
+/* mixer: bank + right rail on desktop, single column below */
+[data-approved-page="audio"] .mixer { display: grid; gap: 14px; grid-template-columns: minmax(0, 1fr); }
+[data-approved-page="audio"] .mixer-main { display: grid; grid-template-columns: minmax(0, 1fr); gap: 10px; min-width: 0; }
+[data-approved-page="audio"] .master-col { display: grid; gap: 12px; align-content: start; min-width: 0; }
+@media (min-width: 1024px) {
+  [data-approved-page="audio"] .mixer { grid-template-columns: minmax(0, 1fr) 240px; align-items: start; }
+}
+
+/* strips */
+[data-approved-page="audio"] [data-testid="audio-strip"] {
+  background: var(--bg-1); border: 1px solid var(--line); border-radius: var(--r-md);
+  padding: 10px 8px; color: var(--text-1);
+}
+[data-approved-page="audio"] [data-testid="audio-strip-name"] {
+  font-size: 12px; font-weight: 800; letter-spacing: .04em; text-align: center;
+}
+[data-approved-page="audio"] [data-testid="audio-strip-readout"] { justify-content: center; color: var(--text-2); }
+[data-approved-page="audio"] [data-testid="audio-strip-status"] {
+  font-size: 11px; font-weight: 700; letter-spacing: .04em; color: var(--text-3); text-align: center;
+}
+[data-approved-page="audio"] [data-testid="audio-nudge"] {
+  background: var(--bg-3); border-color: var(--line-2); border-radius: var(--r-sm);
+  color: var(--text-1); font-weight: 700;
+}
+[data-approved-page="audio"] [data-testid="audio-mute"],
+[data-approved-page="audio"] [data-testid="audio-pgm"] {
+  background: var(--bg-3); border-color: var(--line-2); border-radius: var(--r-sm);
+  font-size: 12px; font-weight: 900; letter-spacing: .04em; color: var(--text-2);
+}
+[data-approved-page="audio"] [data-testid="audio-mute"][aria-pressed="true"] {
+  background: var(--red); border-color: var(--red); color: var(--red-ink);
+}
+[data-approved-page="audio"] [data-testid="audio-pgm"][aria-pressed="true"] {
+  background: var(--green); border-color: var(--green); color: var(--green-ink);
+}
+[data-approved-page="audio"] [data-testid="audio-strip-chip"] {
+  border-radius: 999px; background: var(--bg-2); border-color: var(--line-2);
+  font-size: 13px; font-weight: 800;
+}
+[data-approved-page="audio"] [data-testid="audio-strip-chip"][aria-pressed="true"] {
+  background: var(--bg-4); border-color: var(--blue); box-shadow: inset 0 -2px 0 var(--blue);
+}
+
+/* whole-mix overview */
+[data-approved-page="audio"] [data-testid="audio-mix-overview"] {
+  background: var(--bg-1); border: 1px solid var(--line); border-radius: var(--r-lg);
+  padding: 10px 12px; min-width: 0; max-width: 100%; overflow: hidden;
+}
+[data-approved-page="audio"] [data-testid="audio-overview-row"],
+[data-approved-page="audio"] [data-testid="audio-overview-program"] {
+  min-height: 44px; background: var(--bg-2); border: 1px solid transparent;
+  border-radius: var(--r-sm); color: var(--text-1);
+}
+[data-approved-page="audio"] [data-testid="audio-overview-row"]:hover { border-color: var(--line-2); background: var(--bg-2); }
+[data-approved-page="audio"] [data-testid="audio-overview-row"] > span:first-child {
+  width: auto; flex: 1 1 88px; font-size: 12px; font-weight: 800; letter-spacing: .04em;
+}
+[data-approved-page="audio"] [data-testid="audio-overview-meter"] { background: var(--bg-0); }
+
+/* master + monitor rail */
+[data-approved-page="audio"] .strip-master {
+  display: flex; flex-direction: column; align-items: center; gap: 8px;
+  background: linear-gradient(180deg, var(--bg-1), #141922);
+  border: 1px solid var(--line-2); border-radius: var(--r-md); padding: 10px 8px;
+}
+[data-approved-page="audio"] .strip-name { margin: 0; font-size: 12px; font-weight: 800; letter-spacing: .04em; text-align: center; }
+[data-approved-page="audio"] .strip-status { font-size: 11px; font-weight: 700; letter-spacing: .04em; color: var(--text-3); text-align: center; }
+[data-approved-page="audio"] .monitor-line { font-size: 12px; color: var(--text-2); }
+[data-approved-page="audio"] .mix-note { display: block; font-size: 12px; color: var(--text-3); }
+[data-approved-page="audio"] .mix-note p { margin: 0 0 6px; }
+[data-approved-page="audio"] .phone-master {
+  display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+  background: var(--bg-1); border: 1px solid var(--line-2); border-radius: var(--r-md); padding: 8px 12px;
+}
+@media (min-width: 1280px) {
+  [data-approved-page="audio"] .phone-master { display: none; }
+}
+@media (max-width: 767px) {
+  [data-approved-page="audio"] .screen-head { margin-bottom: 10px; }
+  [data-approved-page="audio"] .screen-head h1 { font-size: 18px; }
+  [data-approved-page="audio"] .audio-meta { width: 100%; padding: 6px 10px; gap: 10px; }
+}
+
+/* strip bank: equal-width columns, scrolls horizontally inside itself */
+[data-approved-page="audio"] .strip-bank {
+  display: grid; grid-auto-flow: column; grid-auto-columns: minmax(120px, 1fr);
+  gap: 8px; overflow-x: auto; padding-bottom: 8px; min-width: 0; max-width: 100%;
+}
+[data-approved-page="audio"] .strip-bank > div { min-width: 0; }
+[data-approved-page="audio"] .strip-bank [data-testid="audio-strip"] { padding: 10px 6px; }
+
+/* segmented PRE-FADER input meter (real telemetry; never labelled PGM) */
+[data-approved-page="audio"] .meter-col {
+  display: flex; flex-direction: column; gap: 2px; width: 10px; height: 240px;
+  justify-content: flex-end; padding: 24px 0; flex: none; box-sizing: border-box;
+}
+[data-approved-page="audio"] .meter-seg { display: block; flex: 1 1 0; min-height: 0; border-radius: 1px; background: var(--bg-3); }
+[data-approved-page="audio"] .meter-seg.on-lo { background: var(--blue); }
+[data-approved-page="audio"] .meter-seg.on-hi { background: var(--amber); }
+[data-approved-page="audio"] .meter-seg.on-top { background: var(--red); }
+
+/* fader track + fill + knob */
+[data-approved-page="audio"] .fader-track {
+  background: var(--bg-2); border: 1px solid var(--line); border-radius: var(--r-sm);
+}
+[data-approved-page="audio"] .fader-fill {
+  position: absolute; left: 0; right: 0; bottom: 0; pointer-events: none;
+  background: linear-gradient(180deg, rgba(106,166,255,.35), rgba(106,166,255,.08));
+  border-radius: var(--r-sm) var(--r-sm) 0 0;
+}
+/* Custom pointer-event fader (Fader.tsx): the whole 56 px-wide track is the
+   grab area, touch-action:none (also inline) so a drag never scrolls the page. */
+[data-approved-page="audio"] .audio-fader-hit {
+  position: absolute; inset: 0; touch-action: none; cursor: pointer;
+  user-select: none; -webkit-user-select: none; -webkit-touch-callout: none;
+  -webkit-tap-highlight-color: transparent;
+}
+[data-approved-page="audio"] .audio-fader-knob {
+  position: absolute; left: 2px; right: 2px; height: 48px; pointer-events: none;
+  border-radius: 6px; box-sizing: border-box;
+  background: linear-gradient(180deg, #4b5563, #2b323d); border: 1px solid var(--line-2);
+  box-shadow: 0 4px 10px rgba(0,0,0,.5);
+}
+[data-approved-page="audio"] .audio-fader-hit[data-staged="true"] .audio-fader-knob {
+  border-color: var(--amber); box-shadow: 0 0 0 2px rgba(232,163,61,.35);
+}
+[data-approved-page="audio"] .audio-fader-hit:focus-visible { outline: 2px solid var(--blue); outline-offset: 2px; }
+
+/* compact overview rows (approved mo-row) */
+[data-approved-page="audio"] [data-testid="audio-mix-overview"] ul { display: grid; gap: 4px; list-style: none; margin: 8px 0 0; padding: 0; }
+[data-approved-page="audio"] .mo-row {
+  display: flex; flex-wrap: wrap; align-items: center; gap: 2px 10px;
+  min-height: 44px; padding: 4px 10px; width: 100%; min-width: 0; text-align: left;
+  border-radius: var(--r-sm); background: var(--bg-2); border: 1px solid transparent; color: var(--text-1);
+}
+[data-approved-page="audio"] .mo-row .mo-name {
+  flex: none; width: 88px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  font-size: 12px; font-weight: 800; letter-spacing: .04em;
+}
+[data-approved-page="audio"] .mo-row.is-muted .mo-name { color: var(--red); }
+[data-approved-page="audio"] .mo-row .mo-bar {
+  flex: 1 1 40px; height: 8px; background: var(--bg-0); border-radius: 2px; overflow: hidden; display: block;
+}
+[data-approved-page="audio"] .mo-row .mo-bar i {
+  display: block; height: 100%;
+  background: linear-gradient(90deg, var(--blue) 70%, var(--amber) 88%, var(--red));
+}
+[data-approved-page="audio"] .mo-row .mo-val { font-family: var(--mono); font-size: 11px; color: var(--text-3); min-width: 32px; text-align: right; }
+[data-approved-page="audio"] .mo-row .mo-sub {
+  flex: 1 1 100%; display: flex; flex-wrap: wrap; gap: 2px 8px; font-size: 11px; color: var(--text-3);
+}
+[data-approved-page="audio"] .mo-row .mo-edited {
+  border: 1px solid var(--amber); border-radius: 4px; padding: 0 5px; color: var(--amber); font-weight: 700;
+}
+
+/* program meters + loudness folded into the PROGRAM/master region */
+[data-approved-page="audio"] .strip-master > section {
+  width: 100%; min-width: 0; padding: 8px; background: var(--bg-2);
+  border-color: var(--line); border-radius: var(--r-sm); font-size: 12px;
+}
+[data-approved-page="audio"] .strip-master > section .w-28 { width: auto; min-width: 0; }
+[data-approved-page="audio"] .strip-master > section .grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+
+/* toolbar: borderless, right-aligned on desktop */
+[data-approved-page="audio"] [data-testid="audio-toolbar"] { border-color: var(--line); background: var(--bg-0); }
+
+/* Round 2: nudge side-stack (4×48px) beside the fader, like the reference. */
+[data-approved-page="audio"] .audio-nudge-col { display: grid; gap: 4px; width: 52px; flex: none; align-content: end; }
+[data-approved-page="audio"] .audio-nudge-btn {
+  height: var(--tap); min-height: var(--tap); width: 52px; min-width: 48px; padding: 0;
+  background: var(--bg-3); border: 1px solid var(--line-2); border-radius: var(--r-sm);
+  color: var(--text-1); font-size: 12px; font-weight: 700;
+}
+[data-approved-page="audio"] .audio-nudge-btn:disabled { opacity: .4; }
+[data-approved-page="audio"] [data-testid="audio-strip"] [data-testid="audio-strip-essential"] > div:first-child { gap: 6px; }
+[data-approved-page="audio"] .strip-bank { grid-auto-columns: minmax(176px, 1fr); }
+[data-approved-page="audio"] .audio-listen-note { display: none; }
+[data-approved-page="audio"] [data-testid="audio-strip"] input[type="range"] { width: 240px; }
+
+/* PGM / MUTE: exact token fills; pressed state never brighter than the token. */
+[data-approved-page="audio"] [data-testid="audio-mute"],
+[data-approved-page="audio"] [data-testid="audio-pgm"] { height: var(--tap); min-height: var(--tap); min-width: var(--tap); }
+[data-approved-page="audio"] [data-testid="audio-pgm"][aria-pressed="true"] {
+  background: var(--green); border-color: var(--green); color: var(--green-ink);
+}
+
+/* Channel details: a quiet inline row, not a bordered 48px+ card in each strip. */
+[data-approved-page="audio"] .audio-details-compact { border: 0; padding: 0; background: transparent; }
+[data-approved-page="audio"] .audio-details-compact > summary {
+  min-height: var(--tap); padding: 0 8px; border-radius: var(--r-sm); justify-content: center;
+  font-size: 12px; font-weight: 700; color: var(--text-2); border: 1px solid var(--line);
+}
+[data-approved-page="audio"] .audio-details-compact > summary:hover { background: var(--bg-2); color: var(--text-1); }
+[data-approved-page="audio"] .audio-details-compact[open] { margin: 0 -6px; padding: 0 6px 6px; }
+[data-approved-page="audio"] .audio-details-compact input,
+[data-approved-page="audio"] .audio-details-compact [role="combobox"] { min-height: var(--tap); }
+
+/* Single approved toolbar: one slim right-aligned row, muted tokens. */
+[data-approved-page="audio"] [data-testid="audio-toolbar"] {
+  position: static; border: 0; padding: 0; margin-bottom: 4px; background: transparent;
+  justify-content: flex-end;
+}
+[data-approved-page="audio"] [data-testid="audio-add-route"] {
+  background: var(--bg-2); border: 1px solid var(--line-2); color: var(--text-1); border-radius: var(--r-md); font-weight: 700;
+}
+[data-approved-page="audio"] [data-testid="audio-save"] {
+  background: var(--blue); border: 1px solid transparent; color: #0b1220; border-radius: var(--r-md); font-weight: 800;
+}
+[data-approved-page="audio"] [data-testid="audio-save"]:disabled { opacity: .45; }
+[data-approved-page="audio"] [data-testid="audio-toolbar"] [role="status"] { flex: 1 1 100%; text-align: right; }
+
+/* Tablet/phone: program loudness lives in the PROGRAM summary only (no dual readouts). */
+@media (max-width: 1279px) {
+  [data-approved-page="audio"] .audio-meta { display: none; }
+}
+[data-approved-page="audio"] .phone-master .lbl { margin-right: 4px; }
+
+/* 48px: links in page chrome + all text/number inputs on this page. */
+[data-approved-page="audio"] a[href] { display: inline-flex; align-items: center; min-height: var(--tap); }
+[data-approved-page="audio"] input:not([type="range"]):not([type="checkbox"]) { min-height: var(--tap); }
+[data-approved-page="audio"] [data-testid="audio-strip-name"],[data-approved-page="audio"] [data-testid="audio-strip-readout"] { overflow-wrap: anywhere; }
+[data-approved-page="audio"] .mo-row,[data-approved-page="audio"] [data-testid="audio-overview-row"],[data-approved-page="audio"] [data-testid="audio-overview-program"] { min-height: var(--tap); }
+[data-approved-page="audio"] a[href] { min-width: var(--tap); justify-content: center; }
+[data-approved-page="audio"] .strip-bank [data-testid="audio-strip"] { padding: 10px 4px; }
+
+/* Round 3: bank at tablet+ (>=768): strips keep the column layout inside the
+   bank (fader + nudges beside, keys under) and the bank scrolls inside itself. */
+[data-approved-page="audio"] .strip-bank [data-testid="audio-strip-essential"] {
+  display: flex; flex-direction: column; align-items: stretch;
+}
+[data-approved-page="audio"] .strip-bank [data-testid="audio-strip-essential"] > div { grid-row: auto; }
+[data-approved-page="audio"] .mixer-main > * { min-width: 0; max-width: 100%; }
+[data-approved-page="audio"] .master-col > * { min-width: 0; max-width: 100%; }
+[data-approved-page="audio"] .strip-bank { overscroll-behavior-x: contain; }
+@media (min-width: 1024px) {
+  [data-approved-page="audio"] .mixer { grid-template-columns: minmax(0, 1fr) 240px; }
+  [data-approved-page="audio"] .master-col { width: 240px; max-width: 240px; overflow: hidden; }
+}
+/* sr-only (absolute) children must be clipped by the bank, not the page. */
+[data-approved-page="audio"] .strip-bank { position: relative; }
+[data-approved-page="audio"] { position: relative; overflow-x: clip; }
+
+/* Round 5: 1440 bank fit — nudges are a 48px side stack BESIDE the fader (reference);
+   ticks/track/meter are tightened so all 8 strips + the rail fit without clipping. */
+@media (min-width: 1024px) {
+  [data-approved-page="audio"] .mixer { grid-template-columns: minmax(0, 1fr) 200px; gap: 10px; }
+  [data-approved-page="audio"] .master-col { width: 200px; max-width: 200px; overflow: visible; }
+  [data-approved-page="audio"] .strip-bank { grid-auto-columns: minmax(0, 1fr); gap: 6px; }
+  [data-approved-page="audio"] .strip-bank [data-testid="audio-strip"] { padding: 10px 3px; min-width: 0; }
+  [data-approved-page="audio"] .strip-bank [data-testid="audio-strip-essential"] > div:first-child { flex-wrap: nowrap; justify-content: center; gap: 3px; min-width: 0; }
+  [data-approved-page="audio"] .strip-bank [data-testid="audio-strip-essential"] > div:first-child > div:first-child { width: 20px; flex: none; }
+  [data-approved-page="audio"] .strip-bank [data-testid="audio-strip-essential"] > div:first-child .fader-track { flex: none; width: 56px; }
+  [data-approved-page="audio"] .strip-bank .audio-nudge-col { order: 0; flex: none; width: 48px; grid-template-columns: 48px; }
+  [data-approved-page="audio"] .strip-bank .audio-nudge-btn { width: 48px; }
+  [data-approved-page="audio"] .strip-bank .meter-col { width: 8px; }
+}
+/* Phone (reference-audio-390): keys + LISTEN note above the fader, nudges beside it. */
+@media (max-width: 767px) {
+  [data-approved-page="audio"] [data-testid="audio-strip-essential"] .audio-strip-keys { order: -1; justify-content: center; }
+  [data-approved-page="audio"] .audio-listen-note { display: block; flex: 1 1 100%; text-align: center; }
+  [data-approved-page="audio"] [data-testid="audio-strip-essential"] { max-width: 100%; }
+}
+
+/* Fix9 — Program loudness cards: wrap, never overflow the card, units stay visible. */
+[data-approved-page="audio"] .strip-master > section [data-testid="loudness-integrated"],
+[data-approved-page="audio"] .strip-master > section [data-testid="loudness-true-peak"] { min-width: 0; }
+[data-approved-page="audio"] .strip-master > section [data-testid="loudness-integrated"] > span,
+[data-approved-page="audio"] .strip-master > section [data-testid="loudness-true-peak"] > span { flex-wrap: wrap; min-width: 0; }
+[data-approved-page="audio"] .strip-master > section .grid { grid-template-columns: repeat(auto-fit, minmax(128px, 1fr)); }
+[data-approved-page="audio"] .strip-master > section [data-testid^="loudness-"] { min-width: 0; overflow-wrap: anywhere; }
+[data-approved-page="audio"] .strip-master > section [data-testid^="loudness-"] .font-mono { white-space: nowrap; }
+[data-approved-page="audio"] .strip-master > section [data-testid="loudness-integrated"] .text-2xl { font-size: 20px; }
+
+/* Fix9 — bank below xl: wrap into rows (no strip is ever cut mid-way). */
+@media (max-width: 1023px) {
+  [data-approved-page="audio"] .strip-bank {
+    grid-auto-flow: row; grid-template-columns: repeat(auto-fill, minmax(176px, 1fr)); grid-auto-columns: auto; overflow-x: visible;
+  }
+}
+/* Fix9 — xl+: a bank with more strips than fit scrolls with snap + a visible bar. */
+@media (min-width: 1024px) {
+  [data-approved-page="audio"] .strip-bank {
+    scroll-snap-type: x mandatory; scrollbar-width: auto; scrollbar-color: var(--blue) var(--bg-3);
+    grid-auto-columns: minmax(124px, 1fr);
+  }
+  [data-approved-page="audio"] .strip-bank > div { scroll-snap-align: start; }
+  /* Rail (approved shape): Whole mix, then the vertical PROGRAM strip, then the MONITOR OUT note. */
+  [data-approved-page="audio"] .mixer { grid-template-columns: minmax(0, 1fr) 232px; grid-template-rows: auto; column-gap: 12px; align-items: start; }
+  [data-approved-page="audio"] .mixer-main { grid-column: 1; grid-row: 1; }
+  [data-approved-page="audio"] .master-col { display: grid; width: 232px; max-width: 232px; grid-column: 2; grid-row: 1; gap: 10px; overflow: visible; }
+  [data-approved-page="audio"] .master-col > .hidden.lg\:block { display: block; }
+  [data-approved-page="audio"] .strip-master > section .grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+}
+/* Compact PROGRAM row in the whole-mix list. */
+[data-approved-page="audio"] [data-testid="audio-overview-program"] > span:nth-child(2),
+[data-approved-page="audio"] [data-testid="audio-overview-program"] > span:nth-child(4) { display: none; }
+[data-approved-page="audio"] [data-testid="audio-overview-program"] { min-height: 0; padding: 6px 10px; }
+[data-approved-page="audio"] .audio-nudge-btn:disabled { opacity: 1; background: var(--bg-1); color: var(--text-3); border-style: dashed; }
+[data-approved-page="audio"] [data-testid="audio-save"]:disabled { opacity: 1; background: var(--bg-2); color: var(--text-3); border: 1px dashed var(--line-2); }
+@media (min-width: 1024px) {
+  [data-approved-page="audio"] .strip-bank { grid-auto-columns: minmax(124px, 1fr); }
+}
+
+/* ---- Fix10: approved geometry ---- */
+[data-approved-page="audio"] .screen-head { align-items: center; margin-bottom: 8px; }
+[data-approved-page="audio"] .screen-head h1 { margin: 0 0 2px; }
+[data-approved-page="audio"] [data-testid="audio-toolbar"] {
+  display: flex; flex-wrap: wrap; align-items: center; justify-content: flex-end; gap: 8px; margin-bottom: 6px;
+}
+[data-approved-page="audio"] [data-testid="audio-toolbar"] [role="status"]:empty { display: none; }
+[data-approved-page="audio"] [data-testid="audio-toolbar"] [role="status"] { flex: 1 1 100%; }
+[data-approved-page="audio"] .audio-draft-note { font-size: 12px; color: var(--text-3); order: -1; margin-right: auto; }
+[data-approved-page="audio"] [data-testid="audio-toolbar"] > button { padding-top: 0; padding-bottom: 0; }
+
+/* Strip header: name only; dB line + peak chip under the fader. */
+[data-approved-page="audio"] .audio-strip-head { align-items: center; }
+[data-approved-page="audio"] .audio-strip-meta { display: flex; flex-direction: column; align-items: center; gap: 2px; }
+[data-approved-page="audio"] .audio-peak-chip {
+  display: inline-flex; gap: 3px; align-items: baseline; padding: 1px 6px; border-radius: 4px;
+  background: var(--bg-3); border: 1px solid var(--line-2); font-size: 10px; font-weight: 700; color: var(--text-3);
+}
+[data-approved-page="audio"] .audio-readout { margin: 0; display: flex; align-items: center; gap: 6px; font-size: 12px; color: var(--text-2); }
+[data-approved-page="audio"] .audio-draft-pip {
+  font-size: 10px; font-weight: 800; color: var(--amber); border: 1px solid var(--amber); border-radius: 4px; padding: 0 4px; line-height: 14px;
+}
+[data-approved-page="audio"] .audio-strip-keys { display: flex; flex-wrap: wrap; justify-content: center; gap: 6px; }
+[data-approved-page="audio"] .audio-listen-key:disabled { opacity: 1; background: var(--bg-1); color: var(--text-3); border-style: dashed; font-size: 12px; font-weight: 900; }
+[data-approved-page="audio"] .audio-undo-slot:empty { display: none; }
+[data-approved-page="audio"] .audio-details-compact > summary { border: 0; min-height: var(--tap); justify-content: center; }
+
+/* Master rail strip (vertical, disabled) */
+[data-approved-page="audio"] .master-fader-row { display: flex; align-items: flex-end; justify-content: center; gap: 8px; }
+[data-approved-page="audio"] .master-track { width: 56px; flex: none; opacity: .55; border-style: dashed; position: relative; }
+[data-approved-page="audio"] .master-keys { display: flex; justify-content: center; gap: 6px; }
+[data-approved-page="audio"] .strip-master > .master-keys button:disabled { opacity: 1; background: var(--bg-1); color: var(--text-3); border-style: dashed; font-weight: 900; }
+
+@media (min-width: 1024px) {
+  [data-approved-page="audio"] .audio-fader-box { height: 208px; }
+  [data-approved-page="audio"] .strip-bank { grid-auto-columns: minmax(118px, 1fr); }
+  [data-approved-page="audio"] .strip-bank [data-testid="audio-strip"] { gap: 6px; padding: 8px 2px; }
+  [data-approved-page="audio"] .strip-bank .meter-col { height: 208px; }
+  [data-approved-page="audio"] .strip-master { padding: 8px 6px; }
+  [data-approved-page="audio"] .strip-master > section { padding: 6px; }
+  [data-approved-page="audio"] .strip-master > section .text-2xl { font-size: 16px; }
+}
+@media (min-width: 768px) and (max-width: 1023px) {
+  [data-approved-page="audio"] .audio-fader-box { height: 208px; }
+}
+/* Approved key rows: MUTE + PGM side by side (48px), LISTEN placeholder on its own row below. */
+[data-approved-page="audio"] .audio-strip-keys { flex-wrap: wrap; }
+[data-approved-page="audio"] .audio-strip-keys [data-testid="audio-mute"],
+[data-approved-page="audio"] .audio-strip-keys [data-testid="audio-pgm"] { flex: 1 1 0; min-width: 48px; max-width: 72px; padding-left: 0; padding-right: 0; }
+[data-approved-page="audio"] .audio-strip-keys .audio-listen-key { flex: 0 0 auto; min-width: 72px; }
+@media (max-width: 767px) {
+  [data-approved-page="audio"] .audio-strip-keys { flex-wrap: nowrap; }
+  [data-approved-page="audio"] .audio-strip-keys .audio-listen-key { flex: 1 1 0; }
+}
+
+/* ---- Fix13: compact strip (<=~380px at xl): chevron corner button, 3-cell key grid ---- */
+[data-approved-page="audio"] .audio-strip { position: relative; }
+[data-approved-page="audio"] .audio-strip-head { min-height: var(--tap); justify-content: center; padding-right: 52px; }
+[data-approved-page="audio"] .audio-strip-head [data-testid="audio-strip-name"] { text-align: left; }
+/* Channel details: the summary is a 48px chevron button in the strip's header corner; its text stays for assistive tech. */
+[data-approved-page="audio"] .audio-strip > .audio-details-compact > summary {
+  position: absolute; top: 4px; right: 4px; width: var(--tap); min-width: var(--tap); height: var(--tap); min-height: var(--tap);
+  padding: 0; font-size: 0; line-height: 0; justify-content: center; gap: 0;
+  border: 1px solid var(--line); border-radius: var(--r-sm); background: var(--bg-2);
+}
+[data-approved-page="audio"] .audio-strip > .audio-details-compact > summary svg { width: 20px; height: 20px; }
+[data-approved-page="audio"] .audio-strip > .audio-details-compact[open] > summary { border-color: var(--blue); }
+[data-approved-page="audio"] .audio-strip > .audio-details-compact[open] { margin: 0; padding: 0; }
+[data-approved-page="audio"] .audio-strip > .audio-details-compact[open] > div { margin-top: 0; padding-top: 4px; }
+[data-approved-page="audio"] .audio-strip-meta { gap: 2px; }
+@media (min-width: 1024px) {
+  [data-approved-page="audio"] .audio-fader-box { height: 186px; }
+  [data-approved-page="audio"] .strip-bank .meter-col { height: 186px; padding: 24px 0; }
+  [data-approved-page="audio"] .strip-bank [data-testid="audio-strip"] { gap: 4px; padding: 4px 3px; }
+  [data-approved-page="audio"] .audio-strip .audio-nudge-col { gap: 2px; }
+  [data-approved-page="audio"] .strip-bank [data-testid="audio-strip-essential"] {
+    display: grid; grid-template-columns: 1fr 1fr; gap: 4px; align-items: center;
+  }
+  [data-approved-page="audio"] .strip-bank [data-testid="audio-strip-essential"] > div:first-child { grid-column: 1 / -1; grid-row: 1; }
+  [data-approved-page="audio"] .strip-bank .audio-strip-keys { display: contents; }
+  [data-approved-page="audio"] .strip-bank .audio-strip-keys [data-testid="audio-mute"] { grid-column: 1; grid-row: 2; max-width: none; width: 100%; }
+  [data-approved-page="audio"] .strip-bank .audio-strip-keys [data-testid="audio-pgm"] { grid-column: 2; grid-row: 2; max-width: none; width: 100%; }
+  [data-approved-page="audio"] .strip-bank .audio-strip-keys .audio-listen-key { grid-column: 1; grid-row: 3; min-width: 0; width: 100%; padding: 0; }
+  [data-approved-page="audio"] .strip-bank .audio-strip-meta { grid-column: 2; grid-row: 3; min-width: 0; }
+  [data-approved-page="audio"] .strip-bank .audio-readout { justify-content: center; }
+  [data-approved-page="audio"] .strip-bank [data-testid="audio-strip-status"] { margin: 0; line-height: 1.2; }
+  [data-approved-page="audio"] .strip-bank .audio-undo-slot { margin: 0; }
+  /* status line rides in the header band beside the chevron corner button */
+  [data-approved-page="audio"] .strip-bank [data-testid="audio-strip-status"] {
+    position: absolute; top: 26px; left: 6px; right: 54px; text-align: left; font-size: 10px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  }
+  [data-approved-page="audio"] .strip-bank .audio-strip-head { justify-content: flex-start; padding-top: 6px; }
+  /* master rail: tighter, program strip stays on screen */
+  [data-approved-page="audio"] .master-col { gap: 8px; }
+  [data-approved-page="audio"] [data-testid="audio-mix-overview"] { padding: 8px 10px; }
+  [data-approved-page="audio"] [data-testid="audio-mix-overview"] ul { gap: 2px; margin-top: 6px; }
+  [data-approved-page="audio"] .master-fader-row .audio-fader-box { height: 186px; }
+  [data-approved-page="audio"] .strip-master { gap: 6px; padding: 6px; }
+}
+/* Phone toolbar: one or two clean rows (Add route + Save on one row; note beneath). */
+@media (max-width: 767px) {
+  [data-approved-page="audio"] [data-testid="audio-toolbar"] { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+  [data-approved-page="audio"] [data-testid="audio-toolbar"] > button { width: 100%; padding-left: 8px; padding-right: 8px; }
+  [data-approved-page="audio"] [data-testid="audio-toolbar"] .audio-draft-note { grid-column: 1 / -1; order: 5; margin: 0; }
+  [data-approved-page="audio"] [data-testid="audio-toolbar"] [data-testid="audio-bank-toggle"] { display: none; }
+}
+
+/* Fix14: compact right rail at desktop so Whole mix + PROGRAM + meters + loudness fit the first fold. */
+@media (min-width: 1024px) {
+  [data-approved-page="audio"] [data-testid="audio-mix-overview"] ul { gap: 2px; margin-top: 6px; }
+  [data-approved-page="audio"] .mo-row { min-height: 32px; padding: 2px 8px; gap: 0 8px; flex-wrap: nowrap; }
+  [data-approved-page="audio"] .mo-row .mo-name { width: 56px; }
+  [data-approved-page="audio"] .mo-row .mo-sub { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; flex: none; }
+  [data-approved-page="audio"] .mo-row { position: relative; }
+  [data-approved-page="audio"] [data-testid="audio-overview-program"] { padding: 4px 10px; font-size: 12px; }
+  [data-approved-page="audio"] [data-testid="audio-mix-overview"] > p { display: none; }
+  [data-approved-page="audio"] .master-col .strip-master { gap: 4px; padding: 6px; }
+  [data-approved-page="audio"] .master-fader-row .audio-fader-box { height: 150px; }
+  [data-approved-page="audio"] .strip-master > section { padding: 6px; }
+  [data-approved-page="audio"] .strip-master > section .grid { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 4px; }
+  [data-approved-page="audio"] .strip-master > section .text-2xl { font-size: 16px; line-height: 1.2; }
+  [data-approved-page="audio"] .strip-master > section p, [data-approved-page="audio"] .strip-master > section h3 { margin: 0; }
+}
+@media (min-width: 1024px) {
+  [data-approved-page="audio"] .master-col .strip-master > section { padding: 6px; border-radius: 6px; }
+  [data-approved-page="audio"] .master-col .strip-master > section > header { display: block; }
+  [data-approved-page="audio"] .master-col .strip-master > section > header + p, [data-approved-page="audio"] .master-col .strip-master > section [data-testid="loudness-integrated"] + * { margin-top: 4px; }
+  [data-approved-page="audio"] .master-col .strip-master > section [data-testid^="loudness-"] { padding: 4px 8px; }
+  [data-approved-page="audio"] .master-col .strip-master > section [data-testid="loudness-integrated"] { flex-direction: row; flex-wrap: wrap; gap: 0 8px; }
+  [data-approved-page="audio"] .master-col .strip-master > section .grid { margin-top: 4px; }
+  [data-approved-page="audio"] .master-col .strip-master > section .grid > div { padding: 3px 8px; }
+  [data-approved-page="audio"] .master-col .strip-master > section .text-lg { font-size: 14px; line-height: 1.2; }
+  [data-approved-page="audio"] .master-col .strip-master .mt-3, [data-approved-page="audio"] .master-col .strip-master .mt-2 { margin-top: 4px; }
+  [data-approved-page="audio"] .master-col .strip-master > .strip-status { font-size: 10px; line-height: 1.25; }
+}
+@media (min-width: 1024px) {
+  [data-approved-page="audio"] .master-col .master-fader-row .audio-nudge-col { grid-template-columns: repeat(2, 48px); width: 100px; gap: 4px; }
+  [data-approved-page="audio"] .master-col .master-fader-row .audio-fader-box { height: 104px; }
+  [data-approved-page="audio"] .master-col .strip-master > .master-keys { margin: 0; }
+}
+
+/* ---- Final: rail no longer leaves an empty column. >=1280: Whole mix beside the bank (right),
+   PROGRAM strip + meters + loudness as one horizontal row UNDER the bank. <1280: compact 2-column block. ---- */
+[data-approved-page="audio"] .strip-master{align-items:stretch}
+@media (min-width:1024px){
+  [data-approved-page="audio"] .mixer{grid-template-columns:minmax(0,1fr) 232px;grid-template-rows:auto auto auto;align-items:start}
+  [data-approved-page="audio"] .master-col{display:contents}
+  [data-approved-page="audio"] .master-col>.hidden.lg\:block{grid-column:2;grid-row:1;display:block;min-width:0}
+  [data-approved-page="audio"] .master-col>.lg\:hidden{display:none}
+  [data-approved-page="audio"] .master-col>.strip-master{grid-column:1/-1;grid-row:2;width:auto;max-width:none}
+  [data-approved-page="audio"] .master-col>.mix-note{grid-column:1/-1;grid-row:3}
+  [data-approved-page="audio"] .mixer-main{grid-row:1}
+}
+@media (min-width:768px){
+  [data-approved-page="audio"] .master-col .strip-master{display:grid;grid-template-columns:minmax(200px,auto) minmax(0,1fr) minmax(0,1fr);grid-auto-flow:row;column-gap:14px;row-gap:4px;align-items:start;justify-items:center}
+  [data-approved-page="audio"] .master-col .strip-master>.strip-name{grid-column:1;grid-row:1}
+  [data-approved-page="audio"] .master-col .strip-master>.master-fader-row{grid-column:1;grid-row:2}
+  [data-approved-page="audio"] .master-col .strip-master>.master-keys{grid-column:1;grid-row:3}
+  [data-approved-page="audio"] .master-col .strip-master>.strip-status{grid-column:1;grid-row:4;max-width:220px}
+  [data-approved-page="audio"] .master-col .strip-master>section{grid-row:1/5;align-self:stretch;justify-self:stretch}
+  [data-approved-page="audio"] .master-col .strip-master>section:nth-of-type(1){grid-column:2}
+  [data-approved-page="audio"] .master-col .strip-master>section:nth-of-type(2){grid-column:3}
+  [data-approved-page="audio"] .master-col .master-fader-row .audio-fader-box{height:120px}
+}
+@media (min-width:768px) and (max-width:1023px){
+  [data-approved-page="audio"] .master-col{grid-template-columns:minmax(0,1fr);gap:8px}
+}
+/* 1024–1279: bank takes the full row; Whole mix, then PROGRAM/meters/loudness, sit under it. */
+@media (min-width:1024px) and (max-width:1279px){
+  [data-approved-page="audio"] .mixer{grid-template-columns:minmax(0,1fr)}
+  [data-approved-page="audio"] .mixer-main{grid-column:1;grid-row:1}
+  [data-approved-page="audio"] .master-col>.hidden.lg\:block{grid-column:1;grid-row:2}
+  [data-approved-page="audio"] .master-col>.strip-master{grid-row:3}
+  [data-approved-page="audio"] .master-col>.mix-note{grid-row:4}
+  [data-approved-page="audio"] .strip-bank [data-testid="audio-strip"]{min-width:0}
+  [data-approved-page="audio"] [data-testid="audio-mix-overview"] ul{grid-template-columns:repeat(3,minmax(0,1fr));gap:4px}
+  [data-approved-page="audio"] .mo-row{flex-wrap:nowrap;min-height:44px}
+  [data-approved-page="audio"] .mo-row .mo-name{width:56px}
+  [data-approved-page="audio"] .mo-row .mo-sub{position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0 0 0 0);white-space:nowrap;flex:none}
+  [data-approved-page="audio"] .mo-row{position:relative}
+  [data-approved-page="audio"] [data-testid="audio-mix-overview"]>p{display:none}
+}
+
+/* ---- Final-fix2: explicit fader-row grid (scale | track | nudges | meter) with fixed
+   column widths so the dB scale never collides with the nudge column; the bank wraps
+   into rows at tablet+ instead of clipping or scrolling horizontally. ---- */
+@media (min-width: 768px) {
+  [data-approved-page="audio"] .strip-bank {
+    grid-auto-flow: row; grid-template-columns: repeat(auto-fill, minmax(172px, 1fr)); grid-auto-columns: auto;
+    overflow-x: visible; scroll-snap-type: none; gap: 8px;
+  }
+  [data-approved-page="audio"] .strip-bank [data-testid="audio-strip"] { padding: 4px 6px 6px; }
+  [data-approved-page="audio"] .strip-bank [data-testid="audio-strip-essential"] > div:first-child {
+    display: grid; grid-template-columns: 30px 56px 48px 8px; column-gap: 4px; justify-content: center; align-items: end; min-width: 0;
+  }
+  [data-approved-page="audio"] .strip-bank [data-testid="audio-strip-essential"] > div:first-child > div:first-child { width: 30px; }
+  [data-approved-page="audio"] .strip-bank .audio-strip-head { min-height: 56px; }
+  [data-approved-page="audio"] .strip-bank [data-testid="audio-strip-status"] {
+    white-space: normal; overflow: visible; text-overflow: clip; overflow-wrap: anywhere; line-height: 1.2; right: 56px; max-height: 26px;
+  }
+  [data-approved-page="audio"] .strip-bank [data-testid="audio-strip-name"] { overflow-wrap: anywhere; }
+}

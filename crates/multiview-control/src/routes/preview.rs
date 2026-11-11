@@ -298,7 +298,7 @@ fn negotiate_whep(
     if let Err(err) = authorize_whep_scope(principal, scope) {
         return err.into_response();
     }
-    match state.whep.negotiate(scope, offer) {
+    match state.whep.negotiate_for(scope, offer, &principal.key_id) {
         Ok(answer) => {
             let location = format!("{}/{}", whep_base_path(scope), answer.session_id);
             let mut response = (StatusCode::CREATED, answer.sdp).into_response();

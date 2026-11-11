@@ -1,0 +1,156 @@
+/* Routing & outputs — exact round-4 rules, namespaced. */
+[data-approved-page="routing"]{--bg-1:#10131a;--bg-2:#161b23;--bg-3:#1d242e;--bg-4:#232b36;--line:#232b36;--line-2:#2e3947;--text-1:#e8ecf1;--text-2:#9aa4b2;--text-3:#7d8794;--green:#3dd68c;--green-dim:#123524;--amber:#e8a33d;--amber-dim:#4a3515;--blue:#6aa6ff;--r-sm:6px;--r-md:10px;--r-lg:14px;--tap:48px;--mono:ui-monospace,"SF Mono",SFMono-Regular,Menlo,Consolas,"Liberation Mono",monospace;--slate:#8b93a0;color:var(--text-1)}
+[data-approved-page="routing"] .route-truth{display:flex;gap:12px;align-items:center;flex-wrap:wrap;background:var(--bg-1);border:1px solid var(--line);border-radius:var(--r-md);padding:8px 14px;margin-bottom:14px}
+[data-approved-page="routing"] .pgm-readout{display:inline-flex;align-items:center;gap:12px;min-height:var(--tap);padding:6px 14px;border-radius:var(--r-sm);border:1px solid var(--line-2);background:var(--bg-2);color:var(--text-1)}
+[data-approved-page="routing"] .pgm-readout b{font-size:15px}
+[data-approved-page="routing"] .lbl{font-size:12px;font-weight:700;letter-spacing:.12em;text-transform:uppercase;color:var(--text-3);margin:0}
+[data-approved-page="routing"] .pending-summary{font-size:12px;color:var(--amber);font-weight:700}
+[data-approved-page="routing"] .route-grid{display:grid;grid-template-columns:minmax(0,1.5fr) minmax(0,1fr);gap:14px;align-items:start}
+[data-approved-page="routing"] .patch-block,[data-approved-page="routing"] .outputs-block{background:var(--bg-1);border:1px solid var(--line);border-radius:var(--r-lg);padding:14px;min-width:0}
+[data-approved-page="routing"] .block-head{display:flex;justify-content:space-between;align-items:center;gap:8px;flex-wrap:wrap;margin-bottom:10px}
+[data-approved-page="routing"] .block-head h2{margin:0;font-size:13px;font-weight:800;letter-spacing:.1em;text-transform:uppercase;color:var(--text-2)}
+[data-approved-page="routing"] .route-picker{display:grid;gap:12px;margin-bottom:12px}
+[data-approved-page="routing"] .rp-sources{display:grid;gap:8px}
+[data-approved-page="routing"] .rp-note{font-size:12px;color:var(--text-2);margin:0}
+[data-approved-page="routing"] .rp-row{display:flex;align-items:center;gap:10px;width:100%;min-height:var(--tap);padding:8px 14px;text-align:left;border:1px solid var(--line-2);border-radius:var(--r-md);background:var(--bg-2);color:var(--text-1)}
+[data-approved-page="routing"] .rp-row b{font-size:14px}
+[data-approved-page="routing"] .rp-row .rp-cur{font-size:12px;color:var(--text-2)}
+[data-approved-page="routing"] .rp-row[aria-pressed="true"]{border-color:var(--blue);box-shadow:inset 0 0 0 1px var(--blue)}
+[data-approved-page="routing"] .rp-row .pill{margin-left:auto;font-size:12px;font-weight:700;color:var(--text-3);border:1px solid var(--line-2);border-radius:999px;padding:2px 10px}
+[data-approved-page="routing"] .rp-row .pill-live{color:var(--green);border-color:var(--green);background:var(--green-dim)}
+[data-approved-page="routing"] .patch-legend{font-size:12px;color:var(--text-3);margin:2px 2px 0}
+[data-approved-page="routing"] .plan-panel{margin-top:12px;padding:14px;border-radius:var(--r-md);background:var(--bg-2);border:1px solid var(--amber-dim);display:grid;gap:12px}
+[data-approved-page="routing"] .plan-panel h3{margin:0;font-size:13px}
+[data-approved-page="routing"] .plan-actions{display:flex;gap:8px;flex-wrap:wrap}
+[data-approved-page="routing"] .route-form button{min-height:var(--tap)}
+[data-approved-page="routing"] .plan-actions button,[data-approved-page="routing"] .rp-row,[data-approved-page="routing"] input:not([type="checkbox"]),[data-approved-page="routing"] [role="combobox"]{min-height:var(--tap)}
+[data-approved-page="routing"] .route-form{max-width:none}
+[data-approved-page="routing"] :focus-visible{outline:2px solid var(--blue);outline-offset:3px}
+@media (min-width:768px){[data-approved-page="routing"] .route-dests{display:none}[data-approved-page="routing"] .patch-block:has(.patch-table) .source-step{display:none}}
+@media (max-width:767px){[data-approved-page="routing"] .patch-wrap{display:none}[data-approved-page="routing"] .source-step[data-phone-hidden="true"]{display:none}[data-approved-page="routing"] .req-eff{grid-template-columns:1fr}[data-approved-page="routing"] .screen-head h1{font-size:18px}}
+@media (max-width:1279px){[data-approved-page="routing"] .route-grid{grid-template-columns:1fr}}
+
+[data-approved-page="routing"] .screen-head{display:flex;justify-content:space-between;align-items:flex-end;gap:16px;flex-wrap:wrap;margin-bottom:14px}
+[data-approved-page="routing"] .screen-head h1{margin:0 0 4px;font-size:24px;font-weight:800;letter-spacing:-.01em}
+[data-approved-page="routing"] .screen-sub{margin:0;color:var(--text-2);font-size:13px;display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+[data-approved-page="routing"] .help-btn{display:inline-flex;align-items:center;gap:4px;min-height:44px;padding:0 14px;border-radius:999px;border:1px solid var(--line-2);background:var(--bg-2);color:var(--text-2);font-size:12px;font-weight:800}
+[data-approved-page="routing"] .help-btn[aria-expanded="true"]{color:var(--text-1);border-color:var(--blue)}
+[data-approved-page="routing"] .help-panel{margin-top:10px;padding:10px 14px;background:var(--bg-1);border:1px solid var(--line);border-radius:var(--r-md);max-width:720px}
+[data-approved-page="routing"] .help-panel[hidden]{display:none}
+[data-approved-page="routing"] .help-panel p{margin:6px 0 0;font-size:12px;color:var(--text-2)}
+[data-approved-page="routing"] .help-panel b{color:var(--text-1)}
+[data-approved-page="routing"] .patch-wrap{overflow-x:auto;max-width:100%}
+[data-approved-page="routing"] .patch-table{border-collapse:collapse;width:100%}
+[data-approved-page="routing"] .patch-table th{padding:8px;font-size:12px;letter-spacing:.08em;text-transform:uppercase;color:var(--text-3);text-align:center}
+[data-approved-page="routing"] .patch-table th.src-h{text-align:left;position:sticky;left:0;background:var(--bg-1);z-index:2}
+[data-approved-page="routing"] .patch-table th.patch-src{text-align:left;position:sticky;left:0;background:var(--bg-1);z-index:1;font-size:13px;font-weight:700;letter-spacing:0;text-transform:none;color:var(--text-1);white-space:nowrap;padding:8px 12px 8px 4px}
+[data-approved-page="routing"] .patch-table td{padding:4px;text-align:center}
+[data-approved-page="routing"] .xpt{width:64px;height:var(--tap);border-radius:6px;border:1px dashed var(--line-2);background:var(--bg-2);font-size:12px;font-weight:800;color:var(--text-3);display:inline-flex;align-items:center;justify-content:center;gap:4px}
+[data-approved-page="routing"] .xpt:hover{border-color:var(--text-3);border-style:solid}
+[data-approved-page="routing"] .xpt.plan{border:1px solid var(--amber);background:var(--amber-dim);color:var(--amber)}
+[data-approved-page="routing"] .rp-step{display:flex;align-items:center;justify-content:space-between;gap:8px;margin-bottom:8px}
+[data-approved-page="routing"] .rp-step .lbl{flex:1}
+[data-approved-page="routing"] .rp-back{min-height:var(--tap);padding:0 12px;border-radius:var(--r-sm);border:1px solid var(--line-2);background:var(--bg-2);color:var(--text-1);font-size:12px;font-weight:800}
+[data-approved-page="routing"] .rp-dests{display:grid;gap:8px}
+[data-approved-page="routing"] .route-dests{margin-bottom:12px}
+[data-approved-page="routing"] .pill{display:inline-flex;align-items:center;gap:6px;font-size:12px;font-weight:700;padding:4px 10px;border-radius:999px;border:1px solid var(--line-2);white-space:nowrap}
+[data-approved-page="routing"] .pill-nosig,[data-approved-page="routing"] .pill-idle{color:var(--slate);background:var(--bg-2)}
+[data-approved-page="routing"] .plan-panel h3{margin:0;font-size:13px}
+[data-approved-page="routing"] .plan-desc{font-size:12px;color:var(--text-2);margin:0}
+[data-approved-page="routing"] .route-form{display:grid;gap:12px}
+[data-approved-page="routing"] .out-cards{display:grid;gap:10px}
+[data-approved-page="routing"] .out-card{background:var(--bg-2);border:1px solid var(--line);border-radius:var(--r-md);padding:12px;min-width:0;display:grid;gap:8px}
+[data-approved-page="routing"] .out-head{display:flex;justify-content:space-between;align-items:center;gap:8px;flex-wrap:wrap}
+[data-approved-page="routing"] .out-head b{font-size:14px}
+[data-approved-page="routing"] .out-head .pill{font-family:var(--mono);font-size:11px;text-transform:uppercase;border-radius:6px}
+[data-approved-page="routing"] .out-sub{margin:0;font-size:12px;color:var(--text-2);overflow-wrap:anywhere}
+[data-approved-page="routing"] .out-tx{display:flex;align-items:center;gap:8px;font-size:12px;flex-wrap:wrap}
+[data-approved-page="routing"] .req-eff{display:grid;grid-template-columns:1fr 1fr;gap:8px;min-width:0}
+[data-approved-page="routing"] .req-eff>div{background:var(--bg-1);border:1px solid var(--line);border-radius:var(--r-sm);padding:8px 10px;min-width:0}
+[data-approved-page="routing"] .req-eff .lbl{display:block;margin-bottom:4px}
+[data-approved-page="routing"] .req-eff .mono{font-family:var(--mono);font-size:13px;overflow-wrap:anywhere}
+[data-approved-page="routing"] .out-flag{font-size:12px;color:var(--text-2);margin:0;display:flex;gap:6px;align-items:center;flex-wrap:wrap}
+[data-approved-page="routing"] .out-actions{display:flex;gap:8px;flex-wrap:wrap}
+[data-approved-page="routing"] [data-testid="output-header-actions"] button{min-height:var(--tap);padding:0 20px;border-radius:var(--r-md);font-size:14px;font-weight:700;border:1px solid var(--line-2);background:var(--bg-2);color:var(--text-1)}
+[data-approved-page="routing"] [data-testid="output-header-actions"] button:hover{background:var(--bg-3)}
+[data-approved-page="routing"] [data-testid="output-header-actions"] button[data-testid="crud-new"]{background:var(--blue);color:#0b1220;border-color:transparent}
+[data-approved-page="routing"] .out-card button,[data-approved-page="routing"] .plan-actions button{border-radius:var(--r-md);font-weight:700}
+
+/* Round 2: 48px targets, muted borders, plan-panel flow. */
+[data-approved-page="routing"] .help-btn{min-height:var(--tap)}
+[data-approved-page="routing"] .pgm-readout .rp-cur{font-family:var(--mono);font-size:11px;color:var(--text-3)}
+[data-approved-page="routing"] .out-flag a,[data-approved-page="routing"] .out-card a,[data-approved-page="routing"] .outputs-block a{display:inline-flex;align-items:center;min-height:var(--tap);min-width:var(--tap);padding:0 8px}
+[data-approved-page="routing"] .outputs-block [role="alert"],[data-approved-page="routing"] .outputs-block [role="status"],[data-approved-page="routing"] .outputs-block [data-slot="alert"]{border-color:var(--line-2);background:var(--bg-2)}
+[data-approved-page="routing"] .route-form{grid-template-columns:repeat(auto-fit,minmax(220px,1fr));align-items:end}
+[data-approved-page="routing"] .route-form>*{min-width:0}
+[data-approved-page="routing"] .route-form [role="combobox"],[data-approved-page="routing"] .route-form input:not([type="checkbox"]){width:100%}
+[data-approved-page="routing"] .patch-table th{white-space:nowrap}
+/* Crosspoint grid fits its column: flexible >=48px cells, wrapped headers; inner scroll only as a last resort. */
+[data-approved-page="routing"] .patch-table{table-layout:auto}
+[data-approved-page="routing"] .patch-table th{white-space:normal;overflow-wrap:anywhere;padding:6px 2px;font-size:11px;letter-spacing:.02em;max-width:84px}
+[data-approved-page="routing"] .patch-table th.patch-src{white-space:normal;max-width:96px;padding:6px 8px 6px 4px;font-size:12px}
+[data-approved-page="routing"] .patch-table th.src-h{max-width:96px;white-space:normal}
+[data-approved-page="routing"] .patch-table td{padding:2px}
+[data-approved-page="routing"] .xpt{width:100%;min-width:var(--tap);padding:0}
+[data-approved-page="routing"] .patch-block{overflow:hidden}
+[data-approved-page="routing"] input[type="checkbox"]{appearance:none;-webkit-appearance:none;display:inline-grid;place-content:center;flex:none;width:var(--tap);min-width:var(--tap);height:var(--tap);margin:0;border:0;background:transparent;cursor:pointer}
+[data-approved-page="routing"] input[type="checkbox"]::before{content:"";width:22px;height:22px;border:2px solid var(--line-2);border-radius:5px;background:var(--bg-2)}
+[data-approved-page="routing"] input[type="checkbox"]:checked::before{background:var(--blue);border-color:var(--blue);box-shadow:inset 0 0 0 4px var(--bg-2)}
+/* Row headers: never wrap per letter — sane min width, single line, ellipsis (full name in title). */
+[data-approved-page="routing"] .patch-table th.patch-src{white-space:nowrap;overflow-wrap:normal;min-width:72px;max-width:112px;overflow:hidden;text-overflow:ellipsis}
+[data-approved-page="routing"] .patch-table th.src-h{white-space:nowrap;min-width:72px}
+/* Grid scrolls inside its panel (both axes) with sticky headers, so Plan/Take stay reachable below it. */
+@media (min-width:768px){
+[data-approved-page="routing"] .patch-wrap{max-height:min(46vh,360px);overflow:auto;overscroll-behavior:contain}
+[data-approved-page="routing"] .patch-table thead th{position:sticky;top:0;background:var(--bg-1);z-index:3}
+[data-approved-page="routing"] .patch-table thead th.src-h{z-index:4}
+[data-approved-page="routing"] .xpt{min-width:56px}
+}
+
+/* Fix9: disabled primary actions (Plan/Take) must read as disabled, never as a lit white button. */
+[data-approved-page="routing"] button:disabled,[data-approved-page="routing"] button[aria-disabled="true"]{background:var(--bg-1);color:var(--text-3);border:1px dashed var(--line-2);opacity:1;cursor:not-allowed}
+[data-approved-page="routing"] .patch-table th.patch-src,[data-approved-page="routing"] .patch-table th.src-h{background:var(--bg-1);box-shadow:1px 0 0 var(--line-2)}
+
+/* Fix13: compact fixed-width crosspoint matrix, clean scroll, sticky first column + header rows, one-line headers. */
+[data-approved-page="routing"] .patch-table{table-layout:fixed;width:max-content;min-width:100%;border-collapse:separate;border-spacing:0}
+[data-approved-page="routing"] .patch-table th.src-h{width:96px;min-width:96px;max-width:96px;left:0;vertical-align:bottom;font-size:11px;white-space:normal;line-height:1.2}
+[data-approved-page="routing"] .patch-table th.patch-src{width:96px;min-width:96px;max-width:96px;box-sizing:border-box}
+[data-approved-page="routing"] .patch-table th.dest-h{width:60px;min-width:60px;max-width:60px;box-sizing:border-box;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;font-size:10px;letter-spacing:0;padding:6px 2px;border-bottom:1px solid var(--line-2)}
+[data-approved-page="routing"] .patch-table th.grp-h{font-size:10px;letter-spacing:.1em;text-align:left;padding:6px 4px;color:var(--blue);border-left:1px solid var(--line-2);white-space:nowrap;overflow:hidden}
+[data-approved-page="routing"] .patch-table td{width:60px;min-width:60px;max-width:60px;box-sizing:border-box;padding:2px}
+[data-approved-page="routing"] .xpt{min-width:0;width:56px}
+[data-approved-page="routing"] .patch-wrap[data-testid="crosspoint-grid"]{background:none;scrollbar-width:thin;scrollbar-color:var(--line-2) transparent;border:1px solid var(--line);border-radius:var(--r-md)}
+[data-approved-page="routing"] .patch-wrap::-webkit-scrollbar{width:8px;height:8px}
+[data-approved-page="routing"] .patch-wrap::-webkit-scrollbar-track{background:transparent;border-radius:0}
+[data-approved-page="routing"] .patch-wrap::-webkit-scrollbar-thumb{background:var(--line-2);border:0;border-radius:4px}
+@media (min-width:768px){
+[data-approved-page="routing"] .patch-table thead tr.grp-row th{top:0}
+[data-approved-page="routing"] .patch-table thead tr:nth-child(2) th{top:29px}
+}
+[data-approved-page="routing"] .plan-tile{display:flex;flex-direction:column;align-items:flex-start;justify-content:center;gap:2px;min-height:var(--tap);padding:6px 14px;border-radius:var(--r-md);border:1px dashed var(--line-2);background:var(--bg-1);color:var(--text-2);font-size:13px;font-weight:700;text-align:left;cursor:not-allowed;justify-self:start;max-width:100%}
+[data-approved-page="routing"] .plan-tile .plan-tile-why{font-size:11px;font-weight:400;color:var(--text-3)}
+@media (max-width:767px){
+[data-approved-page="routing"] .rp-dests{grid-template-columns:repeat(auto-fill,minmax(112px,1fr))}
+[data-approved-page="routing"] .rp-dests .rp-row{flex-direction:column;align-items:flex-start;gap:2px;padding:6px 12px}
+}
+
+/* Crosspoint scroll affordance: edge fade + hint while the matrix overflows; always-visible scrollbar. */
+[data-approved-page="routing"] .patch-shell{position:relative}
+[data-approved-page="routing"] .patch-shell[data-more="end"]::after{content:"";position:absolute;top:0;right:1px;width:36px;height:calc(100% - 44px);pointer-events:none;background:linear-gradient(90deg,transparent,var(--bg-1));border-radius:0 var(--r-md) var(--r-md) 0}
+[data-approved-page="routing"] .patch-more{margin:4px 2px 0;font-size:12px;font-weight:700;color:var(--blue)}
+[data-approved-page="routing"] .patch-wrap{scrollbar-width:auto;scrollbar-color:var(--blue) var(--bg-3)}
+[data-approved-page="routing"] .patch-wrap::-webkit-scrollbar{width:12px;height:12px}
+[data-approved-page="routing"] .patch-wrap::-webkit-scrollbar-thumb{background:var(--blue)}
+[data-approved-page="routing"] .patch-wrap::-webkit-scrollbar-track{background:var(--bg-3)}
+[data-approved-page="routing"] .rp-row .rp-id{font-family:var(--mono);font-size:11px;color:var(--text-3)}
+@media (max-width:767px){[data-approved-page="routing"] .patch-shell{display:contents}[data-approved-page="routing"] .patch-more{display:none}}
+
+/* Help pill: compact icon pill on phones, inline beside the subtitle (accessible name "Help" kept). */
+@media (max-width:767px){
+  [data-approved-page] .help-btn{flex:none;width:48px;min-width:48px;height:48px;padding:0;justify-content:center;font-size:0;gap:0;margin-left:auto}
+  [data-approved-page] .help-btn svg{width:18px;height:18px;margin:0}
+  [data-approved-page] .screen-sub,[data-approved-page] .src-sub{flex-wrap:nowrap;justify-content:space-between;width:100%}
+}
+/* Final-fix2: plan form actions wrap inside the panel instead of running past its edge. */
+[data-approved-page="routing"] .route-form .route-actions{flex-wrap:wrap;min-width:0;max-width:100%}
+[data-approved-page="routing"] .route-form .route-actions>*{max-width:100%}

@@ -16,11 +16,12 @@
 import {
   apiUrl,
   buildHeaders,
+  sendCommand,
   OperationApiError,
   readProblem,
 } from './operations';
 import type { AcceptedBody, RequestOptions } from './operations';
-import type { components } from './schema';
+import type { components } from './types';
 
 /** One live cast session, exactly as the control plane returns it. */
 export type CastSession = components['schemas']['CastSessionDoc'];
@@ -166,11 +167,7 @@ export async function setCastVolume(
   request: CastVolumeRequest,
   options: RequestOptions = {},
 ): Promise<AcceptedBody> {
-  const response = await fetch(apiUrl(options, `${itemPath(id)}/volume`), {
-    method: 'POST',
-    headers: buildHeaders(options, true),
-    body: JSON.stringify(request),
-  });
+  const response = await sendCommand(`${itemPath(id)}/volume`, options, { body: request });
   if (!response.ok) {
     throw await readProblem(response);
   }

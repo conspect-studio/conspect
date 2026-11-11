@@ -113,7 +113,10 @@ pub fn spawn_unified_webrtc(
         shared_stores,
         program_audio,
     )
-    .with_demand(demand);
+    .with_demand(demand)
+    .with_silence_timeout(std::time::Duration::from_millis(
+        config.webrtc.preview_session_timeout.millis(),
+    ));
     let builder = builder.with_preview(Arc::clone(&egress));
 
     // 4. `whip_push` outputs (one lane per configured output).
@@ -138,10 +141,42 @@ pub fn spawn_unified_webrtc(
     });
     tracing::info!("unified WebRTC endpoint bound (one shared socket for preview + WHIP + WHEP-serve + whip_push)");
 
-    let gated = multiview_control::GatedWhep::with_defaults(Arc::new(preview_provider));
+    let caps = multiview_control::FocusCaps::new(
+        usize::try_from(config.webrtc.preview_max_focus).unwrap_or(usize::MAX),
+        usize::try_from(config.webrtc.preview_max_focus_per_scope).unwrap_or(usize::MAX),
+    );
+    let gated = Arc::new(multiview_control::GatedWhep::new(
+        Arc::new(preview_provider),
+        caps,
+        "jpeg",
+    ));
+    spawn_focus_reaper(Arc::clone(&gated));
     UnifiedWebrtc {
-        whep: Some(Arc::new(gated)),
+        whep: Some(gated),
         whip,
         whep_output,
     }
+}
+
+/// How often the liveness sweep runs. With the default 8 s silence horizon a
+/// vanished viewer's slot is reusable within `8 s + 1 s`.
+const REAP_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// Periodically free the focus slots of viewers that vanished without a `DELETE`
+/// (ICE failed, DTLS closed, silent peer). Runs on its own task; it touches only
+/// preview bookkeeping behind short-lived mutexes, never the engine or the output
+/// clock (invariants #1 / #10), and never `.await`s a client.
+fn spawn_focus_reaper(gated: Arc<multiview_control::GatedWhep>) {
+    use multiview_control::WhepProvider;
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(REAP_INTERVAL);
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            tick.tick().await;
+            let ended = gated.reap_dead(std::time::Instant::now());
+            if !ended.is_empty() {
+                tracing::info!(sessions = ?ended, "preview viewers gone without DELETE; focus slots released");
+            }
+        }
+    });
 }

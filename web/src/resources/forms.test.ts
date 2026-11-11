@@ -313,6 +313,147 @@ describe('webrtc source (WHIP ingest, ADR-T014 / ADR-W023)', () => {
   });
 });
 
+describe('source EPG + IPTV playlist metadata (epg-playlist)', () => {
+  it('omits epg/playlist_metadata entirely for an untouched form', () => {
+    const body = sourceFormToBody(sourceForm({ kind: 'hls', url: 'https://cdn/x.m3u8' }));
+    expect(body).not.toHaveProperty('epg');
+    expect(body).not.toHaveProperty('playlist_metadata');
+  });
+
+  it('builds a manual epg block with url + channel_id', () => {
+    const body = sourceFormToBody(
+      sourceForm({
+        kind: 'hls',
+        url: 'https://cdn/x.m3u8',
+        epgMode: 'manual',
+        epgUrl: 'https://guide.example.net/xmltv.xml',
+        epgChannelId: 'bbc1.uk',
+      }),
+    );
+    expect(body.epg).toEqual({
+      mode: 'manual',
+      url: 'https://guide.example.net/xmltv.xml',
+      channel_id: 'bbc1.uk',
+    });
+  });
+
+  it('omits the mode key for automatic (the schema default)', () => {
+    const body = sourceFormToBody(
+      sourceForm({
+        kind: 'hls',
+        url: 'https://cdn/x.m3u8',
+        epgMode: 'automatic',
+        epgUrl: 'https://guide.example.net/xmltv.xml',
+      }),
+    );
+    expect(body.epg).toEqual({ url: 'https://guide.example.net/xmltv.xml' });
+  });
+
+  it('writes mode=disabled while retaining a previously configured url/channel_id', () => {
+    const body = sourceFormToBody(
+      sourceForm({
+        kind: 'hls',
+        epgMode: 'disabled',
+        epgUrl: 'https://guide.example.net/xmltv.xml',
+        epgChannelId: 'bbc1.uk',
+      }),
+    );
+    expect(body.epg).toEqual({
+      mode: 'disabled',
+      url: 'https://guide.example.net/xmltv.xml',
+      channel_id: 'bbc1.uk',
+    });
+  });
+
+  it('builds playlist_metadata from the presentation fields', () => {
+    const body = sourceFormToBody(
+      sourceForm({
+        kind: 'hls',
+        metaTvgId: 'bbc1.uk',
+        metaName: 'BBC One',
+        metaLogo: 'https://logos.example.net/bbc1.png',
+        metaGroup: 'UK Terrestrial',
+      }),
+    );
+    expect(body.playlist_metadata).toEqual({
+      tvg_id: 'bbc1.uk',
+      name: 'BBC One',
+      logo: 'https://logos.example.net/bbc1.png',
+      group: 'UK Terrestrial',
+    });
+  });
+
+  it('round-trips a stored epg + playlist_metadata body', () => {
+    const storedBody = {
+      id: 'news',
+      kind: 'hls',
+      url: 'https://cdn/news.m3u8',
+      epg: {
+        mode: 'manual',
+        url: 'https://guide.example.net/xmltv.xml',
+        channel_id: 'news.uk',
+      },
+      playlist_metadata: { tvg_id: 'news.uk', name: 'News 24', group: 'News' },
+    };
+    const form = defined(
+      sourceFormFromRecord({ id: 'news', name: 'News', body: storedBody }),
+    );
+    expect(form.epgMode).toBe('manual');
+    expect(form.epgUrl).toBe('https://guide.example.net/xmltv.xml');
+    expect(form.epgChannelId).toBe('news.uk');
+    expect(form.metaTvgId).toBe('news.uk');
+    expect(form.metaName).toBe('News 24');
+    expect(form.metaGroup).toBe('News');
+    expect(sourceFormToBody(form)).toMatchObject({
+      epg: storedBody.epg,
+      playlist_metadata: storedBody.playlist_metadata,
+    });
+  });
+
+  it('defaults epgMode to automatic for a legacy record with no epg block', () => {
+    const form = defined(
+      sourceFormFromRecord({ id: 'legacy', name: 'Legacy', body: { id: 'legacy', kind: 'rtsp' } }),
+    );
+    expect(form.epgMode).toBe('automatic');
+    expect(form.epgUrl).toBe('');
+    expect(form.epgChannelId).toBe('');
+    expect(form.metaTvgId).toBe('');
+  });
+
+  it('requires epgUrl and epgChannelId in manual mode', () => {
+    const errors = validateSourceForm(sourceForm({ kind: 'hls', epgMode: 'manual' }), true);
+    expect(errors.epgUrl).toBe('required');
+    expect(errors.epgChannelId).toBe('required');
+  });
+
+  it('rejects a non-http(s) epg url', () => {
+    const errors = validateSourceForm(
+      sourceForm({
+        kind: 'hls',
+        epgMode: 'manual',
+        epgUrl: 'ftp://guide.example.net/x.xml',
+        epgChannelId: 'c',
+      }),
+      true,
+    );
+    expect(errors.epgUrl).toBe('scheme-http');
+  });
+
+  it('rejects a non-http(s) playlist logo url', () => {
+    const errors = validateSourceForm(
+      sourceForm({ kind: 'hls', metaLogo: 'not a url' }),
+      true,
+    );
+    expect(errors.metaLogo).toBe('scheme-http');
+  });
+
+  it('validates nothing extra when epg/metadata are untouched', () => {
+    expect(validateSourceForm(sourceForm({ kind: 'hls', url: 'https://cdn/x.m3u8' }), true)).toEqual(
+      {},
+    );
+  });
+});
+
 describe('sourceFormFromRecord', () => {
   it('refuses an unknown kind with the undefined sentinel (never folds)', () => {
     expect(

@@ -8,7 +8,7 @@
 // hook reads it once and does not poll.
 import { apiUrl, buildHeaders, OperationApiError, readProblem } from './operations';
 import type { RequestOptions } from './operations';
-import type { components } from './schema';
+import type { components } from './types';
 
 /** The build capability + licence surface (`SystemCapabilities`). */
 export type SystemCapabilities = components['schemas']['SystemCapabilities'];
@@ -20,6 +20,8 @@ export type CompositorCapability = components['schemas']['CompositorCapability']
 export type BuildInfo = components['schemas']['BuildInfo'];
 /** The effective build-profile licence literal (`LGPL-clean` | `GPL`). */
 export type EffectiveLicense = components['schemas']['EffectiveLicense'];
+/** The `youtube` source kind's resolve capability (ADR-0015). */
+export type YoutubeCapability = components['schemas']['YoutubeCapability'];
 
 export { OperationApiError } from './operations';
 export type { RequestOptions } from './operations';

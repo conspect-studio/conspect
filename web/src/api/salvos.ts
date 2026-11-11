@@ -21,7 +21,7 @@ import {
   submitOperation,
 } from './operations';
 import type { AcceptedBody, RequestOptions } from './operations';
-import type { components } from './schema';
+import type { components } from './types';
 
 /** A salvo definition, exactly as the control plane returns it. */
 export type Salvo = components['schemas']['SalvoDoc'];

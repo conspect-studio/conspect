@@ -87,6 +87,9 @@ test("create / edit / delete dialogs open without crashing the renderer", async 
   await expect(page.getByRole("dialog")).toBeVisible({ timeout: 5000 });
   await page.keyboard.press("Escape");
 
+  // The approved Sources screen keeps Edit/Delete inside the row's Details panel.
+  await page.getByRole("button", { name: "Details: Camera 1" }).click();
+
   // Edit (loads the record via GET, prefills, opens the same Dialog).
   await page.getByRole("button", { name: "Edit source: Camera 1" }).click();
   await expect(page.getByRole("dialog")).toBeVisible({ timeout: 5000 });
