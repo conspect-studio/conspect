@@ -56,6 +56,7 @@ pub mod system;
 pub mod tally;
 pub mod telemetry;
 pub mod weather;
+pub(crate) mod web_capture;
 pub mod whep_output;
 pub mod whip;
 
@@ -1382,6 +1383,20 @@ pub fn api_router() -> Router<AppState> {
         // Media-player transport surface (ADR-0057/ADR-0097): read + the
         // load/cue/play/pause/stop/seek verbs + the vamp-exit arm/take/cancel
         // triad, each 202 + op id onto the bounded command bus.
+        .route(
+            "/media/captures/capabilities",
+            get(web_capture::capabilities),
+        )
+        .route("/media/captures", post(web_capture::create))
+        .route("/media/captures/{id}", get(web_capture::get))
+        .route(
+            "/media/captures/{id}/artifact",
+            get(web_capture::artifact),
+        )
+        .route(
+            "/media/captures/{id}/cancel",
+            post(web_capture::cancel),
+        )
         .route("/media/players", get(media_players::list_players))
         .route("/media/players/{id}", get(media_players::get_player))
         .route("/media/players/{id}/load", post(media_players::load_player))
@@ -1424,6 +1439,7 @@ pub fn api_router() -> Router<AppState> {
         .route("/preview/program.jpg", get(preview::program_jpeg))
         .route("/preview/switcher/{me}/preview.jpg", get(preview::switcher_preview_jpeg))
         .route("/preview/inputs", get(preview::list_input_ids))
+        .route("/preview/wall", get(preview::wall_geometry))
         .route("/preview/inputs/{id}", get(preview::input_jpeg))
         // Read-only change audit log.
         .route("/audit", get(audit::list_audit))
@@ -1470,6 +1486,8 @@ pub fn signalling_router() -> Router<AppState> {
         .route("/preview/capabilities", get(preview::capabilities))
         .route("/preview/program/moq", post(moq::program_open))
         .route("/preview/program/moq/{lease_id}", axum::routing::delete(moq::program_close))
+        .route("/preview/wall/moq", post(moq::wall_open))
+        .route("/preview/wall/moq/{lease_id}", axum::routing::delete(moq::wall_close))
         .route("/preview/inputs/{id}/moq", post(moq::input_open))
         .route("/preview/inputs/{id}/moq/{lease_id}", axum::routing::delete(moq::input_close))
         .route("/preview/outputs/{id}/moq", post(moq::output_open))

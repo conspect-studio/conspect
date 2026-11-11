@@ -3924,6 +3924,7 @@ dependencies = [
  "multiview-preview",
  "multiview-telemetry",
  "multiview-weather",
+ "multiview-webengine",
  "proptest",
  "prost",
  "quick-xml",
@@ -4279,10 +4280,13 @@ dependencies = [
 name = "multiview-webengine"
 version = "0.1.0"
 dependencies = [
+ "rustix",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "tempfile",
  "thiserror 2.0.18",
+ "tokio",
 ]
 
 [[package]]
