@@ -22,11 +22,11 @@ These ADRs capture the load-bearing decisions for the Multiview engine. 169 ADRs
 - [ADR-0016](ADR-0016.md) — Efficient overlay rendering: GPU glyph-atlas text + libass subtitles + cached/dirty-region compositing *(Proposed)*
 - [ADR-0019](ADR-0019.md) — Native multi-form caption ingest: unified cue model decoded in-demux into a per-tile sampled cue store *(Proposed)*
 - [ADR-0024](ADR-0024.md) — Native caption master-fetch over libav avio (no `curl`, no HTTP dep) + bounded retry; fetcher seam for offline tests *(Accepted)*
-- [ADR-0105](ADR-0105.md) — macOS GPU compositing on wgpu's Metal backend (NV12 as R8+RG8 planes); native IOSurface path deferred until a measured copy-bound workload; amends ADR-0004's rationale *(Accepted)*
 - [ADR-0044](ADR-0044.md) — Local display output via DRM/KMS: the off-by-default `display-kms` raw-frame sink (drm-rs + gbm), mailbox flip policy, scanout affinity *(Accepted)*
 - [ADR-0045](ADR-0045.md) — Display-node mode: `multiview node` subcommand, enrollment/pairing, node presentation discipline, display-locked clock option *(Accepted)*
 - [ADR-0048](ADR-0048.md) — WebRTC transport endpoint: new leaf crate `multiview-webrtc` (feature `native`, str0m =0.16.2 pinned) owning ALL native WebRTC transport (relocated from `multiview-preview`'s `webrtc-native`) — ONE dual-stack `[::]` UDP socket (default 8189) muxing every session (WHIP ingest · WHEP preview · WHEP output viewers · WHIP push) by ICE-ufrag/learned-addr, full-ICE (never ice-lite) with IPv6-first host candidates + `webrtc.advertised_addresses`, per-run self-signed DTLS cert, one bounded driver task the engine never awaits (inv #10), session GC + `max_sessions` *(Proposed)*
 - [ADR-0049](ADR-0049.md) — WebRTC program outputs: `Output::Webrtc` (WHEP serve of the REAL H.264 program rendition to ≤`max_viewers` — fanout `PacketSink` route()+1, encode-once inv #7, B-frames-off validated at config time, SPS/PPS prepend at IDR, rate-limited force-IDR seam) + `Output::WhipPush` (RFC 9725 client publish: Bearer, 307-redirect-follow, supervised reconnect like RTMP/SRT push) + ONE program Opus rendition embedded for all WebRTC consumers; engine-protected real outputs, never shed by the preview ladder, bounded per-viewer drop-oldest rings *(Proposed)*
+- [ADR-0105](ADR-0105.md) — macOS GPU compositing on wgpu's Metal backend (NV12 as R8+RG8 planes); native IOSurface path deferred until a measured copy-bound workload; amends ADR-0004's rationale *(Accepted)*
 
 ## Account / Conspect (account-side subsystem)
 
