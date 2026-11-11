@@ -19,7 +19,7 @@ export function OverviewPage(): JSX.Element {
         title={<Trans>Documentation</Trans>}
         description={
           <Trans>
-            How Multiview works, how to run it, and how to drive it from
+            How Conspect works, how to run it, and how to drive it from
             config-as-code or the API.
           </Trans>
         }
@@ -30,19 +30,20 @@ export function OverviewPage(): JSX.Element {
       </div>
 
       <div className="space-y-4">
-        <DocSection id="what-multiview-is" title={<Trans>What Multiview is</Trans>}>
+        <DocSection id="what-multiview-is" title={<Trans>What Conspect is</Trans>}>
           <Prose>
             <Trans>
-              Multiview is a hardware-accelerated live video multiview generator.
-              It ingests many live sources, composites them into a templated grid
-              on the GPU, and serves the combined picture as a continuous output
-              stream. It is designed for monitoring walls and production
-              multiviewers where the output must never stall.
+              Conspect is a live-media production, routing, and monitoring system.
+              It brings together live sources, audio routing, compositing,
+              overlays, playout, and output delivery. Multiview layouts and
+              monitoring walls are part of that wider production workflow.
             </Trans>
           </Prose>
           <Prose>
             <Trans>
-              Inputs are sampled, never trusted to pace the output. A single
+              Continuous output and fault isolation are design objectives, not
+              warranties of uninterrupted operation. Inputs are sampled, never
+              trusted to pace the output. A single
               fixed-cadence clock emits exactly one frame per tick. When a source
               drops, its tile holds its last good frame and shows a clear state
               while the engine reconnects in the background — the rest of the wall
@@ -76,9 +77,9 @@ export function OverviewPage(): JSX.Element {
             </li>
             <li>
               <Trans>
-                <strong>Control never back-pressures the engine.</strong> The
-                management API, realtime streams, and preview are best-effort and
-                physically incapable of stalling the output path.
+                <strong>Control-plane isolation.</strong> The design keeps the
+                management API, realtime streams, and preview best-effort,
+                with bounded queues separating them from the output path.
               </Trans>
             </li>
           </DocList>
@@ -87,7 +88,7 @@ export function OverviewPage(): JSX.Element {
         <DocSection id="getting-started" title={<Trans>Getting started</Trans>}>
           <Prose>
             <Trans>
-              The fastest way to see Multiview running is the quick-start compose
+              The fastest way to see Conspect running is the quick-start compose
               stack. It publishes a synthetic test feed, composites a 2x2 canvas,
               and serves the result over HTTP so you can open it in a player — no
               real cameras or private feeds required.

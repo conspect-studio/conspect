@@ -350,7 +350,7 @@ export function SyncGroupsPage(): JSX.Element {
             <Trans>
               Groups are stored and exported with the configuration; alignment
               and drift measurement run against the adopted member devices.
-              Program output is never interrupted by sync changes.
+              Sync changes are designed to remain isolated from program-output timing.
             </Trans>
           }
         />

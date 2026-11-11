@@ -31,7 +31,7 @@ export function DevicesHelpPage(): JSX.Element {
         <DocSection id="what-devices-are" title={<Trans>What a managed device is</Trans>}>
           <Prose>
             <Trans>
-              A managed device is a piece of hardware Multiview supervises: a
+              A managed device is a piece of hardware Conspect supervises: a
               hardware decoder feeding a TV, a display node driving a video
               wall, or a cast target. The device entry you adopt is desired
               state — driver, management address, mode, credentials — and a
@@ -42,8 +42,8 @@ export function DevicesHelpPage(): JSX.Element {
           </Prose>
           <Prose>
             <Trans>
-              Devices never carry the program: Multiview's program output
-              never depends on any device. If a device fails, sources bound to
+              Conspect is designed to isolate program-output timing from
+              managed-device failures. If a device fails, sources bound to
               it ride the normal tile ladder and outputs ride their failover
               policy — the multiview keeps running while the driver works on
               recovery.
@@ -66,8 +66,8 @@ export function DevicesHelpPage(): JSX.Element {
               <Trans>
                 Reachable. DEGRADED means the device itself reports a fault —
                 a stalled decode, over-temperature — while its management
-                channel still answers. Program output is unaffected either
-                way.
+                channel still answers. Program-output timing is designed to
+                remain independent of the device.
               </Trans>
             </DocTerm>
             <DocTerm term={<Trans>AUTH_FAILED</Trans>}>
@@ -111,7 +111,7 @@ export function DevicesHelpPage(): JSX.Element {
             </DocTerm>
             <DocTerm term={<Code>displaynode</Code>}>
               <Trans>
-                Multiview's own display-node software for single-board
+                Conspect's own display-node software for single-board
                 computers and spare PCs driving displays; enrolled nodes are
                 located by their keypair identity rather than an address, and
                 present frame-accurate synchronized output.

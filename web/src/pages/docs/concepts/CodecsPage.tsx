@@ -17,7 +17,7 @@ export function CodecsPage(): JSX.Element {
         description={
           <Trans>
             What transcoding actually is, the common video codecs, hardware
-            acceleration, and how Multiview encodes its output.
+            acceleration, and how Conspect encodes its output.
           </Trans>
         }
       />
@@ -54,10 +54,11 @@ export function CodecsPage(): JSX.Element {
               in existence: every browser, phone, set-top box, and hardware
               decoder of the last 15+ years plays it. It is the safe default
               for compatibility. Note that software H.264/H.265 encoders carry
-              a GPL license obligation in Multiview's build, so the default
+              a GPL license obligation in Conspect's build, so the default
               (license-clean) image encodes them only with a hardware encoder;
-              choosing a software H.264 encode means using the GPL image
-              variant.
+              a software-encoder image carries GPL dependency obligations.
+              Those obligations do not relicense Conspect's own code or grant
+              permission to redistribute Conspect.
             </Trans>
           </Prose>
         </DocSection>
@@ -95,7 +96,7 @@ export function CodecsPage(): JSX.Element {
             <Trans>
               Modern GPUs and SoCs contain dedicated video engines — separate
               silicon for decode and encode that runs at a fraction of the
-              power of a CPU doing the same work. Multiview uses them through
+              power of a CPU doing the same work. Conspect uses them through
               each platform's standard interface: NVDEC/NVENC on NVIDIA,
               VAAPI on Intel and AMD (including Quick Sync), and VideoToolbox
               on Apple Silicon. With acceleration, decoding a wall of sources
@@ -119,8 +120,8 @@ export function CodecsPage(): JSX.Element {
             </li>
             <li>
               <Trans>
-                A software fallback always exists, so a build without any GPU
-                still works — just with less headroom.
+                Software paths depend on the build and selected codecs; check
+                capabilities before relying on a deployment without a GPU.
               </Trans>
             </li>
           </DocList>
@@ -129,7 +130,7 @@ export function CodecsPage(): JSX.Element {
         <DocSection id="encode-once" title={<Trans>Encode once, fan out many</Trans>}>
           <Prose>
             <Trans>
-              Multiview composites the canvas <em>once</em> per tick, encodes
+              Conspect composites the canvas <em>once</em> per tick, encodes
               it <em>once per rendition</em>, and fans the same encoded
               packets out to every output that wants that rendition. Writing
               the wall to HLS while pushing it to an RTMP and an SRT

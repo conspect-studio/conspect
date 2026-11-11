@@ -1,6 +1,6 @@
 # Efficiency Budget
 
-> **Status:** authoritative per-stage efficiency budget for the Multiview data plane.
+> **Status:** authoritative per-stage efficiency budget for the Conspect data plane.
 > Pairs with [`docs/research/efficiency.md`](../research/efficiency.md) (the "why") and
 > ADR-E001..E008. **Invariants enforced:** #5 NV12-throughout (1.5 B/px, never RGBA per tile),
 > #6 decode-at-display-resolution (budget in MP/s), #7 encode-once-mux-many, #9 bounded queues.

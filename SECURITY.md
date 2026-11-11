@@ -1,13 +1,13 @@
 # Security Policy
 
-Multiview is a live GPU video multiview engine that ingests many networked sources and
-serves robust continuous output. Because it handles **source credentials**, exposes a
-**management API**, and links **third-party media libraries**, security is treated as a
+Conspect is live-media production, routing and monitoring software that ingests many
+networked sources and aims to provide continuous output. This is a design goal, not a warranty.
+Because it handles **source credentials**, exposes a **management API**, and links **third-party media libraries**, security is treated as a
 first-class concern. This document explains how to report vulnerabilities and the
 security model of the management surface.
 
-> Multiview project code is **source-available** under the **Multiview Source-Available
-> Non-Commercial License** (© Aperim Pty Ltd; see [`LICENSE`](LICENSE)). See the licensing notes in
+> Conspect project code is **source-available** under the **Conspect Source-Available
+> Non-Commercial License v2** (© Aperim Pty Ltd; see [`LICENSE`](LICENSE)). See the licensing notes in
 > [`docs/architecture/conventions.md`](docs/architecture/conventions.md) §7 for the
 > FFmpeg/NDI/codec build-profile model summarised below.
 
@@ -133,7 +133,7 @@ See the preview deep brief at
 
 ## Secrets Handling
 
-Source and output endpoints frequently embed credentials (RTSP/SRT/RTMP/NDI). Multiview
+Source and output endpoints frequently embed credentials (RTSP/SRT/RTMP/NDI). Conspect
 treats these as sensitive throughout:
 
 - Credentials are wrapped in **`secrecy::SecretString`** (zeroized on drop, redacted in
@@ -153,14 +153,14 @@ A source URL such as `rtsp://user:pass@host/stream` carries the username and pas
 - Such URLs are sensitive even though they look like ordinary configuration.
 - Avoid pasting full source URLs into bug reports, screenshots, logs, or chat. Redact the
   userinfo component (`user:pass@`) before sharing.
-- Multiview masks these in API responses and redacts them in logs, but **anything you copy
+- Conspect masks these in API responses and redacts them in logs, but **anything you copy
   manually is your responsibility.**
 
 ---
 
 ## Supply Chain: FFmpeg, NDI, and Codecs
 
-Multiview builds in **off-by-default native/FFI features** so the default `cargo check` is a
+Conspect builds in **off-by-default native/FFI features** so the default `cargo check` is a
 pure-Rust, LGPL-clean, no-native-deps build (conventions §3–§4, §7).
 
 - **FFmpeg / libav\*** (`ffmpeg` feature): linked **LGPL** in the default profile. No

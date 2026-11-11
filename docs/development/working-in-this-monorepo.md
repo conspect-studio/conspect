@@ -1,6 +1,6 @@
 # Working in this monorepo (for agents)
 
-Orientation for any coding agent working in Multiview: a 23-crate Cargo workspace under `crates/`,
+Orientation for any coding agent working in Conspect: a 23-crate Cargo workspace under `crates/`,
 a React/TypeScript SPA under `web/`, dev automation in `xtask/`, and a large `docs/` tree
 (architecture, 56 research briefs, 236 ADRs). This page is **how to move through it without
 drowning your context window**, plus the operational hazards that have actually bitten here.

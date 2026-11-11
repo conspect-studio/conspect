@@ -17,7 +17,7 @@ export function TimingSyncPage(): JSX.Element {
         title={<Trans>Timing & sync</Trans>}
         description={
           <Trans>
-            How Multiview paces its output, what genlock and PTP mean, and how
+            How Conspect paces its output, what genlock and PTP mean, and how
             wall-clock time fits in.
           </Trans>
         }
@@ -27,9 +27,10 @@ export function TimingSyncPage(): JSX.Element {
         <DocSection id="output-clock" title={<Trans>The output clock</Trans>}>
           <Prose>
             <Trans>
-              Multiview's output is paced by exactly one thing: a fixed-cadence
+              Conspect's output is paced by exactly one thing: a fixed-cadence
               internal clock. At every tick — for example every 1/50 s for a
-              50 fps canvas — it emits one finished frame, forever. Sources
+              50 fps canvas — the invariant requires one finished frame. This is
+              a design requirement, not an uptime warranty. Sources
               never set that pace. Each input writes its newest decoded frame
               into a per-tile store, and at each tick the compositor{" "}
               <em>samples</em> whatever is freshest there. A source that
@@ -39,11 +40,11 @@ export function TimingSyncPage(): JSX.Element {
           </Prose>
           <Prose>
             <Trans>
-              This is why the wall keeps running through any input failure:
+              The design aims to maintain output through input failures:
               the output's timing is independent of every input by
               construction. Frame rates are handled as exact fractions (NTSC
               29.97 is <Code>30000/1001</Code>, never a rounded decimal), so
-              the cadence cannot drift over long runs.
+              frame-rate rounding does not accumulate timestamp drift.
             </Trans>
           </Prose>
         </DocSection>
@@ -66,7 +67,7 @@ export function TimingSyncPage(): JSX.Element {
               video source. Facilities lock outputs to a reference and then
               frame-align sources to those outputs; nobody lets program
               content drive a device's clock, because content can stall or
-              lie. Multiview follows the same discipline in software: its
+              lie. Conspect follows the same discipline in software: its
               output cadence can be disciplined by a reference, but never by a
               source.
             </Trans>
@@ -101,12 +102,12 @@ export function TimingSyncPage(): JSX.Element {
           </Prose>
           <Prose>
             <Trans>
-              How Multiview relates: the fixed-cadence output clock free-runs
+              How Conspect relates: the fixed-cadence output clock free-runs
               on the host's monotonic clock by default — no timing hardware
               needed. In a PTP facility the same clock can be{" "}
               <em>disciplined</em> to the grandmaster (its rate gently steered,
               never stepped), and if the reference disappears the output
-              coasts and then free-runs — it never stops. Inputs remain
+              is designed to coast and then free-run. Inputs remain
               sampled, never pacing, in every mode; PTP changes how well
               sources line up with each other, not who controls the output.
             </Trans>
@@ -117,7 +118,7 @@ export function TimingSyncPage(): JSX.Element {
           <Prose>
             <Trans>
               Wall-clock time is ordinary time-of-day (UTC), kept by the
-              host's system clock and disciplined by NTP or PTP. Multiview
+              host's system clock and disciplined by NTP or PTP. Conspect
               uses it for <em>labels only</em>: on-screen clock overlays, log
               timestamps, and the date-time stamps in HLS playlists. It never
               paces frames, because a system clock can step backwards or jump

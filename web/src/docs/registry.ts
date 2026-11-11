@@ -18,12 +18,12 @@ export const DOCS_REGISTRY: readonly DocsPageEntry[] = [
   {
     path: "/help",
     title: msg`Overview`,
-    summary: msg`What Multiview is, the design pillars, and how to get started.`,
-    keywords: ["introduction", "getting started", "quick start", "multiview"],
+    summary: msg`What Conspect is, the design pillars, and how to get started.`,
+    keywords: ["introduction", "getting started", "quick start", "conspect", "multiview", "production", "routing"],
     sections: [
       {
         id: "what-multiview-is",
-        title: msg`What Multiview is`,
+        title: msg`What Conspect is`,
         keywords: ["multiviewer", "monitoring wall", "compositor", "gpu"],
       },
       {
@@ -330,7 +330,7 @@ export const DOCS_REGISTRY: readonly DocsPageEntry[] = [
   {
     path: "/help/display-nodes",
     title: msg`Display nodes`,
-    summary: msg`Multiview's own playout endpoints: enrolled, frame-accurate wall heads on small computers.`,
+    summary: msg`Conspect's own playout endpoints: enrolled, frame-accurate wall heads on small computers.`,
     keywords: ["display node", "wall", "head", "enrollment", "playout", "sbc"],
     sections: [
       {
@@ -572,7 +572,7 @@ export const DOCS_REGISTRY: readonly DocsPageEntry[] = [
   {
     path: "/help/concepts/resilience",
     title: msg`Resilience & the tile lifecycle`,
-    summary: msg`The LIVE / STALE / RECONNECTING / NO SIGNAL ladder, last-good frames, and why output never stalls.`,
+    summary: msg`The LIVE / STALE / RECONNECTING / NO SIGNAL ladder, last-good frames, and the continuous-output design objective.`,
     keywords: ["resilience", "failure", "signal loss", "stale", "no signal", "badge"],
     sections: [
       {
@@ -620,7 +620,7 @@ export const DOCS_REGISTRY: readonly DocsPageEntry[] = [
   {
     path: "/help/concepts/glossary",
     title: msg`Glossary`,
-    summary: msg`Broadcast and streaming terms used across Multiview, alphabetized and searchable.`,
+    summary: msg`Broadcast and streaming terms used across Conspect, alphabetized and searchable.`,
     keywords: ["glossary", "terms", "definitions", "dictionary"],
     sections: [
       {

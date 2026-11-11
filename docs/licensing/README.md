@@ -1,9 +1,36 @@
-# Multiview licensing — source-available non-commercial
+# Conspect licensing — source-available, limited free use
 
-> **Status: ADOPTED for this branch (pending external legal review).** The operative license is the
-> repo-root [`LICENSE`](../../LICENSE) (final, Version 1.0) with [`LICENSE-COMMERCIAL.md`](../../LICENSE-COMMERCIAL.md)
-> as the commercial pointer. Treat the text as the live license, not a draft. The operator is having
-> it reviewed by counsel separately; this package is the research/justification record behind it.
+## Current policy — Version 2.0
+
+The operative [license](../../LICENSE) is Version 2.0. The original rollout record
+below describes Version 1.0 and is historical where it differs from this policy.
+Counsel review remains separate; engineering review is not legal sign-off.
+
+- Free use is **personal, home, hobby and learning use**, plus the express First
+  Nations Owned Broadcaster, Community Broadcaster and non-monetized Content Creator
+  exceptions. Creators must have fewer than 55,000 aggregate audience members.
+- **Religious use is never eligible**, including solo religious creators, regardless
+  of size, charitable status or income.
+- **Any monetization of content made in whole or part with Conspect requires paid
+  licensing**, including ads, sponsored posts, subscriptions, affiliate income,
+  content-linked tips/donations, and free goods or services supplied for promotion.
+  No free exception overrides this rule; the old community sponsorship allowance
+  is not a monetization allowance under Version 2.0.
+- **Paid and metered features are excluded** from free use. Free use has **no
+  warranty**, including fitness for use, subject to non-excludable legal rights.
+- Source access permits private study and authorized use, not general copying,
+  modification, redistribution or derivative reproduction. Asking an AI agent to
+  reproduce Conspect from its code violates the license outside express grants.
+  Third-party rights, mandatory legal rights, and independent implementations of
+  general ideas remain unaffected.
+- Earlier valid grants for earlier copies are not retroactively revoked.
+
+## Historical Version 1.0 rollout record (not current eligibility guidance)
+
+> **Historical status:** Version 1.0 was adopted on the original branch, pending
+> external legal review. The repo-root license now contains Version 2.0; the original
+> Version 1.0 is available in Git history. This record does not describe current
+> eligibility, modification or distribution rights.
 >
 > A clear license in place is deliberate — it prevents the repo from ever sitting with **no** license
 > during the transition off `MIT OR Apache-2.0`.
@@ -12,12 +39,12 @@
 
 | File | What |
 |---|---|
-| [`../../LICENSE`](../../LICENSE) | **The license** (final, Version 1.0, PolyForm-Noncommercial-derived) — commercial definition, the three free exceptions, the use-trigger and licensor-reservation clauses. Aperim Pty Ltd (ABN 46 150 699 737), NSW law. |
+| [`../../LICENSE`](../../LICENSE) | **Current license: Version 2.0** (the historical Version 1.0 was PolyForm-Noncommercial-derived) — commercial definition, the three free exceptions, the use-trigger and licensor-reservation clauses. Aperim Pty Ltd (ABN 46 150 699 737), NSW law. |
 | [`../../LICENSE-COMMERCIAL.md`](../../LICENSE-COMMERCIAL.md) | Commercial-license pointer (contact, OEM/appliance tier, codec/NDI notes; native Dante is NOT supported — AES67/ST 2110-30 is the open Dante interop path). |
 | [`relicense-advisory.md`](relicense-advisory.md) | The full legal/licensing advisory — feasibility, base instrument, the three exceptions, the GPL crux, tooling, the exact repo-change checklist, enforcement & trademark, open decisions. Multi-agent researched + adversarially reviewed. |
 | [`build-and-distribution.md`](build-and-distribution.md) | Engineering companion: the **public-vs-private build/distribution matrix** (codecs / NDI; native Dante is not a planned feature, AES67/ST 2110-30 is public), LGPL container hygiene, and the **CI fan-out workstream** to generate & publish distinct public/non-public artifacts. |
 
-## TL;DR
+## Historical Version 1.0 summary (not current eligibility)
 
 A **dual-license**: public code under the **source-available, non-commercial** `LICENSE` (free home
 use; three free carve-outs); a **separately-sold commercial license** for everyone else (business,
@@ -29,13 +56,14 @@ first public tag; (3) the **`gpl-codecs` (x264/x265) GPL build is hard-incompati
 non-commercial license and must never ship in a distributed artifact; (4) counsel reviews the bespoke
 definitions. And: it is **source-available, not "open source"** (fails OSD §§5–6 / FSF Freedom 0).
 
-## Operator refinements baked into the LICENSE
+## Historical operator refinements in Version 1.0 (not Version 2.0 grants)
 
 1. **Use — not just modification/distribution — is the trigger.** Running the software *as supplied or
    as modified, obtained directly or from a fork*, commercially is itself the licensed (paid) act
    (`LICENSE` §4).
-2. **Fork/derivative reach.** A fork or derivative is licensed to its recipients only on the same
-   terms; commercial use of it (or of the unmodified software) is Commercial Use (`LICENSE` §4).
+2. **Historical fork/derivative reach.** Version 1.0 allowed recipients to receive
+   forks on those same terms. Version 2.0 instead requires separate written
+   permission for modification and distribution; this historical rule grants none.
    *(Honest boundary: copyright reaches copying/derivatives, not abstract functionality — a clean-room
    reimplementation isn't reachable; trademark is the complementary lever. Advisory §9.)*
 3. **Aperim is the sole licensor and is not bound by its own license** — explicit Reservation of the
@@ -67,8 +95,9 @@ workstreams follow (they touch many files and partly need coordination with othe
 - **Commercial price/tiers** (incl. OEM/appliance tier; evaluation window).
 - **Trademark name** — coin a distinctive product name under the **Aperim** house mark ("Multiview"/
   "multiviewer" is generic → a bare word mark is likely refused/weak).
-- **Optional secondary revenue gate** on the Content Creator Exception (omitted from `LICENSE` v1.0 for
-  cleanliness; counsel can add a USD threshold if wanted).
+- **Historical Version 1.0 question, now resolved:** the former optional revenue
+  gate is superseded by Version 2.0's mandatory no-monetization rule. There is no
+  minimum income threshold; promotional non-cash benefits also count.
 - **Bare-license vs contract** characterisation (affects the infringement remedy — for counsel).
 - **CLA timing** — live before the first external PR.
 - **crates.io** — recommend keep `publish = false`.

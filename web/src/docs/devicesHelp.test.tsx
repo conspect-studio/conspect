@@ -58,7 +58,7 @@ describe('devices help copy doctrine', () => {
     expect(text).toMatch(/supports zowiebox/i);
     expect(text).not.toMatch(/official/i);
     // Program continuity is stated in the help, not only in the app.
-    expect(text).toMatch(/program output/i);
+    expect(text).toMatch(/Conspect is designed to isolate program-output timing from managed-device failures/i);
   });
 
   it('/help/devices/adopt states the untrusted-discovery doctrine', async () => {

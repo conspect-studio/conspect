@@ -1,6 +1,7 @@
-# Multiview — Architecture Overview
+<a id="multiview--architecture-overview"></a>
+# Conspect — Architecture Overview
 
-> The front door to the Multiview architecture. This page tells the end-to-end story, draws the
+> The front door to the Conspect architecture. This page tells the end-to-end story, draws the
 > master component diagram, splits the **data plane** from the **control plane**, summarizes the
 > canonical **invariants**, maps the **crates**, and points you to the deep research briefs and ADRs.
 >
@@ -10,9 +11,11 @@
 
 ---
 
-## 1. What Multiview is
+<a id="1-what-multiview-is"></a>
+## 1. What Conspect is
 
-**Multiview** is an efficient, hardware-accelerated, Rust live video multiview generator. It:
+**Conspect** is a hardware-accelerated Rust platform for live-media production, routing and
+monitoring. Multiview composition is one capability within that broader scope. Its media pipeline:
 
 1. **Ingests** many live sources — RTSP, HLS/M3U, MPEG-TS, SRT, RTMP, NDI, file, and first-class
    in-process synthetic sources (colour `bars`, `solid` slates, full-frame `clock`s).
@@ -22,7 +25,8 @@
 It is a **hybrid engine**: FFmpeg/libav handles demux/decode/encode (where libav is strongest), while a
 **custom Rust + GPU-native compositor** and a **custom serving/output stage** are the project's
 differentiators. It targets **commodity hardware** (entry GPUs, Intel iGPUs, AMD APUs, base Apple
-silicon, low-RAM boxes) and guarantees **bulletproof continuous output**. Platforms: **Linux**
+silicon, low-RAM boxes) and aims for **continuous output despite input failures** — a design goal,
+not a warranty. The internal output-clock invariant remains the engineering requirement. Platforms: **Linux**
 (NVIDIA via the Container Toolkit; Intel/AMD via VAAPI) and **macOS** (Apple Silicon + Intel, native).
 **No Windows.**
 

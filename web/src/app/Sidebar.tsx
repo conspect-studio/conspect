@@ -24,7 +24,7 @@ export function Sidebar({ onNavigate }: SidebarProps): JSX.Element {
   return (
     <nav aria-label={t`Primary`} className="flex h-full flex-col gap-1 p-3">
       <div className="px-2 pb-3 text-lg font-semibold tracking-tight">
-        <Trans>Multiview</Trans>
+        <Trans>Conspect</Trans>
       </div>
       <ul className="flex flex-col gap-1">
         {NAV_ITEMS.map(({ path, label, Icon }) => (

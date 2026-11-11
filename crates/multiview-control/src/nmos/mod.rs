@@ -256,7 +256,7 @@ fn authorize_receiver(
         path = "/x-nmos/node/v1.3/self",
         tag = "nmos",
         responses(
-            (status = 200, description = "The Multiview NMOS node resource.", body = crate::nmos::is04::Node),
+            (status = 200, description = "The Conspect NMOS node resource.", body = crate::nmos::is04::Node),
             (status = 401, description = "Missing or invalid credentials.", body = crate::problem::Problem),
             (status = 404, description = "No node resource configured.", body = crate::problem::Problem),
         ),

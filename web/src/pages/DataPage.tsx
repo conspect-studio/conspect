@@ -149,7 +149,7 @@ function HeartbeatPanel(): JSX.Element {
 
         <p className="rounded-md border bg-muted/40 p-3 text-sm text-muted-foreground">
           <Trans>
-            Multiview is source-available, so a source build can compile the
+            Conspect is source-available, so a source build can compile the
             heartbeat client out. We state that plainly: removing it does not grant
             a commercial right — the licence terms bind regardless of the binary.
             The official builds carry the heartbeat for the smooth claim and lease

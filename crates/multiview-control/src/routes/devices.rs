@@ -601,7 +601,7 @@ pub struct SetModeAccepted {
     /// realtime stream (`device.mode`).
     pub operation_id: String,
     /// The declared impact class: a device-side (`dev`) impact — the device
-    /// restarts its pipeline; Multiview program output is never interrupted.
+    /// restarts its pipeline; Conspect program output is never interrupted.
     pub impact: String,
     /// The human-readable impact statement declared before apply.
     pub detail: String,
@@ -612,7 +612,7 @@ pub struct SetModeAccepted {
 ///
 /// The device-side impact is **declared in the body before apply** (ADR-M009):
 /// the device restarts its pipeline; bound sources ride the tile ladder to
-/// `NO_SIGNAL` during the switch; no Multiview output is interrupted. The route
+/// `NO_SIGNAL` during the switch; no Conspect output is interrupted. The route
 /// mints the operation id, `202`s, and **dispatches** the convergence to the
 /// device's running driver poller (DEV-A4), which records the requested mode as
 /// its desired mode, runs `plan_mode_convergence` → `converge_mode`

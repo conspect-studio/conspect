@@ -1,19 +1,19 @@
-# Multiview — Canonical Conventions (Source of Truth)
+# Conspect — Canonical Conventions (Source of Truth)
 
-This document pins the **canonical** naming, structure, and invariants for the Multiview project.
+This document pins the **canonical** naming, structure, and invariants for the Conspect project.
 The deep design briefs in [`../research`](../research/) may use slightly varying names (they were
 written in parallel); **where they differ, THIS document wins**, and the Rust code is the ultimate
-source of truth. All other docs, the agent-instruction files, and the workspace must conform to this.
+source of truth for engineering behaviour. All other engineering docs, the agent-instruction files, and the workspace must conform to this. Licensing rights come only from the applicable operative license and separate agreements, not these conventions or the code.
 
 ---
 
 ## 1. Project identity
 
-- **Name:** Multiview — an efficient, hardware-accelerated, Rust live video multiview generator.
+- **Name:** Conspect — a Rust live-media production, routing and monitoring platform. Multiview composition is one capability, not the product's identity.
 - **Binary / daemon:** `multiview`
-- **Tagline:** Ingest many live sources → composite a templated multiview on the GPU → serve robustly. Built to run great on **commodity hardware**, with **bulletproof continuous output**.
+- **Tagline:** Ingest, compose, mix, route and monitor live media on commodity hardware. Fixed-cadence output and input isolation are engineering design goals, not warranties.
 - **Edition / toolchain:** Rust edition **2021**, pinned via `rust-toolchain.toml` (stable `1.99.1`; CI `dtolnay/rust-toolchain` pins the same version). MSRV documented in the README.
-- **License:** Multiview's own code is **source-available, non-commercial** — the **Multiview Source-Available Non-Commercial License, Version 1.0** (© Aperim Pty Ltd). Free for genuine personal/home/non-commercial use plus three free exceptions; all other (commercial) use needs a paid Commercial License. **Not open source / not free software.** See §7 for the FFmpeg/NDI/codec dependency-linking model.
+- **License:** Conspect's own code uses the **Conspect Source-Available Non-Commercial License, Version 2.0** (© Aperim Pty Ltd). **Not open source / not free software.** Free means personal, home, hobby and learning use plus the expressly limited exceptions; religious use and monetized content require paid licensing. Source access grants private study and authorized use, not general reproduction. See §7 and the operative [license](../../LICENSE).
 - **Platforms:** Linux (x86_64 + aarch64; NVIDIA via Container Toolkit, Intel/AMD via VAAPI) and macOS (Apple Silicon + Intel, native). **No Windows.**
 
 ---
@@ -85,7 +85,7 @@ Default features build a **pure-Rust, LGPL-clean, no-native-deps** check (CI gre
 - **Media engine:** `ffmpeg` (links libav for demux/decode/encode).
 - **RIST transport:** `rist` (Reliable Internet Stream Transport — VSF TR-06 — input + output; **off by default**; permissive/LGPL-clean: librist is BSD-2-Clause, see §7). Tier-0 single-link rides the FFmpeg `rist://` protocol ([ADR-0095](../decisions/ADR-0095.md)).
 - **RIST link statistics:** `rist-stats` (Tier-1, **off by default**; permissive/LGPL-clean). The `multiview-rist-sys` FFI leaf **runtime-loads** librist (`dlopen`, never linked/vendored at build time) and wires `rist_stats_callback_set` → telemetry metric series + the `rist.link.stats` realtime event + the `rist-link-loss` health warning. Required because FFmpeg's `rist://` protocol exposes **no** stats callback (it owns its librist context privately); the leaf-sized egress path is a direct-librist sender. Bonding remains the deferred Tier-2 piece on the same leaf ([ADR-0095](../decisions/ADR-0095.md)).
-- **Codecs licensing:** `gpl-codecs` (x264/x265 → makes the build GPL; **off by default**).
+- **Codecs licensing:** `gpl-codecs` adds GPL-covered x264/x265; **off by default**. Combined-work distribution entails GPL obligations, but this flag neither relicenses Conspect nor grants distribution permission (see §7).
 - **NDI:** `ndi` (proprietary SDK; **off by default**, runtime-loaded; see §7).
 - **Subtitles:** `libass`.
 - **Web/API:** `openapi` (default), `embed-web` (embed the SPA), `webrtc` (the pure WHEP/WHIP seams; native-free).
@@ -127,10 +127,10 @@ These are load-bearing; every doc and implementation must respect them (see the 
 
 ## 7. Licensing model (build profiles)
 
-- **Project code:** the **Multiview Source-Available Non-Commercial License, Version 1.0** (© Aperim Pty Ltd; see `LICENSE`) — source-available, **not** open source / free software. Free for genuine personal/home/non-commercial use plus three free exceptions (First Nations owned broadcasters; community broadcasters under USD $1M sponsorship/yr; content creators under 55,000 subscribers summed across all channels); all other (commercial) use — business, education, government, productization/appliance, streamers/creators — requires a paid Commercial License (`licensing@aperim.com`, see `LICENSE-COMMERCIAL.md`). This governs **Multiview's own code only**; the FFmpeg/NDI/codec build-profile obligations below are unchanged.
-- **Default build = LGPL-clean & redistributable:** FFmpeg linked LGPL; NVENC/NVDEC via `nv-codec-headers` (MIT) need neither `--enable-gpl` nor `--enable-nonfree`; **no** libnpp/x264/x265 in the default build (compositing/scaling done in-house).
+- **Project code:** the **Conspect Source-Available Non-Commercial License, Version 2.0** (© Aperim Pty Ltd; [LICENSE](../../LICENSE)) permits personal, home, hobby and learning use and express First Nations, Community Broadcaster and non-monetized creator exceptions (creators: fewer than 55,000 aggregate audience members). Religious use of any size and any monetization of Conspect-produced content require paid licensing, including ads, sponsorships and promotional gifts. Free use excludes paid/metered features and has no warranty of fitness, subject to non-excludable rights. Source study and necessary authorized-use copies are permitted, not general modification, redistribution or reproduction, including agent-generated copies. Earlier grants remain governed by their original terms. Contact `licensing@aperim.com`; see [commercial licensing](../../LICENSE-COMMERCIAL.md). Third-party rights are unchanged.
+- **Default build = LGPL-clean (not a grant to redistribute Conspect):** FFmpeg linked LGPL; NVENC/NVDEC via `nv-codec-headers` (MIT) need neither `--enable-gpl` nor `--enable-nonfree`; **no** libnpp/x264/x265 in the default build (compositing/scaling done in-house).
 - **Permissive transport libraries stay LGPL-clean:** `libsrt` (MPL-2.0) and **librist** (BSD-2-Clause) are LGPL-compatible external libraries; `--enable-libsrt`/`--enable-librist` force neither `--enable-gpl` nor `--enable-nonfree`, so SRT and RIST do **not** escalate the license. Their feature flags (`rist`; SRT via `ffmpeg`) are off-by-default *native-dependency* gates only, not license gates. (BSD-2-Clause + MPL-2.0 are on the `deny.toml` allow-list.)
-- **`gpl-codecs` feature:** pulls x264/x265 etc. → the resulting build is **GPL**. Opt-in only.
+- **`gpl-codecs` feature:** pulls GPL-covered x264/x265. Opt-in only. Distribution of a combined work requires satisfying GPL obligations and separate permission for Conspect's code; the feature flag does not relicense Conspect or grant distribution rights (LICENSE §9).
 - **NDI:** the NDI SDK is **proprietary** (royalty-free, attribution required, redistribution restricted). It is **never vendored**; the `ndi` feature uses a runtime dynamic-load path, and the SDK/runtime is the user's responsibility. Document the EULA + attribution. NDI I/O is additionally **gated at runtime**: it stays inert until the operator explicitly confirms NDI license acceptance (`[system.ndi] accept_license`, audited), so even `ndi`-enabled builds carry no NDI obligations until a user accepts. Required trademark attribution is always preserved. See [io/ndi.md §7.5](../io/ndi.md).
 - CI uses `cargo-deny` (`deny.toml`) to gate licenses and advisories.
 
