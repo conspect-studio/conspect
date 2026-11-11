@@ -2306,6 +2306,16 @@ fn validate_device_source(
     if device.trim().is_empty() || device.contains(':') || device.contains('\0') {
         return Err(bad("must be a non-empty index or name without ':'"));
     }
+    // avfoundation reads a leading "none" as "no video device", and its index
+    // range continues past the cameras into screen capture ("Capture screen N").
+    // A device source is a camera/capture card: refuse both.
+    if device.eq_ignore_ascii_case("none")
+        || device.to_ascii_lowercase().starts_with("capture screen")
+    {
+        return Err(bad(
+            "must name a camera or capture card, not \"none\" or a screen",
+        ));
+    }
     if let Some(size) = size {
         let ok = size.split_once('x').is_some_and(|(w, h)| {
             w.parse::<u32>().is_ok_and(|w| (16..=16384).contains(&w))
@@ -2317,9 +2327,10 @@ fn validate_device_source(
     }
     if let Some(fps) = fps {
         let ok = match fps.split_once('/') {
-            Some((n, d)) => {
-                n.parse::<u32>().is_ok_and(|n| n > 0) && d.parse::<u32>().is_ok_and(|d| d > 0)
-            }
+            Some((n, d)) => match (n.parse::<u32>(), d.parse::<u32>()) {
+                (Ok(n), Ok(d)) if n > 0 && d > 0 => n / d <= 1000,
+                _ => false,
+            },
             None => fps.parse::<u32>().is_ok_and(|n| (1..=1000).contains(&n)),
         };
         if !ok {

@@ -34,9 +34,8 @@ device = "0"                   # backend index or exact device name
   exists and is tested; libavdevice's avfoundation/dshow demuxers are LGPL and in the pinned build.
   A native binding (zero-copy CVPixelBuffer → IOSurface → Metal) is a later optimisation, behind
   the same config.
-- **Open is bounded:** the device open runs with the existing interrupt deadline (`rw_timeout`),
-  because a TCC prompt or a busy device can block indefinitely. A blocked open never reaches the
-  data plane.
+- **Open is bounded:** see "Open is truly bounded" below. A blocked open never reaches the data
+  plane.
 - **Permission model (macOS):** camera and microphone access is granted per *responsible* app by
   TCC. A process started from SSH or a daemon without a GUI session is always denied. Deployment
   runs the engine as a LaunchAgent in the user's GUI session with a stable code signature, so the
@@ -44,8 +43,29 @@ device = "0"                   # backend index or exact device name
   silent black tile.
 - **Device naming:** indexes are unstable across reboots/plugging; exact names are accepted and
   preferred. `multiview devices` (later) lists them.
-- **Feature gate:** `local-capture` (off by default; on in the `apple` preset). Without it, a
-  `device` source fails validation with a clear message.
+- **Availability:** no extra Cargo feature. A `device` source needs the backend's libavdevice
+  format in the linked FFmpeg (the pinned `apple` / `windows` profiles carry `avfoundation` /
+  `dshow`); when it is absent, the open fails with "input format is not available in the linked
+  FFmpeg" and the tile stays NO SIGNAL — never a crash.
+
+## Authorization
+
+A `device` source opens this host's cameras and capture cards — the same trust class as a `file`
+source reading a host path, and more sensitive (people in the room). The control API therefore
+**refuses** `kind = "device"`: device sources are configured in the config file only, by whoever
+already controls the host. Validation also refuses avfoundation's non-camera selectors — `none`
+("no video device") and `Capture screen N` (screen capture, gated by a separate OS grant) — so a
+device source can only ever name a camera or capture card. "Device" here means a *local capture
+device*; it is unrelated to the control plane's tally/sync/NMOS **device** resources.
+
+## Open is truly bounded
+
+libavdevice's avfoundation/dshow demuxers are `AVFMT_NOFILE`: they ignore `rw_timeout` and never
+poll the interrupt callback during open. The open therefore runs on a helper thread and the ingest
+thread waits at most 10 s; a stuck open is abandoned (the helper is reaped at exit) and the
+supervisor retries, with at most one blocked open per device so a wedged device cannot accumulate
+threads. While reading, a device that delivers no frame for 5 s is treated as failed so the
+reconnect path runs (the demuxers report "no frame yet" as EAGAIN forever).
 
 ## Evidence required
 

@@ -12844,11 +12844,6 @@ fn ingest_plan_for(
             if let Some(pf) = pixel_format {
                 options.push(("pixel_format".to_owned(), pf.clone()));
             }
-            // Bound the open: a permission prompt or a busy device can block.
-            options.push((
-                "rw_timeout".to_owned(),
-                INGEST_RW_TIMEOUT.as_micros().to_string(),
-            ));
             (
                 SourceLocation::Device {
                     format: backend.input_format(),
@@ -13622,6 +13617,93 @@ fn http_headers_for(kind: &SourceKind) -> HttpHeaders {
             referer: referrer.clone(),
         },
         _ => HttpHeaders::default(),
+    }
+}
+
+/// How long a capture device may deliver no frame before its read is treated as
+/// a failure (so the reconnect supervisor reopens it).
+const DEVICE_NO_FRAME_DEADLINE: Duration = Duration::from_secs(5);
+
+/// The longest a capture-device open may block before the attempt is abandoned.
+/// libavdevice's avfoundation/dshow demuxers are `AVFMT_NOFILE`: they neither
+/// poll the interrupt callback nor honour `rw_timeout` during open, and a
+/// permission prompt or a busy device can block indefinitely.
+const DEVICE_OPEN_DEADLINE: Duration = Duration::from_secs(10);
+
+/// Open a capture device with a real deadline: the open runs on a helper
+/// thread and this (ingest) thread waits at most [`DEVICE_OPEN_DEADLINE`]. A
+/// stuck open is abandoned — its helper is detached and reaped at process
+/// exit, owning only its own libav context — so the source fails visibly and
+/// the reconnect supervisor retries with backoff. At most one blocked open per
+/// device is outstanding: a new attempt is refused until the previous helper
+/// finishes, so a wedged device cannot accumulate threads.
+fn open_device_bounded(
+    format: &'static str,
+    device: &str,
+    options: &[(String, String)],
+) -> Result<ffmpeg::format::context::Input, String> {
+    let owned_device = device.to_owned();
+    let owned_options = options.to_vec();
+    open_device_bounded_with(device, DEVICE_OPEN_DEADLINE, move || {
+        multiview_ffmpeg::open_device_input(format, &owned_device, &owned_options).map_err(|e| {
+            // macOS TCC / Windows privacy denials surface as an open error;
+            // say so instead of a bare libav code.
+            format!(
+                "{e} (a camera needs the OS camera permission for this process: \
+                 run it in the user's desktop session)"
+            )
+        })
+    })
+}
+
+/// Device keys with an open still in flight (at most one per device).
+static DEVICE_OPENS_IN_FLIGHT: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
+/// [`open_device_bounded`] with an injectable opener and deadline (tests).
+fn open_device_bounded_with<T: Send + 'static>(
+    device: &str,
+    deadline: Duration,
+    open: impl FnOnce() -> Result<T, String> + Send + 'static,
+) -> Result<T, String> {
+    let lock = || {
+        DEVICE_OPENS_IN_FLIGHT
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    };
+    {
+        let mut in_flight = lock();
+        if in_flight.iter().any(|d| d == device) {
+            return Err(format!(
+                "capture device {device:?}: a previous open is still blocked; not stacking another"
+            ));
+        }
+        in_flight.push(device.to_owned());
+    }
+    let release = |key: &str| lock().retain(|d| d != key);
+    let (tx, rx) = std::sync::mpsc::sync_channel(1);
+    let key = device.to_owned();
+    let spawned = std::thread::Builder::new()
+        .name("multiview-device-open".to_owned())
+        .spawn(move || {
+            let result = open();
+            DEVICE_OPENS_IN_FLIGHT
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .retain(|d| d != &key);
+            // If the waiter gave up, the send fails and the opened context is
+            // dropped (closed) here on the helper thread.
+            let _ = tx.send(result);
+        });
+    if let Err(e) = spawned {
+        release(device);
+        return Err(format!("spawn device open thread: {e}"));
+    }
+    match rx.recv_timeout(deadline) {
+        Ok(result) => result,
+        Err(_) => Err(format!(
+            "capture device {device:?} did not open within {deadline:?} \
+             (permission prompt, busy or wedged device); retrying"
+        )),
     }
 }
 
@@ -15245,14 +15327,7 @@ fn open_and_stream(
             options,
         } => {
             drop(opts);
-            multiview_ffmpeg::open_device_input(format, device, options).map_err(|e| {
-                // macOS TCC / Windows privacy denials surface as an open error;
-                // say so instead of a bare libav code.
-                format!(
-                    "{e} (a camera needs the OS camera permission for this process: \
-                     run it in the user's desktop session)"
-                )
-            })?
+            open_device_bounded(format, device, options)?
         }
         SourceLocation::Url(u) => {
             // HLS WebVTT-rendition isolation (ADR-T011, FFmpeg-8.x-robust): if this
@@ -15593,16 +15668,26 @@ fn open_and_stream(
     // Capture devices are non-blocking: EAGAIN is "no frame yet", never an
     // error (docs/architecture/local-capture-devices.md).
     let is_device = matches!(plan.location, SourceLocation::Device { .. });
+    let mut last_device_frame = Instant::now();
     let reader = spawn_packet_reader(&plan.id, READ_AHEAD_PACKETS, move || {
         let mut packet = ffmpeg::codec::packet::Packet::empty();
         match packet.read(&mut input) {
             Err(ffmpeg::Error::Other { errno })
                 if is_device && errno == ffmpeg::util::error::EAGAIN =>
             {
+                // A device that stops delivering frames (unplugged, revoked,
+                // asleep) must not idle here forever: past the no-frame
+                // deadline it is an error and the reconnect supervisor runs.
+                if last_device_frame.elapsed() >= DEVICE_NO_FRAME_DEADLINE {
+                    return Some(ReadItem::Error(format!(
+                        "capture device delivered no frame for {DEVICE_NO_FRAME_DEADLINE:?}"
+                    )));
+                }
                 std::thread::sleep(Duration::from_millis(2));
                 None
             }
             Ok(()) if packet.stream() == stream_index || Some(packet.stream()) == sub_index => {
+                last_device_frame = Instant::now();
                 if packet.stream() == stream_index {
                     video_fence = video_fence.saturating_add(1);
                 }
@@ -24838,5 +24923,66 @@ segment_ms = 1000
                 "a cutover after packet {cut} must not drop, repeat or reorder a frame"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod device_open_tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+    use super::open_device_bounded_with;
+    use std::sync::mpsc;
+    use std::time::{Duration, Instant};
+
+    /// Chaos (design note local-capture-devices.md): an open that blocks (a
+    /// permission prompt, a wedged device) is abandoned at the deadline, and a
+    /// second attempt while the first is still blocked is refused instead of
+    /// stacking another thread. Once the blocked open finishes, the device can
+    /// be opened again.
+    #[test]
+    fn a_blocking_device_open_times_out_and_never_stacks() {
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let started = Instant::now();
+        let first = open_device_bounded_with("chaos-dev", Duration::from_millis(100), move || {
+            let _ = release_rx.recv(); // blocks until released
+            Ok::<u32, String>(1)
+        });
+        assert!(first.is_err(), "a blocked open must time out");
+        assert!(started.elapsed() < Duration::from_secs(2), "bounded wait");
+
+        let second = open_device_bounded_with("chaos-dev", Duration::from_millis(100), || {
+            Ok::<u32, String>(2)
+        });
+        assert!(
+            second.unwrap_err().contains("still blocked"),
+            "no second helper while the first is blocked"
+        );
+
+        release_tx.send(()).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let third = loop {
+            match open_device_bounded_with("chaos-dev", Duration::from_secs(1), || {
+                Ok::<u32, String>(3)
+            }) {
+                Err(e) if e.contains("still blocked") && Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                other => break other,
+            }
+        };
+        assert_eq!(third, Ok(3), "the device reopens once the stuck open ends");
+    }
+
+    #[test]
+    fn a_healthy_device_open_returns_its_result_and_errors_pass_through() {
+        assert_eq!(
+            open_device_bounded_with("ok-dev", Duration::from_secs(1), || Ok::<u32, String>(7)),
+            Ok(7)
+        );
+        assert_eq!(
+            open_device_bounded_with("bad-dev", Duration::from_secs(1), || {
+                Err::<u32, String>("denied".to_owned())
+            }),
+            Err("denied".to_owned())
+        );
     }
 }
