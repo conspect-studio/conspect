@@ -49,6 +49,13 @@ impl Coordinator {
                         // one-second cadence keeps actual renewal requests within five seconds.
                         due = Instant::now() + Duration::from_secs(1);
                         if lease.renew(&*transport).is_err() {
+                            if let Ok(l) = lease.publisher_lease() {
+                                let (cause, status) = l.last_failure();
+                                eprintln!(
+                                    "lease renew failed at {}: {cause}; last lease HTTP status {status}",
+                                    crate::wall_ms()
+                                );
+                            }
                             denied.store(true, Ordering::Release);
                             *deadline.lock().unwrap() = None;
                             break;
@@ -59,6 +66,14 @@ impl Coordinator {
                             break;
                         }
                         *shared = lease.deadline();
+                        if shared.is_none() {
+                            // Renew succeeded but the local permit is closed: the
+                            // answer's notBeforeMs/leaseExpiresAtMs bound sealing.
+                            eprintln!(
+                                "lease renew ok at {} but the local permit is closed (notBefore/expiry bound)",
+                                crate::wall_ms()
+                            );
+                        }
                     }
                     thread::park_timeout(Duration::from_millis(10));
                 }
@@ -161,8 +176,13 @@ impl Coordinator {
             workers.push(thread::spawn(move || {
                 let mut flushed = false;
                 while !stop.load(Ordering::Acquire) {
-                    if deadline.lock().unwrap().is_none_or(|d| Instant::now() >= d) {
-                        denied.store(true, Ordering::Release);
+                    if deadline.lock().unwrap().is_none_or(|d| Instant::now() >= d)
+                        && !denied.swap(true, Ordering::AcqRel)
+                    {
+                        eprintln!(
+                            "local lease deadline reached at {} without a successful renew",
+                            crate::wall_ms()
+                        );
                     }
                     let fail = denied.load(Ordering::Acquire);
                     if fail {

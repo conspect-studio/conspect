@@ -535,6 +535,8 @@ struct LeaseEndpoint {
     clock: LeaseClock,
     uncertainty_ms: u64,
     scheduler_margin_ms: u64,
+    /// HTTP status of the last lease answer (0 = no answer: transport error/timeout).
+    last_status: std::sync::atomic::AtomicU16,
 }
 
 /// The exclusive publisher lease client and its local [`LeaseFence`].
@@ -550,6 +552,9 @@ pub struct PublisherLease {
     state: Mutex<LeaseState>,
     /// Serializes acquire/renew/release so wire calls cannot interleave.
     calls: Mutex<()>,
+    /// Static, non-secret classification of the last failed lease call, for
+    /// operator diagnostics only. Never carries a token, body or status text.
+    last_failure: Mutex<&'static str>,
 }
 
 impl PublisherLease {
@@ -595,9 +600,11 @@ impl PublisherLease {
                 clock,
                 uncertainty_ms: DEFAULT_CLOCK_UNCERTAINTY_MS,
                 scheduler_margin_ms: DEFAULT_SCHEDULER_MARGIN_MS,
+                last_status: std::sync::atomic::AtomicU16::new(0),
             }),
             state: Mutex::new(LeaseState::default()),
             calls: Mutex::new(()),
+            last_failure: Mutex::new(""),
         })
     }
 
@@ -720,6 +727,37 @@ impl PublisherLease {
     /// The wire call plus the state transition. Serialized by `calls`, which is
     /// the only lock held across I/O, and only from a control-plane thread.
     fn refresh(&self, renewing: bool) -> Result<u32> {
+        let result = self.refresh_inner(renewing);
+        if let Err(error) = &result {
+            *lock(&self.last_failure) = match error {
+                Error::Denied => {
+                    "denied (non-success status, transport error/timeout, or local latch)"
+                }
+                Error::Expired => "answer expired on arrival (late or slow answer)",
+                Error::Replay => "generation went backwards",
+                Error::Invalid => "malformed answer",
+                Error::Capacity => "oversized answer",
+                Error::Crypto => "local randomness/crypto failure",
+                Error::GenerationOverflow => "generation overflow",
+            };
+        }
+        result
+    }
+
+    /// The static classification of the last failed acquire/renew, if any, and
+    /// the HTTP status of the last lease answer (0 = none: transport error or
+    /// timeout). Non-secret: no token, body or header is ever retained here.
+    #[must_use]
+    pub fn last_failure(&self) -> (&'static str, u16) {
+        (
+            *lock(&self.last_failure),
+            self.endpoint
+                .last_status
+                .load(std::sync::atomic::Ordering::Relaxed),
+        )
+    }
+
+    fn refresh_inner(&self, renewing: bool) -> Result<u32> {
         let _serialized = lock(&self.calls);
         // What this call renews, and its body, computed under a short lock.
         let (slot, body, latch) = {
@@ -1012,7 +1050,14 @@ fn send_lease(
         body,
         lease_headers: None,
     };
+    endpoint
+        .last_status
+        .store(0, std::sync::atomic::Ordering::Relaxed);
     let response = endpoint.transport.send(request, &endpoint.credential)?;
+    // Status code only (never body or headers), for operator diagnostics.
+    endpoint
+        .last_status
+        .store(response.status, std::sync::atomic::Ordering::Relaxed);
     // A lease answer is no-store secret material and is bounded like any other.
     if response.body.len() > MAX_RESPONSE_BYTES {
         return Err(Error::Capacity);
