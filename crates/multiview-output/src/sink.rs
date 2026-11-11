@@ -3625,8 +3625,7 @@ mod tests {
             assert_eq!(
                 emitted.len(),
                 usize::try_from(TICKS).unwrap(),
-                "{codec}: every submitted tick must be emitted exactly once (delayed emission                  is fine; loss or duplication is not), got {:?}",
-                emitted
+                "{codec}: every submitted tick must be emitted exactly once (delayed emission                  is fine; loss or duplication is not), got {emitted:?}"
             );
             for (index, (pts, dts)) in emitted.iter().enumerate() {
                 let expected = i64::try_from(index).unwrap();
