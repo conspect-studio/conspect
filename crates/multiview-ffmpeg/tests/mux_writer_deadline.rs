@@ -23,10 +23,10 @@ fn new_muxer(stop: &Arc<AtomicBool>, writer: PacketWriter) -> Muxer {
 
 const SLOW: Duration = Duration::from_millis(40);
 
-/// Hold the calling thread for `d`, exactly. `thread::sleep` may oversleep a
-/// 40 ms request by 100+ ms on a shared macOS VM (timer coalescing, #265),
-/// which would make the writer slower than `SLOW` and the bounds below
-/// meaningless; a spin on the monotonic clock is only delayed by preemption.
+/// Hold the calling thread for at least `d` of wall-clock time. `thread::sleep`
+/// may oversleep a 40 ms request by 100+ ms on a shared macOS VM (timer
+/// coalescing, #265), making the writer far slower than `SLOW`; a spin on the
+/// monotonic clock overshoots only when the thread is preempted.
 fn busy_for(d: Duration) {
     let until = Instant::now() + d;
     while Instant::now() < until {
