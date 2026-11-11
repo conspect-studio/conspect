@@ -24,6 +24,77 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 type Result<T> = std::result::Result<T, &'static str>;
+/// An authenticated-encrypted object whose epoch grant is not accepted yet.
+struct Parked {
+    wire: Vec<u8>,
+    id: conspect_media_crypto::ObjectId,
+    track: usize,
+    n: u64,
+}
+fn accept_plain(
+    received: &mut [Vec<u8>],
+    track: usize,
+    n: u64,
+    plain: Vec<u8>,
+    output: &mut Output,
+) -> Result<()> {
+    let frame = hang::container::Frame::decode(Bytes::from(plain)).map_err(|_| "hang decode")?;
+    received[track].extend_from_slice(&frame.payload);
+    output.enqueue_encoded(n);
+    Ok(())
+}
+/// A parked object can never open once its epoch is behind the receiver's, its
+/// grant lapsed without a successor, or it is too old for the replay window.
+fn wire_epoch(wire: &[u8]) -> Option<u64> {
+    Some(u64::from_be_bytes(wire.get(52..60)?.try_into().ok()?))
+}
+fn stale(receiver: &ReceiverRuntime, p: &Parked, now_ms: u64) -> bool {
+    let Some(epoch) = wire_epoch(&p.wire) else {
+        return false;
+    };
+    epoch < receiver.epoch()
+        || (epoch == receiver.epoch() && receiver.grant_lapsed(now_ms))
+        || now_ms.saturating_sub(p.id.captured_ms) >= 4500
+}
+/// Open parked objects in order. Returns an error only for a denied receiver or a
+/// non-timing open failure; stale objects are dropped and counted.
+fn drain_parked(
+    slot: &Mutex<(ReceiverRuntime, Output)>,
+    queue: &mut conspect_native_exchange_runtime::media::ParkQueue<Parked>,
+    received: &mut [Vec<u8>],
+) -> Result<()> {
+    let mut slot = slot.lock().map_err(|_| "receiver lock")?;
+    let (receiver, output) = &mut *slot;
+    let mut items = queue.take_all().into_iter();
+    while let Some(p) = items.next() {
+        let at = now();
+        if stale(receiver, &p, at) {
+            queue.stale += 1;
+            continue;
+        }
+        let Some(epoch) = wire_epoch(&p.wire) else {
+            return Err("decrypt");
+        };
+        if epoch > receiver.epoch() {
+            // Grant still not accepted: keep this and everything after it, in order.
+            queue.requeue(p);
+            for rest in items.by_ref() {
+                queue.requeue(rest);
+            }
+            return Ok(());
+        }
+        match receiver.open(&p.wire, &p.id, at, output) {
+            Ok(plain) => {
+                queue.drained += 1;
+                accept_plain(received, p.track, p.n, plain, output)?
+            }
+            Err(_) if receiver.is_denied() => return Err("decrypt denied"),
+            Err(_) if stale(receiver, &p, now()) => queue.stale += 1,
+            Err(_) => return Err("decrypt"),
+        }
+    }
+    Ok(())
+}
 fn now() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -66,8 +137,13 @@ fn copy(tx: &mut TcpStream, rx: &mut TcpStream, b: &[u8]) -> Result<Vec<u8>> {
     Ok(out)
 }
 fn main() {
+    conspect_media_crypto::authority_http::status_log_start();
     if let Err(e) = run() {
         eprintln!("{e}");
+        // Redacted exchange record: method, route template, status, ms since start.
+        for line in conspect_media_crypto::authority_http::status_sequence() {
+            eprintln!("http {line}");
+        }
         std::process::exit(1)
     }
 }
@@ -209,7 +285,15 @@ fn connected(
     let b = bindings[0];
     let (publisher_binding, _, publisher_instance) = state.publisher_context();
     let contributor = publisher_binding.org;
-    let scenario_end = Instant::now() + Duration::from_secs(90);
+    // Derived from the booking row, not a fixed window: A's paid window plus the
+    // post-boundary evidence period and slack.
+    let scenario_end = Instant::now()
+        + Duration::from_secs(90)
+        + Duration::from_millis(if scenario == "credit-cutoff" {
+            state.booking_expiry()?.saturating_sub(now())
+        } else {
+            0
+        });
     let mut publisher = Publisher::from_authority(
         provider.as_ref(),
         &mut guard,
@@ -312,6 +396,11 @@ fn connected(
     let mut b_at_expiry = [0; 6];
     let mut cutoff_at = 0;
     let mut accepted = [0u64; 2];
+    let mut late_drops = 0u64;
+    let mut sealing_skipped = 0u64;
+    let mut parked: Vec<conspect_native_exchange_runtime::media::ParkQueue<Parked>> = (0..2)
+        .map(|_| conspect_native_exchange_runtime::media::ParkQueue::new(256))
+        .collect();
     let mut captured = now().saturating_sub(1000).max((now() / 5000) * 5000);
     for phase in 0..if scenario == "credit-cutoff" {
         600
@@ -387,7 +476,14 @@ fn connected(
                         let mut slot = slot.lock().map_err(|_| "receiver lock")?;
                         let (receiver, output) = &mut *slot;
                         let permitted = receiver.fence(now(), output).is_ok();
-                        if !(scenario == "credit-cutoff" && i == 0) {
+                        if scenario == "credit-cutoff" && i == 1 {
+                            // A late grant is not fatal while the booking is live and the
+                            // lease valid: B's objects park until it lands. Only a sticky
+                            // deny (authoritative refusal) is fatal.
+                            if receiver.is_denied() {
+                                return Err("receiver B grant denied");
+                            }
+                        } else if !(scenario == "credit-cutoff" && i == 0) {
                             ready &= permitted;
                         }
                     }
@@ -414,6 +510,12 @@ fn connected(
                 split..f.packets.len()
             };
             for n in range {
+                if scenario == "credit-cutoff" && publisher.bound_scope().epoch != now() / 5000 {
+                    // The range outlasted its epoch on a loaded host: never seal across
+                    // the boundary. The next phase re-admits into the new epoch.
+                    sealing_skipped += 1;
+                    break;
+                }
                 let id = publish(
                     &mut publisher,
                     &mut tracks[track],
@@ -444,7 +546,43 @@ fn connected(
                     let wire = copy(tx, rx, &frame.payload)?;
                     let mut slot = slots[i].lock().map_err(|_| "receiver lock")?;
                     let (receiver, output) = &mut *slot;
+                    let object_epoch = wire_epoch(&wire).ok_or("decrypt")?;
+                    let denied_here = (cutoff && (i == 0 || scenario == "withdraw"))
+                        || (exhausted && i == 0)
+                        || (scenario == "credit-cutoff"
+                            && i == 0
+                            && now() >= state.booking_expiry()?);
+                    if !denied_here
+                        && !receiver.is_denied()
+                        && (!parked[i].is_empty()
+                            || object_epoch > receiver.epoch()
+                            || receiver.grant_lapsed(now()))
+                    {
+                        // Grant for this epoch not accepted yet: hold in order, bounded.
+                        parked[i].park(Parked {
+                            wire,
+                            id: id.clone(),
+                            track,
+                            n: n as u64,
+                        });
+                        continue;
+                    }
                     let plain = receiver.open(&wire, &id, now(), output);
+                    if matches!(plain, Err(conspect_media_crypto::Error::Expired))
+                        && !denied_here
+                        && !receiver.is_denied()
+                        && receiver.grant_lapsed(now())
+                    {
+                        // The grant lapsed between the check and the open (epoch
+                        // boundary crossed mid-loop): not a denial, hold it.
+                        parked[i].park(Parked {
+                            wire,
+                            id: id.clone(),
+                            track,
+                            n: n as u64,
+                        });
+                        continue;
+                    }
                     if (cutoff && (i == 0 || scenario == "withdraw")) || (exhausted && i == 0) {
                         if plain.is_ok() {
                             return Err("denied receiver decrypted");
@@ -459,6 +597,22 @@ fn connected(
                             .map_err(|_| "hang decode")?;
                     received[i][track].extend_from_slice(&frame.payload);
                     output.enqueue_encoded(n as u64);
+                }
+            }
+            // Late grant: wait (bounded) for it to land, then open the parked
+            // objects in order. A denied receiver is fatal; a late one is not.
+            for i in 0..2 {
+                if cutoff && (i == 0 || scenario == "withdraw") {
+                    parked[i].clear();
+                    continue;
+                }
+                let until = Instant::now() + Duration::from_secs(4);
+                while !parked[i].is_empty() {
+                    drain_parked(&slots[i], &mut parked[i], &mut received[i])?;
+                    if parked[i].is_empty() || Instant::now() >= until || !control.healthy() {
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(10));
                 }
             }
             for (i, _slot) in slots.iter().enumerate() {
@@ -488,6 +642,16 @@ fn connected(
                             || receiver.fence(now(), output).is_err())
                     {
                         break;
+                    }
+                    if scenario == "credit-cutoff"
+                        && i == 1
+                        && !receiver.is_denied()
+                        && receiver.grant_lapsed(now())
+                    {
+                        // Grant for the new epoch not accepted yet: drop this decoded
+                        // frame (counted), never fail the run while the booking is live.
+                        late_drops += 1;
+                        continue;
                     }
                     last_media[i][track] = Some(captured + pts);
                     if let Some((start, end)) = receiver
@@ -588,9 +752,16 @@ fn connected(
                         }
                         let mut presentation = slots[i].lock().map_err(|_| "receiver lock")?;
                         let (receiver, output) = &mut *presentation;
-                        receiver
-                            .fence(now(), output)
-                            .map_err(|_| "presentation fence")?;
+                        if let Err(_e) = receiver.fence(now(), output) {
+                            // B's grant lapsed at an epoch boundary while this decoded
+                            // frame waited to be presented: the frame is dropped (the
+                            // fence already flushed the queues). Only a sticky deny is fatal.
+                            if scenario == "credit-cutoff" && !receiver.is_denied() {
+                                late_drops += 1;
+                                continue;
+                            }
+                            return Err("presentation fence");
+                        }
                         output.enqueue_decoded(pts, f.format == "aac");
                     }
                 }
@@ -698,6 +869,10 @@ fn connected(
             cutoff_at.saturating_sub(state.booking_expiry()?),
             accepted[0],
             accepted[1]
+        );
+        println!(
+            "credit-cutoff B late-grant report: parked={} dropped_on_overflow={} stale={} drained={} decoded_frames_dropped_at_boundary={late_drops} ranges_cut_at_epoch_boundary={sealing_skipped}",
+            parked[1].parked_total, parked[1].dropped, parked[1].stale, parked[1].drained
         );
     }
     println!("connected HTTPS authority / HEVC + five AAC / two takers / TCP CPU observer passed; not QUIC/device");

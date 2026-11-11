@@ -115,6 +115,24 @@ function JpegRung({
  * A preview surface for one scope. Picks WHEP vs JPEG from the capabilities
  * document, and degrades WHEP→JPEG (with a badge) on a fatal session error.
  */
+/** The transport rung a surface is using. The ladder is MoQ, then WebRTC, then stills. */
+export type PreviewTransport = 'moq' | 'webrtc' | 'jpeg';
+
+/**
+ * For each scope and endpoint: how many mounted surfaces are on a live rung
+ * (MoQ or WebRTC) now, and a count that rises each time one starts.
+ *
+ * A MoQ lease report can arrive after its surface is gone: a late release
+ * acknowledgement, or the end of an unacknowledged-release hold. The consumer
+ * still needs that report (it may wait for 'released' to open another
+ * preview). It must not get it when another surface for the same source is
+ * live, or has gone live since: that surface's session is then the one the
+ * consumer's lease state describes. A surface that shows stills holds no
+ * session and reports no lease state, so it does not take the source over.
+ * One small record per distinct source; the records are not removed.
+ */
+const surfaces = new Map<string, { live: number; starts: number }>();
+
 export function PreviewSurface({
   scope,
   whepEndpoint,
@@ -128,6 +146,7 @@ export function PreviewSurface({
   fetchImpl,
   onSessionReleased,
   onLeaseState,
+  onTransport,
   diagnosticsHost,
   onTransportUnavailable,
 }: {
@@ -148,6 +167,8 @@ export function PreviewSurface({
   /** Reports an unavailable MoQ path so a parent can label the resulting JPEG honestly. */
   readonly onTransportUnavailable?: (() => void) | undefined;
   readonly onLeaseState?: ((state: 'negotiating' | 'active' | 'released') => void) | undefined;
+  /** Reports the rung in use (`moq`, `webrtc` or `jpeg`) and, after a MoQ fallback, why MoQ is not in use. */
+  readonly onTransport?: ((transport: PreviewTransport, moqFallbackReason?: string) => void) | undefined;
   /** When set, the fallback diagnostics + busy note render into this element (below the picture) behind one disclosure. */
   readonly diagnosticsHost?: HTMLElement | null | undefined;
 }): JSX.Element {
@@ -162,8 +183,30 @@ export function PreviewSurface({
   const refusals = useRef(0);
   const [released, setReleased] = useState(true);
 
-  const [moqUnavailable, setMoqUnavailable] = useState(false);
-  const [moqFailed, setMoqFailed] = useState(false);
+  // Why MoQ is not in use for THIS scope and endpoint (undefined = not tried or
+  // playing). The record carries its key, so a surface that is reused for a
+  // different source starts at MoQ again and never reports a stale reason.
+  const surfaceKey = `${scope}:${whepEndpoint}`;
+  const [moqFallback, setMoqFallback] = useState<{ readonly key: string; readonly reason: string; readonly held: boolean }>();
+  const moqReason = moqFallback?.key === surfaceKey ? moqFallback.reason : undefined;
+  const moqHeld = moqFallback?.key === surfaceKey && moqFallback.held;
+  // The MoQ player reports 'released' after it is unmounted (a late release
+  // acknowledgement, or the end of an unacknowledged-release hold), so the
+  // report goes to the consumer's latest callbacks.
+  const leaseRef = useRef({ onLeaseState, onSessionReleased });
+  useEffect(() => { leaseRef.current = { onLeaseState, onSessionReleased }; });
+  // `shownKey` is the source this surface shows while it is mounted. `leftAt`
+  // is the source it showed last and that source's start count at that time.
+  // Refs, not memo values: React may discard a memo, and these must not change.
+  const shownKey = useRef<string | undefined>(undefined);
+  const leftAt = useRef<{ readonly key: string; readonly starts: number } | undefined>(undefined);
+  useEffect(() => {
+    shownKey.current = surfaceKey;
+    return (): void => {
+      shownKey.current = undefined;
+      leftAt.current = { key: surfaceKey, starts: surfaces.get(surfaceKey)?.starts ?? 0 };
+    };
+  }, [surfaceKey]);
   const moqApi = useMemo(() => createMoqLeaseApi(scope, whepEndpoint), [scope, whepEndpoint]);
   const canWhep = whepAvailable(capabilities, scope);
   const retryNow = (): void => {
@@ -201,13 +244,60 @@ export function PreviewSurface({
     };
   }, [autoRetry, attempt]);
 
-  if (moqFailed) return <div role="alert"><Trans>Live input preview failed.</Trans></div>;
-  if (capabilities?.moq && !moqUnavailable) {
-    return <MoqPlayer key={`${scope}:${whepEndpoint}`} api={moqApi} label={label} audio={audio} className={className}
-      onUnavailable={() => { setMoqUnavailable(true); onTransportUnavailable?.(); }} onFatal={() => { setMoqFailed(true); }}
-      onLeaseState={(state) => { onLeaseState?.(state); if (state === 'released') onSessionReleased?.(); }} />;
-  }
+  const transport: PreviewTransport = capabilities?.moq && moqReason === undefined ? 'moq'
+    : canWhep && !degraded && !moqHeld ? 'webrtc' : 'jpeg';
+  const transportRef = useRef(onTransport);
+  useEffect(() => { transportRef.current = onTransport; });
+  useEffect(() => { transportRef.current?.(transport, moqReason); }, [transport, moqReason]);
+  // Count this surface for its source while it is on a live rung (see `surfaces`).
+  const live = transport !== 'jpeg';
+  useEffect(() => {
+    if (!live) return;
+    const record = surfaces.get(surfaceKey) ?? { live: 0, starts: 0 };
+    surfaces.set(surfaceKey, record);
+    record.live += 1;
+    record.starts += 1;
+    return (): void => { record.live -= 1; };
+  }, [surfaceKey, live]);
 
+  if (capabilities?.moq && moqReason === undefined) {
+    return <MoqPlayer key={surfaceKey} api={moqApi} label={label} audio={audio} className={className}
+      onUnavailable={(reason) => {
+        setMoqFallback({ key: surfaceKey, reason, held: reason === 'release-unacknowledged' });
+        onTransportUnavailable?.();
+      }}
+      onLeaseState={(state) => {
+        // Mounted with this source: the report is current. Unmounted: it is
+        // still the consumer's, but only while no surface for this source is
+        // live and none has gone live since this one left. A surface that now
+        // shows another source drops the old source's report.
+        const record = surfaces.get(surfaceKey);
+        const left = leftAt.current;
+        const current = shownKey.current === surfaceKey
+          || (shownKey.current === undefined && left?.key === surfaceKey
+            && record?.live === 0 && record.starts === left.starts);
+        if (!current) return;
+        leaseRef.current.onLeaseState?.(state);
+        if (state !== 'released') return;
+        // The lease is certainly gone: stills may now give way to WebRTC.
+        setMoqFallback((current) => (current?.key === surfaceKey && current.held ? { ...current, held: false } : current));
+        leaseRef.current.onSessionReleased?.();
+      }} />;
+  }
+  // The user sees why MoQ is not in use. Two reasons are the normal state and
+  // get no note: a browser without MoQ support, and a server that does not
+  // offer MoQ for this scope.
+  const moqNote = moqReason === undefined || moqReason === 'unsupported' || moqReason === 'moq-unavailable' ? null : (
+    <p role="status" className="px-3 py-1 text-xs text-muted-foreground" data-testid="moq-fallback-note" data-reason={moqReason}>
+      {moqReason === 'forbidden'
+        ? <Trans>MoQ video was refused: this account has no access to it. Showing the next available preview.</Trans>
+        : <Trans>MoQ video is not in use ({moqReason}). Showing the next available preview.</Trans>}
+    </p>
+  );
+  const withNote = (rung: JSX.Element): JSX.Element => {
+    if (moqNote === null) return rung;
+    return <>{rung}{diagnosticsHost ? createPortal(moqNote, diagnosticsHost) : moqNote}</>;
+  };
   // No WebRTC for this scope/build: JPEG is the honest primary — NO badge.
   // This applies to every scope, including `input`: a build with no WebRTC at
   // all (the LGPL-clean/GPU-free default, `webrtc: false`) must still offer
@@ -218,18 +308,28 @@ export function PreviewSurface({
   // failed/was busy) keeps the explicit "Live input preview failed" state for
   // `input`, per the real WHEP-failure case this distinction exists for.
   if (!canWhep) {
-    return <JpegRung jpegPath={jpegPath} label={label} degraded={false} className={className} />;
+    return withNote(<JpegRung jpegPath={jpegPath} label={label} degraded={false} className={className} />);
+  }
+  // The MoQ lease may still be held: stills only, until the player reports
+  // 'released' at the end of its hold (MOQ_UNACKNOWLEDGED_HOLD_MS).
+  if (moqHeld) {
+    return withNote(<JpegRung jpegPath={jpegPath} label={label} degraded className={className} />);
   }
 
   // WHEP was attempted and failed: degrade to JPEG with the honest badge + a
   // retry that re-arms a fresh WHEP attempt.
   if (degraded) {
     if (scope === 'input') {
-      return <div role="alert" className="px-3 py-2 text-sm" data-testid="input-preview-unavailable">{busy ? <Trans>Live input preview is busy. Another viewer has the session.</Trans> : <Trans>Live input preview failed.</Trans>}{released ? <Button type="button" onClick={retryNow}>Retry live preview</Button> : null}{diagnostics ? <PreviewDiagnostics diagnostics={diagnostics} /> : null}</div>;
+      return withNote(
+        <>
+          <JpegRung jpegPath={jpegPath} label={label} degraded={false} className={className} />
+          <div role="alert" className="px-3 py-2 text-sm" data-testid="input-preview-unavailable">{busy ? <Trans>Live input preview is busy. Another viewer has the session.</Trans> : <Trans>Live input preview failed.</Trans>}{released ? <Button type="button" onClick={retryNow}>Retry live preview</Button> : null}{diagnostics ? <PreviewDiagnostics diagnostics={diagnostics} /> : null}</div>
+        </>,
+      );
     }
     const busyNote = busy && !capacity ? <p role="alert"><Trans>Live preview is busy. Another viewer has the session.</Trans></p> : null;
     const details = diagnostics ? <PreviewDiagnostics diagnostics={diagnostics} flat={diagnosticsHost != null} /> : null;
-    return (
+    return withNote(
       <>
         <JpegRung
           jpegPath={jpegPath}
@@ -255,11 +355,11 @@ export function PreviewSurface({
         ) : (
           <>{busyNote}{details}</>
         )}
-      </>
+      </>,
     );
   }
 
-  return (
+  return withNote(
     <WhepPlayer
       key={attempt}
       endpoint={whepEndpoint}
@@ -283,6 +383,6 @@ export function PreviewSurface({
         setDiagnostics(details);
         setDegraded(true);
       }}
-    />
+    />,
   );
 }

@@ -802,19 +802,44 @@ impl AuthorizedFeedFactory for RegistryFeedFactory {
         // 3. Subscribe with the fence's OWN flag: the registry observes it
         //    read-only, so an HTTP DELETE fences registry enqueue at the same
         //    instant it fences the transport.
-        let subscription = self
-            .subscriptions
-            .subscribe_with_revocation(&output_scope, binding.config_generation, revocation.flag())
-            .map_err(refusal)?;
+        let subscription = if matches!(scope, WhepScope::Program) {
+            self.subscriptions.subscribe_program_with_revocation(
+                &output_scope,
+                binding.config_generation,
+                revocation.flag(),
+            )
+        } else {
+            self.subscriptions.subscribe_with_revocation(
+                &output_scope,
+                binding.config_generation,
+                revocation.flag(),
+            )
+        }
+        .map_err(refusal)?;
         // 4. One off-clock worker per subscription, never on the output clock.
         let handle = subscription.revoke_handle();
+        let program = matches!(scope, WhepScope::Program);
+        // The opened binding identifies the mix by StreamKind, not by its
+        // position or by assuming that its configured name is "program".
+        let program_metadata = if program {
+            let mix = binding
+                .audio
+                .iter()
+                .filter(|audio| matches!(audio.kind, StreamKind::Audio))
+                .map(factory_audio)
+                .collect::<Result<Vec<_>, _>>()?;
+            Some(metadata::prepare(&factory_video(&binding.video)?, &mix)?)
+        } else {
+            None
+        };
+        let metadata = program_metadata.as_ref().unwrap_or(prepared);
         let worker = OffClockWorker::spawn(
             &runtime,
             revocation,
             WorkerState {
                 sink,
                 subscription,
-                mapping: prepared.mapping.clone(),
+                mapping: metadata.mapping.clone(),
                 recovery: binding.video.recovery.ok_or(MoqReject::Codec)?,
                 generation: binding.config_generation,
                 handle: handle.clone(),
@@ -823,9 +848,9 @@ impl AuthorizedFeedFactory for RegistryFeedFactory {
         .map_err(|_| MoqReject::Unavailable)?;
         Ok(AuthorizedFeed {
             generation: binding.config_generation,
-            catalog: prepared.catalog.clone(),
-            video: prepared.video.clone(),
-            audio: prepared.audio.clone(),
+            catalog: metadata.catalog.clone(),
+            video: metadata.video.clone(),
+            audio: metadata.audio.clone(),
             ladder: if matches!(scope, WhepScope::Program | WhepScope::Wall) {
                 self.renditions
                     .iter()
@@ -1679,6 +1704,151 @@ mod tests {
         let feed = factory.attach(&global(), &WhepScope::Wall, sink).unwrap();
         assert_eq!(feed.ladder.len(), 1);
         assert_eq!(feed.ladder[0].track, crate::monitor_wall::WALL_OUTPUT_ID);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn program_lease_catalog_and_packets_exclude_discrete_audio() {
+        let mut selected = binding("restream", 0, GENERATION, 1280, 720);
+        selected.program_id = multiview_config::MAIN_PROGRAM.into();
+        selected.bus_id = multiview_config::MAIN_PROGRAM.into();
+        selected.audio[0].track = "named-mix".into();
+        for id in 0..4 {
+            let mut discrete = audio();
+            discrete.track = format!("source-{id}");
+            discrete.kind = StreamKind::AudioTrack(id);
+            selected.audio.push(discrete);
+        }
+        let mut registry = FeedRegistry::new(&[selected]).unwrap();
+        let mut factory =
+            RegistryFeedFactory::from_subscriptions(registry.factory.subscriptions.clone())
+                .unwrap();
+        factory.program_output = Some("restream".into());
+        let (sink, _unused_windows) = Fence::channel(4);
+        let program = factory
+            .attach(&global(), &WhepScope::Program, sink.clone())
+            .unwrap();
+        assert_eq!(
+            program
+                .audio
+                .iter()
+                .map(|audio| audio.track.as_str())
+                .collect::<Vec<_>>(),
+            ["named-mix"]
+        );
+        let catalog: serde_json::Value = serde_json::from_slice(&program.catalog).unwrap();
+        assert_eq!(catalog["audio"]["renditions"].as_object().unwrap().len(), 1);
+        drop(program);
+        sink.revoke();
+        let (output_sink, mut output_windows) = Fence::channel(4);
+        let output = factory
+            .attach(
+                &global(),
+                &WhepScope::Output("restream".into()),
+                output_sink.clone(),
+            )
+            .unwrap();
+        assert_eq!(output.audio.len(), 5);
+        let output_catalog: serde_json::Value = serde_json::from_slice(&output.catalog).unwrap();
+        assert_eq!(
+            output_catalog["audio"]["renditions"]
+                .as_object()
+                .unwrap()
+                .len(),
+            5
+        );
+        let (program_sink, mut windows) = Fence::channel(4);
+        let program = factory
+            .attach(&global(), &WhepScope::Program, program_sink.clone())
+            .unwrap();
+        let mut packets = vec![idr(0)];
+        for kind in std::iter::once(StreamKind::Audio).chain((0..4).map(StreamKind::AudioTrack)) {
+            let mut raw = Packet::copy(&[0x21, 0x10]);
+            raw.set_pts(Some(0));
+            raw.set_dts(Some(0));
+            packets.push(EncodedPacket::with_kind(raw, kind));
+        }
+        registry
+            .producer_mut()
+            .offer_complete(0, GENERATION, &packets, SPAN, Instant::now());
+        let program_window = recv_within(&mut windows, Duration::from_secs(2)).unwrap();
+        let output_window = recv_within(&mut output_windows, Duration::from_secs(2)).unwrap();
+        assert_eq!(
+            program_window
+                .audio
+                .keys()
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+            ["named-mix"]
+        );
+        assert_eq!(program_window.audio["named-mix"].len(), 1);
+        assert_eq!(output_window.audio.len(), 5);
+        drop((program, output));
+        program_sink.revoke();
+        output_sink.revoke();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn program_real_packet_density_stays_below_retained_queue_budget() {
+        let mut selected = binding("restream", 0, GENERATION, 1280, 720);
+        selected.video.time_base = Rational::new(1, 30);
+        selected.video.cadence = Rational::new(30, 1);
+        selected.program_id = multiview_config::MAIN_PROGRAM.into();
+        selected.bus_id = multiview_config::MAIN_PROGRAM.into();
+        for id in 0..4 {
+            let mut discrete = audio();
+            discrete.track = format!("source-{id}");
+            discrete.kind = StreamKind::AudioTrack(id);
+            selected.audio.push(discrete);
+        }
+        let mut registry = FeedRegistry::new(&[selected]).unwrap();
+        let mut factory =
+            RegistryFeedFactory::from_subscriptions(registry.factory.subscriptions.clone())
+                .unwrap();
+        factory.program_output = Some("restream".into());
+        let (sink, mut windows) = Fence::channel(256);
+        let feed = factory
+            .attach(&global(), &WhepScope::Program, sink.clone())
+            .unwrap();
+        // Keep every transport payload for the full two-second cache lifetime.
+        // Thirty 30/1 video ticks and five 48 kHz / 1024 AAC emissions per
+        // second would retain ~530 packets without the Program projection.
+        let mut retained = Vec::new();
+        let now = Instant::now();
+        for tick in 0..60 {
+            let mut packets = vec![if tick == 0 {
+                idr(tick)
+            } else {
+                inter_with_key_flag(tick)
+            }];
+            let current_audio = (tick + 1) * 48_000 / (30 * 1024);
+            let previous_audio = tick * 48_000 / (30 * 1024);
+            for sample in previous_audio..current_audio {
+                for kind in
+                    std::iter::once(StreamKind::Audio).chain((0..4).map(StreamKind::AudioTrack))
+                {
+                    let mut raw = Packet::copy(&[0x21, 0x10]);
+                    let pts = tick * 1920 + (sample - previous_audio) * 1024;
+                    raw.set_pts(Some(pts));
+                    raw.set_dts(Some(pts));
+                    packets.push(EncodedPacket::with_kind(raw, kind));
+                }
+            }
+            registry.producer_mut().offer_complete(
+                0,
+                GENERATION,
+                &packets,
+                Duration::from_millis(33),
+                now + Duration::from_millis(u64::try_from(tick).unwrap() * 33),
+            );
+            if let Some(window) = recv_within(&mut windows, Duration::from_secs(2)) {
+                retained.push(window);
+            }
+        }
+        assert_eq!(retained.len(), 60, "the viewer must not lose a GOP");
+        assert_eq!(registry.producer_mut().rejected_windows(), 0);
+        assert!(registry.producer_mut().retained().0 < multiview_output::batch::MAX_QUEUE_PACKETS);
+        drop((feed, retained));
+        sink.revoke();
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
