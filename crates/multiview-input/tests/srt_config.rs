@@ -43,6 +43,40 @@ fn srt_libav_option_url_golden_table() {
 }
 
 #[test]
+fn srt_listener_wildcard_lowers_to_dual_stack_never_ipv4() {
+    use multiview_input::srt::{is_wildcard_host, listener_bind_host, lower_listener_url};
+    for host in ["", "::", "[::]", "[0:0:0:0:0:0:0:0]"] {
+        assert!(is_wildcard_host(host), "{host:?} is a wildcard");
+        assert_eq!(listener_bind_host(host), "[::]");
+    }
+    for host in [
+        "0.0.0.0",
+        "[2001:db8::10]",
+        "2001:db8::10",
+        "192.0.2.1",
+        "[::1]",
+        "srt.example",
+    ] {
+        assert!(!is_wildcard_host(host), "{host:?} is specific");
+        assert_eq!(listener_bind_host(host), host, "specific host unchanged");
+    }
+    assert_eq!(
+        lower_listener_url("srt://:9000?mode=listener&latency=200000"),
+        "srt://[::]:9000?mode=listener&latency=200000"
+    );
+    for url in [
+        "srt://[::]:9000?mode=listener",
+        "srt://0.0.0.0:9000?mode=listener",
+        "srt://[2001:db8::10]:9000?mode=listener",
+        "srt://[::]:9000?mode=caller",
+        "srt://[::]:9000",
+        "srt://[::]:9000?mode=rendezvous",
+    ] {
+        assert_eq!(lower_listener_url(url), url);
+    }
+}
+
+#[test]
 fn srt_modes_roundtrip() {
     for mode in [SrtMode::Caller, SrtMode::Listener, SrtMode::Rendezvous] {
         assert_eq!(SrtMode::from_token(mode.as_libav_token()).unwrap(), mode);

@@ -82,9 +82,11 @@ impl TransferId {
 pub struct TileParams {
     /// `[dst_x, dst_y, src_w, src_h]` in pixels.
     pub placement: [u32; 4],
-    /// `[dst_w, dst_h, 0, 0]` in pixels — the destination rect the source is
-    /// scaled into (scale-at-composite, RT-6 / ADR-0034). Equal to `src_w`/`src_h`
-    /// for a 1:1 tile (no scaling).
+    /// `[dst_w, dst_h, has_alpha, alpha_layer]` — the destination rect (pixels)
+    /// the source is scaled into (scale-at-composite, RT-6 / ADR-0034; equal to
+    /// `src_w`/`src_h` for a 1:1 tile), then the NV12+A flag (`1` = sample the
+    /// straight R8 alpha array, `0` = opaque) and the tile's layer in that array
+    /// (ADR-0058: the spare lanes carry alpha, no struct growth).
     pub dst_size: [u32; 4],
     /// `[opacity, transfer_id, 0, 0]`.
     pub opacity_transfer: [f32; 4],
@@ -296,6 +298,29 @@ impl TileParams {
             prim1: prim[1],
             prim2: prim[2],
         })
+    }
+}
+
+impl TileParams {
+    /// Mark this tile as carrying a straight per-pixel alpha plane resident in
+    /// `layer` of the composite pass's R8 alpha texture array. The shader then
+    /// multiplies that alpha into the uniform opacity at the single premultiply
+    /// step (ADR-0058; inv #8 order unchanged).
+    #[must_use]
+    pub const fn with_alpha_layer(mut self, layer: u32) -> Self {
+        self.dst_size[2] = 1;
+        self.dst_size[3] = layer;
+        self
+    }
+
+    /// The alpha-array layer this tile samples, or `None` for an opaque tile.
+    #[must_use]
+    pub const fn alpha_layer(&self) -> Option<u32> {
+        if self.dst_size[2] == 0 {
+            None
+        } else {
+            Some(self.dst_size[3])
+        }
     }
 }
 

@@ -126,6 +126,16 @@
         "summary": "An ad-hoc cast session was started (cast.session.started on topic `devices`; lossless lifecycle lane).",
         "title": "Ephemeral cast session started"
       },
+      "CatalogueLinkStatus": {
+        "contentType": "application/json",
+        "description": "Emitted on topic `inputs` with envelope `id` = source id, after each catalogue sync. LOSSLESS lifecycle fact. Carries identifiers and the status token only; the change diff and ranked alternatives are served by `GET /api/v1/catalogues/iptv-org/links`. Authorized per source id (BOLA).",
+        "name": "CatalogueLinkStatus",
+        "payload": {
+          "$ref": "#/components/schemas/CatalogueLinkStatus"
+        },
+        "summary": "A source linked to an IPTV-ORG catalogue entry changed link status (catalogue.link_status on topic `inputs`).",
+        "title": "Catalogue link status changed"
+      },
       "DeviceAdopted": {
         "contentType": "application/json",
         "name": "DeviceAdopted",
@@ -233,6 +243,9 @@
                   "$ref": "#/components/schemas/InputStreams"
                 },
                 {
+                  "$ref": "#/components/schemas/InputLifecycle"
+                },
+                {
                   "$ref": "#/components/schemas/JobProgress"
                 },
                 {
@@ -245,7 +258,16 @@
                   "$ref": "#/components/schemas/SalvoEvent"
                 },
                 {
+                  "$ref": "#/components/schemas/SwitcherOperation"
+                },
+                {
                   "$ref": "#/components/schemas/MediaPlayerEvent"
+                },
+                {
+                  "$ref": "#/components/schemas/GraphicsChannelEvent"
+                },
+                {
+                  "$ref": "#/components/schemas/CatalogueLinkStatus"
                 },
                 {
                   "$ref": "#/components/schemas/DeviceStatus"
@@ -369,6 +391,16 @@
         "summary": "The single wire frame used for all realtime messages (ADR-RT002).",
         "title": "Versioned realtime envelope"
       },
+      "GraphicsChannelEvent": {
+        "contentType": "application/json",
+        "description": "Emitted on topic `switcher` with envelope `id` = graphics channel id on cue / take / clear / next. Lossless lifecycle event.",
+        "name": "GraphicsChannelEvent",
+        "payload": {
+          "$ref": "#/components/schemas/GraphicsChannelEvent"
+        },
+        "summary": "A graphics channel's preview/program changed (graphics.channel_state on topic `switcher`).",
+        "title": "Graphics playout channel state"
+      },
       "HealthWarning": {
         "contentType": "application/json",
         "description": "A richer sibling of `Alert` carrying a stable `code`, the affected `subsystem`, and a concrete `remediation`. The `code` is the dedupe key: frames with the same code coalesce rather than stacking. Capability-mismatch codes (e.g. `gpu-present-no-vulkan-adapter`) are latched build-time facts — raised once, cleared on reconfigure/restart.",
@@ -396,6 +428,15 @@
         },
         "summary": "An input source transitioned connection state (input.connection on topic `inputs`).",
         "title": "Input source connection state change"
+      },
+      "InputLifecycle": {
+        "contentType": "application/json",
+        "name": "InputLifecycle",
+        "payload": {
+          "$ref": "#/components/schemas/InputLifecycle"
+        },
+        "summary": "A source moved between idle / starting / ready / failed (input.lifecycle on topic `inputs`). Not the tile signal state.",
+        "title": "Source lifecycle transition"
       },
       "InputStreams": {
         "contentType": "application/json",
@@ -463,6 +504,15 @@
         },
         "summary": "Client requests subscription to one or more topics.",
         "title": "$subscribe control frame (client to server)"
+      },
+      "SwitcherOperation": {
+        "contentType": "application/json",
+        "name": "SwitcherOperation",
+        "payload": {
+          "$ref": "#/components/schemas/SwitcherOperation"
+        },
+        "summary": "The engine applied or rejected an M/E command at an exact output tick.",
+        "title": "Switcher operation terminal result"
       },
       "SystemMetrics": {
         "contentType": "application/json",
@@ -735,6 +785,46 @@
           "session_id",
           "address",
           "output"
+        ],
+        "type": "object"
+      },
+      "CatalogueLinkStatus": {
+        "description": "Data body of `catalogue.link_status` (IPTV-ORG, ADR-M015): a linked source's catalogue link status changed. Envelope `id` = source id.",
+        "properties": {
+          "channel": {
+            "type": "string"
+          },
+          "feed": {
+            "type": "string"
+          },
+          "previous": {
+            "description": "Previous status, when known.",
+            "type": "string"
+          },
+          "replaced_by": {
+            "description": "Replacement channel id (channel_closed).",
+            "type": "string"
+          },
+          "source_id": {
+            "description": "The linked source id.",
+            "type": "string"
+          },
+          "status": {
+            "enum": [
+              "in_sync",
+              "updated",
+              "stream_removed",
+              "channel_closed",
+              "blocklisted",
+              "unlinked",
+              "edited"
+            ],
+            "type": "string"
+          }
+        },
+        "required": [
+          "source_id",
+          "status"
         ],
         "type": "object"
       },
@@ -1155,6 +1245,38 @@
         ],
         "type": "string"
       },
+      "GraphicsChannelEvent": {
+        "description": "Data body of `graphics.channel_state`: a graphics playout channel's preview/program after a cue / take / clear / next. Envelope `id` = channel id.",
+        "properties": {
+          "action": {
+            "description": "The verb that produced this state: cue, take, clear, next or rundown.",
+            "type": "string"
+          },
+          "channel": {
+            "description": "Graphics channel id (matches the envelope `id`).",
+            "type": "string"
+          },
+          "preview": {
+            "description": "Cued (preview) item id, if any.",
+            "type": "string"
+          },
+          "program": {
+            "description": "On-air (program) item id, if any.",
+            "type": "string"
+          },
+          "seq": {
+            "description": "Increments on every program change.",
+            "format": "uint64",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "channel",
+          "seq",
+          "action"
+        ],
+        "type": "object"
+      },
       "HealthWarning": {
         "description": "Data body of `health.warning.raised` and `health.warning.cleared`. A richer sibling of `Alert`: the `code` is the stable dedupe key, and `remediation` carries the concrete fix. Capability-mismatch codes are latched build-time facts (raised once, cleared on reconfigure/restart).",
         "properties": {
@@ -1278,6 +1400,74 @@
         "required": [
           "input_id",
           "state"
+        ],
+        "type": "object"
+      },
+      "InputLifecycle": {
+        "description": "Data body of the `input.lifecycle` event.",
+        "properties": {
+          "at_ms": {
+            "description": "Unix milliseconds.",
+            "format": "int64",
+            "type": "integer"
+          },
+          "from": {
+            "enum": [
+              "idle",
+              "starting",
+              "ready",
+              "failed"
+            ],
+            "type": "string"
+          },
+          "generation": {
+            "description": "Start generation; increments on every start from idle.",
+            "format": "uint64",
+            "type": "integer"
+          },
+          "lease_holders": {
+            "items": {
+              "properties": {
+                "kind": {
+                  "type": "string"
+                },
+                "label": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "kind",
+                "label"
+              ],
+              "type": "object"
+            },
+            "type": "array"
+          },
+          "reason": {
+            "description": "Operator-safe reason.",
+            "type": "string"
+          },
+          "source_id": {
+            "description": "The source id (the authorization object).",
+            "type": "string"
+          },
+          "to": {
+            "enum": [
+              "idle",
+              "starting",
+              "ready",
+              "failed"
+            ],
+            "type": "string"
+          }
+        },
+        "required": [
+          "source_id",
+          "generation",
+          "from",
+          "to",
+          "reason",
+          "at_ms"
         ],
         "type": "object"
       },
@@ -1519,6 +1709,7 @@
       "OutputRunState": {
         "description": "Running state of an output sink.",
         "enum": [
+          "idle",
           "starting",
           "running",
           "migrating",
@@ -1809,6 +2000,38 @@
           "topic",
           "effective_rate_hz",
           "snapshot_seq"
+        ],
+        "type": "object"
+      },
+      "SwitcherOperation": {
+        "description": "Terminal outcome, emitted only at the engine output tick; envelope corr equals operation_id, id equals M/E id.",
+        "properties": {
+          "completed": {
+            "type": "boolean"
+          },
+          "error": {
+            "type": "string"
+          },
+          "me": {
+            "type": "string"
+          },
+          "operation_id": {
+            "type": "string"
+          },
+          "program": {
+            "type": "string"
+          },
+          "tick": {
+            "format": "uint64",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "me",
+          "program",
+          "tick",
+          "operation_id",
+          "completed"
         ],
         "type": "object"
       },
@@ -2215,7 +2438,8 @@
           "config-file-invalid",
           "config-file-requires-restart",
           "config-file-apply-incomplete",
-          "container-no-host-networking"
+          "container-no-host-networking",
+          "catalogue-link-attention"
         ],
         "type": "string"
       },

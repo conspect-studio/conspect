@@ -411,6 +411,10 @@ pub enum WarningCode {
     RistLinkLoss,
     /// A container is configured for multicast without host networking. Latched at startup.
     ContainerNoHostNetworking,
+    /// One or more sources linked to an IPTV-ORG catalogue entry need attention
+    /// (stream removed, channel closed, blocklisted, updated, or edited). Aggregate
+    /// warning (one coalescing key); cleared when every link is back in sync.
+    CatalogueLinkAttention,
 }
 
 /// Which end of a RIST link a [`RistLinkStats`] sample describes.
@@ -543,6 +547,102 @@ impl WarningCode {
             Self::ConfigFileApplyIncomplete => "config-file-apply-incomplete",
             Self::RistLinkLoss => "rist-link-loss",
             Self::ContainerNoHostNetworking => "container-no-host-networking",
+            Self::CatalogueLinkAttention => "catalogue-link-attention",
+        }
+    }
+}
+
+/// A source lifecycle state (`docs/architecture/demand-driven-sources.md`).
+/// A separate axis from the tile signal state and from tally.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SourceLifecycle {
+    /// Not started; costs nothing. Not a fault.
+    Idle,
+    /// Wanted, waiting for its first media.
+    Starting,
+    /// Started and producing.
+    Ready,
+    /// Wanted, not producing.
+    Failed,
+}
+
+/// One holder of a source lease, as named in `input.lifecycle`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LeaseHolder {
+    /// `layout_cell`, `audio_route`, `subtitle_route`, `preview`,
+    /// `hls_session`, `event_automation`, `always_on` or `manual`.
+    pub kind: String,
+    /// The holder's identity within its kind.
+    pub label: String,
+    /// The authorizable object the label names (an automation pin's owning
+    /// source), never on the wire: the realtime session redacts `label` for a
+    /// principal that cannot read it (review DMD-04).
+    #[serde(skip)]
+    pub object_id: Option<String>,
+}
+
+impl LeaseHolder {
+    /// A holder of `kind` labelled `label`, naming no other object.
+    #[must_use]
+    pub fn new(kind: impl Into<String>, label: impl Into<String>) -> Self {
+        Self {
+            kind: kind.into(),
+            label: label.into(),
+            object_id: None,
+        }
+    }
+
+    /// The same holder, naming `object` (when `Some`).
+    #[must_use]
+    pub fn naming(mut self, object: Option<&str>) -> Self {
+        self.object_id = object.map(str::to_owned);
+        self
+    }
+}
+
+/// `input.lifecycle` (topic `inputs`): a source moved between idle /
+/// starting / ready / failed. Lossless (kept in the replay ring).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct InputLifecycle {
+    /// The source id; the object axis this event is authorized under.
+    pub source_id: String,
+    /// The start generation the transition belongs to.
+    pub generation: u64,
+    /// The previous state.
+    pub from: SourceLifecycle,
+    /// The new state.
+    pub to: SourceLifecycle,
+    /// Why, operator-safe (never a URL or credential).
+    pub reason: String,
+    /// When, Unix milliseconds.
+    pub at_ms: i64,
+    /// Who held a lease at the time.
+    #[serde(default)]
+    pub lease_holders: Vec<LeaseHolder>,
+}
+
+impl InputLifecycle {
+    /// Build an `input.lifecycle` body.
+    #[must_use]
+    pub fn new(
+        source_id: impl Into<String>,
+        generation: u64,
+        from: SourceLifecycle,
+        to: SourceLifecycle,
+        reason: impl Into<String>,
+        at_ms: i64,
+        lease_holders: Vec<LeaseHolder>,
+    ) -> Self {
+        Self {
+            source_id: source_id.into(),
+            generation,
+            from,
+            to,
+            reason: reason.into(),
+            at_ms,
+            lease_holders,
         }
     }
 }
@@ -812,6 +912,45 @@ pub struct MediaPlayerEvent {
     pub position_frames: u64,
 }
 
+/// An M/E command's terminal result, emitted only after the output tick
+/// actually applied or rejected it. The operation id is echoed in `corr`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SwitcherOperation {
+    /// M/E id whose command changed (or failed to change) state.
+    pub me: String,
+    /// Main program this M/E belongs to; scoped separately from the M/E id.
+    pub program: String,
+    /// The exact output tick at which the operation settled.
+    pub tick: u64,
+    /// Opaque operation id from the accepted 202 response.
+    pub operation_id: String,
+    /// `true` only when the command was really applied to on-air state.
+    pub completed: bool,
+    /// Typed refusal details, present only when `completed` is false.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+/// A graphics (CG) playout channel's PVW/PGM state changed (topic
+/// [`crate::topic::Topic::Switcher`]): emitted on cue / take / clear / next.
+/// Lossless lifecycle event, scoped by the channel id.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GraphicsChannelEvent {
+    /// The graphics channel id (matches the envelope `id`).
+    pub channel: String,
+    /// The cued (preview) item id, if any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preview: Option<String>,
+    /// The on-air (program) item id, if any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub program: Option<String>,
+    /// Increments on every program change.
+    pub seq: u64,
+    /// The verb that produced this state (`cue`, `take`, `clear`, `next`,
+    /// `rundown`).
+    pub action: String,
+}
+
 impl MediaPlayerEvent {
     /// Construct a media-player state event for `player` entering `state` at
     /// `position_frames`, with no asset scope.
@@ -831,6 +970,33 @@ impl MediaPlayerEvent {
         self.asset = Some(asset.into());
         self
     }
+}
+
+/// A linked source's catalogue link status changed (IPTV-ORG, ADR-M015 slice D).
+///
+/// Lossless low-rate lifecycle fact on topic `inputs`, scoped by the **source id**
+/// (the object axis, so a cam1-scoped principal never sees another source's link
+/// state). Carries only identifiers and the status token — the diff/alternatives
+/// are read from `GET /api/v1/catalogues/iptv-org/links`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CatalogueLinkStatus {
+    /// The linked source's id (the authorization object).
+    pub source_id: String,
+    /// New status (`in_sync`, `updated`, `stream_removed`, `channel_closed`,
+    /// `blocklisted`, `unlinked`, `edited`).
+    pub status: String,
+    /// Previous status, when known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub previous: Option<String>,
+    /// Linked channel id.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub channel: Option<String>,
+    /// Linked feed id.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub feed: Option<String>,
+    /// Replacement channel (for `channel_closed`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replaced_by: Option<String>,
 }
 
 // ---- Devices realtime surface (ADR-RT007, managed-devices.md §2.1/§7) ----
@@ -1528,6 +1694,14 @@ pub enum AuthzScope<'a> {
     /// `program:<id>` — the program-namespaced grant that carries `timing.status`
     /// without punning the plain output-id namespace (ADR-W026).
     Program(&'a str),
+    /// Requires both the M/E object grant and the namespaced program grant;
+    /// a scoped principal can neither see another M/E nor infer its program.
+    ObjectAndProgram {
+        /// M/E resource id.
+        object: &'a str,
+        /// Program grant required alongside the M/E.
+        program: &'a str,
+    },
     /// Restricted by discovery **domain** (ADR-W026). `Some(label)` is matched
     /// against `scoped_discovery_domains`; `None` is an *unlabelled* row, which a
     /// discovery-scoped principal is denied (fail-closed). The policy lives in
@@ -1657,6 +1831,9 @@ pub enum Event {
     /// (RT-3). Rides the same `inputs` lane as `input.connection`.
     #[serde(rename = "input.streams")]
     InputStreams(InputStreams),
+    /// A source's lifecycle state changed (topic `inputs`).
+    #[serde(rename = "input.lifecycle")]
+    InputLifecycle(InputLifecycle),
     /// Long-running job progress (topic `jobs`, correlated by `corr`).
     #[serde(rename = "job.progress")]
     JobProgress(JobProgress),
@@ -1689,6 +1866,10 @@ pub enum Event {
     SalvoCancelled(SalvoEvent),
 
     // ---- Switcher realtime surface (topic `switcher`, ADR-RT008) ----
+    /// One terminal frame-boundary operation result with direct operation-id
+    /// correlation. Lossless; a rejected operation never masquerades as applied.
+    #[serde(rename = "switcher.operation")]
+    SwitcherOperation(SwitcherOperation),
     /// A media player's discrete transport state changed (topic `switcher`,
     /// envelope `id` = player id). A **lossless** lifecycle event kept in the
     /// replay ring ([`Event::is_conflated`] is `false`): cued / playing / paused /
@@ -1697,6 +1878,16 @@ pub enum Event {
     /// stream.
     #[serde(rename = "media.player_state")]
     MediaPlayerState(MediaPlayerEvent),
+    /// A graphics playout channel's PVW/PGM state changed (topic `switcher`).
+    #[serde(rename = "graphics.channel_state")]
+    GraphicsChannelState(GraphicsChannelEvent),
+
+    // ---- Catalogue link tracker (topic `inputs`, IPTV-ORG slice D) ----
+    /// A source linked to an external catalogue entry changed link status
+    /// (topic `inputs`, envelope `id` = source id). Lossless; see
+    /// [`CatalogueLinkStatus`].
+    #[serde(rename = "catalogue.link_status")]
+    CatalogueLinkStatus(CatalogueLinkStatus),
 
     // ---- Devices realtime surface (topic `devices`, ADR-RT007) ----
     /// Conflated latest-wins per-device runtime snapshot (envelope `id` =
@@ -1771,6 +1962,7 @@ impl Event {
             Self::ShedLoad(_) => "shed.load",
             Self::InputConnection(_) => "input.connection",
             Self::InputStreams(_) => "input.streams",
+            Self::InputLifecycle(_) => "input.lifecycle",
             Self::JobProgress(_) => "job.progress",
             Self::AlarmRaised(_) => "alarm.raised",
             Self::AlarmUpdated(_) => "alarm.updated",
@@ -1780,7 +1972,10 @@ impl Event {
             Self::SalvoArmed(_) => "salvo.armed",
             Self::SalvoTaken(_) => "salvo.taken",
             Self::SalvoCancelled(_) => "salvo.cancelled",
+            Self::SwitcherOperation(_) => "switcher.operation",
             Self::MediaPlayerState(_) => "media.player_state",
+            Self::GraphicsChannelState(_) => "graphics.channel_state",
+            Self::CatalogueLinkStatus(_) => "catalogue.link_status",
             Self::DeviceStatus(_) => "device.status",
             Self::DeviceAdopted(_) => "device.adopted",
             Self::DeviceRemoved(_) => "device.removed",
@@ -1832,7 +2027,12 @@ impl Event {
             Self::DeviceSync(e) => AuthzScope::Object(&e.device_id),
             Self::CastSessionStarted(e) => AuthzScope::Object(&e.session_id),
             Self::CastSessionRemoved(e) => AuthzScope::Object(&e.session_id),
+            Self::SwitcherOperation(e) => AuthzScope::ObjectAndProgram {
+                object: &e.me,
+                program: &e.program,
+            },
             Self::MediaPlayerState(e) => AuthzScope::Object(&e.player),
+            Self::GraphicsChannelState(e) => AuthzScope::Object(&e.channel),
             // A tile bound to an input is object-scoped by that input id; a
             // placeholder/no-signal tile (`input: None`) has no authorizable
             // object and stays public (structurally id-less).
@@ -1866,6 +2066,10 @@ impl Event {
             // leak class to a cam1-scoped principal.
             Self::InputStreams(e) => AuthzScope::Object(&e.input_id),
             Self::InputConnection(e) => AuthzScope::Object(&e.input_id),
+            Self::InputLifecycle(e) => AuthzScope::Object(&e.source_id),
+            // A catalogue link status is per linked source: the same object axis as
+            // the source's `GET /sources/{id}` (BOLA, ADR-W026).
+            Self::CatalogueLinkStatus(e) => AuthzScope::Object(&e.source_id),
 
             // ---- Object+output-scoped salvo lane (ADR-W026) ----
             // The REST twin gates BOTH axes when a head is addressed

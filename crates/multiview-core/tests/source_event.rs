@@ -15,6 +15,7 @@ fn obs(boundary: EventBoundary, revision: u64) -> SourceEventObservation {
         boundary,
         correlation_id: None,
         asset_id: None,
+        descriptor: None,
     }
 }
 fn clock(position_ns: i64) -> PresentationClock {
@@ -390,4 +391,36 @@ fn serde_is_tagged_and_exact() {
         serde_json::from_str::<SourceEventObservation>(&json).unwrap(),
         o
     );
+}
+
+/// F3 regression: an OLDER clock epoch must never supersede (and so must
+/// never let `prune_terminal` irreversibly drop) evidence from a newer epoch.
+#[test]
+fn older_clock_epoch_retains_future_epoch_evidence() {
+    let mut t = tracker();
+    let mut o = obs(
+        EventBoundary::Start {
+            pts_ns: Some(10),
+            duration_ns: None,
+        },
+        1,
+    );
+    o.key.epoch = 8;
+    t.observe(o.clone());
+    let at = |epoch: u64| PresentationClock::Fresh {
+        source_id: "source".into(),
+        epoch,
+        position_ns: 20,
+    };
+    let event = t.get(&o.key).unwrap();
+    assert_eq!(event.project(&at(7)).lifecycle, EventLifecycle::Uncertain);
+    assert_eq!(t.prune_terminal(&at(7), |_| true), 0);
+    assert!(
+        t.get(&o.key).is_some(),
+        "epoch-7 clock must retain epoch-8 event"
+    );
+    let event = t.get(&o.key).unwrap();
+    assert_eq!(event.project(&at(8)).lifecycle, EventLifecycle::Active);
+    assert_eq!(event.project(&at(9)).lifecycle, EventLifecycle::Superseded);
+    assert_eq!(t.prune_terminal(&at(9), |_| true), 1);
 }

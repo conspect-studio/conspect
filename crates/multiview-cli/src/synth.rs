@@ -101,6 +101,20 @@ pub enum SyntheticKind {
         /// Draw the overrun a11y badge (`OVER` / `ELAPSED`) past the target.
         overrun_badge: bool,
     },
+    /// A BOM weather graphic for one `[weather]` location (re-rendered only
+    /// when that location's published data revision changes).
+    Weather {
+        /// The weather location id.
+        location: String,
+        /// Seven-day outlook or today's detail.
+        template: multiview_config::WeatherTemplate,
+        /// Opaque gradient or transparent (alpha) background.
+        background: multiview_config::WeatherBackground,
+    },
+    /// A Graphics (CG) item or playout channel bus. Driven by a per-tick
+    /// [`crate::graphics_source::GraphicsGen`] (prepared images + opacity
+    /// ramps from the tick counter), not by `render_key`.
+    Graphics(crate::graphics_source::GraphicsTarget),
 }
 
 impl SyntheticKind {
@@ -157,6 +171,18 @@ impl SyntheticKind {
                 overrun_prefix: overrun_prefix.clone(),
                 overrun_badge: *overrun_badge,
             }),
+            SourceKind::Weather {
+                location,
+                template,
+                background,
+            } => Some(Self::Weather {
+                location: location.clone(),
+                template: *template,
+                background: *background,
+            }),
+            SourceKind::Graphic { .. } | SourceKind::GraphicsChannel { .. } => {
+                crate::graphics_source::GraphicsTarget::from_source_kind(kind).map(Self::Graphics)
+            }
             _ => None,
         }
     }
@@ -165,7 +191,10 @@ impl SyntheticKind {
     /// re-render, not just republish a cached frame).
     #[must_use]
     pub const fn animated(&self) -> bool {
-        matches!(self, Self::Clock { .. } | Self::Timer { .. })
+        matches!(
+            self,
+            Self::Clock { .. } | Self::Timer { .. } | Self::Weather { .. } | Self::Graphics(_)
+        )
     }
 
     /// Whether this source's display advances at the **frame** cadence (an
@@ -241,7 +270,6 @@ pub fn render(
 // `overlay`-gated clock/timer arms read them (bars/solid ignore them, and without
 // `overlay` those arms short-circuit), so they are unused in the default build —
 // the parameters stay part of the public signature regardless of feature set.
-#[cfg_attr(not(feature = "overlay"), allow(unused_variables))]
 pub fn render_at(
     kind: &SyntheticKind,
     width: u32,
@@ -251,85 +279,218 @@ pub fn render_at(
     subsecond_ns: u64,
     cadence: Rational,
 ) -> Result<Nv12Image, SynthError> {
-    match kind {
-        SyntheticKind::Bars => Nv12Image::color_bars(width, height, canvas)
-            .map_err(|e| SynthError::Compositor(e.to_string())),
-        SyntheticKind::Solid { r, g, b } => Nv12Image::solid_rgb(width, height, *r, *g, *b, canvas)
-            .map_err(|e| SynthError::Compositor(e.to_string())),
-        #[cfg(feature = "overlay")]
-        SyntheticKind::Clock {
-            mode,
-            twelve_hour,
-            tz,
-            tz_offset_minutes,
-            label,
-            show_offset,
-            show_reference,
-            numerals,
-        } => {
-            // Resolve the displayed offset for THIS instant: an IANA zone is
-            // DST-correct per render; otherwise the fixed offset. (Integer/chrono
-            // only — never float time.)
-            let offset = match tz {
-                Some(tz) => multiview_overlay::clock::resolve_offset(*tz, now),
-                None => TimeZoneOffset::from_minutes(*tz_offset_minutes),
-            };
-            render_clock(
+    SynthRenderer::new().render_at(kind, width, height, canvas, now, subsecond_ns, cadence)
+}
+
+/// Per-generator-thread render state, reused across renders so a clock/timer
+/// re-bake costs only the draw: one [`TextEngine`] (bundled-font load + glyph
+/// atlas) built lazily once instead of per frame, and the near-black slate
+/// cached per `(width, height, canvas)`.
+///
+/// Output is byte-identical to a fresh-engine render (the engine is a pure
+/// shaping/rasterization cache; the slate is a deterministic solid fill) — see
+/// the `reused_renderer_matches_fresh_render` test.
+///
+/// [`TextEngine`]: multiview_compositor::overlay::text::TextEngine
+#[derive(Default)]
+pub struct SynthRenderer {
+    #[cfg(feature = "overlay")]
+    engine: Option<multiview_compositor::overlay::text::TextEngine>,
+    #[cfg(feature = "overlay")]
+    slate: Option<(u32, u32, CanvasColor, Nv12Image)>,
+}
+
+impl std::fmt::Debug for SynthRenderer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SynthRenderer").finish_non_exhaustive()
+    }
+}
+
+impl SynthRenderer {
+    /// An empty renderer; the text engine and slate are built on first use.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// The reused text engine and the cached `width`×`height` slate.
+    #[cfg(feature = "overlay")]
+    fn parts(
+        &mut self,
+        width: u32,
+        height: u32,
+        canvas: CanvasColor,
+    ) -> Result<
+        (
+            &mut multiview_compositor::overlay::text::TextEngine,
+            &Nv12Image,
+        ),
+        SynthError,
+    > {
+        let cc = |e: multiview_compositor::Error| SynthError::Compositor(e.to_string());
+        if self.engine.is_none() {
+            self.engine = Some(multiview_compositor::overlay::text::TextEngine::new().map_err(cc)?);
+        }
+        let stale = !matches!(&self.slate, Some((w, h, c, _)) if *w == width && *h == height && *c == canvas);
+        if stale {
+            // A near-black slate to draw the clock/timer onto.
+            let bg = Nv12Image::solid_rgb(width, height, 8, 8, 12, canvas).map_err(cc)?;
+            self.slate = Some((width, height, canvas, bg));
+        }
+        match (self.engine.as_mut(), self.slate.as_ref()) {
+            (Some(engine), Some((_, _, _, bg))) => Ok((engine, bg)),
+            _ => Err(SynthError::Compositor(
+                "synthetic renderer state".to_owned(),
+            )),
+        }
+    }
+
+    /// [`render_at`], reusing this renderer's text engine and slate.
+    ///
+    /// # Errors
+    ///
+    /// As [`render_at`].
+    #[cfg_attr(not(feature = "overlay"), allow(unused_variables))]
+    #[allow(clippy::too_many_arguments)]
+    // reason: the same positional signature as the free `render_at`.
+    pub fn render_at(
+        &mut self,
+        kind: &SyntheticKind,
+        width: u32,
+        height: u32,
+        canvas: CanvasColor,
+        now: WallTime,
+        subsecond_ns: u64,
+        cadence: Rational,
+    ) -> Result<Nv12Image, SynthError> {
+        match kind {
+            SyntheticKind::Bars => Nv12Image::color_bars(width, height, canvas)
+                .map_err(|e| SynthError::Compositor(e.to_string())),
+            SyntheticKind::Solid { r, g, b } => {
+                Nv12Image::solid_rgb(width, height, *r, *g, *b, canvas)
+                    .map_err(|e| SynthError::Compositor(e.to_string()))
+            }
+            #[cfg(feature = "overlay")]
+            SyntheticKind::Clock {
+                mode,
+                twelve_hour,
+                tz,
+                tz_offset_minutes,
+                label,
+                show_offset,
+                show_reference,
+                numerals,
+            } => {
+                // Resolve the displayed offset for THIS instant: an IANA zone is
+                // DST-correct per render; otherwise the fixed offset. (Integer/chrono
+                // only — never float time.)
+                let offset = match tz {
+                    Some(tz) => multiview_overlay::clock::resolve_offset(*tz, now),
+                    None => TimeZoneOffset::from_minutes(*tz_offset_minutes),
+                };
+                let (engine, bg) = self.parts(width, height, canvas)?;
+                render_clock(
+                    engine,
+                    bg,
+                    width,
+                    height,
+                    canvas,
+                    ClockRender {
+                        mode: *mode,
+                        twelve_hour: *twelve_hour,
+                        offset,
+                        label: label.as_deref(),
+                        show_offset: *show_offset,
+                        show_reference: *show_reference,
+                        numerals: *numerals,
+                    },
+                    now,
+                )
+            }
+            #[cfg(feature = "overlay")]
+            SyntheticKind::Timer {
+                target,
+                direction,
+                on_target,
+                format,
+                label,
+                overrun_prefix,
+                overrun_badge,
+            } => {
+                // Resolve the target to an absolute instant for THIS sampled `now`
+                // (DST-correct via the shared tz resolver), compute the integer
+                // displayed duration + state, and bake the readout. Resolution can
+                // only fail on a malformed target — rejected at config load — but is
+                // defended here (never a panic on the data plane, safety rule #3).
+                let resolved = target
+                    .resolve(now, *direction)
+                    .map_err(|e| SynthError::Compositor(e.to_string()))?;
+                let readout =
+                    multiview_config::timer::compute(resolved, now, *direction, *on_target);
+                let (engine, bg) = self.parts(width, height, canvas)?;
+                render_timer(
+                    engine,
+                    bg,
+                    width,
+                    height,
+                    canvas,
+                    TimerRender {
+                        readout,
+                        direction: *direction,
+                        format: *format,
+                        label: label.as_deref(),
+                        overrun_prefix: overrun_prefix.as_deref(),
+                        overrun_badge: *overrun_badge,
+                        subsecond_ns,
+                        cadence,
+                    },
+                )
+            }
+            SyntheticKind::Weather {
+                location,
+                template,
+                background,
+            } => crate::weather_source::render_weather(
+                crate::weather_source::snapshot(location).as_deref(),
+                *template,
+                *background,
                 width,
                 height,
                 canvas,
-                ClockRender {
-                    mode: *mode,
-                    twelve_hour: *twelve_hour,
-                    offset,
-                    label: label.as_deref(),
-                    show_offset: *show_offset,
-                    show_reference: *show_reference,
-                    numerals: *numerals,
-                },
-                now,
-            )
+            ),
+            // One-shot render (thumbnails / tests): an item renders its template; a
+            // channel bus starts clear. Live sources use `graphics_loop`.
+            SyntheticKind::Graphics(target) => render_graphics(target, width, height, canvas),
+            // Without the `overlay` feature a clock/timer cannot be baked; the caller
+            // falls back honestly (ADR-0027) rather than panicking.
+            #[cfg(not(feature = "overlay"))]
+            SyntheticKind::Clock { .. } | SyntheticKind::Timer { .. } => {
+                Err(SynthError::OverlayRequired)
+            }
         }
-        #[cfg(feature = "overlay")]
-        SyntheticKind::Timer {
-            target,
-            direction,
-            on_target,
-            format,
-            label,
-            overrun_prefix,
-            overrun_badge,
-        } => {
-            // Resolve the target to an absolute instant for THIS sampled `now`
-            // (DST-correct via the shared tz resolver), compute the integer
-            // displayed duration + state, and bake the readout. Resolution can
-            // only fail on a malformed target — rejected at config load — but is
-            // defended here (never a panic on the data plane, safety rule #3).
-            let resolved = target
-                .resolve(now, *direction)
-                .map_err(|e| SynthError::Compositor(e.to_string()))?;
-            let readout = multiview_config::timer::compute(resolved, now, *direction, *on_target);
-            render_timer(
-                width,
-                height,
-                canvas,
-                TimerRender {
-                    readout,
-                    direction: *direction,
-                    format: *format,
-                    label: label.as_deref(),
-                    overrun_prefix: overrun_prefix.as_deref(),
-                    overrun_badge: *overrun_badge,
-                    subsecond_ns,
-                    cadence,
-                },
-            )
+    }
+}
+
+/// One-shot graphics render (thumbnails / tests): an item renders its
+/// template; a channel bus starts clear. Live sources use `graphics_loop`.
+fn render_graphics(
+    target: &crate::graphics_source::GraphicsTarget,
+    width: u32,
+    height: u32,
+    canvas: CanvasColor,
+) -> Result<Nv12Image, SynthError> {
+    match target {
+        crate::graphics_source::GraphicsTarget::Item(id) => {
+            let config = multiview_graphics::GraphicsHub::global().config();
+            match config.item(id) {
+                Some(item) => crate::graphics_source::render_item(item, width, height, canvas),
+                None => Nv12Image::solid_rgb(width, height, 0, 0, 0, canvas)
+                    .map_err(|e| SynthError::Compositor(e.to_string())),
+            }
         }
-        // Without the `overlay` feature a clock/timer cannot be baked; the caller
-        // falls back honestly (ADR-0027) rather than panicking.
-        #[cfg(not(feature = "overlay"))]
-        SyntheticKind::Clock { .. } | SyntheticKind::Timer { .. } => {
-            Err(SynthError::OverlayRequired)
+        crate::graphics_source::GraphicsTarget::Channel { .. } => {
+            Nv12Image::solid_rgb(width, height, 0, 0, 0, canvas)
+                .map_err(|e| SynthError::Compositor(e.to_string()))
         }
     }
 }
@@ -365,6 +526,13 @@ struct ClockRender<'a> {
 /// (`hh_mm_ss_ff`) changes once per **frame** — `second·fps + frame_index`.
 #[must_use]
 fn render_key(kind: &SyntheticKind, now: WallTime, frame_in_second: u64) -> i64 {
+    if let SyntheticKind::Weather { location, .. } = kind {
+        // Re-render only when the published data revision changes. A
+        // momentarily locked store keeps the cached frame (key `i64::MIN`
+        // never matches a real revision, so it is mapped to "unchanged" by the
+        // generator via `weather_key_or_cached`).
+        return crate::weather_source::render_key(location).unwrap_or(i64::MIN);
+    }
     if !kind.animated() {
         return 0;
     }
@@ -379,6 +547,8 @@ fn render_key(kind: &SyntheticKind, now: WallTime, frame_in_second: u64) -> i64 
 
 #[cfg(feature = "overlay")]
 fn render_clock(
+    engine: &mut multiview_compositor::overlay::text::TextEngine,
+    bg: &Nv12Image,
     width: u32,
     height: u32,
     canvas: CanvasColor,
@@ -386,12 +556,8 @@ fn render_clock(
     now: WallTime,
 ) -> Result<Nv12Image, SynthError> {
     use multiview_compositor::overlay::subpass::{apply_overlays_to_nv12, OverlayDrawList};
-    use multiview_compositor::overlay::text::TextEngine;
 
     let cc = |e: multiview_compositor::Error| SynthError::Compositor(e.to_string());
-    // A near-black slate to draw the clock onto.
-    let bg = Nv12Image::solid_rgb(width, height, 8, 8, 12, canvas).map_err(cc)?;
-    let mut engine = TextEngine::new().map_err(cc)?;
     let mut list = OverlayDrawList::new();
 
     // Reserve the bottom strip for the metadata (label + offset/reference badges)
@@ -421,18 +587,18 @@ fn render_clock(
     };
 
     if spec.mode.has_analog() {
-        draw_analog_face(&mut list, &mut engine, width, dial_h, spec, now)?;
+        draw_analog_face(&mut list, engine, width, dial_h, spec, now)?;
     }
     if spec.mode.has_digital() {
         // Digital-only fills the face region; dual places the readout in the lower
         // band, beneath the dial.
         let top = if dual { dial_h } else { 0 };
-        draw_digital_readout(&mut list, &mut engine, width, top, readout_h, spec, now)?;
+        draw_digital_readout(&mut list, engine, width, top, readout_h, spec, now)?;
     }
     if has_strip {
         draw_metadata_strip(
             &mut list,
-            &mut engine,
+            engine,
             width,
             height.saturating_sub(strip_h),
             strip_h,
@@ -440,7 +606,7 @@ fn render_clock(
         )?;
     }
 
-    apply_overlays_to_nv12(&bg, &list, canvas).map_err(cc)
+    apply_overlays_to_nv12(bg, &list, canvas).map_err(cc)
 }
 
 /// The resolved-per-instant timer render parameters handed to `render_timer`.
@@ -471,6 +637,8 @@ struct TimerRender<'a> {
 /// drawing primitive.
 #[cfg(feature = "overlay")]
 fn render_timer(
+    engine: &mut multiview_compositor::overlay::text::TextEngine,
+    bg: &Nv12Image,
     width: u32,
     height: u32,
     canvas: CanvasColor,
@@ -479,12 +647,10 @@ fn render_timer(
     use multiview_compositor::overlay::subpass::{
         apply_overlays_to_nv12, OverlayColor, OverlayDrawList,
     };
-    use multiview_compositor::overlay::text::{FontFamily, TextEngine};
+    use multiview_compositor::overlay::text::FontFamily;
     use multiview_config::timer::overrun_badge_word;
 
     let cc = |e: multiview_compositor::Error| SynthError::Compositor(e.to_string());
-    let bg = Nv12Image::solid_rgb(width, height, 8, 8, 12, canvas).map_err(cc)?;
-    let mut engine = TextEngine::new().map_err(cc)?;
     let mut list = OverlayDrawList::new();
 
     let is_overrun = spec.readout.state.is_overrun();
@@ -532,7 +698,7 @@ fn render_timer(
     };
     draw_fixed_mono_readout(
         &mut list,
-        &mut engine,
+        engine,
         &text,
         width,
         (count_top, count_h),
@@ -552,7 +718,7 @@ fn render_timer(
         push_run_centred_at(&mut list, &run, i32_of(width) / 2, cy, color);
     }
 
-    apply_overlays_to_nv12(&bg, &list, canvas).map_err(cc)
+    apply_overlays_to_nv12(bg, &list, canvas).map_err(cc)
 }
 
 /// Draw the analogue dial (bezel, ticks, hands, hub) centred in the top `face_h`
@@ -771,14 +937,14 @@ fn draw_metadata_strip(
 /// `u32 -> f32` without an `as` cast (dimensions fit u16 well within 8K).
 #[cfg(feature = "overlay")]
 #[must_use]
-fn f32_of(v: u32) -> f32 {
+pub(crate) fn f32_of(v: u32) -> f32 {
     f32::from(u16::try_from(v).unwrap_or(u16::MAX))
 }
 
 /// `u32 -> i32` saturating (no `as` cast).
 #[cfg(feature = "overlay")]
 #[must_use]
-fn i32_of(v: u32) -> i32 {
+pub(crate) fn i32_of(v: u32) -> i32 {
     i32::try_from(v).unwrap_or(i32::MAX)
 }
 
@@ -787,7 +953,7 @@ fn i32_of(v: u32) -> i32 {
 /// signed — there is no float-to-int cast anywhere on the path.
 #[cfg(feature = "overlay")]
 #[must_use]
-fn round_to_i32(value: f32) -> i32 {
+pub(crate) fn round_to_i32(value: f32) -> i32 {
     if !value.is_finite() {
         return 0;
     }
@@ -834,7 +1000,7 @@ fn unit_vector_deg(deg: f32) -> (f32, f32) {
 /// when the run has no drawable glyphs.
 #[cfg(feature = "overlay")]
 #[must_use]
-fn run_bbox(
+pub(crate) fn run_bbox(
     run: &multiview_compositor::overlay::text::RasterizedRun,
 ) -> Option<(i32, i32, i32, i32)> {
     let mut min_x = i32::MAX;
@@ -861,7 +1027,7 @@ fn run_width(run: &multiview_compositor::overlay::text::RasterizedRun) -> i32 {
 /// tinted `color`. Only the straight coverage (alpha) is carried; the linear
 /// `color` supplies the tint (overlay-rendering.md §4.1).
 #[cfg(feature = "overlay")]
-fn push_run_offset(
+pub(crate) fn push_run_offset(
     list: &mut multiview_compositor::overlay::subpass::OverlayDrawList,
     run: &multiview_compositor::overlay::text::RasterizedRun,
     off_x: i32,
@@ -990,9 +1156,22 @@ pub(crate) fn generator_loop_fenced(
     lifecycle: Option<(&str, u64)>,
 ) {
     let interval = tick_interval(cadence);
+    if let SyntheticKind::Graphics(target) = &kind {
+        graphics_loop(
+            crate::graphics_source::GraphicsGen::production(target.clone(), width, height, canvas),
+            store,
+            interval,
+            stop,
+            lifecycle,
+        );
+        return;
+    }
     let start = Instant::now();
     // (render-key, frame) so a clock re-renders once a second and statics once.
     let mut cached: Option<(i64, Arc<Nv12Image>)> = None;
+    // One text engine + slate for the generator's lifetime: a re-render (once
+    // per displayed second for a clock) no longer reloads the bundled fonts.
+    let mut renderer = SynthRenderer::new();
 
     while !stop.load(Ordering::Acquire) {
         let (secs, subsecond_ns) = unix_now_parts();
@@ -1002,8 +1181,9 @@ pub(crate) fn generator_loop_fenced(
         let frame_in_second = multiview_config::timer::frame_index(subsecond_ns, cadence);
         let key = render_key(&kind, now, frame_in_second);
         let frame = match &cached {
-            Some((k, f)) if *k == key => Arc::clone(f),
-            _ => match render_at(&kind, width, height, canvas, now, subsecond_ns, cadence) {
+            Some((k, f)) if *k == key || key == i64::MIN => Arc::clone(f),
+            _ => match renderer.render_at(&kind, width, height, canvas, now, subsecond_ns, cadence)
+            {
                 Ok(image) => {
                     let f = Arc::new(image);
                     cached = Some((key, Arc::clone(&f)));
@@ -1031,6 +1211,43 @@ pub(crate) fn generator_loop_fenced(
             let _ = lifecycle;
             store.publish_arc(frame, at);
         }
+        sleep_until(interval, stop);
+    }
+}
+
+/// The graphics generator loop: one [`GraphicsGen::frame`] per tick from the
+/// loop's own tick counter (opacity ramps are a pure function of it), the
+/// prepared frame republished otherwise. Never blocks on the hub.
+///
+/// [`GraphicsGen::frame`]: crate::graphics_source::GraphicsGen::frame
+fn graphics_loop(
+    mut generator: crate::graphics_source::GraphicsGen,
+    store: &TileStore<Nv12Image>,
+    interval: Duration,
+    stop: &AtomicBool,
+    lifecycle: Option<(&str, u64)>,
+) {
+    let start = Instant::now();
+    let mut tick: u64 = 0;
+    while !stop.load(Ordering::Acquire) {
+        if let Some(frame) = generator.frame(tick) {
+            let elapsed = Instant::now().saturating_duration_since(start);
+            let at = MediaTime::from_nanos(i64::try_from(elapsed.as_nanos()).unwrap_or(i64::MAX));
+            #[cfg(feature = "ffmpeg")]
+            if let Some((id, epoch)) = lifecycle {
+                if !crate::pipeline::publish_live_synth_frame_for(id, epoch, store, frame, at) {
+                    return;
+                }
+            } else {
+                store.publish_arc(frame, at);
+            }
+            #[cfg(not(feature = "ffmpeg"))]
+            {
+                let _ = lifecycle;
+                store.publish_arc(frame, at);
+            }
+        }
+        tick = tick.wrapping_add(1);
         sleep_until(interval, stop);
     }
 }
@@ -1180,6 +1397,50 @@ segment_ms = 1000
             show_offset: false,
             show_reference: false,
             numerals: false,
+        }
+    }
+
+    /// One reused [`SynthRenderer`] (text engine + slate kept across renders,
+    /// including a tile-size change mid-stream) is byte-identical to a fresh
+    /// per-render engine for every clock face and a timer.
+    #[cfg(feature = "overlay")]
+    #[test]
+    fn reused_renderer_matches_fresh_render() {
+        let c = canvas();
+        let cad = Rational { num: 25, den: 1 };
+        let mut labelled = clock_kind(ClockFaceMode::Dual, false, 600);
+        if let SyntheticKind::Clock {
+            label,
+            show_offset,
+            numerals,
+            ..
+        } = &mut labelled
+        {
+            *label = Some("Sydney".to_owned());
+            *show_offset = true;
+            *numerals = true;
+        }
+        let kinds = [
+            clock_kind(ClockFaceMode::Analog, false, 0),
+            clock_kind(ClockFaceMode::Digital, true, 0),
+            labelled,
+            timer_kind(TimerFormat::HhMmSs, TimerOnTarget::Hold),
+        ];
+        let base = 14 * 3600 + 29 * 50;
+        let mut renderer = SynthRenderer::new();
+        for kind in &kinds {
+            for (i, (w, h)) in [(320_u32, 180_u32), (320, 180), (256, 144), (320, 180)]
+                .into_iter()
+                .enumerate()
+            {
+                let now = WallTime::from_unix_seconds(base + i64::try_from(i).unwrap_or(0) * 7);
+                let fresh = render_at(kind, w, h, c, now, 0, cad).expect("fresh");
+                let reused = renderer
+                    .render_at(kind, w, h, c, now, 0, cad)
+                    .expect("reused");
+                assert_eq!(fresh.y_plane(), reused.y_plane(), "{kind:?} {w}x{h}");
+                assert_eq!(fresh.uv_plane(), reused.uv_plane(), "{kind:?} {w}x{h}");
+            }
         }
     }
 

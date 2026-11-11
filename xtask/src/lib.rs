@@ -9,6 +9,7 @@
 //! resolves a test-only Cargo seam feature (task #109).
 #![warn(missing_docs)]
 
+pub mod gazetteer;
 pub mod iptv;
 pub mod release_features;
 pub mod soak;

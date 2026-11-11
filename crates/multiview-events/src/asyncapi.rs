@@ -241,8 +241,22 @@ fn build_messages() -> Value {
     map.extend(build_messages_envelope());
     // Data event messages.
     map.extend(build_messages_data_events());
+    map.insert("InputLifecycle".to_owned(), input_lifecycle_message());
     // Switcher realtime surface messages (ADR-RT008).
     map.extend(build_messages_switcher_events());
+    map.insert("CatalogueLinkStatus".to_owned(), json!({
+        "name": "CatalogueLinkStatus",
+        "title": "Catalogue link status changed",
+        "summary": "A source linked to an IPTV-ORG catalogue entry changed link status (catalogue.link_status on topic `inputs`).",
+        "description": concat!(
+            "Emitted on topic `inputs` with envelope `id` = source id, after each ",
+            "catalogue sync. LOSSLESS lifecycle fact. Carries identifiers and the status ",
+            "token only; the change diff and ranked alternatives are served by ",
+            "`GET /api/v1/catalogues/iptv-org/links`. Authorized per source id (BOLA).",
+        ),
+        "contentType": "application/json",
+        "payload": { "$ref": "#/components/schemas/CatalogueLinkStatus" }
+    }));
     // Devices realtime surface messages (ADR-RT007).
     map.extend(build_messages_device_events());
     // Control frame messages.
@@ -456,6 +470,16 @@ fn input_streams_message() -> Value {
 /// lossless `media.player_state` lifecycle event on topic `switcher`.
 fn build_messages_switcher_events() -> serde_json::Map<String, Value> {
     let mut map = serde_json::Map::new();
+    map.insert(
+        "SwitcherOperation".to_owned(),
+        json!({
+            "name": "SwitcherOperation",
+            "title": "Switcher operation terminal result",
+            "summary": "The engine applied or rejected an M/E command at an exact output tick.",
+            "contentType": "application/json",
+            "payload": { "$ref": "#/components/schemas/SwitcherOperation" }
+        }),
+    );
     map.insert("MediaPlayerEvent".to_owned(), json!({
         "name": "MediaPlayerEvent",
         "title": "Media-player transport-state lifecycle",
@@ -471,6 +495,14 @@ fn build_messages_switcher_events() -> serde_json::Map<String, Value> {
         ),
         "contentType": "application/json",
         "payload": { "$ref": "#/components/schemas/MediaPlayerEvent" }
+    }));
+    map.insert("GraphicsChannelEvent".to_owned(), json!({
+        "name": "GraphicsChannelEvent",
+        "title": "Graphics playout channel state",
+        "summary": "A graphics channel's preview/program changed (graphics.channel_state on topic `switcher`).",
+        "description": "Emitted on topic `switcher` with envelope `id` = graphics channel id on cue / take / clear / next. Lossless lifecycle event.",
+        "contentType": "application/json",
+        "payload": { "$ref": "#/components/schemas/GraphicsChannelEvent" }
     }));
     map
 }
@@ -698,11 +730,15 @@ fn event_payload_one_of() -> Value {
         { "$ref": "#/components/schemas/HealthWarning" },
         { "$ref": "#/components/schemas/InputConnection" },
         { "$ref": "#/components/schemas/InputStreams" },
+        { "$ref": "#/components/schemas/InputLifecycle" },
         { "$ref": "#/components/schemas/JobProgress" },
         { "$ref": "#/components/schemas/AlarmTransition" },
         { "$ref": "#/components/schemas/TallyEvent" },
         { "$ref": "#/components/schemas/SalvoEvent" },
+        { "$ref": "#/components/schemas/SwitcherOperation" },
         { "$ref": "#/components/schemas/MediaPlayerEvent" },
+        { "$ref": "#/components/schemas/GraphicsChannelEvent" },
+        { "$ref": "#/components/schemas/CatalogueLinkStatus" },
         { "$ref": "#/components/schemas/DeviceStatus" },
         { "$ref": "#/components/schemas/DeviceAdopted" },
         { "$ref": "#/components/schemas/DeviceRemoved" },
@@ -775,6 +811,7 @@ fn core_event_schemas() -> Value {
         "ShedLoad": shed_load_schema(),
         "InputConnection": input_connection_schema(),
         "InputStreams": input_streams_schema(),
+        "InputLifecycle": input_lifecycle_schema(),
         "JobProgress": job_progress_schema(),
         "AlarmTransition": alarm_transition_schema(),
         "TallyTarget": tally_target_schema(),
@@ -1119,7 +1156,7 @@ fn output_run_state_schema() -> Value {
     json!({
         "type": "string",
         "description": "Running state of an output sink.",
-        "enum": ["starting", "running", "migrating", "error"]
+        "enum": ["idle", "starting", "running", "migrating", "error"]
     })
 }
 
@@ -1199,7 +1236,7 @@ fn warning_code_schema() -> Value {
             "`#[non_exhaustive]`: the catalog grows over time, so a client must ",
             "treat an unknown code as a forward-compatible warning, not an error.",
         ),
-        "enum": ["gpu-present-no-vulkan-adapter", "config-file-invalid", "config-file-requires-restart", "config-file-apply-incomplete", "container-no-host-networking"]
+        "enum": ["gpu-present-no-vulkan-adapter", "config-file-invalid", "config-file-requires-restart", "config-file-apply-incomplete", "container-no-host-networking", "catalogue-link-attention"]
     })
 }
 
@@ -1331,6 +1368,41 @@ fn input_connection_schema() -> Value {
                 "type": "integer",
                 "format": "uint32",
                 "description": "Reconnect attempt counter, if reconnecting."
+            }
+        }
+    })
+}
+
+fn input_lifecycle_message() -> Value {
+    json!({
+        "name": "InputLifecycle",
+        "title": "Source lifecycle transition",
+        "summary": "A source moved between idle / starting / ready / failed (input.lifecycle on topic `inputs`). Not the tile signal state.",
+        "contentType": "application/json",
+        "payload": { "$ref": "#/components/schemas/InputLifecycle" }
+    })
+}
+
+fn input_lifecycle_schema() -> Value {
+    let state = json!({ "type": "string", "enum": ["idle", "starting", "ready", "failed"] });
+    json!({
+        "type": "object",
+        "description": "Data body of the `input.lifecycle` event.",
+        "required": ["source_id", "generation", "from", "to", "reason", "at_ms"],
+        "properties": {
+            "source_id": { "type": "string", "description": "The source id (the authorization object)." },
+            "generation": { "type": "integer", "format": "uint64", "description": "Start generation; increments on every start from idle." },
+            "from": state,
+            "to": state,
+            "reason": { "type": "string", "description": "Operator-safe reason." },
+            "at_ms": { "type": "integer", "format": "int64", "description": "Unix milliseconds." },
+            "lease_holders": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "required": ["kind", "label"],
+                    "properties": { "kind": { "type": "string" }, "label": { "type": "string" } }
+                }
             }
         }
     })
@@ -1487,8 +1559,42 @@ fn salvo_event_schema() -> Value {
 /// transport-state event and its tagged state union.
 fn switcher_event_schemas() -> Value {
     json!({
+        "SwitcherOperation": switcher_operation_schema(),
         "MediaPlayerState": media_player_state_schema(),
-        "MediaPlayerEvent": media_player_event_schema()
+        "MediaPlayerEvent": media_player_event_schema(),
+        "GraphicsChannelEvent": graphics_channel_event_schema(),
+        "CatalogueLinkStatus": catalogue_link_status_schema()
+    })
+}
+
+fn switcher_operation_schema() -> Value {
+    json!({
+        "type": "object",
+        "description": "Terminal outcome, emitted only at the engine output tick; envelope corr equals operation_id, id equals M/E id.",
+        "required": ["me", "program", "tick", "operation_id", "completed"],
+        "properties": {
+            "me": { "type": "string" },
+            "program": { "type": "string" },
+            "tick": { "type": "integer", "format": "uint64" },
+            "operation_id": { "type": "string" },
+            "completed": { "type": "boolean" },
+            "error": { "type": "string" }
+        }
+    })
+}
+
+fn graphics_channel_event_schema() -> Value {
+    json!({
+        "type": "object",
+        "description": "Data body of `graphics.channel_state`: a graphics playout channel's preview/program after a cue / take / clear / next. Envelope `id` = channel id.",
+        "required": ["channel", "seq", "action"],
+        "properties": {
+            "channel": { "type": "string", "description": "Graphics channel id (matches the envelope `id`)." },
+            "preview": { "type": "string", "description": "Cued (preview) item id, if any." },
+            "program": { "type": "string", "description": "On-air (program) item id, if any." },
+            "seq": { "type": "integer", "format": "uint64", "description": "Increments on every program change." },
+            "action": { "type": "string", "description": "The verb that produced this state: cue, take, clear, next or rundown." }
+        }
     })
 }
 
@@ -1555,6 +1661,28 @@ fn media_player_state_schema() -> Value {
                 "description": "Reached end-of-file with no loop/vamp engaged."
             }
         ]
+    })
+}
+
+fn catalogue_link_status_schema() -> Value {
+    json!({
+        "type": "object",
+        "description": concat!(
+            "Data body of `catalogue.link_status` (IPTV-ORG, ADR-M015): a linked ",
+            "source's catalogue link status changed. Envelope `id` = source id.",
+        ),
+        "required": ["source_id", "status"],
+        "properties": {
+            "source_id": { "type": "string", "description": "The linked source id." },
+            "status": {
+                "type": "string",
+                "enum": ["in_sync", "updated", "stream_removed", "channel_closed", "blocklisted", "unlinked", "edited"]
+            },
+            "previous": { "type": "string", "description": "Previous status, when known." },
+            "channel": { "type": "string" },
+            "feed": { "type": "string" },
+            "replaced_by": { "type": "string", "description": "Replacement channel id (channel_closed)." }
+        }
     })
 }
 

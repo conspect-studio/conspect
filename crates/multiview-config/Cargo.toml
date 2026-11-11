@@ -36,6 +36,13 @@ chrono-tz = { workspace = true }
 # parsed to `IpNet` and matched against the RESOLVED dial IP. Permissive
 # (MIT/Apache-2.0), pure Rust, already in the workspace lock; deny-clean.
 ipnet = "2.12.0"
+# WHATWG URL parsing for `[[media_fill]]` `url_fetch` URLs (ADR-0100 Decision 8).
+# The hand-rolled authority split was replaced because only the WHATWG parser
+# normalises IDN labels to punycode and the decimal/hex/octal IPv4 notations to
+# `Host::Ipv4`; config then screens the PARSED host, not the input text.
+# `url` is MIT/Apache-2.0, pure Rust; already in the workspace lock (2.5.8, the
+# exact locked version), pulled in transitively by the optional control features.
+url = "2.5.8"
 
 [dev-dependencies]
 proptest = "1.5.0"

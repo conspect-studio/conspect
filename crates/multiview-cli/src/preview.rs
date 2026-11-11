@@ -112,6 +112,7 @@ impl ProgramAudioSlot {
 /// frames to JPEG on demand.
 pub struct CliPreviewProvider {
     program: ProgramSlot,
+    switcher_preview: Option<ProgramSlot>,
     /// The **live-updatable** per-input store map (ADR-W018): the run seeds it
     /// with the startup sources and the live-source hub RCUs additions/removals
     /// in, so live-added inputs are previewable. Reads are wait-free snapshots.
@@ -127,10 +128,19 @@ impl CliPreviewProvider {
     pub fn new(program: ProgramSlot, stores: SharedStores) -> Self {
         Self {
             program,
+            switcher_preview: None,
             stores,
             encoder: Nv12JpegEncoder::new(),
             clock: MonotonicTimeSource::new(),
         }
+    }
+
+    /// Attach a genuinely separate preview bus tap; no tap means PVW is
+    /// unavailable rather than a deceptive copy of Program.
+    #[must_use]
+    pub fn with_switcher_preview(mut self, slot: ProgramSlot) -> Self {
+        self.switcher_preview = Some(slot);
+        self
     }
 
     /// Encode one NV12 image to a JPEG, packing the Y and interleaved Cb/Cr
@@ -150,6 +160,11 @@ impl CliPreviewProvider {
 impl PreviewProvider for CliPreviewProvider {
     fn program_jpeg(&self, quality: u8) -> Option<Vec<u8>> {
         let frame = self.program.load()?;
+        self.encode(&frame, quality)
+    }
+
+    fn switcher_preview_jpeg(&self, quality: u8) -> Option<Vec<u8>> {
+        let frame = self.switcher_preview.as_ref()?.load()?;
         self.encode(&frame, quality)
     }
 

@@ -281,3 +281,92 @@ fn sanitize_oversized_message_is_bounded() {
         multiview_ffmpeg::log_bridge::MAX_LINE_LEN
     );
 }
+
+// ---- context-address normalisation (reconnect flood) ----------------------
+
+/// libav renders each line with the per-context pointer (`[tls @ 0x55…]`),
+/// which is new on every HLS reconnect. The same error text from a fresh
+/// context must coalesce into the existing window instead of emitting again.
+#[test]
+fn same_text_from_a_new_libav_context_address_is_suppressed() {
+    let mut s = Suppressor::new(64, Duration::from_secs(60));
+    let t = Duration::from_secs(0);
+    assert_eq!(
+        s.observe_scoped(
+            BridgeLevel::Error,
+            Some("cnn"),
+            "[tls @ 0x5607a5fed2c0] Error in the pull function.",
+            t
+        ),
+        SuppressOutcome::Emit
+    );
+    assert_eq!(
+        s.observe_scoped(
+            BridgeLevel::Error,
+            Some("cnn"),
+            "[tls @ 0x7fe9d0001a40] Error in the pull function.",
+            t + Duration::from_secs(1)
+        ),
+        SuppressOutcome::Suppress
+    );
+    // Another source's identical text still emits (per-resource keys).
+    assert_eq!(
+        s.observe_scoped(
+            BridgeLevel::Error,
+            Some("bbc"),
+            "[tls @ 0x7fe9d0001a40] Error in the pull function.",
+            t + Duration::from_secs(1)
+        ),
+        SuppressOutcome::Emit
+    );
+    assert_eq!(s.len(), 2);
+}
+
+/// A NEW error kind (different text) is never hidden by the normalisation.
+#[test]
+fn a_different_message_from_the_same_context_still_emits() {
+    let mut s = Suppressor::new(64, Duration::from_secs(60));
+    let t = Duration::from_secs(0);
+    assert_eq!(
+        s.observe(
+            BridgeLevel::Error,
+            "[tls @ 0x1] Error in the pull function.",
+            t
+        ),
+        SuppressOutcome::Emit
+    );
+    assert_eq!(
+        s.observe(
+            BridgeLevel::Error,
+            "[tls @ 0x2] The specified session has been invalidated.",
+            t
+        ),
+        SuppressOutcome::Emit
+    );
+    assert_eq!(
+        s.observe(
+            BridgeLevel::Error,
+            "[hls @ 0x2] Error in the pull function.",
+            t
+        ),
+        SuppressOutcome::Emit
+    );
+}
+
+#[test]
+fn normalize_context_address_rewrites_only_the_pointer() {
+    use multiview_ffmpeg::log_bridge::normalize_context_address;
+    assert_eq!(
+        normalize_context_address("[https @ 0x55aa] HTTP error 404 Not Found"),
+        "[https @ 0x?] HTTP error 404 Not Found"
+    );
+    assert_eq!(
+        normalize_context_address("[a @ 0xAbC1] x [b @ 0x2] y @ 0x"),
+        "[a @ 0x?] x [b @ 0x?] y @ 0x?"
+    );
+    assert!(matches!(
+        normalize_context_address("no address here"),
+        std::borrow::Cow::Borrowed("no address here")
+    ));
+    assert_eq!(normalize_context_address(""), "");
+}

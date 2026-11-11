@@ -112,6 +112,8 @@ multiview-ndi-sys = { path = "crates/multiview-ndi-sys" }
 multiview-rist-sys = { path = "crates/multiview-rist-sys" }
 multiview-srt-sys = { path = "crates/multiview-srt-sys" }
 multiview-cli = { path = "crates/multiview-cli" }
+multiview-weather = { path = "crates/multiview-weather" }
+multiview-graphics = { path = "crates/multiview-graphics" }
 
 [profile.release]
 lto = "thin"

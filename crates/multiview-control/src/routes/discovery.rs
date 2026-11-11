@@ -47,7 +47,7 @@ use crate::devices::discovery::{
     scan_service_types, DiscoveredService, DiscoveryBrowser, DiscoveryInventory, ScanAdmission,
     DEFAULT_ENTRY_TTL, DEFAULT_SCAN_BUDGET,
 };
-use crate::error::ControlResult;
+use crate::error::{ControlError, ControlResult};
 use crate::realtime::CorrKey;
 use crate::state::AppState;
 
@@ -124,6 +124,7 @@ pub(crate) async fn scan_devices(
     let budget = DEFAULT_SCAN_BUDGET;
 
     let fresh = match state.idempotency.reserve(idem.0.as_deref()) {
+        Reservation::Capacity => return Err(ControlError::IdempotencyCapacity),
         // A retried request with the same key: answer with the original
         // operation id WITHOUT re-executing the browse (the canonical
         // routes/mod.rs replay semantics — the original scan already ran or is

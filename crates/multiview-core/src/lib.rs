@@ -16,6 +16,7 @@ pub mod pixel;
 pub mod redact;
 pub mod source_event;
 pub mod stream;
+pub mod switcher;
 pub mod tally;
 pub mod time;
 pub mod traits;

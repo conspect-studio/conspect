@@ -571,3 +571,383 @@ segment_ms = 1000
     );
     generators.shutdown();
 }
+
+/// One raw HTTP/1.0 exchange against the bound control server.
+async fn http(addr: std::net::SocketAddr, request: String) -> String {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+    stream.write_all(request.as_bytes()).await.unwrap();
+    let mut buf = Vec::new();
+    stream.read_to_end(&mut buf).await.unwrap();
+    String::from_utf8_lossy(&buf).into_owned()
+}
+
+/// The registered producer for `id` (its stop/exit registration).
+fn producer(
+    registry: &multiview_cli::live_sources::StopRegistry,
+    id: &str,
+) -> Option<multiview_cli::live_sources::ProducerStop> {
+    registry.lock().ok()?.get(id).cloned()
+}
+
+/// Review R3-03: on the software / no-demand run path, an automation-only
+/// (and an automation-plus-metadata) edit through the GENERIC source PUT goes
+/// through the REAL command drain and leaves the running synthetic producer
+/// alone; a real media edit still swaps it.
+#[allow(clippy::too_many_lines)] // one REST walk through the policy edits
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_policy_only_generic_put_never_restarts_a_synthetic_producer() {
+    std::env::set_var("MULTIVIEW_CONTROL_TOKEN", "test-secret");
+    let config = two_cell_config();
+    let publisher = Arc::new(EnginePublisher::<EngineStateSnapshot, Event>::new(16));
+    let (sender, command_rx) = command_bus(16);
+    let registry = stop_registry();
+    let preview = shared_stores(HashMap::new());
+    let hub = LiveSourceHub::start(Arc::clone(&registry), Arc::clone(&preview));
+    let mut drain = command_drain_with_live_sources(
+        command_rx,
+        config.clone(),
+        Arc::clone(&publisher),
+        hub.handle(),
+    );
+    let mut drive = test_drive(&config);
+    // The running producer for `in_a` (the same hub spawn a live add uses).
+    sender
+        .try_submit(Command::UpsertSource {
+            op: OperationId::new(),
+            source: Box::new(config.sources[0].clone()),
+        })
+        .unwrap();
+    drain(&mut drive);
+    assert!(wait_for(Duration::from_secs(5), || producer(
+        &registry, "in_a"
+    )
+    .is_some()));
+    let running = producer(&registry, "in_a").unwrap();
+
+    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+    let (addr, server, _state) = multiview_cli::control::bind_and_serve(
+        "[::1]:0",
+        &config,
+        Arc::clone(&publisher),
+        sender,
+        multiview_control::no_preview(),
+        None, // switcher absent (legacy path)
+        None, // switcher lease owner absent
+        None,
+        None,
+        None,
+        None,
+        None,
+        multiview_control::LiveApplyCaps::default(),
+        multiview_control::LiveSourceCapability::synthetic_only(),
+        None,
+        None,
+        async move {
+            let _ = shutdown_rx.await;
+        },
+    )
+    .await
+    .expect("control server binds");
+    let put = |version: u32, body: serde_json::Value| {
+        let body = serde_json::json!({ "name": "in_a", "body": body }).to_string();
+        format!(
+            "PUT /api/v1/sources/in_a HTTP/1.0\r\nHost: {addr}\r\n\
+             Authorization: Bearer admin.test-secret\r\nIf-Match: W/\"{version}\"\r\n\
+             Content-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        )
+    };
+    let armed = serde_json::json!({ "automation": { "armed": true,
+        "on_break_start": { "action": "swap_cell", "target": "in_b" } } });
+    for (version, body) in [
+        (
+            1,
+            serde_json::json!({ "id": "in_a", "kind": "bars", "events": armed }),
+        ),
+        (
+            2,
+            serde_json::json!({ "id": "in_a", "kind": "bars", "events": armed,
+                "playlist_metadata": { "name": "Bars" }, "activation": "on_demand" }),
+        ),
+        (3, serde_json::json!({ "id": "in_a", "kind": "bars" })),
+    ] {
+        let response = http(addr, put(version, body.clone())).await;
+        assert!(
+            response.starts_with("HTTP/1.0 200") || response.starts_with("HTTP/1.1 200"),
+            "{response}"
+        );
+        drain(&mut drive);
+        std::thread::sleep(Duration::from_millis(200));
+        let now = producer(&registry, "in_a").expect("producer still registered");
+        assert!(
+            now.is_same_producer(&running) && !running.stop_requested(),
+            "a policy-only edit restarted the producer: {body}"
+        );
+    }
+    // A real media edit still swaps the producer.
+    let response = http(
+        addr,
+        put(
+            4,
+            serde_json::json!({ "id": "in_a", "kind": "solid", "color": "#22aa44" }),
+        ),
+    )
+    .await;
+    assert!(response.contains(" 200 "), "{response}");
+    drain(&mut drive);
+    assert!(
+        wait_for(Duration::from_secs(5), || producer(&registry, "in_a")
+            .is_some_and(|now| !now.is_same_producer(&running))),
+        "a media edit must replace the producer"
+    );
+    assert!(running.stop_requested());
+    let _ = shutdown_tx.send(());
+    let _ = server.await;
+    hub.shutdown();
+}
+
+/// Whether `store` now carries the uniform solid frame (media B) rather than
+/// the bars (media A).
+fn shows_solid(store: &TileStore<Nv12Image>) -> bool {
+    // The latest published frame, independent of the store's staleness
+    // thresholds (the startup store uses the default ones).
+    let Some(frame) = store.slot().load() else {
+        return false;
+    };
+    let a = frame.sample(2, 2);
+    a.is_some() && a == frame.sample(60, 60)
+}
+
+/// A boxed real command drain.
+type Drain = Box<dyn FnMut(&mut CompositorDrive<Nv12Image>)>;
+
+/// One running bars producer for `in_a` behind a real drain whose hub handle
+/// can be forced to shed submissions.
+struct ShedRig {
+    sender: multiview_control::CommandSender,
+    drain: Drain,
+    drive: CompositorDrive<Nv12Image>,
+    registry: multiview_cli::live_sources::StopRegistry,
+    fault: multiview_cli::live_sources::SubmitFault,
+    hub: LiveSourceHub,
+    publisher: Arc<EnginePublisher<EngineStateSnapshot, Event>>,
+    config: MultiviewConfig,
+}
+
+impl ShedRig {
+    fn start() -> Self {
+        let config = two_cell_config();
+        let publisher = Arc::new(EnginePublisher::<EngineStateSnapshot, Event>::new(16));
+        let (sender, command_rx) = command_bus(16);
+        let registry = stop_registry();
+        let preview = shared_stores(HashMap::new());
+        let hub = LiveSourceHub::start(Arc::clone(&registry), Arc::clone(&preview));
+        let fault = multiview_cli::live_sources::SubmitFault::default();
+        let drain = command_drain_with_live_sources(
+            command_rx,
+            config.clone(),
+            Arc::clone(&publisher),
+            hub.handle().with_fault(fault.clone()),
+        );
+        let mut rig = Self {
+            sender,
+            drain: Box::new(drain),
+            drive: test_drive(&config),
+            registry,
+            fault,
+            hub,
+            publisher,
+            config,
+        };
+        rig.upsert(serde_json::json!({ "id": "in_a", "kind": "bars" }));
+        assert!(wait_for(Duration::from_secs(5), || producer(
+            &rig.registry,
+            "in_a"
+        )
+        .is_some()));
+        rig
+    }
+
+    fn upsert(&mut self, body: serde_json::Value) {
+        self.sender
+            .try_submit(Command::UpsertSource {
+                op: OperationId::new(),
+                source: Box::new(source_doc(body)),
+            })
+            .expect("submit upsert");
+        (self.drain)(&mut self.drive);
+    }
+
+    fn running(&self) -> multiview_cli::live_sources::ProducerStop {
+        producer(&self.registry, "in_a").expect("producer registered")
+    }
+}
+
+/// Media B plus an armed automation rule (a policy-only change of B).
+fn solid_with_policy() -> serde_json::Value {
+    serde_json::json!({ "id": "in_a", "kind": "solid", "color": "#22aa44",
+        "events": { "automation": { "armed": true,
+            "on_break_start": { "action": "swap_cell", "target": "in_b" } } } })
+}
+
+/// Shed A→B (via `shed`), recover, send B plus a policy edit: the producer
+/// must become B (review R4-01).
+fn shed_media_change_then_policy_edit_reaches_the_producer(
+    shed: impl Fn(&multiview_cli::live_sources::SubmitFault),
+) {
+    let mut rig = ShedRig::start();
+    let a = rig.running();
+    shed(&rig.fault);
+    rig.upsert(serde_json::json!({ "id": "in_a", "kind": "solid", "color": "#22aa44" }));
+    std::thread::sleep(Duration::from_millis(100));
+    assert!(
+        rig.running().is_same_producer(&a) && !a.stop_requested(),
+        "a shed submission must leave producer A running"
+    );
+    rig.fault.clear();
+    rig.upsert(solid_with_policy());
+    assert!(
+        wait_for(Duration::from_secs(5), || producer(&rig.registry, "in_a")
+            .is_some_and(|now| !now.is_same_producer(&a))),
+        "the recovery upsert of B was swallowed: producer A kept running"
+    );
+    let store = rig.drive.store("in_a").cloned().expect("store");
+    assert!(
+        wait_for(Duration::from_secs(5), || shows_solid(&store)),
+        "the producer must now run media B"
+    );
+    // Once B is applied, a further policy-only edit leaves it alone.
+    let b = rig.running();
+    rig.upsert(serde_json::json!({ "id": "in_a", "kind": "solid", "color": "#22aa44" }));
+    std::thread::sleep(Duration::from_millis(200));
+    assert!(rig.running().is_same_producer(&b) && !b.stop_requested());
+    rig.hub.shutdown();
+}
+
+/// Review R4-01 (1): a media change shed on a FULL hub queue, then B plus a
+/// policy edit, ends with the producer running B.
+#[test]
+fn a_policy_edit_after_a_full_hub_shed_still_replaces_the_producer() {
+    shed_media_change_then_policy_edit_reaches_the_producer(
+        multiview_cli::live_sources::SubmitFault::full,
+    );
+}
+
+/// Review R4-01 (2): the same with the hub GONE, then recovered.
+#[test]
+fn a_policy_edit_after_a_gone_hub_recovers_still_replaces_the_producer() {
+    shed_media_change_then_policy_edit_reaches_the_producer(
+        multiview_cli::live_sources::SubmitFault::gone,
+    );
+}
+
+/// Review R4-01 (3): a guide-only REST edit sends no engine command, so the
+/// drain's mirror goes stale. An identical re-apply of the latest REST body
+/// (the documented retry) must reach the producer when the applied media
+/// differs, and stays a no-op when the applied media already matches.
+#[allow(clippy::too_many_lines)] // one REST walk through shed, guide edit, retry
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_identical_reapply_after_a_guide_only_edit_retries_the_producer() {
+    std::env::set_var("MULTIVIEW_CONTROL_TOKEN", "test-secret");
+    let rig = ShedRig::start();
+    let ShedRig {
+        sender,
+        mut drain,
+        mut drive,
+        registry,
+        fault,
+        hub,
+        publisher,
+        config,
+    } = rig;
+    let a = producer(&registry, "in_a").unwrap();
+
+    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+    let (addr, server, _state) = multiview_cli::control::bind_and_serve(
+        "[::1]:0",
+        &config,
+        Arc::clone(&publisher),
+        sender,
+        multiview_control::no_preview(),
+        None, // switcher absent (legacy path)
+        None, // switcher lease owner absent
+        None,
+        None,
+        None,
+        None,
+        None,
+        multiview_control::LiveApplyCaps::default(),
+        multiview_control::LiveSourceCapability::synthetic_only(),
+        None,
+        None,
+        async move {
+            let _ = shutdown_rx.await;
+        },
+    )
+    .await
+    .expect("control server binds");
+    let put = |version: u32, body: &serde_json::Value| {
+        let body = serde_json::json!({ "name": "in_a", "body": body }).to_string();
+        format!(
+            "PUT /api/v1/sources/in_a HTTP/1.0\r\nHost: {addr}\r\n\
+             Authorization: Bearer admin.test-secret\r\nIf-Match: W/\"{version}\"\r\n\
+             Content-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        )
+    };
+    let solid = serde_json::json!({ "id": "in_a", "kind": "solid", "color": "#22aa44" });
+    let guided = serde_json::json!({ "id": "in_a", "kind": "solid", "color": "#22aa44",
+        "playlist_metadata": { "name": "Green" } });
+    let renamed = serde_json::json!({ "id": "in_a", "kind": "solid", "color": "#22aa44",
+        "playlist_metadata": { "name": "Greener" } });
+
+    // A→B is shed by a full hub.
+    fault.full();
+    let response = http(addr, put(1, &solid)).await;
+    assert!(response.contains(" 200 "), "{response}");
+    drain(&mut drive);
+    fault.clear();
+    std::thread::sleep(Duration::from_millis(100));
+    assert!(producer(&registry, "in_a").unwrap().is_same_producer(&a));
+
+    // A guide-only edit: committed, but no engine command.
+    let response = http(addr, put(2, &guided)).await;
+    assert!(response.contains(" 200 "), "{response}");
+    drain(&mut drive);
+    std::thread::sleep(Duration::from_millis(100));
+    assert!(producer(&registry, "in_a").unwrap().is_same_producer(&a));
+
+    // The documented retry: re-apply the latest body unchanged.
+    let response = http(addr, put(3, &guided)).await;
+    assert!(response.contains(" 200 "), "{response}");
+    drain(&mut drive);
+    assert!(
+        wait_for(Duration::from_secs(5), || producer(&registry, "in_a")
+            .is_some_and(|now| !now.is_same_producer(&a))),
+        "the identical re-apply was swallowed: producer A kept running"
+    );
+    let store = drive.store("in_a").cloned().expect("store");
+    assert!(
+        wait_for(Duration::from_secs(5), || shows_solid(&store)),
+        "the retried producer must run media B"
+    );
+
+    // B is applied: a guide-only edit then an identical re-apply is a no-op.
+    let b = producer(&registry, "in_a").unwrap();
+    let response = http(addr, put(4, &renamed)).await;
+    assert!(response.contains(" 200 "), "{response}");
+    drain(&mut drive);
+    let response = http(addr, put(5, &renamed)).await;
+    assert!(response.contains(" 200 "), "{response}");
+    drain(&mut drive);
+    std::thread::sleep(Duration::from_millis(200));
+    let now = producer(&registry, "in_a").unwrap();
+    assert!(
+        now.is_same_producer(&b) && !b.stop_requested(),
+        "a re-apply whose media is already applied must not restart the producer"
+    );
+    let _ = shutdown_tx.send(());
+    let _ = server.await;
+    hub.shutdown();
+}
