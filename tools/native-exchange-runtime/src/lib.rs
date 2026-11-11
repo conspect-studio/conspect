@@ -169,6 +169,18 @@ impl ReceiverRuntime {
         runtime.directory.sync()?;
         Ok(runtime)
     }
+    /// The epoch of the grant this receiver currently holds.
+    pub fn epoch(&self) -> u64 {
+        self.state.epoch
+    }
+    /// True when this receiver's grant has lapsed at `now_ms` (awaiting a later grant).
+    pub fn grant_lapsed(&self, now_ms: u64) -> bool {
+        now_ms >= self.expiry_wall_ms || Instant::now() >= self.expiry_mono
+    }
+    /// True once a deny (authority refusal, expiry deny, failed transaction) is sticky.
+    pub fn is_denied(&self) -> bool {
+        self.state.denied || !self.healthy.get()
+    }
     /// Install a newly verified grant on the control worker. Reconnect retains
     /// the durable replay journal; a sticky deny can never be cleared here.
     pub fn refresh(

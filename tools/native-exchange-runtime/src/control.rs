@@ -159,6 +159,11 @@ impl Coordinator {
                                 let wait = 5000 - crate::wall_ms() % 5000;
                                 due = Instant::now() + Duration::from_millis(wait);
                             }
+                            // A late or lost answer is not a denial: the lease is checked
+                            // inside `grant`, so a still-valid lease keeps retrying within the
+                            // per-epoch attempt budget. Only an authoritative refusal
+                            // ("grant denied": a status after the single 404 retry) denies.
+                            Err("grant transport") => {}
                             Err(_) => {
                                 let mut slot = slot.lock().unwrap();
                                 let (receiver, output) = &mut *slot;

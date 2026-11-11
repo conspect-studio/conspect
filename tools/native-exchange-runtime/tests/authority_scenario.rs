@@ -25,41 +25,61 @@ fn now() -> u64 {
 }
 #[test]
 fn release_command_invokes_tls_authority_media_receipts_and_cutoff() {
-    scenario("release", false, false);
+    scenario("release", false, false, "");
 }
 #[test]
 fn withdraw_command_cuts_off_both_takers() {
-    scenario("withdraw", false, false);
+    scenario("withdraw", false, false, "");
 }
 #[test]
 fn exhaustion_command_uses_decoded_receipts() {
-    scenario("exhaustion", false, false);
+    scenario("exhaustion", false, false, "");
 }
 #[test]
 fn slow_native_decoder_keeps_tls_lease_and_bookings_alive() {
-    scenario("release", true, false);
+    scenario("release", true, false, "");
 }
 #[test]
 fn lease_denial_flushes_while_native_decoder_stalls() {
-    scenario("release", true, true);
+    scenario("release", true, true, "");
 }
 #[test]
 fn raw_root_identity_mismatch_fails_closed() {
-    scenario("raw-mismatch", false, false);
+    scenario("raw-mismatch", false, false, "");
 }
 #[test]
 fn missing_authority_window_fails_closed() {
-    scenario("missing-window", false, false);
+    scenario("missing-window", false, false, "");
 }
 #[test]
 fn late_authority_headers_fail_closed() {
-    scenario("late-root", false, false);
+    scenario("late-root", false, false, "");
 }
+/// Booking A's paid window for the credit-cutoff fixtures: a fixture value (the
+/// web seed sizes A's credit as ceil(rate x duration / 60000)), long enough that
+/// the fixed costs (fixture encode, TLS, handoff, decode start) cannot consume it
+/// on a loaded runner. The mock and the assertions derive everything from it.
+const CUTOFF_WINDOW_MS: u64 = 30_000;
+
 #[test]
 fn credit_cutoff_uses_early_credit_refusal_and_paid_boundary() {
-    scenario("credit-cutoff", false, false);
+    scenario("credit-cutoff", false, false, "");
 }
-fn scenario(scenario: &'static str, slow: bool, deny_renew: bool) {
+/// Deterministic reproduction of #248: B's grant answers are held 1.5-2.5 s for
+/// requests that arrive within 1 s of an epoch boundary (and the first 200 ms
+/// after it). B must keep decoding on all six tracks across at least two
+/// boundaries; a late grant is not a denial.
+#[test]
+fn credit_cutoff_late_b_grants_do_not_stop_b_decoding() {
+    scenario("credit-cutoff", false, false, "late-b-grants");
+}
+/// Deliberate negative: the expected-fresh fragment arrives after A's paid window
+/// is (nearly) over. The command must refuse with the static reason.
+#[test]
+fn credit_cutoff_fragment_past_a_window_fails_with_static_reason() {
+    scenario("credit-cutoff", false, false, "late-fragment");
+}
+fn scenario(scenario: &'static str, slow: bool, deny_renew: bool, variant: &'static str) {
     // Admit one six-stream FFmpeg/TLS fixture at a time. These wall-clock
     // integration scenarios have real five-second grants; eight concurrent
     // encoders/decoders can miss their epoch under host contention. This bounds
@@ -67,6 +87,14 @@ fn scenario(scenario: &'static str, slow: bool, deny_renew: bool) {
     static ADMISSION: std::sync::Mutex<()> = std::sync::Mutex::new(());
     let _admission = ADMISSION.lock().unwrap_or_else(|p| p.into_inner());
     let negative = matches!(scenario, "raw-mismatch" | "missing-window" | "late-root");
+    let late_fragment = variant == "late-fragment";
+    // The late-fragment fixture uses a short paid window and holds the fragment
+    // past it; the others use the long window.
+    let window_ms: u64 = if late_fragment {
+        4000
+    } else {
+        CUTOFF_WINDOW_MS
+    };
     let mut p = CertificateParams::new(vec![]).unwrap();
     p.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
     let ca_key = KeyPair::generate().unwrap();
@@ -109,6 +137,8 @@ fn scenario(scenario: &'static str, slow: bool, deny_renew: bool) {
         let mut roots = 0;
         let mut renewals = Vec::new();
         let mut extensions = [Vec::new(), Vec::new()];
+        let mut deferred: Vec<std::thread::JoinHandle<()>> = Vec::new();
+        let mut delayed_grants = 0u32;
         while !stopped.load(Ordering::SeqCst) {
             let (s, _) = match listener.accept() {
                 Ok(s) => s,
@@ -189,7 +219,7 @@ fn scenario(scenario: &'static str, slow: bool, deny_renew: bool) {
                 assert_eq!(
                     body["durationMs"],
                     if scenario == "credit-cutoff" && i == 0 {
-                        10000
+                        window_ms
                     } else {
                         60000
                     }
@@ -199,12 +229,25 @@ fn scenario(scenario: &'static str, slow: bool, deny_renew: bool) {
                 books.push(id.clone());
                 if books.len() == 2 {
                     let v = json!({"kind":"exchange-connected-proof-expected-fresh","shared":{"contributorOrg":URL_SAFE_NO_PAD.encode([10;16]),"publisherInstance":URL_SAFE_NO_PAD.encode([5;16]),"feed":URL_SAFE_NO_PAD.encode([9;16]),"version":URL_SAFE_NO_PAD.encode([3;16]),"publisherMachine":URL_SAFE_NO_PAD.encode([5;16])},"bookingA":{"id":books[0],"booking":URL_SAFE_NO_PAD.encode([1;16]),"takerOrg":URL_SAFE_NO_PAD.encode([2;16]),"receiverMachine":URL_SAFE_NO_PAD.encode([4;16])},"bookingB":{"id":books[1],"booking":URL_SAFE_NO_PAD.encode([6;16]),"takerOrg":URL_SAFE_NO_PAD.encode([7;16]),"receiverMachine":URL_SAFE_NO_PAD.encode([8;16])}});
-                    std::fs::write(&expected_server, serde_json::to_vec(&v).unwrap()).unwrap();
-                    std::fs::set_permissions(
-                        &expected_server,
-                        std::fs::Permissions::from_mode(0o600),
-                    )
-                    .unwrap();
+                    let write = {
+                        let (path, bytes) =
+                            (expected_server.clone(), serde_json::to_vec(&v).unwrap());
+                        move || {
+                            std::fs::write(&path, bytes).unwrap();
+                            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+                                .unwrap();
+                        }
+                    };
+                    if late_fragment {
+                        // Hold the fragment until A's paid window has <2 s left.
+                        let wait = expiry[0].saturating_sub(2000).saturating_sub(now()) + 100;
+                        deferred.push(std::thread::spawn(move || {
+                            std::thread::sleep(std::time::Duration::from_millis(wait));
+                            write();
+                        }));
+                    } else {
+                        write();
+                    }
                 }
                 json!({"id":id,"created_at":created,"expires_at":expiry[i]})
             } else if path.contains("/current-epoch?") {
@@ -331,22 +374,48 @@ fn scenario(scenario: &'static str, slow: bool, deny_renew: bool) {
             } else {
                 "application/json"
             };
-            let sent = (|| -> std::io::Result<()> {
-                write!(tls,"HTTP/1.1 {status} OK\r\ncontent-type: {typ}\r\ncontent-length: {}\r\ncache-control: no-store, private\r\nconnection: close\r\n\r\n",bytes.len())?;
-                tls.write_all(&bytes)?;
-                tls.flush()
-            })();
-            if let Err(error) = sent {
-                // A deliberately late response can outlive the client's deadline.
-                // All negative-path receipt and command assertions still apply.
-                assert!(
-                    scenario == "late-root"
-                        && matches!(
-                            error.kind(),
-                            std::io::ErrorKind::BrokenPipe | std::io::ErrorKind::ConnectionReset
-                        )
-                );
+            let mut hold_ms = 0u64;
+            if variant == "late-b-grants" && path.ends_with("/grants") && path.contains("org_b/") {
+                let phase = now() % 5000;
+                if !(200..4000).contains(&phase) {
+                    delayed_grants += 1;
+                    hold_ms = 1500 + 500 * u64::from(delayed_grants % 3);
+                    eprintln!(
+                        "mock: holding B grant answer {hold_ms} ms (request at epoch phase {phase} ms)"
+                    );
+                }
             }
+            let write_answer = move || {
+                let mut tls = tls;
+                if hold_ms > 0 {
+                    std::thread::sleep(std::time::Duration::from_millis(hold_ms));
+                }
+                let sent = (|| -> std::io::Result<()> {
+                    write!(tls,"HTTP/1.1 {status} OK\r\ncontent-type: {typ}\r\ncontent-length: {}\r\ncache-control: no-store, private\r\nconnection: close\r\n\r\n",bytes.len())?;
+                    tls.write_all(&bytes)?;
+                    tls.flush()
+                })();
+                if let Err(error) = sent {
+                    // A deliberately late response can outlive the client's deadline.
+                    // All negative-path receipt and command assertions still apply.
+                    assert!(
+                        (scenario == "late-root" || hold_ms > 0)
+                            && matches!(
+                                error.kind(),
+                                std::io::ErrorKind::BrokenPipe
+                                    | std::io::ErrorKind::ConnectionReset
+                            )
+                    );
+                }
+            };
+            if hold_ms > 0 {
+                deferred.push(std::thread::spawn(write_answer));
+            } else {
+                write_answer();
+            }
+        }
+        for handle in deferred {
+            handle.join().unwrap();
         }
         if negative {
             assert_eq!(
@@ -366,6 +435,15 @@ fn scenario(scenario: &'static str, slow: bool, deny_renew: bool) {
                     .windows(2)
                     .all(|w| w[1].duration_since(w[0]) <= std::time::Duration::from_secs(30)));
             }
+        } else if variant == "late-b-grants" {
+            assert!(delayed_grants > 0, "the mock never delayed a B grant");
+            assert!(boundary_denials > 0);
+            assert_eq!(extensions[0].len(), 1);
+            assert!(!extensions[1].is_empty(), "B must extend with 201");
+            assert!(receipts > 0);
+        } else if late_fragment {
+            // No media may be produced for A's elapsed window: no receipts.
+            assert_eq!(receipts, 0, "no media may follow a late fragment");
         } else if scenario == "credit-cutoff" {
             assert!(boundary_denials > 0);
             assert_eq!(extensions[0].len(), 1);
@@ -379,7 +457,8 @@ fn scenario(scenario: &'static str, slow: bool, deny_renew: bool) {
     });
     let mut manifest = json!({"kind":"exchange-connected-proof-harness","baseUrl":origin,"basePath":"/v0","caPublic":ca.pem(),"mg02Verification":{"jwk":{"x":public}},"scenario":{"expectedIdentities":{"shared":{"feed":URL_SAFE_NO_PAD.encode([9;16]),"version":URL_SAFE_NO_PAD.encode([3;16]),"publisherMachine":URL_SAFE_NO_PAD.encode([5;16]),"contributorOrg":URL_SAFE_NO_PAD.encode([10;16]),"publisherInstance":URL_SAFE_NO_PAD.encode([5;16])}},"versionId":"ver_test","storyId":"story_test","publisherLease":{"bootstrapOnly":true,"adoptable":false}},"credentials":{"contributor":{"orgId":"org_pub","machineId":"mac_pub","token":"synthetic-pub"},"takerA":{"orgId":"org_a","machineId":"mac_a","token":"synthetic-a"},"takerB":{"orgId":"org_b","machineId":"mac_b","token":"synthetic-b"}}});
     if scenario == "credit-cutoff" {
-        manifest["scenario"]["fixtureProfile"] = json!({"name":"funded-expiry"});
+        manifest["scenario"]["fixtureProfile"] =
+            json!({"name":"funded-expiry","bookingDurationMs":window_ms});
     }
     let manifest_path = dir.path().join("manifest");
     std::fs::write(&manifest_path, serde_json::to_vec(&manifest).unwrap()).unwrap();
@@ -461,12 +540,48 @@ fn scenario(scenario: &'static str, slow: bool, deny_renew: bool) {
         );
         return;
     }
+    if late_fragment {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            !output.status.success(),
+            "a late fragment must fail the run"
+        );
+        assert!(
+            stderr.contains("booking A paid window elapsed during fragment handoff"),
+            "static reason missing: {stderr}"
+        );
+        // The redacted status sequence is printed on failure: no ids or tokens.
+        assert!(
+            stderr.contains("http +"),
+            "status sequence missing: {stderr}"
+        );
+        assert!(stderr.contains("/bookings/{booking}/grants"));
+        assert!(!stderr.contains("bk:") && !stderr.contains("synthetic-"));
+        return;
+    }
     assert!(
         output.status.success(),
         "native command failed: {}",
         String::from_utf8_lossy(&output.stderr)
     );
     assert!(String::from_utf8_lossy(&output.stdout).contains("two takers"));
+    if variant == "late-b-grants" {
+        // The parked path must actually have run: objects parked and later opened.
+        let out = String::from_utf8_lossy(&output.stdout);
+        let report = out
+            .lines()
+            .find(|l| l.starts_with("credit-cutoff B late-grant report:"))
+            .expect("late-grant report");
+        let field = |name: &str| -> u64 {
+            report
+                .split_whitespace()
+                .find_map(|w| w.strip_prefix(name))
+                .and_then(|v| v.parse().ok())
+                .unwrap()
+        };
+        assert!(field("parked=") > 0, "no B object was parked: {report}");
+        assert!(field("drained=") > 0, "no parked B object opened: {report}");
+    }
     if scenario == "withdraw" {
         assert!(
             String::from_utf8_lossy(&output.stdout)

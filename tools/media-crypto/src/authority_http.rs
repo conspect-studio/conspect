@@ -248,6 +248,64 @@ pub trait AuthorityHttpTransport: Send + Sync {
     ) -> Result<AuthorityHttpResponse>;
 }
 
+/// Redacted, process-wide record of recent HTTP exchanges for failure reports:
+/// method, route template, status (0 = transport error/timeout) and ms since
+/// start. Never a token, id, query, body or key.
+static STATUS_LOG: Mutex<Vec<(u64, &'static str, String, u16)>> = Mutex::new(Vec::new());
+static STATUS_START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+const STATUS_LOG_CAP: usize = 128;
+
+/// Pin the "ms since start" origin (idempotent; first call wins).
+pub fn status_log_start() {
+    STATUS_START.get_or_init(std::time::Instant::now);
+}
+
+/// Replace every opaque id segment by a placeholder and drop the query/fragment.
+pub fn route_template(url: &str) -> String {
+    let path = url
+        .split_once("://")
+        .map_or(url, |(_, rest)| rest.find('/').map_or("", |i| &rest[i..]));
+    let path = path.split(['?', '#']).next().unwrap_or("");
+    let mut out = String::new();
+    let mut placeholder: Option<&str> = None;
+    for segment in path.split('/').filter(|s| !s.is_empty()) {
+        out.push('/');
+        if let Some(name) = placeholder.take() {
+            out.push_str(name);
+            continue;
+        }
+        out.push_str(segment);
+        placeholder = match segment {
+            "organisations" => Some("{org}"),
+            "bookings" => Some("{booking}"),
+            "versions" => Some("{version}"),
+            "stories" => Some("{story}"),
+            _ => None,
+        };
+    }
+    out
+}
+
+fn record_status(method: &'static str, url: &str, status: u16) {
+    let ms = STATUS_START
+        .get_or_init(std::time::Instant::now)
+        .elapsed()
+        .as_millis() as u64;
+    let mut log = lock(&STATUS_LOG);
+    if log.len() >= STATUS_LOG_CAP {
+        log.remove(0);
+    }
+    log.push((ms, method, route_template(url), status));
+}
+
+/// The recorded sequence, oldest first, one redacted line per exchange.
+pub fn status_sequence() -> Vec<String> {
+    lock(&STATUS_LOG)
+        .iter()
+        .map(|(ms, method, route, status)| format!("+{ms}ms {method} {route} -> {status}"))
+        .collect()
+}
+
 /// Production HTTPS transport: system-trusted TLS, no redirect, bounded timeout
 /// and response body. It neither logs nor exposes the root in Debug.
 #[derive(Clone)]
@@ -348,6 +406,8 @@ impl VerifiedHttpsTransport {
             "GET" if request.body.is_none() => reqwest::Method::GET,
             _ => return Err(Error::Invalid),
         };
+        let method_name = request.method;
+        let request_url = request.url.clone();
         let mut outgoing = self
             .0
             .request(method, &request.url)
@@ -360,7 +420,13 @@ impl VerifiedHttpsTransport {
         if let Some(body) = request.body {
             outgoing = outgoing.header(CONTENT_TYPE, "application/json").body(body);
         }
-        let response = outgoing.send().map_err(|_| Error::Denied)?;
+        let sent = outgoing.send();
+        record_status(
+            method_name,
+            &request_url,
+            sent.as_ref().map_or(0, |r| r.status().as_u16()),
+        );
+        let response = sent.map_err(|_| Error::Denied)?;
         let status = response.status().as_u16();
         if (300..400).contains(&status) {
             return Err(Error::Denied);
@@ -1565,5 +1631,21 @@ mod grant_framing_tests {
             h.insert("content-length", HeaderValue::from_static(value));
             assert_eq!(grant_content_length(200, &h), Err(Error::Invalid));
         }
+    }
+}
+
+#[cfg(test)]
+mod status_log_tests {
+    use super::*;
+    #[test]
+    fn route_template_redacts_ids_query_and_host() {
+        assert_eq!(
+            route_template("https://[::1]:8443/v0/organisations/org_secret/exchange/bookings/bk:org:ref/grants"),
+            "/v0/organisations/{org}/exchange/bookings/{booking}/grants"
+        );
+        assert_eq!(
+            route_template("https://h/v0/organisations/o/exchange/versions/v/publisher/current-epoch?machineId=mac&generation=1"),
+            "/v0/organisations/{org}/exchange/versions/{version}/publisher/current-epoch"
+        );
     }
 }
