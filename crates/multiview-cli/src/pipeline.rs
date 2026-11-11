@@ -23041,10 +23041,11 @@ loop_default = true
             .as_ref()
             .expect("the plan carries a player handle");
         // The geometry is the asset's declared window (the vamp sub-window loops).
+        // Dynamic load: boot geometry is a one-frame sentinel; the first probed,
+        // jointly committed clip (default asset spec carries 0..100 / vamp 10..90)
+        // supplies the real window.
         assert_eq!(handle.geometry.in_point(), 0);
-        assert_eq!(handle.geometry.out_point(), 100);
-        assert_eq!(handle.geometry.vamp_in(), 10);
-        assert_eq!(handle.geometry.vamp_out(), 90);
+        assert_eq!(handle.geometry.out_point(), 1);
         assert_eq!(handle.geometry.cadence(), cadence);
         assert!(
             handle.loop_on_start,
@@ -23077,10 +23078,11 @@ loop_default = true
             "audio decodes the SAME asset as the video"
         );
         assert_eq!(
-            ap.vamp_in_frames, 10,
+            ap.vamp_in_frames,
+            handle.geometry.vamp_in(),
             "audio loops the SAME vamp window as the video"
         );
-        assert_eq!(ap.vamp_out_frames, 90);
+        assert_eq!(ap.vamp_out_frames, handle.geometry.vamp_out());
         assert_eq!(
             ap.cadence, cadence,
             "audio uses the asset cadence for the frame→sample map"
@@ -23104,21 +23106,16 @@ loop_default = true
         let cadence = config.canvas.fps.rational();
         let boot =
             super::build_media_player_boot(&config, &layout, cadence, CanvasColor::default());
-        assert!(boot.plans.is_empty(), "no default asset ⇒ no rolling plan");
+        // With the native `ffmpeg` runtime an idle player keeps a dynamic plan, audio
+        // store and loop so a later explicit load can open, probe and commit a clip.
+        let dynamic = cfg!(feature = "ffmpeg");
+        assert_eq!(boot.plans.len(), usize::from(dynamic));
         assert!(
             boot.mailboxes.contains_key("vt-1"),
             "an idle player still registers its mailbox"
         );
-        // An idle player contributes no audio store/plan either (ADR-T019): nothing
-        // to loop until a load command binds an asset (probe-at-load is post-MVP).
-        assert!(
-            boot.audio_stores.is_empty(),
-            "an idle player has no audio store"
-        );
-        assert!(
-            boot.audio_plans.is_empty(),
-            "an idle player has no audio loop plan"
-        );
+        assert_eq!(boot.audio_stores.len(), usize::from(dynamic));
+        assert_eq!(boot.audio_plans.len(), usize::from(dynamic));
     }
 }
 
@@ -26018,5 +26015,334 @@ segment_ms = 1000
                 "a cutover after packet {cut} must not drop, repeat or reorder a frame"
             );
         }
+    }
+}
+
+/// Actual capture artifact -> capture-service lease -> HTTP load -> native player.
+#[cfg(all(test, feature = "ffmpeg", target_os = "linux"))]
+mod artifact_adoption_tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+    use multiview_compositor::pipeline::CanvasColor;
+    use multiview_config::MultiviewConfig;
+    use multiview_control::{
+        command_bus,
+        web_capture::Provider,
+        web_capture_store::{DurableTerms, Ledger},
+        ApiKeyStore, AppState, EngineStateSnapshot, InMemoryMediaPlayerStore, InMemoryRepository,
+        Principal, ResourceInput, ResourceRepository, Role,
+    };
+    use multiview_core::time::MediaTime;
+    use multiview_engine::{EnginePublisher, ManualTimeSource, TimeSource};
+    use multiview_events::Event;
+    use multiview_framestore::tile::TileRead;
+    use multiview_webengine::{
+        artifact::{ArtifactStore, Limits},
+        capture::Tools,
+        service::{Config, Service},
+    };
+    use std::os::unix::fs::PermissionsExt;
+    use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    const PLAYER: &str = "vt-art";
+    const OWNER: &str = "owner-token.owner-secret";
+    const FOREIGN: &str = "foreign-token.foreign-secret";
+
+    async fn http(
+        addr: std::net::SocketAddr,
+        method: &str,
+        path: &str,
+        body: &str,
+        token: &str,
+        key: &str,
+    ) -> (u16, serde_json::Value, String) {
+        let mut s = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let text = format!("{method} {path} HTTP/1.0\r\nHost: localhost\r\nAuthorization: Bearer {token}\r\nIdempotency-Key: {key}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
+        s.write_all(text.as_bytes()).await.unwrap();
+        let mut out = Vec::new();
+        s.read_to_end(&mut out).await.unwrap();
+        let out = String::from_utf8(out).unwrap();
+        let code = out.split(' ').nth(1).unwrap().parse().unwrap();
+        let raw = out.split_once("\r\n\r\n").map_or("", |x| x.1).to_owned();
+        (code, serde_json::from_str(&raw).unwrap_or_default(), out)
+    }
+
+    fn producer(dir: &Path, name: &str, artifact: &Path) -> PathBuf {
+        let p = dir.join(name);
+        std::fs::write(&p, format!("#!/bin/sh\ncat >/dev/null\ncat '{}'\nprintf '%s\\n' '{{\"event\":\"capture_complete\",\"frames\":25}}' >&2\n", artifact.display())).unwrap();
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o700)).unwrap();
+        p
+    }
+
+    fn config() -> MultiviewConfig {
+        let doc = format!(
+            r##"schema_version = 1
+[canvas]
+width = 64
+height = 48
+fps = "25/1"
+pixel_format = "nv12"
+background = "#101014"
+[canvas.color]
+profile = "sdr-bt709-limited"
+[layout]
+kind = "grid"
+columns = ["1fr"]
+rows = ["1fr"]
+areas = ["a"]
+[[cells]]
+id = "cell_a"
+area = "a"
+[cells.source]
+input_id = "{PLAYER}"
+[media_library]
+root = "/srv/media"
+[[media_players]]
+id = "{PLAYER}"
+loop_default = true
+"##
+        );
+        MultiviewConfig::load_from_toml(&doc).expect("config")
+    }
+
+    #[allow(clippy::too_many_lines)]
+    #[test]
+    fn actual_capture_artifact_loads_into_native_player_over_http() {
+        use multiview_ffmpeg::test_fixtures::{
+            generate_player_clip, write_corrupt_clip, PlayerClipSpec,
+        };
+        let cfg = config();
+        let layout = cfg.solve_layout().unwrap();
+        let cadence = cfg.canvas.fps.rational();
+        let boot = super::build_media_player_boot(&cfg, &layout, cadence, CanvasColor::default());
+        let plan = boot.plans.into_iter().next().unwrap();
+        let handle = plan.player.as_ref().unwrap().clone();
+        let runtime = handle.runtime.as_ref().unwrap().clone();
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut a_spec = PlayerClipSpec::ffv1(cadence, 25, 30);
+        a_spec.audio_level = Some(0.25);
+        let a = dir.path().join("a.mov");
+        generate_player_clip(&a, &a_spec).unwrap();
+        let b = dir.path().join("b.mov");
+        generate_player_clip(&b, &PlayerClipSpec::ffv1(cadence, 25, 140)).unwrap();
+        let bad = dir.path().join("bad.mov");
+        write_corrupt_clip(&bad, 4096).unwrap();
+
+        // Player rails on real threads with a manual output clock.
+        let clock = Arc::new(ManualTimeSource::new());
+        clock.set(1_000_000_000);
+        let source: Arc<dyn TimeSource> = clock.clone();
+        plan.output_origin
+            .store(Some(Arc::new(multiview_engine::epoch::EpochAnchor::new(
+                source,
+                1_000_000_000,
+            ))));
+        let audio_store = Arc::clone(&boot.audio_stores[0].1);
+        let audio_plan = boot.audio_plans.into_iter().next().unwrap();
+        let audio_stop = Arc::new(AtomicBool::new(false));
+        let (s1, st) = (Arc::clone(&audio_stop), Arc::clone(&audio_store));
+        let audio_worker =
+            std::thread::spawn(move || crate::audio::player_audio_loop(&audio_plan, &st, &s1));
+        let stop = Arc::new(AtomicBool::new(false));
+        let s2 = Arc::clone(&stop);
+        let worker = std::thread::spawn(move || {
+            super::player_runtime_loop(&plan, plan.player.as_ref().unwrap(), &s2)
+        });
+        let store = Arc::clone(&boot.stores[0].1);
+
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let mk_service = |name: &str, tool: PathBuf| {
+                let path = dir.path().join(name);
+                std::fs::create_dir(&path).unwrap();
+                let st = ArtifactStore::open(&path, Limits { bytes: 128 << 20, count: 20 }).unwrap();
+                Arc::new(Service::start_durable(
+                    Tools { node: tool, browser: "/bin/sh".into(), ffmpeg: "/bin/sh".into() },
+                    st,
+                    Config { queue_capacity: 4, history: 16, max_fills: 8 },
+                    &dir.path().join(format!("{name}.journal")),
+                ).unwrap())
+            };
+            // One actual capture service per produced artifact keeps each producer
+            // deterministic; the control route still resolves through the service.
+            let _ = &mk_service;
+            // Single service, producer picks the artifact named by a control file.
+            let selector = dir.path().join("selected.mov");
+            std::fs::copy(&a, &selector).unwrap();
+            let node = producer(dir.path(), "node", &selector);
+            let service = mk_service("store", node);
+            let mut keys = ApiKeyStore::new(b"pepper-xyz".to_vec());
+            for (id, tok) in [("owner-token", "owner-secret"), ("foreign-token", "foreign-secret")] {
+                keys.register(id, tok, Principal {
+                    key_id: id.to_owned(), role: Role::Operator,
+                    scoped_object_ids: None, scoped_output_ids: None, scoped_discovery_domains: None,
+                });
+            }
+            let players = InMemoryMediaPlayerStore::new();
+            players.create(PLAYER, ResourceInput { name: PLAYER.into(), body: serde_json::json!({"id": PLAYER, "eof_policy": "hold_last_frame"}) }).unwrap();
+            let players: Arc<dyn ResourceRepository> = Arc::new(players);
+            let publisher = Arc::new(EnginePublisher::<EngineStateSnapshot, Event>::new(8));
+            let (tx, rx) = command_bus(8);
+            let mut state = AppState::new(publisher, tx, Arc::new(InMemoryRepository::new()), Arc::new(keys))
+                .with_media_player_store(players)
+                .with_web_capture(Provider::configured(
+                    service.clone(),
+                    Arc::new(DurableTerms::open(&dir.path().join("terms.log")).unwrap()),
+                    Arc::new(Ledger::durable(&dir.path().join("idem.log")).unwrap()),
+                ));
+            state.player_load = crate::player::runtime_provider();
+            let listener = tokio::net::TcpListener::bind("[::1]:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let (done_tx, done) = tokio::sync::oneshot::channel::<()>();
+            let server = tokio::spawn(multiview_control::serve(listener, state, async move { let _ = done.await; }));
+
+            let mut n = 0u32;
+            let mut capture = |fill: &'static str| {
+                n += 1;
+                let body = serde_json::json!({"fill_id": fill, "view": {"lat": -33.9, "lon": 150.3, "zoom": 10, "overlay": "radar", "width": 1280, "height": 720, "fps": 25, "frames": 25, "public": true}, "terms": {"accepted": true, "version": "windy-2023-09-01"}}).to_string();
+                (body, format!("cap-{n}"))
+            };
+            let mut produce = |fill: &'static str| {
+                let (body, key) = capture(fill);
+                async move {
+                    let (code, v, raw) = http(addr, "POST", "/api/v1/media/captures", &body, OWNER, &key).await;
+                    assert_eq!(code, 202, "{raw}");
+                    let id = v["job_id"].as_u64().unwrap();
+                    let started = Instant::now();
+                    loop {
+                        let (_, s, _) = http(addr, "GET", &format!("/api/v1/media/captures/{id}"), "", OWNER, "g").await;
+                        match s["state"].as_str() {
+                            Some("succeeded") => return (id, s["artifact_id"].as_str().unwrap().to_owned()),
+                            Some("failed" | "uncertain") => panic!("capture failed {s}"),
+                            _ => {}
+                        }
+                        assert!(started.elapsed() < Duration::from_secs(20));
+                        tokio::time::sleep(Duration::from_millis(20)).await;
+                    }
+                }
+            };
+            let load_body = |job: u64, art: &str| serde_json::json!({"artifactRef": {"captureJobId": job, "artifactId": art}, "then": "cue"}).to_string();
+            let poll = |op: u64| async move {
+                let started = Instant::now();
+                loop {
+                    let (code, v, raw) = http(addr, "GET", &format!("/api/v1/media/players/{PLAYER}/load-operations/{op}"), "", OWNER, "p").await;
+                    assert_eq!(code, 200, "{raw}");
+                    if v["state"] != "pending" { return v; }
+                    assert!(started.elapsed() < Duration::from_secs(20), "operation stuck pending {v}");
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            };
+
+            // --- A: audio-bearing artifact -> native adoption ---
+            let (job_a, art_a) = produce("fill-a").await;
+            let (code, v, raw) = http(addr, "POST", &format!("/api/v1/media/players/{PLAYER}/load"), &load_body(job_a, &art_a), OWNER, "load-a").await;
+            assert_eq!(code, 202, "{raw}");
+            let op_a = v["operation"].as_u64().unwrap();
+            let done_a = poll(op_a).await;
+            assert_eq!(done_a["state"], "completed", "{done_a}");
+            let ack = &done_a["native"];
+            assert_eq!(ack["width"], 64);
+            assert_eq!(ack["height"], 48);
+            assert_eq!(ack["cadence_num"], 25);
+            assert_eq!(ack["cadence_den"], 1);
+            assert_eq!(ack["has_audio"], true);
+            assert_eq!(ack["source_id"].as_str().unwrap(), art_a);
+            assert_eq!(ack["duration_frames"], 25);
+            // No raw path leaks.
+            assert!(!raw.contains("/proc/") && !raw.contains(dir.path().to_str().unwrap()));
+            let epoch_a = handle.control_bus.load().clip_epoch;
+            let anchor_a = handle.control_bus.load().start_anchor.unwrap();
+            clock.set(1_000_000_000 + anchor_a.as_nanos());
+            let (a_y, a_color) = match store.read_at(anchor_a) {
+                TileRead::Fresh { frame } | TileRead::Held { frame, .. } => (frame.y_plane()[0], frame.color()),
+                other => panic!("no A frame {:?}", std::mem::discriminant(&other)),
+            };
+            assert_eq!(a_y, 46, "A first-frame luma: fixture base 30 + video-range offset 16");
+            assert_ne!(a_color.range, multiview_core::color::ColorRange::Unspecified);
+            let _ = rx;
+            // Matching PCM from the actual artifact.
+            handle.mailbox.submit(crate::player::TransportVerb::Vamp);
+            let started = Instant::now();
+            while !matches!(handle.control_bus.load().state, crate::player::AudioTransport::Vamping) {
+                assert!(started.elapsed() < Duration::from_secs(5), "A never vamps");
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+            let started = Instant::now();
+            let sample = loop {
+                // The rail publishes a window relative to the committed anchor;
+                // scan a span after it for the constant-level artifact PCM.
+                let base: i64 = anchor_a.as_nanos().saturating_mul(48_000) / 1_000_000_000;
+                let mut hit = None;
+                for off in [500i64, 4_000, 12_000, 24_000, 36_000] {
+                    audio_store.seek_to(base + off);
+                    let blk = audio_store.read(32);
+                    if let Some(x) = blk.interleaved().iter().find(|x| x.abs() > 0.1) { hit = Some(*x); break; }
+                }
+                audio_store.seek_to(24_000);
+                let blk = audio_store.read(32);
+                if let Some(x) = hit { break x; }
+                assert!(started.elapsed() < Duration::from_secs(5), "A PCM missing: control={:?} cursor={} first={:?}", handle.control_bus.load(), audio_store.read_cursor(), blk.interleaved().first());
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            };
+            assert!((sample - 0.25).abs() < 0.08, "A PCM {sample}");
+
+            // --- foreign owner: 404 (job invisible), no path in body ---
+            let (code, _, raw) = http(addr, "POST", &format!("/api/v1/media/players/{PLAYER}/load"), &load_body(job_a, &art_a), FOREIGN, "load-x").await;
+            assert!(code == 403 || code == 404, "{raw}");
+            assert!(!raw.contains("/proc/") && !raw.contains(dir.path().to_str().unwrap()));
+            let (code, _, _) = http(addr, "GET", &format!("/api/v1/media/players/{PLAYER}/load-operations/{op_a}"), "", FOREIGN, "x").await;
+            assert!(code == 403 || code == 404 || code == 503);
+            // Mismatched artifact id -> conflict.
+            let (code, _, _) = http(addr, "POST", &format!("/api/v1/media/players/{PLAYER}/load"), &load_body(job_a, "a0000000000000fff"), OWNER, "load-m").await;
+            assert_eq!(code, 409);
+
+            // --- failed B keeps A ---
+            std::fs::copy(&bad, &selector).unwrap();
+            let (job_bad, art_bad) = produce("fill-bad").await;
+            let (code, v, raw) = http(addr, "POST", &format!("/api/v1/media/players/{PLAYER}/load"), &load_body(job_bad, &art_bad), OWNER, "load-bad").await;
+            assert_eq!(code, 202, "{raw}");
+            let failed = poll(v["operation"].as_u64().unwrap()).await;
+            assert_eq!(failed["state"], "failed", "{failed}");
+            assert_eq!(handle.control_bus.load().clip_epoch, epoch_a, "failed load keeps A");
+            let still = match store.read_at(anchor_a) {
+                TileRead::Fresh { frame } | TileRead::Held { frame, .. } => frame.y_plane()[0],
+                _ => 0,
+            };
+            assert_eq!(still, a_y, "previous good picture retained");
+
+            // --- B: video-only artifact -> explicit silence ---
+            clock.set(1_000_000_000 + anchor_a.as_nanos() + MediaTime::from_tick(2, cadence).as_nanos());
+            std::fs::copy(&b, &selector).unwrap();
+            let (job_b, art_b) = produce("fill-b").await;
+            let (code, v, raw) = http(addr, "POST", &format!("/api/v1/media/players/{PLAYER}/load"), &load_body(job_b, &art_b), OWNER, "load-b").await;
+            assert_eq!(code, 202, "{raw}");
+            let done_b = poll(v["operation"].as_u64().unwrap()).await;
+            assert_eq!(done_b["state"], "completed", "{done_b}");
+            assert_eq!(done_b["native"]["has_audio"], false);
+            let anchor_b = handle.control_bus.load().start_anchor.unwrap();
+            assert!(anchor_b > anchor_a);
+            let b_y = match store.read_at(anchor_b) {
+                TileRead::Fresh { frame } | TileRead::Held { frame, .. } => frame.y_plane()[0],
+                _ => 0,
+            };
+            assert_ne!(b_y, a_y, "B picture replaced A");
+            assert!(runtime.audio_commit.has_adopted(handle.control_bus.load().clip_epoch));
+
+            done_tx.send(()).unwrap();
+            server.await.unwrap().unwrap();
+            service.shutdown();
+        });
+        audio_stop.store(true, Ordering::Release);
+        audio_worker.join().unwrap();
+        stop.store(true, Ordering::Release);
+        assert!(worker.join().unwrap().is_none());
     }
 }

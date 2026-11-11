@@ -2034,10 +2034,13 @@ pub(crate) fn player_audio_loop(plan: &PlayerAudioPlan, store: &AudioStore, stop
                     deck.stop();
                     last_control_gen = 0;
                 }
-                crate::player::Adoption::Silence { .. } => {
+                crate::player::Adoption::Silence { epoch } => {
                     deck = LoopDeck::empty(canonical_format());
                     _active_lease = None;
                     retired_artifact_owner = _artifact_owner.take();
+                    // Explicit silence adoption: a proven audio-absent clip
+                    // acknowledges its generation so the load can complete.
+                    slot.acknowledge_adoption(epoch);
                     last_control_gen = 0;
                 }
                 crate::player::Adoption::Unchanged => {}
