@@ -54,9 +54,17 @@ function sleep(ms: number, signal: AbortSignal): Promise<void> {
 export class WallStore {
   private snapshot: WallSnapshot = { geometry: undefined };
   private geometry: WallGeometry | undefined;
-  private frame: VideoFrame | undefined;
+  /**
+   * The current wall picture, drawn ONCE per decoded frame. Every surface crops
+   * from this canvas. Drawing a `VideoFrame` converts the whole frame each time
+   * (measured: about 8 ms per call in a browser without a GPU, whatever the crop),
+   * so thirteen crops straight from the frame cost thirteen conversions.
+   */
+  private picture: HTMLCanvasElement | undefined;
+  private pictureContext: CanvasRenderingContext2D | undefined;
+  private hasPicture = false;
   private lastFrameAt: number | undefined;
-  private readonly frameListeners = new Set<(frame: VideoFrame) => void>();
+  private readonly frameListeners = new Set<(picture: HTMLCanvasElement) => void>();
   private readonly stateListeners = new Set<() => void>();
   private root: AbortController | undefined;
   private session: AbortController | undefined;
@@ -73,11 +81,26 @@ export class WallStore {
     this.stateListeners.add(listener);
     return () => { this.stateListeners.delete(listener); };
   };
-  /** Per-frame callback; also invoked once with the current frame, if any. */
-  subscribeFrames(listener: (frame: VideoFrame) => void): () => void {
+  /** Per-frame callback with the current wall picture; also invoked once now, if there is one. */
+  subscribeFrames(listener: (picture: HTMLCanvasElement) => void): () => void {
     this.frameListeners.add(listener);
-    if (this.frame) listener(this.frame);
+    if (this.hasPicture && this.picture) listener(this.picture);
     return () => { this.frameListeners.delete(listener); };
+  }
+
+  /** Convert the decoded frame once. False when no 2D canvas is available. */
+  private paint(frame: VideoFrame): boolean {
+    const picture = this.picture ?? (this.picture = document.createElement('canvas'));
+    if (picture.width !== frame.displayWidth || picture.height !== frame.displayHeight) {
+      picture.width = frame.displayWidth;
+      picture.height = frame.displayHeight;
+      this.pictureContext = undefined;
+    }
+    const context = this.pictureContext ?? (this.pictureContext = picture.getContext('2d') ?? undefined);
+    if (!context) return false;
+    context.drawImage(frame, 0, 0);
+    this.hasPicture = true;
+    return true;
   }
 
   start(): void {
@@ -96,8 +119,7 @@ export class WallStore {
     this.session?.abort();
     if (this.watch !== undefined) clearInterval(this.watch);
     this.watch = undefined;
-    this.frame?.close();
-    this.frame = undefined;
+    this.hasPicture = false;
     this.geometry = undefined;
     this.lastFrameAt = undefined;
     this.publish();
@@ -127,18 +149,17 @@ export class WallStore {
     this.stats.frames += 1;
     this.stats.lastFrameAt = Date.now();
     this.failures = 0;
-    // The library owns `incoming`; keep our own reference and close the previous one.
-    const next = incoming.clone();
-    const previous = this.frame;
-    this.frame = next;
-    previous?.close();
+    // The library owns `incoming` and may close it after this call: copy its
+    // pixels now and keep no reference to the frame.
+    if (!this.paint(incoming)) return;
     this.publish();
-    for (const listener of [...this.frameListeners]) listener(next);
+    const picture = this.picture;
+    if (picture) for (const listener of [...this.frameListeners]) listener(picture);
   };
 
   private dropFrame(): void {
-    this.frame?.close();
-    this.frame = undefined;
+    // A picture of another layout must never be cropped with the new geometry.
+    this.hasPicture = false;
     this.lastFrameAt = undefined;
   }
 
