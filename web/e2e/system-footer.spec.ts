@@ -1,6 +1,8 @@
 import { test, expect } from "@playwright/test";
 
-// Drives the REAL built SPA and asserts the live system-metrics footer renders
+// NOTE: the approved six-screen console has no persistent footer, so the same
+// live ours-vs-total telemetry is asserted on the System page (/system).
+// Drives the REAL built SPA and asserts the live system metrics render
 // ALL GPUs with an OURS-vs-TOTAL breakdown once `system.metrics` events stream
 // over the WebSocket. The box has MULTIPLE GPUs shared with co-tenant processes,
 // so the device-wide totals are not all ours; the wire now carries our-process
@@ -90,83 +92,24 @@ test.beforeEach(async ({ page }) => {
   );
 });
 
-test("the footer shows a live CPU ours-vs-total value and a sparkline", async ({
-  page,
-}) => {
-  await page.goto("/");
-
-  // The desktop footer is a button labelled for the system page.
-  const footer = page.getByRole("button", {
-    name: "Open the system metrics page",
-  });
-  await expect(footer).toBeVisible();
-
-  // The hook conflates to the LATEST sample; the CPU cell shows OURS / TOTAL as
-  // explicit text (self_cpu_util 0.18 -> 18%, cpu_util 0.55 -> 55%). The slash
-  // makes the relation legible WITHOUT relying on colour (WCAG 1.4.1).
-  await expect(footer.getByText("18% / 55%")).toBeVisible();
-
-  // The CPU sparkline announces the ours-over-total relation in its label.
-  await expect(
-    footer.getByRole("img", {
-      name: "CPU utilisation trend: ours over host total",
-    }),
-  ).toBeVisible();
-
-  // The live dot reports the open connection.
-  await expect(footer.getByText("Live")).toBeVisible();
+test("the System page shows a live CPU ours-vs-total value", async ({ page }) => {
+  await page.goto("/system");
+  await expect(page.getByRole("heading", { level: 1, name: "System" })).toBeVisible();
+  await expect(page.getByText("18% / 55%").first()).toBeVisible();
 });
 
-test("the footer shows EVERY GPU with an ours-vs-total compute + NVENC breakdown", async ({
-  page,
-}) => {
-  await page.goto("/");
-
-  const footer = page.getByRole("button", {
-    name: "Open the system metrics page",
-  });
-  await expect(footer).toBeVisible();
-
-  // Both GPUs get their own labelled mini-group (not just gpus[0]).
-  await expect(footer.getByText("GPU0", { exact: true })).toBeVisible();
-  await expect(footer.getByText("GPU1", { exact: true })).toBeVisible();
-
-  // GPU0 compute as OURS / TOTAL (self 0.25 -> 25%, total 0.6 -> 60%).
-  await expect(footer.getByText("25% / 60%")).toBeVisible();
-  // GPU1 compute as OURS / TOTAL (self 0.3 -> 30%, total 0.4 -> 40%).
-  await expect(footer.getByText("30% / 40%")).toBeVisible();
-
-  // NVENC sessions are shown ours/device-total per GPU (GPU0 2/6, GPU1 3/4).
-  await expect(footer.getByText("2 / 6")).toBeVisible();
-  await expect(footer.getByText("3 / 4")).toBeVisible();
-
-  // Each GPU compute trend is its OWN sparkline (the dashed "ours" overlay rides
-  // the same graphic, distinguished by line style not colour).
-  await expect(
-    footer.getByRole("img", {
-      name: /GPU0 compute utilisation: ours 25% of 60% device total/,
-    }),
-  ).toBeVisible();
-  await expect(
-    footer.getByRole("img", {
-      name: /GPU1 compute utilisation: ours 30% of 40% device total/,
-    }),
-  ).toBeVisible();
-});
-
-test("clicking the footer navigates to the System page", async ({ page }) => {
-  await page.goto("/");
-
-  await page
-    .getByRole("button", { name: "Open the system metrics page" })
-    .click();
-
-  await expect(page).toHaveURL(/\/system$/);
-  // The System page heading renders.
-  await expect(
-    page.getByRole("heading", { level: 1, name: "System" }),
-  ).toBeVisible();
-  // Both GPU cards surface their device names.
+test("the System page shows EVERY GPU with an ours-vs-total breakdown", async ({ page }) => {
+  await page.goto("/system");
   await expect(page.getByText("NVIDIA RTX 4060")).toBeVisible();
   await expect(page.getByText("NVIDIA RTX 4090")).toBeVisible();
+  await expect(page.getByText("25% / 60%").first()).toBeVisible();
+  await expect(page.getByText("30% / 40%").first()).toBeVisible();
+});
+
+test("the System page is reachable from the navigation drawer", async ({ page }) => {
+  await page.goto("/");
+  await page.getByRole("button", { name: "Open navigation" }).click();
+  await page.getByRole("dialog").getByRole("link", { name: "System", exact: true }).click();
+  await expect(page).toHaveURL(/\/system$/);
+  await expect(page.getByRole("heading", { level: 1, name: "System" })).toBeVisible();
 });

@@ -1059,7 +1059,7 @@ export function SourcesPage(): JSX.Element {
   ): JSX.Element => (
     <SourcesSurface
       rows={rows}
-      demand={demand.data}
+      demand={demand.isError ? undefined : demand.data}
       tileFor={(id): LiveTile | undefined => tileForSource(tiles, id)}
       linkFor={(id): ReturnType<typeof linkBySource.get> => linkBySource.get(id)}
       onEdit={onEdit}

@@ -43,8 +43,9 @@ function PreviewMonitor({ program, source, fresh }: { readonly program: boolean;
 
 /** Program L/R levels strictly from the audio.meter telemetry; otherwise explicitly unavailable. */
 function ProgramLevels(): JSX.Element {
-  const { current } = useAudioMeter();
-  if (current === undefined || current.peak_db.length === 0) return <div className="bd-meter-note" data-testid="desk-meters-unavailable"><Trans>Audio meters unavailable — no measured level telemetry</Trans></div>;
+  const { current, status } = useAudioMeter();
+  // A dropped meter socket must not leave a frozen level on screen.
+  if (status !== 'open' || current === undefined || current.peak_db.length === 0) return <div className="bd-meter-note" data-testid="desk-meters-unavailable"><Trans>Audio meters unavailable — no measured level telemetry</Trans></div>;
   return <ul className="bd-meters" aria-label="Program meters" data-testid="desk-meters">{current.peak_db.map((db, i) => <li key={i}><span>{current.peak_db.length === 2 ? (i === 0 ? 'L' : 'R') : String(i + 1)}</span><i aria-hidden="true"><em style={{ width: `${String(meterFillPercent(db))}%` }} /></i><b>{db.toFixed(1)} dBFS</b></li>)}</ul>;
 }
 

@@ -424,10 +424,13 @@ export function useEngineEvents(): EngineEvents {
         if (next === 'reconnecting' || next === 'closed') {
           tracker.onGap();
           clearMediaPlayerState(queryClient);
+          // Never keep showing cached tiles as live while the stream is down.
+          queryClient.setQueryData<Record<string, LiveTile>>(TILES_QUERY_KEY, {});
         }
       }, (): void => {
         tracker.onGap();
         clearMediaPlayerState(queryClient);
+        queryClient.setQueryData<Record<string, LiveTile>>(TILES_QUERY_KEY, {});
         // Missed frames: refetch everything the stream feeds (resume failed).
         setGaps((count) => count + 1);
         void queryClient.invalidateQueries();
