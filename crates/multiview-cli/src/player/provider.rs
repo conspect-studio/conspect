@@ -14,6 +14,19 @@ use std::{
 pub struct RuntimeProvider {
     players: Mutex<HashMap<String, PlayerRuntime>>,
     operations: Mutex<Vec<Record>>,
+    /// Keys whose terminal record was evicted: a replay is refused (409), never
+    /// re-executed as a new capture.
+    tombstones: Mutex<std::collections::VecDeque<Tombstone>>,
+}
+/// Per-player cap on retained operation records (pending + terminal).
+pub(crate) const MAX_RECORDS_PER_PLAYER: usize = 64;
+/// Per-player cap on expired-idempotency tombstones. Beyond this the oldest
+/// tombstone is forgotten: replay protection is **bounded**, never unlimited.
+pub(crate) const MAX_TOMBSTONES_PER_PLAYER: usize = 1024;
+struct Tombstone {
+    player: String,
+    owner: String,
+    key: String,
 }
 struct Record {
     player: String,
@@ -36,6 +49,68 @@ impl RuntimeProvider {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .insert(id, runtime);
     }
+    /// Scoped teardown: remove `id` (only if it is still `runtime`, so a newer
+    /// same-id boot is never evicted) and drop its operation history. Called
+    /// after the player's native/audio owners have been handed to retirement,
+    /// so the provider no longer pins the runtime or its journal flock.
+    pub fn unregister(&self, id: &str, runtime: &PlayerRuntime) {
+        let mut players = self
+            .players
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if players
+            .get(id)
+            .is_some_and(|r| Arc::ptr_eq(&r.coordinator, &runtime.coordinator))
+        {
+            players.remove(id);
+            drop(players);
+            self.operations
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .retain(|o| o.player != id);
+            self.tombstones
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .retain(|t| t.player != id);
+        }
+    }
+    /// Whether a player id is currently registered (test/diagnostic).
+    #[must_use]
+    pub fn is_registered(&self, id: &str) -> bool {
+        self.players
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .contains_key(id)
+    }
+    /// Evict the oldest terminal record of `player` when at capacity,
+    /// tombstoning its key. Pending records are never evicted.
+    fn make_room(
+        ops: &mut Vec<Record>,
+        tombs: &mut std::collections::VecDeque<Tombstone>,
+        player: &str,
+    ) -> ControlResult<()> {
+        if ops.iter().filter(|o| o.player == player).count() < MAX_RECORDS_PER_PLAYER {
+            return Ok(());
+        }
+        let Some(idx) = ops
+            .iter()
+            .position(|o| o.player == player && o.terminal.is_some())
+        else {
+            return Err(ControlError::EngineBusy);
+        };
+        let gone = ops.remove(idx);
+        tombs.push_back(Tombstone {
+            player: gone.player,
+            owner: gone.owner,
+            key: gone.key,
+        });
+        while tombs.iter().filter(|t| t.player == player).count() > MAX_TOMBSTONES_PER_PLAYER {
+            if let Some(i) = tombs.iter().position(|t| t.player == player) {
+                tombs.remove(i);
+            }
+        }
+        Ok(())
+    }
     fn reconcile(record: &mut Record, runtime: &PlayerRuntime) -> LoadOperation {
         if let Some(view) = &record.terminal {
             return view.clone();
@@ -53,11 +128,16 @@ impl RuntimeProvider {
             runtime.audio_commit.has_adopted(generation)
                 || (!a.has_audio && runtime.audio_commit.is_closed())
         });
-        let failed = runtime
-            .opener
-            .status()
-            .last_failure
-            .is_some_and(|f| f.generation == generation);
+        let audio_refused = matches!(
+            runtime.status.load().fault,
+            Some(super::PlayerFault::AudioUnavailable { generation: g }) if g == generation.0
+        );
+        let failed = audio_refused
+            || runtime
+                .opener
+                .status()
+                .last_failure
+                .is_some_and(|f| f.generation == generation);
         let state = if completed {
             "completed"
         } else if failed {
@@ -102,6 +182,20 @@ impl PlayerLoadProvider for RuntimeProvider {
         for old in ops.iter_mut().filter(|o| o.player == player) {
             Self::reconcile(old, runtime);
         }
+        let expired = self
+            .tombstones
+            .lock()
+            .map_err(|_| ControlError::EngineBusy)?
+            .iter()
+            .any(|t| t.player == player && t.owner == principal.key_id && t.key == key);
+        let live = ops
+            .iter()
+            .any(|o| o.player == player && o.owner == principal.key_id && o.key == key);
+        if expired && !live {
+            return Err(ControlError::Conflict(
+                "idempotency key expired; use a new key".into(),
+            ));
+        }
         if let Some(old) = ops
             .iter_mut()
             .find(|o| o.player == player && o.owner == principal.key_id && o.key == key)
@@ -113,9 +207,17 @@ impl PlayerLoadProvider for RuntimeProvider {
             }
             return Ok(Self::reconcile(old, runtime));
         }
-        // Never evict operation identity silently. Admission remains bounded.
-        if ops.len() >= 64 {
-            return Err(ControlError::EngineBusy);
+        // Idempotency retention contract: identity is kept per player for at
+        // most MAX_RECORDS_PER_PLAYER operations. When full, the oldest
+        // *terminal* record is evicted (never a pending one) and its key is
+        // tombstoned (bounded), so a later replay is refused with 409 rather
+        // than executing a second capture. All-pending => EngineBusy.
+        {
+            let mut tombs = self
+                .tombstones
+                .lock()
+                .map_err(|_| ControlError::EngineBusy)?;
+            Self::make_room(&mut ops, &mut tombs, player)?;
         }
         #[cfg(target_os = "linux")]
         let spec = ClipSpec::from_artifact(
@@ -165,7 +267,60 @@ impl PlayerLoadProvider for RuntimeProvider {
             .find(|o| {
                 o.player == player && o.owner == principal.key_id && o.generation.0 == operation
             })
-            .ok_or(ControlError::EngineBusy)?;
+            .ok_or(ControlError::NotFound {
+                kind: "load-operation",
+                id: operation.to_string(),
+            })?;
         Ok(Self::reconcile(record, runtime))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    fn rec(player: &str, n: u64, terminal: bool) -> Record {
+        Record {
+            player: player.into(),
+            owner: "o".into(),
+            key: format!("k{n}"),
+            reference: ArtifactRef {
+                capture_job_id: n,
+                artifact_id: "a".into(),
+            },
+            then: LoadThen::Cue,
+            generation: Generation(n),
+            terminal: terminal.then_some(LoadOperation {
+                operation: n,
+                state: "completed",
+                native: None,
+            }),
+        }
+    }
+    #[test]
+    fn sequential_completed_loads_evict_oldest_terminal_and_tombstone() {
+        let mut ops = Vec::new();
+        let mut tombs = std::collections::VecDeque::new();
+        for n in 0..(u64::try_from(MAX_RECORDS_PER_PLAYER).unwrap() + 5) {
+            RuntimeProvider::make_room(&mut ops, &mut tombs, "p").unwrap();
+            ops.push(rec("p", n, true));
+        }
+        assert_eq!(ops.len(), MAX_RECORDS_PER_PLAYER);
+        assert_eq!(tombs.len(), 5);
+        assert_eq!(tombs.front().unwrap().key, "k0");
+    }
+    #[test]
+    fn pending_records_are_never_evicted_and_other_players_are_independent() {
+        let mut ops = Vec::new();
+        let mut tombs = std::collections::VecDeque::new();
+        for n in 0..u64::try_from(MAX_RECORDS_PER_PLAYER).unwrap() {
+            ops.push(rec("p", n, false));
+        }
+        assert!(matches!(
+            RuntimeProvider::make_room(&mut ops, &mut tombs, "p"),
+            Err(ControlError::EngineBusy)
+        ));
+        assert_eq!(ops.len(), MAX_RECORDS_PER_PLAYER);
+        assert!(RuntimeProvider::make_room(&mut ops, &mut tombs, "q").is_ok());
+        assert!(tombs.is_empty());
     }
 }

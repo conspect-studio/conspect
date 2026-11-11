@@ -141,6 +141,13 @@ pub enum PlayerFault {
         /// The staged load generation that could not commit.
         generation: u64,
     },
+    /// The clip carries audio but the audio rail is closed, so the joint A/V
+    /// load can never complete. Terminal for that generation; the previous clip
+    /// and its binding are preserved.
+    AudioUnavailable {
+        /// The staged load generation that was refused.
+        generation: u64,
+    },
     /// Seek or cue failed; the player holds its last good picture and pauses its
     /// audio until a newer load commits.
     SeekFailed {
@@ -157,6 +164,7 @@ impl PlayerFault {
     pub const fn generation(self) -> u64 {
         match self {
             Self::SeekFailed { generation, .. }
+            | Self::AudioUnavailable { generation }
             | Self::LoadReferenceMissing { generation }
             | Self::LoadJournalFailed { generation } => generation,
         }

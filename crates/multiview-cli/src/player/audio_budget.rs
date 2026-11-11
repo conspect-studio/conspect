@@ -113,7 +113,8 @@ pub fn player_audio_budget() -> &'static AudioDeckBudget {
 #[cfg(test)]
 pub(crate) fn budget_test_guard() -> std::sync::MutexGuard<'static, ()> {
     static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-    LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+    LOCK.lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 #[cfg(test)]

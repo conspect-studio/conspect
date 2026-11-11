@@ -28,6 +28,10 @@ enum Reference {
 pub struct BindingJournal {
     path: PathBuf,
     player: String,
+    /// Test-only seam run after the new record is fsynced and before it becomes
+    /// visible; lets a test inject a newer request deterministically mid-write.
+    #[cfg(test)]
+    pub(crate) precommit_hook: Option<std::sync::Arc<dyn Fn() + Send + Sync>>,
 }
 impl BindingJournal {
     /// Hold the stable lock inode until all native/audio owners have exited.
@@ -66,6 +70,8 @@ impl BindingJournal {
         Self {
             path: root.join("player-bindings").join(format!("{key}.json")),
             player: player.to_owned(),
+            #[cfg(test)]
+            precommit_hook: None,
         }
     }
     /// Absence alone permits the configured default. Every other error fails closed.
@@ -128,6 +134,46 @@ impl BindingJournal {
     ) -> io::Result<()> {
         self.store_intent(snapshot, Some(request.operation), Some(request.expected.0))
     }
+    /// Latest-wins durable precommit. Writes `snapshot`, then evaluates
+    /// `still_current` **after** the record is durable. When it is no longer
+    /// current (a newer request arrived during the fsync) the previous record is
+    /// restored byte-for-byte (or removed when none existed) and `Ok(false)` is
+    /// returned, so a superseded generation is never left as the durable
+    /// binding and never reaches the audio/video commit.
+    ///
+    /// # Errors
+    /// Returns the I/O error when the record cannot be written or restored.
+    pub fn store_if_current(
+        &self,
+        snapshot: &SlotSnapshot,
+        operation: Option<u64>,
+        still_current: impl FnOnce() -> bool,
+    ) -> io::Result<bool> {
+        let prior = match std::fs::read(&self.path) {
+            Ok(bytes) => Some(bytes),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => None,
+            Err(e) => return Err(e),
+        };
+        self.store_intent(snapshot, operation, None)?;
+        if still_current() {
+            return Ok(true);
+        }
+        match prior {
+            Some(bytes) => {
+                let parent = self
+                    .path
+                    .parent()
+                    .ok_or_else(|| io::Error::other("journal parent missing"))?;
+                let mut temp = tempfile::NamedTempFile::new_in(parent)?;
+                temp.write_all(&bytes)?;
+                temp.as_file().sync_all()?;
+                temp.persist(&self.path).map_err(|e| e.error)?;
+            }
+            None => std::fs::remove_file(&self.path)?,
+        }
+        std::fs::File::open(self.path.parent().unwrap_or(Path::new(".")))?.sync_all()?;
+        Ok(false)
+    }
     fn store_intent(
         &self,
         snapshot: &SlotSnapshot,
@@ -155,6 +201,10 @@ impl BindingJournal {
         let mut temp = tempfile::NamedTempFile::new_in(parent)?;
         temp.write_all(&serde_json::to_vec(&record).map_err(io::Error::other)?)?;
         temp.as_file().sync_all()?;
+        #[cfg(test)]
+        if let Some(hook) = &self.precommit_hook {
+            hook();
+        }
         temp.persist(&self.path).map_err(|e| e.error)?;
         std::fs::File::open(parent)?.sync_all()
     }
@@ -185,6 +235,55 @@ mod tests {
         record["player"] = "other".into();
         std::fs::write(&journal.path, serde_json::to_vec(&record).unwrap()).unwrap();
         assert!(journal.load().is_err());
+    }
+    #[test]
+    fn newer_request_during_fsync_restores_prior_record_and_never_commits() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut journal = BindingJournal::new(dir.path(), "vt-1");
+        let asset = |id: &str, g| SlotSnapshot {
+            generation: Generation(g),
+            reference: Some(SlotReference::Asset { id: id.into() }),
+        };
+        let old = asset("old", 1);
+        journal.store(&old, None).unwrap();
+        let latest = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(2));
+        let hook_latest = std::sync::Arc::clone(&latest);
+        // B (generation 3) arrives while A (generation 2) is being fsynced.
+        journal.precommit_hook = Some(std::sync::Arc::new(move || {
+            hook_latest.store(3, std::sync::atomic::Ordering::Release);
+        }));
+        let a = asset("a", 2);
+        let committed = journal
+            .store_if_current(&a, None, || {
+                latest.load(std::sync::atomic::Ordering::Acquire) == 2
+            })
+            .unwrap();
+        assert!(!committed, "superseded A must not commit");
+        assert_eq!(
+            journal.load().unwrap(),
+            Some(old),
+            "prior durable binding restored"
+        );
+        // B then commits normally and is the durable winner.
+        journal.precommit_hook = None;
+        let b = asset("b", 3);
+        assert!(journal
+            .store_if_current(&b, None, || latest
+                .load(std::sync::atomic::Ordering::Acquire)
+                == 3)
+            .unwrap());
+        assert_eq!(journal.load().unwrap(), Some(b));
+    }
+    #[test]
+    fn superseded_first_ever_record_is_removed() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal = BindingJournal::new(dir.path(), "vt-9");
+        let a = SlotSnapshot {
+            generation: Generation(1),
+            reference: Some(SlotReference::Asset { id: "a".into() }),
+        };
+        assert!(!journal.store_if_current(&a, None, || false).unwrap());
+        assert_eq!(journal.load().unwrap(), None);
     }
     #[test]
     fn detach_operation_recovery_requires_runtime_barrier() {

@@ -14356,6 +14356,8 @@ fn player_runtime_loop(
         );
     }));
     let runtime = handle.runtime.as_ref()?;
+    // The provider must not pin this runtime (and its journal flock) past stop.
+    crate::player::runtime_provider().unregister(&plan.id, runtime);
     runtime.detach.stopped(runtime.binding.load().generation);
     if result.is_err() {
         tracing::error!(player = %plan.id, "player ingest panic; native owners retained for opener retirement");
@@ -14634,19 +14636,63 @@ fn player_runtime_body(
                     generation: staged.generation,
                     reference: staged.clip.reference.clone(),
                 };
-                let refusal = runtime.journal.as_ref().and_then(|journal| {
-                    if snapshot.reference.is_none() {
-                        Some(crate::player::PlayerFault::LoadReferenceMissing {
-                            generation: snapshot.generation.0,
-                        })
-                    } else if journal.store(&snapshot, None).is_err() {
-                        Some(crate::player::PlayerFault::LoadJournalFailed {
-                            generation: snapshot.generation.0,
-                        })
-                    } else {
-                        None
+                let mut superseded_in_flight = false;
+                let audio_unavailable = audio_slot.is_closed() && staged.clip.probed.has_audio;
+                let refusal = if audio_unavailable {
+                    // Fail closed BEFORE any durable write: an audio-bearing clip
+                    // with a dead audio rail can never satisfy the A/V contract.
+                    Some(crate::player::PlayerFault::AudioUnavailable {
+                        generation: snapshot.generation.0,
+                    })
+                } else {
+                    runtime.journal.as_ref().and_then(|journal| {
+                        if snapshot.reference.is_none() {
+                            Some(crate::player::PlayerFault::LoadReferenceMissing {
+                                generation: snapshot.generation.0,
+                            })
+                        } else {
+                            // Latest-wins: re-check AFTER the record is durable and
+                            // restore the prior binding if a newer request raced in.
+                            match journal.store_if_current(&snapshot, None, || {
+                                !coordinator.is_superseded(snapshot.generation)
+                            }) {
+                                Ok(true) => None,
+                                Ok(false) => {
+                                    superseded_in_flight = true;
+                                    None
+                                }
+                                Err(_) => Some(crate::player::PlayerFault::LoadJournalFailed {
+                                    generation: snapshot.generation.0,
+                                }),
+                            }
+                        }
+                    })
+                };
+                if superseded_in_flight {
+                    if let Some(stale) = pending_stage.take() {
+                        *pending_retire = coordinator.retire(stale.clip).err();
+                        opener.wake();
                     }
-                });
+                    continue;
+                }
+                if matches!(
+                    refusal,
+                    Some(crate::player::PlayerFault::AudioUnavailable { .. })
+                ) {
+                    // Terminal for this generation: retire the clip, keep the old one.
+                    if let Some(fault) = refusal {
+                        tracing::warn!(player = %plan.id, ?fault, "audio-bearing load refused: audio rail closed; live binding unchanged");
+                        runtime.status.store(Arc::new(crate::player::PlayerStatus {
+                            clip_epoch: runtime.binding.load().generation.0,
+                            fault: Some(fault),
+                        }));
+                    }
+                    if let Some(stale) = pending_stage.take() {
+                        *pending_retire = coordinator.retire(stale.clip).err();
+                        opener.wake();
+                    }
+                    continue;
+                }
                 if let Some(fault) = refusal {
                     if journal_refusal != Some(fault) {
                         tracing::warn!(player = %plan.id, ?fault, "player load precommit refused; live binding unchanged");
@@ -23013,6 +23059,134 @@ loop_default = true
         stop.store(true, Ordering::Release);
         let exceptional = worker.join().unwrap();
         assert!(exceptional.is_none(), "normal shutdown uses opener handoff");
+    }
+
+    #[cfg(feature = "ffmpeg")]
+    #[test]
+    fn audio_bearing_load_with_closed_audio_rail_fails_closed_not_pending() {
+        use crate::player::{ClipSpec, LoadThen, PlayerFault};
+        use multiview_engine::{ManualTimeSource, TimeSource};
+        use multiview_ffmpeg::test_fixtures::{generate_player_clip, PlayerClipSpec};
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+        let _budget = crate::player::budget_test_guard();
+        let mut config = config_with_player();
+        config.media_players[0].default = None;
+        let layout = config.solve_layout().unwrap();
+        let cadence = config.canvas.fps.rational();
+        let boot =
+            super::build_media_player_boot(&config, &layout, cadence, CanvasColor::default());
+        let plan = boot.plans.into_iter().next().unwrap();
+        let handle = plan.player.as_ref().unwrap().clone();
+        let runtime = handle.runtime.as_ref().unwrap().clone();
+        drop(runtime.audio_commit.close());
+        let dir = tempfile::tempdir().unwrap();
+        let clip = dir.path().join("a.mov");
+        let mut spec = PlayerClipSpec::ffv1(cadence, 25, 30);
+        spec.audio_level = Some(0.25);
+        generate_player_clip(&clip, &spec).unwrap();
+        let clock = Arc::new(ManualTimeSource::new());
+        clock.set(1_000_000_000);
+        let source: Arc<dyn TimeSource> = clock.clone();
+        plan.output_origin
+            .store(Some(Arc::new(multiview_engine::epoch::EpochAnchor::new(
+                source,
+                1_000_000_000,
+            ))));
+        let stop = Arc::new(AtomicBool::new(false));
+        let s2 = Arc::clone(&stop);
+        let worker = std::thread::spawn(move || {
+            super::player_runtime_loop(&plan, plan.player.as_ref().unwrap(), &s2)
+        });
+        let generation = runtime
+            .opener
+            .request(ClipSpec::new(&clip, LoadThen::Cue))
+            .unwrap();
+        let t0 = std::time::Instant::now();
+        while !matches!(
+            runtime.status.load().fault,
+            Some(PlayerFault::AudioUnavailable { .. })
+        ) {
+            assert!(
+                t0.elapsed() < std::time::Duration::from_secs(15),
+                "never terminal"
+            );
+            std::thread::yield_now();
+        }
+        assert_eq!(
+            runtime.status.load().fault.unwrap().generation(),
+            generation.0
+        );
+        assert_eq!(handle.control_bus.load().clip_epoch.0, 0, "no video commit");
+        assert!(runtime.native.load().is_none(), "no fake ACK");
+        assert_eq!(runtime.binding.load().reference, None);
+        stop.store(true, Ordering::Release);
+        assert!(worker.join().unwrap().is_none());
+    }
+
+    #[cfg(feature = "ffmpeg")]
+    #[test]
+    fn stop_unregisters_provider_so_same_state_dir_restart_claims_journal() {
+        let _budget = crate::player::budget_test_guard();
+        let mut config = config_with_player();
+        config.media_players[0].default = None;
+        config.media_players[0].id = "restart-vt".into();
+        let layout = config.solve_layout().unwrap();
+        let cadence = config.canvas.fps.rational();
+        let state = tempfile::tempdir().unwrap();
+        let boot = super::build_media_player_boot_with_state(
+            &config,
+            &layout,
+            cadence,
+            CanvasColor::default(),
+            Some(state.path()),
+        );
+        assert_eq!(boot.plans.len(), 1);
+        assert!(crate::player::runtime_provider().is_registered("restart-vt"));
+        let second = super::build_media_player_boot_with_state(
+            &config,
+            &layout,
+            cadence,
+            CanvasColor::default(),
+            Some(state.path()),
+        );
+        assert!(
+            second.plans.is_empty(),
+            "live owner excludes a second claim"
+        );
+        let plan = boot.plans.into_iter().next().unwrap();
+        let stop = std::sync::atomic::AtomicBool::new(true);
+        let exceptional = super::player_runtime_loop(&plan, plan.player.as_ref().unwrap(), &stop);
+        assert!(exceptional.is_none());
+        assert!(!crate::player::runtime_provider().is_registered("restart-vt"));
+        drop(plan);
+        drop(boot.audio_plans);
+        drop(second);
+        // The opener thread (last native owner) exits asynchronously after
+        // stop; the claim must succeed once it has, with no provider pin.
+        let t0 = std::time::Instant::now();
+        let third = loop {
+            let attempt = super::build_media_player_boot_with_state(
+                &config,
+                &layout,
+                cadence,
+                CanvasColor::default(),
+                Some(state.path()),
+            );
+            if !attempt.plans.is_empty() {
+                break attempt;
+            }
+            assert!(
+                t0.elapsed() < std::time::Duration::from_secs(10),
+                "restart never claimed the journal after stop"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        };
+        assert_eq!(
+            third.plans.len(),
+            1,
+            "restart claims the journal after stop"
+        );
     }
 
     #[test]
