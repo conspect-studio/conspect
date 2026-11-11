@@ -842,3 +842,107 @@ async fn program_punch_takes_a_lease_before_enqueue_and_keeps_it_when_applied() 
     );
     assert_eq!(handle.snapshot().unwrap().program.as_str(), "b");
 }
+
+/// Review SW2-R2-01: a punch to a COLD source is held by the engine while the
+/// source starts. The off-clock sweep must not drop its lease inside the
+/// engine's hold bound; once applied it is kept, and once Program moves to
+/// another source the sweep releases it.
+#[tokio::test]
+async fn cold_program_punch_keeps_its_lease_through_the_hold_and_releases_it_after_program_moves() {
+    let thresholds = TileThresholds::from_millis(500, 2_000, 10_000).unwrap();
+    let mut stores = primed_stores();
+    let cold = Arc::new(TileStore::new("c", thresholds, NoSignalPolicy::Slate));
+    stores.insert("c".into(), Arc::clone(&cold));
+    let (handle, mut driver) = SwitcherControl::new(SwitcherState::new(
+        SourceRef::new("a"),
+        SourceRef::new("b"),
+        vec![],
+    ));
+    handle
+        .set_scenes(ScenePair {
+            version: 1,
+            program: scene("a"),
+            preview: scene("b"),
+        })
+        .unwrap();
+    driver.set_prime_stores(stores);
+    driver.publish_provider_status(multiview_engine::switcher_control::ProviderStatus {
+        scene_version: 1,
+        last_tick: 0,
+        width: 64,
+        height: 64,
+        fps_num: 25,
+        fps_den: 1,
+    });
+    let log = Arc::new(LeaseLog::default());
+    let leases = Arc::new(multiview_control::source_demand::SwitcherPreviewLeases::default());
+    let demand: SharedSourceDemand = Arc::new(LeaseDemand {
+        log: Arc::clone(&log),
+    });
+    let handle_for_state = handle.clone();
+    let leases_for_state = Arc::clone(&leases);
+    let h = harness_with(move |state| {
+        let mut state = state
+            .with_sources_store(configured_sources(&["a", "b", "c"]))
+            .with_switcher(handle_for_state)
+            .with_source_demand(demand);
+        state.switcher_preview_lease = leases_for_state;
+        state
+    });
+    let response = send(
+        &h.router,
+        post_with_key(
+            "/api/v1/switcher/commands/select_program",
+            OPERATOR_TOKEN,
+            request("select_program", Some("c")),
+            "punch-cold",
+        ),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+    let mut outcomes = handle.outcomes();
+    let tick = |index: u64| Tick {
+        index,
+        pts: MediaTime::from_nanos(i64::try_from(index).unwrap() * 40_000_000),
+    };
+    // 20 held ticks and a sweep well past the PVW floor: still pending.
+    for index in 1..=20 {
+        driver.drain_at_tick(tick(index));
+        driver.commit_composed_tick(tick(index));
+    }
+    let late = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let snapshot = handle.snapshot().unwrap();
+    let _ = leases.sweep(
+        Some(snapshot.preview.as_str()),
+        handle.composed_count(),
+        late,
+        64,
+    );
+    assert_eq!(leases.pending_count(), 1, "the held punch keeps its lease");
+    assert!(log.dropped().is_empty());
+    // The source primes; the punch applies on the next fresh tick.
+    cold.publish(
+        Nv12Image::solid(
+            64,
+            64,
+            90,
+            128,
+            128,
+            ColorInfo::default().resolve_defaults(64, 64),
+        )
+        .unwrap(),
+        tick(21).pts,
+    );
+    driver.drain_at_tick(tick(21));
+    driver.commit_composed_tick(tick(21));
+    let outcome = outcomes.try_recv().unwrap();
+    assert!(outcome.event.completed, "{:?}", outcome.event.error);
+    leases.resolve(&outcome.event.operation_id, true);
+    assert!(leases.has_current_program());
+    assert!(log.dropped().is_empty(), "the applied punch keeps c wanted");
+    assert!(!leases.sweep_program(Some("c")), "Program still on c");
+    // Program moves away (a CUT to b); the bridge lease is released.
+    assert!(leases.sweep_program(Some("b")));
+    assert!(!leases.has_current_program());
+    assert_eq!(log.dropped(), vec!["c".to_owned()]);
+}

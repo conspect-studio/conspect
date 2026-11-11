@@ -520,3 +520,74 @@ fn rejected_start_tick_refuses_the_auto_once_and_leaves_no_flight() {
     assert!(events.try_recv().is_err(), "exactly one outcome");
     assert_eq!(handle.snapshot().unwrap().program.as_str(), "a");
 }
+
+/// Review SW2-R2-02: a CUT interrupts a running AUTO and the same tick's frame
+/// is rejected. The AUTO gets exactly one terminal outcome, the CUT one, and
+/// Program stays on the source it showed before the tick.
+#[test]
+fn rejected_tick_that_interrupts_an_auto_refuses_it_exactly_once() {
+    use multiview_engine::clock::Tick;
+    let a = Arc::new(TileStore::<Nv12Image>::with_defaults("a"));
+    let b = Arc::new(TileStore::<Nv12Image>::with_defaults("b"));
+    feed(&a, A_Y, 30);
+    feed(&b, B_Y, 30);
+    let (handle, mut driver) = SwitcherControl::new(SwitcherState::new(
+        SourceRef::new("a"),
+        SourceRef::new("b"),
+        vec![],
+    ));
+    driver.set_prime_stores(HashMap::from([("a".into(), a), ("b".into(), b)]));
+    handle
+        .set_scenes(ScenePair {
+            version: 1,
+            program: layout("a"),
+            preview: layout("b"),
+        })
+        .unwrap();
+    let mut events = handle.outcomes();
+    let tick = |index: u64| Tick {
+        index,
+        pts: MediaTime::from_nanos(i64::try_from(index).unwrap() * TICK_NS),
+    };
+    let send = |id: &str, verb: SwitcherVerb| {
+        handle
+            .try_send(SwitcherCommand {
+                operation_id: id.into(),
+                scene_version: 1,
+                verb,
+            })
+            .unwrap();
+    };
+    send(
+        "auto",
+        SwitcherVerb::Auto(FrameCount::try_from(10).unwrap()),
+    );
+    for index in 0..3 {
+        driver.drain_at_tick(tick(index));
+        driver.commit_composed_tick(tick(index));
+    }
+    send("cut", SwitcherVerb::Cut);
+    driver.drain_at_tick(tick(3));
+    driver.reject_composed_tick(tick(3), "forced render failure");
+    for index in 4..20 {
+        driver.drain_at_tick(tick(index));
+        driver.commit_composed_tick(tick(index));
+    }
+    let mut seen = Vec::new();
+    while let Ok(item) = events.try_recv() {
+        seen.push((item.event.operation_id.clone(), item.event.completed));
+    }
+    assert_eq!(
+        seen.iter().filter(|(id, _)| id == "auto").count(),
+        1,
+        "one AUTO outcome: {seen:?}"
+    );
+    assert_eq!(seen.iter().filter(|(id, _)| id == "cut").count(), 1);
+    assert!(seen.iter().all(|(_, completed)| !completed));
+    let snapshot = handle.snapshot().unwrap();
+    assert_eq!(snapshot.program.as_str(), "a");
+    assert!(
+        !snapshot.in_flight,
+        "no AUTO resurrected after the rejected tick"
+    );
+}

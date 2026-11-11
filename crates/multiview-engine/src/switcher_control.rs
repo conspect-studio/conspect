@@ -364,6 +364,16 @@ impl SwitcherTickDriver {
         }
     }
 
+    /// The running AUTO got its terminal outcome on this tick: a rejected
+    /// frame restores the buses but must not resurrect or refuse it again.
+    fn forget_staged_auto(&mut self) {
+        if let Some(staged) = self.before_staged.as_mut() {
+            staged.active_auto = None;
+            staged.active_auto_scenes = None;
+            staged.machine.abort();
+        }
+    }
+
     /// The source a take verb puts on Program.
     fn incoming<'a>(&'a self, verb: &'a SwitcherVerb) -> &'a str {
         match verb {
@@ -420,6 +430,7 @@ impl SwitcherTickDriver {
         if matches!(verb, SwitcherVerb::Cut | SwitcherVerb::SelectProgram(_)) {
             if let Some(old) = self.active_auto.take() {
                 self.active_auto_scenes = None;
+                self.forget_staged_auto();
                 self.publish_outcome(
                     old,
                     tick.index,
@@ -529,11 +540,7 @@ impl SwitcherTickDriver {
                 if let Some(operation_id) = self.active_auto.take() {
                     self.active_auto_scenes = None;
                     // Already terminal: a rejected frame must not refuse it twice.
-                    if let Some(staged) = self.before_staged.as_mut() {
-                        staged.active_auto = None;
-                        staged.active_auto_scenes = None;
-                        staged.machine.abort();
-                    }
+                    self.forget_staged_auto();
                     self.publish_outcome(
                         operation_id,
                         tick.index,

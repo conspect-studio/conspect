@@ -225,7 +225,7 @@ struct PreviewLeaseState {
     /// The last applied direct Program punch's lease. Held until the next
     /// punch replaces it, so the Program layout demand takes over before it
     /// is released (make-before-break).
-    current_program: Option<SwitcherPreviewLease>,
+    current_program: Option<(String, SwitcherPreviewLease)>,
     pending: std::collections::BTreeMap<String, PendingPreviewLease>,
 }
 
@@ -336,7 +336,7 @@ impl SwitcherPreviewLeases {
                 .and_then(multiview_engine::switcher_control::SwitcherControl::snapshot);
             if entry.program {
                 if applied && snapshot.is_some_and(|s| s.program.as_str() == entry.target) {
-                    state.current_program = Some(entry.lease);
+                    state.current_program = Some((entry.target, entry.lease));
                 }
             } else if applied && snapshot.is_some_and(|s| s.preview.as_str() == entry.target) {
                 state.current = Some(entry.lease);
@@ -363,8 +363,16 @@ impl SwitcherPreviewLeases {
             .pending
             .iter()
             .filter(|(_, entry)| {
+                // A punch may be held by the engine until its source primes
+                // (review SW2-R2-01): its lease stays until that bound passed.
+                let bound = if entry.program {
+                    Self::DRAIN_TICKS_BOUND
+                        + multiview_engine::switcher_control::TAKE_PRIME_DEADLINE_TICKS
+                } else {
+                    Self::DRAIN_TICKS_BOUND
+                };
                 now.saturating_duration_since(entry.accepted_at) >= Self::RECONCILE_FLOOR
-                    && applied_tick.saturating_sub(entry.accepted_tick) >= Self::DRAIN_TICKS_BOUND
+                    && applied_tick.saturating_sub(entry.accepted_tick) >= bound
             })
             .take(max)
             .map(|(id, _)| id.clone())
@@ -376,9 +384,9 @@ impl SwitcherPreviewLeases {
             };
             if let Some(entry) = state.pending.remove(&id) {
                 if entry.program {
-                    // A punch's own outcome normally resolves it; a lost one
-                    // is dropped here (the Program layout demand covers an
-                    // applied punch).
+                    // The engine has decided this punch by now; its own
+                    // outcome normally resolves it. A lost outcome is dropped:
+                    // an applied punch is held by the Program layout demand.
                     report.dropped += 1;
                 } else if entry.target == preview {
                     state.current = Some(entry.lease);
@@ -389,6 +397,34 @@ impl SwitcherPreviewLeases {
             }
         }
         report
+    }
+
+    /// Release an applied punch's lease once Program has moved to another
+    /// source (review SW2-R2-01). The lease only bridges the punch until the
+    /// Program layout demand holds its source. Returns whether one was released.
+    pub fn sweep_program(&self, engine_program: Option<&str>) -> bool {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let moved = matches!(
+            (engine_program, &state.current_program),
+            (Some(program), Some((target, _))) if program != target
+        );
+        if moved {
+            state.current_program = None;
+        }
+        moved
+    }
+
+    /// Whether an applied punch's lease is held.
+    #[must_use]
+    pub fn has_current_program(&self) -> bool {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .current_program
+            .is_some()
     }
 
     /// Permanently close this run's owner; late requests and receipts cannot

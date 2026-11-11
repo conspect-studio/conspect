@@ -66,16 +66,21 @@ pub async fn sweep_switcher_leases(
         }
         // Read the commit count first: the following snapshot is at least as new.
         let composed_count = control.composed_count();
-        let preview = control
-            .snapshot()
+        let snapshot = control.snapshot();
+        let preview = snapshot
+            .as_ref()
             .map(|snapshot| snapshot.preview.as_str().to_owned());
+        let program = snapshot
+            .as_ref()
+            .map(|snapshot| snapshot.program.as_str().to_owned());
+        let released_program = leases.sweep_program(program.as_deref());
         let report = leases.sweep(
             preview.as_deref(),
             composed_count,
             Instant::now(),
             SwitcherPreviewLeases::MAX_PENDING,
         );
-        if report != SwitcherLeaseSweep::default() {
+        if report != SwitcherLeaseSweep::default() || released_program {
             tracing::debug!(
                 adopted = report.adopted,
                 dropped = report.dropped,
