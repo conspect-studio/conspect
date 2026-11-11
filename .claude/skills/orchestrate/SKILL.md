@@ -90,13 +90,15 @@ recall/record is the [`memory`](../memory/SKILL.md) skill.
   reproduced finding away, and re-review only **the delta** after a fix.
 - **R3 diffs** (invariant #1/#10 risk, keys, trust boundaries — authn/authz/egress/TLS,
   licence enforcement, legal or public action, release publishing) → **3-lens panel**,
-  chaos/soak, a rehearsed recovery path, and explicit operator approval.
+  chaos/soak and a rehearsed recovery path. Then the agent merges: no class waits for
+  the operator ([ADR-G009](../../../docs/decisions/ADR-G009.md)).
 
 ### ⑥ MERGE (ADR-G005)
 - Merge only on **green deterministic checks** + a passing cross-vendor review. Report
   failures and skips honestly — a green summary over a skipped suite is a defect. Never
   `--admin`/bypass branch protection; never weaken, skip, `#[ignore]` or delete a test to
-  go green — stop and ask the operator instead.
+  go green. A red check is yours to fix: read the log, fix the cause, or rerun a tracked
+  flaky job. Never park a PR for the operator.
 
 ### ⑦ CLEAN
 - Apply [workspace disk hygiene](../../../docs/development/working-in-this-monorepo.md#workspace-disk-hygiene):

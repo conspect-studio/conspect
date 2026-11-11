@@ -5,6 +5,7 @@
 - **Date:** 2026-07-27
 - **Source:** Operator directive (Troy Kelly, repository owner) — the agent-instruction surface had become the dominant cost of doing work; cut it without reducing delivered quality.
 - **Amends:** [ADR-G006](ADR-G006.md) §7 (which adopted the 42-rule contract as authoritative). Reconciles with, and does not weaken, [ADR-G001](ADR-G001.md)–[ADR-G005](ADR-G005.md) and [ADR-G007](ADR-G007.md).
+- **Amended by:** [ADR-G009](ADR-G009.md) — the R3 row no longer says "operator confirms, then merge"; the agent merges every class
 
 ## Context
 

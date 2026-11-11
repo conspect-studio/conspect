@@ -50,6 +50,7 @@ In order: solve it → route around it (do adjacent work, open a tracking issue)
 
 ## Repository specifics
 
+- This is your product to manage: you own every PR to merged and every red CI check to green. No change class waits for the operator to merge, R3 included ([ADR-G009](docs/decisions/ADR-G009.md)); report decisions, never ask for them.
 - `scripts/classify.sh` prints the R0–R3 change class (a floor — raise, never lower). Full gates contract: [engineering.md](docs/standards/engineering.md).
 - Commands: `cargo check --workspace` (CI-green baseline, no native deps/GPU) · `cargo test -p multiview-<crate>` (working loop) · `cargo fmt --all -- --check && cargo clippy --locked --workspace --all-targets -- -D warnings && cargo test --locked --workspace && cargo deny check` (full CI set) · `web/`: `npm --prefix web ci && npm --prefix web run lint && npm --prefix web run build` · dev automation: `cargo xtask --help`.
 - Invariant #1 (output clock): one fixed-cadence clock emits exactly one valid, correctly-stamped frame per tick, forever, independent of any input; no data-plane path blocks on an input/client/lock. Invariant #10 (isolation): the engine never `.await`s a client; bounded queues drop, never grow. A change risking #1/#10 is R3: stop, write a design note, add a chaos/soak test.
@@ -59,7 +60,7 @@ In order: solve it → route around it (do adjacent work, open a tracking issue)
 - Default build stays LGPL-clean and GPU-free: `cargo check --workspace` must stay green with no native deps and no GPU. `gpl-codecs` and the proprietary NDI SDK are opt-in only, never vendored/default-on.
 - IPv6-first, always: bind dual-stack `[::]`, never `0.0.0.0`; loopback is `[::1]`.
 - Per-object authorization on every resource id — BOLA is this API's number-one risk.
-- Never weaken a test to make a build pass (not deleted, skipped, `#[ignore]`d, or loosened) — stop and ask instead.
+- Never weaken a test to make a build pass (not deleted, skipped, `#[ignore]`d, or loosened). A test that encodes behaviour the change intentionally removes is changed in its own commit, justified under `## Concerns`, and judged by the cross-vendor reviewer.
 - Never alter legal content as engineering work — `LICENSE*`, `NOTICE`, the CLA, licensing docs.
 - Never commit secrets: `.env` is gitignored and read-denied, secrets live in 1Password; `gitleaks` + GitHub push protection gate this.
 - Work in a task-specific Git worktree, never the root checkout; integrate through a reviewed omnibus PR. Preserve root changes when syncing after merge.
