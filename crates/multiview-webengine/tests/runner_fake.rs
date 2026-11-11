@@ -25,11 +25,17 @@ static SERIAL: Mutex<()> = Mutex::new(());
 fn serial() -> MutexGuard<'static, ()> {
     SERIAL.lock().unwrap_or_else(PoisonError::into_inner)
 }
-// Defines `escape CMD...`: exec CMD in a new session. `setsid(1)` is util-linux
-// only; elsewhere (macOS) the stock perl does the same. `exec` keeps `$!` equal
-// to the escaped pid, and a non-interactive `sh` background job is never a
-// group leader, so `setsid()` succeeds.
-const ESCAPE: &str = "escape() { if command -v setsid >/dev/null; then exec setsid \"$@\"; else exec perl -MPOSIX -e 'POSIX::setsid() or die; exec @ARGV' \"$@\"; fi; }";
+// Defines `escape MARKER CMD...`: start a new session, then (only once that
+// succeeded) atomically write the escaped pid to MARKER and exec CMD.
+// `setsid(1)` is util-linux only; elsewhere (macOS) the stock perl does the
+// same. Perl's `POSIX::setsid` returns -1 (truthy) on failure, so check `< 0`.
+const ESCAPE: &str = r#"escape() {
+  m=$1; shift
+  if command -v setsid >/dev/null; then
+    exec setsid sh -c 'echo $$ > "$0.tmp" && mv "$0.tmp" "$0" && exec "$@"' "$m" "$@"
+  fi
+  exec perl -MPOSIX -e 'my $m = shift; my $s = POSIX::setsid(); die "setsid: $!" if !defined $s || $s < 0; open(my $f, ">", "$m.tmp") or die; print $f "$$\n"; close($f) or die; rename("$m.tmp", $m) or die; exec(@ARGV) or die' "$m" "$@"
+}"#;
 const DONE: &str = r#"printf '{"event":"capture_complete","frames":5}\n' >&2"#;
 
 struct Env {
@@ -236,16 +242,18 @@ fn exit_leaving_descendants_returns_and_kills_group() {
     // `grouped` shares the group (swept); `escaped` setsid-escapes while holding
     // both output pipes open, which must not stall the runner.
     let mut e = env(&format!(
-        "cat >/dev/null\nsleep 300 >/dev/null 2>&1 & echo $! > \"$W/grouped\"\n{ESCAPE}\nescape sleep 300 &\necho $! > \"$W/escaped\"\nprintf 'bytes'\n{DONE}"
+        "cat >/dev/null\nsleep 300 >/dev/null 2>&1 & echo $! > \"$W/grouped\"\n{ESCAPE}\nescape \"$W/escaped\" sleep 300 &\nwhile [ ! -s \"$W/escaped\" ]; do sleep 0.05; done\nprintf 'bytes'\n{DONE}"
     ));
     let result = run(&mut e, 1000, 10, &AtomicBool::new(false), 60);
     let escaped = pid_of(&e.dir.path().join("w/escaped"));
     let grouped = pid_of(&e.dir.path().join("w/grouped"));
-    // Clean up the deliberately escaped process regardless of outcome.
-    let _ = rustix::process::kill_process(
-        rustix::process::Pid::from_raw(escaped).unwrap(),
-        rustix::process::Signal::KILL,
-    );
+    // The escape really happened: the pid leads its own session, not ours.
+    // Query first, then always clean up the deliberately escaped process.
+    let escape_leader = rustix::process::Pid::from_raw(escaped).unwrap();
+    let session_of_escaped = rustix::process::getsid(Some(escape_leader));
+    let _ = rustix::process::kill_process(escape_leader, rustix::process::Signal::KILL);
+    assert_eq!(session_of_escaped.unwrap(), escape_leader);
+    assert_ne!(rustix::process::getsid(None).unwrap(), escape_leader);
     assert_eq!(result.unwrap().bytes, 5);
     assert!(!alive(grouped));
 }
