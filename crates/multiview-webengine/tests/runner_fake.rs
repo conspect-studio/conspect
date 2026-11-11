@@ -15,12 +15,27 @@ use std::{
     io::ErrorKind,
     os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
-    sync::{atomic::AtomicBool, Mutex},
+    sync::{atomic::AtomicBool, Mutex, MutexGuard, PoisonError},
     time::{Duration, Instant},
 };
 
 // Serialises script-write + spawn so no fork inherits a writable script fd (ETXTBSY).
 static SERIAL: Mutex<()> = Mutex::new(());
+// One failing test must not poison the lock and fail every later test.
+fn serial() -> MutexGuard<'static, ()> {
+    SERIAL.lock().unwrap_or_else(PoisonError::into_inner)
+}
+// Defines `escape MARKER CMD...`: start a new session, then (only once that
+// succeeded) atomically write the escaped pid to MARKER and exec CMD.
+// `setsid(1)` is util-linux only; elsewhere (macOS) the stock perl does the
+// same. Perl's `POSIX::setsid` returns -1 (truthy) on failure, so check `< 0`.
+const ESCAPE: &str = r#"escape() {
+  m=$1; shift
+  if command -v setsid >/dev/null; then
+    exec setsid sh -c 'echo $$ > "$0.tmp" && mv "$0.tmp" "$0" && exec "$@"' "$m" "$@"
+  fi
+  exec perl -MPOSIX -e 'my $m = shift; my $s = POSIX::setsid(); die "setsid: $!" if !defined $s || $s < 0; open(my $f, ">", "$m.tmp") or die; print $f "$$\n"; close($f) or die; rename("$m.tmp", $m) or die; exec(@ARGV) or die' "$m" "$@"
+}"#;
 const DONE: &str = r#"printf '{"event":"capture_complete","frames":5}\n' >&2"#;
 
 struct Env {
@@ -112,9 +127,16 @@ fn run(
         |_| true,
     )
 }
-fn cancel_soon(flag: &'static AtomicBool) {
+/// Cancels once the fake host has recorded its pid, so the test never depends
+/// on how fast the OS starts the host (first exec of a new script can be slow,
+/// e.g. while macOS assesses it).
+fn cancel_once_started(flag: &'static AtomicBool, pid_file: PathBuf) {
     std::thread::spawn(move || {
-        std::thread::sleep(Duration::from_millis(300));
+        let give_up = Instant::now() + Duration::from_secs(30);
+        while !pid_file.exists() && Instant::now() < give_up {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        std::thread::sleep(Duration::from_millis(100));
         flag.store(true, std::sync::atomic::Ordering::Release);
     });
 }
@@ -155,10 +177,10 @@ fn leaked_private_dirs() -> usize {
 
 #[test]
 fn host_never_reading_stdin_is_cancelled() {
-    let _g = SERIAL.lock().unwrap();
+    let _g = serial();
     static CANCEL: AtomicBool = AtomicBool::new(false);
     let mut e = env("echo $$ > \"$W/pid\"\nexec sleep 300");
-    cancel_soon(&CANCEL);
+    cancel_once_started(&CANCEL, e.dir.path().join("w/pid"));
     // Request far larger than a pipe buffer: the write cannot complete.
     let err = run(&mut e, 1000, 120_000, &CANCEL, 60).unwrap_err();
     assert_eq!(err.kind(), ErrorKind::Interrupted);
@@ -168,7 +190,7 @@ fn host_never_reading_stdin_is_cancelled() {
 
 #[test]
 fn hung_host_hits_deadline_and_is_reaped() {
-    let _g = SERIAL.lock().unwrap();
+    let _g = serial();
     let mut e = env("echo $$ > \"$W/pid\"\nsleep 300 & echo $! > \"$W/child\"\nwait");
     let err = run(&mut e, 1000, 10, &AtomicBool::new(false), 1).unwrap_err();
     assert_eq!(err.kind(), ErrorKind::TimedOut);
@@ -179,7 +201,7 @@ fn hung_host_hits_deadline_and_is_reaped() {
 
 #[test]
 fn excess_output_hits_quota_and_publishes_nothing() {
-    let _g = SERIAL.lock().unwrap();
+    let _g = serial();
     let mut e = env(&format!(
         "cat >/dev/null &\nhead -c 3000000 /dev/zero\n{DONE}"
     ));
@@ -190,7 +212,7 @@ fn excess_output_hits_quota_and_publishes_nothing() {
 
 #[test]
 fn stderr_flood_is_drained_and_final_line_decides() {
-    let _g = SERIAL.lock().unwrap();
+    let _g = serial();
     let mut e = env(&format!(
         "cat >/dev/null\nprintf 'ftyp-moov-bytes'\nhead -c 2000000 /dev/zero | tr '\\0' 'n' >&2\nprintf '\\nnoise\\n' >&2\n{DONE}\nprintf '\\n\\n' >&2"
     ));
@@ -200,7 +222,7 @@ fn stderr_flood_is_drained_and_final_line_decides() {
 
 #[test]
 fn stderr_flood_without_completion_fails() {
-    let _g = SERIAL.lock().unwrap();
+    let _g = serial();
     let mut e = env("cat >/dev/null\nprintf 'bytes'\nhead -c 2000000 /dev/zero | tr '\\0' 'n' >&2");
     assert!(run(&mut e, 1000, 10, &AtomicBool::new(false), 60).is_err());
     no_artifacts(&e);
@@ -208,7 +230,7 @@ fn stderr_flood_without_completion_fails() {
 
 #[test]
 fn failed_exit_with_completion_line_is_rejected() {
-    let _g = SERIAL.lock().unwrap();
+    let _g = serial();
     let mut e = env(&format!("cat >/dev/null\nprintf 'bytes'\n{DONE}\nexit 3"));
     assert!(run(&mut e, 1000, 10, &AtomicBool::new(false), 60).is_err());
     no_artifacts(&e);
@@ -216,27 +238,29 @@ fn failed_exit_with_completion_line_is_rejected() {
 
 #[test]
 fn exit_leaving_descendants_returns_and_kills_group() {
-    let _g = SERIAL.lock().unwrap();
+    let _g = serial();
     // `grouped` shares the group (swept); `escaped` setsid-escapes while holding
     // both output pipes open, which must not stall the runner.
     let mut e = env(&format!(
-        "cat >/dev/null\nsleep 300 >/dev/null 2>&1 & echo $! > \"$W/grouped\"\nsetsid sleep 300 &\necho $! > \"$W/escaped\"\nprintf 'bytes'\n{DONE}"
+        "cat >/dev/null\nsleep 300 >/dev/null 2>&1 & echo $! > \"$W/grouped\"\n{ESCAPE}\nescape \"$W/escaped\" sleep 300 &\nwhile [ ! -s \"$W/escaped\" ]; do sleep 0.05; done\nprintf 'bytes'\n{DONE}"
     ));
     let result = run(&mut e, 1000, 10, &AtomicBool::new(false), 60);
     let escaped = pid_of(&e.dir.path().join("w/escaped"));
     let grouped = pid_of(&e.dir.path().join("w/grouped"));
-    // Clean up the deliberately escaped process regardless of outcome.
-    let _ = rustix::process::kill_process(
-        rustix::process::Pid::from_raw(escaped).unwrap(),
-        rustix::process::Signal::KILL,
-    );
+    // The escape really happened: the pid leads its own session, not ours.
+    // Query first, then always clean up the deliberately escaped process.
+    let escape_leader = rustix::process::Pid::from_raw(escaped).unwrap();
+    let session_of_escaped = rustix::process::getsid(Some(escape_leader));
+    let _ = rustix::process::kill_process(escape_leader, rustix::process::Signal::KILL);
+    assert_eq!(session_of_escaped.unwrap(), escape_leader);
+    assert_ne!(rustix::process::getsid(None).unwrap(), escape_leader);
     assert_eq!(result.unwrap().bytes, 5);
     assert!(!alive(grouped));
 }
 
 #[test]
 fn environment_is_cleared_and_private_dirs_are_removed() {
-    let _g = SERIAL.lock().unwrap();
+    let _g = serial();
     std::env::set_var("NODE_OPTIONS", "--require=/nonexistent");
     std::env::set_var("LD_PRELOAD", "/nonexistent.so");
     std::env::set_var("CONSPECT_TEST_SECRET", "hunter2");
