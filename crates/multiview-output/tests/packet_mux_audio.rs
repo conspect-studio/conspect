@@ -936,3 +936,73 @@ fn segment_sink_muxes_video_plus_audio_per_segment() {
         assert_one_video_one_audio(seg);
     }
 }
+
+/// #253 / review N1: a run that fails AFTER its rendition master was queued
+/// must still land that master (slow disk), so the flushed media playlists
+/// stay discoverable. The master writer is slow; the source errors mid-run.
+#[test]
+fn a_failed_run_still_lands_its_queued_rendition_master() {
+    /// Feeds packets; the first keyframe seen after the video media playlist
+    /// is on disk is handed over (its segment close queues the master), then
+    /// the next read fails — a failed run with a queued master.
+    struct FailAfterMaster {
+        packets: std::vec::IntoIter<EncodedPacket>,
+        video_playlist: std::path::PathBuf,
+        armed: bool,
+    }
+    impl PacketSource for FailAfterMaster {
+        fn next_packet(&mut self) -> Result<Option<EncodedPacket>> {
+            if self.armed {
+                return Err(multiview_output::Error::Output("source died".to_owned()));
+            }
+            let Some(packet) = self.packets.next() else {
+                return Ok(None);
+            };
+            if packet.is_keyframe() {
+                // Wait for the background media publish, then hand over this
+                // keyframe: its segment close queues the master. Fail on the
+                // very next packet.
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+                while !self.video_playlist.exists() && std::time::Instant::now() < deadline {
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+                self.armed = self.video_playlist.exists();
+            }
+            Ok(Some(packet))
+        }
+    }
+    let slow_master: multiview_output::hls::ManifestWriter =
+        std::sync::Arc::new(|path, bytes, fence: &multiview_output::hls::PublishFence| {
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            fence
+                .commit(&mut || {
+                    std::fs::write(path, bytes)
+                        .map_err(|e| multiview_output::Error::Output(e.to_string()))
+                })
+                .map(|_| ())
+        });
+    let dir = tempfile::tempdir().unwrap();
+    let (video, params, tb) = encode_video_at(750_000);
+    // Enough packets for several closed segments (the master is queued once the
+    // first media playlists exist), then a failure.
+    let mut source = FailAfterMaster {
+        packets: video.into_iter(),
+        video_playlist: dir.path().join("video-g0.m3u8"),
+        armed: false,
+    };
+    let outcome = PacketMuxSink::segment_live(
+        dir.path(),
+        "seg",
+        dir.path().join("index.m3u8"),
+        2,
+        SharedEpoch::new(),
+    )
+    .with_master_writer(slow_master)
+    .run_av_tracks(&mut source, MuxStream::new(&params, tb), None, &[]);
+    assert!(outcome.is_err(), "the source error surfaces");
+    let master = std::fs::read_to_string(dir.path().join("master.m3u8"))
+        .expect("the queued master landed despite the failed run");
+    for uri in master_media_uris(&master) {
+        assert_manifest_and_media_readable(dir.path(), &uri);
+    }
+}

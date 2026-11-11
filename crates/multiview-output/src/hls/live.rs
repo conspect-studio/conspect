@@ -674,7 +674,6 @@ impl BackgroundPublisher {
         }
     }
 
-    /// Wait for the final manifest to be published and the thread to exit.
     /// Wait up to `bound` for the pending manifest (if any) to be written,
     /// then drop (fence + detach) the publisher.
     fn drain_within(self, bound: std::time::Duration) {
@@ -696,6 +695,7 @@ impl BackgroundPublisher {
         // Drop: fences any further write and detaches.
     }
 
+    /// Wait for the final manifest to be published and the thread to exit.
     fn join(mut self) -> Result<()> {
         if let Some(thread) = self.thread.take() {
             thread
@@ -808,6 +808,12 @@ pub struct BackgroundFile {
 }
 
 impl BackgroundFile {
+    /// Error-path teardown (#253): let the queued write land, waiting at most
+    /// `bound`, then drop the publisher (fence + detach).
+    pub fn flush_best_effort(self, bound: std::time::Duration) {
+        self.inner.drain_within(bound);
+    }
+
     /// Spawn the publisher for `path`.
     ///
     /// # Errors

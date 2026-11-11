@@ -2864,6 +2864,12 @@ impl<'a> SegmentState<'a> {
             {
                 state.live.flush_best_effort(left());
             }
+            // The master is queued only once every media playlist exists, so
+            // landing it after them keeps the ordering; without this a failed
+            // run could leave flushed renditions with no discoverable master.
+            if let Some(master) = renditions.master_writer.take() {
+                master.flush_best_effort(left());
+            }
         }
     }
 
