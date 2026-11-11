@@ -185,6 +185,12 @@ impl<A> AudioCommitSlot<A> {
 #[derive(Debug)]
 pub struct LoadCoordinator<T> {
     next_gen: AtomicU64,
+    /// Newest generation whose durable commit was claimed (0 = none). A claimed
+    /// generation is never superseded: a later request queues behind it.
+    claimed: AtomicU64,
+    /// Held only for a few atomic operations (never across I/O): makes request
+    /// publication and the commit claim mutually atomic.
+    gate: Mutex<()>,
     quiesced: AtomicU64,
     /// Shared with the interrupt callback: the newest requested generation.
     cancel_gen: Arc<AtomicU64>,
@@ -205,6 +211,8 @@ impl<T> Default for LoadCoordinator<T> {
         let (shutdown_tx, shutdown_rx) = std::sync::mpsc::sync_channel(1);
         Self {
             next_gen: AtomicU64::new(1),
+            claimed: AtomicU64::new(0),
+            gate: Mutex::new(()),
             quiesced: AtomicU64::new(0),
             cancel_gen: Arc::new(AtomicU64::new(0)),
             request: SwapCell::empty(),
@@ -267,6 +275,10 @@ impl<T> LoadCoordinator<T> {
     /// [`Self::submit`] with a hook run between publishing the generation and
     /// storing the request (the window an opener can race into). Test seam.
     fn submit_with(&self, spec: ClipSpec, between: impl FnOnce()) -> Generation {
+        let _gate = self
+            .gate
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let generation = Generation(self.next_gen.fetch_add(1, Ordering::Relaxed));
         self.cancel_gen.fetch_max(generation.0, Ordering::AcqRel);
         between();
@@ -275,12 +287,31 @@ impl<T> LoadCoordinator<T> {
         generation
     }
 
+    /// Ingest side: atomically claim the right to commit `generation`. Succeeds
+    /// iff no newer request was published first; afterwards a newer request
+    /// never supersedes this generation (it commits, then the newer one loads).
+    /// The gate is held for a few atomics only, never across I/O.
+    pub fn claim_commit(&self, generation: Generation) -> bool {
+        let _gate = self
+            .gate
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if self.claimed.load(Ordering::Acquire) == generation.0 {
+            return true;
+        }
+        if generation.0 < self.cancel_gen.load(Ordering::Acquire) {
+            return false;
+        }
+        self.claimed.store(generation.0, Ordering::Release);
+        true
+    }
+
     /// Opener side: whether work for `generation` is stale, decided against
     /// `latest()` at this moment. A generation equal to `latest()` is never
     /// stale.
     #[must_use]
     pub fn is_superseded(&self, generation: Generation) -> bool {
-        generation < self.latest()
+        generation < self.latest() && self.claimed.load(Ordering::Acquire) != generation.0
     }
 
     /// Opener side: take the pending request, if any.
@@ -313,7 +344,9 @@ impl<T> LoadCoordinator<T> {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let stale = guard
             .as_ref()
-            .is_some_and(|s| s.generation != latest)
+            .is_some_and(|s| {
+                s.generation != latest && self.claimed.load(Ordering::Acquire) != s.generation.0
+            })
             .then(|| guard.take())
             .flatten();
         drop(guard);
@@ -346,7 +379,8 @@ impl<T> LoadCoordinator<T> {
             Err(TryLockError::Poisoned(p)) => p.into_inner(),
             Err(TryLockError::WouldBlock) => return None,
         };
-        if guard.as_ref()?.generation != self.latest() {
+        let generation = guard.as_ref()?.generation;
+        if generation != self.latest() && self.claimed.load(Ordering::Acquire) != generation.0 {
             return None;
         }
         guard.take()
@@ -398,8 +432,13 @@ impl<T> LoadCoordinator<T> {
     }
     /// Cancel pending/opening loads and reserve an unloaded binding generation.
     pub fn cancel_pending(&self) -> Generation {
+        let _gate = self
+            .gate
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let generation = Generation(self.next_gen.fetch_add(1, Ordering::Relaxed));
         self.cancel_gen.store(generation.0, Ordering::Release);
+        self.claimed.store(0, Ordering::Release);
         self.request.store(None);
         generation
     }
@@ -483,6 +522,25 @@ impl<T> LoadCoordinator<T> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn claimed_generation_commits_and_newer_request_queues_behind_it() {
+        let c: LoadCoordinator<u8> = LoadCoordinator::new();
+        let a = c.submit(spec("p"));
+        assert!(c.claim_commit(a));
+        let b = c.submit(spec("p"));
+        assert!(b > a);
+        assert!(!c.is_superseded(a), "claimed A is never superseded");
+        assert!(c.is_superseded(Generation(a.0 - 1)) || a.0 == 1);
+    }
+    #[test]
+    fn newer_request_before_claim_denies_commit() {
+        let c: LoadCoordinator<u8> = LoadCoordinator::new();
+        let a = c.submit(spec("p"));
+        let _b = c.submit(spec("p"));
+        assert!(!c.claim_commit(a));
+        assert!(c.is_superseded(a));
+    }
+
     use super::*;
     use crate::player::LoadThen;
 

@@ -14654,7 +14654,7 @@ fn player_runtime_body(
                             // Latest-wins: re-check AFTER the record is durable and
                             // restore the prior binding if a newer request raced in.
                             match journal.store_if_current(&snapshot, None, || {
-                                !coordinator.is_superseded(snapshot.generation)
+                                coordinator.claim_commit(snapshot.generation)
                             }) {
                                 Ok(true) => None,
                                 Ok(false) => {
@@ -14800,13 +14800,23 @@ fn player_runtime_body(
                                 },
                             )));
                         }
-                        runtime.binding.store(Arc::new(crate::player::SlotSnapshot {
+                        let committed = crate::player::SlotSnapshot {
                             generation: epoch,
                             reference: current.as_ref().and_then(|clip| clip.reference.clone()),
-                        }));
+                        };
+                        runtime.binding.store(Arc::new(committed.clone()));
                         crate::player::publish_status(&runtime.status, |status| {
                             status.after_commit(epoch.0)
                         });
+                        // Finalize Prepared -> Committed only after the actual
+                        // video+audio commit, on the ingest executor (off the
+                        // output clock). A crash before this recovers the old
+                        // binding; a failure here leaves it Prepared (old-safe).
+                        if let Some(journal) = runtime.journal.as_ref() {
+                            if let Err(error) = journal.commit(&committed) {
+                                tracing::warn!(player = %plan.id, %error, "player journal finalize failed; boot recovers previous binding");
+                            }
+                        }
                         last_audio_control = None;
                     }
                     Err(returned) => {

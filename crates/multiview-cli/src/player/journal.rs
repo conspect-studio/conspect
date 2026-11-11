@@ -16,6 +16,22 @@ struct Record {
     #[serde(default)]
     expected: Option<u64>,
     reference: Option<Reference>,
+    /// Absent in records written before two-phase commit: those are Committed.
+    #[serde(default = "committed_present_default")]
+    committed_present: bool,
+    /// Prepared (not yet A/V-committed) intent. Never a boot binding.
+    #[serde(default)]
+    prepared: Option<Prepared>,
+}
+fn committed_present_default() -> bool {
+    true
+}
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Prepared {
+    generation: u64,
+    operation: Option<u64>,
+    reference: Option<Reference>,
 }
 #[derive(Serialize, Deserialize)]
 #[serde(tag = "kind", deny_unknown_fields)]
@@ -93,7 +109,18 @@ impl BindingJournal {
             Err(e) => return Err(e),
         };
         let record: Record = serde_json::from_slice(&bytes).map_err(io::Error::other)?;
-        if record.version != 1 || record.player != self.player || record.generation == 0 {
+        if record.version != 1 || record.player != self.player {
+            return Err(io::Error::other("invalid player binding journal identity"));
+        }
+        if !record.committed_present {
+            // Only a prepared intent exists: fail closed to "nothing committed".
+            return if record.prepared.is_some() {
+                Ok(None)
+            } else {
+                Err(io::Error::other("invalid player binding journal identity"))
+            };
+        }
+        if record.generation == 0 {
             return Err(io::Error::other("invalid player binding journal identity"));
         }
         let operation = record
@@ -134,72 +161,83 @@ impl BindingJournal {
     ) -> io::Result<()> {
         self.store_intent(snapshot, Some(request.operation), Some(request.expected.0))
     }
-    /// Latest-wins durable precommit. Writes `snapshot`, then evaluates
-    /// `still_current` **after** the record is durable. When it is no longer
-    /// current (a newer request arrived during the fsync) the previous record is
-    /// restored byte-for-byte (or removed when none existed) and `Ok(false)` is
-    /// returned, so a superseded generation is never left as the durable
-    /// binding and never reaches the audio/video commit.
+    /// Two-phase prepare. Persists a **Prepared** record: the previous
+    /// committed binding is retained verbatim and `snapshot` is recorded only as
+    /// intent, so a crash anywhere before [`Self::commit`] recovers the last
+    /// committed binding (or nothing), never `snapshot`. After the prepared
+    /// record is durable, `claim` runs (post-fsync supersession / atomic commit
+    /// claim). When it declines, the prior record is restored and `Ok(false)` is
+    /// returned.
     ///
     /// # Errors
-    /// Returns the I/O error when the record cannot be written or restored.
+    /// Returns the I/O or decode error when the record cannot be written.
     pub fn store_if_current(
         &self,
         snapshot: &SlotSnapshot,
         operation: Option<u64>,
-        still_current: impl FnOnce() -> bool,
+        claim: impl FnOnce() -> bool,
     ) -> io::Result<bool> {
         let prior = match std::fs::read(&self.path) {
             Ok(bytes) => Some(bytes),
             Err(e) if e.kind() == io::ErrorKind::NotFound => None,
             Err(e) => return Err(e),
         };
-        self.store_intent(snapshot, operation, None)?;
-        if still_current() {
+        let mut record = match &prior {
+            Some(bytes) => {
+                let record: Record = serde_json::from_slice(bytes).map_err(io::Error::other)?;
+                if record.version != 1 || record.player != self.player {
+                    return Err(io::Error::other("invalid player binding journal identity"));
+                }
+                record
+            }
+            None => Record {
+                version: 1,
+                player: self.player.clone(),
+                generation: 0,
+                operation: None,
+                expected: None,
+                reference: None,
+                committed_present: false,
+                prepared: None,
+            },
+        };
+        record.prepared = Some(Prepared {
+            generation: snapshot.generation.0,
+            operation,
+            reference: snapshot.reference.clone().map(Into::into),
+        });
+        self.write_record(&record)?;
+        if claim() {
             return Ok(true);
         }
         match prior {
-            Some(bytes) => {
-                let parent = self
-                    .path
-                    .parent()
-                    .ok_or_else(|| io::Error::other("journal parent missing"))?;
-                let mut temp = tempfile::NamedTempFile::new_in(parent)?;
-                temp.write_all(&bytes)?;
-                temp.as_file().sync_all()?;
-                temp.persist(&self.path).map_err(|e| e.error)?;
+            Some(bytes) => self.write_bytes(&bytes)?,
+            None => {
+                std::fs::remove_file(&self.path)?;
+                std::fs::File::open(self.path.parent().unwrap_or(Path::new(".")))?.sync_all()?;
             }
-            None => std::fs::remove_file(&self.path)?,
         }
-        std::fs::File::open(self.path.parent().unwrap_or(Path::new(".")))?.sync_all()?;
         Ok(false)
     }
-    fn store_intent(
-        &self,
-        snapshot: &SlotSnapshot,
-        operation: Option<u64>,
-        expected: Option<u64>,
-    ) -> io::Result<()> {
-        let record = Record {
-            version: 1,
-            player: self.player.clone(),
-            generation: snapshot.generation.0,
-            operation,
-            expected,
-            reference: snapshot.reference.clone().map(|r| match r {
-                SlotReference::Asset { id } => Reference::Asset { id },
-                SlotReference::Artifact { id, generation } => {
-                    Reference::Artifact { id, generation }
-                }
-            }),
-        };
+    /// Finalize a prepared binding as **Committed**, after the actual video and
+    /// audio commit. Durable before returning; never called on the output clock.
+    ///
+    /// # Errors
+    /// Returns the I/O error when the record cannot be durably written.
+    pub fn commit(&self, snapshot: &SlotSnapshot) -> io::Result<()> {
+        self.store_intent(snapshot, None, None)
+    }
+    fn write_record(&self, record: &Record) -> io::Result<()> {
+        self.write_bytes(&serde_json::to_vec(record).map_err(io::Error::other)?)
+    }
+    fn write_bytes(&self, bytes: &[u8]) -> io::Result<()> {
         let parent = self
             .path
             .parent()
             .ok_or_else(|| io::Error::other("journal parent missing"))?;
         std::fs::create_dir_all(parent)?;
         let mut temp = tempfile::NamedTempFile::new_in(parent)?;
-        temp.write_all(&serde_json::to_vec(&record).map_err(io::Error::other)?)?;
+        temp.write_all(bytes)?;
         temp.as_file().sync_all()?;
         #[cfg(test)]
         if let Some(hook) = &self.precommit_hook {
@@ -207,6 +245,31 @@ impl BindingJournal {
         }
         temp.persist(&self.path).map_err(|e| e.error)?;
         std::fs::File::open(parent)?.sync_all()
+    }
+    fn store_intent(
+        &self,
+        snapshot: &SlotSnapshot,
+        operation: Option<u64>,
+        expected: Option<u64>,
+    ) -> io::Result<()> {
+        self.write_record(&Record {
+            version: 1,
+            player: self.player.clone(),
+            generation: snapshot.generation.0,
+            operation,
+            expected,
+            reference: snapshot.reference.clone().map(Into::into),
+            committed_present: true,
+            prepared: None,
+        })
+    }
+}
+impl From<SlotReference> for Reference {
+    fn from(r: SlotReference) -> Self {
+        match r {
+            SlotReference::Asset { id } => Self::Asset { id },
+            SlotReference::Artifact { id, generation } => Self::Artifact { id, generation },
+        }
     }
 }
 #[cfg(test)]
@@ -261,7 +324,7 @@ mod tests {
         assert!(!committed, "superseded A must not commit");
         assert_eq!(
             journal.load().unwrap(),
-            Some(old),
+            Some(old.clone()),
             "prior durable binding restored"
         );
         // B then commits normally and is the durable winner.
@@ -272,6 +335,12 @@ mod tests {
                 .load(std::sync::atomic::Ordering::Acquire)
                 == 3)
             .unwrap());
+        assert_eq!(
+            journal.load().unwrap(),
+            Some(old),
+            "claimed B is only Prepared until the A/V commit finalizes it"
+        );
+        journal.commit(&b).unwrap();
         assert_eq!(journal.load().unwrap(), Some(b));
     }
     #[test]
@@ -318,5 +387,69 @@ mod tests {
         assert_eq!(journal.load().unwrap(), Some(unloaded));
         std::fs::write(&journal.path, b"broken").unwrap();
         assert!(journal.load().is_err());
+    }
+    fn asset(id: &str, g: u64) -> SlotSnapshot {
+        SlotSnapshot {
+            generation: Generation(g),
+            reference: Some(SlotReference::Asset { id: id.into() }),
+        }
+    }
+    #[test]
+    fn crash_between_prepare_and_commit_recovers_old_binding() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal = BindingJournal::new(dir.path(), "vt-1");
+        let old = asset("old", 1);
+        journal.store(&old, None).unwrap();
+        // "Crash": claim succeeds, process dies before commit().
+        assert!(journal
+            .store_if_current(&asset("new", 2), None, || true)
+            .unwrap());
+        assert_eq!(journal.recover().unwrap().unwrap().0, old);
+        journal.commit(&asset("new", 2)).unwrap();
+        assert_eq!(journal.load().unwrap(), Some(asset("new", 2)));
+    }
+    #[test]
+    fn prepared_first_ever_load_recovers_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal = BindingJournal::new(dir.path(), "vt-1");
+        assert!(journal
+            .store_if_current(&asset("new", 1), None, || true)
+            .unwrap());
+        assert_eq!(journal.load().unwrap(), None);
+    }
+    #[test]
+    fn crash_in_prepare_fsync_window_recovers_old() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut journal = BindingJournal::new(dir.path(), "vt-1");
+        journal.store(&asset("old", 1), None).unwrap();
+        let path = journal.path.clone();
+        let player = journal.player.clone();
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let hook_seen = std::sync::Arc::clone(&seen);
+        journal.precommit_hook = Some(std::sync::Arc::new(move || {
+            // Crash point: temp fsynced, rename not yet done.
+            let probe = BindingJournal {
+                path: path.clone(),
+                player: player.clone(),
+                precommit_hook: None,
+            };
+            *hook_seen.lock().unwrap() = Some(probe.load().unwrap());
+        }));
+        journal
+            .store_if_current(&asset("new", 2), None, || true)
+            .unwrap();
+        assert_eq!(seen.lock().unwrap().clone().unwrap(), Some(asset("old", 1)));
+    }
+    #[test]
+    fn legacy_v1_record_without_new_fields_is_committed() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal = BindingJournal::new(dir.path(), "vt-1");
+        std::fs::create_dir_all(journal.path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &journal.path,
+            br#"{"version":1,"player":"vt-1","generation":4,"operation":null,"reference":{"kind":"Asset","id":"x"}}"#,
+        )
+        .unwrap();
+        assert_eq!(journal.load().unwrap(), Some(asset("x", 4)));
     }
 }
