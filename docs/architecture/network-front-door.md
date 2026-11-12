@@ -437,8 +437,8 @@ Operator runbook: [acme-certificates.md](../runbooks/acme-certificates.md).
   used: its records are media-timeline X.733 alarms keyed by probes, while health warnings are the
   latched, coalescing, remediation-carrying surface this is.
 * `multiview_control::tls_setup` (`acme`, unix):
-  * `front_door_router(state)` is the control router behind the setup gate. This is what slice 4
-    mounts on TCP 443. In `setup`, only these answer:
+  * `front_door_router(state)` is the control router behind the setup gate. The slice-4 TCP door
+    serves it (see "Slice 4 and slice 5 together as built" below). In `setup`, only these answer:
     * `GET /tls-setup` (a self-contained page with a CSP, the fingerprint and "Issue now", and no
       secret input);
     * `GET /api/v1/tls/status`;
@@ -469,8 +469,38 @@ Operator runbook: [acme-certificates.md](../runbooks/acme-certificates.md).
   operator choose CA, challenge and domain names" wording above. They come from `[network.tls]`
   only, so the TOML stays the single source of truth and recovery needs no browser. The page shows
   them and starts issuance.
-* Not built here (slice 4): the engine's TCP 443 listener. Until it lands, the setup page and
-  TLS-ALPN-01 are not reachable from outside the host; DNS-01 and the CLI cover setup.
+* PR B was written before slice 4 merged; the door wiring below closes that gap.
+
+### Slice 4 and slice 5 together as built (TCP door with ACME)
+
+Slice 4 merged first (#328), so slice 5 PR B wires the ACME source into its TCP door
+(`crates/multiview-cli/src/control.rs` `attach_front_door_site`, `frontdoor.rs` `install_site`):
+
+* The TCP door needs `network.mode` (and `https_port`). `[network.tls]` without `mode` has no
+  door, and the boot warns that the setup page and TLS-ALPN-01 are unreachable from outside.
+* Site TLS (section 4 `site`): `site_server_config` over the ACME `CertificateSource` (ALPN
+  `http/1.1`, a `SourceResolver` read per handshake), so `setup` serves the bootstrap certificate
+  and `serving` the issued one; an `install` or renewal reaches the next handshake with no
+  restart. `[network.tls]` wins over `[control.tls]` for the door; with both, a warning is logged
+  and the `[control] listen` listener keeps its own static TLS unchanged.
+* `TlsRouting.acme` (section 4 ALPN exactly `acme-tls/1`): `acme_challenge_server_config`, a
+  rustls config with ALPN exactly `acme-tls/1` over the `ChallengeResolver`, so TLS-ALPN-01 is
+  answered on the door in both states. The `TODO(#291)` is gone.
+* The door's router is `tls_setup::front_door_router_with` (the control router plus the HLS
+  mounts, behind the setup gate). Without `[network.tls]` the door keeps slice 4's ungated router
+  on the `[control.tls]` certificate. The `[control] listen` listener stays the ungated admin
+  listener. `router_with` starts the routing relay and the metrics sampler only for the admin
+  surface, so building the door router does not start them twice.
+* `TlsContext.behind_proxy` follows `network.mode = "behind_proxy"`, so `tls status` reports the
+  section 5a TLS-ALPN-01 hint.
+* The real client address: the door hands `SiteService::serve` the PROXY v2 source address in
+  `behind_proxy` mode (the TCP peer in `direct`), and `ConnectionServer` installs it as
+  `ConnectInfo`. The setup-code limiter and session log read that `ConnectInfo`, so they key on
+  the real client, never the proxy. The session cookie is `Secure`, which is correct on the door.
+* Test: `crates/multiview-cli/tests/tls_door.rs` runs the real front door with a TCP door on
+  `[::1]` and a dead CA: bootstrap certificate and the 503 gate, status without HSTS, the RFC 8737
+  challenge certificate (acmeIdentifier extension) for an `acme-tls/1`-only hello, the swap after
+  `install` and the open gate, and in `behind_proxy` the limiter keyed per PROXY v2 source.
 
 ### Changes to #167-#172
 

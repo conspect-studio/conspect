@@ -45,8 +45,13 @@ implementation will build against.
   Failing renewals raise the `tls-certificate` health warning. On the host, `multiview tls status`,
   `setup-code`, `set-credential` (value from stdin only, stored 0600) and `issue` give full
   recovery without a browser. The `acme` feature is now in the shipped presets; a `[network.tls]`
-  config in a build without it refuses to start. The engine's own TCP 443 listener (slice 4) is
-  still to come. Runbook: `docs/runbooks/acme-certificates.md` (#291).
+  config in a build without it refuses to start. Runbook: `docs/runbooks/acme-certificates.md` (#291).
+- **The TCP 443 door serves the ACME certificate (slices 4 + 5)**: with `network.mode` and
+  `[network.tls]`, the engine's TCP door serves the bootstrap, then the issued certificate (renewals
+  on the next handshake), answers TLS-ALPN-01 (ALPN `acme-tls/1`) and gates every route behind the
+  setup state; `[network.tls]` wins over `[control.tls]` for the door. Behind a proxy, setup-code
+  limits key on the PROXY v2 client address and `multiview tls status` shows the TLS-ALPN-01 hint
+  (#291).
 - **ACME certificate engine for the network front door**: the
   `acme` feature of `multiview-control` issues and renews the front-door certificate over
   DNS-01 (Cloudflare token or global key) or TLS-ALPN-01 from Let's Encrypt, Google or a custom

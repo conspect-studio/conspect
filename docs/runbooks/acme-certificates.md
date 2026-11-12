@@ -7,7 +7,7 @@ alarms, recovery from the host CLI, and the manual staging check. Design:
 The older operator-managed certificate path is [control-plane-tls.md](control-plane-tls.md)
 (`[control.tls] mode = "static"`). It still works and stays until #282 is decided.
 
-## What exists (slice 5) and what slice 4 still has to do
+## How it works (slices 4 and 5)
 
 * Builds: the `acme` cargo feature, which is in the `nvidia`, `apple`, `linux-vaapi` and `full`
   presets. A config with `[network.tls]` in a build without `acme` refuses to start, and
@@ -30,14 +30,25 @@ The older operator-managed certificate path is [control-plane-tls.md](control-pl
   handshakes without a restart. Until then MoQ leases answer `503`. With `[network.tls]`,
   `MULTIVIEW_MOQ_CERTIFICATE`/`_PRIVATE_KEY` are ignored (warned) on the front door; only
   `MULTIVIEW_MOQ_ENDPOINT` and `_PROTOCOL` are read.
-* **Slice 4 (not built yet)** owns the engine's own TCP 443 listener. It must:
-  * take the resolver from `multiview_cli::frontdoor::front_door_tls()`;
-  * serve `multiview_control::tls_setup::front_door_router(state)`, the control router behind the
-    setup gate;
-  * answer TLS-ALPN-01 there.
-
-  Until slice 4 lands, the setup page and TLS-ALPN-01 are not reachable from outside the host.
-  DNS-01 issuance works today, and the CLI covers setup completely.
+* The TCP door (slice 4) needs `network.mode` (`"direct"` or `"behind_proxy"`) as well as
+  `network.https_port`. Without `mode` there is no TCP listener at all: the setup page and
+  TLS-ALPN-01 are then unreachable from outside, and the engine warns at boot. With `mode` and
+  `[network.tls]`, the door:
+  * serves the ACME certificate source as its site certificate (ALPN `http/1.1`): the bootstrap
+    certificate in `setup`, the issued certificate once `serving`. A renewal reaches the next
+    handshake without a restart. `[network.tls]` wins over `[control.tls]` for the door; if both are
+    set, a warning says so, and `[control.tls]` applies to the `[control] listen` listener only;
+  * answers TLS-ALPN-01: a `ClientHello` offering only ALPN `acme-tls/1` gets the challenge
+    certificate for its SNI while an authorization is pending;
+  * serves the control router behind the setup gate. In `setup` only `GET /tls-setup`,
+    `GET /api/v1/tls/status`, `POST /api/v1/tls/setup/session` and `POST /api/v1/tls/issue`
+    answer; `GET /` redirects to `/tls-setup`; everything else is `503`
+    `/problems/tls-setup-required` with `Retry-After: 30`, and no HSTS header is sent. Once `serving`
+    the gate is a no-op.
+* Behind a proxy (`mode = "behind_proxy"`), the setup-code limiter and the session log key on the
+  PROXY v2 source address (the real client), never the proxy's address. `multiview tls status`
+  reports the hint "TLS-ALPN-01 needs TCP 443 to reach the engine; use DNS-01" when TLS-ALPN-01 is
+  configured there.
 
 ## Configure
 
@@ -51,6 +62,7 @@ Let's Encrypt, DNS-01 through Cloudflare (recommended):
 [network]
 public_host = "mda001.example.net"
 https_port = 443
+mode = "direct"                     # required for the TCP door; or "behind_proxy" (+ trusted_proxies)
 
 [network.tls]
 ca = "letsencrypt"
@@ -67,10 +79,16 @@ token_env = "CLOUDFLARE_API_TOKEN"
 propagation_timeout_s = 120
 ```
 
-The same with TLS-ALPN-01. No DNS credential is needed, but the CA must reach TCP 443 of this host,
-which needs slice 4. Let's Encrypt IP-address certificates need `acme_profile = "shortlived"`:
+The same with TLS-ALPN-01. No DNS credential is needed, but the CA must reach TCP 443 of this host
+directly, so it needs `mode = "direct"` (not `behind_proxy`). Let's Encrypt IP-address
+certificates need `acme_profile = "shortlived"`:
 
 ```toml
+[network]
+public_host = "mda001.example.net"
+https_port = 443
+mode = "direct"
+
 [network.tls]
 ca = "letsencrypt"
 challenge = "tls-alpn-01"
@@ -174,12 +192,12 @@ listen address is refused.
    multiview tls: one-time setup code (valid 1 h, single use): word word word word word word word word
    ```
 
-2. If the config holds everything (DNS-01 with the credential present, or TLS-ALPN-01 once slice 4
-   exposes TCP 443), issuance has already started. Watch it with `multiview tls status`.
+2. If the config holds everything (DNS-01 with the credential present, or TLS-ALPN-01 with
+   `mode = "direct"` and TCP 443 reachable), issuance has already started. Watch it with `multiview tls status`.
 3. If something is missing, `multiview tls status` names it in its reasons, for example
    `credential-missing: CLOUDFLARE_API_TOKEN` (names only). Fix it with
    `multiview tls set-credential NAME`, which also triggers issuance.
-4. From a browser (needs slice 4): open `https://<public_host>/`, which redirects to `/tls-setup`
+4. From a browser (needs `network.mode`): open `https://<public_host>/`, which redirects to `/tls-setup`
    in setup. **Compare the fingerprint on the page with the one your browser shows and with the log
    or `multiview tls status`. If they differ, stop.** Paste the setup code and press "Issue now".
    The page accepts no secret, and its CA, challenge and names come from the config.
@@ -269,12 +287,13 @@ shell command line, a PR or an issue.
    acme_profile = "shortlived"
    ```
 
-   plus `[network.tls.dns] token_env = "CLOUDFLARE_API_TOKEN"` and `public_host = "$HOST"`. Then:
+   plus `[network.tls.dns] token_env = "CLOUDFLARE_API_TOKEN"`, and under `[network]`
+   `public_host = "$HOST"`, `https_port = 443` and `mode = "direct"`. Then:
    * Run `multiview validate`, start the engine, and run `multiview tls status`.
    * Confirm `setup` changes to `serving` without a restart and the output ticks continue.
    * Inspect the chain with `openssl s_client` (staging chains are not publicly trusted).
 4. Repeat with `ca = "google"`, `staging = true`, `eab_kid_env`/`eab_hmac_env` and a fresh staging
-   EAB key. For TLS-ALPN-01 (after slice 4), switch the challenge, drop `[network.tls.dns]`, and let
+   EAB key. For TLS-ALPN-01 (`mode = "direct"`), switch the challenge, drop `[network.tls.dns]`, and let
    the CA reach TCP 443.
 5. Check the following:
    * `status` shows the CA, names and expiry, and no credential.
