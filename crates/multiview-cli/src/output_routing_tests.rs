@@ -515,7 +515,11 @@ fn a_take_opens_one_encoder_moves_at_a_rap_and_lingers_out() {
             .outcomes
             .try_iter()
             .find(|o| o.outcome == TakeResult::Applied)
-            .map(|o| o.tick);
+            .map(|o| {
+                // The control plane persists from the outcome alone (D1).
+                assert_eq!(o.bus, src(), "applied carries the taken bus");
+                o.tick
+            });
         now += 1;
     }
     let at = applied_at.expect("applied within the open deadline");
@@ -1421,6 +1425,76 @@ fn untrusted_ids_are_bounded_and_a_held_key_is_never_re_attributed() {
         "attribution stays with the holder"
     );
     assert!(x.r.has_capacity("q"), "the newcomer is not charged");
+}
+
+/// The control adapter maps config ids → router indices from the run's own
+/// output map (binding ids), never from config order: with an internal anchor
+/// at index 0 and outputs renamed/reordered, a take addressed to "renamed"
+/// lands on index 1 and its outcome comes back named "renamed".
+#[test]
+fn the_control_adapter_maps_renamed_ids_to_their_own_index() {
+    use multiview_control::output_routing::{OutputRouting, OutputTakeRequest, RoutedFeed};
+    let (mut r, h, _aux) = router(3, 6, Box::new(|_| Err("never".to_owned())));
+    let h = h.with_outputs(vec![
+        RunOutput {
+            id: None,
+            settings: 0,
+            routable: true,
+        },
+        RunOutput {
+            id: Some("renamed".into()),
+            settings: 0,
+            routable: true,
+        },
+        RunOutput {
+            id: Some("zz-first".into()),
+            settings: 0,
+            routable: false,
+        },
+    ]);
+    let slot = output_routing_slot();
+    slot.store(Some(Arc::new(h)));
+    let adapter = crate::output_routing_control::OutputRoutingAdapter::new(Arc::clone(&slot));
+    let outcomes = adapter.subscribe_outcomes().unwrap();
+    assert!(
+        adapter.plan("zz-first", &RoutedFeed::Program).is_err(),
+        "an unroutable kind is refused at plan"
+    );
+    assert!(adapter.plan("output-0", &RoutedFeed::Program).is_err());
+    let cost = adapter
+        .plan("renamed", &RoutedFeed::Source("x".into()))
+        .unwrap();
+    assert!(cost.needs_encoder && cost.fits(), "{cost:?}");
+    assert!(
+        !adapter
+            .plan("renamed", &RoutedFeed::Program)
+            .unwrap()
+            .needs_encoder
+    );
+    adapter
+        .try_take(OutputTakeRequest {
+            operation_id: "op-1".into(),
+            output: "renamed".into(),
+            feed: RoutedFeed::Program,
+            principal: "p".into(),
+        })
+        .unwrap();
+    let mut d = dispatcher(3);
+    r.on_tick(0, MediaTime::from_nanos(0), &mut d, &mut NoDelivery)
+        .unwrap();
+    let got = outcomes
+        .recv_timeout(std::time::Duration::from_secs(5))
+        .unwrap();
+    assert_eq!(got.output, "renamed");
+    assert_eq!(got.operation_id, "op-1");
+    assert_eq!(got.outcome, "applied");
+    let live = adapter.snapshot().unwrap();
+    assert!(live.outputs.contains_key("renamed") && live.outputs.contains_key("zz-first"));
+    assert_eq!(
+        live.outputs.len(),
+        2,
+        "the internal anchor is never exposed"
+    );
 }
 
 /// A live encoder that, once `die` is set, panics on its next encode or

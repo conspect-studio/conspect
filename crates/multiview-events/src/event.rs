@@ -938,6 +938,24 @@ pub struct SwitcherOperation {
     pub error: Option<String>,
 }
 
+/// The terminal outcome of one output feed take, or an unrequested fallback
+/// (ADR-0108 §6.2, topic [`crate::topic::Topic::Outputs`]). Lossless; delivered
+/// only to principals that may read the output (`AuthzScope::Object(output)`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RouteOutputEvent {
+    /// The output's API id (matches the envelope `id`).
+    pub output: String,
+    /// Opaque operation id from the take's 202 (empty for a fallback).
+    pub operation_id: String,
+    /// The Program tick at which the outcome was decided.
+    pub tick: u64,
+    /// `applied` | `superseded` | `refused:feed-not-fresh` | `refused:capacity` |
+    /// `refused:encoder-not-ready` | `refused:unroutable` | `refused:format-mismatch` |
+    /// `fallback:aux-failed` |
+    /// `fallback:encoder-failed`.
+    pub outcome: String,
+}
+
 /// A graphics (CG) playout channel's PVW/PGM state changed (topic
 /// [`crate::topic::Topic::Switcher`]): emitted on cue / take / clear / next.
 /// Lossless lifecycle event, scoped by the channel id.
@@ -1801,6 +1819,10 @@ pub enum Event {
     /// Output sink status (topic `outputs`).
     #[serde(rename = "output.status")]
     OutputStatus(OutputStatus),
+    /// An output feed take settled (topic `outputs`, envelope `id` = output id,
+    /// ADR-0108 §6.2). Lossless.
+    #[serde(rename = "route.output")]
+    RouteOutput(RouteOutputEvent),
     /// A RIST link-health telemetry sample (topic `outputs`): retransmits / RTT /
     /// link-quality / bandwidth / lost / recovered for a RIST source or output
     /// link, obtained via the direct-librist FFI stats callback `FFmpeg`'s
@@ -1961,6 +1983,7 @@ impl Event {
             Self::AudioLoudness(_) => "audio.loudness",
             Self::SystemMetrics(_) => "system.metrics",
             Self::OutputStatus(_) => "output.status",
+            Self::RouteOutput(_) => "route.output",
             Self::RistLinkStats(_) => "rist.link.stats",
             Self::AlertRaised(_) => "alert.raised",
             Self::AlertCleared(_) => "alert.cleared",
@@ -2034,6 +2057,8 @@ impl Event {
             Self::DeviceSync(e) => AuthzScope::Object(&e.device_id),
             Self::CastSessionStarted(e) => AuthzScope::Object(&e.session_id),
             Self::CastSessionRemoved(e) => AuthzScope::Object(&e.session_id),
+            // The same axis as the REST take/readback check (ADR-0108 §6.3).
+            Self::RouteOutput(e) => AuthzScope::Object(&e.output),
             Self::SwitcherOperation(e) => AuthzScope::ObjectAndProgram {
                 object: &e.me,
                 program: &e.program,

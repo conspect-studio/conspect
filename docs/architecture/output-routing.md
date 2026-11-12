@@ -986,17 +986,29 @@ The class is `class1` for every feed change, because the format never changes (Â
 change is not offered here.
 
 **`POST /api/v1/routing/output/take`.** The body is the same as plan plus an optional `audio`. It
-requires an `Idempotency-Key`. The response is `202 {operation_id, adopt: "next_tick"}`.
+requires an `Idempotency-Key`. The response is
+`202 {operation_id, status: "accepted"|"pending"|"settled", adopt?: "next_tick", outcome?, tick?}`.
+`accepted` (with `adopt: "next_tick"`) answers only the request that enqueued the take. A replay of
+the key answers the same `operation_id` with `pending` (no outcome yet) or `settled` (plus the
+recorded `outcome` and its `tick`); it never carries `adopt` and never enqueues again.
 
-The idempotency store is body-blind. It is keyed by principal, method and path
-(`crates/multiview-control/src/concurrency.rs:166-212`). So a reused key with a **different** body
-is still a replay of the first operation: nothing is applied a second time, and clients must mint a
-new key for every distinct take. A replay returns the recorded `operation_id` and, once known, its
-terminal outcome (`applied`, `superseded`, `refused:*`), never a fresh 202 that implies the feed is
-on air.
+The take's idempotency record is body-blind. It is keyed by principal (API key id), method and path
+plus the raw key (the `IdempotencyKey` extractor in `crates/multiview-control/src/concurrency.rs`),
+so two principals that send the same raw key get two separate takes. A reused key with a
+**different** body is still a replay of the first operation: nothing is applied a second time, and
+clients must mint a new key for every distinct take. A replay returns the recorded `operation_id`
+and, once known, its terminal outcome (`applied`, `superseded`, `refused:*`), never a fresh 202 that
+implies the feed is on air.
 
-The store records only an `OperationId` today (`crates/multiview-control/src/concurrency.rs:182-212`). Slice 1 therefore adds a
-bounded outcome map **beside** it, keyed by operation id with the same retention. The control-side
+The replay decision is owned by a **take-scoped** store
+(`OutputRoutingControl` in `crates/multiview-control/src/output_routing.rs`), not by the
+process-global `IdempotencyStore`. Each record holds `{operation_id, take, outcome}`. The route does
+not use the global store at all: other routes `release`/`rebind` keys there, and a take's replay
+must not depend on them. The take store is bounded at 4096 records and **fails closed** at the cap
+(`503 idempotency-capacity`, like the global store); it never evicts. A record is removed only when
+its own enqueue failed (`engine-busy`, `output-kind-unroutable`), which frees the key for a retry.
+Settled records stay for the life of the process, the same lifetime as the global store's keys. The
+control-side
 `route.output` subscriber writes the outcome when the engine publishes it. A salvo reserves its key
 only after every member is authorized and validated. So a denied or invalid salvo burns no key, and
 its replay can never return a 202 for an operation that never enqueued. The outcome arrives as the realtime event

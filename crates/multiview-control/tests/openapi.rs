@@ -425,3 +425,32 @@ async fn sse_endpoint_streams_for_an_authenticated_viewer() {
         "got {content_type}"
     );
 }
+
+/// Review D2: `POST /routing/plan` answers a crosspoint `RoutePlan` or an
+/// `OutputPlan` (for `target.kind = output`); the `200` schema says both.
+#[test]
+fn routing_plan_200_is_route_plan_or_output_plan() {
+    use multiview_control::openapi::ApiDoc;
+    use utoipa::OpenApi;
+
+    let json = serde_json::to_value(ApiDoc::openapi()).expect("OpenAPI serializes");
+    let schema = &json["paths"]["/api/v1/routing/plan"]["post"]["responses"]["200"]["content"]
+        ["application/json"]["schema"];
+    let name = schema["$ref"]
+        .as_str()
+        .and_then(|r| r.strip_prefix("#/components/schemas/"))
+        .expect("the 200 references a component schema");
+    let refs: Vec<&str> = json["components"]["schemas"][name]["oneOf"]
+        .as_array()
+        .expect("the plan response is a oneOf")
+        .iter()
+        .filter_map(|arm| arm["$ref"].as_str())
+        .collect();
+    assert_eq!(
+        refs,
+        [
+            "#/components/schemas/RoutePlan",
+            "#/components/schemas/OutputPlan"
+        ]
+    );
+}

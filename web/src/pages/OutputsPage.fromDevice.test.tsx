@@ -20,8 +20,14 @@ const DEVICES = [
   },
 ];
 
+const ROUTE_ROWS: unknown[] = [];
+
 const server = setupServer(
   http.get('*/api/v1/outputs', () => HttpResponse.json([])),
+  // Output feed routing (ADR-0108 §8): the card's Video/Audio feed row.
+  http.get('*/api/v1/routing', () => HttpResponse.json({ outputs: ROUTE_ROWS })),
+  http.get('*/api/v1/sources', () => HttpResponse.json([])),
+  http.get('*/api/v1/media/players', () => HttpResponse.json([])),
   http.get('*/api/v1/devices', () => HttpResponse.json(DEVICES)),
   http.get('*/api/v1/devices/dev-a/output-targets', () =>
     HttpResponse.json([{ id: 'slot-0', kind: 'rtsp', label: 'Decode slot 0' }]),

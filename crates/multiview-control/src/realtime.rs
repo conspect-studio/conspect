@@ -118,6 +118,13 @@ pub enum CorrKey {
     /// and the window's seq fence keeps an earlier scan's stragglers from ever
     /// being stamped with a newer scan's id.
     Discovery,
+    /// An output feed take's terminal `route.output` outcome (ADR-0108 §6.2).
+    /// The event carries its operation id end to end, so the projection echoes
+    /// it directly (like `switcher.operation`); this key names the pairing.
+    Route {
+        /// The output API id.
+        output: String,
+    },
 }
 
 impl CorrKey {
@@ -256,6 +263,9 @@ impl CorrKey {
             // The running scan's rows correlate via the windowed Discovery key
             // (recorded at scan start, seq-fenced).
             Event::DeviceDiscovered(_) => Some(Self::Discovery),
+            Event::RouteOutput(e) => Some(Self::Route {
+                output: e.output.clone(),
+            }),
             // A media-player lifecycle transition projects to the same key its
             // originating command produced (ADR-0097 §6, ADR-RT008): the player
             // id + the discrete transport state it entered.
@@ -1200,6 +1210,9 @@ impl SessionStream {
             Event::SwitcherOperation(outcome) => {
                 Some(OperationId::from_string(outcome.operation_id.clone()))
             }
+            // A take outcome carries its own op id (empty for a fallback).
+            Event::RouteOutput(outcome) => (!outcome.operation_id.is_empty())
+                .then(|| OperationId::from_string(outcome.operation_id.clone())),
             _ => self.corr.as_ref().and_then(|registry| {
                 CorrKey::for_event(&event).and_then(|key| registry.resolve(&key, seq_event.seq))
             }),
@@ -1305,6 +1318,7 @@ pub fn event_scope_id(event: &Event) -> Option<String> {
         // A media-player lifecycle event scopes by the player id (ADR-RT008), so
         // the `ids` filter narrows the coarse `switcher` topic to one player.
         Event::SwitcherOperation(e) => Some(e.me.clone()),
+        Event::RouteOutput(e) => Some(e.output.clone()),
         Event::MediaPlayerState(e) => Some(e.player.clone()),
         Event::GraphicsChannelState(e) => Some(e.channel.clone()),
         // A catalogue link status scopes by the linked source id.
@@ -1372,7 +1386,7 @@ pub fn topic_for_event(event: &Event) -> Topic {
         // output-sink concern. `rist.link.stats` is conflated latest-wins
         // (`Event::is_conflated`), so the session pump excludes it from the
         // lossless replay ring exactly like the other conflated samples (inv #10).
-        Event::OutputStatus(_) | Event::RistLinkStats(_) => Topic::Outputs,
+        Event::OutputStatus(_) | Event::RistLinkStats(_) | Event::RouteOutput(_) => Topic::Outputs,
         // Operator alerts AND health warnings (SA-0) AND shed-load decisions ride
         // the existing `alerts` lane — a health warning is a richer sibling of an
         // alert (ADR-0035), and a shed-load is a discrete, lossless

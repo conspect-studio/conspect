@@ -231,6 +231,9 @@
                   "$ref": "#/components/schemas/OutputStatus"
                 },
                 {
+                  "$ref": "#/components/schemas/RouteOutputEvent"
+                },
+                {
                   "$ref": "#/components/schemas/Alert"
                 },
                 {
@@ -476,6 +479,16 @@
         },
         "summary": "An output sink changed run state (starting/running/migrating/error).",
         "title": "Output sink status update"
+      },
+      "RouteOutputEvent": {
+        "contentType": "application/json",
+        "description": "Emitted on topic `outputs` with envelope `id` = output id and `corr` = the take's operation id (ADR-0108 §6.2). Lossless; delivered only to principals that may read the output.",
+        "name": "RouteOutputEvent",
+        "payload": {
+          "$ref": "#/components/schemas/RouteOutputEvent"
+        },
+        "summary": "An output feed take settled (route.output on topic `outputs`).",
+        "title": "Output feed take outcome"
       },
       "SalvoEvent": {
         "contentType": "application/json",
@@ -1805,6 +1818,45 @@
           "authz_changed"
         ],
         "type": "string"
+      },
+      "RouteOutputEvent": {
+        "description": "Data body of `route.output` (ADR-0108 §6.2): the terminal outcome of one output feed take, or an unrequested fallback. Envelope `id` = output id.",
+        "properties": {
+          "operation_id": {
+            "description": "The take's operation id (empty for a fallback).",
+            "type": "string"
+          },
+          "outcome": {
+            "enum": [
+              "applied",
+              "superseded",
+              "refused:feed-not-fresh",
+              "refused:capacity",
+              "refused:encoder-not-ready",
+              "refused:unroutable",
+              "refused:format-mismatch",
+              "fallback:aux-failed",
+              "fallback:encoder-failed"
+            ],
+            "type": "string"
+          },
+          "output": {
+            "description": "Output API id (matches the envelope `id`).",
+            "type": "string"
+          },
+          "tick": {
+            "description": "Program tick at which the outcome was decided.",
+            "format": "uint64",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "output",
+          "operation_id",
+          "tick",
+          "outcome"
+        ],
+        "type": "object"
       },
       "SalvoEvent": {
         "description": "Data body of `salvo.armed`, `salvo.taken`, `salvo.cancelled`.",

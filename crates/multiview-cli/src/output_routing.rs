@@ -175,6 +175,9 @@ pub struct TakeOutcome {
     pub tick: u64,
     /// What happened.
     pub outcome: TakeResult,
+    /// The output's bus after this outcome (for `Applied`, the taken bus):
+    /// lets the control plane persist an applied take from the outcome alone.
+    pub bus: PictureBus,
 }
 
 /// A pending take, as seen in the snapshot.
@@ -250,6 +253,21 @@ pub struct OutputRoutingHandle {
     takes: SyncSender<OutputTake>,
     snapshot: Arc<SwapCell<Arc<RoutingSnapshot>>>,
     outcomes: Arc<Mutex<Option<Receiver<TakeOutcome>>>>,
+    outputs: Arc<[RunOutput]>,
+    has_preview: bool,
+}
+
+/// One routable position of the run (the router's output index).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RunOutput {
+    /// The output's config id (`None` for an internal sink, e.g. the
+    /// `program.ts` anchor).
+    pub id: Option<String>,
+    /// The base (Program) encoder settings index.
+    pub settings: usize,
+    /// Whether slice 1 can cut this output cleanly (its encoder family has
+    /// the parameter-set RAP check; VAAPI/VideoToolbox do not, §4.2).
+    pub routable: bool,
 }
 
 impl std::fmt::Debug for OutputRoutingHandle {
@@ -285,6 +303,33 @@ impl OutputRoutingHandle {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .take()
+    }
+
+    /// Attach the run's output map (router index → config id, settings).
+    #[must_use]
+    pub fn with_outputs(mut self, outputs: Vec<RunOutput>) -> Self {
+        self.outputs = outputs.into();
+        self
+    }
+
+    /// The run's output map, by router index.
+    #[must_use]
+    pub fn outputs(&self) -> &[RunOutput] {
+        &self.outputs
+    }
+
+    /// Whether the run has an M/E (Preview is routable).
+    #[must_use]
+    pub const fn has_preview(&self) -> bool {
+        self.has_preview
+    }
+
+    /// The router index of the output whose config id is `id`.
+    #[must_use]
+    pub fn index_of(&self, id: &str) -> Option<usize> {
+        self.outputs
+            .iter()
+            .position(|o| o.id.as_deref() == Some(id))
     }
 }
 
@@ -649,6 +694,8 @@ impl OutputRouter {
             takes: take_tx,
             snapshot: Arc::clone(&snapshot),
             outcomes: Arc::new(Mutex::new(Some(outcome_rx))),
+            outputs: Arc::from(Vec::new()),
+            has_preview: cfg.has_preview,
         };
         let mut router = Self {
             cfg,
@@ -838,6 +885,12 @@ impl OutputRouter {
 
     fn emit(&mut self, operation_id: String, output_index: usize, tick: u64, outcome: TakeResult) {
         self.dirty = true;
+        // Outcomes are rare control events (not per tick); the clone is the
+        // output's current bus name at most.
+        let bus = self
+            .outputs
+            .get(output_index)
+            .map_or(PictureBus::Program, |o| o.bus.clone());
         if self
             .outcomes
             .try_send(TakeOutcome {
@@ -845,6 +898,7 @@ impl OutputRouter {
                 output_index,
                 tick,
                 outcome,
+                bus,
             })
             .is_err()
         {

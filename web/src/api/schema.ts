@@ -1997,6 +1997,26 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/metrics/program": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * `GET /api/v1/metrics/program` — Program tick lateness p50/p99/max over a
+         *     10 s window plus totals (role: read; whole-system principals only).
+         */
+        get: operations["get_program_metrics"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/outputs": {
         parameters: {
             query?: never;
@@ -2518,6 +2538,29 @@ export interface paths {
         get: operations["get_routing"];
         put?: never;
         post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/routing/output/take": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * `POST /api/v1/routing/output/take` — take an output feed (role: write;
+         *     both ends authorized; `Idempotency-Key` required). `202 {operation_id,
+         *     status:"accepted", adopt:"next_tick"}`; a replay of the key answers the
+         *     same operation with `status` `pending` or `settled` (+ outcome) and is never
+         *     enqueued again. The outcome rides `route.output`.
+         */
+        post: operations["take_output"];
         delete?: never;
         options?: never;
         head?: never;
@@ -6221,6 +6264,34 @@ export interface components {
             /** @description The clockwise quarter-turn. Defaults to `none`. */
             turn?: components["schemas"]["QuarterTurnDoc"];
         };
+        /** @description The `200` body of an output plan. */
+        OutputPlan: {
+            /** @description Always `class1`: a feed change never changes the format (§4.2). */
+            class: components["schemas"]["RouteClass"];
+            /** @description The predicted cost. */
+            cost: components["schemas"]["OutputPlanCost"];
+            /** @description Refusals the take would meet (empty = takeable). */
+            refusals: components["schemas"]["OutputPlanRefusal"][];
+        };
+        /** @description The cost of an output take (§6.2, §6.3). */
+        OutputPlanCost: {
+            /** @description `"N of M in use"` — whole-system principals only. */
+            encoder_sessions?: string | null;
+            /** @description Whether the take fits the encoder budget now. */
+            fits: boolean;
+            /**
+             * Format: int32
+             * @description `0` when an existing encoder carries the feed, `1` for a new one.
+             */
+            new_encoders: number;
+        };
+        /** @description A typed plan refusal (RFC 9457 `type` suffix + operator text). */
+        OutputPlanRefusal: {
+            /** @description Operator-facing text (never names an encoder group). */
+            detail: string;
+            /** @description `capacity` | `unknown-feed` | `switcher-required` | `output-kind-unroutable`. */
+            type: string;
+        };
         /** @description `OpenAPI` mirror of the `GET /api/v1/outputs/{id}/playback` response body. */
         OutputPlaybackResponseDoc: {
             /**
@@ -6236,6 +6307,14 @@ export interface components {
             /** @description Human-friendly name. */
             name: string;
         };
+        /** @description The body of an output plan / take. */
+        OutputRouteRequest: {
+            audio?: null | components["schemas"]["OutputTakeAudio"];
+            /** @description The feed: `{"bus":"program"|"preview"}` or `{"source":"vt1"}`. */
+            feed: Record<string, never>;
+            /** @description The output and stream. */
+            target: components["schemas"]["OutputTargetKind"];
+        };
         /** @description One output's routing row in `GET /api/v1/routing` (ADR-0108 §6.2). */
         OutputRouteState: {
             /** @description The configured audio feed (`"follow"` unless set). */
@@ -6247,7 +6326,16 @@ export interface components {
             effective_audio: Record<string, never>;
             /** @description The output's API id (the id `/api/v1/outputs/{id}` addresses). */
             output: string;
-            /** @description `configured` until the engine reports readback for this output. */
+            pending?: null | components["schemas"]["PendingRoute"];
+            /**
+             * Format: int64
+             * @description The tick the current feed went on air (engine readback).
+             */
+            since_tick?: number | null;
+            /**
+             * @description `configured` until the engine reports readback for this output, then
+             *     `on_air` / `pending` / `degraded` (`redacted` with a hidden feed).
+             */
             state: string;
             /**
              * @description Whether the feed follows the switcher (`program`) or is direct
@@ -6261,21 +6349,54 @@ export interface components {
             video: Record<string, never>;
         };
         /**
+         * @description The stream of an output a take re-points.
+         * @enum {string}
+         */
+        OutputStream: "video";
+        /** @description The `202` body of an output take. */
+        OutputTakeAccepted: {
+            /**
+             * @description When the engine adopts the take: `next_tick`. Only on the request
+             *     that enqueued it; a replay never claims a new adoption.
+             */
+            adopt?: string | null;
+            /** @description Correlates the `route.output` outcome. */
+            operation_id: string;
+            /** @description The recorded terminal outcome, on a replay once known. */
+            outcome?: string | null;
+            /**
+             * @description `accepted` (this request enqueued the take), `pending` (a replay of a
+             *     reserved key whose outcome is not known yet) or `settled` (a replay
+             *     carrying the recorded outcome).
+             */
+            status: string;
+            /**
+             * Format: int64
+             * @description The tick of the recorded outcome, on a replay once known.
+             */
+            tick?: number | null;
+        };
+        /**
+         * @description The audio request of an output take; slice 1 accepts only `follow`.
+         * @enum {string}
+         */
+        OutputTakeAudio: "follow";
+        /**
          * @description How an output's feed relates to the switcher (ADR-0108 §8 tally).
          * @enum {string}
          */
         OutputTally: "program" | "preview" | "clean" | "direct" | "redacted";
-        /**
-         * @description One decode-side entry point on a device, bindable as an ordinary managed
-         *     Output with a `device_ref` (ADR-M009 facet (b)).
-         */
+        /** @description The output end of an output crosspoint (`kind = "output"`). */
         OutputTarget: {
-            /** @description A stable id for this target within the device (driver-assigned). */
-            id: string;
-            /** @description The transport kind the device decodes (`rtsp` / `srt` / `rtmp` / `ndi`). */
-            kind: string;
-            /** @description A human-friendly label for the decode slot, if the driver reports one. */
-            label?: string | null;
+            /** @description The output API id (the id `/api/v1/outputs/{id}` addresses). */
+            output: string;
+            /** @description The stream re-pointed: only `video` in slice 1. */
+            stream: components["schemas"]["OutputStream"];
+        };
+        /** @description The target of an output crosspoint, tagged on `kind` (never untagged). */
+        OutputTargetKind: components["schemas"]["OutputTarget"] & {
+            /** @enum {string} */
+            kind: "output";
         };
         /**
          * @description `OpenAPI` mirror of `multiview_config::OutputTimedMetadata` (ADR-0088 §4):
@@ -6380,6 +6501,16 @@ export interface components {
          * @enum {string}
          */
         PendingActionState: "pending" | "executed" | "cancelled";
+        /** @description A take in progress on one output. */
+        PendingRoute: {
+            /**
+             * Format: int64
+             * @description Ticks the take has been held.
+             */
+            held_ticks: number;
+            /** @description The destination feed, or `{"redacted": true}`. */
+            video: Record<string, never>;
+        };
         /**
          * @description `OpenAPI` mirror of [`multiview_core::alarm::PerceivedSeverity`] (X.733).
          *
@@ -6576,6 +6707,54 @@ export interface components {
          * @enum {string}
          */
         ProgramFidelity: "real-encoded-output" | "pre-encode-canvas-approx";
+        /** @description The `GET /api/v1/metrics/program` body. */
+        ProgramMetricsReport: {
+            /** @description The bucket upper edges, ms (a final overflow bucket follows). */
+            bucket_edges_ms: number[];
+            /** @description Cumulative per-bucket counts (edges, then overflow). */
+            buckets_total: number[];
+            /**
+             * Format: int64
+             * @description Last-good repeats since the run started (`frames_repeated`).
+             */
+            frames_repeated_total: number;
+            /**
+             * Format: int64
+             * @description Last-good repeats in the window.
+             */
+            frames_repeated_window: number;
+            /**
+             * Format: double
+             * @description Largest lateness since the run started, ms.
+             */
+            lateness_max_ms: number;
+            /**
+             * Format: int64
+             * @description Window ticks later than the last bucket edge (66.8 ms).
+             */
+            lateness_over_max_bucket: number;
+            /**
+             * Format: double
+             * @description p50 lateness over the window: the upper edge of its bucket, ms
+             *     (`null` when empty or beyond the last edge).
+             */
+            lateness_p50_ms?: number | null;
+            /**
+             * Format: double
+             * @description p99 lateness over the window: the upper edge of its bucket, ms.
+             */
+            lateness_p99_ms?: number | null;
+            /**
+             * Format: int64
+             * @description Ticks emitted since the run started.
+             */
+            ticks_total: number;
+            /**
+             * Format: int64
+             * @description Ticks in the window (about the last 10 s).
+             */
+            window_ticks: number;
+        };
         /** @description The `POST /api/v1/config/promote` response (ADR-W024 §6). */
         PromoteBody: {
             /**
@@ -6981,8 +7160,25 @@ export interface components {
             /** @description The destination layer id. */
             layer: string;
         };
+        /** @description Encoder bus totals (engine readback). */
+        RoutingBuses: {
+            /**
+             * Format: int64
+             * @description Clock ticks the routed-picture thread could not take.
+             */
+            dropped_ticks: number;
+            /** @description `"N of M in use"` — whole-system principals only. */
+            encoder_sessions?: string | null;
+            /** @description Video encoders running. */
+            encoders: number;
+        };
+        /** @description A crosspoint plan, or an output plan when `target.kind` is `output`. */
+        RoutingPlanRequestDoc: components["schemas"]["RouteTakeRequest"] | components["schemas"]["OutputRouteRequest"];
+        /** @description A crosspoint `RoutePlan`, or an `OutputPlan` when the request's `target.kind` is `output`. */
+        RoutingPlanResponseDoc: components["schemas"]["RoutePlan"] | components["schemas"]["OutputPlan"];
         /** @description The `GET /api/v1/routing` body (ADR-0108 §6.2), filtered per object. */
         RoutingState: {
+            buses?: null | components["schemas"]["RoutingBuses"];
             /** @description One row per output the caller may read. */
             outputs: components["schemas"]["OutputRouteState"][];
         };
@@ -14102,6 +14298,53 @@ export interface operations {
             };
         };
     };
+    get_program_metrics: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Program tick lateness and repeats. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProgramMetricsReport"];
+                };
+            };
+            /** @description Missing or invalid credentials. */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Scoped principal (whole-system metric). */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description No running Program reports metrics. */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
     list_outputs: {
         parameters: {
             query?: never;
@@ -16018,6 +16261,96 @@ export interface operations {
             };
         };
     };
+    take_output: {
+        parameters: {
+            query?: never;
+            header: {
+                /** @description Required; one per distinct take. */
+                "Idempotency-Key": string;
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["OutputRouteRequest"];
+            };
+        };
+        responses: {
+            /** @description Accepted (`status: accepted`, `adopt: next_tick`). A replay of the key returns the same operation id with `status: pending` (no outcome yet) or `status: settled` + the recorded outcome; it never re-enqueues. */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["OutputTakeAccepted"];
+                };
+            };
+            /** @description Missing or invalid credentials. */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Not authorized for the output or the feed. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Unknown output. */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description `routing-unavailable`, `switcher-required`, `output-kind-unroutable` or `capacity`. */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description `unknown-feed`, missing Idempotency-Key, or an unsupported audio request. */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Over 2 takes/s per output or 10/s per principal; see Retry-After. */
+            429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description `engine-busy`: the take mailbox is full (the key is freed); or `idempotency-capacity`: the take store holds its maximum of distinct keys (fails closed; existing keys still replay). */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
     plan_route: {
         parameters: {
             query?: never;
@@ -16027,17 +16360,17 @@ export interface operations {
         };
         requestBody: {
             content: {
-                "application/json": components["schemas"]["RouteTakeRequest"];
+                "application/json": components["schemas"]["RoutingPlanRequestDoc"];
             };
         };
         responses: {
-            /** @description The #11 classification (class1/reset_lite/class2 + coerced). */
+            /** @description A crosspoint: the #11 classification (class1/reset_lite/class2 + coerced). An output target (`target.kind = output`): an `OutputPlan` with cost and refusals. */
             200: {
                 headers: {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["RoutePlan"];
+                    "application/json": components["schemas"]["RoutingPlanResponseDoc"];
                 };
             };
             /** @description Missing or invalid credentials. */

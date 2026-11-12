@@ -78,6 +78,13 @@ import {
 import { useOutputPlayback } from '../resources/outputPlayback';
 import { HelpLink } from '../components/HelpLink';
 import { TaskWorkspace, TouchAction } from '../components/broadcast';
+import { useQuery } from '@tanstack/react-query';
+import { getRoutingState } from '../api/outputRouting';
+import type { OutputRouteState } from '../api/outputRouting';
+import { useMediaPlayers } from '../api/media-playersQueries';
+import { useSources } from '../resources/queries';
+import { OutputFeedRow } from './OutputFeedRow';
+import type { FeedChoice } from './OutputFeedRow';
 import { PageHeader } from '../components/PageHeader';
 import { Badge } from '../components/ui/badge';
 import { Button } from '../components/ui/button';
@@ -950,8 +957,11 @@ function OutputCard({
   onEdit,
   onDelete,
   embedded = false,
+  feedRow,
 }: {
   readonly embedded?: boolean;
+  /** The live Video/Audio feed row (standalone page only). */
+  readonly feedRow?: JSX.Element | undefined;
   readonly output: OutputView;
   readonly playbackPath: string | undefined;
   readonly playbackCollision: boolean;
@@ -1163,6 +1173,7 @@ function OutputCard({
       onDetailsToggle={onDetailsToggle}
     >
       <div className="grid gap-2">
+        {feedRow}
         <div className="flex flex-wrap items-center gap-3 text-sm">
           <Link className="underline" to="/monitoring">
             <Trans>Watch program</Trans>
@@ -1211,6 +1222,25 @@ function OutputCard({
   );
 }
 
+const GENERATOR_KINDS = new Set(['bars', 'test', 'solid', 'clock', 'timer']);
+
+/** The routable feeds grouped Players · Generators · Sources (§8). */
+function useFeedChoices(
+  sources: readonly { readonly id: string; readonly name: string; readonly rawKind: string }[] | undefined,
+  players: readonly { readonly id: string }[] | undefined,
+): readonly FeedChoice[] {
+  const playerIds = new Set((players ?? []).map((p) => p.id));
+  return (sources ?? []).map((source): FeedChoice => {
+    const group: FeedChoice['group'] =
+      playerIds.has(source.id) || source.rawKind === 'media_player'
+        ? 'players'
+        : GENERATOR_KINDS.has(source.rawKind)
+          ? 'generators'
+          : 'sources';
+    return { key: `src:${source.id}`, label: source.name, group };
+  });
+}
+
 const RESOURCE_CONTEXT: ResourceContext = {};
 
 const NO_ERRORS = {};
@@ -1233,6 +1263,22 @@ export function OutputsSurface({
   const { t } = useLingui();
   const outputs = useOutputs();
   const routing = useAudioRouting();
+  // Live feed rows on the standalone page only (the embedded Routing column
+  // keeps its own plan tile).
+  const routeState = useQuery({
+    queryKey: ['routing', 'state'],
+    queryFn: () => getRoutingState(),
+    enabled: !embedded,
+    refetchInterval: 2000,
+  });
+  const sources = useSources();
+  const players = useMediaPlayers();
+  const feedChoices = useFeedChoices(
+    embedded ? undefined : sources.data,
+    embedded ? undefined : players.data,
+  );
+  const routeOf = (id: string): OutputRouteState | undefined =>
+    routeState.data?.outputs.find((row) => row.output === id);
   const selectableTracks = routing.data?.state.selectable_tracks;
   const playbackPaths = hlsPlaybackPaths(outputs.data ?? []);
   const playbackCollisions = hlsPlaybackCollisionIds(outputs.data ?? []);
@@ -1419,6 +1465,16 @@ export function OutputsSurface({
                 onDetailsToggle={(open: boolean): void => {
                   setDetailsOpen((prev) => ({ ...prev, [output.id]: open }));
                 }}
+                feedRow={
+                  embedded ? undefined : (
+                    <OutputFeedRow
+                      output={output.id}
+                      outputName={output.name}
+                      route={routeOf(output.id)}
+                      choices={feedChoices}
+                    />
+                  )
+                }
                 onEdit={openEdit}
                 onDelete={(row: OutputView): void => {
                   setPendingDelete(row);

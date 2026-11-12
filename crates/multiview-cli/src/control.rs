@@ -366,6 +366,21 @@ where
     if let Some(switcher) = switcher {
         state = state.with_switcher(switcher);
     }
+    // Output feed routing (ADR-0108 slice 1): the run installs its routing
+    // slot before the control plane starts; without one the routes answer
+    // 409 `routing-unavailable`.
+    #[cfg(feature = "ffmpeg")]
+    if let Some(slot) = crate::output_routing_control::installed_program_metrics() {
+        state = state.with_program_metrics(std::sync::Arc::new(
+            crate::output_routing_control::ProgramMetricsAdapter(slot),
+        ));
+    }
+    #[cfg(feature = "ffmpeg")]
+    if let Some(slot) = crate::output_routing_control::installed_output_routing() {
+        state = state.with_output_routing(std::sync::Arc::new(
+            crate::output_routing_control::OutputRoutingAdapter::new(slot),
+        ));
+    }
     if let Some(leases) = switcher_leases {
         state.switcher_preview_lease = leases;
     }

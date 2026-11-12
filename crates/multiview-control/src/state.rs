@@ -733,6 +733,11 @@ pub struct AppState {
     /// Real M/E frame-boundary handle; absent until dual-bus pipeline is wired.
     /// Routes fail closed rather than pretending that an unwired switcher applied.
     pub switcher: Option<multiview_engine::switcher_control::SwitcherControl>,
+    /// Output feed routing (ADR-0108 slice 1); `None` until the binary installs
+    /// the engine seam (routes answer 409 `routing-unavailable`).
+    pub output_routing: Option<Arc<crate::output_routing::OutputRoutingControl>>,
+    /// Program tick lateness / repeats (ADR-0108 §10); `None` = 404.
+    pub program_metrics: Option<Arc<crate::program_metrics::ProgramMetrics>>,
     /// Bounded sustained PVW lease retained across requests; the previous lease
     /// is released only after a new source lease is acquired.
     pub switcher_preview_lease: Arc<crate::source_demand::SwitcherPreviewLeases>,
@@ -1054,6 +1059,8 @@ impl AppState {
             config_versions: Arc::new(InMemoryConfigVersionStore::new()),
             idempotency: Arc::new(IdempotencyStore::new()),
             switcher: None,
+            output_routing: None,
+            program_metrics: None,
             switcher_preview_lease: Arc::new(crate::source_demand::SwitcherPreviewLeases::default()),
             // Bound the in-flight correlations: a generous ceiling for pending
             // command outcomes (drop-oldest beyond it, invariant #10). A backlog
@@ -1400,6 +1407,32 @@ impl AppState {
         switcher: multiview_engine::switcher_control::SwitcherControl,
     ) -> Self {
         self.switcher = Some(switcher);
+        self
+    }
+
+    /// Install the Program metrics source (ADR-0108 §10). The 1 s sampler
+    /// starts when the router is built.
+    #[must_use]
+    pub fn with_program_metrics(
+        mut self,
+        source: Arc<dyn crate::program_metrics::ProgramMetricsSource>,
+    ) -> Self {
+        self.program_metrics = Some(Arc::new(crate::program_metrics::ProgramMetrics::new(
+            source,
+        )));
+        self
+    }
+
+    /// Install the output feed routing seam (ADR-0108 slice 1). The outcome
+    /// relay starts when the router is built.
+    #[must_use]
+    pub fn with_output_routing(
+        mut self,
+        routing: crate::output_routing::SharedOutputRouting,
+    ) -> Self {
+        self.output_routing = Some(Arc::new(crate::output_routing::OutputRoutingControl::new(
+            routing,
+        )));
         self
     }
 

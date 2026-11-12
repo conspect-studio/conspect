@@ -457,6 +457,17 @@ export interface Resync {
 /** Why a $resync was issued (the client must rebuild, not merge). The first three are unrecoverable resume gaps; `authz_changed` is a mid-session authorization change (object scope narrowed/widened) on an intact connection (ADR-RT010). */
 export type ResyncReason = "seq_evicted" | "unknown_session" | "session_expired" | "authz_changed";
 
+/** Data body of `route.output` (ADR-0108 §6.2): the terminal outcome of one output feed take, or an unrequested fallback. Envelope `id` = output id. */
+export interface RouteOutputEvent {
+  /** The take's operation id (empty for a fallback). */
+  readonly operation_id: string;
+  readonly outcome: "applied" | "superseded" | "refused:feed-not-fresh" | "refused:capacity" | "refused:encoder-not-ready" | "refused:unroutable" | "refused:format-mismatch" | "fallback:aux-failed" | "fallback:encoder-failed";
+  /** Output API id (matches the envelope `id`). */
+  readonly output: string;
+  /** Program tick at which the outcome was decided. */
+  readonly tick: number;
+}
+
 /** Data body of `salvo.armed`, `salvo.taken`, `salvo.cancelled`. */
 export interface SalvoEvent {
   /** Output head this recall applies to, if scoped. */

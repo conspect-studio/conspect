@@ -96,9 +96,9 @@ const ROUTING_KIND: &str = "crosspoint";
         post,
         path = "/api/v1/routing/plan",
         tag = "routing",
-        request_body = RouteTakeRequest,
+        request_body = RoutingPlanRequestDoc,
         responses(
-            (status = 200, description = "The #11 classification (class1/reset_lite/class2 + coerced).", body = crate::routing::RoutePlan),
+            (status = 200, description = "A crosspoint: the #11 classification (class1/reset_lite/class2 + coerced). An output target (`target.kind = output`): an `OutputPlan` with cost and refusals.", body = RoutingPlanResponseDoc),
             (status = 401, description = "Missing or invalid credentials.", body = crate::problem::Problem),
             (status = 403, description = "Not authorized to plan this crosspoint.", body = crate::problem::Problem),
         ),
@@ -107,8 +107,22 @@ const ROUTING_KIND: &str = "crosspoint";
 pub(crate) async fn plan_route(
     State(state): State<AppState>,
     principal: Principal,
-    Json(req): Json<RouteTakeRequest>,
+    Json(body): Json<serde_json::Value>,
 ) -> ControlResult<Response> {
+    // Discriminate on the explicit `target.kind` tag (never serde untagged):
+    // `output` selects the output-feed request, anything else the crosspoint.
+    let kind = body
+        .get("target")
+        .and_then(|t| t.get("kind"))
+        .and_then(serde_json::Value::as_str);
+    if kind == Some("output") {
+        principal.role.require(Action::Read)?;
+        let req: super::output_routing::OutputRouteRequest = serde_json::from_value(body)
+            .map_err(|e| ControlError::Validation(format!("output plan body: {e}")))?;
+        return super::output_routing::plan_output(&state, &principal, &req);
+    }
+    let req: RouteTakeRequest = serde_json::from_value(body)
+        .map_err(|e| ControlError::Validation(format!("plan body: {e}")))?;
     principal.role.require(Action::Read)?;
     crate::auth::authorize_object(&principal, destination_id(&req.target))?;
     // Per-object authz on the SOURCE too (BOLA, SEC-09): classifying a take reads
@@ -391,8 +405,39 @@ pub struct OutputRouteState {
     /// Whether the feed follows the switcher (`program`) or is direct
     /// (`source`) or the preview bus — the tally distinction (§8).
     pub tally: OutputTally,
-    /// `configured` until the engine reports readback for this output.
+    /// `configured` until the engine reports readback for this output, then
+    /// `on_air` / `pending` / `degraded` (`redacted` with a hidden feed).
     pub state: String,
+    /// The tick the current feed went on air (engine readback).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub since_tick: Option<u64>,
+    /// A take held by the fresh gate (engine readback).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pending: Option<PendingRoute>,
+}
+
+/// A take in progress on one output.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+pub struct PendingRoute {
+    /// The destination feed, or `{"redacted": true}`.
+    #[cfg_attr(feature = "openapi", schema(value_type = Object))]
+    pub video: serde_json::Value,
+    /// Ticks the take has been held.
+    pub held_ticks: u64,
+}
+
+/// Encoder bus totals (engine readback).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+pub struct RoutingBuses {
+    /// Video encoders running.
+    pub encoders: usize,
+    /// Clock ticks the routed-picture thread could not take.
+    pub dropped_ticks: u64,
+    /// `"N of M in use"` — whole-system principals only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub encoder_sessions: Option<String>,
 }
 
 /// How an output's feed relates to the switcher (ADR-0108 §8 tally).
@@ -418,7 +463,54 @@ pub enum OutputTally {
 pub struct RoutingState {
     /// One row per output the caller may read.
     pub outputs: Vec<OutputRouteState>,
+    /// Encoder totals, when the engine reports readback.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub buses: Option<RoutingBuses>,
 }
+
+/// `OpenAPI` shape of a `POST /routing/plan` body: a crosspoint request or an
+/// output request, selected by `target.kind` (`output` selects the latter).
+#[cfg(feature = "openapi")]
+pub struct RoutingPlanRequestDoc;
+
+#[cfg(feature = "openapi")]
+impl utoipa::PartialSchema for RoutingPlanRequestDoc {
+    fn schema() -> utoipa::openapi::RefOr<utoipa::openapi::schema::Schema> {
+        use utoipa::openapi::schema::{OneOfBuilder, Ref};
+        OneOfBuilder::new()
+            .item(Ref::from_schema_name("RouteTakeRequest"))
+            .item(Ref::from_schema_name("OutputRouteRequest"))
+            .description(Some(
+                "A crosspoint plan, or an output plan when `target.kind` is `output`.",
+            ))
+            .into()
+    }
+}
+
+#[cfg(feature = "openapi")]
+impl utoipa::ToSchema for RoutingPlanRequestDoc {}
+
+/// `OpenAPI` shape of a `POST /routing/plan` `200`: a crosspoint
+/// [`RoutePlan`], or an `OutputPlan` for a `target.kind = output` request.
+#[cfg(feature = "openapi")]
+pub struct RoutingPlanResponseDoc;
+
+#[cfg(feature = "openapi")]
+impl utoipa::PartialSchema for RoutingPlanResponseDoc {
+    fn schema() -> utoipa::openapi::RefOr<utoipa::openapi::schema::Schema> {
+        use utoipa::openapi::schema::{OneOfBuilder, Ref};
+        OneOfBuilder::new()
+            .item(Ref::from_schema_name("RoutePlan"))
+            .item(Ref::from_schema_name("OutputPlan"))
+            .description(Some(
+                "A crosspoint `RoutePlan`, or an `OutputPlan` when the request's `target.kind` is `output`.",
+            ))
+            .into()
+    }
+}
+
+#[cfg(feature = "openapi")]
+impl utoipa::ToSchema for RoutingPlanResponseDoc {}
 
 /// `GET /api/v1/routing` — the output routing state (role: read; outputs the
 /// caller may not read are omitted; feeds it may not read are redacted).
@@ -450,6 +542,10 @@ pub(crate) async fn get_routing(
     let resources = crate::boot_model::accepted_resources(&state, "outputs")?
         .map_or_else(|| state.outputs.list(), Ok)?;
     let feeds = config.output_feeds();
+    let live = state
+        .output_routing
+        .as_ref()
+        .and_then(|control| control.routing.snapshot());
     let mut outputs = Vec::with_capacity(resources.len());
     for versioned in resources {
         let id = versioned.resource.id;
@@ -465,13 +561,76 @@ pub(crate) async fn get_routing(
             .cloned()
             .unwrap_or_else(|| {
                 multiview_config::OutputCrosspoint::program(
-                    config_id,
+                    config_id.clone(),
                     multiview_config::MAIN_PROGRAM,
                 )
             });
-        outputs.push(output_route_state(&principal, &feed, id));
+        let mut row = output_route_state(&principal, &feed, id);
+        if let Some(live) = live.as_ref() {
+            apply_live(&principal, &mut row, live.outputs.get(&config_id));
+        }
+        outputs.push(row);
     }
-    Ok((StatusCode::OK, Json(RoutingState { outputs })).into_response())
+    let buses = live.as_ref().map(|live| RoutingBuses {
+        encoders: live.encoders,
+        dropped_ticks: live.dropped_ticks,
+        encoder_sessions: principal
+            .is_global()
+            .then(|| format!("{} of {} in use", live.sessions_in_use, live.sessions_max)),
+    });
+    Ok((StatusCode::OK, Json(RoutingState { outputs, buses })).into_response())
+}
+
+/// The output API id whose body carries config id `config_id` (the reverse
+/// of the take's mapping), for events about outputs no take named.
+pub(crate) fn api_id_of(state: &AppState, config_id: &str) -> Option<String> {
+    let resources = crate::boot_model::accepted_resources(state, "outputs")
+        .ok()?
+        .map_or_else(|| state.outputs.list(), Ok)
+        .ok()?;
+    resources.into_iter().find_map(|versioned| {
+        let body: multiview_config::Output =
+            serde_json::from_value(versioned.resource.body).ok()?;
+        (body.id() == config_id).then_some(versioned.resource.id)
+    })
+}
+
+/// Fold the engine readback into a row, redacting per the row's own rules:
+/// a pending feed the caller may not read becomes `{"redacted": true}`.
+fn apply_live(
+    principal: &Principal,
+    row: &mut OutputRouteState,
+    live: Option<&crate::output_routing::OutputLive>,
+) {
+    let Some(live) = live else {
+        return;
+    };
+    let redacted = serde_json::json!({ "redacted": true });
+    if row.tally == OutputTally::Redacted {
+        // The current feed is hidden: so is when it started and its health.
+        "redacted".clone_into(&mut row.state);
+    } else {
+        let state = if live.degraded {
+            "degraded"
+        } else if live.pending.is_some() {
+            "pending"
+        } else {
+            "on_air"
+        };
+        state.clone_into(&mut row.state);
+        row.since_tick = Some(live.since_tick);
+    }
+    row.pending = live.pending.as_ref().map(|(bus, held)| {
+        let video = crate::output_routing::RoutedFeed::from_bus_name(bus)
+            .map(|feed| feed.video_feed())
+            .filter(|feed| may_read_feed(principal, feed))
+            .and_then(|feed| serde_json::to_value(feed).ok())
+            .unwrap_or_else(|| redacted.clone());
+        PendingRoute {
+            video,
+            held_ticks: *held,
+        }
+    });
 }
 
 /// Whether `principal` may read `feed` (ADR-0108 §6.3): Read on a source; the
@@ -534,6 +693,8 @@ fn output_route_state(
             effective_audio: redacted,
             tally: OutputTally::Redacted,
             state: "configured".to_owned(),
+            since_tick: None,
+            pending: None,
         };
     }
     let tally = match &video {
@@ -557,6 +718,8 @@ fn output_route_state(
         effective_audio,
         tally,
         state: "configured".to_owned(),
+        since_tick: None,
+        pending: None,
     }
 }
 
