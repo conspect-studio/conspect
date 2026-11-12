@@ -257,6 +257,10 @@ pub struct RoutingSnapshot {
     /// lingering ones included and failed ones excluded: a take onto one of
     /// these reuses it (+0 encoders).
     pub live_keys: Vec<(String, usize)>,
+    /// Pending dispatcher moves the router could not cancel by re-asserting
+    /// the output's key (it was already failed/retired); the move was
+    /// cancelled directly instead (#330 item 4).
+    pub move_cancel_failures: u64,
 }
 
 /// The control-plane handle (clone freely).
@@ -644,6 +648,7 @@ pub struct OutputRouter {
     /// Events dropped by live-opened workers' sinks (shared with them).
     dyn_dropped: Arc<AtomicU64>,
     parameter_set_changes: u64,
+    move_cancel_failures: u64,
     video_keys: usize,
     /// Items handed to the reaper this run (0 = nothing to wait for at the end).
     reaped: u64,
@@ -753,6 +758,7 @@ impl OutputRouter {
             dead_encoders: 0,
             dyn_dropped: Arc::new(AtomicU64::new(0)),
             parameter_set_changes: 0,
+            move_cancel_failures: 0,
             video_keys: 0,
             reaped: 0,
             dirty: true,
@@ -1096,14 +1102,78 @@ impl OutputRouter {
         self.emit(old.take.operation_id, index, tick, TakeResult::Superseded);
     }
 
+    /// [`Self::supersede`] only a take whose dispatcher move is in flight
+    /// (`Moving`): a fallback replaces that move. A take still priming,
+    /// opening or warming stays valid from the output's new feed.
+    fn supersede_move(&mut self, index: usize, tick: u64, dispatcher: &mut RenditionDispatcher) {
+        let moving = self
+            .outputs
+            .get(index)
+            .and_then(|o| o.pending.as_ref())
+            .is_some_and(|p| matches!(p.phase, Phase::Moving(_)));
+        if moving {
+            self.supersede(index, tick, dispatcher);
+        }
+    }
+
+    /// Cancel the output's pending dispatcher move by re-asserting its
+    /// current key. When that key is already failed/retired (its fallback is
+    /// on the way), the rebind is refused and the old move would stay
+    /// pending and could land later with no take (#330 item 4): cancel it
+    /// directly instead, and count it.
     fn cancel_dispatcher_move(
-        &self,
+        &mut self,
         index: usize,
         dispatcher: &mut RenditionDispatcher,
         tick: u64,
     ) {
-        if let Some(out) = self.outputs.get(index) {
-            let _ = dispatcher.rebind_video(index, out.key, tick, 1);
+        let Some(key) = self.outputs.get(index).map(|o| o.key) else {
+            return;
+        };
+        if let Err(error) = dispatcher.rebind_video(index, key, tick, 1) {
+            self.move_cancel_failures = self.move_cancel_failures.saturating_add(1);
+            self.dirty = true;
+            let cancelled = dispatcher.cancel_video_move(index);
+            tracing::warn!(
+                output = index,
+                key,
+                ?error,
+                cancelled,
+                "routing: could not re-assert the current key; pending move cancelled directly"
+            );
+        }
+    }
+
+    /// The picture bus a video key carries (`None`: unknown, e.g. closed).
+    fn bus_of_key(&self, key: usize) -> Option<PictureBus> {
+        if self.cfg.base_keys.contains(&key) {
+            return Some(PictureBus::Program);
+        }
+        self.dynamic
+            .iter()
+            .find(|d| d.key == key)
+            .map(|d| d.bus.clone())
+    }
+
+    /// A pending take whose dispatcher move vanished without an Applied or
+    /// Refused (a newer rebind replaced it): settle it as Superseded so it
+    /// never strands (#330 item 3, defensive).
+    fn settle_stranded(&mut self, index: usize, tick: u64, dispatcher: &mut RenditionDispatcher) {
+        let stranded = self
+            .outputs
+            .get(index)
+            .and_then(|o| o.pending.as_ref())
+            .and_then(|p| match p.phase {
+                Phase::Moving(k) => Some(k),
+                _ => None,
+            })
+            .is_some_and(|k| dispatcher.pending_video_move(index) != Some(k));
+        if !stranded {
+            return;
+        }
+        if let Some(old) = self.outputs.get_mut(index).and_then(|o| o.pending.take()) {
+            self.abandon_audio(index, old.phase, tick, dispatcher);
+            self.emit(old.take.operation_id, index, tick, TakeResult::Superseded);
         }
     }
 
@@ -1279,6 +1349,7 @@ impl OutputRouter {
     }
 
     fn drain_moves(&mut self, tick: u64, dispatcher: &mut RenditionDispatcher) {
+        let mut superseded: Vec<usize> = Vec::new();
         for outcome in dispatcher.take_move_outcomes() {
             match outcome {
                 MoveOutcome::Applied {
@@ -1308,10 +1379,19 @@ impl OutputRouter {
                             self.emit(p.take.operation_id, output_index, at, TakeResult::Applied);
                         }
                     } else if out.key != key {
-                        // A fallback move landing (no take pending for it).
-                        out.key = key;
-                        out.since = at;
-                        self.dirty = true;
+                        // A fallback (or a stale, uncancelled) move landing
+                        // with no take pending for it: the bus follows the
+                        // key, so `key` and `bus` never disagree (#330 item
+                        // 4). An unknown key (already closed) is left to its
+                        // own Fallback.
+                        if let Some(bus) = self.bus_of_key(key) {
+                            if let Some(out) = self.outputs.get_mut(output_index) {
+                                out.bus = bus;
+                                out.key = key;
+                                out.since = at;
+                            }
+                            self.dirty = true;
+                        }
                     }
                 }
                 MoveOutcome::Refused {
@@ -1333,7 +1413,8 @@ impl OutputRouter {
                         self.refuse_pending(output_index, tick, reason, dispatcher);
                     }
                 }
-                MoveOutcome::Superseded { .. } | MoveOutcome::AudioFallback { .. } => {}
+                MoveOutcome::Superseded { output_index } => superseded.push(output_index),
+                MoveOutcome::AudioFallback { .. } => {}
                 MoveOutcome::AudioApplied { .. } | MoveOutcome::AudioRefused { .. } => {
                     if let Some(audio) = self.audio.as_mut() {
                         audio.on_outcome(&outcome, dispatcher);
@@ -1341,9 +1422,6 @@ impl OutputRouter {
                     self.dirty = true;
                 }
                 MoveOutcome::Fallback { output_index } => {
-                    if let Some(audio) = self.audio.as_mut() {
-                        audio.fallback(output_index, &PictureBus::Program, tick, None, dispatcher);
-                    }
                     if let Some(out) = self.outputs.get_mut(output_index) {
                         out.bus = PictureBus::Program;
                         out.key = self
@@ -1354,6 +1432,13 @@ impl OutputRouter {
                             .unwrap_or(out.key);
                         out.since = tick;
                     }
+                    // A take whose dispatcher move is in flight is settled
+                    // (Superseded, its audio restored) and the move cancelled,
+                    // before the audio falls back (#330 item 3).
+                    self.supersede_move(output_index, tick, dispatcher);
+                    if let Some(audio) = self.audio.as_mut() {
+                        audio.fallback(output_index, &PictureBus::Program, tick, None, dispatcher);
+                    }
                     self.emit(
                         String::new(),
                         output_index,
@@ -1362,6 +1447,11 @@ impl OutputRouter {
                     );
                 }
             }
+        }
+        // Decided after the whole batch: an Applied/Refused later in it has
+        // already settled the take.
+        for index in superseded {
+            self.settle_stranded(index, tick, dispatcher);
         }
     }
 
@@ -1391,6 +1481,11 @@ impl OutputRouter {
                 let Some(&base) = self.cfg.base_keys.get(index) else {
                     continue;
                 };
+                // A take whose dispatcher move is in flight is settled first
+                // (Superseded, audio restored): the forced rebind replaces
+                // that move, which would otherwise strand it forever (#330
+                // item 3).
+                self.supersede_move(index, tick, dispatcher);
                 let windows = self.request_idr(base, tick);
                 // A fallback: the routed feed is gone, so it is never refused
                 // for a format mismatch (an out-of-band output takes a loss).
@@ -1996,6 +2091,7 @@ impl OutputRouter {
                 .map(crate::routing_audio::RoutedAudio::counters)
                 .unwrap_or_default(),
             live_keys: self.live_keys.clone(),
+            move_cancel_failures: self.move_cancel_failures,
         };
         if *self.snapshot.load() != next {
             self.snapshot.store(Arc::new(next));

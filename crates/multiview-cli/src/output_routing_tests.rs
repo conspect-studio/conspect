@@ -2975,3 +2975,233 @@ fn two_in_flight_takes_to_one_bus_open_one_encoder() {
     );
     assert_eq!(x.h.snapshot().dynamic_encoders_live, 1);
 }
+
+/// A fake live encoder whose keyframes can be withheld (its windows then
+/// never pass the move gate, so a move onto it stays pending).
+struct GatedEnc {
+    forced: bool,
+    no_keys: Arc<AtomicBool>,
+}
+
+impl VideoEncodeWorker for GatedEnc {
+    fn encode(&mut self, item: BakedTick) -> Result<Vec<EncodedPacket>, PipelineError> {
+        let key = std::mem::take(&mut self.forced) && !self.no_keys.load(Ordering::Acquire);
+        Ok(vec![pkt(item.tick, key)])
+    }
+    fn reorder_bound(&self) -> ReorderBound {
+        ReorderBound::NoReorder
+    }
+    fn finish(&mut self) -> Result<Vec<EncodedPacket>, PipelineError> {
+        Ok(Vec::new())
+    }
+    fn force_keyframe(&mut self) {
+        self.forced = true;
+    }
+}
+
+impl LiveEncoder for GatedEnc {
+    fn start_at(&mut self, _t0: u64) {
+        self.forced = true;
+    }
+    fn time_base(&self) -> Rational {
+        Rational::new(1, 5)
+    }
+    fn move_gate(&self) -> MoveGate {
+        Box::new(|p| p.is_keyframe() && p.len() == 77)
+    }
+}
+
+/// Output 1 on a live `cam` key (principal `p`), output 2 on a live `cam2`
+/// key (principal `q`), then `cam2`'s keyframes withheld and output 1's take
+/// "c" to `cam2` left pending in `Moving(kB)`. Returns (harness, kA, kB,
+/// next tick, keyframe switch).
+fn stuck_move_onto_a_shared_key() -> (Harness, usize, usize, u64, Arc<AtomicBool>) {
+    let no_keys = Arc::new(AtomicBool::new(false));
+    let flag = Arc::clone(&no_keys);
+    let open: OpenFn = Box::new(move |_| {
+        let enc: Box<dyn LiveEncoder> = Box::new(GatedEnc {
+            forced: false,
+            no_keys: Arc::clone(&flag),
+        });
+        Ok(enc)
+    });
+    let mut x = harness(3, 6, Some(open));
+    x.tick(0);
+    let until_applied = |x: &mut Harness, from: u64, op: &str| -> u64 {
+        for t in from..from + OPEN_DEADLINE_TICKS {
+            x.tick(t);
+            let got: Vec<_> = x.outcomes.try_iter().collect();
+            if got
+                .iter()
+                .any(|o| o.operation_id == op && o.outcome == TakeResult::Applied)
+            {
+                return t + 1;
+            }
+            assert!(got.is_empty(), "unexpected outcomes {got:?}");
+        }
+        panic!("{op} never applied");
+    };
+    x.h.try_take(take("a", 1, src())).unwrap();
+    let t = until_applied(&mut x, 1, "a");
+    let mut b = take("b", 2, PictureBus::Source("cam2".to_owned()));
+    b.principal = "q".to_owned();
+    x.h.try_take(b).unwrap();
+    let t = until_applied(&mut x, t, "b");
+    let ka = x.d.binding_video_key(1).unwrap();
+    let kb = x.d.binding_video_key(2).unwrap();
+    assert!(ka != 0 && kb != 0 && ka != kb, "two live keys: {ka} {kb}");
+    no_keys.store(true, Ordering::Release);
+    x.h.try_take(take("c", 1, PictureBus::Source("cam2".to_owned())))
+        .unwrap();
+    x.tick(t);
+    assert!(x.results().is_empty(), "c is pending");
+    assert!(
+        x.h.snapshot().outputs[1].pending.is_some(),
+        "c moves onto the warm key at once"
+    );
+    assert_eq!(x.d.pending_video_move(1), Some(kb), "the move is pending");
+    (x, ka, kb, t + 1, no_keys)
+}
+
+/// #330 item 3: an aux failure that rebinds an output to Program while its
+/// take's dispatcher move is pending settles that take (it stranded in
+/// `Moving` forever, holding its destination key subscribed), and the
+/// destination key then lingers and closes like any 0-subscriber key.
+#[test]
+fn an_aux_fallback_settles_a_take_whose_move_is_pending() {
+    let (mut x, _ka, kb, mut t, _no_keys) = stuck_move_onto_a_shared_key();
+    x.failed.store(true, Ordering::Release);
+    let fell_at = t;
+    let mut got = Vec::new();
+    for _ in 0..20 {
+        x.tick(t);
+        t += 1;
+        got.extend(
+            x.outcomes
+                .try_iter()
+                .filter(|o| o.output_index == 1)
+                .map(|o| (o.operation_id, o.outcome, o.tick)),
+        );
+    }
+    // Settled at the fallback itself, before it is reported (not later by
+    // the dispatcher's Superseded echo).
+    assert_eq!(
+        got,
+        vec![
+            ("c".to_owned(), TakeResult::Superseded, fell_at),
+            (
+                String::new(),
+                TakeResult::Fallback(FallbackReason::AuxFailed),
+                fell_at
+            ),
+        ],
+        "the pending take gets a terminal outcome at the fallback"
+    );
+    assert!(
+        x.h.snapshot().outputs.iter().all(|o| o.pending.is_none()),
+        "no take stays pending"
+    );
+    assert_eq!(x.d.binding_video_key(1), Some(0), "output 1 on Program");
+    assert_eq!(x.d.binding_video_key(2), Some(0), "output 2 on Program");
+    // kB has no subscriber since the fallback: it lingers, then closes.
+    while t < fell_at + LINGER_TICKS - 2 {
+        x.tick(t);
+        t += 1;
+    }
+    assert!(!x.d.is_key_failed(kb), "kB lingers");
+    for _ in 0..5 {
+        x.tick(t);
+        t += 1;
+    }
+    assert!(x.d.is_key_failed(kb), "kB closed after the linger");
+}
+
+/// #330 item 3, the dispatcher-Fallback arm: the output's live key fails
+/// while its take's move onto another key is pending. The take is settled
+/// at the fallback (Superseded) and its move cancelled: it never lands
+/// later behind the reported Fallback.
+#[test]
+fn an_encoder_fallback_settles_a_take_whose_move_is_pending() {
+    let (mut x, ka, _kb, mut t, no_keys) = stuck_move_onto_a_shared_key();
+    x.r.close(ka, &mut x.d);
+    x.tick(t);
+    t += 1;
+    let got: Vec<_> = x
+        .outcomes
+        .try_iter()
+        .map(|o| (o.operation_id, o.outcome))
+        .collect();
+    assert!(
+        got.contains(&("c".to_owned(), TakeResult::Superseded)),
+        "{got:?}"
+    );
+    assert!(
+        got.contains(&(
+            String::new(),
+            TakeResult::Fallback(FallbackReason::EncoderFailed)
+        )),
+        "{got:?}"
+    );
+    assert!(x.h.snapshot().outputs[1].pending.is_none());
+    assert_eq!(x.d.pending_video_move(1), None, "the move is cancelled");
+    // kB's keyframes return: nothing lands on output 1.
+    no_keys.store(false, Ordering::Release);
+    for _ in 0..15 {
+        x.tick(t);
+        t += 1;
+    }
+    assert_eq!(
+        x.d.binding_video_key(1),
+        Some(0),
+        "output 1 stays on Program"
+    );
+    let o = &x.h.snapshot().outputs[1];
+    assert_eq!((o.bus.as_str(), o.key.as_str()), ("program", "program/0"));
+}
+
+/// #330 item 4: a take superseded while the output's current key is
+/// already retired (its Fallback not yet drained) cannot cancel the old
+/// move by re-asserting that key. The old move is cancelled directly
+/// (counted) and never lands later with no take, and the output's `key` and
+/// `bus` always agree.
+#[test]
+fn a_failed_cancel_never_lets_an_old_move_land() {
+    let (mut x, ka, kb, mut t, no_keys) = stuck_move_onto_a_shared_key();
+    // kA retires between drains (the router has not seen it yet); a take
+    // that stays priming supersedes "c".
+    x.d.retire_video_key(ka).unwrap();
+    x.h.try_take(take("d", 1, PictureBus::Source("nope".to_owned())))
+        .unwrap();
+    x.tick(t);
+    t += 1;
+    let got: Vec<_> = x
+        .outcomes
+        .try_iter()
+        .map(|o| (o.operation_id, o.outcome))
+        .collect();
+    assert!(
+        got.contains(&("c".to_owned(), TakeResult::Superseded)),
+        "{got:?}"
+    );
+    assert_eq!(x.h.snapshot().move_cancel_failures, 1, "counted");
+    assert_eq!(x.d.pending_video_move(1), None, "the old move is gone");
+    // kB's keyframes return while "d" still primes: the old move to kB
+    // must not land.
+    no_keys.store(false, Ordering::Release);
+    for _ in 0..15 {
+        x.tick(t);
+        t += 1;
+        let o = &x.h.snapshot().outputs[1];
+        assert_eq!(
+            o.key,
+            format!("{}/{}", o.bus, x.d.binding_video_key(1).unwrap()),
+            "key and bus agree"
+        );
+    }
+    assert_ne!(
+        x.d.binding_video_key(1),
+        Some(kb),
+        "the old move never lands"
+    );
+    assert_eq!(x.d.binding_video_key(1), Some(0));
+}
