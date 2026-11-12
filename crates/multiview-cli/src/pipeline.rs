@@ -1578,9 +1578,13 @@ mod failure_class_tests {
             let env = PipelineError::io("output hls: creating /x", Error::from(kind));
             assert_eq!(env.failure_class(), FailureClass::Environment, "{kind:?}");
         }
-        // A real OS error (EADDRINUSE = 98 on Linux) maps by its kind too.
-        let raw = PipelineError::io("x", Error::from_raw_os_error(98));
-        assert_eq!(raw.failure_class(), FailureClass::Environment);
+        // A real OS error (EADDRINUSE = 98 on Linux; the number differs per
+        // OS) maps by its kind too.
+        #[cfg(target_os = "linux")]
+        {
+            let raw = PipelineError::io("x", Error::from_raw_os_error(98));
+            assert_eq!(raw.failure_class(), FailureClass::Environment);
+        }
         // A path fault is the configuration's.
         let path = PipelineError::io("x", Error::from(ErrorKind::NotADirectory));
         assert_eq!(path.failure_class(), FailureClass::State);

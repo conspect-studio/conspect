@@ -767,7 +767,23 @@ mod failure_class_tests {
         let in_use = std::net::TcpListener::bind(addr).unwrap_err();
         assert_eq!(in_use.kind(), ErrorKind::AddrInUse);
         assert_eq!(io_failure_class(in_use.kind()), FailureClass::Environment);
+        // The kinds the raw OS errors map to (portable).
+        for kind in [
+            ErrorKind::ResourceBusy,
+            ErrorKind::PermissionDenied,
+            ErrorKind::StorageFull,
+            ErrorKind::ReadOnlyFilesystem,
+            ErrorKind::WouldBlock,
+        ] {
+            assert_eq!(
+                io_failure_class(kind),
+                FailureClass::Environment,
+                "{kind:?}"
+            );
+        }
+        // Linux errno numbers (they differ per OS: 11 is EDEADLK on macOS):
         // EBUSY (16), EACCES (13), ENOSPC (28), EROFS (30), EAGAIN (11).
+        #[cfg(target_os = "linux")]
         for errno in [16, 13, 28, 30, 11] {
             let error = std::io::Error::from_raw_os_error(errno);
             assert_eq!(
@@ -776,10 +792,6 @@ mod failure_class_tests {
                 "errno {errno}: {error}"
             );
         }
-        assert_eq!(
-            std::io::Error::from_raw_os_error(16).kind(),
-            ErrorKind::ResourceBusy
-        );
         for kind in [
             ErrorKind::NotFound,
             ErrorKind::InvalidInput,
