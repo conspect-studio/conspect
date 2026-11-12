@@ -11,11 +11,18 @@
 //! process stall, three repeats, door off). The witness is a plain std thread
 //! that sleeps 1 ms in a loop on the same time base as the tick deadlines and
 //! records every gap longer than half a period: while it was not running, the
-//! process was not running. A repeat (or a tick later than one period) is
-//! **explained** when its `[deadline, emit]` interval overlaps a witness gap;
-//! anything else is a slip the code under test caused, and the suite asserts
-//! there are none. The negative control in `stall_witness.rs` proves a starved
-//! clock (the program runtime blocked while the process runs) is NOT excused.
+//! process was not running. Each gap is stamped *inside* the sleep (the clock
+//! read just before `sleep` and just after it returns), so it holds only time
+//! the witness was blocked, and only a gap of at least one period counts (a
+//! shorter one cannot cause a repeat).
+//!
+//! A repeat (or a tick later than one period) is **explained** only when ONE
+//! witness gap covers its whole `[deadline, emit]` lateness window except
+//! [`EDGE_SLACK_NS`] (half a period) at each edge: the process was stopped for
+//! essentially all of the time the tick was late. A slip the code under test
+//! caused (the program runtime blocked or starved while the process ran) is
+//! not covered and fails, even when a stall follows it (review PR 333). The
+//! controls in `stall_witness.rs` prove both.
 #![allow(
     dead_code,
     unreachable_pub,
@@ -127,8 +134,16 @@ pub struct ClockRun {
     pub gaps: Vec<(i64, i64)>,
 }
 
-/// The witness thread: sleeps 1 ms in a loop and records every gap longer
-/// than half a period.
+/// The shortest witness gap that counts: one period (a shorter whole-process
+/// stall cannot make a tick a period late).
+pub const MIN_GAP_NS: i64 = PERIOD_NS;
+/// How much of a late tick's window, at each edge, a gap may leave uncovered:
+/// the witness's own wake-up latency and the program thread's, never a
+/// period's worth of slip.
+pub const EDGE_SLACK_NS: i64 = PERIOD_NS / 2;
+
+/// The witness thread: sleeps 1 ms in a loop and records every sleep that
+/// took at least [`MIN_GAP_NS`], stamped inside the sleep.
 struct Witness {
     stop: Arc<AtomicBool>,
     gaps: Arc<Mutex<Vec<(i64, i64)>>>,
@@ -143,14 +158,13 @@ impl Witness {
         let thread = std::thread::Builder::new()
             .name("stall-witness".to_owned())
             .spawn(move || {
-                let mut last = time.now_nanos();
                 while !s.load(Ordering::Relaxed) {
+                    let before = time.now_nanos();
                     std::thread::sleep(Duration::from_millis(1));
-                    let now = time.now_nanos();
-                    if now - last > PERIOD_NS / 2 {
-                        g.lock().unwrap().push((last, now));
+                    let after = time.now_nanos();
+                    if after - before >= MIN_GAP_NS {
+                        g.lock().unwrap().push((before, after));
                     }
-                    last = now;
                 }
             })
             .unwrap();
@@ -242,7 +256,7 @@ pub fn run_clock(duration: Duration, on_tick: impl FnMut(u64) + Send + 'static) 
 pub struct Classification {
     /// Repeats, plus fresh ticks later than one period.
     pub needing_explanation: usize,
-    /// Of those, overlapping a witness gap.
+    /// Of those, covered by one witness gap (see [`classify`]).
     pub explained: usize,
     /// The rest: slips the code under test is responsible for.
     pub unexplained: Vec<(u64, i64, bool)>,
@@ -255,11 +269,7 @@ pub fn classify(run: &ClockRun) -> Classification {
             continue;
         }
         c.needing_explanation += 1;
-        if run
-            .gaps
-            .iter()
-            .any(|&(start, end)| t.deadline < end && t.emit > start)
-        {
+        if run.gaps.iter().any(|&(start, end)| covers(start, end, t)) {
             c.explained += 1;
         } else {
             c.unexplained
@@ -267,6 +277,12 @@ pub fn classify(run: &ClockRun) -> Classification {
         }
     }
     c
+}
+
+/// Whether the gap `[start, end]` covers `t`'s lateness window
+/// `[deadline, emit]` except [`EDGE_SLACK_NS`] at each edge.
+pub fn covers(start: i64, end: i64, t: &TickRecord) -> bool {
+    start <= t.deadline + EDGE_SLACK_NS && end >= t.emit - EDGE_SLACK_NS
 }
 
 pub fn report(name: &str, r: &ClockRun) {

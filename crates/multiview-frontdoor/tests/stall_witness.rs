@@ -11,6 +11,12 @@
 //!   busy-spin inside one tick's projection) while the witness keeps
 //!   running: those repeats are NOT explained, so the witness never excuses a
 //!   starved clock.
+//! * BLOCK THEN STALL (review PR 333): a 100 ms program-runtime block
+//!   immediately followed by a 150 ms SIGSTOP; the ticks the block made late
+//!   are not covered by the stall's gap and stay unexplained.
+//! * BLOCK UNDER FLOOD (review PR 333): a 100 ms program-runtime block while a
+//!   loopback flood keeps every other thread busy; the witness's own
+//!   scheduling noise must not excuse it.
 #![cfg(unix)]
 #![allow(clippy::unwrap_used, clippy::print_stderr)]
 
@@ -18,6 +24,8 @@ mod common;
 
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
+
+use multiview_frontdoor::flood::{Flood, FloodConfig, Shape, Sources};
 
 /// SIGSTOP stops every thread of this test process: the tests in this file
 /// run one at a time, or one test's stall would land in another's run.
@@ -100,4 +108,80 @@ fn a_starved_program_runtime_is_never_explained() {
     );
     let r = std::panic::catch_unwind(|| common::assert_cadence("starved", &run));
     assert!(r.is_err(), "assert_cadence fails a starved clock");
+}
+
+fn spin(d: Duration) {
+    let until = Instant::now() + d;
+    while Instant::now() < until {
+        std::hint::spin_loop();
+    }
+}
+
+/// Start the stall `after` from now, from a helper thread.
+fn sigstop_at(after: Duration, stall: Duration) -> std::thread::JoinHandle<()> {
+    sigstop_self_after(after, stall)
+}
+
+#[test]
+fn a_block_followed_by_a_stall_is_not_explained_by_the_stall() {
+    let _serial = serial();
+    // Tick 30 (deadline ~1 s): the projection spins 100 ms, and the stall is
+    // scheduled to begin as the spin ends. The block's late ticks lie before
+    // the gap starts, so the gap cannot cover them.
+    let stopper = std::sync::Arc::new(Mutex::new(None));
+    let slot = std::sync::Arc::clone(&stopper);
+    let run = common::run_clock(Duration::from_secs(3), move |index| {
+        let mut slot = slot.lock().unwrap();
+        if index == 30 && slot.is_none() {
+            *slot = Some(sigstop_at(
+                Duration::from_millis(100),
+                Duration::from_millis(150),
+            ));
+            drop(slot);
+            spin(Duration::from_millis(100));
+        }
+    });
+    if let Some(handle) = stopper.lock().unwrap().take() {
+        handle.join().unwrap();
+    }
+    common::report("block then stall", &run);
+    let c = common::classify(&run);
+    assert!(
+        !c.unexplained.is_empty(),
+        "a program-runtime block before a stall must stay unexplained: {c:?} gaps {:?}",
+        run.gaps
+    );
+}
+
+#[test]
+fn a_block_under_flood_is_not_explained_by_witness_noise() {
+    let _serial = serial();
+    let target = std::net::UdpSocket::bind("[::1]:0").unwrap();
+    let flood = Flood::start(FloodConfig {
+        target: target.local_addr().unwrap(),
+        pps: 20_000,
+        threads: 4,
+        sources: Sources::One("[::1]:0".parse().unwrap()),
+        shapes: Shape::ALL.to_vec(),
+    })
+    .unwrap();
+    let run = common::run_clock(Duration::from_secs(3), |index| {
+        if index == 30 {
+            spin(Duration::from_millis(100));
+        }
+    });
+    let _ = flood.stop();
+    drop(target);
+    common::report("block under flood", &run);
+    let c = common::classify(&run);
+    assert!(
+        run.repeats >= 2,
+        "the block forced repeats: {}",
+        run.repeats
+    );
+    assert!(
+        !c.unexplained.is_empty(),
+        "witness noise under flood must not excuse a blocked clock: {c:?} gaps {:?}",
+        run.gaps
+    );
 }
