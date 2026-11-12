@@ -39,6 +39,8 @@
 #![warn(missing_docs)]
 
 pub mod account_audit;
+#[cfg(all(feature = "acme", unix))]
+pub mod acme;
 pub mod alarm_ingest;
 pub mod alarm_store;
 pub mod audio_routing;

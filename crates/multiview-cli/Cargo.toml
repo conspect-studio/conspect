@@ -364,6 +364,11 @@ sqlite = ["multiview-control/sqlite"]
 # umbrella presets below so the deploy images can terminate HTTPS without a proxy.
 tls = ["multiview-control/tls"]
 
+# The front-door ACME issuance engine (slice 5, ADR-0107 §5a, #291): library only
+# in this release; boot wiring and the `multiview tls` CLI land with the next
+# slice, so it is deliberately NOT in any preset yet. Implies `tls`.
+acme = ["tls", "multiview-control/acme"]
+
 # mDNS/DNS-SD managed-device discovery (DEV-A5 / ADR-M008 §6 / ADR-0041): install
 # the real `mdns-sd`-backed browser so `POST /api/v1/discovery/devices/scan`
 # browses the LAN for Cast / NDI / (configured) zowietek-control services. The
