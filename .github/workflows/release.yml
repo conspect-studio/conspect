@@ -203,10 +203,18 @@ jobs:
             mkdir -p "dist/${STAGE}/licenses"
             cp -a "${FF_PREFIX}/share/licenses/ffmpeg" "dist/${STAGE}/licenses/ffmpeg"
             test -s "dist/${STAGE}/licenses/ffmpeg/COPYING.LGPLv3"
+            case "${SIGNING_ENABLED}" in
+              true | false) ;;
+              *) echo "::error::signing state unknown ('${SIGNING_ENABLED}')"; exit 1 ;;
+            esac
             IDENTITY="-"
             if [ "${SIGNING_ENABLED}" = "true" ]; then
-              # Exactly one Developer ID Application identity, by its hash.
-              mapfile -t ids < <(security find-identity -v -p codesigning | awk '/Developer ID Application/ {print $2}')
+              # Exactly one Developer ID Application identity, by its hash
+              # (bash 3.2 on the runner: no mapfile).
+              ids=()
+              while IFS= read -r id; do
+                [ -n "${id}" ] && ids+=("${id}")
+              done < <(security find-identity -v -p codesigning | awk '/Developer ID Application/ {print $2}')
               if [ "${#ids[@]}" -ne 1 ]; then
                 echo "::error::expected one Developer ID Application identity, found ${#ids[@]}"; exit 1
               fi
@@ -273,11 +281,17 @@ jobs:
             trap 'rm -rf "${WORK}"' EXIT
             ( umask 077; printf '%s' "${AC_API_KEY_P8}" > "${WORK}/AuthKey.p8" )
             /usr/bin/ditto -c -k --keepParent "dist/${STAGE}" "${WORK}/multiview.zip"
-            RESULT="$(xcrun notarytool submit "${WORK}/multiview.zip" \
+            if ! RESULT="$(xcrun notarytool submit "${WORK}/multiview.zip" \
               --key "${WORK}/AuthKey.p8" \
               --key-id "${AC_API_KEY_ID}" \
               --issuer "${AC_API_ISSUER_ID}" \
-              --wait --output-format json)" || true
+              --wait --timeout 30m --output-format json 2> "${WORK}/submit.err")"; then
+              if [ -z "${RESULT}" ]; then
+                echo "::error::notarytool submit failed before a submission existed:"
+                cat "${WORK}/submit.err"
+                exit 1
+              fi
+            fi
             json_field() { python3 -c 'import json,sys; d=json.loads(sys.stdin.read() or "{}"); print(d.get(sys.argv[1], ""))' "$1" 2>/dev/null || true; }
             STATUS="$(printf '%s' "${RESULT}" | json_field status)"
             SUBMISSION="$(printf '%s' "${RESULT}" | json_field id)"
@@ -300,7 +314,11 @@ jobs:
         run: |
           # import-codesign-certs creates signing_temp.keychain; delete it so the
           # certificate is not usable by any later step.
-          security delete-keychain signing_temp.keychain 2>/dev/null || true
+          # The action's own post step also removes it; this is the backstop.
+          if security list-keychains | grep -q signing_temp.keychain; then
+            security delete-keychain signing_temp.keychain \
+              || echo "::warning::could not delete signing_temp.keychain"
+          fi
 
       - name: Attest build provenance
         uses: actions/attest-build-provenance@v4.1.1 # v4 (4.1.0)
