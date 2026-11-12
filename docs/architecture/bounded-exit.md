@@ -71,6 +71,13 @@ restarting.
      `#EXT-X-ENDLIST`) and the ProgramSet shutdown. So 2 s is a 10× margin.
    - The sink wedge grace (`SINK_WEDGE_GRACE`, 2 s) still applies inside it: a wedged sink is
      detached or cut. That is the same outcome as before, but sooner.
+   - Each phase of the egress join (the consumer wait, then the sinks) waits
+     `min(SINK_WEDGE_GRACE, time left to the armed deadline)`. With a deadline armed, every
+     phase ends at that one instant: the join never waits past the bound, and a sink still
+     running then counts as wedged (outputs open). Without an armed deadline (offline renders,
+     library use) each phase keeps its full grace, as before.
+   - The bound is 2 s plus, at most, the 500 ms exit-path backstop (atexit handlers or a stdio
+     flush that block in the C runtime exit).
    - On a fatal, the bound starts at the fault, before the sinks begin to finalise (they see
      end-of-program when the failing consumer returns). So a sink gets the rest of the bound
      to finalise, not a fresh grace; the join never waits past the armed deadline. A sink

@@ -6174,9 +6174,11 @@ impl StreamEgress {
         // Do not let shutdown wait forever: systemd owns a fresh-process restart
         // after this bounded error, and the detached thread cannot poison a new
         // in-process encoder generation.
-        // #309: ONE budget for the whole join (consumer and sinks), never past an
-        // armed exit deadline, so the consumer cannot starve the sinks and the
-        // join never outlives the bound.
+        // #309: every phase of the join (this consumer wait, then the sinks) gets
+        // `join_budget()` = min(SINK_WEDGE_GRACE, time left to an armed exit
+        // deadline). With a deadline armed, every phase therefore ends at that
+        // same instant, so the join never outlives the bound; without one
+        // (offline/library runs) each phase keeps its full grace.
         let deadline = Instant::now() + join_budget();
         while !self.consumer.is_finished() && Instant::now() < deadline {
             std::thread::park_timeout(Duration::from_millis(10));
