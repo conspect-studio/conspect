@@ -44,6 +44,10 @@ struct RunningPersist {
     task: tokio::task::JoinHandle<()>,
     /// The served control-plane state (one set of stores with the router).
     state: multiview_control::AppState,
+    /// The network front door (ADR-0107) when `[network]` is configured; kept
+    /// for the run's lifetime and dropped at teardown (its runtime shuts down
+    /// in the background, never blocking this one).
+    _front_door: Option<multiview_cli::frontdoor::FrontDoorRun>,
 }
 
 impl RunningPersist {
@@ -432,7 +436,25 @@ struct ControlPlaneWiring {
 #[cfg(feature = "moq-output")]
 async fn start_moq_listener(
     factory: Option<Arc<dyn multiview_control::moq_provider::AuthorizedFeedFactory>>,
+    front_door: Option<&mut multiview_cli::frontdoor::FrontDoorRun>,
 ) -> anyhow::Result<Option<Arc<multiview_control::moq::MoqRegistry>>> {
+    if let Some(door) = front_door {
+        // ADR-0107 slice 1: MoQ rides the front-door socket's QUIC lane.
+        let Some(config) =
+            multiview_control::moq_startup::MoqListenerConfig::from_env_shared(door.local_addr())
+                .map_err(|_| anyhow::anyhow!("invalid explicit MoQ listener configuration"))?
+        else {
+            return Ok(None);
+        };
+        let socket = door
+            .take_moq_socket()
+            .ok_or_else(|| anyhow::anyhow!("front-door QUIC lane unavailable"))?;
+        return Ok(Some(
+            multiview_control::moq_startup::start_shared(config, factory, socket)
+                .await
+                .map_err(|_| anyhow::anyhow!("MoQ listener startup failed"))?,
+        ));
+    }
     match multiview_control::moq_startup::MoqListenerConfig::from_env()
         .map_err(|_| anyhow::anyhow!("invalid explicit MoQ listener configuration"))?
     {
@@ -555,8 +577,16 @@ async fn serve_control_plane(
     // output-serve were dead. The preview encode runs on its own pump thread that
     // touches only bounded `SampleFeed`s (never the socket — inv #10). `None` on a
     // pure build (the SPA sheds to JPEG; the WHIP/WHEP routes answer 503).
+    // The network front door (ADR-0107 slice 1): with `[network]`, ONE
+    // dual-stack UDP socket for MoQ and WebRTC, on its own runtime. Without it,
+    // both keep their legacy sockets unchanged.
+    #[allow(unused_mut)]
+    let mut front_door = multiview_cli::frontdoor::FrontDoorRun::start(config);
     #[cfg(feature = "webrtc-native")]
     let (whep, whip, whep_output) = {
+        let rtc_lane = front_door
+            .as_mut()
+            .and_then(|door| Some((door.take_rtc_lane()?, door.handle())));
         let unified = multiview_cli::webrtc_unified::spawn_unified_webrtc(
             config,
             Arc::clone(&program_slot),
@@ -567,6 +597,7 @@ async fn serve_control_plane(
             multiview_cli::source_demand::installed_control_demand(),
             #[cfg(feature = "moq-output")]
             wall_picture,
+            rtc_lane,
         );
         (unified.whep, unified.whip, unified.whep_output)
     };
@@ -594,7 +625,7 @@ async fn serve_control_plane(
     // revert-to-start/promote actions, and is the persister's target.
     let boot_model = Arc::new(start.to_boot_model(config_path));
     #[cfg(feature = "moq-output")]
-    let moq = start_moq_listener(moq_factory).await?;
+    let moq = start_moq_listener(moq_factory, front_door.as_mut()).await?;
     #[cfg(feature = "moq-output")]
     let bind_control = control::bind_and_serve_with_moq;
     #[cfg(not(feature = "moq-output"))]
@@ -640,6 +671,7 @@ async fn serve_control_plane(
             RUNNING_PERSIST_DEBOUNCE,
         ),
         state: state.clone(),
+        _front_door: front_door,
     };
     // Watch the boot config file for external edits (ADR-W020): a valid write
     // hot-reloads the impacted parts through the SAME router state + command

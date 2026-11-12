@@ -891,6 +891,44 @@ impl Drop for Runtime {
     }
 }
 
+/// A socket shared with other protocols (the front door's QUIC lane) and the
+/// runtime that owns it. The MoQ listener on it never runs on the caller's
+/// runtime.
+pub struct SharedSocket {
+    /// The QUIC lane of the shared socket.
+    pub socket: Box<dyn moq_tokio::noq::AsyncUdpSocket>,
+    /// The endpoint configuration (`grease_quic_bit(false)` etc.).
+    pub endpoint: moq_tokio::noq::EndpointConfig,
+    /// The front door's runtime: the noq driver, connections and accept loop
+    /// all run here.
+    pub runtime: tokio::runtime::Handle,
+    /// Told `(peer, true)` when an admitted session's QUIC handshake is complete
+    /// (its address is validated by the handshake round trip, RFC 9000 section
+    /// 8) and `(peer, false)` when that session ends. The front door uses it to
+    /// put the peer on its established path. Must not block.
+    pub peers: Option<PeerHook>,
+}
+
+/// See [`SharedSocket::peers`].
+pub type PeerHook = Arc<dyn Fn(std::net::SocketAddr, bool) + Send + Sync>;
+
+/// Reports the end of a validated session (also on abort/unwind).
+struct PeerGuard(Option<(PeerHook, std::net::SocketAddr)>);
+
+impl Drop for PeerGuard {
+    fn drop(&mut self) {
+        if let Some((hook, addr)) = self.0.take() {
+            hook(addr, false);
+        }
+    }
+}
+
+impl std::fmt::Debug for SharedSocket {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SharedSocket").finish_non_exhaustive()
+    }
+}
+
 impl Runtime {
     pub async fn listen_files(
         bind: std::net::SocketAddr,
@@ -901,8 +939,38 @@ impl Runtime {
     ) -> anyhow::Result<Arc<Self>> {
         Self::listen_files_after_open(bind, endpoint, protocol, cert, key, || {}).await
     }
+    /// [`listen_files`](Self::listen_files) on a socket the caller owns (the
+    /// shared front door, ADR-0107 slice 1): the listener binds nothing, uses
+    /// `on.socket` with `on.endpoint` (`grease_quic_bit(false)` and the rest),
+    /// and the noq driver plus the accept loop run on `on.runtime`, never the
+    /// caller's runtime.
+    ///
+    /// # Errors
+    ///
+    /// As for [`listen_files`](Self::listen_files).
+    pub async fn listen_files_on(
+        on: SharedSocket,
+        endpoint: String,
+        protocol: &str,
+        cert: std::path::PathBuf,
+        key: std::path::PathBuf,
+    ) -> anyhow::Result<Arc<Self>> {
+        let local = on.socket.local_addr()?;
+        Self::listen_files_inner(local, Some(on), endpoint, protocol, cert, key, || {}).await
+    }
     async fn listen_files_after_open(
         bind: std::net::SocketAddr,
+        endpoint: String,
+        protocol: &str,
+        cert: std::path::PathBuf,
+        key: std::path::PathBuf,
+        after_open: impl FnOnce(),
+    ) -> anyhow::Result<Arc<Self>> {
+        Self::listen_files_inner(bind, None, endpoint, protocol, cert, key, after_open).await
+    }
+    async fn listen_files_inner(
+        bind: std::net::SocketAddr,
+        shared: Option<SharedSocket>,
         endpoint: String,
         protocol: &str,
         cert: std::path::PathBuf,
@@ -950,12 +1018,15 @@ impl Runtime {
                 "/proc/self/fd/{}",
                 key_fd.as_raw_fd()
             ))];
-            Self::listen(config, endpoint, protocol).await
+            match shared {
+                Some(shared) => Self::listen_on(config, endpoint, protocol, Some(shared)).await,
+                None => Self::listen(config, endpoint, protocol).await,
+            }
         }
         #[cfg(not(target_os = "linux"))]
         {
             // No insecure pathname fallback on an unsupported secure-loader platform.
-            let _ = (cert, key, endpoint, protocol, after_open);
+            let _ = (cert, key, endpoint, protocol, after_open, shared);
             anyhow::bail!("secure MoQ certificate loader unavailable on this platform")
         }
     }
@@ -963,6 +1034,14 @@ impl Runtime {
         config: moq_tokio::listen::Config,
         base_url: String,
         protocol: &str,
+    ) -> anyhow::Result<Arc<Self>> {
+        Self::listen_on(config, base_url, protocol, None).await
+    }
+    async fn listen_on(
+        config: moq_tokio::listen::Config,
+        base_url: String,
+        protocol: &str,
+        shared: Option<SharedSocket>,
     ) -> anyhow::Result<Arc<Self>> {
         anyhow::ensure!(
             matches!(protocol, "moq-transport-16" | "moq-transport-18"),
@@ -976,7 +1055,30 @@ impl Runtime {
             config.version.len() == 1 && config.version[0].to_string() == protocol,
             "listener version mismatch"
         );
-        let mut listener = config.init(Default::default())?.listen().await?;
+        let (mut listener, spawn_on, peers) = match shared {
+            None => (
+                config.init(Default::default())?.listen().await?,
+                tokio::runtime::Handle::current(),
+                None,
+            ),
+            Some(shared) => {
+                let runtime = shared.runtime.clone();
+                let peers = shared.peers.clone();
+                let mut server = moq_tokio::server::Config::default();
+                server.listen = config;
+                server.socket = Some(moq_tokio::noq::Injected {
+                    socket: shared.socket,
+                    endpoint: shared.endpoint,
+                });
+                // Build the endpoint inside the front-door runtime: noq spawns
+                // its endpoint driver and every connection task on the runtime
+                // current at construction.
+                let listener = runtime
+                    .spawn(async move { server.init()?.listen().await })
+                    .await??;
+                (listener, runtime, peers)
+            }
+        };
         let runtime = Arc::new(Self {
             state: Arc::new(State {
                 entries: Mutex::new(HashMap::new()),
@@ -987,7 +1089,7 @@ impl Runtime {
             protocol: protocol.into(),
         });
         let state = runtime.state.clone();
-        tokio::spawn(async move {
+        spawn_on.spawn(async move {
             let mut sessions = tokio::task::JoinSet::new();
             let mut shutdown = state.shutdown.subscribe();
             loop {
@@ -1009,7 +1111,11 @@ impl Runtime {
                         });
                         let Some((origin, fence)) = admitted else { let _ = request.reject(moq_tokio::server::Reject::Unauthorized).await; continue };
                         if sessions.len() >= 16 { fence.revoke(); let _ = request.reject(moq_tokio::server::Reject::App(429)).await; continue }
+                        // The handshake is complete here, so the address is validated.
+                        let peer = peers.clone().zip(request.remote_addr());
+                        if let Some((hook, addr)) = &peer { hook(*addr, true) }
                         sessions.spawn(async move {
+                            let _peer = PeerGuard(peer);
                             let mut cancel = fence.cancel.subscribe();
                             let accepted = tokio::select! {
                                 value = request.with_publisher(origin).ok() => value.ok(),

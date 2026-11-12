@@ -45,6 +45,7 @@ pub mod limits;
 pub mod media;
 pub mod media_fill;
 pub mod multicast;
+pub mod network;
 pub mod network_diagnostics;
 pub mod origin;
 pub mod placement;
@@ -107,6 +108,7 @@ pub use multicast::{
     classify, MulticastClass, MulticastGroup, MulticastIface, PacketCount, RejectReason,
     RejectedGroup,
 };
+pub use network::NetworkConfig;
 pub use network_diagnostics::NetworkDiagnosticsConfig;
 pub use origin::{Origin, OriginParseError};
 pub use placement::{DevicePin, MigrationPolicy, PinVendor, PlacementConfig, PlacementWeights};
@@ -468,6 +470,12 @@ pub struct MultiviewConfig {
     /// serialize.
     #[serde(default, skip_serializing_if = "WebrtcConfig::is_default")]
     pub webrtc: WebrtcConfig,
+    /// `[network]`: the single network front door (ADR-0107). Absent keeps the
+    /// legacy listeners (WebRTC on `webrtc.udp_port`, `MoQ` on
+    /// `MULTIVIEW_MOQ_BIND`); present, one dual-stack UDP socket on
+    /// `network.https_port` carries both.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub network: Option<NetworkConfig>,
     /// The GPU work-placement policy (ADR-0018). Absent ⇒ the engine uses its
     /// conservative built-in defaults (single-GPU hosts add zero behaviour).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1207,7 +1215,11 @@ impl MultiviewConfig {
     /// addresses / CORS origins that are structurally usable. The defaulted
     /// (absent) section always validates.
     fn validate_webrtc(&self) -> Result<(), ConfigError> {
-        self.webrtc.validate()
+        self.webrtc.validate()?;
+        if let Some(network) = &self.network {
+            network.validate()?;
+        }
+        Ok(())
     }
 
     /// Validate the optional `[system.ndi]` license-acceptance gate (ADR-0008
