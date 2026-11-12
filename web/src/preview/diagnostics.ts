@@ -22,6 +22,7 @@ export function safeStats(report?: RTCStatsReport) {
   const candidates: { type: string; protocol: string }[] = [];
   const rows: Record<string, unknown>[] = [];
   report?.forEach((stat: RTCStats) => rows.push({ ...stat }));
+  const selectedPair = selectedCandidatePair(rows);
   for (const row of rows) {
     if (row.type === 'transport') dtls = choice(row.dtlsState, ['new', 'connecting', 'connected', 'closed', 'failed']);
     if (row.type === 'local-candidate' || row.type === 'remote-candidate') {
@@ -42,9 +43,44 @@ export function safeStats(report?: RTCStatsReport) {
       codecProfile = /(?:^|;)\s*profile-level-id=([0-9a-fA-F]{6})\s*(?:;|$)/.exec(codec.sdpFmtpLine)?.[1] ?? 'unknown';
     }
   }
-  return { bytesReceived, framesDecoded, width, height, codecMime, codecProfile, dtls, candidates };
+  return { bytesReceived, framesDecoded, width, height, codecMime, codecProfile, dtls, candidates, selectedPair };
 }
 export type SafeStats = ReturnType<typeof safeStats>;
+
+/** The selected ICE pair as enums only: which transport actually carries the media. */
+export interface SelectedPair {
+  /** `udp` or `tcp` (the local candidate's protocol; both ends agree for a host/prflx pair). */
+  readonly protocol: string;
+  readonly local: string;
+  readonly remote: string;
+}
+
+/**
+ * The pair the transport selected (`transport.selectedCandidatePairId`, the spec
+ * field), else the nominated succeeded pair (Firefox reports no selected id).
+ * `null` until a pair is selected. Never copies addresses or ports.
+ */
+function selectedCandidatePair(rows: readonly Record<string, unknown>[]): SelectedPair | null {
+  const byId = (id: unknown): Record<string, unknown> | undefined =>
+    typeof id === 'string' ? rows.find((row) => row.id === id) : undefined;
+  const transport = rows.find((row) => row.type === 'transport' && typeof row.selectedCandidatePairId === 'string');
+  const pair = byId(transport?.selectedCandidatePairId)
+    ?? rows.find((row) => row.type === 'candidate-pair' && (row.selected === true || (row.nominated === true && row.state === 'succeeded')));
+  if (pair === undefined) return null;
+  const local = byId(pair.localCandidateId);
+  const remote = byId(pair.remoteCandidateId);
+  if (local === undefined || remote === undefined) return null;
+  return {
+    protocol: choice(local.protocol, ['udp', 'tcp']),
+    local: choice(local.candidateType, ['host', 'srflx', 'prflx', 'relay']),
+    remote: choice(remote.candidateType, ['host', 'srflx', 'prflx', 'relay']),
+  };
+}
+
+/** `tcp/host-host`-style label for a probe (`data-ice-pair`), or `none` before selection. */
+export function pairLabel(pair: SelectedPair | null): string {
+  return pair === null ? 'none' : `${pair.protocol}/${pair.local}-${pair.remote}`;
+}
 export type FailureStage = 'http-capacity' | 'http-error' | 'signaling' | 'ice-timeout' | 'connection-timeout' | 'ice-failed' | 'peer-failed' | 'dtls-failed' | 'video-no-rtp' | 'video-no-decode' | 'video-stalled' | 'media-unknown' | 'media-play-error';
 export interface PreviewDiagnostics {
   stage: FailureStage;

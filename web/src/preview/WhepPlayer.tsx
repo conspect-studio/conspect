@@ -21,7 +21,7 @@ import type { JSX } from 'react';
 import { useLingui } from '@lingui/react/macro';
 import { Volume2, VolumeX } from 'lucide-react';
 
-import { safeStats, safeStates, failureStage } from './diagnostics';
+import { safeStats, safeStates, failureStage, pairLabel } from './diagnostics';
 import type { FailureStage, PreviewDiagnostics } from './diagnostics';
 
 import { Button } from '../components/ui/button';
@@ -123,6 +123,9 @@ export function WhepPlayer({
   const videoRef = useRef<HTMLVideoElement>(null);
   const [muted, setMuted] = useState(true);
   const [status, setStatus] = useState<WhepPlayerStatus>('connecting');
+  // The selected ICE pair (`udp/host-host`, `tcp/host-host`, ...): lets a probe
+  // prove which transport carries the picture, e.g. WebRTC over TCP 443.
+  const [icePair, setIcePair] = useState('none');
 
   // Keep the latest callbacks in refs so the effect can stay mounted-once
   // without re-running when a parent re-renders with new closures. Synced in an
@@ -221,6 +224,7 @@ export function WhepPlayer({
       void pc.getStats().then((report) => {
         if (aborted() || failed || epoch !== statsEpoch) return;
         media = safeStats(report);
+        setIcePair(pairLabel(media.selectedPair));
         if (media.dtls === 'failed') { fail('dtls-failed'); return; }
         if (connectedAt !== undefined) checkProgress();
       }).catch(() => undefined).finally(() => { statsPending = false; });
@@ -358,7 +362,7 @@ export function WhepPlayer({
   }, [endpoint]);
 
   return (
-    <div className={`relative ${className ?? ''}`} data-testid="whep-player" data-status={status}>
+    <div className={`relative ${className ?? ''}`} data-testid="whep-player" data-status={status} data-ice-pair={icePair}>
       {/* eslint-disable-next-line jsx-a11y/media-has-caption -- live preview has no caption track */}
       <video
         ref={videoRef}
