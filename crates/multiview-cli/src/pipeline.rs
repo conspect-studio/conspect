@@ -4970,11 +4970,25 @@ impl Pipeline {
         }
         .map_err(|e| PipelineError::Engine(e.to_string()));
 
+        // #309: every teardown stage is timed from the moment the clock returned,
+        // so a slow exit names its stage in the log.
+        let teardown_start = Instant::now();
+        let stage = |name: &str| {
+            tracing::info!(
+                stage = name,
+                elapsed_ms =
+                    u64::try_from(teardown_start.elapsed().as_millis()).unwrap_or(u64::MAX),
+                "teardown stage done"
+            );
+        };
+        stage("clock-returned");
         // The clock has stopped (bounded budget reached, or `stop` raised): tear
         // ingest down deterministically (signal + join), then close the egress and
         // finalise. The hot queue is already closed by this point — see below.
         demand.stop_all();
+        stage("demand-stop-all");
         supervisor.shutdown();
+        stage("ingest-supervisor");
         // Invalidate every startup producer, including any libav worker detached
         // after the bounded join. No old run may write into a later run's slot.
         for (id, lifecycle) in startup_lifecycles {
@@ -4988,6 +5002,7 @@ impl Pipeline {
         // Dropping the program here only releases the engine's own resources
         // (its wrapped `EngineRuntime` = clock + drive + time source + pacer).
         drop(program);
+        stage("program-dropped");
 
         // Join the bake consumer + sink threads FIRST — folding their outcome and
         // writing the trailers (the sinks' own `run()` finalisation) — BEFORE
@@ -4996,6 +5011,7 @@ impl Pipeline {
         // unwritten. The engine error (the root cause) is surfaced first; an
         // egress/sink error second.
         let egress_result = egress.join();
+        stage("egress-joined");
         let outcome = outcome?;
         let egress_out = egress_result?;
 
@@ -5944,6 +5960,12 @@ impl StreamEgress {
         }
 
         let (hot_tx, hot_rx) = std::sync::mpsc::sync_channel::<StreamItem>(policy.queue_cap());
+        // #309: only a live (realtime, drop-on-overload) run with no test seam
+        // arms the process exit deadline on a fatal (and only when the binary
+        // enabled it); an offline render and the test seams never do.
+        let arm_exit_on_fatal = matches!(policy, SendPolicy::DropOnOverload)
+            && consumer_fault_after_ticks.is_none()
+            && shed_at_tick.is_none();
         let consumer_in_flight = Arc::clone(&in_flight);
         let fatal = Arc::new(AtomicBool::new(false));
         let consumer_fatal = Arc::clone(&fatal);
@@ -6051,6 +6073,14 @@ impl StreamEgress {
                 if let Err(error) = &result {
                     tracing::error!(error = %error, "fatal encoded-output consumer failure");
                     consumer_fatal.store(true, Ordering::Release);
+                    // #309: from this decision the process is gone within
+                    // EXIT_DEADLINE, however long teardown would take.
+                    if arm_exit_on_fatal {
+                        crate::exit_watchdog::arm(
+                            crate::exit_watchdog::ExitCause::Fatal,
+                            "a fatal encoded-output consumer failure",
+                        );
+                    }
                 }
                 result
             })
@@ -7107,9 +7137,13 @@ fn consumer_main<D: WindowDelivery>(
     let mut last_audio_tick = None;
     // `recv()` returns `Err` only when the hot sender drops = end-of-program
     // (clean stop / EOF), which ends the loop.
+    #[cfg(feature = "_chaos-test-seams")]
+    let mut chaos_stall = chaos::ConsumerStall::from_env();
     while let Ok(item) = hot_rx.recv() {
         // One frame left the queue.
         in_flight.fetch_sub(1, Ordering::AcqRel);
+        #[cfg(feature = "_chaos-test-seams")]
+        chaos_stall.maybe_stall(item.tick_index);
         // Admit the previously encoded tick's complete packet set (its video,
         // program audio and every discrete track) as ONE atomic transaction per
         // binding. Never waits: a full or stale binding loses that whole window
@@ -8985,6 +9019,8 @@ impl IngestSupervisor {
     /// the produced output nor stall the caller. This keeps the output-clock
     /// guarantee (invariant #1) intact end-to-end, including teardown.
     fn join_all(&mut self) {
+        #[cfg(feature = "_chaos-test-seams")]
+        chaos::slow_teardown();
         for (stop, _) in &self.producers {
             stop.store(true, Ordering::Release);
         }
@@ -24984,5 +25020,61 @@ mod device_open_tests {
             }),
             Err("denied".to_owned())
         );
+    }
+}
+
+/// Chaos seams for issue #309 (never in a release build: the
+/// `_chaos-test-seams` feature matches the release-feature guard's
+/// `*test-seam*` rule).
+#[cfg(feature = "_chaos-test-seams")]
+mod chaos {
+    /// Stall the bake consumer ONCE, for `MULTIVIEW_CHAOS_CONSUMER_STALL_MS`
+    /// milliseconds, at tick `MULTIVIEW_CHAOS_CONSUMER_STALL_AT` (default 150):
+    /// the output then falls behind the clock exactly like a slow encode.
+    pub(super) struct ConsumerStall {
+        at: u64,
+        stall: Option<std::time::Duration>,
+    }
+
+    /// Hold source teardown for `MULTIVIEW_CHAOS_SLOW_TEARDOWN_MS`
+    /// milliseconds: the stand-in for producers blocked in libav network
+    /// reads, which used their full grace in production (#309).
+    pub(super) fn slow_teardown() {
+        if let Some(ms) = std::env::var("MULTIVIEW_CHAOS_SLOW_TEARDOWN_MS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+        {
+            tracing::warn!(ms, "chaos: holding source teardown");
+            std::thread::sleep(std::time::Duration::from_millis(ms));
+        }
+    }
+
+    impl ConsumerStall {
+        pub(super) fn from_env() -> Self {
+            let ms = std::env::var("MULTIVIEW_CHAOS_CONSUMER_STALL_MS")
+                .ok()
+                .and_then(|v| v.parse::<u64>().ok());
+            let at = std::env::var("MULTIVIEW_CHAOS_CONSUMER_STALL_AT")
+                .ok()
+                .and_then(|v| v.parse::<u64>().ok())
+                .unwrap_or(150);
+            Self {
+                at,
+                stall: ms.map(std::time::Duration::from_millis),
+            }
+        }
+
+        pub(super) fn maybe_stall(&mut self, tick: u64) {
+            if tick >= self.at {
+                if let Some(d) = self.stall.take() {
+                    tracing::warn!(
+                        tick,
+                        stall_ms = d.as_millis(),
+                        "chaos: stalling the bake consumer"
+                    );
+                    std::thread::sleep(d);
+                }
+            }
+        }
     }
 }

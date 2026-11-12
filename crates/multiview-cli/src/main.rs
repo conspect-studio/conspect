@@ -131,12 +131,24 @@ async fn main() -> ExitCode {
     }
 
     let cli = Cli::parse();
+    // #309: this binary may be ended by the exit watchdog once an exit is
+    // decided (a fatal output fault, a stop signal, a failed run).
+    multiview_cli::exit_watchdog::enable();
     // Boxed: `dispatch` holds a whole `Pipeline` across awaits (clippy::large_futures).
     match Box::pin(dispatch(cli)).await {
         Ok(code) => code,
         Err(err) => {
+            // #309: a failed run must not wait unboundedly in the runtime drop.
+            multiview_cli::exit_watchdog::arm(
+                multiview_cli::exit_watchdog::ExitCause::Fatal,
+                "a failed command",
+            );
             tracing::error!(error = %format!("{err:#}"), "command failed");
             eprintln!("multiview: error: {err:#}");
+            // #309: the Tokio runtime is dropped after this returns; anything
+            // still running on it is waited for there. Logged so the gap to the
+            // process exit is measurable.
+            tracing::info!("main returning; runtime shutdown next");
             ExitCode::FAILURE
         }
     }
@@ -973,6 +985,10 @@ async fn run_pipeline_until_ctrl_c(
             signal = which,
             "stop signal received; stopping after the current frame"
         );
+        multiview_cli::exit_watchdog::arm(
+            multiview_cli::exit_watchdog::ExitCause::Stop,
+            "a stop signal",
+        );
         stop_for_signal.stop();
     });
 
@@ -1083,6 +1099,7 @@ async fn run_pipeline_until_ctrl_c(
     let report =
         drive_main_program_in_set(pipeline, cadence, &stop, &publisher, &preview_slot, drain)
             .await?;
+    let tenants_start = std::time::Instant::now();
 
     // The run is over: release this generation's preview demand explicitly
     // (the sweeper has stopped on the same signal, so nothing can re-adopt a
@@ -1106,6 +1123,11 @@ async fn run_pipeline_until_ctrl_c(
         signal,
     })
     .await;
+    tracing::info!(
+        stage = "run-tenants",
+        elapsed_ms = u64::try_from(tenants_start.elapsed().as_millis()).unwrap_or(u64::MAX),
+        "teardown stage done"
+    );
     // Ask the journal thread to persist pending repeat counters. Not joined, so
     // a counter still queued at process exit can be lost; its record is not.
     multiview_cli::event_journal::flush();
@@ -1191,7 +1213,13 @@ async fn drive_main_program_in_set(
     // that first, THEN `shutdown` (raise any still-running program's stop — a no-op
     // here — and join every supervised task so no task is left detached).
     let recovered = report_rx.await;
+    let shutdown_start = std::time::Instant::now();
     programs.shutdown().await;
+    tracing::info!(
+        stage = "programset-shutdown",
+        elapsed_ms = u64::try_from(shutdown_start.elapsed().as_millis()).unwrap_or(u64::MAX),
+        "teardown stage done"
+    );
     match recovered {
         Ok(Ok(report)) => Ok(report),
         Ok(Err(reason)) => Err(anyhow::anyhow!(reason)).context("pipeline run until Ctrl-C"),
@@ -1368,6 +1396,10 @@ async fn run_software_until_ctrl_c(
         tracing::info!(
             signal = which,
             "stop signal received; stopping after the current frame"
+        );
+        multiview_cli::exit_watchdog::arm(
+            multiview_cli::exit_watchdog::ExitCause::Stop,
+            "a stop signal",
         );
         stop_for_signal.stop();
     });

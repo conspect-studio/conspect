@@ -280,6 +280,8 @@ pub mod player;
 
 #[cfg(feature = "ffmpeg")]
 mod binding_delivery;
+/// Bounded process exit after a fatal fault or a stop signal (#309).
+pub mod exit_watchdog;
 /// Existing encoded output conversion and authorized MoQ family adapter.
 #[cfg(feature = "moq-output")]
 pub mod moq_outputs;
