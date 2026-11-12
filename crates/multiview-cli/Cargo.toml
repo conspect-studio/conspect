@@ -178,6 +178,9 @@ tokio = { workspace = true, features = [
     "io-util",
 ] }
 tempfile = "3"
+# Test-only certificates for `tests/tls_cli.rs` (offline status reads a stored
+# bundle; the dead-CA boot test needs a trust anchor). Already in the lock.
+rcgen = "0.14"
 # Test-only crypto for the device-ACTIVATE never-off-air chaos gate (ADR-I008): an
 # ECDSA-P256 root signs a fabricated attested keyset (so the chaos server's
 # `fetch_keys` passes `TrustedKeys::verify` and `activate_once` actually REACHES the
