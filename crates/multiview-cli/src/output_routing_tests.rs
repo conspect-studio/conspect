@@ -312,9 +312,11 @@ fn unroutable_and_unfresh_takes_are_refused_and_the_mailbox_bounds_floods() {
 }
 
 /// Records each delivered window: (output, [(pts, keyframe-with-params)]).
+/// Audio packets are recorded apart, per output (routed-audio tests).
 #[derive(Default)]
 struct Rec {
     windows: Vec<(usize, Vec<(i64, bool)>)>,
+    audio: Vec<(usize, EncodedPacket)>,
 }
 impl WindowDelivery for Rec {
     fn offer_window(
@@ -327,8 +329,15 @@ impl WindowDelivery for Rec {
     ) -> Result<(), multiview_output::batch::EmissionError> {
         let v = p
             .iter()
+            .filter(|p| p.kind() == multiview_ffmpeg::StreamKind::Video)
             .map(|p| (p.pts().unwrap_or(-1), p.is_keyframe() && p.len() == 77))
             .collect();
+        for a in p
+            .iter()
+            .filter(|p| p.kind() == multiview_ffmpeg::StreamKind::Audio)
+        {
+            self.audio.push((o, a.clone_shared_ref().unwrap()));
+        }
         self.windows.push((o, v));
         Ok(())
     }
@@ -1892,4 +1901,898 @@ fn the_plan_counts_a_lingering_encoder_as_plus_zero() {
         adapter.plan("b", &cam).unwrap().needs_encoder,
         "after the linger closed: +1"
     );
+}
+
+// ---------------------------------------------------------------------------
+// ADR-0108 slice 2: explicit per-output audio (router + real AAC encoders).
+// ---------------------------------------------------------------------------
+
+use multiview_audio::cadence::SampleClock;
+use multiview_audio::crossfade::{grid_ceil, TakeCrossfade, AAC_FRAME_SAMPLES};
+use multiview_audio::format::{AudioBlock, AudioFormat};
+use std::sync::atomic::AtomicU32;
+
+const NTSC: Rational = Rational::new(30_000, 1_001);
+
+/// The program mix: a stationary 440 Hz tone at 0.3.
+fn prog(n: u64) -> f32 {
+    let t = f32::from(u16::try_from(n % 48_000).unwrap()) / 48_000.0;
+    0.3 * (std::f32::consts::TAU * 440.0 * t).sin()
+}
+
+/// The `bars` source: a stationary 1 kHz tone at 0.5.
+fn bars(n: u64) -> f32 {
+    let t = f32::from(u16::try_from(n % 48_000).unwrap()) / 48_000.0;
+    0.5 * (std::f32::consts::TAU * 1_000.0 * t).sin()
+}
+
+fn audio_only(op: &str, output: usize, choice: AudioChoice) -> OutputTake {
+    OutputTake {
+        operation_id: op.to_owned(),
+        output_index: output,
+        bus: None,
+        audio: Some(choice),
+        principal: "p".to_owned(),
+    }
+}
+
+fn bars_src() -> AudioChoice {
+    AudioChoice::Source("bars".to_owned())
+}
+
+/// A router with program audio over a real dispatcher: a real program AAC
+/// encoder feeds the shared stage, real private buses feed theirs.
+struct AudioHarness {
+    r: OutputRouter,
+    h: OutputRoutingHandle,
+    d: RenditionDispatcher,
+    rec: Rec,
+    outcomes: Receiver<TakeOutcome>,
+    program: multiview_output::AudioRenditionEncoder,
+    tb: Rational,
+    clock: SampleClock,
+    cadence: Rational,
+    gain: Arc<AtomicU32>,
+    bars_live: bool,
+    feed_max: std::time::Duration,
+    store: Arc<TileStore<Nv12Image>>,
+    base_force: Arc<AtomicU64>,
+    tap: crate::routing_audio::AudioTapCell,
+    others: Vec<TakeOutcome>,
+}
+
+fn audio_harness(outputs: usize, cadence: Rational, open: OpenFn) -> AudioHarness {
+    let config = multiview_output::AudioEncodeConfig::aac(48_000, 2, 128_000);
+    let program = multiview_output::AudioRenditionEncoder::new(&config).unwrap();
+    let tb = program.time_base();
+    let store = Arc::new(TileStore::<Nv12Image>::with_defaults("cam"));
+    let lookup = Arc::clone(&store);
+    let base_force = Arc::new(AtomicU64::new(NO_FORCE));
+    let (mut r, h) = OutputRouter::new(
+        RouterConfig {
+            cadence,
+            gop: 5,
+            base_keys: vec![0; outputs],
+            base_force: vec![Arc::clone(&base_force)],
+            max_encoders: 6,
+            max_per_principal: DEFAULT_MAX_PER_PRINCIPAL,
+            has_preview: false,
+        },
+        AuxWiring {
+            feeds: Arc::new(SwapCell::from_pointee(Vec::new())),
+            active: Arc::new(AtomicBool::new(false)),
+            failed: Arc::new(AtomicBool::new(false)),
+            dropped: Arc::new(AtomicU64::new(0)),
+            sent: Arc::new(AtomicU64::new(0)),
+            stores: Arc::new(move |id: &str| (id == "cam").then(|| Arc::clone(&lookup))),
+            preview_selection: None,
+        },
+        open,
+    )
+    .unwrap();
+    let gain = Arc::new(AtomicU32::new(1.0_f32.to_bits()));
+    let g = Arc::clone(&gain);
+    r.enable_audio(
+        config,
+        program.codec_params().codec_config_bytes(),
+        Arc::new(move |id: &str| {
+            if id == "bars" {
+                f32::from_bits(g.load(Ordering::Acquire))
+            } else {
+                1.0
+            }
+        }),
+    );
+    let d = RenditionDispatcher::new(DispatchConfig {
+        video_count: 1,
+        audio_count: 1,
+        video_time_base: vec![DtsTimeBase {
+            num: cadence.den,
+            den: cadence.num,
+        }],
+        audio_time_base: vec![DtsTimeBase {
+            num: tb.num,
+            den: tb.den,
+        }],
+        bindings: (0..outputs)
+            .map(|i| BindingConfig {
+                output_index: i,
+                video_key: Some(0),
+                audio_tracks: vec![0],
+                inband_parameter_changes_ok: true,
+            })
+            .collect(),
+        first_tick: 0,
+        cadence,
+        video_move_gates: vec![Some(Box::new(|p: &EncodedPacket| p.is_keyframe()))],
+    })
+    .unwrap();
+    let outcomes = h.outcomes().unwrap();
+    let tap = Arc::clone(&h.audio_tap);
+    AudioHarness {
+        r,
+        h,
+        d,
+        rec: Rec::default(),
+        outcomes,
+        program,
+        tb,
+        clock: SampleClock::new(48_000, cadence),
+        cadence,
+        gain,
+        bars_live: true,
+        feed_max: std::time::Duration::ZERO,
+        store,
+        base_force,
+        tap,
+        others: Vec::new(),
+    }
+}
+
+impl AudioHarness {
+    fn boundary_ns(&self, tick: u64) -> i128 {
+        i128::from(tick) * i128::from(self.cadence.den) * 1_000_000_000
+            / i128::from(self.cadence.num)
+    }
+
+    fn media(&self, tick: u64) -> MediaTime {
+        MediaTime::from_nanos(i64::try_from(self.boundary_ns(tick)).unwrap())
+    }
+
+    fn block(&self, tick: u64, f: fn(u64) -> f32) -> AudioBlock {
+        let (a, b) = (self.clock.total_at(tick), self.clock.total_at(tick + 1));
+        AudioBlock::from_interleaved(
+            AudioFormat::new(48_000, multiview_audio::ChannelLayout::Stereo),
+            (a..b).flat_map(|n| [f(n), f(n)]).collect(),
+        )
+        .unwrap()
+    }
+
+    /// One Program tick in the pipeline's order.
+    fn tick(&mut self, t: u64) {
+        self.r
+            .drain_live_events(&mut self.d, &mut self.rec)
+            .unwrap();
+        if let Some(prev) = t.checked_sub(1) {
+            let forced = take_force(&self.base_force, prev);
+            self.d
+                .dispatch(
+                    DispatchEvent::Video {
+                        key_index: 0,
+                        tick: prev,
+                        timebase: Rational::new(self.cadence.den, self.cadence.num),
+                        packets: vec![pkt(prev, forced || prev % 5 == 0)],
+                        watermark: Some(crate::rendition_workers::DtsWatermark {
+                            complete_before_ns: self.boundary_ns(prev + 1),
+                        }),
+                    },
+                    Instant::now(),
+                    &mut self.rec,
+                )
+                .unwrap();
+        }
+        let frame = Nv12Image::solid(16, 16, 16, 128, 128, CanvasColor::default().output_tag());
+        self.store.publish(frame.unwrap(), self.media(t));
+        if let Some(slot) = self.r.slot(&src()) {
+            slot.latest
+                .store(Some(Arc::new(crate::routing_aux::AuxFrame {
+                    tick: t,
+                    generation: 1,
+                    frame: canvas(),
+                })));
+        }
+        self.r
+            .on_tick(t, self.media(t), &mut self.d, &mut self.rec)
+            .unwrap();
+        let program = self.block(t, prog);
+        let tone = self.block(t, bars);
+        let inputs: Vec<(&str, &AudioBlock)> = if self.bars_live {
+            vec![("bars", &tone)]
+        } else {
+            Vec::new()
+        };
+        let started = Instant::now();
+        self.r.feed_audio(t, &program, &inputs, &mut self.d);
+        self.feed_max = self.feed_max.max(started.elapsed());
+        self.r.tap_program_audio(t, &program);
+        let packets = self
+            .program
+            .encode_interleaved(program.interleaved(), program.frame_count())
+            .unwrap();
+        let wm = packets.last().and_then(|p| {
+            crate::rendition_workers::next_frame_lower_bound_ns(p.pts()?, 1024, 48_000)
+        });
+        self.d
+            .dispatch(
+                DispatchEvent::Audio {
+                    tick: t,
+                    timebases: vec![self.tb],
+                    packets,
+                    watermarks: vec![wm],
+                },
+                Instant::now(),
+                &mut self.rec,
+            )
+            .unwrap();
+        // The private encode threads run within the tick period.
+        std::thread::sleep(std::time::Duration::from_millis(3));
+    }
+
+    /// Tick from `from` until the outcome of `op` arrives (other outcomes
+    /// are kept in `others`); returns it and the next tick.
+    fn until(&mut self, from: u64, op: &str, max: u64) -> (TakeOutcome, u64) {
+        for t in from..from + max {
+            self.tick(t);
+            for o in self.outcomes.try_iter().collect::<Vec<_>>() {
+                if o.operation_id == op {
+                    return (o, t + 1);
+                }
+                self.others.push(o);
+            }
+        }
+        panic!("no outcome for {op} within {max} ticks");
+    }
+
+    fn run(&mut self, from: u64, n: u64) -> u64 {
+        for t in from..from + n {
+            self.tick(t);
+        }
+        from + n
+    }
+
+    fn audio_pts(&self, o: usize) -> Vec<i64> {
+        self.rec
+            .audio
+            .iter()
+            .filter(|(i, _)| *i == o)
+            .map(|(_, p)| p.pts().unwrap())
+            .collect()
+    }
+
+    fn audio_packets(&self, o: usize) -> Vec<&EncodedPacket> {
+        self.rec
+            .audio
+            .iter()
+            .filter(|(i, _)| *i == o)
+            .map(|(_, p)| p)
+            .collect()
+    }
+
+    /// Output `o`'s private-bus PCM (left channel) by absolute sample, from
+    /// the tap; asserts the fed blocks are contiguous.
+    fn private_left(&self, o: usize) -> std::collections::BTreeMap<u64, f32> {
+        let tap = self.tap.lock().unwrap();
+        let mut out = std::collections::BTreeMap::new();
+        let mut next: Option<u64> = None;
+        for (output, start, pcm) in &tap.private {
+            if *output != o {
+                continue;
+            }
+            if let Some(n) = next {
+                // A new bus may start later (after a close), never overlap.
+                assert!(*start >= n, "private PCM overlaps at {start} (< {n})");
+            }
+            for (i, v) in pcm.chunks(2).enumerate() {
+                out.insert(start + u64::try_from(i).unwrap(), v[0]);
+            }
+            next = Some(start + u64::try_from(pcm.len() / 2).unwrap());
+        }
+        out
+    }
+}
+
+/// Every audio packet one AAC frame after the previous one (1024 samples =
+/// 1920 units of the 90 kHz MPEG-TS clock), none missing or duplicated.
+fn assert_pts_step(pts: &[i64], what: &str) {
+    assert!(pts.len() > 4, "{what}: too few audio packets");
+    for pair in pts.windows(2) {
+        assert_eq!(pair[1] - pair[0], 1024, "{what}: audio PTS step");
+        assert_eq!(
+            (pair[1] - pair[0]) * 90_000 / 48_000,
+            1920,
+            "{what}: 90 kHz step"
+        );
+    }
+}
+
+/// A take to `bars` on output 1, then back to Program; returns the drain
+/// ticks of both takes and the next tick.
+fn tone_and_back(x: &mut AudioHarness) -> (u64, u64, u64) {
+    let t = x.run(0, 12);
+    x.h.try_take(audio_only("to-bars", 1, bars_src())).unwrap();
+    let (o, t2) = x.until(t, "to-bars", 60);
+    assert_eq!(o.outcome, TakeResult::Applied, "{o:?}");
+    assert_eq!(o.audio, Some(bars_src()));
+    let t3 = x.run(t2, 15);
+    x.h.try_take(audio_only("to-program", 1, AudioChoice::Program))
+        .unwrap();
+    let (o, t4) = x.until(t3, "to-program", 60);
+    assert_eq!(o.outcome, TakeResult::Applied, "{o:?}");
+    // Long enough for the return to the shared stream and its close.
+    let end = x.run(t4, 20);
+    (t, t3, end)
+}
+
+/// Spec G2: the PCM fed to the private bus across a tone -> program fade is
+/// continuous, the fade lasts exactly one tick of samples from G, no sample
+/// exceeds either side's peak, and the encoded stream keeps one frame per
+/// 1024 samples.
+#[test]
+fn an_audio_only_crossfade_is_sample_continuous_and_one_tick_long() {
+    let mut x = audio_harness(2, NTSC, Box::new(|_| Err("no video".to_owned())));
+    let (_, back_tick, _) = tone_and_back(&mut x);
+    let fades: Vec<(u64, u64)> = x
+        .tap
+        .lock()
+        .unwrap()
+        .fades
+        .iter()
+        .filter(|f| f.0 == 1)
+        .map(|f| (f.1, f.2))
+        .collect();
+    assert_eq!(fades.len(), 2, "one fade per take: {fades:?}");
+    let (g, len) = fades[1];
+    assert_eq!(
+        g,
+        grid_ceil(x.clock.total_at(back_tick), AAC_FRAME_SAMPLES),
+        "G = first grid boundary at or after total_at(T)"
+    );
+    assert_eq!(
+        len,
+        x.clock.total_at(back_tick + 1) - x.clock.total_at(back_tick),
+        "fade length = total_at(T+1) - total_at(T)"
+    );
+    let pcm = x.private_left(1);
+    let step = |a: u64, b: u64| -> f32 {
+        (a..b)
+            .map(|n| (pcm[&(n + 1)] - pcm[&n]).abs())
+            .fold(0.0, f32::max)
+    };
+    // Steady signals on either side of the fade.
+    let s_old = step(g - 3000, g - 1);
+    let s_new = step(g + len, g + len + 3000);
+    assert!(s_old > 0.06 && s_new > 0.01, "steady steps {s_old} {s_new}");
+    for n in g - 3000..g {
+        assert!((pcm[&n] - bars(n)).abs() < 1e-6, "tone before G at {n}");
+    }
+    for n in g + len..g + len + 3000 {
+        assert!(
+            (pcm[&n] - prog(n)).abs() < 1e-6,
+            "program after the fade at {n}"
+        );
+    }
+    // Across the fade: an equal-power pair o·cosθ + n·sinθ moves by at most
+    // hypot(o', n') plus the envelope's own slope (π/2 per fade length).
+    let fade_step = step(g - 1, g + len + 1);
+    let bound = s_old.hypot(s_new) + (0.5 + 0.3) * std::f32::consts::FRAC_PI_2 / (len as f32);
+    assert!(
+        fade_step <= bound,
+        "largest step across the fade {fade_step} > bound {bound} (steady {s_old}, {s_new})"
+    );
+    let xf = TakeCrossfade { start: g, len };
+    for n in g..g + len {
+        let peak = bars(n).abs().max(prog(n).abs());
+        assert!(pcm[&n].abs() <= peak + 1e-6, "sample {n} above both peaks");
+        let (go, gn) = xf.gains(n);
+        let want = (bars(n) * go + prog(n) * gn).clamp(-peak, peak);
+        assert!((pcm[&n] - want).abs() < 1e-5, "envelope at {n}");
+    }
+    // The encoded streams: one frame per 1024 samples, the same frames.
+    assert_pts_step(&x.audio_pts(1), "output 1");
+    assert_pts_step(&x.audio_pts(0), "output 0");
+    let (p0, p1) = (x.audio_pts(0), x.audio_pts(1));
+    let n = p0.len().min(p1.len());
+    assert_eq!(p0[..n], p1[..n], "the same frames on both outputs");
+}
+
+fn decode(packets: &[&EncodedPacket]) -> Vec<(i64, Vec<f32>)> {
+    let reference = multiview_output::AudioRenditionEncoder::new(
+        &multiview_output::AudioEncodeConfig::aac(48_000, 2, 128_000),
+    )
+    .unwrap();
+    let mut decoder = multiview_ffmpeg::StreamAudioDecoder::from_codec_parameters(
+        reference.codec_params(),
+        reference.time_base(),
+    )
+    .unwrap();
+    packets
+        .iter()
+        .map(|p| {
+            let pcm = decoder.decode_interleaved(p).unwrap();
+            (p.pts().unwrap(), pcm.chunks(2).map(|c| c[0]).collect())
+        })
+        .collect()
+}
+
+/// Spec C + G3: back on the program mix, the private bus returns the output
+/// to the shared program stream at G' (>= 4 frames after the fade) and
+/// closes. Decoded output 1 across G' equals decoded output 0 (shared) within
+/// twice the steady-state difference of the two encoders before G', and
+/// within one 16-bit LSB once both decoders receive the same packets.
+#[test]
+fn a_private_bus_back_on_program_returns_to_the_shared_stream() {
+    let mut x = audio_harness(2, NTSC, Box::new(|_| Err("no video".to_owned())));
+    let (_, back_tick, _) = tone_and_back(&mut x);
+    let snap = x.h.snapshot();
+    assert_eq!(snap.audio_buses_live, 0, "{snap:?}");
+    assert_eq!(snap.audio.returned, 1, "{snap:?}");
+    assert_eq!(snap.audio.failed, 0, "{snap:?}");
+    assert_eq!(snap.outputs[1].audio, "program");
+    assert_eq!(snap.outputs[1].audio_choice, "program");
+    assert_eq!(x.d.binding_audio_key(1), None, "back on the shared stage");
+    let tap = x.tap.lock().unwrap();
+    let fade = *tap.fades.iter().rev().find(|f| f.0 == 1).unwrap();
+    let fade_end = fade.1 + fade.2;
+    let (_, g_ret) = *tap.returns.iter().find(|r| r.0 == 1).expect("a return");
+    drop(tap);
+    assert!(
+        g_ret >= fade_end + 4 * 1024,
+        "G' {g_ret} >= fade end {fade_end} + 4 frames"
+    );
+    assert_eq!(g_ret % 1024, 0, "G' on the grid");
+    // Within ~85 ms + one fade of the take's tick.
+    assert!(
+        g_ret - x.clock.total_at(back_tick) <= 4 * 1024 + 2 * 1602 + 2 * 1024,
+        "returned late: {g_ret}"
+    );
+    let d0 = decode(&x.audio_packets(0));
+    let d1 = decode(&x.audio_packets(1));
+    let g_ret = i64::try_from(g_ret).unwrap();
+    let fade_end = i64::try_from(fade_end).unwrap();
+    let diff = |from: i64, to: i64| -> (f32, usize) {
+        let mut max = 0.0_f32;
+        let mut n = 0;
+        for ((p0, s0), (p1, s1)) in d0.iter().zip(&d1) {
+            assert_eq!(p0, p1);
+            if *p0 >= from && *p0 < to {
+                for (a, b) in s0.iter().zip(s1) {
+                    max = max.max((a - b).abs());
+                    n += 1;
+                }
+            }
+        }
+        (max, n)
+    };
+    // Two encoders coding the same PCM, before G': their steady difference.
+    let (base, nb) = diff(fade_end + 2048, g_ret);
+    assert!(nb >= 1024, "baseline span {nb}");
+    let (across, na) = diff(g_ret, g_ret + 2048);
+    assert!(na >= 2048, "span after G' {na}");
+    assert!(
+        across <= 2.0 * base + 1e-4,
+        "decoded difference across G' {across} > 2 x steady {base}"
+    );
+    let (after, nl) = diff(g_ret + 2048, i64::MAX);
+    assert!(nl > 0);
+    // The same packets from here on: the two decoders' remaining difference
+    // is their own float state (measured ~1e-5), far below one 16-bit LSB.
+    assert!(after < 3e-5, "the same packets after G': {after}");
+    assert_pts_step(&x.audio_pts(1), "output 1 across G'");
+}
+
+/// Spec G4 (chaos): a flood of 5,000 audio-only takes alternating Source /
+/// Program / None on outputs 1 and 2 as fast as the mailbox accepts. Output
+/// 0 (Program) keeps every audio frame and every video window; the mailbox
+/// refuses (TakeBusy) instead of growing; private buses never exceed the
+/// outputs; every output's audio stays one frame per 1024 samples.
+#[test]
+fn an_audio_take_flood_never_disturbs_program_and_stays_bounded() {
+    let mut x = audio_harness(3, NTSC, Box::new(|_| Err("no video".to_owned())));
+    let mut t = x.run(0, 8);
+    let choices = [bars_src(), AudioChoice::Program, AudioChoice::Silence];
+    let (mut sent, mut busy) = (0_usize, 0_usize);
+    while sent < 5_000 {
+        loop {
+            let take = audio_only(
+                &format!("f{sent}"),
+                1 + sent % 2,
+                choices[(sent / 2) % 3].clone(),
+            );
+            if x.h.try_take(take).is_err() {
+                busy += 1;
+                break;
+            }
+            sent += 1;
+            if sent == 5_000 {
+                break;
+            }
+        }
+        x.tick(t);
+        t += 1;
+        let live = x.h.snapshot().audio_buses_live;
+        assert!(live <= 2, "private buses {live} > routed outputs");
+    }
+    let end = x.run(t, 40);
+    assert!(busy > 0, "the bounded mailbox refused takes");
+    let video: Vec<i64> = x.windows_of_video(0);
+    let want: Vec<i64> = (0..i64::try_from(video.len()).unwrap()).collect();
+    assert_eq!(video, want, "output 0: one video window per tick");
+    assert!(
+        video.len() as u64 + 8 >= end,
+        "windows {} for {end} ticks",
+        video.len()
+    );
+    let p0 = x.audio_pts(0);
+    assert_pts_step(&p0, "Program (output 0)");
+    let samples = x.clock.total_at(end - 6);
+    assert!(
+        i64::try_from(p0.len()).unwrap() * 1024 >= i64::try_from(samples).unwrap(),
+        "output 0 audio frames {} for {samples} samples",
+        p0.len()
+    );
+    for o in 1..3 {
+        let p = x.audio_pts(o);
+        assert_pts_step(&p, &format!("output {o}"));
+        let n = p.len().min(p0.len());
+        assert_eq!(p[..n], p0[..n], "output {o}: the same frames as Program");
+    }
+    assert!(
+        x.feed_max < std::time::Duration::from_millis(50),
+        "feed {:?}",
+        x.feed_max
+    );
+}
+
+impl AudioHarness {
+    fn windows_of_video(&self, o: usize) -> Vec<i64> {
+        self.rec
+            .windows
+            .iter()
+            .filter(|w| w.0 == o)
+            .flat_map(|w| w.1.iter().map(|p| p.0))
+            .collect()
+    }
+}
+
+/// Spec G5 (chaos): the routed source dies mid-take (before G) and, on a
+/// second take, mid-crossfade. Its audio is silence from then on (no stale
+/// repeat): the bus carries exactly the old audio times the falling
+/// envelope, then nothing. The takes apply (a source without audio is
+/// silence, §5.1); every stream stays continuous.
+#[test]
+fn a_routed_source_dying_mid_take_and_mid_fade_carries_silence() {
+    let mut x = audio_harness(2, NTSC, Box::new(|_| Err("no video".to_owned())));
+    let t = x.run(0, 12);
+    // Mid-take: the strip goes away the tick the take is drained, before G.
+    x.h.try_take(audio_only("die-a", 1, bars_src())).unwrap();
+    x.bars_live = false;
+    let (o, t) = x.until(t, "die-a", 60);
+    assert_eq!(o.outcome, TakeResult::Applied, "{o:?}");
+    let t = x.run(t, 6);
+    let fade_a = *x.tap.lock().unwrap().fades.last().unwrap();
+    let pcm = x.private_left(1);
+    let xf = TakeCrossfade {
+        start: fade_a.1,
+        len: fade_a.2,
+    };
+    for n in fade_a.1..fade_a.1 + fade_a.2 + 2000 {
+        let want = prog(n) * xf.gains(n).0;
+        assert!(
+            (pcm[&n] - want).abs() < 1e-6,
+            "mid-take {n}: {} vs {want}",
+            pcm[&n]
+        );
+    }
+    // Back to Program, then a second take with the source alive that dies
+    // halfway through its fade.
+    x.h.try_take(audio_only("back", 1, AudioChoice::Program))
+        .unwrap();
+    let (_, t) = x.until(t, "back", 60);
+    let t = x.run(t, 4);
+    x.bars_live = true;
+    x.h.try_take(audio_only("die-b", 1, bars_src())).unwrap();
+    let mut t = t;
+    let mut died_at = None;
+    let mut applied = None;
+    for _ in 0..60 {
+        x.tick(t);
+        t += 1;
+        let fade = x.tap.lock().unwrap().fades.last().copied();
+        if let Some((_, g, len)) = fade.filter(|f| f.1 > fade_a.1) {
+            if died_at.is_none() && x.clock.total_at(t) > g {
+                // The tick that fed the fade's start: the source dies now.
+                x.bars_live = false;
+                died_at = Some((x.clock.total_at(t), g, len));
+            }
+        }
+        for o in x.outcomes.try_iter() {
+            if o.operation_id == "die-b" {
+                applied = Some(o.outcome);
+            }
+        }
+        if applied.is_some() && died_at.is_some() {
+            break;
+        }
+    }
+    assert_eq!(applied, Some(TakeResult::Applied));
+    let (dead_from, g, len) = died_at.expect("the fade started");
+    assert!(dead_from > g && dead_from < g + len, "died mid-fade");
+    let t = x.run(t, 4);
+    let pcm = x.private_left(1);
+    let xf = TakeCrossfade { start: g, len };
+    for n in dead_from..g + len + 1000 {
+        if !pcm.contains_key(&n) {
+            break; // the bus returned and closed
+        }
+        let want = prog(n) * xf.gains(n).0;
+        assert!(
+            (pcm[&n] - want).abs() < 1e-6,
+            "mid-fade {n}: {} vs {want} (stale tone?)",
+            pcm[&n]
+        );
+    }
+    let _ = x.run(t, 2);
+    assert_pts_step(&x.audio_pts(0), "Program");
+    assert_pts_step(&x.audio_pts(1), "output 1");
+    assert_eq!(x.h.snapshot().audio.failed, 0);
+}
+
+fn stalled_or_crashing_worker(panic_worker: bool) {
+    let mut x = audio_harness(2, NTSC, Box::new(|_| Err("no video".to_owned())));
+    let (release, wait) = std::sync::mpsc::channel::<()>();
+    let wait = Arc::new(Mutex::new(wait));
+    x.r.set_audio_worker_hook(Arc::new(move |_job| {
+        assert!(!panic_worker, "injected private-bus worker panic");
+        // A wedged worker: never drains its job queue until released.
+        let _ = wait.lock().unwrap().recv();
+    }));
+    let t = x.run(0, 12);
+    x.h.try_take(audio_only("stall", 1, bars_src())).unwrap();
+    let (o, t) = x.until(t, "stall", PRIVATE_AUDIO_QUEUE_TICKS + 4);
+    assert_eq!(
+        o.outcome,
+        TakeResult::Refused(RefuseReason::EncoderNotReady),
+        "{o:?}"
+    );
+    assert_eq!(o.audio, Some(AudioChoice::Follow), "the choice is restored");
+    let t = x.run(t, 4);
+    let snap = x.h.snapshot();
+    assert_eq!(snap.audio_buses_live, 0, "{snap:?}");
+    assert_eq!(snap.audio.failed, 1, "{snap:?}");
+    assert_eq!(
+        x.d.binding_audio_key(1),
+        None,
+        "output 1 on the shared stage"
+    );
+    assert!(
+        x.feed_max < std::time::Duration::from_millis(50),
+        "the consumer never waits: {:?}",
+        x.feed_max
+    );
+    let _ = x.run(t, 4);
+    assert_pts_step(&x.audio_pts(0), "Program");
+    assert_pts_step(&x.audio_pts(1), "output 1");
+    drop(release);
+}
+
+/// The take's outcome arrives within the private queue depth plus slack.
+const PRIVATE_AUDIO_QUEUE_TICKS: u64 = crate::routing_audio::PRIVATE_AUDIO_QUEUE as u64 + 6;
+
+/// Spec G6 (chaos): a wedged private-bus worker fails its bus alone within
+/// the queue depth; the output stays on / returns to the shared program
+/// stream; the consumer never waits; Program is untouched.
+#[test]
+fn a_stalled_private_bus_worker_fails_alone_and_never_blocks() {
+    stalled_or_crashing_worker(false);
+}
+
+/// Spec G6: the same for a panicking private-bus worker.
+#[test]
+fn a_panicking_private_bus_worker_fails_alone() {
+    stalled_or_crashing_worker(true);
+}
+
+/// Spec G7: a combined take (video to a source + audio Program) moves the
+/// video and keeps the program audio (no private bus); a combined take whose
+/// video is refused (feed never fresh) restores the choice and leaves the
+/// audio alone.
+#[test]
+fn a_combined_take_moves_video_with_its_explicit_audio_or_restores_it() {
+    let encoded = Arc::new(AtomicUsize::new(0));
+    let open: OpenFn = Box::new(move |_| {
+        let enc: Box<dyn LiveEncoder> = Box::new(FakeEnc {
+            forced: false,
+            encoded: Arc::clone(&encoded),
+        });
+        Ok(enc)
+    });
+    let mut x = audio_harness(2, CADENCE, open);
+    let t = x.run(0, 5);
+    x.h.try_take(OutputTake {
+        operation_id: "both".to_owned(),
+        output_index: 1,
+        bus: Some(src()),
+        audio: Some(AudioChoice::Program),
+        principal: "p".to_owned(),
+    })
+    .unwrap();
+    let (o, t) = x.until(t, "both", OPEN_DEADLINE_TICKS);
+    assert_eq!(o.outcome, TakeResult::Applied, "{o:?}");
+    assert_eq!(o.bus, src());
+    assert_eq!(o.audio, Some(AudioChoice::Program));
+    let t = x.run(t, 3);
+    let snap = x.h.snapshot();
+    assert_eq!(snap.outputs[1].bus, "src:cam");
+    assert_eq!(snap.outputs[1].audio, "program");
+    assert_eq!(snap.outputs[1].audio_choice, "program");
+    assert_eq!(snap.audio.opened, 0, "no private bus: {snap:?}");
+    // A video take that is never fresh, with audio Source(bars).
+    x.h.try_take(OutputTake {
+        operation_id: "stale".to_owned(),
+        output_index: 1,
+        bus: Some(PictureBus::Source("nowhere".to_owned())),
+        audio: Some(bars_src()),
+        principal: "p".to_owned(),
+    })
+    .unwrap();
+    let (o, _) = x.until(t, "stale", TAKE_PRIME_DEADLINE_TICKS + 2);
+    assert_eq!(o.outcome, TakeResult::Refused(RefuseReason::FeedNotFresh));
+    assert_eq!(o.audio, Some(AudioChoice::Program), "choice restored");
+    let snap = x.h.snapshot();
+    assert_eq!(snap.outputs[1].audio_choice, "program");
+    assert_eq!(snap.outputs[1].audio, "program");
+    assert_eq!(snap.audio_buses_live, 0);
+    assert_eq!(snap.audio.opened, 0, "{snap:?}");
+}
+
+/// Spec G7 (second half, dispatcher-refused): a combined take whose video
+/// move is refused after the audio was installed fades back and restores
+/// the previous choice.
+#[test]
+fn a_superseded_combined_take_restores_the_audio_choice() {
+    let encoded = Arc::new(AtomicUsize::new(0));
+    let open: OpenFn = Box::new(move |_| {
+        let enc: Box<dyn LiveEncoder> = Box::new(FakeEnc {
+            forced: false,
+            encoded: Arc::clone(&encoded),
+        });
+        Ok(enc)
+    });
+    let mut x = audio_harness(2, CADENCE, open);
+    let mut t = x.run(0, 5);
+    x.h.try_take(OutputTake {
+        operation_id: "combined".to_owned(),
+        output_index: 1,
+        bus: Some(src()),
+        audio: Some(bars_src()),
+        principal: "p".to_owned(),
+    })
+    .unwrap();
+    // Wait until the video move is issued (Moving), then supersede it with
+    // a video-only take back to Program before it lands.
+    let mut moving = false;
+    for _ in 0..OPEN_DEADLINE_TICKS {
+        x.tick(t);
+        t += 1;
+        if matches!(
+            x.r.outputs[1].pending.as_ref().map(|p| p.phase),
+            Some(Phase::Moving(_))
+        ) {
+            moving = true;
+            break;
+        }
+    }
+    assert!(moving, "the video move was issued");
+    assert_eq!(x.h.snapshot().outputs[1].audio_choice, "src:bars");
+    x.h.try_take(OutputTake {
+        operation_id: "cancel".to_owned(),
+        output_index: 1,
+        bus: Some(PictureBus::Program),
+        audio: None,
+        principal: "p".to_owned(),
+    })
+    .unwrap();
+    let (o, t) = x.until(t, "cancel", 20);
+    assert_eq!(o.outcome, TakeResult::Applied, "{o:?}");
+    let superseded = x
+        .others
+        .iter()
+        .find(|o| o.operation_id == "combined")
+        .expect("the combined take ended");
+    assert_eq!(superseded.outcome, TakeResult::Superseded);
+    let _ = x.run(t, 12);
+    let snap = x.h.snapshot();
+    assert_eq!(snap.outputs[1].audio_choice, "follow", "choice restored");
+    assert_eq!(snap.outputs[1].audio, "program");
+    assert_eq!(snap.outputs[1].bus, "program");
+}
+
+/// Spec G8: an explicit Source carries its `audio-routing` gain and mute,
+/// read live (a change between ticks applies to the next tick's block); a
+/// Track choice carries its input's block without the route gain.
+#[test]
+fn an_explicit_source_follows_the_live_route_gain_and_a_track_does_not() {
+    let mut x = audio_harness(2, NTSC, Box::new(|_| Err("no video".to_owned())));
+    x.gain.store(0.5_f32.to_bits(), Ordering::Release);
+    let t = x.run(0, 12);
+    x.h.try_take(audio_only("gain", 1, bars_src())).unwrap();
+    let (o, t) = x.until(t, "gain", 60);
+    assert_eq!(o.outcome, TakeResult::Applied);
+    let t = x.run(t, 3);
+    let check = |x: &AudioHarness, tick: u64, f: &dyn Fn(u64) -> f32, what: &str| {
+        let pcm = x.private_left(1);
+        for n in x.clock.total_at(tick)..x.clock.total_at(tick + 1) {
+            assert!((pcm[&n] - f(n)).abs() < 1e-6, "{what} at {n}");
+        }
+    };
+    check(&x, t - 1, &|n| bars(n) * 0.5, "gain 0.5");
+    x.gain.store(0.25_f32.to_bits(), Ordering::Release);
+    x.tick(t);
+    check(&x, t, &|n| bars(n) * 0.25, "gain 0.25 on the next tick");
+    x.gain.store(0.0_f32.to_bits(), Ordering::Release);
+    x.tick(t + 1);
+    check(&x, t + 1, &|_| 0.0, "muted");
+    x.h.try_take(audio_only(
+        "track",
+        1,
+        AudioChoice::Track {
+            name: "eng".to_owned(),
+            input: "bars".to_owned(),
+        },
+    ))
+    .unwrap();
+    let (o, t) = x.until(t + 2, "track", 60);
+    assert_eq!(o.outcome, TakeResult::Applied);
+    let t = x.run(t, 3);
+    check(&x, t - 1, &bars, "a track is not gained");
+    let snap = x.h.snapshot();
+    assert_eq!(snap.outputs[1].audio, "track:eng");
+    assert_eq!(snap.outputs[1].audio_choice, "track:eng");
+}
+
+/// An audio take on a run without program audio, or with neither video nor
+/// audio, is refused `Unroutable`; an audio take that changes nothing
+/// applies at once.
+#[test]
+fn audio_takes_without_a_program_audio_slot_are_unroutable() {
+    let (mut r, h, _) = router(2, 6, Box::new(|_| Err("never".to_owned())));
+    let outcomes = h.outcomes().unwrap();
+    let mut d = dispatcher(2);
+    h.try_take(audio_only("a", 1, AudioChoice::Program))
+        .unwrap();
+    h.try_take(OutputTake {
+        operation_id: "none".to_owned(),
+        output_index: 1,
+        bus: None,
+        audio: None,
+        principal: "p".to_owned(),
+    })
+    .unwrap();
+    r.on_tick(0, MediaTime::from_nanos(0), &mut d, &mut NoDelivery)
+        .unwrap();
+    let got: Vec<_> = outcomes.try_iter().map(|o| o.outcome).collect();
+    assert_eq!(
+        got,
+        vec![
+            TakeResult::Refused(RefuseReason::Unroutable),
+            TakeResult::Refused(RefuseReason::Unroutable)
+        ]
+    );
+    let mut x = audio_harness(2, NTSC, Box::new(|_| Err("no video".to_owned())));
+    let t = x.run(0, 3);
+    x.h.try_take(audio_only("same", 1, AudioChoice::Program))
+        .unwrap();
+    let (o, next) = x.until(t, "same", 2);
+    assert_eq!((o.outcome, o.tick), (TakeResult::Applied, next - 1));
+    assert_eq!(x.h.snapshot().audio.opened, 0);
 }

@@ -788,6 +788,14 @@ impl OutputRouter {
         }
     }
 
+    /// Test seam: inject the private-bus encode thread's per-job hook.
+    #[cfg(test)]
+    pub(crate) fn set_audio_worker_hook(&mut self, hook: crate::routing_audio::WorkerHook) {
+        if let Some(audio) = self.audio.as_mut() {
+            audio.worker_hook = Some(hook);
+        }
+    }
+
     /// Test observation: the block handed to the shared program encoder.
     #[cfg(test)]
     pub(crate) fn tap_program_audio(
