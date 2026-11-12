@@ -541,6 +541,8 @@ jobs:
           sha256sum -c SHA256SUMS
           tar -xzf pebble-linux-amd64.tar.gz
           tar -xzf pebble-challtestsrv-linux-amd64.tar.gz
+          # The release tarballs do not carry the exec bit.
+          chmod +x pebble-linux-amd64/linux/amd64/pebble pebble-challtestsrv-linux-amd64/linux/amd64/pebble-challtestsrv
           echo "PEBBLE_BIN=$PEBBLE_WORK/pebble-linux-amd64/linux/amd64/pebble" >> "$GITHUB_ENV"
           echo "CHALLTESTSRV_BIN=$PEBBLE_WORK/pebble-challtestsrv-linux-amd64/linux/amd64/pebble-challtestsrv" >> "$GITHUB_ENV"
       - name: build the ACME tests
