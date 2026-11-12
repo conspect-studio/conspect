@@ -210,9 +210,12 @@ pub struct Session {
     /// consent check, DTLS, SRTP/RTCP). The preview egress reads it to detect a
     /// peer that vanished without signalling (liveness, not a client `DELETE`).
     last_rx: Option<Instant>,
-    /// The remote address of the last datagram str0m accepted while the session
-    /// was connected: a peer that passed ICE (STUN MESSAGE-INTEGRITY) and DTLS.
-    /// The shared front door marks it established. `None` while not connected.
+    /// The source of the last **non-STUN** datagram (DTLS, SRTP, SRTCP) str0m
+    /// accepted while connected. str0m accepts non-STUN traffic only from the
+    /// nominated send address or a remote candidate of a Succeeded pair (a
+    /// connectivity-check round trip proved it), never on credentials alone. A
+    /// STUN Binding request is accepted on MESSAGE-INTEGRITY from ANY source
+    /// address, so it never sets this (review PR 315).
     validated_peer: Option<SocketAddr>,
 }
 
@@ -566,13 +569,22 @@ impl Session {
             .map_err(|e| WebRtcError::Transport(format!("handle_input: {e}")))?;
         self.last_rx = Some(now);
         self.drive(now);
-        self.validated_peer = self.connected.then_some(source);
+        // First byte 0-3 is STUN (RFC 9443): accepted on credentials, not on
+        // the address, so it proves nothing about `source`.
+        let stun = payload.first().is_some_and(|b| *b < 4);
+        if !self.connected {
+            self.validated_peer = None;
+        } else if !stun {
+            self.validated_peer = Some(source);
+        }
         Ok(())
     }
 
-    /// The remote address that last delivered an accepted datagram on this
-    /// connected session (ICE validated it with STUN MESSAGE-INTEGRITY before
-    /// str0m accepts non-STUN traffic from it). `None` while not connected.
+    /// The peer address the shared front door may treat as established: the
+    /// source of the last DTLS/SRTP datagram str0m accepted on this connected
+    /// session (str0m accepts those only from an ICE-proven address). A STUN
+    /// request, which str0m accepts on MESSAGE-INTEGRITY from any address, never
+    /// makes its source validated. `None` while not connected.
     #[must_use]
     pub fn validated_peer(&self) -> Option<SocketAddr> {
         if self.connected && self.rtc.is_alive() {

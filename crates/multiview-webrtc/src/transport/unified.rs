@@ -694,10 +694,20 @@ impl UnifiedEndpoint {
                     let mut read = 0usize;
                     while let Some(d) = next.take() {
                         read += 1;
-                        let arrival = SocketAddr::new(
-                            d.dst_ip.unwrap_or_else(|| local_addr.ip()),
-                            local_addr.port(),
-                        );
+                        // No PKTINFO on a wildcard-bound socket: the concrete
+                        // local destination is unknown, so drop the datagram
+                        // rather than map it onto a guessed candidate, exactly
+                        // as the socket-owning driver does (defect #3).
+                        let Some(dst_ip) = d
+                            .dst_ip
+                            .or_else(|| (!local_addr.ip().is_unspecified()).then(|| local_addr.ip()))
+                        else {
+                            if read < MAX_DATAGRAMS_PER_WAKE && started.elapsed() < MAX_DRAIN_TIME {
+                                next = inbound.try_next();
+                            }
+                            continue;
+                        };
+                        let arrival = SocketAddr::new(dst_ip, local_addr.port());
                         let dst = crate::transport::resolve_local_destination(arrival, &concrete_candidates);
                         Self::route_inbound(
                             &mut turn, ingest.as_mut(), serve.as_mut(), preview.as_ref(), &mut push,

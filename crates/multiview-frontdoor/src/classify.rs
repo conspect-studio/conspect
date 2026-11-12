@@ -128,6 +128,8 @@ pub enum DropReason {
     BadDtls,
     /// Claims RTP/RTCP but is shorter than an RTCP header.
     BadRtp,
+    /// TURN `ChannelData` shorter than its 4-byte header.
+    BadChannelData,
     /// Claims a QUIC short header but is shorter than any packet our server
     /// can be sent.
     ShortQuicShort,
@@ -195,7 +197,7 @@ pub fn classify(datagram: &[u8], from_turn_server: bool) -> Verdict {
             if datagram.len() >= 4 {
                 Verdict::Rtc
             } else {
-                Verdict::Drop(DropReason::BadRtp)
+                Verdict::Drop(DropReason::BadChannelData)
             }
         }
         ByteClass::ChannelDataOrQuicShort | ByteClass::QuicShort => {
@@ -231,15 +233,12 @@ fn classify_long_header(first: u8, datagram: &[u8]) -> Verdict {
     if version == 0 {
         return Verdict::Drop(DropReason::VersionNegotiation);
     }
-    if !SUPPORTED_QUIC_VERSIONS.contains(&version) {
-        return if datagram.len() >= MIN_INITIAL_DATAGRAM {
-            Verdict::Quic(QuicKind::VersionNegotiationTrigger)
-        } else {
-            Verdict::Drop(DropReason::ShortVersionNegotiationTrigger)
-        };
-    }
     // RFC 9000 section 17.2: DCID length (byte 5) <= 20, then the DCID, then the
-    // SCID length and the SCID.
+    // SCID length and the SCID. Checked before the version branch: noq answers
+    // an unsupported version only for a header it can decode (review PR 315),
+    // so an undecodable one must not spend the Version Negotiation budget.
+    // (RFC 8999 allows longer CIDs for unknown versions; noq cannot parse them,
+    // so it would send no reply anyway.)
     let Some(&dcid_len) = datagram.get(5) else {
         return Verdict::Drop(DropReason::BadQuicLong);
     };
@@ -252,6 +251,13 @@ fn classify_long_header(first: u8, datagram: &[u8]) -> Verdict {
     };
     if scid_len > 20 || datagram.len() < scid_len_at + 1 + usize::from(scid_len) {
         return Verdict::Drop(DropReason::BadQuicLong);
+    }
+    if !SUPPORTED_QUIC_VERSIONS.contains(&version) {
+        return if datagram.len() >= MIN_INITIAL_DATAGRAM {
+            Verdict::Quic(QuicKind::VersionNegotiationTrigger)
+        } else {
+            Verdict::Drop(DropReason::ShortVersionNegotiationTrigger)
+        };
     }
     // Long packet type, bits 4-5 (v1 and the drafts): 0 Initial, 1 0-RTT,
     // 2 Handshake, 3 Retry.
@@ -557,6 +563,17 @@ mod tests {
             classify(&reset[..20], false),
             Verdict::Drop(DropReason::ShortQuicShort)
         );
+    }
+
+    #[test]
+    fn an_undecodable_unknown_version_never_spends_the_vn_budget() {
+        let mut d = long_header(0xc0, 0x5a5a_5a5a, 8, 8, 1300);
+        assert_eq!(
+            classify(&d, false),
+            Verdict::Quic(QuicKind::VersionNegotiationTrigger)
+        );
+        d[5] = 255;
+        assert_eq!(classify(&d, false), Verdict::Drop(DropReason::BadQuicLong));
     }
 
     #[test]

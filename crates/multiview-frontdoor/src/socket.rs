@@ -8,9 +8,8 @@ use std::task::{Context, Poll, Waker};
 
 use noq::udp::{EcnCodepoint, RecvMeta, Transmit, UdpSocketState};
 
-/// Bytes per receive buffer: one GRO super-datagram (64 KiB covers the largest
-/// coalesced read the kernel hands back).
-const RECV_BUF: usize = 64 * 1024;
+/// The largest UDP payload a segment can carry (Ethernet MTU minus IP/UDP).
+const MAX_SEGMENT: usize = 1472;
 
 /// The socket, its batching state, and the wakers of senders waiting for it to
 /// become writable.
@@ -152,10 +151,15 @@ pub(crate) struct RecvBatch {
 }
 
 impl RecvBatch {
-    pub(crate) fn new(_socket: &SharedSocket) -> Self {
+    pub(crate) fn new(socket: &SharedSocket) -> Self {
         let n = noq::udp::BATCH_SIZE.max(1);
+        // Each buffer must hold the largest GRO list the kernel may return
+        // (`gro_segments` x segment size, up to UDP_GRO_CNT_MAX = 64): noq-udp's
+        // recvmmsg path does not report MSG_TRUNC, so a smaller buffer would
+        // silently cut a sender's tail segment (review PR 315).
+        let per_buf = MAX_SEGMENT.saturating_mul(socket.state.gro_segments().get().max(1));
         Self {
-            bufs: (0..n).map(|_| vec![0u8; RECV_BUF]).collect(),
+            bufs: (0..n).map(|_| vec![0u8; per_buf]).collect(),
             meta: vec![RecvMeta::default(); n],
         }
     }
