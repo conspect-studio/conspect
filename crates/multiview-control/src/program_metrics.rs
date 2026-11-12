@@ -98,7 +98,10 @@ impl ProgramMetrics {
             lateness_p50_fine_ms: ms(window.fine_quantile_upper_ns(500)),
             lateness_p99_fine_ms: ms(window.fine_quantile_upper_ns(990)),
             lateness_mean_total_ms: now.lateness.mean_ns().map(ns_to_ms),
-            fine_bucket_edges_ms: FINE_LATENESS_EDGES_NS.iter().map(|ns| ns_to_ms(*ns)).collect(),
+            fine_bucket_edges_ms: FINE_LATENESS_EDGES_NS
+                .iter()
+                .map(|ns| ns_to_ms(*ns))
+                .collect(),
             fine_buckets_total: now.lateness.fine_buckets.to_vec(),
             fine_buckets_window: window.fine_buckets.to_vec(),
         })
