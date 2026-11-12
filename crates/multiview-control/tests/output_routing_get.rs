@@ -170,9 +170,9 @@ async fn rows_carry_the_accepted_api_id_after_a_rename() {
         false,
         None,
     )));
-    // Accept a document whose SECOND output carries the API id "renamed" and
-    // whose first keeps "output-0": a positional or sorted derivation would
-    // pair the feeds with the wrong ids.
+    // Accept a document whose outputs carry the API ids "zz-first" and
+    // "renamed"; the store-only (no envelope) case is pinned by
+    // output_routing_store_ids.rs.
     let layouts = multiview_control::boot_model::layout_library(&state).unwrap();
     let selected =
         multiview_control::boot_model::selected_layout_id(&state, &config, &layouts).unwrap();

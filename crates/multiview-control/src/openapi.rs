@@ -257,6 +257,9 @@ const ASYNCAPI_JSON: &str = include_str!("../../../docs/api/asyncapi.json");
         crate::routes::config::revert_to_start,
         crate::routes::config::promote_to_boot,
         crate::routes::preview::capabilities,
+        // The input still documents its typed `503` problem (source phase), so
+        // an API client can branch on `type` instead of parsing a bare status.
+        crate::routes::preview::input_jpeg,
         crate::routes::cloudflare::save,
         crate::routes::cloudflare::execute,
         crate::routes::moq::program_open,

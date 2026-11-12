@@ -2141,6 +2141,27 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/preview/inputs/{id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * `GET /api/v1/preview/inputs/{id}.jpg` — the latest frame of input `id`
+         *     (role: read). `503` with an RFC 9457 problem typed by source phase when the
+         *     input is unknown or has produced no frame.
+         */
+        get: operations["input_jpeg"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/preview/inputs/{id}/moq": {
         parameters: {
             query?: never;
@@ -14671,6 +14692,56 @@ export interface operations {
             };
             /** @description Missing or invalid credentials. */
             401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
+    input_jpeg: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The input (source) id, optionally with the `.jpg` suffix the SPA appends. */
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The newest frame of the input, `Cache-Control: no-store`. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "image/jpeg": unknown;
+                };
+            };
+            /** @description Missing or invalid credentials. */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Authenticated but not authorized for this input (per-object scope). */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description No frame available. `type` is `/problems/source-failed`, `/problems/source-starting` or `/problems/preview-not-served`; `X-Multiview-Source-State` repeats the coarse phase. */
+            503: {
                 headers: {
                     [name: string]: unknown;
                 };

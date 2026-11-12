@@ -47,6 +47,8 @@ pub mod auth;
 pub mod automation;
 pub mod boot_model;
 pub mod catalogue;
+#[cfg(all(feature = "tls", unix))]
+pub mod certificate_source;
 /// Unix only: the credential vault it relies on enforces POSIX owner-only
 /// permissions and offers no weaker cross-platform fallback.
 #[cfg(unix)]
