@@ -299,6 +299,16 @@ fn enqueue_boot_takes(
             tracing::warn!(output = %id, "routing: no run output for the persisted feed; it stays on Program");
             continue;
         };
+        // The same rule the control-side take enforces: an encoder family
+        // slice 1 cannot cut cleanly (VAAPI/VideoToolbox) is never taken.
+        if !handle
+            .outputs()
+            .get(output_index)
+            .is_some_and(|o| o.routable)
+        {
+            tracing::warn!(output = %id, "routing: this output's kind cannot switch feeds live; it stays on Program");
+            continue;
+        }
         // Bounded like every take id (an HLS config id is its path): cut on a
         // char boundary; the router matches boot takes by prefix and op id.
         let mut operation_id = format!("{}{id}", crate::output_routing::BOOT_TAKE_PREFIX);
