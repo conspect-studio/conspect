@@ -359,6 +359,8 @@ pub(crate) struct RoutedAudio {
     events: Receiver<AudioEvent>,
     dropped: Arc<AtomicU64>,
     counters: AudioRoutingCounters,
+    /// Reused per-tick buffers (old, new, mixed) of `feed` (#329 F5).
+    scratch: (Vec<f32>, Vec<f32>, Vec<f32>),
     #[cfg(test)]
     pub(crate) tap: Option<AudioTapCell>,
     #[cfg(test)]
@@ -396,6 +398,7 @@ impl RoutedAudio {
             events,
             dropped: Arc::new(AtomicU64::new(0)),
             counters: AudioRoutingCounters::default(),
+            scratch: (Vec::new(), Vec::new(), Vec::new()),
             #[cfg(test)]
             tap: None,
             #[cfg(test)]
@@ -989,23 +992,30 @@ impl RoutedAudio {
             let from = bus.start.max(block_start).max(bus.fed);
             let skip = usize::try_from(from.saturating_sub(block_start)).unwrap_or(usize::MAX);
             let ch = self.channels;
-            let pcm_of = |src: &AudioSource| -> Vec<f32> {
-                source_pcm(
+            let gain = &*self.route_gain;
+            let (old, new, out) = (
+                &mut self.scratch.0,
+                &mut self.scratch.1,
+                &mut self.scratch.2,
+            );
+            let pcm_into = |src: &AudioSource, dst: &mut Vec<f32>| {
+                source_pcm_into(
+                    dst,
                     src,
                     program,
                     inputs,
                     preview.as_deref(),
-                    &*self.route_gain,
+                    gain,
                     frames,
                     ch,
-                )
+                );
             };
-            let mut out = Vec::new();
+            out.clear();
             match bus.fade.as_ref() {
                 Some(fade) => {
-                    let old = pcm_of(&fade.from);
-                    let new = pcm_of(&fade.to);
-                    fade.xf.mix_into(&old, &new, ch, block_start, &mut out);
+                    pcm_into(&fade.from, old);
+                    pcm_into(&fade.to, new);
+                    fade.xf.mix_into(old, new, ch, block_start, out);
                     #[cfg(test)]
                     if fade.xf.start >= from && fade.xf.start < end {
                         if let Some(Ok(mut t)) = self.tap.as_ref().map(|t| t.lock()) {
@@ -1013,8 +1023,10 @@ impl RoutedAudio {
                         }
                     }
                 }
-                None => out = pcm_of(&bus.current),
+                None => pcm_into(&bus.current, out),
             }
+            // The one per-tick allocation: the job crosses to the bus's
+            // encode thread by value.
             let tail = out.get(skip.saturating_mul(ch)..).map(<[f32]>::to_vec);
             let Some(tail) = tail else {
                 continue;
@@ -1227,6 +1239,7 @@ impl RoutedAudio {
 }
 
 /// One tick of `src` as interleaved PCM of exactly `frames` frames.
+#[cfg(test)]
 fn source_pcm(
     src: &AudioSource,
     program: &AudioBlock,
@@ -1236,16 +1249,42 @@ fn source_pcm(
     frames: usize,
     channels: usize,
 ) -> Vec<f32> {
+    let mut out = Vec::new();
+    source_pcm_into(
+        &mut out, src, program, inputs, preview, gain, frames, channels,
+    );
+    out
+}
+
+/// One tick of `src` into `out` (cleared first; its capacity is reused).
+#[allow(clippy::too_many_arguments)] // reason: one tick's inputs; called per bus per tick.
+fn source_pcm_into(
+    out: &mut Vec<f32>,
+    src: &AudioSource,
+    program: &AudioBlock,
+    inputs: &[(&str, &AudioBlock)],
+    preview: Option<&str>,
+    gain: &(dyn Fn(&str) -> f32 + Send + Sync),
+    frames: usize,
+    channels: usize,
+) {
     let len = frames.saturating_mul(channels);
+    out.clear();
     // (input id, route gain applied?)
     let (id, gained) = match src {
-        AudioSource::Program => return program.interleaved().to_vec(),
-        AudioSource::Silence => return vec![0.0; len],
+        AudioSource::Program => {
+            out.extend_from_slice(program.interleaved());
+            return;
+        }
+        AudioSource::Silence => {
+            out.resize(len, 0.0);
+            return;
+        }
         AudioSource::Source(id) => (Some(id.as_str()), true),
         AudioSource::Preview => (preview, true),
         AudioSource::Track { input, .. } => (Some(input.as_str()), false),
     };
-    let mut out = vec![0.0; len];
+    out.resize(len, 0.0);
     let block = id.and_then(|id| {
         inputs
             .iter()
@@ -1264,7 +1303,6 @@ fn source_pcm(
             *dst = s * g;
         }
     }
-    out
 }
 
 /// What a private bus's encode thread needs.
