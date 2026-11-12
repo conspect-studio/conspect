@@ -1191,6 +1191,13 @@ fn an_event_whose_generation_and_key_disagree_is_dropped() {
     let b = inject(&mut r, &mut d, src(), Counted::boxed(&live, 0));
     assert_eq!((a, b), (1, 2));
     r.close(a, &mut d);
+    // Let the closed worker end, then drain its tail (counted as dropped)
+    // so the counter below measures only the injected event.
+    let waited = Instant::now();
+    while live.load(Ordering::SeqCst) > 1 && waited.elapsed() < std::time::Duration::from_secs(2) {
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    assert_eq!(live.load(Ordering::SeqCst), 1, "the closed worker ended");
     r.drain_live_events(&mut d, &mut NoDelivery).unwrap();
     let c = inject(&mut r, &mut d, src(), Counted::boxed(&live, 0));
     assert_eq!(c, a, "the closed key's slot is reused");

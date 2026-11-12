@@ -1165,10 +1165,18 @@ impl RenditionDispatcher {
                     }
                     switched = true;
                 } else {
-                    // Never a mid-GOP picture after a switch: the whole window is lost.
-                    delivery.report_loss(b.output_index, OfferError::ProducerLoss);
-                    self.counters.dropped_pending = self.counters.dropped_pending.saturating_add(1);
-                    continue;
+                    // Never a mid-GOP picture after a switch, exactly like a
+                    // move's leading pictures: this window's video is dropped
+                    // (counted) and its audio kept, with no loss signal (a loss
+                    // would flush the healthy backlog and arm the RAP gate,
+                    // which then rejects the audio until the RAP). The gate
+                    // stays pending, so the next video delivered opens at a RAP.
+                    if !packets.is_empty() {
+                        self.counters.dropped_pending =
+                            self.counters.dropped_pending.saturating_add(1);
+                    }
+                    packets.clear();
+                    switched = true;
                 }
             }
             if skip > 0 {
@@ -2749,6 +2757,105 @@ mod tests {
         pop_all(&mut sink, 0, now);
         pop_all(&mut sink, 1, now);
         assert_eq!(sink.queues[1].take_discontinuity(), None);
+    }
+
+    /// R (final-head media MED): a fallback cuts at the first gated RAP of
+    /// the window, like a move: a window [P, RAP] + audio delivers [RAP,
+    /// audio], no loss is reported and nothing is dropped.
+    #[test]
+    fn a_fallback_cuts_at_the_first_rap_inside_the_window() {
+        let now = Instant::now();
+        let mut d =
+            RenditionDispatcher::new(gated_cfg(vec![binding(0, 0, 1), binding(1, 1, 1)], 2, 1))
+                .unwrap();
+        let mut sink = FakeDelivery::new(2);
+        let key = d
+            .add_video_key(DtsTimeBase { num: 1, den: 5 }, gate())
+            .unwrap();
+        d.rebind_video(1, key, 0, 10).unwrap();
+        for i in 0..2_i64 {
+            let m = Some(mark(TICK * i128::from(i + 1)));
+            let p = if i == 0 { rap77(i) } else { video(i, 8, false) };
+            d.dispatch(
+                ve(key, u64::try_from(i).unwrap(), vec![p], m),
+                now,
+                &mut sink,
+            )
+            .unwrap();
+            feed_base(&mut d, &mut sink, 2, i, now, plain(i)).unwrap();
+            pop_all(&mut sink, 0, now);
+            pop_all(&mut sink, 1, now);
+        }
+        assert_eq!(d.binding_video_key(1), Some(key));
+        let _ = sink.queues[1].take_discontinuity();
+        let _ = d.take_move_outcomes();
+        d.retire_video_key(key).unwrap();
+        // Window 2 on key 1: a P picture, then a RAP (two packets).
+        let m = Some(mark(TICK * 3));
+        for k in 0..2 {
+            let packets = if k == 1 {
+                vec![video(2, 8, false), rap77(2)]
+            } else {
+                vec![video(2, 8, false)]
+            };
+            d.dispatch(ve(k, 2, packets, m), now, &mut sink).unwrap();
+        }
+        d.dispatch(ae(2, vec![audio(2, 0)], vec![m]), now, &mut sink)
+            .unwrap();
+        pop_all(&mut sink, 0, now);
+        assert_eq!(
+            d.take_move_outcomes(),
+            vec![MoveOutcome::Fallback { output_index: 1 }]
+        );
+        assert_eq!(
+            pop_all(&mut sink, 1, now),
+            vec![(77, 2)],
+            "the window starts at the RAP and keeps its audio"
+        );
+        assert_eq!(sink.queues[1].take_discontinuity(), None, "no loss");
+        assert_eq!(d.counters().dropped_pending, 0);
+    }
+
+    /// R: a fallback window with no RAP at all drops only its video (counted)
+    /// and keeps its audio, with no loss; the next window opens at its RAP.
+    #[test]
+    fn a_fallback_window_without_a_rap_keeps_its_audio_and_reports_no_loss() {
+        let now = Instant::now();
+        let mut d =
+            RenditionDispatcher::new(gated_cfg(vec![binding(0, 0, 1), binding(1, 1, 1)], 2, 1))
+                .unwrap();
+        let mut sink = FakeDelivery::new(2);
+        let key = d
+            .add_video_key(DtsTimeBase { num: 1, den: 5 }, gate())
+            .unwrap();
+        d.rebind_video(1, key, 0, 10).unwrap();
+        for i in 0..2_i64 {
+            let m = Some(mark(TICK * i128::from(i + 1)));
+            let p = if i == 0 { rap77(i) } else { video(i, 8, false) };
+            d.dispatch(
+                ve(key, u64::try_from(i).unwrap(), vec![p], m),
+                now,
+                &mut sink,
+            )
+            .unwrap();
+            feed_base(&mut d, &mut sink, 2, i, now, plain(i)).unwrap();
+            pop_all(&mut sink, 0, now);
+            pop_all(&mut sink, 1, now);
+        }
+        let _ = sink.queues[1].take_discontinuity();
+        let _ = d.take_move_outcomes();
+        d.retire_video_key(key).unwrap();
+        // Window 2: P only on key 1 -> audio only, no loss.
+        feed_base(&mut d, &mut sink, 2, 2, now, plain(2)).unwrap();
+        pop_all(&mut sink, 0, now);
+        assert_eq!(pop_all(&mut sink, 1, now), vec![(8, 1)], "audio kept");
+        assert_eq!(sink.queues[1].take_discontinuity(), None, "no loss");
+        assert_eq!(d.counters().dropped_pending, 1, "the video is counted");
+        // Window 3: the RAP opens the GOP.
+        feed_base(&mut d, &mut sink, 2, 3, now, |_| rap77(3)).unwrap();
+        pop_all(&mut sink, 0, now);
+        assert_eq!(pop_all(&mut sink, 1, now), vec![(77, 2)]);
+        assert_eq!(d.binding_video_key(1), Some(1));
     }
 
     #[test]
