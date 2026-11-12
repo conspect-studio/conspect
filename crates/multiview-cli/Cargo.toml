@@ -181,6 +181,12 @@ tempfile = "3"
 # Test-only certificates for `tests/tls_cli.rs` (offline status reads a stored
 # bundle; the dead-CA boot test needs a trust anchor). Already in the lock.
 rcgen = "0.14"
+# Test-only TLS client for `tests/tls_door.rs` (the real TCP door with
+# `[network.tls]`: bootstrap certificate, TLS-ALPN-01, renewal swap). rustls
+# 0.23 / tokio-rustls 0.26 with their default aws-lc-rs provider, already in
+# the lock via multiview-control's `tls`.
+rustls = "0.23"
+tokio-rustls = "0.26"
 # Test-only crypto for the device-ACTIVATE never-off-air chaos gate (ADR-I008): an
 # ECDSA-P256 root signs a fabricated attested keyset (so the chaos server's
 # `fetch_keys` passes `TrustedKeys::verify` and `activate_once` actually REACHES the
