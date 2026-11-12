@@ -1,5 +1,9 @@
 # Per-stream decoupled routing + instant switching (the crosspoint model)
 
+> **2026-11-12:** the output←program part of this brief (RT-12 sink-mover, RT-13 splice for routing,
+> RT-17) is re-scoped by [ADR-0108](../decisions/ADR-0108-output-routing-matrix.md); see
+> [output-routing.md](../architecture/output-routing.md) §10.
+>
 > Status: design brief feeding **ADR-0034**. Verification-hardened against the
 > as-built code (file:line cited inline) and reviewed adversarially. Where the
 > text *proposes* new surface it says so; where the code already does the thing,
