@@ -32,10 +32,12 @@
 //!   is `serving` ([`start_moq_when_serving`]), and then serves the ACME
 //!   certificate through `SourceResolver` (renewals reach new handshakes with
 //!   no restart), never the `MULTIVIEW_MOQ_CERTIFICATE` files;
-//! * slice 4's TCP 443 listener (not built yet) takes the TLS-ALPN-01-aware
-//!   resolver from [`front_door_tls`] and mounts
-//!   `multiview_control::tls_setup::front_door_router(state)` (the control
-//!   router behind the setup gate). The `[control] listen` listener stays the
+//! * the TCP door (slice 4) serves the ACME certificate source as its site
+//!   certificate (`[network.tls]` wins over `[control.tls]` for the door),
+//!   answers TLS-ALPN-01 (ALPN exactly `acme-tls/1`) from the
+//!   [`front_door_tls`] challenge resolver, and mounts
+//!   `multiview_control::tls_setup::front_door_router` (the control router
+//!   behind the setup gate). The `[control] listen` listener stays the
 //!   loopback admin listener and is not gated.
 
 use std::net::{IpAddr, SocketAddr};
@@ -266,30 +268,42 @@ impl FrontDoorRun {
 
     /// Attach the site to the TCP door: `server` (the control-plane router on
     /// the same serve options as the plain listener, observing its shutdown)
-    /// over `tls_site`. Without a TLS configuration the door keeps serving
-    /// ICE-TCP only (a warning says so).
+    /// over `tls_site`, and `acme` (the TLS-ALPN-01 responder, ALPN exactly
+    /// `acme-tls/1`) when `[network.tls]` is configured (slice 5). Without a
+    /// site TLS configuration the door keeps serving ICE-TCP only (a warning
+    /// says so).
     pub fn install_site(
         &self,
         server: multiview_control::ConnectionServer,
         tls_site: Option<multiview_frontdoor::SiteTlsConfig>,
+        acme: Option<multiview_frontdoor::SiteTlsConfig>,
     ) {
         let Some(tcp) = self.door.tcp_local_addr() else {
             return;
         };
         let Some(site) = tls_site else {
-            tracing::warn!(%tcp, "front-door TCP door: no site certificate ([control.tls] static, a `tls` build on unix), so TLS on the door is unavailable; ICE-TCP still runs");
+            tracing::warn!(%tcp, "front-door TCP door: no site certificate ([network.tls] in an `acme` build, or [control.tls] static in a `tls` build, on unix), so TLS on the door is unavailable; ICE-TCP still runs");
             return;
         };
+        let challenge = acme.is_some();
         let routing = multiview_frontdoor::TlsRouting {
             site: Some(site),
-            // TODO(#291): slice 5 wires the ACME `ChallengeResolver` here
-            // (TLS-ALPN-01); until then an `acme-tls/1` hello is closed.
-            acme: None,
+            acme,
         };
         let service: Arc<dyn multiview_frontdoor::SiteService> = Arc::new(ControlSite(server));
         if self.door.set_tls_routing(routing).is_ok() && self.door.set_site(Some(service)).is_ok() {
-            tracing::info!(%tcp, tls_site = true, "front-door TCP door serves the site (HTTP/1.1 over the [control.tls] certificate)");
+            if challenge {
+                tracing::info!(%tcp, tls_site = true, tls_alpn_01 = true, "front-door TCP door serves the site (HTTP/1.1 over the ACME certificate, behind the setup gate) and answers TLS-ALPN-01");
+            } else {
+                tracing::info!(%tcp, tls_site = true, "front-door TCP door serves the site (HTTP/1.1 over the [control.tls] certificate)");
+            }
         }
+    }
+
+    /// The bound TCP door address, if the door runs.
+    #[must_use]
+    pub fn tcp_local_addr(&self) -> Option<std::net::SocketAddr> {
+        self.door.tcp_local_addr()
     }
 
     /// The bound address.
@@ -351,9 +365,10 @@ impl FrontDoorRun {
     }
 }
 
-/// The resolver slice 4's TCP 443 listener installs (ACME certificate, with
-/// TLS-ALPN-01 challenges answered for ALPN `acme-tls/1`), when the run has
-/// `[network.tls]`. Mount it with `multiview_control::tls_setup::front_door_router`.
+/// The run's TLS-ALPN-01 challenge resolver (ACME certificate, with
+/// challenges answered for ALPN `acme-tls/1`), when the run has
+/// `[network.tls]`. The TCP door's `acme-tls/1` route serves it
+/// (`multiview_control::acme_challenge_server_config`).
 #[cfg(all(feature = "acme", unix))]
 #[must_use]
 pub fn front_door_tls() -> Option<Arc<multiview_control::certificate_source::ChallengeResolver>> {

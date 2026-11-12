@@ -299,7 +299,19 @@ impl TlsBoot {
             "tls: one-time setup code printed on stderr (valid 1 h, single use; \
              `multiview tls setup-code` mints a new one)"
         );
-        let behind_proxy = false;
+        // Section 5a: behind a reverse proxy TLS-ALPN-01 cannot reach the
+        // engine (the proxy terminates or routes TLS), so status reports the
+        // hint.
+        let behind_proxy = config.network.as_ref().and_then(|n| n.mode)
+            == Some(multiview_config::NetworkMode::BehindProxy);
+        if config.network.as_ref().and_then(|n| n.mode).is_none() {
+            tracing::warn!(
+                "tls: [network.tls] is configured but network.mode is not set, so the front \
+                 door has no TCP door: the setup page and TLS-ALPN-01 are unreachable from \
+                 outside and the certificate is used only by QUIC; set network.mode \
+                 (\"direct\" or \"behind_proxy\") with network.https_port"
+            );
+        }
         let context = Arc::new(TlsContext {
             source,
             certificates,

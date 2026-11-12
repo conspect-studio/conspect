@@ -267,6 +267,10 @@ pub fn router(state: AppState) -> Router {
     router_with(state, Surface::Admin)
 }
 
+/// The served router type ([`router`], [`tls_setup::front_door_router`]),
+/// named for callers that compose it without depending on axum directly.
+pub type ControlRouter = Router;
+
 /// Which listener a router is built for. The two differ only in the
 /// `/api/v1/tls/*` routes (ADR-0107 section 5a): the admin listener carries
 /// the loopback-only certificate admin routes, the front door the setup-code
@@ -281,17 +285,21 @@ pub enum Surface {
 
 /// [`router`] for an explicit [`Surface`].
 pub fn router_with(state: AppState, surface: Surface) -> Router {
-    #[cfg(not(all(feature = "acme", unix)))]
-    let _ = surface;
     // SEC-14: install the management-plane request-concurrency + rate caps only when
     // the operator has limits enabled (the default). Disabled ⇒ the router is exactly
     // what it was before — no middleware, no overhead.
     let limits_enabled = state.limiters.is_enabled();
-    if let Some(control) = state.output_routing.as_ref() {
-        output_routing::spawn_outcome_relay(&state, control);
-    }
-    if let Some(metrics) = state.program_metrics.as_ref() {
-        program_metrics::spawn_sampler(metrics);
+    // The background relay and sampler belong to the admin router, which every
+    // run builds. The front door router shares the same state. If it spawned
+    // them again, the sampler would push two samples per second and halve the
+    // metrics window.
+    if surface == Surface::Admin {
+        if let Some(control) = state.output_routing.as_ref() {
+            output_routing::spawn_outcome_relay(&state, control);
+        }
+        if let Some(metrics) = state.program_metrics.as_ref() {
+            program_metrics::spawn_sampler(metrics);
+        }
     }
 
     let api = routes::api_router()
@@ -928,6 +936,28 @@ pub fn site_server_config(
             source,
         )));
     config.alpn_protocols = vec![b"http/1.1".to_vec()];
+    Ok(std::sync::Arc::new(config))
+}
+
+/// The rustls [`ServerConfig`](rustls::ServerConfig) the front door's TCP door
+/// routes a TLS-ALPN-01 `ClientHello` to (ALPN exactly `acme-tls/1`, RFC 8737;
+/// slice 5, ADR-0107 section 5a): the same explicit `aws-lc-rs` provider as
+/// [`site_server_config`], the challenge certificate selected by `resolver`
+/// for the hello's SNI, and ALPN `acme-tls/1` only, so the challenge
+/// handshake can never negotiate the site protocol.
+///
+/// # Errors
+/// [`TlsSetupError::Rustls`] if the provider rejects the protocol versions.
+#[cfg(all(feature = "tls", unix))]
+pub fn acme_challenge_server_config(
+    resolver: std::sync::Arc<certificate_source::ChallengeResolver>,
+) -> Result<std::sync::Arc<rustls::ServerConfig>, TlsSetupError> {
+    let provider = std::sync::Arc::new(rustls::crypto::aws_lc_rs::default_provider());
+    let mut config = rustls::ServerConfig::builder_with_provider(provider)
+        .with_safe_default_protocol_versions()?
+        .with_no_client_auth()
+        .with_cert_resolver(resolver);
+    config.alpn_protocols = vec![b"acme-tls/1".to_vec()];
     Ok(std::sync::Arc::new(config))
 }
 

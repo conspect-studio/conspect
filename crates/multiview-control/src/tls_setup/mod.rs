@@ -120,12 +120,18 @@ fn setup_allowed(method: &Method, path: &str) -> bool {
 /// `state` must carry a TLS context ([`AppState::with_tls`]); without one the
 /// gate fails closed (every request is `503` setup-required).
 pub fn front_door_router(state: AppState) -> Router {
+    front_door_router_with(state, |router| router)
+}
+
+/// [`front_door_router`] with extra routes added by `extend` before the gate
+/// is applied. The run uses it to mount the `/hls/{output}` directories, so
+/// they sit behind the setup gate like every other route.
+pub fn front_door_router_with(state: AppState, extend: impl FnOnce(Router) -> Router) -> Router {
     let tls = state.tls.clone();
     let page = Router::new()
         .route("/tls-setup", get(setup_page))
         .with_state(state.clone());
-    crate::router_with(state, crate::Surface::FrontDoor)
-        .merge(page)
+    extend(crate::router_with(state, crate::Surface::FrontDoor).merge(page))
         .layer(axum::middleware::from_fn_with_state(tls, setup_gate))
 }
 
