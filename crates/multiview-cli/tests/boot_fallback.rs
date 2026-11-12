@@ -241,7 +241,7 @@ async fn non_bootable_saved_state_without_last_good_fails_with_the_clear_error()
         before,
         "nothing moved"
     );
-    assert!(rejected_files(&path).is_empty());
+    assert_eq!(rejected_files(&path).len(), 0);
 }
 
 #[tokio::test]
@@ -265,8 +265,9 @@ async fn a_build_failure_falls_back_only_when_last_good_differs_and_builds() {
     // NOT moved aside.
     let both = fallback_after_build_failure(&start, &path, "boom", |_| Err::<(), _>("boom".into()));
     assert!(both.unwrap_err().contains("does not build either"));
-    assert!(
-        rejected_files(&path).is_empty(),
+    assert_eq!(
+        rejected_files(&path).len(),
+        0,
         "never quarantined on a global fault"
     );
     // The last-good build succeeds: fall back.
