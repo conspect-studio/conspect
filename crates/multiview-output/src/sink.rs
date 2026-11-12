@@ -136,6 +136,16 @@ pub trait PacketSource {
     /// # Errors
     /// Returns an [`Error`] if the upstream packet feed failed.
     fn next_packet(&mut self) -> Result<Option<EncodedPacket>>;
+
+    /// Whether the packet most recently returned by [`Self::next_packet`]
+    /// opens a window whose decoder configuration changed (a routing move onto
+    /// a RAP with different parameter sets). Reported at most once per change;
+    /// a segmenting muxer asks only at a video keyframe and marks the segment
+    /// that starts there discontinuous. Sources without the notion keep the
+    /// default `false`.
+    fn take_decoder_config_change(&mut self) -> bool {
+        false
+    }
 }
 
 /// One muxer stream's registration: the `Send` codec-params snapshot it is
@@ -2803,7 +2813,8 @@ impl<'a> SegmentState<'a> {
             }
             let pts = pts_from_packet(packet.pts(), self.stats.packets, self.time_base);
             let boundary = packet.kind() == StreamKind::Video && packet.is_keyframe();
-            if let Err(error) = self.write_source_packet(packet, pts) {
+            let config_changed = boundary && source.take_decoder_config_change();
+            if let Err(error) = self.write_packet_marking(packet, pts, config_changed) {
                 // A segment-boundary failure can be a playlist publication or
                 // file-system fault, not a damaged muxer. Let the supervisor
                 // handle it rather than silently hide a stale live playlist.
@@ -2844,7 +2855,21 @@ impl<'a> SegmentState<'a> {
         Ok(())
     }
 
+    /// Write one source packet with no decoder-config change (unit tests).
+    #[cfg(test)]
     fn write_source_packet(&mut self, packet: EncodedPacket, pts: MediaTime) -> Result<()> {
+        self.write_packet_marking(packet, pts, false)
+    }
+
+    /// As [`Self::write_source_packet`]; `config_changed` (a video keyframe
+    /// opening a new decoder configuration) marks the segment that starts at
+    /// it `EXT-X-DISCONTINUITY` in every media playlist.
+    fn write_packet_marking(
+        &mut self,
+        packet: EncodedPacket,
+        pts: MediaTime,
+        config_changed: bool,
+    ) -> Result<()> {
         match packet.kind() {
             StreamKind::Video => {
                 // Only a VIDEO keyframe rotates a segment (the GOP boundary —
@@ -2852,6 +2877,9 @@ impl<'a> SegmentState<'a> {
                 let is_key = packet.is_keyframe();
                 if is_key {
                     self.start_segment(pts)?;
+                    if config_changed {
+                        self.mark_started_segment_discontinuous();
+                    }
                 }
                 self.write_audio_rendition(&packet)?;
                 #[cfg(test)]
@@ -2901,6 +2929,24 @@ impl<'a> SegmentState<'a> {
             _ => {}
         }
         Ok(())
+    }
+
+    /// The segment just started (its predecessor is already pushed) begins a
+    /// new decoder configuration: every media playlist (main, video and audio
+    /// renditions) lists it after `EXT-X-DISCONTINUITY`, at the same point.
+    fn mark_started_segment_discontinuous(&mut self) {
+        if let Some(renditions) = self.renditions.as_mut() {
+            for state in renditions
+                .states
+                .iter_mut()
+                .chain(std::iter::once(&mut renditions.video))
+            {
+                state.live.set_initial_discontinuity();
+            }
+        }
+        if let Some(live) = self.live.as_mut() {
+            live.set_initial_discontinuity();
+        }
     }
 
     /// Drop every damaged in-flight file and muxer before reopening at a RAP.
@@ -3613,6 +3659,95 @@ mod tests {
         assert!(!playlist.contains("seg0.ts"));
         assert!(playlist.contains("#EXT-X-DISCONTINUITY\n"));
         assert!(playlist.contains("seg1.ts"));
+    }
+
+    /// A video keyframe flagged as a decoder-config change (a routing move
+    /// onto different parameter sets) puts exactly one `EXT-X-DISCONTINUITY`
+    /// immediately before the segment that STARTS at it; an unflagged run has
+    /// none.
+    #[test]
+    fn a_decoder_config_change_marks_the_segment_starting_at_its_keyframe() {
+        use super::{PacketSource, SegmentState, StreamSeed};
+        use crate::hls::LivePlaylist;
+        use ffmpeg::codec::packet::{Flags, Packet};
+        use multiview_ffmpeg::{EncodedPacket, StreamCodecParameters, VideoEncoder};
+
+        struct Flagged {
+            packets: std::vec::IntoIter<EncodedPacket>,
+            flag_pts: Option<i64>,
+            last_pts: Option<i64>,
+        }
+        impl PacketSource for Flagged {
+            fn next_packet(&mut self) -> Result<Option<EncodedPacket>> {
+                let next = self.packets.next();
+                self.last_pts = next.as_ref().and_then(EncodedPacket::pts);
+                Ok(next)
+            }
+            fn take_decoder_config_change(&mut self) -> bool {
+                self.last_pts.is_some() && self.last_pts == self.flag_pts
+            }
+        }
+        let run = |flag_pts: Option<i64>| -> String {
+            let dir = tempfile::tempdir().unwrap();
+            let encoder = VideoEncoder::new(&EncodeConfig::mpeg2(WIDTH, HEIGHT).target()).unwrap();
+            let params = StreamCodecParameters::from_encoder(&encoder);
+            let mut state = SegmentState::new(
+                StreamSeed::Params(&params),
+                encoder.time_base(),
+                None,
+                dir.path(),
+                "seg",
+            );
+            state.live = Some(LivePlaylist::new(dir.path().join("index.m3u8"), 10));
+            // Keyframes at 0, 3, 6, 9: segments seg0..seg3 start there.
+            let packets: Vec<EncodedPacket> = (0..12)
+                .map(|index| {
+                    let mut packet = Packet::copy(&[0, 0, 1, 0, 0, 8, 0, 0]);
+                    packet.set_flags(if index % 3 == 0 {
+                        Flags::KEY
+                    } else {
+                        Flags::empty()
+                    });
+                    packet.set_pts(Some(index));
+                    packet.set_dts(Some(index));
+                    EncodedPacket::from_packet(packet)
+                })
+                .collect();
+            let mut source = Flagged {
+                packets: packets.into_iter(),
+                flag_pts,
+                last_pts: None,
+            };
+            state.drive_from_packets(&mut source).unwrap();
+            let mut report = crate::hls::MediaPlaylist::new(crate::hls::SegmentType::MpegTs);
+            state.finish(&mut report, 33_333_333).unwrap();
+            std::fs::read_to_string(dir.path().join("index.m3u8")).unwrap()
+        };
+        let _counter_guard = counter_guard();
+        let plain = run(None);
+        assert!(
+            !plain.contains("#EXT-X-DISCONTINUITY\n"),
+            "no flag, no discontinuity:\n{plain}"
+        );
+        let flagged = run(Some(6));
+        assert_eq!(
+            flagged.matches("#EXT-X-DISCONTINUITY\n").count(),
+            1,
+            "{flagged}"
+        );
+        let lines: Vec<&str> = flagged.lines().collect();
+        let at = lines
+            .iter()
+            .position(|l| *l == "#EXT-X-DISCONTINUITY")
+            .unwrap();
+        let next_uri = lines[at + 1..]
+            .iter()
+            .find(|l| !l.starts_with('#'))
+            .unwrap();
+        assert_eq!(
+            *next_uri, "seg2.ts",
+            "the discontinuity precedes the segment starting at the flagged keyframe:\n{flagged}"
+        );
     }
 
     #[test]

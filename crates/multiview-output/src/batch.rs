@@ -247,6 +247,7 @@ struct Queued {
     batch: Arc<PacketBatch>,
     offered_at: Instant,
     generation: u64,
+    decoder_config_changed: bool,
 }
 
 /// One queue's locally owned admission state. Operations never wait for clients.
@@ -264,6 +265,9 @@ pub struct BoundedBatchQueue {
     max_age: Duration,
     recovery_gate: Option<RecoveryGate>,
     closed: bool,
+    /// A `mark_discontinuity(DecoderConfigChanged)` whose generation has not
+    /// admitted its first window yet: that window's lease reports it.
+    config_change_pending: bool,
 }
 
 impl Default for BoundedBatchQueue {
@@ -292,6 +296,7 @@ impl BoundedBatchQueue {
             max_age: max_age.min(MAX_QUEUE_AGE),
             recovery_gate: None,
             closed: false,
+            config_change_pending: false,
         }
     }
 
@@ -386,10 +391,12 @@ impl BoundedBatchQueue {
         debug_assert!(self.reservations.packets.load(Ordering::Acquire) <= packets);
         debug_assert!(self.reservations.bytes.load(Ordering::Acquire) <= bytes);
         self.needs_keyframe = false;
+        let decoder_config_changed = std::mem::take(&mut self.config_change_pending);
         self.entries.push_back(Queued {
             batch,
             offered_at: now,
             generation: self.generation(),
+            decoder_config_changed,
         });
         Ok(())
     }
@@ -422,6 +429,7 @@ impl BoundedBatchQueue {
         Ok(self.entries.pop_front().map(|entry| BatchLease {
             batch: entry.batch,
             generation: entry.generation,
+            decoder_config_changed: entry.decoder_config_changed,
             reservations: Arc::clone(&self.reservations),
         }))
     }
@@ -474,9 +482,17 @@ impl BoundedBatchQueue {
     /// backlog nor arms the RAP gate, so it can never reject the cut window
     /// itself. When a loss is already pending (the gate is armed), that loss's
     /// generation bump is the reset and nothing more is recorded.
+    ///
+    /// With [`OfferError::DecoderConfigChanged`] the first window admitted
+    /// after this call reports [`BatchLease::decoder_config_changed`], so a
+    /// muxer that carries parameter sets out of band per segment (HLS) can
+    /// mark the segment starting there discontinuous.
     pub fn mark_discontinuity(&mut self, reason: OfferError) {
         if self.closed || self.needs_keyframe {
             return;
+        }
+        if reason == OfferError::DecoderConfigChanged {
+            self.config_change_pending = true;
         }
         let generation = self.reservations.generation.fetch_add(1, Ordering::AcqRel) + 1;
         match &mut self.pending_discontinuity {
@@ -563,6 +579,9 @@ impl BoundedBatchQueue {
     }
 
     fn invalidate(&mut self, reason: OfferError) {
+        // A loss starts its own generation: a pending decoder-config change
+        // no longer names the first window of a generation.
+        self.config_change_pending = false;
         if !self.needs_keyframe {
             let generation = self.reservations.generation.fetch_add(1, Ordering::AcqRel) + 1;
             self.pending_discontinuity = Some(Discontinuity {
@@ -608,6 +627,7 @@ impl Drop for BoundedBatchQueue {
 pub struct BatchLease {
     batch: Arc<PacketBatch>,
     generation: u64,
+    decoder_config_changed: bool,
     reservations: Arc<Reservations>,
 }
 
@@ -628,6 +648,16 @@ impl BatchLease {
     #[must_use]
     pub fn generation(&self) -> u64 {
         self.generation
+    }
+
+    /// True only for the first window admitted after
+    /// [`BoundedBatchQueue::mark_discontinuity`] with
+    /// [`OfferError::DecoderConfigChanged`]: this window opens at a RAP whose
+    /// decoder configuration differs from the previous window's. A loss
+    /// ([`BoundedBatchQueue::report_loss`]) never sets it.
+    #[must_use]
+    pub fn decoder_config_changed(&self) -> bool {
+        self.decoder_config_changed
     }
 
     /// False after a loss invalidated this lease while a worker held it.
@@ -853,6 +883,36 @@ mod tests {
         assert_eq!(
             q.take_discontinuity().unwrap().reason,
             OfferError::ProducerLoss
+        );
+    }
+
+    #[test]
+    fn only_the_first_lease_after_a_config_change_reports_it() {
+        let now = Instant::now();
+        let mut q = strict_queue();
+        q.try_offer(h264_au(0x65, true), now).unwrap();
+        q.mark_discontinuity(OfferError::DecoderConfigChanged);
+        q.try_offer(h264_au(0x65, true), now).unwrap();
+        q.try_offer(h264_au(0x41, false), now).unwrap();
+        let flags: Vec<bool> = (0..3)
+            .map(|_| q.pop_at(now).unwrap().unwrap().decoder_config_changed())
+            .collect();
+        assert_eq!(flags, [false, true, false], "only the cut window");
+        // Another discontinuity reason never sets it.
+        q.mark_discontinuity(OfferError::ProducerLoss);
+        q.try_offer(h264_au(0x65, true), now).unwrap();
+        assert!(!q.pop_at(now).unwrap().unwrap().decoder_config_changed());
+        // A loss never sets it, and cancels a pending config change: the
+        // recovery window starts a loss generation.
+        q.mark_discontinuity(OfferError::DecoderConfigChanged);
+        q.report_loss(OfferError::ProducerLoss);
+        q.try_offer(h264_au(0x65, true), now).unwrap();
+        assert!(!q.pop_at(now).unwrap().unwrap().decoder_config_changed());
+        q.report_loss(OfferError::DecoderConfigChanged);
+        q.try_offer(h264_au(0x65, true), now).unwrap();
+        assert!(
+            !q.pop_at(now).unwrap().unwrap().decoder_config_changed(),
+            "report_loss never sets the flag, whatever its reason"
         );
     }
 
