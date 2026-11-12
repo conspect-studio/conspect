@@ -10,8 +10,8 @@
 //! Isolation (invariant #10): every call on the trait is non-blocking
 //! (`try_take` is a bounded `try_send`, `snapshot` a wait-free load). The
 //! outcome relay runs on its own thread + task and never touches the clock.
-//! All state here is bounded: the take-record map (one record per reserved
-//! `Idempotency-Key`, same cap and same lifetime as the key) and both rate
+//! All state here is bounded: the take store (one record per take
+//! `Idempotency-Key`, fail-closed at its cap, never evicted) and both rate
 //! limiters have fixed caps.
 
 use std::collections::{HashMap, VecDeque};
@@ -195,9 +195,11 @@ pub trait OutputRouting: Send + Sync {
 /// Shared handle to an installed [`OutputRouting`].
 pub type SharedOutputRouting = Arc<dyn OutputRouting>;
 
-/// Take records kept beside the idempotency store: the same cap, and a record
-/// is created only with a fresh key reservation and removed only with that
-/// key's release, so a record can never be evicted while its key replays.
+/// Take records held by the take store. At the cap a new distinct key fails
+/// closed (`idempotency-capacity`); a record is never evicted, so every key
+/// that was answered `accepted` replays its own operation for the life of the
+/// process (the same lifetime as [`crate::concurrency::IdempotencyStore`]
+/// keys, which also never expire).
 pub const MAX_TAKE_RECORDS: usize = crate::concurrency::MAX_IDEMPOTENCY_RESERVATIONS;
 /// Takes per second per output (§6.4).
 pub const TAKES_PER_OUTPUT_PER_SEC: usize = 2;
@@ -231,51 +233,91 @@ pub struct PendingTake {
 /// A take's record for the life of its `Idempotency-Key`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct TakeRecord {
+    operation_id: crate::command::OperationId,
     take: PendingTake,
     outcome: Option<RecordedOutcome>,
 }
 
-/// A bounded, insertion-ordered map (oldest evicted first).
-#[derive(Debug)]
-struct BoundedMap<V> {
-    cap: usize,
-    map: HashMap<String, V>,
-    order: VecDeque<String>,
+/// The result of [`OutputRoutingControl::reserve_take`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TakeReservation {
+    /// The key was unseen: enqueue the take under this new operation id.
+    Fresh(crate::command::OperationId),
+    /// The key already names a take: answer it, never enqueue again.
+    Replay(TakeReplay),
+    /// The store is full: fail closed (`idempotency-capacity`).
+    Capacity,
 }
 
-impl<V> BoundedMap<V> {
+/// What a replayed key answers: its own operation and, once known, outcome.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TakeReplay {
+    /// The operation the key's first request enqueued.
+    pub operation_id: crate::command::OperationId,
+    /// Its terminal outcome, once the engine reported it.
+    pub outcome: Option<RecordedOutcome>,
+}
+
+/// The take-scoped idempotency store: scoped key → record, plus operation id
+/// → scoped key for settling. Bounded by `cap`; never evicts.
+#[derive(Debug)]
+struct TakeStore {
+    cap: usize,
+    by_key: HashMap<String, TakeRecord>,
+    by_op: HashMap<String, String>,
+}
+
+impl TakeStore {
     fn new(cap: usize) -> Self {
         Self {
             cap,
-            map: HashMap::new(),
-            order: VecDeque::new(),
+            by_key: HashMap::new(),
+            by_op: HashMap::new(),
         }
     }
 
-    fn insert(&mut self, key: String, value: V) {
-        if self.map.insert(key.clone(), value).is_none() {
-            self.order.push_back(key);
+    fn replay(&self, key: &str) -> Option<TakeReplay> {
+        self.by_key.get(key).map(|r| TakeReplay {
+            operation_id: r.operation_id.clone(),
+            outcome: r.outcome.clone(),
+        })
+    }
+
+    fn reserve(&mut self, key: &str, take: PendingTake) -> TakeReservation {
+        if let Some(replay) = self.replay(key) {
+            return TakeReservation::Replay(replay);
         }
-        while self.map.len() > self.cap {
-            let Some(oldest) = self.order.pop_front() else {
-                break;
-            };
-            self.map.remove(&oldest);
+        if self.by_key.len() >= self.cap {
+            return TakeReservation::Capacity;
+        }
+        let op = crate::command::OperationId::new();
+        self.by_op.insert(op.as_str().to_owned(), key.to_owned());
+        self.by_key.insert(
+            key.to_owned(),
+            TakeRecord {
+                operation_id: op.clone(),
+                take,
+                outcome: None,
+            },
+        );
+        TakeReservation::Fresh(op)
+    }
+
+    fn release(&mut self, key: &str, op: &crate::command::OperationId) {
+        if self.by_key.get(key).is_some_and(|r| r.operation_id == *op) {
+            self.by_key.remove(key);
+            self.by_op.remove(op.as_str());
         }
     }
 
-    fn remove(&mut self, key: &str) -> Option<V> {
-        let value = self.map.remove(key)?;
-        self.order.retain(|k| k != key);
-        Some(value)
+    fn record_mut(&mut self, operation_id: &str) -> Option<&mut TakeRecord> {
+        let key = self.by_op.get(operation_id)?;
+        self.by_key.get_mut(key)
     }
 
-    fn get(&self, key: &str) -> Option<&V> {
-        self.map.get(key)
-    }
-
-    fn get_mut(&mut self, key: &str) -> Option<&mut V> {
-        self.map.get_mut(key)
+    fn record(&self, operation_id: &str) -> Option<&TakeRecord> {
+        let key = self.by_op.get(operation_id)?;
+        self.by_key.get(key)
     }
 }
 
@@ -397,11 +439,15 @@ pub struct OutputRoutingControl {
     pub routing: SharedOutputRouting,
     /// The take rate limits.
     pub limiter: TakeLimiter,
-    /// Operation id → take record. Inserted only after a fresh key
-    /// reservation and removed only with that key's release; the idempotency
-    /// store never holds more than [`MAX_TAKE_RECORDS`] keys, so the bound
-    /// below is never reached by eviction (it stays as a backstop).
-    records: Mutex<BoundedMap<TakeRecord>>,
+    /// The take-scoped idempotency store. It alone owns the replay decision
+    /// of `POST /routing/output/take`: the route does not use the
+    /// process-global [`crate::concurrency::IdempotencyStore`], so a foreign
+    /// `release`/`rebind` of the same raw string there (as switcher,
+    /// discovery and command submission do) can never change a take's replay.
+    /// Keys arrive already scoped by principal, method and path (the
+    /// [`crate::concurrency::IdempotencyKey`] extractor), so two principals'
+    /// equal raw keys are two takes.
+    records: Mutex<TakeStore>,
 }
 
 impl std::fmt::Debug for OutputRoutingControl {
@@ -418,29 +464,32 @@ impl OutputRoutingControl {
         Self {
             routing,
             limiter: TakeLimiter::default(),
-            records: Mutex::new(BoundedMap::new(MAX_TAKE_RECORDS)),
+            records: Mutex::new(TakeStore::new(MAX_TAKE_RECORDS)),
         }
     }
 
-    fn records(&self) -> std::sync::MutexGuard<'_, BoundedMap<TakeRecord>> {
+    fn records(&self) -> std::sync::MutexGuard<'_, TakeStore> {
         self.records.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// Record an accepted take for the life of its reserved key. Call only
-    /// after a fresh reservation of that key.
-    pub fn track(&self, operation_id: &str, pending: PendingTake) {
-        self.records().insert(
-            operation_id.to_owned(),
-            TakeRecord {
-                take: pending,
-                outcome: None,
-            },
-        );
+    /// The replay of a take key already reserved, without reserving (lets the
+    /// route answer a retry before its rate limits and existence checks).
+    #[must_use]
+    pub fn replay(&self, key: &str) -> Option<TakeReplay> {
+        self.records().replay(key)
     }
 
-    /// Forget a take that never reached the engine (with its key's release).
-    pub fn untrack(&self, operation_id: &str) {
-        self.records().remove(operation_id);
+    /// Reserve `key` for a take of `pending`: fresh, replay of the key's own
+    /// operation, or capacity (fail closed; nothing is evicted). The record
+    /// exists before the enqueue, so an outcome can never beat it.
+    pub fn reserve_take(&self, key: &str, pending: PendingTake) -> TakeReservation {
+        self.records().reserve(key, pending)
+    }
+
+    /// Free `key` after its own take failed to enqueue (busy/unroutable), but
+    /// only if it still names `op`.
+    pub fn release_take(&self, key: &str, op: &crate::command::OperationId) {
+        self.records().release(key, op);
     }
 
     /// Record a terminal outcome on its take; returns the take it settles,
@@ -450,7 +499,7 @@ impl OutputRoutingControl {
             return None;
         }
         let mut records = self.records();
-        let record = records.get_mut(&outcome.operation_id)?;
+        let record = records.record_mut(&outcome.operation_id)?;
         record.outcome = Some(RecordedOutcome {
             outcome: outcome.outcome.clone(),
             tick: outcome.tick,
@@ -462,7 +511,7 @@ impl OutputRoutingControl {
     #[must_use]
     pub fn outcome_of(&self, operation_id: &str) -> Option<RecordedOutcome> {
         self.records()
-            .get(operation_id)
+            .record(operation_id)
             .and_then(|r| r.outcome.clone())
     }
 
@@ -470,7 +519,7 @@ impl OutputRoutingControl {
     #[must_use]
     pub fn pending_api_id(&self, operation_id: &str) -> Option<String> {
         self.records()
-            .get(operation_id)
+            .record(operation_id)
             .filter(|r| r.outcome.is_none())
             .map(|r| r.take.api_id.clone())
     }
@@ -478,7 +527,7 @@ impl OutputRoutingControl {
     /// Take records held (bounded by [`MAX_TAKE_RECORDS`]).
     #[must_use]
     pub fn records_len(&self) -> usize {
-        self.records().map.len()
+        self.records().by_key.len()
     }
 }
 
@@ -642,13 +691,36 @@ mod tests {
     }
 
     #[test]
-    fn recorded_outcomes_are_bounded() {
-        let mut map = BoundedMap::new(3);
-        for i in 0..10 {
-            map.insert(format!("k{i}"), i);
+    fn take_records_are_bounded_and_fail_closed_without_eviction() {
+        let mut store = TakeStore::new(3);
+        let pending = || PendingTake {
+            api_id: "o".to_owned(),
+            feed: RoutedFeed::Program,
+        };
+        let mut ops = Vec::new();
+        for i in 0..3 {
+            let TakeReservation::Fresh(op) = store.reserve(&format!("k{i}"), pending()) else {
+                panic!("fresh");
+            };
+            ops.push(op);
         }
-        assert_eq!(map.map.len(), 3);
-        assert!(map.get("k9").is_some() && map.get("k0").is_none());
+        assert_eq!(store.reserve("k9", pending()), TakeReservation::Capacity);
+        assert_eq!(store.by_key.len(), 3);
+        for (i, op) in ops.iter().enumerate() {
+            let Some(replay) = store.replay(&format!("k{i}")) else {
+                panic!("k{i} evicted");
+            };
+            assert_eq!(&replay.operation_id, op);
+        }
+        // A release with a stale op is a no-op; the owner's frees the key.
+        store.release("k0", &crate::command::OperationId::new());
+        assert!(store.replay("k0").is_some());
+        store.release("k0", &ops[0]);
+        assert!(store.replay("k0").is_none() && store.record(ops[0].as_str()).is_none());
+        assert!(matches!(
+            store.reserve("k9", pending()),
+            TakeReservation::Fresh(_)
+        ));
     }
 
     #[test]

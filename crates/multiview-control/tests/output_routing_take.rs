@@ -807,22 +807,9 @@ async fn an_early_reserved_key_survives_many_later_takes_and_still_persists() {
     assert_eq!(first["status"], "accepted");
     let op = first["operation_id"].as_str().unwrap().to_owned();
     // 1500 later accepted takes (past the old 1024 cap), recorded the way the
-    // route records them: a fresh key reservation, then the take record.
+    // route records them: a fresh reservation in the take store.
     let control = rig.state.output_routing.clone().unwrap();
-    for i in 0..1500 {
-        let multiview_control::concurrency::Reservation::Fresh(later) =
-            rig.state.idempotency.reserve(Some(&format!("later-{i}")))
-        else {
-            panic!("fresh reservation");
-        };
-        control.track(
-            later.as_str(),
-            multiview_control::output_routing::PendingTake {
-                api_id: "output-0".to_owned(),
-                feed: RoutedFeed::Program,
-            },
-        );
-    }
+    fill_take_store(&control, "later", 1500);
     // Replay the early key with a different body.
     let replay = send(
         &rig.router,
@@ -906,6 +893,175 @@ async fn replays_for_other_bodies_never_apply_twice_and_take_requires_a_key() {
     )
     .await;
     assert_eq!(rig.fake.takes().len(), 1);
+}
+
+/// Reserve `n` distinct takes in the take store the way the route does.
+fn fill_take_store(
+    control: &multiview_control::output_routing::OutputRoutingControl,
+    prefix: &str,
+    n: usize,
+) {
+    for i in 0..n {
+        let reserved = control.reserve_take(
+            &format!("{prefix}-{i}"),
+            multiview_control::output_routing::PendingTake {
+                api_id: "output-0".to_owned(),
+                feed: RoutedFeed::Program,
+            },
+        );
+        assert!(
+            matches!(
+                reserved,
+                multiview_control::output_routing::TakeReservation::Fresh(_)
+            ),
+            "fresh reservation {i}: {reserved:?}"
+        );
+    }
+}
+
+/// The scoped key the `IdempotencyKey` extractor derives for a take (the
+/// route is nested under `/api/v1`, so the extractor sees the inner path).
+fn scoped_take_key(key_id: &str, raw: &str) -> String {
+    let path = "/routing/output/take";
+    format!(
+        "4:POST:{}:{key_id}:{}:{path}:{}:{raw}",
+        key_id.len(),
+        path.len(),
+        raw.len()
+    )
+}
+
+/// Review E1(a): the take store fails closed at its cap and never evicts:
+/// with 4096 records one more distinct key is `idempotency-capacity`, nothing
+/// is enqueued, and the oldest key still replays its own operation + outcome.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_full_take_store_fails_closed_and_the_oldest_key_still_replays() {
+    let dir = tempfile::tempdir().unwrap();
+    let rig = rig(&dir.path().join("boot.toml"), true);
+    let src = serde_json::json!({"source": "bars"});
+    let first = body_json(
+        send(
+            &rig.router,
+            take(&rig, OPERATOR_TOKEN, "oldest", "output-1", src.clone()),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(first["status"], "accepted");
+    let op = first["operation_id"].as_str().unwrap().to_owned();
+    rig.fake.emit(&op, OUT_B_CONFIG_ID, "refused:capacity");
+    let control = rig.state.output_routing.clone().unwrap();
+    wait_for(|| control.outcome_of(&op).is_some()).await;
+    let cap = multiview_control::output_routing::MAX_TAKE_RECORDS;
+    assert_eq!(cap, 4096);
+    fill_take_store(&control, "filler", cap - 1);
+    assert_eq!(control.records_len(), cap);
+    let resp = send(
+        &rig.router,
+        take(&rig, OPERATOR_TOKEN, "one-more", "output-1", src.clone()),
+    )
+    .await;
+    let status = resp.status();
+    let problem = body_json(resp).await;
+    assert!(
+        problem["type"]
+            .as_str()
+            .is_some_and(|t| t.ends_with("idempotency-capacity")),
+        "{status} {problem}"
+    );
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(rig.fake.takes().len(), 1, "the refused key never enqueued");
+    assert_eq!(control.records_len(), cap, "nothing evicted, nothing added");
+    let replay = body_json(
+        send(
+            &rig.router,
+            take(&rig, OPERATOR_TOKEN, "oldest", "output-1", src),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(replay["operation_id"], op.as_str());
+    assert_eq!(replay["status"], "settled");
+    assert_eq!(replay["outcome"], "refused:capacity");
+    assert_eq!(replay["tick"], 77);
+    assert_eq!(rig.fake.takes().len(), 1);
+}
+
+/// Review E1(b): another route releasing (or rebinding) the same scoped string
+/// in the process-global idempotency store, as switcher / discovery / command
+/// submission do, never changes a take's replay.
+#[tokio::test]
+async fn a_foreign_global_release_never_changes_a_take_replay() {
+    let dir = tempfile::tempdir().unwrap();
+    let rig = rig(&dir.path().join("boot.toml"), true);
+    let src = serde_json::json!({"source": "bars"});
+    let first = body_json(
+        send(
+            &rig.router,
+            take(&rig, OPERATOR_TOKEN, "shared", "output-1", src.clone()),
+        )
+        .await,
+    )
+    .await;
+    let op = first["operation_id"].as_str().unwrap().to_owned();
+    let scoped = scoped_take_key("operator-key", "shared");
+    match rig.state.idempotency.reserve(Some(&scoped)) {
+        multiview_control::concurrency::Reservation::Fresh(foreign)
+        | multiview_control::concurrency::Reservation::Replay(foreign) => {
+            rig.state.idempotency.release(Some(&scoped), &foreign);
+        }
+        multiview_control::concurrency::Reservation::Capacity => panic!("capacity"),
+    }
+    let replay = body_json(
+        send(
+            &rig.router,
+            take(&rig, OPERATOR_TOKEN, "shared", "output-1", src),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(replay["operation_id"], op.as_str(), "{replay}");
+    assert_eq!(replay["status"], "pending");
+    assert!(replay.get("adopt").is_none());
+    assert_eq!(rig.fake.takes().len(), 1, "exactly one enqueue");
+}
+
+/// Review E1(c): the take key is scoped by principal (and method + path):
+/// two principals with the same raw key get two separate takes.
+#[tokio::test]
+async fn two_principals_with_the_same_raw_key_get_separate_takes() {
+    let dir = tempfile::tempdir().unwrap();
+    let rig = rig(&dir.path().join("boot.toml"), true);
+    let src = serde_json::json!({"source": "bars"});
+    let mut ops = Vec::new();
+    for token in [OPERATOR_TOKEN, support::ADMIN_TOKEN] {
+        let resp = body_json(
+            send(
+                &rig.router,
+                take(&rig, token, "same", "output-1", src.clone()),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(resp["status"], "accepted", "{resp}");
+        ops.push(resp["operation_id"].as_str().unwrap().to_owned());
+    }
+    assert_ne!(ops[0], ops[1]);
+    let takes = rig.fake.takes();
+    assert_eq!(takes.len(), 2);
+    assert_eq!(takes[0].principal, "operator-key");
+    assert_eq!(takes[1].principal, "admin-key");
+    // Each principal's replay answers its own operation.
+    let replay = body_json(
+        send(
+            &rig.router,
+            take(&rig, support::ADMIN_TOKEN, "same", "output-1", src),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(replay["operation_id"], ops[1].as_str());
+    assert_eq!(rig.fake.takes().len(), 2);
 }
 
 struct Counters(Arc<multiview_engine::lateness::TickLateness>);

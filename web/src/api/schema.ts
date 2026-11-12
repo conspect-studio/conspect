@@ -16340,7 +16340,7 @@ export interface operations {
                     "application/json": components["schemas"]["Problem"];
                 };
             };
-            /** @description `engine-busy`: the take mailbox is full. */
+            /** @description `engine-busy`: the take mailbox is full (the key is freed); or `idempotency-capacity`: the take store holds its maximum of distinct keys (fails closed; existing keys still replay). */
             503: {
                 headers: {
                     [name: string]: unknown;

@@ -6,9 +6,15 @@
 //! (source: `authorize_object(source)`; bus: Program scope + `me1`) — all
 //! **before** existence, so an id the caller may not read is a 403 whether or
 //! not it exists. Then the take checks the `Idempotency-Key` (a replay answers
-//! from the record), the rate limits (429 + `Retry-After`), existence (404 /
-//! `unknown-feed`), and only then reserves the key and enqueues
-//! (`try_send`; full → 503 `engine-busy`, the reservation released).
+//! from the take's own record), the rate limits (429 + `Retry-After`),
+//! existence (404 / `unknown-feed`), and only then reserves the key in the
+//! take store and enqueues (`try_send`; full → 503 `engine-busy`, the
+//! reservation released).
+//!
+//! The take's replay decision is owned by
+//! [`crate::output_routing::OutputRoutingControl`]'s take store, never by the
+//! process-global [`crate::concurrency::IdempotencyStore`]: other routes
+//! `release`/`rebind` keys there, and a take's replay must not depend on them.
 
 use std::time::Instant;
 
@@ -19,10 +25,11 @@ use multiview_config::VideoFeed;
 use serde::{Deserialize, Serialize};
 
 use crate::auth::{Action, Principal};
-use crate::concurrency::{IdempotencyKey, Reservation};
+use crate::concurrency::IdempotencyKey;
 use crate::error::{ControlError, ControlResult};
 use crate::output_routing::{
-    OutputTakeRequest, PendingTake, PlanRefusal, RoutedFeed, TakeSubmitError,
+    OutputTakeRequest, PendingTake, PlanRefusal, RoutedFeed, TakeReplay, TakeReservation,
+    TakeSubmitError,
 };
 use crate::problem::Problem;
 use crate::state::AppState;
@@ -307,13 +314,13 @@ fn accepted(body: OutputTakeAccepted) -> Response {
     (StatusCode::ACCEPTED, Json(body)).into_response()
 }
 
-/// The `202` of a replayed key: the reserved op and, once known, its outcome.
-/// Never re-enqueues and never answers `adopt` again: the take record lives
-/// exactly as long as the key, so a replay always meets its own operation.
-fn replayed(control: &crate::output_routing::OutputRoutingControl, op: &str) -> Response {
-    let recorded = control.outcome_of(op);
+/// The `202` of a replayed key: the key's own op and, once known, its
+/// outcome. Never re-enqueues and never answers `adopt` again: the take store
+/// never evicts a record, so a replay always meets its own operation.
+fn replayed(replay: TakeReplay) -> Response {
+    let recorded = replay.outcome;
     accepted(OutputTakeAccepted {
-        operation_id: op.to_owned(),
+        operation_id: replay.operation_id.to_string(),
         status: if recorded.is_some() {
             "settled"
         } else {
@@ -393,7 +400,7 @@ fn plan_gate(
             (status = 409, description = "`routing-unavailable`, `switcher-required`, `output-kind-unroutable` or `capacity`.", body = crate::problem::Problem),
             (status = 422, description = "`unknown-feed`, missing Idempotency-Key, or an unsupported audio request.", body = crate::problem::Problem),
             (status = 429, description = "Over 2 takes/s per output or 10/s per principal; see Retry-After.", body = crate::problem::Problem),
-            (status = 503, description = "`engine-busy`: the take mailbox is full.", body = crate::problem::Problem),
+            (status = 503, description = "`engine-busy`: the take mailbox is full (the key is freed); or `idempotency-capacity`: the take store holds its maximum of distinct keys (fails closed; existing keys still replay).", body = crate::problem::Problem),
         ),
     )
 )]
@@ -413,9 +420,10 @@ pub(crate) async fn take_output(
             "Idempotency-Key is required".into(),
         ));
     };
-    // A replay answers from the record without re-running anything.
-    if let Some(op) = state.idempotency.peek(key) {
-        return Ok(replayed(&control, op.as_str()));
+    // A replay answers from the take's own record without re-running
+    // anything. `key` is already scoped by principal, method and path.
+    if let Some(replay) = control.replay(key) {
+        return Ok(replayed(replay));
     }
     let Some(config_id) = config_id_of(&state, req.output())? else {
         return Err(ControlError::NotFound {
@@ -437,20 +445,17 @@ pub(crate) async fn take_output(
     if let Some(refused) = plan_gate(&control, &principal, &config_id, &feed) {
         return Ok(refused);
     }
-    let op = match state.idempotency.reserve(Some(key)) {
-        Reservation::Capacity => return Err(ControlError::IdempotencyCapacity),
-        // Lost a race with a concurrent request bearing the same key.
-        Reservation::Replay(op) => return Ok(replayed(&control, op.as_str())),
-        Reservation::Fresh(op) => op,
+    // The record exists before the enqueue, so an outcome never beats it.
+    let pending = PendingTake {
+        api_id: req.output().to_owned(),
+        feed: feed.clone(),
     };
-    // Track before the enqueue so an outcome can never beat its record.
-    control.track(
-        op.as_str(),
-        PendingTake {
-            api_id: req.output().to_owned(),
-            feed: feed.clone(),
-        },
-    );
+    let op = match control.reserve_take(key, pending) {
+        TakeReservation::Capacity => return Err(ControlError::IdempotencyCapacity),
+        // Lost a race with a concurrent request bearing the same key.
+        TakeReservation::Replay(replay) => return Ok(replayed(replay)),
+        TakeReservation::Fresh(op) => op,
+    };
     let take = OutputTakeRequest {
         operation_id: op.to_string(),
         output: config_id,
@@ -458,8 +463,8 @@ pub(crate) async fn take_output(
         principal: principal.key_id.clone(),
     };
     if let Err(error) = control.routing.try_take(take) {
-        control.untrack(op.as_str());
-        state.idempotency.release(Some(key), &op);
+        // Only this take's own failed enqueue frees its key.
+        control.release_take(key, &op);
         return Ok(match error {
             TakeSubmitError::Busy => ControlError::EngineBusy.into_response(),
             TakeSubmitError::Unroutable => unroutable_kind(),

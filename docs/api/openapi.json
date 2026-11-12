@@ -9437,7 +9437,7 @@
             }
           },
           "503": {
-            "description": "`engine-busy`: the take mailbox is full.",
+            "description": "`engine-busy`: the take mailbox is full (the key is freed); or `idempotency-capacity`: the take store holds its maximum of distinct keys (fails closed; existing keys still replay).",
             "content": {
               "application/json": {
                 "schema": {
