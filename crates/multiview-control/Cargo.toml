@@ -12,6 +12,9 @@ authors.workspace = true
 publish = false
 
 [dependencies]
+# The capture runtime inside is unix-only (process groups, openat-pinned
+# files); on other platforms only its portable request model is built and the
+# control plane reports capture unavailable.
 multiview-webengine = { path = "../multiview-webengine" }
 rustix = { version = "1", features = ["fs", "process"] }
 multiview-moq = { path = "../multiview-moq", optional = true }
@@ -249,6 +252,8 @@ rustls-pki-types = { version = "1", features = ["std"], optional = true }
 # Bootstrap and RFC 8737 challenge certificates; MIT/Apache-2.0, pure Rust.
 rcgen = { version = "0.14", optional = true }
 time = { version = "0.3", optional = true }
+
+
 
 [dev-dependencies]
 hang = "=0.21.22"

@@ -1,21 +1,23 @@
 //! Encrypted, owner-bound credential references. The caller supplies a master key
 //! from an external secret service; this crate never persists that key. Run file
 //! operations on a management-plane blocking worker, never on the media clock.
+// `store`/`open` are unix-only (POSIX owner-only permissions; no weaker
+// fallback), so their imports are too.
+#[cfg(unix)]
+use chacha20poly1305::aead::{AeadCore, OsRng};
 use chacha20poly1305::{
-    aead::{Aead, AeadCore, KeyInit, OsRng, Payload},
+    aead::{Aead, KeyInit, Payload},
     ChaCha20Poly1305, Nonce,
 };
 use serde::{Deserialize, Serialize};
-use std::{
-    fmt,
-    fs::{self, OpenOptions},
-    io::Write,
-    path::{Path, PathBuf},
-};
+use std::{fmt, fs, path::PathBuf};
+#[cfg(unix)]
+use std::{fs::OpenOptions, io::Write, path::Path};
 use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
 const MAX_CIPHERTEXT: usize = 16384;
 const ENCRYPTION_OVERHEAD: usize = 28;
+#[cfg(unix)]
 fn valid_header(value: &str) -> bool {
     !value.trim().is_empty() && !value.chars().any(char::is_control)
 }

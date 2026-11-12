@@ -1,3 +1,4 @@
+#![cfg(unix)]
 use multiview_webengine::artifact::*;
 use std::io::{Read, Write};
 fn limits() -> Limits {

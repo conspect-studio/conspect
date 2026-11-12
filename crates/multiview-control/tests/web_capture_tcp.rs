@@ -1,3 +1,4 @@
+#![cfg(unix)]
 //! Real IPv6 HTTP -> actual durable Service -> immutable artifact handoff.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
 mod support;
