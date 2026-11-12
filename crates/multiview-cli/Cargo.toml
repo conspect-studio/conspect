@@ -480,6 +480,8 @@ ptp = ["multiview-engine/ptp"]
 # "requires srt-libsrt" error (never libsrt's opaque "Bad parameters").
 ffmpeg = [
     "dep:ffmpeg-next",
+    # #309: the exit watchdog's SIGKILL backstop (safe `rustix::process::kill_process`).
+    "dep:rustix",
     "dep:tempfile",
     "dep:ureq",
     "dep:url",

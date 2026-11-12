@@ -33,20 +33,26 @@ restarting.
    - `exit_watchdog::arm(cause)` is wait-free and allocation-free and never logs: it
      compare-and-sets a deadline, raises the cause, and unparks the thread. So it is safe to
      call from any thread, including the output clock.
-   - The first arm fixes the deadline. A later `Fatal` upgrades a `Stop` (a run that fails
-     during its stop reports failure); a `Stop` never downgrades a `Fatal`.
-   - At the deadline, if the process is still alive, the thread writes one line to
-     `/dev/stderr` through its own file handle (no std stderr lock, no tracing: either may be
-     the stuck part) and calls `std::process::exit` with the cause's code: 1 for a fatal, 0 for
-     a stop.
+   - The first arm fixes the deadline. A later `Fatal` upgrades a `Stop`: a run that fails
+     during its stop reports failure, and the deadline moves to the fatal's own bound if that is
+     later. A `Stop` never downgrades a `Fatal`.
+   - At the deadline, if the process is still alive, the thread acts as follows:
+     - It writes one line to `/dev/stderr` from a helper thread, through its own file handle
+       (no std stderr lock, no tracing: either may be the stuck part).
+     - It calls `std::process::exit` with the cause's code: 1 for a fatal, 0 for a stop.
+     - A backstop thread sends `SIGKILL` to the process if the C runtime exit path (atexit
+       handlers, stdio flush) has not finished within 500 ms.
 2. **Arm points: every exit decision.**
    - The bake consumer returns a fatal error (live run only, never with a test seam), or the
      consumer could not be spawned.
    - The output clock sees the egress fatal flag (`stop_on_egress_failure`) or a disconnected hot
      queue. This also covers a consumer that died without returning, for example a panic.
    - The engine loop returns an error.
+   - The egress join returns an error (an output did not finalise): this upgrades a stop to a
+     fatal.
    - A stop signal (SIGTERM or Ctrl-C).
-   - Not armed: a failed non-run command, an offline render, the in-process test seams.
+   - Not armed: a failed non-run command, an offline render (every arm in the pipeline is gated
+     on the live drop-on-overload policy), the in-process test seams.
 3. **The bound.** `EXIT_DEADLINE = 2 s` from the decision to the process exit.
    - The measured useful teardown takes about 0.2 s: egress (encoder flush, muxer trailer, HLS
      `#EXT-X-ENDLIST`) and the ProgramSet shutdown. So 2 s is a 10× margin.
@@ -58,12 +64,18 @@ restarting.
      returning, inside the bound.
    - Source teardown (bounded and warned per producer) runs after it, and the deadline cuts
      whatever is left.
-   - On a stop, the signal task also starts the ADR-W024 final Running persist and the
-     event-journal flush right away, concurrently with the pipeline teardown, so they land
-     inside the bound. The ordinary end-of-run persist still runs if there is time (same state,
+   - As soon as any exit is decided (a stop or a fatal), a dedicated OS thread with its own
+     small runtime starts the durable shutdown work, concurrently with the pipeline teardown:
+     - the control plane's graceful drain;
+     - the ADR-W024 final Running persist;
+     - the event-journal flush.
+
+     It does not wait for the main runtime, whose workers may be busy with the synchronous
+     teardown. The ordinary end-of-run steps still run if there is time (the persist is
      idempotent).
-   - The control plane's graceful drain (10 s ceiling) is cut by the deadline. Clients
-     reconnect to the restarted process.
+   - The drain (10 s ceiling) is cut by the deadline. In-flight requests get the remainder of
+     the bound, about 2 s. A client whose request was cut cannot tell whether a mutation landed.
+     The Running persist that runs at the decision captures any mutation committed before it.
 
 ## Why the outputs stay valid at a hard exit
 
@@ -76,10 +88,17 @@ restarting.
 - **PR 255** (HLS publish on the error path) lands its finalize inside the egress join, which now
   runs first. The chaos test requires `#EXT-X-ENDLIST`.
 - **File outputs** (`program.ts`, `.mkv`, `.mp4` targets) write their final path in place. Their
-  trailer is part of the egress join, which runs first and takes milliseconds. A file is only
-  truncated if its sink is wedged past `SINK_WEDGE_GRACE`, which is the same as before. For MP4,
-  a missing `moov` atom makes the file unplayable. That risk is unchanged and is not made more
-  likely by this change.
+  trailer is part of the egress join, which runs first and takes milliseconds.
+  - **New truncation band:** a finalise that takes longer than the bound (about 2 s) is now cut.
+    Before this change, it got the 13–44 s teardown window and usually completed.
+  - The egress join's sink budget (`SINK_WEDGE_GRACE`, 2 s) starts at the same instant as the
+    exit bound. A sink that is still finalising at the bound is cut, and its `WEDGED` report
+    line is not printed.
+  - For MP4, a missing `moov` atom makes the file unplayable.
+  - The MPEG-TS outputs the engine ships for live use (HLS segments, `program.ts`) stay
+    readable up to the cut.
+  - Recorded file outputs that need a trailer, and the cost of a longer bound for them, are a
+    follow-up.
 - **Network outputs** (SRT, RTMP, WebRTC, MoQ): the receiver sees the end of a stream either way.
 - **Temp files:** a hard exit can leave one manifest `.tmp` per playlist and one open segment
   `.tmp`. No manifest lists them, and they are bounded per exit. Startup clean-up of stale
@@ -89,12 +108,12 @@ restarting.
 
 - Before this change, a persistent fault cycled every 15 to 47 s; it can now cycle every few
   seconds.
-- A systemd deployment with `Restart=always`, `RestartSec=2s` and systemd's default start
-  limit (5 starts in 10 s) that could stop the unit if the engine fails within about 2 s of every
-  start.
-- The faults measured on #309 came 3 to 150 min apart, so this is not a present risk. The
-  deployment runbook must state the start-limit settings (`StartLimitIntervalSec=0`, or a burst
-  that covers a persistent fault), and the operator should watch the restart counter.
+- With `Restart=always`, `RestartSec=2s` and systemd's default start limit (5 starts in 10 s),
+  systemd could stop the unit if the engine fails within about 2 s of every start.
+- The faults measured on #309 came 3 to 150 min apart, so this is not a present risk.
+- The required supervisor settings (`StartLimitIntervalSec=0`, `Restart=always`) and the restart
+  counter to watch are in
+  [building §4.1](../operations/building.md#41-running-under-a-supervisor-exit-and-restart).
 
 ## Invariant #1
 
@@ -112,7 +131,10 @@ change shortens dead output after a fault; it does not change the tick path.
   - the fatal line, then exit code 1 within 2 s + 0.5 s of it;
   - the watchdog's armed line and its hard-exit line (the held teardown cannot finish in time on
     its own);
-  - a manifest that parses, has `#EXT-X-ENDLIST` and lists only complete segments.
+  - a manifest that parses, has `#EXT-X-ENDLIST` and lists only complete segments;
+  - `stage="egress-joined"` logged before the held source teardown begins;
+  - the exit-time Running persist written (`active.toml`; the test config runs the control
+    plane).
 
   The same for SIGTERM (sent once the pipeline runs and the process is alive), with exit code 0.
   Locally: 20 × fatal and 20 × stop. CI (macOS job): 10 × each.

@@ -223,6 +223,33 @@ embedded SPA are served by `multiview-control`. Health probes (`/livez`, `/ready
 lightweight runtime so they never contend with the video threads. See the
 [example configs](../../examples/) and [io/inputs.md](../io/inputs.md).
 
+### 4.1 Running under a supervisor (exit and restart)
+
+The engine ends itself on a fatal output fault (for example "output fell N ticks behind the
+clock"), and on SIGTERM or Ctrl-C. In both cases the process is gone within **2 s** of the
+decision ([bounded exit](../architecture/bounded-exit.md)): outputs are finalised first, then the
+exit watchdog cuts any source teardown that overruns. Exit code 1 means a fault; 0 means a clean
+stop. The line `teardown overran the 2000 ms exit bound` on stderr means that the watchdog ended
+the run.
+
+Run it under a supervisor that restarts it. A fault that repeats on every start can now restart
+every few seconds, so allow that rate:
+
+```ini
+# systemd unit
+[Unit]
+StartLimitIntervalSec=0      # never stop restarting a crash-looping engine
+
+[Service]
+Restart=always
+RestartSec=2s
+```
+
+With the systemd default (5 starts in 10 s), a fault within about 2 s of every start stops the
+unit permanently. With Docker, `restart: unless-stopped` (in `deploy/compose.yaml`) restarts it,
+with Docker's own back-off. Watch the restart count (`systemctl show -p NRestarts`): a rising
+count is a fault to investigate, not a healthy state.
+
 ---
 
 ## 5. Feature-flag build profiles

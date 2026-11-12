@@ -805,7 +805,22 @@ async fn run_pipeline_until_ctrl_c(
     // engine `ProgramSet` member metadata.
     let cadence = pipeline.cadence();
 
-    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+    let (shutdown_tx, outer_shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+    // #309: the control server's drain starts at the end-of-run shutdown OR as
+    // soon as an exit is decided (`early_drain`), whichever comes first, so the
+    // drain gets the exit bound instead of starting after the source teardown.
+    let early_drain = std::sync::Arc::new(tokio::sync::Notify::new());
+    let (drain_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+    {
+        let early_drain = std::sync::Arc::clone(&early_drain);
+        tokio::spawn(async move {
+            tokio::select! {
+                _ = outer_shutdown_rx => {}
+                () = early_drain.notified() => {}
+            }
+            let _ = drain_tx.send(());
+        });
+    }
     // Conspect local-mesh (ADR-0051 §2/§5): start the always-on discovery loop
     // (best-effort, never blocks — inv #10) before serving, so `/api/v1/mesh/peers`
     // reflects live neighbours. The shared `MeshState` is wired into the control
@@ -975,12 +990,6 @@ async fn run_pipeline_until_ctrl_c(
     }
 
     let stop_for_signal = stop.clone();
-    // #309: the durable shutdown work (the final ADR-W024 Running persist, the
-    // event-journal flush) must land inside the exit bound, so it runs as soon
-    // as the stop is decided — concurrently with the pipeline teardown — not
-    // after the slow source teardown. The ordinary end-of-run persist below
-    // still runs too (idempotent: the same Running state, written again).
-    let early_persist_state = running_persist.as_ref().map(|p| p.state.clone());
     let signal = tokio::spawn(async move {
         let which = await_shutdown_signal().await;
         tracing::info!(
@@ -989,13 +998,52 @@ async fn run_pipeline_until_ctrl_c(
         );
         stop_for_signal.stop();
         multiview_cli::exit_watchdog::arm(multiview_cli::exit_watchdog::ExitCause::Stop);
-        if let Some(state) = early_persist_state {
-            if let Err(error) = multiview_control::boot_model::persist_running_now(&state).await {
-                tracing::warn!(error = %error, "the stop-time running-state persist was skipped (fail-soft)");
-            }
-        }
-        multiview_cli::event_journal::flush();
     });
+    // #309: the durable shutdown work must land inside the exit bound, so it
+    // starts the moment ANY exit is decided (a stop signal or a fatal output
+    // fault), concurrently with the pipeline teardown — not after the slow
+    // source teardown. The ordinary end-of-run steps still run if there is time
+    // (the persist writes the same Running state again; idempotent).
+    let early_persist_state = running_persist.as_ref().map(|p| p.state.clone());
+    let decided_drain = std::sync::Arc::clone(&early_drain);
+    // A dedicated OS thread with its own small runtime: the main runtime's
+    // workers can be busy with the synchronous pipeline teardown (a task parked
+    // behind it would miss the bound), and this work must not depend on them.
+    let decided_stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let decided_stop_flag = Arc::clone(&decided_stop);
+    let decided = std::thread::Builder::new()
+        .name("multiview-exit-durable".to_owned())
+        .spawn(move || {
+            while multiview_cli::exit_watchdog::armed().is_none() {
+                if decided_stop_flag.load(std::sync::atomic::Ordering::Acquire) {
+                    return;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            // Begin the control plane's graceful drain now (the deadline cuts it).
+            decided_drain.notify_one();
+            if let Some(state) = early_persist_state {
+                match tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                {
+                    Ok(rt) => match rt
+                        .block_on(multiview_control::boot_model::persist_running_now(&state))
+                    {
+                        Ok(()) => tracing::info!("exit-time running-state persist written"),
+                        Err(error) => tracing::warn!(
+                            error = %error,
+                            "the exit-time running-state persist was skipped (fail-soft)"
+                        ),
+                    },
+                    Err(error) => {
+                        tracing::warn!(error = %error, "no runtime for the exit-time persist");
+                    }
+                }
+            }
+            multiview_cli::event_journal::flush();
+        })
+        .ok();
 
     // Sample CPU/host-memory/per-GPU load at ~1.3 Hz and PUSH `Event::SystemMetrics`
     // onto the SAME outbound publisher the control plane forwards to the WebUI
@@ -1136,6 +1184,9 @@ async fn run_pipeline_until_ctrl_c(
     // Ask the journal thread to persist pending repeat counters. Not joined, so
     // a counter still queued at process exit can be lost; its record is not.
     multiview_cli::event_journal::flush();
+    // A clean, undecided finish: let the durable thread end (it never armed).
+    decided_stop.store(true, std::sync::atomic::Ordering::Release);
+    drop(decided);
     Ok(report)
 }
 

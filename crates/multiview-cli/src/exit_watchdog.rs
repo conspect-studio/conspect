@@ -59,7 +59,10 @@ impl ExitCause {
 pub struct Watchdog {
     /// The process-relative origin for [`Self::due_ns`].
     origin: Instant,
-    /// Deadline, in ns after `origin`; 0 = not armed. Set once (first arm).
+    /// Deadline, in ns after `origin`; 0 = not armed. Set by the first arm;
+    /// a later Fatal that upgrades a Stop moves it to that Fatal's own
+    /// deadline if later, so the failure is reported within the bound of the
+    /// fatal decision.
     due_ns: AtomicU64,
     /// [`ExitCause::tag`] of the strongest cause armed so far; 0 = none.
     cause: AtomicU8,
@@ -83,18 +86,20 @@ impl Watchdog {
     /// deadline; a later Fatal upgrades a Stop cause. Returns `true` when this
     /// call set the deadline.
     pub fn arm(&self, cause: ExitCause, deadline: Duration) -> bool {
-        self.cause.fetch_max(cause.tag(), Ordering::AcqRel);
         let due = u64::try_from(self.origin.elapsed().saturating_add(deadline).as_nanos())
             .unwrap_or(u64::MAX)
             .max(1);
+        let previous = self.cause.fetch_max(cause.tag(), Ordering::AcqRel);
         let set = self
             .due_ns
             .compare_exchange(0, due, Ordering::AcqRel, Ordering::Acquire)
             .is_ok();
-        if set {
-            if let Some(thread) = self.thread.get() {
-                thread.unpark();
-            }
+        if !set && cause.tag() > previous {
+            // An upgrade (Stop → Fatal): give the fatal its own full bound.
+            self.due_ns.fetch_max(due, Ordering::AcqRel);
+        }
+        if let Some(thread) = self.thread.get() {
+            thread.unpark();
         }
         set
     }
@@ -110,16 +115,19 @@ impl Watchdog {
     pub fn run(&self, on_deadline: fn(ExitCause)) {
         loop {
             let due = self.due_ns.load(Ordering::Acquire);
-            if due != 0 {
-                let due_at = self.origin + Duration::from_nanos(due);
-                let now = Instant::now();
-                if due_at > now {
-                    std::thread::sleep(due_at - now);
-                }
-                on_deadline(self.cause().unwrap_or(ExitCause::Fatal));
-                return;
+            if due == 0 {
+                std::thread::park();
+                continue;
             }
-            std::thread::park();
+            let due_at = self.origin + Duration::from_nanos(due);
+            let now = Instant::now();
+            if due_at > now {
+                // Wake at the deadline, or earlier on an arm that moved it.
+                std::thread::park_timeout(due_at - now);
+                continue;
+            }
+            on_deadline(self.cause().unwrap_or(ExitCause::Fatal));
+            return;
         }
     }
 
@@ -150,24 +158,54 @@ impl Default for Watchdog {
     }
 }
 
+/// How long the ordinary exit path may take before the process is killed.
+pub const EXIT_PATH_GRACE: Duration = Duration::from_millis(500);
+
 #[allow(clippy::exit)]
 // reason: this IS the bounded hard exit (#309). It runs only after the deadline,
 // when teardown overran; `process::exit` ends the process without running the
-// destructors that overran. The message goes to /dev/stderr through its own
-// file handle — no std stderr lock, no tracing — because either may be the part
-// that is stuck.
+// destructors that overran. The message is best-effort on a helper thread
+// through its own /dev/stderr handle (no std stderr lock, no tracing: either may
+// be the stuck part). The C runtime exit path (atexit handlers, stdio flush)
+// could itself block, so a backstop thread kills the process with SIGKILL if
+// `exit` has not finished within EXIT_PATH_GRACE.
 fn exit_process(cause: ExitCause) {
-    if let Ok(mut err) = std::fs::OpenOptions::new().write(true).open("/dev/stderr") {
-        let _ = writeln!(
-            err,
-            "multiview: teardown overran the {} ms exit bound ({cause:?}); exiting with code {} \
-             (outputs already finalised are valid; the supervisor restarts the service)",
-            EXIT_DEADLINE.as_millis(),
-            cause.code()
-        );
-    }
+    let _ = std::thread::Builder::new()
+        .name("multiview-exit-notice".to_owned())
+        .spawn(move || {
+            if let Ok(mut err) = std::fs::OpenOptions::new().write(true).open("/dev/stderr") {
+                let _ = writeln!(
+                    err,
+                    "multiview: teardown overran the {} ms exit bound ({cause:?}); exiting with \
+                     code {} (outputs finalised before the bound are valid; detached sinks may be \
+                     incomplete; the supervisor restarts the service)",
+                    EXIT_DEADLINE.as_millis(),
+                    cause.code()
+                );
+            }
+        });
+    let _ = std::thread::Builder::new()
+        .name("multiview-exit-backstop".to_owned())
+        .spawn(|| {
+            std::thread::sleep(EXIT_PATH_GRACE);
+            kill_self();
+        });
+    // Give the notice a moment; never wait for it.
+    std::thread::sleep(Duration::from_millis(20));
     std::process::exit(cause.code());
 }
+
+/// End the process unconditionally (no atexit handlers, no stdio flush).
+#[cfg(all(unix, feature = "ffmpeg"))]
+fn kill_self() {
+    use rustix::process::{getpid, kill_process, Signal};
+    let _ = kill_process(getpid(), Signal::KILL);
+}
+
+/// Without unix signals (or without the `rustix` dependency in this build)
+/// the C runtime exit path is the only one.
+#[cfg(not(all(unix, feature = "ffmpeg")))]
+fn kill_self() {}
 
 static WATCHDOG: OnceLock<Watchdog> = OnceLock::new();
 
@@ -189,7 +227,13 @@ pub fn arm(cause: ExitCause) {
     }
 }
 
-/// Whether the exit deadline is armed (for logging only).
+/// The armed state as a cheap poll: `Some(cause)` once any exit was decided.
+/// The binary's "exit decided" task polls this (every few ms, off the clock) to
+/// start the durable shutdown work — control drain, final Running persist,
+/// journal flush — concurrently with the pipeline teardown, inside the bound.
+/// (Polling keeps [`arm`] wait-free: it never wakes an async task itself.)
+///
+/// Whether the exit deadline is armed.
 #[must_use]
 pub fn armed() -> Option<ExitCause> {
     WATCHDOG.get().and_then(Watchdog::cause)
@@ -272,6 +316,47 @@ mod tests {
             elapsed < Duration::from_millis(400),
             "promptly at: {elapsed:?}"
         );
+    }
+
+    static FIRED2: Mutex<Vec<(ExitCause, Instant)>> = Mutex::new(Vec::new());
+    fn record2(cause: ExitCause) {
+        FIRED2
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push((cause, Instant::now()));
+    }
+
+    #[test]
+    fn a_fatal_during_a_stop_gets_its_own_full_bound() {
+        static W: OnceLock<Watchdog> = OnceLock::new();
+        let w = W.get_or_init(Watchdog::new);
+        assert!(w.start(record2));
+        let start = Instant::now();
+        w.arm(ExitCause::Stop, Duration::from_millis(300));
+        std::thread::sleep(Duration::from_millis(200));
+        let fatal_at = Instant::now();
+        w.arm(ExitCause::Fatal, Duration::from_millis(300));
+        let until = start + Duration::from_secs(5);
+        while FIRED2
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_empty()
+            && Instant::now() < until
+        {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let fired = FIRED2
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        assert_eq!(fired.len(), 1);
+        let (cause, at) = fired[0];
+        assert_eq!(cause, ExitCause::Fatal, "the failure is reported");
+        assert!(
+            at >= fatal_at + Duration::from_millis(300),
+            "the fatal's own bound"
+        );
+        assert!(at < fatal_at + Duration::from_millis(600), "and not later");
     }
 
     #[test]

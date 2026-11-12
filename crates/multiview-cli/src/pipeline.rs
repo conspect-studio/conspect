@@ -4823,7 +4823,14 @@ impl Pipeline {
             // The output clock completes this tick; then the program owner
             // joins the consumer and propagates its exact fatal cause. A UI
             // that still answers HTTP must never mask stopped encoded media.
-            stop_on_egress_failure(&egress_fatal, &egress_stop, false);
+            // #309: the engine side of the fatal output decision (covers a
+            // consumer that died without returning, e.g. a panic). Live runs
+            // only; wait-free; a no-op unless the binary enabled the watchdog.
+            if stop_on_egress_failure(&egress_fatal, &egress_stop, false)
+                && matches!(policy, SendPolicy::DropOnOverload)
+            {
+                crate::exit_watchdog::arm(crate::exit_watchdog::ExitCause::Fatal);
+            }
             match policy {
                 SendPolicy::BlockForExact => {
                     // A blocking send back-pressures the OFFLINE renderer (not a
@@ -4989,7 +4996,7 @@ impl Pipeline {
         }
         // #309: an engine error is a fatal decision too; bound the exit from
         // here, before the (slow, bounded-per-producer) source teardown.
-        if outcome.is_err() {
+        if outcome.is_err() && matches!(policy, SendPolicy::DropOnOverload) {
             crate::exit_watchdog::arm(crate::exit_watchdog::ExitCause::Fatal);
         }
         // #309: finalise the OUTPUTS first. The engine loop consumed the
@@ -5010,6 +5017,11 @@ impl Pipeline {
         // an egress/sink error second.
         let egress_result = egress.join();
         stage("egress-joined");
+        // #309: an output that failed to finalise is a failed run, even during a
+        // stop: upgrade the exit cause before the slow source teardown.
+        if egress_result.is_err() && matches!(policy, SendPolicy::DropOnOverload) {
+            crate::exit_watchdog::arm(crate::exit_watchdog::ExitCause::Fatal);
+        }
         // Then tear ingest down (signal + bounded join per producer). Producers
         // blocked in libav network reads use their full grace here; the exit
         // watchdog bounds the total.
@@ -5567,10 +5579,6 @@ fn stop_on_egress_failure(fatal: &AtomicBool, stop: &StopSignal, disconnected: b
     }
     if fatal.load(Ordering::Acquire) {
         stop.stop();
-        // #309: the engine side of the fatal output decision (covers a consumer
-        // that died without returning, e.g. a panic). Wait-free; a no-op unless
-        // the binary enabled the watchdog.
-        crate::exit_watchdog::arm(crate::exit_watchdog::ExitCause::Fatal);
         true
     } else {
         false

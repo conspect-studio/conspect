@@ -60,6 +60,8 @@ area = "b"
 fit = "contain"
 [cells.source]
 input_id = "b"
+[control]
+listen = "[::1]:0"
 [[outputs]]
 kind = "hls"
 path = "${WORK}/hls/index.m3u8"
@@ -81,7 +83,7 @@ check_hls() {
 
 run_once() {
   local mode="$1" i="$2" log="${WORK}/run.log" rc t_exit t_decide pid
-  rm -rf "${WORK}/hls" && mkdir -p "${WORK}/hls"
+  rm -rf "${WORK}/hls" "${WORK}/.multiview" && mkdir -p "${WORK}/hls"
   export MULTIVIEW_CHAOS_SLOW_TEARDOWN_MS="${HOLD_MS}"
   if [ "${mode}" = fatal ]; then
     # 3 s at 29.97 fps is ~90 ticks: far past the 8-tick substitution envelope
@@ -133,6 +135,18 @@ PY
   grep -q "exit deadline armed" "${log}" || { echo "  FAIL: watchdog never armed"; return 1; }
   grep -q "teardown overran the" "${log}" || { echo "  FAIL: no watchdog hard exit (teardown not held?)"; return 1; }
   grep -q "chaos: holding source teardown" "${log}" || { echo "  FAIL: teardown seam not reached"; return 1; }
+  # Outputs are finalised BEFORE the held source teardown (egress first).
+  python3 - "${log}" <<'PY' || { echo "  FAIL: egress not joined before source teardown"; return 1; }
+import sys
+lines = open(sys.argv[1], errors="replace").read().splitlines()
+def first(s):
+    return next((i for i, l in enumerate(lines) if s in l), None)
+e, h = first('stage="egress-joined"'), first("chaos: holding source teardown")
+sys.exit(0 if e is not None and h is not None and e < h else 1)
+PY
+  # The durable Running state was written at the exit decision.
+  grep -q "exit-time running-state persist written" "${log}" && [ -s "${WORK}/.multiview/active.toml" ] \
+    || { echo "  FAIL: the exit-time Running persist did not land"; grep -E "persist|armed|overran|control plane|stage=" "${log}" | sed 's/\x1b\[[0-9;]*m//g' | cut -c1-200 | tail -12; ls -la "${WORK}/.multiview" 2>&1 | head -5; return 1; }
   [ "${took}" -le $((BOUND_MS + SLACK_MS)) ] || { echo "  FAIL: exit took ${took} ms > ${BOUND_MS}+${SLACK_MS}"; grep -E "teardown|exit|chaos" "${log}" | tail -12; return 1; }
   check_hls || { echo "  FAIL: HLS invalid"; return 1; }
 }
