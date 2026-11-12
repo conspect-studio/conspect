@@ -106,12 +106,13 @@ impl ValidationReport {
                 "boot document (no accepted state yet)"
             };
             let source = start.source.display();
-            match &start.refusal {
-                None => out.push_str(&format!("\nOK   start: {what}\n     {source}")),
-                Some(reason) => out.push_str(&format!(
+            let line = match &start.refusal {
+                None => format!("\nOK   start: {what}\n     {source}"),
+                Some(reason) => format!(
                     "\nFAIL start: {what}\n     {source}\n     the engine would refuse to start: {reason}"
-                )),
-            }
+                ),
+            };
+            out.push_str(&line);
         }
         for warning in &self.warnings {
             out.push_str("\nWARN ");

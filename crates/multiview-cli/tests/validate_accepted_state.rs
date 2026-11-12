@@ -3,7 +3,12 @@
 //! file. The lead's preflight on 12 November validated `conspect.toml` ("1
 //! cell", true and irrelevant) while `desired.json` held a 6-cell canvas the
 //! engine refused.
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing
+)]
 
 use std::path::Path;
 

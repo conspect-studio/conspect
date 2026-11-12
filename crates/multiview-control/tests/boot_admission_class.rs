@@ -4,7 +4,12 @@
 //! admission validator (`multiview_config::boot_admission`, the rule
 //! `Pipeline::build` enforces), or the command was refused and `desired.json`
 //! is byte-for-byte unchanged and no engine command was sent.
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing
+)]
 mod support;
 
 use axum::http::StatusCode;
