@@ -515,7 +515,11 @@ fn a_take_opens_one_encoder_moves_at_a_rap_and_lingers_out() {
             .outcomes
             .try_iter()
             .find(|o| o.outcome == TakeResult::Applied)
-            .map(|o| o.tick);
+            .map(|o| {
+                // The control plane persists from the outcome alone (D1).
+                assert_eq!(o.bus, src(), "applied carries the taken bus");
+                o.tick
+            });
         now += 1;
     }
     let at = applied_at.expect("applied within the open deadline");

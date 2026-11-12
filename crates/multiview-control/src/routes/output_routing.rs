@@ -133,8 +133,14 @@ pub struct OutputPlan {
 pub struct OutputTakeAccepted {
     /// Correlates the `route.output` outcome.
     pub operation_id: String,
-    /// When the engine adopts the take: `next_tick`.
-    pub adopt: String,
+    /// `accepted` (this request enqueued the take), `pending` (a replay of a
+    /// reserved key whose outcome is not known yet) or `settled` (a replay
+    /// carrying the recorded outcome).
+    pub status: String,
+    /// When the engine adopts the take: `next_tick`. Only on the request
+    /// that enqueued it; a replay never claims a new adoption.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub adopt: Option<String>,
     /// The recorded terminal outcome, on a replay once known.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub outcome: Option<String>,
@@ -301,12 +307,20 @@ fn accepted(body: OutputTakeAccepted) -> Response {
     (StatusCode::ACCEPTED, Json(body)).into_response()
 }
 
-/// The `202` of a replayed key: the recorded op and, once known, its outcome.
+/// The `202` of a replayed key: the reserved op and, once known, its outcome.
+/// Never re-enqueues and never answers `adopt` again: the take record lives
+/// exactly as long as the key, so a replay always meets its own operation.
 fn replayed(control: &crate::output_routing::OutputRoutingControl, op: &str) -> Response {
     let recorded = control.outcome_of(op);
     accepted(OutputTakeAccepted {
         operation_id: op.to_owned(),
-        adopt: "next_tick".to_owned(),
+        status: if recorded.is_some() {
+            "settled"
+        } else {
+            "pending"
+        }
+        .to_owned(),
+        adopt: None,
         outcome: recorded.as_ref().map(|r| r.outcome.clone()),
         tick: recorded.map(|r| r.tick),
     })
@@ -360,7 +374,9 @@ fn plan_gate(
 
 /// `POST /api/v1/routing/output/take` — take an output feed (role: write;
 /// both ends authorized; `Idempotency-Key` required). `202 {operation_id,
-/// adopt:"next_tick"}`; the outcome rides `route.output`.
+/// status:"accepted", adopt:"next_tick"}`; a replay of the key answers the
+/// same operation with `status` `pending` or `settled` (+ outcome) and is never
+/// enqueued again. The outcome rides `route.output`.
 #[cfg_attr(
     feature = "openapi",
     utoipa::path(
@@ -370,7 +386,7 @@ fn plan_gate(
         request_body = OutputRouteRequest,
         params(("Idempotency-Key" = String, Header, description = "Required; one per distinct take.")),
         responses(
-            (status = 202, description = "Accepted; adopted at the next tick. A replay carries the recorded outcome once known.", body = OutputTakeAccepted),
+            (status = 202, description = "Accepted (`status: accepted`, `adopt: next_tick`). A replay of the key returns the same operation id with `status: pending` (no outcome yet) or `status: settled` + the recorded outcome; it never re-enqueues.", body = OutputTakeAccepted),
             (status = 401, description = "Missing or invalid credentials.", body = crate::problem::Problem),
             (status = 403, description = "Not authorized for the output or the feed.", body = crate::problem::Problem),
             (status = 404, description = "Unknown output.", body = crate::problem::Problem),
@@ -462,7 +478,8 @@ pub(crate) async fn take_output(
     );
     Ok(accepted(OutputTakeAccepted {
         operation_id: op.to_string(),
-        adopt: "next_tick".to_owned(),
+        status: "accepted".to_owned(),
+        adopt: Some("next_tick".to_owned()),
         outcome: None,
         tick: None,
     }))

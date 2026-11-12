@@ -150,6 +150,19 @@ impl Fake {
                 output: output.to_owned(),
                 tick: 77,
                 outcome: outcome.to_owned(),
+                feed: None,
+            })
+            .unwrap();
+    }
+    /// Emit like the engine does: the outcome carries the output's feed.
+    fn emit_with_feed(&self, operation_id: &str, output: &str, outcome: &str, feed: RoutedFeed) {
+        self.tx
+            .send(OutputOutcome {
+                operation_id: operation_id.to_owned(),
+                output: output.to_owned(),
+                tick: 78,
+                outcome: outcome.to_owned(),
+                feed: Some(feed),
             })
             .unwrap();
     }
@@ -771,6 +784,88 @@ async fn route_output_reaches_only_principals_that_may_read_the_output() {
         Event::RouteOutput(e) => assert_eq!(e.output, "output-0", "output-1's event was filtered"),
         other => panic!("{other:?}"),
     }
+}
+
+/// Review D1: the take record lives as long as its reserved key. Fill the
+/// records far past the old 1024 pending cap; an early key's replay (with a
+/// different body) still answers its own operation as `pending` (never a new
+/// `adopt`), nothing is enqueued twice, and its later `applied` persists.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_early_reserved_key_survives_many_later_takes_and_still_persists() {
+    let dir = tempfile::tempdir().unwrap();
+    let rig = rig(&dir.path().join("boot.toml"), true);
+    let src = serde_json::json!({"source": "bars"});
+    let first = body_json(
+        send(
+            &rig.router,
+            take(&rig, OPERATOR_TOKEN, "early", "output-1", src.clone()),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(first["adopt"], "next_tick");
+    assert_eq!(first["status"], "accepted");
+    let op = first["operation_id"].as_str().unwrap().to_owned();
+    // 1500 later accepted takes (past the old 1024 cap), recorded the way the
+    // route records them: a fresh key reservation, then the take record.
+    let control = rig.state.output_routing.clone().unwrap();
+    for i in 0..1500 {
+        let multiview_control::concurrency::Reservation::Fresh(later) =
+            rig.state.idempotency.reserve(Some(&format!("later-{i}")))
+        else {
+            panic!("fresh reservation");
+        };
+        control.track(
+            later.as_str(),
+            multiview_control::output_routing::PendingTake {
+                api_id: "output-0".to_owned(),
+                feed: RoutedFeed::Program,
+            },
+        );
+    }
+    // Replay the early key with a different body.
+    let replay = send(
+        &rig.router,
+        take(
+            &rig,
+            OPERATOR_TOKEN,
+            "early",
+            "output-1",
+            serde_json::json!({"bus": "program"}),
+        ),
+    )
+    .await;
+    assert_eq!(replay.status(), StatusCode::ACCEPTED);
+    let replay = body_json(replay).await;
+    assert_eq!(replay["operation_id"], op.as_str());
+    assert_eq!(replay["status"], "pending");
+    assert!(replay.get("adopt").is_none(), "a replay never re-adopts");
+    assert!(replay.get("outcome").is_none());
+    assert_eq!(rig.fake.takes().len(), 1, "one enqueue total");
+    // Its later applied persists, and the replay then carries the outcome.
+    rig.fake.emit_with_feed(
+        &op,
+        OUT_B_CONFIG_ID,
+        "applied",
+        RoutedFeed::Source("bars".into()),
+    );
+    wait_for(|| persisted_feed(&rig.state, OUT_B_CONFIG_ID).is_some()).await;
+    assert_eq!(
+        persisted_feed(&rig.state, OUT_B_CONFIG_ID),
+        Some(src.clone())
+    );
+    let replay = body_json(
+        send(
+            &rig.router,
+            take(&rig, OPERATOR_TOKEN, "early", "output-1", src),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(replay["operation_id"], op.as_str());
+    assert_eq!(replay["status"], "settled");
+    assert_eq!(replay["outcome"], "applied");
+    assert_eq!(rig.fake.takes().len(), 1);
 }
 
 #[tokio::test]

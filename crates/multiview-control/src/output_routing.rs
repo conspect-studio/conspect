@@ -10,8 +10,9 @@
 //! Isolation (invariant #10): every call on the trait is non-blocking
 //! (`try_take` is a bounded `try_send`, `snapshot` a wait-free load). The
 //! outcome relay runs on its own thread + task and never touches the clock.
-//! All state here is bounded: the outcome map, the pending-take map and both
-//! rate limiters have fixed caps.
+//! All state here is bounded: the take-record map (one record per reserved
+//! `Idempotency-Key`, same cap and same lifetime as the key) and both rate
+//! limiters have fixed caps.
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex, PoisonError};
@@ -167,6 +168,10 @@ pub struct OutputOutcome {
     pub tick: u64,
     /// `applied` | `superseded` | `refused:*` | `fallback:*`.
     pub outcome: String,
+    /// The output's feed after this outcome, when the engine knows it
+    /// (always set for `applied`: the feed to persist). Carried here so
+    /// persistence never depends on control-plane bookkeeping.
+    pub feed: Option<RoutedFeed>,
 }
 
 /// The engine seam the binary implements (all calls non-blocking).
@@ -190,10 +195,10 @@ pub trait OutputRouting: Send + Sync {
 /// Shared handle to an installed [`OutputRouting`].
 pub type SharedOutputRouting = Arc<dyn OutputRouting>;
 
-/// Recorded terminal outcomes kept beside the idempotency store (same cap).
-pub const MAX_RECORDED_OUTCOMES: usize = crate::concurrency::MAX_IDEMPOTENCY_RESERVATIONS;
-/// Takes awaiting an outcome (for persistence); oldest dropped beyond this.
-pub const MAX_PENDING_TAKES: usize = 1024;
+/// Take records kept beside the idempotency store: the same cap, and a record
+/// is created only with a fresh key reservation and removed only with that
+/// key's release, so a record can never be evicted while its key replays.
+pub const MAX_TAKE_RECORDS: usize = crate::concurrency::MAX_IDEMPOTENCY_RESERVATIONS;
 /// Takes per second per output (§6.4).
 pub const TAKES_PER_OUTPUT_PER_SEC: usize = 2;
 /// Takes per second per principal (§6.4).
@@ -221,6 +226,13 @@ pub struct PendingTake {
     pub api_id: String,
     /// The feed to persist on `applied`.
     pub feed: RoutedFeed,
+}
+
+/// A take's record for the life of its `Idempotency-Key`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TakeRecord {
+    take: PendingTake,
+    outcome: Option<RecordedOutcome>,
 }
 
 /// A bounded, insertion-ordered map (oldest evicted first).
@@ -260,6 +272,10 @@ impl<V> BoundedMap<V> {
 
     fn get(&self, key: &str) -> Option<&V> {
         self.map.get(key)
+    }
+
+    fn get_mut(&mut self, key: &str) -> Option<&mut V> {
+        self.map.get_mut(key)
     }
 }
 
@@ -381,8 +397,11 @@ pub struct OutputRoutingControl {
     pub routing: SharedOutputRouting,
     /// The take rate limits.
     pub limiter: TakeLimiter,
-    outcomes: Mutex<BoundedMap<RecordedOutcome>>,
-    pending: Mutex<BoundedMap<PendingTake>>,
+    /// Operation id → take record. Inserted only after a fresh key
+    /// reservation and removed only with that key's release; the idempotency
+    /// store never holds more than [`MAX_TAKE_RECORDS`] keys, so the bound
+    /// below is never reached by eviction (it stays as a backstop).
+    records: Mutex<BoundedMap<TakeRecord>>,
 }
 
 impl std::fmt::Debug for OutputRoutingControl {
@@ -399,66 +418,67 @@ impl OutputRoutingControl {
         Self {
             routing,
             limiter: TakeLimiter::default(),
-            outcomes: Mutex::new(BoundedMap::new(MAX_RECORDED_OUTCOMES)),
-            pending: Mutex::new(BoundedMap::new(MAX_PENDING_TAKES)),
+            records: Mutex::new(BoundedMap::new(MAX_TAKE_RECORDS)),
         }
     }
 
-    /// Remember an accepted take until its outcome.
+    fn records(&self) -> std::sync::MutexGuard<'_, BoundedMap<TakeRecord>> {
+        self.records.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Record an accepted take for the life of its reserved key. Call only
+    /// after a fresh reservation of that key.
     pub fn track(&self, operation_id: &str, pending: PendingTake) {
-        self.pending
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .insert(operation_id.to_owned(), pending);
+        self.records().insert(
+            operation_id.to_owned(),
+            TakeRecord {
+                take: pending,
+                outcome: None,
+            },
+        );
     }
 
-    /// Forget a take that never reached the engine.
+    /// Forget a take that never reached the engine (with its key's release).
     pub fn untrack(&self, operation_id: &str) {
-        self.pending
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .remove(operation_id);
+        self.records().remove(operation_id);
     }
 
-    /// Record a terminal outcome; returns the take it settles, if tracked.
+    /// Record a terminal outcome on its take; returns the take it settles,
+    /// if it was taken through this control plane.
     pub fn settle(&self, outcome: &OutputOutcome) -> Option<PendingTake> {
         if outcome.operation_id.is_empty() {
             return None;
         }
-        self.outcomes
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .insert(
-                outcome.operation_id.clone(),
-                RecordedOutcome {
-                    outcome: outcome.outcome.clone(),
-                    tick: outcome.tick,
-                },
-            );
-        self.pending
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .remove(&outcome.operation_id)
+        let mut records = self.records();
+        let record = records.get_mut(&outcome.operation_id)?;
+        record.outcome = Some(RecordedOutcome {
+            outcome: outcome.outcome.clone(),
+            tick: outcome.tick,
+        });
+        Some(record.take.clone())
     }
 
     /// The recorded terminal outcome of `operation_id`, once known.
     #[must_use]
     pub fn outcome_of(&self, operation_id: &str) -> Option<RecordedOutcome> {
-        self.outcomes
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
+        self.records()
             .get(operation_id)
-            .cloned()
+            .and_then(|r| r.outcome.clone())
     }
 
-    /// The API id of a tracked (not yet settled) take.
+    /// The API id of a tracked take that has no outcome yet.
     #[must_use]
     pub fn pending_api_id(&self, operation_id: &str) -> Option<String> {
-        self.pending
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
+        self.records()
             .get(operation_id)
-            .map(|p| p.api_id.clone())
+            .filter(|r| r.outcome.is_none())
+            .map(|r| r.take.api_id.clone())
+    }
+
+    /// Take records held (bounded by [`MAX_TAKE_RECORDS`]).
+    #[must_use]
+    pub fn records_len(&self) -> usize {
+        self.records().map.len()
     }
 }
 
@@ -511,9 +531,15 @@ async fn relay_one(
     let Some(api_id) = api_id else {
         return;
     };
+    // The feed to persist rides the outcome itself, so an `applied` persists
+    // whether or not this process still holds the take's record.
     if outcome.outcome == "applied" {
-        if let Some(pending) = &settled {
-            if let Err(error) = persist_feed(state, &outcome.output, &pending.feed).await {
+        let feed = outcome
+            .feed
+            .clone()
+            .or_else(|| settled.as_ref().map(|p| p.feed.clone()));
+        if let Some(feed) = feed {
+            if let Err(error) = persist_feed(state, &outcome.output, &feed).await {
                 tracing::warn!(%error, output = %api_id, "output routing: applied take not persisted");
             }
         }

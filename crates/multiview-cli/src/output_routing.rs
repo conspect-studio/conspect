@@ -175,6 +175,9 @@ pub struct TakeOutcome {
     pub tick: u64,
     /// What happened.
     pub outcome: TakeResult,
+    /// The output's bus after this outcome (for `Applied`, the taken bus):
+    /// lets the control plane persist an applied take from the outcome alone.
+    pub bus: PictureBus,
 }
 
 /// A pending take, as seen in the snapshot.
@@ -856,6 +859,12 @@ impl OutputRouter {
 
     fn emit(&mut self, operation_id: String, output_index: usize, tick: u64, outcome: TakeResult) {
         self.dirty = true;
+        // Outcomes are rare control events (not per tick); the clone is the
+        // output's current bus name at most.
+        let bus = self
+            .outputs
+            .get(output_index)
+            .map_or(PictureBus::Program, |o| o.bus.clone());
         if self
             .outcomes
             .try_send(TakeOutcome {
@@ -863,6 +872,7 @@ impl OutputRouter {
                 output_index,
                 tick,
                 outcome,
+                bus,
             })
             .is_err()
         {

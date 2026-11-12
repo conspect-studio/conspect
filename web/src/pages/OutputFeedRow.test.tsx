@@ -35,7 +35,7 @@ const server = setupServer(
   }),
   http.post('*/api/v1/routing/output/take', ({ request }) => {
     takeKey = request.headers.get('Idempotency-Key');
-    return HttpResponse.json({ operation_id: 'op-7', adopt: 'next_tick' }, { status: 202 });
+    return HttpResponse.json({ operation_id: 'op-7', status: 'accepted', adopt: 'next_tick' }, { status: 202 });
   }),
 );
 

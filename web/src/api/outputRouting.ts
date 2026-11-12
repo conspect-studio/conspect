@@ -4,7 +4,7 @@
 //   * `POST /api/v1/routing/plan` with `target.kind = "output"` — the cost
 //     (+0/+1 encoder, sessions only for whole-system principals) and typed
 //     refusals, without applying.
-//   * `POST /api/v1/routing/output/take` — `202 {operation_id, adopt}`; the
+//   * `POST /api/v1/routing/output/take` — `202 {operation_id, status, adopt?}`; the
 //     terminal outcome arrives as the realtime `route.output` event.
 import { apiUrl, buildHeaders, OperationApiError, readProblem, sendCommand } from './operations';
 import type { RequestOptions } from './operations';
@@ -56,7 +56,8 @@ function isOutputPlan(value: unknown): value is OutputPlan {
 }
 
 function isTakeAccepted(value: unknown): value is OutputTakeAccepted {
-  return isRecord(value) && typeof value.operation_id === 'string' && typeof value.adopt === 'string';
+  // A replay of a reserved key carries `status` but never `adopt`.
+  return isRecord(value) && typeof value.operation_id === 'string' && typeof value.status === 'string';
 }
 
 function body(output: string, feed: OutputVideoFeed): Record<string, unknown> {

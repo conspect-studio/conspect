@@ -39,6 +39,14 @@ pub fn outcome_str(result: TakeResult) -> &'static str {
     }
 }
 
+fn routed_feed(bus: &PictureBus) -> RoutedFeed {
+    match bus {
+        PictureBus::Program => RoutedFeed::Program,
+        PictureBus::Preview => RoutedFeed::Preview,
+        PictureBus::Source(id) => RoutedFeed::Source(id.clone()),
+    }
+}
+
 fn picture_bus(feed: &RoutedFeed) -> PictureBus {
     match feed {
         RoutedFeed::Program => PictureBus::Program,
@@ -125,6 +133,7 @@ fn pump(rx: &Receiver<TakeOutcome>, ids: &[Option<String>], tx: &SyncSender<Outp
             output: output.clone(),
             tick: outcome.tick,
             outcome: outcome_str(outcome.outcome).to_owned(),
+            feed: Some(routed_feed(&outcome.bus)),
         };
         if let Err(std::sync::mpsc::TrySendError::Disconnected(_)) = tx.try_send(mapped) {
             return;
