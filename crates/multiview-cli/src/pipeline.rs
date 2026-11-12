@@ -301,6 +301,26 @@ fn first_slice_me_layout_supported(
             == Some(me.program_source.as_str())
 }
 
+/// ADR-0108 slice 1, step 1: an output fed directly by a source (or a switcher
+/// bus other than Program) is validated and read back, but this engine does
+/// not carry it yet. Refuse the run rather than silently putting Program on
+/// that output. A `bus = "preview"` output was already admitted before this
+/// slice and keeps its existing behaviour.
+fn ensure_outputs_carry_program(config: &MultiviewConfig) -> Result<(), PipelineError> {
+    if let Some(routed) = config
+        .output_feeds()
+        .into_iter()
+        .find(|xp| matches!(xp.effective_video(), multiview_config::VideoFeed::Source(_)))
+    {
+        return Err(PipelineError::Engine(format!(
+            "output {:?} is routed to {:?}; this engine carries only Program on outputs",
+            routed.output,
+            routed.effective_video().picture_bus()
+        )));
+    }
+    Ok(())
+}
+
 /// Errors building or running the libav\* pipeline.
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
@@ -1463,6 +1483,56 @@ segment_ms = 1000
 }
 
 #[cfg(test)]
+mod output_feed_guard_tests {
+    use super::ensure_outputs_carry_program;
+    use multiview_config::MultiviewConfig;
+
+    const DOC: &str = r##"
+schema_version = 1
+[canvas]
+width = 64
+height = 64
+fps = "25/1"
+pixel_format = "nv12"
+background = "#000000"
+[canvas.color]
+profile = "sdr-bt709-limited"
+[layout]
+kind = "grid"
+columns = ["1fr"]
+rows = ["1fr"]
+areas = ["a"]
+[[sources]]
+id = "a"
+kind = "test"
+[[cells]]
+id = "c"
+area = "a"
+[cells.source]
+input_id = "a"
+[[outputs]]
+id = "o"
+kind = "hls"
+path = "/tmp/output-feed-guard/index.m3u8"
+codec = "mpeg2video"
+segment_ms = 1000
+"##;
+
+    #[test]
+    fn default_program_outputs_run_and_a_source_feed_is_refused_loudly() {
+        let plain = MultiviewConfig::load_from_toml(DOC).expect("parses");
+        assert!(ensure_outputs_carry_program(&plain).is_ok());
+        let routed = MultiviewConfig::load_from_toml(&format!(
+            "{DOC}\n[[routing.output]]\noutput = \"o\"\nvideo = {{ source = \"a\" }}\n"
+        ))
+        .expect("parses");
+        routed.validate().expect("valid");
+        let err = ensure_outputs_carry_program(&routed).expect_err("refused");
+        assert!(err.to_string().contains("src:a"), "{err}");
+    }
+}
+
+#[cfg(test)]
 mod encoder_format_tests {
     use super::{encoder_input_format, output_codec};
     use ffmpeg_next::format::Pixel;
@@ -2439,6 +2509,10 @@ impl Pipeline {
                 return Err(PipelineError::Engine("first-slice M/E requires one full-canvas source cell initially bound to program_source; multi-cell layouts are not replaced".into()));
             }
         }
+        // ADR-0108 slice 1, step 1: an output fed directly by a source is
+        // validated and read back, but this engine does not carry it yet. Fail
+        // loudly rather than silently putting Program on that output.
+        ensure_outputs_carry_program(config)?;
         let switcher_cell_id = switcher_me
             .as_ref()
             .and_then(|_| config.cells.first().map(|cell| cell.id.clone()));

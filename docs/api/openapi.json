@@ -9187,6 +9187,47 @@
         }
       }
     },
+    "/api/v1/routing": {
+      "get": {
+        "tags": [
+          "routing"
+        ],
+        "summary": "`GET /api/v1/routing` — the output routing state (role: read; outputs the\ncaller may not read are omitted; feeds it may not read are redacted).",
+        "operationId": "get_routing",
+        "responses": {
+          "200": {
+            "description": "The routing state, filtered per object.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RoutingState"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid credentials.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Not authorized to read.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/v1/routing/plan": {
       "post": {
         "tags": [
@@ -18841,6 +18882,55 @@
           }
         }
       },
+      "OutputRouteState": {
+        "type": "object",
+        "description": "One output's routing row in `GET /api/v1/routing` (ADR-0108 §6.2).",
+        "required": [
+          "output",
+          "video",
+          "audio",
+          "effective_audio",
+          "tally",
+          "state"
+        ],
+        "properties": {
+          "audio": {
+            "type": "object",
+            "description": "The configured audio feed (`\"follow\"` unless set)."
+          },
+          "effective_audio": {
+            "type": "object",
+            "description": "What the audio carries now: `\"program\"` (the program mix),\n`{\"source\": id}`, `\"preview_source\"`, or `{\"redacted\": true}`."
+          },
+          "output": {
+            "type": "string",
+            "description": "The output's API id (the id `/api/v1/outputs/{id}` addresses)."
+          },
+          "state": {
+            "type": "string",
+            "description": "`configured` until the engine reports readback for this output."
+          },
+          "tally": {
+            "$ref": "#/components/schemas/OutputTally",
+            "description": "Whether the feed follows the switcher (`program`) or is direct\n(`source`) or the preview bus — the tally distinction (§8)."
+          },
+          "video": {
+            "type": "object",
+            "description": "The configured video feed: `{\"bus\": \"program\"}`, `{\"source\": \"vt1\"}`,\nor `{\"redacted\": true}` when the caller may not read the feed."
+          }
+        }
+      },
+      "OutputTally": {
+        "type": "string",
+        "description": "How an output's feed relates to the switcher (ADR-0108 §8 tally).",
+        "enum": [
+          "program",
+          "preview",
+          "clean",
+          "direct",
+          "redacted"
+        ]
+      },
       "OutputTarget": {
         "type": "object",
         "description": "One decode-side entry point on a device, bindable as an ordinary managed\nOutput with a `device_ref` (ADR-M009 facet (b)).",
@@ -20165,6 +20255,22 @@
           }
         ],
         "description": "`OpenAPI` mirror of [`multiview_control::routing::RouteTarget`] (RT-11).\n\nThe destination a crosspoint take re-points — internally tagged on `kind`,\n`snake_case`, never `untagged`."
+      },
+      "RoutingState": {
+        "type": "object",
+        "description": "The `GET /api/v1/routing` body (ADR-0108 §6.2), filtered per object.",
+        "required": [
+          "outputs"
+        ],
+        "properties": {
+          "outputs": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/OutputRouteState"
+            },
+            "description": "One row per output the caller may read."
+          }
+        }
       },
       "RundownInput": {
         "type": "object",

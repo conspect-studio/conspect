@@ -370,3 +370,149 @@ impl CrosspointKind {
         }
     }
 }
+
+/// One output's routing row in `GET /api/v1/routing` (ADR-0108 §6.2).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+pub struct OutputRouteState {
+    /// The output's API id (the id `/api/v1/outputs/{id}` addresses).
+    pub output: String,
+    /// The configured video feed: `{"bus": "program"}`, `{"source": "vt1"}`,
+    /// or `{"redacted": true}` when the caller may not read the feed.
+    #[cfg_attr(feature = "openapi", schema(value_type = Object))]
+    pub video: serde_json::Value,
+    /// The configured audio feed (`"follow"` unless set).
+    #[cfg_attr(feature = "openapi", schema(value_type = Object))]
+    pub audio: serde_json::Value,
+    /// What the audio carries now: `"program"` (the program mix),
+    /// `{"source": id}`, `"preview_source"`, or `{"redacted": true}`.
+    #[cfg_attr(feature = "openapi", schema(value_type = Object))]
+    pub effective_audio: serde_json::Value,
+    /// Whether the feed follows the switcher (`program`) or is direct
+    /// (`source`) or the preview bus — the tally distinction (§8).
+    pub tally: OutputTally,
+    /// `configured` until the engine reports readback for this output.
+    pub state: String,
+}
+
+/// How an output's feed relates to the switcher (ADR-0108 §8 tally).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum OutputTally {
+    /// On Program: follows the switcher.
+    Program,
+    /// On the Preview bus.
+    Preview,
+    /// On the Clean bus.
+    Clean,
+    /// A source directly: ignores the switcher.
+    Direct,
+    /// Hidden from this caller.
+    Redacted,
+}
+
+/// The `GET /api/v1/routing` body (ADR-0108 §6.2), filtered per object.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+pub struct RoutingState {
+    /// One row per output the caller may read.
+    pub outputs: Vec<OutputRouteState>,
+}
+
+/// `GET /api/v1/routing` — the output routing state (role: read; outputs the
+/// caller may not read are omitted; feeds it may not read are redacted).
+#[cfg_attr(
+    feature = "openapi",
+    utoipa::path(
+        get,
+        path = "/api/v1/routing",
+        tag = "routing",
+        responses(
+            (status = 200, description = "The routing state, filtered per object.", body = RoutingState),
+            (status = 401, description = "Missing or invalid credentials.", body = crate::problem::Problem),
+            (status = 403, description = "Not authorized to read.", body = crate::problem::Problem),
+        ),
+    )
+)]
+pub(crate) async fn get_routing(
+    State(state): State<AppState>,
+    principal: Principal,
+) -> ControlResult<Response> {
+    principal.role.require(Action::Read)?;
+    let config: multiview_config::MultiviewConfig =
+        serde_json::from_value(crate::boot_model::current_desired_config(&state)?)
+            .map_err(|e| ControlError::Repository(format!("desired configuration: {e}")))?;
+    let ids = crate::boot_model::accepted_output_ids(&state)?
+        .filter(|ids| ids.len() == config.outputs.len())
+        .unwrap_or_else(|| {
+            (0..config.outputs.len())
+                .map(|index| format!("output-{index}"))
+                .collect()
+        });
+    let outputs = config
+        .output_feeds()
+        .into_iter()
+        .zip(ids)
+        .filter(|(_, id)| crate::auth::authorize_object(&principal, id).is_ok())
+        .map(|(feed, id)| output_route_state(&principal, &feed, id))
+        .collect();
+    Ok((StatusCode::OK, Json(RoutingState { outputs })).into_response())
+}
+
+/// Whether `principal` may read `feed` (ADR-0108 §6.3): Read on a source; the
+/// Program scope for a switcher bus. Authorization of the feed end is the same
+/// rule the take uses, so readback never discloses what a take would refuse.
+pub(crate) fn may_read_feed(principal: &Principal, feed: &multiview_config::VideoFeed) -> bool {
+    use multiview_config::VideoFeed;
+    match feed {
+        VideoFeed::Bus(_) => crate::auth::authorize_scope(
+            principal,
+            multiview_events::AuthzScope::Program(multiview_config::MAIN_PROGRAM),
+        )
+        .is_ok(),
+        VideoFeed::Source(id) | VideoFeed::Layout(id) => {
+            crate::auth::authorize_object(principal, id).is_ok()
+        }
+        _ => false,
+    }
+}
+
+fn output_route_state(
+    principal: &Principal,
+    feed: &multiview_config::OutputCrosspoint,
+    output: String,
+) -> OutputRouteState {
+    use multiview_config::{FollowAudio, OutputBus, VideoFeed};
+    let redacted = serde_json::json!({ "redacted": true });
+    let video = feed.effective_video();
+    if !may_read_feed(principal, &video) {
+        return OutputRouteState {
+            output,
+            video: redacted.clone(),
+            audio: serde_json::to_value(&feed.audio).unwrap_or_else(|_| redacted.clone()),
+            effective_audio: redacted,
+            tally: OutputTally::Redacted,
+            state: "configured".to_owned(),
+        };
+    }
+    let tally = match &video {
+        VideoFeed::Bus(OutputBus::Preview) => OutputTally::Preview,
+        VideoFeed::Bus(OutputBus::Clean) => OutputTally::Clean,
+        VideoFeed::Bus(_) => OutputTally::Program,
+        _ => OutputTally::Direct,
+    };
+    let effective_audio = match FollowAudio::of(&video) {
+        FollowAudio::Source(id) => serde_json::json!({ "source": id }),
+        FollowAudio::PreviewSource => serde_json::json!("preview_source"),
+        _ => serde_json::json!("program"),
+    };
+    OutputRouteState {
+        output,
+        video: serde_json::to_value(&video).unwrap_or_else(|_| redacted.clone()),
+        audio: serde_json::to_value(&feed.audio).unwrap_or(redacted),
+        effective_audio,
+        tally,
+        state: "configured".to_owned(),
+    }
+}
