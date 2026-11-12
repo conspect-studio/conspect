@@ -182,6 +182,26 @@ impl DesiredState {
     }
 }
 
+/// The start-up admission rule (the same `multiview_config` function
+/// `Pipeline::build` enforces) applied to an already-validated document.
+/// Pure CPU on the control plane, never on the output clock.
+///
+/// # Errors
+/// [`ControlError::NotAdmissibleWithSwitcher`] when the declared switcher M/E
+/// cannot drive the canvas; [`ControlError::Validation`] when it does not solve.
+pub fn admit_for_boot(config: &MultiviewConfig) -> ControlResult<()> {
+    let solved = config
+        .solve_layout()
+        .map_err(|e| ControlError::Validation(format!("desired configuration: {e}")))?;
+    config
+        .switcher_canvas_admission(&solved)
+        .map_err(ControlError::NotAdmissibleWithSwitcher)
+    // `outputs_carry_program` is deliberately not checked here: `routing` is a
+    // storeless restart-only section start-up splices from the BOOT file
+    // (`boot::splice_storeless_sections`), so the accepted copy is not what
+    // start-up builds. `multiview validate` checks it on the spliced document.
+}
+
 /// Load authoritative accepted intent. A corrupt existing record is an error,
 /// never permission to replace it with an older observational snapshot.
 ///
@@ -242,6 +262,10 @@ async fn write_desired(state: &AppState, desired: DesiredState) -> ControlResult
         .as_ref()
         .ok_or_else(|| ControlError::Repository("missing boot model".into()))?;
     desired.validate()?;
+    // #317: a state the control plane accepts must be a state the engine can
+    // boot. Every accepted-state commit funnels through here, so this one call
+    // holds the start-up admission rule for every persisting command.
+    admit_for_boot(&desired.config)?;
     let json = serde_json::to_string(&desired)
         .map_err(|e| ControlError::Repository(format!("serializing desired state: {e}")))?;
     let model = Arc::clone(model);

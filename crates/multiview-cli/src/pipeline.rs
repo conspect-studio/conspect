@@ -268,57 +268,11 @@ struct StreamPlan {
     binding_ids: Vec<Option<String>>,
 }
 
-/// Is this document's canvas one the first slice can drive as a real M/E bus?
-///
-/// Exactly one full-canvas, fully opaque, unclipped, non-overlay cell bound to
-/// the declared `program_source` — the shape the engine treats as the
-/// source-agnostic bus canvas. An unsupported opted-in layout is refused with a
-/// typed error instead of silently replacing the operator's multiview.
-#[allow(clippy::float_cmp)]
-// reason: authored layout fractions compared against their exact canonical
-// values; an approximate comparison would admit a windowed/tiled canvas as
-// "full canvas" and change which sources the buses admit.
-fn first_slice_me_layout_supported(
-    layout: &Layout,
-    config: &MultiviewConfig,
-    me: &multiview_config::MixEffectsConfig,
-) -> bool {
-    layout.cells.len() == 1
-        && config.overlays.is_empty()
-        && !config.cells.first().is_some_and(|cell| {
-            cell.corner_radius.is_some()
-                || cell.border.is_some()
-                || cell.fit.as_deref().is_some_and(|fit| fit != "fill")
-                || cell.visible == Some(false)
-        })
-        && layout.cells.first().is_some_and(|cell| {
-            cell.x == 0.0 && cell.y == 0.0 && cell.w == 1.0 && cell.h == 1.0 && cell.opacity == 1.0
-        })
-        && config
-            .cells
-            .first()
-            .and_then(|cell| cell.source.input_id.as_deref())
-            == Some(me.program_source.as_str())
-}
-
-/// ADR-0108 slice 1, step 1: an output fed directly by a source (or a switcher
-/// bus other than Program) is validated and read back, but this engine does
-/// not carry it yet. Refuse the run rather than silently putting Program on
-/// that output. A `bus = "preview"` output was already admitted before this
-/// slice and keeps its existing behaviour.
+/// ADR-0108 slice 1, step 1 start-up refusal; the rule itself lives in
+/// [`multiview_config::outputs_carry_program`] so start-up and `multiview
+/// validate` share it (#317).
 fn ensure_outputs_carry_program(config: &MultiviewConfig) -> Result<(), PipelineError> {
-    if let Some(routed) = config
-        .output_feeds()
-        .into_iter()
-        .find(|xp| matches!(xp.effective_video(), multiview_config::VideoFeed::Source(_)))
-    {
-        return Err(PipelineError::Engine(format!(
-            "output {:?} is routed to {:?}; this engine carries only Program on outputs",
-            routed.output,
-            routed.effective_video().picture_bus()
-        )));
-    }
-    Ok(())
+    multiview_config::outputs_carry_program(config).map_err(PipelineError::Engine)
 }
 
 /// Errors building or running the libav\* pipeline.
@@ -2504,14 +2458,14 @@ impl Pipeline {
         // legacy multiview with multiple cells remains untouched when the M/E
         // block is absent; an opted-in unsupported layout fails loudly instead
         // of replacing the operator's canvas with a guessed source.
-        if let Some(me) = &switcher_me {
-            if !first_slice_me_layout_supported(&layout, config, me) {
-                return Err(PipelineError::Engine("first-slice M/E requires one full-canvas source cell initially bound to program_source; multi-cell layouts are not replaced".into()));
-            }
-        }
-        // ADR-0108 slice 1, step 1: an output fed directly by a source is
-        // validated and read back, but this engine does not carry it yet. Fail
-        // loudly rather than silently putting Program on that output.
+        // The SAME admission rules the control plane applies before it persists an
+        // accepted state (#317): `multiview_config::switcher_canvas_admission`,
+        // and (ADR-0108 slice 1, step 1) `outputs_carry_program`: an output fed
+        // directly by a source is validated and read back, but this engine does
+        // not carry it yet — fail loudly rather than put Program on it.
+        config
+            .switcher_canvas_admission(&layout)
+            .map_err(|refusal| PipelineError::Engine(refusal.to_string()))?;
         ensure_outputs_carry_program(config)?;
         let switcher_cell_id = switcher_me
             .as_ref()

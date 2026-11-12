@@ -44,8 +44,12 @@ impl Cli {
 /// a compile error until it is wired up.
 #[derive(Debug, Subcommand)]
 pub enum Command {
-    /// Load a config, validate it (grid-solve + cross-references), and print a
-    /// human-readable report. Pure and side-effect-free.
+    /// Load a config, validate it (grid-solve + cross-references), then check
+    /// what the engine will REALLY start from: the accepted state
+    /// (`<config-dir>/.multiview/desired.json`) when one exists, else the
+    /// config, against the start-up admission rule. Prints a human-readable
+    /// report and exits non-zero with start-up's own reason when either fails.
+    /// Pure and side-effect-free (the deploy preflight).
     Validate(ValidateArgs),
     /// Load + validate a config, build the engine, attach built-in test-pattern
     /// sources, and run. In `--software` mode this drives the FFmpeg-free output

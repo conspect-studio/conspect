@@ -29,6 +29,7 @@
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
+pub mod admission;
 pub mod api;
 pub mod audio;
 pub mod catalogues;
@@ -74,6 +75,10 @@ use multiview_core::layout::{
 };
 use multiview_core::stream::StreamKind as CoreStreamKind;
 
+pub use admission::{
+    boot_admission, outputs_carry_program, switcher_canvas_admission, BootAdmissionError,
+    SwitcherCanvasRefusal,
+};
 pub use api::{ApiConfig, ApiKeyConfig, ApiKeyRole};
 use audio::PROGRAM_TRACK as PROGRAM_TRACK_NAME;
 pub use audio::{

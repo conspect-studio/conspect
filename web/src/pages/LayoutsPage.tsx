@@ -6,6 +6,7 @@ import { useMemo, useState } from 'react';
 import type { JSX } from 'react';
 import { Trans, useLingui } from '@lingui/react/macro';
 import { Link } from 'react-router-dom';
+import { useQuery } from '@tanstack/react-query';
 import {
   flexRender,
   getCoreRowModel,
@@ -17,7 +18,13 @@ import { MonitorPlay, Pencil, Plus, Send, Trash2 } from 'lucide-react';
 import { createApiClient } from '../api/client';
 import { useDeleteLayout, useLayouts } from '../api/queries';
 import type { Layout } from '../api/queries';
-import { applyLayoutCommand, describeApplyError } from '../layout/applyLayout';
+import { getSwitcher } from '../api/switcher';
+import {
+  applyLayoutCommand,
+  blockedBySwitcher,
+  describeApplyError,
+  isSwitcherRefusal,
+} from '../layout/applyLayout';
 import { fromLayoutBody } from '../layout/model';
 import { HelpLink } from '../components/HelpLink';
 import { PageHeader } from '../components/PageHeader';
@@ -48,10 +55,19 @@ function cellCount(layout: Layout): number {
   return model?.cells.length ?? 0;
 }
 
+/** The authored cell count of any placement kind (grid or absolute). */
+function authoredCellCount(layout: Layout): number {
+  const body: unknown = layout.body;
+  if (typeof body !== 'object' || body === null) return 0;
+  const cells = (body as { cells?: unknown }).cells;
+  return Array.isArray(cells) ? cells.length : 0;
+}
+
 function useColumns(
   onRequestDelete: (layout: Layout) => void,
   onApply: (layout: Layout) => void,
   applying: boolean,
+  switcherOn: boolean,
 ): ColumnDef<Layout>[] {
   const { t } = useLingui();
   return useMemo<ColumnDef<Layout>[]>(
@@ -86,13 +102,19 @@ function useColumns(
         header: t`Actions`,
         cell: (ctx): JSX.Element => {
           const layout = ctx.row.original;
+          // #317: known in advance — with the switcher on, a multi-cell layout
+          // cannot be the Program canvas. Disabled WITH the reason in text.
+          const blocked = blockedBySwitcher(switcherOn, authoredCellCount(layout));
+          const reasonId = `apply-blocked-${layout.id}`;
           return (
             <div className="flex items-center gap-2">
               <Button
                 variant="outline"
                 size="sm"
-                disabled={applying}
+                disabled={applying || blocked}
                 aria-label={`${t`Apply layout to engine`}: ${layout.name}`}
+                aria-describedby={blocked ? reasonId : undefined}
+                data-testid={blocked ? 'layout-apply-blocked-by-switcher' : undefined}
                 onClick={(): void => {
                   onApply(layout);
                 }}
@@ -100,6 +122,17 @@ function useColumns(
                 <Send aria-hidden="true" />
                 <Trans>Apply</Trans>
               </Button>
+              {blocked ? (
+                <span
+                  id={reasonId}
+                  className="text-xs text-muted-foreground"
+                  data-testid="layout-apply-blocked-reason"
+                >
+                  <Trans>
+                    The switcher is on: a multi-cell layout cannot be the Program canvas.
+                  </Trans>
+                </span>
+              ) : null}
               <Button asChild variant="outline" size="sm">
                 <Link to={`/layouts/${encodeURIComponent(layout.id)}`}>
                   <Pencil aria-hidden="true" />
@@ -122,7 +155,7 @@ function useColumns(
         },
       },
     ],
-    [t, onRequestDelete, onApply, applying],
+    [t, onRequestDelete, onApply, applying, switcherOn],
   );
 }
 
@@ -134,6 +167,15 @@ export function LayoutsPage(): JSX.Element {
   const deleteLayout = useDeleteLayout({ api: client });
   const [pendingDelete, setPendingDelete] = useState<Layout | null>(null);
   const [applying, setApplying] = useState(false);
+  // The switcher is "on" when the server serves a live M/E state; a 409 (no
+  // switcher runtime) or any failure leaves Apply enabled and the server
+  // authoritative.
+  const switcher = useQuery({
+    queryKey: ['switcher', 'me1'],
+    queryFn: () => getSwitcher(),
+    retry: false,
+  });
+  const switcherOn = switcher.data !== undefined;
 
   // Apply is a LIVE action (ADR-W019): the stored layout is resolved + solved
   // at the route and swaps in at the next frame boundary — no export, no
@@ -150,8 +192,12 @@ export function LayoutsPage(): JSX.Element {
       })
       .catch((error: unknown): void => {
         toast({
-          title: t`Could not apply layout`,
-          description: describeApplyError(error),
+          title: isSwitcherRefusal(error)
+            ? t`Layout not applied: the switcher is on`
+            : t`Could not apply layout`,
+          description: isSwitcherRefusal(error)
+            ? `${describeApplyError(error)} ${t`Nothing was changed; the current layout keeps running.`}`
+            : describeApplyError(error),
           variant: 'destructive',
         });
       })
@@ -160,7 +206,7 @@ export function LayoutsPage(): JSX.Element {
       });
   };
 
-  const columns = useColumns(setPendingDelete, applyLayout, applying);
+  const columns = useColumns(setPendingDelete, applyLayout, applying, switcherOn);
   const data = useMemo<Layout[]>(() => layouts.data ?? [], [layouts.data]);
 
   // eslint-disable-next-line react-hooks/incompatible-library -- TanStack Table instance is a leaf; see prior note.
