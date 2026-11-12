@@ -113,3 +113,80 @@ fn rejects_unsupported_http01_and_invalid_combinations() {
     tls.trust_anchor = Some("/etc/conspect/pebble-root.pem".into());
     tls.validate().unwrap();
 }
+
+const DOCUMENT: &str = r##"
+schema_version = 1
+[canvas]
+width = 1920
+height = 1080
+fps = "30000/1001"
+pixel_format = "nv12"
+background = "#101014"
+[canvas.color]
+profile = "sdr-bt709-limited"
+[layout]
+kind = "grid"
+columns = ["1fr"]
+rows = ["1fr"]
+areas = ["a"]
+[[sources]]
+id = "in_a"
+kind = "test"
+[[cells]]
+id = "cell_a"
+area = "a"
+fit = "contain"
+[cells.source]
+input_id = "in_a"
+[[outputs]]
+id = "out-a"
+kind = "rtsp_server"
+mount = "/multiview"
+codec = "h264"
+[network]
+public_host = "test.example.org"
+[network.tls]
+ca = "letsencrypt"
+challenge = "dns-01"
+domains = ["test.example.org"]
+state_dir = "/var/lib/conspect/tls"
+[network.tls.dns]
+provider = "cloudflare"
+token_env = "CF_TOKEN"
+[control]
+listen = "[::1]:8080"
+[control.tls]
+mode = "static"
+cert_file = "/etc/multiview/tls/fullchain.pem"
+key_file = "/etc/multiview/tls/privkey.pem"
+"##;
+
+#[test]
+fn document_keeps_static_tls_beside_network_tls() {
+    let config: multiview_config::MultiviewConfig = toml::from_str(DOCUMENT).unwrap();
+    config.validate().unwrap();
+    assert!(config.network.is_some());
+    let control = config.control.as_ref().expect("control section");
+    assert!(matches!(
+        control.tls,
+        Some(multiview_config::TlsConfig::Static { .. })
+    ));
+    let restored: multiview_config::MultiviewConfig =
+        toml::from_str(&toml::to_string(&config).unwrap()).unwrap();
+    assert_eq!(config.network, restored.network);
+    assert_eq!(config.control, restored.control);
+}
+
+#[test]
+fn document_rejects_a_public_host_missing_from_domains() {
+    let raw = DOCUMENT.replace(
+        "domains = [\"test.example.org\"]",
+        "domains = [\"other.example.org\"]",
+    );
+    let config: multiview_config::MultiviewConfig = toml::from_str(&raw).unwrap();
+    assert!(config
+        .validate()
+        .unwrap_err()
+        .to_string()
+        .contains("network.tls.domains"));
+}

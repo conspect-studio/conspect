@@ -2,7 +2,7 @@
 //! This module lives in control, not frontdoor, so listener crates can depend on
 //! the source without a dependency edge back from the control plane.
 
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use rustls::{
@@ -235,12 +235,17 @@ impl ResolvesServerCert for ChallengeResolver {
         if alpn.next() != Some(b"acme-tls/1".as_slice()) || alpn.next().is_some() {
             return Some(self.source.current());
         }
-        let name = hello.server_name()?;
-        self.challenges
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .get(name)
-            .cloned()
+        let Some(name) = hello.server_name() else {
+            return Some(self.source.current());
+        };
+        Some(
+            self.challenges
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .get(name)
+                .cloned()
+                .unwrap_or_else(|| self.source.current()),
+        )
     }
 }
 
@@ -248,6 +253,10 @@ impl ResolvesServerCert for ChallengeResolver {
 pub struct AcmeCertificateSource {
     sender: watch::Sender<Arc<CertifiedKey>>,
     status: RwLock<CertificateStatus>,
+    /// Serialises bootstrap rotation against ACME install.
+    /// Held across disk I/O so a rotation cannot recreate `bootstrap.key`
+    /// after install has deleted it. `status()` never takes this lock.
+    transition: Mutex<()>,
 }
 
 impl AcmeCertificateSource {
@@ -270,10 +279,15 @@ impl AcmeCertificateSource {
                 last_error: None,
                 bootstrap_fingerprint: Some(fingerprint),
             }),
+            transition: Mutex::new(()),
         }
     }
 
     /// Rotate an expiring bootstrap certificate in setup without restarting outputs.
+    ///
+    /// Blocking: generates a key and fsyncs the state directory. Call it from
+    /// `spawn_blocking` or the front door's own runtime, never from a task that
+    /// shares the output-clock runtime. `status()` does not wait on this I/O.
     /// The caller schedules this off the data path before the seven-day expiry.
     ///
     /// # Errors
@@ -283,22 +297,30 @@ impl AcmeCertificateSource {
         host: &str,
         state_dir: &std::path::Path,
     ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
-        let mut status = self
-            .status
-            .write()
+        let _transition = self
+            .transition
+            .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if status.state != TlsState::Setup {
+        if self.status().state != TlsState::Setup {
             return Ok(false);
         }
         let fresh = bootstrap_certificate(host)?;
         fresh.persist(state_dir)?;
         self.sender.send_replace(fresh.certificate);
-        status.bootstrap_fingerprint = Some(fresh.fingerprint);
+        self.status
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .bootstrap_fingerprint = Some(fresh.fingerprint);
         Ok(true)
     }
 
     /// Install a verified ACME chain without interrupting existing handshakes.
     /// Remove the bootstrap key on disk before announcing the serving state.
+    ///
+    /// Blocking: deletes the bootstrap key and fsyncs the state directory. Call
+    /// it from `spawn_blocking` or the front door's own runtime. `status()` does
+    /// not wait on this I/O. The transition lock is held across the delete so a
+    /// concurrent rotation cannot recreate `bootstrap.key` afterwards.
     ///
     /// # Errors
     /// Returns an I/O error and preserves the previous certificate if key removal fails.
@@ -308,9 +330,9 @@ impl AcmeCertificateSource {
         expires_at: i64,
         state_dir: &std::path::Path,
     ) -> std::io::Result<()> {
-        let mut status = self
-            .status
-            .write()
+        let _transition = self
+            .transition
+            .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         match std::fs::remove_file(state_dir.join("bootstrap.key")) {
             Ok(()) => std::fs::File::open(state_dir)?.sync_all()?,
@@ -318,6 +340,10 @@ impl AcmeCertificateSource {
             Err(error) => return Err(error),
         }
         self.sender.send_replace(key);
+        let mut status = self
+            .status
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         status.state = TlsState::Serving;
         status.expires_at = Some(expires_at);
         status.last_error = None;
