@@ -332,6 +332,32 @@ pub enum PipelineError {
         /// Why it is unavailable.
         reason: String,
     },
+    /// The host/environment failed while building (#324): an OS-level I/O
+    /// error — a directory that cannot be created, a worker thread that cannot
+    /// be spawned. No configuration would build here, so start-up retries it
+    /// and never falls back to the last-good state over it.
+    #[error("{context}: {source}")]
+    Environment {
+        /// What was being done (e.g. `output hls: creating /srv/hls`).
+        context: String,
+        /// The OS error.
+        #[source]
+        source: std::io::Error,
+    },
+}
+
+impl PipelineError {
+    /// Whether this build failure is a fault in the configuration or in the
+    /// host (#324). Only [`PipelineError::Environment`] is environment-class;
+    /// everything else defaults to state-class, which is safe because the
+    /// start-up fallback never changes the saved configuration.
+    #[must_use]
+    pub fn failure_class(&self) -> crate::boot::FailureClass {
+        match self {
+            Self::Environment { .. } => crate::boot::FailureClass::Environment,
+            _ => crate::boot::FailureClass::State,
+        }
+    }
 }
 
 /// A summary of one pipeline run.
@@ -1508,6 +1534,59 @@ segment_ms = 1000
 }
 
 #[cfg(test)]
+mod failure_class_tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+    use super::{Pipeline, PipelineError};
+    use crate::boot::FailureClass;
+    use multiview_config::MultiviewConfig;
+
+    /// #324: only the environment variant is environment-class; every
+    /// configuration-shaped error stays state-class.
+    #[test]
+    fn pipeline_error_failure_class_mapping() {
+        let env = PipelineError::Environment {
+            context: "output hls: creating /x".to_owned(),
+            source: std::io::Error::from(std::io::ErrorKind::PermissionDenied),
+        };
+        assert_eq!(env.failure_class(), FailureClass::Environment);
+        for error in [
+            PipelineError::Engine("e".into()),
+            PipelineError::NoOutput("file/HLS"),
+            PipelineError::Output {
+                kind: "hls",
+                reason: "r".into(),
+            },
+            PipelineError::Codec {
+                codec: "h264".into(),
+                reason: "r".into(),
+            },
+        ] {
+            assert_eq!(error.failure_class(), FailureClass::State, "{error}");
+        }
+    }
+
+    /// #324, end to end through `Pipeline::build`: an HLS segment directory
+    /// that cannot be created (here: its parent is a regular file, so this
+    /// fails even as root) is an environment-class build failure.
+    #[test]
+    fn an_uncreatable_hls_directory_is_an_environment_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let blocker = dir.path().join("not-a-dir");
+        std::fs::write(&blocker, b"x").unwrap();
+        let playlist = blocker.join("hls").join("index.m3u8");
+        let doc = format!(
+            "schema_version = 1\n[canvas]\nwidth = 64\nheight = 64\nfps = \"25/1\"\npixel_format = \"nv12\"\nbackground = \"#000000\"\n[canvas.color]\nprofile = \"sdr-bt709-limited\"\n[layout]\nkind = \"absolute\"\n[[sources]]\nid = \"envclass_cam\"\nkind = \"bars\"\n[[cells]]\nid = \"c\"\nrect = {{ x = 0.0, y = 0.0, w = 1.0, h = 1.0 }}\n[cells.source]\ninput_id = \"envclass_cam\"\n[[outputs]]\nkind = \"hls\"\npath = {:?}\ncodec = \"mpeg2video\"\nsegment_ms = 1000\n",
+            playlist.display().to_string()
+        );
+        let config = MultiviewConfig::load_from_toml(&doc).expect("parses");
+        let Err(error) = Pipeline::build(&config) else {
+            panic!("the build must fail");
+        };
+        assert_eq!(error.failure_class(), FailureClass::Environment, "{error}");
+    }
+}
+
+#[cfg(test)]
 mod output_feed_guard_tests {
     use super::ensure_outputs_carry_program;
     use multiview_config::MultiviewConfig;
@@ -2599,8 +2678,13 @@ impl Pipeline {
         // places tiles 1:1 at the cell origin).
         let mut stores: HashMapStores = std::collections::HashMap::new();
         let source_events = Arc::new(
-            crate::source_event_runtime::Runtime::new()
-                .map_err(|e| PipelineError::Engine(format!("source events: {e}")))?,
+            // #324: the only failure is a worker thread spawn — the host.
+            crate::source_event_runtime::Runtime::new().map_err(|source| {
+                PipelineError::Environment {
+                    context: "engine: source events".to_owned(),
+                    source,
+                }
+            })?,
         );
         let mut ingest_plans: Vec<IngestPlan> = Vec::with_capacity(config.sources.len());
         // Per-source audio stores + decode plans (AUD-2). Built for every
@@ -3415,9 +3499,10 @@ impl Pipeline {
         &self,
         binding_ids: &[Option<String>],
     ) -> Result<RunRouting, PipelineError> {
-        let spawn_err = |e: std::io::Error| PipelineError::Output {
-            kind: "routing",
-            reason: e.to_string(),
+        // #324: a thread that cannot be spawned is a host fault, not a state one.
+        let spawn_err = |source: std::io::Error| PipelineError::Environment {
+            context: "output routing".to_owned(),
+            source,
         };
         let (aux_tx, aux_rx) = multiview_engine::aux_tick_channel();
         let catalogue = Arc::clone(&self.catalogue);
@@ -12118,9 +12203,12 @@ fn build_hls_output(
     epoch: &multiview_output::SharedEpoch,
 ) -> Result<RunnableOutput, PipelineError> {
     let (dir, prefix, playlist_path) = hls_paths(Path::new(path));
-    std::fs::create_dir_all(&dir).map_err(|e| PipelineError::Output {
-        kind: "hls",
-        reason: format!("creating {}: {e}", dir.display()),
+    // #324: a directory that cannot be created (permissions, a read-only or
+    // full volume, a missing mount) is a host fault: retried, never a reason to
+    // fall back from the operator's saved state.
+    std::fs::create_dir_all(&dir).map_err(|source| PipelineError::Environment {
+        context: format!("output hls: creating {}", dir.display()),
+        source,
     })?;
     let (meta, matrix) = output_mux_meta(output);
     Ok(RunnableOutput::Hls {

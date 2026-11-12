@@ -72,10 +72,39 @@ pub fn emit_accepted_state_rejected<S>(
         severity: WarningSeverity::Critical,
         subsystem: "config".to_owned(),
         message,
-        remediation: "Check the configuration (`multiview validate <config>`); fix the cause or re-apply a layout the switcher can use. The rejected file is kept for inspection; this warning clears on the next clean start.".to_owned(),
+        remediation: ACCEPTED_STATE_REJECTED_REMEDIATION.to_owned(),
         since: since_nanos,
         active: true,
     }));
+}
+
+/// The `accepted-state-rejected` remediation (#324): the saved configuration is
+/// NOT changed by a fallback, so the operator must know both that it is still
+/// there and how to make the warning go away (it is persisted across restarts
+/// until acknowledged).
+const ACCEPTED_STATE_REJECTED_REMEDIATION: &str = "The saved configuration was not changed: it is still in .multiview/desired.json and a copy is kept under .multiview/rejected/. Every restart tries it first again. Check it with `multiview validate <config>`; fix the cause, or re-apply a layout from the running configuration (the first change through the API saves what runs). This warning stays across restarts until acknowledged: POST /api/v1/health/accepted-state-rejected/ack or `multiview acknowledge-fallback <config>`.";
+
+/// Clear the `accepted-state-rejected` warning (#324): the operator
+/// acknowledged it. Published through the drop-oldest lane (inv #10) as a
+/// `health.warning.cleared` transition, so every subscriber (the warning
+/// store's ingest, the UI banner) converges on it. Returns the cleared warning.
+#[must_use = "the caller records the cleared warning in its store"]
+pub fn emit_accepted_state_rejected_cleared<S>(
+    publisher: &EnginePublisher<S, Event>,
+    message: String,
+    since_nanos: i64,
+) -> HealthWarning {
+    let warning = HealthWarning {
+        code: WarningCode::AcceptedStateRejected,
+        severity: WarningSeverity::Critical,
+        subsystem: "config".to_owned(),
+        message,
+        remediation: ACCEPTED_STATE_REJECTED_REMEDIATION.to_owned(),
+        since: since_nanos,
+        active: false,
+    };
+    publisher.publish_event(Event::HealthWarningCleared(warning.clone()));
+    warning
 }
 
 /// A control-owned, dependency-light view of the SA-0 composite MISMATCH.

@@ -181,6 +181,22 @@ pub enum RunError {
     Pattern(String),
 }
 
+impl RunError {
+    /// Whether this build failure is a fault in the configuration or in the
+    /// host (#324). An expired entitlement lease is not a state fault: every
+    /// state is refused alike, so falling back to last-good would not help and
+    /// must not be recorded as a rejected configuration. Everything else is
+    /// state-class (the safe default: the fallback never changes the saved
+    /// configuration).
+    #[must_use]
+    pub fn failure_class(&self) -> crate::boot::FailureClass {
+        match self {
+            Self::LeaseExpired(_) => crate::boot::FailureClass::Environment,
+            _ => crate::boot::FailureClass::State,
+        }
+    }
+}
+
 /// A built, ready-to-run software engine.
 ///
 /// Construct one with [`SoftwareEngine::build`] from a validated config, then
@@ -1019,6 +1035,24 @@ fn test_pattern(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #324: a lease refusal is environment-class (never a fallback); every
+    /// other build error stays state-class.
+    #[test]
+    fn run_error_failure_class_mapping() {
+        use crate::boot::FailureClass;
+        assert_eq!(
+            RunError::LeaseExpired("blocked".into()).failure_class(),
+            FailureClass::Environment
+        );
+        for error in [
+            RunError::Clock("c".into()),
+            RunError::Engine("e".into()),
+            RunError::Pattern("p".into()),
+        ] {
+            assert_eq!(error.failure_class(), FailureClass::State, "{error}");
+        }
+    }
 
     /// Pull a real [`Source`] out of the parser (it is `#[non_exhaustive]`, so it
     /// cannot be struct-literal-constructed from this crate) by wrapping its

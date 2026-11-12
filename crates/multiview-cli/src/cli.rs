@@ -66,6 +66,24 @@ pub enum Command {
     /// resolved enrollment + presentation plan. The live ingest → scanout path
     /// and the real enrollment HTTP are hardware/network follow-ons.
     Node(NodeArgs),
+    /// Acknowledge a start-up fallback (#324): when a start could not use the
+    /// saved configuration (`<config-dir>/.multiview/desired.json`) and ran
+    /// from the last configuration that started, the `accepted-state-rejected`
+    /// warning stays raised across restarts until acknowledged. This removes
+    /// that record; the saved configuration itself is never changed. A
+    /// running engine clears its banner on its next start, or acknowledge it
+    /// through the API (`POST /api/v1/health/accepted-state-rejected/ack`).
+    AcknowledgeFallback(AcknowledgeFallbackArgs),
+}
+
+/// Arguments for `multiview acknowledge-fallback`.
+#[derive(Debug, Args)]
+#[non_exhaustive]
+pub struct AcknowledgeFallbackArgs {
+    /// Path to the TOML configuration document whose start-up fallback warning
+    /// to acknowledge.
+    #[arg(value_name = "CONFIG")]
+    pub config: PathBuf,
 }
 
 /// Arguments for `multiview validate`.

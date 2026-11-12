@@ -1,4 +1,5 @@
-//! "A start that cannot build the saved state must not be an outage" (#317 part 2).
+//! "A start that cannot build the saved state must not be an outage" (#317
+//! part 2), without ever overwriting the operator's saved state (#324).
 //!
 //! Next to the accepted state (`.multiview/desired.json`) the run keeps
 //! `.multiview/last-good.json`: a byte copy of the accepted envelope the engine
@@ -9,27 +10,39 @@
 //!
 //! At start, when the accepted state fails start-up admission (the same
 //! `multiview_config::boot_admission` the control plane applies before it
-//! persists) or the pipeline build itself fails, the run:
+//! persists) or the pipeline build fails with a STATE-class error, the run:
 //! 1. logs the exact reason. Nothing is written while deciding; only once the
 //!    engine has been BUILT from last-good does the run go on to:
-//! 2. keep the operator's rejected bytes on disk as
-//!    `.multiview/rejected/desired-<unix-ms>-<n>.json` (bounded: newest
-//!    [`MAX_REJECTED`] kept) — never silently discarded;
-//! 3. start from `last-good.json`, which is ALSO restored as the accepted
-//!    state so the control plane, the stores and the next restart agree with
-//!    what the engine runs;
-//! 4. raise a latched `accepted-state-rejected` health warning naming what was
-//!    rejected, why, and where it was kept (the UI health banner and
-//!    `GET /api/v1/health` show it).
+//! 2. keep a COPY of the rejected bytes as
+//!    `.multiview/rejected/desired-<unix-ms>-<n>.json` (deduplicated: identical
+//!    bytes already kept are reused; bounded: newest [`MAX_REJECTED`] kept);
+//! 3. write the persisted marker `.multiview/boot-fallback.json`, so the
+//!    alarm survives restarts until an operator acknowledges it
+//!    (`POST /api/v1/health/accepted-state-rejected/ack` or
+//!    `multiview acknowledge-fallback <config>`);
+//! 4. start from `last-good.json`, seeding the control plane's in-memory
+//!    accepted snapshot with it so the stores and `GET` routes agree with what
+//!    the engine runs — `desired.json` itself is NEVER moved or overwritten
+//!    (#324): every restart tries it first again, so a fault that goes away
+//!    (a newer build, a fixed host) heals with no operator action;
+//! 5. raise a latched `accepted-state-rejected` health warning naming what was
+//!    rejected, why, and where the copy was kept.
+//!
+//! An ENVIRONMENT-class build error (a port in use, a missing directory
+//! permission…) never falls back at all: it is retried and then fails, since
+//! it would break every state alike (see [`crate::boot::FailureClass`]).
 //!
 //! With no last-good copy (a first install) the start fails as before with the
 //! clear error: a first install must never invent a state.
 
+use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
 use multiview_config::MultiviewConfig;
 use multiview_control::boot_model::{
-    desired_path_for, load_desired_file, state_dir_for, write_atomic, DesiredState,
+    boot_fallback_marker_path, clear_boot_fallback_marker, load_desired_file,
+    read_boot_fallback_marker, state_dir_for, write_atomic, AtomicWriteError, BootFallbackMarker,
+    DesiredState,
 };
 
 /// The last-good copy's file name inside the state directory.
@@ -51,20 +64,216 @@ pub fn last_good_path_for(boot_path: &Path) -> PathBuf {
 pub struct Fallback {
     /// Why the accepted state could not start (the exact start-up reason).
     pub reason: String,
-    /// Where the rejected accepted state was kept.
-    pub kept_at: PathBuf,
+    /// Where a copy of the rejected accepted state was kept (`None`: the copy
+    /// could not be written — `desired.json` still holds the bytes).
+    pub kept_at: Option<PathBuf>,
+    /// Why the kept copy or the persisted marker could not be written, if
+    /// either failed (#324: the start proceeds anyway — nothing is lost because
+    /// `desired.json` is untouched — but the operator must be told the alarm
+    /// will not survive a restart).
+    pub persist_error: Option<String>,
+    /// Unix milliseconds of the start that fell back.
+    pub since_unix_ms: i64,
 }
 
 impl Fallback {
     /// The operator-facing warning text.
     #[must_use]
     pub fn message(&self) -> String {
-        format!(
-            "The saved configuration could not start ({}). The engine started from the last configuration that ran; the rejected one is kept at {}.",
-            self.reason,
-            self.kept_at.display()
+        let mut message = format!(
+            "The saved configuration could not start ({}). The engine started from the last configuration that ran; the saved configuration is unchanged in .multiview/desired.json and is tried again on every restart.",
+            self.reason
+        );
+        if let Some(kept) = &self.kept_at {
+            let _ = write!(message, " A copy is kept at {}.", kept.display());
+        }
+        if let Some(error) = &self.persist_error {
+            let _ = write!(
+                message,
+                " The start-up fallback could not be recorded on disk ({error}); this warning will not survive a restart."
+            );
+        }
+        message
+    }
+
+    /// The persisted marker for this fallback.
+    #[must_use]
+    pub fn marker(&self) -> BootFallbackMarker {
+        BootFallbackMarker::new(
+            self.reason.clone(),
+            self.kept_at.as_ref().map(|p| p.display().to_string()),
+            self.since_unix_ms,
+            self.message(),
         )
     }
+}
+
+/// An atomic state-file writer: production uses
+/// [`multiview_control::boot_model::write_atomic_checked`]; tests inject
+/// `ENOSPC` / `AfterRename`.
+pub type AtomicWriter<'a> = dyn Fn(&Path, &str) -> Result<(), AtomicWriteError> + 'a;
+
+/// Write `content` to `path` with `writer`, treating an `AfterRename` failure
+/// as written when the file reads back byte-equal (the rename is visible; only
+/// its directory sync failed — warned, not fatal).
+fn write_checked(path: &Path, content: &str, writer: &AtomicWriter<'_>) -> Result<(), String> {
+    match writer(path, content) {
+        Ok(()) => Ok(()),
+        Err(AtomicWriteError::AfterRename(error))
+            if std::fs::read_to_string(path).is_ok_and(|now| now == content) =>
+        {
+            tracing::warn!(path = %path.display(), %error, "written, but the directory sync failed");
+            Ok(())
+        }
+        Err(error) => Err(format!("writing {}: {error}", path.display())),
+    }
+}
+
+/// Keep a COPY of the rejected accepted-state bytes under `rejected/`
+/// (bounded) and return where (#324: `desired.json` itself is never touched).
+/// Identical bytes already kept are reused instead of written again, so a
+/// state that keeps failing on every restart does not churn the bounded
+/// directory (and push out older, different rejected states).
+///
+/// # Errors
+/// The directory or the copy could not be written.
+pub fn keep_rejected_copy(
+    boot_path: &Path,
+    rejected_text: &str,
+    now_ms: i64,
+) -> Result<PathBuf, String> {
+    keep_rejected_copy_with(
+        boot_path,
+        rejected_text,
+        now_ms,
+        &multiview_control::boot_model::write_atomic_checked,
+    )
+}
+
+/// [`keep_rejected_copy`] with an injectable writer.
+///
+/// # Errors
+/// See [`keep_rejected_copy`].
+pub fn keep_rejected_copy_with(
+    boot_path: &Path,
+    rejected_text: &str,
+    now_ms: i64,
+    writer: &AtomicWriter<'_>,
+) -> Result<PathBuf, String> {
+    let rejected_dir = state_dir_for(boot_path).join(REJECTED_DIR);
+    if let Some(existing) = rejected_files(&rejected_dir)
+        .into_iter()
+        .find(|p| std::fs::read_to_string(p).is_ok_and(|kept| kept == rejected_text))
+    {
+        return Ok(existing);
+    }
+    create_private_dir(&rejected_dir)?;
+    // `desired-<13-digit ms>-<3-digit n>.json`: lexical order = time order.
+    let mut n = 0_u32;
+    let mut kept = rejected_dir.join(format!("desired-{now_ms:013}-{n:03}.json"));
+    while kept.exists() {
+        n = n.saturating_add(1);
+        kept = rejected_dir.join(format!("desired-{now_ms:013}-{n:03}.json"));
+    }
+    write_checked(&kept, rejected_text, writer)
+        .map_err(|e| format!("keeping a copy of the rejected state: {e}"))?;
+    prune_rejected(&rejected_dir, &kept);
+    Ok(kept)
+}
+
+/// Persist the start-up fallback marker for `fallback` (#324).
+///
+/// # Errors
+/// The marker could not be written.
+pub fn write_marker_with(
+    boot_path: &Path,
+    fallback: &Fallback,
+    writer: &AtomicWriter<'_>,
+) -> Result<(), String> {
+    let json = serde_json::to_string(&fallback.marker())
+        .map_err(|e| format!("serializing the start-up fallback marker: {e}"))?;
+    write_checked(&boot_fallback_marker_path(boot_path), &json, writer)
+        .map_err(|e| format!("recording the start-up fallback marker: {e}"))
+}
+
+/// Raise the `accepted-state-rejected` warning at start-up when one is due
+/// (#324): from THIS start's fallback when it fell back (freshest, and it also
+/// covers a marker that could not be written), else from a persisted marker an
+/// earlier start left (a crash-restart, a `--ticks` run, a run without
+/// `[control]`). Call after the warning ingest subscribed, before the output
+/// clock exists (inv #1); publishes through the drop-oldest lane (inv #10).
+/// Returns whether a warning was raised.
+#[must_use = "whether a warning was raised (start-up may ignore it; tests assert it)"]
+pub fn announce<S>(
+    boot_path: &Path,
+    start: &crate::boot::StartConfig,
+    publisher: &multiview_engine::EnginePublisher<S, multiview_events::Event>,
+) -> bool {
+    let now_nanos = |ms: Option<i64>| {
+        ms.map_or_else(
+            || {
+                i64::try_from(
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map_or(0, |d| d.as_nanos()),
+                )
+                .unwrap_or(i64::MAX)
+            },
+            |ms| ms.saturating_mul(1_000_000),
+        )
+    };
+    if let Some(fallback) = &start.boot_fallback {
+        multiview_control::emit_accepted_state_rejected(
+            publisher,
+            fallback.message(),
+            now_nanos(Some(fallback.since_unix_ms)),
+        );
+        return true;
+    }
+    match read_boot_fallback_marker(boot_path) {
+        Ok(Some(marker)) => {
+            multiview_control::emit_accepted_state_rejected(
+                publisher,
+                marker.message,
+                now_nanos(Some(marker.since_unix_ms)),
+            );
+            true
+        }
+        Ok(None) => false,
+        // A marker that exists but cannot be read still means an earlier
+        // start fell back: raise it rather than silently drop the alarm.
+        Err(error) => {
+            multiview_control::emit_accepted_state_rejected(
+                publisher,
+                format!(
+                    "An earlier start could not use the saved configuration and started from the last configuration that ran, but its record cannot be read ({error})."
+                ),
+                now_nanos(None),
+            );
+            true
+        }
+    }
+}
+
+/// Acknowledge a pending start-up fallback warning from the command line
+/// (#324): remove the marker. Returns the cleared warning's text, or `None`
+/// when nothing was pending. A running engine clears its banner on the API
+/// acknowledgement or its next start.
+///
+/// # Errors
+/// The marker exists but could not be removed.
+pub fn acknowledge(boot_path: &Path) -> Result<Option<String>, String> {
+    let message = match read_boot_fallback_marker(boot_path) {
+        Ok(marker) => marker.map(|m| m.message),
+        Err(error) => Some(format!("(an unreadable start-up fallback record: {error})")),
+    };
+    let removed = clear_boot_fallback_marker(boot_path).map_err(|e| {
+        format!(
+            "removing {}: {e}",
+            boot_fallback_marker_path(boot_path).display()
+        )
+    })?;
+    Ok(if removed { message } else { None })
 }
 
 /// Load the last-good envelope, if any. An unreadable/invalid copy is treated
@@ -80,50 +289,6 @@ pub fn load_last_good(boot_path: &Path) -> Option<DesiredState> {
     }
 }
 
-/// Keep the rejected accepted-state bytes under `rejected/` (bounded) and
-/// restore the last-good envelope as the accepted state. Returns where the
-/// rejected copy was kept. Order: keep (durable) → restore (durable) → prune,
-/// so a crash at any point leaves the operator's bytes on disk.
-///
-/// # Errors
-/// An I/O failure; the caller then refuses to start (never discards the
-/// operator's state without having kept it).
-pub fn quarantine_and_restore(
-    boot_path: &Path,
-    rejected_text: &str,
-    last_good: &DesiredState,
-    now_ms: i64,
-) -> Result<PathBuf, String> {
-    let desired = desired_path_for(boot_path);
-    let rejected_dir = state_dir_for(boot_path).join(REJECTED_DIR);
-    create_private_dir(&rejected_dir)?;
-    // `desired-<13-digit ms>-<3-digit n>.json`: lexical order = time order.
-    let mut n = 0_u32;
-    let mut kept = rejected_dir.join(format!("desired-{now_ms:013}-{n:03}.json"));
-    while kept.exists() {
-        n = n.saturating_add(1);
-        kept = rejected_dir.join(format!("desired-{now_ms:013}-{n:03}.json"));
-    }
-    write_atomic(&kept, rejected_text).map_err(|e| format!("keeping {}: {e}", kept.display()))?;
-    let json = serde_json::to_string(last_good)
-        .map_err(|e| format!("serializing the last-good state: {e}"))?;
-    if let Err(e) = write_atomic(&desired, &json) {
-        // A directory-fsync failure AFTER the rename leaves the restore visible:
-        // the start proceeds (and warns) rather than refusing on a state that is
-        // already in place.
-        if std::fs::read_to_string(&desired).is_ok_and(|now| now == json) {
-            tracing::warn!(error = %e, "last-good restored, but the directory sync failed");
-        } else {
-            return Err(format!(
-                "restoring {} from last-good: {e}",
-                desired.display()
-            ));
-        }
-    }
-    prune_rejected(&rejected_dir, &kept);
-    Ok(kept)
-}
-
 /// The state directory's owner-only (0700) policy for the `rejected/` subdir.
 fn create_private_dir(dir: &Path) -> Result<(), String> {
     std::fs::create_dir_all(dir).map_err(|e| format!("creating {}: {e}", dir.display()))?;
@@ -136,11 +301,10 @@ fn create_private_dir(dir: &Path) -> Result<(), String> {
     Ok(())
 }
 
-/// Keep only the newest [`MAX_REJECTED`] `desired-*.json` files, ordered by
-/// file name (the zero-padded millisecond stamp), never removing `keep`.
-fn prune_rejected(dir: &Path, keep: &Path) {
+/// The kept `desired-*.json` files in `dir`, sorted by name (= time).
+fn rejected_files(dir: &Path) -> Vec<PathBuf> {
     let Ok(entries) = std::fs::read_dir(dir) else {
-        return;
+        return Vec::new();
     };
     let mut files: Vec<PathBuf> = entries
         .filter_map(Result::ok)
@@ -156,6 +320,13 @@ fn prune_rejected(dir: &Path, keep: &Path) {
         })
         .collect();
     files.sort();
+    files
+}
+
+/// Keep only the newest [`MAX_REJECTED`] `desired-*.json` files, ordered by
+/// file name (the zero-padded millisecond stamp), never removing `keep`.
+fn prune_rejected(dir: &Path, keep: &Path) {
+    let files = rejected_files(dir);
     let excess = files.len().saturating_sub(MAX_REJECTED);
     for path in files.into_iter().take(excess).filter(|p| p != keep) {
         if let Err(error) = std::fs::remove_file(&path) {

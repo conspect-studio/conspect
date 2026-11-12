@@ -4110,6 +4110,62 @@
         }
       }
     },
+    "/api/v1/health/{code}/ack": {
+      "post": {
+        "tags": [
+          "health"
+        ],
+        "summary": "`POST /api/v1/health/{code}/ack` — acknowledge the persisted\n`accepted-state-rejected` warning (role: write, #324).",
+        "description": "Removes the start-up fallback marker (on the blocking pool — file I/O never\nruns on a runtime worker, and never on the engine), records the warning as\ncleared in the store and publishes `health.warning.cleared` through the\ndrop-oldest lane (inv #10). The operator's saved configuration is not\ntouched: acknowledging only silences the alarm.",
+        "operationId": "ack_health_warning",
+        "parameters": [
+          {
+            "name": "code",
+            "in": "path",
+            "description": "Warning code to acknowledge; only `accepted-state-rejected` is acknowledgeable.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Acknowledged: the persisted marker is removed and the warning cleared."
+          },
+          "401": {
+            "description": "Missing or invalid credentials.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Not authorized to acknowledge.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Not an acknowledgeable code, no config-file run, or nothing pending.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/v1/inputs/{id}/events": {
       "get": {
         "tags": [
@@ -24499,7 +24555,7 @@
     },
     {
       "name": "health",
-      "description": "Health warnings: active capability mismatches + remediation (read-only)"
+      "description": "Health warnings: active capability mismatches + remediation; acknowledge the persisted start-up fallback warning"
     },
     {
       "name": "licence",
