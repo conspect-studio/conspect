@@ -86,9 +86,15 @@ Do **not** link Homebrew's `ffmpeg` formula: it is a different major from the pi
 with `--enable-gpl` (x264/x265), so linking against it introduces applicable GPL combined-work
 obligations and is never the LGPL-clean artifact. This does not relicense Conspect or grant
 permission to distribute it; local development and testing must also stay within your applicable
-Conspect permissions. A pinned macOS (VideoToolbox/AudioToolbox) profile for `deploy/ffmpeg-build.sh` is
-the next step of the macOS work; until it lands, `release.yml`'s macOS legs fail loudly instead of
-linking Homebrew's FFmpeg.
+Conspect permissions. Build the pinned prefix with the macOS profile instead (Homebrew supplies only the
+LGPL/permissive deps `pkg-config nasm opus srt gnutls`):
+
+```sh
+FF_PREFIX="$PWD/../multiview-ffmpeg" FF_LICENSE=lgpl FF_HWACCEL=apple TARGETARCH=arm64 \
+  bash deploy/ffmpeg-build.sh
+export PKG_CONFIG_PATH="$PWD/../multiview-ffmpeg/lib/pkgconfig"
+cargo build --release -p multiview-cli --features apple
+```
 
 > [!WARNING]
 > **bindgen picks up `LIBCLANG_PATH`.** `ffmpeg-sys-next` generates its bindings with bindgen,
@@ -255,7 +261,7 @@ cargo build --release -p multiview-cli --features "apple,embed-web"
 |--------|-----------|----------------|
 | *(default)* | `software` + `wgpu` + `openapi` (no `ffmpeg`, no GPU codec, no NDI) | LGPL-clean, no-native-deps CI / portable |
 | `nvidia` | `cuda` + `ffmpeg` + `wgpu` | Linux + NVIDIA (NVDEC→CUDA→NVENC island) |
-| `apple` | `videotoolbox` + `metal` + `ffmpeg` | macOS native (VT→Metal→VT island) |
+| `apple` | `videotoolbox` + `gpu` (wgpu on Metal, [ADR-0105](../decisions/ADR-0105.md)) + `ffmpeg` | macOS native |
 | `linux-vaapi` | `vaapi` + `qsv` + `ffmpeg` + `wgpu` | Linux Intel/AMD (dma-buf island) |
 | `full` | everything non-GPL | Cross-platform max non-GPL build |
 
@@ -347,11 +353,14 @@ a separate obligation from software copyright and may apply regardless of build 
 ### 7.2 macOS
 
 - **Native only** — there is no container GPU path on macOS (no Metal/VideoToolbox in containers).
-- **Universal2 release.** Build each target (`aarch64-apple-darwin`, `x86_64-apple-darwin`), `lipo`
-  into a single universal2 binary, bundle the LGPL `libav*` (and optional `libndi`) dylibs with
-  `@rpath`/`@loader_path` install names, then **inside-out codesign** every dylib + the executable
-  (hardened runtime, secure timestamp, consistent Team ID — `codesign --deep` is unreliable), and
-  finally `notarytool` + `stapler`.
+- **Release artifact (Apple silicon).** `release.yml` builds `aarch64-apple-darwin` with the
+  `apple` preset against the pinned prefix, then `deploy/macos-bundle.sh <stage> [identity]`
+  copies the `libav*` dylibs and their non-system dependencies into `lib/` with `@rpath` install
+  names, copies their upstream licence texts into `licenses/`, and **codesigns inside-out** (every
+  dylib, then the executable; hardened runtime + timestamp with a Developer ID, ad-hoc
+  otherwise). The archive is notarized with `notarytool` when the signing secrets are configured.
+  CLI binaries cannot be stapled. The same bundle step runs in the macOS CI job on every PR.
+  An Intel (`x86_64-apple-darwin`) / universal2 artifact is not built yet.
 - Verify HW: `ffmpeg -hwaccels` on the pinned build lists `videotoolbox`.
 
 See [ADR-0011](../decisions/ADR-0011.md) for the full platform decision and consequences.
