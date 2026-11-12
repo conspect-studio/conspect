@@ -127,8 +127,9 @@ pub use rendition::{
     MAX_VIDEO_RENDITIONS_PER_PROGRAM,
 };
 pub use routing::{
-    AudioCrosspoint, OutputBus, OutputCrosspoint, OutputRef, RoutingRefs, RoutingTable, StreamRef,
-    StreamSelector, SubtitleCrosspoint, VideoCrosspoint, MAIN_PROGRAM,
+    AudioCrosspoint, AudioFeed, FollowAudio, OutputBus, OutputCrosspoint, OutputRef, RoutingRefs,
+    RoutingTable, StreamRef, StreamSelector, SubtitleCrosspoint, VideoCrosspoint, VideoFeed,
+    MAIN_PROGRAM,
 };
 pub use salvo::{Salvo, SourceRecall, TallyRecall, UmdRecall};
 pub use schema::{
@@ -1603,11 +1604,9 @@ impl MultiviewConfig {
             .first()
             .map_or(MAIN_PROGRAM, |p| p.id.as_str());
         for output in &self.outputs {
-            table.output.push(OutputCrosspoint {
-                output: output.id(),
-                program: program.to_owned(),
-                bus: OutputBus::Program,
-            });
+            table
+                .output
+                .push(OutputCrosspoint::program(output.id(), program));
         }
 
         // SUBTITLE: legacy captions are per-source (CaptionSelector), not
@@ -1642,17 +1641,7 @@ impl MultiviewConfig {
                     xp.output, xp.program
                 )));
             }
-            if xp.bus != OutputBus::Program
-                && self
-                    .switcher
-                    .as_ref()
-                    .is_none_or(|s| s.mix_effects.is_empty())
-            {
-                return Err(ConfigError::Validation(format!(
-                    "output {:?} selects a switcher bus without a declared M/E",
-                    xp.output
-                )));
-            }
+            self.validate_output_feed(xp)?;
         }
 
         let tracks = self.selectable_tracks();
@@ -1688,6 +1677,81 @@ impl MultiviewConfig {
         }
 
         Ok(())
+    }
+
+    /// Validate one output crosspoint's feed (ADR-0108 §6.1): the `bus` alias
+    /// agrees with `video`; a switcher bus needs a declared M/E; a source feed
+    /// names a declared source; layout feeds and explicit audio feeds are not
+    /// routable yet and are refused rather than silently ignored.
+    fn validate_output_feed(&self, xp: &OutputCrosspoint) -> Result<(), ConfigError> {
+        if let Some(video) = &xp.video {
+            if xp.bus != OutputBus::Program && *video != VideoFeed::Bus(xp.bus) {
+                return Err(ConfigError::Validation(format!(
+                    "output {:?}: `bus` and `video` disagree (bus {:?}, video {:?})",
+                    xp.output, xp.bus, video
+                )));
+            }
+        }
+        let video = xp.effective_video();
+        let has_me = self
+            .switcher
+            .as_ref()
+            .is_some_and(|s| !s.mix_effects.is_empty());
+        match &video {
+            VideoFeed::Bus(OutputBus::Program) => {}
+            VideoFeed::Bus(_) => {
+                if !has_me {
+                    return Err(ConfigError::Validation(format!(
+                        "output {:?} selects a switcher bus without a declared M/E",
+                        xp.output
+                    )));
+                }
+            }
+            VideoFeed::Source(id) => {
+                if !self.sources.iter().any(|s| s.id == *id) {
+                    return Err(ConfigError::Validation(format!(
+                        "output {:?} is fed by unknown source {id:?}",
+                        xp.output
+                    )));
+                }
+            }
+            VideoFeed::Layout(id) => {
+                return Err(ConfigError::Validation(format!(
+                    "output {:?}: a layout feed ({id:?}) cannot be routed to an output yet",
+                    xp.output
+                )));
+            }
+        }
+        match &xp.audio {
+            AudioFeed::Follow => Ok(()),
+            other => Err(ConfigError::Validation(format!(
+                "output {:?}: an explicit audio feed ({other:?}) is not supported yet; \
+                 use `follow` (the audio of the video feed)",
+                xp.output
+            ))),
+        }
+    }
+
+    /// Every configured output's effective feed, in output order (ADR-0108):
+    /// the `[[routing.output]]` entry when present, else Program with audio
+    /// `follow` (exactly today's behaviour).
+    #[must_use]
+    pub fn output_feeds(&self) -> Vec<OutputCrosspoint> {
+        let program = self
+            .programs
+            .first()
+            .map_or(MAIN_PROGRAM, |p| p.id.as_str());
+        let explicit = self.routing.as_ref().map(|t| t.output.as_slice());
+        self.outputs
+            .iter()
+            .map(|output| {
+                let id = output.id();
+                explicit
+                    .and_then(|rows| rows.iter().find(|xp| xp.output == id))
+                    .cloned()
+                    .unwrap_or_else(|| OutputCrosspoint::program(id, program))
+            })
+            .collect()
     }
 
     /// Validate the optional placement policy block (ADR-0018): reserve-headroom

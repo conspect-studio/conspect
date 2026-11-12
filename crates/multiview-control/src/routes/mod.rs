@@ -1415,6 +1415,7 @@ pub fn api_router() -> Router<AppState> {
         .route("/switcher/{me}", get(switcher::get_switcher))
         .route("/switcher/plan", post(switcher::plan_switcher))
         .route("/switcher/commands/{kind}", post(switcher::submit_switcher))
+        .route("/routing", get(routing::get_routing))
         .route("/routing/plan", post(routing::plan_route))
         .route("/routing/{kind}/take", post(routing::take_route))
         // Tally operator surface: read resolved state, profiles, manual override.

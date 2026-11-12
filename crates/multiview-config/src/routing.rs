@@ -229,9 +229,114 @@ pub struct OutputCrosspoint {
     /// The program this output carries. Absent ⇒ [`MAIN_PROGRAM`].
     #[serde(default = "main_program")]
     pub program: String,
-    /// The actual canvas this output carries. Defaults to on-air PGM.
+    /// The actual canvas this output carries. Defaults to on-air PGM. Kept as an
+    /// alias of [`OutputCrosspoint::video`] (ADR-0108 §6.1): `bus = "preview"`
+    /// means `video = { bus = "preview" }`; when both are present they must agree.
     #[serde(default, skip_serializing_if = "is_program_bus")]
     pub bus: OutputBus,
+    /// The output's video feed (ADR-0108). Absent ⇒ the `bus` alias, which
+    /// itself defaults to Program: exactly today's behaviour.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub video: Option<VideoFeed>,
+    /// The output's audio feed (ADR-0108 §5). Absent ⇒ `follow`.
+    #[serde(default, skip_serializing_if = "AudioFeed::is_follow")]
+    pub audio: AudioFeed,
+}
+
+/// The video feed of an output (ADR-0108 §2.1). Externally tagged, never
+/// untagged (ADR-0010): `{ bus = "program" }`, `{ source = "vt1" }`,
+/// `{ layout = "NewsOne" }`.
+///
+/// `Bus(Program)` follows the switcher (cuts and AUTO are seen as pictures);
+/// `Source(id)` is that source directly and ignores the switcher. The two are
+/// distinct routes even while Program happens to show the same source.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum VideoFeed {
+    /// A switcher bus of the one M/E: Program, Preview or Clean.
+    Bus(OutputBus),
+    /// Any configured source directly (cameras, media players, generators).
+    Source(String),
+    /// A stored layout (ADR-0108 slice 3; refused by validation until then).
+    Layout(String),
+}
+
+impl VideoFeed {
+    /// The Program bus feed (today's behaviour for every output).
+    pub const PROGRAM: Self = Self::Bus(OutputBus::Program);
+
+    /// The picture-bus name this feed reads: `program`, `preview`, `clean`,
+    /// `src:<id>` or `aux:<layout>`.
+    #[must_use]
+    pub fn picture_bus(&self) -> String {
+        match self {
+            Self::Bus(OutputBus::Program) => "program".to_owned(),
+            Self::Bus(OutputBus::Preview) => "preview".to_owned(),
+            Self::Bus(OutputBus::Clean) => "clean".to_owned(),
+            Self::Source(id) => format!("src:{id}"),
+            Self::Layout(id) => format!("aux:{id}"),
+        }
+    }
+}
+
+/// The audio feed of an output (ADR-0108 §5.1). Externally tagged: a plain
+/// string for `follow` / `program` / `none`, a table for `{ source = "x" }`
+/// and `{ tracks = ["eng"] }`.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum AudioFeed {
+    /// The audio that belongs to the video feed (the default).
+    #[default]
+    Follow,
+    /// The mixed program bus.
+    Program,
+    /// Silence.
+    None,
+    /// One source's own audio.
+    Source(String),
+    /// Today's discrete-track selection.
+    Tracks(Vec<String>),
+}
+
+impl AudioFeed {
+    /// Whether this is the default `follow` (serde skip predicate).
+    #[must_use]
+    pub fn is_follow(&self) -> bool {
+        *self == Self::Follow
+    }
+}
+
+/// What `audio = "follow"` resolves to for a video feed (ADR-0108 §5.1).
+///
+/// Program and Clean carry the program mix; a source carries its own audio;
+/// Preview carries the PVW source's audio, resolved at the tick (`None` here
+/// means "the PVW source", which only the engine knows).
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum FollowAudio {
+    /// The program mix.
+    ProgramMix,
+    /// This source's own audio.
+    Source(String),
+    /// The audio of whatever source the M/E's PVW currently selects.
+    PreviewSource,
+    /// The layout's `audio` attribute (slice 3); Program by default.
+    LayoutDefault,
+}
+
+impl FollowAudio {
+    /// Resolve `follow` for `video`.
+    #[must_use]
+    pub fn of(video: &VideoFeed) -> Self {
+        match video {
+            VideoFeed::Bus(OutputBus::Program | OutputBus::Clean) => Self::ProgramMix,
+            VideoFeed::Bus(OutputBus::Preview) => Self::PreviewSource,
+            VideoFeed::Source(id) => Self::Source(id.clone()),
+            VideoFeed::Layout(_) => Self::LayoutDefault,
+        }
+    }
 }
 
 #[allow(clippy::trivially_copy_pass_by_ref)]
@@ -247,6 +352,25 @@ impl OutputCrosspoint {
     #[must_use]
     pub fn as_ref(&self) -> OutputRef {
         OutputRef::new(self.output.clone(), self.program.clone())
+    }
+
+    /// The default crosspoint for `output`: Program, audio follow. This is what
+    /// an output with no `[[routing.output]]` entry carries.
+    #[must_use]
+    pub fn program(output: impl Into<String>, program: impl Into<String>) -> Self {
+        Self {
+            output: output.into(),
+            program: program.into(),
+            bus: OutputBus::Program,
+            video: None,
+            audio: AudioFeed::Follow,
+        }
+    }
+
+    /// The effective video feed: `video` when present, else the `bus` alias.
+    #[must_use]
+    pub fn effective_video(&self) -> VideoFeed {
+        self.video.clone().unwrap_or(VideoFeed::Bus(self.bus))
     }
 }
 
