@@ -340,7 +340,8 @@ page alone.
 
 A profile resolves to directory URL + EAB requirement + trust anchor + preferred ACME profile. The
 order flow has no per-CA code. Account credentials are stored per directory
-(`<state_dir>/account.<directory-host>.json`, 0600), so changing CA never reuses another CA's
+(`<state_dir>/account.<directory-host>-<first 8 hex of sha256(directory URL)>.json`, 0600; the
+hash keeps two directories on one host apart), so changing CA never reuses another CA's
 account. When the configured CA changes, the current certificate keeps serving until the new CA
 issues. No automatic fallback from one CA to another (not asked for; not designed).
 
@@ -376,6 +377,40 @@ propagates, CA rate limit `429`/`rateLimited`, CA unreachable). This runs in CI 
 documented live check against the Let's Encrypt and Google staging directories needs a Cloudflare
 token and a Google EAB secret: they live in 1Password and the job runs manually (`workflow_dispatch`),
 never on pull requests.
+
+### Slice 5 engine as built (PR A)
+
+Library only, behind the off-by-default `acme` feature of `multiview-control` (forwarded by
+`multiview-cli`, in no preset yet); boot wiring, the `multiview tls` CLI and the setup routes are
+PR B.
+
+* Files: `crates/multiview-control/src/acme/{mod,egress,dns,cloudflare,store,engine}.rs`. instant-acme
+  0.8.5 is built without its `hyper-rustls` client; the engine supplies the HTTP client. No OpenSSL.
+* Egress (CA directory and Cloudflare API): HTTPS only, no proxy, a resolver that resolves once and
+  screens every address (reqwest dials exactly those), IP literals screened before sending, at most 3
+  redirects each re-screened, connect 10 s / request 30 s, bodies capped at 1 MiB while streaming.
+  Refused: loopback, link-local (incl. `169.254.169.254`), RFC 1918, ULA, CGNAT, multicast,
+  unspecified, broadcast and IPv4-mapped/compatible forms. `[network.tls] allow_private_directory =
+  true` (custom CA only, together with `trust_anchor`) admits RFC 1918 / ULA / CGNAT / loopback for
+  the ACME directory client only; link-local, multicast, unspecified and mapped forms stay refused.
+  With `trust_anchor`, only that PEM bundle is trusted (opened without following symlinks).
+* State (`state_dir`, 0700, files 0600, atomic rename + fsync): `account.<host>-<hash>.json`,
+  `active.pem` (key + chain + a `CONSPECT ACME META` section with the non-secret metadata, one file so
+  one rename commits all three; the served key swaps only after that commit),
+  `pending-txt.json` (DNS-01 ledger: intent before `publish_txt`, handle after, entry removed after
+  `remove_txt`; at most 64 entries; replayed by `cleanup_pending()` at start), `secrets/<NAME>` as
+  the fallback for every env-var name.
+* Cleanup: every attempt runs inside a 10 min timeout so TXT records and ALPN challenges are removed
+  on success, failure and timeout; the ledger covers a crash or kill.
+* Runtime: `AcmeService` runs on its own OS thread (`acme`) with its own current-thread Tokio runtime;
+  commands go through a bounded queue (capacity 4, full = dropped); `CertificateSource::status()` is
+  the only read path. `tests/acme_cadence.rs` proves the output clock keeps cadence while the CA
+  hangs or refuses.
+* Renewal: ARI window (uniform random instant, `Retry-After` floors the next ARI check) or two thirds
+  of the lifetime ±(lifetime/30, at most one day); failures back off 15 min doubling to 6 h, never
+  under 60 s. Alarm: while renewal fails, under 50 % of the lifetime left = warning, under 25 % =
+  critical; past `notAfter` = expired (still served). `CertificateStatus` carries `alarm`,
+  `renewal_due_at`, `next_attempt_at`; an optional hook lets PR B feed the alarm store.
 
 ### Changes to #167-#172
 
@@ -548,7 +583,7 @@ challenge = "dns-01"             # "dns-01" | "tls-alpn-01"
 domains = ["mda001.example.net"] # SANs; IP literals allowed with tls-alpn-01 (Let's Encrypt short-lived)
 contact_email = "ops@example.net"
 acme_profile = "shortlived"      # used only when the directory advertises it
-state_dir = "/var/lib/conspect/tls"  # 0700; account.<directory-host>.json, cert, key, bootstrap
+state_dir = "/var/lib/conspect/tls"  # 0700; account.<host>-<hash>.json, active.pem/.json, pending-txt.json, bootstrap
 [network.tls.dns]
 provider = "cloudflare"
 token_env = "CLOUDFLARE_API_TOKEN"   # Zone:DNS:Edit + Zone:Zone:Read (recommended)
@@ -575,6 +610,8 @@ state_dir = "/var/lib/conspect/tls"
 ca = "custom"
 directory = "https://acme.corp.example/acme/directory"
 trust_anchor = "/etc/conspect/corp-root.pem"   # PEM bundle for the directory connection
+# allow_private_directory = true               # only if the directory is on loopback / RFC 1918 /
+#                                              # ULA / CGNAT (or `localhost`); needs trust_anchor
 challenge = "dns-01"
 domains = ["mda001.corp.example"]
 eab_kid_env = "CORP_EAB_KID"                   # optional

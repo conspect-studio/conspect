@@ -252,6 +252,27 @@ rustls-pki-types = { version = "1", features = ["std"], optional = true }
 # Bootstrap and RFC 8737 challenge certificates; MIT/Apache-2.0, pure Rust.
 rcgen = { version = "0.14", optional = true }
 time = { version = "0.3", optional = true }
+# ACME issuance engine (front-door slice 5, ADR-0107 §5a): OFF by default
+# (`acme`). instant-acme (Apache-2.0) speaks RFC 8555/8737/9773; built WITHOUT
+# its `hyper-rustls` default so it never opens its own connections — the engine
+# supplies the SSRF-screened reqwest client (`acme/egress.rs`) through
+# `instant_acme::HttpClient`. `aws-lc-rs` matches the rustls provider already in
+# the lock, `rcgen` builds the CSR, `time` + `x509-parser` give ARI
+# (`renewalInfo`, `CertificateIdentifier`). No OpenSSL, no new native lib.
+instant-acme = { version = "0.8.5", default-features = false, features = [
+    "aws-lc-rs",
+    "rcgen",
+    "time",
+    "x509-parser",
+], optional = true }
+# `http` request/response types of the `instant_acme::HttpClient` seam, and
+# `http-body-util` to collect the ACME request body. MIT/Apache-2.0, already in
+# the lock via axum/hyper; only built with `acme`.
+http = { version = "1", optional = true }
+http-body-util = { version = "0.1.3", optional = true }
+# Wipe Cloudflare credentials and EAB HMAC bytes on drop. MIT/Apache-2.0, pure
+# Rust, already in the lock (rustls / aws-lc-rs); only built with `acme`.
+zeroize = { version = "1", optional = true }
 
 
 
@@ -417,6 +438,22 @@ moq-transport = ["dep:multiview-moq", "dep:url"]
 # LGPL-clean; kept out of the CI-green default build and the deny default graph (`[graph]
 # all-features = false`). Wired into the `multiview-cli` umbrella presets.
 "tls" = ["dep:rustls", "dep:rustls-pki-types", "dep:tokio-rustls", "dep:rcgen", "dep:time"]
+# Off-by-default ACME issuance engine for the front-door certificate (slice 5,
+# ADR-0107 §5a, #291): DNS-01 (Cloudflare) and TLS-ALPN-01, SSRF-screened egress,
+# private 0700 state directory, its own OS thread + current-thread runtime (never
+# the output-clock runtime, invariant #1/#10). Builds on `tls` (the certificate
+# source + challenge resolver). Pure Rust + aws-lc-rs; no OpenSSL.
+"acme" = [
+    "tls",
+    "dep:instant-acme",
+    "dep:reqwest",
+    "dep:url",
+    "dep:hickory-resolver",
+    "dep:x509-parser",
+    "dep:http",
+    "dep:http-body-util",
+    "dep:zeroize",
+]
 
 [[test]]
 # The TLS-0 serve e2e needs the rustls termination path compiled in.
@@ -427,6 +464,26 @@ required-features = ["tls"]
 # The front-door connection entry point (ADR-0107 slice 4) over TLS.
 name = "site_connection"
 required-features = ["tls"]
+
+[[test]]
+# The output clock keeps its cadence while the ACME service hangs or is refused.
+name = "acme_cadence"
+required-features = ["acme"]
+
+[[test]]
+# Egress screen: redirect refusals, hop bound, body cap, trust anchor.
+name = "acme_egress"
+required-features = ["acme"]
+
+[[test]]
+# Cloudflare provider request shapes against an in-process fake API on [::1].
+name = "acme_cloudflare"
+required-features = ["acme"]
+
+[[test]]
+# Full ACME flows against Pebble + challtestsrv (run by the acme-pebble CI job).
+name = "acme_pebble"
+required-features = ["acme"]
 
 [[example]]
 # The real authority fixture imports the optional native MoQ provider.

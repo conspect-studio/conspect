@@ -259,6 +259,12 @@ pub struct NetworkTlsConfig {
     /// PEM root path trusted for the custom directory connection.
     #[serde(default)]
     pub trust_anchor: Option<PathBuf>,
+    /// Admit a custom directory on a loopback, RFC 1918, unique-local or CGNAT
+    /// address (or `localhost`). Off by default; only valid with `ca = "custom"`
+    /// and only together with `trust_anchor`. Link-local, multicast,
+    /// unspecified, broadcast and IPv4-mapped/compatible addresses stay refused.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub allow_private_directory: bool,
     /// Environment variable holding the EAB key identifier.
     #[serde(default)]
     pub eab_kid_env: Option<String>,
@@ -352,6 +358,37 @@ fn domain(field: &str, name: &str, challenge: AcmeChallenge) -> Result<(), Confi
         ));
     }
     Ok(())
+}
+
+/// Screen a custom-directory IP literal. `Ok(true)` means the address is in
+/// a private range that needs `allow_private_directory`; never-legitimate
+/// ranges are refused outright.
+fn directory_ip_is_private(ip: IpAddr) -> Result<bool, ConfigError> {
+    use crate::device::net_guard::{classify, BlockClass};
+    if let IpAddr::V6(v6) = ip {
+        if !v6.is_loopback()
+            && !v6.is_unspecified()
+            && (v6.to_ipv4_mapped().is_some() || v6.to_ipv4().is_some())
+        {
+            return Err(fail(
+                "directory",
+                "IPv4-mapped and IPv4-compatible addresses are forbidden",
+            ));
+        }
+    }
+    match classify(ip) {
+        None => Ok(false),
+        Some(
+            BlockClass::Loopback
+            | BlockClass::Private
+            | BlockClass::UniqueLocal
+            | BlockClass::Carrier,
+        ) => Ok(true),
+        Some(_) => Err(fail(
+            "directory",
+            "link-local, multicast, unspecified and broadcast addresses are forbidden",
+        )),
+    }
 }
 
 impl NetworkConfig {
@@ -669,57 +706,35 @@ impl NetworkTlsConfig {
                     "must be an HTTPS URL without credentials, query or fragment",
                 ));
             }
-            match parsed.host() {
-                Some(url::Host::Ipv4(ip)) => {
-                    if ip.is_link_local()
-                        || ip.is_multicast()
-                        || ip.is_unspecified()
-                        || ip.is_broadcast()
-                    {
-                        return Err(fail(
-                            "directory",
-                            "link-local, multicast and unspecified addresses are forbidden",
-                        ));
-                    }
-                    if (ip.is_private() || ip.is_loopback()) && self.trust_anchor.is_none() {
-                        return Err(fail(
-                            "trust_anchor",
-                            "private ACME directories require a PEM trust anchor",
-                        ));
-                    }
-                }
-                Some(url::Host::Ipv6(ip)) => {
-                    if ip.is_multicast()
-                        || ip.is_unspecified()
-                        || (ip.segments()[0] & 0xffc0) == 0xfe80
-                        || ip.to_ipv4_mapped().is_some()
-                    {
-                        return Err(fail(
-                            "directory",
-                            "link-local, multicast and IPv4-mapped addresses are forbidden",
-                        ));
-                    }
-                    if (ip.is_unique_local() || ip.is_loopback()) && self.trust_anchor.is_none() {
-                        return Err(fail(
-                            "trust_anchor",
-                            "private ACME directories require a PEM trust anchor",
-                        ));
-                    }
-                }
+            let private = match parsed.host() {
+                Some(url::Host::Ipv4(ip)) => directory_ip_is_private(IpAddr::V4(ip))?,
+                Some(url::Host::Ipv6(ip)) => directory_ip_is_private(IpAddr::V6(ip))?,
                 Some(url::Host::Domain(host)) => {
                     if host == "." || host.is_empty() || !host.contains('.') && host != "localhost"
                     {
                         return Err(fail("directory", "must use a DNS name or IP address"));
                     }
-                    if host == "localhost" && self.trust_anchor.is_none() {
-                        return Err(fail(
-                            "trust_anchor",
-                            "local ACME directories require a PEM trust anchor",
-                        ));
-                    }
+                    host == "localhost"
                 }
                 None => return Err(fail("directory", "must contain a host")),
+            };
+            if private && self.trust_anchor.is_none() {
+                return Err(fail(
+                    "trust_anchor",
+                    "private ACME directories require a PEM trust anchor (and allow_private_directory = true)",
+                ));
             }
+            if private && !self.allow_private_directory {
+                return Err(fail(
+                    "allow_private_directory",
+                    "a loopback, private, unique-local or CGNAT ACME directory needs allow_private_directory = true",
+                ));
+            }
+        } else if self.allow_private_directory {
+            return Err(fail(
+                "allow_private_directory",
+                "only custom CA accepts allow_private_directory",
+            ));
         }
         if let Some(profile) = &self.acme_profile {
             if profile.is_empty()
