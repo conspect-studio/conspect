@@ -34,6 +34,11 @@ const MAX_MOVE_OUTCOMES: usize = 64;
 /// start a rendition on another output" predicate. Injected, never parsed here.
 pub(crate) type MoveGate = Box<dyn Fn(&EncodedPacket) -> bool + Send>;
 
+/// Per-key "the in-band decoder configuration of this RAP" extractor
+/// (SPS/PPS/VPS bytes, or the MPEG-2 sequence header). `None` = unknown.
+/// Injected, never parsed here. Consulted on keyframes only.
+pub(crate) type ParameterSets = Box<dyn Fn(&EncodedPacket) -> Option<Vec<u8>> + Send>;
+
 /// Why a video move was refused.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum MoveRefusal {
@@ -51,6 +56,10 @@ pub(crate) enum MoveOutcome {
         output_index: usize,
         key: usize,
         tick: u64,
+        /// The cut RAP's parameter sets differ from the ones the output last
+        /// carried: a discontinuity was reported to the output before the cut
+        /// window (its muxer resets). `false` = a plain splice.
+        parameter_sets_changed: bool,
     },
     Refused {
         output_index: usize,
@@ -312,6 +321,7 @@ struct VideoMeta {
     retired: bool,
     failed: bool,
     gate: Option<MoveGate>,
+    params: Option<ParameterSets>,
 }
 
 #[derive(Clone, Copy)]
@@ -343,6 +353,9 @@ struct BindingState {
     mv: Option<PendingMove>,
     /// After a fallback the next delivered window must pass the move gate.
     fallback_gate_pending: bool,
+    /// Parameter sets of the last RAP delivered to this output (when its
+    /// key has an extractor).
+    last_sets: Option<Vec<u8>>,
 }
 
 fn push_outcome(outcomes: &mut VecDeque<MoveOutcome>, outcome: MoveOutcome) {
@@ -417,6 +430,7 @@ impl RenditionDispatcher {
                 pending: VecDeque::new(),
                 mv: None,
                 fallback_gate_pending: false,
+                last_sets: None,
             });
         }
         let mut gates = config.video_move_gates.into_iter();
@@ -426,6 +440,7 @@ impl RenditionDispatcher {
                 retired: false,
                 failed: false,
                 gate: gates.next().flatten(),
+                params: None,
             })
             .collect();
         Ok(Self {
@@ -947,6 +962,32 @@ impl RenditionDispatcher {
                         let pass = self.video_meta.get(m.key).and_then(|x| gated_rap(&x.gate));
                         if let Some(at) = pass {
                             skip = at;
+                            // Compare the cut RAP's decoder configuration with
+                            // the output's: a change resets the output's mux.
+                            let cut_sets = self.video_meta.get(m.key).and_then(|x| {
+                                let f = x.params.as_ref()?;
+                                if dest_dynamic {
+                                    self.video
+                                        .get(m.key)
+                                        .and_then(|s| s.peek(index))
+                                        .and_then(|w| w.packets.get(at))
+                                        .and_then(|p| f(p))
+                                } else {
+                                    entry
+                                        .base
+                                        .iter()
+                                        .find(|(k, _)| *k == m.key)
+                                        .and_then(|(_, v)| v.get(at))
+                                        .and_then(f)
+                                }
+                            });
+                            let changed = cut_sets.is_some() && cut_sets != b.last_sets;
+                            if changed {
+                                delivery.report_loss(b.output_index, OfferError::ProducerLoss);
+                            }
+                            if cut_sets.is_some() {
+                                b.last_sets = cut_sets;
+                            }
                             b.video_key = Some(m.key);
                             push_outcome(
                                 &mut self.outcomes,
@@ -954,6 +995,7 @@ impl RenditionDispatcher {
                                     output_index: b.output_index,
                                     key: m.key,
                                     tick: u64::try_from(index).unwrap_or(u64::MAX),
+                                    parameter_sets_changed: changed,
                                 },
                             );
                             b.mv = None;
@@ -1025,6 +1067,20 @@ impl RenditionDispatcher {
             }
             if skip > 0 {
                 packets.drain(..skip.min(packets.len()));
+            }
+            if let Some(f) = cur
+                .and_then(|k| self.video_meta.get(k))
+                .and_then(|m| m.params.as_ref())
+            {
+                if let Some(sets) = packets
+                    .iter()
+                    .filter(|p| p.is_keyframe())
+                    .find_map(|p| f(p))
+                {
+                    if b.last_sets.as_ref() != Some(&sets) {
+                        b.last_sets = Some(sets);
+                    }
+                }
             }
             packets.append(&mut entry.audio);
             if delivery
@@ -1282,6 +1338,7 @@ impl RenditionDispatcher {
                 retired: false,
                 failed: false,
                 gate: Some(gate),
+                params: None,
             };
             return Ok(index);
         }
@@ -1293,6 +1350,7 @@ impl RenditionDispatcher {
             retired: false,
             failed: false,
             gate: Some(gate),
+            params: None,
         });
         Ok(index)
     }
@@ -1371,6 +1429,7 @@ impl RenditionDispatcher {
                     output_index,
                     key,
                     tick: at_tick,
+                    parameter_sets_changed: false,
                 },
             );
         } else if !has_gate {
@@ -1397,6 +1456,23 @@ impl RenditionDispatcher {
                 failed: 0,
             });
         }
+        Ok(())
+    }
+    /// Install the parameter-set extractor of a base or live key (used to
+    /// detect a decoder-configuration change at a move).
+    ///
+    /// # Errors
+    /// `InvalidConfig` for an unknown key.
+    pub(crate) fn set_parameter_sets(
+        &mut self,
+        key: usize,
+        params: ParameterSets,
+    ) -> Result<(), DispatchError> {
+        let meta = self
+            .video_meta
+            .get_mut(key)
+            .ok_or(DispatchError::InvalidConfig)?;
+        meta.params = Some(params);
         Ok(())
     }
     /// Drain move/fallback outcomes (at most 64 are retained, oldest dropped).
@@ -2135,7 +2211,8 @@ mod tests {
             vec![MoveOutcome::Applied {
                 output_index: 1,
                 key: 2,
-                tick: 4
+                tick: 4,
+                parameter_sets_changed: false
             }]
         );
         assert_eq!(d.binding_video_key(1), Some(2));
@@ -2180,12 +2257,95 @@ mod tests {
             vec![MoveOutcome::Applied {
                 output_index: 1,
                 key,
-                tick: 2
+                tick: 2,
+                parameter_sets_changed: false
             }]
         );
         assert_eq!(b_windows.len(), 4);
         assert_eq!(b_windows[2], (77, 2), "cut at the RAP, audio kept");
         assert_eq!(b_windows[3], (8, 2));
+    }
+
+    /// F (lens 1 #3): run a move onto a live key whose RAP's parameter sets
+    /// `differ` (or not) from the base key's last delivered RAP. Returns the
+    /// outcome and the number of discontinuities the moved output saw.
+    fn move_with_sets(differ: bool) -> (Vec<MoveOutcome>, usize) {
+        let now = Instant::now();
+        let mut d =
+            RenditionDispatcher::new(gated_cfg(vec![binding(0, 0, 1), binding(1, 1, 1)], 2, 1))
+                .unwrap();
+        let mut sink = FakeDelivery::new(2);
+        let key = d
+            .add_video_key(DtsTimeBase { num: 1, den: 5 }, gate())
+            .unwrap();
+        // Synthetic extractor: a keyframe's "sets" are its length (base RAPs
+        // are 8 bytes, the live RAP 77) unless the sets are declared equal.
+        for k in [1, key] {
+            d.set_parameter_sets(
+                k,
+                Box::new(move |p: &EncodedPacket| {
+                    p.is_keyframe().then(|| {
+                        if differ {
+                            vec![u8::try_from(p.len()).unwrap()]
+                        } else {
+                            vec![1]
+                        }
+                    })
+                }),
+            )
+            .unwrap();
+        }
+        d.rebind_video(1, key, 2, 3).unwrap();
+        let mut discontinuities = 0;
+        for i in 0..5_i64 {
+            let m = Some(mark(TICK * i128::from(i + 1)));
+            let pkt = if i == 2 { rap77(i) } else { video(i, 8, false) };
+            d.dispatch(
+                ve(key, u64::try_from(i).unwrap(), vec![pkt], m),
+                now,
+                &mut sink,
+            )
+            .unwrap();
+            feed_base(&mut d, &mut sink, 2, i, now, plain(i)).unwrap();
+            pop_all(&mut sink, 0, now);
+            pop_all(&mut sink, 1, now);
+            if sink.queues[1].take_discontinuity().is_some() {
+                discontinuities += 1;
+            }
+        }
+        assert_eq!(d.binding_video_key(1), Some(key));
+        assert_eq!(
+            sink.windows.iter().filter(|w| w.0 == 1).count(),
+            5,
+            "no window lost"
+        );
+        (d.take_move_outcomes(), discontinuities)
+    }
+
+    #[test]
+    fn a_move_with_changed_parameter_sets_reports_one_discontinuity() {
+        let (outcomes, discontinuities) = move_with_sets(true);
+        assert_eq!(
+            outcomes,
+            vec![MoveOutcome::Applied {
+                output_index: 1,
+                key: 2,
+                tick: 2,
+                parameter_sets_changed: true
+            }]
+        );
+        assert_eq!(discontinuities, 1, "exactly once, before the cut window");
+        let (outcomes, discontinuities) = move_with_sets(false);
+        assert_eq!(
+            outcomes,
+            vec![MoveOutcome::Applied {
+                output_index: 1,
+                key: 2,
+                tick: 2,
+                parameter_sets_changed: false
+            }]
+        );
+        assert_eq!(discontinuities, 0, "equal sets splice");
     }
 
     #[test]

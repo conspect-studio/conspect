@@ -27,7 +27,8 @@ use multiview_framestore::{SwapCell, TileStore};
 use crate::binding_delivery::WindowDelivery;
 use crate::pipeline::PipelineError;
 use crate::rendition_dispatch::{
-    DispatchError, DtsTimeBase, MoveGate, MoveOutcome, MoveRefusal, RenditionDispatcher,
+    DispatchError, DtsTimeBase, MoveGate, MoveOutcome, MoveRefusal, ParameterSets,
+    RenditionDispatcher,
 };
 use crate::rendition_workers::{
     BakedTick, ClosingWorker, DispatchEvent, RenditionWorker, ReorderBound, VideoEncodeWorker,
@@ -171,6 +172,9 @@ pub struct RoutingSnapshot {
     /// Live-opened workers' events dropped because the consumer queue was
     /// full (the key then fails alone) or the key was already closed.
     pub dropped_live_events: u64,
+    /// Applied moves whose cut RAP carried different parameter sets than the
+    /// output's previous feed (each reported a discontinuity to that output).
+    pub parameter_set_changes: u64,
     /// Video encoder keys the dispatcher has ever registered (base + live).
     pub video_keys: usize,
     /// Clock ticks handed to the aux thread (0 while nothing is routed).
@@ -234,6 +238,11 @@ pub trait LiveEncoder: VideoEncodeWorker {
     fn time_base(&self) -> Rational;
     /// The self-contained-RAP predicate for this encoder's packets.
     fn move_gate(&self) -> MoveGate;
+    /// The in-band parameter-set extractor for this encoder's RAPs (compared
+    /// at a move; `None` = not compared, a plain splice).
+    fn parameter_sets(&self) -> Option<ParameterSets> {
+        None
+    }
 }
 
 /// Opens one encoder for a rendition settings index, on the opener thread.
@@ -487,6 +496,7 @@ pub struct OutputRouter {
     reaper_overflow: u64,
     /// Events dropped by live-opened workers' sinks (shared with them).
     dyn_dropped: Arc<AtomicU64>,
+    parameter_set_changes: u64,
     video_keys: usize,
     /// Items handed to the reaper this run (0 = nothing to wait for at the end).
     reaped: u64,
@@ -581,6 +591,7 @@ impl OutputRouter {
             dropped_outcomes: 0,
             reaper_overflow: 0,
             dyn_dropped: Arc::new(AtomicU64::new(0)),
+            parameter_set_changes: 0,
             video_keys: 0,
             reaped: 0,
             dirty: true,
@@ -788,6 +799,9 @@ impl OutputRouter {
                 refuse(self);
                 continue;
             };
+            if let Some(params) = encoder.parameter_sets() {
+                let _ = dispatcher.set_parameter_sets(key, params);
+            }
             let force_at = Arc::new(AtomicU64::new(NO_FORCE));
             let worker = GapFill {
                 inner: encoder,
@@ -885,7 +899,12 @@ impl OutputRouter {
                     output_index,
                     key,
                     tick: at,
+                    parameter_sets_changed,
                 } => {
+                    if parameter_sets_changed {
+                        self.parameter_set_changes = self.parameter_set_changes.saturating_add(1);
+                        self.dirty = true;
+                    }
                     let Some(out) = self.outputs.get_mut(output_index) else {
                         continue;
                     };
@@ -1378,6 +1397,7 @@ impl OutputRouter {
             dropped_outcomes: self.dropped_outcomes,
             reaper_overflow: self.reaper_overflow,
             dropped_live_events: self.dyn_dropped.load(Ordering::Relaxed),
+            parameter_set_changes: self.parameter_set_changes,
             video_keys: self.video_keys,
             aux_ticks_sent: self.aux.sent.load(Ordering::Relaxed),
         };

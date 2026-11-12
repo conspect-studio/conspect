@@ -6782,6 +6782,11 @@ impl crate::output_routing::LiveEncoder for PipelineVideoWorker {
         let params = self.0.codec_params().clone();
         Box::new(move |packet| params.is_self_contained_rap(packet))
     }
+
+    fn parameter_sets(&self) -> Option<crate::rendition_dispatch::ParameterSets> {
+        let params = self.0.codec_params().clone();
+        Some(Box::new(move |packet| params.rap_parameter_sets(packet)))
+    }
 }
 
 /// The per-item frame-substitution limit: the maximum number of consecutive
@@ -7222,6 +7227,15 @@ fn consumer_main<D: WindowDelivery>(
             Some(gate)
         })
         .collect();
+    let video_parameter_sets: Vec<crate::rendition_dispatch::ParameterSets> = video_encoders
+        .iter()
+        .map(|encoder| {
+            let params = encoder.codec_params().clone();
+            let sets: crate::rendition_dispatch::ParameterSets =
+                Box::new(move |packet| params.rap_parameter_sets(packet));
+            sets
+        })
+        .collect();
     for (key, encoder) in video_encoders.into_iter().enumerate() {
         let base = encoder.time_base();
         let tx = event_tx.clone();
@@ -7303,6 +7317,10 @@ fn consumer_main<D: WindowDelivery>(
         kind: "dispatch",
         reason: format!("{e:?}"),
     })?;
+    // Consulted only at a move: a run without a take is unaffected.
+    for (key, sets) in video_parameter_sets.into_iter().enumerate() {
+        let _ = dispatcher.set_parameter_sets(key, sets);
+    }
     // A monotonic clock for rate-bounding the loudness emit, sampled OFF the hot
     // loop (this is the bake-consumer thread). The epoch is the consumer start;
     // the conflator only ever sees a non-decreasing `now_ns`.

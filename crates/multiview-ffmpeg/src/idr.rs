@@ -117,6 +117,70 @@ pub fn is_self_contained_idr(au: &[u8], codec: CodecKind, framing: NalFraming) -
     seen.iter().all(|&s| s)
 }
 
+/// The parameter-set NAL units of an access unit, in stream order: SPS (7)
+/// and PPS (8) for H.264; VPS (32), SPS (33) and PPS (34) for HEVC. Each item
+/// is the whole NAL (header + payload, no start code / length prefix). Any
+/// other codec or framing yields nothing. Used to tell whether two RAPs carry
+/// the same decoder configuration (a move between encoders whose sets differ
+/// is a discontinuity for the receiving muxer, ADR-0108 decision 3).
+///
+/// Fail-closed (Annex B): a parameter-set NAL shorter than 4 bytes, or one
+/// immediately followed by a start-code fragment whose header byte has the
+/// forbidden_zero_bit set (an emulated `00 00 01` inside a payload that
+/// skipped emulation prevention), makes the whole result empty: no partial
+/// or synthesized set is ever compared.
+#[must_use]
+pub fn parameter_sets(au: &[u8], codec: CodecKind, framing: NalFraming) -> Vec<&[u8]> {
+    let wanted: &[u8] = match codec {
+        CodecKind::H264 => &[7, 8],
+        CodecKind::Hevc => &[32, 33, 34],
+        CodecKind::Av1 | CodecKind::Other => return Vec::new(),
+    };
+    let ty = |nal: &[u8]| match codec {
+        CodecKind::H264 => nal.first().map(|&b| b & 0x1F),
+        _ => nal.first().map(|&b| (b >> 1) & 0x3F),
+    };
+    let mut nals: Vec<&[u8]> = Vec::new();
+    collect_nals(au, framing, &mut nals);
+    let mut out = Vec::new();
+    for (n, nal) in nals.iter().enumerate() {
+        if !ty(nal).is_some_and(|t| wanted.contains(&t)) {
+            continue;
+        }
+        let forbidden_next = matches!(framing, NalFraming::AnnexB)
+            && nals
+                .get(n + 1)
+                .and_then(|next| next.first())
+                .is_some_and(|&b| b & 0x80 != 0);
+        if nal.len() < 4 || forbidden_next {
+            return Vec::new();
+        }
+        out.push(*nal);
+    }
+    out
+}
+
+/// MPEG-2 video: the sequence header (`00 00 01 B3` and its bytes up to the
+/// next start code), or `None` when the access unit has none.
+#[must_use]
+pub fn mpeg2_sequence_header(au: &[u8]) -> Option<&[u8]> {
+    let start = au.windows(4).position(|w| w == [0, 0, 1, 0xB3])?;
+    let body = au.get(start + 4..)?;
+    let end = body
+        .windows(3)
+        .position(|w| w == [0, 0, 1])
+        .map_or(au.len(), |p| start + 4 + p);
+    au.get(start..end)
+}
+
+/// Every NAL unit of `au` under `framing` (empty NALs skipped).
+fn collect_nals<'a>(au: &'a [u8], framing: NalFraming, out: &mut Vec<&'a [u8]>) {
+    for_each_nal(au, framing, |nal| {
+        out.push(nal);
+        false
+    });
+}
+
 /// H.264: at least one `nal_unit_type == 5` (IDR slice) NAL is present.
 fn h264_is_idr(au: &[u8], framing: NalFraming) -> bool {
     for_each_nal(au, framing, |nal| {
@@ -140,7 +204,11 @@ fn hevc_is_idr(au: &[u8], framing: NalFraming) -> bool {
 ///
 /// `Obu` framing is not a NAL framing — it can never carry an H.264/HEVC NAL, so
 /// it conservatively yields no units (and thus `false`).
-fn for_each_nal(au: &[u8], framing: NalFraming, mut pred: impl FnMut(&[u8]) -> bool) -> bool {
+fn for_each_nal<'a>(
+    au: &'a [u8],
+    framing: NalFraming,
+    mut pred: impl FnMut(&'a [u8]) -> bool,
+) -> bool {
     match framing {
         NalFraming::AnnexB => annexb_any_nal(au, &mut pred),
         NalFraming::LengthPrefixed { nal_length_size } => {
@@ -152,7 +220,7 @@ fn for_each_nal(au: &[u8], framing: NalFraming, mut pred: impl FnMut(&[u8]) -> b
 
 /// Iterate Annex-B NAL units (split on `00 00 01` start codes, tolerating a
 /// 4-byte `00 00 00 01` variant), returning `true` on the first `pred` hit.
-fn annexb_any_nal(au: &[u8], pred: &mut impl FnMut(&[u8]) -> bool) -> bool {
+fn annexb_any_nal<'a>(au: &'a [u8], pred: &mut impl FnMut(&'a [u8]) -> bool) -> bool {
     let mut starts: Vec<usize> = Vec::new();
     let mut i = 0_usize;
     // Find every `00 00 01` prefix; the NAL body begins just after it.
@@ -182,10 +250,10 @@ fn annexb_any_nal(au: &[u8], pred: &mut impl FnMut(&[u8]) -> bool) -> bool {
 /// Iterate length-prefixed NAL units (avcC / hvcC), returning `true` on the
 /// first `pred` hit. A `nal_length_size` outside 1..=4, or a length that runs
 /// past the buffer, ends iteration safely.
-fn length_prefixed_any_nal(
-    au: &[u8],
+fn length_prefixed_any_nal<'a>(
+    au: &'a [u8],
     nal_length_size: u8,
-    pred: &mut impl FnMut(&[u8]) -> bool,
+    pred: &mut impl FnMut(&'a [u8]) -> bool,
 ) -> bool {
     let size = usize::from(nal_length_size);
     if !(1..=4).contains(&size) {
@@ -320,7 +388,52 @@ mod tests {
 
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
-    use super::{is_idr, is_self_contained_idr, read_leb128, CodecKind, NalFraming};
+    use super::{
+        is_idr, is_self_contained_idr, mpeg2_sequence_header, parameter_sets, read_leb128,
+        CodecKind, NalFraming,
+    };
+
+    #[test]
+    fn parameter_sets_are_extracted_in_order_and_compare_by_bytes() {
+        let sps = [0x67, 0x42, 0x00, 0x1F, 0xAA];
+        let pps = [0x68, 0xCE, 0x3C, 0x80];
+        let mut au = vec![0, 0, 0, 1];
+        au.extend_from_slice(&sps);
+        au.extend_from_slice(&[0, 0, 1]);
+        au.extend_from_slice(&pps);
+        au.extend_from_slice(&[0, 0, 1, 0x65, 0x88, 0x80]);
+        let sets = parameter_sets(&au, CodecKind::H264, NalFraming::AnnexB);
+        assert_eq!(sets, vec![&sps[..], &pps[..]]);
+        let mut other = au.clone();
+        other[8] = 0xAB;
+        assert_ne!(
+            parameter_sets(&other, CodecKind::H264, NalFraming::AnnexB),
+            sets
+        );
+        assert!(parameter_sets(&au, CodecKind::Av1, NalFraming::Obu).is_empty());
+    }
+
+    /// G: an SPS whose payload contains a raw `00 00 01` (no emulation
+    /// prevention) followed by a byte with the forbidden bit set fails closed:
+    /// no set is reported (never a truncated or synthesized one).
+    #[test]
+    fn an_emulated_start_code_inside_a_parameter_set_fails_closed() {
+        let au = [
+            0, 0, 0, 1, 0x67, 0x42, 0x00, 0x1F, 0, 0, 1, 0xE8, 0x11, 0x22, 0, 0, 1, 0x68, 0xCE,
+            0x3C, 0x80, 0, 0, 1, 0x65, 0x88,
+        ];
+        assert!(parameter_sets(&au, CodecKind::H264, NalFraming::AnnexB).is_empty());
+        // A too-short parameter set fails closed too.
+        let short = [0, 0, 1, 0x67, 0x42, 0, 0, 1, 0x65, 0x88];
+        assert!(parameter_sets(&short, CodecKind::H264, NalFraming::AnnexB).is_empty());
+    }
+
+    #[test]
+    fn mpeg2_sequence_header_runs_to_the_next_start_code() {
+        let au = [0, 0, 1, 0xB3, 1, 2, 3, 0, 0, 1, 0xB5, 9, 0, 0, 1, 0x00];
+        assert_eq!(mpeg2_sequence_header(&au), Some(&au[..7]));
+        assert_eq!(mpeg2_sequence_header(&[0, 0, 1, 0x00, 1]), None);
+    }
 
     #[test]
     fn leb128_single_and_multi_byte() {

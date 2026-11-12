@@ -1305,6 +1305,7 @@ fn a_forced_idr_lands_on_a_gap_filled_tick() {
             output_index: 0,
             key,
             tick: t,
+            parameter_sets_changed: false,
         }),
         "the rebind at T lands"
     );

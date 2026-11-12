@@ -276,6 +276,10 @@ fn a_take_to_a_source_and_back_through_the_real_pipeline() {
     }
     assert!(to_source.tick < to_program.tick);
     assert_eq!(
+        run.final_snapshot.parameter_set_changes, 0,
+        "mpeg2video: the live-opened encoder's sequence header equals the running one's (plain splice both ways)"
+    );
+    assert_eq!(
         run.final_snapshot.dynamic_encoders_live, 0,
         "closed at the end of the run"
     );
