@@ -943,10 +943,35 @@ The existing `bus` field (`crates/multiview-config/src/routing.rs:236`) stays as
 desugar (`crates/multiview-config/src/lib.rs:1590-1600`) keeps writing Program.
 
 A take is persisted **only after its `applied` outcome**, never on `refused:*` or `superseded`, under
-the same config-mutation lock `apply-layout` uses (`crates/multiview-control/src/routes/mod.rs:811`). A restart therefore comes
-back on the operator's last feed that actually went on air. This differs from `apply-layout`, which
-commits before the engine adopts (`crates/multiview-control/src/routes/mod.rs:876-901`): a route take can still be refused by the
-fresh gate after the 202.
+the same config-mutation lock `apply-layout` uses (`crates/multiview-control/src/routes/mod.rs:811`). This differs from
+`apply-layout`, which commits before the engine adopts (`crates/multiview-control/src/routes/mod.rs:876-901`): a route take can
+still be refused by the fresh gate after the 202. A take back to Program removes the output's row, unless the boot file
+routes that output elsewhere: then an explicit Program row is kept, so a restart does not re-seed the boot row.
+
+**Restart (#329).** `routing.output` rows are **store-backed**: start-up takes them from the accepted
+state (`desired.json`, where `persist_feed` committed them), not from the boot file. The other routing
+tables (video, audio and subtitle crosspoints) stay restart-only and are spliced from the boot file as
+before. Per output, the accepted row wins; a boot-file `[[routing.output]]` row seeds an output the
+accepted state has no row for. The same rule applies to the accepted state, an `active.toml` resume and
+a last-good fallback (`crates/multiview-cli/src/boot.rs`, `splice_output_routing`).
+
+The engine itself always starts every output on Program. Right after the run's routing handle is
+published, before the clock starts, it enqueues one **boot take** per output whose persisted feed is not
+Program: `operation_id = "boot:<output config id>"`, principal `system:boot`. A boot take goes through
+the normal gate (fresh within 50 ticks, capacity), so a source that is not up yet is refused
+`feed-not-fresh`. The router on the bake consumer then re-issues it at most once every 2 s, for up to
+30 s after the run's first tick. This state is O(outputs), lives off the clock on the consumer that
+already owns the take state machine, and needs no extra thread or timer. An operator take on the same
+output ends the boot take for good. After the window, or on a refusal that cannot clear (unroutable,
+format mismatch), the output stays on Program, a warning is logged, and the routing snapshot counts it
+(`boot_takes_given_up`). A refused or expired boot take never deletes the persisted feed: the operator's
+intent stays. An applied boot take re-persists the same feed, which is harmless.
+
+**What the operator sees when a boot take is refused.** `GET /routing` shows `video: {"bus":
+"program"}` with tally `program` (what is on air) and `configured_video` with the persisted feed. The
+Outputs page shows the live feed in the select and a "configured: X (not on air)" note. Start-up
+admission (`outputs_carry_program`, the single start-up rule) refuses only a feed the engine cannot
+carry at all: a layout, which validation already refuses until slice 3.
 
 ### 6.2 HTTP surface
 
@@ -963,15 +988,19 @@ POST /api/v1/routing/output/take          new kind "output"
 POST /api/v1/routing/salvo/plan|take      several crosspoints, one tick (new)
 ```
 
-`GET /api/v1/routing`, filtered per object for scoped principals:
+`GET /api/v1/routing`, filtered per object for scoped principals. When the engine publishes a live
+snapshot for an output, `video`, `tally` and `effective_audio` describe what is **on air** (the live
+bus), and `configured_video` is the persisted feed. They differ after a refused boot take or a
+fallback. Each field is redacted by its own per-object rule. Without a live snapshot (no run), both
+fields are the configured feed and `state` is `configured`.
 
 ```json
 { "tick": 1843021,
   "outputs": [
-    { "output": "restream", "video": {"layout": "NewsOne"}, "audio": "follow",
+    { "output": "restream", "video": {"layout": "NewsOne"}, "configured_video": {"layout": "NewsOne"}, "audio": "follow",
       "effective_audio": "program", "encoded_bus": "aux:NewsOne/h264-1080p", "state": "on_air",
       "since_tick": 1841990, "pending": null },
-    { "output": "srt-multiview", "video": {"bus": "program"}, "audio": "follow",
+    { "output": "srt-multiview", "video": {"bus": "program"}, "configured_video": {"bus": "program"}, "audio": "follow",
       "effective_audio": "program", "state": "on_air", "since_tick": 0,
       "pending": {"video": {"source": "vt1"}, "held_ticks": 12, "operation_id": "…"} } ],
   "cells": [ … existing video/audio/subtitle crosspoints … ],
@@ -1029,11 +1058,17 @@ The replay decision is owned by a **take-scoped** store
 (`OutputRoutingControl` in `crates/multiview-control/src/output_routing.rs`), not by the
 process-global `IdempotencyStore`. Each record holds `{operation_id, take, outcome}`. The route does
 not use the global store at all: other routes `release`/`rebind` keys there, and a take's replay
-must not depend on them. The take store is bounded at 4096 records and **fails closed** at the cap
-(`503 idempotency-capacity`, like the global store); it never evicts. A record is removed only when
-its own enqueue failed (`engine-busy`, `output-kind-unroutable`), which frees the key for a retry.
-Settled records stay for the life of the process, the same lifetime as the global store's keys. The
-control-side
+must not depend on them. The take store is bounded at 4096 records in total and 256 **per principal**.
+A **pending** record (one with no outcome yet) is never evicted, so a key answered `accepted` always
+replays its own operation while that operation is pending. Under pressure, **settled** records are
+evicted oldest first. When a principal reaches its own cap, its own oldest settled record goes first. If
+all of that principal's records are pending, that principal gets `503 idempotency-capacity` and other
+principals are unaffected. At the global cap, the oldest settled record of any principal goes. Only
+when all 4096 records are pending does the store fail closed for everyone. This is the documented
+trade-off: **a replay of an evicted (settled) key is a new take**, because the store no longer knows
+the key. Clients already must mint a new key per distinct take, and a replay long after its settlement
+re-applies a feed the operator already chose. A record is also removed when its own enqueue failed
+(`engine-busy`, `output-kind-unroutable`), which frees the key for a retry. The control-side
 `route.output` subscriber writes the outcome when the engine publishes it. A salvo reserves its key
 only after every member is authorized and validated. So a denied or invalid salvo burns no key, and
 its replay can never return a 202 for an operation that never enqueued. The outcome arrives as the realtime event
@@ -1069,7 +1104,7 @@ A take or plan requires:
 
 | Object | Requirement |
 | --- | --- |
-| Destination | Role `Write` (`principal.role.require(Action::Write)`, as `crates/multiview-control/src/routes/routing.rs:151`) **and** `authorize_object(principal, output)` (`crates/multiview-control/src/auth.rs:336`), the same object axis the output routes use (`crates/multiview-control/src/routes/outputs.rs:77,110`). Not `authorize_output`, which reads a different allowlist (`crates/multiview-control/src/auth.rs:268-274,349`) |
+| Destination | Role `Write` (`principal.role.require(Action::Write)`, as `crates/multiview-control/src/routes/routing.rs:151`) **and** both axes of the output: `authorize_scope(principal, AuthzScope::ObjectAndOutput { object: output, output })` (#329). The object axis (`scoped_object_ids`) is the one the output routes use (`crates/multiview-control/src/routes/outputs.rs:77,110`). The output axis (`scoped_output_ids`, ADR-W026) is checked as well, so a key confined to some outputs can neither plan nor take another, nor read its row or its events |
 | Feed `source:x` | `authorize_object(principal, x)` with Read (`crates/multiview-control/src/auth.rs:336`) |
 | Feed `layout:L` | Read on L **and on every source its cells bind**. A layout picture shows those sources' pixels, so a principal limited to L could otherwise route a source it cannot read |
 | Feed `bus:*` (Program, Preview, Clean) and `layout:*` cells binding `bus:*` | `authorize_scope(Program("main"))` plus `authorize_object(me1)`, as `authorize_refs` does (`crates/multiview-control/src/routes/switcher.rs:99-112`). **This deliberately replaces per-source Read**: a bus shows whatever the M/E selects, now or later, so the grant is the Program scope itself. Only principals that already hold Program scope can route a bus |
@@ -1111,7 +1146,8 @@ affects:
   (`require_unscoped_for_whole_system`). A scoped principal gets its own cost (`+0` or `+1`
   encoder) and a boolean `fits`. Its capacity refusal reads "No free encoder session for this
   output", without counts.
-- `route.output` is delivered with `AuthzScope::Object(output)` (the same axis as the REST check).
+- `route.output` is delivered with `AuthzScope::ObjectAndOutput { object: output, output }`, the same two axes
+  as the REST check. `GET /routing` omits the rows that fail this rule.
 - Authorization runs before existence, as the existing routes do (`crates/multiview-control/src/routes/routing.rs:164-169`,
   `crates/multiview-control/src/routes/switcher.rs:288-289`). So an id the caller may not read gets 403 whether or not it exists.
 
