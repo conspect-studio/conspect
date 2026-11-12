@@ -108,13 +108,32 @@ What is true on main f5f2230e (the full table with citations is in §1 of the no
      `VideoRenditionEncoder` and the AAC state, which start at 0 today, `crates/multiview-output/src/sink.rs:604,1141-1159`). It
      moves the output at a forced IDR at T ≥ T0 + 1 (T ≥ T0 + 2 for audio, after priming).
    - All encoders stamp PTS = DTS = the tick index, so the step is one tick across the move.
-   - Every encoder is opened with `forced-idr=1`. The move happens only on a decoder-ready RAP
-     (`is_decoder_ready_rap`).
-   - Encoders with the same settings produce byte-identical parameter sets, carried in band at
-     every IDR (no `GLOBAL_HEADER`). A mismatch is an internal fault (`encoder-format-mismatch`),
-     never silent.
-   - The dispatcher gains `rebind(output, video_key, audio_key, at_tick)`, atomic per output at a
-     window boundary. The consumer `try_send`s to a new worker and never waits for it.
+   - Every encoder is opened with `forced-idr=1`. The move happens only on a window the
+     destination stage has **completed**, whose first video packet is a decoder-ready RAP
+     **carrying its parameter sets** in that access unit (SPS+PPS for H.264, VPS+SPS+PPS for
+     HEVC). `is_decoder_ready_rap` alone is not enough (it is true on an IDR NAL without
+     parameter sets); the move gate parses the access unit. Every family runs without
+     `AV_CODEC_FLAG_GLOBAL_HEADER`, which is what repeats them in band at every IDR: NVENC
+     `repeatSPSPPS`, x264 `b_repeat_headers`, x265 `repeat-headers` (libavcodec sets each when the
+     flag is absent); VAAPI and VideoToolbox are not routable until their own check exists.
+   - Parameter sets are **not assumed** identical. Equal settings usually give identical bytes
+     (measured for libx264/libx265); when they differ, the move is still correct because the new
+     sets ride in band at the cut and MPEG-TS (HLS segments, SRT), MoQ (new group) and FLV
+     consumers re-read in-band sets; the HLS segmenter starts a segment at that IDR. Where a
+     consumer needs out-of-band init (fMP4/CMAF `EXT-X-MAP`, a MoQ catalog description), a
+     difference is signalled as a discontinuity on that output (a brief decoder reset), never
+     spliced silently. NVENC identity is measured on mda001.
+   - **A stage that is not yet live for a window never gates any other stage's window.** A
+     live-opened encoder joins the dispatcher's completion rule only from its first completed
+     window; before that its stage is ignored for closure, so Program outputs keep closing on time
+     whatever a new encoder does (wedged, slow, failed).
+   - The dispatcher gains `rebind_video(output, key, at_tick)` (at the video move tick T) and
+     `rebind_audio(output, key, at_sample)` (at the AAC grid boundary G at or after T, decision 5):
+     two contracts, each atomic per output at its own boundary. The consumer `try_send`s to a new
+     worker and never waits for it.
+   - A live open has a deadline: 90 ticks (3 s at 30000/1001) from admission to its first
+     completed RAP window. On overrun the take is refused `encoder-not-ready`, the reservation is
+     released, the worker goes to the reaper, and the output keeps its previous feed.
    - The dispatcher registers a new encoder key before its first packet. A window from a key with
      no bound output is dropped, never an error, because today an unknown key aborts delivery for
      every output (`crates/multiview-cli/src/rendition_dispatch.rs:319-344`).
@@ -143,7 +162,8 @@ What is true on main f5f2230e (the full table with citations is in §1 of the no
 
    Audio buses are built on the bake consumer from the per-source blocks the program bus already
    pulls each tick (every source is already a strip, mixed at gain 0 unless included). An output's
-   audio subscription moves with its video, in the same rebind.
+   audio subscription moves in the same take, but not in the same rebind: video moves at tick T,
+   audio at the grid boundary G at or after T (`rebind_audio`, below).
 
    Audio moves on one **global AAC frame grid**: every encoded audio bus emits frames on multiples
    of 1024 of the run's sample counter, and a live-opened bus starts on that grid. An output's
