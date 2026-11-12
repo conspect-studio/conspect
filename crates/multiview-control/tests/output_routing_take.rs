@@ -895,7 +895,8 @@ async fn replays_for_other_bodies_never_apply_twice_and_take_requires_a_key() {
     assert_eq!(rig.fake.takes().len(), 1);
 }
 
-/// Reserve `n` distinct takes in the take store the way the route does.
+/// Reserve `n` distinct takes in the take store the way the route does, each
+/// charged to its own principal (so no per-principal cap is met).
 fn fill_take_store(
     control: &multiview_control::output_routing::OutputRoutingControl,
     prefix: &str,
@@ -904,6 +905,7 @@ fn fill_take_store(
     for i in 0..n {
         let reserved = control.reserve_take(
             &format!("{prefix}-{i}"),
+            &format!("{prefix}-principal-{i}"),
             multiview_control::output_routing::PendingTake {
                 api_id: "output-0".to_owned(),
                 feed: RoutedFeed::Program,

@@ -450,7 +450,7 @@ pub(crate) async fn take_output(
         api_id: req.output().to_owned(),
         feed: feed.clone(),
     };
-    let op = match control.reserve_take(key, pending) {
+    let op = match control.reserve_take(key, &principal.key_id, pending) {
         TakeReservation::Capacity => return Err(ControlError::IdempotencyCapacity),
         // Lost a race with a concurrent request bearing the same key.
         TakeReservation::Replay(replay) => return Ok(replayed(replay)),

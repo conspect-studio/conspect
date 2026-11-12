@@ -11,7 +11,8 @@
 //! (`try_take` is a bounded `try_send`, `snapshot` a wait-free load). The
 //! outcome relay runs on its own thread + task and never touches the clock.
 //! All state here is bounded: the take store (one record per take
-//! `Idempotency-Key`, fail-closed at its cap, never evicted) and both rate
+//! `Idempotency-Key`, capped in total and per principal; settled records are
+//! evicted oldest-first under pressure, pending ones never) and both rate
 //! limiters have fixed caps.
 
 use std::collections::{HashMap, VecDeque};
@@ -201,12 +202,16 @@ pub trait OutputRouting: Send + Sync {
 /// Shared handle to an installed [`OutputRouting`].
 pub type SharedOutputRouting = Arc<dyn OutputRouting>;
 
-/// Take records held by the take store. At the cap a new distinct key fails
-/// closed (`idempotency-capacity`); a record is never evicted, so every key
-/// that was answered `accepted` replays its own operation for the life of the
-/// process (the same lifetime as [`crate::concurrency::IdempotencyStore`]
-/// keys, which also never expire).
+/// Take records held by the take store (all principals together). At the cap
+/// a new distinct key evicts the oldest **settled** record; only when every
+/// record is still pending does it fail closed (`idempotency-capacity`). A
+/// pending record is never evicted, so a key answered `accepted` always replays
+/// its own operation while its outcome is unknown.
 pub const MAX_TAKE_RECORDS: usize = crate::concurrency::MAX_IDEMPOTENCY_RESERVATIONS;
+/// Take records one principal may hold. At this cap the principal's own oldest
+/// settled record is evicted first; a principal whose records are all pending
+/// gets `idempotency-capacity` while every other principal is unaffected.
+pub const MAX_TAKE_RECORDS_PER_PRINCIPAL: usize = 256;
 /// Takes per second per output (§6.4).
 pub const TAKES_PER_OUTPUT_PER_SEC: usize = 2;
 /// Takes per second per principal (§6.4).
@@ -236,12 +241,17 @@ pub struct PendingTake {
     pub feed: RoutedFeed,
 }
 
-/// A take's record for the life of its `Idempotency-Key`.
+/// A take's record for the life of its `Idempotency-Key` (or until it is
+/// settled and evicted under pressure).
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct TakeRecord {
     operation_id: crate::command::OperationId,
     take: PendingTake,
     outcome: Option<RecordedOutcome>,
+    /// The principal the record is charged to.
+    principal: String,
+    /// Reservation order (the eviction age).
+    seq: u64,
 }
 
 /// The result of [`OutputRoutingControl::reserve_take`].
@@ -251,7 +261,8 @@ pub enum TakeReservation {
     Fresh(crate::command::OperationId),
     /// The key already names a take: answer it, never enqueue again.
     Replay(TakeReplay),
-    /// The store is full: fail closed (`idempotency-capacity`).
+    /// No record can be made: the principal's records (or, globally, every
+    /// record) are all pending. Fail closed (`idempotency-capacity`).
     Capacity,
 }
 
@@ -265,20 +276,33 @@ pub struct TakeReplay {
 }
 
 /// The take-scoped idempotency store: scoped key → record, plus operation id
-/// → scoped key for settling. Bounded by `cap`; never evicts.
+/// → scoped key for settling. Bounded by `cap` records in total and
+/// `per_principal` records per principal; under pressure the oldest SETTLED
+/// record is evicted (the principal's own first), never a pending one.
 #[derive(Debug)]
 struct TakeStore {
     cap: usize,
+    per_principal: usize,
+    next_seq: u64,
     by_key: HashMap<String, TakeRecord>,
     by_op: HashMap<String, String>,
+    /// Records held per principal (an entry is removed at zero, so this map is
+    /// bounded by the record count).
+    held: HashMap<String, usize>,
+    /// Settled records by reservation order: the eviction queue.
+    settled: std::collections::BTreeMap<u64, String>,
 }
 
 impl TakeStore {
-    fn new(cap: usize) -> Self {
+    fn new(cap: usize, per_principal: usize) -> Self {
         Self {
             cap,
+            per_principal,
+            next_seq: 0,
             by_key: HashMap::new(),
             by_op: HashMap::new(),
+            held: HashMap::new(),
+            settled: std::collections::BTreeMap::new(),
         }
     }
 
@@ -289,21 +313,66 @@ impl TakeStore {
         })
     }
 
-    fn reserve(&mut self, key: &str, take: PendingTake) -> TakeReservation {
+    /// Remove `key`'s record and every index of it.
+    fn remove(&mut self, key: &str) {
+        let Some(record) = self.by_key.remove(key) else {
+            return;
+        };
+        self.by_op.remove(record.operation_id.as_str());
+        self.settled.remove(&record.seq);
+        if let Some(count) = self.held.get_mut(&record.principal) {
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                self.held.remove(&record.principal);
+            }
+        }
+    }
+
+    /// Evict the oldest settled record (of `principal` only, when given).
+    /// `false` when there is none: every candidate is pending.
+    fn evict_oldest_settled(&mut self, principal: Option<&str>) -> bool {
+        // O(records) at worst, on the control plane only, bounded by `cap`.
+        let victim = self
+            .settled
+            .values()
+            .find(|key| {
+                principal.is_none_or(|p| self.by_key.get(*key).is_some_and(|r| r.principal == p))
+            })
+            .cloned();
+        match victim {
+            Some(key) => {
+                self.remove(&key);
+                true
+            }
+            None => false,
+        }
+    }
+
+    fn reserve(&mut self, key: &str, principal: &str, take: PendingTake) -> TakeReservation {
         if let Some(replay) = self.replay(key) {
             return TakeReservation::Replay(replay);
         }
-        if self.by_key.len() >= self.cap {
+        if self.held.get(principal).copied().unwrap_or(0) >= self.per_principal
+            && !self.evict_oldest_settled(Some(principal))
+        {
+            return TakeReservation::Capacity;
+        }
+        if self.by_key.len() >= self.cap && !self.evict_oldest_settled(None) {
             return TakeReservation::Capacity;
         }
         let op = crate::command::OperationId::new();
+        let seq = self.next_seq;
+        self.next_seq = self.next_seq.wrapping_add(1);
         self.by_op.insert(op.as_str().to_owned(), key.to_owned());
+        *self.held.entry(principal.to_owned()).or_insert(0) += 1;
         self.by_key.insert(
             key.to_owned(),
             TakeRecord {
                 operation_id: op.clone(),
                 take,
                 outcome: None,
+                principal: principal.to_owned(),
+                seq,
             },
         );
         TakeReservation::Fresh(op)
@@ -311,14 +380,19 @@ impl TakeStore {
 
     fn release(&mut self, key: &str, op: &crate::command::OperationId) {
         if self.by_key.get(key).is_some_and(|r| r.operation_id == *op) {
-            self.by_key.remove(key);
-            self.by_op.remove(op.as_str());
+            self.remove(key);
         }
     }
 
-    fn record_mut(&mut self, operation_id: &str) -> Option<&mut TakeRecord> {
-        let key = self.by_op.get(operation_id)?;
-        self.by_key.get_mut(key)
+    /// Record `outcome` on `operation_id`'s take; the take it settles.
+    fn settle(&mut self, operation_id: &str, outcome: RecordedOutcome) -> Option<PendingTake> {
+        let key = self.by_op.get(operation_id)?.clone();
+        let record = self.by_key.get_mut(&key)?;
+        if record.outcome.is_none() {
+            self.settled.insert(record.seq, key);
+        }
+        record.outcome = Some(outcome);
+        Some(record.take.clone())
     }
 
     fn record(&self, operation_id: &str) -> Option<&TakeRecord> {
@@ -470,7 +544,10 @@ impl OutputRoutingControl {
         Self {
             routing,
             limiter: TakeLimiter::default(),
-            records: Mutex::new(TakeStore::new(MAX_TAKE_RECORDS)),
+            records: Mutex::new(TakeStore::new(
+                MAX_TAKE_RECORDS,
+                MAX_TAKE_RECORDS_PER_PRINCIPAL,
+            )),
         }
     }
 
@@ -485,11 +562,13 @@ impl OutputRoutingControl {
         self.records().replay(key)
     }
 
-    /// Reserve `key` for a take of `pending`: fresh, replay of the key's own
-    /// operation, or capacity (fail closed; nothing is evicted). The record
-    /// exists before the enqueue, so an outcome can never beat it.
-    pub fn reserve_take(&self, key: &str, pending: PendingTake) -> TakeReservation {
-        self.records().reserve(key, pending)
+    /// Reserve `key` for a take of `pending` charged to `principal` (the
+    /// authenticated key id): fresh, replay of the key's own operation, or
+    /// capacity. Under pressure the oldest settled record is evicted (the
+    /// principal's own first, at its per-principal cap); a pending record never
+    /// is. The record exists before the enqueue, so an outcome never beats it.
+    pub fn reserve_take(&self, key: &str, principal: &str, pending: PendingTake) -> TakeReservation {
+        self.records().reserve(key, principal, pending)
     }
 
     /// Free `key` after its own take failed to enqueue (busy/unroutable), but
@@ -504,13 +583,13 @@ impl OutputRoutingControl {
         if outcome.operation_id.is_empty() {
             return None;
         }
-        let mut records = self.records();
-        let record = records.record_mut(&outcome.operation_id)?;
-        record.outcome = Some(RecordedOutcome {
-            outcome: outcome.outcome.clone(),
-            tick: outcome.tick,
-        });
-        Some(record.take.clone())
+        self.records().settle(
+            &outcome.operation_id,
+            RecordedOutcome {
+                outcome: outcome.outcome.clone(),
+                tick: outcome.tick,
+            },
+        )
     }
 
     /// The recorded terminal outcome of `operation_id`, once known.
@@ -698,19 +777,19 @@ mod tests {
 
     #[test]
     fn take_records_are_bounded_and_fail_closed_without_eviction() {
-        let mut store = TakeStore::new(3);
+        let mut store = TakeStore::new(3, 3);
         let pending = || PendingTake {
             api_id: "o".to_owned(),
             feed: RoutedFeed::Program,
         };
         let mut ops = Vec::new();
         for i in 0..3 {
-            let TakeReservation::Fresh(op) = store.reserve(&format!("k{i}"), pending()) else {
+            let TakeReservation::Fresh(op) = store.reserve(&format!("k{i}"), "p", pending()) else {
                 panic!("fresh");
             };
             ops.push(op);
         }
-        assert_eq!(store.reserve("k9", pending()), TakeReservation::Capacity);
+        assert_eq!(store.reserve("k9", "p", pending()), TakeReservation::Capacity);
         assert_eq!(store.by_key.len(), 3);
         for (i, op) in ops.iter().enumerate() {
             let Some(replay) = store.replay(&format!("k{i}")) else {
@@ -724,9 +803,102 @@ mod tests {
         store.release("k0", &ops[0]);
         assert!(store.replay("k0").is_none() && store.record(ops[0].as_str()).is_none());
         assert!(matches!(
-            store.reserve("k9", pending()),
+            store.reserve("k9", "p", pending()),
             TakeReservation::Fresh(_)
         ));
+    }
+
+    fn pending_take() -> PendingTake {
+        PendingTake {
+            api_id: "o".to_owned(),
+            feed: RoutedFeed::Program,
+        }
+    }
+
+    fn fresh(store: &mut TakeStore, key: &str, principal: &str) -> crate::command::OperationId {
+        match store.reserve(key, principal, pending_take()) {
+            TakeReservation::Fresh(op) => op,
+            other => panic!("{key}: expected fresh, got {other:?}"),
+        }
+    }
+
+    fn settle(store: &mut TakeStore, op: &crate::command::OperationId) {
+        assert!(store
+            .settle(
+                op.as_str(),
+                RecordedOutcome {
+                    outcome: "applied".to_owned(),
+                    tick: 1,
+                },
+            )
+            .is_some());
+    }
+
+    #[test]
+    fn one_principal_filling_its_cap_cannot_block_another() {
+        let mut store = TakeStore::new(100, 4);
+        for i in 0..4 {
+            fresh(&mut store, &format!("a{i}"), "alice");
+        }
+        // All of alice's records are pending: alice fails closed …
+        assert_eq!(
+            store.reserve("a-more", "alice", pending_take()),
+            TakeReservation::Capacity
+        );
+        // … and bob is unaffected.
+        fresh(&mut store, "b0", "bob");
+        // Every alice key still replays its own operation while pending.
+        for i in 0..4 {
+            assert!(store.replay(&format!("a{i}")).is_some());
+        }
+    }
+
+    #[test]
+    fn a_principal_at_its_cap_evicts_its_own_oldest_settled_record_first() {
+        let mut store = TakeStore::new(100, 3);
+        let bob = fresh(&mut store, "b0", "bob");
+        settle(&mut store, &bob);
+        let a0 = fresh(&mut store, "a0", "alice");
+        let a1 = fresh(&mut store, "a1", "alice");
+        fresh(&mut store, "a2", "alice");
+        settle(&mut store, &a1);
+        settle(&mut store, &a0);
+        // Alice is at her cap: her OWN oldest settled (a0, reserved first) is
+        // evicted, not bob's older settled record and not her pending a2.
+        fresh(&mut store, "a3", "alice");
+        assert!(store.replay("a0").is_none(), "alice's oldest settled evicted");
+        assert!(store.replay("a1").is_some());
+        assert!(store.replay("a2").is_some(), "pending never evicted");
+        assert!(store.replay("b0").is_some(), "another principal untouched");
+        assert_eq!(store.by_key.len(), 4);
+    }
+
+    #[test]
+    fn settled_records_are_evicted_oldest_first_at_the_global_cap_and_pending_never() {
+        let mut store = TakeStore::new(4, 4);
+        let k0 = fresh(&mut store, "k0", "p0");
+        fresh(&mut store, "k1", "p1");
+        let k2 = fresh(&mut store, "k2", "p2");
+        fresh(&mut store, "k3", "p3");
+        settle(&mut store, &k2);
+        settle(&mut store, &k0);
+        // Full: the oldest SETTLED by reservation order (k0) goes first.
+        fresh(&mut store, "k4", "p4");
+        assert!(store.replay("k0").is_none());
+        assert!(store.record(k0.as_str()).is_none(), "both indexes cleared");
+        fresh(&mut store, "k5", "p5");
+        assert!(store.replay("k2").is_none());
+        // Only pending records remain: fail closed, nothing evicted.
+        assert_eq!(
+            store.reserve("k6", "p6", pending_take()),
+            TakeReservation::Capacity
+        );
+        for key in ["k1", "k3", "k4", "k5"] {
+            assert!(store.replay(key).is_some(), "{key} pending, kept");
+        }
+        // A replay of an evicted key is a new take (the documented trade-off).
+        assert_eq!(store.by_key.len(), 4);
+        assert!(store.held.len() <= 4, "per-principal counts are bounded");
     }
 
     #[test]
