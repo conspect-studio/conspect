@@ -147,3 +147,77 @@ async fn trust_anchor_replaces_the_built_in_roots() {
         EgressError::Refused
     );
 }
+
+/// Review #331 L-1: an IPv4-mapped or IPv4-compatible literal is never handed
+/// to the connector, even with `allow_private` and the loopback seam open for
+/// the port. A listener on 127.0.0.1 counts accepted connections: it must
+/// see none, for the literal itself and for a redirect to it.
+#[tokio::test]
+async fn mapped_and_compatible_literals_are_never_dialled() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+    let v4 = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let v4_port = v4.local_addr().unwrap().port();
+    let accepted = Arc::new(AtomicUsize::new(0));
+    let counter = Arc::clone(&accepted);
+    tokio::spawn(async move {
+        while let Ok((_s, _)) = v4.accept().await {
+            counter.fetch_add(1, Ordering::SeqCst);
+        }
+    });
+    let (port, _t, root) = fixture().await;
+    let target = format!("https://[::ffff:127.0.0.1]:{v4_port}/ok");
+    let redirect = Router::new().route(
+        "/to-mapped",
+        get(move || {
+            let target = target.clone();
+            async move { (StatusCode::FOUND, [(header::LOCATION, target)]).into_response() }
+        }),
+    );
+    let pki = fixture_pki();
+    let redirector = serve_https(redirect, &pki).await;
+    let redirect_dir = tempfile::tempdir().unwrap();
+    let redirect_root = write_root(&pki, redirect_dir.path());
+    for (allow_ports, anchor) in [
+        (vec![port, v4_port], root.clone()),
+        (vec![redirector.port(), v4_port], redirect_root.clone()),
+    ] {
+        let c = EgressClient::new(
+            EgressPolicy::for_tests_allowing_loopback_ports(true, &allow_ports),
+            Some(&anchor),
+            EgressTimeouts::default(),
+            1024,
+        )
+        .unwrap();
+        for literal in [
+            format!("https://[::ffff:127.0.0.1]:{v4_port}/ok"),
+            format!("https://[::127.0.0.1]:{v4_port}/ok"),
+        ] {
+            let r = c.reqwest().get(&literal).build().unwrap();
+            assert_eq!(
+                c.send(r).await.unwrap_err(),
+                EgressError::Refused,
+                "{literal}"
+            );
+        }
+    }
+    let c = EgressClient::new(
+        EgressPolicy::for_tests_allowing_loopback_ports(true, &[redirector.port(), v4_port]),
+        Some(&redirect_root),
+        EgressTimeouts::default(),
+        1024,
+    )
+    .unwrap();
+    let r = c
+        .reqwest()
+        .get(format!("https://[::1]:{}/to-mapped", redirector.port()))
+        .build()
+        .unwrap();
+    assert_eq!(c.send(r).await.unwrap_err(), EgressError::Refused);
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    assert_eq!(
+        accepted.load(Ordering::SeqCst),
+        0,
+        "a mapped literal was dialled"
+    );
+}

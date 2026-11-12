@@ -395,7 +395,8 @@ PR B.
   the ACME directory client only; link-local, multicast, unspecified and mapped forms stay refused.
   With `trust_anchor`, only that PEM bundle is trusted (opened without following symlinks).
 * State (`state_dir`, 0700, files 0600, atomic rename + fsync): `account.<host>-<hash>.json`,
-  `active.pem` (key + chain in one file so they swap together), `active.json` (non-secret meta),
+  `active.pem` (key + chain + a `CONSPECT ACME META` section with the non-secret metadata, one file so
+  one rename commits all three; the served key swaps only after that commit),
   `pending-txt.json` (DNS-01 ledger: intent before `publish_txt`, handle after, entry removed after
   `remove_txt`; at most 64 entries; replayed by `cleanup_pending()` at start), `secrets/<NAME>` as
   the fallback for every env-var name.

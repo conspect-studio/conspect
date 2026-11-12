@@ -277,6 +277,43 @@ fn parse_bundle(chain_pem: &[u8], key_pem: &[u8]) -> Result<Parsed, AcmeError> {
     })
 }
 
+const META_BEGIN: &str = "-----BEGIN CONSPECT ACME META-----";
+const META_END: &str = "-----END CONSPECT ACME META-----";
+
+/// The non-secret metadata as a PEM-style section appended to `active.pem`.
+/// PEM readers skip a section with an unknown label, so the bundle stays a
+/// plain key + chain for rustls and for `openssl`.
+fn meta_section(meta: &ActiveMeta) -> Result<String, AcmeError> {
+    use base64::Engine;
+    let json = serde_json::to_vec(meta).map_err(|_| AcmeError::Storage)?;
+    let b64 = base64::engine::general_purpose::STANDARD.encode(json);
+    let mut out = format!("\n{META_BEGIN}\n");
+    for chunk in b64.as_bytes().chunks(64) {
+        out.push_str(&String::from_utf8_lossy(chunk));
+        out.push('\n');
+    }
+    out.push_str(META_END);
+    out.push('\n');
+    Ok(out)
+}
+
+/// Read the metadata section of a stored bundle, if present and well formed.
+fn meta_from_bundle(bundle: &[u8]) -> Option<ActiveMeta> {
+    use base64::Engine;
+    let text = std::str::from_utf8(bundle).ok()?;
+    let start = text.find(META_BEGIN)?.checked_add(META_BEGIN.len())?;
+    let rest = text.get(start..)?;
+    let body: String = rest
+        .get(..rest.find(META_END)?)?
+        .chars()
+        .filter(|c| !c.is_whitespace())
+        .collect();
+    let json = base64::engine::general_purpose::STANDARD
+        .decode(body)
+        .ok()?;
+    serde_json::from_slice(&json).ok()
+}
+
 /// Parse a stored RFC 9773 `aki.serial` identifier.
 #[must_use]
 pub fn parse_cert_id(id: &str) -> Option<CertificateIdentifier<'static>> {
@@ -553,16 +590,22 @@ impl AcmeEngine {
         };
         let bundle = zeroize::Zeroizing::new(bundle);
         let parsed = parse_bundle(&bundle, &bundle)?;
-        let stored: Option<ActiveMeta> = store::read_private(dir, store::ACTIVE_META)?
-            .and_then(|raw| serde_json::from_slice(&raw).ok());
+        // The metadata travels inside `active.pem`, so it can never disagree
+        // with the certificate. A bundle without it (lost or unreadable) is
+        // treated as issued by the configured directory: a still-valid
+        // certificate is never thrown away for missing bookkeeping; the
+        // normal renewal schedule replaces it in time.
+        let stored = meta_from_bundle(&bundle);
         let meta = ActiveMeta {
             not_before: parsed.not_before,
             not_after: parsed.not_after,
             ari_cert_id: parsed.ari_cert_id.clone(),
-            ca: stored.as_ref().map_or_else(String::new, |m| m.ca.clone()),
+            ca: stored
+                .as_ref()
+                .map_or_else(|| self.ca_name(), |m| m.ca.clone()),
             directory_url: stored
                 .as_ref()
-                .map_or_else(String::new, |m| m.directory_url.clone()),
+                .map_or_else(|| self.directory_url.clone(), |m| m.directory_url.clone()),
             names: parsed.names.clone(),
         };
         self.source
@@ -575,6 +618,10 @@ impl AcmeEngine {
             false,
         ));
         Ok(Some(meta))
+    }
+
+    fn ca_name(&self) -> String {
+        format!("{:?}", self.config.ca).to_ascii_lowercase()
     }
 
     /// Whether a stored certificate must be replaced regardless of schedule:
@@ -773,17 +820,19 @@ impl AcmeEngine {
             not_before: parsed.not_before,
             not_after: parsed.not_after,
             ari_cert_id: parsed.ari_cert_id.clone(),
-            ca: format!("{:?}", self.config.ca).to_ascii_lowercase(),
+            ca: self.ca_name(),
             directory_url: self.directory_url.clone(),
             names: parsed.names.clone(),
         };
-        let meta_json = serde_json::to_vec(&meta).map_err(|_| AcmeError::Storage)?;
+        // One file, one rename: key, chain and metadata commit together, and
+        // the served key changes only after that commit (crash-safe).
+        let bundle =
+            zeroize::Zeroizing::new(format!("{}{}", bundle.as_str(), meta_section(&meta)?));
         let source = Arc::clone(&self.source);
         let key = Arc::clone(&parsed.key);
         let not_after = parsed.not_after;
         tokio::task::spawn_blocking(move || -> Result<(), AcmeError> {
             store::write_private(&dir, store::ACTIVE_PEM, bundle.as_bytes())?;
-            store::write_private(&dir, store::ACTIVE_META, &meta_json)?;
             source
                 .install(key, not_after, &dir)
                 .map_err(|_| AcmeError::Storage)
@@ -1053,7 +1102,7 @@ async fn run(engine: AcmeEngine, mut receiver: mpsc::Receiver<AcmeCommand>) {
                         not_before: issued.not_before,
                         not_after: issued.not_after,
                         ari_cert_id: issued.ari_cert_id,
-                        ca: String::new(),
+                        ca: engine.ca_name(),
                         directory_url: engine.directory_url.clone(),
                         names: issued.names,
                     });
@@ -1097,6 +1146,84 @@ async fn run(engine: AcmeEngine, mut receiver: mpsc::Receiver<AcmeCommand>) {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bundle_metadata_round_trips_and_pem_readers_ignore_it() {
+        let meta = ActiveMeta {
+            not_before: 1,
+            not_after: 2,
+            ari_cert_id: Some("a.b".to_owned()),
+            ca: "custom".to_owned(),
+            directory_url: "https://acme.example/dir".to_owned(),
+            names: vec!["a.example".to_owned()],
+        };
+        let key = rcgen::KeyPair::generate().unwrap();
+        let cert = rcgen::CertificateParams::new(vec!["a.example".to_owned()])
+            .unwrap()
+            .self_signed(&key)
+            .unwrap();
+        let bundle = format!(
+            "{}\n{}{}",
+            key.serialize_pem(),
+            cert.pem(),
+            meta_section(&meta).unwrap()
+        );
+        assert_eq!(meta_from_bundle(bundle.as_bytes()), Some(meta));
+        let parsed = parse_bundle(bundle.as_bytes(), bundle.as_bytes()).unwrap();
+        assert_eq!(parsed.names, vec!["a.example".to_owned()]);
+        // A bundle without the section (older layout, or the section lost)
+        // still parses; the metadata is simply absent.
+        let bare = format!("{}\n{}", key.serialize_pem(), cert.pem());
+        assert!(meta_from_bundle(bare.as_bytes()).is_none());
+        assert!(parse_bundle(bare.as_bytes(), bare.as_bytes()).is_ok());
+    }
+
+    /// Review #331 L-1 (media lens): a valid stored certificate whose metadata
+    /// is missing must not be treated as foreign and re-issued at once.
+    #[test]
+    fn a_valid_bundle_without_metadata_is_kept_not_reissued() {
+        use crate::certificate_source::CertificateSource as _;
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let state_dir = tmp.path().join("state");
+        std::fs::create_dir(&state_dir).unwrap();
+        std::fs::set_permissions(&state_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let config = NetworkTlsConfig {
+            ca: CertificateAuthority::Letsencrypt,
+            staging: true,
+            challenge: AcmeChallenge::TlsAlpn01,
+            domains: vec!["a.example.org".to_owned()],
+            contact_email: None,
+            acme_profile: None,
+            directory: None,
+            trust_anchor: None,
+            allow_private_directory: false,
+            eab_kid_env: None,
+            eab_hmac_env: None,
+            state_dir: state_dir.clone(),
+            dns: None,
+        };
+        let key = rcgen::KeyPair::generate().unwrap();
+        let cert = rcgen::CertificateParams::new(vec!["a.example.org".to_owned()])
+            .unwrap()
+            .self_signed(&key)
+            .unwrap();
+        let bare = format!("{}\n{}", key.serialize_pem(), cert.pem());
+        store::write_private(&state_dir, store::ACTIVE_PEM, bare.as_bytes()).unwrap();
+        let boot = crate::certificate_source::bootstrap_certificate("a.example.org").unwrap();
+        let source = Arc::new(AcmeCertificateSource::new(
+            boot.certificate.clone(),
+            boot.fingerprint,
+            "letsencrypt".to_owned(),
+            vec!["a.example.org".to_owned()],
+        ));
+        let resolver = Arc::new(ChallengeResolver::new(source.clone()));
+        let engine = AcmeEngine::new(config, None, resolver, source.clone()).unwrap();
+        let meta = engine.load_existing().unwrap().unwrap();
+        assert!(!engine.needs_reissue(&meta), "{meta:?}");
+        assert_eq!(meta.ca, "letsencrypt");
+        assert!(!Arc::ptr_eq(&boot.certificate, &source.current()));
+    }
 
     #[test]
     fn ari_picks_inside_the_window_or_now() {

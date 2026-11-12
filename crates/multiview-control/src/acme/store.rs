@@ -8,8 +8,8 @@
 //! * `account.<directory-host>-<8 hex of sha256(directory url)>.json`: ACME
 //!   account credentials per directory, so a CA change never reuses another
 //!   CA's account and two directories on one host stay apart;
-//! * `active.pem` (private key + chain in ONE file, so they swap atomically)
-//!   and `active.json` (non-secret metadata);
+//! * `active.pem`: private key + chain + a `CONSPECT ACME META` section
+//!   (non-secret metadata) in ONE file, so all three commit with one rename;
 //! * `pending-txt.json`: the DNS-01 ledger: intent is recorded before
 //!   `publish_txt`, the handle after it, the entry removed after `remove_txt`.
 //! * `secrets/<NAME>`: host-written credentials (`multiview tls set-credential`).
@@ -34,16 +34,11 @@ const READ_CAP: u64 = 1024 * 1024;
 /// [`AcmeError::Storage`] on `..`, a symlink, a foreign owner or wider mode.
 pub fn private_dir(path: &Path) -> Result<(), AcmeError> {
     use rustix::fs::{FileType, Mode, OFlags};
-    use std::os::unix::fs::DirBuilderExt;
     if !path.is_absolute() || path.components().any(|c| matches!(c, Component::ParentDir)) {
         return Err(AcmeError::Storage);
     }
     crate::web_capture_startup::reject_symlink(path).map_err(|_| AcmeError::Storage)?;
-    std::fs::DirBuilder::new()
-        .recursive(true)
-        .mode(0o700)
-        .create(path)
-        .map_err(|_| AcmeError::Storage)?;
+    create_missing_private(path)?;
     crate::web_capture_startup::reject_symlink(path).map_err(|_| AcmeError::Storage)?;
     let fd = rustix::fs::open(
         path,
@@ -57,6 +52,38 @@ pub fn private_dir(path: &Path) -> Result<(), AcmeError> {
         || stat.st_mode & 0o777 != 0o700
     {
         return Err(AcmeError::Storage);
+    }
+    Ok(())
+}
+
+/// Create every missing component of `path`, root first, each one 0700 by an
+/// explicit `fchmod` (never trusting the process umask) and owned by the
+/// effective user. Existing ancestors are left exactly as they are.
+fn create_missing_private(path: &Path) -> Result<(), AcmeError> {
+    use rustix::fs::{Mode, OFlags};
+    let mut missing: Vec<&Path> = path
+        .ancestors()
+        .take_while(|p| std::fs::symlink_metadata(p).is_err())
+        .collect();
+    missing.reverse();
+    for dir in missing {
+        match rustix::fs::mkdir(dir, Mode::from_raw_mode(0o700)) {
+            Ok(()) => {}
+            // Created concurrently: the leaf check in `private_dir` judges it.
+            Err(rustix::io::Errno::EXIST) => continue,
+            Err(_) => return Err(AcmeError::Storage),
+        }
+        let fd = rustix::fs::open(
+            dir,
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .map_err(|_| AcmeError::Storage)?;
+        let stat = rustix::fs::fstat(&fd).map_err(|_| AcmeError::Storage)?;
+        if stat.st_uid != rustix::process::geteuid().as_raw() {
+            return Err(AcmeError::Storage);
+        }
+        rustix::fs::fchmod(&fd, Mode::from_raw_mode(0o700)).map_err(|_| AcmeError::Storage)?;
     }
     Ok(())
 }
@@ -200,8 +227,6 @@ pub struct ActiveMeta {
 
 /// `active.pem` file name.
 pub const ACTIVE_PEM: &str = "active.pem";
-/// `active.json` file name.
-pub const ACTIVE_META: &str = "active.json";
 /// `pending-txt.json` file name.
 pub const LEDGER: &str = "pending-txt.json";
 
@@ -432,6 +457,27 @@ mod tests {
         assert!(read_private(&dir, "f.json").is_err());
         assert!(write_private(&dir, "../x", b"").is_err());
         assert!(write_private(&dir, ".hidden", b"").is_err());
+    }
+
+    #[test]
+    fn every_created_ancestor_is_0700_whatever_the_umask() {
+        let t = tempfile::tempdir().unwrap();
+        let old = rustix::process::umask(rustix::fs::Mode::from_raw_mode(0o022));
+        let leaf = t.path().join("var").join("lib").join("tls");
+        let result = private_dir(&leaf);
+        rustix::process::umask(old);
+        result.unwrap();
+        for dir in [
+            t.path().join("var"),
+            t.path().join("var").join("lib"),
+            leaf.clone(),
+        ] {
+            let mode = std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o700, "{}", dir.display());
+        }
+        // A pre-existing ancestor is left alone.
+        let mode = std::fs::metadata(t.path()).unwrap().permissions().mode() & 0o777;
+        assert_ne!(mode, 0, "tempdir untouched");
     }
 
     #[test]

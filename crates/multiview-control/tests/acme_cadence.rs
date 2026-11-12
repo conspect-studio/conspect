@@ -2,8 +2,9 @@
 //! realtime pacer, 25 fps) emits every tick on time while the `AcmeService`
 //! runs an order against (a) a "CA" that accepts TCP and never answers and
 //! (b) a CA port that refuses. The service reports `last_error` without
-//! blocking anything. Bounds are counts and generous wall-clock limits that
-//! hold on a loaded macOS runner (no percentiles).
+//! blocking anything. Bounds are counts and generous wall-clock limits (no
+//! percentiles) that fail closed: a stalled clock either repeats frames or
+//! overruns the wall budget. It runs in the `feature-clippy` `acme` leg.
 #![allow(
     clippy::unwrap_used,
     clippy::expect_used,
