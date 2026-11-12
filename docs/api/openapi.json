@@ -19210,6 +19210,7 @@
         "required": [
           "output",
           "video",
+          "configured_video",
           "audio",
           "effective_audio",
           "tally",
@@ -19220,9 +19221,13 @@
             "type": "object",
             "description": "The configured audio feed (`\"follow\"` unless set)."
           },
+          "configured_video": {
+            "type": "object",
+            "description": "The configured (persisted) video feed, redacted by the same rule. It\ndiffers from `video` after a refused start-up take or a fallback: the\noperator's intent is kept, Program is on air."
+          },
           "effective_audio": {
             "type": "object",
-            "description": "What the audio carries now: `\"program\"` (the program mix),\n`{\"source\": id}`, `\"preview_source\"`, or `{\"redacted\": true}`."
+            "description": "What the audio carries now (from the on-air feed): `\"program\"` (the program mix),\n`{\"source\": id}`, `\"preview_source\"`, or `{\"redacted\": true}`."
           },
           "output": {
             "type": "string",
@@ -19254,11 +19259,11 @@
           },
           "tally": {
             "$ref": "#/components/schemas/OutputTally",
-            "description": "Whether the feed follows the switcher (`program`) or is direct\n(`source`) or the preview bus — the tally distinction (§8)."
+            "description": "Whether the ON-AIR feed follows the switcher (`program`) or is direct\n(`source`) or the preview bus — the tally distinction (§8)."
           },
           "video": {
             "type": "object",
-            "description": "The configured video feed: `{\"bus\": \"program\"}`, `{\"source\": \"vt1\"}`,\nor `{\"redacted\": true}` when the caller may not read the feed."
+            "description": "The video feed ON AIR: the engine's live bus when it reports one for\nthis output, else the configured feed. `{\"bus\": \"program\"}`,\n`{\"source\": \"vt1\"}`, or `{\"redacted\": true}` when the caller may not\nread the feed."
           }
         }
       },

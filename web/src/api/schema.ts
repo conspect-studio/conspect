@@ -6320,7 +6320,13 @@ export interface components {
             /** @description The configured audio feed (`"follow"` unless set). */
             audio: Record<string, never>;
             /**
-             * @description What the audio carries now: `"program"` (the program mix),
+             * @description The configured (persisted) video feed, redacted by the same rule. It
+             *     differs from `video` after a refused start-up take or a fallback: the
+             *     operator's intent is kept, Program is on air.
+             */
+            configured_video: Record<string, never>;
+            /**
+             * @description What the audio carries now (from the on-air feed): `"program"` (the program mix),
              *     `{"source": id}`, `"preview_source"`, or `{"redacted": true}`.
              */
             effective_audio: Record<string, never>;
@@ -6338,13 +6344,15 @@ export interface components {
              */
             state: string;
             /**
-             * @description Whether the feed follows the switcher (`program`) or is direct
+             * @description Whether the ON-AIR feed follows the switcher (`program`) or is direct
              *     (`source`) or the preview bus — the tally distinction (§8).
              */
             tally: components["schemas"]["OutputTally"];
             /**
-             * @description The configured video feed: `{"bus": "program"}`, `{"source": "vt1"}`,
-             *     or `{"redacted": true}` when the caller may not read the feed.
+             * @description The video feed ON AIR: the engine's live bus when it reports one for
+             *     this output, else the configured feed. `{"bus": "program"}`,
+             *     `{"source": "vt1"}`, or `{"redacted": true}` when the caller may not
+             *     read the feed.
              */
             video: Record<string, never>;
         };

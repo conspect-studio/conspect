@@ -77,6 +77,7 @@ const ROUTE_ROWS = [
   {
     output: 'srt-main',
     video: { source: 'bars' },
+    configured_video: { source: 'bars' },
     audio: 'follow',
     effective_audio: { source: 'bars' },
     tally: 'direct',
