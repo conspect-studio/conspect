@@ -659,6 +659,20 @@ impl WhepEgress {
         Ok(())
     }
 
+    /// The ICE-validated remote address of every connected preview session
+    /// (bounded by the session count).
+    #[must_use]
+    pub fn validated_peers(&self) -> Vec<SocketAddr> {
+        self.sessions
+            .lock()
+            .map(|m| {
+                m.values()
+                    .filter_map(|e| e.session.as_ref().and_then(Session::validated_peer))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
     /// Drive every session's egress one step and return all outbound datagrams
     /// (paired with the destination the driver sends each to). The endpoint driver
     /// calls this on a tick / after a recv; a stalled session merely produces

@@ -373,6 +373,10 @@ pub mod webrtc_endpoint;
 #[cfg(feature = "webrtc-native")]
 pub mod webrtc_outputs;
 
+/// The network front door (ADR-0107 slice 1): one dual-stack UDP socket for
+/// MoQ and WebRTC, on its own runtime, when `[network]` is configured.
+pub mod frontdoor;
+
 /// The **single-socket** WebRTC orchestration (ADR-0048 §4): binds ONE shared
 /// dual-stack UDP socket and adopts every WebRTC role onto it — preview WHEP, WHIP
 /// ingest, WHEP-serve outputs, and `whip_push` outputs — fixing the box-validation

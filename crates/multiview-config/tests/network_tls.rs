@@ -44,7 +44,7 @@ fn custom_profile_round_trips_and_rejects_literal_credentials() {
     assert!(!serialized.contains("secret"));
     let mut invalid = network.clone();
     let Some(multiview_config::DnsProviderConfig::Cloudflare { token_env, .. }) =
-        invalid.tls.dns.as_mut()
+        invalid.tls.as_mut().expect("tls").dns.as_mut()
     else {
         panic!("cloudflare")
     };
@@ -55,7 +55,7 @@ fn custom_profile_round_trips_and_rejects_literal_credentials() {
         .to_string()
         .contains("network.tls.dns.token_env"));
     if let Some(multiview_config::DnsProviderConfig::Cloudflare { token_env, .. }) =
-        invalid.tls.dns.as_mut()
+        invalid.tls.as_mut().expect("tls").dns.as_mut()
     {
         *token_env = Some("Ab3kQ9x2Lm7Zr0Tq5Wv8Yc1Nd4Hs6Jf2Gp9Ke3Ru".into());
     }

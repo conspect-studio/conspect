@@ -27,6 +27,32 @@ impl MoqListenerConfig {
     pub fn from_env() -> Result<Option<Self>, MoqReject> {
         Self::from_values(|name| std::env::var(name).ok())
     }
+    /// [`from_env`](Self::from_env) for the shared front door (ADR-0107 slice
+    /// 1): `MULTIVIEW_MOQ_BIND` is not needed (`MoQ` rides the front-door socket);
+    /// when present it is ignored with a deprecation warning. `bind` is set to
+    /// the front door's address.
+    ///
+    /// # Errors
+    ///
+    /// As for [`from_env`](Self::from_env).
+    pub fn from_env_shared(front_door: SocketAddr) -> Result<Option<Self>, MoqReject> {
+        let get = |name: &str| std::env::var(name).ok();
+        if get("MULTIVIEW_MOQ_BIND").is_some() {
+            tracing::warn!(
+                front_door = %front_door,
+                "MULTIVIEW_MOQ_BIND is deprecated and ignored while [network] is configured:                  MoQ rides the front-door socket (ADR-0107); remove it"
+            );
+        }
+        let bind = front_door.to_string();
+        Self::from_values(|name| {
+            if name == "MULTIVIEW_MOQ_BIND" {
+                Some(bind.clone())
+            } else {
+                get(name)
+            }
+        })
+    }
+
     fn from_values(get: impl Fn(&str) -> Option<String>) -> Result<Option<Self>, MoqReject> {
         let Some(endpoint) = get("MULTIVIEW_MOQ_ENDPOINT") else {
             return Ok(None);
@@ -76,6 +102,35 @@ impl MoqListenerConfig {
             private_key,
         }))
     }
+}
+
+/// [`start`] on the shared front-door socket (ADR-0107 slice 1): the
+/// listener binds nothing; it serves `MoQ` from the front door's QUIC lane, on the
+/// front door's own runtime.
+///
+/// # Errors
+///
+/// As for [`start`].
+pub async fn start_shared(
+    config: MoqListenerConfig,
+    factory: Option<Arc<dyn AuthorizedFeedFactory>>,
+    on: multiview_moq::provider::SharedSocket,
+) -> Result<Arc<MoqRegistry>, MoqReject> {
+    let factory = factory.ok_or(MoqReject::Unavailable)?;
+    let runtime = multiview_moq::provider::Runtime::listen_files_on(
+        on,
+        config.endpoint,
+        &config.protocol,
+        config.certificate,
+        config.private_key,
+    )
+    .await
+    .map_err(|_| MoqReject::Unavailable)?;
+    Ok(Arc::new(MoqRegistry::new(
+        Arc::new(WebTransportProvider::new(runtime, factory)),
+        std::time::Duration::from_secs(30),
+        16,
+    )))
 }
 
 /// Start only with an actual authorized shared-rendition factory.

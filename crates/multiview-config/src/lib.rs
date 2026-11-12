@@ -455,7 +455,10 @@ pub struct MultiviewConfig {
     /// Network-path diagnostics (`[network_diagnostics]`, docs/io/iptv-org.md §3a).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub network_diagnostics: Option<NetworkDiagnosticsConfig>,
-    /// Front-door ACME certificate settings (listener wiring belongs to slice 4).
+    /// `[network]`: the single network front door (ADR-0107). Slice 1: absent
+    /// keeps the legacy listeners (WebRTC on `webrtc.udp_port`, `MoQ` on
+    /// `MULTIVIEW_MOQ_BIND`); present, one dual-stack UDP socket on
+    /// `network.https_port` carries both. Slice 5: the ACME settings.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub network: Option<NetworkConfig>,
     /// The management control-plane listener. When present, `multiview run`

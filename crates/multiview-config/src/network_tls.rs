@@ -7,14 +7,58 @@ use serde::{Deserialize, Serialize};
 
 use crate::ConfigError;
 
-/// The new front-door network section. Socket settings belong to the listener slice.
+/// Default `network.https_port`.
+pub const DEFAULT_HTTPS_PORT: u16 = 443;
+/// Default `network.workers`: OS threads of the front door's own runtime.
+pub const DEFAULT_WORKERS: u16 = 2;
+/// Most `network.workers` accepted.
+pub const MAX_WORKERS: u16 = 64;
+
+const fn default_workers() -> u16 {
+    DEFAULT_WORKERS
+}
+
+/// The front-door `[network]` section (ADR-0107).
+///
+/// Slice 1 (the shared UDP socket) reads `https_port`, `advertise` and
+/// `workers`; slice 5 (ACME) reads `public_host` and `tls`. `public_host` and
+/// `tls` come together: both or neither.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct NetworkConfig {
     /// Public DNS name or IP address for the front door.
-    pub public_host: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub public_host: Option<String>,
     /// ACME certificate settings, when issuance is configured.
-    pub tls: NetworkTlsConfig,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tls: Option<NetworkTlsConfig>,
+    /// The UDP port of the shared front-door socket (QUIC/MoQ and WebRTC),
+    /// bound dual-stack on `[::]`. **Setting it is what turns the slice-1 front
+    /// door on**; absent, `[network]` carries only ACME settings and the legacy
+    /// listeners stay as they are. Typically 443; a port below 1024 needs
+    /// `CAP_NET_BIND_SERVICE` (or systemd socket activation, a later slice).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub https_port: Option<u16>,
+    /// Public addresses for ICE host candidates (IP literals, IPv6 first). When
+    /// non-empty it replaces `webrtc.advertised_addresses`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub advertise: Vec<String>,
+    /// OS threads of the front door's own Tokio runtime. It never shares the
+    /// runtime that drives the output clock (invariant #1). Default 2.
+    #[serde(default = "default_workers")]
+    pub workers: u16,
+}
+
+impl Default for NetworkConfig {
+    fn default() -> Self {
+        Self {
+            public_host: None,
+            tls: None,
+            https_port: None,
+            advertise: Vec::new(),
+            workers: DEFAULT_WORKERS,
+        }
+    }
 }
 
 /// ACME authority selected as data, not a separate protocol implementation.
@@ -166,17 +210,63 @@ impl NetworkConfig {
     /// # Errors
     /// Returns a field-specific validation error on malformed configuration.
     pub fn validate(&self) -> Result<(), ConfigError> {
-        domain("public_host", &self.public_host, AcmeChallenge::TlsAlpn01)?;
-        self.tls.validate()?;
-        if !self
-            .tls
-            .domains
-            .iter()
-            .any(|name| name == &self.public_host)
-        {
-            return Err(fail("domains", "must include network.public_host"));
+        self.validate_socket()?;
+        match (&self.public_host, &self.tls) {
+            (None, None) => Ok(()),
+            (Some(public_host), Some(tls)) => {
+                domain("public_host", public_host, AcmeChallenge::TlsAlpn01)?;
+                tls.validate()?;
+                if !tls.domains.iter().any(|name| name == public_host) {
+                    return Err(fail("domains", "must include network.public_host"));
+                }
+                Ok(())
+            }
+            (Some(_), None) => Err(ConfigError::Validation(
+                "network.public_host is set without [network.tls]".to_owned(),
+            )),
+            (None, Some(_)) => Err(ConfigError::Validation(
+                "[network.tls] needs network.public_host".to_owned(),
+            )),
+        }
+    }
+
+    /// Validate the slice-1 socket keys (`https_port`, `workers`, `advertise`).
+    fn validate_socket(&self) -> Result<(), ConfigError> {
+        if self.https_port == Some(0) {
+            return Err(ConfigError::Validation(
+                "network.https_port must not be 0: the front door needs a stable port".to_owned(),
+            ));
+        }
+        if self.workers == 0 || self.workers > MAX_WORKERS {
+            return Err(ConfigError::Validation(format!(
+                "network.workers must be between 1 and {MAX_WORKERS}"
+            )));
+        }
+        for address in &self.advertise {
+            let ip: IpAddr = address.parse().map_err(|_| {
+                ConfigError::Validation(format!(
+                    "network.advertise entry {address:?} is not an IP literal"
+                ))
+            })?;
+            if ip.is_unspecified() {
+                return Err(ConfigError::Validation(format!(
+                    "network.advertise entry {address:?} is unspecified"
+                )));
+            }
         }
         Ok(())
+    }
+
+    /// The advertised IP literals, IPv6 first (ADR-0042).
+    #[must_use]
+    pub fn advertised_ips(&self) -> Vec<IpAddr> {
+        let mut ips: Vec<IpAddr> = self
+            .advertise
+            .iter()
+            .filter_map(|a| a.parse().ok())
+            .collect();
+        ips.sort_by_key(IpAddr::is_ipv4);
+        ips
     }
 }
 
@@ -411,5 +501,65 @@ impl NetworkTlsConfig {
             (AcmeChallenge::TlsAlpn01, None) => {}
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod socket_tests {
+    use super::*;
+
+    #[test]
+    fn a_socket_only_section_is_valid_and_defaults() {
+        let n: NetworkConfig = toml::from_str("").unwrap();
+        assert_eq!(n, NetworkConfig::default());
+        assert_eq!((n.https_port, n.workers), (None, 2));
+        n.validate().unwrap();
+        let n: NetworkConfig = toml::from_str(
+            "https_port = 8443\nadvertise = [\"203.0.113.10\", \"2001:db8::10\"]\nworkers = 3",
+        )
+        .unwrap();
+        n.validate().unwrap();
+        assert_eq!(
+            n.advertised_ips(),
+            vec![
+                "2001:db8::10".parse::<IpAddr>().unwrap(),
+                "203.0.113.10".parse().unwrap()
+            ]
+        );
+    }
+
+    #[test]
+    fn rejects_bad_socket_values_and_unknown_keys() {
+        for bad in [
+            "https_port = 0",
+            "workers = 0",
+            "workers = 65",
+            "advertise = [\"host.example\"]",
+            "advertise = [\"::\"]",
+        ] {
+            let n: NetworkConfig = toml::from_str(bad).unwrap();
+            assert!(n.validate().is_err(), "{bad}");
+        }
+        assert!(toml::from_str::<NetworkConfig>("bogus = 1").is_err());
+    }
+
+    #[test]
+    fn public_host_and_tls_come_together() {
+        let n: NetworkConfig = toml::from_str("public_host = \"a.example.org\"").unwrap();
+        assert!(n
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("network.tls"));
+        let n: NetworkConfig = toml::from_str(
+            "[tls]\nca = \"letsencrypt\"\nchallenge = \"tls-alpn-01\"\ndomains = [\"a.example.org\"]\nstate_dir = \"/var/lib/conspect/tls\"",
+        )
+        .unwrap();
+        assert!(n
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("public_host"));
     }
 }
