@@ -12,6 +12,9 @@ authors.workspace = true
 publish = false
 
 [dependencies]
+# The capture runtime inside is unix-only (process groups, openat-pinned
+# files); on other platforms only its portable request model is built and the
+# control plane reports capture unavailable.
 multiview-webengine = { path = "../multiview-webengine" }
 rustix = { version = "1", features = ["fs", "process"] }
 multiview-moq = { path = "../multiview-moq", optional = true }
@@ -246,6 +249,11 @@ tempfile = "3"
 # (the `tokio-rustls`/`reqwest`/`ring` posture already documented above).
 rustls = { version = "0.23", optional = true }
 rustls-pki-types = { version = "1", features = ["std"], optional = true }
+# Bootstrap and RFC 8737 challenge certificates; MIT/Apache-2.0, pure Rust.
+rcgen = { version = "0.14", optional = true }
+time = { version = "0.3", optional = true }
+
+
 
 [dev-dependencies]
 hang = "=0.21.22"
@@ -315,6 +323,8 @@ reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"
 # dev-dep covers the client config + danger verifier. Already in the lock (the
 # `cast` backend); `aws-lc-rs` provider to match the server's TLS material.
 tokio-rustls = "0.26"
+# Inspect RFC 8737 extension in the in-process TLS handshake; MIT/Apache-2.0.
+x509-parser = "0.18"
 
 [features]
 # External Chrome/FFmpeg proof runs in its required Linux CI leg.
@@ -406,7 +416,7 @@ moq-transport = ["dep:multiview-moq", "dep:url"]
 # aws-lc-rs crypto blob already in the lock (via the `cast`/`reqwest` backends),
 # LGPL-clean; kept out of the CI-green default build and the deny default graph (`[graph]
 # all-features = false`). Wired into the `multiview-cli` umbrella presets.
-"tls" = ["dep:rustls", "dep:rustls-pki-types", "dep:tokio-rustls"]
+"tls" = ["dep:rustls", "dep:rustls-pki-types", "dep:tokio-rustls", "dep:rcgen", "dep:time"]
 
 [[test]]
 # The TLS-0 serve e2e needs the rustls termination path compiled in.

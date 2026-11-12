@@ -1,3 +1,4 @@
+#![cfg(unix)]
 //! Queued capture service tests against fake producer executables (no browser).
 //! Orders and counts rely on confirmed statuses; timeouts are hang guards only.
 #![allow(

@@ -1,3 +1,4 @@
+#![cfg(unix)]
 use multiview_webengine::cdp_wire::{encode, Decoder, WireError};
 use serde_json::json;
 

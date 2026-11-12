@@ -199,6 +199,7 @@ impl ConfigDiff {
             discovery: running_discovery,
             catalogues: running_catalogues,
             network_diagnostics: running_network_diagnostics,
+            network: running_network,
             timing: running_timing,
             webrtc: running_webrtc,
             network: running_network,
@@ -235,6 +236,7 @@ impl ConfigDiff {
             discovery: next_discovery,
             catalogues: next_catalogues,
             network_diagnostics: next_network_diagnostics,
+            network: next_network,
             timing: next_timing,
             webrtc: next_webrtc,
             network: next_network,
@@ -326,6 +328,7 @@ impl ConfigDiff {
                 "network_diagnostics",
                 running_network_diagnostics != next_network_diagnostics,
             ),
+            ("network", running_network != next_network),
             ("timing", running_timing != next_timing),
             ("webrtc", running_webrtc != next_webrtc),
             // The front door binds its socket and runtime once at boot.

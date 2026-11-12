@@ -47,6 +47,7 @@ pub mod media_fill;
 pub mod multicast;
 pub mod network;
 pub mod network_diagnostics;
+pub mod network_tls;
 pub mod origin;
 pub mod placement;
 pub mod playback;
@@ -110,6 +111,9 @@ pub use multicast::{
 };
 pub use network::NetworkConfig;
 pub use network_diagnostics::NetworkDiagnosticsConfig;
+pub use network_tls::{
+    AcmeChallenge, CertificateAuthority, DnsProviderConfig, NetworkConfig, NetworkTlsConfig,
+};
 pub use origin::{Origin, OriginParseError};
 pub use placement::{DevicePin, MigrationPolicy, PinVendor, PlacementConfig, PlacementWeights};
 pub use playback::{
@@ -452,6 +456,9 @@ pub struct MultiviewConfig {
     /// Network-path diagnostics (`[network_diagnostics]`, docs/io/iptv-org.md §3a).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub network_diagnostics: Option<NetworkDiagnosticsConfig>,
+    /// Front-door ACME certificate settings (listener wiring belongs to slice 4).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub network: Option<NetworkConfig>,
     /// The management control-plane listener. When present, `multiview run`
     /// serves the API + docs (+ web UI) alongside the engine; absent ⇒ headless.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -781,6 +788,9 @@ impl MultiviewConfig {
         }
         self.validate_api()?;
         self.validate_control()?;
+        if let Some(network) = &self.network {
+            network.validate()?;
+        }
         self.validate_webrtc()?;
         self.validate_system()?;
         self.validate_placement()?;

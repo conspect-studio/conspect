@@ -1,8 +1,19 @@
 //! Explicit integration fixture. Reads secrets on stdin; writes response only to
 //! a new private file. Never logs credentials. Caller owns cleanup by recorded UID.
+#[cfg(unix)]
 use multiview_cloudflare::{Client, Credential};
+#[cfg(unix)]
 use std::io::{Read, Write};
+#[cfg(unix)]
 use std::os::unix::fs::OpenOptionsExt;
+
+/// The fixture writes a 0600 file (unix permissions); other platforms refuse.
+#[cfg(not(unix))]
+fn main() {
+    std::process::exit(2);
+}
+
+#[cfg(unix)]
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut input = String::new();

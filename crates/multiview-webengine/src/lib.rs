@@ -74,13 +74,22 @@ pub use usage::{
     ResourceUsage, Sampler, CPU_CORES_CAP,
 };
 
-// Browser capture runtime and immutable artifact service.
+// Browser capture runtime and immutable artifact service. Unix only: it
+// relies on process groups, signals and openat-pinned private files.
+#[cfg(unix)]
 pub mod artifact;
 pub mod capture;
+#[cfg(unix)]
 pub mod cdp_wire;
+#[cfg(unix)]
 pub mod fetch;
+#[cfg(unix)]
 pub mod resource;
+#[cfg(unix)]
 pub mod runner;
+#[cfg(unix)]
 pub mod scheduler;
+#[cfg(unix)]
 pub mod service;
+#[cfg(unix)]
 pub mod service_journal;

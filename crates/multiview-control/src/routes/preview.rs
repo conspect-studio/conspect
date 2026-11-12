@@ -15,11 +15,87 @@ use axum::Json;
 use crate::auth::{Action, Principal};
 use crate::preview::{WhepReject, WhepScope};
 use crate::problem::{Problem, PROBLEM_JSON};
+use crate::source_demand::SourceDemandPhase;
 use crate::state::AppState;
 
 /// The JPEG quality used for preview stills (1–100): low enough to be cheap,
 /// high enough to be useful for monitoring.
 const PREVIEW_QUALITY: u8 = 70;
+
+/// Longest source `detail` echoed in a still problem, in characters. The engine's
+/// reason is a short operator-safe sentence; the cap keeps this response bounded
+/// whatever a future provider puts there.
+const STILL_DETAIL_MAX_CHARS: usize = 160;
+
+/// True for a Unicode **format** character (general category Cf): the bidi
+/// controls and zero-width marks that can reorder or hide the text around them in
+/// an operator's UI. Dropped from a detail rather than spaced.
+fn is_format_char(c: char) -> bool {
+    matches!(
+        c,
+        '\u{00AD}'                // soft hyphen
+        | '\u{061C}'              // Arabic letter mark
+        | '\u{180E}'              // Mongolian vowel separator
+        | '\u{200B}'..='\u{200F}' // zero-width space..right-to-left mark
+        | '\u{202A}'..='\u{202E}' // LRE..RLO (bidi embedding/override)
+        | '\u{2060}'..='\u{2064}' // word joiner..invisible plus
+        | '\u{2066}'..='\u{2069}' // LRI..PDI (bidi isolates)
+        | '\u{FEFF}'              // zero-width no-break space
+    )
+}
+
+/// A bounded, single-line, control-character-free copy of a source `detail`.
+/// The provider contract says a detail is operator-safe; this route does not
+/// trust even that with unbounded output. `None` when nothing survives.
+fn bounded_still_detail(raw: &str) -> Option<String> {
+    let flattened: String = raw
+        .chars()
+        .filter(|c| !is_format_char(*c))
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect();
+    let collapsed = flattened.split_whitespace().collect::<Vec<_>>().join(" ");
+    if collapsed.is_empty() {
+        return None;
+    }
+    if collapsed.chars().count() <= STILL_DETAIL_MAX_CHARS {
+        return Some(collapsed);
+    }
+    let mut truncated: String = collapsed.chars().take(STILL_DETAIL_MAX_CHARS).collect();
+    truncated.push('…');
+    Some(truncated)
+}
+
+/// The `503` problem for a still that has no frame, typed by source phase.
+///
+/// RFC 9457 with a stable `type` slug per phase so a client branches on the URI,
+/// never on prose: `source-failed`, `source-starting`, or `preview-not-served`
+/// (no demand bound / not started yet, and never a phase for an unknown id).
+/// The failed case carries the engine's bounded, operator-safe reason.
+fn still_unavailable_problem(phase: Option<SourceDemandPhase>, detail: Option<&str>) -> Problem {
+    match phase {
+        Some(SourceDemandPhase::Failed) => {
+            let problem = Problem::new(
+                503,
+                "source-failed",
+                "The source has no picture: it is failing",
+            );
+            match detail.and_then(bounded_still_detail) {
+                Some(detail) => problem.with_detail(detail),
+                None => problem,
+            }
+        }
+        Some(SourceDemandPhase::Idle | SourceDemandPhase::Starting) => Problem::new(
+            503,
+            "source-starting",
+            "The source is starting and has not produced a frame yet",
+        ),
+        Some(SourceDemandPhase::Ready) | None => Problem::new(
+            503,
+            "preview-not-served",
+            "No preview frame is available for this input",
+        ),
+    }
+}
 
 /// Build a `200 image/jpeg` response (no-store) for an encoded still.
 fn jpeg_response(bytes: Vec<u8>) -> Response {
@@ -104,7 +180,23 @@ pub(crate) async fn switcher_preview_jpeg(
 }
 
 /// `GET /api/v1/preview/inputs/{id}.jpg` — the latest frame of input `id`
-/// (role: read). `503` when the input is unknown or has produced no frame.
+/// (role: read). `503` with an RFC 9457 problem typed by source phase when the
+/// input is unknown or has produced no frame.
+#[cfg_attr(
+    feature = "openapi",
+    utoipa::path(
+        get,
+        path = "/api/v1/preview/inputs/{id}",
+        tag = "preview",
+        params(("id" = String, Path, description = "The input (source) id, optionally with the `.jpg` suffix the SPA appends.")),
+        responses(
+            (status = 200, description = "The newest frame of the input, `Cache-Control: no-store`.", content_type = "image/jpeg"),
+            (status = 401, description = "Missing or invalid credentials.", body = crate::problem::Problem),
+            (status = 403, description = "Authenticated but not authorized for this input (per-object scope).", body = crate::problem::Problem),
+            (status = 503, description = "No frame available. `type` is `/problems/source-failed`, `/problems/source-starting` or `/problems/preview-not-served`; `X-Multiview-Source-State` repeats the coarse phase.", body = crate::problem::Problem),
+        ),
+    )
+)]
 pub(crate) async fn input_jpeg(
     State(state): State<AppState>,
     principal: Principal,
@@ -124,22 +216,32 @@ pub(crate) async fn input_jpeg(
         return err.into_response();
     }
     // Polling a preview is a consumer: a short lease, extended by each poll,
-    // starts an idle source off-clock. Until its first frame this answers 503
-    // with `X-Multiview-Source-State: starting` so the UI can say so.
+    // starts an idle source off-clock.
     let phase = state
         .source_demand
         .as_ref()
         .and_then(|demand| demand.touch_preview(id));
+    // A source that holds a frame keeps serving it whatever its phase says.
     if let Some(bytes) = state.preview.input_jpeg(id, PREVIEW_QUALITY) {
         return jpeg_response(bytes);
     }
-    let mut response = StatusCode::SERVICE_UNAVAILABLE.into_response();
+    // No picture: say why. The phase and detail are read only AFTER the
+    // per-object authorization above, so a caller without access to this source
+    // gets its refusal and never a phase (BOLA).
+    let detail = if phase == Some(SourceDemandPhase::Failed) {
+        state
+            .source_demand
+            .as_ref()
+            .and_then(|demand| demand.status(id).detail)
+    } else {
+        None
+    };
+    let mut response = still_unavailable_problem(phase, detail.as_deref()).into_response();
     if let Some(phase) = phase {
         let token = match phase {
-            crate::source_demand::SourceDemandPhase::Idle
-            | crate::source_demand::SourceDemandPhase::Starting => "starting",
-            crate::source_demand::SourceDemandPhase::Ready => "ready",
-            crate::source_demand::SourceDemandPhase::Failed => "failed",
+            SourceDemandPhase::Idle | SourceDemandPhase::Starting => "starting",
+            SourceDemandPhase::Ready => "ready",
+            SourceDemandPhase::Failed => "failed",
         };
         response.headers_mut().insert(
             "x-multiview-source-state",

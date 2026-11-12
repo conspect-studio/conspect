@@ -52,6 +52,7 @@ async fn viewer_and_other_object_are_denied_before_provider_admission() {
         assert_eq!(r.status(), StatusCode::FORBIDDEN);
     }
 }
+#[cfg(unix)]
 #[test]
 fn symlink_root_is_rejected_at_startup() {
     let d = tempfile::tempdir().unwrap();
@@ -63,6 +64,7 @@ fn symlink_root_is_rejected_at_startup() {
     assert!(multiview_control::web_capture_startup::reject_symlink(&link).is_err());
     assert!(multiview_control::web_capture_startup::reject_symlink(&real.join("new")).is_ok());
 }
+#[cfg(unix)]
 #[test]
 fn ledger_replay_divergence_and_bounds() {
     use multiview_control::web_capture_store::{Ledger, Reserve};
