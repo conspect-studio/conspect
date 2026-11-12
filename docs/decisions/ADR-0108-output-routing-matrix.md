@@ -100,7 +100,9 @@ What is true on main f5f2230e (the full table with citations is in §1 of the no
 
 3. **A take moves the output's subscription at an IDR. It is a clean cut, never a restamp.**
    - **Destination exists** (another output already carries that picture bus with those settings):
-     **+0 encoders**. The engine forces an IDR on it at tick T and rebinds the output at window T.
+     **+0 encoders**. The engine rebinds the output at an IDR of that bus. It forces one only within a
+     per-encoded-bus floor: 500 ms when the caller may Write every subscriber, otherwise 2 s,
+     coalesced with the ADR-0049 PLI path. Else it waits for the next natural IDR, at most one GOP.
    - **Destination does not exist:** **+1 encoder**. The engine opens it off the clock on its own
      worker thread, starting at an absolute tick T0 (`starting_at(T0)`, added to
      `VideoRenditionEncoder` and the AAC state, which start at 0 today, `crates/multiview-output/src/sink.rs:604,1141-1159`). It
@@ -138,12 +140,20 @@ What is true on main f5f2230e (the full table with citations is in §1 of the no
    pulls each tick (every source is already a strip, mixed at gain 0 unless included). An output's
    audio subscription moves with its video, in the same rebind.
 
-   A spike measured the AAC decoder transient at a move: 97-919 samples into the splice frame, no
-   click step. So the destination is fed an equal-power crossfade from old to new over exactly the
-   tick before the move, `SampleClock::total_at(T) − total_at(T−1)` samples. When the destination
-   is shared with other outputs, the crossfade runs on a transient private encoded audio bus, which
-   the output leaves at the next IDR. `audio-routing` stays the source of gain, mute and
-   membership. The existing per-output `tracks` keep their meaning.
+   Audio moves on one **global AAC frame grid**: every encoded audio bus emits frames on multiples
+   of 1024 of the run's sample counter, and a live-opened bus starts on that grid. An output's
+   audio moves at the first grid boundary G at or after the video move (at most 21 ms later), so
+   there are no duplicated or missing samples. The boundary at G always joins two encodings of the
+   **same** signal:
+   - the output moves onto a private (CPU, transient) encoded audio bus fed the old audio up to G;
+   - it crossfades old to new from G over one tick, `SampleClock::total_at` exact, inside that
+     stream;
+   - if the destination is shared, the output moves on at the next grid boundary to the shared
+     bus, where the signal is identical, so other subscribers never hear the fade.
+   The rule is needed because a spike measured a decoder transient of 97-919 samples when two
+   different-content AAC streams are spliced. AudioSpecificConfig identity is checked at open.
+   `audio-routing` stays the source of gain, mute and membership. The existing per-output `tracks`
+   keep their meaning.
 
 6. **Layout-as-a-source (#243).**
    - An active layout canvas publishes into a `TileStore` named `layout:<id>`. Program and Preview
@@ -187,8 +197,13 @@ What is true on main f5f2230e (the full table with citations is in §1 of the no
    - A take that needs a new encoder is admitted against the probed free NVENC sessions minus the
      sessions the config's wall, WHEP and preview ladder need (3 on mda001; 12 per system on the
      current driver, so 7 remain for routed encoded buses), and `routing.max_encoders` (default 6).
+   - Lingering and live routed buses are attributed per principal: at most one linger besides its
+     subscriptions, and `routing.max_encoders_per_principal` (default 2) in total. Lingers close
+     first under pressure.
    - The plan states "+0 encoders" or "+1 encoder". The only refusal for this reason reads "This
-     output needs its own encoder and the GPU has no free encoder session (N of M in use)".
+     output needs its own encoder and the GPU has no free encoder session (N of M in use)" for
+     whole-system principals, and "No free encoder session for this output" for scoped principals,
+     which never see fleet counts or unreadable bus ids.
    - At most `routing.max_decode_escalations` (default 2) decode resizes are forced by routing.
    - In the default GPU-free build, aux canvases use the identity path or the ADR-0103 integer box
      scaler, never the CPU reference compositor (measured: not viable at full cadence).
@@ -244,8 +259,9 @@ Results (ffprobe and the run log):
     - the first packet after every move a keyframe;
     - 0 decode errors;
     - the decoded luma switched exactly at the move frame (209 → 210: 69 → 183).
-- **AAC move:** splicing two independent AAC streams at a frame boundary showed a decoder transient
-  97-919 samples into the frame, with no click step. Hence the one-tick pre-move crossfade.
+- **AAC move:** splicing two different-content AAC streams at a frame boundary showed a decoder
+  transient 97-919 samples into the frame, with no click step. Hence the global frame grid and the
+  same-signal boundary rule (decision 5).
 - **Not proven:**
   - A GPU aux compose beside Program on the RTX 4060 (a shared queue). That is a hard acceptance
     gate of slice 3; the CPU integer path is the fallback.
@@ -273,6 +289,7 @@ Results (ffprobe and the run log):
 | --- | --- |
 | Each routed layout as an ADR-0030 Program (its own clock) | No frame-aligned cut against Program, separate stamp sequences, and a second seed per feed. Kept for different cadence or size outputs only |
 | RT-13 restamp splicer | Not needed: all encoders share the tick counter, so DTS is already continuous across a move |
+| Forcing an IDR on a shared destination at every take | Gives other principals' outputs extra IDRs; bounded instead by the per-encoded-bus floor (decision 3) |
 | Switching the frames fed into an output's own encoder (round 1 of this ADR) | Outputs that share an encoder could not be routed on their own; an encoder per output defeats #7. Withdrawn after the operator's model |
 | Compose aux canvases on the clock task | Puts N extra composites on invariant #1's path (ADR-0103's rejected alternative) |
 | A tile pass-through for a single source | Breaks #6 (an extra scaler), #8 (a second colour conversion) and cadence conversion; the compositor already does all three in one pass |

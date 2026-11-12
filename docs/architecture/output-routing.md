@@ -418,9 +418,16 @@ nothing in a take blocks the bake consumer (§4.4).
 Tick T is the move tick (§4.5).
 
 1. **Destination ready.**
-   - If the encoded bus for `(new picture bus, the output's settings)` exists, the engine forces an
-     IDR on it at T. Its other subscribers see one extra IDR at T: the cost of sharing, a few
-     hundred kbit once.
+   - If the encoded bus for `(new picture bus, the output's settings)` exists, the move waits for
+     that bus's next IDR. It forces one only within the **per-encoded-bus force floor**:
+     - when the bus's other subscribers are all outputs the caller may Write, at most one forced IDR
+       per 500 ms;
+     - otherwise at most one forced IDR per 2 s, coalesced with the ADR-0049 viewer-join/PLI force
+       path (`crates/multiview-ffmpeg/src/encode.rs:208-216`) through one per-bus gate;
+     - when the floor is not met, the move happens at the next natural or already-due IDR, at most
+       one GOP later (2 s on mda001).
+
+     So no principal can make another principal's output carry more than one extra IDR per 2 s.
    - If it does not exist, the engine opens it **off the clock** (§4.3). It starts at an absolute
      tick T0 (§4.3) and moves the output at T = T0 + 1 or later, at a forced IDR. The spike moved
      at T0 + 10.
@@ -492,6 +499,15 @@ verified per protocol in the slice that ships it (§9). §4.6 proved the MPEG-TS
   dispatcher is extended and the carrier work (#144, #154-#156) stays separate.
 - **Linger and close.** An encoded bus whose last subscriber left closes after 10 s. Its worker gets
   EOF, flushes and joins, off the clock. A re-take within 10 s reuses it (+0 encoders).
+  - Every live and lingering bus is attributed to the principal whose take last subscribed an output
+    to it.
+  - A principal may hold at most **one** lingering bus besides its current subscriptions, and at
+    most `routing.max_encoders_per_principal` (default 2) routed buses in total. Its oldest linger
+    closes first.
+  - A re-take does not refresh the linger of a bus the principal has already left.
+  - Under admission pressure, 0-subscriber lingers close before any take is refused.
+
+  So round-robin takes cannot pin the encoder pool.
 - **Merging.** Two outputs that reach the same picture bus with the same settings are on the same
   encoded bus **by construction**: the key is the same, so there is nothing to merge and nothing to
   split.
@@ -615,8 +631,9 @@ Results:
 
   NVENC parameter-set identity and HLS/LL-HLS/FLV/MoQ consumers are verified in slice 1 on mda001
   (§9).
-- **AAC move** (scratch): see §5.2. The decoder transient spans 97-919 samples into the splice
-  frame, with no click step. Hence the pre-move crossfade.
+- **AAC move** (scratch): see §5.2. Two different-content streams spliced at a frame boundary
+  gave a decoder transient 97-919 samples into the splice frame, with no click step. Hence the
+  global frame grid and the same-signal boundary rule.
 - **The first spike used its own libx264 wrapper** (with `forced-idr=1`), not `VideoRenditionEncoder`.
   The forced-IDR plumbing is slice 1 work (§4.2 step 2). Its claims are limited to MPEG-TS/H.264.
 - **Not proven by the spike:** a GPU aux compose beside a GPU Program compose on the RTX 4060 (a
@@ -663,30 +680,71 @@ ticks, from:
 - **An output's audio subscription moves with its video**, in the same dispatcher rebind (§4.3),
   at the same window T.
 
-**Why audio needs one extra step.** Moving between two AAC streams at a frame boundary is a
-decoder transient. In the spike (scratch), two independent AAC encoders (ffmpeg `aac`, 128 kbit/s)
-were spliced at frame 100. The decoded output left the old signal 97 samples into the splice frame
-and matched the new stream only after 919 samples: one MDCT overlap of mixed content. No click step
-was measured (the largest sample step was 379, against 381 in steady signal), but it is not a
-clean cut.
+**Why audio needs its own rule.** Video moves at an IDR at tick T. Audio cannot move at the same
+instant, for two reasons.
 
-So the move is made **inaudible by construction**. From tick T−1, the destination encoded audio
-bus is fed a PCM crossfade from the old audio to the new one over one tick (§5.3). By the move tick
-T, the old and new streams are both carrying the new audio near the window boundary, and the
-overlap transient falls on matched content.
+**AAC frames do not align with ticks.** An AAC frame is 1024 samples; a tick is 1601 or 1602
+samples at 48 kHz and 30000/1001. A tick boundary and a frame boundary coincide only every 512
+ticks (17 s).
 
-- A destination encoded audio bus that is newly opened starts at sample origin `total_at(T0)`, not
-  0. `AudioState` starts at `audio_pts = 0` today (`crates/multiview-output/src/sink.rs:1141-1159`), so slice 1 adds
-  `starting_at(samples)`.
-- Its priming packet is dropped: the move happens at T ≥ T0 + 2, after priming. A primed packet
-  is the only negative-DTS packet the dispatcher admits, and only at stream start
-  (`crates/multiview-cli/src/rendition_dispatch.rs:146-157`).
-- Default config gives today's single program AAC encoder and today's samples.
+**Two encoders have two frame grids.** Each encoder's frame grid starts at its own origin
+(`audio_pts = 0` today, `crates/multiview-output/src/sink.rs:1141-1159`). Moving between two grids
+mid-frame would duplicate or drop up to 1023 samples, and audio PTS would step unevenly.
+
+**Rule 1: one global AAC frame grid.**
+
+- Every encoded audio bus emits frames on frame boundaries `n × 1024` of the run's one sample
+  counter (`SampleClock::total_at`).
+- A bus opened live starts at the first grid boundary at or after `total_at(T0)`, via
+  `starting_at(samples)` added to `AudioState`.
+- So every bus has the same frame boundaries and the same PTS for the same samples.
+- An output's audio moves at **grid boundary G**, the first frame boundary at or after
+  `total_at(T)`. That is at most 1023 samples (21 ms) after the video move.
+- Packets that start before G come from the old bus; packets from G come from the new one. The
+  sample count and audio PTS are continuous by construction.
+- The dispatcher's audio rebind keys on G, not on the video window.
+
+**Rule 2: the same signal on both sides of G.** AAC overlaps consecutive frames (MDCT). A decoder
+that receives frame G−1 from one encoder and frame G from another cancels the overlap cleanly only
+if both encoders were coding the same signal around G. The spike (scratch) spliced two independent
+AAC streams carrying different content: the decoded output was mixed from 97 to 919 samples into
+the splice frame (no click step: largest sample step 379, against 381 in steady signal). So:
+
+- **The output's audio moves onto a private encoded audio bus** for this take. It is fed the
+  **old** audio up to G, so the boundary at G joins two encodings of the same signal. From G it
+  crossfades old to new over one tick (§5.3), *inside that one stream*.
+- When the take's destination is a **shared** encoded audio bus (another output already carries
+  that audio with those settings), the private bus carries the new audio after the fade,
+  sample-identical to the shared bus. The output then moves again, at the next grid boundary after
+  the fade, from private to shared: the same signal, the same grid, so the boundary is clean. The
+  private bus then closes. Subscribers of the shared bus never hear the fade.
+- When no shared destination exists, the private bus simply becomes the output's new audio bus.
+
+The private bus must open early enough to be warm at G: it opens when the take is admitted, which
+is at least the video open time before T, so it has encoded several frames of the old audio before
+G.
+
+**Cost.** AAC is software (`aac`), not an NVENC session: a private bus costs about 2.7 % of one
+core while it exists (§5.2 cost line), at most a few seconds per take. It is never refused for
+encoder sessions. The plan shows it as `+1 audio encode (transient, CPU)`.
+
+**Config identity.** Encoded audio buses with the same AAC settings produce the same
+AudioSpecificConfig (profile, rate and channel layout). Slice 1 checks it byte for byte when a bus
+opens, and a mismatch is `encoder-format-mismatch` (§4.2 step 4), as for video. The muxer's audio
+init (FLV sequence header, fMP4 and MoQ init) is therefore unchanged by a move.
+
+**Priming.** A live-opened bus's priming packet is never delivered: an output moves to it at G,
+which is at least one frame after its first frame. A primed packet is the only negative-DTS
+packet the dispatcher admits, and only at stream start
+(`crates/multiview-cli/src/rendition_dispatch.rs:146-157`).
+
+Default config gives today's single program AAC encoder and today's samples. It also starts on the
+global grid, because today's encoder starts at sample 0.
 
 ### 5.3 Crossfade at a take
 
-When a take changes an output's audio feed, the destination encoded audio bus is fed, for the one
-tick T−1 before the move, a mix of old and new:
+When a take changes an output's audio feed, the output's private encoded audio bus (§5.2) carries
+the old audio up to grid boundary G, then a mix of old and new from G:
 
 ```text
 out = old · cos(θ) + new · sin(θ)
@@ -696,16 +754,10 @@ out = old · cos(θ) + new · sin(θ)
 tick, 1601 or 1602 samples at 48 kHz and 30000/1001, never a float. This is the equal-power envelope
 of `GainRamp` (`crates/multiview-audio/src/mixer.rs:35-109`) that ADR-0104 §4 uses for AUTO, applied per output.
 
-The ramp covers tick T−1, the tick before the video cut, and the move happens at T. So the new
-audio is fully in at the cut, sample-accurate against the tick.
+The ramp starts at G, at most 21 ms after the video cut, and lasts one tick of samples. It is
+sample-accurate on the global sample counter.
 
-**Where the encoded bus is shared:** if other outputs already subscribe to the destination, they
-must not hear a fade from someone else's old audio. In that case the crossfade runs on a private
-encoded bus opened for this take, which the output moves to at T; it moves on to the shared bus at
-the next IDR, where the audio is identical on both. The plan shows this as `+1 audio encoder
-(transient)`. Silence to a feed is a ramp up, and a feed to silence a ramp down,
-so there is no pop at either end. A take whose old and new audio feed are equal (for example
-switching between two layouts that both carry `program`) does nothing to the audio.
+**Where the encoded bus is shared:** the fade runs on the private bus only (§5.2), so other subscribers never hear it.
 
 ### 5.4 Lip-sync for one-tick-delayed feeds
 
@@ -924,8 +976,13 @@ affects:
 `route.output` events.
 
 - Outputs and cells the principal may not read are omitted.
-- A feed, a `decode_resizes` entry, a capacity `holders` entry or a `feed-cycle` path node the
-  principal may not read becomes `{"redacted": true}` or a count, never an id.
+- A feed, a `buses.picture` entry, a `decode_resizes` entry, a capacity `holders` entry or a
+  `feed-cycle` path node the principal may not read becomes `{"redacted": true}` or a count, never
+  an id.
+- Encoder-session occupancy (`"N of M in use"`) is shown only to whole-system principals
+  (`require_unscoped_for_whole_system`). A scoped principal gets its own cost (`+0` or `+1`
+  encoder) and a boolean `fits`. Its capacity refusal reads "No free encoder session for this
+  output", without counts.
 - `route.output` is delivered with `AuthzScope::Object(output)` (the same axis as the REST check).
 - Authorization runs before existence, as the existing routes do (`crates/multiview-control/src/routes/routing.rs:164-169`,
   `crates/multiview-control/src/routes/switcher.rs:288-289`). So an id the caller may not read gets 403 whether or not it exists.
@@ -934,12 +991,14 @@ affects:
 
 The engine takes at most one effective cut per output per tick, because the latest take wins at the
 drain (spike: about 20,000 takes caused 4 cuts and no clock effect). Forced IDRs are a bitrate cost,
-so the control plane limits takes to 2 per second **per output** (at most one forced IDR every
-500 ms per output) and 10 per second **per principal**.
+so the control plane limits takes to 2 per second **per output** and 10 per second **per
+principal**. Forced IDRs are limited **per encoded bus** (§4.2 step 1): one per 500 ms when only
+the caller's own outputs subscribe, otherwise one per 2 s, shared with the viewer-join/PLI path.
 
 `crates/multiview-ffmpeg/src/encode.rs:208-216` documents a caller-owned floor of at least 2 s for forced keyframes. That floor
 is for viewer-join and PLI requests. A take is an operator content cut and has its own floor: 500
-ms, enforced by the limiter and again at adoption. Each forced IDR costs one deep copy of the frame
+ms per encoded bus when the caller owns every subscriber, otherwise the same 2 s floor, enforced at
+adoption. Each forced IDR costs one deep copy of the frame
 (`crates/multiview-ffmpeg/src/encode.rs:310-318`), at most 2 per second per output. A take over either limit gets 429 with `Retry-After`. The existing per-IP limiter
 (`crates/multiview-control/src/limits.rs`) still applies first. Idempotency keys bound replays.
 
@@ -1181,9 +1240,10 @@ Also checked:
 - `follow` switches on the video tick;
 - the measured-age delay for layout-as-source (sample-exact at k = 1, ramped when k changes under
   injected aux lag);
-- AAC move: with the pre-move crossfade, no sample step above the steady-signal maximum, and the
-  new audio fully in at the move tick; a newly opened encoded audio bus starts at
-  `total_at(T0)`.
+- AAC move: audio PTS step constant (1024 samples per packet) across every move, including
+  private-to-shared; no duplicated or missing samples (sample-exact compare against the PCM fed);
+  no sample step above the steady-signal maximum; AudioSpecificConfig byte-identical;
+  every encoded audio bus's frame boundaries are multiples of 1024 on the global counter.
 
 **Chaos and soak** (owed by an invariant #1/#10 change; none may be skipped):
 
@@ -1193,7 +1253,12 @@ Also checked:
    run without routing (CI host); the ratio is checked on mda001.
 2. **Failing feeds:** routed sources die, reconnect and flap every 2 s during takes. Never a stale
    or black frame on a routed output: pixel-probe each frame against the expected feed.
-2b. **Ongoing authorization:**
+2b. **Cross-principal effects:**
+   - one principal flapping takes onto a bus that another principal's output subscribes to adds at
+     most one extra IDR per 2 s to that output;
+   - round-robin takes cannot hold more than the per-principal encoder cap;
+   - scoped principals never see session counts or unreadable bus ids.
+2c. **Ongoing authorization:**
    - a layout edit that adds an unreadable source to a routed layout, or to the current PVW/PGM
      layout, is refused (403 `routed-layout`);
    - a principal with Program scope but no Read on S cannot select a `layout:` that shows S onto
