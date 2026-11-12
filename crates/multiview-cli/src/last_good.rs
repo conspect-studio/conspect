@@ -10,14 +10,15 @@
 //! At start, when the accepted state fails start-up admission (the same
 //! `multiview_config::boot_admission` the control plane applies before it
 //! persists) or the pipeline build itself fails, the run:
-//! 1. logs the exact reason;
-//! 2. keeps the operator's rejected state on disk as
+//! 1. logs the exact reason. Nothing is written while deciding; only once the
+//!    engine has been BUILT from last-good does the run go on to:
+//! 2. keep the operator's rejected bytes on disk as
 //!    `.multiview/rejected/desired-<unix-ms>.json` (bounded: newest
 //!    [`MAX_REJECTED`] kept) — never silently discarded;
-//! 3. starts from `last-good.json`, which is ALSO restored as the accepted
+//! 3. start from `last-good.json`, which is ALSO restored as the accepted
 //!    state so the control plane, the stores and the next restart agree with
 //!    what the engine runs;
-//! 4. raises a latched `accepted-state-rejected` health warning naming what was
+//! 4. raise a latched `accepted-state-rejected` health warning naming what was
 //!    rejected, why, and where it was kept (the UI health banner and
 //!    `GET /api/v1/health` show it).
 //!
@@ -79,69 +80,91 @@ pub fn load_last_good(boot_path: &Path) -> Option<DesiredState> {
     }
 }
 
-/// Keep the rejected accepted state under `rejected/` (bounded) and restore the
-/// last-good envelope as the accepted state. Returns where the rejected copy
-/// was kept.
+/// Keep the rejected accepted-state bytes under `rejected/` (bounded) and
+/// restore the last-good envelope as the accepted state. Returns where the
+/// rejected copy was kept. Order: keep (durable) → restore (durable) → prune,
+/// so a crash at any point leaves the operator's bytes on disk.
 ///
 /// # Errors
 /// An I/O failure; the caller then refuses to start (never discards the
 /// operator's state without having kept it).
 pub fn quarantine_and_restore(
     boot_path: &Path,
+    rejected_text: &str,
     last_good: &DesiredState,
     now_ms: i64,
 ) -> Result<PathBuf, String> {
     let desired = desired_path_for(boot_path);
     let rejected_dir = state_dir_for(boot_path).join(REJECTED_DIR);
-    std::fs::create_dir_all(&rejected_dir)
-        .map_err(|e| format!("creating {}: {e}", rejected_dir.display()))?;
-    let text = std::fs::read_to_string(&desired)
-        .map_err(|e| format!("reading {}: {e}", desired.display()))?;
-    let mut kept = rejected_dir.join(format!("desired-{now_ms}.json"));
+    create_private_dir(&rejected_dir)?;
+    let mut kept = rejected_dir.join(format!("desired-{now_ms:013}.json"));
     let mut n = 1_u32;
     while kept.exists() {
-        kept = rejected_dir.join(format!("desired-{now_ms}-{n}.json"));
+        kept = rejected_dir.join(format!("desired-{now_ms:013}-{n}.json"));
         n = n.saturating_add(1);
     }
-    // Keep first (atomic, durable), THEN replace: a crash between the two
-    // leaves both the rejected state kept and the accepted file unchanged.
-    write_atomic(&kept, &text).map_err(|e| format!("keeping {}: {e}", kept.display()))?;
-    prune_rejected(&rejected_dir);
+    write_atomic(&kept, rejected_text).map_err(|e| format!("keeping {}: {e}", kept.display()))?;
     let json = serde_json::to_string(last_good)
         .map_err(|e| format!("serializing the last-good state: {e}"))?;
-    write_atomic(&desired, &json)
-        .map_err(|e| format!("restoring {} from last-good: {e}", desired.display()))?;
+    if let Err(e) = write_atomic(&desired, &json) {
+        // A directory-fsync failure AFTER the rename leaves the restore visible:
+        // the start proceeds (and warns) rather than refusing on a state that is
+        // already in place.
+        if std::fs::read_to_string(&desired).is_ok_and(|now| now == json) {
+            tracing::warn!(error = %e, "last-good restored, but the directory sync failed");
+        } else {
+            return Err(format!(
+                "restoring {} from last-good: {e}",
+                desired.display()
+            ));
+        }
+    }
+    prune_rejected(&rejected_dir, &kept);
     Ok(kept)
 }
 
-/// Keep only the newest [`MAX_REJECTED`] `desired-*.json` files.
-fn prune_rejected(dir: &Path) {
+/// The state directory's owner-only (0700) policy for the `rejected/` subdir.
+fn create_private_dir(dir: &Path) -> Result<(), String> {
+    std::fs::create_dir_all(dir).map_err(|e| format!("creating {}: {e}", dir.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
+            .map_err(|e| format!("securing {}: {e}", dir.display()))?;
+    }
+    Ok(())
+}
+
+/// Keep only the newest [`MAX_REJECTED`] `desired-*.json` files, ordered by
+/// file name (the zero-padded millisecond stamp), never removing `keep`.
+fn prune_rejected(dir: &Path, keep: &Path) {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
     };
-    let mut files: Vec<(std::time::SystemTime, PathBuf)> = entries
+    let mut files: Vec<PathBuf> = entries
         .filter_map(Result::ok)
-        .filter(|e| {
-            e.file_name().to_str().is_some_and(|n| {
+        .filter(|e| e.file_type().is_ok_and(|t| t.is_file()))
+        .map(|e| e.path())
+        .filter(|p| {
+            p.file_name().and_then(|n| n.to_str()).is_some_and(|n| {
                 n.starts_with("desired-")
                     && Path::new(n)
                         .extension()
                         .is_some_and(|ext| ext.eq_ignore_ascii_case("json"))
             })
         })
-        .filter_map(|e| Some((e.metadata().ok()?.modified().ok()?, e.path())))
         .collect();
     files.sort();
     let excess = files.len().saturating_sub(MAX_REJECTED);
-    for (_, path) in files.into_iter().take(excess) {
+    for path in files.into_iter().take(excess).filter(|p| p != keep) {
         if let Err(error) = std::fs::remove_file(&path) {
             tracing::warn!(path = %path.display(), %error, "could not prune a kept rejected state");
         }
     }
 }
 
-/// Record the accepted state the engine has now STARTED from as last-good: a
-/// byte copy of `desired.json`, written atomically. Call only after the first
+/// Record the accepted envelope the engine has now STARTED from as last-good,
+/// written atomically. Call only after the first
 /// tick was emitted, off the output clock (a blocking task). A missing accepted
 /// state (a run that never committed one) writes nothing.
 ///

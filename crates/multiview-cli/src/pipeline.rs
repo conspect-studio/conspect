@@ -1437,6 +1437,50 @@ segment_ms = 1000
 }
 
 #[cfg(test)]
+mod failed_build_release_tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+    use super::{retained_lifecycle_ids, Pipeline};
+    use multiview_config::MultiviewConfig;
+
+    /// #317 review (lens 3): a build that fails AFTER reserving live lifecycle
+    /// epochs releases them, so a fallback build in the same process starts
+    /// clean (no orphaned process-wide registry entries).
+    #[test]
+    fn a_failed_build_releases_its_live_lifecycle_registrations() {
+        let doc = r##"schema_version = 1
+[canvas]
+width = 64
+height = 64
+fps = "25/1"
+pixel_format = "nv12"
+background = "#000000"
+[canvas.color]
+profile = "sdr-bt709-limited"
+[layout]
+kind = "absolute"
+[[sources]]
+id = "failedbuild_cam"
+kind = "bars"
+[[cells]]
+id = "c"
+rect = { x = 0.0, y = 0.0, w = 1.0, h = 1.0 }
+[cells.source]
+input_id = "failedbuild_cam"
+[[outputs]]
+kind = "hls"
+path = "/tmp/failed-build-release.m3u8"
+codec = "mpeg2video"
+segment_ms = 1000
+"##;
+        let mut config = MultiviewConfig::load_from_toml(doc).expect("parses");
+        // No runnable output: the build reserves its sources, then fails.
+        config.outputs.clear();
+        assert!(Pipeline::build(&config).is_err(), "the build fails");
+        assert_eq!(retained_lifecycle_ids("failedbuild_"), (0, 0));
+    }
+}
+
+#[cfg(test)]
 mod output_feed_guard_tests {
     use super::ensure_outputs_carry_program;
     use multiview_config::MultiviewConfig;
@@ -2433,6 +2477,24 @@ impl Pipeline {
     // ingest plan per source, wires native captions, and assembles the outputs —
     // each step is in-scope and splitting it would only scatter the wiring.
     pub fn build(config: &MultiviewConfig) -> Result<Self, PipelineError> {
+        let built = Self::build_inner(config);
+        if built.is_err() {
+            // #317: a failed build may already have reserved live lifecycle
+            // epochs/anchor slots for its sources (process-wide registries). No
+            // run started, so no worker owns them: release them so a fallback
+            // build in the same process starts clean.
+            for source in &config.sources {
+                if live_lifecycle(&source.id) != 0 {
+                    remove_live_lifecycle(&source.id);
+                }
+            }
+        }
+        built
+    }
+
+    #[allow(clippy::too_many_lines)]
+    // reason: see `build`.
+    fn build_inner(config: &MultiviewConfig) -> Result<Self, PipelineError> {
         // Fail-closed (#103): an AES67 PCM-audio source in a non-`aes67` build is a
         // config this binary cannot honour — reject it clearly up front, never wire
         // it dark (the same contract as a `display` source/output in a non-

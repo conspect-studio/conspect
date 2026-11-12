@@ -17,17 +17,19 @@ outage that only a hand edit of `desired.json` could end.
 ## Decision
 
 1. **Last-good copy.** `.multiview/last-good.json` is a serialized copy of the accepted
-   envelope the engine last *started* from. "Started" = the pipeline built **and** the
+   envelope the engine last *started* from (by definition: later commits during the run did
+   not start; each already passed the start-up admission rule before it was persisted, PR #318). "Started" = the pipeline built **and** the
    output clock emitted its first tick (the run's state slot sequence advanced). A
    control-plane task polls that wait-free counter (100 ms) and writes on the blocking pool
    with the shared atomic writer (tmp `O_EXCL` 0600 → fsync → rename → dir fsync). It never
    touches the clock; a run stopped before its first tick writes nothing.
 2. **Fallback at start.** If the accepted state fails start-up admission
    (`multiview_config::boot_admission`, the same rule the control plane enforces before it
-   persists) or cannot be read, or `Pipeline::build` fails on it while a *different*
+   persists) or does not parse/validate (an I/O error reading it is retried once and then fails as before:
+   a blip is never a rollback), or `Pipeline::build` fails on it while a *different*
    last-good exists, the run: logs the exact reason; proves the last-good state admits (and,
-   for a build failure, builds) **before** touching anything, so a global fault never moves
-   the operator's state; keeps the rejected `desired.json` as
+   for a build failure, builds) without writing anything; builds the engine from it; and only
+   then keeps the rejected `desired.json` as
    `.multiview/rejected/desired-<unix-ms>.json` (newest 5 kept); restores last-good as the
    accepted state (so control plane, stores and the next restart agree with what runs);
    starts; and raises the latched critical health warning `accepted-state-rejected` naming

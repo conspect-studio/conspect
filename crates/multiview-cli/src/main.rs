@@ -233,7 +233,7 @@ async fn run_run(args: RunArgs) -> anyhow::Result<ExitCode> {
         .map_err(|reason| anyhow::anyhow!(reason))?;
 
     if args.software {
-        return run_software(&start, &args).await;
+        return Box::pin(run_software(&start, &args)).await;
     }
 
     // Run-owned: retain across configuration parses and replacement pipelines.
@@ -255,15 +255,22 @@ async fn run_software(
     start: &multiview_cli::boot::StartConfig,
     args: &RunArgs,
 ) -> anyhow::Result<ExitCode> {
-    // The engine is built from the starting Running document (ADR-W024).
-    let config = &start.running;
     // Conspect entitlement plane (ADR-0050): assemble the shared lease store +
     // published ladder level from the environment, then gate the NEW engine build
     // (S1). A running engine is NEVER re-gated; this only refuses a *new* start at
     // the block-new-instance rung (the never-off-air promise).
     let plane = multiview_cli::licence::EntitlementPlane::from_env();
-    let mut engine =
-        SoftwareEngine::build_gated(config, plane.level()).map_err(|e| anyhow::anyhow!("{e}"))?;
+    // #317: build from the start decision; a build failure on the accepted
+    // state falls back to a different last-good that builds. Only AFTER a
+    // successful build is a planned fallback committed to disk.
+    let (start, mut engine) =
+        multiview_cli::boot::build_with_fallback(start.clone(), &args.config, |config| {
+            SoftwareEngine::build_gated(config, plane.level()).map_err(|e| e.to_string())
+        })
+        .map_err(anyhow::Error::msg)?;
+    let start =
+        multiview_cli::boot::commit_fallback(start, &args.config).map_err(anyhow::Error::msg)?;
+    let start = &start;
     let cadence = engine.cadence();
     let report = if let Some(ticks) = args.tick_budget(cadence) {
         tracing::info!(ticks, "software run: bounded");
@@ -302,24 +309,18 @@ async fn run_pipeline(
     // re-gated (the never-off-air promise).
     let plane = multiview_cli::licence::EntitlementPlane::from_env();
     multiview_cli::run::start_gate(plane.level()).map_err(|e| anyhow::anyhow!("{e}"))?;
-    // #317: a build that fails on the accepted state falls back to the last
-    // state that started (when it differs and itself builds) instead of dying.
-    let fallback_start;
-    let (start, built) = match Pipeline::build(&start.running) {
-        Ok(built) => (start, built),
-        Err(error) => {
-            let reason = format!("building the pipeline: {error}");
-            let (next, built) = multiview_cli::boot::fallback_after_build_failure(
-                start,
-                &args.config,
-                &reason,
-                |config| Pipeline::build(config).map_err(|e| e.to_string()),
-            )
-            .map_err(anyhow::Error::msg)?;
-            fallback_start = next;
-            (&fallback_start, built)
-        }
-    };
+    // #317: build from the start decision; a build failure on the accepted
+    // state falls back to a different last-good that builds. Only AFTER a
+    // successful build is a planned fallback committed to disk (the operator's
+    // state is never moved aside for a fault that breaks every state).
+    let (start, built) =
+        multiview_cli::boot::build_with_fallback(start.clone(), &args.config, |config| {
+            Pipeline::build(config).map_err(|e| format!("building the pipeline: {e}"))
+        })
+        .map_err(anyhow::Error::msg)?;
+    let start =
+        multiview_cli::boot::commit_fallback(start, &args.config).map_err(anyhow::Error::msg)?;
+    let start = &start;
     // Wire the wait-free tile-watermark signal (S3) into the pipeline's overlay
     // bake (a no-op without the `overlay` feature). The bake samples it off the
     // hot loop; it can never stall the output clock (invariant #1).

@@ -14,7 +14,9 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
-use multiview_cli::boot::{fallback_after_build_failure, resolve_start_config};
+use multiview_cli::boot::{
+    build_with_fallback, commit_fallback, resolve_start_config, StartConfig,
+};
 use multiview_cli::last_good::{last_good_path_for, spawn_recorder, MAX_REJECTED, REJECTED_DIR};
 use multiview_config::{MultiviewConfig, StartMode};
 use multiview_control::{boot_model::BootModel, command_bus, AppState, EngineStateSnapshot};
@@ -137,6 +139,13 @@ fn make_six_cell(path: &Path) {
     std::fs::write(&file, document.to_string()).unwrap();
 }
 
+/// What `multiview run` does with a build that succeeds: decide, build, commit.
+fn start_ok(boot: MultiviewConfig, path: &Path) -> Result<StartConfig, String> {
+    let start = resolve_start_config(boot, BOOT.to_owned(), path)?;
+    let (start, ()) = build_with_fallback(start, path, |_| Ok(()))?;
+    commit_fallback(start, path)
+}
+
 fn rejected_files(path: &Path) -> Vec<PathBuf> {
     let dir = path.parent().unwrap().join(".multiview").join(REJECTED_DIR);
     let mut files: Vec<_> = std::fs::read_dir(dir)
@@ -174,7 +183,16 @@ async fn non_bootable_saved_state_with_last_good_starts_from_last_good_and_keeps
     make_six_cell(&path);
     let rejected_bytes = std::fs::read(desired(&path)).unwrap();
 
-    let start = resolve_start_config(boot, BOOT.to_owned(), &path).expect("falls back, starts");
+    // Deciding writes nothing; the swap happens only after the build.
+    let planned = resolve_start_config(boot.clone(), BOOT.to_owned(), &path).unwrap();
+    assert!(planned.pending_fallback.is_some());
+    assert_eq!(
+        std::fs::read(desired(&path)).unwrap(),
+        rejected_bytes,
+        "not yet moved"
+    );
+    assert_eq!(rejected_files(&path).len(), 0);
+    let start = start_ok(boot, &path).expect("falls back, starts");
     assert_eq!(start.running.cells.len(), 1, "started from last-good");
     multiview_config::boot_admission(&start.running).expect("the started state boots");
     let fallback = start.boot_fallback.clone().expect("fallback recorded");
@@ -195,12 +213,7 @@ async fn non_bootable_saved_state_with_last_good_starts_from_last_good_and_keeps
         .unwrap()
         .unwrap();
     assert_eq!(restored.config.cells.len(), 1);
-    let again = resolve_start_config(
-        MultiviewConfig::load_from_toml(BOOT).unwrap(),
-        BOOT.to_owned(),
-        &path,
-    )
-    .unwrap();
+    let again = start_ok(MultiviewConfig::load_from_toml(BOOT).unwrap(), &path).unwrap();
     assert!(again.boot_fallback.is_none(), "the next start is clean");
 
     // The alarm: a latched, critical health warning naming reason and file.
@@ -227,7 +240,7 @@ async fn non_bootable_saved_state_without_last_good_fails_with_the_clear_error()
     let (path, boot) = install(dir.path()).await;
     make_six_cell(&path);
     let before = std::fs::read(desired(&path)).unwrap();
-    let error = resolve_start_config(boot, BOOT.to_owned(), &path).expect_err("no fallback");
+    let error = start_ok(boot, &path).expect_err("no fallback");
     assert!(
         error.contains("accepted desired state cannot be resumed"),
         "{error}"
@@ -251,7 +264,7 @@ async fn a_build_failure_falls_back_only_when_last_good_differs_and_builds() {
     mark_started(&path).await;
     // Same state as last-good: nothing different to fall back to.
     let start = resolve_start_config(boot.clone(), BOOT.to_owned(), &path).unwrap();
-    let same = fallback_after_build_failure(&start, &path, "encoder missing", |_| Ok(()));
+    let same = build_with_fallback(start, &path, |_| Err::<(), _>("encoder missing".into()));
     assert_eq!(same.unwrap_err(), "encoder missing");
     // A different (admissible) accepted state whose build fails.
     let file = desired(&path);
@@ -260,20 +273,71 @@ async fn a_build_failure_falls_back_only_when_last_good_differs_and_builds() {
         .replace("\"preview_source\":\"in_b\"", "\"preview_source\":\"in_a\"");
     std::fs::write(&file, &text).unwrap();
     let start = resolve_start_config(boot.clone(), BOOT.to_owned(), &path).unwrap();
-    assert!(start.boot_fallback.is_none());
-    // The last-good build ALSO fails (an environment fault): the accepted state is
-    // NOT moved aside.
-    let both = fallback_after_build_failure(&start, &path, "boom", |_| Err::<(), _>("boom".into()));
+    assert!(start.pending_fallback.is_none());
+    // The last-good build ALSO fails (an environment fault): nothing moves.
+    let both = build_with_fallback(start.clone(), &path, |_| Err::<(), _>("boom".into()));
     assert!(both.unwrap_err().contains("does not build either"));
     assert_eq!(
         rejected_files(&path).len(),
         0,
         "never quarantined on a global fault"
     );
-    // The last-good build succeeds: fall back.
-    let (next, ()) = fallback_after_build_failure(&start, &path, "boom", |_| Ok(())).unwrap();
+    assert_eq!(
+        std::fs::read_to_string(&file).unwrap(),
+        text,
+        "accepted state untouched"
+    );
+    // Only the accepted build fails: fall back, and commit after the build.
+    let accepted_cells = start.running.switcher.clone();
+    let (next, ()) = build_with_fallback(start, &path, |config| {
+        if config.switcher == accepted_cells {
+            Err("boom".into())
+        } else {
+            Ok(())
+        }
+    })
+    .unwrap();
+    assert_eq!(rejected_files(&path).len(), 0, "decided, not yet committed");
+    let next = commit_fallback(next, &path).unwrap();
     assert!(next.boot_fallback.unwrap().reason.contains("boom"));
     assert_eq!(rejected_files(&path).len(), 1);
+    assert_eq!(
+        std::fs::read_to_string(&rejected_files(&path)[0]).unwrap(),
+        text
+    );
+}
+
+/// Review (lens 1, high): an admission failure whose last-good then fails to
+/// BUILD (a global fault) must not move the operator's state aside.
+#[tokio::test]
+async fn admission_fallback_whose_build_fails_moves_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, boot) = install(dir.path()).await;
+    mark_started(&path).await;
+    make_six_cell(&path);
+    let before = std::fs::read(desired(&path)).unwrap();
+    let start = resolve_start_config(boot, BOOT.to_owned(), &path).unwrap();
+    let failed = build_with_fallback(start, &path, |_| Err::<(), _>("encoder missing".into()));
+    assert!(failed.unwrap_err().contains("does not build either"));
+    assert_eq!(std::fs::read(desired(&path)).unwrap(), before, "untouched");
+    assert_eq!(rejected_files(&path).len(), 0);
+}
+
+/// Review (lens 1, high): an unreadable accepted state (an I/O error) is not
+/// evidence it is bad: fail as before, never roll back over it.
+#[cfg(unix)]
+#[tokio::test]
+async fn an_unreadable_accepted_state_does_not_roll_back() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, boot) = install(dir.path()).await;
+    mark_started(&path).await;
+    // A directory where the file should be: read_to_string fails with an I/O
+    // error that is not NotFound.
+    std::fs::remove_file(desired(&path)).unwrap();
+    std::fs::create_dir(desired(&path)).unwrap();
+    let error = start_ok(boot, &path).expect_err("fails, does not fall back");
+    assert!(error.contains("cannot be read"), "{error}");
+    assert_eq!(rejected_files(&path).len(), 0);
 }
 
 #[tokio::test]
@@ -283,7 +347,7 @@ async fn kept_rejected_states_are_bounded() {
     mark_started(&path).await;
     for _ in 0..(MAX_REJECTED + 3) {
         make_six_cell(&path);
-        resolve_start_config(boot.clone(), BOOT.to_owned(), &path).unwrap();
+        start_ok(boot.clone(), &path).unwrap();
     }
     assert_eq!(rejected_files(&path).len(), MAX_REJECTED);
 }
@@ -324,4 +388,93 @@ async fn the_real_binary_restarts_from_last_good_and_fails_clearly_without_it() 
         String::from_utf8_lossy(&started.stderr)
     );
     assert_eq!(rejected_files(&path).len(), 1, "the rejected state is kept");
+}
+
+/// Review (lens 3): the production tick signal — the engine publisher's
+/// state-slot sequence — drives the recorder: frozen → nothing written; one
+/// published state → written.
+#[tokio::test]
+async fn the_recorder_follows_the_engine_state_slot() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, _) = install(dir.path()).await;
+    let accepted = multiview_control::boot_model::load_desired(&path)
+        .unwrap()
+        .unwrap();
+    let publisher = Arc::new(EnginePublisher::<EngineStateSnapshot, Event>::new(8));
+    let stop = StopSignal::new();
+    let observed = Arc::clone(&publisher);
+    let task = spawn_recorder(
+        path.clone(),
+        accepted,
+        move || observed.state.sequence(),
+        stop.clone(),
+    );
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    assert!(
+        !last_good_path_for(&path).exists(),
+        "frozen clock: nothing written"
+    );
+    publisher.publish_state(serde_json::json!({"tick": 1}));
+    tokio::time::timeout(std::time::Duration::from_secs(5), task)
+        .await
+        .expect("recorder finishes after the first tick")
+        .unwrap();
+    assert!(last_good_path_for(&path).exists(), "first tick: written");
+}
+
+fn validate(path: &Path) -> (i32, String) {
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_multiview"))
+        .arg("validate")
+        .arg(path)
+        .output()
+        .expect("the multiview binary runs");
+    (
+        output.status.code().unwrap_or(-1),
+        String::from_utf8_lossy(&output.stdout).into_owned(),
+    )
+}
+
+/// Review (lens 2): `multiview validate` says WHICH outcome a start would have
+/// (fall back vs fail); both exit non-zero.
+#[tokio::test]
+async fn validate_distinguishes_fall_back_from_fail() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, _) = install(dir.path()).await;
+    make_six_cell(&path);
+    let (code, text) = validate(&path);
+    assert_ne!(code, 0, "{text}");
+    assert!(
+        text.contains("would refuse to start (no last-good copy"),
+        "{text}"
+    );
+
+    let dir = tempfile::tempdir().unwrap();
+    let (path, _) = install(dir.path()).await;
+    mark_started(&path).await;
+    make_six_cell(&path);
+    let (code, text) = validate(&path);
+    assert_ne!(code, 0, "{text}");
+    assert!(
+        text.contains("start from the last-good copy instead"),
+        "{text}"
+    );
+    assert!(!text.contains("would refuse to start"), "{text}");
+    assert!(
+        text.contains("multi-cell layouts are not replaced"),
+        "{text}"
+    );
+}
+
+/// Review (lens 2): the boot model names the fallback (`resume_fallback`).
+#[tokio::test]
+async fn the_boot_model_names_the_fallback() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, boot) = install(dir.path()).await;
+    mark_started(&path).await;
+    make_six_cell(&path);
+    let start = start_ok(boot, &path).unwrap();
+    let model = start.to_boot_model(&path);
+    assert!(model
+        .resume_fallback()
+        .is_some_and(|reason| reason.contains("started from the last configuration that ran")));
 }

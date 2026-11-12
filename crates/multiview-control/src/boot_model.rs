@@ -223,18 +223,26 @@ pub fn desired_path_for(boot_path: &Path) -> PathBuf {
 /// # Errors
 /// A malformed, unreadable or invalid record fails closed.
 pub fn load_desired_file(path: &Path) -> Result<Option<DesiredState>, String> {
-    let path = path.to_path_buf();
-    let text = match std::fs::read_to_string(&path) {
+    let text = match std::fs::read_to_string(path) {
         Ok(text) => text,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(e) => return Err(format!("reading {}: {e}", path.display())),
     };
+    parse_desired_text(&text, path).map(Some)
+}
+
+/// Parse and validate an accepted-state envelope already read from `path`
+/// (named in errors only).
+///
+/// # Errors
+/// A malformed or invalid record.
+pub fn parse_desired_text(text: &str, path: &Path) -> Result<DesiredState, String> {
     let desired: DesiredState =
-        serde_json::from_str(&text).map_err(|e| format!("parsing {}: {e}", path.display()))?;
+        serde_json::from_str(text).map_err(|e| format!("parsing {}: {e}", path.display()))?;
     desired
         .validate()
         .map_err(|e| format!("validating {}: {e}", path.display()))?;
-    Ok(Some(desired))
+    Ok(desired)
 }
 
 /// Stage an entire prospective desired document before publishing any stores,
