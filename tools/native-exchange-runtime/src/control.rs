@@ -12,11 +12,49 @@ use std::{
 
 pub type Slot = Arc<Mutex<(ReceiverRuntime, Output)>>;
 
+/// Gate for one receiver's grant worker. A cycle (root fetch, grant request,
+/// install) runs only while holding the gate's lock and only while it is open,
+/// so `close` returns only once no cycle is in flight and none can start. A
+/// caller that is about to cut a taker off (a withdrawal it sends itself)
+/// closes the gate FIRST, so no root or grant request of that worker can reach
+/// the authority after the cutoff was sent.
+#[derive(Default)]
+pub struct CycleGate {
+    open: AtomicBool,
+    cycle: Mutex<()>,
+}
+impl CycleGate {
+    pub fn new() -> Self {
+        Self {
+            open: AtomicBool::new(true),
+            cycle: Mutex::new(()),
+        }
+    }
+    /// Enter one cycle, or `None` once closed. Hold the guard for the cycle.
+    pub fn enter(&self) -> Option<std::sync::MutexGuard<'_, ()>> {
+        let guard = self.cycle.lock().unwrap_or_else(|e| e.into_inner());
+        self.open.load(Ordering::Acquire).then_some(guard)
+    }
+    /// Stop new cycles without waiting (a deny found by the worker itself).
+    pub fn shut(&self) {
+        self.open.store(false, Ordering::Release);
+    }
+    /// Stop new cycles and wait (bounded by one cycle) for one in flight.
+    pub fn close(&self) {
+        self.shut();
+        drop(self.cycle.lock().unwrap_or_else(|e| e.into_inner()));
+    }
+    pub fn is_open(&self) -> bool {
+        self.open.load(Ordering::Acquire)
+    }
+}
+
 /// A deny is sticky for the whole run. The watchdog does not wait for HTTP or decode.
 pub struct Coordinator {
     stop: Arc<AtomicBool>,
     denied: Arc<AtomicBool>,
     active: Arc<[AtomicBool; 2]>,
+    grants: Arc<[CycleGate; 2]>,
     workers: Vec<thread::JoinHandle<()>>,
     slots: Vec<Slot>,
 }
@@ -31,6 +69,7 @@ impl Coordinator {
         let stop = Arc::new(AtomicBool::new(false));
         let denied = Arc::new(AtomicBool::new(false));
         let active = Arc::new([AtomicBool::new(true), AtomicBool::new(true)]);
+        let grants = Arc::new([CycleGate::new(), CycleGate::new()]);
         let mut workers = Vec::new();
         let shutdown_slots = slots.clone();
         let booking = lease.clone();
@@ -106,10 +145,10 @@ impl Coordinator {
             }));
         }
         for i in 0..2 {
-            let (stop, denied, active, transport, booking, slot) = (
+            let (stop, denied, gates, transport, booking, slot) = (
                 stop.clone(),
                 denied.clone(),
-                active.clone(),
+                grants.clone(),
                 transport.clone(),
                 booking.clone(),
                 slots[i].clone(),
@@ -119,7 +158,11 @@ impl Coordinator {
                 let mut attempt_epoch = u64::MAX;
                 let mut attempts = 0;
                 while !stop.load(Ordering::Acquire) && !denied.load(Ordering::Acquire) {
-                    if Instant::now() >= due && active[i].load(Ordering::Acquire) {
+                    if Instant::now() >= due && gates[i].is_open() {
+                        // Hold the gate for the whole cycle; re-checked under it.
+                        let Some(_cycle) = gates[i].enter() else {
+                            continue;
+                        };
                         let epoch = crate::wall_ms() / 5000;
                         if epoch != attempt_epoch {
                             attempt_epoch = epoch;
@@ -152,7 +195,7 @@ impl Coordinator {
                                     .is_err()
                                 {
                                     let _ = receiver.deny(output);
-                                    active[i].store(false, Ordering::Release);
+                                    gates[i].shut();
                                 }
                             }
                             Err("grant near boundary") => {
@@ -174,7 +217,7 @@ impl Coordinator {
                                 let mut slot = slot.lock().unwrap();
                                 let (receiver, output) = &mut *slot;
                                 let _ = receiver.deny(output);
-                                active[i].store(false, Ordering::Release);
+                                gates[i].shut();
                             }
                         }
                     }
@@ -223,12 +266,21 @@ impl Coordinator {
             stop,
             denied,
             active,
+            grants,
             workers,
             slots: shutdown_slots,
         }
     }
     pub fn deactivate(&self, i: usize) {
         self.active[i].store(false, Ordering::Release);
+        self.grants[i].shut();
+    }
+    /// Stop receiver `i`'s grant worker and wait for a cycle in flight: after
+    /// this returns that worker sends no root or grant request. Call it BEFORE
+    /// sending a cutoff (withdrawal) that the worker must not outlive.
+    pub fn quiesce(&self, i: usize) {
+        self.deactivate(i);
+        self.grants[i].close();
     }
     pub fn healthy(&self) -> bool {
         !self.denied.load(Ordering::Acquire)
@@ -248,5 +300,47 @@ impl Drop for Coordinator {
             let mut slot = slot.lock().unwrap_or_else(|poison| poison.into_inner());
             slot.1.flush();
         }
+    }
+}
+
+#[cfg(test)]
+mod gate_tests {
+    use super::CycleGate;
+    use std::sync::{mpsc, Arc};
+    use std::time::Duration;
+    /// `close` waits for the cycle in flight and no cycle starts after it.
+    #[test]
+    fn close_waits_for_the_cycle_in_flight_and_blocks_new_ones() {
+        let gate = Arc::new(CycleGate::new());
+        let (entered, wait_entered) = mpsc::channel();
+        let (finish, wait_finish) = mpsc::channel::<()>();
+        let (done, wait_done) = mpsc::channel();
+        let worker = {
+            let gate = gate.clone();
+            std::thread::spawn(move || {
+                let guard = gate.enter().expect("open gate");
+                entered.send(()).unwrap();
+                wait_finish.recv().unwrap();
+                done.send("cycle finished").unwrap();
+                drop(guard);
+            })
+        };
+        wait_entered.recv().unwrap();
+        let closer = {
+            let gate = gate.clone();
+            std::thread::spawn(move || {
+                gate.close();
+                "closed"
+            })
+        };
+        // While the cycle is in flight, close has not returned.
+        std::thread::sleep(Duration::from_millis(50));
+        assert!(!closer.is_finished(), "close returned during a cycle");
+        assert!(!gate.is_open());
+        finish.send(()).unwrap();
+        assert_eq!(wait_done.recv().unwrap(), "cycle finished");
+        assert_eq!(closer.join().unwrap(), "closed");
+        worker.join().unwrap();
+        assert!(gate.enter().is_none(), "a cycle started after close");
     }
 }

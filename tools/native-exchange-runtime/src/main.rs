@@ -148,13 +148,54 @@ fn retry_late_grant<T>(deadline: u64, mut attempt: impl FnMut() -> Result<T>) ->
             Err("grant near boundary") if now() < deadline => {
                 std::thread::sleep(LATE_GRANT_SETTLE);
             }
-            // One retry only: the root fetch itself is admitted out of the epoch
-            // tail, so the retry is sent early in the new epoch.
-            Err(ROOT_EXPIRED_IN_TRANSIT) if !root_retried && now() < deadline => {
+            // One retry only, and it may start after the deadline. The root
+            // fetch runs only inside the mapping mint, which is BEFORE the
+            // marker and the fragment-handoff check; that check refuses a run
+            // with under 2 000 ms of A's window left (static reason), and A's
+            // boundary is probed only from the media loop once wall time >=
+            // expires_at. One retry lasts <= ATTEMPT_MAX_MS (2 751 ms: tail
+            // admission 1 751 + one 1 000 ms transport timeout). Worst case it
+            // starts at the deadline (booked + min(3 000, window - 3 000)):
+            // * 4 000 ms window: ends <= booked + 3 751 < expiry; the handoff
+            //   check then leaves < 2 000 ms and fails statically, as on main.
+            // * 10 000 ms window: ends <= booked + 5 751, leaving >= 4 249 ms.
+            // * 30 000 ms window: ends <= booked + 5 751, leaving >= 24 249 ms.
+            // Skipping it instead ended the run before the probe (D3 again).
+            Err(ROOT_EXPIRED_IN_TRANSIT) if !root_retried => {
                 root_retried = true;
             }
             other => return other,
         }
+    }
+}
+/// Install a receiver's first grant through the real `ReceiverRuntime::accept`.
+/// Exactly one accept error is timing: `Expired` for a grant whose epoch is
+/// already over at install time (the signature and identity checks passed, a
+/// stalled host let the epoch end between the grant check and this install).
+/// That one is "grant near boundary" and may be retried by `retry_late_grant`.
+/// Every other error is a refusal and fatal at once: `Denied` (bad signature,
+/// identity mismatch, a stale `.stage`/`.poison`/`.active` sibling, a held
+/// lock, a sticky durable deny), `Replay` (counter/epoch rollback), `Invalid`,
+/// and `Expired` for a grant of the CURRENT epoch (expired or near its end).
+fn accept_first_grant(
+    key: &ed25519_dalek::VerifyingKey,
+    binding: Binding,
+    grant: &[u8],
+    at: u64,
+    path: std::path::PathBuf,
+) -> Result<ReceiverRuntime> {
+    match ReceiverRuntime::accept(key, binding, grant, at, 0, path) {
+        Ok(receiver) => Ok(receiver),
+        Err(conspect_media_crypto::Error::Expired)
+            if grant
+                .get(144..152)
+                .and_then(|b| b.try_into().ok())
+                .map(u64::from_be_bytes)
+                .is_some_and(|epoch| epoch < at / 5000) =>
+        {
+            Err("grant near boundary")
+        }
+        Err(_) => Err("signed independent binding"),
     }
 }
 /// The startup publisher is built from the live current-epoch root. Like every
@@ -438,20 +479,13 @@ fn connected(
     for (i, b) in bindings.iter().enumerate() {
         let receiver = retry_late_grant(grant_deadline, || {
             let grant = state.grant(t, i)?;
-            match ReceiverRuntime::accept(
+            accept_first_grant(
                 &key,
                 *b,
                 &grant,
                 now(),
-                0,
                 durable.join(format!("receiver-{i}")),
-            ) {
-                Ok(receiver) => Ok(receiver),
-                // A valid grant whose epoch ended between its check and this
-                // install (a stalled host): timing, retried like a late grant.
-                Err(conspect_media_crypto::Error::Expired) => Err("grant near boundary"),
-                Err(_) => Err("signed independent binding"),
-            }
+            )
         })?;
         receivers.push(receiver);
     }
@@ -924,6 +958,12 @@ fn connected(
             match scenario {
                 "release" => state.booking_release(t, 0)?,
                 "withdraw" => {
+                    // A withdrawal cuts off BOTH takers and the publisher. Stop
+                    // both grant workers and wait out a cycle in flight first:
+                    // otherwise a worker that started its cycle earlier still
+                    // fetches a root after the withdrawal was acknowledged.
+                    control.quiesce(0);
+                    control.quiesce(1);
                     state.withdraw(t, m["scenario"]["storyId"].as_str().ok_or("storyId")?)?;
                     cutoff_at = now();
                 }
@@ -1091,6 +1131,242 @@ mod startup_grant_tests {
     fn root_overtaken_in_transit_is_retried_exactly_once() {
         let mut calls = 0;
         let r: Result<()> = retry_late_grant(now() + 60_000, || {
+            calls += 1;
+            Err(ROOT_EXPIRED_IN_TRANSIT)
+        });
+        assert_eq!((r, calls), (Err(ROOT_EXPIRED_IN_TRANSIT), 2));
+    }
+    struct Counter(u64);
+    impl conspect_media_crypto::CounterReservation for Counter {
+        fn reserve(
+            &mut self,
+            _: [u8; 16],
+            _: u64,
+            _: [u8; 16],
+            _: u32,
+        ) -> conspect_media_crypto::Result<u64> {
+            self.0 += 1;
+            Ok(self.0)
+        }
+    }
+    fn test_binding() -> Binding {
+        Binding {
+            booking: [1; 16],
+            taker: [2; 16],
+            feed: [9; 16],
+            version: [3; 16],
+            engine: [4; 16],
+            publisher: [5; 16],
+            generation: 0,
+            publisher_generation: 11,
+        }
+    }
+    /// A real MG02 grant signed for the epoch that holds `issued`.
+    fn signed_grant(signer: &ed25519_dalek::SigningKey, b: Binding, issued: u64) -> Vec<u8> {
+        signed_grant_until(signer, b, issued, (issued / 5000 + 1) * 5000)
+    }
+    fn signed_grant_until(
+        signer: &ed25519_dalek::SigningKey,
+        b: Binding,
+        issued: u64,
+        expires: u64,
+    ) -> Vec<u8> {
+        let mut publisher = Publisher::new(
+            b.feed,
+            b.version,
+            b.publisher,
+            b.publisher_generation,
+            issued,
+            Box::new(Counter(0)),
+        )
+        .unwrap();
+        publisher.grant(signer, b, true, expires, issued).unwrap()
+    }
+    /// Review finding 1 of PR #312, through the REAL `ReceiverRuntime::accept`:
+    /// a refusal from accept is never retried. Only a grant whose epoch is over
+    /// at install time is timing ("grant near boundary").
+    #[test]
+    fn first_grant_accept_refusals_are_not_retried() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let signer = ed25519_dalek::SigningKey::from_bytes(&[42; 32]);
+        let key = signer.verifying_key();
+        let b = test_binding();
+        let issued = 100_000; // epoch 20 = [100 000, 105 000)
+        let grant = signed_grant(&signer, b, issued);
+        let attempt = |path: &str, key: &ed25519_dalek::VerifyingKey, b: Binding, at: u64| {
+            let mut calls = 0;
+            let r = retry_late_grant(now() + 60_000, || {
+                calls += 1;
+                accept_first_grant(key, b, &grant, at, dir.path().join(path)).map(|_| ())
+            });
+            (r, calls)
+        };
+        // Wrong verifying key (signature): Denied -> fatal, once.
+        let other = ed25519_dalek::SigningKey::from_bytes(&[7; 32]).verifying_key();
+        assert_eq!(
+            attempt("sig", &other, b, issued + 10),
+            (Err("signed independent binding"), 1)
+        );
+        // Identity mismatch: Denied -> fatal, once.
+        let mut wrong = b;
+        wrong.taker = [8; 16];
+        assert_eq!(
+            attempt("identity", &key, wrong, issued + 10),
+            (Err("signed independent binding"), 1)
+        );
+        // A stale crash sibling (.poison) next to the receiver state: Denied.
+        std::fs::write(dir.path().join("poisoned.poison"), b"").unwrap();
+        assert_eq!(
+            attempt("poisoned", &key, b, issued + 10),
+            (Err("signed independent binding"), 1)
+        );
+        // A sticky durable deny from an earlier run: Denied, never re-granted.
+        {
+            let mut r =
+                ReceiverRuntime::accept(&key, b, &grant, issued + 10, 0, dir.path().join("sticky"))
+                    .unwrap();
+            r.deny(&mut Output::default()).unwrap();
+        }
+        assert_eq!(
+            attempt("sticky", &key, b, issued + 10),
+            (Err("signed independent binding"), 1)
+        );
+        // A receiver whose durable epoch is ahead of the grant: Replay.
+        drop(
+            ReceiverRuntime::accept(
+                &key,
+                b,
+                &signed_grant(&signer, b, 105_000),
+                105_010,
+                0,
+                dir.path().join("rollback"),
+            )
+            .unwrap(),
+        );
+        assert_eq!(
+            attempt("rollback", &key, b, issued + 10),
+            (Err("signed independent binding"), 1)
+        );
+        // Expired, but in the CURRENT epoch (a grant that expires inside its
+        // epoch, installed after that expiry): not an epoch crossing, fatal.
+        let short = signed_grant_until(&signer, b, issued, issued + 1_000);
+        let mut calls = 0;
+        let r = retry_late_grant(now() + 60_000, || {
+            calls += 1;
+            accept_first_grant(&key, b, &short, issued + 2_000, dir.path().join("short"))
+                .map(|_| ())
+        });
+        assert_eq!((r, calls), (Err("signed independent binding"), 1));
+        // The one timing case: the grant's epoch ended before the install.
+        // Retried, each retry a new request (here: the same answer again, so
+        // it stays timing until the deadline). With a passed deadline: once.
+        let mut calls = 0;
+        let r = retry_late_grant(0, || {
+            calls += 1;
+            accept_first_grant(&key, b, &grant, 105_010, dir.path().join("late")).map(|_| ())
+        });
+        assert_eq!((r, calls), (Err("grant near boundary"), 1));
+        let mut calls = 0;
+        let r = retry_late_grant(now() + 60_000, || {
+            calls += 1;
+            let at = if calls == 1 { 105_010 } else { issued + 10 };
+            accept_first_grant(&key, b, &grant, at, dir.path().join("late")).map(|_| ())
+        });
+        assert_eq!((r, calls), (Ok(()), 2));
+    }
+    /// D2, deterministically and below the scenario: a taker whose parked
+    /// objects for a track ALL went stale ends the phase with zero accepted
+    /// bytes. The production drain (`drain_parked`) drops them as stale, the
+    /// decoder-input rule skips the empty buffer, and the real decoder is
+    /// never handed it. Handing it over is exactly what aborted the run before
+    /// the fix: FFmpeg rejects an empty input ("FFmpeg command failed").
+    #[test]
+    fn all_stale_parked_objects_give_an_empty_input_that_is_skipped_not_decoded() {
+        use conspect_native_exchange_runtime::media::{Fixture, ParkQueue};
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let signer = ed25519_dalek::SigningKey::from_bytes(&[42; 32]);
+        let b = test_binding();
+        // Objects sealed in epoch 20 while the grant for 20 was not accepted.
+        let mut publisher = Publisher::new(
+            b.feed,
+            b.version,
+            b.publisher,
+            b.publisher_generation,
+            100_000,
+            Box::new(Counter(0)),
+        )
+        .unwrap();
+        let mut queue = ParkQueue::new(256);
+        for n in 0..5u64 {
+            let id = conspect_media_crypto::ObjectId {
+                track: "video".into(),
+                group: n,
+                object: 0,
+                captured_ms: 100_050,
+            };
+            let wire = publisher.encrypt(&id, 100_100 + n, b"access unit").unwrap();
+            queue.park(Parked {
+                wire,
+                id,
+                track: 0,
+                n,
+            });
+        }
+        // The receiver's next accepted grant is for epoch 21: every parked
+        // epoch-20 object is behind it and can never open.
+        let receiver = ReceiverRuntime::accept(
+            &signer.verifying_key(),
+            b,
+            &signed_grant(&signer, b, 105_000),
+            105_010,
+            0,
+            dir.path().join("receiver"),
+        )
+        .unwrap();
+        let slot = Mutex::new((receiver, Output::default()));
+        let mut received = vec![Vec::new(); 6];
+        drain_parked(&slot, &mut queue, &mut received).unwrap();
+        assert_eq!((queue.stale, queue.drained, queue.len()), (5, 0, 0));
+        assert!(received[0].is_empty(), "no accepted bytes for the track");
+        let fixture = Fixture {
+            name: "video".into(),
+            format: "hevc",
+            packets: vec![],
+        };
+        // The cause: the real decoder fails on that empty input.
+        assert_eq!(
+            decode(dir.path(), &fixture, 1, &received[0]).unwrap_err(),
+            "FFmpeg command failed"
+        );
+        // The rule: the empty input is skipped and the decoder is not called.
+        let mut called = false;
+        let skipped = decoder_input(&received[0], |bytes| {
+            called = true;
+            decode(dir.path(), &fixture, 1, bytes)
+        })
+        .unwrap();
+        assert!(skipped.is_none() && !called);
+    }
+    /// Review finding 3 of PR #312: the single root retry is not skipped once
+    /// the startup deadline has passed (it is bounded by being single).
+    #[test]
+    fn root_retry_runs_once_even_after_the_deadline() {
+        let mut calls = 0;
+        let r: Result<u32> = retry_late_grant(0, || {
+            calls += 1;
+            if calls == 1 {
+                Err(ROOT_EXPIRED_IN_TRANSIT)
+            } else {
+                Ok(calls)
+            }
+        });
+        assert_eq!(r, Ok(2));
+        let mut calls = 0;
+        let r: Result<()> = retry_late_grant(0, || {
             calls += 1;
             Err(ROOT_EXPIRED_IN_TRANSIT)
         });

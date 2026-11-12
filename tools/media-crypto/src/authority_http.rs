@@ -1521,6 +1521,12 @@ impl AuthorityRootProvider for HttpAuthorityRootProvider {
             }
             _ => return Err(Error::Denied),
         };
+        // A fence that closed while the answer was in flight (release,
+        // revocation, withdrawal, lapsed deadline) is not timing: it is checked
+        // first, before any epoch check, and answered as `Denied`, so no caller
+        // can mistake it for an answer overtaken by the boundary and retry it.
+        let answered = (self.now_ms)()?;
+        LeaseFence::permit(lease.as_ref(), answered).ok_or(Error::Denied)?;
         let generation = self.parse_identity(&reply)?;
         if generation != expected_generation {
             return Err(Error::Replay);
@@ -1562,7 +1568,7 @@ impl AuthorityRootProvider for HttpAuthorityRootProvider {
         if after < observed || after >= end || after / EPOCH_MS != request.epoch {
             return Err(Error::Expired);
         }
-        LeaseFence::permit(lease.as_ref(), after).ok_or(Error::Expired)?;
+        LeaseFence::permit(lease.as_ref(), after).ok_or(Error::Denied)?;
         // The root's local expiry is never later than the lease the authority
         // actually honours, and never outside this epoch: the permit deadline
         // translated back into wall clock, clamped to the epoch end.

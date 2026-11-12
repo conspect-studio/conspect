@@ -31,6 +31,15 @@ fn release_command_invokes_tls_authority_media_receipts_and_cutoff() {
 fn withdraw_command_cuts_off_both_takers() {
     scenario("withdraw", false, false, "");
 }
+/// #313 / PR #312: no root request may reach the authority once the client has
+/// sent the withdrawal. The mock holds every root answer 900 ms, so a grant
+/// worker cycle is in flight most of the time, and asserts that none is in
+/// flight when the withdrawal arrives. A root that arrives after it is caught
+/// by the mock's "root fetched after the withdrawal" assertion.
+#[test]
+fn withdraw_with_slow_cutoff_answers_fetches_no_root_after_the_withdrawal() {
+    scenario("withdraw", false, false, "withdraw-held-cutoff");
+}
 #[test]
 fn exhaustion_command_uses_decoded_receipts() {
     scenario("exhaustion", false, false, "");
@@ -105,6 +114,15 @@ fn credit_cutoff_mapping_refusal_is_not_retried() {
 fn credit_cutoff_startup_root_in_epoch_tail_still_probes_the_paid_boundary() {
     scenario("credit-cutoff", false, false, "root-in-epoch-tail");
 }
+/// Decrements a root-in-flight counter once a held answer has been written.
+struct InFlight(Option<Arc<std::sync::atomic::AtomicU32>>);
+impl Drop for InFlight {
+    fn drop(&mut self) {
+        if let Some(count) = &self.0 {
+            count.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
+}
 fn scenario(scenario: &'static str, slow: bool, deny_renew: bool, variant: &'static str) {
     // Admit one six-stream FFmpeg/TLS fixture at a time. These wall-clock
     // integration scenarios have real five-second grants; eight concurrent
@@ -171,6 +189,9 @@ fn scenario(scenario: &'static str, slow: bool, deny_renew: bool, variant: &'sta
         let mut not_before_ms = 1u64;
         let mut first_root_phase: Option<u64> = None;
         let mut held_roots = 0u32;
+        // withdraw-held-cutoff: root requests answered-but-held, and withdrawals.
+        let roots_in_flight = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let mut withdrawals = 0u32;
         while !stopped.load(Ordering::SeqCst) {
             let (s, _) = match listener.accept() {
                 Ok(s) => s,
@@ -414,6 +435,12 @@ fn scenario(scenario: &'static str, slow: bool, deny_renew: bool, variant: &'sta
                 charged_totals[i] += 1;
                 json!({"sequence":body["sequence"],"chargedMicro":1,"chargedMicroTotal":charged_totals[i],"reservedMicro":10000,"stopReason":if scenario=="exhaustion"&&path.contains("org_a/"){Some("reservation_exhausted")}else{None}})
             } else if path.ends_with("/withdraw") {
+                assert_eq!(
+                    roots_in_flight.load(Ordering::SeqCst),
+                    0,
+                    "withdrawal sent while a root request was in flight"
+                );
+                withdrawals += 1;
                 denied = true;
                 json!({})
             } else if path.ends_with("/release") {
@@ -439,6 +466,7 @@ fn scenario(scenario: &'static str, slow: bool, deny_renew: bool, variant: &'sta
                 "application/json"
             };
             let mut hold_ms = 0u64;
+            let mut in_flight_guard: Option<Arc<std::sync::atomic::AtomicU32>> = None;
             if variant == "late-mapping-grant"
                 && mapping_grants == 1
                 && path.ends_with("/grants")
@@ -446,6 +474,16 @@ fn scenario(scenario: &'static str, slow: bool, deny_renew: bool, variant: &'sta
             {
                 hold_ms = 1500;
                 delayed_grants += 1;
+            }
+            if variant == "withdraw-held-cutoff" && path.contains("/current-epoch?") {
+                // Every root answer is held 900 ms (inside the 1 s transport
+                // timeout), so a grant-worker cycle is in flight most of the
+                // time. The withdrawal must never be sent while one is.
+                hold_ms = 900;
+                delayed_grants += 1;
+                let flight = roots_in_flight.clone();
+                flight.fetch_add(1, Ordering::SeqCst);
+                in_flight_guard = Some(flight);
             }
             if variant == "late-b-grants" && path.ends_with("/grants") && path.contains("org_b/") {
                 let phase = now() % 5000;
@@ -479,6 +517,7 @@ fn scenario(scenario: &'static str, slow: bool, deny_renew: bool, variant: &'sta
                     std::thread::sleep(std::time::Duration::from_millis(hold_ms));
                 }
                 let sent = (|| -> std::io::Result<()> {
+                    let _done = InFlight(in_flight_guard);
                     write!(tls,"HTTP/1.1 {status} OK\r\ncontent-type: {typ}\r\ncontent-length: {}\r\ncache-control: no-store, private\r\nconnection: close\r\n\r\n",bytes.len())?;
                     tls.write_all(&bytes)?;
                     tls.flush()
@@ -548,6 +587,11 @@ fn scenario(scenario: &'static str, slow: bool, deny_renew: bool, variant: &'sta
             assert!(boundary_denials > 0);
             assert_eq!(extensions[0].len(), 1);
             assert!(!extensions[1].is_empty(), "B must extend with 201");
+            assert!(receipts > 0);
+        } else if variant == "withdraw-held-cutoff" {
+            assert!(delayed_grants > 0, "the mock never held a root answer");
+            assert_eq!(withdrawals, 1, "the withdrawal was never sent");
+            assert!(denied);
             assert!(receipts > 0);
         } else if variant == "late-b-epoch" {
             assert!(delayed_grants > 0, "the mock never delayed a B grant");
@@ -705,9 +749,14 @@ fn scenario(scenario: &'static str, slow: bool, deny_renew: bool, variant: &'sta
         assert!(field("drained=") > 0, "no parked B object opened: {report}");
     }
     if variant == "late-b-epoch" {
-        // The unreachable pre-expiry epoch must have aged B's parked objects out
-        // of the replay window (the empty-decode precondition), and B must have
-        // decoded again afterwards: the run continued instead of aborting.
+        // What the mock decides, independent of where the client's phases fall:
+        // B had no obtainable grant for the held window, so its parked objects
+        // aged out of the replay window. That B decoded again afterwards is the
+        // client's own fatal `decode_evidence` check ("second receiver did not
+        // advance after paid expiry"), so a passing run proves it. Whether a
+        // phase ends with ZERO accepted bytes depends on phase alignment; that
+        // state (D2) is pinned deterministically one level down by the unit
+        // test `all_stale_parked_objects_give_an_empty_input_that_is_skipped_not_decoded`.
         let out = String::from_utf8_lossy(&output.stdout);
         let report = out
             .lines()
@@ -723,16 +772,6 @@ fn scenario(scenario: &'static str, slow: bool, deny_renew: bool, variant: &'sta
         assert!(
             field("stale=") > 0,
             "no parked B object went stale: {report}"
-        );
-        assert!(
-            field("drained=") > 0,
-            "no parked B object opened after the stale epoch: {report}"
-        );
-        // The stale epoch must actually have emptied a track: this is the state
-        // that used to be handed to the decoder and aborted the run.
-        assert!(
-            field("empty_decode_skips=") > 0,
-            "the stale epoch never emptied a track: {report}"
         );
     }
     if scenario == "withdraw" {

@@ -910,8 +910,9 @@ impl Bootstrap {
             now_ms: n,
         }) {
             Ok(_) => Ok(Value::Null),
-            // Retryable only while the lease still holds: an Expired caused by a
-            // lease fence that closed meanwhile (revocation, withdrawal) is fatal.
+            // A fence that closed while the answer was in flight is `Denied` in
+            // the provider (checked before any epoch check), so it is fatal
+            // here. The lease is still re-checked as defence in depth.
             // An answered refusal is `Denied` and a rollback `Replay` in the
             // provider before any epoch check, so delaying them cannot make them
             // retryable.
