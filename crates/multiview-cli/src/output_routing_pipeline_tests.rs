@@ -529,7 +529,7 @@ fn audio_follows_a_take_to_a_source_with_a_crossfade_through_the_real_pipeline()
     let before = span(1, 2048, g(to_bars.tick) - 1024);
     assert!(rms(&before) < 1e-3, "before the take: {}", rms(&before));
     let after = span(1, g(to_program.tick) + 4096, i64::MAX);
-    assert!(!after.is_empty());
+    assert!(after.len() > 1024, "audio after the return");
     assert!(rms(&after) < 1e-3, "after the return: {}", rms(&after));
     // The crossfade spans the samples from G: the tone rises inside the
     // tick after G, never before G.

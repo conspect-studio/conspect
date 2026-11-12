@@ -7682,7 +7682,7 @@ fn consumer_main<D: WindowDelivery>(
             // ADR-0108 §5.2: feed routed outputs' private audio buses from
             // this same tick's program block and per-source clean blocks
             // (no second store read). Never blocks; no take = no work.
-            {
+            if router.has_private_audio() {
                 #[cfg(not(feature = "overlay"))]
                 let feed_bus: &multiview_audio::program::ProgramBus = bus;
                 #[cfg(feature = "overlay")]

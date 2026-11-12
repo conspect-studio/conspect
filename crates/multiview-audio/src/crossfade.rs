@@ -198,7 +198,10 @@ mod tests {
         let tone = |hz: f32, amp: f32| -> Vec<f32> {
             (0..frames)
                 .flat_map(|i| {
-                    let v = amp * (std::f32::consts::TAU * hz * i as f32 / 48_000.0).sin();
+                    let v = amp
+                        * (std::f32::consts::TAU * hz * f32::from(u16::try_from(i).unwrap())
+                            / 48_000.0)
+                            .sin();
                     [v, v]
                 })
                 .collect::<Vec<f32>>()

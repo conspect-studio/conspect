@@ -643,6 +643,12 @@ impl OutputRouter {
         ));
     }
 
+    /// Whether any output has a private audio bus (no take = `false`, and
+    /// the consumer then does no routed-audio work at all).
+    pub(crate) fn has_private_audio(&self) -> bool {
+        self.audio.as_ref().is_some_and(|a| a.private_buses() > 0)
+    }
+
     /// Feed this tick's program block and per-source clean blocks to every
     /// private audio bus (bake consumer, right after the program bus ticked).
     /// Never blocks. A run without a take does nothing here.
