@@ -18,7 +18,8 @@ The older operator-managed certificate path is [control-plane-tls.md](control-pl
   * The ACME service starts on its own thread. A valid stored certificate (`active.pem`) is
     installed first, without contacting the CA. Otherwise issuance starts at once, with no UI step.
     While still in `setup`, the bootstrap certificate is rotated every 6 days.
-  * A one-time setup code is logged at `info`.
+  * A one-time setup code is printed on stderr (the service journal). It never goes through the
+    log ring, so `GET /api/v1/logs` cannot return it.
   * The output clock, inputs and outputs run in both states. Nothing on the clock path waits for
     the CA.
 * The `[control] listen` listener is the loopback admin listener. It is not gated, so the CLI
@@ -170,7 +171,7 @@ listen address is refused.
 
    ```text
    tls: front door in setup with a self-generated bootstrap certificate ... fingerprint=AB:CD:...
-   tls: one-time setup code ... setup_code=word word word word word word word word
+   multiview tls: one-time setup code (valid 1 h, single use): word word word word word word word word
    ```
 
 2. If the config holds everything (DNS-01 with the credential present, or TLS-ALPN-01 once slice 4

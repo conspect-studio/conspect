@@ -14,8 +14,8 @@
 //!    once; the bootstrap certificate is rotated every 6 days while in setup;
 //! 4. the alarm hook raises / clears the `tls-certificate` health warning
 //!    (the warning store the UI already shows under `GET /api/v1/health`);
-//! 5. a one-time setup code, logged at `info` (a code for this host's setup
-//!    page, not a CA credential).
+//! 5. a one-time setup code, printed on stderr only (the host's journal),
+//!    never through `tracing`, so it never reaches the `GET /api/v1/logs` ring.
 //!
 //! A missing credential is not a startup error: the engine stays in `setup`
 //! and `GET /api/v1/tls/status` names the missing variable.
@@ -291,9 +291,12 @@ impl TlsBoot {
         let handle = AcmeService::spawn(engine)?;
         let setup = Arc::new(SetupAuth::new());
         let code = setup.mint();
+        // The code goes to stderr (the host's journal) only, never through
+        // `tracing`: the log ring is served by `GET /api/v1/logs` to any Read
+        // principal, and the code must not leave the host by any route.
+        print_setup_code(&code);
         tracing::info!(
-            setup_code = %code,
-            "tls: one-time setup code for the certificate setup page (valid 1 h, single use; \
+            "tls: one-time setup code printed on stderr (valid 1 h, single use; \
              `multiview tls setup-code` mints a new one)"
         );
         let behind_proxy = false;
@@ -370,6 +373,13 @@ pub async fn wait_serving(
             }
         }
     }
+}
+
+/// Print the one-time setup code on stderr, bypassing `tracing` (and so the
+/// log ring that `GET /api/v1/logs` serves).
+#[allow(clippy::print_stderr)]
+fn print_setup_code(code: &str) {
+    eprintln!("multiview tls: one-time setup code (valid 1 h, single use): {code}");
 }
 
 #[cfg(test)]

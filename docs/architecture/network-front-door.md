@@ -426,7 +426,8 @@ Operator runbook: [acme-certificates.md](../runbooks/acme-certificates.md).
   * `AcmeService` starts. A stored valid certificate is installed first; otherwise issuance starts
     at once. The bootstrap certificate is rotated every 6 days on the service thread while in
     setup;
-  * a one-time setup code is logged at `info`.
+  * a one-time setup code is printed on stderr (journal) only, never through `tracing`, so the
+    `GET /api/v1/logs` ring never holds it.
 * The DNS provider re-reads its credential at the start of every attempt. A credential missing at
   boot keeps the engine in setup (`credential-missing: NAME` in the status reasons), and
   `multiview tls set-credential` + `issue` then completes without a restart.
