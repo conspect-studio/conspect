@@ -73,6 +73,18 @@ const ROUTING = {
 
 let deleted: { id: string; ifMatch: string | null } | undefined;
 
+const ROUTE_ROWS = [
+  {
+    output: 'srt-main',
+    video: { source: 'bars' },
+    audio: 'follow',
+    effective_audio: { source: 'bars' },
+    tally: 'direct',
+    state: 'on_air',
+    since_tick: 90,
+  },
+];
+
 const server = setupServer(
   http.get('*/api/v1/outputs', () => HttpResponse.json(OUTPUTS)),
   http.get('*/api/v1/outputs/:id', ({ params }) => {
@@ -85,6 +97,10 @@ const server = setupServer(
   http.get('*/api/v1/outputs/:id/playback', () =>
     HttpResponse.json({ urls: [] }),
   ),
+  // Output feed routing (ADR-0108 §8): the card's Video/Audio feed row.
+  http.get('*/api/v1/routing', () => HttpResponse.json({ outputs: ROUTE_ROWS })),
+  http.get('*/api/v1/sources', () => HttpResponse.json([])),
+  http.get('*/api/v1/media/players', () => HttpResponse.json([])),
   http.get('*/api/v1/devices', () => HttpResponse.json([])),
   http.get('*/api/v1/audio-routing', () =>
     HttpResponse.json(ROUTING, { headers: { ETag: 'W/"3"' } }),
@@ -437,5 +453,20 @@ describe('OutputsPage collision honesty (derived mounts)', () => {
     }
     // Only one playlist link exists, exactly as with the old table.
     expect(screen.getAllByRole('link', { name: 'Open HLS playlist' }).length).toBe(1);
+  });
+});
+
+describe('OutputsPage feed row (ADR-0108 §8)', () => {
+  it('shows each card its own live tally and follow audio from GET /routing', async () => {
+    renderOutputs();
+    const card = await screen.findByTestId('output-card-srt-main');
+    await waitFor(() => {
+      expect(within(card).getByTestId('output-tally')).toHaveTextContent('direct: bars');
+    });
+    expect(within(card).getByTestId('output-audio')).toHaveTextContent('Follow (bars)');
+    expect(within(card).getByLabelText(/Video feed for/)).toBeInTheDocument();
+    // An output without a readable row shows Unknown, never a guessed PGM.
+    const other = screen.getByTestId('output-card-out-rtsp');
+    expect(within(other).getByTestId('output-tally')).toHaveTextContent('Unknown');
   });
 });

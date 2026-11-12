@@ -18,8 +18,14 @@ const ROUTING = {
   selectable_tracks: ['prog', 'cam1-clean', 'commentary'],
 };
 
+const ROUTE_ROWS: unknown[] = [];
+
 const server = setupServer(
   http.get('*/api/v1/outputs', () => HttpResponse.json([])),
+  // Output feed routing (ADR-0108 §8): the card's Video/Audio feed row.
+  http.get('*/api/v1/routing', () => HttpResponse.json({ outputs: ROUTE_ROWS })),
+  http.get('*/api/v1/sources', () => HttpResponse.json([])),
+  http.get('*/api/v1/media/players', () => HttpResponse.json([])),
   http.get('*/api/v1/devices', () => HttpResponse.json([])),
   http.get('*/api/v1/audio-routing', () =>
     HttpResponse.json(ROUTING, { headers: { ETag: 'W/"3"' } }),

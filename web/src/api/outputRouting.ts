@@ -1,0 +1,138 @@
+// Output feed routing (ADR-0108 slice 1): plan / take an output's video feed
+// and read the routing state back.
+//   * `GET  /api/v1/routing` — per-output feed, tally and live readback.
+//   * `POST /api/v1/routing/plan` with `target.kind = "output"` — the cost
+//     (+0/+1 encoder, sessions only for whole-system principals) and typed
+//     refusals, without applying.
+//   * `POST /api/v1/routing/output/take` — `202 {operation_id, adopt}`; the
+//     terminal outcome arrives as the realtime `route.output` event.
+import { apiUrl, buildHeaders, OperationApiError, readProblem, sendCommand } from './operations';
+import type { RequestOptions } from './operations';
+import type { components } from './types';
+
+/** A slice-1 output video feed (externally tagged, never untagged). */
+export type OutputVideoFeed =
+  | { readonly bus: 'program' | 'preview' }
+  | { readonly source: string };
+
+/** One output's routing row (feeds are `{redacted: true}` when hidden). */
+export type OutputRouteState = components['schemas']['OutputRouteState'];
+/** The plan body for an output target. */
+export type OutputPlan = components['schemas']['OutputPlan'];
+/** The take's `202` body. */
+export type OutputTakeAccepted = components['schemas']['OutputTakeAccepted'];
+
+/** The `GET /routing` body. */
+export interface RoutingStateBody {
+  readonly outputs: readonly OutputRouteState[];
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null;
+}
+
+function isRoutingState(value: unknown): value is RoutingStateBody {
+  return (
+    isRecord(value) &&
+    Array.isArray(value.outputs) &&
+    value.outputs.every(
+      (row: unknown) => isRecord(row) && typeof row.output === 'string' && typeof row.tally === 'string',
+    )
+  );
+}
+
+function isOutputPlan(value: unknown): value is OutputPlan {
+  return (
+    isRecord(value) &&
+    typeof value.class === 'string' &&
+    isRecord(value.cost) &&
+    typeof value.cost.new_encoders === 'number' &&
+    typeof value.cost.fits === 'boolean' &&
+    Array.isArray(value.refusals) &&
+    value.refusals.every(
+      (r: unknown) => isRecord(r) && typeof r.type === 'string' && typeof r.detail === 'string',
+    )
+  );
+}
+
+function isTakeAccepted(value: unknown): value is OutputTakeAccepted {
+  return isRecord(value) && typeof value.operation_id === 'string' && typeof value.adopt === 'string';
+}
+
+function body(output: string, feed: OutputVideoFeed): Record<string, unknown> {
+  return { target: { kind: 'output', output, stream: 'video' }, feed };
+}
+
+/** Read the routing state (`GET /api/v1/routing`). */
+export async function getRoutingState(options: RequestOptions = {}): Promise<RoutingStateBody> {
+  const response = await fetch(apiUrl(options, '/api/v1/routing'), {
+    headers: buildHeaders(options, false),
+  });
+  if (!response.ok) throw await readProblem(response);
+  const json: unknown = await response.json();
+  if (!isRoutingState(json)) {
+    throw new OperationApiError('The server returned an unexpected routing state.');
+  }
+  return json;
+}
+
+/** Plan an output feed change (dry run). */
+export async function planOutputFeed(
+  output: string,
+  feed: OutputVideoFeed,
+  options: RequestOptions = {},
+): Promise<OutputPlan> {
+  const response = await fetch(apiUrl(options, '/api/v1/routing/plan'), {
+    method: 'POST',
+    headers: buildHeaders(options, true),
+    body: JSON.stringify(body(output, feed)),
+  });
+  if (!response.ok) throw await readProblem(response);
+  const json: unknown = await response.json();
+  if (!isOutputPlan(json)) {
+    throw new OperationApiError('The server returned an unexpected output plan.');
+  }
+  return json;
+}
+
+/** Take an output feed; resolves to the accepted body (not the outcome). */
+export async function takeOutputFeed(
+  output: string,
+  feed: OutputVideoFeed,
+  options: RequestOptions = {},
+): Promise<OutputTakeAccepted> {
+  const response = await sendCommand('/api/v1/routing/output/take', options, {
+    body: { ...body(output, feed), audio: 'follow' },
+  });
+  const json: unknown = await response.json();
+  if (!isTakeAccepted(json)) {
+    throw new OperationApiError('The server returned an unexpected take result.');
+  }
+  return json;
+}
+
+/** Whether a feed value is the redaction marker. */
+export function isRedacted(value: unknown): boolean {
+  return isRecord(value) && value.redacted === true;
+}
+
+/** The feed a routing row's `video` carries, or `undefined` if hidden/unknown. */
+export function feedOf(value: unknown): OutputVideoFeed | undefined {
+  if (!isRecord(value)) return undefined;
+  if (value.bus === 'program' || value.bus === 'preview') return { bus: value.bus };
+  if (typeof value.source === 'string') return { source: value.source };
+  return undefined;
+}
+
+/** The select value of a feed (`bus:program`, `src:<id>`). */
+export function feedKey(feed: OutputVideoFeed): string {
+  return 'bus' in feed ? `bus:${feed.bus}` : `src:${feed.source}`;
+}
+
+/** Parse a select value back into a feed. */
+export function feedFromKey(key: string): OutputVideoFeed | undefined {
+  if (key === 'bus:program') return { bus: 'program' };
+  if (key === 'bus:preview') return { bus: 'preview' };
+  if (key.startsWith('src:') && key.length > 4) return { source: key.slice(4) };
+  return undefined;
+}
