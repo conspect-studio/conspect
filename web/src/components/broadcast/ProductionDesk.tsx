@@ -80,7 +80,9 @@ const TILE_DETAIL_MAX_CHARS = 160;
  */
 function tileDetail(detail: string | null | undefined): string | undefined {
   if (!detail) return undefined;
-  const flat = detail.replace(/\s+/gu, ' ').trim();
+  // Drop Unicode format characters (bidi overrides, zero-width marks), turn any
+  // other control character into a space, then collapse: one bounded, plain line.
+  const flat = detail.replace(/\p{Cf}/gu, '').replace(/\p{Cc}/gu, ' ').replace(/\s+/gu, ' ').trim();
   if (!flat) return undefined;
   // Count code points, not UTF-16 units, so a truncation never splits a pair.
   const chars = Array.from(flat);
@@ -98,9 +100,11 @@ function SourcePicture({ id, demand }: { readonly id: string; readonly demand: S
   // Keeps the last good frame across failed polls; stale only after a bounded age (max(5 polls,10 s)).
   const wall = useWallSurface(id);
   const phase = demand?.phase;
-  // A failed source has no picture to fetch and its still route answers 503 every
-  // poll; the wall-geometry poll keeps its demand alive, so stop polling here.
-  const { url, state } = useJpegStill(`/api/v1/preview/inputs/${encodeURIComponent(id)}.jpg`, 2000, !wall.live && phase !== 'failed');
+  // Keep polling while the cell is not live — including a failed source: the poll
+  // holds its 5 s preview demand, and dropping it would lapse the lease and flip
+  // the tile to "Idle" (a scoped viewer, or a wall without that cell, has no other
+  // demand keeper). The route answers the typed problem instead of a frame.
+  const { url, state } = useJpegStill(`/api/v1/preview/inputs/${encodeURIComponent(id)}.jpg`, 2000, !wall.live);
   if (wall.live) return <WallCrop source={id} label={t`Source live preview`} className="bd-source-picture" />;
   const reason = tileDetail(demand?.detail);
   if (phase === 'failed') return <span role="status" className="bd-slate" data-testid="tile-failed"><span className="bd-slate-title"><Trans>No signal</Trans></span>{reason !== undefined ? <span className="bd-slate-detail" data-testid="tile-failed-detail">{reason}</span> : null}</span>;

@@ -131,9 +131,11 @@ as bounded plain text (never markup); a `starting` source — or an `idle` one
 something wants — says "Starting", over its last good frame when it has one; an
 `idle` source nothing wants says so; and a still keeps its "Stale frame" mark.
 The tile shares one polled `GET /api/v1/sources/status` query with the bus keys
-(3 s, paused while the tab is hidden), and stops polling the still of a `failed`
-source (its wall-geometry poll keeps the demand, and the route would only answer
-`503`).
+(3 s, paused while the tab is hidden). A `failed` tile keeps polling its still:
+that poll is what holds the source's 5 s preview demand — `/api/v1/preview/wall`
+renews it too, but only for a principal the wall is served to and a source it
+carries a cell for — so dropping the poll would lapse the lease and flip the tile
+to `Idle`.
 
 ### Owner hooks for later kinds (`multiview-engine/src/lifecycle.rs`)
 

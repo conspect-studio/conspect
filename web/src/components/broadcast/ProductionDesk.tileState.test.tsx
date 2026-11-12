@@ -96,7 +96,8 @@ const stillPath = (id: string): string => `/api/v1/preview/inputs/${id}.jpg`;
 describe('desk wall tile states', () => {
   it('states a failed source with a no-signal slate and the engine reason as literal text', async () => {
     server.use(http.get('*/api/v1/sources/status', () => HttpResponse.json([
-      demand('cam-c', 'failed', { detail: 'no media yet; still retrying — <b>not markup</b>' }),
+      // A bidi override and a zero-width space must not survive into the tile.
+      demand('cam-c', 'failed', { detail: 'no media yet; still retrying — <b>not markup</b>\u202E\u200B' }),
     ])));
     const { container } = page();
     const failed = await screen.findByTestId('tile-failed');
@@ -106,13 +107,12 @@ describe('desk wall tile states', () => {
     expect(detail).toHaveTextContent('no media yet; still retrying — <b>not markup</b>');
     // The reason is a text node: the markup is shown, not parsed.
     expect(detail.querySelector('b')).toBeNull();
+    expect(detail.textContent).not.toContain('\u202E');
+    expect(detail.textContent).not.toContain('\u200B');
     expect(container.querySelectorAll('.bd-wall-tile b')).toHaveLength(4);
-    // A failed source has no still to fetch: its poll is off (the wall poll keeps demand).
-    await vi.waitFor(() => {
-      const calls = stills.enabled.filter((c) => c.path === stillPath('cam-c'));
-      expect(calls.length).toBeGreaterThan(0);
-      expect(calls[calls.length - 1]?.enabled).toBe(false);
-    });
+    // A failed source keeps its still poll: that poll holds the 5 s preview
+    // demand, and dropping it would lapse the lease and flip the tile to idle.
+    expect(stills.enabled.filter((c) => c.path === stillPath('cam-c')).some((c) => c.enabled)).toBe(true);
   });
 
   it('bounds a long source reason without splitting a character', async () => {

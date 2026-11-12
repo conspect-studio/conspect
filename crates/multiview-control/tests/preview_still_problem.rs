@@ -16,6 +16,7 @@
 
 mod support;
 
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use axum::http::{header, StatusCode};
@@ -25,8 +26,12 @@ use multiview_control::{
 };
 use support::{body_json, get, harness_with, send, OPERATOR_TOKEN, SCOPED_TOKEN};
 
-/// The measured defect: the provider has no frame for any input.
-struct NoFramePreview;
+/// The measured defect: the provider has no frame for any input. It counts the
+/// still lookups so a test can prove authorization precedes the frame read.
+#[derive(Default)]
+struct NoFramePreview {
+    jpeg_calls: AtomicUsize,
+}
 
 impl PreviewProvider for NoFramePreview {
     fn program_jpeg(&self, _quality: u8) -> Option<Vec<u8>> {
@@ -34,6 +39,7 @@ impl PreviewProvider for NoFramePreview {
     }
 
     fn input_jpeg(&self, _id: &str, _quality: u8) -> Option<Vec<u8>> {
+        self.jpeg_calls.fetch_add(1, Ordering::SeqCst);
         None
     }
 
@@ -64,6 +70,9 @@ struct PhaseDemand {
     phase: SourceDemandPhase,
     detail: Option<String>,
     touched: Mutex<Vec<String>>,
+    /// Counts every state read (`status`/`active`) so the BOLA test can prove
+    /// authorization runs before any phase is consulted.
+    state_reads: AtomicUsize,
 }
 
 impl PhaseDemand {
@@ -72,12 +81,14 @@ impl PhaseDemand {
             phase,
             detail: detail.map(str::to_owned),
             touched: Mutex::new(Vec::new()),
+            state_reads: AtomicUsize::new(0),
         })
     }
 }
 
 impl SourceDemandProvider for PhaseDemand {
     fn status(&self, id: &str) -> SourceDemandView {
+        self.state_reads.fetch_add(1, Ordering::SeqCst);
         SourceDemandView {
             phase: self.phase,
             detail: self.detail.clone(),
@@ -124,7 +135,7 @@ async fn a_failed_source_still_is_a_typed_problem_with_its_reason() {
     let probe = Arc::clone(&demand);
     let h = harness_with(move |state| {
         state
-            .with_preview(Arc::new(NoFramePreview))
+            .with_preview(Arc::new(NoFramePreview::default()))
             .with_source_demand(demand)
     });
 
@@ -161,7 +172,7 @@ async fn starting_and_idle_sources_are_typed_starting_and_leak_no_detail() {
         let demand = PhaseDemand::new(phase, Some("internal reason"));
         let h = harness_with(move |state| {
             state
-                .with_preview(Arc::new(NoFramePreview))
+                .with_preview(Arc::new(NoFramePreview::default()))
                 .with_source_demand(demand)
         });
         let resp = send(
@@ -189,7 +200,7 @@ async fn a_ready_source_without_a_frame_is_not_served() {
     let demand = PhaseDemand::new(SourceDemandPhase::Ready, None);
     let h = harness_with(move |state| {
         state
-            .with_preview(Arc::new(NoFramePreview))
+            .with_preview(Arc::new(NoFramePreview::default()))
             .with_source_demand(demand)
     });
     let resp = send(
@@ -208,7 +219,7 @@ async fn a_ready_source_without_a_frame_is_not_served() {
 
 #[tokio::test]
 async fn an_unknown_input_without_a_demand_manager_is_not_served_and_leaks_no_phase() {
-    let h = harness_with(move |state| state.with_preview(Arc::new(NoFramePreview)));
+    let h = harness_with(move |state| state.with_preview(Arc::new(NoFramePreview::default())));
     let resp = send(
         &h.router,
         get("/api/v1/preview/inputs/ghost.jpg", OPERATOR_TOKEN),
@@ -225,11 +236,13 @@ async fn an_unknown_input_without_a_demand_manager_is_not_served_and_leaks_no_ph
 
 #[tokio::test]
 async fn a_failed_sources_detail_is_bounded_and_flattened() {
-    let long = format!("line one\nline two\u{7}{}", "x".repeat(400));
+    // Control characters (\u{7}), a bidi override (\u{202E}) and a zero-width
+    // space (\u{200B}) must not survive into an operator-facing reason.
+    let long = format!("line one\nline two\u{7}\u{202E}\u{200B}{}", "x".repeat(400));
     let demand = PhaseDemand::new(SourceDemandPhase::Failed, Some(&long));
     let h = harness_with(move |state| {
         state
-            .with_preview(Arc::new(NoFramePreview))
+            .with_preview(Arc::new(NoFramePreview::default()))
             .with_source_demand(demand)
     });
     let resp = send(
@@ -254,6 +267,14 @@ async fn a_failed_sources_detail_is_bounded_and_flattened() {
         "a truncated detail says so: {detail:?}"
     );
     assert!(detail.starts_with("line one line two"));
+    assert!(
+        !detail.contains('\u{202E}'),
+        "a bidi override is dropped: {detail:?}"
+    );
+    assert!(
+        !detail.contains('\u{200B}'),
+        "a zero-width space is dropped: {detail:?}"
+    );
 }
 
 #[tokio::test]
@@ -263,11 +284,9 @@ async fn an_unauthorized_principal_gets_the_same_refusal_and_no_phase() {
         Some("no media yet; still retrying"),
     );
     let probe = Arc::clone(&demand);
-    let h = harness_with(move |state| {
-        state
-            .with_preview(Arc::new(NoFramePreview))
-            .with_source_demand(demand)
-    });
+    let preview = Arc::new(NoFramePreview::default());
+    let frames = Arc::clone(&preview);
+    let h = harness_with(move |state| state.with_preview(preview).with_source_demand(demand));
 
     // SCOPED_TOKEN is an operator scoped to another object, so cam-1 is out of
     // scope: the same 403 as before this change, with no phase anywhere.
@@ -300,6 +319,32 @@ async fn an_unauthorized_principal_gets_the_same_refusal_and_no_phase() {
         probe.touched.lock().unwrap().is_empty(),
         "authorization runs before the demand provider is consulted"
     );
+    assert_eq!(
+        probe.state_reads.load(Ordering::SeqCst),
+        0,
+        "no phase is read for a denied caller"
+    );
+    assert_eq!(
+        frames.jpeg_calls.load(Ordering::SeqCst),
+        0,
+        "no frame is read for a denied caller"
+    );
+
+    // No credentials at all: the same 401 refusal, and still nothing about the
+    // source, from any provider.
+    let anon = send(&h.router, get("/api/v1/preview/inputs/cam-1.jpg", "")).await;
+    assert_eq!(anon.status(), StatusCode::UNAUTHORIZED);
+    assert!(anon.headers().get("x-multiview-source-state").is_none());
+    let anon_body = body_json(anon).await;
+    assert_eq!(anon_body["type"], "/problems/unauthenticated");
+    assert!(
+        !serde_json::to_string(&anon_body)
+            .unwrap()
+            .contains("no media"),
+        "an unauthenticated caller learns nothing about the source"
+    );
+    assert_eq!(probe.state_reads.load(Ordering::SeqCst), 0);
+    assert_eq!(frames.jpeg_calls.load(Ordering::SeqCst), 0);
 }
 
 #[tokio::test]

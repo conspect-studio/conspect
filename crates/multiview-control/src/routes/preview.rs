@@ -27,12 +27,30 @@ const PREVIEW_QUALITY: u8 = 70;
 /// whatever a future provider puts there.
 const STILL_DETAIL_MAX_CHARS: usize = 160;
 
+/// True for a Unicode **format** character (general category Cf): the bidi
+/// controls and zero-width marks that can reorder or hide the text around them in
+/// an operator's UI. Dropped from a detail rather than spaced.
+fn is_format_char(c: char) -> bool {
+    matches!(
+        c,
+        '\u{00AD}'                // soft hyphen
+        | '\u{061C}'              // Arabic letter mark
+        | '\u{180E}'              // Mongolian vowel separator
+        | '\u{200B}'..='\u{200F}' // zero-width space..right-to-left mark
+        | '\u{202A}'..='\u{202E}' // LRE..RLO (bidi embedding/override)
+        | '\u{2060}'..='\u{2064}' // word joiner..invisible plus
+        | '\u{2066}'..='\u{2069}' // LRI..PDI (bidi isolates)
+        | '\u{FEFF}'              // zero-width no-break space
+    )
+}
+
 /// A bounded, single-line, control-character-free copy of a source `detail`.
 /// The provider contract says a detail is operator-safe; this route does not
 /// trust even that with unbounded output. `None` when nothing survives.
 fn bounded_still_detail(raw: &str) -> Option<String> {
     let flattened: String = raw
         .chars()
+        .filter(|c| !is_format_char(*c))
         .map(|c| if c.is_control() { ' ' } else { c })
         .collect();
     let collapsed = flattened.split_whitespace().collect::<Vec<_>>().join(" ");
