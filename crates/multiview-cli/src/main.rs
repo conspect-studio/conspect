@@ -338,7 +338,7 @@ async fn run_pipeline(
         // and drives this single program (id "main") through it — move the owned
         // pipeline in (the set spawns it on its own supervised task).
         // Boxed: the run future holds the whole pipeline (clippy::large_futures).
-        Box::pin(run_pipeline_until_ctrl_c(
+        let run = Box::pin(run_pipeline_until_ctrl_c(
             pipeline,
             start,
             &plane,
@@ -346,7 +346,13 @@ async fn run_pipeline(
             #[cfg(feature = "moq-output")]
             preview_budget,
         ))
-        .await?
+        .await;
+        if run.is_err() {
+            // #309: a failed run (startup or engine) is an exit decision; bound
+            // the runtime drop that follows `main`.
+            multiview_cli::exit_watchdog::arm(multiview_cli::exit_watchdog::ExitCause::Fatal);
+        }
+        run?
     };
 
     println!("{}", report.render());
@@ -1022,6 +1028,12 @@ async fn run_pipeline_until_ctrl_c(
             }
             // Begin the control plane's graceful drain now (the deadline cuts it).
             decided_drain.notify_one();
+            // Journal counters first (bounded wait for the worker to apply it):
+            // the persist below can be the slower step.
+            if !multiview_cli::event_journal::flush_and_wait(std::time::Duration::from_millis(500))
+            {
+                tracing::warn!("the exit-time journal flush was not applied in time");
+            }
             if let Some(state) = early_persist_state {
                 match tokio::runtime::Builder::new_current_thread()
                     .enable_all()
@@ -1041,7 +1053,6 @@ async fn run_pipeline_until_ctrl_c(
                     }
                 }
             }
-            multiview_cli::event_journal::flush();
         })
         .ok();
 
@@ -1496,8 +1507,12 @@ async fn run_software_until_ctrl_c(
 
     let report = engine
         .run_until_stopped_with_control(&stop, publisher.as_ref(), drain)
-        .await
-        .context("headless run until Ctrl-C")?;
+        .await;
+    if report.is_err() {
+        // #309: an engine error is an exit decision.
+        multiview_cli::exit_watchdog::arm(multiview_cli::exit_watchdog::ExitCause::Fatal);
+    }
+    let report = report.context("headless run until Ctrl-C")?;
 
     // The engine loop returned; tear down every run tenant in one call.
     shutdown_run_tenants(RunTenants {

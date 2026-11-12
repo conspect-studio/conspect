@@ -202,10 +202,12 @@ fn kill_self() {
     let _ = kill_process(getpid(), Signal::KILL);
 }
 
-/// Without unix signals (or without the `rustix` dependency in this build)
-/// the C runtime exit path is the only one.
+/// Without `rustix` in this build: `abort` also skips atexit handlers and stdio
+/// flushing (it raises SIGABRT), so the bound still holds.
 #[cfg(not(all(unix, feature = "ffmpeg")))]
-fn kill_self() {}
+fn kill_self() {
+    std::process::abort();
+}
 
 static WATCHDOG: OnceLock<Watchdog> = OnceLock::new();
 

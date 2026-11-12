@@ -40,16 +40,19 @@ restarting.
      - It writes one line to `/dev/stderr` from a helper thread, through its own file handle
        (no std stderr lock, no tracing: either may be the stuck part).
      - It calls `std::process::exit` with the cause's code: 1 for a fatal, 0 for a stop.
-     - A backstop thread sends `SIGKILL` to the process if the C runtime exit path (atexit
-       handlers, stdio flush) has not finished within 500 ms.
+     - A backstop thread ends the process if the C runtime exit path (atexit handlers, stdio
+       flush) has not finished within 500 ms: `SIGKILL` in builds with `rustix` (every
+       `ffmpeg` build), `abort()` otherwise. Both skip atexit handlers.
 2. **Arm points: every exit decision.**
    - The bake consumer returns a fatal error (live run only, never with a test seam), or the
      consumer could not be spawned.
    - The output clock sees the egress fatal flag (`stop_on_egress_failure`) or a disconnected hot
      queue. This also covers a consumer that died without returning, for example a panic.
    - The engine loop returns an error.
-   - The egress join returns an error (an output did not finalise): this upgrades a stop to a
-     fatal.
+   - The egress join sees the consumer still running 500 ms in (a healthy consumer finishes in
+     under 100 ms), or returns an error. This upgrades a stop to a fatal, and the fatal gets its
+     own full bound.
+   - Any failed `run` (startup or engine, full pipeline or `--software`).
    - A stop signal (SIGTERM or Ctrl-C).
    - Not armed: a failed non-run command, an offline render (every arm in the pipeline is gated
      on the live drop-on-overload policy), the in-process test seams.
@@ -68,7 +71,7 @@ restarting.
      small runtime starts the durable shutdown work, concurrently with the pipeline teardown:
      - the control plane's graceful drain;
      - the ADR-W024 final Running persist;
-     - the event-journal flush.
+     - the event-journal flush (first, and it waits up to 500 ms for the worker to apply it).
 
      It does not wait for the main runtime, whose workers may be busy with the synchronous
      teardown. The ordinary end-of-run steps still run if there is time (the persist is
@@ -137,7 +140,11 @@ change shortens dead output after a fault; it does not change the tick path.
     plane).
 
   The same for SIGTERM (sent once the pipeline runs and the process is alive), with exit code 0.
-  Locally: 20 × fatal and 20 × stop. CI (macOS job): 10 × each.
+  The `stopwedge` mode sends SIGTERM while the consumer is stalled (an output that cannot
+  finalise during a stop). It requires exit code 1 within 0.5 s + 2 s + 0.5 s of the signal.
+
+  On the Apple-silicon host: 20 × each mode, 0 failures. fatal and stop exited at 2.08–2.10 s;
+  stopwedge at 2.60–2.94 s. CI (macOS job) runs 10 × each mode.
 - **Negative control:** with `enable()` removed, the same runs exit after 40 s and fail.
 - **Release guard:** the `_chaos-test-seams` feature is in the `*test-seam*` family, so the
   release-feature guard keeps it out of every shipped preset.

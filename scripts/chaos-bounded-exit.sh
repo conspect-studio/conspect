@@ -85,7 +85,11 @@ run_once() {
   local mode="$1" i="$2" log="${WORK}/run.log" rc t_exit t_decide pid
   rm -rf "${WORK}/hls" "${WORK}/.multiview" && mkdir -p "${WORK}/hls"
   export MULTIVIEW_CHAOS_SLOW_TEARDOWN_MS="${HOLD_MS}"
-  if [ "${mode}" = fatal ]; then
+  if [ "${mode}" = stopwedge ]; then
+    # SIGTERM while the consumer is stalled 10 s (an output that cannot
+    # finalise during the stop): the run must report failure (rc 1).
+    export MULTIVIEW_CHAOS_CONSUMER_STALL_MS=10000 MULTIVIEW_CHAOS_CONSUMER_STALL_AT=60
+  elif [ "${mode}" = fatal ]; then
     # 3 s at 29.97 fps is ~90 ticks: far past the 8-tick substitution envelope
     # (and the live queue), so the consumer must fail "fell N ticks behind".
     export MULTIVIEW_CHAOS_CONSUMER_STALL_MS=3000 MULTIVIEW_CHAOS_CONSUMER_STALL_AT=60
@@ -94,7 +98,7 @@ run_once() {
   fi
   RUST_LOG=info "${BIN}" run "${WORK}/cfg.toml" > "${log}" 2>&1 &
   pid=$!
-  if [ "${mode}" = stop ]; then
+  if [ "${mode}" = stop ] || [ "${mode}" = stopwedge ]; then
     # Signal only once the pipeline runs (its first tick is logged), and only
     # if the process is still alive.
     local waited=0
@@ -102,7 +106,12 @@ run_once() {
       sleep 0.1; waited=$((waited + 1))
       [ "${waited}" -lt 300 ] || { echo "run ${i} (stop): pipeline never started"; tail -20 "${log}"; return 1; }
     done
-    sleep 2
+    if [ "${mode}" = stopwedge ]; then
+      until grep -q "chaos: stalling the bake consumer" "${log}" 2>/dev/null; do sleep 0.05; done
+      sleep 0.2
+    else
+      sleep 2
+    fi
     kill -0 "${pid}" || { echo "run ${i} (stop): process died before the signal"; tail -20 "${log}"; return 1; }
     t_decide="$(now_ms)"
     kill -TERM "${pid}"
@@ -127,13 +136,17 @@ PY
 )"
     [ -n "${t_decide}" ] || { echo "run ${i} (${mode}): no fatal line"; tail -20 "${log}"; return 1; }
   fi
-  local took=$((t_exit - t_decide)) want=$([ "${mode}" = fatal ] && echo 1 || echo 0)
+  local took=$((t_exit - t_decide)) want=$([ "${mode}" = stop ] && echo 0 || echo 1)
+  # stopwedge: the bound runs from the fatal upgrade (≤ 0.5 s after the
+  # signal), so allow that on top.
+  local extra=$([ "${mode}" = stopwedge ] && echo 500 || echo 0)
   echo "run ${i} (${mode}): rc=${rc} decision->exit=${took} ms"
   [ "${rc}" = "${want}" ] || { echo "  FAIL: exit code ${rc}, want ${want}"; tail -20 "${log}"; return 1; }
   # The bound must come from the watchdog (the held teardown cannot finish in
   # time on its own): require its armed line and its hard-exit message.
   grep -q "exit deadline armed" "${log}" || { echo "  FAIL: watchdog never armed"; return 1; }
   grep -q "teardown overran the" "${log}" || { echo "  FAIL: no watchdog hard exit (teardown not held?)"; return 1; }
+  if [ "${mode}" != stopwedge ]; then
   grep -q "chaos: holding source teardown" "${log}" || { echo "  FAIL: teardown seam not reached"; return 1; }
   # Outputs are finalised BEFORE the held source teardown (egress first).
   python3 - "${log}" <<'PY' || { echo "  FAIL: egress not joined before source teardown"; return 1; }
@@ -144,17 +157,28 @@ def first(s):
 e, h = first('stage="egress-joined"'), first("chaos: holding source teardown")
 sys.exit(0 if e is not None and h is not None and e < h else 1)
 PY
+  fi
+  # The journal flush was applied at the exit decision.
+  if grep -q "exit-time journal flush was not applied" "${log}"; then echo "  FAIL: journal flush not applied"; return 1; fi
   # The durable Running state was written at the exit decision.
   grep -q "exit-time running-state persist written" "${log}" && [ -s "${WORK}/.multiview/active.toml" ] \
     || { echo "  FAIL: the exit-time Running persist did not land"; grep -E "persist|armed|overran|control plane|stage=" "${log}" | sed 's/\x1b\[[0-9;]*m//g' | cut -c1-200 | tail -12; ls -la "${WORK}/.multiview" 2>&1 | head -5; return 1; }
-  [ "${took}" -le $((BOUND_MS + SLACK_MS)) ] || { echo "  FAIL: exit took ${took} ms > ${BOUND_MS}+${SLACK_MS}"; grep -E "teardown|exit|chaos" "${log}" | tail -12; return 1; }
+  [ "${took}" -le $((BOUND_MS + SLACK_MS + extra)) ] || { echo "  FAIL: exit took ${took} ms > ${BOUND_MS}+${SLACK_MS}"; grep -E "teardown|exit|chaos" "${log}" | tail -12; return 1; }
+  if [ "${mode}" = stopwedge ]; then
+    # The output could not finalise: only require that what is on disk is valid.
+    local m="${WORK}/hls/index.m3u8"
+    if [ -s "${m}" ]; then
+      for seg in $(grep -v '^#' "${m}"); do [ -s "${WORK}/hls/${seg}" ] || { echo "  FAIL: listed segment missing"; return 1; }; done
+    fi
+    return 0
+  fi
   check_hls || { echo "  FAIL: HLS invalid"; return 1; }
 }
 
 write_config
 fails=0
 for i in $(seq 1 "${RUNS}"); do
-  for mode in fatal stop; do
+  for mode in fatal stop stopwedge; do
     [ "${MODE}" = both ] || [ "${MODE}" = "${mode}" ] || continue
     run_once "${mode}" "${i}" || fails=$((fails + 1))
   done

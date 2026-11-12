@@ -162,6 +162,12 @@ const HLS_LIVE_WINDOW: usize = 6;
 /// (reaped at process exit). Matches the ingest [`INGEST_JOIN_GRACE`] posture.
 const SINK_WEDGE_GRACE: Duration = Duration::from_secs(2);
 
+/// How long the egress join waits for a healthy consumer before treating it as
+/// failing and upgrading a stop exit to a fatal one (#309). A healthy consumer
+/// finishes in under 100 ms (measured), so 500 ms is generous and still leaves
+/// a fatal's own full exit bound.
+const EGRESS_SUSPECT_AFTER: Duration = Duration::from_millis(500);
+
 /// How the hot-loop projection hands each composited tick to the bake consumer
 /// over the bounded streaming queue (ADR-0025). The choice is the single
 /// load-bearing split between the offline render and the live daemon.
@@ -5764,6 +5770,8 @@ struct StreamEgress {
     /// The engine reads one atomic bit per tick and requests a clean tick-boundary
     /// stop; the owner then propagates the exact joined error to its supervisor.
     fatal: Arc<AtomicBool>,
+    /// Live run (#309): a consumer that overruns the join upgrades the exit.
+    arm_on_wedge: bool,
     sinks: Vec<JoinHandle<Result<SinkRunOutcome, PipelineError>>>,
     /// Frames currently queued in the hot-loop → consumer channel (bumped by the
     /// hot loop on send, decremented by the consumer on recv).
@@ -6124,6 +6132,7 @@ impl StreamEgress {
             Self {
                 consumer,
                 fatal,
+                arm_on_wedge: arm_exit_on_fatal,
                 sinks,
                 in_flight,
                 peak_occupancy,
@@ -6157,7 +6166,16 @@ impl StreamEgress {
         // after this bounded error, and the detached thread cannot poison a new
         // in-process encoder generation.
         let deadline = Instant::now() + SINK_WEDGE_GRACE;
+        // #309: a consumer that is not done after this much of the grace is a
+        // failing output: upgrade a stop to a fatal NOW, while the exit bound
+        // still has room, rather than after the whole grace.
+        let suspect_at = Instant::now() + EGRESS_SUSPECT_AFTER;
+        let mut upgraded = false;
         while !self.consumer.is_finished() && Instant::now() < deadline {
+            if !upgraded && self.arm_on_wedge && Instant::now() >= suspect_at {
+                crate::exit_watchdog::arm(crate::exit_watchdog::ExitCause::Fatal);
+                upgraded = true;
+            }
             std::thread::park_timeout(Duration::from_millis(10));
         }
         if !self.consumer.is_finished() {
@@ -6277,6 +6295,7 @@ mod egress_fatal_tests {
         StreamEgress {
             consumer,
             fatal: Arc::new(AtomicBool::new(fatal)),
+            arm_on_wedge: false,
             sinks: Vec::new(),
             in_flight: Arc::new(AtomicI64::new(0)),
             peak_occupancy: Arc::new(AtomicUsize::new(0)),
