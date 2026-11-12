@@ -1078,11 +1078,7 @@ impl RenditionDispatcher {
                 .and_then(|k| self.video_meta.get(k))
                 .and_then(|m| m.params.as_ref())
             {
-                if let Some(sets) = packets
-                    .iter()
-                    .filter(|p| p.is_keyframe())
-                    .find_map(|p| f(p))
-                {
+                if let Some(sets) = packets.iter().filter(|p| p.is_keyframe()).find_map(f) {
                     if b.last_sets.as_ref() != Some(&sets) {
                         b.last_sets = Some(sets);
                     }

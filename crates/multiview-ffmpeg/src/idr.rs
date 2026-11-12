@@ -126,7 +126,7 @@ pub fn is_self_contained_idr(au: &[u8], codec: CodecKind, framing: NalFraming) -
 ///
 /// Fail-closed (Annex B): a parameter-set NAL shorter than 4 bytes, or one
 /// immediately followed by a start-code fragment whose header byte has the
-/// forbidden_zero_bit set (an emulated `00 00 01` inside a payload that
+/// `forbidden_zero_bit` set (an emulated `00 00 01` inside a payload that
 /// skipped emulation prevention), makes the whole result empty: no partial
 /// or synthesized set is ever compared.
 #[must_use]
@@ -410,7 +410,10 @@ mod tests {
             parameter_sets(&other, CodecKind::H264, NalFraming::AnnexB),
             sets
         );
-        assert!(parameter_sets(&au, CodecKind::Av1, NalFraming::Obu).is_empty());
+        assert_eq!(
+            parameter_sets(&au, CodecKind::Av1, NalFraming::Obu),
+            Vec::<&[u8]>::new()
+        );
     }
 
     /// G: an SPS whose payload contains a raw `00 00 01` (no emulation
@@ -422,10 +425,16 @@ mod tests {
             0, 0, 0, 1, 0x67, 0x42, 0x00, 0x1F, 0, 0, 1, 0xE8, 0x11, 0x22, 0, 0, 1, 0x68, 0xCE,
             0x3C, 0x80, 0, 0, 1, 0x65, 0x88,
         ];
-        assert!(parameter_sets(&au, CodecKind::H264, NalFraming::AnnexB).is_empty());
+        assert_eq!(
+            parameter_sets(&au, CodecKind::H264, NalFraming::AnnexB),
+            Vec::<&[u8]>::new()
+        );
         // A too-short parameter set fails closed too.
         let short = [0, 0, 1, 0x67, 0x42, 0, 0, 1, 0x65, 0x88];
-        assert!(parameter_sets(&short, CodecKind::H264, NalFraming::AnnexB).is_empty());
+        assert_eq!(
+            parameter_sets(&short, CodecKind::H264, NalFraming::AnnexB),
+            Vec::<&[u8]>::new()
+        );
     }
 
     #[test]

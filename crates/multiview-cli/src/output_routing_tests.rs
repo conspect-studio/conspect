@@ -1262,7 +1262,7 @@ fn a_forced_idr_lands_on_a_gap_filled_tick() {
     let key = d
         .add_video_key(
             DtsTimeBase { num: 1, den: 5 },
-            Box::new(|p| p.is_keyframe()),
+            Box::new(EncodedPacket::is_keyframe),
         )
         .unwrap();
     d.rebind_video(0, key, t, 1).unwrap();

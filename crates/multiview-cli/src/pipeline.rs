@@ -3403,7 +3403,10 @@ impl Pipeline {
         .map_err(spawn_err)?;
         self.output_routing.store(Some(Arc::new(handle)));
         Ok(RunRouting {
-            consumer: ConsumerRouting { router, base_force },
+            consumer: ConsumerRouting {
+                router: Box::new(router),
+                base_force,
+            },
             aux_tx,
             preview_selection,
             aux,
@@ -5135,19 +5138,22 @@ impl Pipeline {
             hook.preview_selection = preview_selection;
             // The only clock-side routing duty: one non-blocking `try_send`
             // after a fresh compose, and only while a routed feed is active.
+            // The engine run future is boxed (one allocation per run, never
+            // per tick) so the hook's state does not inflate this future.
             let hook = multiview_engine::WithAuxTick {
                 inner: hook,
                 aux: aux_tx,
             };
             match max_ticks {
                 Some(max) => {
-                    program
-                        .run_for_with_frame_control(publisher, max, state_of, event_of, hook)
-                        .await
+                    Box::pin(
+                        program
+                            .run_for_with_frame_control(publisher, max, state_of, event_of, hook),
+                    )
+                    .await
                 }
                 None => {
-                    program
-                        .run_with_frame_control(publisher, state_of, event_of, hook)
+                    Box::pin(program.run_with_frame_control(publisher, state_of, event_of, hook))
                         .await
                 }
             }
@@ -5160,13 +5166,14 @@ impl Pipeline {
             };
             match max_ticks {
                 Some(max) => {
-                    program
-                        .run_for_with_frame_control(publisher, max, state_of, event_of, hook)
-                        .await
+                    Box::pin(
+                        program
+                            .run_for_with_frame_control(publisher, max, state_of, event_of, hook),
+                    )
+                    .await
                 }
                 None => {
-                    program
-                        .run_with_frame_control(publisher, state_of, event_of, hook)
+                    Box::pin(program.run_with_frame_control(publisher, state_of, event_of, hook))
                         .await
                 }
             }
@@ -6727,7 +6734,9 @@ struct RunRouting {
 
 /// Output-routing state the bake consumer owns for one run (ADR-0108).
 struct ConsumerRouting {
-    router: crate::output_routing::OutputRouter,
+    /// Boxed: this value lives across the run's awaits, and inline it grew
+    /// the run future past `clippy::large_futures`.
+    router: Box<crate::output_routing::OutputRouter>,
     /// Per base video key: its worker's forced-IDR request cell.
     base_force: Vec<Arc<AtomicU64>>,
 }
@@ -7720,7 +7729,7 @@ fn consumer_main<D: WindowDelivery>(
     // Video workers join before the audio worker (terminal ordering preserved).
     // Live-opened encoders are retired first and handed to the routing reaper
     // (bounded wait; they never gate the base windows).
-    router.shutdown(&mut dispatcher, ROUTING_SHUTDOWN_GRACE);
+    (*router).shutdown(&mut dispatcher, ROUTING_SHUTDOWN_GRACE);
     drop(event_tx);
     let joiner = std::thread::Builder::new()
         .name("multiview-worker-join".to_owned())
