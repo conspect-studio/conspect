@@ -430,6 +430,9 @@ jobs:
           # surface that broke.
           - crate: multiview-webrtc
             feature: native
+          # The front door's one-socket MoQ + WebRTC tests (ADR-0107, #287).
+          - crate: multiview-frontdoor
+            feature: webrtc
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@1.99.1
