@@ -47,7 +47,7 @@ struct RunningPersist {
     /// The network front door (ADR-0107) when `[network]` is configured; kept
     /// for the run's lifetime and dropped at teardown (its runtime shuts down
     /// in the background, never blocking this one).
-    _front_door: Option<multiview_cli::frontdoor::FrontDoorRun>,
+    front_door: Option<multiview_cli::frontdoor::FrontDoorRun>,
 }
 
 impl RunningPersist {
@@ -55,8 +55,11 @@ impl RunningPersist {
     /// termination** → one final best-effort persist capturing changes
     /// younger than the debounce (review M2: the ordering restores the
     /// deterministic `.tmp` single-writer guarantee; fail-soft on error).
-    async fn finish(self) {
+    /// Returns the front door so the caller drops it **after** the control
+    /// server has drained (review PR 315: sessions are cut last, not first).
+    async fn finish(self) -> Option<multiview_cli::frontdoor::FrontDoorRun> {
         multiview_control::boot_model::finish_running_persist(self.task, &self.state).await;
+        self.front_door
     }
 }
 
@@ -673,7 +676,7 @@ async fn serve_control_plane(
             RUNNING_PERSIST_DEBOUNCE,
         ),
         state: state.clone(),
-        _front_door: front_door,
+        front_door,
     };
     // Watch the boot config file for external edits (ADR-W020): a valid write
     // hot-reloads the impacted parts through the SAME router state + command
@@ -1573,9 +1576,10 @@ async fn shutdown_run_tenants(tenants: RunTenants) {
     // abort → await → one final best-effort `active.toml` write capturing
     // changes younger than the debounce, so a resume after this shutdown sees
     // the latest Running state. Fail-soft.
-    if let Some(persist) = running_persist {
-        persist.finish().await;
-    }
+    let front_door = match running_persist {
+        Some(persist) => persist.finish().await,
+        None => None,
+    };
     if let Some(watch) = config_watch {
         watch.stop();
     }
@@ -1589,6 +1593,12 @@ async fn shutdown_run_tenants(tenants: RunTenants) {
             Ok(Err(e)) => tracing::warn!(error = %e, "control server I/O error at shutdown"),
             Err(e) => tracing::warn!(error = %e, "control server task join error"),
         }
+    }
+    // Last: the front door's sessions outlive the control-plane drain. Its
+    // runtime shuts down on a blocking-pool thread, bounded, so this never
+    // blocks a worker of this runtime.
+    if let Some(door) = front_door {
+        door.shutdown().await;
     }
     signal.abort();
 }

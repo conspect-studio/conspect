@@ -94,9 +94,15 @@ impl noq::AsyncUdpSocket for QuicLane {
         };
         let first = match rx.poll_recv(cx) {
             Poll::Ready(Some(d)) => d,
-            // Dispatcher gone: nothing arrives again; the endpoint stops
-            // through its own close.
-            Poll::Ready(None) | Poll::Pending => return Poll::Pending,
+            // Dispatcher gone (front door shutting down): end the endpoint
+            // driver rather than parking it with no waker.
+            Poll::Ready(None) => {
+                return Poll::Ready(Err(io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "front door closed",
+                )));
+            }
+            Poll::Pending => return Poll::Pending,
         };
         let mut filled = 0usize;
         let mut next = Some(first);

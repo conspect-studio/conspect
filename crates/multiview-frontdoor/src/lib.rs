@@ -53,6 +53,9 @@ pub use socket::SharedSocket;
 pub const ESTABLISHED_QUEUE: usize = 1024;
 /// New-flow-queue depth per lane (design note section 13).
 pub const NEW_QUEUE: usize = 256;
+/// How long [`FrontDoor::shutdown_blocking`] waits for the runtime's tasks.
+pub const SHUTDOWN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
 /// Default cap on established QUIC peers (`network.quic.max_connections`).
 pub const DEFAULT_MAX_QUIC_PEERS: usize = 1024;
 
@@ -288,6 +291,7 @@ fn lane_channel() -> (LaneTx, LaneRx) {
 /// caller, whatever runtime it is on).
 pub struct FrontDoor {
     runtime: Option<tokio::runtime::Runtime>,
+    handle: tokio::runtime::Handle,
     socket: Arc<SharedSocket>,
     stats: Arc<Stats>,
     quic_established: Arc<EstablishedSet>,
@@ -360,6 +364,7 @@ impl FrontDoor {
             "front door: one UDP socket for QUIC and WebRTC on its own runtime"
         );
         Ok(Self {
+            handle: runtime.handle().clone(),
             runtime: Some(runtime),
             socket,
             stats,
@@ -379,16 +384,9 @@ impl FrontDoor {
     /// A handle to the front door's own runtime. Spawn every task that serves
     /// this socket here, never on the program runtime.
     ///
-    /// # Panics
-    ///
-    /// Never: the runtime is present until drop.
     #[must_use]
-    #[allow(clippy::missing_panics_doc)]
     pub fn handle(&self) -> tokio::runtime::Handle {
-        match &self.runtime {
-            Some(rt) => rt.handle().clone(),
-            None => tokio::runtime::Handle::current(),
-        }
+        self.handle.clone()
     }
 
     /// The counters.
@@ -436,7 +434,24 @@ impl FrontDoor {
     }
 }
 
+impl FrontDoor {
+    /// Stop the runtime and wait (at most [`SHUTDOWN_TIMEOUT`]) for its tasks,
+    /// which releases the socket. Blocks: call it from a plain thread or
+    /// `spawn_blocking`, never from inside an async task.
+    pub fn shutdown_blocking(mut self) {
+        // The lanes not taken by a consumer hold no socket; drop them first.
+        self.quic_rx = None;
+        self.rtc_rx = None;
+        if let Some(rt) = self.runtime.take() {
+            rt.shutdown_timeout(SHUTDOWN_TIMEOUT);
+        }
+    }
+}
+
 impl Drop for FrontDoor {
+    /// Dropping without [`shutdown_blocking`](Self::shutdown_blocking) never
+    /// blocks the caller (whatever runtime it is on): the runtime shuts down in
+    /// the background, so the socket closes shortly **after** the drop returns.
     fn drop(&mut self) {
         if let Some(rt) = self.runtime.take() {
             rt.shutdown_background();

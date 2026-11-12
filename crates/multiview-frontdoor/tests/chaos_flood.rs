@@ -19,8 +19,14 @@
 //!   its worst tick is no worse than theirs by more than one period;
 //! * the established viewer receives at least 95% of the groups published while
 //!   the flood runs;
-//! * memory: RSS growth during the flood stays under [`RSS_BOUND_KB`], and the
-//!   per-source table never exceeds its cap.
+//! * memory: process RSS growth during the flood stays under [`RSS_BOUND_KB`]
+//!   (a coarse leak canary; the structural caps are unit-tested in `limits.rs`).
+//!
+//! Scope, stated honestly: the clock here is `EngineRuntime::run` with the
+//! production pacer and time source on its own runtime. The production daemon
+//! also runs the control plane and a per-tick control drain on that runtime;
+//! the test isolates the one thing this PR changes (front-door CPU and
+//! scheduling), it does not reproduce the full daemon.
 //!
 //! Duration per run: `FRONTDOOR_CHAOS_SECS` (default 6 s). Flood rate:
 //! `FRONTDOOR_CHAOS_PPS` (default 20 000 datagrams/s, sized for a 2-core CI
@@ -520,7 +526,11 @@ fn flood_does_not_slip_the_output_clock_or_starve_an_established_viewer() {
         rtc_seen.load(Ordering::Relaxed)
     );
     drop(viewer);
-    drop(door);
+    door.shutdown_blocking();
+    // The door-off baseline really has no front door: the port is free again.
+    let probe = std::net::UdpSocket::bind(("::", port));
+    assert!(probe.is_ok(), "front door released UDP {port}: {probe:?}");
+    drop(probe);
 
     // 3. No front door, same flood at the same (now closed) port.
     let flood = Flood::start(port, pps);
@@ -552,7 +562,6 @@ fn flood_does_not_slip_the_output_clock_or_starve_an_established_viewer() {
         rss_after.saturating_sub(rss_before) < RSS_BOUND_KB,
         "RSS grew {rss_before} -> {rss_after} kB under flood"
     );
-    assert!(stats.tracked_sources <= 16_384);
     assert!(
         stats.to_rtc > 256,
         "the WebRTC lane carried flood traffic: {stats:?}"

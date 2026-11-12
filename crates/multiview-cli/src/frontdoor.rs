@@ -3,8 +3,15 @@
 //! With `[network]` configured, one dual-stack UDP socket on
 //! `[::]:network.https_port`, owned by `multiview-frontdoor` on its **own**
 //! Tokio runtime, carries both MoQ (the vendored noq server, QUIC lane) and
-//! WebRTC (the `UnifiedEndpoint`, WebRTC lane). Nothing it starts runs on the
-//! `#[tokio::main]` runtime that drives the output clock.
+//! WebRTC (the `UnifiedEndpoint`, WebRTC lane). The socket, the dispatcher,
+//! the noq endpoint driver and every QUIC connection task, the MoQ accept loop
+//! and its sessions, and the WebRTC driver run on the front-door runtime.
+//!
+//! Not moved in slice 1 (pre-existing, on the `#[tokio::main]` runtime): the MoQ
+//! per-admission publication pump and its `moq-net` origin driver, spawned by
+//! `Runtime::admit*` when the control plane admits a viewer, and the registry's
+//! lease-expiry task. They are fed by bounded drop-oldest windows and never
+//! touch the socket; moving them is follow-up work.
 //!
 //! Without `[network]` nothing changes: WebRTC binds `webrtc.udp_port`, MoQ
 //! binds `MULTIVIEW_MOQ_BIND`, both on the main runtime as before. Old configs
@@ -141,6 +148,19 @@ impl FrontDoorRun {
             runtime: self.door.handle(),
             peers: Some(peers),
         })
+    }
+
+    /// Shut the front door down: its runtime (dispatcher, QUIC and WebRTC
+    /// tasks) stops and the socket is closed, waiting at most
+    /// [`multiview_frontdoor::SHUTDOWN_TIMEOUT`] on a blocking-pool thread.
+    pub async fn shutdown(self) {
+        let door = self.door;
+        if tokio::task::spawn_blocking(move || door.shutdown_blocking())
+            .await
+            .is_err()
+        {
+            tracing::warn!("front-door shutdown task failed");
+        }
     }
 
     /// The counters (telemetry).

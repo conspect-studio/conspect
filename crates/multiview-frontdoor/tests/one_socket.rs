@@ -157,8 +157,15 @@ fn start_rtc(
 
 /// A real str0m WHIP publisher on its own UDP socket: negotiate against the
 /// endpoint, connect over ICE/DTLS through the shared socket, and send IDR
-/// access units until the endpoint's ring has RTP. Returns RTP packets seen.
-fn publish_rtc(whip: &multiview_webrtc::transport::WhipHandle, bind: SocketAddr) -> usize {
+/// access units until the endpoint's ring has RTP. Then, once the endpoint has
+/// marked the publisher established, send a burst well above the per-source
+/// new-flow burst (200) and check none of it is rate limited. Returns RTP
+/// packets seen.
+fn publish_rtc(
+    whip: &multiview_webrtc::transport::WhipHandle,
+    bind: SocketAddr,
+    door: &FrontDoor,
+) -> usize {
     let sock = UdpSocket::bind(bind).unwrap();
     sock.set_nonblocking(true).unwrap();
     let local = sock.local_addr().unwrap();
@@ -201,6 +208,64 @@ fn publish_rtc(whip: &multiview_webrtc::transport::WhipHandle, bind: SocketAddr)
         publisher.is_connected(),
         "ICE+DTLS completed through the shared socket"
     );
+
+    // Review finding (PR 315): the validated WebRTC peer must reach the
+    // established path, or its media is held to the 500/s new-flow bucket.
+    let established = door.rtc_established();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while established.is_empty() && Instant::now() < deadline {
+        let now = Instant::now();
+        while let Ok((n, src)) = sock.recv_from(&mut buf) {
+            publisher
+                .handle_datagram(src, local, &buf[..n], now)
+                .unwrap();
+        }
+        publisher.handle_timeout(now).unwrap();
+        while let Some((_src, dst, payload)) = publisher.poll_transmit(now) {
+            let _ = sock.send_to(&payload, dst);
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert_eq!(
+        established.len(),
+        1,
+        "the ICE-validated publisher is established"
+    );
+    let before = door.stats().snapshot();
+    // ~1000 SRTP datagrams in a burst: five times the per-source burst.
+    let mut big = vec![0x00u8, 0x00, 0x00, 0x01, 0x65];
+    big.extend(std::iter::repeat_n(0xCDu8, 1100));
+    let mut sent = 0usize;
+    for _ in 0..1000 {
+        let now = Instant::now();
+        while let Ok((n, src)) = sock.recv_from(&mut buf) {
+            publisher
+                .handle_datagram(src, local, &buf[..n], now)
+                .unwrap();
+        }
+        ts = ts.wrapping_add(3000);
+        let _ = publisher.write_video_sample(&big, true, ts, now);
+        publisher.handle_timeout(now).unwrap();
+        while let Some((_src, dst, payload)) = publisher.poll_transmit(now) {
+            if sock.send_to(&payload, dst).is_ok() {
+                sent += 1;
+            }
+        }
+        if sent >= 1000 {
+            break;
+        }
+    }
+    std::thread::sleep(Duration::from_millis(300));
+    let after = door.stats().snapshot();
+    assert!(sent >= 1000, "sent {sent}");
+    assert_eq!(
+        after.dropped_per_source, before.dropped_per_source,
+        "an established peer is never rate limited: {after:?}"
+    );
+    assert!(
+        after.to_rtc - before.to_rtc >= 900,
+        "{before:?} -> {after:?}"
+    );
     rtp
 }
 
@@ -227,7 +292,7 @@ fn both_on_one_socket(loopback: &str, advertise: std::net::IpAddr) {
         .unwrap();
     let moq_client = client_rt.spawn(moq_subscribe(server, client_bind));
     let rtc_bind: SocketAddr = client_bind.parse().unwrap();
-    let rtp = publish_rtc(&whip, rtc_bind);
+    let rtp = publish_rtc(&whip, rtc_bind, &door);
     let payload = client_rt.block_on(moq_client).unwrap();
 
     assert_eq!(payload, b"hello", "the MoQ frame arrived over WebTransport");

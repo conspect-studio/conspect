@@ -233,10 +233,17 @@ impl EstablishedSet {
     /// the new-flow path for that moment.
     #[must_use]
     pub fn contains(&self, addr: SocketAddr) -> bool {
-        match self.addrs.try_read() {
-            Ok(set) => set.contains_key(&canonical(addr)),
-            Err(_) => false,
+        let addr = canonical(addr);
+        // Writers hold the lock for one map operation; retry a few times
+        // (spinning, never parking) before treating the peer as new.
+        for _ in 0..4 {
+            match self.addrs.try_read() {
+                Ok(set) => return set.contains_key(&addr),
+                Err(std::sync::TryLockError::WouldBlock) => std::hint::spin_loop(),
+                Err(std::sync::TryLockError::Poisoned(_)) => return false,
+            }
         }
+        false
     }
 
     /// Mark `addr` validated (one more reference). Returns `false` (and
@@ -274,10 +281,11 @@ impl EstablishedSet {
         }
     }
 
-    /// How many addresses are established.
+    /// How many addresses are established (diagnostics; never blocks: a
+    /// contended lock reads as 0).
     #[must_use]
     pub fn len(&self) -> usize {
-        self.addrs.read().map_or(0, |s| s.len())
+        self.addrs.try_read().map_or(0, |s| s.len())
     }
 
     /// Whether no address is established.

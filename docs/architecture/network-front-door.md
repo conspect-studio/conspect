@@ -795,4 +795,14 @@ does not block 1-3. Public UDP 443 opens only after slice 3. 6, 7, 8 depend on 4
   Present: `webrtc.udp_port` and `MULTIVIEW_MOQ_BIND` are ignored with a deprecation
   warning (not a second legacy socket; that is a later slice if needed).
 * Not in slice 1: steering, nftables, Retry policy knobs, rcvbuf via systemd (slice 3);
-  the output clock itself still runs on the `#[tokio::main]` runtime (tracked separately).
+  the output clock itself still runs on the `#[tokio::main]` runtime (#311). The MoQ
+  per-admission publication pump and its `moq-net` origin driver are also still spawned
+  on the caller's (control-plane, i.e. main) runtime by `Runtime::admit*`; they never touch
+  the socket and are fed by bounded drop-oldest windows.
+* Budgets as built: per source 500/s burst 200; global new flow 50 000/s; Version
+  Negotiation triggers 200/s and supported-version Initials 200/s, each charged
+  **before** the per-source and global buckets; noq holds at most 64 pending handshakes
+  and 4 MiB of their data (`max_incoming`, `incoming_buffer_size_total`).
+* Shutdown: the daemon drops the front door last, after the control-plane drain, with a
+  bounded `shutdown_timeout` (2 s) on a blocking-pool thread, so the socket is closed when
+  teardown returns.
