@@ -83,6 +83,9 @@ const SCOPED_ROUTER_TOKEN: &str = "route-scoped.route-scoped-secret";
 /// route buses). Its output axis names output-1 explicitly: a key with an
 /// output allowlist may route only the outputs on it (#329 F2).
 const BUS_ROUTER_TOKEN: &str = "route-bus.route-bus-secret";
+/// Confined on the OUTPUT axis only (`scoped_output_ids = ["output-1"]`, no
+/// object list): ADR-W026's output-scoped key (#329 F2).
+const OUTPUT_AXIS_TOKEN: &str = "route-outaxis.route-outaxis-secret";
 /// Scoped to output-0 only.
 const OTHER_OUTPUT_TOKEN: &str = "route-other.route-other-secret";
 
@@ -108,6 +111,17 @@ fn keys() -> ApiKeyStore {
             &["output-1", "me1"],
             Some(vec!["program:main".to_owned(), "output-1".to_owned()]),
         ),
+    );
+    keys.register(
+        "route-outaxis",
+        "route-outaxis-secret",
+        Principal {
+            key_id: "route-outaxis".to_owned(),
+            role: Role::Operator,
+            scoped_object_ids: None,
+            scoped_output_ids: Some(vec!["output-1".to_owned()]),
+            scoped_discovery_domains: None,
+        },
     );
     keys.register(
         "route-other",
@@ -1084,6 +1098,82 @@ async fn two_principals_with_the_same_raw_key_get_separate_takes() {
     .await;
     assert_eq!(replay["operation_id"], ops[1].as_str());
     assert_eq!(rig.fake.takes().len(), 2);
+}
+
+/// #329 F2: a key confined by `scoped_output_ids` alone (no object list) can
+/// plan/take, read and hear only its own outputs.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_output_scoped_key_routes_reads_and_hears_only_its_outputs() {
+    let dir = tempfile::tempdir().unwrap();
+    let rig = rig(&dir.path().join("boot.toml"), true);
+    let bars = || serde_json::json!({"source": "bars"});
+    // The other output: 403 on plan AND take, nothing enqueued, key unburned.
+    for path in ["/api/v1/routing/plan", "/api/v1/routing/output/take"] {
+        let resp = send(
+            &rig.router,
+            post(path, OUTPUT_AXIS_TOKEN, Some("k"), &body("output-0", bars())),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN, "{path} output-0");
+    }
+    assert!(rig.fake.takes().is_empty());
+    // Its own output: 200 plan, 202 take.
+    let resp = send(
+        &rig.router,
+        post(
+            "/api/v1/routing/plan",
+            OUTPUT_AXIS_TOKEN,
+            None,
+            &body("output-1", bars()),
+        ),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let resp = send(
+        &rig.router,
+        take(&rig, OUTPUT_AXIS_TOKEN, "k", "output-1", bars()),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::ACCEPTED);
+    assert_eq!(rig.fake.takes().len(), 1);
+    // GET /routing lists only output-1.
+    let state =
+        body_json(send(&rig.router, get("/api/v1/routing", OUTPUT_AXIS_TOKEN)).await).await;
+    let rows: Vec<&str> = state["outputs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r["output"].as_str().unwrap())
+        .collect();
+    assert_eq!(rows, vec!["output-1"], "{state}");
+    // Realtime: the same session filter the WS/SSE handlers install for it.
+    let mut session = SessionStream::new(rig.engine.subscribe(), "o", None).with_scopes(
+        None,
+        Some(vec!["output-1".to_owned()]),
+        None,
+    );
+    for output in ["output-0", "output-1"] {
+        rig.engine
+            .publish_event(Event::RouteOutput(multiview_events::RouteOutputEvent {
+                output: output.into(),
+                operation_id: String::new(),
+                tick: 1,
+                outcome: "applied".into(),
+            }));
+    }
+    let got = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if let Some(f) = session.next_delta().await.unwrap() {
+                return f;
+            }
+        }
+    })
+    .await
+    .unwrap();
+    match got.envelope.payload {
+        Event::RouteOutput(e) => assert_eq!(e.output, "output-1", "output-0 was filtered"),
+        other => panic!("{other:?}"),
+    }
 }
 
 struct Counters(Arc<multiview_engine::lateness::TickLateness>);

@@ -320,3 +320,22 @@ fn input_lifecycle_is_object_scoped_and_round_trips() {
     assert_eq!(back, body);
     assert_eq!(serde_json::to_value(&body).unwrap()["to"], json!("ready"));
 }
+
+#[test]
+fn route_output_is_object_and_output_of_the_output() {
+    // #329 F2: the REST take/readback gate both axes of the output, so an
+    // output-scoped key receives only its own outputs' `route.output`.
+    let e = Event::RouteOutput(multiview_events::RouteOutputEvent {
+        output: "out-1".into(),
+        operation_id: String::new(),
+        tick: 1,
+        outcome: "applied".into(),
+    });
+    assert_eq!(
+        e.authz_scope(),
+        AuthzScope::ObjectAndOutput {
+            object: "out-1",
+            output: "out-1"
+        }
+    );
+}
