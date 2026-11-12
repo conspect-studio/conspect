@@ -39,7 +39,8 @@ impl CycleGate {
     pub fn shut(&self) {
         self.open.store(false, Ordering::Release);
     }
-    /// Stop new cycles and wait (bounded by one cycle) for one in flight.
+    /// Stop new cycles and wait for a request in flight (bounded by one
+    /// request: the worker holds the gate only for request + install).
     pub fn close(&self) {
         self.shut();
         drop(self.cycle.lock().unwrap_or_else(|e| e.into_inner()));
@@ -159,10 +160,6 @@ impl Coordinator {
                 let mut attempts = 0;
                 while !stop.load(Ordering::Acquire) && !denied.load(Ordering::Acquire) {
                     if Instant::now() >= due && gates[i].is_open() {
-                        // Hold the gate for the whole cycle; re-checked under it.
-                        let Some(_cycle) = gates[i].enter() else {
-                            continue;
-                        };
                         let epoch = crate::wall_ms() / 5000;
                         if epoch != attempt_epoch {
                             attempt_epoch = epoch;
@@ -173,6 +170,14 @@ impl Coordinator {
                                 + Duration::from_millis(5000 - crate::wall_ms() % 5000);
                             continue;
                         }
+                        // The gate is held only for the request and install below
+                        // (re-checked under it). It is released on every exit of
+                        // this block, including `continue`, so it is never held
+                        // while the worker waits for its next attempt: `close`
+                        // waits for at most one request in flight.
+                        let Some(_cycle) = gates[i].enter() else {
+                            continue;
+                        };
                         attempts += 1;
                         due = Instant::now() + Duration::from_secs(1);
                         // The issuer's current epoch must exist before requesting a grant.
@@ -342,5 +347,39 @@ mod gate_tests {
         assert_eq!(closer.join().unwrap(), "closed");
         worker.join().unwrap();
         assert!(gate.enter().is_none(), "a cycle started after close");
+    }
+    /// The worker's loop shape: a cycle that ends with `continue` (budget
+    /// spent, or an answer from an ended epoch) releases the gate before the
+    /// worker waits, so `close` does not wait for the next attempt.
+    #[test]
+    fn a_worker_waiting_for_its_next_attempt_does_not_hold_the_gate() {
+        let gate = Arc::new(CycleGate::new());
+        let (waiting, wait_waiting) = mpsc::channel();
+        let (stop, wait_stop) = mpsc::channel::<()>();
+        let worker = {
+            let gate = gate.clone();
+            std::thread::spawn(move || {
+                let mut first = true;
+                loop {
+                    if first {
+                        first = false;
+                        let Some(_cycle) = gate.enter() else {
+                            continue;
+                        };
+                        continue;
+                    }
+                    waiting.send(()).unwrap();
+                    // The long wait for the next attempt (up to an epoch).
+                    let _ = wait_stop.recv_timeout(Duration::from_secs(10));
+                    break;
+                }
+            })
+        };
+        wait_waiting.recv().unwrap();
+        let started = std::time::Instant::now();
+        gate.close();
+        assert!(started.elapsed() < Duration::from_secs(1), "close waited");
+        stop.send(()).unwrap();
+        worker.join().unwrap();
     }
 }
