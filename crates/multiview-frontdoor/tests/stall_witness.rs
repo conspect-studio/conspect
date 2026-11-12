@@ -186,3 +186,51 @@ fn a_block_under_flood_is_not_explained_by_witness_noise() {
         run.gaps
     );
 }
+
+/// The classifier on fixed numbers (no timing): a repeat is excused exactly by
+/// the witnessed stall inside its window, never by a gap beside it.
+#[test]
+fn the_excuse_is_proportional_to_the_witnessed_stall() {
+    const MS: i64 = 1_000_000;
+    let tick = |index, deadline: i64, late: i64| common::TickRecord {
+        index,
+        pts: multiview_core::time::MediaTime::from_tick(
+            i64::try_from(index).unwrap(),
+            common::cadence(),
+        ),
+        deadline,
+        emit: deadline + late,
+        repeat: true,
+    };
+    let run = |gaps: Vec<(i64, i64)>, t: common::TickRecord| common::ClockRun {
+        ticks: vec![t],
+        expected: 1,
+        repeats: 1,
+        gaps,
+    };
+    // 50 ms late, a 43.6 ms gap inside the window: 6.4 ms left, explained.
+    let c = common::classify(&run(
+        vec![(1_005 * MS, 1_048 * MS + 600_000)],
+        tick(1, 1_000 * MS, 50 * MS),
+    ));
+    assert_eq!((c.explained, c.unexplained.len()), (1, 0), "{c:?}");
+    // 103 ms late, only a 40 ms gap inside: 63 ms left, unexplained.
+    let c = common::classify(&run(
+        vec![(1_010 * MS, 1_050 * MS)],
+        tick(2, 1_000 * MS, 103 * MS),
+    ));
+    assert_eq!((c.explained, c.unexplained.len()), (0, 1), "{c:?}");
+    // 70 ms late, a 150 ms stall that starts as the tick is emitted: nothing
+    // inside the window, unexplained (a block followed by a stall).
+    let c = common::classify(&run(
+        vec![(1_070 * MS, 1_220 * MS)],
+        tick(3, 1_000 * MS, 70 * MS),
+    ));
+    assert_eq!((c.explained, c.unexplained.len()), (0, 1), "{c:?}");
+    // 150 ms late with a 150 ms stall covering it: explained.
+    let c = common::classify(&run(
+        vec![(1_000 * MS, 1_150 * MS)],
+        tick(4, 1_000 * MS, 150 * MS),
+    ));
+    assert_eq!((c.explained, c.unexplained.len()), (1, 0), "{c:?}");
+}

@@ -11,19 +11,27 @@
 //! which no code under test can promise (macOS run 43192931229: one ~104 ms
 //! process stall, three repeats, door off). The witness is a plain std thread
 //! that sleeps 1 ms in a loop on the same time base as the tick deadlines and
-//! records every sleep of at least one period: while it was not running, the
+//! records every sleep longer than [`MIN_GAP_NS`]: while it was not running, the
 //! process was not running. Each gap is stamped *inside* the sleep (the clock
 //! read just before `sleep` and just after it returns), so it holds only time
-//! the witness was blocked, and only a gap of at least one period counts (a
-//! shorter one cannot cause a repeat).
+//! the witness was blocked; a gap counts from [`MIN_GAP_NS`] (5 ms, five
+//! sleeps: a real deschedule, not timer jitter).
 //!
-//! A repeat (or a tick later than one period) is **explained** only when ONE
-//! witness gap covers its whole `[deadline, emit]` lateness window except
-//! [`EDGE_SLACK_NS`] (half a period) at each edge: the process was stopped for
-//! essentially all of the time the tick was late. A slip the code under test
-//! caused (the program runtime blocked or starved while the process ran) is
-//! not covered and fails, even when a stall follows it (review PR 333). The
-//! controls in `stall_witness.rs` prove both.
+//! What needs explaining is a **repeat**: the engine's "tick behind"
+//! (ADR-T018, `frames_repeated`, the metric issue #289 asserts). A fresh tick
+//! that runs a little past a period carries its own tick and PTS (asserted
+//! exactly for every tick) and is not behind; the slice-1 suite never asserted
+//! on it either. A repeat is **explained** only when its
+//! lateness minus the witness-observed stall time inside its `[deadline,
+//! emit]` window is less than one period: without the time the process was
+//! seen not running, the tick would not have been a period late. The excuse is
+//! proportional, never a whole-period pass for any overlap, so a slip the code
+//! under test caused (the program runtime blocked or starved while the process
+//! ran) stays unexplained even when a stall sits next to it (review PR 333),
+//! while a host that deschedules the witness and the clock thread at slightly
+//! different moments (macOS CI run 43324610127: gaps of 43.6/76.5 ms against
+//! repeats 50/103 ms late) is not blamed on the code. The controls in
+//! `stall_witness.rs` prove both.
 #![allow(
     dead_code,
     unreachable_pub,
@@ -135,13 +143,8 @@ pub struct ClockRun {
     pub gaps: Vec<(i64, i64)>,
 }
 
-/// The shortest witness gap that counts: one period (a shorter whole-process
-/// stall cannot make a tick a period late).
-pub const MIN_GAP_NS: i64 = PERIOD_NS;
-/// How much of a late tick's window, at each edge, a gap may leave uncovered:
-/// the witness's own wake-up latency and the program thread's, never a
-/// period's worth of slip.
-pub const EDGE_SLACK_NS: i64 = PERIOD_NS / 2;
+/// The shortest witness sleep that counts as a gap: five times the 1 ms sleep.
+pub const MIN_GAP_NS: i64 = 5_000_000;
 
 /// The witness thread: sleeps 1 ms in a loop and records every sleep that
 /// took at least [`MIN_GAP_NS`], stamped inside the sleep.
@@ -255,9 +258,9 @@ pub fn run_clock(duration: Duration, on_tick: impl FnMut(u64) + Send + 'static) 
 /// The classification of every tick that needed help.
 #[derive(Debug, Clone, Default)]
 pub struct Classification {
-    /// Repeats, plus fresh ticks later than one period.
+    /// Repeats (the engine's ticks behind).
     pub needing_explanation: usize,
-    /// Of those, covered by one witness gap (see [`classify`]).
+    /// Of those, explained by the witness (see [`classify`]).
     pub explained: usize,
     /// The rest: slips the code under test is responsible for.
     pub unexplained: Vec<(u64, i64, bool)>,
@@ -266,11 +269,11 @@ pub struct Classification {
 pub fn classify(run: &ClockRun) -> Classification {
     let mut c = Classification::default();
     for t in &run.ticks {
-        if !(t.repeat || t.lateness() > PERIOD_NS) {
+        if !t.repeat {
             continue;
         }
         c.needing_explanation += 1;
-        if run.gaps.iter().any(|&(start, end)| covers(start, end, t)) {
+        if t.lateness() - stalled_within(&run.gaps, t.deadline, t.emit) < PERIOD_NS {
             c.explained += 1;
         } else {
             c.unexplained
@@ -280,10 +283,13 @@ pub fn classify(run: &ClockRun) -> Classification {
     c
 }
 
-/// Whether the gap `[start, end]` covers `t`'s lateness window
-/// `[deadline, emit]` except [`EDGE_SLACK_NS`] at each edge.
-pub fn covers(start: i64, end: i64, t: &TickRecord) -> bool {
-    start <= t.deadline + EDGE_SLACK_NS && end >= t.emit - EDGE_SLACK_NS
+/// Witness-observed stall time inside `[from, to]`: the length of the union of
+/// the gaps' intersections with it (gaps never overlap: one thread records
+/// them in order).
+pub fn stalled_within(gaps: &[(i64, i64)], from: i64, to: i64) -> i64 {
+    gaps.iter()
+        .map(|&(start, end)| (end.min(to) - start.max(from)).max(0))
+        .sum()
 }
 
 pub fn report(name: &str, r: &ClockRun) {

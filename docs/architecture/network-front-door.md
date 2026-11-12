@@ -950,16 +950,21 @@ read from the established socket.
 that the CI host never stalls the process for more than a period (macOS run 43192931229: one
 ~104 ms whole-process stall, three last-good repeats, door off). The clock absorbs such a stall by
 design (ADR-T018). The witness is a std thread that sleeps 1 ms in a loop on the clock's own time
-base and records every sleep that took at least one period, stamped inside the sleep (clock read
-just before `sleep`, just after it returns), so a gap holds only time the witness was blocked. A
-repeat (or a tick later than a period) is explained only when ONE gap covers its whole
-`[deadline, emit]` window except half a period at each edge, i.e. the whole process was stopped
-for essentially all the time the tick was late. The suite asserts zero unexplained ticks,
-absolutely. `tests/stall_witness.rs` records the red case (a SIGSTOP/SIGCONT stall of 150 ms
-fails the old assertion with 3-4 repeats), the green case (all of them explained), and three
-controls that must stay unexplained: a 150 ms spin on the program runtime while the process runs;
-a 100 ms program-runtime block immediately followed by a 150 ms SIGSTOP; and a 100 ms block under
-a 20k pps loopback flood (review PR 333).
+base and records every sleep that took at least 5 ms, stamped inside the sleep (clock read just
+before `sleep`, just after it returns), so a gap holds only time the witness was blocked. What
+needs explaining is a repeat (a tick behind, the metric #289 asserts). A repeat is explained only
+when its lateness minus the witness-observed stall time inside its `[deadline, emit]` window is
+under one period: without the time the process was seen not running, it would not have been
+behind. The excuse is proportional, never a pass for any overlap. The suite asserts zero
+unexplained repeats, absolutely, plus the exact PTS of every tick. `tests/stall_witness.rs`
+records the red case (a SIGSTOP/SIGCONT stall of 150 ms fails the old assertion with 3-4
+repeats), the green case (all of them explained), a pure classifier test on fixed numbers, and
+three controls that must stay unexplained: a 150 ms spin on the program runtime while the process
+runs; a 100 ms program-runtime block immediately followed by a 150 ms SIGSTOP; and a 100 ms block
+under a 20k pps loopback flood (review PR 333). Why proportional, measured: on macOS CI (run
+43324610127) the witness and the clock thread were descheduled at slightly different moments
+(gaps 43.6 and 76.5 ms against repeats 50 and 103 ms late), which a whole-window cover rule
+blamed on the code; the proportional rule explains them and still fails every control.
 
 ### Slice 4 as built (issue #290)
 
