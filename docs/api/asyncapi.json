@@ -2439,7 +2439,8 @@
           "config-file-requires-restart",
           "config-file-apply-incomplete",
           "container-no-host-networking",
-          "catalogue-link-attention"
+          "catalogue-link-attention",
+          "accepted-state-rejected"
         ],
         "type": "string"
       },

@@ -208,18 +208,41 @@ pub fn admit_for_boot(config: &MultiviewConfig) -> ControlResult<()> {
 /// # Errors
 /// A malformed, unreadable or invalid accepted record fails closed.
 pub fn load_desired(boot_path: &Path) -> Result<Option<DesiredState>, String> {
-    let path = state_dir_for(boot_path).join(DESIRED_FILE);
-    let text = match std::fs::read_to_string(&path) {
+    load_desired_file(&desired_path_for(boot_path))
+}
+
+/// The accepted-state file (`desired.json`) for the boot config at `boot_path`.
+#[must_use]
+pub fn desired_path_for(boot_path: &Path) -> PathBuf {
+    state_dir_for(boot_path).join(DESIRED_FILE)
+}
+
+/// [`load_desired`] for an explicit envelope file (the accepted state or its
+/// last-good copy): read, parse and validate; a missing file is `Ok(None)`.
+///
+/// # Errors
+/// A malformed, unreadable or invalid record fails closed.
+pub fn load_desired_file(path: &Path) -> Result<Option<DesiredState>, String> {
+    let text = match std::fs::read_to_string(path) {
         Ok(text) => text,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(e) => return Err(format!("reading {}: {e}", path.display())),
     };
+    parse_desired_text(&text, path).map(Some)
+}
+
+/// Parse and validate an accepted-state envelope already read from `path`
+/// (named in errors only).
+///
+/// # Errors
+/// A malformed or invalid record.
+pub fn parse_desired_text(text: &str, path: &Path) -> Result<DesiredState, String> {
     let desired: DesiredState =
-        serde_json::from_str(&text).map_err(|e| format!("parsing {}: {e}", path.display()))?;
+        serde_json::from_str(text).map_err(|e| format!("parsing {}: {e}", path.display()))?;
     desired
         .validate()
         .map_err(|e| format!("validating {}: {e}", path.display()))?;
-    Ok(Some(desired))
+    Ok(desired)
 }
 
 /// Stage an entire prospective desired document before publishing any stores,

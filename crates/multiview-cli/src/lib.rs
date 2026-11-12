@@ -156,6 +156,7 @@ pub mod control;
 pub mod display_size;
 pub mod event_journal;
 pub mod hls_event_observer;
+pub mod last_good;
 /// The Conspect entitlement-plane wiring for the cli (CONSPECT-2b/10, ADR-0050):
 /// the shared lease store, the published [`licence::WatermarkSignal`] the engine
 /// bake samples lock-free (S3), and the sampled [`multiview_licence::EnforcementLevel`]

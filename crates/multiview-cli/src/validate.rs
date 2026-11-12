@@ -48,6 +48,9 @@ pub struct StartCheck {
     /// `None` when the engine can start from it, else the exact reason start-up
     /// would give.
     pub refusal: Option<String>,
+    /// With a refusal: whether a start would fall back to the last-good copy
+    /// (`true`) or fail (`false`). Either way the preflight exits non-zero.
+    pub falls_back: bool,
 }
 
 /// Whether a config validated, and if not, the human-readable reason.
@@ -108,8 +111,11 @@ impl ValidationReport {
             let source = start.source.display();
             let line = match &start.refusal {
                 None => format!("\nOK   start: {what}\n     {source}"),
+                Some(reason) if start.falls_back => format!(
+                    "\nFAIL start: {what}\n     {source}\n     the engine would REJECT this state and start from the last-good copy instead (raising the accepted-state-rejected warning): {reason}"
+                ),
                 Some(reason) => format!(
-                    "\nFAIL start: {what}\n     {source}\n     the engine would refuse to start: {reason}"
+                    "\nFAIL start: {what}\n     {source}\n     the engine would refuse to start (no usable last-good copy to fall back to): {reason}"
                 ),
             };
             out.push_str(&line);
@@ -172,7 +178,7 @@ pub fn validate_config(path: &Path) -> anyhow::Result<ValidationReport> {
     match config.validate() {
         Ok(()) => {
             let summary = summarize(&config);
-            let start = start_check(config, text, path);
+            let start = start_check(&config, &text, path);
             Ok(ValidationReport {
                 path: path.to_path_buf(),
                 status: ValidationStatus::Ok { summary },
@@ -195,7 +201,7 @@ pub fn validate_config(path: &Path) -> anyhow::Result<ValidationReport> {
 /// [`crate::boot::resolve_start_config`] start-up calls — and apply the SAME
 /// start-up admission rule `Pipeline::build` enforces
 /// ([`multiview_config::boot_admission`]). Read-only: nothing is written.
-fn start_check(boot: MultiviewConfig, text: String, path: &Path) -> StartCheck {
+fn start_check(boot: &MultiviewConfig, text: &str, path: &Path) -> StartCheck {
     let desired = multiview_control::boot_model::state_dir_for(path).join("desired.json");
     let accepted = desired.exists();
     let source = if accepted {
@@ -203,16 +209,15 @@ fn start_check(boot: MultiviewConfig, text: String, path: &Path) -> StartCheck {
     } else {
         path.to_path_buf()
     };
-    let refusal = match crate::boot::resolve_start_config(boot, text, path) {
-        Err(reason) => Some(reason),
-        Ok(start) => multiview_config::boot_admission(&start.running)
-            .err()
-            .map(|e| e.to_string()),
+    let (refusal, falls_back) = match crate::boot::preflight_start(boot, text, path) {
+        Ok(()) => (None, false),
+        Err(refusal) => (Some(refusal.reason), refusal.falls_back),
     };
     StartCheck {
         source,
         accepted,
         refusal,
+        falls_back,
     }
 }
 

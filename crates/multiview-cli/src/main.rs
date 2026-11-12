@@ -233,7 +233,7 @@ async fn run_run(args: RunArgs) -> anyhow::Result<ExitCode> {
         .map_err(|reason| anyhow::anyhow!(reason))?;
 
     if args.software {
-        return run_software(&start, &args).await;
+        return Box::pin(run_software(&start, &args)).await;
     }
 
     // Run-owned: retain across configuration parses and replacement pipelines.
@@ -255,15 +255,22 @@ async fn run_software(
     start: &multiview_cli::boot::StartConfig,
     args: &RunArgs,
 ) -> anyhow::Result<ExitCode> {
-    // The engine is built from the starting Running document (ADR-W024).
-    let config = &start.running;
     // Conspect entitlement plane (ADR-0050): assemble the shared lease store +
     // published ladder level from the environment, then gate the NEW engine build
     // (S1). A running engine is NEVER re-gated; this only refuses a *new* start at
     // the block-new-instance rung (the never-off-air promise).
     let plane = multiview_cli::licence::EntitlementPlane::from_env();
-    let mut engine =
-        SoftwareEngine::build_gated(config, plane.level()).map_err(|e| anyhow::anyhow!("{e}"))?;
+    // #317: build from the start decision; a build failure on the accepted
+    // state falls back to a different last-good that builds. Only AFTER a
+    // successful build is a planned fallback committed to disk.
+    let (start, mut engine) =
+        multiview_cli::boot::build_with_fallback(start.clone(), &args.config, |config| {
+            SoftwareEngine::build_gated(config, plane.level()).map_err(|e| e.to_string())
+        })
+        .map_err(anyhow::Error::msg)?;
+    let start =
+        multiview_cli::boot::commit_fallback(start, &args.config).map_err(anyhow::Error::msg)?;
+    let start = &start;
     let cadence = engine.cadence();
     let report = if let Some(ticks) = args.tick_budget(cadence) {
         tracing::info!(ticks, "software run: bounded");
@@ -296,19 +303,28 @@ async fn run_pipeline(
     use multiview_cli::pipeline::Pipeline;
 
     // The pipeline is built from the starting Running document (ADR-W024).
-    let config = &start.running;
     // Conspect entitlement plane (ADR-0050): assemble the shared store + ladder
     // level from the environment, then gate the NEW pipeline build (S1) — refuse a
     // new start at the block-new-instance rung. A running pipeline is never
     // re-gated (the never-off-air promise).
     let plane = multiview_cli::licence::EntitlementPlane::from_env();
     multiview_cli::run::start_gate(plane.level()).map_err(|e| anyhow::anyhow!("{e}"))?;
+    // #317: build from the start decision; a build failure on the accepted
+    // state falls back to a different last-good that builds. Only AFTER a
+    // successful build is a planned fallback committed to disk (the operator's
+    // state is never moved aside for a fault that breaks every state).
+    let (start, built) =
+        multiview_cli::boot::build_with_fallback(start.clone(), &args.config, |config| {
+            Pipeline::build(config).map_err(|e| format!("building the pipeline: {e}"))
+        })
+        .map_err(anyhow::Error::msg)?;
+    let start =
+        multiview_cli::boot::commit_fallback(start, &args.config).map_err(anyhow::Error::msg)?;
+    let start = &start;
     // Wire the wait-free tile-watermark signal (S3) into the pipeline's overlay
     // bake (a no-op without the `overlay` feature). The bake samples it off the
     // hot loop; it can never stall the output clock (invariant #1).
-    let mut pipeline = Pipeline::build(config)
-        .context("building the pipeline")?
-        .with_watermark_signal(plane.signal.clone());
+    let mut pipeline = built.with_watermark_signal(plane.signal.clone());
     if let Some(subs) = &args.subtitles {
         let track = load_subtitles(subs)
             .with_context(|| format!("loading subtitles {}", subs.display()))?;
@@ -1113,6 +1129,8 @@ async fn run_pipeline_until_ctrl_c(
         .unwrap_or(i64::MAX);
         let _ = multiview_control::emit_network_warnings(publisher.as_ref(), mismatch, since_nanos);
     }
+    announce_boot_fallback(start, publisher.as_ref());
+    let _last_good = spawn_last_good_recorder(start, config_path, &publisher, &stop);
 
     // MP-1 (ADR-0030 §2.2): build the engine `ProgramSet` and drive this single
     // program (id "main") through it — behaviour-identical to today (one program,
@@ -1147,6 +1165,43 @@ async fn run_pipeline_until_ctrl_c(
     // a counter still queued at process exit can be lost; its record is not.
     multiview_cli::event_journal::flush();
     Ok(report)
+}
+
+/// #317: when this run started from the last-good copy because the accepted
+/// state could not start, raise the latched `accepted-state-rejected` warning
+/// (UI banner + `GET /api/v1/health`). Before the output clock exists (inv #1),
+/// through the drop-oldest lane (inv #10).
+fn announce_boot_fallback(
+    start: &multiview_cli::boot::StartConfig,
+    publisher: &EnginePublisher<EngineStateSnapshot, Event>,
+) {
+    if let Some(fallback) = &start.boot_fallback {
+        let since_nanos = i64::try_from(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_nanos()),
+        )
+        .unwrap_or(i64::MAX);
+        multiview_control::emit_accepted_state_rejected(publisher, fallback.message(), since_nanos);
+    }
+}
+
+/// #317: record the started accepted state as last-good after the first tick
+/// (see [`multiview_cli::last_good::spawn_recorder`]).
+fn spawn_last_good_recorder(
+    start: &multiview_cli::boot::StartConfig,
+    config_path: &Path,
+    publisher: &Arc<EnginePublisher<EngineStateSnapshot, Event>>,
+    stop: &StopSignal,
+) -> Option<tokio::task::JoinHandle<()>> {
+    let started = start.desired.clone()?;
+    let publisher = Arc::clone(publisher);
+    Some(multiview_cli::last_good::spawn_recorder(
+        config_path.to_path_buf(),
+        started,
+        move || publisher.state.sequence(),
+        stop.clone(),
+    ))
 }
 
 /// Drive the single legacy `"main"` program through an engine
@@ -1263,6 +1318,15 @@ async fn run_pipeline(
     // Conspect S1 startup gate: gate the NEW engine build on the published ladder
     // level (refuse at the block-new-instance rung).
     let plane = multiview_cli::licence::EntitlementPlane::from_env();
+    // #317: this readiness report starts nothing, so it never commits a
+    // fallback; it must not report a clean "ready" for a saved state a real
+    // start would reject.
+    if let Some(reason) = start.pending_fallback_reason() {
+        anyhow::bail!(
+            "the accepted state would be rejected at start ({reason}); a real start would fall \
+             back to the last-good copy and raise the accepted-state-rejected warning"
+        );
+    }
     let engine =
         SoftwareEngine::build_gated(config, plane.level()).map_err(|e| anyhow::anyhow!("{e}"))?;
     println!(
@@ -1427,6 +1491,9 @@ async fn run_software_until_ctrl_c(
     // CONSPECT engine-seam S5 (ADR-0052 §3): the consent-independent local-metrics
     // retention feed for the software run.
     let (retention_store, retention_task) = spawn_metrics_retention(&publisher);
+    // #317: after the control plane's warning ingest subscribed.
+    announce_boot_fallback(start, publisher.as_ref());
+    let _last_good = spawn_last_good_recorder(start, config_path, &publisher, &stop);
 
     // DEV-C1 (ADR-M010): the outbound presentation epoch publishes on the
     // software path too — `timing.status` per program on the same drop-oldest
