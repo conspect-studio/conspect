@@ -320,7 +320,7 @@ mod tests {
 
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
-    use super::{is_idr, read_leb128, CodecKind, NalFraming};
+    use super::{is_idr, is_self_contained_idr, read_leb128, CodecKind, NalFraming};
 
     #[test]
     fn leb128_single_and_multi_byte() {
