@@ -1525,7 +1525,12 @@ impl OutputRouter {
     }
 
     /// Feed every live-opened encoder its bus's frame for this tick (hold
-    /// the last one when none is new), counting held ticks per bus.
+    /// the last one when none is new), counting held ticks per bus. A bus
+    /// is held for a tick when its picture did not advance OR its encoder
+    /// refused the frame (`OfferRejection::Overloaded`): a live encoder that
+    /// never drains its input queue must degrade and fall back exactly like
+    /// a lagging feed, even though its picture bus (Clean included) is
+    /// published fresh every tick by the bake consumer itself.
     fn feed(&mut self, tick: u64, dispatcher: &mut RenditionDispatcher) {
         let mut fresh_buses: Vec<(PictureBus, bool)> = Vec::new();
         let mut dead: Vec<usize> = Vec::new();
@@ -1539,15 +1544,22 @@ impl OutputRouter {
                 d.last_aux_tick = Some(frame.tick);
                 d.last_fed = Some(Arc::clone(&frame.frame));
             }
-            fresh_buses.push((d.bus.clone(), fresh));
             let (Some(canvas), Some(worker)) = (d.last_fed.clone(), d.worker.as_ref()) else {
+                // No canvas to offer yet: nothing was dropped, so this is
+                // not (yet) a held tick for the bus beyond slot freshness.
+                fresh_buses.push((d.bus.clone(), fresh));
                 continue;
             };
             // Never blocks: a full queue drops and the worker gap-fills.
-            let ended = matches!(
-                worker.offer(BakedTick { tick, canvas }),
-                Err(OfferRejection::Ended)
-            );
+            let offer_result = worker.offer(BakedTick { tick, canvas });
+            let ended = matches!(offer_result, Err(OfferRejection::Ended));
+            let dropped = matches!(offer_result, Err(OfferRejection::Overloaded));
+            // Fresh for health purposes requires BOTH: the slot advanced
+            // AND the encoder actually accepted the frame. A dropped offer
+            // counts as a held tick for this key's bus, exactly like a
+            // lagging aux frame, so a slow-but-alive encoder holding one
+            // frame forever cannot stay "fresh" forever.
+            fresh_buses.push((d.bus.clone(), fresh && !dropped));
             d.silent = d.silent.saturating_add(1);
             // A panicked/exited worker, or one that emits nothing while fed
             // (wedged), would freeze its outputs forever: close the key so

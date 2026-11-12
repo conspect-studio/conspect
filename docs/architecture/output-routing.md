@@ -503,12 +503,16 @@ Tick T is the move tick (§4.5).
    changes on a take, because the destination key includes the output's own settings. A format
    change is RT-15's migration, a separate operation.
 6. **Lagging feeds.** A picture bus whose aux frame for tick T has not arrived is held: its encoder
-   is fed the newest frame with that frame's own generation label. After 60 held ticks the alarm
+   is fed the newest frame with that frame's own generation label. A bus is also held for a tick
+   when its encoder refuses the offered frame (a full worker queue): a starved live encoder — Clean
+   included, whose picture is otherwise published fresh every tick by the bake consumer itself —
+   degrades and falls back exactly like a lagging aux feed. After 60 held ticks the alarm
    `routing.degraded` is raised. After 150 held ticks (5 s), whether the aux thread is dead or
-   wedged, every output subscribed to that bus moves to Program at an IDR, with the typed event
-   `fallback:aux-failed`. An output is never frozen forever. The bake consumer's own substitution
-   path (`crates/multiview-cli/src/pipeline.rs:7173-7195`) becomes per picture bus, so a consumer stall never feeds Program
-   pixels into another bus's encoder.
+   wedged, or the live encoder itself is starved, every output subscribed to that bus moves to
+   Program at an IDR, with the typed event `fallback:aux-failed`. An output is never frozen
+   forever. The bake consumer's own substitution path (`crates/multiview-cli/src/pipeline.rs:7173-7195`)
+   becomes per picture bus, so a consumer stall never feeds Program pixels into another bus's
+   encoder.
 
 What each consumer is expected to see at the move. The design relies on the facts below. Each is
 verified per protocol in the slice that ships it (§9). §4.6 proved the MPEG-TS rows.
@@ -629,7 +633,9 @@ verified per protocol in the slice that ships it (§9). §4.6 proved the MPEG-TS
   (`fallback:aux-failed`) at 150 ticks. A drop guard publishes `routing.feed_state = failed` and an alarm.
   Program and every default output continue, which is the ADR-0103 wall pattern.
 - **A wedged encoder** costs only the outputs subscribed to its encoded bus. The dispatcher already isolates bindings
-  (`crates/multiview-cli/src/rendition_dispatch.rs:1-5`).
+  (`crates/multiview-cli/src/rendition_dispatch.rs:1-5`). A bus is held for a tick when its picture did not advance OR
+  its encoder refused the frame, so a starved encoder (Clean included) degrades at 60 and falls back at 150 exactly
+  like a lagging aux feed.
 
 ### 4.5 Take gating
 

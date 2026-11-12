@@ -1887,3 +1887,255 @@ fn the_plan_counts_a_lingering_encoder_as_plus_zero() {
         "after the linger closed: +1"
     );
 }
+
+/// I1: a live encoder that blocks forever in `encode` (never drains its
+/// input queue, `WORKER_QUEUE_TICKS` = 4): once its bounded queue fills, the
+/// consumer's `offer` is rejected (`Overloaded`), never waited on. A dropped
+/// offer counts as a held tick for that key's bus, so Clean — published
+/// fresh by the bake consumer every tick, which would otherwise always look
+/// "fresh" — degrades and falls back exactly like a lagging aux bus.
+struct BlockedEnc {
+    forced: bool,
+    block: Arc<AtomicBool>,
+    gate: Mutex<Receiver<()>>,
+}
+
+impl VideoEncodeWorker for BlockedEnc {
+    fn encode(&mut self, item: BakedTick) -> Result<Vec<EncodedPacket>, PipelineError> {
+        // Block while `block` is set, polling it so a later `store(false,
+        // ..)` lets this call return (used by the transient-stall test);
+        // never releases on its own otherwise, so the input queue never
+        // drains while `block` stays set.
+        let gate = self.gate.lock().unwrap();
+        while self.block.load(Ordering::SeqCst) {
+            let _ = gate.recv_timeout(std::time::Duration::from_millis(5));
+        }
+        drop(gate);
+        let key = std::mem::take(&mut self.forced);
+        Ok(vec![pkt(item.tick, key)])
+    }
+    fn reorder_bound(&self) -> ReorderBound {
+        ReorderBound::NoReorder
+    }
+    fn finish(&mut self) -> Result<Vec<EncodedPacket>, PipelineError> {
+        Ok(Vec::new())
+    }
+    fn force_keyframe(&mut self) {
+        self.forced = true;
+    }
+}
+
+impl LiveEncoder for BlockedEnc {
+    fn start_at(&mut self, _t0: u64) {
+        self.forced = true;
+    }
+    fn time_base(&self) -> Rational {
+        Rational::new(1, 5)
+    }
+    fn move_gate(&self) -> MoveGate {
+        Box::new(|p| p.is_keyframe() && p.len() == 77)
+    }
+}
+
+/// Build a harness whose live-opened encoder blocks forever in `encode` once
+/// `block` is set (never draining its input queue, so `worker.offer` starts
+/// returning `Overloaded` once the bounded queue fills). The returned sender
+/// keeps the worker's gate open; drop it at the end of the test to let the
+/// blocked worker thread return (never leaking a spinning/blocked thread).
+fn blocked_harness(outputs: usize) -> (Harness, Arc<AtomicBool>, SyncSender<()>) {
+    let block = Arc::new(AtomicBool::new(false));
+    let b = Arc::clone(&block);
+    let (release, gate) = mpsc::sync_channel::<()>(0);
+    let mut gate = Some(gate);
+    let open: OpenFn = Box::new(move |_| {
+        let e: Box<dyn LiveEncoder> = Box::new(BlockedEnc {
+            forced: false,
+            block: Arc::clone(&b),
+            gate: Mutex::new(gate.take().expect("opened once")),
+        });
+        Ok(e)
+    });
+    (harness_with(outputs, 6, Some(open), true), block, release)
+}
+
+/// (a): a Clean output whose live encoder worker is blocked never drains its
+/// input queue -> `degraded` in the snapshot after ~60 held ticks, then
+/// `Fallback(...)` back to Program by ~150. Output 0 (Program) stays
+/// contiguous and on time throughout; every `on_tick` call stays well under
+/// the real-time envelope (never waits on the blocked encoder).
+#[test]
+fn a_blocked_clean_encoder_degrades_then_falls_back_and_program_is_unaffected() {
+    let (mut x, block, release) = blocked_harness(2);
+    for t in 0..5 {
+        x.tick(t);
+    }
+    x.h.try_take(take("c", 1, PictureBus::Clean)).unwrap();
+    let (_, now) = apply(&mut x, 5, "c");
+    assert_eq!(x.d.binding_video_key(1), Some(1), "on the Clean key");
+    // Let a few healthy ticks pass before wedging the encoder, so "held"
+    // below counts cleanly from the wedge point.
+    let mut t = now;
+    for _ in 0..3 {
+        x.tick(t);
+        t += 1;
+    }
+    block.store(true, Ordering::SeqCst);
+    let wedged_at = t;
+    let mut degraded_at = None;
+    let mut fell_back_at = None;
+    // The pre-existing wedged-worker rule (`WEDGED_ENCODER_TICKS` = 90, a
+    // worker producing no events at all) may close the key before the new
+    // 150-tick held-bus rule even gets a chance to: either path is a
+    // legitimate Fallback, so this loop accepts the first of either and
+    // only pins the NEW behaviour this task adds (`degraded` raised from a
+    // dropped offer, which did not happen before this change).
+    for _ in 0..FALLBACK_AFTER_TICKS + 20 {
+        let started = Instant::now();
+        x.tick(t);
+        assert!(
+            started.elapsed() < std::time::Duration::from_millis(50),
+            "on_tick never waits on the blocked encoder: took {:?}",
+            started.elapsed()
+        );
+        if degraded_at.is_none() && x.h.snapshot().outputs[1].degraded {
+            degraded_at = Some(t);
+        }
+        if matches!(
+            x.results()
+                .iter()
+                .find(|r| matches!(r, TakeResult::Fallback(_))),
+            Some(TakeResult::Fallback(_))
+        ) {
+            fell_back_at = Some(t);
+            break;
+        }
+        t += 1;
+    }
+    // Margin: the worker's own bounded queue (`WORKER_QUEUE_TICKS`) must
+    // first fill with real offers before any one is actually dropped (an
+    // in-flight recv on the worker thread can also absorb one more), so the
+    // "held" count only starts climbing a few ticks after the wedge; the
+    // design doc states the bounds as "~60"/"~150" for exactly this reason.
+    let sched_margin: u64 = 20;
+    let degraded_at = degraded_at.expect("Clean degrades once its queue is saturated");
+    let fell_back_at = fell_back_at.expect("Clean falls back to Program");
+    assert!(
+        degraded_at - wedged_at < DEGRADED_AFTER_TICKS + sched_margin,
+        "degraded close to the 60-held-tick bound: {} ticks after the wedge",
+        degraded_at - wedged_at + 1
+    );
+    assert!(
+        fell_back_at - wedged_at < FALLBACK_AFTER_TICKS + sched_margin,
+        "fallback close to the 150-held-tick bound: {} ticks after the wedge",
+        fell_back_at - wedged_at + 1
+    );
+    assert_eq!(x.d.binding_video_key(1), Some(0), "back on Program");
+    let o0: Vec<i64> = x
+        .windows_of(0)
+        .iter()
+        .filter_map(|w| w.first().map(|p| p.0))
+        .collect();
+    assert!(
+        o0.windows(2).all(|w| w[1] == w[0] + 1),
+        "Program windows contiguous and on time throughout: {o0:?}"
+    );
+    assert_eq!(
+        o0.len(),
+        usize::try_from(t).unwrap(),
+        "Program delivered exactly one window per tick"
+    );
+    drop(release);
+}
+
+/// (b): same scenario, on a source bus (not Clean): a live encoder whose
+/// queue fills with dropped offers degrades and falls back just like Clean.
+#[test]
+fn a_blocked_source_encoder_degrades_then_falls_back() {
+    let (mut x, block, release) = blocked_harness(2);
+    x.tick(0);
+    x.h.try_take(take("a", 1, src())).unwrap();
+    let (_, now) = apply(&mut x, 1, "a");
+    assert_eq!(x.d.binding_video_key(1), Some(1));
+    let mut t = now;
+    for _ in 0..3 {
+        x.tick(t);
+        t += 1;
+    }
+    block.store(true, Ordering::SeqCst);
+    let wedged_at = t;
+    let mut degraded_at = None;
+    let mut fell_back_at = None;
+    // As in the Clean test: the pre-existing wedged-worker rule (90 ticks of
+    // total silence) may close the key before the new 150-tick held-bus
+    // rule gets a chance to; either is a legitimate Fallback here.
+    for _ in 0..FALLBACK_AFTER_TICKS + 20 {
+        x.tick(t);
+        if degraded_at.is_none() && x.h.snapshot().outputs[1].degraded {
+            degraded_at = Some(t);
+        }
+        if x.results()
+            .iter()
+            .any(|r| matches!(r, TakeResult::Fallback(_)))
+        {
+            fell_back_at = Some(t);
+            break;
+        }
+        t += 1;
+    }
+    // Margin, same reasoning as the Clean test above.
+    let sched_margin: u64 = 20;
+    let degraded_at = degraded_at.expect("degrades once its queue is saturated");
+    let fell_back_at = fell_back_at.expect("falls back to Program");
+    assert!(
+        degraded_at - wedged_at < DEGRADED_AFTER_TICKS + sched_margin,
+        "degraded close to the 60-held-tick bound"
+    );
+    assert!(
+        fell_back_at - wedged_at < FALLBACK_AFTER_TICKS + sched_margin,
+        "fallback close to the 150-held-tick bound"
+    );
+    assert_eq!(x.d.binding_video_key(1), Some(0), "back on Program");
+    drop(release);
+}
+
+/// (c): a transient stall of fewer than `MAX_GAP_FILL_TICKS` dropped offers
+/// must not degrade or fall back: the encoder catches up (unblocks) well
+/// inside the gap-fill horizon.
+#[test]
+fn a_transient_offer_stall_within_the_gap_fill_horizon_never_degrades() {
+    let (mut x, block, release) = blocked_harness(2);
+    for t in 0..5 {
+        x.tick(t);
+    }
+    x.h.try_take(take("c", 1, PictureBus::Clean)).unwrap();
+    let (_, now) = apply(&mut x, 5, "c");
+    let mut t = now;
+    for _ in 0..3 {
+        x.tick(t);
+        t += 1;
+    }
+    block.store(true, Ordering::SeqCst);
+    // A stall shorter than MAX_GAP_FILL_TICKS: well under the degraded bound.
+    let stall_ticks = MAX_GAP_FILL_TICKS.saturating_sub(2).max(1);
+    for _ in 0..stall_ticks {
+        x.tick(t);
+        t += 1;
+    }
+    block.store(false, Ordering::SeqCst);
+    for _ in 0..10 {
+        x.tick(t);
+        t += 1;
+    }
+    assert!(
+        !x.h.snapshot().outputs[1].degraded,
+        "a transient stall under the gap-fill horizon never degrades"
+    );
+    assert!(
+        x.results()
+            .iter()
+            .all(|r| !matches!(r, TakeResult::Fallback(_))),
+        "no fallback from a transient stall"
+    );
+    assert_eq!(x.d.binding_video_key(1), Some(1), "still on the Clean key");
+    drop(release);
+}
