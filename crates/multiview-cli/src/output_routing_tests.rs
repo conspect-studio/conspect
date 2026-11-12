@@ -513,6 +513,15 @@ impl Harness {
     fn results(&self) -> Vec<TakeResult> {
         self.outcomes.try_iter().map(|o| o.outcome).collect()
     }
+    /// Simulate a consumer gap on Clean exactly as the pipeline computes it:
+    /// `substitute_clean(skip_from..t)` is called for the missing range
+    /// (never published/ticked at all — the hot queue shed them), BEFORE
+    /// this tick's own `publish_clean`/`on_tick` for the surviving tick `t`,
+    /// matching the pipeline's call order.
+    fn tick_after_clean_gap(&mut self, skip_from: u64, t: u64) {
+        self.r.substitute_clean(skip_from..t);
+        self.tick(t);
+    }
 }
 
 fn src() -> PictureBus {
@@ -2138,4 +2147,76 @@ fn a_transient_offer_stall_within_the_gap_fill_horizon_never_degrades() {
     );
     assert_eq!(x.d.binding_video_key(1), Some(1), "still on the Clean key");
     drop(release);
+}
+
+/// R2-1 (media lens): a bake-consumer stall sheds hot-queue ticks from the
+/// Clean bus exactly like Program's own base-worker substitution loop.
+/// Scenario: a genuine consumer gap of `k = 8` missed ticks (never
+/// published/ticked at all, simulating what the pipeline's
+/// `missing_ticks_before` computes when the hot queue sheds them),
+/// substituted via `substitute_clean` before the surviving tick's own
+/// `publish_clean`/`on_tick`. Observed directly at the Clean live encoder
+/// (`PtrEnc`, which records every tick `encode()` actually received, i.e.
+/// strictly AFTER `GapFill` has already tried to paper over any gap):
+/// without `substitute_clean`, the Clean worker would be offered only the
+/// surviving tick 8+ ticks after its last offer — a gap beyond `GapFill`'s
+/// own `MAX_GAP_FILL_TICKS` bound — and `GapFill::encode` would return an
+/// error (`tick gap ...`), ending the worker thread and failing the key
+/// (`Fallback`). The fix makes the Clean worker see every tick strictly
+/// consecutively (the substituted ticks, then the surviving tick), so
+/// `GapFill` never sees a gap at all and the key survives.
+#[test]
+fn a_consumer_gap_on_clean_is_substituted_like_program_and_never_fails_the_key() {
+    let (mut x, seen) = ptr_harness(2);
+    for t in 0..5 {
+        x.tick(t);
+    }
+    x.h.try_take(take("c", 1, PictureBus::Clean)).unwrap();
+    let (_, now) = apply(&mut x, 5, "c");
+    let mut t = now;
+    for _ in 0..3 {
+        x.tick(t);
+        t += 1;
+    }
+    let last_fed_tick = t;
+    // The genuine consumer gap: `FRAME_SUBSTITUTION_LIMIT` in `pipeline.rs`
+    // is 8, matching `MAX_GAP_FILL_TICKS` — exactly the boundary where an
+    // unfilled gap handed straight to the Clean worker (no
+    // `substitute_clean`) would fail it outright, since `GapFill::encode`
+    // checks `item.tick - next > MAX_GAP_FILL_TICKS` BEFORE filling anything
+    // in, and 8 is already over that strict `>` bound once GapFill's own
+    // `next` is one past `last_fed_tick`.
+    let gap: u64 = 8;
+    let surviving_tick = last_fed_tick + gap + 1;
+    x.tick_after_clean_gap(last_fed_tick + 1, surviving_tick);
+    // Let the worker thread drain everything it was offered.
+    std::thread::sleep(std::time::Duration::from_millis(50));
+    assert!(
+        x.results()
+            .iter()
+            .all(|r| !matches!(r, TakeResult::Fallback(_))),
+        "the Clean key must not fail from a substituted consumer gap: {:?}",
+        x.results()
+    );
+    assert!(
+        !x.d.is_key_failed(1),
+        "the Clean key's encoder must not have ended from an unfilled gap"
+    );
+    let ticks: Vec<u64> = seen.lock().unwrap().iter().map(|(t, _)| *t).collect();
+    assert!(
+        ticks.contains(&surviving_tick),
+        "the surviving tick reached the Clean encoder: {ticks:?}"
+    );
+    assert!(
+        ticks.windows(2).all(|w| w[1] == w[0] + 1),
+        "the Clean encoder's observed tick sequence is strictly consecutive \
+         with no gap, proving the substituted ticks closed it: {ticks:?}"
+    );
+    assert!(
+        ticks
+            .iter()
+            .min()
+            .is_some_and(|&first| first <= last_fed_tick),
+        "the sequence covers back through the last healthy tick: {ticks:?}"
+    );
 }

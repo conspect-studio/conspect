@@ -825,6 +825,52 @@ impl OutputRouter {
         }
     }
 
+    /// Substitute every tick in `ticks` on the Clean bus with its own last
+    /// pre-bake frame, exactly like Program's base-worker substitution:
+    /// call on the bake consumer BEFORE [`Self::publish_clean`]/[`Self::on_tick`]
+    /// for the surviving tick, with the SAME range the base-worker
+    /// substitution loop computes, when a consumer stall sheds ticks from
+    /// the hot queue. Without this, a Clean live encoder would see only
+    /// surviving ticks and rely on its own `GapFill` (bounded by
+    /// [`MAX_GAP_FILL_TICKS`]) to absorb a consumer gap — which, combined
+    /// with any dropped offers, can exceed that bound and fail the key.
+    ///
+    /// For each Clean dynamic key with a last-fed canvas, offers
+    /// `BakedTick { tick, canvas: last_fed }` (non-blocking, like
+    /// [`Self::feed`]) for every tick in `ticks`, in increasing order, and
+    /// advances that key's `last_aux_tick` to the last substituted tick so
+    /// `feed()` for the surviving tick does not re-offer or re-count these
+    /// already-substituted ticks as held. Does nothing (one bool check)
+    /// unless Clean is active or a Clean key has no canvas yet. Never
+    /// blocks: a dropped substitution offer is tolerated exactly like a
+    /// dropped `feed()` offer (absorbed by the key's own `GapFill`, within
+    /// its bound).
+    pub(crate) fn substitute_clean(&mut self, ticks: std::ops::Range<u64>) {
+        if !self.clean_active {
+            return;
+        }
+        for d in &mut self.dynamic {
+            if d.bus != PictureBus::Clean {
+                continue;
+            }
+            let Some(worker) = d.worker.as_ref() else {
+                continue;
+            };
+            let Some(canvas) = d.last_fed.clone() else {
+                continue;
+            };
+            let mut last = d.last_aux_tick;
+            for tick in ticks.clone() {
+                let _ = worker.offer(BakedTick {
+                    tick,
+                    canvas: Arc::clone(&canvas),
+                });
+                last = Some(tick);
+            }
+            d.last_aux_tick = last;
+        }
+    }
+
     /// One Program tick: drain dynamic events, takes, opens and dispatcher
     /// outcomes; advance every take; feed live-opened encoders. Never waits.
     ///

@@ -338,9 +338,14 @@ source and the same source on a full-canvas Program cell give byte-identical fra
   before the router's tick, so the Clean encoder gets frame T in tick T. It is one `Arc` clone into
   a wait-free `SwapCell`, no copy, and a single cached-bool check when nothing selects Clean. The
   aux thread never composes Clean and never wakes for it: routing only Clean leaves the clock's aux
-  gate closed and sends no aux tick. Clean is always fresh (§4.5), its health never degrades, and
-  an aux-thread failure never moves an output off Clean (only aux-composed buses fall back).
-  `audio = follow` on Clean is the program mix.
+  gate closed and sends no aux tick. Clean is always fresh for the take gate (§4.5): it is published
+  every tick by the bake consumer itself, never by the aux thread, so an aux-thread failure never
+  moves an output off Clean (only aux-composed buses fall back on that path). Clean's health still
+  degrades and falls back exactly like every other bus (§4.2 step 6, §4.4) when its OWN live encoder
+  refuses frames (a full worker queue) — a starved encoder, not a stale feed. A bake-consumer stall
+  that sheds hot-queue ticks substitutes Clean with its own last pre-bake frame
+  (`OutputRouter::substitute_clean`), exactly like Program's base-worker substitution, so a consumer
+  gap alone never fails the Clean key either. `audio = follow` on Clean is the program mix.
 
 ---
 
