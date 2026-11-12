@@ -1,3 +1,4 @@
+#![cfg(unix)]
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::print_stderr)]
 use multiview_webengine::{
     artifact::{ArtifactStore, Limits, Provenance},

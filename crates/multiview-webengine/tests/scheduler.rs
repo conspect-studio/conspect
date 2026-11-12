@@ -1,3 +1,4 @@
+#![cfg(unix)]
 //! Scheduler tests against the real queued service with fake producers.
 //! A manual clock drives all timing; counts come from the producer's run log.
 //! The only real-time use is a hang guard.

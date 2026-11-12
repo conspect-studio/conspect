@@ -1,3 +1,4 @@
+#![cfg(unix)]
 //! Reproduce HTTP's lost receipt after durable correlated service admission.
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 mod support;

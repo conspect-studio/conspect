@@ -1101,6 +1101,90 @@ jobs:
           otool -L "$bin" | grep -q "${FF_PREFIX}/lib/libavformat" \
             || { echo "::error::test binary is not linked against ${FF_PREFIX}"; exit 1; }
 
+  # ── Windows: pinned LGPL FFmpeg (MSVC) + workspace check + libav suite ─────────
+  # ADR-0011 amendment. Builds OUR pinned FFmpeg with FF_HWACCEL=windows via
+  # deploy/ffmpeg-build.sh from MSYS2 inside the MSVC environment (deps from
+  # vcpkg), caches the prefix on the build inputs, then checks the workspace and
+  # runs the multiview-ffmpeg suite against it. No third-party Windows FFmpeg.
+  windows-ffmpeg:
+    name: Windows pinned-FFmpeg check + test
+    runs-on: windows-2022
+    timeout-minutes: 120
+    needs: changes
+    if: ${{ github.event_name != 'pull_request' || needs.changes.outputs.code == 'true' }}
+    env:
+      VCPKG_ROOT: C:\vcpkg
+      FF_WIN_DEPS_WIN: C:\vcpkg\installed\x64-windows
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@1.99.1
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: windows-ffmpeg
+      - uses: msys2/setup-msys2@v2
+        with:
+          msystem: MSYS
+          path-type: inherit
+          install: make diffutils pkgconf nasm patch tar xz gnupg git
+      # Before msvc-dev-cmd: it repoints VCPKG_ROOT at the Visual Studio-bundled
+      # vcpkg, which has no classic mode. Use the runner's C:\vcpkg explicitly.
+      - name: "vcpkg deps (permissive only: opus BSD, libsrt MPL-2.0 + OpenSSL Apache-2.0, zlib)"
+        run: |
+          $env:VCPKG_ROOT = 'C:\vcpkg'
+          & 'C:\vcpkg\vcpkg.exe' install --classic --triplet x64-windows opus libsrt zlib
+      - uses: ilammy/msvc-dev-cmd@v1
+      - name: FFmpeg prefix outside the checkout (no `..`; actions/cache rejects it)
+        run: '"FF_PREFIX_WIN=$env:RUNNER_WORKSPACE\multiview-ffmpeg" | Out-File -Append $env:GITHUB_ENV'
+      - name: Cache pinned FFmpeg prefix
+        id: ffcache
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.FF_PREFIX_WIN }}
+          key: ffmpeg-windows-${{ hashFiles('deploy/ffmpeg-build.sh', 'deploy/ffmpeg-fetch-source.sh', 'deploy/ffmpeg-patches/**', 'deploy/Dockerfile.ffmpeg', '.github/workflows/ci.yml') }}
+      - name: Build pinned FFmpeg (windows profile)
+        if: steps.ffcache.outputs.cache-hit != 'true'
+        shell: msys2 {0}
+        run: |
+          set -euo pipefail
+          pin() { sed -n "s/^ARG $1=//p" deploy/Dockerfile.ffmpeg | head -1; }
+          deps="$(cygpath -u "$FF_WIN_DEPS_WIN")"
+          export PKG_CONFIG_PATH="$deps/lib/pkgconfig" FF_WIN_DEPS="$deps"
+          export INCLUDE="$FF_WIN_DEPS_WIN\include;$INCLUDE" LIB="$FF_WIN_DEPS_WIN\lib;$LIB"
+          FF_PREFIX="$(cygpath -u "$RUNNER_WORKSPACE")/multiview-ffmpeg" FF_LICENSE=lgpl FF_HWACCEL=windows TARGETARCH=amd64 \
+            FFMPEG_VERSION="$(pin FFMPEG_VERSION)" FFMPEG_SHA256="$(pin FFMPEG_SHA256)" \
+            FFMPEG_GIT_COMMIT="$(pin FFMPEG_GIT_COMMIT)" bash deploy/ffmpeg-build.sh
+      - name: Re-assert the IO allowlist (cache hits included)
+        shell: msys2 {0}
+        run: |
+          set -euo pipefail
+          FF_PREFIX="$(cygpath -u "$RUNNER_WORKSPACE")/multiview-ffmpeg" FF_HWACCEL=windows \
+            FF_WIN_DEPS="$(cygpath -u "$FF_WIN_DEPS_WIN")" bash deploy/ffmpeg-build.sh --assert-features
+      - name: Assert LGPL-only, NVENC/D3D11VA present, soname 63; export env
+        run: |
+          $prefix = "$env:RUNNER_WORKSPACE\multiview-ffmpeg"
+          $env:PATH = "$prefix\bin;$env:FF_WIN_DEPS_WIN\bin;$env:PATH"
+          if (-not (Test-Path "$prefix\bin\avcodec-63.dll")) { throw "avcodec-63.dll missing" }
+          if (-not (ffmpeg -hide_banner -encoders | Select-String "h264_nvenc")) { throw "h264_nvenc missing" }
+          if (ffmpeg -hide_banner -buildconf | Select-String "enable-gpl|enable-nonfree|libx26") { throw "GPL/nonfree component in the Windows FFmpeg" }
+          # ffmpeg-sys-next on MSVC links from FFMPEG_DIR (import libs in lib/);
+          # bindgen needs libclang (LLVM is preinstalled on windows-2022).
+          "FFMPEG_DIR=$prefix" | Out-File -Append $env:GITHUB_ENV
+          "LIBCLANG_PATH=C:\Program Files\LLVM\bin" | Out-File -Append $env:GITHUB_ENV
+          "PKG_CONFIG_PATH=$prefix\lib\pkgconfig" | Out-File -Append $env:GITHUB_ENV
+          "$prefix\bin" | Out-File -Append $env:GITHUB_PATH
+          "$env:FF_WIN_DEPS_WIN\bin" | Out-File -Append $env:GITHUB_PATH
+      - name: cargo check --workspace
+        run: cargo check --locked --workspace
+      - name: clippy multiview-ffmpeg --features ffmpeg
+        run: cargo clippy --locked -p multiview-ffmpeg --features ffmpeg --all-targets -- -D warnings
+      - name: test multiview-ffmpeg --features ffmpeg (codec selection + NVENC fallback)
+        run: cargo test --locked -p multiview-ffmpeg --features ffmpeg --test codec_select
+
   # ── AsyncAPI 3.0 spec validation (SUR-6b follow-on, folded into IN-7) ────────
   # Validates docs/api/asyncapi.json against the AsyncAPI 3.0 JSON Schema using
   # the official @asyncapi/cli. The spec is generated by `cargo xtask gen-asyncapi`

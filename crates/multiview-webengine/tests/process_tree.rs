@@ -1,3 +1,6 @@
+// The /proc process-tree sampler is exercised against Linux fixtures and, in
+// places, the live Linux kernel; the file is Linux-only.
+#![cfg(target_os = "linux")]
 //! Process-tree walking against a **fixture** `/proc`, never the host's.
 //!
 //! The regression this file exists for: ADR-0102's measured bug where a sampler

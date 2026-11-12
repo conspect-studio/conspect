@@ -1,3 +1,4 @@
+#![cfg(unix)]
 //! Deterministic runner tests against fake producer executables (no browser).
 //! Success never depends on wall-clock timing; deadlines are only hang guards.
 #![allow(

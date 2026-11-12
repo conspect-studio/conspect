@@ -19,14 +19,12 @@ impl Tools {
     /// # Errors
     /// Rejects relative paths, `..` components, and non-executable files.
     pub fn validate(&self) -> std::io::Result<()> {
-        use std::os::unix::fs::PermissionsExt;
         for path in [&self.node, &self.browser, &self.ffmpeg] {
             let ok = path.is_absolute()
                 && !path
                     .components()
                     .any(|c| matches!(c, std::path::Component::ParentDir))
-                && std::fs::metadata(path)
-                    .is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0);
+                && std::fs::metadata(path).is_ok_and(|m| m.is_file() && is_executable(&m));
             if !ok {
                 return Err(std::io::Error::other("untrusted or missing tool path"));
             }
@@ -160,4 +158,16 @@ impl WindyView {
         }
         Ok(())
     }
+}
+
+#[cfg(unix)]
+fn is_executable(m: &std::fs::Metadata) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    m.permissions().mode() & 0o111 != 0
+}
+
+/// No executable bit off unix; the capture runtime does not run there.
+#[cfg(not(unix))]
+fn is_executable(_m: &std::fs::Metadata) -> bool {
+    false
 }
