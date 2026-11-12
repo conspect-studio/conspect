@@ -20,8 +20,11 @@ const MAX_STAGED_BYTES: usize = 16 * 1024 * 1024;
 const STAGE_DEADLINE: Duration = Duration::from_secs(2);
 /// Live (non-retired) dynamic video keys at once.
 const MAX_DYNAMIC_KEYS: usize = 8;
-/// Lifetime cap on dynamic slots (retired slots are never reused), so key
-/// churn cannot grow the stage vectors without bound.
+/// Hard cap on dynamic slots. A retired slot no binding references any more
+/// is reused (fully reset) by the next `add_video_key`, so key churn never
+/// grows the stage vectors and never exhausts this cap; it only bounds the
+/// pathological case of retired slots still referenced by a binding that has
+/// not yet been reconciled. The live cap above is the effective bound.
 const MAX_DYNAMIC_SLOTS: usize = 64;
 /// Per-binding FIFO of assembled windows waiting for their video part.
 const MAX_PENDING_WINDOWS: usize = 4;
@@ -1239,15 +1242,37 @@ impl RenditionDispatcher {
             .iter()
             .filter(|m| m.dynamic && !m.retired)
             .count();
+        let reusable = self.reusable_slot();
         if self.failed
             || self.finished
             || live >= MAX_DYNAMIC_KEYS
-            || dynamic >= MAX_DYNAMIC_SLOTS
+            || (reusable.is_none() && dynamic >= MAX_DYNAMIC_SLOTS)
             || i128::from(time_base.num).checked_mul(i128::from(self.cadence.num))
                 != i128::from(time_base.den).checked_mul(i128::from(self.cadence.den))
             || time_base.num <= 0
         {
             return Err(DispatchError::InvalidConfig);
+        }
+        if let Some(index) = reusable {
+            // Fully reset: no staged window, watermark or DTS history of the
+            // retired key survives. Its late events are the caller's to drop
+            // (the router tags them with a per-worker generation).
+            let (Some(stage), Some(tb), Some(meta)) = (
+                self.video.get_mut(index),
+                self.video_time_base.get_mut(index),
+                self.video_meta.get_mut(index),
+            ) else {
+                return Err(DispatchError::InvalidConfig);
+            };
+            *stage = StreamStage::new();
+            *tb = time_base;
+            *meta = VideoMeta {
+                dynamic: true,
+                retired: false,
+                failed: false,
+                gate: Some(gate),
+            };
+            return Ok(index);
         }
         let index = self.video.len();
         self.video.push(StreamStage::new());
@@ -1259,6 +1284,20 @@ impl RenditionDispatcher {
             gate: Some(gate),
         });
         Ok(index)
+    }
+    /// A retired dynamic slot that no binding reads, moves to or falls back
+    /// to (so no pending move or staged window can alias a new key there).
+    fn reusable_slot(&self) -> Option<usize> {
+        (self.base_video..self.video_meta.len()).find(|&k| {
+            self.video_meta
+                .get(k)
+                .is_some_and(|m| m.dynamic && m.retired)
+                && !self.bindings.iter().any(|b| {
+                    b.video_key == Some(k)
+                        || b.fallback == Some(k)
+                        || b.mv.is_some_and(|m| m.key == k)
+                })
+        })
     }
     /// Retire a dynamic key; its staged windows are dropped and later events
     /// for it are counted, never an error.

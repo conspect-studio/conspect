@@ -419,11 +419,44 @@ impl RenditionWorker {
     /// # Errors
     /// Returns the encoder's failure, or an error if the worker panicked.
     pub fn join(self) -> Result<(), PipelineError> {
+        self.close_input().join()
+    }
+
+    /// Drop the input sender now, without waiting: the worker leaves its
+    /// receive loop, runs `finish()` and its terminal event, and ends on its
+    /// own. The returned handle may be joined later or dropped (detached) —
+    /// either way no thread outlives its key with a live input.
+    #[must_use]
+    pub fn close_input(self) -> ClosingWorker {
         drop(self.input);
+        ClosingWorker {
+            thread: self.thread,
+        }
+    }
+}
+
+/// A [`RenditionWorker`] whose input is already closed (see
+/// [`RenditionWorker::close_input`]).
+pub struct ClosingWorker {
+    thread: JoinHandle<Result<(), PipelineError>>,
+}
+
+impl ClosingWorker {
+    /// Wait for `finish()` and the terminal event.
+    ///
+    /// # Errors
+    /// Returns the encoder's failure, or an error if the worker panicked.
+    pub fn join(self) -> Result<(), PipelineError> {
         self.thread.join().map_err(|_| PipelineError::Output {
             kind: "video-worker",
             reason: "video rendition worker panicked".to_owned(),
         })?
+    }
+
+    /// The worker thread has ended.
+    #[must_use]
+    pub fn is_finished(&self) -> bool {
+        self.thread.is_finished()
     }
 }
 

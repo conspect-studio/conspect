@@ -951,3 +951,267 @@ fn a_slow_close_never_blocks_the_consumer() {
         "handed to the reaper, not dropped"
     );
 }
+
+/// A live encoder that counts its live worker threads (the encoder is owned
+/// by the worker thread and dropped when that thread ends) and whose
+/// `finish()` takes `finish_ms`.
+struct Counted {
+    inner: FakeEnc,
+    live: Arc<AtomicUsize>,
+    finish_ms: u64,
+}
+
+impl Counted {
+    fn boxed(live: &Arc<AtomicUsize>, finish_ms: u64) -> Box<dyn VideoEncodeWorker> {
+        live.fetch_add(1, Ordering::SeqCst);
+        Box::new(Self {
+            inner: FakeEnc {
+                forced: false,
+                encoded: Arc::new(AtomicUsize::new(0)),
+            },
+            live: Arc::clone(live),
+            finish_ms,
+        })
+    }
+}
+
+impl Drop for Counted {
+    fn drop(&mut self) {
+        self.live.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+impl VideoEncodeWorker for Counted {
+    fn encode(&mut self, item: BakedTick) -> Result<Vec<EncodedPacket>, PipelineError> {
+        self.inner.encode(item)
+    }
+    fn reorder_bound(&self) -> ReorderBound {
+        ReorderBound::NoReorder
+    }
+    fn finish(&mut self) -> Result<Vec<EncodedPacket>, PipelineError> {
+        std::thread::sleep(std::time::Duration::from_millis(self.finish_ms));
+        Ok(Vec::new())
+    }
+    fn force_keyframe(&mut self) {}
+}
+
+/// Register a live key in the dispatcher and the router, as `drain_opens`
+/// does, around an arbitrary worker.
+fn inject(
+    r: &mut OutputRouter,
+    d: &mut RenditionDispatcher,
+    bus: PictureBus,
+    worker: Box<dyn VideoEncodeWorker>,
+) -> usize {
+    let key = d
+        .add_video_key(DtsTimeBase { num: 1, den: 5 }, Box::new(|_| true))
+        .unwrap();
+    let lost = Arc::new(AtomicBool::new(false));
+    let generation = r.next_generation;
+    r.next_generation += 1;
+    let w = r
+        .spawn_live_worker(
+            key,
+            generation,
+            Rational::new(1, 5),
+            worker,
+            Arc::clone(&lost),
+        )
+        .unwrap();
+    r.dynamic.push(DynamicKey {
+        bus,
+        settings: 0,
+        key,
+        worker: Some(w),
+        force_at: force_cell(),
+        principal: "p".to_owned(),
+        linger_deadline: None,
+        lingering_since: 0,
+        last_fed: None,
+        last_aux_tick: None,
+        seen_event: false,
+        lost,
+        generation,
+    });
+    key
+}
+
+/// A (lens 2 #1, lens 3 #1): 12 closes while the reaper is inside a 3 s
+/// finish. The reaper queue (8) overflows; the overflowed handles are dropped
+/// unjoined. Bound: every worker thread ends within 3 s + 1.5 s of the
+/// closes (they finish concurrently because each input is closed before the
+/// handoff), never serially behind the reaper (12 x 3 s), and no close call
+/// takes > 50 ms.
+#[test]
+fn closes_beyond_the_reaper_queue_never_leave_a_worker_thread_running() {
+    let live = Arc::new(AtomicUsize::new(0));
+    let (mut r, _h, _aux) = router(1, 6, Box::new(|_| Err("never".to_owned())));
+    let mut d = dispatcher(1);
+    let mut worst = std::time::Duration::ZERO;
+    for i in 0..12 {
+        let key = inject(
+            &mut r,
+            &mut d,
+            PictureBus::Source(format!("s{i}")),
+            Counted::boxed(&live, 3000),
+        );
+        let started = Instant::now();
+        r.close(key, &mut d);
+        worst = worst.max(started.elapsed());
+    }
+    assert!(r.reaper_overflow >= 3, "overflow: {}", r.reaper_overflow);
+    assert!(
+        worst < std::time::Duration::from_millis(50),
+        "close {worst:?}"
+    );
+    let closed = Instant::now();
+    while live.load(Ordering::SeqCst) > 0
+        && closed.elapsed() < std::time::Duration::from_millis(4500)
+    {
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    assert_eq!(
+        live.load(Ordering::SeqCst),
+        0,
+        "every worker thread ended within {:?}",
+        closed.elapsed()
+    );
+}
+
+/// A: a live worker whose event queue is never drained never blocks. Bound:
+/// 200 ticks encoded within 2 s with nobody reading (queue 64), every drop
+/// counted, the key marked lost; the next consumer drain fails that key
+/// alone (retired, output falls back) in < 50 ms; after close the thread ends.
+#[test]
+fn an_undrained_live_worker_drops_its_events_and_never_blocks() {
+    let live = Arc::new(AtomicUsize::new(0));
+    let (mut r, h, _aux) = router(1, 6, Box::new(|_| Err("never".to_owned())));
+    let mut d = dispatcher(1);
+    let key = inject(&mut r, &mut d, src(), Counted::boxed(&live, 0));
+    let started = Instant::now();
+    let mut offered = 0_u64;
+    while offered < 200 && started.elapsed() < std::time::Duration::from_secs(2) {
+        let w = r.dynamic[0].worker.as_ref().unwrap();
+        if w.offer(BakedTick {
+            tick: offered,
+            canvas: canvas(),
+        })
+        .is_ok()
+        {
+            offered += 1;
+        } else {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+    }
+    assert_eq!(offered, 200, "the worker kept taking input");
+    let deadline = Instant::now();
+    while r.dyn_dropped.load(Ordering::Relaxed) < 200 - 64
+        && deadline.elapsed() < std::time::Duration::from_secs(1)
+    {
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    assert!(r.dyn_dropped.load(Ordering::Relaxed) >= 200 - 64);
+    assert!(r.dynamic[0].lost.load(Ordering::Acquire));
+    let tick = Instant::now();
+    r.on_tick(1, MediaTime::from_nanos(0), &mut d, &mut NoDelivery)
+        .unwrap();
+    assert!(tick.elapsed() < std::time::Duration::from_millis(50));
+    assert!(d.is_key_failed(key), "the key fails alone");
+    assert_eq!(d.binding_video_key(0), Some(0), "Program untouched");
+    assert!(h.snapshot().dropped_live_events >= 200 - 64);
+    let closed = Instant::now();
+    while live.load(Ordering::SeqCst) > 0 && closed.elapsed() < std::time::Duration::from_secs(1) {
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    assert_eq!(live.load(Ordering::SeqCst), 0, "worker thread ended");
+}
+
+/// B (lens 2 #2): 200 sequential open/close cycles all succeed (the live cap
+/// is the only bound, retired slots are reused), the stage vectors never grow
+/// past base + live cap, and a closed worker's late event never reaches the
+/// key that reused its slot.
+#[test]
+fn two_hundred_open_close_cycles_reuse_retired_slots() {
+    let live = Arc::new(AtomicUsize::new(0));
+    let (mut r, _h, _aux) = router(1, 6, Box::new(|_| Err("never".to_owned())));
+    let mut d = dispatcher(1);
+    for i in 0..200 {
+        let key = inject(&mut r, &mut d, src(), Counted::boxed(&live, 0));
+        assert!(key >= 1, "cycle {i}");
+        r.close(key, &mut d);
+        r.drain_live_events(&mut d, &mut NoDelivery).unwrap();
+    }
+    assert!(
+        d.video_key_count() <= 2,
+        "slots reused: {}",
+        d.video_key_count()
+    );
+    // A late event tagged with a closed worker's generation is dropped.
+    // Let every closed worker end and its tail be drained (and counted).
+    let waited = Instant::now();
+    while live.load(Ordering::SeqCst) > 0 && waited.elapsed() < std::time::Duration::from_secs(2) {
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    assert_eq!(live.load(Ordering::SeqCst), 0, "closed workers ended");
+    r.drain_live_events(&mut d, &mut NoDelivery).unwrap();
+    let key = inject(&mut r, &mut d, src(), Counted::boxed(&live, 0));
+    let before = r.dyn_dropped.load(Ordering::Relaxed);
+    r.dyn_tx
+        .try_send((
+            0,
+            DispatchEvent::Video {
+                key_index: key,
+                tick: 0,
+                timebase: Rational::new(1, 5),
+                packets: vec![pkt(0, true)],
+                watermark: None,
+            },
+        ))
+        .unwrap();
+    r.drain_live_events(&mut d, &mut NoDelivery).unwrap();
+    assert_eq!(r.dyn_dropped.load(Ordering::Relaxed), before + 1);
+    assert!(!d.is_key_failed(key), "the new key is untouched");
+    assert!(!r.dynamic[0].seen_event);
+}
+
+/// B: an open whose result arrives on its deadline tick (before the take's
+/// own deadline check) is reaped, never registered: no slot is consumed.
+#[test]
+fn a_deadline_missed_open_never_takes_a_slot() {
+    let (release, gate) = mpsc::channel::<()>();
+    let gate = Mutex::new(gate);
+    let encoded = Arc::new(AtomicUsize::new(0));
+    let enc = Arc::clone(&encoded);
+    let open: OpenFn = Box::new(move |_| {
+        let _ = gate.lock().unwrap().recv();
+        let e: Box<dyn LiveEncoder> = Box::new(FakeEnc {
+            forced: false,
+            encoded: Arc::clone(&enc),
+        });
+        Ok(e)
+    });
+    let mut x = harness(2, 6, Some(open));
+    x.tick(0);
+    x.h.try_take(take("a", 1, src())).unwrap();
+    let mut t = 1;
+    while x.r.opens.is_empty() {
+        x.tick(t);
+        t += 1;
+        assert!(t < 10, "admitted");
+    }
+    let deadline = x.r.opens.values().next().unwrap().deadline;
+    while t < deadline {
+        x.tick(t);
+        t += 1;
+    }
+    release.send(()).unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(100));
+    x.tick(t);
+    assert_eq!(
+        x.results(),
+        vec![TakeResult::Refused(RefuseReason::EncoderNotReady)]
+    );
+    assert_eq!(x.d.video_key_count(), 1, "no slot consumed");
+    assert_eq!(x.h.snapshot().dynamic_encoders_live, 0);
+    assert_eq!(x.d.binding_video_key(1), Some(0));
+}

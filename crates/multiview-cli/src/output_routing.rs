@@ -30,7 +30,7 @@ use crate::rendition_dispatch::{
     DispatchError, DtsTimeBase, MoveGate, MoveOutcome, MoveRefusal, RenditionDispatcher,
 };
 use crate::rendition_workers::{
-    BakedTick, DispatchEvent, RenditionWorker, ReorderBound, VideoEncodeWorker,
+    BakedTick, ClosingWorker, DispatchEvent, RenditionWorker, ReorderBound, VideoEncodeWorker,
 };
 use crate::routing_aux::{AuxFeed, AuxFeeds, PictureBus, PictureBusSlot};
 
@@ -168,6 +168,9 @@ pub struct RoutingSnapshot {
     pub dropped_outcomes: u64,
     /// Workers dropped unjoined because the reaper queue was full.
     pub reaper_overflow: u64,
+    /// Live-opened workers' events dropped because the consumer queue was
+    /// full (the key then fails alone) or the key was already closed.
+    pub dropped_live_events: u64,
     /// Video encoder keys the dispatcher has ever registered (base + live).
     pub video_keys: usize,
     /// Clock ticks handed to the aux thread (0 while nothing is routed).
@@ -387,7 +390,8 @@ struct OpenResult {
 }
 
 enum Reap {
-    Worker(RenditionWorker),
+    /// A worker whose input is already closed: it finishes on its own.
+    Worker(ClosingWorker),
     Encoder(Box<dyn LiveEncoder>),
 }
 
@@ -403,6 +407,14 @@ struct DynamicKey {
     last_fed: Option<Arc<Nv12Image>>,
     last_aux_tick: Option<u64>,
     seen_event: bool,
+    /// Set by the worker's event sink when it had to drop an event (the
+    /// consumer's queue was full): the key's window stream has a hole, so
+    /// the key fails alone at the next drain.
+    lost: Arc<AtomicBool>,
+    /// Router-unique id of this key's worker. Every event the worker sends is
+    /// tagged with it, so a late event of a closed worker whose dispatcher
+    /// slot was reused is dropped and counted, never applied to the new key.
+    generation: u64,
 }
 
 struct PendingOpen {
@@ -459,13 +471,16 @@ pub struct OutputRouter {
     open_tx: SyncSender<OpenRequest>,
     open_rx: Receiver<OpenResult>,
     reap_tx: SyncSender<Reap>,
-    dyn_tx: SyncSender<DispatchEvent>,
-    dyn_rx: Receiver<DispatchEvent>,
+    dyn_tx: SyncSender<(u64, DispatchEvent)>,
+    dyn_rx: Receiver<(u64, DispatchEvent)>,
+    next_generation: u64,
     feeds: HashMap<PictureBus, AuxFeed>,
     health: HashMap<PictureBus, BusHealth>,
     last_forced: HashMap<usize, u64>,
     dropped_outcomes: u64,
     reaper_overflow: u64,
+    /// Events dropped by live-opened workers' sinks (shared with them).
+    dyn_dropped: Arc<AtomicU64>,
     video_keys: usize,
     /// Items handed to the reaper this run (0 = nothing to wait for at the end).
     reaped: u64,
@@ -553,11 +568,13 @@ impl OutputRouter {
             reap_tx,
             dyn_tx,
             dyn_rx,
+            next_generation: 0,
             feeds: HashMap::new(),
             health: HashMap::new(),
             last_forced: HashMap::new(),
             dropped_outcomes: 0,
             reaper_overflow: 0,
+            dyn_dropped: Arc::new(AtomicU64::new(0)),
             video_keys: 0,
             reaped: 0,
             dirty: true,
@@ -611,11 +628,25 @@ impl OutputRouter {
         dispatcher: &mut RenditionDispatcher,
         delivery: &mut D,
     ) -> Result<(), DispatchError> {
-        while let Ok(event) = self.dyn_rx.try_recv() {
-            if let DispatchEvent::Video { key_index, .. } = &event {
-                if let Some(d) = self.dynamic.iter_mut().find(|d| d.key == *key_index) {
-                    d.seen_event = true;
-                }
+        // A key whose sink dropped an event has a hole: it fails alone (its
+        // subscribers fall back to Program through the dispatcher).
+        let lost: Vec<usize> = self
+            .dynamic
+            .iter()
+            .filter(|d| d.lost.load(Ordering::Acquire))
+            .map(|d| d.key)
+            .collect();
+        for key in lost {
+            self.close(key, dispatcher);
+        }
+        while let Ok((generation, event)) = self.dyn_rx.try_recv() {
+            let Some(d) = self.dynamic.iter_mut().find(|d| d.generation == generation) else {
+                // A closed worker's late event (its slot may be reused).
+                self.dyn_dropped.fetch_add(1, Ordering::Relaxed);
+                continue;
+            };
+            if matches!(event, DispatchEvent::Video { .. }) {
+                d.seen_event = true;
             }
             if let Err(e) = dispatcher.dispatch(event, Instant::now(), delivery) {
                 if !matches!(e, DispatchError::Admission { .. }) {
@@ -722,8 +753,20 @@ impl OutputRouter {
                 continue;
             };
             let tb = encoder.time_base();
-            let Some(index) = waiter else {
+            // Register the key only while the take still waits for exactly
+            // this open within its deadline; otherwise the encoder never
+            // takes a dispatcher slot.
+            let waiting = waiter.filter(|&index| {
+                self.outputs
+                    .get(index)
+                    .and_then(|o| o.pending.as_ref())
+                    .is_some_and(|p| p.phase == Phase::Opening(result.id))
+            });
+            let Some(index) = waiting.filter(|_| tick < open.deadline) else {
                 self.reap(Reap::Encoder(encoder));
+                if waiting.is_some() {
+                    refuse(self);
+                }
                 continue;
             };
             encoder.start_at(tick);
@@ -746,14 +789,11 @@ impl OutputRouter {
                 next: None,
                 last: None,
             };
-            let tx = self.dyn_tx.clone();
+            let lost = Arc::new(AtomicBool::new(false));
+            let generation = self.next_generation;
+            self.next_generation = self.next_generation.wrapping_add(1);
             let spawned =
-                RenditionWorker::spawn(key, self.cfg.cadence, tb, Box::new(worker), move |event| {
-                    tx.send(event).map_err(|e| PipelineError::Output {
-                        kind: "routing-worker",
-                        reason: e.to_string(),
-                    })
-                });
+                self.spawn_live_worker(key, generation, tb, Box::new(worker), Arc::clone(&lost));
             let Ok(worker) = spawned else {
                 let _ = dispatcher.retire_video_key(key);
                 refuse(self);
@@ -772,6 +812,8 @@ impl OutputRouter {
                 last_fed: None,
                 last_aux_tick: None,
                 seen_event: false,
+                lost,
+                generation,
             });
             // The first offer (frame T, an IDR) is made by `feed` this same
             // tick, after the key exists. The move is requested once the key's
@@ -783,6 +825,40 @@ impl OutputRouter {
                 };
             }
         }
+    }
+
+    /// Spawn a live-opened worker whose event sink never blocks: a full
+    /// consumer queue drops the event, counts it and marks the key `lost`
+    /// (every later event of that worker is dropped too, so the dispatcher
+    /// never sees a stream with a hole); a closed queue ends the worker.
+    fn spawn_live_worker(
+        &self,
+        key: usize,
+        generation: u64,
+        tb: Rational,
+        worker: Box<dyn VideoEncodeWorker>,
+        lost: Arc<AtomicBool>,
+    ) -> Result<RenditionWorker, PipelineError> {
+        let tx = self.dyn_tx.clone();
+        let dropped = Arc::clone(&self.dyn_dropped);
+        RenditionWorker::spawn(key, self.cfg.cadence, tb, worker, move |event| {
+            if lost.load(Ordering::Acquire) {
+                dropped.fetch_add(1, Ordering::Relaxed);
+                return Ok(());
+            }
+            match tx.try_send((generation, event)) {
+                Ok(()) => Ok(()),
+                Err(TrySendError::Full(_)) => {
+                    lost.store(true, Ordering::Release);
+                    dropped.fetch_add(1, Ordering::Relaxed);
+                    Ok(())
+                }
+                Err(TrySendError::Disconnected(_)) => Err(PipelineError::Output {
+                    kind: "routing-worker",
+                    reason: "routing consumer ended".to_owned(),
+                }),
+            }
+        })
     }
 
     fn refuse_pending(&mut self, index: usize, tick: u64, reason: RefuseReason) {
@@ -1212,13 +1288,16 @@ impl OutputRouter {
         })
     }
 
-    /// Retire the key and hand its worker to the reaper. Never joins here.
+    /// Retire the key, close its worker's input and hand the closing worker
+    /// to the reaper. Never joins here; the input is closed BEFORE the
+    /// handoff, so a worker the reaper cannot take (queue full, shutdown
+    /// grace over) still leaves its loop, finishes and ends on its own.
     fn close(&mut self, key: usize, dispatcher: &mut RenditionDispatcher) {
         let _ = dispatcher.retire_video_key(key);
         if let Some(pos) = self.dynamic.iter().position(|d| d.key == key) {
             let mut d = self.dynamic.swap_remove(pos);
             if let Some(worker) = d.worker.take() {
-                self.reap(Reap::Worker(worker));
+                self.reap(Reap::Worker(worker.close_input()));
             }
             self.last_forced.remove(&key);
             self.dirty = true;
@@ -1292,6 +1371,7 @@ impl OutputRouter {
             opens_in_flight: self.opens.len(),
             dropped_outcomes: self.dropped_outcomes,
             reaper_overflow: self.reaper_overflow,
+            dropped_live_events: self.dyn_dropped.load(Ordering::Relaxed),
             video_keys: self.video_keys,
             aux_ticks_sent: self.aux.sent.load(Ordering::Relaxed),
         };
@@ -1321,6 +1401,14 @@ impl OutputRouter {
             self.close(key, dispatcher);
         }
         self.aux.active.store(false, Ordering::Release);
+        // Drain what the closing workers already queued (bounded): their keys
+        // are retired, so the events are only counted, never dispatched.
+        for _ in 0..DYNAMIC_EVENT_QUEUE.saturating_mul(2) {
+            if self.dyn_rx.try_recv().is_err() {
+                break;
+            }
+            self.dyn_dropped.fetch_add(1, Ordering::Relaxed);
+        }
         self.video_keys = dispatcher.video_key_count();
         self.publish_snapshot();
         let reaper = self.reaper.take();
