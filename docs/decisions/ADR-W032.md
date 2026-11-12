@@ -121,8 +121,8 @@ the warning vanished on the next restart. The amended rules:
      key (a whole-system action; a scoped key is `403`); any other code is `404`; `404` when
      nothing is pending. Under the config-mutation lock it removes the marker on the
      blocking pool (an unreadable or unparsable marker still counts as pending and is
-     removed), publishes `health.warning.cleared` through the drop-oldest lane (invariant
-     #10) and waits up to 2 s for the warning ingest to apply it — the broadcast is FIFO, so
+     removed); it then releases the lock, publishes `health.warning.cleared` through the
+     drop-oldest lane (invariant #10) and waits up to 250 ms for the warning ingest to apply it — the broadcast is FIFO, so
      a raise published earlier is applied first and cannot overwrite the clear — before
      writing the store directly as a last resort.
    - CLI: `multiview acknowledge-fallback <config>` removes the marker. It cannot reach a

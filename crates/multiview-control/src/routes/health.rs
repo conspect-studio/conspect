@@ -132,7 +132,7 @@ pub(crate) async fn ack_health_warning(
     };
     // Serialize with every other state-file writer (a concurrent commit or a
     // second acknowledge) across the read + remove.
-    let _mutation = state.lock_config_mutation().await;
+    let mutation = state.lock_config_mutation().await;
     let boot_path = model.boot_path().to_path_buf();
     let (marker_removed, marker_message) = tokio::task::spawn_blocking(move || {
         // An unreadable/oversized/unparsable marker still means "pending":
@@ -146,6 +146,10 @@ pub(crate) async fn ack_health_warning(
     .await
     .map_err(|e| ControlError::Repository(format!("acknowledge task failed: {e}")))?
     .map_err(|e| ControlError::Repository(format!("removing the start-up fallback marker: {e}")))?;
+    // The file work is done: release the config-mutation lock BEFORE waiting
+    // for the ingest, so an acknowledge never stalls config mutations or the
+    // running-state persister (review lens 2 round 2).
+    drop(mutation);
     let active = active_rejection(&state)?;
     if !marker_removed && active.is_none() {
         return Err(not_found());
@@ -184,7 +188,10 @@ pub(crate) async fn ack_health_warning(
 }
 
 /// How long an acknowledge waits for the warning ingest to apply its clear.
-const ACK_INGEST_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
+/// The ingest is one subscriber draining a bounded (64-deep) broadcast into an
+/// in-memory store, so our clear lands within a few events; 250 ms is ample,
+/// and on timeout the route writes the clear itself.
+const ACK_INGEST_WAIT: std::time::Duration = std::time::Duration::from_millis(250);
 
 /// The active `accepted-state-rejected` warning in the store, if any.
 fn active_rejection(state: &AppState) -> ControlResult<Option<HealthWarning>> {

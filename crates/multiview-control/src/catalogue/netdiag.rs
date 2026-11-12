@@ -201,9 +201,18 @@ fn redact_word(word: &str) -> String {
             w = format!("{}{}", &w[..i + 3], &rest[at + 1..]);
         }
     }
-    // Query string / fragment.
-    if let Some(i) = w.find(['?', '#']) {
-        w.truncate(i);
+    // Query string / fragment: removed up to the end of the URL (a closing
+    // quote/bracket/separator or the end of the word), keeping whatever
+    // follows it in the same word — a quoted URL in an error message
+    // (`"srt://h:1?passphrase=x":`) must not swallow the closing quote and the
+    // rest of the sentence (#324 review).
+    let mut from = 0;
+    while let Some(start) = w[from..].find(['?', '#']).map(|i| i + from) {
+        let end = w[start..]
+            .find(['"', '\'', ')', ']', '>', ',', ';', '`'])
+            .map_or(w.len(), |i| i + start);
+        w.replace_range(start..end, "");
+        from = start;
     }
     // Bare `key=value` secrets outside a query (`token=abc`, `sig:=`).
     if let Some((k, _)) = w.split_once('=') {
@@ -385,6 +394,21 @@ mod tests {
             redact_text("not available in your region"),
             "not available in your region"
         );
+    }
+
+    /// #324 review: a quoted URL's query is removed, but the closing quote and
+    /// the rest of the sentence survive.
+    #[test]
+    fn redact_text_keeps_the_text_after_a_quoted_query() {
+        let out = redact_text(
+            r#"srt "srt srt://host:9000?passphrase=sekrit&mode=caller": stream_id is 900 bytes"#,
+        );
+        assert_eq!(
+            out, r#"srt "srt srt://host:9000": stream_id is 900 bytes"#,
+            "{out}"
+        );
+        let out = redact_text(r#"("rist://h:1?secret=abc#frag", next)"#);
+        assert_eq!(out, r#"("rist://h:1", next)"#, "{out}");
     }
 
     use super::*;
