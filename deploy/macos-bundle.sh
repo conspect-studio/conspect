@@ -70,7 +70,10 @@ collect_licences() {
 }
 
 # Breadth-first copy of the dependency closure (bash 3.2 safe: no
-# associative arrays; a file already in lib/ has been visited).
+# associative arrays). SOURCES records "<basename> <realpath>" per bundled
+# library, so two different libraries with one basename are an error, not a
+# silent collapse.
+SOURCES="$(mktemp)"
 queue=("${BIN}")
 i=0
 while [ "${i}" -lt "${#queue[@]}" ]; do
@@ -79,9 +82,16 @@ while [ "${i}" -lt "${#queue[@]}" ]; do
   while read -r dep; do
     [ -n "${dep}" ] || continue
     name="$(basename "${dep}")"
-    [ -e "${LIB}/${name}" ] && continue
-    # Copy the real file behind any symlink chain, under the referenced name.
-    real="$(python3 -c 'import os,sys;print(os.path.realpath(sys.argv[1]))' "${dep}" 2>/dev/null || echo "${dep}")"
+    real="$(python3 -c 'import os,sys;print(os.path.realpath(sys.argv[1]))' "${dep}")"
+    prev="$(awk -v n="${name}" '$1 == n { print $2; exit }' "${SOURCES}")"
+    if [ -n "${prev}" ]; then
+      if [ "${prev}" != "${real}" ] && ! cmp -s "${prev}" "${real}"; then
+        echo "macos-bundle: two different libraries named ${name}: ${prev} and ${real}" >&2
+        exit 5
+      fi
+      continue
+    fi
+    printf '%s %s\n' "${name}" "${real}" >> "${SOURCES}"
     cp -f "${real}" "${LIB}/${name}"
     chmod u+w "${LIB}/${name}"
     collect_licences "${real}"
@@ -107,25 +117,53 @@ done
 rewrite "${BIN}"
 install_name_tool -add_rpath "@executable_path/lib" "${BIN}" 2>/dev/null || true
 
-# Verify: nothing outside the OS or the bundle is referenced any more.
+# Verify: every load command of every object resolves to the OS or to a file
+# in the bundle. @rpath / @loader_path / @executable_path references are
+# resolved here, not exempted.
+resolves() {
+  local obj="$1" dep="$2" name
+  name="$(basename "${dep}")"
+  case "${dep}" in
+    /usr/lib/* | /System/*) return 0 ;;
+    @rpath/* | @loader_path/* | @executable_path/*) [ -f "${LIB}/${name}" ] ;;
+    *) return 1 ;;
+  esac
+}
 bad=0
 for obj in "${BIN}" "${LIB}"/*.dylib; do
   [ -e "${obj}" ] || continue
-  if [ -n "$(deps_of "${obj}")" ]; then
-    echo "macos-bundle: ${obj} still references:" >&2
-    deps_of "${obj}" >&2
-    bad=1
-  fi
+  self="$(otool -D "${obj}" 2>/dev/null | sed -n 2p || true)"
+  while read -r dep; do
+    [ -n "${dep}" ] || continue
+    [ "${dep}" = "${self}" ] && continue
+    if ! resolves "${obj}" "${dep}"; then
+      echo "macos-bundle: ${obj} references ${dep}, which is not in the bundle or the OS" >&2
+      bad=1
+    fi
+  done < <(otool -L "${obj}" | tail -n +2 | awk '{print $1}')
 done
 [ "${bad}" = 0 ] || exit 3
 
 # Sign inside-out. install_name_tool invalidated every signature, and arm64
 # refuses to run unsigned code, so ad-hoc signing is the minimum.
+# The executable keeps hardened runtime but disables library validation, so a
+# user can replace a bundled LGPL dylib with their own (differently signed)
+# build, as the LGPL requires. The libraries themselves need no entitlement.
+ENTITLEMENTS="$(mktemp)"
+cat > "${ENTITLEMENTS}" <<'PLIST'
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+<key>com.apple.security.cs.disable-library-validation</key><true/>
+</dict></plist>
+PLIST
 sign() {
+  local extra=()
+  [ "$1" = "${BIN}" ] && extra=(--entitlements "${ENTITLEMENTS}")
   if [ "${IDENTITY}" = "-" ]; then
-    codesign --force --sign - "$1"
+    codesign --force --sign - ${extra[@]+"${extra[@]}"} "$1"
   else
-    codesign --force --options runtime --timestamp --sign "${IDENTITY}" "$1"
+    codesign --force --options runtime --timestamp --sign "${IDENTITY}" ${extra[@]+"${extra[@]}"} "$1"
   fi
 }
 for dylib in "${LIB}"/*.dylib; do

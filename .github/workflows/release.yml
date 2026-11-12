@@ -157,13 +157,23 @@ jobs:
         id: signing
         env:
           MACOS_CERTIFICATE: ${{ secrets.MACOS_CERTIFICATE }}
+          MACOS_CERTIFICATE_PWD: ${{ secrets.MACOS_CERTIFICATE_PWD }}
+          AC_API_KEY_ID: ${{ secrets.AC_API_KEY_ID }}
+          AC_API_ISSUER_ID: ${{ secrets.AC_API_ISSUER_ID }}
           AC_API_KEY_P8: ${{ secrets.AC_API_KEY_P8 }}
         run: |
-          if [ -n "${MACOS_CERTIFICATE:-}" ] && [ -n "${AC_API_KEY_P8:-}" ]; then
+          set=0
+          for v in MACOS_CERTIFICATE MACOS_CERTIFICATE_PWD AC_API_KEY_ID AC_API_ISSUER_ID AC_API_KEY_P8; do
+            [ -n "${!v:-}" ] && set=$((set + 1))
+          done
+          if [ "${set}" = 5 ]; then
             echo "enabled=true" >> "$GITHUB_OUTPUT"
-          else
+          elif [ "${set}" = 0 ]; then
             echo "enabled=false" >> "$GITHUB_OUTPUT"
-            echo "::notice::macOS signing secrets absent; shipping an unsigned binary."
+            echo "::notice::macOS signing secrets absent; shipping an ad-hoc signed, un-notarized binary."
+          else
+            echo "::error::macOS signing secrets are partly configured (${set}/5); set all five or none."
+            exit 1
           fi
 
       - name: Import signing certificate
@@ -201,21 +211,6 @@ jobs:
             for lib in libavcodec.63.dylib libavformat.63.dylib libavutil.61.dylib; do
               test -e "dist/${STAGE}/lib/${lib}" || { echo "::error::${lib} not bundled"; exit 1; }
             done
-            if [ "${SIGNING_ENABLED}" = "true" ]; then
-              # Notarize: notarytool wants an archive of the signed tree.
-              KEYFILE="$(mktemp)"
-              printf '%s' "${AC_API_KEY_P8}" > "${KEYFILE}"
-              ZIP="$(mktemp -d)/multiview.zip"
-              /usr/bin/ditto -c -k --keepParent "dist/${STAGE}" "${ZIP}"
-              xcrun notarytool submit "${ZIP}" \
-                --key "${KEYFILE}" \
-                --key-id "${AC_API_KEY_ID}" \
-                --issuer "${AC_API_ISSUER_ID}" \
-                --wait
-              rm -f "${KEYFILE}"
-              # CLI binaries can't be stapled (no bundle); the notarization
-              # ticket is served by Apple and checked online at first run.
-            fi
           fi
           if [ "${RUNNER_OS}" = "Linux" ]; then
             # Ship the pinned LGPL libav* next to the binary (dynamic linkage,
@@ -253,6 +248,25 @@ jobs:
           fi
           # Legal files are mandatory: a missing one fails the release.
           cp README.md LICENSE LICENSE-COMMERCIAL.md NOTICE THIRD-PARTY-NOTICES.md "dist/${STAGE}/"
+          if [ "${RUNNER_OS}" = "macOS" ] && [ "${SIGNING_ENABLED}" = "true" ]; then
+            # Notarize the finished tree (everything that ships), and require
+            # an Accepted verdict before anything is published.
+            KEYFILE="$(mktemp)"
+            printf '%s' "${AC_API_KEY_P8}" > "${KEYFILE}"
+            ZIP="$(mktemp -d)/multiview.zip"
+            /usr/bin/ditto -c -k --keepParent "dist/${STAGE}" "${ZIP}"
+            RESULT="$(xcrun notarytool submit "${ZIP}" \
+              --key "${KEYFILE}" \
+              --key-id "${AC_API_KEY_ID}" \
+              --issuer "${AC_API_ISSUER_ID}" \
+              --wait --output-format json)"
+            rm -f "${KEYFILE}"
+            printf '%s\n' "${RESULT}"
+            printf '%s' "${RESULT}" | grep -q '"status" *: *"Accepted"' \
+              || { echo "::error::notarization was not Accepted"; exit 1; }
+            # CLI binaries can't be stapled (no bundle); the ticket is served by
+            # Apple and checked online at first run.
+          fi
           tar -C dist -czf "dist/${STAGE}.tar.gz" "${STAGE}"
           ( cd dist && shasum -a 256 "${STAGE}.tar.gz" > "${STAGE}.tar.gz.sha256" )
           echo "archive=dist/${STAGE}.tar.gz" >> "$GITHUB_OUTPUT"
