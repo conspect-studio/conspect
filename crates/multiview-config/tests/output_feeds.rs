@@ -231,3 +231,173 @@ fn every_shipped_example_keeps_program_on_every_output() {
     }
     assert!(seen >= 5, "expected shipped examples, saw {seen}");
 }
+
+/// `[audio]` with two named discrete tracks, and the outputs of [`BASE`]
+/// plus one of each transport family for the capability rule.
+const TRACKS: &str = r#"
+[audio]
+sample_rate_hz = 48000
+[[audio.routes]]
+input_id = "a"
+channels = { kind = "stereo" }
+target_track = "eng"
+[[audio.routes]]
+input_id = "bars"
+channels = { kind = "stereo" }
+target_track = "deu"
+"#;
+
+fn feed(output: &str, audio: &str) -> String {
+    format!("\n[[routing.output]]\noutput = \"{output}\"\naudio = {audio}\n")
+}
+
+#[test]
+fn explicit_program_none_and_source_audio_feeds_validate() {
+    for audio in [r#""program""#, r#""none""#, r#"{ source = "bars" }"#] {
+        let cfg = load(&feed("srt-out", audio)).unwrap();
+        assert!(!cfg.output_feeds()[1].audio.is_follow(), "{audio}");
+        let parsed = MultiviewConfig::load_from_json(&cfg.to_json().unwrap()).unwrap();
+        assert_eq!(parsed, cfg, "{audio} round-trips");
+    }
+    let err = load(&feed("srt-out", r#"{ source = "nope" }"#)).unwrap_err();
+    assert!(err.contains("unknown source \"nope\""), "{err}");
+}
+
+#[test]
+fn a_tracks_feed_names_declared_distinct_tracks() {
+    load(&format!(
+        "{TRACKS}{}",
+        feed("srt-out", r#"{ tracks = ["eng"] }"#)
+    ))
+    .unwrap();
+    let err = load(&format!(
+        "{TRACKS}{}",
+        feed("srt-out", r#"{ tracks = [] }"#)
+    ))
+    .unwrap_err();
+    assert!(err.contains("at least one track"), "{err}");
+    let err = load(&format!(
+        "{TRACKS}{}",
+        feed("srt-out", r#"{ tracks = ["fra"] }"#)
+    ))
+    .unwrap_err();
+    assert!(err.contains("undeclared track \"fra\""), "{err}");
+    // `prog` is the program bus, not a discrete track.
+    let err = load(&format!(
+        "{TRACKS}{}",
+        feed("srt-out", r#"{ tracks = ["prog"] }"#)
+    ))
+    .unwrap_err();
+    assert!(err.contains("undeclared track"), "{err}");
+    let err = load(&format!(
+        "{TRACKS}{}",
+        feed("srt-out", r#"{ tracks = ["eng", "eng"] }"#)
+    ))
+    .unwrap_err();
+    assert!(err.contains("twice"), "{err}");
+    // Without an [audio] block nothing is declared.
+    let err = load(&feed("srt-out", r#"{ tracks = ["eng"] }"#)).unwrap_err();
+    assert!(err.contains("undeclared track"), "{err}");
+}
+
+#[test]
+fn more_than_one_track_only_where_tracks_are_carried_at_once() {
+    // HLS (select-one): one track only.
+    let err = load(&format!(
+        "{TRACKS}{}",
+        feed("srt-out", r#"{ tracks = ["eng", "deu"] }"#)
+    ))
+    .unwrap_err();
+    assert!(err.contains("cannot carry 2 audio tracks at once"), "{err}");
+    // SRT (MPEG-TS PIDs, simultaneous): any number.
+    let srt = "\n[[outputs]]\nid = \"srt\"\nkind = \"srt\"\nurl = \"srt://[::1]:9000\"\ncodec = \"mpeg2video\"\n";
+    let doc = format!(
+        "{srt}{TRACKS}{}",
+        feed("srt", r#"{ tracks = ["eng", "deu"] }"#)
+    );
+    let cfg = MultiviewConfig::load_from_toml(&format!("{BASE}{doc}")).unwrap();
+    cfg.validate().unwrap();
+}
+
+#[test]
+fn start_up_refuses_an_explicit_audio_feed_it_does_not_carry() {
+    let cfg = load(&feed("srt-out", r#""none""#)).unwrap();
+    let err = multiview_config::outputs_carry_program(&cfg).unwrap_err();
+    assert!(
+        err.contains("this engine starts every output on follow audio"),
+        "{err}"
+    );
+    let cfg = load(&feed("srt-out", r#""follow""#)).unwrap();
+    multiview_config::outputs_carry_program(&cfg).unwrap();
+}
+
+fn routing(tracks: &[(&str, &str)]) -> multiview_config::AudioRouting {
+    let mut doc = String::from("[audio]\nsample_rate_hz = 48000\n");
+    for (input, track) in tracks {
+        doc.push_str(&format!(
+            "[[audio.routes]]\ninput_id = \"{input}\"\nchannels = {{ kind = \"stereo\" }}\ntarget_track = \"{track}\"\n"
+        ));
+    }
+    MultiviewConfig::load_from_toml(&format!("{BASE}{doc}"))
+        .unwrap()
+        .audio
+        .unwrap()
+}
+
+#[test]
+fn a_renamed_track_is_rewritten_in_every_tracks_feed() {
+    // Two tracks on `restream` (HLS, select-one) would not validate; the
+    // propagation unit works on the parsed document.
+    let mut cfg = MultiviewConfig::load_from_toml(&format!(
+        "{BASE}{TRACKS}{}{}",
+        feed("restream", r#"{ tracks = ["eng", "deu"] }"#),
+        feed("srt-out", r#""program""#)
+    ))
+    .unwrap();
+    let old = routing(&[("a", "eng"), ("bars", "deu")]);
+    let new = routing(&[("a", "english"), ("bars", "deu")]);
+    let updates =
+        multiview_config::propagate_routing_feed_change(Some(&old), &new, cfg.routing.as_mut());
+    assert_eq!(updates.len(), 1, "{updates:?}");
+    assert_eq!(updates[0].output, "restream");
+    assert_eq!(
+        updates[0].renamed,
+        vec![("eng".to_owned(), "english".to_owned())]
+    );
+    assert!(updates[0].removed.is_empty() && !updates[0].became_program);
+    let feeds = cfg.output_feeds();
+    assert_eq!(
+        feeds[0].audio,
+        AudioFeed::Tracks(vec!["english".into(), "deu".into()])
+    );
+    assert_eq!(feeds[1].audio, AudioFeed::Program, "untouched");
+}
+
+#[test]
+fn a_removed_track_is_dropped_and_an_emptied_feed_becomes_program() {
+    let mut cfg = MultiviewConfig::load_from_toml(&format!(
+        "{BASE}{TRACKS}{}{}",
+        feed("restream", r#"{ tracks = ["eng", "deu"] }"#),
+        feed("srt-out", r#"{ tracks = ["deu"] }"#)
+    ))
+    .unwrap();
+    let old = routing(&[("a", "eng"), ("bars", "deu")]);
+    let new = routing(&[("a", "eng")]);
+    let updates =
+        multiview_config::propagate_routing_feed_change(Some(&old), &new, cfg.routing.as_mut());
+    assert_eq!(updates.len(), 2, "{updates:?}");
+    let feeds = cfg.output_feeds();
+    assert_eq!(feeds[0].audio, AudioFeed::Tracks(vec!["eng".into()]));
+    assert_eq!(feeds[1].audio, AudioFeed::Program, "an emptied feed");
+    assert!(updates[1].became_program);
+    assert_eq!(updates[1].removed, vec!["deu".to_owned()]);
+    cfg.validate().unwrap();
+    // Nothing changed: no update.
+    let none =
+        multiview_config::propagate_routing_feed_change(Some(&new), &new, cfg.routing.as_mut());
+    assert!(none.is_empty());
+    assert!(
+        multiview_config::propagate_routing_feed_change(None, &new, cfg.routing.as_mut())
+            .is_empty()
+    );
+}
