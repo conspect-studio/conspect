@@ -162,6 +162,10 @@ pub enum OfferError {
     Closed,
     /// The producer discarded real encoded media before queue admission.
     ProducerLoss,
+    /// Not a loss: the producer spliced in a stream whose in-band decoder
+    /// configuration (parameter sets) differs, starting at a strict RAP. Only
+    /// ever a [`Discontinuity::reason`] from [`BoundedBatchQueue::mark_discontinuity`].
+    DecoderConfigChanged,
 }
 
 /// An encoder emission failed validation or atomic queue admission.
@@ -458,6 +462,37 @@ impl BoundedBatchQueue {
     pub fn report_loss(&mut self, reason: OfferError) {
         if !self.closed {
             self.invalidate(reason);
+        }
+    }
+
+    /// Declare a mux discontinuity WITHOUT a loss: the next admitted window
+    /// (which the producer guarantees opens at a strict RAP, e.g. the cut
+    /// window of a move between encoders whose parameter sets differ) starts
+    /// a new generation, so every consumer resets its mux continuity there.
+    ///
+    /// Unlike [`Self::report_loss`] this neither flushes the healthy queued
+    /// backlog nor arms the RAP gate, so it can never reject the cut window
+    /// itself. When a loss is already pending (the gate is armed), that loss's
+    /// generation bump is the reset and nothing more is recorded.
+    pub fn mark_discontinuity(&mut self, reason: OfferError) {
+        if self.closed || self.needs_keyframe {
+            return;
+        }
+        let generation = self.reservations.generation.fetch_add(1, Ordering::AcqRel) + 1;
+        match &mut self.pending_discontinuity {
+            // An unconsumed earlier event keeps its counters; it now names
+            // the latest generation.
+            Some(event) => event.generation = generation,
+            None => {
+                self.pending_discontinuity = Some(Discontinuity {
+                    generation,
+                    reason,
+                    flushed_windows: 0,
+                    flushed_packets: 0,
+                    flushed_bytes: 0,
+                    emitted_loss: None,
+                });
+            }
         }
     }
 
@@ -789,6 +824,36 @@ mod tests {
         assert_eq!(reserved, (1, 1));
         drop(lease);
         handle.join().unwrap();
+    }
+
+    #[test]
+    fn a_marked_discontinuity_keeps_the_backlog_and_admits_the_next_rap() {
+        let now = Instant::now();
+        let mut q = strict_queue();
+        q.try_offer(h264_au(0x65, true), now).unwrap();
+        q.try_offer(h264_au(0x41, false), now).unwrap();
+        q.mark_discontinuity(OfferError::DecoderConfigChanged);
+        assert_eq!(q.queued_windows(), 2, "no flush");
+        assert_eq!(q.generation(), 1);
+        // The gate is not armed: the cut window (an IDR) is admitted.
+        q.try_offer(h264_au(0x65, true), now).unwrap();
+        let event = q.take_discontinuity().unwrap();
+        assert_eq!(event.generation, 1);
+        assert_eq!(event.reason, OfferError::DecoderConfigChanged);
+        assert_eq!(event.flushed_windows, 0);
+        assert_eq!(q.take_discontinuity(), None);
+        let gens: Vec<u64> = (0..3)
+            .map(|_| q.pop_at(now).unwrap().unwrap().generation())
+            .collect();
+        assert_eq!(gens, [0, 0, 1], "the backlog keeps its generation");
+        // During a pending loss the loss's own bump is the reset.
+        q.report_loss(OfferError::ProducerLoss);
+        q.mark_discontinuity(OfferError::DecoderConfigChanged);
+        assert_eq!(q.generation(), 2);
+        assert_eq!(
+            q.take_discontinuity().unwrap().reason,
+            OfferError::ProducerLoss
+        );
     }
 
     #[test]

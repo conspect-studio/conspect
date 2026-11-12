@@ -284,6 +284,9 @@ mod binding_delivery;
 /// Existing encoded output conversion and authorized MoQ family adapter.
 #[cfg(feature = "moq-output")]
 pub mod moq_outputs;
+/// Output routing take state machine and live encoders (ADR-0108 slice 1).
+#[cfg(feature = "ffmpeg")]
+pub mod output_routing;
 #[cfg(feature = "ffmpeg")]
 pub mod output_window_registry;
 /// The full libav\* end-to-end `multiview run` pipeline (ingest → composite →
@@ -385,6 +388,11 @@ pub mod frontdoor;
 /// bind hit `EADDRINUSE` and silently degraded. Behind `webrtc-native`.
 #[cfg(feature = "webrtc-native")]
 pub mod webrtc_unified;
+
+/// Pure-integer NV12 cell scaler (monitor wall, routing aux canvases).
+pub mod nv12_blit;
+/// The `routing-aux` thread: one-cell routed feeds (ADR-0108 slice 1).
+pub mod routing_aux;
 
 /// The shared monitor wall (ADR-0103): one composed, once-encoded MoQ stream.
 #[cfg(feature = "moq-output")]

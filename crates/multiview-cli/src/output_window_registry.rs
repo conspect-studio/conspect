@@ -991,6 +991,15 @@ impl OutputWindowRegistry {
             }
         }
     }
+    /// A non-loss mux discontinuity on every subscription of one output (see
+    /// [`WindowDelivery::mark_discontinuity`]).
+    pub(crate) fn mark_discontinuity(&mut self, output_index: usize, reason: OfferError) {
+        for peer in &mut self.peers {
+            if peer.output_index == output_index {
+                peer.queue.mark_discontinuity(reason);
+            }
+        }
+    }
     /// Every subscription ended by the registry itself (run finished/aborted).
     pub(crate) fn close(&mut self) {
         self.closed.store(true, Ordering::Release);
@@ -1257,6 +1266,10 @@ impl<D: WindowDelivery> WindowDelivery for OutputWindowTap<D> {
     fn report_loss(&mut self, output_index: usize, reason: OfferError) {
         self.registry.report_loss(output_index, reason);
         self.delivery.report_loss(output_index, reason);
+    }
+    fn mark_discontinuity(&mut self, output_index: usize, reason: OfferError) {
+        self.registry.mark_discontinuity(output_index, reason);
+        self.delivery.mark_discontinuity(output_index, reason);
     }
     fn take_discontinuity(
         &mut self,
@@ -1918,6 +1931,7 @@ mod tests {
             Ok(())
         }
         fn report_loss(&mut self, _output_index: usize, _reason: OfferError) {}
+        fn mark_discontinuity(&mut self, _output_index: usize, _reason: OfferError) {}
         fn take_discontinuity(
             &mut self,
             _output_index: usize,

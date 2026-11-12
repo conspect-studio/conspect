@@ -108,6 +108,7 @@ pub mod programset;
 pub mod ptp;
 pub mod registry;
 pub mod route;
+pub mod routing_aux;
 pub mod runtime;
 pub mod salvo;
 pub mod scheduler;
@@ -174,6 +175,9 @@ pub use registry::{
     RequestedSize, SourceActor, SourceHandle, SourceInit, SourceKey, SourceRegistry,
 };
 pub use route::{resolve_selector, RouteApplier, RouteIntent, RouteResolution};
+pub use routing_aux::{
+    aux_tick_channel, AuxTick, AuxTickSender, ClosureControl, WithAuxTick, AUX_TICK_CAPACITY,
+};
 pub use runtime::{
     CooperativePacer, EngineRuntime, Pacer, RealtimePacer, RunOutcome, RunStop, StopSignal,
     MAX_REPEATS_BETWEEN_CONTROL, MAX_REPEATS_PER_TICK,

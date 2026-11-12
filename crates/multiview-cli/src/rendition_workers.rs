@@ -160,6 +160,10 @@ pub trait VideoEncodeWorker: Send + 'static {
     /// # Errors
     /// Returns a concrete encoder flush failure without publishing false EOF.
     fn finish(&mut self) -> Result<Vec<EncodedPacket>, PipelineError>;
+
+    /// Make the next encoded frame a keyframe. One-shot; the caller owns the
+    /// rate limit. The default does nothing (an encoder that cannot force).
+    fn force_keyframe(&mut self) {}
 }
 
 /// Why a non-blocking offer could not be accepted.
@@ -356,6 +360,13 @@ impl RenditionWorker {
         self.key_index
     }
 
+    /// Whether the worker thread has ended (panicked, failed or returned).
+    /// Cheap (`JoinHandle::is_finished`), never blocks.
+    #[must_use]
+    pub fn is_finished(&self) -> bool {
+        self.thread.is_finished()
+    }
+
     /// Offer one baked tick without waiting. A full queue is a truthful
     /// overload for this rendition, never a reason to stall the program clock.
     ///
@@ -415,11 +426,44 @@ impl RenditionWorker {
     /// # Errors
     /// Returns the encoder's failure, or an error if the worker panicked.
     pub fn join(self) -> Result<(), PipelineError> {
+        self.close_input().join()
+    }
+
+    /// Drop the input sender now, without waiting: the worker leaves its
+    /// receive loop, runs `finish()` and its terminal event, and ends on its
+    /// own. The returned handle may be joined later or dropped (detached) —
+    /// either way no thread outlives its key with a live input.
+    #[must_use]
+    pub fn close_input(self) -> ClosingWorker {
         drop(self.input);
+        ClosingWorker {
+            thread: self.thread,
+        }
+    }
+}
+
+/// A [`RenditionWorker`] whose input is already closed (see
+/// [`RenditionWorker::close_input`]).
+pub struct ClosingWorker {
+    thread: JoinHandle<Result<(), PipelineError>>,
+}
+
+impl ClosingWorker {
+    /// Wait for `finish()` and the terminal event.
+    ///
+    /// # Errors
+    /// Returns the encoder's failure, or an error if the worker panicked.
+    pub fn join(self) -> Result<(), PipelineError> {
         self.thread.join().map_err(|_| PipelineError::Output {
             kind: "video-worker",
             reason: "video rendition worker panicked".to_owned(),
         })?
+    }
+
+    /// The worker thread has ended.
+    #[must_use]
+    pub fn is_finished(&self) -> bool {
+        self.thread.is_finished()
     }
 }
 

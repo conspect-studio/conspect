@@ -401,6 +401,77 @@ impl StreamCodecParameters {
         }
     }
 
+    /// The ADR-0108 move gate: a decoder-ready RAP that also carries its
+    /// parameter sets in band (SPS+PPS for H.264, VPS+SPS+PPS for HEVC; a
+    /// sequence header `00 00 01 B3` for MPEG-2), so a consumer moved onto this
+    /// access unit can start decoding from it alone. Stricter than
+    /// [`Self::is_decoder_ready_rap`], which is true on an IDR NAL alone.
+    #[must_use]
+    pub fn is_self_contained_rap(&self, packet: &EncodedPacket) -> bool {
+        if !self.is_decoder_ready_rap(packet) {
+            return false;
+        }
+        let Some(payload) = packet.payload() else {
+            return false;
+        };
+        match self.parameters.id() {
+            ffmpeg::codec::Id::MPEG2VIDEO => payload.windows(4).any(|w| w == [0, 0, 1, 0xB3]),
+            ffmpeg::codec::Id::H264 => self.nal_framing().is_some_and(|framing| {
+                crate::idr::is_self_contained_idr(payload, crate::idr::CodecKind::H264, framing)
+            }),
+            ffmpeg::codec::Id::HEVC => self.nal_framing().is_some_and(|framing| {
+                crate::idr::is_self_contained_idr(payload, crate::idr::CodecKind::Hevc, framing)
+            }),
+            _ => false,
+        }
+    }
+
+    /// The in-band decoder configuration a keyframe carries: its SPS/PPS
+    /// (H.264) or VPS/SPS/PPS (HEVC) NAL bytes concatenated with their
+    /// lengths, or the MPEG-2 sequence header. `Absent` for a non-keyframe,
+    /// an unsupported codec or a RAP without in-band sets; `Rejected` when
+    /// the scan failed closed (never a partial set). Two RAPs with equal
+    /// `Sets` splice without a reset; `Rejected` is always a change.
+    #[must_use]
+    pub fn rap_parameter_sets(&self, packet: &EncodedPacket) -> crate::idr::RapParameterSets {
+        use crate::idr::{ParameterSetScan, RapParameterSets};
+        if packet.kind() != StreamKind::Video || !packet.is_keyframe() {
+            return RapParameterSets::Absent;
+        }
+        let Some(payload) = packet.payload() else {
+            return RapParameterSets::Absent;
+        };
+        let codec = match self.parameters.id() {
+            ffmpeg::codec::Id::MPEG2VIDEO => {
+                return crate::idr::mpeg2_sequence_header(payload)
+                    .map_or(RapParameterSets::Absent, |h| {
+                        RapParameterSets::Sets(h.to_vec())
+                    });
+            }
+            ffmpeg::codec::Id::H264 => crate::idr::CodecKind::H264,
+            ffmpeg::codec::Id::HEVC => crate::idr::CodecKind::Hevc,
+            _ => return RapParameterSets::Absent,
+        };
+        let Some(framing) = self.nal_framing() else {
+            return RapParameterSets::Absent;
+        };
+        match crate::idr::scan_parameter_sets(payload, codec, framing) {
+            ParameterSetScan::Absent => RapParameterSets::Absent,
+            ParameterSetScan::Rejected => RapParameterSets::Rejected,
+            ParameterSetScan::Found(sets) => {
+                let mut out = Vec::new();
+                for set in sets {
+                    let Ok(len) = u32::try_from(set.len()) else {
+                        return RapParameterSets::Rejected;
+                    };
+                    out.extend_from_slice(&len.to_be_bytes());
+                    out.extend_from_slice(set);
+                }
+                RapParameterSets::Sets(out)
+            }
+        }
+    }
+
     #[allow(unsafe_code)]
     fn extradata(&self) -> &[u8] {
         // SAFETY: `parameters` owns its AVCodecParameters for this borrow.
@@ -475,6 +546,72 @@ impl std::fmt::Debug for StreamCodecParameters {
             .field("configured_bit_rate", &self.configured_bit_rate)
             .field("video_dimensions", &self.video_dimensions)
             .finish()
+    }
+}
+
+#[cfg(test)]
+mod rap_parameter_sets_tests {
+    #![allow(clippy::unwrap_used)]
+    use super::{EncodedPacket, StreamCodecParameters};
+    use crate::idr::RapParameterSets;
+    use ffmpeg_next::codec::{self, packet::Flags, packet::Packet};
+
+    /// H.264 parameters with no extradata (raw Annex-B encoder output).
+    #[allow(unsafe_code)]
+    fn h264_annexb() -> StreamCodecParameters {
+        let mut parameters = codec::Parameters::new();
+        // SAFETY: `parameters` exclusively owns a freshly allocated
+        // AVCodecParameters; only two plain enum fields are written.
+        unsafe {
+            let raw = parameters.as_mut_ptr();
+            (*raw).codec_type = ffmpeg_next::ffi::AVMediaType::AVMEDIA_TYPE_VIDEO;
+            (*raw).codec_id = ffmpeg_next::ffi::AVCodecID::AV_CODEC_ID_H264;
+        }
+        StreamCodecParameters {
+            parameters,
+            configured_bit_rate: None,
+            video_dimensions: None,
+        }
+    }
+
+    fn keyframe(au: &[u8]) -> EncodedPacket {
+        let mut raw = Packet::copy(au);
+        raw.set_pts(Some(0));
+        raw.set_dts(Some(0));
+        raw.set_flags(Flags::KEY);
+        EncodedPacket::from_packet(raw)
+    }
+
+    /// S (final-head media LOW): a real Annex-B AU whose SPS hides an
+    /// embedded start code (a synthesized PPS, forbidden bit clear) maps to
+    /// `Rejected` through the production extractor; a canonical AU maps to
+    /// `Sets` as length-prefixed (u32 BE) SPS then PPS.
+    #[test]
+    fn the_production_extractor_rejects_an_embedded_start_code() {
+        let params = h264_annexb();
+        assert_eq!(params.nal_framing(), Some(crate::idr::NalFraming::AnnexB));
+        let embedded = [
+            0, 0, 0, 1, 0x67, 0x42, 0x00, 0x1F, 0, 0, 1, 0x68, 0x11, 0x22, 0x33, 0, 0, 1, 0x68,
+            0xCE, 0x3C, 0x80, 0, 0, 1, 0x65, 0x88, 0x80,
+        ];
+        assert_eq!(
+            params.rap_parameter_sets(&keyframe(&embedded)),
+            RapParameterSets::Rejected
+        );
+        let canonical = [
+            0, 0, 0, 1, 0x67, 0x42, 0x00, 0x1F, 0, 0, 1, 0x68, 0xCE, 0x3C, 0x80, 0, 0, 1, 0x65,
+            0x88, 0x80,
+        ];
+        assert_eq!(
+            params.rap_parameter_sets(&keyframe(&canonical)),
+            RapParameterSets::Sets(vec![
+                0, 0, 0, 4, 0x67, 0x42, 0x00, 0x1F, 0, 0, 0, 4, 0x68, 0xCE, 0x3C, 0x80
+            ])
+        );
+        assert_eq!(
+            params.rap_parameter_sets(&keyframe(&[0, 0, 0, 1, 0x65, 0x88, 0x80])),
+            RapParameterSets::Absent
+        );
     }
 }
 

@@ -90,9 +90,10 @@ impl RejectionReason {
             OfferError::Occupied => Self::Occupied,
             OfferError::OldestAge => Self::OldestAge,
             OfferError::ClockReversed => Self::ClockReversed,
-            OfferError::NeedsRecoveryPoint | OfferError::Closed | OfferError::ProducerLoss => {
-                Self::NeedsRecoveryPoint
-            }
+            OfferError::NeedsRecoveryPoint
+            | OfferError::Closed
+            | OfferError::ProducerLoss
+            | OfferError::DecoderConfigChanged => Self::NeedsRecoveryPoint,
             OfferError::WrongProgramShape => Self::WrongProgramShape,
         }
     }
@@ -249,6 +250,12 @@ pub(crate) trait WindowDelivery {
     /// assembler discarded), so the binding requires a fresh RAP.
     fn report_loss(&mut self, output_index: usize, reason: OfferError);
 
+    /// Declare a mux discontinuity that is NOT a loss (the next offered window
+    /// opens at a strict RAP with a different decoder configuration): bumps
+    /// the binding's generation without flushing or arming the RAP gate, so
+    /// the window itself is admitted. Not counted as a rejection.
+    fn mark_discontinuity(&mut self, output_index: usize, reason: OfferError);
+
     /// Consume this binding's loss event (generation + flushed counters) so the
     /// mux can reset continuity. Exactly one consumer.
     fn take_discontinuity(&mut self, output_index: usize) -> Option<Discontinuity>;
@@ -317,6 +324,12 @@ impl WindowDelivery for BindingDelivery {
             binding.queue.report_loss(reason);
             binding.rejected_batches = binding.rejected_batches.saturating_add(1);
             binding.last_rejection = Some(RejectionReason::from_offer(reason));
+        }
+    }
+
+    fn mark_discontinuity(&mut self, output_index: usize, reason: OfferError) {
+        if let Some(binding) = self.bindings.get_mut(output_index) {
+            binding.queue.mark_discontinuity(reason);
         }
     }
 
