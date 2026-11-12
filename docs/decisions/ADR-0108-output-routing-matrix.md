@@ -1,4 +1,4 @@
-# ADR-0108: Route anything to any output — per-output video and audio feeds produced by aux canvases of the one Program, raw switch with a forced IDR at a tick boundary, layout-as-a-source
+# ADR-0108: Route anything to any output — picture buses and encoded buses; an output subscribes to one encoded bus and a take moves the subscription at an IDR; layout-as-a-source
 
 - **Status:** Accepted
 - **Area:** Core engine / Output / Audio / Web/API (invariants #1, #10, #9, #7)
@@ -27,15 +27,25 @@ is one of these:
 The operator changes a feed live, from the UI and the API, with no restart and without disturbing
 other outputs.
 
+When asked why an output that shares an encoder could not be routed on its own, the operator
+said: "Why can't an output be routed seperately if it shares an encoder - I'm lost". He then
+stated the model this ADR adopts:
+
+> "I'm still lost - we should be making this as absolutely efficient as possible.
+> An encoder outputs to a bus, it might "end up" none, one, or more places.
+> If an encoder output is routed to a HLS and an SRT output - then they are getting their input from the encoder outputs bus. If the output of the output has to change, it stops getting its input from the output encoders bus and starts getting it from somewhere else.
+> Program will have a program bus - that probably will go to one or more encoders.
+> Program has to be handled separately because if program is routed to an output, like HLS, that output isn't simply selecting the input to program, it's "take"ing program. And that might be a wipe, dissolve, or a straight input."
+
 What is true on main f5f2230e (the full table with citations is in §1 of the note):
 
 - `OutputBus { Program, Clean, Preview }` exists in config (`crates/multiview-config/src/routing.rs:204-240`),
   but nothing at runtime reads it. Every output encodes the one overlay-baked Program canvas
   (`crates/multiview-cli/src/pipeline.rs:7172-7206`), and encoders are keyed only by codec
-  (`pipeline.rs:2820-2844`).
+  (`crates/multiview-cli/src/pipeline.rs:2820-2844`).
 - Output changes are restart-class (`crates/multiview-control/src/routes/outputs.rs:185,254`).
 - `apply-layout` replaces the one live canvas (`crates/multiview-control/src/routes/mod.rs:756-942`).
-- With `[switcher]` declared, startup admits only a one-cell canvas (`pipeline.rs:281-302,2438`), so
+- With `[switcher]` declared, startup admits only a one-cell canvas (`crates/multiview-cli/src/pipeline.rs:281-302,2438`), so
   a multiview and a switcher cannot both be on air (#243).
 - Route takes exist for cells, bus channels, tracks and layers, but there is no `output` kind and no
   `GET` of the state (`crates/multiview-control/src/routes/routing.rs:107-208,347-371`).
@@ -46,11 +56,21 @@ What is true on main f5f2230e (the full table with citations is in §1 of the no
 
 ## Decision
 
-1. **Feeds.** `Feed = Bus(program|preview|clean) | Layout(id) | Source(id)`. VT, bars, solid, clock,
-   timer and graphics are already `SourceKind`s, so they are routed by source id; the UI lists them
-   in their own groups. `AudioFeed = Follow | Program | Source(id) | Tracks([..]) | None`. In config:
-   `[[routing.output]] { output, video, audio, route_group }`. An absent entry means Program and
-   follow, exactly today's behaviour. The existing `bus` field is kept as an alias.
+1. **Two layers of bus.**
+   - **Picture buses** carry raw frames on the tick: `program` (the M/E's result, so a CUT or AUTO
+     happens on it), `preview`, `clean`, `src:<id>` (any source; VT, bars and the other
+     generators are sources) and `aux:<layout id>`.
+   - **Encoders** are keyed by `(picture bus, encoder settings)`. Each writes one **encoded bus**
+     with zero, one or many subscribers. A bus with no subscriber closes after a 10 s linger.
+   - **An output is a subscriber of one encoded bus.** It never owns an encoder. So every output
+     can always be routed on its own.
+   - Audio has the same two layers: audio buses (`program` mix, `src:<id>`, layout audio) and
+     encoded audio buses keyed by `(audio bus, AAC settings)`.
+   - `{bus: program}` (follows the switcher) and `{source: X}` (direct, ignores the switcher) are
+     distinct routes everywhere: config, API, UI and tally.
+   - Config: `[[routing.output]] { output, video, audio }`. An absent entry means Program and
+     follow, exactly today's behaviour, encoders and pixels. The existing `bus` field is kept as an
+     alias. No operator-facing string names an encoder grouping.
 
 2. **Aux canvases of the one Program, on the Program's clock.** A routed layout, single source or
    Preview is produced by a `CompositorDrive` over the **same** `TileStore` map Program samples
@@ -70,7 +90,7 @@ What is true on main f5f2230e (the full table with citations is in §1 of the no
      cell per routed source), through the existing make-before-break handover. Each resize is
      costed in the plan and capped by admission.
    - The routed path shows exactly the samples Program shows for that source. Ingest retags tiles
-     to the canvas colour today (`pipeline.rs:14229`), and native-colour carry-through is a
+     to the canvas colour today (`crates/multiview-cli/src/pipeline.rs:14229`), and native-colour carry-through is a
      pre-existing gap (#310).
    - The aux thread is a dedicated OS thread at `nice +10`, never on the tokio runtime that hosts
      the output clock.
@@ -78,26 +98,26 @@ What is true on main f5f2230e (the full table with citations is in §1 of the no
    - Preview is a one-cell canvas that follows the M/E's PVW selection through a `SwapCell`.
    - An aux canvas exists only while something selects it.
 
-3. **Raw switch, never an encoded splice, and no mid-stream encoder change.** Each set of outputs
-   fed by one encoder is a **route group**. By default an output's group is keyed by its encoder
-   settings, exactly as today's encoders are, so absent config gives today's encoder count. Each
-   group has a selector in front of its existing video encoder, and its own AAC encoder opened at
-   start. A take changes what the selector feeds; the encoders, their tick counters, parameter sets
-   and every muxer binding stay untouched. A take on one output of a multi-output group is refused
-   with `shared-encoder` (the plan offers taking the whole group). Independent feeds for outputs
-   with identical settings need a distinct `route_group` in config: one more encoder at the next
-   start (restart-class, shown as Class-2 by the plan). A live group split is make-before-break
-   work (RT-15/#146), not routing. On mda001 the two outputs already have separate encoders, so
-   slice 1 adds no encoder session.
-   - Every frame carries its feed generation. The encoder forces a true IDR (`forced-idr=1`, added
-     to `VideoRenditionEncoder` in slice 1) on the first frame whose generation changed.
-   - PTS = DTS = the tick index. The bake consumer feeds every Program tick as today, taking the
-     selector's frame for tick T, or the newest held frame **with its own generation label**. A
-     lagging aux thread is held at the selector: `routing.degraded` after 60 ticks, then a fallback
-     to Program with an IDR after 150 held ticks, whether the aux thread is dead or wedged. It never trips the consumer's 8-tick
-     substitution limit.
-   - An output's format is pinned and never changes on a take. A format change is RT-15's
-     make-before-break migration.
+3. **A take moves the output's subscription at an IDR. It is a clean cut, never a restamp.**
+   - **Destination exists** (another output already carries that picture bus with those settings):
+     **+0 encoders**. The engine forces an IDR on it at tick T and rebinds the output at window T.
+   - **Destination does not exist:** **+1 encoder**. The engine opens it off the clock on its own
+     worker thread, starting at an absolute tick T0 (`starting_at(T0)`, added to
+     `VideoRenditionEncoder` and the AAC state, which start at 0 today, `crates/multiview-output/src/sink.rs:604,1141-1159`). It
+     moves the output at a forced IDR at T ≥ T0 + 1 (T ≥ T0 + 2 for audio, after priming).
+   - All encoders stamp PTS = DTS = the tick index, so the step is one tick across the move.
+   - Every encoder is opened with `forced-idr=1`. The move happens only on a decoder-ready RAP
+     (`is_decoder_ready_rap`).
+   - Encoders with the same settings produce byte-identical parameter sets, carried in band at
+     every IDR (no `GLOBAL_HEADER`). A mismatch is an internal fault (`encoder-format-mismatch`),
+     never silent.
+   - The dispatcher gains `rebind(output, video_key, audio_key, at_tick)`, atomic per output at a
+     window boundary. The consumer `try_send`s to a new worker and never waits for it.
+   - Lagging aux buses hold last-good with their own generation label: `routing.degraded` at 60
+     ticks, then a move to Program at an IDR at 150 ticks, whether the aux thread is dead or wedged.
+   - An output's format never changes on a take. A format change is RT-15.
+   - An output-level dissolve is out of scope: it needs both pictures in one encoder. Program's
+     transitions reach the outputs because they happen on the program bus.
 
 4. **Take gate (ADR-0104 reused), run on the bake consumer.** The take state machine runs on the
    bake consumer, which handles every tick. The aux thread only composes. So a wedged aux thread
@@ -112,17 +132,18 @@ What is true on main f5f2230e (the full table with citations is in §1 of the no
    - A source, VT or generator carries its own audio.
    - Preview carries the PVW source's audio.
    - A layout carries its `audio` attribute (default `program`).
-   - A route group carries one video feed and one audio feed. An audio take on one member of a
-     multi-output group is refused with `shared-encoder`, as a video take is.
    - An explicit selection overrides follow.
 
-   Routed audio is built on the bake consumer from the per-source blocks the program bus already
-   pulls each tick (every source is already a strip, mixed at gain 0 unless included), and encoded
-   by the route group's AAC encoder, which is opened at start with sample origin
-   `total_at(0)`. A take therefore never opens an encoder or changes AAC priming. A take crossfades old into new with the equal-power envelope
-   over exactly `SampleClock::total_at(T+1) − total_at(T)` samples, starting on the video cut tick.
-   `audio-routing` stays the source of gain, mute and membership. The existing per-output `tracks`
-   keep their meaning.
+   Audio buses are built on the bake consumer from the per-source blocks the program bus already
+   pulls each tick (every source is already a strip, mixed at gain 0 unless included). An output's
+   audio subscription moves with its video, in the same rebind.
+
+   A spike measured the AAC decoder transient at a move: 97-919 samples into the splice frame, no
+   click step. So the destination is fed an equal-power crossfade from old to new over exactly the
+   tick before the move, `SampleClock::total_at(T) − total_at(T−1)` samples. When the destination
+   is shared with other outputs, the crossfade runs on a transient private encoded audio bus, which
+   the output leaves at the next IDR. `audio-routing` stays the source of gain, mute and
+   membership. The existing per-output `tracks` keep their meaning.
 
 6. **Layout-as-a-source (#243).**
    - An active layout canvas publishes into a `TileStore` named `layout:<id>`. Program and Preview
@@ -163,9 +184,11 @@ What is true on main f5f2230e (the full table with citations is in §1 of the no
 
 8. **Admission (invariant #9).**
    - At most `routing.max_aux_canvases` (default 2) aux canvases.
-   - Takes add no encoder session. The route-group encoder count is admitted at start against the
-     probed free NVENC sessions minus the sessions the config's wall, WHEP and preview ladder need
-     (3 on mda001).
+   - A take that needs a new encoder is admitted against the probed free NVENC sessions minus the
+     sessions the config's wall, WHEP and preview ladder need (3 on mda001; 12 per system on the
+     current driver, so 7 remain for routed encoded buses), and `routing.max_encoders` (default 6).
+   - The plan states "+0 encoders" or "+1 encoder". The only refusal for this reason reads "This
+     output needs its own encoder and the GPU has no free encoder session (N of M in use)".
    - At most `routing.max_decode_escalations` (default 2) decode resizes are forced by routing.
    - In the default GPU-free build, aux canvases use the identity path or the ADR-0103 integer box
      scaler, never the CPU reference compositor (measured: not viable at full cadence).
@@ -210,17 +233,33 @@ Results (ffprobe and the run log):
   - The CPU reference compositor costs p50 198 ms per 720p frame on one core (44 ms on 10 cores).
   - The ADR-0103 integer blit costs 9.4 ms (720p) and 14.1 ms (1080p) on one core.
   - Stereo AAC costs about 2.7 % of a core.
+- **Second spike (the operator's model): a subscription move between running encoders.**
+  - Setup: encoders A (`program`, from tick 0), B (`src:bars`, **opened live at tick 200** with
+    absolute PTS) and C (`src:bars`, from tick 0), all with the production option set plus
+    `forced-idr=1`. Output X moved A → B at 210 and B → A at 330; output Y moved A → C at 250.
+    Packets were muxed to TS, with no re-encode.
+  - Results, for libx264 and libx265 alike:
+    - SPS/PPS (and VPS) of B and C byte-identical to A's;
+    - 450 packets per output, every PTS step 3003, DTS = PTS;
+    - the first packet after every move a keyframe;
+    - 0 decode errors;
+    - the decoded luma switched exactly at the move frame (209 → 210: 69 → 183).
+- **AAC move:** splicing two independent AAC streams at a frame boundary showed a decoder transient
+  97-919 samples into the frame, with no click step. Hence the one-tick pre-move crossfade.
 - **Not proven:**
   - A GPU aux compose beside Program on the RTX 4060 (a shared queue). That is a hard acceptance
-    gate of slice 3, with the idle P2000 or the CPU integer path as the fallback.
+    gate of slice 3; the CPU integer path is the fallback.
+  - NVENC parameter-set identity across a live open. That is slice 1 acceptance on mda001.
   - The spike used its own libx264 wrapper with `forced-idr=1`, and proved only MPEG-TS/H.264.
     Every other protocol's cut is verified in the slice that ships it.
 
 ## Rationale
 
-- **A raw switch.** It keeps one encoder and one tick counter per output, so continuity holds by
-  construction and the consumer sees an ordinary IDR. An encoded splice (RT-13) would force IDRs on
-  other outputs' encoders, or wait up to a GOP. It would also restamp DTS across two encoders.
+- **Subscription move.** It is the operator's model and the most efficient one: an output never
+  owns an encoder, so any output routes on its own; outputs that carry the same bus with the same
+  settings share one encode by construction; and an unneeded encoder closes. All encoders stamp
+  from the one tick counter, so the move needs no restamp. The spike shows identical parameter
+  sets, so it needs no muxer re-initialisation either.
 - **The shared clock.** It gives frame-aligned cuts between Program and a layout, and one stamp
   sequence. ADR-0030's separate clocks cannot do either.
 - **Off-clock aux composition.** ADR-0103 proved this costs the clock nothing. Doing it on the clock
@@ -233,7 +272,8 @@ Results (ffprobe and the run log):
 | Alternative | Rejected because |
 | --- | --- |
 | Each routed layout as an ADR-0030 Program (its own clock) | No frame-aligned cut against Program, separate stamp sequences, and a second seed per feed. Kept for different cadence or size outputs only |
-| Encoded splice between per-feed encoders (RT-13) | Forces IDRs on encoders shared with other outputs, or waits for a GOP; a DTS restamp seam; no benefit when every feed is composed anyway |
+| RT-13 restamp splicer | Not needed: all encoders share the tick counter, so DTS is already continuous across a move |
+| Switching the frames fed into an output's own encoder (round 1 of this ADR) | Outputs that share an encoder could not be routed on their own; an encoder per output defeats #7. Withdrawn after the operator's model |
 | Compose aux canvases on the clock task | Puts N extra composites on invariant #1's path (ADR-0103's rejected alternative) |
 | A tile pass-through for a single source | Breaks #6 (an extra scaler), #8 (a second colour conversion) and cadence conversion; the compositor already does all three in one pass |
 | A new `/outputs/{id}/feed` resource | Duplicates plan/take, idempotency and BOLA, and splits the matrix over two APIs |
@@ -242,28 +282,29 @@ Results (ffprobe and the run log):
 ## Consequences
 
 - **Invariant #1.** The clock gains one non-blocking `try_send`. Chaos tests (take flood, failing
-  feeds, ongoing authorization, wedged and panicking aux thread, wedged group encoder) and a 1 h mda001 soak are owed by
+  feeds, ongoing authorization, wedged and panicking aux thread, wedged encoder, a wedged live encoder open) and a 1 h mda001 soak are owed by
   the implementing slices (note §9).
 - **Invariant #10.** Every new channel is bounded and drops. Takes are admitted with `try_send`
   (503 when full).
-- **Invariant #7.** Encoder count with default config equals today's for video. AAC goes from one
-  shared encoder to one per route group (2 on mda001, about +2.7 % of a core).
-- **Backward compatibility.** Absent config gives today's pixels, samples, video encoder count and
-  outputs. The only internal difference is one AAC encoder per route group instead of one shared
-  encoder. Configs with a switcher and a
-  multi-cell layout start instead of failing.
+- **Invariant #7** becomes a structure: one encode per (picture or audio bus, settings), whatever
+  the subscriber count. Default config keeps today's encoders. A routed output costs a new encoder
+  only while no other output carries its bus with its settings.
+- **Backward compatibility.** Absent config gives today's pixels, samples, encoders and outputs.
+  Configs with a switcher and a multi-cell layout start instead of failing.
 - **ADR-0030** stays Proposed, amended: aux canvases of one Program cover output routing, and
   separate Programs remain the model for other cadences or sizes and for passthrough.
 - **ADR-0034 / decoupled-routing backlog:**
-  - RT-12's `OutputRef` is reused, and its sink-mover is superseded for routing.
+  - RT-12's `OutputRef` is reused. Its sink-mover is reused as the idea and built on the production
+    dispatcher (`rebind`).
   - RT-13 is superseded for routing, and stays for passthrough.
   - RT-15 stays separate (format migration only).
   - RT-16's salvo shape is reused.
   - RT-17 is superseded by slice 5.
   - SW-27 is superseded.
 - **Slices** (note §10; epic #303, slices #304-#308):
-  1. preview, program, VT, bars and source to an output, live, from the Outputs page and the API.
-     This is what the operator named, except layout, and it needs no GPU compose;
+  1. preview, program, VT, bars and source to any output, live and independently (also outputs with
+     identical settings), from the Outputs page and the API. This is what the operator named,
+     except layout, and it needs no GPU compose;
   2. explicit audio feed and Clean;
   3. layout to an output;
   4. layout-as-a-source and removal of the first-slice restriction (#243);
