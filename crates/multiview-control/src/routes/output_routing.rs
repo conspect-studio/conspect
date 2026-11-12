@@ -2,7 +2,7 @@
 //! `POST /api/v1/routing/output/take` (ADR-0108 slice 1, design §6.2-§6.4).
 //!
 //! Order of checks on both routes, so nothing leaks and nothing is burned:
-//! role → destination `authorize_object(output)` → feed authorization
+//! role → destination on both axes (`ObjectAndOutput{output, output}`) → feed authorization
 //! (source: `authorize_object(source)`; bus: Program scope + `me1`) — all
 //! **before** existence, so an id the caller may not read is a 403 whether or
 //! not it exists. Then the take checks the `Idempotency-Key` (a replay answers
@@ -168,9 +168,23 @@ fn capacity_text(principal: &Principal, in_use: usize, max: usize) -> String {
     }
 }
 
+/// Authorize the output end on BOTH axes (§6.3): the object axis
+/// (`scoped_object_ids`) and the output axis (`scoped_output_ids`, ADR-W026),
+/// so a key confined to some outputs can neither take nor read another. The
+/// same rule filters `GET /routing` rows and `route.output` delivery.
+pub(crate) fn authorize_output_end(principal: &Principal, output: &str) -> ControlResult<()> {
+    crate::auth::authorize_scope(
+        principal,
+        multiview_events::AuthzScope::ObjectAndOutput {
+            object: output,
+            output,
+        },
+    )
+}
+
 /// Authorize both ends (§6.3), before any existence check.
 fn authorize_ends(principal: &Principal, req: &OutputRouteRequest) -> ControlResult<()> {
-    crate::auth::authorize_object(principal, req.output())?;
+    authorize_output_end(principal, req.output())?;
     match &req.feed {
         VideoFeed::Source(id) | VideoFeed::Layout(id) => {
             crate::auth::authorize_object(principal, id)?;

@@ -2057,8 +2057,13 @@ impl Event {
             Self::DeviceSync(e) => AuthzScope::Object(&e.device_id),
             Self::CastSessionStarted(e) => AuthzScope::Object(&e.session_id),
             Self::CastSessionRemoved(e) => AuthzScope::Object(&e.session_id),
-            // The same axis as the REST take/readback check (ADR-0108 §6.3).
-            Self::RouteOutput(e) => AuthzScope::Object(&e.output),
+            // An output take's outcome: both axes of the output, exactly as
+            // the REST take/readback authorize it, so an output-scoped key
+            // (`scoped_output_ids`) receives only its own outputs' events.
+            Self::RouteOutput(e) => AuthzScope::ObjectAndOutput {
+                object: &e.output,
+                output: &e.output,
+            },
             Self::SwitcherOperation(e) => AuthzScope::ObjectAndProgram {
                 object: &e.me,
                 program: &e.program,

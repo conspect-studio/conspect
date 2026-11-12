@@ -549,7 +549,8 @@ pub(crate) async fn get_routing(
     let mut outputs = Vec::with_capacity(resources.len());
     for versioned in resources {
         let id = versioned.resource.id;
-        if crate::auth::authorize_object(&principal, &id).is_err() {
+        // The same two-axis rule the take uses (object + output axis).
+        if super::output_routing::authorize_output_end(&principal, &id).is_err() {
             continue;
         }
         let body: multiview_config::Output = serde_json::from_value(versioned.resource.body)
