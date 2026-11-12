@@ -666,6 +666,85 @@ pub fn propagate_routing_change(
     updates
 }
 
+/// One `[[routing.output]]` audio feed rewritten by
+/// [`propagate_routing_feed_change`] (ADR-0108 §5.5: the ADR-R005 §4.3 rename
+/// propagation extends to output audio feeds).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[non_exhaustive]
+pub struct OutputFeedAudioUpdate {
+    /// The routed output's id (`[[routing.output]] output`).
+    pub output: String,
+    /// Track names the feed no longer carries.
+    pub removed: Vec<String>,
+    /// `(old_name, new_name)` pairs the feed was rewritten to follow.
+    pub renamed: Vec<(String, String)>,
+    /// The feed emptied and became `program`.
+    pub became_program: bool,
+}
+
+/// Rewrite every `[[routing.output]] audio = { tracks = [..] }` feed to follow
+/// a routing replace's renames and removals, **in place** (the sibling of
+/// [`propagate_routing_change`] for output feeds). A track renamed to a name
+/// the feed already carries collapses; a feed whose every track was removed
+/// becomes `program` (the output stays audible). Returns one update per feed
+/// actually changed.
+pub fn propagate_routing_feed_change(
+    old: Option<&AudioRouting>,
+    new: &AudioRouting,
+    routing: Option<&mut crate::RoutingTable>,
+) -> Vec<OutputFeedAudioUpdate> {
+    let (renamed, removed) = diff_track_changes(old, new);
+    let Some(routing) = routing else {
+        return Vec::new();
+    };
+    if renamed.is_empty() && removed.is_empty() {
+        return Vec::new();
+    }
+    let mut updates = Vec::new();
+    for xp in &mut routing.output {
+        let crate::AudioFeed::Tracks(tracks) = &xp.audio else {
+            continue;
+        };
+        let mut next: Vec<String> = Vec::with_capacity(tracks.len());
+        for track in tracks {
+            if removed.contains(track) {
+                continue;
+            }
+            let mapped = renamed
+                .iter()
+                .find(|(old, _)| old == track)
+                .map_or_else(|| track.clone(), |(_, new)| new.clone());
+            if !next.contains(&mapped) {
+                next.push(mapped);
+            }
+        }
+        if next == *tracks {
+            continue;
+        }
+        let update = OutputFeedAudioUpdate {
+            output: xp.output.clone(),
+            removed: removed
+                .iter()
+                .filter(|t| tracks.contains(t))
+                .cloned()
+                .collect(),
+            renamed: renamed
+                .iter()
+                .filter(|(old, _)| tracks.contains(old))
+                .cloned()
+                .collect(),
+            became_program: next.is_empty(),
+        };
+        xp.audio = if next.is_empty() {
+            crate::AudioFeed::Program
+        } else {
+            crate::AudioFeed::Tracks(next)
+        };
+        updates.push(update);
+    }
+    updates
+}
+
 /// The **per-output audio capability** — the verified ADR-R005 §4.2 matrix as a
 /// first-class, machine-readable value (the brief: "a first-class data
 /// structure, not scattered conditionals").

@@ -42,7 +42,9 @@ use crate::concurrency::{IfMatch, Version};
 use crate::error::{ControlError, ControlResult};
 use crate::state::AppState;
 use crate::typed_resources::{with_apply, ApplyMode};
-use multiview_config::{propagate_routing_change, AudioRouting, PROGRAM_TRACK};
+use multiview_config::{
+    propagate_routing_change, propagate_routing_feed_change, AudioRouting, PROGRAM_TRACK,
+};
 
 /// One discrete-track rename a routing replace's propagation applied.
 #[derive(Debug, Clone, Serialize)]
@@ -226,7 +228,11 @@ fn apply_routing_propagation(
     output_ids: &[String],
 ) -> ControlResult<Vec<OutputsUpdatedEntry>> {
     let updates = propagate_routing_change(old_routing, routing, &mut prospective.outputs);
-    if updates.is_empty() {
+    // ADR-0108 §5.5: `[[routing.output]] audio = { tracks = [..] }` feeds
+    // follow the same renames/removals, in the same prospective document
+    // (an emptied feed becomes `program`). Reported as further entries.
+    let feeds = propagate_routing_feed_change(old_routing, routing, prospective.routing.as_mut());
+    if updates.is_empty() && feeds.is_empty() {
         return Ok(Vec::new());
     }
     // Per-object authorization (BOLA, ADR-W005/ADR-W026): every output this
@@ -244,6 +250,11 @@ fn apply_routing_propagation(
             denied.push(output_id);
         }
         ids.push(output_id);
+    }
+    for feed in &feeds {
+        if crate::auth::authorize_object(principal, &feed.output).is_err() {
+            denied.push(&feed.output);
+        }
     }
     if !denied.is_empty() {
         return Err(ControlError::Forbidden(format!(
@@ -267,6 +278,20 @@ fn apply_routing_propagation(
                 })
                 .collect(),
         })
+        .chain(feeds.iter().map(|feed| {
+            OutputsUpdatedEntry {
+                output: feed.output.clone(),
+                removed: feed.removed.clone(),
+                renamed: feed
+                    .renamed
+                    .iter()
+                    .map(|(from, to)| RenamedTrack {
+                        from: from.clone(),
+                        to: to.clone(),
+                    })
+                    .collect(),
+            }
+        }))
         .collect())
 }
 
