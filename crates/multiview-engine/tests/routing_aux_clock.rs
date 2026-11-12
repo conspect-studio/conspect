@@ -14,10 +14,14 @@
 //!    - panicking aux (reads one tick, then panics): `sent + dropped == fresh`,
 //!      `fresh - 5 <= dropped <= fresh - 1`;
 //!    - inactive sender: zero sends and zero drops;
-//!    - the clock-side cost of the aux duty itself, measured per fresh tick
-//!      around `WithAuxTick::after_compose` (whose inner control does nothing
-//!      there, so the time is the flag load + `try_send` + counter): max < 1 ms
-//!      and p99 < 100 µs.
+//!    - the clock-side cost of the aux duty in the real run, measured per fresh
+//!      tick around `WithAuxTick::after_compose`: max below half a tick
+//!      (16.7 ms at 30000/1001, the design's Program protection bound). A real
+//!      run has only ~90 samples, so its p99 is its max and measures runner
+//!      preemption, not the code; the code's own cost is part 3.
+//! 3. Tight loop: 10 000 `AuxTickSender::offer` calls each against a wedged
+//!    (full) channel and a disconnected one, timed individually: p99 < 100 µs
+//!    and median < 10 µs. This is the per-tick clock-side work routing adds.
 //! 2. Deterministic `ManualTimeSource` + `CooperativePacer` (no real sleeps; the
 //!    control advances the clock exactly one period per compose, as
 //!    `cadence_hold.rs` does), 300 ticks: a wedged and a panicked receiver each
@@ -102,13 +106,18 @@ impl<C: FrameControl> FrameControl for Timed<C> {
     }
 }
 
-/// The aux duty's per-tick cost bounds: max < 1 ms, p99 < 100 µs.
+/// Half a tick at 30000/1001, in nanoseconds (the design's bound for any
+/// clock-side cost, output-routing.md §10).
+const HALF_TICK_NS: u64 = 1_001_000_000 / 30_000 / 2;
+
+/// The aux duty's per-tick cost in a real run: max below half a tick.
 fn assert_offer_cost(name: &str, offer_ns: &[u64]) {
     assert!(!offer_ns.is_empty(), "{name}: no fresh tick measured");
     let max = *offer_ns.last().unwrap();
-    let p99 = offer_ns[(offer_ns.len() * 99 / 100).min(offer_ns.len() - 1)];
-    assert!(max < 1_000_000, "{name}: aux duty max {max} ns >= 1 ms");
-    assert!(p99 < 100_000, "{name}: aux duty p99 {p99} ns >= 100 us");
+    assert!(
+        max < HALF_TICK_NS,
+        "{name}: aux duty max {max} ns >= half a tick ({HALF_TICK_NS} ns)"
+    );
 }
 
 /// Run the real clock for `TICKS` ticks with the aux sender wrapped around a
@@ -301,4 +310,48 @@ async fn a_wedged_or_panicked_aux_gives_zero_repeats_on_a_manual_clock() {
     assert!(dying.join().is_err(), "the aux thread panicked as injected");
     assert_eq!((ticks, repeated), (300, 0), "panicked aux: zero repeats");
     assert_eq!(sent + dropped, 300, "every fresh tick offered exactly once");
+}
+
+/// Part 3: the clock-side work routing adds, measured over many offers so the
+/// percentiles describe the code rather than one preempted tick.
+#[test]
+fn an_offer_to_a_wedged_or_dead_aux_thread_is_microseconds() {
+    const OFFERS: usize = 10_000;
+    fn time_offers(tx: &AuxTickSender) -> Vec<u64> {
+        let mut ns = Vec::with_capacity(OFFERS);
+        for index in 0..OFFERS {
+            let tick = AuxTick {
+                index: u64::try_from(index).unwrap(),
+                pts: multiview_core::time::MediaTime::ZERO,
+            };
+            let started = Instant::now();
+            tx.offer(tick);
+            ns.push(u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX));
+        }
+        ns.sort_unstable();
+        ns
+    }
+    let check = |name: &str, ns: &[u64]| {
+        let p50 = ns[ns.len() / 2];
+        let p99 = ns[ns.len() * 99 / 100];
+        assert!(p50 < 10_000, "{name}: offer median {p50} ns >= 10 us");
+        assert!(p99 < 100_000, "{name}: offer p99 {p99} ns >= 100 us");
+    };
+    // Wedged: the receiver is held and never read (every offer after 4 drops).
+    let (tx, rx) = aux_tick_channel();
+    tx.active_flag().store(true, Ordering::Release);
+    let wedged = time_offers(&tx);
+    assert_eq!(tx.sent_counter().load(Ordering::Relaxed), 4);
+    check("wedged", &wedged);
+    drop(rx);
+    // Dead: the receiver is gone (the aux thread exited).
+    let (tx, rx) = aux_tick_channel();
+    tx.active_flag().store(true, Ordering::Release);
+    drop(rx);
+    let dead = time_offers(&tx);
+    assert_eq!(
+        tx.dropped_counter().load(Ordering::Relaxed),
+        u64::try_from(OFFERS).unwrap()
+    );
+    check("dead", &dead);
 }
