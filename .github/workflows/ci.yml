@@ -1100,6 +1100,18 @@ jobs:
           otool -L "$bin" | grep libavformat
           otool -L "$bin" | grep -q "${FF_PREFIX}/lib/libavformat" \
             || { echo "::error::test binary is not linked against ${FF_PREFIX}"; exit 1; }
+      - name: Release bundle check (apple preset, deploy/macos-bundle.sh, ad-hoc signed)
+        # The release workflow only runs on tags; this proves on every PR that
+        # the apple binary bundles into a self-contained, signed directory that
+        # starts with no DYLD_* override (what release.yml ships).
+        run: |
+          set -euo pipefail
+          cargo build --locked -p multiview-cli --features apple
+          stage="${RUNNER_TEMP}/bundle"
+          rm -rf "${stage}" && mkdir -p "${stage}"
+          cp target/debug/multiview "${stage}/multiview"
+          env -u DYLD_LIBRARY_PATH bash deploy/macos-bundle.sh "${stage}" -
+          ls "${stage}/lib" "${stage}/licenses"
 
   # ── Windows: pinned LGPL FFmpeg (MSVC) + workspace check + libav suite ─────────
   # ADR-0011 amendment. Builds OUR pinned FFmpeg with FF_HWACCEL=windows via

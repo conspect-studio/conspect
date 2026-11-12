@@ -12,11 +12,13 @@ name: release
 # RUNPATH). The GPL `gpl-codecs` build is
 # NOT a release artifact.
 #
-# macOS is deliberately NOT in the matrix yet. It must link a pinned LGPL
-# FFmpeg (a VideoToolbox/AudioToolbox profile for deploy/ffmpeg-build.sh is
-# the next change); Homebrew's `ffmpeg` is GPL (x264/x265) and a different
-# major, so it must NEVER feed a release artifact. The codesign + notarize
-# steps below stay, gated on runner.os, for when the macOS legs return.
+# macOS (Apple silicon) builds the `apple` preset against OUR pinned LGPL
+# FFmpeg (FF_HWACCEL=apple: VideoToolbox/AudioToolbox). Homebrew provides only
+# LGPL/permissive build deps (opus, srt, gnutls); Homebrew's `ffmpeg` (GPL) is
+# never installed here. deploy/macos-bundle.sh copies the libav* dylibs and
+# their deps into lib/ with @rpath install names, collects their upstream
+# licence texts, and signs inside-out (Developer ID + hardened runtime when the
+# signing secrets exist, ad-hoc otherwise); the archive is then notarized.
 
 on:
   push:
@@ -50,6 +52,9 @@ jobs:
           - os: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
             features: ffmpeg,linux-vaapi
+          - os: macos-15
+            target: aarch64-apple-darwin
+            features: apple
     runs-on: ${{ matrix.os }}
     steps:
       - name: Checkout
@@ -73,6 +78,7 @@ jobs:
       # ASSERT the soname. The prefix is bundled into the archive below.
       # ---------------------------------------------------------------------
       - name: Build pinned FFmpeg 9.0.2
+        if: runner.os == 'Linux'
         env:
           FF_PREFIX: /opt/multiview-ffmpeg
           FF_LICENSE: lgpl
@@ -102,6 +108,29 @@ jobs:
             63.*) echo "FFmpeg 9.0.x confirmed (libavcodec ${MODVER})." ;;
             *) echo "::error::Expected libavcodec 63.x (FFmpeg 9.0.x), got ${MODVER}"; exit 1 ;;
           esac
+          {
+            echo "FF_PREFIX=${FF_PREFIX}"
+            echo "PKG_CONFIG_PATH=${FF_PREFIX}/lib/pkgconfig"
+          } >> "$GITHUB_ENV"
+
+      - name: Build pinned FFmpeg 9.0.2 (apple profile)
+        if: runner.os == 'macOS'
+        run: |
+          set -euo pipefail
+          pin() { sed -n "s/^ARG $1=//p" deploy/Dockerfile.ffmpeg | head -1; }
+          FFMPEG_VERSION="$(pin FFMPEG_VERSION)"; FFMPEG_SHA256="$(pin FFMPEG_SHA256)"
+          FFMPEG_GIT_COMMIT="$(pin FFMPEG_GIT_COMMIT)"
+          export FFMPEG_VERSION FFMPEG_SHA256 FFMPEG_GIT_COMMIT
+          FF_PREFIX="${RUNNER_TEMP}/multiview-ffmpeg"
+          # LGPL/permissive build deps only. Never Homebrew's GPL `ffmpeg`.
+          brew install pkg-config nasm opus srt gnutls
+          export PKG_CONFIG_PATH="$(brew --prefix)/lib/pkgconfig"
+          FF_PREFIX="${FF_PREFIX}" FF_LICENSE=lgpl FF_HWACCEL=apple TARGETARCH=arm64 \
+            bash deploy/ffmpeg-build.sh
+          if "${FF_PREFIX}/bin/ffmpeg" -hide_banner -buildconf | grep -qE 'enable-gpl|enable-nonfree|libx26[45]'; then
+            echo "::error::macOS FFmpeg prefix is not LGPL-only"; exit 1
+          fi
+          test -e "${FF_PREFIX}/lib/libavcodec.63.dylib"
           {
             echo "FF_PREFIX=${FF_PREFIX}"
             echo "PKG_CONFIG_PATH=${FF_PREFIX}/lib/pkgconfig"
@@ -144,43 +173,50 @@ jobs:
           p12-file-base64: ${{ secrets.MACOS_CERTIFICATE }}
           p12-password: ${{ secrets.MACOS_CERTIFICATE_PWD }}
 
-      - name: Codesign + notarize (macOS)
-        if: runner.os == 'macOS' && steps.signing.outputs.enabled == 'true'
+      - name: Package tar.gz + sha256
+        id: package
+        shell: bash
         env:
+          SIGNING_ENABLED: ${{ steps.signing.outputs.enabled }}
           AC_API_KEY_ID: ${{ secrets.AC_API_KEY_ID }}
           AC_API_ISSUER_ID: ${{ secrets.AC_API_ISSUER_ID }}
           AC_API_KEY_P8: ${{ secrets.AC_API_KEY_P8 }}
         run: |
           set -euo pipefail
           BIN="target/${{ matrix.target }}/release/multiview"
-          # Hardened-runtime codesign with a secure timestamp. The signing
-          # identity is the first Developer ID Application in the keychain.
-          IDENTITY="$(security find-identity -v -p codesigning | awk -F'"' '/Developer ID Application/{print $2; exit}')"
-          codesign --force --options runtime --timestamp --sign "${IDENTITY}" "${BIN}"
-          codesign --verify --strict --verbose=2 "${BIN}"
-          # Notarize: notarytool wants an archive; zip the signed binary.
-          KEYFILE="$(mktemp)"
-          printf '%s' "${AC_API_KEY_P8}" > "${KEYFILE}"
-          ZIP="$(mktemp -d)/multiview.zip"
-          /usr/bin/ditto -c -k --keepParent "${BIN}" "${ZIP}"
-          xcrun notarytool submit "${ZIP}" \
-            --key "${KEYFILE}" \
-            --key-id "${AC_API_KEY_ID}" \
-            --issuer "${AC_API_ISSUER_ID}" \
-            --wait
-          rm -f "${KEYFILE}"
-          # CLI binaries can't be stapled (no bundle); the notarization ticket is
-          # served by Apple and checked online at first run.
-
-      - name: Package tar.gz + sha256
-        id: package
-        shell: bash
-        run: |
-          set -euo pipefail
-          BIN="target/${{ matrix.target }}/release/multiview"
           STAGE="multiview-${{ github.ref_name }}-${{ matrix.target }}"
           mkdir -p "dist/${STAGE}"
           cp "${BIN}" "dist/${STAGE}/multiview"
+          if [ "${RUNNER_OS}" = "macOS" ]; then
+            # Self-contained bundle: libav* + deps in lib/ (@rpath), their
+            # licence texts in licenses/, signed inside-out.
+            mkdir -p "dist/${STAGE}/licenses"
+            cp -a "${FF_PREFIX}/share/licenses/ffmpeg" "dist/${STAGE}/licenses/ffmpeg"
+            test -s "dist/${STAGE}/licenses/ffmpeg/COPYING.LGPLv3"
+            IDENTITY="-"
+            if [ "${SIGNING_ENABLED}" = "true" ]; then
+              IDENTITY="$(security find-identity -v -p codesigning | awk -F'"' '/Developer ID Application/{print $2; exit}')"
+            fi
+            env -u DYLD_LIBRARY_PATH bash deploy/macos-bundle.sh "dist/${STAGE}" "${IDENTITY}"
+            for lib in libavcodec.63.dylib libavformat.63.dylib libavutil.61.dylib; do
+              test -e "dist/${STAGE}/lib/${lib}" || { echo "::error::${lib} not bundled"; exit 1; }
+            done
+            if [ "${SIGNING_ENABLED}" = "true" ]; then
+              # Notarize: notarytool wants an archive of the signed tree.
+              KEYFILE="$(mktemp)"
+              printf '%s' "${AC_API_KEY_P8}" > "${KEYFILE}"
+              ZIP="$(mktemp -d)/multiview.zip"
+              /usr/bin/ditto -c -k --keepParent "dist/${STAGE}" "${ZIP}"
+              xcrun notarytool submit "${ZIP}" \
+                --key "${KEYFILE}" \
+                --key-id "${AC_API_KEY_ID}" \
+                --issuer "${AC_API_ISSUER_ID}" \
+                --wait
+              rm -f "${KEYFILE}"
+              # CLI binaries can't be stapled (no bundle); the notarization
+              # ticket is served by Apple and checked online at first run.
+            fi
+          fi
           if [ "${RUNNER_OS}" = "Linux" ]; then
             # Ship the pinned LGPL libav* next to the binary (dynamic linkage,
             # THIRD-PARTY-NOTICES §1) and point the binary at them with an
