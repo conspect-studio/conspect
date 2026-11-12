@@ -41,6 +41,7 @@ pub mod logs;
 pub mod media_players;
 pub mod mesh;
 pub mod moq;
+pub mod output_routing;
 pub mod outputs;
 pub mod overlays;
 pub mod preview;
@@ -1417,6 +1418,7 @@ pub fn api_router() -> Router<AppState> {
         .route("/switcher/commands/{kind}", post(switcher::submit_switcher))
         .route("/routing", get(routing::get_routing))
         .route("/routing/plan", post(routing::plan_route))
+        .route("/routing/output/take", post(output_routing::take_output))
         .route("/routing/{kind}/take", post(routing::take_route))
         // Tally operator surface: read resolved state, profiles, manual override.
         .route("/tally", get(tally::list_tally))

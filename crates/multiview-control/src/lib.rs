@@ -76,6 +76,7 @@ pub mod moq_provider;
 pub mod moq_startup;
 pub mod nmos;
 pub mod notify;
+pub mod output_routing;
 pub mod pending_actions;
 pub mod preview;
 pub mod problem;
@@ -260,6 +261,9 @@ pub fn router(state: AppState) -> Router {
     // the operator has limits enabled (the default). Disabled ⇒ the router is exactly
     // what it was before — no middleware, no overhead.
     let limits_enabled = state.limiters.is_enabled();
+    if let Some(control) = state.output_routing.as_ref() {
+        output_routing::spawn_outcome_relay(&state, control);
+    }
 
     let api = routes::api_router()
         // The WebRTC media-signalling routes, wrapped with their own CORS layer

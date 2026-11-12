@@ -3332,7 +3332,10 @@ impl Pipeline {
     /// sender, the `routing-aux` thread, and the consumer's router with its
     /// base forced-IDR cells. Publishes the take handle into
     /// [`Self::output_routing`]. Nothing here runs per tick.
-    fn build_output_routing(&self) -> Result<RunRouting, PipelineError> {
+    fn build_output_routing(
+        &self,
+        binding_ids: &[Option<String>],
+    ) -> Result<RunRouting, PipelineError> {
         let spawn_err = |e: std::io::Error| PipelineError::Output {
             kind: "routing",
             reason: e.to_string(),
@@ -3401,7 +3404,22 @@ impl Pipeline {
             open,
         )
         .map_err(spawn_err)?;
-        self.output_routing.store(Some(Arc::new(handle)));
+        // Router index i = runner i: the id the control plane addresses, the
+        // Program settings, and whether slice 1 can cut that encoder family.
+        let run_outputs = self
+            .output_video_keys
+            .iter()
+            .enumerate()
+            .map(|(index, &settings)| crate::output_routing::RunOutput {
+                id: binding_ids.get(index).cloned().flatten(),
+                settings,
+                routable: self.rendition_configs.get(settings).is_some_and(|cfg| {
+                    !(cfg.codec_name.contains("vaapi") || cfg.codec_name.contains("videotoolbox"))
+                }),
+            })
+            .collect();
+        self.output_routing
+            .store(Some(Arc::new(handle.with_outputs(run_outputs))));
         Ok(RunRouting {
             consumer: ConsumerRouting {
                 router: Box::new(router),
@@ -3748,8 +3766,6 @@ impl Pipeline {
     /// run starts its egress, then this run's
     /// [`OutputRoutingHandle`](crate::output_routing::OutputRoutingHandle)
     /// (take mailbox, wait-free snapshot, outcome stream).
-    #[allow(dead_code)]
-    // reason: the HTTP take API (a later ADR-0108 PR) is the consumer; the producer side is wired and tested here.
     #[must_use]
     pub fn output_routing(&self) -> crate::output_routing::OutputRoutingSlot {
         Arc::clone(&self.output_routing)
@@ -4743,7 +4759,7 @@ impl Pipeline {
         // Output routing (ADR-0108 slice 1): the clock's aux tick sender (inert
         // until a take routes a feed), the off-clock `routing-aux` thread (it
         // blocks on recv while nothing is routed), and the consumer's router.
-        let routing = self.build_output_routing()?;
+        let routing = self.build_output_routing(&binding_ids)?;
         let RunRouting {
             consumer: consumer_routing,
             aux_tx,

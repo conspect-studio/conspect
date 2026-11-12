@@ -496,6 +496,7 @@ fn build_messages_switcher_events() -> serde_json::Map<String, Value> {
         "contentType": "application/json",
         "payload": { "$ref": "#/components/schemas/MediaPlayerEvent" }
     }));
+    map.insert("RouteOutputEvent".to_owned(), route_output_message());
     map.insert("GraphicsChannelEvent".to_owned(), json!({
         "name": "GraphicsChannelEvent",
         "title": "Graphics playout channel state",
@@ -726,6 +727,7 @@ fn event_payload_one_of() -> Value {
         { "$ref": "#/components/schemas/AudioMeter" },
         { "$ref": "#/components/schemas/AudioLoudness" },
         { "$ref": "#/components/schemas/OutputStatus" },
+        { "$ref": "#/components/schemas/RouteOutputEvent" },
         { "$ref": "#/components/schemas/Alert" },
         { "$ref": "#/components/schemas/HealthWarning" },
         { "$ref": "#/components/schemas/InputConnection" },
@@ -801,6 +803,7 @@ fn core_event_schemas() -> Value {
         "GpuVendor": gpu_vendor_schema(),
         "OutputRunState": output_run_state_schema(),
         "OutputStatus": output_status_schema(),
+        "RouteOutputEvent": route_output_event_schema(),
         "AlertSeverity": alert_severity_schema(),
         "Alert": alert_schema(),
         "WarningSeverity": warning_severity_schema(),
@@ -1579,6 +1582,34 @@ fn switcher_operation_schema() -> Value {
             "operation_id": { "type": "string" },
             "completed": { "type": "boolean" },
             "error": { "type": "string" }
+        }
+    })
+}
+
+fn route_output_message() -> Value {
+    json!({
+        "name": "RouteOutputEvent",
+        "title": "Output feed take outcome",
+        "summary": "An output feed take settled (route.output on topic `outputs`).",
+        "description": "Emitted on topic `outputs` with envelope `id` = output id and `corr` = the take's operation id (ADR-0108 §6.2). Lossless; delivered only to principals that may read the output.",
+        "contentType": "application/json",
+        "payload": { "$ref": "#/components/schemas/RouteOutputEvent" }
+    })
+}
+
+fn route_output_event_schema() -> Value {
+    json!({
+        "type": "object",
+        "description": "Data body of `route.output` (ADR-0108 §6.2): the terminal outcome of one output feed take, or an unrequested fallback. Envelope `id` = output id.",
+        "required": ["output", "operation_id", "tick", "outcome"],
+        "properties": {
+            "output": { "type": "string", "description": "Output API id (matches the envelope `id`)." },
+            "operation_id": { "type": "string", "description": "The take's operation id (empty for a fallback)." },
+            "tick": { "type": "integer", "format": "uint64", "description": "Program tick at which the outcome was decided." },
+            "outcome": {
+                "type": "string",
+                "enum": ["applied", "superseded", "refused:feed-not-fresh", "refused:capacity", "refused:encoder-not-ready", "refused:unroutable", "fallback:aux-failed", "fallback:encoder-failed"]
+            }
         }
     })
 }

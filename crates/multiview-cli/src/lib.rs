@@ -286,6 +286,9 @@ pub mod moq_outputs;
 /// Output routing take state machine and live encoders (ADR-0108 slice 1).
 #[cfg(feature = "ffmpeg")]
 pub mod output_routing;
+/// The control-plane adapter over the output routing handle (ADR-0108).
+#[cfg(feature = "ffmpeg")]
+pub mod output_routing_control;
 #[cfg(feature = "ffmpeg")]
 pub mod output_window_registry;
 /// The full libav\* end-to-end `multiview run` pipeline (ingest → composite →
