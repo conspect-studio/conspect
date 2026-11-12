@@ -1069,6 +1069,7 @@ impl AppState {
             automation: None,
             whep: crate::preview::no_whep(),
             moq: Arc::new(crate::moq::MoqRegistry::default()),
+            #[allow(clippy::default_constructed_unit_structs)] // unit on non-unix
             web_capture: crate::web_capture::Provider::default(),
             cloudflare: None,
             whip: crate::whip::no_whip(),

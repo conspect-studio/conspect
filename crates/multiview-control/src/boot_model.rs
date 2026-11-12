@@ -2256,8 +2256,10 @@ fn atomic_target_mode(_dest: &Path) -> u32 {
     0o600
 }
 
-/// Non-Unix fallback: no-op mode set (mode is advisory off Unix).
+/// Non-Unix fallback: no-op mode set (mode is advisory off Unix). Keeps the
+/// unix signature so callers are platform-neutral.
 #[cfg(not(unix))]
+#[allow(clippy::unnecessary_wraps)]
 fn set_owner_only_mode(_file: &std::fs::File, _mode: u32) -> std::io::Result<()> {
     Ok(())
 }

@@ -47,6 +47,9 @@ pub mod auth;
 pub mod automation;
 pub mod boot_model;
 pub mod catalogue;
+/// Unix only: the credential vault it relies on enforces POSIX owner-only
+/// permissions and offers no weaker cross-platform fallback.
+#[cfg(unix)]
 pub mod cloudflare_management;
 pub mod command;
 pub mod concurrency;
@@ -1067,6 +1070,8 @@ where
 
 pub mod web_capture;
 
+#[cfg(unix)]
 pub mod web_capture_startup;
 
+#[cfg(unix)]
 pub mod web_capture_store;

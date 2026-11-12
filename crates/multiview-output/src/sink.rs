@@ -2541,6 +2541,9 @@ impl<'a> SegmentState<'a> {
                 continue;
             };
             if segment.packets == 0 {
+                // Windows cannot delete an open file: close it first.
+                #[cfg(windows)]
+                segment.muxer.release_output().map_err(ff)?;
                 match std::fs::remove_file(&segment.write_path) {
                     Ok(()) | Err(_) => {}
                 }
@@ -2553,6 +2556,10 @@ impl<'a> SegmentState<'a> {
             // is too late for an atomic rename of the file we are about to
             // retire.
             segment.muxer.flush().map_err(ff)?;
+            // Windows cannot rename an open file: close it first (the muxer
+            // stays alive and is redirected to the next segment).
+            #[cfg(windows)]
+            segment.muxer.release_output().map_err(ff)?;
             std::fs::rename(&segment.write_path, &segment.path)
                 .map_err(|e| Error::Output(format!("publishing audio segment: {e}")))?;
             let uri = segment
@@ -3043,6 +3050,10 @@ impl<'a> SegmentState<'a> {
         // too late for an atomic rename of the file we are about to retire.
         if self.live.is_some() && segment.write_path != segment.path {
             segment.muxer.flush().map_err(ff)?;
+            // Windows cannot rename an open file: close it first (the muxer
+            // stays alive and is redirected to the next segment).
+            #[cfg(windows)]
+            segment.muxer.release_output().map_err(ff)?;
         }
         let segment = &*segment;
         #[cfg(test)]

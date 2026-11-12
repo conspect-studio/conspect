@@ -1,3 +1,4 @@
+#![cfg(unix)]
 //! Crash-safe pending idempotency receipts must never create a second capture.
 #![allow(clippy::unwrap_used)]
 use multiview_control::web_capture_store::{Ledger, Reserve, LEDGER_CAPACITY};
