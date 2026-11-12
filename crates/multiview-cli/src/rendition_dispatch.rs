@@ -913,6 +913,9 @@ impl RenditionDispatcher {
             };
             let index = entry.index;
             let mut applied = false;
+            // Leading video packets of the cut window before its first gated
+            // RAP: never delivered after a switch (audio is kept).
+            let mut skip = 0_usize;
             if let Some(mut m) = b.mv {
                 if index >= m.at_tick {
                     let usable = self
@@ -921,32 +924,29 @@ impl RenditionDispatcher {
                         .is_some_and(|x| !x.failed && !x.retired);
                     if usable {
                         let dest_dynamic = self.video_meta.get(m.key).is_some_and(|x| x.dynamic);
-                        let first_pkt_passes = |gate: &Option<MoveGate>| -> bool {
-                            let Some(g) = gate.as_ref() else {
-                                return false;
-                            };
+                        // The gate passes on ANY video packet of the window;
+                        // the delivered window starts at the first that does.
+                        let gated_rap = |gate: &Option<MoveGate>| -> Option<usize> {
+                            let g = gate.as_ref()?;
                             if dest_dynamic {
-                                self.video.get(m.key).is_some_and(|s| s.complete(end))
-                                    && self
-                                        .video
-                                        .get(m.key)
-                                        .and_then(|s| s.peek(index))
-                                        .and_then(|w| w.packets.first())
-                                        .is_some_and(|p| g(p))
+                                if !self.video.get(m.key).is_some_and(|s| s.complete(end)) {
+                                    return None;
+                                }
+                                self.video
+                                    .get(m.key)
+                                    .and_then(|s| s.peek(index))
+                                    .and_then(|w| w.packets.iter().position(|p| g(p)))
                             } else {
                                 entry
                                     .base
                                     .iter()
                                     .find(|(k, _)| *k == m.key)
-                                    .and_then(|(_, v)| v.first())
-                                    .is_some_and(g)
+                                    .and_then(|(_, v)| v.iter().position(g))
                             }
                         };
-                        let pass = self
-                            .video_meta
-                            .get(m.key)
-                            .is_some_and(|x| first_pkt_passes(&x.gate));
-                        if pass {
+                        let pass = self.video_meta.get(m.key).and_then(|x| gated_rap(&x.gate));
+                        if let Some(at) = pass {
+                            skip = at;
                             b.video_key = Some(m.key);
                             push_outcome(
                                 &mut self.outcomes,
@@ -1005,8 +1005,16 @@ impl RenditionDispatcher {
                 let gate = cur
                     .and_then(|k| self.video_meta.get(k))
                     .and_then(|m| m.gate.as_ref());
-                let pass = applied || gate.is_none_or(|g| packets.first().is_some_and(g));
-                if pass {
+                let rap = if applied {
+                    Some(skip)
+                } else {
+                    match gate {
+                        None => Some(0),
+                        Some(g) => packets.iter().position(g),
+                    }
+                };
+                if let Some(at) = rap {
+                    skip = at;
                     b.fallback_gate_pending = false;
                 } else {
                     // Never a mid-GOP picture after a switch: the whole window is lost.
@@ -1014,6 +1022,9 @@ impl RenditionDispatcher {
                     self.counters.dropped_pending = self.counters.dropped_pending.saturating_add(1);
                     continue;
                 }
+            }
+            if skip > 0 {
+                packets.drain(..skip.min(packets.len()));
             }
             packets.append(&mut entry.audio);
             if delivery
@@ -2134,6 +2145,47 @@ mod tests {
         assert!(firsts[..4].iter().all(|&l| l == 8 || l == 6));
         assert_eq!(firsts[4], 77);
         assert_eq!(firsts[5], 8);
+    }
+
+    /// E (lens 1 #2): the destination window's SECOND video packet is the
+    /// gated RAP. The move applies on that window and the delivered window
+    /// starts at the RAP (the leading non-RAP is dropped, audio kept).
+    #[test]
+    fn move_gate_passes_on_a_later_rap_in_the_window_and_cuts_there() {
+        let now = Instant::now();
+        let mut d =
+            RenditionDispatcher::new(gated_cfg(vec![binding(0, 0, 1), binding(1, 1, 1)], 2, 1))
+                .unwrap();
+        let mut sink = FakeDelivery::new(2);
+        let key = d
+            .add_video_key(DtsTimeBase { num: 1, den: 5 }, gate())
+            .unwrap();
+        d.rebind_video(1, key, 2, 1).unwrap();
+        let mut b_windows = Vec::new();
+        for i in 0..4_i64 {
+            let m = Some(mark(TICK * i128::from(i + 1)));
+            let pkts = if i == 2 {
+                vec![video(i, 8, false), rap77(i)]
+            } else {
+                vec![video(i, 8, false)]
+            };
+            d.dispatch(ve(key, u64::try_from(i).unwrap(), pkts, m), now, &mut sink)
+                .unwrap();
+            feed_base(&mut d, &mut sink, 2, i, now, plain(i)).unwrap();
+            pop_all(&mut sink, 0, now);
+            b_windows.extend(pop_all(&mut sink, 1, now));
+        }
+        assert_eq!(
+            d.take_move_outcomes(),
+            vec![MoveOutcome::Applied {
+                output_index: 1,
+                key,
+                tick: 2
+            }]
+        );
+        assert_eq!(b_windows.len(), 4);
+        assert_eq!(b_windows[2], (77, 2), "cut at the RAP, audio kept");
+        assert_eq!(b_windows[3], (8, 2));
     }
 
     #[test]
