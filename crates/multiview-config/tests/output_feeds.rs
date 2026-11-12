@@ -144,13 +144,13 @@ fn bus_alias_must_agree_with_video() {
 }
 
 #[test]
-fn layout_and_explicit_audio_are_refused_until_their_slices() {
+fn layout_is_refused_until_its_slice_and_explicit_audio_is_accepted() {
     let err =
         load("\n[[routing.output]]\noutput = \"srt-out\"\nvideo = { layout = \"NewsOne\" }\n")
             .unwrap_err();
     assert!(err.contains("layout feed"), "{err}");
-    let err = load("\n[[routing.output]]\noutput = \"srt-out\"\naudio = \"none\"\n").unwrap_err();
-    assert!(err.contains("explicit audio feed"), "{err}");
+    // ADR-0108 slice 2: explicit audio feeds validate (rules: tests below).
+    load("\n[[routing.output]]\noutput = \"srt-out\"\naudio = \"none\"\n").unwrap();
     load("\n[[routing.output]]\noutput = \"srt-out\"\naudio = \"follow\"\n").unwrap();
 }
 
