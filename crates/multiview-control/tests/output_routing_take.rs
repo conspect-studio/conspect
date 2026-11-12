@@ -933,11 +933,14 @@ fn scoped_take_key(key_id: &str, raw: &str) -> String {
     )
 }
 
-/// Review E1(a): the take store fails closed at its cap and never evicts:
-/// with 4096 records one more distinct key is `idempotency-capacity`, nothing
-/// is enqueued, and the oldest key still replays its own operation + outcome.
+/// Review E1(a), revised by #329 F3: the take store fails closed at its cap
+/// only when every record is PENDING — then one more distinct key is
+/// `idempotency-capacity`, nothing is enqueued, and the oldest (pending) key
+/// still replays its own operation. Once that oldest record is settled, the
+/// next distinct key evicts it (oldest settled first) and is accepted; a
+/// replay of the evicted key is then a new take (the documented trade-off).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_full_take_store_fails_closed_and_the_oldest_key_still_replays() {
+async fn a_full_take_store_fails_closed_only_when_all_pending_and_evicts_the_oldest_settled() {
     let dir = tempfile::tempdir().unwrap();
     let rig = rig(&dir.path().join("boot.toml"), true);
     let src = serde_json::json!({"source": "bars"});
@@ -951,9 +954,7 @@ async fn a_full_take_store_fails_closed_and_the_oldest_key_still_replays() {
     .await;
     assert_eq!(first["status"], "accepted");
     let op = first["operation_id"].as_str().unwrap().to_owned();
-    rig.fake.emit(&op, OUT_B_CONFIG_ID, "refused:capacity");
     let control = rig.state.output_routing.clone().unwrap();
-    wait_for(|| control.outcome_of(&op).is_some()).await;
     let cap = multiview_control::output_routing::MAX_TAKE_RECORDS;
     assert_eq!(cap, 4096);
     fill_take_store(&control, "filler", cap - 1);
@@ -977,16 +978,33 @@ async fn a_full_take_store_fails_closed_and_the_oldest_key_still_replays() {
     let replay = body_json(
         send(
             &rig.router,
-            take(&rig, OPERATOR_TOKEN, "oldest", "output-1", src),
+            take(&rig, OPERATOR_TOKEN, "oldest", "output-1", src.clone()),
         )
         .await,
     )
     .await;
     assert_eq!(replay["operation_id"], op.as_str());
-    assert_eq!(replay["status"], "settled");
-    assert_eq!(replay["outcome"], "refused:capacity");
-    assert_eq!(replay["tick"], 77);
-    assert_eq!(rig.fake.takes().len(), 1);
+    assert_eq!(replay["status"], "pending", "a pending record is never evicted");
+    // Settle the oldest: it becomes the eviction candidate.
+    rig.fake.emit(&op, OUT_B_CONFIG_ID, "refused:capacity");
+    wait_for(|| control.outcome_of(&op).is_some()).await;
+    // Past the per-output rate window before the next fresh take.
+    tokio::time::sleep(Duration::from_millis(1100)).await;
+    let resp = body_json(
+        send(
+            &rig.router,
+            take(&rig, OPERATOR_TOKEN, "one-more", "output-1", src.clone()),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(resp["status"], "accepted", "{resp}");
+    assert_eq!(rig.fake.takes().len(), 2);
+    assert_eq!(control.records_len(), cap, "one evicted, one added");
+    assert!(
+        control.outcome_of(&op).is_none(),
+        "the oldest settled record was evicted"
+    );
 }
 
 /// Review E1(b): another route releasing (or rebinding) the same scoped string
