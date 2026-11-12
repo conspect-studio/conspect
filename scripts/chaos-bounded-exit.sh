@@ -71,6 +71,7 @@ check_hls() {
   local m="${WORK}/hls/index.m3u8"
   [ -s "${m}" ] || { echo "no manifest"; return 1; }
   head -1 "${m}" | grep -q '^#EXTM3U' || { echo "manifest not M3U"; return 1; }
+  grep -q '^#EXT-X-ENDLIST' "${m}" || { echo "manifest not finalised (no #EXT-X-ENDLIST)"; return 1; }
   local seg
   for seg in $(grep -v '^#' "${m}"); do
     [ -s "${WORK}/hls/${seg}" ] || { echo "listed segment ${seg} missing"; return 1; }
@@ -83,14 +84,24 @@ run_once() {
   rm -rf "${WORK}/hls" && mkdir -p "${WORK}/hls"
   export MULTIVIEW_CHAOS_SLOW_TEARDOWN_MS="${HOLD_MS}"
   if [ "${mode}" = fatal ]; then
-    export MULTIVIEW_CHAOS_CONSUMER_STALL_MS=1500 MULTIVIEW_CHAOS_CONSUMER_STALL_AT=60
+    # 3 s at 29.97 fps is ~90 ticks: far past the 8-tick substitution envelope
+    # (and the live queue), so the consumer must fail "fell N ticks behind".
+    export MULTIVIEW_CHAOS_CONSUMER_STALL_MS=3000 MULTIVIEW_CHAOS_CONSUMER_STALL_AT=60
   else
     unset MULTIVIEW_CHAOS_CONSUMER_STALL_MS MULTIVIEW_CHAOS_CONSUMER_STALL_AT
   fi
   RUST_LOG=info "${BIN}" run "${WORK}/cfg.toml" > "${log}" 2>&1 &
   pid=$!
   if [ "${mode}" = stop ]; then
-    sleep 4
+    # Signal only once the pipeline runs (its first tick is logged), and only
+    # if the process is still alive.
+    local waited=0
+    until grep -q "pipeline run: until" "${log}" 2>/dev/null; do
+      sleep 0.1; waited=$((waited + 1))
+      [ "${waited}" -lt 300 ] || { echo "run ${i} (stop): pipeline never started"; tail -20 "${log}"; return 1; }
+    done
+    sleep 2
+    kill -0 "${pid}" || { echo "run ${i} (stop): process died before the signal"; tail -20 "${log}"; return 1; }
     t_decide="$(now_ms)"
     kill -TERM "${pid}"
   fi
@@ -104,11 +115,12 @@ run_once() {
     t_decide="$(python3 - "${log}" <<'PY'
 import re,sys,datetime
 for line in open(sys.argv[1], errors="replace"):
-    if "fatal encoded-output consumer failure" in line:
-        m = re.search(r"(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d+)Z", line)
+    if "fatal encoded-output consumer failure" in line and "ticks behind the clock" in line:
+        m = re.search(r"(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d)\.(\d+)Z", line)
         if m:
-            t = datetime.datetime.fromisoformat(m.group(1)[:26]).replace(tzinfo=datetime.timezone.utc)
-            print(int(t.timestamp()*1000)); break
+            base = datetime.datetime.strptime(m.group(1), "%Y-%m-%dT%H:%M:%S").replace(tzinfo=datetime.timezone.utc)
+            frac = float("0." + m.group(2))
+            print(int((base.timestamp() + frac) * 1000)); break
 PY
 )"
     [ -n "${t_decide}" ] || { echo "run ${i} (${mode}): no fatal line"; tail -20 "${log}"; return 1; }
@@ -116,6 +128,11 @@ PY
   local took=$((t_exit - t_decide)) want=$([ "${mode}" = fatal ] && echo 1 || echo 0)
   echo "run ${i} (${mode}): rc=${rc} decision->exit=${took} ms"
   [ "${rc}" = "${want}" ] || { echo "  FAIL: exit code ${rc}, want ${want}"; tail -20 "${log}"; return 1; }
+  # The bound must come from the watchdog (the held teardown cannot finish in
+  # time on its own): require its armed line and its hard-exit message.
+  grep -q "exit deadline armed" "${log}" || { echo "  FAIL: watchdog never armed"; return 1; }
+  grep -q "teardown overran the" "${log}" || { echo "  FAIL: no watchdog hard exit (teardown not held?)"; return 1; }
+  grep -q "chaos: holding source teardown" "${log}" || { echo "  FAIL: teardown seam not reached"; return 1; }
   [ "${took}" -le $((BOUND_MS + SLACK_MS)) ] || { echo "  FAIL: exit took ${took} ms > ${BOUND_MS}+${SLACK_MS}"; grep -E "teardown|exit|chaos" "${log}" | tail -12; return 1; }
   check_hls || { echo "  FAIL: HLS invalid"; return 1; }
 }

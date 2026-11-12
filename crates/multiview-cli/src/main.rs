@@ -138,11 +138,6 @@ async fn main() -> ExitCode {
     match Box::pin(dispatch(cli)).await {
         Ok(code) => code,
         Err(err) => {
-            // #309: a failed run must not wait unboundedly in the runtime drop.
-            multiview_cli::exit_watchdog::arm(
-                multiview_cli::exit_watchdog::ExitCause::Fatal,
-                "a failed command",
-            );
             tracing::error!(error = %format!("{err:#}"), "command failed");
             eprintln!("multiview: error: {err:#}");
             // #309: the Tokio runtime is dropped after this returns; anything
@@ -342,14 +337,15 @@ async fn run_pipeline(
         // MP-1 (ADR-0030 §2.2): the daemon run path builds an engine `ProgramSet`
         // and drives this single program (id "main") through it — move the owned
         // pipeline in (the set spawns it on its own supervised task).
-        run_pipeline_until_ctrl_c(
+        // Boxed: the run future holds the whole pipeline (clippy::large_futures).
+        Box::pin(run_pipeline_until_ctrl_c(
             pipeline,
             start,
             &plane,
             &args.config,
             #[cfg(feature = "moq-output")]
             preview_budget,
-        )
+        ))
         .await?
     };
 
@@ -979,17 +975,26 @@ async fn run_pipeline_until_ctrl_c(
     }
 
     let stop_for_signal = stop.clone();
+    // #309: the durable shutdown work (the final ADR-W024 Running persist, the
+    // event-journal flush) must land inside the exit bound, so it runs as soon
+    // as the stop is decided — concurrently with the pipeline teardown — not
+    // after the slow source teardown. The ordinary end-of-run persist below
+    // still runs too (idempotent: the same Running state, written again).
+    let early_persist_state = running_persist.as_ref().map(|p| p.state.clone());
     let signal = tokio::spawn(async move {
         let which = await_shutdown_signal().await;
         tracing::info!(
             signal = which,
             "stop signal received; stopping after the current frame"
         );
-        multiview_cli::exit_watchdog::arm(
-            multiview_cli::exit_watchdog::ExitCause::Stop,
-            "a stop signal",
-        );
         stop_for_signal.stop();
+        multiview_cli::exit_watchdog::arm(multiview_cli::exit_watchdog::ExitCause::Stop);
+        if let Some(state) = early_persist_state {
+            if let Err(error) = multiview_control::boot_model::persist_running_now(&state).await {
+                tracing::warn!(error = %error, "the stop-time running-state persist was skipped (fail-soft)");
+            }
+        }
+        multiview_cli::event_journal::flush();
     });
 
     // Sample CPU/host-memory/per-GPU load at ~1.3 Hz and PUSH `Event::SystemMetrics`
@@ -1397,11 +1402,8 @@ async fn run_software_until_ctrl_c(
             signal = which,
             "stop signal received; stopping after the current frame"
         );
-        multiview_cli::exit_watchdog::arm(
-            multiview_cli::exit_watchdog::ExitCause::Stop,
-            "a stop signal",
-        );
         stop_for_signal.stop();
+        multiview_cli::exit_watchdog::arm(multiview_cli::exit_watchdog::ExitCause::Stop);
     });
 
     // The off-hot-path system-metrics poller: samples whole-system CPU + host

@@ -4847,6 +4847,8 @@ impl Pipeline {
                         // rather than reporting a healthy UI over dead streams.
                         egress_fatal.store(true, Ordering::Release);
                         egress_stop.stop();
+                        // #309: wait-free; bounded exit from this decision.
+                        crate::exit_watchdog::arm(crate::exit_watchdog::ExitCause::Fatal);
                         hot_dropped.fetch_add(1, Ordering::Release);
                     }
                 },
@@ -4982,9 +4984,35 @@ impl Pipeline {
             );
         };
         stage("clock-returned");
-        // The clock has stopped (bounded budget reached, or `stop` raised): tear
-        // ingest down deterministically (signal + join), then close the egress and
-        // finalise. The hot queue is already closed by this point — see below.
+        if let Some(cause) = crate::exit_watchdog::armed() {
+            tracing::info!(?cause, "exit deadline armed; finalising outputs first");
+        }
+        // #309: an engine error is a fatal decision too; bound the exit from
+        // here, before the (slow, bounded-per-producer) source teardown.
+        if outcome.is_err() {
+            crate::exit_watchdog::arm(crate::exit_watchdog::ExitCause::Fatal);
+        }
+        // #309: finalise the OUTPUTS first. The engine loop consumed the
+        // `state_of` closure (the ONLY owner of the hot sender) when
+        // `run_for`/`run` returned above, so the hot queue is already closed →
+        // the bake consumer's `recv()` has seen end-of-input, drains the queue,
+        // fans the remainder, and drops the per-sink senders → each sink sees its
+        // channel close and finalises (writes its trailer). Dropping the program
+        // here only releases the engine's own resources (its wrapped
+        // `EngineRuntime` = clock + drive + time source + pacer).
+        drop(program);
+        stage("program-dropped");
+        // Join the bake consumer + sink threads BEFORE the (slow) source
+        // teardown, so the trailers and the HLS manifest land within ~100 ms of
+        // the clock returning — inside the exit bound — and BEFORE propagating
+        // any engine error, so a mid-run engine error still finalises the
+        // partial output. The engine error (the root cause) is surfaced first;
+        // an egress/sink error second.
+        let egress_result = egress.join();
+        stage("egress-joined");
+        // Then tear ingest down (signal + bounded join per producer). Producers
+        // blocked in libav network reads use their full grace here; the exit
+        // watchdog bounds the total.
         demand.stop_all();
         stage("demand-stop-all");
         supervisor.shutdown();
@@ -4994,24 +5022,6 @@ impl Pipeline {
         for (id, lifecycle) in startup_lifecycles {
             end_live_lifecycle(&id, lifecycle);
         }
-        // The engine loop consumed the `state_of` closure (the ONLY owner of the
-        // hot sender) when `run_for`/`run` returned above, so the hot queue is
-        // already closed → the bake consumer's `recv()` has seen end-of-input,
-        // drains the queue, fans the remainder, and drops the per-sink senders →
-        // each sink sees its channel close and finalises (writes its trailer).
-        // Dropping the program here only releases the engine's own resources
-        // (its wrapped `EngineRuntime` = clock + drive + time source + pacer).
-        drop(program);
-        stage("program-dropped");
-
-        // Join the bake consumer + sink threads FIRST — folding their outcome and
-        // writing the trailers (the sinks' own `run()` finalisation) — BEFORE
-        // propagating any engine error, so a mid-run engine error still finalises
-        // the partial output and never detaches the egress threads with a trailer
-        // unwritten. The engine error (the root cause) is surfaced first; an
-        // egress/sink error second.
-        let egress_result = egress.join();
-        stage("egress-joined");
         let outcome = outcome?;
         let egress_out = egress_result?;
 
@@ -5557,6 +5567,10 @@ fn stop_on_egress_failure(fatal: &AtomicBool, stop: &StopSignal, disconnected: b
     }
     if fatal.load(Ordering::Acquire) {
         stop.stop();
+        // #309: the engine side of the fatal output decision (covers a consumer
+        // that died without returning, e.g. a panic). Wait-free; a no-op unless
+        // the binary enabled the watchdog.
+        crate::exit_watchdog::arm(crate::exit_watchdog::ExitCause::Fatal);
         true
     } else {
         false
@@ -6076,10 +6090,7 @@ impl StreamEgress {
                     // #309: from this decision the process is gone within
                     // EXIT_DEADLINE, however long teardown would take.
                     if arm_exit_on_fatal {
-                        crate::exit_watchdog::arm(
-                            crate::exit_watchdog::ExitCause::Fatal,
-                            "a fatal encoded-output consumer failure",
-                        );
+                        crate::exit_watchdog::arm(crate::exit_watchdog::ExitCause::Fatal);
                     }
                 }
                 result
@@ -6090,6 +6101,9 @@ impl StreamEgress {
                 // drop, closing the channels so the hot loop sees Disconnected and
                 // each sink sees end-of-program — nothing wedges.
                 fatal.store(true, Ordering::Release);
+                if arm_exit_on_fatal {
+                    crate::exit_watchdog::arm(crate::exit_watchdog::ExitCause::Fatal);
+                }
                 std::thread::spawn(|| {
                     Err(PipelineError::Output {
                         kind: "bake-consumer",
