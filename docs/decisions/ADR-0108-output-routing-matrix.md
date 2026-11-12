@@ -115,6 +115,11 @@ What is true on main f5f2230e (the full table with citations is in §1 of the no
      never silent.
    - The dispatcher gains `rebind(output, video_key, audio_key, at_tick)`, atomic per output at a
      window boundary. The consumer `try_send`s to a new worker and never waits for it.
+   - The dispatcher registers a new encoder key before its first packet. A window from a key with
+     no bound output is dropped, never an error, because today an unknown key aborts delivery for
+     every output (`crates/multiview-cli/src/rendition_dispatch.rs:319-344`).
+   - Closing an encoder (EOF, flush, join) runs on a reaper thread, never on the consumer.
+   - Opens are serialised per GPU, and the session is reserved at admission.
    - Lagging aux buses hold last-good with their own generation label: `routing.degraded` at 60
      ticks, then a move to Program at an IDR at 150 ticks, whether the aux thread is dead or wedged.
    - An output's format never changes on a take. A format change is RT-15.

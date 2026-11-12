@@ -480,6 +480,11 @@ verified per protocol in the slice that ships it (§9). §4.6 proved the MPEG-TS
   `{encoder worker, subscribers, linger deadline}`. It extends today's start-time keying by settings
   (`crates/multiview-cli/src/pipeline.rs:2830-2842`) with the picture bus. Absent config gives today's keys (`program`,
   settings), today's encoder count and today's pixels.
+- **Opening is admitted and serialised.** Admission **reserves** the encoder session at plan
+  acceptance, before the open, so two takes on adjacent ticks cannot both pass against the same
+  NVML count. At most one live encoder open runs at a time per GPU; others queue, bounded at 4 and
+  refused beyond that. A failed open releases the reservation and refuses the take with
+  `encoder-not-ready`.
 - **Opening is off the clock and off the consumer.** A take whose destination does not exist spawns
   a `RenditionWorker` on a new OS thread (the existing worker type, `crates/multiview-cli/src/pipeline.rs:6964-6984`). The
   encoder opens there; an NVENC open can take hundreds of ms.
@@ -497,8 +502,22 @@ verified per protocol in the slice that ships it (§9). §4.6 proved the MPEG-TS
   `migration::OutputCrosspoint` / `PacketRouter::move_sink` (`crates/multiview-engine/src/migration.rs:145-235`)
   are the same idea over the unused fan-out carrier; production uses the dispatcher, so the
   dispatcher is extended and the carrier work (#144, #154-#156) stays separate.
-- **Linger and close.** An encoded bus whose last subscriber left closes after 10 s. Its worker gets
-  EOF, flushes and joins, off the clock. A re-take within 10 s reuses it (+0 encoders).
+- **Dispatcher topology is extended before the first frame.** Today the dispatcher's encoder set is
+  fixed for a run. An event from an unknown encoder key is `InvalidEvent`, which fails the
+  dispatcher and aborts delivery for **every** output, Program included
+  (`crates/multiview-cli/src/rendition_dispatch.rs:145,188,319-344`). Slice 1 therefore:
+  - registers a new key (`add_video_key`/`add_audio_key`, with its time base) in the dispatcher
+    **before** the worker's first offer. The add arrives as a control event on the same consumer
+    thread, so it is ordered before any packet of that key;
+  - makes a packet window from a registered key that has no bound output **dropped and counted**,
+    never an error;
+  - keeps `InvalidEvent` for genuinely malformed events only. A unit test proves that an unknown or
+    late key never aborts Program delivery.
+- **Linger and close.** An encoded bus whose last subscriber left closes after 10 s. The consumer
+  only **marks** it for close. The EOF, flush (an NVENC flush can take a GOP) and join run on a
+  separate `routing-reaper` thread, never on the consumer or the clock. The worker's event send to
+  the consumer is `try_send` while it is being closed: a full channel drops tail packets, which no
+  subscriber needs. A §9 chaos test asserts that a close never moves the consumer's tick. A re-take within 10 s reuses it (+0 encoders).
   - Every live and lingering bus is attributed to the principal whose take last subscribed an output
     to it.
   - A principal may hold at most **one** lingering bus besides its current subscriptions, and at
@@ -1216,6 +1235,12 @@ Also checked:
   constant, and the stream count is unchanged;
 - a live open never holds the bake consumer (an injected 2 s encoder open: Program unaffected,
   consumer offers dropped for the new worker only);
+- the dispatcher registers a new key before its first packet; an unbound or unknown key's window
+  is dropped and counted, and Program delivery is never aborted;
+- a close (EOF, flush, join) runs on the reaper; an injected 3 s flush does not move the
+  consumer's tick;
+- two takes on adjacent ticks against one free session: one is admitted, the other refused, never
+  both;
 - linger-close after 10 s and reuse within 10 s;
 - a held aux frame keeps its old generation, so the IDR lands on the first produced new-feed frame
   (drops injected at the seam);
@@ -1270,6 +1295,10 @@ Also checked:
    `refused:feed-not-fresh` at 50 ticks, driven by the bake consumer (the
    `a_blocked_wall_worker_costs_the_output_clock_zero_ticks` pattern).
 4. **Panicking aux thread:** the same, plus a drop guard marks the feeds failed.
+4b. **Open storm and GPU interference (mda001):** 1 take per second for 10 minutes, each needing a
+   new encoder, alternating with moves back (each open serialised, each bus lingering and closing).
+   It passes when the Program protection bound holds, Program's encoders report no
+   `OfferRejection::Overloaded`, and the session count never exceeds the reservation.
 5. **Wedged encoder:** only the outputs on its encoded bus lose windows (dispatcher isolation). A
    wedged live open: the take is refused at its deadline and the output keeps its feed.
 6. **mda001 soak:** 1 h with the HLS output on a layout and SRT on a source, a take every 30 s.
