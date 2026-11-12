@@ -47,6 +47,8 @@ pub mod auth;
 pub mod automation;
 pub mod boot_model;
 pub mod catalogue;
+#[cfg(feature = "tls")]
+pub mod certificate_source;
 pub mod cloudflare_management;
 pub mod command;
 pub mod concurrency;
