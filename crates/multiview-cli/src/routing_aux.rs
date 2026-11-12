@@ -47,24 +47,28 @@ pub enum PictureBus {
     Program,
     /// The M/E's PVW source as a one-cell canvas.
     Preview,
+    /// The Program canvas before the overlay bake (published by the bake
+    /// consumer itself; not composed here).
+    Clean,
     /// One source as a one-cell canvas.
     Source(String),
 }
 
 impl PictureBus {
     /// The picture-bus name, matching [`VideoFeed::picture_bus`]:
-    /// `program`, `preview` or `src:<id>`.
+    /// `program`, `preview`, `clean` or `src:<id>`.
     #[must_use]
     pub fn as_str(&self) -> Cow<'_, str> {
         match self {
             Self::Program => Cow::Borrowed("program"),
             Self::Preview => Cow::Borrowed("preview"),
+            Self::Clean => Cow::Borrowed("clean"),
             Self::Source(id) => Cow::Owned(format!("src:{id}")),
         }
     }
 }
 
-/// A feed slice 1 cannot route (Clean or a layout).
+/// A feed that cannot be routed onto an output (a layout).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct UnroutableFeed;
 
@@ -75,6 +79,7 @@ impl TryFrom<&VideoFeed> for PictureBus {
         match feed {
             VideoFeed::Bus(OutputBus::Program) => Ok(Self::Program),
             VideoFeed::Bus(OutputBus::Preview) => Ok(Self::Preview),
+            VideoFeed::Bus(OutputBus::Clean) => Ok(Self::Clean),
             VideoFeed::Source(id) => Ok(Self::Source(id.clone())),
             _ => Err(UnroutableFeed),
         }
@@ -257,7 +262,8 @@ impl AuxState {
         }
         for feed in feeds.iter() {
             let source: Arc<str> = match &feed.bus {
-                PictureBus::Program => continue,
+                // Program and Clean come from the bake consumer, never here.
+                PictureBus::Program | PictureBus::Clean => continue,
                 PictureBus::Source(id) => match self.per_feed.get(&feed.key) {
                     Some(FeedState {
                         source: Some(s), ..

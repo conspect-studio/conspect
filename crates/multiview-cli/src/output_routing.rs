@@ -192,7 +192,7 @@ pub struct PendingView {
 /// One output's routing state.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OutputRouteView {
-    /// Current bus name (`program`, `preview`, `src:<id>`).
+    /// Current bus name (`program`, `preview`, `clean`, `src:<id>`).
     pub bus: String,
     /// Internal encoding label.
     pub key: String,
@@ -237,6 +237,10 @@ pub struct RoutingSnapshot {
     pub audio_buses_live: usize,
     /// Routed-audio counters (opened, failed, refused, faded back).
     pub audio: crate::routing_audio::AudioRoutingCounters,
+    /// Live-opened encoder keys as `(bus name, settings index)`, sorted,
+    /// lingering ones included and failed ones excluded: a take onto one of
+    /// these reuses it (+0 encoders).
+    pub live_keys: Vec<(String, usize)>,
 }
 
 /// The control-plane handle (clone freely).
@@ -605,6 +609,11 @@ pub struct OutputRouter {
     dyn_rx: Receiver<(u64, DispatchEvent)>,
     next_generation: u64,
     feeds: HashMap<PictureBus, AuxFeed>,
+    /// Whether a Clean feed is active (cached so `publish_clean` costs one
+    /// bool load when nothing selects Clean).
+    clean_active: bool,
+    /// The last published `live_keys` (recomputed only while keys exist).
+    live_keys: Vec<(String, usize)>,
     health: HashMap<PictureBus, BusHealth>,
     last_forced: HashMap<usize, u64>,
     dropped_outcomes: u64,
@@ -714,6 +723,8 @@ impl OutputRouter {
             dyn_rx,
             next_generation: 0,
             feeds: HashMap::new(),
+            clean_active: false,
+            live_keys: Vec::new(),
             health: HashMap::new(),
             last_forced: HashMap::new(),
             dropped_outcomes: 0,
@@ -793,6 +804,27 @@ impl OutputRouter {
         }
     }
 
+    /// Publish this tick's Clean picture: the Program canvas BEFORE the
+    /// overlay bake. Call on the bake consumer before [`Self::on_tick`] for
+    /// the same tick, so a Clean encoder is fed frame `tick` that tick. Does
+    /// nothing (one bool load) unless some take or encoder uses Clean; never
+    /// copies the picture (one `Arc` clone into a wait-free slot).
+    pub(crate) fn publish_clean(&mut self, tick: u64, canvas: &Arc<Nv12Image>) {
+        if !self.clean_active {
+            return;
+        }
+        if let Some(feed) = self.feeds.get(&PictureBus::Clean) {
+            feed.slot
+                .latest
+                .store(Some(Arc::new(crate::routing_aux::AuxFrame {
+                    tick,
+                    generation: 0,
+                    frame: Arc::clone(canvas),
+                })));
+            feed.slot.composed.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
     /// One Program tick: drain dynamic events, takes, opens and dispatcher
     /// outcomes; advance every take; feed live-opened encoders. Never waits.
     ///
@@ -820,6 +852,7 @@ impl OutputRouter {
         self.check_aux(tick, dispatcher);
         self.linger(tick, dispatcher);
         self.sync_feeds();
+        self.sync_live_keys(dispatcher);
         if self.dirty || self.outputs.iter().any(|o| o.pending.is_some()) {
             self.publish_snapshot_at(tick);
         }
@@ -913,8 +946,8 @@ impl OutputRouter {
                 Err(TryRecvError::Empty | TryRecvError::Disconnected) => return,
             };
             let index = take.output_index;
-            let routable = index < self.outputs.len()
-                && (take.bus != PictureBus::Preview || self.cfg.has_preview);
+            let needs_switcher = matches!(take.bus, PictureBus::Preview | PictureBus::Clean);
+            let routable = index < self.outputs.len() && (!needs_switcher || self.cfg.has_preview);
             if !routable {
                 self.emit(
                     take.operation_id,
@@ -1195,12 +1228,17 @@ impl OutputRouter {
     }
 
     /// Lag rule and aux failure: move every output on a held bus to Program.
+    /// The aux thread failing moves only the buses it composes: Clean is fed
+    /// by the bake consumer itself and stays.
     fn check_aux(&mut self, tick: u64, dispatcher: &mut RenditionDispatcher) {
         let failed = self.aux.failed.load(Ordering::Acquire);
         let fallen: Vec<PictureBus> = self
             .health
             .iter_mut()
-            .filter(|(_, h)| !h.fallen && (failed || h.held >= FALLBACK_AFTER_TICKS))
+            .filter(|(bus, h)| {
+                let aux_failed = failed && aux_composed(bus);
+                !h.fallen && (aux_failed || h.held >= FALLBACK_AFTER_TICKS)
+            })
             .map(|(bus, h)| {
                 h.fallen = true;
                 bus.clone()
@@ -1268,7 +1306,9 @@ impl OutputRouter {
 
     fn feed_fresh(&self, bus: &PictureBus, tick: u64, pts: MediaTime) -> bool {
         let source: Option<Arc<str>> = match bus {
-            PictureBus::Program => return true,
+            // Program and Clean are always fresh (§4.5): both come from the
+            // bake consumer's own Program canvas.
+            PictureBus::Program | PictureBus::Clean => return true,
             PictureBus::Source(id) => Some(Arc::from(id.as_str())),
             PictureBus::Preview => self.aux.preview_selection.as_ref().and_then(|s| s.load()),
         };
@@ -1619,8 +1659,9 @@ impl OutputRouter {
         }
     }
 
-    /// Keep the aux thread's feed set equal to the buses in use; raise the
-    /// clock's send gate only while one exists.
+    /// Keep the feed set equal to the buses in use. The aux thread is handed
+    /// (and the clock's send gate raised for) only the buses it composes
+    /// (Preview, sources): routing only Clean never wakes it.
     fn sync_feeds(&mut self) {
         let mut wanted: Vec<PictureBus> = self.dynamic.iter().map(|d| d.bus.clone()).collect();
         wanted.extend(self.opens.values().map(|o| o.bus.clone()));
@@ -1642,11 +1683,36 @@ impl OutputRouter {
                 .entry(bus.clone())
                 .or_insert_with(|| AuxFeed::new(bus));
         }
-        let list: Vec<AuxFeed> = self.feeds.values().cloned().collect();
+        self.clean_active = self.feeds.contains_key(&PictureBus::Clean);
+        let list: Vec<AuxFeed> = self
+            .feeds
+            .values()
+            .filter(|f| aux_composed(&f.bus))
+            .cloned()
+            .collect();
         let active = !list.is_empty();
         self.aux.feeds.store(Arc::new(list));
         self.aux.active.store(active, Ordering::Release);
         self.dirty = true;
+    }
+
+    /// Recompute `live_keys` (only while live keys exist or were published).
+    fn sync_live_keys(&mut self, dispatcher: &RenditionDispatcher) {
+        if self.dynamic.is_empty() && self.live_keys.is_empty() {
+            return;
+        }
+        let mut keys: Vec<(String, usize)> = self
+            .dynamic
+            .iter()
+            .filter(|d| !dispatcher.is_key_failed(d.key))
+            .map(|d| (d.bus.as_str().into_owned(), d.settings))
+            .collect();
+        keys.sort_unstable();
+        keys.dedup();
+        if keys != self.live_keys {
+            self.live_keys = keys;
+            self.dirty = true;
+        }
     }
 
     fn publish_snapshot(&mut self) {
@@ -1692,6 +1758,7 @@ impl OutputRouter {
                 .as_ref()
                 .map(crate::routing_audio::RoutedAudio::counters)
                 .unwrap_or_default(),
+            live_keys: self.live_keys.clone(),
         };
         if *self.snapshot.load() != next {
             self.snapshot.store(Arc::new(next));
@@ -1731,6 +1798,7 @@ impl OutputRouter {
             self.dyn_dropped.fetch_add(1, Ordering::Relaxed);
         }
         self.video_keys = dispatcher.video_key_count();
+        self.live_keys.clear();
         self.publish_snapshot();
         let reaper = self.reaper.take();
         let handed_over = self.reaped;
@@ -1748,6 +1816,12 @@ impl OutputRouter {
             }
         }
     }
+}
+
+/// Whether the `routing-aux` thread composes `bus` (Program and Clean come
+/// from the bake consumer).
+fn aux_composed(bus: &PictureBus) -> bool {
+    matches!(bus, PictureBus::Preview | PictureBus::Source(_))
 }
 
 #[cfg(test)]

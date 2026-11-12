@@ -366,9 +366,19 @@ struct Harness {
     base_force: Arc<AtomicU64>,
     live: bool,
     max_router: std::time::Duration,
+    /// The pre-bake canvas handed to `publish_clean` per tick (kept alive so
+    /// pointer identity is meaningful).
+    clean: Vec<(u64, Arc<Nv12Image>)>,
+    /// The clock's aux send gate and sent-tick counter.
+    aux_active: Arc<AtomicBool>,
+    aux_sent: Arc<AtomicU64>,
 }
 
 fn harness(outputs: usize, max: usize, open: Option<OpenFn>) -> Harness {
+    harness_with(outputs, max, open, false)
+}
+
+fn harness_with(outputs: usize, max: usize, open: Option<OpenFn>, has_preview: bool) -> Harness {
     let store = Arc::new(TileStore::<Nv12Image>::with_defaults("cam"));
     let store2 = Arc::new(TileStore::<Nv12Image>::with_defaults("cam2"));
     let lookup = Arc::clone(&store);
@@ -377,6 +387,8 @@ fn harness(outputs: usize, max: usize, open: Option<OpenFn>) -> Harness {
     let failed = Arc::new(AtomicBool::new(false));
     let encoded = Arc::new(AtomicUsize::new(0));
     let enc2 = Arc::clone(&encoded);
+    let aux_active = Arc::new(AtomicBool::new(false));
+    let aux_sent = Arc::new(AtomicU64::new(0));
     let open = open.unwrap_or_else(|| {
         Box::new(move |_| {
             let enc: Box<dyn LiveEncoder> = Box::new(FakeEnc {
@@ -394,14 +406,14 @@ fn harness(outputs: usize, max: usize, open: Option<OpenFn>) -> Harness {
             base_force: vec![Arc::clone(&base_force)],
             max_encoders: max,
             max_per_principal: DEFAULT_MAX_PER_PRINCIPAL,
-            has_preview: false,
+            has_preview,
         },
         AuxWiring {
             feeds: Arc::new(SwapCell::from_pointee(Vec::new())),
-            active: Arc::new(AtomicBool::new(false)),
+            active: Arc::clone(&aux_active),
             failed: Arc::clone(&failed),
             dropped: Arc::new(AtomicU64::new(0)),
-            sent: Arc::new(AtomicU64::new(0)),
+            sent: Arc::clone(&aux_sent),
             stores: Arc::new(move |id: &str| match id {
                 "cam" => Some(Arc::clone(&lookup)),
                 "cam2" => Some(Arc::clone(&lookup2)),
@@ -427,6 +439,9 @@ fn harness(outputs: usize, max: usize, open: Option<OpenFn>) -> Harness {
         base_force,
         live: true,
         max_router: std::time::Duration::ZERO,
+        clean: Vec::new(),
+        aux_active,
+        aux_sent,
     }
 }
 
@@ -475,6 +490,10 @@ impl Harness {
                 }
             }
         }
+        // The bake consumer publishes the pre-bake canvas before the router.
+        let clean = canvas();
+        self.r.publish_clean(t, &clean);
+        self.clean.push((t, clean));
         let started = Instant::now();
         self.r
             .on_tick(t, pts(t), &mut self.d, &mut self.rec)
@@ -1647,4 +1666,224 @@ fn a_panicking_live_encoder_falls_back_to_program() {
 #[test]
 fn a_wedged_live_encoder_falls_back_to_program() {
     a_dying_live_encoder_falls_back(true, u64::from(WEDGED_ENCODER_TICKS) + 20);
+}
+
+/// A live encoder recording the canvas pointer of every tick it encodes.
+struct PtrEnc {
+    forced: bool,
+    seen: Arc<Mutex<Vec<(u64, usize)>>>,
+}
+
+impl VideoEncodeWorker for PtrEnc {
+    fn encode(&mut self, item: BakedTick) -> Result<Vec<EncodedPacket>, PipelineError> {
+        self.seen
+            .lock()
+            .unwrap()
+            .push((item.tick, Arc::as_ptr(&item.canvas).addr()));
+        let key = std::mem::take(&mut self.forced);
+        Ok(vec![pkt(item.tick, key)])
+    }
+    fn reorder_bound(&self) -> ReorderBound {
+        ReorderBound::NoReorder
+    }
+    fn finish(&mut self) -> Result<Vec<EncodedPacket>, PipelineError> {
+        Ok(Vec::new())
+    }
+    fn force_keyframe(&mut self) {
+        self.forced = true;
+    }
+}
+
+impl LiveEncoder for PtrEnc {
+    fn start_at(&mut self, _t0: u64) {
+        self.forced = true;
+    }
+    fn time_base(&self) -> Rational {
+        Rational::new(1, 5)
+    }
+    fn move_gate(&self) -> MoveGate {
+        Box::new(|p| p.is_keyframe() && p.len() == 77)
+    }
+}
+
+/// The (tick, canvas address) pairs a [`PtrEnc`] encoded.
+type SeenPtrs = Arc<Mutex<Vec<(u64, usize)>>>;
+
+fn ptr_harness(outputs: usize) -> (Harness, SeenPtrs) {
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let rec = Arc::clone(&seen);
+    let open: OpenFn = Box::new(move |_| {
+        let enc: Box<dyn LiveEncoder> = Box::new(PtrEnc {
+            forced: false,
+            seen: Arc::clone(&rec),
+        });
+        Ok(enc)
+    });
+    (harness_with(outputs, 6, Some(open), true), seen)
+}
+
+fn apply(x: &mut Harness, from: u64, op: &str) -> (u64, u64) {
+    for t in from..from + OPEN_DEADLINE_TICKS {
+        x.tick(t);
+        if let Some(o) = x.outcomes.try_iter().next() {
+            assert_eq!(o.operation_id, op, "unexpected outcome {o:?}");
+            assert_eq!(o.outcome, TakeResult::Applied, "{o:?}");
+            return (o.tick, t + 1);
+        }
+    }
+    panic!("{op} never applied");
+}
+
+/// ADR-0108 slice 2 (§2.5): a take to Clean opens one live encoder fed
+/// exactly the pre-bake canvases handed to `publish_clean` (same `Arc`, the
+/// frame of the same tick), applies at a RAP, and never wakes the aux thread.
+#[test]
+fn a_take_to_clean_feeds_the_pre_bake_canvas_and_never_wakes_aux() {
+    let (mut x, seen) = ptr_harness(2);
+    for t in 0..5 {
+        x.tick(t);
+    }
+    assert!(!x.r.clean_active && x.r.slot(&PictureBus::Clean).is_none());
+    assert!(
+        seen.lock().unwrap().is_empty(),
+        "no Clean take: publish_clean stores nothing and nothing opens"
+    );
+    x.h.try_take(take("c", 1, PictureBus::Clean)).unwrap();
+    let (at, now) = apply(&mut x, 5, "c");
+    assert_eq!(x.d.video_key_count(), 2, "+1 encoder for Clean");
+    assert_eq!(x.d.binding_video_key(1), Some(1));
+    assert_eq!(
+        x.d.binding_video_key(0),
+        Some(0),
+        "output 0 stays on Program"
+    );
+    let o1 = x.windows_of(1);
+    let first = o1
+        .iter()
+        .find(|w| w.first().is_some_and(|p| p.0 == i64::try_from(at).unwrap()))
+        .unwrap();
+    assert!(
+        first[0].1,
+        "the first packet on Clean is a self-contained RAP"
+    );
+    for t in now..now + 20 {
+        x.tick(t);
+    }
+    // Let the worker drain what it was offered.
+    std::thread::sleep(std::time::Duration::from_millis(50));
+    let seen = seen.lock().unwrap().clone();
+    assert!(
+        seen.len() >= 20,
+        "the Clean encoder was fed: {}",
+        seen.len()
+    );
+    for (tick, ptr) in &seen {
+        let published = x
+            .clean
+            .iter()
+            .find(|(t, _)| t == tick)
+            .map(|(_, c)| Arc::as_ptr(c).addr());
+        assert_eq!(
+            published,
+            Some(*ptr),
+            "tick {tick}: the encoder got exactly the canvas published for that tick"
+        );
+    }
+    assert!(
+        !x.aux_active.load(Ordering::Acquire),
+        "only Clean routed: the aux send gate stays closed"
+    );
+    assert_eq!(x.aux_sent.load(Ordering::Relaxed), 0, "no aux tick sent");
+    assert_eq!(
+        x.h.snapshot().outputs[1].bus,
+        "clean",
+        "readback names the Clean bus"
+    );
+}
+
+/// The aux thread failing never moves an output off Clean (Clean is fed by
+/// the bake consumer, not by the aux thread).
+#[test]
+fn an_aux_failure_never_moves_an_output_off_clean() {
+    let (mut x, _seen) = ptr_harness(2);
+    x.tick(0);
+    x.h.try_take(take("c", 1, PictureBus::Clean)).unwrap();
+    let (_, mut now) = apply(&mut x, 1, "c");
+    x.failed.store(true, Ordering::Release);
+    for _ in 0..30 {
+        x.tick(now);
+        now += 1;
+    }
+    assert_eq!(x.results(), Vec::new(), "no Fallback outcome");
+    assert_eq!(x.d.binding_video_key(1), Some(1), "still on the Clean key");
+    assert_eq!(x.h.snapshot().outputs[1].bus, "clean");
+}
+
+/// Clean without an M/E is unroutable (like Preview).
+#[test]
+fn clean_without_a_switcher_is_refused() {
+    let mut x = harness(2, 6, None);
+    x.tick(0);
+    x.h.try_take(take("c", 1, PictureBus::Clean)).unwrap();
+    x.tick(1);
+    assert_eq!(
+        x.results(),
+        vec![TakeResult::Refused(RefuseReason::Unroutable)]
+    );
+}
+
+/// Slice 1 limit fixed: the plan counts a lingering live encoder for the
+/// same (bus, settings) as +0 (the take reuses it), and +1 once it closed.
+#[test]
+fn the_plan_counts_a_lingering_encoder_as_plus_zero() {
+    use multiview_control::output_routing::{OutputRouting, RoutedFeed};
+    let mut x = harness(2, 6, None);
+    let h = x.h.clone().with_outputs(vec![
+        RunOutput {
+            id: Some("a".into()),
+            settings: 0,
+            routable: true,
+        },
+        RunOutput {
+            id: Some("b".into()),
+            settings: 0,
+            routable: true,
+        },
+    ]);
+    let slot = output_routing_slot();
+    slot.store(Some(Arc::new(h)));
+    let adapter = crate::output_routing_control::OutputRoutingAdapter::new(Arc::clone(&slot));
+    let cam = RoutedFeed::Source("cam".into());
+    x.tick(0);
+    assert!(
+        adapter.plan("b", &cam).unwrap().needs_encoder,
+        "+1 at first"
+    );
+    x.h.try_take(take("to-src", 1, src())).unwrap();
+    let (_, now) = apply(&mut x, 1, "to-src");
+    x.h.try_take(take("back", 1, PictureBus::Program)).unwrap();
+    let (_, now) = apply(&mut x, now, "back");
+    assert_eq!(x.h.snapshot().dynamic_encoders_live, 1, "lingering");
+    assert_eq!(
+        x.h.snapshot().live_keys,
+        vec![("src:cam".to_owned(), 0)],
+        "the lingering key is published"
+    );
+    assert!(
+        !adapter.plan("b", &cam).unwrap().needs_encoder,
+        "a lingering encoder is reused: +0"
+    );
+    assert!(
+        !adapter.plan("a", &cam).unwrap().needs_encoder,
+        "same settings on the other output: +0 too"
+    );
+    for t in now..=now + LINGER_TICKS + 1 {
+        x.tick(t);
+    }
+    assert_eq!(x.h.snapshot().dynamic_encoders_live, 0, "closed");
+    assert_eq!(x.h.snapshot().live_keys, Vec::<(String, usize)>::new());
+    assert!(
+        adapter.plan("b", &cam).unwrap().needs_encoder,
+        "after the linger closed: +1"
+    );
 }

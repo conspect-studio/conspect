@@ -43,6 +43,7 @@ fn routed_feed(bus: &PictureBus) -> RoutedFeed {
     match bus {
         PictureBus::Program => RoutedFeed::Program,
         PictureBus::Preview => RoutedFeed::Preview,
+        PictureBus::Clean => RoutedFeed::Clean,
         PictureBus::Source(id) => RoutedFeed::Source(id.clone()),
     }
 }
@@ -51,6 +52,7 @@ fn picture_bus(feed: &RoutedFeed) -> PictureBus {
     match feed {
         RoutedFeed::Program => PictureBus::Program,
         RoutedFeed::Preview => PictureBus::Preview,
+        RoutedFeed::Clean => PictureBus::Clean,
         RoutedFeed::Source(id) => PictureBus::Source(id.clone()),
     }
 }
@@ -155,19 +157,24 @@ impl OutputRouting for OutputRoutingAdapter {
         if !run_output.routable {
             return Err(PlanRefusal::OutputKindUnroutable);
         }
-        if *feed == RoutedFeed::Preview && !handle.has_preview() {
+        if matches!(feed, RoutedFeed::Preview | RoutedFeed::Clean) && !handle.has_preview() {
             return Err(PlanRefusal::SwitcherRequired);
         }
         let snapshot = handle.snapshot();
         let bus = feed.bus_name();
-        // +0 when the feed is Program (the base encoder) or another output
-        // with the same settings already carries this bus (encode once per
-        // (bus, settings), §4.3).
+        // +0 when the feed is Program (the base encoder), another output
+        // with the same settings already carries this bus, or a live encoder
+        // for (bus, settings) still runs (a lingering one is reused by the
+        // take): encode once per (bus, settings), §4.3.
         let shared = *feed == RoutedFeed::Program
             || handle.outputs().iter().enumerate().any(|(i, o)| {
                 o.settings == run_output.settings
                     && snapshot.outputs.get(i).is_some_and(|v| v.bus == bus)
-            });
+            })
+            || snapshot
+                .live_keys
+                .iter()
+                .any(|(b, settings)| *b == bus && *settings == run_output.settings);
         Ok(PlanCost {
             needs_encoder: !shared,
             sessions_in_use: snapshot

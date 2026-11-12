@@ -19195,7 +19195,7 @@
           },
           "feed": {
             "type": "object",
-            "description": "The feed: `{\"bus\":\"program\"|\"preview\"}` or `{\"source\":\"vt1\"}`."
+            "description": "The feed: `{\"bus\":\"program\"|\"preview\"|\"clean\"}` or `{\"source\":\"vt1\"}`."
           },
           "target": {
             "$ref": "#/components/schemas/OutputTargetKind",

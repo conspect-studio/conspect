@@ -7584,6 +7584,10 @@ fn consumer_main<D: WindowDelivery>(
         // live-opened encoders. Never waits; a no-take run does nothing here.
         let tick_pts =
             MediaTime::from_tick(i64::try_from(item.tick_index).unwrap_or(i64::MAX), cadence);
+        // The Clean bus is this tick's Program canvas BEFORE the overlay bake,
+        // published before the router tick so a Clean encoder gets frame T
+        // this tick. One bool check when nothing selects Clean.
+        router.publish_clean(item.tick_index, &item.canvas);
         router
             .on_tick(item.tick_index, tick_pts, &mut dispatcher, &mut delivery)
             .map_err(|e| PipelineError::Output {
@@ -12984,6 +12988,13 @@ struct StreamingPacketSource {
     current_permit: Option<Arc<multiview_output::batch::BatchLease>>,
     /// How many packets this source delivered (for the per-sink report count).
     delivered: usize,
+    /// The lease the last packet came from (identity only: a `Weak` keeps the
+    /// allocation, so its address cannot be reused by the next window, while
+    /// the lease itself and its reservation are released as before).
+    last_lease: std::sync::Weak<multiview_output::batch::BatchLease>,
+    /// The current window opened a decoder-configuration change not yet
+    /// reported to the sink (reported once per lease).
+    config_change_unreported: bool,
 }
 
 impl StreamingPacketSource {
@@ -12992,6 +13003,8 @@ impl StreamingPacketSource {
             rx,
             current_permit: None,
             delivered: 0,
+            last_lease: std::sync::Weak::new(),
+            config_change_unreported: false,
         }
     }
 }
@@ -13004,9 +13017,20 @@ impl PacketSource for StreamingPacketSource {
         let Ok(leased) = self.rx.recv() else {
             return Ok(None);
         };
+        // The pump fans one window's packets with clones of ONE `Arc`
+        // permit, so a different address is the next window.
+        let lease = Arc::downgrade(&leased.permit);
+        if !self.last_lease.ptr_eq(&lease) {
+            self.last_lease = lease;
+            self.config_change_unreported = leased.permit.decoder_config_changed();
+        }
         self.current_permit = Some(leased.permit);
         self.delivered = self.delivered.saturating_add(1);
         Ok(Some(leased.packet))
+    }
+
+    fn take_decoder_config_change(&mut self) -> bool {
+        std::mem::take(&mut self.config_change_unreported)
     }
 }
 
