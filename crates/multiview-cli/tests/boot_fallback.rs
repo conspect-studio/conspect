@@ -286,3 +286,41 @@ async fn kept_rejected_states_are_bounded() {
     }
     assert_eq!(rejected_files(&path).len(), MAX_REJECTED);
 }
+
+fn run_binary(path: &Path) -> std::process::Output {
+    std::process::Command::new(env!("CARGO_BIN_EXE_multiview"))
+        .args(["run", "--software", "--ticks", "2"])
+        .arg(path)
+        .env("MULTIVIEW_CONTROL_TOKEN", "test-secret")
+        .output()
+        .expect("the multiview binary runs")
+}
+
+/// Today's restart, end to end through the real binary: the saved 6-cell state
+/// with one M/E and a last-good copy → the process starts and runs; without a
+/// last-good copy → it fails with the clear reason (and moves nothing).
+#[tokio::test]
+async fn the_real_binary_restarts_from_last_good_and_fails_clearly_without_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, _) = install(dir.path()).await;
+    make_six_cell(&path);
+    let failed = run_binary(&path);
+    let stderr = String::from_utf8_lossy(&failed.stderr);
+    assert!(!failed.status.success(), "no last-good: fails");
+    assert!(
+        stderr.contains("multi-cell layouts are not replaced"),
+        "{stderr}"
+    );
+
+    let dir = tempfile::tempdir().unwrap();
+    let (path, _) = install(dir.path()).await;
+    mark_started(&path).await;
+    make_six_cell(&path);
+    let started = run_binary(&path);
+    assert!(
+        started.status.success(),
+        "falls back and runs: {}",
+        String::from_utf8_lossy(&started.stderr)
+    );
+    assert_eq!(rejected_files(&path).len(), 1, "the rejected state is kept");
+}
