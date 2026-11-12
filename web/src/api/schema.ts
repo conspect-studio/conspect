@@ -2504,6 +2504,26 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/routing": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * `GET /api/v1/routing` — the output routing state (role: read; outputs the
+         *     caller may not read are omitted; feeds it may not read are redacted).
+         */
+        get: operations["get_routing"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/routing/plan": {
         parameters: {
             query?: never;
@@ -6216,6 +6236,35 @@ export interface components {
             /** @description Human-friendly name. */
             name: string;
         };
+        /** @description One output's routing row in `GET /api/v1/routing` (ADR-0108 §6.2). */
+        OutputRouteState: {
+            /** @description The configured audio feed (`"follow"` unless set). */
+            audio: Record<string, never>;
+            /**
+             * @description What the audio carries now: `"program"` (the program mix),
+             *     `{"source": id}`, `"preview_source"`, or `{"redacted": true}`.
+             */
+            effective_audio: Record<string, never>;
+            /** @description The output's API id (the id `/api/v1/outputs/{id}` addresses). */
+            output: string;
+            /** @description `configured` until the engine reports readback for this output. */
+            state: string;
+            /**
+             * @description Whether the feed follows the switcher (`program`) or is direct
+             *     (`source`) or the preview bus — the tally distinction (§8).
+             */
+            tally: components["schemas"]["OutputTally"];
+            /**
+             * @description The configured video feed: `{"bus": "program"}`, `{"source": "vt1"}`,
+             *     or `{"redacted": true}` when the caller may not read the feed.
+             */
+            video: Record<string, never>;
+        };
+        /**
+         * @description How an output's feed relates to the switcher (ADR-0108 §8 tally).
+         * @enum {string}
+         */
+        OutputTally: "program" | "preview" | "clean" | "direct" | "redacted";
         /**
          * @description One decode-side entry point on a device, bindable as an ordinary managed
          *     Output with a `device_ref` (ADR-M009 facet (b)).
@@ -6931,6 +6980,11 @@ export interface components {
             kind: "subtitle_layer";
             /** @description The destination layer id. */
             layer: string;
+        };
+        /** @description The `GET /api/v1/routing` body (ADR-0108 §6.2), filtered per object. */
+        RoutingState: {
+            /** @description One row per output the caller may read. */
+            outputs: components["schemas"]["OutputRouteState"][];
         };
         /** @description `PUT /channels/{id}/rundown` body. */
         RundownInput: {
@@ -15917,6 +15971,44 @@ export interface operations {
             };
             /** @description If-Match precondition failed. */
             412: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
+    get_routing: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The routing state, filtered per object. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RoutingState"];
+                };
+            };
+            /** @description Missing or invalid credentials. */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Not authorized to read. */
+            403: {
                 headers: {
                     [name: string]: unknown;
                 };

@@ -128,6 +128,28 @@ pub fn switcher_canvas_admission(
     Ok(())
 }
 
+/// ADR-0108 slice 1, step 1: an output fed directly by a source (or a switcher
+/// bus other than Program) is validated and read back, but the engine does not
+/// carry it yet, so start-up refuses it rather than silently putting Program on
+/// that output. A `bus = "preview"` output keeps its existing behaviour.
+///
+/// # Errors
+/// The start-up refusal text naming the routed output.
+pub fn outputs_carry_program(config: &MultiviewConfig) -> Result<(), String> {
+    if let Some(routed) = config
+        .output_feeds()
+        .into_iter()
+        .find(|xp| matches!(xp.effective_video(), crate::VideoFeed::Source(_)))
+    {
+        return Err(format!(
+            "output {:?} is routed to {:?}; this engine carries only Program on outputs",
+            routed.output,
+            routed.effective_video().picture_bus()
+        ));
+    }
+    Ok(())
+}
+
 /// Why a document cannot be booted.
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
@@ -138,6 +160,9 @@ pub enum BootAdmissionError {
     /// The document is valid but the declared switcher cannot drive its canvas.
     #[error(transparent)]
     SwitcherCanvas(#[from] SwitcherCanvasRefusal),
+    /// An output is routed to something this engine does not carry yet.
+    #[error("{0}")]
+    OutputRouting(String),
 }
 
 /// The start-up admission validator: everything a document must satisfy, beyond
@@ -152,6 +177,7 @@ pub fn boot_admission(config: &MultiviewConfig) -> Result<(), BootAdmissionError
     config.validate()?;
     let solved = config.solve_layout()?;
     config.switcher_canvas_admission(&solved)?;
+    outputs_carry_program(config).map_err(BootAdmissionError::OutputRouting)?;
     Ok(())
 }
 

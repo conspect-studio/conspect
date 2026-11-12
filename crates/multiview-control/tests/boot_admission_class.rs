@@ -394,3 +394,68 @@ async fn every_other_persisting_command_yields_a_bootable_state_or_a_clean_refus
         let _ = run.commands.try_drain();
     }
 }
+
+/// Review finding (Grok, PR #318): a boot-file edit that the admission refuses
+/// is latched like any invalid document — warned once, `desired.json`
+/// unchanged, and later polls of the same content do NOT re-enter the commit
+/// (no lock retake, no re-published warning every second).
+#[tokio::test]
+async fn watcher_refuses_an_inadmissible_boot_file_edit_once_and_latches_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("boot.toml");
+    let text = boot_text(true);
+    std::fs::write(&path, &text).unwrap();
+    let config = MultiviewConfig::load_from_toml(&text).unwrap();
+    let (state, _commands) = state_for(&path, &config);
+    let layouts = multiview_control::boot_model::layout_library(&state).unwrap();
+    multiview_control::boot_model::commit_desired(&state, config.clone(), layouts)
+        .await
+        .unwrap();
+    let desired = path.parent().unwrap().join(".multiview/desired.json");
+    let before = std::fs::read(&desired).unwrap();
+    let mut events = state.engine.subscribe();
+    let (options, mut poll) = multiview_control::config_watch::WatchOptions::default()
+        .with_initial_observed(text.clone())
+        .with_manual_poll();
+    let _watch =
+        multiview_control::config_watch::spawn(path.clone(), config, state.clone(), options);
+    assert!(poll.poll_once().await && poll.poll_once().await);
+
+    // The operator edits the boot file to a two-cell canvas with the M/E on.
+    let edited = text.replace(
+        "[[cells]]\nid = \"pgm\"\nrect = { x = 0.0, y = 0.0, w = 1.0, h = 1.0 }\n[cells.source]\ninput_id = \"in_a\"\n",
+        "[[cells]]\nid = \"pgm\"\nrect = { x = 0.0, y = 0.0, w = 0.5, h = 1.0 }\n[cells.source]\ninput_id = \"in_a\"\n[[cells]]\nid = \"two\"\nrect = { x = 0.5, y = 0.0, w = 0.5, h = 1.0 }\n[cells.source]\ninput_id = \"in_b\"\n",
+    );
+    assert_ne!(edited, text, "fixture edit applies");
+    std::fs::write(&path, &edited).unwrap();
+    for _ in 0..6 {
+        assert!(poll.poll_once().await);
+    }
+    let mut warnings = 0;
+    while let Ok(event) = events.try_recv() {
+        if matches!(
+            event.event.as_ref(),
+            multiview_events::Event::HealthWarningRaised(_)
+        ) {
+            warnings += 1;
+        }
+    }
+    assert_eq!(
+        warnings, 1,
+        "refused once and latched, not re-tried every poll"
+    );
+    let snapshot = state.config_watch.snapshot();
+    assert!(
+        snapshot
+            .last_rejected
+            .as_ref()
+            .is_some_and(|r| r.detail.contains("The switcher is on")),
+        "{snapshot:?}"
+    );
+    assert_eq!(snapshot.applied_count, 0);
+    assert_eq!(
+        std::fs::read(&desired).unwrap(),
+        before,
+        "desired.json unchanged"
+    );
+}

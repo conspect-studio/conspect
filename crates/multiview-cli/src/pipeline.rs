@@ -268,6 +268,13 @@ struct StreamPlan {
     binding_ids: Vec<Option<String>>,
 }
 
+/// ADR-0108 slice 1, step 1 start-up refusal; the rule itself lives in
+/// [`multiview_config::outputs_carry_program`] so start-up and `multiview
+/// validate` share it (#317).
+fn ensure_outputs_carry_program(config: &MultiviewConfig) -> Result<(), PipelineError> {
+    multiview_config::outputs_carry_program(config).map_err(PipelineError::Engine)
+}
+
 /// Errors building or running the libav\* pipeline.
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
@@ -1430,6 +1437,56 @@ segment_ms = 1000
 }
 
 #[cfg(test)]
+mod output_feed_guard_tests {
+    use super::ensure_outputs_carry_program;
+    use multiview_config::MultiviewConfig;
+
+    const DOC: &str = r##"
+schema_version = 1
+[canvas]
+width = 64
+height = 64
+fps = "25/1"
+pixel_format = "nv12"
+background = "#000000"
+[canvas.color]
+profile = "sdr-bt709-limited"
+[layout]
+kind = "grid"
+columns = ["1fr"]
+rows = ["1fr"]
+areas = ["a"]
+[[sources]]
+id = "a"
+kind = "test"
+[[cells]]
+id = "c"
+area = "a"
+[cells.source]
+input_id = "a"
+[[outputs]]
+id = "o"
+kind = "hls"
+path = "/tmp/output-feed-guard/index.m3u8"
+codec = "mpeg2video"
+segment_ms = 1000
+"##;
+
+    #[test]
+    fn default_program_outputs_run_and_a_source_feed_is_refused_loudly() {
+        let plain = MultiviewConfig::load_from_toml(DOC).expect("parses");
+        assert!(ensure_outputs_carry_program(&plain).is_ok());
+        let routed = MultiviewConfig::load_from_toml(&format!(
+            "{DOC}\n[[routing.output]]\noutput = \"o\"\nvideo = {{ source = \"a\" }}\n"
+        ))
+        .expect("parses");
+        routed.validate().expect("valid");
+        let err = ensure_outputs_carry_program(&routed).expect_err("refused");
+        assert!(err.to_string().contains("src:a"), "{err}");
+    }
+}
+
+#[cfg(test)]
 mod encoder_format_tests {
     use super::{encoder_input_format, output_codec};
     use ffmpeg_next::format::Pixel;
@@ -2401,11 +2458,15 @@ impl Pipeline {
         // legacy multiview with multiple cells remains untouched when the M/E
         // block is absent; an opted-in unsupported layout fails loudly instead
         // of replacing the operator's canvas with a guessed source.
-        // The SAME admission rule the control plane applies before it persists an
-        // accepted state (#317): `multiview_config::switcher_canvas_admission`.
+        // The SAME admission rules the control plane applies before it persists an
+        // accepted state (#317): `multiview_config::switcher_canvas_admission`,
+        // and (ADR-0108 slice 1, step 1) `outputs_carry_program`: an output fed
+        // directly by a source is validated and read back, but this engine does
+        // not carry it yet — fail loudly rather than put Program on it.
         config
             .switcher_canvas_admission(&layout)
             .map_err(|refusal| PipelineError::Engine(refusal.to_string()))?;
+        ensure_outputs_carry_program(config)?;
         let switcher_cell_id = switcher_me
             .as_ref()
             .and_then(|_| config.cells.first().map(|cell| cell.id.clone()));

@@ -430,11 +430,17 @@ Tick T is the move tick (§4.5).
    - If it does not exist, the engine opens it **off the clock** (§4.3). It starts at an absolute
      tick T0 (§4.3) and moves the output at T = T0 + 1 or later, at a forced IDR. The spike moved
      at T0 + 10.
-2. **Keyframe.** Each encoder is opened with `forced-idr=1`, so a forced I picture is a true IDR.
+2. **Keyframe with parameter sets (the move gate).** Each encoder is opened with `forced-idr=1`, so a forced I picture is a true IDR.
    `VideoRenditionEncoder` lacks the option today (`crates/multiview-output/src/sink.rs:578-595`), and it lacks a method that
    forwards to `VideoEncoder::force_next_keyframe` (`crates/multiview-ffmpeg/src/encode.rs:208-216`).
    Slice 1 adds both. The move happens only when the destination packet stamped T is a decoder-ready
    RAP (`StreamCodecParameters::is_decoder_ready_rap`, `crates/multiview-ffmpeg/src/packet.rs:384`).
+   `is_decoder_ready_rap` is necessary, not sufficient: it is true on an IDR NAL alone. The gate
+   also parses the access unit and requires its parameter sets in it: SPS and PPS for H.264,
+   VPS, SPS and PPS for HEVC. They are there because no family is opened with
+   `AV_CODEC_FLAG_GLOBAL_HEADER`, and libavcodec then sets NVENC `repeatSPSPPS`, x264
+   `b_repeat_headers` and x265 `repeat-headers`. VAAPI and VideoToolbox outputs are not routable
+   in slice 1 (`output-kind-unroutable`) until the same check exists for them.
    Otherwise the move is retried at the next tick, up to 3, then refused with `encoder-not-ready`
    while the output keeps its feed.
 3. **Timestamps.** The output's packets are window T−1 from the old encoder, then window T from the
@@ -445,10 +451,19 @@ Tick T is the move tick (§4.5).
    encoder opened 200 ticks late. They carry them in band at every IDR, because the crate never
    sets `AV_CODEC_FLAG_GLOBAL_HEADER` (`crates/multiview-ffmpeg/src/encode_options.rs:24-28`).
    So the output's muxer init (TS PMT, fMP4 `EXT-X-MAP`, FLV sequence header, MoQ catalog
-   description) stays valid. The engine compares the new encoder's parameters with the
-   destination output's current ones when the encoder opens. A mismatch is an internal fault, not
-   an operator refusal: it is logged, the take is refused with `encoder-format-mismatch`, and a
-   test pins it for every encoder family. NVENC identity is acceptance on mda001.
+   description) usually stays valid. **Identity is not assumed.** The engine compares the new
+   encoder's in-band parameter sets with the moving output's current ones at the move:
+   - **equal**: a plain move;
+   - **different** (same codec, size and format): still correct for consumers that read in-band
+     sets: MPEG-TS (HLS TS segments and SRT: the decoder re-reads SPS/PPS at the IDR, and the
+     segmenter starts a segment there), FLV and MoQ (a new group starting at the IDR with its
+     sets). Slice 1 routes those. For consumers with out-of-band init (fMP4/CMAF `EXT-X-MAP`, a
+     MoQ catalog description, an FLV sequence header) a difference is signalled as a
+     discontinuity on that output (`EXT-X-DISCONTINUITY`, a new init), and the event says "a brief
+     decoder reset on this output"; it is never spliced silently;
+   - a change of codec, size or pixel format is impossible by construction (the key includes the
+     output's settings) and is an internal fault `encoder-format-mismatch`.
+   Which case NVENC gives across a live open is measured on mda001 (slice 1 acceptance).
 5. **Format.** An output's format (size, cadence, pixel format, colour tags, codec settings) never
    changes on a take, because the destination key includes the output's own settings. A format
    change is RT-15's migration, a separate operation.
@@ -487,6 +502,11 @@ verified per protocol in the slice that ships it (§9). §4.6 proved the MPEG-TS
 - **Opening is off the clock and off the consumer.** A take whose destination does not exist spawns
   a `RenditionWorker` on a new OS thread (the existing worker type, `crates/multiview-cli/src/pipeline.rs:6964-6984`). The
   encoder opens there; an NVENC open can take hundreds of ms.
+  - **Open deadline.** 90 ticks (3 s at 30000/1001) from admission to the destination's first
+    completed window that passes the move gate (§4.2 step 2). On overrun the take is refused
+    `encoder-not-ready`, the session reservation is released, the worker is handed to the reaper,
+    and the output keeps its previous feed. The operator sees "The encoder for this feed did not
+    start in time".
   - `VideoRenditionEncoder` today always starts at tick 0 and rejects anything else
     (`crates/multiview-output/src/sink.rs:604,646-655`). Slice 1 adds `starting_at(T0)`: the first frame it accepts is T0, and
     that frame is an IDR.
@@ -495,9 +515,29 @@ verified per protocol in the slice that ships it (§9). §4.6 proved the MPEG-TS
     bounded wait it uses for established workers (`offer_within`, `crates/multiview-cli/src/pipeline.rs:7193-7206`). So a
     slow open or a warming encoder cannot hold the consumer.
 - **Rebinding.** The dispatcher's bindings are fixed for one generation today
-  (`crates/multiview-cli/src/rendition_dispatch.rs:61-79`). Slice 1 adds `rebind(output, video_key,
-  audio_key, at_tick)`: windows before `at_tick` admit from the old keys, and windows from `at_tick`
-  admit from the new keys. The swap is atomic per output, at a window boundary.
+  (`crates/multiview-cli/src/rendition_dispatch.rs:61-79`). Slice 1 adds two contracts, because
+  video and audio move at different boundaries (§5.2):
+  - `rebind_video(output, key, at_tick)`: windows before `at_tick` carry the old key's video, and
+    windows from `at_tick` the new key's;
+  - `rebind_audio(output, key, at_sample)`: audio packets that start before grid boundary G carry
+    the old key, packets from G the new key.
+
+  Each swap is atomic per output at its own boundary.
+- **Window closure with a live-opened stage (the rule that protects Program).** The dispatcher
+  closes a window only when every live stage is complete up to its end
+  (`crates/multiview-cli/src/rendition_dispatch.rs:601-607`). A stage opened live is therefore
+  **not live for closure** until its first completed window: before that it never gates any other
+  stage, and its windows are not delivered to anyone. From its first window it joins the rule like
+  any stage, and the normal watchdog and per-binding admission isolate a wedge afterwards. An
+  output is rebound only to a window the destination stage has completed and whose first video
+  packet passes the move gate (§4.2 step 2). Two tests pin this, and they fail without the rule: a
+  live open whose encoder is slow (several ticks) or wedged (never produces) leaves every existing
+  output's windows closing on time with none late or missing; and the moved output's first packet
+  after the move is a keyframe carrying its parameter sets. The open-storm and wedged-live-open
+  chaos tests (§9) assert the same.
+- **Gaps on a live-opened worker.** The consumer `try_send`s to a new worker and may drop a tick.
+  The worker fills the missing tick with its last frame, so its encoder still sees consecutive
+  ticks (`crates/multiview-output/src/sink.rs:646-655`) and its windows stay contiguous.
   `migration::OutputCrosspoint` / `PacketRouter::move_sink` (`crates/multiview-engine/src/migration.rs:145-235`)
   are the same idea over the unused fan-out carrier; production uses the dispatcher, so the
   dispatcher is extended and the carrier work (#144, #154-#156) stays separate.
@@ -698,8 +738,9 @@ ticks, from:
   subscribers. Today one shared AAC encoder carries the program stream and every discrete track
   (`crates/multiview-cli/src/pipeline.rs:5795`, `crates/multiview-output/src/sink.rs:724`). That is the key `(audio:program, settings)` plus its tracks,
   unchanged with default config.
-- **An output's audio subscription moves with its video**, in the same take. Its rebind is keyed
-  on the audio grid boundary G at or after the video move tick (Rule 1 below), at most 21 ms later.
+- **An output's audio subscription moves in the same take as its video, but in its own rebind**
+  (`rebind_audio`, §4.3), keyed on the audio grid boundary G at or after the video move tick T
+  (Rule 1 below), at most 21 ms later. Video is rebound at T, audio at G.
 
 **Why audio needs its own rule.** Video moves at an IDR at tick T. Audio cannot move at the same
 instant, for two reasons.
@@ -1111,8 +1152,8 @@ The plan shows the arithmetic. A refused take returns 409 `capacity` with
   touches Program.
 - **On the GPU this is a scheduling argument, not yet a proof.** A wgpu queue is shared, and aux
   submissions can delay a later Program submission. Slice 3, the first slice that composes on the
-  GPU off-clock, has a hard gate on mda001: Program lateness p99 and max are not worse than the hour
-  before, with two aux layout canvases active for an hour. If the gate fails, slice 3 ships on the
+  GPU off-clock, has a hard gate on mda001: the Program protection bound of §10, with two aux
+  layout canvases active for an hour. If the gate fails, slice 3 ships on the
   CPU integer path, which slice 3 measures and gates first, and wgpu aux stays off. A second-GPU
   placement is not offered: one `AdmissionPick` pins compositor and decode per run
   (`crates/multiview-cli/src/pipeline.rs:4130-4180`). Slices 1-2 compose no GPU aux work.
@@ -1288,8 +1329,9 @@ Also checked:
 
 1. **Take flood:** 2,000 takes per second across all outputs for 10 minutes (almost all of them
    get 429). Program emits exactly
-   the expected tick count with contiguous PTS. Program lateness p99 stays within 2 ms of the same
-   run without routing (CI host); the ratio is checked on mda001.
+   the expected tick count with contiguous PTS. Program lateness meets the Program protection
+   bound of §10 against the same run without routing (on the CI host for the test, on mda001 for
+   acceptance).
 2. **Failing feeds:** routed sources die, reconnect and flap every 2 s during takes. Never a stale
    or black frame on a routed output: pixel-probe each frame against the expected feed.
 2b. **Cross-principal effects:**
@@ -1316,7 +1358,7 @@ Also checked:
 5. **Wedged encoder:** only the outputs on its encoded bus lose windows (dispatcher isolation). A
    wedged live open: the take is refused at its deadline and the output keeps its feed.
 6. **mda001 soak:** 1 h with the HLS output on a layout and SRT on a source, a take every 30 s.
-   ffprobe continuity on both. Program tick lateness p99 is not worse than the hour before. NVENC
+   ffprobe continuity on both. Program tick lateness meets the Program protection bound of §10. NVENC
    sessions match the plan's count.
 
 ---
@@ -1350,8 +1392,11 @@ minutes with N routed feeds active, against the same 10-minute measurement with 
 
 Program tick lateness is not exported today. Slice 1 adds the measurement: a histogram of emit time
 minus deadline, at the point `state_of` runs, and a `frames_repeated` counter
-(`crates/multiview-engine/src/runtime.rs:354-361`) on the metrics endpoint. Every R3 slice also owes
-its chaos/soak tests (§9: take flood, a feed that dies, a stalled aux worker).
+(`crates/multiview-engine/src/runtime.rs:354-361`) on the metrics endpoint. This one bound is the
+Program protection bound everywhere in this note (§7, §9). Every R3 slice also owes its chaos/soak
+tests (§9). Slice 1 runs: the take flood (1), failing and flapping feeds (2), cross-principal
+effects (2b), ongoing authorization (2c), a wedged aux thread (3), a panicking aux thread (4), the
+open storm (4b), a wedged encoder and a wedged live open (5), and the mda001 soak (6).
 
 **Slice 1 acceptance on mda001:**
 
@@ -1367,7 +1412,8 @@ its chaos/soak tests (§9: take flood, a feed that dies, a stalled aux worker).
 - The Program protection bound above, with both outputs routed (N = 2).
 - NVENC sessions are +1 while an output is on a picture bus no other encoder carries, as the plan
   said; they return to 5 within 10 s of the move back.
-- NVENC parameter sets are byte-identical across a live-opened encoder and the running one.
+- Measure whether NVENC parameter sets are byte-identical across a live-opened encoder and the
+  running one, and show that the move is correct in either case (§4.2 step 4).
 - A take to the failed `times-square` is refused at 50 ticks while the output keeps its feed.
 
 **What slice 1 gives the operator, by his own words:** **preview, program, VT, bars, source**, on
