@@ -42,6 +42,10 @@ rustix = { version = "1.1.4", features = ["time"], optional = true }
 # this leaf crate (which is `unsafe_code = "deny"` + `// SAFETY:`), so there is no
 # `unsafe` in the engine. License: MIT OR Apache-2.0 (LGPL-clean).
 multiview-ntpsys = { workspace = true, optional = true }
+# Output clock thread scheduling on macOS (QoS user-interactive, #311): the one
+# FFI call lives in this leaf crate (deny + SAFETY), so the engine stays
+# `forbid(unsafe_code)`. A no-op that links nothing on every other target.
+multiview-clocksys = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 tokio = { workspace = true }

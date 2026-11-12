@@ -87,6 +87,13 @@ so an early or late wake never compounds.
   mean lateness and ~20% repeats on a saturated macOS runner, i.e. the long
   sleep overshooting; the halving schedule removes that. Cost: about
   log2(period / 500 µs) ≈ 6 wakes per tick plus at most 500 µs of spinning.
+  On macOS the clock thread also marks itself QoS `USER_INTERACTIVE`
+  (`pthread_set_qos_class_self_np`, no privilege, this thread only), the class
+  Apple documents for animation and event handling: a default-QoS thread's timer
+  wakeups are deferred behind every runnable thread on a saturated host, which a
+  pacing schedule alone cannot fix. The one FFI call lives in the leaf crate
+  `multiview-clocksys` (`unsafe_code = "deny"`, `// SAFETY:` note, mirrors
+  `multiview-ntpsys`); it is a no-op that links nothing on other targets.
 * Every sleep step is capped at 10 ms (`STOP_POLL`, the same bound the async pacer
   had), so a raised `StopSignal` is observed within one step even on an unreachable
   deadline (a frozen clock).
@@ -232,7 +239,8 @@ construction.
 * Each program owns one OS thread (`clock-<id>`), visible in `top -H` / `ps -L`.
 * `ProgramSet` teardown detaches (not aborts) a wedged clock thread at the grace.
 * Linux builds link rustix's `thread`/`process`/`time` features (MIT/Apache-2.0,
-  pure Rust, no native deps): the default build stays LGPL-clean and GPU-free.
+  pure Rust, no native deps); macOS builds link `libc` through the new FFI leaf
+  `multiview-clocksys`. The default build stays LGPL-clean and GPU-free.
 * Tests: `crates/multiview-engine/tests/clock_thread.rs` (exact count and PTS over a
   long cooperative run, no drift at 29.97 over a simulated day on a real clock
   thread, migration handoff incl. repeats, resync past the cut and a predecessor

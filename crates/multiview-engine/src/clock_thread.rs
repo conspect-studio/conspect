@@ -358,8 +358,10 @@ fn tune_current_thread() -> String {
 
 #[cfg(not(target_os = "linux"))]
 fn tune_current_thread() -> String {
+    // macOS: QoS user-interactive (no privilege needed); a no-op elsewhere.
+    let class = multiview_clocksys::raise_current_thread();
     format!(
-        "portable sleep + {} µs spin, default priority",
+        "halving sleep + {} µs spin, {class}",
         SPIN_MARGIN.as_micros()
     )
 }
