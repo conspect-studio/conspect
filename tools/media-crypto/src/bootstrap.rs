@@ -24,6 +24,11 @@ const CLOCK_UNCERTAINTY_MS: u64 = 1000;
 const NETWORK_BUDGET_MS: u64 = 500;
 const SETTLE_MARGIN_MS: u64 = 250;
 
+/// A canonical root answer that expired only because the wall clock crossed
+/// into the next epoch while the request was in flight. The single error a
+/// caller may retry (once, after the boundary); see [`Bootstrap::root`].
+pub const ROOT_EXPIRED_IN_TRANSIT: &str = "canonical root expired in transit";
+
 /// Only control-plane admission uses this clock; the canonical lease has its own clock.
 pub trait EpochAdmissionClock: Send + Sync {
     fn wall_ms(&self) -> Result<u64>;
@@ -610,13 +615,23 @@ impl Bootstrap {
             self.renew(t)?;
             std::thread::sleep(Duration::from_millis(100));
         }
-        self.root(t)?;
+        // Admitted out of the epoch tail exactly like a grant: no root request
+        // in the last CLOCK_UNCERTAINTY_MS + NETWORK_BUDGET_MS of an epoch. This
+        // samples the system clock, which is the provider's clock (the
+        // injectable admission clock only drives the grant tests).
+        let _ = t;
+        self.root_at(admitted_wall(&SystemAdmissionClock)?)?;
         for i in 0..2 {
             self.renew(t)?;
             let b = &self.bookings.as_ref().ok_or("no bookings")?[i];
-            let r = self
-                .bounded_grant(t, i, b)
-                .map_err(|_| "mapping grant rejected")?;
+            // A transport failure (no answer inside the transport timeout) is a
+            // late or lost answer, not a refusal: keep it distinguishable so the
+            // runtime can retry it on its own bounded budget. Only an answered
+            // non-200 or a malformed body is "mapping grant rejected".
+            let r = self.bounded_grant(t, i, b).map_err(|e| match e {
+                "grant transport" => "mapping grant transport",
+                other => other,
+            })?;
             let bytes = Zeroizing::new(r.body);
             if r.status != 200 || bytes.len() != 264 {
                 return Err("mapping grant rejected");
@@ -864,21 +879,50 @@ impl Bootstrap {
         }
         Ok(r.body)
     }
+    /// Fetch (and discard) the canonical current-epoch root, sent at once.
+    ///
+    /// Used by the running control worker, which must never hold a fetch
+    /// decision across a wait (a withdrawal may land meanwhile). The startup
+    /// fetch in [`Bootstrap::mint_mapping`] is admitted out of the epoch tail
+    /// first. Errors are classified, never retried here:
+    /// * [`ROOT_EXPIRED_IN_TRANSIT`]: the provider answered `Expired` AND the
+    ///   wall clock is now in a later epoch than the request. The answer was
+    ///   overtaken by the boundary; the caller may ask again in the new epoch,
+    ///   within its own bounded budget.
+    /// * `"canonical root rejected"`: everything else, including a refusal
+    ///   (`Denied`), a generation rollback or identity mismatch (`Replay`,
+    ///   `Denied`), a malformed body (`Invalid`), a transport failure, and an
+    ///   `Expired` answer without an epoch crossing (an authority answering for
+    ///   the wrong epoch). These are fatal and must never be retried.
     pub fn root(&self, t: &dyn AuthorityHttpTransport) -> Result<Value> {
         let _ = t; // The canonical provider owns the verified transport.
-        let n = now()?;
-        self.root_provider()?
-            .current_epoch_root(&EpochRootRequest {
-                org: self.binding.org,
-                version: self.binding.version,
-                feed: self.feed,
-                publisher_machine: self.binding.publisher_machine,
-                publisher: self.publisher_instance,
-                epoch: n / 5000,
-                now_ms: n,
-            })
-            .map_err(|_| "canonical root rejected")?;
-        Ok(Value::Null)
+        self.root_at(now()?)
+    }
+    fn root_at(&self, n: u64) -> Result<Value> {
+        let provider = self.root_provider()?;
+        match provider.current_epoch_root(&EpochRootRequest {
+            org: self.binding.org,
+            version: self.binding.version,
+            feed: self.feed,
+            publisher_machine: self.binding.publisher_machine,
+            publisher: self.publisher_instance,
+            epoch: n / EPOCH_MS,
+            now_ms: n,
+        }) {
+            Ok(_) => Ok(Value::Null),
+            // A fence that closed while the answer was in flight is `Denied` in
+            // the provider (checked before any epoch check), so it is fatal
+            // here. The lease is still re-checked as defence in depth.
+            // An answered refusal is `Denied` and a rollback `Replay` in the
+            // provider before any epoch check, so delaying them cannot make them
+            // retryable.
+            Err(crate::Error::Expired)
+                if now()? / EPOCH_MS > n / EPOCH_MS && self.lease_valid() =>
+            {
+                Err(ROOT_EXPIRED_IN_TRANSIT)
+            }
+            Err(_) => Err("canonical root rejected"),
+        }
     }
     /// Verify the released booking-lifetime route, not a synthetic exhaustion cause.
     /// The probe is admitted out of the epoch tail and clamped to the epoch end

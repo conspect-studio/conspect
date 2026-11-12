@@ -506,7 +506,24 @@ mod epoch_admission {
         close_on_first: bool,
         transport_error: bool,
         wrong_expiry_dto: bool,
+        /// Root answer behaviour: see `ROOT_*` below.
+        root_mode: AtomicU64,
+        /// Arrival wall ms of every current-epoch request.
+        root_calls: Mutex<Vec<u64>>,
     }
+    /// Answer normally, but hold the answer past the next epoch boundary when
+    /// the request arrived in the epoch tail (>= 3500 ms into the epoch).
+    const ROOT_HOLD_TAIL: u64 = 0;
+    /// Hold only the first answer past the next boundary, wherever it arrived.
+    const ROOT_HOLD_FIRST: u64 = 1;
+    /// Refuse every root request with 403.
+    const ROOT_REFUSE: u64 = 2;
+    /// Answer with a rolled-back generation (792 < the lease's 793).
+    const ROOT_ROLLBACK: u64 = 3;
+    /// Answer for the previous epoch (wrong epoch).
+    const ROOT_STALE_EPOCH: u64 = 4;
+    /// Added to a mode: hold EVERY answer past the next epoch boundary.
+    const ROOT_DELAY_ALL: u64 = 16;
     impl Authority {
         fn new(clock: Arc<Clock>, statuses: Vec<u16>) -> Self {
             Self {
@@ -517,6 +534,8 @@ mod epoch_admission {
                 close_on_first: false,
                 transport_error: false,
                 wrong_expiry_dto: false,
+                root_mode: AtomicU64::new(ROOT_HOLD_TAIL),
+                root_calls: Mutex::new(vec![]),
             }
         }
     }
@@ -540,12 +559,35 @@ mod epoch_admission {
             } else if r.url.contains("/lease/release") {
                 (200, json!({}))
             } else if r.url.contains("/current-epoch") {
-                let epoch = wall / 5000;
+                let raw_mode = self.root_mode.load(Ordering::SeqCst);
+                let delay_all = raw_mode & ROOT_DELAY_ALL != 0;
+                let mode = raw_mode & !ROOT_DELAY_ALL;
+                let first = {
+                    let mut calls = self.root_calls.lock().unwrap();
+                    calls.push(wall);
+                    calls.len() == 1
+                };
+                let epoch = if mode == ROOT_STALE_EPOCH {
+                    wall / 5000 - 1
+                } else {
+                    wall / 5000
+                };
+                let generation = if mode == ROOT_ROLLBACK { 792 } else { 793 };
                 let enc = |b| base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([b; 16]);
-                (
-                    200,
-                    json!({"versionId":"ver_test","publisherMachineId":"mac_pub","generation":793,"epoch":epoch,"epochStartMs":epoch*5000,"epochEndMs":epoch*5000+5000,"rootKeyBase64":base64::engine::general_purpose::STANDARD.encode([7u8;32]),"contributorOrgCryptoId":enc(10),"versionCryptoId":enc(3),"publisherMachineCryptoId":enc(5),"feedCryptoId":enc(9)}),
-                )
+                let body = json!({"versionId":"ver_test","publisherMachineId":"mac_pub","generation":generation,"epoch":epoch,"epochStartMs":epoch*5000,"epochEndMs":epoch*5000+5000,"rootKeyBase64":base64::engine::general_purpose::STANDARD.encode([7u8;32]),"contributorOrgCryptoId":enc(10),"versionCryptoId":enc(3),"publisherMachineCryptoId":enc(5),"feedCryptoId":enc(9)});
+                // The answer is built for the arrival epoch and then held past the
+                // next boundary: exactly a root answer overtaken in transit.
+                if delay_all
+                    || (mode == ROOT_HOLD_TAIL && wall % 5000 >= 3500)
+                    || (mode == ROOT_HOLD_FIRST && first)
+                {
+                    std::thread::sleep(Duration::from_millis(5000 - wall % 5000 + 30));
+                }
+                if mode == ROOT_REFUSE {
+                    (403, json!({"error":"refused"}))
+                } else {
+                    (200, body)
+                }
             } else if r.url.ends_with("/bookings") {
                 let payload: Value = serde_json::from_slice(&r.body.unwrap()).unwrap();
                 let org = if r.url.contains("org_a") {
@@ -726,5 +768,143 @@ mod epoch_admission {
             );
             assert!(clock.sleeps.lock().unwrap().is_empty());
         }
+    }
+
+    /// Wait on the real clock until the epoch phase is inside `[from, to)`.
+    fn wait_for_phase(from: u64, to: u64) {
+        loop {
+            let phase = real_now() % 5000;
+            if (from..to).contains(&phase) {
+                return;
+            }
+            let wait = (from + 5000 - phase) % 5000;
+            std::thread::sleep(Duration::from_millis(wait.max(1)));
+        }
+    }
+    /// D3: the startup root fetch must be admitted out of the epoch tail like a
+    /// grant. Started 4.6 s into an epoch, a root request sent at once is
+    /// answered in the next epoch and rejected as expired: before the fix this
+    /// ended the run with "canonical root rejected".
+    #[test]
+    fn startup_root_fetch_is_admitted_out_of_the_epoch_tail() {
+        // The grant admission clock is parked mid-epoch so only the root
+        // fetch's own admission is under test.
+        let clock = Arc::new(Clock::new(real_now() / 5000 * 5000 + 1000));
+        let authority = Arc::new(Authority::new(clock.clone(), vec![]));
+        let mut b = setup(clock, authority.clone());
+        wait_for_phase(4600, 4700);
+        b.renew(authority.as_ref()).unwrap();
+        let result = b.mint_mapping(authority.as_ref());
+        let calls = authority.root_calls.lock().unwrap().clone();
+        assert_eq!(calls.len(), 1);
+        assert!(
+            calls[0] % 5000 >= 250 && calls[0] % 5000 < 3500,
+            "root requested in the epoch tail at phase {} ms",
+            calls[0] % 5000
+        );
+        assert_eq!(result, Ok(()));
+    }
+    /// D3: an answer overtaken by the boundary in transit is reported as the one
+    /// retryable root error, not as a refusal, and the next request succeeds.
+    #[test]
+    fn root_answer_overtaken_by_the_boundary_is_retryable_once() {
+        let clock = Arc::new(Clock::new(real_now()));
+        let authority = Arc::new(Authority::new(clock.clone(), vec![]));
+        authority.root_mode.store(ROOT_HOLD_FIRST, Ordering::SeqCst);
+        let mut b = setup(clock, authority.clone());
+        wait_for_phase(500, 1000);
+        b.renew(authority.as_ref()).unwrap();
+        assert_eq!(
+            b.root(authority.as_ref()),
+            Err("canonical root expired in transit")
+        );
+        assert_eq!(
+            harness::ROOT_EXPIRED_IN_TRANSIT,
+            "canonical root expired in transit"
+        );
+        b.renew(authority.as_ref()).unwrap();
+        assert_eq!(b.root(authority.as_ref()), Ok(Value::Null));
+        assert_eq!(authority.root_calls.lock().unwrap().len(), 2);
+    }
+    /// A refusal, a generation rollback and an answer for the wrong epoch are
+    /// fatal root rejections, never the retryable in-transit expiry, whatever
+    /// the epoch phase.
+    #[test]
+    fn root_refusal_rollback_and_wrong_epoch_are_never_retryable() {
+        for mode in [ROOT_REFUSE, ROOT_ROLLBACK, ROOT_STALE_EPOCH] {
+            let clock = Arc::new(Clock::new(real_now()));
+            let authority = Arc::new(Authority::new(clock.clone(), vec![]));
+            authority.root_mode.store(mode, Ordering::SeqCst);
+            let mut b = setup(clock, authority.clone());
+            wait_for_phase(500, 1000);
+            b.renew(authority.as_ref()).unwrap();
+            assert_eq!(
+                b.root(authority.as_ref()),
+                Err("canonical root rejected"),
+                "mode {mode}"
+            );
+            assert_eq!(authority.root_calls.lock().unwrap().len(), 1);
+        }
+    }
+    /// The authority cannot turn a refusal or a rollback into the retryable
+    /// in-transit class by holding its answer past the boundary: the provider
+    /// classifies the status and the generation before any epoch check.
+    #[test]
+    fn delayed_refusal_and_rollback_stay_fatal() {
+        for mode in [ROOT_REFUSE, ROOT_ROLLBACK] {
+            let clock = Arc::new(Clock::new(real_now()));
+            let authority = Arc::new(Authority::new(clock.clone(), vec![]));
+            authority
+                .root_mode
+                .store(mode | ROOT_DELAY_ALL, Ordering::SeqCst);
+            let mut b = setup(clock, authority.clone());
+            wait_for_phase(500, 1000);
+            b.renew(authority.as_ref()).unwrap();
+            assert_eq!(
+                b.root(authority.as_ref()),
+                Err("canonical root rejected"),
+                "mode {mode}"
+            );
+            assert_eq!(authority.root_calls.lock().unwrap().len(), 1);
+        }
+    }
+    /// A wrong-epoch answer held past the boundary is indistinguishable at the
+    /// provider from an answer overtaken in transit (both are an epoch mismatch
+    /// after the boundary), so each call reports the retryable class; the
+    /// runtime's single-retry budget bounds the cost at two requests.
+    #[test]
+    fn delayed_wrong_epoch_root_is_classified_in_transit() {
+        let clock = Arc::new(Clock::new(real_now()));
+        let authority = Arc::new(Authority::new(clock.clone(), vec![]));
+        authority
+            .root_mode
+            .store(ROOT_STALE_EPOCH | ROOT_DELAY_ALL, Ordering::SeqCst);
+        let mut b = setup(clock, authority.clone());
+        wait_for_phase(500, 1000);
+        b.renew(authority.as_ref()).unwrap();
+        assert_eq!(
+            b.root(authority.as_ref()),
+            Err("canonical root expired in transit")
+        );
+        assert_eq!(authority.root_calls.lock().unwrap().len(), 1);
+    }
+    /// A lease that closed while the root request was in flight (a withdrawal,
+    /// a revocation) is fatal even when the epoch also advanced.
+    #[test]
+    fn root_expired_after_the_lease_closed_is_not_retryable() {
+        let clock = Arc::new(Clock::new(real_now()));
+        let authority = Arc::new(Authority::new(clock.clone(), vec![]));
+        authority.root_mode.store(ROOT_HOLD_FIRST, Ordering::SeqCst);
+        let mut b = setup(clock, authority.clone());
+        wait_for_phase(500, 1000);
+        b.renew(authority.as_ref()).unwrap();
+        let lease = b.publisher_lease().unwrap();
+        let closer = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(1500));
+            lease.release().unwrap();
+        });
+        let result = b.root(authority.as_ref());
+        closer.join().unwrap();
+        assert_eq!(result, Err("canonical root rejected"));
     }
 }

@@ -3,7 +3,7 @@ use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use bytes::Bytes;
 use conspect_media_crypto::{
     authority_http::VerifiedHttpsTransport,
-    bootstrap::{private_json, Bootstrap},
+    bootstrap::{private_json, Bootstrap, ROOT_EXPIRED_IN_TRANSIT},
     journal::DurableCounterJournal,
     AuthorityRootGuard, Binding, Publisher,
 };
@@ -100,6 +100,166 @@ fn now() -> u64 {
         .duration_since(UNIX_EPOCH)
         .unwrap()
         .as_millis() as u64
+}
+/// Startup retry budget. Each startup phase that may meet a late answer (the
+/// mapping mint before the marker, the two receiver grants after the expected
+/// fragment) may START a retry for at most 3 seconds, and never later than
+/// `STARTUP_BOUNDARY_RESERVE_MS` before booking A's authoritative expires_at.
+/// The first attempt always runs, exactly as on main; only retries are gated.
+/// A single grant request lasts at most `ATTEMPT_MAX_MS` (epoch-tail admission
+/// 1500 + 250 + 1 ms, then one 1-second transport timeout), so a retried
+/// receiver grant started before the deadline ends before A's boundary:
+/// * 4 000 ms window: deadline = booked + 1 000; ends <= booked + 3 751.
+/// * 10 000 ms window: deadline = booked + 3 000; ends <= booked + 5 751.
+/// * 30 000 ms window: deadline = booked + 3 000; ends <= booked + 5 751.
+///
+/// A whole mapping mint is longer (root plus two grants, each admitted, plus
+/// the pre-existing single tail-404 retry) and a retried mint can run past
+/// that bound. It still cannot make A's boundary confirmed late or faked: the
+/// fragment-handoff check refuses a run with under 2 s of A's window left
+/// (static reason), and the boundary is only probed by the media loop once
+/// wall time >= expires_at.
+const STARTUP_GRANT_BUDGET_MS: u64 = 3000;
+const STARTUP_BOUNDARY_RESERVE_MS: u64 = 3000;
+#[cfg(test)]
+const ATTEMPT_MAX_MS: u64 = 1500 + 250 + 1 + 1000;
+const LATE_GRANT_SETTLE: Duration = Duration::from_millis(250);
+fn startup_grant_deadline(expiry: u64, at: u64) -> u64 {
+    at.saturating_add(STARTUP_GRANT_BUDGET_MS)
+        .min(expiry.saturating_sub(STARTUP_BOUNDARY_RESERVE_MS))
+}
+/// The only startup failures that are timing, not refusal: a grant answer that
+/// did not arrive inside the transport timeout, a 200 grant that arrived too
+/// close to its epoch end, and a canonical root answer that the epoch boundary
+/// overtook in transit. Everything else (an answered
+/// refusal, a malformed answer, an equivocating or rolled-back root, a lease
+/// or booking that is gone) is returned at once and never retried.
+fn retry_late_grant<T>(deadline: u64, mut attempt: impl FnMut() -> Result<T>) -> Result<T> {
+    let mut root_retried = false;
+    loop {
+        let result = attempt();
+        match result {
+            Err("grant transport" | "mapping grant transport") if now() < deadline => {
+                std::thread::sleep(LATE_GRANT_SETTLE);
+            }
+            // A 200 grant that arrived so late in its epoch that it expires within
+            // the clock uncertainty: a local timing check, not a refusal. The next
+            // attempt is admitted out of the tail, in the next epoch.
+            Err("grant near boundary") if now() < deadline => {
+                std::thread::sleep(LATE_GRANT_SETTLE);
+            }
+            // One retry only, and it may start after the deadline. The root
+            // fetch runs only inside the mapping mint, which is BEFORE the
+            // marker and the fragment-handoff check; that check refuses a run
+            // with under 2 000 ms of A's window left (static reason), and A's
+            // boundary is probed only from the media loop once wall time >=
+            // expires_at. One retry lasts <= ATTEMPT_MAX_MS (2 751 ms: tail
+            // admission 1 751 + one 1 000 ms transport timeout). Worst case it
+            // starts at the deadline (booked + min(3 000, window - 3 000)):
+            // * 4 000 ms window: ends <= booked + 3 751 < expiry; the handoff
+            //   check then leaves < 2 000 ms and fails statically, as on main.
+            // * 10 000 ms window: ends <= booked + 5 751, leaving >= 4 249 ms.
+            // * 30 000 ms window: ends <= booked + 5 751, leaving >= 24 249 ms.
+            // Skipping it instead ended the run before the probe (D3 again).
+            Err(ROOT_EXPIRED_IN_TRANSIT) if !root_retried => {
+                root_retried = true;
+            }
+            other => return other,
+        }
+    }
+}
+/// Install a receiver's first grant through the real `ReceiverRuntime::accept`.
+/// Exactly one accept error is timing: `Expired` for a grant whose epoch is
+/// already over at install time (the signature and identity checks passed, a
+/// stalled host let the epoch end between the grant check and this install).
+/// That one is "grant near boundary" and may be retried by `retry_late_grant`.
+/// Every other error is a refusal and fatal at once: `Denied` (bad signature,
+/// identity mismatch, a stale `.stage`/`.poison`/`.active` sibling, a held
+/// lock, a sticky durable deny), `Replay` (counter/epoch rollback), `Invalid`,
+/// and `Expired` for a grant of the CURRENT epoch (expired or near its end).
+fn accept_first_grant(
+    key: &ed25519_dalek::VerifyingKey,
+    binding: Binding,
+    grant: &[u8],
+    at: u64,
+    path: std::path::PathBuf,
+) -> Result<ReceiverRuntime> {
+    match ReceiverRuntime::accept(key, binding, grant, at, 0, path) {
+        Ok(receiver) => Ok(receiver),
+        Err(conspect_media_crypto::Error::Expired)
+            if grant
+                .get(144..152)
+                .and_then(|b| b.try_into().ok())
+                .map(u64::from_be_bytes)
+                .is_some_and(|epoch| epoch < at / 5000) =>
+        {
+            Err("grant near boundary")
+        }
+        Err(_) => Err("signed independent binding"),
+    }
+}
+/// The startup publisher is built from the live current-epoch root. Like every
+/// later epoch's publisher, it is never requested in the epoch tail, and an
+/// answer that the boundary overtook (Expired, with the wall clock now in a
+/// later epoch) is asked for exactly once more. Any other provider error
+/// (refusal, equivocation, rollback, identity mismatch) stays fatal.
+fn startup_publisher(
+    mut build: impl FnMut(u64) -> std::result::Result<Publisher, conspect_media_crypto::Error>,
+) -> Result<Publisher> {
+    for attempt in 0..2 {
+        if now() % 5000 > 3500 {
+            std::thread::sleep(Duration::from_millis(5000 - now() % 5000));
+        }
+        let at = now();
+        match build(at) {
+            Ok(publisher) => return Ok(publisher),
+            Err(conspect_media_crypto::Error::Expired)
+                if attempt == 0 && now() / 5000 > at / 5000 => {}
+            Err(_) => return Err("authority publisher"),
+        }
+    }
+    Err("authority publisher")
+}
+/// The decoder-input rule, for every scenario: an EMPTY input (no accepted
+/// bytes for this taker/track in the window: parked objects that went stale, an
+/// authorization fence, a range cut at the epoch boundary) has nothing to
+/// decode and is skipped (`None`, counted by the caller). Any non-empty input
+/// is decoded and a decode failure is returned: a malformed stream always
+/// fails the run. A skip never emits a decoded observation or receipt, so a
+/// taker that silently has no media still fails `decode_evidence`.
+type Frames = Vec<conspect_native_exchange_runtime::media::DecodedFrame>;
+fn decoder_input(
+    bytes: &[u8],
+    decode: impl FnOnce(&[u8]) -> Result<Frames>,
+) -> Result<Option<Frames>> {
+    if bytes.is_empty() {
+        return Ok(None);
+    }
+    decode(bytes).map(Some)
+}
+/// Per-taker decode evidence at the end of a run. A skipped empty decoder input
+/// produces no decoded interval, so a taker that silently received no media
+/// for the whole run (or for every phase after A's boundary) fails here.
+fn decode_evidence(
+    scenario: &str,
+    intervals: &[[u64; 6]; 2],
+    b_at_expiry: &[u64; 6],
+) -> Result<()> {
+    if scenario == "credit-cutoff"
+        && intervals[1]
+            .iter()
+            .zip(b_at_expiry)
+            .any(|(after, before)| after <= before)
+    {
+        return Err("second receiver did not advance after paid expiry");
+    }
+    if scenario == "credit-cutoff" && intervals[0].iter().any(|n| *n < 2) {
+        return Err("paid-window six-track decode evidence missing");
+    }
+    if scenario != "withdraw" && intervals[1].iter().any(|n| *n < 4) {
+        return Err("second receiver did not continue");
+    }
+    Ok(())
 }
 fn raw(v: &Value) -> Result<[u8; 16]> {
     let s = v.as_str().ok_or("identity missing")?;
@@ -240,8 +400,12 @@ fn connected(
         return Err("credit-cutoff requires funded-expiry profile exclusively");
     }
     state.book(t)?;
+    let grant_deadline = startup_grant_deadline(state.booking_expiry()?, now());
     state.renew(t)?;
-    state.mint_mapping(t)?;
+    // A delayed answer here is as legitimate as one during media: without the
+    // retry a single late mapping grant, or a root answer overtaken by the
+    // epoch boundary, would end the run before A's paid boundary is probed.
+    retry_late_grant(grant_deadline, || state.mint_mapping(t))?;
     state.write_marker(Path::new(&a[3]))?;
     let marker_at = now();
     let expected = state.wait_expected(t, Path::new(&a[5]))?;
@@ -294,34 +458,36 @@ fn connected(
         } else {
             0
         });
-    let mut publisher = Publisher::from_authority(
-        provider.as_ref(),
-        &mut guard,
-        contributor,
-        b.version,
-        b.feed,
-        b.publisher,
-        publisher_instance,
-        now(),
-        Box::new(
-            DurableCounterJournal::open(&durable.join("nonces")).map_err(|_| "nonce journal")?,
-        ),
-    )
-    .map_err(|_| "authority publisher")?;
+    let mut publisher = startup_publisher(|at| {
+        Publisher::from_authority(
+            provider.as_ref(),
+            &mut guard,
+            contributor,
+            b.version,
+            b.feed,
+            b.publisher,
+            publisher_instance,
+            at,
+            Box::new(DurableCounterJournal::open(&durable.join("nonces"))?),
+        )
+    })?;
+    // The receivers' first grants get their own startup budget, under the same
+    // reserve before A's expires_at: the fragment handoff above may legitimately
+    // have used the mapping phase's budget already.
+    let grant_deadline = startup_grant_deadline(state.booking_expiry()?, now());
     let mut receivers = Vec::new();
     for (i, b) in bindings.iter().enumerate() {
-        let grant = state.grant(t, i)?;
-        receivers.push(
-            ReceiverRuntime::accept(
+        let receiver = retry_late_grant(grant_deadline, || {
+            let grant = state.grant(t, i)?;
+            accept_first_grant(
                 &key,
                 *b,
                 &grant,
                 now(),
-                0,
                 durable.join(format!("receiver-{i}")),
             )
-            .map_err(|_| "signed independent binding")?,
-        );
+        })?;
+        receivers.push(receiver);
     }
     let broadcast = moq_net::broadcast::Producer::new(Default::default());
     let consumer = broadcast.consume();
@@ -387,17 +553,18 @@ fn connected(
     );
 
     let mut received = vec![vec![Vec::new(); 6]; 2];
-    let mut intervals = [[0; 6]; 2];
+    let mut intervals = [[0u64; 6]; 2];
     let mut last_media = [[None; 6]; 2];
     let media_started = Instant::now();
     let mut exhausted = false;
     let mut cutoff = false;
     let mut cutoff_phase = 0;
-    let mut b_at_expiry = [0; 6];
+    let mut b_at_expiry = [0u64; 6];
     let mut cutoff_at = 0;
     let mut accepted = [0u64; 2];
     let mut late_drops = 0u64;
     let mut sealing_skipped = 0u64;
+    let mut empty_decode_skips = [0u64; 2];
     let mut parked: Vec<conspect_native_exchange_runtime::media::ParkQueue<Parked>> = (0..2)
         .map(|_| conspect_native_exchange_runtime::media::ParkQueue::new(256))
         .collect();
@@ -446,7 +613,8 @@ fn connected(
                     std::thread::sleep(Duration::from_millis(5000 - now() % 5000));
                 }
                 if publisher.bound_scope().epoch != now() / 5000 {
-                    publisher = Publisher::from_authority(
+                    let at = now();
+                    match Publisher::from_authority(
                         provider.as_ref(),
                         &mut guard,
                         contributor,
@@ -454,15 +622,22 @@ fn connected(
                         b.feed,
                         b.publisher,
                         publisher_instance,
-                        now(),
+                        at,
                         Box::new(
                             DurableCounterJournal::open(
-                                &durable.join(format!("nonces-{}", now() / 5000)),
+                                &durable.join(format!("nonces-{}", at / 5000)),
                             )
                             .map_err(|_| "epoch journal")?,
                         ),
-                    )
-                    .map_err(|_| "epoch authority publisher")?;
+                    ) {
+                        Ok(next) => publisher = next,
+                        // The boundary overtook the root answer in transit: the
+                        // bounded admission cycle asks again in the new epoch.
+                        Err(conspect_media_crypto::Error::Expired) if now() / 5000 > at / 5000 => {
+                            continue;
+                        }
+                        Err(_) => return Err("epoch authority publisher"),
+                    }
                     captured = now();
                 }
                 // The independent bounded grant worker installs the current epoch before media resumes.
@@ -510,7 +685,10 @@ fn connected(
                 split..f.packets.len()
             };
             for n in range {
-                if scenario == "credit-cutoff" && publisher.bound_scope().epoch != now() / 5000 {
+                // One wall sample decides the epoch check AND the seal, so a
+                // boundary cannot fall between them.
+                let seal_at = now();
+                if scenario == "credit-cutoff" && publisher.bound_scope().epoch != seal_at / 5000 {
                     // The range outlasted its epoch on a loaded host: never seal across
                     // the boundary. The next phase re-admits into the new epoch.
                     sealing_skipped += 1;
@@ -522,7 +700,7 @@ fn connected(
                     &f.name,
                     n as u64 * 20_000,
                     captured,
-                    now(),
+                    seal_at,
                     Bytes::copy_from_slice(&f.packets[n]),
                 )
                 .map_err(|_| "seal lease/epoch")?;
@@ -626,7 +804,13 @@ fn connected(
                         continue;
                     }
                 }
-                for decoded in decode(dir, f, i, &received[i][track])? {
+                let Some(frames) =
+                    decoder_input(&received[i][track], |bytes| decode(dir, f, i, bytes))?
+                else {
+                    empty_decode_skips[i] += 1;
+                    continue;
+                };
+                for decoded in frames {
                     let pts = decoded.pts_ms;
                     if last_media[i][track].is_some_and(|old| captured + pts <= old) {
                         continue;
@@ -774,6 +958,12 @@ fn connected(
             match scenario {
                 "release" => state.booking_release(t, 0)?,
                 "withdraw" => {
+                    // A withdrawal cuts off BOTH takers and the publisher. Stop
+                    // both grant workers and wait out a cycle in flight first:
+                    // otherwise a worker that started its cycle earlier still
+                    // fetches a root after the withdrawal was acknowledged.
+                    control.quiesce(0);
+                    control.quiesce(1);
                     state.withdraw(t, m["scenario"]["storyId"].as_str().ok_or("storyId")?)?;
                     cutoff_at = now();
                 }
@@ -819,19 +1009,18 @@ fn connected(
     if !cutoff {
         return Err("decoded receipt exhaustion timeout");
     }
-    if scenario == "credit-cutoff"
-        && intervals[1]
-            .iter()
-            .zip(b_at_expiry)
-            .any(|(after, before)| *after <= before)
-    {
-        return Err("second receiver did not advance after paid expiry");
-    }
-    if scenario == "credit-cutoff" && intervals[0].iter().any(|n| *n < 2) {
-        return Err("paid-window six-track decode evidence missing");
-    }
-    if scenario != "withdraw" && intervals[1].iter().any(|n| *n < 4) {
-        return Err("second receiver did not continue");
+    // Skipped empty decoder inputs are counted and reported for every scenario.
+    println!(
+        "decoder input report: empty_inputs_skipped A={} B={}",
+        empty_decode_skips[0], empty_decode_skips[1]
+    );
+    if let Err(e) = decode_evidence(scenario, &intervals, &b_at_expiry) {
+        // Counts only (no ids, keys or media): why the evidence is missing.
+        eprintln!(
+            "decode evidence: intervals A={:?} B={:?} B_at_expiry={b_at_expiry:?} empty={empty_decode_skips:?} late_drops={late_drops} ranges_cut={sealing_skipped} B_parked={} B_stale={} B_drained={} B_overflow={}",
+            intervals[0], intervals[1], parked[1].parked_total, parked[1].stale, parked[1].drained, parked[1].dropped
+        );
+        return Err(e);
     }
     if scenario == "withdraw" {
         // Terminal publisher cutoff: the next renew must be refused with exactly
@@ -871,10 +1060,391 @@ fn connected(
             accepted[1]
         );
         println!(
-            "credit-cutoff B late-grant report: parked={} dropped_on_overflow={} stale={} drained={} decoded_frames_dropped_at_boundary={late_drops} ranges_cut_at_epoch_boundary={sealing_skipped}",
-            parked[1].parked_total, parked[1].dropped, parked[1].stale, parked[1].drained
+            "credit-cutoff B late-grant report: parked={} dropped_on_overflow={} stale={} drained={} decoded_frames_dropped_at_boundary={late_drops} ranges_cut_at_epoch_boundary={sealing_skipped} empty_decode_skips={}",
+            parked[1].parked_total, parked[1].dropped, parked[1].stale, parked[1].drained, empty_decode_skips[1]
         );
     }
     println!("connected HTTPS authority / HEVC + five AAC / two takers / TCP CPU observer passed; not QUIC/device");
     Ok(())
+}
+
+#[cfg(test)]
+mod startup_grant_tests {
+    use super::*;
+    #[test]
+    fn shared_deadline_reserves_the_paid_boundary_in_every_fixture() {
+        for window in [4_000, 10_000, 30_000] {
+            let booked_at = 100_000;
+            let expiry = booked_at + window;
+            let deadline = startup_grant_deadline(expiry, booked_at);
+            // The last retry starts before the deadline and ends before expiry.
+            assert!(deadline + ATTEMPT_MAX_MS < expiry, "window {window}");
+            assert_eq!(deadline, booked_at + 3_000.min(window - 3_000));
+        }
+        assert_eq!(startup_grant_deadline(110_000, 109_000), 107_000);
+    }
+    #[test]
+    fn first_attempt_runs_even_after_the_deadline() {
+        let mut calls = 0;
+        let r: Result<()> = retry_late_grant(0, || {
+            calls += 1;
+            Err("grant transport")
+        });
+        assert_eq!((r, calls), (Err("grant transport"), 1));
+    }
+    #[test]
+    fn timing_failures_are_retried_and_refusals_are_not() {
+        for timing in [
+            "grant transport",
+            "mapping grant transport",
+            "grant near boundary",
+        ] {
+            let mut calls = 0;
+            let r = retry_late_grant(now() + 60_000, || {
+                calls += 1;
+                if calls < 3 {
+                    Err(timing)
+                } else {
+                    Ok(calls)
+                }
+            });
+            assert_eq!(r, Ok(3), "{timing}");
+        }
+        for refusal in [
+            "mapping grant rejected",
+            "grant denied",
+            "canonical root rejected",
+            "lease expired",
+            "booking expired",
+            "signed independent binding",
+            "grant metadata rejected",
+        ] {
+            let mut calls = 0;
+            let r: Result<()> = retry_late_grant(now() + 60_000, || {
+                calls += 1;
+                Err(refusal)
+            });
+            assert_eq!((r, calls), (Err(refusal), 1), "{refusal}");
+        }
+    }
+    #[test]
+    fn root_overtaken_in_transit_is_retried_exactly_once() {
+        let mut calls = 0;
+        let r: Result<()> = retry_late_grant(now() + 60_000, || {
+            calls += 1;
+            Err(ROOT_EXPIRED_IN_TRANSIT)
+        });
+        assert_eq!((r, calls), (Err(ROOT_EXPIRED_IN_TRANSIT), 2));
+    }
+    struct Counter(u64);
+    impl conspect_media_crypto::CounterReservation for Counter {
+        fn reserve(
+            &mut self,
+            _: [u8; 16],
+            _: u64,
+            _: [u8; 16],
+            _: u32,
+        ) -> conspect_media_crypto::Result<u64> {
+            self.0 += 1;
+            Ok(self.0)
+        }
+    }
+    fn test_binding() -> Binding {
+        Binding {
+            booking: [1; 16],
+            taker: [2; 16],
+            feed: [9; 16],
+            version: [3; 16],
+            engine: [4; 16],
+            publisher: [5; 16],
+            generation: 0,
+            publisher_generation: 11,
+        }
+    }
+    /// A real MG02 grant signed for the epoch that holds `issued`.
+    fn signed_grant(signer: &ed25519_dalek::SigningKey, b: Binding, issued: u64) -> Vec<u8> {
+        signed_grant_until(signer, b, issued, (issued / 5000 + 1) * 5000)
+    }
+    fn signed_grant_until(
+        signer: &ed25519_dalek::SigningKey,
+        b: Binding,
+        issued: u64,
+        expires: u64,
+    ) -> Vec<u8> {
+        let mut publisher = Publisher::new(
+            b.feed,
+            b.version,
+            b.publisher,
+            b.publisher_generation,
+            issued,
+            Box::new(Counter(0)),
+        )
+        .unwrap();
+        publisher.grant(signer, b, true, expires, issued).unwrap()
+    }
+    /// Review finding 1 of PR #312, through the REAL `ReceiverRuntime::accept`:
+    /// a refusal from accept is never retried. Only a grant whose epoch is over
+    /// at install time is timing ("grant near boundary").
+    #[test]
+    fn first_grant_accept_refusals_are_not_retried() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let signer = ed25519_dalek::SigningKey::from_bytes(&[42; 32]);
+        let key = signer.verifying_key();
+        let b = test_binding();
+        let issued = 100_000; // epoch 20 = [100 000, 105 000)
+        let grant = signed_grant(&signer, b, issued);
+        let attempt = |path: &str, key: &ed25519_dalek::VerifyingKey, b: Binding, at: u64| {
+            let mut calls = 0;
+            let r = retry_late_grant(now() + 60_000, || {
+                calls += 1;
+                accept_first_grant(key, b, &grant, at, dir.path().join(path)).map(|_| ())
+            });
+            (r, calls)
+        };
+        // Wrong verifying key (signature): Denied -> fatal, once.
+        let other = ed25519_dalek::SigningKey::from_bytes(&[7; 32]).verifying_key();
+        assert_eq!(
+            attempt("sig", &other, b, issued + 10),
+            (Err("signed independent binding"), 1)
+        );
+        // Identity mismatch: Denied -> fatal, once.
+        let mut wrong = b;
+        wrong.taker = [8; 16];
+        assert_eq!(
+            attempt("identity", &key, wrong, issued + 10),
+            (Err("signed independent binding"), 1)
+        );
+        // A stale crash sibling (.poison) next to the receiver state: Denied.
+        std::fs::write(dir.path().join("poisoned.poison"), b"").unwrap();
+        assert_eq!(
+            attempt("poisoned", &key, b, issued + 10),
+            (Err("signed independent binding"), 1)
+        );
+        // A sticky durable deny from an earlier run: Denied, never re-granted.
+        {
+            let mut r =
+                ReceiverRuntime::accept(&key, b, &grant, issued + 10, 0, dir.path().join("sticky"))
+                    .unwrap();
+            r.deny(&mut Output::default()).unwrap();
+        }
+        assert_eq!(
+            attempt("sticky", &key, b, issued + 10),
+            (Err("signed independent binding"), 1)
+        );
+        // A receiver whose durable epoch is ahead of the grant: Replay.
+        drop(
+            ReceiverRuntime::accept(
+                &key,
+                b,
+                &signed_grant(&signer, b, 105_000),
+                105_010,
+                0,
+                dir.path().join("rollback"),
+            )
+            .unwrap(),
+        );
+        assert_eq!(
+            attempt("rollback", &key, b, issued + 10),
+            (Err("signed independent binding"), 1)
+        );
+        // Expired, but in the CURRENT epoch (a grant that expires inside its
+        // epoch, installed after that expiry): not an epoch crossing, fatal.
+        let short = signed_grant_until(&signer, b, issued, issued + 1_000);
+        let mut calls = 0;
+        let r = retry_late_grant(now() + 60_000, || {
+            calls += 1;
+            accept_first_grant(&key, b, &short, issued + 2_000, dir.path().join("short"))
+                .map(|_| ())
+        });
+        assert_eq!((r, calls), (Err("signed independent binding"), 1));
+        // The one timing case: the grant's epoch ended before the install.
+        // Retried, each retry a new request (here: the same answer again, so
+        // it stays timing until the deadline). With a passed deadline: once.
+        let mut calls = 0;
+        let r = retry_late_grant(0, || {
+            calls += 1;
+            accept_first_grant(&key, b, &grant, 105_010, dir.path().join("late")).map(|_| ())
+        });
+        assert_eq!((r, calls), (Err("grant near boundary"), 1));
+        let mut calls = 0;
+        let r = retry_late_grant(now() + 60_000, || {
+            calls += 1;
+            let at = if calls == 1 { 105_010 } else { issued + 10 };
+            accept_first_grant(&key, b, &grant, at, dir.path().join("late")).map(|_| ())
+        });
+        assert_eq!((r, calls), (Ok(()), 2));
+    }
+    /// D2, deterministically and below the scenario: a taker whose parked
+    /// objects for a track ALL went stale ends the phase with zero accepted
+    /// bytes. The production drain (`drain_parked`) drops them as stale, the
+    /// decoder-input rule skips the empty buffer, and the real decoder is
+    /// never handed it. Handing it over is exactly what aborted the run before
+    /// the fix: FFmpeg rejects an empty input ("FFmpeg command failed").
+    #[test]
+    fn all_stale_parked_objects_give_an_empty_input_that_is_skipped_not_decoded() {
+        use conspect_native_exchange_runtime::media::{Fixture, ParkQueue};
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let signer = ed25519_dalek::SigningKey::from_bytes(&[42; 32]);
+        let b = test_binding();
+        // Objects sealed in epoch 20 while the grant for 20 was not accepted.
+        let mut publisher = Publisher::new(
+            b.feed,
+            b.version,
+            b.publisher,
+            b.publisher_generation,
+            100_000,
+            Box::new(Counter(0)),
+        )
+        .unwrap();
+        let mut queue = ParkQueue::new(256);
+        for n in 0..5u64 {
+            let id = conspect_media_crypto::ObjectId {
+                track: "video".into(),
+                group: n,
+                object: 0,
+                captured_ms: 100_050,
+            };
+            let wire = publisher.encrypt(&id, 100_100 + n, b"access unit").unwrap();
+            queue.park(Parked {
+                wire,
+                id,
+                track: 0,
+                n,
+            });
+        }
+        // The receiver's next accepted grant is for epoch 21: every parked
+        // epoch-20 object is behind it and can never open.
+        let receiver = ReceiverRuntime::accept(
+            &signer.verifying_key(),
+            b,
+            &signed_grant(&signer, b, 105_000),
+            105_010,
+            0,
+            dir.path().join("receiver"),
+        )
+        .unwrap();
+        let slot = Mutex::new((receiver, Output::default()));
+        let mut received = vec![Vec::new(); 6];
+        drain_parked(&slot, &mut queue, &mut received).unwrap();
+        assert_eq!((queue.stale, queue.drained, queue.len()), (5, 0, 0));
+        assert!(received[0].is_empty(), "no accepted bytes for the track");
+        let fixture = Fixture {
+            name: "video".into(),
+            format: "hevc",
+            packets: vec![],
+        };
+        // The cause: the real decoder fails on that empty input.
+        assert_eq!(
+            decode(dir.path(), &fixture, 1, &received[0]).unwrap_err(),
+            "FFmpeg command failed"
+        );
+        // The rule: the empty input is skipped and the decoder is not called.
+        let mut called = false;
+        let skipped = decoder_input(&received[0], |bytes| {
+            called = true;
+            decode(dir.path(), &fixture, 1, bytes)
+        })
+        .unwrap();
+        assert!(skipped.is_none() && !called);
+    }
+    /// Review finding 3 of PR #312: the single root retry is not skipped once
+    /// the startup deadline has passed (it is bounded by being single).
+    #[test]
+    fn root_retry_runs_once_even_after_the_deadline() {
+        let mut calls = 0;
+        let r: Result<u32> = retry_late_grant(0, || {
+            calls += 1;
+            if calls == 1 {
+                Err(ROOT_EXPIRED_IN_TRANSIT)
+            } else {
+                Ok(calls)
+            }
+        });
+        assert_eq!(r, Ok(2));
+        let mut calls = 0;
+        let r: Result<()> = retry_late_grant(0, || {
+            calls += 1;
+            Err(ROOT_EXPIRED_IN_TRANSIT)
+        });
+        assert_eq!((r, calls), (Err(ROOT_EXPIRED_IN_TRANSIT), 2));
+    }
+    #[test]
+    fn startup_publisher_retries_only_a_boundary_crossing_expiry() {
+        use conspect_media_crypto::Error;
+        let fatal: [fn() -> Error; 4] = [
+            || Error::Denied,
+            || Error::Replay,
+            || Error::Invalid,
+            || Error::Crypto,
+        ];
+        for (n, e) in fatal.iter().enumerate() {
+            let mut calls = 0;
+            assert!(startup_publisher(|_| {
+                calls += 1;
+                Err(e())
+            })
+            .is_err());
+            assert_eq!(calls, 1, "fatal error #{n}");
+        }
+        // Expired without an epoch crossing (a wrong-epoch answer): fatal, once.
+        let mut calls = 0;
+        assert!(startup_publisher(|_| {
+            calls += 1;
+            Err(Error::Expired)
+        })
+        .is_err());
+        assert_eq!(calls, 1);
+    }
+    #[test]
+    fn decoder_input_rule() {
+        use conspect_native_exchange_runtime::media::{decode, Fixture};
+        let dir = tempfile::tempdir().unwrap();
+        let f = Fixture {
+            name: "garbage".into(),
+            format: "hevc",
+            packets: vec![],
+        };
+        // Empty: skipped, decoder never invoked.
+        assert!(matches!(
+            decoder_input(&[], |_| panic!("decoder ran on empty input")),
+            Ok(None)
+        ));
+        // Any non-empty malformed input is a hard failure, however small.
+        for len in [1usize, 64, 4096] {
+            assert_eq!(
+                decoder_input(&vec![0x5a; len], |b| decode(dir.path(), &f, 1, b)).unwrap_err(),
+                "FFmpeg command failed"
+            );
+        }
+        // A decoder error is propagated unchanged.
+        assert_eq!(
+            decoder_input(&[1], |_| Err("insufficient advancing decoded frames")).unwrap_err(),
+            "insufficient advancing decoded frames"
+        );
+    }
+    #[test]
+    fn a_taker_without_media_fails_the_run_evidence() {
+        let full = [[5u64; 6]; 2];
+        assert_eq!(decode_evidence("credit-cutoff", &full, &[1; 6]), Ok(()));
+        assert_eq!(decode_evidence("release", &full, &[0; 6]), Ok(()));
+        // B silently skipped every input: no interval at all.
+        let no_b = [[5; 6], [0; 6]];
+        assert!(decode_evidence("credit-cutoff", &no_b, &[0; 6]).is_err());
+        assert!(decode_evidence("release", &no_b, &[0; 6]).is_err());
+        // A silently skipped every input in its paid window.
+        let no_a = [[0; 6], [5; 6]];
+        assert_eq!(
+            decode_evidence("credit-cutoff", &no_a, &[1; 6]),
+            Err("paid-window six-track decode evidence missing")
+        );
+        // B decoded before A's boundary but nothing after it.
+        assert_eq!(
+            decode_evidence("credit-cutoff", &full, &[5; 6]),
+            Err("second receiver did not advance after paid expiry")
+        );
+    }
 }
