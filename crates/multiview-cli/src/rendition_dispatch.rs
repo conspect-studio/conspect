@@ -418,6 +418,30 @@ struct AudioMove {
     key: Option<usize>,
     generation: u64,
     at: i64,
+    /// The pending video move `(key, generation)` this audio move follows:
+    /// it lands only in (or after) the window that video move is applied
+    /// in, and is dropped (`AudioRefused`) when that move is refused or
+    /// superseded. `None` = unconditional.
+    after_video: Option<(usize, u64)>,
+}
+
+/// Drop an audio move whose video move is no longer pending (refused,
+/// superseded or cancelled before it was applied): the output's audio never
+/// switches without its video.
+fn drop_orphan_audio_move(b: &mut BindingState, outcomes: &mut VecDeque<MoveOutcome>) {
+    let Some(gate) = b.audio_mv.and_then(|m| m.after_video) else {
+        return;
+    };
+    if b.mv.is_some_and(|m| (m.key, m.generation) == gate) {
+        return;
+    }
+    b.audio_mv = None;
+    push_outcome(
+        outcomes,
+        MoveOutcome::AudioRefused {
+            output_index: b.output_index,
+        },
+    );
 }
 
 struct BindingState {
@@ -462,7 +486,9 @@ fn compose_audio(
     mv_index: Option<i128>,
     base: Vec<EncodedPacket>,
 ) -> Result<Vec<EncodedPacket>, DispatchError> {
-    let mv = b.audio_mv.filter(|_| mv_index.is_some());
+    let mv = b
+        .audio_mv
+        .filter(|m| mv_index.is_some() && m.after_video.is_none());
     if b.audio_key.is_none() && mv.is_none() {
         return Ok(base);
     }
@@ -1085,6 +1111,13 @@ impl RenditionDispatcher {
             }
         }
     }
+    /// Audio moves whose video move is gone are dropped (see
+    /// [`drop_orphan_audio_move`]).
+    fn reconcile_audio_gates(&mut self) {
+        for b in &mut self.bindings {
+            drop_orphan_audio_move(b, &mut self.outcomes);
+        }
+    }
     fn base_stale(&self, now: Instant) -> bool {
         self.video
             .iter()
@@ -1103,6 +1136,7 @@ impl RenditionDispatcher {
         self.fail_stale_dynamic(now);
         self.reconcile();
         self.reconcile_audio();
+        self.reconcile_audio_gates();
         let early = self.pump(now, delivery)?;
         let result = self.drain_base(now, delivery);
         self.prune_dynamic();
@@ -1316,6 +1350,13 @@ impl RenditionDispatcher {
                                     signal_sets_change(delivery, b.output_index, b.inband_ok);
                                 }
                                 b.video_key = Some(m.key);
+                                // An audio move following this video move
+                                // lands in this window (or at its G, later).
+                                if let Some(am) = b.audio_mv.as_mut() {
+                                    if am.after_video == Some((m.key, m.generation)) {
+                                        am.after_video = None;
+                                    }
+                                }
                                 push_outcome(
                                     &mut self.outcomes,
                                     MoveOutcome::Applied {
@@ -1440,6 +1481,7 @@ impl RenditionDispatcher {
                     }
                 }
             }
+            drop_orphan_audio_move(b, &mut self.outcomes);
             let mut audio = compose_audio(
                 b,
                 &self.dyn_audio,
@@ -1766,6 +1808,7 @@ impl RenditionDispatcher {
                 );
             }
         }
+        self.reconcile_audio_gates();
         if let Some(stage) = self.video.get_mut(key) {
             let dropped: usize = stage.windows.iter().map(|w| w.packets.len()).sum();
             stage.clear();
@@ -1873,6 +1916,7 @@ impl RenditionDispatcher {
                 forced,
             });
         }
+        self.reconcile_audio_gates();
         Ok(())
     }
     /// Install the parameter-set extractor of a base or live key (used to
@@ -1970,14 +2014,26 @@ impl RenditionDispatcher {
     /// in the window holding G, packets with DTS < G come from the old
     /// source and packets from G from the new one. Latest wins.
     ///
+    /// With `after_video = Some(k)`, the move follows the output's video move
+    /// to key `k`. When that move is pending, the audio move
+    /// (ADR-0108 §5.2: audio moves in the same take as its video) lands
+    /// only once that video move is applied (in that window, from `G`; or
+    /// from the window start when the video was applied after `G`'s window),
+    /// and is dropped with [`MoveOutcome::AudioRefused`] when the video move
+    /// is refused or superseded first; when the output already reads `k` (the
+    /// video move was applied at once) it is unconditional. The output's
+    /// audio never switches while its video stays.
+    ///
     /// # Errors
     /// `InvalidConfig` for an unknown output, an output without program
-    /// audio, or an unknown/retired/failed key.
+    /// audio, an unknown/retired/failed key, or `after_video` naming a video
+    /// move that is neither pending nor applied (it was refused).
     pub(crate) fn rebind_audio(
         &mut self,
         output_index: usize,
         key: Option<usize>,
         at: i64,
+        after_video: Option<usize>,
     ) -> Result<(), DispatchError> {
         let generation = key
             .and_then(|k| self.dyn_audio.get(k))
@@ -1990,6 +2046,14 @@ impl RenditionDispatcher {
             .iter_mut()
             .find(|b| b.output_index == output_index && b.audio_tracks.contains(&0))
             .ok_or(DispatchError::InvalidConfig)?;
+        let gate = match after_video {
+            None => None,
+            Some(k) => match b.mv {
+                Some(m) if m.key == k => Some((m.key, m.generation)),
+                _ if b.video_key == Some(k) => None,
+                _ => return Err(DispatchError::InvalidConfig),
+            },
+        };
         if b.audio_mv.is_none() && b.audio_key == key {
             return Ok(());
         }
@@ -1997,6 +2061,7 @@ impl RenditionDispatcher {
             key,
             generation,
             at,
+            after_video: gate,
         });
         // A destination that never proves a window must not hold this
         // output forever: its staging watchdog starts now (it then fails
@@ -2012,11 +2077,18 @@ impl RenditionDispatcher {
     /// then commit every ready window exactly as [`Self::dispatch`] does. A
     /// fault in the stage fails that stage alone, never the run.
     ///
+    /// `generation` is the one [`Self::add_audio_key`] returned for the
+    /// emitting bus: an emission whose generation is not the slot's current
+    /// one (a late packet of a closed bus landing on a reused slot) is
+    /// dropped and counted, never staged.
+    ///
     /// # Errors
     /// Only what [`Self::dispatch`]'s drain returns for the base windows.
+    #[allow(clippy::too_many_arguments)] // reason: key + generation identify the stage; the rest mirrors dispatch.
     pub(crate) fn dispatch_dynamic_audio<D: WindowDelivery>(
         &mut self,
         key: usize,
+        generation: u64,
         packets: Vec<EncodedPacket>,
         watermark: Option<DtsWatermark>,
         finish: bool,
@@ -2033,7 +2105,7 @@ impl RenditionDispatcher {
         let Some(a) = self.dyn_audio.get_mut(key) else {
             return Err(DispatchError::InvalidEvent);
         };
-        if a.retired || a.failed {
+        if a.retired || a.failed || a.generation != generation {
             self.counters.dropped_unbound = self.counters.dropped_unbound.saturating_add(1);
         } else {
             let stage = &mut a.stage;
@@ -3878,7 +3950,7 @@ mod tests {
         let mut d =
             RenditionDispatcher::new(aac_cfg(vec![binding(0, 0, 1), binding(1, 0, 1)])).unwrap();
         let mut sink = FakeDelivery::new(2);
-        let (key, _) = d.add_audio_key().unwrap();
+        let (key, key_gen) = d.add_audio_key().unwrap();
         // G inside window 5 (9600..11520): 10240.
         let g = 10_240;
         let mut seen = [Vec::new(), Vec::new()];
@@ -3886,11 +3958,19 @@ mod tests {
             // The private bus runs from window 2 on, carrying its own tag.
             if i >= 2 {
                 let p: Vec<_> = frames_in(i).into_iter().map(|x| tagged(x, 2)).collect();
-                d.dispatch_dynamic_audio(key, p, Some(mark(tick_ns(i + 1))), false, now, &mut sink)
-                    .unwrap();
+                d.dispatch_dynamic_audio(
+                    key,
+                    key_gen,
+                    p,
+                    Some(mark(tick_ns(i + 1))),
+                    false,
+                    now,
+                    &mut sink,
+                )
+                .unwrap();
             }
             if i == 3 {
-                d.rebind_audio(1, Some(key), g).unwrap();
+                d.rebind_audio(1, Some(key), g, None).unwrap();
             }
             d.dispatch(ve25(i), now, &mut sink).unwrap();
             d.dispatch(audio_event(i, 1), now, &mut sink).unwrap();
@@ -3921,10 +4001,11 @@ mod tests {
         let mut d =
             RenditionDispatcher::new(aac_cfg(vec![binding(0, 0, 1), binding(1, 0, 1)])).unwrap();
         let mut sink = FakeDelivery::new(2);
-        let (key, _) = d.add_audio_key().unwrap();
+        let (key, key_gen) = d.add_audio_key().unwrap();
         // The private stage proves window 0 and then wedges.
         d.dispatch_dynamic_audio(
             key,
+            key_gen,
             vec![tagged(0, 2)],
             Some(mark(tick_ns(1))),
             false,
@@ -3932,7 +4013,7 @@ mod tests {
             &mut sink,
         )
         .unwrap();
-        d.rebind_audio(1, Some(key), 1024).unwrap();
+        d.rebind_audio(1, Some(key), 1024, None).unwrap();
         let mut seen = [Vec::new(), Vec::new()];
         for i in 0..12_i64 {
             d.dispatch(ve25(i), now, &mut sink).unwrap();
@@ -3962,10 +4043,257 @@ mod tests {
         assert!(!sink.aborted);
         // Watchdog: a stage that never proves a window fails within 2 s.
         let (k2, _) = d.add_audio_key().unwrap();
-        d.rebind_audio(0, Some(k2), 30_720).unwrap();
+        d.rebind_audio(0, Some(k2), 30_720, None).unwrap();
         d.watchdog(now + STAGE_DEADLINE + Duration::from_millis(10), &mut sink)
             .unwrap();
         assert!(d.is_audio_key_failed(k2));
+    }
+
+    /// A1: a late emission of a closed private bus must never land on the
+    /// slot's next tenant. The emission carries the generation it was opened
+    /// with; on a reused slot it is dropped and counted, never staged.
+    #[test]
+    fn a_stale_generation_audio_emission_is_dropped_on_a_reused_slot() {
+        let mut d =
+            RenditionDispatcher::new(aac_cfg(vec![binding(0, 0, 1), binding(1, 0, 1)])).unwrap();
+        let mut sink = FakeDelivery::new(2);
+        let (old, old_gen) = d.add_audio_key().unwrap();
+        d.retire_audio_key(old).unwrap();
+        let (key, key_gen) = d.add_audio_key().unwrap();
+        assert_eq!(key, old, "the slot is reused");
+        assert_ne!(key_gen, old_gen);
+        let g = 1024;
+        d.rebind_audio(1, Some(key), g, None).unwrap();
+        // After the rebind: its staging watchdog starts at the rebind.
+        let now = Instant::now();
+        let before = d.counters().dropped_unbound;
+        let mut seen = Vec::new();
+        for i in 0..6_i64 {
+            // The closed bus's late packets (tag 9) arrive first, under the
+            // old generation, for the same windows.
+            let late: Vec<_> = frames_in(i).into_iter().map(|x| tagged(x, 9)).collect();
+            d.dispatch_dynamic_audio(
+                key,
+                old_gen,
+                late,
+                Some(mark(tick_ns(i + 1))),
+                false,
+                now,
+                &mut sink,
+            )
+            .unwrap();
+            let p: Vec<_> = frames_in(i).into_iter().map(|x| tagged(x, 2)).collect();
+            d.dispatch_dynamic_audio(
+                key,
+                key_gen,
+                p,
+                Some(mark(tick_ns(i + 1))),
+                false,
+                now,
+                &mut sink,
+            )
+            .unwrap();
+            d.dispatch(ve25(i), now, &mut sink).unwrap();
+            d.dispatch(audio_event(i, 1), now, &mut sink).unwrap();
+            seen.extend(audio_of(&mut sink, 1, now));
+        }
+        let all: Vec<i64> = (0..6).flat_map(frames_in).collect();
+        assert_eq!(seen.iter().map(|p| p.0).collect::<Vec<_>>(), all);
+        for &(dts, tag) in &seen {
+            assert_eq!(tag, if dts < g { 1 } else { 2 }, "dts {dts}");
+        }
+        assert_eq!(
+            d.counters().dropped_unbound,
+            before + 6,
+            "each stale emission counted"
+        );
+        assert!(!d.is_audio_key_failed(key));
+    }
+
+    /// B2 harness: output 1 moves its video to a dynamic key `k` at window 3
+    /// (gate passes on a 77-byte RAP from window `rap_from`, never if `None`)
+    /// and its audio follows to a private stage at G = 10 240 (window 5).
+    /// `supersede_at`: re-assert the current video key in that window. Returns
+    /// output 1's (dts, tag) audio and the outcomes.
+    fn follow_scenario(
+        rap_from: Option<i64>,
+        supersede_at: Option<i64>,
+    ) -> (Vec<(i64, u8)>, Vec<MoveOutcome>, usize) {
+        let mut d =
+            RenditionDispatcher::new(aac_cfg(vec![binding(0, 0, 1), binding(1, 0, 1)])).unwrap();
+        let mut sink = FakeDelivery::new(2);
+        let k = d
+            .add_video_key(DtsTimeBase { num: 1, den: 25 }, gate())
+            .unwrap();
+        let (akey, akey_gen) = d.add_audio_key().unwrap();
+        let g = 10_240;
+        d.rebind_video(1, k, 3, 2).unwrap();
+        d.rebind_audio(1, Some(akey), g, Some(k)).unwrap();
+        let now = Instant::now();
+        let mut seen = Vec::new();
+        for i in 0..10_i64 {
+            if supersede_at == Some(i) {
+                d.rebind_video(1, 0, u64::try_from(i).unwrap(), 1).unwrap();
+            }
+            let pk = if rap_from.is_some_and(|r| i >= r) {
+                rap77(i)
+            } else {
+                video(i, 8, false)
+            };
+            d.dispatch(
+                DispatchEvent::Video {
+                    key_index: k,
+                    tick: u64::try_from(i).unwrap(),
+                    timebase: Rational::new(1, 25),
+                    packets: vec![pk],
+                    watermark: Some(mark(tick_ns(i + 1))),
+                },
+                now,
+                &mut sink,
+            )
+            .unwrap();
+            let p: Vec<_> = frames_in(i).into_iter().map(|x| tagged(x, 2)).collect();
+            d.dispatch_dynamic_audio(
+                akey,
+                akey_gen,
+                p,
+                Some(mark(tick_ns(i + 1))),
+                false,
+                now,
+                &mut sink,
+            )
+            .unwrap();
+            d.dispatch(ve25(i), now, &mut sink).unwrap();
+            d.dispatch(audio_event(i, 1), now, &mut sink).unwrap();
+            seen.extend(audio_of(&mut sink, 1, now));
+            let _ = audio_of(&mut sink, 0, now);
+        }
+        let all: Vec<i64> = (0..10).flat_map(frames_in).collect();
+        assert_eq!(
+            seen.iter().map(|p| p.0).collect::<Vec<_>>(),
+            all,
+            "no gap, no duplicate"
+        );
+        assert!(!sink.aborted);
+        (
+            seen,
+            d.take_move_outcomes(),
+            d.binding_video_key(1).unwrap(),
+        )
+    }
+
+    /// B2: the video move is refused (no RAP within its windows) before the
+    /// audio window of G: the audio move is dropped with it, the output's
+    /// audio never leaves the program stage.
+    #[test]
+    fn a_refused_video_move_drops_its_audio_move() {
+        let (seen, outcomes, video) = follow_scenario(None, None);
+        assert_eq!(video, 0, "the video stayed");
+        assert!(seen.iter().all(|p| p.1 == 1), "the audio stayed: {seen:?}");
+        assert!(outcomes.contains(&MoveOutcome::AudioRefused { output_index: 1 }));
+        assert!(!outcomes
+            .iter()
+            .any(|o| matches!(o, MoveOutcome::AudioApplied { .. })));
+    }
+
+    /// B2: the take is superseded (the move cancelled) before it is applied:
+    /// the audio move is dropped too.
+    #[test]
+    fn a_superseded_video_move_drops_its_audio_move() {
+        let (seen, outcomes, video) = follow_scenario(Some(4), Some(2));
+        assert_eq!(video, 0, "the video stayed");
+        assert!(seen.iter().all(|p| p.1 == 1), "the audio stayed: {seen:?}");
+        assert!(outcomes.contains(&MoveOutcome::Superseded { output_index: 1 }));
+        assert!(outcomes.contains(&MoveOutcome::AudioRefused { output_index: 1 }));
+    }
+
+    /// B2: the applied path is unchanged: video applied in window 4 (before
+    /// G's window 5), audio switches exactly at G.
+    #[test]
+    fn an_applied_video_move_lands_its_audio_move_at_g() {
+        let (seen, outcomes, video) = follow_scenario(Some(4), None);
+        assert_ne!(video, 0, "the video moved");
+        for &(dts, tag) in &seen {
+            assert_eq!(tag, if dts < 10_240 { 1 } else { 2 }, "dts {dts}");
+        }
+        assert!(outcomes.iter().any(|o| matches!(
+            o,
+            MoveOutcome::AudioApplied {
+                output_index: 1,
+                from_dts: 10_240,
+                ..
+            }
+        )));
+    }
+
+    /// A2: an audio move whose G lies three windows ahead never holds the
+    /// windows before G's window: they take all their audio from the old
+    /// stage (DTS < G), so each is delivered as its base window closes, even
+    /// while the destination stage has proven nothing yet.
+    #[test]
+    fn a_future_audio_move_never_holds_the_windows_before_its_g() {
+        let mut d =
+            RenditionDispatcher::new(aac_cfg(vec![binding(0, 0, 1), binding(1, 0, 1)])).unwrap();
+        let mut sink = FakeDelivery::new(2);
+        let (key, key_gen) = d.add_audio_key().unwrap();
+        // G = 9 216 is in window 4 (7 680..9 600); issued in window 1.
+        let g = 9_216;
+        let mut seen = Vec::new();
+        for i in 0..7_i64 {
+            if i == 1 {
+                // (`now` is read after the rebind: its watchdog starts there.)
+                d.rebind_audio(1, Some(key), g, None).unwrap();
+            }
+            let now = Instant::now();
+            // The private stage proves nothing until window 4 is due, then
+            // catches up all at once.
+            if i == 4 {
+                for w in 0..=4 {
+                    let p: Vec<_> = frames_in(w).into_iter().map(|x| tagged(x, 2)).collect();
+                    d.dispatch_dynamic_audio(
+                        key,
+                        key_gen,
+                        p,
+                        Some(mark(tick_ns(w + 1))),
+                        false,
+                        now,
+                        &mut sink,
+                    )
+                    .unwrap();
+                }
+            } else if i > 4 {
+                let p: Vec<_> = frames_in(i).into_iter().map(|x| tagged(x, 2)).collect();
+                d.dispatch_dynamic_audio(
+                    key,
+                    key_gen,
+                    p,
+                    Some(mark(tick_ns(i + 1))),
+                    false,
+                    now,
+                    &mut sink,
+                )
+                .unwrap();
+            }
+            d.dispatch(ve25(i), now, &mut sink).unwrap();
+            d.dispatch(audio_event(i, 1), now, &mut sink).unwrap();
+            assert_eq!(
+                sink.windows.iter().filter(|w| w.0 == 1).count(),
+                usize::try_from(i + 1).unwrap(),
+                "output 1 window {i} delivered on time"
+            );
+            let got = audio_of(&mut sink, 1, now);
+            if i < 4 {
+                assert_eq!(got.iter().map(|p| p.0).collect::<Vec<_>>(), frames_in(i));
+                assert!(got.iter().all(|p| p.1 == 1), "window {i}: old audio");
+            }
+            seen.extend(got);
+        }
+        let all: Vec<i64> = (0..7).flat_map(frames_in).collect();
+        assert_eq!(seen.iter().map(|p| p.0).collect::<Vec<_>>(), all);
+        for &(dts, tag) in &seen {
+            assert_eq!(tag, if dts < g { 1 } else { 2 }, "dts {dts}");
+        }
+        assert!(!d.is_audio_key_failed(key));
     }
 
     /// Sample-exact across the move, with the real libav AAC encoder and
@@ -3994,7 +4322,7 @@ mod tests {
         c.video_time_base = vec![DtsTimeBase { num: 1, den: 25 }];
         let mut d = RenditionDispatcher::new(c).unwrap();
         let mut sink = FakeDelivery::new(2);
-        let (key, _) = d.add_audio_key().unwrap();
+        let (key, key_gen) = d.add_audio_key().unwrap();
         let pcm = |n: u64| -> f32 {
             let t = f32::from(u16::try_from(n % 48_000).unwrap()) / 48_000.0;
             0.3 * (std::f32::consts::TAU * 440.0 * t).sin()
@@ -4029,11 +4357,11 @@ mod tests {
                 private_pending.extend(out);
                 let wm = watermark(&private_pending);
                 let batch = std::mem::take(&mut private_pending);
-                d.dispatch_dynamic_audio(key, batch, wm, false, Instant::now(), &mut sink)
+                d.dispatch_dynamic_audio(key, key_gen, batch, wm, false, Instant::now(), &mut sink)
                     .unwrap();
             }
             if tick == move_tick {
-                d.rebind_audio(1, Some(key), g).unwrap();
+                d.rebind_audio(1, Some(key), g, None).unwrap();
             }
             let t = tick;
             d.dispatch(

@@ -78,6 +78,8 @@ impl AudioSource {
 
 /// Encoded packets of one private bus for one fed tick.
 struct AudioEvent {
+    /// The dispatcher stage the bus was opened on, with its generation.
+    key: usize,
     generation: u64,
     packets: Vec<EncodedPacket>,
     watermark: Option<DtsWatermark>,
@@ -87,6 +89,9 @@ struct Fade {
     xf: TakeCrossfade,
     from: AudioSource,
     to: AudioSource,
+    /// The output read this bus before the take's audio move was issued (a
+    /// refused video move drops that move, so the binding returns to this).
+    was_bound: bool,
 }
 
 /// The private encoder's codec configuration as the consumer knows it.
@@ -132,6 +137,21 @@ pub struct AudioRoutingCounters {
     pub faded_back: u64,
 }
 
+/// Test observation of routed audio: the PCM handed to the shared program
+/// encoder and to each private bus, as `(first sample, interleaved PCM)`.
+#[cfg(test)]
+#[derive(Debug, Default)]
+pub(crate) struct AudioTap {
+    pub(crate) program: Vec<(u64, Vec<f32>)>,
+    pub(crate) private: Vec<(usize, u64, Vec<f32>)>,
+    /// Each scheduled crossfade: `(output, G)`.
+    pub(crate) moves: Vec<(usize, u64)>,
+}
+
+/// Shared [`AudioTap`] (router, handle and test).
+#[cfg(test)]
+pub(crate) type AudioTapCell = Arc<std::sync::Mutex<AudioTap>>;
+
 /// The routed-audio manager, owned by the router on the bake consumer.
 pub(crate) struct RoutedAudio {
     config: AudioEncodeConfig,
@@ -147,6 +167,8 @@ pub(crate) struct RoutedAudio {
     events: Receiver<AudioEvent>,
     dropped: Arc<AtomicU64>,
     counters: AudioRoutingCounters,
+    #[cfg(test)]
+    pub(crate) tap: Option<AudioTapCell>,
 }
 
 impl RoutedAudio {
@@ -172,6 +194,8 @@ impl RoutedAudio {
             events,
             dropped: Arc::new(AtomicU64::new(0)),
             counters: AudioRoutingCounters::default(),
+            #[cfg(test)]
+            tap: None,
         }
     }
 
@@ -211,7 +235,7 @@ impl RoutedAudio {
         let spawned = spawn_bus_worker(
             self.config.clone(),
             start_i64,
-            generation,
+            (key, generation),
             self.events_tx.clone(),
             config_tx,
             Arc::clone(&failed),
@@ -242,11 +266,18 @@ impl RoutedAudio {
 
     /// The router issued the output's video rebind at move tick `move_tick`:
     /// schedule the crossfade at `G` and move the output's audio slot there.
+    ///
+    /// `after_video = Some(k)`: the router just issued a video move to key
+    /// `k`; the audio slot moves only once it is applied (the dispatcher
+    /// drops it if the video move is refused or superseded: the audio never
+    /// switches while the video stays). `None` for a video change that
+    /// already happened (a fallback landing).
     pub(crate) fn follow(
         &mut self,
         output: usize,
         target: &PictureBus,
         move_tick: u64,
+        after_video: Option<usize>,
         dispatcher: &mut RenditionDispatcher,
     ) {
         let to = AudioSource::follow(target);
@@ -271,6 +302,7 @@ impl RoutedAudio {
             .start
             .saturating_add(WARM_FRAMES.saturating_mul(AAC_FRAME_SAMPLES));
         let g = grid_ceil(at.max(warm).max(bus.fed), AAC_FRAME_SAMPLES);
+        let was_bound = bus.bound;
         if !bus.bound {
             if matches!(bus.config_seen, ConfigState::Pending) {
                 match bus.config.try_recv() {
@@ -288,7 +320,7 @@ impl RoutedAudio {
             };
             if !same
                 || dispatcher
-                    .rebind_audio(output, Some(bus.key), g_i64)
+                    .rebind_audio(output, Some(bus.key), g_i64, after_video)
                     .is_err()
             {
                 // encoder-format-mismatch / not ready: the video still moves.
@@ -307,10 +339,17 @@ impl RoutedAudio {
             None => bus.current.clone(),
         };
         bus.current = from.clone();
+        #[cfg(test)]
+        if let Some(tap) = self.tap.as_ref() {
+            if let Ok(mut t) = tap.lock() {
+                t.moves.push((output, g));
+            }
+        }
         bus.fade = Some(Fade {
             xf: TakeCrossfade { start: g, len },
             from,
             to: to.clone(),
+            was_bound,
         });
         if let Some(c) = self.carried.get_mut(output) {
             *c = to;
@@ -328,6 +367,10 @@ impl RoutedAudio {
         let Some(fade) = bus.fade.take() else {
             return;
         };
+        // The dispatcher dropped the audio move with the video move: the
+        // output reads what it read before the take (a later take binds the
+        // bus again; the bus fades back first, so Rule 2 holds then).
+        bus.bound = fade.was_bound;
         let start = grid_ceil(fade.xf.end().max(bus.fed), AAC_FRAME_SAMPLES);
         if fade.xf.start >= bus.fed {
             // Nothing of the fade was fed yet: the bus never left the old audio.
@@ -338,6 +381,7 @@ impl RoutedAudio {
                 xf: TakeCrossfade { start, len },
                 from: fade.to,
                 to: fade.from.clone(),
+                was_bound: fade.was_bound,
             });
             self.counters.faded_back = self.counters.faded_back.saturating_add(1);
             tracing::info!(output, "routing: video move refused; audio fades back");
@@ -406,6 +450,12 @@ impl RoutedAudio {
             if tail.is_empty() {
                 continue;
             }
+            #[cfg(test)]
+            if let Some(tap) = self.tap.as_ref() {
+                if let Ok(mut t) = tap.lock() {
+                    t.private.push((output, from, tail.clone()));
+                }
+            }
             bus.fed = end;
             if let Some(fade) = bus.fade.as_ref() {
                 if end >= fade.xf.end() {
@@ -429,6 +479,19 @@ impl RoutedAudio {
         }
     }
 
+    /// Record the block handed to the shared program encoder for `tick`.
+    #[cfg(test)]
+    pub(crate) fn tap_program(&self, tick: u64, program: &AudioBlock) {
+        if let Some(tap) = self.tap.as_ref() {
+            let end = self.clock.total_at(tick.saturating_add(1));
+            let frames = u64::try_from(program.frame_count()).unwrap_or(0);
+            if let Ok(mut t) = tap.lock() {
+                t.program
+                    .push((end.saturating_sub(frames), program.interleaved().to_vec()));
+            }
+        }
+    }
+
     /// Dispatch the private buses' encoded packets (before the base drain).
     ///
     /// # Errors
@@ -439,11 +502,14 @@ impl RoutedAudio {
         delivery: &mut D,
     ) -> Result<(), DispatchError> {
         while let Ok(event) = self.events.try_recv() {
+            // The event names its stage by (key, generation): the
+            // dispatcher stages it only while that slot still carries this
+            // generation (a reused slot drops it, counted).
             let Some(key) = self
                 .buses
                 .iter()
                 .flatten()
-                .find(|b| b.generation == event.generation)
+                .find(|b| b.generation == event.generation && b.key == event.key)
                 .map(|b| b.key)
             else {
                 self.dropped.fetch_add(1, Ordering::Relaxed);
@@ -451,6 +517,7 @@ impl RoutedAudio {
             };
             if let Err(e) = dispatcher.dispatch_dynamic_audio(
                 key,
+                event.generation,
                 event.packets,
                 event.watermark,
                 false,
@@ -551,7 +618,7 @@ fn source_pcm(
 fn spawn_bus_worker(
     config: AudioEncodeConfig,
     start: i64,
-    generation: u64,
+    stage: (usize, u64),
     events: SyncSender<AudioEvent>,
     config_tx: SyncSender<Option<Vec<u8>>>,
     failed: Arc<AtomicBool>,
@@ -562,9 +629,7 @@ fn spawn_bus_worker(
         .name("routing-audio".to_owned())
         .spawn(move || {
             let run = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                bus_worker(
-                    &config, start, generation, &events, &config_tx, &jobs, &dropped,
-                )
+                bus_worker(&config, start, stage, &events, &config_tx, &jobs, &dropped)
             }));
             if !matches!(run, Ok(true)) {
                 failed.store(true, Ordering::Release);
@@ -577,7 +642,7 @@ fn spawn_bus_worker(
 fn bus_worker(
     config: &AudioEncodeConfig,
     start: i64,
-    generation: u64,
+    (key, generation): (usize, u64),
     events: &SyncSender<AudioEvent>,
     config_tx: &SyncSender<Option<Vec<u8>>>,
     jobs: &Receiver<Vec<f32>>,
@@ -603,6 +668,7 @@ fn bus_worker(
         }
         if events
             .try_send(AudioEvent {
+                key,
                 generation,
                 packets,
                 watermark,

@@ -248,6 +248,8 @@ pub struct RoutingSnapshot {
 /// calling [`Self::try_take`]. Both strings are length-bounded here.
 #[derive(Clone)]
 pub struct OutputRoutingHandle {
+    #[cfg(test)]
+    pub(crate) audio_tap: crate::routing_audio::AudioTapCell,
     takes: SyncSender<OutputTake>,
     snapshot: Arc<SwapCell<Arc<RoutingSnapshot>>>,
     outcomes: Arc<Mutex<Option<Receiver<TakeOutcome>>>>,
@@ -620,6 +622,8 @@ pub struct OutputRouter {
     /// Routed outputs' audio (`audio = follow`); `None` for a run without
     /// program audio.
     audio: Option<crate::routing_audio::RoutedAudio>,
+    #[cfg(test)]
+    audio_tap: crate::routing_audio::AudioTapCell,
 }
 
 impl OutputRouter {
@@ -682,7 +686,11 @@ impl OutputRouter {
             })
             .collect();
         let snapshot = Arc::new(SwapCell::from_pointee(RoutingSnapshot::default()));
+        #[cfg(test)]
+        let audio_tap = crate::routing_audio::AudioTapCell::default();
         let handle = OutputRoutingHandle {
+            #[cfg(test)]
+            audio_tap: Arc::clone(&audio_tap),
             takes: take_tx,
             snapshot: Arc::clone(&snapshot),
             outcomes: Arc::new(Mutex::new(Some(outcome_rx))),
@@ -718,6 +726,8 @@ impl OutputRouter {
             dirty: true,
             reaper: Some(reaper),
             audio: None,
+            #[cfg(test)]
+            audio_tap,
         };
         router.publish_snapshot();
         Ok((router, handle))
@@ -740,6 +750,22 @@ impl OutputRouter {
             route_gain,
             self.aux.preview_selection.clone(),
         ));
+        #[cfg(test)]
+        if let Some(audio) = self.audio.as_mut() {
+            audio.tap = Some(Arc::clone(&self.audio_tap));
+        }
+    }
+
+    /// Test observation: the block handed to the shared program encoder.
+    #[cfg(test)]
+    pub(crate) fn tap_program_audio(
+        &self,
+        tick: u64,
+        program: &multiview_audio::format::AudioBlock,
+    ) {
+        if let Some(audio) = self.audio.as_ref() {
+            audio.tap_program(tick, program);
+        }
     }
 
     /// Whether any output has a private audio bus (no take = `false`, and
@@ -1145,7 +1171,7 @@ impl OutputRouter {
                 | MoveOutcome::AudioFallback { .. } => {}
                 MoveOutcome::Fallback { output_index } => {
                     if let Some(audio) = self.audio.as_mut() {
-                        audio.follow(output_index, &PictureBus::Program, tick, dispatcher);
+                        audio.follow(output_index, &PictureBus::Program, tick, None, dispatcher);
                     }
                     if let Some(out) = self.outputs.get_mut(output_index) {
                         out.bus = PictureBus::Program;
@@ -1200,7 +1226,7 @@ impl OutputRouter {
                         out.bus = PictureBus::Program;
                     }
                     if let Some(audio) = self.audio.as_mut() {
-                        audio.follow(index, &PictureBus::Program, tick, dispatcher);
+                        audio.follow(index, &PictureBus::Program, tick, Some(base), dispatcher);
                     }
                     self.emit(
                         String::new(),
@@ -1292,7 +1318,7 @@ impl OutputRouter {
                                 p.phase = Phase::Moving(key);
                             }
                             if let Some(audio) = self.audio.as_mut() {
-                                audio.follow(index, &bus, at, dispatcher);
+                                audio.follow(index, &bus, at, Some(key), dispatcher);
                             }
                         } else {
                             self.refuse_pending(index, tick, RefuseReason::EncoderNotReady);
@@ -1378,7 +1404,7 @@ impl OutputRouter {
             if dispatcher.rebind_video(index, key, tick, windows).is_ok() {
                 set(self, Phase::Moving(key));
                 if let Some(audio) = self.audio.as_mut() {
-                    audio.follow(index, bus, tick, dispatcher);
+                    audio.follow(index, bus, tick, Some(key), dispatcher);
                 }
                 // A re-take of a lingering key adopts it (re-attributed,
                 // linger cleared). A key another output still subscribes

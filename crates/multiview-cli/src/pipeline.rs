@@ -7833,6 +7833,8 @@ fn consumer_main<D: WindowDelivery>(
                 let track_bus = bus;
                 discrete_track_samples(track_bus, &selected_tracks, block.frame_count())
             };
+            #[cfg(test)]
+            router.tap_program_audio(item.tick_index, &block);
             let offered = audio_worker.as_ref().map_or(
                 Err(crate::rendition_workers::OfferRejection::Ended),
                 |worker| {
