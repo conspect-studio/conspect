@@ -93,8 +93,9 @@ pub fn bootstrap_certificate(
 ) -> Result<BootstrapCertificate, Box<dyn std::error::Error + Send + Sync>> {
     let key = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256)?;
     let mut params = rcgen::CertificateParams::new(vec![host.to_owned()])?;
-    params.not_before = ::time::OffsetDateTime::now_utc();
-    params.not_after = params.not_before + ::time::Duration::days(7);
+    let now = ::time::OffsetDateTime::now_utc();
+    params.not_before = now - ::time::Duration::minutes(5);
+    params.not_after = now + ::time::Duration::days(7);
     let der = params.self_signed(&key)?.der().to_vec();
     let fingerprint = Sha256::digest(&der)
         .iter()
@@ -118,10 +119,35 @@ pub fn bootstrap_certificate(
 /// # Errors
 /// Returns an error if the directory or file cannot be written securely.
 fn persist_bootstrap_key(state_dir: &std::path::Path, key: &[u8]) -> std::io::Result<()> {
+    use rustix::fs::{FileType, Mode, OFlags};
     use std::io::Write;
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::create_dir_all(state_dir)?;
-    std::fs::set_permissions(state_dir, std::fs::Permissions::from_mode(0o700))?;
+    use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+    if state_dir
+        .components()
+        .any(|part| matches!(part, std::path::Component::ParentDir))
+    {
+        return Err(std::io::Error::other("state_dir cannot contain '..'"));
+    }
+    crate::web_capture_startup::reject_symlink(state_dir)?;
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(state_dir)?;
+    crate::web_capture_startup::reject_symlink(state_dir)?;
+    let dir = rustix::fs::open(
+        state_dir,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    )?;
+    let stat = rustix::fs::fstat(&dir)?;
+    if FileType::from_raw_mode(stat.st_mode) != FileType::Directory
+        || stat.st_uid != rustix::process::geteuid().as_raw()
+        || stat.st_mode & 0o777 != 0o700
+    {
+        return Err(std::io::Error::other(
+            "state_dir must be an owner-private 0700 directory",
+        ));
+    }
     let mut temp = tempfile::NamedTempFile::new_in(state_dir)?;
     temp.as_file()
         .set_permissions(std::fs::Permissions::from_mode(0o600))?;
@@ -247,17 +273,56 @@ impl AcmeCertificateSource {
         }
     }
 
-    /// Install a verified ACME chain without interrupting existing handshakes.
-    pub fn install(&self, key: Arc<CertifiedKey>, expires_at: i64) {
-        self.sender.send_replace(key);
+    /// Rotate an expiring bootstrap certificate in setup without restarting outputs.
+    /// The caller schedules this off the data path before the seven-day expiry.
+    ///
+    /// # Errors
+    /// Returns a certificate or I/O error; the previous certificate remains active.
+    pub fn rotate_bootstrap(
+        &self,
+        host: &str,
+        state_dir: &std::path::Path,
+    ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
         let mut status = self
             .status
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if status.state != TlsState::Setup {
+            return Ok(false);
+        }
+        let fresh = bootstrap_certificate(host)?;
+        fresh.persist(state_dir)?;
+        self.sender.send_replace(fresh.certificate);
+        status.bootstrap_fingerprint = Some(fresh.fingerprint);
+        Ok(true)
+    }
+
+    /// Install a verified ACME chain without interrupting existing handshakes.
+    /// Remove the bootstrap key on disk before announcing the serving state.
+    ///
+    /// # Errors
+    /// Returns an I/O error and preserves the previous certificate if key removal fails.
+    pub fn install(
+        &self,
+        key: Arc<CertifiedKey>,
+        expires_at: i64,
+        state_dir: &std::path::Path,
+    ) -> std::io::Result<()> {
+        let mut status = self
+            .status
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match std::fs::remove_file(state_dir.join("bootstrap.key")) {
+            Ok(()) => std::fs::File::open(state_dir)?.sync_all()?,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+        self.sender.send_replace(key);
         status.state = TlsState::Serving;
         status.expires_at = Some(expires_at);
         status.last_error = None;
         status.bootstrap_fingerprint = None;
+        Ok(())
     }
 
     /// Report a sanitized failure; the active certificate never changes.

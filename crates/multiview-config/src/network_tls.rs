@@ -109,16 +109,12 @@ fn fail(field: &str, message: &str) -> ConfigError {
 
 fn env_name(field: &str, value: &str) -> Result<(), ConfigError> {
     let valid = !value.is_empty()
-        && value.len() <= 128
-        && (value
-            .as_bytes()
-            .first()
-            .is_some_and(u8::is_ascii_alphabetic)
-            || value.starts_with('_'));
+        && value.len() <= 64
+        && (value.as_bytes().first().is_some_and(u8::is_ascii_uppercase) || value.starts_with('_'));
     if !valid
         || !value
             .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b == b'_')
+            .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit() || b == b'_')
     {
         return Err(fail(
             field,
@@ -135,6 +131,9 @@ fn domain(field: &str, name: &str, challenge: AcmeChallenge) -> Result<(), Confi
         } else {
             Err(fail(field, "IP addresses require tls-alpn-01"))
         };
+    }
+    if name.bytes().any(|b| b.is_ascii_uppercase()) {
+        return Err(fail(field, "DNS names must use lowercase ASCII"));
     }
     let bare = name.strip_prefix("*.").unwrap_or(name);
     if bare != name && challenge != AcmeChallenge::Dns01 {
@@ -236,8 +235,16 @@ impl NetworkTlsConfig {
                 return Err(fail("domains", "contains a duplicate name"));
             }
         }
-        if !self.state_dir.is_absolute() {
-            return Err(fail("state_dir", "must be an absolute path"));
+        if !self.state_dir.is_absolute()
+            || self
+                .state_dir
+                .components()
+                .any(|part| matches!(part, std::path::Component::ParentDir))
+        {
+            return Err(fail(
+                "state_dir",
+                "must be an absolute path without '..' components",
+            ));
         }
         if let Some(path) = &self.trust_anchor {
             if !path.is_absolute() {
@@ -271,6 +278,57 @@ impl NetworkTlsConfig {
                     "directory",
                     "must be an HTTPS URL without credentials, query or fragment",
                 ));
+            }
+            match parsed.host() {
+                Some(url::Host::Ipv4(ip)) => {
+                    if ip.is_link_local()
+                        || ip.is_multicast()
+                        || ip.is_unspecified()
+                        || ip.is_broadcast()
+                    {
+                        return Err(fail(
+                            "directory",
+                            "link-local, multicast and unspecified addresses are forbidden",
+                        ));
+                    }
+                    if (ip.is_private() || ip.is_loopback()) && self.trust_anchor.is_none() {
+                        return Err(fail(
+                            "trust_anchor",
+                            "private ACME directories require a PEM trust anchor",
+                        ));
+                    }
+                }
+                Some(url::Host::Ipv6(ip)) => {
+                    if ip.is_multicast()
+                        || ip.is_unspecified()
+                        || (ip.segments()[0] & 0xffc0) == 0xfe80
+                        || ip.to_ipv4_mapped().is_some()
+                    {
+                        return Err(fail(
+                            "directory",
+                            "link-local, multicast and IPv4-mapped addresses are forbidden",
+                        ));
+                    }
+                    if (ip.is_unique_local() || ip.is_loopback()) && self.trust_anchor.is_none() {
+                        return Err(fail(
+                            "trust_anchor",
+                            "private ACME directories require a PEM trust anchor",
+                        ));
+                    }
+                }
+                Some(url::Host::Domain(host)) => {
+                    if host == "." || host.is_empty() || !host.contains('.') && host != "localhost"
+                    {
+                        return Err(fail("directory", "must use a DNS name or IP address"));
+                    }
+                    if host == "localhost" && self.trust_anchor.is_none() {
+                        return Err(fail(
+                            "trust_anchor",
+                            "local ACME directories require a PEM trust anchor",
+                        ));
+                    }
+                }
+                None => return Err(fail("directory", "must contain a host")),
             }
         }
         if let Some(profile) = &self.acme_profile {

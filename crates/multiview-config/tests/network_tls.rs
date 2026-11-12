@@ -54,6 +54,12 @@ fn custom_profile_round_trips_and_rejects_literal_credentials() {
         .unwrap_err()
         .to_string()
         .contains("network.tls.dns.token_env"));
+    if let Some(multiview_config::DnsProviderConfig::Cloudflare { token_env, .. }) =
+        invalid.tls.dns.as_mut()
+    {
+        *token_env = Some("Ab3kQ9x2Lm7Zr0Tq5Wv8Yc1Nd4Hs6Jf2Gp9Ke3Ru".into());
+    }
+    assert!(invalid.validate().is_err());
 }
 
 #[test]
@@ -89,4 +95,21 @@ fn rejects_unsupported_http01_and_invalid_combinations() {
         .unwrap_err()
         .to_string()
         .contains("acme_profile"));
+    tls.ca = CertificateAuthority::Custom;
+    tls.domains = vec!["test.example.org".into()];
+    tls.directory = Some("https://169.254.169.254/latest/meta-data".into());
+    assert!(tls
+        .validate()
+        .unwrap_err()
+        .to_string()
+        .contains("directory"));
+    tls.directory = Some("https://2130706433/directory".into());
+    assert!(tls
+        .validate()
+        .unwrap_err()
+        .to_string()
+        .contains("trust_anchor"));
+    tls.directory = Some("https://localhost/directory".into());
+    tls.trust_anchor = Some("/etc/conspect/pebble-root.pem".into());
+    tls.validate().unwrap();
 }

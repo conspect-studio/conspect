@@ -70,7 +70,25 @@ fn bootstrap_is_fresh_private_and_hot_swaps_without_downgrade() {
     let next = bootstrap_certificate("test.example.org").unwrap();
     assert_ne!(bootstrap.fingerprint, next.fingerprint);
     let dir = tempfile::tempdir().unwrap();
+    std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
     bootstrap.persist(dir.path()).unwrap();
+    let shared = tempfile::tempdir().unwrap();
+    std::fs::set_permissions(shared.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+    assert!(bootstrap.persist(shared.path()).is_err());
+    let linked = shared.path().join("linked");
+    std::os::unix::fs::symlink(dir.path(), &linked).unwrap();
+    assert!(bootstrap.persist(&linked.join("nested")).is_err());
+    assert!(bootstrap
+        .persist(&dir.path().join("inside").join("..").join("escape"))
+        .is_err());
+    assert_eq!(
+        std::fs::metadata(shared.path())
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o755
+    );
     assert_eq!(
         std::fs::metadata(dir.path()).unwrap().permissions().mode() & 0o777,
         0o700
@@ -97,7 +115,20 @@ fn bootstrap_is_fresh_private_and_hot_swaps_without_downgrade() {
     );
     source.report_error("ca-unavailable");
     assert!(Arc::ptr_eq(&bootstrap.certificate, &source.current()));
-    source.install(next.certificate.clone(), 1_900_000_000);
+    assert!(source
+        .rotate_bootstrap("test.example.org", dir.path())
+        .unwrap());
+    assert_ne!(
+        source.status().bootstrap_fingerprint,
+        Some(bootstrap.fingerprint)
+    );
+    source
+        .install(next.certificate.clone(), 1_900_000_000, dir.path())
+        .unwrap();
+    assert!(!source
+        .rotate_bootstrap("test.example.org", dir.path())
+        .unwrap());
+    assert!(!dir.path().join("bootstrap.key").exists());
     assert!(receiver.has_changed().unwrap());
     assert!(Arc::ptr_eq(&next.certificate, &source.current()));
     assert_eq!(source.status().state, TlsState::Serving);
