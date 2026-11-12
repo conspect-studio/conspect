@@ -334,7 +334,8 @@ fn an_offer_to_a_wedged_or_dead_aux_thread_is_microseconds() {
     }
     let check = |name: &str, ns: &[u64]| {
         let p50 = ns[ns.len() / 2];
-        let p99 = ns[ns.len() * 99 / 100];
+        // Nearest-rank p99: the smallest sample >= 99 % of all samples.
+        let p99 = ns[(ns.len() * 99).div_ceil(100) - 1];
         assert!(p50 < 10_000, "{name}: offer median {p50} ns >= 10 us");
         assert!(p99 < 100_000, "{name}: offer p99 {p99} ns >= 100 us");
     };

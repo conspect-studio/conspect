@@ -1035,6 +1035,7 @@ fn inject(
         seen_event: false,
         lost,
         generation,
+        silent: 0,
     });
     key
 }
@@ -1413,4 +1414,129 @@ fn untrusted_ids_are_bounded_and_a_held_key_is_never_re_attributed() {
         "attribution stays with the holder"
     );
     assert!(x.r.has_capacity("q"), "the newcomer is not charged");
+}
+
+/// A live encoder that, once `die` is set, panics on its next encode or
+/// (with `block`) blocks in it forever (until the test drops `release`).
+struct Dying {
+    inner: FakeEnc,
+    die: Arc<AtomicBool>,
+    block: Option<Mutex<Receiver<()>>>,
+}
+
+impl VideoEncodeWorker for Dying {
+    fn encode(&mut self, item: BakedTick) -> Result<Vec<EncodedPacket>, PipelineError> {
+        if self.die.load(Ordering::SeqCst) {
+            if let Some(gate) = &self.block {
+                let _ = gate.lock().unwrap().recv();
+            } else {
+                panic!("injected live encoder panic");
+            }
+        }
+        self.inner.encode(item)
+    }
+    fn reorder_bound(&self) -> ReorderBound {
+        ReorderBound::NoReorder
+    }
+    fn finish(&mut self) -> Result<Vec<EncodedPacket>, PipelineError> {
+        Ok(Vec::new())
+    }
+    fn force_keyframe(&mut self) {
+        self.inner.force_keyframe();
+    }
+}
+
+impl LiveEncoder for Dying {
+    fn start_at(&mut self, t0: u64) {
+        self.inner.start_at(t0);
+    }
+    fn time_base(&self) -> Rational {
+        Rational::new(1, 5)
+    }
+    fn move_gate(&self) -> MoveGate {
+        self.inner.move_gate()
+    }
+}
+
+/// U: drive a take onto a live encoder, make it die after the move (panic
+/// or block), and assert the output falls back to Program with
+/// Fallback(EncoderFailed) within `bound` ticks of the death, Program windows
+/// of the other output contiguous throughout.
+fn a_dying_live_encoder_falls_back(block: bool, bound: u64) {
+    let (release, gate) = mpsc::channel::<()>();
+    let mut gate = Some(gate);
+    let die = Arc::new(AtomicBool::new(false));
+    let kill = Arc::clone(&die);
+    let open: OpenFn = Box::new(move |_| {
+        let e: Box<dyn LiveEncoder> = Box::new(Dying {
+            inner: FakeEnc {
+                forced: false,
+                encoded: Arc::new(AtomicUsize::new(0)),
+            },
+            die: Arc::clone(&die),
+            block: if block {
+                gate.take().map(Mutex::new)
+            } else {
+                None
+            },
+        });
+        Ok(e)
+    });
+    let mut x = harness(2, 6, Some(open));
+    for t in 0..5 {
+        x.tick(t);
+    }
+    x.h.try_take(take("a", 1, src())).unwrap();
+    let mut t = 5;
+    let mut applied = false;
+    while t < 60 && !applied {
+        x.tick(t);
+        applied = x.results().contains(&TakeResult::Applied);
+        t += 1;
+    }
+    assert!(applied, "the take applied before the encoder died");
+    assert_eq!(x.d.binding_video_key(1), Some(1));
+    kill.store(true, Ordering::SeqCst);
+    let mut fell = None;
+    let start = t;
+    while t < start + bound && fell.is_none() {
+        x.tick(t);
+        if x.results()
+            .contains(&TakeResult::Fallback(FallbackReason::EncoderFailed))
+        {
+            fell = Some(t);
+        }
+        t += 1;
+    }
+    let fell = fell.expect("Fallback(EncoderFailed) within the bound");
+    // The fallback lands at the next Program RAP (gop 5).
+    for t in fell + 1..fell + 8 {
+        x.tick(t);
+    }
+    assert_eq!(x.d.binding_video_key(1), Some(0), "back on Program");
+    assert_eq!(x.h.snapshot().dead_encoders, 1);
+    assert_eq!(x.h.snapshot().dynamic_encoders_live, 0);
+    let o0: Vec<i64> = x
+        .windows_of(0)
+        .iter()
+        .filter_map(|w| w.first().map(|p| p.0))
+        .collect();
+    assert!(
+        o0.windows(2).all(|w| w[1] == w[0] + 1) && o0.len() + 2 >= usize::try_from(fell).unwrap(),
+        "Program windows contiguous: {o0:?}"
+    );
+    drop(release);
+}
+
+/// U (HIGH): a live encoder that panics after the move is detected (worker ended), its key closed, the output back on Program.
+#[test]
+fn a_panicking_live_encoder_falls_back_to_program() {
+    a_dying_live_encoder_falls_back(false, 20);
+}
+
+/// U (HIGH): a live encoder that blocks forever in encode (wedged) is closed
+/// after WEDGED_ENCODER_TICKS offered ticks without an event.
+#[test]
+fn a_wedged_live_encoder_falls_back_to_program() {
+    a_dying_live_encoder_falls_back(true, u64::from(WEDGED_ENCODER_TICKS) + 20);
 }

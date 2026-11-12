@@ -31,7 +31,8 @@ use crate::rendition_dispatch::{
     RenditionDispatcher,
 };
 use crate::rendition_workers::{
-    BakedTick, ClosingWorker, DispatchEvent, RenditionWorker, ReorderBound, VideoEncodeWorker,
+    BakedTick, ClosingWorker, DispatchEvent, OfferRejection, RenditionWorker, ReorderBound,
+    VideoEncodeWorker,
 };
 use crate::routing_aux::{AuxFeed, AuxFeeds, PictureBus, PictureBusSlot};
 
@@ -126,9 +127,29 @@ impl RefuseReason {
 pub enum FallbackReason {
     /// The aux picture thread failed or stopped publishing.
     AuxFailed,
-    /// The output's live-opened encoder failed.
+    /// The output's live-opened encoder failed, ended or wedged.
     EncoderFailed,
 }
+
+impl FallbackReason {
+    /// Operator-facing explanation (never names a group or shared encoder).
+    #[must_use]
+    pub const fn operator_message(self) -> &'static str {
+        match self {
+            Self::AuxFailed => {
+                "This feed stopped delivering pictures; the output is back on Program"
+            }
+            Self::EncoderFailed => {
+                "The encoder for this feed stopped; the output is back on Program"
+            }
+        }
+    }
+}
+
+/// A live key whose worker produced no event for this many consecutive
+/// offered ticks is wedged (design §9 chaos 5) and is closed: its outputs
+/// fall back to Program at a RAP.
+pub const WEDGED_ENCODER_TICKS: u32 = 90;
 
 /// The result of one take (or an unrequested fallback).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -195,6 +216,9 @@ pub struct RoutingSnapshot {
     pub dropped_outcomes: u64,
     /// Workers dropped unjoined because the reaper queue was full.
     pub reaper_overflow: u64,
+    /// Live-opened encoders closed because their worker ended (panic, error)
+    /// or produced nothing for [`WEDGED_ENCODER_TICKS`] offered ticks.
+    pub dead_encoders: u64,
     /// Live-opened workers' events dropped because the consumer queue was
     /// full (the key then fails alone) or the key was already closed.
     pub dropped_live_events: u64,
@@ -466,6 +490,9 @@ struct DynamicKey {
     /// tagged with it, so a late event of a closed worker whose dispatcher
     /// slot was reused is dropped and counted, never applied to the new key.
     generation: u64,
+    /// Consecutive ticks this key was offered a frame with no event from its
+    /// worker since; reset by every event. `WEDGED_ENCODER_TICKS` = wedged.
+    silent: u32,
 }
 
 struct PendingOpen {
@@ -530,6 +557,8 @@ pub struct OutputRouter {
     last_forced: HashMap<usize, u64>,
     dropped_outcomes: u64,
     reaper_overflow: u64,
+    /// Live keys closed because their worker ended or wedged.
+    dead_encoders: u64,
     /// Events dropped by live-opened workers' sinks (shared with them).
     dyn_dropped: Arc<AtomicU64>,
     parameter_set_changes: u64,
@@ -626,6 +655,7 @@ impl OutputRouter {
             last_forced: HashMap::new(),
             dropped_outcomes: 0,
             reaper_overflow: 0,
+            dead_encoders: 0,
             dyn_dropped: Arc::new(AtomicU64::new(0)),
             parameter_set_changes: 0,
             video_keys: 0,
@@ -660,7 +690,7 @@ impl OutputRouter {
         self.drain_opens(tick, dispatcher);
         self.drain_moves(tick, dispatcher);
         self.advance_takes(tick, pts, dispatcher);
-        self.feed(tick);
+        self.feed(tick, dispatcher);
         self.check_aux(tick, dispatcher);
         self.linger(tick, dispatcher);
         self.sync_feeds();
@@ -714,6 +744,7 @@ impl OutputRouter {
             if matches!(event, DispatchEvent::Video { .. }) {
                 d.seen_event = true;
             }
+            d.silent = 0;
             if let Err(e) = dispatcher.dispatch(event, Instant::now(), delivery) {
                 if !matches!(e, DispatchError::Admission { .. }) {
                     return Err(e);
@@ -883,6 +914,7 @@ impl OutputRouter {
                 seen_event: false,
                 lost,
                 generation,
+                silent: 0,
             });
             // The first offer (frame T, an IDR) is made by `feed` this same
             // tick, after the key exists. The move is requested once the key's
@@ -1292,8 +1324,9 @@ impl OutputRouter {
 
     /// Feed every live-opened encoder its bus's frame for this tick (hold
     /// the last one when none is new), counting held ticks per bus.
-    fn feed(&mut self, tick: u64) {
+    fn feed(&mut self, tick: u64, dispatcher: &mut RenditionDispatcher) {
         let mut fresh_buses: Vec<(PictureBus, bool)> = Vec::new();
+        let mut dead: Vec<usize> = Vec::new();
         for d in &mut self.dynamic {
             let latest = self.feeds.get(&d.bus).and_then(|f| f.slot.latest.load());
             let new = latest
@@ -1309,7 +1342,21 @@ impl OutputRouter {
                 continue;
             };
             // Never blocks: a full queue drops and the worker gap-fills.
-            let _ = worker.offer(BakedTick { tick, canvas });
+            let ended = matches!(
+                worker.offer(BakedTick { tick, canvas }),
+                Err(OfferRejection::Ended)
+            );
+            d.silent = d.silent.saturating_add(1);
+            // A panicked/exited worker, or one that emits nothing while fed
+            // (wedged), would freeze its outputs forever: close the key so
+            // they fall back to Program (Fallback(EncoderFailed)).
+            if ended || worker.is_finished() || d.silent >= WEDGED_ENCODER_TICKS {
+                dead.push(d.key);
+            }
+        }
+        for key in dead {
+            self.dead_encoders = self.dead_encoders.saturating_add(1);
+            self.close(key, dispatcher);
         }
         for (bus, fresh) in fresh_buses {
             let health = self.health.entry(bus).or_insert(BusHealth {
@@ -1469,6 +1516,7 @@ impl OutputRouter {
             opens_in_flight: self.opens.len(),
             dropped_outcomes: self.dropped_outcomes,
             reaper_overflow: self.reaper_overflow,
+            dead_encoders: self.dead_encoders,
             dropped_live_events: self.dyn_dropped.load(Ordering::Relaxed),
             parameter_set_changes: self.parameter_set_changes,
             video_keys: self.video_keys,
