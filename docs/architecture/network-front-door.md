@@ -771,3 +771,28 @@ Slices 1, 2, 3 and 4 are independently useful: 1 fixes #280 for MoQ and WebRTC w
 adds site HTTP/3; 3 is the abuse floor that must exist before 443 is the only door; 4 removes the
 nginx dependency and covers no-UDP networks. Slice 5 (ACME) depends on 4 for TLS-ALPN-01 only and
 does not block 1-3. Public UDP 443 opens only after slice 3. 6, 7, 8 depend on 4; 9 depends on 1; 10 waits for #282.
+
+### Slice 1 as built (issue #287)
+
+* Crate `multiview-frontdoor`: `FrontDoor::start` builds its own multi-thread runtime
+  (`network.workers` threads named `frontdoor-N`), binds `[::]:https_port` dual-stack on
+  that runtime's reactor and spawns the one dispatcher task there. `classify` is the
+  section 3 table plus structural checks (STUN cookie and exact length; DTLS and RTCP
+  minimum headers; Initial >= 1200 bytes; VN (version 0) and Retry dropped at a server;
+  unsupported versions >= 1200 bytes are Version Negotiation triggers and pay a global
+  200/s budget; short headers >= 21 bytes). QUIC v2 is not spoken by moq-noq 1.3.5, so a
+  v2 Initial is a VN trigger.
+* Lanes: QUIC lane is a `noq::AsyncUdpSocket` (sends via `UdpSocketState` with GSO);
+  the WebRTC lane hands datagrams to `UnifiedEndpoint::run_shared`, which sends on a
+  duplicate descriptor of the same socket. Established sets: WebRTC peers are written
+  when a session is connected and str0m accepted a datagram from that address
+  (`Session::validated_peer`); QUIC peers when the MoQ accept loop admits a session
+  (handshake complete). Both reference counted, capped, removed when the session ends.
+* MoQ: `moq-tokio` takes the lane through `server::Config::socket` (vendor change
+  recorded in `vendor/MOQ-DELIVERY-PROVENANCE.md`); the provider builds the server and
+  runs its accept loop on the front-door runtime.
+* Config: `[network] https_port, advertise, workers`. Absent: legacy sockets unchanged.
+  Present: `webrtc.udp_port` and `MULTIVIEW_MOQ_BIND` are ignored with a deprecation
+  warning (not a second legacy socket; that is a later slice if needed).
+* Not in slice 1: steering, nftables, Retry policy knobs, rcvbuf via systemd (slice 3);
+  the output clock itself still runs on the `#[tokio::main]` runtime (tracked separately).
