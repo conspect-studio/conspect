@@ -61,7 +61,12 @@ What is true on main f5f2230e (the full table with citations is in §1 of the no
      the stamps and the cadence are all the Program's.
    - A single source is a **one-cell canvas** (`fit = contain`), not a tile pass-through. Scaling,
      the fixed colour order and the cadence latch live in the compositor. The identity case (tile
-     equals the canvas in size and tag) skips drawing.
+     equals the canvas in size, format and full `ColorInfo`) skips drawing.
+   - Ingest tiles already carry the canvas colour tag, so in slices 1-2 a non-identity single source
+     is a pure-integer CPU letterbox (the ADR-0103 scaler, 14.1 ms per 1080p frame on one core).
+     **No GPU compose is added before slice 3.**
+   - The aux thread is a dedicated OS thread at `nice +10`, never on the tokio runtime that hosts
+     the output clock.
    - Clean is the Program canvas before the overlay bake, with no extra compose.
    - Preview is a one-cell canvas that follows the M/E's PVW selection through a `SwapCell`.
    - An aux canvas exists only while something selects it.
@@ -115,6 +120,7 @@ What is true on main f5f2230e (the full table with citations is in §1 of the no
      their own sources in steady state. Their audio is delayed by the measured picture age
      (`source_times`): a bounded 4-tick ring, ramped when the age changes.
    - Feed cycles are refused at plan time and at adoption.
+   - A PVW/PGM/AUTO select of `layout:L` requires Read on every source L shows, transitively.
    - `first_slice_me_layout_supported` is removed: with a switcher, the Program canvas is the M/E
      bus, and the configured multi-cell layout becomes the routable stored layout `config`.
    - `apply-layout` keeps its meaning without a switcher. With a switcher it answers 422
@@ -175,8 +181,13 @@ Results (ffprobe and the run log):
 - **The untouched routed output** kept a pure GOP-60 cadence.
 - **The `dead` take** was refused at 50 ticks with b held.
 - **Program:** 900/900 ticks and 0 repeats in both arms. Tick lateness with the aux thread on 4
-  cores: p99 13.6-15.6 ms baseline vs 18.8-19.8 ms with routing (max 18-19 vs 31-34 ms). The
-  shared host ran at load 25-90, so ±5 ms is noise.
+  cores: p99 13.6-15.6 ms baseline vs 18.8-19.8 ms with routing, and max 18-19 vs 31-34 ms.
+  That is +4 to +5 ms at p99 and +13 to +15 ms at max; the max came within 2 ms of a whole tick.
+  The spike's aux canvases used the CPU reference compositor, far heavier than slice 1's path.
+  **The spike proves** no lost or repeated Program tick, continuous PTS on the routed output and
+  clean cuts. **It does not prove** that Program lateness is unaffected. That is measured per slice
+  on mda001 against a stated bound (p50 +1 ms, p99 +2 ms, max +5 ms and below half a tick, 0
+  repeats, HLS PTS delta 3003 on every packet; note §10).
 - **Starved aux thread:** the routed outputs fell to 110/900 fresh frames, gap-filled at a constant
   PTS step, while Program stayed at 0 repeats.
 - **Cost:**
@@ -233,7 +244,8 @@ Results (ffprobe and the run log):
   - RT-17 is superseded by slice 5.
   - SW-27 is superseded.
 - **Slices** (note §10):
-  1. source, VT, bars or Preview to an output, live, from the Outputs page and the API;
+  1. preview, program, VT, bars and source to an output, live, from the Outputs page and the API.
+     This is what the operator named, except layout, and it needs no GPU compose;
   2. explicit audio feed and Clean;
   3. layout to an output;
   4. layout-as-a-source and removal of the first-slice restriction (#243);

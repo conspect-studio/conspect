@@ -103,7 +103,7 @@ That reuse is what makes it decode-once-use-many: a routed feed never opens a de
 | --- | --- | --- | --- |
 | Program | The Program canvas (unchanged) | Output clock | none |
 | Clean | The Program canvas **before** the overlay bake (`item.canvas`, `pipeline.rs:7172`) | Bake consumer | none |
-| Preview | A one-cell aux canvas bound to the PVW source | `routing-aux` | one 1-cell |
+| Preview | A one-cell aux canvas bound to the PVW source | `routing-aux` | one 1-cell (identity or CPU blit in slice 1) |
 | Source / VT / generator | A one-cell aux canvas, `fit = contain` | `routing-aux` | one 1-cell (often identity, §2.4) |
 | Layout | An aux canvas of that layout's cells | `routing-aux` | one N-cell |
 
@@ -154,12 +154,38 @@ The clock's only new duty is one `try_send` of a `Tick` (16 bytes) into a capaci
 
 - One `routing-aux` thread per run, and only while an aux canvas is active. It is an OS thread, not a
   tokio task, at lower scheduling priority than the clock (spike: `setpriority(+10)`).
-- Each aux canvas uses the run's compositor backend (`RunBackend::select`, `pipeline.rs:4140-4175`):
-  the GPU (wgpu) on mda001, the CPU reference in the default build.
+- One-cell canvases (Preview, source, VT, generator) use the identity path or the CPU integer
+  letterbox (§2.4), in every build. N-cell layout canvases (slice 3) use the run's compositor
+  backend (`RunBackend::select`, `pipeline.rs:4140-4175`): wgpu on mda001 under slice 3's gate, the
+  integer path in the default build (§7).
 - At most `routing.max_aux_canvases` canvases are active at once (default 2; admission rule in §7).
 - An aux canvas is **active** only while at least one output, or a layout-as-source bus (§3),
   selects it. An unselected feed costs nothing.
 - Two outputs on the same feed share the canvas. Whether they share one encoder is decided in §4.3.
+
+**Where aux work runs, relative to the Program clock.** Program protection is built into the thread
+placement:
+
+| Work | Runs on | Priority |
+| --- | --- | --- |
+| Program clock and compose | a `tokio::spawn`ed task on the main runtime, unchanged (`crates/multiview-engine/src/programset.rs:546`) | normal |
+| Aux compose | one dedicated OS thread `routing-aux`, never a tokio task, never on the main runtime | `nice +10` (`setpriority` on the thread id) |
+| Aux selection and encode feed | the existing bake consumer thread and the existing encoder workers (`pipeline.rs:5953`, `crates/multiview-cli/src/rendition_workers.rs`) | unchanged |
+
+The aux thread never blocks the runtime the clock runs on. The planned move of the output clock to a
+dedicated thread does not change any of this. A separate lane is also moving network work off the
+main runtime; neither depends on the other.
+
+What aux work shares with Program, and the bound on each:
+
+| Shared resource | Bound |
+| --- | --- |
+| `TileStore` read path | Lock-free ring snapshot plus one relaxed `fetch_max` on the latch watermark (`crates/multiview-framestore/src/tile.rs:493-502`). The aux thread reads at the same `T.pts` Program read, so it selects the same frame. If Program has already advanced the watermark to T+1 and the producer pruned T's frame, the aux read falls back to the earliest retained frame (`tile.rs:592-640`): one frame newer, never a wait and never a change to Program's selection (`fetch_max` to a lower seq is a no-op) |
+| CPU | One thread at `nice +10`. Slice 1: about 0 (identity) to 42 % of one core (1080p letterbox blit, §7) per active canvas. mda001 has 10 threads at about 20 % |
+| Memory bandwidth | A 1080p NV12 frame is 3.1 MB; one blit reads and writes about 6 MB per tick (190 MB/s at 30 fps) |
+| GPU queue | **None in slices 1-2.** First used in slice 3, under that slice's hard gate (§7) |
+| Encoder sessions | **None added by a take** (§4.3) |
+| Program audio bus | Read-only use of the blocks it already produced (§5.2) |
 
 ### 2.4 A single source is a one-cell canvas, not a tile pass-through
 
@@ -185,6 +211,20 @@ drive returns the tile `Arc` without drawing. This makes the common case (a 16:9
 output) free of compose cost. Until the resize settles (1.5 s, `display_size.rs:41`), the compose
 scales the smaller tile. A tile with a different aspect ratio is letterboxed by the compositor.
 
+**No GPU in slice 1.** Ingest tiles are already converted to NV12 and tagged with the canvas colour
+(`CanvasColor::default().output_tag()`, `pipeline.rs:14229`, applied by `TileScaler`). Generators
+that cannot resize decode at the full canvas (`display_size.rs:95-100`). So a routed single source
+is either:
+
+- **the identity**, when the tile is canvas-sized at the canvas aspect ratio (generators, and any
+  16:9 source once its decode follows the routed size); or
+- **a letterbox or pillarbox with a pure-integer CPU blit** (the ADR-0103 wall scaler,
+  `crates/multiview-cli/src/monitor_wall.rs:179-229`), with colour samples copied unchanged (tag
+  equal). Measured at p50 9.4 ms (720p) and 14.1 ms (1080p) per frame on one core.
+
+Slice 1 therefore adds no second GPU compose. It does not use the CPU reference compositor either,
+which is measured at 198 ms per 720p frame on one core.
+
 The identity shortcut is taken **only** when all of these hold; otherwise the full compose runs:
 
 - the tile and the canvas have equal width and height;
@@ -200,7 +240,9 @@ matrix and size, checking pixel values as well as ffprobe tags.
 
 ### 2.5 Preview and Clean
 
-- **Preview** = a one-cell aux canvas whose cell follows the M/E's PVW selection. The switcher hook
+- **Preview is not composed today.** The switcher's PVW "bus" is a raw sample of the PVW source's
+  tile `Arc`, at tile size, for the monitor (`switcher_hook.rs:110-126`). Nothing composes or encodes
+  it. In this design, **Preview** is a one-cell aux canvas whose cell follows the M/E's PVW selection. The switcher hook
   already knows the selection every tick (`switcher_hook.rs:61`). It publishes it into a wait-free
   `SwapCell`, written only when it changes (the ADR-0104 §4 pattern). The aux thread rebinds its cell
   when the cell changes (`CompositorDrive::rebind_cell`, `drive.rs:480`). This is the "own admitted
@@ -446,15 +488,24 @@ Results:
   are not disturbed.
 - **The take to `dead`** was refused at the 50-tick deadline, and B stayed on b.
 - **Program:** 900/900 ticks and 0 repeats in both arms. Program tick lateness with the aux thread
-  limited to 4 cores:
+  limited to 4 cores was:
 
   | Arm | p99 | max |
   | --- | --- | --- |
   | Baseline | 13.6-15.6 ms | 18-19 ms |
   | With routing | 18.8-19.8 ms | 31-34 ms |
 
-  The shared build host ran at load 25-90 on 56 cores, so differences of about 5 ms are noise. A
-  later unpinned run produced the opposite ordering (baseline p99 83 ms, routing 21 ms).
+  That is **+4 to +5 ms at p99 and +13 to +15 ms at max**. The max with routing came within 2 ms of
+  one whole tick (33.4 ms). Both arms ran on the same loaded host (load 25-90 on 56 cores), and the
+  max difference is larger than the run-to-run spread of the baseline. An unpinned pair produced
+  the opposite ordering (baseline p99 83 ms, routing 21 ms), which shows how noisy the host is, but
+  it does not cancel the pinned result.
+
+  **What the spike proves:** no lost and no repeated Program tick, continuous PTS on the routed
+  output, and clean cuts. **What it does not prove:** that Program lateness is unaffected. That
+  spike ran the CPU reference compositor for its aux canvases (about 100 ms per frame on 4 cores),
+  a much heavier load than slice 1's identity and integer blit. Program protection is therefore
+  measured per slice on mda001 against the bound in §10, not inferred from the spike.
 - **When the aux thread was starved**, the routed outputs fell to 110 of 900 fresh frames. The
   spike's encoder thread gap-filled the rest at a constant PTS step. Program stayed at 900/900 and
   0 repeats. That shows the intended degradation order (§7). In production the hold lives in the
@@ -666,7 +717,13 @@ The idempotency store is body-blind. It is keyed by principal, method and path
 is still a replay of the first operation: nothing is applied a second time, and clients must mint a
 new key for every distinct take. A replay returns the recorded `operation_id` and, once known, its
 terminal outcome (`applied`, `superseded`, `refused:*`), never a fresh 202 that implies the feed is
-on air. The outcome arrives as the realtime event
+on air.
+
+The store records only an `OperationId` today (`concurrency.rs:182-212`). Slice 1 therefore adds a
+bounded outcome map **beside** it, keyed by operation id with the same retention. The control-side
+`route.output` subscriber writes the outcome when the engine publishes it. A salvo reserves its key
+only after every member is authorized and validated. So a denied or invalid salvo burns no key, and
+its replay can never return a 202 for an operation that never enqueued. The outcome arrives as the realtime event
 `route.output {output, operation_id, tick, outcome}`, with `outcome` one of:
 
 - `applied`
@@ -714,9 +771,18 @@ affects:
   Read on the added source. Otherwise the edit gets 403 `routed-layout`, naming the affected outputs
   the editor may read and a count of the others. The editor who can read the source and publishes
   it onto an output is accountable for that exposure.
-- **An M/E selection** (PVW, PGM) already requires Program scope plus Read on the selected source
-  (`switcher.rs:99-112`). Every output carrying a bus was taken by a holder of Program scope, so no
-  re-check is needed.
+- **One source-closure function** computes every source a feed shows, transitively through
+  `layout:` cells and `bus:` cells (through the M/E's current selection). It is used by:
+  - output takes;
+  - **PVW/PGM/AUTO selects.** A select of `layout:L` requires Read on L's whole closure. Today
+    `authorize_refs` checks only the selected id (`switcher.rs:102-104`), and slice 4 extends it;
+  - layout edits. An edit of a layout that is in any output feed's closure **or** in the current
+    PVW/PGM selection's closure requires Read on the added sources and Write on the affected
+    outputs.
+
+  So whatever reaches a bus was selected by a principal who could read all of it. An output
+  carrying a bus shows whatever the M/E selects; that is the deliberate Program-scope grant in the
+  table above.
 - **The engine records the taking principal's id** with each output's current feed (in `GET /routing`
   for auditors with whole-system access), so any later exposure can be traced.
 
@@ -745,8 +811,11 @@ it, because 20 takes per second drain in under a tick.
 **Breaking change.** `POST /commands/apply-layout` on a run with `[switcher]` now answers 422
 `switcher-owns-program`. Today it answers 202 and breaks the M/E (`routes/mod.rs:756-786`,
 `switcher_hook.rs:66`). Its optional `target: {output}` alias runs the output take's full path: both
-authorization ends, idempotency and the limits. It does not use `apply-layout`'s layout-only check
-(`routes/mod.rs:802`).
+authorization ends, idempotency, the limits and persistence only after `applied`. It does not use
+`apply-layout`'s layout-only check (`routes/mod.rs:802`) or its commit-before-adopt
+(`routes/mod.rs:876-901`). The 422 `switcher-owns-program` is returned **before** the idempotency
+reservation (today the route reserves first, `routes/mod.rs:815`), so a refused call does not burn
+the key.
 
 ---
 
@@ -962,9 +1031,12 @@ Also checked:
    run without routing (CI host); the ratio is checked on mda001.
 2. **Failing feeds:** routed sources die, reconnect and flap every 2 s during takes. Never a stale
    or black frame on a routed output: pixel-probe each frame against the expected feed.
-2b. **Ongoing authorization:** a layout edit that adds an unreadable source to a routed layout is
-   refused (403 `routed-layout`). A PVW select by another principal cannot expose a source to a
-   principal without Program scope. Redaction holds on plan, 409 and event bodies.
+2b. **Ongoing authorization:**
+   - a layout edit that adds an unreadable source to a routed layout, or to the current PVW/PGM
+     layout, is refused (403 `routed-layout`);
+   - a principal with Program scope but no Read on S cannot select a `layout:` that shows S onto
+     PVW or PGM, directly or through nested `layout:` or `bus:` cells;
+   - redaction holds on plan, 409 and event bodies.
 3. **Wedged aux thread:** blocked forever on the first frame. Program gets 40/40 ticks with
    contiguous PTS; routed outputs hold last-good; `routing.degraded` is raised (the
    `a_blocked_wall_worker_costs_the_output_clock_zero_ticks` pattern).
@@ -990,6 +1062,22 @@ clock-adjacent path, otherwise as `scripts/classify.sh` says.
 | 4 | Layout-as-a-source on the M/E (PVW/PGM/AUTO); `bus:program` and `bus:preview` cells; cycle refusal; first-slice restriction removed; `apply-layout` semantics | "in, around, through" (#243) | R3. `multiview-engine`, `-cli`, `-config`, `-control` | More than one M/E |
 | 5 | Crosspoint matrix Routing page (video + audio, tally, all states), output salvos (`/routing/salvo/*`, `Salvo.output`) | One screen for everything, atomic multi-output takes | R2. `web`, `multiview-control`, `-config`, `-engine` (salvo adoption) | — |
 
+**Program protection bound: acceptance for every slice.** Measured on mda001 over at least 10
+minutes with N routed feeds active, against the same 10-minute measurement with none:
+
+| Measure | Bound |
+| --- | --- |
+| Program tick lateness p50 | within +1 ms |
+| Program tick lateness p99 | within +2 ms |
+| Program tick lateness max | within +5 ms, and below half a tick (16.7 ms) |
+| `frames_repeated` (ticks behind) | 0 |
+| HLS video | every packet's PTS delta is 3003 |
+
+Program tick lateness is not exported today. Slice 1 adds the measurement: a histogram of emit time
+minus deadline, at the point `state_of` runs, and a `frames_repeated` counter
+(`crates/multiview-engine/src/runtime.rs:354-361`) on the metrics endpoint. Every R3 slice also owes
+its chaos/soak tests (§9: take flood, a feed that dies, a stalled aux worker).
+
 **Slice 1 acceptance on mda001:**
 
 - From the Outputs page, take the SRT output to bars, then to `vt1`, then Preview, then Program,
@@ -997,12 +1085,19 @@ clock-adjacent path, otherwise as `scripts/classify.sh` says.
 - ffprobe on each stream: PTS step constant, `K` at each cut tick, SPS/PPS unchanged, no HLS
   discontinuity.
 - The SRT and HLS audio follow (1 kHz tone on bars).
-- Program tick lateness p99 is within 2 ms of the previous hour.
+- The Program protection bound above, with both outputs routed (N = 2).
 - NVENC sessions unchanged (5), as planned.
 - A take to the failed `times-square` is refused at 50 ticks while the output keeps its feed.
 
-Slice 1 is the least engine risk: one-cell canvases are mostly the identity, no GPU composite is
-added, and audio uses blocks the bus already produces.
+**What slice 1 gives the operator, by his own words:** **preview, program, VT, bars, source**, on
+any output, live. **Not layout.** Layout needs an N-cell compose, which on mda001 means a second
+GPU compose beside Program, and that is unproven. It ships in slice 3 under its own gate.
+
+Slice 1 is the least engine risk:
+
+- no GPU work is added (identity or a CPU integer blit, §2.4);
+- no encoder or binding changes (§4.3);
+- audio uses blocks the bus already produces (§5.2).
 
 **Mapping of old backlogs and issues:**
 
