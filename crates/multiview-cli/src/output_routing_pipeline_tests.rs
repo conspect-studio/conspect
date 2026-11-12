@@ -144,9 +144,30 @@ fn drive_full<F>(
 where
     F: FnOnce(OutputRoutingSlot) + Send + 'static,
 {
+    drive_clocked(template, audio, switcher, prefix, ticks, None, control)
+}
+
+/// As [`drive_full`], with an optional boot-take retry policy (a test of the
+/// give-up path shortens the 30 s window to stay within its wall bound).
+fn drive_clocked<F>(
+    template: &str,
+    audio: bool,
+    switcher: bool,
+    prefix: &str,
+    ticks: u64,
+    boot_retry: Option<super::BootRetryPolicy>,
+    control: F,
+) -> Run
+where
+    F: FnOnce(OutputRoutingSlot) + Send + 'static,
+{
     let config =
         multiview_config::MultiviewConfig::load_from_toml(&template.replace('@', prefix)).unwrap();
     let mut pipeline = Pipeline::build(&config).unwrap();
+    pipeline.address_boot_feeds_to_test_sinks(&config);
+    if let Some(policy) = boot_retry {
+        pipeline.set_boot_retry(policy);
+    }
     if audio {
         pipeline.enable_program_audio();
     }
@@ -879,5 +900,134 @@ fn a_take_to_clean_carries_the_pre_bake_canvas_through_the_real_pipeline() {
         } else {
             assert_eq!(differing, 0, "tick {t}: no bake in this build");
         }
+    }
+}
+
+/// `CONFIG` plus a persisted feed for `out1`: `video = { source = "<id>" }`,
+/// and a third source `@_never`: a file source whose file does not exist, so
+/// it never produces a picture (never fresh).
+fn boot_config(feed_source: &str) -> String {
+    format!(
+        "{CONFIG}\n[[sources]]\nid = \"@_never\"\nkind = \"file\"\npath = \"/nonexistent/multiview-routing-e2e/@/never.ts\"\n[[routing.output]]\noutput = \"out1\"\nvideo = {{ source = \"{feed_source}\" }}\n"
+    )
+}
+
+/// #329 F1(b): a run whose config persists `out1 = { source = X }` comes up
+/// with `out1` on `src:X` after the boot take (a live source; a refused boot
+/// take on a starved host is re-issued within the window), `out0` on Program
+/// throughout, one window per tick on both.
+#[test]
+fn a_persisted_source_feed_is_on_air_after_the_boot_take() {
+    const TICKS: u64 = 300;
+    let applied = Arc::new(Mutex::new(None::<TakeOutcome>));
+    let record = Arc::clone(&applied);
+    let template = boot_config("@_b");
+    let run = drive_clocked(&template, false, false, "route_boot", TICKS, None, move |slot| {
+        let handle = wait_for("the routing handle", Duration::from_secs(10), || slot.load());
+        let outcomes = handle.outcomes().expect("one outcome reader");
+        let o = wait_for("the boot take applied", Duration::from_secs(10), || {
+            outcomes
+                .try_iter()
+                .find(|o| o.operation_id == "boot:test-sink-1" && o.outcome == TakeResult::Applied)
+        });
+        // The readback agrees with the outcome: out1 on air on the source.
+        wait_for("the readback shows the source on air", Duration::from_secs(1), || {
+            let s = handle.snapshot();
+            (s.outputs[1].bus == "src:route_boot_b"
+                && s.outputs[0].bus == "program"
+                && s.boot_takes_pending == 0)
+                .then_some(())
+        });
+        *record.lock().unwrap() = Some(o);
+    });
+    let applied = applied.lock().unwrap().clone().expect("boot take applied");
+    assert_eq!(applied.output_index, 1);
+    assert_eq!(applied.bus, PictureBus::Source("route_boot_b".to_owned()));
+    assert_eq!(run.final_snapshot.boot_takes_given_up, 0);
+    assert_eq!(run.frames, TICKS);
+    let all: Vec<i64> = (0..i64::try_from(TICKS).unwrap()).collect();
+    assert_eq!(pts_of(&run.outputs[0]), all, "out0: every Program window");
+    // Contiguous, one window per tick, from tick 0 through the cut and on to
+    // within 5 ticks of the end. The last few windows of a live-opened
+    // encoder race the run's shutdown (seen under a parallel test load: one
+    // tail window missing); that end-of-run tail is outside this test.
+    let steady: Vec<i64> = pts_of(&run.outputs[1])
+        .into_iter()
+        .filter(|&t| t < i64::try_from(TICKS).unwrap() - 5)
+        .collect();
+    assert_eq!(
+        steady,
+        all[..steady.len()],
+        "out1: one window per tick across the cut"
+    );
+    assert_eq!(steady.len() as u64, TICKS - 5, "out1 carried to the end");
+    let first = run.outputs[1]
+        .iter()
+        .find(|p| p.0 == i64::try_from(applied.tick).unwrap())
+        .unwrap();
+    assert!(first.1 && first.2, "the cut lands on a keyframe with a sequence header: {first:?}");
+}
+
+/// #329 F1(b): a persisted feed whose source never becomes fresh: the boot
+/// take is refused `feed-not-fresh`, re-issued (at most once per retry
+/// period) through the window, then given up; the output stays on Program and
+/// Program is untouched (one window per tick on both outputs). The policy is
+/// shortened (retry 2 s, window 8 s) only to bound the wall time; production
+/// uses 2 s / 30 s (`BootRetryPolicy::default`).
+#[test]
+fn a_never_fresh_boot_feed_is_retried_then_given_up_and_program_is_untouched() {
+    // 25 fps: the 8 s window = 200 ticks; run past it.
+    const TICKS: u64 = 330;
+    const WINDOW_TICKS: u64 = 200;
+    let refusals = Arc::new(Mutex::new(Vec::<u64>::new()));
+    let record = Arc::clone(&refusals);
+    let template = boot_config("@_never");
+    let policy = super::BootRetryPolicy {
+        retry_secs: 2,
+        window_secs: 8,
+    };
+    let run = drive_clocked(&template, false, false, "route_bootnf", TICKS, Some(policy), move |slot| {
+        let handle = wait_for("the routing handle", Duration::from_secs(10), || slot.load());
+        let outcomes = handle.outcomes().expect("one outcome reader");
+        let start = Instant::now();
+        while start.elapsed() < Duration::from_secs(30) {
+            while let Ok(o) = outcomes.try_recv() {
+                assert_eq!(o.operation_id, "boot:test-sink-1", "{o:?}");
+                assert_eq!(
+                    o.outcome,
+                    TakeResult::Refused(super::RefuseReason::FeedNotFresh),
+                    "{o:?}"
+                );
+                record.lock().unwrap().push(o.tick);
+            }
+            if handle.snapshot().boot_takes_given_up == 1 {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        panic!("the boot take was never given up");
+    });
+    let ticks = refusals.lock().unwrap().clone();
+    // Each attempt waits out the 50-tick prime deadline; a re-issue comes no
+    // sooner than 2 s (50 ticks) after the previous issue, and only inside
+    // the window — so at most WINDOW/50 + 1 attempts.
+    assert!(ticks.len() >= 2, "retried: {ticks:?}");
+    assert!(ticks.len() <= 5, "bounded: {ticks:?}");
+    for pair in ticks.windows(2) {
+        assert!(pair[1] - pair[0] >= 50, "at most one attempt per 2 s: {ticks:?}");
+    }
+    assert!(
+        ticks.iter().all(|&t| t <= WINDOW_TICKS + super::TAKE_PRIME_DEADLINE_TICKS + 2),
+        "no attempt after the window: {ticks:?}"
+    );
+    let s = &run.final_snapshot;
+    assert_eq!(s.boot_takes_given_up, 1);
+    assert_eq!(s.boot_takes_pending, 0);
+    assert!(s.outputs.iter().all(|o| o.bus == "program" && o.pending.is_none()));
+    assert_eq!(s.dynamic_encoders_live, 0, "no encoder was ever opened");
+    assert_eq!(run.frames, TICKS);
+    let all: Vec<i64> = (0..i64::try_from(TICKS).unwrap()).collect();
+    for (i, output) in run.outputs.iter().enumerate() {
+        assert_eq!(pts_of(output), all, "output {i}: Program untouched");
     }
 }

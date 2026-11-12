@@ -2225,6 +2225,8 @@ pub struct Pipeline {
     /// not Program (#329). Each becomes one boot take after the run's routing
     /// handle is published; the engine itself always starts on Program.
     boot_output_feeds: Vec<(String, crate::routing_aux::PictureBus)>,
+    /// The boot takes' retry policy (the defaults; a test shortens it).
+    boot_retry: crate::output_routing::BootRetryPolicy,
     /// The running Program's lateness histogram + repeats counter (ADR-0108
     /// §10), published at run start for the control plane's metrics route.
     program_metrics: ProgramMetricsSlot,
@@ -3304,6 +3306,7 @@ impl Pipeline {
             window_subscriptions: crate::output_window_registry::window_subscription_slot(),
             output_routing: crate::output_routing::output_routing_slot(),
             boot_output_feeds: boot_output_feeds(config),
+            boot_retry: crate::output_routing::BootRetryPolicy::default(),
             program_metrics: Arc::new(multiview_framestore::SwapCell::empty()),
             optional_preview: None,
             window_dependencies: Arc::new(window_dependency_axes(config)),
@@ -3543,6 +3546,7 @@ impl Pipeline {
                 max_encoders: crate::output_routing::DEFAULT_MAX_ENCODERS,
                 max_per_principal: crate::output_routing::DEFAULT_MAX_PER_PRINCIPAL,
                 has_preview,
+                boot_retry: self.boot_retry,
             },
             crate::output_routing::AuxWiring {
                 feeds,
@@ -4317,6 +4321,25 @@ impl Pipeline {
         // by the per-tick snapshot projection; replaced wholesale per run).
         self.push_links.store(Arc::new(links));
         (runners, binding_ids)
+    }
+
+    /// Test seam: shorten the boot-take retry policy (wall-clock bound tests).
+    #[cfg(test)]
+    pub(crate) fn set_boot_retry(&mut self, policy: crate::output_routing::BootRetryPolicy) {
+        self.boot_retry = policy;
+    }
+
+    /// Test seam: the fake sinks of [`Self::drive_streaming_for_test`] are
+    /// addressed as `test-sink-<index>`, so rename each boot feed's output to
+    /// the fake sink at the configured output's position.
+    #[cfg(test)]
+    pub(crate) fn address_boot_feeds_to_test_sinks(&mut self, config: &MultiviewConfig) {
+        let ids: Vec<String> = config.outputs.iter().map(multiview_config::Output::id).collect();
+        for (id, _) in &mut self.boot_output_feeds {
+            if let Some(index) = ids.iter().position(|o| o == id) {
+                *id = format!("test-sink-{index}");
+            }
+        }
     }
 
     /// **Test seam** (ADR-0025): drive the streaming bake→encode→fan-out path

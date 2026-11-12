@@ -184,6 +184,7 @@ fn router(
             max_encoders: max,
             max_per_principal: DEFAULT_MAX_PER_PRINCIPAL,
             has_preview: false,
+            boot_retry: BootRetryPolicy::default(),
         },
         aux,
         open,
@@ -407,6 +408,7 @@ fn harness_with(outputs: usize, max: usize, open: Option<OpenFn>, has_preview: b
             max_encoders: max,
             max_per_principal: DEFAULT_MAX_PER_PRINCIPAL,
             has_preview,
+            boot_retry: BootRetryPolicy::default(),
         },
         AuxWiring {
             feeds: Arc::new(SwapCell::from_pointee(Vec::new())),
@@ -2138,4 +2140,62 @@ fn a_transient_offer_stall_within_the_gap_fill_horizon_never_degrades() {
     );
     assert_eq!(x.d.binding_video_key(1), Some(1), "still on the Clean key");
     drop(release);
+}
+
+/// #329: a refused boot take is re-issued no sooner than the retry period;
+/// an operator take on the same output ends the boot intent for good (the
+/// boot take is superseded and never re-issued).
+#[test]
+fn an_operator_take_ends_a_boot_take_retry_window() {
+    let (mut r, h, _aux) = router(2, 6, Box::new(|_| Err("never".to_owned())));
+    let outcomes = h.outcomes().unwrap();
+    let mut d = dispatcher(2);
+    let boot = OutputTake {
+        operation_id: format!("{BOOT_TAKE_PREFIX}o1"),
+        output_index: 1,
+        bus: PictureBus::Source("cam".to_owned()),
+        principal: BOOT_PRINCIPAL.to_owned(),
+    };
+    h.try_take(boot).unwrap();
+    // CADENCE is 5/1: 2 s = 10 ticks; the prime deadline is 50 ticks.
+    let mut t = 0;
+    let mut refused = Vec::new();
+    while refused.len() < 2 {
+        r.on_tick(t, MediaTime::from_nanos(0), &mut d, &mut NoDelivery)
+            .unwrap();
+        refused.extend(outcomes.try_iter().map(|o| (o.tick, o.outcome)));
+        t += 1;
+        assert!(t < 400, "never retried: {refused:?}");
+    }
+    assert!(refused
+        .iter()
+        .all(|(_, o)| *o == TakeResult::Refused(RefuseReason::FeedNotFresh)));
+    assert!(refused[1].0 - refused[0].0 >= TAKE_PRIME_DEADLINE_TICKS);
+    assert_eq!(r.snapshot.load().boot_takes_pending, 1);
+    // The operator takes Program on that output while the boot take retries.
+    h.try_take(take("op", 1, PictureBus::Program)).unwrap();
+    for _ in 0..200 {
+        r.on_tick(t, MediaTime::from_nanos(0), &mut d, &mut NoDelivery)
+            .unwrap();
+        t += 1;
+    }
+    let after: Vec<_> = outcomes
+        .try_iter()
+        .map(|o| (o.operation_id, o.outcome))
+        .collect();
+    // At most one boot outcome (the pending attempt, superseded) and then
+    // only the operator's take.
+    let boot: Vec<_> = after
+        .iter()
+        .filter(|(op, _)| op.starts_with(BOOT_TAKE_PREFIX))
+        .collect();
+    assert!(
+        boot.len() <= 1 && boot.iter().all(|(_, o)| *o == TakeResult::Superseded),
+        "the boot take is never re-issued after an operator take: {after:?}"
+    );
+    assert!(
+        after.iter().any(|(op, o)| op == "op" && *o == TakeResult::Applied),
+        "{after:?}"
+    );
+    assert_eq!(r.snapshot.load().boot_takes_pending, 0);
 }

@@ -503,6 +503,27 @@ pub struct RouterConfig {
     pub max_per_principal: usize,
     /// Whether an M/E exists (Preview is routable).
     pub has_preview: bool,
+    /// The start-up take retry policy (#329).
+    pub boot_retry: BootRetryPolicy,
+}
+
+/// How a refused start-up (boot) take is retried: re-issued at most once per
+/// `retry_secs`, for at most `window_secs` after the run's first tick.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BootRetryPolicy {
+    /// Minimum seconds between two issues of one output's boot take.
+    pub retry_secs: i64,
+    /// The window after the first tick; then the output stays on Program.
+    pub window_secs: i64,
+}
+
+impl Default for BootRetryPolicy {
+    fn default() -> Self {
+        Self {
+            retry_secs: BOOT_RETRY_SECS,
+            window_secs: BOOT_WINDOW_SECS,
+        }
+    }
 }
 
 /// Aux-side wiring the router drives.
@@ -993,7 +1014,7 @@ impl OutputRouter {
     /// other refusal gives up. The persisted feed is never touched here: the
     /// operator's intent stays, the readback shows the live bus.
     fn on_boot_outcome(&mut self, operation_id: &str, index: usize, tick: u64, outcome: TakeResult) {
-        let retry_ticks = self.ticks_for(BOOT_RETRY_SECS);
+        let retry_ticks = self.ticks_for(self.cfg.boot_retry.retry_secs);
         let Some(slot) = self
             .boot
             .get_mut(index)
@@ -1029,7 +1050,7 @@ impl OutputRouter {
     /// Re-issue due boot takes inside the window; give up after it. Bounded:
     /// one check per output, only while a boot take is still unresolved.
     fn retry_boot_takes(&mut self, tick: u64) {
-        let window = self.ticks_for(BOOT_WINDOW_SECS);
+        let window = self.ticks_for(self.cfg.boot_retry.window_secs);
         let first = self.first_tick.unwrap_or(tick);
         for index in 0..self.boot.len() {
             let Some(due) = self.boot.get(index).and_then(|b| b.as_ref()).and_then(|b| b.due)
@@ -1046,7 +1067,7 @@ impl OutputRouter {
                     tracing::warn!(
                         output = index,
                         feed = %boot.take.bus.as_str(),
-                        window_secs = BOOT_WINDOW_SECS,
+                        window_secs = self.cfg.boot_retry.window_secs,
                         "routing: the start-up feed never became takeable; the output stays on \
                          Program (the configured feed is kept)"
                     );
