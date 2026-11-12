@@ -375,6 +375,12 @@ where
             crate::output_routing_control::ProgramMetricsAdapter(slot),
         ));
     }
+    // Front-door ACME (ADR-0107 section 5a): the run started the ACME service
+    // before binding; its context mounts `/api/v1/tls/*` on this listener.
+    #[cfg(all(feature = "acme", unix))]
+    if let Some(tls) = crate::tls_boot::installed_tls_context() {
+        state = state.with_tls(tls);
+    }
     #[cfg(feature = "ffmpeg")]
     if let Some(slot) = crate::output_routing_control::installed_output_routing() {
         state = state.with_output_routing(std::sync::Arc::new(

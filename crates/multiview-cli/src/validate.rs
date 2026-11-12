@@ -175,7 +175,11 @@ pub fn validate_config(path: &Path) -> anyhow::Result<ValidationReport> {
     // invalid one still benefits — the operator fixes everything in one pass).
     let warnings = config_warnings(&config);
 
-    match config.validate() {
+    match config
+        .validate()
+        .map_err(|e| e.to_string())
+        .and_then(|()| crate::tls_cli::ensure_acme_supported(&config))
+    {
         Ok(()) => {
             let summary = summarize(&config);
             let start = start_check(&config, &text, path);
@@ -188,9 +192,7 @@ pub fn validate_config(path: &Path) -> anyhow::Result<ValidationReport> {
         }
         Err(err) => Ok(ValidationReport {
             path: path.to_path_buf(),
-            status: ValidationStatus::Invalid {
-                reason: err.to_string(),
-            },
+            status: ValidationStatus::Invalid { reason: err },
             warnings,
             start: None,
         }),

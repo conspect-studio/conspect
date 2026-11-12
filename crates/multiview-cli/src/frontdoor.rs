@@ -16,6 +16,20 @@
 //! Without it nothing changes: WebRTC binds `webrtc.udp_port`, MoQ
 //! binds `MULTIVIEW_MOQ_BIND`, both on the main runtime as before. Old configs
 //! start unchanged.
+//!
+//! **Certificates (slice 5, ADR-0107 section 5a).** With `[network.tls]` the
+//! run starts the ACME wiring ([`crate::tls_boot`]) before the control plane
+//! binds, and:
+//!
+//! * the QUIC lane is held: MoQ starts on it only once the certificate source
+//!   is `serving` ([`start_moq_when_serving`]), and then serves the ACME
+//!   certificate through `SourceResolver` (renewals reach new handshakes with
+//!   no restart), never the `MULTIVIEW_MOQ_CERTIFICATE` files;
+//! * slice 4's TCP 443 listener (not built yet) takes the TLS-ALPN-01-aware
+//!   resolver from [`front_door_tls`] and mounts
+//!   `multiview_control::tls_setup::front_door_router(state)` (the control
+//!   router behind the setup gate). The `[control] listen` listener stays the
+//!   loopback admin listener and is not gated.
 
 use std::sync::Arc;
 
@@ -169,6 +183,49 @@ impl FrontDoorRun {
     #[must_use]
     pub fn stats(&self) -> Arc<multiview_frontdoor::Stats> {
         self.door.stats()
+    }
+}
+
+/// The resolver slice 4's TCP 443 listener installs (ACME certificate, with
+/// TLS-ALPN-01 challenges answered for ALPN `acme-tls/1`), when the run has
+/// `[network.tls]`. Mount it with `multiview_control::tls_setup::front_door_router`.
+#[cfg(all(feature = "acme", unix))]
+#[must_use]
+pub fn front_door_tls() -> Option<Arc<multiview_control::certificate_source::ChallengeResolver>> {
+    crate::tls_boot::installed_tls_context().map(|tls| Arc::clone(&tls.resolver))
+}
+
+/// Hold the front-door QUIC lane until the ACME source is serving, then start
+/// MoQ on it with the ACME certificate and install the real provider into
+/// `deferred`. Bounded by `shutdown`; a control-plane task, never on the
+/// output clock (it only awaits a watch channel).
+#[cfg(all(feature = "acme", unix, feature = "moq-output"))]
+pub async fn start_moq_when_serving(
+    tls: Arc<multiview_control::tls_setup::TlsContext>,
+    shutdown: impl std::future::Future<Output = ()>,
+    endpoint: String,
+    protocol: String,
+    factory: Option<Arc<dyn multiview_control::moq_provider::AuthorizedFeedFactory>>,
+    socket: multiview_moq::provider::SharedSocket,
+    deferred: Arc<multiview_control::moq_startup::DeferredProvider>,
+) {
+    tracing::info!("front door: QUIC/MoQ held until the ACME certificate is serving");
+    if !crate::tls_boot::wait_serving(Arc::clone(&tls.certificates), shutdown).await {
+        return;
+    }
+    let resolver: Arc<dyn multiview_moq::moq_tokio_rustls::server::ResolvesServerCert> = Arc::new(
+        multiview_control::certificate_source::SourceResolver(Arc::clone(&tls.certificates)),
+    );
+    match multiview_control::moq_startup::start_shared_resolver(
+        endpoint, protocol, factory, socket, resolver,
+    )
+    .await
+    {
+        Ok(provider) => {
+            deferred.set(provider);
+            tracing::info!("front door: certificate serving; QUIC/MoQ started");
+        }
+        Err(_) => tracing::error!("front door: MoQ listener failed to start on the QUIC lane"),
     }
 }
 
