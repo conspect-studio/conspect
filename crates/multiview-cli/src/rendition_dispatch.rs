@@ -3244,8 +3244,10 @@ mod tests {
             d.take_move_outcomes(),
             vec![MoveOutcome::Fallback { output_index: 1 }]
         );
-        // Window 3 (a P frame after the switch) is lost; window 4 starts at the RAP.
-        assert_eq!(pop_all(&mut sink, 1, later), vec![(77, 2)]);
+        // Window 3's video (a P frame after the switch) is dropped and its
+        // audio kept, with no loss (review #319 R); window 4 starts at the RAP.
+        assert_eq!(pop_all(&mut sink, 1, later), vec![(8, 1), (77, 2)]);
+        assert_eq!(sink.queues[1].take_discontinuity(), None, "no loss");
         assert!(!sink.aborted);
         // Output A was never disturbed.
         assert_eq!(sink.windows.iter().filter(|w| w.0 == 0).count(), 5);
