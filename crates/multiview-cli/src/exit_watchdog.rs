@@ -170,6 +170,13 @@ pub const EXIT_PATH_GRACE: Duration = Duration::from_millis(500);
 // could itself block, so a backstop thread kills the process with SIGKILL if
 // `exit` has not finished within EXIT_PATH_GRACE.
 fn exit_process(cause: ExitCause) {
+    // A stop whose outputs have not finalised by the deadline did not stop
+    // cleanly: report it as a failure (a wedged consumer or sink, #309).
+    let cause = if cause == ExitCause::Stop && OUTPUTS_OPEN.load(Ordering::Acquire) > 0 {
+        ExitCause::Fatal
+    } else {
+        cause
+    };
     let _ = std::thread::Builder::new()
         .name("multiview-exit-notice".to_owned())
         .spawn(move || {
@@ -210,6 +217,31 @@ fn kill_self() {
 }
 
 static WATCHDOG: OnceLock<Watchdog> = OnceLock::new();
+
+/// Live output egresses that have not finalised yet.
+static OUTPUTS_OPEN: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// A live output egress started (its outputs are open until finalised).
+pub fn outputs_opened() {
+    OUTPUTS_OPEN.fetch_add(1, Ordering::AcqRel);
+}
+
+/// A live output egress finalised every output (consumer done, every sink
+/// joined, nothing wedged).
+pub fn outputs_finalised() {
+    let mut current = OUTPUTS_OPEN.load(Ordering::Acquire);
+    while current > 0 {
+        match OUTPUTS_OPEN.compare_exchange_weak(
+            current,
+            current - 1,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => return,
+            Err(seen) => current = seen,
+        }
+    }
+}
 
 /// Start the process exit watchdog. Called once by the `multiview` binary's
 /// `main`; a library user (tests, other binaries) never calls it, so [`arm`]

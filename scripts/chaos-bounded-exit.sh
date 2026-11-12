@@ -5,13 +5,16 @@
 # H.264-capable `ffmpeg` feature set) N times on a two-source HLS config:
 #   fatal: the bake consumer stalls once (the output falls behind the clock and
 #          the run fails) while source teardown is held far past every grace;
-#   stop:  SIGTERM while source teardown is held.
+#   stop:  SIGTERM while source teardown is held;
+#   stopwedge: SIGTERM while the consumer is stalled (an output that cannot
+#          finalise during the stop): exit code 1 within the bound.
 # Asserts for every run: exit code (1 fatal, 0 stop), the time from the
 # decision (the fatal log line / the signal) to the process exit is within the
 # bound + slack, and the on-disk HLS manifest is valid and lists only complete
 # segments.
 #
 # Usage: scripts/chaos-bounded-exit.sh <multiview-binary> [runs=20] [mode=both]
+#   mode "both" runs all three modes (fatal, stop, stopwedge).
 set -euo pipefail
 
 BIN="${1:?usage: chaos-bounded-exit.sh <multiview-binary> [runs] [fatal|stop|both]}"
@@ -107,7 +110,11 @@ run_once() {
       [ "${waited}" -lt 300 ] || { echo "run ${i} (stop): pipeline never started"; tail -20 "${log}"; return 1; }
     done
     if [ "${mode}" = stopwedge ]; then
-      until grep -q "chaos: stalling the bake consumer" "${log}" 2>/dev/null; do sleep 0.05; done
+      local w2=0
+      until grep -q "chaos: stalling the bake consumer" "${log}" 2>/dev/null; do
+        sleep 0.05; w2=$((w2 + 1))
+        [ "${w2}" -lt 400 ] || { echo "run ${i} (stopwedge): stall seam never reached"; tail -20 "${log}"; kill -KILL "${pid}"; return 1; }
+      done
       sleep 0.2
     else
       sleep 2
@@ -137,9 +144,7 @@ PY
     [ -n "${t_decide}" ] || { echo "run ${i} (${mode}): no fatal line"; tail -20 "${log}"; return 1; }
   fi
   local took=$((t_exit - t_decide)) want=$([ "${mode}" = stop ] && echo 0 || echo 1)
-  # stopwedge: the bound runs from the fatal upgrade (≤ 0.5 s after the
-  # signal), so allow that on top.
-  local extra=$([ "${mode}" = stopwedge ] && echo 500 || echo 0)
+  local extra=0
   echo "run ${i} (${mode}): rc=${rc} decision->exit=${took} ms"
   [ "${rc}" = "${want}" ] || { echo "  FAIL: exit code ${rc}, want ${want}"; tail -20 "${log}"; return 1; }
   # The bound must come from the watchdog (the held teardown cannot finish in

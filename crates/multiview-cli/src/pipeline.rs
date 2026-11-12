@@ -162,12 +162,6 @@ const HLS_LIVE_WINDOW: usize = 6;
 /// (reaped at process exit). Matches the ingest [`INGEST_JOIN_GRACE`] posture.
 const SINK_WEDGE_GRACE: Duration = Duration::from_secs(2);
 
-/// How long the egress join waits for a healthy consumer before treating it as
-/// failing and upgrading a stop exit to a fatal one (#309). A healthy consumer
-/// finishes in under 100 ms (measured), so 500 ms is generous and still leaves
-/// a fatal's own full exit bound.
-const EGRESS_SUSPECT_AFTER: Duration = Duration::from_millis(500);
-
 /// How the hot-loop projection hands each composited tick to the bake consumer
 /// over the bounded streaming queue (ADR-0025). The choice is the single
 /// load-bearing split between the offline render and the live daemon.
@@ -5996,6 +5990,10 @@ impl StreamEgress {
         let arm_exit_on_fatal = matches!(policy, SendPolicy::DropOnOverload)
             && consumer_fault_after_ticks.is_none()
             && shed_at_tick.is_none();
+        if arm_exit_on_fatal {
+            // #309: open until the egress join finalises every output.
+            crate::exit_watchdog::outputs_opened();
+        }
         let consumer_in_flight = Arc::clone(&in_flight);
         let fatal = Arc::new(AtomicBool::new(false));
         let consumer_fatal = Arc::clone(&fatal);
@@ -6166,16 +6164,7 @@ impl StreamEgress {
         // after this bounded error, and the detached thread cannot poison a new
         // in-process encoder generation.
         let deadline = Instant::now() + SINK_WEDGE_GRACE;
-        // #309: a consumer that is not done after this much of the grace is a
-        // failing output: upgrade a stop to a fatal NOW, while the exit bound
-        // still has room, rather than after the whole grace.
-        let suspect_at = Instant::now() + EGRESS_SUSPECT_AFTER;
-        let mut upgraded = false;
         while !self.consumer.is_finished() && Instant::now() < deadline {
-            if !upgraded && self.arm_on_wedge && Instant::now() >= suspect_at {
-                crate::exit_watchdog::arm(crate::exit_watchdog::ExitCause::Fatal);
-                upgraded = true;
-            }
             std::thread::park_timeout(Duration::from_millis(10));
         }
         if !self.consumer.is_finished() {
@@ -6252,6 +6241,10 @@ impl StreamEgress {
             }
             lines.push(outcome.line);
             frames.push(outcome.frames);
+        }
+        // #309: every output finalised (no sink was detached as wedged).
+        if self.arm_on_wedge && !lines.iter().any(|l| l.contains("WEDGED")) {
+            crate::exit_watchdog::outputs_finalised();
         }
         Ok(EgressOutcome {
             lines,

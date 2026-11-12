@@ -49,9 +49,14 @@ restarting.
    - The output clock sees the egress fatal flag (`stop_on_egress_failure`) or a disconnected hot
      queue. This also covers a consumer that died without returning, for example a panic.
    - The engine loop returns an error.
-   - The egress join sees the consumer still running 500 ms in (a healthy consumer finishes in
-     under 100 ms), or returns an error. This upgrades a stop to a fatal, and the fatal gets its
+   - The egress join returns an error. This upgrades a stop to a fatal, and the fatal gets its
      own full bound.
+   - **Outputs still open at the deadline.** Each live egress counts as open until its join has
+     finalised every output (the consumer is done, every sink is joined, none is detached as
+     wedged). If a stop reaches the deadline with outputs still open, it exits 1, not 0: the
+     outputs did not finalise. This covers a wedged consumer and a wedged sink alike. A slow
+     but healthy drain that finishes before the deadline still exits 0. There is no progress
+     heuristic: only the result matters.
    - Any failed `run` (startup or engine, full pipeline or `--software`).
    - A stop signal (SIGTERM or Ctrl-C).
    - Not armed: a failed non-run command, an offline render (every arm in the pipeline is gated
@@ -141,10 +146,10 @@ change shortens dead output after a fault; it does not change the tick path.
 
   The same for SIGTERM (sent once the pipeline runs and the process is alive), with exit code 0.
   The `stopwedge` mode sends SIGTERM while the consumer is stalled (an output that cannot
-  finalise during a stop). It requires exit code 1 within 0.5 s + 2 s + 0.5 s of the signal.
+  finalise during a stop). It requires exit code 1 within 2 s + 0.5 s of the signal.
 
-  On the Apple-silicon host: 20 × each mode, 0 failures. fatal and stop exited at 2.08–2.10 s;
-  stopwedge at 2.60–2.94 s. CI (macOS job) runs 10 × each mode.
+  On the Apple-silicon host: 20 × each mode, 0 failures, exits at 2.08–2.12 s. CI (macOS job)
+  runs 10 × each mode.
 - **Negative control:** with `enable()` removed, the same runs exit after 40 s and fail.
 - **Release guard:** the `_chaos-test-seams` feature is in the `*test-seam*` family, so the
   release-feature guard keeps it out of every shipped preset.
