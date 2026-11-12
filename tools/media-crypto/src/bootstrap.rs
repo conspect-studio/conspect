@@ -614,9 +614,13 @@ impl Bootstrap {
         for i in 0..2 {
             self.renew(t)?;
             let b = &self.bookings.as_ref().ok_or("no bookings")?[i];
+            // A transport failure (no answer inside the transport timeout) is a
+            // late or lost answer, not a refusal: keep it distinguishable so the
+            // runtime can retry it on its own bounded budget. Only an answered
+            // non-200 or a malformed body is "mapping grant rejected".
             let r = self
                 .bounded_grant(t, i, b)
-                .map_err(|_| "mapping grant rejected")?;
+                .map_err(|_| "mapping grant transport")?;
             let bytes = Zeroizing::new(r.body);
             if r.status != 200 || bytes.len() != 264 {
                 return Err("mapping grant rejected");

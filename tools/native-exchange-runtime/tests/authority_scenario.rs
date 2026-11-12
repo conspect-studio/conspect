@@ -293,7 +293,10 @@ fn scenario(scenario: &'static str, slow: bool, deny_renew: bool, variant: &'sta
                 if variant == "mapping-refusal" && mapping_grants == 1 {
                     status = 403;
                     json!({"error":"refused"})
-                } else if scenario == "credit-cutoff" && path.contains("org_a/") && now() >= expiry[0] {
+                } else if scenario == "credit-cutoff"
+                    && path.contains("org_a/")
+                    && now() >= expiry[0]
+                {
                     boundary_denials += 1;
                     status = 404;
                     json!({"type":"about:blank","title":"Not Found","status":404,"detail":"booking expired"})
@@ -399,7 +402,11 @@ fn scenario(scenario: &'static str, slow: bool, deny_renew: bool, variant: &'sta
                 "application/json"
             };
             let mut hold_ms = 0u64;
-            if variant == "late-mapping-grant" && mapping_grants == 1 && path.ends_with("/grants") && path.contains("org_a/") {
+            if variant == "late-mapping-grant"
+                && mapping_grants == 1
+                && path.ends_with("/grants")
+                && path.contains("org_a/")
+            {
                 hold_ms = 1500;
                 delayed_grants += 1;
             }
@@ -663,7 +670,10 @@ fn scenario(scenario: &'static str, slow: bool, deny_renew: bool, variant: &'sta
                 .and_then(|v| v.parse().ok())
                 .unwrap()
         };
-        assert!(field("stale=") > 0, "no parked B object went stale: {report}");
+        assert!(
+            field("stale=") > 0,
+            "no parked B object went stale: {report}"
+        );
         assert!(
             field("drained=") > 0,
             "no parked B object opened after the stale epoch: {report}"

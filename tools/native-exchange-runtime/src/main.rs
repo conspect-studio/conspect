@@ -101,6 +101,31 @@ fn now() -> u64 {
         .unwrap()
         .as_millis() as u64
 }
+/// Shared startup budget: at most 3 seconds of retries plus one in-flight
+/// 1-second transport timeout. Reserve 2 seconds before A's authoritative
+/// expires_at, including the deliberately short 4-second negative fixture.
+/// A normal 10-second window consequently retains >=6 seconds after booking;
+/// the 30-second fixture retains >=26 seconds.
+const STARTUP_GRANT_BUDGET_MS: u64 = 3000;
+const STARTUP_BOUNDARY_RESERVE_MS: u64 = 2000;
+const LATE_GRANT_SETTLE: Duration = Duration::from_millis(250);
+fn startup_grant_deadline(expiry: u64, at: u64) -> u64 {
+    at.saturating_add(STARTUP_GRANT_BUDGET_MS)
+        .min(expiry.saturating_sub(STARTUP_BOUNDARY_RESERVE_MS))
+}
+fn retry_late_grant<T>(deadline: u64, mut attempt: impl FnMut() -> Result<T>) -> Result<T> {
+    loop {
+        if now() >= deadline {
+            return Err("startup grant deadline");
+        }
+        match attempt() {
+            Err("grant transport" | "mapping grant transport") if now() < deadline => {
+                std::thread::sleep(LATE_GRANT_SETTLE);
+            }
+            other => return other,
+        }
+    }
+}
 fn raw(v: &Value) -> Result<[u8; 16]> {
     let s = v.as_str().ok_or("identity missing")?;
     let b = URL_SAFE_NO_PAD.decode(s).map_err(|_| "identity encoding")?;
@@ -240,8 +265,12 @@ fn connected(
         return Err("credit-cutoff requires funded-expiry profile exclusively");
     }
     state.book(t)?;
+    let grant_deadline = startup_grant_deadline(state.booking_expiry()?, now());
     state.renew(t)?;
-    state.mint_mapping(t)?;
+    // A delayed answer here is as legitimate as one during media: without the
+    // retry a single late mapping grant would end the run before A's paid
+    // boundary is ever probed.
+    retry_late_grant(grant_deadline, || state.mint_mapping(t))?;
     state.write_marker(Path::new(&a[3]))?;
     let marker_at = now();
     let expected = state.wait_expected(t, Path::new(&a[5]))?;
@@ -310,7 +339,7 @@ fn connected(
     .map_err(|_| "authority publisher")?;
     let mut receivers = Vec::new();
     for (i, b) in bindings.iter().enumerate() {
-        let grant = state.grant(t, i)?;
+        let grant = retry_late_grant(grant_deadline, || state.grant(t, i))?;
         receivers.push(
             ReceiverRuntime::accept(
                 &key,
@@ -398,6 +427,7 @@ fn connected(
     let mut accepted = [0u64; 2];
     let mut late_drops = 0u64;
     let mut sealing_skipped = 0u64;
+    let mut empty_decode_skips = 0u64;
     let mut parked: Vec<conspect_native_exchange_runtime::media::ParkQueue<Parked>> = (0..2)
         .map(|_| conspect_native_exchange_runtime::media::ParkQueue::new(256))
         .collect();
@@ -625,6 +655,15 @@ fn connected(
                     if now() >= state.booking_expiry()? || receiver.fence(now(), output).is_err() {
                         continue;
                     }
+                }
+                if received[i][track].is_empty() {
+                    // No accepted bytes means no decodable media for this taker/track,
+                    // regardless of scenario. Parked objects, stale drops and an
+                    // authorization fence cannot manufacture decoder input. Never
+                    // emit a decoded observation or usable receipt for an empty phase;
+                    // nonempty malformed input still fails in decode below.
+                    empty_decode_skips += 1;
+                    continue;
                 }
                 for decoded in decode(dir, f, i, &received[i][track])? {
                     let pts = decoded.pts_ms;
@@ -871,10 +910,26 @@ fn connected(
             accepted[1]
         );
         println!(
-            "credit-cutoff B late-grant report: parked={} dropped_on_overflow={} stale={} drained={} decoded_frames_dropped_at_boundary={late_drops} ranges_cut_at_epoch_boundary={sealing_skipped}",
+            "credit-cutoff B late-grant report: parked={} dropped_on_overflow={} stale={} drained={} decoded_frames_dropped_at_boundary={late_drops} ranges_cut_at_epoch_boundary={sealing_skipped} empty_decode_skips={empty_decode_skips}",
             parked[1].parked_total, parked[1].dropped, parked[1].stale, parked[1].drained
         );
     }
     println!("connected HTTPS authority / HEVC + five AAC / two takers / TCP CPU observer passed; not QUIC/device");
     Ok(())
+}
+
+#[cfg(test)]
+mod startup_grant_tests {
+    use super::*;
+    #[test]
+    fn shared_deadline_reserves_the_paid_boundary_in_both_fixtures() {
+        for window in [4_000, 10_000, 30_000] {
+            let booked_at = 100_000;
+            let expiry = booked_at + window;
+            let deadline = startup_grant_deadline(expiry, booked_at);
+            assert!(deadline + 1_000 <= expiry - 1_000);
+            assert_eq!(deadline, booked_at + 3_000.min(window - 2_000));
+        }
+        assert_eq!(startup_grant_deadline(110_000, 109_000), 108_000);
+    }
 }
