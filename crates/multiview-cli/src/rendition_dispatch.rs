@@ -4,6 +4,9 @@
 //! many or delayed packets. Only an explicit exclusive DTS watermark, or EOF
 //! after all delayed packets, closes a window. No output clock waits here.
 
+// reason: the live-key / rebind API is consumed by the pipeline in a later slice.
+#![allow(dead_code)]
+
 use std::collections::VecDeque;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -12,11 +15,61 @@ use crate::binding_delivery::WindowDelivery;
 use crate::rendition_workers::{DispatchEvent, DtsWatermark};
 use multiview_core::time::Rational;
 use multiview_ffmpeg::{EncodedPacket, StreamKind};
+use multiview_output::batch::OfferError;
 
 const MAX_STAGED_WINDOWS: usize = 16;
 const MAX_STAGED_PACKETS: usize = 512;
 const MAX_STAGED_BYTES: usize = 16 * 1024 * 1024;
 const STAGE_DEADLINE: Duration = Duration::from_secs(2);
+/// Live (non-retired) dynamic video keys at once.
+const MAX_DYNAMIC_KEYS: usize = 8;
+/// Lifetime cap on dynamic slots (retired slots are never reused), so key
+/// churn cannot grow the stage vectors without bound.
+const MAX_DYNAMIC_SLOTS: usize = 64;
+/// Per-binding FIFO of assembled windows waiting for their video part.
+const MAX_PENDING_WINDOWS: usize = 4;
+const MAX_MOVE_OUTCOMES: usize = 64;
+
+/// Per-key "is this packet a self-contained random-access point that may
+/// start a rendition on another output" predicate. Injected, never parsed here.
+pub(crate) type MoveGate = Box<dyn Fn(&EncodedPacket) -> bool + Send>;
+
+/// Why a video move was refused.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MoveRefusal {
+    /// No window in the allowed span carried a gated RAP from the destination
+    /// (or the destination failed/retired first).
+    EncoderNotReady,
+    /// The destination key has no move gate: never move without one.
+    NoGate,
+}
+
+/// Result of a requested video move or of a failure fallback.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MoveOutcome {
+    Applied {
+        output_index: usize,
+        key: usize,
+        tick: u64,
+    },
+    Refused {
+        output_index: usize,
+        reason: MoveRefusal,
+    },
+    /// A pending move was replaced by a newer request.
+    Superseded { output_index: usize },
+    /// The binding's dynamic key failed/retired; it returned to its startup key.
+    Fallback { output_index: usize },
+}
+
+/// Observable drop/failure counters (monotonic, saturating).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct DispatchCounters {
+    pub dropped_late_dynamic: u64,
+    pub dropped_unbound: u64,
+    pub dropped_pending: u64,
+    pub dynamic_failed: u64,
+}
 
 /// Packet DTS time base: seconds per integer DTS unit (`num/den`).
 #[derive(Debug, Clone, Copy)]
@@ -77,6 +130,8 @@ pub(crate) struct DispatchConfig {
     pub first_tick: u64,
     /// Exact rational program frames per second, never truncated to a fixed tick.
     pub cadence: Rational,
+    /// Per base video key move gate. Empty = none; otherwise `len == video_count`.
+    pub video_move_gates: Vec<Option<MoveGate>>,
 }
 
 /// An invalid worker event, excessive stage, or missed watchdog deadline.
@@ -221,6 +276,21 @@ impl StreamStage {
         }
         Vec::new()
     }
+    fn peek(&self, index: i128) -> Option<&Window> {
+        self.windows.iter().find(|w| w.index == index)
+    }
+    /// Drop staged windows older than `bound`; returns the packets dropped.
+    fn prune_before(&mut self, bound: i128) -> usize {
+        let mut dropped = 0;
+        while self.windows.front().is_some_and(|w| w.index < bound) {
+            if let Some(window) = self.windows.pop_front() {
+                self.staged_packets = self.staged_packets.saturating_sub(window.packets.len());
+                self.staged_bytes = self.staged_bytes.saturating_sub(window.bytes);
+                dropped += window.packets.len();
+            }
+        }
+        dropped
+    }
     fn stale(&self, now: Instant) -> bool {
         self.windows.front().is_some_and(|w| {
             now.checked_duration_since(w.first_seen)
@@ -237,10 +307,59 @@ impl StreamStage {
     }
 }
 
+struct VideoMeta {
+    dynamic: bool,
+    retired: bool,
+    failed: bool,
+    gate: Option<MoveGate>,
+}
+
+#[derive(Clone, Copy)]
+struct PendingMove {
+    key: usize,
+    at_tick: i128,
+    max_windows: u32,
+    failed: u32,
+}
+
+struct Entry {
+    index: i128,
+    end: i128,
+    span: Duration,
+    /// Video of every base key this binding may use for this window (current,
+    /// move destination, fallback). A dynamic key's video is read from its
+    /// stage at delivery time instead.
+    base: Vec<(usize, Vec<EncodedPacket>)>,
+    audio: Vec<EncodedPacket>,
+}
+
+struct BindingState {
+    output_index: usize,
+    video_key: Option<usize>,
+    audio_tracks: Vec<usize>,
+    /// Startup video key, returned to when a dynamic key fails.
+    fallback: Option<usize>,
+    pending: VecDeque<Entry>,
+    mv: Option<PendingMove>,
+    /// After a fallback the next delivered window must pass the move gate.
+    fallback_gate_pending: bool,
+}
+
+fn push_outcome(outcomes: &mut VecDeque<MoveOutcome>, outcome: MoveOutcome) {
+    if outcomes.len() >= MAX_MOVE_OUTCOMES {
+        outcomes.pop_front();
+    }
+    outcomes.push_back(outcome);
+}
+
 /// Per-program bounded join. The caller handles returned errors and never
 /// labels an output healthy after a rejected event or missing proof.
 pub(crate) struct RenditionDispatcher {
-    bindings: Vec<BindingConfig>,
+    bindings: Vec<BindingState>,
+    video_meta: Vec<VideoMeta>,
+    base_video: usize,
+    counters: DispatchCounters,
+    outcomes: VecDeque<MoveOutcome>,
     video: Vec<StreamStage>,
     audio: Vec<StreamStage>,
     video_time_base: Vec<DtsTimeBase>,
@@ -272,6 +391,8 @@ impl RenditionDispatcher {
             })
             || config.audio_count != config.audio_time_base.len()
             || config.video_count == 0
+            || (!config.video_move_gates.is_empty()
+                && config.video_move_gates.len() != config.video_count)
             || config.bindings.is_empty()
         {
             return Err(DispatchError::InvalidConfig);
@@ -288,10 +409,31 @@ impl RenditionDispatcher {
             {
                 return Err(DispatchError::InvalidConfig);
             }
-            bindings.push(binding);
+            bindings.push(BindingState {
+                output_index: binding.output_index,
+                video_key: binding.video_key,
+                audio_tracks: binding.audio_tracks,
+                fallback: binding.video_key,
+                pending: VecDeque::new(),
+                mv: None,
+                fallback_gate_pending: false,
+            });
         }
+        let mut gates = config.video_move_gates.into_iter();
+        let video_meta = (0..config.video_count)
+            .map(|_| VideoMeta {
+                dynamic: false,
+                retired: false,
+                failed: false,
+                gate: gates.next().flatten(),
+            })
+            .collect();
         Ok(Self {
             bindings,
+            video_meta,
+            base_video: config.video_count,
+            counters: DispatchCounters::default(),
+            outcomes: VecDeque::new(),
             video: (0..config.video_count)
                 .map(|_| StreamStage::new())
                 .collect(),
@@ -318,18 +460,32 @@ impl RenditionDispatcher {
         if self.failed || self.finished {
             return Err(DispatchError::InvalidEvent);
         }
-        if let Err(error) = self.check_global_budget(&event) {
+        let dynamic_event = matches!(
+            &event,
+            DispatchEvent::Video { key_index, .. } | DispatchEvent::FinishVideo { key_index, .. }
+                if *key_index >= self.base_video
+        );
+        if let Err(error) = if dynamic_event {
+            Ok(())
+        } else {
+            self.check_global_budget(&event)
+        } {
             self.fail();
             delivery.abort();
             return Err(error);
         }
         let result = self.apply(event, now).and_then(|()| {
-            if self.video.iter().chain(&self.audio).any(|stage| {
-                stage
-                    .windows
-                    .front()
-                    .is_some_and(|window| self.next_window.is_some_and(|next| window.index < next))
-            }) {
+            if self
+                .video
+                .iter()
+                .take(self.base_video)
+                .chain(&self.audio)
+                .any(|stage| {
+                    stage.windows.front().is_some_and(|window| {
+                        self.next_window.is_some_and(|next| window.index < next)
+                    })
+                })
+            {
                 return Err(DispatchError::LatePacket);
             }
             self.drain(now, delivery)
@@ -450,6 +606,16 @@ impl RenditionDispatcher {
                 packets,
                 watermark,
             } => {
+                if key_index >= self.base_video {
+                    return self.apply_dynamic_video(
+                        key_index,
+                        Some(timebase),
+                        packets,
+                        watermark,
+                        false,
+                        now,
+                    );
+                }
                 if self
                     .video_time_base
                     .get(key_index)
@@ -516,6 +682,9 @@ impl RenditionDispatcher {
                 }
             }
             DispatchEvent::FinishVideo { key_index, packets } => {
+                if key_index >= self.base_video {
+                    return self.apply_dynamic_video(key_index, None, packets, None, true, now);
+                }
                 if self.video.get(key_index).is_none_or(|s| s.finished) {
                     return Err(DispatchError::InvalidEvent);
                 }
@@ -555,15 +724,322 @@ impl RenditionDispatcher {
         }
         Ok(())
     }
-    #[allow(clippy::too_many_lines)] // Atomic whole-window closure and fanout are reviewed as one state transition.
+    fn apply_dynamic_video(
+        &mut self,
+        key: usize,
+        timebase: Option<Rational>,
+        packets: Vec<EncodedPacket>,
+        watermark: Option<DtsWatermark>,
+        finish: bool,
+        now: Instant,
+    ) -> Result<(), DispatchError> {
+        let Some(meta) = self.video_meta.get(key) else {
+            return Err(DispatchError::InvalidEvent);
+        };
+        if meta.retired || meta.failed {
+            self.counters.dropped_unbound = self.counters.dropped_unbound.saturating_add(1);
+            return Ok(());
+        }
+        let tb = *self
+            .video_time_base
+            .get(key)
+            .ok_or(DispatchError::InvalidEvent)?;
+        let cadence = self.cadence;
+        let result = (|| -> Result<(), DispatchError> {
+            let stage = self.video.get_mut(key).ok_or(DispatchError::InvalidEvent)?;
+            if stage.finished || timebase.is_some_and(|t| !tb.matches(t)) {
+                return Err(DispatchError::InvalidEvent);
+            }
+            for p in packets {
+                if p.kind() != StreamKind::Video {
+                    return Err(DispatchError::InvalidEvent);
+                }
+                stage.put(p, tb, cadence, now)?;
+            }
+            if finish {
+                stage.finished = true;
+                stage.first_unproved = None;
+            } else {
+                if watermark.is_none() {
+                    stage.first_unproved.get_or_insert(now);
+                }
+                stage.advance(watermark)?;
+            }
+            Ok(())
+        })();
+        if result.is_err() {
+            // A live key's fault is its own: never the program's.
+            self.fail_dynamic(key);
+        }
+        Ok(())
+    }
+    fn fail_dynamic(&mut self, key: usize) {
+        if let Some(meta) = self.video_meta.get_mut(key) {
+            if !meta.failed {
+                meta.failed = true;
+                self.counters.dynamic_failed = self.counters.dynamic_failed.saturating_add(1);
+            }
+        }
+        if let Some(stage) = self.video.get_mut(key) {
+            stage.clear();
+        }
+    }
+    /// Bindings on a failed/retired dynamic key return to their startup key
+    /// (gated on a RAP); moves to such a key are refused.
+    fn reconcile(&mut self) {
+        for b in &mut self.bindings {
+            if let Some(m) = b.mv {
+                if self
+                    .video_meta
+                    .get(m.key)
+                    .is_none_or(|x| x.failed || x.retired)
+                {
+                    push_outcome(
+                        &mut self.outcomes,
+                        MoveOutcome::Refused {
+                            output_index: b.output_index,
+                            reason: MoveRefusal::EncoderNotReady,
+                        },
+                    );
+                    b.mv = None;
+                }
+            }
+            if let (Some(k), Some(fb)) = (b.video_key, b.fallback) {
+                if self
+                    .video_meta
+                    .get(k)
+                    .is_some_and(|x| x.failed || x.retired)
+                {
+                    b.video_key = Some(fb);
+                    b.fallback_gate_pending = true;
+                    push_outcome(
+                        &mut self.outcomes,
+                        MoveOutcome::Fallback {
+                            output_index: b.output_index,
+                        },
+                    );
+                }
+            }
+        }
+    }
+    fn fail_stale_dynamic(&mut self, now: Instant) {
+        for k in self.base_video..self.video.len() {
+            if self.video.get(k).is_some_and(|s| s.stale(now)) {
+                self.fail_dynamic(k);
+            }
+        }
+    }
+    fn base_stale(&self, now: Instant) -> bool {
+        self.video
+            .iter()
+            .take(self.base_video)
+            .chain(&self.audio)
+            .any(|s| s.stale(now))
+    }
     fn drain<D: WindowDelivery>(
         &mut self,
         now: Instant,
         delivery: &mut D,
     ) -> Result<(), DispatchError> {
-        if self.video.iter().any(|s| s.stale(now)) || self.audio.iter().any(|s| s.stale(now)) {
+        if self.base_stale(now) {
             return Err(DispatchError::WatchdogExpired);
         }
+        self.fail_stale_dynamic(now);
+        self.reconcile();
+        let early = self.pump(now, delivery)?;
+        let result = self.drain_base(now, delivery);
+        self.prune_dynamic();
+        result?;
+        early.map_or(Ok(()), Err)
+    }
+    /// Free dynamic windows no binding can still need.
+    fn prune_dynamic(&mut self) {
+        let next = self.next_window.unwrap_or(i128::MAX);
+        for k in self.base_video..self.video.len() {
+            let mut floor = next;
+            for b in &self.bindings {
+                if b.video_key == Some(k) || b.mv.is_some_and(|m| m.key == k) {
+                    if let Some(head) = b.pending.front() {
+                        floor = floor.min(head.index);
+                    }
+                }
+            }
+            if let Some(stage) = self.video.get_mut(k) {
+                let dropped = stage.prune_before(floor);
+                self.counters.dropped_late_dynamic = self
+                    .counters
+                    .dropped_late_dynamic
+                    .saturating_add(u64::try_from(dropped).unwrap_or(u64::MAX));
+            }
+        }
+    }
+    fn pump<D: WindowDelivery>(
+        &mut self,
+        now: Instant,
+        delivery: &mut D,
+    ) -> Result<Option<DispatchError>, DispatchError> {
+        let mut first = None;
+        for bi in 0..self.bindings.len() {
+            if let Some(error) = self.pump_binding(bi, now, delivery)? {
+                first.get_or_insert(error);
+            }
+        }
+        Ok(first)
+    }
+    /// Deliver, in order, every pending window of one binding whose video part
+    /// is available. Resolves video moves and post-fallback RAP gating.
+    #[allow(clippy::too_many_lines)] // One in-order per-binding delivery state machine.
+    fn pump_binding<D: WindowDelivery>(
+        &mut self,
+        bi: usize,
+        now: Instant,
+        delivery: &mut D,
+    ) -> Result<Option<DispatchError>, DispatchError> {
+        let mut first_err = None;
+        let Some(b) = self.bindings.get_mut(bi) else {
+            return Ok(None);
+        };
+        while let Some(head) = b.pending.front() {
+            let end = head.end;
+            if let Some(k) = b.video_key {
+                if self.video_meta.get(k).is_some_and(|m| m.dynamic)
+                    && !self.video.get(k).is_some_and(|s| s.complete(end))
+                {
+                    break;
+                }
+            }
+            let Some(mut entry) = b.pending.pop_front() else {
+                break;
+            };
+            let index = entry.index;
+            let mut applied = false;
+            if let Some(mut m) = b.mv {
+                if index >= m.at_tick {
+                    let usable = self
+                        .video_meta
+                        .get(m.key)
+                        .is_some_and(|x| !x.failed && !x.retired);
+                    if usable {
+                        let dest_dynamic = self.video_meta.get(m.key).is_some_and(|x| x.dynamic);
+                        let first_pkt_passes = |gate: &Option<MoveGate>| -> bool {
+                            let Some(g) = gate.as_ref() else {
+                                return false;
+                            };
+                            if dest_dynamic {
+                                self.video.get(m.key).is_some_and(|s| s.complete(end))
+                                    && self
+                                        .video
+                                        .get(m.key)
+                                        .and_then(|s| s.peek(index))
+                                        .and_then(|w| w.packets.first())
+                                        .is_some_and(|p| g(p))
+                            } else {
+                                entry
+                                    .base
+                                    .iter()
+                                    .find(|(k, _)| *k == m.key)
+                                    .and_then(|(_, v)| v.first())
+                                    .is_some_and(g)
+                            }
+                        };
+                        let pass = self
+                            .video_meta
+                            .get(m.key)
+                            .is_some_and(|x| first_pkt_passes(&x.gate));
+                        if pass {
+                            b.video_key = Some(m.key);
+                            push_outcome(
+                                &mut self.outcomes,
+                                MoveOutcome::Applied {
+                                    output_index: b.output_index,
+                                    key: m.key,
+                                    tick: u64::try_from(index).unwrap_or(u64::MAX),
+                                },
+                            );
+                            b.mv = None;
+                            applied = true;
+                        } else {
+                            m.failed = m.failed.saturating_add(1);
+                            if m.failed >= m.max_windows {
+                                push_outcome(
+                                    &mut self.outcomes,
+                                    MoveOutcome::Refused {
+                                        output_index: b.output_index,
+                                        reason: MoveRefusal::EncoderNotReady,
+                                    },
+                                );
+                                b.mv = None;
+                            } else {
+                                b.mv = Some(m);
+                            }
+                        }
+                    } else {
+                        push_outcome(
+                            &mut self.outcomes,
+                            MoveOutcome::Refused {
+                                output_index: b.output_index,
+                                reason: MoveRefusal::EncoderNotReady,
+                            },
+                        );
+                        b.mv = None;
+                    }
+                }
+            }
+            let cur = b.video_key;
+            let mut packets: Vec<EncodedPacket> = Vec::new();
+            if let Some(k) = cur {
+                if self.video_meta.get(k).is_some_and(|m| m.dynamic) {
+                    if let Some(w) = self.video.get(k).and_then(|s| s.peek(index)) {
+                        for p in &w.packets {
+                            packets.push(
+                                p.clone_shared_ref()
+                                    .map_err(|_| DispatchError::PacketReference)?,
+                            );
+                        }
+                    }
+                } else if let Some(pos) = entry.base.iter().position(|(bk, _)| *bk == k) {
+                    packets = entry.base.swap_remove(pos).1;
+                }
+            }
+            if b.fallback_gate_pending && cur.is_some() {
+                let gate = cur
+                    .and_then(|k| self.video_meta.get(k))
+                    .and_then(|m| m.gate.as_ref());
+                let pass = applied || gate.is_none_or(|g| packets.first().is_some_and(g));
+                if pass {
+                    b.fallback_gate_pending = false;
+                } else {
+                    // Never a mid-GOP picture after a switch: the whole window is lost.
+                    delivery.report_loss(b.output_index, OfferError::ProducerLoss);
+                    self.counters.dropped_pending = self.counters.dropped_pending.saturating_add(1);
+                    continue;
+                }
+            }
+            packets.append(&mut entry.audio);
+            if delivery
+                .offer_window(
+                    b.output_index,
+                    delivery.generation(b.output_index),
+                    packets,
+                    entry.span,
+                    now,
+                )
+                .is_err()
+            {
+                first_err.get_or_insert(DispatchError::Admission {
+                    output_index: b.output_index,
+                });
+            }
+        }
+        Ok(first_err)
+    }
+    #[allow(clippy::too_many_lines)] // Atomic whole-window closure and fanout are reviewed as one state transition.
+    fn drain_base<D: WindowDelivery>(
+        &mut self,
+        now: Instant,
+        delivery: &mut D,
+    ) -> Result<(), DispatchError> {
+        let bv = self.base_video;
         loop {
             let Some(index) = self.next_window else {
                 return Ok(());
@@ -571,6 +1047,7 @@ impl RenditionDispatcher {
             let live: Vec<_> = self
                 .video
                 .iter()
+                .take(bv)
                 .chain(&self.audio)
                 .filter(|s| !s.finished)
                 .collect();
@@ -582,11 +1059,17 @@ impl RenditionDispatcher {
             let max_index = self
                 .video
                 .iter()
+                .take(bv)
                 .chain(&self.audio)
                 .filter_map(|s| s.windows.back().map(|w| w.index))
                 .max();
             if max_index.is_none_or(|last| index > last)
-                && self.video.iter().chain(&self.audio).all(|s| s.finished)
+                && self
+                    .video
+                    .iter()
+                    .take(bv)
+                    .chain(&self.audio)
+                    .all(|s| s.finished)
             {
                 self.finished = true;
                 return Ok(());
@@ -602,12 +1085,17 @@ impl RenditionDispatcher {
                 .checked_add(1)
                 .and_then(|i| Self::tick_boundary(i, self.cadence))
                 .ok_or(DispatchError::InvalidEvent)?;
-            if !self.video.iter().all(|stage| stage.complete(end))
+            if !self.video.iter().take(bv).all(|stage| stage.complete(end))
                 || !self.audio.iter().all(|stage| stage.complete(end))
             {
                 return Ok(());
             }
-            let video: Vec<Vec<_>> = self.video.iter_mut().map(|s| s.take(index)).collect();
+            let video: Vec<Vec<_>> = self
+                .video
+                .iter_mut()
+                .take(bv)
+                .map(|s| s.take(index))
+                .collect();
             let audio: Vec<Vec<_>> = self.audio.iter_mut().map(|s| s.take(index)).collect();
             let removed_packets = video.iter().chain(&audio).map(Vec::len).sum::<usize>();
             let removed_bytes = video
@@ -619,46 +1107,61 @@ impl RenditionDispatcher {
             self.global_staged_packets -= removed_packets;
             self.global_staged_bytes -= removed_bytes;
             self.next_window = index.checked_add(1);
-            let mut first_admission_error = None;
+            let start =
+                Self::tick_boundary(index, self.cadence).ok_or(DispatchError::InvalidEvent)?;
+            let span = Duration::from_nanos(
+                u64::try_from(end.checked_sub(start).ok_or(DispatchError::InvalidEvent)?)
+                    .map_err(|_| DispatchError::InvalidEvent)?,
+            );
             for binding in &mut self.bindings {
-                let mut packets = Vec::new();
-                if let Some(v) = binding.video_key {
-                    for p in video.get(v).ok_or(DispatchError::InvalidConfig)? {
-                        packets.push(
+                let mut keys: Vec<usize> = Vec::new();
+                for k in [
+                    binding.video_key,
+                    binding.mv.map(|m| m.key),
+                    binding.fallback,
+                ]
+                .into_iter()
+                .flatten()
+                {
+                    if k < bv && !keys.contains(&k) {
+                        keys.push(k);
+                    }
+                }
+                let mut base = Vec::with_capacity(keys.len());
+                for k in keys {
+                    let mut part = Vec::new();
+                    for p in video.get(k).ok_or(DispatchError::InvalidConfig)? {
+                        part.push(
                             p.clone_shared_ref()
                                 .map_err(|_| DispatchError::PacketReference)?,
                         );
                     }
+                    base.push((k, part));
                 }
+                let mut audio_packets = Vec::new();
                 for &a in &binding.audio_tracks {
                     for p in audio.get(a).ok_or(DispatchError::InvalidConfig)? {
-                        packets.push(
+                        audio_packets.push(
                             p.clone_shared_ref()
                                 .map_err(|_| DispatchError::PacketReference)?,
                         );
                     }
                 }
-                let start =
-                    Self::tick_boundary(index, self.cadence).ok_or(DispatchError::InvalidEvent)?;
-                let media_span = Duration::from_nanos(
-                    u64::try_from(end.checked_sub(start).ok_or(DispatchError::InvalidEvent)?)
-                        .map_err(|_| DispatchError::InvalidEvent)?,
-                );
-                if delivery
-                    .offer_window(
-                        binding.output_index,
-                        delivery.generation(binding.output_index),
-                        packets,
-                        media_span,
-                        now,
-                    )
-                    .is_err()
+                if binding.pending.len() >= MAX_PENDING_WINDOWS
+                    && binding.pending.pop_front().is_some()
                 {
-                    first_admission_error.get_or_insert(DispatchError::Admission {
-                        output_index: binding.output_index,
-                    });
+                    delivery.report_loss(binding.output_index, OfferError::ProducerLoss);
+                    self.counters.dropped_pending = self.counters.dropped_pending.saturating_add(1);
                 }
+                binding.pending.push_back(Entry {
+                    index,
+                    end,
+                    span,
+                    base,
+                    audio: audio_packets,
+                });
             }
+            let first_admission_error = self.pump(now, delivery)?;
             // The dispatcher's COMPLETION is a fact about its own stages and
             // must be recorded even when a binding rejected this window (the
             // rejection is that binding's own explicit loss, reported in its
@@ -669,6 +1172,7 @@ impl RenditionDispatcher {
             if self
                 .video
                 .iter()
+                .take(bv)
                 .chain(&self.audio)
                 .all(|s| s.finished && s.windows.is_empty())
             {
@@ -683,6 +1187,7 @@ impl RenditionDispatcher {
             if self
                 .video
                 .iter()
+                .take(bv)
                 .chain(&self.audio)
                 .all(|s| s.windows.is_empty())
             {
@@ -703,18 +1208,172 @@ impl RenditionDispatcher {
         self.global_staged_bytes = 0;
     }
     /// Run the bounded 2-second staging watchdog without requiring a new event.
+    /// A stale dynamic (live) key fails alone; only a base stage fails the run.
     pub(crate) fn watchdog<D: WindowDelivery>(
         &mut self,
         now: Instant,
         delivery: &mut D,
     ) -> Result<(), DispatchError> {
-        if self.video.iter().any(|s| s.stale(now)) || self.audio.iter().any(|s| s.stale(now)) {
+        if self.base_stale(now) {
             self.fail();
             delivery.abort();
-            Err(DispatchError::WatchdogExpired)
-        } else {
-            Ok(())
+            return Err(DispatchError::WatchdogExpired);
         }
+        self.fail_stale_dynamic(now);
+        self.reconcile();
+        // Delivering post-fallback windows is not needed here; the next event
+        // pumps them. Admission faults stay with the binding's own report.
+        Ok(())
+    }
+
+    /// Append a dynamic (live) video stage. Never gates any other stage.
+    ///
+    /// # Errors
+    /// `InvalidConfig` for a time base unequal to the cadence inverse, too many
+    /// live dynamic keys, or a finished/failed dispatcher.
+    pub(crate) fn add_video_key(
+        &mut self,
+        time_base: DtsTimeBase,
+        gate: MoveGate,
+    ) -> Result<usize, DispatchError> {
+        let dynamic = self.video.len().saturating_sub(self.base_video);
+        let live = self
+            .video_meta
+            .iter()
+            .filter(|m| m.dynamic && !m.retired)
+            .count();
+        if self.failed
+            || self.finished
+            || live >= MAX_DYNAMIC_KEYS
+            || dynamic >= MAX_DYNAMIC_SLOTS
+            || i128::from(time_base.num).checked_mul(i128::from(self.cadence.num))
+                != i128::from(time_base.den).checked_mul(i128::from(self.cadence.den))
+            || time_base.num <= 0
+        {
+            return Err(DispatchError::InvalidConfig);
+        }
+        let index = self.video.len();
+        self.video.push(StreamStage::new());
+        self.video_time_base.push(time_base);
+        self.video_meta.push(VideoMeta {
+            dynamic: true,
+            retired: false,
+            failed: false,
+            gate: Some(gate),
+        });
+        Ok(index)
+    }
+    /// Retire a dynamic key; its staged windows are dropped and later events
+    /// for it are counted, never an error.
+    ///
+    /// # Errors
+    /// `InvalidConfig` for an unknown or base key.
+    pub(crate) fn retire_video_key(&mut self, key: usize) -> Result<(), DispatchError> {
+        let meta = self
+            .video_meta
+            .get_mut(key)
+            .filter(|m| m.dynamic)
+            .ok_or(DispatchError::InvalidConfig)?;
+        meta.retired = true;
+        if let Some(stage) = self.video.get_mut(key) {
+            let dropped: usize = stage.windows.iter().map(|w| w.packets.len()).sum();
+            stage.clear();
+            self.counters.dropped_unbound = self
+                .counters
+                .dropped_unbound
+                .saturating_add(u64::try_from(dropped).unwrap_or(u64::MAX));
+        }
+        Ok(())
+    }
+    /// Register a video move for one output (latest wins). Resolved on the
+    /// first window `>= at_tick` whose destination video passes the key's gate;
+    /// refused when none of `max_windows` windows does.
+    ///
+    /// # Errors
+    /// `InvalidConfig` for an unknown output, an audio-only output, or an
+    /// unknown/retired/failed key.
+    pub(crate) fn rebind_video(
+        &mut self,
+        output_index: usize,
+        key: usize,
+        at_tick: u64,
+        max_windows: u32,
+    ) -> Result<(), DispatchError> {
+        let usable = self
+            .video_meta
+            .get(key)
+            .is_some_and(|m| !m.failed && !m.retired);
+        let has_gate = self.video_meta.get(key).is_some_and(|m| m.gate.is_some());
+        let Some(b) = self
+            .bindings
+            .iter_mut()
+            .find(|b| b.output_index == output_index)
+        else {
+            return Err(DispatchError::InvalidConfig);
+        };
+        if b.video_key.is_none() || !usable {
+            return Err(DispatchError::InvalidConfig);
+        }
+        if b.mv.take().is_some() {
+            push_outcome(&mut self.outcomes, MoveOutcome::Superseded { output_index });
+        }
+        if b.video_key == Some(key) {
+            push_outcome(
+                &mut self.outcomes,
+                MoveOutcome::Applied {
+                    output_index,
+                    key,
+                    tick: at_tick,
+                },
+            );
+        } else if !has_gate {
+            push_outcome(
+                &mut self.outcomes,
+                MoveOutcome::Refused {
+                    output_index,
+                    reason: MoveRefusal::NoGate,
+                },
+            );
+        } else if max_windows == 0 {
+            push_outcome(
+                &mut self.outcomes,
+                MoveOutcome::Refused {
+                    output_index,
+                    reason: MoveRefusal::EncoderNotReady,
+                },
+            );
+        } else {
+            b.mv = Some(PendingMove {
+                key,
+                at_tick: i128::from(at_tick),
+                max_windows,
+                failed: 0,
+            });
+        }
+        Ok(())
+    }
+    /// Drain move/fallback outcomes (at most 64 are retained, oldest dropped).
+    pub(crate) fn take_move_outcomes(&mut self) -> Vec<MoveOutcome> {
+        self.outcomes.drain(..).collect()
+    }
+    /// The video key an output currently reads.
+    pub(crate) fn binding_video_key(&self, output_index: usize) -> Option<usize> {
+        self.bindings
+            .iter()
+            .find(|b| b.output_index == output_index)
+            .and_then(|b| b.video_key)
+    }
+    pub(crate) fn video_key_count(&self) -> usize {
+        self.video.len()
+    }
+    /// True for an unknown, failed or retired key.
+    pub(crate) fn is_key_failed(&self, key: usize) -> bool {
+        self.video_meta
+            .get(key)
+            .is_none_or(|m| m.failed || m.retired)
+    }
+    pub(crate) fn counters(&self) -> DispatchCounters {
+        self.counters
     }
 }
 
@@ -901,6 +1560,7 @@ mod tests {
             bindings,
             first_tick: 0,
             cadence: Rational::new(5, 1),
+            video_move_gates: Vec::new(),
         }
     }
     fn binding(i: usize, v: usize, a: usize) -> BindingConfig {
@@ -1250,5 +1910,340 @@ mod tests {
             exact,
             tick * RenditionDispatcher::tick_boundary(1, cadence).unwrap()
         );
+    }
+
+    // ---- live keys / rebind ----
+    fn rap77(dts: i64) -> EncodedPacket {
+        let mut bytes = vec![0_u8; 77];
+        bytes[..6].copy_from_slice(&[0, 0, 0, 1, 0x65, 0x88]);
+        let mut raw = Packet::copy(&bytes);
+        raw.set_pts(Some(dts));
+        raw.set_dts(Some(dts));
+        raw.set_flags(Flags::KEY);
+        EncodedPacket::with_kind(raw, StreamKind::Video)
+    }
+    fn gate() -> MoveGate {
+        Box::new(|p| p.is_keyframe() && p.len() == 77)
+    }
+    fn gated_cfg(bindings: Vec<BindingConfig>, video: usize, audio: usize) -> DispatchConfig {
+        let mut c = cfg(bindings, video, audio);
+        c.video_move_gates = (0..video).map(|_| Some(gate())).collect();
+        c
+    }
+    /// Feed base window `i` (all base keys + one audio) at `now`.
+    fn feed_base(
+        d: &mut RenditionDispatcher,
+        sink: &mut FakeDelivery,
+        keys: usize,
+        i: i64,
+        now: Instant,
+        first: impl Fn(usize) -> EncodedPacket,
+    ) -> Result<(), DispatchError> {
+        let m = Some(mark(TICK * i128::from(i + 1)));
+        let tick = u64::try_from(i).unwrap();
+        for k in 0..keys {
+            d.dispatch(ve(k, tick, vec![first(k)], m), now, sink)?;
+        }
+        d.dispatch(ae(tick, vec![audio(i, 0)], vec![m]), now, sink)
+    }
+    fn plain(i: i64) -> impl Fn(usize) -> EncodedPacket {
+        move |_| video(i, 8, i == 0)
+    }
+    /// Pop and release every queued window of one output: (first len, count).
+    fn pop_all(sink: &mut FakeDelivery, o: usize, now: Instant) -> Vec<(usize, usize)> {
+        let mut out = Vec::new();
+        while let Some(Some(lease)) = sink.queues[o].pop_at(now).ok().map(Some) {
+            let Some(l) = lease else { break };
+            out.push((l.packets()[0].len(), l.packets().len()));
+        }
+        out
+    }
+
+    #[test]
+    fn default_topology_delivers_exactly_as_before() {
+        let now = Instant::now();
+        let mut d = RenditionDispatcher::new(cfg(vec![binding(0, 0, 1)], 1, 1)).unwrap();
+        let mut sink = FakeDelivery::new(1);
+        for i in 0..3 {
+            feed_base(&mut d, &mut sink, 1, i, now, plain(i)).unwrap();
+            pop_all(&mut sink, 0, now);
+        }
+        assert_eq!(sink.windows, vec![(0, 2), (0, 2), (0, 2)]);
+        assert_eq!(d.counters(), DispatchCounters::default());
+        assert_eq!(d.video_key_count(), 1);
+        assert_eq!(d.binding_video_key(0), Some(0));
+        assert_eq!(d.take_move_outcomes(), vec![]);
+    }
+
+    #[test]
+    fn a_slow_live_key_never_delays_base_windows() {
+        let now = Instant::now();
+        let mut d =
+            RenditionDispatcher::new(gated_cfg(vec![binding(0, 0, 1), binding(1, 1, 1)], 2, 1))
+                .unwrap();
+        let mut sink = FakeDelivery::new(2);
+        let key = d
+            .add_video_key(DtsTimeBase { num: 1, den: 5 }, gate())
+            .unwrap();
+        assert_eq!(key, 2);
+        for i in 0..10_i64 {
+            if i >= 6 {
+                let m = Some(mark(TICK * i128::from(i + 1)));
+                d.dispatch(
+                    ve(2, u64::try_from(i).unwrap(), vec![rap77(i)], m),
+                    now,
+                    &mut sink,
+                )
+                .unwrap();
+            }
+            feed_base(&mut d, &mut sink, 2, i, now, plain(i)).unwrap();
+            let n = usize::try_from(i + 1).unwrap();
+            // Exactly on closure of window i, both outputs got window i.
+            assert_eq!(sink.windows.len(), 2 * n, "window {i} delayed or gapped");
+            pop_all(&mut sink, 0, now);
+            pop_all(&mut sink, 1, now);
+        }
+        assert_eq!(d.counters().dynamic_failed, 0);
+    }
+
+    #[test]
+    fn a_wedged_live_key_never_delays_base_windows_and_fails_alone() {
+        let now = Instant::now();
+        let mut d =
+            RenditionDispatcher::new(gated_cfg(vec![binding(0, 0, 1), binding(1, 1, 1)], 2, 1))
+                .unwrap();
+        let mut sink = FakeDelivery::new(2);
+        let key = d
+            .add_video_key(DtsTimeBase { num: 1, den: 5 }, gate())
+            .unwrap();
+        d.rebind_video(1, key, 2, 3).unwrap();
+        for i in 0..6_i64 {
+            feed_base(&mut d, &mut sink, 2, i, now, plain(i)).unwrap();
+            assert_eq!(sink.windows.len(), 2 * usize::try_from(i + 1).unwrap());
+            pop_all(&mut sink, 0, now);
+            pop_all(&mut sink, 1, now);
+            if i < 4 {
+                assert!(
+                    d.take_move_outcomes().is_empty(),
+                    "refused too early at {i}"
+                );
+            }
+        }
+        // Windows 2,3,4 failed the gate: refused, B kept key 1.
+        assert_eq!(
+            d.take_move_outcomes(),
+            vec![MoveOutcome::Refused {
+                output_index: 1,
+                reason: MoveRefusal::EncoderNotReady
+            }]
+        );
+        assert_eq!(d.binding_video_key(1), Some(1));
+        // The wedged key goes stale: it fails alone, the run survives.
+        let t0 = now;
+        d.dispatch(ve(2, 0, vec![], None), t0, &mut sink).unwrap();
+        let later = now + Duration::from_secs(3);
+        d.watchdog(later, &mut sink).unwrap();
+        assert!(d.is_key_failed(2));
+        assert_eq!(d.counters().dynamic_failed, 1);
+        assert!(!sink.aborted);
+        feed_base(&mut d, &mut sink, 2, 6, later, plain(6)).unwrap();
+        assert_eq!(sink.windows.len(), 14);
+    }
+
+    #[test]
+    fn move_lands_on_first_window_with_rap_and_parameter_sets() {
+        let now = Instant::now();
+        let mut d =
+            RenditionDispatcher::new(gated_cfg(vec![binding(0, 0, 1), binding(1, 1, 1)], 2, 1))
+                .unwrap();
+        let mut sink = FakeDelivery::new(2);
+        let key = d
+            .add_video_key(DtsTimeBase { num: 1, den: 5 }, gate())
+            .unwrap();
+        d.rebind_video(1, key, 2, 10).unwrap();
+        let mut b_windows = Vec::new();
+        for i in 0..6_i64 {
+            let m = Some(mark(TICK * i128::from(i + 1)));
+            let pkt = match i {
+                3 => video(i, 6, true), // IDR without parameter sets (len != 77)
+                4 => rap77(i),
+                _ => video(i, 8, false),
+            };
+            d.dispatch(
+                ve(2, u64::try_from(i).unwrap(), vec![pkt], m),
+                now,
+                &mut sink,
+            )
+            .unwrap();
+            feed_base(&mut d, &mut sink, 2, i, now, plain(i)).unwrap();
+            pop_all(&mut sink, 0, now);
+            b_windows.extend(pop_all(&mut sink, 1, now));
+        }
+        assert_eq!(
+            d.take_move_outcomes(),
+            vec![MoveOutcome::Applied {
+                output_index: 1,
+                key: 2,
+                tick: 4
+            }]
+        );
+        assert_eq!(d.binding_video_key(1), Some(2));
+        let firsts: Vec<usize> = b_windows.iter().map(|w| w.0).collect();
+        // windows 0..=3 carry key 1 (len 8, or len 6 for a RAP-less IDR never used), 4 the gated RAP.
+        assert_eq!(firsts.len(), 6);
+        assert!(firsts[..4].iter().all(|&l| l == 8 || l == 6));
+        assert_eq!(firsts[4], 77);
+        assert_eq!(firsts[5], 8);
+    }
+
+    #[test]
+    fn unbound_and_retired_key_events_are_dropped_and_counted_never_abort() {
+        let now = Instant::now();
+        let mut d = RenditionDispatcher::new(gated_cfg(vec![binding(0, 0, 1)], 1, 1)).unwrap();
+        let mut sink = FakeDelivery::new(1);
+        let key = d
+            .add_video_key(DtsTimeBase { num: 1, den: 5 }, gate())
+            .unwrap();
+        // Registered but unbound: staged, pruned once nobody can need it.
+        d.dispatch(
+            ve(key, 0, vec![video(0, 8, false)], Some(mark(TICK))),
+            now,
+            &mut sink,
+        )
+        .unwrap();
+        feed_base(&mut d, &mut sink, 1, 0, now, plain(0)).unwrap();
+        assert_eq!(d.counters().dropped_late_dynamic, 1);
+        assert!(d.retire_video_key(0).is_err()); // base keys cannot retire
+        d.retire_video_key(key).unwrap();
+        d.dispatch(
+            ve(key, 1, vec![video(1, 8, false)], Some(mark(TICK * 2))),
+            now,
+            &mut sink,
+        )
+        .unwrap();
+        d.dispatch(
+            DispatchEvent::FinishVideo {
+                key_index: key,
+                packets: vec![],
+            },
+            now,
+            &mut sink,
+        )
+        .unwrap();
+        assert_eq!(d.counters().dropped_unbound, 2);
+        assert!(d.is_key_failed(key));
+        assert!(d.rebind_video(0, key, 0, 3).is_err());
+        assert!(!sink.aborted);
+        // A key never registered is still an invalid event.
+        assert_eq!(
+            d.dispatch(ve(9, 0, vec![], None), now, &mut sink),
+            Err(DispatchError::InvalidEvent)
+        );
+    }
+
+    #[test]
+    fn add_key_refuses_a_time_base_unequal_to_the_cadence() {
+        let mut d = RenditionDispatcher::new(gated_cfg(vec![binding(0, 0, 1)], 1, 1)).unwrap();
+        assert_eq!(
+            d.add_video_key(DtsTimeBase { num: 1, den: 30 }, gate()),
+            Err(DispatchError::InvalidConfig)
+        );
+        assert_eq!(d.video_key_count(), 1);
+        for _ in 0..MAX_DYNAMIC_KEYS {
+            d.add_video_key(DtsTimeBase { num: 1, den: 5 }, gate())
+                .unwrap();
+        }
+        assert_eq!(
+            d.add_video_key(DtsTimeBase { num: 1, den: 5 }, gate()),
+            Err(DispatchError::InvalidConfig)
+        );
+        assert_eq!(d.video_key_count(), 1 + MAX_DYNAMIC_KEYS);
+        let mut bad = cfg(vec![binding(0, 0, 1)], 1, 1);
+        bad.video_move_gates = vec![];
+        bad.video_move_gates.push(None);
+        bad.video_move_gates.push(None);
+        assert!(RenditionDispatcher::new(bad).is_err());
+    }
+
+    #[test]
+    fn pending_fifo_is_bounded_and_drops_with_reported_loss() {
+        let now = Instant::now();
+        let mut d = RenditionDispatcher::new(gated_cfg(vec![binding(0, 0, 1)], 1, 1)).unwrap();
+        let mut sink = FakeDelivery::new(1);
+        let key = d
+            .add_video_key(DtsTimeBase { num: 1, den: 5 }, gate())
+            .unwrap();
+        d.rebind_video(0, key, 0, 10).unwrap();
+        d.dispatch(ve(key, 0, vec![rap77(0)], Some(mark(TICK))), now, &mut sink)
+            .unwrap();
+        feed_base(&mut d, &mut sink, 1, 0, now, plain(0)).unwrap();
+        assert_eq!(d.binding_video_key(0), Some(key));
+        assert_eq!(sink.windows.len(), 1);
+        // The dynamic key stalls: base windows keep closing, the FIFO stays bounded.
+        for i in 1..=6_i64 {
+            feed_base(&mut d, &mut sink, 1, i, now, plain(i)).unwrap();
+        }
+        assert_eq!(sink.windows.len(), 1);
+        assert_eq!(d.counters().dropped_pending, 2);
+        assert!(d.bindings[0].pending.len() <= MAX_PENDING_WINDOWS);
+        assert!(sink.queues[0].take_discontinuity().is_some());
+    }
+
+    #[test]
+    fn failed_dynamic_stage_falls_back_to_base_at_a_rap() {
+        let now = Instant::now();
+        let mut d =
+            RenditionDispatcher::new(gated_cfg(vec![binding(0, 0, 1), binding(1, 1, 1)], 2, 1))
+                .unwrap();
+        let mut sink = FakeDelivery::new(2);
+        let key = d
+            .add_video_key(DtsTimeBase { num: 1, den: 5 }, gate())
+            .unwrap();
+        d.rebind_video(1, key, 0, 10).unwrap();
+        let mut b = Vec::new();
+        for i in 0..3_i64 {
+            let m = Some(mark(TICK * i128::from(i + 1)));
+            let p = if i == 0 { rap77(i) } else { video(i, 8, false) };
+            d.dispatch(
+                ve(key, u64::try_from(i).unwrap(), vec![p], m),
+                now,
+                &mut sink,
+            )
+            .unwrap();
+            feed_base(&mut d, &mut sink, 2, i, now, plain(i)).unwrap();
+            pop_all(&mut sink, 0, now);
+            b.extend(pop_all(&mut sink, 1, now));
+        }
+        assert_eq!(b.len(), 3);
+        assert_eq!(d.binding_video_key(1), Some(key));
+        d.take_move_outcomes();
+        // Window 3: the dynamic key delivers an unproven packet and wedges.
+        d.dispatch(ve(key, 3, vec![video(3, 8, false)], None), now, &mut sink)
+            .unwrap();
+        feed_base(&mut d, &mut sink, 2, 3, now, plain(3)).unwrap();
+        pop_all(&mut sink, 0, now);
+        assert_eq!(pop_all(&mut sink, 1, now).len(), 0);
+        let later = now + Duration::from_secs(3);
+        // Window 4 closes after the stall; its base video for key 1 is a gated RAP.
+        feed_base(&mut d, &mut sink, 2, 4, later, |k| {
+            if k == 1 {
+                rap77(4)
+            } else {
+                video(4, 8, false)
+            }
+        })
+        .unwrap();
+        assert!(d.is_key_failed(key));
+        assert_eq!(d.counters().dynamic_failed, 1);
+        assert_eq!(d.binding_video_key(1), Some(1));
+        assert_eq!(
+            d.take_move_outcomes(),
+            vec![MoveOutcome::Fallback { output_index: 1 }]
+        );
+        // Window 3 (a P frame after the switch) is lost; window 4 starts at the RAP.
+        assert_eq!(pop_all(&mut sink, 1, later), vec![(77, 2)]);
+        assert!(!sink.aborted);
+        // Output A was never disturbed.
+        assert_eq!(sink.windows.iter().filter(|w| w.0 == 0).count(), 5);
     }
 }

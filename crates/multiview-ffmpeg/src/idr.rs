@@ -83,6 +83,40 @@ pub fn is_idr(au: &[u8], codec: CodecKind, framing: NalFraming) -> bool {
     }
 }
 
+/// Whether a coded access unit is a strict IDR **and** carries, in that same
+/// access unit, every parameter set a decoder needs to start there (ADR-0108
+/// §4.2 move gate): SPS (7) and PPS (8) for H.264; VPS (32), SPS (33) and PPS
+/// (34) for HEVC. [`is_idr`] alone is true on an IDR NAL without parameter
+/// sets, which a consumer that joins or is moved at this access unit cannot
+/// decode. Any other codec, malformed input or a missing set returns `false`.
+#[must_use]
+pub fn is_self_contained_idr(au: &[u8], codec: CodecKind, framing: NalFraming) -> bool {
+    if !is_idr(au, codec, framing) {
+        return false;
+    }
+    let mut seen = [false; 3];
+    let wanted: [u8; 3] = match codec {
+        CodecKind::H264 => [7, 8, 8],
+        CodecKind::Hevc => [32, 33, 34],
+        CodecKind::Av1 | CodecKind::Other => return false,
+    };
+    for_each_nal(au, framing, |nal| {
+        let ty = match codec {
+            CodecKind::H264 => nal.first().map(|&b| b & 0x1F),
+            _ => nal.first().map(|&b| (b >> 1) & 0x3F),
+        };
+        if let Some(ty) = ty {
+            for (slot, &want) in seen.iter_mut().zip(&wanted) {
+                if ty == want {
+                    *slot = true;
+                }
+            }
+        }
+        false
+    });
+    seen.iter().all(|&s| s)
+}
+
 /// H.264: at least one `nal_unit_type == 5` (IDR slice) NAL is present.
 fn h264_is_idr(au: &[u8], framing: NalFraming) -> bool {
     for_each_nal(au, framing, |nal| {
@@ -283,6 +317,7 @@ fn read_leb128(buf: &[u8], offset: usize) -> Option<(usize, usize)> {
 
 #[cfg(test)]
 mod tests {
+
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
     use super::{is_idr, read_leb128, CodecKind, NalFraming};
@@ -324,5 +359,77 @@ mod tests {
     fn obu_framing_never_carries_an_h264_nal() {
         let au = [0x65, 0xAA];
         assert!(!is_idr(&au, CodecKind::H264, NalFraming::Obu));
+    }
+
+    #[test]
+    fn self_contained_idr_requires_every_parameter_set_in_the_access_unit() {
+        let sc = [0u8, 0, 0, 1];
+        let au = |types: &[u8]| -> Vec<u8> {
+            types
+                .iter()
+                .flat_map(|&t| sc.iter().copied().chain([t, 0xAA]))
+                .collect()
+        };
+        // H.264 NAL header byte: nal_ref_idc 3 | type.
+        let h = |t: u8| 0x60 | t;
+        let full = au(&[h(7), h(8), h(5)]);
+        assert!(is_self_contained_idr(
+            &full,
+            CodecKind::H264,
+            NalFraming::AnnexB
+        ));
+        assert!(!is_self_contained_idr(
+            &au(&[h(5)]),
+            CodecKind::H264,
+            NalFraming::AnnexB
+        ));
+        assert!(!is_self_contained_idr(
+            &au(&[h(7), h(5)]),
+            CodecKind::H264,
+            NalFraming::AnnexB
+        ));
+        assert!(!is_self_contained_idr(
+            &au(&[h(7), h(8), h(1)]),
+            CodecKind::H264,
+            NalFraming::AnnexB
+        ));
+        // HEVC first header byte: type << 1.
+        let v = |t: u8| t << 1;
+        let hevc = |types: &[u8]| -> Vec<u8> {
+            types
+                .iter()
+                .flat_map(|&t| sc.iter().copied().chain([v(t), 0x01, 0xAA]))
+                .collect()
+        };
+        assert!(is_self_contained_idr(
+            &hevc(&[32, 33, 34, 19]),
+            CodecKind::Hevc,
+            NalFraming::AnnexB
+        ));
+        assert!(is_self_contained_idr(
+            &hevc(&[32, 33, 34, 20]),
+            CodecKind::Hevc,
+            NalFraming::AnnexB
+        ));
+        assert!(!is_self_contained_idr(
+            &hevc(&[33, 34, 19]),
+            CodecKind::Hevc,
+            NalFraming::AnnexB
+        ));
+        assert!(!is_self_contained_idr(
+            &hevc(&[32, 33, 34, 21]),
+            CodecKind::Hevc,
+            NalFraming::AnnexB
+        ));
+        assert!(!is_self_contained_idr(
+            &[],
+            CodecKind::H264,
+            NalFraming::AnnexB
+        ));
+        assert!(!is_self_contained_idr(
+            &full,
+            CodecKind::Other,
+            NalFraming::AnnexB
+        ));
     }
 }

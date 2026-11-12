@@ -401,6 +401,31 @@ impl StreamCodecParameters {
         }
     }
 
+    /// The ADR-0108 move gate: a decoder-ready RAP that also carries its
+    /// parameter sets in band (SPS+PPS for H.264, VPS+SPS+PPS for HEVC; a
+    /// sequence header `00 00 01 B3` for MPEG-2), so a consumer moved onto this
+    /// access unit can start decoding from it alone. Stricter than
+    /// [`Self::is_decoder_ready_rap`], which is true on an IDR NAL alone.
+    #[must_use]
+    pub fn is_self_contained_rap(&self, packet: &EncodedPacket) -> bool {
+        if !self.is_decoder_ready_rap(packet) {
+            return false;
+        }
+        let Some(payload) = packet.payload() else {
+            return false;
+        };
+        match self.parameters.id() {
+            ffmpeg::codec::Id::MPEG2VIDEO => payload.windows(4).any(|w| w == [0, 0, 1, 0xB3]),
+            ffmpeg::codec::Id::H264 => self.nal_framing().is_some_and(|framing| {
+                crate::idr::is_self_contained_idr(payload, crate::idr::CodecKind::H264, framing)
+            }),
+            ffmpeg::codec::Id::HEVC => self.nal_framing().is_some_and(|framing| {
+                crate::idr::is_self_contained_idr(payload, crate::idr::CodecKind::Hevc, framing)
+            }),
+            _ => false,
+        }
+    }
+
     #[allow(unsafe_code)]
     fn extradata(&self) -> &[u8] {
         // SAFETY: `parameters` owns its AVCodecParameters for this borrow.

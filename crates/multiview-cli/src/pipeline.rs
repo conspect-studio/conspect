@@ -7099,6 +7099,7 @@ fn consumer_main<D: WindowDelivery>(
         bindings,
         first_tick: 0,
         cadence,
+        video_move_gates: Vec::new(),
     })
     .map_err(|e| PipelineError::Output {
         kind: "dispatch",

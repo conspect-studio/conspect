@@ -442,6 +442,7 @@ impl PreviewVertical {
                 bindings,
                 first_tick: 0,
                 cadence,
+                video_move_gates: Vec::new(),
             },
         )
         .ok()?;

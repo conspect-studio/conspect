@@ -578,14 +578,31 @@ impl VideoRenditionEncoder {
     pub fn new(config: &EncodeConfig) -> Result<Self> {
         config.validate()?;
         let pairs: &[(&str, &str)] =
-            if config.codec_name == "libx264" || config.codec_name == "libx265" {
-                &[("tune", "zerolatency"), ("bf", "0")]
+            // `forced-idr=1` (ADR-0108 §4.2): a forced keyframe (a route move,
+            // `force_next_keyframe`) is a true IDR. It changes nothing for a
+            // stream that never forces one. No family is opened with
+            // `AV_CODEC_FLAG_GLOBAL_HEADER`, so libavcodec repeats the parameter
+            // sets in band at every IDR (x264 `b_repeat_headers`, x265
+            // `repeat-headers`, NVENC `repeatSPSPPS`).
+            // libx265 defaults to an open GOP, which turns a forced I picture
+            // and every periodic keyframe into a CRA: never a decoder-ready RAP
+            // for a joined or moved consumer. A closed GOP makes them IDRs.
+            if config.codec_name == "libx264" {
+                &[("tune", "zerolatency"), ("bf", "0"), ("forced-idr", "1")]
+            } else if config.codec_name == "libx265" {
+                &[
+                    ("tune", "zerolatency"),
+                    ("bf", "0"),
+                    ("forced-idr", "1"),
+                    ("x265-params", "open-gop=0"),
+                ]
             } else if config.codec_name.ends_with("_nvenc") {
                 &[
                     ("tune", "ull"),
                     ("zerolatency", "1"),
                     ("delay", "0"),
                     ("bf", "0"),
+                    ("forced-idr", "1"),
                 ]
             } else {
                 &[("bf", "0")]
@@ -605,6 +622,30 @@ impl VideoRenditionEncoder {
             finished: false,
             no_reorder,
         })
+    }
+
+    /// Start this encoder at absolute output tick `t0` instead of 0 (ADR-0108
+    /// §4.3, an encoder opened live): the first frame it accepts is `t0`, and
+    /// it is a keyframe. PTS stays the absolute tick index, so a subscriber
+    /// moved from an encoder that started at 0 sees a one-tick step.
+    #[must_use]
+    pub fn starting_at(mut self, t0: u64) -> Self {
+        self.tick = i64::try_from(t0).unwrap_or(i64::MAX);
+        self.encoder.force_next_keyframe();
+        self
+    }
+
+    /// The next tick this encoder accepts.
+    #[must_use]
+    pub fn next_tick(&self) -> u64 {
+        u64::try_from(self.tick).unwrap_or(0)
+    }
+
+    /// Make the next encoded frame a keyframe (an IDR with `forced-idr=1`).
+    /// One-shot; the caller owns the rate limit (ADR-0108 §4.2: one forced IDR
+    /// per 2 s per encoded bus).
+    pub fn force_next_keyframe(&mut self) {
+        self.encoder.force_next_keyframe();
     }
 
     /// True only when the opened encoder is proven never to reorder (no B
@@ -3778,6 +3819,146 @@ mod tests {
                     "{codec}: the restamped DTS must equal PTS (decode order == presentation                      order for proven no-reorder encoders), packet {index}"
                 );
             }
+        }
+    }
+
+    /// ADR-0108 §4.2/§4.3: an encoder opened live with `starting_at(T0)` emits
+    /// absolute PTS from T0, its first packet is a self-contained IDR (in-band
+    /// parameter sets), a forced keyframe on a running encoder is one too, and
+    /// for libx264/libx265 the live-opened encoder's parameter sets equal the
+    /// running encoder's (the measured identity the move relies on; NVENC is
+    /// measured on hardware).
+    #[test]
+    fn a_live_opened_rendition_starts_at_t0_with_a_self_contained_idr() {
+        use multiview_core::frame::FrameMeta;
+        use multiview_core::pixel::PixelFormat;
+        use multiview_core::time::MediaTime;
+        fn frame(luma: u8) -> DecodedVideoFrame {
+            let mut video =
+                ffmpeg::util::frame::Video::new(ffmpeg::format::Pixel::YUV420P, WIDTH, HEIGHT);
+            for plane in 0..3 {
+                video
+                    .data_mut(plane)
+                    .fill(if plane == 0 { luma } else { 128 });
+            }
+            DecodedVideoFrame {
+                frame: video,
+                meta: FrameMeta {
+                    pts: MediaTime::ZERO,
+                    width: WIDTH,
+                    height: HEIGHT,
+                    format: PixelFormat::Nv12,
+                    color: multiview_core::color::ColorInfo::default(),
+                },
+                raw_pts: None,
+                a53_cc: None,
+            }
+        }
+        /// The NAL units of an Annex B access unit that are parameter sets.
+        fn parameter_sets(au: &[u8], hevc: bool) -> Vec<Vec<u8>> {
+            let mut starts = Vec::new();
+            let mut i = 0;
+            while i + 3 <= au.len() {
+                if au[i..i + 3] == [0, 0, 1] {
+                    starts.push(i + 3);
+                    i += 3;
+                } else {
+                    i += 1;
+                }
+            }
+            let mut out = Vec::new();
+            for (n, &start) in starts.iter().enumerate() {
+                let mut end = starts.get(n + 1).map_or(au.len(), |&next| next - 3);
+                while end > start && au[end - 1] == 0 {
+                    end -= 1;
+                }
+                let nal = &au[start..end];
+                let ty = if hevc {
+                    (nal[0] >> 1) & 0x3F
+                } else {
+                    nal[0] & 0x1F
+                };
+                let is_ps = if hevc {
+                    (32..=34).contains(&ty)
+                } else {
+                    ty == 7 || ty == 8
+                };
+                if is_ps {
+                    out.push(nal.to_vec());
+                }
+            }
+            out
+        }
+        const T0: u64 = 200;
+        for (codec, hevc) in [("libx264", false), ("libx265", true)] {
+            if ffmpeg::encoder::find_by_name(codec).is_none() {
+                continue;
+            }
+            let mut config = EncodeConfig::mpeg2(WIDTH, HEIGHT);
+            config.codec_name = codec.to_owned();
+            config.gop = 60;
+            config.cadence = Rational::FPS_29_97;
+            let mut running = super::VideoRenditionEncoder::new(&config).unwrap();
+            let first = running.encode_frame_at(frame(60), 0).unwrap();
+            let reference = parameter_sets(first[0].payload().unwrap(), hevc);
+            assert!(
+                !reference.is_empty(),
+                "{codec}: tick 0 carries parameter sets"
+            );
+            for tick in 1..T0 {
+                running.encode_frame_at(frame(60), tick).unwrap();
+            }
+            // A forced keyframe on the running encoder is a self-contained IDR.
+            running.force_next_keyframe();
+            let forced = running.encode_frame_at(frame(60), T0).unwrap();
+            let nal_types = |au: &[u8]| -> Vec<u8> {
+                au.windows(4)
+                    .filter(|w| w[..3] == [0, 0, 1])
+                    .map(|w| {
+                        if hevc {
+                            (w[3] >> 1) & 0x3F
+                        } else {
+                            w[3] & 0x1F
+                        }
+                    })
+                    .collect()
+            };
+            assert!(
+                running.codec_params().is_self_contained_rap(&forced[0]),
+                "{codec}: forced keyframe {} packets, key {}, NAL types {:?}",
+                forced.len(),
+                forced[0].is_keyframe(),
+                nal_types(forced[0].payload().unwrap())
+            );
+            let ordinary = running.encode_frame_at(frame(60), T0 + 1).unwrap();
+            assert!(!ordinary[0].is_keyframe(), "{codec}: the force is one-shot");
+
+            let mut live = super::VideoRenditionEncoder::new(&config)
+                .unwrap()
+                .starting_at(T0);
+            assert_eq!(live.next_tick(), T0);
+            assert!(
+                live.encode_frame_at(frame(180), 0).is_err(),
+                "{codec}: tick 0 refused"
+            );
+            let opened = live.encode_frame_at(frame(180), T0).unwrap();
+            assert_eq!(
+                opened[0].pts(),
+                Some(i64::try_from(T0).unwrap()),
+                "{codec}: absolute PTS"
+            );
+            assert_eq!(opened[0].dts(), opened[0].pts());
+            assert!(
+                live.codec_params().is_self_contained_rap(&opened[0]),
+                "{codec}: first IDR"
+            );
+            assert_eq!(
+                parameter_sets(opened[0].payload().unwrap(), hevc),
+                reference,
+                "{codec}: parameter sets of a live-opened encoder equal the running encoder's"
+            );
+            let next = live.encode_frame_at(frame(180), T0 + 1).unwrap();
+            assert_eq!(next[0].pts(), Some(i64::try_from(T0 + 1).unwrap()));
         }
     }
 
