@@ -427,6 +427,17 @@ pub(crate) fn begin_generation_at(id: &str, generation: u64) {
     retire_observer(old);
 }
 
+/// Registered fetch ids starting with `prefix` (registry-leak tests).
+#[cfg(test)]
+pub(crate) fn retained_ids(prefix: &str) -> usize {
+    urls()
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .keys()
+        .filter(|id| id.starts_with(prefix))
+        .count()
+}
+
 /// Next-generation shorthand for tests that do not own a lifecycle token.
 #[cfg(test)]
 fn begin_generation(id: &str) -> u64 {

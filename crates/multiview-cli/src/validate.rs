@@ -115,7 +115,7 @@ impl ValidationReport {
                     "\nFAIL start: {what}\n     {source}\n     the engine would REJECT this state and start from the last-good copy instead (raising the accepted-state-rejected warning): {reason}"
                 ),
                 Some(reason) => format!(
-                    "\nFAIL start: {what}\n     {source}\n     the engine would refuse to start (no last-good copy to fall back to): {reason}"
+                    "\nFAIL start: {what}\n     {source}\n     the engine would refuse to start (no usable last-good copy to fall back to): {reason}"
                 ),
             };
             out.push_str(&line);

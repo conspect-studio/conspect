@@ -56,9 +56,18 @@ pub struct StartConfig {
     /// [`resolve_start_config`], committed by [`commit_fallback`] after the
     /// engine was built from last-good.
     pub pending_fallback: Option<PendingFallback>,
+    /// The exact `desired.json` bytes this start was resolved from (kept
+    /// verbatim if a later build failure falls back).
+    pub accepted_text: Option<String>,
 }
 
 impl StartConfig {
+    /// The reason of a decided-but-uncommitted fallback, if any.
+    #[must_use]
+    pub fn pending_fallback_reason(&self) -> Option<&str> {
+        self.pending_fallback.as_ref().map(|p| p.reason.as_str())
+    }
+
     /// The control plane's [`BootModel`] for this resolution, rooted at the
     /// boot file `boot_path` (the watch + promote target).
     ///
@@ -166,6 +175,7 @@ pub fn resolve_start_config(
                                 desired: Some(desired),
                                 boot_fallback: None,
                                 pending_fallback: None,
+                                accepted_text: Some(text.clone()),
                             });
                         }
                         Err(error) => {
@@ -199,6 +209,7 @@ pub fn resolve_start_config(
             desired: None,
             boot_fallback: None,
             pending_fallback: None,
+            accepted_text: None,
         });
     }
     Ok(match load_resume_config(boot_path) {
@@ -223,6 +234,7 @@ pub fn resolve_start_config(
                         desired: None,
                         boot_fallback: None,
                         pending_fallback: None,
+                        accepted_text: None,
                     }
                 }
                 Err(error) => {
@@ -246,6 +258,7 @@ pub fn resolve_start_config(
                         desired: None,
                         boot_fallback: None,
                         pending_fallback: None,
+                        accepted_text: None,
                     }
                 }
             }
@@ -267,6 +280,7 @@ pub fn resolve_start_config(
                 desired: None,
                 boot_fallback: None,
                 pending_fallback: None,
+                accepted_text: None,
             }
         }
     })
@@ -352,6 +366,7 @@ fn plan_last_good(
             rejected_text,
             last_good,
         }),
+        accepted_text: None,
     })
 }
 
@@ -424,14 +439,11 @@ pub fn build_with_fallback<T>(
                 .map_or_else(String::new, |p| p.reason.clone())
         ));
     }
-    let Some(accepted) = &start.desired else {
+    // Only a start resolved from the accepted state, with the exact bytes it
+    // was built from, can fall back.
+    let Some(rejected_text) = start.accepted_text.clone() else {
         return Err(error);
     };
-    let Ok(rejected_text) = serde_json::to_string(accepted) else {
-        return Err(error);
-    };
-    let disk = multiview_control::boot_model::desired_path_for(boot_path);
-    let rejected_text = std::fs::read_to_string(&disk).unwrap_or(rejected_text);
     let reason = format!("building the engine from the accepted state failed: {error}");
     let planned = plan_last_good(
         start.loaded.clone(),
@@ -440,7 +452,8 @@ pub fn build_with_fallback<T>(
         reason.clone(),
         rejected_text,
     )
-    .map_err(|_| error.clone())?;
+    // Nothing different to fall back to: the original build error, verbatim.
+    .map_err(|planned| if planned == reason { error.clone() } else { planned })?;
     match build(&planned.running) {
         Ok(engine) => Ok((planned, engine)),
         Err(second) => Err(format!(

@@ -444,7 +444,7 @@ async fn validate_distinguishes_fall_back_from_fail() {
     let (code, text) = validate(&path);
     assert_ne!(code, 0, "{text}");
     assert!(
-        text.contains("would refuse to start (no last-good copy"),
+        text.contains("would refuse to start (no usable last-good copy"),
         "{text}"
     );
 
@@ -461,6 +461,23 @@ async fn validate_distinguishes_fall_back_from_fail() {
     assert!(!text.contains("would refuse to start"), "{text}");
     assert!(
         text.contains("multi-cell layouts are not replaced"),
+        "{text}"
+    );
+}
+
+/// Review round 2 (lens 2): a last-good copy that itself cannot start is
+/// reported as "fails", naming why, never as a fallback.
+#[tokio::test]
+async fn validate_reports_an_unusable_last_good_as_a_failure() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, _) = install(dir.path()).await;
+    make_six_cell(&path);
+    // The "last-good" copy is the same unstartable state.
+    std::fs::copy(desired(&path), last_good_path_for(&path)).unwrap();
+    let (code, text) = validate(&path);
+    assert_ne!(code, 0, "{text}");
+    assert!(
+        text.contains("would refuse to start (no usable last-good copy"),
         "{text}"
     );
 }

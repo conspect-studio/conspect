@@ -1477,6 +1477,33 @@ segment_ms = 1000
         config.outputs.clear();
         assert!(Pipeline::build(&config).is_err(), "the build fails");
         assert_eq!(retained_lifecycle_ids("failedbuild_"), (0, 0));
+        assert_eq!(
+            crate::hls_fetch::retained_ids("failedbuild_"),
+            0,
+            "fetch map too"
+        );
+    }
+
+    /// Review round 2 (lens 3): a failed build never retires an id that was
+    /// already live in this process before it.
+    #[test]
+    fn a_failed_build_keeps_an_id_that_was_already_live() {
+        let id = "keeplive_cam";
+        let before = super::begin_live_lifecycle(id);
+        let doc = format!(
+            "schema_version = 1\n[canvas]\nwidth = 64\nheight = 64\nfps = \"25/1\"\npixel_format = \"nv12\"\nbackground = \"#000000\"\n[canvas.color]\nprofile = \"sdr-bt709-limited\"\n[layout]\nkind = \"absolute\"\n[[sources]]\nid = \"{id}\"\nkind = \"bars\"\n[[cells]]\nid = \"c\"\nrect = {{ x = 0.0, y = 0.0, w = 1.0, h = 1.0 }}\n[cells.source]\ninput_id = \"{id}\"\n[[outputs]]\nkind = \"hls\"\npath = \"/tmp/failed-build-live.m3u8\"\ncodec = \"mpeg2video\"\nsegment_ms = 1000\n"
+        );
+        let mut config = MultiviewConfig::load_from_toml(&doc).expect("parses");
+        config.outputs.clear();
+        assert!(Pipeline::build(&config).is_err());
+        assert_ne!(
+            super::live_lifecycle(id),
+            0,
+            "the live id keeps a lifecycle"
+        );
+        assert_eq!(retained_lifecycle_ids("keeplive_"), (1, 1));
+        super::remove_live_lifecycle(id);
+        let _ = before;
     }
 }
 
@@ -2477,15 +2504,22 @@ impl Pipeline {
     // ingest plan per source, wires native captions, and assembles the outputs —
     // each step is in-scope and splitting it would only scatter the wiring.
     pub fn build(config: &MultiviewConfig) -> Result<Self, PipelineError> {
+        // #317: a failed build may already have reserved live lifecycle
+        // epochs/anchor slots/fetch registrations for its sources
+        // (process-wide registries). Release ONLY the ids this build created
+        // (none before it): an id another live pipeline in this process owns is
+        // never retired by someone else's failed build.
+        let unreserved: Vec<&str> = config
+            .sources
+            .iter()
+            .map(|source| source.id.as_str())
+            .filter(|id| live_lifecycle(id) == 0)
+            .collect();
         let built = Self::build_inner(config);
         if built.is_err() {
-            // #317: a failed build may already have reserved live lifecycle
-            // epochs/anchor slots for its sources (process-wide registries). No
-            // run started, so no worker owns them: release them so a fallback
-            // build in the same process starts clean.
-            for source in &config.sources {
-                if live_lifecycle(&source.id) != 0 {
-                    remove_live_lifecycle(&source.id);
+            for id in unreserved {
+                if live_lifecycle(id) != 0 {
+                    remove_live_lifecycle(id);
                 }
             }
         }
@@ -17391,6 +17425,8 @@ pub(crate) fn remove_live_lifecycle(id: &str) -> u64 {
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     let lifecycle = advance_live_lifecycle(id, &mut tokens);
+    // `advance_live_lifecycle` re-registered the fetch entry at `lifecycle`, so
+    // forgetting that exact generation drops it.
     crate::hls_fetch::forget_source(id, lifecycle);
     tokens.remove(id);
     anchor_slots()

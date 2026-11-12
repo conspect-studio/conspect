@@ -1318,6 +1318,15 @@ async fn run_pipeline(
     // Conspect S1 startup gate: gate the NEW engine build on the published ladder
     // level (refuse at the block-new-instance rung).
     let plane = multiview_cli::licence::EntitlementPlane::from_env();
+    // #317: this readiness report starts nothing, so it never commits a
+    // fallback; it must not report a clean "ready" for a saved state a real
+    // start would reject.
+    if let Some(reason) = start.pending_fallback_reason() {
+        anyhow::bail!(
+            "the accepted state would be rejected at start ({reason}); a real start would fall \
+             back to the last-good copy and raise the accepted-state-rejected warning"
+        );
+    }
     let engine =
         SoftwareEngine::build_gated(config, plane.level()).map_err(|e| anyhow::anyhow!("{e}"))?;
     println!(

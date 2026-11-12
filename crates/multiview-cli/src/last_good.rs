@@ -13,7 +13,7 @@
 //! 1. logs the exact reason. Nothing is written while deciding; only once the
 //!    engine has been BUILT from last-good does the run go on to:
 //! 2. keep the operator's rejected bytes on disk as
-//!    `.multiview/rejected/desired-<unix-ms>.json` (bounded: newest
+//!    `.multiview/rejected/desired-<unix-ms>-<n>.json` (bounded: newest
 //!    [`MAX_REJECTED`] kept) — never silently discarded;
 //! 3. start from `last-good.json`, which is ALSO restored as the accepted
 //!    state so the control plane, the stores and the next restart agree with
@@ -97,11 +97,12 @@ pub fn quarantine_and_restore(
     let desired = desired_path_for(boot_path);
     let rejected_dir = state_dir_for(boot_path).join(REJECTED_DIR);
     create_private_dir(&rejected_dir)?;
-    let mut kept = rejected_dir.join(format!("desired-{now_ms:013}.json"));
-    let mut n = 1_u32;
+    // `desired-<13-digit ms>-<3-digit n>.json`: lexical order = time order.
+    let mut n = 0_u32;
+    let mut kept = rejected_dir.join(format!("desired-{now_ms:013}-{n:03}.json"));
     while kept.exists() {
-        kept = rejected_dir.join(format!("desired-{now_ms:013}-{n}.json"));
         n = n.saturating_add(1);
+        kept = rejected_dir.join(format!("desired-{now_ms:013}-{n:03}.json"));
     }
     write_atomic(&kept, rejected_text).map_err(|e| format!("keeping {}: {e}", kept.display()))?;
     let json = serde_json::to_string(last_good)
