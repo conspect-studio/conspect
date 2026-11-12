@@ -534,7 +534,10 @@ mod tests {
             0xCE, 0x3C, 0x80, 0, 0, 1, 0x65, 0x88,
         ];
         assert_eq!(scan(&dup), ParameterSetScan::Rejected);
-        assert!(parameter_sets(&dup, CodecKind::H264, NalFraming::AnnexB).is_empty());
+        assert_eq!(
+            parameter_sets(&dup, CodecKind::H264, NalFraming::AnnexB),
+            Vec::<&[u8]>::new()
+        );
         // SPS payload hides `00 00 01 65 ..` (a fake IDR slice): the real PPS
         // after a VCL NAL -> Rejected.
         let after_vcl = [

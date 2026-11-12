@@ -2678,6 +2678,7 @@ mod tests {
     /// queued backlog is flushed and counted as a rejection.
     #[test]
     fn a_parameter_set_change_at_a_move_admits_the_cut_window_and_flushes_nothing() {
+        const CUT: i64 = 5;
         use crate::binding_delivery::{BindingDelivery, BindingPolicy, DeliveryLimits};
         let now = Instant::now();
         let gate = RecoveryGate::StrictRap {
@@ -2706,7 +2707,6 @@ mod tests {
             .add_video_key(DtsTimeBase { num: 1, den: 5 }, h264_gate())
             .unwrap();
         d.set_parameter_sets(live, h264_sets()).unwrap();
-        const CUT: i64 = 5;
         d.rebind_video(0, live, u64::try_from(CUT).unwrap(), 3)
             .unwrap();
         for i in 0..8_i64 {
