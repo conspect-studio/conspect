@@ -1593,8 +1593,12 @@ codec = "mpeg2video"
 segment_ms = 1000
 "##;
 
+    /// #329: behaviour intentionally changed. A source feed is now accepted at
+    /// start-up (the engine starts on Program and takes it live as a boot
+    /// take); only a feed the engine cannot carry at all — a layout — is
+    /// refused, loudly, by the same single start-up rule.
     #[test]
-    fn default_program_outputs_run_and_a_source_feed_is_refused_loudly() {
+    fn default_program_outputs_run_a_source_feed_is_accepted_and_a_layout_is_refused() {
         let plain = MultiviewConfig::load_from_toml(DOC).expect("parses");
         assert!(ensure_outputs_carry_program(&plain).is_ok());
         let routed = MultiviewConfig::load_from_toml(&format!(
@@ -1602,8 +1606,22 @@ segment_ms = 1000
         ))
         .expect("parses");
         routed.validate().expect("valid");
-        let err = ensure_outputs_carry_program(&routed).expect_err("refused");
-        assert!(err.to_string().contains("src:a"), "{err}");
+        ensure_outputs_carry_program(&routed).expect("a source feed starts (as a boot take)");
+        assert_eq!(
+            super::boot_output_feeds(&routed),
+            vec![(
+                "o".to_owned(),
+                crate::routing_aux::PictureBus::Source("a".to_owned())
+            )],
+            "one boot take for the routed output"
+        );
+        assert!(super::boot_output_feeds(&plain).is_empty(), "Program needs no boot take");
+        let layout = MultiviewConfig::load_from_toml(&format!(
+            "{DOC}\n[[routing.output]]\noutput = \"o\"\nvideo = {{ layout = \"L\" }}\n"
+        ))
+        .expect("parses");
+        let err = ensure_outputs_carry_program(&layout).expect_err("refused");
+        assert!(err.to_string().contains("aux:L"), "{err}");
     }
 }
 
