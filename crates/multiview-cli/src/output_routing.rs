@@ -1091,7 +1091,7 @@ impl OutputRouter {
                 | MoveOutcome::AudioFallback { .. } => {}
                 MoveOutcome::Fallback { output_index } => {
                     if let Some(audio) = self.audio.as_mut() {
-                        audio.follow(output_index, &PictureBus::Program, tick, dispatcher);
+                        audio.follow(output_index, &PictureBus::Program, tick, None, dispatcher);
                     }
                     if let Some(out) = self.outputs.get_mut(output_index) {
                         out.bus = PictureBus::Program;
@@ -1146,7 +1146,7 @@ impl OutputRouter {
                         out.bus = PictureBus::Program;
                     }
                     if let Some(audio) = self.audio.as_mut() {
-                        audio.follow(index, &PictureBus::Program, tick, dispatcher);
+                        audio.follow(index, &PictureBus::Program, tick, Some(base), dispatcher);
                     }
                     self.emit(
                         String::new(),
@@ -1238,7 +1238,7 @@ impl OutputRouter {
                                 p.phase = Phase::Moving(key);
                             }
                             if let Some(audio) = self.audio.as_mut() {
-                                audio.follow(index, &bus, at, dispatcher);
+                                audio.follow(index, &bus, at, Some(key), dispatcher);
                             }
                         } else {
                             self.refuse_pending(index, tick, RefuseReason::EncoderNotReady);
@@ -1324,7 +1324,7 @@ impl OutputRouter {
             if dispatcher.rebind_video(index, key, tick, windows).is_ok() {
                 set(self, Phase::Moving(key));
                 if let Some(audio) = self.audio.as_mut() {
-                    audio.follow(index, bus, tick, dispatcher);
+                    audio.follow(index, bus, tick, Some(key), dispatcher);
                 }
                 // A re-take of a lingering key adopts it (re-attributed,
                 // linger cleared). A key another output still subscribes

@@ -89,6 +89,9 @@ struct Fade {
     xf: TakeCrossfade,
     from: AudioSource,
     to: AudioSource,
+    /// The output read this bus before the take's audio move was issued (a
+    /// refused video move drops that move, so the binding returns to this).
+    was_bound: bool,
 }
 
 /// The private encoder's codec configuration as the consumer knows it.
@@ -244,11 +247,18 @@ impl RoutedAudio {
 
     /// The router issued the output's video rebind at move tick `move_tick`:
     /// schedule the crossfade at `G` and move the output's audio slot there.
+    ///
+    /// `after_video = Some(k)`: the router just issued a video move to key
+    /// `k`; the audio slot moves only once it is applied (the dispatcher
+    /// drops it if the video move is refused or superseded: the audio never
+    /// switches while the video stays). `None` for a video change that
+    /// already happened (a fallback landing).
     pub(crate) fn follow(
         &mut self,
         output: usize,
         target: &PictureBus,
         move_tick: u64,
+        after_video: Option<usize>,
         dispatcher: &mut RenditionDispatcher,
     ) {
         let to = AudioSource::follow(target);
@@ -273,6 +283,7 @@ impl RoutedAudio {
             .start
             .saturating_add(WARM_FRAMES.saturating_mul(AAC_FRAME_SAMPLES));
         let g = grid_ceil(at.max(warm).max(bus.fed), AAC_FRAME_SAMPLES);
+        let was_bound = bus.bound;
         if !bus.bound {
             if matches!(bus.config_seen, ConfigState::Pending) {
                 match bus.config.try_recv() {
@@ -290,7 +301,7 @@ impl RoutedAudio {
             };
             if !same
                 || dispatcher
-                    .rebind_audio(output, Some(bus.key), g_i64)
+                    .rebind_audio(output, Some(bus.key), g_i64, after_video)
                     .is_err()
             {
                 // encoder-format-mismatch / not ready: the video still moves.
@@ -313,6 +324,7 @@ impl RoutedAudio {
             xf: TakeCrossfade { start: g, len },
             from,
             to: to.clone(),
+            was_bound,
         });
         if let Some(c) = self.carried.get_mut(output) {
             *c = to;
@@ -330,6 +342,10 @@ impl RoutedAudio {
         let Some(fade) = bus.fade.take() else {
             return;
         };
+        // The dispatcher dropped the audio move with the video move: the
+        // output reads what it read before the take (a later take binds the
+        // bus again; the bus fades back first, so Rule 2 holds then).
+        bus.bound = fade.was_bound;
         let start = grid_ceil(fade.xf.end().max(bus.fed), AAC_FRAME_SAMPLES);
         if fade.xf.start >= bus.fed {
             // Nothing of the fade was fed yet: the bus never left the old audio.
@@ -340,6 +356,7 @@ impl RoutedAudio {
                 xf: TakeCrossfade { start, len },
                 from: fade.to,
                 to: fade.from.clone(),
+                was_bound: fade.was_bound,
             });
             self.counters.faded_back = self.counters.faded_back.saturating_add(1);
             tracing::info!(output, "routing: video move refused; audio fades back");
