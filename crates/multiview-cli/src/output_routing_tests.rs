@@ -1215,3 +1215,97 @@ fn a_deadline_missed_open_never_takes_a_slot() {
     assert_eq!(x.h.snapshot().dynamic_encoders_live, 0);
     assert_eq!(x.d.binding_video_key(1), Some(0));
 }
+
+/// D (lens 1 #1): the force is armed for tick T, the offer for T is dropped
+/// and T+1 arrives (gap 1). The packet for T (a fill tick) is the keyframe,
+/// not T+1, and a move with `at_tick = T` lands at T.
+#[test]
+fn a_forced_idr_lands_on_a_gap_filled_tick() {
+    let force = force_cell();
+    let mut w = GapFill {
+        inner: Box::new(FakeEnc {
+            forced: false,
+            encoded: Arc::new(AtomicUsize::new(0)),
+        }),
+        force_at: Arc::clone(&force),
+        next: None,
+        last: None,
+    };
+    let t = 10;
+    let mut packets = Vec::new();
+    for tick in t - 3..t {
+        packets.extend(
+            w.encode(BakedTick {
+                tick,
+                canvas: canvas(),
+            })
+            .unwrap(),
+        );
+    }
+    force.store(t, Ordering::Release);
+    packets.extend(
+        w.encode(BakedTick {
+            tick: t + 1,
+            canvas: canvas(),
+        })
+        .unwrap(),
+    );
+    let keys: Vec<(i64, bool)> = packets
+        .iter()
+        .map(|p| (p.pts().unwrap(), p.is_keyframe()))
+        .collect();
+    let t_i = i64::try_from(t).unwrap();
+    assert!(keys.contains(&(t_i, true)), "T is the keyframe: {keys:?}");
+    assert!(keys.contains(&(t_i + 1, false)), "only once: {keys:?}");
+    // The dispatcher applies a move at T on that packet.
+    let mut d = dispatcher(1);
+    let key = d
+        .add_video_key(
+            DtsTimeBase { num: 1, den: 5 },
+            Box::new(|p| p.is_keyframe()),
+        )
+        .unwrap();
+    d.rebind_video(0, key, t, 1).unwrap();
+    let mut rec = Rec::default();
+    let now = Instant::now();
+    let mark = |tick: i64| crate::rendition_workers::DtsWatermark {
+        complete_before_ns: i128::from(tick + 1) * TICK_NS,
+    };
+    for p in packets {
+        let tick = p.pts().unwrap();
+        d.dispatch(
+            DispatchEvent::Video {
+                key_index: key,
+                tick: u64::try_from(tick).unwrap(),
+                timebase: Rational::new(1, 5),
+                packets: vec![p],
+                watermark: Some(mark(tick)),
+            },
+            now,
+            &mut rec,
+        )
+        .unwrap();
+    }
+    for tick in 0..=t_i + 1 {
+        d.dispatch(
+            DispatchEvent::Video {
+                key_index: 0,
+                tick: u64::try_from(tick).unwrap(),
+                timebase: Rational::new(1, 5),
+                packets: vec![pkt(u64::try_from(tick).unwrap(), false)],
+                watermark: Some(mark(tick)),
+            },
+            now,
+            &mut rec,
+        )
+        .unwrap();
+    }
+    assert!(
+        d.take_move_outcomes().contains(&MoveOutcome::Applied {
+            output_index: 0,
+            key,
+            tick: t,
+        }),
+        "the rebind at T lands"
+    );
+}

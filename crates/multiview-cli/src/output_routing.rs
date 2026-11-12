@@ -320,6 +320,12 @@ impl VideoEncodeWorker for GapFill {
             }
             if let Some(last) = self.last.clone() {
                 for tick in next..item.tick {
+                    // The forced IDR belongs to the first ENCODED tick >= its
+                    // tick, fill ticks included: a dropped offer for the
+                    // forced tick must not push the keyframe past the rebind.
+                    if take_force(&self.force_at, tick) {
+                        self.inner.force_keyframe();
+                    }
                     out.append(&mut self.inner.encode(BakedTick {
                         tick,
                         canvas: Arc::clone(&last),
