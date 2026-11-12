@@ -117,6 +117,10 @@ pub struct Muxer {
     options: MuxOptions,
     header_written: bool,
     trailer_written: bool,
+    /// The output file was closed by [`release_output`](Muxer::release_output)
+    /// (every byte flushed); the next [`redirect_output`](Muxer::redirect_output)
+    /// opens a new one, and [`finish`](Muxer::finish) has nothing left to write.
+    released: bool,
     /// The interrupt state a push muxer's `AVIOInterruptCB` points at
     /// ([`Muxer::create_push`]). Declared AFTER `output` so the context (and
     /// its `AVIOContext`, which holds a copy of the callback) is closed before
@@ -229,6 +233,7 @@ impl Muxer {
             options: MuxOptions::new(),
             header_written: false,
             trailer_written: false,
+            released: false,
             interrupt: None,
             writer: None,
         })
@@ -248,6 +253,7 @@ impl Muxer {
             options: MuxOptions::new(),
             header_written: false,
             trailer_written: false,
+            released: false,
             interrupt: None,
             writer: None,
         })
@@ -291,6 +297,7 @@ impl Muxer {
             options,
             header_written: false,
             trailer_written: false,
+            released: false,
             interrupt: None,
             writer: None,
         })
@@ -329,6 +336,7 @@ impl Muxer {
             options: MuxOptions::new(),
             header_written: false,
             trailer_written: false,
+            released: false,
             interrupt: Some(interrupt),
             writer: None,
         })
@@ -365,6 +373,7 @@ impl Muxer {
             options: MuxOptions::new(),
             header_written: false,
             trailer_written: false,
+            released: false,
             interrupt: Some(interrupt),
             writer: Some(io),
         })
@@ -667,7 +676,7 @@ impl Muxer {
         stream_index: usize,
         mut packet: codec::packet::Packet,
     ) -> Result<()> {
-        if !self.header_written {
+        if !self.header_written || self.released {
             return Err(FfmpegError::Mux(ffmpeg::Error::InvalidData));
         }
         let info = *self
@@ -697,6 +706,14 @@ impl Muxer {
         }
         if !self.header_written {
             return Err(FfmpegError::Mux(ffmpeg::Error::InvalidData));
+        }
+        if self.released {
+            // The file is already flushed and closed; there is no `pb` to write
+            // a trailer to. (An MPEG-TS trailer is only the flush that
+            // `release_output` already did.) libav's deinit runs when the
+            // context is freed.
+            self.trailer_written = true;
+            return Ok(());
         }
         self.output.write_trailer().map_err(FfmpegError::Mux)?;
         self.trailer_written = true;
@@ -732,6 +749,10 @@ impl Muxer {
         if !self.header_written || self.trailer_written {
             return Err(FfmpegError::Mux(ffmpeg::Error::InvalidData));
         }
+        if self.released {
+            // Nothing is open; everything was flushed before the release.
+            return Ok(());
+        }
         // SAFETY: `self.output.as_mut_ptr()` is the live, owned output
         // `AVFormatContext` (we hold `&mut self`; the header has been
         // written). `av_interleaved_write_frame(ctx, NULL)` and
@@ -753,6 +774,38 @@ impl Muxer {
         if rc < 0 {
             return Err(FfmpegError::Mux(ffmpeg::Error::from(rc)));
         }
+        Ok(())
+    }
+
+    /// Flush every pending byte of the current output file and close it,
+    /// keeping the muxer itself (per-PID continuity, PCR/PTS state) alive for
+    /// the next [`redirect_output`](Muxer::redirect_output).
+    ///
+    /// Needed where a file cannot be renamed while open (Windows): the
+    /// segmenter releases the finished segment, renames it into place, then
+    /// redirects to the next one. After this, [`write_packet`](Muxer::write_packet)
+    /// is a contract violation until `redirect_output`, and
+    /// [`finish`](Muxer::finish) completes without writing.
+    ///
+    /// # Errors
+    /// [`FfmpegError::Mux`] if the header was not written, the trailer was
+    /// already written, or the flush or close failed.
+    #[allow(unsafe_code)]
+    pub fn release_output(&mut self) -> Result<()> {
+        if self.released {
+            return Ok(());
+        }
+        self.flush()?;
+        // SAFETY: `self.output.as_mut_ptr()` is the live, owned output
+        // `AVFormatContext` (`&mut self`, header written, everything flushed
+        // above). `avio_closep` closes the context's `pb` and nulls it; libav
+        // checks `s->pb` for null before every later flush, and
+        // `redirect_output` installs a new `pb` before any packet is written.
+        let rc = unsafe { ffmpeg::ffi::avio_closep(&raw mut (*self.output.as_mut_ptr()).pb) };
+        if rc < 0 {
+            return Err(FfmpegError::Mux(ffmpeg::Error::from(rc)));
+        }
+        self.released = true;
         Ok(())
     }
 
@@ -788,9 +841,11 @@ impl Muxer {
     ///   the flush failed, or the new `AVIOContext` could not be opened.
     #[allow(unsafe_code)]
     pub fn redirect_output(&mut self, path: &Path) -> Result<()> {
-        self.flush()?;
         if !self.header_written || self.trailer_written {
             return Err(FfmpegError::Mux(ffmpeg::Error::InvalidData));
+        }
+        if !self.released {
+            self.flush()?;
         }
         let path_str = path.to_str().ok_or_else(nul_err)?;
         let cpath = CString::new(path_str).map_err(|_| nul_err())?;
@@ -814,6 +869,8 @@ impl Muxer {
             if opened < 0 {
                 opened
             } else {
+                // A released output has no `pb`; `avio_closep` accepts a null
+                // handle and returns 0.
                 let closed = ffmpeg::ffi::avio_closep(&raw mut (*ctx).pb);
                 if closed < 0 {
                     ffmpeg::ffi::avio_closep(&raw mut next_pb);
@@ -827,6 +884,7 @@ impl Muxer {
         if rc < 0 {
             return Err(FfmpegError::Mux(ffmpeg::Error::from(rc)));
         }
+        self.released = false;
         // Ask the still-open inner context to re-emit PAT/PMT/SDT
         // before the next packet (the segment-start self-containment libav's own
         // HLS muxer gets via the identical `mpegts_flags=resend_headers`
