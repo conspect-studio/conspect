@@ -7342,6 +7342,22 @@ fn consumer_main<D: WindowDelivery>(
     // The program-audio encode worker owns the AAC encoder: it encodes program +
     // discrete tracks OFF this consumer, in tick order, computes the watermarks
     // and dispatches (design note docs/architecture/audio-encode-worker.md).
+    // ADR-0108 §5: routed outputs' audio follows their video feed. Private
+    // per-output buses open with the program encoder's exact settings and
+    // must reproduce its AudioSpecificConfig. Nothing opens without a take.
+    if let Some(encoder) = audio_encoder.as_ref() {
+        let gains = audio_route.clone();
+        let route_gain: crate::routing_audio::RouteGain = Arc::new(move |id: &str| {
+            gains
+                .as_ref()
+                .map_or(1.0, |handle| handle.output_route_gain(id))
+        });
+        router.enable_audio(
+            encoder.config().clone(),
+            encoder.codec_params().codec_config_bytes(),
+            route_gain,
+        );
+    }
     let mut audio_worker = match audio_encoder.take() {
         Some(encoder) => {
             let tx = event_tx.clone();
@@ -7662,6 +7678,23 @@ fn consumer_main<D: WindowDelivery>(
                 // The eviction flag is the "WHEP consumer behind" signal we
                 // intentionally ignore here (drop-oldest; inv #10).
                 let _ = slot.push(block.clone());
+            }
+            // ADR-0108 §5.2: feed routed outputs' private audio buses from
+            // this same tick's program block and per-source clean blocks
+            // (no second store read). Never blocks; no take = no work.
+            {
+                #[cfg(not(feature = "overlay"))]
+                let feed_bus: &multiview_audio::program::ProgramBus = bus;
+                #[cfg(feature = "overlay")]
+                let feed_bus = audio_bus
+                    .as_ref()
+                    .ok_or_else(|| PipelineError::Engine("audio bus missing".to_owned()))?;
+                router.feed_audio(
+                    item.tick_index,
+                    &block,
+                    &feed_bus.input_tracks(),
+                    &mut dispatcher,
+                );
             }
             if audio_worker.is_none() {
                 return Err(PipelineError::Output {

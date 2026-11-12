@@ -813,6 +813,13 @@ impl AudioRenditionEncoder {
         Ok(())
     }
 
+    /// The settings this encoder opened with (a private per-output bus opens
+    /// with exactly these, so its `AudioSpecificConfig` can match, §5.2).
+    #[must_use]
+    pub const fn config(&self) -> &AudioEncodeConfig {
+        &self.config
+    }
+
     /// Program-audio encoder frame size in exact samples (AAC is typically 1024).
     #[must_use]
     pub fn frame_samples(&self) -> Option<u32> {

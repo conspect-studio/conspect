@@ -1931,17 +1931,6 @@ impl RenditionDispatcher {
         }
         Ok(())
     }
-    /// Drop an output's pending audio move (the video move it belonged to
-    /// was refused before G).
-    pub(crate) fn cancel_audio_move(&mut self, output_index: usize) {
-        if let Some(b) = self
-            .bindings
-            .iter_mut()
-            .find(|b| b.output_index == output_index)
-        {
-            b.audio_mv = None;
-        }
-    }
     /// Stage one dynamic audio stage's emission (`finish` = its EOF tail),
     /// then commit every ready window exactly as [`Self::dispatch`] does. A
     /// fault in the stage fails that stage alone, never the run.
@@ -3471,7 +3460,7 @@ mod tests {
         let (key, _) = d.add_audio_key().unwrap();
         // G inside window 5 (9600..11520): 10240.
         let g = 10_240;
-        let mut seen = vec![Vec::new(), Vec::new()];
+        let mut seen = [Vec::new(), Vec::new()];
         for i in 0..10_i64 {
             // The private bus runs from window 2 on, carrying its own tag.
             if i >= 2 {
@@ -3523,7 +3512,7 @@ mod tests {
         )
         .unwrap();
         d.rebind_audio(1, Some(key), 1024).unwrap();
-        let mut seen = vec![Vec::new(), Vec::new()];
+        let mut seen = [Vec::new(), Vec::new()];
         for i in 0..12_i64 {
             d.dispatch(ve25(i), now, &mut sink).unwrap();
             d.dispatch(audio_event(i, 1), now, &mut sink).unwrap();
@@ -3625,7 +3614,7 @@ mod tests {
             if tick == move_tick {
                 d.rebind_audio(1, Some(key), g).unwrap();
             }
-            let t = u64::try_from(tick).unwrap();
+            let t = tick;
             d.dispatch(
                 ve25(i64::try_from(tick).unwrap()),
                 Instant::now(),
