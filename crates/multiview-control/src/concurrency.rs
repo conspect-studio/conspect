@@ -259,19 +259,6 @@ impl IdempotencyStore {
         Reservation::Fresh(op)
     }
 
-    /// The operation already reserved for `key`, without reserving.
-    ///
-    /// Lets a route answer a replay before its own pre-reservation checks
-    /// (rate limits, existence) so a retry never counts as a new take.
-    #[must_use]
-    pub fn peek(&self, key: &str) -> Option<OperationId> {
-        self.seen
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .get(key)
-            .cloned()
-    }
-
     /// Release a previously [`reserve`](Self::reserve)d key, but **only** if it
     /// still maps to `op`.
     ///
