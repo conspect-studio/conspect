@@ -137,6 +137,21 @@ pub struct AudioRoutingCounters {
     pub faded_back: u64,
 }
 
+/// Test observation of routed audio: the PCM handed to the shared program
+/// encoder and to each private bus, as `(first sample, interleaved PCM)`.
+#[cfg(test)]
+#[derive(Debug, Default)]
+pub(crate) struct AudioTap {
+    pub(crate) program: Vec<(u64, Vec<f32>)>,
+    pub(crate) private: Vec<(usize, u64, Vec<f32>)>,
+    /// Each scheduled crossfade: `(output, G)`.
+    pub(crate) moves: Vec<(usize, u64)>,
+}
+
+/// Shared [`AudioTap`] (router, handle and test).
+#[cfg(test)]
+pub(crate) type AudioTapCell = Arc<std::sync::Mutex<AudioTap>>;
+
 /// The routed-audio manager, owned by the router on the bake consumer.
 pub(crate) struct RoutedAudio {
     config: AudioEncodeConfig,
@@ -152,6 +167,8 @@ pub(crate) struct RoutedAudio {
     events: Receiver<AudioEvent>,
     dropped: Arc<AtomicU64>,
     counters: AudioRoutingCounters,
+    #[cfg(test)]
+    pub(crate) tap: Option<AudioTapCell>,
 }
 
 impl RoutedAudio {
@@ -177,6 +194,8 @@ impl RoutedAudio {
             events,
             dropped: Arc::new(AtomicU64::new(0)),
             counters: AudioRoutingCounters::default(),
+            #[cfg(test)]
+            tap: None,
         }
     }
 
@@ -320,6 +339,12 @@ impl RoutedAudio {
             None => bus.current.clone(),
         };
         bus.current = from.clone();
+        #[cfg(test)]
+        if let Some(tap) = self.tap.as_ref() {
+            if let Ok(mut t) = tap.lock() {
+                t.moves.push((output, g));
+            }
+        }
         bus.fade = Some(Fade {
             xf: TakeCrossfade { start: g, len },
             from,
@@ -425,6 +450,12 @@ impl RoutedAudio {
             if tail.is_empty() {
                 continue;
             }
+            #[cfg(test)]
+            if let Some(tap) = self.tap.as_ref() {
+                if let Ok(mut t) = tap.lock() {
+                    t.private.push((output, from, tail.clone()));
+                }
+            }
             bus.fed = end;
             if let Some(fade) = bus.fade.as_ref() {
                 if end >= fade.xf.end() {
@@ -445,6 +476,19 @@ impl RoutedAudio {
         }
         for output in failed {
             self.fail(output, dispatcher);
+        }
+    }
+
+    /// Record the block handed to the shared program encoder for `tick`.
+    #[cfg(test)]
+    pub(crate) fn tap_program(&self, tick: u64, program: &AudioBlock) {
+        if let Some(tap) = self.tap.as_ref() {
+            let end = self.clock.total_at(tick.saturating_add(1));
+            let frames = u64::try_from(program.frame_count()).unwrap_or(0);
+            if let Ok(mut t) = tap.lock() {
+                t.program
+                    .push((end.saturating_sub(frames), program.interleaved().to_vec()));
+            }
         }
     }
 

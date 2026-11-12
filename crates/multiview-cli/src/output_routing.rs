@@ -245,6 +245,8 @@ pub struct RoutingSnapshot {
 /// calling [`Self::try_take`]. Both strings are length-bounded here.
 #[derive(Clone)]
 pub struct OutputRoutingHandle {
+    #[cfg(test)]
+    pub(crate) audio_tap: crate::routing_audio::AudioTapCell,
     takes: SyncSender<OutputTake>,
     snapshot: Arc<SwapCell<Arc<RoutingSnapshot>>>,
     outcomes: Arc<Mutex<Option<Receiver<TakeOutcome>>>>,
@@ -575,6 +577,8 @@ pub struct OutputRouter {
     /// Routed outputs' audio (`audio = follow`); `None` for a run without
     /// program audio.
     audio: Option<crate::routing_audio::RoutedAudio>,
+    #[cfg(test)]
+    audio_tap: crate::routing_audio::AudioTapCell,
 }
 
 impl OutputRouter {
@@ -637,7 +641,11 @@ impl OutputRouter {
             })
             .collect();
         let snapshot = Arc::new(SwapCell::from_pointee(RoutingSnapshot::default()));
+        #[cfg(test)]
+        let audio_tap = crate::routing_audio::AudioTapCell::default();
         let handle = OutputRoutingHandle {
+            #[cfg(test)]
+            audio_tap: Arc::clone(&audio_tap),
             takes: take_tx,
             snapshot: Arc::clone(&snapshot),
             outcomes: Arc::new(Mutex::new(Some(outcome_rx))),
@@ -671,6 +679,8 @@ impl OutputRouter {
             dirty: true,
             reaper: Some(reaper),
             audio: None,
+            #[cfg(test)]
+            audio_tap,
         };
         router.publish_snapshot();
         Ok((router, handle))
@@ -693,6 +703,22 @@ impl OutputRouter {
             route_gain,
             self.aux.preview_selection.clone(),
         ));
+        #[cfg(test)]
+        if let Some(audio) = self.audio.as_mut() {
+            audio.tap = Some(Arc::clone(&self.audio_tap));
+        }
+    }
+
+    /// Test observation: the block handed to the shared program encoder.
+    #[cfg(test)]
+    pub(crate) fn tap_program_audio(
+        &self,
+        tick: u64,
+        program: &multiview_audio::format::AudioBlock,
+    ) {
+        if let Some(audio) = self.audio.as_ref() {
+            audio.tap_program(tick, program);
+        }
     }
 
     /// Whether any output has a private audio bus (no take = `false`, and

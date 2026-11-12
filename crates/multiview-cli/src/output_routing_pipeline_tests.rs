@@ -536,3 +536,106 @@ fn audio_follows_a_take_to_a_source_with_a_crossfade_through_the_real_pipeline()
     let pre_g = span(1, g(to_bars.tick) - 3072, g(to_bars.tick) - 1024);
     assert!(rms(&pre_g) < 1e-3, "no tone before G: {}", rms(&pre_g));
 }
+
+/// Rule 2 with the program loudness normaliser on (it always runs on the
+/// program bus when program audio is enabled): the program mix carries the
+/// bars tone (`@_b` included in the mix) and output 1 takes `src:<solid>`.
+/// Up to G the private bus must be fed EXACTLY the PCM the shared program
+/// encoder is fed for the same samples (the post-loudnorm program block),
+/// sample for sample, so both encoders code one signal before the boundary.
+#[test]
+fn a_private_bus_is_fed_the_post_loudnorm_program_pcm_up_to_g() {
+    const TICKS: u64 = 300;
+    let config = AUDIO_CONFIG.replacen(
+        "input_id = \"@_b\"\nchannels = { kind = \"stereo\" }\ninclude_in_program_bus = false",
+        "input_id = \"@_b\"\nchannels = { kind = \"stereo\" }\ninclude_in_program_bus = true",
+        1,
+    );
+    assert_ne!(config, AUDIO_CONFIG, "the tone is mixed into Program");
+    let observed = Arc::new(Mutex::new(Observed::default()));
+    let record = Arc::clone(&observed);
+    let tap = Arc::new(Mutex::new(None));
+    let tap_out = Arc::clone(&tap);
+    let run = drive_config(&config, true, "route_ln", TICKS, move |slot| {
+        let handle = wait_for("the routing handle", Duration::from_secs(10), || {
+            slot.load()
+        });
+        *tap_out.lock().unwrap() = Some(Arc::clone(&handle.audio_tap));
+        let outcomes = handle.outcomes().expect("one outcome reader");
+        wait_for("the first routing tick", Duration::from_secs(10), || {
+            (handle.snapshot().video_keys > 0).then_some(())
+        });
+        // After the normaliser's 3 s short-term window: a non-unity gain.
+        std::thread::sleep(Duration::from_millis(4500));
+        for _ in 0..5 {
+            let t = take("to-solid", 1, PictureBus::Source("route_ln_a".to_owned()));
+            handle.try_take(t).unwrap();
+            let o = wait_for("outcome", Duration::from_secs(5), || {
+                outcomes.try_recv().ok()
+            });
+            match o.outcome {
+                TakeResult::Applied => {
+                    record.lock().unwrap().to_source = Some((o, 0));
+                    return;
+                }
+                TakeResult::Refused(super::RefuseReason::FeedNotFresh) => {}
+                other => panic!("{other:?}"),
+            }
+        }
+        panic!("never applied");
+    });
+    assert_eq!(run.frames, TICKS);
+    assert_eq!(
+        run.final_snapshot.audio.opened, 1,
+        "{:?}",
+        run.final_snapshot
+    );
+    let (applied, _) = observed.lock().unwrap().to_source.clone().expect("applied");
+    let tap = tap.lock().unwrap().clone().expect("tap");
+    let tap = tap.lock().unwrap();
+    // The take's move is the first (a later fallback may add another).
+    assert!(!tap.moves.is_empty());
+    let (_, g) = tap.moves[0];
+    assert!(
+        g <= (applied.tick * 1920).div_ceil(1024) * 1024,
+        "G {g} at or before the applied video"
+    );
+    let program: std::collections::BTreeMap<u64, f32> = tap
+        .program
+        .iter()
+        .flat_map(|(start, pcm)| {
+            pcm.iter()
+                .enumerate()
+                .map(move |(i, v)| (start * 2 + u64::try_from(i).unwrap(), *v))
+        })
+        .collect();
+    let mut compared = 0_usize;
+    let mut energy = 0.0_f64;
+    for (output, start, pcm) in &tap.private {
+        assert_eq!(*output, 1);
+        for (i, v) in pcm.iter().enumerate() {
+            let at = start * 2 + u64::try_from(i).unwrap();
+            if at / 2 >= g {
+                break;
+            }
+            let p = program
+                .get(&at)
+                .unwrap_or_else(|| panic!("sample {at} not encoded"));
+            assert_eq!(
+                v.to_bits(),
+                p.to_bits(),
+                "interleaved sample {at} before G {g}"
+            );
+            compared += 1;
+            energy += f64::from(*v) * f64::from(*v);
+        }
+    }
+    assert!(
+        compared >= 2 * 2048,
+        "the bus coded >= 2 frames before G: {compared}"
+    );
+    assert!(
+        energy > 1.0,
+        "the program mix is not silent before G: {energy}"
+    );
+}
