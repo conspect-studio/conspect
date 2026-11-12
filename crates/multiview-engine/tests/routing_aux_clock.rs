@@ -241,7 +241,7 @@ fn a_wedged_or_dead_aux_thread_costs_the_output_clock_nothing() {
 }
 
 /// Deterministic part: 300 ticks on a manual clock that advances exactly one
-/// period per compose. Returns (ticks, frames_repeated, sent, dropped).
+/// period per compose. Returns `(ticks, frames_repeated, sent, dropped)`.
 async fn run_manual(aux: AuxTickSender) -> (u64, u64, u64, u64) {
     const MANUAL_TICKS: u64 = 300;
     // An exact-period cadence (25 fps = 40 ms) so whole-period advances land
