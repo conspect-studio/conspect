@@ -238,7 +238,9 @@ every few seconds, so allow that rate:
 ```ini
 # systemd unit
 [Unit]
-StartLimitIntervalSec=0      # never stop restarting a crash-looping engine
+StartLimitIntervalSec=120    # more than 20 starts in 2 minutes (a fault on every start)...
+StartLimitBurst=20           # ...stops the unit; rarer faults keep restarting
+OnFailure=engine-alert.service  # your alert (crash loop or start-limit hit)
 
 [Service]
 Restart=always
@@ -246,9 +248,13 @@ RestartSec=2s
 ```
 
 With the systemd default (5 starts in 10 s), a fault within about 2 s of every start stops the
-unit permanently. With Docker, `restart: unless-stopped` (in `deploy/compose.yaml`) restarts it,
-with Docker's own back-off. Watch the restart count (`systemctl show -p NRestarts`): a rising
-count is a fault to investigate, not a healthy state.
+unit after five tries. That is the right outcome for a persistent startup failure (a bad config,
+a missing device): the engine can never start, and restarting forever only hides it. Size the
+start limit so that a fault that happens every few minutes keeps the engine running, while a
+fault on every start still stops the unit and raises the `OnFailure=` alert. With Docker,
+`restart: unless-stopped` (in `deploy/compose.yaml`) restarts it, with Docker's own back-off.
+Watch the restart count (`systemctl show -p NRestarts`): a rising count is a fault to
+investigate, not a healthy state.
 
 ---
 

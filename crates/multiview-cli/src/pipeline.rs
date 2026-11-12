@@ -6308,7 +6308,11 @@ fn binding_report_lines(bindings: &[crate::binding_delivery::BindingStatus]) -> 
 fn join_sinks_after_consumer_failure(
     sinks: Vec<JoinHandle<Result<SinkRunOutcome, PipelineError>>>,
 ) -> bool {
-    let deadline = Instant::now() + SINK_WEDGE_GRACE;
+    // Never wait past the armed exit deadline: the watchdog ends the process
+    // there anyway, so a sink still finalising then is cut either way.
+    let grace = crate::exit_watchdog::remaining()
+        .map_or(SINK_WEDGE_GRACE, |left| left.min(SINK_WEDGE_GRACE));
+    let deadline = Instant::now() + grace;
     let mut all_finalised = true;
     for (i, handle) in sinks.into_iter().enumerate() {
         while !handle.is_finished() && Instant::now() < deadline {

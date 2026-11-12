@@ -71,6 +71,11 @@ restarting.
      `#EXT-X-ENDLIST`) and the ProgramSet shutdown. So 2 s is a 10× margin.
    - The sink wedge grace (`SINK_WEDGE_GRACE`, 2 s) still applies inside it: a wedged sink is
      detached or cut. That is the same outcome as before, but sooner.
+   - On a fatal, the bound starts at the fault, before the sinks begin to finalise (they see
+     end-of-program when the failing consumer returns). So a sink gets the rest of the bound
+     to finalise, not a fresh grace; the join never waits past the armed deadline. A sink
+     whose finalise takes longer than that remainder is cut. HLS segments and manifests stay
+     valid (atomic publish), and the finalised manifest lands only if it is in time.
 4. **Useful work first.**
    - The pipeline teardown now joins egress (consumer and sinks: trailers, HLS finalize)
      **before** the source teardown. So the outputs are final within about 100 ms of the clock
@@ -88,7 +93,14 @@ restarting.
      idempotent).
    - The drain (10 s ceiling) is cut by the deadline. In-flight requests get the remainder of
      the bound, about 2 s. A client whose request was cut cannot tell whether a mutation landed.
-     The Running persist that runs at the decision captures any mutation committed before it.
+   - **What is guaranteed, and what is best effort.** The exit bound is the guarantee. The
+     exit-time journal flush (up to 500 ms) and Running persist run inside it, as best effort:
+     - the persist captures the mutations committed before it composes;
+     - a mutation committed after that, during the drain, is not durable across the restart;
+     - a flush or persist still in flight at the deadline is lost, and the log shows no
+       "exit-time running-state persist written" line.
+
+     The bound takes priority over these steps: they are cut, never waited for.
 
 ## Why the outputs stay valid at a hard exit
 
@@ -124,8 +136,8 @@ restarting.
 - With `Restart=always`, `RestartSec=2s` and systemd's default start limit (5 starts in 10 s),
   systemd could stop the unit if the engine fails within about 2 s of every start.
 - The faults measured on #309 came 3 to 150 min apart, so this is not a present risk.
-- The required supervisor settings (`StartLimitIntervalSec=0`, `Restart=always`) and the restart
-  counter to watch are in
+- The recommended supervisor settings (a finite start limit sized to the new cadence,
+  `Restart=always`, an `OnFailure=` alert) and the restart counter to watch are in
   [building §4.1](../operations/building.md#41-running-under-a-supervisor-exit-and-restart).
 
 ## Invariant #1

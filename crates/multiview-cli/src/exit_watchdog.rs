@@ -104,6 +104,15 @@ impl Watchdog {
         set
     }
 
+    /// Time left until the armed deadline (`None` when not armed).
+    #[must_use]
+    pub fn remaining(&self) -> Option<Duration> {
+        let due = self.due_ns.load(Ordering::Acquire);
+        (due != 0).then(|| {
+            (self.origin + Duration::from_nanos(due)).saturating_duration_since(Instant::now())
+        })
+    }
+
     /// The armed cause, if any.
     #[must_use]
     pub fn cause(&self) -> Option<ExitCause> {
@@ -285,6 +294,12 @@ pub fn arm(cause: ExitCause) {
 /// journal flush — concurrently with the pipeline teardown, inside the bound.
 /// (Polling keeps [`arm`] wait-free: it never wakes an async task itself.)
 ///
+/// Time left until the process exit deadline, if one is armed.
+#[must_use]
+pub fn remaining() -> Option<Duration> {
+    WATCHDOG.get().and_then(Watchdog::remaining)
+}
+
 /// Whether the exit deadline is armed.
 #[must_use]
 pub fn armed() -> Option<ExitCause> {
