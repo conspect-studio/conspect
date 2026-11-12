@@ -193,13 +193,20 @@ pub fn redact_text(text: &str) -> String {
 
 fn redact_word(word: &str) -> String {
     let mut w = word.to_owned();
-    // Userinfo inside any `scheme://user:pass@host` authority.
-    if let Some(i) = w.find("://") {
-        let rest = &w[i + 3..];
-        let auth_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    // Userinfo inside EVERY `scheme://user:pass@host` authority in the word
+    // (a word can hold several URLs, e.g. a debug-printed list; #324 review).
+    // The authority ends at a path/query/fragment start or a separator.
+    let mut from = 0;
+    while let Some(i) = w[from..].find("://").map(|i| i + from) {
+        let auth_start = i + 3;
+        let rest = &w[auth_start..];
+        let auth_end = rest
+            .find(['/', '?', '#', '"', '\'', ')', ']', '>', ',', ';', '`'])
+            .unwrap_or(rest.len());
         if let Some(at) = rest[..auth_end].rfind('@') {
-            w = format!("{}{}", &w[..i + 3], &rest[at + 1..]);
+            w.replace_range(auth_start..=auth_start + at, "");
         }
+        from = auth_start;
     }
     // Query string / fragment: removed up to the end of the URL (a closing
     // quote/bracket/separator or the end of the word), keeping whatever
@@ -409,6 +416,17 @@ mod tests {
         );
         let out = redact_text(r#"("rist://h:1?secret=abc#frag", next)"#);
         assert_eq!(out, r#"("rist://h:1", next)"#, "{out}");
+    }
+
+    /// #324 review: every URL in one word loses its userinfo and query, not
+    /// only the first.
+    #[test]
+    fn redact_text_strips_every_url_in_a_word() {
+        let out =
+            redact_text(r#"["srt://h:1?passphrase=sekrit","rtmp://user:secretpass@host/x?k=v"]"#);
+        assert_eq!(out, r#"["srt://h:1","rtmp://host/x"]"#, "{out}");
+        let out = redact_text(r#"["rtmp://a:b@h1/x","srt://c:d@h2:9"]"#);
+        assert_eq!(out, r#"["rtmp://h1/x","srt://h2:9"]"#, "{out}");
     }
 
     use super::*;
