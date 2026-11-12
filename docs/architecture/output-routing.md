@@ -332,6 +332,15 @@ source and the same source on a full-canvas Program cell give byte-identical fra
   watermark: `BakeContext`, `crates/multiview-cli/src/pipeline.rs:5146-5195`). The bake consumer offers `item.canvas` instead
   of `overlaid` to the Clean encoder. It costs no compose, only one encoder while selected. When a DSK
   stage exists (ADR-0054), Clean is the tap before the DSK. The routing contract does not change.
+- **Clean as built (slice 2, #305).** `{"bus":"clean"}` is a routed picture bus like Preview and
+  needs an M/E (`switcher-required` otherwise). The bake consumer publishes `item.canvas` (the
+  Program canvas before `baker.bake`) into the Clean slot with `OutputRouter::publish_clean`, just
+  before the router's tick, so the Clean encoder gets frame T in tick T. It is one `Arc` clone into
+  a wait-free `SwapCell`, no copy, and a single cached-bool check when nothing selects Clean. The
+  aux thread never composes Clean and never wakes for it: routing only Clean leaves the clock's aux
+  gate closed and sends no aux tick. Clean is always fresh (§4.5), its health never degrades, and
+  an aux-thread failure never moves an output off Clean (only aux-composed buses fall back).
+  `audio = follow` on Clean is the program mix.
 
 ---
 
@@ -481,6 +490,13 @@ Tick T is the move tick (§4.5).
    generation bump; that output's out-of-band init is then stale until restart (the operator sees
    the fallback event). Equal sets always move. Writing a real discontinuity (HLS tag, TS continuity,
    new fMP4/FLV init) is owed by a later slice.
+
+   **Slice 2:** HLS (TS segments) writes `EXT-X-DISCONTINUITY` before the segment that starts at
+   the changed-set RAP. The queue marks the first window admitted after the
+   `DecoderConfigChanged` discontinuity (`BatchLease::decoder_config_changed`); the HLS packet
+   source reports it once at that window's keyframe, and the segmenter marks the segment starting
+   there in the main playlist and every rendition playlist. A loss never sets it. SRT, RIST and
+   `.ts` files still carry the new sets in band with no other change.
 
    Which case NVENC gives across a live open is measured on mda001 (slice 1 acceptance).
 5. **Format.** An output's format (size, cadence, pixel format, colour tags, codec settings) never
@@ -964,7 +980,10 @@ POST /api/v1/routing/salvo/plan|take      several crosspoints, one tick (new)
   "feed": {"layout": "NewsOne"} }
 ```
 
-The response gives the class, the cost and the refusals:
+The response gives the class, the cost and the refusals. `new_encoders` is `0` when the feed is
+Program, when another output with the same settings already carries the bus, or when a live-opened
+encoder for (bus, settings) still runs, a lingering one (§4.3) included: the take reuses it. The
+engine publishes those keys in its readback (`live_keys`; failed keys excluded).
 
 ```json
 { "class": "class1",
@@ -1405,7 +1424,7 @@ clock-adjacent path, otherwise as `scripts/classify.sh` says.
 | # | Slice | Gives the operator | Risk / crates | Does NOT yet do |
 | --- | --- | --- | --- | --- |
 | **1** (#304) | **Route preview, program, VT, bars or a source to any output, live, from the Outputs page and the API**: each output on its own, also when outputs share settings | The operator's named items except layout. Audio follows (`follow`), with a crossfade. "On Program" and "source direct" are distinct | R3. `multiview-config` (feed fields, `bus` alias), `multiview-engine` (aux thread with one-cell canvases: identity or CPU letterbox; picture-bus slots; take state machine on the bake consumer), `multiview-output` (`forced-idr=1`, force-keyframe, `starting_at(T0)` for video and AAC), `multiview-cli` (encoder registry keyed by picture bus + settings, live open off the clock, linger-close, dispatcher `rebind` at a window, per-bus substitution, routed audio buses), `multiview-control` (`GET /routing`, `output` take kind, `route.output` event, BOLA on the object axis, limits), `web` (Outputs page feed rows) | Layouts as feeds, Clean, explicit audio selection, salvos, the matrix page |
-| 2 (#305) | Explicit audio feed per output (`program`, `source`, `tracks`, `none`) live; Clean bus to an output | "how do I route audio?": any source's audio alone on any output, live | R2-R3. `multiview-cli`, `-config`, `-control`, `web` (Audio row) | Layout audio attribute (slice 3) |
+| 2 (#305) | Explicit audio feed per output (`program`, `source`, `tracks`, `none`) live; Clean bus to an output (part 1 built: Clean bus, plan counts lingering encoders as +0, HLS discontinuity at a changed-set move; explicit audio feed still to do) | "how do I route audio?": any source's audio alone on any output, live | R2-R3. `multiview-cli`, `-config`, `-control`, `web` (Audio row) | Layout audio attribute (slice 3) |
 | 3 (#306) | Route a stored layout to an output (GPU aux canvas + CPU integer path), admission and cost in plan, the `routing.degraded` path | "layout": NewsOne on the HLS output while the switcher stays on | R3. `multiview-engine`, `-cli`, `-control`, `web` | Layout on the M/E, buses inside layouts |
 | 4 (#307) | Layout-as-a-source on the M/E (PVW/PGM/AUTO); `bus:program` and `bus:preview` cells; cycle refusal; first-slice restriction removed; `apply-layout` semantics | "in, around, through" (#243) | R3. `multiview-engine`, `-cli`, `-config`, `-control` | More than one M/E |
 | 5 (#308) | Crosspoint matrix Routing page (video + audio, tally, all states), output salvos (`/routing/salvo/*`, `Salvo.output`) | One screen for everything, atomic multi-output takes | R2. `web`, `multiview-control`, `-config`, `-engine` (salvo adoption) | — |
