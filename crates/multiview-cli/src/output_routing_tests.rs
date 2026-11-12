@@ -160,6 +160,7 @@ fn router(
         active: Arc::new(AtomicBool::new(false)),
         failed: Arc::new(AtomicBool::new(false)),
         dropped: Arc::new(AtomicU64::new(0)),
+        sent: Arc::new(AtomicU64::new(0)),
         stores: Arc::new(|_: &str| None),
         preview_selection: None,
     };
@@ -169,6 +170,7 @@ fn router(
         active: Arc::clone(&aux.active),
         failed: Arc::clone(&aux.failed),
         dropped: Arc::clone(&aux.dropped),
+        sent: Arc::clone(&aux.sent),
         stores: Arc::clone(&aux.stores),
         preview_selection: None,
     };
@@ -396,6 +398,7 @@ fn harness(outputs: usize, max: usize, open: Option<OpenFn>) -> Harness {
             active: Arc::new(AtomicBool::new(false)),
             failed: Arc::clone(&failed),
             dropped: Arc::new(AtomicU64::new(0)),
+            sent: Arc::new(AtomicU64::new(0)),
             stores: Arc::new(move |id: &str| match id {
                 "cam" => Some(Arc::clone(&lookup)),
                 "cam2" => Some(Arc::clone(&lookup2)),
@@ -503,7 +506,7 @@ fn a_take_opens_one_encoder_moves_at_a_rap_and_lingers_out() {
     x.h.try_take(take("a", 1, src())).unwrap();
     let mut applied_at = None;
     let mut now = 5;
-    while now < 40 && applied_at.is_none() {
+    while now < 5 + OPEN_DEADLINE_TICKS && applied_at.is_none() {
         x.tick(now);
         applied_at = x
             .outcomes
@@ -718,5 +721,233 @@ fn a_wedged_aux_degrades_then_falls_back_and_a_dead_aux_falls_back_at_once() {
     assert_eq!(
         x.results(),
         vec![TakeResult::Refused(RefuseReason::FeedNotFresh)]
+    );
+}
+
+/// Test 2 (slow open): the encoder opens after 2 s, far past the 90-tick
+/// deadline of this harness. Bounds: every Program window closes on its tick
+/// (one window per output per tick), no tick of the consumer waits > 200 ms,
+/// the take is refused at exactly its deadline, the late encoder is reaped
+/// (never registered: still 1 key) and the output keeps its feed.
+#[test]
+fn a_slow_open_never_delays_program_and_its_late_encoder_is_reaped() {
+    let encoded = Arc::new(AtomicUsize::new(0));
+    let enc = Arc::clone(&encoded);
+    let open: OpenFn = Box::new(move |_| {
+        std::thread::sleep(std::time::Duration::from_secs(2));
+        let e: Box<dyn LiveEncoder> = Box::new(FakeEnc {
+            forced: false,
+            encoded: Arc::clone(&enc),
+        });
+        Ok(e)
+    });
+    let mut x = harness(2, 6, Some(open));
+    x.tick(0);
+    x.h.try_take(take("a", 1, src())).unwrap();
+    let mut refused_at = None;
+    let mut t = 1;
+    while t <= OPEN_DEADLINE_TICKS + 3 {
+        let started = Instant::now();
+        x.tick(t);
+        assert!(
+            started.elapsed() < std::time::Duration::from_millis(200),
+            "consumer never waits"
+        );
+        assert_eq!(
+            x.windows_of(0).len(),
+            usize::try_from(t).unwrap(),
+            "window at {t}"
+        );
+        assert_eq!(x.windows_of(1).len(), usize::try_from(t).unwrap());
+        if let Some(o) = x.outcomes.try_iter().next() {
+            assert_eq!(
+                o.outcome,
+                TakeResult::Refused(RefuseReason::EncoderNotReady)
+            );
+            refused_at = Some(o.tick);
+        }
+        t += 1;
+    }
+    // Admitted at tick 2 (tick 1 primes: the slot gets its first frame).
+    let refused_at = refused_at.expect("refused at the deadline");
+    assert!(
+        (OPEN_DEADLINE_TICKS..=OPEN_DEADLINE_TICKS + 2).contains(&refused_at),
+        "refused at the deadline, got {refused_at}"
+    );
+    // Let the open finish; its encoder arrives late and goes to the reaper.
+    let open_started = Instant::now();
+    while open_started.elapsed() < std::time::Duration::from_millis(2300) {
+        x.tick(t);
+        t += 1;
+    }
+    assert_eq!(
+        x.d.video_key_count(),
+        1,
+        "the late encoder is never registered"
+    );
+    assert_eq!(
+        x.d.binding_video_key(1),
+        Some(0),
+        "the output keeps its feed"
+    );
+    assert_eq!(x.h.snapshot().opens_in_flight, 0);
+    assert_eq!(
+        encoded.load(Ordering::Relaxed),
+        0,
+        "the late encoder never encodes"
+    );
+    assert_eq!(x.windows_of(0).len(), usize::try_from(t - 1).unwrap());
+}
+
+/// Test 5 (flapping source): the source is live for 60 ticks, dark for 60,
+/// four times. A take issued in a dark phase (5 ticks after going dark, past
+/// the 500 ms hold) is refused `FeedNotFresh` and never applied, even when the
+/// encoder for that bus already lingers (+0 path); takes in live phases apply.
+#[test]
+fn a_flapping_source_never_gets_a_take_while_not_fresh() {
+    let mut x = harness(2, 6, None);
+    let mut results: Vec<(String, TakeResult)> = Vec::new();
+    for t in 0..240_u64 {
+        let phase = t / 60;
+        let at = t % 60;
+        x.live = phase % 2 == 0;
+        if at == 5 {
+            x.h.try_take(take(&format!("src{phase}"), 1, src()))
+                .unwrap();
+        }
+        if x.live && at == 45 {
+            x.h.try_take(take(&format!("pgm{phase}"), 1, PictureBus::Program))
+                .unwrap();
+        }
+        x.tick(t);
+        for o in x.outcomes.try_iter() {
+            if !x.live && o.outcome == TakeResult::Applied {
+                assert_ne!(
+                    x.d.binding_video_key(1),
+                    Some(1),
+                    "applied while dark at {t}"
+                );
+            }
+            results.push((o.operation_id, o.outcome));
+        }
+        if !x.live && at > 3 {
+            assert_eq!(
+                x.d.binding_video_key(1),
+                Some(0),
+                "dark phase stays on Program at {t}"
+            );
+        }
+    }
+    let of = |id: &str| -> Vec<TakeResult> {
+        results
+            .iter()
+            .filter(|(op, _)| op == id)
+            .map(|(_, r)| *r)
+            .collect()
+    };
+    for live in ["src0", "src2", "pgm0", "pgm2"] {
+        assert_eq!(of(live), vec![TakeResult::Applied], "{live}: {results:?}");
+    }
+    for dark in ["src1", "src3"] {
+        assert_eq!(
+            of(dark),
+            vec![TakeResult::Refused(RefuseReason::FeedNotFresh)],
+            "{dark}: {results:?}"
+        );
+    }
+    assert_eq!(
+        x.d.video_key_count(),
+        2,
+        "one encoder for the bus, re-used (+0)"
+    );
+}
+
+/// A live encoder whose `finish()` takes 3 s (test 6).
+struct SlowFinish(FakeEnc);
+
+impl VideoEncodeWorker for SlowFinish {
+    fn encode(&mut self, item: BakedTick) -> Result<Vec<EncodedPacket>, PipelineError> {
+        self.0.encode(item)
+    }
+    fn reorder_bound(&self) -> ReorderBound {
+        ReorderBound::NoReorder
+    }
+    fn finish(&mut self) -> Result<Vec<EncodedPacket>, PipelineError> {
+        std::thread::sleep(std::time::Duration::from_secs(3));
+        Ok(Vec::new())
+    }
+    fn force_keyframe(&mut self) {
+        self.0.force_keyframe();
+    }
+}
+
+impl LiveEncoder for SlowFinish {
+    fn start_at(&mut self, t0: u64) {
+        self.0.start_at(t0);
+    }
+    fn time_base(&self) -> Rational {
+        self.0.time_base()
+    }
+    fn move_gate(&self) -> MoveGate {
+        self.0.move_gate()
+    }
+}
+
+/// Test 6: closing an encoder whose finish takes 3 s never blocks the
+/// consumer. Bound: every router call around and after the close < 50 ms, and
+/// the close lands on its linger tick.
+#[test]
+fn a_slow_close_never_blocks_the_consumer() {
+    let encoded = Arc::new(AtomicUsize::new(0));
+    let enc = Arc::clone(&encoded);
+    let open: OpenFn = Box::new(move |_| {
+        let e: Box<dyn LiveEncoder> = Box::new(SlowFinish(FakeEnc {
+            forced: false,
+            encoded: Arc::clone(&enc),
+        }));
+        Ok(e)
+    });
+    let mut x = harness(2, 6, Some(open));
+    x.tick(0);
+    x.h.try_take(take("a", 1, src())).unwrap();
+    let mut t = 1;
+    while !x.results().contains(&TakeResult::Applied) {
+        x.tick(t);
+        t += 1;
+        assert!(t < 60, "applied");
+    }
+    x.h.try_take(take("b", 1, PictureBus::Program)).unwrap();
+    while !x.results().contains(&TakeResult::Applied) {
+        x.tick(t);
+        t += 1;
+        assert!(t < 120, "back on Program");
+    }
+    // Run to the linger close and well past it; measure from before the close.
+    x.max_router = std::time::Duration::ZERO;
+    let close_by = t + LINGER_TICKS + 2;
+    while x.h.snapshot().dynamic_encoders_live > 0 {
+        x.tick(t);
+        t += 1;
+        assert!(t <= close_by, "closed at its linger tick");
+    }
+    let closed = Instant::now();
+    while closed.elapsed() < std::time::Duration::from_millis(3200) {
+        x.tick(t);
+        t += 1;
+    }
+    assert!(
+        x.max_router < std::time::Duration::from_millis(50),
+        "router tick during a 3 s finish: {:?}",
+        x.max_router
+    );
+    assert_eq!(
+        x.windows_of(0).len(),
+        usize::try_from(t - 1).unwrap(),
+        "Program cadence"
+    );
+    assert_eq!(
+        x.h.snapshot().reaper_overflow,
+        0,
+        "handed to the reaper, not dropped"
     );
 }

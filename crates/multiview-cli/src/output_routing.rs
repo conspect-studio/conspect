@@ -13,9 +13,6 @@
 //! (Program) encoders are offered exactly as before by the pipeline.
 //! Nothing here runs on the output clock.
 
-// reason: consumed by the pipeline wiring commit that follows (spec part B2).
-#![allow(dead_code)]
-
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender, TryRecvError, TrySendError};
@@ -171,6 +168,10 @@ pub struct RoutingSnapshot {
     pub dropped_outcomes: u64,
     /// Workers dropped unjoined because the reaper queue was full.
     pub reaper_overflow: u64,
+    /// Video encoder keys the dispatcher has ever registered (base + live).
+    pub video_keys: usize,
+    /// Clock ticks handed to the aux thread (0 while nothing is routed).
+    pub aux_ticks_sent: u64,
 }
 
 /// The control-plane handle (clone freely).
@@ -213,6 +214,15 @@ impl OutputRoutingHandle {
     }
 }
 
+/// Where a run publishes its [`OutputRoutingHandle`] for the control plane.
+pub type OutputRoutingSlot = Arc<SwapCell<Option<Arc<OutputRoutingHandle>>>>;
+
+/// An empty [`OutputRoutingSlot`].
+#[must_use]
+pub fn output_routing_slot() -> OutputRoutingSlot {
+    Arc::new(SwapCell::empty())
+}
+
 /// A live-openable encoder: the worker contract plus the live-open seams.
 pub trait LiveEncoder: VideoEncodeWorker {
     /// Accept `t0` as the first tick, as a keyframe (`starting_at`).
@@ -240,15 +250,21 @@ impl ForceAt {
     /// Wrap `inner`, returning the request cell.
     #[must_use]
     pub fn new(inner: Box<dyn VideoEncodeWorker>) -> (Self, Arc<AtomicU64>) {
-        let force_at = Arc::new(AtomicU64::new(NO_FORCE));
-        (
-            Self {
-                inner,
-                force_at: Arc::clone(&force_at),
-            },
-            force_at,
-        )
+        let force_at = force_cell();
+        (Self::with_cell(inner, Arc::clone(&force_at)), force_at)
     }
+
+    /// Wrap `inner` around an existing request cell (from [`force_cell`]).
+    #[must_use]
+    pub fn with_cell(inner: Box<dyn VideoEncodeWorker>, force_at: Arc<AtomicU64>) -> Self {
+        Self { inner, force_at }
+    }
+}
+
+/// A fresh, unset forced-IDR request cell.
+#[must_use]
+pub fn force_cell() -> Arc<AtomicU64> {
+    Arc::new(AtomicU64::new(NO_FORCE))
 }
 
 fn take_force(cell: &AtomicU64, tick: u64) -> bool {
@@ -352,6 +368,8 @@ pub struct AuxWiring {
     pub failed: Arc<AtomicBool>,
     /// Clock ticks dropped toward the aux thread.
     pub dropped: Arc<AtomicU64>,
+    /// Clock ticks handed to the aux thread.
+    pub sent: Arc<AtomicU64>,
     /// Source stores.
     pub stores: StoreLookup,
     /// The PVW source id.
@@ -448,6 +466,9 @@ pub struct OutputRouter {
     last_forced: HashMap<usize, u64>,
     dropped_outcomes: u64,
     reaper_overflow: u64,
+    video_keys: usize,
+    /// Items handed to the reaper this run (0 = nothing to wait for at the end).
+    reaped: u64,
     dirty: bool,
     reaper: Option<std::thread::JoinHandle<()>>,
 }
@@ -537,6 +558,8 @@ impl OutputRouter {
             last_forced: HashMap::new(),
             dropped_outcomes: 0,
             reaper_overflow: 0,
+            video_keys: 0,
+            reaped: 0,
             dirty: true,
             reaper: Some(reaper),
         };
@@ -558,6 +581,11 @@ impl OutputRouter {
         delivery: &mut D,
     ) -> Result<(), DispatchError> {
         self.drain_live_events(dispatcher, delivery)?;
+        let keys = dispatcher.video_key_count();
+        if keys != self.video_keys {
+            self.video_keys = keys;
+            self.dirty = true;
+        }
         self.drain_takes(tick, dispatcher);
         self.drain_opens(tick, dispatcher);
         self.drain_moves(tick, dispatcher);
@@ -1198,6 +1226,7 @@ impl OutputRouter {
     }
 
     fn reap(&mut self, item: Reap) {
+        self.reaped = self.reaped.saturating_add(1);
         if self.reap_tx.try_send(item).is_err() {
             // Dropped unjoined: the input closes, the thread ends on its own.
             self.reaper_overflow = self.reaper_overflow.saturating_add(1);
@@ -1263,6 +1292,8 @@ impl OutputRouter {
             opens_in_flight: self.opens.len(),
             dropped_outcomes: self.dropped_outcomes,
             reaper_overflow: self.reaper_overflow,
+            video_keys: self.video_keys,
+            aux_ticks_sent: self.aux.sent.load(Ordering::Relaxed),
         };
         if *self.snapshot.load() != next {
             self.snapshot.store(Arc::new(next));
@@ -1277,7 +1308,9 @@ impl OutputRouter {
     }
 
     /// End of run: retire every live key and hand its worker to the reaper,
-    /// then let the reaper finish. Joins only the reaper, bounded by `bound`.
+    /// then let the reaper finish. Joins only the reaper, bounded by `bound`,
+    /// and only when something was handed to it: a run without a live open
+    /// returns at once (its end-of-run timing is unchanged).
     pub(crate) fn shutdown(
         mut self,
         dispatcher: &mut RenditionDispatcher,
@@ -1288,8 +1321,14 @@ impl OutputRouter {
             self.close(key, dispatcher);
         }
         self.aux.active.store(false, Ordering::Release);
+        self.video_keys = dispatcher.video_key_count();
+        self.publish_snapshot();
         let reaper = self.reaper.take();
+        let handed_over = self.reaped;
         drop(self);
+        if handed_over == 0 {
+            return;
+        }
         if let Some(reaper) = reaper {
             let deadline = Instant::now() + bound;
             while !reaper.is_finished() && Instant::now() < deadline {
@@ -1305,3 +1344,7 @@ impl OutputRouter {
 #[cfg(test)]
 #[path = "output_routing_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "output_routing_pipeline_tests.rs"]
+mod pipeline_tests;

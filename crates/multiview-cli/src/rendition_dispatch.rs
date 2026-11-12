@@ -4,9 +4,6 @@
 //! many or delayed packets. Only an explicit exclusive DTS watermark, or EOF
 //! after all delayed packets, closes a window. No output clock waits here.
 
-// reason: the live-key / rebind API is consumed by the pipeline in a later slice.
-#![allow(dead_code)]
-
 use std::collections::VecDeque;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -1356,7 +1353,9 @@ impl RenditionDispatcher {
     pub(crate) fn take_move_outcomes(&mut self) -> Vec<MoveOutcome> {
         self.outcomes.drain(..).collect()
     }
-    /// The video key an output currently reads.
+    /// The video key an output currently reads (test observation; the router
+    /// tracks its own bindings from the move outcomes).
+    #[cfg(test)]
     pub(crate) fn binding_video_key(&self, output_index: usize) -> Option<usize> {
         self.bindings
             .iter()
@@ -1372,6 +1371,8 @@ impl RenditionDispatcher {
             .get(key)
             .is_none_or(|m| m.failed || m.retired)
     }
+    #[allow(dead_code)]
+    // reason: read by the routing metrics of the HTTP API PR (ADR-0108 slice 1 follow-up); tested here.
     pub(crate) fn counters(&self) -> DispatchCounters {
         self.counters
     }

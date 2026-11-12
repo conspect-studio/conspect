@@ -36,6 +36,7 @@ pub struct AuxTickSender {
     tx: SyncSender<AuxTick>,
     active: Arc<AtomicBool>,
     dropped: Arc<AtomicU64>,
+    sent: Arc<AtomicU64>,
 }
 
 /// Build the bounded clock → aux channel. The sender starts INACTIVE: no tick
@@ -48,6 +49,7 @@ pub fn aux_tick_channel() -> (AuxTickSender, Receiver<AuxTick>) {
             tx,
             active: Arc::new(AtomicBool::new(false)),
             dropped: Arc::new(AtomicU64::new(0)),
+            sent: Arc::new(AtomicU64::new(0)),
         },
         rx,
     )
@@ -61,7 +63,9 @@ impl AuxTickSender {
             return;
         }
         match self.tx.try_send(tick) {
-            Ok(()) => {}
+            Ok(()) => {
+                self.sent.fetch_add(1, Ordering::Relaxed);
+            }
             Err(TrySendError::Full(_) | TrySendError::Disconnected(_)) => {
                 self.dropped.fetch_add(1, Ordering::Relaxed);
             }
@@ -72,6 +76,12 @@ impl AuxTickSender {
     #[must_use]
     pub fn active_flag(&self) -> Arc<AtomicBool> {
         Arc::clone(&self.active)
+    }
+
+    /// Ticks handed to the aux thread (zero while no routed feed is active).
+    #[must_use]
+    pub fn sent_counter(&self) -> Arc<AtomicU64> {
+        Arc::clone(&self.sent)
     }
 
     /// Ticks dropped because the aux thread was full, wedged or gone.
@@ -145,6 +155,7 @@ mod tests {
         tx.offer(tick(1));
         assert!(rx.try_recv().is_err());
         assert_eq!(tx.dropped_counter().load(Ordering::Relaxed), 0);
+        assert_eq!(tx.sent_counter().load(Ordering::Relaxed), 0);
     }
 
     #[test]
@@ -155,6 +166,7 @@ mod tests {
             tx.offer(tick(i));
         }
         assert_eq!(tx.dropped_counter().load(Ordering::Relaxed), 6);
+        assert_eq!(tx.sent_counter().load(Ordering::Relaxed), 4);
         assert_eq!(rx.try_recv().unwrap().index, 0);
         drop(rx);
         tx.offer(tick(11));
