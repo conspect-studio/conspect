@@ -172,7 +172,7 @@ pub fn validate_config(path: &Path) -> anyhow::Result<ValidationReport> {
     match config.validate() {
         Ok(()) => {
             let summary = summarize(&config);
-            let start = start_check(config, text, path);
+            let start = start_check(&config, &text, path);
             Ok(ValidationReport {
                 path: path.to_path_buf(),
                 status: ValidationStatus::Ok { summary },
@@ -195,7 +195,7 @@ pub fn validate_config(path: &Path) -> anyhow::Result<ValidationReport> {
 /// [`crate::boot::resolve_start_config`] start-up calls — and apply the SAME
 /// start-up admission rule `Pipeline::build` enforces
 /// ([`multiview_config::boot_admission`]). Read-only: nothing is written.
-fn start_check(boot: MultiviewConfig, text: String, path: &Path) -> StartCheck {
+fn start_check(boot: &MultiviewConfig, text: &str, path: &Path) -> StartCheck {
     let desired = multiview_control::boot_model::state_dir_for(path).join("desired.json");
     let accepted = desired.exists();
     let source = if accepted {
@@ -203,12 +203,7 @@ fn start_check(boot: MultiviewConfig, text: String, path: &Path) -> StartCheck {
     } else {
         path.to_path_buf()
     };
-    let refusal = match crate::boot::resolve_start_config(boot, text, path) {
-        Err(reason) => Some(reason),
-        Ok(start) => multiview_config::boot_admission(&start.running)
-            .err()
-            .map(|e| e.to_string()),
-    };
+    let refusal = crate::boot::preflight_start(boot, text, path).err();
     StartCheck {
         source,
         accepted,

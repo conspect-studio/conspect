@@ -23614,7 +23614,8 @@
         "enum": [
           "gpu-present-no-vulkan-adapter",
           "container-no-host-networking",
-          "catalogue-link-attention"
+          "catalogue-link-attention",
+          "accepted-state-rejected"
         ]
       },
       "WarningSeverityDoc": {

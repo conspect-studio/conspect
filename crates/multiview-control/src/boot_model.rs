@@ -208,7 +208,22 @@ pub fn admit_for_boot(config: &MultiviewConfig) -> ControlResult<()> {
 /// # Errors
 /// A malformed, unreadable or invalid accepted record fails closed.
 pub fn load_desired(boot_path: &Path) -> Result<Option<DesiredState>, String> {
-    let path = state_dir_for(boot_path).join(DESIRED_FILE);
+    load_desired_file(&desired_path_for(boot_path))
+}
+
+/// The accepted-state file (`desired.json`) for the boot config at `boot_path`.
+#[must_use]
+pub fn desired_path_for(boot_path: &Path) -> PathBuf {
+    state_dir_for(boot_path).join(DESIRED_FILE)
+}
+
+/// [`load_desired`] for an explicit envelope file (the accepted state or its
+/// last-good copy): read, parse and validate; a missing file is `Ok(None)`.
+///
+/// # Errors
+/// A malformed, unreadable or invalid record fails closed.
+pub fn load_desired_file(path: &Path) -> Result<Option<DesiredState>, String> {
+    let path = path.to_path_buf();
     let text = match std::fs::read_to_string(&path) {
         Ok(text) => text,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
