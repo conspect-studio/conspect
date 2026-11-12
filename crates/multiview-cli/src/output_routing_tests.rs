@@ -1176,6 +1176,50 @@ fn two_hundred_open_close_cycles_reuse_retired_slots() {
     assert!(!r.dynamic[0].seen_event);
 }
 
+/// P (final-head abuse HIGH): an event is accepted only when ONE live key has
+/// both its generation and its key index. A closed worker's event tagged
+/// (generation = reused slot, key index = reused slot) matches another live
+/// key's generation but names the slot reused by a new key: it is dropped and
+/// counted, the new key's stage is untouched and the key does not fail.
+#[test]
+fn an_event_whose_generation_and_key_disagree_is_dropped() {
+    let live = Arc::new(AtomicUsize::new(0));
+    let (mut r, _h, _aux) = router(1, 6, Box::new(|_| Err("never".to_owned())));
+    let mut d = dispatcher(1);
+    let a = inject(&mut r, &mut d, src(), Counted::boxed(&live, 0));
+    let b = inject(&mut r, &mut d, src(), Counted::boxed(&live, 0));
+    assert_eq!((a, b), (1, 2));
+    r.close(a, &mut d);
+    r.drain_live_events(&mut d, &mut NoDelivery).unwrap();
+    let c = inject(&mut r, &mut d, src(), Counted::boxed(&live, 0));
+    assert_eq!(c, a, "the closed key's slot is reused");
+    let reused = u64::try_from(c).unwrap();
+    assert!(
+        r.dynamic.iter().any(|k| k.generation == reused && k.key == b),
+        "generation {reused} names the other live key"
+    );
+    let before = r.dyn_dropped.load(Ordering::Relaxed);
+    // A timebase the key does not have: applied, it would fail the key.
+    r.dyn_tx
+        .try_send((
+            reused,
+            DispatchEvent::Video {
+                key_index: c,
+                tick: 0,
+                timebase: Rational::new(1, 7),
+                packets: vec![pkt(0, true)],
+                watermark: None,
+            },
+        ))
+        .unwrap();
+    r.drain_live_events(&mut d, &mut NoDelivery).unwrap();
+    assert_eq!(r.dyn_dropped.load(Ordering::Relaxed), before + 1);
+    assert!(!d.is_key_failed(c), "the new key does not fail");
+    assert!(!d.is_key_failed(b), "the generation's own key is untouched");
+    assert_eq!(d.counters().dropped_unbound, 0, "nothing reached a stage");
+    assert!(r.dynamic.iter().all(|k| !k.seen_event));
+}
+
 /// B: an open whose result arrives on its deadline tick (before the take's
 /// own deadline check) is reaped, never registered: no slot is consumed.
 #[test]

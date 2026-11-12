@@ -671,8 +671,21 @@ impl OutputRouter {
             self.close(key, dispatcher);
         }
         while let Ok((generation, event)) = self.dyn_rx.try_recv() {
-            let Some(d) = self.dynamic.iter_mut().find(|d| d.generation == generation) else {
-                // A closed worker's late event (its slot may be reused).
+            // Accept only an event whose generation AND key index both name
+            // the same live key: a generation alone could match another live
+            // key while the event's key index names a reused slot.
+            let key_index = match &event {
+                DispatchEvent::Video { key_index, .. }
+                | DispatchEvent::FinishVideo { key_index, .. } => Some(*key_index),
+                DispatchEvent::Audio { .. } | DispatchEvent::FinishAudio { .. } => None,
+            };
+            let Some(d) = self
+                .dynamic
+                .iter_mut()
+                .find(|d| d.generation == generation && Some(d.key) == key_index)
+            else {
+                // A closed worker's late event (its slot may be reused), or an
+                // event whose key index does not match its worker's key.
                 self.dyn_dropped.fetch_add(1, Ordering::Relaxed);
                 continue;
             };
