@@ -1018,7 +1018,14 @@ fn connected(
         incomplete_decode_skips[0],
         incomplete_decode_skips[1]
     );
-    decode_evidence(scenario, &intervals, &b_at_expiry)?;
+    if let Err(e) = decode_evidence(scenario, &intervals, &b_at_expiry) {
+        // Counts only (no ids, keys or media): why the evidence is missing.
+        eprintln!(
+            "decode evidence: intervals A={:?} B={:?} B_at_expiry={b_at_expiry:?} empty={empty_decode_skips:?} incomplete={incomplete_decode_skips:?} late_drops={late_drops} ranges_cut={sealing_skipped} B_parked={} B_stale={} B_drained={} B_overflow={}",
+            intervals[0], intervals[1], parked[1].parked_total, parked[1].stale, parked[1].drained, parked[1].dropped
+        );
+        return Err(e);
+    }
     if scenario == "withdraw" {
         // Terminal publisher cutoff: the next renew must be refused with exactly
         // 404 (the withdrawn story's lease route). Any other denial, or a lease
