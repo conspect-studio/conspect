@@ -49,6 +49,7 @@
     clippy::default_trait_access
 )]
 
+#[path = "common/witness.rs"]
 mod common;
 
 use std::net::{Ipv6Addr, SocketAddr};

@@ -21,6 +21,24 @@ pub enum TlsState {
     Serving,
 }
 
+/// Expiry alarm level of the installed certificate (ADR-0107 §5a).
+///
+/// Raised only while renewal is failing: under 50 % of the lifetime left is a
+/// warning, under 25 % critical; past `not_after` the certificate is expired
+/// (and keeps serving: nothing silently downgrades).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CertificateAlarm {
+    /// No alarm.
+    #[default]
+    None,
+    /// Renewal failing and less than half of the lifetime remains.
+    Warning,
+    /// Renewal failing and less than a quarter of the lifetime remains.
+    Critical,
+    /// The certificate is past `not_after`.
+    Expired,
+}
+
 /// Non-secret certificate status for CLI and status API consumers.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CertificateStatus {
@@ -36,6 +54,12 @@ pub struct CertificateStatus {
     pub last_error: Option<String>,
     /// SHA-256 fingerprint of the bootstrap leaf certificate.
     pub bootstrap_fingerprint: Option<String>,
+    /// Expiry alarm level (non-secret).
+    pub alarm: CertificateAlarm,
+    /// When the next renewal is due (Unix seconds), once scheduled.
+    pub renewal_due_at: Option<i64>,
+    /// When the next issuance attempt runs after a failure (Unix seconds).
+    pub next_attempt_at: Option<i64>,
 }
 
 /// Fail-closed problem identifier for disallowed setup-state requests.
@@ -278,6 +302,9 @@ impl AcmeCertificateSource {
                 expires_at: None,
                 last_error: None,
                 bootstrap_fingerprint: Some(fingerprint),
+                alarm: CertificateAlarm::None,
+                renewal_due_at: None,
+                next_attempt_at: None,
             }),
             transition: Mutex::new(()),
         }
@@ -358,6 +385,24 @@ impl AcmeCertificateSource {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .last_error = Some(reason.to_owned());
     }
+
+    /// Publish the renewal schedule (non-secret, Unix seconds).
+    pub fn set_schedule(&self, renewal_due_at: Option<i64>, next_attempt_at: Option<i64>) {
+        let mut status = self
+            .status
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        status.renewal_due_at = renewal_due_at;
+        status.next_attempt_at = next_attempt_at;
+    }
+
+    /// Publish the expiry alarm level.
+    pub fn set_alarm(&self, alarm: CertificateAlarm) {
+        self.status
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .alarm = alarm;
+    }
 }
 
 impl CertificateSource for AcmeCertificateSource {
@@ -404,6 +449,9 @@ impl CertificateSource for StaticCertificateSource {
             expires_at: None,
             last_error: None,
             bootstrap_fingerprint: None,
+            alarm: CertificateAlarm::None,
+            renewal_due_at: None,
+            next_attempt_at: None,
         }
     }
 }

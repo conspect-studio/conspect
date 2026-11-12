@@ -2447,6 +2447,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "h2"
+version = "0.4.20"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7d29020232d6aa3fb1daca64c1127cf662cf97f254ae16c18c05b8ab635fc118"
+dependencies = [
+ "atomic-waker",
+ "bytes",
+ "fnv",
+ "futures-core",
+ "futures-sink",
+ "http 1.4.1",
+ "indexmap 2.14.0",
+ "slab",
+ "tokio",
+ "tokio-util",
+ "tracing",
+]
+
+[[package]]
 name = "half"
 version = "2.7.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2769,6 +2788,7 @@ dependencies = [
  "bytes",
  "futures-channel",
  "futures-core",
+ "h2",
  "http 1.4.1",
  "http-body 1.0.1",
  "httparse",
@@ -2790,6 +2810,8 @@ dependencies = [
  "hyper 1.10.1",
  "hyper-util",
  "rustls",
+ "rustls-native-certs",
+ "rustls-platform-verifier",
  "tokio",
  "tokio-rustls",
  "tower-service",
@@ -3018,6 +3040,31 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "879f10e63c20629ecabbb64a8010319738c66a5cd0c29b02d63d272b03751d01"
 dependencies = [
  "generic-array",
+]
+
+[[package]]
+name = "instant-acme"
+version = "0.8.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9f05ad37c421b962354c358d347d4a6130151df9407978372d3ad7f0c8f71a64"
+dependencies = [
+ "async-trait",
+ "aws-lc-rs",
+ "base64 0.22.1",
+ "bytes",
+ "http 1.4.1",
+ "http-body 1.0.1",
+ "http-body-util",
+ "httpdate",
+ "hyper-rustls",
+ "rcgen",
+ "rustls-pki-types",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "time",
+ "tokio",
+ "x509-parser",
 ]
 
 [[package]]
@@ -3898,10 +3945,12 @@ dependencies = [
  "hang",
  "hickory-resolver",
  "hmac",
+ "http 1.4.1",
  "http-body 1.0.1",
  "http-body-util",
  "hyper 1.10.1",
  "hyper-util",
+ "instant-acme",
  "lettre",
  "mdns-sd",
  "mime_guess",
@@ -3958,6 +4007,7 @@ dependencies = [
  "utoipa-scalar",
  "uuid",
  "x509-parser",
+ "zeroize",
 ]
 
 [[package]]
@@ -4062,8 +4112,11 @@ dependencies = [
  "multiview-framestore",
  "multiview-webrtc",
  "proptest",
+ "rcgen",
+ "rustls",
  "socket2 0.6.4",
  "tokio",
+ "tokio-rustls",
  "tracing",
  "url",
 ]

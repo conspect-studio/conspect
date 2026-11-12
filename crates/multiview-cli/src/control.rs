@@ -132,7 +132,9 @@ pub async fn bind_and_serve<F>(
 where
     F: Future<Output = ()> + Send + 'static,
 {
-    bind_and_serve_with_moq(
+    // Boxed so a caller's future does not embed this large state machine
+    // (clippy::large_futures, 16 KiB threshold).
+    Box::pin(bind_and_serve_with_moq(
         listen,
         config,
         publisher,
@@ -153,8 +155,9 @@ where
         None,
         #[cfg(feature = "moq-output")]
         None,
+        None,
         shutdown,
-    )
+    ))
     .await
 }
 
@@ -200,6 +203,10 @@ pub async fn bind_and_serve_with_moq<F>(
     #[cfg(feature = "moq-output")] moq_slot: Option<
         crate::output_window_registry::WindowSubscriptionSlot,
     >,
+    // The network front door (ADR-0107 slice 4): when its TCP door runs, the
+    // SAME router and serve options are attached to it as the site, draining
+    // with this server's shutdown. `None` leaves the plain listener only.
+    front_door: Option<&crate::frontdoor::FrontDoorRun>,
     shutdown: F,
 ) -> std::io::Result<(SocketAddr, JoinHandle<std::io::Result<()>>, AppState)>
 where
@@ -704,6 +711,17 @@ where
         }
         None => multiview_control::ServeOptions::default(),
     };
+    // The front door's TCP door serves the same app (slice 4). Its connections
+    // observe this server's shutdown through a watch flipped when `shutdown`
+    // resolves (or dropped with the server task).
+    let site_app = app.clone();
+    let site_options = serve_options.clone();
+    let shutdown = attach_front_door_site(
+        front_door,
+        config,
+        move |watch| multiview_control::ConnectionServer::new(site_app, &site_options, watch),
+        shutdown,
+    )?;
     let handle = match config
         .control
         .as_ref()
@@ -737,6 +755,57 @@ where
         }
     };
     Ok((addr, handle, state))
+}
+
+/// Attach the control-plane `app` to the front door's TCP door as its site
+/// (ADR-0107 slice 4, issue #290) and return the server's shutdown future,
+/// extended to signal the door's connections. The site certificate is the
+/// `[control.tls] mode = "static"` pair through the `CertificateSource` seam
+/// (`tls` builds on unix); otherwise the door runs ICE-TCP only, with a warning.
+///
+/// # Errors
+/// A `[control.tls]` certificate that cannot be loaded (the same startup
+/// failure the plain TLS listener reports).
+// reason: without `tls` (or off unix) the certificate-load error path is
+// compiled out, so the `Result` is only unnecessary in that build.
+#[cfg_attr(not(all(feature = "tls", unix)), allow(clippy::unnecessary_wraps))]
+fn attach_front_door_site<F>(
+    front_door: Option<&crate::frontdoor::FrontDoorRun>,
+    config: &MultiviewConfig,
+    server: impl FnOnce(tokio::sync::watch::Receiver<bool>) -> multiview_control::ConnectionServer,
+    shutdown: F,
+) -> std::io::Result<std::pin::Pin<Box<dyn Future<Output = ()> + Send + 'static>>>
+where
+    F: Future<Output = ()> + Send + 'static,
+{
+    let Some(door) = front_door.filter(|d| d.has_tcp_door()) else {
+        return Ok(Box::pin(shutdown));
+    };
+    let tls = config.control.as_ref().and_then(|c| c.tls.as_ref());
+    #[cfg(all(feature = "tls", unix))]
+    let site = match tls {
+        Some(tls) => {
+            let source = multiview_control::static_certificate_source(tls)
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
+            Some(
+                multiview_control::site_server_config(Arc::new(source)).map_err(|e| {
+                    std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string())
+                })?,
+            )
+        }
+        None => None,
+    };
+    #[cfg(not(all(feature = "tls", unix)))]
+    let site: Option<multiview_frontdoor::SiteTlsConfig> = {
+        let _ = tls;
+        None
+    };
+    let (signal, watch) = tokio::sync::watch::channel(false);
+    door.install_site(server(watch), site);
+    Ok(Box::pin(async move {
+        shutdown.await;
+        let _ = signal.send(true);
+    }))
 }
 
 /// Abort the off-clock management task when the server exits or is cancelled.

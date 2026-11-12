@@ -20,6 +20,7 @@
 #![cfg(unix)]
 #![allow(clippy::unwrap_used, clippy::print_stderr)]
 
+#[path = "common/witness.rs"]
 mod common;
 
 use std::sync::Mutex;

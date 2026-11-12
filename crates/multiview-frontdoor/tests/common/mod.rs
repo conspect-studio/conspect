@@ -1,28 +1,5 @@
-//! Shared harness for the clock tests (`chaos_flood.rs`, `stall_witness.rs`):
-//! the REAL engine tick loop (`EngineRuntime` + `RealtimePacer` +
-//! `MonotonicTimeSource`) on its own "program" runtime, a per-tick record, and
-//! the **stall witness** (issue #321).
-//!
-//! Why the witness: the engine absorbs a stall it cannot prevent (the whole
-//! process descheduled by the host) by emitting last-good repeats under fresh
-//! ticks (ADR-T018); that is the design working. Asserting `repeats == 0`
-//! asserted that the CI host never stalls the process for more than a period,
-//! which no code under test can promise (macOS run 43192931229: one ~104 ms
-//! process stall, three repeats, door off). The witness is a plain std thread
-//! that sleeps 1 ms in a loop on the same time base as the tick deadlines and
-//! records every gap longer than half a period: while it was not running, the
-//! process was not running. Each gap is stamped *inside* the sleep (the clock
-//! read just before `sleep` and just after it returns), so it holds only time
-//! the witness was blocked, and only a gap of at least one period counts (a
-//! shorter one cannot cause a repeat).
-//!
-//! A repeat (or a tick later than one period) is **explained** only when ONE
-//! witness gap covers its whole `[deadline, emit]` lateness window except
-//! [`EDGE_SLACK_NS`] (half a period) at each edge: the process was stopped for
-//! essentially all of the time the tick was late. A slip the code under test
-//! caused (the program runtime blocked or starved while the process ran) is
-//! not covered and fails, even when a stall follows it (review PR 333). The
-//! controls in `stall_witness.rs` prove both.
+//! Shared helpers for the TCP door tests: throwaway certificates (ring
+//! provider, dev only), a TLS client, a trivial site, ICE-TCP frames.
 #![allow(
     dead_code,
     unreachable_pub,
@@ -30,325 +7,175 @@
     clippy::expect_used,
     clippy::panic,
     clippy::indexing_slicing,
-    clippy::as_conversions,
-    clippy::cast_possible_truncation,
-    clippy::cast_possible_wrap,
-    clippy::cast_sign_loss,
-    clippy::cast_precision_loss,
-    clippy::print_stderr,
-    clippy::doc_markdown
+    clippy::missing_panics_doc
 )]
 
-use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::net::SocketAddr;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
-use multiview_compositor::blend::LinearRgba;
-use multiview_compositor::pipeline::{CanvasColor, Nv12Image};
-use multiview_core::color::ColorInfo;
-use multiview_core::layout::{Canvas, Cell, FitMode, Layout};
-use multiview_core::time::{MediaTime, Rational};
-use multiview_engine::{
-    CompositedFrame, CompositorDrive, EnginePublisher, EngineRuntime, MonotonicTimeSource,
-    OutputClock, RealtimePacer, StopSignal, TimeSource,
-};
-use multiview_framestore::TileStore;
+use multiview_frontdoor::tcp::BoxFuture;
+use multiview_frontdoor::{ConnGuard, DoorStream, SiteService};
+use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, ServerName};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpStream;
 
-/// 30 fps: an exact rational cadence.
-pub const FPS: (i64, i64) = (30, 1);
-/// The tick period in whole nanoseconds (for gap thresholds only; expected
-/// PTS values come from `MediaTime::from_tick`).
-pub const PERIOD_NS: i64 = 1_000_000_000 * FPS.1 / FPS.0;
-
-pub fn cadence() -> Rational {
-    Rational::new(FPS.0, FPS.1)
+pub fn provider() -> Arc<rustls::crypto::CryptoProvider> {
+    Arc::new(rustls::crypto::ring::default_provider())
 }
 
-pub fn build_drive() -> CompositorDrive<Nv12Image> {
-    let mut stores = HashMap::new();
-    stores.insert(
-        "cam-a".to_owned(),
-        Arc::new(TileStore::<Nv12Image>::with_defaults("cam-a")),
-    );
-    CompositorDrive::new(
-        Arc::new(Layout {
-            name: "chaos".to_owned(),
-            canvas: Canvas {
-                width: 64,
-                height: 36,
-                fps_num: 30,
-                fps_den: 1,
-            },
-            cells: vec![Cell {
-                x: 0.0,
-                y: 0.0,
-                w: 1.0,
-                h: 1.0,
-                z: 0,
-                fit: FitMode::Contain,
-                source: Some("cam-a".to_owned()),
-                ..Cell::default()
-            }],
-        }),
-        stores,
-        Nv12Image::solid(
-            64,
-            36,
-            16,
-            128,
-            128,
-            ColorInfo::default().resolve_defaults(1920, 1080),
-        )
-        .unwrap(),
-        CanvasColor::default(),
-        LinearRgba::TRANSPARENT,
-    )
-    .unwrap()
-}
-
-/// One emitted tick.
-#[derive(Debug, Clone, Copy)]
-pub struct TickRecord {
-    pub index: u64,
-    pub pts: MediaTime,
-    /// Its deadline on the time source.
-    pub deadline: i64,
-    /// When `state_of` saw it, on the same time source.
-    pub emit: i64,
-    pub repeat: bool,
-}
-
-impl TickRecord {
-    pub fn lateness(&self) -> i64 {
-        self.emit - self.deadline
-    }
-}
-
-#[derive(Debug, Clone)]
-pub struct ClockRun {
-    pub ticks: Vec<TickRecord>,
-    pub expected: u64,
-    pub repeats: u64,
-    /// Witness gaps `[start, end]` (time-source nanoseconds).
-    pub gaps: Vec<(i64, i64)>,
-}
-
-/// The shortest witness gap that counts: one period (a shorter whole-process
-/// stall cannot make a tick a period late).
-pub const MIN_GAP_NS: i64 = PERIOD_NS;
-/// How much of a late tick's window, at each edge, a gap may leave uncovered:
-/// the witness's own wake-up latency and the program thread's, never a
-/// period's worth of slip.
-pub const EDGE_SLACK_NS: i64 = PERIOD_NS / 2;
-
-/// The witness thread: sleeps 1 ms in a loop and records every sleep that
-/// took at least [`MIN_GAP_NS`], stamped inside the sleep.
-struct Witness {
-    stop: Arc<AtomicBool>,
-    gaps: Arc<Mutex<Vec<(i64, i64)>>>,
-    thread: std::thread::JoinHandle<()>,
-}
-
-impl Witness {
-    fn start(time: Arc<dyn TimeSource>) -> Self {
-        let stop = Arc::new(AtomicBool::new(false));
-        let gaps = Arc::new(Mutex::new(Vec::new()));
-        let (s, g) = (Arc::clone(&stop), Arc::clone(&gaps));
-        let thread = std::thread::Builder::new()
-            .name("stall-witness".to_owned())
-            .spawn(move || {
-                while !s.load(Ordering::Relaxed) {
-                    let before = time.now_nanos();
-                    std::thread::sleep(Duration::from_millis(1));
-                    let after = time.now_nanos();
-                    if after - before >= MIN_GAP_NS {
-                        g.lock().unwrap().push((before, after));
-                    }
-                }
-            })
-            .unwrap();
-        Self { stop, gaps, thread }
-    }
-
-    fn stop(self) -> Vec<(i64, i64)> {
-        self.stop.store(true, Ordering::Relaxed);
-        let _ = self.thread.join();
-        let g = self.gaps.lock().unwrap().clone();
-        g
-    }
-}
-
-/// Run the real engine tick loop for `duration` on a 2-worker program runtime.
-/// `on_tick(index)` runs inside the tick's `state_of` (on the program runtime):
-/// the negative control blocks there.
-pub fn run_clock(duration: Duration, on_tick: impl FnMut(u64) + Send + 'static) -> ClockRun {
-    let program_rt = tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(2)
-        .thread_name("program")
-        .enable_all()
-        .build()
+/// A self-signed site `ServerConfig` (ALPN http/1.1) for `localhost` and the
+/// loopback literals.
+pub fn site_config() -> Arc<rustls::ServerConfig> {
+    let ck = rcgen::generate_simple_self_signed(vec![
+        "localhost".to_owned(),
+        "127.0.0.1".to_owned(),
+        "::1".to_owned(),
+    ])
+    .unwrap();
+    let cert = CertificateDer::from(ck.cert.der().to_vec());
+    let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(ck.signing_key.serialize_der()));
+    let mut cfg = rustls::ServerConfig::builder_with_provider(provider())
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .with_no_client_auth()
+        .with_single_cert(vec![cert], key)
         .unwrap();
-    let time: Arc<dyn TimeSource> = Arc::new(MonotonicTimeSource::new());
-    let witness = Witness::start(Arc::clone(&time));
-    let mut on_tick = on_tick;
-    let (records, expected, repeats) = program_rt.block_on(async move {
-        let clock = OutputClock::new(cadence()).unwrap();
-        let mut runtime =
-            EngineRuntime::new(clock, build_drive(), Arc::clone(&time), RealtimePacer);
-        let seed = runtime.seed_nanos();
-        let deadline_clock = OutputClock::new(cadence()).unwrap();
-        let publisher: Arc<EnginePublisher<u64, u64>> = Arc::new(EnginePublisher::new(8));
-        let records = Arc::new(Mutex::new(Vec::<TickRecord>::with_capacity(4096)));
-        let rec = Arc::clone(&records);
-        let ts = Arc::clone(&time);
-        let stop = StopSignal::new();
-        let stop2 = stop.clone();
-        let repeats = runtime.frames_repeated_counter();
-        let started = Instant::now();
-        let stopper = tokio::spawn(async move {
-            tokio::time::sleep(duration).await;
-            stop2.stop();
-        });
-        runtime
-            .run(
-                &publisher,
-                &stop,
-                move |f: &CompositedFrame| {
-                    let emit = ts.now_nanos();
-                    let record = TickRecord {
-                        index: f.tick.index,
-                        pts: f.tick.pts,
-                        deadline: deadline_clock.deadline_nanos(f.tick.index, seed),
-                        emit,
-                        repeat: f.repeat,
-                    };
-                    if let Ok(mut r) = rec.lock() {
-                        r.push(record);
-                    }
-                    on_tick(f.tick.index);
-                    f.tick.index
-                },
-                |_| None,
-            )
-            .await
-            .unwrap();
-        let elapsed = started.elapsed();
-        stopper.await.unwrap();
-        let r = records.lock().unwrap().clone();
-        (
-            r,
-            (elapsed.as_nanos() as i64 / PERIOD_NS) as u64,
-            repeats.load(Ordering::Relaxed),
+    cfg.alpn_protocols = vec![b"http/1.1".to_vec()];
+    Arc::new(cfg)
+}
+
+#[derive(Debug)]
+struct AcceptAny(Arc<rustls::crypto::CryptoProvider>);
+
+impl rustls::client::danger::ServerCertVerifier for AcceptAny {
+    fn verify_server_cert(
+        &self,
+        _end_entity: &CertificateDer<'_>,
+        _intermediates: &[CertificateDer<'_>],
+        _server_name: &ServerName<'_>,
+        _ocsp: &[u8],
+        _now: rustls::pki_types::UnixTime,
+    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        Ok(rustls::client::danger::ServerCertVerified::assertion())
+    }
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls12_signature(
+            message,
+            cert,
+            dss,
+            &self.0.signature_verification_algorithms,
         )
-    });
-    let gaps = witness.stop();
-    ClockRun {
-        ticks: records,
-        expected,
-        repeats,
-        gaps,
+    }
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls13_signature(
+            message,
+            cert,
+            dss,
+            &self.0.signature_verification_algorithms,
+        )
+    }
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        self.0.signature_verification_algorithms.supported_schemes()
     }
 }
 
-/// The classification of every tick that needed help.
-#[derive(Debug, Clone, Default)]
-pub struct Classification {
-    /// Repeats, plus fresh ticks later than one period.
-    pub needing_explanation: usize,
-    /// Of those, covered by one witness gap (see [`classify`]).
-    pub explained: usize,
-    /// The rest: slips the code under test is responsible for.
-    pub unexplained: Vec<(u64, i64, bool)>,
+pub fn client_config(alpn: &[&[u8]]) -> Arc<rustls::ClientConfig> {
+    let p = provider();
+    let mut cfg = rustls::ClientConfig::builder_with_provider(Arc::clone(&p))
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(AcceptAny(p)))
+        .with_no_client_auth();
+    cfg.alpn_protocols = alpn.iter().map(|a| a.to_vec()).collect();
+    Arc::new(cfg)
 }
 
-pub fn classify(run: &ClockRun) -> Classification {
-    let mut c = Classification::default();
-    for t in &run.ticks {
-        if !(t.repeat || t.lateness() > PERIOD_NS) {
-            continue;
+/// TLS-connect to `addr` with SNI `sni`, send a GET, return the response.
+pub async fn https_get(addr: SocketAddr, sni: &str) -> std::io::Result<String> {
+    let connector = tokio_rustls::TlsConnector::from(client_config(&[b"http/1.1"]));
+    let tcp = TcpStream::connect(addr).await?;
+    let name = ServerName::try_from(sni.to_owned()).unwrap();
+    let mut tls = connector.connect(name, tcp).await?;
+    tls.write_all(b"GET / HTTP/1.1\r\nHost: localhost\r\n\r\n")
+        .await?;
+    let mut out = Vec::new();
+    tls.read_to_end(&mut out).await.ok();
+    Ok(String::from_utf8_lossy(&out).into_owned())
+}
+
+/// A site that writes a fixed 200 and records the peers it served.
+#[derive(Default)]
+pub struct FixedSite {
+    pub served: AtomicU64,
+    pub peers: Mutex<Vec<SocketAddr>>,
+}
+
+impl SiteService for FixedSite {
+    fn serve(
+        &self,
+        mut io: tokio_rustls::server::TlsStream<DoorStream>,
+        peer: SocketAddr,
+        guard: ConnGuard,
+    ) -> BoxFuture<()> {
+        self.served.fetch_add(1, Ordering::Relaxed);
+        self.peers.lock().unwrap().push(peer);
+        Box::pin(async move {
+            let _guard = guard;
+            let mut buf = [0u8; 1024];
+            let _ = tokio::time::timeout(Duration::from_secs(2), io.read(&mut buf)).await;
+            let _ = io
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok")
+                .await;
+            let _ = io.shutdown().await;
+        })
+    }
+}
+
+/// A Binding Request with `USERNAME` = `username`.
+pub fn binding_request(username: &str) -> Vec<u8> {
+    let mut m = vec![0x00, 0x01, 0, 0, 0x21, 0x12, 0xA4, 0x42];
+    m.extend_from_slice(&[7; 12]);
+    let name = username.as_bytes();
+    m.extend_from_slice(&[0x00, 0x06]);
+    m.extend_from_slice(&u16::try_from(name.len()).unwrap().to_be_bytes());
+    m.extend_from_slice(name);
+    while m.len() % 4 != 0 {
+        m.push(0);
+    }
+    let body = u16::try_from(m.len() - 20).unwrap();
+    m[2..4].copy_from_slice(&body.to_be_bytes());
+    m
+}
+
+/// `len_be16 || payload`.
+pub fn frame(payload: &[u8]) -> Vec<u8> {
+    let mut out = u16::try_from(payload.len()).unwrap().to_be_bytes().to_vec();
+    out.extend_from_slice(payload);
+    out
+}
+
+/// Wait (bounded) until the peer closes: `true` if EOF/reset arrived in `within`.
+pub async fn closed_within(stream: &mut TcpStream, within: Duration) -> bool {
+    let mut buf = [0u8; 4096];
+    let deadline = tokio::time::Instant::now() + within;
+    loop {
+        match tokio::time::timeout_at(deadline, stream.read(&mut buf)).await {
+            Ok(Ok(0) | Err(_)) => return true,
+            Ok(Ok(_)) => {}
+            Err(_) => return false,
         }
-        c.needing_explanation += 1;
-        if run.gaps.iter().any(|&(start, end)| covers(start, end, t)) {
-            c.explained += 1;
-        } else {
-            c.unexplained
-                .push((t.index, t.lateness() / 1_000_000, t.repeat));
-        }
     }
-    c
-}
-
-/// Whether the gap `[start, end]` covers `t`'s lateness window
-/// `[deadline, emit]` except [`EDGE_SLACK_NS`] at each edge.
-pub fn covers(start: i64, end: i64, t: &TickRecord) -> bool {
-    start <= t.deadline + EDGE_SLACK_NS && end >= t.emit - EDGE_SLACK_NS
-}
-
-pub fn report(name: &str, r: &ClockRun) {
-    let mut late: Vec<i64> = r.ticks.iter().map(TickRecord::lateness).collect();
-    late.sort_unstable();
-    let max = late.last().copied().unwrap_or(0);
-    let c = classify(r);
-    let longest_gap = r.gaps.iter().map(|(s, e)| e - s).max().unwrap_or(0);
-    eprintln!(
-        "chaos {name}: ticks {} (expected {}) repeats {} late>1 period {} max lateness {:.3} ms; \
-         witness gaps {} (longest {:.1} ms); needing explanation {}, explained {}, unexplained {:?}",
-        r.ticks.len(),
-        r.expected,
-        r.repeats,
-        r.ticks.iter().filter(|t| t.lateness() > PERIOD_NS).count(),
-        max as f64 / 1e6,
-        r.gaps.len(),
-        longest_gap as f64 / 1e6,
-        c.needing_explanation,
-        c.explained,
-        c.unexplained
-    );
-}
-
-/// The issue #321 assertion: one frame per tick, the output PTS exactly
-/// `from_tick(index)` with consecutive indices (constant delta), and zero
-/// unexplained repeats or slips. Absolute, never relative to another arm.
-pub fn assert_cadence(name: &str, r: &ClockRun) {
-    let ticks = r.ticks.len() as u64;
-    assert!(
-        ticks + 2 >= r.expected && ticks <= r.expected + 2,
-        "{name}: one frame per tick: {ticks} vs expected {}",
-        r.expected
-    );
-    for pair in r.ticks.windows(2) {
-        assert_eq!(
-            pair[1].index,
-            pair[0].index + 1,
-            "{name}: consecutive tick indices"
-        );
-    }
-    for t in &r.ticks {
-        let expected = MediaTime::from_tick(i64::try_from(t.index).unwrap(), cadence());
-        assert_eq!(
-            t.pts, expected,
-            "{name}: PTS of tick {} from the tick",
-            t.index
-        );
-    }
-    let c = classify(r);
-    assert!(
-        c.unexplained.is_empty(),
-        "{name}: {} repeats/slips not explained by a whole-process stall: {:?} (gaps {:?})",
-        c.unexplained.len(),
-        c.unexplained,
-        r.gaps
-    );
-}
-
-/// The assertion #321 retired: "no tick ever repeated". It attributes host
-/// stalls (which the clock absorbs by design) to the code under test.
-pub fn old_assert_cadence(name: &str, r: &ClockRun) {
-    let ticks = r.ticks.len() as u64;
-    assert!(
-        ticks + 2 >= r.expected && ticks <= r.expected + 2,
-        "{name}: one frame per tick"
-    );
-    assert_eq!(r.repeats, 0, "{name}: no tick fell behind compose");
 }

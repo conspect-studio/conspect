@@ -54,6 +54,7 @@ mod socket;
 pub mod steering;
 #[cfg(target_os = "linux")]
 mod sys;
+pub mod tcp;
 
 use std::net::{IpAddr, Ipv6Addr, SocketAddr};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -62,6 +63,11 @@ use std::time::{Duration, Instant};
 
 use tokio::sync::mpsc;
 
+pub use tcp::ice_tcp::UsernameCheck;
+
+/// A ready site TLS configuration for [`TlsRouting::site`] (re-exported so
+/// callers need not name `rustls`).
+pub type SiteTlsConfig = Arc<rustls::ServerConfig>;
 pub use classify::{classify, first_byte_class, ByteClass, DropReason, Lane, QuicKind, Verdict};
 pub use limits::{Budget, EstablishedSet, NewFlowLimiter, NewFlowLimits, PeerBuckets, Refusal};
 pub use quic::QuicLane;
@@ -70,6 +76,10 @@ pub use socket::{
     kernel_drops, kernel_drops_supported, parse_udp_drops, RecvBufferReport, SharedSocket,
 };
 pub use steering::{ProgramSet, ReuseportGroup, SteeringMode, STEERING_MAX_PEERS};
+pub use tcp::{
+    BoxFuture, ConnGuard, DoorStream, DoorTlsStream, IceTcpFrame, IceTcpLane, IceTcpSender,
+    RedirectConfig, SendOutcome, SiteService, TcpDoorConfig, TlsRouting, TrustedProxies,
+};
 
 /// Established-queue depth per lane (design note section 13).
 pub const ESTABLISHED_QUEUE: usize = 1024;
@@ -198,10 +208,56 @@ pub struct Stats {
     pub dropped_stun_global: AtomicU64,
     /// Dropped by the per-established-peer bucket (issue #325).
     pub dropped_established_peer: AtomicU64,
+    /// TCP connections admitted at accept.
+    pub tcp_accepted: AtomicU64,
+    /// TCP accept errors (EMFILE and friends; backed off, never fatal).
+    pub tcp_accept_errors: AtomicU64,
+    /// TCP connections refused at the global cap.
+    pub tcp_refused_global: AtomicU64,
+    /// TCP connections refused at the per-source cap.
+    pub tcp_refused_per_source: AtomicU64,
+    /// TCP connections closed at the first-byte deadline.
+    pub tcp_first_byte_timeout: AtomicU64,
+    /// TCP connections whose first bytes were not ours.
+    pub tcp_classified_close: AtomicU64,
+    /// TLS handshakes closed at the deadline.
+    pub tcp_tls_handshake_timeout: AtomicU64,
+    /// TLS handshakes that failed or had no configuration.
+    pub tcp_tls_failed: AtomicU64,
+    /// TLS connections handed to the site.
+    pub tcp_tls_site: AtomicU64,
+    /// TLS-ALPN-01 challenge handshakes completed.
+    pub tcp_tls_acme: AtomicU64,
+    /// TLS connections for the reserved TURN name (closed until slice 8).
+    pub tcp_turn_reserved: AtomicU64,
+    /// Connections refused behind a proxy (untrusted peer, missing or bad PROXY v2).
+    pub tcp_proxy_rejected: AtomicU64,
+    /// ICE-TCP connections registered.
+    pub ice_tcp_accepted: AtomicU64,
+    /// ICE-TCP connections refused (first frame, probation framing, table).
+    pub ice_tcp_rejected: AtomicU64,
+    /// ICE-TCP frames delivered to the lane.
+    pub ice_tcp_frames_in: AtomicU64,
+    /// ICE-TCP frames dropped because the lane queue was full.
+    pub ice_tcp_dropped_in: AtomicU64,
+    /// ICE-TCP outbound frames dropped (drop-oldest).
+    pub ice_tcp_dropped_out: AtomicU64,
+    /// ICE-TCP connections closed as stuck writers.
+    pub ice_tcp_closed_stuck: AtomicU64,
+    /// ICE-TCP connections closed because nothing answered in probation.
+    pub ice_tcp_probation_expired: AtomicU64,
+    /// Port-80 redirects answered.
+    pub redirect_served: AtomicU64,
+    /// Port-80 connections refused at a cap.
+    pub redirect_refused: AtomicU64,
+    /// Gauge: TCP door connections open now.
+    pub tcp_open_connections: AtomicU64,
+    /// Gauge: redirect connections open now.
+    pub redirect_open_connections: AtomicU64,
 }
 
 impl Stats {
-    fn bump(counter: &AtomicU64) {
+    pub(crate) fn bump(counter: &AtomicU64) {
         counter.fetch_add(1, Ordering::Relaxed);
     }
 
@@ -234,6 +290,29 @@ impl Stats {
             dropped_stun_per_source: get(&self.dropped_stun_per_source),
             dropped_stun_global: get(&self.dropped_stun_global),
             dropped_established_peer: get(&self.dropped_established_peer),
+            tcp_accepted: get(&self.tcp_accepted),
+            tcp_accept_errors: get(&self.tcp_accept_errors),
+            tcp_refused_global: get(&self.tcp_refused_global),
+            tcp_refused_per_source: get(&self.tcp_refused_per_source),
+            tcp_first_byte_timeout: get(&self.tcp_first_byte_timeout),
+            tcp_classified_close: get(&self.tcp_classified_close),
+            tcp_tls_handshake_timeout: get(&self.tcp_tls_handshake_timeout),
+            tcp_tls_failed: get(&self.tcp_tls_failed),
+            tcp_tls_site: get(&self.tcp_tls_site),
+            tcp_tls_acme: get(&self.tcp_tls_acme),
+            tcp_turn_reserved: get(&self.tcp_turn_reserved),
+            tcp_proxy_rejected: get(&self.tcp_proxy_rejected),
+            ice_tcp_accepted: get(&self.ice_tcp_accepted),
+            ice_tcp_rejected: get(&self.ice_tcp_rejected),
+            ice_tcp_frames_in: get(&self.ice_tcp_frames_in),
+            ice_tcp_dropped_in: get(&self.ice_tcp_dropped_in),
+            ice_tcp_dropped_out: get(&self.ice_tcp_dropped_out),
+            ice_tcp_closed_stuck: get(&self.ice_tcp_closed_stuck),
+            ice_tcp_probation_expired: get(&self.ice_tcp_probation_expired),
+            redirect_served: get(&self.redirect_served),
+            redirect_refused: get(&self.redirect_refused),
+            tcp_open_connections: get(&self.tcp_open_connections),
+            redirect_open_connections: get(&self.redirect_open_connections),
         }
     }
 }
@@ -266,6 +345,29 @@ pub struct StatsSnapshot {
     pub dropped_stun_per_source: u64,
     pub dropped_stun_global: u64,
     pub dropped_established_peer: u64,
+    pub tcp_accepted: u64,
+    pub tcp_accept_errors: u64,
+    pub tcp_refused_global: u64,
+    pub tcp_refused_per_source: u64,
+    pub tcp_first_byte_timeout: u64,
+    pub tcp_classified_close: u64,
+    pub tcp_tls_handshake_timeout: u64,
+    pub tcp_tls_failed: u64,
+    pub tcp_tls_site: u64,
+    pub tcp_tls_acme: u64,
+    pub tcp_turn_reserved: u64,
+    pub tcp_proxy_rejected: u64,
+    pub ice_tcp_accepted: u64,
+    pub ice_tcp_rejected: u64,
+    pub ice_tcp_frames_in: u64,
+    pub ice_tcp_dropped_in: u64,
+    pub ice_tcp_dropped_out: u64,
+    pub ice_tcp_closed_stuck: u64,
+    pub ice_tcp_probation_expired: u64,
+    pub redirect_served: u64,
+    pub redirect_refused: u64,
+    pub tcp_open_connections: u64,
+    pub redirect_open_connections: u64,
 }
 
 /// Errors starting the front door.
@@ -282,6 +384,10 @@ pub enum Error {
     },
     /// A lane was taken twice.
     LaneTaken(Lane),
+    /// The TCP door is not running (or its ICE-TCP lane was already taken).
+    NoTcpDoor,
+    /// The TCP door was started twice.
+    TcpDoorRunning,
 }
 
 impl std::fmt::Display for Error {
@@ -290,6 +396,8 @@ impl std::fmt::Display for Error {
             Self::Runtime(e) => write!(f, "front-door runtime: {e}"),
             Self::Socket { addr, source } => write!(f, "front-door socket {addr}: {source}"),
             Self::LaneTaken(lane) => write!(f, "front-door {lane:?} lane already taken"),
+            Self::NoTcpDoor => f.write_str("front-door TCP door not running or lane taken"),
+            Self::TcpDoorRunning => f.write_str("front-door TCP door already started"),
         }
     }
 }
@@ -298,7 +406,7 @@ impl std::error::Error for Error {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Runtime(e) | Self::Socket { source: e, .. } => Some(e),
-            Self::LaneTaken(_) => None,
+            Self::LaneTaken(_) | Self::NoTcpDoor | Self::TcpDoorRunning => None,
         }
     }
 }
@@ -383,6 +491,8 @@ pub struct FrontDoor {
     rtc_established: Arc<EstablishedSet>,
     quic_rx: Option<LaneRx>,
     rtc_rx: Option<LaneRx>,
+    tcp: Option<(SocketAddr, Arc<tcp::TcpDoorState>)>,
+    redirect: Option<SocketAddr>,
 }
 
 impl std::fmt::Debug for FrontDoor {
@@ -474,6 +584,8 @@ impl FrontDoor {
             rtc_established,
             quic_rx: Some(quic_rx),
             rtc_rx: Some(rtc_rx),
+            tcp: None,
+            redirect: None,
         })
     }
 
@@ -551,6 +663,140 @@ impl FrontDoor {
             Arc::clone(&self.socket),
             Arc::clone(&self.rtc_established),
         ))
+    }
+}
+
+impl FrontDoor {
+    /// Start the TCP door (slice 4): bind `cfg.listen` on the front door's own
+    /// runtime (dual-stack for `[::]`, never `0.0.0.0`, backlog 1024) and spawn
+    /// its accept loop there. Returns the bound address.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Socket`] on a bind failure, [`Error::TcpDoorRunning`] on a
+    /// second call.
+    pub fn start_tcp(
+        &mut self,
+        cfg: TcpDoorConfig,
+        tls: TlsRouting,
+        site: Option<Arc<dyn SiteService>>,
+    ) -> Result<SocketAddr, Error> {
+        if self.tcp.is_some() {
+            return Err(Error::TcpDoorRunning);
+        }
+        let addr = cfg.listen;
+        let listener = {
+            let _guard = self.handle.enter();
+            tcp::bind_listener(addr).map_err(|source| Error::Socket { addr, source })?
+        };
+        let local = listener
+            .local_addr()
+            .map_err(|source| Error::Socket { addr, source })?;
+        let state = tcp::TcpDoorState::new(cfg, tls, site, Arc::clone(&self.stats));
+        self.handle
+            .spawn(tcp::accept_loop(listener, Arc::clone(&state)));
+        tracing::info!(
+            %local,
+            behind_proxy = state.config.proxy.is_some(),
+            ice_tcp = state.config.ice_tcp,
+            "front door: TCP door listening on its own runtime"
+        );
+        self.tcp = Some((local, state));
+        Ok(local)
+    }
+
+    /// Start the plaintext port-80 redirect listener on the front door's
+    /// runtime. Returns the bound address.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Socket`] on a bind failure.
+    pub fn start_redirect(&mut self, cfg: RedirectConfig) -> Result<SocketAddr, Error> {
+        let addr = cfg.listen;
+        let listener = {
+            let _guard = self.handle.enter();
+            tcp::bind_listener(addr).map_err(|source| Error::Socket { addr, source })?
+        };
+        let local = listener
+            .local_addr()
+            .map_err(|source| Error::Socket { addr, source })?;
+        let state = tcp::RedirectState::new(cfg, Arc::clone(&self.stats));
+        self.handle.spawn(tcp::redirect_loop(listener, state));
+        self.redirect = Some(local);
+        Ok(local)
+    }
+
+    /// The TCP door's bound address, if it runs.
+    #[must_use]
+    pub fn tcp_local_addr(&self) -> Option<SocketAddr> {
+        self.tcp.as_ref().map(|(a, _)| *a)
+    }
+
+    /// The redirect listener's bound address, if it runs.
+    #[must_use]
+    pub fn redirect_local_addr(&self) -> Option<SocketAddr> {
+        self.redirect
+    }
+
+    /// Replace the TLS routing (site / ACME configurations); applies to the
+    /// next handshake.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::NoTcpDoor`] when the TCP door is not running.
+    pub fn set_tls_routing(&self, tls: TlsRouting) -> Result<(), Error> {
+        let (_, state) = self.tcp.as_ref().ok_or(Error::NoTcpDoor)?;
+        *state
+            .routing
+            .tls
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = tls;
+        Ok(())
+    }
+
+    /// Install (or replace) the site service; applies to the next connection.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::NoTcpDoor`] when the TCP door is not running.
+    pub fn set_site(&self, site: Option<Arc<dyn SiteService>>) -> Result<(), Error> {
+        let (_, state) = self.tcp.as_ref().ok_or(Error::NoTcpDoor)?;
+        *state
+            .routing
+            .site
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = site;
+        Ok(())
+    }
+
+    /// Install an optional pre-check of a first ICE-TCP Binding Request's
+    /// `USERNAME` (`"<local>:<remote>"`); the default accepts every
+    /// structurally valid request and leaves authentication to the consumer
+    /// (probation).
+    ///
+    /// # Errors
+    ///
+    /// [`Error::NoTcpDoor`] when the TCP door is not running.
+    pub fn set_ice_tcp_username_check(&self, check: Option<UsernameCheck>) -> Result<(), Error> {
+        let (_, state) = self.tcp.as_ref().ok_or(Error::NoTcpDoor)?;
+        *state
+            .ice
+            .check
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = check;
+        Ok(())
+    }
+
+    /// Take the ICE-TCP lane. Until it is taken, ICE-TCP connections are
+    /// closed right after their first frame.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::NoTcpDoor`] when the TCP door is not running or the lane was
+    /// already taken.
+    pub fn take_ice_tcp_lane(&mut self) -> Result<IceTcpLane, Error> {
+        let (local, state) = self.tcp.as_ref().ok_or(Error::NoTcpDoor)?;
+        state.ice.take_lane(local.port()).ok_or(Error::NoTcpDoor)
     }
 }
 

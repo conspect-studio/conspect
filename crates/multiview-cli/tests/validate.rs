@@ -257,6 +257,90 @@ fn missing_file_is_reported_clearly() {
     );
 }
 
+#[test]
+fn front_door_tcp_rules_surface_in_validate() {
+    // Slice 4 (issue #290): the `[network]` TCP-door rules reach `multiview validate`.
+    let doc = |network: &str| {
+        format!(
+            r##"
+schema_version = 1
+
+[canvas]
+width = 1920
+height = 1080
+fps = "30000/1001"
+pixel_format = "nv12"
+background = "#101014"
+[canvas.color]
+profile = "sdr-bt709-limited"
+
+[layout]
+kind = "grid"
+columns = ["1fr"]
+rows = ["1fr"]
+areas = ["a"]
+
+[[sources]]
+id = "in_a"
+kind = "test"
+
+[[cells]]
+id = "cell_a"
+area = "a"
+fit = "contain"
+[cells.source]
+input_id = "in_a"
+
+[[outputs]]
+id = "out-a"
+kind = "hls"
+path = "/srv/hls/out-a/a.m3u8"
+codec = "mpeg2video"
+segment_ms = 2000
+
+[network]
+{network}
+"##
+        )
+    };
+    let dir = tempdir();
+    let ok = dir.join("ok.toml");
+    fs::write(
+        &ok,
+        doc("https_port = 443\nmode = \"direct\"\npublic_host = \"a.example.org\""),
+    )
+    .unwrap();
+    let report = validate_config(&ok).unwrap();
+    assert!(report.is_ok(), "{}", report.render());
+    for (name, network, needle) in [
+        (
+            "v4.toml",
+            "https_port = 443\nbind = \"0.0.0.0\"",
+            "IPv6-first",
+        ),
+        (
+            "redirect.toml",
+            "https_port = 443\nmode = \"direct\"",
+            "public_host",
+        ),
+        (
+            "proxy.toml",
+            "https_port = 443\nmode = \"behind_proxy\"",
+            "trusted_proxies",
+        ),
+    ] {
+        let path = dir.join(name);
+        fs::write(&path, doc(network)).unwrap();
+        let report = validate_config(&path).unwrap();
+        assert!(!report.is_ok(), "{name} must not validate");
+        assert!(
+            report.render().contains(needle),
+            "{name}: {}",
+            report.render()
+        );
+    }
+}
+
 /// A unique temporary directory under the OS temp dir, created for the test.
 fn tempdir() -> PathBuf {
     let base = std::env::temp_dir();

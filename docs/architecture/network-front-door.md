@@ -347,7 +347,8 @@ page alone.
 
 A profile resolves to directory URL + EAB requirement + trust anchor + preferred ACME profile. The
 order flow has no per-CA code. Account credentials are stored per directory
-(`<state_dir>/account.<directory-host>.json`, 0600), so changing CA never reuses another CA's
+(`<state_dir>/account.<directory-host>-<first 8 hex of sha256(directory URL)>.json`, 0600; the
+hash keeps two directories on one host apart), so changing CA never reuses another CA's
 account. When the configured CA changes, the current certificate keeps serving until the new CA
 issues. No automatic fallback from one CA to another (not asked for; not designed).
 
@@ -383,6 +384,40 @@ propagates, CA rate limit `429`/`rateLimited`, CA unreachable). This runs in CI 
 documented live check against the Let's Encrypt and Google staging directories needs a Cloudflare
 token and a Google EAB secret: they live in 1Password and the job runs manually (`workflow_dispatch`),
 never on pull requests.
+
+### Slice 5 engine as built (PR A)
+
+Library only, behind the off-by-default `acme` feature of `multiview-control` (forwarded by
+`multiview-cli`, in no preset yet); boot wiring, the `multiview tls` CLI and the setup routes are
+PR B.
+
+* Files: `crates/multiview-control/src/acme/{mod,egress,dns,cloudflare,store,engine}.rs`. instant-acme
+  0.8.5 is built without its `hyper-rustls` client; the engine supplies the HTTP client. No OpenSSL.
+* Egress (CA directory and Cloudflare API): HTTPS only, no proxy, a resolver that resolves once and
+  screens every address (reqwest dials exactly those), IP literals screened before sending, at most 3
+  redirects each re-screened, connect 10 s / request 30 s, bodies capped at 1 MiB while streaming.
+  Refused: loopback, link-local (incl. `169.254.169.254`), RFC 1918, ULA, CGNAT, multicast,
+  unspecified, broadcast and IPv4-mapped/compatible forms. `[network.tls] allow_private_directory =
+  true` (custom CA only, together with `trust_anchor`) admits RFC 1918 / ULA / CGNAT / loopback for
+  the ACME directory client only; link-local, multicast, unspecified and mapped forms stay refused.
+  With `trust_anchor`, only that PEM bundle is trusted (opened without following symlinks).
+* State (`state_dir`, 0700, files 0600, atomic rename + fsync): `account.<host>-<hash>.json`,
+  `active.pem` (key + chain + a `CONSPECT ACME META` section with the non-secret metadata, one file so
+  one rename commits all three; the served key swaps only after that commit),
+  `pending-txt.json` (DNS-01 ledger: intent before `publish_txt`, handle after, entry removed after
+  `remove_txt`; at most 64 entries; replayed by `cleanup_pending()` at start), `secrets/<NAME>` as
+  the fallback for every env-var name.
+* Cleanup: every attempt runs inside a 10 min timeout so TXT records and ALPN challenges are removed
+  on success, failure and timeout; the ledger covers a crash or kill.
+* Runtime: `AcmeService` runs on its own OS thread (`acme`) with its own current-thread Tokio runtime;
+  commands go through a bounded queue (capacity 4, full = dropped); `CertificateSource::status()` is
+  the only read path. `tests/acme_cadence.rs` proves the output clock keeps cadence while the CA
+  hangs or refuses.
+* Renewal: ARI window (uniform random instant, `Retry-After` floors the next ARI check) or two thirds
+  of the lifetime ±(lifetime/30, at most one day); failures back off 15 min doubling to 6 h, never
+  under 60 s. Alarm: while renewal fails, under 50 % of the lifetime left = warning, under 25 % =
+  critical; past `notAfter` = expired (still served). `CertificateStatus` carries `alarm`,
+  `renewal_due_at`, `next_attempt_at`; an optional hook lets PR B feed the alarm store.
 
 ### Changes to #167-#172
 
@@ -512,9 +547,10 @@ supported as `[network] mode = "behind_proxy"`:
 
 ```toml
 [network]
-mode = "direct"                  # "direct" | "behind_proxy"
+mode = "direct"                  # "direct" | "behind_proxy"; absent = no TCP listener (slice 4)
 public_host = "mda001.example.net"  # used for the 80->443 redirect, Alt-Svc authority, TURN SNI
 https_port = 443                 # TCP and UDP
+tcp_port = 443                   # as built (slice 4): the direct-mode TCP port, default https_port
 http_redirect_port = 80          # 0 disables the redirect listener
 bind = "[::]"                    # IPv6-first; an IPv4-only address is rejected at load
 advertise = ["2404:db8::10", "203.0.113.10"]  # public addresses for ICE candidates (was webrtc.advertised_addresses)
@@ -554,7 +590,7 @@ challenge = "dns-01"             # "dns-01" | "tls-alpn-01"
 domains = ["mda001.example.net"] # SANs; IP literals allowed with tls-alpn-01 (Let's Encrypt short-lived)
 contact_email = "ops@example.net"
 acme_profile = "shortlived"      # used only when the directory advertises it
-state_dir = "/var/lib/conspect/tls"  # 0700; account.<directory-host>.json, cert, key, bootstrap
+state_dir = "/var/lib/conspect/tls"  # 0700; account.<host>-<hash>.json, active.pem/.json, pending-txt.json, bootstrap
 [network.tls.dns]
 provider = "cloudflare"
 token_env = "CLOUDFLARE_API_TOKEN"   # Zone:DNS:Edit + Zone:Zone:Read (recommended)
@@ -581,6 +617,8 @@ state_dir = "/var/lib/conspect/tls"
 ca = "custom"
 directory = "https://acme.corp.example/acme/directory"
 trust_anchor = "/etc/conspect/corp-root.pem"   # PEM bundle for the directory connection
+# allow_private_directory = true               # only if the directory is on loopback / RFC 1918 /
+#                                              # ULA / CGNAT (or `localhost`); needs trust_anchor
 challenge = "dns-01"
 domains = ["mda001.corp.example"]
 eab_kid_env = "CORP_EAB_KID"                   # optional
@@ -911,10 +949,108 @@ read from the established socket.
 **The #321 stall witness.** The slice-1 suite asserted `repeats == 0` on every arm, which asserted
 that the CI host never stalls the process for more than a period (macOS run 43192931229: one
 ~104 ms whole-process stall, three last-good repeats, door off). The clock absorbs such a stall by
-design (ADR-T018). The witness is a std thread that sleeps 1 ms in a loop and records every gap
-longer than half a period on the clock's own time base; a repeat (or a tick later than a period)
-is explained only when its `[deadline, emit]` interval overlaps a gap, i.e. the whole process was
-not running. The suite asserts zero unexplained ticks, absolutely. `tests/stall_witness.rs`
-records the red case (a SIGSTOP/SIGCONT stall of 150 ms fails the old assertion with 3-4
-repeats), the green case (all of them explained), and the negative control (a 150 ms spin on the
-program runtime while the process runs: the repeats are unexplained and the assertion fails).
+design (ADR-T018). The witness is a std thread that sleeps 1 ms in a loop on the clock's own time
+base and records every sleep that took at least one period, stamped inside the sleep (clock read
+just before `sleep`, just after it returns), so a gap holds only time the witness was blocked. A
+repeat (or a tick later than a period) is explained only when ONE gap covers its whole
+`[deadline, emit]` window except half a period at each edge, i.e. the whole process was stopped
+for essentially all the time the tick was late. The suite asserts zero unexplained ticks,
+absolutely. `tests/stall_witness.rs` records the red case (a SIGSTOP/SIGCONT stall of 150 ms
+fails the old assertion with 3-4 repeats), the green case (all of them explained), and three
+controls that must stay unexplained: a 150 ms spin on the program runtime while the process runs;
+a 100 ms program-runtime block immediately followed by a 150 ms SIGSTOP; and a 100 ms block under
+a 20k pps loopback flood (review PR 333).
+
+### Slice 4 as built (issue #290)
+
+PR1 of slice 4: the TCP door, ICE-TCP lane, `behind_proxy` mode, port-80 redirect and the site over
+the engine's own TLS. The str0m ICE-TCP consumer and the browser ladder are PR2 of this slice.
+
+* **Config** (`[network]`, all optional, every saved `desired.json`/TOML keeps loading):
+  `mode` (`"direct"` | `"behind_proxy"`), `tcp_port`, `http_redirect_port`, `bind`, `trusted_proxies`,
+  `proxy_listen`, `[network.ice_tcp] enabled`. **`mode` absent means no TCP listener at all**: the
+  slice-1 UDP door only, so a saved state with only `https_port = 443` starts unchanged while another
+  server (nginx on mda001) still owns TCP 443. `mode` requires `https_port`. `bind` must be an IPv6
+  literal (default `[::]`, dual-stack; an IPv4 literal or IPv4-mapped address is rejected at load).
+  `trusted_proxies` takes IP literals and CIDR prefixes (at most 64), required non-empty for
+  `behind_proxy`. `proxy_listen` defaults to `[::1]:8443` and rejects `0.0.0.0`.
+* **Deviation, `tcp_port`**: section 10 has one `https_port` for TCP and UDP. `tcp_port` (default
+  `https_port`) lets an operator stage the TCP door on a second port while another server still owns
+  TCP 443, then drop the key at cutover.
+* **`public_host` relaxed**: it is valid alone now (the redirect target); `[network.tls]` still
+  requires it. `direct` with the redirect enabled requires `public_host`: the redirect target never
+  comes from the `Host` header. The redirect port must differ from the TCP door port.
+* **Topology (#1)**: `FrontDoor::start_tcp` binds the listener inside the front-door runtime
+  (backlog 1024, dual-stack for `[::]`, never `0.0.0.0`) and runs the accept loop, every
+  per-connection task, the ICE-TCP reader/writer tasks and the redirect there. The site service is
+  the control-plane router on `multiview_control::ConnectionServer`, run on the front-door runtime.
+* **Accept, in order**: accept (an error counts and backs off 50 ms, never exits); the global cap
+  (1024) before any byte is read; the per-source cap (256, IPv4 address or IPv6 /64) on the TCP peer
+  in `direct`. Behind a proxy: the TCP peer must be in `trusted_proxies` (else closed before any
+  read), then a PROXY v2 header (binary, `PROXY` command, `TCP4`/`TCP6` only, at most 536 bytes of
+  addresses + TLVs) within the 5 s first-byte deadline; anything else (missing, v1 text, `LOCAL`,
+  UDP/unix, oversize) closes before any byte of the client's protocol is read. The header's source is
+  the peer for the per-source cap, `ConnectInfo` and logs.
+* **First byte**, `peek` under the 5 s deadline from accept: `0x16` is TLS; `0x00`-`0x05` reads the
+  2-byte RFC 4571 length (never TLS, so consuming it is safe) and 20..=1535 is ICE-TCP (when
+  enabled); anything else closes.
+* **TLS**: `LazyConfigAcceptor` over a reader capped at 16 KiB until the `ClientHello` parses; hello
+  plus handshake bounded by 10 s from the first byte. ALPN exactly `acme-tls/1` routes to the ACME
+  responder config (None until slice 5: closed); SNI `turn.<public_host>` is closed (reserved for
+  slice 8); everything else is the site (ALPN `http/1.1` only) and is handed, with the admission
+  guard, to the site service. The site is the same router and `ServeOptions` as the plain
+  `[control] bind` listener (header-read timeout, `ConnectInfo`, upgrades, the control per-IP cap on
+  the real peer, drain on the control-plane shutdown). The plain listener keeps running unchanged.
+  The certificate is `[control.tls] mode = "static"` through `StaticCertificateSource` +
+  `SourceResolver` (feature `tls`, unix); without it the door logs a warning and serves ICE-TCP only.
+* **ICE-TCP lane contract** (`FrontDoor::take_ice_tcp_lane`): the first frame must arrive within the
+  5 s deadline, be <= 1535 bytes and structurally a STUN Binding Request (type `0x0001`, cookie,
+  exact length, a `USERNAME` containing `:`). An optional pre-check hook on the full `USERNAME`
+  (`set_ice_tcp_username_check`) defaults to accept. Until a consumer takes the lane, connections
+  close right after their first frame. Registered connections (table keyed by canonical peer, capped
+  at the door's connection cap; a second connection from the same peer is refused) start in
+  **probation**: frames go to the lane, but until the consumer queues an outbound frame to that peer
+  (str0m answering an authenticated Binding Request, i.e. `MESSAGE-INTEGRITY` verified) at most 8
+  inbound frames, each <= 1535 bytes and a STUN message (first byte `0x00`/`0x01`), are accepted,
+  and with no outbound frame within 5 s of accept the connection closes
+  (`ice_tcp_probation_expired`). After probation frames up to 65 535 bytes flow (a zero-length frame
+  closes). Each `IceTcpFrame` carries `peer` (canonical) and `local` (accepted socket, unmapped).
+  Inbound: one lane queue of 1024, `try_send`, full drops and counts. Outbound:
+  `IceTcpSender::send` never blocks; per connection at most 256 frames **and 256 KiB** (drop-oldest;
+  the byte cap is an addition: 256 maximum-size frames would otherwise pin 16 MiB per connection);
+  the connection's **writer** closes a stuck peer (`ice_tcp_closed_stuck`), measuring progress
+  against wall time so a peer trickling ACKs cannot keep its slot: (a) each frame must be written
+  completely within the write timeout (5 s) of its write starting, never reset by partial writes;
+  (b) after every pop the writer checks the queue against its high-water mark (half the cap: 128
+  frames or 128 KiB) and closes once it has stayed at or over it for the write timeout
+  (`backlogged_since`, cleared only when the queue drops below). `send` never closes or waits.
+  The first frame's STUN attribute list is walked to the end (header, value and padding must fit)
+  before the `USERNAME` is accepted. 30 s without an inbound frame closes. `IceTcpSender::close(peer)` drops a
+  connection.
+* **Redirect**: `[bind]:http_redirect_port`, own caps (256 global, 16 per source), 5 s total per
+  connection, at most 8 KiB read for the request line; `301` to `https://<public_host>[:port]<path>`
+  (IPv6 literal bracketed, port omitted when 443), path + query kept, the fragment dropped, anything
+  with control characters, spaces, `\`, a leading `//` or not in origin form becomes `/`. The `Host`
+  header is never read.
+* **Stats**: TCP counters for accepted, refusals (global, per source, proxy), first-byte and
+  handshake timeouts, classified closes, TLS site/ACME/failed, TURN-reserved, the ICE-TCP lifecycle
+  and drops, the redirect, plus `tcp_open_connections` / `redirect_open_connections` gauges.
+* **Failure posture**: a TCP or redirect bind failure is logged; the UDP door keeps running.
+* **Tests**: unit and property tests for the first-byte classifier (all 256 bytes, all lengths), the
+  PROXY v2 parser and the RFC 4571 deframer; `tests/tcp_door.rs` (TLS h1 and ICE-TCP on one port over
+  IPv4 and IPv6, the ICE-TCP gates and probation, `behind_proxy` fail-closed and header address, the
+  redirect, the deadlines, the per-source cap, a stuck reader, a trickling reader closed within 3x
+  the write timeout); `tests/tcp_chaos.rs` (connect flood, first-byte and TLS slowloris, half-open
+  TLS, stuck ICE-TCP readers, oversized and garbage frames against the real tick loop). The attacker
+  runs in-process, so the chaos test compares like with like (the `chaos_flood.rs` pattern): three
+  runs, `idle` (door up, no attack), `attack_door_on` and `attack_door_off` (the door shut down, the
+  same port served by a trivial `TcpListener` on its own 2-worker runtime that reads and discards
+  with a 5 s deadline), the same attack paced to `FRONTDOOR_TCP_CHAOS_CPS` (default 2000) connection
+  attempts/s. Asserted: tick counts within 2 of elapsed/period in every run, idle without repeats,
+  door-on repeats at most door-off + 1, door-on p99 within 4 ms of the worse of door-off and idle,
+  door-on worst tick within one period of theirs; and the door's own bounds: the connection cap,
+  RSS growth, fd count back to baseline, every defence counter (stuck writers included) fired.
+* **Deferred**: the ACME `ChallengeResolver` wiring into `TlsRouting.acme` (whichever of #290/#291
+  lands second; TODO in `multiview-cli/src/frontdoor.rs`); the str0m ICE-TCP consumer, passive TCP
+  candidates in the SDP and the browser ladder (PR2 of this slice); systemd socket activation
+  (section 9) and the mda001 cutover (slice 6).
