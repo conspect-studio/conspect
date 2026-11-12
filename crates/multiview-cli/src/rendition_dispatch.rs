@@ -4225,6 +4225,76 @@ mod tests {
         )));
     }
 
+    /// A2: an audio move whose G lies three windows ahead never holds the
+    /// windows before G's window: they take all their audio from the old
+    /// stage (DTS < G), so each is delivered as its base window closes, even
+    /// while the destination stage has proven nothing yet.
+    #[test]
+    fn a_future_audio_move_never_holds_the_windows_before_its_g() {
+        let mut d =
+            RenditionDispatcher::new(aac_cfg(vec![binding(0, 0, 1), binding(1, 0, 1)])).unwrap();
+        let mut sink = FakeDelivery::new(2);
+        let (key, key_gen) = d.add_audio_key().unwrap();
+        // G = 9 216 is in window 4 (7 680..9 600); issued in window 1.
+        let g = 9_216;
+        let mut seen = Vec::new();
+        for i in 0..7_i64 {
+            if i == 1 {
+                // (`now` is read after the rebind: its watchdog starts there.)
+                d.rebind_audio(1, Some(key), g, None).unwrap();
+            }
+            let now = Instant::now();
+            // The private stage proves nothing until window 4 is due, then
+            // catches up all at once.
+            if i == 4 {
+                for w in 0..=4 {
+                    let p: Vec<_> = frames_in(w).into_iter().map(|x| tagged(x, 2)).collect();
+                    d.dispatch_dynamic_audio(
+                        key,
+                        key_gen,
+                        p,
+                        Some(mark(tick_ns(w + 1))),
+                        false,
+                        now,
+                        &mut sink,
+                    )
+                    .unwrap();
+                }
+            } else if i > 4 {
+                let p: Vec<_> = frames_in(i).into_iter().map(|x| tagged(x, 2)).collect();
+                d.dispatch_dynamic_audio(
+                    key,
+                    key_gen,
+                    p,
+                    Some(mark(tick_ns(i + 1))),
+                    false,
+                    now,
+                    &mut sink,
+                )
+                .unwrap();
+            }
+            d.dispatch(ve25(i), now, &mut sink).unwrap();
+            d.dispatch(audio_event(i, 1), now, &mut sink).unwrap();
+            assert_eq!(
+                sink.windows.iter().filter(|w| w.0 == 1).count(),
+                usize::try_from(i + 1).unwrap(),
+                "output 1 window {i} delivered on time"
+            );
+            let got = audio_of(&mut sink, 1, now);
+            if i < 4 {
+                assert_eq!(got.iter().map(|p| p.0).collect::<Vec<_>>(), frames_in(i));
+                assert!(got.iter().all(|p| p.1 == 1), "window {i}: old audio");
+            }
+            seen.extend(got);
+        }
+        let all: Vec<i64> = (0..7).flat_map(frames_in).collect();
+        assert_eq!(seen.iter().map(|p| p.0).collect::<Vec<_>>(), all);
+        for &(dts, tag) in &seen {
+            assert_eq!(tag, if dts < g { 1 } else { 2 }, "dts {dts}");
+        }
+        assert!(!d.is_audio_key_failed(key));
+    }
+
     /// Sample-exact across the move, with the real libav AAC encoder and
     /// decoder at 48 kHz: the old bus and the private bus encode the same PCM
     /// on the same global grid (the private bus opened mid-run at G0), the
