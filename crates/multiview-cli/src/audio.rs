@@ -580,6 +580,25 @@ impl AudioControlHandle {
         }
     }
 
+    /// The linear route gain an output feed `audio = source:<id>` carries
+    /// (ADR-0108 §5.5): the source's `audio-routing` `gain_db`, 0 when the
+    /// route is muted, unity without a route. `include_in_program_bus` is a
+    /// mix concern and is not applied. Read live (one atomic load).
+    #[must_use]
+    pub fn output_route_gain(&self, id: &str) -> f32 {
+        let routing = self.routing.load();
+        let Some(route) = routing
+            .as_ref()
+            .and_then(|r| r.routes.iter().find(|route| route.input_id == id))
+        else {
+            return 1.0;
+        };
+        if route.mute {
+            return 0.0;
+        }
+        10f32.powf(route.gain_db.clamp(-96.0, 24.0) / 20.0)
+    }
+
     /// Let `id` join at unity while no routing is declared, matching what a
     /// source bound at startup gets.
     pub(crate) fn allow_unrouted_unity(&self, id: &str) {

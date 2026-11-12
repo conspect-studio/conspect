@@ -1149,13 +1149,21 @@ async fn apply_change(
     // any control store or command changes, so an I/O refusal leaves state intact.
     // A shed command does not undo accepted intent; the poll retries its live apply.
     if let Err(error) = commit_watched_desired(state, &next).await {
+        // #317: a document the engine could not boot from is as invalid as one
+        // that fails `validate`: latch its fingerprint (warned once), never
+        // re-enter the commit on every poll. Only a transient I/O refusal retries.
+        let inadmissible = matches!(error, crate::ControlError::NotAdmissibleWithSwitcher(_));
         reject(
             state,
             path,
             &format!("committing desired state: {error}"),
             invalid_active,
         );
-        return ApplyResult::Retry;
+        return if inadmissible {
+            ApplyResult::RejectedInvalid
+        } else {
+            ApplyResult::Retry
+        };
     }
     let outcome = apply_document_diff(state, ACTOR, &diff, &next);
     // The document is valid either way — the invalid latch clears even when

@@ -156,6 +156,7 @@ pub mod control;
 pub mod display_size;
 pub mod event_journal;
 pub mod hls_event_observer;
+pub mod last_good;
 /// The Conspect entitlement-plane wiring for the cli (CONSPECT-2b/10, ADR-0050):
 /// the shared lease store, the published [`licence::WatermarkSignal`] the engine
 /// bake samples lock-free (S3), and the sampled [`multiview_licence::EnforcementLevel`]
@@ -285,6 +286,12 @@ pub mod exit_watchdog;
 /// Existing encoded output conversion and authorized MoQ family adapter.
 #[cfg(feature = "moq-output")]
 pub mod moq_outputs;
+/// Output routing take state machine and live encoders (ADR-0108 slice 1).
+#[cfg(feature = "ffmpeg")]
+pub mod output_routing;
+/// The control-plane adapter over the output routing handle (ADR-0108).
+#[cfg(feature = "ffmpeg")]
+pub mod output_routing_control;
 #[cfg(feature = "ffmpeg")]
 pub mod output_window_registry;
 /// The full libav\* end-to-end `multiview run` pipeline (ingest → composite →
@@ -295,6 +302,9 @@ pub mod output_window_registry;
 pub mod pipeline;
 #[cfg(feature = "ffmpeg")]
 mod rendition_dispatch;
+/// Routed outputs' audio: per-output private AAC buses + take crossfade.
+#[cfg(feature = "ffmpeg")]
+mod routing_audio;
 // Planning uses compile-feature probes only and needs no native FFmpeg linkage.
 pub mod rendition_plan;
 #[cfg(feature = "ffmpeg")]
@@ -375,6 +385,10 @@ pub mod webrtc_endpoint;
 #[cfg(feature = "webrtc-native")]
 pub mod webrtc_outputs;
 
+/// The network front door (ADR-0107 slice 1): one dual-stack UDP socket for
+/// MoQ and WebRTC, on its own runtime, when `[network]` is configured.
+pub mod frontdoor;
+
 /// The **single-socket** WebRTC orchestration (ADR-0048 §4): binds ONE shared
 /// dual-stack UDP socket and adopts every WebRTC role onto it — preview WHEP, WHIP
 /// ingest, WHEP-serve outputs, and `whip_push` outputs — fixing the box-validation
@@ -382,6 +396,11 @@ pub mod webrtc_outputs;
 /// bind hit `EADDRINUSE` and silently degraded. Behind `webrtc-native`.
 #[cfg(feature = "webrtc-native")]
 pub mod webrtc_unified;
+
+/// Pure-integer NV12 cell scaler (monitor wall, routing aux canvases).
+pub mod nv12_blit;
+/// The `routing-aux` thread: one-cell routed feeds (ADR-0108 slice 1).
+pub mod routing_aux;
 
 /// The shared monitor wall (ADR-0103): one composed, once-encoded MoQ stream.
 #[cfg(feature = "moq-output")]

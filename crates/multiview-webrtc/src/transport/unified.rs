@@ -189,6 +189,49 @@ impl RunProbe {
     }
 }
 
+/// An IPv4-mapped IPv6 socket address as plain IPv4.
+fn canonical_peer(addr: SocketAddr) -> SocketAddr {
+    match addr {
+        SocketAddr::V6(v6) => v6
+            .ip()
+            .to_ipv4_mapped()
+            .map_or(addr, |v4| SocketAddr::new(v4.into(), v6.port())),
+        SocketAddr::V4(_) => addr,
+    }
+}
+
+/// One datagram delivered by a shared front door (ADR-0107 slice 1).
+#[derive(Debug, Clone)]
+pub struct InboundDatagram {
+    /// The remote address, as the dual-stack socket reported it.
+    pub src: SocketAddr,
+    /// The concrete local IP the datagram arrived on (PKTINFO), IPv4-mapped
+    /// addresses unmapped; `None` when the kernel reported none.
+    pub dst_ip: Option<std::net::IpAddr>,
+    /// The datagram.
+    pub payload: Vec<u8>,
+}
+
+/// The receive side of a socket the endpoint shares with other protocols (the
+/// front door's RFC 9443 dispatcher, ADR-0107). The endpoint only *sends* on
+/// its own descriptor; every datagram arrives through this, already classified
+/// as STUN/DTLS/RTP/TURN and rate limited.
+pub trait SharedInbound: Send + 'static {
+    /// Poll the next datagram; `Ready(None)` once the source is gone.
+    fn poll_next(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<InboundDatagram>>;
+    /// Take a queued datagram without waiting.
+    fn try_next(&mut self) -> Option<InboundDatagram>;
+    /// A session's remote address passed ICE (STUN MESSAGE-INTEGRITY) and DTLS:
+    /// the front door may put it on the established path. Returns whether it
+    /// was accepted (the set is capped).
+    fn validated(&mut self, peer: SocketAddr) -> bool;
+    /// A previously validated address is no longer used by any session.
+    fn invalidated(&mut self, peer: SocketAddr);
+}
+
 /// The single-socket WebRTC endpoint: ONE bound dual-stack UDP socket and ONE
 /// TURN relay driver, shared by every WebRTC role (ADR-0048 §4).
 ///
@@ -250,7 +293,25 @@ impl UnifiedEndpoint {
     ///
     /// [`WebRtcError::Socket`] / [`WebRtcError::Config`] if the bind fails.
     pub fn bind(config: EndpointConfig) -> Result<UnifiedBuilder> {
-        let endpoint = WebRtcEndpoint::bind(config.clone())?;
+        Self::builder(config.clone(), WebRtcEndpoint::bind(config)?)
+    }
+
+    /// Start a [`UnifiedBuilder`] on a socket shared with a front door
+    /// (ADR-0107): `socket` is a send descriptor of the shared socket, and the
+    /// endpoint is then driven with [`run_shared`](Self::run_shared).
+    ///
+    /// # Errors
+    ///
+    /// [`WebRtcError::Config`] / [`WebRtcError::Socket`] as for
+    /// [`WebRtcEndpoint::from_socket`].
+    pub fn with_shared_socket(
+        config: EndpointConfig,
+        socket: std::net::UdpSocket,
+    ) -> Result<UnifiedBuilder> {
+        Self::builder(config.clone(), WebRtcEndpoint::from_socket(config, socket)?)
+    }
+
+    fn builder(config: EndpointConfig, endpoint: WebRtcEndpoint) -> Result<UnifiedBuilder> {
         let host_candidates = endpoint.host_candidates()?;
         Ok(UnifiedBuilder {
             endpoint: Self {
@@ -546,6 +607,188 @@ impl UnifiedEndpoint {
                         ).await;
                     }
                 }
+            }
+        }
+    }
+
+    /// Run the driver on a socket shared through a front door (ADR-0107 slice
+    /// 1): receive from `inbound` (never from the socket), send on the
+    /// endpoint's own descriptor (a duplicate of the shared socket), and report
+    /// validated peers back so the dispatcher can tell established flows from
+    /// new ones. Same bounded per-wake budget and servicing handoff as
+    /// [`run`](Self::run). Spawn it on the front door's runtime.
+    ///
+    /// # Errors
+    ///
+    /// [`WebRtcError::Socket`] if converting the send socket to async fails.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one select! loop, mirroring run_inner_body for the shared-socket input"
+    )]
+    pub async fn run_shared<I: SharedInbound>(
+        self,
+        mut inbound: I,
+        stop: Arc<AtomicBool>,
+    ) -> Result<()> {
+        let probe = RunProbe::default();
+        let bind_addr = self.endpoint.config().bind_addr();
+        let local_addr = self.endpoint.local_addr()?;
+        let concrete_candidates: Vec<SocketAddr> = self
+            .host_candidates
+            .iter()
+            .copied()
+            .filter(|a| !a.ip().is_unspecified())
+            .collect();
+        let mut turn = TurnRelayDriver::from_config(&self.config, Instant::now());
+        let std_socket = self.endpoint.into_socket();
+        std_socket
+            .set_nonblocking(true)
+            .map_err(|source| WebRtcError::Socket {
+                addr: bind_addr,
+                source,
+            })?;
+        let socket =
+            tokio::net::UdpSocket::from_std(std_socket).map_err(|source| WebRtcError::Socket {
+                addr: bind_addr,
+                source,
+            })?;
+        let mut ingest = self.ingest;
+        let mut serve = self.serve;
+        let preview = self.preview;
+        let mut push = self.push;
+        let mut tick = tokio::time::interval(DRIVER_TICK);
+        // Bounded by the session caps: one entry per validated session peer.
+        let mut reported: std::collections::HashSet<SocketAddr> = std::collections::HashSet::new();
+        let mut current: Vec<SocketAddr> = Vec::new();
+
+        loop {
+            if stop.load(Ordering::Acquire) {
+                for peer in reported.drain() {
+                    inbound.invalidated(peer);
+                }
+                return Ok(());
+            }
+            tokio::select! {
+                biased;
+                _ = tick.tick() => {
+                    let now = Instant::now();
+                    Self::service_timers_and_gc(
+                        &socket, &mut turn,
+                        &mut ingest, &mut serve, preview.as_ref(), &mut push,
+                        local_addr, now, &probe,
+                        #[cfg(test)]
+                        ServiceOrigin::IdleTick,
+                    ).await;
+                    current.clear();
+                    Self::validated_peers(ingest.as_ref(), serve.as_ref(), preview.as_ref(), &push, &mut current);
+                    Self::sync_validated(&mut inbound, &mut reported, &current);
+                }
+                first = std::future::poll_fn(|cx| inbound.poll_next(cx)) => {
+                    let Some(first) = first else {
+                        // The dispatcher is gone: the front door shut down.
+                        return Ok(());
+                    };
+                    let now = Instant::now();
+                    let started = Instant::now();
+                    let mut next = Some(first);
+                    let mut read = 0usize;
+                    while let Some(d) = next.take() {
+                        read += 1;
+                        // No PKTINFO on a wildcard-bound socket: the concrete
+                        // local destination is unknown, so drop the datagram
+                        // rather than map it onto a guessed candidate, exactly
+                        // as the socket-owning driver does (defect #3).
+                        let Some(dst_ip) = d
+                            .dst_ip
+                            .or_else(|| (!local_addr.ip().is_unspecified()).then(|| local_addr.ip()))
+                        else {
+                            if read < MAX_DATAGRAMS_PER_WAKE && started.elapsed() < MAX_DRAIN_TIME {
+                                next = inbound.try_next();
+                            }
+                            continue;
+                        };
+                        let arrival = SocketAddr::new(dst_ip, local_addr.port());
+                        let dst = crate::transport::resolve_local_destination(arrival, &concrete_candidates);
+                        Self::route_inbound(
+                            &mut turn, ingest.as_mut(), serve.as_mut(), preview.as_ref(), &mut push,
+                            d.src, dst, &d.payload, now,
+                        );
+                        if read < MAX_DATAGRAMS_PER_WAKE && started.elapsed() < MAX_DRAIN_TIME {
+                            next = inbound.try_next();
+                        }
+                    }
+                    if read >= MAX_DATAGRAMS_PER_WAKE || started.elapsed() >= MAX_DRAIN_TIME {
+                        // Budget spent with input possibly still queued: the same
+                        // bounded handoff as the socket-owning driver.
+                        tokio::task::yield_now().await;
+                        Self::service_timers_and_gc(
+                            &socket, &mut turn,
+                            &mut ingest, &mut serve, preview.as_ref(), &mut push,
+                            local_addr, now, &probe,
+                            #[cfg(test)]
+                            ServiceOrigin::ExhaustionHandoff,
+                        ).await;
+                    } else {
+                        Self::pump_all(
+                            &socket, &mut turn,
+                            ingest.as_mut(), serve.as_mut(), preview.as_ref(), &mut push,
+                            local_addr, now,
+                            #[cfg(test)]
+                            &probe,
+                            #[cfg(test)]
+                            ServiceOrigin::DrainedDry,
+                        ).await;
+                    }
+                }
+            }
+        }
+    }
+
+    /// Every connected session's ICE-validated remote address, across roles.
+    fn validated_peers(
+        ingest: Option<&IngestLane>,
+        serve: Option<&ServeLane>,
+        preview: Option<&Arc<crate::whep_egress::WhepEgress>>,
+        push: &[PushLane],
+        out: &mut Vec<SocketAddr>,
+    ) {
+        if let Some(lane) = ingest {
+            WhipEndpoint::validated_peers(&lane.sessions, out);
+        }
+        if let Some(lane) = serve {
+            WhepServeEndpoint::validated_peers(&lane.viewers, out);
+        }
+        if let Some(preview) = preview {
+            out.extend(preview.validated_peers());
+        }
+        out.extend(push.iter().filter_map(PushLane::validated_peer));
+        // One key per peer however the dual-stack socket reported it (an IPv4
+        // peer arrives IPv4-mapped on the socket path, native IPv4 through a
+        // TURN relay), and one entry per address however many sessions use it.
+        for peer in out.iter_mut() {
+            *peer = canonical_peer(*peer);
+        }
+        out.sort_unstable();
+        out.dedup();
+    }
+
+    /// Report the difference between `current` and what was last reported.
+    fn sync_validated<I: SharedInbound>(
+        inbound: &mut I,
+        reported: &mut std::collections::HashSet<SocketAddr>,
+        current: &[SocketAddr],
+    ) {
+        // `current` is canonical, sorted and deduplicated.
+        reported.retain(|peer| {
+            let keep = current.binary_search(peer).is_ok();
+            if !keep {
+                inbound.invalidated(*peer);
+            }
+            keep
+        });
+        for peer in current {
+            if !reported.contains(peer) && inbound.validated(*peer) {
+                reported.insert(*peer);
             }
         }
     }
@@ -865,6 +1108,57 @@ impl UnifiedEndpoint {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A recording `SharedInbound` (no datagrams), for the validated-peer sync.
+    #[derive(Default)]
+    struct Recorder {
+        events: Vec<(SocketAddr, bool)>,
+    }
+
+    impl SharedInbound for Recorder {
+        fn poll_next(
+            &mut self,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Option<InboundDatagram>> {
+            std::task::Poll::Pending
+        }
+        fn try_next(&mut self) -> Option<InboundDatagram> {
+            None
+        }
+        fn validated(&mut self, peer: SocketAddr) -> bool {
+            self.events.push((peer, true));
+            true
+        }
+        fn invalidated(&mut self, peer: SocketAddr) {
+            self.events.push((peer, false));
+        }
+    }
+
+    /// Review finding (PR 315): a peer seen IPv4-mapped on one path and native
+    /// IPv4 on another must be one established entry with no per-tick churn.
+    #[test]
+    fn mapped_and_native_reports_of_one_peer_are_one_entry_without_churn() {
+        let mapped: SocketAddr = "[::ffff:192.0.2.9]:5000".parse().unwrap();
+        let native: SocketAddr = "192.0.2.9:5000".parse().unwrap();
+        let mut rec = Recorder::default();
+        let mut reported = std::collections::HashSet::new();
+        for _tick in 0..5 {
+            let mut current = vec![mapped, native];
+            for p in &mut current {
+                *p = canonical_peer(*p);
+            }
+            current.sort_unstable();
+            current.dedup();
+            UnifiedEndpoint::sync_validated(&mut rec, &mut reported, &current);
+        }
+        assert_eq!(
+            rec.events,
+            vec![(native, true)],
+            "one insert, no remove/insert churn"
+        );
+        UnifiedEndpoint::sync_validated(&mut rec, &mut reported, &[]);
+        assert_eq!(rec.events.last(), Some(&(native, false)));
+    }
     use std::net::{Ipv6Addr, SocketAddrV6, UdpSocket};
 
     /// Count queued UDP datagrams with Linux's advancing peek cursor. No read

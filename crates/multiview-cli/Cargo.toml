@@ -75,6 +75,10 @@ multiview-preview = { workspace = true }
 # link it and stay GPU/native-free; `cargo deny` scans the default build only
 # (`all-features = false`), so the str0m closure never enters the deny graph.
 multiview-webrtc = { workspace = true, optional = true }
+# The network front door (ADR-0107): one UDP socket for MoQ and WebRTC on its
+# own runtime. Pure Rust in the default build; its WebRTC adapter (str0m) is
+# enabled only by `webrtc-native`.
+multiview-frontdoor = { workspace = true }
 # The `whip_push` output's HTTP signalling (ADR-0049 §5.2): the WHIP `POST`
 # offer->answer against the remote origin (Bearer, https-only 307/308 redirects).
 # OPTIONAL, pulled in ONLY by `webrtc-native`; pinned to the `rustls-tls` backend
@@ -328,6 +332,7 @@ webrtc-native = [
     "webrtc",
     "dep:multiview-webrtc",
     "multiview-webrtc/native",
+    "multiview-frontdoor/webrtc",
     "dep:reqwest",
     "ffmpeg",
 ]
@@ -362,6 +367,11 @@ sqlite = ["multiview-control/sqlite"]
 # default (no native TLS dep in the baseline build); included in the shipped
 # umbrella presets below so the deploy images can terminate HTTPS without a proxy.
 tls = ["multiview-control/tls"]
+
+# The front-door ACME issuance engine (slice 5, ADR-0107 §5a, #291): library only
+# in this release; boot wiring and the `multiview tls` CLI land with the next
+# slice, so it is deliberately NOT in any preset yet. Implies `tls`.
+acme = ["tls", "multiview-control/acme"]
 
 # mDNS/DNS-SD managed-device discovery (DEV-A5 / ADR-M008 §6 / ADR-0041): install
 # the real `mdns-sd`-backed browser so `POST /api/v1/discovery/devices/scan`

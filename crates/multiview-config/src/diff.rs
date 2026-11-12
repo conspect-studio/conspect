@@ -201,6 +201,7 @@ impl ConfigDiff {
             network_diagnostics: running_network_diagnostics,
             timing: running_timing,
             webrtc: running_webrtc,
+            network: running_network,
             system: running_system,
             media_library: running_media_library,
             media_players: running_media_players,
@@ -236,6 +237,7 @@ impl ConfigDiff {
             network_diagnostics: next_network_diagnostics,
             timing: next_timing,
             webrtc: next_webrtc,
+            network: next_network,
             system: next_system,
             media_library: next_media_library,
             media_players: next_media_players,
@@ -279,7 +281,7 @@ impl ConfigDiff {
         let media_changed = running_media_library != next_media_library
             || running_media_players != next_media_players;
         let mut changed_sections = BTreeSet::new();
-        let sectioned: [(&'static str, bool); 28] = [
+        let sectioned: [(&'static str, bool); 29] = [
             (
                 "schema_version",
                 running_schema_version != next_schema_version,
@@ -324,6 +326,7 @@ impl ConfigDiff {
                 "network_diagnostics",
                 running_network_diagnostics != next_network_diagnostics,
             ),
+            ("network", running_network != next_network),
             ("timing", running_timing != next_timing),
             ("webrtc", running_webrtc != next_webrtc),
             // A change to `[system.ndi]` license acceptance is restart-class: full

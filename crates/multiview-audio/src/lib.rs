@@ -64,6 +64,7 @@ pub mod cadence;
 pub mod capability;
 pub mod chanmap;
 pub mod correlation;
+pub mod crossfade;
 #[cfg(feature = "ffmpeg")]
 pub mod decode;
 pub mod error;

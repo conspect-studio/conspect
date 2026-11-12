@@ -268,37 +268,11 @@ struct StreamPlan {
     binding_ids: Vec<Option<String>>,
 }
 
-/// Is this document's canvas one the first slice can drive as a real M/E bus?
-///
-/// Exactly one full-canvas, fully opaque, unclipped, non-overlay cell bound to
-/// the declared `program_source` — the shape the engine treats as the
-/// source-agnostic bus canvas. An unsupported opted-in layout is refused with a
-/// typed error instead of silently replacing the operator's multiview.
-#[allow(clippy::float_cmp)]
-// reason: authored layout fractions compared against their exact canonical
-// values; an approximate comparison would admit a windowed/tiled canvas as
-// "full canvas" and change which sources the buses admit.
-fn first_slice_me_layout_supported(
-    layout: &Layout,
-    config: &MultiviewConfig,
-    me: &multiview_config::MixEffectsConfig,
-) -> bool {
-    layout.cells.len() == 1
-        && config.overlays.is_empty()
-        && !config.cells.first().is_some_and(|cell| {
-            cell.corner_radius.is_some()
-                || cell.border.is_some()
-                || cell.fit.as_deref().is_some_and(|fit| fit != "fill")
-                || cell.visible == Some(false)
-        })
-        && layout.cells.first().is_some_and(|cell| {
-            cell.x == 0.0 && cell.y == 0.0 && cell.w == 1.0 && cell.h == 1.0 && cell.opacity == 1.0
-        })
-        && config
-            .cells
-            .first()
-            .and_then(|cell| cell.source.input_id.as_deref())
-            == Some(me.program_source.as_str())
+/// ADR-0108 slice 1, step 1 start-up refusal; the rule itself lives in
+/// [`multiview_config::outputs_carry_program`] so start-up and `multiview
+/// validate` share it (#317).
+fn ensure_outputs_carry_program(config: &MultiviewConfig) -> Result<(), PipelineError> {
+    multiview_config::outputs_carry_program(config).map_err(PipelineError::Engine)
 }
 
 /// Errors building or running the libav\* pipeline.
@@ -1463,6 +1437,127 @@ segment_ms = 1000
 }
 
 #[cfg(test)]
+mod failed_build_release_tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+    use super::{retained_lifecycle_ids, Pipeline};
+    use multiview_config::MultiviewConfig;
+
+    /// #317 review (lens 3): a build that fails AFTER reserving live lifecycle
+    /// epochs releases them, so a fallback build in the same process starts
+    /// clean (no orphaned process-wide registry entries).
+    #[test]
+    fn a_failed_build_releases_its_live_lifecycle_registrations() {
+        let doc = r##"schema_version = 1
+[canvas]
+width = 64
+height = 64
+fps = "25/1"
+pixel_format = "nv12"
+background = "#000000"
+[canvas.color]
+profile = "sdr-bt709-limited"
+[layout]
+kind = "absolute"
+[[sources]]
+id = "failedbuild_cam"
+kind = "bars"
+[[cells]]
+id = "c"
+rect = { x = 0.0, y = 0.0, w = 1.0, h = 1.0 }
+[cells.source]
+input_id = "failedbuild_cam"
+[[outputs]]
+kind = "hls"
+path = "/tmp/failed-build-release.m3u8"
+codec = "mpeg2video"
+segment_ms = 1000
+"##;
+        let mut config = MultiviewConfig::load_from_toml(doc).expect("parses");
+        // No runnable output: the build reserves its sources, then fails.
+        config.outputs.clear();
+        assert!(Pipeline::build(&config).is_err(), "the build fails");
+        assert_eq!(retained_lifecycle_ids("failedbuild_"), (0, 0));
+        assert_eq!(
+            crate::hls_fetch::retained_ids("failedbuild_"),
+            0,
+            "fetch map too"
+        );
+    }
+
+    /// Review round 2 (lens 3): a failed build never retires an id that was
+    /// already live in this process before it.
+    #[test]
+    fn a_failed_build_keeps_an_id_that_was_already_live() {
+        let id = "keeplive_cam";
+        let before = super::begin_live_lifecycle(id);
+        let doc = format!(
+            "schema_version = 1\n[canvas]\nwidth = 64\nheight = 64\nfps = \"25/1\"\npixel_format = \"nv12\"\nbackground = \"#000000\"\n[canvas.color]\nprofile = \"sdr-bt709-limited\"\n[layout]\nkind = \"absolute\"\n[[sources]]\nid = \"{id}\"\nkind = \"bars\"\n[[cells]]\nid = \"c\"\nrect = {{ x = 0.0, y = 0.0, w = 1.0, h = 1.0 }}\n[cells.source]\ninput_id = \"{id}\"\n[[outputs]]\nkind = \"hls\"\npath = \"/tmp/failed-build-live.m3u8\"\ncodec = \"mpeg2video\"\nsegment_ms = 1000\n"
+        );
+        let mut config = MultiviewConfig::load_from_toml(&doc).expect("parses");
+        config.outputs.clear();
+        assert!(Pipeline::build(&config).is_err());
+        assert_ne!(
+            super::live_lifecycle(id),
+            0,
+            "the live id keeps a lifecycle"
+        );
+        assert_eq!(retained_lifecycle_ids("keeplive_"), (1, 1));
+        super::remove_live_lifecycle(id);
+        let _ = before;
+    }
+}
+
+#[cfg(test)]
+mod output_feed_guard_tests {
+    use super::ensure_outputs_carry_program;
+    use multiview_config::MultiviewConfig;
+
+    const DOC: &str = r##"
+schema_version = 1
+[canvas]
+width = 64
+height = 64
+fps = "25/1"
+pixel_format = "nv12"
+background = "#000000"
+[canvas.color]
+profile = "sdr-bt709-limited"
+[layout]
+kind = "grid"
+columns = ["1fr"]
+rows = ["1fr"]
+areas = ["a"]
+[[sources]]
+id = "a"
+kind = "test"
+[[cells]]
+id = "c"
+area = "a"
+[cells.source]
+input_id = "a"
+[[outputs]]
+id = "o"
+kind = "hls"
+path = "/tmp/output-feed-guard/index.m3u8"
+codec = "mpeg2video"
+segment_ms = 1000
+"##;
+
+    #[test]
+    fn default_program_outputs_run_and_a_source_feed_is_refused_loudly() {
+        let plain = MultiviewConfig::load_from_toml(DOC).expect("parses");
+        assert!(ensure_outputs_carry_program(&plain).is_ok());
+        let routed = MultiviewConfig::load_from_toml(&format!(
+            "{DOC}\n[[routing.output]]\noutput = \"o\"\nvideo = {{ source = \"a\" }}\n"
+        ))
+        .expect("parses");
+        routed.validate().expect("valid");
+        let err = ensure_outputs_carry_program(&routed).expect_err("refused");
+        assert!(err.to_string().contains("src:a"), "{err}");
+    }
+}
+
+#[cfg(test)]
 mod encoder_format_tests {
     use super::{encoder_input_format, output_codec};
     use ffmpeg_next::format::Pixel;
@@ -1689,6 +1784,19 @@ impl RunnableOutput {
         }
     }
 }
+
+/// The running Program's wait-free metric handles (ADR-0108 §10).
+#[derive(Debug, Clone)]
+pub struct ProgramMetricsHandles {
+    /// Tick lateness histogram.
+    pub lateness: Arc<multiview_engine::lateness::TickLateness>,
+    /// Cumulative last-good repeats.
+    pub frames_repeated: Arc<std::sync::atomic::AtomicU64>,
+}
+
+/// Where a run publishes its [`ProgramMetricsHandles`].
+pub type ProgramMetricsSlot =
+    Arc<multiview_framestore::SwapCell<Option<Arc<ProgramMetricsHandles>>>>;
 
 /// A built, ready-to-run pipeline.
 pub struct Pipeline {
@@ -1959,6 +2067,10 @@ pub struct Pipeline {
     /// Distinct concrete video encoders and one key per runnable output.
     rendition_configs: Vec<EncodeConfig>,
     output_video_keys: Vec<usize>,
+    /// Per runnable output (same order as `output_video_keys`): its muxer
+    /// reads decoder configuration in band (MPEG-TS), so a routing move onto
+    /// changed parameter sets may splice (output-routing.md §4.2 step 4).
+    output_inband_sets: Vec<bool>,
     output_audio_tracks: Vec<Vec<usize>>,
     /// Outputs that EXPLICITLY declared an audio selection (per output: the id
     /// and its full declared track list). Drives the run-time truthful binding:
@@ -2037,6 +2149,13 @@ pub struct Pipeline {
     /// startup) loads it lock-free to attach shared-rendition subscribers. The
     /// cell exists from build time; the factory appears when the egress starts.
     window_subscriptions: crate::output_window_registry::WindowSubscriptionSlot,
+    /// The output-routing take handle of the current (or last) run (ADR-0108
+    /// slice 1). Published off-clock when the egress starts; the control plane
+    /// loads it lock-free to enqueue takes and read the routing snapshot.
+    output_routing: crate::output_routing::OutputRoutingSlot,
+    /// The running Program's lateness histogram + repeats counter (ADR-0108
+    /// §10), published at run start for the control plane's metrics route.
+    program_metrics: ProgramMetricsSlot,
     optional_preview: Option<crate::preview_vertical::PreviewStartup>,
     /// The run's **real** authorization axes for every effective output (t65):
     /// the implicit program the legacy config desugars to, plus each ingest
@@ -2409,6 +2528,31 @@ impl Pipeline {
     // ingest plan per source, wires native captions, and assembles the outputs —
     // each step is in-scope and splitting it would only scatter the wiring.
     pub fn build(config: &MultiviewConfig) -> Result<Self, PipelineError> {
+        // #317: a failed build may already have reserved live lifecycle
+        // epochs/anchor slots/fetch registrations for its sources
+        // (process-wide registries). Release ONLY the ids this build created
+        // (none before it): an id another live pipeline in this process owns is
+        // never retired by someone else's failed build.
+        let unreserved: Vec<&str> = config
+            .sources
+            .iter()
+            .map(|source| source.id.as_str())
+            .filter(|id| live_lifecycle(id) == 0)
+            .collect();
+        let built = Self::build_inner(config);
+        if built.is_err() {
+            for id in unreserved {
+                if live_lifecycle(id) != 0 {
+                    remove_live_lifecycle(id);
+                }
+            }
+        }
+        built
+    }
+
+    #[allow(clippy::too_many_lines)]
+    // reason: see `build`.
+    fn build_inner(config: &MultiviewConfig) -> Result<Self, PipelineError> {
         // Fail-closed (#103): an AES67 PCM-audio source in a non-`aes67` build is a
         // config this binary cannot honour — reject it clearly up front, never wire
         // it dark (the same contract as a `display` source/output in a non-
@@ -2434,11 +2578,15 @@ impl Pipeline {
         // legacy multiview with multiple cells remains untouched when the M/E
         // block is absent; an opted-in unsupported layout fails loudly instead
         // of replacing the operator's canvas with a guessed source.
-        if let Some(me) = &switcher_me {
-            if !first_slice_me_layout_supported(&layout, config, me) {
-                return Err(PipelineError::Engine("first-slice M/E requires one full-canvas source cell initially bound to program_source; multi-cell layouts are not replaced".into()));
-            }
-        }
+        // The SAME admission rules the control plane applies before it persists an
+        // accepted state (#317): `multiview_config::switcher_canvas_admission`,
+        // and (ADR-0108 slice 1, step 1) `outputs_carry_program`: an output fed
+        // directly by a source is validated and read back, but this engine does
+        // not carry it yet — fail loudly rather than put Program on it.
+        config
+            .switcher_canvas_admission(&layout)
+            .map_err(|refusal| PipelineError::Engine(refusal.to_string()))?;
+        ensure_outputs_carry_program(config)?;
         let switcher_cell_id = switcher_me
             .as_ref()
             .and_then(|_| config.cells.first().map(|cell| cell.id.clone()));
@@ -2818,6 +2966,7 @@ impl Pipeline {
         apply_output_audio_selections(&mut outputs, &config.outputs, &discrete_tracks);
         let mut rendition_configs = Vec::<EncodeConfig>::new();
         let mut output_video_keys = Vec::with_capacity(outputs.len());
+        let mut output_inband_sets = Vec::with_capacity(outputs.len());
         let mut output_audio_tracks = Vec::with_capacity(outputs.len());
         let mut declared_audio_outputs: Vec<(String, Vec<usize>)> = Vec::new();
         for output in &outputs {
@@ -2842,6 +2991,12 @@ impl Pipeline {
                 rendition_configs.len() - 1
             };
             output_video_keys.push(key);
+            let ll_hls = config
+                .outputs
+                .iter()
+                .find(|item| item.id() == output.id())
+                .is_some_and(|item| matches!(item, multiview_config::Output::LlHls { .. }));
+            output_inband_sets.push(!ll_hls && inband_parameter_changes_ok(output));
             let audio_selection = match output {
                 RunnableOutput::File { sink, .. }
                 | RunnableOutput::Hls { sink, .. }
@@ -3038,6 +3193,7 @@ impl Pipeline {
             encode_cfg: cfg,
             rendition_configs,
             output_video_keys,
+            output_inband_sets,
             output_audio_tracks,
             declared_audio_outputs,
             outputs,
@@ -3074,6 +3230,8 @@ impl Pipeline {
             epoch_anchor: crate::timing_status::anchor_slot(),
             program_audio_preview: None,
             window_subscriptions: crate::output_window_registry::window_subscription_slot(),
+            output_routing: crate::output_routing::output_routing_slot(),
+            program_metrics: Arc::new(multiview_framestore::SwapCell::empty()),
             optional_preview: None,
             window_dependencies: Arc::new(window_dependency_axes(config)),
         })
@@ -3247,6 +3405,110 @@ impl Pipeline {
     #[must_use]
     pub fn live_ingest_spawner(&self) -> Arc<dyn crate::live_sources::IngestSpawner> {
         Arc::new(self.live_spawner())
+    }
+
+    /// Build one run's output routing (ADR-0108 slice 1): the clock's aux tick
+    /// sender, the `routing-aux` thread, and the consumer's router with its
+    /// base forced-IDR cells. Publishes the take handle into
+    /// [`Self::output_routing`]. Nothing here runs per tick.
+    fn build_output_routing(
+        &self,
+        binding_ids: &[Option<String>],
+    ) -> Result<RunRouting, PipelineError> {
+        let spawn_err = |e: std::io::Error| PipelineError::Output {
+            kind: "routing",
+            reason: e.to_string(),
+        };
+        let (aux_tx, aux_rx) = multiview_engine::aux_tick_channel();
+        let catalogue = Arc::clone(&self.catalogue);
+        let boot = self.stores.clone();
+        let stores: crate::routing_aux::StoreLookup = Arc::new(move |id: &str| {
+            catalogue
+                .load()
+                .get(id)
+                .map(|entry| Arc::clone(entry.store()))
+                .or_else(|| boot.get(id).cloned())
+        });
+        let has_preview = self.switcher_driver.is_some();
+        let preview_selection: Option<Arc<multiview_framestore::SwapCell<Option<Arc<str>>>>> =
+            has_preview.then(|| Arc::new(multiview_framestore::SwapCell::new(None)));
+        let feeds: crate::routing_aux::AuxFeeds =
+            Arc::new(multiview_framestore::SwapCell::from_pointee(Vec::new()));
+        let aux = crate::routing_aux::spawn_routing_aux(crate::routing_aux::AuxInputs {
+            rx: aux_rx,
+            feeds: Arc::clone(&feeds),
+            stores: Arc::clone(&stores),
+            preview_selection: preview_selection.clone(),
+            canvas: crate::routing_aux::AuxCanvas {
+                width: self.encode_cfg.width,
+                height: self.encode_cfg.height,
+                color: self.canvas_color.output_tag(),
+            },
+        })
+        .map_err(spawn_err)?;
+        let base_force: Vec<Arc<AtomicU64>> = self
+            .rendition_configs
+            .iter()
+            .map(|_| crate::output_routing::force_cell())
+            .collect();
+        let configs = self.rendition_configs.clone();
+        let open: crate::output_routing::OpenFn = Box::new(move |settings| {
+            let cfg = configs
+                .get(settings)
+                .ok_or_else(|| "unknown rendition settings".to_owned())?;
+            let encoder = VideoRenditionEncoder::new(cfg).map_err(|e| e.to_string())?;
+            let live: Box<dyn crate::output_routing::LiveEncoder> =
+                Box::new(PipelineVideoWorker(encoder));
+            Ok(live)
+        });
+        let (router, handle) = crate::output_routing::OutputRouter::new(
+            crate::output_routing::RouterConfig {
+                cadence: self.encode_cfg.cadence,
+                gop: self.encode_cfg.gop.max(1),
+                base_keys: self.output_video_keys.clone(),
+                base_force: base_force.clone(),
+                max_encoders: crate::output_routing::DEFAULT_MAX_ENCODERS,
+                max_per_principal: crate::output_routing::DEFAULT_MAX_PER_PRINCIPAL,
+                has_preview,
+            },
+            crate::output_routing::AuxWiring {
+                feeds,
+                active: aux_tx.active_flag(),
+                failed: Arc::clone(&aux.failed),
+                dropped: aux_tx.dropped_counter(),
+                sent: aux_tx.sent_counter(),
+                stores,
+                preview_selection: preview_selection.clone(),
+            },
+            open,
+        )
+        .map_err(spawn_err)?;
+        // Router index i = runner i: the id the control plane addresses, the
+        // Program settings, and whether slice 1 can cut that encoder family.
+        let run_outputs = self
+            .output_video_keys
+            .iter()
+            .enumerate()
+            .map(|(index, &settings)| crate::output_routing::RunOutput {
+                id: binding_ids.get(index).cloned().flatten(),
+                settings,
+                routable: self.rendition_configs.get(settings).is_some_and(|cfg| {
+                    !(cfg.codec_name.contains("vaapi") || cfg.codec_name.contains("videotoolbox"))
+                }),
+            })
+            .collect();
+        self.output_routing
+            .store(Some(Arc::new(handle.with_outputs(run_outputs))));
+        Ok(RunRouting {
+            consumer: ConsumerRouting {
+                router: Box::new(router),
+                base_force,
+                inband_sets: self.output_inband_sets.clone(),
+            },
+            aux_tx,
+            preview_selection,
+            aux,
+        })
     }
 
     /// Every catalogued source's frame store, keyed by id.
@@ -3571,6 +3833,28 @@ impl Pipeline {
     #[must_use]
     pub fn window_subscriptions(&self) -> crate::output_window_registry::WindowSubscriptionSlot {
         Arc::clone(&self.window_subscriptions)
+    }
+
+    /// How many distinct video rendition configs (= Program encoder keys)
+    /// this pipeline opens per run.
+    #[cfg(test)]
+    pub(crate) fn rendition_config_count(&self) -> usize {
+        self.rendition_configs.len()
+    }
+
+    /// The run's output-routing handle slot (ADR-0108 slice 1): empty until a
+    /// run starts its egress, then this run's
+    /// [`OutputRoutingHandle`](crate::output_routing::OutputRoutingHandle)
+    /// (take mailbox, wait-free snapshot, outcome stream).
+    #[must_use]
+    pub fn output_routing(&self) -> crate::output_routing::OutputRoutingSlot {
+        Arc::clone(&self.output_routing)
+    }
+
+    /// The running Program's metric handles (empty until a run starts).
+    #[must_use]
+    pub fn program_metrics(&self) -> ProgramMetricsSlot {
+        Arc::clone(&self.program_metrics)
     }
 
     /// The control-plane adapter for this exact run's canonical registry slot.
@@ -3924,6 +4208,8 @@ impl Pipeline {
         if !live {
             if let Some(hls_key) = hls_key {
                 self.output_video_keys.insert(0, hls_key);
+                // The anchor is a `program.ts` file: MPEG-TS, in band.
+                self.output_inband_sets.insert(0, true);
                 self.output_audio_tracks
                     .insert(0, hls_audio.unwrap_or_default());
             }
@@ -4558,6 +4844,16 @@ impl Pipeline {
         let bake_ctx = self.bake_context();
         #[cfg(feature = "overlay")]
         let tile_spec_apply = Arc::clone(&self.tile_spec_apply);
+        // Output routing (ADR-0108 slice 1): the clock's aux tick sender (inert
+        // until a take routes a feed), the off-clock `routing-aux` thread (it
+        // blocks on recv while nothing is routed), and the consumer's router.
+        let routing = self.build_output_routing(&binding_ids)?;
+        let RunRouting {
+            consumer: consumer_routing,
+            aux_tx,
+            preview_selection,
+            aux: _routing_aux,
+        } = routing;
         demand.start();
         let (egress, hot_tx) = StreamEgress::spawn(
             bake_ctx,
@@ -4590,6 +4886,7 @@ impl Pipeline {
             live_track_inputs,
             #[cfg(feature = "aes67")]
             aes67_send_handles,
+            consumer_routing,
         );
 
         // Build the single program now (post-prime, ADR-0030 MP-0): the run path
@@ -4612,6 +4909,13 @@ impl Pipeline {
                     program: self.program_spec.id.clone(),
                     reason: e.to_string(),
                 })?;
+        // Publish the Program's wait-free counters for the metrics route
+        // (one store per run, never per tick).
+        self.program_metrics
+            .store(Some(Arc::new(ProgramMetricsHandles {
+                lateness: program.lateness(),
+                frames_repeated: program.frames_repeated_counter(),
+            })));
         // Publish the run's epoch anchor (tick-0 seed + monotonic source) into
         // the shared slot — a single lock-free store the off-hot-path
         // timing-status task reads to derive the outbound presentation epoch.
@@ -4955,28 +5259,45 @@ impl Pipeline {
             );
             hook.preview_slot = Some(preview_slot);
             hook.preview_stores = Some(self.catalogue_stores());
+            hook.preview_selection = preview_selection;
+            // The only clock-side routing duty: one non-blocking `try_send`
+            // after a fresh compose, and only while a routed feed is active.
+            // The engine run future is boxed (one allocation per run, never
+            // per tick) so the hook's state does not inflate this future.
+            let hook = multiview_engine::WithAuxTick {
+                inner: hook,
+                aux: aux_tx,
+            };
             match max_ticks {
                 Some(max) => {
-                    program
-                        .run_for_with_frame_control(publisher, max, state_of, event_of, hook)
-                        .await
+                    Box::pin(
+                        program
+                            .run_for_with_frame_control(publisher, max, state_of, event_of, hook),
+                    )
+                    .await
                 }
                 None => {
-                    program
-                        .run_with_frame_control(publisher, state_of, event_of, hook)
+                    Box::pin(program.run_with_frame_control(publisher, state_of, event_of, hook))
                         .await
                 }
             }
         } else {
+            // `ClosureControl` calls `control` exactly as `run_with_control`'s
+            // adapter does (before every compose and on every repeat).
+            let hook = multiview_engine::WithAuxTick {
+                inner: multiview_engine::ClosureControl(control),
+                aux: aux_tx,
+            };
             match max_ticks {
                 Some(max) => {
-                    program
-                        .run_for_with_control(publisher, max, state_of, event_of, control)
-                        .await
+                    Box::pin(
+                        program
+                            .run_for_with_frame_control(publisher, max, state_of, event_of, hook),
+                    )
+                    .await
                 }
                 None => {
-                    program
-                        .run_with_control(publisher, state_of, event_of, control)
+                    Box::pin(program.run_with_frame_control(publisher, state_of, event_of, hook))
                         .await
                 }
             }
@@ -5832,6 +6153,7 @@ impl StreamEgress {
         #[cfg(feature = "aes67")] aes67_send_handles: Vec<
             multiview_output::aes67::Aes67SenderHandle,
         >,
+        routing: ConsumerRouting,
     ) -> (Self, SyncSender<StreamItem>) {
         let in_flight = Arc::new(AtomicI64::new(0));
         let peak_occupancy = Arc::new(AtomicUsize::new(0));
@@ -6087,6 +6409,7 @@ impl StreamEgress {
                     #[cfg(feature = "aes67")]
                     aes67_send_handles,
                     &consumer_in_flight,
+                    routing,
                 );
                 // The seam's fault fires only when the consumer itself finished
                 // healthy on its (shortened) input: its real outcome is replaced
@@ -6717,6 +7040,32 @@ fn drive_audio_for_item(
     bus.tick_to(tick_index.saturating_add(1))
 }
 
+/// One run's output routing, split between the clock and the consumer.
+struct RunRouting {
+    consumer: ConsumerRouting,
+    /// The clock's non-blocking aux tick sender.
+    aux_tx: multiview_engine::AuxTickSender,
+    /// The M/E's PVW source id cell (switcher runs only).
+    preview_selection: Option<Arc<multiview_framestore::SwapCell<Option<Arc<str>>>>>,
+    /// The aux thread; dropping it never joins (the thread ends when the
+    /// clock's sender drops).
+    aux: crate::routing_aux::RoutingAuxHandle,
+}
+
+/// Output-routing state the bake consumer owns for one run (ADR-0108).
+struct ConsumerRouting {
+    /// Boxed: this value lives across the run's awaits, and inline it grew
+    /// the run future past `clippy::large_futures`.
+    router: Box<crate::output_routing::OutputRouter>,
+    /// Per base video key: its worker's forced-IDR request cell.
+    base_force: Vec<Arc<AtomicU64>>,
+    /// Per output: [`BindingConfig::inband_parameter_changes_ok`].
+    inband_sets: Vec<bool>,
+}
+
+/// End-of-run bound for the routing reaper to finish closed live encoders.
+const ROUTING_SHUTDOWN_GRACE: Duration = Duration::from_secs(1);
+
 /// The concrete encoder owned exclusively by one bounded rendition worker.
 struct PipelineVideoWorker(VideoRenditionEncoder);
 
@@ -6744,6 +7093,30 @@ impl VideoEncodeWorker for PipelineVideoWorker {
             kind: "encode",
             reason: e.to_string(),
         })
+    }
+
+    fn force_keyframe(&mut self) {
+        self.0.force_next_keyframe();
+    }
+}
+
+impl crate::output_routing::LiveEncoder for PipelineVideoWorker {
+    fn start_at(&mut self, t0: u64) {
+        self.0.start_at(t0);
+    }
+
+    fn time_base(&self) -> Rational {
+        self.0.time_base()
+    }
+
+    fn move_gate(&self) -> crate::rendition_dispatch::MoveGate {
+        let params = self.0.codec_params().clone();
+        Box::new(move |packet| params.is_self_contained_rap(packet))
+    }
+
+    fn parameter_sets(&self) -> Option<crate::rendition_dispatch::ParameterSets> {
+        let params = self.0.codec_params().clone();
+        Some(Box::new(move |packet| params.rap_parameter_sets(packet)))
     }
 }
 
@@ -7151,7 +7524,13 @@ fn consumer_main<D: WindowDelivery>(
     track_inputs: &multiview_framestore::SwapCell<Arc<Vec<String>>>,
     #[cfg(feature = "aes67")] aes67_send_handles: Vec<multiview_output::aes67::Aes67SenderHandle>,
     in_flight: &AtomicI64,
+    routing: ConsumerRouting,
 ) -> Result<Vec<crate::binding_delivery::BindingStatus>, PipelineError> {
+    let ConsumerRouting {
+        mut router,
+        base_force,
+        inband_sets,
+    } = routing;
     let mut baker = StreamBaker::new(ctx)?;
     let (event_tx, event_rx) = std::sync::mpsc::sync_channel::<DispatchEvent>(256);
     if video_encoders.is_empty() {
@@ -7168,14 +7547,44 @@ fn consumer_main<D: WindowDelivery>(
             den: v.time_base().den,
         })
         .collect();
+    // ADR-0108 move gates for the base (Program) keys: a take back to Program
+    // lands only on a self-contained RAP. Gates are consulted on a move or a
+    // fallback only, so a run without a take delivers exactly as before.
+    let video_move_gates: Vec<Option<crate::rendition_dispatch::MoveGate>> = video_encoders
+        .iter()
+        .map(|encoder| {
+            let params = encoder.codec_params().clone();
+            let gate: crate::rendition_dispatch::MoveGate =
+                Box::new(move |packet| params.is_self_contained_rap(packet));
+            Some(gate)
+        })
+        .collect();
+    let video_parameter_sets: Vec<crate::rendition_dispatch::ParameterSets> = video_encoders
+        .iter()
+        .map(|encoder| {
+            let params = encoder.codec_params().clone();
+            let sets: crate::rendition_dispatch::ParameterSets =
+                Box::new(move |packet| params.rap_parameter_sets(packet));
+            sets
+        })
+        .collect();
     for (key, encoder) in video_encoders.into_iter().enumerate() {
         let base = encoder.time_base();
         let tx = event_tx.clone();
+        // The forced-IDR cell is never set without a take: `ForceAt` then
+        // forwards every call unchanged.
+        let force = base_force
+            .get(key)
+            .cloned()
+            .unwrap_or_else(crate::output_routing::force_cell);
         let worker = RenditionWorker::spawn(
             key,
             cadence,
             base,
-            Box::new(PipelineVideoWorker(encoder)),
+            Box::new(crate::output_routing::ForceAt::with_cell(
+                Box::new(PipelineVideoWorker(encoder)),
+                force,
+            )),
             move |event| {
                 tx.send(event).map_err(|e| PipelineError::Output {
                     kind: "video-worker",
@@ -7224,6 +7633,9 @@ fn consumer_main<D: WindowDelivery>(
             output_index: index,
             video_key: Some(key),
             audio_tracks: output_audio_tracks.get(index).cloned().unwrap_or_default(),
+            // Unknown (no runnable output recorded at this index): refuse a
+            // changed-format splice rather than risk a corrupt stream.
+            inband_parameter_changes_ok: inband_sets.get(index).copied().unwrap_or(false),
         })
         .collect();
     let mut dispatcher = RenditionDispatcher::new(DispatchConfig {
@@ -7234,11 +7646,21 @@ fn consumer_main<D: WindowDelivery>(
         bindings,
         first_tick: 0,
         cadence,
+        video_move_gates,
     })
     .map_err(|e| PipelineError::Output {
         kind: "dispatch",
         reason: format!("{e:?}"),
     })?;
+    // Compared at a move/fallback, but also run on the default path: every
+    // delivered keyframe of a binding's current key is scanned (one bounded
+    // NAL walk per keyframe per output, plus a Vec copy of the sets when they
+    // change) so the next switch compares against what the output carries.
+    // This is consumer-thread (off-clock) work and never blocks; a run
+    // without a take still pays it once per GOP per output.
+    for (key, sets) in video_parameter_sets.into_iter().enumerate() {
+        let _ = dispatcher.set_parameter_sets(key, sets);
+    }
     // A monotonic clock for rate-bounding the loudness emit, sampled OFF the hot
     // loop (this is the bake-consumer thread). The epoch is the consumer start;
     // the conflator only ever sees a non-decreasing `now_ns`.
@@ -7246,6 +7668,22 @@ fn consumer_main<D: WindowDelivery>(
     // The program-audio encode worker owns the AAC encoder: it encodes program +
     // discrete tracks OFF this consumer, in tick order, computes the watermarks
     // and dispatches (design note docs/architecture/audio-encode-worker.md).
+    // ADR-0108 §5: routed outputs' audio follows their video feed. Private
+    // per-output buses open with the program encoder's exact settings and
+    // must reproduce its AudioSpecificConfig. Nothing opens without a take.
+    if let Some(encoder) = audio_encoder.as_ref() {
+        let gains = audio_route.clone();
+        let route_gain: crate::routing_audio::RouteGain = Arc::new(move |id: &str| {
+            gains
+                .as_ref()
+                .map_or(1.0, |handle| handle.output_route_gain(id))
+        });
+        router.enable_audio(
+            encoder.config().clone(),
+            encoder.codec_params().codec_config_bytes(),
+            route_gain,
+        );
+    }
     let mut audio_worker = match audio_encoder.take() {
         Some(encoder) => {
             let tx = event_tx.clone();
@@ -7323,6 +7761,14 @@ fn consumer_main<D: WindowDelivery>(
         in_flight.fetch_sub(1, Ordering::AcqRel);
         #[cfg(feature = "_chaos-test-seams")]
         chaos_stall.maybe_stall(item.tick_index);
+        // Live-opened encoders' windows first: a live window T must be staged
+        // before base window T closes, or a move onto it is refused.
+        router
+            .drain_live_events(&mut dispatcher, &mut delivery)
+            .map_err(|e| PipelineError::Output {
+                kind: "dispatch",
+                reason: format!("{e:?}"),
+            })?;
         // Admit the previously encoded tick's complete packet set (its video,
         // program audio and every discrete track) as ONE atomic transaction per
         // binding. Never waits: a full or stale binding loses that whole window
@@ -7343,6 +7789,16 @@ fn consumer_main<D: WindowDelivery>(
         }
         dispatcher
             .watchdog(Instant::now(), &mut delivery)
+            .map_err(|e| PipelineError::Output {
+                kind: "dispatch",
+                reason: format!("{e:?}"),
+            })?;
+        // Output routing (ADR-0108): takes, live opens, moves and feeding of
+        // live-opened encoders. Never waits; a no-take run does nothing here.
+        let tick_pts =
+            MediaTime::from_tick(i64::try_from(item.tick_index).unwrap_or(i64::MAX), cadence);
+        router
+            .on_tick(item.tick_index, tick_pts, &mut dispatcher, &mut delivery)
             .map_err(|e| PipelineError::Output {
                 kind: "dispatch",
                 reason: format!("{e:?}"),
@@ -7553,6 +8009,23 @@ fn consumer_main<D: WindowDelivery>(
                 // intentionally ignore here (drop-oldest; inv #10).
                 let _ = slot.push(block.clone());
             }
+            // ADR-0108 §5.2: feed routed outputs' private audio buses from
+            // this same tick's program block and per-source clean blocks
+            // (no second store read). Never blocks; no take = no work.
+            if router.has_private_audio() {
+                #[cfg(not(feature = "overlay"))]
+                let feed_bus: &multiview_audio::program::ProgramBus = bus;
+                #[cfg(feature = "overlay")]
+                let feed_bus = audio_bus
+                    .as_ref()
+                    .ok_or_else(|| PipelineError::Engine("audio bus missing".to_owned()))?;
+                router.feed_audio(
+                    item.tick_index,
+                    &block,
+                    &feed_bus.input_tracks(),
+                    &mut dispatcher,
+                );
+            }
             if audio_worker.is_none() {
                 return Err(PipelineError::Output {
                     kind: "encode-audio",
@@ -7573,6 +8046,8 @@ fn consumer_main<D: WindowDelivery>(
                 let track_bus = bus;
                 discrete_track_samples(track_bus, &selected_tracks, block.frame_count())
             };
+            #[cfg(test)]
+            router.tap_program_audio(item.tick_index, &block);
             let offered = audio_worker.as_ref().map_or(
                 Err(crate::rendition_workers::OfferRejection::Ended),
                 |worker| {
@@ -7622,6 +8097,9 @@ fn consumer_main<D: WindowDelivery>(
     // sending its tail into a full channel would deadlock a plain `join` here,
     // so the joins run on a helper thread while this thread keeps draining.
     // Video workers join before the audio worker (terminal ordering preserved).
+    // Live-opened encoders are retired first and handed to the routing reaper
+    // (bounded wait; they never gate the base windows).
+    (*router).shutdown(&mut dispatcher, ROUTING_SHUTDOWN_GRACE);
     drop(event_tx);
     let joiner = std::thread::Builder::new()
         .name("multiview-worker-join".to_owned())
@@ -9203,7 +9681,10 @@ impl IngestSupervisor {
         for (stop, _) in &self.producers {
             stop.store(true, Ordering::Release);
         }
-        let deadline = Instant::now() + INGEST_JOIN_GRACE;
+        // #309: never past an armed process exit deadline.
+        let grace = crate::exit_watchdog::remaining()
+            .map_or(INGEST_JOIN_GRACE, |left| left.min(INGEST_JOIN_GRACE));
+        let deadline = Instant::now() + grace;
         for (_, handle) in self.producers.drain(..) {
             let name = handle.thread().name().unwrap_or("ingest").to_owned();
             while !handle.is_finished() && Instant::now() < deadline {
@@ -12501,6 +12982,30 @@ fn handle_ndi_output(
 /// run** (HLS-2, ADR-0032): an infinite live run must not also write an
 /// ever-growing `program.ts` — the rolling segment window (the live `.m3u8` +
 /// pruned `seg*.ts`) is the bounded on-disk artifact instead.
+/// Whether an output's muxer carries decoder configuration in band, so a
+/// routing switch onto changed parameter sets may splice with a mux
+/// discontinuity (output-routing.md §4.2 step 4): MPEG-TS only (HLS TS
+/// segments, SRT / RIST / UDP-TS push, a `.ts` file). fMP4/CMAF, FLV (RTMP),
+/// RTSP, WebRTC/WHIP and MP4/MKV files carry it out of band (init segment,
+/// sequence header, SDP, `moov`); raw-frame sinks carry no packets.
+fn inband_parameter_changes_ok(output: &RunnableOutput) -> bool {
+    match output {
+        RunnableOutput::Hls { .. } => true,
+        // `srt` / `rist` mux MPEG-TS; `rtmp` muxes FLV (sequence header).
+        RunnableOutput::Push { label, .. } => matches!(*label, "srt" | "rist"),
+        RunnableOutput::File { path, .. } => path
+            .extension()
+            .and_then(|e| e.to_str())
+            .is_some_and(|e| matches!(e.to_ascii_lowercase().as_str(), "ts" | "m2ts" | "mts")),
+        #[cfg(feature = "webrtc-native")]
+        RunnableOutput::WebRtc { .. } => false,
+        #[cfg(feature = "ndi-bindings")]
+        RunnableOutput::Ndi { .. } => false,
+        #[cfg(feature = "aes67")]
+        RunnableOutput::Aes67 { .. } => false,
+    }
+}
+
 fn maybe_prepend_program_ts(mut runnable: Vec<RunnableOutput>, live: bool) -> Vec<RunnableOutput> {
     if live {
         return runnable;
@@ -17516,6 +18021,8 @@ pub(crate) fn remove_live_lifecycle(id: &str) -> u64 {
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     let lifecycle = advance_live_lifecycle(id, &mut tokens);
+    // `advance_live_lifecycle` re-registered the fetch entry at `lifecycle`, so
+    // forgetting that exact generation drops it.
     crate::hls_fetch::forget_source(id, lifecycle);
     tokens.remove(id);
     anchor_slots()
@@ -24641,6 +25148,41 @@ segment_ms = 1000
             };
             assert_subscription_observations(&observed);
         });
+    }
+
+    /// Q (output-routing.md §4.2 step 4): only MPEG-TS muxers take a changed
+    /// decoder configuration in band; FLV, MP4/MKV files are out of band.
+    #[test]
+    fn inband_parameter_changes_follow_the_output_container() {
+        let push = |protocol, label| {
+            let sink = PacketMuxSink::push(protocol, "srt://[::1]:9000");
+            RunnableOutput::Push {
+                id: "p".to_owned(),
+                link: push_link_for(label, &sink, "srt://[::1]:9000"),
+                sink,
+                label,
+                url: String::new(),
+            }
+        };
+        let file = |path: &str| RunnableOutput::File {
+            id: "f".to_owned(),
+            sink: PacketMuxSink::file(path),
+            path: std::path::PathBuf::from(path),
+        };
+        assert!(inband_parameter_changes_ok(&push(PushProtocol::Srt, "srt")));
+        assert!(inband_parameter_changes_ok(&push(
+            PushProtocol::Rist,
+            "rist"
+        )));
+        assert!(!inband_parameter_changes_ok(&push(
+            PushProtocol::Rtmp,
+            "rtmp"
+        )));
+        assert!(inband_parameter_changes_ok(&file("/x/program.ts")));
+        assert!(inband_parameter_changes_ok(&file("/x/a.M2TS")));
+        assert!(!inband_parameter_changes_ok(&file("/x/a.mp4")));
+        assert!(!inband_parameter_changes_ok(&file("/x/a.mkv")));
+        assert!(!inband_parameter_changes_ok(&file("/x/noext")));
     }
 
     /// The registry indexes the FINAL runner order: the synthetic `program.ts`

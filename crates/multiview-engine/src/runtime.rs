@@ -284,6 +284,9 @@ pub struct EngineRuntime<P> {
     /// Mirrors `ticks_emitted`; the overload signal for telemetry / the
     /// degradation loop (a rising rate means compose is not fitting the budget).
     frames_repeated: Arc<AtomicU64>,
+    /// Program tick lateness (emit − deadline) at each publish, fresh or
+    /// repeat (ADR-0108 §10). Wait-free atomics only.
+    lateness: Arc<crate::lateness::TickLateness>,
 }
 
 impl<P: Pacer> EngineRuntime<P> {
@@ -305,6 +308,7 @@ impl<P: Pacer> EngineRuntime<P> {
             seed_nanos,
             ticks_emitted: Arc::new(AtomicU64::new(0)),
             frames_repeated: Arc::new(AtomicU64::new(0)),
+            lateness: crate::lateness::TickLateness::shared(),
         }
     }
 
@@ -360,6 +364,19 @@ impl<P: Pacer> EngineRuntime<P> {
     #[must_use]
     pub fn frames_repeated_counter(&self) -> Arc<AtomicU64> {
         Arc::clone(&self.frames_repeated)
+    }
+
+    /// The shared Program tick-lateness histogram (read off-thread).
+    #[must_use]
+    pub fn lateness(&self) -> Arc<crate::lateness::TickLateness> {
+        Arc::clone(&self.lateness)
+    }
+
+    /// Record the lateness of the tick just published (one time-source read
+    /// plus atomics; never allocates or locks).
+    fn record_lateness(&self, tick_index: u64) {
+        let deadline = self.clock.deadline_nanos(tick_index, self.seed_nanos);
+        self.lateness.record(self.time_source.now_nanos(), deadline);
     }
 
     /// Run the tick loop **forever**, until `stop` is raised.
@@ -764,6 +781,7 @@ impl<P: Pacer> EngineRuntime<P> {
                     if let Some(event) = event_of(&*last) {
                         publisher.publish_event(event);
                     }
+                    self.record_lateness(repeat_tick.index);
                     emitted = emitted.saturating_add(1);
                     self.ticks_emitted.fetch_add(1, Ordering::AcqRel);
                     self.frames_repeated.fetch_add(1, Ordering::AcqRel);
@@ -793,6 +811,7 @@ impl<P: Pacer> EngineRuntime<P> {
             // 4. Publish outward — wait-free state slot + non-blocking drop-oldest
             //    event stream. Neither can be back-pressured by a consumer.
             publisher.publish_state(state_of(&frame));
+            self.record_lateness(tick.index);
             // Events are sparse: publish only when the projection yields one, so
             // the drop-oldest broadcast carries state changes, not a per-tick
             // flood. The state slot above still refreshes every tick.

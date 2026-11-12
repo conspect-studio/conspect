@@ -132,7 +132,9 @@ pub async fn bind_and_serve<F>(
 where
     F: Future<Output = ()> + Send + 'static,
 {
-    bind_and_serve_with_moq(
+    // Boxed so a caller's future does not embed this large state machine
+    // (clippy::large_futures, 16 KiB threshold).
+    Box::pin(bind_and_serve_with_moq(
         listen,
         config,
         publisher,
@@ -153,8 +155,9 @@ where
         None,
         #[cfg(feature = "moq-output")]
         None,
+        None,
         shutdown,
-    )
+    ))
     .await
 }
 
@@ -200,6 +203,10 @@ pub async fn bind_and_serve_with_moq<F>(
     #[cfg(feature = "moq-output")] moq_slot: Option<
         crate::output_window_registry::WindowSubscriptionSlot,
     >,
+    // The network front door (ADR-0107 slice 4): when its TCP door runs, the
+    // SAME router and serve options are attached to it as the site, draining
+    // with this server's shutdown. `None` leaves the plain listener only.
+    front_door: Option<&crate::frontdoor::FrontDoorRun>,
     shutdown: F,
 ) -> std::io::Result<(SocketAddr, JoinHandle<std::io::Result<()>>, AppState)>
 where
@@ -365,6 +372,21 @@ where
     }
     if let Some(switcher) = switcher {
         state = state.with_switcher(switcher);
+    }
+    // Output feed routing (ADR-0108 slice 1): the run installs its routing
+    // slot before the control plane starts; without one the routes answer
+    // 409 `routing-unavailable`.
+    #[cfg(feature = "ffmpeg")]
+    if let Some(slot) = crate::output_routing_control::installed_program_metrics() {
+        state = state.with_program_metrics(std::sync::Arc::new(
+            crate::output_routing_control::ProgramMetricsAdapter(slot),
+        ));
+    }
+    #[cfg(feature = "ffmpeg")]
+    if let Some(slot) = crate::output_routing_control::installed_output_routing() {
+        state = state.with_output_routing(std::sync::Arc::new(
+            crate::output_routing_control::OutputRoutingAdapter::new(slot),
+        ));
     }
     if let Some(leases) = switcher_leases {
         state.switcher_preview_lease = leases;
@@ -689,6 +711,17 @@ where
         }
         None => multiview_control::ServeOptions::default(),
     };
+    // The front door's TCP door serves the same app (slice 4). Its connections
+    // observe this server's shutdown through a watch flipped when `shutdown`
+    // resolves (or dropped with the server task).
+    let site_app = app.clone();
+    let site_options = serve_options.clone();
+    let shutdown = attach_front_door_site(
+        front_door,
+        config,
+        move |watch| multiview_control::ConnectionServer::new(site_app, &site_options, watch),
+        shutdown,
+    )?;
     let handle = match config
         .control
         .as_ref()
@@ -722,6 +755,57 @@ where
         }
     };
     Ok((addr, handle, state))
+}
+
+/// Attach the control-plane `app` to the front door's TCP door as its site
+/// (ADR-0107 slice 4, issue #290) and return the server's shutdown future,
+/// extended to signal the door's connections. The site certificate is the
+/// `[control.tls] mode = "static"` pair through the `CertificateSource` seam
+/// (`tls` builds on unix); otherwise the door runs ICE-TCP only, with a warning.
+///
+/// # Errors
+/// A `[control.tls]` certificate that cannot be loaded (the same startup
+/// failure the plain TLS listener reports).
+// reason: without `tls` (or off unix) the certificate-load error path is
+// compiled out, so the `Result` is only unnecessary in that build.
+#[cfg_attr(not(all(feature = "tls", unix)), allow(clippy::unnecessary_wraps))]
+fn attach_front_door_site<F>(
+    front_door: Option<&crate::frontdoor::FrontDoorRun>,
+    config: &MultiviewConfig,
+    server: impl FnOnce(tokio::sync::watch::Receiver<bool>) -> multiview_control::ConnectionServer,
+    shutdown: F,
+) -> std::io::Result<std::pin::Pin<Box<dyn Future<Output = ()> + Send + 'static>>>
+where
+    F: Future<Output = ()> + Send + 'static,
+{
+    let Some(door) = front_door.filter(|d| d.has_tcp_door()) else {
+        return Ok(Box::pin(shutdown));
+    };
+    let tls = config.control.as_ref().and_then(|c| c.tls.as_ref());
+    #[cfg(all(feature = "tls", unix))]
+    let site = match tls {
+        Some(tls) => {
+            let source = multiview_control::static_certificate_source(tls)
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
+            Some(
+                multiview_control::site_server_config(Arc::new(source)).map_err(|e| {
+                    std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string())
+                })?,
+            )
+        }
+        None => None,
+    };
+    #[cfg(not(all(feature = "tls", unix)))]
+    let site: Option<multiview_frontdoor::SiteTlsConfig> = {
+        let _ = tls;
+        None
+    };
+    let (signal, watch) = tokio::sync::watch::channel(false);
+    door.install_site(server(watch), site);
+    Ok(Box::pin(async move {
+        shutdown.await;
+        let _ = signal.send(true);
+    }))
 }
 
 /// Abort the off-clock management task when the server exits or is cancelled.
@@ -2308,6 +2392,24 @@ impl CommandDrain {
                 id,
                 "the stored canvas differs from the running session's pinned canvas (Class-2)",
             );
+            return;
+        }
+        // #317 backstop: the route refuses this with a typed 422 before persisting;
+        // the drain re-checks with the SAME start-up admission rule so no other
+        // submitter can put a canvas under the M/E that the engine could not boot.
+        // Pure comparisons over the solved cells; no allocation on the Ok path.
+        if let Err(refusal) = multiview_config::switcher_canvas_admission(
+            self.config.switcher.as_ref(),
+            &resolved.solved,
+            &resolved.document.cells,
+            &self.config.overlays,
+        ) {
+            tracing::warn!(
+                layout = %id,
+                reason = %refusal,
+                "apply_layout held: the switcher M/E cannot drive this canvas; not applied live"
+            );
+            self.publish_apply_held(id, &refusal.operator_message());
             return;
         }
         let cells = resolved.solved.cells.len();
@@ -3944,6 +4046,62 @@ input_id = "in_b"
             saw_held,
             "a held stored-layout apply emits an apply_layout_held outcome (inv #10 drop-oldest)"
         );
+    }
+
+    /// #317 backstop: with a switcher M/E declared, a stored multi-cell layout
+    /// reaching the drain (the route refuses it first) is HELD with the
+    /// operator reason, never swapped under the running M/E.
+    #[test]
+    fn apply_layout_multi_cell_under_a_switcher_is_held() {
+        let mut config = test_config();
+        config.switcher = Some(multiview_config::SwitcherConfig {
+            mix_effects: vec![multiview_config::MixEffectsConfig {
+                id: "me1".into(),
+                program: "main".into(),
+                program_source: "in_a".into(),
+                preview_source: "in_b".into(),
+                flip_flop: true,
+            }],
+            extra: serde_json::Map::new(),
+        });
+        let publisher = Arc::new(EnginePublisher::<EngineStateSnapshot, Event>::new(16));
+        let (sender, command_rx) = command_bus(8);
+        let mut drain = CommandDrain::new(command_rx, config.clone(), Arc::clone(&publisher));
+        let mut drive = test_drive(&config);
+        let before = drive.layout().clone();
+        let mut sub = publisher.subscribe();
+        let body = serde_json::json!({
+            "canvas": matching_canvas(),
+            "layout": { "kind": "absolute" },
+            "cells": [
+                { "id": "l", "rect": { "x": 0.0, "y": 0.0, "w": 0.5, "h": 1.0 }, "source": { "input_id": "in_a" } },
+                { "id": "r", "rect": { "x": 0.5, "y": 0.0, "w": 0.5, "h": 1.0 }, "source": { "input_id": "in_b" } }
+            ]
+        });
+        let document = multiview_config::LayoutDocument::from_body(&body).expect("body parses");
+        let solved = document.solve_named("NewsOne").expect("body solves");
+        sender
+            .try_submit(Command::ApplyLayout {
+                op: OperationId::new(),
+                layout: "NewsOne".to_owned(),
+                document: Some(Box::new(multiview_control::ResolvedLayout::new(
+                    solved, document,
+                ))),
+            })
+            .expect("submit apply-layout");
+        let _ = drain.apply(&mut drive);
+        assert_eq!(drive.layout().cells, before.cells, "held, never swapped");
+        let mut saw_held = false;
+        while let Ok(seq) = sub.try_recv() {
+            if let Event::JobProgress(progress) = seq.event.as_ref() {
+                if progress.phase == "apply_layout_held" {
+                    let message = progress.message.as_deref().unwrap_or_default();
+                    assert!(message.contains("The switcher is on"), "{message:?}");
+                    saw_held = true;
+                }
+            }
+        }
+        assert!(saw_held, "the hold is observable on the realtime stream");
     }
 
     /// MINOR-3 (ADR-W019 review): the drain's pinned-canvas backstop compares

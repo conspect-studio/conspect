@@ -576,6 +576,40 @@ impl StreamAudioDecoder {
         Ok(Self { decoder, time_base })
     }
 
+    /// Build a decoder for the stream an opened encoder produces (its
+    /// codec-parameters snapshot, e.g. an AAC `AudioSpecificConfig`).
+    ///
+    /// # Errors
+    /// Returns [`FfmpegError::OpenDecoder`] if a decoder cannot be built.
+    pub fn from_codec_parameters(
+        parameters: &crate::packet::StreamCodecParameters,
+        time_base: Rational,
+    ) -> Result<Self> {
+        crate::decode::ensure_initialized()?;
+        Self::new(parameters.as_parameters().clone(), time_base)
+    }
+
+    /// Decode one coded packet and return every frame it releases as
+    /// interleaved `f32` (planar-`f32` decoders only, such as libav `aac`).
+    ///
+    /// # Errors
+    /// [`FfmpegError::Decode`] on a libav error, or
+    /// [`FfmpegError::FrameMismatch`] for a non-planar-`f32` frame.
+    pub fn decode_interleaved(
+        &mut self,
+        packet: &crate::packet::EncodedPacket,
+    ) -> Result<Vec<f32>> {
+        self.send_packet(&packet.to_owned_packet())?;
+        let mut out = Vec::new();
+        while let Some(frame) = self.receive_frame()? {
+            out.extend(crate::audio_file::interleave_fltp(
+                &frame.frame,
+                frame.frame.channels(),
+            )?);
+        }
+        Ok(out)
+    }
+
     /// The decoder's sample rate in Hz.
     #[must_use]
     pub fn sample_rate(&self) -> u32 {

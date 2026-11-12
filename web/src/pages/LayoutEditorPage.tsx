@@ -11,7 +11,7 @@ import { useNavigate, useParams } from 'react-router-dom';
 
 import { createApiClient } from '../api/client';
 import { useLayouts, useSaveLayout } from '../api/queries';
-import { applyLayoutCommand, describeApplyError } from '../layout/applyLayout';
+import { applyLayoutCommand, describeApplyError, isSwitcherRefusal } from '../layout/applyLayout';
 import { fromLayoutBody } from '../layout/model';
 import type { LayoutModel } from '../layout/model';
 import {
@@ -121,8 +121,12 @@ export function LayoutEditorPage(): JSX.Element {
             })
             .catch((error: unknown): void => {
               toast({
-                title: t`Layout saved, but apply failed`,
-                description: describeApplyError(error),
+                title: isSwitcherRefusal(error)
+                  ? t`Layout saved, not applied: the switcher is on`
+                  : t`Layout saved, but apply failed`,
+                description: isSwitcherRefusal(error)
+                  ? `${describeApplyError(error)} ${t`Nothing was changed; the current layout keeps running.`}`
+                  : describeApplyError(error),
                 variant: 'destructive',
               });
             });

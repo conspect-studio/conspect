@@ -179,6 +179,18 @@ impl<P: Pacer> MultiviewProgram<P> {
         self.runtime.ticks_counter()
     }
 
+    /// The program's wait-free tick-lateness histogram (ADR-0108 §10).
+    #[must_use]
+    pub fn lateness(&self) -> std::sync::Arc<crate::lateness::TickLateness> {
+        self.runtime.lateness()
+    }
+
+    /// The program's wait-free cumulative repeats counter.
+    #[must_use]
+    pub fn frames_repeated_counter(&self) -> std::sync::Arc<std::sync::atomic::AtomicU64> {
+        self.runtime.frames_repeated_counter()
+    }
+
     /// Drive the protected per-tick loop **forever**, until this program's
     /// [`StopSignal`] is raised, applying the per-tick `control` reconfiguration
     /// hook at each frame boundary.

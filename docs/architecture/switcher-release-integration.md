@@ -109,3 +109,22 @@ merge to main, native-host acceptance, or deployment is claimed here.
 Resource check: local target reached 4.2 GiB, below the 10 GiB growth cap;
 filesystem free space stayed above 360 GiB (lowest sampled 420 GiB, final
 sample 474 GiB). No other worktree or gate-owner lane was edited.
+
+## One admission rule on the live and start paths (#317)
+
+With a switcher M/E declared, the engine starts only from a canvas of exactly one
+full-canvas, opaque, unstyled cell bound to the M/E `program_source`, with no
+overlays. That rule lives in one function, `multiview_config::switcher_canvas_admission`
+(`boot_admission` adds `validate` + solve). It is called by:
+
+- `Pipeline::build` (start-up; the error text is unchanged);
+- `boot_model::write_desired`, the single choke point every `desired.json` commit
+  passes through, so no command can persist a state the engine cannot boot;
+- `POST /api/v1/commands/apply-layout`, before the commit and before the engine
+  command, answering `422` `/problems/layout-not-admissible-with-switcher` with
+  nothing applied or persisted;
+- the engine drain's `apply_stored_layout` (backstop, held with
+  `apply_layout_held`);
+- `multiview validate <config>`, which now also checks what `multiview run` will
+  start from (`.multiview/desired.json` when it exists) and exits non-zero with
+  start-up's reason. Run it as the deploy preflight.

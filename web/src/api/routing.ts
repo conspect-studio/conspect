@@ -24,7 +24,8 @@ import type { components } from './types';
 export type RouteTakeRequest = components['schemas']['RouteTakeRequest'];
 
 /** The dry-run classification a plan returns. */
-export type RoutePlan = components['schemas']['RoutePlan'];
+/** The crosspoint arm of the generated `POST /routing/plan` response union. */
+export type RoutePlan = Extract<components['schemas']['RoutingPlanResponseDoc'], { readonly coerced: unknown }>;
 
 /** The body a hot (Class-1 / reset-lite) take returns. */
 export type TakeApplied = components['schemas']['TakeApplied'];

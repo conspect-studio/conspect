@@ -588,6 +588,9 @@ pub enum WarningCodeDoc {
     ContainerNoHostNetworking,
     /// Sources linked to an IPTV-ORG catalogue entry need attention.
     CatalogueLinkAttention,
+    /// The saved accepted state could not start; the engine started from the
+    /// last state that started (#317).
+    AcceptedStateRejected,
 }
 
 /// `OpenAPI` mirror of [`multiview_events::HealthWarning`] (SA-0).

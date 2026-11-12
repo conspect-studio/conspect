@@ -41,6 +41,7 @@ pub mod logs;
 pub mod media_players;
 pub mod mesh;
 pub mod moq;
+pub mod output_routing;
 pub mod outputs;
 pub mod overlays;
 pub mod preview;
@@ -727,6 +728,27 @@ async fn cmd_swap(
     Ok(response)
 }
 
+/// The accepted configuration with a stored layout's `canvas`/`layout`/`cells`
+/// folded in: the state an apply of that layout would make the accepted one.
+fn prospective_layout_config(
+    state: &AppState,
+    body: &serde_json::Value,
+) -> ControlResult<multiview_config::MultiviewConfig> {
+    let mut document = crate::boot_model::current_desired_config(state)?;
+    let object = document
+        .as_object_mut()
+        .ok_or_else(|| ControlError::Repository("config base is not an object".into()))?;
+    for key in ["canvas", "layout", "cells"] {
+        let value = body
+            .get(key)
+            .ok_or_else(|| ControlError::Validation(format!("selected layout has no {key}")))?;
+        merge_selected_layout_key(object, key, value);
+    }
+    serde_path_to_error::deserialize(document).map_err(|e| {
+        ControlError::Validation(format!("selected config at `{}`: {}", e.path(), e.inner()))
+    })
+}
+
 /// Fold one stored-layout key into the desired config document.
 ///
 /// A stored layout's `canvas` carries only the geometry it authored (size and
@@ -783,7 +805,7 @@ fn merge_selected_layout_key(
             (status = 202, description = "Apply-layout accepted: the stored layout was resolved + solved and will swap in at the next frame boundary; `applied_live`/`carried_only` state the property classes. Outcome on the realtime stream (`job.progress`).", body = AcceptedBody),
             (status = 401, description = "Missing or invalid credentials.", body = Problem),
             (status = 403, description = "Not authorized to apply a layout.", body = Problem),
-            (status = 422, description = "The layout id does not exist, its stored body does not parse/solve, its canvas differs from the running session's pinned canvas (Class-2), or the running canvas is unknown (no seeded snapshot — the gate fails closed).", body = Problem),
+            (status = 422, description = "The layout id does not exist, its stored body does not parse/solve, its canvas differs from the running session's pinned canvas (Class-2), the running canvas is unknown (no seeded snapshot — the gate fails closed), or a switcher M/E is declared and the layout is not one full-canvas cell bound to its program source (type `/problems/layout-not-admissible-with-switcher`; nothing is applied or persisted).", body = Problem),
             (status = 503, description = "Engine command bus at capacity; shed.", body = Problem),
         ),
     )
@@ -853,26 +875,21 @@ pub(crate) async fn cmd_apply_layout(
             &versioned.layout.body,
             state.running_canvas.as_ref(),
         )?;
+        // #317: validate the RESULTING state with the start-up admission rule
+        // (the same function `Pipeline::build` calls) BEFORE anything is applied
+        // or persisted. A refusal is a typed 422, the idempotency key and the bus
+        // slot are released below, and the accepted state stays last-good.
+        let prospective = prospective_layout_config(&state, &versioned.layout.body);
+        // A base that does not compose fails closed below when there is a boot
+        // model to persist into; without one nothing is persisted and the engine
+        // drain's own admission backstop (`apply_stored_layout`) still holds it.
+        if let Ok(config) = &prospective {
+            config
+                .switcher_canvas_admission(&resolved.solved)
+                .map_err(ControlError::NotAdmissibleWithSwitcher)?;
+        }
         if state.boot_model.is_some() {
-            let stored = &versioned;
-            let mut document = crate::boot_model::current_desired_config(&state)?;
-            let object = document
-                .as_object_mut()
-                .ok_or_else(|| ControlError::Repository("config base is not an object".into()))?;
-            for key in ["canvas", "layout", "cells"] {
-                let value = stored.layout.body.get(key).ok_or_else(|| {
-                    ControlError::Validation(format!("selected layout has no {key}"))
-                })?;
-                merge_selected_layout_key(object, key, value);
-            }
-            let config: multiview_config::MultiviewConfig =
-                serde_path_to_error::deserialize(document).map_err(|e| {
-                    ControlError::Validation(format!(
-                        "selected config at `{}`: {}",
-                        e.path(),
-                        e.inner()
-                    ))
-                })?;
+            let config = prospective?;
             crate::boot_model::commit_desired_with_selection(
                 &state,
                 config,
@@ -1415,7 +1432,13 @@ pub fn api_router() -> Router<AppState> {
         .route("/switcher/{me}", get(switcher::get_switcher))
         .route("/switcher/plan", post(switcher::plan_switcher))
         .route("/switcher/commands/{kind}", post(switcher::submit_switcher))
+        .route(
+            "/metrics/program",
+            get(crate::program_metrics::get_program_metrics),
+        )
+        .route("/routing", get(routing::get_routing))
         .route("/routing/plan", post(routing::plan_route))
+        .route("/routing/output/take", post(output_routing::take_output))
         .route("/routing/{kind}/take", post(routing::take_route))
         // Tally operator surface: read resolved state, profiles, manual override.
         .route("/tally", get(tally::list_tally))

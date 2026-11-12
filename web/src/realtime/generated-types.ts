@@ -91,6 +91,19 @@ export interface CastSessionStarted {
   readonly session_id: string;
 }
 
+/** Data body of `catalogue.link_status` (IPTV-ORG, ADR-M015): a linked source's catalogue link status changed. Envelope `id` = source id. */
+export interface CatalogueLinkStatus {
+  readonly channel?: string;
+  readonly feed?: string;
+  /** Previous status, when known. */
+  readonly previous?: string;
+  /** Replacement channel id (channel_closed). */
+  readonly replaced_by?: string;
+  /** The linked source id. */
+  readonly source_id: string;
+  readonly status: "in_sync" | "updated" | "stream_removed" | "channel_closed" | "blocklisted" | "unlinked" | "edited";
+}
+
 /** Data body of `device.adopted`: a device was adopted into the registry. */
 export interface DeviceAdopted {
   /** The registry device id. */
@@ -105,11 +118,11 @@ export interface DeviceAdopted {
 export interface DeviceCapabilities {
   /** The device handles audio. */
   readonly audio: boolean;
-  /** The device can decode (receive a Multiview output). */
+  /** The device can decode (receive a Conspect output). */
   readonly decode: boolean;
   /** The device drives a physical display. */
   readonly display: boolean;
-  /** The device can encode (offers streams Multiview ingests as Sources). */
+  /** The device can encode (offers streams Conspect ingests as Sources). */
   readonly encode: boolean;
   /** The device supports managed firmware update. */
   readonly firmware_update: boolean;
@@ -193,7 +206,7 @@ export interface DeviceStreamStatus {
   readonly fps?: number;
   /** Whether the device reports this stream as healthy. */
   readonly healthy: boolean;
-  /** The Multiview output this decode stream is bound to, if any. */
+  /** The Conspect output this decode stream is bound to, if any. */
   readonly output_ref?: string;
   /** Whether the device is encoding or decoding this stream. */
   readonly role: "encode" | "decode";
@@ -253,6 +266,20 @@ export interface GpuMetrics {
 /** GPU/accelerator hardware vendor (selects which per-engine signals to expect). */
 export type GpuVendor = "nvidia" | "intel" | "amd" | "apple" | "other";
 
+/** Data body of `graphics.channel_state`: a graphics playout channel's preview/program after a cue / take / clear / next. Envelope `id` = channel id. */
+export interface GraphicsChannelEvent {
+  /** The verb that produced this state: cue, take, clear, next or rundown. */
+  readonly action: string;
+  /** Graphics channel id (matches the envelope `id`). */
+  readonly channel: string;
+  /** Cued (preview) item id, if any. */
+  readonly preview?: string;
+  /** On-air (program) item id, if any. */
+  readonly program?: string;
+  /** Increments on every program change. */
+  readonly seq: number;
+}
+
 /** Data body of `health.warning.raised` and `health.warning.cleared`. A richer sibling of `Alert`: the `code` is the stable dedupe key, and `remediation` carries the concrete fix. Capability-mismatch codes are latched build-time facts (raised once, cleared on reconfigure/restart). */
 export interface HealthWarning {
   /** Whether the condition is currently active (raise vs clear). */
@@ -287,7 +314,7 @@ export interface Hello {
   readonly session_id: string;
 }
 
-/** Declared impact class of a management change: cp (control-plane only), c1 (hot/seamless at a frame boundary), c2 (controlled reset via make-before-break), dev (the DEVICE pipeline restarts; Multiview program output is unaffected). */
+/** Declared impact class of a management change: cp (control-plane only), c1 (hot/seamless at a frame boundary), c2 (controlled reset via make-before-break), dev (the DEVICE pipeline restarts; Conspect program output is unaffected). */
 export type ImpactClass = "cp" | "c1" | "c2" | "dev";
 
 /** Data body of the `input.connection` event. */
@@ -297,6 +324,24 @@ export interface InputConnection {
   /** The owning input's id (the configured source id) — the object axis this lifecycle event is authorized under (ADR-W026). */
   readonly input_id: string;
   readonly state: LifecycleState;
+}
+
+/** Data body of the `input.lifecycle` event. */
+export interface InputLifecycle {
+  /** Unix milliseconds. */
+  readonly at_ms: number;
+  readonly from: "idle" | "starting" | "ready" | "failed";
+  /** Start generation; increments on every start from idle. */
+  readonly generation: number;
+  readonly lease_holders?: readonly {
+    readonly kind: string;
+    readonly label: string;
+  }[];
+  /** Operator-safe reason. */
+  readonly reason: string;
+  /** The source id (the authorization object). */
+  readonly source_id: string;
+  readonly to: "idle" | "starting" | "ready" | "failed";
 }
 
 /** Data body of the `input.streams` event: an input's full elementary-stream inventory (RT-3). */
@@ -375,7 +420,7 @@ export type MediaPlayerState =
 };
 
 /** Running state of an output sink. */
-export type OutputRunState = "starting" | "running" | "migrating" | "error";
+export type OutputRunState = "idle" | "starting" | "running" | "migrating" | "error";
 
 /** Data body of the `output.status` event. */
 export interface OutputStatus {
@@ -411,6 +456,17 @@ export interface Resync {
 
 /** Why a $resync was issued (the client must rebuild, not merge). The first three are unrecoverable resume gaps; `authz_changed` is a mid-session authorization change (object scope narrowed/widened) on an intact connection (ADR-RT010). */
 export type ResyncReason = "seq_evicted" | "unknown_session" | "session_expired" | "authz_changed";
+
+/** Data body of `route.output` (ADR-0108 §6.2): the terminal outcome of one output feed take, or an unrequested fallback. Envelope `id` = output id. */
+export interface RouteOutputEvent {
+  /** The take's operation id (empty for a fallback). */
+  readonly operation_id: string;
+  readonly outcome: "applied" | "superseded" | "refused:feed-not-fresh" | "refused:capacity" | "refused:encoder-not-ready" | "refused:unroutable" | "refused:format-mismatch" | "fallback:aux-failed" | "fallback:encoder-failed";
+  /** Output API id (matches the envelope `id`). */
+  readonly output: string;
+  /** Program tick at which the outcome was decided. */
+  readonly tick: number;
+}
 
 /** Data body of `salvo.armed`, `salvo.taken`, `salvo.cancelled`. */
 export interface SalvoEvent {
@@ -477,6 +533,16 @@ export interface Subscribed {
   readonly snapshot_seq: number;
   /** The topic that was subscribed. */
   readonly topic: string;
+}
+
+/** Terminal outcome, emitted only at the engine output tick; envelope corr equals operation_id, id equals M/E id. */
+export interface SwitcherOperation {
+  readonly completed: boolean;
+  readonly error?: string;
+  readonly me: string;
+  readonly operation_id: string;
+  readonly program: string;
+  readonly tick: number;
 }
 
 /** How well a device can participate in synchronized presentation (fixed probed tri-state). */
@@ -615,7 +681,7 @@ export interface WallClockRef {
 }
 
 /** Stable catalog code of a health warning (kebab-case). `#[non_exhaustive]`: the catalog grows over time, so a client must treat an unknown code as a forward-compatible warning, not an error. */
-export type WarningCode = "gpu-present-no-vulkan-adapter" | "config-file-invalid" | "config-file-requires-restart" | "config-file-apply-incomplete" | "container-no-host-networking";
+export type WarningCode = "gpu-present-no-vulkan-adapter" | "config-file-invalid" | "config-file-requires-restart" | "config-file-apply-incomplete" | "container-no-host-networking" | "catalogue-link-attention" | "accepted-state-rejected";
 
 /** Severity of a health warning (sibling of AlertSeverity). */
 export type WarningSeverity = "info" | "warning" | "critical";

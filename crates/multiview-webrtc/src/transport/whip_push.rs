@@ -317,6 +317,15 @@ impl PushLane {
         };
     }
 
+    /// The ICE-validated remote address of the connected push session, if any.
+    #[must_use]
+    pub fn validated_peer(&self) -> Option<SocketAddr> {
+        match &self.state {
+            PushState::Connected { session, .. } => session.validated_peer(),
+            _ => None,
+        }
+    }
+
     /// Feed one inbound datagram (already relay-decapsulated by the unified driver)
     /// to a connecting/connected push session — str0m ignores a datagram not for it.
     pub fn handle_inbound(

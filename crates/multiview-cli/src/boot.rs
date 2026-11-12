@@ -21,7 +21,7 @@
 use std::path::Path;
 
 use multiview_config::{MultiviewConfig, StartMode};
-use multiview_control::boot_model::{load_desired, load_resume_config, BootModel};
+use multiview_control::boot_model::{load_resume_config, BootModel};
 
 /// The resolved starting state of a run: the document the engine is built
 /// from (**Running**), the immutable boot snapshot (**Loaded**), and what the
@@ -48,9 +48,26 @@ pub struct StartConfig {
     pub resume_fallback: Option<String>,
     /// Accepted layout library and selected identity from the atomic record.
     pub desired: Option<multiview_control::boot_model::DesiredState>,
+    /// Set when the accepted state could not start and this run started from
+    /// the last-good copy instead (#317): the reason and where the rejected
+    /// state was kept. Raised as the `accepted-state-rejected` health warning.
+    pub boot_fallback: Option<crate::last_good::Fallback>,
+    /// A fallback decided but not yet committed (nothing written yet): set by
+    /// [`resolve_start_config`], committed by [`commit_fallback`] after the
+    /// engine was built from last-good.
+    pub pending_fallback: Option<PendingFallback>,
+    /// The exact `desired.json` bytes this start was resolved from (kept
+    /// verbatim if a later build failure falls back).
+    pub accepted_text: Option<String>,
 }
 
 impl StartConfig {
+    /// The reason of a decided-but-uncommitted fallback, if any.
+    #[must_use]
+    pub fn pending_fallback_reason(&self) -> Option<&str> {
+        self.pending_fallback.as_ref().map(|p| p.reason.as_str())
+    }
+
     /// The control plane's [`BootModel`] for this resolution, rooted at the
     /// boot file `boot_path` (the watch + promote target).
     ///
@@ -69,7 +86,13 @@ impl StartConfig {
             self.running.clone(),
             self.start,
             self.resumed,
-            self.resume_fallback.clone(),
+            // #317: a run that started from last-good says so on
+            // `GET /api/v1/config/boot-model` (`resume_fallback`), not only in
+            // the health warning.
+            self.boot_fallback
+                .as_ref()
+                .map(crate::last_good::Fallback::message)
+                .or_else(|| self.resume_fallback.clone()),
         )
     }
 }
@@ -121,6 +144,9 @@ fn splice_storeless_sections(
 /// `active.toml`.
 /// # Errors
 /// A corrupt accepted record or incompatible boot splice prevents startup.
+#[allow(clippy::too_many_lines)]
+// reason: one ordered decision (accepted state → last-good fallback → start
+// policy → active.toml resume → boot); splitting it scatters the precedence.
 pub fn resolve_start_config(
     boot: MultiviewConfig,
     boot_text: String,
@@ -128,24 +154,45 @@ pub fn resolve_start_config(
 ) -> Result<StartConfig, String> {
     // Accepted intent outranks the observational active snapshot, including
     // when the boot file selected its normal boot policy.
-    match load_desired(boot_path) {
-        Ok(Some(desired)) => {
-            let running = splice_storeless_sections(desired.config.clone(), &boot);
-            running
-                .validate()
-                .map_err(|error| format!("accepted desired state cannot be resumed: {error}"))?;
-            return Ok(StartConfig {
-                running,
-                loaded: boot,
-                boot_text,
-                start: StartMode::Resume,
-                resumed: true,
-                resume_fallback: None,
-                desired: Some(desired),
-            });
+    // #317: the accepted state must pass the SAME start-up admission the
+    // control plane applies before it persists. When it does not (or cannot be
+    // read), start from the last state that started instead of failing — and
+    // fail exactly as before when there is none.
+    match read_accepted(boot_path) {
+        Accepted::Present { text, parsed } => {
+            let rejection = match *parsed {
+                Ok(desired) => {
+                    let running = splice_storeless_sections(desired.config.clone(), &boot);
+                    match crate::last_good::admit(&running) {
+                        Ok(()) => {
+                            return Ok(StartConfig {
+                                running,
+                                loaded: boot,
+                                boot_text,
+                                start: StartMode::Resume,
+                                resumed: true,
+                                resume_fallback: None,
+                                desired: Some(desired),
+                                boot_fallback: None,
+                                pending_fallback: None,
+                                accepted_text: Some(text.clone()),
+                            });
+                        }
+                        Err(error) => {
+                            format!("accepted desired state cannot be resumed: {error}")
+                        }
+                    }
+                }
+                Err(error) => format!("accepted desired state cannot be read: {error}"),
+            };
+            return plan_last_good(boot, boot_text, boot_path, rejection, text);
         }
-        Ok(None) => {}
-        Err(error) => return Err(format!("accepted desired state cannot be read: {error}")),
+        Accepted::Absent => {}
+        // An I/O error reading the file (EMFILE, EIO …) is NOT evidence the
+        // saved state is bad: fail as before, never roll back over a blip.
+        Accepted::Unreadable(error) => {
+            return Err(format!("accepted desired state cannot be read: {error}"));
+        }
     }
     let start = boot
         .control
@@ -160,6 +207,9 @@ pub fn resolve_start_config(
             resumed: false,
             resume_fallback: None,
             desired: None,
+            boot_fallback: None,
+            pending_fallback: None,
+            accepted_text: None,
         });
     }
     Ok(match load_resume_config(boot_path) {
@@ -182,6 +232,9 @@ pub fn resolve_start_config(
                         resumed: true,
                         resume_fallback: None,
                         desired: None,
+                        boot_fallback: None,
+                        pending_fallback: None,
+                        accepted_text: None,
                     }
                 }
                 Err(error) => {
@@ -203,6 +256,9 @@ pub fn resolve_start_config(
                         resumed: false,
                         resume_fallback: Some(reason),
                         desired: None,
+                        boot_fallback: None,
+                        pending_fallback: None,
+                        accepted_text: None,
                     }
                 }
             }
@@ -222,7 +278,229 @@ pub fn resolve_start_config(
                 resumed: false,
                 resume_fallback: Some(reason),
                 desired: None,
+                boot_fallback: None,
+                pending_fallback: None,
+                accepted_text: None,
             }
         }
     })
+}
+
+/// What was read from `desired.json`.
+enum Accepted {
+    /// No accepted state (a first install, or one that never committed).
+    Absent,
+    /// The file could not be read (an I/O error, retried once).
+    Unreadable(String),
+    /// The exact bytes read, and whether they parse and validate.
+    Present {
+        text: String,
+        parsed: Box<Result<multiview_control::boot_model::DesiredState, String>>,
+    },
+}
+
+fn read_accepted(boot_path: &Path) -> Accepted {
+    let path = multiview_control::boot_model::desired_path_for(boot_path);
+    let mut last = String::new();
+    for _ in 0..2 {
+        match std::fs::read_to_string(&path) {
+            Ok(text) => {
+                let parsed = multiview_control::boot_model::parse_desired_text(&text, &path);
+                return Accepted::Present {
+                    text,
+                    parsed: Box::new(parsed),
+                };
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Accepted::Absent,
+            Err(e) => last = format!("reading {}: {e}", path.display()),
+        }
+    }
+    Accepted::Unreadable(last)
+}
+
+/// A decided-but-not-yet-committed fallback: the rejected bytes and the
+/// last-good envelope that will replace them once the engine built from it.
+#[derive(Debug, Clone)]
+pub struct PendingFallback {
+    reason: String,
+    rejected_text: String,
+    last_good: multiview_control::boot_model::DesiredState,
+}
+
+/// Plan a start from the last-good copy because the accepted state cannot
+/// start (`reason`). NOTHING is written here: the swap happens in
+/// [`commit_fallback`], only after the engine was built from last-good. Without
+/// a usable last-good copy this is the original error (a first install never
+/// invents a state).
+fn plan_last_good(
+    boot: MultiviewConfig,
+    boot_text: String,
+    boot_path: &Path,
+    reason: String,
+    rejected_text: String,
+) -> Result<StartConfig, String> {
+    let Some(last_good) = crate::last_good::load_last_good(boot_path) else {
+        return Err(reason);
+    };
+    let running = splice_storeless_sections(last_good.config.clone(), &boot);
+    if let Err(error) = crate::last_good::admit(&running) {
+        tracing::error!(%error, "the last-good state no longer starts either");
+        return Err(format!(
+            "{reason}; the last-good state cannot start either: {error}"
+        ));
+    }
+    if serde_json::to_string(&last_good).ok().as_deref() == Some(rejected_text.as_str()) {
+        return Err(reason);
+    }
+    Ok(StartConfig {
+        running,
+        loaded: boot,
+        boot_text,
+        start: StartMode::Resume,
+        resumed: true,
+        resume_fallback: None,
+        desired: Some(last_good.clone()),
+        boot_fallback: None,
+        pending_fallback: Some(PendingFallback {
+            reason,
+            rejected_text,
+            last_good,
+        }),
+        accepted_text: None,
+    })
+}
+
+/// Commit a planned fallback once the engine has been BUILT from last-good:
+/// keep the rejected bytes under `rejected/`, restore last-good as the
+/// accepted state, and record [`StartConfig::boot_fallback`] (the warning).
+/// A start that does not plan a fallback is returned unchanged.
+///
+/// # Errors
+/// The rejected state could not be kept or last-good not restored; the run
+/// must not start (the operator's state is never discarded unkept).
+pub fn commit_fallback(mut start: StartConfig, boot_path: &Path) -> Result<StartConfig, String> {
+    let Some(pending) = start.pending_fallback.take() else {
+        return Ok(start);
+    };
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX));
+    let kept_at = crate::last_good::quarantine_and_restore(
+        boot_path,
+        &pending.rejected_text,
+        &pending.last_good,
+        now_ms,
+    )
+    .map_err(|error| {
+        format!(
+            "{}; and the fallback could not complete: {error}",
+            pending.reason
+        )
+    })?;
+    let fallback = crate::last_good::Fallback {
+        reason: pending.reason,
+        kept_at,
+    };
+    tracing::error!(
+        boot = %boot_path.display(),
+        reason = %fallback.reason,
+        kept_at = %fallback.kept_at.display(),
+        "the accepted state cannot start; started from the last state that started"
+    );
+    start.boot_fallback = Some(fallback);
+    Ok(start)
+}
+
+/// Build the engine for `start`; if that fails on the ACCEPTED state, plan a
+/// fallback to a different last-good and build that. The returned start still
+/// carries any pending fallback: call [`commit_fallback`] with it (the build
+/// succeeded, so the swap is now safe). Called before the output clock exists.
+///
+/// # Errors
+/// The build error when there is nothing different to fall back to, or the
+/// fallback's own failure. Nothing on disk changed in either case.
+pub fn build_with_fallback<T>(
+    start: StartConfig,
+    boot_path: &Path,
+    build: impl Fn(&MultiviewConfig) -> Result<T, String>,
+) -> Result<(StartConfig, T), String> {
+    let error = match build(&start.running) {
+        Ok(engine) => return Ok((start, engine)),
+        Err(error) => error,
+    };
+    // A planned fallback that does not build either, or a start that did not
+    // come from the accepted state: nothing else to try.
+    if start.pending_fallback.is_some() {
+        return Err(format!(
+            "{}; the last-good state does not build either: {error}",
+            start
+                .pending_fallback
+                .as_ref()
+                .map_or_else(String::new, |p| p.reason.clone())
+        ));
+    }
+    // Only a start resolved from the accepted state, with the exact bytes it
+    // was built from, can fall back.
+    let Some(rejected_text) = start.accepted_text.clone() else {
+        return Err(error);
+    };
+    let reason = format!("building the engine from the accepted state failed: {error}");
+    let planned = plan_last_good(
+        start.loaded.clone(),
+        start.boot_text.clone(),
+        boot_path,
+        reason.clone(),
+        rejected_text,
+    )
+    // Nothing different to fall back to: the original build error, verbatim.
+    .map_err(|planned| if planned == reason { error.clone() } else { planned })?;
+    match build(&planned.running) {
+        Ok(engine) => Ok((planned, engine)),
+        Err(second) => Err(format!(
+            "{reason}; the last-good state does not build either: {second}"
+        )),
+    }
+}
+
+/// Side-effect-free preflight of what `multiview run` would do (used by
+/// `multiview validate`): the SAME decision start-up makes
+/// ([`resolve_start_config`] writes nothing), so "fall back" is only predicted
+/// when the spliced last-good copy itself admits. A pipeline build failure is
+/// not modelled (it needs the encoder/devices of the target host).
+///
+/// # Errors
+/// The exact reason start-up would reject the accepted state, and whether a
+/// start would fall back to the last-good copy or fail.
+pub fn preflight_start(
+    boot: &MultiviewConfig,
+    boot_text: &str,
+    boot_path: &Path,
+) -> Result<(), PreflightRefusal> {
+    match resolve_start_config(boot.clone(), boot_text.to_owned(), boot_path) {
+        Ok(start) => match start.pending_fallback {
+            Some(pending) => Err(PreflightRefusal {
+                reason: pending.reason,
+                falls_back: true,
+            }),
+            None => crate::last_good::admit(&start.running).map_err(|reason| PreflightRefusal {
+                reason,
+                falls_back: false,
+            }),
+        },
+        Err(reason) => Err(PreflightRefusal {
+            reason,
+            falls_back: false,
+        }),
+    }
+}
+
+/// Why `multiview validate` predicts a start would not use the accepted state.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct PreflightRefusal {
+    /// The exact start-up reason.
+    pub reason: String,
+    /// `true`: a start would fall back to the last-good copy (and raise the
+    /// `accepted-state-rejected` warning); `false`: a start would fail.
+    pub falls_back: bool,
 }

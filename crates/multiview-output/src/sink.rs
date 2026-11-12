@@ -578,14 +578,31 @@ impl VideoRenditionEncoder {
     pub fn new(config: &EncodeConfig) -> Result<Self> {
         config.validate()?;
         let pairs: &[(&str, &str)] =
-            if config.codec_name == "libx264" || config.codec_name == "libx265" {
-                &[("tune", "zerolatency"), ("bf", "0")]
+            // `forced-idr=1` (ADR-0108 §4.2): a forced keyframe (a route move,
+            // `force_next_keyframe`) is a true IDR. It changes nothing for a
+            // stream that never forces one. No family is opened with
+            // `AV_CODEC_FLAG_GLOBAL_HEADER`, so libavcodec repeats the parameter
+            // sets in band at every IDR (x264 `b_repeat_headers`, x265
+            // `repeat-headers`, NVENC `repeatSPSPPS`).
+            // libx265 defaults to an open GOP, which turns a forced I picture
+            // and every periodic keyframe into a CRA: never a decoder-ready RAP
+            // for a joined or moved consumer. A closed GOP makes them IDRs.
+            if config.codec_name == "libx264" {
+                &[("tune", "zerolatency"), ("bf", "0"), ("forced-idr", "1")]
+            } else if config.codec_name == "libx265" {
+                &[
+                    ("tune", "zerolatency"),
+                    ("bf", "0"),
+                    ("forced-idr", "1"),
+                    ("x265-params", "open-gop=0"),
+                ]
             } else if config.codec_name.ends_with("_nvenc") {
                 &[
                     ("tune", "ull"),
                     ("zerolatency", "1"),
                     ("delay", "0"),
                     ("bf", "0"),
+                    ("forced-idr", "1"),
                 ]
             } else {
                 &[("bf", "0")]
@@ -605,6 +622,35 @@ impl VideoRenditionEncoder {
             finished: false,
             no_reorder,
         })
+    }
+
+    /// Start this encoder at absolute output tick `t0` instead of 0 (ADR-0108
+    /// §4.3, an encoder opened live): the first frame it accepts is `t0`, and
+    /// it is a keyframe. PTS stays the absolute tick index, so a subscriber
+    /// moved from an encoder that started at 0 sees a one-tick step.
+    #[must_use]
+    pub fn starting_at(mut self, t0: u64) -> Self {
+        self.start_at(t0);
+        self
+    }
+
+    /// In-place [`Self::starting_at`], for an encoder already owned by a worker.
+    pub fn start_at(&mut self, t0: u64) {
+        self.tick = i64::try_from(t0).unwrap_or(i64::MAX);
+        self.encoder.force_next_keyframe();
+    }
+
+    /// The next tick this encoder accepts.
+    #[must_use]
+    pub fn next_tick(&self) -> u64 {
+        u64::try_from(self.tick).unwrap_or(0)
+    }
+
+    /// Make the next encoded frame a keyframe (an IDR with `forced-idr=1`).
+    /// One-shot; the caller owns the rate limit (ADR-0108 §4.2: one forced IDR
+    /// per 2 s per encoded bus).
+    pub fn force_next_keyframe(&mut self) {
+        self.encoder.force_next_keyframe();
     }
 
     /// True only when the opened encoder is proven never to reorder (no B
@@ -717,6 +763,37 @@ impl AudioRenditionEncoder {
         })
     }
 
+    /// Open a program-audio encoder whose first frame starts at absolute
+    /// sample `start` of the run's one sample counter (ADR-0108 §5.2 Rule 1:
+    /// one global AAC frame grid). `start` must be a multiple of the opened
+    /// encoder's frame size, so this bus emits frames on the same boundaries
+    /// and with the same PTS as every other bus (today's program encoder
+    /// starts at 0, also on the grid). The caller feeds PCM from `start` on.
+    ///
+    /// # Errors
+    /// The codec cannot open, `start` is negative, or `start` is off the grid.
+    pub fn starting_at_sample(config: &AudioEncodeConfig, start: i64) -> Result<Self> {
+        let mut encoder = Self::new(config)?;
+        let frame = i64::try_from(encoder.audio.frame_size).unwrap_or(i64::MAX);
+        if start < 0 || frame <= 0 || start % frame != 0 {
+            return Err(Error::Output(format!(
+                "audio start sample {start} is not on the {frame}-sample frame grid"
+            )));
+        }
+        encoder.audio.audio_pts = start;
+        Ok(encoder)
+    }
+
+    /// The absolute sample index the next fed sample will carry (the encoded
+    /// frames' PTS run plus the samples still buffered for the next frame).
+    #[must_use]
+    pub fn next_sample(&self) -> i64 {
+        let pending = self.audio.fifo.first().map_or(0, Vec::len);
+        self.audio
+            .audio_pts
+            .saturating_add(i64::try_from(pending).unwrap_or(i64::MAX))
+    }
+
     /// Open separately identified discrete tracks with the shared audio format.
     ///
     /// # Errors
@@ -734,6 +811,13 @@ impl AudioRenditionEncoder {
             )?);
         }
         Ok(())
+    }
+
+    /// The settings this encoder opened with (a private per-output bus opens
+    /// with exactly these, so its `AudioSpecificConfig` can match, §5.2).
+    #[must_use]
+    pub const fn config(&self) -> &AudioEncodeConfig {
+        &self.config
     }
 
     /// Program-audio encoder frame size in exact samples (AAC is typically 1024).
@@ -3781,6 +3865,178 @@ mod tests {
         }
     }
 
+    /// A solid YUV420P test frame of luma `luma`.
+    fn live_open_frame(luma: u8) -> DecodedVideoFrame {
+        use multiview_core::frame::FrameMeta;
+        use multiview_core::pixel::PixelFormat;
+        use multiview_core::time::MediaTime;
+        let mut video =
+            ffmpeg::util::frame::Video::new(ffmpeg::format::Pixel::YUV420P, WIDTH, HEIGHT);
+        for plane in 0..3 {
+            video
+                .data_mut(plane)
+                .fill(if plane == 0 { luma } else { 128 });
+        }
+        DecodedVideoFrame {
+            frame: video,
+            meta: FrameMeta {
+                pts: MediaTime::ZERO,
+                width: WIDTH,
+                height: HEIGHT,
+                format: PixelFormat::Nv12,
+                color: multiview_core::color::ColorInfo::default(),
+            },
+            raw_pts: None,
+            a53_cc: None,
+        }
+    }
+
+    /// The NAL type of each Annex B start code in `au`.
+    fn annexb_nal_types(au: &[u8], hevc: bool) -> Vec<u8> {
+        au.windows(4)
+            .filter(|w| w[..3] == [0, 0, 1])
+            .map(|w| {
+                if hevc {
+                    (w[3] >> 1) & 0x3F
+                } else {
+                    w[3] & 0x1F
+                }
+            })
+            .collect()
+    }
+
+    /// The NAL units of an Annex B access unit that are parameter sets.
+    fn annexb_parameter_sets(au: &[u8], hevc: bool) -> Vec<Vec<u8>> {
+        let mut starts = Vec::new();
+        let mut i = 0;
+        while i + 3 <= au.len() {
+            if au[i..i + 3] == [0, 0, 1] {
+                starts.push(i + 3);
+                i += 3;
+            } else {
+                i += 1;
+            }
+        }
+        let mut out = Vec::new();
+        for (n, &start) in starts.iter().enumerate() {
+            let mut end = starts.get(n + 1).map_or(au.len(), |&next| next - 3);
+            while end > start && au[end - 1] == 0 {
+                end -= 1;
+            }
+            let nal = &au[start..end];
+            let ty = if hevc {
+                (nal[0] >> 1) & 0x3F
+            } else {
+                nal[0] & 0x1F
+            };
+            let is_ps = if hevc {
+                (32..=34).contains(&ty)
+            } else {
+                ty == 7 || ty == 8
+            };
+            if is_ps {
+                out.push(nal.to_vec());
+            }
+        }
+        out
+    }
+
+    /// Run an encoder from tick 0 to `t0`, check that a forced keyframe at
+    /// `t0` is a one-shot self-contained IDR, and return tick 0's parameter
+    /// sets (the running encoder's decoder configuration).
+    fn running_encoder_sets(
+        config: &EncodeConfig,
+        codec: &str,
+        hevc: bool,
+        t0: u64,
+    ) -> Vec<Vec<u8>> {
+        let mut running = super::VideoRenditionEncoder::new(config).unwrap();
+        let first = running.encode_frame_at(live_open_frame(60), 0).unwrap();
+        let reference = annexb_parameter_sets(first[0].payload().unwrap(), hevc);
+        assert!(
+            !reference.is_empty(),
+            "{codec}: tick 0 carries parameter sets"
+        );
+        for tick in 1..t0 {
+            running.encode_frame_at(live_open_frame(60), tick).unwrap();
+        }
+        // A forced keyframe on the running encoder is a self-contained IDR.
+        running.force_next_keyframe();
+        let forced = running.encode_frame_at(live_open_frame(60), t0).unwrap();
+        assert!(
+            running.codec_params().is_self_contained_rap(&forced[0]),
+            "{codec}: forced keyframe {} packets, key {}, NAL types {:?}",
+            forced.len(),
+            forced[0].is_keyframe(),
+            annexb_nal_types(forced[0].payload().unwrap(), hevc)
+        );
+        let ordinary = running
+            .encode_frame_at(live_open_frame(60), t0 + 1)
+            .unwrap();
+        assert!(!ordinary[0].is_keyframe(), "{codec}: the force is one-shot");
+        reference
+    }
+
+    /// Open an encoder live at `t0`: tick 0 is refused, the first packet is
+    /// a self-contained IDR at absolute PTS `t0` whose parameter sets equal
+    /// `reference`, and PTS continues from there.
+    fn assert_live_open_at(
+        config: &EncodeConfig,
+        codec: &str,
+        hevc: bool,
+        t0: u64,
+        reference: &[Vec<u8>],
+    ) {
+        let mut live = super::VideoRenditionEncoder::new(config)
+            .unwrap()
+            .starting_at(t0);
+        assert_eq!(live.next_tick(), t0);
+        assert!(
+            live.encode_frame_at(live_open_frame(180), 0).is_err(),
+            "{codec}: tick 0 refused"
+        );
+        let opened = live.encode_frame_at(live_open_frame(180), t0).unwrap();
+        assert_eq!(
+            opened[0].pts(),
+            Some(i64::try_from(t0).unwrap()),
+            "{codec}: absolute PTS"
+        );
+        assert_eq!(opened[0].dts(), opened[0].pts());
+        assert!(
+            live.codec_params().is_self_contained_rap(&opened[0]),
+            "{codec}: first IDR"
+        );
+        assert_eq!(
+            annexb_parameter_sets(opened[0].payload().unwrap(), hevc),
+            reference,
+            "{codec}: parameter sets of a live-opened encoder equal the running encoder's"
+        );
+        let next = live.encode_frame_at(live_open_frame(180), t0 + 1).unwrap();
+        assert_eq!(next[0].pts(), Some(i64::try_from(t0 + 1).unwrap()));
+    }
+
+    /// ADR-0108 §4.2/§4.3: an encoder opened live with `starting_at(T0)` emits
+    /// absolute PTS from T0, its first packet is a self-contained IDR (in-band
+    /// parameter sets), a forced keyframe on a running encoder is one too, and
+    /// for libx264/libx265 the live-opened encoder's parameter sets equal the
+    /// running encoder's (the measured identity the move relies on; NVENC is
+    /// measured on hardware).
+    #[test]
+    fn a_live_opened_rendition_starts_at_t0_with_a_self_contained_idr() {
+        const T0: u64 = 200;
+        for (codec, hevc) in [("libx264", false), ("libx265", true)] {
+            if ffmpeg::encoder::find_by_name(codec).is_none() {
+                continue;
+            }
+            let mut config = EncodeConfig::mpeg2(WIDTH, HEIGHT);
+            config.codec_name = codec.to_owned();
+            config.gop = 60;
+            config.cadence = Rational::FPS_29_97;
+            let reference = running_encoder_sets(&config, codec, hevc, T0);
+            assert_live_open_at(&config, codec, hevc, T0, &reference);
+        }
+    }
+
     #[test]
     fn concrete_rendition_opens_zero_latency_and_emits_every_tick() {
         use multiview_core::frame::FrameMeta;
@@ -4128,5 +4384,55 @@ mod tests {
              across {} segments",
             result.segments.len()
         );
+    }
+
+    /// ADR-0108 §5.2 Rule 1: an audio bus opened live at an arbitrary tick
+    /// starts on the global AAC grid: its first packet PTS is the first
+    /// multiple of 1024 at or after `total_at(T_admit)`, then steps 1024.
+    #[test]
+    fn a_live_opened_audio_bus_starts_on_the_global_aac_grid() {
+        use multiview_audio::cadence::SampleClock;
+        use multiview_audio::crossfade::{grid_ceil, AAC_FRAME_SAMPLES};
+        let clock = SampleClock::new(48_000, Rational::new(30_000, 1_001));
+        let config = AudioEncodeConfig::aac(48_000, 2, 128_000);
+        assert!(super::AudioRenditionEncoder::starting_at_sample(&config, 1000).is_err());
+        assert!(super::AudioRenditionEncoder::starting_at_sample(&config, -1024).is_err());
+        for admit in [1_u64, 7, 333, 512, 4_099] {
+            let g = grid_ceil(clock.total_at(admit), AAC_FRAME_SAMPLES);
+            let mut enc = super::AudioRenditionEncoder::starting_at_sample(
+                &config,
+                i64::try_from(g).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(enc.frame_samples(), Some(1024));
+            assert_eq!(enc.next_sample(), i64::try_from(g).unwrap());
+            let mut pts = Vec::new();
+            let mut tick = admit;
+            while pts.len() < 12 {
+                let frames =
+                    usize::try_from(clock.total_at(tick + 1) - clock.total_at(tick)).unwrap();
+                for p in enc
+                    .encode_interleaved(&vec![0.1; frames * 2], frames)
+                    .unwrap()
+                {
+                    pts.push(p.pts().unwrap());
+                }
+                tick += 1;
+            }
+            let first = pts
+                .iter()
+                .copied()
+                .find(|&p| p >= i64::try_from(g).unwrap())
+                .unwrap();
+            assert_eq!(
+                first,
+                i64::try_from(g).unwrap(),
+                "admit {admit}: first frame at G"
+            );
+            for pair in pts.windows(2) {
+                assert_eq!(pair[1] - pair[0], 1024, "admit {admit}: step 1024 {pts:?}");
+            }
+            assert!(pts.iter().all(|p| p.rem_euclid(1024) == 0), "on the grid");
+        }
     }
 }
