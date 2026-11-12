@@ -10,6 +10,7 @@ import { MonitoringPage } from './MonitoringPage';
 
 const release = vi.hoisted(() => new Map<string, () => void>());
 const sessions = vi.hoisted(() => new Array<string>());
+const held = vi.hoisted(() => ({ enabled: false, programWhepDone: false, programMoqDone: false, notify: undefined as undefined | (() => void) }));
 vi.mock('../preview/PreviewSurface', () => ({
   PreviewSurface: ({ whepEndpoint, onSessionReleased, onLeaseState }: { whepEndpoint: string; onSessionReleased?: () => void; onLeaseState?: (state: 'negotiating' | 'active' | 'released') => void }): null => {
     const callback = useRef(onSessionReleased);
@@ -19,7 +20,15 @@ vi.mock('../preview/PreviewSurface', () => ({
     useEffect(() => {
       sessions.push(whepEndpoint);
       state.current?.('negotiating');
-      release.set(whepEndpoint, () => { state.current?.('released'); callback.current?.(); });
+      if (held.enabled && whepEndpoint === '/api/v1/preview/program/whep') {
+        held.notify = () => { state.current?.('released'); callback.current?.(); };
+        release.set(whepEndpoint, () => {
+          held.programWhepDone = true;
+          if (held.programMoqDone) held.notify?.();
+        });
+      } else {
+        release.set(whepEndpoint, () => { state.current?.('released'); callback.current?.(); });
+      }
     }, [whepEndpoint]);
     return null;
   },
@@ -41,7 +50,7 @@ const server = setupServer(
   http.get('*/api/v1/outputs', () => HttpResponse.json([])),
 );
 beforeAll(() => { server.listen(); });
-afterEach(() => { server.resetHandlers(); release.clear(); sessions.length = 0; ids = ['a', 'b']; });
+afterEach(() => { server.resetHandlers(); release.clear(); sessions.length = 0; ids = ['a', 'b']; held.enabled = false; held.programWhepDone = false; held.programMoqDone = false; held.notify = undefined; });
 afterAll(() => { server.close(); });
 
 function posts(endpoint: string): number {
@@ -55,6 +64,19 @@ async function renderPage(): Promise<void> {
 }
 
 describe('MonitoringPage single WHEP focus', () => {
+  it('waits for both the Program WHEP release and the held MoQ deadline before input focus', async () => {
+    held.enabled = true;
+    await renderPage();
+    fireEvent.click(screen.getByRole('button', { name: 'Open preview of input a' }));
+    expect(posts('/api/v1/preview/inputs/a/whep')).toBe(0);
+    act(() => { release.get('/api/v1/preview/program/whep')?.(); });
+    expect(posts('/api/v1/preview/inputs/a/whep')).toBe(0);
+    act(() => { held.programMoqDone = true; held.notify?.(); });
+    expect(posts('/api/v1/preview/inputs/a/whep')).toBe(1);
+    fireEvent.click(screen.getByRole('button', { name: 'Close' }));
+    act(() => { release.get('/api/v1/preview/inputs/a/whep')?.(); });
+    expect(posts('/api/v1/preview/program/whep')).toBe(2);
+  });
   it('waits for program DELETE and then input DELETE before it restores program', async () => {
     await renderPage();
     fireEvent.click(screen.getByRole('button', { name: 'Open preview of input a' }));

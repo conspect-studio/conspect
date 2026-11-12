@@ -515,6 +515,36 @@ async fn serve_control_plane(
         Arc::clone(&shared_stores),
         ingest,
     );
+    // The off-clock wall publishes one newest picture for WHEP as well as its
+    // optional MoQ rendition. The picture slot is never the Program slot.
+    #[cfg(feature = "moq-output")]
+    let wall_setup = if let (Some(wall), Some(slot)) = (
+        multiview_cli::monitor_wall::WallConfig::from_env(),
+        moq_slot.clone(),
+    ) {
+        let geometry = multiview_cli::preview::wall_slot();
+        let picture = multiview_cli::preview::wall_picture_slot();
+        match multiview_cli::monitor_wall::spawn(
+            wall,
+            config.canvas.fps.rational(),
+            Arc::clone(&shared_stores),
+            slot,
+            Arc::clone(&geometry),
+            Arc::clone(&picture),
+        ) {
+            Ok(worker) => Some((geometry, picture, worker)),
+            Err(error) => {
+                tracing::warn!(%error, "monitor wall worker could not start");
+                None
+            }
+        }
+    } else {
+        None
+    };
+    #[cfg(all(feature = "moq-output", feature = "webrtc-native"))]
+    let wall_picture = wall_setup
+        .as_ref()
+        .map(|(_, picture, _)| Arc::clone(picture));
     // ALL native WebRTC roles ride ONE shared dual-stack UDP socket (ADR-0048 §4,
     // box-validation defect B): preview WHEP egress (ADR-P006), WHIP ingest
     // (ADR-T014), WHEP-serve + `whip_push` outputs (ADR-0049). One bind, one driver
@@ -535,6 +565,8 @@ async fn serve_control_plane(
             webrtc_registry,
             &egress_registry,
             multiview_cli::source_demand::installed_control_demand(),
+            #[cfg(feature = "moq-output")]
+            wall_picture,
         );
         (unified.whep, unified.whip, unified.whep_output)
     };
@@ -553,21 +585,8 @@ async fn serve_control_plane(
     // The shared monitor wall (ADR-0103): off unless `MULTIVIEW_MOQ_WALL=1`.
     // One off-clock worker composes and encodes it once for every viewer.
     #[cfg(feature = "moq-output")]
-    if let (Some(wall), Some(slot)) = (
-        multiview_cli::monitor_wall::WallConfig::from_env(),
-        moq_slot.clone(),
-    ) {
-        let geometry = multiview_cli::preview::wall_slot();
-        match multiview_cli::monitor_wall::spawn(
-            wall,
-            config.canvas.fps.rational(),
-            provider.stores(),
-            slot,
-            Arc::clone(&geometry),
-        ) {
-            Ok(worker) => provider = provider.with_wall(geometry, Box::new(worker)),
-            Err(error) => tracing::warn!(%error, "monitor wall worker could not start"),
-        }
+    if let Some((geometry, _picture, worker)) = wall_setup {
+        provider = provider.with_wall(geometry, Box::new(worker));
     }
     let provider: multiview_control::SharedPreview = Arc::new(provider);
     // The Boot/Loaded/Running model (ADR-W024): Loaded is the immutable boot

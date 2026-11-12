@@ -141,6 +141,9 @@ struct PreviewVideoEncoder {
     rtp_ts: AtomicU32,
     /// Whether the first emitted access unit (the keyframe) has been produced.
     first_done: AtomicBool,
+    /// Set when the encoder failed to open: the session stays video-less
+    /// instead of re-opening a libav encoder on every preview tick.
+    open_failed: AtomicBool,
 }
 
 impl PreviewVideoEncoder {
@@ -150,6 +153,7 @@ impl PreviewVideoEncoder {
             inner: Mutex::new(PreviewEncodeState::default()),
             rtp_ts: AtomicU32::new(0),
             first_done: AtomicBool::new(false),
+            open_failed: AtomicBool::new(false),
         }
     }
 
@@ -197,10 +201,20 @@ impl PreviewVideoEncoder {
         let state = &mut *guard;
         let dims = self.target_dims(image);
         if state.encoder.is_none() || state.encoder_dims != dims {
+            // A failed open is sticky for these dimensions (never re-opened per
+            // tick); a layout change to another size re-arms one attempt.
+            if state.encoder.is_none()
+                && state.encoder_dims == dims
+                && self.open_failed.load(Ordering::Acquire)
+            {
+                return None;
+            }
             // First frame, or the layout changed to a different capped size:
             // reopen at the new size (the new stream starts with a keyframe).
             state.encoder = self.open(dims);
             state.encoder_dims = dims;
+            self.open_failed
+                .store(state.encoder.is_none(), Ordering::Release);
             self.first_done.store(false, Ordering::Release);
         }
         let video = state.fitter.fit(image, dims)?;
@@ -228,11 +242,11 @@ impl PreviewVideoEncoder {
         let fps = Rational::new(i64::from(PREVIEW_FPS), 1);
         let (encoder_name, options) = match self.codec {
             PreviewCodec::H264 => {
-                let name = multiview_ffmpeg::codec::select_encoder(VideoCodec::H264)?;
+                let name = preview_encoder(VideoCodec::H264)?;
                 (name, preview_h264_options(name, fps))
             }
             PreviewCodec::Vp8 => {
-                let name = multiview_ffmpeg::codec::select_encoder(VideoCodec::Vp8)?;
+                let name = preview_encoder(VideoCodec::Vp8)?;
                 (name, preview_vp8_options(fps))
             }
             // A future preview codec with no encoder wired here yields no encoder
@@ -366,6 +380,11 @@ enum SlotReader {
         id: String,
         clock: MonotonicTimeSource,
     },
+    /// Generation-fenced whole-system wall. A changed layout ends this focus.
+    Wall {
+        slot: crate::preview::WallPictureSlot,
+        generation: u64,
+    },
 }
 
 impl SlotReader {
@@ -373,6 +392,10 @@ impl SlotReader {
     fn load(&self) -> Option<Arc<Nv12Image>> {
         match self {
             Self::Program(slot) => slot.load(),
+            Self::Wall { slot, generation } => slot
+                .load()
+                .filter(|picture| picture.generation == *generation)
+                .map(|picture| Arc::clone(&picture.image)),
             Self::Input { stores, id, clock } => {
                 let stores = stores.load();
                 let store = stores.get(id)?;
@@ -497,6 +520,8 @@ pub struct CliWhepProvider {
     state: Arc<Mutex<DriverState>>,
     program: ProgramSlot,
     stores: SharedStores,
+    /// Composed wall source; absent when its off-clock worker is not configured.
+    wall: Option<crate::preview::WallPictureSlot>,
     /// Leases a source's demand for an input session.
     demand: Option<multiview_control::SharedSourceDemand>,
     /// The shared **program-audio preview tap** (ADR-P006 audio): the single drop-
@@ -557,6 +582,7 @@ impl CliWhepProvider {
                     state,
                     program,
                     stores,
+                    wall: None,
                     program_audio,
                     available: false,
                     silence_timeout: DEFAULT_SILENCE_TIMEOUT,
@@ -596,6 +622,7 @@ impl CliWhepProvider {
             state,
             program,
             stores,
+            wall: None,
             demand: None,
             program_audio,
             available: true,
@@ -628,11 +655,19 @@ impl CliWhepProvider {
             state,
             program,
             stores,
+            wall: None,
             demand: None,
             program_audio,
             available: true,
             silence_timeout: DEFAULT_SILENCE_TIMEOUT,
         }
+    }
+
+    /// Supply the wall worker's latest picture slot, without a Program fallback.
+    #[must_use]
+    pub fn with_wall(mut self, wall: Option<crate::preview::WallPictureSlot>) -> Self {
+        self.wall = wall;
+        self
     }
 
     /// Take a source demand lease for each input session.
@@ -668,10 +703,13 @@ impl CliWhepProvider {
         scope: &WhepScope,
         codec: PreviewCodec,
         opus: bool,
-    ) -> (
-        Arc<SlotMediaSource>,
-        Option<crate::preview::ProgramAudioSlot>,
-    ) {
+    ) -> Result<
+        (
+            Arc<SlotMediaSource>,
+            Option<crate::preview::ProgramAudioSlot>,
+        ),
+        WhepReject,
+    > {
         let (reader, audio_scope) = match scope {
             WhepScope::Input(id) => (
                 SlotReader::Input {
@@ -681,12 +719,28 @@ impl CliWhepProvider {
                 },
                 false,
             ),
-            // Program, Output, and any future scope sample the program/preview
-            // slot (the canvas-approx tap; the real-rendition fan-out is the
-            // ADR-P006 PRV-5b upgrade) and carry the program audio.
-            WhepScope::Program | WhepScope::Output(_) | _ => {
+            WhepScope::Wall => {
+                let wall = self
+                    .wall
+                    .as_ref()
+                    .and_then(|slot| slot.load().map(|picture| (slot, picture)))
+                    .ok_or(WhepReject::CapacityExceeded {
+                        fallback: "jpeg".to_owned(),
+                    })?;
+                (
+                    SlotReader::Wall {
+                        slot: Arc::clone(wall.0),
+                        generation: wall.1.generation,
+                    },
+                    false,
+                )
+            }
+            // The Program and Output canvas approximation carries program audio.
+            WhepScope::Program | WhepScope::Output(_) => {
                 (SlotReader::Program(Arc::clone(&self.program)), true)
             }
+            // Non-exhaustive API: new scopes must explicitly opt in to media.
+            _ => return Err(WhepReject::UnknownEntity),
         };
         // A per-session program-PCM ring, only when the offer negotiated Opus AND
         // this run has program audio AND the scope carries audio.
@@ -698,7 +752,7 @@ impl CliWhepProvider {
             session_tap.clone(),
             opus,
         ));
-        (media, session_tap)
+        Ok((media, session_tap))
     }
 }
 
@@ -714,7 +768,7 @@ impl WhepProvider for CliWhepProvider {
         // The offer may negotiate Opus; program audio reaches the peer when this
         // run has a program-audio tap and the scope carries audio (ADR-P006).
         let opus = offer_has_opus(offer);
-        let (media, audio_tap) = self.media_for(scope, codec, opus);
+        let (media, audio_tap) = self.media_for(scope, codec, opus)?;
         let answer = self
             .egress
             .accept_session(offer, codec, media.as_ref())
@@ -785,6 +839,10 @@ impl WhepProvider for CliWhepProvider {
 
     fn webrtc_available(&self) -> bool {
         self.available && self.egress.has_candidates()
+    }
+
+    fn wall_available(&self) -> bool {
+        self.wall.as_ref().is_some_and(|wall| wall.load().is_some())
     }
 }
 
@@ -1026,12 +1084,44 @@ fn select_offer_codec(offer: &str) -> Result<PreviewCodec, WhepReject> {
             }
         }
     }
-    if has_h264 && multiview_ffmpeg::codec::can_encode(VideoCodec::H264) {
+    choose_offer_codec(has_h264, has_vp8, |codec| preview_encoder(codec).is_some())
+}
+
+/// Pure negotiation rule: H.264 when offered and an encoder is USABLE here,
+/// else VP8 when offered and usable, else reject (review WHEP-VT-OPEN-FALLBACK:
+/// a registered but unusable hardware H.264 encoder must not win the
+/// negotiation and leave the session without video).
+fn choose_offer_codec(
+    has_h264: bool,
+    has_vp8: bool,
+    usable: impl Fn(VideoCodec) -> bool,
+) -> Result<PreviewCodec, WhepReject> {
+    if has_h264 && usable(VideoCodec::H264) {
         Ok(PreviewCodec::H264)
-    } else if has_vp8 && multiview_ffmpeg::codec::can_encode(VideoCodec::Vp8) {
+    } else if has_vp8 && usable(VideoCodec::Vp8) {
         Ok(PreviewCodec::Vp8)
     } else {
         Err(WhepReject::UnsupportedCodec)
+    }
+}
+
+/// The preview encoder for `codec` that actually opens on this host, resolved
+/// ONCE per process (hardware candidates are probed with a real session open;
+/// see `multiview_ffmpeg::select_usable_encoder`). Never probed per tick or per
+/// session.
+fn preview_encoder(codec: VideoCodec) -> Option<&'static str> {
+    use std::sync::OnceLock;
+    static H264: OnceLock<Option<&'static str>> = OnceLock::new();
+    static VP8: OnceLock<Option<&'static str>> = OnceLock::new();
+    let resolve = || {
+        multiview_ffmpeg::select_usable_encoder(codec, &mut |n| {
+            multiview_ffmpeg::probe_encoder_opens(n)
+        })
+    };
+    match codec {
+        VideoCodec::H264 => *H264.get_or_init(resolve),
+        VideoCodec::Vp8 => *VP8.get_or_init(resolve),
+        _ => None,
     }
 }
 
@@ -1126,6 +1216,32 @@ mod tests {
         clippy::panic,
         clippy::indexing_slicing
     )]
+
+    /// Review WHEP-VT-OPEN-FALLBACK: an offered H.264 whose encoder cannot open
+    /// here must not win; VP8 is chosen when offered and usable, else reject.
+    #[test]
+    fn an_unusable_h264_encoder_negotiates_vp8_or_rejects() {
+        use super::choose_offer_codec;
+        use multiview_ffmpeg::VideoCodec;
+        use multiview_preview::whep::PreviewCodec;
+        let all = |_: VideoCodec| true;
+        let no_h264 = |c: VideoCodec| c != VideoCodec::H264;
+        let none = |_: VideoCodec| false;
+        assert_eq!(
+            choose_offer_codec(true, true, all).ok(),
+            Some(PreviewCodec::H264)
+        );
+        assert_eq!(
+            choose_offer_codec(true, true, no_h264).ok(),
+            Some(PreviewCodec::Vp8)
+        );
+        assert!(choose_offer_codec(true, false, no_h264).is_err());
+        assert!(choose_offer_codec(true, true, none).is_err());
+        assert_eq!(
+            choose_offer_codec(false, true, all).ok(),
+            Some(PreviewCodec::Vp8)
+        );
+    }
 
     use std::net::SocketAddr;
     use std::time::Instant;
@@ -1369,6 +1485,7 @@ mod tests {
                 std::collections::HashMap::new(),
             ))),
             program_audio: None,
+            wall: None,
             available: true,
             silence_timeout: super::DEFAULT_SILENCE_TIMEOUT,
         };
@@ -1378,6 +1495,58 @@ mod tests {
             Err(WhepReject::CapacityExceeded { .. })
         ));
         assert_eq!(provider.active_sessions(), 0);
+    }
+
+    #[test]
+    fn wall_media_reads_composed_picture_not_program_and_has_no_audio() {
+        use multiview_compositor::pipeline::Nv12Image;
+        use multiview_control::{WhepProvider, WhepReject, WhepScope};
+        use multiview_preview::whep::transport::PreviewMediaSource;
+        use multiview_preview::whep::PreviewCodec;
+        use std::sync::{Arc, Mutex};
+        let color = multiview_core::color::ColorInfo::default();
+        let program = crate::preview::program_slot();
+        program.store(Some(Arc::new(
+            Nv12Image::solid(64, 36, 16, 128, 128, color).unwrap(),
+        )));
+        let wall = crate::preview::wall_picture_slot();
+        wall.store(Some(Arc::new(crate::preview::WallPicture {
+            generation: 1,
+            image: Arc::new(Nv12Image::solid(64, 36, 120, 128, 128, color).unwrap()),
+        })));
+        let provider = super::CliWhepProvider {
+            demand: None,
+            egress: Arc::new(WhepEgress::new()),
+            state: Arc::new(Mutex::new(super::DriverState::default())),
+            program,
+            stores: Arc::new(multiview_framestore::SwapCell::new(Arc::new(
+                std::collections::HashMap::new(),
+            ))),
+            wall: Some(wall.clone()),
+            program_audio: None,
+            available: true,
+            silence_timeout: super::DEFAULT_SILENCE_TIMEOUT,
+        };
+        let (media, audio) = provider
+            .media_for(&WhepScope::Wall, PreviewCodec::H264, true)
+            .unwrap();
+        assert!(audio.is_none());
+        assert!(media.audio_feed().is_none());
+        assert_eq!(media.slot.load().unwrap().y_plane()[0], 120);
+        wall.store(Some(Arc::new(crate::preview::WallPicture {
+            generation: 2,
+            image: Arc::new(Nv12Image::solid(64, 36, 200, 128, 128, color).unwrap()),
+        })));
+        assert!(
+            media.slot.load().is_none(),
+            "old-generation viewer cannot see new-layout pixels"
+        );
+        wall.store(None);
+        assert!(!provider.wall_available());
+        assert!(matches!(
+            provider.media_for(&WhepScope::Wall, PreviewCodec::H264, false),
+            Err(WhepReject::CapacityExceeded { .. })
+        ));
     }
 
     /// A WHEP offer carrying a recvonly H.264 video m-line (str0m needs real ICE

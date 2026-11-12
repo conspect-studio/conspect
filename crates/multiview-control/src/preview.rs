@@ -58,6 +58,10 @@ pub struct WallCell {
     pub w: u32,
     /// Height in coded pixels.
     pub h: u32,
+    /// Whether this cell currently carries a picture. A cell without one is
+    /// black in the wall; its surface shows the source's own still instead.
+    /// Excluded from layout identity: it changes without a new generation.
+    pub live: bool,
 }
 
 /// Exact wall cadence; never a float frame rate.
@@ -235,6 +239,11 @@ pub trait WhepProvider: Send + Sync {
         false
     }
 
+    /// Whether a composed wall picture source is ready for WebRTC viewers.
+    fn wall_available(&self) -> bool {
+        false
+    }
+
     /// The fidelity label the **program** WHEP scope would carry (ADR-P005/P006).
     ///
     /// `RealEncodedOutput` when the program rendition itself is WebRTC-compatible
@@ -325,6 +334,9 @@ pub struct ScopeCapabilities {
     pub inputs: ScopeCapability,
     /// The per-output rendition scope.
     pub outputs: ScopeCapability,
+    /// Whole-system composed wall; available only while its worker is ready.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub wall: Option<ScopeCapability>,
 }
 
 /// The `GET /api/v1/preview/capabilities` response (ADR-P006 move 6): what preview
@@ -371,6 +383,10 @@ impl PreviewCapabilities {
                     whep: webrtc,
                     fidelity: None,
                 },
+                wall: Some(ScopeCapability {
+                    whep: webrtc && provider.wall_available(),
+                    fidelity: None,
+                }),
             },
             focus: provider.focus_limits(),
             fallback: "jpeg".to_owned(),
@@ -626,6 +642,10 @@ impl WhepProvider for GatedWhep {
 
     fn webrtc_available(&self) -> bool {
         self.inner.webrtc_available()
+    }
+
+    fn wall_available(&self) -> bool {
+        self.inner.wall_available()
     }
 
     fn program_fidelity(&self) -> ProgramFidelity {

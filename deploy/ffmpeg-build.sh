@@ -54,13 +54,38 @@ FF_HWACCEL="${FF_HWACCEL:-vaapi}"
 FF_PREFIX="${FF_PREFIX:-/opt/multiview-ffmpeg}"
 NVCODEC_COMMIT="${NVCODEC_COMMIT:-e844e5b26f46bb77479f063029595293aa8f812d}"
 TARGETARCH="${TARGETARCH:-amd64}"
+# Host OS: Linux builds the container/release prefix; Darwin builds the native
+# macOS prefix (FF_HWACCEL=apple). Shared libraries are named per platform.
+HOST_OS="$(uname -s)"
+cpu_count() { getconf _NPROCESSORS_ONLN 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 4; }
+# The installed major-versioned library for a libav component, e.g.
+# soname avcodec 63 -> libavcodec.so.63 (Linux) / libavcodec.63.dylib (macOS).
+soname() {
+  case "${HOST_OS}" in
+    Darwin) echo "lib/lib$1.$2.dylib" ;;
+    MINGW*|MSYS*|CYGWIN*) echo "bin/$1-$2.dll" ;;
+    *) echo "lib/lib$1.so.$2" ;;
+  esac
+}
+# Run a prefix binary with the prefix's libraries on the loader path.
+with_prefix_libs() {
+  if [ "${HOST_OS}" = "Darwin" ]; then
+    DYLD_LIBRARY_PATH="${FF_PREFIX}/lib:${DYLD_LIBRARY_PATH:-}" "$@"
+  elif [ "${FF_HWACCEL}" = "windows" ]; then
+    # Windows resolves DLLs via PATH: our prefix, then the dependency DLLs
+    # (opus, srt, zlib) from FF_WIN_DEPS (the vcpkg install root).
+    PATH="${FF_PREFIX}/bin:${FF_WIN_DEPS:+${FF_WIN_DEPS}/bin:}${PATH}" "$@"
+  else
+    LD_LIBRARY_PATH="${FF_PREFIX}/lib:${LD_LIBRARY_PATH:-}" "$@"
+  fi
+}
 
 # Run this independently in the image builder AND after installation, so a
 # cached build cannot publish an FFmpeg lacking the promised input/output IO.
 assert_features() {
   local ffmpeg="${FF_PREFIX}/bin/ffmpeg" listing kind name
   for kind in protocols demuxers muxers; do
-    listing="$(LD_LIBRARY_PATH="${FF_PREFIX}/lib:${LD_LIBRARY_PATH:-}" "${ffmpeg}" -hide_banner "-${kind}")"
+    listing="$(with_prefix_libs "${ffmpeg}" -hide_banner "-${kind}")"
     case "${kind}" in
       protocols)
         # SRT is bidirectional. RTSP and HLS are *demuxers*, not protocols.
@@ -226,7 +251,7 @@ fi
 #    a content-pinned git commit. No CUDA SDK: --enable-cuda-llvm JIT-compiles
 #    scale_cuda via clang, keeping the build LGPL-clean (ADR-0031, §4 brief).
 # -----------------------------------------------------------------------------
-if [ "${FF_HWACCEL}" = "nvidia" ]; then
+if [ "${FF_HWACCEL}" = "nvidia" ] || [ "${FF_HWACCEL}" = "windows" ]; then
   git clone https://github.com/FFmpeg/nv-codec-headers.git nv-codec-headers
   git -C nv-codec-headers checkout --quiet "${NVCODEC_COMMIT}"
   make -C nv-codec-headers install "PREFIX=${FF_PREFIX}"
@@ -247,7 +272,11 @@ CONFIGURE_ARGS=(
   --enable-shared --disable-static --enable-version3
   --disable-doc --disable-ffplay --disable-debug --disable-autodetect
   # ffprobe is KEPT (invariant #8: verify output with ffprobe); ffplay dropped.
-  --enable-decoder=h264,hevc,av1,vp9,mpeg2video,mjpeg,ffv1,aac,opus,mp2,ac3,pcm_s16le,pcm_s24le,pcm_f32le,flac
+  # rawvideo: local capture devices (avfoundation/dshow/v4l2) deliver raw frames.
+  # eac3 rides with ac3: ac3dec.c references the E-AC-3 parser; GCC drops it
+  # as dead code without the eac3 decoder, MSVC (Windows profile) does not.
+  # Broadcast HLS/TS commonly carries E-AC-3 too. LGPL.
+  --enable-decoder=h264,hevc,av1,vp9,mpeg2video,mjpeg,ffv1,rawvideo,aac,opus,mp2,ac3,eac3,pcm_s16le,pcm_s24le,pcm_f32le,flac
   # Caption/subtitle decoders the caption pipeline opens by name
   # (multiview-ffmpeg caption_decode: cc_dec=ccaption, webvtt, subrip, mov_text=movtext, ass).
   --enable-decoder=ccaption,webvtt,subrip,movtext,ass
@@ -262,14 +291,21 @@ CONFIGURE_ARGS=(
   --enable-protocol=file,pipe,tcp,udp,rtp,rtmp,http,https,tls,crypto,data,libsrt
   --enable-filter=scale,format,aformat,aresample,anull,null,fps,setpts,asetpts
   --enable-swscale --enable-swresample --enable-avfilter
-  --enable-libopus --enable-libsrt --enable-gnutls
+  --enable-libopus --enable-libsrt
   # zlib: HTTP gzip Content-Encoding — some HLS origins gzip their playlists;
   # without it libav fails the fetch ("need zlib with gzip support"). zlib is
   # zlib-licensed (permissive), so the build stays LGPL-clean.
   --enable-zlib
 )
 
-# Hardware acceleration — both branches are LGPL-clean.
+# TLS: GnuTLS (LGPL) on Linux/macOS; Windows uses Schannel, the system TLS.
+if [ "${FF_HWACCEL}" = "windows" ]; then
+  CONFIGURE_ARGS+=(--enable-schannel)
+else
+  CONFIGURE_ARGS+=(--enable-gnutls)
+fi
+
+# Hardware acceleration — every branch is LGPL-clean.
 case "${FF_HWACCEL}" in
   nvidia)
     # NVENC/NVDEC/cuvid via nv-codec-headers; scale_cuda via cuda-llvm (no SDK).
@@ -306,8 +342,56 @@ case "${FF_HWACCEL}" in
       CONFIGURE_ARGS+=(--enable-libvpl)
     fi
     ;;
+  apple)
+    # Native macOS (ADR-0011): VideoToolbox encode/decode + AudioToolbox, all
+    # Apple system frameworks — LGPL-clean (no --enable-gpl/nonfree). Built
+    # natively on a Mac; containers cannot reach VideoToolbox. Names verified
+    # against the n9.0.2 source (libavcodec/allcodecs.c, hwaccels.h,
+    # libavfilter/allfilters.c). avfoundation is the macOS capture indev.
+    if [ "${HOST_OS}" != "Darwin" ]; then
+      echo "ffmpeg-build: FF_HWACCEL=apple must be built on macOS" >&2
+      exit 2
+    fi
+    # shellcheck disable=SC2054  # commas are FFmpeg list-value syntax (one word)
+    CONFIGURE_ARGS+=(
+      --enable-videotoolbox --enable-audiotoolbox
+      --enable-encoder=h264_videotoolbox,hevc_videotoolbox,prores_videotoolbox
+      --enable-hwaccel=h264_videotoolbox,hevc_videotoolbox,vp9_videotoolbox,av1_videotoolbox,prores_videotoolbox
+      --enable-filter=scale_vt
+      --enable-avfoundation --enable-indev=avfoundation --enable-avdevice
+      --enable-encoder=aac_at --enable-decoder=aac_at
+    )
+    ;;
+  windows)
+    # Native Windows x64 (ADR-0011 amendment), built with MSVC from an MSYS2
+    # shell (vcvars64 environment): NVENC/NVDEC via nv-codec-headers (LGPL,
+    # runtime-loaded), D3D11VA decode, Media Foundation encoders (system;
+    # vendor-neutral fallback), DirectShow capture indev. No GPL, no nonfree.
+    case "${HOST_OS}" in
+      MINGW*|MSYS*|CYGWIN*) ;;
+      *) echo "ffmpeg-build: FF_HWACCEL=windows must be built on Windows (MSYS2 + MSVC)" >&2; exit 2 ;;
+    esac
+    # vcpkg's MSVC zlib is `z.lib`; FFmpeg's MSVC zlib probe links `zlib.lib`.
+    # Provide the alias in a private lib dir (FF_WIN_DEPS = the vcpkg install
+    # root, e.g. .../installed/x64-windows) instead of patching configure.
+    if [ -n "${FF_WIN_DEPS:-}" ] && [ -f "${FF_WIN_DEPS}/lib/z.lib" ] && [ ! -f "${FF_WIN_DEPS}/lib/zlib.lib" ]; then
+      mkdir -p "${WORK}/winlib"
+      cp "${FF_WIN_DEPS}/lib/z.lib" "${WORK}/winlib/zlib.lib"
+      export LIB="$(cygpath -w "${WORK}/winlib");${LIB:-}"
+    fi
+    # shellcheck disable=SC2054  # commas are FFmpeg list-value syntax (one word)
+    CONFIGURE_ARGS+=(
+      --toolchain=msvc --target-os=win64 --arch=x86_64
+      --enable-ffnvcodec --enable-nvenc --enable-nvdec --enable-cuvid
+      --enable-d3d11va --enable-dxva2 --enable-mediafoundation
+      --enable-encoder=h264_nvenc,hevc_nvenc,h264_mf,hevc_mf
+      --enable-decoder=h264_cuvid,hevc_cuvid,av1_cuvid,vp9_cuvid
+      --enable-hwaccel=h264_nvdec,hevc_nvdec,av1_nvdec,vp9_nvdec,h264_d3d11va,hevc_d3d11va,av1_d3d11va,vp9_d3d11va
+      --enable-indev=dshow --enable-avdevice
+    )
+    ;;
   *)
-    echo "ffmpeg-build: unknown FF_HWACCEL='${FF_HWACCEL}' (want nvidia|vaapi)" >&2
+    echo "ffmpeg-build: unknown FF_HWACCEL='${FF_HWACCEL}' (want nvidia|vaapi|apple|windows)" >&2
     exit 2
     ;;
 esac
@@ -369,8 +453,37 @@ for component in LIBSRT_PROTOCOL RTSP_DEMUXER HLS_DEMUXER WAV_DEMUXER \
     exit 5
   fi
 done
-make -j"$(nproc)"
+if [ "${FF_HWACCEL}" = "windows" ]; then
+  for component in H264_NVENC_ENCODER HEVC_NVENC_ENCODER H264_MF_ENCODER H264_D3D11VA_HWACCEL \
+                   H264_NVDEC_HWACCEL DSHOW_INDEV RAWVIDEO_DECODER SCHANNEL; do
+    if ! awk -v n="CONFIG_${component}" '$1 == "#define" && $2 == n && $3 == "1" { found=1 } END { exit !found }' config_components.h config.h 2>/dev/null; then
+      echo "ffmpeg-build: windows profile component ${component} did not survive configure" >&2
+      exit 5
+    fi
+  done
+fi
+if [ "${FF_HWACCEL}" = "apple" ]; then
+  # The apple profile's own components must survive dependency resolution too.
+  for component in AVFOUNDATION_INDEV RAWVIDEO_DECODER H264_VIDEOTOOLBOX_ENCODER HEVC_VIDEOTOOLBOX_ENCODER \
+                   H264_VIDEOTOOLBOX_HWACCEL HEVC_VIDEOTOOLBOX_HWACCEL SCALE_VT_FILTER \
+                   AAC_AT_ENCODER AAC_AT_DECODER; do
+    if ! awk -v n="CONFIG_${component}" '$1 == "#define" && $2 == n && $3 == "1" { found=1 } END { exit !found }' config_components.h; then
+      echo "ffmpeg-build: apple profile component ${component} did not survive configure" >&2
+      exit 5
+    fi
+  done
+fi
+make -j"$(cpu_count)"
 make install
+if [ "${FF_HWACCEL}" = "windows" ]; then
+  # MSYS writes POSIX paths (/s/...) into the .pc files; native consumers
+  # (pkg-config-rs under MSVC, cargo build scripts) need S:/... form.
+  # MSVC builds install the import libraries (avcodec.lib, ...) next to the
+  # DLLs in bin/; Rust's ffmpeg-sys (FFMPEG_DIR) and pkg-config look in lib/.
+  cp "${FF_PREFIX}"/bin/*.lib "${FF_PREFIX}/lib/"
+  win_prefix="$(cygpath -m "${FF_PREFIX}")"
+  sed -i "s#$(printf '%s' "${FF_PREFIX}" | sed 's/[#&]/\\&/g')#${win_prefix}#g" "${FF_PREFIX}"/lib/pkgconfig/*.pc
+fi
 
 # Licence texts travel WITH the libraries: every artifact that conveys these
 # libav* binaries (app images, release tarballs) copies ${FF_PREFIX}/share/licenses.
@@ -386,10 +499,10 @@ install -m 0644 LICENSE.md COPYING.LGPLv3 COPYING.GPLv3 COPYING.LGPLv2.1 COPYING
 #    survived dependency resolution) and the FFmpeg 9.0.2 sonames. Fail the BUILD
 #    here rather than shipping an unusable image.
 # -----------------------------------------------------------------------------
-test -e "${FF_PREFIX}/lib/libavcodec.so.63"
-test -e "${FF_PREFIX}/lib/libavutil.so.61"
-test -e "${FF_PREFIX}/lib/libavformat.so.63"
+test -e "${FF_PREFIX}/$(soname avcodec 63)"
+test -e "${FF_PREFIX}/$(soname avutil 61)"
+test -e "${FF_PREFIX}/$(soname avformat 63)"
 test -s "${FF_PREFIX}/share/licenses/ffmpeg/COPYING.LGPLv3"
 test -s "${FF_PREFIX}/share/licenses/ffmpeg/COPYING.GPLv3"
 assert_features
-echo "ffmpeg-build: OK — FFmpeg ${FFMPEG_VERSION} installed to ${FF_PREFIX} (libavcodec.so.63)."
+echo "ffmpeg-build: OK — FFmpeg ${FFMPEG_VERSION} installed to ${FF_PREFIX} ($(soname avcodec 63))."

@@ -2,7 +2,7 @@
 // These tests use the real <MoqPlayer> and the real <PreviewSurface>; only the
 // playback function, the WHEP player and the still poll are replaced.
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { useState, type JSX } from 'react';
+import { useEffect, useRef, useState, type JSX } from 'react';
 import { act, fireEvent } from '@testing-library/react';
 import { renderWithProviders } from '../test/render';
 
@@ -13,7 +13,20 @@ vi.mock('./moqPlayback', () => ({
   MoqReleaseUnacknowledged: mocks.Unacknowledged,
   startMoqPlaybackWithRefresh: mocks.start,
 }));
-vi.mock('./WhepPlayer', () => ({ WhepPlayer: () => <div data-testid="whep" /> }));
+const whep = vi.hoisted(() => ({ release: undefined as undefined | (() => void) }));
+vi.mock('./WhepPlayer', () => ({ WhepPlayer: ({ onLeaseState, onSessionReleased }: {
+  onLeaseState?: (state: 'negotiating' | 'active' | 'released') => void; onSessionReleased?: () => void;
+}) => {
+  const callbacks = useRef({ onLeaseState, onSessionReleased });
+  useEffect(() => { callbacks.current = { onLeaseState, onSessionReleased }; });
+  useEffect(() => {
+    callbacks.current.onLeaseState?.('negotiating');
+    callbacks.current.onLeaseState?.('active');
+    whep.release = () => { callbacks.current.onLeaseState?.('released'); callbacks.current.onSessionReleased?.(); };
+    return () => { whep.release = undefined; };
+  }, []);
+  return <div data-testid="whep" />;
+} }));
 vi.mock('./useJpegPreview', () => ({ useJpegStill: () => ({ src: undefined, state: 'loading' }), useJpegPreview: () => undefined }));
 import { MOQ_UNACKNOWLEDGED_HOLD_MS } from './MoqPlayer';
 import { PreviewSurface } from './PreviewSurface';
@@ -59,23 +72,47 @@ function Consumer({ onLease }: { readonly onLease: (state: string) => void }): J
 afterEach(() => { vi.useRealTimers(); });
 
 describe('unacknowledged MoQ release', () => {
-  it('shows stills while the lease can still be held, then opens WebRTC and reports released once', async () => {
+  it('opens WebRTC while MoQ is held, keeps it after release, and reports released only when both end', async () => {
     vi.useFakeTimers();
     mocks.start.mockReset();
     mocks.start.mockRejectedValue(new mocks.Unacknowledged('not acknowledged'));
     const onLeaseState = vi.fn();
     const view = surface(onLeaseState);
     await advance(0);
-    expect(view.getByTestId('jpeg-rung')).toBeInTheDocument();
-    expect(view.queryByTestId('whep')).toBeNull();
+    expect(view.getByTestId('whep')).toBeInTheDocument();
+    expect(view.queryByTestId('jpeg-rung')).toBeNull();
+    expect(view.getByTestId('moq-fallback-note')).toHaveTextContent('release-unacknowledged');
     await advance(MOQ_UNACKNOWLEDGED_HOLD_MS - 1);
-    expect(view.queryByTestId('whep')).toBeNull();
+    expect(view.getByTestId('whep')).toBeInTheDocument();
     expect(releasedCalls(onLeaseState)).toBe(0);
-    expect(seen[seen.length - 1]).toEqual({ transport: 'jpeg', reason: 'release-unacknowledged' });
+    expect(seen[seen.length - 1]).toEqual({ transport: 'webrtc', reason: 'release-unacknowledged' });
     await advance(1);
     expect(view.getByTestId('whep')).toBeInTheDocument();
+    expect(releasedCalls(onLeaseState)).toBe(0);
+    act(() => { whep.release?.(); });
     expect(releasedCalls(onLeaseState)).toBe(1);
-    expect(seen[seen.length - 1]).toEqual({ transport: 'webrtc', reason: 'release-unacknowledged' });
+    expect(mocks.start).toHaveBeenCalledTimes(1);
+  });
+
+  it('withholds consumer release until MoQ expires after WebRTC has released', async () => {
+    vi.useFakeTimers();
+    mocks.start.mockReset();
+    mocks.start.mockRejectedValue(new mocks.Unacknowledged('not acknowledged'));
+    const onLeaseState = vi.fn();
+    const onSessionReleased = vi.fn();
+    const view = renderWithProviders(<PreviewSurface scope="program" whepEndpoint="/api/v1/preview/program/whep"
+      jpegPath="/jpeg" label="preview" capabilities={both} onLeaseState={onLeaseState}
+      onSessionReleased={onSessionReleased} />);
+    await advance(0);
+    expect(view.getByTestId('whep')).toBeInTheDocument();
+    act(() => { whep.release?.(); });
+    expect(releasedCalls(onLeaseState)).toBe(0);
+    expect(onSessionReleased).not.toHaveBeenCalled();
+    await advance(MOQ_UNACKNOWLEDGED_HOLD_MS - 1);
+    expect(onSessionReleased).not.toHaveBeenCalled();
+    await advance(1);
+    expect(releasedCalls(onLeaseState)).toBe(1);
+    expect(onSessionReleased).toHaveBeenCalledOnce();
   });
 
   it('reports released after the hold when the surface was unmounted before the release failed', async () => {
@@ -93,6 +130,31 @@ describe('unacknowledged MoQ release', () => {
     expect(releasedCalls(onLeaseState)).toBe(0);
     await advance(1);
     expect(releasedCalls(onLeaseState)).toBe(1);
+  });
+
+  it('ignores a late old WHEP release after a new Program session mounts', async () => {
+    vi.useFakeTimers();
+    mocks.start.mockReset();
+    mocks.start.mockRejectedValueOnce(new mocks.Unacknowledged('not acknowledged'))
+      .mockImplementationOnce((options: { onActive: () => void }) => {
+        options.onActive();
+        return new Promise<void>(() => { /* new Program remains active */ });
+      });
+    const onLease = vi.fn();
+    const view = renderWithProviders(<Consumer onLease={onLease} />);
+    await advance(0);
+    expect(view.getByTestId('whep')).toBeInTheDocument();
+    const oldWhepRelease = whep.release;
+    fireEvent.click(view.getByText('toggle'));
+    await advance(MOQ_UNACKNOWLEDGED_HOLD_MS);
+    expect(releasedCalls(onLease)).toBe(0);
+    fireEvent.click(view.getByText('toggle'));
+    await advance(0);
+    expect(onLease).toHaveBeenLastCalledWith('active');
+    const before = onLease.mock.calls.length;
+    act(() => { oldWhepRelease?.(); });
+    expect(onLease.mock.calls.slice(before)).toEqual([]);
+    expect(onLease).toHaveBeenLastCalledWith('active');
   });
 
   it('does not let the old hold mark a new session released when the surface is mounted again within the hold', async () => {

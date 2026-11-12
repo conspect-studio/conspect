@@ -51,11 +51,16 @@ describe('transport ladder: MoQ, then WebRTC, then stills',()=>{
   fireEvent.click(view.getByText(reason));
   expect(view.getByTestId('whep')).toBeInTheDocument(); expect(view.queryByTestId('moq-fallback-note')).toBeNull();
  });
- it('shows stills, not WebRTC, while an unacknowledged MoQ lease can still be held (the hold itself: MoqReleaseHold.test.tsx)',()=>{
+ it('opens WebRTC during an unacknowledged MoQ hold',()=>{
   const view=surface(both);
   fireEvent.click(view.getByText('release-unacknowledged'));
-  expect(view.queryByTestId('whep')).toBeNull(); expect(view.getByTestId('jpeg-rung')).toBeInTheDocument();
-  expect(view.getByTestId('fallback-badge')).toBeInTheDocument();
+  expect(view.getByTestId('whep')).toBeInTheDocument(); expect(view.queryByTestId('jpeg-rung')).toBeNull();
+  expect(view.getByTestId('moq-fallback-note')).toHaveTextContent('release-unacknowledged');
+  expect(last()).toEqual({transport:'webrtc',reason:'release-unacknowledged'});
+  view.unmount();
+  const stills=surface(moqOnly);
+  fireEvent.click(stills.getByText('release-unacknowledged'));
+  expect(stills.getByTestId('jpeg-rung')).toBeInTheDocument();
   expect(last()).toEqual({transport:'jpeg',reason:'release-unacknowledged'});
  });
  it('starts at MoQ again, with no stale reason, when the surface is reused for another source',()=>{

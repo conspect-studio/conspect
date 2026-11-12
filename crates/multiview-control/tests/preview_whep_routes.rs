@@ -20,8 +20,8 @@ use std::sync::{Arc, Mutex};
 use axum::body::Body;
 use axum::http::{header, Request, StatusCode};
 use multiview_control::{
-    command_bus, ApiKeyStore, AppState, InMemoryRepository, Principal, Role, WhepAnswer,
-    WhepProvider, WhepReject, WhepScope,
+    command_bus, ApiKeyStore, AppState, InMemoryRepository, PreviewProvider, Principal, Role,
+    WhepAnswer, WhepProvider, WhepReject, WhepScope,
 };
 use multiview_engine::EnginePublisher;
 
@@ -100,11 +100,42 @@ a=rtpmap:96 H264/90000\r\na=sendonly\r\n"
     fn active_sessions(&self) -> usize {
         self.sessions.lock().unwrap().len()
     }
+
+    fn wall_available(&self) -> bool {
+        true
+    }
 }
 
 /// Build an `AppState` + router with the four seeded keys and the given fake
 /// WHEP provider, so the route layer can be exercised end-to-end.
+struct FakeWall;
+impl PreviewProvider for FakeWall {
+    fn program_jpeg(&self, _: u8) -> Option<Vec<u8>> {
+        None
+    }
+    fn input_jpeg(&self, _: &str, _: u8) -> Option<Vec<u8>> {
+        None
+    }
+    fn input_ids(&self) -> Vec<String> {
+        Vec::new()
+    }
+    fn wall(&self) -> Option<multiview_control::preview::WallGeometry> {
+        Some(multiview_control::preview::WallGeometry {
+            generation: 1,
+            width: 64,
+            height: 64,
+            cadence: multiview_control::preview::WallCadence { num: 15, den: 1 },
+            cells: Vec::new(),
+            preview_source: None,
+        })
+    }
+}
+
 fn router_with_whep(whep: Arc<FakeWhep>) -> axum::Router {
+    router_with_optional_wall(whep, false)
+}
+
+fn router_with_optional_wall(whep: Arc<FakeWhep>, wall: bool) -> axum::Router {
     let engine = Arc::new(EnginePublisher::new(64));
     let (tx, _rx) = command_bus(4);
     let mut keys = ApiKeyStore::new(PEPPER.to_vec());
@@ -157,6 +188,11 @@ fn router_with_whep(whep: Arc<FakeWhep>) -> axum::Router {
         Arc::new(keys),
     )
     .with_whep(whep);
+    let state = if wall {
+        state.with_preview(Arc::new(FakeWall))
+    } else {
+        state
+    };
     multiview_control::router(state)
 }
 

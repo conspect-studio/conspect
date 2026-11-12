@@ -12,6 +12,9 @@ authors.workspace = true
 publish = false
 
 [dependencies]
+# The capture runtime inside is unix-only (process groups, openat-pinned
+# files); on other platforms only its portable request model is built and the
+# control plane reports capture unavailable.
 multiview-webengine = { path = "../multiview-webengine" }
 rustix = { version = "1", features = ["fs", "process"] }
 multiview-moq = { path = "../multiview-moq", optional = true }
@@ -246,6 +249,8 @@ tempfile = "3"
 # (the `tokio-rustls`/`reqwest`/`ring` posture already documented above).
 rustls = { version = "0.23", optional = true }
 rustls-pki-types = { version = "1", features = ["std"], optional = true }
+
+
 
 [dev-dependencies]
 hang = "=0.21.22"

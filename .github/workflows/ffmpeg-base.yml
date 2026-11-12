@@ -23,6 +23,7 @@ on:
     paths:
       - "deploy/ffmpeg-build.sh"
       - "deploy/ffmpeg-fetch-source.sh"
+      - "deploy/ffmpeg-signing-key.asc"
       - "deploy/ffmpeg-patches/**"
       - "deploy/Dockerfile.ffmpeg"
       - ".github/workflows/ffmpeg-base.yml"
@@ -30,6 +31,7 @@ on:
     paths:
       - "deploy/ffmpeg-build.sh"
       - "deploy/ffmpeg-fetch-source.sh"
+      - "deploy/ffmpeg-signing-key.asc"
       - "deploy/ffmpeg-patches/**"
       - "deploy/Dockerfile.ffmpeg"
       - ".github/workflows/ffmpeg-base.yml"

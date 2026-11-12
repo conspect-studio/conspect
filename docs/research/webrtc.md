@@ -204,6 +204,8 @@ Dotted edges are drop-oldest rings — nothing on the engine side ever blocks on
 
 ## 3. Port & firewall model
 
+> **Superseded port model (2026-11-12).** [ADR-0107](../decisions/ADR-0107-single-front-door-443.md) moves WebRTC media onto the engine's shared UDP 443 socket (first-byte demux with QUIC) plus ICE-TCP on TCP 443, and adds a minimal built-in TURN-over-TLS server. The table below describes the pre-ADR-0107 layout (`webrtc.udp_port` 8189). See [network-front-door](../architecture/network-front-door.md).
+
 The entire subsystem needs exactly **one new UDP port**. Signaling rides the existing control-plane
 HTTP listener; there are no per-session port ranges and Multiview does not *run* a STUN/TURN server.
 It **is** an in-crate TURN *client* (Amendment 2026-06-13, [ADR-0048 §5.1](../decisions/ADR-0048.md)):

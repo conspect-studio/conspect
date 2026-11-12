@@ -2412,6 +2412,40 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/preview/wall/whep": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Open the video-only whole-system wall focus (Write + unscoped principal). */
+        post: operations["wall_whep_open"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/preview/wall/whep/{session_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post?: never;
+        /** Release the whole-system wall WHEP session. */
+        delete: operations["wall_whep_close"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/probes": {
         parameters: {
             query?: never;
@@ -6955,6 +6989,7 @@ export interface components {
             outputs: components["schemas"]["ScopeCapability"];
             /** @description The composited program canvas scope. */
             program: components["schemas"]["ScopeCapability"];
+            wall?: null | components["schemas"]["ScopeCapability"];
         };
         /** @description Per-scope WHEP availability (plus the program scope's fidelity label). */
         ScopeCapability: {
@@ -8215,6 +8250,12 @@ export interface components {
              * @description Height in coded pixels.
              */
             h: number;
+            /**
+             * @description Whether this cell currently carries a picture. A cell without one is
+             *     black in the wall; its surface shows the source's own still instead.
+             *     Excluded from layout identity: it changes without a new generation.
+             */
+            live: boolean;
             /** @description Source (input) id whose newest frame fills this rectangle. */
             source: string;
             /**
@@ -15425,6 +15466,115 @@ export interface operations {
             };
             /** @description Generation mismatch */
             409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
+    wall_whep_open: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** @description SDP offer */
+        requestBody: {
+            content: {
+                "application/sdp": string;
+            };
+        };
+        responses: {
+            /** @description Wall focus opened; SDP answer and Location. */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/sdp": unknown;
+                };
+            };
+            /** @description Missing credentials */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Scoped or read-only principal */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Unsupported codec */
+            415: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Wall unavailable or focus capacity exhausted */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
+    wall_whep_close: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description WHEP session id */
+                session_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Wall focus released */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Missing credentials */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Scoped or read-only principal */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description No such session */
+            404: {
                 headers: {
                     [name: string]: unknown;
                 };

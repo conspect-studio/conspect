@@ -6050,15 +6050,15 @@ msgstr ""
 msgid "Live host and accelerator utilisation streaming from the engine."
 msgstr ""
 
-#: src/preview/PreviewSurface.tsx:326
+#: src/preview/PreviewSurface.tsx:332
 msgid "Live input preview failed."
 msgstr ""
 
-#: src/preview/PreviewSurface.tsx:326
+#: src/preview/PreviewSurface.tsx:332
 msgid "Live input preview is busy. Another viewer has the session."
 msgstr ""
 
-#: src/preview/PreviewSurface.tsx:330
+#: src/preview/PreviewSurface.tsx:336
 msgid "Live preview is busy. Another viewer has the session."
 msgstr ""
 
@@ -6753,11 +6753,11 @@ msgstr ""
 msgid "Mono"
 msgstr ""
 
-#: src/preview/PreviewSurface.tsx:294
+#: src/preview/PreviewSurface.tsx:306
 msgid "MoQ video is not in use ({moqReason}). Showing the next available preview."
 msgstr ""
 
-#: src/preview/PreviewSurface.tsx:293
+#: src/preview/PreviewSurface.tsx:305
 msgid "MoQ video was refused: this account has no access to it. Showing the next available preview."
 msgstr ""
 
@@ -12146,6 +12146,10 @@ msgstr ""
 msgid "Wall tiles are live video from one shared MoQ stream; a tile without a live cell shows its still."
 msgstr ""
 
+#: src/components/broadcast/ProductionDesk.tsx:89
+msgid "Wall tiles are live video from one shared WebRTC session; a tile without a live cell shows its still."
+msgstr ""
+
 #: src/components/broadcast/ProductionDesk.tsx:90
 msgid "Wall tiles are still previews refreshed every ~2 s — not live video."
 msgstr ""
@@ -12382,7 +12386,7 @@ msgstr ""
 msgid "Whole mix overview"
 msgstr ""
 
-#: src/preview/PreviewSurface.tsx:348
+#: src/preview/PreviewSurface.tsx:354
 msgid "Why live preview failed"
 msgstr ""
 

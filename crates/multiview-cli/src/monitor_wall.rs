@@ -169,6 +169,7 @@ pub fn assign_cells(config: &WallConfig, ids: &[String]) -> Vec<WallCell> {
             y: (index / config.columns) * config.cell_height,
             w: config.cell_width,
             h: config.cell_height,
+            live: false,
         })
         .collect()
 }
@@ -268,10 +269,11 @@ impl Drop for WallWorker {
 
 /// Clears the published geometry when the worker thread ends for any reason,
 /// including a panic unwinding the thread, so the route answers 503.
-struct GeometryGuard(WallSlot);
+struct GeometryGuard(WallSlot, crate::preview::WallPictureSlot);
 impl Drop for GeometryGuard {
     fn drop(&mut self) {
         self.0.store(None);
+        self.1.store(None);
     }
 }
 
@@ -289,6 +291,7 @@ pub fn spawn(
     stores: SharedStores,
     slot: WindowSubscriptionSlot,
     geometry: WallSlot,
+    picture: crate::preview::WallPictureSlot,
 ) -> std::io::Result<WallWorker> {
     spawn_inner(
         config,
@@ -296,6 +299,7 @@ pub fn spawn(
         stores,
         slot,
         geometry,
+        picture,
         #[cfg(test)]
         None,
     )
@@ -307,6 +311,7 @@ fn spawn_inner(
     stores: SharedStores,
     slot: WindowSubscriptionSlot,
     geometry: WallSlot,
+    picture: crate::preview::WallPictureSlot,
     #[cfg(test)] hook: Option<FrameHook>,
 ) -> std::io::Result<WallWorker> {
     let stop = Arc::new(AtomicBool::new(false));
@@ -314,7 +319,7 @@ fn spawn_inner(
     std::thread::Builder::new()
         .name("moq-wall".into())
         .spawn(move || {
-            let _guard = GeometryGuard(geometry.clone());
+            let _guard = GeometryGuard(geometry.clone(), picture.clone());
             let cadence = config.cadence(production_cadence);
             let mut run = Run {
                 publisher: None,
@@ -322,8 +327,10 @@ fn spawn_inner(
                 cadence,
                 stores,
                 geometry,
+                picture,
                 generation: 0,
                 cells: Vec::new(),
+                live_changed: false,
                 #[cfg(test)]
                 hook,
             };
@@ -344,8 +351,11 @@ struct Run {
     cadence: Rational,
     stores: SharedStores,
     geometry: WallSlot,
+    picture: crate::preview::WallPictureSlot,
     generation: u64,
     cells: Vec<WallCell>,
+    /// A cell's `live` flag changed since the last published geometry.
+    live_changed: bool,
     #[cfg(test)]
     hook: Option<FrameHook>,
 }
@@ -393,6 +403,7 @@ impl Run {
             let Some(factory) = current.as_ref() else {
                 session = None;
                 self.geometry.store(None);
+                self.picture.store(None);
                 continue;
             };
             if session
@@ -401,6 +412,7 @@ impl Run {
             {
                 session = None;
                 self.geometry.store(None);
+                self.picture.store(None);
             }
             // A changed cell set never changes the running encode: the session
             // (and its registration, whose dependencies are exactly the encoded
@@ -409,6 +421,7 @@ impl Run {
             // old registration; the UI reopens on the generation change.
             if self.refresh_cells() && session.take().is_some() {
                 self.geometry.store(None);
+                self.picture.store(None);
                 failed_for = None;
             }
             let Some(picture) = compose(&self.config, &self.cells, &self.stores) else {
@@ -428,6 +441,11 @@ impl Run {
                             "monitor wall encoder opened once for this run"
                         );
                         session = Some(opened);
+                        self.picture
+                            .store(Some(Arc::new(crate::preview::WallPicture {
+                                generation: self.generation,
+                                image: Arc::new(picture),
+                            })));
                         self.publish_geometry();
                     }
                     Err(reason) => {
@@ -445,26 +463,44 @@ impl Run {
                 failed_for = Some(Arc::as_ptr(&active.factory).addr());
                 session = None;
                 self.geometry.store(None);
+                self.picture.store(None);
                 continue;
             }
+            // Publish after a successful encode; a stalled WHEP peer only samples
+            // this wait-free latest value and cannot delay this worker.
+            self.picture
+                .store(Some(Arc::new(crate::preview::WallPicture {
+                    generation: self.generation,
+                    image: Arc::new(picture),
+                })));
             self.publish_geometry();
         }
     }
 
     /// Returns true when the cell assignment changed.
     fn refresh_cells(&mut self) -> bool {
-        // Only sources that have ever produced a frame get a cell: a source with
-        // no picture keeps its own still/"starting" surface on the desk rather
-        // than a black live tile.
-        let ids: Vec<String> = self
-            .stores
-            .load()
-            .iter()
-            .filter(|(_, store)| store.slot().load().is_some())
-            .map(|(id, _)| id.clone())
-            .collect();
-        let cells = assign_cells(&self.config, &ids);
-        if cells == self.cells {
+        // The layout is every configured source, so a source that warms up or
+        // idles never reshapes the wall (which would reopen the encoder and end
+        // every viewer's lease). Whether a cell has a picture is published per
+        // cell as `live`, without a new generation.
+        let snapshot = self.stores.load();
+        let ids: Vec<String> = snapshot.keys().cloned().collect();
+        let mut cells = assign_cells(&self.config, &ids);
+        for cell in &mut cells {
+            cell.live = snapshot
+                .get(&cell.source)
+                .is_some_and(|store| store.slot().load().is_some());
+        }
+        let layout_changed = cells.len() != self.cells.len()
+            || cells
+                .iter()
+                .zip(&self.cells)
+                .any(|(a, b)| (&a.source, a.x, a.y, a.w, a.h) != (&b.source, b.x, b.y, b.w, b.h));
+        if !layout_changed {
+            if cells != self.cells {
+                self.cells = cells;
+                self.live_changed = true;
+            }
             return false;
         }
         self.cells = cells;
@@ -472,11 +508,12 @@ impl Run {
         true
     }
 
-    fn publish_geometry(&self) {
-        let fresh = self
-            .geometry
-            .load()
-            .is_none_or(|current| current.generation != self.generation);
+    fn publish_geometry(&mut self) {
+        let fresh = std::mem::take(&mut self.live_changed)
+            || self
+                .geometry
+                .load()
+                .is_none_or(|current| current.generation != self.generation);
         if fresh {
             self.geometry.store(Some(Arc::new(WallGeometry {
                 generation: self.generation,
@@ -694,8 +731,10 @@ mod tests {
             cadence: config.cadence(Rational::new(30_000, 1001)),
             stores: crate::live_sources::shared_stores(std::collections::HashMap::new()),
             geometry: crate::preview::wall_slot(),
+            picture: crate::preview::wall_picture_slot(),
             generation: 0,
             cells: Vec::new(),
+            live_changed: false,
             hook: None,
         }
         .frame_period();
@@ -760,7 +799,7 @@ mod tests {
     }
 
     #[test]
-    fn a_source_without_any_frame_gets_no_cell() {
+    fn a_cold_source_keeps_its_cell_and_warming_up_never_reshapes_the_wall() {
         let color = ColorInfo::default().resolve_defaults(64, 36);
         let live = Arc::new(multiview_framestore::TileStore::<Nv12Image>::with_defaults(
             "live",
@@ -769,38 +808,50 @@ mod tests {
             Nv12Image::solid(64, 36, 90, 128, 128, color).unwrap(),
             multiview_core::time::MediaTime::ZERO,
         );
+        let cold = Arc::new(multiview_framestore::TileStore::<Nv12Image>::with_defaults(
+            "cold",
+        ));
         let mut map = std::collections::HashMap::new();
         map.insert("live".to_owned(), live);
-        map.insert(
-            "cold".to_owned(),
-            Arc::new(multiview_framestore::TileStore::<Nv12Image>::with_defaults(
-                "cold",
-            )),
-        );
+        map.insert("cold".to_owned(), cold.clone());
         let mut run = Run {
             publisher: None,
             config: WallConfig::default(),
             cadence: Rational::new(15, 1),
             stores: crate::live_sources::shared_stores(map),
             geometry: crate::preview::wall_slot(),
+            picture: crate::preview::wall_picture_slot(),
             generation: 0,
             cells: Vec::new(),
+            live_changed: false,
             hook: None,
         };
-        assert!(run.refresh_cells());
-        let sources: Vec<&str> = run.cells.iter().map(|c| c.source.as_str()).collect();
-        assert_eq!(
-            sources,
-            vec!["live"],
-            "a cold source keeps its still, not a black tile"
+        assert!(run.refresh_cells(), "first layout");
+        let generation = run.generation;
+        let flags: Vec<(&str, bool)> = run
+            .cells
+            .iter()
+            .map(|c| (c.source.as_str(), c.live))
+            .collect();
+        assert_eq!(flags, vec![("cold", false), ("live", true)]);
+        // The cold source produces its first frame: same layout, same
+        // generation (no encoder reopen, no lease churn), only `live` flips.
+        cold.publish(
+            Nv12Image::solid(64, 36, 90, 128, 128, color).unwrap(),
+            multiview_core::time::MediaTime::ZERO,
         );
+        assert!(!run.refresh_cells(), "warming up is not a layout change");
+        assert_eq!(run.generation, generation);
+        assert!(run.cells.iter().all(|c| c.live));
+        run.publish_geometry();
+        assert!(run.geometry.load().unwrap().cells.iter().all(|c| c.live));
     }
 
     #[test]
     fn a_dead_worker_withdraws_the_geometry() {
         let geometry = crate::preview::wall_slot();
         {
-            let _guard = GeometryGuard(geometry.clone());
+            let _guard = GeometryGuard(geometry.clone(), crate::preview::wall_picture_slot());
             geometry.store(Some(Arc::new(WallGeometry {
                 generation: 1,
                 width: 2,
@@ -869,6 +920,7 @@ segment_ms = 1000
             stores,
             pipeline.window_subscriptions(),
             geometry.clone(),
+            crate::preview::wall_picture_slot(),
             Some(hook),
         )
         .unwrap();
@@ -972,6 +1024,7 @@ segment_ms = 1000
         let factory = Arc::new(factory);
         slot.store(Some(factory.clone()));
         let geometry = crate::preview::wall_slot();
+        let picture = crate::preview::wall_picture_slot();
         let wall = WallConfig {
             columns: 2,
             rows: 1,
@@ -981,7 +1034,15 @@ segment_ms = 1000
             bitrate_bps: 500_000,
             encoder: "libx264".to_owned(),
         };
-        let _worker = spawn(wall, Rational::new(25, 1), stores, slot, geometry.clone()).unwrap();
+        let _worker = spawn(
+            wall,
+            Rational::new(25, 1),
+            stores,
+            slot,
+            geometry.clone(),
+            picture.clone(),
+        )
+        .unwrap();
         let deadline = Instant::now() + Duration::from_secs(10);
         while geometry.load().is_none() {
             assert!(Instant::now() < deadline, "wall never became ready");
@@ -989,6 +1050,13 @@ segment_ms = 1000
             std::thread::sleep(Duration::from_millis(10));
         }
         let published = geometry.load().unwrap();
+        let composed = picture.load().expect("wall WHEP samples composed NV12");
+        assert_eq!((composed.image.width(), composed.image.height()), (128, 36));
+        assert_eq!(
+            composed.image.y_plane()[0],
+            120,
+            "wall cell, not Program pixels"
+        );
         // Production runner 0 is not yet effective here (as with an H.264 output
         // still awaiting its first keyframe); the wall must not take its index.
         let wall_index = factory

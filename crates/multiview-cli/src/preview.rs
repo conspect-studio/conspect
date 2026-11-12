@@ -33,6 +33,24 @@ pub type ProgramSlot = Arc<multiview_framestore::SwapCell<Option<Arc<Nv12Image>>
 pub type WallSlot =
     Arc<multiview_framestore::SwapCell<Option<Arc<multiview_control::preview::WallGeometry>>>>;
 
+/// One composed wall picture and the layout generation of its source cells.
+#[derive(Debug)]
+pub struct WallPicture {
+    /// Changes whenever the wall cells change; an old WHEP focus must not see new pixels.
+    pub generation: u64,
+    /// The encoded worker's newest composed picture.
+    pub image: Arc<Nv12Image>,
+}
+
+/// Wait-free latest composed wall picture, never the Program picture.
+pub type WallPictureSlot = Arc<multiview_framestore::SwapCell<Option<Arc<WallPicture>>>>;
+
+/// Shared newest composed wall picture; read without a lock by WHEP encoders.
+#[must_use]
+pub fn wall_picture_slot() -> WallPictureSlot {
+    Arc::new(multiview_framestore::SwapCell::empty())
+}
+
 /// Create an empty wall-geometry slot.
 #[must_use]
 pub fn wall_slot() -> WallSlot {

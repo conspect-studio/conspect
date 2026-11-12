@@ -10,12 +10,12 @@ export function WallStreamProvider({ children, deps }: { readonly children: Reac
   const [store] = useState(() => new WallStore(deps));
   useEffect(() => {
     store.start();
-    return () => { store.stop(); };
+    return () => { store.stop(); store.dispose(); };
   }, [store]);
   return <WallContext.Provider value={store}>{children}</WallContext.Provider>;
 }
 
-const NONE: WallSnapshot = { geometry: undefined };
+const NONE: WallSnapshot = { geometry: undefined, transport: 'stills' };
 const noopSubscribe = (): (() => void) => () => undefined;
 
 export interface WallSurface {
@@ -27,10 +27,10 @@ export interface WallSurface {
 
 /** Whole-wall state for the desk note: live, or the reason surfaces show stills. */
 // eslint-disable-next-line react-refresh/only-export-components -- hook colocated with its context
-export function useWallStatus(): { readonly live: boolean; readonly reason: string | undefined } {
+export function useWallStatus(): { readonly live: boolean; readonly reason: string | undefined; readonly transport: WallSnapshot['transport'] } {
   const store = useContext(WallContext);
   const snapshot = useSyncExternalStore(store?.subscribeState ?? noopSubscribe, store?.getSnapshot ?? (() => NONE));
-  return { live: snapshot.geometry !== undefined, reason: snapshot.reason };
+  return { live: snapshot.geometry !== undefined, reason: snapshot.reason, transport: snapshot.transport };
 }
 
 /** Live state of one surface: true only when the wall is streaming and the cell exists. */
@@ -55,9 +55,11 @@ export function WallCrop({ source, label, className, testId }: {
     if (!store || !target || x === undefined || y === undefined || w === undefined || h === undefined) return;
     const ctx = target.getContext('2d');
     if (!ctx) return;
-    return store.subscribeFrames((frame) => {
-      const rect = cropRect({ source, x, y, w, h }, frame.displayWidth, frame.displayHeight);
-      if (rect) ctx.drawImage(frame, rect[0], rect[1], rect[2], rect[3], 0, 0, target.width, target.height);
+    // `picture` is the store's canvas, already converted from the decoded frame:
+    // a crop from it is a small copy, not another whole-frame conversion.
+    return store.subscribeFrames((picture) => {
+      const rect = cropRect({ source, x, y, w, h }, picture.width, picture.height);
+      if (rect) ctx.drawImage(picture, rect[0], rect[1], rect[2], rect[3], 0, 0, target.width, target.height);
     });
   }, [store, source, x, y, w, h]);
   return <canvas ref={canvas} width={w ?? 0} height={h ?? 0} role="img" aria-label={label} className={className} data-wall-live="1" data-testid={testId ?? 'wall-crop'} />;

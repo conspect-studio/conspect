@@ -5,6 +5,7 @@
 // React re-render. Each surface falls back to its own still when the wall is not live.
 import { startMoqPlaybackWithRefresh } from './moqPlayback';
 import { createWallLeaseApi, fetchWall, type WallGeometry } from './wallApi';
+import { playWallWhep, type WallWhepOptions } from './wallWhep';
 
 export const WALL_POLL_MS = 2000;
 export const WALL_STALE_MS = 2000;
@@ -29,15 +30,17 @@ export type WallPlay = typeof startMoqPlaybackWithRefresh;
 export interface WallDeps {
   readonly fetchWall: typeof fetchWall;
   readonly play: WallPlay;
+  readonly playWhep?: (options: WallWhepOptions) => Promise<void>;
   readonly createLeaseApi: typeof createWallLeaseApi;
 }
-const DEFAULT_DEPS: WallDeps = { fetchWall, play: startMoqPlaybackWithRefresh, createLeaseApi: createWallLeaseApi };
+const DEFAULT_DEPS: WallDeps = { fetchWall, play: startMoqPlaybackWithRefresh, playWhep: playWallWhep, createLeaseApi: createWallLeaseApi };
 
 export interface WallSnapshot {
   /** Geometry is only exposed while frames are flowing; undefined means "use stills". */
   readonly geometry: WallGeometry | undefined;
   /** Why surfaces show stills (undefined while live or still connecting). */
   readonly reason?: string | undefined;
+  readonly transport: 'moq' | 'webrtc' | 'stills';
 }
 
 export function isAborted(s: AbortSignal): boolean { return s.aborted; }
@@ -52,11 +55,19 @@ function sleep(ms: number, signal: AbortSignal): Promise<void> {
 }
 
 export class WallStore {
-  private snapshot: WallSnapshot = { geometry: undefined };
+  private snapshot: WallSnapshot = { geometry: undefined, transport: 'stills' };
   private geometry: WallGeometry | undefined;
-  private frame: VideoFrame | undefined;
+  /**
+   * The current wall picture, drawn ONCE per decoded frame. Every surface crops
+   * from this canvas. Drawing a `VideoFrame` converts the whole frame each time
+   * (measured: about 8 ms per call in a browser without a GPU, whatever the crop),
+   * so thirteen crops straight from the frame cost thirteen conversions.
+   */
+  private picture: HTMLCanvasElement | undefined;
+  private pictureContext: CanvasRenderingContext2D | undefined;
+  private hasPicture = false;
   private lastFrameAt: number | undefined;
-  private readonly frameListeners = new Set<(frame: VideoFrame) => void>();
+  private readonly frameListeners = new Set<(picture: HTMLCanvasElement) => void>();
   private readonly stateListeners = new Set<() => void>();
   private root: AbortController | undefined;
   private session: AbortController | undefined;
@@ -64,6 +75,9 @@ export class WallStore {
   private watch: ReturnType<typeof setInterval> | undefined;
   private failures = 0;
   private reason: string | undefined;
+  private transport: 'moq' | 'webrtc' | 'stills' = 'stills';
+  private moqFailed = false;
+  private moqReason: string | undefined;
   readonly stats: WallStats = { frames: 0, lastFrameAt: 0, sessions: 0, decoders: 0, gapsOver500ms: 0, maxGapMs: 0 };
 
   constructor(private readonly deps: WallDeps = DEFAULT_DEPS) {}
@@ -73,11 +87,33 @@ export class WallStore {
     this.stateListeners.add(listener);
     return () => { this.stateListeners.delete(listener); };
   };
-  /** Per-frame callback; also invoked once with the current frame, if any. */
-  subscribeFrames(listener: (frame: VideoFrame) => void): () => void {
+  /** Per-frame callback with the current wall picture; also invoked once now, if there is one. */
+  subscribeFrames(listener: (picture: HTMLCanvasElement) => void): () => void {
     this.frameListeners.add(listener);
-    if (this.frame) listener(this.frame);
+    if (this.hasPicture && this.picture) listener(this.picture);
     return () => { this.frameListeners.delete(listener); };
+  }
+
+  /** Convert the decoded frame once. False when no 2D canvas is available. */
+  private paint(frame: VideoFrame | HTMLVideoElement): boolean {
+    const picture = this.picture ?? (this.picture = document.createElement('canvas'));
+    const width = frame instanceof HTMLVideoElement ? frame.videoWidth : frame.displayWidth;
+    const height = frame instanceof HTMLVideoElement ? frame.videoHeight : frame.displayHeight;
+    if (!width || !height) return false;
+    // WHEP may downscale the wall to its preview encode cap. Restore the
+    // authored geometry before subscribers crop in authored cell coordinates.
+    const outputWidth = frame instanceof HTMLVideoElement ? this.geometry?.width ?? width : width;
+    const outputHeight = frame instanceof HTMLVideoElement ? this.geometry?.height ?? height : height;
+    if (picture.width !== outputWidth || picture.height !== outputHeight) {
+      picture.width = outputWidth;
+      picture.height = outputHeight;
+      this.pictureContext = undefined;
+    }
+    const context = this.pictureContext ?? (this.pictureContext = picture.getContext('2d') ?? undefined);
+    if (!context) return false;
+    context.drawImage(frame, 0, 0, outputWidth, outputHeight);
+    this.hasPicture = true;
+    return true;
   }
 
   start(): void {
@@ -86,21 +122,33 @@ export class WallStore {
     this.root = root;
     window.__wallStats = this.stats;
     this.watch = setInterval(() => { this.publish(); }, 500);
+    window.addEventListener('pagehide', this.onPageHide);
+    window.addEventListener('pageshow', this.onPageShow);
     void this.pollLoop(root.signal);
     void this.playLoop(root.signal);
   }
 
+  private readonly onPageHide = (): void => { this.stop(); };
+  private readonly onPageShow = (event: PageTransitionEvent): void => { if (event.persisted) this.start(); };
+
   stop(): void {
+    window.removeEventListener('pagehide', this.onPageHide);
     this.root?.abort();
     this.root = undefined;
     this.session?.abort();
     if (this.watch !== undefined) clearInterval(this.watch);
     this.watch = undefined;
-    this.frame?.close();
-    this.frame = undefined;
+    this.hasPicture = false;
     this.geometry = undefined;
     this.lastFrameAt = undefined;
+    this.transport = 'stills';
     this.publish();
+  }
+
+  /** Remove bfcache lifecycle listeners when the desk itself unmounts. */
+  dispose(): void {
+    this.stop();
+    window.removeEventListener('pageshow', this.onPageShow);
   }
 
   /** Re-derive the snapshot: live only with geometry and a frame no older than WALL_STALE_MS. */
@@ -108,12 +156,13 @@ export class WallStore {
     const live = this.geometry !== undefined && this.lastFrameAt !== undefined && performance.now() - this.lastFrameAt <= WALL_STALE_MS;
     const geometry = live ? this.geometry : undefined;
     const reason = live ? undefined : this.reason;
-    if (geometry === this.snapshot.geometry && reason === this.snapshot.reason) return;
-    this.snapshot = { geometry, reason };
+    const transport = geometry ? this.transport : 'stills';
+    if (geometry === this.snapshot.geometry && reason === this.snapshot.reason && transport === this.snapshot.transport) return;
+    this.snapshot = { geometry, reason, transport };
     for (const listener of [...this.stateListeners]) listener();
   }
 
-  private onFrame = (incoming: VideoFrame): void => {
+  private onFrame = (incoming: VideoFrame | HTMLVideoElement): void => {
     // A frame from a session of another layout generation is never shown.
     if (this.playingGeneration === undefined || this.playingGeneration !== this.geometry?.generation) return;
     const now = performance.now();
@@ -122,23 +171,21 @@ export class WallStore {
       if (gap > 500) this.stats.gapsOver500ms += 1;
       if (gap > this.stats.maxGapMs) this.stats.maxGapMs = gap;
     }
+    // The source owns the frame or video element: copy pixels synchronously.
+    if (!this.paint(incoming)) return;
     this.lastFrameAt = now;
     this.reason = undefined;
     this.stats.frames += 1;
     this.stats.lastFrameAt = Date.now();
     this.failures = 0;
-    // The library owns `incoming`; keep our own reference and close the previous one.
-    const next = incoming.clone();
-    const previous = this.frame;
-    this.frame = next;
-    previous?.close();
     this.publish();
-    for (const listener of [...this.frameListeners]) listener(next);
+    const picture = this.picture;
+    if (picture) for (const listener of [...this.frameListeners]) listener(picture);
   };
 
   private dropFrame(): void {
-    this.frame?.close();
-    this.frame = undefined;
+    // A picture of another layout must never be cropped with the new geometry.
+    this.hasPicture = false;
     this.lastFrameAt = undefined;
   }
 
@@ -196,31 +243,42 @@ export class WallStore {
       this.session = session;
       this.playingGeneration = geometry.generation;
       const aborted = AbortSignal.any([signal, session.signal]);
+      const sessionFrame = (frame: VideoFrame | HTMLVideoElement): void => {
+        if (!aborted.aborted && this.session === session) this.onFrame(frame);
+      };
       let failed = false;
+      const rung = this.moqFailed ? 'webrtc' : 'moq';
+      this.transport = rung;
       try {
-        await this.deps.play({
-          api: this.deps.createLeaseApi(), canvas: document.createElement('canvas'), signal: aborted, audio: false,
-          onActive: () => { this.stats.sessions += 1; this.stats.decoders += 1; },
-          onFrame: this.onFrame,
-        });
+        if (rung === 'moq') {
+          await this.deps.play({
+            api: this.deps.createLeaseApi(), canvas: document.createElement('canvas'), signal: aborted, audio: false,
+            onActive: () => { this.stats.sessions += 1; this.stats.decoders += 1; },
+            onFrame: sessionFrame,
+          });
+        } else {
+          await (this.deps.playWhep ?? playWallWhep)({
+            signal: aborted, onFrame: sessionFrame,
+            onActive: () => { this.stats.sessions += 1; this.stats.decoders += 1; },
+          });
+        }
       } catch (error) {
         failed = !isAborted(aborted);
         if (failed) {
+          if (rung === 'moq') { this.moqFailed = true; this.moqReason = error instanceof Error ? error.message : String(error); }
           this.stats.lastError = error instanceof Error ? `${error.name}: ${error.message}` : String(error);
-          this.reason = `live stream failed (${this.stats.lastError})`;
+          this.reason = rung === 'moq' ? `MoQ failed (${this.stats.lastError})` : `${this.moqReason ? `MoQ failed (${this.moqReason}); ` : ''}WebRTC failed (${this.stats.lastError})`;
         }
       }
       this.session = undefined;
       this.playingGeneration = undefined;
       if (isAborted(signal)) return;
       if (failed || !this.isAborted(session)) {
-        // Session failed or ended on its own: bounded backoff, never a hot loop.
-        const delay = WALL_BACKOFF_MS[Math.min(this.failures, WALL_BACKOFF_MS.length - 1)] ?? 30000;
-        this.failures += 1;
-        this.geometry = undefined;
+        // First MoQ failure falls through immediately; later WHEP failures back off.
+        const delay = rung === 'moq' && failed ? 0 : WALL_BACKOFF_MS[Math.min(this.failures++, WALL_BACKOFF_MS.length - 1)] ?? 30000;
+        this.dropFrame();
         this.publish();
-        await sleep(delay, signal);
-        this.wake?.();
+        if (delay) await sleep(delay, signal);
       }
       // A generation change (session aborted by the poller) reopens immediately.
     }

@@ -1,3 +1,4 @@
+#![cfg(unix)]
 //! Confirm termination is converted to cancellation, with process cleanup.
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 use std::{

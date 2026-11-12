@@ -355,7 +355,10 @@ where
     )
     .with_preview(preview)
     .with_warning_store(warnings);
-    state = state.with_web_capture(multiview_control::web_capture_startup::from_environment()?);
+    #[cfg(unix)]
+    {
+        state = state.with_web_capture(multiview_control::web_capture_startup::from_environment()?);
+    }
     #[cfg(feature = "moq-output")]
     if let Some(moq) = moq {
         state = state.with_moq(moq);
@@ -617,15 +620,20 @@ where
     // IPTV guide refresher (epg-playlist): one control-plane task that only
     // fetches while `[iptv] enabled`; never touches the engine (inv #1/#10).
     drop(multiview_control::iptv::spawn_refresher(state.clone()));
+    #[cfg(unix)]
     let cloudflare = configured_cloudflare()?;
+    #[cfg(unix)]
     let reconciler = cloudflare
         .as_ref()
         .map(|provider| AbortTask(provider.clone().spawn_reconciler()));
+    #[cfg(unix)]
     let state = if let Some(provider) = cloudflare {
         state.with_cloudflare(provider)
     } else {
         state
     };
+    #[cfg(not(unix))]
+    let reconciler: Option<AbortTask> = configured_cloudflare()?.map(|never| match never {});
     // Keep the abort guard inside the server's shutdown future. It also runs if
     // the server future is dropped, so no management task survives the server.
     let shutdown = async move {
@@ -724,8 +732,24 @@ impl Drop for AbortTask {
     }
 }
 
+/// Managed Cloudflare needs the POSIX owner-only credential vault; on Windows
+/// configuring it is refused explicitly instead of silently ignored.
+#[cfg(not(unix))]
+fn configured_cloudflare() -> std::io::Result<Option<std::convert::Infallible>> {
+    let configured = std::env::var_os("MULTIVIEW_CLOUDFLARE_STATE_DIR").is_some()
+        || std::env::var_os("MULTIVIEW_CLOUDFLARE_MASTER_KEY_FILE").is_some();
+    if configured {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "managed Cloudflare is not supported on this platform",
+        ));
+    }
+    Ok(None)
+}
+
 /// Opt-in startup configuration references a private key file, never a raw key
 /// argument or environment value. Errors deliberately omit secret paths/data.
+#[cfg(unix)]
 fn configured_cloudflare(
 ) -> std::io::Result<Option<Arc<multiview_control::cloudflare_management::ManagedCloudflare>>> {
     use std::io::{Error, ErrorKind, Read};

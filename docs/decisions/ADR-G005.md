@@ -5,6 +5,7 @@
 - **Date:** 2026-06-14
 - **Source:** operator directive 2026-06-14 — "You are responsible for all reviews and merges"
 - **Amends:** [ADR-G003](ADR-G003.md)
+- **Amended by:** [ADR-G009](ADR-G009.md) — the delegation covers every change class, R3 included; no merge waits for the operator
 
 ## Context
 

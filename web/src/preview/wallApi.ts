@@ -10,6 +10,8 @@ export interface WallCell {
   readonly y: number;
   readonly w: number;
   readonly h: number;
+  /** False while the source has no picture yet: that surface keeps its still. */
+  readonly live?: boolean;
 }
 
 export interface WallGeometry {
@@ -33,7 +35,7 @@ function headers(): Record<string, string> {
 
 export function findCell(geometry: WallGeometry | undefined, source: string | null | undefined): WallCell | undefined {
   if (!geometry || source == null) return undefined;
-  return geometry.cells.find((cell) => cell.source === source);
+  return geometry.cells.find((cell) => cell.source === source && cell.live !== false);
 }
 
 /** Source rectangle for drawImage, clamped to the frame; undefined when it is empty or outside. */

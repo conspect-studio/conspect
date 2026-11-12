@@ -142,6 +142,16 @@ pub(crate) fn validated_body(
     match collection {
         TypedCollection::Sources => {
             let source = typecheck::<multiview_config::Source>(collection, &candidate)?;
+            // A local capture device opens this host's cameras/capture cards: a
+            // privilege no control-API principal is granted. Config-file only
+            // (docs/architecture/local-capture-devices.md, "Authorization").
+            if matches!(source.kind, multiview_config::SourceKind::Device { .. }) {
+                return Err(ControlError::Validation(
+                    "source kind `device` (local capture device) is configured in the \
+                     config file only; the control API does not open host devices"
+                        .to_owned(),
+                ));
+            }
             source
                 .validate()
                 .map_err(|err| ControlError::Validation(format!("source body invalid: {err}")))?;
@@ -235,6 +245,16 @@ mod tests {
         let body = json!({ "id": "cam1", "kind": "flux-capacitor" });
         let err = validated_body(TypedCollection::Sources, "cam1", &body).unwrap_err();
         assert!(err.to_string().contains("flux-capacitor") || err.to_string().contains("kind"));
+    }
+
+    #[test]
+    fn refuses_a_local_capture_device_source_over_the_api() {
+        // Opening host cameras is a privilege no control-API principal holds:
+        // device sources are config-file only.
+        let body =
+            json!({ "id": "cam1", "kind": "device", "backend": "avfoundation", "device": "0" });
+        let err = validated_body(TypedCollection::Sources, "cam1", &body).unwrap_err();
+        assert!(err.to_string().contains("config file only"), "{err}");
     }
 
     #[test]

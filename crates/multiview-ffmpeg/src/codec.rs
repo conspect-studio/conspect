@@ -26,7 +26,11 @@
 //!   `select_encoder` skips it and falls through to the next candidate —
 //!   graceful degradation, never a crash.
 //!
-//! The ordering encodes the preference policy: hardware (NVENC, `cuda`) →
+//! * **`videotoolbox`** (macOS) — adds Apple's `h264_videotoolbox` /
+//!   `hevc_videotoolbox`, also ahead of software. A system framework, so the
+//!   build stays LGPL-clean.
+//!
+//! The ordering encodes the preference policy: hardware (`VideoToolbox`, NVENC) →
 //! GPL software (`gpl-codecs`) → LGPL software (always). Selection walks the
 //! list and returns the first encoder the build can actually open.
 
@@ -120,17 +124,43 @@ impl VideoCodec {
     }
 }
 
+impl VideoCodec {
+    /// This codec's Apple `VideoToolbox` hardware encoder short-name, present only
+    /// when the `videotoolbox` feature is enabled on macOS (otherwise [`None`]).
+    /// `VideoToolbox` is a system framework, so selecting it keeps the build
+    /// LGPL-clean; `select_encoder` still verifies the linked `FFmpeg` has it.
+    #[must_use]
+    pub const fn videotoolbox_encoder(self) -> Option<&'static str> {
+        #[cfg(all(feature = "videotoolbox", target_os = "macos"))]
+        {
+            match self {
+                Self::H264 => Some("h264_videotoolbox"),
+                Self::H265 => Some("hevc_videotoolbox"),
+                Self::Mpeg2Video | Self::Ffv1 | Self::Mjpeg | Self::Vp8 => None,
+            }
+        }
+        #[cfg(not(all(feature = "videotoolbox", target_os = "macos")))]
+        {
+            let _ = self;
+            None
+        }
+    }
+}
+
 /// The ordered preference list of concrete libav encoder short-names this build
 /// is allowed to use for `codec`, best first.
 ///
-/// Order is fixed policy: NVENC hardware (`cuda`) → GPL software (`gpl-codecs`)
-/// → LGPL software (always). Names absent from the compiled features are
+/// Order is fixed policy: hardware (`VideoToolbox` on macOS with `videotoolbox`,
+/// NVENC with `cuda`) → GPL software (`gpl-codecs`) → LGPL software (always). Names absent from the compiled features are
 /// omitted, so the default build's list contains only LGPL software encoders
 /// (and is empty for H.264/H.265). The result is pure compile-time data; no
 /// libav call happens here.
 #[must_use]
 pub fn candidate_encoders(codec: VideoCodec) -> Vec<&'static str> {
-    let mut candidates = Vec::with_capacity(3);
+    let mut candidates = Vec::with_capacity(4);
+    if let Some(name) = codec.videotoolbox_encoder() {
+        candidates.push(name);
+    }
     if let Some(name) = codec.nvenc_encoder() {
         candidates.push(name);
     }
@@ -168,6 +198,58 @@ pub fn select_encoder(codec: VideoCodec) -> Option<&'static str> {
     candidate_encoders(codec)
         .into_iter()
         .find(|name| ffmpeg_next::encoder::find_by_name(name).is_some())
+}
+
+/// Whether `name` is a hardware encoder whose presence in the libav registry
+/// does not prove it can open (no device, a VM without `VideoToolbox`, a GPU
+/// without NVENC sessions left).
+#[must_use]
+pub fn is_hardware_encoder(name: &str) -> bool {
+    name.ends_with("_videotoolbox") || name.ends_with("_nvenc")
+}
+
+/// Like [`select_encoder`], but a **hardware** candidate is accepted only if
+/// `opens(name)` reports that a real encoder session opens. A failing hardware
+/// encoder falls through to the next permitted candidate (software), so a Mac
+/// or GPU host whose hardware encoder is registered but unusable still gets an
+/// encoded program — never a dead output. Software candidates are not probed.
+///
+/// Call this once at pipeline build (never per tick). `opens` is the probe
+/// seam; production passes [`probe_encoder_opens`].
+#[cfg(feature = "ffmpeg")]
+pub fn select_usable_encoder(
+    codec: VideoCodec,
+    opens: &mut dyn FnMut(&'static str) -> bool,
+) -> Option<&'static str> {
+    candidate_encoders(codec).into_iter().find(|name| {
+        ffmpeg_next::encoder::find_by_name(name).is_some()
+            && (!is_hardware_encoder(name) || opens(name))
+    })
+}
+
+/// Probe whether hardware encoder `name` opens a real session: a tiny NV12
+/// encoder (256x144, 25 fps) is opened and dropped. Any error means "not
+/// usable here".
+#[cfg(feature = "ffmpeg")]
+#[must_use]
+pub fn probe_encoder_opens(name: &'static str) -> bool {
+    let target = crate::VideoEncodeTarget {
+        codec_name: name.to_owned(),
+        width: 256,
+        height: 144,
+        format: ffmpeg_next::format::Pixel::NV12,
+        time_base: multiview_core::time::Rational::new(1, 25),
+        bit_rate: 500_000,
+        gop: 25,
+        cuda_device: None,
+    };
+    match crate::VideoEncoder::new(&target) {
+        Ok(_) => true,
+        Err(e) => {
+            tracing::warn!(encoder = name, error = %e, "hardware encoder is registered but does not open; falling back");
+            false
+        }
+    }
 }
 
 /// A logical audio codec the output pipeline can target.
@@ -293,9 +375,10 @@ mod tests {
     #[cfg(not(feature = "gpl-codecs"))]
     #[test]
     fn default_build_cannot_encode_h264_or_h265() {
-        // Without gpl-codecs (and without cuda) the H.264/H.265 candidate list
-        // is empty: the LGPL-clean build cannot reach a GPL/proprietary encoder.
-        #[cfg(not(feature = "cuda"))]
+        // Without gpl-codecs (and without a hardware encoder: cuda, or
+        // videotoolbox on macOS) the H.264/H.265 candidate list is empty: the
+        // LGPL-clean build cannot reach a GPL/proprietary encoder.
+        #[cfg(not(any(feature = "cuda", all(feature = "videotoolbox", target_os = "macos"))))]
         {
             assert_eq!(candidate_encoders(VideoCodec::H264), Vec::<&str>::new());
             assert_eq!(candidate_encoders(VideoCodec::H265), Vec::<&str>::new());

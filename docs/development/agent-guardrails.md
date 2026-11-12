@@ -128,7 +128,8 @@ test.
 - **NEVER** modify, weaken, delete, skip, `#[ignore]`/`.skip`/`.only` an existing test to make a
   build pass.
 - **NEVER** weaken an assertion (e.g. `assert_eq!` → `assert!`, `toBe(x)` → `toBeTruthy()`).
-- **NEVER** edit code-under-test to conform to a test you suspect is wrong — **STOP and ask a human.**
+- **NEVER** edit code-under-test to conform to a test you suspect is wrong. Establish which is
+  wrong from the specification or the issue; if it is the test, correct it as below.
 - A legitimate test change goes in **its own commit, justified in the PR, and reviewed**.
 - **Ban assertion-free / tautological tests** (asserting the implementation back to itself; "does
   not throw" alone). Every test asserts real behaviour.
@@ -220,7 +221,8 @@ Who reviews what, and when, is the class matrix in
 
 **Cautions:** treat **unanimous** AI approval as a yellow flag — require at least one substantive
 risk statement. AI review does **not** cover TOCTOU, race conditions, or timing/authorization logic;
-those need property/concurrency tests plus human review.
+those need property/concurrency tests plus the 3-lens panel (there is no human review step;
+[ADR-G009](../decisions/ADR-G009.md)).
 
 ---
 

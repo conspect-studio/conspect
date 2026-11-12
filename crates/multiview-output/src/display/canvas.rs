@@ -20,16 +20,21 @@
 //! [`DisplayCanvas::dmabuf_image`] accessors are how a dmabuf-backed canvas
 //! opts into those faster paths.
 
+#[cfg(unix)]
 use std::os::fd::BorrowedFd;
 
 use thiserror::Error;
 
-use super::strategy::{CanvasDelivery, DrmFormat};
+use super::strategy::CanvasDelivery;
+#[cfg(unix)]
+use super::strategy::DrmFormat;
 
 /// One plane of an importable dmabuf-backed canvas: the borrowed prime fd plus
 /// where that plane starts and how wide its rows are. Borrowed for the
 /// duration of one scan-out submission — the canvas owns the fd, the backend
 /// imports it (`prime_fd_to_buffer`) and adds a framebuffer over it.
+/// Unix only: dmabuf/DRM scan-out does not exist on Windows.
+#[cfg(unix)]
 #[derive(Debug, Clone, Copy)]
 pub struct DmabufPlane<'a> {
     /// The prime (dmabuf) file descriptor backing this plane (planes may share
@@ -47,6 +52,7 @@ pub struct DmabufPlane<'a> {
 /// (display-out.md §2). Only meaningful when the format is plane-scannable
 /// (NV12/P010) and the modifier matches the plane (the
 /// [`super::strategy::select_buffer_strategy`] gate).
+#[cfg(unix)]
 #[derive(Debug, Clone)]
 pub struct DmabufImage<'a> {
     /// The dmabuf pixel format (NV12/P010 for direct scanout).
@@ -98,6 +104,7 @@ pub trait DisplayCanvas {
     ///
     /// The default is [`None`] (the CPU-planes path); only a dmabuf-backed
     /// canvas overrides it.
+    #[cfg(unix)]
     fn dmabuf_image(&self) -> Option<DmabufImage<'_>> {
         None
     }
@@ -388,6 +395,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn default_canvas_exposes_no_importable_dmabuf_image() {
         // The CPU-planes default never offers a dmabuf to import; the
@@ -396,6 +404,7 @@ mod tests {
         assert!(DisplayCanvas::dmabuf_image(&frame).is_none());
     }
 
+    #[cfg(unix)]
     #[test]
     fn a_dmabuf_canvas_exposes_its_borrowed_fds_and_plane_layout() {
         use crate::display::strategy::{DrmFormat, DRM_FORMAT_MOD_LINEAR};
