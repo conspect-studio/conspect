@@ -1,7 +1,11 @@
 //! ACME certificate configuration for the future network front door.
 //! No credential values are accepted here: fields ending in `_env` are names only.
 
-use std::{collections::HashSet, net::IpAddr, path::PathBuf};
+use std::{
+    collections::HashSet,
+    net::{IpAddr, Ipv6Addr, SocketAddr},
+    path::PathBuf,
+};
 
 use serde::{Deserialize, Serialize};
 
@@ -14,15 +18,124 @@ pub const DEFAULT_WORKERS: u16 = 2;
 /// Most `network.workers` accepted.
 pub const MAX_WORKERS: u16 = 64;
 
+/// Default `network.http_redirect_port` in `direct` mode.
+pub const DEFAULT_HTTP_REDIRECT_PORT: u16 = 80;
+/// Default `network.proxy_listen` in `behind_proxy` mode.
+pub const DEFAULT_PROXY_LISTEN: &str = "[::1]:8443";
+/// Most `network.trusted_proxies` entries accepted.
+pub const MAX_TRUSTED_PROXIES: usize = 64;
+
 const fn default_workers() -> u16 {
     DEFAULT_WORKERS
+}
+
+const fn default_true() -> bool {
+    true
+}
+
+/// How the front door owns TCP (design note sections 4 and 8).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NetworkMode {
+    /// The engine owns the TCP door (`[bind]:tcp_port`) and the port-80 redirect.
+    Direct,
+    /// A reverse proxy owns TCP 443 and forwards to `proxy_listen` with PROXY v2.
+    BehindProxy,
+}
+
+/// `[network.ice_tcp]`: passive ICE-TCP candidates on the TCP door (RFC 6544).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct IceTcpConfig {
+    /// Accept RFC 4571-framed ICE-TCP connections on the TCP door. Default true.
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+}
+
+impl Default for IceTcpConfig {
+    fn default() -> Self {
+        Self { enabled: true }
+    }
+}
+
+/// One `network.trusted_proxies` entry: an address and a prefix length.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TrustedProxy {
+    /// The network address (IPv4-mapped IPv6 normalised to IPv4).
+    pub addr: IpAddr,
+    /// Prefix length (32/128 for a single address).
+    pub prefix: u8,
+}
+
+impl TrustedProxy {
+    /// Parse an IP literal or a CIDR prefix (`"::1"`, `"10.0.0.0/8"`).
+    ///
+    /// # Errors
+    /// A validation error naming the entry.
+    pub fn parse(entry: &str) -> Result<Self, ConfigError> {
+        let bad = || {
+            ConfigError::Validation(format!(
+                "network.trusted_proxies entry {entry:?} is not an IP literal or CIDR prefix"
+            ))
+        };
+        let (ip, prefix) = match entry.split_once('/') {
+            Some((ip, prefix)) => (ip, Some(prefix.parse::<u8>().map_err(|_| bad())?)),
+            None => (entry, None),
+        };
+        let addr = unmap_ip(ip.parse::<IpAddr>().map_err(|_| bad())?);
+        let max = if addr.is_ipv4() { 32 } else { 128 };
+        let prefix = prefix.unwrap_or(max);
+        if prefix > max {
+            return Err(bad());
+        }
+        Ok(Self { addr, prefix })
+    }
+
+    /// Whether `ip` (IPv4-mapped normalised) falls inside this prefix.
+    #[must_use]
+    pub fn contains(&self, ip: IpAddr) -> bool {
+        match (self.addr, unmap_ip(ip)) {
+            (IpAddr::V4(net), IpAddr::V4(ip)) => {
+                prefix_match(&net.octets(), &ip.octets(), self.prefix)
+            }
+            (IpAddr::V6(net), IpAddr::V6(ip)) => {
+                prefix_match(&net.octets(), &ip.octets(), self.prefix)
+            }
+            _ => false,
+        }
+    }
+}
+
+fn unmap_ip(ip: IpAddr) -> IpAddr {
+    match ip {
+        IpAddr::V6(v6) => v6.to_ipv4_mapped().map_or(IpAddr::V6(v6), IpAddr::V4),
+        IpAddr::V4(_) => ip,
+    }
+}
+
+fn prefix_match(net: &[u8], ip: &[u8], prefix: u8) -> bool {
+    let mut bits = u32::from(prefix);
+    for (a, b) in net.iter().zip(ip) {
+        if bits == 0 {
+            return true;
+        }
+        let take = bits.min(8);
+        let mask = u8::MAX.checked_shl(8 - take).unwrap_or(0);
+        if a & mask != b & mask {
+            return false;
+        }
+        bits -= take;
+    }
+    true
 }
 
 /// The front-door `[network]` section (ADR-0107).
 ///
 /// Slice 1 (the shared UDP socket) reads `https_port`, `advertise` and
-/// `workers`; slice 5 (ACME) reads `public_host` and `tls`. `public_host` and
-/// `tls` come together: both or neither.
+/// `workers`; slice 4 (the TCP door) reads `mode`, `tcp_port`,
+/// `http_redirect_port`, `bind`, `trusted_proxies`, `proxy_listen`,
+/// `ice_tcp` and `public_host` (the redirect target); slice 5 (ACME) reads
+/// `tls`. `tls` requires `public_host`; `public_host` alone is valid.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct NetworkConfig {
@@ -47,6 +160,36 @@ pub struct NetworkConfig {
     /// runtime that drives the output clock (invariant #1). Default 2.
     #[serde(default = "default_workers")]
     pub workers: u16,
+    /// Who owns TCP (slice 4). **Absent = no TCP listener at all** (slice-1
+    /// behaviour: the UDP door only), so a saved state with only `https_port`
+    /// starts unchanged while another server holds TCP 443.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode: Option<NetworkMode>,
+    /// The TCP port of the door in `direct` mode; defaults to `https_port`.
+    /// (A deviation from design section 10, which has one port for both: it lets
+    /// an operator stage the TCP door on a second port while another server
+    /// still owns TCP 443.)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tcp_port: Option<u16>,
+    /// The plaintext 80 -> 443 redirect listener in `direct` mode (default 80;
+    /// `0` disables). Ignored in `behind_proxy` mode.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub http_redirect_port: Option<u16>,
+    /// The IPv6 address the TCP door and the redirect bind in `direct` mode
+    /// (default `[::]`, dual-stack). An IPv4 literal is rejected (IPv6-first).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bind: Option<String>,
+    /// PROXY v2 sources trusted in `behind_proxy` mode: IP literals or CIDR
+    /// prefixes. Required (non-empty) in that mode.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub trusted_proxies: Vec<String>,
+    /// The TCP listener a proxy forwards to in `behind_proxy` mode (default
+    /// `[::1]:8443`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proxy_listen: Option<String>,
+    /// `[network.ice_tcp]`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ice_tcp: Option<IceTcpConfig>,
 }
 
 impl Default for NetworkConfig {
@@ -57,6 +200,13 @@ impl Default for NetworkConfig {
             https_port: None,
             advertise: Vec::new(),
             workers: DEFAULT_WORKERS,
+            mode: None,
+            tcp_port: None,
+            http_redirect_port: None,
+            bind: None,
+            trusted_proxies: Vec::new(),
+            proxy_listen: None,
+            ice_tcp: None,
         }
     }
 }
@@ -248,23 +398,173 @@ impl NetworkConfig {
     /// Returns a field-specific validation error on malformed configuration.
     pub fn validate(&self) -> Result<(), ConfigError> {
         self.validate_socket()?;
+        self.validate_tcp()?;
+        if let Some(public_host) = &self.public_host {
+            domain("public_host", public_host, AcmeChallenge::TlsAlpn01).map_err(|_| {
+                ConfigError::Validation(
+                    "network.public_host must be a lowercase DNS name or an IP literal".to_owned(),
+                )
+            })?;
+        }
+        // Slice 4 relaxed "both or neither": `public_host` alone is valid (the
+        // redirect target); `[network.tls]` still needs it.
         match (&self.public_host, &self.tls) {
-            (None, None) => Ok(()),
             (Some(public_host), Some(tls)) => {
-                domain("public_host", public_host, AcmeChallenge::TlsAlpn01)?;
                 tls.validate()?;
                 if !tls.domains.iter().any(|name| name == public_host) {
                     return Err(fail("domains", "must include network.public_host"));
                 }
                 Ok(())
             }
-            (Some(_), None) => Err(ConfigError::Validation(
-                "network.public_host is set without [network.tls]".to_owned(),
-            )),
             (None, Some(_)) => Err(ConfigError::Validation(
                 "[network.tls] needs network.public_host".to_owned(),
             )),
+            (_, None) => Ok(()),
         }
+    }
+
+    /// The `[network.ice_tcp] enabled` value (default true).
+    #[must_use]
+    pub fn ice_tcp_enabled(&self) -> bool {
+        self.ice_tcp.unwrap_or_default().enabled
+    }
+
+    /// The TCP port of the `direct` door (`tcp_port`, else `https_port`).
+    #[must_use]
+    pub fn effective_tcp_port(&self) -> Option<u16> {
+        self.tcp_port.or(self.https_port)
+    }
+
+    /// The redirect listener port in `direct` mode (`None` = disabled).
+    #[must_use]
+    pub fn effective_redirect_port(&self) -> Option<u16> {
+        if self.mode != Some(NetworkMode::Direct) {
+            return None;
+        }
+        match self
+            .http_redirect_port
+            .unwrap_or(DEFAULT_HTTP_REDIRECT_PORT)
+        {
+            0 => None,
+            port => Some(port),
+        }
+    }
+
+    /// The parsed `bind` address (default `::`).
+    ///
+    /// # Errors
+    /// A validation error for anything but an IPv6 literal.
+    pub fn bind_ip(&self) -> Result<Ipv6Addr, ConfigError> {
+        let Some(bind) = self.bind.as_deref() else {
+            return Ok(Ipv6Addr::UNSPECIFIED);
+        };
+        let bare = bind
+            .strip_prefix('[')
+            .and_then(|b| b.strip_suffix(']'))
+            .unwrap_or(bind);
+        match bare.parse::<IpAddr>() {
+            Ok(IpAddr::V6(v6)) if v6.to_ipv4_mapped().is_none() => Ok(v6),
+            Ok(_) => Err(ConfigError::Validation(format!(
+                "network.bind {bind:?} is IPv4: the front door is IPv6-first; use \"[::]\" \
+                 (dual-stack) or an IPv6 address"
+            ))),
+            Err(_) => Err(ConfigError::Validation(format!(
+                "network.bind {bind:?} is not an IPv6 address"
+            ))),
+        }
+    }
+
+    /// The parsed `proxy_listen` address (default `[::1]:8443`).
+    ///
+    /// # Errors
+    /// A validation error for a malformed or unspecified-IPv4 address.
+    pub fn proxy_listen_addr(&self) -> Result<SocketAddr, ConfigError> {
+        let text = self.proxy_listen.as_deref().unwrap_or(DEFAULT_PROXY_LISTEN);
+        let addr: SocketAddr = text.parse().map_err(|_| {
+            ConfigError::Validation(format!(
+                "network.proxy_listen {text:?} is not a socket address"
+            ))
+        })?;
+        if addr.ip() == IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED) {
+            return Err(ConfigError::Validation(
+                "network.proxy_listen must not be 0.0.0.0: bind [::] (dual-stack) or a \
+                 specific address"
+                    .to_owned(),
+            ));
+        }
+        if addr.port() == 0 {
+            return Err(ConfigError::Validation(
+                "network.proxy_listen needs a non-zero port".to_owned(),
+            ));
+        }
+        Ok(addr)
+    }
+
+    /// The parsed `trusted_proxies`.
+    ///
+    /// # Errors
+    /// A validation error naming the first malformed entry.
+    pub fn trusted_proxy_list(&self) -> Result<Vec<TrustedProxy>, ConfigError> {
+        self.trusted_proxies
+            .iter()
+            .map(|e| TrustedProxy::parse(e))
+            .collect()
+    }
+
+    /// Validate the slice-4 TCP keys.
+    fn validate_tcp(&self) -> Result<(), ConfigError> {
+        self.bind_ip()?;
+        if self.trusted_proxies.len() > MAX_TRUSTED_PROXIES {
+            return Err(ConfigError::Validation(format!(
+                "network.trusted_proxies holds at most {MAX_TRUSTED_PROXIES} entries"
+            )));
+        }
+        self.trusted_proxy_list()?;
+        self.proxy_listen_addr()?;
+        if self.tcp_port == Some(0) {
+            return Err(ConfigError::Validation(
+                "network.tcp_port must not be 0".to_owned(),
+            ));
+        }
+        let Some(mode) = self.mode else {
+            return Ok(());
+        };
+        if self.https_port.is_none() {
+            return Err(ConfigError::Validation(
+                "network.mode needs network.https_port: the TCP door is part of the front door"
+                    .to_owned(),
+            ));
+        }
+        match mode {
+            NetworkMode::Direct => {
+                if let Some(redirect) = self.effective_redirect_port() {
+                    if self.public_host.is_none() {
+                        return Err(ConfigError::Validation(
+                            "network.mode = \"direct\" with the redirect listener needs \
+                             network.public_host (the redirect target never comes from the \
+                             Host header); set it, or http_redirect_port = 0"
+                                .to_owned(),
+                        ));
+                    }
+                    if Some(redirect) == self.effective_tcp_port() {
+                        return Err(ConfigError::Validation(
+                            "network.http_redirect_port must differ from the TCP door port"
+                                .to_owned(),
+                        ));
+                    }
+                }
+            }
+            NetworkMode::BehindProxy => {
+                if self.trusted_proxies.is_empty() {
+                    return Err(ConfigError::Validation(
+                        "network.mode = \"behind_proxy\" needs network.trusted_proxies (PROXY \
+                         v2 is accepted from those sources only)"
+                            .to_owned(),
+                    ));
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Validate the slice-1 socket keys (`https_port`, `workers`, `advertise`).
@@ -586,13 +886,13 @@ mod socket_tests {
     }
 
     #[test]
-    fn public_host_and_tls_come_together() {
+    fn tls_needs_public_host_but_public_host_stands_alone() {
+        // Slice 4 (issue #290) relaxed "both or neither": `public_host` alone is
+        // now valid (the port-80 redirect target), so this half of the test was
+        // changed from "rejected" to "accepted". `tls` without it is still
+        // rejected below.
         let n: NetworkConfig = toml::from_str("public_host = \"a.example.org\"").unwrap();
-        assert!(n
-            .validate()
-            .unwrap_err()
-            .to_string()
-            .contains("network.tls"));
+        n.validate().unwrap();
         let n: NetworkConfig = toml::from_str(
             "[tls]\nca = \"letsencrypt\"\nchallenge = \"tls-alpn-01\"\ndomains = [\"a.example.org\"]\nstate_dir = \"/var/lib/conspect/tls\"",
         )

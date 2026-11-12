@@ -12,7 +12,12 @@ publish = false
 [dependencies]
 # The shared socket, the dispatcher and the lanes run on the front door's OWN
 # multi-thread runtime (never the program runtime that drives the output clock).
-tokio = { workspace = true, features = ["rt-multi-thread", "net", "sync", "time", "macros"] }
+tokio = { workspace = true, features = ["rt-multi-thread", "net", "sync", "time", "macros", "io-util"] }
+# The TCP door's TLS (slice 4). No crypto provider is selected here: the caller
+# passes ready `rustls::ServerConfig`s (aws-lc-rs in the binary). Both already
+# in Cargo.lock (MIT OR Apache-2.0 / ISC).
+rustls = { version = "0.23", default-features = false, features = ["std"] }
+tokio-rustls = { version = "0.26", default-features = false }
 # Dual-stack bind (`IPV6_V6ONLY=false`) and the SO_RCVBUF request; std cannot set
 # either. Already in the graph (MIT OR Apache-2.0).
 socket2 = { version = "0.6", features = ["all"] }
@@ -34,7 +39,11 @@ webrtc = ["dep:multiview-webrtc", "multiview-webrtc/native"]
 
 [dev-dependencies]
 proptest = "1.11.0"
-tokio = { workspace = true, features = ["rt-multi-thread", "net", "sync", "time", "macros"] }
+tokio = { workspace = true, features = ["rt-multi-thread", "net", "sync", "time", "macros", "io-util"] }
+# The TCP door tests build throwaway certificates and a TLS client with the
+# `ring` provider (dev only; already in the lock).
+rcgen = "0.14"
+rustls = { version = "0.23", default-features = false, features = ["std", "ring", "tls12"] }
 # The chaos test drives the REAL engine tick loop (EngineRuntime + RealtimePacer)
 # on a program runtime while the front door is flooded. Pure-Rust crates.
 multiview-engine = { workspace = true }

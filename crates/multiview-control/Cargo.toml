@@ -464,6 +464,11 @@ name = "tls_serve"
 required-features = ["tls"]
 
 [[test]]
+# The front-door connection entry point (ADR-0107 slice 4) over TLS.
+name = "site_connection"
+required-features = ["tls"]
+
+[[test]]
 # The output clock keeps its cadence while the ACME service hangs or is refused.
 name = "acme_cadence"
 required-features = ["acme"]

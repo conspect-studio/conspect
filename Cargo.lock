@@ -4113,8 +4113,11 @@ dependencies = [
  "multiview-framestore",
  "multiview-webrtc",
  "proptest",
+ "rcgen",
+ "rustls",
  "socket2 0.6.4",
  "tokio",
+ "tokio-rustls",
  "tracing",
  "url",
 ]

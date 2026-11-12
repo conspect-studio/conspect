@@ -17,6 +17,13 @@
 //! binds `MULTIVIEW_MOQ_BIND`, both on the main runtime as before. Old configs
 //! start unchanged.
 //!
+//! Slice 4 (issue #290): with `network.mode` set as well, the TCP door starts on
+//! the same front-door runtime (`direct`: `[bind]:tcp_port` plus the port-80
+//! redirect; `behind_proxy`: `proxy_listen`, PROXY v2 required). `mode` absent
+//! means no TCP listener at all. The site on the door is the SAME control-plane
+//! router and serve options as the plain `[control]` listener, over the
+//! `[control.tls]` static certificate ([`FrontDoorRun::install_site`]).
+//!
 //! **Certificates (slice 5, ADR-0107 section 5a).** With `[network.tls]` the
 //! run starts the ACME wiring ([`crate::tls_boot`]) before the control plane
 //! binds, and:
@@ -31,13 +38,94 @@
 //!   router behind the setup gate). The `[control] listen` listener stays the
 //!   loopback admin listener and is not gated.
 
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 
-use multiview_config::MultiviewConfig;
+use multiview_config::{MultiviewConfig, NetworkMode};
 
 /// The running front door and the lanes its consumers have not taken yet.
 pub struct FrontDoorRun {
     door: multiview_frontdoor::FrontDoor,
+}
+
+/// The TCP door settings derived from `[network]` (slice 4): `None` unless
+/// `network.mode` is set.
+#[derive(Debug, Clone)]
+pub struct TcpPlan {
+    /// The door.
+    pub door: multiview_frontdoor::TcpDoorConfig,
+    /// The port-80 redirect (direct mode, `http_redirect_port != 0`).
+    pub redirect: Option<multiview_frontdoor::RedirectConfig>,
+    /// The mode, for the startup log.
+    pub mode: NetworkMode,
+}
+
+/// The TCP door plan for a validated config.
+#[must_use]
+pub fn tcp_config_from(config: &MultiviewConfig) -> Option<TcpPlan> {
+    let network = config.network.as_ref()?;
+    let mode = network.mode?;
+    network.https_port?;
+    let turn_sni = network
+        .public_host
+        .as_deref()
+        .filter(|h| h.parse::<IpAddr>().is_err())
+        .map(|h| format!("turn.{h}"));
+    let base = multiview_frontdoor::TcpDoorConfig {
+        ice_tcp: network.ice_tcp_enabled(),
+        turn_sni,
+        ..multiview_frontdoor::TcpDoorConfig::default()
+    };
+    match mode {
+        NetworkMode::Direct => {
+            let bind = IpAddr::V6(network.bind_ip().ok()?);
+            let port = network.effective_tcp_port()?;
+            let redirect = network.effective_redirect_port().and_then(|redirect| {
+                Some(multiview_frontdoor::RedirectConfig::new(
+                    SocketAddr::new(bind, redirect),
+                    network.public_host.clone()?,
+                    port,
+                ))
+            });
+            Some(TcpPlan {
+                door: multiview_frontdoor::TcpDoorConfig {
+                    listen: SocketAddr::new(bind, port),
+                    ..base
+                },
+                redirect,
+                mode,
+            })
+        }
+        NetworkMode::BehindProxy => {
+            let trusted = network.trusted_proxy_list().ok()?;
+            Some(TcpPlan {
+                door: multiview_frontdoor::TcpDoorConfig {
+                    listen: network.proxy_listen_addr().ok()?,
+                    proxy: Some(multiview_frontdoor::TrustedProxies::new(
+                        trusted.iter().map(|t| (t.addr, t.prefix)),
+                    )),
+                    ..base
+                },
+                redirect: None,
+                mode,
+            })
+        }
+    }
+}
+
+/// The door's site: the control-plane router on the shared serve floor.
+struct ControlSite(multiview_control::ConnectionServer);
+
+impl multiview_frontdoor::SiteService for ControlSite {
+    fn serve(
+        &self,
+        io: multiview_frontdoor::DoorTlsStream,
+        peer: SocketAddr,
+        guard: multiview_frontdoor::ConnGuard,
+    ) -> multiview_frontdoor::BoxFuture<()> {
+        let server = self.0.clone();
+        Box::pin(async move { server.serve(io, peer, guard).await })
+    }
 }
 
 impl std::fmt::Debug for FrontDoorRun {
@@ -119,11 +207,88 @@ impl FrontDoorRun {
         warn_deprecated(config);
         let fd_config = config_from(config)?;
         match multiview_frontdoor::FrontDoor::start(&fd_config) {
-            Ok(door) => Some(Self { door }),
+            Ok(door) => {
+                let mut run = Self { door };
+                run.start_tcp(config);
+                Some(run)
+            }
             Err(error) => {
                 tracing::error!(%error, port = fd_config.port, "the front door failed to start; WebRTC and MoQ unavailable this run");
                 None
             }
+        }
+    }
+
+    /// Start the TCP door and the redirect (slice 4). A bind failure is logged
+    /// and the UDP door keeps running.
+    fn start_tcp(&mut self, config: &MultiviewConfig) {
+        let Some(plan) = tcp_config_from(config) else {
+            return;
+        };
+        let listen = plan.door.listen;
+        let ice_tcp = plan.door.ice_tcp;
+        let tcp = match self.door.start_tcp(
+            plan.door,
+            multiview_frontdoor::TlsRouting::default(),
+            None,
+        ) {
+            Ok(local) => local,
+            Err(error) => {
+                tracing::error!(%error, %listen, "the front-door TCP door failed to start; the UDP door keeps running, TCP unavailable this run");
+                return;
+            }
+        };
+        let redirect = plan.redirect.and_then(|redirect| {
+            let addr = redirect.listen;
+            match self.door.start_redirect(redirect) {
+                Ok(local) => Some(local),
+                Err(error) => {
+                    tracing::error!(%error, %addr, "the port-80 redirect failed to start; unavailable this run");
+                    None
+                }
+            }
+        });
+        tracing::info!(
+            %tcp,
+            mode = ?plan.mode,
+            redirect = ?redirect,
+            ice_tcp,
+            tls_site = false,
+            "front-door TCP door listening (the site attaches once the control plane is built)"
+        );
+    }
+
+    /// Whether the TCP door runs.
+    #[must_use]
+    pub fn has_tcp_door(&self) -> bool {
+        self.door.tcp_local_addr().is_some()
+    }
+
+    /// Attach the site to the TCP door: `server` (the control-plane router on
+    /// the same serve options as the plain listener, observing its shutdown)
+    /// over `tls_site`. Without a TLS configuration the door keeps serving
+    /// ICE-TCP only (a warning says so).
+    pub fn install_site(
+        &self,
+        server: multiview_control::ConnectionServer,
+        tls_site: Option<multiview_frontdoor::SiteTlsConfig>,
+    ) {
+        let Some(tcp) = self.door.tcp_local_addr() else {
+            return;
+        };
+        let Some(site) = tls_site else {
+            tracing::warn!(%tcp, "front-door TCP door: no site certificate ([control.tls] static, a `tls` build on unix), so TLS on the door is unavailable; ICE-TCP still runs");
+            return;
+        };
+        let routing = multiview_frontdoor::TlsRouting {
+            site: Some(site),
+            // TODO(#291): slice 5 wires the ACME `ChallengeResolver` here
+            // (TLS-ALPN-01); until then an `acme-tls/1` hello is closed.
+            acme: None,
+        };
+        let service: Arc<dyn multiview_frontdoor::SiteService> = Arc::new(ControlSite(server));
+        if self.door.set_tls_routing(routing).is_ok() && self.door.set_site(Some(service)).is_ok() {
+            tracing::info!(%tcp, tls_site = true, "front-door TCP door serves the site (HTTP/1.1 over the [control.tls] certificate)");
         }
     }
 
@@ -283,8 +448,62 @@ areas = ["a"]
     }
 
     #[test]
+    fn mode_absent_means_no_tcp_door() {
+        // mda001's saved state: https_port only. UDP door, no TCP listener.
+        let config = load(&format!("{BASE}\n[network]\nhttps_port = 443\n"));
+        assert!(config_from(&config).is_some());
+        assert!(tcp_config_from(&config).is_none());
+    }
+
+    #[test]
+    fn direct_mode_plans_the_door_and_the_redirect() {
+        let config = load(&format!(
+            "{BASE}\n[network]\nhttps_port = 443\ntcp_port = 8443\nmode = \"direct\"\npublic_host = \"mda001.example.net\"\n"
+        ));
+        let plan = tcp_config_from(&config).expect("direct");
+        assert_eq!(plan.door.listen, "[::]:8443".parse().unwrap());
+        assert!(plan.door.proxy.is_none());
+        assert!(plan.door.ice_tcp);
+        assert_eq!(
+            plan.door.turn_sni.as_deref(),
+            Some("turn.mda001.example.net")
+        );
+        let redirect = plan.redirect.expect("redirect");
+        assert_eq!(redirect.listen, "[::]:80".parse().unwrap());
+        assert_eq!(redirect.https_port, 8443);
+        assert_eq!(redirect.public_host, "mda001.example.net");
+        let no_redirect = load(&format!(
+            "{BASE}\n[network]\nhttps_port = 443\nmode = \"direct\"\nhttp_redirect_port = 0\nbind = \"[::1]\"\n[network.ice_tcp]\nenabled = false\n"
+        ));
+        let plan = tcp_config_from(&no_redirect).unwrap();
+        assert!(plan.redirect.is_none());
+        assert!(!plan.door.ice_tcp);
+        assert_eq!(plan.door.listen, "[::1]:443".parse().unwrap());
+    }
+
+    #[test]
+    fn behind_proxy_plans_proxy_listen_and_trust() {
+        let config = load(&format!(
+            "{BASE}\n[network]\nhttps_port = 443\nmode = \"behind_proxy\"\ntrusted_proxies = [\"::1\", \"10.0.0.0/8\"]\n"
+        ));
+        let plan = tcp_config_from(&config).unwrap();
+        assert_eq!(plan.door.listen, "[::1]:8443".parse().unwrap());
+        assert!(plan.redirect.is_none());
+        let trusted = plan.door.proxy.unwrap();
+        assert!(trusted.contains("::1".parse().unwrap()));
+        assert!(trusted.contains("10.9.8.7".parse().unwrap()));
+        assert!(!trusted.contains("192.0.2.1".parse().unwrap()));
+    }
+
+    #[test]
     fn invalid_network_section_is_rejected_by_validation() {
-        for bad in ["https_port = 0", "workers = 0"] {
+        for bad in [
+            "https_port = 0",
+            "workers = 0",
+            "bind = \"0.0.0.0\"",
+            "https_port = 443\nmode = \"direct\"",
+            "https_port = 443\nmode = \"behind_proxy\"",
+        ] {
             let config = load(&format!("{BASE}\n[network]\n{bad}\n"));
             let network = config.network.as_ref().expect("[network] parsed");
             let err = network.validate().expect_err(bad).to_string();
