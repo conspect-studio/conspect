@@ -2310,6 +2310,24 @@ impl CommandDrain {
             );
             return;
         }
+        // #317 backstop: the route refuses this with a typed 422 before persisting;
+        // the drain re-checks with the SAME start-up admission rule so no other
+        // submitter can put a canvas under the M/E that the engine could not boot.
+        // Pure comparisons over the solved cells; no allocation on the Ok path.
+        if let Err(refusal) = multiview_config::switcher_canvas_admission(
+            self.config.switcher.as_ref(),
+            &resolved.solved,
+            &resolved.document.cells,
+            &self.config.overlays,
+        ) {
+            tracing::warn!(
+                layout = %id,
+                reason = %refusal,
+                "apply_layout held: the switcher M/E cannot drive this canvas; not applied live"
+            );
+            self.publish_apply_held(id, &refusal.operator_message());
+            return;
+        }
         let cells = resolved.solved.cells.len();
         #[cfg(feature = "ffmpeg")]
         for id in resolved

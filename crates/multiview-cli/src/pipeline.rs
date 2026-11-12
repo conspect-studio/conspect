@@ -268,39 +268,6 @@ struct StreamPlan {
     binding_ids: Vec<Option<String>>,
 }
 
-/// Is this document's canvas one the first slice can drive as a real M/E bus?
-///
-/// Exactly one full-canvas, fully opaque, unclipped, non-overlay cell bound to
-/// the declared `program_source` — the shape the engine treats as the
-/// source-agnostic bus canvas. An unsupported opted-in layout is refused with a
-/// typed error instead of silently replacing the operator's multiview.
-#[allow(clippy::float_cmp)]
-// reason: authored layout fractions compared against their exact canonical
-// values; an approximate comparison would admit a windowed/tiled canvas as
-// "full canvas" and change which sources the buses admit.
-fn first_slice_me_layout_supported(
-    layout: &Layout,
-    config: &MultiviewConfig,
-    me: &multiview_config::MixEffectsConfig,
-) -> bool {
-    layout.cells.len() == 1
-        && config.overlays.is_empty()
-        && !config.cells.first().is_some_and(|cell| {
-            cell.corner_radius.is_some()
-                || cell.border.is_some()
-                || cell.fit.as_deref().is_some_and(|fit| fit != "fill")
-                || cell.visible == Some(false)
-        })
-        && layout.cells.first().is_some_and(|cell| {
-            cell.x == 0.0 && cell.y == 0.0 && cell.w == 1.0 && cell.h == 1.0 && cell.opacity == 1.0
-        })
-        && config
-            .cells
-            .first()
-            .and_then(|cell| cell.source.input_id.as_deref())
-            == Some(me.program_source.as_str())
-}
-
 /// Errors building or running the libav\* pipeline.
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
@@ -2434,11 +2401,11 @@ impl Pipeline {
         // legacy multiview with multiple cells remains untouched when the M/E
         // block is absent; an opted-in unsupported layout fails loudly instead
         // of replacing the operator's canvas with a guessed source.
-        if let Some(me) = &switcher_me {
-            if !first_slice_me_layout_supported(&layout, config, me) {
-                return Err(PipelineError::Engine("first-slice M/E requires one full-canvas source cell initially bound to program_source; multi-cell layouts are not replaced".into()));
-            }
-        }
+        // The SAME admission rule the control plane applies before it persists an
+        // accepted state (#317): `multiview_config::switcher_canvas_admission`.
+        config
+            .switcher_canvas_admission(&layout)
+            .map_err(|refusal| PipelineError::Engine(refusal.to_string()))?;
         let switcher_cell_id = switcher_me
             .as_ref()
             .and_then(|_| config.cells.first().map(|cell| cell.id.clone()));
