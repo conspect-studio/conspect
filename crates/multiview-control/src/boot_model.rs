@@ -196,10 +196,13 @@ pub fn admit_for_boot(config: &MultiviewConfig) -> ControlResult<()> {
     config
         .switcher_canvas_admission(&solved)
         .map_err(ControlError::NotAdmissibleWithSwitcher)
-    // `outputs_carry_program` is deliberately not checked here: `routing` is a
-    // storeless restart-only section start-up splices from the BOOT file
-    // (`boot::splice_storeless_sections`), so the accepted copy is not what
-    // start-up builds. `multiview validate` checks it on the spliced document.
+    // `outputs_carry_program` is deliberately not checked here: start-up
+    // builds the accepted document with the boot file's restart-only sections
+    // spliced in (`boot::splice_storeless_sections`: the routing crosspoint
+    // tables come from the boot file, `routing.output` rows stay store-backed
+    // from the accepted copy, seeded by boot rows). `multiview validate`
+    // checks it on that spliced document. Since #329 it refuses only feeds
+    // the engine cannot carry at all (a layout, which validation refuses).
 }
 
 /// Load authoritative accepted intent. A corrupt existing record is an error,

@@ -99,11 +99,20 @@ impl StartConfig {
 
 /// Splice the storeless restart-only sections from the BOOT document into a
 /// resumed Running document (ADR-W024 review M1): `control`, `placement`,
-/// `walls`, `routing`, and `schema_version` have no control store — the boot
+/// `walls`, `schema_version`, `events` and the routing CROSSPOINT tables
+/// (`routing.video` / `audio` / `subtitle`) have no control store — the boot
 /// file is their durable truth, and a restart is exactly when they take effect.
 /// Without the splice, a boot-file `[control] listen` edit would be silently
 /// lost on the very restart the operator performed to apply it (the stale
 /// `active.toml` copy would win).
+///
+/// `routing.output` is **store-backed** (ADR-0108 §6.1, #329): an applied
+/// output take is committed into the accepted state (`persist_feed`), so
+/// those rows come from `running` — accepted rows win per output. A boot-file
+/// `[[routing.output]]` row for an output the running document has no row for
+/// seeds it (the operator's file declares the starting feed). Boot rows for an
+/// output the running document does not declare are dropped (they would not
+/// validate). See [`splice_output_routing`].
 ///
 /// `salvos` and `tally_profiles` are deliberately NOT spliced (ADR-W024 round
 /// 6): they ARE runtime-mutable through their definition routes (a pure
@@ -123,19 +132,52 @@ fn splice_storeless_sections(
     running.control.clone_from(&boot.control);
     running.placement.clone_from(&boot.placement);
     running.walls.clone_from(&boot.walls);
-    running.routing.clone_from(&boot.routing);
+    running.routing = splice_output_routing(&running, boot);
     running.events = boot.events;
     running
+}
+
+/// The routing table a resumed Running document starts with: the boot file's
+/// crosspoint tables (video/audio/subtitle, restart-only) plus the output
+/// rows of `running` (store-backed: the accepted feeds), seeded per output by
+/// a boot row where `running` has none. `None` when every table is empty.
+fn splice_output_routing(
+    running: &MultiviewConfig,
+    boot: &MultiviewConfig,
+) -> Option<multiview_config::routing::RoutingTable> {
+    let mut table = boot.routing.clone().unwrap_or_default();
+    let accepted: &[multiview_config::OutputCrosspoint] = running
+        .routing
+        .as_ref()
+        .map_or(&[], |t| t.output.as_slice());
+    let declared: std::collections::HashSet<String> =
+        running.outputs.iter().map(multiview_config::Output::id).collect();
+    let mut output: Vec<multiview_config::OutputCrosspoint> = accepted.to_vec();
+    for seed in std::mem::take(&mut table.output) {
+        if declared.contains(&seed.output) && !output.iter().any(|xp| xp.output == seed.output) {
+            output.push(seed);
+        }
+    }
+    table.output = output;
+    let empty = table.output.is_empty()
+        && table.video.is_empty()
+        && table.audio.is_empty()
+        && table.subtitle.is_empty();
+    (!empty).then_some(table)
 }
 
 /// Resolve the starting Running state for a run booted from `boot` (already
 /// parsed + validated) at `boot_path` (ADR-W024 §4).
 ///
-/// Under `start = "resume"` the persisted `active.toml` next to the boot file
-/// becomes Running when it is valid — with the storeless restart-only
-/// sections (`control`, `placement`, `walls`, `routing`, `schema_version`)
-/// spliced from the BOOT document (review M1: a boot-file edit to a
-/// restart-only section must take effect on restart). `salvos`/`tally_profiles`
+/// The accepted state (`desired.json`) outranks everything when present. Under
+/// `start = "resume"` the persisted `active.toml` next to the boot file
+/// becomes Running when it is valid. In both (and for a last-good fallback)
+/// the storeless restart-only sections (`control`, `placement`, `walls`,
+/// `events`, `schema_version`, the routing crosspoint tables) are spliced from
+/// the BOOT document (review M1: a boot-file edit to a restart-only section
+/// must take effect on restart), while `routing.output` rows are store-backed:
+/// the resumed document's rows (the applied takes) win per output and a boot
+/// row only seeds an output that has none (#329; ADR-0108 §6.1). `salvos`/`tally_profiles`
 /// are store-backed running state (ADR-W024 round 6) and resume FROM
 /// `active.toml`, never spliced. A missing/unreadable/invalid file — or a
 /// splice that no longer validates — falls back to the boot document with a
@@ -503,4 +545,145 @@ pub struct PreflightRefusal {
     /// `true`: a start would fall back to the last-good copy (and raise the
     /// `accepted-state-rejected` warning); `false`: a start would fail.
     pub falls_back: bool,
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used, clippy::unwrap_used)]
+mod splice_tests {
+    use super::splice_storeless_sections;
+    use multiview_config::{MultiviewConfig, VideoFeed};
+
+    /// Two sources, two cells, two HLS outputs (`o1`, `o2`); `extra` appended.
+    fn doc(extra: &str) -> MultiviewConfig {
+        let text = format!(
+            r##"schema_version = 1
+[canvas]
+width = 64
+height = 64
+fps = "25/1"
+pixel_format = "nv12"
+background = "#101014"
+[canvas.color]
+profile = "sdr-bt709-limited"
+[layout]
+kind = "grid"
+columns = ["1fr", "1fr"]
+rows = ["1fr"]
+areas = ["a b"]
+[[sources]]
+id = "in_a"
+kind = "solid"
+color = "#101418"
+[[sources]]
+id = "in_b"
+kind = "bars"
+[[cells]]
+id = "cell_a"
+area = "a"
+[cells.source]
+input_id = "in_a"
+[[cells]]
+id = "cell_b"
+area = "b"
+[cells.source]
+input_id = "in_b"
+[[outputs]]
+id = "o1"
+kind = "hls"
+path = "/tmp/boot-splice/o1.m3u8"
+codec = "mpeg2video"
+segment_ms = 1000
+[[outputs]]
+id = "o2"
+kind = "hls"
+path = "/tmp/boot-splice/o2.m3u8"
+codec = "mpeg2video"
+segment_ms = 1000
+{extra}"##
+        );
+        let config = MultiviewConfig::load_from_toml(&text).expect("parses");
+        config.validate().expect("valid");
+        config
+    }
+
+    fn feed_of(config: &MultiviewConfig, output: &str) -> Option<VideoFeed> {
+        config
+            .routing
+            .as_ref()?
+            .output
+            .iter()
+            .find(|xp| xp.output == output)
+            .map(multiview_config::OutputCrosspoint::effective_video)
+    }
+
+    const BOOT_VIDEO_XP: &str = r#"
+[[routing.video]]
+cell = "cell_b"
+source = { input_id = "in_b", kind = { kind = "video" } }
+"#;
+
+    #[test]
+    fn the_accepted_output_row_wins_over_the_boot_row() {
+        let boot = doc(&format!(
+            "{BOOT_VIDEO_XP}\n[[routing.output]]\noutput = \"o1\"\nvideo = {{ source = \"in_a\" }}\n"
+        ));
+        let accepted = doc("[[routing.output]]\noutput = \"o1\"\nvideo = { source = \"in_b\" }\n");
+        let running = splice_storeless_sections(accepted, &boot);
+        assert_eq!(
+            feed_of(&running, "o1"),
+            Some(VideoFeed::Source("in_b".into())),
+            "the persisted take survives the restart"
+        );
+        running.validate().expect("the spliced document validates");
+    }
+
+    #[test]
+    fn a_boot_row_seeds_an_output_the_accepted_state_has_no_row_for() {
+        let boot = doc(
+            "[[routing.output]]\noutput = \"o1\"\nvideo = { source = \"in_a\" }\n\
+             [[routing.output]]\noutput = \"o2\"\nvideo = { source = \"in_a\" }\n",
+        );
+        let accepted = doc("[[routing.output]]\noutput = \"o2\"\nvideo = { source = \"in_b\" }\n");
+        let running = splice_storeless_sections(accepted, &boot);
+        assert_eq!(
+            feed_of(&running, "o1"),
+            Some(VideoFeed::Source("in_a".into())),
+            "no accepted row: the boot row seeds o1"
+        );
+        assert_eq!(
+            feed_of(&running, "o2"),
+            Some(VideoFeed::Source("in_b".into())),
+            "accepted row wins per output"
+        );
+        assert_eq!(running.routing.as_ref().map(|t| t.output.len()), Some(2));
+    }
+
+    #[test]
+    fn the_other_routing_tables_still_come_from_the_boot_file() {
+        // Boot declares a video crosspoint and no output rows; the accepted
+        // copy has an output row and NO video crosspoint (a stale copy).
+        let boot = doc(BOOT_VIDEO_XP);
+        let accepted = doc("[[routing.output]]\noutput = \"o2\"\nvideo = { source = \"in_a\" }\n");
+        let running = splice_storeless_sections(accepted, &boot);
+        let table = running.routing.as_ref().expect("a routing table");
+        assert_eq!(table.video.len(), 1, "video crosspoints spliced from boot");
+        assert_eq!(table.video[0].cell, "cell_b");
+        assert_eq!(
+            feed_of(&running, "o2"),
+            Some(VideoFeed::Source("in_a".into()))
+        );
+        // And the reverse: a boot edit that removes a crosspoint takes effect,
+        // and nothing at all routed stays `None` (today's absent table).
+        let running = splice_storeless_sections(doc(BOOT_VIDEO_XP), &doc(""));
+        assert!(running.routing.is_none(), "{:?}", running.routing);
+    }
+
+    #[test]
+    fn a_boot_row_for_an_output_the_running_document_lacks_is_dropped() {
+        let boot = doc("[[routing.output]]\noutput = \"o2\"\nvideo = { source = \"in_a\" }\n");
+        let mut accepted = doc("");
+        accepted.outputs.truncate(1);
+        let running = splice_storeless_sections(accepted, &boot);
+        assert!(running.routing.is_none(), "{:?}", running.routing);
+    }
 }

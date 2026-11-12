@@ -691,8 +691,10 @@ async fn relay_one(
 }
 
 /// Persist `feed` as `output`'s `[[routing.output]]` entry (Program removes
-/// it), under the config-mutation lock `apply-layout` uses. Called only after
-/// the engine reported `applied`.
+/// it, unless the boot file routes that output elsewhere: then an explicit
+/// Program row is kept so a restart does not re-seed the boot row), under the
+/// config-mutation lock `apply-layout` uses. Called only after the engine
+/// reported `applied`. Start-up carries these rows (store-backed, #329).
 ///
 /// # Errors
 /// The accepted document cannot be read, validated or committed.
@@ -717,12 +719,23 @@ pub async fn persist_feed(
     // cell/audio rows (a later layout edit must not meet stale crosspoints).
     let mut table = config.routing.take().unwrap_or_default();
     table.output.retain(|xp| xp.output != output);
-    if *feed != RoutedFeed::Program {
+    // A start-up seeds an output with no accepted row from the BOOT file's
+    // row (#329), so a take back to Program must stay explicit when the boot
+    // file routes that output elsewhere — or a restart would undo it.
+    let boot_seeds_other = state.boot_model.as_ref().is_some_and(|model| {
+        model.loaded().routing.as_ref().is_some_and(|t| {
+            t.output
+                .iter()
+                .any(|xp| xp.output == output && xp.effective_video() != multiview_config::VideoFeed::PROGRAM)
+        })
+    });
+    if *feed != RoutedFeed::Program || boot_seeds_other {
         let mut xp = multiview_config::OutputCrosspoint::program(output, program);
         xp.video = Some(feed.video_feed());
         table.output.push(xp);
     }
-    // Program: the entry is removed (absent = Program, today's behaviour).
+    // Otherwise Program removes the entry (absent = Program, today's
+    // behaviour).
     let empty = table.output.is_empty()
         && table.video.is_empty()
         && table.audio.is_empty()
