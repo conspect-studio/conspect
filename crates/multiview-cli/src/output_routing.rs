@@ -825,9 +825,9 @@ impl OutputRouter {
         dispatcher: &mut RenditionDispatcher,
     ) {
         if let Some(audio) = self.audio.as_mut() {
-            let before = audio.private_buses();
+            let before = (audio.private_buses(), audio.counters());
             audio.feed(tick, program, inputs, dispatcher);
-            if audio.private_buses() != before {
+            if (audio.private_buses(), audio.counters()) != before {
                 self.dirty = true;
             }
         }
@@ -911,7 +911,13 @@ impl OutputRouter {
             self.close(key, dispatcher);
         }
         if let Some(audio) = self.audio.as_mut() {
+            let before = (audio.private_buses(), audio.counters());
             audio.drain(dispatcher, delivery)?;
+            // A bus the dispatcher failed (stall, watchdog) closed here: the
+            // readback must say so.
+            if (audio.private_buses(), audio.counters()) != before {
+                self.dirty = true;
+            }
         }
         while let Ok((generation, event)) = self.dyn_rx.try_recv() {
             // Accept only an event whose generation AND key index both name

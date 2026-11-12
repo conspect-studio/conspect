@@ -2284,7 +2284,8 @@ fn an_audio_only_crossfade_is_sample_continuous_and_one_tick_long() {
     // Across the fade: an equal-power pair o·cosθ + n·sinθ moves by at most
     // hypot(o', n') plus the envelope's own slope (π/2 per fade length).
     let fade_step = step(g - 1, g + len + 1);
-    let bound = s_old.hypot(s_new) + (0.5 + 0.3) * std::f32::consts::FRAC_PI_2 / (len as f32);
+    let len_f = f32::from(u16::try_from(len).unwrap());
+    let bound = s_old.hypot(s_new) + (0.5 + 0.3) * std::f32::consts::FRAC_PI_2 / len_f;
     assert!(
         fade_step <= bound,
         "largest step across the fade {fade_step} > bound {bound} (steady {s_old}, {s_new})"
@@ -2393,7 +2394,7 @@ fn a_private_bus_back_on_program_returns_to_the_shared_stream() {
 /// Spec G4 (chaos): a flood of 5,000 audio-only takes alternating Source /
 /// Program / None on outputs 1 and 2 as fast as the mailbox accepts. Output
 /// 0 (Program) keeps every audio frame and every video window; the mailbox
-/// refuses (TakeBusy) instead of growing; private buses never exceed the
+/// refuses (`TakeBusy`) instead of growing; private buses never exceed the
 /// outputs; every output's audio stays one frame per 1024 samples.
 #[test]
 fn an_audio_take_flood_never_disturbs_program_and_stays_bounded() {
@@ -2428,7 +2429,7 @@ fn an_audio_take_flood_never_disturbs_program_and_stays_bounded() {
     let want: Vec<i64> = (0..i64::try_from(video.len()).unwrap()).collect();
     assert_eq!(video, want, "output 0: one video window per tick");
     assert!(
-        video.len() as u64 + 8 >= end,
+        u64::try_from(video.len()).unwrap() + 8 >= end,
         "windows {} for {end} ticks",
         video.len()
     );
@@ -2551,29 +2552,41 @@ fn stalled_or_crashing_worker(panic_worker: bool) {
     let mut x = audio_harness(2, NTSC, Box::new(|_| Err("no video".to_owned())));
     let (release, wait) = std::sync::mpsc::channel::<()>();
     let wait = Arc::new(Mutex::new(wait));
+    let wedged = Arc::new(AtomicBool::new(false));
+    let wedge = Arc::clone(&wedged);
     x.r.set_audio_worker_hook(Arc::new(move |_job| {
+        if !wedge.load(Ordering::Acquire) {
+            return;
+        }
         assert!(!panic_worker, "injected private-bus worker panic");
         // A wedged worker: never drains its job queue until released.
         let _ = wait.lock().unwrap().recv();
     }));
+    // The take applies first: the output is on its private bus (tone).
     let t = x.run(0, 12);
-    x.h.try_take(audio_only("stall", 1, bars_src())).unwrap();
-    let (o, t) = x.until(t, "stall", PRIVATE_AUDIO_QUEUE_TICKS + 4);
-    assert_eq!(
-        o.outcome,
-        TakeResult::Refused(RefuseReason::EncoderNotReady),
-        "{o:?}"
-    );
-    assert_eq!(o.audio, Some(AudioChoice::Follow), "the choice is restored");
-    let t = x.run(t, 4);
+    x.h.try_take(audio_only("tone", 1, bars_src())).unwrap();
+    let (o, t) = x.until(t, "tone", 60);
+    assert_eq!(o.outcome, TakeResult::Applied, "{o:?}");
+    let t = x.run(t, 2);
+    assert_eq!(x.h.snapshot().audio_buses_live, 1);
+    assert!(x.d.binding_audio_key(1).is_some(), "on the private bus");
+    // Now the worker wedges (or panics) at its next job.
+    wedged.store(true, Ordering::Release);
+    let mut failed_at = None;
+    let depth = u64::try_from(crate::routing_audio::PRIVATE_AUDIO_QUEUE).unwrap();
+    for k in 0..depth + 4 {
+        x.tick(t + k);
+        if x.h.snapshot().audio_buses_live == 0 {
+            failed_at = Some(k);
+            break;
+        }
+    }
+    let k = failed_at.expect("the bus failed");
+    assert!(k <= depth + 1, "failed within the queue depth: {k}");
+    let t = x.run(t + k + 1, 4);
     let snap = x.h.snapshot();
-    assert_eq!(snap.audio_buses_live, 0, "{snap:?}");
     assert_eq!(snap.audio.failed, 1, "{snap:?}");
-    assert_eq!(
-        x.d.binding_audio_key(1),
-        None,
-        "output 1 on the shared stage"
-    );
+    assert_eq!(x.d.binding_audio_key(1), None, "back on the shared stage");
     assert!(
         x.feed_max < std::time::Duration::from_millis(50),
         "the consumer never waits: {:?}",
@@ -2584,9 +2597,6 @@ fn stalled_or_crashing_worker(panic_worker: bool) {
     assert_pts_step(&x.audio_pts(1), "output 1");
     drop(release);
 }
-
-/// The take's outcome arrives within the private queue depth plus slack.
-const PRIVATE_AUDIO_QUEUE_TICKS: u64 = crate::routing_audio::PRIVATE_AUDIO_QUEUE as u64 + 6;
 
 /// Spec G6 (chaos): a wedged private-bus worker fails its bus alone within
 /// the queue depth; the output stays on / returns to the shared program
@@ -2765,20 +2775,22 @@ fn an_explicit_source_follows_the_live_route_gain_and_a_track_does_not() {
 /// applies at once.
 #[test]
 fn audio_takes_without_a_program_audio_slot_are_unroutable() {
-    let (mut r, h, _) = router(2, 6, Box::new(|_| Err("never".to_owned())));
-    let outcomes = h.outcomes().unwrap();
-    let mut d = dispatcher(2);
-    h.try_take(audio_only("a", 1, AudioChoice::Program))
+    let (mut rt, handle, _) = router(2, 6, Box::new(|_| Err("never".to_owned())));
+    let outcomes = handle.outcomes().unwrap();
+    let mut disp = dispatcher(2);
+    handle
+        .try_take(audio_only("a", 1, AudioChoice::Program))
         .unwrap();
-    h.try_take(OutputTake {
-        operation_id: "none".to_owned(),
-        output_index: 1,
-        bus: None,
-        audio: None,
-        principal: "p".to_owned(),
-    })
-    .unwrap();
-    r.on_tick(0, MediaTime::from_nanos(0), &mut d, &mut NoDelivery)
+    handle
+        .try_take(OutputTake {
+            operation_id: "none".to_owned(),
+            output_index: 1,
+            bus: None,
+            audio: None,
+            principal: "p".to_owned(),
+        })
+        .unwrap();
+    rt.on_tick(0, MediaTime::from_nanos(0), &mut disp, &mut NoDelivery)
         .unwrap();
     let got: Vec<_> = outcomes.try_iter().map(|o| o.outcome).collect();
     assert_eq!(
@@ -2795,4 +2807,84 @@ fn audio_takes_without_a_program_audio_slot_are_unroutable() {
     let (o, next) = x.until(t, "same", 2);
     assert_eq!((o.outcome, o.tick), (TakeResult::Applied, next - 1));
     assert_eq!(x.h.snapshot().audio.opened, 0);
+}
+
+/// Spec B (flood bound): a change taken while a fade runs never overlaps it
+/// and never steps. It starts from the running fade's target at the first
+/// grid boundary after that fade ends; the PCM stays continuous.
+#[test]
+fn a_take_during_a_running_fade_is_queued_after_it() {
+    let mut x = audio_harness(2, NTSC, Box::new(|_| Err("no video".to_owned())));
+    let mut t = x.run(0, 12);
+    x.h.try_take(audio_only("first", 1, bars_src())).unwrap();
+    // Tick until the first fade has started being fed.
+    let mut first = None;
+    for _ in 0..60 {
+        x.tick(t);
+        t += 1;
+        if let Some(f) = x.tap.lock().unwrap().fades.iter().find(|f| f.0 == 1) {
+            first = Some((f.1, f.2));
+        }
+        if first.is_some() {
+            break;
+        }
+    }
+    let (g1, len1) = first.expect("the first fade started");
+    assert!(
+        x.clock.total_at(t) < g1 + len1,
+        "the first fade is still running when the next take drains"
+    );
+    x.h.try_take(audio_only("second", 1, AudioChoice::Silence))
+        .unwrap();
+    let (o, t) = x.until(t, "second", 60);
+    assert_eq!(o.outcome, TakeResult::Applied, "{o:?}");
+    let first_outcome = x.others.iter().find(|o| o.operation_id == "first");
+    assert_eq!(
+        first_outcome.map(|o| o.outcome),
+        Some(TakeResult::Superseded),
+        "latest wins: the first take reports superseded"
+    );
+    let _ = x.run(t, 4);
+    let fades: Vec<(u64, u64)> = x
+        .tap
+        .lock()
+        .unwrap()
+        .fades
+        .iter()
+        .filter(|f| f.0 == 1)
+        .map(|f| (f.1, f.2))
+        .collect();
+    assert_eq!(fades.len(), 2, "{fades:?}");
+    let (g2, _) = fades[1];
+    assert_eq!(fades[0], (g1, len1), "the running fade ran to its end");
+    // The tick block in which the running fade ends is already mixed when
+    // it ends: the next fade starts at the first grid boundary at or after
+    // that block's end (never inside the running fade, never a step).
+    let mut k = 0;
+    while x.clock.total_at(k + 1) < g1 + len1 {
+        k += 1;
+    }
+    assert_eq!(
+        g2,
+        grid_ceil(x.clock.total_at(k + 1), AAC_FRAME_SAMPLES),
+        "the next fade starts at the first grid boundary after the running one ends"
+    );
+    assert!(g2 >= g1 + len1, "no overlap");
+    let pcm = x.private_left(1);
+    // Between the fades the bus carries the first fade's target exactly.
+    for n in g1 + len1..g2 {
+        assert!(
+            (pcm[&n] - bars(n)).abs() < 1e-6,
+            "tone between fades at {n}"
+        );
+    }
+    // No step anywhere above the fade-bounded maximum.
+    let worst = (g1 - 1..g2 + 2000)
+        .map(|n| (pcm[&(n + 1)] - pcm[&n]).abs())
+        .fold(0.0_f32, f32::max);
+    let steady = 0.5 * std::f32::consts::TAU * 1_000.0 / 48_000.0;
+    assert!(
+        worst <= steady * 1.5,
+        "largest step {worst} (steady tone {steady})"
+    );
 }

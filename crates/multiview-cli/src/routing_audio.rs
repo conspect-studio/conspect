@@ -24,8 +24,9 @@
 //! four frames before `G'`.
 //!
 //! **One fade at a time.** A change requested while a fade runs is queued: it
-//! starts from the running fade's target at the first grid boundary after
-//! that fade ends (never two overlapping fades, never a step). A change not
+//! starts from the running fade's target at the first grid boundary at or
+//! after the end of the tick block in which that fade ends (never two
+//! overlapping fades, never a step). A change not
 //! yet started is replaced (latest wins). Per output this is O(1) state.
 //!
 //! Isolation (invariants #1/#10): nothing here runs on the output clock. The
@@ -583,7 +584,7 @@ impl RoutedAudio {
             bus.reserved = false;
         }
         let to = o.choice.resolve(target);
-        let changed = self.change(output, to, move_tick, Mode::Bind(after_video), dispatcher);
+        let changed = self.change(output, &to, move_tick, Mode::Bind(after_video), dispatcher);
         if let (Change::Scheduled(_), Some(_)) = (changed, after_video) {
             if let Some(o) = self.outputs.get_mut(output) {
                 o.pending_change = Some(before);
@@ -605,7 +606,7 @@ impl RoutedAudio {
             return;
         };
         let to = o.choice.resolve(target);
-        let _ = self.change(output, to, move_tick, Mode::Bind(after_video), dispatcher);
+        let _ = self.change(output, &to, move_tick, Mode::Bind(after_video), dispatcher);
     }
 
     /// The output's video move was applied: the take's audio stays.
@@ -640,9 +641,7 @@ impl RoutedAudio {
         // The dispatcher dropped (or drops at its next drain) an audio move
         // gated on the refused video move: the output reads the shared stage.
         if matches!(bus.bind, Bind::Gated | Bind::Deferred { after: Some(_) }) {
-            let reads_bus = dispatcher
-                .audio_slot(output)
-                .is_some_and(|(k, _)| k == Some(bus.key));
+            let reads_bus = dispatcher.audio_slot_key(output) == Some(bus.key);
             bus.bind = if reads_bus {
                 Bind::Bound
             } else {
@@ -657,7 +656,7 @@ impl RoutedAudio {
             self.counters.faded_back = self.counters.faded_back.saturating_add(1);
             tracing::info!(output, "routing: video move refused; audio fades back");
         }
-        let _ = self.change(output, back, tick, Mode::Quiet, dispatcher);
+        let _ = self.change(output, &back, tick, Mode::Quiet, dispatcher);
     }
 
     /// Adopt an audio-only take at drain tick `tick`: the output's choice
@@ -680,7 +679,7 @@ impl RoutedAudio {
             .map_or_else(|| o.choice.clone(), |w| w.restore);
         o.choice = choice;
         let to = o.choice.resolve(bus);
-        match self.change(output, to, tick, Mode::Bind(None), dispatcher) {
+        match self.change(output, &to, tick, Mode::Bind(None), dispatcher) {
             Change::Unchanged => AudioTakeStart::Unchanged,
             Change::Refused => {
                 if let Some(o) = self.outputs.get_mut(output) {
@@ -742,7 +741,7 @@ impl RoutedAudio {
         }
         o.choice = w.restore;
         let to = o.choice.resolve(bus);
-        let _ = self.change(output, to, tick, Mode::Quiet, dispatcher);
+        let _ = self.change(output, &to, tick, Mode::Quiet, dispatcher);
     }
 
     /// Schedule the output's audio to become `to` from the drain/move tick
@@ -752,14 +751,14 @@ impl RoutedAudio {
     fn change(
         &mut self,
         output: usize,
-        to: AudioSource,
+        to: &AudioSource,
         tick: u64,
         mode: Mode,
         dispatcher: &mut RenditionDispatcher,
     ) -> Change {
         let has_bus = self.outputs.get(output).is_some_and(|o| o.bus.is_some());
         if !has_bus {
-            if to == AudioSource::Program || matches!(mode, Mode::Quiet) {
+            if *to == AudioSource::Program || matches!(mode, Mode::Quiet) {
                 return Change::Unchanged;
             }
             if !self.open(output, tick, dispatcher) {
@@ -779,8 +778,8 @@ impl RoutedAudio {
         // air, or the output keeps the program mix the shared stage carries.
         let needs_bind = matches!(mode, Mode::Bind(_))
             && !bus.bind.on_air()
-            && !(to == AudioSource::Program && *bus.target() == AudioSource::Program);
-        if *bus.target() == to && !needs_bind {
+            && !(*to == AudioSource::Program && *bus.target() == AudioSource::Program);
+        if bus.target() == to && !needs_bind {
             return Change::Unchanged;
         }
         let running = bus.fade.as_ref().is_some_and(|f| f.xf.start < bus.fed);
@@ -790,7 +789,7 @@ impl RoutedAudio {
             // Never two overlapping fades: from the running fade's target,
             // at the first grid boundary after it ends (`feed`).
             let target = bus.fade.as_ref().map(|f| (f.to.clone(), f.xf.start));
-            bus.queued = (target.as_ref().map(|t| &t.0) != Some(&to)).then(|| to.clone());
+            bus.queued = (target.as_ref().map(|t| &t.0) != Some(to)).then(|| to.clone());
             if bus.queued.is_none() {
                 // Back to the running fade's target: that fade's G.
                 landed = target.map(|t| t.1);
@@ -802,7 +801,7 @@ impl RoutedAudio {
             };
             bus.queued = None;
             bus.current = from.clone();
-            if from != to {
+            if from != *to {
                 // Rule 2: the bus coded the old signal for WARM_FRAMES
                 // before G and G lies after everything already fed.
                 let warm = bus

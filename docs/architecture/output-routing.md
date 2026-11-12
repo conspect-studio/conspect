@@ -898,7 +898,8 @@ choice: an explicit choice stays, `follow` follows the new video. A fallback to 
 explicit choice; `follow` follows Program.
 
 **One fade at a time.** A change requested while a fade runs never overlaps it and never steps: it
-starts from the running fade's target at the first grid boundary after that fade ends. A change not
+starts from the running fade's target at the first grid boundary at or after the end of the
+tick block in which that fade ends. A change not
 yet started is replaced by a newer one (latest wins). The per-output state is O(1), whatever the
 take rate.
 

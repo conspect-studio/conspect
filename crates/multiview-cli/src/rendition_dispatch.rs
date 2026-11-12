@@ -2160,23 +2160,13 @@ impl RenditionDispatcher {
             .iter()
             .any(|b| b.output_index == output_index && b.audio_tracks.contains(&0))
     }
-    /// The output's program-audio slot: `(reads, pending)` where `reads` is
-    /// the dynamic stage it reads now (`None` = the shared program stage)
-    /// and `pending` is a requested move `(destination, gated on a video
-    /// move)`. `None` for an output without a program-audio slot.
-    pub(crate) fn audio_slot(
-        &self,
-        output_index: usize,
-    ) -> Option<(Option<usize>, Option<(Option<usize>, bool)>)> {
+    /// The dynamic audio stage the output's program-audio slot reads now
+    /// (`None` = the shared program stage, or no program-audio slot).
+    pub(crate) fn audio_slot_key(&self, output_index: usize) -> Option<usize> {
         self.bindings
             .iter()
             .find(|b| b.output_index == output_index && b.audio_tracks.contains(&0))
-            .map(|b| {
-                (
-                    b.audio_key,
-                    b.audio_mv.map(|m| (m.key, m.after_video.is_some())),
-                )
-            })
+            .and_then(|b| b.audio_key)
     }
     /// True for an unknown, failed or retired dynamic audio stage.
     pub(crate) fn is_audio_key_failed(&self, key: usize) -> bool {

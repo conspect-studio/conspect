@@ -891,6 +891,7 @@ fn a_take_to_clean_carries_the_pre_bake_canvas_through_the_real_pipeline() {
 /// within ~10 ticks, to the shared stream (`audio_buses_live == 0`). Audio
 /// PTS steps 1024 (1/48000) = 1920 MPEG-TS (90 kHz) units on every packet.
 #[test]
+#[allow(clippy::too_many_lines)] // One end-to-end scenario with its assertions.
 fn an_audio_only_take_routes_a_source_and_returns_to_the_shared_stream() {
     const TICKS: u64 = 400;
     let observed = Arc::new(Mutex::new(Observed::default()));

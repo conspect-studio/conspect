@@ -270,11 +270,7 @@ fn a_tracks_feed_names_declared_distinct_tracks() {
         feed("srt-out", r#"{ tracks = ["eng"] }"#)
     ))
     .unwrap();
-    let err = load(&format!(
-        "{TRACKS}{}",
-        feed("srt-out", r#"{ tracks = [] }"#)
-    ))
-    .unwrap_err();
+    let err = load(&format!("{TRACKS}{}", feed("srt-out", r"{ tracks = [] }"))).unwrap_err();
     assert!(err.contains("at least one track"), "{err}");
     let err = load(&format!(
         "{TRACKS}{}",
@@ -332,11 +328,13 @@ fn start_up_refuses_an_explicit_audio_feed_it_does_not_carry() {
 }
 
 fn routing(tracks: &[(&str, &str)]) -> multiview_config::AudioRouting {
+    use std::fmt::Write as _;
     let mut doc = String::from("[audio]\nsample_rate_hz = 48000\n");
     for (input, track) in tracks {
-        doc.push_str(&format!(
-            "[[audio.routes]]\ninput_id = \"{input}\"\nchannels = {{ kind = \"stereo\" }}\ntarget_track = \"{track}\"\n"
-        ));
+        let _ = writeln!(
+            doc,
+            "[[audio.routes]]\ninput_id = \"{input}\"\nchannels = {{ kind = \"stereo\" }}\ntarget_track = \"{track}\""
+        );
     }
     MultiviewConfig::load_from_toml(&format!("{BASE}{doc}"))
         .unwrap()
@@ -395,9 +393,7 @@ fn a_removed_track_is_dropped_and_an_emptied_feed_becomes_program() {
     // Nothing changed: no update.
     let none =
         multiview_config::propagate_routing_feed_change(Some(&new), &new, cfg.routing.as_mut());
-    assert!(none.is_empty());
-    assert!(
-        multiview_config::propagate_routing_feed_change(None, &new, cfg.routing.as_mut())
-            .is_empty()
-    );
+    assert_eq!(none, Vec::new());
+    let first = multiview_config::propagate_routing_feed_change(None, &new, cfg.routing.as_mut());
+    assert_eq!(first, Vec::new(), "no prior document: nothing to propagate");
 }

@@ -688,6 +688,7 @@ pub struct OutputFeedAudioUpdate {
 /// the feed already carries collapses; a feed whose every track was removed
 /// becomes `program` (the output stays audible). Returns one update per feed
 /// actually changed.
+#[must_use]
 pub fn propagate_routing_feed_change(
     old: Option<&AudioRouting>,
     new: &AudioRouting,
