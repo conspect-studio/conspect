@@ -381,6 +381,11 @@ pub mod webrtc_outputs;
 #[cfg(feature = "webrtc-native")]
 pub mod webrtc_unified;
 
+/// Pure-integer NV12 cell scaler (monitor wall, routing aux canvases).
+pub mod nv12_blit;
+/// The `routing-aux` thread: one-cell routed feeds (ADR-0108 slice 1).
+pub mod routing_aux;
+
 /// The shared monitor wall (ADR-0103): one composed, once-encoded MoQ stream.
 #[cfg(feature = "moq-output")]
 pub mod monitor_wall;

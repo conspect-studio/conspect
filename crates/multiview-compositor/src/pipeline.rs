@@ -526,6 +526,13 @@ impl Nv12Image {
         &self.uv_plane
     }
 
+    /// Mutably borrow the Y and interleaved Cb/Cr planes together, for an
+    /// owner that redraws a reusable buffer in place (the routing aux
+    /// letterbox ring). Geometry and colour tag are unchanged.
+    pub fn planes_mut(&mut self) -> (&mut [u8], &mut [u8]) {
+        (&mut self.y_plane, &mut self.uv_plane)
+    }
+
     /// Sample the `(y, cb, cr)` 8-bit code values at integer pixel `(x, y)`
     /// (nearest, no chroma interpolation — the reference uses simple chroma
     /// replication; correct chroma siting is a GPU concern out of scope here).
