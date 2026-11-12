@@ -3,7 +3,7 @@ use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use bytes::Bytes;
 use conspect_media_crypto::{
     authority_http::VerifiedHttpsTransport,
-    bootstrap::{private_json, Bootstrap},
+    bootstrap::{private_json, Bootstrap, ROOT_EXPIRED_IN_TRANSIT},
     journal::DurableCounterJournal,
     AuthorityRootGuard, Binding, Publisher,
 };
@@ -62,6 +62,7 @@ fn drain_parked(
     slot: &Mutex<(ReceiverRuntime, Output)>,
     queue: &mut conspect_native_exchange_runtime::media::ParkQueue<Parked>,
     received: &mut [Vec<u8>],
+    lost: &mut [u64; 6],
 ) -> Result<()> {
     let mut slot = slot.lock().map_err(|_| "receiver lock")?;
     let (receiver, output) = &mut *slot;
@@ -70,6 +71,7 @@ fn drain_parked(
         let at = now();
         if stale(receiver, &p, at) {
             queue.stale += 1;
+            lost[p.track] += 1;
             continue;
         }
         let Some(epoch) = wire_epoch(&p.wire) else {
@@ -89,7 +91,10 @@ fn drain_parked(
                 accept_plain(received, p.track, p.n, plain, output)?
             }
             Err(_) if receiver.is_denied() => return Err("decrypt denied"),
-            Err(_) if stale(receiver, &p, now()) => queue.stale += 1,
+            Err(_) if stale(receiver, &p, now()) => {
+                queue.stale += 1;
+                lost[p.track] += 1;
+            }
             Err(_) => return Err("decrypt"),
         }
     }
@@ -101,30 +106,136 @@ fn now() -> u64 {
         .unwrap()
         .as_millis() as u64
 }
-/// Shared startup budget: at most 3 seconds of retries plus one in-flight
-/// 1-second transport timeout. Reserve 2 seconds before A's authoritative
-/// expires_at, including the deliberately short 4-second negative fixture.
-/// A normal 10-second window consequently retains >=6 seconds after booking;
-/// the 30-second fixture retains >=26 seconds.
+/// Startup retry budget. Each startup phase that may meet a late answer (the
+/// mapping mint before the marker, the two receiver grants after the expected
+/// fragment) gets at most 3 seconds in which a retry may START. The first
+/// attempt always runs; only retries are gated. One attempt lasts at most
+/// `ATTEMPT_MAX_MS`: the epoch-tail admission wait (at most 1500 + 250 + 1 ms,
+/// bootstrap `admitted_wall`) plus one 1-second transport timeout. No retry
+/// starts later than `STARTUP_BOUNDARY_RESERVE_MS` before booking A's
+/// authoritative expires_at, so the last retry ends at least 249 ms before A's
+/// paid boundary in every fixture:
+/// * 4 000 ms window: deadline = booked + 1 000; last retry ends <= booked + 3 751.
+/// * 10 000 ms window: deadline = booked + 3 000; ends <= booked + 5 751.
+/// * 30 000 ms window: deadline = booked + 3 000; ends <= booked + 5 751.
+///
+/// (The receiver-grant phase starts its own 3-second budget after the fragment
+/// handoff, under the same reserve.) The pre-existing single 404 retry inside a
+/// grant (a tail denial, never a refusal) is outside this budget, as on main.
 const STARTUP_GRANT_BUDGET_MS: u64 = 3000;
-const STARTUP_BOUNDARY_RESERVE_MS: u64 = 2000;
+const STARTUP_BOUNDARY_RESERVE_MS: u64 = 3000;
+#[cfg(test)]
+const ATTEMPT_MAX_MS: u64 = 1500 + 250 + 1 + 1000;
 const LATE_GRANT_SETTLE: Duration = Duration::from_millis(250);
 fn startup_grant_deadline(expiry: u64, at: u64) -> u64 {
     at.saturating_add(STARTUP_GRANT_BUDGET_MS)
         .min(expiry.saturating_sub(STARTUP_BOUNDARY_RESERVE_MS))
 }
+/// The only startup failures that are timing, not refusal: a grant answer that
+/// did not arrive inside the transport timeout, a 200 grant that arrived too
+/// close to its epoch end, and a canonical root answer that the epoch boundary
+/// overtook in transit. Everything else (an answered
+/// refusal, a malformed answer, an equivocating or rolled-back root, a lease
+/// or booking that is gone) is returned at once and never retried.
 fn retry_late_grant<T>(deadline: u64, mut attempt: impl FnMut() -> Result<T>) -> Result<T> {
+    let mut root_retried = false;
     loop {
-        if now() >= deadline {
-            return Err("startup grant deadline");
-        }
-        match attempt() {
+        let result = attempt();
+        match result {
             Err("grant transport" | "mapping grant transport") if now() < deadline => {
                 std::thread::sleep(LATE_GRANT_SETTLE);
+            }
+            // A 200 grant that arrived so late in its epoch that it expires within
+            // the clock uncertainty: a local timing check, not a refusal. The next
+            // attempt is admitted out of the tail, in the next epoch.
+            Err("grant near boundary") if now() < deadline => {}
+            // One retry only: the root fetch itself is admitted out of the epoch
+            // tail, so the retry is sent early in the new epoch.
+            Err(ROOT_EXPIRED_IN_TRANSIT) if !root_retried && now() < deadline => {
+                root_retried = true;
             }
             other => return other,
         }
     }
+}
+/// The startup publisher is built from the live current-epoch root. Like every
+/// later epoch's publisher, it is never requested in the epoch tail, and an
+/// answer that the boundary overtook (Expired, with the wall clock now in a
+/// later epoch) is asked for exactly once more. Any other provider error
+/// (refusal, equivocation, rollback, identity mismatch) stays fatal.
+fn startup_publisher(
+    mut build: impl FnMut(u64) -> std::result::Result<Publisher, conspect_media_crypto::Error>,
+) -> Result<Publisher> {
+    for attempt in 0..2 {
+        if now() % 5000 > 3500 {
+            std::thread::sleep(Duration::from_millis(5000 - now() % 5000));
+        }
+        let at = now();
+        match build(at) {
+            Ok(publisher) => return Ok(publisher),
+            Err(conspect_media_crypto::Error::Expired)
+                if attempt == 0 && now() / 5000 > at / 5000 => {}
+            Err(_) => return Err("authority publisher"),
+        }
+    }
+    Err("authority publisher")
+}
+/// What one taker's accumulated input for one track yields.
+#[derive(Debug)]
+enum DecoderInput {
+    Frames(Vec<conspect_native_exchange_runtime::media::DecodedFrame>),
+    /// No accepted bytes at all: nothing to decode, no observation emitted.
+    Empty,
+    /// The input failed to decode AND objects of this taker/track were lost in
+    /// this window to the counted delivery policy (stale or overflowing park
+    /// queue, a range cut at the epoch boundary, an authorization fence), or are
+    /// still parked: the stream is incomplete by design, not malformed.
+    Incomplete,
+}
+/// The rule for decoder input, for every scenario. An empty input is skipped
+/// and counted. A non-empty input that fails to decode is a hard error unless
+/// objects of this taker/track were lost or are still parked in this window
+/// (`missing > 0`): only then is it counted as incomplete and skipped. A
+/// complete, malformed input therefore always fails. Skips never emit a
+/// decoded observation or receipt, so a taker that silently has no media
+/// still fails `decode_evidence` at the end of the run.
+fn decoder_input(
+    bytes: &[u8],
+    missing: u64,
+    decode: impl FnOnce(&[u8]) -> Result<Vec<conspect_native_exchange_runtime::media::DecodedFrame>>,
+) -> Result<DecoderInput> {
+    if bytes.is_empty() {
+        return Ok(DecoderInput::Empty);
+    }
+    match decode(bytes) {
+        Ok(frames) => Ok(DecoderInput::Frames(frames)),
+        Err(_) if missing > 0 => Ok(DecoderInput::Incomplete),
+        Err(e) => Err(e),
+    }
+}
+/// Per-taker decode evidence at the end of a run. A skipped empty decoder input
+/// produces no decoded interval, so a taker that silently received no media
+/// for the whole run (or for every phase after A's boundary) fails here.
+fn decode_evidence(
+    scenario: &str,
+    intervals: &[[u64; 6]; 2],
+    b_at_expiry: &[u64; 6],
+) -> Result<()> {
+    if scenario == "credit-cutoff"
+        && intervals[1]
+            .iter()
+            .zip(b_at_expiry)
+            .any(|(after, before)| after <= before)
+    {
+        return Err("second receiver did not advance after paid expiry");
+    }
+    if scenario == "credit-cutoff" && intervals[0].iter().any(|n| *n < 2) {
+        return Err("paid-window six-track decode evidence missing");
+    }
+    if scenario != "withdraw" && intervals[1].iter().any(|n| *n < 4) {
+        return Err("second receiver did not continue");
+    }
+    Ok(())
 }
 fn raw(v: &Value) -> Result<[u8; 16]> {
     let s = v.as_str().ok_or("identity missing")?;
@@ -268,8 +379,8 @@ fn connected(
     let grant_deadline = startup_grant_deadline(state.booking_expiry()?, now());
     state.renew(t)?;
     // A delayed answer here is as legitimate as one during media: without the
-    // retry a single late mapping grant would end the run before A's paid
-    // boundary is ever probed.
+    // retry a single late mapping grant, or a root answer overtaken by the
+    // epoch boundary, would end the run before A's paid boundary is probed.
     retry_late_grant(grant_deadline, || state.mint_mapping(t))?;
     state.write_marker(Path::new(&a[3]))?;
     let marker_at = now();
@@ -323,34 +434,43 @@ fn connected(
         } else {
             0
         });
-    let mut publisher = Publisher::from_authority(
-        provider.as_ref(),
-        &mut guard,
-        contributor,
-        b.version,
-        b.feed,
-        b.publisher,
-        publisher_instance,
-        now(),
-        Box::new(
-            DurableCounterJournal::open(&durable.join("nonces")).map_err(|_| "nonce journal")?,
-        ),
-    )
-    .map_err(|_| "authority publisher")?;
+    let mut publisher = startup_publisher(|at| {
+        Publisher::from_authority(
+            provider.as_ref(),
+            &mut guard,
+            contributor,
+            b.version,
+            b.feed,
+            b.publisher,
+            publisher_instance,
+            at,
+            Box::new(DurableCounterJournal::open(&durable.join("nonces"))?),
+        )
+    })?;
+    // The receivers' first grants get their own startup budget, under the same
+    // reserve before A's expires_at: the fragment handoff above may legitimately
+    // have used the mapping phase's budget already.
+    let grant_deadline = startup_grant_deadline(state.booking_expiry()?, now());
     let mut receivers = Vec::new();
     for (i, b) in bindings.iter().enumerate() {
-        let grant = retry_late_grant(grant_deadline, || state.grant(t, i))?;
-        receivers.push(
-            ReceiverRuntime::accept(
+        let receiver = retry_late_grant(grant_deadline, || {
+            let grant = state.grant(t, i)?;
+            match ReceiverRuntime::accept(
                 &key,
                 *b,
                 &grant,
                 now(),
                 0,
                 durable.join(format!("receiver-{i}")),
-            )
-            .map_err(|_| "signed independent binding")?,
-        );
+            ) {
+                Ok(receiver) => Ok(receiver),
+                // A valid grant whose epoch ended between its check and this
+                // install (a stalled host): timing, retried like a late grant.
+                Err(conspect_media_crypto::Error::Expired) => Err("grant near boundary"),
+                Err(_) => Err("signed independent binding"),
+            }
+        })?;
+        receivers.push(receiver);
     }
     let broadcast = moq_net::broadcast::Producer::new(Default::default());
     let consumer = broadcast.consume();
@@ -416,18 +536,21 @@ fn connected(
     );
 
     let mut received = vec![vec![Vec::new(); 6]; 2];
-    let mut intervals = [[0; 6]; 2];
+    let mut intervals = [[0u64; 6]; 2];
     let mut last_media = [[None; 6]; 2];
     let media_started = Instant::now();
     let mut exhausted = false;
     let mut cutoff = false;
     let mut cutoff_phase = 0;
-    let mut b_at_expiry = [0; 6];
+    let mut b_at_expiry = [0u64; 6];
     let mut cutoff_at = 0;
     let mut accepted = [0u64; 2];
     let mut late_drops = 0u64;
     let mut sealing_skipped = 0u64;
-    let mut empty_decode_skips = 0u64;
+    let mut empty_decode_skips = [0u64; 2];
+    let mut incomplete_decode_skips = [0u64; 2];
+    // Objects of each taker/track not delivered in the current input window.
+    let mut lost = [[0u64; 6]; 2];
     let mut parked: Vec<conspect_native_exchange_runtime::media::ParkQueue<Parked>> = (0..2)
         .map(|_| conspect_native_exchange_runtime::media::ParkQueue::new(256))
         .collect();
@@ -442,6 +565,7 @@ fn connected(
         if scenario == "credit-cutoff" && phase > 0 && phase % 2 == 0 {
             captured = now();
             received = vec![vec![Vec::new(); 6]; 2];
+            lost = [[0u64; 6]; 2];
         }
         for (track, f) in fixtures.iter().enumerate() {
             if Instant::now() >= scenario_end {
@@ -476,7 +600,8 @@ fn connected(
                     std::thread::sleep(Duration::from_millis(5000 - now() % 5000));
                 }
                 if publisher.bound_scope().epoch != now() / 5000 {
-                    publisher = Publisher::from_authority(
+                    let at = now();
+                    match Publisher::from_authority(
                         provider.as_ref(),
                         &mut guard,
                         contributor,
@@ -484,15 +609,22 @@ fn connected(
                         b.feed,
                         b.publisher,
                         publisher_instance,
-                        now(),
+                        at,
                         Box::new(
                             DurableCounterJournal::open(
-                                &durable.join(format!("nonces-{}", now() / 5000)),
+                                &durable.join(format!("nonces-{}", at / 5000)),
                             )
                             .map_err(|_| "epoch journal")?,
                         ),
-                    )
-                    .map_err(|_| "epoch authority publisher")?;
+                    ) {
+                        Ok(next) => publisher = next,
+                        // The boundary overtook the root answer in transit: the
+                        // bounded admission cycle asks again in the new epoch.
+                        Err(conspect_media_crypto::Error::Expired) if now() / 5000 > at / 5000 => {
+                            continue;
+                        }
+                        Err(_) => return Err("epoch authority publisher"),
+                    }
                     captured = now();
                 }
                 // The independent bounded grant worker installs the current epoch before media resumes.
@@ -539,11 +671,19 @@ fn connected(
             } else {
                 split..f.packets.len()
             };
+            let range_end = range.end;
             for n in range {
-                if scenario == "credit-cutoff" && publisher.bound_scope().epoch != now() / 5000 {
+                // One wall sample decides the epoch check AND the seal, so a
+                // boundary cannot fall between them.
+                let seal_at = now();
+                if scenario == "credit-cutoff" && publisher.bound_scope().epoch != seal_at / 5000 {
                     // The range outlasted its epoch on a loaded host: never seal across
-                    // the boundary. The next phase re-admits into the new epoch.
+                    // the boundary. The next phase re-admits into the new epoch. The
+                    // unsealed remainder is a counted loss for both takers.
                     sealing_skipped += 1;
+                    for taker_lost in &mut lost {
+                        taker_lost[track] += (range_end - n) as u64;
+                    }
                     break;
                 }
                 let id = publish(
@@ -552,7 +692,7 @@ fn connected(
                     &f.name,
                     n as u64 * 20_000,
                     captured,
-                    now(),
+                    seal_at,
                     Bytes::copy_from_slice(&f.packets[n]),
                 )
                 .map_err(|_| "seal lease/epoch")?;
@@ -589,12 +729,14 @@ fn connected(
                             || receiver.grant_lapsed(now()))
                     {
                         // Grant for this epoch not accepted yet: hold in order, bounded.
-                        parked[i].park(Parked {
+                        if let Some(old) = parked[i].park(Parked {
                             wire,
                             id: id.clone(),
                             track,
                             n: n as u64,
-                        });
+                        }) {
+                            lost[i][old.track] += 1;
+                        }
                         continue;
                     }
                     let plain = receiver.open(&wire, &id, now(), output);
@@ -605,12 +747,14 @@ fn connected(
                     {
                         // The grant lapsed between the check and the open (epoch
                         // boundary crossed mid-loop): not a denial, hold it.
-                        parked[i].park(Parked {
+                        if let Some(old) = parked[i].park(Parked {
                             wire,
                             id: id.clone(),
                             track,
                             n: n as u64,
-                        });
+                        }) {
+                            lost[i][old.track] += 1;
+                        }
                         continue;
                     }
                     if (cutoff && (i == 0 || scenario == "withdraw")) || (exhausted && i == 0) {
@@ -620,6 +764,8 @@ fn connected(
                         continue;
                     }
                     if scenario == "credit-cutoff" && i == 0 && plain.is_err() {
+                        // A's authorization fence: not delivered, counted as lost.
+                        lost[0][track] += 1;
                         continue;
                     }
                     let frame =
@@ -638,7 +784,7 @@ fn connected(
                 }
                 let until = Instant::now() + Duration::from_secs(4);
                 while !parked[i].is_empty() {
-                    drain_parked(&slots[i], &mut parked[i], &mut received[i])?;
+                    drain_parked(&slots[i], &mut parked[i], &mut received[i], &mut lost[i])?;
                     if parked[i].is_empty() || Instant::now() >= until || !control.healthy() {
                         break;
                     }
@@ -656,16 +802,22 @@ fn connected(
                         continue;
                     }
                 }
-                if received[i][track].is_empty() {
-                    // No accepted bytes means no decodable media for this taker/track,
-                    // regardless of scenario. Parked objects, stale drops and an
-                    // authorization fence cannot manufacture decoder input. Never
-                    // emit a decoded observation or usable receipt for an empty phase;
-                    // nonempty malformed input still fails in decode below.
-                    empty_decode_skips += 1;
-                    continue;
-                }
-                for decoded in decode(dir, f, i, &received[i][track])? {
+                let missing =
+                    lost[i][track] + parked[i].iter().filter(|p| p.track == track).count() as u64;
+                let frames = match decoder_input(&received[i][track], missing, |bytes| {
+                    decode(dir, f, i, bytes)
+                })? {
+                    DecoderInput::Frames(frames) => frames,
+                    DecoderInput::Empty => {
+                        empty_decode_skips[i] += 1;
+                        continue;
+                    }
+                    DecoderInput::Incomplete => {
+                        incomplete_decode_skips[i] += 1;
+                        continue;
+                    }
+                };
+                for decoded in frames {
                     let pts = decoded.pts_ms;
                     if last_media[i][track].is_some_and(|old| captured + pts <= old) {
                         continue;
@@ -858,20 +1010,15 @@ fn connected(
     if !cutoff {
         return Err("decoded receipt exhaustion timeout");
     }
-    if scenario == "credit-cutoff"
-        && intervals[1]
-            .iter()
-            .zip(b_at_expiry)
-            .any(|(after, before)| *after <= before)
-    {
-        return Err("second receiver did not advance after paid expiry");
-    }
-    if scenario == "credit-cutoff" && intervals[0].iter().any(|n| *n < 2) {
-        return Err("paid-window six-track decode evidence missing");
-    }
-    if scenario != "withdraw" && intervals[1].iter().any(|n| *n < 4) {
-        return Err("second receiver did not continue");
-    }
+    // Skipped empty decoder inputs are counted and reported for every scenario.
+    println!(
+        "decoder input report: empty_inputs_skipped A={} B={} incomplete_inputs_skipped A={} B={}",
+        empty_decode_skips[0],
+        empty_decode_skips[1],
+        incomplete_decode_skips[0],
+        incomplete_decode_skips[1]
+    );
+    decode_evidence(scenario, &intervals, &b_at_expiry)?;
     if scenario == "withdraw" {
         // Terminal publisher cutoff: the next renew must be refused with exactly
         // 404 (the withdrawn story's lease route). Any other denial, or a lease
@@ -910,8 +1057,8 @@ fn connected(
             accepted[1]
         );
         println!(
-            "credit-cutoff B late-grant report: parked={} dropped_on_overflow={} stale={} drained={} decoded_frames_dropped_at_boundary={late_drops} ranges_cut_at_epoch_boundary={sealing_skipped} empty_decode_skips={empty_decode_skips}",
-            parked[1].parked_total, parked[1].dropped, parked[1].stale, parked[1].drained
+            "credit-cutoff B late-grant report: parked={} dropped_on_overflow={} stale={} drained={} decoded_frames_dropped_at_boundary={late_drops} ranges_cut_at_epoch_boundary={sealing_skipped} empty_decode_skips={}",
+            parked[1].parked_total, parked[1].dropped, parked[1].stale, parked[1].drained, empty_decode_skips[1]
         );
     }
     println!("connected HTTPS authority / HEVC + five AAC / two takers / TCP CPU observer passed; not QUIC/device");
@@ -922,14 +1069,148 @@ fn connected(
 mod startup_grant_tests {
     use super::*;
     #[test]
-    fn shared_deadline_reserves_the_paid_boundary_in_both_fixtures() {
+    fn shared_deadline_reserves_the_paid_boundary_in_every_fixture() {
         for window in [4_000, 10_000, 30_000] {
             let booked_at = 100_000;
             let expiry = booked_at + window;
             let deadline = startup_grant_deadline(expiry, booked_at);
-            assert!(deadline + 1_000 <= expiry - 1_000);
-            assert_eq!(deadline, booked_at + 3_000.min(window - 2_000));
+            // The last retry starts before the deadline and ends before expiry.
+            assert!(deadline + ATTEMPT_MAX_MS < expiry, "window {window}");
+            assert_eq!(deadline, booked_at + 3_000.min(window - 3_000));
         }
-        assert_eq!(startup_grant_deadline(110_000, 109_000), 108_000);
+        assert_eq!(startup_grant_deadline(110_000, 109_000), 107_000);
+    }
+    #[test]
+    fn first_attempt_runs_even_after_the_deadline() {
+        let mut calls = 0;
+        let r: Result<()> = retry_late_grant(0, || {
+            calls += 1;
+            Err("grant transport")
+        });
+        assert_eq!((r, calls), (Err("grant transport"), 1));
+    }
+    #[test]
+    fn timing_failures_are_retried_and_refusals_are_not() {
+        for timing in [
+            "grant transport",
+            "mapping grant transport",
+            "grant near boundary",
+        ] {
+            let mut calls = 0;
+            let r = retry_late_grant(now() + 60_000, || {
+                calls += 1;
+                if calls < 3 {
+                    Err(timing)
+                } else {
+                    Ok(calls)
+                }
+            });
+            assert_eq!(r, Ok(3), "{timing}");
+        }
+        for refusal in [
+            "mapping grant rejected",
+            "grant denied",
+            "canonical root rejected",
+            "lease expired",
+            "booking expired",
+            "signed independent binding",
+            "grant metadata rejected",
+        ] {
+            let mut calls = 0;
+            let r: Result<()> = retry_late_grant(now() + 60_000, || {
+                calls += 1;
+                Err(refusal)
+            });
+            assert_eq!((r, calls), (Err(refusal), 1), "{refusal}");
+        }
+    }
+    #[test]
+    fn root_overtaken_in_transit_is_retried_exactly_once() {
+        let mut calls = 0;
+        let r: Result<()> = retry_late_grant(now() + 60_000, || {
+            calls += 1;
+            Err(ROOT_EXPIRED_IN_TRANSIT)
+        });
+        assert_eq!((r, calls), (Err(ROOT_EXPIRED_IN_TRANSIT), 2));
+    }
+    #[test]
+    fn startup_publisher_retries_only_a_boundary_crossing_expiry() {
+        use conspect_media_crypto::Error;
+        let fatal: [fn() -> Error; 4] = [
+            || Error::Denied,
+            || Error::Replay,
+            || Error::Invalid,
+            || Error::Crypto,
+        ];
+        for (n, e) in fatal.iter().enumerate() {
+            let mut calls = 0;
+            assert!(startup_publisher(|_| {
+                calls += 1;
+                Err(e())
+            })
+            .is_err());
+            assert_eq!(calls, 1, "fatal error #{n}");
+        }
+        // Expired without an epoch crossing (a wrong-epoch answer): fatal, once.
+        let mut calls = 0;
+        assert!(startup_publisher(|_| {
+            calls += 1;
+            Err(Error::Expired)
+        })
+        .is_err());
+        assert_eq!(calls, 1);
+    }
+    #[test]
+    fn decoder_input_rule() {
+        use conspect_native_exchange_runtime::media::{decode, Fixture};
+        let dir = tempfile::tempdir().unwrap();
+        let f = Fixture {
+            name: "garbage".into(),
+            format: "hevc",
+            packets: vec![],
+        };
+        let garbage = [0x5au8; 4096];
+        let real = |b: &[u8]| decode(dir.path(), &f, 1, b);
+        // Empty: skipped, decoder never invoked.
+        assert!(matches!(
+            decoder_input(&[], 0, |_| panic!("decoder ran on empty input")),
+            Ok(DecoderInput::Empty)
+        ));
+        // Complete but malformed: a hard failure.
+        assert_eq!(
+            decoder_input(&garbage, 0, real).unwrap_err(),
+            "FFmpeg command failed"
+        );
+        // Undecodable with counted losses in this window: incomplete, skipped.
+        assert!(matches!(
+            decoder_input(&garbage, 3, real),
+            Ok(DecoderInput::Incomplete)
+        ));
+        // Decodable input is decoded whatever was lost.
+        assert!(matches!(
+            decoder_input(&garbage, 3, |_| Ok(vec![])),
+            Ok(DecoderInput::Frames(v)) if v.is_empty()
+        ));
+    }
+    #[test]
+    fn a_taker_without_media_fails_the_run_evidence() {
+        let full = [[5u64; 6]; 2];
+        assert_eq!(decode_evidence("credit-cutoff", &full, &[1; 6]), Ok(()));
+        assert_eq!(decode_evidence("release", &full, &[0; 6]), Ok(()));
+        // B silently skipped every input: no interval at all.
+        let no_b = [[5; 6], [0; 6]];
+        assert!(decode_evidence("credit-cutoff", &no_b, &[0; 6]).is_err());
+        assert!(decode_evidence("release", &no_b, &[0; 6]).is_err());
+        // A silently skipped every input in its paid window.
+        let no_a = [[0; 6], [5; 6]];
+        assert_eq!(
+            decode_evidence("credit-cutoff", &no_a, &[1; 6]),
+            Err("paid-window six-track decode evidence missing")
+        );
+        // B decoded before A's boundary but nothing after it.
+        assert_eq!(
+            decode_evidence("credit-cutoff", &full, &[5; 6]),
+            Err("second receiver did not advance after paid expiry")
+        );
     }
 }

@@ -62,13 +62,21 @@ impl<T> ParkQueue<T> {
             stale: 0,
         }
     }
-    pub fn park(&mut self, item: T) {
-        if self.queue.len() >= self.cap {
-            self.queue.pop_front();
+    /// Park in order; at capacity the oldest item is dropped, counted and
+    /// returned so the caller can account for the loss.
+    pub fn park(&mut self, item: T) -> Option<T> {
+        let dropped = if self.queue.len() >= self.cap {
             self.dropped += 1;
-        }
+            self.queue.pop_front()
+        } else {
+            None
+        };
         self.queue.push_back(item);
         self.parked_total += 1;
+        dropped
+    }
+    pub fn iter(&self) -> impl Iterator<Item = &T> {
+        self.queue.iter()
     }
     /// Put an item back at the tail without counting it as newly parked.
     pub fn requeue(&mut self, item: T) {
@@ -277,14 +285,36 @@ pub fn decode(
 }
 
 #[cfg(test)]
+mod decode_input_tests {
+    use super::{decode, Fixture};
+    /// The empty-input skip in the runtime is only for zero accepted bytes. A
+    /// non-empty but malformed decoder input is still a hard decode failure.
+    #[test]
+    fn nonempty_malformed_input_still_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        for format in ["hevc", "aac"] {
+            let fixture = Fixture {
+                name: format!("garbage-{format}"),
+                format,
+                packets: vec![],
+            };
+            let garbage = [0x5au8; 4096];
+            assert!(
+                decode(dir.path(), &fixture, 1, &garbage).is_err(),
+                "{format}"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
 mod park_tests {
     use super::ParkQueue;
     #[test]
     fn park_queue_drops_oldest_and_counts() {
         let mut q = ParkQueue::new(2);
-        for n in 0..5 {
-            q.park(n);
-        }
+        let dropped: Vec<_> = (0..5).filter_map(|n| q.park(n)).collect();
+        assert_eq!(dropped, vec![0, 1, 2]);
         assert_eq!((q.dropped, q.parked_total, q.len()), (3, 5, 2));
         assert_eq!(q.take_all(), vec![3, 4]);
     }

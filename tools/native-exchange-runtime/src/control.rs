@@ -164,6 +164,12 @@ impl Coordinator {
                             // per-epoch attempt budget. Only an authoritative refusal
                             // ("grant denied": a status after the single 404 retry) denies.
                             Err("grant transport") => {}
+                            // The epoch boundary overtook the root answer in transit:
+                            // timing, not a refusal. The next attempt (this epoch's
+                            // second, or the next epoch's first) is admitted out of
+                            // the tail. A refused, equivocating or rolled-back root
+                            // is "canonical root rejected" and still denies below.
+                            Err(conspect_media_crypto::bootstrap::ROOT_EXPIRED_IN_TRANSIT) => {}
                             Err(_) => {
                                 let mut slot = slot.lock().unwrap();
                                 let (receiver, output) = &mut *slot;
