@@ -177,6 +177,10 @@ pub struct Config {
 
 	/// Per-connection statistics context.
 	pub stats: moq_net::stats::Session,
+
+	/// An embedder-owned QUIC socket used instead of binding `listen.bind`.
+	#[cfg(feature = "noq")]
+	pub socket: Option<crate::noq::Injected>,
 }
 
 impl Config {
@@ -203,6 +207,7 @@ impl Config {
 			publisher: self.publisher.clone(),
 			subscriber: self.subscriber.clone(),
 			stats: self.stats.clone(),
+			socket: None,
 		}
 	}
 }
@@ -267,6 +272,8 @@ impl Server {
 			publisher,
 			subscriber,
 			stats,
+			#[cfg(feature = "noq")]
+			socket,
 		} = config;
 
 		// Refuse here rather than in `init`, so a caller that skipped its own check
@@ -289,7 +296,11 @@ impl Server {
 		// `--listen`) doesn't also open UDP/443.
 		quic.validate()?;
 
-		let build_quic = parts.quic() && (config.bind.is_some() || !config.has_stream_listener());
+		#[cfg(feature = "noq")]
+		let injected = socket.is_some();
+		#[cfg(not(feature = "noq"))]
+		let injected = false;
+		let build_quic = parts.quic() && (injected || config.bind.is_some() || !config.has_stream_listener());
 		// Read before the member is taken out below, which consumes `parts`.
 		#[cfg(any(feature = "tcp", all(feature = "uds", unix)))]
 		let build_streams = parts.streams();
@@ -321,7 +332,7 @@ impl Server {
 
 		#[cfg(feature = "noq")]
 		let noq = build_quic
-			.then(|| crate::noq::NoqServer::new(config.clone(), &quic, member))
+			.then(|| crate::noq::NoqServer::new(config.clone(), &quic, member, socket))
 			.transpose()?;
 
 		// Collect the configured stream listeners (at most one TCP, one Unix).

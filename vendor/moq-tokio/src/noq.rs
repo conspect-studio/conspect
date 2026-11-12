@@ -14,6 +14,9 @@ use std::task::{Context, Poll, Waker, ready};
 use std::time::Duration;
 use web_transport_moq::noq;
 
+/// The noq types an embedder needs to build an [`Injected`] socket.
+pub use web_transport_moq::noq::{AsyncUdpSocket, EndpointConfig};
+
 /// Attach a qlog factory writing into the configured directory, if any.
 ///
 /// noq's factory opens one file per connection, named after its initial destination
@@ -524,8 +527,29 @@ fn proto_status(err: &web_transport_moq::proto::ConnectError) -> Option<u16> {
 pub(crate) struct NoqServer {
 	pub quic: noq::Endpoint,
 	pub certs: Arc<ServeCerts>,
-	socket: Socket,
+	/// `None` when the embedder injected its own socket ([`Injected`]); the
+	/// embedder then owns the socket's lifetime.
+	socket: Option<Socket>,
 	_reload: crate::tls::Reload,
+}
+
+/// An embedder-owned socket for the QUIC listener (multiview: the shared UDP
+/// front door, which demultiplexes one port between QUIC and WebRTC).
+///
+/// The server then binds nothing: it uses `socket` and `endpoint` (which the
+/// embedder configures, e.g. `grease_quic_bit(false)` for RFC 9443 sharing)
+/// instead of [`listen::Config::bind`].
+pub struct Injected {
+	/// The socket noq receives from and sends through.
+	pub socket: Box<dyn noq::AsyncUdpSocket>,
+	/// The endpoint configuration to use for this socket.
+	pub endpoint: noq::EndpointConfig,
+}
+
+impl std::fmt::Debug for Injected {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		f.debug_struct("Injected").field("endpoint", &self.endpoint).finish_non_exhaustive()
+	}
 }
 
 /// The server's UDP socket, which [`NoqServer::shutdown`] closes even while noq
@@ -662,7 +686,12 @@ impl std::task::Wake for Blocked {
 }
 
 impl NoqServer {
-	pub fn new(config: listen::Config, quic: &crate::quic::Config, member: Option<listen::Socket>) -> Result<Self> {
+	pub fn new(
+		config: listen::Config,
+		quic: &crate::quic::Config,
+		member: Option<listen::Socket>,
+		injected: Option<Injected>,
+	) -> Result<Self> {
 		let mut transport = noq::TransportConfig::default();
 		let quic = quic.resolve();
 		apply_transport(&mut transport, &quic);
@@ -724,8 +753,15 @@ impl NoqServer {
 			.unwrap_or(crate::server::DEFAULT_BIND);
 		let load_balancer = config.load_balancer();
 
+		// An injected socket brings its own endpoint config and must not be sharded.
+		if injected.is_some() && member.is_some() {
+			return Err(Error::ShardWithQuicLb);
+		}
+		let (mut endpoint_config, injected_socket) = match injected {
+			Some(Injected { socket, endpoint }) => (endpoint, Some(socket)),
+			None => (noq::EndpointConfig::default(), None),
+		};
 		// Configure connection ID generator with server ID if provided
-		let mut endpoint_config = noq::EndpointConfig::default();
 		if let Some(shard) = member.as_ref().map(listen::Socket::shard) {
 			if load_balancer.is_some() {
 				return Err(Error::ShardWithQuicLb);
@@ -758,18 +794,23 @@ impl NoqServer {
 			}));
 		}
 
-		// A group socket was released only after every member bound and the
-		// steering filter covered the final array.
-		let socket = match member {
-			Some(member) => member.into_inner(),
-			None => crate::bind::udp(crate::bind::Udp::new(listen)).map_err(Error::BindSocket)?,
+		let (socket, abstract_socket): (Option<Socket>, Box<dyn noq::AsyncUdpSocket>) = match injected_socket {
+			Some(injected) => (None, injected),
+			None => {
+				// A group socket was released only after every member bound and the
+				// steering filter covered the final array.
+				let socket = match member {
+					Some(member) => member.into_inner(),
+					None => crate::bind::udp(crate::bind::Udp::new(listen)).map_err(Error::BindSocket)?,
+				};
+				let socket = Socket::new(socket).map_err(Error::CreateEndpoint)?;
+				(Some(socket.clone()), Box::new(socket))
+			}
 		};
 
 		// Create the generic QUIC endpoint.
-		let socket = Socket::new(socket).map_err(Error::CreateEndpoint)?;
-		let quic =
-			noq::Endpoint::new_with_abstract_socket(endpoint_config, Some(tls), Box::new(socket.clone()), runtime)
-				.map_err(Error::CreateEndpoint)?;
+		let quic = noq::Endpoint::new_with_abstract_socket(endpoint_config, Some(tls), abstract_socket, runtime)
+			.map_err(Error::CreateEndpoint)?;
 
 		// Spawn the cert reload watcher only after endpoint creation succeeds,
 		// so we don't leave a dangling watcher on failure.
@@ -806,12 +847,14 @@ impl NoqServer {
 		// Not `wait_idle`, which also sits out each connection's 3 PTO closing
 		// period: that only repeats the close to a peer that already has it.
 		self.quic.wait_all_draining().await;
-		self.socket.release();
+		if let Some(socket) = &self.socket {
+			socket.release();
+		}
 	}
 
 	/// A handle keeping the socket open after this server is gone.
 	pub fn retain(&self) -> Option<Arc<tokio::net::UdpSocket>> {
-		self.socket.retain()
+		self.socket.as_ref().and_then(Socket::retain)
 	}
 }
 
@@ -1015,6 +1058,7 @@ mod tests {
 			},
 			&quic,
 			None,
+			None,
 		)
 		.expect("server init");
 		let addr = server.local_addr().expect("local addr");
@@ -1107,7 +1151,7 @@ mod tests {
 		// The knob left unset, the way a binary that never mentions it runs.
 		let quic = crate::quic::Config::default();
 
-		let server = NoqServer::new(server_config, &quic, None).expect("server init");
+		let server = NoqServer::new(server_config, &quic, None, None).expect("server init");
 		let addr = server.local_addr().expect("local addr");
 
 		let accepted = tokio::spawn(async move {
