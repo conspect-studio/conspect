@@ -79,6 +79,23 @@ fn credit_cutoff_late_b_grants_do_not_stop_b_decoding() {
 fn credit_cutoff_fragment_past_a_window_fails_with_static_reason() {
     scenario("credit-cutoff", false, false, "late-fragment");
 }
+/// Deterministic reproduction of the CI `FFmpeg command failed` mode: B's epoch
+/// grant is unobtainable for the whole epoch that precedes A's expiry, so every
+/// object B parked in that epoch is dropped as stale. A taker with no accepted
+/// bytes for a track has nothing to decode; that is not a decode failure and
+/// must not end the run before A's paid boundary is probed (404) at expiry.
+#[test]
+fn credit_cutoff_stale_b_epoch_still_probes_the_paid_boundary() {
+    scenario("credit-cutoff", false, false, "late-b-epoch");
+}
+#[test]
+fn credit_cutoff_late_mapping_answer_still_probes_the_paid_boundary() {
+    scenario("credit-cutoff", false, false, "late-mapping-grant");
+}
+#[test]
+fn credit_cutoff_mapping_refusal_is_not_retried() {
+    scenario("credit-cutoff", false, false, "mapping-refusal");
+}
 fn scenario(scenario: &'static str, slow: bool, deny_renew: bool, variant: &'static str) {
     // Admit one six-stream FFmpeg/TLS fixture at a time. These wall-clock
     // integration scenarios have real five-second grants; eight concurrent
@@ -139,6 +156,7 @@ fn scenario(scenario: &'static str, slow: bool, deny_renew: bool, variant: &'sta
         let mut extensions = [Vec::new(), Vec::new()];
         let mut deferred: Vec<std::thread::JoinHandle<()>> = Vec::new();
         let mut delayed_grants = 0u32;
+        let mut mapping_grants = 0u32;
         while !stopped.load(Ordering::SeqCst) {
             let (s, _) = match listener.accept() {
                 Ok(s) => s,
@@ -269,7 +287,13 @@ fn scenario(scenario: &'static str, slow: bool, deny_renew: bool, variant: &'sta
                 }
                 dto
             } else if path.ends_with("/grants") {
-                if scenario == "credit-cutoff" && path.contains("org_a/") && now() >= expiry[0] {
+                if books.len() == 2 && path.contains("org_a/") {
+                    mapping_grants += 1;
+                }
+                if variant == "mapping-refusal" && mapping_grants == 1 {
+                    status = 403;
+                    json!({"error":"refused"})
+                } else if scenario == "credit-cutoff" && path.contains("org_a/") && now() >= expiry[0] {
                     boundary_denials += 1;
                     status = 404;
                     json!({"type":"about:blank","title":"Not Found","status":404,"detail":"booking expired"})
@@ -375,6 +399,10 @@ fn scenario(scenario: &'static str, slow: bool, deny_renew: bool, variant: &'sta
                 "application/json"
             };
             let mut hold_ms = 0u64;
+            if variant == "late-mapping-grant" && mapping_grants == 1 && path.ends_with("/grants") && path.contains("org_a/") {
+                hold_ms = 1500;
+                delayed_grants += 1;
+            }
             if variant == "late-b-grants" && path.ends_with("/grants") && path.contains("org_b/") {
                 let phase = now() % 5000;
                 if !(200..4000).contains(&phase) {
@@ -384,6 +412,22 @@ fn scenario(scenario: &'static str, slow: bool, deny_renew: bool, variant: &'sta
                         "mock: holding B grant answer {hold_ms} ms (request at epoch phase {phase} ms)"
                     );
                 }
+            }
+            if variant == "late-b-epoch"
+                && path.ends_with("/grants")
+                && path.contains("org_b/")
+                && books.len() == 2
+                // The epoch immediately before the one holding A's expiry: B's
+                // grant is unobtainable for that entire epoch (every request is
+                // answered after the epoch ends), so everything it parks there
+                // ages past the replay window and is dropped as stale. The next
+                // epoch's grants are answered normally, so B decodes again.
+                && now() >= expiry[0].saturating_sub(window_ms).saturating_add(5000)
+                && now() < expiry[0].saturating_add(5000)
+            {
+                delayed_grants += 1;
+                hold_ms = 5000;
+                eprintln!("mock: holding B grant answer {hold_ms} ms for the pre-expiry epoch");
             }
             let write_answer = move || {
                 let mut tls = tls;
@@ -435,9 +479,25 @@ fn scenario(scenario: &'static str, slow: bool, deny_renew: bool, variant: &'sta
                     .windows(2)
                     .all(|w| w[1].duration_since(w[0]) <= std::time::Duration::from_secs(30)));
             }
+        } else if variant == "mapping-refusal" {
+            assert_eq!(mapping_grants, 1, "an answered 403 must not be retried");
+        } else if variant == "late-mapping-grant" {
+            assert_eq!(delayed_grants, 1);
+            assert!(mapping_grants >= 2, "transport timeout was not retried");
+            assert!(boundary_denials > 0, "A paid boundary not probed");
+            assert!(receipts > 0);
         } else if variant == "late-b-grants" {
             assert!(delayed_grants > 0, "the mock never delayed a B grant");
             assert!(boundary_denials > 0);
+            assert_eq!(extensions[0].len(), 1);
+            assert!(!extensions[1].is_empty(), "B must extend with 201");
+            assert!(receipts > 0);
+        } else if variant == "late-b-epoch" {
+            assert!(delayed_grants > 0, "the mock never delayed a B grant");
+            assert!(
+                boundary_denials > 0,
+                "A's paid boundary was never probed after the stale B epoch"
+            );
             assert_eq!(extensions[0].len(), 1);
             assert!(!extensions[1].is_empty(), "B must extend with 201");
             assert!(receipts > 0);
@@ -512,6 +572,11 @@ fn scenario(scenario: &'static str, slow: bool, deny_renew: bool, variant: &'sta
         String::from_utf8_lossy(&output.stderr)
     );
     server_result.unwrap();
+    if variant == "mapping-refusal" {
+        assert!(!output.status.success(), "refused mapping must fail closed");
+        assert!(String::from_utf8_lossy(&output.stderr).contains("mapping grant rejected"));
+        return;
+    }
     if negative {
         assert!(
             !output.status.success(),
@@ -581,6 +646,34 @@ fn scenario(scenario: &'static str, slow: bool, deny_renew: bool, variant: &'sta
         };
         assert!(field("parked=") > 0, "no B object was parked: {report}");
         assert!(field("drained=") > 0, "no parked B object opened: {report}");
+    }
+    if variant == "late-b-epoch" {
+        // The unreachable pre-expiry epoch must have aged B's parked objects out
+        // of the replay window (the empty-decode precondition), and B must have
+        // decoded again afterwards: the run continued instead of aborting.
+        let out = String::from_utf8_lossy(&output.stdout);
+        let report = out
+            .lines()
+            .find(|l| l.starts_with("credit-cutoff B late-grant report:"))
+            .expect("late-grant report");
+        let field = |name: &str| -> u64 {
+            report
+                .split_whitespace()
+                .find_map(|w| w.strip_prefix(name))
+                .and_then(|v| v.parse().ok())
+                .unwrap()
+        };
+        assert!(field("stale=") > 0, "no parked B object went stale: {report}");
+        assert!(
+            field("drained=") > 0,
+            "no parked B object opened after the stale epoch: {report}"
+        );
+        // The stale epoch must actually have emptied a track: this is the state
+        // that used to be handed to the decoder and aborted the run.
+        assert!(
+            field("empty_decode_skips=") > 0,
+            "the stale epoch never emptied a track: {report}"
+        );
     }
     if scenario == "withdraw" {
         assert!(
