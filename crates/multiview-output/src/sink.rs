@@ -2541,6 +2541,9 @@ impl<'a> SegmentState<'a> {
                 continue;
             };
             if segment.packets == 0 {
+                // Windows cannot delete an open file: close it first.
+                #[cfg(windows)]
+                segment.muxer.release_output().map_err(ff)?;
                 match std::fs::remove_file(&segment.write_path) {
                     Ok(()) | Err(_) => {}
                 }

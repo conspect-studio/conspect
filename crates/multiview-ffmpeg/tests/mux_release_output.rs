@@ -132,3 +132,23 @@ fn write_packet_after_release_is_refused_until_redirect() {
     assert!(refused, "a packet written while released must be refused");
     muxer.redirect_output(&dir.path().join("b.ts")).unwrap();
 }
+
+#[test]
+fn release_is_refused_for_containers_that_need_a_trailer() {
+    let dir = TempDir::new().unwrap();
+    let mut enc = encoder();
+    let tb = enc.time_base();
+    let path = dir.path().join("a.mp4");
+    let mut muxer = Muxer::create_as(&path, "mp4").unwrap();
+    let idx = muxer.add_stream(enc.as_codec_context(), tb).unwrap();
+    muxer.write_header().unwrap();
+    encode_into(&mut enc, &mut muxer, idx, 0, 6);
+    assert!(muxer.release_output().is_err(), "mp4 needs its trailer");
+    // Still fully usable: the trailer is written normally.
+    enc.send_eof().unwrap();
+    while let Some(p) = enc.receive_packet().unwrap() {
+        muxer.write_packet(idx, p).unwrap();
+    }
+    muxer.finish().unwrap();
+    assert!(std::fs::metadata(&path).unwrap().len() > 0);
+}

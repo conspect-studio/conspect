@@ -795,6 +795,11 @@ impl Muxer {
         if self.released {
             return Ok(());
         }
+        if !self.is_mpegts() {
+            // Other containers (MP4, …) need `av_write_trailer` for indexes;
+            // closing their file early would truncate them.
+            return Err(FfmpegError::Mux(ffmpeg::Error::InvalidData));
+        }
         self.flush()?;
         // SAFETY: `self.output.as_mut_ptr()` is the live, owned output
         // `AVFormatContext` (`&mut self`, header written, everything flushed
@@ -802,11 +807,27 @@ impl Muxer {
         // checks `s->pb` for null before every later flush, and
         // `redirect_output` installs a new `pb` before any packet is written.
         let rc = unsafe { ffmpeg::ffi::avio_closep(&raw mut (*self.output.as_mut_ptr()).pb) };
+        // `avio_closep` frees and nulls `pb` even when the final write fails,
+        // so the output is released either way; report the failure after.
+        self.released = true;
         if rc < 0 {
             return Err(FfmpegError::Mux(ffmpeg::Error::from(rc)));
         }
-        self.released = true;
         Ok(())
+    }
+
+    /// Whether this muxer's output format is MPEG-TS.
+    #[allow(unsafe_code)]
+    fn is_mpegts(&mut self) -> bool {
+        // SAFETY: the owned, live `AVFormatContext`; `oformat` is set at
+        // creation and its `name` is a static NUL-terminated string.
+        unsafe {
+            let ctx = self.output.as_mut_ptr();
+            let fmt = (*ctx).oformat;
+            !fmt.is_null()
+                && !(*fmt).name.is_null()
+                && std::ffi::CStr::from_ptr((*fmt).name).to_bytes() == b"mpegts"
+        }
     }
 
     /// Redirect this **already-initialized** muxer's output to a new file at
