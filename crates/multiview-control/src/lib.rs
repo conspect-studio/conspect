@@ -80,6 +80,7 @@ pub mod output_routing;
 pub mod pending_actions;
 pub mod preview;
 pub mod problem;
+pub mod program_metrics;
 pub mod realtime;
 pub mod repository;
 pub mod resource_store;
@@ -263,6 +264,9 @@ pub fn router(state: AppState) -> Router {
     let limits_enabled = state.limiters.is_enabled();
     if let Some(control) = state.output_routing.as_ref() {
         output_routing::spawn_outcome_relay(&state, control);
+    }
+    if let Some(metrics) = state.program_metrics.as_ref() {
+        program_metrics::spawn_sampler(metrics);
     }
 
     let api = routes::api_router()

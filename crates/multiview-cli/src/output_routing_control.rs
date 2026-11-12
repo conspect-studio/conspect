@@ -238,6 +238,42 @@ pub fn installed_output_routing() -> Option<OutputRoutingSlot> {
         .clone()
 }
 
+/// The control plane's Program metrics source over a run's metrics slot.
+pub struct ProgramMetricsAdapter(pub crate::pipeline::ProgramMetricsSlot);
+
+impl multiview_control::program_metrics::ProgramMetricsSource for ProgramMetricsAdapter {
+    fn read(&self) -> Option<multiview_control::program_metrics::ProgramCounters> {
+        let handles = self.0.load()?;
+        Some(multiview_control::program_metrics::ProgramCounters {
+            lateness: handles.lateness.snapshot(),
+            frames_repeated: handles
+                .frames_repeated
+                .load(std::sync::atomic::Ordering::Acquire),
+        })
+    }
+}
+
+fn installed_metrics() -> &'static Mutex<Option<crate::pipeline::ProgramMetricsSlot>> {
+    static SLOT: OnceLock<Mutex<Option<crate::pipeline::ProgramMetricsSlot>>> = OnceLock::new();
+    SLOT.get_or_init(|| Mutex::new(None))
+}
+
+/// Install (or clear) the run's Program metrics slot for the control plane.
+pub fn install_program_metrics(slot: Option<crate::pipeline::ProgramMetricsSlot>) {
+    *installed_metrics()
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner) = slot;
+}
+
+/// The installed Program metrics slot, if any.
+#[must_use]
+pub fn installed_program_metrics() -> Option<crate::pipeline::ProgramMetricsSlot> {
+    installed_metrics()
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .clone()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

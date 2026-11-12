@@ -370,6 +370,12 @@ where
     // slot before the control plane starts; without one the routes answer
     // 409 `routing-unavailable`.
     #[cfg(feature = "ffmpeg")]
+    if let Some(slot) = crate::output_routing_control::installed_program_metrics() {
+        state = state.with_program_metrics(std::sync::Arc::new(
+            crate::output_routing_control::ProgramMetricsAdapter(slot),
+        ));
+    }
+    #[cfg(feature = "ffmpeg")]
     if let Some(slot) = crate::output_routing_control::installed_output_routing() {
         state = state.with_output_routing(std::sync::Arc::new(
             crate::output_routing_control::OutputRoutingAdapter::new(slot),

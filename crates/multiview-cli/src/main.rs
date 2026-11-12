@@ -859,6 +859,9 @@ async fn run_pipeline_until_ctrl_c(
         multiview_cli::output_routing_control::install_output_routing(Some(
             pipeline.output_routing(),
         ));
+        multiview_cli::output_routing_control::install_program_metrics(Some(
+            pipeline.program_metrics(),
+        ));
         multiview_cli::source_demand::install_control_demand(Some(Arc::new(
             multiview_cli::source_demand::ControlDemand::new(demand, pipeline.catalogue()),
         )));

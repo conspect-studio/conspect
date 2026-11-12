@@ -812,3 +812,39 @@ async fn replays_for_other_bodies_never_apply_twice_and_take_requires_a_key() {
     .await;
     assert_eq!(rig.fake.takes().len(), 1);
 }
+
+struct Counters(Arc<multiview_engine::lateness::TickLateness>);
+impl multiview_control::program_metrics::ProgramMetricsSource for Counters {
+    fn read(&self) -> Option<multiview_control::program_metrics::ProgramCounters> {
+        Some(multiview_control::program_metrics::ProgramCounters {
+            lateness: self.0.snapshot(),
+            frames_repeated: 3,
+        })
+    }
+}
+
+#[tokio::test]
+async fn program_metrics_are_whole_system_only() {
+    let dir = tempfile::tempdir().unwrap();
+    let plain = rig(&dir.path().join("boot.toml"), false);
+    let resp = send(
+        &plain.router,
+        get("/api/v1/metrics/program", OPERATOR_TOKEN),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    let lateness = multiview_engine::lateness::TickLateness::shared();
+    lateness.record(1_500_000, 0);
+    let state = plain
+        .state
+        .clone()
+        .with_program_metrics(Arc::new(Counters(Arc::clone(&lateness))));
+    let router = multiview_control::router(state);
+    let resp = send(&router, get("/api/v1/metrics/program", SCOPED_ROUTER_TOKEN)).await;
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    let body = body_json(send(&router, get("/api/v1/metrics/program", VIEWER_TOKEN)).await).await;
+    assert_eq!(body["ticks_total"], 1);
+    assert_eq!(body["frames_repeated_total"], 3);
+    assert_eq!(body["lateness_p99_ms"], 2.0);
+    assert_eq!(body["lateness_max_ms"], 1.5);
+}

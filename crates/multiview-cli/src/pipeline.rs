@@ -1760,6 +1760,19 @@ impl RunnableOutput {
     }
 }
 
+/// The running Program's wait-free metric handles (ADR-0108 §10).
+#[derive(Debug, Clone)]
+pub struct ProgramMetricsHandles {
+    /// Tick lateness histogram.
+    pub lateness: Arc<multiview_engine::lateness::TickLateness>,
+    /// Cumulative last-good repeats.
+    pub frames_repeated: Arc<std::sync::atomic::AtomicU64>,
+}
+
+/// Where a run publishes its [`ProgramMetricsHandles`].
+pub type ProgramMetricsSlot =
+    Arc<multiview_framestore::SwapCell<Option<Arc<ProgramMetricsHandles>>>>;
+
 /// A built, ready-to-run pipeline.
 pub struct Pipeline {
     /// Every configured source's definition and frame store. A source with no
@@ -2111,6 +2124,9 @@ pub struct Pipeline {
     /// slice 1). Published off-clock when the egress starts; the control plane
     /// loads it lock-free to enqueue takes and read the routing snapshot.
     output_routing: crate::output_routing::OutputRoutingSlot,
+    /// The running Program's lateness histogram + repeats counter (ADR-0108
+    /// §10), published at run start for the control plane's metrics route.
+    program_metrics: ProgramMetricsSlot,
     optional_preview: Option<crate::preview_vertical::PreviewStartup>,
     /// The run's **real** authorization axes for every effective output (t65):
     /// the implicit program the legacy config desugars to, plus each ingest
@@ -3153,6 +3169,7 @@ impl Pipeline {
             program_audio_preview: None,
             window_subscriptions: crate::output_window_registry::window_subscription_slot(),
             output_routing: crate::output_routing::output_routing_slot(),
+            program_metrics: Arc::new(multiview_framestore::SwapCell::empty()),
             optional_preview: None,
             window_dependencies: Arc::new(window_dependency_axes(config)),
         })
@@ -3769,6 +3786,12 @@ impl Pipeline {
     #[must_use]
     pub fn output_routing(&self) -> crate::output_routing::OutputRoutingSlot {
         Arc::clone(&self.output_routing)
+    }
+
+    /// The running Program's metric handles (empty until a run starts).
+    #[must_use]
+    pub fn program_metrics(&self) -> ProgramMetricsSlot {
+        Arc::clone(&self.program_metrics)
     }
 
     /// The control-plane adapter for this exact run's canonical registry slot.
@@ -4821,6 +4844,13 @@ impl Pipeline {
                     program: self.program_spec.id.clone(),
                     reason: e.to_string(),
                 })?;
+        // Publish the Program's wait-free counters for the metrics route
+        // (one store per run, never per tick).
+        self.program_metrics
+            .store(Some(Arc::new(ProgramMetricsHandles {
+                lateness: program.lateness(),
+                frames_repeated: program.frames_repeated_counter(),
+            })));
         // Publish the run's epoch anchor (tick-0 seed + monotonic source) into
         // the shared slot — a single lock-free store the off-hot-path
         // timing-status task reads to derive the outbound presentation epoch.
