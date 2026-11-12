@@ -33,6 +33,10 @@ is_system() {
   esac
 }
 
+rpaths_of() {
+  otool -l "$1" | awk '$1 == "cmd" && $2 == "LC_RPATH" { r = 1; next } r && $1 == "path" { print $2; r = 0 }'
+}
+
 # Non-system, non-@rpath dependency paths of a Mach-O (first line of
 # `otool -L` is the object itself for a dylib; skip it via -D comparison).
 deps_of() {
@@ -116,16 +120,59 @@ for dylib in "${LIB}"/*.dylib; do
 done
 rewrite "${BIN}"
 install_name_tool -add_rpath "@executable_path/lib" "${BIN}" 2>/dev/null || true
+# Drop every rpath that points outside the bundle (e.g. a build prefix), so
+# nothing can resolve through it on the user's machine.
+for obj in "${BIN}" "${LIB}"/*.dylib; do
+  [ -e "${obj}" ] || continue
+  for rp in $(rpaths_of "${obj}"); do
+    case "${rp}" in
+      @executable_path/lib | @loader_path) ;;
+      *) install_name_tool -delete_rpath "${rp}" "${obj}" ;;
+    esac
+  done
+done
 
 # Verify: every load command of every object resolves to the OS or to a file
 # in the bundle. @rpath / @loader_path / @executable_path references are
 # resolved here, not exempted.
+# Resolve one load command exactly as dyld would for this object: expand
+# @loader_path / @executable_path, and try each LC_RPATH in order for @rpath.
+# The first existing candidate must be inside the bundle (or the OS).
+STAGE_ABS="$(cd "${STAGE}" && pwd -P)"
+expand() {
+  local obj="$1" path="$2" odir edir
+  odir="$(cd "$(dirname "${obj}")" && pwd -P)"
+  edir="$(cd "$(dirname "${BIN}")" && pwd -P)"
+  path="${path/#@loader_path/${odir}}"
+  path="${path/#@executable_path/${edir}}"
+  printf '%s' "${path}"
+}
+inside_bundle() {
+  local real
+  real="$(python3 -c 'import os,sys;print(os.path.realpath(sys.argv[1]))' "$1")"
+  case "${real}" in
+    "${STAGE_ABS}"/*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
 resolves() {
-  local obj="$1" dep="$2" name
-  name="$(basename "${dep}")"
+  local obj="$1" dep="$2" cand rp
   case "${dep}" in
     /usr/lib/* | /System/*) return 0 ;;
-    @rpath/* | @loader_path/* | @executable_path/*) [ -f "${LIB}/${name}" ] ;;
+    @loader_path/* | @executable_path/*)
+      cand="$(expand "${obj}" "${dep}")"
+      [ -f "${cand}" ] && inside_bundle "${cand}"
+      return ;;
+    @rpath/*)
+      # rpaths of the referencing object, then (for dylibs) the executable's.
+      for rp in $(rpaths_of "${obj}") $( [ "${obj}" != "${BIN}" ] && rpaths_of "${BIN}" ); do
+        cand="$(expand "${obj}" "${rp}")/${dep#@rpath/}"
+        if [ -f "${cand}" ]; then
+          inside_bundle "${cand}"
+          return
+        fi
+      done
+      return 1 ;;
     *) return 1 ;;
   esac
 }
