@@ -791,9 +791,12 @@ does not block 1-3. Public UDP 443 opens only after slice 3. 6, 7, 8 depend on 4
 * MoQ: `moq-tokio` takes the lane through `server::Config::socket` (vendor change
   recorded in `vendor/MOQ-DELIVERY-PROVENANCE.md`); the provider builds the server and
   runs its accept loop on the front-door runtime.
-* Config: `[network] https_port, advertise, workers`. Absent: legacy sockets unchanged.
-  Present: `webrtc.udp_port` and `MULTIVIEW_MOQ_BIND` are ignored with a deprecation
-  warning (not a second legacy socket; that is a later slice if needed).
+* Config: `[network] https_port, advertise, workers`, in the same `NetworkConfig` as
+  slice 5's `public_host` and `[network.tls]` (both optional; those two come together).
+  Setting `network.https_port` is the switch: unset (no `[network]`, or ACME settings
+  only), the legacy sockets stay unchanged. Set: `webrtc.udp_port` and `MULTIVIEW_MOQ_BIND`
+  are ignored with a deprecation warning (not a second legacy socket; that is a later
+  slice if needed).
 * Not in slice 1: steering, nftables, Retry policy knobs, rcvbuf via systemd (slice 3);
   the output clock itself still runs on the `#[tokio::main]` runtime (#311). The MoQ
   per-admission publication pump and its `moq-net` origin driver are also still spawned

@@ -199,7 +199,6 @@ impl ConfigDiff {
             discovery: running_discovery,
             catalogues: running_catalogues,
             network_diagnostics: running_network_diagnostics,
-            network: running_network,
             timing: running_timing,
             webrtc: running_webrtc,
             network: running_network,
@@ -236,7 +235,6 @@ impl ConfigDiff {
             discovery: next_discovery,
             catalogues: next_catalogues,
             network_diagnostics: next_network_diagnostics,
-            network: next_network,
             timing: next_timing,
             webrtc: next_webrtc,
             network: next_network,
@@ -331,8 +329,6 @@ impl ConfigDiff {
             ("network", running_network != next_network),
             ("timing", running_timing != next_timing),
             ("webrtc", running_webrtc != next_webrtc),
-            // The front door binds its socket and runtime once at boot.
-            ("network", running_network != next_network),
             // A change to `[system.ndi]` license acceptance is restart-class: full
             // live revocation/acceptance propagation to running NDI I/O at the next
             // safe boundary (ADR-0008 §7.5) is a separate follow-up, so surface it

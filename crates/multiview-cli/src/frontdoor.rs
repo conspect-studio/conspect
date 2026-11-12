@@ -1,6 +1,6 @@
 //! The network front door wiring (ADR-0107 slice 1, issue #287).
 //!
-//! With `[network]` configured, one dual-stack UDP socket on
+//! With `network.https_port` configured, one dual-stack UDP socket on
 //! `[::]:network.https_port`, owned by `multiview-frontdoor` on its **own**
 //! Tokio runtime, carries both MoQ (the vendored noq server, QUIC lane) and
 //! WebRTC (the `UnifiedEndpoint`, WebRTC lane). The socket, the dispatcher,
@@ -13,7 +13,7 @@
 //! lease-expiry task. They are fed by bounded drop-oldest windows and never
 //! touch the socket; moving them is follow-up work.
 //!
-//! Without `[network]` nothing changes: WebRTC binds `webrtc.udp_port`, MoQ
+//! Without it nothing changes: WebRTC binds `webrtc.udp_port`, MoQ
 //! binds `MULTIVIEW_MOQ_BIND`, both on the main runtime as before. Old configs
 //! start unchanged.
 
@@ -38,6 +38,8 @@ impl std::fmt::Debug for FrontDoorRun {
 #[must_use]
 pub fn config_from(config: &MultiviewConfig) -> Option<multiview_frontdoor::FrontDoorConfig> {
     let network = config.network.as_ref()?;
+    // `[network]` with only ACME settings (slice 5) does not start the socket.
+    let port = network.https_port?;
     let max_rtc = usize::try_from(config.webrtc.max_sessions)
         .unwrap_or(usize::MAX)
         // Ingest publishers and whip_push sessions are admitted outside the
@@ -54,7 +56,7 @@ pub fn config_from(config: &MultiviewConfig) -> Option<multiview_frontdoor::Fron
     #[cfg(not(feature = "webrtc-native"))]
     let turn_servers = Vec::new();
     Some(multiview_frontdoor::FrontDoorConfig {
-        port: network.https_port,
+        port,
         workers: usize::from(network.workers.max(1)),
         max_rtc_peers: max_rtc,
         turn_servers,
@@ -65,12 +67,12 @@ pub fn config_from(config: &MultiviewConfig) -> Option<multiview_frontdoor::Fron
 /// Warn about the legacy keys `[network]` deprecates (one release, then
 /// rejected; design note section 10). Never changes behaviour.
 pub fn warn_deprecated(config: &MultiviewConfig) {
-    let Some(network) = config.network.as_ref() else {
+    let Some(network) = config.network.as_ref().filter(|n| n.https_port.is_some()) else {
         if config.webrtc.udp_port != 8189 {
             tracing::info!(
                 udp_port = config.webrtc.udp_port,
                 "webrtc.udp_port is deprecated in favour of [network] https_port (ADR-0107); \
-                 it keeps working without [network]"
+                 it keeps working while network.https_port is unset"
             );
         }
         return;
@@ -78,7 +80,7 @@ pub fn warn_deprecated(config: &MultiviewConfig) {
     if config.webrtc.udp_port != 8189 {
         tracing::warn!(
             udp_port = config.webrtc.udp_port,
-            https_port = network.https_port,
+            https_port = ?network.https_port,
             "webrtc.udp_port is deprecated and ignored while [network] is configured: \
              WebRTC rides the front-door socket (ADR-0107)"
         );
@@ -215,9 +217,13 @@ areas = ["a"]
         let fd = config_from(&config).expect("front door configured");
         assert_eq!(fd.port, 8443);
         assert_eq!(fd.workers, 3);
-        let defaults = load(&format!("{BASE}\n[network]\n"));
+        let defaults = load(&format!("{BASE}\n[network]\nhttps_port = 443\n"));
         let fd = config_from(&defaults).unwrap();
         assert_eq!((fd.port, fd.workers), (443, 2));
+        // A [network] section without https_port (ACME settings only) keeps
+        // the legacy listeners.
+        let acme_only = load(&format!("{BASE}\n[network]\nworkers = 2\n"));
+        assert!(config_from(&acme_only).is_none());
     }
 
     #[test]
