@@ -396,6 +396,16 @@ impl AcmeCertificateSource {
         status.next_attempt_at = next_attempt_at;
     }
 
+    /// The front-door state alone: one read lock, no clone of the name list.
+    /// This is what the setup gate reads on every request.
+    #[must_use]
+    pub fn state(&self) -> TlsState {
+        self.status
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .state
+    }
+
     /// Publish the expiry alarm level.
     pub fn set_alarm(&self, alarm: CertificateAlarm) {
         self.status

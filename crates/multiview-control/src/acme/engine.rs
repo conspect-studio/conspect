@@ -51,8 +51,12 @@ const JITTER_CAP_S: i64 = 24 * 60 * 60;
 /// Longest the service sleeps before re-evaluating its schedule.
 const MAX_SLEEP: Duration = Duration::from_secs(6 * 60 * 60);
 
-/// Hook invoked when the alarm level changes (PR B routes it to the alarm store).
+/// Hook invoked when the alarm level changes (the boot wiring raises/clears the
+/// `tls-certificate` health warning from it).
 pub type AlarmHook = Arc<dyn Fn(CertificateAlarm) + Send + Sync>;
+
+/// Non-blocking "issue now" for the control plane (see [`AcmeHandle::trigger`]).
+pub type IssueTrigger = Arc<dyn Fn() -> Result<(), SendError> + Send + Sync>;
 
 /// A successfully issued and installed certificate (non-secret facts).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -314,6 +318,31 @@ fn meta_from_bundle(bundle: &[u8]) -> Option<ActiveMeta> {
     serde_json::from_slice(&json).ok()
 }
 
+/// Read the stored certificate's non-secret facts without installing it
+/// (offline `multiview tls status`). `Ok(None)` when no certificate is stored.
+///
+/// # Errors
+/// [`AcmeError::Storage`] / [`AcmeError::Mismatch`] for insecure or malformed state.
+pub fn stored_meta(state_dir: &Path) -> Result<Option<ActiveMeta>, AcmeError> {
+    if !state_dir.join(store::ACTIVE_PEM).exists() {
+        return Ok(None);
+    }
+    let Some(bundle) = store::read_private(state_dir, store::ACTIVE_PEM)? else {
+        return Ok(None);
+    };
+    let bundle = zeroize::Zeroizing::new(bundle);
+    let parsed = parse_bundle(&bundle, &bundle)?;
+    let stored = meta_from_bundle(&bundle);
+    Ok(Some(ActiveMeta {
+        not_before: parsed.not_before,
+        not_after: parsed.not_after,
+        ari_cert_id: parsed.ari_cert_id,
+        ca: stored.as_ref().map_or_else(String::new, |m| m.ca.clone()),
+        directory_url: stored.map_or_else(String::new, |m| m.directory_url),
+        names: parsed.names,
+    }))
+}
+
 /// Parse a stored RFC 9773 `aki.serial` identifier.
 #[must_use]
 pub fn parse_cert_id(id: &str) -> Option<CertificateIdentifier<'static>> {
@@ -365,6 +394,8 @@ pub struct AcmeEngine {
     secrets: SecretLookup,
     alarm_hook: Option<AlarmHook>,
     alarm: Mutex<CertificateAlarm>,
+    /// `(public host, period)`: rotate the bootstrap certificate this often while in setup.
+    bootstrap_rotation: Option<(String, Duration)>,
 }
 
 impl std::fmt::Debug for AcmeEngine {
@@ -410,7 +441,23 @@ impl AcmeEngine {
             secrets,
             alarm_hook: None,
             alarm: Mutex::new(CertificateAlarm::None),
+            bootstrap_rotation: None,
         })
+    }
+
+    /// Rotate the 7-day bootstrap certificate every `every` while the source is
+    /// in setup (on the service thread; the key is persisted 0600 in
+    /// `state_dir`). The boot wiring passes six days.
+    #[must_use]
+    pub fn with_bootstrap_rotation(mut self, public_host: String, every: Duration) -> Self {
+        self.bootstrap_rotation = Some((public_host, every.max(MIN_DELAY)));
+        self
+    }
+
+    /// The configured directory URL.
+    #[must_use]
+    pub fn directory_url(&self) -> &str {
+        &self.directory_url
     }
 
     /// Install a hook called on every alarm-level change.
@@ -951,6 +998,23 @@ impl AcmeHandle {
         })
     }
 
+    /// A cloneable "issue now" trigger for the control plane. It holds only a
+    /// weak sender, so it never keeps the service alive after this handle drops.
+    #[must_use]
+    pub fn trigger(&self) -> IssueTrigger {
+        let weak = self.sender.as_ref().map(mpsc::Sender::downgrade);
+        Arc::new(move || {
+            let sender = weak
+                .as_ref()
+                .and_then(mpsc::WeakSender::upgrade)
+                .ok_or(SendError::Closed)?;
+            sender.try_send(AcmeCommand::IssueNow).map_err(|e| match e {
+                mpsc::error::TrySendError::Full(_) => SendError::Busy,
+                mpsc::error::TrySendError::Closed(_) => SendError::Closed,
+            })
+        })
+    }
+
     /// Whether the service thread has exited.
     #[must_use]
     pub fn is_finished(&self) -> bool {
@@ -1050,7 +1114,29 @@ async fn run(engine: AcmeEngine, mut receiver: mpsc::Receiver<AcmeCommand>) {
     // recheck = lifetime fallback, fixed until the certificate changes.
     let mut ari: Option<(i64, Option<i64>)> = None;
     let mut force = false;
+    let mut next_rotation = engine
+        .bootstrap_rotation
+        .as_ref()
+        .map(|(_, every)| std::time::Instant::now() + *every);
     loop {
+        if let (Some((host, every)), Some(at)) = (&engine.bootstrap_rotation, next_rotation) {
+            if std::time::Instant::now() >= at {
+                match engine.source.rotate_bootstrap(host, &engine.config.state_dir) {
+                    Ok(true) => tracing::info!(
+                        fingerprint = crate::certificate_source::CertificateSource::status(
+                            engine.source.as_ref()
+                        )
+                        .bootstrap_fingerprint
+                            .as_deref()
+                            .unwrap_or(""),
+                        "acme: bootstrap certificate rotated (compare this SHA-256 fingerprint with your browser's)"
+                    ),
+                    Ok(false) => {}
+                    Err(_) => tracing::warn!("acme: bootstrap certificate rotation failed; the current one stays"),
+                }
+                next_rotation = Some(std::time::Instant::now() + *every);
+            }
+        }
         let now = unix_now();
         let due_at = match &current {
             None => now,
@@ -1130,6 +1216,9 @@ async fn run(engine: AcmeEngine, mut receiver: mpsc::Receiver<AcmeCommand>) {
             sleep_for = sleep_for.min(Duration::from_secs(
                 u64::try_from(recheck.saturating_sub(now)).unwrap_or(0),
             ));
+        }
+        if let Some(at) = next_rotation {
+            sleep_for = sleep_for.min(at.saturating_duration_since(std::time::Instant::now()));
         }
         let sleep_for = sleep_for.clamp(Duration::from_secs(1), MAX_SLEEP);
         tokio::select! {

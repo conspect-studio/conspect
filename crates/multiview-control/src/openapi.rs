@@ -264,6 +264,11 @@ const ASYNCAPI_JSON: &str = include_str!("../../../docs/api/asyncapi.json");
         crate::routes::preview::input_jpeg,
         crate::routes::cloudflare::save,
         crate::routes::cloudflare::execute,
+        crate::tls_api::doc::status,
+        crate::tls_api::doc::setup_session,
+        crate::tls_api::doc::issue,
+        crate::tls_api::doc::setup_code,
+        crate::tls_api::doc::credential,
         crate::routes::moq::program_open,
         crate::routes::moq::program_close,
         crate::routes::moq::wall_open,
@@ -319,6 +324,11 @@ const ASYNCAPI_JSON: &str = include_str!("../../../docs/api/asyncapi.json");
         crate::realtime::WsTicketResponse,
         crate::preview::PreviewCapabilities,
         crate::routes::cloudflare::SaveCredential,
+        crate::tls_api::TlsStatusBody,
+        crate::tls_api::SetupSessionRequest,
+        crate::tls_api::SetupCodeBody,
+        crate::tls_api::CredentialRequest,
+        crate::tls_api::IssueAccepted,
         crate::routes::cloudflare::CloudflareRequest,
         crate::routes::cloudflare::CloudflareRelayConfig,
         crate::routes::cloudflare::CloudflareUpstreams,
@@ -649,6 +659,7 @@ const ASYNCAPI_JSON: &str = include_str!("../../../docs/api/asyncapi.json");
         (name = "config", description = "Config/layout versioning: revisions, diff, rollback"),
         (name = "nmos", description = "AMWA NMOS Node API: IS-04 resources + IS-05 connection"),
         (name = "realtime", description = "WebSocket + SSE event stream"),
+        (name = "tls", description = "Front-door ACME certificates (ADR-0107 section 5a): status, the setup-code login, issuance, and the loopback-only setup-code and credential admin routes"),
     )
 )]
 pub struct ApiDoc;
@@ -806,6 +817,13 @@ const REST_ROUTES: &[(&str, &str)] = &[
     ("DELETE", "/api/v1/tally/profiles/{id}"),
     ("GET", "/api/v1/preview/capabilities"),
     ("POST", "/api/v1/cloudflare/credentials"),
+    // Front-door certificates (ADR-0107 section 5a); mounted only with
+    // `[network.tls]`. setup-code/credential are loopback admin only.
+    ("GET", "/api/v1/tls/status"),
+    ("POST", "/api/v1/tls/setup/session"),
+    ("POST", "/api/v1/tls/issue"),
+    ("POST", "/api/v1/tls/setup-code"),
+    ("POST", "/api/v1/tls/credential"),
     ("POST", "/api/v1/cloudflare/{action}"),
     ("POST", "/api/v1/preview/program/moq"),
     ("DELETE", "/api/v1/preview/program/moq/{lease_id}"),

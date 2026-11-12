@@ -103,6 +103,9 @@ pub mod system;
 pub mod tally_ingest;
 pub mod tally_state;
 pub mod telemetry_consent;
+pub mod tls_api;
+#[cfg(all(feature = "acme", unix))]
+pub mod tls_setup;
 pub(crate) mod typed_resources;
 pub mod versioning;
 pub mod warning_ingest;
@@ -261,6 +264,25 @@ pub use whip::{no_whip, NoWhip, SharedWhip, WhipAnswer, WhipAuth, WhipProvider, 
 ///
 /// The returned router carries `AppState`, so it is ready to serve.
 pub fn router(state: AppState) -> Router {
+    router_with(state, Surface::Admin)
+}
+
+/// Which listener a router is built for. The two differ only in the
+/// `/api/v1/tls/*` routes (ADR-0107 section 5a): the admin listener carries
+/// the loopback-only certificate admin routes, the front door the setup-code
+/// login. Both carry them only when [`AppState::with_tls`] is set.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Surface {
+    /// The `[control] listen` loopback admin listener.
+    Admin,
+    /// The network front door (TCP 443, slice 4).
+    FrontDoor,
+}
+
+/// [`router`] for an explicit [`Surface`].
+pub fn router_with(state: AppState, surface: Surface) -> Router {
+    #[cfg(not(all(feature = "acme", unix)))]
+    let _ = surface;
     // SEC-14: install the management-plane request-concurrency + rate caps only when
     // the operator has limits enabled (the default). Disabled ⇒ the router is exactly
     // what it was before — no middleware, no overhead.
@@ -289,7 +311,15 @@ pub fn router(state: AppState) -> Router {
         .route("/events", get(realtime::sse_handler))
         // Unauthenticated auth-mode discovery: the SPA reads this before it has a
         // token, to decide whether to show a login gate (and to validate a key).
-        .route("/auth/status", get(realtime::auth_status_handler))
+        .route("/auth/status", get(realtime::auth_status_handler));
+    // Front-door certificate routes (ADR-0107 section 5a), only with `[network.tls]`.
+    #[cfg(all(feature = "acme", unix))]
+    let api = if state.tls.is_some() {
+        api.merge(tls_setup::api_routes(surface))
+    } else {
+        api
+    };
+    let api = api
         // The Conspect config-lock interceptor (S2 backend, ADR-0050 §5): one
         // additive guard over the whole `/api/v1` surface that refuses
         // *configuration* mutations with a `409 config_locked` problem when the
