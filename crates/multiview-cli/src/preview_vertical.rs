@@ -657,6 +657,7 @@ impl WindowDelivery for PreviewDelivery {
             })
     }
     fn report_loss(&mut self, _: usize, _: multiview_output::batch::OfferError) {}
+    fn mark_discontinuity(&mut self, _: usize, _: multiview_output::batch::OfferError) {}
     fn take_discontinuity(&mut self, _: usize) -> Option<multiview_output::batch::Discontinuity> {
         None
     }

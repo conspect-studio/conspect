@@ -204,6 +204,7 @@ impl WindowDelivery for NoDelivery {
         Ok(())
     }
     fn report_loss(&mut self, _o: usize, _r: multiview_output::batch::OfferError) {}
+    fn mark_discontinuity(&mut self, _o: usize, _r: multiview_output::batch::OfferError) {}
     fn take_discontinuity(&mut self, _o: usize) -> Option<multiview_output::batch::Discontinuity> {
         None
     }
@@ -330,6 +331,7 @@ impl WindowDelivery for Rec {
         Ok(())
     }
     fn report_loss(&mut self, _o: usize, _r: multiview_output::batch::OfferError) {}
+    fn mark_discontinuity(&mut self, _o: usize, _r: multiview_output::batch::OfferError) {}
     fn take_discontinuity(&mut self, _o: usize) -> Option<multiview_output::batch::Discontinuity> {
         None
     }

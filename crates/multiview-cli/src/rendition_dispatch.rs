@@ -998,7 +998,13 @@ impl RenditionDispatcher {
                             });
                             let changed = cut_sets.is_some() && cut_sets != b.last_sets;
                             if changed {
-                                delivery.report_loss(b.output_index, OfferError::ProducerLoss);
+                                // Not a loss: the cut window opens at a strict
+                                // RAP. A loss here would arm the queue's RAP
+                                // gate and flush its healthy backlog.
+                                delivery.mark_discontinuity(
+                                    b.output_index,
+                                    OfferError::DecoderConfigChanged,
+                                );
                             }
                             if cut_sets.is_some() {
                                 b.last_sets = cut_sets;
@@ -1688,6 +1694,13 @@ mod tests {
             reason: multiview_output::batch::OfferError,
         ) {
             self.queues[output_index].report_loss(reason);
+        }
+        fn mark_discontinuity(
+            &mut self,
+            output_index: usize,
+            reason: multiview_output::batch::OfferError,
+        ) {
+            self.queues[output_index].mark_discontinuity(reason);
         }
         fn take_discontinuity(
             &mut self,
@@ -2423,6 +2436,130 @@ mod tests {
             d.dispatch(ve(9, 0, vec![], None), now, &mut sink),
             Err(DispatchError::InvalidEvent)
         );
+    }
+
+    /// A real H.264 Annex B access unit: SPS (with `sps_tag` in its payload)
+    /// + PPS + IDR slice when `idr`, else a single non-IDR slice.
+    fn h264(dts: i64, idr: bool, sps_tag: u8) -> EncodedPacket {
+        let bytes: Vec<u8> = if idr {
+            vec![
+                0, 0, 0, 1, 0x67, 0x42, 0xC0, 0x1E, sps_tag, 0xDA, //
+                0, 0, 0, 1, 0x68, 0xCE, 0x3C, 0x80, //
+                0, 0, 0, 1, 0x65, 0x88, 0x84, 0x00, 0x33,
+            ]
+        } else {
+            vec![0, 0, 0, 1, 0x41, 0x9A, 0x02, 0x04, 0x11]
+        };
+        let mut raw = Packet::copy(&bytes);
+        raw.set_pts(Some(dts));
+        raw.set_dts(Some(dts));
+        if idr {
+            raw.set_flags(Flags::KEY);
+        }
+        EncodedPacket::with_kind(raw, StreamKind::Video)
+    }
+    fn h264_gate() -> MoveGate {
+        Box::new(|p| {
+            p.payload().is_some_and(|au| {
+                multiview_ffmpeg::idr::is_self_contained_idr(
+                    au,
+                    CodecKind::H264,
+                    NalFraming::AnnexB,
+                )
+            })
+        })
+    }
+    fn h264_sets() -> ParameterSets {
+        Box::new(|p| {
+            let au = p.payload()?;
+            let sets =
+                multiview_ffmpeg::idr::parameter_sets(au, CodecKind::H264, NalFraming::AnnexB);
+            (!sets.is_empty()).then(|| sets.concat())
+        })
+    }
+
+    /// K (lens 1 r2 #1): a move whose cut RAP carries different parameter
+    /// sets, on the REAL `BindingDelivery` with a strict H.264 RAP gate. The
+    /// windows before the cut are still queued (the sink has not pulled), the
+    /// cut window `[SPS+PPS+IDR, audio]` is admitted, nothing queued before it
+    /// is flushed, and exactly one discontinuity (a new generation starting at
+    /// the cut window) is reported. Fails with a loss-based signal: the
+    /// queued backlog is flushed and counted as a rejection.
+    #[test]
+    fn a_parameter_set_change_at_a_move_admits_the_cut_window_and_flushes_nothing() {
+        use crate::binding_delivery::{BindingDelivery, BindingPolicy, DeliveryLimits};
+        let now = Instant::now();
+        let gate = RecoveryGate::StrictRap {
+            codec: CodecKind::H264,
+            framing: NalFraming::AnnexB,
+        };
+        let (mut delivery, mut receivers) = BindingDelivery::new(
+            vec![BindingPolicy::Bounded],
+            DeliveryLimits::default(),
+            vec![Some(gate)],
+        );
+        // The sink (mux) side: pulls every packet until the run ends.
+        let rx = receivers.remove(0);
+        let sink = std::thread::spawn(move || {
+            let mut got = Vec::new();
+            while let Ok(p) = rx.recv() {
+                got.push((p.packet.dts(), p.packet.kind(), p.permit.generation()));
+            }
+            got
+        });
+        let mut c = cfg(vec![binding(0, 0, 1)], 1, 1);
+        c.video_move_gates = vec![Some(h264_gate())];
+        let mut d = RenditionDispatcher::new(c).unwrap();
+        d.set_parameter_sets(0, h264_sets()).unwrap();
+        let live = d
+            .add_video_key(DtsTimeBase { num: 1, den: 5 }, h264_gate())
+            .unwrap();
+        d.set_parameter_sets(live, h264_sets()).unwrap();
+        const CUT: i64 = 5;
+        d.rebind_video(0, live, u64::try_from(CUT).unwrap(), 3)
+            .unwrap();
+        for i in 0..8_i64 {
+            let m = Some(mark(TICK * i128::from(i + 1)));
+            let tick = u64::try_from(i).unwrap();
+            d.dispatch(
+                ve(live, tick, vec![h264(i, i == CUT, 0xBB)], m),
+                now,
+                &mut delivery,
+            )
+            .unwrap();
+            d.dispatch(
+                ve(0, tick, vec![h264(i, i == 0, 0xAA)], m),
+                now,
+                &mut delivery,
+            )
+            .unwrap();
+            d.dispatch(ae(tick, vec![audio(i, 0)], vec![m]), now, &mut delivery)
+                .unwrap();
+        }
+        assert_eq!(
+            d.take_move_outcomes(),
+            vec![MoveOutcome::Applied {
+                output_index: 0,
+                key: live,
+                tick: 5,
+                parameter_sets_changed: true
+            }]
+        );
+        let discontinuity = delivery.take_discontinuity(0).expect("one discontinuity");
+        assert_eq!(discontinuity.flushed_windows, 0, "nothing flushed");
+        assert_eq!(delivery.take_discontinuity(0), None, "exactly one");
+        let status = &delivery.statuses()[0];
+        assert_eq!(status.admitted_batches, 8);
+        assert_eq!(status.rejected_batches, 0);
+        delivery.finish();
+        // Sink side: every window arrived (2 packets each); the cut window
+        // opens the new generation with the IDR first, audio after it.
+        let got = sink.join().unwrap();
+        let gens: Vec<u64> = got.iter().map(|g| g.2).collect();
+        assert_eq!(gens, [[0; 10].as_slice(), [1; 6].as_slice()].concat());
+        assert_eq!(got[10].0, Some(CUT));
+        assert_eq!(got[10].1, StreamKind::Video);
+        assert_eq!(got[11].1, StreamKind::Audio);
     }
 
     /// J (lens 2 r2 #1): output A has a pending move to live key K; K is
