@@ -1588,6 +1588,9 @@ impl RenditionDispatcher {
             push_outcome(&mut self.outcomes, MoveOutcome::Superseded { output_index });
         }
         if b.video_key == Some(key) {
+            // Same key = the same encoder the output already reads: its
+            // decoder configuration cannot change here, so no gate and no
+            // parameter-set decision are needed (the move is a no-op).
             push_outcome(
                 &mut self.outcomes,
                 MoveOutcome::Applied {
@@ -2632,6 +2635,95 @@ mod tests {
             }]
         );
         assert_eq!(discontinuities, 0, "equal sets splice");
+    }
+
+    /// V1: output 1 moves 1 -> 0 at tick 1 and back 0 -> 1 at tick 3 between
+    /// base keys whose RAPs carry `sets0` / `sets1`; every base window is a
+    /// gated RAP. Returns (outcomes, discontinuities, final key).
+    fn there_and_back(
+        sets0: u8,
+        sets1: u8,
+        inband: bool,
+    ) -> (Vec<MoveOutcome>, usize, Option<usize>) {
+        let now = Instant::now();
+        let mut moved = binding(1, 1, 1);
+        moved.inband_parameter_changes_ok = inband;
+        let mut d =
+            RenditionDispatcher::new(gated_cfg(vec![binding(0, 0, 1), moved], 2, 1)).unwrap();
+        let mut sink = FakeDelivery::new(2);
+        d.set_parameter_sets(0, fixed_sets(RapParameterSets::Sets(vec![sets0])))
+            .unwrap();
+        d.set_parameter_sets(1, fixed_sets(RapParameterSets::Sets(vec![sets1])))
+            .unwrap();
+        let mut discontinuities = 0;
+        for i in 0..5_i64 {
+            match i {
+                1 => d.rebind_video(1, 0, 1, 3).unwrap(),
+                3 => d.rebind_video(1, 1, 3, 3).unwrap(),
+                _ => {}
+            }
+            feed_base(&mut d, &mut sink, 2, i, now, |_| rap77(i)).unwrap();
+            pop_all(&mut sink, 0, now);
+            pop_all(&mut sink, 1, now);
+            if sink.queues[1].take_discontinuity().is_some() {
+                discontinuities += 1;
+            }
+        }
+        (
+            d.take_move_outcomes(),
+            discontinuities,
+            d.binding_video_key(1),
+        )
+    }
+
+    /// V1 (re-baseline after a switch): A -> B -> A with identical sets on
+    /// an out-of-band output: both moves apply, zero discontinuities.
+    #[test]
+    fn there_and_back_with_identical_sets_never_resets() {
+        let (outcomes, discontinuities, key) = there_and_back(1, 1, false);
+        assert_eq!(
+            outcomes,
+            vec![
+                MoveOutcome::Applied {
+                    output_index: 1,
+                    key: 0,
+                    tick: 1,
+                    parameter_sets_changed: false
+                },
+                MoveOutcome::Applied {
+                    output_index: 1,
+                    key: 1,
+                    tick: 3,
+                    parameter_sets_changed: false
+                },
+            ]
+        );
+        assert_eq!((discontinuities, key), (0, Some(1)));
+    }
+
+    /// V1: A -> B with differing sets, then back to A's original sets on an
+    /// in-band output: exactly one change per real difference, both apply.
+    #[test]
+    fn there_and_back_with_differing_sets_reports_each_real_change_once() {
+        let (outcomes, discontinuities, key) = there_and_back(2, 1, true);
+        assert_eq!(
+            outcomes,
+            vec![
+                MoveOutcome::Applied {
+                    output_index: 1,
+                    key: 0,
+                    tick: 1,
+                    parameter_sets_changed: true
+                },
+                MoveOutcome::Applied {
+                    output_index: 1,
+                    key: 1,
+                    tick: 3,
+                    parameter_sets_changed: true
+                },
+            ]
+        );
+        assert_eq!((discontinuities, key), (2, Some(1)));
     }
 
     /// Extractor whose keyframe sets are `sets` (any non-keyframe: Absent).
