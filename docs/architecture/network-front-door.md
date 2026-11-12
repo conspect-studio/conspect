@@ -505,9 +505,10 @@ supported as `[network] mode = "behind_proxy"`:
 
 ```toml
 [network]
-mode = "direct"                  # "direct" | "behind_proxy"
+mode = "direct"                  # "direct" | "behind_proxy"; absent = no TCP listener (slice 4)
 public_host = "mda001.example.net"  # used for the 80->443 redirect, Alt-Svc authority, TURN SNI
 https_port = 443                 # TCP and UDP
+tcp_port = 443                   # as built (slice 4): the direct-mode TCP port, default https_port
 http_redirect_port = 80          # 0 disables the redirect listener
 bind = "[::]"                    # IPv6-first; an IPv4-only address is rejected at load
 advertise = ["2404:db8::10", "203.0.113.10"]  # public addresses for ICE candidates (was webrtc.advertised_addresses)
@@ -809,3 +810,84 @@ does not block 1-3. Public UDP 443 opens only after slice 3. 6, 7, 8 depend on 4
 * Shutdown: the daemon drops the front door last, after the control-plane drain, with a
   bounded `shutdown_timeout` (2 s) on a blocking-pool thread, so the socket is closed when
   teardown returns.
+
+### Slice 4 as built (issue #290)
+
+PR1 of slice 4: the TCP door, ICE-TCP lane, `behind_proxy` mode, port-80 redirect and the site over
+the engine's own TLS. The str0m ICE-TCP consumer and the browser ladder are PR2 of this slice.
+
+* **Config** (`[network]`, all optional, every saved `desired.json`/TOML keeps loading):
+  `mode` (`"direct"` | `"behind_proxy"`), `tcp_port`, `http_redirect_port`, `bind`, `trusted_proxies`,
+  `proxy_listen`, `[network.ice_tcp] enabled`. **`mode` absent means no TCP listener at all**: the
+  slice-1 UDP door only, so a saved state with only `https_port = 443` starts unchanged while another
+  server (nginx on mda001) still owns TCP 443. `mode` requires `https_port`. `bind` must be an IPv6
+  literal (default `[::]`, dual-stack; an IPv4 literal or IPv4-mapped address is rejected at load).
+  `trusted_proxies` takes IP literals and CIDR prefixes (at most 64), required non-empty for
+  `behind_proxy`. `proxy_listen` defaults to `[::1]:8443` and rejects `0.0.0.0`.
+* **Deviation, `tcp_port`**: section 10 has one `https_port` for TCP and UDP. `tcp_port` (default
+  `https_port`) lets an operator stage the TCP door on a second port while another server still owns
+  TCP 443, then drop the key at cutover.
+* **`public_host` relaxed**: it is valid alone now (the redirect target); `[network.tls]` still
+  requires it. `direct` with the redirect enabled requires `public_host`: the redirect target never
+  comes from the `Host` header. The redirect port must differ from the TCP door port.
+* **Topology (#1)**: `FrontDoor::start_tcp` binds the listener inside the front-door runtime
+  (backlog 1024, dual-stack for `[::]`, never `0.0.0.0`) and runs the accept loop, every
+  per-connection task, the ICE-TCP reader/writer tasks and the redirect there. The site service is
+  the control-plane router on `multiview_control::ConnectionServer`, run on the front-door runtime.
+* **Accept, in order**: accept (an error counts and backs off 50 ms, never exits); the global cap
+  (1024) before any byte is read; the per-source cap (256, IPv4 address or IPv6 /64) on the TCP peer
+  in `direct`. Behind a proxy: the TCP peer must be in `trusted_proxies` (else closed before any
+  read), then a PROXY v2 header (binary, `PROXY` command, `TCP4`/`TCP6` only, at most 536 bytes of
+  addresses + TLVs) within the 5 s first-byte deadline; anything else (missing, v1 text, `LOCAL`,
+  UDP/unix, oversize) closes before any byte of the client's protocol is read. The header's source is
+  the peer for the per-source cap, `ConnectInfo` and logs.
+* **First byte**, `peek` under the 5 s deadline from accept: `0x16` is TLS; `0x00`-`0x05` reads the
+  2-byte RFC 4571 length (never TLS, so consuming it is safe) and 20..=1535 is ICE-TCP (when
+  enabled); anything else closes.
+* **TLS**: `LazyConfigAcceptor` over a reader capped at 16 KiB until the `ClientHello` parses; hello
+  plus handshake bounded by 10 s from the first byte. ALPN exactly `acme-tls/1` routes to the ACME
+  responder config (None until slice 5: closed); SNI `turn.<public_host>` is closed (reserved for
+  slice 8); everything else is the site (ALPN `http/1.1` only) and is handed, with the admission
+  guard, to the site service. The site is the same router and `ServeOptions` as the plain
+  `[control] bind` listener (header-read timeout, `ConnectInfo`, upgrades, the control per-IP cap on
+  the real peer, drain on the control-plane shutdown). The plain listener keeps running unchanged.
+  The certificate is `[control.tls] mode = "static"` through `StaticCertificateSource` +
+  `SourceResolver` (feature `tls`, unix); without it the door logs a warning and serves ICE-TCP only.
+* **ICE-TCP lane contract** (`FrontDoor::take_ice_tcp_lane`): the first frame must arrive within the
+  5 s deadline, be <= 1535 bytes and structurally a STUN Binding Request (type `0x0001`, cookie,
+  exact length, a `USERNAME` containing `:`). An optional pre-check hook on the full `USERNAME`
+  (`set_ice_tcp_username_check`) defaults to accept. Until a consumer takes the lane, connections
+  close right after their first frame. Registered connections (table keyed by canonical peer, capped
+  at the door's connection cap; a second connection from the same peer is refused) start in
+  **probation**: frames go to the lane, but until the consumer queues an outbound frame to that peer
+  (str0m answering an authenticated Binding Request, i.e. `MESSAGE-INTEGRITY` verified) at most 8
+  inbound frames, each <= 1535 bytes and a STUN message (first byte `0x00`/`0x01`), are accepted,
+  and with no outbound frame within 5 s of accept the connection closes
+  (`ice_tcp_probation_expired`). After probation frames up to 65 535 bytes flow (a zero-length frame
+  closes). Each `IceTcpFrame` carries `peer` (canonical) and `local` (accepted socket, unmapped).
+  Inbound: one lane queue of 1024, `try_send`, full drops and counts. Outbound:
+  `IceTcpSender::send` never blocks; per connection at most 256 frames **and 256 KiB** (drop-oldest;
+  the byte cap is an addition: 256 maximum-size frames would otherwise pin 16 MiB per connection);
+  a write stalled 5 s, or a queue overflowing continuously for 5 s, closes the connection
+  (`ice_tcp_closed_stuck`). 30 s without an inbound frame closes. `IceTcpSender::close(peer)` drops a
+  connection.
+* **Redirect**: `[bind]:http_redirect_port`, own caps (256 global, 16 per source), 5 s total per
+  connection, at most 8 KiB read for the request line; `301` to `https://<public_host>[:port]<path>`
+  (IPv6 literal bracketed, port omitted when 443), path + query kept, the fragment dropped, anything
+  with control characters, spaces, `\`, a leading `//` or not in origin form becomes `/`. The `Host`
+  header is never read.
+* **Stats**: TCP counters for accepted, refusals (global, per source, proxy), first-byte and
+  handshake timeouts, classified closes, TLS site/ACME/failed, TURN-reserved, the ICE-TCP lifecycle
+  and drops, the redirect, plus `tcp_open_connections` / `redirect_open_connections` gauges.
+* **Failure posture**: a TCP or redirect bind failure is logged; the UDP door keeps running.
+* **Tests**: unit and property tests for the first-byte classifier (all 256 bytes, all lengths), the
+  PROXY v2 parser and the RFC 4571 deframer; `tests/tcp_door.rs` (TLS h1 and ICE-TCP on one port over
+  IPv4 and IPv6, the ICE-TCP gates and probation, `behind_proxy` fail-closed and header address, the
+  redirect, the deadlines, the per-source cap, a stuck reader); `tests/tcp_chaos.rs` (connect flood,
+  first-byte and TLS slowloris, half-open TLS, stuck ICE-TCP readers, oversized and garbage frames
+  against the real tick loop: cadence, lateness bounds, the connection cap, RSS and fd count back to
+  baseline).
+* **Deferred**: the ACME `ChallengeResolver` wiring into `TlsRouting.acme` (whichever of #290/#291
+  lands second; TODO in `multiview-cli/src/frontdoor.rs`); the str0m ICE-TCP consumer, passive TCP
+  candidates in the SDP and the browser ladder (PR2 of this slice); systemd socket activation
+  (section 9) and the mda001 cutover (slice 6).

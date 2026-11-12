@@ -647,11 +647,7 @@ async fn serve_control_plane(
     let boot_model = Arc::new(start.to_boot_model(config_path));
     #[cfg(feature = "moq-output")]
     let moq = start_moq_listener(moq_factory, front_door.as_mut()).await?;
-    #[cfg(feature = "moq-output")]
-    let bind_control = control::bind_and_serve_with_moq;
-    #[cfg(not(feature = "moq-output"))]
-    let bind_control = control::bind_and_serve;
-    let (addr, handle, state) = bind_control(
+    let (addr, handle, state) = control::bind_and_serve_with_moq(
         listen,
         config,
         Arc::clone(publisher),
@@ -672,6 +668,7 @@ async fn serve_control_plane(
         moq,
         #[cfg(feature = "moq-output")]
         moq_slot,
+        front_door.as_ref(),
         async move {
             let _ = shutdown_rx.await;
         },

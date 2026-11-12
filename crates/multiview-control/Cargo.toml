@@ -423,6 +423,11 @@ moq-transport = ["dep:multiview-moq", "dep:url"]
 name = "tls_serve"
 required-features = ["tls"]
 
+[[test]]
+# The front-door connection entry point (ADR-0107 slice 4) over TLS.
+name = "site_connection"
+required-features = ["tls"]
+
 [[example]]
 # The real authority fixture imports the optional native MoQ provider.
 # Its feature-enabled unit tests remain required by the main draft gate.
