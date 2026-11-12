@@ -567,7 +567,12 @@ impl OutputRoutingControl {
     /// capacity. Under pressure the oldest settled record is evicted (the
     /// principal's own first, at its per-principal cap); a pending record never
     /// is. The record exists before the enqueue, so an outcome never beats it.
-    pub fn reserve_take(&self, key: &str, principal: &str, pending: PendingTake) -> TakeReservation {
+    pub fn reserve_take(
+        &self,
+        key: &str,
+        principal: &str,
+        pending: PendingTake,
+    ) -> TakeReservation {
         self.records().reserve(key, principal, pending)
     }
 
@@ -724,9 +729,9 @@ pub async fn persist_feed(
     // file routes that output elsewhere — or a restart would undo it.
     let boot_seeds_other = state.boot_model.as_ref().is_some_and(|model| {
         model.loaded().routing.as_ref().is_some_and(|t| {
-            t.output
-                .iter()
-                .any(|xp| xp.output == output && xp.effective_video() != multiview_config::VideoFeed::PROGRAM)
+            t.output.iter().any(|xp| {
+                xp.output == output && xp.effective_video() != multiview_config::VideoFeed::PROGRAM
+            })
         })
     });
     if *feed != RoutedFeed::Program || boot_seeds_other {
@@ -802,7 +807,10 @@ mod tests {
             };
             ops.push(op);
         }
-        assert_eq!(store.reserve("k9", "p", pending()), TakeReservation::Capacity);
+        assert_eq!(
+            store.reserve("k9", "p", pending()),
+            TakeReservation::Capacity
+        );
         assert_eq!(store.by_key.len(), 3);
         for (i, op) in ops.iter().enumerate() {
             let Some(replay) = store.replay(&format!("k{i}")) else {
@@ -879,7 +887,10 @@ mod tests {
         // Alice is at her cap: her OWN oldest settled (a0, reserved first) is
         // evicted, not bob's older settled record and not her pending a2.
         fresh(&mut store, "a3", "alice");
-        assert!(store.replay("a0").is_none(), "alice's oldest settled evicted");
+        assert!(
+            store.replay("a0").is_none(),
+            "alice's oldest settled evicted"
+        );
         assert!(store.replay("a1").is_some());
         assert!(store.replay("a2").is_some(), "pending never evicted");
         assert!(store.replay("b0").is_some(), "another principal untouched");

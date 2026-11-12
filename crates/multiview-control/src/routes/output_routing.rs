@@ -330,7 +330,9 @@ fn accepted(body: OutputTakeAccepted) -> Response {
 
 /// The `202` of a replayed key: the key's own op and, once known, its
 /// outcome. Never re-enqueues and never answers `adopt` again: the take store
-/// never evicts a record, so a replay always meets its own operation.
+/// never evicts a pending record, so a replay while pending always meets its
+/// own operation (a settled record may be evicted under pressure; its key is
+/// then a new take — the documented trade-off, design §6.2).
 fn replayed(replay: TakeReplay) -> Response {
     let recorded = replay.outcome;
     accepted(OutputTakeAccepted {
@@ -414,7 +416,7 @@ fn plan_gate(
             (status = 409, description = "`routing-unavailable`, `switcher-required`, `output-kind-unroutable` or `capacity`.", body = crate::problem::Problem),
             (status = 422, description = "`unknown-feed`, missing Idempotency-Key, or an unsupported audio request.", body = crate::problem::Problem),
             (status = 429, description = "Over 2 takes/s per output or 10/s per principal; see Retry-After.", body = crate::problem::Problem),
-            (status = 503, description = "`engine-busy`: the take mailbox is full (the key is freed); or `idempotency-capacity`: the take store holds its maximum of distinct keys (fails closed; existing keys still replay).", body = crate::problem::Problem),
+            (status = 503, description = "`engine-busy`: the take mailbox is full (the key is freed); or `idempotency-capacity`: the caller's (or every) take record is still pending at its cap (fails closed; pending keys still replay; settled records are evicted oldest-first otherwise).", body = crate::problem::Problem),
         ),
     )
 )]

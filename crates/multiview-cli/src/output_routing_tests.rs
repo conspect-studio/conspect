@@ -2194,7 +2194,9 @@ fn an_operator_take_ends_a_boot_take_retry_window() {
         "the boot take is never re-issued after an operator take: {after:?}"
     );
     assert!(
-        after.iter().any(|(op, o)| op == "op" && *o == TakeResult::Applied),
+        after
+            .iter()
+            .any(|(op, o)| op == "op" && *o == TakeResult::Applied),
         "{after:?}"
     );
     assert_eq!(r.snapshot.load().boot_takes_pending, 0);

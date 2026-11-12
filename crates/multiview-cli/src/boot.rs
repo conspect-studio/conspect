@@ -150,8 +150,11 @@ fn splice_output_routing(
         .routing
         .as_ref()
         .map_or(&[], |t| t.output.as_slice());
-    let declared: std::collections::HashSet<String> =
-        running.outputs.iter().map(multiview_config::Output::id).collect();
+    let declared: std::collections::HashSet<String> = running
+        .outputs
+        .iter()
+        .map(multiview_config::Output::id)
+        .collect();
     let mut output: Vec<multiview_config::OutputCrosspoint> = accepted.to_vec();
     for seed in std::mem::take(&mut table.output) {
         if declared.contains(&seed.output) && !output.iter().any(|xp| xp.output == seed.output) {

@@ -1013,13 +1013,18 @@ impl OutputRouter {
     /// a re-issue, no sooner than [`BOOT_RETRY_SECS`] after the last one; any
     /// other refusal gives up. The persisted feed is never touched here: the
     /// operator's intent stays, the readback shows the live bus.
-    fn on_boot_outcome(&mut self, operation_id: &str, index: usize, tick: u64, outcome: TakeResult) {
+    fn on_boot_outcome(
+        &mut self,
+        operation_id: &str,
+        index: usize,
+        tick: u64,
+        outcome: TakeResult,
+    ) {
         let retry_ticks = self.ticks_for(self.cfg.boot_retry.retry_secs);
-        let Some(slot) = self
-            .boot
-            .get_mut(index)
-            .filter(|slot| slot.as_ref().is_some_and(|b| b.take.operation_id == operation_id))
-        else {
+        let Some(slot) = self.boot.get_mut(index).filter(|slot| {
+            slot.as_ref()
+                .is_some_and(|b| b.take.operation_id == operation_id)
+        }) else {
             return;
         };
         match outcome {
@@ -1053,7 +1058,11 @@ impl OutputRouter {
         let window = self.ticks_for(self.cfg.boot_retry.window_secs);
         let first = self.first_tick.unwrap_or(tick);
         for index in 0..self.boot.len() {
-            let Some(due) = self.boot.get(index).and_then(|b| b.as_ref()).and_then(|b| b.due)
+            let Some(due) = self
+                .boot
+                .get(index)
+                .and_then(|b| b.as_ref())
+                .and_then(|b| b.due)
             else {
                 continue;
             };

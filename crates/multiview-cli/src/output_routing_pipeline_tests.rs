@@ -922,24 +922,38 @@ fn a_persisted_source_feed_is_on_air_after_the_boot_take() {
     let applied = Arc::new(Mutex::new(None::<TakeOutcome>));
     let record = Arc::clone(&applied);
     let template = boot_config("@_b");
-    let run = drive_clocked(&template, false, false, "route_boot", TICKS, None, move |slot| {
-        let handle = wait_for("the routing handle", Duration::from_secs(10), || slot.load());
-        let outcomes = handle.outcomes().expect("one outcome reader");
-        let o = wait_for("the boot take applied", Duration::from_secs(10), || {
-            outcomes
-                .try_iter()
-                .find(|o| o.operation_id == "boot:test-sink-1" && o.outcome == TakeResult::Applied)
-        });
-        // The readback agrees with the outcome: out1 on air on the source.
-        wait_for("the readback shows the source on air", Duration::from_secs(1), || {
-            let s = handle.snapshot();
-            (s.outputs[1].bus == "src:route_boot_b"
-                && s.outputs[0].bus == "program"
-                && s.boot_takes_pending == 0)
-                .then_some(())
-        });
-        *record.lock().unwrap() = Some(o);
-    });
+    let run = drive_clocked(
+        &template,
+        false,
+        false,
+        "route_boot",
+        TICKS,
+        None,
+        move |slot| {
+            let handle = wait_for("the routing handle", Duration::from_secs(10), || {
+                slot.load()
+            });
+            let outcomes = handle.outcomes().expect("one outcome reader");
+            let o = wait_for("the boot take applied", Duration::from_secs(10), || {
+                outcomes.try_iter().find(|o| {
+                    o.operation_id == "boot:test-sink-1" && o.outcome == TakeResult::Applied
+                })
+            });
+            // The readback agrees with the outcome: out1 on air on the source.
+            wait_for(
+                "the readback shows the source on air",
+                Duration::from_secs(1),
+                || {
+                    let s = handle.snapshot();
+                    (s.outputs[1].bus == "src:route_boot_b"
+                        && s.outputs[0].bus == "program"
+                        && s.boot_takes_pending == 0)
+                        .then_some(())
+                },
+            );
+            *record.lock().unwrap() = Some(o);
+        },
+    );
     let applied = applied.lock().unwrap().clone().expect("boot take applied");
     assert_eq!(applied.output_index, 1);
     assert_eq!(applied.bus, PictureBus::Source("route_boot_b".to_owned()));
@@ -965,7 +979,10 @@ fn a_persisted_source_feed_is_on_air_after_the_boot_take() {
         .iter()
         .find(|p| p.0 == i64::try_from(applied.tick).unwrap())
         .unwrap();
-    assert!(first.1 && first.2, "the cut lands on a keyframe with a sequence header: {first:?}");
+    assert!(
+        first.1 && first.2,
+        "the cut lands on a keyframe with a sequence header: {first:?}"
+    );
 }
 
 /// #329 F1(b): a persisted feed whose source never becomes fresh: the boot
@@ -986,27 +1003,37 @@ fn a_never_fresh_boot_feed_is_retried_then_given_up_and_program_is_untouched() {
         retry_secs: 2,
         window_secs: 8,
     };
-    let run = drive_clocked(&template, false, false, "route_bootnf", TICKS, Some(policy), move |slot| {
-        let handle = wait_for("the routing handle", Duration::from_secs(10), || slot.load());
-        let outcomes = handle.outcomes().expect("one outcome reader");
-        let start = Instant::now();
-        while start.elapsed() < Duration::from_secs(30) {
-            while let Ok(o) = outcomes.try_recv() {
-                assert_eq!(o.operation_id, "boot:test-sink-1", "{o:?}");
-                assert_eq!(
-                    o.outcome,
-                    TakeResult::Refused(super::RefuseReason::FeedNotFresh),
-                    "{o:?}"
-                );
-                record.lock().unwrap().push(o.tick);
+    let run = drive_clocked(
+        &template,
+        false,
+        false,
+        "route_bootnf",
+        TICKS,
+        Some(policy),
+        move |slot| {
+            let handle = wait_for("the routing handle", Duration::from_secs(10), || {
+                slot.load()
+            });
+            let outcomes = handle.outcomes().expect("one outcome reader");
+            let start = Instant::now();
+            while start.elapsed() < Duration::from_secs(30) {
+                while let Ok(o) = outcomes.try_recv() {
+                    assert_eq!(o.operation_id, "boot:test-sink-1", "{o:?}");
+                    assert_eq!(
+                        o.outcome,
+                        TakeResult::Refused(super::RefuseReason::FeedNotFresh),
+                        "{o:?}"
+                    );
+                    record.lock().unwrap().push(o.tick);
+                }
+                if handle.snapshot().boot_takes_given_up == 1 {
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(5));
             }
-            if handle.snapshot().boot_takes_given_up == 1 {
-                return;
-            }
-            std::thread::sleep(Duration::from_millis(5));
-        }
-        panic!("the boot take was never given up");
-    });
+            panic!("the boot take was never given up");
+        },
+    );
     let ticks = refusals.lock().unwrap().clone();
     // Each attempt waits out the 50-tick prime deadline; a re-issue comes no
     // sooner than 2 s (50 ticks) after the previous issue, and only inside
@@ -1014,16 +1041,24 @@ fn a_never_fresh_boot_feed_is_retried_then_given_up_and_program_is_untouched() {
     assert!(ticks.len() >= 2, "retried: {ticks:?}");
     assert!(ticks.len() <= 5, "bounded: {ticks:?}");
     for pair in ticks.windows(2) {
-        assert!(pair[1] - pair[0] >= 50, "at most one attempt per 2 s: {ticks:?}");
+        assert!(
+            pair[1] - pair[0] >= 50,
+            "at most one attempt per 2 s: {ticks:?}"
+        );
     }
     assert!(
-        ticks.iter().all(|&t| t <= WINDOW_TICKS + super::TAKE_PRIME_DEADLINE_TICKS + 2),
+        ticks
+            .iter()
+            .all(|&t| t <= WINDOW_TICKS + super::TAKE_PRIME_DEADLINE_TICKS + 2),
         "no attempt after the window: {ticks:?}"
     );
     let s = &run.final_snapshot;
     assert_eq!(s.boot_takes_given_up, 1);
     assert_eq!(s.boot_takes_pending, 0);
-    assert!(s.outputs.iter().all(|o| o.bus == "program" && o.pending.is_none()));
+    assert!(s
+        .outputs
+        .iter()
+        .all(|o| o.bus == "program" && o.pending.is_none()));
     assert_eq!(s.dynamic_encoders_live, 0, "no encoder was ever opened");
     assert_eq!(run.frames, TICKS);
     let all: Vec<i64> = (0..i64::try_from(TICKS).unwrap()).collect();

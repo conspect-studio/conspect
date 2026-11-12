@@ -302,7 +302,9 @@ fn enqueue_boot_takes(
         // Bounded like every take id (an HLS config id is its path): cut on a
         // char boundary; the router matches boot takes by prefix and op id.
         let mut operation_id = format!("{}{id}", crate::output_routing::BOOT_TAKE_PREFIX);
-        let mut end = operation_id.len().min(crate::output_routing::MAX_TAKE_ID_BYTES);
+        let mut end = operation_id
+            .len()
+            .min(crate::output_routing::MAX_TAKE_ID_BYTES);
         while !operation_id.is_char_boundary(end) {
             end -= 1;
         }
@@ -1615,7 +1617,10 @@ segment_ms = 1000
             )],
             "one boot take for the routed output"
         );
-        assert!(super::boot_output_feeds(&plain).is_empty(), "Program needs no boot take");
+        assert!(
+            super::boot_output_feeds(&plain).is_empty(),
+            "Program needs no boot take"
+        );
         let layout = MultiviewConfig::load_from_toml(&format!(
             "{DOC}\n[[routing.output]]\noutput = \"o\"\nvideo = {{ layout = \"L\" }}\n"
         ))
@@ -4334,7 +4339,11 @@ impl Pipeline {
     /// the fake sink at the configured output's position.
     #[cfg(test)]
     pub(crate) fn address_boot_feeds_to_test_sinks(&mut self, config: &MultiviewConfig) {
-        let ids: Vec<String> = config.outputs.iter().map(multiview_config::Output::id).collect();
+        let ids: Vec<String> = config
+            .outputs
+            .iter()
+            .map(multiview_config::Output::id)
+            .collect();
         for (id, _) in &mut self.boot_output_feeds {
             if let Some(index) = ids.iter().position(|o| o == id) {
                 *id = format!("test-sink-{index}");
