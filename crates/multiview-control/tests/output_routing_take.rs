@@ -79,7 +79,9 @@ const OUT_B_CONFIG_ID: &str = "hls /tmp/output-routing-take/b/index.m3u8";
 
 /// Scoped to output-1 and bars only (no Program scope, no M/E).
 const SCOPED_ROUTER_TOKEN: &str = "route-scoped.route-scoped-secret";
-/// Scoped to output-1 + the Program scope + me1 (may route buses).
+/// Scoped to output-1 (object AND output axis) + the Program scope + me1 (may
+/// route buses). Its output axis names output-1 explicitly: a key with an
+/// output allowlist may route only the outputs on it (#329 F2).
 const BUS_ROUTER_TOKEN: &str = "route-bus.route-bus-secret";
 /// Scoped to output-0 only.
 const OTHER_OUTPUT_TOKEN: &str = "route-other.route-other-secret";
@@ -104,7 +106,7 @@ fn keys() -> ApiKeyStore {
         scoped(
             "route-bus",
             &["output-1", "me1"],
-            Some(vec!["program:main".to_owned()]),
+            Some(vec!["program:main".to_owned(), "output-1".to_owned()]),
         ),
     );
     keys.register(
