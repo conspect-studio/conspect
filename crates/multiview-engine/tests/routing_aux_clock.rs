@@ -107,8 +107,8 @@ impl<C: FrameControl> FrameControl for Timed<C> {
 }
 
 /// Half a tick at 30000/1001, in nanoseconds (the design's bound for any
-/// clock-side cost, output-routing.md §10): 1001/30000 s / 2 =
-/// 1_001_000_000_000 ns / 30_000 / 2 = 16_683_333 ns (~16.68 ms).
+/// clock-side cost, output-routing.md §10): 1001 / 30000 s / 2 =
+/// 16 683 333 ns (about 16.68 ms).
 const HALF_TICK_NS: u64 = 1_001_000_000_000 / 30_000 / 2;
 
 /// The aux duty's per-tick cost in a real run: max below half a tick.
