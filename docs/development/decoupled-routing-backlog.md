@@ -1,5 +1,13 @@
 # Decoupled routing — PR-sized backlog (RT-0..RT-15)
 
+> **2026-11-12, [ADR-0108](../decisions/ADR-0108-output-routing-matrix.md):** the output lane is
+> re-scoped by the output-routing design ([output-routing.md](../architecture/output-routing.md) §10).
+> RT-12's `OutputRef`/output identity is **reused**; its `PacketRouter` sink-mover is **superseded**
+> for routing (a one-time dispatcher rebind at an IDR). RT-13 is **superseded for routing** (raw
+> switch in front of the output's own encoder, no splice) and stays for ADR-0030 passthrough. RT-15
+> stays **separate** (format migration only, never a route take). RT-16's `OutputRecall` shape is
+> **reused** by slice 5. RT-17 is **superseded** by slice 5 (matrix on `GET /routing` readback).
+
 > Implements [ADR-0034](../decisions/ADR-0034.md) /
 > [decoupled-routing.md](../research/decoupled-routing.md). Dependency-ordered;
 > each item is one reviewable PR. Reuse tags name the surface to build **on**, not
