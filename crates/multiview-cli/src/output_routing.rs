@@ -34,6 +34,8 @@ use crate::rendition_workers::{
     BakedTick, ClosingWorker, DispatchEvent, OfferRejection, RenditionWorker, ReorderBound,
     VideoEncodeWorker,
 };
+pub use crate::routing_audio::AudioChoice;
+use crate::routing_audio::{AudioTakeProgress, AudioTakeStart};
 use crate::routing_aux::{AuxFeed, AuxFeeds, PictureBus, PictureBusSlot};
 
 /// Longest accepted `principal` / `operation_id`, in bytes.
@@ -75,8 +77,11 @@ pub struct OutputTake {
     pub operation_id: String,
     /// Output index in the run's output list.
     pub output_index: usize,
-    /// Destination picture bus.
-    pub bus: PictureBus,
+    /// Destination picture bus (`None`: an audio-only take, the video is
+    /// untouched).
+    pub bus: Option<PictureBus>,
+    /// The output's new audio choice (`None`: keep the current one).
+    pub audio: Option<AudioChoice>,
     /// The principal the encoder is attributed to.
     pub principal: String,
 }
@@ -178,13 +183,18 @@ pub struct TakeOutcome {
     /// The output's bus after this outcome (for `Applied`, the taken bus):
     /// lets the control plane persist an applied take from the outcome alone.
     pub bus: PictureBus,
+    /// The output's audio choice after this outcome (`None` for a run
+    /// without program audio), for persistence.
+    pub audio: Option<AudioChoice>,
 }
 
 /// A pending take, as seen in the snapshot.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PendingView {
-    /// Destination bus name.
+    /// Destination bus name (the current bus for an audio-only take).
     pub bus: String,
+    /// The take's audio choice label, when it carries one.
+    pub audio: Option<String>,
     /// Ticks it has waited.
     pub held_ticks: u64,
 }
@@ -202,6 +212,12 @@ pub struct OutputRouteView {
     pub pending: Option<PendingView>,
     /// The current bus is holding its last picture beyond the degraded bound.
     pub degraded: bool,
+    /// The audio the output carries (once scheduled changes landed):
+    /// `program`, `none`, `src:<id>`, `track:<name>`, `preview`.
+    pub audio: String,
+    /// The output's audio choice: `follow`, `program`, `none`, `src:<id>`,
+    /// `track:<name>`.
+    pub audio_choice: String,
 }
 
 /// Wait-free routing state, written by the consumer only on change.
@@ -272,6 +288,9 @@ pub struct RunOutput {
     /// Whether slice 1 can cut this output cleanly (its encoder family has
     /// the parameter-set RAP check; VAAPI/VideoToolbox do not, §4.2).
     pub routable: bool,
+    /// Whether the output's binding has a program-audio slot, the slot a
+    /// routed audio feed rides (§5.5). `false`: audio takes are refused.
+    pub program_audio: bool,
 }
 
 impl std::fmt::Debug for OutputRoutingHandle {
@@ -571,6 +590,8 @@ enum Phase {
     Warming { key: usize, deadline: u64 },
     /// A dispatcher move to `key` was requested.
     Moving(usize),
+    /// An audio-only take's crossfade is scheduled; refused at `deadline`.
+    AudioMoving { deadline: u64 },
 }
 
 struct Pending {
@@ -924,6 +945,7 @@ impl OutputRouter {
             .outputs
             .get(output_index)
             .map_or(PictureBus::Program, |o| o.bus.clone());
+        let audio = self.audio.as_ref().map(|a| a.choice(output_index));
         if self
             .outcomes
             .try_send(TakeOutcome {
@@ -932,6 +954,7 @@ impl OutputRouter {
                 tick,
                 outcome,
                 bus,
+                audio,
             })
             .is_err()
         {
@@ -946,8 +969,16 @@ impl OutputRouter {
                 Err(TryRecvError::Empty | TryRecvError::Disconnected) => return,
             };
             let index = take.output_index;
-            let needs_switcher = matches!(take.bus, PictureBus::Preview | PictureBus::Clean);
-            let routable = index < self.outputs.len() && (!needs_switcher || self.cfg.has_preview);
+            let needs_switcher = matches!(take.bus, Some(PictureBus::Preview | PictureBus::Clean));
+            // Audio rides the output's program-audio slot (§5.5): a run
+            // without program audio, or an output without that slot (NDI,
+            // AES67, display), cannot take an audio choice.
+            let audio_ok = take.audio.is_none()
+                || (self.audio.is_some() && dispatcher.has_program_audio(index));
+            let routable = index < self.outputs.len()
+                && (!needs_switcher || self.cfg.has_preview)
+                && (take.bus.is_some() || take.audio.is_some())
+                && audio_ok;
             if !routable {
                 self.emit(
                     take.operation_id,
@@ -958,6 +989,7 @@ impl OutputRouter {
                 continue;
             }
             self.supersede(index, tick, dispatcher);
+            let audio_only = take.bus.is_none();
             let Some(out) = self.outputs.get_mut(index) else {
                 continue;
             };
@@ -967,6 +999,67 @@ impl OutputRouter {
                 phase: Phase::Priming,
             });
             self.dirty = true;
+            if audio_only {
+                // Adopted at this drain tick: no fresh gate for audio (a
+                // source without audio is silence, §5.1).
+                self.start_audio_take(index, tick, dispatcher);
+            }
+        }
+    }
+
+    /// Start the pending take's audio change on the output's current video
+    /// bus (an audio-only take, or a combined take whose video is already
+    /// on air).
+    fn start_audio_take(&mut self, index: usize, tick: u64, dispatcher: &mut RenditionDispatcher) {
+        let Some((choice, bus)) = self.outputs.get(index).and_then(|o| {
+            o.pending
+                .as_ref()
+                .and_then(|p| p.take.audio.clone())
+                .map(|c| (c, o.bus.clone()))
+        }) else {
+            return;
+        };
+        let started = self.audio.as_mut().map_or(AudioTakeStart::Refused, |a| {
+            a.take_audio(index, choice, &bus, tick, dispatcher)
+        });
+        match started {
+            AudioTakeStart::Unchanged => {
+                if let Some(p) = self.outputs.get_mut(index).and_then(|o| o.pending.take()) {
+                    self.emit(p.take.operation_id, index, tick, TakeResult::Applied);
+                }
+            }
+            AudioTakeStart::Refused => {
+                self.refuse_pending(index, tick, RefuseReason::EncoderNotReady, dispatcher);
+            }
+            AudioTakeStart::Started => {
+                if let Some(p) = self.outputs.get_mut(index).and_then(|o| o.pending.as_mut()) {
+                    p.phase = Phase::AudioMoving {
+                        deadline: tick.saturating_add(TAKE_PRIME_DEADLINE_TICKS),
+                    };
+                }
+            }
+        }
+    }
+
+    /// The pending take ended without applying: undo its audio (restore the
+    /// choice; audio already scheduled fades back).
+    fn abandon_audio(
+        &mut self,
+        index: usize,
+        phase: Phase,
+        tick: u64,
+        dispatcher: &mut RenditionDispatcher,
+    ) {
+        let bus = self
+            .outputs
+            .get(index)
+            .map_or(PictureBus::Program, |o| o.bus.clone());
+        if let Some(audio) = self.audio.as_mut() {
+            if matches!(phase, Phase::AudioMoving { .. }) {
+                audio.finish_take(index, false, &bus, tick, dispatcher);
+            } else {
+                audio.video_refused(index, tick, dispatcher);
+            }
         }
     }
 
@@ -978,10 +1071,8 @@ impl OutputRouter {
         };
         if matches!(old.phase, Phase::Moving(_)) {
             self.cancel_dispatcher_move(index, dispatcher, tick);
-            if let Some(audio) = self.audio.as_mut() {
-                audio.video_refused(index, tick);
-            }
         }
+        self.abandon_audio(index, old.phase, tick, dispatcher);
         if let Phase::Opening(id) = old.phase {
             if let Some(open) = self.opens.get_mut(&id) {
                 open.waiter = None;
@@ -1012,13 +1103,13 @@ impl OutputRouter {
             };
             self.dirty = true;
             let waiter = open.waiter;
-            let refuse = |router: &mut Self| {
+            let refuse = |router: &mut Self, dispatcher: &mut RenditionDispatcher| {
                 if let Some(index) = waiter {
-                    router.refuse_pending(index, tick, RefuseReason::EncoderNotReady);
+                    router.refuse_pending(index, tick, RefuseReason::EncoderNotReady, dispatcher);
                 }
             };
             let Ok(mut encoder) = result.encoder else {
-                refuse(self);
+                refuse(self, dispatcher);
                 continue;
             };
             let tb = encoder.time_base();
@@ -1034,7 +1125,7 @@ impl OutputRouter {
             let Some(index) = waiting.filter(|_| tick < open.deadline) else {
                 self.reap(Reap::Encoder(encoder));
                 if waiting.is_some() {
-                    refuse(self);
+                    refuse(self, dispatcher);
                 }
                 continue;
             };
@@ -1048,7 +1139,7 @@ impl OutputRouter {
                 gate,
             ) else {
                 self.reap(Reap::Encoder(encoder));
-                refuse(self);
+                refuse(self, dispatcher);
                 continue;
             };
             if let Some(params) = encoder.parameter_sets() {
@@ -1068,7 +1159,7 @@ impl OutputRouter {
                 self.spawn_live_worker(key, generation, tb, Box::new(worker), Arc::clone(&lost));
             let Ok(worker) = spawned else {
                 let _ = dispatcher.retire_video_key(key);
-                refuse(self);
+                refuse(self, dispatcher);
                 continue;
             };
             self.last_forced.insert(key, tick);
@@ -1134,9 +1225,20 @@ impl OutputRouter {
         })
     }
 
-    fn refuse_pending(&mut self, index: usize, tick: u64, reason: RefuseReason) {
-        if let Some(audio) = self.audio.as_mut() {
-            audio.video_refused(index, tick);
+    fn refuse_pending(
+        &mut self,
+        index: usize,
+        tick: u64,
+        reason: RefuseReason,
+        dispatcher: &mut RenditionDispatcher,
+    ) {
+        let phase = self
+            .outputs
+            .get(index)
+            .and_then(|o| o.pending.as_ref())
+            .map(|p| p.phase);
+        if let Some(phase) = phase {
+            self.abandon_audio(index, phase, tick, dispatcher);
         }
         if let Some(p) = self.outputs.get_mut(index).and_then(|o| o.pending.take()) {
             self.emit(
@@ -1167,9 +1269,14 @@ impl OutputRouter {
                     let expected = matches!(out.pending.as_ref().map(|p| p.phase), Some(Phase::Moving(k)) if k == key);
                     if expected {
                         if let Some(p) = out.pending.take() {
-                            out.bus = p.take.bus.clone();
+                            if let Some(bus) = p.take.bus.clone() {
+                                out.bus = bus;
+                            }
                             out.key = key;
                             out.since = at;
+                            if let Some(audio) = self.audio.as_mut() {
+                                audio.video_applied(output_index);
+                            }
                             self.emit(p.take.operation_id, output_index, at, TakeResult::Applied);
                         }
                     } else if out.key != key {
@@ -1195,16 +1302,19 @@ impl OutputRouter {
                                 RefuseReason::EncoderNotReady
                             }
                         };
-                        self.refuse_pending(output_index, tick, reason);
+                        self.refuse_pending(output_index, tick, reason, dispatcher);
                     }
                 }
-                MoveOutcome::Superseded { .. }
-                | MoveOutcome::AudioApplied { .. }
-                | MoveOutcome::AudioRefused { .. }
-                | MoveOutcome::AudioFallback { .. } => {}
+                MoveOutcome::Superseded { .. } | MoveOutcome::AudioFallback { .. } => {}
+                MoveOutcome::AudioApplied { .. } | MoveOutcome::AudioRefused { .. } => {
+                    if let Some(audio) = self.audio.as_mut() {
+                        audio.on_outcome(&outcome, dispatcher);
+                    }
+                    self.dirty = true;
+                }
                 MoveOutcome::Fallback { output_index } => {
                     if let Some(audio) = self.audio.as_mut() {
-                        audio.follow(output_index, &PictureBus::Program, tick, None, dispatcher);
+                        audio.fallback(output_index, &PictureBus::Program, tick, None, dispatcher);
                     }
                     if let Some(out) = self.outputs.get_mut(output_index) {
                         out.bus = PictureBus::Program;
@@ -1264,7 +1374,7 @@ impl OutputRouter {
                         out.bus = PictureBus::Program;
                     }
                     if let Some(audio) = self.audio.as_mut() {
-                        audio.follow(index, &PictureBus::Program, tick, Some(base), dispatcher);
+                        audio.fallback(index, &PictureBus::Program, tick, Some(base), dispatcher);
                     }
                     self.emit(
                         String::new(),
@@ -1320,20 +1430,30 @@ impl OutputRouter {
 
     fn advance_takes(&mut self, tick: u64, pts: MediaTime, dispatcher: &mut RenditionDispatcher) {
         for index in 0..self.outputs.len() {
-            let Some((bus, started, phase, principal)) = self.outputs.get(index).and_then(|o| {
-                o.pending.as_ref().map(|p| {
-                    (
-                        p.take.bus.clone(),
-                        p.started,
-                        p.phase,
-                        p.take.principal.clone(),
-                    )
+            let Some((bus, choice, started, phase, principal)) =
+                self.outputs.get(index).and_then(|o| {
+                    o.pending.as_ref().map(|p| {
+                        (
+                            p.take.bus.clone(),
+                            p.take.audio.clone(),
+                            p.started,
+                            p.phase,
+                            p.take.principal.clone(),
+                        )
+                    })
                 })
-            }) else {
+            else {
+                continue;
+            };
+            if let Phase::AudioMoving { deadline } = phase {
+                self.advance_audio_take(index, tick, deadline, dispatcher);
+                continue;
+            }
+            let Some(bus) = bus else {
                 continue;
             };
             match phase {
-                Phase::Moving(_) => {}
+                Phase::Moving(_) | Phase::AudioMoving { .. } => {}
                 Phase::Warming { key, deadline } => {
                     let seen = self
                         .dynamic
@@ -1341,7 +1461,7 @@ impl OutputRouter {
                         .find(|d| d.key == key)
                         .map(|d| d.seen_event);
                     if tick >= deadline || seen.is_none() || dispatcher.is_key_failed(key) {
-                        self.refuse_pending(index, tick, RefuseReason::EncoderNotReady);
+                        self.refuse_pending(index, tick, RefuseReason::EncoderNotReady, dispatcher);
                     } else if seen == Some(true) {
                         // The key has no subscriber yet: an IDR on it costs no
                         // viewer anything, so the warm-up force skips the floor.
@@ -1358,10 +1478,15 @@ impl OutputRouter {
                                 p.phase = Phase::Moving(key);
                             }
                             if let Some(audio) = self.audio.as_mut() {
-                                audio.follow(index, &bus, at, Some(key), dispatcher);
+                                audio.follow(index, &bus, choice, at, Some(key), dispatcher);
                             }
                         } else {
-                            self.refuse_pending(index, tick, RefuseReason::EncoderNotReady);
+                            self.refuse_pending(
+                                index,
+                                tick,
+                                RefuseReason::EncoderNotReady,
+                                dispatcher,
+                            );
                         }
                     }
                 }
@@ -1370,26 +1495,73 @@ impl OutputRouter {
                     if late {
                         // The result, if it ever comes, goes to the reaper.
                         self.opens.remove(&id);
-                        self.refuse_pending(index, tick, RefuseReason::EncoderNotReady);
+                        self.refuse_pending(index, tick, RefuseReason::EncoderNotReady, dispatcher);
                     }
                 }
                 Phase::Priming => {
                     let current = self.outputs.get(index).map(|o| o.bus.clone());
                     if current.as_ref() == Some(&bus) {
-                        if let Some(p) = self.outputs.get_mut(index).and_then(|o| o.pending.take())
+                        self.cancel_dispatcher_move(index, dispatcher, tick);
+                        if choice.is_some() {
+                            // The video is already on air: the audio alone.
+                            self.start_audio_take(index, tick, dispatcher);
+                        } else if let Some(p) =
+                            self.outputs.get_mut(index).and_then(|o| o.pending.take())
                         {
-                            self.cancel_dispatcher_move(index, dispatcher, tick);
                             self.emit(p.take.operation_id, index, tick, TakeResult::Applied);
                         }
                         continue;
                     }
                     if !self.feed_fresh(&bus, tick, pts) {
                         if tick.saturating_sub(started) >= TAKE_PRIME_DEADLINE_TICKS {
-                            self.refuse_pending(index, tick, RefuseReason::FeedNotFresh);
+                            self.refuse_pending(
+                                index,
+                                tick,
+                                RefuseReason::FeedNotFresh,
+                                dispatcher,
+                            );
                         }
                         continue;
                     }
-                    self.start_move(index, &bus, &principal, tick, dispatcher);
+                    self.start_move(index, &bus, choice.as_ref(), &principal, tick, dispatcher);
+                }
+            }
+        }
+    }
+
+    /// An audio-only take in flight: applied once on air (the tick whose
+    /// block holds `G`), refused when its bus fails or at `deadline`.
+    fn advance_audio_take(
+        &mut self,
+        index: usize,
+        tick: u64,
+        deadline: u64,
+        dispatcher: &mut RenditionDispatcher,
+    ) {
+        let progress = self
+            .audio
+            .as_ref()
+            .map_or(AudioTakeProgress::Failed, |a| a.take_progress(index));
+        match progress {
+            AudioTakeProgress::Done(g) => {
+                let bus = self
+                    .outputs
+                    .get(index)
+                    .map_or(PictureBus::Program, |o| o.bus.clone());
+                let at = self.audio.as_mut().map_or(tick, |a| {
+                    a.finish_take(index, true, &bus, tick, dispatcher);
+                    a.tick_of_sample(g)
+                });
+                if let Some(p) = self.outputs.get_mut(index).and_then(|o| o.pending.take()) {
+                    self.emit(p.take.operation_id, index, at, TakeResult::Applied);
+                }
+            }
+            AudioTakeProgress::Failed => {
+                self.refuse_pending(index, tick, RefuseReason::EncoderNotReady, dispatcher);
+            }
+            AudioTakeProgress::Waiting => {
+                if tick >= deadline {
+                    self.refuse_pending(index, tick, RefuseReason::EncoderNotReady, dispatcher);
                 }
             }
         }
@@ -1399,6 +1571,7 @@ impl OutputRouter {
         &mut self,
         index: usize,
         bus: &PictureBus,
+        choice: Option<&AudioChoice>,
         principal: &str,
         tick: u64,
         dispatcher: &mut RenditionDispatcher,
@@ -1409,7 +1582,7 @@ impl OutputRouter {
         // Take admission: open the output's private audio bus before the
         // video move (§5.2), so it is warm at the grid boundary G.
         if let Some(audio) = self.audio.as_mut() {
-            audio.admit(index, bus, tick, dispatcher);
+            audio.admit(index, bus, choice, tick, dispatcher);
         }
         let existing = if *bus == PictureBus::Program {
             Some(settings)
@@ -1444,7 +1617,7 @@ impl OutputRouter {
             if dispatcher.rebind_video(index, key, tick, windows).is_ok() {
                 set(self, Phase::Moving(key));
                 if let Some(audio) = self.audio.as_mut() {
-                    audio.follow(index, bus, tick, Some(key), dispatcher);
+                    audio.follow(index, bus, choice.cloned(), tick, Some(key), dispatcher);
                 }
                 // A re-take of a lingering key adopts it (re-attributed,
                 // linger cleared). A key another output still subscribes
@@ -1457,7 +1630,7 @@ impl OutputRouter {
                     d.linger_deadline = None;
                 }
             } else {
-                self.refuse_pending(index, tick, RefuseReason::EncoderNotReady);
+                self.refuse_pending(index, tick, RefuseReason::EncoderNotReady, dispatcher);
             }
             return;
         }
@@ -1468,7 +1641,7 @@ impl OutputRouter {
             }
         }
         if !self.has_capacity(principal) {
-            self.refuse_pending(index, tick, RefuseReason::Capacity);
+            self.refuse_pending(index, tick, RefuseReason::Capacity, dispatcher);
             return;
         }
         let id = self.next_open;
@@ -1491,7 +1664,7 @@ impl OutputRouter {
                 self.dirty = true;
             }
             Err(TrySendError::Full(_) | TrySendError::Disconnected(_)) => {
-                self.refuse_pending(index, tick, RefuseReason::Capacity);
+                self.refuse_pending(index, tick, RefuseReason::Capacity, dispatcher);
             }
         }
     }
@@ -1668,7 +1841,7 @@ impl OutputRouter {
         wanted.extend(
             self.outputs
                 .iter()
-                .filter_map(|o| o.pending.as_ref().map(|p| p.take.bus.clone())),
+                .filter_map(|o| o.pending.as_ref().and_then(|p| p.take.bus.clone())),
         );
         wanted.retain(|b| *b != PictureBus::Program);
         let unchanged = wanted.iter().all(|b| self.feeds.contains_key(b))
@@ -1723,18 +1896,28 @@ impl OutputRouter {
         let outputs = self
             .outputs
             .iter()
-            .map(|o| OutputRouteView {
+            .enumerate()
+            .map(|(i, o)| OutputRouteView {
                 bus: o.bus.as_str().into_owned(),
                 key: format!("{}/{}", o.bus.as_str(), o.key),
                 since_tick: o.since,
                 pending: o.pending.as_ref().map(|p| PendingView {
-                    bus: p.take.bus.as_str().into_owned(),
+                    bus: p.take.bus.as_ref().unwrap_or(&o.bus).as_str().into_owned(),
+                    audio: p.take.audio.as_ref().map(AudioChoice::label),
                     held_ticks: tick.saturating_sub(p.started),
                 }),
                 degraded: self
                     .health
                     .get(&o.bus)
                     .is_some_and(|h| h.held >= DEGRADED_AFTER_TICKS),
+                audio: self
+                    .audio
+                    .as_ref()
+                    .map_or_else(|| "program".to_owned(), |a| a.carried_label(i)),
+                audio_choice: self
+                    .audio
+                    .as_ref()
+                    .map_or_else(|| "follow".to_owned(), |a| a.choice(i).label()),
             })
             .collect();
         let next = RoutingSnapshot {

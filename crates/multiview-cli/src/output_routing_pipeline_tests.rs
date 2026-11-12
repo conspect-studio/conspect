@@ -245,7 +245,8 @@ fn take(op: &str, output: usize, bus: PictureBus) -> OutputTake {
     OutputTake {
         operation_id: op.to_owned(),
         output_index: output,
-        bus,
+        bus: Some(bus),
+        audio: None,
         principal: "operator".to_owned(),
     }
 }

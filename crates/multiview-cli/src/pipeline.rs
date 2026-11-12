@@ -3414,6 +3414,7 @@ impl Pipeline {
     fn build_output_routing(
         &self,
         binding_ids: &[Option<String>],
+        audio_tracks: &[Vec<usize>],
     ) -> Result<RunRouting, PipelineError> {
         let spawn_err = |e: std::io::Error| PipelineError::Output {
             kind: "routing",
@@ -3495,6 +3496,9 @@ impl Pipeline {
                 routable: self.rendition_configs.get(settings).is_some_and(|cfg| {
                     !(cfg.codec_name.contains("vaapi") || cfg.codec_name.contains("videotoolbox"))
                 }),
+                // The routed audio rides the binding's program-audio slot
+                // (track 0, present only when this run encodes program audio).
+                program_audio: audio_tracks.get(index).is_some_and(|t| t.contains(&0)),
             })
             .collect();
         self.output_routing
@@ -4847,7 +4851,7 @@ impl Pipeline {
         // Output routing (ADR-0108 slice 1): the clock's aux tick sender (inert
         // until a take routes a feed), the off-clock `routing-aux` thread (it
         // blocks on recv while nothing is routed), and the consumer's router.
-        let routing = self.build_output_routing(&binding_ids)?;
+        let routing = self.build_output_routing(&binding_ids, &enforced_audio_tracks)?;
         let RunRouting {
             consumer: consumer_routing,
             aux_tx,

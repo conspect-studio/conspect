@@ -223,7 +223,8 @@ fn take(op: &str, output: usize, bus: PictureBus) -> OutputTake {
     OutputTake {
         operation_id: op.to_owned(),
         output_index: output,
-        bus,
+        bus: Some(bus),
+        audio: None,
         principal: "p".to_owned(),
     }
 }
@@ -1459,16 +1460,19 @@ fn the_control_adapter_maps_renamed_ids_to_their_own_index() {
             id: None,
             settings: 0,
             routable: true,
+            program_audio: true,
         },
         RunOutput {
             id: Some("renamed".into()),
             settings: 0,
             routable: true,
+            program_audio: true,
         },
         RunOutput {
             id: Some("zz-first".into()),
             settings: 0,
             routable: false,
+            program_audio: true,
         },
     ]);
     let slot = output_routing_slot();
@@ -1843,11 +1847,13 @@ fn the_plan_counts_a_lingering_encoder_as_plus_zero() {
             id: Some("a".into()),
             settings: 0,
             routable: true,
+            program_audio: true,
         },
         RunOutput {
             id: Some("b".into()),
             settings: 0,
             routable: true,
+            program_audio: true,
         },
     ]);
     let slot = output_routing_slot();
