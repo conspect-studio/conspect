@@ -264,18 +264,26 @@ pub const HANDOFF_LEAD_TICKS: u64 = 2;
 /// emit path) until the cut is known, skips its clock to `cut` and emits from
 /// there. Because OLD picks a cut strictly ahead of anything it has emitted
 /// and stops exactly below it, and NEW starts exactly at it, no tick index is
-/// missed or emitted twice. Two atomics; no lock, no await, no channel.
+/// missed or emitted twice. One atomic state (compare-and-swap transitions); no lock, no await, no channel. A
+/// rolled-back request is withdrawn with [`Handoff::retract`].
 #[derive(Debug)]
 pub struct Handoff {
-    requested: AtomicBool,
-    cut: AtomicU64,
+    /// One atomic state: `HANDOFF_IDLE`, `HANDOFF_REQUESTED`, or the cut tick.
+    /// Every transition is a compare-and-swap, so a request, the outgoing
+    /// loop's cut choice and a rollback's [`Handoff::retract`] can never race
+    /// into an inconsistent state.
+    state: AtomicU64,
 }
+
+/// No handoff requested.
+const HANDOFF_IDLE: u64 = u64::MAX;
+/// Requested; the outgoing loop has not chosen a cut yet.
+const HANDOFF_REQUESTED: u64 = u64::MAX - 1;
 
 impl Default for Handoff {
     fn default() -> Self {
         Self {
-            requested: AtomicBool::new(false),
-            cut: AtomicU64::new(u64::MAX),
+            state: AtomicU64::new(HANDOFF_IDLE),
         }
     }
 }
@@ -287,37 +295,66 @@ impl Handoff {
         Arc::new(Self::default())
     }
 
-    /// Ask the outgoing program to hand off at its next frame boundary.
+    /// Ask the outgoing program to hand off at its next frame boundary. A
+    /// no-op if already requested or cut.
     pub fn request(&self) {
-        self.requested.store(true, Ordering::Release);
+        let _ = self.state.compare_exchange(
+            HANDOFF_IDLE,
+            HANDOFF_REQUESTED,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
+    }
+
+    /// Withdraw a request whose cut has not been chosen (a rolled-back
+    /// migration): the outgoing program then simply keeps running.
+    ///
+    /// # Errors
+    ///
+    /// `Err(cut)` when the outgoing program already chose its cut: the
+    /// handoff happened and cannot be withdrawn.
+    pub fn retract(&self) -> Result<(), u64> {
+        match self.state.compare_exchange(
+            HANDOFF_REQUESTED,
+            HANDOFF_IDLE,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) | Err(HANDOFF_IDLE) => Ok(()),
+            Err(cut) => Err(cut),
+        }
     }
 
     /// The agreed cut tick, once the outgoing program has chosen it.
     #[must_use]
     pub fn cut(&self) -> Option<u64> {
-        let cut = self.cut.load(Ordering::Acquire);
-        (cut != u64::MAX).then_some(cut)
+        let state = self.state.load(Ordering::Acquire);
+        (state < HANDOFF_REQUESTED).then_some(state)
     }
 
-    /// OLD side, on loop exit: if a handoff was requested and no cut chosen
+    /// OLD side, on loop exit: if a handoff is requested and no cut chosen
     /// yet, the cut is `next` (the first tick OLD did not emit).
     fn cut_for_outgoing_at_exit(&self, next: u64) {
-        if self.requested.load(Ordering::Acquire) && self.cut().is_none() {
-            self.cut.store(next, Ordering::Release);
-        }
+        let _ = self.state.compare_exchange(
+            HANDOFF_REQUESTED,
+            next.min(HANDOFF_REQUESTED - 1),
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
     }
 
-    /// OLD side: choose the cut if requested and not yet chosen; return it.
-    fn cut_for_outgoing(&self, next: u64) -> Option<u64> {
-        if let Some(cut) = self.cut() {
-            return Some(cut);
-        }
-        if !self.requested.load(Ordering::Acquire) {
-            return None;
-        }
-        let cut = next.saturating_add(HANDOFF_LEAD_TICKS);
-        self.cut.store(cut, Ordering::Release);
-        Some(cut)
+    /// OLD side, at a frame boundary: choose the cut if requested and not yet
+    /// chosen.
+    fn cut_for_outgoing(&self, next: u64) {
+        let cut = next
+            .saturating_add(HANDOFF_LEAD_TICKS)
+            .min(HANDOFF_REQUESTED - 1);
+        let _ = self.state.compare_exchange(
+            HANDOFF_REQUESTED,
+            cut,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
     }
 }
 

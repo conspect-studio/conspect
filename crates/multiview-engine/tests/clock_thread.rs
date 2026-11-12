@@ -447,6 +447,107 @@ fn a_successor_starts_when_its_predecessor_stops_before_choosing_a_cut() {
     assert_eq!(*first.lock().unwrap(), Some(10));
 }
 
+#[test]
+fn a_retracted_request_leaves_the_predecessor_running() {
+    // Request then retract before OLD reaches a boundary: OLD keeps emitting
+    // and never hands off; a retract after the cut reports the cut.
+    let handoff = multiview_engine::Handoff::default();
+    handoff.request();
+    assert_eq!(handoff.retract(), Ok(()));
+    assert_eq!(handoff.cut(), None);
+    let cadence = Rational::FPS_25;
+    let time = Arc::new(ManualTimeSource::new());
+    let ts: Arc<dyn TimeSource> = time.clone();
+    let mut old = EngineRuntime::new(
+        OutputClock::new(cadence).unwrap(),
+        drive(cadence),
+        ts,
+        JumpPacer(Arc::clone(&time)),
+    );
+    let cell = old.handoff();
+    cell.request();
+    assert_eq!(cell.retract(), Ok(()));
+    let publisher: EnginePublisher<u64, ()> = EnginePublisher::new(8);
+    let outcome = clock_thread::block_on(old.run_for(
+        &publisher,
+        &StopSignal::new(),
+        50,
+        |f: &CompositedFrame| f.tick.index,
+        |_f: &CompositedFrame| None::<()>,
+    ))
+    .unwrap();
+    assert_eq!((outcome.ticks, outcome.stop), (50, RunStop::Completed));
+    assert_eq!(cell.cut(), None, "no cut after a retract, not even at exit");
+    cell.request();
+    clock_thread::block_on(old.run_for(
+        &publisher,
+        &StopSignal::new(),
+        5,
+        |f: &CompositedFrame| f.tick.index,
+        |_f: &CompositedFrame| None::<()>,
+    ))
+    .unwrap();
+    let cut = cell.cut().unwrap();
+    assert_eq!(cell.retract(), Err(cut), "a chosen cut cannot be withdrawn");
+}
+
+#[test]
+fn a_rolled_back_successor_leaves_a_slow_predecessor_alive_and_ticking() {
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .unwrap();
+    rt.block_on(async {
+        // OLD at 1/4 fps: after tick 0 it sleeps 4 s, longer than the 2 s
+        // handoff grace, so start_successor times out and rolls back. OLD
+        // must then keep running and emit tick 1, never hand off.
+        let cadence = Rational::new(1, 4);
+        let time: Arc<dyn TimeSource> = Arc::new(MonotonicTimeSource::new());
+        let mut set: ProgramSet<RealtimePacer> = ProgramSet::new(Arc::clone(&time));
+        let old = Program::multiview(
+            &spec("main", cadence),
+            OutputClock::new(cadence).unwrap(),
+            drive(cadence),
+            Arc::clone(&time),
+            RealtimePacer,
+        )
+        .unwrap();
+        let old_ticks = old.ticks_counter();
+        set.start(old).unwrap();
+        let started = Instant::now();
+        while old_ticks.load(Ordering::Acquire) < 1 {
+            assert!(started.elapsed() < Duration::from_secs(30));
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+        let new = Program::multiview_succeeding(
+            &spec("main.migrating", cadence),
+            OutputClock::new(cadence).unwrap(),
+            drive(cadence),
+            Arc::clone(&time),
+            RealtimePacer,
+            set.seed_nanos("main").unwrap(),
+            |_| {},
+        )
+        .unwrap();
+        let rolled_back = set.start_successor("main", new).await;
+        assert!(
+            rolled_back.is_err(),
+            "OLD was asleep past the grace: rollback"
+        );
+        assert!(!set.is_running("main.migrating"));
+        while old_ticks.load(Ordering::Acquire) < 2 {
+            assert!(
+                started.elapsed() < Duration::from_secs(30),
+                "OLD kept ticking after the rollback"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(set.is_running("main"));
+        set.shutdown().await;
+    });
+}
+
 /// An actor that fails `fail_first` times, then completes; counts its runs.
 struct Flaky {
     runs: Arc<AtomicU64>,

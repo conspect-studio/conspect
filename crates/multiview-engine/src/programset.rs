@@ -630,8 +630,9 @@ impl<P: Pacer + Send + 'static> ProgramSet<P> {
     ///
     /// Returns the cut once the predecessor has chosen it (within a tick). If
     /// it has not within [`PROGRAM_JOIN_GRACE`] (a wedged predecessor), the
-    /// successor is stopped and removed again (rollback; the predecessor keeps
-    /// running untouched) and an [`Error::InvalidControlLoop`] is returned.
+    /// request is withdrawn ([`Handoff::retract`](crate::runtime::Handoff::retract)),
+    /// the successor is stopped and removed again (rollback; the predecessor
+    /// keeps running untouched) and an [`Error::InvalidControlLoop`] is returned.
     ///
     /// # Errors
     ///
@@ -683,12 +684,13 @@ impl<P: Pacer + Send + 'static> ProgramSet<P> {
             }
             tokio::time::sleep(std::time::Duration::from_millis(1)).await;
         }
-        if let Some(cut) = handoff.cut() {
+        // Rollback: the predecessor never reached a frame boundary (wedged).
+        // Withdraw the request atomically so the predecessor keeps running
+        // untouched when it unsticks; if it chose a cut in the meantime the
+        // handoff did happen and NEW must stay.
+        if let Err(cut) = handoff.retract() {
             return Ok(cut);
         }
-        // Rollback: the predecessor never reached a frame boundary (wedged).
-        // A request without a cut stays harmless: the predecessor cuts at its
-        // next boundary or exit, and nobody is waiting any more.
         self.stop(&successor_id).await;
         Err(Error::InvalidControlLoop(format!(
             "{predecessor} did not hand off within {} ms; successor rolled back",

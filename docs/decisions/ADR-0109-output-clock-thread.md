@@ -146,11 +146,13 @@ Edge cases, each with a test:
   before it chose a cut, the exit publishes `cut = next` (the first tick it did
   not emit), so NEW never waits for a predecessor that is gone.
 * OLD's clock never rewinds, so a re-run of OLD after a handoff emits nothing.
-* If OLD does not choose a cut within the 2 s grace (a wedged loop),
-  `start_successor` stops and removes NEW again and returns an error (rollback;
-  OLD untouched).
+* If OLD does not choose a cut within the 2 s grace (a wedged or slow loop),
+  `start_successor` withdraws the request (`Handoff::retract`, a compare-and-swap
+  that fails only if OLD chose a cut meanwhile, in which case the handoff stands),
+  stops and removes NEW and returns an error. OLD keeps running untouched.
 
-The cut is two atomics (no lock, no channel, no await). Because OLD chooses a cut
+The handoff state is one atomic (idle / requested / cut), every transition a
+compare-and-swap: no lock, no channel, no await. Because OLD chooses a cut
 strictly ahead of everything it has emitted and never emits it, and NEW begins
 exactly at it, the union of both programs' emitted indices is contiguous with no
 duplicate. The existing make-before-break crosspoint (`OutputCrosspoint`) and
