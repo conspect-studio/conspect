@@ -43,7 +43,7 @@ impl SwitcherCanvasRefusal {
     pub fn operator_message(&self) -> String {
         match self {
             Self::CellCount(n) => format!(
-                "The switcher is on: a multi-cell layout cannot be the Program canvas ({n} cells; the switcher needs exactly one full-canvas cell)."
+                "The switcher is on: a multi-cell layout cannot be the Program canvas. This layout has {n} cells; the switcher needs exactly one full-canvas cell."
             ),
             Self::Overlays(n) => format!(
                 "The switcher is on: overlays cannot be added to the Program canvas ({n} declared)."
@@ -181,7 +181,7 @@ mod tests {
             ""
         };
         let text = format!(
-            "schema_version = 1\n[canvas]\nwidth = 64\nheight = 64\nfps = \"25/1\"\n[layout]\nkind = \"absolute\"\n[[sources]]\nid = \"a\"\nkind = \"bars\"\n[[sources]]\nid = \"b\"\nkind = \"bars\"\n{cells}[[outputs]]\nkind = \"hls\"\npath = \"/tmp/x.m3u8\"\ncodec = \"mpeg2video\"\nsegment_ms = 1000\n{sw}"
+            "schema_version = 1\n[canvas]\nwidth = 64\nheight = 64\nfps = \"25/1\"\npixel_format = \"nv12\"\nbackground = \"#101014\"\n[canvas.color]\nprofile = \"sdr-bt709-limited\"\n[layout]\nkind = \"absolute\"\n[[sources]]\nid = \"a\"\nkind = \"bars\"\n[[sources]]\nid = \"b\"\nkind = \"bars\"\n{cells}[[outputs]]\nkind = \"hls\"\npath = \"/tmp/x.m3u8\"\ncodec = \"mpeg2video\"\nsegment_ms = 1000\n{sw}"
         );
         MultiviewConfig::load_from_toml(&text).expect("fixture parses")
     }

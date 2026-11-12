@@ -29,6 +29,25 @@ pub struct ValidationReport {
     /// ignored). Empty when the document did not parse or nothing applies.
     /// Rendered as `WARN` lines so the operator sees them.
     pub warnings: Vec<String>,
+    /// What the engine will REALLY start from (#317): the accepted state
+    /// (`<config-dir>/.multiview/desired.json`) when one exists, else the boot
+    /// document, checked with the start-up admission rule. `None` when the boot
+    /// document itself did not validate.
+    pub start: Option<StartCheck>,
+}
+
+/// The start-up check of a [`ValidationReport`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct StartCheck {
+    /// The document the engine starts from: the accepted-state file, or the boot
+    /// file when no accepted state exists.
+    pub source: PathBuf,
+    /// Whether that is the accepted state (`desired.json`).
+    pub accepted: bool,
+    /// `None` when the engine can start from it, else the exact reason start-up
+    /// would give.
+    pub refusal: Option<String>,
 }
 
 /// Whether a config validated, and if not, the human-readable reason.
@@ -56,8 +75,12 @@ pub enum ValidationStatus {
 impl ValidationReport {
     /// Whether the document validated cleanly.
     #[must_use]
-    pub const fn is_ok(&self) -> bool {
+    pub fn is_ok(&self) -> bool {
         matches!(self.status, ValidationStatus::Ok { .. })
+            && self
+                .start
+                .as_ref()
+                .is_none_or(|start| start.refusal.is_none())
     }
 
     /// Render the report as the multi-line text the binary prints. Non-fatal
@@ -76,6 +99,20 @@ impl ValidationReport {
                 format!("FAIL {path}\n     invalid configuration: {reason}")
             }
         };
+        if let Some(start) = &self.start {
+            let what = if start.accepted {
+                "accepted state (the engine starts from this, not the boot file)"
+            } else {
+                "boot document (no accepted state yet)"
+            };
+            let source = start.source.display();
+            match &start.refusal {
+                None => out.push_str(&format!("\nOK   start: {what}\n     {source}")),
+                Some(reason) => out.push_str(&format!(
+                    "\nFAIL start: {what}\n     {source}\n     the engine would refuse to start: {reason}"
+                )),
+            }
+        }
         for warning in &self.warnings {
             out.push_str("\nWARN ");
             out.push_str(warning);
@@ -108,6 +145,7 @@ pub fn validate_config(path: &Path) -> anyhow::Result<ValidationReport> {
                     reason: err.to_string(),
                 },
                 warnings: Vec::new(),
+                start: None,
             });
         }
     };
@@ -121,6 +159,7 @@ pub fn validate_config(path: &Path) -> anyhow::Result<ValidationReport> {
                     reason: format!("parse: {err}"),
                 },
                 warnings: Vec::new(),
+                start: None,
             });
         }
     };
@@ -130,20 +169,49 @@ pub fn validate_config(path: &Path) -> anyhow::Result<ValidationReport> {
     let warnings = config_warnings(&config);
 
     match config.validate() {
-        Ok(()) => Ok(ValidationReport {
-            path: path.to_path_buf(),
-            status: ValidationStatus::Ok {
-                summary: summarize(&config),
-            },
-            warnings,
-        }),
+        Ok(()) => {
+            let summary = summarize(&config);
+            let start = start_check(config, text, path);
+            Ok(ValidationReport {
+                path: path.to_path_buf(),
+                status: ValidationStatus::Ok { summary },
+                warnings,
+                start: Some(start),
+            })
+        }
         Err(err) => Ok(ValidationReport {
             path: path.to_path_buf(),
             status: ValidationStatus::Invalid {
                 reason: err.to_string(),
             },
             warnings,
+            start: None,
         }),
+    }
+}
+
+/// Resolve what `multiview run` would start from — the SAME
+/// [`crate::boot::resolve_start_config`] start-up calls — and apply the SAME
+/// start-up admission rule `Pipeline::build` enforces
+/// ([`multiview_config::boot_admission`]). Read-only: nothing is written.
+fn start_check(boot: MultiviewConfig, text: String, path: &Path) -> StartCheck {
+    let desired = multiview_control::boot_model::state_dir_for(path).join("desired.json");
+    let accepted = desired.exists();
+    let source = if accepted {
+        desired
+    } else {
+        path.to_path_buf()
+    };
+    let refusal = match crate::boot::resolve_start_config(boot, text, path) {
+        Err(reason) => Some(reason),
+        Ok(start) => multiview_config::boot_admission(&start.running)
+            .err()
+            .map(|e| e.to_string()),
+    };
+    StartCheck {
+        source,
+        accepted,
+        refusal,
     }
 }
 
