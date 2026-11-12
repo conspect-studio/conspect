@@ -182,24 +182,67 @@ impl DesiredState {
     }
 }
 
+/// The start-up admission rule (the same `multiview_config` function
+/// `Pipeline::build` enforces) applied to an already-validated document.
+/// Pure CPU on the control plane, never on the output clock.
+///
+/// # Errors
+/// [`ControlError::NotAdmissibleWithSwitcher`] when the declared switcher M/E
+/// cannot drive the canvas; [`ControlError::Validation`] when it does not solve.
+pub fn admit_for_boot(config: &MultiviewConfig) -> ControlResult<()> {
+    let solved = config
+        .solve_layout()
+        .map_err(|e| ControlError::Validation(format!("desired configuration: {e}")))?;
+    config
+        .switcher_canvas_admission(&solved)
+        .map_err(ControlError::NotAdmissibleWithSwitcher)
+    // `outputs_carry_program` is deliberately not checked here: `routing` is a
+    // storeless restart-only section start-up splices from the BOOT file
+    // (`boot::splice_storeless_sections`), so the accepted copy is not what
+    // start-up builds. `multiview validate` checks it on the spliced document.
+}
+
 /// Load authoritative accepted intent. A corrupt existing record is an error,
 /// never permission to replace it with an older observational snapshot.
 ///
 /// # Errors
 /// A malformed, unreadable or invalid accepted record fails closed.
 pub fn load_desired(boot_path: &Path) -> Result<Option<DesiredState>, String> {
-    let path = state_dir_for(boot_path).join(DESIRED_FILE);
-    let text = match std::fs::read_to_string(&path) {
+    load_desired_file(&desired_path_for(boot_path))
+}
+
+/// The accepted-state file (`desired.json`) for the boot config at `boot_path`.
+#[must_use]
+pub fn desired_path_for(boot_path: &Path) -> PathBuf {
+    state_dir_for(boot_path).join(DESIRED_FILE)
+}
+
+/// [`load_desired`] for an explicit envelope file (the accepted state or its
+/// last-good copy): read, parse and validate; a missing file is `Ok(None)`.
+///
+/// # Errors
+/// A malformed, unreadable or invalid record fails closed.
+pub fn load_desired_file(path: &Path) -> Result<Option<DesiredState>, String> {
+    let text = match std::fs::read_to_string(path) {
         Ok(text) => text,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(e) => return Err(format!("reading {}: {e}", path.display())),
     };
+    parse_desired_text(&text, path).map(Some)
+}
+
+/// Parse and validate an accepted-state envelope already read from `path`
+/// (named in errors only).
+///
+/// # Errors
+/// A malformed or invalid record.
+pub fn parse_desired_text(text: &str, path: &Path) -> Result<DesiredState, String> {
     let desired: DesiredState =
-        serde_json::from_str(&text).map_err(|e| format!("parsing {}: {e}", path.display()))?;
+        serde_json::from_str(text).map_err(|e| format!("parsing {}: {e}", path.display()))?;
     desired
         .validate()
         .map_err(|e| format!("validating {}: {e}", path.display()))?;
-    Ok(Some(desired))
+    Ok(desired)
 }
 
 /// Stage an entire prospective desired document before publishing any stores,
@@ -242,6 +285,10 @@ async fn write_desired(state: &AppState, desired: DesiredState) -> ControlResult
         .as_ref()
         .ok_or_else(|| ControlError::Repository("missing boot model".into()))?;
     desired.validate()?;
+    // #317: a state the control plane accepts must be a state the engine can
+    // boot. Every accepted-state commit funnels through here, so this one call
+    // holds the start-up admission rule for every persisting command.
+    admit_for_boot(&desired.config)?;
     let json = serde_json::to_string(&desired)
         .map_err(|e| ControlError::Repository(format!("serializing desired state: {e}")))?;
     let model = Arc::clone(model);

@@ -277,6 +277,29 @@ pub fn decode(
 }
 
 #[cfg(test)]
+mod decode_input_tests {
+    use super::{decode, Fixture};
+    /// The empty-input skip in the runtime is only for zero accepted bytes. A
+    /// non-empty but malformed decoder input is still a hard decode failure.
+    #[test]
+    fn nonempty_malformed_input_still_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        for format in ["hevc", "aac"] {
+            let fixture = Fixture {
+                name: format!("garbage-{format}"),
+                format,
+                packets: vec![],
+            };
+            let garbage = [0x5au8; 4096];
+            assert!(
+                decode(dir.path(), &fixture, 1, &garbage).is_err(),
+                "{format}"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
 mod park_tests {
     use super::ParkQueue;
     #[test]

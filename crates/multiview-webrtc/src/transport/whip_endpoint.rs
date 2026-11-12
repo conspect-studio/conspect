@@ -548,6 +548,11 @@ impl WhipEndpoint {
         }
     }
 
+    /// The ICE-validated remote address of every connected session.
+    pub(crate) fn validated_peers(sessions: &[DrivenSession], out: &mut Vec<SocketAddr>) {
+        out.extend(sessions.iter().filter_map(|s| s.session.validated_peer()));
+    }
+
     /// Route one received datagram to the first session that accepts it (the
     /// str0m ufrag/peer demux), drain its RTP, and note connection.
     pub(crate) fn route_datagram(

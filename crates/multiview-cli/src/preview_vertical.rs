@@ -431,6 +431,8 @@ impl PreviewVertical {
                 output_index: i,
                 video_key: Some(i),
                 audio_tracks: audio_tracks.to_vec(),
+                // Preview renditions never move between encoders.
+                inband_parameter_changes_ok: false,
             })
             .collect();
         let mut dispatcher = crate::rendition_dispatch::RenditionDispatcher::new(

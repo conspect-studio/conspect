@@ -3802,6 +3802,7 @@ dependencies = [
  "multiview-events",
  "multiview-ffmpeg",
  "multiview-framestore",
+ "multiview-frontdoor",
  "multiview-graphics",
  "multiview-hal",
  "multiview-input",
@@ -4044,6 +4045,26 @@ dependencies = [
  "proptest",
  "proptest-state-machine 0.8.0",
  "thiserror 2.0.18",
+]
+
+[[package]]
+name = "multiview-frontdoor"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "hashlink 0.11.1",
+ "moq-noq",
+ "moq-tokio",
+ "multiview-compositor",
+ "multiview-core",
+ "multiview-engine",
+ "multiview-framestore",
+ "multiview-webrtc",
+ "proptest",
+ "socket2 0.6.4",
+ "tokio",
+ "tracing",
+ "url",
 ]
 
 [[package]]

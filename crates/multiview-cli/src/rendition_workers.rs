@@ -360,6 +360,13 @@ impl RenditionWorker {
         self.key_index
     }
 
+    /// Whether the worker thread has ended (panicked, failed or returned).
+    /// Cheap (`JoinHandle::is_finished`), never blocks.
+    #[must_use]
+    pub fn is_finished(&self) -> bool {
+        self.thread.is_finished()
+    }
+
     /// Offer one baked tick without waiting. A full queue is a truthful
     /// overload for this rendition, never a reason to stall the program clock.
     ///

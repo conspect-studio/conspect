@@ -40,3 +40,18 @@ Archive SHA256 (cached .crate bytes):
 Focused unsupported-writer regression passed (one test;1523filtered): defaultfalse
 fake stream cannot credit payload ACK, sets unsupported and releases guard. Root
 workspace members/lock restored after test invocation; no dev-dependency graph retained.
+
+## Socket injection for the shared front door (ADR-0107 slice 1, issue #287)
+
+`moq-tokio` 0.19.34 gains one opt-in field, `server::Config::socket:
+Option<noq::Injected>` (noq feature only), and `noq::Injected { socket: Box<dyn
+AsyncUdpSocket>, endpoint: EndpointConfig }`. When set, `NoqServer::new` binds
+nothing and builds the endpoint with `new_with_abstract_socket` over the embedder's
+socket and endpoint config (multiview passes the front door's QUIC lane and
+`grease_quic_bit(false)`, `min_reset_interval(200 ms)`, pinned versions). The
+server then does not own the socket (`release`/`retain` are no-ops); the embedder
+does. `None` (every existing caller) keeps the original path byte for byte: same
+bind, same `Socket`, same sharding. Combining an injected socket with a reuseport
+group member is refused (`ShardWithQuicLb`). `noq::{AsyncUdpSocket,
+EndpointConfig}` are re-exported from `moq_tokio::noq` for the embedder. Existing
+`NoqServer::new` test callers pass `None`. No wire behaviour changes.

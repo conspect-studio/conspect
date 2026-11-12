@@ -415,6 +415,12 @@ pub enum WarningCode {
     /// (stream removed, channel closed, blocklisted, updated, or edited). Aggregate
     /// warning (one coalescing key); cleared when every link is back in sync.
     CatalogueLinkAttention,
+    /// The saved accepted state (`desired.json`) could not start, so the engine
+    /// started from the last state that started (#317). The message names the
+    /// reason and where the rejected state was kept. **Latched** until restart.
+    /// Remediation: fix or re-apply the configuration; the rejected file stays on
+    /// disk for inspection.
+    AcceptedStateRejected,
 }
 
 /// Which end of a RIST link a [`RistLinkStats`] sample describes.
@@ -548,6 +554,7 @@ impl WarningCode {
             Self::RistLinkLoss => "rist-link-loss",
             Self::ContainerNoHostNetworking => "container-no-host-networking",
             Self::CatalogueLinkAttention => "catalogue-link-attention",
+            Self::AcceptedStateRejected => "accepted-state-rejected",
         }
     }
 }

@@ -44,11 +44,15 @@ export class OperationApiError extends Error {
   /** The RFC 9457 `detail`, when the failure carried a problem body. */
   readonly detail: string | undefined;
 
-  constructor(message: string, status?: number, detail?: string) {
+  /** The RFC 9457 `type` (a stable `/problems/<slug>`), when one was returned. */
+  readonly problemType: string | undefined;
+
+  constructor(message: string, status?: number, detail?: string, problemType?: string) {
     super(message);
     this.name = 'OperationApiError';
     this.status = status;
     this.detail = detail;
+    this.problemType = problemType;
   }
 }
 
@@ -92,6 +96,7 @@ export async function readProblem(response: Response): Promise<OperationApiError
         body.title,
         body.status,
         body.detail ?? undefined,
+        typeof body.type === 'string' ? body.type : undefined,
       );
     }
   } catch {

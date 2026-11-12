@@ -463,6 +463,25 @@ Tick T is the move tick (§4.5).
      decoder reset on this output"; it is never spliced silently;
    - a change of codec, size or pixel format is impossible by construction (the key includes the
      output's settings) and is an internal fault `encoder-format-mismatch`.
+
+   **Slice 1 behaviour (no mux re-init is built).** Each dispatcher binding carries
+   `inband_parameter_changes_ok`, set by the pipeline from the output's container: `true` for
+   MPEG-TS muxers only (HLS TS segments, SRT and RIST push, a `.ts`/`.m2ts`/`.mts` file, the
+   internal `program.ts` anchor); `false` for LL-HLS (fMP4/CMAF), RTMP/FLV, WebRTC/WHIP, MP4/MKV
+   and other files, and the raw-frame sinks (NDI, AES67, where it does not apply). With `true`, a
+   move or fallback onto a RAP whose parameter sets differ (or whose scan was rejected as
+   malformed) splices at that RAP, which carries the new sets in band, so an MPEG-TS decoder
+   reconfigures there. The dispatcher also bumps the output queue's generation (it does not arm the
+   RAP gate or flush the backlog); in slice 1 no MPEG-TS muxer reads that generation, so no
+   `EXT-X-DISCONTINUITY` and no continuity-counter reset is written, and the MoQ publisher treats
+   the bump as one dropped window and resumes at the next RAP. With `false`, a take's move is
+   **refused** (`Refused(FormatMismatch)`: "This feed's encoder settings differ from the output's;
+   the take was refused to avoid a corrupt stream") and the output keeps its feed. A fallback cannot
+   be refused (the routed feed is gone), so on such an output it splices at the RAP with the same
+   generation bump; that output's out-of-band init is then stale until restart (the operator sees
+   the fallback event). Equal sets always move. Writing a real discontinuity (HLS tag, TS continuity,
+   new fMP4/FLV init) is owed by a later slice.
+
    Which case NVENC gives across a live open is measured on mda001 (slice 1 acceptance).
 5. **Format.** An output's format (size, cadence, pixel format, colour tags, codec settings) never
    changes on a take, because the destination key includes the output's own settings. A format

@@ -1531,3 +1531,82 @@ fn live_lease_generation_is_adopted_even_when_root_fetch_fails() {
     assert_eq!(p.generation(), Some(7));
     assert!(p.adopt_generation(6).is_err());
 }
+
+/// Review finding 2 of PR #312: a lease that closes while the root answer is in
+/// flight must be a refusal (`Denied`), never `Expired`, even when the answer
+/// also arrives after the epoch boundary. `Expired` is the only error a caller
+/// may treat as an answer overtaken in transit; a closed fence must not look
+/// like one. The release happens INSIDE the transport call, i.e. between the
+/// request leaving and its answer arriving.
+#[test]
+fn a_lease_closed_while_the_root_answer_is_in_flight_is_denied_not_expired() {
+    struct CloseInFlight {
+        inner: Arc<Mock>,
+        lease: Mutex<Option<Arc<PublisherLease>>>,
+        clock: Arc<Clock>,
+        answer_at: u64,
+    }
+    impl AuthorityHttpTransport for CloseInFlight {
+        fn send(
+            &self,
+            request: AuthorityHttpRequest,
+            credential: &OrganisationCsk,
+        ) -> conspect_media_crypto::Result<AuthorityHttpResponse> {
+            let root = request.url.contains("/current-epoch");
+            let answer = self.inner.send(request, credential);
+            if root {
+                // The answer is in flight: the fence closes, then it arrives
+                // (optionally after the epoch boundary as well).
+                self.lease.lock().unwrap().as_ref().unwrap().revoke();
+                self.clock.set(self.answer_at);
+            }
+            answer
+        }
+    }
+    // Same epoch, and across the boundary: both must be Denied.
+    for answer_at in [102501, 105001] {
+        let clock = Clock::new(102001);
+        let inner = Arc::new(Mock::new(vec![
+            reply(201, lease_body(1, 112001, 101000)),
+            reply(200, root(1)),
+        ]));
+        let transport = Arc::new(CloseInFlight {
+            inner: inner.clone(),
+            lease: Mutex::new(None),
+            clock: clock.clone(),
+            answer_at,
+        });
+        let lease = Arc::new(
+            PublisherLease::with_transport(
+                "https://authority.test",
+                ids(),
+                CRYPTO,
+                OrganisationCsk::new("organisation-csk-secret".into()).unwrap(),
+                transport.clone(),
+                clock.lease_clock(),
+            )
+            .unwrap()
+            .with_margins(1000, 0),
+        );
+        let assigned = lease.acquire().unwrap();
+        *transport.lease.lock().unwrap() = Some(lease.clone());
+        let p = HttpAuthorityRootProvider::with_transport(
+            "https://authority.test",
+            ids(),
+            CRYPTO,
+            None,
+            OrganisationCsk::new("organisation-csk-secret".into()).unwrap(),
+            transport,
+        )
+        .unwrap()
+        .with_clock(clock.wall_fn())
+        .with_lease(lease);
+        p.adopt_generation(assigned).unwrap();
+        assert_eq!(
+            p.current_epoch_root(&request()).unwrap_err(),
+            Error::Denied,
+            "answer at {answer_at}"
+        );
+        assert_eq!(inner.call_count(), 2, "one root request, no retry");
+    }
+}

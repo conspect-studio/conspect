@@ -268,57 +268,11 @@ struct StreamPlan {
     binding_ids: Vec<Option<String>>,
 }
 
-/// Is this document's canvas one the first slice can drive as a real M/E bus?
-///
-/// Exactly one full-canvas, fully opaque, unclipped, non-overlay cell bound to
-/// the declared `program_source` — the shape the engine treats as the
-/// source-agnostic bus canvas. An unsupported opted-in layout is refused with a
-/// typed error instead of silently replacing the operator's multiview.
-#[allow(clippy::float_cmp)]
-// reason: authored layout fractions compared against their exact canonical
-// values; an approximate comparison would admit a windowed/tiled canvas as
-// "full canvas" and change which sources the buses admit.
-fn first_slice_me_layout_supported(
-    layout: &Layout,
-    config: &MultiviewConfig,
-    me: &multiview_config::MixEffectsConfig,
-) -> bool {
-    layout.cells.len() == 1
-        && config.overlays.is_empty()
-        && !config.cells.first().is_some_and(|cell| {
-            cell.corner_radius.is_some()
-                || cell.border.is_some()
-                || cell.fit.as_deref().is_some_and(|fit| fit != "fill")
-                || cell.visible == Some(false)
-        })
-        && layout.cells.first().is_some_and(|cell| {
-            cell.x == 0.0 && cell.y == 0.0 && cell.w == 1.0 && cell.h == 1.0 && cell.opacity == 1.0
-        })
-        && config
-            .cells
-            .first()
-            .and_then(|cell| cell.source.input_id.as_deref())
-            == Some(me.program_source.as_str())
-}
-
-/// ADR-0108 slice 1, step 1: an output fed directly by a source (or a switcher
-/// bus other than Program) is validated and read back, but this engine does
-/// not carry it yet. Refuse the run rather than silently putting Program on
-/// that output. A `bus = "preview"` output was already admitted before this
-/// slice and keeps its existing behaviour.
+/// ADR-0108 slice 1, step 1 start-up refusal; the rule itself lives in
+/// [`multiview_config::outputs_carry_program`] so start-up and `multiview
+/// validate` share it (#317).
 fn ensure_outputs_carry_program(config: &MultiviewConfig) -> Result<(), PipelineError> {
-    if let Some(routed) = config
-        .output_feeds()
-        .into_iter()
-        .find(|xp| matches!(xp.effective_video(), multiview_config::VideoFeed::Source(_)))
-    {
-        return Err(PipelineError::Engine(format!(
-            "output {:?} is routed to {:?}; this engine carries only Program on outputs",
-            routed.output,
-            routed.effective_video().picture_bus()
-        )));
-    }
-    Ok(())
+    multiview_config::outputs_carry_program(config).map_err(PipelineError::Engine)
 }
 
 /// Errors building or running the libav\* pipeline.
@@ -1483,6 +1437,77 @@ segment_ms = 1000
 }
 
 #[cfg(test)]
+mod failed_build_release_tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+    use super::{retained_lifecycle_ids, Pipeline};
+    use multiview_config::MultiviewConfig;
+
+    /// #317 review (lens 3): a build that fails AFTER reserving live lifecycle
+    /// epochs releases them, so a fallback build in the same process starts
+    /// clean (no orphaned process-wide registry entries).
+    #[test]
+    fn a_failed_build_releases_its_live_lifecycle_registrations() {
+        let doc = r##"schema_version = 1
+[canvas]
+width = 64
+height = 64
+fps = "25/1"
+pixel_format = "nv12"
+background = "#000000"
+[canvas.color]
+profile = "sdr-bt709-limited"
+[layout]
+kind = "absolute"
+[[sources]]
+id = "failedbuild_cam"
+kind = "bars"
+[[cells]]
+id = "c"
+rect = { x = 0.0, y = 0.0, w = 1.0, h = 1.0 }
+[cells.source]
+input_id = "failedbuild_cam"
+[[outputs]]
+kind = "hls"
+path = "/tmp/failed-build-release.m3u8"
+codec = "mpeg2video"
+segment_ms = 1000
+"##;
+        let mut config = MultiviewConfig::load_from_toml(doc).expect("parses");
+        // No runnable output: the build reserves its sources, then fails.
+        config.outputs.clear();
+        assert!(Pipeline::build(&config).is_err(), "the build fails");
+        assert_eq!(retained_lifecycle_ids("failedbuild_"), (0, 0));
+        assert_eq!(
+            crate::hls_fetch::retained_ids("failedbuild_"),
+            0,
+            "fetch map too"
+        );
+    }
+
+    /// Review round 2 (lens 3): a failed build never retires an id that was
+    /// already live in this process before it.
+    #[test]
+    fn a_failed_build_keeps_an_id_that_was_already_live() {
+        let id = "keeplive_cam";
+        let before = super::begin_live_lifecycle(id);
+        let doc = format!(
+            "schema_version = 1\n[canvas]\nwidth = 64\nheight = 64\nfps = \"25/1\"\npixel_format = \"nv12\"\nbackground = \"#000000\"\n[canvas.color]\nprofile = \"sdr-bt709-limited\"\n[layout]\nkind = \"absolute\"\n[[sources]]\nid = \"{id}\"\nkind = \"bars\"\n[[cells]]\nid = \"c\"\nrect = {{ x = 0.0, y = 0.0, w = 1.0, h = 1.0 }}\n[cells.source]\ninput_id = \"{id}\"\n[[outputs]]\nkind = \"hls\"\npath = \"/tmp/failed-build-live.m3u8\"\ncodec = \"mpeg2video\"\nsegment_ms = 1000\n"
+        );
+        let mut config = MultiviewConfig::load_from_toml(&doc).expect("parses");
+        config.outputs.clear();
+        assert!(Pipeline::build(&config).is_err());
+        assert_ne!(
+            super::live_lifecycle(id),
+            0,
+            "the live id keeps a lifecycle"
+        );
+        assert_eq!(retained_lifecycle_ids("keeplive_"), (1, 1));
+        super::remove_live_lifecycle(id);
+        let _ = before;
+    }
+}
+
+#[cfg(test)]
 mod output_feed_guard_tests {
     use super::ensure_outputs_carry_program;
     use multiview_config::MultiviewConfig;
@@ -2029,6 +2054,10 @@ pub struct Pipeline {
     /// Distinct concrete video encoders and one key per runnable output.
     rendition_configs: Vec<EncodeConfig>,
     output_video_keys: Vec<usize>,
+    /// Per runnable output (same order as `output_video_keys`): its muxer
+    /// reads decoder configuration in band (MPEG-TS), so a routing move onto
+    /// changed parameter sets may splice (output-routing.md §4.2 step 4).
+    output_inband_sets: Vec<bool>,
     output_audio_tracks: Vec<Vec<usize>>,
     /// Outputs that EXPLICITLY declared an audio selection (per output: the id
     /// and its full declared track list). Drives the run-time truthful binding:
@@ -2483,6 +2512,31 @@ impl Pipeline {
     // ingest plan per source, wires native captions, and assembles the outputs —
     // each step is in-scope and splitting it would only scatter the wiring.
     pub fn build(config: &MultiviewConfig) -> Result<Self, PipelineError> {
+        // #317: a failed build may already have reserved live lifecycle
+        // epochs/anchor slots/fetch registrations for its sources
+        // (process-wide registries). Release ONLY the ids this build created
+        // (none before it): an id another live pipeline in this process owns is
+        // never retired by someone else's failed build.
+        let unreserved: Vec<&str> = config
+            .sources
+            .iter()
+            .map(|source| source.id.as_str())
+            .filter(|id| live_lifecycle(id) == 0)
+            .collect();
+        let built = Self::build_inner(config);
+        if built.is_err() {
+            for id in unreserved {
+                if live_lifecycle(id) != 0 {
+                    remove_live_lifecycle(id);
+                }
+            }
+        }
+        built
+    }
+
+    #[allow(clippy::too_many_lines)]
+    // reason: see `build`.
+    fn build_inner(config: &MultiviewConfig) -> Result<Self, PipelineError> {
         // Fail-closed (#103): an AES67 PCM-audio source in a non-`aes67` build is a
         // config this binary cannot honour — reject it clearly up front, never wire
         // it dark (the same contract as a `display` source/output in a non-
@@ -2508,14 +2562,14 @@ impl Pipeline {
         // legacy multiview with multiple cells remains untouched when the M/E
         // block is absent; an opted-in unsupported layout fails loudly instead
         // of replacing the operator's canvas with a guessed source.
-        if let Some(me) = &switcher_me {
-            if !first_slice_me_layout_supported(&layout, config, me) {
-                return Err(PipelineError::Engine("first-slice M/E requires one full-canvas source cell initially bound to program_source; multi-cell layouts are not replaced".into()));
-            }
-        }
-        // ADR-0108 slice 1, step 1: an output fed directly by a source is
-        // validated and read back, but this engine does not carry it yet. Fail
-        // loudly rather than silently putting Program on that output.
+        // The SAME admission rules the control plane applies before it persists an
+        // accepted state (#317): `multiview_config::switcher_canvas_admission`,
+        // and (ADR-0108 slice 1, step 1) `outputs_carry_program`: an output fed
+        // directly by a source is validated and read back, but this engine does
+        // not carry it yet — fail loudly rather than put Program on it.
+        config
+            .switcher_canvas_admission(&layout)
+            .map_err(|refusal| PipelineError::Engine(refusal.to_string()))?;
         ensure_outputs_carry_program(config)?;
         let switcher_cell_id = switcher_me
             .as_ref()
@@ -2896,6 +2950,7 @@ impl Pipeline {
         apply_output_audio_selections(&mut outputs, &config.outputs, &discrete_tracks);
         let mut rendition_configs = Vec::<EncodeConfig>::new();
         let mut output_video_keys = Vec::with_capacity(outputs.len());
+        let mut output_inband_sets = Vec::with_capacity(outputs.len());
         let mut output_audio_tracks = Vec::with_capacity(outputs.len());
         let mut declared_audio_outputs: Vec<(String, Vec<usize>)> = Vec::new();
         for output in &outputs {
@@ -2920,6 +2975,12 @@ impl Pipeline {
                 rendition_configs.len() - 1
             };
             output_video_keys.push(key);
+            let ll_hls = config
+                .outputs
+                .iter()
+                .find(|item| item.id() == output.id())
+                .is_some_and(|item| matches!(item, multiview_config::Output::LlHls { .. }));
+            output_inband_sets.push(!ll_hls && inband_parameter_changes_ok(output));
             let audio_selection = match output {
                 RunnableOutput::File { sink, .. }
                 | RunnableOutput::Hls { sink, .. }
@@ -3116,6 +3177,7 @@ impl Pipeline {
             encode_cfg: cfg,
             rendition_configs,
             output_video_keys,
+            output_inband_sets,
             output_audio_tracks,
             declared_audio_outputs,
             outputs,
@@ -3406,6 +3468,7 @@ impl Pipeline {
             consumer: ConsumerRouting {
                 router: Box::new(router),
                 base_force,
+                inband_sets: self.output_inband_sets.clone(),
             },
             aux_tx,
             preview_selection,
@@ -4106,6 +4169,8 @@ impl Pipeline {
         if !live {
             if let Some(hls_key) = hls_key {
                 self.output_video_keys.insert(0, hls_key);
+                // The anchor is a `program.ts` file: MPEG-TS, in band.
+                self.output_inband_sets.insert(0, true);
                 self.output_audio_tracks
                     .insert(0, hls_audio.unwrap_or_default());
             }
@@ -6739,6 +6804,8 @@ struct ConsumerRouting {
     router: Box<crate::output_routing::OutputRouter>,
     /// Per base video key: its worker's forced-IDR request cell.
     base_force: Vec<Arc<AtomicU64>>,
+    /// Per output: [`BindingConfig::inband_parameter_changes_ok`].
+    inband_sets: Vec<bool>,
 }
 
 /// End-of-run bound for the routing reaper to finish closed live encoders.
@@ -7207,6 +7274,7 @@ fn consumer_main<D: WindowDelivery>(
     let ConsumerRouting {
         mut router,
         base_force,
+        inband_sets,
     } = routing;
     let mut baker = StreamBaker::new(ctx)?;
     let (event_tx, event_rx) = std::sync::mpsc::sync_channel::<DispatchEvent>(256);
@@ -7310,6 +7378,9 @@ fn consumer_main<D: WindowDelivery>(
             output_index: index,
             video_key: Some(key),
             audio_tracks: output_audio_tracks.get(index).cloned().unwrap_or_default(),
+            // Unknown (no runnable output recorded at this index): refuse a
+            // changed-format splice rather than risk a corrupt stream.
+            inband_parameter_changes_ok: inband_sets.get(index).copied().unwrap_or(false),
         })
         .collect();
     let mut dispatcher = RenditionDispatcher::new(DispatchConfig {
@@ -12645,6 +12716,30 @@ fn handle_ndi_output(
 /// run** (HLS-2, ADR-0032): an infinite live run must not also write an
 /// ever-growing `program.ts` — the rolling segment window (the live `.m3u8` +
 /// pruned `seg*.ts`) is the bounded on-disk artifact instead.
+/// Whether an output's muxer carries decoder configuration in band, so a
+/// routing switch onto changed parameter sets may splice with a mux
+/// discontinuity (output-routing.md §4.2 step 4): MPEG-TS only (HLS TS
+/// segments, SRT / RIST / UDP-TS push, a `.ts` file). fMP4/CMAF, FLV (RTMP),
+/// RTSP, WebRTC/WHIP and MP4/MKV files carry it out of band (init segment,
+/// sequence header, SDP, `moov`); raw-frame sinks carry no packets.
+fn inband_parameter_changes_ok(output: &RunnableOutput) -> bool {
+    match output {
+        RunnableOutput::Hls { .. } => true,
+        // `srt` / `rist` mux MPEG-TS; `rtmp` muxes FLV (sequence header).
+        RunnableOutput::Push { label, .. } => matches!(*label, "srt" | "rist"),
+        RunnableOutput::File { path, .. } => path
+            .extension()
+            .and_then(|e| e.to_str())
+            .is_some_and(|e| matches!(e.to_ascii_lowercase().as_str(), "ts" | "m2ts" | "mts")),
+        #[cfg(feature = "webrtc-native")]
+        RunnableOutput::WebRtc { .. } => false,
+        #[cfg(feature = "ndi-bindings")]
+        RunnableOutput::Ndi { .. } => false,
+        #[cfg(feature = "aes67")]
+        RunnableOutput::Aes67 { .. } => false,
+    }
+}
+
 fn maybe_prepend_program_ts(mut runnable: Vec<RunnableOutput>, live: bool) -> Vec<RunnableOutput> {
     if live {
         return runnable;
@@ -17660,6 +17755,8 @@ pub(crate) fn remove_live_lifecycle(id: &str) -> u64 {
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     let lifecycle = advance_live_lifecycle(id, &mut tokens);
+    // `advance_live_lifecycle` re-registered the fetch entry at `lifecycle`, so
+    // forgetting that exact generation drops it.
     crate::hls_fetch::forget_source(id, lifecycle);
     tokens.remove(id);
     anchor_slots()
@@ -24785,6 +24882,41 @@ segment_ms = 1000
             };
             assert_subscription_observations(&observed);
         });
+    }
+
+    /// Q (output-routing.md §4.2 step 4): only MPEG-TS muxers take a changed
+    /// decoder configuration in band; FLV, MP4/MKV files are out of band.
+    #[test]
+    fn inband_parameter_changes_follow_the_output_container() {
+        let push = |protocol, label| {
+            let sink = PacketMuxSink::push(protocol, "srt://[::1]:9000");
+            RunnableOutput::Push {
+                id: "p".to_owned(),
+                link: push_link_for(label, &sink, "srt://[::1]:9000"),
+                sink,
+                label,
+                url: String::new(),
+            }
+        };
+        let file = |path: &str| RunnableOutput::File {
+            id: "f".to_owned(),
+            sink: PacketMuxSink::file(path),
+            path: std::path::PathBuf::from(path),
+        };
+        assert!(inband_parameter_changes_ok(&push(PushProtocol::Srt, "srt")));
+        assert!(inband_parameter_changes_ok(&push(
+            PushProtocol::Rist,
+            "rist"
+        )));
+        assert!(!inband_parameter_changes_ok(&push(
+            PushProtocol::Rtmp,
+            "rtmp"
+        )));
+        assert!(inband_parameter_changes_ok(&file("/x/program.ts")));
+        assert!(inband_parameter_changes_ok(&file("/x/a.M2TS")));
+        assert!(!inband_parameter_changes_ok(&file("/x/a.mp4")));
+        assert!(!inband_parameter_changes_ok(&file("/x/a.mkv")));
+        assert!(!inband_parameter_changes_ok(&file("/x/noext")));
     }
 
     /// The registry indexes the FINAL runner order: the synthetic `program.ts`

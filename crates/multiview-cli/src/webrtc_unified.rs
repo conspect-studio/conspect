@@ -48,6 +48,11 @@ pub struct UnifiedWebrtc {
 /// WHEP-serve routes keep their default `503` — exactly as the per-role binds did,
 /// but now from a single point of failure (the one socket) instead of three.
 #[must_use]
+#[allow(
+    clippy::too_many_arguments,
+    clippy::too_many_lines,
+    reason = "one flat wiring sequence per WebRTC role, plus the optional front-door lane (ADR-0107)"
+)]
 pub fn spawn_unified_webrtc(
     config: &MultiviewConfig,
     program_slot: crate::preview::ProgramSlot,
@@ -57,9 +62,33 @@ pub fn spawn_unified_webrtc(
     egress_registry: &EgressRegistry,
     demand: Option<multiview_control::SharedSourceDemand>,
     #[cfg(feature = "moq-output")] wall: Option<crate::preview::WallPictureSlot>,
+    front_door: Option<(multiview_frontdoor::RtcLane, tokio::runtime::Handle)>,
 ) -> UnifiedWebrtc {
-    let endpoint_config = endpoint_config_from(config);
-    let builder = match UnifiedEndpoint::bind(endpoint_config) {
+    let mut endpoint_config = endpoint_config_from(config);
+    // With the front door (ADR-0107), WebRTC rides its shared socket: the
+    // endpoint sends on a duplicate of that socket and receives from the
+    // dispatcher's WebRTC lane; the driver runs on the front door's runtime.
+    let (builder, shared) = match front_door {
+        Some((lane, handle)) => {
+            if let Some(network) = config.network.as_ref() {
+                let advertised = network.advertised_ips();
+                if !advertised.is_empty() {
+                    endpoint_config.advertised_addresses = advertised;
+                }
+            }
+            endpoint_config.udp_port = lane.local_addr().port();
+            let built = lane
+                .send_socket()
+                .map_err(|source| multiview_webrtc::error::WebRtcError::Socket {
+                    addr: lane.local_addr(),
+                    source,
+                })
+                .and_then(|send| UnifiedEndpoint::with_shared_socket(endpoint_config, send));
+            (built, Some((lane, handle)))
+        }
+        None => (UnifiedEndpoint::bind(endpoint_config), None),
+    };
+    let builder = match builder {
         Ok(b) => b,
         Err(err) => {
             tracing::warn!(%err, "the shared WebRTC socket failed to bind; all WebRTC roles unavailable this run (preview sheds to JPEG)");
@@ -145,12 +174,22 @@ pub fn spawn_unified_webrtc(
     // Spawn the ONE driver task that owns the socket for the run's lifetime.
     let endpoint = builder.build();
     let stop = Arc::new(AtomicBool::new(false));
-    tokio::spawn(async move {
-        if let Err(err) = endpoint.run(stop).await {
-            tracing::warn!(%err, "unified WebRTC endpoint driver exited");
-        }
-    });
-    tracing::info!("unified WebRTC endpoint bound (one shared socket for preview + WHIP + WHEP-serve + whip_push)");
+    if let Some((lane, handle)) = shared {
+        let local = lane.local_addr();
+        handle.spawn(async move {
+            if let Err(err) = endpoint.run_shared(lane, stop).await {
+                tracing::warn!(%err, "unified WebRTC endpoint driver exited");
+            }
+        });
+        tracing::info!(%local, "unified WebRTC endpoint on the front-door socket (driver on the front-door runtime)");
+    } else {
+        tokio::spawn(async move {
+            if let Err(err) = endpoint.run(stop).await {
+                tracing::warn!(%err, "unified WebRTC endpoint driver exited");
+            }
+        });
+        tracing::info!("unified WebRTC endpoint bound (one shared socket for preview + WHIP + WHEP-serve + whip_push)");
+    }
 
     let caps = multiview_control::FocusCaps::new(
         usize::try_from(config.webrtc.preview_max_focus).unwrap_or(usize::MAX),

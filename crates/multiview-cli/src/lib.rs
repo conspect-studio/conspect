@@ -156,6 +156,7 @@ pub mod control;
 pub mod display_size;
 pub mod event_journal;
 pub mod hls_event_observer;
+pub mod last_good;
 /// The Conspect entitlement-plane wiring for the cli (CONSPECT-2b/10, ADR-0050):
 /// the shared lease store, the published [`licence::WatermarkSignal`] the engine
 /// bake samples lock-free (S3), and the sampled [`multiview_licence::EnforcementLevel`]
@@ -378,6 +379,10 @@ pub mod webrtc_endpoint;
 /// reqwest WHIP signaller).
 #[cfg(feature = "webrtc-native")]
 pub mod webrtc_outputs;
+
+/// The network front door (ADR-0107 slice 1): one dual-stack UDP socket for
+/// MoQ and WebRTC, on its own runtime, when `[network]` is configured.
+pub mod frontdoor;
 
 /// The **single-socket** WebRTC orchestration (ADR-0048 §4): binds ONE shared
 /// dual-stack UDP socket and adopts every WebRTC role onto it — preview WHEP, WHIP
