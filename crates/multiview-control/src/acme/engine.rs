@@ -997,7 +997,9 @@ async fn run(engine: AcmeEngine, mut receiver: mpsc::Receiver<AcmeCommand>) {
     };
     let mut failures: u32 = 0;
     let mut next_attempt: Option<i64> = None;
-    let mut ari: Option<(i64, i64)> = None; // (renew_at, recheck_at)
+    // Cached schedule for `current`: (renew_at, ARI recheck instant). `None`
+    // recheck = lifetime fallback, fixed until the certificate changes.
+    let mut ari: Option<(i64, Option<i64>)> = None;
     let mut force = false;
     loop {
         let now = unix_now();
@@ -1005,14 +1007,15 @@ async fn run(engine: AcmeEngine, mut receiver: mpsc::Receiver<AcmeCommand>) {
             None => now,
             Some(meta) if engine.needs_reissue(meta) => now,
             Some(meta) => match ari {
-                Some((at, recheck)) if now < recheck => at,
+                Some((at, None)) => at,
+                Some((at, Some(recheck))) if now < recheck => at,
                 _ => {
                     let Some((at, recheck)) =
                         unless_shutdown(engine.renewal_at(meta, now), &mut receiver).await
                     else {
                         return;
                     };
-                    ari = recheck.map(|delay| (at, now.saturating_add(secs(delay))));
+                    ari = Some((at, recheck.map(|delay| now.saturating_add(secs(delay)))));
                     at
                 }
             },
@@ -1074,7 +1077,7 @@ async fn run(engine: AcmeEngine, mut receiver: mpsc::Receiver<AcmeCommand>) {
         }
         let mut sleep_for =
             Duration::from_secs(u64::try_from(wake.saturating_sub(now)).unwrap_or(0));
-        if let Some((_, recheck)) = ari {
+        if let Some((_, Some(recheck))) = ari {
             sleep_for = sleep_for.min(Duration::from_secs(
                 u64::try_from(recheck.saturating_sub(now)).unwrap_or(0),
             ));

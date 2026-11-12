@@ -14,8 +14,7 @@
 //! * no proxy is consulted; bodies are read in chunks under a hard cap.
 //!
 //! Production policy refuses loopback, link-local, RFC 1918, ULA, CGNAT,
-//! multicast, unspecified, broadcast and IPv4-mapped/compatible forms of
-//! those. `allow_private` (the config's `allow_private_directory`, ACME
+//! multicast, unspecified, broadcast and every IPv4-mapped/compatible form. `allow_private` (the config's `allow_private_directory`, ACME
 //! directory client only) admits RFC 1918 / ULA / CGNAT and loopback, never
 //! link-local, multicast, unspecified or broadcast.
 //!
@@ -111,13 +110,12 @@ impl EgressPolicy {
     /// [`EgressRefused`] naming the refused class.
     pub fn screen_ip(&self, ip: IpAddr, port: u16) -> Result<(), EgressRefused> {
         if let IpAddr::V6(v6) = ip {
-            // An IPv4-mapped/compatible form is judged as the IPv4 it embeds, but
-            // a mapped loopback/private literal is never admitted even with
-            // `allow_private`: it only exists to dodge a naive screen.
+            // IPv4-mapped (`::ffff:a.b.c.d`) and IPv4-compatible (`::a.b.c.d`)
+            // forms are always refused: a CA or DNS API is dialled by its real
+            // address, and these forms only exist to dodge a naive screen.
             if !v6.is_loopback()
                 && !v6.is_unspecified()
                 && (v6.to_ipv4_mapped().is_some() || v6.to_ipv4().is_some())
-                && classify(ip).is_some()
             {
                 return Err(EgressRefused("ipv4-mapped"));
             }
@@ -491,10 +489,11 @@ mod tests {
             "ff02::1",
             "255.255.255.255",
             "::ffff:10.0.0.1",
+            "::ffff:8.8.8.8",
         ] {
             assert!(p.screen_ip(ip(s), 443).is_err(), "{s}");
         }
-        for s in ["8.8.8.8", "2001:4860:4860::8888", "::ffff:8.8.8.8"] {
+        for s in ["8.8.8.8", "2001:4860:4860::8888"] {
             assert!(p.screen_ip(ip(s), 443).is_ok(), "{s}");
         }
     }
