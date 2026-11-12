@@ -481,6 +481,39 @@ mod tests {
         }
     }
 
+    /// H (lens 1 #5): odd source sizes. An NV12 tile itself can never be odd
+    /// (`Nv12Image::new` rejects it), but `contain_rect` takes any size: the
+    /// rect for 641x481 -> 1920x1080 and for a sweep of odd sizes is
+    /// even-aligned and inside the canvas (no out-of-bounds blit), and the
+    /// largest even tile below it composes to a canvas-size image.
+    #[test]
+    fn odd_sizes_give_an_even_in_bounds_rect() {
+        let (x, y, w, h) = contain_rect(641, 481, 1920, 1080).unwrap();
+        assert_eq!((x % 2, y % 2, w % 2, h % 2), (0, 0, 0, 0));
+        assert!(x + w <= 1920 && y + h <= 1080);
+        assert_eq!(h, 1080, "4:3-ish pillarbox fills the height");
+        for sw in (1..2000).step_by(37) {
+            for sh in (1..1200).step_by(41) {
+                for (cw, ch) in [(1920, 1080), (1280, 720), (2, 2), (642, 482)] {
+                    let (x, y, w, h) = contain_rect(sw, sh, cw, ch).unwrap();
+                    assert_eq!((x | y | w | h) & 1, 0, "{sw}x{sh} in {cw}x{ch}");
+                    assert!(x + w <= cw && y + h <= ch, "{sw}x{sh} in {cw}x{ch}");
+                }
+            }
+        }
+        assert!(Nv12Image::new(
+            641,
+            481,
+            vec![16; 641 * 481],
+            vec![128; 641 * 481 / 2],
+            canvas().color
+        )
+        .is_err());
+        let tile = Arc::new(gradient(640, 480, canvas().color));
+        let out = FeedState::default().compose(&tile, canvas()).unwrap();
+        assert_eq!((out.width(), out.height()), (1920, 1080));
+    }
+
     #[test]
     fn the_ring_reuses_free_buffers_and_holds_when_all_are_in_use() {
         let c = canvas();

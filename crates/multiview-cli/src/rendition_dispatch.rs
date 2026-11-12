@@ -480,6 +480,12 @@ impl RenditionDispatcher {
             DispatchEvent::Video { key_index, .. } | DispatchEvent::FinishVideo { key_index, .. }
                 if *key_index >= self.base_video
         );
+        // A live (dynamic) key's event skips the GLOBAL budget: it must never
+        // fail the run. Its own ceiling is per-stage (`StreamStage::put`:
+        // MAX_STAGED_WINDOWS / MAX_STAGED_PACKETS / MAX_STAGED_BYTES = 16 MiB,
+        // overflow fails that key alone) times at most MAX_DYNAMIC_KEYS (8)
+        // live keys, so the worst case added beside the base budget is
+        // 8 x 16 MiB = 128 MiB and 8 x 512 packets, bounded and per key.
         if let Err(error) = if dynamic_event {
             Ok(())
         } else {
