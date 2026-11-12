@@ -276,15 +276,39 @@ impl FrontDoorRun {
             tracing::warn!(%tcp, "front-door TCP door: no site certificate ([control.tls] static, a `tls` build on unix), so TLS on the door is unavailable; ICE-TCP still runs");
             return;
         };
-        let routing = multiview_frontdoor::TlsRouting {
-            site: Some(site),
-            // TODO(#291): slice 5 wires the ACME `ChallengeResolver` here
-            // (TLS-ALPN-01); until then an `acme-tls/1` hello is closed.
-            acme: None,
-        };
+        // Read-modify-write: only the site half changes here, so a previously
+        // installed ACME (TLS-ALPN-01) responder is never clobbered back to
+        // `None` (#291).
         let service: Arc<dyn multiview_frontdoor::SiteService> = Arc::new(ControlSite(server));
-        if self.door.set_tls_routing(routing).is_ok() && self.door.set_site(Some(service)).is_ok() {
+        if self.door.set_site_config(Some(site)).is_ok()
+            && self.door.set_site(Some(service)).is_ok()
+        {
             tracing::info!(%tcp, tls_site = true, "front-door TCP door serves the site (HTTP/1.1 over the [control.tls] certificate)");
+        }
+    }
+
+    /// Install (or replace) the ACME TLS-ALPN-01 challenge responder on the
+    /// TCP door: only the ACME half of the routing changes, so a previously
+    /// installed site certificate keeps serving. `multiview run` calls this
+    /// once slice 5 PR B boots the `AcmeService` (#291); not called from this
+    /// crate yet.
+    #[cfg(all(feature = "tls", unix))]
+    pub fn install_acme_resolver(
+        &self,
+        resolver: Arc<multiview_control::certificate_source::ChallengeResolver>,
+    ) {
+        let Some(tcp) = self.door.tcp_local_addr() else {
+            return;
+        };
+        match multiview_control::acme_challenge_server_config(resolver) {
+            Ok(config) => {
+                if self.door.set_acme_config(Some(config)).is_ok() {
+                    tracing::info!(%tcp, "front-door TCP door serves the ACME TLS-ALPN-01 challenge responder");
+                }
+            }
+            Err(error) => {
+                tracing::error!(%error, %tcp, "front-door TCP door: building the ACME challenge TLS configuration failed; acme-tls/1 hellos keep closing");
+            }
         }
     }
 

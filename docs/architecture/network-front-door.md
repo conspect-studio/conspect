@@ -937,10 +937,19 @@ the engine's own TLS. The str0m ICE-TCP consumer and the browser ladder are PR2 
   door-on repeats at most door-off + 1, door-on p99 within 4 ms of the worse of door-off and idle,
   door-on worst tick within one period of theirs; and the door's own bounds: the connection cap,
   RSS growth, fd count back to baseline, every defence counter (stuck writers included) fired.
-* **Deferred**: the ACME `ChallengeResolver` wiring into `TlsRouting.acme` (whichever of #290/#291
-  lands second; TODO in `multiview-cli/src/frontdoor.rs`); the str0m ICE-TCP consumer, passive TCP
-  candidates in the SDP and the browser ladder (PR2 of this slice); systemd socket activation
-  (section 9) and the mda001 cutover (slice 6).
+* **ACME wiring (#291)**: the door's `TlsRouting.acme` route is wired to slice 5's
+  `ChallengeResolver` via `multiview_control::acme_challenge_server_config` (explicit `aws-lc-rs`
+  provider, safe default protocol versions, ALPN `acme-tls/1` only) and
+  `FrontDoorRun::install_acme_resolver`, which installs only the ACME half of the routing
+  (`FrontDoor::set_acme_config`) so a previously installed site certificate keeps serving;
+  symmetrically, `install_site` now installs only the site half (`FrontDoor::set_site_config`), so
+  it never clobbers a previously installed ACME responder back to `None`. `multiview run` starts
+  the `AcmeService` and calls `install_acme_resolver` once in slice 5 PR B; this crate does not call
+  it yet.
+* **Deferred**: systemd socket activation (section 9) and the mda001 cutover (slice 6). The str0m
+  ICE-TCP consumer and the browser's selected-pair report are below (PR2 of this slice). The browser
+  ladder itself needed no change: MoQ fails over to WebRTC, and the browser gathers its active TCP
+  candidate against the advertised passive one when UDP is blocked.
 
 #### Slice 4 PR2: the str0m ICE-TCP consumer (issue #290)
 

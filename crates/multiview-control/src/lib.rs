@@ -901,6 +901,33 @@ pub fn site_server_config(
     Ok(std::sync::Arc::new(config))
 }
 
+/// A rustls [`ServerConfig`](rustls::ServerConfig) for the TLS-ALPN-01
+/// challenge responder (RFC 8737) on the network front door's TCP door: the
+/// explicit `aws-lc-rs` provider (as [`load_tls_material`] / [`site_server_config`]),
+/// safe default protocol versions (TLS 1.3; RFC 8737 only requires TLS 1.2+),
+/// the cert resolver set to `resolver` ([`ChallengeResolver`](certificate_source::ChallengeResolver),
+/// which answers a challenge only when the `ClientHello`'s ALPN is exactly
+/// `acme-tls/1`, keyed by SNI), ALPN `acme-tls/1` only.
+///
+/// This configuration never serves application data: a successful handshake
+/// is immediately followed by the front door closing the connection (slice 4,
+/// design note section 4) once the challenge certificate has been presented.
+///
+/// # Errors
+/// [`TlsSetupError::Rustls`] if the provider rejects the protocol versions.
+#[cfg(all(feature = "tls", unix))]
+pub fn acme_challenge_server_config(
+    resolver: std::sync::Arc<certificate_source::ChallengeResolver>,
+) -> Result<std::sync::Arc<rustls::ServerConfig>, TlsSetupError> {
+    let provider = std::sync::Arc::new(rustls::crypto::aws_lc_rs::default_provider());
+    let mut config = rustls::ServerConfig::builder_with_provider(provider)
+        .with_safe_default_protocol_versions()?
+        .with_no_client_auth()
+        .with_cert_resolver(resolver);
+    config.alpn_protocols = vec![b"acme-tls/1".to_vec()];
+    Ok(std::sync::Arc::new(config))
+}
+
 /// A [`StaticCertificateSource`](certificate_source::StaticCertificateSource) from
 /// the `[control.tls] mode = "static"` PEM files, with the same loading and
 /// errors as [`load_tls_material`] (the key is checked against the leaf).
