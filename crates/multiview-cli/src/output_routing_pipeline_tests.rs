@@ -594,7 +594,7 @@ fn a_private_bus_is_fed_the_post_loudnorm_program_pcm_up_to_g() {
     let tap = tap.lock().unwrap().clone().expect("tap");
     let tap = tap.lock().unwrap();
     // The take's move is the first (a later fallback may add another).
-    assert!(!tap.moves.is_empty());
+    assert_ne!(tap.moves.len(), 0, "the take scheduled a crossfade");
     let (_, g) = tap.moves[0];
     assert!(
         g <= (applied.tick * 1920).div_ceil(1024) * 1024,

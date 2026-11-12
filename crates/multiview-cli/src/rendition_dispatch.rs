@@ -2144,8 +2144,9 @@ impl RenditionDispatcher {
             }
         }
     }
-    /// The dynamic audio stage an output's program slot reads (`None` = the
-    /// shared program stage).
+    /// The dynamic audio stage an output's program slot reads (test
+    /// observation).
+    #[cfg(test)]
     pub(crate) fn binding_audio_key(&self, output_index: usize) -> Option<usize> {
         self.bindings
             .iter()
