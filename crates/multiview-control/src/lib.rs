@@ -905,9 +905,12 @@ pub fn site_server_config(
 /// challenge responder (RFC 8737) on the network front door's TCP door: the
 /// explicit `aws-lc-rs` provider (as [`load_tls_material`] / [`site_server_config`]),
 /// safe default protocol versions (TLS 1.3; RFC 8737 only requires TLS 1.2+),
-/// the cert resolver set to `resolver` ([`ChallengeResolver`](certificate_source::ChallengeResolver),
-/// which answers a challenge only when the `ClientHello`'s ALPN is exactly
-/// `acme-tls/1`, keyed by SNI), ALPN `acme-tls/1` only.
+/// a private challenge-only cert resolver over `resolver`
+/// ([`ChallengeResolver::challenge`](certificate_source::ChallengeResolver::challenge)):
+/// it answers only when the `ClientHello`'s ALPN is exactly `acme-tls/1`, SNI
+/// is present and a challenge is published for that name; otherwise it returns
+/// no certificate and rustls aborts the handshake, so this route never presents
+/// the site or bootstrap key. ALPN `acme-tls/1` only.
 ///
 /// This configuration never serves application data: a successful handshake
 /// is immediately followed by the front door closing the connection (slice 4,
@@ -923,9 +926,37 @@ pub fn acme_challenge_server_config(
     let mut config = rustls::ServerConfig::builder_with_provider(provider)
         .with_safe_default_protocol_versions()?
         .with_no_client_auth()
-        .with_cert_resolver(resolver);
+        .with_cert_resolver(std::sync::Arc::new(ChallengeOnly(resolver)));
     config.alpn_protocols = vec![b"acme-tls/1".to_vec()];
     Ok(std::sync::Arc::new(config))
+}
+
+/// The ACME route's resolver: a published TLS-ALPN-01 challenge or nothing.
+/// Unlike [`ChallengeResolver`](certificate_source::ChallengeResolver)'s own
+/// `resolve`, it never falls back to the site certificate source.
+#[cfg(all(feature = "tls", unix))]
+struct ChallengeOnly(std::sync::Arc<certificate_source::ChallengeResolver>);
+
+#[cfg(all(feature = "tls", unix))]
+impl std::fmt::Debug for ChallengeOnly {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("ChallengeOnly([redacted])")
+    }
+}
+
+#[cfg(all(feature = "tls", unix))]
+impl rustls::server::ResolvesServerCert for ChallengeOnly {
+    fn resolve(
+        &self,
+        hello: rustls::server::ClientHello<'_>,
+    ) -> Option<std::sync::Arc<rustls::sign::CertifiedKey>> {
+        let mut alpn = hello.alpn()?;
+        if alpn.next() != Some(b"acme-tls/1".as_slice()) || alpn.next().is_some() {
+            return None;
+        }
+        let name = hello.server_name()?;
+        self.0.challenge(name)
+    }
 }
 
 /// A [`StaticCertificateSource`](certificate_source::StaticCertificateSource) from

@@ -2,7 +2,9 @@
 //! `FrontDoorRun::install_acme_resolver` builds the TLS-ALPN-01 responder's
 //! `ServerConfig` and installs it without disturbing a previously installed
 //! site configuration, and vice versa (`install_site` no longer clobbers the
-//! ACME half back to `None`).
+//! ACME half back to `None`). The ACME route is challenge-only: an
+//! `acme-tls/1` hello for an unpublished name, or without SNI, aborts the
+//! handshake and never presents the site certificate.
 #![cfg(all(feature = "tls", unix))]
 #![allow(
     clippy::unwrap_used,
@@ -128,6 +130,41 @@ async fn handshake(
     Ok((negotiated, leaf_der))
 }
 
+/// One handshake attempt with an arbitrary `ServerName` (an IP literal sends
+/// no SNI). Returns the handshake result and the leaf the server presented,
+/// recorded even when the handshake then fails.
+async fn attempt(
+    addr: SocketAddr,
+    name: ServerName<'static>,
+    alpn: &[&[u8]],
+) -> (std::io::Result<()>, Option<Vec<u8>>) {
+    let verifier = Arc::new(AcceptAnyRecordLeaf(std::sync::Mutex::new(None)));
+    let dyn_verifier: Arc<dyn rustls::client::danger::ServerCertVerifier> = verifier.clone();
+    let mut cfg = rustls::ClientConfig::builder_with_provider(client_provider())
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .dangerous()
+        .with_custom_certificate_verifier(dyn_verifier)
+        .with_no_client_auth();
+    cfg.alpn_protocols = alpn.iter().map(|p| p.to_vec()).collect();
+    let connector = tokio_rustls::TlsConnector::from(Arc::new(cfg));
+    let result = match TcpStream::connect(addr).await {
+        Ok(tcp) => {
+            match tokio::time::timeout(Duration::from_secs(5), connector.connect(name, tcp)).await {
+                Ok(Ok(mut tls)) => {
+                    let _ = tls.shutdown().await;
+                    Ok(())
+                }
+                Ok(Err(e)) => Err(e),
+                Err(_) => Err(std::io::Error::other("handshake timed out")),
+            }
+        }
+        Err(e) => Err(e),
+    };
+    let leaf = verifier.0.lock().unwrap().clone();
+    (result, leaf)
+}
+
 fn self_signed(host: &str) -> Arc<CertifiedKey> {
     let ck = rcgen::generate_simple_self_signed(vec![host.to_owned()]).unwrap();
     let cert = CertificateDer::from(ck.cert.der().to_vec());
@@ -220,6 +257,86 @@ async fn acme_route_wired_through_install_acme_resolver() {
         .expect("the acme-tls/1 handshake still completes after the site install");
     assert_eq!(alpn2.as_deref(), Some(b"acme-tls/1".as_slice()));
     assert!(has_acme_identifier_oid(&leaf2));
+
+    tokio::task::spawn_blocking(move || door.shutdown_blocking())
+        .await
+        .unwrap();
+}
+
+/// A1: the ACME route never falls back to the site/bootstrap key. The
+/// resolver's site source here IS the site key, so a fallback would be
+/// observable as the site leaf.
+#[tokio::test(flavor = "multi_thread")]
+async fn acme_route_is_challenge_only() {
+    let site_key = self_signed("localhost");
+    let site_leaf = site_key.cert[0].as_ref().to_vec();
+    let site_source: Arc<dyn multiview_control::certificate_source::CertificateSource> =
+        Arc::new(StaticCertificateSource::new(Arc::clone(&site_key)));
+    let resolver = Arc::new(ChallengeResolver::new(Arc::clone(&site_source)));
+
+    let mut door = FrontDoor::start(&FrontDoorConfig {
+        port: 0,
+        workers: 2,
+        ..FrontDoorConfig::default()
+    })
+    .unwrap();
+    let addr = door
+        .start_tcp(
+            TcpDoorConfig {
+                listen: "[::1]:0".parse().unwrap(),
+                ..TcpDoorConfig::default()
+            },
+            TlsRouting::default(),
+            Some(Arc::new(FixedSite)),
+        )
+        .unwrap();
+    door.set_site_config(Some(
+        multiview_control::site_server_config(site_source).unwrap(),
+    ))
+    .unwrap();
+    door.set_acme_config(Some(
+        multiview_control::acme_challenge_server_config(Arc::clone(&resolver)).unwrap(),
+    ))
+    .unwrap();
+    resolver.publish(
+        "acme.test".to_owned(),
+        alpn_challenge_certificate("acme.test", b"key-authz").unwrap(),
+    );
+
+    // Unpublished SNI: the handshake fails and the site leaf is never shown.
+    let (result, leaf) = attempt(
+        addr,
+        ServerName::try_from("other.test").unwrap(),
+        &[b"acme-tls/1"],
+    )
+    .await;
+    assert!(
+        result.is_err(),
+        "acme-tls/1 for an unpublished name must fail"
+    );
+    assert_ne!(leaf.as_deref(), Some(site_leaf.as_slice()));
+    assert!(leaf.is_none(), "no certificate may be presented");
+
+    // No SNI (IP-literal server name): the handshake fails likewise.
+    let (result, leaf) =
+        attempt(addr, ServerName::try_from("::1").unwrap(), &[b"acme-tls/1"]).await;
+    assert!(result.is_err(), "acme-tls/1 without SNI must fail");
+    assert_ne!(leaf.as_deref(), Some(site_leaf.as_slice()));
+    assert!(leaf.is_none(), "no certificate may be presented");
+
+    // The published name still gets its challenge leaf.
+    let (alpn, leaf) = handshake(addr, "acme.test", &[b"acme-tls/1"])
+        .await
+        .expect("the published acme-tls/1 handshake completes");
+    assert_eq!(alpn.as_deref(), Some(b"acme-tls/1".as_slice()));
+    assert!(has_acme_identifier_oid(&leaf));
+    assert_ne!(leaf, site_leaf);
+
+    // The site route still serves the site leaf.
+    let (_, http_leaf) = handshake(addr, "acme.test", &[b"http/1.1"])
+        .await
+        .expect("the http/1.1 handshake completes");
+    assert_eq!(http_leaf, site_leaf);
 
     tokio::task::spawn_blocking(move || door.shutdown_blocking())
         .await

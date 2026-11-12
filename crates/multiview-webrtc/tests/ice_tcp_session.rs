@@ -16,7 +16,7 @@ use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 
 use multiview_webrtc::transport::{
-    tcp_passive_candidates, MediaKind, Session, SessionConfig, Transport,
+    resolve_local_destination, tcp_passive_candidates, MediaKind, Session, SessionConfig, Transport,
 };
 
 /// Shuttle every routed transmit from one peer into the other as TCP, until
@@ -170,4 +170,72 @@ fn tcp_candidates_one_per_concrete_host_ip() {
             "192.0.2.1:443".parse().unwrap(),
         ]
     );
+}
+
+/// Review M1 (PR 337): NAT 1:1 (`network.advertise`). The server session's
+/// only candidates are the advertised public passive TCP ones; an IPv4 active
+/// client's frames arrive on a dual-stack listener whose accepted socket
+/// reports the private, IPv4-mapped local address `[::ffff:10.0.0.5]:443`.
+/// Resolved through `resolve_local_destination` exactly as the unified
+/// driver does, the destination must be the IPv4 candidate: ICE+DTLS connect.
+#[test]
+fn ipv4_active_client_connects_behind_nat_1to1_with_a_mapped_local() {
+    let now = Instant::now();
+    let public_v6: SocketAddr = "[2001:db8::10]:443".parse().unwrap();
+    let public_v4: SocketAddr = "203.0.113.10:443".parse().unwrap();
+    let mapped_local: SocketAddr = "[::ffff:10.0.0.5]:443".parse().unwrap();
+    let tcp_candidates = [public_v6, public_v4];
+    let client: SocketAddr = "198.51.100.7:50125".parse().unwrap();
+
+    let mut publisher = Session::new(&SessionConfig::default(), now);
+    publisher.add_tcp_active_candidate(client).unwrap();
+    let mut ingest = Session::new(&SessionConfig::ingest(), now);
+    for c in tcp_candidates {
+        ingest.add_tcp_passive_candidate(c).unwrap();
+    }
+    let offer = publisher.create_offer(&[MediaKind::Video]).unwrap();
+    let answer = ingest.accept_offer(&offer).unwrap();
+    assert!(
+        answer.contains("203.0.113.10 443 typ host tcptype passive"),
+        "{answer}"
+    );
+    publisher.accept_answer(&answer).unwrap();
+
+    let mut clock = now;
+    let mut to_server = 0usize;
+    let mut connected = false;
+    for _ in 0..2000 {
+        publisher.handle_timeout(clock).unwrap();
+        ingest.handle_timeout(clock).unwrap();
+        while let Some(o) = publisher.poll_transmit_routed(clock) {
+            assert_eq!(o.transport, Transport::Tcp);
+            // The door reports the accepted socket's local end, not the
+            // advertised address the client dialled.
+            let dst = resolve_local_destination(mapped_local, &tcp_candidates);
+            assert_eq!(
+                dst, public_v4,
+                "a mapped v4 arrival resolves to the v4 candidate"
+            );
+            to_server += 1;
+            ingest
+                .handle_datagram_proto(Transport::Tcp, o.source, dst, &o.payload, clock)
+                .unwrap();
+        }
+        while let Some(o) = ingest.poll_transmit_routed(clock) {
+            assert_eq!(o.transport, Transport::Tcp);
+            publisher
+                .handle_datagram_proto(Transport::Tcp, o.source, o.destination, &o.payload, clock)
+                .unwrap();
+        }
+        if publisher.is_connected() && ingest.is_connected() {
+            connected = true;
+            break;
+        }
+        clock = publisher
+            .poll_timeout(clock)
+            .min(ingest.poll_timeout(clock))
+            .max(clock + Duration::from_millis(1));
+    }
+    assert!(to_server > 0, "the client sent frames to the server");
+    assert!(connected, "ICE+DTLS over ICE-TCP behind NAT 1:1");
 }

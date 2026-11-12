@@ -967,13 +967,29 @@ the engine's own TLS. The str0m ICE-TCP consumer and the browser ladder are PR2 
   driver path routes by `transport`, never by address: a TCP transmit is never sent over UDP (it is
   dropped when no TCP lane is wired).
 * **Driver**: `UnifiedEndpoint::run_shared_with_tcp(udp lane, Option<impl SharedTcp>, stop)`
-  (`run_shared` = no TCP). The TCP arm is polled after the tick, with the UDP arm's per-wake budget
-  (256 frames / 2 ms) and the same bounded handoff; no TURN classification (TURN is UDP here); the
-  frame's `local` resolves onto the passive TCP candidates; frames fan to every role as
-  `Transport::Tcp`. Outbound goes through `Egress { socket, tcp: Option<&dyn TcpSend> }`;
+  (`run_shared` = no TCP). The `select!` is biased tick → UDP → TCP, and the tick uses
+  `MissedTickBehavior::Delay` (a late tick runs once, never a burst; the socket-owning `run()` too).
+  Each lane wake drains at most one budget (256 items / 2 ms). **Fairness rule**: when a wake
+  exhausts its budget, the *other* lane is drained once, without waiting, with the same budget
+  (`try_next` loop) — a permanently ready UDP lane cannot starve TCP (or vice versa); every lane is
+  served at least once per two budgets. An exhausted wake is then followed by `yield_now` and one
+  full servicing pass (the bounded handoff), and the biased tick arm is polled first on the next
+  iteration. No TURN classification (TURN is UDP here); the frame's `local` resolves onto the
+  passive TCP candidates; frames fan to every role as `Transport::Tcp`. Outbound goes through `Egress { socket, tcp: Option<&dyn TcpSend> }`;
   `TcpSend::send` is the lane's synchronous drop-oldest queue, so nothing awaits a TCP peer
   (invariants #1/#10). `multiview-frontdoor` implements `SharedTcp` for `IceTcpLane` (feature
   `webrtc`); the str0m answer to an authenticated Binding Request is what lifts the door's probation.
+* **NAT 1:1 (`network.advertise`)**: the door reports the accepted socket's local address unmapped
+  (`IceTcpFrame.local`, canonical like `peer`), and `resolve_local_destination` unmaps an
+  IPv4-mapped arrival (`[::ffff:10.0.0.5]:443`) before its same-family match, so an IPv4 ICE-TCP
+  client behind NAT 1:1 resolves onto the advertised IPv4 passive candidate, not the IPv6 one.
+* **ACME route (`acme-tls/1`)**: `acme_challenge_server_config` wraps the `ChallengeResolver` in a
+  private challenge-only resolver: it answers only when ALPN is exactly `acme-tls/1`, SNI is present
+  and `ChallengeResolver::challenge(name)` has a published challenge; otherwise it returns no
+  certificate and rustls aborts the handshake. The ACME route never presents the site or bootstrap
+  key (the `ChallengeResolver`'s own site-fallback `resolve` is unchanged).
+* **Outbound queue**: `IceTcpSender::send` moves evicted (drop-oldest) frames out under the
+  per-connection lock and frees them after releasing it; `ice_tcp_dropped_out` counts each.
 * **Established set**: `Session::validated_peer()` reports only a peer validated over **UDP**; a
   session whose last accepted non-STUN datagram came over ICE-TCP reports none, so the UDP socket's
   established set never learns an address from a TCP path.
@@ -988,6 +1004,11 @@ the engine's own TLS. The str0m ICE-TCP consumer and the browser ladder are PR2 
   WHIP ingest endpoint on `run_shared_with_tcp`, a str0m client with no UDP socket at all over a real
   `TcpStream`: ICE + DTLS, >= 10 RTP packets into the ingest ring, the answer carries
   `tcptype passive` on the door port, 0 UDP datagrams at the door, nothing established; IPv6 and
-  IPv4 loopback).
+  IPv4 loopback); `ice_tcp_session.rs::ipv4_active_client_connects_behind_nat_1to1_with_a_mapped_local`
+  (advertised-only candidates, mapped local resolved as the driver does: ICE+DTLS connect);
+  `unified.rs::a_saturated_udp_lane_cannot_starve_the_tcp_lane_or_the_tick` (an always-ready UDP
+  lane plus N TCP frames: all N consumed and the idle tick keeps firing);
+  `multiview-cli/tests/acme_tls_alpn_resolver.rs::acme_route_is_challenge_only` (unpublished SNI and
+  no SNI fail the handshake with no certificate presented; the published name still works).
 * **Not in this PR**: a real-browser ICE-TCP check (browsers gather active TCP candidates
   themselves); the deferred items above other than the str0m consumer.
