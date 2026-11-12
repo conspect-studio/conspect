@@ -27,6 +27,10 @@ pub struct SwitcherFrameHook<C> {
     pub preview_slot: Option<Arc<SwapCell<Option<Arc<Nv12Image>>>>>,
     /// Shared store map, reused rather than decoding the preview source twice.
     pub preview_stores: Option<HashMap<String, Arc<TileStore<Nv12Image>>>>,
+    /// Wait-free PVW selection for the routed Preview feed (ADR-0108 §2.5):
+    /// written only when the PVW source changes, so it allocates only then.
+    pub preview_selection: Option<Arc<SwapCell<Option<Arc<str>>>>>,
+    last_preview: Option<Arc<str>>,
     fps_num: i64,
     fps_den: i64,
 }
@@ -47,6 +51,8 @@ impl<C> SwitcherFrameHook<C> {
             last_error: None,
             preview_slot: None,
             preview_stores: None,
+            preview_selection: None,
+            last_preview: None,
             fps_num: 0,
             fps_den: 0,
         }
@@ -108,6 +114,14 @@ impl<C: FnMut(&mut CompositorDrive<Nv12Image>)> FrameControl for SwitcherFrameHo
     }
 
     fn after_compose(&mut self, frame: &CompositedFrame) {
+        if let Some(selection) = &self.preview_selection {
+            let (_, preview) = self.driver.selections();
+            if self.last_preview.as_deref() != Some(preview.as_str()) {
+                let id: Arc<str> = Arc::from(preview.as_str());
+                selection.store(Some(Arc::clone(&id)));
+                self.last_preview = Some(id);
+            }
+        }
         // A cheap, wait-free source sample only (no lock, no allocation): the
         // selected PVW source's newest frame becomes the monitor picture. An
         // actual configured full-rate PVW output must instead own its own
