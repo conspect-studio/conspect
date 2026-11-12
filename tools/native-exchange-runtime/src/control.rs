@@ -13,40 +13,101 @@ use std::{
 pub type Slot = Arc<Mutex<(ReceiverRuntime, Output)>>;
 
 /// Gate for one receiver's grant worker. A cycle (root fetch, grant request,
-/// install) runs only while holding the gate's lock and only while it is open,
-/// so `close` returns only once no cycle is in flight and none can start. A
-/// caller that is about to cut a taker off (a withdrawal it sends itself)
-/// closes the gate FIRST, so no root or grant request of that worker can reach
-/// the authority after the cutoff was sent.
-#[derive(Default)]
+/// install) runs only while the gate is open, and is "busy" only while it may
+/// send a request or install a grant. `close` stops new cycles and waits until
+/// no cycle is busy. A cycle is not busy while it sleeps for epoch admission
+/// (`GatedClock::sleep`), and its next clock sample after that sleep fails once
+/// the gate is closed, so no request follows a `close`. A caller that is about
+/// to cut a taker off (a withdrawal it sends itself) closes the gate FIRST: no
+/// root or grant request of that worker reaches the authority afterwards, and
+/// `close` waits for at most the requests already in flight (each bounded by
+/// the transport timeout), never for an admission sleep.
 pub struct CycleGate {
-    open: AtomicBool,
-    cycle: Mutex<()>,
+    state: Mutex<(bool, bool)>, // (open, busy)
+    idle: std::sync::Condvar,
+}
+impl Default for CycleGate {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+/// A busy cycle; dropping it marks the gate idle.
+pub struct Cycle<'a>(&'a CycleGate);
+impl Drop for Cycle<'_> {
+    fn drop(&mut self) {
+        self.0.set_busy(false);
+    }
 }
 impl CycleGate {
     pub fn new() -> Self {
         Self {
-            open: AtomicBool::new(true),
-            cycle: Mutex::new(()),
+            state: Mutex::new((true, false)),
+            idle: std::sync::Condvar::new(),
         }
     }
-    /// Enter one cycle, or `None` once closed. Hold the guard for the cycle.
-    pub fn enter(&self) -> Option<std::sync::MutexGuard<'_, ()>> {
-        let guard = self.cycle.lock().unwrap_or_else(|e| e.into_inner());
-        self.open.load(Ordering::Acquire).then_some(guard)
+    fn lock(&self) -> std::sync::MutexGuard<'_, (bool, bool)> {
+        self.state.lock().unwrap_or_else(|e| e.into_inner())
+    }
+    fn set_busy(&self, busy: bool) {
+        self.lock().1 = busy;
+        if !busy {
+            self.idle.notify_all();
+        }
+    }
+    /// Start one busy cycle, or `None` once closed.
+    pub fn enter(&self) -> Option<Cycle<'_>> {
+        let mut state = self.lock();
+        if !state.0 {
+            return None;
+        }
+        state.1 = true;
+        Some(Cycle(self))
+    }
+    /// Mark the cycle idle for an admission sleep (no request is in flight).
+    fn pause(&self) {
+        self.set_busy(false);
+    }
+    /// Mark the cycle busy again before its next request; false once closed.
+    fn resume(&self) -> bool {
+        let mut state = self.lock();
+        state.1 = state.0;
+        state.0
     }
     /// Stop new cycles without waiting (a deny found by the worker itself).
     pub fn shut(&self) {
-        self.open.store(false, Ordering::Release);
+        self.lock().0 = false;
     }
-    /// Stop new cycles and wait for a request in flight (bounded by one
-    /// request: the worker holds the gate only for request + install).
+    /// Stop new cycles and wait until no cycle is busy.
     pub fn close(&self) {
-        self.shut();
-        drop(self.cycle.lock().unwrap_or_else(|e| e.into_inner()));
+        let mut state = self.lock();
+        state.0 = false;
+        while state.1 {
+            state = self.idle.wait(state).unwrap_or_else(|e| e.into_inner());
+        }
     }
     pub fn is_open(&self) -> bool {
-        self.open.load(Ordering::Acquire)
+        self.lock().0
+    }
+}
+/// The grant worker's epoch-admission clock. Every admission wait in the grant
+/// path (`bounded_grant`: the tail wait and the 404 retry's boundary wait) is a
+/// `sleep` followed by a `wall_ms` sample before the next request, so the
+/// cycle is idle while it sleeps and cannot send a request once the gate has
+/// closed meanwhile.
+pub struct GatedClock {
+    gate: Arc<[CycleGate; 2]>,
+    index: usize,
+}
+impl conspect_media_crypto::bootstrap::EpochAdmissionClock for GatedClock {
+    fn wall_ms(&self) -> conspect_media_crypto::bootstrap::Result<u64> {
+        if !self.gate[self.index].resume() {
+            return Err("grant worker stopped");
+        }
+        Ok(crate::wall_ms())
+    }
+    fn sleep(&self, duration: Duration) {
+        self.gate[self.index].pause();
+        thread::sleep(duration);
     }
 }
 
@@ -146,14 +207,17 @@ impl Coordinator {
             }));
         }
         for i in 0..2 {
-            let (stop, denied, gates, transport, booking, slot) = (
+            let (stop, denied, gates, transport, slot) = (
                 stop.clone(),
                 denied.clone(),
                 grants.clone(),
                 transport.clone(),
-                booking.clone(),
                 slots[i].clone(),
             );
+            let booking = booking.clone().with_admission_clock(Arc::new(GatedClock {
+                gate: grants.clone(),
+                index: i,
+            }));
             workers.push(thread::spawn(move || {
                 let mut due = Instant::now();
                 let mut attempt_epoch = u64::MAX;
@@ -170,11 +234,9 @@ impl Coordinator {
                                 + Duration::from_millis(5000 - crate::wall_ms() % 5000);
                             continue;
                         }
-                        // The gate is held only for the request and install below
-                        // (re-checked under it). It is released on every exit of
-                        // this block, including `continue`, so it is never held
-                        // while the worker waits for its next attempt: `close`
-                        // waits for at most one request in flight.
+                        // Busy only for the requests and install below; idle on
+                        // every exit of this block and during admission sleeps
+                        // (`GatedClock`), so `close` never waits for a wait.
                         let Some(_cycle) = gates[i].enter() else {
                             continue;
                         };
@@ -218,6 +280,9 @@ impl Coordinator {
                             // the tail. A refused, equivocating or rolled-back root
                             // is "canonical root rejected" and still denies below.
                             Err(conspect_media_crypto::bootstrap::ROOT_EXPIRED_IN_TRANSIT) => {}
+                            // The gate closed during an admission wait (the caller
+                            // quiesced this worker): no request was sent; stop.
+                            Err(_) if !gates[i].is_open() => {}
                             Err(_) => {
                                 let mut slot = slot.lock().unwrap();
                                 let (receiver, output) = &mut *slot;
@@ -310,76 +375,69 @@ impl Drop for Coordinator {
 
 #[cfg(test)]
 mod gate_tests {
-    use super::CycleGate;
+    use super::{CycleGate, GatedClock};
+    use conspect_media_crypto::bootstrap::EpochAdmissionClock;
     use std::sync::{mpsc, Arc};
-    use std::time::Duration;
-    /// `close` waits for the cycle in flight and no cycle starts after it.
+    use std::time::{Duration, Instant};
+    /// `close` waits for a busy cycle and no cycle starts after it.
     #[test]
-    fn close_waits_for_the_cycle_in_flight_and_blocks_new_ones() {
+    fn close_waits_for_a_busy_cycle_and_blocks_new_ones() {
         let gate = Arc::new(CycleGate::new());
         let (entered, wait_entered) = mpsc::channel();
         let (finish, wait_finish) = mpsc::channel::<()>();
-        let (done, wait_done) = mpsc::channel();
         let worker = {
             let gate = gate.clone();
             std::thread::spawn(move || {
-                let guard = gate.enter().expect("open gate");
+                let cycle = gate.enter().expect("open gate");
                 entered.send(()).unwrap();
                 wait_finish.recv().unwrap();
-                done.send("cycle finished").unwrap();
-                drop(guard);
+                drop(cycle);
             })
         };
         wait_entered.recv().unwrap();
         let closer = {
             let gate = gate.clone();
-            std::thread::spawn(move || {
-                gate.close();
-                "closed"
-            })
+            std::thread::spawn(move || gate.close())
         };
-        // While the cycle is in flight, close has not returned.
         std::thread::sleep(Duration::from_millis(50));
-        assert!(!closer.is_finished(), "close returned during a cycle");
+        assert!(!closer.is_finished(), "close returned during a busy cycle");
         assert!(!gate.is_open());
         finish.send(()).unwrap();
-        assert_eq!(wait_done.recv().unwrap(), "cycle finished");
-        assert_eq!(closer.join().unwrap(), "closed");
+        closer.join().unwrap();
         worker.join().unwrap();
         assert!(gate.enter().is_none(), "a cycle started after close");
     }
-    /// The worker's loop shape: a cycle that ends with `continue` (budget
-    /// spent, or an answer from an ended epoch) releases the gate before the
-    /// worker waits, so `close` does not wait for the next attempt.
+    /// The 404-retry boundary wait (up to an epoch) is an admission sleep:
+    /// `close` returns while the cycle sleeps, and the cycle's next clock
+    /// sample fails, so the retry request is never sent.
     #[test]
-    fn a_worker_waiting_for_its_next_attempt_does_not_hold_the_gate() {
-        let gate = Arc::new(CycleGate::new());
-        let (waiting, wait_waiting) = mpsc::channel();
-        let (stop, wait_stop) = mpsc::channel::<()>();
+    fn close_does_not_wait_for_an_admission_sleep_and_no_request_follows() {
+        let gates = Arc::new([CycleGate::new(), CycleGate::new()]);
+        let clock = Arc::new(GatedClock {
+            gate: gates.clone(),
+            index: 1,
+        });
+        let (sleeping, wait_sleeping) = mpsc::channel();
         let worker = {
-            let gate = gate.clone();
+            let (gates, clock) = (gates.clone(), clock.clone());
             std::thread::spawn(move || {
-                let mut first = true;
-                loop {
-                    if first {
-                        first = false;
-                        let Some(_cycle) = gate.enter() else {
-                            continue;
-                        };
-                        continue;
-                    }
-                    waiting.send(()).unwrap();
-                    // The long wait for the next attempt (up to an epoch).
-                    let _ = wait_stop.recv_timeout(Duration::from_secs(10));
-                    break;
-                }
+                let _cycle = gates[1].enter().expect("open gate");
+                clock.wall_ms().expect("first sample while open");
+                sleeping.send(()).unwrap();
+                clock.sleep(Duration::from_secs(3));
+                clock.wall_ms()
             })
         };
-        wait_waiting.recv().unwrap();
-        let started = std::time::Instant::now();
-        gate.close();
-        assert!(started.elapsed() < Duration::from_secs(1), "close waited");
-        stop.send(()).unwrap();
-        worker.join().unwrap();
+        wait_sleeping.recv().unwrap();
+        std::thread::sleep(Duration::from_millis(50));
+        let started = Instant::now();
+        gates[1].close();
+        assert!(
+            started.elapsed() < Duration::from_millis(500),
+            "close waited for the admission sleep"
+        );
+        assert_eq!(worker.join().unwrap(), Err("grant worker stopped"));
+        // The other taker's gate is unaffected.
+        assert!(gates[0].is_open());
     }
 }
