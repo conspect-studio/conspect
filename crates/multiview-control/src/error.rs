@@ -94,7 +94,16 @@ pub enum ControlError {
     /// A persistence/repository fault.
     #[error("repository error: {0}")]
     Repository(String),
+
+    /// The prospective accepted state is one the engine would refuse to start
+    /// from (issue #317): the declared switcher M/E cannot drive its canvas.
+    /// Nothing was applied or persisted.
+    #[error("{0}")]
+    NotAdmissibleWithSwitcher(multiview_config::SwitcherCanvasRefusal),
 }
+
+/// The stable problem `type` slug for [`ControlError::NotAdmissibleWithSwitcher`].
+pub const LAYOUT_NOT_ADMISSIBLE_WITH_SWITCHER: &str = "layout-not-admissible-with-switcher";
 
 impl ControlError {
     /// Map this error onto its RFC 9457 problem document.
@@ -155,6 +164,15 @@ impl ControlError {
             Self::Repository(msg) => {
                 Problem::new(500, "repository", "Internal repository error").with_detail(msg)
             }
+            // 422, like the switcher routes' refusal of an unsupported take and
+            // apply-layout's existing Class-2 refusal: the request is well-formed
+            // but not executable in the current configuration.
+            Self::NotAdmissibleWithSwitcher(refusal) => Problem::new(
+                422,
+                LAYOUT_NOT_ADMISSIBLE_WITH_SWITCHER,
+                "Not admissible while the switcher is on",
+            )
+            .with_detail(refusal.operator_message()),
         }
     }
 }

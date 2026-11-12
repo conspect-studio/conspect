@@ -5,7 +5,12 @@ import { afterAll, afterEach, beforeAll, describe, expect, it } from 'vitest';
 import { http, HttpResponse } from 'msw';
 import { setupServer } from 'msw/node';
 
-import { applyLayoutCommand, describeApplyError } from './applyLayout';
+import {
+  applyLayoutCommand,
+  blockedBySwitcher,
+  describeApplyError,
+  isSwitcherRefusal,
+} from './applyLayout';
 
 let lastBody: unknown;
 let lastAuth: string | null;
@@ -85,5 +90,38 @@ describe('describeApplyError', () => {
   it('prefers the problem detail, falls back to the message, then String()', () => {
     expect(describeApplyError(new Error('plain failure'))).toBe('plain failure');
     expect(describeApplyError('odd rejection')).toBe('odd rejection');
+  });
+});
+
+describe('switcher admission (#317)', () => {
+  it('recognises the typed refusal and keeps its operator reason', async () => {
+    server.use(
+      http.post('*/api/v1/commands/apply-layout', () => HttpResponse.json({
+        type: '/problems/layout-not-admissible-with-switcher',
+        title: 'Not admissible while the switcher is on',
+        status: 422,
+        detail: 'The switcher is on: a multi-cell layout cannot be the Program canvas.',
+      }, { status: 422 })),
+    );
+    const error: unknown = await applyLayoutCommand('news').catch((e: unknown) => e);
+    expect(isSwitcherRefusal(error)).toBe(true);
+    expect(describeApplyError(error)).toBe('The switcher is on: a multi-cell layout cannot be the Program canvas.');
+  });
+
+  it('does not mistake another 422 for the switcher refusal', async () => {
+    server.use(
+      http.post('*/api/v1/commands/apply-layout', () => HttpResponse.json(
+        { type: '/problems/validation', title: 'Request validation failed', status: 422, detail: 'x' },
+        { status: 422 },
+      )),
+    );
+    const error: unknown = await applyLayoutCommand('news').catch((e: unknown) => e);
+    expect(isSwitcherRefusal(error)).toBe(false);
+  });
+
+  it('blocks only multi-cell layouts while the switcher is on', () => {
+    expect(blockedBySwitcher(true, 6)).toBe(true);
+    expect(blockedBySwitcher(true, 1)).toBe(false);
+    expect(blockedBySwitcher(false, 6)).toBe(false);
   });
 });

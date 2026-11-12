@@ -461,7 +461,7 @@ export type ResyncReason = "seq_evicted" | "unknown_session" | "session_expired"
 export interface RouteOutputEvent {
   /** The take's operation id (empty for a fallback). */
   readonly operation_id: string;
-  readonly outcome: "applied" | "superseded" | "refused:feed-not-fresh" | "refused:capacity" | "refused:encoder-not-ready" | "refused:unroutable" | "fallback:aux-failed" | "fallback:encoder-failed";
+  readonly outcome: "applied" | "superseded" | "refused:feed-not-fresh" | "refused:capacity" | "refused:encoder-not-ready" | "refused:unroutable" | "refused:format-mismatch" | "fallback:aux-failed" | "fallback:encoder-failed";
   /** Output API id (matches the envelope `id`). */
   readonly output: string;
   /** Program tick at which the outcome was decided. */
@@ -681,7 +681,7 @@ export interface WallClockRef {
 }
 
 /** Stable catalog code of a health warning (kebab-case). `#[non_exhaustive]`: the catalog grows over time, so a client must treat an unknown code as a forward-compatible warning, not an error. */
-export type WarningCode = "gpu-present-no-vulkan-adapter" | "config-file-invalid" | "config-file-requires-restart" | "config-file-apply-incomplete" | "container-no-host-networking" | "catalogue-link-attention";
+export type WarningCode = "gpu-present-no-vulkan-adapter" | "config-file-invalid" | "config-file-requires-restart" | "config-file-apply-incomplete" | "container-no-host-networking" | "catalogue-link-attention" | "accepted-state-rejected";
 
 /** Severity of a health warning (sibling of AlertSeverity). */
 export type WarningSeverity = "info" | "warning" | "critical";

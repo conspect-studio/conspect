@@ -141,6 +141,7 @@ fn dispatcher(outputs: usize) -> RenditionDispatcher {
                 output_index: i,
                 video_key: Some(0),
                 audio_tracks: Vec::new(),
+                inband_parameter_changes_ok: true,
             })
             .collect(),
         first_tick: 0,
@@ -1034,6 +1035,7 @@ fn inject(
         seen_event: false,
         lost,
         generation,
+        silent: 0,
     });
     key
 }
@@ -1174,6 +1176,66 @@ fn two_hundred_open_close_cycles_reuse_retired_slots() {
     assert_eq!(r.dyn_dropped.load(Ordering::Relaxed), before + 1);
     assert!(!d.is_key_failed(key), "the new key is untouched");
     assert!(!r.dynamic[0].seen_event);
+}
+
+/// P (final-head abuse HIGH): an event is accepted only when ONE live key has
+/// both its generation and its key index. A closed worker's event tagged
+/// (generation = reused slot, key index = reused slot) matches another live
+/// key's generation but names the slot reused by a new key: it is dropped and
+/// counted, the new key's stage is untouched and the key does not fail.
+#[test]
+fn an_event_whose_generation_and_key_disagree_is_dropped() {
+    let live = Arc::new(AtomicUsize::new(0));
+    let (mut r, _h, _aux) = router(1, 6, Box::new(|_| Err("never".to_owned())));
+    let mut d = dispatcher(1);
+    let first = inject(&mut r, &mut d, src(), Counted::boxed(&live, 0));
+    let other = inject(&mut r, &mut d, src(), Counted::boxed(&live, 0));
+    assert_eq!((first, other), (1, 2));
+    r.close(first, &mut d);
+    // Let the closed worker end, then drain its tail (counted as dropped)
+    // so the counter below measures only the injected event.
+    let waited = Instant::now();
+    while live.load(Ordering::SeqCst) > 1 && waited.elapsed() < std::time::Duration::from_secs(2) {
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    assert_eq!(live.load(Ordering::SeqCst), 1, "the closed worker ended");
+    r.drain_live_events(&mut d, &mut NoDelivery).unwrap();
+    let reused_key = inject(&mut r, &mut d, src(), Counted::boxed(&live, 0));
+    assert_eq!(reused_key, first, "the closed key's slot is reused");
+    let reused = u64::try_from(reused_key).unwrap();
+    assert!(
+        r.dynamic
+            .iter()
+            .any(|k| k.generation == reused && k.key == other),
+        "generation {reused} names the other live key"
+    );
+    let before = r.dyn_dropped.load(Ordering::Relaxed);
+    // A timebase the key does not have: applied, it would fail the key.
+    r.dyn_tx
+        .try_send((
+            reused,
+            DispatchEvent::Video {
+                key_index: reused_key,
+                tick: 0,
+                timebase: Rational::new(1, 7),
+                packets: vec![pkt(0, true)],
+                watermark: None,
+            },
+        ))
+        .unwrap();
+    r.drain_live_events(&mut d, &mut NoDelivery).unwrap();
+    assert_eq!(r.dyn_dropped.load(Ordering::Relaxed), before + 1);
+    assert!(!d.is_key_failed(reused_key), "the new key does not fail");
+    assert!(
+        !d.is_key_failed(other),
+        "the generation's own key is untouched"
+    );
+    assert_eq!(
+        d.counters().dropped_unbound,
+        0,
+        "nothing reached first stage"
+    );
+    assert!(r.dynamic.iter().all(|k| !k.seen_event));
 }
 
 /// B: an open whose result arrives on its deadline tick (before the take's
@@ -1429,4 +1491,156 @@ fn the_control_adapter_maps_renamed_ids_to_their_own_index() {
         2,
         "the internal anchor is never exposed"
     );
+}
+
+/// A live encoder that, once `die` is set, panics on its next encode or
+/// (with `block`) blocks in it forever (until the test drops `release`).
+struct Dying {
+    inner: FakeEnc,
+    die: Arc<AtomicBool>,
+    block: Option<Mutex<Receiver<()>>>,
+}
+
+impl VideoEncodeWorker for Dying {
+    fn encode(&mut self, item: BakedTick) -> Result<Vec<EncodedPacket>, PipelineError> {
+        if self.die.load(Ordering::SeqCst) {
+            if let Some(gate) = &self.block {
+                let _ = gate.lock().unwrap().recv();
+            } else {
+                panic!("injected live encoder panic");
+            }
+        }
+        self.inner.encode(item)
+    }
+    fn reorder_bound(&self) -> ReorderBound {
+        ReorderBound::NoReorder
+    }
+    fn finish(&mut self) -> Result<Vec<EncodedPacket>, PipelineError> {
+        Ok(Vec::new())
+    }
+    fn force_keyframe(&mut self) {
+        self.inner.force_keyframe();
+    }
+}
+
+impl LiveEncoder for Dying {
+    fn start_at(&mut self, t0: u64) {
+        self.inner.start_at(t0);
+    }
+    fn time_base(&self) -> Rational {
+        Rational::new(1, 5)
+    }
+    fn move_gate(&self) -> MoveGate {
+        self.inner.move_gate()
+    }
+}
+
+/// U: drive a take onto a live encoder, make it die after the move (panic
+/// or block), and assert the output falls back to Program with
+/// Fallback(EncoderFailed) within `bound` ticks of the death, Program windows
+/// of the other output contiguous throughout.
+fn a_dying_live_encoder_falls_back(block: bool, bound: u64) {
+    let (release, gate) = mpsc::channel::<()>();
+    let mut gate = Some(gate);
+    let die = Arc::new(AtomicBool::new(false));
+    let kill = Arc::clone(&die);
+    let open: OpenFn = Box::new(move |_| {
+        let e: Box<dyn LiveEncoder> = Box::new(Dying {
+            inner: FakeEnc {
+                forced: false,
+                encoded: Arc::new(AtomicUsize::new(0)),
+            },
+            die: Arc::clone(&die),
+            block: if block {
+                gate.take().map(Mutex::new)
+            } else {
+                None
+            },
+        });
+        Ok(e)
+    });
+    let mut x = harness(2, 6, Some(open));
+    for t in 0..5 {
+        x.tick(t);
+    }
+    x.h.try_take(take("a", 1, src())).unwrap();
+    let mut t = 5;
+    let mut applied = false;
+    let mut attempts = 1;
+    // Same bound as the other end-to-end takes; a take refused on a loaded
+    // host (its encoder not ready in time) is retried, at most 3 times.
+    while t < 5 + 3 * OPEN_DEADLINE_TICKS && !applied {
+        x.tick(t);
+        let results = x.results();
+        applied = results.contains(&TakeResult::Applied);
+        if !applied && attempts < 3 && results.iter().any(|r| matches!(r, TakeResult::Refused(_))) {
+            attempts += 1;
+            x.h.try_take(take("a", 1, src())).unwrap();
+        }
+        t += 1;
+    }
+    assert!(applied, "the take applied before the encoder died");
+    assert_eq!(x.d.binding_video_key(1), Some(1));
+    kill.store(true, Ordering::SeqCst);
+    if !block {
+        // Tick once so the worker gets a frame, then wait (wall clock, not
+        // ticks: the host may be loaded) for its thread to have ended, so
+        // the detection below is the ended-worker path, not the wedge rule.
+        x.tick(t);
+        t += 1;
+        let waited = Instant::now();
+        while !x
+            .r
+            .dynamic
+            .iter()
+            .all(|d| d.worker.as_ref().is_none_or(RenditionWorker::is_finished))
+            && waited.elapsed() < std::time::Duration::from_secs(5)
+        {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
+    let mut fell = None;
+    let start = t;
+    while t < start + bound && fell.is_none() {
+        x.tick(t);
+        if x.results()
+            .contains(&TakeResult::Fallback(FallbackReason::EncoderFailed))
+        {
+            fell = Some(t);
+        }
+        t += 1;
+    }
+    let fell = fell.expect("Fallback(EncoderFailed) within the bound");
+    // The fallback lands at the next Program RAP (gop 5).
+    for t in fell + 1..fell + 8 {
+        x.tick(t);
+    }
+    assert_eq!(x.d.binding_video_key(1), Some(0), "back on Program");
+    assert_eq!(x.h.snapshot().dead_encoders, 1);
+    assert_eq!(x.h.snapshot().dynamic_encoders_live, 0);
+    let o0: Vec<i64> = x
+        .windows_of(0)
+        .iter()
+        .filter_map(|w| w.first().map(|p| p.0))
+        .collect();
+    assert!(
+        o0.windows(2).all(|w| w[1] == w[0] + 1) && o0.len() + 2 >= usize::try_from(fell).unwrap(),
+        "Program windows contiguous: {o0:?}"
+    );
+    drop(release);
+}
+
+/// U (HIGH): a live encoder that panics after the move is detected (worker ended), its key closed, the output back on Program.
+#[test]
+fn a_panicking_live_encoder_falls_back_to_program() {
+    // Detected on the first tick after the worker ended (never the 90-tick
+    // wedge rule).
+    a_dying_live_encoder_falls_back(false, 3);
+}
+
+/// U (HIGH): a live encoder that blocks forever in encode (wedged) is closed
+/// after `WEDGED_ENCODER_TICKS` offered ticks without an event.
+#[test]
+fn a_wedged_live_encoder_falls_back_to_program() {
+    a_dying_live_encoder_falls_back(true, u64::from(WEDGED_ENCODER_TICKS) + 20);
 }

@@ -550,6 +550,72 @@ impl std::fmt::Debug for StreamCodecParameters {
 }
 
 #[cfg(test)]
+mod rap_parameter_sets_tests {
+    #![allow(clippy::unwrap_used)]
+    use super::{EncodedPacket, StreamCodecParameters};
+    use crate::idr::RapParameterSets;
+    use ffmpeg_next::codec::{self, packet::Flags, packet::Packet};
+
+    /// H.264 parameters with no extradata (raw Annex-B encoder output).
+    #[allow(unsafe_code)]
+    fn h264_annexb() -> StreamCodecParameters {
+        let mut parameters = codec::Parameters::new();
+        // SAFETY: `parameters` exclusively owns a freshly allocated
+        // AVCodecParameters; only two plain enum fields are written.
+        unsafe {
+            let raw = parameters.as_mut_ptr();
+            (*raw).codec_type = ffmpeg_next::ffi::AVMediaType::AVMEDIA_TYPE_VIDEO;
+            (*raw).codec_id = ffmpeg_next::ffi::AVCodecID::AV_CODEC_ID_H264;
+        }
+        StreamCodecParameters {
+            parameters,
+            configured_bit_rate: None,
+            video_dimensions: None,
+        }
+    }
+
+    fn keyframe(au: &[u8]) -> EncodedPacket {
+        let mut raw = Packet::copy(au);
+        raw.set_pts(Some(0));
+        raw.set_dts(Some(0));
+        raw.set_flags(Flags::KEY);
+        EncodedPacket::from_packet(raw)
+    }
+
+    /// S (final-head media LOW): a real Annex-B AU whose SPS hides an
+    /// embedded start code (a synthesized PPS, forbidden bit clear) maps to
+    /// `Rejected` through the production extractor; a canonical AU maps to
+    /// `Sets` as length-prefixed (u32 BE) SPS then PPS.
+    #[test]
+    fn the_production_extractor_rejects_an_embedded_start_code() {
+        let params = h264_annexb();
+        assert_eq!(params.nal_framing(), Some(crate::idr::NalFraming::AnnexB));
+        let embedded = [
+            0, 0, 0, 1, 0x67, 0x42, 0x00, 0x1F, 0, 0, 1, 0x68, 0x11, 0x22, 0x33, 0, 0, 1, 0x68,
+            0xCE, 0x3C, 0x80, 0, 0, 1, 0x65, 0x88, 0x80,
+        ];
+        assert_eq!(
+            params.rap_parameter_sets(&keyframe(&embedded)),
+            RapParameterSets::Rejected
+        );
+        let canonical = [
+            0, 0, 0, 1, 0x67, 0x42, 0x00, 0x1F, 0, 0, 1, 0x68, 0xCE, 0x3C, 0x80, 0, 0, 1, 0x65,
+            0x88, 0x80,
+        ];
+        assert_eq!(
+            params.rap_parameter_sets(&keyframe(&canonical)),
+            RapParameterSets::Sets(vec![
+                0, 0, 0, 4, 0x67, 0x42, 0x00, 0x1F, 0, 0, 0, 4, 0x68, 0xCE, 0x3C, 0x80
+            ])
+        );
+        assert_eq!(
+            params.rap_parameter_sets(&keyframe(&[0, 0, 0, 1, 0x65, 0x88, 0x80])),
+            RapParameterSets::Absent
+        );
+    }
+}
+
+#[cfg(test)]
 mod nal_config_tests {
     use super::nal_framing_from_config;
     use crate::idr::{is_idr, CodecKind, NalFraming};

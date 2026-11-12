@@ -1239,7 +1239,7 @@ fn warning_code_schema() -> Value {
             "`#[non_exhaustive]`: the catalog grows over time, so a client must ",
             "treat an unknown code as a forward-compatible warning, not an error.",
         ),
-        "enum": ["gpu-present-no-vulkan-adapter", "config-file-invalid", "config-file-requires-restart", "config-file-apply-incomplete", "container-no-host-networking", "catalogue-link-attention"]
+        "enum": ["gpu-present-no-vulkan-adapter", "config-file-invalid", "config-file-requires-restart", "config-file-apply-incomplete", "container-no-host-networking", "catalogue-link-attention", "accepted-state-rejected"]
     })
 }
 
@@ -1608,7 +1608,7 @@ fn route_output_event_schema() -> Value {
             "tick": { "type": "integer", "format": "uint64", "description": "Program tick at which the outcome was decided." },
             "outcome": {
                 "type": "string",
-                "enum": ["applied", "superseded", "refused:feed-not-fresh", "refused:capacity", "refused:encoder-not-ready", "refused:unroutable", "fallback:aux-failed", "fallback:encoder-failed"]
+                "enum": ["applied", "superseded", "refused:feed-not-fresh", "refused:capacity", "refused:encoder-not-ready", "refused:unroutable", "refused:format-mismatch", "fallback:aux-failed", "fallback:encoder-failed"]
             }
         }
     })

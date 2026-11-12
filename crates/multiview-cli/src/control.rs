@@ -2325,6 +2325,24 @@ impl CommandDrain {
             );
             return;
         }
+        // #317 backstop: the route refuses this with a typed 422 before persisting;
+        // the drain re-checks with the SAME start-up admission rule so no other
+        // submitter can put a canvas under the M/E that the engine could not boot.
+        // Pure comparisons over the solved cells; no allocation on the Ok path.
+        if let Err(refusal) = multiview_config::switcher_canvas_admission(
+            self.config.switcher.as_ref(),
+            &resolved.solved,
+            &resolved.document.cells,
+            &self.config.overlays,
+        ) {
+            tracing::warn!(
+                layout = %id,
+                reason = %refusal,
+                "apply_layout held: the switcher M/E cannot drive this canvas; not applied live"
+            );
+            self.publish_apply_held(id, &refusal.operator_message());
+            return;
+        }
         let cells = resolved.solved.cells.len();
         #[cfg(feature = "ffmpeg")]
         for id in resolved
@@ -3959,6 +3977,62 @@ input_id = "in_b"
             saw_held,
             "a held stored-layout apply emits an apply_layout_held outcome (inv #10 drop-oldest)"
         );
+    }
+
+    /// #317 backstop: with a switcher M/E declared, a stored multi-cell layout
+    /// reaching the drain (the route refuses it first) is HELD with the
+    /// operator reason, never swapped under the running M/E.
+    #[test]
+    fn apply_layout_multi_cell_under_a_switcher_is_held() {
+        let mut config = test_config();
+        config.switcher = Some(multiview_config::SwitcherConfig {
+            mix_effects: vec![multiview_config::MixEffectsConfig {
+                id: "me1".into(),
+                program: "main".into(),
+                program_source: "in_a".into(),
+                preview_source: "in_b".into(),
+                flip_flop: true,
+            }],
+            extra: serde_json::Map::new(),
+        });
+        let publisher = Arc::new(EnginePublisher::<EngineStateSnapshot, Event>::new(16));
+        let (sender, command_rx) = command_bus(8);
+        let mut drain = CommandDrain::new(command_rx, config.clone(), Arc::clone(&publisher));
+        let mut drive = test_drive(&config);
+        let before = drive.layout().clone();
+        let mut sub = publisher.subscribe();
+        let body = serde_json::json!({
+            "canvas": matching_canvas(),
+            "layout": { "kind": "absolute" },
+            "cells": [
+                { "id": "l", "rect": { "x": 0.0, "y": 0.0, "w": 0.5, "h": 1.0 }, "source": { "input_id": "in_a" } },
+                { "id": "r", "rect": { "x": 0.5, "y": 0.0, "w": 0.5, "h": 1.0 }, "source": { "input_id": "in_b" } }
+            ]
+        });
+        let document = multiview_config::LayoutDocument::from_body(&body).expect("body parses");
+        let solved = document.solve_named("NewsOne").expect("body solves");
+        sender
+            .try_submit(Command::ApplyLayout {
+                op: OperationId::new(),
+                layout: "NewsOne".to_owned(),
+                document: Some(Box::new(multiview_control::ResolvedLayout::new(
+                    solved, document,
+                ))),
+            })
+            .expect("submit apply-layout");
+        let _ = drain.apply(&mut drive);
+        assert_eq!(drive.layout().cells, before.cells, "held, never swapped");
+        let mut saw_held = false;
+        while let Ok(seq) = sub.try_recv() {
+            if let Event::JobProgress(progress) = seq.event.as_ref() {
+                if progress.phase == "apply_layout_held" {
+                    let message = progress.message.as_deref().unwrap_or_default();
+                    assert!(message.contains("The switcher is on"), "{message:?}");
+                    saw_held = true;
+                }
+            }
+        }
+        assert!(saw_held, "the hold is observable on the realtime stream");
     }
 
     /// MINOR-3 (ADR-W019 review): the drain's pinned-canvas backstop compares

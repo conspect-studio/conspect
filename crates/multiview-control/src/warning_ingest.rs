@@ -56,6 +56,28 @@ pub fn emit_network_warnings<S>(
     1
 }
 
+/// Raise the latched `accepted-state-rejected` warning (#317): the saved accepted
+/// state could not start and the engine started from the last state that
+/// started. `message` names what was rejected, why, and where it was kept.
+/// Published once at start-up through the drop-oldest lane (inv #10), before the
+/// output clock exists (inv #1).
+pub fn emit_accepted_state_rejected<S>(
+    publisher: &EnginePublisher<S, Event>,
+    message: String,
+    since_nanos: i64,
+) {
+    tracing::error!(code = "accepted-state-rejected", %message, "accepted state rejected at start");
+    publisher.publish_event(Event::HealthWarningRaised(HealthWarning {
+        code: WarningCode::AcceptedStateRejected,
+        severity: WarningSeverity::Critical,
+        subsystem: "config".to_owned(),
+        message,
+        remediation: "Check the configuration (`multiview validate <config>`); fix the cause or re-apply a layout the switcher can use. The rejected file is kept for inspection; this warning clears on the next clean start.".to_owned(),
+        since: since_nanos,
+        active: true,
+    }));
+}
+
 /// A control-owned, dependency-light view of the SA-0 composite MISMATCH.
 ///
 /// The build site (the CLI) computes the both-halves cross-check with

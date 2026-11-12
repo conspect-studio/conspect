@@ -31,6 +31,15 @@ fn release_command_invokes_tls_authority_media_receipts_and_cutoff() {
 fn withdraw_command_cuts_off_both_takers() {
     scenario("withdraw", false, false, "");
 }
+/// #313 / PR #312: no root request may reach the authority once the client has
+/// sent the withdrawal. The mock holds every root answer 900 ms, so a grant
+/// worker cycle is in flight most of the time, and asserts that none is in
+/// flight when the withdrawal arrives. A root that arrives after it is caught
+/// by the mock's "root fetched after the withdrawal" assertion.
+#[test]
+fn withdraw_with_slow_cutoff_answers_fetches_no_root_after_the_withdrawal() {
+    scenario("withdraw", false, false, "withdraw-held-cutoff");
+}
 #[test]
 fn exhaustion_command_uses_decoded_receipts() {
     scenario("exhaustion", false, false, "");
@@ -78,6 +87,41 @@ fn credit_cutoff_late_b_grants_do_not_stop_b_decoding() {
 #[test]
 fn credit_cutoff_fragment_past_a_window_fails_with_static_reason() {
     scenario("credit-cutoff", false, false, "late-fragment");
+}
+/// Deterministic reproduction of the CI `FFmpeg command failed` mode: B's epoch
+/// grant is unobtainable for the whole epoch that precedes A's expiry, so every
+/// object B parked in that epoch is dropped as stale. A taker with no accepted
+/// bytes for a track has nothing to decode; that is not a decode failure and
+/// must not end the run before A's paid boundary is probed (404) at expiry.
+#[test]
+fn credit_cutoff_stale_b_epoch_still_probes_the_paid_boundary() {
+    scenario("credit-cutoff", false, false, "late-b-epoch");
+}
+#[test]
+fn credit_cutoff_late_mapping_answer_still_probes_the_paid_boundary() {
+    scenario("credit-cutoff", false, false, "late-mapping-grant");
+}
+#[test]
+fn credit_cutoff_mapping_refusal_is_not_retried() {
+    scenario("credit-cutoff", false, false, "mapping-refusal");
+}
+/// D3: the authority's takeover fence (`notBeforeMs`) ends 350 ms before an
+/// epoch boundary, so the client's startup root fetch is due in the epoch tail.
+/// A root request sent there is answered for its arrival epoch after the
+/// boundary and is rejected as expired; before the fix that ended the whole run
+/// ("canonical root rejected") before A's paid boundary was ever probed.
+#[test]
+fn credit_cutoff_startup_root_in_epoch_tail_still_probes_the_paid_boundary() {
+    scenario("credit-cutoff", false, false, "root-in-epoch-tail");
+}
+/// Decrements a root-in-flight counter once a held answer has been written.
+struct InFlight(Option<Arc<std::sync::atomic::AtomicU32>>);
+impl Drop for InFlight {
+    fn drop(&mut self) {
+        if let Some(count) = &self.0 {
+            count.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
 }
 fn scenario(scenario: &'static str, slow: bool, deny_renew: bool, variant: &'static str) {
     // Admit one six-stream FFmpeg/TLS fixture at a time. These wall-clock
@@ -139,6 +183,15 @@ fn scenario(scenario: &'static str, slow: bool, deny_renew: bool, variant: &'sta
         let mut extensions = [Vec::new(), Vec::new()];
         let mut deferred: Vec<std::thread::JoinHandle<()>> = Vec::new();
         let mut delayed_grants = 0u32;
+        let mut mapping_grants = 0u32;
+        // root-in-epoch-tail: the lease's notBeforeMs (wall) and the epoch phase
+        // at which the first current-epoch request arrived.
+        let mut not_before_ms = 1u64;
+        let mut first_root_phase: Option<u64> = None;
+        let mut held_roots = 0u32;
+        // withdraw-held-cutoff: root requests answered-but-held, and withdrawals.
+        let roots_in_flight = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let mut withdrawals = 0u32;
         while !stopped.load(Ordering::SeqCst) {
             let (s, _) = match listener.accept() {
                 Ok(s) => s,
@@ -187,9 +240,21 @@ fn scenario(scenario: &'static str, slow: bool, deny_renew: bool, variant: &'sta
             let mut binary = false;
             let response = if path.ends_with("/lease/acquire") {
                 status = 201;
+                if variant == "root-in-epoch-tail" {
+                    // The client may seal (and so fetch a root) from notBeforeMs
+                    // plus its 1000 ms clock uncertainty: place that instant at
+                    // epoch phase 4650, at least 2 s from now.
+                    let target = (now() + 2000) / 5000 * 5000 + 4650;
+                    let target = if target < now() + 2000 {
+                        target + 5000
+                    } else {
+                        target
+                    };
+                    not_before_ms = target - 1000;
+                }
                 // The token is minted once, on acquire, and never appears on a
                 // renewal answer.
-                json!({"generation":793,"leaseToken":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA","leaseExpiresAtMs":now()+10000,"notBeforeMs":1})
+                json!({"generation":793,"leaseToken":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA","leaseExpiresAtMs":now()+10000,"notBeforeMs":not_before_ms})
             } else if path.ends_with("/lease/renew") {
                 renewals.push(std::time::Instant::now());
                 if deny_renew && renewals.len() >= 8 {
@@ -205,7 +270,7 @@ fn scenario(scenario: &'static str, slow: bool, deny_renew: bool, variant: &'sta
                     body["leaseToken"].as_str().is_some(),
                     "a renewal must present the retained lease token"
                 );
-                json!({"generation":793,"leaseExpiresAtMs":now()+10000,"notBeforeMs":1})
+                json!({"generation":793,"leaseExpiresAtMs":now()+10000,"notBeforeMs":not_before_ms})
             } else if path.ends_with("/lease/release") {
                 if scenario == "withdraw" && denied {
                     status = 404;
@@ -257,6 +322,14 @@ fn scenario(scenario: &'static str, slow: bool, deny_renew: bool, variant: &'sta
                     "root fetched after the withdrawal (sealing continued)"
                 );
                 roots += 1;
+                let phase = now() % 5000;
+                first_root_phase.get_or_insert(phase);
+                if variant == "root-in-epoch-tail" && roots == 1 && phase >= 4000 {
+                    // Built below for the arrival epoch, answered 30 ms after the
+                    // boundary (well inside the 1 s transport timeout).
+                    held_roots += 1;
+                    eprintln!("mock: first root request at epoch phase {phase} ms; answer crosses the boundary");
+                }
                 let mut dto = json!({"versionId":"ver_test","publisherMachineId":"mac_pub","generation":793,"epoch":now()/5000,"epochStartMs":now()/5000*5000,"epochEndMs":(now()/5000+1)*5000,"feedCryptoId":URL_SAFE_NO_PAD.encode([9;16]),"versionCryptoId":URL_SAFE_NO_PAD.encode([3;16]),"publisherMachineCryptoId":URL_SAFE_NO_PAD.encode([5;16]),"contributorOrgCryptoId":URL_SAFE_NO_PAD.encode([10;16]),"rootKeyBase64":STANDARD.encode([11;32])});
                 if scenario == "raw-mismatch" {
                     dto["feedCryptoId"] = json!(URL_SAFE_NO_PAD.encode([99; 16]));
@@ -264,12 +337,24 @@ fn scenario(scenario: &'static str, slow: bool, deny_renew: bool, variant: &'sta
                 if scenario == "missing-window" {
                     dto.as_object_mut().unwrap().remove("epochEndMs");
                 }
+                if held_roots == 1 && roots == 1 {
+                    std::thread::sleep(std::time::Duration::from_millis(5000 - phase + 30));
+                }
                 if scenario == "late-root" {
                     std::thread::sleep(std::time::Duration::from_millis(5000 - now() % 5000 + 20));
                 }
                 dto
             } else if path.ends_with("/grants") {
-                if scenario == "credit-cutoff" && path.contains("org_a/") && now() >= expiry[0] {
+                if books.len() == 2 && path.contains("org_a/") {
+                    mapping_grants += 1;
+                }
+                if variant == "mapping-refusal" && mapping_grants == 1 {
+                    status = 403;
+                    json!({"error":"refused"})
+                } else if scenario == "credit-cutoff"
+                    && path.contains("org_a/")
+                    && now() >= expiry[0]
+                {
                     boundary_denials += 1;
                     status = 404;
                     json!({"type":"about:blank","title":"Not Found","status":404,"detail":"booking expired"})
@@ -350,6 +435,12 @@ fn scenario(scenario: &'static str, slow: bool, deny_renew: bool, variant: &'sta
                 charged_totals[i] += 1;
                 json!({"sequence":body["sequence"],"chargedMicro":1,"chargedMicroTotal":charged_totals[i],"reservedMicro":10000,"stopReason":if scenario=="exhaustion"&&path.contains("org_a/"){Some("reservation_exhausted")}else{None}})
             } else if path.ends_with("/withdraw") {
+                assert_eq!(
+                    roots_in_flight.load(Ordering::SeqCst),
+                    0,
+                    "withdrawal sent while a root request was in flight"
+                );
+                withdrawals += 1;
                 denied = true;
                 json!({})
             } else if path.ends_with("/release") {
@@ -375,6 +466,25 @@ fn scenario(scenario: &'static str, slow: bool, deny_renew: bool, variant: &'sta
                 "application/json"
             };
             let mut hold_ms = 0u64;
+            let mut in_flight_guard: Option<Arc<std::sync::atomic::AtomicU32>> = None;
+            if variant == "late-mapping-grant"
+                && mapping_grants == 1
+                && path.ends_with("/grants")
+                && path.contains("org_a/")
+            {
+                hold_ms = 1500;
+                delayed_grants += 1;
+            }
+            if variant == "withdraw-held-cutoff" && path.contains("/current-epoch?") {
+                // Every root answer is held 900 ms (inside the 1 s transport
+                // timeout), so a grant-worker cycle is in flight most of the
+                // time. The withdrawal must never be sent while one is.
+                hold_ms = 900;
+                delayed_grants += 1;
+                let flight = roots_in_flight.clone();
+                flight.fetch_add(1, Ordering::SeqCst);
+                in_flight_guard = Some(flight);
+            }
             if variant == "late-b-grants" && path.ends_with("/grants") && path.contains("org_b/") {
                 let phase = now() % 5000;
                 if !(200..4000).contains(&phase) {
@@ -385,12 +495,29 @@ fn scenario(scenario: &'static str, slow: bool, deny_renew: bool, variant: &'sta
                     );
                 }
             }
+            if variant == "late-b-epoch"
+                && path.ends_with("/grants")
+                && path.contains("org_b/")
+                && books.len() == 2
+                // The epoch immediately before the one holding A's expiry: B's
+                // grant is unobtainable for that entire epoch (every request is
+                // answered after the epoch ends), so everything it parks there
+                // ages past the replay window and is dropped as stale. The next
+                // epoch's grants are answered normally, so B decodes again.
+                && now() >= expiry[0].saturating_sub(window_ms).saturating_add(5000)
+                && now() < expiry[0].saturating_add(5000)
+            {
+                delayed_grants += 1;
+                hold_ms = 5000;
+                eprintln!("mock: holding B grant answer {hold_ms} ms for the pre-expiry epoch");
+            }
             let write_answer = move || {
                 let mut tls = tls;
                 if hold_ms > 0 {
                     std::thread::sleep(std::time::Duration::from_millis(hold_ms));
                 }
                 let sent = (|| -> std::io::Result<()> {
+                    let _done = InFlight(in_flight_guard);
                     write!(tls,"HTTP/1.1 {status} OK\r\ncontent-type: {typ}\r\ncontent-length: {}\r\ncache-control: no-store, private\r\nconnection: close\r\n\r\n",bytes.len())?;
                     tls.write_all(&bytes)?;
                     tls.flush()
@@ -435,9 +562,43 @@ fn scenario(scenario: &'static str, slow: bool, deny_renew: bool, variant: &'sta
                     .windows(2)
                     .all(|w| w[1].duration_since(w[0]) <= std::time::Duration::from_secs(30)));
             }
+        } else if variant == "mapping-refusal" {
+            assert_eq!(mapping_grants, 1, "an answered 403 must not be retried");
+        } else if variant == "late-mapping-grant" {
+            assert_eq!(delayed_grants, 1);
+            assert!(mapping_grants >= 2, "transport timeout was not retried");
+            assert!(boundary_denials > 0, "A paid boundary not probed");
+            assert!(receipts > 0);
+        } else if variant == "root-in-epoch-tail" {
+            // The fence really ended in the tail, and the client still fetched its
+            // first root outside the tail, then reached A's paid boundary.
+            assert!(not_before_ms > 1 && (not_before_ms + 1000) % 5000 == 4650);
+            let phase = first_root_phase.expect("no root fetched");
+            assert!(
+                (250..3500).contains(&phase),
+                "first root request in the epoch tail at phase {phase} ms"
+            );
+            assert!(boundary_denials > 0, "A paid boundary not probed");
+            assert_eq!(extensions[0].len(), 1);
+            assert!(!extensions[1].is_empty(), "B must extend with 201");
+            assert!(receipts > 0);
         } else if variant == "late-b-grants" {
             assert!(delayed_grants > 0, "the mock never delayed a B grant");
             assert!(boundary_denials > 0);
+            assert_eq!(extensions[0].len(), 1);
+            assert!(!extensions[1].is_empty(), "B must extend with 201");
+            assert!(receipts > 0);
+        } else if variant == "withdraw-held-cutoff" {
+            assert!(delayed_grants > 0, "the mock never held a root answer");
+            assert_eq!(withdrawals, 1, "the withdrawal was never sent");
+            assert!(denied);
+            assert!(receipts > 0);
+        } else if variant == "late-b-epoch" {
+            assert!(delayed_grants > 0, "the mock never delayed a B grant");
+            assert!(
+                boundary_denials > 0,
+                "A's paid boundary was never probed after the stale B epoch"
+            );
             assert_eq!(extensions[0].len(), 1);
             assert!(!extensions[1].is_empty(), "B must extend with 201");
             assert!(receipts > 0);
@@ -512,6 +673,11 @@ fn scenario(scenario: &'static str, slow: bool, deny_renew: bool, variant: &'sta
         String::from_utf8_lossy(&output.stderr)
     );
     server_result.unwrap();
+    if variant == "mapping-refusal" {
+        assert!(!output.status.success(), "refused mapping must fail closed");
+        assert!(String::from_utf8_lossy(&output.stderr).contains("mapping grant rejected"));
+        return;
+    }
     if negative {
         assert!(
             !output.status.success(),
@@ -581,6 +747,32 @@ fn scenario(scenario: &'static str, slow: bool, deny_renew: bool, variant: &'sta
         };
         assert!(field("parked=") > 0, "no B object was parked: {report}");
         assert!(field("drained=") > 0, "no parked B object opened: {report}");
+    }
+    if variant == "late-b-epoch" {
+        // What the mock decides, independent of where the client's phases fall:
+        // B had no obtainable grant for the held window, so its parked objects
+        // aged out of the replay window. That B decoded again afterwards is the
+        // client's own fatal `decode_evidence` check ("second receiver did not
+        // advance after paid expiry"), so a passing run proves it. Whether a
+        // phase ends with ZERO accepted bytes depends on phase alignment; that
+        // state (D2) is pinned deterministically one level down by the unit
+        // test `all_stale_parked_objects_give_an_empty_input_that_is_skipped_not_decoded`.
+        let out = String::from_utf8_lossy(&output.stdout);
+        let report = out
+            .lines()
+            .find(|l| l.starts_with("credit-cutoff B late-grant report:"))
+            .expect("late-grant report");
+        let field = |name: &str| -> u64 {
+            report
+                .split_whitespace()
+                .find_map(|w| w.strip_prefix(name))
+                .and_then(|v| v.parse().ok())
+                .unwrap()
+        };
+        assert!(
+            field("stale=") > 0,
+            "no parked B object went stale: {report}"
+        );
     }
     if scenario == "withdraw" {
         assert!(

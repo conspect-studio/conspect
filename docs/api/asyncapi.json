@@ -1834,6 +1834,7 @@
               "refused:capacity",
               "refused:encoder-not-ready",
               "refused:unroutable",
+              "refused:format-mismatch",
               "fallback:aux-failed",
               "fallback:encoder-failed"
             ],
@@ -2490,7 +2491,8 @@
           "config-file-requires-restart",
           "config-file-apply-incomplete",
           "container-no-host-networking",
-          "catalogue-link-attention"
+          "catalogue-link-attention",
+          "accepted-state-rejected"
         ],
         "type": "string"
       },

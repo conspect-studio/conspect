@@ -8570,7 +8570,7 @@ export interface components {
          *     Serde-equivalent: a unit enum rendered as its `kebab-case` variant name.
          * @enum {string}
          */
-        WarningCodeDoc: "gpu-present-no-vulkan-adapter" | "container-no-host-networking" | "catalogue-link-attention";
+        WarningCodeDoc: "gpu-present-no-vulkan-adapter" | "container-no-host-networking" | "catalogue-link-attention" | "accepted-state-rejected";
         /**
          * @description `OpenAPI` mirror of [`multiview_events::WarningSeverity`] (SA-0).
          *
@@ -10015,7 +10015,7 @@ export interface operations {
                     "application/json": components["schemas"]["Problem"];
                 };
             };
-            /** @description The layout id does not exist, its stored body does not parse/solve, its canvas differs from the running session's pinned canvas (Class-2), or the running canvas is unknown (no seeded snapshot — the gate fails closed). */
+            /** @description The layout id does not exist, its stored body does not parse/solve, its canvas differs from the running session's pinned canvas (Class-2), the running canvas is unknown (no seeded snapshot — the gate fails closed), or a switcher M/E is declared and the layout is not one full-canvas cell bound to its program source (type `/problems/layout-not-admissible-with-switcher`; nothing is applied or persisted). */
             422: {
                 headers: {
                     [name: string]: unknown;

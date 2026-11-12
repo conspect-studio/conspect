@@ -742,3 +742,48 @@ fn endpoint_binds_dual_stack_socket() {
     let local = endpoint.local_addr().expect("bound addr");
     assert!(local.is_ipv6(), "bound IPv6 dual-stack, not 0.0.0.0");
 }
+
+/// Review finding (PR 315, protocol lens): str0m accepts a STUN Binding
+/// request with valid MESSAGE-INTEGRITY from ANY source address, so the
+/// front door's established set must not trust "str0m accepted a datagram
+/// from X". Only the nominated destination counts.
+#[test]
+fn only_the_nominated_peer_is_validated_never_a_spoofed_source() {
+    let (mut a, a_addr, mut b, b_addr) = offerer_answerer();
+    let now = Instant::now();
+    a.add_host_candidate(a_addr).unwrap();
+    b.add_host_candidate(b_addr).unwrap();
+    let offer = a.create_offer(&[MediaKind::Video]).unwrap();
+    let answer = b.accept_offer(&offer).unwrap();
+    a.accept_answer(&answer).unwrap();
+    assert!(pump_until(&mut a, a_addr, &mut b, b_addr, now, |a, b| a
+        .is_connected()
+        && b.is_connected()
+        && b.validated_peer().is_some()));
+    assert_eq!(b.validated_peer(), Some(a_addr), "the nominated peer");
+
+    // Capture a's next authenticated Binding request (a consent/keepalive
+    // check) and replay it to b from a spoofed address.
+    let mut clock = now;
+    let mut check = None;
+    for _ in 0..2000 {
+        clock += Duration::from_millis(50);
+        a.handle_timeout(clock).unwrap();
+        while let Some((_s, _d, payload)) = a.poll_transmit(clock) {
+            if payload.len() >= 20 && payload[0] == 0x00 && payload[1] == 0x01 {
+                check = Some(payload);
+            }
+        }
+        if check.is_some() {
+            break;
+        }
+    }
+    let check = check.expect("a sends an authenticated Binding request");
+    let spoofed: SocketAddr = "[2001:db8::66]:4444".parse().unwrap();
+    b.handle_datagram(spoofed, b_addr, &check, clock).unwrap();
+    assert_eq!(
+        b.validated_peer(),
+        Some(a_addr),
+        "a spoofed source with valid MESSAGE-INTEGRITY is never validated"
+    );
+}

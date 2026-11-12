@@ -582,6 +582,26 @@ mod tests {
         assert_eq!(mpeg2_sequence_header(&[0, 0, 1, 0x00, 1]), None);
     }
 
+    /// V4: the compared MPEG-2 "sets" are the sequence header only: a
+    /// following sequence extension (`00 00 01 B5`) and GOP header
+    /// (`00 00 01 B8`, whose time code changes every GOP) never enter them.
+    #[test]
+    fn mpeg2_sequence_header_ignores_the_gop_time_code() {
+        let gop = |tc: u8| {
+            vec![
+                0, 0, 1, 0xB3, 0x78, 0x04, 0x38, 0x35, 0, 0, 1, 0xB5, 0x14, 0x8A, 0, 0, 1, 0xB8,
+                0x00, tc, 0x08, 0x00, 0, 0, 1, 0x00, 0x00, 0x0F,
+            ]
+        };
+        let (a, b) = (gop(0x08), gop(0x48));
+        assert_ne!(a, b);
+        assert_eq!(mpeg2_sequence_header(&a), mpeg2_sequence_header(&b));
+        assert_eq!(
+            mpeg2_sequence_header(&a),
+            Some(&[0, 0, 1, 0xB3, 0x78, 0x04, 0x38, 0x35][..])
+        );
+    }
+
     #[test]
     fn leb128_single_and_multi_byte() {
         assert_eq!(read_leb128(&[0x00], 0), Some((0, 1)));

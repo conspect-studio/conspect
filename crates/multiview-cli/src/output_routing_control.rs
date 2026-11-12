@@ -33,6 +33,7 @@ pub fn outcome_str(result: TakeResult) -> &'static str {
         TakeResult::Refused(RefuseReason::Capacity) => "refused:capacity",
         TakeResult::Refused(RefuseReason::EncoderNotReady) => "refused:encoder-not-ready",
         TakeResult::Refused(RefuseReason::Unroutable) => "refused:unroutable",
+        TakeResult::Refused(RefuseReason::FormatMismatch) => "refused:format-mismatch",
         TakeResult::Fallback(FallbackReason::AuxFailed) => "fallback:aux-failed",
         TakeResult::Fallback(FallbackReason::EncoderFailed) => "fallback:encoder-failed",
     }
