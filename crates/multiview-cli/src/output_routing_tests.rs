@@ -1310,3 +1310,51 @@ fn a_forced_idr_lands_on_a_gap_filled_tick() {
         "the rebind at T lands"
     );
 }
+
+/// C (lens 2 #3): over-long principal / operation ids are refused at the
+/// mailbox; a take onto a key another principal's output subscribes does not
+/// re-attribute that key (the holder keeps it, the newcomer is charged 0).
+#[test]
+fn untrusted_ids_are_bounded_and_a_held_key_is_never_re_attributed() {
+    let mut x = harness(3, 6, None);
+    let long = "x".repeat(MAX_TAKE_ID_BYTES + 1);
+    let mut t1 = take("ok", 1, src());
+    t1.principal.clone_from(&long);
+    assert_eq!(x.h.try_take(t1), Err(TakeBusy));
+    assert_eq!(x.h.try_take(take(&long, 1, src())), Err(TakeBusy));
+    let mut fits = take(&"o".repeat(MAX_TAKE_ID_BYTES), 1, src());
+    fits.principal = "p".repeat(MAX_TAKE_ID_BYTES);
+    assert!(x.h.try_take(fits).is_ok(), "128 bytes fit");
+    let mut t = 0;
+    while !x.results().contains(&TakeResult::Applied) {
+        x.tick(t);
+        t += 1;
+        assert!(t < 60, "applied");
+    }
+    let holder = "p".repeat(MAX_TAKE_ID_BYTES);
+    assert_eq!(x.r.dynamic[0].principal, holder);
+    // Past the per-key forced-IDR floor (the fake encoder has no natural IDR).
+    for _ in 0..FORCE_FLOOR_TICKS {
+        x.tick(t);
+        t += 1;
+    }
+    let mut other = take("q-take", 2, src());
+    other.principal = "q".to_owned();
+    x.h.try_take(other).unwrap();
+    let mut applied = false;
+    for _ in 0..40 {
+        x.tick(t);
+        t += 1;
+        if x.results().contains(&TakeResult::Applied) {
+            applied = true;
+            break;
+        }
+    }
+    assert!(applied, "the newcomer rides the key");
+    assert_eq!(x.d.video_key_count(), 2, "+0 encoders");
+    assert_eq!(
+        x.r.dynamic[0].principal, holder,
+        "attribution stays with the holder"
+    );
+    assert!(x.r.has_capacity("q"), "the newcomer is not charged");
+}

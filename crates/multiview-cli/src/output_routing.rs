@@ -35,6 +35,8 @@ use crate::rendition_workers::{
 };
 use crate::routing_aux::{AuxFeed, AuxFeeds, PictureBus, PictureBusSlot};
 
+/// Longest accepted `principal` / `operation_id`, in bytes.
+pub const MAX_TAKE_ID_BYTES: usize = 128;
 /// Take mailbox capacity (the `COMMAND_CAPACITY` pattern, §4.4).
 pub const TAKE_MAILBOX: usize = 64;
 /// Outcome stream capacity; full = drop + count.
@@ -78,7 +80,9 @@ pub struct OutputTake {
     pub principal: String,
 }
 
-/// The take mailbox is full (HTTP 503 `engine-busy` in the later API PR).
+/// The take was not enqueued: the mailbox is full or the run ended (HTTP 503
+/// `engine-busy` in the later API PR), or the take's `principal` /
+/// `operation_id` exceeds [`MAX_TAKE_ID_BYTES`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TakeBusy;
 
@@ -182,6 +186,12 @@ pub struct RoutingSnapshot {
 }
 
 /// The control-plane handle (clone freely).
+///
+/// Trust boundary: `OutputTake::principal` is trusted exactly as given — it
+/// is the identity encoder capacity is charged to and attributed to. The
+/// control plane must pass the authenticated key id only (never a
+/// client-supplied string) and must have authorized the take (§10) before
+/// calling [`Self::try_take`]. Both strings are length-bounded here.
 #[derive(Clone)]
 pub struct OutputRoutingHandle {
     takes: SyncSender<OutputTake>,
@@ -200,8 +210,12 @@ impl OutputRoutingHandle {
     /// Enqueue a take without waiting.
     ///
     /// # Errors
-    /// [`TakeBusy`] when the mailbox is full or the run ended.
+    /// [`TakeBusy`] when the mailbox is full or the run ended, or an id is
+    /// longer than [`MAX_TAKE_ID_BYTES`].
     pub fn try_take(&self, take: OutputTake) -> Result<(), TakeBusy> {
+        if take.principal.len() > MAX_TAKE_ID_BYTES || take.operation_id.len() > MAX_TAKE_ID_BYTES {
+            return Err(TakeBusy);
+        }
         self.takes.try_send(take).map_err(|_| TakeBusy)
     }
 
@@ -1142,11 +1156,25 @@ impl OutputRouter {
                     p.phase = phase;
                 }
             };
+            // Another output (not this one) already subscribes the key.
+            let held_by_other = self.outputs.iter().enumerate().any(|(i, o)| {
+                i != index
+                    && (o.key == key
+                        || matches!(
+                            o.pending.as_ref().map(|p| p.phase),
+                            Some(Phase::Moving(k) | Phase::Warming { key: k, .. }) if k == key
+                        ))
+            });
             if dispatcher.rebind_video(index, key, tick, windows).is_ok() {
                 set(self, Phase::Moving(key));
-                // A re-take adopts the key (re-attributed, linger cleared).
+                // A re-take of a lingering key adopts it (re-attributed,
+                // linger cleared). A key another output still subscribes
+                // stays with its holder: the newcomer rides it at +0 and is
+                // never able to move the holder's attribution or cap.
                 if let Some(d) = self.dynamic.iter_mut().find(|d| d.key == key) {
-                    principal.clone_into(&mut d.principal);
+                    if !held_by_other {
+                        principal.clone_into(&mut d.principal);
+                    }
                     d.linger_deadline = None;
                 }
             } else {
