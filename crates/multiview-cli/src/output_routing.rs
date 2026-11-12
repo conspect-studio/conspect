@@ -229,6 +229,11 @@ pub struct RoutingSnapshot {
     pub video_keys: usize,
     /// Clock ticks handed to the aux thread (0 while nothing is routed).
     pub aux_ticks_sent: u64,
+    /// Per-output private encoded audio buses running (+1 audio encode
+    /// each, CPU).
+    pub audio_buses_live: usize,
+    /// Routed-audio counters (opened, failed, refused, faded back).
+    pub audio: crate::routing_audio::AudioRoutingCounters,
 }
 
 /// The control-plane handle (clone freely).
@@ -240,6 +245,8 @@ pub struct RoutingSnapshot {
 /// calling [`Self::try_take`]. Both strings are length-bounded here.
 #[derive(Clone)]
 pub struct OutputRoutingHandle {
+    #[cfg(test)]
+    pub(crate) audio_tap: crate::routing_audio::AudioTapCell,
     takes: SyncSender<OutputTake>,
     snapshot: Arc<SwapCell<Arc<RoutingSnapshot>>>,
     outcomes: Arc<Mutex<Option<Receiver<TakeOutcome>>>>,
@@ -567,6 +574,11 @@ pub struct OutputRouter {
     reaped: u64,
     dirty: bool,
     reaper: Option<std::thread::JoinHandle<()>>,
+    /// Routed outputs' audio (`audio = follow`); `None` for a run without
+    /// program audio.
+    audio: Option<crate::routing_audio::RoutedAudio>,
+    #[cfg(test)]
+    audio_tap: crate::routing_audio::AudioTapCell,
 }
 
 impl OutputRouter {
@@ -629,7 +641,11 @@ impl OutputRouter {
             })
             .collect();
         let snapshot = Arc::new(SwapCell::from_pointee(RoutingSnapshot::default()));
+        #[cfg(test)]
+        let audio_tap = crate::routing_audio::AudioTapCell::default();
         let handle = OutputRoutingHandle {
+            #[cfg(test)]
+            audio_tap: Arc::clone(&audio_tap),
             takes: take_tx,
             snapshot: Arc::clone(&snapshot),
             outcomes: Arc::new(Mutex::new(Some(outcome_rx))),
@@ -662,9 +678,72 @@ impl OutputRouter {
             reaped: 0,
             dirty: true,
             reaper: Some(reaper),
+            audio: None,
+            #[cfg(test)]
+            audio_tap,
         };
         router.publish_snapshot();
         Ok((router, handle))
+    }
+
+    /// Install the routed-audio side (a run with program audio): private
+    /// buses open with `config` (the program encoder's settings) and must
+    /// produce `program_config` (its `AudioSpecificConfig`) byte for byte.
+    pub(crate) fn enable_audio(
+        &mut self,
+        config: multiview_output::AudioEncodeConfig,
+        program_config: Option<Vec<u8>>,
+        route_gain: crate::routing_audio::RouteGain,
+    ) {
+        self.audio = Some(crate::routing_audio::RoutedAudio::new(
+            self.outputs.len(),
+            config,
+            self.cfg.cadence,
+            program_config,
+            route_gain,
+            self.aux.preview_selection.clone(),
+        ));
+        #[cfg(test)]
+        if let Some(audio) = self.audio.as_mut() {
+            audio.tap = Some(Arc::clone(&self.audio_tap));
+        }
+    }
+
+    /// Test observation: the block handed to the shared program encoder.
+    #[cfg(test)]
+    pub(crate) fn tap_program_audio(
+        &self,
+        tick: u64,
+        program: &multiview_audio::format::AudioBlock,
+    ) {
+        if let Some(audio) = self.audio.as_ref() {
+            audio.tap_program(tick, program);
+        }
+    }
+
+    /// Whether any output has a private audio bus (no take = `false`, and
+    /// the consumer then does no routed-audio work at all).
+    pub(crate) fn has_private_audio(&self) -> bool {
+        self.audio.as_ref().is_some_and(|a| a.private_buses() > 0)
+    }
+
+    /// Feed this tick's program block and per-source clean blocks to every
+    /// private audio bus (bake consumer, right after the program bus ticked).
+    /// Never blocks. A run without a take does nothing here.
+    pub(crate) fn feed_audio(
+        &mut self,
+        tick: u64,
+        program: &multiview_audio::format::AudioBlock,
+        inputs: &[(&str, &multiview_audio::format::AudioBlock)],
+        dispatcher: &mut RenditionDispatcher,
+    ) {
+        if let Some(audio) = self.audio.as_mut() {
+            let before = audio.private_buses();
+            audio.feed(tick, program, inputs, dispatcher);
+            if audio.private_buses() != before {
+                self.dirty = true;
+            }
+        }
     }
 
     /// One Program tick: drain dynamic events, takes, opens and dispatcher
@@ -721,6 +800,9 @@ impl OutputRouter {
             .collect();
         for key in lost {
             self.close(key, dispatcher);
+        }
+        if let Some(audio) = self.audio.as_mut() {
+            audio.drain(dispatcher, delivery)?;
         }
         while let Ok((generation, event)) = self.dyn_rx.try_recv() {
             // Accept only an event whose generation AND key index both name
@@ -809,6 +891,9 @@ impl OutputRouter {
         };
         if matches!(old.phase, Phase::Moving(_)) {
             self.cancel_dispatcher_move(index, dispatcher, tick);
+            if let Some(audio) = self.audio.as_mut() {
+                audio.video_refused(index, tick);
+            }
         }
         if let Phase::Opening(id) = old.phase {
             if let Some(open) = self.opens.get_mut(&id) {
@@ -963,6 +1048,9 @@ impl OutputRouter {
     }
 
     fn refuse_pending(&mut self, index: usize, tick: u64, reason: RefuseReason) {
+        if let Some(audio) = self.audio.as_mut() {
+            audio.video_refused(index, tick);
+        }
         if let Some(p) = self.outputs.get_mut(index).and_then(|o| o.pending.take()) {
             self.emit(
                 p.take.operation_id,
@@ -1023,8 +1111,14 @@ impl OutputRouter {
                         self.refuse_pending(output_index, tick, reason);
                     }
                 }
-                MoveOutcome::Superseded { .. } => {}
+                MoveOutcome::Superseded { .. }
+                | MoveOutcome::AudioApplied { .. }
+                | MoveOutcome::AudioRefused { .. }
+                | MoveOutcome::AudioFallback { .. } => {}
                 MoveOutcome::Fallback { output_index } => {
+                    if let Some(audio) = self.audio.as_mut() {
+                        audio.follow(output_index, &PictureBus::Program, tick, None, dispatcher);
+                    }
                     if let Some(out) = self.outputs.get_mut(output_index) {
                         out.bus = PictureBus::Program;
                         out.key = self
@@ -1076,6 +1170,9 @@ impl OutputRouter {
                 {
                     if let Some(out) = self.outputs.get_mut(index) {
                         out.bus = PictureBus::Program;
+                    }
+                    if let Some(audio) = self.audio.as_mut() {
+                        audio.follow(index, &PictureBus::Program, tick, Some(base), dispatcher);
                     }
                     self.emit(
                         String::new(),
@@ -1166,6 +1263,9 @@ impl OutputRouter {
                             {
                                 p.phase = Phase::Moving(key);
                             }
+                            if let Some(audio) = self.audio.as_mut() {
+                                audio.follow(index, &bus, at, Some(key), dispatcher);
+                            }
                         } else {
                             self.refuse_pending(index, tick, RefuseReason::EncoderNotReady);
                         }
@@ -1212,6 +1312,11 @@ impl OutputRouter {
         let Some(&settings) = self.cfg.base_keys.get(index) else {
             return;
         };
+        // Take admission: open the output's private audio bus before the
+        // video move (§5.2), so it is warm at the grid boundary G.
+        if let Some(audio) = self.audio.as_mut() {
+            audio.admit(index, bus, tick, dispatcher);
+        }
         let existing = if *bus == PictureBus::Program {
             Some(settings)
         } else {
@@ -1244,6 +1349,9 @@ impl OutputRouter {
             });
             if dispatcher.rebind_video(index, key, tick, windows).is_ok() {
                 set(self, Phase::Moving(key));
+                if let Some(audio) = self.audio.as_mut() {
+                    audio.follow(index, bus, tick, Some(key), dispatcher);
+                }
                 // A re-take of a lingering key adopts it (re-attributed,
                 // linger cleared). A key another output still subscribes
                 // stays with its holder: the newcomer rides it at +0 and is
@@ -1521,6 +1629,15 @@ impl OutputRouter {
             parameter_set_changes: self.parameter_set_changes,
             video_keys: self.video_keys,
             aux_ticks_sent: self.aux.sent.load(Ordering::Relaxed),
+            audio_buses_live: self
+                .audio
+                .as_ref()
+                .map_or(0, crate::routing_audio::RoutedAudio::private_buses),
+            audio: self
+                .audio
+                .as_ref()
+                .map(crate::routing_audio::RoutedAudio::counters)
+                .unwrap_or_default(),
         };
         if *self.snapshot.load() != next {
             self.snapshot.store(Arc::new(next));
@@ -1546,6 +1663,9 @@ impl OutputRouter {
         let keys: Vec<usize> = self.dynamic.iter().map(|d| d.key).collect();
         for key in keys {
             self.close(key, dispatcher);
+        }
+        if let Some(audio) = self.audio.as_mut() {
+            audio.shutdown(dispatcher);
         }
         self.aux.active.store(false, Ordering::Release);
         // Drain what the closing workers already queued (bounded): their keys

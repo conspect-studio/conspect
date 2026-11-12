@@ -297,6 +297,9 @@ pub mod output_window_registry;
 pub mod pipeline;
 #[cfg(feature = "ffmpeg")]
 mod rendition_dispatch;
+/// Routed outputs' audio: per-output private AAC buses + take crossfade.
+#[cfg(feature = "ffmpeg")]
+mod routing_audio;
 // Planning uses compile-feature probes only and needs no native FFmpeg linkage.
 pub mod rendition_plan;
 #[cfg(feature = "ffmpeg")]

@@ -763,6 +763,37 @@ impl AudioRenditionEncoder {
         })
     }
 
+    /// Open a program-audio encoder whose first frame starts at absolute
+    /// sample `start` of the run's one sample counter (ADR-0108 §5.2 Rule 1:
+    /// one global AAC frame grid). `start` must be a multiple of the opened
+    /// encoder's frame size, so this bus emits frames on the same boundaries
+    /// and with the same PTS as every other bus (today's program encoder
+    /// starts at 0, also on the grid). The caller feeds PCM from `start` on.
+    ///
+    /// # Errors
+    /// The codec cannot open, `start` is negative, or `start` is off the grid.
+    pub fn starting_at_sample(config: &AudioEncodeConfig, start: i64) -> Result<Self> {
+        let mut encoder = Self::new(config)?;
+        let frame = i64::try_from(encoder.audio.frame_size).unwrap_or(i64::MAX);
+        if start < 0 || frame <= 0 || start % frame != 0 {
+            return Err(Error::Output(format!(
+                "audio start sample {start} is not on the {frame}-sample frame grid"
+            )));
+        }
+        encoder.audio.audio_pts = start;
+        Ok(encoder)
+    }
+
+    /// The absolute sample index the next fed sample will carry (the encoded
+    /// frames' PTS run plus the samples still buffered for the next frame).
+    #[must_use]
+    pub fn next_sample(&self) -> i64 {
+        let pending = self.audio.fifo.first().map_or(0, Vec::len);
+        self.audio
+            .audio_pts
+            .saturating_add(i64::try_from(pending).unwrap_or(i64::MAX))
+    }
+
     /// Open separately identified discrete tracks with the shared audio format.
     ///
     /// # Errors
@@ -780,6 +811,13 @@ impl AudioRenditionEncoder {
             )?);
         }
         Ok(())
+    }
+
+    /// The settings this encoder opened with (a private per-output bus opens
+    /// with exactly these, so its `AudioSpecificConfig` can match, §5.2).
+    #[must_use]
+    pub const fn config(&self) -> &AudioEncodeConfig {
+        &self.config
     }
 
     /// Program-audio encoder frame size in exact samples (AAC is typically 1024).
@@ -4346,5 +4384,55 @@ mod tests {
              across {} segments",
             result.segments.len()
         );
+    }
+
+    /// ADR-0108 §5.2 Rule 1: an audio bus opened live at an arbitrary tick
+    /// starts on the global AAC grid: its first packet PTS is the first
+    /// multiple of 1024 at or after `total_at(T_admit)`, then steps 1024.
+    #[test]
+    fn a_live_opened_audio_bus_starts_on_the_global_aac_grid() {
+        use multiview_audio::cadence::SampleClock;
+        use multiview_audio::crossfade::{grid_ceil, AAC_FRAME_SAMPLES};
+        let clock = SampleClock::new(48_000, Rational::new(30_000, 1_001));
+        let config = AudioEncodeConfig::aac(48_000, 2, 128_000);
+        assert!(super::AudioRenditionEncoder::starting_at_sample(&config, 1000).is_err());
+        assert!(super::AudioRenditionEncoder::starting_at_sample(&config, -1024).is_err());
+        for admit in [1_u64, 7, 333, 512, 4_099] {
+            let g = grid_ceil(clock.total_at(admit), AAC_FRAME_SAMPLES);
+            let mut enc = super::AudioRenditionEncoder::starting_at_sample(
+                &config,
+                i64::try_from(g).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(enc.frame_samples(), Some(1024));
+            assert_eq!(enc.next_sample(), i64::try_from(g).unwrap());
+            let mut pts = Vec::new();
+            let mut tick = admit;
+            while pts.len() < 12 {
+                let frames =
+                    usize::try_from(clock.total_at(tick + 1) - clock.total_at(tick)).unwrap();
+                for p in enc
+                    .encode_interleaved(&vec![0.1; frames * 2], frames)
+                    .unwrap()
+                {
+                    pts.push(p.pts().unwrap());
+                }
+                tick += 1;
+            }
+            let first = pts
+                .iter()
+                .copied()
+                .find(|&p| p >= i64::try_from(g).unwrap())
+                .unwrap();
+            assert_eq!(
+                first,
+                i64::try_from(g).unwrap(),
+                "admit {admit}: first frame at G"
+            );
+            for pair in pts.windows(2) {
+                assert_eq!(pair[1] - pair[0], 1024, "admit {admit}: step 1024 {pts:?}");
+            }
+            assert!(pts.iter().all(|p| p.rem_euclid(1024) == 0), "on the grid");
+        }
     }
 }
