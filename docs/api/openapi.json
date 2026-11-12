@@ -9342,7 +9342,7 @@
         "tags": [
           "routing"
         ],
-        "summary": "`POST /api/v1/routing/output/take` — take an output feed (role: write;\nboth ends authorized; `Idempotency-Key` required). `202 {operation_id,\nadopt:\"next_tick\"}`; the outcome rides `route.output`.",
+        "summary": "`POST /api/v1/routing/output/take` — take an output feed (role: write;\nboth ends authorized; `Idempotency-Key` required). `202 {operation_id,\nstatus:\"accepted\", adopt:\"next_tick\"}`; a replay of the key answers the\nsame operation with `status` `pending` or `settled` (+ outcome) and is never\nenqueued again. The outcome rides `route.output`.",
         "operationId": "take_output",
         "parameters": [
           {
@@ -9367,7 +9367,7 @@
         },
         "responses": {
           "202": {
-            "description": "Accepted; adopted at the next tick. A replay carries the recorded outcome once known.",
+            "description": "Accepted (`status: accepted`, `adopt: next_tick`). A replay of the key returns the same operation id with `status: pending` (no outcome yet) or `status: settled` + the recorded outcome; it never re-enqueues.",
             "content": {
               "application/json": {
                 "schema": {
@@ -9472,7 +9472,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/RoutePlan"
+                  "$ref": "#/components/schemas/RoutingPlanResponseDoc"
                 }
               }
             }
@@ -19274,12 +19274,15 @@
         "description": "The `202` body of an output take.",
         "required": [
           "operation_id",
-          "adopt"
+          "status"
         ],
         "properties": {
           "adopt": {
-            "type": "string",
-            "description": "When the engine adopts the take: `next_tick`."
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "When the engine adopts the take: `next_tick`. Only on the request\nthat enqueued it; a replay never claims a new adoption."
           },
           "operation_id": {
             "type": "string",
@@ -19291,6 +19294,10 @@
               "null"
             ],
             "description": "The recorded terminal outcome, on a replay once known."
+          },
+          "status": {
+            "type": "string",
+            "description": "`accepted` (this request enqueued the take), `pending` (a replay of a\nreserved key whose outcome is not known yet) or `settled` (a replay\ncarrying the recorded outcome)."
           },
           "tick": {
             "type": [
@@ -20810,6 +20817,17 @@
           }
         ],
         "description": "A crosspoint plan, or an output plan when `target.kind` is `output`."
+      },
+      "RoutingPlanResponseDoc": {
+        "oneOf": [
+          {
+            "$ref": "#/components/schemas/RoutePlan"
+          },
+          {
+            "$ref": "#/components/schemas/OutputPlan"
+          }
+        ],
+        "description": "A crosspoint `RoutePlan`, or an `OutputPlan` when the request's `target.kind` is `output`."
       },
       "RoutingState": {
         "type": "object",

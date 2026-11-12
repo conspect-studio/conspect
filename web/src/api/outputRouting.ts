@@ -17,8 +17,10 @@ export type OutputVideoFeed =
 
 /** One output's routing row (feeds are `{redacted: true}` when hidden). */
 export type OutputRouteState = components['schemas']['OutputRouteState'];
-/** The plan body for an output target. */
-export type OutputPlan = components['schemas']['OutputPlan'];
+/** The `POST /routing/plan` `200` body: a crosspoint plan or an output plan. */
+export type RoutingPlanResponse = components['schemas']['RoutingPlanResponseDoc'];
+/** The plan body for an output target (the output arm of the response). */
+export type OutputPlan = Extract<RoutingPlanResponse, { readonly cost: unknown }>;
 /** The take's `202` body. */
 export type OutputTakeAccepted = components['schemas']['OutputTakeAccepted'];
 
@@ -41,6 +43,7 @@ function isRoutingState(value: unknown): value is RoutingStateBody {
   );
 }
 
+// Narrows the generated plan response union to its output arm.
 function isOutputPlan(value: unknown): value is OutputPlan {
   return (
     isRecord(value) &&

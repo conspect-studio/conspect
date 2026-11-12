@@ -2556,7 +2556,9 @@ export interface paths {
         /**
          * `POST /api/v1/routing/output/take` — take an output feed (role: write;
          *     both ends authorized; `Idempotency-Key` required). `202 {operation_id,
-         *     adopt:"next_tick"}`; the outcome rides `route.output`.
+         *     status:"accepted", adopt:"next_tick"}`; a replay of the key answers the
+         *     same operation with `status` `pending` or `settled` (+ outcome) and is never
+         *     enqueued again. The outcome rides `route.output`.
          */
         post: operations["take_output"];
         delete?: never;
@@ -6353,12 +6355,21 @@ export interface components {
         OutputStream: "video";
         /** @description The `202` body of an output take. */
         OutputTakeAccepted: {
-            /** @description When the engine adopts the take: `next_tick`. */
-            adopt: string;
+            /**
+             * @description When the engine adopts the take: `next_tick`. Only on the request
+             *     that enqueued it; a replay never claims a new adoption.
+             */
+            adopt?: string | null;
             /** @description Correlates the `route.output` outcome. */
             operation_id: string;
             /** @description The recorded terminal outcome, on a replay once known. */
             outcome?: string | null;
+            /**
+             * @description `accepted` (this request enqueued the take), `pending` (a replay of a
+             *     reserved key whose outcome is not known yet) or `settled` (a replay
+             *     carrying the recorded outcome).
+             */
+            status: string;
             /**
              * Format: int64
              * @description The tick of the recorded outcome, on a replay once known.
@@ -7163,6 +7174,8 @@ export interface components {
         };
         /** @description A crosspoint plan, or an output plan when `target.kind` is `output`. */
         RoutingPlanRequestDoc: components["schemas"]["RouteTakeRequest"] | components["schemas"]["OutputRouteRequest"];
+        /** @description A crosspoint `RoutePlan`, or an `OutputPlan` when the request's `target.kind` is `output`. */
+        RoutingPlanResponseDoc: components["schemas"]["RoutePlan"] | components["schemas"]["OutputPlan"];
         /** @description The `GET /api/v1/routing` body (ADR-0108 §6.2), filtered per object. */
         RoutingState: {
             buses?: null | components["schemas"]["RoutingBuses"];
@@ -16264,7 +16277,7 @@ export interface operations {
             };
         };
         responses: {
-            /** @description Accepted; adopted at the next tick. A replay carries the recorded outcome once known. */
+            /** @description Accepted (`status: accepted`, `adopt: next_tick`). A replay of the key returns the same operation id with `status: pending` (no outcome yet) or `status: settled` + the recorded outcome; it never re-enqueues. */
             202: {
                 headers: {
                     [name: string]: unknown;
@@ -16357,7 +16370,7 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["RoutePlan"];
+                    "application/json": components["schemas"]["RoutingPlanResponseDoc"];
                 };
             };
             /** @description Missing or invalid credentials. */

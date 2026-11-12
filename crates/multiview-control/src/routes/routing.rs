@@ -98,7 +98,7 @@ const ROUTING_KIND: &str = "crosspoint";
         tag = "routing",
         request_body = RoutingPlanRequestDoc,
         responses(
-            (status = 200, description = "A crosspoint: the #11 classification (class1/reset_lite/class2 + coerced). An output target (`target.kind = output`): an `OutputPlan` with cost and refusals.", body = crate::routing::RoutePlan),
+            (status = 200, description = "A crosspoint: the #11 classification (class1/reset_lite/class2 + coerced). An output target (`target.kind = output`): an `OutputPlan` with cost and refusals.", body = RoutingPlanResponseDoc),
             (status = 401, description = "Missing or invalid credentials.", body = crate::problem::Problem),
             (status = 403, description = "Not authorized to plan this crosspoint.", body = crate::problem::Problem),
         ),
@@ -489,6 +489,28 @@ impl utoipa::PartialSchema for RoutingPlanRequestDoc {
 
 #[cfg(feature = "openapi")]
 impl utoipa::ToSchema for RoutingPlanRequestDoc {}
+
+/// `OpenAPI` shape of a `POST /routing/plan` `200`: a crosspoint
+/// [`RoutePlan`], or an `OutputPlan` for a `target.kind = output` request.
+#[cfg(feature = "openapi")]
+pub struct RoutingPlanResponseDoc;
+
+#[cfg(feature = "openapi")]
+impl utoipa::PartialSchema for RoutingPlanResponseDoc {
+    fn schema() -> utoipa::openapi::RefOr<utoipa::openapi::schema::Schema> {
+        use utoipa::openapi::schema::{OneOfBuilder, Ref};
+        OneOfBuilder::new()
+            .item(Ref::from_schema_name("RoutePlan"))
+            .item(Ref::from_schema_name("OutputPlan"))
+            .description(Some(
+                "A crosspoint `RoutePlan`, or an `OutputPlan` when the request's `target.kind` is `output`.",
+            ))
+            .into()
+    }
+}
+
+#[cfg(feature = "openapi")]
+impl utoipa::ToSchema for RoutingPlanResponseDoc {}
 
 /// `GET /api/v1/routing` — the output routing state (role: read; outputs the
 /// caller may not read are omitted; feeds it may not read are redacted).
