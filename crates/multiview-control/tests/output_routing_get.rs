@@ -142,3 +142,62 @@ async fn unauthenticated_is_401() {
     let resp = send(&router, get("/api/v1/routing", "nope.nope")).await;
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
 }
+
+/// Review #316 finding 1: the row id is the output resource's accepted API id,
+/// paired with that resource's own body, never a positional `output-{n}`.
+#[tokio::test]
+async fn rows_carry_the_accepted_api_id_after_a_rename() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("boot.toml");
+    let extra = "\n[[routing.output]]\noutput = \"hls /tmp/output-routing-get/b/index.m3u8\"\nvideo = { source = \"bars\" }\n";
+    let config = MultiviewConfig::load_from_toml(&format!("{DOC}{extra}")).unwrap();
+    let seeded = multiview_control::seed_resources(&config).unwrap();
+    let publisher = Arc::new(EnginePublisher::<EngineStateSnapshot, Event>::new(64));
+    let (sender, _receiver) = command_bus(64);
+    let state = AppState::new(
+        publisher,
+        sender,
+        Arc::new(InMemoryRepository::new()),
+        Arc::new(support::seeded_keys()),
+    )
+    .with_seeded_resources(seeded)
+    .with_base_document(serde_json::to_value(&config).unwrap())
+    .with_boot_model(Arc::new(BootModel::new(
+        path.clone(),
+        config.clone(),
+        config.clone(),
+        StartMode::Boot,
+        false,
+        None,
+    )));
+    // Accept a document whose SECOND output carries the API id "renamed" and
+    // whose first keeps "output-0": a positional or sorted derivation would
+    // pair the feeds with the wrong ids.
+    let layouts = multiview_control::boot_model::layout_library(&state).unwrap();
+    let selected =
+        multiview_control::boot_model::selected_layout_id(&state, &config, &layouts).unwrap();
+    multiview_control::boot_model::commit_desired_document(
+        &state,
+        config,
+        layouts,
+        selected,
+        vec!["zz-first".to_owned(), "renamed".to_owned()],
+    )
+    .await
+    .unwrap();
+    let router = multiview_control::router(state);
+    let body = body_json(send(&router, get("/api/v1/routing", OPERATOR_TOKEN)).await).await;
+    let rows = body["outputs"].as_array().unwrap();
+    let by_id = |id: &str| rows.iter().find(|r| r["output"] == id).cloned();
+    assert_eq!(rows.len(), 2, "{body}");
+    assert_eq!(by_id("zz-first").unwrap()["tally"], "program", "{body}");
+    assert_eq!(
+        by_id("renamed").unwrap()["video"],
+        serde_json::json!({"source": "bars"}),
+        "{body}"
+    );
+    assert!(
+        by_id("output-0").is_none() && by_id("output-1").is_none(),
+        "{body}"
+    );
+}

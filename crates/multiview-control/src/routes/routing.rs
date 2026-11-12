@@ -443,34 +443,67 @@ pub(crate) async fn get_routing(
     let config: multiview_config::MultiviewConfig =
         serde_json::from_value(crate::boot_model::current_desired_config(&state)?)
             .map_err(|e| ControlError::Repository(format!("desired configuration: {e}")))?;
-    let ids = crate::boot_model::accepted_output_ids(&state)?
-        .filter(|ids| ids.len() == config.outputs.len())
-        .unwrap_or_else(|| {
-            (0..config.outputs.len())
-                .map(|index| format!("output-{index}"))
-                .collect()
-        });
-    let outputs = config
-        .output_feeds()
-        .into_iter()
-        .zip(ids)
-        .filter(|(_, id)| crate::auth::authorize_object(&principal, id).is_ok())
-        .map(|(feed, id)| output_route_state(&principal, &feed, id))
-        .collect();
+    // Each row's API id is the output RESOURCE's own id, paired with its own
+    // body — exactly the source `list_outputs` / `get_output` serve — never a
+    // positional zip of two differently ordered lists (BOLA: the filter must
+    // authorize the id the caller would address).
+    let resources = crate::boot_model::accepted_resources(&state, "outputs")?
+        .map_or_else(|| state.outputs.list(), Ok)?;
+    let feeds = config.output_feeds();
+    let mut outputs = Vec::with_capacity(resources.len());
+    for versioned in resources {
+        let id = versioned.resource.id;
+        if crate::auth::authorize_object(&principal, &id).is_err() {
+            continue;
+        }
+        let body: multiview_config::Output = serde_json::from_value(versioned.resource.body)
+            .map_err(|e| ControlError::Repository(format!("output {id:?} body: {e}")))?;
+        let config_id = body.id();
+        let feed = feeds
+            .iter()
+            .find(|xp| xp.output == config_id)
+            .cloned()
+            .unwrap_or_else(|| {
+                multiview_config::OutputCrosspoint::program(
+                    config_id,
+                    multiview_config::MAIN_PROGRAM,
+                )
+            });
+        outputs.push(output_route_state(&principal, &feed, id));
+    }
     Ok((StatusCode::OK, Json(RoutingState { outputs })).into_response())
 }
 
 /// Whether `principal` may read `feed` (ADR-0108 §6.3): Read on a source; the
 /// Program scope for a switcher bus. Authorization of the feed end is the same
 /// rule the take uses, so readback never discloses what a take would refuse.
+fn program_scope(principal: &Principal) -> bool {
+    crate::auth::authorize_scope(
+        principal,
+        multiview_events::AuthzScope::Program(multiview_config::MAIN_PROGRAM),
+    )
+    .is_ok()
+}
+
+/// Whether `principal` may read an audio feed: Read on a named source, the
+/// Program scope for the mix and `follow` of a bus, per-track ids as objects.
+fn may_read_audio(principal: &Principal, feed: &multiview_config::AudioFeed) -> bool {
+    use multiview_config::AudioFeed;
+    match feed {
+        AudioFeed::Follow | AudioFeed::None => true,
+        AudioFeed::Program => program_scope(principal),
+        AudioFeed::Source(id) => crate::auth::authorize_object(principal, id).is_ok(),
+        AudioFeed::Tracks(tracks) => tracks
+            .iter()
+            .all(|track| crate::auth::authorize_object(principal, track).is_ok()),
+        _ => false,
+    }
+}
+
 pub(crate) fn may_read_feed(principal: &Principal, feed: &multiview_config::VideoFeed) -> bool {
     use multiview_config::VideoFeed;
     match feed {
-        VideoFeed::Bus(_) => crate::auth::authorize_scope(
-            principal,
-            multiview_events::AuthzScope::Program(multiview_config::MAIN_PROGRAM),
-        )
-        .is_ok(),
+        VideoFeed::Bus(_) => program_scope(principal),
         VideoFeed::Source(id) | VideoFeed::Layout(id) => {
             crate::auth::authorize_object(principal, id).is_ok()
         }
@@ -486,11 +519,18 @@ fn output_route_state(
     use multiview_config::{FollowAudio, OutputBus, VideoFeed};
     let redacted = serde_json::json!({ "redacted": true });
     let video = feed.effective_video();
+    // Every field is redacted by its own per-object rule: the audio feed can
+    // name a source the caller may not read even when the video is readable.
+    let audio = if may_read_audio(principal, &feed.audio) {
+        serde_json::to_value(&feed.audio).unwrap_or_else(|_| redacted.clone())
+    } else {
+        redacted.clone()
+    };
     if !may_read_feed(principal, &video) {
         return OutputRouteState {
             output,
             video: redacted.clone(),
-            audio: serde_json::to_value(&feed.audio).unwrap_or_else(|_| redacted.clone()),
+            audio,
             effective_audio: redacted,
             tally: OutputTally::Redacted,
             state: "configured".to_owned(),
@@ -502,6 +542,9 @@ fn output_route_state(
         VideoFeed::Bus(_) => OutputTally::Program,
         _ => OutputTally::Direct,
     };
+    // `follow` of a readable video feed resolves to audio of that same feed
+    // (its own source, the PVW source or the mix), so it discloses nothing
+    // beyond what the readable video already shows.
     let effective_audio = match FollowAudio::of(&video) {
         FollowAudio::Source(id) => serde_json::json!({ "source": id }),
         FollowAudio::PreviewSource => serde_json::json!("preview_source"),
@@ -510,9 +553,42 @@ fn output_route_state(
     OutputRouteState {
         output,
         video: serde_json::to_value(&video).unwrap_or_else(|_| redacted.clone()),
-        audio: serde_json::to_value(&feed.audio).unwrap_or(redacted),
+        audio,
         effective_audio,
         tally,
         state: "configured".to_owned(),
+    }
+}
+
+#[cfg(test)]
+mod redaction_tests {
+    use super::{output_route_state, OutputTally};
+    use crate::auth::{Principal, Role};
+    use multiview_config::{AudioFeed, OutputCrosspoint, VideoFeed};
+
+    fn scoped(objects: &[&str]) -> Principal {
+        Principal {
+            key_id: "k".into(),
+            role: Role::Operator,
+            scoped_object_ids: Some(objects.iter().map(|s| (*s).to_owned()).collect()),
+            scoped_output_ids: None,
+            scoped_discovery_domains: None,
+        }
+    }
+
+    #[test]
+    fn no_unreadable_id_survives_in_any_field() {
+        let mut feed = OutputCrosspoint::program("o", "main");
+        feed.video = Some(VideoFeed::Source("secret-cam".into()));
+        feed.audio = AudioFeed::Source("secret-mic".into());
+        let row = output_route_state(&scoped(&["o"]), &feed, "o".into());
+        let json = serde_json::to_string(&row).unwrap_or_default();
+        assert!(!json.contains("secret"), "{json}");
+        assert_eq!(row.tally, OutputTally::Redacted);
+        // Readable video, unreadable audio source: only the audio is redacted.
+        let row = output_route_state(&scoped(&["o", "secret-cam"]), &feed, "o".into());
+        let json = serde_json::to_string(&row).unwrap_or_default();
+        assert!(!json.contains("secret-mic"), "{json}");
+        assert!(json.contains("secret-cam"), "{json}");
     }
 }
