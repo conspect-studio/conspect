@@ -941,3 +941,44 @@ the engine's own TLS. The str0m ICE-TCP consumer and the browser ladder are PR2 
   lands second; TODO in `multiview-cli/src/frontdoor.rs`); the str0m ICE-TCP consumer, passive TCP
   candidates in the SDP and the browser ladder (PR2 of this slice); systemd socket activation
   (section 9) and the mda001 cutover (slice 6).
+
+#### Slice 4 PR2: the str0m ICE-TCP consumer (issue #290)
+
+* **Candidates**: `EndpointConfig::ice_tcp_port` (default `None`). When set, every role that gathers
+  host candidates — WHIP ingest, WHEP-serve output (Program), `whip_push`, and the native preview
+  `WhepEgress` (wall + input/program preview, `with_host_candidates_tcp`) — adds one **passive**
+  ICE-TCP host candidate (`tcptype passive`) per concrete host IP (the same advertised IPs as UDP,
+  `network.advertise`) on the TCP door's port, **after** its UDP candidates. Priorities are str0m's
+  own (RFC 8445 type preference 126 for a UDP host, 90 for a TCP host), never overridden, so UDP stays
+  preferred. `UnifiedEndpoint::bind` (the socket-owning `run()`) forces `ice_tcp_port = None`: it has
+  no TCP lane.
+* **Session seam**: `Session::add_tcp_passive_candidate`, `handle_datagram_proto(Transport, ..)`
+  (`handle_datagram` = UDP) and `poll_transmit_routed() -> Outbound { transport, source, destination,
+  payload }` carrying str0m's `Transmit::proto`. TCP and UDP candidates share `addr:443`, so every
+  driver path routes by `transport`, never by address: a TCP transmit is never sent over UDP (it is
+  dropped when no TCP lane is wired).
+* **Driver**: `UnifiedEndpoint::run_shared_with_tcp(udp lane, Option<impl SharedTcp>, stop)`
+  (`run_shared` = no TCP). The TCP arm is polled after the tick, with the UDP arm's per-wake budget
+  (256 frames / 2 ms) and the same bounded handoff; no TURN classification (TURN is UDP here); the
+  frame's `local` resolves onto the passive TCP candidates; frames fan to every role as
+  `Transport::Tcp`. Outbound goes through `Egress { socket, tcp: Option<&dyn TcpSend> }`;
+  `TcpSend::send` is the lane's synchronous drop-oldest queue, so nothing awaits a TCP peer
+  (invariants #1/#10). `multiview-frontdoor` implements `SharedTcp` for `IceTcpLane` (feature
+  `webrtc`); the str0m answer to an authenticated Binding Request is what lifts the door's probation.
+* **Established set**: `Session::validated_peer()` reports only a peer validated over **UDP**; a
+  session whose last accepted non-STUN datagram came over ICE-TCP reports none, so the UDP socket's
+  established set never learns an address from a TCP path.
+* **cli**: `FrontDoorRun::take_ice_tcp_lane()` is `Some` only when the TCP door runs with
+  `network.ice_tcp.enabled`; `spawn_unified_webrtc` then sets `ice_tcp_port` to the door's TCP port
+  and runs `run_shared_with_tcp`. **`behind_proxy` = no ICE-TCP** (design section 8): the door runs
+  with `ice_tcp = false` and no lane is handed out.
+* **Tests**: `multiview-webrtc/tests/ice_tcp_session.rs` (passive vs active TCP sessions connect and
+  carry SRTP over an in-memory TCP shuttle on IPv4/IPv6, `validated_peer()` stays `None`; a UDP peer
+  still pairs and validates over UDP with the TCP candidate listed after UDP);
+  `multiview-frontdoor/tests/ice_tcp_webrtc.rs::webrtc_over_ice_tcp_with_no_udp` (a real door, a
+  WHIP ingest endpoint on `run_shared_with_tcp`, a str0m client with no UDP socket at all over a real
+  `TcpStream`: ICE + DTLS, >= 10 RTP packets into the ingest ring, the answer carries
+  `tcptype passive` on the door port, 0 UDP datagrams at the door, nothing established; IPv6 and
+  IPv4 loopback).
+* **Not in this PR**: a real-browser ICE-TCP check (browsers gather active TCP candidates
+  themselves); the deferred items above other than the str0m consumer.

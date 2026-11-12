@@ -31,7 +31,7 @@ use tokio::sync::mpsc;
 use crate::config::EndpointConfig;
 use crate::error::{Result, WebRtcError};
 use crate::session::{SessionId, SessionRole, SessionTable};
-use crate::transport::{RtpRing, Session, SessionConfig, WebRtcEndpoint};
+use crate::transport::{RtpRing, Session, SessionConfig, Transport, WebRtcEndpoint};
 use crate::turn::TurnRelayDriver;
 
 /// The maximum UDP datagram the recv loop reads (a generous MTU ceiling; WebRTC
@@ -80,6 +80,9 @@ pub(crate) struct WhipShared {
     commands: mpsc::Sender<Command>,
     /// Host candidate addresses gathered at bind, IPv6-first (ADR-0042).
     host_candidates: Vec<SocketAddr>,
+    /// Passive ICE-TCP candidates (the front door's TCP port), added after the
+    /// UDP host candidates; empty without ICE-TCP.
+    tcp_candidates: Vec<SocketAddr>,
     /// The session bookkeeping table (one-publisher-per-source / GC); guarded by
     /// a short-lived mutex the engine never touches.
     table: std::sync::Mutex<SessionTable>,
@@ -172,11 +175,13 @@ impl WhipHandle {
     pub(crate) fn build(
         config: &EndpointConfig,
         host_candidates: Vec<SocketAddr>,
+        tcp_candidates: Vec<SocketAddr>,
     ) -> (Self, mpsc::Receiver<Command>, Arc<WhipShared>) {
         let (tx, rx) = mpsc::channel(64);
         let shared = Arc::new(WhipShared {
             commands: tx,
             host_candidates,
+            tcp_candidates,
             table: std::sync::Mutex::new(SessionTable::new(
                 config.max_sessions,
                 config.session_idle_timeout,
@@ -237,6 +242,10 @@ impl WhipHandle {
             }
             session.add_host_candidate(*addr)?;
             gathered += 1;
+        }
+        // Passive ICE-TCP after UDP (str0m ranks a TCP host below a UDP host).
+        for addr in &self.inner.tcp_candidates {
+            session.add_tcp_passive_candidate(*addr)?;
         }
         // TURN relay candidates the driver's in-crate TURN client has allocated
         // (ADR-0048 §5.1) — the operator's NAT-traversal last resort, offered
@@ -401,7 +410,8 @@ impl WhipEndpoint {
     pub fn bind(config: EndpointConfig) -> Result<(Self, WhipHandle)> {
         let endpoint = WebRtcEndpoint::bind(config)?;
         let host_candidates = endpoint.host_candidates()?;
-        let (handle, commands, shared) = WhipHandle::build(endpoint.config(), host_candidates);
+        let (handle, commands, shared) =
+            WhipHandle::build(endpoint.config(), host_candidates, Vec::new());
         Ok((
             Self {
                 endpoint,
@@ -448,6 +458,7 @@ impl WhipEndpoint {
         let mut commands = self.commands;
         let mut buf = vec![0u8; RECV_BUFFER];
         let mut tick = tokio::time::interval(DRIVER_TICK);
+        let egress = crate::transport::Egress::udp(&socket);
 
         loop {
             if stop.load(Ordering::Acquire) {
@@ -472,7 +483,7 @@ impl WhipEndpoint {
                     }
                     Self::pump_turn(&socket, &mut turn, now, &self.shared).await;
                     Self::pump_outbound(
-                        &socket, &mut sessions, &mut turn, now,
+                        egress, &mut sessions, &mut turn, now,
                         #[cfg(test)]
                         &mut |_, _| {},
                     ).await;
@@ -483,7 +494,7 @@ impl WhipEndpoint {
                     Self::tick(&mut sessions, now);
                     Self::pump_turn(&socket, &mut turn, now, &self.shared).await;
                     Self::pump_outbound(
-                        &socket, &mut sessions, &mut turn, now,
+                        egress, &mut sessions, &mut turn, now,
                         #[cfg(test)]
                         &mut |_, _| {},
                     ).await;
@@ -529,10 +540,10 @@ impl WhipEndpoint {
                 peer,
                 relay,
                 payload,
-            } => Self::route_datagram(sessions, peer, relay, &payload, now),
+            } => Self::route_datagram(sessions, Transport::Udp, peer, relay, &payload, now),
             crate::transport::relay_io::Inbound::TurnControl => {}
             crate::transport::relay_io::Inbound::Media => {
-                Self::route_datagram(sessions, src, local_addr, payload, now);
+                Self::route_datagram(sessions, Transport::Udp, src, local_addr, payload, now);
             }
         }
     }
@@ -557,6 +568,7 @@ impl WhipEndpoint {
     /// str0m ufrag/peer demux), drain its RTP, and note connection.
     pub(crate) fn route_datagram(
         sessions: &mut [DrivenSession],
+        proto: Transport,
         src: SocketAddr,
         local: SocketAddr,
         payload: &[u8],
@@ -567,7 +579,9 @@ impl WhipEndpoint {
             // (ufrag/peer demux miss), so trying each session is correct and
             // cheap; the accepting one consumes it.
             let before = s.session.received_rtp_count();
-            let _ = s.session.handle_datagram(src, local, payload, now);
+            let _ = s
+                .session
+                .handle_datagram_proto(proto, src, local, payload, now);
             s.was_connected |= s.session.is_connected();
             let moved = s.session.received_rtp_count() != before;
             s.ring.drain_from(&mut s.session);
@@ -582,7 +596,7 @@ impl WhipEndpoint {
     /// addr → TURN Send indication; defect C). Non-blocking; a send error drops the
     /// datagram — never blocks the loop.
     pub(crate) async fn pump_outbound(
-        socket: &tokio::net::UdpSocket,
+        egress: crate::transport::Egress<'_>,
         sessions: &mut [DrivenSession],
         turn: &mut TurnRelayDriver,
         now: Instant,
@@ -592,13 +606,12 @@ impl WhipEndpoint {
         #[cfg(test)] on_sent: &mut (dyn FnMut(SocketAddr, &[u8]) + Send),
     ) {
         for s in sessions.iter_mut() {
-            while let Some((source, dst, payload)) = s.session.poll_transmit(now) {
+            while let Some(dg) = s.session.poll_transmit_routed(now) {
                 // A send error (e.g. unreachable) is dropped: the publisher's
                 // own retransmit/ICE recovers it; the loop never blocks.
-                crate::transport::relay_io::send_routed(socket, turn, source, dst, &payload, now)
-                    .await;
+                crate::transport::relay_io::send_routed(egress, turn, &dg, now).await;
                 #[cfg(test)]
-                on_sent(dst, &payload);
+                on_sent(dg.destination, &dg.payload);
             }
         }
     }

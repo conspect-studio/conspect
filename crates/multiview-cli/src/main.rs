@@ -608,6 +608,14 @@ async fn serve_control_plane(
         let rtc_lane = front_door
             .as_mut()
             .and_then(|door| Some((door.take_rtc_lane()?, door.handle())));
+        // ICE-TCP rides the front-door UDP lane's endpoint only.
+        let ice_tcp_lane = if rtc_lane.is_some() {
+            front_door
+                .as_mut()
+                .and_then(multiview_cli::frontdoor::FrontDoorRun::take_ice_tcp_lane)
+        } else {
+            None
+        };
         let unified = multiview_cli::webrtc_unified::spawn_unified_webrtc(
             config,
             Arc::clone(&program_slot),
@@ -619,6 +627,7 @@ async fn serve_control_plane(
             #[cfg(feature = "moq-output")]
             wall_picture,
             rtc_lane,
+            ice_tcp_lane,
         );
         (unified.whep, unified.whip, unified.whep_output)
     };

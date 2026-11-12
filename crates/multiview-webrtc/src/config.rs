@@ -50,6 +50,10 @@ pub struct EndpointConfig {
     pub cors_allow_origins: Vec<String>,
     /// The ICE-server list (STUN + TURN) — the operator's TURN requirement.
     pub ice_servers: Vec<IceServer>,
+    /// The front door's TCP port (ADR-0107 slice 4): when set, every role adds
+    /// one passive ICE-TCP host candidate per concrete host IP on this port,
+    /// after its UDP candidates. `None` (the default): no ICE-TCP.
+    pub ice_tcp_port: Option<u16>,
 }
 
 impl Default for EndpointConfig {
@@ -62,6 +66,7 @@ impl Default for EndpointConfig {
             tombstone_ttl: DEFAULT_TOMBSTONE_TTL,
             cors_allow_origins: vec!["*".to_owned()],
             ice_servers: Vec::new(),
+            ice_tcp_port: None,
         }
     }
 }

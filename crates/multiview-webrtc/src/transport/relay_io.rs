@@ -13,31 +13,47 @@
 
 use std::net::SocketAddr;
 
-use tokio::net::UdpSocket;
-
+use crate::transport::unified::Egress;
+use crate::transport::{Outbound, Transport};
 use crate::turn::TurnRelayDriver;
 
-/// Send one `(source, destination, payload)` the session emitted, routing it
-/// through the TURN relay when `source` is an allocated relay address (defect C).
+/// Send one datagram the session emitted, routed by its transport and source.
 ///
-/// * `source` is one of our bound local sockets → send `payload` straight to
+/// * [`Transport::Tcp`] → queue `payload` on the ICE-TCP connection to
+///   `destination` ([`TcpSend::send`], synchronous, never blocks). Without an
+///   ICE-TCP lane it is dropped: it never leaves over UDP, since a TCP and a UDP
+///   candidate may share one `addr:port`.
+/// * UDP, `source` one of our bound local sockets → send `payload` straight to
 ///   `destination` (the direct/host path).
-/// * `source` is an allocated TURN relay → frame `payload` as a TURN Send
+/// * UDP, `source` an allocated TURN relay → frame `payload` as a TURN Send
 ///   indication toward `destination` (the peer) and send that to the relay's TURN
 ///   server. A permission for the peer is ensured by [`TurnRelayDriver`] first.
 ///
 /// Non-blocking; a send error is dropped (str0m / the peer recover via retransmit,
 /// and the driver never blocks on a peer — invariant #10).
+///
+/// [`TcpSend::send`]: crate::transport::TcpSend::send
 pub(crate) async fn send_routed(
-    socket: &UdpSocket,
+    egress: Egress<'_>,
     turn: &mut TurnRelayDriver,
-    source: SocketAddr,
-    destination: SocketAddr,
-    payload: &[u8],
+    datagram: &Outbound,
     now: std::time::Instant,
 ) {
-    if turn.is_relay(source) {
-        if let Some((server, wire)) = turn.frame_for_relay(source, destination, payload, now) {
+    let Outbound {
+        transport,
+        source,
+        destination,
+        payload,
+    } = datagram;
+    if *transport == Transport::Tcp {
+        if let Some(tcp) = egress.tcp {
+            let _ = tcp.send(*destination, payload);
+        }
+        return;
+    }
+    let socket = egress.socket;
+    if turn.is_relay(*source) {
+        if let Some((server, wire)) = turn.frame_for_relay(*source, *destination, payload, now) {
             let _ = socket.send_to(&wire, server).await;
             return;
         }
@@ -45,7 +61,7 @@ pub(crate) async fn send_routed(
         // drop this datagram — the peer's ICE keepalive re-drives the path.
         return;
     }
-    let _ = socket.send_to(payload, destination).await;
+    let _ = socket.send_to(payload, *destination).await;
 }
 
 /// The two ways an inbound datagram from `src` can be consumed before it reaches

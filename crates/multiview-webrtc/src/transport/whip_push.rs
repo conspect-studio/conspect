@@ -34,7 +34,7 @@ use std::time::{Duration, Instant};
 
 use crate::egress::{EgressFeed, EgressMedia};
 use crate::error::{Result, WebRtcError};
-use crate::transport::{MediaKind, Session, SessionConfig, WebRtcEndpoint};
+use crate::transport::{MediaKind, Session, SessionConfig, Transport, WebRtcEndpoint};
 use crate::turn::TurnRelayDriver;
 
 /// The maximum UDP datagram the recv loop reads.
@@ -68,6 +68,20 @@ impl WhipPushOffer {
     /// [`WebRtcError::Transport`] if a candidate is invalid or the change set
     /// produced no offer.
     pub fn create(host_candidates: &[SocketAddr], audio: bool) -> Result<Self> {
+        Self::create_with_tcp(host_candidates, &[], audio)
+    }
+
+    /// [`create`](Self::create), also advertising `tcp_candidates` as passive
+    /// ICE-TCP host candidates after the UDP ones (the front door's TCP port).
+    ///
+    /// # Errors
+    ///
+    /// As [`create`](Self::create).
+    pub fn create_with_tcp(
+        host_candidates: &[SocketAddr],
+        tcp_candidates: &[SocketAddr],
+        audio: bool,
+    ) -> Result<Self> {
         let now = Instant::now();
         let mut session = Session::new(&SessionConfig::push(), now);
         let mut gathered = 0usize;
@@ -83,6 +97,10 @@ impl WhipPushOffer {
                 "whip_push has no reachable host candidate: set webrtc.advertised_addresses"
                     .to_owned(),
             ));
+        }
+        // Passive ICE-TCP after UDP (str0m ranks a TCP host below a UDP host).
+        for addr in tcp_candidates {
+            session.add_tcp_passive_candidate(*addr)?;
         }
         let kinds: &[MediaKind] = if audio {
             &[MediaKind::Video, MediaKind::Audio]
@@ -195,6 +213,9 @@ pub struct WhipPushSpec {
     pub audio: bool,
     /// The host candidates the sendonly offer advertises (IPv6-first).
     pub host_candidates: Vec<SocketAddr>,
+    /// Passive ICE-TCP candidates the offer advertises after the UDP ones
+    /// (empty without ICE-TCP).
+    pub tcp_candidates: Vec<SocketAddr>,
 }
 
 /// One `whip_push` output's lifecycle on the shared socket: a supervised state
@@ -263,7 +284,7 @@ impl PushLane {
     /// schedules a backoff reconnect. Never `.await`s the remote peer (inv #10).
     pub async fn step(
         &mut self,
-        socket: &tokio::net::UdpSocket,
+        egress: crate::transport::Egress<'_>,
         turn: &mut TurnRelayDriver,
         local_addr: SocketAddr,
         now: Instant,
@@ -291,7 +312,7 @@ impl PushLane {
             } => {
                 let _ = local_addr;
                 WhipPushClient::drain_and_send(
-                    socket,
+                    egress,
                     turn,
                     &mut session,
                     &self.spec.feed,
@@ -335,9 +356,22 @@ impl PushLane {
         payload: &[u8],
         now: Instant,
     ) {
+        self.handle_inbound_proto(Transport::Udp, src, dst, payload, now);
+    }
+
+    /// [`handle_inbound`](Self::handle_inbound) for a datagram received on
+    /// `proto` (an ICE-TCP frame is [`Transport::Tcp`]).
+    pub fn handle_inbound_proto(
+        &mut self,
+        proto: Transport,
+        src: SocketAddr,
+        dst: SocketAddr,
+        payload: &[u8],
+        now: Instant,
+    ) {
         match &mut self.state {
             PushState::Connected { session, .. } | PushState::Connecting { session, .. } => {
-                let _ = session.handle_datagram(src, dst, payload, now);
+                let _ = session.handle_datagram_proto(proto, src, dst, payload, now);
             }
             PushState::Idle { .. } => {}
         }
@@ -345,7 +379,11 @@ impl PushLane {
 
     /// Build a sendonly offer and dispatch the (blocking) WHIP `POST` off-thread.
     fn begin_connect(&mut self, now: Instant) -> PushState {
-        let Ok(offer) = WhipPushOffer::create(&self.spec.host_candidates, self.spec.audio) else {
+        let Ok(offer) = WhipPushOffer::create_with_tcp(
+            &self.spec.host_candidates,
+            &self.spec.tcp_candidates,
+            self.spec.audio,
+        ) else {
             return PushState::Idle {
                 retry_at: now + self.backoff.next_delay(),
             };
@@ -463,6 +501,7 @@ impl WhipPushClient {
 
         let mut backoff = PushBackoff::new();
         let mut buf = vec![0u8; RECV_BUFFER];
+        let egress = crate::transport::Egress::udp(&socket);
 
         while !stop.load(Ordering::Acquire) {
             // Build a fresh sendonly offer + negotiate with the remote origin.
@@ -503,12 +542,12 @@ impl WhipPushClient {
                                 let _ = session.handle_datagram(src, local_addr, payload, now);
                             }
                         }
-                        Self::drain_and_send(&socket, &mut turn, &mut session, &self.feed, &mut saw_keyframe, now).await;
+                        Self::drain_and_send(egress, &mut turn, &mut session, &self.feed, &mut saw_keyframe, now).await;
                     }
                     _ = tick.tick() => {
                         let now = Instant::now();
                         let _ = session.handle_timeout(now);
-                        Self::drain_and_send(&socket, &mut turn, &mut session, &self.feed, &mut saw_keyframe, now).await;
+                        Self::drain_and_send(egress, &mut turn, &mut session, &self.feed, &mut saw_keyframe, now).await;
                     }
                 }
                 if !session.is_alive() {
@@ -529,7 +568,7 @@ impl WhipPushClient {
     /// then flush its outbound datagrams onto the socket, routing through the TURN
     /// relay when str0m chose the relay candidate (defect C). Non-blocking.
     async fn drain_and_send(
-        socket: &tokio::net::UdpSocket,
+        egress: crate::transport::Egress<'_>,
         turn: &mut TurnRelayDriver,
         session: &mut Session,
         feed: &EgressFeed,
@@ -560,8 +599,8 @@ impl WhipPushClient {
                 }
             }
         }
-        while let Some((source, dst, payload)) = session.poll_transmit(now) {
-            crate::transport::relay_io::send_routed(socket, turn, source, dst, &payload, now).await;
+        while let Some(dg) = session.poll_transmit_routed(now) {
+            crate::transport::relay_io::send_routed(egress, turn, &dg, now).await;
         }
     }
 }

@@ -36,6 +36,8 @@ pub fn endpoint_config_from(config: &multiview_config::MultiviewConfig) -> Endpo
         tombstone_ttl: multiview_webrtc::config::DEFAULT_TOMBSTONE_TTL,
         cors_allow_origins: w.cors_allow_origins.clone(),
         ice_servers,
+        // Set by the front-door wiring only (slice 4, ICE-TCP on the TCP door).
+        ice_tcp_port: None,
     }
 }
 

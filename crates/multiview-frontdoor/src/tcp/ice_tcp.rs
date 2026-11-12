@@ -484,6 +484,44 @@ impl IceTcpLane {
     }
 }
 
+/// The str0m driver's view of the lane (feature `webrtc`), mirroring
+/// [`crate::rtc`]'s `SharedInbound` adapter: inbound frames in, a non-blocking
+/// send out.
+#[cfg(feature = "webrtc")]
+mod webrtc_adapter {
+    use super::{IceTcpFrame, IceTcpLane, SendOutcome};
+    use multiview_webrtc::transport::{InboundFrame, SharedTcp, TcpSend};
+    use std::net::SocketAddr;
+    use std::task::{Context, Poll};
+
+    fn convert(f: IceTcpFrame) -> InboundFrame {
+        InboundFrame {
+            peer: f.peer,
+            local: f.local,
+            payload: f.payload,
+        }
+    }
+
+    impl TcpSend for IceTcpLane {
+        fn send(&self, peer: SocketAddr, payload: &[u8]) -> bool {
+            matches!(
+                self.sender.send(peer, payload),
+                SendOutcome::Queued | SendOutcome::DroppedOldest
+            )
+        }
+    }
+
+    impl SharedTcp for IceTcpLane {
+        fn poll_next(&mut self, cx: &mut Context<'_>) -> Poll<Option<InboundFrame>> {
+            self.poll_recv(cx).map(|f| f.map(convert))
+        }
+
+        fn try_next(&mut self) -> Option<InboundFrame> {
+            self.try_recv().map(convert)
+        }
+    }
+}
+
 /// Read the first frame's body (its two length bytes already consumed and
 /// classified) before `deadline`.
 async fn read_first_frame(
