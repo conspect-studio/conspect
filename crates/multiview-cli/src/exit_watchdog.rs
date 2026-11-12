@@ -172,7 +172,9 @@ pub const EXIT_PATH_GRACE: Duration = Duration::from_millis(500);
 fn exit_process(cause: ExitCause) {
     // A stop whose outputs have not finalised by the deadline did not stop
     // cleanly: report it as a failure (a wedged consumer or sink, #309).
-    let cause = if cause == ExitCause::Stop && OUTPUTS_OPEN.load(Ordering::Acquire) > 0 {
+    let cause = if cause == ExitCause::Stop
+        && (OUTPUTS_OPEN.load(Ordering::Acquire) > 0 || RUN_FAILED.load(Ordering::Acquire))
+    {
         ExitCause::Fatal
     } else {
         cause
@@ -180,7 +182,12 @@ fn exit_process(cause: ExitCause) {
     let _ = std::thread::Builder::new()
         .name("multiview-exit-notice".to_owned())
         .spawn(move || {
-            if let Ok(mut err) = std::fs::OpenOptions::new().write(true).open("/dev/stderr") {
+            // /dev/stderr is Linux; macOS/BSD expose the fd under /dev/fd.
+            let handle = std::fs::OpenOptions::new()
+                .write(true)
+                .open("/dev/stderr")
+                .or_else(|_| std::fs::OpenOptions::new().write(true).open("/dev/fd/2"));
+            if let Ok(mut err) = handle {
                 let _ = writeln!(
                     err,
                     "multiview: teardown overran the {} ms exit bound ({cause:?}); exiting with \
@@ -217,6 +224,15 @@ fn kill_self() {
 }
 
 static WATCHDOG: OnceLock<Watchdog> = OnceLock::new();
+
+/// The run's own verdict is a failure (for example it faltered: frames were
+/// shed). Does not arm a deadline; only makes a hard exit report code 1.
+static RUN_FAILED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Record that the run's verdict is a failure (wait-free; safe on the clock).
+pub fn note_run_failed() {
+    RUN_FAILED.store(true, Ordering::Release);
+}
 
 /// Live output egresses that have not finalised yet.
 static OUTPUTS_OPEN: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);

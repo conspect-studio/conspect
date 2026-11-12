@@ -40,6 +40,9 @@ restarting.
      - It writes one line to `/dev/stderr` from a helper thread, through its own file handle
        (no std stderr lock, no tracing: either may be the stuck part).
      - It calls `std::process::exit` with the cause's code: 1 for a fatal, 0 for a stop.
+       A stop exits 1 instead when outputs are still open, or when the run's own verdict
+       is a failure (it faltered: frames were shed). That is the same code a normal return
+       would give.
      - A backstop thread ends the process if the C runtime exit path (atexit handlers, stdio
        flush) has not finished within 500 ms: `SIGKILL` in builds with `rustix` (every
        `ffmpeg` build), `abort()` otherwise. Both skip atexit handlers.
@@ -52,8 +55,9 @@ restarting.
    - The egress join returns an error. This upgrades a stop to a fatal, and the fatal gets its
      own full bound.
    - **Outputs still open at the deadline.** Each live egress counts as open until its join has
-     finalised every output (the consumer is done, every sink is joined, none is detached as
-     wedged). If a stop reaches the deadline with outputs still open, it exits 1, not 0: the
+     resolved every output, on every return path (a drop guard). An output stays open only when
+     the consumer is still running at the grace, or a sink is detached as wedged (an explicit
+     flag). If a stop reaches the deadline with outputs still open, it exits 1, not 0: the
      outputs did not finalise. This covers a wedged consumer and a wedged sink alike. A slow
      but healthy drain that finishes before the deadline still exits 0. There is no progress
      heuristic: only the result matters.
@@ -150,6 +154,10 @@ change shortens dead output after a fault; it does not change the tick path.
 
   On the Apple-silicon host: 20 × each mode, 0 failures, exits at 2.08–2.12 s. CI (macOS job)
   runs 10 × each mode.
+- The script also proves that the watchdog ended the process:
+  - no normal-return stage (`run-tenants`) is logged;
+  - the exit code equals the code in the watchdog's line;
+  - every wait is bounded, and a run that does not exit is killed and fails.
 - **Negative control:** with `enable()` removed, the same runs exit after 40 s and fail.
 - **Release guard:** the `_chaos-test-seams` feature is in the `*test-seam*` family, so the
   release-feature guard keeps it out of every shipped preset.

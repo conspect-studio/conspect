@@ -228,8 +228,8 @@ lightweight runtime so they never contend with the video threads. See the
 The engine ends itself on a fatal output fault (for example "output fell N ticks behind the
 clock"), and on SIGTERM or Ctrl-C. In both cases the process is gone within **2 s** of the
 decision ([bounded exit](../architecture/bounded-exit.md)): outputs are finalised first, then the
-exit watchdog cuts any source teardown that overruns. Exit code 1 means a fault; 0 means a clean
-stop. The line `teardown overran the 2000 ms exit bound` on stderr means that the watchdog ended
+exit watchdog cuts any source teardown that overruns. Exit code 1 means a fault, or a stop whose
+outputs did not finalise, or a run that faltered (shed frames). 0 means a clean stop. The line `teardown overran the 2000 ms exit bound` on stderr means that the watchdog ended
 the run.
 
 Run it under a supervisor that restarts it. A fault that repeats on every start can now restart

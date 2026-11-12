@@ -107,7 +107,7 @@ run_once() {
     local waited=0
     until grep -q "pipeline run: until" "${log}" 2>/dev/null; do
       sleep 0.1; waited=$((waited + 1))
-      [ "${waited}" -lt 300 ] || { echo "run ${i} (stop): pipeline never started"; tail -20 "${log}"; return 1; }
+      [ "${waited}" -lt 300 ] || { echo "run ${i} (stop): pipeline never started"; tail -20 "${log}"; kill -KILL "${pid}" 2>/dev/null || true; return 1; }
     done
     if [ "${mode}" = stopwedge ]; then
       local w2=0
@@ -123,6 +123,15 @@ run_once() {
     t_decide="$(now_ms)"
     kill -TERM "${pid}"
   fi
+  # Bounded wait: a run that never exits is a failure, never a hang.
+  local polls=0
+  while kill -0 "${pid}" 2>/dev/null; do
+    sleep 0.02; polls=$((polls + 1))
+    if [ "${polls}" -gt 2500 ]; then   # 50 s
+      kill -KILL "${pid}" 2>/dev/null || true
+      echo "run ${i} (${mode}): did not exit within 50 s"; tail -20 "${log}"; return 1
+    fi
+  done
   set +e
   wait "${pid}"
   rc=$?
@@ -151,6 +160,10 @@ PY
   # time on its own): require its armed line and its hard-exit message.
   grep -q "exit deadline armed" "${log}" || { echo "  FAIL: watchdog never armed"; return 1; }
   grep -q "teardown overran the" "${log}" || { echo "  FAIL: no watchdog hard exit (teardown not held?)"; return 1; }
+  # The watchdog ended the process: nothing of the normal return path after it.
+  if grep -q 'stage="run-tenants"' "${log}"; then echo "  FAIL: the run returned normally (not the watchdog)"; return 1; fi
+  # The code the watchdog announced is the code the process returned.
+  grep -q "exiting with code ${rc} " "${log}" || { echo "  FAIL: exit code ${rc} differs from the watchdog's"; return 1; }
   if [ "${mode}" != stopwedge ]; then
   grep -q "chaos: holding source teardown" "${log}" || { echo "  FAIL: teardown seam not reached"; return 1; }
   # Outputs are finalised BEFORE the held source teardown (egress first).

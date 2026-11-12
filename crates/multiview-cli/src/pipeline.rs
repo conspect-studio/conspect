@@ -4848,6 +4848,8 @@ impl Pipeline {
                     Err(TrySendError::Full(_)) => {
                         // Shed and COUNT — never block (inv #1/#10).
                         hot_dropped.fetch_add(1, Ordering::Release);
+                        // #309: a shed frame makes the run's verdict FALTERED (exit 1).
+                        crate::exit_watchdog::note_run_failed();
                     }
                     Err(TrySendError::Disconnected(_)) => {
                         // The output producer died. Stop at this tick boundary
@@ -4857,6 +4859,8 @@ impl Pipeline {
                         // #309: wait-free; bounded exit from this decision.
                         crate::exit_watchdog::arm(crate::exit_watchdog::ExitCause::Fatal);
                         hot_dropped.fetch_add(1, Ordering::Release);
+                        // #309: a shed frame makes the run's verdict FALTERED (exit 1).
+                        crate::exit_watchdog::note_run_failed();
                     }
                 },
             }
@@ -6159,6 +6163,12 @@ impl StreamEgress {
     /// Returns a [`PipelineError`] if the consumer panicked, or a sink that DID
     /// finish errored/panicked (a detached wedged sink is reported, not errored).
     fn join(self) -> Result<EgressOutcome, PipelineError> {
+        // #309: this egress's outputs count as open until join resolves them.
+        // Every return path resolves them (the guard's Drop), except a consumer
+        // still running at the grace or a sink detached as wedged: those
+        // outputs are not finalised and stay open.
+        let mut open_guard = OutputsOpenGuard::new(self.arm_on_wedge);
+        let mut any_sink_wedged = false;
         // A fatal native encoder can wedge in libav without returning an error.
         // Do not let shutdown wait forever: systemd owns a fresh-process restart
         // after this bounded error, and the detached thread cannot poison a new
@@ -6168,6 +6178,7 @@ impl StreamEgress {
             std::thread::park_timeout(Duration::from_millis(10));
         }
         if !self.consumer.is_finished() {
+            open_guard.keep_open();
             return Err(PipelineError::Output {
                 kind: "bake-consumer",
                 reason: "encoder consumer failed to stop within bounded teardown".to_owned(),
@@ -6225,6 +6236,7 @@ impl StreamEgress {
                 lines.push(format!(
                     "sink {i}: WEDGED (teardown grace exceeded, detached)"
                 ));
+                any_sink_wedged = true;
                 frames.push(0);
                 continue;
             }
@@ -6242,15 +6254,38 @@ impl StreamEgress {
             lines.push(outcome.line);
             frames.push(outcome.frames);
         }
-        // #309: every output finalised (no sink was detached as wedged).
-        if self.arm_on_wedge && !lines.iter().any(|l| l.contains("WEDGED")) {
-            crate::exit_watchdog::outputs_finalised();
+        if any_sink_wedged {
+            open_guard.keep_open();
         }
         Ok(EgressOutcome {
             lines,
             peak_occupancy: self.peak_occupancy.load(Ordering::Acquire),
             sink_frames: frames,
         })
+    }
+}
+
+/// Resolves one live egress's "outputs open" count (#309) on drop, unless told
+/// the outputs stayed open (a wedged consumer or sink).
+struct OutputsOpenGuard {
+    armed: bool,
+}
+
+impl OutputsOpenGuard {
+    const fn new(armed: bool) -> Self {
+        Self { armed }
+    }
+
+    fn keep_open(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for OutputsOpenGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            crate::exit_watchdog::outputs_finalised();
+        }
     }
 }
 
