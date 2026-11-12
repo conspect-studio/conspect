@@ -273,7 +273,14 @@ async fn run_software(
             .context("software bounded run")?
     } else {
         tracing::info!("software run: until Ctrl-C");
-        run_software_until_ctrl_c(&mut engine, start, &plane, &args.config).await?
+        {
+            let run = run_software_until_ctrl_c(&mut engine, start, &plane, &args.config).await;
+            if run.is_err() {
+                // #309: a failed run is an exit decision.
+                multiview_cli::exit_watchdog::arm(multiview_cli::exit_watchdog::ExitCause::Fatal);
+            }
+            run?
+        }
     };
 
     println!("{}", report.render());
@@ -998,12 +1005,13 @@ async fn run_pipeline_until_ctrl_c(
     let stop_for_signal = stop.clone();
     let signal = tokio::spawn(async move {
         let which = await_shutdown_signal().await;
+        // #309: decide first, log second.
+        stop_for_signal.stop();
+        multiview_cli::exit_watchdog::arm(multiview_cli::exit_watchdog::ExitCause::Stop);
         tracing::info!(
             signal = which,
             "stop signal received; stopping after the current frame"
         );
-        stop_for_signal.stop();
-        multiview_cli::exit_watchdog::arm(multiview_cli::exit_watchdog::ExitCause::Stop);
     });
     // #309: the durable shutdown work must land inside the exit bound, so it
     // starts the moment ANY exit is decided (a stop signal or a fatal output
@@ -1466,12 +1474,13 @@ async fn run_software_until_ctrl_c(
     let stop_for_signal = stop.clone();
     let signal = tokio::spawn(async move {
         let which = await_shutdown_signal().await;
+        // #309: decide first, log second.
+        stop_for_signal.stop();
+        multiview_cli::exit_watchdog::arm(multiview_cli::exit_watchdog::ExitCause::Stop);
         tracing::info!(
             signal = which,
             "stop signal received; stopping after the current frame"
         );
-        stop_for_signal.stop();
-        multiview_cli::exit_watchdog::arm(multiview_cli::exit_watchdog::ExitCause::Stop);
     });
 
     // The off-hot-path system-metrics poller: samples whole-system CPU + host

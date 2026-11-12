@@ -4994,15 +4994,16 @@ impl Pipeline {
                 "teardown stage done"
             );
         };
+        // #309: an engine error is a fatal decision too; arm before anything
+        // that can block (a log line), before the slow source teardown.
+        if outcome.is_err() && matches!(policy, SendPolicy::DropOnOverload) {
+            crate::exit_watchdog::arm(crate::exit_watchdog::ExitCause::Fatal);
+        }
         stage("clock-returned");
         if let Some(cause) = crate::exit_watchdog::armed() {
             tracing::info!(?cause, "exit deadline armed; finalising outputs first");
         }
-        // #309: an engine error is a fatal decision too; bound the exit from
-        // here, before the (slow, bounded-per-producer) source teardown.
-        if outcome.is_err() && matches!(policy, SendPolicy::DropOnOverload) {
-            crate::exit_watchdog::arm(crate::exit_watchdog::ExitCause::Fatal);
-        }
+
         // #309: finalise the OUTPUTS first. The engine loop consumed the
         // `state_of` closure (the ONLY owner of the hot sender) when
         // `run_for`/`run` returned above, so the hot queue is already closed →
@@ -6103,13 +6104,13 @@ impl StreamEgress {
                     result
                 };
                 if let Err(error) = &result {
-                    tracing::error!(error = %error, "fatal encoded-output consumer failure");
+                    // #309: decide first, log second — a blocked log writer must
+                    // not delay the stop flag or the exit deadline.
                     consumer_fatal.store(true, Ordering::Release);
-                    // #309: from this decision the process is gone within
-                    // EXIT_DEADLINE, however long teardown would take.
                     if arm_exit_on_fatal {
                         crate::exit_watchdog::arm(crate::exit_watchdog::ExitCause::Fatal);
                     }
+                    tracing::error!(error = %error, "fatal encoded-output consumer failure");
                 }
                 result
             })
@@ -6212,9 +6213,11 @@ impl StreamEgress {
         // failed binding is visible even when its sink thread produced a file.
         lines.extend(binding_report_lines(&bindings));
         // A shared teardown budget: healthy sinks finish in milliseconds; only a
-        // genuinely wedged sink consumes the grace before being detached. The
-        // same deadline as the consumer wait (#309), so a sink first reached
-        // after it counts as wedged, not finalised.
+        // genuinely wedged sink consumes the grace before being detached. A
+        // fresh budget (the sinks start finalising only once the consumer has
+        // returned), still capped by an armed exit deadline (#309): with one
+        // armed, a sink first reached after it counts as wedged.
+        let deadline = Instant::now() + join_budget();
         for (i, handle) in self.sinks.into_iter().enumerate() {
             while !handle.is_finished() && Instant::now() < deadline {
                 std::thread::sleep(Duration::from_millis(10));

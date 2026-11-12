@@ -114,7 +114,13 @@ run_once() {
     local waited=0
     until grep -q "pipeline run: until" "${log}" 2>/dev/null; do
       sleep 0.1; waited=$((waited + 1))
-      [ "${waited}" -lt 300 ] || { echo "run ${i} (stop): pipeline never started"; tail -20 "${log}"; kill -KILL "${pid}" 2>/dev/null || true; return 1; }
+      if ! kill -0 "${pid}" 2>/dev/null && grep -q "building the pipeline" "${log}"; then
+        # The host refused an encoder session (e.g. VideoToolbox busy):
+        # an environment fault, not this run's scenario. Retry it once.
+        echo "run ${i} (${mode}): pipeline build failed (encoder unavailable); retrying"
+        return 3
+      fi
+      [ "${waited}" -lt 300 ] || { echo "run ${i} (${mode}): pipeline never started"; tail -20 "${log}"; kill -KILL "${pid}" 2>/dev/null || true; return 1; }
     done
     if [ "${mode}" = stopwedge ] || [ "${mode}" = falterstop ]; then
       local w2=0
