@@ -1496,14 +1496,39 @@ fn a_dying_live_encoder_falls_back(block: bool, bound: u64) {
     x.h.try_take(take("a", 1, src())).unwrap();
     let mut t = 5;
     let mut applied = false;
-    while t < 60 && !applied {
+    let mut attempts = 1;
+    // Same bound as the other end-to-end takes; a take refused on a loaded
+    // host (its encoder not ready in time) is retried, at most 3 times.
+    while t < 5 + 3 * OPEN_DEADLINE_TICKS && !applied {
         x.tick(t);
-        applied = x.results().contains(&TakeResult::Applied);
+        let results = x.results();
+        applied = results.contains(&TakeResult::Applied);
+        if !applied && attempts < 3 && results.iter().any(|r| matches!(r, TakeResult::Refused(_))) {
+            attempts += 1;
+            x.h.try_take(take("a", 1, src())).unwrap();
+        }
         t += 1;
     }
     assert!(applied, "the take applied before the encoder died");
     assert_eq!(x.d.binding_video_key(1), Some(1));
     kill.store(true, Ordering::SeqCst);
+    if !block {
+        // Tick once so the worker gets a frame, then wait (wall clock, not
+        // ticks: the host may be loaded) for its thread to have ended, so
+        // the detection below is the ended-worker path, not the wedge rule.
+        x.tick(t);
+        t += 1;
+        let waited = Instant::now();
+        while !x
+            .r
+            .dynamic
+            .iter()
+            .all(|d| d.worker.as_ref().is_none_or(RenditionWorker::is_finished))
+            && waited.elapsed() < std::time::Duration::from_secs(5)
+        {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
     let mut fell = None;
     let start = t;
     while t < start + bound && fell.is_none() {
@@ -1538,7 +1563,9 @@ fn a_dying_live_encoder_falls_back(block: bool, bound: u64) {
 /// U (HIGH): a live encoder that panics after the move is detected (worker ended), its key closed, the output back on Program.
 #[test]
 fn a_panicking_live_encoder_falls_back_to_program() {
-    a_dying_live_encoder_falls_back(false, 20);
+    // Detected on the first tick after the worker ended (never the 90-tick
+    // wedge rule).
+    a_dying_live_encoder_falls_back(false, 3);
 }
 
 /// U (HIGH): a live encoder that blocks forever in encode (wedged) is closed
