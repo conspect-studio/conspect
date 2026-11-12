@@ -128,10 +128,14 @@ pub fn switcher_canvas_admission(
     Ok(())
 }
 
-/// ADR-0108 slice 1, step 1: an output fed directly by a source (or a switcher
-/// bus other than Program) is validated and read back, but the engine does not
-/// carry it yet, so start-up refuses it rather than silently putting Program on
-/// that output. A `bus = "preview"` output keeps its existing behaviour.
+/// The single start-up rule for output feeds (ADR-0108 §6.1, #329): refuse
+/// only a feed the engine cannot carry at all — a layout (validation already
+/// refuses it until slice 3; this stays the one start-up rule). Program,
+/// Preview, Clean and a source are accepted: the engine starts every output
+/// on Program and then issues one BOOT TAKE per output whose persisted feed is
+/// not Program, through the normal take gate with a bounded retry window (the
+/// output stays on Program if it never becomes takeable). Audio other than
+/// `follow` is refused by validation and is not handled here.
 ///
 /// # Errors
 /// The start-up refusal text naming the routed output.
@@ -139,10 +143,10 @@ pub fn outputs_carry_program(config: &MultiviewConfig) -> Result<(), String> {
     if let Some(routed) = config
         .output_feeds()
         .into_iter()
-        .find(|xp| matches!(xp.effective_video(), crate::VideoFeed::Source(_)))
+        .find(|xp| matches!(xp.effective_video(), crate::VideoFeed::Layout(_)))
     {
         return Err(format!(
-            "output {:?} is routed to {:?}; this engine carries only Program on outputs",
+            "output {:?} is routed to {:?}; this engine cannot carry a layout feed on an output yet",
             routed.output,
             routed.effective_video().picture_bus()
         ));
@@ -160,7 +164,7 @@ pub enum BootAdmissionError {
     /// The document is valid but the declared switcher cannot drive its canvas.
     #[error(transparent)]
     SwitcherCanvas(#[from] SwitcherCanvasRefusal),
-    /// An output is routed to something this engine does not carry yet.
+    /// An output is routed to something this engine cannot carry (a layout).
     #[error("{0}")]
     OutputRouting(String),
 }

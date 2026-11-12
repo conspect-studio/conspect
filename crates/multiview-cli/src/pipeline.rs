@@ -269,6 +269,56 @@ struct StreamPlan {
 }
 
 /// ADR-0108 slice 1, step 1 start-up refusal; the rule itself lives in
+/// Every configured output whose persisted video feed is not Program, as
+/// `(config id, picture bus)` (#329). A feed the engine cannot carry (a
+/// layout) never reaches here: start-up admission refuses it first.
+fn boot_output_feeds(config: &MultiviewConfig) -> Vec<(String, crate::routing_aux::PictureBus)> {
+    config
+        .output_feeds()
+        .into_iter()
+        .filter_map(|xp| {
+            let bus = crate::routing_aux::PictureBus::try_from(&xp.effective_video()).ok()?;
+            (bus != crate::routing_aux::PictureBus::Program).then_some((xp.output, bus))
+        })
+        .collect()
+}
+
+/// Enqueue one BOOT TAKE per output whose persisted feed is not Program
+/// (#329): `operation_id = "boot:<config id>"`, principal `system:boot`. The
+/// take rides the normal gate (fresh within the prime deadline, capacity); the
+/// router re-issues a refused one within its bounded retry window. Called once
+/// per run, right after the handle exists and before the clock starts; the
+/// mailbox (64) is far larger than the outputs of any run, and a refused
+/// enqueue only logs (the output stays on Program).
+fn enqueue_boot_takes(
+    handle: &crate::output_routing::OutputRoutingHandle,
+    feeds: &[(String, crate::routing_aux::PictureBus)],
+) {
+    for (id, bus) in feeds {
+        let Some(output_index) = handle.index_of(id) else {
+            tracing::warn!(output = %id, "routing: no run output for the persisted feed; it stays on Program");
+            continue;
+        };
+        // Bounded like every take id (an HLS config id is its path): cut on a
+        // char boundary; the router matches boot takes by prefix and op id.
+        let mut operation_id = format!("{}{id}", crate::output_routing::BOOT_TAKE_PREFIX);
+        let mut end = operation_id.len().min(crate::output_routing::MAX_TAKE_ID_BYTES);
+        while !operation_id.is_char_boundary(end) {
+            end -= 1;
+        }
+        operation_id.truncate(end);
+        let take = crate::output_routing::OutputTake {
+            operation_id,
+            output_index,
+            bus: bus.clone(),
+            principal: crate::output_routing::BOOT_PRINCIPAL.to_owned(),
+        };
+        if handle.try_take(take).is_err() {
+            tracing::warn!(output = %id, "routing: the start-up take could not be queued; the output stays on Program");
+        }
+    }
+}
+
 /// [`multiview_config::outputs_carry_program`] so start-up and `multiview
 /// validate` share it (#317).
 fn ensure_outputs_carry_program(config: &MultiviewConfig) -> Result<(), PipelineError> {
@@ -2153,6 +2203,10 @@ pub struct Pipeline {
     /// slice 1). Published off-clock when the egress starts; the control plane
     /// loads it lock-free to enqueue takes and read the routing snapshot.
     output_routing: crate::output_routing::OutputRoutingSlot,
+    /// Per configured output (config id): its persisted video feed when it is
+    /// not Program (#329). Each becomes one boot take after the run's routing
+    /// handle is published; the engine itself always starts on Program.
+    boot_output_feeds: Vec<(String, crate::routing_aux::PictureBus)>,
     /// The running Program's lateness histogram + repeats counter (ADR-0108
     /// §10), published at run start for the control plane's metrics route.
     program_metrics: ProgramMetricsSlot,
@@ -3231,6 +3285,7 @@ impl Pipeline {
             program_audio_preview: None,
             window_subscriptions: crate::output_window_registry::window_subscription_slot(),
             output_routing: crate::output_routing::output_routing_slot(),
+            boot_output_feeds: boot_output_feeds(config),
             program_metrics: Arc::new(multiview_framestore::SwapCell::empty()),
             optional_preview: None,
             window_dependencies: Arc::new(window_dependency_axes(config)),
@@ -3497,8 +3552,9 @@ impl Pipeline {
                 }),
             })
             .collect();
-        self.output_routing
-            .store(Some(Arc::new(handle.with_outputs(run_outputs))));
+        let handle = Arc::new(handle.with_outputs(run_outputs));
+        enqueue_boot_takes(&handle, &self.boot_output_feeds);
+        self.output_routing.store(Some(handle));
         Ok(RunRouting {
             consumer: ConsumerRouting {
                 router: Box::new(router),

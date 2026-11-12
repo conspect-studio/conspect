@@ -64,6 +64,15 @@ pub const OPEN_QUEUE: usize = 4;
 pub const REAPER_QUEUE: usize = 8;
 /// Largest gap a live-opened worker fills with its last canvas.
 pub const MAX_GAP_FILL_TICKS: u64 = 8;
+/// Operation-id prefix of a start-up (boot) take: `boot:<output config id>`.
+pub const BOOT_TAKE_PREFIX: &str = "boot:";
+/// The principal a boot take is charged to.
+pub const BOOT_PRINCIPAL: &str = "system:boot";
+/// A refused boot take is re-issued at most once per this many seconds …
+pub const BOOT_RETRY_SECS: i64 = 2;
+/// … for at most this long after the run's first tick; then the output stays
+/// on Program (logged).
+pub const BOOT_WINDOW_SECS: i64 = 30;
 /// Live-opened workers' event queue to the consumer.
 const DYNAMIC_EVENT_QUEUE: usize = 64;
 const NO_FORCE: u64 = u64::MAX;
@@ -241,6 +250,10 @@ pub struct RoutingSnapshot {
     /// lingering ones included and failed ones excluded: a take onto one of
     /// these reuses it (+0 encoders).
     pub live_keys: Vec<(String, usize)>,
+    /// Start-up (boot) takes still inside their retry window (#329).
+    pub boot_takes_pending: usize,
+    /// Start-up takes given up: the output stayed on Program.
+    pub boot_takes_given_up: u64,
 }
 
 /// The control-plane handle (clone freely).
@@ -586,6 +599,16 @@ struct OutputState {
     pending: Option<Pending>,
 }
 
+/// A boot take being carried through its retry window (#329): one per output
+/// at most, so the state is O(outputs).
+struct BootRetry {
+    take: OutputTake,
+    /// The tick it was last issued (entered the take state machine).
+    issued: u64,
+    /// When refused: the tick it may be re-issued.
+    due: Option<u64>,
+}
+
 struct BusHealth {
     held: u64,
     fallen: bool,
@@ -633,6 +656,12 @@ pub struct OutputRouter {
     audio: Option<crate::routing_audio::RoutedAudio>,
     #[cfg(test)]
     audio_tap: crate::routing_audio::AudioTapCell,
+    /// Per output: its boot take while inside the retry window.
+    boot: Vec<Option<BootRetry>>,
+    /// The run's first tick (the boot retry window's origin).
+    first_tick: Option<u64>,
+    /// Boot takes given up (refused for good, or the window ended).
+    boot_given_up: u64,
 }
 
 impl OutputRouter {
@@ -739,7 +768,11 @@ impl OutputRouter {
             audio: None,
             #[cfg(test)]
             audio_tap,
+            boot: Vec::new(),
+            first_tick: None,
+            boot_given_up: 0,
         };
+        router.boot = router.outputs.iter().map(|_| None).collect();
         router.publish_snapshot();
         Ok((router, handle))
     }
@@ -844,7 +877,9 @@ impl OutputRouter {
             self.video_keys = keys;
             self.dirty = true;
         }
+        self.first_tick.get_or_insert(tick);
         self.drain_takes(tick, dispatcher);
+        self.retry_boot_takes(tick);
         self.drain_opens(tick, dispatcher);
         self.drain_moves(tick, dispatcher);
         self.advance_takes(tick, pts, dispatcher);
@@ -918,6 +953,9 @@ impl OutputRouter {
 
     fn emit(&mut self, operation_id: String, output_index: usize, tick: u64, outcome: TakeResult) {
         self.dirty = true;
+        if operation_id.starts_with(BOOT_TAKE_PREFIX) {
+            self.on_boot_outcome(&operation_id, output_index, tick, outcome);
+        }
         // Outcomes are rare control events (not per tick); the clone is the
         // output's current bus name at most.
         let bus = self
@@ -939,6 +977,99 @@ impl OutputRouter {
         }
     }
 
+    /// Ticks in `secs` seconds at the Program cadence (rounded up, at least 1).
+    fn ticks_for(&self, secs: i64) -> u64 {
+        let (num, den) = (self.cfg.cadence.num, self.cfg.cadence.den);
+        if num <= 0 || den <= 0 {
+            return 1;
+        }
+        let ticks = secs.saturating_mul(num).saturating_add(den - 1) / den;
+        u64::try_from(ticks).unwrap_or(1).max(1)
+    }
+
+    /// A boot take's outcome: applied or superseded ends it; a refusal the
+    /// gate may lift later (not fresh, capacity, encoder not ready) schedules
+    /// a re-issue, no sooner than [`BOOT_RETRY_SECS`] after the last one; any
+    /// other refusal gives up. The persisted feed is never touched here: the
+    /// operator's intent stays, the readback shows the live bus.
+    fn on_boot_outcome(&mut self, operation_id: &str, index: usize, tick: u64, outcome: TakeResult) {
+        let retry_ticks = self.ticks_for(BOOT_RETRY_SECS);
+        let Some(slot) = self
+            .boot
+            .get_mut(index)
+            .filter(|slot| slot.as_ref().is_some_and(|b| b.take.operation_id == operation_id))
+        else {
+            return;
+        };
+        match outcome {
+            TakeResult::Refused(
+                RefuseReason::FeedNotFresh | RefuseReason::Capacity | RefuseReason::EncoderNotReady,
+            ) => {
+                if let Some(boot) = slot.as_mut() {
+                    boot.due = Some(tick.max(boot.issued.saturating_add(retry_ticks)));
+                }
+            }
+            TakeResult::Refused(reason) => {
+                if let Some(boot) = slot.take() {
+                    self.boot_given_up = self.boot_given_up.saturating_add(1);
+                    tracing::warn!(
+                        output = index,
+                        feed = %boot.take.bus.as_str(),
+                        reason = reason.operator_message(),
+                        "routing: the start-up take cannot be carried; the output stays on Program"
+                    );
+                }
+            }
+            TakeResult::Applied | TakeResult::Superseded | TakeResult::Fallback(_) => {
+                *slot = None;
+            }
+        }
+    }
+
+    /// Re-issue due boot takes inside the window; give up after it. Bounded:
+    /// one check per output, only while a boot take is still unresolved.
+    fn retry_boot_takes(&mut self, tick: u64) {
+        let window = self.ticks_for(BOOT_WINDOW_SECS);
+        let first = self.first_tick.unwrap_or(tick);
+        for index in 0..self.boot.len() {
+            let Some(due) = self.boot.get(index).and_then(|b| b.as_ref()).and_then(|b| b.due)
+            else {
+                continue;
+            };
+            if tick < due || self.outputs.get(index).is_none_or(|o| o.pending.is_some()) {
+                continue;
+            }
+            if tick.saturating_sub(first) > window {
+                if let Some(boot) = self.boot.get_mut(index).and_then(Option::take) {
+                    self.boot_given_up = self.boot_given_up.saturating_add(1);
+                    self.dirty = true;
+                    tracing::warn!(
+                        output = index,
+                        feed = %boot.take.bus.as_str(),
+                        window_secs = BOOT_WINDOW_SECS,
+                        "routing: the start-up feed never became takeable; the output stays on \
+                         Program (the configured feed is kept)"
+                    );
+                }
+                continue;
+            }
+            let Some(boot) = self.boot.get_mut(index).and_then(Option::as_mut) else {
+                continue;
+            };
+            boot.issued = tick;
+            boot.due = None;
+            let take = boot.take.clone();
+            if let Some(out) = self.outputs.get_mut(index) {
+                out.pending = Some(Pending {
+                    take,
+                    started: tick,
+                    phase: Phase::Priming,
+                });
+                self.dirty = true;
+            }
+        }
+    }
+
     fn drain_takes(&mut self, tick: u64, dispatcher: &mut RenditionDispatcher) {
         loop {
             let take = match self.takes.try_recv() {
@@ -946,6 +1077,18 @@ impl OutputRouter {
                 Err(TryRecvError::Empty | TryRecvError::Disconnected) => return,
             };
             let index = take.output_index;
+            // A boot take enters its retry window; an operator take on the
+            // same output replaces the boot intent for good.
+            if let Some(slot) = self.boot.get_mut(index) {
+                *slot = take
+                    .operation_id
+                    .starts_with(BOOT_TAKE_PREFIX)
+                    .then(|| BootRetry {
+                        take: take.clone(),
+                        issued: tick,
+                        due: None,
+                    });
+            }
             let needs_switcher = matches!(take.bus, PictureBus::Preview | PictureBus::Clean);
             let routable = index < self.outputs.len() && (!needs_switcher || self.cfg.has_preview);
             if !routable {
@@ -1771,6 +1914,8 @@ impl OutputRouter {
                 .map(crate::routing_audio::RoutedAudio::counters)
                 .unwrap_or_default(),
             live_keys: self.live_keys.clone(),
+            boot_takes_pending: self.boot.iter().filter(|b| b.is_some()).count(),
+            boot_takes_given_up: self.boot_given_up,
         };
         if *self.snapshot.load() != next {
             self.snapshot.store(Arc::new(next));
