@@ -2012,11 +2012,18 @@ impl RenditionDispatcher {
     /// then commit every ready window exactly as [`Self::dispatch`] does. A
     /// fault in the stage fails that stage alone, never the run.
     ///
+    /// `generation` is the one [`Self::add_audio_key`] returned for the
+    /// emitting bus: an emission whose generation is not the slot's current
+    /// one (a late packet of a closed bus landing on a reused slot) is
+    /// dropped and counted, never staged.
+    ///
     /// # Errors
     /// Only what [`Self::dispatch`]'s drain returns for the base windows.
+    #[allow(clippy::too_many_arguments)] // reason: key + generation identify the stage; the rest mirrors dispatch.
     pub(crate) fn dispatch_dynamic_audio<D: WindowDelivery>(
         &mut self,
         key: usize,
+        generation: u64,
         packets: Vec<EncodedPacket>,
         watermark: Option<DtsWatermark>,
         finish: bool,
@@ -2033,7 +2040,7 @@ impl RenditionDispatcher {
         let Some(a) = self.dyn_audio.get_mut(key) else {
             return Err(DispatchError::InvalidEvent);
         };
-        if a.retired || a.failed {
+        if a.retired || a.failed || a.generation != generation {
             self.counters.dropped_unbound = self.counters.dropped_unbound.saturating_add(1);
         } else {
             let stage = &mut a.stage;
@@ -3878,7 +3885,7 @@ mod tests {
         let mut d =
             RenditionDispatcher::new(aac_cfg(vec![binding(0, 0, 1), binding(1, 0, 1)])).unwrap();
         let mut sink = FakeDelivery::new(2);
-        let (key, _) = d.add_audio_key().unwrap();
+        let (key, key_gen) = d.add_audio_key().unwrap();
         // G inside window 5 (9600..11520): 10240.
         let g = 10_240;
         let mut seen = [Vec::new(), Vec::new()];
@@ -3886,8 +3893,16 @@ mod tests {
             // The private bus runs from window 2 on, carrying its own tag.
             if i >= 2 {
                 let p: Vec<_> = frames_in(i).into_iter().map(|x| tagged(x, 2)).collect();
-                d.dispatch_dynamic_audio(key, p, Some(mark(tick_ns(i + 1))), false, now, &mut sink)
-                    .unwrap();
+                d.dispatch_dynamic_audio(
+                    key,
+                    key_gen,
+                    p,
+                    Some(mark(tick_ns(i + 1))),
+                    false,
+                    now,
+                    &mut sink,
+                )
+                .unwrap();
             }
             if i == 3 {
                 d.rebind_audio(1, Some(key), g).unwrap();
@@ -3921,10 +3936,11 @@ mod tests {
         let mut d =
             RenditionDispatcher::new(aac_cfg(vec![binding(0, 0, 1), binding(1, 0, 1)])).unwrap();
         let mut sink = FakeDelivery::new(2);
-        let (key, _) = d.add_audio_key().unwrap();
+        let (key, key_gen) = d.add_audio_key().unwrap();
         // The private stage proves window 0 and then wedges.
         d.dispatch_dynamic_audio(
             key,
+            key_gen,
             vec![tagged(0, 2)],
             Some(mark(tick_ns(1))),
             false,
@@ -3968,6 +3984,67 @@ mod tests {
         assert!(d.is_audio_key_failed(k2));
     }
 
+    /// A1: a late emission of a closed private bus must never land on the
+    /// slot's next tenant. The emission carries the generation it was opened
+    /// with; on a reused slot it is dropped and counted, never staged.
+    #[test]
+    fn a_stale_generation_audio_emission_is_dropped_on_a_reused_slot() {
+        let mut d =
+            RenditionDispatcher::new(aac_cfg(vec![binding(0, 0, 1), binding(1, 0, 1)])).unwrap();
+        let mut sink = FakeDelivery::new(2);
+        let (old, old_gen) = d.add_audio_key().unwrap();
+        d.retire_audio_key(old).unwrap();
+        let (key, key_gen) = d.add_audio_key().unwrap();
+        assert_eq!(key, old, "the slot is reused");
+        assert_ne!(key_gen, old_gen);
+        let g = 1024;
+        d.rebind_audio(1, Some(key), g).unwrap();
+        // After the rebind: its staging watchdog starts at the rebind.
+        let now = Instant::now();
+        let before = d.counters().dropped_unbound;
+        let mut seen = Vec::new();
+        for i in 0..6_i64 {
+            // The closed bus's late packets (tag 9) arrive first, under the
+            // old generation, for the same windows.
+            let late: Vec<_> = frames_in(i).into_iter().map(|x| tagged(x, 9)).collect();
+            d.dispatch_dynamic_audio(
+                key,
+                old_gen,
+                late,
+                Some(mark(tick_ns(i + 1))),
+                false,
+                now,
+                &mut sink,
+            )
+            .unwrap();
+            let p: Vec<_> = frames_in(i).into_iter().map(|x| tagged(x, 2)).collect();
+            d.dispatch_dynamic_audio(
+                key,
+                key_gen,
+                p,
+                Some(mark(tick_ns(i + 1))),
+                false,
+                now,
+                &mut sink,
+            )
+            .unwrap();
+            d.dispatch(ve25(i), now, &mut sink).unwrap();
+            d.dispatch(audio_event(i, 1), now, &mut sink).unwrap();
+            seen.extend(audio_of(&mut sink, 1, now));
+        }
+        let all: Vec<i64> = (0..6).flat_map(frames_in).collect();
+        assert_eq!(seen.iter().map(|p| p.0).collect::<Vec<_>>(), all);
+        for &(dts, tag) in &seen {
+            assert_eq!(tag, if dts < g { 1 } else { 2 }, "dts {dts}");
+        }
+        assert_eq!(
+            d.counters().dropped_unbound,
+            before + 6,
+            "each stale emission counted"
+        );
+        assert!(!d.is_audio_key_failed(key));
+    }
+
     /// Sample-exact across the move, with the real libav AAC encoder and
     /// decoder at 48 kHz: the old bus and the private bus encode the same PCM
     /// on the same global grid (the private bus opened mid-run at G0), the
@@ -3994,7 +4071,7 @@ mod tests {
         c.video_time_base = vec![DtsTimeBase { num: 1, den: 25 }];
         let mut d = RenditionDispatcher::new(c).unwrap();
         let mut sink = FakeDelivery::new(2);
-        let (key, _) = d.add_audio_key().unwrap();
+        let (key, key_gen) = d.add_audio_key().unwrap();
         let pcm = |n: u64| -> f32 {
             let t = f32::from(u16::try_from(n % 48_000).unwrap()) / 48_000.0;
             0.3 * (std::f32::consts::TAU * 440.0 * t).sin()
@@ -4029,7 +4106,7 @@ mod tests {
                 private_pending.extend(out);
                 let wm = watermark(&private_pending);
                 let batch = std::mem::take(&mut private_pending);
-                d.dispatch_dynamic_audio(key, batch, wm, false, Instant::now(), &mut sink)
+                d.dispatch_dynamic_audio(key, key_gen, batch, wm, false, Instant::now(), &mut sink)
                     .unwrap();
             }
             if tick == move_tick {

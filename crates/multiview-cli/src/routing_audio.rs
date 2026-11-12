@@ -78,6 +78,8 @@ impl AudioSource {
 
 /// Encoded packets of one private bus for one fed tick.
 struct AudioEvent {
+    /// The dispatcher stage the bus was opened on, with its generation.
+    key: usize,
     generation: u64,
     packets: Vec<EncodedPacket>,
     watermark: Option<DtsWatermark>,
@@ -211,7 +213,7 @@ impl RoutedAudio {
         let spawned = spawn_bus_worker(
             self.config.clone(),
             start_i64,
-            generation,
+            (key, generation),
             self.events_tx.clone(),
             config_tx,
             Arc::clone(&failed),
@@ -439,11 +441,14 @@ impl RoutedAudio {
         delivery: &mut D,
     ) -> Result<(), DispatchError> {
         while let Ok(event) = self.events.try_recv() {
+            // The event names its stage by (key, generation): the
+            // dispatcher stages it only while that slot still carries this
+            // generation (a reused slot drops it, counted).
             let Some(key) = self
                 .buses
                 .iter()
                 .flatten()
-                .find(|b| b.generation == event.generation)
+                .find(|b| b.generation == event.generation && b.key == event.key)
                 .map(|b| b.key)
             else {
                 self.dropped.fetch_add(1, Ordering::Relaxed);
@@ -451,6 +456,7 @@ impl RoutedAudio {
             };
             if let Err(e) = dispatcher.dispatch_dynamic_audio(
                 key,
+                event.generation,
                 event.packets,
                 event.watermark,
                 false,
@@ -551,7 +557,7 @@ fn source_pcm(
 fn spawn_bus_worker(
     config: AudioEncodeConfig,
     start: i64,
-    generation: u64,
+    stage: (usize, u64),
     events: SyncSender<AudioEvent>,
     config_tx: SyncSender<Option<Vec<u8>>>,
     failed: Arc<AtomicBool>,
@@ -562,9 +568,7 @@ fn spawn_bus_worker(
         .name("routing-audio".to_owned())
         .spawn(move || {
             let run = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                bus_worker(
-                    &config, start, generation, &events, &config_tx, &jobs, &dropped,
-                )
+                bus_worker(&config, start, stage, &events, &config_tx, &jobs, &dropped)
             }));
             if !matches!(run, Ok(true)) {
                 failed.store(true, Ordering::Release);
@@ -577,7 +581,7 @@ fn spawn_bus_worker(
 fn bus_worker(
     config: &AudioEncodeConfig,
     start: i64,
-    generation: u64,
+    (key, generation): (usize, u64),
     events: &SyncSender<AudioEvent>,
     config_tx: &SyncSender<Option<Vec<u8>>>,
     jobs: &Receiver<Vec<f32>>,
@@ -603,6 +607,7 @@ fn bus_worker(
         }
         if events
             .try_send(AudioEvent {
+                key,
                 generation,
                 packets,
                 watermark,
