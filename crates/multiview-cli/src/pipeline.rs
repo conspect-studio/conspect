@@ -7326,7 +7326,12 @@ fn consumer_main<D: WindowDelivery>(
         kind: "dispatch",
         reason: format!("{e:?}"),
     })?;
-    // Consulted only at a move: a run without a take is unaffected.
+    // Compared at a move/fallback, but also run on the default path: every
+    // delivered keyframe of a binding's current key is scanned (one bounded
+    // NAL walk per keyframe per output, plus a Vec copy of the sets when they
+    // change) so the next switch compares against what the output carries.
+    // This is consumer-thread (off-clock) work and never blocks; a run
+    // without a take still pays it once per GOP per output.
     for (key, sets) in video_parameter_sets.into_iter().enumerate() {
         let _ = dispatcher.set_parameter_sets(key, sets);
     }
