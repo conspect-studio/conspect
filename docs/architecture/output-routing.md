@@ -561,12 +561,14 @@ verified per protocol in the slice that ships it (§9). §4.6 proved the MPEG-TS
 
   Each swap is atomic per output at its own boundary.
 - **Window closure with a live-opened stage (the rule that protects Program).** The dispatcher
-  closes a window only when every live stage is complete up to its end
-  (`crates/multiview-cli/src/rendition_dispatch.rs:601-607`). A stage opened live is therefore
-  **not live for closure** until its first completed window: before that it never gates any other
-  stage, and its windows are not delivered to anyone. From its first window it joins the rule like
-  any stage, and the normal watchdog and per-binding admission isolate a wedge afterwards. An
-  output is rebound only to a window the destination stage has completed and whose first video
+  closes a window on the **base** stages only: the base (startup) video stages and the audio
+  stages must be complete up to its end (`RenditionDispatcher::drain_base` in
+  `crates/multiview-cli/src/rendition_dispatch.rs`). A stage opened live **never gates a base
+  window**, not before its first completed window and not after it: its windows are not delivered
+  to anyone until an output moves onto it, and a slow, wedged or failed live stage can delay no
+  window of any other stage. This is stronger isolation than "every live stage is complete": the
+  live stage's watchdog (`fail_stale_dynamic`) and per-binding admission fail it alone, and its
+  subscribers fall back to Program. An output is rebound only to a window the destination stage has completed and whose first video
   packet passes the move gate (§4.2 step 2). Two tests pin this, and they fail without the rule: a
   live open whose encoder is slow (several ticks) or wedged (never produces) leaves every existing
   output's windows closing on time with none late or missing; and the moved output's first packet
