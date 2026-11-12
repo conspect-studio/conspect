@@ -322,11 +322,16 @@ struct VideoMeta {
     failed: bool,
     gate: Option<MoveGate>,
     params: Option<ParameterSets>,
+    /// Bumped every time a dynamic slot is (re)assigned: a pending move
+    /// names `(key, generation)`, so a reused slot never satisfies a move
+    /// requested against the key that used to live there.
+    generation: u64,
 }
 
 #[derive(Clone, Copy)]
 struct PendingMove {
     key: usize,
+    generation: u64,
     at_tick: i128,
     max_windows: u32,
     failed: u32,
@@ -381,6 +386,8 @@ pub(crate) struct RenditionDispatcher {
     next_window: Option<i128>,
     global_staged_packets: usize,
     global_staged_bytes: usize,
+    /// Source of `VideoMeta::generation` for (re)assigned dynamic slots.
+    next_key_generation: u64,
     failed: bool,
     finished: bool,
 }
@@ -441,6 +448,7 @@ impl RenditionDispatcher {
                 failed: false,
                 gate: gates.next().flatten(),
                 params: None,
+                generation: 0,
             })
             .collect();
         Ok(Self {
@@ -461,6 +469,7 @@ impl RenditionDispatcher {
             next_window: Some(i128::from(config.first_tick)),
             global_staged_packets: 0,
             global_staged_bytes: 0,
+            next_key_generation: 1,
             failed: false,
             finished: false,
         })
@@ -813,7 +822,7 @@ impl RenditionDispatcher {
                 if self
                     .video_meta
                     .get(m.key)
-                    .is_none_or(|x| x.failed || x.retired)
+                    .is_none_or(|x| x.failed || x.retired || x.generation != m.generation)
                 {
                     push_outcome(
                         &mut self.outcomes,
@@ -942,7 +951,7 @@ impl RenditionDispatcher {
                     let usable = self
                         .video_meta
                         .get(m.key)
-                        .is_some_and(|x| !x.failed && !x.retired);
+                        .is_some_and(|x| !x.failed && !x.retired && x.generation == m.generation);
                     if usable {
                         let dest_dynamic = self.video_meta.get(m.key).is_some_and(|x| x.dynamic);
                         // The gate passes on ANY video packet of the window;
@@ -1322,6 +1331,8 @@ impl RenditionDispatcher {
         {
             return Err(DispatchError::InvalidConfig);
         }
+        let generation = self.next_key_generation;
+        self.next_key_generation = self.next_key_generation.wrapping_add(1);
         if let Some(index) = reusable {
             // Fully reset: no staged window, watermark or DTS history of the
             // retired key survives. Its late events are the caller's to drop
@@ -1341,6 +1352,7 @@ impl RenditionDispatcher {
                 failed: false,
                 gate: Some(gate),
                 params: None,
+                generation,
             };
             return Ok(index);
         }
@@ -1353,6 +1365,7 @@ impl RenditionDispatcher {
             failed: false,
             gate: Some(gate),
             params: None,
+            generation,
         });
         Ok(index)
     }
@@ -1382,6 +1395,21 @@ impl RenditionDispatcher {
             .filter(|m| m.dynamic)
             .ok_or(DispatchError::InvalidConfig)?;
         meta.retired = true;
+        // No pending move may outlive the key it names: the slot can be
+        // reused by a later `add_video_key`, and a move left here would then
+        // land on an unrelated key.
+        for b in &mut self.bindings {
+            if b.mv.is_some_and(|m| m.key == key) {
+                b.mv = None;
+                push_outcome(
+                    &mut self.outcomes,
+                    MoveOutcome::Refused {
+                        output_index: b.output_index,
+                        reason: MoveRefusal::EncoderNotReady,
+                    },
+                );
+            }
+        }
         if let Some(stage) = self.video.get_mut(key) {
             let dropped: usize = stage.windows.iter().map(|w| w.packets.len()).sum();
             stage.clear();
@@ -1411,6 +1439,7 @@ impl RenditionDispatcher {
             .get(key)
             .is_some_and(|m| !m.failed && !m.retired);
         let has_gate = self.video_meta.get(key).is_some_and(|m| m.gate.is_some());
+        let generation = self.video_meta.get(key).map_or(0, |m| m.generation);
         let Some(b) = self
             .bindings
             .iter_mut()
@@ -1453,6 +1482,7 @@ impl RenditionDispatcher {
         } else {
             b.mv = Some(PendingMove {
                 key,
+                generation,
                 at_tick: i128::from(at_tick),
                 max_windows,
                 failed: 0,
@@ -2392,6 +2422,111 @@ mod tests {
         assert_eq!(
             d.dispatch(ve(9, 0, vec![], None), now, &mut sink),
             Err(DispatchError::InvalidEvent)
+        );
+    }
+
+    /// J (lens 2 r2 #1): output A has a pending move to live key K; K is
+    /// closed (the router's linger/close path retires it) and, on a later
+    /// tick, its slot is reused by a new key for output B. A is refused and
+    /// keeps its key; a RAP on the reused slot never lands A's old move.
+    #[test]
+    fn a_move_to_a_retired_key_is_refused_and_never_lands_on_its_reused_slot() {
+        let now = Instant::now();
+        let mut d =
+            RenditionDispatcher::new(gated_cfg(vec![binding(0, 0, 1), binding(1, 1, 1)], 2, 1))
+                .unwrap();
+        let mut sink = FakeDelivery::new(2);
+        let k = d
+            .add_video_key(DtsTimeBase { num: 1, den: 5 }, gate())
+            .unwrap();
+        // A = output 0, moving to K from tick 1 for up to 10 windows.
+        d.rebind_video(0, k, 1, 10).unwrap();
+        feed_base(&mut d, &mut sink, 2, 0, now, plain(0)).unwrap();
+        pop_all(&mut sink, 0, now);
+        pop_all(&mut sink, 1, now);
+        d.retire_video_key(k).unwrap();
+        assert_eq!(
+            d.take_move_outcomes(),
+            vec![MoveOutcome::Refused {
+                output_index: 0,
+                reason: MoveRefusal::EncoderNotReady
+            }],
+            "retiring K refuses every move naming it at once"
+        );
+        // Later tick: B's key takes the freed slot (same index).
+        feed_base(&mut d, &mut sink, 2, 1, now, plain(1)).unwrap();
+        let reused = d
+            .add_video_key(DtsTimeBase { num: 1, den: 5 }, gate())
+            .unwrap();
+        assert_eq!(reused, k, "the retired slot is reused");
+        d.rebind_video(1, reused, 2, 10).unwrap();
+        for i in 2..5_i64 {
+            let m = Some(mark(TICK * i128::from(i + 1)));
+            d.dispatch(
+                ve(reused, u64::try_from(i).unwrap(), vec![rap77(i)], m),
+                now,
+                &mut sink,
+            )
+            .unwrap();
+            feed_base(&mut d, &mut sink, 2, i, now, plain(i)).unwrap();
+            pop_all(&mut sink, 0, now);
+            pop_all(&mut sink, 1, now);
+        }
+        assert_eq!(d.binding_video_key(0), Some(0), "A's key unchanged");
+        assert_eq!(d.binding_video_key(1), Some(reused), "B moved");
+        assert_eq!(
+            d.take_move_outcomes(),
+            vec![MoveOutcome::Applied {
+                output_index: 1,
+                key: reused,
+                tick: 2,
+                parameter_sets_changed: false
+            }],
+            "no Applied for A"
+        );
+    }
+
+    /// J: a pending move carries its key's generation; a move that somehow
+    /// survived a slot reuse (stale bookkeeping) is refused, never applied.
+    #[test]
+    fn a_stale_generation_move_is_refused_on_a_reused_slot() {
+        let now = Instant::now();
+        let mut d =
+            RenditionDispatcher::new(gated_cfg(vec![binding(0, 0, 1), binding(1, 1, 1)], 2, 1))
+                .unwrap();
+        let mut sink = FakeDelivery::new(2);
+        let k = d
+            .add_video_key(DtsTimeBase { num: 1, den: 5 }, gate())
+            .unwrap();
+        d.rebind_video(0, k, 1, 10).unwrap();
+        let stale = d.bindings[0].mv;
+        d.retire_video_key(k).unwrap();
+        let _ = d.take_move_outcomes();
+        let reused = d
+            .add_video_key(DtsTimeBase { num: 1, den: 5 }, gate())
+            .unwrap();
+        assert_eq!(reused, k);
+        // Re-inject the old move (as if its clear had been missed).
+        d.bindings[0].mv = stale;
+        for i in 0..3_i64 {
+            let m = Some(mark(TICK * i128::from(i + 1)));
+            d.dispatch(
+                ve(reused, u64::try_from(i).unwrap(), vec![rap77(i)], m),
+                now,
+                &mut sink,
+            )
+            .unwrap();
+            feed_base(&mut d, &mut sink, 2, i, now, plain(i)).unwrap();
+            pop_all(&mut sink, 0, now);
+            pop_all(&mut sink, 1, now);
+        }
+        assert_eq!(d.binding_video_key(0), Some(0));
+        assert_eq!(
+            d.take_move_outcomes(),
+            vec![MoveOutcome::Refused {
+                output_index: 0,
+                reason: MoveRefusal::EncoderNotReady
+            }]
         );
     }
 
