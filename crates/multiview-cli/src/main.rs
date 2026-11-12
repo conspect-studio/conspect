@@ -1054,6 +1054,12 @@ async fn run_pipeline_until_ctrl_c(
                 }
             }
         })
+        .map_err(|error| {
+            tracing::error!(
+                error = %error,
+                "could not start the exit-durable thread; the exit-time drain, persist and journal flush will not run early"
+            );
+        })
         .ok();
 
     // Sample CPU/host-memory/per-GPU load at ~1.3 Hz and PUSH `Event::SystemMetrics`

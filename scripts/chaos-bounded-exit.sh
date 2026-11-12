@@ -7,7 +7,9 @@
 #          the run fails) while source teardown is held far past every grace;
 #   stop:  SIGTERM while source teardown is held;
 #   stopwedge: SIGTERM while the consumer is stalled (an output that cannot
-#          finalise during the stop): exit code 1 within the bound.
+#          finalise during the stop): exit code 1 within the bound;
+#   falterstop: a short stall sheds frames (no fatal), then SIGTERM: the run
+#          faltered, so exit code 1 within the bound.
 # Asserts for every run: exit code (1 fatal, 0 stop), the time from the
 # decision (the fatal log line / the signal) to the process exit is within the
 # bound + slack, and the on-disk HLS manifest is valid and lists only complete
@@ -88,7 +90,12 @@ run_once() {
   local mode="$1" i="$2" log="${WORK}/run.log" rc t_exit t_decide pid
   rm -rf "${WORK}/hls" "${WORK}/.multiview" && mkdir -p "${WORK}/hls"
   export MULTIVIEW_CHAOS_SLOW_TEARDOWN_MS="${HOLD_MS}"
-  if [ "${mode}" = stopwedge ]; then
+  if [ "${mode}" = falterstop ]; then
+    # A short stall (about 6 ticks: past the 4-slot live queue, inside the
+    # 8-tick envelope) sheds frames without a fatal; then SIGTERM. The run
+    # faltered, so it must exit 1.
+    export MULTIVIEW_CHAOS_CONSUMER_STALL_MS=200 MULTIVIEW_CHAOS_CONSUMER_STALL_AT=60
+  elif [ "${mode}" = stopwedge ]; then
     # SIGTERM while the consumer is stalled 10 s (an output that cannot
     # finalise during the stop): the run must report failure (rc 1).
     export MULTIVIEW_CHAOS_CONSUMER_STALL_MS=10000 MULTIVIEW_CHAOS_CONSUMER_STALL_AT=60
@@ -101,7 +108,7 @@ run_once() {
   fi
   RUST_LOG=info "${BIN}" run "${WORK}/cfg.toml" > "${log}" 2>&1 &
   pid=$!
-  if [ "${mode}" = stop ] || [ "${mode}" = stopwedge ]; then
+  if [ "${mode}" = stop ] || [ "${mode}" = stopwedge ] || [ "${mode}" = falterstop ]; then
     # Signal only once the pipeline runs (its first tick is logged), and only
     # if the process is still alive.
     local waited=0
@@ -109,13 +116,13 @@ run_once() {
       sleep 0.1; waited=$((waited + 1))
       [ "${waited}" -lt 300 ] || { echo "run ${i} (stop): pipeline never started"; tail -20 "${log}"; kill -KILL "${pid}" 2>/dev/null || true; return 1; }
     done
-    if [ "${mode}" = stopwedge ]; then
+    if [ "${mode}" = stopwedge ] || [ "${mode}" = falterstop ]; then
       local w2=0
       until grep -q "chaos: stalling the bake consumer" "${log}" 2>/dev/null; do
         sleep 0.05; w2=$((w2 + 1))
-        [ "${w2}" -lt 400 ] || { echo "run ${i} (stopwedge): stall seam never reached"; tail -20 "${log}"; kill -KILL "${pid}"; return 1; }
+        [ "${w2}" -lt 400 ] || { echo "run ${i} (${mode}): stall seam never reached"; tail -20 "${log}"; kill -KILL "${pid}"; return 1; }
       done
-      sleep 0.2
+      if [ "${mode}" = falterstop ]; then sleep 1.5; else sleep 0.2; fi
     else
       sleep 2
     fi
@@ -155,6 +162,9 @@ PY
   local took=$((t_exit - t_decide)) want=$([ "${mode}" = stop ] && echo 0 || echo 1)
   local extra=0
   echo "run ${i} (${mode}): rc=${rc} decision->exit=${took} ms"
+  if [ "${mode}" = falterstop ] && grep -q "ticks behind the clock" "${log}"; then
+    echo "  FAIL: falterstop hit the fatal envelope (stall too long for this host)"; return 1
+  fi
   [ "${rc}" = "${want}" ] || { echo "  FAIL: exit code ${rc}, want ${want}"; tail -20 "${log}"; return 1; }
   # The bound must come from the watchdog (the held teardown cannot finish in
   # time on its own): require its armed line and its hard-exit message.
@@ -196,7 +206,7 @@ PY
 write_config
 fails=0
 for i in $(seq 1 "${RUNS}"); do
-  for mode in fatal stop stopwedge; do
+  for mode in fatal stop stopwedge falterstop; do
     [ "${MODE}" = both ] || [ "${MODE}" = "${mode}" ] || continue
     run_once "${mode}" "${i}" || fails=$((fails + 1))
   done

@@ -183,10 +183,12 @@ fn exit_process(cause: ExitCause) {
         .name("multiview-exit-notice".to_owned())
         .spawn(move || {
             // /dev/stderr is Linux; macOS/BSD expose the fd under /dev/fd.
+            // Append: a fresh open of a regular-file stderr must not overwrite
+            // the start of the log.
             let handle = std::fs::OpenOptions::new()
-                .write(true)
+                .append(true)
                 .open("/dev/stderr")
-                .or_else(|_| std::fs::OpenOptions::new().write(true).open("/dev/fd/2"));
+                .or_else(|_| std::fs::OpenOptions::new().append(true).open("/dev/fd/2"));
             if let Ok(mut err) = handle {
                 let _ = writeln!(
                     err,

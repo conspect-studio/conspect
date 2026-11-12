@@ -53,7 +53,8 @@ restarting.
      queue. This also covers a consumer that died without returning, for example a panic.
    - The engine loop returns an error.
    - The egress join returns an error. This upgrades a stop to a fatal, and the fatal gets its
-     own full bound.
+     own full bound. On a consumer error, the join still waits for the sinks (bounded) before it
+     returns, so their trailers and HLS finalize land.
    - **Outputs still open at the deadline.** Each live egress counts as open until its join has
      resolved every output, on every return path (a drop guard). An output stays open only when
      the consumer is still running at the grace, or a sink is detached as wedged (an explicit
@@ -152,8 +153,11 @@ change shortens dead output after a fault; it does not change the tick path.
   The `stopwedge` mode sends SIGTERM while the consumer is stalled (an output that cannot
   finalise during a stop). It requires exit code 1 within 2 s + 0.5 s of the signal.
 
-  On the Apple-silicon host: 20 × each mode, 0 failures, exits at 2.08–2.12 s. CI (macOS job)
-  runs 10 × each mode.
+  The `falterstop` mode stalls the consumer for 200 ms (frames are shed but the envelope holds),
+  then sends SIGTERM. It requires exit code 1, because the run faltered.
+
+  On the Apple-silicon host: 20 × each of the four modes, 0 failures, exits at 2.08–2.13 s. CI
+  (macOS job) runs 10 × each mode.
 - The script also proves that the watchdog ended the process:
   - no normal-return stage (`run-tenants`) is logged;
   - the exit code equals the code in the watchdog's line;

@@ -5020,12 +5020,12 @@ impl Pipeline {
         // partial output. The engine error (the root cause) is surfaced first;
         // an egress/sink error second.
         let egress_result = egress.join();
-        stage("egress-joined");
         // #309: an output that failed to finalise is a failed run, even during a
-        // stop: upgrade the exit cause before the slow source teardown.
+        // stop: upgrade the exit cause before anything else (even a log line).
         if egress_result.is_err() && matches!(policy, SendPolicy::DropOnOverload) {
             crate::exit_watchdog::arm(crate::exit_watchdog::ExitCause::Fatal);
         }
+        stage("egress-joined");
         // Then tear ingest down (signal + bounded join per producer). Producers
         // blocked in libav network reads use their full grace here; the exit
         // watchdog bounds the total.
@@ -6184,40 +6184,30 @@ impl StreamEgress {
                 reason: "encoder consumer failed to stop within bounded teardown".to_owned(),
             });
         }
-        let bindings = self
+        // #309: on a consumer error (the fatal path) the sinks are still
+        // finalising (they see end-of-program once the returning consumer
+        // dropped their senders): join them too, bounded, before returning the
+        // consumer's error, so the trailers / HLS finalize land and a wedged
+        // sink is accounted for.
+        let consumer_result = self
             .consumer
             .join()
-            .map_err(|_| PipelineError::Engine("bake consumer thread panicked".to_owned()))??;
+            .map_err(|_| PipelineError::Engine("bake consumer thread panicked".to_owned()))
+            .and_then(|r| r);
+        let bindings = match consumer_result {
+            Ok(bindings) => bindings,
+            Err(error) => {
+                if !join_sinks_after_consumer_failure(self.sinks) {
+                    open_guard.keep_open();
+                }
+                return Err(error);
+            }
+        };
         let mut lines = Vec::with_capacity(self.sinks.len() + bindings.len());
         let mut frames = Vec::with_capacity(self.sinks.len());
         // Per-binding delivery truth, emitted BEFORE the sink lines so a lost or
         // failed binding is visible even when its sink thread produced a file.
-        for (index, binding) in bindings.iter().enumerate() {
-            lines.push(format!(
-                "binding {index}: {} windows / {} packets admitted, {} windows lost \
-                 ({} packets), generation {}, queued {}, in-flight {}/{} bytes{}",
-                binding.admitted_batches,
-                binding.admitted_packets,
-                binding.rejected_batches,
-                binding.rejected_packets,
-                binding.generation,
-                binding.queued_windows,
-                binding.reserved_packets,
-                binding.reserved_bytes,
-                match binding.last_rejection {
-                    Some(reason) => format!(
-                        ", last loss: {}{}",
-                        reason.label(),
-                        if binding.failed {
-                            " (binding failed)"
-                        } else {
-                            ""
-                        }
-                    ),
-                    None => String::new(),
-                }
-            ));
-        }
+        lines.extend(binding_report_lines(&bindings));
         // A shared teardown budget: healthy sinks finish in milliseconds; only a
         // genuinely wedged sink consumes the grace before being detached.
         let deadline = Instant::now() + SINK_WEDGE_GRACE;
@@ -6240,16 +6230,30 @@ impl StreamEgress {
                 frames.push(0);
                 continue;
             }
-            let outcome = handle.join().map_err(|_| PipelineError::Output {
-                kind: "sink",
-                reason: "sink thread panicked".to_owned(),
-            })??;
+            let outcome = match handle
+                .join()
+                .map_err(|_| PipelineError::Output {
+                    kind: "sink",
+                    reason: "sink thread panicked".to_owned(),
+                })
+                .and_then(|r| r)
+            {
+                Ok(outcome) => outcome,
+                Err(error) => {
+                    // #309: an output that failed is not finalised.
+                    open_guard.keep_open();
+                    return Err(error);
+                }
+            };
             // Write the HLS playlist (if any) once the segment encode completed.
             if let Some((path, text)) = outcome.playlist {
-                std::fs::write(&path, text.as_bytes()).map_err(|e| PipelineError::Output {
-                    kind: "hls",
-                    reason: format!("writing playlist {}: {e}", path.display()),
-                })?;
+                if let Err(e) = std::fs::write(&path, text.as_bytes()) {
+                    open_guard.keep_open();
+                    return Err(PipelineError::Output {
+                        kind: "hls",
+                        reason: format!("writing playlist {}: {e}", path.display()),
+                    });
+                }
             }
             lines.push(outcome.line);
             frames.push(outcome.frames);
@@ -6263,6 +6267,66 @@ impl StreamEgress {
             sink_frames: frames,
         })
     }
+}
+
+/// One report line per binding: its delivery truth (admitted / lost windows,
+/// generation, queue and in-flight state, and the last loss reason).
+fn binding_report_lines(bindings: &[crate::binding_delivery::BindingStatus]) -> Vec<String> {
+    let mut lines = Vec::with_capacity(bindings.len());
+    for (index, binding) in bindings.iter().enumerate() {
+        lines.push(format!(
+            "binding {index}: {} windows / {} packets admitted, {} windows lost \
+             ({} packets), generation {}, queued {}, in-flight {}/{} bytes{}",
+            binding.admitted_batches,
+            binding.admitted_packets,
+            binding.rejected_batches,
+            binding.rejected_packets,
+            binding.generation,
+            binding.queued_windows,
+            binding.reserved_packets,
+            binding.reserved_bytes,
+            match binding.last_rejection {
+                Some(reason) => format!(
+                    ", last loss: {}{}",
+                    reason.label(),
+                    if binding.failed {
+                        " (binding failed)"
+                    } else {
+                        ""
+                    }
+                ),
+                None => String::new(),
+            }
+        ));
+    }
+    lines
+}
+
+/// After a consumer failure, join every sink within one [`SINK_WEDGE_GRACE`]
+/// (#309): they are still finalising. Returns `false` if any sink failed or
+/// was still running and had to be detached (its output is not finalised).
+fn join_sinks_after_consumer_failure(
+    sinks: Vec<JoinHandle<Result<SinkRunOutcome, PipelineError>>>,
+) -> bool {
+    let deadline = Instant::now() + SINK_WEDGE_GRACE;
+    let mut all_finalised = true;
+    for (i, handle) in sinks.into_iter().enumerate() {
+        while !handle.is_finished() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        if handle.is_finished() {
+            if !matches!(handle.join(), Ok(Ok(_))) {
+                all_finalised = false;
+            }
+        } else {
+            tracing::warn!(
+                sink = i,
+                "sink wedged finalising after a consumer failure; detaching"
+            );
+            all_finalised = false;
+        }
+    }
+    all_finalised
 }
 
 /// Resolves one live egress's "outputs open" count (#309) on drop, unless told
@@ -6328,6 +6392,37 @@ mod egress_fatal_tests {
             in_flight: Arc::new(AtomicI64::new(0)),
             peak_occupancy: Arc::new(AtomicUsize::new(0)),
         }
+    }
+
+    /// #309: after a consumer error the sinks are still finalising; the join
+    /// waits for them (bounded) instead of detaching them, and only then
+    /// returns the consumer's error.
+    #[test]
+    fn a_consumer_error_still_joins_the_finalising_sinks() {
+        let finished = Arc::new(AtomicBool::new(false));
+        let done = Arc::clone(&finished);
+        let sink = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(150));
+            done.store(true, Ordering::Release);
+            Ok(super::SinkRunOutcome {
+                line: "sink".to_owned(),
+                playlist: None,
+                frames: 0,
+            })
+        });
+        let consumer = std::thread::spawn(|| {
+            Err(PipelineError::Output {
+                kind: "video-worker",
+                reason: "fell behind".to_owned(),
+            })
+        });
+        let mut egress = egress_with_consumer(consumer, true);
+        egress.sinks.push(sink);
+        assert!(egress.join().is_err(), "the consumer's error is returned");
+        assert!(
+            finished.load(Ordering::Acquire),
+            "the sink finished finalising before join returned"
+        );
     }
 
     /// The per-tick hot-loop check: a healthy consumer leaves the run running;
