@@ -16,6 +16,10 @@
 set -euo pipefail
 
 STAGE="${1:?usage: macos-bundle.sh <stage-dir> [identity]}"
+if [ "$#" -ge 2 ] && [ -z "$2" ]; then
+  echo "macos-bundle: empty signing identity (use '-' for ad-hoc)" >&2
+  exit 2
+fi
 IDENTITY="${2:--}"
 BIN="${STAGE}/multiview"
 LIB="${STAGE}/lib"
@@ -37,18 +41,40 @@ rpaths_of() {
   otool -l "$1" | awk '$1 == "cmd" && $2 == "LC_RPATH" { r = 1; next } r && $1 == "path" { print $2; r = 0 }'
 }
 
-# Non-system, non-@rpath dependency paths of a Mach-O (first line of
-# `otool -L` is the object itself for a dylib; skip it via -D comparison).
+# Every non-system dependency of a Mach-O, as "<load command><TAB><file>".
+# @rpath / @loader_path / @executable_path load commands are resolved to the
+# file dyld would load (the object's LC_RPATHs, then the executable's), so a
+# library whose own install name is @rpath-relative is bundled too.
 deps_of() {
-  local self
-  self="$(otool -D "$1" 2>/dev/null | sed -n 2p || true)"
-  otool -L "$1" | tail -n +2 | awk '{print $1}' | while read -r dep; do
+  local obj="$1" self dep odir file rp
+  self="$(otool -D "${obj}" 2>/dev/null | sed -n 2p || true)"
+  odir="$(cd "$(dirname "${obj}")" && pwd -P)"
+  local deps
+  deps="$(otool -L "${obj}" | tail -n +2 | awk '{print $1}')"
+  while read -r dep; do
+    [ -n "${dep}" ] || continue
     [ "${dep}" = "${self}" ] && continue
+    is_system "${dep}" && continue
+    file=""
     case "${dep}" in
-      @rpath/* | @loader_path/* | @executable_path/*) continue ;;
+      @loader_path/*) file="${odir}/${dep#@loader_path/}" ;;
+      @executable_path/*) file="$(cd "$(dirname "${BIN}")" && pwd -P)/${dep#@executable_path/}" ;;
+      @rpath/*)
+        for rp in $(rpaths_of "${obj}"); do
+          rp="${rp/#@loader_path/${odir}}"
+          rp="${rp/#@executable_path/$(cd "$(dirname "${BIN}")" && pwd -P)}"
+          if [ -f "${rp}/${dep#@rpath/}" ]; then file="${rp}/${dep#@rpath/}"; break; fi
+        done
+        # Already bundled under this name: nothing to copy.
+        [ -z "${file}" ] && [ -f "${LIB}/${dep#@rpath/}" ] && file="${LIB}/${dep#@rpath/}" ;;
+      *) file="${dep}" ;;
     esac
-    is_system "${dep}" || echo "${dep}"
-  done
+    if [ -z "${file}" ] || [ ! -f "${file}" ]; then
+      echo "macos-bundle: ${obj}: cannot resolve ${dep}" >&2
+      exit 6
+    fi
+    printf '%s\t%s\n' "${dep}" "${file}"
+  done <<< "${deps}"
 }
 
 # Copy the licence texts of the package a bundled library came from
@@ -83,10 +109,13 @@ i=0
 while [ "${i}" -lt "${#queue[@]}" ]; do
   obj="${queue[${i}]}"
   i=$((i + 1))
-  while read -r dep; do
+  while IFS="$(printf '\t')" read -r dep file; do
     [ -n "${dep}" ] || continue
+    [ "${dep}" = FAIL ] && exit 6
     name="$(basename "${dep}")"
-    real="$(python3 -c 'import os,sys;print(os.path.realpath(sys.argv[1]))' "${dep}")"
+    real="$(python3 -c 'import os,sys;print(os.path.realpath(sys.argv[1]))' "${file}")"
+    # A file already inside the bundle is visited.
+    case "${real}" in "$(cd "${LIB}" && pwd -P)"/*) continue ;; esac
     prev="$(awk -v n="${name}" '$1 == n { print $2; exit }' "${SOURCES}")"
     if [ -n "${prev}" ]; then
       if [ "${prev}" != "${real}" ] && ! cmp -s "${prev}" "${real}"; then
@@ -100,26 +129,34 @@ while [ "${i}" -lt "${#queue[@]}" ]; do
     chmod u+w "${LIB}/${name}"
     collect_licences "${real}"
     queue+=("${LIB}/${name}")
-  done < <(deps_of "${obj}")
+  done <<< "$(deps_of "${obj}" || echo FAIL)"
 done
+
+# Add an rpath; an rpath that is already present is fine, any other error fails.
+add_rpath() {
+  rpaths_of "$2" | grep -qxF "$1" && return 0
+  install_name_tool -add_rpath "$1" "$2"
+}
 
 # Rewrite install names and references.
 rewrite() {
-  local obj="$1"
-  while read -r dep; do
+  local obj="$1" dep file
+  while IFS="$(printf '\t')" read -r dep file; do
     [ -n "${dep}" ] || continue
+    [ "${dep}" = FAIL ] && exit 6
+    case "${dep}" in @rpath/*) continue ;; esac
     install_name_tool -change "${dep}" "@rpath/$(basename "${dep}")" "${obj}"
-  done < <(deps_of "${obj}")
+  done <<< "$(deps_of "${obj}" || echo FAIL)"
 }
 for dylib in "${LIB}"/*.dylib; do
   [ -e "${dylib}" ] || continue
   install_name_tool -id "@rpath/$(basename "${dylib}")" "${dylib}"
   rewrite "${dylib}"
   # A bundled dylib finds its siblings next to itself.
-  install_name_tool -add_rpath "@loader_path" "${dylib}" 2>/dev/null || true
+  add_rpath "@loader_path" "${dylib}"
 done
 rewrite "${BIN}"
-install_name_tool -add_rpath "@executable_path/lib" "${BIN}" 2>/dev/null || true
+add_rpath "@executable_path/lib" "${BIN}"
 # Drop every rpath that points outside the bundle (e.g. a build prefix), so
 # nothing can resolve through it on the user's machine.
 for obj in "${BIN}" "${LIB}"/*.dylib; do
@@ -218,8 +255,19 @@ for dylib in "${LIB}"/*.dylib; do
   sign "${dylib}"
 done
 sign "${BIN}"
-codesign --verify --strict --verbose=1 "${BIN}"
+for obj in "${LIB}"/*.dylib "${BIN}"; do
+  [ -e "${obj}" ] || continue
+  codesign --verify --strict "${obj}"
+done
+if [ "${IDENTITY}" != "-" ]; then
+  info="$(codesign -dv --verbose=4 "${BIN}" 2>&1)"
+  printf '%s\n' "${info}" | grep -q '^Authority=Developer ID Application' \
+    || { echo "macos-bundle: binary is not Developer ID signed" >&2; exit 7; }
+  printf '%s\n' "${info}" | grep -q 'flags=.*runtime' \
+    || { echo "macos-bundle: hardened runtime is not set" >&2; exit 7; }
+fi
+rm -f "${SOURCES}" "${ENTITLEMENTS}"
 
 # The bundle must start with no loader override.
-env -u DYLD_LIBRARY_PATH -u DYLD_FALLBACK_LIBRARY_PATH "${BIN}" --version
+env -u DYLD_LIBRARY_PATH -u DYLD_FALLBACK_LIBRARY_PATH "${BIN}" --version > /dev/null
 echo "macos-bundle: OK — $(ls "${LIB}" | wc -l | tr -d ' ') dylib(s) bundled"
