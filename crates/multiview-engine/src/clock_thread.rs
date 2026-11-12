@@ -14,10 +14,9 @@
 //!   (`PR_SET_TIMERSLACK`) so the kernel does not coalesce the wakeup by its
 //!   default 50 µs.
 //! * **macOS / Windows** (and any other target): a portable fallback —
-//!   `std::thread::sleep` until [`SPIN_MARGIN`] before the deadline, then a
-//!   short busy spin (never `yield`, which depresses priority on macOS) to the
-//!   deadline. Correct everywhere; precise to the
-//!   platform's sleep granularity plus the spin.
+//!   relative `std::thread::sleep`s of at most half the time left (a late wake
+//!   still lands before the deadline), then a short busy spin (never `yield`,
+//!   which depresses priority on macOS) over the last [`SPIN_MARGIN`].
 //!
 //! Every wait is sized from the tick's absolute deadline (`seed + pts_at(n)`,
 //! from the integer tick counter), re-read after every wakeup, so a sleep that
@@ -73,6 +72,7 @@ pub fn on_clock_thread() -> bool {
 /// capped at [`STOP_POLL`]; the source is re-read after every wakeup, so an
 /// early or late wakeup never accumulates into drift.
 pub fn sleep_until(deadline_nanos: i64, source: &dyn TimeSource, stop: &StopSignal) {
+    let poll = i64::try_from(STOP_POLL.as_nanos()).unwrap_or(i64::MAX);
     loop {
         if stop.is_stopped() {
             return;
@@ -81,20 +81,16 @@ pub fn sleep_until(deadline_nanos: i64, source: &dyn TimeSource, stop: &StopSign
         if remaining <= 0 {
             return;
         }
-        let poll = i64::try_from(STOP_POLL.as_nanos()).unwrap_or(i64::MAX);
-        if remaining > poll {
-            // Far from the deadline: a plain bounded step, then re-check stop.
-            sleep_step(poll, false);
-        } else {
-            sleep_step(remaining, true);
+        if !platform_step(remaining, poll, deadline_nanos, source) {
+            return;
         }
     }
 }
 
-/// Sleep for `nanos` from now, against the monotonic clock. `last` marks the
-/// final step to the deadline (the portable fallback spins only there).
+/// Linux: one absolute `clock_nanosleep` step of at most `poll`. Returns
+/// `true` to re-check (the caller re-reads the source after every wake).
 #[cfg(target_os = "linux")]
-fn sleep_step(nanos: i64, _last: bool) {
+fn platform_step(remaining: i64, poll: i64, _deadline: i64, _source: &dyn TimeSource) -> bool {
     use rustix::thread::{clock_nanosleep_absolute, ClockId};
     use rustix::time::{clock_gettime, Timespec};
     // Convert "deadline in `nanos`" to an ABSOLUTE CLOCK_MONOTONIC instant and
@@ -103,6 +99,7 @@ fn sleep_step(nanos: i64, _last: bool) {
     // reads are back to back (tens of ns); the caller re-reads its source after.
     // No `unsafe` here: rustix's `clock_nanosleep_absolute` is the safe wrapper
     // (it owns the raw syscall), so the engine stays `forbid(unsafe_code)`.
+    let nanos = remaining.min(poll);
     let now = clock_gettime(ClockId::Monotonic);
     let total = i128::from(now.tv_sec)
         .saturating_mul(1_000_000_000)
@@ -117,33 +114,32 @@ fn sleep_step(nanos: i64, _last: bool) {
             Err(rustix::io::Errno::INTR) => {}
             // `Ok`, or an error the absolute sleep cannot recover from: return
             // and let the caller re-read the time source (never spin forever).
-            _ => return,
+            _ => return true,
         }
     }
 }
 
-/// Portable fallback (macOS, Windows, other targets): sleep to [`SPIN_MARGIN`]
-/// before the step end, then busy-spin the rest on the final step.
+/// Portable fallback (macOS, Windows, other targets). There is no absolute
+/// sleep in `std`, and the OS may wake a relative sleep late by an amount that
+/// grows with its length (macOS timer coalescing leeway; Windows timer
+/// resolution). So never sleep more than HALF the time left (or [`STOP_POLL`]):
+/// even a wake late by 100% of the request lands before the deadline. Once
+/// within [`SPIN_MARGIN`], busy-spin on the time source to the deadline —
+/// never `thread::yield_now`, which on macOS (`swtch_pri`) depresses the
+/// thread's priority for a scheduler quantum. Returns `false` once the
+/// deadline is reached.
 #[cfg(not(target_os = "linux"))]
-fn sleep_step(nanos: i64, last: bool) {
-    let nanos = u64::try_from(nanos.max(0)).unwrap_or(0);
-    let step = Duration::from_nanos(nanos);
-    if !last {
-        std::thread::sleep(step);
-        return;
+fn platform_step(remaining: i64, poll: i64, deadline: i64, source: &dyn TimeSource) -> bool {
+    let margin = i64::try_from(SPIN_MARGIN.as_nanos()).unwrap_or(0);
+    if remaining > margin {
+        let half = (remaining / 2).min(poll);
+        std::thread::sleep(Duration::from_nanos(u64::try_from(half).unwrap_or(0)));
+        return true;
     }
-    let start = std::time::Instant::now();
-    if let Some(sleep) = step.checked_sub(SPIN_MARGIN) {
-        std::thread::sleep(sleep);
-    }
-    // A pure spin, deliberately NOT `thread::yield_now`: on macOS
-    // `sched_yield` is `swtch_pri`, which depresses the thread's priority for a
-    // whole scheduler quantum (~10 ms), so on a saturated host the clock would
-    // lose its core exactly when its tick is due (seen on CI as ~20 ms mean
-    // lateness and repeats). The spin is bounded by SPIN_MARGIN per tick.
-    while start.elapsed() < step {
+    while source.now_nanos() < deadline {
         std::hint::spin_loop();
     }
+    false
 }
 
 /// Wakes the clock thread by unparking it.

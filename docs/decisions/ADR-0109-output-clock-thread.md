@@ -76,13 +76,17 @@ so an early or late wake never compounds.
   `std::time::Instant` (the `MonotonicTimeSource`) is `CLOCK_MONOTONIC` on Linux,
   so the sleep and the deadline arithmetic use the same clock.
 * **macOS, Windows, other targets** (macOS and Windows are CI targets): a portable
-  fallback — `std::thread::sleep` to 500 µs before the deadline, then a busy
-  spin (`hint::spin_loop`) to it. Not a yielding spin: on macOS `sched_yield` is
-  `swtch_pri`, which depresses the thread's priority for a scheduler quantum
-  (~10 ms); the first CI run showed the yielding variant losing its core on a
-  saturated runner (mean 21.8 ms, 33 repeats). There is no absolute-deadline sleep in `std`;
-  the spin margin absorbs the platform's sleep overshoot. It is correct everywhere
-  and costs at most ~500 µs of spinning per tick (1.5% of a core at 30 fps).
+  fallback. `std` has no absolute-deadline sleep, and a relative sleep may wake
+  late by an amount that grows with its length (macOS timer-coalescing leeway,
+  Windows timer resolution). So the fallback never sleeps more than **half** the
+  time left: even a wake late by 100% of the request lands before the deadline.
+  Within the last 500 µs it busy-spins (`hint::spin_loop`) on the time source.
+  Not a yielding spin: on macOS `sched_yield` is `swtch_pri`, which depresses the
+  thread's priority for a scheduler quantum (~10 ms). The first CI runs (one long
+  sleep to 500 µs before the deadline, then a yield or busy spin) showed ~22 ms
+  mean lateness and ~20% repeats on a saturated macOS runner, i.e. the long
+  sleep overshooting; the halving schedule removes that. Cost: about
+  log2(period / 500 µs) ≈ 6 wakes per tick plus at most 500 µs of spinning.
 * Every sleep step is capped at 10 ms (`STOP_POLL`, the same bound the async pacer
   had), so a raised `StopSignal` is observed within one step even on an unreachable
   deadline (a frozen clock).
