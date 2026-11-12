@@ -1,0 +1,722 @@
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing
+)]
+//! Unit harness: a real `RenditionDispatcher`, fake encoders.
+
+use super::*;
+use crate::rendition_dispatch::{BindingConfig, DispatchConfig};
+use multiview_compositor::pipeline::CanvasColor;
+use std::sync::atomic::AtomicUsize;
+
+const CADENCE: Rational = Rational::new(5, 1);
+
+/// A fake live encoder: one packet per tick, keyframe when forced or first.
+struct FakeEnc {
+    forced: bool,
+    encoded: Arc<AtomicUsize>,
+}
+
+fn pkt(tick: u64, key: bool) -> EncodedPacket {
+    use ffmpeg_next::codec::packet::{Flags, Packet};
+    let mut raw = if key {
+        let mut b = vec![0_u8; 77];
+        b[..6].copy_from_slice(&[0, 0, 0, 1, 0x65, 0x88]);
+        Packet::copy(&b)
+    } else {
+        Packet::new(8)
+    };
+    let t = i64::try_from(tick).unwrap();
+    raw.set_pts(Some(t));
+    raw.set_dts(Some(t));
+    if key {
+        raw.set_flags(Flags::KEY);
+    }
+    EncodedPacket::with_kind(raw, multiview_ffmpeg::StreamKind::Video)
+}
+
+impl VideoEncodeWorker for FakeEnc {
+    fn encode(&mut self, item: BakedTick) -> Result<Vec<EncodedPacket>, PipelineError> {
+        self.encoded.fetch_add(1, Ordering::Relaxed);
+        let key = std::mem::take(&mut self.forced);
+        Ok(vec![pkt(item.tick, key)])
+    }
+    fn reorder_bound(&self) -> ReorderBound {
+        ReorderBound::NoReorder
+    }
+    fn finish(&mut self) -> Result<Vec<EncodedPacket>, PipelineError> {
+        Ok(Vec::new())
+    }
+    fn force_keyframe(&mut self) {
+        self.forced = true;
+    }
+}
+
+impl LiveEncoder for FakeEnc {
+    fn start_at(&mut self, _t0: u64) {
+        self.forced = true;
+    }
+    fn time_base(&self) -> Rational {
+        Rational::new(1, 5)
+    }
+    fn move_gate(&self) -> MoveGate {
+        Box::new(|p| p.is_keyframe() && p.len() == 77)
+    }
+}
+
+fn canvas() -> Arc<Nv12Image> {
+    Arc::new(Nv12Image::solid(16, 16, 16, 128, 128, CanvasColor::default().output_tag()).unwrap())
+}
+
+#[test]
+fn gap_fill_encodes_missing_ticks_and_fails_beyond_the_bound() {
+    let encoded = Arc::new(AtomicUsize::new(0));
+    let mut w = GapFill {
+        inner: Box::new(FakeEnc {
+            forced: false,
+            encoded: Arc::clone(&encoded),
+        }),
+        force_at: Arc::new(AtomicU64::new(NO_FORCE)),
+        next: None,
+        last: None,
+    };
+    let out = w
+        .encode(BakedTick {
+            tick: 10,
+            canvas: canvas(),
+        })
+        .unwrap();
+    assert_eq!(out.len(), 1);
+    let out = w
+        .encode(BakedTick {
+            tick: 14,
+            canvas: canvas(),
+        })
+        .unwrap();
+    let ticks: Vec<_> = out.iter().filter_map(EncodedPacket::pts).collect();
+    assert_eq!(
+        ticks,
+        vec![11, 12, 13, 14],
+        "consecutive ticks to the encoder"
+    );
+    assert!(w
+        .encode(BakedTick {
+            tick: 14 + MAX_GAP_FILL_TICKS + 2,
+            canvas: canvas()
+        })
+        .is_err());
+}
+
+#[test]
+fn force_at_requests_one_keyframe_at_or_after_the_tick() {
+    let encoded = Arc::new(AtomicUsize::new(0));
+    let (mut w, cell) = ForceAt::new(Box::new(FakeEnc {
+        forced: false,
+        encoded,
+    }));
+    cell.store(3, Ordering::Release);
+    let keys: Vec<bool> = (0..6)
+        .map(|t| {
+            w.encode(BakedTick {
+                tick: t,
+                canvas: canvas(),
+            })
+            .unwrap()[0]
+                .is_keyframe()
+        })
+        .collect();
+    assert_eq!(keys, vec![false, false, false, true, false, false]);
+}
+
+fn dispatcher(outputs: usize) -> RenditionDispatcher {
+    RenditionDispatcher::new(DispatchConfig {
+        video_count: 1,
+        audio_count: 0,
+        video_time_base: vec![DtsTimeBase { num: 1, den: 5 }],
+        audio_time_base: Vec::new(),
+        bindings: (0..outputs)
+            .map(|i| BindingConfig {
+                output_index: i,
+                video_key: Some(0),
+                audio_tracks: Vec::new(),
+            })
+            .collect(),
+        first_tick: 0,
+        cadence: CADENCE,
+        video_move_gates: vec![Some(Box::new(|p: &EncodedPacket| p.is_keyframe()))],
+    })
+    .unwrap()
+}
+
+fn router(
+    outputs: usize,
+    max: usize,
+    open: OpenFn,
+) -> (OutputRouter, OutputRoutingHandle, AuxWiring) {
+    let wiring = || AuxWiring {
+        feeds: Arc::new(SwapCell::from_pointee(Vec::new())),
+        active: Arc::new(AtomicBool::new(false)),
+        failed: Arc::new(AtomicBool::new(false)),
+        dropped: Arc::new(AtomicU64::new(0)),
+        stores: Arc::new(|_: &str| None),
+        preview_selection: None,
+    };
+    let aux = wiring();
+    let mirror = AuxWiring {
+        feeds: Arc::clone(&aux.feeds),
+        active: Arc::clone(&aux.active),
+        failed: Arc::clone(&aux.failed),
+        dropped: Arc::clone(&aux.dropped),
+        stores: Arc::clone(&aux.stores),
+        preview_selection: None,
+    };
+    let (r, h) = OutputRouter::new(
+        RouterConfig {
+            cadence: CADENCE,
+            gop: 5,
+            base_keys: vec![0; outputs],
+            base_force: vec![Arc::new(AtomicU64::new(NO_FORCE))],
+            max_encoders: max,
+            max_per_principal: DEFAULT_MAX_PER_PRINCIPAL,
+            has_preview: false,
+        },
+        aux,
+        open,
+    )
+    .unwrap();
+    (r, h, mirror)
+}
+
+struct NoDelivery;
+impl WindowDelivery for NoDelivery {
+    fn offer_window(
+        &mut self,
+        _o: usize,
+        _g: u64,
+        _p: Vec<EncodedPacket>,
+        _s: std::time::Duration,
+        _n: Instant,
+    ) -> Result<(), multiview_output::batch::EmissionError> {
+        Ok(())
+    }
+    fn report_loss(&mut self, _o: usize, _r: multiview_output::batch::OfferError) {}
+    fn take_discontinuity(&mut self, _o: usize) -> Option<multiview_output::batch::Discontinuity> {
+        None
+    }
+    fn generation(&self, _o: usize) -> u64 {
+        0
+    }
+    fn statuses(&self) -> Vec<crate::binding_delivery::BindingStatus> {
+        Vec::new()
+    }
+    fn finish(&mut self) {}
+    fn abort(&mut self) {}
+}
+
+fn take(op: &str, output: usize, bus: PictureBus) -> OutputTake {
+    OutputTake {
+        operation_id: op.to_owned(),
+        output_index: output,
+        bus,
+        principal: "p".to_owned(),
+    }
+}
+
+#[test]
+fn no_take_means_no_aux_activity_and_no_outcomes() {
+    let (mut r, h, aux) = router(2, 6, Box::new(|_| Err("never".to_owned())));
+    let mut d = dispatcher(2);
+    for t in 0..10 {
+        r.on_tick(t, MediaTime::from_nanos(0), &mut d, &mut NoDelivery)
+            .unwrap();
+    }
+    assert!(
+        !aux.active.load(Ordering::Acquire),
+        "clock gate stays closed"
+    );
+    assert!(h.outcomes().unwrap().try_recv().is_err());
+    assert_eq!(d.video_key_count(), 1, "no encoder opened");
+}
+
+#[test]
+fn unroutable_and_unfresh_takes_are_refused_and_the_mailbox_bounds_floods() {
+    let (mut r, h, aux) = router(2, 6, Box::new(|_| Err("never".to_owned())));
+    let outcomes = h.outcomes().unwrap();
+    let mut d = dispatcher(2);
+    h.try_take(take("bad", 9, PictureBus::Program)).unwrap();
+    h.try_take(take("pvw", 0, PictureBus::Preview)).unwrap();
+    h.try_take(take("src", 1, PictureBus::Source("cam".to_owned())))
+        .unwrap();
+    r.on_tick(0, MediaTime::from_nanos(0), &mut d, &mut NoDelivery)
+        .unwrap();
+    let first: Vec<_> = outcomes
+        .try_iter()
+        .map(|o| (o.operation_id, o.outcome))
+        .collect();
+    assert_eq!(
+        first,
+        vec![
+            (
+                "bad".to_owned(),
+                TakeResult::Refused(RefuseReason::Unroutable)
+            ),
+            (
+                "pvw".to_owned(),
+                TakeResult::Refused(RefuseReason::Unroutable)
+            ),
+        ]
+    );
+    assert!(
+        aux.active.load(Ordering::Acquire),
+        "a pending source take activates aux"
+    );
+    for t in 1..=TAKE_PRIME_DEADLINE_TICKS {
+        r.on_tick(t, MediaTime::from_nanos(0), &mut d, &mut NoDelivery)
+            .unwrap();
+    }
+    let late: Vec<_> = outcomes.try_iter().map(|o| (o.tick, o.outcome)).collect();
+    assert_eq!(
+        late,
+        vec![(
+            TAKE_PRIME_DEADLINE_TICKS,
+            TakeResult::Refused(RefuseReason::FeedNotFresh)
+        )]
+    );
+    assert_eq!(d.binding_video_key(1), Some(0), "output kept its feed");
+    assert!(
+        !aux.active.load(Ordering::Acquire),
+        "gate closes when nothing is routed"
+    );
+    // Flood: the mailbox holds 64; the 65th is busy.
+    let accepted = (0..1000)
+        .filter(|i| {
+            h.try_take(take(&i.to_string(), i % 2, PictureBus::Program))
+                .is_ok()
+        })
+        .count();
+    assert_eq!(accepted, TAKE_MAILBOX);
+    r.on_tick(100, MediaTime::from_nanos(0), &mut d, &mut NoDelivery)
+        .unwrap();
+    let applied = outcomes
+        .try_iter()
+        .filter(|o| o.outcome == TakeResult::Applied)
+        .count();
+    assert_eq!(applied, 2, "at most one effective take per output per tick");
+}
+
+/// Records each delivered window: (output, [(pts, keyframe-with-params)]).
+#[derive(Default)]
+struct Rec {
+    windows: Vec<(usize, Vec<(i64, bool)>)>,
+}
+impl WindowDelivery for Rec {
+    fn offer_window(
+        &mut self,
+        o: usize,
+        _g: u64,
+        p: Vec<EncodedPacket>,
+        _s: std::time::Duration,
+        _n: Instant,
+    ) -> Result<(), multiview_output::batch::EmissionError> {
+        let v = p
+            .iter()
+            .map(|p| (p.pts().unwrap_or(-1), p.is_keyframe() && p.len() == 77))
+            .collect();
+        self.windows.push((o, v));
+        Ok(())
+    }
+    fn report_loss(&mut self, _o: usize, _r: multiview_output::batch::OfferError) {}
+    fn take_discontinuity(&mut self, _o: usize) -> Option<multiview_output::batch::Discontinuity> {
+        None
+    }
+    fn generation(&self, _o: usize) -> u64 {
+        0
+    }
+    fn statuses(&self) -> Vec<crate::binding_delivery::BindingStatus> {
+        Vec::new()
+    }
+    fn finish(&mut self) {}
+    fn abort(&mut self) {}
+}
+
+const TICK_NS: i128 = 200_000_000;
+
+fn pts(t: u64) -> MediaTime {
+    MediaTime::from_nanos(i64::try_from(t).unwrap() * 200_000_000)
+}
+
+struct Harness {
+    r: OutputRouter,
+    h: OutputRoutingHandle,
+    d: RenditionDispatcher,
+    rec: Rec,
+    store: Arc<TileStore<Nv12Image>>,
+    failed: Arc<AtomicBool>,
+    outcomes: Receiver<TakeOutcome>,
+    aux_publishes: bool,
+    encoded: Arc<AtomicUsize>,
+    store2: Arc<TileStore<Nv12Image>>,
+    base_force: Arc<AtomicU64>,
+    live: bool,
+    max_router: std::time::Duration,
+}
+
+fn harness(outputs: usize, max: usize, open: Option<OpenFn>) -> Harness {
+    let store = Arc::new(TileStore::<Nv12Image>::with_defaults("cam"));
+    let store2 = Arc::new(TileStore::<Nv12Image>::with_defaults("cam2"));
+    let lookup = Arc::clone(&store);
+    let lookup2 = Arc::clone(&store2);
+    let base_force = Arc::new(AtomicU64::new(NO_FORCE));
+    let failed = Arc::new(AtomicBool::new(false));
+    let encoded = Arc::new(AtomicUsize::new(0));
+    let enc2 = Arc::clone(&encoded);
+    let open = open.unwrap_or_else(|| {
+        Box::new(move |_| {
+            let enc: Box<dyn LiveEncoder> = Box::new(FakeEnc {
+                forced: false,
+                encoded: Arc::clone(&enc2),
+            });
+            Ok(enc)
+        })
+    });
+    let (r, h) = OutputRouter::new(
+        RouterConfig {
+            cadence: CADENCE,
+            gop: 5,
+            base_keys: vec![0; outputs],
+            base_force: vec![Arc::clone(&base_force)],
+            max_encoders: max,
+            max_per_principal: DEFAULT_MAX_PER_PRINCIPAL,
+            has_preview: false,
+        },
+        AuxWiring {
+            feeds: Arc::new(SwapCell::from_pointee(Vec::new())),
+            active: Arc::new(AtomicBool::new(false)),
+            failed: Arc::clone(&failed),
+            dropped: Arc::new(AtomicU64::new(0)),
+            stores: Arc::new(move |id: &str| match id {
+                "cam" => Some(Arc::clone(&lookup)),
+                "cam2" => Some(Arc::clone(&lookup2)),
+                _ => None,
+            }),
+            preview_selection: None,
+        },
+        open,
+    )
+    .unwrap();
+    let outcomes = h.outcomes().unwrap();
+    Harness {
+        r,
+        h,
+        d: dispatcher(outputs),
+        rec: Rec::default(),
+        store,
+        failed,
+        outcomes,
+        aux_publishes: true,
+        encoded,
+        store2,
+        base_force,
+        live: true,
+        max_router: std::time::Duration::ZERO,
+    }
+}
+
+impl Harness {
+    /// One Program tick, in the pipeline's order: live events, base events
+    /// (the base encoder emits tick t-1's packets one iteration later),
+    /// router, then the base workers are offered frame t.
+    fn tick(&mut self, t: u64) {
+        self.r
+            .drain_live_events(&mut self.d, &mut self.rec)
+            .unwrap();
+        if let Some(prev) = t.checked_sub(1) {
+            let ns = i128::from(prev + 1) * TICK_NS;
+            let forced = take_force(&self.base_force, prev);
+            self.d
+                .dispatch(
+                    DispatchEvent::Video {
+                        key_index: 0,
+                        tick: prev,
+                        timebase: Rational::new(1, 5),
+                        packets: vec![pkt(prev, forced || prev % 5 == 0)],
+                        watermark: Some(crate::rendition_workers::DtsWatermark {
+                            complete_before_ns: ns,
+                        }),
+                    },
+                    Instant::now(),
+                    &mut self.rec,
+                )
+                .unwrap();
+        }
+        let frame = Nv12Image::solid(16, 16, 16, 128, 128, CanvasColor::default().output_tag());
+        for store in [&self.store, &self.store2] {
+            if self.live {
+                store.publish(frame.clone().unwrap(), pts(t));
+            }
+        }
+        if self.aux_publishes {
+            for bus in [src(), PictureBus::Source("cam2".to_owned())] {
+                if let Some(slot) = self.r.slot(&bus) {
+                    slot.latest
+                        .store(Some(Arc::new(crate::routing_aux::AuxFrame {
+                            tick: t,
+                            generation: 1,
+                            frame: canvas(),
+                        })));
+                }
+            }
+        }
+        let started = Instant::now();
+        self.r
+            .on_tick(t, pts(t), &mut self.d, &mut self.rec)
+            .unwrap();
+        self.max_router = self.max_router.max(started.elapsed());
+        // A live worker encodes within the tick period.
+        std::thread::sleep(std::time::Duration::from_millis(2));
+    }
+    fn windows_of(&self, o: usize) -> Vec<&Vec<(i64, bool)>> {
+        self.rec
+            .windows
+            .iter()
+            .filter(|w| w.0 == o)
+            .map(|w| &w.1)
+            .collect()
+    }
+    fn results(&self) -> Vec<TakeResult> {
+        self.outcomes.try_iter().map(|o| o.outcome).collect()
+    }
+}
+
+fn src() -> PictureBus {
+    PictureBus::Source("cam".to_owned())
+}
+
+#[test]
+fn a_take_opens_one_encoder_moves_at_a_rap_and_lingers_out() {
+    let mut x = harness(2, 6, None);
+    for t in 0..5 {
+        x.tick(t);
+    }
+    x.h.try_take(take("a", 1, src())).unwrap();
+    let mut applied_at = None;
+    let mut now = 5;
+    while now < 40 && applied_at.is_none() {
+        x.tick(now);
+        applied_at = x
+            .outcomes
+            .try_iter()
+            .find(|o| o.outcome == TakeResult::Applied)
+            .map(|o| o.tick);
+        now += 1;
+    }
+    let at = applied_at.expect("applied within the open deadline");
+    assert_eq!(x.d.video_key_count(), 2, "+1 encoder");
+    assert_eq!(x.d.binding_video_key(1), Some(1));
+    assert_eq!(
+        x.d.binding_video_key(0),
+        Some(0),
+        "the other output stays on Program"
+    );
+    let o1 = x.windows_of(1);
+    let first_moved = o1
+        .iter()
+        .find(|w| w.first().is_some_and(|p| p.0 == i64::try_from(at).unwrap()))
+        .unwrap();
+    assert!(
+        first_moved[0].1,
+        "the moved output's first packet is a self-contained RAP"
+    );
+    let ptss: Vec<i64> = o1.iter().filter_map(|w| w.first().map(|p| p.0)).collect();
+    assert!(
+        ptss.windows(2).all(|w| w[1] == w[0] + 1),
+        "PTS step constant: {ptss:?}"
+    );
+    let o0: Vec<i64> = x
+        .windows_of(0)
+        .iter()
+        .filter_map(|w| w.first().map(|p| p.0))
+        .collect();
+    assert!(o0.windows(2).all(|w| w[1] == w[0] + 1) && o0.len() >= usize::try_from(at).unwrap());
+    // Back to Program: +0 encoders.
+    x.h.try_take(take("b", 1, PictureBus::Program)).unwrap();
+    let mut back = None;
+    for t in now..now + 40 {
+        x.tick(t);
+        if x.outcomes
+            .try_iter()
+            .any(|o| o.operation_id == "b" && o.outcome == TakeResult::Applied)
+        {
+            back = Some(t);
+            break;
+        }
+    }
+    let back = back.expect("back on Program");
+    assert_eq!(x.d.binding_video_key(1), Some(0));
+    assert_eq!(x.d.video_key_count(), 2, "+0 encoders back to Program");
+    assert_eq!(x.h.snapshot().dynamic_encoders_live, 1, "lingering");
+    for t in back + 1..=back + LINGER_TICKS + 1 {
+        x.tick(t);
+    }
+    assert_eq!(
+        x.h.snapshot().dynamic_encoders_live,
+        0,
+        "closed after the linger"
+    );
+    assert!(x.d.is_key_failed(1), "retired");
+    let before = x.encoded.load(Ordering::Relaxed);
+    std::thread::sleep(std::time::Duration::from_millis(50));
+    assert_eq!(
+        x.encoded.load(Ordering::Relaxed),
+        before,
+        "reaped worker encodes nothing more"
+    );
+}
+
+#[test]
+fn a_wedged_open_never_delays_program_and_is_refused_at_its_deadline() {
+    let (_hold, wait) = mpsc::channel::<()>();
+    let wait = Mutex::new(wait);
+    let open: OpenFn = Box::new(move |_| {
+        let _ = wait.lock().unwrap().recv(); // never returns while the test runs
+        Err("unreachable".to_owned())
+    });
+    let mut x = harness(2, 6, Some(open));
+    x.tick(0);
+    x.h.try_take(take("a", 1, src())).unwrap();
+    for t in 1..=OPEN_DEADLINE_TICKS + 3 {
+        let started = Instant::now();
+        x.tick(t);
+        assert!(
+            started.elapsed() < std::time::Duration::from_millis(200),
+            "consumer never waits"
+        );
+        // Every output's window t-? closes on time: one window per output per tick.
+        assert_eq!(
+            x.windows_of(0).len(),
+            usize::try_from(t).unwrap(),
+            "late/missing window at {t}"
+        );
+        assert_eq!(x.windows_of(1).len(), usize::try_from(t).unwrap());
+    }
+    assert_eq!(
+        x.results(),
+        vec![TakeResult::Refused(RefuseReason::EncoderNotReady)]
+    );
+    assert_eq!(
+        x.d.binding_video_key(1),
+        Some(0),
+        "the output keeps its feed"
+    );
+    assert_eq!(x.h.snapshot().opens_in_flight, 0, "reservation released");
+}
+
+#[test]
+fn two_takes_against_the_last_free_slot_admit_one() {
+    let mut x = harness(3, 1, None);
+    x.tick(0);
+    x.h.try_take(take("a", 1, src())).unwrap();
+    x.tick(1);
+    let mut y = take("b", 2, PictureBus::Source("cam2".to_owned()));
+    y.principal = "q".to_owned();
+    x.h.try_take(y).unwrap();
+    let mut got = Vec::new();
+    for t in 2..40 {
+        x.tick(t);
+        got.extend(x.outcomes.try_iter().map(|o| (o.operation_id, o.outcome)));
+    }
+    assert!(
+        got.contains(&("a".to_owned(), TakeResult::Applied)),
+        "{got:?}"
+    );
+    assert!(
+        got.contains(&("b".to_owned(), TakeResult::Refused(RefuseReason::Capacity))),
+        "{got:?}"
+    );
+    assert_eq!(x.d.video_key_count(), 2, "exactly one encoder opened");
+}
+
+#[test]
+fn a_wedged_aux_degrades_then_falls_back_and_a_dead_aux_falls_back_at_once() {
+    let mut x = harness(2, 6, None);
+    x.tick(0);
+    x.h.try_take(take("a", 1, src())).unwrap();
+    let mut t = 1;
+    while !x
+        .outcomes
+        .try_iter()
+        .any(|o| o.outcome == TakeResult::Applied)
+    {
+        x.tick(t);
+        t += 1;
+        assert!(t < 60);
+    }
+    x.aux_publishes = false;
+    let wedged_at = t;
+    let mut degraded_at = None;
+    let mut fell_back_at = None;
+    for _ in 0..FALLBACK_AFTER_TICKS + 20 {
+        x.tick(t);
+        if degraded_at.is_none() && x.h.snapshot().outputs[1].degraded {
+            degraded_at = Some(t);
+        }
+        if x.outcomes
+            .try_iter()
+            .any(|o| o.outcome == TakeResult::Fallback(FallbackReason::AuxFailed))
+        {
+            fell_back_at = Some(t);
+            break;
+        }
+        t += 1;
+    }
+    let held = |at: Option<u64>| at.map(|a| a - wedged_at + 1);
+    assert_eq!(
+        held(degraded_at),
+        Some(DEGRADED_AFTER_TICKS),
+        "degraded at 60 held ticks"
+    );
+    assert_eq!(
+        held(fell_back_at),
+        Some(FALLBACK_AFTER_TICKS),
+        "fallback at 150"
+    );
+    for _ in 0..10 {
+        t += 1;
+        x.tick(t);
+    }
+    assert_eq!(x.d.binding_video_key(1), Some(0), "back on Program");
+    assert_eq!(
+        x.windows_of(0).len(),
+        usize::try_from(t).unwrap(),
+        "Program unaffected"
+    );
+    // Dead aux: a fresh take refused FeedNotFresh, an applied one falls back at once.
+    x.aux_publishes = true;
+    x.h.try_take(take("c", 1, src())).unwrap();
+    while !x
+        .outcomes
+        .try_iter()
+        .any(|o| o.outcome == TakeResult::Applied)
+    {
+        t += 1;
+        x.tick(t);
+    }
+    x.failed.store(true, Ordering::Release);
+    t += 1;
+    x.tick(t);
+    assert_eq!(
+        x.results(),
+        vec![TakeResult::Fallback(FallbackReason::AuxFailed)]
+    );
+    x.h.try_take(take("d", 1, src())).unwrap();
+    for _ in 0..=TAKE_PRIME_DEADLINE_TICKS {
+        t += 1;
+        x.tick(t);
+    }
+    assert_eq!(
+        x.results(),
+        vec![TakeResult::Refused(RefuseReason::FeedNotFresh)]
+    );
+}

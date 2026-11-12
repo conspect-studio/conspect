@@ -630,9 +630,14 @@ impl VideoRenditionEncoder {
     /// moved from an encoder that started at 0 sees a one-tick step.
     #[must_use]
     pub fn starting_at(mut self, t0: u64) -> Self {
+        self.start_at(t0);
+        self
+    }
+
+    /// In-place [`Self::starting_at`], for an encoder already owned by a worker.
+    pub fn start_at(&mut self, t0: u64) {
         self.tick = i64::try_from(t0).unwrap_or(i64::MAX);
         self.encoder.force_next_keyframe();
-        self
     }
 
     /// The next tick this encoder accepts.

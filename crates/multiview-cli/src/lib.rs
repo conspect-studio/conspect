@@ -283,6 +283,9 @@ mod binding_delivery;
 /// Existing encoded output conversion and authorized MoQ family adapter.
 #[cfg(feature = "moq-output")]
 pub mod moq_outputs;
+/// Output routing take state machine and live encoders (ADR-0108 slice 1).
+#[cfg(feature = "ffmpeg")]
+pub mod output_routing;
 #[cfg(feature = "ffmpeg")]
 pub mod output_window_registry;
 /// The full libav\* end-to-end `multiview run` pipeline (ingest → composite →

@@ -6610,6 +6610,25 @@ impl VideoEncodeWorker for PipelineVideoWorker {
             reason: e.to_string(),
         })
     }
+
+    fn force_keyframe(&mut self) {
+        self.0.force_next_keyframe();
+    }
+}
+
+impl crate::output_routing::LiveEncoder for PipelineVideoWorker {
+    fn start_at(&mut self, t0: u64) {
+        self.0.start_at(t0);
+    }
+
+    fn time_base(&self) -> Rational {
+        self.0.time_base()
+    }
+
+    fn move_gate(&self) -> crate::rendition_dispatch::MoveGate {
+        let params = self.0.codec_params().clone();
+        Box::new(move |packet| params.is_self_contained_rap(packet))
+    }
 }
 
 /// The per-item frame-substitution limit: the maximum number of consecutive

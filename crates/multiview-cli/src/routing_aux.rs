@@ -452,7 +452,10 @@ mod tests {
             contain_rect(640, 480, 1920, 1080),
             Some((240, 0, 1440, 1080))
         );
-        assert_eq!(contain_rect(1920, 800, 1920, 1080), Some((0, 140, 1920, 800)));
+        assert_eq!(
+            contain_rect(1920, 800, 1920, 1080),
+            Some((0, 140, 1920, 800))
+        );
 
         for (sw, sh) in [(640, 360), (640, 480)] {
             let tile = Arc::new(gradient(sw, sh, c.color));

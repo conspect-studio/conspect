@@ -160,6 +160,10 @@ pub trait VideoEncodeWorker: Send + 'static {
     /// # Errors
     /// Returns a concrete encoder flush failure without publishing false EOF.
     fn finish(&mut self) -> Result<Vec<EncodedPacket>, PipelineError>;
+
+    /// Make the next encoded frame a keyframe. One-shot; the caller owns the
+    /// rate limit. The default does nothing (an encoder that cannot force).
+    fn force_keyframe(&mut self) {}
 }
 
 /// Why a non-blocking offer could not be accepted.
