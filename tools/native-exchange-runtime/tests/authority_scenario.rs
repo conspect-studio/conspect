@@ -96,6 +96,15 @@ fn credit_cutoff_late_mapping_answer_still_probes_the_paid_boundary() {
 fn credit_cutoff_mapping_refusal_is_not_retried() {
     scenario("credit-cutoff", false, false, "mapping-refusal");
 }
+/// D3: the authority's takeover fence (`notBeforeMs`) ends 350 ms before an
+/// epoch boundary, so the client's startup root fetch is due in the epoch tail.
+/// A root request sent there is answered for its arrival epoch after the
+/// boundary and is rejected as expired; before the fix that ended the whole run
+/// ("canonical root rejected") before A's paid boundary was ever probed.
+#[test]
+fn credit_cutoff_startup_root_in_epoch_tail_still_probes_the_paid_boundary() {
+    scenario("credit-cutoff", false, false, "root-in-epoch-tail");
+}
 fn scenario(scenario: &'static str, slow: bool, deny_renew: bool, variant: &'static str) {
     // Admit one six-stream FFmpeg/TLS fixture at a time. These wall-clock
     // integration scenarios have real five-second grants; eight concurrent
@@ -157,6 +166,11 @@ fn scenario(scenario: &'static str, slow: bool, deny_renew: bool, variant: &'sta
         let mut deferred: Vec<std::thread::JoinHandle<()>> = Vec::new();
         let mut delayed_grants = 0u32;
         let mut mapping_grants = 0u32;
+        // root-in-epoch-tail: the lease's notBeforeMs (wall) and the epoch phase
+        // at which the first current-epoch request arrived.
+        let mut not_before_ms = 1u64;
+        let mut first_root_phase: Option<u64> = None;
+        let mut held_roots = 0u32;
         while !stopped.load(Ordering::SeqCst) {
             let (s, _) = match listener.accept() {
                 Ok(s) => s,
@@ -205,9 +219,21 @@ fn scenario(scenario: &'static str, slow: bool, deny_renew: bool, variant: &'sta
             let mut binary = false;
             let response = if path.ends_with("/lease/acquire") {
                 status = 201;
+                if variant == "root-in-epoch-tail" {
+                    // The client may seal (and so fetch a root) from notBeforeMs
+                    // plus its 1000 ms clock uncertainty: place that instant at
+                    // epoch phase 4650, at least 2 s from now.
+                    let target = (now() + 2000) / 5000 * 5000 + 4650;
+                    let target = if target < now() + 2000 {
+                        target + 5000
+                    } else {
+                        target
+                    };
+                    not_before_ms = target - 1000;
+                }
                 // The token is minted once, on acquire, and never appears on a
                 // renewal answer.
-                json!({"generation":793,"leaseToken":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA","leaseExpiresAtMs":now()+10000,"notBeforeMs":1})
+                json!({"generation":793,"leaseToken":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA","leaseExpiresAtMs":now()+10000,"notBeforeMs":not_before_ms})
             } else if path.ends_with("/lease/renew") {
                 renewals.push(std::time::Instant::now());
                 if deny_renew && renewals.len() >= 8 {
@@ -223,7 +249,7 @@ fn scenario(scenario: &'static str, slow: bool, deny_renew: bool, variant: &'sta
                     body["leaseToken"].as_str().is_some(),
                     "a renewal must present the retained lease token"
                 );
-                json!({"generation":793,"leaseExpiresAtMs":now()+10000,"notBeforeMs":1})
+                json!({"generation":793,"leaseExpiresAtMs":now()+10000,"notBeforeMs":not_before_ms})
             } else if path.ends_with("/lease/release") {
                 if scenario == "withdraw" && denied {
                     status = 404;
@@ -275,12 +301,23 @@ fn scenario(scenario: &'static str, slow: bool, deny_renew: bool, variant: &'sta
                     "root fetched after the withdrawal (sealing continued)"
                 );
                 roots += 1;
+                let phase = now() % 5000;
+                first_root_phase.get_or_insert(phase);
+                if variant == "root-in-epoch-tail" && roots == 1 && phase >= 4000 {
+                    // Built below for the arrival epoch, answered 30 ms after the
+                    // boundary (well inside the 1 s transport timeout).
+                    held_roots += 1;
+                    eprintln!("mock: first root request at epoch phase {phase} ms; answer crosses the boundary");
+                }
                 let mut dto = json!({"versionId":"ver_test","publisherMachineId":"mac_pub","generation":793,"epoch":now()/5000,"epochStartMs":now()/5000*5000,"epochEndMs":(now()/5000+1)*5000,"feedCryptoId":URL_SAFE_NO_PAD.encode([9;16]),"versionCryptoId":URL_SAFE_NO_PAD.encode([3;16]),"publisherMachineCryptoId":URL_SAFE_NO_PAD.encode([5;16]),"contributorOrgCryptoId":URL_SAFE_NO_PAD.encode([10;16]),"rootKeyBase64":STANDARD.encode([11;32])});
                 if scenario == "raw-mismatch" {
                     dto["feedCryptoId"] = json!(URL_SAFE_NO_PAD.encode([99; 16]));
                 }
                 if scenario == "missing-window" {
                     dto.as_object_mut().unwrap().remove("epochEndMs");
+                }
+                if held_roots == 1 && roots == 1 {
+                    std::thread::sleep(std::time::Duration::from_millis(5000 - phase + 30));
                 }
                 if scenario == "late-root" {
                     std::thread::sleep(std::time::Duration::from_millis(5000 - now() % 5000 + 20));
@@ -492,6 +529,19 @@ fn scenario(scenario: &'static str, slow: bool, deny_renew: bool, variant: &'sta
             assert_eq!(delayed_grants, 1);
             assert!(mapping_grants >= 2, "transport timeout was not retried");
             assert!(boundary_denials > 0, "A paid boundary not probed");
+            assert!(receipts > 0);
+        } else if variant == "root-in-epoch-tail" {
+            // The fence really ended in the tail, and the client still fetched its
+            // first root outside the tail, then reached A's paid boundary.
+            assert!(not_before_ms > 1 && (not_before_ms + 1000) % 5000 == 4650);
+            let phase = first_root_phase.expect("no root fetched");
+            assert!(
+                (250..3500).contains(&phase),
+                "first root request in the epoch tail at phase {phase} ms"
+            );
+            assert!(boundary_denials > 0, "A paid boundary not probed");
+            assert_eq!(extensions[0].len(), 1);
+            assert!(!extensions[1].is_empty(), "B must extend with 201");
             assert!(receipts > 0);
         } else if variant == "late-b-grants" {
             assert!(delayed_grants > 0, "the mock never delayed a B grant");
