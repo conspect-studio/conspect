@@ -62,7 +62,6 @@ fn drain_parked(
     slot: &Mutex<(ReceiverRuntime, Output)>,
     queue: &mut conspect_native_exchange_runtime::media::ParkQueue<Parked>,
     received: &mut [Vec<u8>],
-    lost: &mut [u64; 6],
 ) -> Result<()> {
     let mut slot = slot.lock().map_err(|_| "receiver lock")?;
     let (receiver, output) = &mut *slot;
@@ -71,7 +70,6 @@ fn drain_parked(
         let at = now();
         if stale(receiver, &p, at) {
             queue.stale += 1;
-            lost[p.track] += 1;
             continue;
         }
         let Some(epoch) = wire_epoch(&p.wire) else {
@@ -91,10 +89,7 @@ fn drain_parked(
                 accept_plain(received, p.track, p.n, plain, output)?
             }
             Err(_) if receiver.is_denied() => return Err("decrypt denied"),
-            Err(_) if stale(receiver, &p, now()) => {
-                queue.stale += 1;
-                lost[p.track] += 1;
-            }
+            Err(_) if stale(receiver, &p, now()) => queue.stale += 1,
             Err(_) => return Err("decrypt"),
         }
     }
@@ -108,20 +103,22 @@ fn now() -> u64 {
 }
 /// Startup retry budget. Each startup phase that may meet a late answer (the
 /// mapping mint before the marker, the two receiver grants after the expected
-/// fragment) gets at most 3 seconds in which a retry may START. The first
-/// attempt always runs; only retries are gated. One attempt lasts at most
-/// `ATTEMPT_MAX_MS`: the epoch-tail admission wait (at most 1500 + 250 + 1 ms,
-/// bootstrap `admitted_wall`) plus one 1-second transport timeout. No retry
-/// starts later than `STARTUP_BOUNDARY_RESERVE_MS` before booking A's
-/// authoritative expires_at, so the last retry ends at least 249 ms before A's
-/// paid boundary in every fixture:
-/// * 4 000 ms window: deadline = booked + 1 000; last retry ends <= booked + 3 751.
+/// fragment) may START a retry for at most 3 seconds, and never later than
+/// `STARTUP_BOUNDARY_RESERVE_MS` before booking A's authoritative expires_at.
+/// The first attempt always runs, exactly as on main; only retries are gated.
+/// A single grant request lasts at most `ATTEMPT_MAX_MS` (epoch-tail admission
+/// 1500 + 250 + 1 ms, then one 1-second transport timeout), so a retried
+/// receiver grant started before the deadline ends before A's boundary:
+/// * 4 000 ms window: deadline = booked + 1 000; ends <= booked + 3 751.
 /// * 10 000 ms window: deadline = booked + 3 000; ends <= booked + 5 751.
 /// * 30 000 ms window: deadline = booked + 3 000; ends <= booked + 5 751.
 ///
-/// (The receiver-grant phase starts its own 3-second budget after the fragment
-/// handoff, under the same reserve.) The pre-existing single 404 retry inside a
-/// grant (a tail denial, never a refusal) is outside this budget, as on main.
+/// A whole mapping mint is longer (root plus two grants, each admitted, plus
+/// the pre-existing single tail-404 retry) and a retried mint can run past
+/// that bound. It still cannot make A's boundary confirmed late or faked: the
+/// fragment-handoff check refuses a run with under 2 s of A's window left
+/// (static reason), and the boundary is only probed by the media loop once
+/// wall time >= expires_at.
 const STARTUP_GRANT_BUDGET_MS: u64 = 3000;
 const STARTUP_BOUNDARY_RESERVE_MS: u64 = 3000;
 #[cfg(test)]
@@ -148,7 +145,9 @@ fn retry_late_grant<T>(deadline: u64, mut attempt: impl FnMut() -> Result<T>) ->
             // A 200 grant that arrived so late in its epoch that it expires within
             // the clock uncertainty: a local timing check, not a refusal. The next
             // attempt is admitted out of the tail, in the next epoch.
-            Err("grant near boundary") if now() < deadline => {}
+            Err("grant near boundary") if now() < deadline => {
+                std::thread::sleep(LATE_GRANT_SETTLE);
+            }
             // One retry only: the root fetch itself is admitted out of the epoch
             // tail, so the retry is sent early in the new epoch.
             Err(ROOT_EXPIRED_IN_TRANSIT) if !root_retried && now() < deadline => {
@@ -180,38 +179,22 @@ fn startup_publisher(
     }
     Err("authority publisher")
 }
-/// What one taker's accumulated input for one track yields.
-#[derive(Debug)]
-enum DecoderInput {
-    Frames(Vec<conspect_native_exchange_runtime::media::DecodedFrame>),
-    /// No accepted bytes at all: nothing to decode, no observation emitted.
-    Empty,
-    /// The input failed to decode AND objects of this taker/track were lost in
-    /// this window to the counted delivery policy (stale or overflowing park
-    /// queue, a range cut at the epoch boundary, an authorization fence), or are
-    /// still parked: the stream is incomplete by design, not malformed.
-    Incomplete,
-}
-/// The rule for decoder input, for every scenario. An empty input is skipped
-/// and counted. A non-empty input that fails to decode is a hard error unless
-/// objects of this taker/track were lost or are still parked in this window
-/// (`missing > 0`): only then is it counted as incomplete and skipped. A
-/// complete, malformed input therefore always fails. Skips never emit a
-/// decoded observation or receipt, so a taker that silently has no media
-/// still fails `decode_evidence` at the end of the run.
+/// The decoder-input rule, for every scenario: an EMPTY input (no accepted
+/// bytes for this taker/track in the window: parked objects that went stale, an
+/// authorization fence, a range cut at the epoch boundary) has nothing to
+/// decode and is skipped (`None`, counted by the caller). Any non-empty input
+/// is decoded and a decode failure is returned: a malformed stream always
+/// fails the run. A skip never emits a decoded observation or receipt, so a
+/// taker that silently has no media still fails `decode_evidence`.
+type Frames = Vec<conspect_native_exchange_runtime::media::DecodedFrame>;
 fn decoder_input(
     bytes: &[u8],
-    missing: u64,
-    decode: impl FnOnce(&[u8]) -> Result<Vec<conspect_native_exchange_runtime::media::DecodedFrame>>,
-) -> Result<DecoderInput> {
+    decode: impl FnOnce(&[u8]) -> Result<Frames>,
+) -> Result<Option<Frames>> {
     if bytes.is_empty() {
-        return Ok(DecoderInput::Empty);
+        return Ok(None);
     }
-    match decode(bytes) {
-        Ok(frames) => Ok(DecoderInput::Frames(frames)),
-        Err(_) if missing > 0 => Ok(DecoderInput::Incomplete),
-        Err(e) => Err(e),
-    }
+    decode(bytes).map(Some)
 }
 /// Per-taker decode evidence at the end of a run. A skipped empty decoder input
 /// produces no decoded interval, so a taker that silently received no media
@@ -548,9 +531,6 @@ fn connected(
     let mut late_drops = 0u64;
     let mut sealing_skipped = 0u64;
     let mut empty_decode_skips = [0u64; 2];
-    let mut incomplete_decode_skips = [0u64; 2];
-    // Objects of each taker/track not delivered in the current input window.
-    let mut lost = [[0u64; 6]; 2];
     let mut parked: Vec<conspect_native_exchange_runtime::media::ParkQueue<Parked>> = (0..2)
         .map(|_| conspect_native_exchange_runtime::media::ParkQueue::new(256))
         .collect();
@@ -565,7 +545,6 @@ fn connected(
         if scenario == "credit-cutoff" && phase > 0 && phase % 2 == 0 {
             captured = now();
             received = vec![vec![Vec::new(); 6]; 2];
-            lost = [[0u64; 6]; 2];
         }
         for (track, f) in fixtures.iter().enumerate() {
             if Instant::now() >= scenario_end {
@@ -671,19 +650,14 @@ fn connected(
             } else {
                 split..f.packets.len()
             };
-            let range_end = range.end;
             for n in range {
                 // One wall sample decides the epoch check AND the seal, so a
                 // boundary cannot fall between them.
                 let seal_at = now();
                 if scenario == "credit-cutoff" && publisher.bound_scope().epoch != seal_at / 5000 {
                     // The range outlasted its epoch on a loaded host: never seal across
-                    // the boundary. The next phase re-admits into the new epoch. The
-                    // unsealed remainder is a counted loss for both takers.
+                    // the boundary. The next phase re-admits into the new epoch.
                     sealing_skipped += 1;
-                    for taker_lost in &mut lost {
-                        taker_lost[track] += (range_end - n) as u64;
-                    }
                     break;
                 }
                 let id = publish(
@@ -729,14 +703,12 @@ fn connected(
                             || receiver.grant_lapsed(now()))
                     {
                         // Grant for this epoch not accepted yet: hold in order, bounded.
-                        if let Some(old) = parked[i].park(Parked {
+                        parked[i].park(Parked {
                             wire,
                             id: id.clone(),
                             track,
                             n: n as u64,
-                        }) {
-                            lost[i][old.track] += 1;
-                        }
+                        });
                         continue;
                     }
                     let plain = receiver.open(&wire, &id, now(), output);
@@ -747,14 +719,12 @@ fn connected(
                     {
                         // The grant lapsed between the check and the open (epoch
                         // boundary crossed mid-loop): not a denial, hold it.
-                        if let Some(old) = parked[i].park(Parked {
+                        parked[i].park(Parked {
                             wire,
                             id: id.clone(),
                             track,
                             n: n as u64,
-                        }) {
-                            lost[i][old.track] += 1;
-                        }
+                        });
                         continue;
                     }
                     if (cutoff && (i == 0 || scenario == "withdraw")) || (exhausted && i == 0) {
@@ -764,8 +734,6 @@ fn connected(
                         continue;
                     }
                     if scenario == "credit-cutoff" && i == 0 && plain.is_err() {
-                        // A's authorization fence: not delivered, counted as lost.
-                        lost[0][track] += 1;
                         continue;
                     }
                     let frame =
@@ -784,7 +752,7 @@ fn connected(
                 }
                 let until = Instant::now() + Duration::from_secs(4);
                 while !parked[i].is_empty() {
-                    drain_parked(&slots[i], &mut parked[i], &mut received[i], &mut lost[i])?;
+                    drain_parked(&slots[i], &mut parked[i], &mut received[i])?;
                     if parked[i].is_empty() || Instant::now() >= until || !control.healthy() {
                         break;
                     }
@@ -802,20 +770,11 @@ fn connected(
                         continue;
                     }
                 }
-                let missing =
-                    lost[i][track] + parked[i].iter().filter(|p| p.track == track).count() as u64;
-                let frames = match decoder_input(&received[i][track], missing, |bytes| {
-                    decode(dir, f, i, bytes)
-                })? {
-                    DecoderInput::Frames(frames) => frames,
-                    DecoderInput::Empty => {
-                        empty_decode_skips[i] += 1;
-                        continue;
-                    }
-                    DecoderInput::Incomplete => {
-                        incomplete_decode_skips[i] += 1;
-                        continue;
-                    }
+                let Some(frames) =
+                    decoder_input(&received[i][track], |bytes| decode(dir, f, i, bytes))?
+                else {
+                    empty_decode_skips[i] += 1;
+                    continue;
                 };
                 for decoded in frames {
                     let pts = decoded.pts_ms;
@@ -1012,16 +971,13 @@ fn connected(
     }
     // Skipped empty decoder inputs are counted and reported for every scenario.
     println!(
-        "decoder input report: empty_inputs_skipped A={} B={} incomplete_inputs_skipped A={} B={}",
-        empty_decode_skips[0],
-        empty_decode_skips[1],
-        incomplete_decode_skips[0],
-        incomplete_decode_skips[1]
+        "decoder input report: empty_inputs_skipped A={} B={}",
+        empty_decode_skips[0], empty_decode_skips[1]
     );
     if let Err(e) = decode_evidence(scenario, &intervals, &b_at_expiry) {
         // Counts only (no ids, keys or media): why the evidence is missing.
         eprintln!(
-            "decode evidence: intervals A={:?} B={:?} B_at_expiry={b_at_expiry:?} empty={empty_decode_skips:?} incomplete={incomplete_decode_skips:?} late_drops={late_drops} ranges_cut={sealing_skipped} B_parked={} B_stale={} B_drained={} B_overflow={}",
+            "decode evidence: intervals A={:?} B={:?} B_at_expiry={b_at_expiry:?} empty={empty_decode_skips:?} late_drops={late_drops} ranges_cut={sealing_skipped} B_parked={} B_stale={} B_drained={} B_overflow={}",
             intervals[0], intervals[1], parked[1].parked_total, parked[1].stale, parked[1].drained, parked[1].dropped
         );
         return Err(e);
@@ -1176,28 +1132,23 @@ mod startup_grant_tests {
             format: "hevc",
             packets: vec![],
         };
-        let garbage = [0x5au8; 4096];
-        let real = |b: &[u8]| decode(dir.path(), &f, 1, b);
         // Empty: skipped, decoder never invoked.
         assert!(matches!(
-            decoder_input(&[], 0, |_| panic!("decoder ran on empty input")),
-            Ok(DecoderInput::Empty)
+            decoder_input(&[], |_| panic!("decoder ran on empty input")),
+            Ok(None)
         ));
-        // Complete but malformed: a hard failure.
+        // Any non-empty malformed input is a hard failure, however small.
+        for len in [1usize, 64, 4096] {
+            assert_eq!(
+                decoder_input(&vec![0x5a; len], |b| decode(dir.path(), &f, 1, b)).unwrap_err(),
+                "FFmpeg command failed"
+            );
+        }
+        // A decoder error is propagated unchanged.
         assert_eq!(
-            decoder_input(&garbage, 0, real).unwrap_err(),
-            "FFmpeg command failed"
+            decoder_input(&[1], |_| Err("insufficient advancing decoded frames")).unwrap_err(),
+            "insufficient advancing decoded frames"
         );
-        // Undecodable with counted losses in this window: incomplete, skipped.
-        assert!(matches!(
-            decoder_input(&garbage, 3, real),
-            Ok(DecoderInput::Incomplete)
-        ));
-        // Decodable input is decoded whatever was lost.
-        assert!(matches!(
-            decoder_input(&garbage, 3, |_| Ok(vec![])),
-            Ok(DecoderInput::Frames(v)) if v.is_empty()
-        ));
     }
     #[test]
     fn a_taker_without_media_fails_the_run_evidence() {

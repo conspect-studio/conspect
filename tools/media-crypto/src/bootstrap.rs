@@ -910,7 +910,14 @@ impl Bootstrap {
             now_ms: n,
         }) {
             Ok(_) => Ok(Value::Null),
-            Err(crate::Error::Expired) if now()? / EPOCH_MS > n / EPOCH_MS => {
+            // Retryable only while the lease still holds: an Expired caused by a
+            // lease fence that closed meanwhile (revocation, withdrawal) is fatal.
+            // An answered refusal is `Denied` and a rollback `Replay` in the
+            // provider before any epoch check, so delaying them cannot make them
+            // retryable.
+            Err(crate::Error::Expired)
+                if now()? / EPOCH_MS > n / EPOCH_MS && self.lease_valid() =>
+            {
                 Err(ROOT_EXPIRED_IN_TRANSIT)
             }
             Err(_) => Err("canonical root rejected"),
