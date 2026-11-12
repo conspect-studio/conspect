@@ -122,6 +122,21 @@ one `SwapCell` per frame; the map is replaced only on a transition, so steady
 state allocates nothing. Media-player tiles (not catalogued) keep the signal
 state. Tally borders/blocks and not-ready fills are not built here.
 
+### Desk wall tile (web)
+
+`ProductionDesk`'s wall tile resolves every source to a picture or a stated
+reason, so an operator never sees an unexplained empty box: a live cell draws the
+wall crop; a `failed` source draws a no-signal slate with the engine's `detail`
+as bounded plain text (never markup); a `starting` source — or an `idle` one
+something wants — says "Starting", over its last good frame when it has one; an
+`idle` source nothing wants says so; and a still keeps its "Stale frame" mark.
+The tile shares one polled `GET /api/v1/sources/status` query with the bus keys
+(3 s, paused while the tab is hidden). A `failed` tile keeps polling its still:
+that poll is what holds the source's 5 s preview demand — `/api/v1/preview/wall`
+renews it too, but only for a principal the wall is served to and a source it
+carries a cell for — so dropping the poll would lapse the lease and flip the tile
+to `Idle`.
+
 ### Owner hooks for later kinds (`multiview-engine/src/lifecycle.rs`)
 
 For web sources (not built): an async `SourceOwner` trait with `start(source,
@@ -144,7 +159,7 @@ Covered by fake-owner tests.
 | Program-bus and discrete audio routes | Boot: `[audio].routes`. Runtime: `AudioControlHandle::request_routing` republishes on every live routing apply. Muted routes count, because the route is how an operator meters it. | audio |
 | Subtitle routes (`RouteSubtitle`) | Command drain, per layer routed away from its own source | video (captions ride the video demux) |
 | Source preview, WHEP | `CliWhepProvider::negotiate` (input scope) holds a lease for the session's life. A session whose peer dies is reaped by the encode pump (`whep_egress` now marks dead sessions closed), so a tab closed without `DELETE` still releases. | video |
-| Source preview, JPEG polling (`/preview/inputs/{id}.jpg`) | Each poll takes or extends a 5 s timed lease (at most 64 timed leases). Until the first frame it answers 503 with `X-Multiview-Source-State: starting`. Monitoring's ~1 fps **thumbnails do not poll idle sources**, so opening Monitoring never starts all sources; opening a preview dialog does. | video |
+| Source preview, JPEG polling (`/preview/inputs/{id}.jpg`) | Each poll takes or extends a 5 s timed lease (at most 64 timed leases). With no picture it answers `503` with an RFC 9457 problem typed by phase — `/problems/source-failed` (carrying the engine's bounded reason in `detail`), `/problems/source-starting`, or `/problems/preview-not-served` — plus the coarse `X-Multiview-Source-State` header. The phase is read only after the per-object authorization check (BOLA). Monitoring's ~1 fps **thumbnails do not poll idle sources**, so opening Monitoring never starts all sources; opening a preview dialog does. | video |
 | On-demand HLS sessions (`feat/rc-on-demand-hls`) | `SourceDemandProvider::session_lease(id, session)`. That branch must hold this lease for each session's life (see "Not done"). | video + audio |
 | Armed event automation | Standing pins from `events.automation.armed`: the watched source (video, for observation) and the rule's replacement target (video, or video + audio for `route_program`) so a take has a picture at once | video / all |
 | `activation = "always_on"` (default) | Standing pin from the source setting | video + audio (as the kind has them) |
