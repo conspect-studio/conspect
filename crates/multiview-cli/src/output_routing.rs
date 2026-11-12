@@ -875,6 +875,7 @@ impl OutputRouter {
         }
         self.drain_takes(tick, dispatcher);
         self.drain_opens(tick, dispatcher);
+        self.expire_orphan_opens(tick);
         self.drain_moves(tick, dispatcher);
         self.advance_takes(tick, pts, dispatcher);
         self.feed(tick, dispatcher);
@@ -1202,6 +1203,19 @@ impl OutputRouter {
                     deadline: open.deadline,
                 };
             }
+        }
+    }
+
+    /// An open whose take was superseded (no waiter) and whose result never
+    /// arrived releases its capacity at its deadline, like a waited one
+    /// (#330: otherwise a wedged open leaked an encoder session forever).
+    /// A result arriving later goes to the reaper (`drain_opens`).
+    fn expire_orphan_opens(&mut self, tick: u64) {
+        let before = self.opens.len();
+        self.opens
+            .retain(|_, o| o.waiter.is_some() || tick < o.deadline);
+        if self.opens.len() != before {
+            self.dirty = true;
         }
     }
 
@@ -1537,10 +1551,36 @@ impl OutputRouter {
                         }
                         continue;
                     }
+                    if self.wait_for_shared_open(index, &bus, started, tick, dispatcher) {
+                        continue;
+                    }
                     self.start_move(index, &bus, choice.as_ref(), &principal, tick, dispatcher);
                 }
             }
         }
+    }
+
+    /// Encode once per (bus, settings) (§4.3): while an open for the same
+    /// key is in flight, the take waits for it and then reuses its encoder
+    /// (#330: two takes opened two encoders). Returns `true` while waiting;
+    /// the wait is bounded by [`OPEN_DEADLINE_TICKS`].
+    fn wait_for_shared_open(
+        &mut self,
+        index: usize,
+        bus: &PictureBus,
+        started: u64,
+        tick: u64,
+        dispatcher: &mut RenditionDispatcher,
+    ) -> bool {
+        let settings = self.cfg.base_keys.get(index).copied();
+        let in_flight = self
+            .opens
+            .values()
+            .any(|o| o.bus == *bus && Some(o.settings) == settings);
+        if in_flight && tick.saturating_sub(started) >= OPEN_DEADLINE_TICKS {
+            self.refuse_pending(index, tick, RefuseReason::EncoderNotReady, dispatcher);
+        }
+        in_flight
     }
 
     /// An audio-only take in flight: applied once on air (the tick whose

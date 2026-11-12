@@ -2888,3 +2888,90 @@ fn a_take_during_a_running_fade_is_queued_after_it() {
         "largest step {worst} (steady tone {steady})"
     );
 }
+
+// ---------------------------------------------------------------------------
+// #330 (PR 319 review): router faults.
+// ---------------------------------------------------------------------------
+
+/// #330 item 1: a take superseded while its open is wedged releases the
+/// open's encoder session at the open's deadline (it leaked forever).
+#[test]
+fn a_superseded_wedged_open_releases_its_session_at_the_deadline() {
+    let (_hold, wait) = mpsc::channel::<()>();
+    let wait = Mutex::new(wait);
+    let open: OpenFn = Box::new(move |_| {
+        let _ = wait.lock().unwrap().recv(); // wedged while the test runs
+        Err("unreachable".to_owned())
+    });
+    let mut x = harness(2, 6, Some(open));
+    x.tick(0);
+    x.h.try_take(take("a", 1, src())).unwrap();
+    x.tick(1);
+    x.tick(2);
+    assert_eq!(x.h.snapshot().opens_in_flight, 1, "the open is in flight");
+    // Superseded by a take back to Program (no waiter remains).
+    x.h.try_take(take("b", 1, PictureBus::Program)).unwrap();
+    for t in 3..=OPEN_DEADLINE_TICKS + 3 {
+        x.tick(t);
+    }
+    let got: Vec<_> = x
+        .outcomes
+        .try_iter()
+        .map(|o| (o.operation_id, o.outcome))
+        .collect();
+    assert!(
+        got.contains(&("a".to_owned(), TakeResult::Superseded)),
+        "{got:?}"
+    );
+    assert_eq!(
+        x.h.snapshot().opens_in_flight,
+        0,
+        "the superseded open's session is released at its deadline"
+    );
+}
+
+/// #330 item 2: two outputs' takes to the same bus with the same settings,
+/// while the first open is still in flight, open ONE encoder (+0 for the
+/// second), never two.
+#[test]
+fn two_in_flight_takes_to_one_bus_open_one_encoder() {
+    let opens = Arc::new(AtomicUsize::new(0));
+    let count = Arc::clone(&opens);
+    let encoded = Arc::new(AtomicUsize::new(0));
+    let open: OpenFn = Box::new(move |_| {
+        count.fetch_add(1, Ordering::Relaxed);
+        // Slow enough that the second take is admitted meanwhile.
+        std::thread::sleep(std::time::Duration::from_millis(30));
+        let enc: Box<dyn LiveEncoder> = Box::new(FakeEnc {
+            forced: false,
+            encoded: Arc::clone(&encoded),
+        });
+        Ok(enc)
+    });
+    let mut x = harness(3, 6, Some(open));
+    x.tick(0);
+    x.h.try_take(take("a", 1, src())).unwrap();
+    x.h.try_take(take("b", 2, src())).unwrap();
+    let mut got = Vec::new();
+    for t in 1..60 {
+        x.tick(t);
+        got.extend(x.outcomes.try_iter().map(|o| (o.operation_id, o.outcome)));
+        if got.len() == 2 {
+            break;
+        }
+    }
+    assert!(
+        got.contains(&("a".to_owned(), TakeResult::Applied)),
+        "{got:?}"
+    );
+    assert!(
+        got.contains(&("b".to_owned(), TakeResult::Applied)),
+        "{got:?}"
+    );
+    assert_eq!(
+        opens.load(Ordering::Relaxed),
+        1,
+        "one encoder for one (bus, settings)"
+    );
+    assert_eq!(x.h.snapshot().dynamic_encoders_live, 1);
+}
