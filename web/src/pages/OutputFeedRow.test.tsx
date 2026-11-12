@@ -146,6 +146,69 @@ describe('OutputFeedRow', () => {
     expect(screen.getByRole('button', { name: /Take feed to Out 1/ })).toBeDisabled();
   });
 
+  it('starts the select on the feed on air, and moves it on an applied take', async () => {
+    const { unmount } = renderWithProviders(
+      <OutputFeedRow output="out-1" outputName="Out 1" route={directRow} choices={choices} />,
+    );
+    const select = screen.getByLabelText(/Video feed for Out 1/);
+    expect(select).toHaveValue('src:bars');
+    expect(select).toHaveDisplayValue('Bars');
+    expect(screen.getByRole('button', { name: /Take feed to Out 1/ })).toBeDisabled();
+    fireEvent.change(select, { target: { value: 'bus:program' } });
+    await screen.findByTestId('output-plan-cost');
+    fireEvent.click(screen.getByRole('button', { name: /Take feed to Out 1/ }));
+    await waitFor(() => {
+      expect(screen.getByRole('status')).toHaveAttribute('data-phase', 'pending');
+    });
+    emit({ output: 'out-1', operation_id: 'op-7', tick: 10, outcome: 'applied' });
+    await waitFor(() => {
+      expect(screen.getByRole('status')).toHaveAttribute('data-phase', 'applied');
+    });
+    // Program is now on air: the select shows it and the Take key says so.
+    expect(screen.getByLabelText(/Video feed for Out 1/)).toHaveValue('bus:program');
+    await waitFor(() => {
+      expect(screen.getByRole('button', { name: /Take feed to Out 1/ })).toBeDisabled();
+    });
+    unmount();
+    renderWithProviders(
+      <OutputFeedRow output="out-1" outputName="Out 1" route={programRow} choices={choices} />,
+    );
+    expect(screen.getByLabelText(/Video feed for Out 1/)).toHaveDisplayValue(
+      'Program (follows the switcher)',
+    );
+  });
+
+  it('names the feed in the cost line; session counts only when the API returns them', async () => {
+    // A scoped principal: the API omits encoder_sessions.
+    const { unmount } = renderWithProviders(
+      <OutputFeedRow output="out-1" outputName="Out 1" route={programRow} choices={choices} />,
+    );
+    fireEvent.change(screen.getByLabelText(/Video feed for Out 1/), {
+      target: { value: 'src:bars' },
+    });
+    await waitFor(() => {
+      expect(screen.getByTestId('output-plan-cost')).toHaveTextContent(/^Bars → \+1 encoder$/);
+    });
+    unmount();
+    // A whole-system principal: the API returns the session count.
+    planResponse = {
+      class: 'class1',
+      cost: { new_encoders: 1, fits: true, encoder_sessions: '6 of 12 in use' },
+      refusals: [],
+    };
+    renderWithProviders(
+      <OutputFeedRow output="out-1" outputName="Out 1" route={programRow} choices={choices} />,
+    );
+    fireEvent.change(screen.getByLabelText(/Video feed for Out 1/), {
+      target: { value: 'src:bars' },
+    });
+    await waitFor(() => {
+      expect(screen.getByTestId('output-plan-cost')).toHaveTextContent(
+        'Bars → +1 encoder (6 of 12 encoder sessions in use)',
+      );
+    });
+  });
+
   it('shows PGM for Program and direct: <id> for a source', () => {
     const { unmount } = renderWithProviders(
       <OutputFeedRow output="out-1" outputName="Out 1" route={programRow} choices={choices} />,

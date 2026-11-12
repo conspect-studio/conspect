@@ -197,8 +197,20 @@ msgstr ""
 msgid "{discardedNoClient} packets discarded while no caller was attached"
 msgstr ""
 
+#: src/pages/OutputFeedRow.tsx:341
+msgid "{feedLabel} → {costLine}"
+msgstr ""
+
+#: src/pages/OutputFeedRow.tsx:343
+msgid "{feedLabel} → {costLine} ({sessions})"
+msgstr ""
+
 #: src/devices/lastSeen.tsx:60
 msgid "{hours} h ago"
+msgstr ""
+
+#: src/pages/OutputFeedRow.tsx:251
+msgid "{inUse} of {max} encoder sessions in use"
 msgstr ""
 
 #: src/resources/FormControls.tsx:350
@@ -300,11 +312,11 @@ msgstr ""
 msgid "← Back"
 msgstr ""
 
-#: src/pages/OutputFeedRow.tsx:177
+#: src/pages/OutputFeedRow.tsx:241
 msgid "+0 encoders"
 msgstr ""
 
-#: src/pages/OutputFeedRow.tsx:178
+#: src/pages/OutputFeedRow.tsx:242
 msgid "+1 encoder"
 msgstr ""
 
@@ -1510,7 +1522,7 @@ msgstr ""
 #: src/app/navigation.tsx:58
 #: src/components/broadcast/BroadcastShell.tsx:34
 #: src/components/broadcast/library/Chips.tsx:139
-#: src/pages/OutputFeedRow.tsx:301
+#: src/pages/OutputFeedRow.tsx:374
 #: src/pages/OutputsPage.tsx:892
 msgid "Audio"
 msgstr ""
@@ -1916,7 +1928,7 @@ msgstr ""
 msgid "Bus setup"
 msgstr ""
 
-#: src/pages/OutputFeedRow.tsx:209
+#: src/pages/OutputFeedRow.tsx:282
 msgid "Buses"
 msgstr ""
 
@@ -1957,7 +1969,7 @@ msgstr ""
 #: src/pages/graphics/LibraryView.tsx:155
 #: src/pages/LayoutsPage.tsx:365
 #: src/pages/MediaPlayersPage.tsx:894
-#: src/pages/OutputFeedRow.tsx:324
+#: src/pages/OutputFeedRow.tsx:397
 #: src/pages/OutputsPage.tsx:1568
 #: src/pages/OutputsPage.tsx:1617
 #: src/pages/RelayManagementPage.tsx:80
@@ -2280,11 +2292,11 @@ msgstr ""
 msgid "Choose a data source…"
 msgstr ""
 
-#: src/pages/OutputFeedRow.tsx:119
+#: src/pages/OutputFeedRow.tsx:181
 msgid "Choose a feed and plan it first"
 msgstr ""
 
-#: src/pages/OutputFeedRow.tsx:235
+#: src/pages/OutputFeedRow.tsx:308
 msgid "Choose a feed…"
 msgstr ""
 
@@ -2670,7 +2682,7 @@ msgstr ""
 msgid "Confirm a program-affecting take?"
 msgstr ""
 
-#: src/pages/OutputFeedRow.tsx:308
+#: src/pages/OutputFeedRow.tsx:381
 msgid "Confirm a take on a Program output?"
 msgstr ""
 
@@ -2679,7 +2691,7 @@ msgid "Confirm program change"
 msgstr ""
 
 #: src/components/broadcast/ProductionDesk.tsx:216
-#: src/pages/OutputFeedRow.tsx:332
+#: src/pages/OutputFeedRow.tsx:405
 #: src/pages/RoutingPage.tsx:662
 msgid "Confirm take"
 msgstr ""
@@ -3638,7 +3650,7 @@ msgstr ""
 msgid "Degraded"
 msgstr ""
 
-#: src/pages/OutputFeedRow.tsx:255
+#: src/pages/OutputFeedRow.tsx:328
 msgid "degraded (holding last picture)"
 msgstr ""
 
@@ -3858,7 +3870,7 @@ msgstr ""
 msgid "Digital (HH:MM:SS readout)"
 msgstr ""
 
-#: src/pages/OutputFeedRow.tsx:204
+#: src/pages/OutputFeedRow.tsx:277
 msgid "direct: {id}"
 msgstr ""
 
@@ -4728,7 +4740,7 @@ msgstr ""
 msgid "Feature guide"
 msgstr ""
 
-#: src/pages/OutputFeedRow.tsx:287
+#: src/pages/OutputFeedRow.tsx:360
 msgid "Feed change on {outputName}"
 msgstr ""
 
@@ -4833,20 +4845,20 @@ msgstr ""
 msgid "Focus transport"
 msgstr ""
 
-#: src/pages/OutputFeedRow.tsx:182
-#: src/pages/OutputFeedRow.tsx:189
+#: src/pages/OutputFeedRow.tsx:255
+#: src/pages/OutputFeedRow.tsx:262
 msgid "Follow"
 msgstr ""
 
-#: src/pages/OutputFeedRow.tsx:187
+#: src/pages/OutputFeedRow.tsx:260
 msgid "Follow ({id})"
 msgstr ""
 
-#: src/pages/OutputFeedRow.tsx:184
+#: src/pages/OutputFeedRow.tsx:257
 msgid "Follow (preview source)"
 msgstr ""
 
-#: src/pages/OutputFeedRow.tsx:183
+#: src/pages/OutputFeedRow.tsx:256
 msgid "Follow (program mix)"
 msgstr ""
 
@@ -4953,7 +4965,7 @@ msgstr ""
 msgid "Gaps must be whole pixel counts (0 or more)."
 msgstr ""
 
-#: src/pages/OutputFeedRow.tsx:211
+#: src/pages/OutputFeedRow.tsx:284
 msgid "Generators"
 msgstr ""
 
@@ -5261,7 +5273,7 @@ msgstr ""
 msgid "HH:MM:SS:FF (with frames)"
 msgstr ""
 
-#: src/pages/OutputFeedRow.tsx:206
+#: src/pages/OutputFeedRow.tsx:279
 msgid "Hidden"
 msgstr ""
 
@@ -7819,7 +7831,7 @@ msgstr ""
 msgid "on {0}"
 msgstr ""
 
-#: src/pages/OutputFeedRow.tsx:255
+#: src/pages/OutputFeedRow.tsx:328
 msgid "on air"
 msgstr ""
 
@@ -8252,7 +8264,7 @@ msgstr ""
 #: src/pages/AudioPage.tsx:477
 #: src/pages/graphics/PlayoutView.tsx:240
 #: src/pages/graphics/PlayoutView.tsx:402
-#: src/pages/OutputFeedRow.tsx:200
+#: src/pages/OutputFeedRow.tsx:273
 msgid "PGM"
 msgstr ""
 
@@ -8338,11 +8350,11 @@ msgstr ""
 msgid "Plan a source → {0}"
 msgstr ""
 
-#: src/pages/OutputFeedRow.tsx:137
+#: src/pages/OutputFeedRow.tsx:199
 msgid "Plan failed"
 msgstr ""
 
-#: src/pages/OutputFeedRow.tsx:121
+#: src/pages/OutputFeedRow.tsx:183
 msgid "Plan this feed first"
 msgstr ""
 
@@ -8356,14 +8368,6 @@ msgstr ""
 msgid "Plan: {0} → {1}"
 msgstr ""
 
-#: src/pages/OutputFeedRow.tsx:268
-msgid "Plan: {costLine}"
-msgstr ""
-
-#: src/pages/OutputFeedRow.tsx:270
-msgid "Plan: {costLine} ({sessions} encoder sessions)"
-msgstr ""
-
 #: src/pages/approved/ShowPage.tsx:91
 msgid "Planned"
 msgstr ""
@@ -8372,7 +8376,7 @@ msgstr ""
 msgid "Planned cue in"
 msgstr ""
 
-#: src/pages/OutputFeedRow.tsx:260
+#: src/pages/OutputFeedRow.tsx:333
 msgid "Planning…"
 msgstr ""
 
@@ -8411,7 +8415,7 @@ msgstr ""
 msgid "Player"
 msgstr ""
 
-#: src/pages/OutputFeedRow.tsx:210
+#: src/pages/OutputFeedRow.tsx:283
 msgid "Players"
 msgstr ""
 
@@ -8476,7 +8480,7 @@ msgid "preview"
 msgstr ""
 
 #: src/layout/components/GridLayoutEditor.tsx:552
-#: src/pages/OutputFeedRow.tsx:109
+#: src/pages/OutputFeedRow.tsx:164
 #: src/preview/SourcePreviewButton.tsx:16
 msgid "Preview"
 msgstr ""
@@ -8631,7 +8635,7 @@ msgstr ""
 msgid "PROGRAM"
 msgstr ""
 
-#: src/pages/OutputFeedRow.tsx:106
+#: src/pages/OutputFeedRow.tsx:161
 msgid "Program (follows the switcher)"
 msgstr ""
 
@@ -8790,7 +8794,7 @@ msgstr ""
 
 #: src/pages/graphics/PlayoutView.tsx:234
 #: src/pages/graphics/PlayoutView.tsx:403
-#: src/pages/OutputFeedRow.tsx:201
+#: src/pages/OutputFeedRow.tsx:274
 msgid "PVW"
 msgstr ""
 
@@ -10129,7 +10133,7 @@ msgstr ""
 #: src/layout/components/SourcePalette.tsx:203
 #: src/pages/docs/ConfigPage.tsx:141
 #: src/pages/docs/FeaturesPage.tsx:38
-#: src/pages/OutputFeedRow.tsx:212
+#: src/pages/OutputFeedRow.tsx:285
 msgid "Sources"
 msgstr "المصادر"
 
@@ -10615,7 +10619,7 @@ msgstr ""
 msgid "Tags"
 msgstr ""
 
-#: src/pages/OutputFeedRow.tsx:282
+#: src/pages/OutputFeedRow.tsx:355
 #: src/pages/RoutingPage.tsx:632
 #: src/pages/SalvosPage.tsx:269
 msgid "Take"
@@ -10633,11 +10637,11 @@ msgstr ""
 msgid "Take exit"
 msgstr ""
 
-#: src/pages/OutputFeedRow.tsx:157
+#: src/pages/OutputFeedRow.tsx:221
 msgid "Take failed"
 msgstr ""
 
-#: src/pages/OutputFeedRow.tsx:280
+#: src/pages/OutputFeedRow.tsx:353
 msgid "Take feed to {outputName}"
 msgstr ""
 
@@ -10649,7 +10653,7 @@ msgstr ""
 msgid "Take next"
 msgstr ""
 
-#: src/pages/OutputFeedRow.tsx:255
+#: src/pages/OutputFeedRow.tsx:328
 msgid "take pending"
 msgstr ""
 
@@ -10666,7 +10670,7 @@ msgstr ""
 msgid "Take vamp exit on {0}"
 msgstr ""
 
-#: src/pages/OutputFeedRow.tsx:311
+#: src/pages/OutputFeedRow.tsx:384
 msgid "Takes are locked and {outputName} currently carries Program. Confirm to change its feed."
 msgstr ""
 
@@ -11500,7 +11504,7 @@ msgstr ""
 msgid "This machine is not claimed to an owner yet."
 msgstr ""
 
-#: src/pages/OutputFeedRow.tsx:125
+#: src/pages/OutputFeedRow.tsx:187
 msgid "This output already carries this feed"
 msgstr ""
 
@@ -11918,7 +11922,7 @@ msgstr ""
 #: src/pages/approved/RoutingSurface.tsx:44
 #: src/pages/approved/SourcesSurface.tsx:326
 #: src/pages/MediaPlayersPage.tsx:355
-#: src/pages/OutputFeedRow.tsx:199
+#: src/pages/OutputFeedRow.tsx:272
 msgid "Unknown"
 msgstr ""
 
@@ -12155,7 +12159,7 @@ msgid "Very low (~1 frame)"
 msgstr ""
 
 #: src/components/broadcast/library/Chips.tsx:139
-#: src/pages/OutputFeedRow.tsx:219
+#: src/pages/OutputFeedRow.tsx:292
 msgid "Video"
 msgstr ""
 
@@ -12163,7 +12167,7 @@ msgstr ""
 msgid "Video cells"
 msgstr ""
 
-#: src/pages/OutputFeedRow.tsx:226
+#: src/pages/OutputFeedRow.tsx:299
 msgid "Video feed for {outputName}"
 msgstr ""
 
