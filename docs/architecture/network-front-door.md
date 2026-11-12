@@ -868,8 +868,14 @@ the engine's own TLS. The str0m ICE-TCP consumer and the browser ladder are PR2 
   Inbound: one lane queue of 1024, `try_send`, full drops and counts. Outbound:
   `IceTcpSender::send` never blocks; per connection at most 256 frames **and 256 KiB** (drop-oldest;
   the byte cap is an addition: 256 maximum-size frames would otherwise pin 16 MiB per connection);
-  a write stalled 5 s, or a queue overflowing continuously for 5 s, closes the connection
-  (`ice_tcp_closed_stuck`). 30 s without an inbound frame closes. `IceTcpSender::close(peer)` drops a
+  the connection's **writer** closes a stuck peer (`ice_tcp_closed_stuck`), measuring progress
+  against wall time so a peer trickling ACKs cannot keep its slot: (a) each frame must be written
+  completely within the write timeout (5 s) of its write starting, never reset by partial writes;
+  (b) after every pop the writer checks the queue against its high-water mark (half the cap: 128
+  frames or 128 KiB) and closes once it has stayed at or over it for the write timeout
+  (`backlogged_since`, cleared only when the queue drops below). `send` never closes or waits.
+  The first frame's STUN attribute list is walked to the end (header, value and padding must fit)
+  before the `USERNAME` is accepted. 30 s without an inbound frame closes. `IceTcpSender::close(peer)` drops a
   connection.
 * **Redirect**: `[bind]:http_redirect_port`, own caps (256 global, 16 per source), 5 s total per
   connection, at most 8 KiB read for the request line; `301` to `https://<public_host>[:port]<path>`
@@ -883,10 +889,17 @@ the engine's own TLS. The str0m ICE-TCP consumer and the browser ladder are PR2 
 * **Tests**: unit and property tests for the first-byte classifier (all 256 bytes, all lengths), the
   PROXY v2 parser and the RFC 4571 deframer; `tests/tcp_door.rs` (TLS h1 and ICE-TCP on one port over
   IPv4 and IPv6, the ICE-TCP gates and probation, `behind_proxy` fail-closed and header address, the
-  redirect, the deadlines, the per-source cap, a stuck reader); `tests/tcp_chaos.rs` (connect flood,
-  first-byte and TLS slowloris, half-open TLS, stuck ICE-TCP readers, oversized and garbage frames
-  against the real tick loop: cadence, lateness bounds, the connection cap, RSS and fd count back to
-  baseline).
+  redirect, the deadlines, the per-source cap, a stuck reader, a trickling reader closed within 3x
+  the write timeout); `tests/tcp_chaos.rs` (connect flood, first-byte and TLS slowloris, half-open
+  TLS, stuck ICE-TCP readers, oversized and garbage frames against the real tick loop). The attacker
+  runs in-process, so the chaos test compares like with like (the `chaos_flood.rs` pattern): three
+  runs, `idle` (door up, no attack), `attack_door_on` and `attack_door_off` (the door shut down, the
+  same port served by a trivial `TcpListener` on its own 2-worker runtime that reads and discards
+  with a 5 s deadline), the same attack paced to `FRONTDOOR_TCP_CHAOS_CPS` (default 2000) connection
+  attempts/s. Asserted: tick counts within 2 of elapsed/period in every run, idle without repeats,
+  door-on repeats at most door-off + 1, door-on p99 within 4 ms of the worse of door-off and idle,
+  door-on worst tick within one period of theirs; and the door's own bounds: the connection cap,
+  RSS growth, fd count back to baseline, every defence counter (stuck writers included) fired.
 * **Deferred**: the ACME `ChallengeResolver` wiring into `TlsRouting.acme` (whichever of #290/#291
   lands second; TODO in `multiview-cli/src/frontdoor.rs`); the str0m ICE-TCP consumer, passive TCP
   candidates in the SDP and the browser ladder (PR2 of this slice); systemd socket activation

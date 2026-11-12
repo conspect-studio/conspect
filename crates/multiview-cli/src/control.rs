@@ -132,7 +132,9 @@ pub async fn bind_and_serve<F>(
 where
     F: Future<Output = ()> + Send + 'static,
 {
-    bind_and_serve_with_moq(
+    // Boxed so a caller's future does not embed this large state machine
+    // (clippy::large_futures, 16 KiB threshold).
+    Box::pin(bind_and_serve_with_moq(
         listen,
         config,
         publisher,
@@ -155,7 +157,7 @@ where
         None,
         None,
         shutdown,
-    )
+    ))
     .await
 }
 

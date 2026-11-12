@@ -2,24 +2,36 @@
 //! door while the REAL engine tick loop (`EngineRuntime` + `RealtimePacer`)
 //! runs on a separate program runtime.
 //!
-//! Two runs, same door: `idle` (TCP door up, no attack) and `attack`: an
-//! accept/connect flood from many loopback sources (most connections idle, a
-//! first-byte slowloris), TLS slowloris (`0x16` then stall), half-open TLS (a
-//! full `ClientHello` then nothing), stuck ICE-TCP readers (never read while
-//! the consumer pushes megabytes at them), oversized probation frames and
-//! garbage first bytes.
+//! The attacker runs in-process, so its CPU competes with the clock; the test
+//! therefore compares like with like (the `chaos_flood.rs` pattern, #321,
+//! #284). Three runs, the same paced attack generator in two of them:
+//! * `idle`: the TCP door up, no attack;
+//! * `attack_door_on`: the attack against the TCP door: an accept/connect
+//!   flood from many loopback sources (most connections idle, a first-byte
+//!   slowloris), TLS slowloris (`0x16` then stall), half-open TLS (a full
+//!   `ClientHello` then nothing), stuck ICE-TCP readers (never read while the
+//!   consumer pushes megabytes at them), oversized probation frames and
+//!   garbage first bytes;
+//! * `attack_door_off`: the door shut down and the same port served by a
+//!   trivial baseline (a plain `TcpListener` on its own 2-worker runtime that
+//!   reads and discards each connection with a 5 s deadline), the same attack.
 //!
-//! Asserted (counts and design bounds, not tight percentiles; #321):
-//! * cadence: each run emits `elapsed / period` ticks within 2, no repeats;
-//! * lateness under attack: p99 no worse than idle by more than
-//!   [`P99_BOUND_NS`], worst tick no worse by more than one period;
+//! The attack is paced to `FRONTDOOR_TCP_CHAOS_CPS` connection attempts per
+//! second in total (default 2000: far above the 512 cap's turnover, so every
+//! attack kind runs and the held population stays far above the cap).
+//!
+//! Asserted (counts and design bounds, not tight percentiles):
+//! * cadence: each run emits `elapsed / period` ticks within 2; `idle` has no
+//!   repeats and the door-on run at most one more than the door-off run;
+//! * lateness: door-on p99 no worse than the worse of door-off and idle by
+//!   more than [`P99_BOUND_NS`], worst tick no worse by more than one period;
 //! * the door's `open_connections` gauge never exceeds `max_connections`;
-//! * RSS growth during the attack stays under [`RSS_BOUND_KB`];
+//! * RSS growth during the door-on attack stays under [`RSS_BOUND_KB`];
 //! * Linux: the process fd count returns to its baseline (+ slack) after the
-//!   attack stops (every refused / timed-out connection was really closed).
+//!   attack stops (every refused / timed-out connection was really closed);
+//! * every door defence fired, stuck ICE-TCP writers included.
 //!
-//! Duration per run: `FRONTDOOR_TCP_CHAOS_SECS` (default 4 s), sized for a
-//! 2-core CI runner together with the attack threads.
+//! Duration per run: `FRONTDOOR_TCP_CHAOS_SECS` (default 4 s).
 #![allow(
     clippy::unwrap_used,
     clippy::expect_used,
@@ -45,19 +57,29 @@ use std::time::Duration;
 use clock::{rss_kb, run_clock, ClockRun, FPS};
 use common::{binding_request, frame, site_config, FixedSite};
 use multiview_frontdoor::{FrontDoor, FrontDoorConfig, SiteService, TcpDoorConfig, TlsRouting};
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpSocket;
 
 const P99_BOUND_NS: i64 = 4_000_000;
 const RSS_BOUND_KB: u64 = 64 * 1024;
 const MAX_CONNECTIONS: usize = 512;
 const FD_SLACK: usize = 32;
+/// Attack tasks: six kinds x four lanes.
+const ATTACK_TASKS: u64 = 24;
 
 fn secs() -> u64 {
     std::env::var("FRONTDOOR_TCP_CHAOS_SECS")
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(4)
+}
+
+fn cps() -> u64 {
+    std::env::var("FRONTDOOR_TCP_CHAOS_CPS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .filter(|&v: &u64| v > 0)
+        .unwrap_or(2000)
 }
 
 fn fd_count() -> Option<usize> {
@@ -77,12 +99,11 @@ fn report(name: &str, r: &ClockRun) {
     );
 }
 
-fn assert_cadence(name: &str, r: &ClockRun) {
+fn assert_ticks(name: &str, r: &ClockRun) {
     assert!(
         r.ticks + 2 >= r.expected && r.ticks <= r.expected + 2,
         "{name}: one frame per tick: {r:?}"
     );
-    assert_eq!(r.repeats, 0, "{name}: no tick fell behind compose: {r:?}");
 }
 
 /// A raw TLS 1.3 `ClientHello` (bytes only; never completed).
@@ -127,7 +148,7 @@ struct Attack {
     rt: tokio::runtime::Runtime,
 }
 
-fn start_attack(target: SocketAddr) -> Attack {
+fn start_attack(target: SocketAddr, cps: u64) -> Attack {
     let stop = Arc::new(AtomicBool::new(false));
     let connects = Arc::new(AtomicU64::new(0));
     let rt = tokio::runtime::Builder::new_multi_thread()
@@ -137,6 +158,8 @@ fn start_attack(target: SocketAddr) -> Attack {
         .build()
         .unwrap();
     let hello = Arc::new(client_hello());
+    // Each task paces its own attempts so the total is `cps` per second.
+    let per_task = Duration::from_micros(1_000_000 * ATTACK_TASKS / cps);
     for kind in 0..6u8 {
         for lane in 0..4u8 {
             let stop = Arc::clone(&stop);
@@ -145,7 +168,10 @@ fn start_attack(target: SocketAddr) -> Attack {
             rt.spawn(async move {
                 let mut n = 0u32;
                 let mut held = std::collections::VecDeque::new();
+                let mut pace = tokio::time::interval(per_task);
+                pace.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
                 while !stop.load(Ordering::Relaxed) {
+                    pace.tick().await;
                     n = n.wrapping_add(1);
                     let src = 2 + u8::try_from(
                         (u32::from(kind) * 40 + u32::from(lane) * 10 + n % 10) % 250,
@@ -153,7 +179,6 @@ fn start_attack(target: SocketAddr) -> Attack {
                     .unwrap();
                     let rcvbuf = (kind == 3).then_some(4096);
                     let Some(mut s) = connect_from(src, target, rcvbuf).await else {
-                        tokio::time::sleep(Duration::from_millis(5)).await;
                         continue;
                     };
                     connects.fetch_add(1, Ordering::Relaxed);
@@ -182,14 +207,63 @@ fn start_attack(target: SocketAddr) -> Attack {
                     if held.len() > 256 {
                         held.pop_front();
                     }
-                    if n % 8 == 0 {
-                        tokio::time::sleep(Duration::from_millis(5)).await;
-                    }
                 }
             });
         }
     }
     Attack { stop, connects, rt }
+}
+
+impl Attack {
+    /// Stop, tear down, and return the number of connects.
+    fn stop(self) -> u64 {
+        self.stop.store(true, Ordering::Relaxed);
+        let connects = self.connects.load(Ordering::Relaxed);
+        self.rt.shutdown_timeout(Duration::from_secs(2));
+        connects
+    }
+}
+
+/// The door-off baseline: a dumb server on `port` with its own 2-worker
+/// runtime, reading and discarding each connection with a 5 s deadline.
+struct Baseline {
+    rt: tokio::runtime::Runtime,
+    accepted: Arc<AtomicU64>,
+}
+
+fn start_baseline(port: u16) -> Baseline {
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .thread_name("baseline")
+        .enable_all()
+        .build()
+        .unwrap();
+    let accepted = Arc::new(AtomicU64::new(0));
+    let listener = rt.block_on(async {
+        let sock = TcpSocket::new_v6().unwrap();
+        sock.set_reuseaddr(true).unwrap();
+        // `[::]` is dual-stack on Linux and macOS by default (bindv6only=0).
+        sock.bind(SocketAddr::new("::".parse().unwrap(), port))
+            .unwrap();
+        sock.listen(1024).unwrap()
+    });
+    let count = Arc::clone(&accepted);
+    rt.spawn(async move {
+        loop {
+            let Ok((mut s, _)) = listener.accept().await else {
+                continue;
+            };
+            count.fetch_add(1, Ordering::Relaxed);
+            tokio::spawn(async move {
+                let mut buf = [0u8; 4096];
+                let _ = tokio::time::timeout(Duration::from_secs(5), async {
+                    while matches!(s.read(&mut buf).await, Ok(n) if n > 0) {}
+                })
+                .await;
+            });
+        }
+    });
+    Baseline { rt, accepted }
 }
 
 #[test]
@@ -250,13 +324,16 @@ fn tcp_attack_does_not_slip_the_output_clock_and_stays_bounded() {
     });
     let stats = door.stats();
 
-    // 1. Idle.
+    let cps = cps();
+    let port = addr.port();
+
+    // 1. Idle: door up, no attack.
     let idle = run_clock(duration);
     report("idle", &idle);
     let fds_before = fd_count();
     let rss_before = rss_kb();
 
-    // 2. Attack.
+    // 2. Attack, door on.
     let max_open = Arc::new(AtomicU64::new(0));
     let sampling = Arc::new(AtomicBool::new(true));
     let sampler = {
@@ -271,16 +348,14 @@ fn tcp_attack_does_not_slip_the_output_clock_and_stays_bounded() {
             }
         })
     };
-    let attack = start_attack(target);
+    let attack = start_attack(target, cps);
     std::thread::sleep(Duration::from_secs(1));
     let on = run_clock(duration);
-    attack.stop.store(true, Ordering::Relaxed);
-    let connects = attack.connects.load(Ordering::Relaxed);
-    attack.rt.shutdown_timeout(Duration::from_secs(2));
+    let connects_on = attack.stop();
     let rss_after = rss_kb();
-    report("attack", &on);
+    report("attack_door_on", &on);
 
-    // 3. After the attack: every connection closes (deadlines, stuck close).
+    // After the attack: every connection closes (deadlines, stuck close).
     let mut fds_after = fd_count();
     if let Some(before) = fds_before {
         for _ in 0..100 {
@@ -291,35 +366,80 @@ fn tcp_attack_does_not_slip_the_output_clock_and_stays_bounded() {
             fds_after = fd_count();
         }
     }
+    for _ in 0..100 {
+        if stats.tcp_open_connections.load(Ordering::Relaxed) == 0 {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
     sampling.store(false, Ordering::Relaxed);
     sampler.join().unwrap();
     let snap = stats.snapshot();
     eprintln!(
-        "tcp chaos: {connects} connects, max open {} (cap {MAX_CONNECTIONS}), rss {rss_before} -> {rss_after} kB, fds {fds_before:?} -> {fds_after:?}, door {snap:?}",
+        "tcp chaos door on: {connects_on} connects ({cps} cps paced), max open {} (cap {MAX_CONNECTIONS}), rss {rss_before} -> {rss_after} kB, fds {fds_before:?} -> {fds_after:?}, door {snap:?}",
         max_open.load(Ordering::Relaxed)
     );
+    door.shutdown_blocking();
 
-    assert_cadence("idle", &idle);
-    assert_cadence("attack", &on);
-    assert!(
-        on.p99_ns <= idle.p99_ns + P99_BOUND_NS,
-        "p99 under attack {:.3} ms vs idle {:.3} ms",
-        on.p99_ns as f64 / 1e6,
-        idle.p99_ns as f64 / 1e6
+    // 3. Attack, door off: the same port served by the dumb baseline.
+    let baseline = start_baseline(port);
+    let attack = start_attack(target, cps);
+    std::thread::sleep(Duration::from_secs(1));
+    let off = run_clock(duration);
+    let connects_off = attack.stop();
+    report("attack_door_off", &off);
+    eprintln!(
+        "tcp chaos door off: {connects_off} connects, baseline accepted {}",
+        baseline.accepted.load(Ordering::Relaxed)
+    );
+    baseline.rt.shutdown_timeout(Duration::from_secs(2));
+
+    for (name, r) in [
+        ("idle", &idle),
+        ("attack_door_on", &on),
+        ("attack_door_off", &off),
+    ] {
+        assert_ticks(name, r);
+    }
+    assert_eq!(
+        idle.repeats, 0,
+        "idle: no tick fell behind compose: {idle:?}"
     );
     assert!(
-        on.max_ns <= idle.max_ns + period_ns,
-        "worst tick under attack more than a period worse: {on:?} vs {idle:?}"
+        on.repeats <= off.repeats + 1,
+        "repeats with the door on ({}) exceed door off ({}) by more than 1",
+        on.repeats,
+        off.repeats
+    );
+    assert!(
+        on.p99_ns <= off.p99_ns.max(idle.p99_ns) + P99_BOUND_NS,
+        "p99 with the door on ({:.3} ms) exceeds max(door off {:.3} ms, idle {:.3} ms) by more than {} ms",
+        on.p99_ns as f64 / 1e6,
+        off.p99_ns as f64 / 1e6,
+        idle.p99_ns as f64 / 1e6,
+        P99_BOUND_NS / 1_000_000
+    );
+    assert!(
+        on.max_ns <= off.max_ns.max(idle.max_ns) + period_ns,
+        "worst tick with the door on is more than a period worse: on {on:?} off {off:?} idle {idle:?}"
     );
     assert!(
         max_open.load(Ordering::Relaxed) <= MAX_CONNECTIONS as u64,
         "open connections exceeded the cap"
     );
-    assert!(connects > 1000, "the attack really ran: {connects}");
+    assert!(connects_on > 1000, "the attack really ran: {connects_on}");
+    assert!(
+        connects_off > 1000,
+        "the baseline attack really ran: {connects_off}"
+    );
     assert!(snap.tcp_first_byte_timeout > 0, "{snap:?}");
     assert!(snap.tcp_tls_handshake_timeout > 0, "{snap:?}");
     assert!(snap.tcp_classified_close > 0, "{snap:?}");
     assert!(snap.ice_tcp_rejected > 0, "{snap:?}");
+    assert!(
+        snap.ice_tcp_closed_stuck > 0,
+        "stuck writers closed: {snap:?}"
+    );
     assert!(
         rss_after.saturating_sub(rss_before) < RSS_BOUND_KB,
         "RSS grew {rss_before} -> {rss_after} kB"
@@ -331,5 +451,4 @@ fn tcp_attack_does_not_slip_the_output_clock_and_stays_bounded() {
         );
     }
     assert_eq!(snap.tcp_open_connections, 0, "{snap:?}");
-    door.shutdown_blocking();
 }

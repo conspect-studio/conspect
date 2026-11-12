@@ -15,14 +15,15 @@
 //! full = drop and count), one per-connection out queue ([`OUT_QUEUE`] frames
 //! and [`OUT_QUEUE_BYTES`] bytes, drop-oldest; the lock is held only for
 //! push/pop, never across an await), a read buffer of at most one frame, and
-//! the table capped by the door's connection cap. Nothing a producer calls ever waits on a peer: a stuck peer
-//! is closed by its own writer task.
+//! the table capped by the door's connection cap. Nothing a producer calls
+//! ever waits on a peer: a stuck peer is closed by its own writer task, which
+//! measures progress against wall time (see [`IceTcpSender::send`]).
 
 use std::collections::{HashMap, VecDeque};
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use tokio::net::TcpStream;
@@ -89,7 +90,9 @@ pub enum FirstFrameError {
 
 /// Check that `frame` is structurally a STUN Binding Request (RFC 8489):
 /// type `0x0001`, the magic cookie, a message length covering exactly the
-/// frame, and a `USERNAME` attribute containing `:`. Returns the username.
+/// frame, a well-formed attribute list (every attribute's header, value and
+/// 4-byte padding fit, walked to the end) and a `USERNAME` attribute
+/// containing `:`. Returns the username only after the whole walk.
 ///
 /// # Errors
 /// A [`FirstFrameError`].
@@ -106,25 +109,31 @@ pub fn binding_request_username(frame: &[u8]) -> Result<&str, FirstFrameError> {
         return Err(FirstFrameError::NotBindingRequest);
     }
     let mut attrs = frame.get(20..).ok_or(FirstFrameError::Malformed)?;
+    let mut username: Option<&[u8]> = None;
     while !attrs.is_empty() {
         let Some(&[a0, a1, b0, b1]) = attrs.get(..4) else {
             return Err(FirstFrameError::Malformed);
         };
         let kind = u16::from_be_bytes([a0, a1]);
         let len = usize::from(u16::from_be_bytes([b0, b1]));
-        let value = attrs.get(4..4 + len).ok_or(FirstFrameError::Malformed)?;
-        if kind == ATTR_USERNAME {
-            let name = std::str::from_utf8(value).map_err(|_| FirstFrameError::NoUsername)?;
-            return if name.contains(':') {
-                Ok(name)
-            } else {
-                Err(FirstFrameError::NoUsername)
-            };
-        }
         let padded = (len + 3) & !3;
+        // Header, value and padding must all fit in the frame.
+        if attrs.len() < 4 + padded {
+            return Err(FirstFrameError::Malformed);
+        }
+        let value = attrs.get(4..4 + len).ok_or(FirstFrameError::Malformed)?;
+        if kind == ATTR_USERNAME && username.is_none() {
+            username = Some(value);
+        }
         attrs = attrs.get(4 + padded..).ok_or(FirstFrameError::Malformed)?;
     }
-    Err(FirstFrameError::NoUsername)
+    let value = username.ok_or(FirstFrameError::NoUsername)?;
+    let name = std::str::from_utf8(value).map_err(|_| FirstFrameError::NoUsername)?;
+    if name.contains(':') {
+        Ok(name)
+    } else {
+        Err(FirstFrameError::NoUsername)
+    }
 }
 
 /// Why the deframer refused the stream.
@@ -228,7 +237,6 @@ pub(crate) struct IceTcpTiming {
 struct OutState {
     frames: VecDeque<Vec<u8>>,
     bytes: usize,
-    overflow_since: Option<Instant>,
 }
 
 impl OutState {
@@ -236,6 +244,11 @@ impl OutState {
         let frame = self.frames.pop_front()?;
         self.bytes = self.bytes.saturating_sub(frame.len());
         Some(frame)
+    }
+
+    /// At or over the high-water mark: half the queue, in frames or bytes.
+    fn backlogged(&self) -> bool {
+        self.frames.len() >= OUT_QUEUE / 2 || self.bytes >= OUT_QUEUE_BYTES / 2
     }
 }
 
@@ -340,8 +353,12 @@ impl std::fmt::Debug for IceTcpSender {
 
 impl IceTcpSender {
     /// Queue one frame to `peer`. Never blocks: a full queue drops its oldest
-    /// frame. A peer whose queue has overflowed continuously for the write
-    /// timeout is closed as stuck.
+    /// frame. The connection's writer closes a stuck peer
+    /// (`ice_tcp_closed_stuck`) when a frame is not written completely within
+    /// the write timeout of its write starting, or when the queue stays at or
+    /// over its high-water mark (half of [`OUT_QUEUE`] frames or
+    /// [`OUT_QUEUE_BYTES`] bytes) for the write timeout — a peer trickling
+    /// ACKs cannot hold its slot by draining a few bytes at a time.
     #[must_use]
     pub fn send(&self, peer: SocketAddr, payload: &[u8]) -> SendOutcome {
         if payload.len() > MAX_FRAME || payload.is_empty() {
@@ -354,8 +371,7 @@ impl IceTcpSender {
         let mut frame = Vec::with_capacity(payload.len() + 2);
         frame.extend_from_slice(&len.to_be_bytes());
         frame.extend_from_slice(payload);
-        let now = Instant::now();
-        let (outcome, stuck) = {
+        let outcome = {
             let mut out = conn
                 .out
                 .lock()
@@ -369,13 +385,9 @@ impl IceTcpSender {
                 dropped = true;
             }
             let outcome = if dropped {
-                let since = *out.overflow_since.get_or_insert(now);
-                (
-                    SendOutcome::DroppedOldest,
-                    now.duration_since(since) >= conn.write_timeout,
-                )
+                SendOutcome::DroppedOldest
             } else {
-                (SendOutcome::Queued, false)
+                SendOutcome::Queued
             };
             out.bytes += frame.len();
             out.frames.push_back(frame);
@@ -383,10 +395,6 @@ impl IceTcpSender {
         };
         conn.answered.store(true, Ordering::Release);
         conn.ready.notify_one();
-        if stuck {
-            Stats::bump(&self.shared.stats.ice_tcp_closed_stuck);
-            conn.close();
-        }
         outcome
     }
 
@@ -664,24 +672,39 @@ async fn read_loop(
     }
 }
 
+/// The writer: drains the out queue to the socket and closes a stuck peer.
+///
+/// Progress is measured against wall time, never reset by partial progress:
+/// (a) each frame must be written completely within `write_timeout` of its
+/// write starting; (b) the queue may stay at or over its high-water mark
+/// ([`OutState::backlogged`], checked after every pop) for at most
+/// `write_timeout` (`backlogged_since` is cleared only when it drops below).
 async fn write_loop(
     conn: Arc<Conn>,
     mut writer: tokio::net::tcp::OwnedWriteHalf,
     mut close: watch::Receiver<bool>,
     stats: Arc<Stats>,
 ) {
+    let mut backlogged_since: Option<tokio::time::Instant> = None;
     loop {
-        let next = {
+        let (next, backlogged) = {
             let mut out = conn
                 .out
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             let next = out.pop();
-            if out.frames.len() < OUT_QUEUE / 2 && out.bytes < OUT_QUEUE_BYTES / 2 {
-                out.overflow_since = None;
-            }
-            next
+            (next, out.backlogged())
         };
+        let now = tokio::time::Instant::now();
+        if backlogged {
+            let since = *backlogged_since.get_or_insert(now);
+            if now.duration_since(since) >= conn.write_timeout {
+                Stats::bump(&stats.ice_tcp_closed_stuck);
+                break;
+            }
+        } else {
+            backlogged_since = None;
+        }
         let Some(frame) = next else {
             tokio::select! {
                 biased;
@@ -689,10 +712,15 @@ async fn write_loop(
                 () = conn.ready.notified() => continue,
             }
         };
+        // The earlier of the frame's own deadline and the backlog's.
+        let mut deadline = now + conn.write_timeout;
+        if let Some(since) = backlogged_since {
+            deadline = deadline.min(since + conn.write_timeout);
+        }
         let write = tokio::select! {
             biased;
             _ = close.wait_for(|c| *c) => break,
-            w = tokio::time::timeout(conn.write_timeout, writer.write_all(&frame)) => w,
+            w = tokio::time::timeout_at(deadline, writer.write_all(&frame)) => w,
         };
         match write {
             Ok(Ok(())) => {}
@@ -760,6 +788,59 @@ mod tests {
         bad_len[22..24].copy_from_slice(&[0xff, 0xff]);
         assert_eq!(
             binding_request_username(&bad_len),
+            Err(FirstFrameError::Malformed)
+        );
+    }
+
+    /// A Binding Request: `binding_request(username)` followed by `extra`
+    /// attribute bytes, the header length rewritten to cover the frame.
+    fn with_trailing(username: &str, extra: &[u8]) -> Vec<u8> {
+        let mut m = binding_request(username);
+        m.extend_from_slice(extra);
+        let body = u16::try_from(m.len() - 20).unwrap();
+        m[2..4].copy_from_slice(&body.to_be_bytes());
+        m
+    }
+
+    #[test]
+    fn first_frame_walks_every_attribute() {
+        // A well-formed attribute after USERNAME is fine.
+        let ok = with_trailing(
+            "abcd:efgh",
+            &[0x80, 0x29, 0x00, 0x08, 1, 2, 3, 4, 5, 6, 7, 8],
+        );
+        assert_eq!(binding_request_username(&ok), Ok("abcd:efgh"));
+        // An attribute after USERNAME whose length overruns the frame.
+        let overrun = with_trailing("abcd:efgh", &[0x80, 0x29, 0x00, 0x40, 1, 2, 3, 4]);
+        assert_eq!(
+            binding_request_username(&overrun),
+            Err(FirstFrameError::Malformed)
+        );
+        // A mis-padded attribute after USERNAME: SOFTWARE with a 1-byte value
+        // and no padding, directly followed by the next attribute. The walk
+        // skips value + padding (4 bytes), lands mid-attribute and finds a
+        // header whose length overruns the frame.
+        let mispadded = with_trailing(
+            "abcd:efgh",
+            &[
+                0x80, 0x22, 0x00, 0x01, b'a', 0x80, 0x23, 0x00, 0x03, b'x', b'y', b'z',
+            ],
+        );
+        assert_eq!(mispadded.len() % 4, 0);
+        assert_eq!(
+            binding_request_username(&mispadded),
+            Err(FirstFrameError::Malformed)
+        );
+        // The same malformed tail BEFORE the USERNAME is malformed too (no
+        // username is returned from a list that does not parse).
+        let mut m = vec![0x00, 0x01, 0, 0, 0x21, 0x12, 0xA4, 0x42];
+        m.extend_from_slice(&[7; 12]);
+        m.extend_from_slice(&[0x80, 0x29, 0x00, 0x40, 1, 2, 3, 4]);
+        m.extend_from_slice(&[0x00, 0x06, 0x00, 0x03, b'a', b':', b'b', 0]);
+        let body = u16::try_from(m.len() - 20).unwrap();
+        m[2..4].copy_from_slice(&body.to_be_bytes());
+        assert_eq!(
+            binding_request_username(&m),
             Err(FirstFrameError::Malformed)
         );
     }

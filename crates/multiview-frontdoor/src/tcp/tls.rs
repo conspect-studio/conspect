@@ -150,3 +150,79 @@ pub(crate) fn route_hello(
     }
     HelloRoute::Site
 }
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod tests {
+    use super::*;
+
+    /// Route a real `ClientHello` built by a rustls client with `alpn` and
+    /// server name `name` (an IP literal sends no SNI).
+    fn route(alpn: &[&[u8]], name: &str, turn_sni: Option<&str>) -> HelloRoute {
+        let provider = Arc::new(rustls::crypto::ring::default_provider());
+        let mut cfg = rustls::ClientConfig::builder_with_provider(provider)
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .with_root_certificates(rustls::RootCertStore::empty())
+            .with_no_client_auth();
+        cfg.alpn_protocols = alpn.iter().map(|p| p.to_vec()).collect();
+        let mut client = rustls::ClientConnection::new(
+            Arc::new(cfg),
+            rustls::pki_types::ServerName::try_from(name.to_owned()).unwrap(),
+        )
+        .unwrap();
+        let mut bytes = Vec::new();
+        while client.wants_write() {
+            client.write_tls(&mut bytes).unwrap();
+        }
+        let mut acceptor = rustls::server::Acceptor::default();
+        let mut rd = bytes.as_slice();
+        while !rd.is_empty() {
+            acceptor.read_tls(&mut rd).unwrap();
+        }
+        let accepted = acceptor
+            .accept()
+            .map_err(|(e, _)| e)
+            .unwrap()
+            .expect("a complete ClientHello");
+        route_hello(&accepted.client_hello(), turn_sni)
+    }
+
+    #[test]
+    fn acme_only_when_alpn_is_exactly_acme() {
+        assert_eq!(
+            route(&[ACME_TLS_ALPN], "example.org", None),
+            HelloRoute::Acme
+        );
+        assert_eq!(
+            route(&[ACME_TLS_ALPN, b"http/1.1"], "example.org", None),
+            HelloRoute::Site
+        );
+        assert_eq!(
+            route(&[b"http/1.1", ACME_TLS_ALPN], "example.org", None),
+            HelloRoute::Site
+        );
+        assert_eq!(route(&[b"http/1.1"], "example.org", None), HelloRoute::Site);
+        assert_eq!(route(&[], "example.org", None), HelloRoute::Site);
+    }
+
+    #[test]
+    fn turn_sni_is_reserved_case_insensitively() {
+        let turn = Some("turn.example.org");
+        assert_eq!(
+            route(&[b"http/1.1"], "TURN.Example.ORG", turn),
+            HelloRoute::TurnReserved
+        );
+        assert_eq!(
+            route(&[b"http/1.1"], "turn.example.org", turn),
+            HelloRoute::TurnReserved
+        );
+        assert_eq!(route(&[b"http/1.1"], "example.org", turn), HelloRoute::Site);
+        // No SNI (an IP literal is never sent as SNI): the site.
+        assert_eq!(route(&[b"http/1.1"], "::1", turn), HelloRoute::Site);
+        assert_eq!(
+            route(&[b"http/1.1"], "turn.example.org", None),
+            HelloRoute::Site
+        );
+    }
+}

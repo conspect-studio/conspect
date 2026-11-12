@@ -7,7 +7,8 @@
     clippy::expect_used,
     clippy::panic,
     clippy::indexing_slicing,
-    clippy::too_many_lines
+    clippy::too_many_lines,
+    clippy::print_stderr
 )]
 
 mod common;
@@ -472,6 +473,98 @@ fn stuck_ice_tcp_reader_is_bounded_and_closed() {
     });
     let s = d.fd.stats().snapshot();
     assert!(s.ice_tcp_dropped_out > 0, "{s:?}");
+    assert!(s.ice_tcp_closed_stuck >= 1, "{s:?}");
+    d.fd.shutdown_blocking();
+}
+
+/// A peer that keeps draining a trickle (512 bytes every 50 ms, a tiny
+/// receive buffer) while the consumer pushes 16 KiB frames continuously never
+/// catches up: the writer closes it as stuck within 3 x the write timeout,
+/// even though every write makes some progress (F1, PR #328).
+#[test]
+fn trickling_ice_tcp_reader_is_closed_as_stuck() {
+    trickle_case(16 * 1024);
+}
+
+/// The same trickle with 512-byte frames: every single write completes well
+/// within the write timeout (512 bytes per 50 ms), so only the writer's
+/// backlog rule (queue at or over its high-water mark for the write timeout)
+/// can close it.
+#[test]
+fn trickling_ice_tcp_reader_with_small_frames_is_closed_as_stuck() {
+    trickle_case(512);
+}
+
+fn trickle_case(frame_len: usize) {
+    let write_timeout = Duration::from_millis(300);
+    let mut d = start(TcpDoorConfig {
+        ice_write_timeout: write_timeout,
+        ..fast("[::1]:0")
+    });
+    let mut lane = d.fd.take_ice_tcp_lane().unwrap();
+    let sender = lane.sender();
+    let stats = d.fd.stats();
+    let elapsed = client_rt().block_on(async {
+        let sock = TcpSocket::new_v6().unwrap();
+        sock.set_recv_buffer_size(4096).unwrap();
+        let trickle = sock.connect(d.addr).await.unwrap();
+        let (mut rd, mut wr) = trickle.into_split();
+        wr.write_all(&frame(&binding_request("a:b"))).await.unwrap();
+        let peer = lane.recv().await.unwrap().peer;
+        // The trickle: 512 bytes every 50 ms until EOF or error.
+        let drained = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let reader = tokio::spawn({
+            let drained = Arc::clone(&drained);
+            async move {
+                let mut buf = [0u8; 512];
+                loop {
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                    match rd.read(&mut buf).await {
+                        Ok(0) | Err(_) => return,
+                        Ok(n) => drained.fetch_add(n, Ordering::Relaxed),
+                    };
+                }
+            }
+        });
+        let payload = vec![0x80u8; frame_len];
+        let t = std::time::Instant::now();
+        let mut closed_after = None;
+        while t.elapsed() < Duration::from_secs(5) {
+            if sender.send(peer, &payload) == SendOutcome::NoConnection {
+                closed_after = Some(t.elapsed());
+                break;
+            }
+            if frame_len >= 4096 {
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            } else {
+                tokio::task::yield_now().await;
+            }
+        }
+        // The peer only sees the FIN after draining what the kernel already
+        // buffered, at trickle speed: stop reading instead of waiting for it.
+        reader.abort();
+        let drained = drained.load(Ordering::Relaxed);
+        eprintln!(
+            "trickle ({frame_len} B frames): peer drained {drained} bytes, closed after {closed_after:?}"
+        );
+        assert!(drained > 0, "the trickle really read");
+        drop(wr);
+        closed_after.expect("the trickling peer was closed")
+    });
+    assert!(
+        elapsed <= write_timeout * 3,
+        "closed after {elapsed:?}, bound {:?}",
+        write_timeout * 3
+    );
+    let gone = (0..100).any(|_| {
+        if stats.tcp_open_connections.load(Ordering::Relaxed) == 0 {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+        false
+    });
+    let s = stats.snapshot();
+    assert!(gone, "the open-connections gauge returns to 0: {s:?}");
     assert!(s.ice_tcp_closed_stuck >= 1, "{s:?}");
     d.fd.shutdown_blocking();
 }
