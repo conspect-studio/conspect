@@ -299,6 +299,14 @@ impl Handoff {
         (cut != u64::MAX).then_some(cut)
     }
 
+    /// OLD side, on loop exit: if a handoff was requested and no cut chosen
+    /// yet, the cut is `next` (the first tick OLD did not emit).
+    fn cut_for_outgoing_at_exit(&self, next: u64) {
+        if self.requested.load(Ordering::Acquire) && self.cut().is_none() {
+            self.cut.store(next, Ordering::Release);
+        }
+    }
+
     /// OLD side: choose the cut if requested and not yet chosen; return it.
     fn cut_for_outgoing(&self, next: u64) -> Option<u64> {
         if let Some(cut) = self.cut() {
@@ -774,11 +782,37 @@ impl<P: Pacer> EngineRuntime<P> {
             .is_some_and(|cut| self.clock.next_index() >= cut)
     }
 
+    async fn run_inner<S, E, FS, FE, FC>(
+        &mut self,
+        publisher: &EnginePublisher<S, E>,
+        stop: &StopSignal,
+        max_ticks: Option<u64>,
+        state_of: &mut FS,
+        event_of: &mut FE,
+        control: &mut FC,
+    ) -> crate::Result<RunOutcome>
+    where
+        FS: FnMut(&CompositedFrame) -> S,
+        FE: FnMut(&CompositedFrame) -> Option<E>,
+        FC: FrameControl,
+    {
+        let outcome = self
+            .run_loop(publisher, stop, max_ticks, state_of, event_of, control)
+            .await;
+        // However the loop ended (stop, budget, error), a requested handoff
+        // always gets a cut: the next tick this runtime has not emitted. A
+        // successor waiting on it then starts exactly there instead of waiting
+        // forever for a predecessor that is gone (#311).
+        self.handoff_out
+            .cut_for_outgoing_at_exit(self.clock.next_index());
+        outcome
+    }
+
     #[allow(clippy::too_many_lines)]
     // reason: the protected tick loop reads top to bottom as one unit (pace,
     // cadence-hold repeats, compose, publish) with its handoff and stop exits
     // inline; splitting it would scatter the invariant-#1 reasoning.
-    async fn run_inner<S, E, FS, FE, FC>(
+    async fn run_loop<S, E, FS, FE, FC>(
         &mut self,
         publisher: &EnginePublisher<S, E>,
         stop: &StopSignal,
@@ -910,7 +944,11 @@ impl<P: Pacer> EngineRuntime<P> {
                         // ONE `skip_to`, accepting one bounded discontinuity rather than
                         // unbounded catch-up. `cap_resync_floor` is O(1) and never
                         // composes a tick before its deadline (inv #1) — see its docs.
-                        self.clock.skip_to(self.cap_resync_floor(now, next));
+                        // Never resync past a handoff cut: the successor owns
+                        // every tick from the cut on (#311).
+                        let floor = self.cap_resync_floor(now, next);
+                        let floor = self.handoff_out.cut().map_or(floor, |cut| floor.min(cut));
+                        self.clock.skip_to(floor);
                         break;
                     }
                     // Re-emit last-good under the fresh tick: the held canvas is

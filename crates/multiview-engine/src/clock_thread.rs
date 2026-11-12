@@ -15,7 +15,8 @@
 //!   default 50 µs.
 //! * **macOS / Windows** (and any other target): a portable fallback —
 //!   `std::thread::sleep` until [`SPIN_MARGIN`] before the deadline, then a
-//!   short yielding spin to the deadline. Correct everywhere; precise to the
+//!   short busy spin (never `yield`, which depresses priority on macOS) to the
+//!   deadline. Correct everywhere; precise to the
 //!   platform's sleep granularity plus the spin.
 //!
 //! Every wait is sized from the tick's absolute deadline (`seed + pts_at(n)`,
@@ -41,7 +42,7 @@ use crate::runtime::StopSignal;
 pub const STOP_POLL: Duration = Duration::from_millis(10);
 
 /// Portable fallback only: how long before the deadline the fallback stops
-/// sleeping and spins (yielding) instead. Covers the macOS/Windows sleep
+/// sleeping and busy-spins instead (at most 1.5% of a core at 30 fps). Covers the macOS/Windows sleep
 /// overshoot so the tick is not emitted a whole sleep quantum late.
 pub const SPIN_MARGIN: Duration = Duration::from_micros(500);
 
@@ -122,7 +123,7 @@ fn sleep_step(nanos: i64, _last: bool) {
 }
 
 /// Portable fallback (macOS, Windows, other targets): sleep to [`SPIN_MARGIN`]
-/// before the step end, then yield-spin the rest on the final step.
+/// before the step end, then busy-spin the rest on the final step.
 #[cfg(not(target_os = "linux"))]
 fn sleep_step(nanos: i64, last: bool) {
     let nanos = u64::try_from(nanos.max(0)).unwrap_or(0);
@@ -135,8 +136,13 @@ fn sleep_step(nanos: i64, last: bool) {
     if let Some(sleep) = step.checked_sub(SPIN_MARGIN) {
         std::thread::sleep(sleep);
     }
+    // A pure spin, deliberately NOT `thread::yield_now`: on macOS
+    // `sched_yield` is `swtch_pri`, which depresses the thread's priority for a
+    // whole scheduler quantum (~10 ms), so on a saturated host the clock would
+    // lose its core exactly when its tick is due (seen on CI as ~20 ms mean
+    // lateness and repeats). The spin is bounded by SPIN_MARGIN per tick.
     while start.elapsed() < step {
-        std::thread::yield_now();
+        std::hint::spin_loop();
     }
 }
 
@@ -404,6 +410,29 @@ mod tests {
         let panicked = spawn("clock-panic", || -> u8 { panic!("boom") }).ok();
         let panicked = panicked.map(|h| rt.block_on(h.join()));
         assert_eq!(panicked, Some(Err(ClockThreadPanic("boom".to_owned()))));
+    }
+
+    /// Linux niceness is per thread: `setpriority(PRIO_PROCESS, tid)` changes
+    /// only the named thread (setpriority(2), NOTES). Raising it (+5) needs no
+    /// privilege, so this checks the call targets the clock thread alone.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn niceness_by_thread_id_changes_only_that_thread() {
+        use rustix::process::{getpriority_process, setpriority_process};
+        let before = getpriority_process(None).unwrap_or(0);
+        let inside = std::thread::spawn(move || {
+            let tid = rustix::thread::gettid();
+            let set = setpriority_process(Some(tid), before + 5);
+            (set.is_ok(), getpriority_process(Some(tid)).ok())
+        })
+        .join()
+        .ok();
+        assert_eq!(inside, Some((true, Some(before + 5))));
+        assert_eq!(
+            getpriority_process(None).ok(),
+            Some(before),
+            "process unchanged"
+        );
     }
 
     #[test]

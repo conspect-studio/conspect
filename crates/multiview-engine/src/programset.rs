@@ -601,8 +601,10 @@ impl<P: Pacer + Send + 'static> ProgramSet<P> {
         // shares no executor worker and no timer wheel with the control plane.
         // The thread owns the program; nothing here blocks the caller or any
         // other program.
+        let stop = handle.stop.clone();
         let task = crate::clock_thread::spawn(&format!("clock-{}", id.as_str()), move || {
-            let _outcome = crate::clock_thread::block_on(supervisor.supervise(program));
+            let _outcome =
+                crate::clock_thread::block_on(supervisor.supervise_until(program, Some(&stop)));
         })
         .map_err(|error| Error::InvalidControlLoop(format!("clock thread for {id}: {error}")))?;
         handle.task = Some(task);
@@ -626,8 +628,10 @@ impl<P: Pacer + Send + 'static> ProgramSet<P> {
     /// built with the predecessor's seed and cadence. Await
     /// [`ProgramSet::stop`] on the predecessor afterwards to reap its thread.
     ///
-    /// Returns the cut once the predecessor has chosen it (within a tick), or
-    /// [`None`] if it did not within [`PROGRAM_JOIN_GRACE`].
+    /// Returns the cut once the predecessor has chosen it (within a tick). If
+    /// it has not within [`PROGRAM_JOIN_GRACE`] (a wedged predecessor), the
+    /// successor is stopped and removed again (rollback; the predecessor keeps
+    /// running untouched) and an [`Error::InvalidControlLoop`] is returned.
     ///
     /// # Errors
     ///
@@ -639,7 +643,7 @@ impl<P: Pacer + Send + 'static> ProgramSet<P> {
         &mut self,
         predecessor: &str,
         mut successor: Program<P>,
-    ) -> Result<Option<u64>> {
+    ) -> Result<u64> {
         let pid = ProgramId::new(predecessor)
             .map_err(|e| Error::InvalidControlLoop(format!("predecessor id: {e}")))?;
         let (handoff, seed, cadence) = match self.programs.get(&pid) {
@@ -669,16 +673,27 @@ impl<P: Pacer + Send + 'static> ProgramSet<P> {
                 "a successor must be a multiview program".to_owned(),
             ));
         }
+        let successor_id = successor.id().as_str().to_owned();
         self.start(successor)?;
         handoff.request();
         let started = std::time::Instant::now();
         while started.elapsed() < PROGRAM_JOIN_GRACE {
             if let Some(cut) = handoff.cut() {
-                return Ok(Some(cut));
+                return Ok(cut);
             }
             tokio::time::sleep(std::time::Duration::from_millis(1)).await;
         }
-        Ok(handoff.cut())
+        if let Some(cut) = handoff.cut() {
+            return Ok(cut);
+        }
+        // Rollback: the predecessor never reached a frame boundary (wedged).
+        // A request without a cut stays harmless: the predecessor cuts at its
+        // next boundary or exit, and nobody is waiting any more.
+        self.stop(&successor_id).await;
+        Err(Error::InvalidControlLoop(format!(
+            "{predecessor} did not hand off within {} ms; successor rolled back",
+            PROGRAM_JOIN_GRACE.as_millis()
+        )))
     }
 
     /// Whether a program with `id` is currently in the set.

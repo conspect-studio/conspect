@@ -17,8 +17,9 @@
 //! * one frame per tick: emitted within 2 of `elapsed / period`;
 //! * no tick behind: 0 repeats on Linux; at most 1% on macOS (a shared macOS
 //!   runner deschedules whole processes, #321);
-//! * p99 lateness <= half a period (16.7 ms at 30 fps) — the ADR-0109 §6
-//!   margin: a tick is "behind" only past one whole period;
+//! * p99 lateness (the engine's own histogram, upper edge of the fine bucket)
+//!   <= 16.7 ms, half a period at 30 fps — the ADR-0109 §6 margin: a tick is
+//!   "behind" only past one whole period;
 //! * Linux: the clock thread's mean lateness is below the old task's under the
 //!   same load (the comparison #311 asks for; reported only on macOS, whose
 //!   shared runners deschedule whole processes, #321).
@@ -47,7 +48,7 @@
 use std::collections::HashMap;
 use std::net::{SocketAddr, UdpSocket};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use multiview_compositor::blend::LinearRgba;
@@ -198,39 +199,34 @@ fn run_clock(topology: Topology, duration: Duration) -> ClockRun {
     // Let the load reach steady state before the clock seeds.
     std::thread::sleep(Duration::from_millis(300));
     let time: Arc<dyn TimeSource> = Arc::new(MonotonicTimeSource::new());
-    let lateness = Arc::new(Mutex::new(Vec::<i64>::with_capacity(4096)));
     let stop = StopSignal::new();
     let body = {
         let time = Arc::clone(&time);
-        let lateness = Arc::clone(&lateness);
         let stop = stop.clone();
         move || {
             let clock = OutputClock::new(Rational::new(FPS, 1)).unwrap();
             let mut runtime =
                 EngineRuntime::new(clock, build_drive(), Arc::clone(&time), RealtimePacer);
-            let seed = runtime.seed_nanos();
             let publisher: EnginePublisher<u64, u64> = EnginePublisher::new(8);
             let started = Instant::now();
-            let ts = Arc::clone(&time);
-            let lat = Arc::clone(&lateness);
-            let fut = async move {
+            async move {
+                // Lateness is the engine's own wait-free histogram (ADR-0108
+                // §10, fine buckets #311): nothing on the tick path but atomics.
                 runtime
                     .run(
                         &publisher,
                         &stop,
-                        move |f: &CompositedFrame| {
-                            let index = f.tick.index as i64;
-                            let deadline = seed + index * 1_000_000_000 / FPS;
-                            lat.lock().unwrap().push(ts.now_nanos() - deadline);
-                            f.tick.index
-                        },
+                        |f: &CompositedFrame| f.tick.index,
                         |_| None,
                     )
                     .await
                     .unwrap();
-                (runtime.frames_repeated(), started.elapsed())
-            };
-            fut
+                (
+                    runtime.frames_repeated(),
+                    runtime.lateness().snapshot(),
+                    started.elapsed(),
+                )
+            }
         }
     };
     let stopper = {
@@ -240,7 +236,7 @@ fn run_clock(topology: Topology, duration: Duration) -> ClockRun {
             stop.stop();
         })
     };
-    let (repeats, elapsed) = match topology {
+    let (repeats, lateness, elapsed) = match topology {
         Topology::Thread => {
             let handle = rt.block_on(async {
                 clock_thread::spawn("clock-chaos", move || clock_thread::block_on(body())).unwrap()
@@ -256,17 +252,16 @@ fn run_clock(topology: Topology, duration: Duration) -> ClockRun {
     }
     rt.shutdown_timeout(Duration::from_secs(2));
     let period_ns = 1_000_000_000 / FPS;
-    let mut l = lateness.lock().unwrap().clone();
-    let mean_ns = l.iter().sum::<i64>() / (l.len().max(1) as i64);
-    l.sort_unstable();
-    let pick = |q: f64| l[((l.len() as f64 - 1.0) * q) as usize];
     ClockRun {
-        ticks: l.len() as u64,
+        ticks: lateness.count,
         expected: (elapsed.as_nanos() as i64 / period_ns) as u64,
         repeats,
-        mean_ns,
-        p99_ns: pick(0.99),
-        max_ns: *l.last().unwrap(),
+        mean_ns: lateness.mean_ns().unwrap_or(0) as i64,
+        // The upper edge of the fine bucket holding p99 (u64::MAX = beyond 66.8 ms).
+        p99_ns: lateness
+            .fine_quantile_upper_ns(990)
+            .map_or(i64::MAX, |ns| i64::try_from(ns).unwrap_or(i64::MAX)),
+        max_ns: lateness.max_ns as i64,
     }
 }
 
@@ -336,7 +331,7 @@ impl Flood {
 
 fn report(name: &str, r: &ClockRun) {
     eprintln!(
-        "clock chaos {name}: ticks {} (expected {}) repeats {} lateness mean {:.3} ms p99 {:.3} ms max {:.3} ms",
+        "clock chaos {name}: ticks {} (expected {}) repeats {} lateness mean {:.3} ms p99 <= {:.3} ms (bucket edge) max {:.3} ms",
         r.ticks,
         r.expected,
         r.repeats,
@@ -360,9 +355,9 @@ fn assert_thread_bounds(name: &str, r: &ClockRun) {
     } else {
         assert_eq!(r.repeats, 0, "{name}: no tick fell behind: {r:?}");
     }
-    let half_period = 1_000_000_000 / FPS / 2;
+    // 16.7 ms is the histogram edge at half a 30 fps period.
     assert!(
-        r.p99_ns <= half_period,
+        r.p99_ns <= 16_700_000,
         "{name}: p99 lateness above the ADR-0109 bound: {r:?}"
     );
 }

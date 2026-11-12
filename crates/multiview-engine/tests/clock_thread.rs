@@ -310,6 +310,223 @@ fn migration_handoff_is_exact_while_old_is_catching_up_with_repeats() {
 }
 
 #[test]
+fn migration_handoff_is_exact_when_old_resyncs_past_the_cut() {
+    // From tick 95 one compose costs 10 s (250 periods > MAX_REPEATS_PER_TICK):
+    // OLD emits the cap of repeats, then would `skip_to` far past the cut. The
+    // resync is clamped to the cut, so nothing in [cut, floor) is lost.
+    let cadence = Rational::FPS_25;
+    let time = Arc::new(ManualTimeSource::new());
+    let ts: Arc<dyn TimeSource> = time.clone();
+    let mut old = EngineRuntime::new(
+        OutputClock::new(cadence).unwrap(),
+        drive(cadence),
+        Arc::clone(&ts),
+        JumpPacer(Arc::clone(&time)),
+    );
+    let seed = old.seed_nanos();
+    let handoff = old.handoff();
+    let publisher: EnginePublisher<u64, ()> = EnginePublisher::new(8);
+    let old_seen = Mutex::new(Vec::new());
+    let request = Arc::clone(&handoff);
+    let slow = Arc::clone(&time);
+    let outcome = clock_thread::block_on(old.run_for_with_tick_control(
+        &publisher,
+        &StopSignal::new(),
+        10_000,
+        |f: &CompositedFrame| {
+            old_seen.lock().unwrap().push(f.tick.index);
+            f.tick.index
+        },
+        |_f: &CompositedFrame| None::<()>,
+        move |_d: &mut CompositorDrive<Nv12Image>, tick: Tick| {
+            if tick.index == 95 {
+                request.request();
+                slow.advance(Duration::from_secs(10));
+            }
+        },
+    ))
+    .unwrap();
+    assert_eq!(outcome.stop, RunStop::HandedOff);
+    let cut = handoff.cut().unwrap();
+    assert_eq!(cut, 96 + multiview_engine::HANDOFF_LEAD_TICKS);
+    // Re-running OLD after the handoff emits nothing (its clock never rewinds).
+    let rerun = clock_thread::block_on(old.run_for(
+        &publisher,
+        &StopSignal::new(),
+        10,
+        |f: &CompositedFrame| f.tick.index,
+        |_f: &CompositedFrame| None::<()>,
+    ))
+    .unwrap();
+    assert_eq!((rerun.ticks, rerun.stop), (0, RunStop::HandedOff));
+    let mut new = EngineRuntime::with_seed(
+        OutputClock::new(cadence).unwrap(),
+        drive(cadence),
+        ts,
+        JumpPacer(Arc::clone(&time)),
+        seed,
+    );
+    new.succeed(Arc::clone(&handoff));
+    let new_seen = Mutex::new(Vec::new());
+    clock_thread::block_on(new.run_for(
+        &publisher,
+        &StopSignal::new(),
+        20,
+        |f: &CompositedFrame| {
+            new_seen.lock().unwrap().push(f.tick.index);
+            f.tick.index
+        },
+        |_f: &CompositedFrame| None::<()>,
+    ))
+    .unwrap();
+    assert_contiguous_once(
+        &old_seen.into_inner().unwrap(),
+        &new_seen.into_inner().unwrap(),
+        cut,
+    );
+}
+
+#[test]
+fn a_successor_starts_when_its_predecessor_stops_before_choosing_a_cut() {
+    // OLD's handoff is requested but OLD stops (or fails) before it reaches a
+    // frame boundary: the cut is published at exit, so NEW never waits forever.
+    let cadence = Rational::FPS_25;
+    let time = Arc::new(ManualTimeSource::new());
+    let ts: Arc<dyn TimeSource> = time.clone();
+    let mut old = EngineRuntime::new(
+        OutputClock::new(cadence).unwrap(),
+        drive(cadence),
+        Arc::clone(&ts),
+        JumpPacer(Arc::clone(&time)),
+    );
+    let seed = old.seed_nanos();
+    let handoff = old.handoff();
+    let publisher: EnginePublisher<u64, ()> = EnginePublisher::new(8);
+    let stop = StopSignal::new();
+    let (raise, request) = (stop.clone(), Arc::clone(&handoff));
+    let outcome = clock_thread::block_on(old.run_for_with_tick_control(
+        &publisher,
+        &stop,
+        10_000,
+        |f: &CompositedFrame| f.tick.index,
+        |_f: &CompositedFrame| None::<()>,
+        move |_d: &mut CompositorDrive<Nv12Image>, tick: Tick| {
+            if tick.index == 9 {
+                request.request();
+                raise.stop();
+            }
+        },
+    ))
+    .unwrap();
+    assert_eq!((outcome.ticks, outcome.stop), (10, RunStop::Stopped));
+    assert_eq!(
+        handoff.cut(),
+        Some(10),
+        "the exit publishes the first unemitted tick"
+    );
+    let mut new = EngineRuntime::with_seed(
+        OutputClock::new(cadence).unwrap(),
+        drive(cadence),
+        ts,
+        JumpPacer(Arc::clone(&time)),
+        seed,
+    );
+    new.succeed(handoff);
+    let first = Mutex::new(None);
+    clock_thread::block_on(new.run_for(
+        &publisher,
+        &StopSignal::new(),
+        1,
+        |f: &CompositedFrame| {
+            first.lock().unwrap().get_or_insert(f.tick.index);
+            f.tick.index
+        },
+        |_f: &CompositedFrame| None::<()>,
+    ))
+    .unwrap();
+    assert_eq!(*first.lock().unwrap(), Some(10));
+}
+
+/// An actor that fails `fail_first` times, then completes; counts its runs.
+struct Flaky {
+    runs: Arc<AtomicU64>,
+    fail_first: u64,
+}
+
+impl multiview_engine::Actor for Flaky {
+    fn name(&self) -> &'static str {
+        "flaky"
+    }
+    async fn run(&mut self) -> multiview_engine::ActorExit {
+        let n = self.runs.fetch_add(1, Ordering::AcqRel);
+        // A real actor awaits its work; yield once so this one does too.
+        tokio::task::yield_now().await;
+        if n < self.fail_first {
+            multiview_engine::ActorExit::Failed
+        } else {
+            multiview_engine::ActorExit::Completed
+        }
+    }
+}
+
+#[test]
+fn a_failing_program_restarts_after_its_backoff_on_a_clock_thread_and_stop_cuts_a_backoff_short() {
+    use multiview_engine::{RestartPolicy, StopReason, Supervisor};
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(1)
+        .enable_all()
+        .build()
+        .unwrap();
+    // (a) Two failures, 20 ms base backoff: the runtime timer wakes the clock
+    //     thread, so it restarts and completes.
+    let runs = Arc::new(AtomicU64::new(0));
+    let actor = Flaky {
+        runs: Arc::clone(&runs),
+        fail_first: 2,
+    };
+    let policy = RestartPolicy::new(Duration::from_millis(20), Duration::from_millis(40), 10);
+    let started = Instant::now();
+    let handle = rt.block_on(async move {
+        clock_thread::spawn("clock-flaky", move || {
+            clock_thread::block_on(Supervisor::new(policy).supervise_until(actor, None))
+        })
+        .unwrap()
+    });
+    let outcome = rt.block_on(handle.join()).unwrap();
+    assert_eq!(
+        (outcome.restarts, outcome.reason),
+        (2, StopReason::Completed)
+    );
+    assert_eq!(runs.load(Ordering::Acquire), 3);
+    assert!(started.elapsed() < Duration::from_secs(10));
+    // (b) Always failing with a 30 s backoff: a raised stop ends supervision
+    //     within a few poll steps, not after the backoff.
+    let actor = Flaky {
+        runs: Arc::new(AtomicU64::new(0)),
+        fail_first: u64::MAX,
+    };
+    let policy = RestartPolicy::new(Duration::from_secs(30), Duration::from_secs(30), 10);
+    let stop = StopSignal::new();
+    let inner = stop.clone();
+    let handle = rt.block_on(async move {
+        clock_thread::spawn("clock-failing", move || {
+            clock_thread::block_on(Supervisor::new(policy).supervise_until(actor, Some(&inner)))
+        })
+        .unwrap()
+    });
+    std::thread::sleep(Duration::from_millis(100));
+    let stopping = Instant::now();
+    stop.stop();
+    let outcome = rt.block_on(handle.join()).unwrap();
+    assert!(
+        stopping.elapsed() < Duration::from_secs(2),
+        "{:?}",
+        stopping.elapsed()
+    );
+    assert_eq!(outcome.restarts, 1);
+}
+
+#[test]
 fn migration_handoff_on_real_clock_threads_misses_and_doubles_nothing() {
     let rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
@@ -355,11 +572,7 @@ fn migration_handoff_on_real_clock_threads_misses_and_doubles_nothing() {
         )
         .unwrap();
         let new_ticks = new.ticks_counter();
-        let cut = set
-            .start_successor("main", new)
-            .await
-            .unwrap()
-            .expect("OLD chose a cut within the grace");
+        let cut = set.start_successor("main", new).await.unwrap();
         while new_ticks.load(Ordering::Acquire) < 20 {
             assert!(
                 started.elapsed() < Duration::from_secs(30),

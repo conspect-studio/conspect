@@ -76,10 +76,13 @@ so an early or late wake never compounds.
   `std::time::Instant` (the `MonotonicTimeSource`) is `CLOCK_MONOTONIC` on Linux,
   so the sleep and the deadline arithmetic use the same clock.
 * **macOS, Windows, other targets** (macOS and Windows are CI targets): a portable
-  fallback — `std::thread::sleep` to 500 µs before the deadline, then a yielding
-  spin (`thread::yield_now`) to it. There is no absolute-deadline sleep in `std`;
+  fallback — `std::thread::sleep` to 500 µs before the deadline, then a busy
+  spin (`hint::spin_loop`) to it. Not a yielding spin: on macOS `sched_yield` is
+  `swtch_pri`, which depresses the thread's priority for a scheduler quantum
+  (~10 ms); the first CI run showed the yielding variant losing its core on a
+  saturated runner (mean 21.8 ms, 33 repeats). There is no absolute-deadline sleep in `std`;
   the spin margin absorbs the platform's sleep overshoot. It is correct everywhere
-  and costs at most ~500 µs of yielding per tick.
+  and costs at most ~500 µs of spinning per tick (1.5% of a core at 30 fps).
 * Every sleep step is capped at 10 ms (`STOP_POLL`, the same bound the async pacer
   had), so a raised `StopSignal` is observed within one step even on an unreachable
   deadline (a frozen clock).
@@ -89,7 +92,8 @@ so an early or late wake never compounds.
   sleep, so it can never block an executor worker.
 
 **Scheduling (optional, reported, never required).** The thread asks for niceness
-−10 (Linux, per-thread `setpriority`). Without `CAP_SYS_NICE` the call fails and the
+−10 (Linux, `setpriority(PRIO_PROCESS, gettid())`, which on Linux applies to that
+one thread; a unit test checks the call changes only the calling thread). Without `CAP_SYS_NICE` the call fails and the
 thread runs at the default priority; either way the start-up log line
 `output clock thread started` names the pacing mechanism, the timer slack and the
 priority outcome. `SCHED_FIFO` is deliberately **not** used: a real-time policy lets
@@ -133,6 +137,19 @@ one bug that spins the loop starve the host, and the measurement does not need i
 4. NEW skips its clock to `cut` and paces to it; it has two full periods to see the
    cut before it is due.
 
+Edge cases, each with a test:
+
+* A catch-up resync (`skip_to` after `MAX_REPEATS_PER_TICK` repeats) is clamped
+  to the cut, so a long deschedule never jumps OLD past it and leaves
+  `[cut, floor)` to nobody.
+* If OLD's loop ends for any reason (stop, budget, error) after a request but
+  before it chose a cut, the exit publishes `cut = next` (the first tick it did
+  not emit), so NEW never waits for a predecessor that is gone.
+* OLD's clock never rewinds, so a re-run of OLD after a handoff emits nothing.
+* If OLD does not choose a cut within the 2 s grace (a wedged loop),
+  `start_successor` stops and removes NEW again and returns an error (rollback;
+  OLD untouched).
+
 The cut is two atomics (no lock, no channel, no await). Because OLD chooses a cut
 strictly ahead of everything it has emitted and never emits it, and NEW begins
 exactly at it, the union of both programs' emitted indices is contiguous with no
@@ -150,6 +167,11 @@ duplicate. The existing make-before-break crosspoint (`OutputCrosspoint`) and
   (`ClockThreadPanic`) for `ProgramSet` programs; `run_on_clock_thread` resumes it
   on the caller, exactly as awaiting the loop inline would have. Exit behaviour on
   a fatal loop error is unchanged (issue #309 owns it).
+* The per-program supervisor's restart backoff runs on the clock thread too:
+  `Supervisor::supervise_until` sleeps it in 10 ms steps (the runtime context the
+  thread entered drives the timer and wakes the thread) and ends supervision when
+  the program's stop is raised, so stopping a failing program never waits out a
+  backoff and never detaches a parked thread.
 * Falling behind keeps the ADR-T018 repeat/skip accounting unchanged.
 
 ### 6. Lateness bound the tests assert
@@ -166,7 +188,9 @@ saturated (a CPU-bound task hogging every worker, blocking calls, a timer storm)
 and a front-door flood, every tick is emitted (count within 2 of
 elapsed/period), **0 repeats on Linux** (at most 1% on macOS), p99 lateness at or
 below **half a period**, and on Linux the clock thread's mean lateness is below
-the old task topology's under the same load. The tight target is measured on the
+the old task topology's under the same load. Lateness in the chaos test is read
+from the engine's own wait-free histogram (fine buckets), so nothing but atomics
+sits on the tick path. The tight target is measured on the
 test server after deploy: p99 < 2 ms and 0 ticks behind under idle, control-plane
 load and front-door flood.
 
@@ -205,6 +229,8 @@ construction.
   pure Rust, no native deps): the default build stays LGPL-clean and GPU-free.
 * Tests: `crates/multiview-engine/tests/clock_thread.rs` (exact count and PTS over a
   long cooperative run, no drift at 29.97 over a simulated day on a real clock
-  thread, migration handoff, shutdown while sleeping, a panicking consumer) and the
+  thread, migration handoff incl. repeats, resync past the cut and a predecessor
+  that stops first, restart backoff and stop on a clock thread, shutdown while
+  sleeping, a panicking consumer) and the
   R3 chaos test `crates/multiview-frontdoor/tests/clock_thread_chaos.rs` (saturated
   control runtime + front-door flood; reports the old task topology side by side).
