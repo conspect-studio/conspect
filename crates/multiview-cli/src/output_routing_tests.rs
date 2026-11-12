@@ -1188,10 +1188,10 @@ fn an_event_whose_generation_and_key_disagree_is_dropped() {
     let live = Arc::new(AtomicUsize::new(0));
     let (mut r, _h, _aux) = router(1, 6, Box::new(|_| Err("never".to_owned())));
     let mut d = dispatcher(1);
-    let a = inject(&mut r, &mut d, src(), Counted::boxed(&live, 0));
-    let b = inject(&mut r, &mut d, src(), Counted::boxed(&live, 0));
-    assert_eq!((a, b), (1, 2));
-    r.close(a, &mut d);
+    let first = inject(&mut r, &mut d, src(), Counted::boxed(&live, 0));
+    let other = inject(&mut r, &mut d, src(), Counted::boxed(&live, 0));
+    assert_eq!((first, other), (1, 2));
+    r.close(first, &mut d);
     // Let the closed worker end, then drain its tail (counted as dropped)
     // so the counter below measures only the injected event.
     let waited = Instant::now();
@@ -1200,13 +1200,13 @@ fn an_event_whose_generation_and_key_disagree_is_dropped() {
     }
     assert_eq!(live.load(Ordering::SeqCst), 1, "the closed worker ended");
     r.drain_live_events(&mut d, &mut NoDelivery).unwrap();
-    let c = inject(&mut r, &mut d, src(), Counted::boxed(&live, 0));
-    assert_eq!(c, a, "the closed key's slot is reused");
-    let reused = u64::try_from(c).unwrap();
+    let reused_key = inject(&mut r, &mut d, src(), Counted::boxed(&live, 0));
+    assert_eq!(reused_key, first, "the closed key's slot is reused");
+    let reused = u64::try_from(reused_key).unwrap();
     assert!(
         r.dynamic
             .iter()
-            .any(|k| k.generation == reused && k.key == b),
+            .any(|k| k.generation == reused && k.key == other),
         "generation {reused} names the other live key"
     );
     let before = r.dyn_dropped.load(Ordering::Relaxed);
@@ -1215,7 +1215,7 @@ fn an_event_whose_generation_and_key_disagree_is_dropped() {
         .try_send((
             reused,
             DispatchEvent::Video {
-                key_index: c,
+                key_index: reused_key,
                 tick: 0,
                 timebase: Rational::new(1, 7),
                 packets: vec![pkt(0, true)],
@@ -1225,9 +1225,16 @@ fn an_event_whose_generation_and_key_disagree_is_dropped() {
         .unwrap();
     r.drain_live_events(&mut d, &mut NoDelivery).unwrap();
     assert_eq!(r.dyn_dropped.load(Ordering::Relaxed), before + 1);
-    assert!(!d.is_key_failed(c), "the new key does not fail");
-    assert!(!d.is_key_failed(b), "the generation's own key is untouched");
-    assert_eq!(d.counters().dropped_unbound, 0, "nothing reached a stage");
+    assert!(!d.is_key_failed(reused_key), "the new key does not fail");
+    assert!(
+        !d.is_key_failed(other),
+        "the generation's own key is untouched"
+    );
+    assert_eq!(
+        d.counters().dropped_unbound,
+        0,
+        "nothing reached first stage"
+    );
     assert!(r.dynamic.iter().all(|k| !k.seen_event));
 }
 
@@ -1535,7 +1542,7 @@ fn a_panicking_live_encoder_falls_back_to_program() {
 }
 
 /// U (HIGH): a live encoder that blocks forever in encode (wedged) is closed
-/// after WEDGED_ENCODER_TICKS offered ticks without an event.
+/// after `WEDGED_ENCODER_TICKS` offered ticks without an event.
 #[test]
 fn a_wedged_live_encoder_falls_back_to_program() {
     a_dying_live_encoder_falls_back(true, u64::from(WEDGED_ENCODER_TICKS) + 20);
