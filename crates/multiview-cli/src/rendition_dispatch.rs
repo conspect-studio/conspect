@@ -47,17 +47,22 @@ pub(crate) use multiview_ffmpeg::idr::RapParameterSets;
 /// and leaves the output's configuration unknown (the next switch resets
 /// too); otherwise the sets are compared and recorded.
 fn decide_sets(last: &mut Option<Vec<u8>>, cut: RapParameterSets) -> bool {
+    let changed = sets_change(last.as_ref(), &cut);
+    match cut {
+        RapParameterSets::Absent => {}
+        RapParameterSets::Rejected => *last = None,
+        RapParameterSets::Sets(sets) => *last = Some(sets),
+    }
+    changed
+}
+
+/// Whether a switch onto a RAP carrying `cut` changes the decoder
+/// configuration an output last carried (`decide_sets` without recording).
+fn sets_change(last: Option<&Vec<u8>>, cut: &RapParameterSets) -> bool {
     match cut {
         RapParameterSets::Absent => false,
-        RapParameterSets::Rejected => {
-            *last = None;
-            true
-        }
-        RapParameterSets::Sets(sets) => {
-            let changed = last.as_ref() != Some(&sets);
-            *last = Some(sets);
-            changed
-        }
+        RapParameterSets::Rejected => true,
+        RapParameterSets::Sets(sets) => last != Some(sets),
     }
 }
 
@@ -69,6 +74,11 @@ pub(crate) enum MoveRefusal {
     EncoderNotReady,
     /// The destination key has no move gate: never move without one.
     NoGate,
+    /// The cut RAP's decoder configuration differs from the output's and the
+    /// output's container carries it out of band (fMP4 init, FLV sequence
+    /// header, SDP): slice 1 never splices that silently, so the output keeps
+    /// its feed (output-routing.md §4.2 step 4).
+    FormatMismatch,
 }
 
 /// Result of a requested video move or of a failure fallback.
@@ -148,6 +158,12 @@ pub(crate) struct BindingConfig {
     pub output_index: usize,
     pub video_key: Option<usize>,
     pub audio_tracks: Vec<usize>,
+    /// The output's muxer reads decoder configuration in band (MPEG-TS: HLS
+    /// TS segments, SRT, RIST, a `.ts` file), so a move onto a RAP whose
+    /// parameter sets differ may splice with a mux discontinuity. `false`
+    /// (fMP4/CMAF, FLV, WebRTC/WHIP, MP4/MKV files) refuses such a move and
+    /// signals a forced switch (a fallback) as a loss instead.
+    pub inband_parameter_changes_ok: bool,
 }
 
 /// Immutable encoder and output topology for one configuration generation.
@@ -357,6 +373,9 @@ struct PendingMove {
     at_tick: i128,
     max_windows: u32,
     failed: u32,
+    /// A fallback the output cannot decline (its feed is gone): never
+    /// refused for a format mismatch, signalled as a loss instead.
+    forced: bool,
 }
 
 struct Entry {
@@ -384,6 +403,22 @@ struct BindingState {
     /// key has an extractor); `None` = unknown (never seen, or the last scan
     /// was rejected), which a switch to a key with sets treats as a change.
     last_sets: Option<Vec<u8>>,
+    /// See [`BindingConfig::inband_parameter_changes_ok`].
+    inband_ok: bool,
+}
+
+/// A switch onto a RAP with a different decoder configuration: an in-band
+/// muxer (MPEG-TS) resets its continuity at the cut window (not a loss: the
+/// cut window opens at a strict RAP, and a loss would arm the queue's RAP
+/// gate and flush its healthy backlog); an out-of-band one (only reached by
+/// a forced switch, a move is refused first) takes the loss path, whose
+/// decoder reset happens at the next RAP (the cut window itself).
+fn signal_sets_change<D: WindowDelivery>(delivery: &mut D, output_index: usize, inband_ok: bool) {
+    if inband_ok {
+        delivery.mark_discontinuity(output_index, OfferError::DecoderConfigChanged);
+    } else {
+        delivery.report_loss(output_index, OfferError::DecoderConfigChanged);
+    }
 }
 
 fn push_outcome(outcomes: &mut VecDeque<MoveOutcome>, outcome: MoveOutcome) {
@@ -461,6 +496,7 @@ impl RenditionDispatcher {
                 mv: None,
                 fallback_gate_pending: false,
                 last_sets: None,
+                inband_ok: binding.inband_parameter_changes_ok,
             });
         }
         let mut gates = config.video_move_gates.into_iter();
@@ -999,7 +1035,6 @@ impl RenditionDispatcher {
                         };
                         let pass = self.video_meta.get(m.key).and_then(|x| gated_rap(&x.gate));
                         if let Some(at) = pass {
-                            skip = at;
                             // Compare the cut RAP's decoder configuration with
                             // the output's: a change resets the output's mux.
                             let cut_sets = self
@@ -1023,28 +1058,38 @@ impl RenditionDispatcher {
                                     }
                                 })
                                 .unwrap_or(RapParameterSets::Absent);
-                            let changed = decide_sets(&mut b.last_sets, cut_sets);
-                            if changed {
-                                // Not a loss: the cut window opens at a strict
-                                // RAP. A loss here would arm the queue's RAP
-                                // gate and flush its healthy backlog.
-                                delivery.mark_discontinuity(
-                                    b.output_index,
-                                    OfferError::DecoderConfigChanged,
+                            let changed = sets_change(b.last_sets.as_ref(), &cut_sets);
+                            if changed && !b.inband_ok && !m.forced {
+                                // Out-of-band decoder configuration (fMP4
+                                // init, FLV sequence header, SDP): never a
+                                // silent splice. The output keeps its feed.
+                                push_outcome(
+                                    &mut self.outcomes,
+                                    MoveOutcome::Refused {
+                                        output_index: b.output_index,
+                                        reason: MoveRefusal::FormatMismatch,
+                                    },
                                 );
+                                b.mv = None;
+                            } else {
+                                skip = at;
+                                let _ = decide_sets(&mut b.last_sets, cut_sets);
+                                if changed {
+                                    signal_sets_change(delivery, b.output_index, b.inband_ok);
+                                }
+                                b.video_key = Some(m.key);
+                                push_outcome(
+                                    &mut self.outcomes,
+                                    MoveOutcome::Applied {
+                                        output_index: b.output_index,
+                                        key: m.key,
+                                        tick: u64::try_from(index).unwrap_or(u64::MAX),
+                                        parameter_sets_changed: changed,
+                                    },
+                                );
+                                b.mv = None;
+                                applied = true;
                             }
-                            b.video_key = Some(m.key);
-                            push_outcome(
-                                &mut self.outcomes,
-                                MoveOutcome::Applied {
-                                    output_index: b.output_index,
-                                    key: m.key,
-                                    tick: u64::try_from(index).unwrap_or(u64::MAX),
-                                    parameter_sets_changed: changed,
-                                },
-                            );
-                            b.mv = None;
-                            applied = true;
                         } else {
                             m.failed = m.failed.saturating_add(1);
                             if m.failed >= m.max_windows {
@@ -1115,10 +1160,7 @@ impl RenditionDispatcher {
                             .and_then(|f| packets.get(at).map(f))
                             .unwrap_or(RapParameterSets::Absent);
                         if decide_sets(&mut b.last_sets, cut) {
-                            delivery.mark_discontinuity(
-                                b.output_index,
-                                OfferError::DecoderConfigChanged,
-                            );
+                            signal_sets_change(delivery, b.output_index, b.inband_ok);
                         }
                     }
                     switched = true;
@@ -1493,6 +1535,31 @@ impl RenditionDispatcher {
         at_tick: u64,
         max_windows: u32,
     ) -> Result<(), DispatchError> {
+        self.rebind(output_index, key, at_tick, max_windows, false)
+    }
+    /// [`Self::rebind_video`] for a fallback the output cannot decline (its
+    /// routed feed is gone): never refused for a format mismatch; on an
+    /// out-of-band binding a changed configuration is signalled as a loss.
+    ///
+    /// # Errors
+    /// As [`Self::rebind_video`].
+    pub(crate) fn rebind_video_forced(
+        &mut self,
+        output_index: usize,
+        key: usize,
+        at_tick: u64,
+        max_windows: u32,
+    ) -> Result<(), DispatchError> {
+        self.rebind(output_index, key, at_tick, max_windows, true)
+    }
+    fn rebind(
+        &mut self,
+        output_index: usize,
+        key: usize,
+        at_tick: u64,
+        max_windows: u32,
+        forced: bool,
+    ) -> Result<(), DispatchError> {
         let usable = self
             .video_meta
             .get(key)
@@ -1545,6 +1612,7 @@ impl RenditionDispatcher {
                 at_tick: i128::from(at_tick),
                 max_windows,
                 failed: 0,
+                forced,
             });
         }
         Ok(())
@@ -1793,6 +1861,7 @@ mod tests {
             output_index: i,
             video_key: Some(v),
             audio_tracks: (0..a).collect(),
+            inband_parameter_changes_ok: true,
         }
     }
     fn mark(ns: i128) -> DtsWatermark {
@@ -2368,10 +2437,19 @@ mod tests {
     /// `differ` (or not) from the base key's last delivered RAP. Returns the
     /// outcome and the number of discontinuities the moved output saw.
     fn move_with_sets(differ: bool) -> (Vec<MoveOutcome>, usize) {
+        let (outcomes, discontinuities, moved) = move_with_sets_on(differ, true);
+        assert_eq!(moved, Some(2));
+        (outcomes, discontinuities)
+    }
+    /// [`move_with_sets`] on an output whose muxer reads decoder configuration
+    /// in band (`inband`) or not. Also returns the output's key afterwards.
+    /// Every window of the output is delivered either way.
+    fn move_with_sets_on(differ: bool, inband: bool) -> (Vec<MoveOutcome>, usize, Option<usize>) {
         let now = Instant::now();
+        let mut moved = binding(1, 1, 1);
+        moved.inband_parameter_changes_ok = inband;
         let mut d =
-            RenditionDispatcher::new(gated_cfg(vec![binding(0, 0, 1), binding(1, 1, 1)], 2, 1))
-                .unwrap();
+            RenditionDispatcher::new(gated_cfg(vec![binding(0, 0, 1), moved], 2, 1)).unwrap();
         let mut sink = FakeDelivery::new(2);
         let key = d
             .add_video_key(DtsTimeBase { num: 1, den: 5 }, gate())
@@ -2411,13 +2489,115 @@ mod tests {
                 discontinuities += 1;
             }
         }
-        assert_eq!(d.binding_video_key(1), Some(key));
         assert_eq!(
             sink.windows.iter().filter(|w| w.0 == 1).count(),
             5,
             "no window lost"
         );
-        (d.take_move_outcomes(), discontinuities)
+        assert_eq!(
+            sink.queues[1].take_discontinuity(),
+            None,
+            "no loss or reset left unconsumed"
+        );
+        (
+            d.take_move_outcomes(),
+            discontinuities,
+            d.binding_video_key(1),
+        )
+    }
+
+    /// Q (final-head media HIGH, output-routing.md §4.2 step 4): on an output
+    /// whose container carries decoder configuration out of band (fMP4 init,
+    /// FLV sequence header), a move onto changed parameter sets is REFUSED:
+    /// no splice, no reset, the output keeps its key and every window.
+    #[test]
+    fn a_move_with_changed_sets_on_an_out_of_band_output_is_refused() {
+        let (outcomes, discontinuities, key) = move_with_sets_on(true, false);
+        assert_eq!(
+            outcomes,
+            vec![MoveOutcome::Refused {
+                output_index: 1,
+                reason: MoveRefusal::FormatMismatch
+            }]
+        );
+        assert_eq!(key, Some(1), "the output keeps its feed");
+        assert_eq!(discontinuities, 0, "nothing was spliced");
+        // Equal sets still move there (nothing to signal).
+        let (outcomes, discontinuities, key) = move_with_sets_on(false, false);
+        assert!(matches!(
+            outcomes.as_slice(),
+            [MoveOutcome::Applied {
+                parameter_sets_changed: false,
+                ..
+            }]
+        ));
+        assert_eq!((key, discontinuities), (Some(2), 0));
+    }
+
+    /// Q (b): on an MPEG-TS output the same move splices with one in-band
+    /// discontinuity and the cut window is admitted.
+    #[test]
+    fn a_move_with_changed_sets_on_a_ts_output_splices() {
+        let (outcomes, discontinuities, key) = move_with_sets_on(true, true);
+        assert!(matches!(
+            outcomes.as_slice(),
+            [MoveOutcome::Applied {
+                parameter_sets_changed: true,
+                ..
+            }]
+        ));
+        assert_eq!((key, discontinuities), (Some(2), 1));
+    }
+
+    /// Q: a FALLBACK cannot be declined. On an out-of-band output a changed
+    /// configuration is signalled as a loss (decoder reset at the next RAP,
+    /// the cut window itself), which is still admitted; never a silent
+    /// splice. `rebind_video_forced` is the router's aux-failure fallback.
+    #[test]
+    fn a_forced_fallback_with_changed_sets_on_an_out_of_band_output_reports_a_loss() {
+        let now = Instant::now();
+        let mut moved = binding(1, 1, 1);
+        moved.inband_parameter_changes_ok = false;
+        let mut d =
+            RenditionDispatcher::new(gated_cfg(vec![binding(0, 0, 1), moved], 2, 1)).unwrap();
+        let mut sink = FakeDelivery::new(2);
+        d.set_parameter_sets(0, fixed_sets(RapParameterSets::Sets(vec![1])))
+            .unwrap();
+        d.set_parameter_sets(1, fixed_sets(RapParameterSets::Sets(vec![2])))
+            .unwrap();
+        // Output 1 carried key 1's sets (window 0 is a RAP on every key).
+        feed_base(&mut d, &mut sink, 2, 0, now, plain(0)).unwrap();
+        pop_all(&mut sink, 1, now);
+        assert_eq!(sink.queues[1].take_discontinuity(), None);
+        // A plain move to key 0 (changed sets) is refused...
+        d.rebind_video(1, 0, 1, 3).unwrap();
+        let rap_on = |i: i64| move |_k: usize| rap77(i);
+        feed_base(&mut d, &mut sink, 2, 1, now, rap_on(1)).unwrap();
+        pop_all(&mut sink, 1, now);
+        assert_eq!(
+            d.take_move_outcomes(),
+            vec![MoveOutcome::Refused {
+                output_index: 1,
+                reason: MoveRefusal::FormatMismatch
+            }]
+        );
+        assert_eq!(d.binding_video_key(1), Some(1));
+        // ...a forced one is applied and reports a loss, never a splice.
+        d.rebind_video_forced(1, 0, 2, 3).unwrap();
+        feed_base(&mut d, &mut sink, 2, 2, now, rap_on(2)).unwrap();
+        assert_eq!(d.binding_video_key(1), Some(0));
+        assert!(matches!(
+            d.take_move_outcomes().as_slice(),
+            [MoveOutcome::Applied {
+                parameter_sets_changed: true,
+                ..
+            }]
+        ));
+        assert_eq!(pop_all(&mut sink, 1, now), vec![(77, 2)], "cut admitted");
+        assert_eq!(
+            sink.queues[1].take_discontinuity().map(|e| e.reason),
+            Some(OfferError::DecoderConfigChanged)
+        );
     }
 
     #[test]

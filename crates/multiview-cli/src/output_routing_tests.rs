@@ -141,6 +141,7 @@ fn dispatcher(outputs: usize) -> RenditionDispatcher {
                 output_index: i,
                 video_key: Some(0),
                 audio_tracks: Vec::new(),
+                inband_parameter_changes_ok: true,
             })
             .collect(),
         first_tick: 0,
@@ -1195,7 +1196,9 @@ fn an_event_whose_generation_and_key_disagree_is_dropped() {
     assert_eq!(c, a, "the closed key's slot is reused");
     let reused = u64::try_from(c).unwrap();
     assert!(
-        r.dynamic.iter().any(|k| k.generation == reused && k.key == b),
+        r.dynamic
+            .iter()
+            .any(|k| k.generation == reused && k.key == b),
         "generation {reused} names the other live key"
     );
     let before = r.dyn_dropped.load(Ordering::Relaxed);

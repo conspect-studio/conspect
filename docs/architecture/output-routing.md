@@ -463,6 +463,20 @@ Tick T is the move tick (§4.5).
      decoder reset on this output"; it is never spliced silently;
    - a change of codec, size or pixel format is impossible by construction (the key includes the
      output's settings) and is an internal fault `encoder-format-mismatch`.
+
+   **Slice 1 behaviour (no mux re-init is built).** Each dispatcher binding carries
+   `inband_parameter_changes_ok`, set by the pipeline from the output's container: `true` for
+   MPEG-TS muxers only (HLS TS segments, SRT and RIST push, a `.ts`/`.m2ts`/`.mts` file, the
+   internal `program.ts` anchor); `false` for LL-HLS (fMP4/CMAF), RTMP/FLV, WebRTC/WHIP, MP4/MKV
+   and other files, and the raw-frame sinks (NDI, AES67, where it does not apply). With `true`, a
+   move or fallback onto a RAP whose parameter sets differ (or whose scan was rejected as
+   malformed) splices and marks a mux discontinuity on that output, which MoQ honours by reopening
+   at the next RAP. With `false`, a take's move is **refused** (`Refused(FormatMismatch)`: "This
+   feed's encoder settings differ from the output's; the take was refused to avoid a corrupt
+   stream") and the output keeps its feed. A fallback cannot be refused (the routed feed is gone),
+   so on such an output it takes the loss path: a reported loss, with the decoder reset at the next
+   RAP, which is the cut window itself. Equal sets always move.
+
    Which case NVENC gives across a live open is measured on mda001 (slice 1 acceptance).
 5. **Format.** An output's format (size, cadence, pixel format, colour tags, codec settings) never
    changes on a take, because the destination key includes the output's own settings. A format

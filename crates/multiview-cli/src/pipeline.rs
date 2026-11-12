@@ -2029,6 +2029,10 @@ pub struct Pipeline {
     /// Distinct concrete video encoders and one key per runnable output.
     rendition_configs: Vec<EncodeConfig>,
     output_video_keys: Vec<usize>,
+    /// Per runnable output (same order as `output_video_keys`): its muxer
+    /// reads decoder configuration in band (MPEG-TS), so a routing move onto
+    /// changed parameter sets may splice (output-routing.md §4.2 step 4).
+    output_inband_sets: Vec<bool>,
     output_audio_tracks: Vec<Vec<usize>>,
     /// Outputs that EXPLICITLY declared an audio selection (per output: the id
     /// and its full declared track list). Drives the run-time truthful binding:
@@ -2896,6 +2900,7 @@ impl Pipeline {
         apply_output_audio_selections(&mut outputs, &config.outputs, &discrete_tracks);
         let mut rendition_configs = Vec::<EncodeConfig>::new();
         let mut output_video_keys = Vec::with_capacity(outputs.len());
+        let mut output_inband_sets = Vec::with_capacity(outputs.len());
         let mut output_audio_tracks = Vec::with_capacity(outputs.len());
         let mut declared_audio_outputs: Vec<(String, Vec<usize>)> = Vec::new();
         for output in &outputs {
@@ -2920,6 +2925,12 @@ impl Pipeline {
                 rendition_configs.len() - 1
             };
             output_video_keys.push(key);
+            let ll_hls = config
+                .outputs
+                .iter()
+                .find(|item| item.id() == output.id())
+                .is_some_and(|item| matches!(item, multiview_config::Output::LlHls { .. }));
+            output_inband_sets.push(!ll_hls && inband_parameter_changes_ok(output));
             let audio_selection = match output {
                 RunnableOutput::File { sink, .. }
                 | RunnableOutput::Hls { sink, .. }
@@ -3116,6 +3127,7 @@ impl Pipeline {
             encode_cfg: cfg,
             rendition_configs,
             output_video_keys,
+            output_inband_sets,
             output_audio_tracks,
             declared_audio_outputs,
             outputs,
@@ -3406,6 +3418,7 @@ impl Pipeline {
             consumer: ConsumerRouting {
                 router: Box::new(router),
                 base_force,
+                inband_sets: self.output_inband_sets.clone(),
             },
             aux_tx,
             preview_selection,
@@ -4106,6 +4119,8 @@ impl Pipeline {
         if !live {
             if let Some(hls_key) = hls_key {
                 self.output_video_keys.insert(0, hls_key);
+                // The anchor is a `program.ts` file: MPEG-TS, in band.
+                self.output_inband_sets.insert(0, true);
                 self.output_audio_tracks
                     .insert(0, hls_audio.unwrap_or_default());
             }
@@ -6739,6 +6754,8 @@ struct ConsumerRouting {
     router: Box<crate::output_routing::OutputRouter>,
     /// Per base video key: its worker's forced-IDR request cell.
     base_force: Vec<Arc<AtomicU64>>,
+    /// Per output: [`BindingConfig::inband_parameter_changes_ok`].
+    inband_sets: Vec<bool>,
 }
 
 /// End-of-run bound for the routing reaper to finish closed live encoders.
@@ -7207,6 +7224,7 @@ fn consumer_main<D: WindowDelivery>(
     let ConsumerRouting {
         mut router,
         base_force,
+        inband_sets,
     } = routing;
     let mut baker = StreamBaker::new(ctx)?;
     let (event_tx, event_rx) = std::sync::mpsc::sync_channel::<DispatchEvent>(256);
@@ -7310,6 +7328,9 @@ fn consumer_main<D: WindowDelivery>(
             output_index: index,
             video_key: Some(key),
             audio_tracks: output_audio_tracks.get(index).cloned().unwrap_or_default(),
+            // Unknown (no runnable output recorded at this index): refuse a
+            // changed-format splice rather than risk a corrupt stream.
+            inband_parameter_changes_ok: inband_sets.get(index).copied().unwrap_or(false),
         })
         .collect();
     let mut dispatcher = RenditionDispatcher::new(DispatchConfig {
@@ -12612,6 +12633,30 @@ fn handle_ndi_output(
 /// run** (HLS-2, ADR-0032): an infinite live run must not also write an
 /// ever-growing `program.ts` — the rolling segment window (the live `.m3u8` +
 /// pruned `seg*.ts`) is the bounded on-disk artifact instead.
+/// Whether an output's muxer carries decoder configuration in band, so a
+/// routing switch onto changed parameter sets may splice with a mux
+/// discontinuity (output-routing.md §4.2 step 4): MPEG-TS only (HLS TS
+/// segments, SRT / RIST / UDP-TS push, a `.ts` file). fMP4/CMAF, FLV (RTMP),
+/// RTSP, WebRTC/WHIP and MP4/MKV files carry it out of band (init segment,
+/// sequence header, SDP, `moov`); raw-frame sinks carry no packets.
+fn inband_parameter_changes_ok(output: &RunnableOutput) -> bool {
+    match output {
+        RunnableOutput::Hls { .. } => true,
+        // `srt` / `rist` mux MPEG-TS; `rtmp` muxes FLV (sequence header).
+        RunnableOutput::Push { label, .. } => matches!(*label, "srt" | "rist"),
+        RunnableOutput::File { path, .. } => path
+            .extension()
+            .and_then(|e| e.to_str())
+            .is_some_and(|e| matches!(e.to_ascii_lowercase().as_str(), "ts" | "m2ts" | "mts")),
+        #[cfg(feature = "webrtc-native")]
+        RunnableOutput::WebRtc { .. } => false,
+        #[cfg(feature = "ndi-bindings")]
+        RunnableOutput::Ndi { .. } => false,
+        #[cfg(feature = "aes67")]
+        RunnableOutput::Aes67 { .. } => false,
+    }
+}
+
 fn maybe_prepend_program_ts(mut runnable: Vec<RunnableOutput>, live: bool) -> Vec<RunnableOutput> {
     if live {
         return runnable;
@@ -24752,6 +24797,41 @@ segment_ms = 1000
             };
             assert_subscription_observations(&observed);
         });
+    }
+
+    /// Q (output-routing.md §4.2 step 4): only MPEG-TS muxers take a changed
+    /// decoder configuration in band; FLV, MP4/MKV files are out of band.
+    #[test]
+    fn inband_parameter_changes_follow_the_output_container() {
+        let push = |protocol, label| {
+            let sink = PacketMuxSink::push(protocol, "srt://[::1]:9000");
+            RunnableOutput::Push {
+                id: "p".to_owned(),
+                link: push_link_for(label, &sink, "srt://[::1]:9000"),
+                sink,
+                label,
+                url: String::new(),
+            }
+        };
+        let file = |path: &str| RunnableOutput::File {
+            id: "f".to_owned(),
+            sink: PacketMuxSink::file(path),
+            path: std::path::PathBuf::from(path),
+        };
+        assert!(inband_parameter_changes_ok(&push(PushProtocol::Srt, "srt")));
+        assert!(inband_parameter_changes_ok(&push(
+            PushProtocol::Rist,
+            "rist"
+        )));
+        assert!(!inband_parameter_changes_ok(&push(
+            PushProtocol::Rtmp,
+            "rtmp"
+        )));
+        assert!(inband_parameter_changes_ok(&file("/x/program.ts")));
+        assert!(inband_parameter_changes_ok(&file("/x/a.M2TS")));
+        assert!(!inband_parameter_changes_ok(&file("/x/a.mp4")));
+        assert!(!inband_parameter_changes_ok(&file("/x/a.mkv")));
+        assert!(!inband_parameter_changes_ok(&file("/x/noext")));
     }
 
     /// The registry indexes the FINAL runner order: the synthetic `program.ts`

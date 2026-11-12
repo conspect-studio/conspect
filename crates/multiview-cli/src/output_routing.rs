@@ -97,6 +97,28 @@ pub enum RefuseReason {
     EncoderNotReady,
     /// The output or feed cannot be routed.
     Unroutable,
+    /// The feed's encoder configuration differs from the output's and the
+    /// output's container cannot take it in band (output-routing.md §4.2).
+    FormatMismatch,
+}
+
+impl RefuseReason {
+    /// Operator-facing explanation (never names a group or shared encoder).
+    #[must_use]
+    pub const fn operator_message(self) -> &'static str {
+        match self {
+            Self::FeedNotFresh => "This feed has no current picture; the take was refused",
+            Self::Capacity => "No encoder capacity is available; the take was refused",
+            Self::EncoderNotReady => {
+                "This feed's encoder did not become ready; the take was refused"
+            }
+            Self::Unroutable => "This feed cannot be routed to the output; the take was refused",
+            Self::FormatMismatch => {
+                "This feed's encoder settings differ from the output's; the take was refused \
+                 to avoid a corrupt stream"
+            }
+        }
+    }
 }
 
 /// Why an output fell back to Program on its own.
@@ -960,8 +982,13 @@ impl OutputRouter {
                         .and_then(|o| o.pending.as_ref())
                         .is_some_and(|p| matches!(p.phase, Phase::Moving(_)));
                     if moving {
-                        let _ = reason == MoveRefusal::NoGate;
-                        self.refuse_pending(output_index, tick, RefuseReason::EncoderNotReady);
+                        let reason = match reason {
+                            MoveRefusal::FormatMismatch => RefuseReason::FormatMismatch,
+                            MoveRefusal::EncoderNotReady | MoveRefusal::NoGate => {
+                                RefuseReason::EncoderNotReady
+                            }
+                        };
+                        self.refuse_pending(output_index, tick, reason);
                     }
                 }
                 MoveOutcome::Superseded { .. } => {}
@@ -1009,7 +1036,12 @@ impl OutputRouter {
                     continue;
                 };
                 let windows = self.request_idr(base, tick);
-                if dispatcher.rebind_video(index, base, tick, windows).is_ok() {
+                // A fallback: the routed feed is gone, so it is never refused
+                // for a format mismatch (an out-of-band output takes a loss).
+                if dispatcher
+                    .rebind_video_forced(index, base, tick, windows)
+                    .is_ok()
+                {
                     if let Some(out) = self.outputs.get_mut(index) {
                         out.bus = PictureBus::Program;
                     }
