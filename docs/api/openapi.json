@@ -7744,6 +7744,64 @@
         }
       }
     },
+    "/api/v1/preview/inputs/{id}": {
+      "get": {
+        "tags": [
+          "preview"
+        ],
+        "summary": "`GET /api/v1/preview/inputs/{id}.jpg` — the latest frame of input `id`\n(role: read). `503` with an RFC 9457 problem typed by source phase when the\ninput is unknown or has produced no frame.",
+        "operationId": "input_jpeg",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "The input (source) id, optionally with the `.jpg` suffix the SPA appends.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The newest frame of the input, `Cache-Control: no-store`.",
+            "content": {
+              "image/jpeg": {}
+            }
+          },
+          "401": {
+            "description": "Missing or invalid credentials.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Authenticated but not authorized for this input (per-object scope).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "No frame available. `type` is `/problems/source-failed`, `/problems/source-starting` or `/problems/preview-not-served`; `X-Multiview-Source-State` repeats the coarse phase.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/v1/preview/inputs/{id}/moq": {
       "post": {
         "tags": [

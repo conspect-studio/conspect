@@ -47,6 +47,9 @@ export function useSourceStatus(): UseQueryResult<ReadonlyMap<string, SourceDema
     queryFn: () => getSourceStatus(),
     select: (list) => new Map(list.map((s) => [s.id, s])),
     refetchInterval: 3000,
+    // One poll for the whole desk (the tile state + bus reasons share it); it
+    // pauses while the tab is hidden, so a background desk adds no load.
+    refetchIntervalInBackground: false,
   });
 }
 

@@ -13,6 +13,7 @@ import { useLayouts } from '../../api/queries';
 import { useAlarms } from '../../api/alarmsQueries';
 import { useSources } from '../../resources/queries';
 import { useSourceStatus } from '../../api/sourceStatus';
+import type { SourceDemand } from '../../api/sourceStatus';
 import { subscribeRealtime } from '../../realtime/shared';
 import { useEngineEvents } from '../../realtime/useEngineEvents';
 import type { LiveTile } from '../../realtime/useEngineEvents';
@@ -70,13 +71,45 @@ function tallyGlyph(tally: string): string {
   return tally === 'program' ? '● PGM' : tally === 'preview' ? '▲ PVW' : tally === 'dark' ? '○ OFF' : '? UNKNOWN';
 }
 
-function SourcePicture({ id }: { readonly id: string }): JSX.Element {
+/** Longest engine `detail` shown on a tile, in characters. */
+const TILE_DETAIL_MAX_CHARS = 160;
+
+/**
+ * The engine's reason as one bounded, plain-text line. React renders it as a
+ * text node, so a detail containing markup shows literally — never as HTML.
+ */
+function tileDetail(detail: string | null | undefined): string | undefined {
+  if (!detail) return undefined;
+  const flat = detail.replace(/\s+/gu, ' ').trim();
+  if (!flat) return undefined;
+  // Count code points, not UTF-16 units, so a truncation never splits a pair.
+  const chars = Array.from(flat);
+  return chars.length > TILE_DETAIL_MAX_CHARS ? `${chars.slice(0, TILE_DETAIL_MAX_CHARS).join('')}…` : flat;
+}
+
+/**
+ * A wall tile's picture, or the reason it has none. Every state resolves to a
+ * picture or stated text: a failed source shows a no-signal slate with the
+ * engine's reason, a starting source says "Starting" over its last good frame,
+ * and a stale still keeps its "Stale frame" mark.
+ */
+function SourcePicture({ id, demand }: { readonly id: string; readonly demand: SourceDemand | undefined }): JSX.Element {
   const { t } = useLingui();
   // Keeps the last good frame across failed polls; stale only after a bounded age (max(5 polls,10 s)).
   const wall = useWallSurface(id);
-  const { url, state } = useJpegStill(`/api/v1/preview/inputs/${encodeURIComponent(id)}.jpg`, 2000, !wall.live);
+  const phase = demand?.phase;
+  // A failed source has no picture to fetch and its still route answers 503 every
+  // poll; the wall-geometry poll keeps its demand alive, so stop polling here.
+  const { url, state } = useJpegStill(`/api/v1/preview/inputs/${encodeURIComponent(id)}.jpg`, 2000, !wall.live && phase !== 'failed');
   if (wall.live) return <WallCrop source={id} label={t`Source live preview`} className="bd-source-picture" />;
-  return url ? <><img className="bd-source-picture" src={url} alt={t`Source still preview`} data-still-state={state} />{state === 'stale' ? <em className="bd-stale" data-testid="tile-stale"><Trans>Stale frame</Trans></em> : null}</> : <span><Trans>No confirmed frame</Trans></span>;
+  const reason = tileDetail(demand?.detail);
+  if (phase === 'failed') return <span role="status" className="bd-slate" data-testid="tile-failed"><span className="bd-slate-title"><Trans>No signal</Trans></span>{reason !== undefined ? <span className="bd-slate-detail" data-testid="tile-failed-detail">{reason}</span> : null}</span>;
+  if (phase === 'starting' || (phase === 'idle' && demand?.video_wanted === true)) return url !== undefined
+    ? <><img className="bd-source-picture" src={url} alt={t`Source still preview`} data-still-state={state} /><em className="bd-tile-overlay" data-testid="tile-starting"><Trans>Starting</Trans></em></>
+    : <span role="status" className="bd-slate" data-testid="tile-starting"><span className="bd-slate-title"><Trans>Starting</Trans></span></span>;
+  if (url !== undefined) return <><img className="bd-source-picture" src={url} alt={t`Source still preview`} data-still-state={state} />{state === 'stale' ? <em className="bd-stale" data-testid="tile-stale"><Trans>Stale frame</Trans></em> : null}</>;
+  if (phase === 'idle') return <span role="status" className="bd-slate" data-testid="tile-idle"><span className="bd-slate-title"><Trans>Idle — not in use</Trans></span></span>;
+  return <span data-testid="tile-no-frame"><Trans>No confirmed frame</Trans></span>;
 }
 
 /** Real bus state and correlated commands inside the approved desk composition. */
@@ -167,7 +200,7 @@ function ProductionDeskBody(): JSX.Element {
     <div className="bd-desk-grid">
       <PreviewMonitor program source={name(state.data?.program_source)} fresh={fresh && status === 'open'} />
       <PreviewMonitor program={false} source={name(state.data?.preview_source)} fresh={fresh && status === 'open'} />
-      <section className="bd-wall"><h2><Trans>Multiview wall</Trans></h2><div className="bd-wall-grid">{sources.data?.map((source) => <div className="bd-wall-tile" key={source.id} data-tile-state={tileForSource(tiles, source.id)?.state ?? 'unknown'} data-tally={tallyForSource(source.id, state.data, fresh && status === 'open')}><SourcePicture id={source.id} /><small>{tallyGlyph(tallyForSource(source.id, state.data, fresh && status === 'open'))}</small><b>{source.name}</b><span><TileLabel tile={tileForSource(tiles, source.id)} /></span></div>)}</div><WallNote /><p>{sources.isError ? t`Source catalog unavailable` : !sources.data?.length ? t`No source catalog available` : t`Tally follows the engine bus IDs; source presence does not prove signal.`}</p><p><Trans>Layouts</Trans>: {layouts.isError ? t`Unavailable` : layouts.data?.length ?? '—'} · <Trans>Observed tiles</Trans>: {tilesKnown ? tiles.size : '—'} · <Link className="bd-link48" to="/monitoring"><Trans>Open live monitoring</Trans></Link></p></section>
+      <section className="bd-wall"><h2><Trans>Multiview wall</Trans></h2><div className="bd-wall-grid">{sources.data?.map((source) => <div className="bd-wall-tile" key={source.id} data-tile-state={tileForSource(tiles, source.id)?.state ?? 'unknown'} data-tally={tallyForSource(source.id, state.data, fresh && status === 'open')}><SourcePicture id={source.id} demand={demand.data?.get(source.id)} /><small>{tallyGlyph(tallyForSource(source.id, state.data, fresh && status === 'open'))}</small><b>{source.name}</b><span><TileLabel tile={tileForSource(tiles, source.id)} /></span></div>)}</div><WallNote /><p>{sources.isError ? t`Source catalog unavailable` : !sources.data?.length ? t`No source catalog available` : t`Tally follows the engine bus IDs; source presence does not prove signal.`}</p><p><Trans>Layouts</Trans>: {layouts.isError ? t`Unavailable` : layouts.data?.length ?? '—'} · <Trans>Observed tiles</Trans>: {tilesKnown ? tiles.size : '—'} · <Link className="bd-link48" to="/monitoring"><Trans>Open live monitoring</Trans></Link></p></section>
       <section className="bd-switcher"><h2><Trans>M/E 1 — Switcher</Trans></h2>
         <div className="bd-buses">{(['preview', 'program'] as const).map((bus) => <div className={`bd-bus bd-bus-${bus}`} key={bus} role="group" aria-label={bus === 'program' ? t`PGM bus — direct taps always confirm` : t`PVW bus`}><b>{bus === 'program' ? 'PGM' : 'PVW'}</b><div>{sources.data?.map((source, index) => { const keyReason = reason ?? busKeyReason(bus, source.id, state.data, demand.data?.get(source.id)?.phase); return <button key={source.id} disabled={disabled || keyReason !== undefined} data-key-reason={keyReason} title={keyReason ? `${source.name} — ${keyReason}` : source.name} aria-pressed={tallyForSource(source.id, state.data, fresh && status === 'open') === bus} onClick={() => { request(bus === 'program' ? 'select_program' : 'select_preview', source.id); }}><span className="bd-key-name">{source.name}</span><i className="bd-idx" aria-hidden="true">{index + 1}</i></button>; })}{!sources.data?.length && <span><Trans>No sources available</Trans></span>}</div></div>)}</div>
         <div className="bd-takes"><div className="bd-transitions" role="group" aria-label={t`Transition type`}><button disabled aria-pressed="true" title={t`MIX is the only supported transition`}>MIX</button><button disabled title={t`WIPE and DIP have no supported control contract`}>WIPE</button><button disabled title={t`WIPE and DIP have no supported control contract`}>DIP</button></div><button className="bd-auto" disabled={disabled || autoReason !== undefined} title={autoReason ? `AUTO — ${autoReason}` : t`AUTO mix over ${frames} frames`} onClick={() => { request('auto'); }}>AUTO</button><div className="bd-cutrow"><button className="bd-cut" disabled={disabled || sameBuses} title={sameBuses ? t`CUT — Preview and Program carry the same source` : undefined} aria-describedby="bd-cut-src" onClick={() => { request('cut'); }}>CUT<span aria-hidden="true" className="bd-cut-src"> · {name(state.data?.preview_source) ?? t`source unknown`}</span></button><span id="bd-cut-src" className="sr-only">{t`Cuts to`} {name(state.data?.preview_source) ?? t`unknown source`}</span></div></div>
