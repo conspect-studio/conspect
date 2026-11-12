@@ -793,7 +793,6 @@ impl OutputRouter {
             first_tick: None,
             boot_given_up: 0,
         };
-        router.boot = router.outputs.iter().map(|_| None).collect();
         router.publish_snapshot();
         Ok((router, handle))
     }
@@ -1108,7 +1107,11 @@ impl OutputRouter {
             };
             let index = take.output_index;
             // A boot take enters its retry window; an operator take on the
-            // same output replaces the boot intent for good.
+            // same output replaces the boot intent for good. One slot per
+            // output, allocated on the first take (bounded by the outputs).
+            if self.boot.len() < self.outputs.len() {
+                self.boot.resize_with(self.outputs.len(), || None);
+            }
             if let Some(slot) = self.boot.get_mut(index) {
                 *slot = take
                     .operation_id

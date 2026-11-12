@@ -1177,10 +1177,11 @@ async fn readback_reports_the_live_bus_and_the_configured_feed_separately() {
     );
     assert_eq!(r["tally"], "program", "tally from the live bus: {r}");
     assert_eq!(r["effective_audio"], "program", "{r}");
-    // A scoped key that may read bars but not the Program scope: the live
-    // Program bus is redacted, the configured feed is shown.
+    // A key whose output allowlist lacks `program:main` (so it may not read
+    // the Program bus) but may read bars: the live Program bus is redacted,
+    // the configured feed is shown.
     let r =
-        row(&body_json(send(&rig.router, get("/api/v1/routing", SCOPED_ROUTER_TOKEN)).await).await);
+        row(&body_json(send(&rig.router, get("/api/v1/routing", OUTPUT_AXIS_TOKEN)).await).await);
     assert_eq!(r["video"], serde_json::json!({"redacted": true}), "{r}");
     assert_eq!(r["tally"], "redacted", "{r}");
     assert_eq!(
@@ -1236,7 +1237,7 @@ async fn an_output_scoped_key_routes_reads_and_hears_only_its_outputs() {
         .await;
         assert_eq!(resp.status(), StatusCode::FORBIDDEN, "{path} output-0");
     }
-    assert!(rig.fake.takes().is_empty());
+    assert_eq!(rig.fake.takes().len(), 0);
     // Its own output: 200 plan, 202 take.
     let resp = send(
         &rig.router,

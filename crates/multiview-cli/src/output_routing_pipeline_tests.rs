@@ -974,7 +974,11 @@ fn a_persisted_source_feed_is_on_air_after_the_boot_take() {
         all[..steady.len()],
         "out1: one window per tick across the cut"
     );
-    assert_eq!(steady.len() as u64, TICKS - 5, "out1 carried to the end");
+    assert_eq!(
+        u64::try_from(steady.len()).unwrap(),
+        TICKS - 5,
+        "out1 carried to the end"
+    );
     let first = run.outputs[1]
         .iter()
         .find(|p| p.0 == i64::try_from(applied.tick).unwrap())
