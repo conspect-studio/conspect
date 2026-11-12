@@ -100,9 +100,9 @@ What is true on main f5f2230e (the full table with citations is in §1 of the no
 
 3. **A take moves the output's subscription at an IDR. It is a clean cut, never a restamp.**
    - **Destination exists** (another output already carries that picture bus with those settings):
-     **+0 encoders**. The engine rebinds the output at an IDR of that bus. It forces one only within a
-     per-encoded-bus floor: 500 ms when the caller may Write every subscriber, otherwise 2 s,
-     coalesced with the ADR-0049 PLI path. Else it waits for the next natural IDR, at most one GOP.
+     **+0 encoders**. The engine rebinds the output at an IDR of that bus. It forces one only within one
+     per-encoded-bus floor of 2 s, shared with the ADR-0049 PLI path. Otherwise it waits for the
+     next natural IDR, at most one GOP.
    - **Destination does not exist:** **+1 encoder**. The engine opens it off the clock on its own
      worker thread, starting at an absolute tick T0 (`starting_at(T0)`, added to
      `VideoRenditionEncoder` and the AAC state, which start at 0 today, `crates/multiview-output/src/sink.rs:604,1141-1159`). It
@@ -153,8 +153,10 @@ What is true on main f5f2230e (the full table with citations is in §1 of the no
    - the output moves onto a private (CPU, transient) encoded audio bus fed the old audio up to G;
    - it crossfades old to new from G over one tick, `SampleClock::total_at` exact, inside that
      stream;
-   - if the destination is shared, the output moves on at the next grid boundary to the shared
-     bus, where the signal is identical, so other subscribers never hear the fade.
+   - if the destination is shared, the output moves on to the shared bus at least 4 frames after
+     the fade, and only when the decoded output across that boundary matches the shared bus alone
+     (an encoder-state check, not just equal samples). The private bus lives at most 2 s, and then
+     becomes the output's own audio encode. Other subscribers never hear the fade.
    The rule is needed because a spike measured a decoder transient of 97-919 samples when two
    different-content AAC streams are spliced. AudioSpecificConfig identity is checked at open.
    `audio-routing` stays the source of gain, mute and membership. The existing per-output `tracks`
@@ -193,8 +195,8 @@ What is true on main f5f2230e (the full table with citations is in §1 of the no
    - Plan, 409 and event bodies redact what the caller cannot read.
    - Takes are persisted only after `applied`.
    - Idempotency keys are body-blind (a new key per distinct take).
-   - Takes are limited to 2 per second per output (one forced IDR per 500 ms) and 10 per second per
-     principal.
+   - Takes are limited to 2 per second per output and 10 per second per principal; forced IDRs to
+     one per 2 s per encoded bus.
    - `apply-layout` with a switcher becomes 422, a breaking change documented in the note.
 
 8. **Admission (invariant #9).**

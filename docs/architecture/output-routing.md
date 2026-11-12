@@ -420,10 +420,9 @@ Tick T is the move tick (§4.5).
 1. **Destination ready.**
    - If the encoded bus for `(new picture bus, the output's settings)` exists, the move waits for
      that bus's next IDR. It forces one only within the **per-encoded-bus force floor**:
-     - when the bus's other subscribers are all outputs the caller may Write, at most one forced IDR
-       per 500 ms;
-     - otherwise at most one forced IDR per 2 s, coalesced with the ADR-0049 viewer-join/PLI force
-       path (`crates/multiview-ffmpeg/src/encode.rs:208-216`) through one per-bus gate;
+     - at most one forced IDR per 2 s per encoded bus, for takes and the ADR-0049 viewer-join/PLI
+       force path together (`crates/multiview-ffmpeg/src/encode.rs:208-216`), through one per-bus
+       gate. There is one floor, not two: the caller-owned 2 s floor already governs that seam;
      - when the floor is not met, the move happens at the next natural or already-due IDR, at most
        one GOP later (2 s on mda001).
 
@@ -506,7 +505,10 @@ verified per protocol in the slice that ships it (§9). §4.6 proved the MPEG-TS
   fixed for a run. An event from an unknown encoder key is `InvalidEvent`, which fails the
   dispatcher and aborts delivery for **every** output, Program included
   (`crates/multiview-cli/src/rendition_dispatch.rs:145,188,319-344`). Slice 1 therefore:
-  - registers a new key (`add_video_key`/`add_audio_key`, with its time base) in the dispatcher
+  - registers a new key (`add_video_key`/`add_audio_key`, with its time base, which must equal the
+    cadence exactly as `RenditionDispatcher::new` requires,
+    `crates/multiview-cli/src/rendition_dispatch.rs:269-272`; a mismatch refuses the open) in the
+    dispatcher
     **before** the worker's first offer. The add arrives as a control event on the same consumer
     thread, so it is ordered before any packet of that key;
   - makes a packet window from a registered key that has no bound output **dropped and counted**,
@@ -696,8 +698,8 @@ ticks, from:
   subscribers. Today one shared AAC encoder carries the program stream and every discrete track
   (`crates/multiview-cli/src/pipeline.rs:5795`, `crates/multiview-output/src/sink.rs:724`). That is the key `(audio:program, settings)` plus its tracks,
   unchanged with default config.
-- **An output's audio subscription moves with its video**, in the same dispatcher rebind (§4.3),
-  at the same window T.
+- **An output's audio subscription moves with its video**, in the same take. Its rebind is keyed
+  on the audio grid boundary G at or after the video move tick (Rule 1 below), at most 21 ms later.
 
 **Why audio needs its own rule.** Video moves at an IDR at tick T. Audio cannot move at the same
 instant, for two reasons.
@@ -737,6 +739,16 @@ the splice frame (no click step: largest sample step 379, against 381 in steady 
   sample-identical to the shared bus. The output then moves again, at the next grid boundary after
   the fade, from private to shared: the same signal, the same grid, so the boundary is clean. The
   private bus then closes. Subscribers of the shared bus never hear the fade.
+  - **Encoder state, not just samples.** Two AAC encoders fed identical PCM can still differ at a
+    frame boundary, through their MDCT history and bit-reservoir state. So the private-to-shared
+    boundary at G′ is chosen at least 4 frames after the fade ends (85 ms), so both encoders have
+    coded the same signal for longer than their history. The acceptance criterion is on the
+    decoded output, not on encoder state: across G′, the decoded samples must equal those of the
+    shared bus alone to within the codec's own steady-state error. That is measured, and the move
+    does not happen until it holds.
+  - **Bounded lifetime.** A private bus exists at most 2 s after the fade. If the decoded-identity
+    check has not passed by then, the output stays on its private bus, which then becomes the
+    output's own encoded audio bus (+1 audio encode, CPU), and an event records it.
 - When no shared destination exists, the private bus simply becomes the output's new audio bus.
 
 The private bus must open early enough to be warm at G: it opens when the take is admitted, which
@@ -1011,13 +1023,12 @@ affects:
 The engine takes at most one effective cut per output per tick, because the latest take wins at the
 drain (spike: about 20,000 takes caused 4 cuts and no clock effect). Forced IDRs are a bitrate cost,
 so the control plane limits takes to 2 per second **per output** and 10 per second **per
-principal**. Forced IDRs are limited **per encoded bus** (§4.2 step 1): one per 500 ms when only
-the caller's own outputs subscribe, otherwise one per 2 s, shared with the viewer-join/PLI path.
+principal**. Forced IDRs are limited **per encoded bus** (§4.2 step 1): one per 2 s, shared with the
+viewer-join/PLI path.
 
 `crates/multiview-ffmpeg/src/encode.rs:208-216` documents a caller-owned floor of at least 2 s for forced keyframes. That floor
-is for viewer-join and PLI requests. A take is an operator content cut and has its own floor: 500
-ms per encoded bus when the caller owns every subscriber, otherwise the same 2 s floor, enforced at
-adoption. Each forced IDR costs one deep copy of the frame
+is for viewer-join and PLI requests. A take uses the same 2 s per-bus floor, enforced at adoption. A
+take within it moves at the bus's next natural IDR (at most one GOP). Each forced IDR costs one deep copy of the frame
 (`crates/multiview-ffmpeg/src/encode.rs:310-318`), at most 2 per second per output. A take over either limit gets 429 with `Retry-After`. The existing per-IP limiter
 (`crates/multiview-control/src/limits.rs`) still applies first. Idempotency keys bound replays.
 
@@ -1236,7 +1247,10 @@ Also checked:
 - a live open never holds the bake consumer (an injected 2 s encoder open: Program unaffected,
   consumer offers dropped for the new worker only);
 - the dispatcher registers a new key before its first packet; an unbound or unknown key's window
-  is dropped and counted, and Program delivery is never aborted;
+  is dropped and counted, and Program delivery is never aborted; a key whose time base differs from
+  the cadence is refused at registration;
+- AAC private-to-shared move: the decoded-identity criterion across G′, and the 2 s lifetime
+  fallback;
 - a close (EOF, flush, join) runs on the reaper; an injected 3 s flush does not move the
   consumer's tick;
 - two takes on adjacent ticks against one free session: one is admitted, the other refused, never
