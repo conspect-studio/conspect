@@ -122,7 +122,7 @@ tempfile = { version = "3", optional = true }
 # dir we own, fail closed on one we don't). Already in the workspace graph (the
 # engine's `ptp` feature); MIT/Apache-2.0/BSD, `cargo deny`-clean. Optional + gated
 # so the default build never pulls the `fs`/`process` surface.
-rustix = { workspace = true, features = ["fs", "process"], optional = true }
+rustix = { workspace = true, features = ["fs", "process", "stdio"], optional = true }
 
 # Used ONLY by the `heartbeat` feature for the device-PoP keypair (CONSPECT-3,
 # ADR-I007): GENERATE (the only RNG in the product, at the cli boundary — the leaf

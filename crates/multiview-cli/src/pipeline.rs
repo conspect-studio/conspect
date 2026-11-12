@@ -6173,7 +6173,10 @@ impl StreamEgress {
         // Do not let shutdown wait forever: systemd owns a fresh-process restart
         // after this bounded error, and the detached thread cannot poison a new
         // in-process encoder generation.
-        let deadline = Instant::now() + SINK_WEDGE_GRACE;
+        // #309: ONE budget for the whole join (consumer and sinks), never past an
+        // armed exit deadline, so the consumer cannot starve the sinks and the
+        // join never outlives the bound.
+        let deadline = Instant::now() + join_budget();
         while !self.consumer.is_finished() && Instant::now() < deadline {
             std::thread::park_timeout(Duration::from_millis(10));
         }
@@ -6209,8 +6212,9 @@ impl StreamEgress {
         // failed binding is visible even when its sink thread produced a file.
         lines.extend(binding_report_lines(&bindings));
         // A shared teardown budget: healthy sinks finish in milliseconds; only a
-        // genuinely wedged sink consumes the grace before being detached.
-        let deadline = Instant::now() + SINK_WEDGE_GRACE;
+        // genuinely wedged sink consumes the grace before being detached. The
+        // same deadline as the consumer wait (#309), so a sink first reached
+        // after it counts as wedged, not finalised.
         for (i, handle) in self.sinks.into_iter().enumerate() {
             while !handle.is_finished() && Instant::now() < deadline {
                 std::thread::sleep(Duration::from_millis(10));
@@ -6302,17 +6306,19 @@ fn binding_report_lines(bindings: &[crate::binding_delivery::BindingStatus]) -> 
     lines
 }
 
+/// The egress join's wait budget (#309): [`SINK_WEDGE_GRACE`], never past an
+/// armed exit deadline (the watchdog ends the process there anyway).
+fn join_budget() -> Duration {
+    crate::exit_watchdog::remaining().map_or(SINK_WEDGE_GRACE, |left| left.min(SINK_WEDGE_GRACE))
+}
+
 /// After a consumer failure, join every sink within one [`SINK_WEDGE_GRACE`]
 /// (#309): they are still finalising. Returns `false` if any sink failed or
 /// was still running and had to be detached (its output is not finalised).
 fn join_sinks_after_consumer_failure(
     sinks: Vec<JoinHandle<Result<SinkRunOutcome, PipelineError>>>,
 ) -> bool {
-    // Never wait past the armed exit deadline: the watchdog ends the process
-    // there anyway, so a sink still finalising then is cut either way.
-    let grace = crate::exit_watchdog::remaining()
-        .map_or(SINK_WEDGE_GRACE, |left| left.min(SINK_WEDGE_GRACE));
-    let deadline = Instant::now() + grace;
+    let deadline = Instant::now() + join_budget();
     let mut all_finalised = true;
     for (i, handle) in sinks.into_iter().enumerate() {
         while !handle.is_finished() && Instant::now() < deadline {

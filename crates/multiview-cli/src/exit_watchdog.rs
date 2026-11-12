@@ -9,6 +9,7 @@
 //! code. Teardown that finishes in time is not affected: `main` returns and the
 //! process exits normally.
 
+#[cfg(not(all(unix, feature = "ffmpeg")))]
 use std::io::Write;
 use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 use std::sync::OnceLock;
@@ -59,10 +60,9 @@ impl ExitCause {
 pub struct Watchdog {
     /// The process-relative origin for [`Self::due_ns`].
     origin: Instant,
-    /// Deadline, in ns after `origin`; 0 = not armed. Set by the first arm;
-    /// a later Fatal that upgrades a Stop moves it to that Fatal's own
-    /// deadline if later, so the failure is reported within the bound of the
-    /// fatal decision.
+    /// Deadline, in ns after `origin`; 0 = not armed. Set by the FIRST arm and
+    /// never moved: the bound is measured from the first exit decision. A later
+    /// Fatal only upgrades the cause (the exit code), not the deadline.
     due_ns: AtomicU64,
     /// [`ExitCause::tag`] of the strongest cause armed so far; 0 = none.
     cause: AtomicU8,
@@ -89,15 +89,11 @@ impl Watchdog {
         let due = u64::try_from(self.origin.elapsed().saturating_add(deadline).as_nanos())
             .unwrap_or(u64::MAX)
             .max(1);
-        let previous = self.cause.fetch_max(cause.tag(), Ordering::AcqRel);
+        self.cause.fetch_max(cause.tag(), Ordering::AcqRel);
         let set = self
             .due_ns
             .compare_exchange(0, due, Ordering::AcqRel, Ordering::Acquire)
             .is_ok();
-        if !set && cause.tag() > previous {
-            // An upgrade (Stop → Fatal): give the fatal its own full bound.
-            self.due_ns.fetch_max(due, Ordering::AcqRel);
-        }
         if let Some(thread) = self.thread.get() {
             thread.unpark();
         }
@@ -179,8 +175,8 @@ pub const EXIT_PATH_GRACE: Duration = Duration::from_millis(500);
 // could itself block, so a backstop thread kills the process with SIGKILL if
 // `exit` has not finished within EXIT_PATH_GRACE.
 fn exit_process(cause: ExitCause) {
-    // A stop whose outputs have not finalised by the deadline did not stop
-    // cleanly: report it as a failure (a wedged consumer or sink, #309).
+    // A stop whose outputs have not finalised by the deadline, or whose run
+    // faltered, did not stop cleanly: report it as a failure (#309).
     let cause = if cause == ExitCause::Stop
         && (OUTPUTS_OPEN.load(Ordering::Acquire) > 0 || RUN_FAILED.load(Ordering::Acquire))
     {
@@ -191,23 +187,14 @@ fn exit_process(cause: ExitCause) {
     let _ = std::thread::Builder::new()
         .name("multiview-exit-notice".to_owned())
         .spawn(move || {
-            // /dev/stderr is Linux; macOS/BSD expose the fd under /dev/fd.
-            // Append: a fresh open of a regular-file stderr must not overwrite
-            // the start of the log.
-            let handle = std::fs::OpenOptions::new()
-                .append(true)
-                .open("/dev/stderr")
-                .or_else(|_| std::fs::OpenOptions::new().append(true).open("/dev/fd/2"));
-            if let Ok(mut err) = handle {
-                let _ = writeln!(
-                    err,
-                    "multiview: teardown overran the {} ms exit bound ({cause:?}); exiting with \
-                     code {} (outputs finalised before the bound are valid; detached sinks may be \
-                     incomplete; the supervisor restarts the service)",
-                    EXIT_DEADLINE.as_millis(),
-                    cause.code()
-                );
-            }
+            let line = format!(
+                "multiview: teardown overran the {} ms exit bound ({cause:?}); exiting with \
+                 code {} (outputs finalised before the bound are valid; detached sinks may be \
+                 incomplete; the supervisor restarts the service)\n",
+                EXIT_DEADLINE.as_millis(),
+                cause.code()
+            );
+            write_stderr_raw(line.as_bytes());
         });
     let _ = std::thread::Builder::new()
         .name("multiview-exit-backstop".to_owned())
@@ -218,6 +205,26 @@ fn exit_process(cause: ExitCause) {
     // Give the notice a moment; never wait for it.
     std::thread::sleep(Duration::from_millis(20));
     std::process::exit(cause.code());
+}
+
+/// Write to the already-open fd 2, without the std stderr lock and without
+/// reopening its path (a socket stderr — systemd's journal default — cannot be
+/// reopened). Best effort.
+#[cfg(all(unix, feature = "ffmpeg"))]
+fn write_stderr_raw(bytes: &[u8]) {
+    let _ = rustix::io::write(rustix::stdio::stderr(), bytes);
+}
+
+/// Without `rustix`: reopen the stderr path append-only (no socket support).
+#[cfg(not(all(unix, feature = "ffmpeg")))]
+fn write_stderr_raw(bytes: &[u8]) {
+    let handle = std::fs::OpenOptions::new()
+        .append(true)
+        .open("/dev/stderr")
+        .or_else(|_| std::fs::OpenOptions::new().append(true).open("/dev/fd/2"));
+    if let Ok(mut err) = handle {
+        let _ = err.write_all(bytes);
+    }
 }
 
 /// End the process unconditionally (no atexit handlers, no stdio flush).
@@ -394,7 +401,7 @@ mod tests {
     }
 
     #[test]
-    fn a_fatal_during_a_stop_gets_its_own_full_bound() {
+    fn a_fatal_during_a_stop_upgrades_the_code_and_keeps_the_first_deadline() {
         static W: OnceLock<Watchdog> = OnceLock::new();
         let w = W.get_or_init(Watchdog::new);
         assert!(w.start(record2));
@@ -420,10 +427,13 @@ mod tests {
         let (cause, at) = fired[0];
         assert_eq!(cause, ExitCause::Fatal, "the failure is reported");
         assert!(
-            at >= fatal_at + Duration::from_millis(300),
-            "the fatal's own bound"
+            at >= start + Duration::from_millis(300),
+            "not before the first deadline"
         );
-        assert!(at < fatal_at + Duration::from_millis(600), "and not later");
+        assert!(
+            at < fatal_at + Duration::from_millis(250),
+            "the first decision's deadline holds; the upgrade does not extend it"
+        );
     }
 
     #[test]

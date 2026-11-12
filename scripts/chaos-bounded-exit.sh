@@ -16,7 +16,7 @@
 # segments.
 #
 # Usage: scripts/chaos-bounded-exit.sh <multiview-binary> [runs=20] [mode=both]
-#   mode "both" runs all three modes (fatal, stop, stopwedge).
+#   mode "both" (or "all") runs the four modes: fatal, stop, stopwedge, falterstop.
 set -euo pipefail
 
 BIN="${1:?usage: chaos-bounded-exit.sh <multiview-binary> [runs] [fatal|stop|both]}"
@@ -120,6 +120,13 @@ run_once() {
       local w2=0
       until grep -q "chaos: stalling the bake consumer" "${log}" 2>/dev/null; do
         sleep 0.05; w2=$((w2 + 1))
+        if grep -q "ticks behind the clock" "${log}" 2>/dev/null; then
+          # A genuine fault before the seam (e.g. a slow first hardware-encoder
+          # open on a loaded host): not this run's scenario. Retry it once.
+          kill -KILL "${pid}" 2>/dev/null || true; wait "${pid}" 2>/dev/null || true
+          echo "run ${i} (${mode}): genuine early fatal before the seam; retrying"
+          return 3
+        fi
         [ "${w2}" -lt 400 ] || { echo "run ${i} (${mode}): stall seam never reached"; tail -20 "${log}"; kill -KILL "${pid}"; return 1; }
       done
       if [ "${mode}" = falterstop ]; then sleep 1.5; else sleep 0.2; fi
@@ -205,11 +212,20 @@ PY
 
 write_config
 fails=0
+ran=0
 for i in $(seq 1 "${RUNS}"); do
   for mode in fatal stop stopwedge falterstop; do
-    [ "${MODE}" = both ] || [ "${MODE}" = "${mode}" ] || continue
-    run_once "${mode}" "${i}" || fails=$((fails + 1))
+    if [ "${MODE}" = both ] || [ "${MODE}" = all ] || [ "${MODE}" = "${mode}" ]; then
+      set +e
+      run_once "${mode}" "${i}"
+      r=$?
+      if [ "${r}" = 3 ]; then run_once "${mode}" "${i}"; r=$?; fi
+      set -e
+      [ "${r}" = 0 ] || fails=$((fails + 1))
+      ran=$((ran + 1))
+    fi
   done
 done
-echo "chaos-bounded-exit: ${fails} failure(s)"
+[ "${ran}" -gt 0 ] || { echo "chaos-bounded-exit: mode '${MODE}' matched no run"; exit 2; }
+echo "chaos-bounded-exit: ${ran} run(s), ${fails} failure(s)"
 [ "${fails}" = 0 ]

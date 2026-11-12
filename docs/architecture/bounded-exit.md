@@ -33,9 +33,9 @@ restarting.
    - `exit_watchdog::arm(cause)` is wait-free and allocation-free and never logs: it
      compare-and-sets a deadline, raises the cause, and unparks the thread. So it is safe to
      call from any thread, including the output clock.
-   - The first arm fixes the deadline. A later `Fatal` upgrades a `Stop`: a run that fails
-     during its stop reports failure, and the deadline moves to the fatal's own bound if that is
-     later. A `Stop` never downgrades a `Fatal`.
+   - The first arm fixes the deadline, and it never moves: the bound is measured from the
+     first exit decision. A later `Fatal` upgrades a `Stop` (a run that fails during its stop
+     exits 1), but it does not extend the deadline. A `Stop` never downgrades a `Fatal`.
    - At the deadline, if the process is still alive, the thread acts as follows:
      - It writes one line to `/dev/stderr` from a helper thread, through its own file handle
        (no std stderr lock, no tracing: either may be the stuck part).
@@ -52,8 +52,8 @@ restarting.
    - The output clock sees the egress fatal flag (`stop_on_egress_failure`) or a disconnected hot
      queue. This also covers a consumer that died without returning, for example a panic.
    - The engine loop returns an error.
-   - The egress join returns an error. This upgrades a stop to a fatal, and the fatal gets its
-     own full bound. On a consumer error, the join still waits for the sinks (bounded) before it
+   - The egress join returns an error. This upgrades a stop to a fatal (exit 1); the deadline
+     stays. On a consumer error, the join still waits for the sinks (bounded) before it
      returns, so their trailers and HLS finalize land.
    - **Outputs still open at the deadline.** Each live egress counts as open until its join has
      resolved every output, on every return path (a drop guard). An output stays open only when
@@ -163,7 +163,7 @@ change shortens dead output after a fault; it does not change the tick path.
 
   The same for SIGTERM (sent once the pipeline runs and the process is alive), with exit code 0.
   The `stopwedge` mode sends SIGTERM while the consumer is stalled (an output that cannot
-  finalise during a stop). It requires exit code 1 within 2 s + 0.5 s of the signal.
+  finalise during a stop). It requires exit code 1 within 2 s + 0.5 s of the signal (the bound runs from the stop decision; the failure only changes the code).
 
   The `falterstop` mode stalls the consumer for 200 ms (frames are shed but the envelope holds),
   then sends SIGTERM. It requires exit code 1, because the run faltered.
