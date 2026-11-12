@@ -118,7 +118,11 @@ cadence or canvas size** (for example a 25 fps or vertical output) and for passt
 Those are not the operator's request.
 
 **The aux canvases do not run on the clock.** ADR-0103 proved that a second composite beside
-Program costs the clock nothing when it runs on its own thread and shares only wait-free reads
+Program costs the clock nothing when it runs on its own thread and shares only wait-free reads.
+One difference matters here: the wall reads `store.slot().load()` (`monitor_wall.rs:246,492`), while
+an aux canvas uses `read_at`, because it needs the cadence latch. `read_at` advances the latch
+watermark, and §2.3 shows that this cannot change Program's selection. The single-reader wording
+in the `tile.rs` docs is updated in slice 1
 (`crates/multiview-cli/src/monitor_wall.rs`, chaos tests `a_blocked_wall_worker_costs_the_output_clock_zero_ticks`
 and `a_panicking_wall_worker_disables_only_the_wall`). This design generalises that pattern, with
 three differences from the wall: aux canvases run at full cadence, they are tick-driven, and they
@@ -146,8 +150,10 @@ use the real compositor.
       route group selector (one per encoder group) ─► that group's existing encoder ─► its outputs
 ```
 
-The clock's only new duty is one `try_send` of a `Tick` (16 bytes) into a capacity-4 channel, in
-`after_compose`. That send never blocks. A full channel drops the tick and increments a counter
+In slices 1-2, the clock's only new duty is one `try_send` of a `Tick` (16 bytes) into a capacity-4
+channel, in `after_compose`. Slices 3-4 add one more: the existing O(1) frame-boundary
+`insert_store`/`remove_store` (`drive.rs:431,454`) for a `layout:` or `bus:` store, once when such a
+store is activated or retired. That send never blocks. A full channel drops the tick and increments a counter
 (§4.4 handles the gap).
 
 ### 2.3 How many canvases, and on which device
@@ -202,9 +208,25 @@ The compositor already does all three in one pass: scale-at-composite, the fixed
 and the latch-on-tick `read_at` (`crates/multiview-framestore/src/tile.rs:592-640`). So a single
 source is a one-cell canvas with `fit = contain` (letterbox or pillarbox on the canvas background).
 
-The cost is honest. A routed source is registered as a consumer at the full canvas size, so its
-decode size rises to the per-axis supremum (`display_size.rs:72`, make-before-break handover,
-`display_size.rs:1-17`). The decode-side scaler already emits tiles at the planned size, tagged like
+The cost, stated plainly. Today the decode size follows **only** the active Program layout: an
+unbound source decodes at 640x360 (`display_size.rs:72-93`, `pipeline.rs:12718-12724`). Slice 1
+therefore adds **aux sizing**: the control drain publishes into the existing `DisplayLayoutSlot` a
+*sizing layout*, which is the Program layout plus one full-canvas cell per source an active aux
+canvas binds. So `cell_pixel_size` takes the per-axis supremum over both.
+
+The resize uses the existing make-before-break handover (`display_size.rs:1-17`):
+
+- it settles in 1.5 s;
+- it waits at least 5 s between two resizes of the same decoder;
+- at most 2 handovers run at once, each holding a second NVDEC session briefly.
+
+A source that is also on Program decodes at the larger size, and Program scales it down at
+composite as it already does for multi-size cells. The cost is more decode MP/s for that source.
+Program's picture does not change.
+
+The plan reports each resize in `decode_resizes`, with the extra MP/s. Admission counts them
+(§7: at most `routing.max_decode_escalations`, default 2). Until a resize lands, the source is
+blitted, not identity: a 640x360 tile is letterboxed to 1080p at 14.1 ms per frame on one core. The decode-side scaler already emits tiles at the planned size, tagged like
 the canvas (`TileScaler`, `pipeline.rs:17574-17580`). So once the resize lands, the tile matches the
 canvas in size and colour tag, and the one-cell compose is the identity. Implementation detail: the
 drive returns the tile `Arc` without drawing. This makes the common case (a 16:9 source to a 16:9
@@ -228,15 +250,25 @@ which is measured at 198 ms per 720p frame on one core.
 The identity shortcut is taken **only** when all of these hold; otherwise the full compose runs:
 
 - the tile and the canvas have equal width and height;
-- the pixel format is NV12 on both sides;
+- the pixel format is NV12 on both sides. Stride does not matter: the encoder's frame converter
+  repacks into libav planes (`sink.rs:601,654`);
+- the tile is progressive. An interlaced-flagged tile always takes the full compose;
 - the tile carries no alpha plane;
 - the cell has opacity 1 and no border or radius;
 - the tile's full `ColorInfo` equals the canvas `ColorInfo`: primaries, transfer, matrix **and**
   range.
 
-A tag comparison is not enough on its own: the decode-side scaler retags to the canvas
-(`pipeline.rs:17574-17580`), so slice 1 tests the shortcut against sources with a different range,
-matrix and size, checking pixel values as well as ffprobe tags.
+**What this colour rule does and does not prove.** Every ingest tile is tagged with the canvas
+colour at decode (`pipeline.rs:14229`). `TileScaler` retags without converting
+(`pipeline.rs:17593-17620`). So the tag comparison above always passes for an ingest tile. It does
+not prove that the source's native colour matches. That retag already exists on **Program**:
+Program composites the same tiles with the same tags.
+
+So a routed source shows exactly the samples Program would show for that source in a full-canvas
+cell. Invariant #8 is no worse on a routed output than on Program today. Fixing native colour
+carry-through at ingest (for example a BT.601 or full-range source) is a pre-existing gap, filed
+as #310. The routing path must not hide it: slice 1 tests that a routed
+source and the same source on a full-canvas Program cell give byte-identical frames.
 
 ### 2.5 Preview and Clean
 
@@ -368,13 +400,21 @@ Tick T is the first tick at which the take is adopted (§4.5).
    The consumer's existing substitution limit (`missing_ticks_before`, `FRAME_SUBSTITUTION_LIMIT = 8`,
    `pipeline.rs:6541-6575`) concerns the consumer itself falling behind the clock. It is unchanged.
    A lagging aux thread never feeds it: a lagging feed is held at the selector.
-   - A feed held for more than 60 consecutive ticks raises `routing.degraded` for those outputs.
-   - The hold continues for as long as the aux thread is alive.
-   - A dead aux thread (§4.4) makes the selector fall back to Program for its groups. That is a
-     visible typed event `route.output {outcome: "fallback:aux-failed"}`, with a forced IDR, never a
-     frozen picture forever.
+   - A feed held for more than 60 consecutive ticks (2 s) raises `routing.degraded` for those
+     outputs.
+   - A feed held for 150 consecutive ticks (5 s) makes the selector fall back to Program for its
+     groups. This happens **whether the aux thread is dead or alive but wedged**: the trigger is the
+     held-tick count, not liveness. It is a visible typed event
+     `route.output {outcome: "fallback:aux-failed"}`, with a forced IDR, so the output is never
+     frozen forever.
+   - The operator re-takes the feed once `routing.degraded` clears.
    - The cut is therefore adopted at the first tick T for which the selector **holds a produced
      frame of the new generation stamped T**. Until then the old feed continues.
+   - **The consumer's own substitution path** (`pipeline.rs:7173-7195`, used when the consumer
+     itself falls behind) today offers one shared `last_baked` Program canvas to every worker.
+     Slice 1 makes it per group: each group substitutes **its own** last frame with its own
+     generation, so a consumer stall never feeds Program pixels to a routed group. §9 adds a
+     consumer-stall test next to the aux-drop test.
 4. **Format.** An output's format (size, cadence, pixel format, colour tags, codec settings) is
    pinned at output start and **never changes on a take**. The new feed is composed at the output's
    pinned canvas size and colour. Scaling, letterboxing and tag conversion happen in the compositor
@@ -442,17 +482,27 @@ make-before-break operation that belongs with RT-15 and #146. It is not part of 
 - **Take admission:** `try_send` into a bounded mailbox (64, the `COMMAND_CAPACITY` pattern of
   `switcher_control.rs:53`). A full mailbox answers 503 `engine-busy`.
 - **A wedged or panicking aux thread** affects only the routed groups. They hold their last-good
-  frame for 60 ticks (`routing.degraded`), then fall back to Program with a forced IDR
-  (`fallback:aux-failed`). A drop guard publishes `routing.feed_state = failed` and an alarm.
+  frame: `routing.degraded` at 60 ticks, then a fallback to Program with a forced IDR
+  (`fallback:aux-failed`) at 150 ticks. A drop guard publishes `routing.feed_state = failed` and an alarm.
   Program and every default output continue, which is the ADR-0103 wall pattern.
 - **A wedged group encoder** costs only its group's outputs. The dispatcher already isolates bindings
   (`crates/multiview-cli/src/rendition_dispatch.rs:1-5`).
 
 ### 4.5 Take gating
 
-A take names an output and a feed. The aux thread drains the mailbox at the start of each tick it
-processes. Per output, the latest take wins; a replaced pending take gets the outcome `superseded`.
-The thread then applies the gate:
+A take names an output and a feed. **The take state machine runs on the bake consumer**, which
+handles every Program tick (`pipeline.rs:7110`), **not on the aux thread**. So a wedged aux thread
+cannot stop a take from completing, being refused, or raising an alarm. At each tick the consumer:
+
+- drains the take mailbox, where the latest take per output wins and a replaced pending take gets
+  the outcome `superseded`;
+- tells the aux thread which canvases to keep active, through a `SwapCell`;
+- applies the gate below, using only wait-free reads: `state_at` on the stores, and the selector's
+  newest aux frame and its stamp;
+- counts held ticks per group. This is also how it detects an aux thread that is dead or wedged:
+  no new aux frame for N ticks.
+
+The gate:
 
 | Feed | Ready when |
 | --- | --- |
@@ -590,12 +640,23 @@ A `layout:<id>` or `bus:*` used **as a source** (§3) is at least one tick behin
 that feed's audio rides with it (for example a layout on Program via the M/E with
 `audio = source:x`), the audio is delayed by the **measured** picture age:
 
-- the age is `k = (tick.pts − selected frame stamp)` in whole ticks, from `source_times`;
-- the delay is `total_at(T) − total_at(T−k)` samples, read from a bounded, preallocated ring of 4
-  ticks (6,408 samples per channel at 48 kHz, 30000/1001);
-- when k changes, the read position moves across one tick with the equal-power ramp of §5.3, so
-  there is no click;
-- k > 4 means the picture is STALE by the store's own rule, and the audio holds the 4-tick delay.
+- the age is `k = max(0, tick.pts − selected frame stamp)` in whole ticks, clamped at 0, because
+  `read_at`'s earliest-retained fallback can return a frame stamped after `now`
+  (`tile.rs:592-640`). The stamp is the layout
+  canvas's own publish stamp (`T.pts` of the tick it was composed for), which `source_times`
+  reports for the selected tile (`drive.rs:71-73`);
+- the delay is `total_at(T) − total_at(T−k)` samples, read from a bounded, preallocated ring sized
+  for 4 ticks (a ceiling of 4 × 1602 = 6,408 samples per channel at 48 kHz, 30000/1001; the exact
+  span varies between 6,406 and 6,407);
+- **the delay target changes only when a new k holds for 30 ticks** (hysteresis), so a transient
+  aux lag does not move the audio;
+- a delay change is a **sample slip by resampling**, not a crossfade. Crossfading a signal with a
+  delayed copy of itself would comb-filter. The read position moves at a rate offset of at most
+  0.5 % (about 8.6 cents, inaudible), using linear interpolation. One tick (1,601-1,602 samples)
+  is absorbed in about 6.7 s;
+- for k > 4, the picture is a held frame aging into STALE by the store's own rule (`tile.rs:521-530`).
+  A held picture has no lip sync to keep, so the audio stays at the 4-tick delay. When the picture
+  is fresh again, the delay slews back to the new k as above.
 
 A layout routed **directly** to an output is not delayed: it composes from tick T's stores and is
 encoded as frame T.
@@ -606,8 +667,14 @@ encoded as frame T.
   naming.** An output's `audio = source:x` carries x's clean block with x's route `gain_db` and
   `mute` applied. It does not apply `include_in_program_bus`, which concerns the mix only.
 - **An output's existing `audio.mode/tracks` stays valid.** `tracks` is now one value of the output
-  audio feed. Default outputs keep exactly today's `auto | program | tracks` semantics and the
-  shared encoder.
+  audio feed. Default outputs keep exactly today's `auto | program | tracks` semantics. Their AAC
+  encode moves from the one shared encoder to their route group's encoder (§5.2); the samples are
+  the same.
+- **A route group has one video feed and one audio feed.** Outputs that share a group share both.
+  An audio take on one member of a multi-output group is refused with `shared-encoder`, exactly
+  as a video take is (§4.3). Different audio on two outputs with identical settings needs a
+  distinct `route_group` in config. On mda001 each output is its own group, so slice 2 gives every
+  output its own audio feed.
 - **On a routed output**, the routed audio feed takes the group encoder's program-audio stream slot.
   The group's selected discrete tracks are encoded by the same group encoder, so each binding's
   audio still comes from one encoder, as today.
@@ -800,13 +867,18 @@ affects:
 
 The engine takes at most one effective cut per output per tick, because the latest take wins at the
 drain (spike: about 20,000 takes caused 4 cuts and no clock effect). Forced IDRs are a bitrate cost,
-so the control plane limits takes to 10 per second **per output** and 20 per second **per
-principal**. A take over either limit gets 429 with `Retry-After`. The existing per-IP limiter
+so the control plane limits takes to 2 per second **per output** (at most one forced IDR every
+500 ms per output) and 10 per second **per principal**.
+
+`encode.rs:208-216` documents a caller-owned floor of at least 2 s for forced keyframes. That floor
+is for viewer-join and PLI requests. A take is an operator content cut and has its own floor: 500
+ms, enforced by the limiter and again at adoption. Each forced IDR costs one deep copy of the frame
+(`encode.rs:310-318`), at most 2 per second per output. A take over either limit gets 429 with `Retry-After`. The existing per-IP limiter
 (`crates/multiview-control/src/limits.rs`) still applies first. Idempotency keys bound replays.
 
 The take mailbox is bounded (64) and **shared by all principals**: when it is full, every
 principal's take gets 503 `engine-busy`. The per-principal limit keeps one principal from filling
-it, because 20 takes per second drain in under a tick.
+it, because 10 takes per second drain in under a tick.
 
 **Breaking change.** `POST /commands/apply-layout` on a run with `[switcher]` now answers 422
 `switcher-owns-program`. Today it answers 202 and breaks the M/E (`routes/mod.rs:756-786`,
@@ -839,11 +911,12 @@ Measured on the build host (Xeon Gold 6132, under load). Compose numbers come fr
 
 - **The CPU reference compositor cannot run aux canvases at full cadence.** It is a correctness
   reference, and it costs about 200 ms per 720p frame on one core. In the default (GPU-free) build,
-  aux canvases therefore use the GPU-free integer path. The identity fast path covers same-size
-  sources. A layout or a letterboxed source uses the wall's integer box scaler with a BT.709 tag
-  pass (no conversion). It is admitted only when all its tiles carry the canvas tag; otherwise the
-  plan refuses with `capacity: aux-compose-unsupported-on-cpu-for-mixed-colour`. With the `gpu`
-  feature (mda001), aux canvases use the wgpu compositor.
+  aux canvases use the GPU-free integer path in **every** build, including mda001, until slice 3's
+  measurement says otherwise. The identity fast path covers same-size sources. A layout or a
+  letterboxed source uses the wall's integer box scaler; samples are copied, because every tile
+  already carries the canvas tag (§2.4). A 6-cell 1080p layout costs 14.1 ms per frame on one core.
+  wgpu aux composition (with borders, fit modes and the full colour pipeline) is an **optional
+  upgrade in slice 3**, enabled only if it passes the Program protection bound (§10).
 - **On mda001** the 4060 runs 5 NVENC sessions at 21 % encoder load. The driver limits sessions
   per system to a moving number (12 on current drivers; `docs/architecture/hardware-and-efficiency.md:155`),
   probed through `nvmlDeviceGetEncoderSessions`. **A take adds no encoder session** (§4.3).
@@ -855,9 +928,14 @@ Measured on the build host (Xeon Gold 6132, under load). Compose numbers come fr
 1. `active_aux_canvases + new ≤ routing.max_aux_canvases` (default 2; 0 disables aux canvases);
 2. on the CPU path, each new aux canvas passes the CPU rule above;
 3. at start, the encoder count (route groups) fits
-   `min(routing.max_encoders, probed_free_encoder_sessions − 2)`. The 2 sessions are reserved for
-   WHEP and the wall. A config that does not fit fails validation with the arithmetic, never at
-   runtime.
+   `probed_free_encoder_sessions − non_routed_sessions`. Here `non_routed_sessions` is computed from
+   the config, not assumed: 1 for the wall when `MULTIVIEW_MOQ_WALL=1`, plus
+   `webrtc.preview_max_focus` WHEP encoders, plus the optional preview ladder's rungs. On mda001
+   that is 1 + 2 = 3, so with 12 sessions per system, 9 are left for route groups. A config that
+   does not fit fails validation with the arithmetic, never at runtime. `routing.max_encoders`
+   (default 4) caps the result;
+4. the number of decode resizes forced by routing stays within `routing.max_decode_escalations`
+   (default 2), with the plan showing their MP/s.
 
 The plan shows the arithmetic. A refused take returns 409 `capacity` with
 `{resource, needed, available, holders: [outputs whose feeds hold aux canvases]}`, redacted per
@@ -877,9 +955,10 @@ The plan shows the arithmetic. A refused take returns 409 `capacity` with
 - **On the GPU this is a scheduling argument, not yet a proof.** A wgpu queue is shared, and aux
   submissions can delay a later Program submission. Slice 3, the first slice that composes on the
   GPU off-clock, has a hard gate on mda001: Program lateness p99 and max are not worse than the hour
-  before, with two aux layout canvases active for an hour. If the gate fails, aux canvases move to
-  the second GPU (the idle Quadro P2000) or to the CPU integer path, and the gate is rerun. Slice 1
-  composes no GPU aux work except the identity case, which composes nothing.
+  before, with two aux layout canvases active for an hour. If the gate fails, slice 3 ships on the
+  CPU integer path, which slice 3 measures and gates first, and wgpu aux stays off. A second-GPU
+  placement is not offered: one `AdmissionPick` pins compositor and decode per run
+  (`pipeline.rs:4130-4180`). Slices 1-2 compose no GPU aux work.
 - The spike shows this order holds: routed outputs at 110/900 fresh while Program had 0 repeats.
 
 ---
@@ -1007,6 +1086,12 @@ Also checked:
 - a held aux frame keeps its old generation, so the IDR lands on the first produced new-feed frame
   (drops injected at the seam);
 - more than 8 dropped aux ticks do not trip the consumer's `FRAME_SUBSTITUTION_LIMIT`;
+- **consumer stall:** a stalled bake consumer substitutes each group's own last frame and
+  generation, never Program pixels into a routed group;
+- **aux sizing:** routing a 640x360-planned source raises its decode to canvas size through the
+  handover, and the plan's `decode_resizes` and MP/s match;
+- **colour parity:** a routed source is byte-identical to the same source on a full-canvas Program
+  cell;
 - a dead aux thread falls back to Program with an IDR;
 - `forced-idr=1` gives a true IDR (`is_idr`) on libx264 and NVENC, and a decode of the cut GOP
   references nothing before the cut;
@@ -1026,7 +1111,8 @@ Also checked:
 
 **Chaos and soak** (owed by an invariant #1/#10 change; none may be skipped):
 
-1. **Take flood:** 2,000 takes per second across all outputs for 10 minutes. Program emits exactly
+1. **Take flood:** 2,000 takes per second across all outputs for 10 minutes (almost all of them
+   get 429). Program emits exactly
    the expected tick count with contiguous PTS. Program lateness p99 stays within 2 ms of the same
    run without routing (CI host); the ratio is checked on mda001.
 2. **Failing feeds:** routed sources die, reconnect and flap every 2 s during takes. Never a stale
@@ -1037,8 +1123,10 @@ Also checked:
    - a principal with Program scope but no Read on S cannot select a `layout:` that shows S onto
      PVW or PGM, directly or through nested `layout:` or `bus:` cells;
    - redaction holds on plan, 409 and event bodies.
-3. **Wedged aux thread:** blocked forever on the first frame. Program gets 40/40 ticks with
-   contiguous PTS; routed outputs hold last-good; `routing.degraded` is raised (the
+3. **Wedged aux thread:** blocked forever on the first frame. Program gets every tick with
+   contiguous PTS. Routed outputs hold last-good, raise `routing.degraded` at 60 ticks and fall back
+   to Program with an IDR at 150 ticks. A take pending at the wedge gets its terminal
+   `refused:feed-not-fresh` at 50 ticks, driven by the bake consumer (the
    `a_blocked_wall_worker_costs_the_output_clock_zero_ticks` pattern).
 4. **Panicking aux thread:** the same, plus a drop guard marks the feeds failed.
 5. **Wedged group encoder:** only its group's outputs lose windows (dispatcher isolation).
@@ -1050,17 +1138,19 @@ Also checked:
 
 ## 10. Slices
 
+Epic: #303.
+
 Each slice is one PR, shippable alone and visible to the operator. Acceptance is measured on mda001
 after deploy (deployment by the lead under RULES). Risk class: R3 for slices touching the
 clock-adjacent path, otherwise as `scripts/classify.sh` says.
 
 | # | Slice | Gives the operator | Risk / crates | Does NOT yet do |
 | --- | --- | --- | --- | --- |
-| **1** | **Route a single source, VT, bars or Preview to an output, live, from the Outputs page and the API** | Named items: "preview", "VT", "bars", "source", "program" (back). Audio follows (`follow`), crossfaded | R3. `multiview-config` (feed fields, alias), `multiview-engine` (aux thread with one-cell canvases + identity path, take mailbox, gate), `multiview-output` (`forced-idr=1` + force-keyframe on `VideoRenditionEncoder`), `multiview-cli` (route-group selector in front of the existing encoders, generation-labelled frames, per-group AAC encoder from bus strips), `multiview-control` (`GET /routing`, `output` kind on plan/take, `route.output` event, BOLA on the object axis, per-output and per-principal limits), `web` (Outputs page feed row) | Layouts as feeds, Clean, explicit audio selection, salvos, the matrix page |
-| 2 | Explicit audio feed per output (`program`, `source`, `tracks`, `none`) live; Clean bus to an output | "how do I route audio?": any source's audio alone on any output, live | R2-R3. `multiview-cli`, `-config`, `-control`, `web` (Audio row) | Layout audio attribute (slice 3) |
-| 3 | Route a stored layout to an output (GPU aux canvas + CPU integer path), admission and cost in plan, the `routing.degraded` path | "layout": NewsOne on the HLS output while the switcher stays on | R3. `multiview-engine`, `-cli`, `-control`, `web` | Layout on the M/E, buses inside layouts |
-| 4 | Layout-as-a-source on the M/E (PVW/PGM/AUTO); `bus:program` and `bus:preview` cells; cycle refusal; first-slice restriction removed; `apply-layout` semantics | "in, around, through" (#243) | R3. `multiview-engine`, `-cli`, `-config`, `-control` | More than one M/E |
-| 5 | Crosspoint matrix Routing page (video + audio, tally, all states), output salvos (`/routing/salvo/*`, `Salvo.output`) | One screen for everything, atomic multi-output takes | R2. `web`, `multiview-control`, `-config`, `-engine` (salvo adoption) | — |
+| **1** (#304) | **Route a single source, VT, bars or Preview to an output, live, from the Outputs page and the API** | Named items: "preview", "VT", "bars", "source", "program" (back). Audio follows (`follow`), crossfaded | R3. `multiview-config` (feed fields, alias), `multiview-engine` (aux thread with one-cell canvases + identity path, take mailbox, gate), `multiview-output` (`forced-idr=1` + force-keyframe on `VideoRenditionEncoder`), `multiview-cli` (route-group selector in front of the existing encoders, generation-labelled frames, per-group AAC encoder from bus strips), `multiview-control` (`GET /routing`, `output` kind on plan/take, `route.output` event, BOLA on the object axis, per-output and per-principal limits), `web` (Outputs page feed row) | Layouts as feeds, Clean, explicit audio selection, salvos, the matrix page |
+| 2 (#305) | Explicit audio feed per output (`program`, `source`, `tracks`, `none`) live; Clean bus to an output | "how do I route audio?": any source's audio alone on any output, live | R2-R3. `multiview-cli`, `-config`, `-control`, `web` (Audio row) | Layout audio attribute (slice 3) |
+| 3 (#306) | Route a stored layout to an output (GPU aux canvas + CPU integer path), admission and cost in plan, the `routing.degraded` path | "layout": NewsOne on the HLS output while the switcher stays on | R3. `multiview-engine`, `-cli`, `-control`, `web` | Layout on the M/E, buses inside layouts |
+| 4 (#307) | Layout-as-a-source on the M/E (PVW/PGM/AUTO); `bus:program` and `bus:preview` cells; cycle refusal; first-slice restriction removed; `apply-layout` semantics | "in, around, through" (#243) | R3. `multiview-engine`, `-cli`, `-config`, `-control` | More than one M/E |
+| 5 (#308) | Crosspoint matrix Routing page (video + audio, tally, all states), output salvos (`/routing/salvo/*`, `Salvo.output`) | One screen for everything, atomic multi-output takes | R2. `web`, `multiview-control`, `-config`, `-engine` (salvo adoption) | — |
 
 **Program protection bound: acceptance for every slice.** Measured on mda001 over at least 10
 minutes with N routed feeds active, against the same 10-minute measurement with none:

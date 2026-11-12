@@ -64,7 +64,14 @@ What is true on main f5f2230e (the full table with citations is in §1 of the no
      equals the canvas in size, format and full `ColorInfo`) skips drawing.
    - Ingest tiles already carry the canvas colour tag, so in slices 1-2 a non-identity single source
      is a pure-integer CPU letterbox (the ADR-0103 scaler, 14.1 ms per 1080p frame on one core).
-     **No GPU compose is added before slice 3.**
+     **No GPU compose is added before slice 3.** Slice 3 starts on the integer path, and wgpu aux is
+     an upgrade gated by measurement.
+   - Routed sources join the decode-size plan (a *sizing layout*: Program cells plus one full-canvas
+     cell per routed source), through the existing make-before-break handover. Each resize is
+     costed in the plan and capped by admission.
+   - The routed path shows exactly the samples Program shows for that source. Ingest retags tiles
+     to the canvas colour today (`pipeline.rs:14229`), and native-colour carry-through is a
+     pre-existing gap (#310).
    - The aux thread is a dedicated OS thread at `nice +10`, never on the tokio runtime that hosts
      the output clock.
    - Clean is the Program canvas before the overlay bake, with no extra compose.
@@ -87,12 +94,14 @@ What is true on main f5f2230e (the full table with citations is in §1 of the no
    - PTS = DTS = the tick index. The bake consumer feeds every Program tick as today, taking the
      selector's frame for tick T, or the newest held frame **with its own generation label**. A
      lagging aux thread is held at the selector: `routing.degraded` after 60 ticks, then a fallback
-     to Program with an IDR if the aux thread is dead. It never trips the consumer's 8-tick
+     to Program with an IDR after 150 held ticks, whether the aux thread is dead or wedged. It never trips the consumer's 8-tick
      substitution limit.
    - An output's format is pinned and never changes on a take. A format change is RT-15's
      make-before-break migration.
 
-4. **Take gate (ADR-0104 reused).** A take applies only when its feed is fresh at that tick
+4. **Take gate (ADR-0104 reused), run on the bake consumer.** The take state machine runs on the
+   bake consumer, which handles every tick. The aux thread only composes. So a wedged aux thread
+   cannot stop takes from completing or being refused. A take applies only when its feed is fresh at that tick
    (`state_at(T.pts).is_live()` for sources and Preview; a composed frame for a layout). It is held
    up to 50 ticks, then refused with `feed-not-fresh`. Until then the output keeps its last-good
    feed: never a stale, slate or black frame from a feed that was not ready. On-demand sources are
@@ -103,6 +112,8 @@ What is true on main f5f2230e (the full table with citations is in §1 of the no
    - A source, VT or generator carries its own audio.
    - Preview carries the PVW source's audio.
    - A layout carries its `audio` attribute (default `program`).
+   - A route group carries one video feed and one audio feed. An audio take on one member of a
+     multi-output group is refused with `shared-encoder`, as a video take is.
    - An explicit selection overrides follow.
 
    Routed audio is built on the bake consumer from the per-source blocks the program bus already
@@ -118,7 +129,9 @@ What is true on main f5f2230e (the full table with citations is in §1 of the no
      publish into `bus:program` and `bus:preview`.
    - The M/E's PVW/PGM/AUTO and layout cells select these like any source. They are one tick behind
      their own sources in steady state. Their audio is delayed by the measured picture age
-     (`source_times`): a bounded 4-tick ring, ramped when the age changes.
+     (`source_times`): a bounded 4-tick ring, with 30-tick hysteresis and a resampled sample slip
+     (at most a 0.5 % rate offset) when the age changes. Never a crossfade of the signal with a
+     delayed copy of itself.
    - Feed cycles are refused at plan time and at adoption.
    - A PVW/PGM/AUTO select of `layout:L` requires Read on every source L shows, transitively.
    - `first_slice_me_layout_supported` is removed: with a switcher, the Program canvas is the M/E
@@ -144,13 +157,16 @@ What is true on main f5f2230e (the full table with citations is in §1 of the no
    - Plan, 409 and event bodies redact what the caller cannot read.
    - Takes are persisted only after `applied`.
    - Idempotency keys are body-blind (a new key per distinct take).
-   - Takes are limited to 10 per second per output and 20 per second per principal.
+   - Takes are limited to 2 per second per output (one forced IDR per 500 ms) and 10 per second per
+     principal.
    - `apply-layout` with a switcher becomes 422, a breaking change documented in the note.
 
 8. **Admission (invariant #9).**
    - At most `routing.max_aux_canvases` (default 2) aux canvases.
-   - Takes add no encoder session. The route-group encoder count is admitted at start against
-     `min(routing.max_encoders, probed free NVENC sessions − 2)`.
+   - Takes add no encoder session. The route-group encoder count is admitted at start against the
+     probed free NVENC sessions minus the sessions the config's wall, WHEP and preview ladder need
+     (3 on mda001).
+   - At most `routing.max_decode_escalations` (default 2) decode resizes are forced by routing.
    - In the default GPU-free build, aux canvases use the identity path or the ADR-0103 integer box
      scaler, never the CPU reference compositor (measured: not viable at full cadence).
    - A refused take answers 409 `capacity`, naming the resource and its holders.
@@ -232,7 +248,9 @@ Results (ffprobe and the run log):
   (503 when full).
 - **Invariant #7.** Encoder count with default config equals today's for video. AAC goes from one
   shared encoder to one per route group (2 on mda001, about +2.7 % of a core).
-- **Backward compatibility.** Absent config behaves exactly as today. Configs with a switcher and a
+- **Backward compatibility.** Absent config gives today's pixels, samples, video encoder count and
+  outputs. The only internal difference is one AAC encoder per route group instead of one shared
+  encoder. Configs with a switcher and a
   multi-cell layout start instead of failing.
 - **ADR-0030** stays Proposed, amended: aux canvases of one Program cover output routing, and
   separate Programs remain the model for other cadences or sizes and for passthrough.
@@ -243,7 +261,7 @@ Results (ffprobe and the run log):
   - RT-16's salvo shape is reused.
   - RT-17 is superseded by slice 5.
   - SW-27 is superseded.
-- **Slices** (note §10):
+- **Slices** (note §10; epic #303, slices #304-#308):
   1. preview, program, VT, bars and source to an output, live, from the Outputs page and the API.
      This is what the operator named, except layout, and it needs no GPU compose;
   2. explicit audio feed and Clean;
