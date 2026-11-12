@@ -418,10 +418,11 @@ pub enum WarningCode {
     /// The saved accepted state (`desired.json`) could not start, so the engine
     /// started from the last state that started (#317). The message names the
     /// reason and where a copy of the rejected state was kept; `desired.json`
-    /// itself is unchanged (#324). **Persisted** across restarts until
-    /// acknowledged (`POST /api/v1/health/accepted-state-rejected/ack` or
-    /// `multiview acknowledge-fallback`). Remediation: fix or re-apply the
-    /// configuration.
+    /// itself is unchanged (#324). **Persisted**: raised on every start that
+    /// still cannot use the saved configuration, cleared by a start that can;
+    /// acknowledging (`POST /api/v1/health/accepted-state-rejected/ack` or
+    /// `multiview acknowledge-fallback`) silences the current alarm only.
+    /// Remediation: fix or re-apply the configuration.
     AcceptedStateRejected,
 }
 

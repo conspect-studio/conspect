@@ -86,13 +86,16 @@ pub(crate) async fn list_health(
 const HEALTH_WARNING_KIND: &str = "health-warning";
 
 /// `POST /api/v1/health/{code}/ack` — acknowledge the persisted
-/// `accepted-state-rejected` warning (role: write, #324).
+/// `accepted-state-rejected` warning (role: write, unscoped; #324).
 ///
-/// Removes the start-up fallback marker (on the blocking pool — file I/O never
-/// runs on a runtime worker, and never on the engine), records the warning as
-/// cleared in the store and publishes `health.warning.cleared` through the
-/// drop-oldest lane (inv #10). The operator's saved configuration is not
-/// touched: acknowledging only silences the alarm.
+/// Removes the start-up fallback marker (on the blocking pool, under the
+/// config-mutation lock — file I/O never runs on a runtime worker, and never on
+/// the engine), then publishes `health.warning.cleared` through the
+/// drop-oldest lane (inv #10) and waits briefly for the warning ingest to apply
+/// it. Acknowledging silences the CURRENT alarm only: a later start that still
+/// cannot use the saved configuration raises it again. The saved configuration
+/// is not touched. An unreadable or unparsable marker still counts as pending
+/// and is removed.
 #[cfg_attr(
     feature = "openapi",
     utoipa::path(
@@ -103,7 +106,7 @@ const HEALTH_WARNING_KIND: &str = "health-warning";
         responses(
             (status = 204, description = "Acknowledged: the persisted marker is removed and the warning cleared."),
             (status = 401, description = "Missing or invalid credentials.", body = crate::problem::Problem),
-            (status = 403, description = "Not authorized to acknowledge.", body = crate::problem::Problem),
+            (status = 403, description = "Not authorized to acknowledge (read-only role, or a scoped key: this is a whole-system action).", body = crate::problem::Problem),
             (status = 404, description = "Not an acknowledgeable code, no config-file run, or nothing pending.", body = crate::problem::Problem),
         ),
     )
@@ -114,6 +117,9 @@ pub(crate) async fn ack_health_warning(
     Path(code): Path<String>,
 ) -> ControlResult<StatusCode> {
     principal.role.require(Action::Write)?;
+    // A system-wide alarm about the whole saved configuration: a scoped
+    // principal must not silence it (BOLA — it is outside any allowlist).
+    crate::routes::require_unscoped_for_whole_system(&principal)?;
     let not_found = || ControlError::NotFound {
         kind: HEALTH_WARNING_KIND,
         id: code.clone(),
@@ -124,42 +130,76 @@ pub(crate) async fn ack_health_warning(
     let Some(model) = state.boot_model.clone() else {
         return Err(not_found());
     };
+    // Serialize with every other state-file writer (a concurrent commit or a
+    // second acknowledge) across the read + remove.
+    let _mutation = state.lock_config_mutation().await;
     let boot_path = model.boot_path().to_path_buf();
-    let removed = tokio::task::spawn_blocking(move || {
-        let marker = crate::boot_model::read_boot_fallback_marker(&boot_path)
+    let (marker_removed, marker_message) = tokio::task::spawn_blocking(move || {
+        // An unreadable/oversized/unparsable marker still means "pending":
+        // its message is unknown, but it is removed all the same.
+        let message = crate::boot_model::read_boot_fallback_marker(&boot_path)
             .ok()
-            .flatten();
-        crate::boot_model::clear_boot_fallback_marker(&boot_path).map(|removed| (removed, marker))
+            .flatten()
+            .map(|m| m.message);
+        crate::boot_model::clear_boot_fallback_marker(&boot_path).map(|removed| (removed, message))
     })
     .await
     .map_err(|e| ControlError::Repository(format!("acknowledge task failed: {e}")))?
     .map_err(|e| ControlError::Repository(format!("removing the start-up fallback marker: {e}")))?;
-    let (marker_removed, marker) = removed;
-    let active = state
-        .warnings
-        .list(&WarningFilter::active_only())?
-        .into_iter()
-        .find(|w| w.code == WarningCode::AcceptedStateRejected);
+    let active = active_rejection(&state)?;
     if !marker_removed && active.is_none() {
         return Err(not_found());
     }
     let message = active
         .as_ref()
         .map(|w| w.message.clone())
-        .or_else(|| marker.map(|m| m.message))
+        .or(marker_message)
         .unwrap_or_default();
     let since = active.as_ref().map_or(0, |w| w.since);
     let cleared = crate::warning_ingest::emit_accepted_state_rejected_cleared(
         state.engine.as_ref(),
-        message,
+        &message,
         since,
     );
-    // Upsert directly as well: the ingest mirrors the same event, but a client
-    // that acknowledges and immediately re-reads must see it cleared.
-    state.warnings.upsert(cleared)?;
+    // The broadcast is FIFO: once the ingest applied OUR clear, any raise
+    // published before it was applied first, so the store cannot flip back.
+    // Never upsert ahead of the ingest (a raise still queued would then
+    // overwrite the clear). Bounded wait on the control plane only; on timeout
+    // (no ingest running, or it lagged past our event) write it directly.
+    // "Applied" = the store holds the warning AND it is inactive: an absent
+    // entry may just mean an earlier raise has not been ingested yet.
+    let deadline = tokio::time::Instant::now() + ACK_INGEST_WAIT;
+    while !rejection_cleared(&state)? {
+        if tokio::time::Instant::now() >= deadline {
+            state.warnings.upsert(cleared)?;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
     tracing::info!(
         key = %principal.key_id,
         "accepted-state-rejected acknowledged; start-up fallback marker removed"
     );
     Ok(StatusCode::NO_CONTENT)
+}
+
+/// How long an acknowledge waits for the warning ingest to apply its clear.
+const ACK_INGEST_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// The active `accepted-state-rejected` warning in the store, if any.
+fn active_rejection(state: &AppState) -> ControlResult<Option<HealthWarning>> {
+    Ok(state
+        .warnings
+        .list(&WarningFilter::active_only())?
+        .into_iter()
+        .find(|w| w.code == WarningCode::AcceptedStateRejected))
+}
+
+/// Whether the store holds the `accepted-state-rejected` warning as cleared.
+fn rejection_cleared(state: &AppState) -> ControlResult<bool> {
+    Ok(state
+        .warnings
+        .list(&WarningFilter { active: None })?
+        .into_iter()
+        .any(|w| w.code == WarningCode::AcceptedStateRejected && !w.active))
 }

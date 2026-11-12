@@ -2170,6 +2170,10 @@ pub const BOOT_FALLBACK_FILE: &str = "boot-fallback.json";
 /// restart (and a `--ticks` / no-`[control]` run) until an operator
 /// acknowledges it. A latched in-memory warning alone would vanish on the
 /// very restart that is most likely to follow a bad start.
+///
+/// Deliberately NOT `deny_unknown_fields`: a marker written by a newer build
+/// with extra fields must still raise the warning (and be acknowledgeable)
+/// after a rollback to this one.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[non_exhaustive]
 pub struct BootFallbackMarker {
@@ -2216,15 +2220,32 @@ pub fn boot_fallback_marker_path(boot_path: &Path) -> PathBuf {
 /// # Errors
 /// The marker exists but cannot be read or parsed.
 pub fn read_boot_fallback_marker(boot_path: &Path) -> Result<Option<BootFallbackMarker>, String> {
+    use std::io::Read as _;
     let path = boot_fallback_marker_path(boot_path);
-    match std::fs::read_to_string(&path) {
-        Ok(text) => serde_json::from_str(&text)
-            .map(Some)
-            .map_err(|e| format!("parsing {}: {e}", path.display())),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(e) => Err(format!("reading {}: {e}", path.display())),
+    let file = match std::fs::File::open(&path) {
+        Ok(file) => file,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(format!("reading {}: {e}", path.display())),
+    };
+    // Bounded read (#324): a marker is a few KiB; anything larger is not one of
+    // ours and is treated as unreadable (still removable by an acknowledge).
+    let mut text = String::new();
+    file.take(MAX_BOOT_FALLBACK_MARKER_BYTES.saturating_add(1))
+        .read_to_string(&mut text)
+        .map_err(|e| format!("reading {}: {e}", path.display()))?;
+    if text.len() > usize::try_from(MAX_BOOT_FALLBACK_MARKER_BYTES).unwrap_or(usize::MAX) {
+        return Err(format!(
+            "{} is larger than {MAX_BOOT_FALLBACK_MARKER_BYTES} bytes",
+            path.display()
+        ));
     }
+    serde_json::from_str(&text)
+        .map(Some)
+        .map_err(|e| format!("parsing {}: {e}", path.display()))
 }
+
+/// The largest start-up fallback marker [`read_boot_fallback_marker`] reads.
+pub const MAX_BOOT_FALLBACK_MARKER_BYTES: u64 = 64 * 1024;
 
 /// Remove the start-up fallback marker (the operator acknowledged it). Returns
 /// whether a marker was present. Blocking file I/O: call it at start-up or on

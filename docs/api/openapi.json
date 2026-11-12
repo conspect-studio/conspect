@@ -4115,8 +4115,8 @@
         "tags": [
           "health"
         ],
-        "summary": "`POST /api/v1/health/{code}/ack` — acknowledge the persisted\n`accepted-state-rejected` warning (role: write, #324).",
-        "description": "Removes the start-up fallback marker (on the blocking pool — file I/O never\nruns on a runtime worker, and never on the engine), records the warning as\ncleared in the store and publishes `health.warning.cleared` through the\ndrop-oldest lane (inv #10). The operator's saved configuration is not\ntouched: acknowledging only silences the alarm.",
+        "summary": "`POST /api/v1/health/{code}/ack` — acknowledge the persisted\n`accepted-state-rejected` warning (role: write, unscoped; #324).",
+        "description": "Removes the start-up fallback marker (on the blocking pool, under the\nconfig-mutation lock — file I/O never runs on a runtime worker, and never on\nthe engine), then publishes `health.warning.cleared` through the\ndrop-oldest lane (inv #10) and waits briefly for the warning ingest to apply\nit. Acknowledging silences the CURRENT alarm only: a later start that still\ncannot use the saved configuration raises it again. The saved configuration\nis not touched. An unreadable or unparsable marker still counts as pending\nand is removed.",
         "operationId": "ack_health_warning",
         "parameters": [
           {
@@ -4144,7 +4144,7 @@
             }
           },
           "403": {
-            "description": "Not authorized to acknowledge.",
+            "description": "Not authorized to acknowledge (read-only role, or a scoped key: this is a whole-system action).",
             "content": {
               "application/json": {
                 "schema": {

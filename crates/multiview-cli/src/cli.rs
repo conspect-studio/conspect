@@ -69,10 +69,12 @@ pub enum Command {
     /// Acknowledge a start-up fallback (#324): when a start could not use the
     /// saved configuration (`<config-dir>/.multiview/desired.json`) and ran
     /// from the last configuration that started, the `accepted-state-rejected`
-    /// warning stays raised across restarts until acknowledged. This removes
-    /// that record; the saved configuration itself is never changed. A
-    /// running engine clears its banner on its next start, or acknowledge it
-    /// through the API (`POST /api/v1/health/accepted-state-rejected/ack`).
+    /// warning is persisted. This removes that record, silencing the current
+    /// alarm only; the saved configuration is never changed. Every later start
+    /// that still cannot use the saved configuration raises the warning again,
+    /// until it is fixed or replaced; a start that uses it clears the warning
+    /// by itself. A running engine's banner is cleared only by the API
+    /// acknowledgement (`POST /api/v1/health/accepted-state-rejected/ack`).
     AcknowledgeFallback(AcknowledgeFallbackArgs),
 }
 

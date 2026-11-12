@@ -1310,12 +1310,15 @@ export interface paths {
         put?: never;
         /**
          * `POST /api/v1/health/{code}/ack` — acknowledge the persisted
-         *     `accepted-state-rejected` warning (role: write, #324).
-         * @description Removes the start-up fallback marker (on the blocking pool — file I/O never
-         *     runs on a runtime worker, and never on the engine), records the warning as
-         *     cleared in the store and publishes `health.warning.cleared` through the
-         *     drop-oldest lane (inv #10). The operator's saved configuration is not
-         *     touched: acknowledging only silences the alarm.
+         *     `accepted-state-rejected` warning (role: write, unscoped; #324).
+         * @description Removes the start-up fallback marker (on the blocking pool, under the
+         *     config-mutation lock — file I/O never runs on a runtime worker, and never on
+         *     the engine), then publishes `health.warning.cleared` through the
+         *     drop-oldest lane (inv #10) and waits briefly for the warning ingest to apply
+         *     it. Acknowledging silences the CURRENT alarm only: a later start that still
+         *     cannot use the saved configuration raises it again. The saved configuration
+         *     is not touched. An unreadable or unparsable marker still counts as pending
+         *     and is removed.
          */
         post: operations["ack_health_warning"];
         delete?: never;
@@ -12130,7 +12133,7 @@ export interface operations {
                     "application/json": components["schemas"]["Problem"];
                 };
             };
-            /** @description Not authorized to acknowledge. */
+            /** @description Not authorized to acknowledge (read-only role, or a scoped key: this is a whole-system action). */
             403: {
                 headers: {
                     [name: string]: unknown;

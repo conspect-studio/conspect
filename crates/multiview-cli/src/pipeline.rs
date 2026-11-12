@@ -332,29 +332,53 @@ pub enum PipelineError {
         /// Why it is unavailable.
         reason: String,
     },
-    /// The host/environment failed while building (#324): an OS-level I/O
-    /// error — a directory that cannot be created, a worker thread that cannot
-    /// be spawned. No configuration would build here, so start-up retries it
-    /// and never falls back to the last-good state over it.
+    /// An OS-level I/O error while building or running (#324), carrying its
+    /// [`std::io::Error`] so start-up can classify it by kind
+    /// ([`crate::boot::io_failure_class`]): a directory that cannot be
+    /// created, a worker thread that cannot be spawned.
     #[error("{context}: {source}")]
-    Environment {
+    Io {
         /// What was being done (e.g. `output hls: creating /srv/hls`).
         context: String,
         /// The OS error.
         #[source]
         source: std::io::Error,
+        /// `true` when the failure is a host fault regardless of its kind —
+        /// a thread spawn the OS refused (`EAGAIN`, a thread or memory limit)
+        /// can never be fixed by a different configuration.
+        host: bool,
     },
 }
 
 impl PipelineError {
+    /// An I/O failure classified by its kind.
+    pub(crate) fn io(context: impl Into<String>, source: std::io::Error) -> Self {
+        Self::Io {
+            context: context.into(),
+            source,
+            host: false,
+        }
+    }
+
+    /// A worker-thread spawn the OS refused: always a host fault.
+    pub(crate) fn thread_spawn(context: impl Into<String>, source: std::io::Error) -> Self {
+        Self::Io {
+            context: context.into(),
+            source,
+            host: true,
+        }
+    }
+
     /// Whether this build failure is a fault in the configuration or in the
-    /// host (#324). Only [`PipelineError::Environment`] is environment-class;
-    /// everything else defaults to state-class, which is safe because the
-    /// start-up fallback never changes the saved configuration.
+    /// host (#324): an [`PipelineError::Io`] by its OS error kind (or always
+    /// environment for a refused thread spawn); everything else is
+    /// state-class, which is safe because the start-up fallback never changes
+    /// the saved configuration.
     #[must_use]
     pub fn failure_class(&self) -> crate::boot::FailureClass {
         match self {
-            Self::Environment { .. } => crate::boot::FailureClass::Environment,
+            Self::Io { host: true, .. } => crate::boot::FailureClass::Environment,
+            Self::Io { source, .. } => crate::boot::io_failure_class(source.kind()),
             _ => crate::boot::FailureClass::State,
         }
     }
@@ -1544,11 +1568,25 @@ mod failure_class_tests {
     /// configuration-shaped error stays state-class.
     #[test]
     fn pipeline_error_failure_class_mapping() {
-        let env = PipelineError::Environment {
-            context: "output hls: creating /x".to_owned(),
-            source: std::io::Error::from(std::io::ErrorKind::PermissionDenied),
-        };
-        assert_eq!(env.failure_class(), FailureClass::Environment);
+        use std::io::{Error, ErrorKind};
+        for kind in [
+            ErrorKind::AddrInUse,
+            ErrorKind::ResourceBusy,
+            ErrorKind::PermissionDenied,
+            ErrorKind::StorageFull,
+        ] {
+            let env = PipelineError::io("output hls: creating /x", Error::from(kind));
+            assert_eq!(env.failure_class(), FailureClass::Environment, "{kind:?}");
+        }
+        // A real OS error (EADDRINUSE = 98 on Linux) maps by its kind too.
+        let raw = PipelineError::io("x", Error::from_raw_os_error(98));
+        assert_eq!(raw.failure_class(), FailureClass::Environment);
+        // A path fault is the configuration's.
+        let path = PipelineError::io("x", Error::from(ErrorKind::NotADirectory));
+        assert_eq!(path.failure_class(), FailureClass::State);
+        // A refused thread spawn is the host's whatever its kind.
+        let spawn = PipelineError::thread_spawn("x", Error::other("limit"));
+        assert_eq!(spawn.failure_class(), FailureClass::Environment);
         for error in [
             PipelineError::Engine("e".into()),
             PipelineError::NoOutput("file/HLS"),
@@ -1566,23 +1604,49 @@ mod failure_class_tests {
     }
 
     /// #324, end to end through `Pipeline::build`: an HLS segment directory
-    /// that cannot be created (here: its parent is a regular file, so this
-    /// fails even as root) is an environment-class build failure.
+    /// the process may not create (its parent is mode 0500) is an
+    /// environment-class build failure — a real `PermissionDenied`.
+    #[cfg(unix)]
     #[test]
-    fn an_uncreatable_hls_directory_is_an_environment_failure() {
+    fn an_hls_directory_without_permission_is_an_environment_failure() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempfile::tempdir().unwrap();
+        let locked = dir.path().join("locked");
+        std::fs::create_dir(&locked).unwrap();
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o500)).unwrap();
+        if std::fs::create_dir(locked.join("probe")).is_ok() {
+            eprintln!("skipping: this process ignores directory permissions (root)");
+            return;
+        }
+        let playlist = locked.join("hls").join("index.m3u8");
+        let result = Pipeline::build(&hls_config(&playlist));
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let Err(error) = result else {
+            panic!("the build must fail");
+        };
+        assert_eq!(error.failure_class(), FailureClass::Environment, "{error}");
+    }
+
+    /// #324: an HLS path under a regular file is the configured path's fault
+    /// (`NotADirectory`), so a STATE-class failure — kind-based, not site-based.
+    #[test]
+    fn an_hls_path_under_a_file_is_a_state_failure() {
         let dir = tempfile::tempdir().unwrap();
         let blocker = dir.path().join("not-a-dir");
         std::fs::write(&blocker, b"x").unwrap();
         let playlist = blocker.join("hls").join("index.m3u8");
+        let Err(error) = Pipeline::build(&hls_config(&playlist)) else {
+            panic!("the build must fail");
+        };
+        assert_eq!(error.failure_class(), FailureClass::State, "{error}");
+    }
+
+    fn hls_config(playlist: &std::path::Path) -> MultiviewConfig {
         let doc = format!(
             "schema_version = 1\n[canvas]\nwidth = 64\nheight = 64\nfps = \"25/1\"\npixel_format = \"nv12\"\nbackground = \"#000000\"\n[canvas.color]\nprofile = \"sdr-bt709-limited\"\n[layout]\nkind = \"absolute\"\n[[sources]]\nid = \"envclass_cam\"\nkind = \"bars\"\n[[cells]]\nid = \"c\"\nrect = {{ x = 0.0, y = 0.0, w = 1.0, h = 1.0 }}\n[cells.source]\ninput_id = \"envclass_cam\"\n[[outputs]]\nkind = \"hls\"\npath = {:?}\ncodec = \"mpeg2video\"\nsegment_ms = 1000\n",
             playlist.display().to_string()
         );
-        let config = MultiviewConfig::load_from_toml(&doc).expect("parses");
-        let Err(error) = Pipeline::build(&config) else {
-            panic!("the build must fail");
-        };
-        assert_eq!(error.failure_class(), FailureClass::Environment, "{error}");
+        MultiviewConfig::load_from_toml(&doc).expect("parses")
     }
 }
 
@@ -2679,12 +2743,8 @@ impl Pipeline {
         let mut stores: HashMapStores = std::collections::HashMap::new();
         let source_events = Arc::new(
             // #324: the only failure is a worker thread spawn — the host.
-            crate::source_event_runtime::Runtime::new().map_err(|source| {
-                PipelineError::Environment {
-                    context: "engine: source events".to_owned(),
-                    source,
-                }
-            })?,
+            crate::source_event_runtime::Runtime::new()
+                .map_err(|source| PipelineError::thread_spawn("engine: source events", source))?,
         );
         let mut ingest_plans: Vec<IngestPlan> = Vec::with_capacity(config.sources.len());
         // Per-source audio stores + decode plans (AUD-2). Built for every
@@ -3499,11 +3559,11 @@ impl Pipeline {
         &self,
         binding_ids: &[Option<String>],
     ) -> Result<RunRouting, PipelineError> {
-        // #324: a thread that cannot be spawned is a host fault, not a state one.
-        let spawn_err = |source: std::io::Error| PipelineError::Environment {
-            context: "output routing".to_owned(),
-            source,
-        };
+        // #324: a thread that cannot be spawned is a host fault. This runs in
+        // `drive_streaming` (after start-up committed), so it never reaches the
+        // start-up fallback decision; the class only matters for reporting.
+        let spawn_err =
+            |source: std::io::Error| PipelineError::thread_spawn("output routing", source);
         let (aux_tx, aux_rx) = multiview_engine::aux_tick_channel();
         let catalogue = Arc::clone(&self.catalogue);
         let boot = self.stores.clone();
@@ -12203,12 +12263,12 @@ fn build_hls_output(
     epoch: &multiview_output::SharedEpoch,
 ) -> Result<RunnableOutput, PipelineError> {
     let (dir, prefix, playlist_path) = hls_paths(Path::new(path));
-    // #324: a directory that cannot be created (permissions, a read-only or
-    // full volume, a missing mount) is a host fault: retried, never a reason to
-    // fall back from the operator's saved state.
-    std::fs::create_dir_all(&dir).map_err(|source| PipelineError::Environment {
-        context: format!("output hls: creating {}", dir.display()),
-        source,
+    // #324: classified by kind — permissions, a read-only or full volume is a
+    // host fault (retried, never a reason to fall back from the operator's
+    // saved state); a path under a regular file (`NotADirectory`) is a fault
+    // of the configured path, so state-class.
+    std::fs::create_dir_all(&dir).map_err(|source| {
+        PipelineError::io(format!("output hls: creating {}", dir.display()), source)
     })?;
     let (meta, matrix) = output_mux_meta(output);
     Ok(RunnableOutput::Hls {

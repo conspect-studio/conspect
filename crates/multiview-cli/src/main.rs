@@ -190,15 +190,18 @@ async fn dispatch(cli: Cli) -> anyhow::Result<ExitCode> {
 }
 
 /// The `acknowledge-fallback` subcommand (#324): remove the persisted
-/// start-up fallback marker so the `accepted-state-rejected` warning is not
-/// raised again on the next start. The saved configuration is not touched.
+/// start-up fallback marker, silencing the current `accepted-state-rejected`
+/// alarm. A later start that still cannot use the saved configuration raises
+/// it again. The saved configuration is not touched.
 fn run_acknowledge_fallback(args: &AcknowledgeFallbackArgs) -> anyhow::Result<ExitCode> {
     match multiview_cli::last_good::acknowledge(&args.config).map_err(anyhow::Error::msg)? {
         Some(message) => {
             println!("acknowledged the start-up fallback warning: {message}");
             println!(
-                "a running engine clears its banner on the next start, or acknowledge it \
-                 through the API (POST /api/v1/health/accepted-state-rejected/ack)"
+                "the saved configuration is unchanged. The warning is raised again on every \
+                 start that still cannot use it, until it is fixed or replaced; a start that \
+                 uses it clears the warning by itself. A running engine's banner is cleared \
+                 only through the API (POST /api/v1/health/accepted-state-rejected/ack)."
             );
         }
         None => println!("no start-up fallback warning is pending"),
@@ -337,11 +340,14 @@ async fn run_pipeline(
     multiview_cli::run::start_gate(plane.level()).map_err(|e| anyhow::anyhow!("{e}"))?;
     // #317/#324: build from the start decision; a STATE-class build failure on
     // the accepted state falls back to a different last-good that builds. An
-    // environment-class one (`PipelineError::Environment`: host I/O, thread
-    // spawns) is retried on the same state and then fails — a fault that
-    // breaks every state never falls back. Only AFTER a successful build is a
-    // planned fallback recorded (a kept copy + the persisted marker;
-    // desired.json itself is never changed).
+    // environment-class one (`PipelineError::Io` classified by its OS error
+    // kind — e.g. permission denied / a full volume creating the HLS dir — or a
+    // refused thread spawn) is retried on the same state and then fails: a
+    // fault that breaks every state never falls back. Only AFTER a successful
+    // build is a planned fallback recorded (a kept copy + the persisted marker;
+    // desired.json itself is never changed). No socket binds during the build:
+    // the control-plane/MoQ listeners bind later, so EADDRINUSE there fails
+    // start-up and never reaches this decision.
     let (start, built) = multiview_cli::boot::build_with_fallback(
         start.clone(),
         &args.config,

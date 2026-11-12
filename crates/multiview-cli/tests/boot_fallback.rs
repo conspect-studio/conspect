@@ -250,7 +250,7 @@ async fn non_bootable_saved_state_with_last_good_starts_from_last_good_and_keeps
     // The alarm: a latched, critical health warning naming reason and file.
     let publisher = EnginePublisher::<EngineStateSnapshot, Event>::new(8);
     let mut events = publisher.subscribe();
-    multiview_control::emit_accepted_state_rejected(&publisher, fallback.message(), 1);
+    multiview_control::emit_accepted_state_rejected(&publisher, &fallback.message(), 1);
     let event = events.try_recv().expect("warning published");
     let Event::HealthWarningRaised(warning) = event.event.as_ref() else {
         panic!("expected a health warning, got {:?}", event.event);
@@ -903,11 +903,19 @@ async fn an_unchanged_state_that_fails_to_build_returns_the_original_error_and_w
     assert!(!marker_exists(&path));
 }
 
-/// The boot document plus a read-only and an operator API key.
+/// The boot document plus a read-only, an operator and a SCOPED operator
+/// API key (their secrets are set by [`set_key_secrets`]).
 fn boot_with_keys() -> String {
     format!(
-        "{BOOT}[[api.keys]]\nkey_id = \"ro\"\nsecret_env = \"BOOT_FALLBACK_TEST_RO\"\nrole = \"read_only\"\n[[api.keys]]\nkey_id = \"op\"\nsecret_env = \"BOOT_FALLBACK_TEST_OP\"\nrole = \"operator\"\n"
+        "{BOOT}[[api.keys]]\nkey_id = \"ro\"\nsecret_env = \"BOOT_FALLBACK_TEST_RO\"\nrole = \"read_only\"\n[[api.keys]]\nkey_id = \"op\"\nsecret_env = \"BOOT_FALLBACK_TEST_OP\"\nrole = \"operator\"\n[[api.keys]]\nkey_id = \"sc\"\nsecret_env = \"BOOT_FALLBACK_TEST_SC\"\nrole = \"operator\"\nscoped_object_ids = [\"in_a\"]\n"
     )
+}
+
+fn set_key_secrets() {
+    std::env::set_var("MULTIVIEW_CONTROL_TOKEN", "test-secret");
+    std::env::set_var("BOOT_FALLBACK_TEST_RO", "ro-secret");
+    std::env::set_var("BOOT_FALLBACK_TEST_OP", "op-secret");
+    std::env::set_var("BOOT_FALLBACK_TEST_SC", "sc-secret");
 }
 
 async fn http(addr: std::net::SocketAddr, method: &str, uri: &str, token: &str) -> (u16, String) {
@@ -980,9 +988,7 @@ async fn serve(
 /// `POST /api/v1/health/accepted-state-rejected/ack` (write role).
 #[tokio::test]
 async fn the_persisted_warning_is_listed_and_acknowledged_over_the_api() {
-    std::env::set_var("MULTIVIEW_CONTROL_TOKEN", "test-secret");
-    std::env::set_var("BOOT_FALLBACK_TEST_RO", "ro-secret");
-    std::env::set_var("BOOT_FALLBACK_TEST_OP", "op-secret");
+    set_key_secrets();
     let text = boot_with_keys();
     let dir = tempfile::tempdir().unwrap();
     let (path, boot) = install_text(dir.path(), &text).await;
@@ -1029,6 +1035,16 @@ async fn the_persisted_warning_is_listed_and_acknowledged_over_the_api() {
     .await;
     assert_eq!(status, 403);
     assert!(marker_exists(&path));
+    // #324 review: a SCOPED operator may not silence a whole-system alarm.
+    let (status, _) = http(
+        addr,
+        "POST",
+        "/api/v1/health/accepted-state-rejected/ack",
+        "sc.sc-secret",
+    )
+    .await;
+    assert_eq!(status, 403);
+    assert!(marker_exists(&path), "a refused ack leaves the marker");
     // Another code: not acknowledgeable.
     let (status, _) = http(
         addr,
@@ -1064,6 +1080,191 @@ async fn the_persisted_warning_is_listed_and_acknowledged_over_the_api() {
         saved,
         "never touched"
     );
+    let _ = stop.send(());
+    let _ = server.await;
+}
+
+/// A fallback committed from the six-cell state, the way run 1 leaves it;
+/// returns the boot path, the boot config and the boot text with API keys.
+async fn fallen_back(dir: &Path) -> (PathBuf, MultiviewConfig, String) {
+    set_key_secrets();
+    let text = boot_with_keys();
+    let (path, boot) = install_text(dir, &text).await;
+    mark_started(&path).await;
+    make_six_cell(&path);
+    let first = resolve_start_config(boot.clone(), text.clone(), &path).unwrap();
+    let (first, ()) = build_with_fallback(first, &path, &retry(), |_| Ok(())).unwrap();
+    commit_fallback(first, &path).unwrap();
+    assert!(marker_exists(&path));
+    (path, boot, text)
+}
+
+/// #324 review B: once the saved state starts again (admitted AND built, no
+/// fallback), a pending marker is stale — its "started from the last
+/// configuration that ran" is no longer true. The start removes it, raises
+/// nothing, and `validate` stops warning.
+#[tokio::test]
+async fn a_clean_start_from_the_accepted_state_clears_a_stale_marker() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, boot) = install(dir.path()).await;
+    mark_started(&path).await;
+    let good = std::fs::read(desired(&path)).unwrap();
+    make_six_cell(&path);
+    start_ok(boot.clone(), &path).unwrap();
+    assert!(marker_exists(&path));
+    // The operator fixes the saved state (here: back to one that admits).
+    std::fs::write(desired(&path), &good).unwrap();
+    let start = start_ok(boot, &path).unwrap();
+    assert!(start.boot_fallback.is_none());
+    assert!(!marker_exists(&path), "the stale marker is settled");
+    let publisher = publisher();
+    let mut events = publisher.subscribe();
+    assert!(!multiview_cli::last_good::announce(
+        &path, &start, &publisher
+    ));
+    assert!(raised(&mut events).is_none());
+    let (_, report) = validate(&path);
+    assert!(!report.contains("start-up fallback is pending"), "{report}");
+}
+
+/// #324 review B: a start with NO accepted state proves nothing about the
+/// saved configuration, so it leaves a pending marker alone.
+#[tokio::test]
+async fn a_start_without_an_accepted_state_leaves_the_marker_alone() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, boot) = install(dir.path()).await;
+    mark_started(&path).await;
+    make_six_cell(&path);
+    start_ok(boot.clone(), &path).unwrap();
+    assert!(marker_exists(&path));
+    std::fs::remove_file(desired(&path)).unwrap();
+    let start = start_ok(boot, &path).unwrap();
+    assert!(start.accepted_text.is_none());
+    assert!(marker_exists(&path), "not settled by a boot-document start");
+}
+
+/// #324 review E: credentials in the build error never reach the marker,
+/// the warning or the message.
+#[tokio::test]
+async fn secrets_in_the_build_error_are_redacted_before_persisting() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, boot) = install(dir.path()).await;
+    mark_started(&path).await;
+    make_different_admissible(&path);
+    let start = resolve_start_config(boot, BOOT.to_owned(), &path).unwrap();
+    let accepted = start.running.switcher.clone();
+    let (start, ()) = build_with_fallback(start, &path, &retry(), |config| {
+        if config.switcher == accepted {
+            Err(BuildFailure::state(
+                "opening srt://h:1?passphrase=secret123456 failed; pushing rtmp://u:p@h/app/key refused",
+            ))
+        } else {
+            Ok(())
+        }
+    })
+    .unwrap();
+    let start = commit_fallback(start, &path).unwrap();
+    let fallback = start.boot_fallback.clone().unwrap();
+    let marker = std::fs::read_to_string(boot_fallback_marker_path(&path)).unwrap();
+    let publisher = publisher();
+    let mut events = publisher.subscribe();
+    assert!(multiview_cli::last_good::announce(
+        &path, &start, &publisher
+    ));
+    let warning = raised(&mut events).unwrap();
+    for text in [&fallback.reason, &fallback.message(), &marker, &warning] {
+        assert!(!text.contains("secret123456"), "{text}");
+        assert!(!text.contains("passphrase="), "{text}");
+        assert!(!text.contains("u:p@"), "{text}");
+        assert!(text.contains("srt://h:1"), "the host stays useful: {text}");
+    }
+}
+
+/// #324 review E: a huge build error is bounded in the marker and messages.
+#[tokio::test]
+async fn a_huge_build_error_is_bounded_in_the_marker_and_the_warning() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, boot) = install(dir.path()).await;
+    mark_started(&path).await;
+    make_different_admissible(&path);
+    let start = resolve_start_config(boot, BOOT.to_owned(), &path).unwrap();
+    let accepted = start.running.switcher.clone();
+    // Short words: redaction (which masks long token runs) cannot shrink it.
+    let huge = "ab ".repeat((1 << 20) / 3);
+    let (start, ()) = build_with_fallback(start, &path, &retry(), |config| {
+        if config.switcher == accepted {
+            Err(BuildFailure::state(huge.clone()))
+        } else {
+            Ok(())
+        }
+    })
+    .unwrap();
+    let start = commit_fallback(start, &path).unwrap();
+    let max = multiview_control::MAX_WARNING_TEXT;
+    let fallback = start.boot_fallback.clone().unwrap();
+    assert!(fallback.reason.len() <= max, "{}", fallback.reason.len());
+    assert!(fallback.message().len() <= max);
+    let marker = std::fs::read(boot_fallback_marker_path(&path)).unwrap();
+    assert!(marker.len() <= 3 * max, "{} bytes", marker.len());
+    let publisher = publisher();
+    let mut events = publisher.subscribe();
+    assert!(multiview_cli::last_good::announce(
+        &path, &start, &publisher
+    ));
+    assert!(raised(&mut events).unwrap().len() <= max);
+}
+
+/// #324 review F: the rejected/ bound holds on a dedupe hit too, and the
+/// reused copy is never the one pruned.
+#[tokio::test]
+async fn the_rejected_bound_holds_when_a_kept_copy_is_reused() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, boot) = install(dir.path()).await;
+    mark_started(&path).await;
+    make_six_cell(&path);
+    let saved = std::fs::read(desired(&path)).unwrap();
+    let rejected = path.parent().unwrap().join(".multiview").join(REJECTED_DIR);
+    std::fs::create_dir_all(&rejected).unwrap();
+    // The OLDEST file holds the matching bytes: plain oldest-first pruning
+    // would remove it.
+    let matching = rejected.join("desired-0000000000000-000.json");
+    std::fs::write(&matching, &saved).unwrap();
+    for i in 1..(MAX_REJECTED + 3) {
+        std::fs::write(
+            rejected.join(format!("desired-{i:013}-000.json")),
+            format!("other {i}"),
+        )
+        .unwrap();
+    }
+    let start = start_ok(boot, &path).unwrap();
+    assert_eq!(start.boot_fallback.unwrap().kept_at, Some(matching.clone()));
+    let left = rejected_files(&path);
+    assert_eq!(left.len(), MAX_REJECTED, "{left:?}");
+    assert!(left.contains(&matching));
+}
+
+/// #324 review D: an unreadable (here: unparsable, then oversized) marker is
+/// still pending — the acknowledge removes it and answers 204.
+#[tokio::test]
+async fn an_unreadable_marker_is_acknowledged_and_removed() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, boot, text) = fallen_back(dir.path()).await;
+    let start = resolve_start_config(boot, text, &path).unwrap();
+    let publisher = Arc::new(publisher());
+    let (addr, stop, server, _commands) = serve(&start, &path, &publisher).await;
+    let oversized = vec![b' '; 128 * 1024];
+    for garbage in [b"{not json".to_vec(), oversized] {
+        std::fs::write(boot_fallback_marker_path(&path), &garbage).unwrap();
+        let (status, body) = http(
+            addr,
+            "POST",
+            "/api/v1/health/accepted-state-rejected/ack",
+            "op.op-secret",
+        )
+        .await;
+        assert_eq!(status, 204, "{body}");
+        assert!(!marker_exists(&path));
+    }
     let _ = stop.send(());
     let _ = server.await;
 }

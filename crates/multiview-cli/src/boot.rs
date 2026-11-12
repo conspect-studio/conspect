@@ -379,9 +379,16 @@ fn plan_last_good(
 
 /// What kind of fault a failed engine build is (#324). The start-up fallback
 /// only helps when the fault is in the saved STATE: a host/environment fault
-/// (a port in use, a missing directory permission, a thread that cannot be
-/// spawned, an expired lease) breaks every state alike, so falling back would
-/// only replace the operator's configuration for nothing.
+/// during the BUILD (a directory the process may not create, a full or
+/// read-only volume, a thread that cannot be spawned, an expired lease)
+/// breaks every state alike, so falling back would only replace the
+/// operator's configuration for nothing.
+///
+/// Scope: this classifies the engine BUILD only. No socket is bound during
+/// `Pipeline::build` / `SoftwareEngine::build` — the control-plane and `MoQ`
+/// listeners bind after [`commit_fallback`], and AES67 senders bind when the
+/// run drives them — so an `EADDRINUSE` there fails start-up (or skips that
+/// output) and never reaches the fallback decision at all.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum FailureClass {
@@ -393,6 +400,33 @@ pub enum FailureClass {
     /// The host/environment failed (I/O, sockets, threads, licence lease): the
     /// same configuration is retried with backoff and never rolled back.
     Environment,
+}
+
+/// Classify an OS error raised while building the engine by its kind (#324):
+/// the kinds a host produces (address in use/unavailable, permission denied,
+/// a full, read-only or over-quota volume, a busy resource, a transient
+/// `EAGAIN`/`EINTR`/timeout, a refused connection, out of memory) are
+/// [`FailureClass::Environment`]; anything else — `NotFound`, `InvalidInput`,
+/// `InvalidData`, … usually means the configuration names something wrong —
+/// is [`FailureClass::State`], the safe default (see there).
+#[must_use]
+pub fn io_failure_class(kind: std::io::ErrorKind) -> FailureClass {
+    use std::io::ErrorKind as K;
+    match kind {
+        K::AddrInUse
+        | K::AddrNotAvailable
+        | K::PermissionDenied
+        | K::StorageFull
+        | K::ReadOnlyFilesystem
+        | K::ResourceBusy
+        | K::WouldBlock
+        | K::Interrupted
+        | K::TimedOut
+        | K::ConnectionRefused
+        | K::OutOfMemory
+        | K::QuotaExceeded => FailureClass::Environment,
+        _ => FailureClass::State,
+    }
 }
 
 /// A classified engine build failure (#324).
@@ -449,10 +483,12 @@ impl From<&str> for BuildFailure {
     }
 }
 
-/// How often an environment-class build failure is retried (#324), on the
+/// How often an environment-class BUILD failure is retried (#324), on the
 /// SAME configuration, before start-up gives up. Runs at start-up before any
 /// output clock exists (inv #1), so a plain blocking sleep is fine: nothing
-/// else is scheduled yet that it could delay.
+/// else is scheduled yet that it could delay. It covers the engine build only:
+/// the control-plane listener bind and the output-routing thread spawn happen
+/// later (after the commit / when the run drives), outside this retry.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct RetryPolicy {
@@ -463,9 +499,9 @@ pub struct RetryPolicy {
 
 impl RetryPolicy {
     /// Production: 250 ms, 1 s, 2 s (3 retries, 4 attempts, ~3.25 s worst
-    /// case) — long enough to ride out a socket still in `TIME_WAIT` or a
-    /// device a previous instance is releasing, short enough that a supervisor
-    /// restart loop stays responsive.
+    /// case) — long enough to ride out a transient host fault during the build
+    /// (`EAGAIN` on a thread spawn, a volume being remounted), short enough
+    /// that a supervisor restart loop stays responsive.
     #[must_use]
     pub fn startup() -> Self {
         Self::new(vec![
@@ -532,7 +568,9 @@ fn environment_error(failure: &BuildFailure, attempts: usize) -> String {
 /// copy of the rejected bytes is kept under `rejected/` (deduplicated), the
 /// persisted `boot-fallback.json` marker is written, and
 /// [`StartConfig::boot_fallback`] is recorded (the warning). A start that does
-/// not plan a fallback is returned unchanged.
+/// not plan a fallback is returned unchanged, except that a start which ran
+/// from the accepted state settles (removes) a stale marker
+/// ([`crate::last_good::settle_marker`]).
 ///
 /// If the copy or the marker cannot be written (`ENOSPC`, a read-only state
 /// dir) the start STILL proceeds from last-good: `desired.json` is untouched so
@@ -560,6 +598,9 @@ pub fn commit_fallback_with(
     writer: &crate::last_good::AtomicWriter<'_>,
 ) -> Result<StartConfig, String> {
     let Some(pending) = start.pending_fallback.take() else {
+        // No fallback: if this start ran from the accepted state, a pending
+        // marker from an earlier fallback is now false — settle it (#324).
+        let _ = crate::last_good::settle_marker(boot_path, &start);
         return Ok(start);
     };
     let now_ms = std::time::SystemTime::now()
@@ -578,17 +619,16 @@ pub fn commit_fallback_with(
             None
         }
     };
-    let mut fallback = crate::last_good::Fallback {
-        reason: pending.reason,
-        kept_at,
-        persist_error: None,
-        since_unix_ms: now_ms,
-    };
+    // Redacted + bounded before anything persists, publishes or logs it.
+    let mut fallback = crate::last_good::Fallback::new(&pending.reason, now_ms);
+    fallback.kept_at = kept_at;
     if let Err(error) = crate::last_good::write_marker_with(boot_path, &fallback, writer) {
         persist_errors.push(error);
     }
     if !persist_errors.is_empty() {
-        fallback.persist_error = Some(persist_errors.join("; "));
+        fallback.persist_error = Some(multiview_control::bounded_warning_text(
+            &multiview_control::catalogue::netdiag::redact_text(&persist_errors.join("; ")),
+        ));
     }
     tracing::error!(
         boot = %boot_path.display(),
@@ -709,4 +749,45 @@ pub struct PreflightRefusal {
     /// `true`: a start would fall back to the last-good copy (and raise the
     /// `accepted-state-rejected` warning); `false`: a start would fail.
     pub falls_back: bool,
+}
+
+#[cfg(test)]
+mod failure_class_tests {
+    #![allow(clippy::unwrap_used)]
+    use super::{io_failure_class, FailureClass};
+
+    /// #324: classification by OS error kind, driven with real `io::Error`s
+    /// (a bound port, a held lock, a forbidden path) and raw errnos.
+    #[test]
+    fn host_io_kinds_are_environment_and_path_kinds_are_state() {
+        use std::io::ErrorKind;
+        // A real EADDRINUSE from the OS.
+        let held = std::net::TcpListener::bind("[::1]:0").unwrap();
+        let addr = held.local_addr().unwrap();
+        let in_use = std::net::TcpListener::bind(addr).unwrap_err();
+        assert_eq!(in_use.kind(), ErrorKind::AddrInUse);
+        assert_eq!(io_failure_class(in_use.kind()), FailureClass::Environment);
+        // EBUSY (16), EACCES (13), ENOSPC (28), EROFS (30), EAGAIN (11).
+        for errno in [16, 13, 28, 30, 11] {
+            let error = std::io::Error::from_raw_os_error(errno);
+            assert_eq!(
+                io_failure_class(error.kind()),
+                FailureClass::Environment,
+                "errno {errno}: {error}"
+            );
+        }
+        assert_eq!(
+            std::io::Error::from_raw_os_error(16).kind(),
+            ErrorKind::ResourceBusy
+        );
+        for kind in [
+            ErrorKind::NotFound,
+            ErrorKind::InvalidInput,
+            ErrorKind::InvalidData,
+            ErrorKind::NotADirectory,
+            ErrorKind::Other,
+        ] {
+            assert_eq!(io_failure_class(kind), FailureClass::State, "{kind:?}");
+        }
+    }
 }

@@ -28,9 +28,12 @@
 //! 5. raise a latched `accepted-state-rejected` health warning naming what was
 //!    rejected, why, and where the copy was kept.
 //!
-//! An ENVIRONMENT-class build error (a port in use, a missing directory
-//! permission…) never falls back at all: it is retried and then fails, since
-//! it would break every state alike (see [`crate::boot::FailureClass`]).
+//! An ENVIRONMENT-class build error (an OS error of a host kind — permission
+//! denied, a full or read-only volume, a busy resource — or a refused thread
+//! spawn) never falls back at all: it is retried and then fails, since it
+//! would break every state alike (see [`crate::boot::FailureClass`]). Socket
+//! binds are not part of the build: a listener's `EADDRINUSE` fails start-up
+//! later and never reaches this decision.
 //!
 //! With no last-good copy (a first install) the start fails as before with the
 //! clear error: a first install must never invent a state.
@@ -77,7 +80,24 @@ pub struct Fallback {
 }
 
 impl Fallback {
-    /// The operator-facing warning text.
+    /// A fallback for `reason`, made safe to persist, publish and log (#324):
+    /// the reason embeds an engine error that can carry a source/output URL
+    /// with credentials (`srt://…?passphrase=`, `rtmp://user:pass@…`) and can
+    /// be arbitrarily long, so it is redacted
+    /// ([`multiview_control::catalogue::netdiag::redact_text`]: URL userinfo,
+    /// query strings, `key=`-style values and long token runs) and bounded to
+    /// [`multiview_control::MAX_WARNING_TEXT`] before anything stores it.
+    #[must_use]
+    pub fn new(reason: &str, since_unix_ms: i64) -> Self {
+        Self {
+            reason: safe_text(reason),
+            kept_at: None,
+            persist_error: None,
+            since_unix_ms,
+        }
+    }
+
+    /// The operator-facing warning text (redacted and bounded).
     #[must_use]
     pub fn message(&self) -> String {
         let mut message = format!(
@@ -93,7 +113,7 @@ impl Fallback {
                 " The start-up fallback could not be recorded on disk ({error}); this warning will not survive a restart."
             );
         }
-        message
+        multiview_control::bounded_warning_text(&message)
     }
 
     /// The persisted marker for this fallback.
@@ -106,6 +126,14 @@ impl Fallback {
             self.message(),
         )
     }
+}
+
+/// Redact credentials and bound the length of text that leaves the process
+/// in the start-up fallback warning (#324).
+fn safe_text(text: &str) -> String {
+    multiview_control::bounded_warning_text(&multiview_control::catalogue::netdiag::redact_text(
+        text,
+    ))
 }
 
 /// An atomic state-file writer: production uses
@@ -165,6 +193,9 @@ pub fn keep_rejected_copy_with(
         .into_iter()
         .find(|p| std::fs::read_to_string(p).is_ok_and(|kept| kept == rejected_text))
     {
+        // The bound holds on a reuse too (files may have been dropped in by
+        // hand or by an older build); the reused copy is never pruned.
+        prune_rejected(&rejected_dir, &existing);
         return Ok(existing);
     }
     create_private_dir(&rejected_dir)?;
@@ -179,6 +210,43 @@ pub fn keep_rejected_copy_with(
         .map_err(|e| format!("keeping a copy of the rejected state: {e}"))?;
     prune_rejected(&rejected_dir, &kept);
     Ok(kept)
+}
+
+/// Remove a pending start-up fallback marker when THIS start ran from the
+/// accepted state (#324): its claim — "the engine started from the last
+/// configuration that ran" — is no longer true, so it must not raise the
+/// warning again. Only a start resolved from the accepted state and built with
+/// no fallback settles it; a start with no `desired.json` (or one that fell
+/// back) leaves it alone. Start-up only (blocking file I/O, before the clock).
+/// Returns whether a marker was removed; a removal failure is logged, never
+/// fatal (at worst the warning is raised once more).
+pub fn settle_marker(boot_path: &Path, start: &crate::boot::StartConfig) -> bool {
+    if start.accepted_text.is_none()
+        || start.boot_fallback.is_some()
+        || start.pending_fallback.is_some()
+    {
+        return false;
+    }
+    let reason = match read_boot_fallback_marker(boot_path) {
+        Ok(Some(marker)) => marker.reason,
+        Ok(None) => return false,
+        Err(error) => format!("(unreadable record: {error})"),
+    };
+    match clear_boot_fallback_marker(boot_path) {
+        Ok(removed) => {
+            if removed {
+                tracing::warn!(
+                    reason = %safe_text(&reason),
+                    "the saved configuration started again: cleared the pending start-up fallback warning"
+                );
+            }
+            removed
+        }
+        Err(error) => {
+            tracing::warn!(%error, "could not clear a stale start-up fallback marker");
+            false
+        }
+    }
 }
 
 /// Persist the start-up fallback marker for `fallback` (#324).
@@ -225,7 +293,7 @@ pub fn announce<S>(
     if let Some(fallback) = &start.boot_fallback {
         multiview_control::emit_accepted_state_rejected(
             publisher,
-            fallback.message(),
+            &fallback.message(),
             now_nanos(Some(fallback.since_unix_ms)),
         );
         return true;
@@ -234,7 +302,9 @@ pub fn announce<S>(
         Ok(Some(marker)) => {
             multiview_control::emit_accepted_state_rejected(
                 publisher,
-                marker.message,
+                // Read back from disk (possibly written by an older build):
+                // redact + bound again.
+                &safe_text(&marker.message),
                 now_nanos(Some(marker.since_unix_ms)),
             );
             true
@@ -245,9 +315,9 @@ pub fn announce<S>(
         Err(error) => {
             multiview_control::emit_accepted_state_rejected(
                 publisher,
-                format!(
+                &safe_text(&format!(
                     "An earlier start could not use the saved configuration and started from the last configuration that ran, but its record cannot be read ({error})."
-                ),
+                )),
                 now_nanos(None),
             );
             true
@@ -256,15 +326,22 @@ pub fn announce<S>(
 }
 
 /// Acknowledge a pending start-up fallback warning from the command line
-/// (#324): remove the marker. Returns the cleared warning's text, or `None`
-/// when nothing was pending. A running engine clears its banner on the API
-/// acknowledgement or its next start.
+/// (#324): remove the persisted marker. Returns the cleared warning's text
+/// (a placeholder when the marker was unreadable), or `None` when nothing was
+/// pending.
+///
+/// This silences the current alarm only. It does not change the saved
+/// configuration, and it does not reach a running engine's banner (use the
+/// API acknowledgement for that). Every later start that still cannot use the
+/// saved configuration falls back again and raises the warning again, until
+/// the configuration is fixed or replaced; a start that uses it clears the
+/// warning by itself.
 ///
 /// # Errors
 /// The marker exists but could not be removed.
 pub fn acknowledge(boot_path: &Path) -> Result<Option<String>, String> {
     let message = match read_boot_fallback_marker(boot_path) {
-        Ok(marker) => marker.map(|m| m.message),
+        Ok(marker) => marker.map(|m| safe_text(&m.message)),
         Err(error) => Some(format!("(an unreadable start-up fallback record: {error})")),
     };
     let removed = clear_boot_fallback_marker(boot_path).map_err(|e| {
@@ -328,7 +405,9 @@ fn rejected_files(dir: &Path) -> Vec<PathBuf> {
 fn prune_rejected(dir: &Path, keep: &Path) {
     let files = rejected_files(dir);
     let excess = files.len().saturating_sub(MAX_REJECTED);
-    for path in files.into_iter().take(excess).filter(|p| p != keep) {
+    // Skip `keep` BEFORE counting, so a kept file among the oldest (a dedupe
+    // reuse, #324) still leaves exactly MAX_REJECTED.
+    for path in files.into_iter().filter(|p| p != keep).take(excess) {
         if let Err(error) = std::fs::remove_file(&path) {
             tracing::warn!(path = %path.display(), %error, "could not prune a kept rejected state");
         }
