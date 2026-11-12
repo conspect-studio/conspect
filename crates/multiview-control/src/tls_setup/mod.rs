@@ -234,9 +234,8 @@ async fn create_session(State(state): State<AppState>, request: Request) -> Resp
     let Some(peer) = peer_ip(request.extensions()) else {
         return problem(400, "tls-peer-unknown", "Peer address unavailable");
     };
-    let body = match axum::body::to_bytes(request.into_body(), 4096).await {
-        Ok(body) => body,
-        Err(_) => return problem(413, "payload-too-large", "Body too large"),
+    let Ok(body) = axum::body::to_bytes(request.into_body(), 4096).await else {
+        return problem(413, "payload-too-large", "Body too large");
     };
     let Ok(SetupSessionRequest { code }) = serde_json::from_slice(&body) else {
         return problem(400, "bad-request", "Expected {\"code\": \"...\"}");
@@ -445,26 +444,29 @@ pub fn missing_credentials(config: &NetworkTlsConfig) -> Vec<String> {
 fn loopback_admin(
     parts: &axum::http::request::Parts,
     state: &AppState,
-) -> Result<Arc<TlsContext>, Response> {
-    let tls = state
-        .tls
-        .clone()
-        .ok_or_else(|| problem(404, "tls-not-configured", "No [network.tls] configured"))?;
+) -> Result<Arc<TlsContext>, Box<Response>> {
+    let tls = state.tls.clone().ok_or_else(|| {
+        Box::new(problem(
+            404,
+            "tls-not-configured",
+            "No [network.tls] configured",
+        ))
+    })?;
     let loopback = parts
         .extensions
         .get::<ConnectInfo<SocketAddr>>()
         .is_some_and(|ConnectInfo(addr)| is_loopback(addr.ip()));
     if !loopback {
-        return Err(problem(
+        return Err(Box::new(problem(
             403,
             "tls-loopback-only",
             "This route is served only to a loopback peer on the admin listener",
-        ));
+        )));
     }
     match crate::routes::authenticate_principal(parts, state) {
         Ok(p) if p.role == Role::Admin => Ok(tls),
-        Ok(_) => Err(problem(403, "forbidden", "Admin role required")),
-        Err(e) => Err(e.into_response()),
+        Ok(_) => Err(Box::new(problem(403, "forbidden", "Admin role required"))),
+        Err(e) => Err(Box::new(e.into_response())),
     }
 }
 
@@ -472,7 +474,7 @@ async fn admin_setup_code(State(state): State<AppState>, request: Request) -> Re
     let (parts, _) = request.into_parts();
     let tls = match loopback_admin(&parts, &state) {
         Ok(tls) => tls,
-        Err(r) => return r,
+        Err(r) => return *r,
     };
     let code = tls.setup.mint();
     tracing::info!("tls setup: a new one-time setup code was minted via the admin listener");
@@ -490,7 +492,7 @@ async fn admin_issue(State(state): State<AppState>, request: Request) -> Respons
     let (parts, _) = request.into_parts();
     match loopback_admin(&parts, &state) {
         Ok(tls) => trigger_issue(&tls),
-        Err(r) => r,
+        Err(r) => *r,
     }
 }
 
@@ -498,7 +500,7 @@ async fn admin_credential(State(state): State<AppState>, request: Request) -> Re
     let (parts, body) = request.into_parts();
     let tls = match loopback_admin(&parts, &state) {
         Ok(tls) => tls,
-        Err(r) => return r,
+        Err(r) => return *r,
     };
     let Ok(body) = axum::body::to_bytes(body, CREDENTIAL_BODY_LIMIT).await else {
         return problem(413, "payload-too-large", "Body larger than 8 KiB");
@@ -537,7 +539,7 @@ async fn admin_credential(State(state): State<AppState>, request: Request) -> Re
     }
 }
 
-/// Write `<state_dir>/secrets/<name>` mode 0600 atomically (state_dir and
+/// Write `<state_dir>/secrets/<name>` mode 0600 atomically (`state_dir` and
 /// secrets/ are 0700). Also used by the CLI when the engine is not running.
 ///
 /// # Errors

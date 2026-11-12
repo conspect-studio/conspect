@@ -11,6 +11,7 @@
 //! A credential value is read from stdin only (never argv), with echo off when
 //! stdin is a terminal, and is never printed.
 
+use std::fmt::Write as _;
 use std::io::{Read as _, Write as _};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpStream};
 use std::path::Path;
@@ -45,12 +46,13 @@ pub fn ensure_acme_supported(config: &MultiviewConfig) -> Result<(), String> {
     )
 }
 
-/// Run one `multiview tls` subcommand; returns the process exit status.
+/// Run one `multiview tls` subcommand; returns the text for stdout (the
+/// binary prints it; this library never prints).
 ///
 /// # Errors
 /// An unreadable or invalid config, a refused (non-loopback) listener, or a
 /// failed request.
-pub fn run(command: &TlsCommand) -> anyhow::Result<bool> {
+pub fn run(command: &TlsCommand) -> anyhow::Result<String> {
     match command {
         TlsCommand::Status(args) => status(args),
         TlsCommand::SetupCode(args) => {
@@ -61,14 +63,12 @@ pub fn run(command: &TlsCommand) -> anyhow::Result<bool> {
                 anyhow::bail!("setup-code refused: HTTP {code}: {}", problem_title(&body));
             }
             let json: serde_json::Value = serde_json::from_slice(&body)?;
-            println!(
-                "{}",
+            Ok(format!(
+                "{}\n(one-time setup code: valid 1 hour, single use)",
                 json.get("code")
                     .and_then(serde_json::Value::as_str)
                     .unwrap_or_default()
-            );
-            eprintln!("one-time setup code: valid 1 hour, single use");
-            Ok(true)
+            ))
         }
         TlsCommand::SetCredential(args) => set_credential(args),
         TlsCommand::Issue(args) => {
@@ -180,10 +180,11 @@ impl AdminClient {
             head.push_str("\r\n");
         }
         let body = body.unwrap_or_default();
-        head.push_str(&format!(
+        let _ = write!(
+            head,
             "Content-Type: application/json\r\nContent-Length: {}\r\n\r\n",
             body.len()
-        ));
+        );
         let mut out = zeroize_string::Secret(head);
         stream.write_all(out.0.as_bytes())?;
         stream.write_all(body)?;
@@ -260,17 +261,16 @@ fn problem_title(body: &[u8]) -> String {
         .unwrap_or_else(|| "no detail".to_owned())
 }
 
-fn issue(admin: &AdminClient) -> anyhow::Result<bool> {
+fn issue(admin: &AdminClient) -> anyhow::Result<String> {
     let (code, body) = admin.post("/api/v1/tls/issue", None)?;
     if code == 202 {
-        println!("issuance started; follow it with `multiview tls status`");
-        Ok(true)
+        Ok("issuance started; follow it with `multiview tls status`".to_owned())
     } else {
         anyhow::bail!("issue refused: HTTP {code}: {}", problem_title(&body))
     }
 }
 
-fn status(args: &TlsStatusArgs) -> anyhow::Result<bool> {
+fn status(args: &TlsStatusArgs) -> anyhow::Result<String> {
     let config = load(&args.config.config)?;
     let tls = tls_config(&config)?;
     let online = AdminClient::from_config(&config)
@@ -290,11 +290,10 @@ fn status(args: &TlsStatusArgs) -> anyhow::Result<bool> {
         offline_status(tls)?
     };
     if args.json {
-        println!("{}", serde_json::to_string_pretty(&value)?);
+        Ok(serde_json::to_string_pretty(&value)?)
     } else {
-        print!("{}", render_status(&value));
+        Ok(render_status(&value).trim_end().to_owned())
     }
-    Ok(true)
 }
 
 /// The status read from `state_dir` when the engine is not running.
@@ -441,12 +440,12 @@ pub fn render_status(value: &serde_json::Value) -> String {
         ("last error", text("last_error")),
     ];
     for (k, v) in rows {
-        out.push_str(&format!("{k:<13} {v}\n"));
+        let _ = writeln!(out, "{k:<13} {v}");
     }
     for key in ["reasons", "hints"] {
         if let Some(list) = field(value, key).and_then(serde_json::Value::as_array) {
             for item in list.iter().filter_map(serde_json::Value::as_str) {
-                out.push_str(&format!("{:<13} {item}\n", key.trim_end_matches('s')));
+                let _ = writeln!(out, "{:<13} {item}", key.trim_end_matches('s'));
             }
         }
     }
@@ -458,14 +457,18 @@ pub fn render_status(value: &serde_json::Value) -> String {
 fn read_secret_stdin(name: &str) -> anyhow::Result<zeroize_string::Secret> {
     let stdin = std::io::stdin();
     #[cfg(not(all(unix, feature = "acme")))]
-    eprintln!("value for {name} (read from stdin; echo cannot be disabled in this build):");
+    let _ = writeln!(
+        std::io::stderr(),
+        "value for {name} (read from stdin; echo cannot be disabled in this build):"
+    );
     #[cfg(all(unix, feature = "acme"))]
     let restore = {
         use rustix::termios::{tcgetattr, tcsetattr, LocalModes, OptionalActions};
         match tcgetattr(&stdin) {
             Ok(saved) => {
-                eprint!("value for {name} (input hidden): ");
-                let _ = std::io::stderr().flush();
+                let mut err = std::io::stderr();
+                let _ = write!(err, "value for {name} (input hidden): ");
+                let _ = err.flush();
                 let mut quiet = saved.clone();
                 quiet.local_modes.remove(LocalModes::ECHO);
                 let _ = tcsetattr(&stdin, OptionalActions::Now, &quiet);
@@ -479,7 +482,7 @@ fn read_secret_stdin(name: &str) -> anyhow::Result<zeroize_string::Secret> {
     #[cfg(all(unix, feature = "acme"))]
     if let Some(saved) = restore {
         let _ = rustix::termios::tcsetattr(&stdin, rustix::termios::OptionalActions::Now, &saved);
-        eprintln!();
+        let _ = writeln!(std::io::stderr());
     }
     read.context("reading the value from stdin")?;
     let trimmed = line.0.trim_end_matches(['\r', '\n']).to_owned();
@@ -490,7 +493,7 @@ fn read_secret_stdin(name: &str) -> anyhow::Result<zeroize_string::Secret> {
     Ok(value)
 }
 
-fn set_credential(args: &TlsSetCredentialArgs) -> anyhow::Result<bool> {
+fn set_credential(args: &TlsSetCredentialArgs) -> anyhow::Result<String> {
     let config = load(&args.config.config)?;
     let tls = tls_config(&config)?;
     if !tls.secret_names().contains(&args.name.as_str()) {
@@ -515,19 +518,18 @@ fn set_credential(args: &TlsSetCredentialArgs) -> anyhow::Result<bool> {
                 problem_title(&response)
             );
         }
-        println!(
-            "{} stored in the engine's state directory (0600)",
+        let issued = issue(&admin)?;
+        Ok(format!(
+            "{} stored in the engine's state directory (0600)\n{issued}",
             args.name
-        );
-        issue(&admin)
+        ))
     } else {
         write_offline(tls, &args.name, value.0.as_bytes())?;
-        println!(
+        Ok(format!(
             "{} stored in {}/secrets/ (0600); the engine was not running: it is used at the next start",
             args.name,
             tls.state_dir.display()
-        );
-        Ok(true)
+        ))
     }
 }
 

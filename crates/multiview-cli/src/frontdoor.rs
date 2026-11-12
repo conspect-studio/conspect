@@ -196,7 +196,7 @@ pub fn front_door_tls() -> Option<Arc<multiview_control::certificate_source::Cha
 }
 
 /// Hold the front-door QUIC lane until the ACME source is serving, then start
-/// MoQ on it with the ACME certificate and install the real provider into
+/// `MoQ` on it with the ACME certificate and install the real provider into
 /// `deferred`. Bounded by `shutdown`; a control-plane task, never on the
 /// output clock (it only awaits a watch channel).
 #[cfg(all(feature = "acme", unix, feature = "moq-output"))]
@@ -216,16 +216,15 @@ pub async fn start_moq_when_serving(
     let resolver: Arc<dyn multiview_moq::moq_tokio_rustls::server::ResolvesServerCert> = Arc::new(
         multiview_control::certificate_source::SourceResolver(Arc::clone(&tls.certificates)),
     );
-    match multiview_control::moq_startup::start_shared_resolver(
+    if let Ok(provider) = multiview_control::moq_startup::start_shared_resolver(
         endpoint, protocol, factory, socket, resolver,
     )
     .await
     {
-        Ok(provider) => {
-            deferred.set(provider);
-            tracing::info!("front door: certificate serving; QUIC/MoQ started");
-        }
-        Err(_) => tracing::error!("front door: MoQ listener failed to start on the QUIC lane"),
+        deferred.set(provider);
+        tracing::info!("front door: certificate serving; QUIC/MoQ started");
+    } else {
+        tracing::error!("front door: MoQ listener failed to start on the QUIC lane");
     }
 }
 

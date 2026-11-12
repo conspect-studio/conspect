@@ -2,7 +2,13 @@
 //! the setup gate, setup-code sessions, loopback-only admin routes, credential
 //! storage and the non-secret status body. Router-level (`tower::oneshot`).
 #![cfg(all(feature = "acme", unix))]
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing,
+    clippy::too_many_lines
+)]
 
 mod support;
 
@@ -402,7 +408,7 @@ async fn serving_makes_the_gate_a_no_op() {
     .await;
     assert_eq!(status["state"], "serving");
     assert!(status["bootstrap_fingerprint"].is_null());
-    assert!(status["reasons"].as_array().unwrap().is_empty());
+    assert_eq!(status["reasons"], serde_json::json!([]));
 }
 
 #[tokio::test]
@@ -523,7 +529,7 @@ async fn credential_is_stored_0600_and_never_echoed_or_logged() {
     let stored = send(&router, post("CONSPECT_TEST_TLS_SETUP_CF_TOKEN", SECRET)).await;
     assert_eq!(stored.status(), StatusCode::NO_CONTENT);
     let stored_body = body_bytes(stored).await;
-    assert!(stored_body.is_empty());
+    assert_eq!(stored_body, Vec::<u8>::new());
     let file = f.state_dir.join("secrets/CONSPECT_TEST_TLS_SETUP_CF_TOKEN");
     assert_eq!(std::fs::read_to_string(&file).unwrap(), SECRET);
     assert_eq!(

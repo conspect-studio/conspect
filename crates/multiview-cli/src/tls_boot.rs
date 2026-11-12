@@ -362,8 +362,8 @@ pub async fn wait_serving(
         }
         tokio::select! {
             () = &mut shutdown => return false,
-            changed = changes.changed() => {
-                if changed.is_err() {
+            result = changes.changed() => {
+                if result.is_err() {
                     // The source is gone: nothing will ever serve.
                     return false;
                 }

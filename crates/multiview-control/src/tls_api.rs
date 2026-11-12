@@ -96,7 +96,7 @@ pub(crate) mod doc {
             (status = 404, description = "No `[network.tls]` configured.", body = crate::problem::Problem),
         ),
     )]
-    pub(crate) async fn status() {}
+    pub(crate) async fn tls_status() {}
 
     #[utoipa::path(
         post,
@@ -110,7 +110,7 @@ pub(crate) mod doc {
             (status = 429, description = "Five failed attempts from this source (IPv6 /64) in 15 minutes: locked for 15 minutes.", body = crate::problem::Problem),
         ),
     )]
-    pub(crate) async fn setup_session() {}
+    pub(crate) async fn tls_setup_session() {}
 
     #[utoipa::path(
         post,
@@ -124,7 +124,7 @@ pub(crate) mod doc {
         ),
         security(("bearer_auth" = [])),
     )]
-    pub(crate) async fn issue() {}
+    pub(crate) async fn tls_issue() {}
 
     #[utoipa::path(
         post,
@@ -136,7 +136,7 @@ pub(crate) mod doc {
         ),
         security(("bearer_auth" = [])),
     )]
-    pub(crate) async fn setup_code() {}
+    pub(crate) async fn tls_setup_code() {}
 
     #[utoipa::path(
         post,
@@ -151,5 +151,5 @@ pub(crate) mod doc {
         ),
         security(("bearer_auth" = [])),
     )]
-    pub(crate) async fn credential() {}
+    pub(crate) async fn tls_credential() {}
 }
