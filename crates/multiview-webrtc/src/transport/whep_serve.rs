@@ -569,6 +569,11 @@ impl WhepServeEndpoint {
         }
     }
 
+    /// The ICE-validated remote address of every connected viewer.
+    pub(crate) fn validated_peers(viewers: &[ViewerSession], out: &mut Vec<SocketAddr>) {
+        out.extend(viewers.iter().filter_map(|v| v.session.validated_peer()));
+    }
+
     /// Route one received datagram to the first viewer session that accepts it.
     pub(crate) fn route_datagram(
         viewers: &mut [ViewerSession],

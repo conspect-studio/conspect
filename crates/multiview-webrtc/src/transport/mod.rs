@@ -33,7 +33,7 @@ pub(crate) mod whip_push;
 
 pub use ingest::{RtpRing, RtpRingEngine, MAX_INGRESS_RTP};
 pub use local_addr::resolve_local_destination;
-pub use unified::{UnifiedBuilder, UnifiedEndpoint};
+pub use unified::{InboundDatagram, SharedInbound, UnifiedBuilder, UnifiedEndpoint};
 pub use whep_serve::{WhepNegotiated, WhepServeEndpoint, WhepServeHandle};
 pub use whip_endpoint::{WhipEndpoint, WhipHandle, WhipNegotiated};
 pub use whip_push::{
@@ -210,6 +210,10 @@ pub struct Session {
     /// consent check, DTLS, SRTP/RTCP). The preview egress reads it to detect a
     /// peer that vanished without signalling (liveness, not a client `DELETE`).
     last_rx: Option<Instant>,
+    /// The remote address of the last datagram str0m accepted while the session
+    /// was connected: a peer that passed ICE (STUN MESSAGE-INTEGRITY) and DTLS.
+    /// The shared front door marks it established. `None` while not connected.
+    validated_peer: Option<SocketAddr>,
 }
 
 /// A decrypted media frame surfaced from the remote peer.
@@ -311,6 +315,7 @@ impl Session {
             received_rtp_total: 0,
             keyframe_requested: false,
             last_rx: None,
+            validated_peer: None,
         }
     }
 
@@ -561,7 +566,20 @@ impl Session {
             .map_err(|e| WebRtcError::Transport(format!("handle_input: {e}")))?;
         self.last_rx = Some(now);
         self.drive(now);
+        self.validated_peer = self.connected.then_some(source);
         Ok(())
+    }
+
+    /// The remote address that last delivered an accepted datagram on this
+    /// connected session (ICE validated it with STUN MESSAGE-INTEGRITY before
+    /// str0m accepts non-STUN traffic from it). `None` while not connected.
+    #[must_use]
+    pub fn validated_peer(&self) -> Option<SocketAddr> {
+        if self.connected && self.rtc.is_alive() {
+            self.validated_peer
+        } else {
+            None
+        }
     }
 
     /// Advance the session's timers without any network input (the driver calls
@@ -836,6 +854,27 @@ impl WebRtcEndpoint {
         config.validate()?;
         let bind_addr = config.bind_addr();
         let socket = bind_dual_stack(bind_addr)?;
+        Ok(Self { config, socket })
+    }
+
+    /// Adopt an already-bound dual-stack socket (the shared front-door socket,
+    /// ADR-0107): the endpoint sends on it; its port is the candidates' port.
+    ///
+    /// # Errors
+    ///
+    /// [`WebRtcError::Config`] if the configuration is invalid or the socket is
+    /// not bound to an IPv6 (dual-stack) address.
+    pub fn from_socket(config: EndpointConfig, socket: std::net::UdpSocket) -> Result<Self> {
+        config.validate()?;
+        let local = socket.local_addr().map_err(|source| WebRtcError::Socket {
+            addr: config.bind_addr(),
+            source,
+        })?;
+        if !local.is_ipv6() {
+            return Err(WebRtcError::Config(
+                "the shared media socket must be bound dual-stack on [::]".to_owned(),
+            ));
+        }
         Ok(Self { config, socket })
     }
 
