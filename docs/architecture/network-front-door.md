@@ -126,6 +126,13 @@ Every lane has two bounded queues, *established* and *new*, and drains establish
   flows never consult it. A global new-flow budget sits on top (a per-second cap on all new-flow
   datagrams), so a spoofed or distributed flood is bounded in userspace work even though no
   per-source key can stop it.
+* **What the established path still charges (slice 3, issue #325).** The established set is keyed
+  on the remote address, which an off-path spoofer can forge if it knows a viewer's exact IP and
+  port. So the bypass is not total: a supported-version Initial always pays the Initial and global
+  budgets (VN triggers always pay theirs), every established peer has its own generous token
+  bucket (20 000/s, burst 4 000) so one spoofed 4-tuple cannot take the whole established queue,
+  and a Version Negotiation shape in the RTP range (first byte 128-191, zero version) is dropped
+  from any source that is not established. The residual risk is stated in "Slice 3 as built".
 
 ### Stateless replies the endpoint can be made to send
 
@@ -134,7 +141,7 @@ Every lane has two bounded queues, *established* and *new*, and drains establish
 | QUIC Version Negotiation | long header with an unsupported version | noq answers unconditionally and RFC 9000's 3x anti-amplification limit does **not** apply (no connection exists). The dispatcher reads the version field (bytes 1-4) and only passes unsupported-version packets of at least 1200 bytes (RFC 9000 section 14.1: clients pad Initials) through the new-flow bucket and a global VN budget; the reply is about 60 bytes, so the factor is below 1 |
 | QUIC Retry | Initial when more than `retry_above_handshakes` are pending | Retry is smaller than the Initial; the token proves the address on the next Initial |
 | QUIC stateless reset | short header for an unknown CID | `EndpointConfig::min_reset_interval` is **one interval for the whole endpoint**, not per peer (moq-noq-proto `endpoint.rs`). The front door sets it explicitly (200 ms) and only lets unknown short headers through the new-flow bucket. A flood can still occupy the interval; the cost is that a client whose connection died (engine restart) learns it at its idle timeout (30 s) instead of at once, and the MoQ client then reconnects. Accepted and stated |
-| STUN Binding response | Binding Request | str0m answers only for a live session's ufrag with a valid MESSAGE-INTEGRITY (`ice/agent.rs` `accepts_message`), so a spoofed request draws nothing |
+| STUN Binding response | Binding Request | str0m answers only for a live session's ufrag with a valid MESSAGE-INTEGRITY (`ice/agent.rs` `accepts_message`), so a spoofed request draws nothing. Since slice 3 a well-formed STUN message from a non-established source also pays its own per-source (50/s, burst 50) and global (5 000/s) STUN budgets before reaching str0m |
 
 Batching: `UdpSocketState::recv` reads up to 32 messages per syscall with GRO (64 segments on the
 spike host). Sends use GSO through `UdpSocketState::send`. These are pure Rust (`moq-noq-udp`,
@@ -651,8 +658,8 @@ What S6 and S7 mean for the design:
   anything. Three layers, in order of strength:
   1. **Separate queues for validated flows.** Once a WebRTC 4-tuple is ICE-connected or a QUIC
      connection is confirmed, its packets are steered to a second socket in the same
-     `SO_REUSEPORT` group by a CBPF/eBPF program keyed on the established 4-tuple set (moq-tokio
-     already ships a CBPF steering filter for QUIC CIDs, `vendor/moq-tokio/src/noq.rs:918`). A flood
+     `SO_REUSEPORT` group by a classic BPF program keyed on the established source addresses
+     (built in slice 3: CBPF, not eBPF, see "Slice 3 as built"). A flood
      of unvalidated traffic then fills the listener queue, not the one paying viewers use. This is
      the only layer that also works against spoofed and distributed floods. Linux only; other
      platforms keep one queue (stated as a platform limit).
@@ -662,7 +669,8 @@ What S6 and S7 mean for the design:
      absent). Honest limit: it stops a real source, not a spoofed one (it depends on BCP 38 at the
      attacker's network) and not a botnet.
   3. **Buffer sizing.** systemd `ReceiveBuffer=8M` (`SO_RCVBUFFORCE`, which bypasses `rmem_max`);
-     the engine logs when the kernel clamps its request.
+     the engine itself tries `SO_RCVBUFFORCE` first (works with `CAP_NET_ADMIN`), falls back to
+     `SO_RCVBUF`, reads the result back and warns when the usable size is below the request.
   Beyond these, a volumetric attack is an upstream (network/DDoS-provider) problem; the engine's job
   is that it cannot be turned into an amplifier and that its own state stays bounded.
 * **Output clock exposure is real and must be designed out, not explained away.** The production
@@ -676,8 +684,8 @@ What S6 and S7 mean for the design:
   front door (UDP dispatcher, QUIC endpoint, h3 and router handlers it serves, TCP door, TURN) runs on
   **its own Tokio runtime** with a fixed, small worker count (`network.workers`, default 2), started
   on its own OS threads. It never runs on the runtime that drives programs. Slice 1 creates that
-  runtime. Slice 3's chaos suite measures tick lateness with a flood running, on the engine's real
-  clock, and fails on any "ticks behind" increase. Moving the program clock itself onto a dedicated
+  runtime. Slice 3's chaos suite runs the engine's real clock with a flood running and fails on any
+  repeat or slip that a whole-process stall does not explain (the stall witness, issue #321). Moving the program clock itself onto a dedicated
   thread is outside this design; the dedicated front-door runtime removes the front door from that
   question.
 
@@ -728,16 +736,20 @@ How the UI skips a dead rung fast:
 * **#10, every structure bounded, nothing cleared by an attacker.** Dispatcher lanes (1024
   established + 256 new per lane, `try_send`, drop); the established 4-tuple set (bounded by session
   and connection caps, written only after validation, entries removed with their session); source
-  buckets (16 384, LRU eviction, never a global clear); a global new-flow budget; ICE-TCP
+  buckets (16 384, LRU eviction, never a global clear); a global new-flow budget; per-source STUN
+  buckets (16 384, LRU) and a global STUN budget; per-established-peer buckets (bounded by the
+  established-set caps); one steering program at a time (at most 1 244 peers, 4 096 instructions);
+  the sender-waker list (1 024, overflow wakes every held waker); ICE-TCP
   per-connection out queue (256) and read buffer (one RFC 4571 frame, 65 535 bytes); TCP per-IP and
   global connection caps at accept; QUIC `max_connections` and per-connection stream limits; h3
   `max_field_section_size`; TURN allocations (one per lease, 4 per source, global cap). Nothing
   awaits a client: UDP sends are non-blocking (`try_send_to` / noq's `UdpSender`); TCP writes run in
   the per-connection task, fed by a bounded queue with `try_send`.
 * **Amplification.** Before address validation noq applies the 3x limit (RFC 9000 section 8.1);
-  Retry above `retry_above_handshakes`; Version Negotiation and stateless reset are rate-limited as
-  in section 3 (the 3x limit does not cover them); STUN answers only an authenticated Binding
-  Request (str0m); TURN's pre-auth reply is a 401 no larger than the request, with no state.
+  Retry above `retry_above_handshakes` (wired in slice 3's PR B); Version Negotiation and stateless
+  reset are rate-limited as in section 3 (the 3x limit does not cover them); STUN answers only an
+  authenticated Binding Request (str0m); TURN's pre-auth reply is a 401 no larger than the request,
+  with no state. `tests/amplification.rs` measures all three QUIC shapes against a real endpoint.
 
 ## 14. Test plan
 
@@ -809,3 +821,100 @@ does not block 1-3. Public UDP 443 opens only after slice 3. 6, 7, 8 depend on 4
 * Shutdown: the daemon drops the front door last, after the control-plane drain, with a
   bounded `shutdown_timeout` (2 s) on a blocking-pool thread, so the socket is closed when
   teardown returns.
+
+### Slice 3 as built, part A: flood hardening in `multiview-frontdoor` (issues #289, #321, #325)
+
+**Validated-flow steering (Linux).** `FrontDoorConfig::steering` (default `true`).
+
+* Group: two dual-stack UDP sockets on the same `[::]:port`, both `SO_REUSEPORT`, created in a
+  fixed order so the kernel group index is known: the **listener** first (index 0: every
+  unvalidated datagram, and every send), then the **established** socket (index 1). With port 0
+  the listener's ephemeral port is read back and the established socket binds it.
+  `steering::ReuseportGroup` is that pair, public so tests exercise the kernel mechanism directly.
+* Program: classic BPF via `SO_ATTACH_REUSEPORT_CBPF` (on the listener; it applies to the group).
+  CBPF needs no `CAP_BPF`/`CAP_SYS_ADMIN` and works with `kernel.unprivileged_bpf_disabled=1`. The
+  program sees `skb->data` at the UDP payload, so every header field is read through `SKF_NET_OFF`:
+  IP version nibble; IPv4 source address and (after the IHL, `ldxb msh`) source port; IPv6 only
+  when the next header is UDP (an extension header goes to the listener), the four address words
+  and the port. A load that fails returns 0 (listener). It returns 1 when the source's key is in
+  the set.
+* Key and lookup: a 32-bit hash of a family tag, the address words and the port, salted with a
+  fresh random value per program (std `RandomState`), computed identically in userspace and in
+  CBPF (xor, mul, rsh; 32-bit wrapping). IPv4-mapped peers hash as IPv4, since an IPv4 datagram on
+  the dual-stack socket carries an IPv4 header. The sorted keys form a balanced binary search
+  (`jeq`/`jgt`, with a 32-bit `ja` to each right subtree). The program length depends only on the
+  number of keys; `STEERING_MAX_PEERS` = 1 244 is the largest set that fits `BPF_MAXINSNS` (4 096;
+  2 379 instructions at the cap), checked on both sides by a unit test. Peers beyond the cap stay
+  on the listener (served through the new-flow path and their per-peer bucket) and are counted
+  (`steering_overflow`).
+* Collisions: a non-member whose salted hash equals a member's only shares the established queue.
+  The dispatcher checks the exact `EstablishedSet` for every datagram from either socket; a
+  non-member read from the established socket pays the new-flow limits like any other new flow
+  and is counted (`steered_unverified`).
+* Update path, off the data plane: `EstablishedSet` bumps a generation and notifies on every
+  insert that adds an address and every remove that deletes one. A steering-updater task on the
+  front-door runtime waits for either set, debounces 20 ms, snapshots both sets (QUIC and WebRTC
+  peers in one program) plus the configured TURN servers, compiles and attaches with one
+  `setsockopt` (the kernel swaps the program under RCU). The dispatcher never compiles or
+  attaches. A failed attach keeps the previous program and counts `steering_update_errors`
+  (warning at most every 10 s).
+* Dispatcher: one task, sole owner of the limiter. It waits for either socket and drains the
+  established socket first (the per-wake budget of 1 024 datagrams covers both), then the
+  listener.
+* Fallback: if the pair cannot be created (second socket, `SO_REUSEPORT`) or the first attach
+  fails, the door runs one socket on the same port; off Linux it always does.
+  `FrontDoor::steering()` reports `ReuseportCbpf` or `SingleSocket { reason }`, logged at start
+  (info when active or disabled by configuration, warn for a fallback on Linux).
+* Group membership: the kernel lets a socket join a reuseport group only with the same effective
+  uid as the group, so only a process running as the engine's own user could take a share of the
+  traffic. Run the engine as a dedicated user.
+* Residual risk (issue #325): steering and the established bypass are keyed on the source address
+  and port. An off-path spoofer that knows a viewer's exact IP and port lands in the established
+  kernel queue and shares it with that viewer; its userspace share is bounded by the viewer's
+  per-peer bucket (20 000/s, burst 4 000; `dropped_established_peer`), its Initials still pay the
+  Initial and global budgets, and it cannot reach any other viewer's queue position. A key a
+  spoofer cannot forge (QUIC connection ID, ICE-validated 5-tuple in the kernel) is not used:
+  connection IDs are not visible to CBPF for WebRTC, and the address key keeps one program for
+  both lanes.
+
+**STUN caps.** `Budget::Stun` for a well-formed STUN message from a non-established source:
+per-source 50/s burst 50 (an ICE agent paces checks at Ta >= 50 ms per pair) in its own bounded
+LRU (same `max_sources` cap and key) and a global 5 000/s, both checked before the generic
+per-source and global buckets, so a refused STUN message spends nothing else. Established peers
+(consent freshness) never pay it. Counters `dropped_stun_per_source`, `dropped_stun_global`.
+
+**Receive buffers.** Each socket tries `SO_RCVBUFFORCE` first, then `SO_RCVBUF`, reads back, and
+reports `usable` (Linux: half of what `getsockopt` returns). A warning names the request, the
+grant, `net.core.rmem_max` and the fix (`docs/runbooks/udp-443-flood.md`, slice 3 PR B).
+`FrontDoor::buffer_report()` returns the shallower of the pair.
+
+**Kernel drops.** A sampler task reads `/proc/net/udp6` every second (dual-stack sockets are
+listed there), matches each socket's inode (`/proc/self/fd/<fd>`) and stores the `drops` column in
+`kernel_drops_listener` / `kernel_drops_established`, warning at most every 10 s when they grow.
+Off Linux the gauges stay 0 and `kernel_drops_supported()` is false.
+
+**Other #325 fixes.** Supported-version Initials always pay the Initial and global budgets (also
+from established addresses); per-established-peer buckets as above; a QUIC VN shape in the RTP
+range from a non-established source is dropped (0x80 RTP is not affected; an established peer's
+datagram is never touched); the sender-waker list is capped at 1 024 (a full list wakes every held
+waker and restarts, so no sender is ever left parked).
+
+**Chaos suite.** `multiview_frontdoor::flood` (shapes, sources: one, many IPv4 loopback, rotating
+IPv6 /64s via `IPV6_FREEBIND`) drives `tests/chaos_flood.rs`, the steering and amplification
+tests, and `examples/udp443_flood.rs` (the second-host tool: `--target --pps --secs --threads
+--sources --shapes`). Chaos arms: idle; door on with an established MoQ viewer under each flood kind
+(one source, many IPv4 sources, rotating /64s); door off with the many-source flood. Per arm: tick
+count within 2, every PTS exactly `MediaTime::from_tick(index)` with consecutive indices, zero
+unexplained repeats, viewer >= 95% of groups, RSS bound, and with steering the viewer's datagrams
+read from the established socket.
+
+**The #321 stall witness.** The slice-1 suite asserted `repeats == 0` on every arm, which asserted
+that the CI host never stalls the process for more than a period (macOS run 43192931229: one
+~104 ms whole-process stall, three last-good repeats, door off). The clock absorbs such a stall by
+design (ADR-T018). The witness is a std thread that sleeps 1 ms in a loop and records every gap
+longer than half a period on the clock's own time base; a repeat (or a tick later than a period)
+is explained only when its `[deadline, emit]` interval overlaps a gap, i.e. the whole process was
+not running. The suite asserts zero unexplained ticks, absolutely. `tests/stall_witness.rs`
+records the red case (a SIGSTOP/SIGCONT stall of 150 ms fails the old assertion with 3-4
+repeats), the green case (all of them explained), and the negative control (a 150 ms spin on the
+program runtime while the process runs: the repeats are unexplained and the assertion fails).
