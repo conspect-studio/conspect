@@ -951,7 +951,10 @@ impl OutputRouter {
                         self.refuse_pending(output_index, tick, RefuseReason::EncoderNotReady);
                     }
                 }
-                MoveOutcome::Superseded { .. } => {}
+                MoveOutcome::Superseded { .. }
+                | MoveOutcome::AudioApplied { .. }
+                | MoveOutcome::AudioRefused { .. }
+                | MoveOutcome::AudioFallback { .. } => {}
                 MoveOutcome::Fallback { output_index } => {
                     if let Some(out) = self.outputs.get_mut(output_index) {
                         out.bus = PictureBus::Program;
