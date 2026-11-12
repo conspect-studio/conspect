@@ -407,18 +407,16 @@ struct BindingState {
     inband_ok: bool,
 }
 
-/// A switch onto a RAP with a different decoder configuration: an in-band
-/// muxer (MPEG-TS) resets its continuity at the cut window (not a loss: the
-/// cut window opens at a strict RAP, and a loss would arm the queue's RAP
-/// gate and flush its healthy backlog); an out-of-band one (only reached by
-/// a forced switch, a move is refused first) takes the loss path, whose
-/// decoder reset happens at the next RAP (the cut window itself).
-fn signal_sets_change<D: WindowDelivery>(delivery: &mut D, output_index: usize, inband_ok: bool) {
-    if inband_ok {
-        delivery.mark_discontinuity(output_index, OfferError::DecoderConfigChanged);
-    } else {
-        delivery.report_loss(output_index, OfferError::DecoderConfigChanged);
-    }
+/// A switch onto a RAP with a different decoder configuration. The cut window
+/// opens at a self-contained RAP (the move gate proved it), so the switch is
+/// signalled as a generation bump without arming the queue's RAP gate and
+/// without flushing the healthy backlog. A loss here would arm a gate that a
+/// recovery-gate-less queue (MPEG-2, the default codec) can never clear, and
+/// would reject the cut window itself. Slice 1 has no muxer re-init: an
+/// out-of-band output reaches this only through a forced fallback (a take is
+/// refused first), where staying on a dead feed is not an option.
+fn signal_sets_change<D: WindowDelivery>(delivery: &mut D, output_index: usize, _inband_ok: bool) {
+    delivery.mark_discontinuity(output_index, OfferError::DecoderConfigChanged);
 }
 
 fn push_outcome(outcomes: &mut VecDeque<MoveOutcome>, outcome: MoveOutcome) {
@@ -1806,6 +1804,15 @@ mod tests {
                 aborted: false,
             }
         }
+        /// Queues with no recovery gate: the production MPEG-2 (default
+        /// codec) case, where an armed RAP gate can never clear.
+        fn gateless(count: usize) -> Self {
+            Self {
+                queues: (0..count).map(|_| BoundedBatchQueue::new()).collect(),
+                windows: Vec::new(),
+                aborted: false,
+            }
+        }
     }
     impl WindowDelivery for FakeDelivery {
         fn offer_window(
@@ -2561,9 +2568,9 @@ mod tests {
     }
 
     /// Q: a FALLBACK cannot be declined. On an out-of-band output a changed
-    /// configuration is signalled as a loss (decoder reset at the next RAP,
-    /// the cut window itself), which is still admitted; never a silent
-    /// splice. `rebind_video_forced` is the router's aux-failure fallback.
+    /// configuration is signalled as a discontinuity (never a silent splice,
+    /// never a loss that arms the RAP gate); the cut window is admitted.
+    /// `rebind_video_forced` is the router's aux-failure fallback.
     #[test]
     fn a_forced_fallback_with_changed_sets_on_an_out_of_band_output_reports_a_loss() {
         let now = Instant::now();
@@ -2609,6 +2616,39 @@ mod tests {
             sink.queues[1].take_discontinuity().map(|e| e.reason),
             Some(OfferError::DecoderConfigChanged)
         );
+    }
+
+    /// Review #319 (media, final head): on a queue with no recovery gate (the
+    /// production MPEG-2 default) a forced fallback with changed sets must not
+    /// arm a RAP gate the queue can never clear: the cut window and every
+    /// later window are admitted.
+    #[test]
+    fn a_forced_fallback_on_a_gateless_queue_keeps_delivering() {
+        let now = Instant::now();
+        let mut moved = binding(1, 1, 1);
+        moved.inband_parameter_changes_ok = false;
+        let mut d =
+            RenditionDispatcher::new(gated_cfg(vec![binding(0, 0, 1), moved], 2, 1)).unwrap();
+        let mut sink = FakeDelivery::gateless(2);
+        d.set_parameter_sets(0, fixed_sets(RapParameterSets::Sets(vec![1])))
+            .unwrap();
+        d.set_parameter_sets(1, fixed_sets(RapParameterSets::Sets(vec![2])))
+            .unwrap();
+        feed_base(&mut d, &mut sink, 2, 0, now, plain(0)).unwrap();
+        pop_all(&mut sink, 1, now);
+        let rap_on = |i: i64| move |_k: usize| rap77(i);
+        d.rebind_video_forced(1, 0, 1, 3).unwrap();
+        feed_base(&mut d, &mut sink, 2, 1, now, rap_on(1)).unwrap();
+        assert_eq!(d.binding_video_key(1), Some(0));
+        assert_eq!(pop_all(&mut sink, 1, now).len(), 1, "cut window admitted");
+        for tick in 2..6 {
+            feed_base(&mut d, &mut sink, 2, tick, now, plain(tick)).unwrap();
+            assert_eq!(
+                pop_all(&mut sink, 1, now).len(),
+                1,
+                "window {tick} after the cut is admitted"
+            );
+        }
     }
 
     #[test]
