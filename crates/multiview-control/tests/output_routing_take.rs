@@ -1100,6 +1100,91 @@ async fn two_principals_with_the_same_raw_key_get_separate_takes() {
     assert_eq!(rig.fake.takes().len(), 2);
 }
 
+/// #329 F1(c): with a live snapshot whose bus differs from the persisted
+/// feed (a refused boot take, a fallback), `video` and `tally` are the LIVE
+/// bus and `configured_video` the persisted feed; each is redacted by its own
+/// rule; without a snapshot the row is today's configured view.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn readback_reports_the_live_bus_and_the_configured_feed_separately() {
+    let dir = tempfile::tempdir().unwrap();
+    let rig = rig(&dir.path().join("boot.toml"), true);
+    let row = |state: &serde_json::Value| {
+        state["outputs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["output"] == "output-1")
+            .cloned()
+            .unwrap()
+    };
+    // Persist out1 = source bars (an applied take), no live snapshot yet.
+    let resp = send(
+        &rig.router,
+        take(&rig, OPERATOR_TOKEN, "p1", "output-1", serde_json::json!({"source": "bars"})),
+    )
+    .await;
+    let op = body_json(resp).await["operation_id"].as_str().unwrap().to_owned();
+    rig.fake.emit_with_feed(&op, OUT_B_CONFIG_ID, "applied", RoutedFeed::Source("bars".into()));
+    wait_for(|| persisted_feed(&rig.state, OUT_B_CONFIG_ID).is_some()).await;
+    let r = row(&body_json(send(&rig.router, get("/api/v1/routing", OPERATOR_TOKEN)).await).await);
+    assert_eq!(r["state"], "configured");
+    assert_eq!(r["video"], serde_json::json!({"source": "bars"}));
+    assert_eq!(r["configured_video"], serde_json::json!({"source": "bars"}));
+    assert_eq!(r["tally"], "direct");
+    // The engine is on Program for that output (e.g. after a restart whose
+    // boot take was refused).
+    let mut outputs = HashMap::new();
+    outputs.insert(
+        OUT_B_CONFIG_ID.to_owned(),
+        OutputLive {
+            bus: "program".into(),
+            since_tick: 3,
+            pending: None,
+            degraded: false,
+        },
+    );
+    rig.fake.state.lock().unwrap().live = Some(RoutingLive {
+        outputs,
+        encoders: 1,
+        sessions_in_use: 0,
+        sessions_max: 6,
+        dropped_ticks: 0,
+    });
+    let r = row(&body_json(send(&rig.router, get("/api/v1/routing", OPERATOR_TOKEN)).await).await);
+    assert_eq!(r["state"], "on_air");
+    assert_eq!(r["video"], serde_json::json!({"bus": "program"}), "{r}");
+    assert_eq!(r["configured_video"], serde_json::json!({"source": "bars"}), "{r}");
+    assert_eq!(r["tally"], "program", "tally from the live bus: {r}");
+    assert_eq!(r["effective_audio"], "program", "{r}");
+    // A scoped key that may read bars but not the Program scope: the live
+    // Program bus is redacted, the configured feed is shown.
+    let r = row(&body_json(send(&rig.router, get("/api/v1/routing", SCOPED_ROUTER_TOKEN)).await).await);
+    assert_eq!(r["video"], serde_json::json!({"redacted": true}), "{r}");
+    assert_eq!(r["tally"], "redacted", "{r}");
+    assert_eq!(r["configured_video"], serde_json::json!({"source": "bars"}), "{r}");
+    // And the reverse: on air a source the caller cannot read.
+    rig.fake
+        .state
+        .lock()
+        .unwrap()
+        .live
+        .as_mut()
+        .unwrap()
+        .outputs
+        .get_mut(OUT_B_CONFIG_ID)
+        .unwrap()
+        .bus = "src:secret-cam".into();
+    let scoped = body_json(send(&rig.router, get("/api/v1/routing", SCOPED_ROUTER_TOKEN)).await).await;
+    assert!(!scoped.to_string().contains("secret-cam"), "{scoped}");
+    let r = row(&scoped);
+    assert_eq!(r["video"], serde_json::json!({"redacted": true}));
+    assert_eq!(r["configured_video"], serde_json::json!({"source": "bars"}));
+    let r = row(&body_json(send(&rig.router, get("/api/v1/routing", OPERATOR_TOKEN)).await).await);
+    assert_eq!(r["video"], serde_json::json!({"source": "secret-cam"}));
+    assert_eq!(r["effective_audio"], serde_json::json!({"source": "secret-cam"}));
+    assert_eq!(r["tally"], "direct");
+}
+
 /// #329 F2: a key confined by `scoped_output_ids` alone (no object list) can
 /// plan/take, read and hear only its own outputs.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

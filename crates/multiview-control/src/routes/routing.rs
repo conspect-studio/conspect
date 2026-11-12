@@ -391,18 +391,25 @@ impl CrosspointKind {
 pub struct OutputRouteState {
     /// The output's API id (the id `/api/v1/outputs/{id}` addresses).
     pub output: String,
-    /// The configured video feed: `{"bus": "program"}`, `{"source": "vt1"}`,
-    /// or `{"redacted": true}` when the caller may not read the feed.
+    /// The video feed ON AIR: the engine's live bus when it reports one for
+    /// this output, else the configured feed. `{"bus": "program"}`,
+    /// `{"source": "vt1"}`, or `{"redacted": true}` when the caller may not
+    /// read the feed.
     #[cfg_attr(feature = "openapi", schema(value_type = Object))]
     pub video: serde_json::Value,
+    /// The configured (persisted) video feed, redacted by the same rule. It
+    /// differs from `video` after a refused start-up take or a fallback: the
+    /// operator's intent is kept, Program is on air.
+    #[cfg_attr(feature = "openapi", schema(value_type = Object))]
+    pub configured_video: serde_json::Value,
     /// The configured audio feed (`"follow"` unless set).
     #[cfg_attr(feature = "openapi", schema(value_type = Object))]
     pub audio: serde_json::Value,
-    /// What the audio carries now: `"program"` (the program mix),
+    /// What the audio carries now (from the on-air feed): `"program"` (the program mix),
     /// `{"source": id}`, `"preview_source"`, or `{"redacted": true}`.
     #[cfg_attr(feature = "openapi", schema(value_type = Object))]
     pub effective_audio: serde_json::Value,
-    /// Whether the feed follows the switcher (`program`) or is direct
+    /// Whether the ON-AIR feed follows the switcher (`program`) or is direct
     /// (`source`) or the preview bus — the tally distinction (§8).
     pub tally: OutputTally,
     /// `configured` until the engine reports readback for this output, then
@@ -566,7 +573,8 @@ pub(crate) async fn get_routing(
                     multiview_config::MAIN_PROGRAM,
                 )
             });
-        let mut row = output_route_state(&principal, &feed, id);
+        let live_output = live.as_ref().and_then(|l| l.outputs.get(&config_id));
+        let mut row = on_air_route_state(&principal, &feed, live_output, id);
         if let Some(live) = live.as_ref() {
             apply_live(&principal, &mut row, live.outputs.get(&config_id));
         }
@@ -594,6 +602,31 @@ pub(crate) fn api_id_of(state: &AppState, config_id: &str) -> Option<String> {
             serde_json::from_value(versioned.resource.body).ok()?;
         (body.id() == config_id).then_some(versioned.resource.id)
     })
+}
+
+/// The row for `feed` (the configured crosspoint) when `live` (the engine's
+/// readback for this output) says what is on air: `video`, `tally` and
+/// `effective_audio` come from the LIVE bus, `configured_video` from the
+/// configured feed — each redacted by its own per-object rule (#329). A live
+/// bus the control plane cannot name keeps the configured view.
+fn on_air_route_state(
+    principal: &Principal,
+    feed: &multiview_config::OutputCrosspoint,
+    live: Option<&crate::output_routing::OutputLive>,
+    output: String,
+) -> OutputRouteState {
+    let configured = output_route_state(principal, feed, output.clone());
+    let Some(on_air) = live
+        .and_then(|l| crate::output_routing::RoutedFeed::from_bus_name(&l.bus))
+        .map(|bus| bus.video_feed())
+    else {
+        return configured;
+    };
+    let mut live_xp = feed.clone();
+    live_xp.video = Some(on_air);
+    let mut row = output_route_state(principal, &live_xp, output);
+    row.configured_video = configured.configured_video;
+    row
 }
 
 /// Fold the engine readback into a row, redacting per the row's own rules:
@@ -690,6 +723,7 @@ fn output_route_state(
         return OutputRouteState {
             output,
             video: redacted.clone(),
+            configured_video: redacted.clone(),
             audio,
             effective_audio: redacted,
             tally: OutputTally::Redacted,
@@ -712,9 +746,11 @@ fn output_route_state(
         FollowAudio::PreviewSource => serde_json::json!("preview_source"),
         _ => serde_json::json!("program"),
     };
+    let video = serde_json::to_value(&video).unwrap_or_else(|_| redacted.clone());
     OutputRouteState {
         output,
-        video: serde_json::to_value(&video).unwrap_or_else(|_| redacted.clone()),
+        configured_video: video.clone(),
+        video,
         audio,
         effective_audio,
         tally,
