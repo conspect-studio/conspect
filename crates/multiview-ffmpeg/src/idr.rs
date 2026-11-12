@@ -164,45 +164,23 @@ pub fn scan_parameter_sets(
     codec: CodecKind,
     framing: NalFraming,
 ) -> ParameterSetScan<'_> {
-    // (type -> rank) for parameter sets; VCL types end the parameter sets.
-    let (ty, rank, vcl): (
-        fn(&[u8]) -> Option<u8>,
-        fn(u8) -> Option<u8>,
-        fn(u8) -> bool,
-    ) = match codec {
-        CodecKind::H264 => (
-            |nal| nal.first().map(|&b| b & 0x1F),
-            |t| match t {
-                7 => Some(1),
-                8 => Some(2),
-                _ => None,
-            },
-            |t| (1..=5).contains(&t),
-        ),
-        CodecKind::Hevc => (
-            |nal| nal.first().map(|&b| (b >> 1) & 0x3F),
-            |t| match t {
-                32 => Some(0),
-                33 => Some(1),
-                34 => Some(2),
-                _ => None,
-            },
-            |t| t <= 31,
-        ),
-        CodecKind::Av1 | CodecKind::Other => return ParameterSetScan::Absent,
-    };
+    if !matches!(codec, CodecKind::H264 | CodecKind::Hevc) {
+        return ParameterSetScan::Absent;
+    }
     let mut nals: Vec<&[u8]> = Vec::new();
     collect_nals(au, framing, &mut nals);
     let mut out = Vec::new();
     let mut last_rank: Option<u8> = None;
     let mut seen_vcl = false;
     for (n, nal) in nals.iter().enumerate() {
-        let Some(t) = ty(nal) else { continue };
-        if vcl(t) {
-            seen_vcl = true;
-            continue;
-        }
-        let Some(r) = rank(t) else { continue };
+        let r = match classify_nal(nal, codec) {
+            NalClass::Vcl => {
+                seen_vcl = true;
+                continue;
+            }
+            NalClass::Other => continue,
+            NalClass::ParameterSet(r) => r,
+        };
         if seen_vcl || last_rank.is_some_and(|last| r <= last) {
             return ParameterSetScan::Rejected;
         }
@@ -221,6 +199,33 @@ pub fn scan_parameter_sets(
         ParameterSetScan::Absent
     } else {
         ParameterSetScan::Found(out)
+    }
+}
+
+enum NalClass {
+    /// A coded slice (H.264 types 1..=5, HEVC 0..=31).
+    Vcl,
+    /// A parameter set and its canonical rank (VPS 0 < SPS 1 < PPS 2).
+    ParameterSet(u8),
+    Other,
+}
+
+fn classify_nal(nal: &[u8], codec: CodecKind) -> NalClass {
+    match (codec, nal.first()) {
+        (CodecKind::H264, Some(&b)) => match b & 0x1F {
+            1..=5 => NalClass::Vcl,
+            7 => NalClass::ParameterSet(1),
+            8 => NalClass::ParameterSet(2),
+            _ => NalClass::Other,
+        },
+        (CodecKind::Hevc, Some(&b)) => match (b >> 1) & 0x3F {
+            0..=31 => NalClass::Vcl,
+            32 => NalClass::ParameterSet(0),
+            33 => NalClass::ParameterSet(1),
+            34 => NalClass::ParameterSet(2),
+            _ => NalClass::Other,
+        },
+        _ => NalClass::Other,
     }
 }
 

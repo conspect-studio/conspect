@@ -3827,6 +3827,156 @@ mod tests {
         }
     }
 
+    /// A solid YUV420P test frame of luma `luma`.
+    fn live_open_frame(luma: u8) -> DecodedVideoFrame {
+        use multiview_core::frame::FrameMeta;
+        use multiview_core::pixel::PixelFormat;
+        use multiview_core::time::MediaTime;
+        let mut video =
+            ffmpeg::util::frame::Video::new(ffmpeg::format::Pixel::YUV420P, WIDTH, HEIGHT);
+        for plane in 0..3 {
+            video
+                .data_mut(plane)
+                .fill(if plane == 0 { luma } else { 128 });
+        }
+        DecodedVideoFrame {
+            frame: video,
+            meta: FrameMeta {
+                pts: MediaTime::ZERO,
+                width: WIDTH,
+                height: HEIGHT,
+                format: PixelFormat::Nv12,
+                color: multiview_core::color::ColorInfo::default(),
+            },
+            raw_pts: None,
+            a53_cc: None,
+        }
+    }
+
+    /// The NAL type of each Annex B start code in `au`.
+    fn annexb_nal_types(au: &[u8], hevc: bool) -> Vec<u8> {
+        au.windows(4)
+            .filter(|w| w[..3] == [0, 0, 1])
+            .map(|w| {
+                if hevc {
+                    (w[3] >> 1) & 0x3F
+                } else {
+                    w[3] & 0x1F
+                }
+            })
+            .collect()
+    }
+
+    /// The NAL units of an Annex B access unit that are parameter sets.
+    fn annexb_parameter_sets(au: &[u8], hevc: bool) -> Vec<Vec<u8>> {
+        let mut starts = Vec::new();
+        let mut i = 0;
+        while i + 3 <= au.len() {
+            if au[i..i + 3] == [0, 0, 1] {
+                starts.push(i + 3);
+                i += 3;
+            } else {
+                i += 1;
+            }
+        }
+        let mut out = Vec::new();
+        for (n, &start) in starts.iter().enumerate() {
+            let mut end = starts.get(n + 1).map_or(au.len(), |&next| next - 3);
+            while end > start && au[end - 1] == 0 {
+                end -= 1;
+            }
+            let nal = &au[start..end];
+            let ty = if hevc {
+                (nal[0] >> 1) & 0x3F
+            } else {
+                nal[0] & 0x1F
+            };
+            let is_ps = if hevc {
+                (32..=34).contains(&ty)
+            } else {
+                ty == 7 || ty == 8
+            };
+            if is_ps {
+                out.push(nal.to_vec());
+            }
+        }
+        out
+    }
+
+    /// Run an encoder from tick 0 to `t0`, check that a forced keyframe at
+    /// `t0` is a one-shot self-contained IDR, and return tick 0's parameter
+    /// sets (the running encoder's decoder configuration).
+    fn running_encoder_sets(
+        config: &EncodeConfig,
+        codec: &str,
+        hevc: bool,
+        t0: u64,
+    ) -> Vec<Vec<u8>> {
+        let mut running = super::VideoRenditionEncoder::new(config).unwrap();
+        let first = running.encode_frame_at(live_open_frame(60), 0).unwrap();
+        let reference = annexb_parameter_sets(first[0].payload().unwrap(), hevc);
+        assert!(
+            !reference.is_empty(),
+            "{codec}: tick 0 carries parameter sets"
+        );
+        for tick in 1..t0 {
+            running.encode_frame_at(live_open_frame(60), tick).unwrap();
+        }
+        // A forced keyframe on the running encoder is a self-contained IDR.
+        running.force_next_keyframe();
+        let forced = running.encode_frame_at(live_open_frame(60), t0).unwrap();
+        assert!(
+            running.codec_params().is_self_contained_rap(&forced[0]),
+            "{codec}: forced keyframe {} packets, key {}, NAL types {:?}",
+            forced.len(),
+            forced[0].is_keyframe(),
+            annexb_nal_types(forced[0].payload().unwrap(), hevc)
+        );
+        let ordinary = running
+            .encode_frame_at(live_open_frame(60), t0 + 1)
+            .unwrap();
+        assert!(!ordinary[0].is_keyframe(), "{codec}: the force is one-shot");
+        reference
+    }
+
+    /// Open an encoder live at `t0`: tick 0 is refused, the first packet is
+    /// a self-contained IDR at absolute PTS `t0` whose parameter sets equal
+    /// `reference`, and PTS continues from there.
+    fn assert_live_open_at(
+        config: &EncodeConfig,
+        codec: &str,
+        hevc: bool,
+        t0: u64,
+        reference: &[Vec<u8>],
+    ) {
+        let mut live = super::VideoRenditionEncoder::new(config)
+            .unwrap()
+            .starting_at(t0);
+        assert_eq!(live.next_tick(), t0);
+        assert!(
+            live.encode_frame_at(live_open_frame(180), 0).is_err(),
+            "{codec}: tick 0 refused"
+        );
+        let opened = live.encode_frame_at(live_open_frame(180), t0).unwrap();
+        assert_eq!(
+            opened[0].pts(),
+            Some(i64::try_from(t0).unwrap()),
+            "{codec}: absolute PTS"
+        );
+        assert_eq!(opened[0].dts(), opened[0].pts());
+        assert!(
+            live.codec_params().is_self_contained_rap(&opened[0]),
+            "{codec}: first IDR"
+        );
+        assert_eq!(
+            annexb_parameter_sets(opened[0].payload().unwrap(), hevc),
+            reference,
+            "{codec}: parameter sets of a live-opened encoder equal the running encoder's"
+        );
+        let next = live.encode_frame_at(live_open_frame(180), t0 + 1).unwrap();
+        assert_eq!(next[0].pts(), Some(i64::try_from(t0 + 1).unwrap()));
+    }
+
     /// ADR-0108 §4.2/§4.3: an encoder opened live with `starting_at(T0)` emits
     /// absolute PTS from T0, its first packet is a self-contained IDR (in-band
     /// parameter sets), a forced keyframe on a running encoder is one too, and
@@ -3835,65 +3985,6 @@ mod tests {
     /// measured on hardware).
     #[test]
     fn a_live_opened_rendition_starts_at_t0_with_a_self_contained_idr() {
-        use multiview_core::frame::FrameMeta;
-        use multiview_core::pixel::PixelFormat;
-        use multiview_core::time::MediaTime;
-        fn frame(luma: u8) -> DecodedVideoFrame {
-            let mut video =
-                ffmpeg::util::frame::Video::new(ffmpeg::format::Pixel::YUV420P, WIDTH, HEIGHT);
-            for plane in 0..3 {
-                video
-                    .data_mut(plane)
-                    .fill(if plane == 0 { luma } else { 128 });
-            }
-            DecodedVideoFrame {
-                frame: video,
-                meta: FrameMeta {
-                    pts: MediaTime::ZERO,
-                    width: WIDTH,
-                    height: HEIGHT,
-                    format: PixelFormat::Nv12,
-                    color: multiview_core::color::ColorInfo::default(),
-                },
-                raw_pts: None,
-                a53_cc: None,
-            }
-        }
-        /// The NAL units of an Annex B access unit that are parameter sets.
-        fn parameter_sets(au: &[u8], hevc: bool) -> Vec<Vec<u8>> {
-            let mut starts = Vec::new();
-            let mut i = 0;
-            while i + 3 <= au.len() {
-                if au[i..i + 3] == [0, 0, 1] {
-                    starts.push(i + 3);
-                    i += 3;
-                } else {
-                    i += 1;
-                }
-            }
-            let mut out = Vec::new();
-            for (n, &start) in starts.iter().enumerate() {
-                let mut end = starts.get(n + 1).map_or(au.len(), |&next| next - 3);
-                while end > start && au[end - 1] == 0 {
-                    end -= 1;
-                }
-                let nal = &au[start..end];
-                let ty = if hevc {
-                    (nal[0] >> 1) & 0x3F
-                } else {
-                    nal[0] & 0x1F
-                };
-                let is_ps = if hevc {
-                    (32..=34).contains(&ty)
-                } else {
-                    ty == 7 || ty == 8
-                };
-                if is_ps {
-                    out.push(nal.to_vec());
-                }
-            }
-            out
-        }
         const T0: u64 = 200;
         for (codec, hevc) in [("libx264", false), ("libx265", true)] {
             if ffmpeg::encoder::find_by_name(codec).is_none() {
@@ -3903,67 +3994,8 @@ mod tests {
             config.codec_name = codec.to_owned();
             config.gop = 60;
             config.cadence = Rational::FPS_29_97;
-            let mut running = super::VideoRenditionEncoder::new(&config).unwrap();
-            let first = running.encode_frame_at(frame(60), 0).unwrap();
-            let reference = parameter_sets(first[0].payload().unwrap(), hevc);
-            assert!(
-                !reference.is_empty(),
-                "{codec}: tick 0 carries parameter sets"
-            );
-            for tick in 1..T0 {
-                running.encode_frame_at(frame(60), tick).unwrap();
-            }
-            // A forced keyframe on the running encoder is a self-contained IDR.
-            running.force_next_keyframe();
-            let forced = running.encode_frame_at(frame(60), T0).unwrap();
-            let nal_types = |au: &[u8]| -> Vec<u8> {
-                au.windows(4)
-                    .filter(|w| w[..3] == [0, 0, 1])
-                    .map(|w| {
-                        if hevc {
-                            (w[3] >> 1) & 0x3F
-                        } else {
-                            w[3] & 0x1F
-                        }
-                    })
-                    .collect()
-            };
-            assert!(
-                running.codec_params().is_self_contained_rap(&forced[0]),
-                "{codec}: forced keyframe {} packets, key {}, NAL types {:?}",
-                forced.len(),
-                forced[0].is_keyframe(),
-                nal_types(forced[0].payload().unwrap())
-            );
-            let ordinary = running.encode_frame_at(frame(60), T0 + 1).unwrap();
-            assert!(!ordinary[0].is_keyframe(), "{codec}: the force is one-shot");
-
-            let mut live = super::VideoRenditionEncoder::new(&config)
-                .unwrap()
-                .starting_at(T0);
-            assert_eq!(live.next_tick(), T0);
-            assert!(
-                live.encode_frame_at(frame(180), 0).is_err(),
-                "{codec}: tick 0 refused"
-            );
-            let opened = live.encode_frame_at(frame(180), T0).unwrap();
-            assert_eq!(
-                opened[0].pts(),
-                Some(i64::try_from(T0).unwrap()),
-                "{codec}: absolute PTS"
-            );
-            assert_eq!(opened[0].dts(), opened[0].pts());
-            assert!(
-                live.codec_params().is_self_contained_rap(&opened[0]),
-                "{codec}: first IDR"
-            );
-            assert_eq!(
-                parameter_sets(opened[0].payload().unwrap(), hevc),
-                reference,
-                "{codec}: parameter sets of a live-opened encoder equal the running encoder's"
-            );
-            let next = live.encode_frame_at(frame(180), T0 + 1).unwrap();
-            assert_eq!(next[0].pts(), Some(i64::try_from(T0 + 1).unwrap()));
+            let reference = running_encoder_sets(&config, codec, hevc, T0);
+            assert_live_open_at(&config, codec, hevc, T0, &reference);
         }
     }
 
