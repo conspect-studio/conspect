@@ -334,14 +334,16 @@ async fn run_pipeline(
         // MP-1 (ADR-0030 §2.2): the daemon run path builds an engine `ProgramSet`
         // and drives this single program (id "main") through it — move the owned
         // pipeline in (the set spawns it on its own supervised task).
-        run_pipeline_until_ctrl_c(
+        // Boxed: the run future carries the whole control-plane wiring
+        // (clippy::large_futures; the front-door handle grew it past 16 KiB).
+        Box::pin(run_pipeline_until_ctrl_c(
             pipeline,
             start,
             &plane,
             &args.config,
             #[cfg(feature = "moq-output")]
             preview_budget,
-        )
+        ))
         .await?
     };
 

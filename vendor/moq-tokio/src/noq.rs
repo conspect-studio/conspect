@@ -544,6 +544,10 @@ pub struct Injected {
 	pub socket: Box<dyn noq::AsyncUdpSocket>,
 	/// The endpoint configuration to use for this socket.
 	pub endpoint: noq::EndpointConfig,
+	/// Caps on handshakes noq holds before the server accepts them:
+	/// `(max_incoming, incoming_buffer_size_total bytes)`. noq's defaults
+	/// (65 536 and 100 MiB) are too generous for a socket shared with media.
+	pub incoming: Option<(usize, u64)>,
 }
 
 impl std::fmt::Debug for Injected {
@@ -692,6 +696,10 @@ impl NoqServer {
 		member: Option<listen::Socket>,
 		injected: Option<Injected>,
 	) -> Result<Self> {
+		let (mut endpoint_config, injected_socket, incoming) = match injected {
+			Some(Injected { socket, endpoint, incoming }) => (endpoint, Some(socket), incoming),
+			None => (noq::EndpointConfig::default(), None, None),
+		};
 		let mut transport = noq::TransportConfig::default();
 		let quic = quic.resolve();
 		apply_transport(&mut transport, &quic);
@@ -731,6 +739,9 @@ impl NoqServer {
 		let tls: noq::crypto::rustls::QuicServerConfig = tls.try_into()?;
 		let mut tls = noq::ServerConfig::with_crypto(Arc::new(tls));
 		tls.transport_config(transport);
+		if let Some((max_incoming, total)) = incoming {
+			tls.max_incoming(max_incoming).incoming_buffer_size_total(total);
+		}
 
 		// Advertise the preferred_address transport parameter (RFC 9000 §9.6).
 		// noq allocates a fresh CID + reset token for the address during the handshake.
@@ -754,13 +765,10 @@ impl NoqServer {
 		let load_balancer = config.load_balancer();
 
 		// An injected socket brings its own endpoint config and must not be sharded.
-		if injected.is_some() && member.is_some() {
+		if injected_socket.is_some() && member.is_some() {
 			return Err(Error::ShardWithQuicLb);
 		}
-		let (mut endpoint_config, injected_socket) = match injected {
-			Some(Injected { socket, endpoint }) => (endpoint, Some(socket)),
-			None => (noq::EndpointConfig::default(), None),
-		};
+
 		// Configure connection ID generator with server ID if provided
 		if let Some(shard) = member.as_ref().map(listen::Socket::shard) {
 			if load_balancer.is_some() {

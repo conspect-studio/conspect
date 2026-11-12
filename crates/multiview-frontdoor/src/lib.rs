@@ -44,7 +44,7 @@ use std::time::Instant;
 use tokio::sync::mpsc;
 
 pub use classify::{classify, first_byte_class, ByteClass, DropReason, Lane, QuicKind, Verdict};
-pub use limits::{EstablishedSet, NewFlowLimiter, NewFlowLimits, Refusal};
+pub use limits::{Budget, EstablishedSet, NewFlowLimiter, NewFlowLimits, Refusal};
 pub use quic::QuicLane;
 pub use rtc::RtcLane;
 pub use socket::SharedSocket;
@@ -124,6 +124,8 @@ pub struct Stats {
     pub dropped_global: AtomicU64,
     /// Dropped by the global Version Negotiation budget.
     pub dropped_vn: AtomicU64,
+    /// Dropped by the global handshake (Initial) budget.
+    pub dropped_initial: AtomicU64,
     /// Dropped because a lane queue was full.
     pub dropped_queue_full: AtomicU64,
     /// Dropped because the lane had no consumer.
@@ -151,6 +153,7 @@ impl Stats {
             dropped_per_source: get(&self.dropped_per_source),
             dropped_global: get(&self.dropped_global),
             dropped_vn: get(&self.dropped_vn),
+            dropped_initial: get(&self.dropped_initial),
             dropped_queue_full: get(&self.dropped_queue_full),
             dropped_no_consumer: get(&self.dropped_no_consumer),
             recv_errors: get(&self.recv_errors),
@@ -170,6 +173,7 @@ pub struct StatsSnapshot {
     pub dropped_per_source: u64,
     pub dropped_global: u64,
     pub dropped_vn: u64,
+    pub dropped_initial: u64,
     pub dropped_queue_full: u64,
     pub dropped_no_consumer: u64,
     pub recv_errors: u64,
@@ -506,29 +510,36 @@ impl Dispatcher {
         let from_turn =
             !self.turn_servers.is_empty() && self.turn_servers.contains(&classify::canonical(src));
         let verdict = classify(payload, from_turn);
-        let (lane, vn) = match verdict {
+        let (lane, budget) = match verdict {
             Verdict::Drop(_) => {
                 Stats::bump(&self.stats.dropped_classify);
                 return;
             }
-            Verdict::Rtc => (Lane::Rtc, false),
-            Verdict::Quic(kind) => (Lane::Quic, kind == QuicKind::VersionNegotiationTrigger),
+            Verdict::Rtc => (Lane::Rtc, Budget::None),
+            Verdict::Quic(QuicKind::VersionNegotiationTrigger) => {
+                (Lane::Quic, Budget::VersionNegotiation)
+            }
+            Verdict::Quic(QuicKind::Initial) => (Lane::Quic, Budget::Initial),
+            Verdict::Quic(_) => (Lane::Quic, Budget::None),
         };
         let (tx, established) = match lane {
             Lane::Quic => (&self.quic, &self.quic_established),
             Lane::Rtc => (&self.rtc, &self.rtc_established),
         };
         // A TURN server we allocated on is validated by configuration.
-        let is_established = !vn && (from_turn || established.contains(src));
+        // A VN trigger always pays its budget: no validated peer needs one.
+        let is_established =
+            budget != Budget::VersionNegotiation && (from_turn || established.contains(src));
         let queue = if is_established {
             &tx.established
         } else {
             // New-flow limits run before the datagram is copied anywhere.
-            if let Err(refusal) = self.limiter.admit(src, vn, now) {
+            if let Err(refusal) = self.limiter.admit(src, budget, now) {
                 Stats::bump(match refusal {
                     Refusal::PerSource => &self.stats.dropped_per_source,
                     Refusal::Global => &self.stats.dropped_global,
                     Refusal::VersionNegotiation => &self.stats.dropped_vn,
+                    Refusal::Initial => &self.stats.dropped_initial,
                 });
                 return;
             }

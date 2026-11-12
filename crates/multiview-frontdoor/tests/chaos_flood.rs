@@ -239,12 +239,16 @@ impl Flood {
                 let stop = Arc::clone(&stop);
                 let sent = Arc::clone(&sent);
                 std::thread::spawn(move || {
-                    let sockets: Vec<UdpSocket> = (0..50u8)
+                    // Linux routes all of 127/8 to lo; macOS only 127.0.0.1,
+                    // where the flood then comes from one source address.
+                    let mut sockets: Vec<UdpSocket> = (0..50u8)
                         .filter_map(|i| {
                             UdpSocket::bind((format!("127.0.0.{}", 2 + t * 50 + i), 0)).ok()
                         })
                         .collect();
-                    assert!(!sockets.is_empty(), "loopback sources");
+                    if sockets.is_empty() {
+                        sockets.push(UdpSocket::bind("127.0.0.1:0").unwrap());
+                    }
                     let target: SocketAddr = format!("127.0.0.1:{target_port}").parse().unwrap();
                     let shapes = shapes();
                     let per_thread = pps / 4;
@@ -360,6 +364,7 @@ fn start_viewer(door: &mut FrontDoor) -> Viewer {
         server.socket = Some(moq_tokio::noq::Injected {
             socket: Box::new(lane),
             endpoint: multiview_frontdoor::quic::endpoint_config(),
+            incoming: Some(multiview_frontdoor::quic::incoming_caps()),
         });
         let mut listener = server.init().unwrap().listen().await.unwrap();
         tokio::spawn(async move {

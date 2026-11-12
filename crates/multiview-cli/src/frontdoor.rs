@@ -36,10 +36,21 @@ pub fn config_from(config: &MultiviewConfig) -> Option<multiview_frontdoor::Fron
         // Ingest publishers and whip_push sessions are admitted outside the
         // viewer pool; give them headroom in the established set.
         .saturating_add(64);
+    // TURN servers the WebRTC endpoint allocates on: only their datagrams may be
+    // ChannelData (64-79), and they are trusted by configuration (relayed
+    // media from them is on the established path).
+    #[cfg(feature = "webrtc-native")]
+    let turn_servers = crate::webrtc_endpoint::endpoint_config_from(config)
+        .turn_servers()
+        .map(|s| s.addr)
+        .collect();
+    #[cfg(not(feature = "webrtc-native"))]
+    let turn_servers = Vec::new();
     Some(multiview_frontdoor::FrontDoorConfig {
         port: network.https_port,
         workers: usize::from(network.workers.max(1)),
         max_rtc_peers: max_rtc,
+        turn_servers,
         ..multiview_frontdoor::FrontDoorConfig::default()
     })
 }
@@ -126,6 +137,7 @@ impl FrontDoorRun {
         Some(multiview_moq::provider::SharedSocket {
             socket: Box::new(lane),
             endpoint: multiview_frontdoor::quic::endpoint_config(),
+            incoming: Some(multiview_frontdoor::quic::incoming_caps()),
             runtime: self.door.handle(),
             peers: Some(peers),
         })

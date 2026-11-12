@@ -98,7 +98,12 @@ pub enum Lane {
 /// The QUIC packet shapes the dispatcher treats differently.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum QuicKind {
-    /// A long header with a supported version (Initial, 0-RTT, Handshake).
+    /// A supported-version Initial (padded to >= 1200 bytes): the only packet
+    /// that makes noq create connection state for an unvalidated address, so it
+    /// is charged to a global handshake budget as well as the new-flow limits.
+    Initial,
+    /// A long header with a supported version that is not an Initial (0-RTT,
+    /// Handshake).
     Long,
     /// A short header (1-RTT data, or a stateless-reset trigger when the
     /// connection ID is unknown).
@@ -252,6 +257,7 @@ fn classify_long_header(first: u8, datagram: &[u8]) -> Verdict {
     // 2 Handshake, 3 Retry.
     match (first & 0x30) >> 4 {
         0 if datagram.len() < MIN_INITIAL_DATAGRAM => Verdict::Drop(DropReason::ShortInitial),
+        0 => Verdict::Quic(QuicKind::Initial),
         3 => Verdict::Drop(DropReason::Retry),
         _ => Verdict::Quic(QuicKind::Long),
     }
@@ -465,7 +471,7 @@ mod tests {
     #[test]
     fn quic_v1_initial_must_be_padded() {
         let ok = long_header(0xc3, 1, 8, 8, 1200);
-        assert_eq!(classify(&ok, false), Verdict::Quic(QuicKind::Long));
+        assert_eq!(classify(&ok, false), Verdict::Quic(QuicKind::Initial));
         let short = long_header(0xc3, 1, 8, 8, 1199);
         assert_eq!(
             classify(&short, false),
@@ -613,13 +619,15 @@ mod tests {
                     };
                     proptest::prop_assert!(ok, "rtc got {:?}", &data[..data.len().min(8)]);
                 }
-                Verdict::Quic(QuicKind::Long) => {
+                Verdict::Quic(kind @ (QuicKind::Long | QuicKind::Initial)) => {
                     proptest::prop_assert!(data[0] >= 192);
                     let v = long_header_version(&data).unwrap();
                     proptest::prop_assert!(SUPPORTED_QUIC_VERSIONS.contains(&v));
-                    // Never a Retry, never an unpadded Initial.
+                    // Never a Retry, never an unpadded Initial; Initials are
+                    // always tagged as such (they pay the handshake budget).
                     let ty = (data[0] & 0x30) >> 4;
                     proptest::prop_assert!(ty != 3);
+                    proptest::prop_assert_eq!(ty == 0, kind == QuicKind::Initial);
                     proptest::prop_assert!(ty != 0 || data.len() >= MIN_INITIAL_DATAGRAM);
                 }
                 Verdict::Quic(QuicKind::VersionNegotiationTrigger) => {

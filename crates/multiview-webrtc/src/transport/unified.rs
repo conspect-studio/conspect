@@ -189,6 +189,17 @@ impl RunProbe {
     }
 }
 
+/// An IPv4-mapped IPv6 socket address as plain IPv4.
+fn canonical_peer(addr: SocketAddr) -> SocketAddr {
+    match addr {
+        SocketAddr::V6(v6) => v6
+            .ip()
+            .to_ipv4_mapped()
+            .map_or(addr, |v4| SocketAddr::new(v4.into(), v6.port())),
+        SocketAddr::V4(_) => addr,
+    }
+}
+
 /// One datagram delivered by a shared front door (ADR-0107 slice 1).
 #[derive(Debug, Clone)]
 pub struct InboundDatagram {
@@ -741,6 +752,14 @@ impl UnifiedEndpoint {
             out.extend(preview.validated_peers());
         }
         out.extend(push.iter().filter_map(PushLane::validated_peer));
+        // One key per peer however the dual-stack socket reported it (an IPv4
+        // peer arrives IPv4-mapped on the socket path, native IPv4 through a
+        // TURN relay), and one entry per address however many sessions use it.
+        for peer in out.iter_mut() {
+            *peer = canonical_peer(*peer);
+        }
+        out.sort_unstable();
+        out.dedup();
     }
 
     /// Report the difference between `current` and what was last reported.
@@ -749,8 +768,9 @@ impl UnifiedEndpoint {
         reported: &mut std::collections::HashSet<SocketAddr>,
         current: &[SocketAddr],
     ) {
+        // `current` is canonical, sorted and deduplicated.
         reported.retain(|peer| {
-            let keep = current.contains(peer);
+            let keep = current.binary_search(peer).is_ok();
             if !keep {
                 inbound.invalidated(*peer);
             }
@@ -1078,6 +1098,57 @@ impl UnifiedEndpoint {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A recording `SharedInbound` (no datagrams), for the validated-peer sync.
+    #[derive(Default)]
+    struct Recorder {
+        events: Vec<(SocketAddr, bool)>,
+    }
+
+    impl SharedInbound for Recorder {
+        fn poll_next(
+            &mut self,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Option<InboundDatagram>> {
+            std::task::Poll::Pending
+        }
+        fn try_next(&mut self) -> Option<InboundDatagram> {
+            None
+        }
+        fn validated(&mut self, peer: SocketAddr) -> bool {
+            self.events.push((peer, true));
+            true
+        }
+        fn invalidated(&mut self, peer: SocketAddr) {
+            self.events.push((peer, false));
+        }
+    }
+
+    /// Review finding (PR 315): a peer seen IPv4-mapped on one path and native
+    /// IPv4 on another must be one established entry with no per-tick churn.
+    #[test]
+    fn mapped_and_native_reports_of_one_peer_are_one_entry_without_churn() {
+        let mapped: SocketAddr = "[::ffff:192.0.2.9]:5000".parse().unwrap();
+        let native: SocketAddr = "192.0.2.9:5000".parse().unwrap();
+        let mut rec = Recorder::default();
+        let mut reported = std::collections::HashSet::new();
+        for _tick in 0..5 {
+            let mut current = vec![mapped, native];
+            for p in &mut current {
+                *p = canonical_peer(*p);
+            }
+            current.sort_unstable();
+            current.dedup();
+            UnifiedEndpoint::sync_validated(&mut rec, &mut reported, &current);
+        }
+        assert_eq!(
+            rec.events,
+            vec![(native, true)],
+            "one insert, no remove/insert churn"
+        );
+        UnifiedEndpoint::sync_validated(&mut rec, &mut reported, &[]);
+        assert_eq!(rec.events.last(), Some(&(native, false)));
+    }
     use std::net::{Ipv6Addr, SocketAddrV6, UdpSocket};
 
     /// Count queued UDP datagrams with Linux's advancing peek cursor. No read

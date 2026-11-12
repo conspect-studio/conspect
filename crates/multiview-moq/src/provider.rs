@@ -899,6 +899,9 @@ pub struct SharedSocket {
     pub socket: Box<dyn moq_tokio::noq::AsyncUdpSocket>,
     /// The endpoint configuration (`grease_quic_bit(false)` etc.).
     pub endpoint: moq_tokio::noq::EndpointConfig,
+    /// `(max_incoming, incoming_buffer_size_total)` caps on handshakes noq
+    /// holds before the accept loop takes them.
+    pub incoming: Option<(usize, u64)>,
     /// The front door's runtime: the noq driver, connections and accept loop
     /// all run here.
     pub runtime: tokio::runtime::Handle,
@@ -1069,6 +1072,7 @@ impl Runtime {
                 server.socket = Some(moq_tokio::noq::Injected {
                     socket: shared.socket,
                     endpoint: shared.endpoint,
+                    incoming: shared.incoming,
                 });
                 // Build the endpoint inside the front-door runtime: noq spawns
                 // its endpoint driver and every connection task on the runtime

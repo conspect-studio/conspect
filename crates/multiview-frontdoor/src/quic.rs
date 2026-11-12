@@ -36,6 +36,19 @@ pub fn endpoint_config() -> noq::EndpointConfig {
     config
 }
 
+/// Most handshakes noq holds before the server accepts them (the default is
+/// 65 536). Each pending `Incoming` lives until the accept loop takes it.
+pub const MAX_INCOMING: usize = 64;
+/// Most bytes noq buffers for those pending handshakes (the default is 100 MiB).
+pub const INCOMING_BUFFER_TOTAL: u64 = 4 * 1024 * 1024;
+
+/// The `(max_incoming, incoming_buffer_size_total)` caps for
+/// `moq_tokio::noq::Injected::incoming`.
+#[must_use]
+pub const fn incoming_caps() -> (usize, u64) {
+    (MAX_INCOMING, INCOMING_BUFFER_TOTAL)
+}
+
 /// The QUIC consumer's view of the shared socket. Give it to
 /// `noq::Endpoint::new_with_abstract_socket` (from inside the front door's
 /// runtime, so the endpoint driver and its connections run there).
@@ -91,13 +104,21 @@ impl noq::AsyncUdpSocket for QuicLane {
             let (Some(buf), Some(slot)) = (bufs.get_mut(filled), meta.get_mut(filled)) else {
                 break;
             };
-            let len = datagram.payload.len().min(buf.len());
-            if let (Some(dst), Some(src)) = (buf.get_mut(..len), datagram.payload.get(..len)) {
-                dst.copy_from_slice(src);
-            }
+            let len = datagram.payload.len();
+            // noq sizes each buffer to its max UDP payload (1472 B by default).
+            // A larger datagram cannot be a packet noq accepts; drop it rather
+            // than hand noq a truncated one.
+            let (Some(dst), Some(src)) = (buf.get_mut(..len), datagram.payload.get(..len)) else {
+                next = rx.try_recv();
+                continue;
+            };
+            dst.copy_from_slice(src);
             let mut m = RecvMeta::default();
             m.addr = datagram.src;
             m.len = len;
+            // One datagram per buffer: noq walks `len` in `stride` steps
+            // (`split_to(stride)`), so stride == len hands it exactly one
+            // datagram. stride 0 would never advance.
             m.stride = len;
             m.ecn = datagram.ecn;
             m.dst_ip = datagram.dst_ip;

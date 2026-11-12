@@ -60,6 +60,7 @@ fn start_moq(door: &mut FrontDoor) -> tokio::task::JoinHandle<anyhow::Result<()>
         server.socket = Some(moq_tokio::noq::Injected {
             socket: Box::new(lane),
             endpoint: multiview_frontdoor::quic::endpoint_config(),
+            incoming: Some(multiview_frontdoor::quic::incoming_caps()),
         });
         let mut listener = server.init()?.listen().await?;
         let request = listener.accept().await.expect("an incoming session");
@@ -272,6 +273,7 @@ fn every_first_byte_on_the_live_socket_misdelivers_nothing() {
         server.socket = Some(moq_tokio::noq::Injected {
             socket: Box::new(lane),
             endpoint: multiview_frontdoor::quic::endpoint_config(),
+            incoming: Some(multiview_frontdoor::quic::incoming_caps()),
         });
         let mut listener = server.init()?.listen().await?;
         while listener.accept().await.is_some() {
@@ -328,4 +330,48 @@ fn every_first_byte_on_the_live_socket_misdelivers_nothing() {
         "{stats:?}"
     );
     stop.store(true, Ordering::Release);
+}
+
+/// Review finding (PR 315): a full-size Initial must reach noq as ONE datagram
+/// of its full length, with no truncation and no re-splitting, so noq's
+/// `split_to(stride)` walk yields exactly one packet.
+#[test]
+fn a_padded_initial_reaches_noq_as_one_whole_datagram() {
+    use noq::AsyncUdpSocket;
+    let mut door = FrontDoor::start(&config()).unwrap();
+    let port = door.local_addr().port();
+    let mut lane = door.take_quic_lane().unwrap();
+    let sender = UdpSocket::bind("[::1]:0").unwrap();
+    let mut initial = vec![0u8; 1250];
+    initial[0] = 0xc3;
+    initial[1..5].copy_from_slice(&1u32.to_be_bytes());
+    initial[5] = 8;
+    initial[14] = 8;
+    sender.send_to(&initial, ("::1", port)).unwrap();
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let (len, stride, meta_count) = rt.block_on(async {
+        let mut storage = vec![vec![0u8; 1472]; 4];
+        let mut metas = vec![noq::udp::RecvMeta::default(); 4];
+        let n = tokio::time::timeout(
+            TIMEOUT,
+            std::future::poll_fn(|cx| {
+                let mut bufs: Vec<std::io::IoSliceMut<'_>> = storage
+                    .iter_mut()
+                    .map(|b| std::io::IoSliceMut::new(b))
+                    .collect();
+                lane.poll_recv(cx, &mut bufs, &mut metas)
+            }),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        (metas[0].len, metas[0].stride, n)
+    });
+    assert_eq!(meta_count, 1);
+    assert_eq!(len, 1250, "whole datagram");
+    // noq walks `len` in `stride` steps: one step means one packet.
+    assert_eq!(len.div_ceil(stride), 1, "exactly one datagram for noq");
 }

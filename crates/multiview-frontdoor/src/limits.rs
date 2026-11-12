@@ -80,6 +80,10 @@ pub struct NewFlowLimits {
     pub max_sources: usize,
     /// Sustained Version-Negotiation-trigger datagrams per second, all sources.
     pub vn_pps: u32,
+    /// Sustained supported-version Initials per second from unvalidated
+    /// addresses, all sources: bounds how fast noq can be made to create
+    /// handshake state (each pending handshake lives until its deadline).
+    pub initial_pps: u32,
 }
 
 impl Default for NewFlowLimits {
@@ -90,6 +94,7 @@ impl Default for NewFlowLimits {
             global_pps: 50_000,
             max_sources: 16_384,
             vn_pps: 200,
+            initial_pps: 200,
         }
     }
 }
@@ -103,6 +108,20 @@ pub enum Refusal {
     Global,
     /// The global Version Negotiation budget is spent.
     VersionNegotiation,
+    /// The global handshake (Initial) budget is spent.
+    Initial,
+}
+
+/// Which extra global budget a new-flow datagram pays, besides the
+/// per-source and global new-flow budgets.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Budget {
+    /// None.
+    None,
+    /// The Version Negotiation budget.
+    VersionNegotiation,
+    /// The handshake (Initial) budget.
+    Initial,
 }
 
 /// Per-source buckets (bounded LRU) plus global budgets. Single owner.
@@ -112,6 +131,7 @@ pub struct NewFlowLimiter {
     sources: LruCache<SourceKey, TokenBucket>,
     global: TokenBucket,
     vn: TokenBucket,
+    initial: TokenBucket,
 }
 
 impl NewFlowLimiter {
@@ -125,22 +145,30 @@ impl NewFlowLimiter {
             // A tenth of a second of burst on the global budgets.
             global: TokenBucket::new(limits.global_pps, (limits.global_pps / 10).max(1), now),
             vn: TokenBucket::new(limits.vn_pps, (limits.vn_pps / 10).max(1), now),
+            initial: TokenBucket::new(limits.initial_pps, (limits.initial_pps / 10).max(1), now),
         }
     }
 
-    /// Admit one new-flow datagram from `src`, or say why not. The per-source
-    /// bucket is charged first, so a single noisy source cannot spend the global
-    /// budget beyond its own rate. `vn_trigger` also charges the VN budget.
+    /// Admit one new-flow datagram from `src`, or say why not. A Version
+    /// Negotiation trigger (or an Initial) is checked against its global budget
+    /// **first**, so a rotating-source flood of unknown-version long headers
+    /// draws at most `vn_pps` replies, and of Initials creates at most
+    /// `initial_pps` handshakes per second, whatever the per-source and global
+    /// budgets allow. Then
+    /// the per-source bucket, so a single noisy source cannot spend the global
+    /// budget beyond its own rate, then the global budget.
     ///
     /// # Errors
     ///
     /// The [`Refusal`] naming the budget that is spent.
-    pub fn admit(
-        &mut self,
-        src: SocketAddr,
-        vn_trigger: bool,
-        now: Instant,
-    ) -> Result<(), Refusal> {
+    pub fn admit(&mut self, src: SocketAddr, budget: Budget, now: Instant) -> Result<(), Refusal> {
+        match budget {
+            Budget::VersionNegotiation if !self.vn.try_take(now) => {
+                return Err(Refusal::VersionNegotiation);
+            }
+            Budget::Initial if !self.initial.try_take(now) => return Err(Refusal::Initial),
+            _ => {}
+        }
         let key = SourceKey::of(src);
         let per_source = if let Some(bucket) = self.sources.get_mut(&key) {
             bucket.try_take(now)
@@ -159,9 +187,6 @@ impl NewFlowLimiter {
         };
         if !per_source {
             return Err(Refusal::PerSource);
-        }
-        if vn_trigger && !self.vn.try_take(now) {
-            return Err(Refusal::VersionNegotiation);
         }
         if !self.global.try_take(now) {
             return Err(Refusal::Global);
@@ -297,12 +322,12 @@ mod tests {
         let mut l = NewFlowLimiter::new(NewFlowLimits::default(), t0);
         let src: SocketAddr = "[2001:db8::1]:4000".parse().unwrap();
         let ok = (0..10_000)
-            .filter(|_| l.admit(src, false, t0).is_ok())
+            .filter(|_| l.admit(src, Budget::None, t0).is_ok())
             .count();
         assert_eq!(ok, 200, "only the per-source burst passes");
         // Another port in the same /64 is the same source.
         let same64: SocketAddr = "[2001:db8::ffff]:9".parse().unwrap();
-        assert_eq!(l.admit(same64, false, t0), Err(Refusal::PerSource));
+        assert_eq!(l.admit(same64, Budget::None, t0), Err(Refusal::PerSource));
         assert_eq!(l.tracked_sources(), 1);
     }
 
@@ -333,7 +358,7 @@ mod tests {
                 1234,
             );
             for src in [v4, v6] {
-                admitted += usize::from(l.admit(src, false, t0).is_ok());
+                admitted += usize::from(l.admit(src, Budget::None, t0).is_ok());
                 assert!(l.tracked_sources() <= 1024);
             }
         }
@@ -350,11 +375,60 @@ mod tests {
         let mut vn_ok = 0;
         for i in 0..1000u32 {
             let src = SocketAddr::new(IpAddr::V4(Ipv4Addr::from(0xc000_0200 + i)), 1);
-            if l.admit(src, true, t0).is_ok() {
+            if l.admit(src, Budget::VersionNegotiation, t0).is_ok() {
                 vn_ok += 1;
             }
         }
         assert_eq!(vn_ok, 20, "vn burst = vn_pps / 10");
+    }
+
+    #[test]
+    fn vn_budget_binds_before_per_source_and_global_budgets() {
+        // Review finding (PR 315): with the VN check last, a rotating-source
+        // flood spent the 50 000/s global budget, not the 200/s VN budget.
+        let t0 = Instant::now();
+        let mut l = NewFlowLimiter::new(NewFlowLimits::default(), t0);
+        let mut vn = 0usize;
+        let mut refused_vn = 0usize;
+        for i in 0..5_000u32 {
+            let src = SocketAddr::new(IpAddr::V4(Ipv4Addr::from(0x0a00_0000 + i)), 443);
+            match l.admit(src, Budget::VersionNegotiation, t0) {
+                Ok(()) => vn += 1,
+                Err(Refusal::VersionNegotiation) => refused_vn += 1,
+                Err(other) => panic!("unexpected {other:?}"),
+            }
+        }
+        assert_eq!(vn, 20);
+        assert_eq!(refused_vn, 4_980);
+        // Refused VN triggers spent nothing else: no source keys were created and
+        // ordinary new flows still get the whole global burst.
+        assert_eq!(l.tracked_sources(), 20);
+        // One second later the VN budget has refilled by exactly vn_pps (capped
+        // at its burst).
+        let t1 = t0 + Duration::from_secs(1);
+        let again = (0..1_000u32)
+            .filter(|i| {
+                let src = SocketAddr::new(IpAddr::V4(Ipv4Addr::from(0x0b00_0000 + i)), 443);
+                l.admit(src, Budget::VersionNegotiation, t1).is_ok()
+            })
+            .count();
+        assert_eq!(again, 20);
+    }
+
+    #[test]
+    fn initials_from_rotating_sources_are_held_to_the_handshake_budget() {
+        let t0 = Instant::now();
+        let mut l = NewFlowLimiter::new(NewFlowLimits::default(), t0);
+        let ok = (0..10_000u32)
+            .filter(|i| {
+                let src = SocketAddr::new(IpAddr::V4(Ipv4Addr::from(0x0c00_0000 + i)), 443);
+                l.admit(src, Budget::Initial, t0).is_ok()
+            })
+            .count();
+        assert_eq!(ok, 20, "initial burst = initial_pps / 10");
+        // Other new-flow traffic is unaffected by a spent handshake budget.
+        let src: SocketAddr = "[2001:db8::7]:5".parse().unwrap();
+        assert!(l.admit(src, Budget::None, t0).is_ok());
     }
 
     #[test]
