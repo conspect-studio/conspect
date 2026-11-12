@@ -117,47 +117,122 @@ pub fn is_self_contained_idr(au: &[u8], codec: CodecKind, framing: NalFraming) -
     seen.iter().all(|&s| s)
 }
 
-/// The parameter-set NAL units of an access unit, in stream order: SPS (7)
-/// and PPS (8) for H.264; VPS (32), SPS (33) and PPS (34) for HEVC. Each item
-/// is the whole NAL (header + payload, no start code / length prefix). Any
-/// other codec or framing yields nothing. Used to tell whether two RAPs carry
-/// the same decoder configuration (a move between encoders whose sets differ
-/// is a discontinuity for the receiving muxer, ADR-0108 decision 3).
+/// Result of scanning one access unit for its in-band parameter sets.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ParameterSetScan<'a> {
+    /// The access unit carries no parameter-set NAL (or the codec/framing has
+    /// none to scan).
+    Absent,
+    /// The parameter-set NALs, in stream order (header + payload, no start
+    /// code / length prefix).
+    Found(Vec<&'a [u8]>),
+    /// Malformed: the scan failed closed. Never "no change" — a caller
+    /// comparing decoder configurations treats this as a change.
+    Rejected,
+}
+
+/// The owned, comparable form of [`ParameterSetScan`] (sets concatenated
+/// with 4-byte big-endian lengths, or an MPEG-2 sequence header).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RapParameterSets {
+    /// No in-band sets (or not a keyframe / unsupported codec).
+    Absent,
+    /// The decoder configuration bytes.
+    Sets(Vec<u8>),
+    /// The scan failed closed (see [`ParameterSetScan::Rejected`]).
+    Rejected,
+}
+
+/// Scan the parameter-set NAL units of an access unit: SPS (7) and PPS (8)
+/// for H.264; VPS (32), SPS (33) and PPS (34) for HEVC. Used to tell whether
+/// two RAPs carry the same decoder configuration (a move between encoders
+/// whose sets differ is a discontinuity for the receiving muxer, ADR-0108
+/// decision 3). Any other codec or OBU framing yields `Absent`.
 ///
-/// Fail-closed (Annex B): a parameter-set NAL shorter than 4 bytes, or one
-/// immediately followed by a start-code fragment whose header byte has the
-/// `forbidden_zero_bit` set (an emulated `00 00 01` inside a payload that
-/// skipped emulation prevention), makes the whole result empty: no partial
-/// or synthesized set is ever compared.
+/// Fail-closed (`Rejected`), so that no partial or synthesized set is ever
+/// compared:
+/// - each parameter-set type appears at most once, in the canonical order
+///   VPS < SPS < PPS, and none after the first VCL NAL (an emulated
+///   `00 00 01` inside a payload that skipped emulation prevention splits it
+///   into extra NALs, which this almost always exposes);
+/// - a parameter-set NAL shorter than 4 bytes;
+/// - (Annex B) a parameter-set NAL immediately followed by a start-code
+///   fragment whose header byte has the `forbidden_zero_bit` set.
 #[must_use]
-pub fn parameter_sets(au: &[u8], codec: CodecKind, framing: NalFraming) -> Vec<&[u8]> {
-    let wanted: &[u8] = match codec {
-        CodecKind::H264 => &[7, 8],
-        CodecKind::Hevc => &[32, 33, 34],
-        CodecKind::Av1 | CodecKind::Other => return Vec::new(),
-    };
-    let ty = |nal: &[u8]| match codec {
-        CodecKind::H264 => nal.first().map(|&b| b & 0x1F),
-        _ => nal.first().map(|&b| (b >> 1) & 0x3F),
+pub fn scan_parameter_sets(
+    au: &[u8],
+    codec: CodecKind,
+    framing: NalFraming,
+) -> ParameterSetScan<'_> {
+    // (type -> rank) for parameter sets; VCL types end the parameter sets.
+    let (ty, rank, vcl): (
+        fn(&[u8]) -> Option<u8>,
+        fn(u8) -> Option<u8>,
+        fn(u8) -> bool,
+    ) = match codec {
+        CodecKind::H264 => (
+            |nal| nal.first().map(|&b| b & 0x1F),
+            |t| match t {
+                7 => Some(1),
+                8 => Some(2),
+                _ => None,
+            },
+            |t| (1..=5).contains(&t),
+        ),
+        CodecKind::Hevc => (
+            |nal| nal.first().map(|&b| (b >> 1) & 0x3F),
+            |t| match t {
+                32 => Some(0),
+                33 => Some(1),
+                34 => Some(2),
+                _ => None,
+            },
+            |t| t <= 31,
+        ),
+        CodecKind::Av1 | CodecKind::Other => return ParameterSetScan::Absent,
     };
     let mut nals: Vec<&[u8]> = Vec::new();
     collect_nals(au, framing, &mut nals);
     let mut out = Vec::new();
+    let mut last_rank: Option<u8> = None;
+    let mut seen_vcl = false;
     for (n, nal) in nals.iter().enumerate() {
-        if !ty(nal).is_some_and(|t| wanted.contains(&t)) {
+        let Some(t) = ty(nal) else { continue };
+        if vcl(t) {
+            seen_vcl = true;
             continue;
         }
+        let Some(r) = rank(t) else { continue };
+        if seen_vcl || last_rank.is_some_and(|last| r <= last) {
+            return ParameterSetScan::Rejected;
+        }
+        last_rank = Some(r);
         let forbidden_next = matches!(framing, NalFraming::AnnexB)
             && nals
                 .get(n + 1)
                 .and_then(|next| next.first())
                 .is_some_and(|&b| b & 0x80 != 0);
         if nal.len() < 4 || forbidden_next {
-            return Vec::new();
+            return ParameterSetScan::Rejected;
         }
         out.push(*nal);
     }
-    out
+    if out.is_empty() {
+        ParameterSetScan::Absent
+    } else {
+        ParameterSetScan::Found(out)
+    }
+}
+
+/// The parameter-set NAL units of an access unit, in stream order; empty
+/// when there are none OR the scan was rejected (see
+/// [`scan_parameter_sets`], which distinguishes the two).
+#[must_use]
+pub fn parameter_sets(au: &[u8], codec: CodecKind, framing: NalFraming) -> Vec<&[u8]> {
+    match scan_parameter_sets(au, codec, framing) {
+        ParameterSetScan::Found(sets) => sets,
+        ParameterSetScan::Absent | ParameterSetScan::Rejected => Vec::new(),
+    }
 }
 
 /// MPEG-2 video: the sequence header (`00 00 01 B3` and its bytes up to the
@@ -435,6 +510,61 @@ mod tests {
             parameter_sets(&short, CodecKind::H264, NalFraming::AnnexB),
             Vec::<&[u8]>::new()
         );
+    }
+
+    /// M (lens 1 r2 #3): an embedded `00 00 01` inside an SPS whose next
+    /// byte has the forbidden bit CLEAR is not read as a PPS: the duplicate
+    /// (or out-of-order) parameter set it synthesizes is `Rejected`, which is
+    /// distinct from `Absent`.
+    #[test]
+    fn a_synthesized_parameter_set_is_rejected_not_absent() {
+        use super::{scan_parameter_sets, ParameterSetScan};
+        fn scan(au: &[u8]) -> ParameterSetScan<'_> {
+            scan_parameter_sets(au, CodecKind::H264, NalFraming::AnnexB)
+        }
+        // SPS payload hides `00 00 01 68 11 22 33` (a fake PPS, forbidden bit
+        // clear), then the real PPS: PPS twice -> Rejected.
+        let dup = [
+            0, 0, 0, 1, 0x67, 0x42, 0x00, 0x1F, 0, 0, 1, 0x68, 0x11, 0x22, 0x33, 0, 0, 1, 0x68,
+            0xCE, 0x3C, 0x80, 0, 0, 1, 0x65, 0x88,
+        ];
+        assert_eq!(scan(&dup), ParameterSetScan::Rejected);
+        assert!(parameter_sets(&dup, CodecKind::H264, NalFraming::AnnexB).is_empty());
+        // SPS payload hides `00 00 01 65 ..` (a fake IDR slice): the real PPS
+        // after a VCL NAL -> Rejected.
+        let after_vcl = [
+            0, 0, 0, 1, 0x67, 0x42, 0x00, 0x1F, 0, 0, 1, 0x65, 0x11, 0x22, 0, 0, 1, 0x68, 0xCE,
+            0x3C, 0x80, 0, 0, 1, 0x65, 0x88,
+        ];
+        assert_eq!(scan(&after_vcl), ParameterSetScan::Rejected);
+        // PPS before SPS -> Rejected.
+        let reversed = [
+            0, 0, 0, 1, 0x68, 0xCE, 0x3C, 0x80, 0, 0, 1, 0x67, 0x42, 0x00, 0x1F, 0, 0, 1, 0x65,
+            0x88,
+        ];
+        assert_eq!(scan(&reversed), ParameterSetScan::Rejected);
+        // No sets at all -> Absent; a canonical AU -> Found (SEI ignored).
+        assert_eq!(
+            scan(&[0, 0, 0, 1, 0x65, 0x88, 0x80]),
+            ParameterSetScan::Absent
+        );
+        let ok = [
+            0, 0, 0, 1, 0x67, 0x42, 0x00, 0x1F, 0, 0, 1, 0x68, 0xCE, 0x3C, 0x80, 0, 0, 1, 0x06,
+            0x05, 0x01, 0, 0, 1, 0x65, 0x88,
+        ];
+        assert_eq!(
+            scan(&ok),
+            ParameterSetScan::Found(vec![&ok[4..8], &ok[11..15]])
+        );
+        // HEVC VPS < SPS < PPS.
+        let hevc = [
+            0, 0, 0, 1, 0x40, 0x01, 0x0C, 0x01, 0, 0, 1, 0x42, 0x01, 0x01, 0x01, 0, 0, 1, 0x44,
+            0x01, 0xC1, 0x72, 0, 0, 1, 0x26, 0x01, 0xAF,
+        ];
+        assert!(matches!(
+            scan_parameter_sets(&hevc, CodecKind::Hevc, NalFraming::AnnexB),
+            ParameterSetScan::Found(v) if v.len() == 3
+        ));
     }
 
     #[test]

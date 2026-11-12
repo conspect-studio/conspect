@@ -35,9 +35,31 @@ const MAX_MOVE_OUTCOMES: usize = 64;
 pub(crate) type MoveGate = Box<dyn Fn(&EncodedPacket) -> bool + Send>;
 
 /// Per-key "the in-band decoder configuration of this RAP" extractor
-/// (SPS/PPS/VPS bytes, or the MPEG-2 sequence header). `None` = unknown.
+/// (SPS/PPS/VPS bytes, or the MPEG-2 sequence header). `Absent` = none in
+/// band; `Rejected` = malformed (always treated as a change at a switch).
 /// Injected, never parsed here. Consulted on keyframes only.
-pub(crate) type ParameterSets = Box<dyn Fn(&EncodedPacket) -> Option<Vec<u8>> + Send>;
+pub(crate) type ParameterSets = Box<dyn Fn(&EncodedPacket) -> RapParameterSets + Send>;
+pub(crate) use multiview_ffmpeg::idr::RapParameterSets;
+
+/// The one decoder-configuration decision at the packet that opens a new GOP
+/// on an output after a switch (move or fallback): `true` = the output's mux
+/// must reset there. `Absent` cut sets splice; `Rejected` is always a change
+/// and leaves the output's configuration unknown (the next switch resets
+/// too); otherwise the sets are compared and recorded.
+fn decide_sets(last: &mut Option<Vec<u8>>, cut: RapParameterSets) -> bool {
+    match cut {
+        RapParameterSets::Absent => false,
+        RapParameterSets::Rejected => {
+            *last = None;
+            true
+        }
+        RapParameterSets::Sets(sets) => {
+            let changed = last.as_ref() != Some(&sets);
+            *last = Some(sets);
+            changed
+        }
+    }
+}
 
 /// Why a video move was refused.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -359,7 +381,8 @@ struct BindingState {
     /// After a fallback the next delivered window must pass the move gate.
     fallback_gate_pending: bool,
     /// Parameter sets of the last RAP delivered to this output (when its
-    /// key has an extractor).
+    /// key has an extractor); `None` = unknown (never seen, or the last scan
+    /// was rejected), which a switch to a key with sets treats as a change.
     last_sets: Option<Vec<u8>>,
 }
 
@@ -979,24 +1002,28 @@ impl RenditionDispatcher {
                             skip = at;
                             // Compare the cut RAP's decoder configuration with
                             // the output's: a change resets the output's mux.
-                            let cut_sets = self.video_meta.get(m.key).and_then(|x| {
-                                let f = x.params.as_ref()?;
-                                if dest_dynamic {
-                                    self.video
-                                        .get(m.key)
-                                        .and_then(|s| s.peek(index))
-                                        .and_then(|w| w.packets.get(at))
-                                        .and_then(|p| f(p))
-                                } else {
-                                    entry
-                                        .base
-                                        .iter()
-                                        .find(|(k, _)| *k == m.key)
-                                        .and_then(|(_, v)| v.get(at))
-                                        .and_then(f)
-                                }
-                            });
-                            let changed = cut_sets.is_some() && cut_sets != b.last_sets;
+                            let cut_sets = self
+                                .video_meta
+                                .get(m.key)
+                                .and_then(|x| {
+                                    let f = x.params.as_ref()?;
+                                    if dest_dynamic {
+                                        self.video
+                                            .get(m.key)
+                                            .and_then(|s| s.peek(index))
+                                            .and_then(|w| w.packets.get(at))
+                                            .map(|p| f(p))
+                                    } else {
+                                        entry
+                                            .base
+                                            .iter()
+                                            .find(|(k, _)| *k == m.key)
+                                            .and_then(|(_, v)| v.get(at))
+                                            .map(f)
+                                    }
+                                })
+                                .unwrap_or(RapParameterSets::Absent);
+                            let changed = decide_sets(&mut b.last_sets, cut_sets);
                             if changed {
                                 // Not a loss: the cut window opens at a strict
                                 // RAP. A loss here would arm the queue's RAP
@@ -1005,9 +1032,6 @@ impl RenditionDispatcher {
                                     b.output_index,
                                     OfferError::DecoderConfigChanged,
                                 );
-                            }
-                            if cut_sets.is_some() {
-                                b.last_sets = cut_sets;
                             }
                             b.video_key = Some(m.key);
                             push_outcome(
@@ -1049,6 +1073,9 @@ impl RenditionDispatcher {
                 }
             }
             let cur = b.video_key;
+            // This window opens a new GOP after a switch: its sets were
+            // decided (and recorded) once, at the opening packet.
+            let mut switched = applied;
             let mut packets: Vec<EncodedPacket> = Vec::new();
             if let Some(k) = cur {
                 if self.video_meta.get(k).is_some_and(|m| m.dynamic) {
@@ -1079,6 +1106,22 @@ impl RenditionDispatcher {
                 if let Some(at) = rap {
                     skip = at;
                     b.fallback_gate_pending = false;
+                    if !applied {
+                        // The fallback's GOP-opening packet: the same single
+                        // decision a move makes (a move decided above).
+                        let cut = cur
+                            .and_then(|k| self.video_meta.get(k))
+                            .and_then(|m| m.params.as_ref())
+                            .and_then(|f| packets.get(at).map(f))
+                            .unwrap_or(RapParameterSets::Absent);
+                        if decide_sets(&mut b.last_sets, cut) {
+                            delivery.mark_discontinuity(
+                                b.output_index,
+                                OfferError::DecoderConfigChanged,
+                            );
+                        }
+                    }
+                    switched = true;
                 } else {
                     // Never a mid-GOP picture after a switch: the whole window is lost.
                     delivery.report_loss(b.output_index, OfferError::ProducerLoss);
@@ -1089,13 +1132,23 @@ impl RenditionDispatcher {
             if skip > 0 {
                 packets.drain(..skip.min(packets.len()));
             }
+            // Steady state: track the CURRENT key's configuration from its own
+            // RAPs so the next switch compares against what the output carries.
+            // Never on a switch window (decided above, never overridden).
             if let Some(f) = cur
                 .and_then(|k| self.video_meta.get(k))
                 .and_then(|m| m.params.as_ref())
+                .filter(|_| !switched)
             {
-                if let Some(sets) = packets.iter().filter(|p| p.is_keyframe()).find_map(f) {
-                    if b.last_sets.as_ref() != Some(&sets) {
-                        b.last_sets = Some(sets);
+                for p in packets.iter().filter(|p| p.is_keyframe()) {
+                    match f(p) {
+                        RapParameterSets::Absent => {}
+                        RapParameterSets::Rejected => b.last_sets = None,
+                        RapParameterSets::Sets(sets) => {
+                            if b.last_sets.as_ref() != Some(&sets) {
+                                b.last_sets = Some(sets);
+                            }
+                        }
                     }
                 }
             }
@@ -2329,13 +2382,13 @@ mod tests {
             d.set_parameter_sets(
                 k,
                 Box::new(move |p: &EncodedPacket| {
-                    p.is_keyframe().then(|| {
-                        if differ {
-                            vec![u8::try_from(p.len()).unwrap()]
-                        } else {
-                            vec![1]
-                        }
-                    })
+                    if !p.is_keyframe() {
+                        RapParameterSets::Absent
+                    } else if differ {
+                        RapParameterSets::Sets(vec![u8::try_from(p.len()).unwrap()])
+                    } else {
+                        RapParameterSets::Sets(vec![1])
+                    }
                 }),
             )
             .unwrap();
@@ -2391,6 +2444,131 @@ mod tests {
             }]
         );
         assert_eq!(discontinuities, 0, "equal sets splice");
+    }
+
+    /// Extractor whose keyframe sets are `sets` (any non-keyframe: Absent).
+    fn fixed_sets(sets: RapParameterSets) -> ParameterSets {
+        Box::new(move |p: &EncodedPacket| {
+            if p.is_keyframe() {
+                sets.clone()
+            } else {
+                RapParameterSets::Absent
+            }
+        })
+    }
+
+    /// M (lens 1 r2 #3): a cut RAP whose parameter-set scan was Rejected
+    /// (malformed) is a change — one discontinuity — never a silent splice.
+    #[test]
+    fn a_rejected_parameter_set_scan_at_a_move_is_a_change() {
+        let now = Instant::now();
+        let mut d =
+            RenditionDispatcher::new(gated_cfg(vec![binding(0, 0, 1), binding(1, 1, 1)], 2, 1))
+                .unwrap();
+        let mut sink = FakeDelivery::new(2);
+        let key = d
+            .add_video_key(DtsTimeBase { num: 1, den: 5 }, gate())
+            .unwrap();
+        d.set_parameter_sets(1, fixed_sets(RapParameterSets::Sets(vec![1])))
+            .unwrap();
+        d.set_parameter_sets(key, fixed_sets(RapParameterSets::Rejected))
+            .unwrap();
+        d.rebind_video(1, key, 2, 3).unwrap();
+        let mut discontinuities = 0;
+        for i in 0..4_i64 {
+            let m = Some(mark(TICK * i128::from(i + 1)));
+            let pkt = if i == 2 { rap77(i) } else { video(i, 8, false) };
+            d.dispatch(
+                ve(key, u64::try_from(i).unwrap(), vec![pkt], m),
+                now,
+                &mut sink,
+            )
+            .unwrap();
+            feed_base(&mut d, &mut sink, 2, i, now, plain(i)).unwrap();
+            pop_all(&mut sink, 0, now);
+            pop_all(&mut sink, 1, now);
+            if sink.queues[1].take_discontinuity().is_some() {
+                discontinuities += 1;
+            }
+        }
+        assert_eq!(
+            d.take_move_outcomes(),
+            vec![MoveOutcome::Applied {
+                output_index: 1,
+                key,
+                tick: 2,
+                parameter_sets_changed: true
+            }]
+        );
+        assert_eq!(discontinuities, 1);
+    }
+
+    /// L (lens 1 r2 #2): a FALLBACK onto a key whose sets differ from the
+    /// ones the output carried is decided once at the GOP-opening packet:
+    /// exactly one discontinuity, and the window is still admitted.
+    #[test]
+    fn a_fallback_with_changed_parameter_sets_reports_one_discontinuity() {
+        let now = Instant::now();
+        let mut d =
+            RenditionDispatcher::new(gated_cfg(vec![binding(0, 0, 1), binding(1, 1, 1)], 2, 1))
+                .unwrap();
+        let mut sink = FakeDelivery::new(2);
+        let key = d
+            .add_video_key(DtsTimeBase { num: 1, den: 5 }, gate())
+            .unwrap();
+        d.set_parameter_sets(1, fixed_sets(RapParameterSets::Sets(vec![1])))
+            .unwrap();
+        d.set_parameter_sets(key, fixed_sets(RapParameterSets::Sets(vec![2])))
+            .unwrap();
+        d.rebind_video(1, key, 0, 10).unwrap();
+        for i in 0..3_i64 {
+            let m = Some(mark(TICK * i128::from(i + 1)));
+            let p = if i == 0 { rap77(i) } else { video(i, 8, false) };
+            d.dispatch(
+                ve(key, u64::try_from(i).unwrap(), vec![p], m),
+                now,
+                &mut sink,
+            )
+            .unwrap();
+            feed_base(&mut d, &mut sink, 2, i, now, plain(i)).unwrap();
+            pop_all(&mut sink, 0, now);
+            pop_all(&mut sink, 1, now);
+        }
+        assert_eq!(d.binding_video_key(1), Some(key));
+        let _ = sink.queues[1].take_discontinuity();
+        let _ = d.take_move_outcomes();
+        // The live key is closed (retired); window 3's base video for key 1
+        // is a RAP, so the fallback loses no window (no loss signal that
+        // could mask a missing decision).
+        d.retire_video_key(key).unwrap();
+        let rap_on_1 = |i: i64| {
+            move |k: usize| {
+                if k == 1 {
+                    rap77(i)
+                } else {
+                    video(i, 8, false)
+                }
+            }
+        };
+        feed_base(&mut d, &mut sink, 2, 3, now, rap_on_1(3)).unwrap();
+        pop_all(&mut sink, 0, now);
+        assert_eq!(
+            d.take_move_outcomes(),
+            vec![MoveOutcome::Fallback { output_index: 1 }]
+        );
+        assert_eq!(pop_all(&mut sink, 1, now), vec![(77, 2)], "admitted");
+        let event = sink.queues[1].take_discontinuity();
+        assert_eq!(
+            event.map(|e| e.reason),
+            Some(OfferError::DecoderConfigChanged),
+            "the fallback reset the mux, without a loss"
+        );
+        assert_eq!(sink.queues[1].take_discontinuity(), None, "exactly one");
+        // Steady state afterwards: the same sets on key 1 never reset again.
+        feed_base(&mut d, &mut sink, 2, 4, now, rap_on_1(4)).unwrap();
+        pop_all(&mut sink, 0, now);
+        pop_all(&mut sink, 1, now);
+        assert_eq!(sink.queues[1].take_discontinuity(), None);
     }
 
     #[test]
@@ -2471,10 +2649,23 @@ mod tests {
     }
     fn h264_sets() -> ParameterSets {
         Box::new(|p| {
-            let au = p.payload()?;
-            let sets =
-                multiview_ffmpeg::idr::parameter_sets(au, CodecKind::H264, NalFraming::AnnexB);
-            (!sets.is_empty()).then(|| sets.concat())
+            if !p.is_keyframe() {
+                return RapParameterSets::Absent;
+            }
+            let Some(au) = p.payload() else {
+                return RapParameterSets::Absent;
+            };
+            match multiview_ffmpeg::idr::scan_parameter_sets(
+                au,
+                CodecKind::H264,
+                NalFraming::AnnexB,
+            ) {
+                multiview_ffmpeg::idr::ParameterSetScan::Absent => RapParameterSets::Absent,
+                multiview_ffmpeg::idr::ParameterSetScan::Rejected => RapParameterSets::Rejected,
+                multiview_ffmpeg::idr::ParameterSetScan::Found(sets) => {
+                    RapParameterSets::Sets(sets.concat())
+                }
+            }
         })
     }
 

@@ -428,33 +428,48 @@ impl StreamCodecParameters {
 
     /// The in-band decoder configuration a keyframe carries: its SPS/PPS
     /// (H.264) or VPS/SPS/PPS (HEVC) NAL bytes concatenated with their
-    /// lengths, or the MPEG-2 sequence header. `None` for a non-keyframe, an
-    /// unsupported codec or a RAP without in-band sets (fail closed: never a
-    /// partial set). Two RAPs with equal results splice without a reset.
+    /// lengths, or the MPEG-2 sequence header. `Absent` for a non-keyframe,
+    /// an unsupported codec or a RAP without in-band sets; `Rejected` when
+    /// the scan failed closed (never a partial set). Two RAPs with equal
+    /// `Sets` splice without a reset; `Rejected` is always a change.
     #[must_use]
-    pub fn rap_parameter_sets(&self, packet: &EncodedPacket) -> Option<Vec<u8>> {
+    pub fn rap_parameter_sets(&self, packet: &EncodedPacket) -> crate::idr::RapParameterSets {
+        use crate::idr::{ParameterSetScan, RapParameterSets};
         if packet.kind() != StreamKind::Video || !packet.is_keyframe() {
-            return None;
+            return RapParameterSets::Absent;
         }
-        let payload = packet.payload()?;
+        let Some(payload) = packet.payload() else {
+            return RapParameterSets::Absent;
+        };
         let codec = match self.parameters.id() {
             ffmpeg::codec::Id::MPEG2VIDEO => {
-                return crate::idr::mpeg2_sequence_header(payload).map(<[u8]>::to_vec);
+                return crate::idr::mpeg2_sequence_header(payload)
+                    .map_or(RapParameterSets::Absent, |h| {
+                        RapParameterSets::Sets(h.to_vec())
+                    });
             }
             ffmpeg::codec::Id::H264 => crate::idr::CodecKind::H264,
             ffmpeg::codec::Id::HEVC => crate::idr::CodecKind::Hevc,
-            _ => return None,
+            _ => return RapParameterSets::Absent,
         };
-        let sets = crate::idr::parameter_sets(payload, codec, self.nal_framing()?);
-        if sets.is_empty() {
-            return None;
+        let Some(framing) = self.nal_framing() else {
+            return RapParameterSets::Absent;
+        };
+        match crate::idr::scan_parameter_sets(payload, codec, framing) {
+            ParameterSetScan::Absent => RapParameterSets::Absent,
+            ParameterSetScan::Rejected => RapParameterSets::Rejected,
+            ParameterSetScan::Found(sets) => {
+                let mut out = Vec::new();
+                for set in sets {
+                    let Ok(len) = u32::try_from(set.len()) else {
+                        return RapParameterSets::Rejected;
+                    };
+                    out.extend_from_slice(&len.to_be_bytes());
+                    out.extend_from_slice(set);
+                }
+                RapParameterSets::Sets(out)
+            }
         }
-        let mut out = Vec::new();
-        for set in sets {
-            out.extend_from_slice(&u32::try_from(set.len()).ok()?.to_be_bytes());
-            out.extend_from_slice(set);
-        }
-        Some(out)
     }
 
     #[allow(unsafe_code)]
