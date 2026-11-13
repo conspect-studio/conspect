@@ -103,3 +103,22 @@ async fn a_certbot_style_renewal_is_served_without_a_restart() {
     assert_eq!(leaf(&source), fourth);
     task.abort();
 }
+
+/// #360: a renewal that lands after the served pair was loaded but before the
+/// reload task's first read must still be picked up (the task used to take
+/// its baseline from the renewed files and never replace the old certificate).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_renewal_between_load_and_first_poll_is_not_missed() {
+    let dir = tempfile::tempdir().unwrap();
+    let first = renew(dir.path(), 1, "first.example");
+    let tls = TlsConfig::Static {
+        cert_file: dir.path().join("live/fullchain.pem"),
+        key_file: dir.path().join("live/privkey.pem"),
+    };
+    let source = Arc::new(static_certificate_source(&tls).unwrap());
+    assert_eq!(leaf(&source), first);
+    let second = renew(dir.path(), 2, "second.example");
+    let task = spawn_static_certificate_reload(tls, Arc::clone(&source), Duration::from_millis(20));
+    wait_for(&source, &second).await;
+    task.abort();
+}

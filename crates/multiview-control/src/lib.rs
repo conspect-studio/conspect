@@ -1138,10 +1138,13 @@ pub fn spawn_static_certificate_reload(
                 .ok()
                 .flatten()
         };
-        // The pair served now is the one loaded at start-up; its stamps are
-        // the baseline (a change between that load and this read is simply a
-        // change, picked up on the first poll).
-        let mut last = snapshot(tls.clone()).await.map(|s| s.stamps);
+        // No baseline: the served pair was loaded by the caller before this
+        // task first ran, and a renewal can land in between (#360). Stamps
+        // taken here would then describe the renewed files while the old
+        // certificate is still served, and the renewal would be missed until
+        // the next one. So the first poll always parses; when it equals the
+        // served certificate it only records the stamps.
+        let mut last: Option<[FileStamp; 2]> = None;
         let mut failed: Option<[FileStamp; 2]> = None;
         let mut ticker = tokio::time::interval(every);
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -1163,9 +1166,12 @@ pub fn spawn_static_certificate_reload(
             .await;
             match parsed {
                 Ok((stamps, Ok(key))) => {
-                    source.replace(std::sync::Arc::new(key));
                     last = Some(stamps);
                     failed = None;
+                    if certificate_source::CertificateSource::current(&*source).cert == key.cert {
+                        continue;
+                    }
+                    source.replace(std::sync::Arc::new(key));
                     tracing::info!("[control.tls] static certificate changed on disk; new handshakes use the renewed certificate");
                 }
                 Ok((stamps, Err(error))) => {
