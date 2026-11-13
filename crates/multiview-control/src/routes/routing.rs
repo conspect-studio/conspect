@@ -804,7 +804,25 @@ fn may_read_audio(principal: &Principal, feed: &multiview_config::AudioFeed) -> 
 /// feed is readable only with Read on the layout AND on every source its
 /// cells bind). Built once per readback from the accepted library; a layout
 /// missing here (unknown, or a body that does not parse) is unreadable.
-pub(crate) type LayoutSources = std::collections::HashMap<String, Vec<String>>;
+pub(crate) type LayoutSources = std::collections::HashMap<String, LayoutReadback>;
+
+/// One stored layout as the readback needs it.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct LayoutReadback {
+    /// Every source its cells bind.
+    pub(crate) sources: Vec<String>,
+    /// Its `audio` attribute (what `follow` resolves to on it, §5.1).
+    pub(crate) audio: multiview_config::LayoutAudio,
+}
+
+impl From<Vec<String>> for LayoutReadback {
+    fn from(sources: Vec<String>) -> Self {
+        Self {
+            sources,
+            audio: multiview_config::LayoutAudio::default(),
+        }
+    }
+}
 
 /// [`LayoutSources`] for the accepted layouts library.
 pub(crate) fn layout_sources(state: &AppState) -> ControlResult<LayoutSources> {
@@ -828,7 +846,13 @@ pub(crate) fn layout_sources(state: &AppState) -> ControlResult<LayoutSources> {
                 .iter()
                 .filter_map(|c| c.source.input_id.clone())
                 .collect();
-            Some((id, sources))
+            Some((
+                id,
+                LayoutReadback {
+                    sources,
+                    audio: doc.audio,
+                },
+            ))
         })
         .collect())
 }
@@ -847,7 +871,7 @@ pub(crate) fn may_read_feed(
             readable(id)
                 && layouts
                     .get(id)
-                    .is_some_and(|sources| sources.iter().all(|s| readable(s)))
+                    .is_some_and(|layout| layout.sources.iter().all(|s| readable(s)))
         }
         _ => false,
     }
@@ -897,6 +921,18 @@ fn output_route_state(
         match FollowAudio::of(&video) {
             FollowAudio::Source(id) => serde_json::json!({ "source": id }),
             FollowAudio::PreviewSource => serde_json::json!("preview_source"),
+            // A layout's `audio` attribute; its source is a bound cell's,
+            // which `may_read_feed` already required Read on.
+            FollowAudio::LayoutDefault => match &video {
+                VideoFeed::Layout(id) => match layouts.get(id).map(|l| &l.audio) {
+                    Some(multiview_config::LayoutAudio::None) => serde_json::json!("none"),
+                    Some(multiview_config::LayoutAudio::Source(source)) => {
+                        serde_json::json!({ "source": source })
+                    }
+                    _ => serde_json::json!("program"),
+                },
+                _ => serde_json::json!("program"),
+            },
             _ => serde_json::json!("program"),
         }
     } else {
@@ -1048,7 +1084,7 @@ mod redaction_tests {
     #[test]
     fn a_layout_feed_is_redacted_unless_every_bound_source_is_readable() {
         let mut layouts = LayoutSources::new();
-        layouts.insert("L".into(), vec!["bars".into(), "secret-cam".into()]);
+        layouts.insert("L".into(), vec!["bars".into(), "secret-cam".into()].into());
         let mut feed = OutputCrosspoint::program("o", "main");
         feed.video = Some(VideoFeed::Layout("L".into()));
         let row = output_route_state(&scoped(&["o", "L", "bars"]), &layouts, &feed, "o".into());
@@ -1066,5 +1102,39 @@ mod redaction_tests {
         feed.video = Some(VideoFeed::Layout("Gone".into()));
         let row = output_route_state(&scoped(&["o", "Gone"]), &layouts, &feed, "o".into());
         assert_eq!(row.tally, OutputTally::Redacted);
+    }
+
+    /// PR 2 (#306): `follow` on a layout feed resolves to the layout's
+    /// `audio` attribute in the configured readback.
+    #[test]
+    fn follow_on_a_layout_feed_reports_its_audio_attribute() {
+        let mut feed = OutputCrosspoint::program("o", "main");
+        feed.video = Some(VideoFeed::Layout("L".into()));
+        let who = scoped(&["o", "L", "bars"]);
+        for (audio, expected) in [
+            (
+                multiview_config::LayoutAudio::Program,
+                serde_json::json!("program"),
+            ),
+            (
+                multiview_config::LayoutAudio::None,
+                serde_json::json!("none"),
+            ),
+            (
+                multiview_config::LayoutAudio::Source("bars".into()),
+                serde_json::json!({ "source": "bars" }),
+            ),
+        ] {
+            let mut layouts = LayoutSources::new();
+            layouts.insert(
+                "L".into(),
+                super::LayoutReadback {
+                    sources: vec!["bars".into()],
+                    audio,
+                },
+            );
+            let row = output_route_state(&who, &layouts, &feed, "o".into());
+            assert_eq!(row.effective_audio, expected);
+        }
     }
 }

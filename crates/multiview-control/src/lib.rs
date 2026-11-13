@@ -65,6 +65,7 @@ pub mod devices;
 pub mod error;
 pub mod event_automation;
 pub mod frontdoor_metrics;
+pub mod h3_site;
 pub mod iptv;
 pub mod is07;
 pub mod jwt;

@@ -323,8 +323,9 @@ pub enum FollowAudio {
     Source(String),
     /// The audio of whatever source the M/E's PVW currently selects.
     PreviewSource,
-    /// A routed layout's audio: the program mix (no stored layout carries an
-    /// `audio` attribute yet, ADR-0108 §5.1).
+    /// A routed layout's audio: its stored `audio` attribute
+    /// ([`crate::LayoutAudio`], the program mix by default; ADR-0108 §5.1),
+    /// resolved from the layouts library, which this document does not hold.
     LayoutDefault,
 }
 
@@ -454,9 +455,26 @@ pub struct RoutingTable {
     /// Output crosspoints: output ← program.
     #[serde(default)]
     pub output: Vec<OutputCrosspoint>,
+    /// Routed layouts composed at once (ADR-0108 §7 admission rule 1):
+    /// `None` is the default ([`DEFAULT_MAX_AUX_CANVASES`]); `0` disables
+    /// routed layouts. Bounded by [`MAX_AUX_CANVASES_LIMIT`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_aux_canvases: Option<usize>,
 }
 
+/// Default `routing.max_aux_canvases` (ADR-0108 §7).
+pub const DEFAULT_MAX_AUX_CANVASES: usize = 2;
+/// The largest accepted `routing.max_aux_canvases`: every canvas is a CPU
+/// compose on the one `routing-aux` thread, so the bound stays small.
+pub const MAX_AUX_CANVASES_LIMIT: usize = 8;
+
 impl RoutingTable {
+    /// The effective `max_aux_canvases` (the default when unset).
+    #[must_use]
+    pub fn max_aux_canvases(&self) -> usize {
+        self.max_aux_canvases.unwrap_or(DEFAULT_MAX_AUX_CANVASES)
+    }
+
     /// Validate this table against the document's declared destinations and
     /// inputs.
     ///
@@ -473,12 +491,21 @@ impl RoutingTable {
     /// * every subtitle crosspoint's `layer` resolves to a declared layer, and
     ///   the `source.kind` is [`StreamKind::Subtitle`];
     /// * every output crosspoint's `output` resolves to a declared output;
-    /// * no cell / track / layer / output is bound by two crosspoints.
+    /// * no cell / track / layer / output is bound by two crosspoints, and
+    /// * `max_aux_canvases` is at most [`MAX_AUX_CANVASES_LIMIT`].
     ///
     /// # Errors
     ///
     /// Returns [`ConfigError::Validation`] naming the first violated invariant.
     pub fn validate(&self, refs: &RoutingRefs<'_>) -> Result<(), ConfigError> {
+        if self
+            .max_aux_canvases
+            .is_some_and(|n| n > MAX_AUX_CANVASES_LIMIT)
+        {
+            return Err(ConfigError::Validation(format!(
+                "routing.max_aux_canvases must be at most {MAX_AUX_CANVASES_LIMIT}"
+            )));
+        }
         self.validate_video(refs)?;
         self.validate_audio(refs)?;
         self.validate_subtitle(refs)?;

@@ -53,43 +53,18 @@ struct RunningPersist {
     _tls: Option<TlsWiring>,
 }
 
-/// The run's ACME wiring: the service plus a shutdown signal for the task
-/// that holds the QUIC lane until the certificate is serving.
+/// The run's ACME wiring: the ACME service (its thread lives as long as the
+/// run). The h3 endpoint's wait for `serving` runs on the front door and ends
+/// with it.
 struct TlsWiring {
-    #[cfg(all(feature = "acme", unix, feature = "moq-output"))]
-    context: Arc<multiview_control::tls_setup::TlsContext>,
     #[cfg(all(feature = "acme", unix))]
     boot: multiview_cli::tls_boot::TlsBoot,
-    #[cfg(all(feature = "acme", unix))]
-    shutdown: tokio_util_shutdown::Shutdown,
-}
-
-/// A cloneable one-shot shutdown flag (no extra dependency).
-#[cfg(all(feature = "acme", unix))]
-mod tokio_util_shutdown {
-    /// Fires once; every clone observes it.
-    #[derive(Clone)]
-    pub(crate) struct Shutdown(std::sync::Arc<tokio::sync::watch::Sender<bool>>);
-    impl Shutdown {
-        pub(crate) fn new() -> Self {
-            Self(std::sync::Arc::new(tokio::sync::watch::channel(false).0))
-        }
-        pub(crate) fn fire(&self) {
-            self.0.send_replace(true);
-        }
-        #[cfg(feature = "moq-output")]
-        pub(crate) async fn wait(self) {
-            let mut rx = self.0.subscribe();
-            let _ = rx.wait_for(|v| *v).await;
-        }
-    }
 }
 
 impl Drop for TlsWiring {
     fn drop(&mut self) {
         #[cfg(all(feature = "acme", unix))]
         {
-            self.shutdown.fire();
             multiview_cli::tls_boot::install_tls_context(None);
             // `boot` (the ACME service) drops after this: bounded join (2 s).
             let _ = self.boot.service_finished();
@@ -113,16 +88,8 @@ fn start_tls(
         else {
             return Ok(None);
         };
-        let context = Arc::clone(&boot.context);
-        multiview_cli::tls_boot::install_tls_context(Some(Arc::clone(&context)));
-        #[cfg(not(feature = "moq-output"))]
-        drop(context);
-        Ok(Some(TlsWiring {
-            #[cfg(feature = "moq-output")]
-            context,
-            boot,
-            shutdown: tokio_util_shutdown::Shutdown::new(),
-        }))
+        multiview_cli::tls_boot::install_tls_context(Some(Arc::clone(&boot.context)));
+        Ok(Some(TlsWiring { boot }))
     }
     #[cfg(not(all(feature = "acme", unix)))]
     {
@@ -643,59 +610,68 @@ async fn start_moq_listener(
     front_door: Option<&mut multiview_cli::frontdoor::FrontDoorRun>,
     tls: Option<&TlsWiring>,
 ) -> anyhow::Result<Option<Arc<multiview_control::moq::MoqRegistry>>> {
-    #[cfg(all(feature = "acme", unix))]
-    if let (Some(door), Some(tls)) = (front_door.as_ref(), tls) {
-        // ADR-0107 section 5a: with `[network.tls]` the front-door QUIC lane
-        // serves the ACME certificate and is NOT started while in setup. The
-        // lane is taken now (so nothing else binds it); MoQ starts from a
-        // control-plane task once the source is serving. Until then every MoQ
-        // lease answers the existing honest 503 (provider unavailable).
-        let _ = door;
-        let Some((endpoint, protocol)) =
-            multiview_control::moq_startup::MoqListenerConfig::endpoint_from_env()
-                .map_err(|_| anyhow::anyhow!("invalid explicit MoQ listener configuration"))?
-        else {
-            return Ok(None);
+    #[cfg(not(all(feature = "acme", unix)))]
+    let _ = tls;
+    if let Some(door) = front_door {
+        // Slice 2 (#288): MoQ rides the front door's HTTP/3 endpoint as
+        // WebTransport under /moq/. The endpoint starts once the control plane
+        // is built (`attach_front_door_site`), with `[network.tls]` only once
+        // the certificate is serving; until the endpoint is up the provider
+        // is unavailable, so every MoQ lease answers the existing honest 503.
+        let acme = {
+            #[cfg(all(feature = "acme", unix))]
+            {
+                tls.is_some()
+            }
+            #[cfg(not(all(feature = "acme", unix)))]
+            {
+                false
+            }
         };
-        let door = front_door.ok_or_else(|| anyhow::anyhow!("front door unavailable"))?;
-        let socket = door
-            .take_moq_socket()
-            .ok_or_else(|| anyhow::anyhow!("front-door QUIC lane unavailable"))?;
+        let (endpoint, protocol, fallback_tls) = if acme {
+            let Some((endpoint, protocol)) =
+                multiview_control::moq_startup::MoqListenerConfig::endpoint_from_env()
+                    .map_err(|_| anyhow::anyhow!("invalid explicit MoQ listener configuration"))?
+            else {
+                return Ok(None);
+            };
+            (endpoint, protocol, None)
+        } else {
+            let Some(config) = multiview_control::moq_startup::MoqListenerConfig::from_env_shared(
+                door.local_addr(),
+            )
+            .map_err(|_| anyhow::anyhow!("invalid explicit MoQ listener configuration"))?
+            else {
+                return Ok(None);
+            };
+            // Used only when the door has no site certificate of its own.
+            let fallback = match multiview_moq::provider::server_tls_from_files(
+                &config.certificate,
+                &config.private_key,
+            ) {
+                Ok(tls) => Some(Arc::new(tls)),
+                Err(error) => {
+                    tracing::warn!(%error, "MULTIVIEW_MOQ_CERTIFICATE/_PRIVATE_KEY unusable for the HTTP/3 endpoint");
+                    None
+                }
+            };
+            (config.endpoint, config.protocol, fallback)
+        };
+        let (provider, wt) =
+            multiview_control::moq_startup::start_h3(&endpoint, &protocol, factory)
+                .map_err(|_| anyhow::anyhow!("MoQ startup on the front door failed"))?;
         let deferred = Arc::new(multiview_control::moq_startup::DeferredProvider::default());
         let registry = Arc::new(multiview_control::moq::MoqRegistry::new(
             deferred.clone(),
             std::time::Duration::from_secs(30),
             16,
         ));
-        tokio::spawn(multiview_cli::frontdoor::start_moq_when_serving(
-            tls.context.clone(),
-            tls.shutdown.clone().wait(),
-            endpoint,
-            protocol,
-            factory,
-            socket,
-            deferred,
-        ));
+        door.set_h3_moq(multiview_cli::frontdoor::H3Moq {
+            wt,
+            on_up: Box::new(move || deferred.set(provider)),
+            fallback_tls,
+        });
         return Ok(Some(registry));
-    }
-    #[cfg(not(all(feature = "acme", unix)))]
-    let _ = tls;
-    if let Some(door) = front_door {
-        // ADR-0107 slice 1: MoQ rides the front-door socket's QUIC lane.
-        let Some(config) =
-            multiview_control::moq_startup::MoqListenerConfig::from_env_shared(door.local_addr())
-                .map_err(|_| anyhow::anyhow!("invalid explicit MoQ listener configuration"))?
-        else {
-            return Ok(None);
-        };
-        let socket = door
-            .take_moq_socket()
-            .ok_or_else(|| anyhow::anyhow!("front-door QUIC lane unavailable"))?;
-        return Ok(Some(
-            multiview_control::moq_startup::start_shared(config, factory, socket)
-                .await
-                .map_err(|_| anyhow::anyhow!("MoQ listener startup failed"))?,
-        ));
     }
     match multiview_control::moq_startup::MoqListenerConfig::from_env()
         .map_err(|_| anyhow::anyhow!("invalid explicit MoQ listener configuration"))?

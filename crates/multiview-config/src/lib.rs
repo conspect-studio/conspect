@@ -102,7 +102,7 @@ pub use iptv::{
     IptvConfig, IptvEntry, IptvEntryKind, DEFAULT_GUIDE_REFRESH_MINUTES, MAX_GUIDE_REFRESH_MINUTES,
     MAX_IPTV_ENTRIES, MIN_GUIDE_REFRESH_MINUTES,
 };
-pub use layout_doc::{LayoutCanvas, LayoutDocument};
+pub use layout_doc::{LayoutAudio, LayoutCanvas, LayoutDocument};
 pub use media::{
     frames_for_ms, EofPolicy, MediaAsset, MediaAssetKind, MediaLibrary, MediaPlayer,
     MediaPlayerAudio,
@@ -1929,6 +1929,16 @@ impl MultiviewConfig {
                 Ok(())
             }
         }
+    }
+
+    /// `routing.max_aux_canvases` (ADR-0108 §7): routed layouts composed at
+    /// once; the default when the document sets none.
+    #[must_use]
+    pub fn max_aux_canvases(&self) -> usize {
+        self.routing.as_ref().map_or(
+            routing::DEFAULT_MAX_AUX_CANVASES,
+            RoutingTable::max_aux_canvases,
+        )
     }
 
     /// Every configured output's effective feed, in output order (ADR-0108):

@@ -18,6 +18,9 @@ publish = false
 multiview-webengine = { path = "../multiview-webengine" }
 rustix = { version = "1", features = ["fs", "process"] }
 multiview-moq = { path = "../multiview-moq", optional = true }
+# The HTTP/3 + WebTransport endpoint the front door serves the site and MoQ
+# on (slice 2, #288): `h3_site::H3Site` adapts this crate's router to it.
+multiview-h3 = { path = "../multiview-h3" }
 multiview-cloudflare = { path = "../multiview-cloudflare" }
 multiview-credentials = { path = "../multiview-credentials" }
 multiview-core = { workspace = true }
@@ -269,7 +272,7 @@ instant-acme = { version = "0.8.5", default-features = false, features = [
 # `http-body-util` to collect the ACME request body. MIT/Apache-2.0, already in
 # the lock via axum/hyper; only built with `acme`.
 http = { version = "1", optional = true }
-http-body-util = { version = "0.1.3", optional = true }
+http-body-util = "0.1.3"
 # Wipe Cloudflare credentials and EAB HMAC bytes on drop. MIT/Apache-2.0, pure
 # Rust, already in the lock (rustls / aws-lc-rs); only built with `acme`.
 zeroize = { version = "1", optional = true }
@@ -277,6 +280,11 @@ zeroize = { version = "1", optional = true }
 
 
 [dev-dependencies]
+# `tests/h3_site.rs`: the router and MoQ over a real HTTP/3 endpoint, reached
+# with multiview-h3's native test client; the QUIC stack is already in the
+# graph via multiview-h3.
+multiview-h3 = { path = "../multiview-h3", features = ["test-client"] }
+noq = { package = "moq-noq", version = "=1.3.5", default-features = false, features = ["runtime-tokio", "rustls-ring"] }
 # Capture every tracing field in the TLS setup tests to prove a credential value
 # is never logged (`tests/tls_setup.rs`). Workspace crate, already in the lock.
 tracing-subscriber = { workspace = true }
@@ -454,7 +462,6 @@ moq-transport = ["dep:multiview-moq", "dep:url"]
     "dep:hickory-resolver",
     "dep:x509-parser",
     "dep:http",
-    "dep:http-body-util",
     "dep:zeroize",
 ]
 
@@ -498,6 +505,10 @@ required-features = ["acme"]
 # Full ACME flows against Pebble + challtestsrv (run by the acme-pebble CI job).
 name = "acme_pebble"
 required-features = ["acme"]
+
+[[test]]
+name = "h3_site"
+required-features = ["moq-transport"]
 
 [[example]]
 # The real authority fixture imports the optional native MoQ provider.
