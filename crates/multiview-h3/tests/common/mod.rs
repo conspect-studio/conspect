@@ -203,7 +203,19 @@ pub async fn fetch(
 ) -> (http::Response<()>, Vec<u8>) {
     let fut = async {
         let mut stream = send.send_request(req).await.unwrap();
-        stream.finish().await.unwrap();
+        // RFC 9114 section 4.1: a server that has its complete response may
+        // stop reading the request with H3_NO_ERROR before our FIN lands; a
+        // client MUST NOT discard the response for that. Anything else fails.
+        if let Err(err) = stream.finish().await {
+            // h3 reports a peer STOP_SENDING as `RemoteTerminate`, which
+            // `is_h3_no_error` does not cover.
+            let no_error = err.is_h3_no_error()
+                || matches!(
+                    err,
+                    h3::error::StreamError::RemoteTerminate { code } if code == h3::error::Code::H3_NO_ERROR
+                );
+            assert!(no_error, "finish failed: {err}");
+        }
         let resp = stream.recv_response().await.unwrap();
         let body = read_body(&mut stream).await;
         (resp, body)

@@ -771,6 +771,12 @@ impl Connection {
                         encoder,
                         seen,
                     });
+                    // `poll_qpack` already ran in this pass, and the bytes
+                    // after the head may all be buffered already, so the
+                    // stream's own waker will not fire again: re-poll now
+                    // or the drain (and its cap) would wait for unrelated
+                    // activity.
+                    cx.waker().wake_by_ref();
                 }
                 Err(UniKind::Other | UniKind::WebTransport) => {
                     // RFC 9114 section 6.2: abort reading unknown types with

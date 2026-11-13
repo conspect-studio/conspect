@@ -47,6 +47,10 @@ fn frame_header(ty: u64, len: u64) -> Vec<u8> {
 async fn oversized_settings_closes_the_connection_others_unaffected() {
     let server = start(TestSite::new(), None, limits(), None).await;
     let mut good = h3_client(&server).await;
+    // Served once up front: the server has read this connection's SETTINGS,
+    // so the short test deadline cannot expire it under a loaded host.
+    let (resp, _) = fetch(&mut good.send, request(http::Method::GET, "/")).await;
+    assert_eq!(resp.status(), 200);
 
     let conn = quic_connect(&server, b"h3").await.unwrap();
     let mut control = conn.open_uni().await.unwrap();
@@ -67,6 +71,10 @@ async fn oversized_settings_closes_the_connection_others_unaffected() {
 async fn trickled_control_frame_is_cut_at_the_deadline() {
     let server = start(TestSite::new(), None, limits(), None).await;
     let mut good = h3_client(&server).await;
+    // Served once up front: the server has read this connection's SETTINGS,
+    // so the short test deadline cannot expire it under a loaded host.
+    let (resp, _) = fetch(&mut good.send, request(http::Method::GET, "/")).await;
+    assert_eq!(resp.status(), 200);
 
     let conn = quic_connect(&server, b"h3").await.unwrap();
     let mut control = conn.open_uni().await.unwrap();

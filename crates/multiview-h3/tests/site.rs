@@ -101,12 +101,13 @@ async fn requests_beyond_the_cap_are_rejected_not_queued() {
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
     // The third is reset promptly with H3_REQUEST_REJECTED.
+    // The reset can land while the request HEADERS are still being sent
+    // (then `send_request` reports it) or afterwards (`recv_response`).
     let third = async {
         let mut stream = client
             .send
             .send_request(request(http::Method::GET, "/third"))
-            .await
-            .unwrap();
+            .await?;
         let _ = stream.finish().await;
         stream.recv_response().await
     };
