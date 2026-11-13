@@ -1232,6 +1232,16 @@ pub struct Listen {
 	#[serde(skip)]
 	pub peers: Option<Peers>,
 
+	/// Serve certificates from this resolver instead of `cert`/`key`/`generate`/`identity`
+	/// (multiview: the front door's hot-swappable ACME certificate source).
+	///
+	/// When set it is the only certificate source of a QUIC server: nothing is loaded
+	/// from disk and no reload watcher runs. Not settable from the CLI or a config
+	/// file, since it only exists in memory.
+	#[usage(skip)]
+	#[serde(skip)]
+	pub resolver: Option<std::sync::Arc<dyn rustls::server::ResolvesServerCert>>,
+
 	/// PEM file(s) of root CAs for validating optional client certificates (mTLS).
 	///
 	/// When set, clients *may* present a certificate during the TLS handshake.

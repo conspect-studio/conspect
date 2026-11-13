@@ -127,4 +127,6 @@ overlays. That rule lives in one function, `multiview_config::switcher_canvas_ad
   `apply_layout_held`);
 - `multiview validate <config>`, which now also checks what `multiview run` will
   start from (`.multiview/desired.json` when it exists) and exits non-zero with
-  start-up's reason. Run it as the deploy preflight.
+  start-up's reason. Run it as the deploy preflight. It also warns while an
+  earlier start-up fallback ([ADR-W032](../decisions/ADR-W032.md), amended by
+  #324) is pending acknowledgement.

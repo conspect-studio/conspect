@@ -4011,6 +4011,7 @@ dependencies = [
  "tower",
  "tower-http 0.7.0",
  "tracing",
+ "tracing-subscriber",
  "url",
  "utoipa",
  "utoipa-axum",
@@ -4114,6 +4115,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "hashlink 0.11.1",
+ "libc",
  "moq-noq",
  "moq-tokio",
  "multiview-compositor",

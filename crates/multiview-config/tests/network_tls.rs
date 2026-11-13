@@ -299,3 +299,17 @@ fn allow_private_directory_round_trips_and_defaults_off() {
         .unwrap()
         .contains("allow_private_directory"));
 }
+
+#[test]
+fn secret_names_lists_every_referenced_name_and_no_value() {
+    let network: NetworkConfig = toml::from_str(
+        &sample()
+            .split_once("[network]\n")
+            .unwrap()
+            .1
+            .replace("[network.tls", "[tls"),
+    )
+    .unwrap();
+    let tls = network.tls.as_ref().unwrap();
+    assert_eq!(tls.secret_names(), vec!["EAB_KID", "EAB_HMAC", "CF_TOKEN"]);
+}

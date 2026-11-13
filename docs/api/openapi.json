@@ -4110,6 +4110,62 @@
         }
       }
     },
+    "/api/v1/health/{code}/ack": {
+      "post": {
+        "tags": [
+          "health"
+        ],
+        "summary": "`POST /api/v1/health/{code}/ack` — acknowledge the persisted\n`accepted-state-rejected` warning (role: write, unscoped; #324).",
+        "description": "Removes the start-up fallback marker (on the blocking pool, under the\nconfig-mutation lock — file I/O never runs on a runtime worker, and never on\nthe engine), then publishes `health.warning.cleared` through the\ndrop-oldest lane (inv #10) and waits briefly for the warning ingest to apply\nit. Acknowledging silences the CURRENT alarm only: a later start that still\ncannot use the saved configuration raises it again. The saved configuration\nis not touched. An unreadable or unparsable marker still counts as pending\nand is removed.",
+        "operationId": "ack_health_warning",
+        "parameters": [
+          {
+            "name": "code",
+            "in": "path",
+            "description": "Warning code to acknowledge; only `accepted-state-rejected` is acknowledgeable.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Acknowledged: the persisted marker is removed and the warning cleared."
+          },
+          "401": {
+            "description": "Missing or invalid credentials.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Not authorized to acknowledge (read-only role, or a scoped key: this is a whole-system action).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Not an acknowledgeable code, no config-file run, or nothing pending.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/v1/inputs/{id}/events": {
       "get": {
         "tags": [
@@ -12631,6 +12687,247 @@
         }
       }
     },
+    "/api/v1/tls/credential": {
+      "post": {
+        "tags": [
+          "tls"
+        ],
+        "operationId": "tls_credential",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CredentialRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "204": {
+            "description": "Stored as `<state_dir>/secrets/<NAME>`, mode 0600. Loopback admin listener only; body at most 8 KiB."
+          },
+          "400": {
+            "description": "Malformed body.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Not loopback, or not admin.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "NAME is not referenced by the configuration.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ]
+      }
+    },
+    "/api/v1/tls/issue": {
+      "post": {
+        "tags": [
+          "tls"
+        ],
+        "operationId": "tls_issue",
+        "responses": {
+          "202": {
+            "description": "Issuance attempt queued.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/IssueAccepted"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Front door: neither an admin bearer nor a setup session.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Admin listener: not loopback or not admin.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "The ACME service is busy or stopped.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ]
+      }
+    },
+    "/api/v1/tls/setup-code": {
+      "post": {
+        "tags": [
+          "tls"
+        ],
+        "operationId": "tls_setup_code",
+        "responses": {
+          "200": {
+            "description": "A new one-time setup code, returned once (replaces the previous code). Loopback admin listener only.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SetupCodeBody"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Not loopback, or not admin.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ]
+      }
+    },
+    "/api/v1/tls/setup/session": {
+      "post": {
+        "tags": [
+          "tls"
+        ],
+        "operationId": "tls_setup_session",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SetupSessionRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "204": {
+            "description": "Setup session created: an `HttpOnly; Secure; SameSite=Strict` cookie valid one hour, honoured only in setup."
+          },
+          "401": {
+            "description": "Wrong, expired or used setup code.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Not in setup.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "Five failed attempts from this source (IPv6 /64) in 15 minutes: locked for 15 minutes.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/tls/status": {
+      "get": {
+        "tags": [
+          "tls"
+        ],
+        "operationId": "tls_status",
+        "responses": {
+          "200": {
+            "description": "Non-secret certificate status. Unauthenticated while the front door is in setup; Read role once serving.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TlsStatusBody"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Serving and no valid credential.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No `[network.tls]` configured.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/v1/weather/locations": {
       "get": {
         "tags": [
@@ -15579,6 +15876,26 @@
         },
         "additionalProperties": false
       },
+      "CredentialRequest": {
+        "type": "object",
+        "description": "`POST /api/v1/tls/credential` body (loopback admin listener only).",
+        "required": [
+          "name",
+          "value"
+        ],
+        "properties": {
+          "name": {
+            "type": "string",
+            "description": "One of the environment-variable NAMES the configuration references\n(`[network.tls]` EAB names, `[network.tls.dns]` credential names)."
+          },
+          "value": {
+            "type": "string",
+            "format": "password",
+            "description": "The secret value. Write-only: never logged, never echoed.",
+            "writeOnly": true
+          }
+        }
+      },
       "CueInput": {
         "type": "object",
         "description": "`POST cue` body.",
@@ -16911,6 +17228,19 @@
           "x-nmos-api": {
             "$ref": "#/components/schemas/NmosApiClaim",
             "description": "The NMOS per-API access grant — `x-nmos-api`."
+          }
+        }
+      },
+      "IssueAccepted": {
+        "type": "object",
+        "description": "`POST /api/v1/tls/issue` response.",
+        "required": [
+          "kind"
+        ],
+        "properties": {
+          "kind": {
+            "type": "string",
+            "description": "Always `issue`."
           }
         }
       },
@@ -21641,6 +21971,41 @@
           }
         }
       },
+      "SetupCodeBody": {
+        "type": "object",
+        "description": "`POST /api/v1/tls/setup-code` response: the new code, returned once.",
+        "required": [
+          "code",
+          "expires_in"
+        ],
+        "properties": {
+          "code": {
+            "type": "string",
+            "description": "The one-time setup code (8 words, valid one hour, single use)."
+          },
+          "expires_in": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Seconds until it expires.",
+            "minimum": 0
+          }
+        }
+      },
+      "SetupSessionRequest": {
+        "type": "object",
+        "description": "`POST /api/v1/tls/setup/session` body.",
+        "required": [
+          "code"
+        ],
+        "properties": {
+          "code": {
+            "type": "string",
+            "format": "password",
+            "description": "The one-time setup code (8 words) printed on the host.",
+            "writeOnly": true
+          }
+        }
+      },
       "SnapshotAccepted": {
         "type": "object",
         "description": "The `202 Accepted` body of `POST /api/v1/diagnostics/snapshot`: the id to read\nthe assembled bundle back with.",
@@ -24284,6 +24649,103 @@
         ],
         "description": "`OpenAPI` mirror of `multiview_config::timer::TimerTarget` (tagged by\n`target`; flattened into the `Timer` source variant alongside `kind`)."
       },
+      "TlsStatusBody": {
+        "type": "object",
+        "description": "Non-secret certificate status (`GET /api/v1/tls/status`).",
+        "required": [
+          "state",
+          "staging",
+          "challenge",
+          "names",
+          "alarm",
+          "reasons",
+          "hints"
+        ],
+        "properties": {
+          "alarm": {
+            "type": "string",
+            "description": "`none`, `warning` (renewal failing, under 50 % of the lifetime left),\n`critical` (under 25 %) or `expired`."
+          },
+          "bootstrap_fingerprint": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "SHA-256 fingerprint of the bootstrap certificate (setup only)."
+          },
+          "ca": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "CA profile (`letsencrypt`, `google`, `custom`)."
+          },
+          "challenge": {
+            "type": "string",
+            "description": "`dns-01` or `tls-alpn-01`."
+          },
+          "expires_at": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "Expiry of the served ACME certificate, Unix seconds."
+          },
+          "hints": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Operator hints (e.g. the TLS-ALPN-01 reachability note)."
+          },
+          "last_error": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Sanitized token of the last failure (e.g. `ca-unavailable`)."
+          },
+          "names": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Names requested on the certificate."
+          },
+          "next_attempt_at": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "When the next attempt runs after a failure, Unix seconds."
+          },
+          "reasons": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Why the engine is still in setup, e.g. `credential-missing: CLOUDFLARE_API_TOKEN`\n(names only, never values)."
+          },
+          "renewal_due_at": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "When the next renewal is due, Unix seconds."
+          },
+          "staging": {
+            "type": "boolean",
+            "description": "Whether the CA's staging directory is configured."
+          },
+          "state": {
+            "type": "string",
+            "description": "`setup`, `serving` or `expired` (serving an expired certificate)."
+          }
+        }
+      },
       "TransitionDoc": {
         "type": "object",
         "description": "A transition preset.",
@@ -24593,7 +25055,8 @@
           "gpu-present-no-vulkan-adapter",
           "container-no-host-networking",
           "catalogue-link-attention",
-          "accepted-state-rejected"
+          "accepted-state-rejected",
+          "tls-certificate"
         ]
       },
       "WarningSeverityDoc": {
@@ -24951,7 +25414,7 @@
     },
     {
       "name": "health",
-      "description": "Health warnings: active capability mismatches + remediation (read-only)"
+      "description": "Health warnings: active capability mismatches + remediation; acknowledge the persisted start-up fallback warning"
     },
     {
       "name": "licence",
@@ -25024,6 +25487,10 @@
     {
       "name": "realtime",
       "description": "WebSocket + SSE event stream"
+    },
+    {
+      "name": "tls",
+      "description": "Front-door ACME certificates (ADR-0107 section 5a): status, the setup-code login, issuance, and the loopback-only setup-code and credential admin routes"
     }
   ]
 }

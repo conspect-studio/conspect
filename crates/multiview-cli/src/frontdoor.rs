@@ -23,6 +23,22 @@
 //! means no TCP listener at all. The site on the door is the SAME control-plane
 //! router and serve options as the plain `[control]` listener, over the
 //! `[control.tls]` static certificate ([`FrontDoorRun::install_site`]).
+//!
+//! **Certificates (slice 5, ADR-0107 section 5a).** With `[network.tls]` the
+//! run starts the ACME wiring ([`crate::tls_boot`]) before the control plane
+//! binds, and:
+//!
+//! * the QUIC lane is held: MoQ starts on it only once the certificate source
+//!   is `serving` ([`start_moq_when_serving`]), and then serves the ACME
+//!   certificate through `SourceResolver` (renewals reach new handshakes with
+//!   no restart), never the `MULTIVIEW_MOQ_CERTIFICATE` files;
+//! * the TCP door (slice 4) serves the ACME certificate source as its site
+//!   certificate (`[network.tls]` wins over `[control.tls]` for the door),
+//!   answers TLS-ALPN-01 (ALPN exactly `acme-tls/1`) from the
+//!   [`front_door_tls`] challenge resolver, and mounts
+//!   `multiview_control::tls_setup::front_door_router` (the control router
+//!   behind the setup gate). The `[control] listen` listener stays the
+//!   loopback admin listener and is not gated.
 
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
@@ -262,36 +278,54 @@ impl FrontDoorRun {
 
     /// Attach the site to the TCP door: `server` (the control-plane router on
     /// the same serve options as the plain listener, observing its shutdown)
-    /// over `tls_site`. Without a TLS configuration the door keeps serving
-    /// ICE-TCP only (a warning says so).
+    /// over `tls_site`, and `acme` (the TLS-ALPN-01 responder, ALPN exactly
+    /// `acme-tls/1`) when `[network.tls]` is configured (slice 5). Without a
+    /// site TLS configuration the door keeps serving ICE-TCP only (a warning
+    /// says so).
     pub fn install_site(
         &self,
         server: multiview_control::ConnectionServer,
         tls_site: Option<multiview_frontdoor::SiteTlsConfig>,
+        acme: Option<multiview_frontdoor::SiteTlsConfig>,
     ) {
         let Some(tcp) = self.door.tcp_local_addr() else {
             return;
         };
         let Some(site) = tls_site else {
-            tracing::warn!(%tcp, "front-door TCP door: no site certificate ([control.tls] static, a `tls` build on unix), so TLS on the door is unavailable; ICE-TCP still runs");
+            tracing::warn!(%tcp, "front-door TCP door: no site certificate ([network.tls] in an `acme` build, or [control.tls] static in a `tls` build, on unix), so TLS on the door is unavailable; ICE-TCP still runs");
             return;
         };
-        // Read-modify-write: only the site half changes here, so a previously
-        // installed ACME (TLS-ALPN-01) responder is never clobbered back to
-        // `None` (#291).
+        // Read-modify-write per half (#291): the site half here; the ACME
+        // (TLS-ALPN-01) half through `set_acme_config`, so neither clobbers
+        // the other.
+        let challenge = acme.is_some();
         let service: Arc<dyn multiview_frontdoor::SiteService> = Arc::new(ControlSite(server));
+        if let Some(acme) = acme {
+            if self.door.set_acme_config(Some(acme)).is_err() {
+                tracing::error!(%tcp, "front-door TCP door: installing the ACME TLS-ALPN-01 responder failed");
+            }
+        }
         if self.door.set_site_config(Some(site)).is_ok()
             && self.door.set_site(Some(service)).is_ok()
         {
-            tracing::info!(%tcp, tls_site = true, "front-door TCP door serves the site (HTTP/1.1 over the [control.tls] certificate)");
+            if challenge {
+                tracing::info!(%tcp, tls_site = true, tls_alpn_01 = true, "front-door TCP door serves the site (HTTP/1.1 over the ACME certificate, behind the setup gate) and answers TLS-ALPN-01");
+            } else {
+                tracing::info!(%tcp, tls_site = true, "front-door TCP door serves the site (HTTP/1.1 over the [control.tls] certificate)");
+            }
         }
+    }
+
+    /// The bound TCP door address, if the door runs.
+    #[must_use]
+    pub fn tcp_local_addr(&self) -> Option<std::net::SocketAddr> {
+        self.door.tcp_local_addr()
     }
 
     /// Install (or replace) the ACME TLS-ALPN-01 challenge responder on the
     /// TCP door: only the ACME half of the routing changes, so a previously
-    /// installed site certificate keeps serving. `multiview run` calls this
-    /// once slice 5 PR B boots the `AcmeService` (#291); not called from this
-    /// crate yet.
+    /// installed site certificate keeps serving. With `[network.tls]` the site
+    /// install path ([`Self::install_site`]) passes the same responder.
     #[cfg(all(feature = "tls", unix))]
     pub fn install_acme_resolver(
         &self,
@@ -379,6 +413,49 @@ impl FrontDoorRun {
     #[must_use]
     pub fn stats(&self) -> Arc<multiview_frontdoor::Stats> {
         self.door.stats()
+    }
+}
+
+/// The run's TLS-ALPN-01 challenge resolver (ACME certificate, with
+/// challenges answered for ALPN `acme-tls/1`), when the run has
+/// `[network.tls]`. The TCP door's `acme-tls/1` route serves it
+/// (`multiview_control::acme_challenge_server_config`).
+#[cfg(all(feature = "acme", unix))]
+#[must_use]
+pub fn front_door_tls() -> Option<Arc<multiview_control::certificate_source::ChallengeResolver>> {
+    crate::tls_boot::installed_tls_context().map(|tls| Arc::clone(&tls.resolver))
+}
+
+/// Hold the front-door QUIC lane until the ACME source is serving, then start
+/// `MoQ` on it with the ACME certificate and install the real provider into
+/// `deferred`. Bounded by `shutdown`; a control-plane task, never on the
+/// output clock (it only awaits a watch channel).
+#[cfg(all(feature = "acme", unix, feature = "moq-output"))]
+pub async fn start_moq_when_serving(
+    tls: Arc<multiview_control::tls_setup::TlsContext>,
+    shutdown: impl std::future::Future<Output = ()>,
+    endpoint: String,
+    protocol: String,
+    factory: Option<Arc<dyn multiview_control::moq_provider::AuthorizedFeedFactory>>,
+    socket: multiview_moq::provider::SharedSocket,
+    deferred: Arc<multiview_control::moq_startup::DeferredProvider>,
+) {
+    tracing::info!("front door: QUIC/MoQ held until the ACME certificate is serving");
+    if !crate::tls_boot::wait_serving(Arc::clone(&tls.certificates), shutdown).await {
+        return;
+    }
+    let resolver: Arc<dyn multiview_moq::moq_tokio_rustls::server::ResolvesServerCert> = Arc::new(
+        multiview_control::certificate_source::SourceResolver(Arc::clone(&tls.certificates)),
+    );
+    if let Ok(provider) = multiview_control::moq_startup::start_shared_resolver(
+        endpoint, protocol, factory, socket, resolver,
+    )
+    .await
+    {
+        deferred.set(provider);
+        tracing::info!("front door: certificate serving; QUIC/MoQ started");
+    } else {
+        tracing::error!("front door: MoQ listener failed to start on the QUIC lane");
     }
 }
 

@@ -24,8 +24,8 @@ pub mod store;
 pub use dns::{DnsFuture, DnsProvider, TxtHandle};
 pub use egress::{AcmeHttp, EgressPolicy};
 pub use engine::{
-    alarm_for, ari_renewal_at, backoff_delay, fallback_renewal_at, AcmeCommand, AcmeEngine,
-    AcmeHandle, AcmeService, AlarmHook, Issued, SendError,
+    alarm_for, ari_renewal_at, backoff_delay, fallback_renewal_at, stored_meta, AcmeCommand,
+    AcmeEngine, AcmeHandle, AcmeService, AlarmHook, IssueTrigger, Issued, SendError,
 };
 
 /// A credential-safe failure category. Underlying HTTP / ACME / DNS errors

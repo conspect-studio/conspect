@@ -2492,7 +2492,8 @@
           "config-file-apply-incomplete",
           "container-no-host-networking",
           "catalogue-link-attention",
-          "accepted-state-rejected"
+          "accepted-state-rejected",
+          "tls-certificate"
         ],
         "type": "string"
       },
