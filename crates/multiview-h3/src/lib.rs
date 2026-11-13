@@ -63,6 +63,8 @@
 //! front door's own runtime.
 
 pub mod capsule;
+#[cfg(feature = "test-client")]
+pub mod client;
 pub mod config;
 pub mod counters;
 pub mod endpoint;
