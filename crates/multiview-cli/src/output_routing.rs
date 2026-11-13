@@ -153,39 +153,48 @@ impl LayoutChange {
 
 pub use multiview_control::output_routing::next_layout_revision;
 
-/// Layout ids whose latest state the router remembers (pending changes on
-/// the control side, known states on the router side); removals are
-/// forgotten first, then the oldest revision. A forgotten removal only lets a
-/// take queued before it through (the take mailbox drains every tick).
+/// Layout ids whose latest state the router remembers; removals are
+/// forgotten first, then the oldest revision. A take whose body is not newer
+/// than any forgotten state, and whose layout has no remembered state, is
+/// refused (fail closed).
 pub const LAYOUT_STATES: usize = 64;
 
 /// Latest layout changes not yet applied, coalesced per id (the newest
-/// revision wins), so a burst of edits never loses the last one. Written by
-/// the control plane, drained by the router with `try_lock` (never blocks
-/// the consumer; on contention it retries next tick).
+/// revision wins), so a burst of edits never loses one: never evicted, so
+/// bounded by the layouts library (one entry per committed layout id,
+/// control-plane memory). Written by the control plane, drained by the router
+/// with `try_lock` (never blocks the consumer; on contention it retries next
+/// tick).
 type LayoutInbox = Arc<Mutex<HashMap<String, LayoutChange>>>;
 
-/// Insert `change` into a revision-ordered, bounded map (an older revision
-/// for the same id is ignored; the oldest entry is evicted at the bound).
-fn remember(map: &mut HashMap<String, LayoutChange>, change: LayoutChange) {
+/// Insert `change` into a revision-ordered map (an older revision for the
+/// same id is ignored). At `bound` entries the oldest is evicted (removals
+/// first); returns the evicted revision, which the caller records as a
+/// watermark so a take older than a forgotten state fails closed.
+fn remember(
+    map: &mut HashMap<String, LayoutChange>,
+    change: LayoutChange,
+    bound: usize,
+) -> Option<u64> {
     if map
         .get(change.id())
         .is_some_and(|known| known.revision() > change.revision())
     {
-        return;
+        return None;
     }
-    if !map.contains_key(change.id()) && map.len() >= LAYOUT_STATES {
-        // A removal is forgotten before an edit (an edit carries a body
-        // that outputs may be composing), then the oldest revision.
-        if let Some(oldest) = map
+    let mut evicted = None;
+    if !map.contains_key(change.id()) && map.len() >= bound {
+        if let Some((oldest, revision)) = map
             .iter()
             .min_by_key(|(_, c)| (matches!(c, LayoutChange::Edited(_)), c.revision()))
-            .map(|(id, _)| id.clone())
+            .map(|(id, c)| (id.clone(), c.revision()))
         {
             map.remove(&oldest);
+            evicted = Some(revision);
         }
     }
     map.insert(change.id().to_owned(), change);
+    evicted
 }
 
 /// The take was not enqueued: the mailbox is full or the run ended (HTTP 503
@@ -453,7 +462,7 @@ impl OutputRoutingHandle {
             .layout_changes
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        remember(&mut inbox, change);
+        let _ = remember(&mut inbox, change, usize::MAX);
         Ok(())
     }
 
@@ -849,6 +858,8 @@ pub struct OutputRouter {
     /// The latest known state of each layout seen (bounded): a take carrying
     /// an older body than a later edit or removal is refused.
     layout_states: HashMap<String, LayoutChange>,
+    /// The newest revision `layout_states` forgot (0: none).
+    layout_states_forgotten: u64,
     outcomes: SyncSender<TakeOutcome>,
     snapshot: Arc<SwapCell<Arc<RoutingSnapshot>>>,
     outputs: Vec<OutputState>,
@@ -1001,6 +1012,7 @@ impl OutputRouter {
             takes,
             layout_changes,
             layout_states: HashMap::new(),
+            layout_states_forgotten: 0,
             outcomes,
             snapshot,
             outputs,
@@ -1498,7 +1510,7 @@ impl OutputRouter {
             {
                 continue;
             }
-            remember(&mut self.layout_states, change.clone());
+            self.remember_state(change.clone());
             match change {
                 LayoutChange::Edited(layout) => {
                     if self.refresh_layout_body(&layout, tick) {
@@ -1514,9 +1526,19 @@ impl OutputRouter {
     /// or removal of that layout (it was authorized for content that is no
     /// longer the layout's): such a take is refused.
     fn layout_take_is_stale(&self, layout: &LayoutRef) -> bool {
-        self.layout_states
-            .get(&layout.id)
-            .is_some_and(|known| known.revision() > layout.body.revision)
+        match self.layout_states.get(&layout.id) {
+            Some(known) => known.revision() > layout.body.revision,
+            // Unknown: stale only if a forgotten state could be newer.
+            None => layout.body.revision <= self.layout_states_forgotten,
+        }
+    }
+
+    /// Record a layout's latest state (bounded; an eviction raises the
+    /// fail-closed watermark).
+    fn remember_state(&mut self, change: LayoutChange) {
+        if let Some(evicted) = remember(&mut self.layout_states, change, LAYOUT_STATES) {
+            self.layout_states_forgotten = self.layout_states_forgotten.max(evicted);
+        }
     }
 
     /// Outputs whose audio follows a layout re-resolve it after its body
@@ -1610,10 +1632,7 @@ impl OutputRouter {
                     );
                     continue;
                 }
-                remember(
-                    &mut self.layout_states,
-                    LayoutChange::Edited(layout.clone()),
-                );
+                self.remember_state(LayoutChange::Edited(layout.clone()));
                 // A re-take of a composing layout carries its latest body
                 // (an edited layout): the canvas follows it from this tick.
                 let _ = self.refresh_layout_body(layout, tick);
@@ -1988,6 +2007,30 @@ impl OutputRouter {
         }
     }
 
+    /// The video move of output `index` landed on `landed`. A layout edited
+    /// while the move was in flight: the audio scheduled with the move
+    /// followed the old body's attribute, so follow the body that landed (a
+    /// no-op when it resolves the same).
+    fn audio_applied(
+        &mut self,
+        index: usize,
+        scheduled: Option<&PictureBus>,
+        landed: &PictureBus,
+        at: u64,
+        dispatcher: &mut RenditionDispatcher,
+    ) {
+        let Some(audio) = self.audio.as_mut() else {
+            return;
+        };
+        audio.video_applied(index);
+        if matches!(
+            (scheduled, landed),
+            (Some(PictureBus::Layout(_)), PictureBus::Layout(_))
+        ) {
+            audio.fallback(index, landed, at, None, dispatcher);
+        }
+    }
+
     fn drain_moves(&mut self, tick: u64, dispatcher: &mut RenditionDispatcher) {
         let mut superseded: Vec<usize> = Vec::new();
         for outcome in dispatcher.take_move_outcomes() {
@@ -2008,14 +2051,20 @@ impl OutputRouter {
                     let expected = matches!(out.pending.as_ref().map(|p| p.phase), Some(Phase::Moving(k)) if k == key);
                     if expected {
                         if let Some(p) = out.pending.take() {
+                            let scheduled = p.take.bus.clone();
                             if let Some(bus) = p.take.bus.clone() {
                                 out.bus = bus;
                             }
                             out.key = key;
                             out.since = at;
-                            if let Some(audio) = self.audio.as_mut() {
-                                audio.video_applied(output_index);
-                            }
+                            let landed = out.bus.clone();
+                            self.audio_applied(
+                                output_index,
+                                scheduled.as_ref(),
+                                &landed,
+                                at,
+                                dispatcher,
+                            );
                             self.emit(p.take.operation_id, output_index, at, TakeResult::Applied);
                         }
                     } else if out.key != key {

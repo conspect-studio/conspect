@@ -1725,14 +1725,17 @@ PR 1 (layout to an output, live) builds, and deviates from §2.3 and §7 as stat
 - **Cost, measured (build host, one core).** 1080p, 6 cells: see the PR for the release p50
   (`aux_layout::tests::a_1080p_layout_compose_costs_less_than_a_tick_on_one_core` prints it).
 - **Live edits (PR 2).** Every committed `PUT /layouts/{id}` is re-resolved on the control plane
-  and handed to the router (`LayoutChange::Edited`). The changes are coalesced per layout id in a
-  bounded inbox (64 ids, newest revision wins; the router drains it with `try_lock`, so it never
-  blocks). The router swaps the body that every output and pending take on that layout composes,
+  and handed to the router (`LayoutChange::Edited`). The changes are coalesced per layout id in an
+  inbox. The newest revision wins, and the inbox never evicts, so it is bounded by the layouts
+  library. The router drains it with `try_lock`, so it never blocks. The router swaps the body that every output and pending take on that layout composes,
   from the next tick, and requests an IDR on its encoders (within the per-key force floor). Outputs
-  whose audio follows re-resolve the layout's `audio` attribute. It is not a take: no outcome, no
-  persistence change. Every resolved body carries a process-wide revision taken after the library
-  read or commit. A take queued with a body older than a later edit or removal of its layout is
-  refused (`refused:unroutable`). Such a take can neither revert an edit nor air content its taker
+  whose audio follows re-resolve the layout's `audio` attribute. An output whose move lands
+  after an edit follows the body that landed. It is not a take: no outcome, no
+  persistence change. Every resolved body carries a process-wide revision: a take takes it before
+  it reads the library, and an edit or delete takes it after its commit. A take queued with a body
+  older than a later edit or removal of its layout is refused (`refused:unroutable`), and so is a
+  take that races a commit. The router remembers the latest state of 64 layouts. When it forgets
+  one, a take that is not newer than the forgotten state fails closed. Such a take can neither revert an edit nor air content its taker
   was not authorized for. Authorization (§6.3): such an edit or delete needs Write on every output
   the layout feeds, and an edit also needs Read on every source the new body binds. Otherwise the
   request gets a 403 `routed-layout` (one generic refusal, naming nothing).

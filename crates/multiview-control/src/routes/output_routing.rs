@@ -423,6 +423,10 @@ fn resolve_layout(
     principal: &Principal,
     id: &str,
 ) -> ControlResult<Result<RoutedLayout, FeedRefusal>> {
+    // The revision is taken BEFORE the library read: an edit or delete takes
+    // its revision after its commit, so a take that read the pre-commit body
+    // always has the lower revision and the engine refuses it as stale.
+    let revision = crate::output_routing::next_layout_revision();
     let versioned = match crate::routes::authoritative_layouts(state)? {
         Some(desired) => crate::routes::authoritative_layout(&desired, id),
         None => state.repository.get_layout(id),
@@ -469,7 +473,7 @@ fn resolve_layout(
         slates: resolved.document.cell_slates(),
         audio: resolved.document.audio.clone(),
         layout: resolved.solved,
-        revision: crate::output_routing::next_layout_revision(),
+        revision,
     };
     if !routed.integer_drawable() {
         return Ok(Err((

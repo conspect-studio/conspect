@@ -116,9 +116,11 @@ pub struct RoutedLayout {
     pub revision: u64,
 }
 
-/// The next layout resolution revision (process-wide, monotonic). Taken
-/// AFTER the layouts library is read (a take) or committed (an edit, a
-/// delete), so a higher revision always reflects a later library state.
+/// The next layout resolution revision (process-wide, monotonic). A take
+/// takes it BEFORE it reads the layouts library; an edit or a delete takes it
+/// AFTER its commit. So a take that read a body older than an edit always
+/// has a lower revision than that edit (a take racing a commit may be
+/// refused needlessly, never admitted wrongly).
 #[must_use]
 pub fn next_layout_revision() -> u64 {
     static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);

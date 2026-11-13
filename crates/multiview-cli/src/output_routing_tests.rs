@@ -4708,4 +4708,126 @@ fn layout_changes_coalesce_and_keep_the_newest() {
             .unwrap();
     assert!(Arc::ptr_eq(&composing, &last.unwrap().body));
     assert!(x.r.layout_states.len() <= crate::output_routing::LAYOUT_STATES);
+    // States were forgotten: a take older than any forgotten state, onto a
+    // layout with no remembered state, fails closed; a newer one does not.
+    assert!(x.r.layout_states_forgotten > 0);
+    let mut old = crate::aux_layout::RoutedLayout::clone(&first_body(&first));
+    old.id = "other-0".to_owned();
+    old.revision = 1;
+    assert!(x
+        .r
+        .layout_take_is_stale(&crate::routing_aux::LayoutRef::new(Arc::new(old))));
+    let PictureBus::Layout(fresh) = layout_bus("other-0") else {
+        panic!("a layout bus");
+    };
+    assert!(!x.r.layout_take_is_stale(&fresh));
+}
+
+fn first_body(bus: &PictureBus) -> Arc<crate::aux_layout::RoutedLayout> {
+    let PictureBus::Layout(layout) = bus else {
+        panic!("a layout bus");
+    };
+    Arc::clone(&layout.body)
+}
+
+/// A layout bus with `audio` on the test canvas (one cell of `cam`).
+fn layout_bus_with_audio(id: &str, audio: multiview_config::LayoutAudio) -> PictureBus {
+    let PictureBus::Layout(base) = layout_bus(id) else {
+        panic!("a layout bus");
+    };
+    let mut body = crate::aux_layout::RoutedLayout::clone(&base.body);
+    body.audio = audio;
+    body.revision = crate::output_routing::next_layout_revision();
+    PictureBus::Layout(crate::routing_aux::LayoutRef::new(Arc::new(body)))
+}
+
+impl AudioHarness {
+    /// Publish every active layout slot for tick `t` (the aux thread's job).
+    fn compose_layouts(&self, t: u64) {
+        for feed in self.r.aux.feeds.load().iter() {
+            if matches!(feed.bus, PictureBus::Layout(_)) {
+                feed.slot
+                    .latest
+                    .store(Some(Arc::new(crate::routing_aux::AuxFrame {
+                        tick: t,
+                        generation: 1,
+                        frame: canvas(),
+                    })));
+            }
+        }
+    }
+}
+
+/// #369 review (lens 1): an output whose audio follows a routed layout
+/// carries the layout's `audio` attribute, and a live edit of that attribute
+/// is followed on air, also when the edit lands while the take's move is in
+/// flight (the audio follows the body that landed).
+#[test]
+fn layout_audio_follows_live_edits_also_mid_move() {
+    use multiview_config::LayoutAudio;
+    let encoded = Arc::new(AtomicUsize::new(0));
+    let open: OpenFn = Box::new(move |_| {
+        let enc: Box<dyn LiveEncoder> = Box::new(FakeEnc {
+            forced: false,
+            encoded: Arc::clone(&encoded),
+        });
+        Ok(enc)
+    });
+    let mut x = audio_harness(2, CADENCE, open);
+    let silent = layout_bus_with_audio("L", LayoutAudio::None);
+    let mut t = x.run(0, 3);
+    x.h.try_take(OutputTake {
+        audio: Some(AudioChoice::Follow),
+        ..take("to-layout", 1, silent)
+    })
+    .unwrap();
+    // Edit as soon as the take is moving (the move's audio followed `none`).
+    let mut edited = false;
+    for _ in 0..60 {
+        x.compose_layouts(t);
+        x.tick(t);
+        t += 1;
+        let moving =
+            x.r.outputs
+                .get(1)
+                .and_then(|o| o.pending.as_ref())
+                .is_some_and(|p| matches!(p.phase, Phase::Moving(_)));
+        if moving && !edited {
+            let PictureBus::Layout(next) =
+                layout_bus_with_audio("L", LayoutAudio::Source("bars".into()))
+            else {
+                panic!("a layout bus");
+            };
+            x.h.try_layout_change(crate::output_routing::LayoutChange::Edited(next))
+                .unwrap();
+            edited = true;
+        }
+        if x.outcomes
+            .try_iter()
+            .any(|o| o.operation_id == "to-layout" && o.outcome == TakeResult::Applied)
+        {
+            break;
+        }
+    }
+    assert!(edited, "the take reached its move");
+    for _ in 0..40 {
+        x.compose_layouts(t);
+        x.tick(t);
+        t += 1;
+    }
+    let view = &x.h.snapshot().outputs[1];
+    assert_eq!(view.bus, "aux:L");
+    assert_eq!(view.audio, "src:bars", "the edited attribute is on air");
+    // A later live edit to `none` is followed on air too.
+    let PictureBus::Layout(silent_again) = layout_bus_with_audio("L", LayoutAudio::None) else {
+        panic!("a layout bus");
+    };
+    x.h.try_layout_change(crate::output_routing::LayoutChange::Edited(silent_again))
+        .unwrap();
+    for _ in 0..40 {
+        x.compose_layouts(t);
+        x.tick(t);
+        t += 1;
+    }
+    assert_eq!(x.h.snapshot().outputs[1].audio, "none");
 }
