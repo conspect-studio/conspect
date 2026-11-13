@@ -290,6 +290,16 @@ async fn dispatch(cli: Cli) -> anyhow::Result<ExitCode> {
         // + control-plane state and exceeds clippy's large-future bound.
         Command::Run(args) => Box::pin(run_run(args)).await,
         Command::Node(args) => run_node(&args),
+        #[cfg(all(feature = "acme", unix))]
+        Command::Tls(multiview_cli::cli::TlsCommand::DohCheck(args)) => {
+            let (text, seen) = multiview_cli::tls_cli::doh_check(&args).await;
+            println!("{text}");
+            Ok(if seen {
+                ExitCode::SUCCESS
+            } else {
+                ExitCode::FAILURE
+            })
+        }
         Command::Tls(command) => {
             println!("{}", multiview_cli::tls_cli::run(&command)?);
             Ok(ExitCode::SUCCESS)
