@@ -6,6 +6,8 @@
 //     refusals, without applying.
 //   * `POST /api/v1/routing/output/take` — `202 {operation_id, status, adopt?}`; the
 //     terminal outcome arrives as the realtime `route.output` event.
+//   * Audio (ADR-0108 slice 2): `target.stream = "audio"` with `audio` and no
+//     `feed` plans / takes the output's audio feed alone (video untouched).
 import { apiUrl, buildHeaders, OperationApiError, readProblem, sendCommand } from './operations';
 import type { RequestOptions } from './operations';
 import type { components } from './types';
@@ -14,6 +16,14 @@ import type { components } from './types';
 export type OutputVideoFeed =
   | { readonly bus: 'program' | 'preview' | 'clean' }
   | { readonly source: string };
+
+/** An output audio feed (externally tagged like the config `audio`). */
+export type OutputAudioFeed =
+  | 'follow'
+  | 'program'
+  | 'none'
+  | { readonly source: string }
+  | { readonly tracks: readonly string[] };
 
 /** One output's routing row (feeds are `{redacted: true}` when hidden). */
 export type OutputRouteState = components['schemas']['OutputRouteState'];
@@ -67,6 +77,10 @@ function body(output: string, feed: OutputVideoFeed): Record<string, unknown> {
   return { target: { kind: 'output', output, stream: 'video' }, feed };
 }
 
+function audioBody(output: string, audio: OutputAudioFeed): Record<string, unknown> {
+  return { target: { kind: 'output', output, stream: 'audio' }, audio };
+}
+
 /** Read the routing state (`GET /api/v1/routing`). */
 export async function getRoutingState(options: RequestOptions = {}): Promise<RoutingStateBody> {
   const response = await fetch(apiUrl(options, '/api/v1/routing'), {
@@ -113,6 +127,67 @@ export async function takeOutputFeed(
     throw new OperationApiError('The server returned an unexpected take result.');
   }
   return json;
+}
+
+/** Plan an output audio feed change (dry run; `stream: audio`). */
+export async function planOutputAudio(
+  output: string,
+  audio: OutputAudioFeed,
+  options: RequestOptions = {},
+): Promise<OutputPlan> {
+  const response = await fetch(apiUrl(options, '/api/v1/routing/plan'), {
+    method: 'POST',
+    headers: buildHeaders(options, true),
+    body: JSON.stringify(audioBody(output, audio)),
+  });
+  if (!response.ok) throw await readProblem(response);
+  const json: unknown = await response.json();
+  if (!isOutputPlan(json)) {
+    throw new OperationApiError('The server returned an unexpected output plan.');
+  }
+  return json;
+}
+
+/** Take an output audio feed alone; resolves to the accepted body. */
+export async function takeOutputAudio(
+  output: string,
+  audio: OutputAudioFeed,
+  options: RequestOptions = {},
+): Promise<OutputTakeAccepted> {
+  const response = await sendCommand('/api/v1/routing/output/take', options, {
+    body: audioBody(output, audio),
+  });
+  const json: unknown = await response.json();
+  if (!isTakeAccepted(json)) {
+    throw new OperationApiError('The server returned an unexpected take result.');
+  }
+  return json;
+}
+
+/** The audio feed a routing row's `audio` carries, or `undefined` if hidden/unknown. */
+export function audioOf(value: unknown): OutputAudioFeed | undefined {
+  if (value === 'follow' || value === 'program' || value === 'none') return value;
+  if (!isRecord(value)) return undefined;
+  if (typeof value.source === 'string') return { source: value.source };
+  if (Array.isArray(value.tracks) && value.tracks.every((t: unknown) => typeof t === 'string')) {
+    return { tracks: value.tracks };
+  }
+  return undefined;
+}
+
+/** The select value of an audio feed (`follow`, `program`, `none`, `src:<id>`, `track:<name>`). */
+export function audioKey(audio: OutputAudioFeed): string {
+  if (typeof audio === 'string') return audio;
+  if ('source' in audio) return `src:${audio.source}`;
+  return `track:${audio.tracks.join(',')}`;
+}
+
+/** Parse an audio select value back into a feed. */
+export function audioFromKey(key: string): OutputAudioFeed | undefined {
+  if (key === 'follow' || key === 'program' || key === 'none') return key;
+  if (key.startsWith('src:') && key.length > 4) return { source: key.slice(4) };
+  if (key.startsWith('track:') && key.length > 6) return { tracks: [key.slice(6)] };
+  return undefined;
 }
 
 /** Whether a feed value is the redaction marker. */

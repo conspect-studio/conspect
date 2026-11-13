@@ -27,7 +27,7 @@
 // never "publishing decoded media"). The CRUD dialogs (create / edit with
 // GET prefill + `If-Match` ETag, delete confirmation) keep the exact
 // CrudPage flow and copy; they were lifted, not redesigned.
-import { useState } from 'react';
+import { useMemo, useState } from 'react';
 import type { JSX } from 'react';
 import { Link } from 'react-router-dom';
 import { hlsPlaybackCollisionIds, hlsPlaybackPaths } from '../preview/outputPlayback';
@@ -84,6 +84,7 @@ import type { OutputRouteState } from '../api/outputRouting';
 import { useMediaPlayers } from '../api/media-playersQueries';
 import { useSources } from '../resources/queries';
 import { OutputFeedRow } from './OutputFeedRow';
+import { OutputAudioRow } from './OutputAudioRow';
 import type { FeedChoice } from './OutputFeedRow';
 import { PageHeader } from '../components/PageHeader';
 import { Badge } from '../components/ui/badge';
@@ -1280,6 +1281,16 @@ export function OutputsSurface({
   const routeOf = (id: string): OutputRouteState | undefined =>
     routeState.data?.outputs.find((row) => row.output === id);
   const selectableTracks = routing.data?.state.selectable_tracks;
+  // Discrete tracks a routed audio feed may carry (the program bus `prog` is
+  // the "Program mix" item); unknown until audio-routing has loaded.
+  const audioTracks = useMemo(
+    () => selectableTracks?.filter((track) => track !== 'prog'),
+    [selectableTracks],
+  );
+  const audioSources = useMemo(
+    () => (embedded ? [] : (sources.data ?? []).map((s) => ({ id: s.id, label: s.name }))),
+    [embedded, sources.data],
+  );
   const playbackPaths = hlsPlaybackPaths(outputs.data ?? []);
   const playbackCollisions = hlsPlaybackCollisionIds(outputs.data ?? []);
   const save = useSaveResource('outputs', RESOURCE_CONTEXT);
@@ -1472,6 +1483,15 @@ export function OutputsSurface({
                       outputName={output.name}
                       route={routeOf(output.id)}
                       choices={feedChoices}
+                      audioRow={
+                        <OutputAudioRow
+                          output={output.id}
+                          outputName={output.name}
+                          route={routeOf(output.id)}
+                          sources={audioSources}
+                          tracks={audioTracks}
+                        />
+                      }
                     />
                   )
                 }
