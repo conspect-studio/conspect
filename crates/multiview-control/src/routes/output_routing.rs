@@ -168,9 +168,11 @@ pub(crate) fn capacity_text(principal: &Principal, in_use: usize, max: usize) ->
     }
 }
 
-/// Authorize both ends (§6.3), before any existence check.
+/// Authorize both ends (§6.3), before any existence check. The output end
+/// is the patch panel's output-slot check (§12.8, #342 review A2): the object
+/// AND the output axis.
 fn authorize_ends(principal: &Principal, req: &OutputRouteRequest) -> ControlResult<()> {
-    crate::auth::authorize_object(principal, req.output())?;
+    authorize_output_slot(principal, req.output())?;
     match &req.feed {
         VideoFeed::Source(id) | VideoFeed::Layout(id) => {
             crate::auth::authorize_object(principal, id)?;
@@ -185,6 +187,22 @@ fn authorize_ends(principal: &Principal, req: &OutputRouteRequest) -> ControlRes
         _ => return Err(ControlError::Forbidden("unsupported feed kind".to_owned())),
     }
     Ok(())
+}
+
+/// The output-slot destination check shared by `/routing/output/take` and the
+/// patch routes: `ObjectAndOutput` and `authorize_output`.
+///
+/// # Errors
+/// `Forbidden` when either axis denies `output`.
+pub(crate) fn authorize_output_slot(principal: &Principal, output: &str) -> ControlResult<()> {
+    crate::auth::authorize_scope(
+        principal,
+        multiview_events::AuthzScope::ObjectAndOutput {
+            object: output,
+            output,
+        },
+    )?;
+    crate::auth::authorize_output(principal, output)
 }
 
 pub(crate) fn routing_unavailable() -> Response {

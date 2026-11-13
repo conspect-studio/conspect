@@ -39,7 +39,7 @@ use multiview_events::AuthzScope;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
-use crate::auth::{authorize_object, authorize_output, authorize_scope, Action, Principal};
+use crate::auth::{authorize_object, authorize_scope, Action, Principal};
 use crate::concurrency::{IdempotencyKey, Reservation};
 use crate::error::{ControlError, ControlResult};
 use crate::problem::Problem;
@@ -218,14 +218,7 @@ fn authorize(principal: &Principal, req: &PatchRequest) -> ControlResult<()> {
             authorize_scope(principal, AuthzScope::Program(PROGRAM))?;
         }
         if let Some(output) = &destination.output {
-            authorize_scope(
-                principal,
-                AuthzScope::ObjectAndOutput {
-                    object: output,
-                    output,
-                },
-            )?;
-            authorize_output(principal, output)?;
+            super::output_routing::authorize_output_slot(principal, output)?;
         }
         if let Some(object) =
             source_id(&xp.source).or_else(|| xp.source.get("layout").and_then(Value::as_str))

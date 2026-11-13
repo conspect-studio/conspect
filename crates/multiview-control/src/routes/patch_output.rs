@@ -18,25 +18,16 @@ use super::output_routing::{
 use super::patch::{
     problem, PatchCrosspoint, PatchPlan, PatchRefusal, PatchRequest, PlannedCrosspoint, SlotCost,
 };
-use crate::auth::{authorize_output, authorize_scope, Principal};
+use crate::auth::Principal;
 use crate::concurrency::IdempotencyKey;
 use crate::error::{ControlError, ControlResult};
 use crate::output_routing::PlanRefusal;
 use crate::state::AppState;
-use multiview_events::AuthzScope;
 
 /// Whether `principal` passes the output axis for `output` (the patch
 /// route's destination check: `ObjectAndOutput` + `authorize_output`).
 pub(crate) fn may_patch_output(principal: &Principal, output: &str) -> bool {
-    authorize_scope(
-        principal,
-        AuthzScope::ObjectAndOutput {
-            object: output,
-            output,
-        },
-    )
-    .is_ok()
-        && authorize_output(principal, output).is_ok()
+    super::output_routing::authorize_output_slot(principal, output).is_ok()
 }
 
 /// One validated output-slot request: the output and its video feed. Audio
