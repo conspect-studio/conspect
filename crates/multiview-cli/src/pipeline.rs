@@ -6067,6 +6067,10 @@ struct SinkRunOutcome {
 
 /// The live hot-queue send. In `_chaos-test-seams` builds, a deterministic
 /// shed seam (#350) can refuse one tick exactly as a full queue does.
+// The error is `try_send`'s own: it hands the item back without a copy.
+// Boxing it would allocate on the output path. Its size depends on the
+// codec features, so `allow`, not `expect`.
+#[allow(clippy::result_large_err)]
 fn send_or_forced_shed(
     hot_tx: &std::sync::mpsc::SyncSender<StreamItem>,
     item: StreamItem,
