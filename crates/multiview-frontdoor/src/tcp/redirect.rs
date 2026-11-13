@@ -1,7 +1,7 @@
 //! The plaintext port-80 -> HTTPS redirect (design note section 10).
 //!
 //! Reads at most [`MAX_REQUEST_HEAD`] bytes looking for the end of the request
-//! line, answers `301` to `https://<public_host>[:port]<path>` and closes. The
+//! head (`\r\n\r\n`), answers `301` to `https://<public_host>[:port]<path>` and closes. The
 //! target host comes from configuration only: the `Host` header is never read
 //! (an open redirect through a forged `Host` is impossible by construction).
 

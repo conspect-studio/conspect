@@ -680,11 +680,15 @@ async fn redirect_one(config: &RedirectConfig, mut stream: TcpStream) -> std::io
         if n == 0 {
             break;
         }
-        let seen_from = filled.saturating_sub(1);
+        // Read to the end of the header block (`\r\n\r\n`), not the first
+        // `\r\n`: a request line split across segments (certbot's HTTP-01
+        // fetch) must be parsed whole (#353 review). Still bounded by
+        // MAX_REQUEST_HEAD and the per-connection deadline.
+        let seen_from = filled.saturating_sub(3);
         filled += n;
         if head
             .get(seen_from..filled)
-            .is_some_and(|w| w.windows(2).any(|p| p == b"\r\n"))
+            .is_some_and(|w| w.windows(4).any(|p| p == b"\r\n\r\n"))
         {
             break;
         }

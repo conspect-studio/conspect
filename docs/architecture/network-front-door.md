@@ -1258,10 +1258,12 @@ The engine serves TCP 443, TCP 80 and UDP 443 on mda001; nginx is removed by the
   of being closed. With no `[control]` nothing waits.
 * **Certificates for the cutover**: `[network] cert_file`/`key_file` give the door its own static
   certificate without making the loopback admin listener TLS; exclusive with `[network.tls]`.
-  Static pairs (these and `[control.tls]`) are reloaded without a restart: a 30 s `stat` poll of
-  the resolved target, size, mtime and inode (certbot re-points `live/` symlinks), parse and
-  key/leaf check on the blocking pool, swap into the `StaticCertificateSource` the resolver reads
-  per handshake; a broken pair keeps the old certificate. `[network] acme_webroot` makes the
+  Static pairs (these and `[control.tls]`) are reloaded without a restart: every 30 s each file
+  is opened once, `fstat`ed and read (at most 1 MiB) on the blocking pool; when the stamps
+  (device, inode, size, mtime of the opened file; certbot re-points `live/` symlinks) change, the
+  bytes just read are parsed and key/leaf-checked and swapped into the
+  `StaticCertificateSource` the resolver reads per handshake; a broken pair keeps the old
+  certificate. `[network] acme_webroot` makes the
   port-80 listener answer `/.well-known/acme-challenge/<base64url token>` from
   `<webroot>/.well-known/acme-challenge/` (regular files, at most 1 KiB, no symlinks), so certbot
   `--webroot` renews without nginx. The move to the engine's own ACME and the point where
@@ -1269,14 +1271,16 @@ The engine serves TCP 443, TCP 80 and UDP 443 on mda001; nginx is removed by the
 * **HLS** (`multiview-output::hls::http`): confinement, open and `fstat` in one blocking-pool
   hop (was five `tokio::fs` round trips); the length and validators come from the opened handle;
   64 KiB body chunks (`BODY_CHUNK`, never the whole file); nginx's `ETag` format
-  (`"<mtime hex>-<size hex>"`), `Last-Modified`, `If-None-Match`/`If-Modified-Since` -> `304`,
-  `If-Range`. `deploy/hls-nginx.conf` stays the contract; `tests/hls_nginx_parity.rs` pins it.
+  (`"<mtime hex>-<size hex>"`), `Last-Modified`, `If-None-Match`/`If-Modified-Since` -> `304` (with `Range`, only an exact
+  strong tag revalidates), `If-Range`. `deploy/hls-nginx.conf` stays the contract; `tests/hls_nginx_parity.rs` pins it.
   Zero-copy `sendfile` is not possible under rustls without kTLS; the bounded chunked read is
   the as-built form, and `scripts/hls-ttfb.py` measures TTFB against nginx (acceptance on
   mda001).
-* **UI** (`multiview-control::spa`): strong `ETag` (SHA-256), `304`, gzip for text assets with
-  `Vary: Accept-Encoding` (compressed once per asset, cached for the process; bounded by the
-  embedded file set), a missing `/assets/*` is `404`. `[control] ui_dir` serves a UI build from
+* **UI** (`multiview-control::spa`): the representation (identity or gzip, from
+  `Accept-Encoding`) is chosen first; strong `ETag` per representation (SHA-256, `-gz` suffix),
+  `304` only for the selected representation's tag; gzip for text assets with
+  `Vary: Accept-Encoding` (compressed once per content hash, cached for the process; bounded by
+  the servable file set), a missing `/assets/*` is `404`. `[control] ui_dir` serves a UI build from
   disk instead of the embedded copy, read into memory at start-up (at most 10 000 files /
   256 MiB) so a request never touches the filesystem.
 * **Invariants #1/#10**: everything above runs on the front-door runtime or the control plane's;

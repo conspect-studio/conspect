@@ -67,16 +67,30 @@ echo "== 1. certificate readable by $SVC_USER, renewed copies follow"
 install -d -m 0750 -o root -g "$SVC_USER" "$TLS_DIR"
 # The hook is static text (quoted heredoc); its three values live in an env
 # file it reads, validated above, so nothing is interpolated into shell source.
+# Root sources the env file on every renewal: it and every directory above
+# it must be root-owned and not group/world-writable, or the service user
+# could swap it for shell.
+for d in /etc /etc/conspect; do
+    [ "$(stat -c '%u' "$d")" = 0 ] && [ $(( 0$(stat -c '%a' "$d") & 022 )) -eq 0 ] \
+        || { echo "$d must be root-owned and not group/world-writable (chmod go-w $d)" >&2; exit 1; }
+done
 install -d -m 0755 "$(dirname "$HOOK")"
-printf 'CONSPECT_LE=%s\nCONSPECT_TLS_DIR=%s\nCONSPECT_GROUP=%s\n' "$LE" "$TLS_DIR" "$SVC_USER" \
-    > /etc/conspect/certbot-hook.env
-chmod 0644 /etc/conspect/certbot-hook.env
+envtmp="$(mktemp /etc/conspect/.certbot-hook.env.XXXXXX)"
+printf 'CONSPECT_LE=%s\nCONSPECT_TLS_DIR=%s\nCONSPECT_GROUP=%s\n' "$LE" "$TLS_DIR" "$SVC_USER" > "$envtmp"
+chown root:root "$envtmp"
+chmod 0600 "$envtmp"
+mv -f "$envtmp" /etc/conspect/certbot-hook.env
 cat > "$HOOK" <<'HOOKEOF'
 #!/bin/sh
 # Installed by deploy/systemd/front-door-cutover.sh: copy the renewed
 # certificate for the conspect engine (it reloads the files within 30 s).
 set -e
-. /etc/conspect/certbot-hook.env
+env=/etc/conspect/certbot-hook.env
+# Fail closed unless the file is root's alone, and re-check its values.
+[ "$(stat -c '%u %a' "$env")" = "0 600" ] || { echo "conspect hook: $env must be root 0600" >&2; exit 1; }
+. "$env"
+case "$CONSPECT_LE$CONSPECT_TLS_DIR" in *[!A-Za-z0-9._/-]*) echo "conspect hook: unsafe path" >&2; exit 1;; esac
+case "$CONSPECT_GROUP" in ""|*[!a-z0-9_-]*) echo "conspect hook: unsafe group" >&2; exit 1;; esac
 [ "${RENEWED_LINEAGE:-$CONSPECT_LE}" = "$CONSPECT_LE" ] || exit 0
 install -m 0644 -o root -g "$CONSPECT_GROUP" "$CONSPECT_LE/fullchain.pem" "$CONSPECT_TLS_DIR/fullchain.pem.new"
 install -m 0640 -o root -g "$CONSPECT_GROUP" "$CONSPECT_LE/privkey.pem" "$CONSPECT_TLS_DIR/privkey.pem.new"

@@ -187,26 +187,27 @@ fn compressible(mime: &str) -> bool {
 /// Bodies below this are sent as they are (nginx `gzip_min_length` scale).
 const GZIP_MIN_LENGTH: usize = 1024;
 
-/// Gzipped copies of the embedded text assets, built on first request and
-/// kept for the process lifetime. Bounded by construction: at most one entry
-/// per file compiled into the binary, keyed by the embedded path (a request
-/// for a path that is not embedded never reaches this table).
-static GZIPPED: std::sync::OnceLock<
-    std::sync::Mutex<std::collections::HashMap<String, Option<bytes::Bytes>>>,
-> = std::sync::OnceLock::new();
+/// Gzipped copies of the served text assets, built on first request and kept
+/// for the process lifetime, keyed by the SHA-256 of the exact source bytes
+/// (so a cached body is only ever returned for the bytes it was made from,
+/// whichever UI source served them). Bounded by construction: one entry per
+/// distinct servable file (the embedded set, or `ui_dir`, at most
+/// [`UI_DIR_MAX_FILES`]); a request for a path that is not servable never
+/// reaches this table.
+type GzipCache = std::collections::HashMap<[u8; 32], Option<bytes::Bytes>>;
+static GZIPPED: std::sync::OnceLock<std::sync::Mutex<GzipCache>> = std::sync::OnceLock::new();
 
-fn gzip_cache() -> &'static std::sync::Mutex<std::collections::HashMap<String, Option<bytes::Bytes>>>
-{
+fn gzip_cache() -> &'static std::sync::Mutex<GzipCache> {
     GZIPPED.get_or_init(Default::default)
 }
 
 /// The gzipped body for `key`, compressing on first use (on the blocking
 /// pool). `None` when compression does not pay (smaller than the original).
-async fn gzipped(key: &str, data: bytes::Bytes) -> Option<bytes::Bytes> {
+async fn gzipped(sha256: [u8; 32], data: bytes::Bytes) -> Option<bytes::Bytes> {
     if let Some(hit) = gzip_cache()
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .get(key)
+        .get(&sha256)
     {
         return hit.clone();
     }
@@ -228,7 +229,7 @@ async fn gzipped(key: &str, data: bytes::Bytes) -> Option<bytes::Bytes> {
     gzip_cache()
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .insert(key.to_owned(), compressed.clone());
+        .insert(sha256, compressed.clone());
     compressed
 }
 
@@ -294,7 +295,7 @@ async fn serve_asset(key: &str, method: &Method, headers: &HeaderMap) -> Option<
     let mime = mime_guess::from_path(key).first_or_octet_stream();
     let text = compressible(mime.as_ref());
     let gzip = if text && data.len() >= GZIP_MIN_LENGTH && accepts_gzip(headers) {
-        gzipped(key, data.clone()).await
+        gzipped(sha256, data.clone()).await
     } else {
         None
     };

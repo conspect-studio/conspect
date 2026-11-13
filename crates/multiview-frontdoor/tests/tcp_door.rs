@@ -642,6 +642,24 @@ fn redirect_serves_http01_challenges_from_the_webroot() {
         let out = get(missing);
         assert!(out.starts_with("HTTP/1.1 404 Not Found\r\n"), "{out}");
     }
+    // A request line split across TCP segments is answered from the whole
+    // head (certbot's fetch may arrive in pieces).
+    let split = client_rt().block_on(async move {
+        let mut s = TcpStream::connect(addr).await.unwrap();
+        s.set_nodelay(true).unwrap();
+        s.write_all(b"GET /.well-known/acme-challenge/tok_")
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        s.write_all(b"EN-1 HTTP/1.1\r\nHost: x\r\n").await.unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        s.write_all(b"User-Agent: certbot\r\n\r\n").await.unwrap();
+        let mut out = String::new();
+        s.read_to_string(&mut out).await.unwrap();
+        out
+    });
+    assert!(split.starts_with("HTTP/1.1 200 OK\r\n"), "{split}");
+    assert!(split.ends_with("tok_EN-1.thumbprint"), "{split}");
     // Traversal is not a token: it gets the redirect, never a file.
     let out = get(b"GET /.well-known/acme-challenge/../../secret HTTP/1.1\r\n\r\n");
     assert!(out.starts_with("HTTP/1.1 301"), "{out}");
