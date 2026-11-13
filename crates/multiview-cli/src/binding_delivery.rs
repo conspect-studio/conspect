@@ -331,6 +331,9 @@ impl WindowDelivery for BindingDelivery {
             binding.queue.report_loss(reason);
             binding.rejected_batches = binding.rejected_batches.saturating_add(1);
             binding.last_rejection = Some(RejectionReason::from_offer(reason));
+            if let BindingPolicy::DropCounted(counter) = &binding.policy {
+                counter.fetch_add(1, Ordering::AcqRel);
+            }
         }
     }
 
@@ -960,6 +963,89 @@ mod tests {
             drop(packet.permit);
         }
         out
+    }
+
+    /// ADR-0111 (invariants #1/#10): a `DropCounted` binding whose sink
+    /// stalls is never abandoned and never grows. Every packet the sink
+    /// did not receive is counted; the retained packets never exceed the
+    /// queue cap; when the sink takes packets again, delivery resumes at a
+    /// keyframe.
+    #[test]
+    fn a_drop_counted_binding_survives_a_stalled_sink_and_stays_at_its_cap() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        use std::sync::Arc;
+        const CAP: usize = 8;
+        let dropped = Arc::new(AtomicU64::new(0));
+        let (mut delivery, mut receivers) = BindingDelivery::new(
+            vec![BindingPolicy::DropCounted(Arc::clone(&dropped))],
+            limits(CAP),
+            vec![Some(gate())],
+        );
+        let rx = receivers.pop().unwrap();
+        let start = Instant::now();
+        // The sink takes nothing for 3 s (longer than the pump's grace)
+        // while one window per 40 ms is offered, an IDR every 25th.
+        let mut offered = 0_u64;
+        let mut peak = 0;
+        let offer = |delivery: &mut BindingDelivery, index: u64, now: Instant| {
+            let nal = if index % 25 == 0 { 5 } else { 1 };
+            delivery.stage(&[h264_packet(nal)]);
+            delivery.flush_tick(now, Duration::from_millis(40));
+        };
+        while start.elapsed() < Duration::from_secs(3) {
+            let began = Instant::now();
+            offer(&mut delivery, offered, began);
+            offered += 1;
+            // The consumer side never waits on the stalled sink.
+            assert!(
+                began.elapsed() < Duration::from_millis(100),
+                "{:?}",
+                began.elapsed()
+            );
+            let status = delivery.statuses()[0];
+            peak = peak.max(status.reserved_packets);
+            assert!(status.reserved_packets <= CAP, "{status:?}");
+            assert!(!status.failed, "a stalled cast sink is never abandoned");
+            std::thread::sleep(Duration::from_millis(40));
+        }
+        assert!(peak > 0 && peak <= CAP, "{peak}");
+        let lost = dropped.load(Ordering::Acquire);
+        assert!(lost > 0, "the stalled sink's packets are counted");
+        // The sink comes back: it drains what was handed off, and new
+        // windows flow again from the next IDR.
+        let mut received = 0_u64;
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut idr_after_stall = false;
+        while Instant::now() < deadline && !idr_after_stall {
+            offer(&mut delivery, offered, Instant::now());
+            offered += 1;
+            while let Ok(leased) = rx.recv_timeout(Duration::from_millis(40)) {
+                received += 1;
+                let payload = leased.packet.payload().unwrap();
+                if received > 2 && payload[4] & 0x1F == 5 {
+                    idr_after_stall = true;
+                }
+            }
+        }
+        assert!(
+            idr_after_stall,
+            "delivery resumed at a keyframe after the stall"
+        );
+        let status = delivery.statuses()[0];
+        assert!(
+            !status.failed && status.reserved_packets <= CAP,
+            "{status:?}"
+        );
+        // Nothing is unaccounted for: every offered packet was received,
+        // counted as dropped, or is still retained (bounded).
+        let lost = dropped.load(Ordering::Acquire);
+        assert!(
+            received + lost + u64::try_from(CAP).unwrap() >= offered,
+            "received {received} + dropped {lost} of {offered}"
+        );
+        assert!(received < offered);
+        drop(rx);
+        delivery.finish();
     }
 
     #[test]

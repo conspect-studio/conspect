@@ -19,6 +19,8 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 
+#[cfg(all(test, feature = "gpl-codecs"))]
+mod pipeline_tests;
 mod ring;
 mod runner;
 #[cfg(test)]

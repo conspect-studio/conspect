@@ -9,7 +9,7 @@ use std::sync::mpsc::{Receiver, RecvTimeoutError};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use multiview_ffmpeg::{StreamCodecParameters, StreamKind};
+use multiview_ffmpeg::{EncodedPacket, StreamKind};
 
 use multiview_core::time::Rational;
 use multiview_output::hls::cast::{
@@ -337,13 +337,17 @@ pub(crate) struct CastSinkReport {
 /// packager path is caught here: the output is disabled for the run, its
 /// packets are discarded from then on, and the thread ends normally, so the
 /// run and every other output are unaffected.
+///
+/// `is_idr` tells whether a video packet is a decoder-ready random-access
+/// point of the opened encoder (a keyframe flag alone is not enough).
 pub(crate) fn run_cast_sink(
     setup: CastSetup,
     rx: &Receiver<LeasedPacket>,
-    params: &StreamCodecParameters,
+    is_idr: &dyn Fn(&EncodedPacket) -> bool,
 ) -> CastSinkReport {
     let gate = Arc::clone(&setup.gate);
     let id = setup.id.clone();
+    let dir = setup.dir.clone();
     let has_audio = setup.audio.is_some();
     let mut runner = CastRunner::new(setup);
     let mut report = CastSinkReport {
@@ -391,7 +395,7 @@ pub(crate) fn run_cast_sink(
             kind,
             pts,
             dts: packet.dts().unwrap_or(pts),
-            keyframe: video && params.is_decoder_ready_rap(packet),
+            keyframe: video && is_idr(packet),
             config_changed: video && std::mem::take(&mut config_change_pending),
             data,
         };
@@ -406,6 +410,8 @@ pub(crate) fn run_cast_sink(
             );
             tracing::error!(output = %id, "cast sink panicked; this output is disabled for the run");
             gate.disable(reason);
+            // The runner is not touched again; its stream files go now.
+            purge_owned(&dir, &id);
         }
     }
     report.restarts = runner.restarts();

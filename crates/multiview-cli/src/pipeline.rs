@@ -9640,7 +9640,8 @@ fn run_cast_output(
         video,
         audio,
     };
-    let report = crate::cast_output::run_cast_sink(setup, rx, params);
+    let report =
+        crate::cast_output::run_cast_sink(setup, rx, &|packet| params.is_decoder_ready_rap(packet));
     SinkRunOutcome {
         line: format!(
             "cast {id} ({}): {} packet(s), {} restart(s){}",
