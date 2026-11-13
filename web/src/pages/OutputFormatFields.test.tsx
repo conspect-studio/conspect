@@ -70,6 +70,10 @@ describe('OutputFormatFields', () => {
     expect(formatError(next)).toBeUndefined();
     expect(formatError(withFormat(base(), { width: '1281', height: '720', mode: 'contain', anchor: 'center' }))).toBe('size');
     expect(formatError(withFormat(base(), { width: '1280', height: '', mode: 'contain', anchor: 'center' }))).toBe('size');
+    // The area cap (3840 × 2160), as the config enforces it.
+    expect(formatError(withFormat(base(), { width: '3840', height: '2160', mode: 'contain', anchor: 'center' }))).toBeUndefined();
+    expect(formatError(withFormat(base(), { width: '8192', height: '8192', mode: 'contain', anchor: 'center' }))).toBe('size');
+    expect(formatError(withFormat(base(), { width: '2160', height: '3842', mode: 'contain', anchor: 'center' }))).toBe('size');
   });
 
   it('writes the video slot bitrate and removes an emptied slot list', () => {

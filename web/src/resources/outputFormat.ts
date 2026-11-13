@@ -49,11 +49,16 @@ export function resetsLive(kind: OutputKind): boolean {
   return kind === 'hls';
 }
 
-/** Kinds without an encoded video slot (raw frames or audio only). */
+/** Kinds with an encoded video slot (not raw frames, not audio only). */
 export function hasEncodedVideo(kind: OutputKind): boolean {
-  // NDI and the display head carry raw frames (no encoded video slot).
+  // NDI and the display head carry raw frames: no encoded video slot. AES67
+  // (audio only) is not an `OutputKind` at all: it has no form in this UI
+  // (Edit is refused), so the format editor can never show for it.
   return kind !== 'ndi' && kind !== 'display';
 }
+
+/** The largest output picture area (the config's `MAX_FORMAT_AREA`, 4K UHD). */
+export const MAX_FORMAT_AREA = 3840 * 2160;
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
@@ -171,7 +176,8 @@ export function withBitrate(form: OutputFormState, value: string): OutputFormSta
 
 /**
  * Validation of the format fields: each size even and 16..=8192, both or
- * neither; the bitrate 1..=1000000 kbit/s (the config's own limits).
+ * neither, the area at most {@link MAX_FORMAT_AREA}; the bitrate
+ * 1..=1000000 kbit/s (the config's own limits).
  */
 export function formatError(form: OutputFormState): string | undefined {
   const format = formatOf(form);
@@ -181,6 +187,8 @@ export function formatError(form: OutputFormState): string | undefined {
       return n !== undefined && n % 2 === 0 && n >= 16 && n <= 8192;
     };
     if (!edge(format.width) || !edge(format.height)) return 'size';
+    const area = Number(format.width) * Number(format.height);
+    if (area > MAX_FORMAT_AREA) return 'size';
   }
   const bitrate = bitrateOf(form);
   if (bitrate !== '') {

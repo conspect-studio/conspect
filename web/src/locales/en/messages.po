@@ -1404,7 +1404,7 @@ msgstr "Apple"
 msgid "Applied as {0}. Operation {1}."
 msgstr "Applied as {0}. Operation {1}."
 
-#: src/pages/OutputFormatFields.tsx:198
+#: src/pages/OutputFormatFields.tsx:201
 msgid "Applies on the next restart."
 msgstr "Applies on the next restart."
 
@@ -1430,7 +1430,7 @@ msgstr "Apply mode"
 msgid "Apply requested configuration"
 msgstr "Apply requested configuration"
 
-#: src/pages/OutputFormatFields.tsx:194
+#: src/pages/OutputFormatFields.tsx:197
 msgid "Applying resets this output (about 1 s); Program and other outputs are not affected."
 msgstr "Applying resets this output (about 1 s); Program and other outputs are not affected."
 
@@ -1591,16 +1591,16 @@ msgid "Audio silence"
 msgstr "Audio silence"
 
 #. placeholder {0}: slot.track ?? '—'
-#: src/pages/OutputFormatFields.tsx:181
+#: src/pages/OutputFormatFields.tsx:184
 msgid "Audio slot {index}: track {0}"
 msgstr "Audio slot {index}: track {0}"
 
-#: src/pages/OutputFormatFields.tsx:173
-#: src/pages/OutputFormatFields.tsx:179
+#: src/pages/OutputFormatFields.tsx:176
+#: src/pages/OutputFormatFields.tsx:182
 msgid "Audio slot 0: program mix"
 msgstr "Audio slot 0: program mix"
 
-#: src/pages/OutputFormatFields.tsx:170
+#: src/pages/OutputFormatFields.tsx:173
 msgid "Audio slots"
 msgstr "Audio slots"
 
@@ -10197,7 +10197,7 @@ msgstr "Skip cue"
 msgid "Skip to content"
 msgstr "Skip to content"
 
-#: src/pages/OutputFormatFields.tsx:149
+#: src/pages/OutputFormatFields.tsx:152
 msgid "Slots"
 msgstr "Slots"
 
@@ -11093,7 +11093,7 @@ msgstr "The API exposes no per-output restart readback."
 msgid "The applied event was not observed on the realtime stream. The command may or may not have been applied."
 msgstr "The applied event was not observed on the realtime stream. The command may or may not have been applied."
 
-#: src/pages/OutputFormatFields.tsx:167
+#: src/pages/OutputFormatFields.tsx:170
 msgid "The bitrate must be a whole number from 1 to 1000000 kbit/s."
 msgstr "The bitrate must be a whole number from 1 to 1000000 kbit/s."
 
@@ -12373,7 +12373,7 @@ msgstr "Very low (~1 frame)"
 msgid "Video"
 msgstr "Video"
 
-#: src/pages/OutputFormatFields.tsx:157
+#: src/pages/OutputFormatFields.tsx:160
 msgid "Video bitrate (kbit/s)"
 msgstr "Video bitrate (kbit/s)"
 
@@ -12394,7 +12394,7 @@ msgid "Video RTP arrived, but no decoded frames were reported."
 msgstr "Video RTP arrived, but no decoded frames were reported."
 
 #. placeholder {0}: form.codec || '—'
-#: src/pages/OutputFormatFields.tsx:153
+#: src/pages/OutputFormatFields.tsx:156
 msgid "Video slot 0: codec {0}"
 msgstr "Video slot 0: codec {0}"
 
@@ -12786,8 +12786,8 @@ msgid "Width (px)"
 msgstr "Width (px)"
 
 #: src/pages/OutputFormatFields.tsx:144
-msgid "Width and height must both be even numbers from 16 to 8192."
-msgstr "Width and height must both be even numbers from 16 to 8192."
+msgid "Width and height must both be even numbers from 16 to 8192, at most 3840 × 2160 pixels in area."
+msgstr "Width and height must both be even numbers from 16 to 8192, at most 3840 × 2160 pixels in area."
 
 #: src/pages/SupportPage.tsx:436
 msgid "Window"

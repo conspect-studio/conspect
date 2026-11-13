@@ -141,7 +141,10 @@ export function OutputFormatFields({
       </div>
       {error === 'size' ? (
         <p role="alert" className="text-sm text-destructive">
-          <Trans>Width and height must both be even numbers from 16 to 8192.</Trans>
+          <Trans>
+            Width and height must both be even numbers from 16 to 8192, at most 3840 × 2160 pixels in
+            area.
+          </Trans>
         </p>
       ) : null}
       <div className="grid gap-2">
