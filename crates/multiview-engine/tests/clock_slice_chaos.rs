@@ -12,7 +12,8 @@
 //! Asserted on every Linux host: every tick is emitted (exact count). Where
 //! the kernel applies the slice (EEVDF custom slices, 6.12+), with the slice:
 //! no tick is repeated, no wake is later than [`ONE_CORE_WAKE_CEILING_MS`] (the
-//! oversubscribed bound ADR-0109 §8 gives), and — when the default run was
+//! oversubscribed bound ADR-0109 §8 gives) nor than the default run's worst
+//! wake, and — when the default run was
 //! contended (mean wake above 0.5 ms) — the mean wake is under half the
 //! default run's. Measured on the build host (6.12): default mean 2.1–2.3 ms,
 //! max 11.9 ms; slice mean 0.2–0.5 ms, max 4.0–6.7 ms. Older kernels and hosts
@@ -113,7 +114,7 @@ fn run(cpu: usize, custom: bool) -> Run {
         .map(|_| {
             let stop = Arc::clone(&stop);
             std::thread::spawn(move || {
-                let _ = pin(cpu);
+                assert!(pin(cpu), "a spinner could not pin to cpu {cpu}");
                 let mut x = 0_u64;
                 while !stop.load(Ordering::Relaxed) {
                     x = std::hint::black_box(x.wrapping_add(1));
@@ -125,7 +126,7 @@ fn run(cpu: usize, custom: bool) -> Run {
         .build()
         .unwrap();
     let handle = clock_thread::spawn("clock-slice", move || {
-        let _ = pin(cpu);
+        assert!(pin(cpu), "the clock thread could not pin to cpu {cpu}");
         // `spawn` already asked for CLOCK_SLICE; the default run resets it.
         let slice = multiview_clocksys::set_current_thread_slice(if custom {
             u64::try_from(CLOCK_SLICE.as_nanos()).unwrap()
@@ -204,6 +205,10 @@ fn a_short_slice_wakes_the_clock_through_cpu_bound_neighbours() {
     assert!(
         short.wake_max_ms < ONE_CORE_WAKE_CEILING_MS,
         "every wake within the one-core ceiling with the slice: {short:?}"
+    );
+    assert!(
+        short.wake_max_ms < default.wake_max_ms,
+        "the slice lowers the worst wake against the same neighbours: {short:?} vs {default:?}"
     );
     if default.wake_mean_ms > 0.5 {
         assert!(

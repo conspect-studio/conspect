@@ -114,8 +114,9 @@ pub fn set_current_thread_slice(slice_ns: u64) -> Slice {
     let Some(mut attr) = current_attr(size) else {
         return Slice::Refused(last_errno());
     };
-    // The ABI version this struct is (VER0, 48 bytes: no `sched_util_*`, and
-    // no SCHED_FLAG_UTIL_* flag is passed). Set explicitly, never inherited.
+    // The size of the struct libc declares (the kernel accepts any size from
+    // VER0, 48 bytes, up; no SCHED_FLAG_UTIL_* flag is passed, so the
+    // util-clamp fields are never read). Set explicitly, never inherited.
     attr.size = size;
     attr.sched_policy = 0; // SCHED_OTHER
     attr.sched_flags = 0;
@@ -124,7 +125,7 @@ pub fn set_current_thread_slice(slice_ns: u64) -> Slice {
     attr.sched_deadline = 0;
     attr.sched_period = 0;
     // SAFETY: `attr` is a fully initialised `sched_attr` whose `size` field is
-    // set just above to its own size (the VER0 layout libc declares); pid 0
+    // set just above to its own size; pid 0
     // targets the calling thread only; flags 0. The kernel only reads `attr`.
     // A syscall returns a value, it cannot unwind.
     let rc = unsafe { libc::syscall(libc::SYS_sched_setattr, 0, std::ptr::addr_of!(attr), 0_u32) };

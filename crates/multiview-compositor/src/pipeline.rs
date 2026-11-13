@@ -878,7 +878,7 @@ impl ScratchPool {
     /// Lease output planes of exactly `y_len`/`uv_len` bytes. A returned vector
     /// with enough capacity is resized+zeroed in place; otherwise one new vector
     /// is allocated and counted. The image's `Drop` returns the vectors through
-    /// the shared one-slot cache.
+    /// the shared bounded spare cache ([`PLANE_SPARES`] per plane kind).
     fn lease_planes(&self, y_len: usize, uv_len: usize) -> (Vec<u8>, Vec<u8>, Arc<PlaneReturn>) {
         let y = Self::take_plane(&self.planes.y, y_len, &self.alloc_count);
         let uv = Self::take_plane(&self.planes.uv, uv_len, &self.alloc_count);
