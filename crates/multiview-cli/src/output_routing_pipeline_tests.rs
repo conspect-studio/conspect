@@ -144,9 +144,26 @@ fn drive_full<F>(
 where
     F: FnOnce(OutputRoutingSlot) + Send + 'static,
 {
+    drive_prepared(template, audio, switcher, prefix, ticks, |_| {}, control)
+}
+
+/// As [`drive_full`]; `prep` sees the built pipeline before the run.
+fn drive_prepared<F>(
+    template: &str,
+    audio: bool,
+    switcher: bool,
+    prefix: &str,
+    ticks: u64,
+    prep: impl FnOnce(&mut Pipeline),
+    control: F,
+) -> Run
+where
+    F: FnOnce(OutputRoutingSlot) + Send + 'static,
+{
     let config =
         multiview_config::MultiviewConfig::load_from_toml(&template.replace('@', prefix)).unwrap();
     let mut pipeline = Pipeline::build(&config).unwrap();
+    prep(&mut pipeline);
     if audio {
         pipeline.enable_program_audio();
     }
@@ -1014,4 +1031,68 @@ fn an_audio_only_take_routes_a_source_and_returns_to_the_shared_stream() {
     let after = span(1, g(to_program.tick) + 4096, i64::MAX);
     assert!(after.len() > 1024);
     assert!(rms(&after) < 1e-3, "after the return: {}", rms(&after));
+}
+
+/// ADR-0108 slice 2 §6.1: a run whose config persists `audio = { source =
+/// "<b>" }` on output 1 starts it on follow and re-applies the persisted feed
+/// as an audio-only boot take: within a few ticks of the first routing tick
+/// the router snapshot shows output 1 carrying `src:<b>` (video unchanged),
+/// and output 0 keeps the program mix.
+#[test]
+fn a_persisted_audio_feed_is_re_applied_by_a_boot_take() {
+    const TICKS: u64 = 120;
+    let template = format!(
+        "{AUDIO_CONFIG}\n[[routing.output]]\noutput = \"out1\"\naudio = {{ source = \"@_b\" }}\n"
+    );
+    let seen = Arc::new(Mutex::new(None));
+    let record = Arc::clone(&seen);
+    let prep = |pipeline: &mut Pipeline| {
+        let takes = pipeline.boot_audio_takes_mut();
+        assert_eq!(
+            *takes,
+            vec![(
+                "out1".to_owned(),
+                super::AudioChoice::Source("route_boot_b".to_owned())
+            )],
+            "the persisted feed is parsed into one boot take"
+        );
+        // The harness binds its sinks as `test-sink-N` (positional).
+        takes[0].0 = "test-sink-1".to_owned();
+    };
+    let run = drive_prepared(
+        &template,
+        true,
+        false,
+        "route_boot",
+        TICKS,
+        prep,
+        move |slot| {
+            let handle = wait_for("the routing handle", Duration::from_secs(10), || {
+                slot.load()
+            });
+            let outcomes = handle.outcomes().expect("one outcome reader");
+            let o = wait_for("the boot take outcome", Duration::from_secs(10), || {
+                outcomes.try_recv().ok()
+            });
+            assert_eq!(o.operation_id, "boot-audio:test-sink-1");
+            assert_eq!(o.outcome, TakeResult::Applied, "{o:?}");
+            let s = wait_for("the boot audio on air", Duration::from_secs(5), || {
+                let s = handle.snapshot();
+                (s.outputs
+                    .get(1)
+                    .is_some_and(|v| v.audio == "src:route_boot_b"))
+                .then_some(s)
+            });
+            *record.lock().unwrap() = Some((o.tick, s));
+        },
+    );
+    let (tick, s) = seen.lock().unwrap().take().expect("observed");
+    assert!(
+        tick < 30,
+        "the boot take applies within a few ticks: {tick}"
+    );
+    assert_eq!(s.outputs[1].bus, "program", "the video is untouched");
+    assert_eq!(s.outputs[1].audio_choice, "src:route_boot_b");
+    assert_eq!(s.outputs[0].audio, "program");
+    assert_eq!(run.frames, TICKS);
 }

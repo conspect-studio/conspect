@@ -132,8 +132,8 @@ pub fn switcher_canvas_admission(
 /// bus other than Program) is validated and read back, but the engine does not
 /// carry it yet, so start-up refuses it rather than silently putting Program on
 /// that output. A `bus = "preview"` output keeps its existing behaviour. An
-/// explicit (non-`follow`) audio feed is refused the same way: start-up
-/// carries every output on follow audio (an explicit choice is a live take).
+/// explicit (non-`follow`) audio feed is accepted: start-up re-applies it as
+/// an audio-only boot take (ADR-0108 slice 2 §6.1).
 ///
 /// # Errors
 /// The start-up refusal text naming the routed output.
@@ -149,18 +149,9 @@ pub fn outputs_carry_program(config: &MultiviewConfig) -> Result<(), String> {
             routed.effective_video().picture_bus()
         ));
     }
-    // ADR-0108 slice 2: an explicit audio feed is taken live; start-up does
-    // not apply one yet, so it is refused rather than silently aired as follow.
-    if let Some(routed) = config
-        .output_feeds()
-        .into_iter()
-        .find(|xp| !xp.audio.is_follow())
-    {
-        return Err(format!(
-            "output {:?} declares audio {:?}; this engine starts every output on follow audio",
-            routed.output, routed.audio
-        ));
-    }
+    // ADR-0108 slice 2: an explicit (non-`follow`) audio feed is accepted:
+    // the run starts the output on follow and re-applies the persisted feed
+    // as an audio-only boot take once its routing handle is published.
     Ok(())
 }
 

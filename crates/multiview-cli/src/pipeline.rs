@@ -275,6 +275,47 @@ fn ensure_outputs_carry_program(config: &MultiviewConfig) -> Result<(), Pipeline
     multiview_config::outputs_carry_program(config).map_err(PipelineError::Engine)
 }
 
+/// The persisted non-`follow` audio feeds of `config`'s outputs as engine
+/// choices (a track resolved to its `audio-routing` route input; an
+/// undeclared track or a multi-track feed, which the routed slot cannot
+/// carry, is skipped with a warning).
+fn boot_audio_choices(
+    config: &MultiviewConfig,
+) -> Vec<(String, crate::routing_audio::AudioChoice)> {
+    use crate::routing_audio::AudioChoice;
+    use multiview_config::AudioFeed;
+    config
+        .output_feeds()
+        .into_iter()
+        .filter_map(|xp| {
+            let choice = match &xp.audio {
+                AudioFeed::Program => AudioChoice::Program,
+                AudioFeed::None => AudioChoice::Silence,
+                AudioFeed::Source(id) => AudioChoice::Source(id.clone()),
+                AudioFeed::Tracks(tracks) => {
+                    let input = match tracks.as_slice() {
+                        [name] => config.audio.as_ref().and_then(|a| {
+                            a.routes
+                                .iter()
+                                .find(|r| r.target_track.as_deref() == Some(name.as_str()))
+                                .map(|r| (name.clone(), r.input_id.clone()))
+                        }),
+                        _ => None,
+                    };
+                    let Some((name, input)) = input else {
+                        tracing::warn!(output = %xp.output, "output routing: persisted audio tracks cannot ride the routed slot; the output starts on follow");
+                        return None;
+                    };
+                    AudioChoice::Track { name, input }
+                }
+                // `follow` is what the run starts on.
+                _ => return None,
+            };
+            Some((xp.output, choice))
+        })
+        .collect()
+}
+
 /// Errors building or running the libav\* pipeline.
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
@@ -2153,6 +2194,10 @@ pub struct Pipeline {
     /// slice 1). Published off-clock when the egress starts; the control plane
     /// loads it lock-free to enqueue takes and read the routing snapshot.
     output_routing: crate::output_routing::OutputRoutingSlot,
+    /// Persisted non-`follow` output audio feeds `(output config id, choice)`
+    /// (ADR-0108 slice 2 §6.1): each run issues them as audio-only boot takes
+    /// right after its routing handle is published.
+    boot_audio_takes: Vec<(String, crate::routing_audio::AudioChoice)>,
     /// The running Program's lateness histogram + repeats counter (ADR-0108
     /// §10), published at run start for the control plane's metrics route.
     program_metrics: ProgramMetricsSlot,
@@ -3231,6 +3276,7 @@ impl Pipeline {
             program_audio_preview: None,
             window_subscriptions: crate::output_window_registry::window_subscription_slot(),
             output_routing: crate::output_routing::output_routing_slot(),
+            boot_audio_takes: boot_audio_choices(config),
             program_metrics: Arc::new(multiview_framestore::SwapCell::empty()),
             optional_preview: None,
             window_dependencies: Arc::new(window_dependency_axes(config)),
@@ -3513,6 +3559,51 @@ impl Pipeline {
             preview_selection,
             aux,
         })
+    }
+
+    /// Issue one audio-only take per output whose persisted audio feed is not
+    /// `follow` (ADR-0108 slice 2 §6.1), onto the handle
+    /// [`Self::build_output_routing`] just published. The consumer drains them
+    /// on its first ticks. An audio-only take has no fresh gate, so there is
+    /// no retry: a take that cannot be enqueued, or that the engine refuses
+    /// (an output without a program-audio slot), is logged and the persisted
+    /// value stays. Never blocks (bounded `try_send`).
+    fn issue_boot_audio_takes(&self) {
+        if self.boot_audio_takes.is_empty() {
+            return;
+        }
+        let Some(handle) = self.output_routing.load() else {
+            return;
+        };
+        for (output, choice) in &self.boot_audio_takes {
+            let Some(index) = handle.index_of(output) else {
+                tracing::warn!(%output, "output routing: boot audio take for an output this run does not route");
+                continue;
+            };
+            if !handle.outputs().get(index).is_some_and(|o| o.program_audio) {
+                tracing::warn!(%output, audio = %choice.label(), "output routing: this output cannot carry a routed audio feed; it starts on follow");
+                continue;
+            }
+            let take = crate::output_routing::OutputTake {
+                operation_id: format!("boot-audio:{output}"),
+                output_index: index,
+                bus: None,
+                audio: Some(choice.clone()),
+                principal: "boot".to_owned(),
+            };
+            if handle.try_take(take).is_err() {
+                tracing::warn!(%output, "output routing: boot audio take not enqueued; it starts on follow");
+            }
+        }
+    }
+
+    /// Test seam: the boot audio takes parsed from the config (the stream
+    /// test harness renames its bindings `test-sink-N`, so a test re-keys them).
+    #[cfg(test)]
+    pub(crate) fn boot_audio_takes_mut(
+        &mut self,
+    ) -> &mut Vec<(String, crate::routing_audio::AudioChoice)> {
+        &mut self.boot_audio_takes
     }
 
     /// Every catalogued source's frame store, keyed by id.
@@ -4852,6 +4943,7 @@ impl Pipeline {
         // until a take routes a feed), the off-clock `routing-aux` thread (it
         // blocks on recv while nothing is routed), and the consumer's router.
         let routing = self.build_output_routing(&binding_ids, &enforced_audio_tracks)?;
+        self.issue_boot_audio_takes();
         let RunRouting {
             consumer: consumer_routing,
             aux_tx,
