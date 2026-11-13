@@ -545,6 +545,10 @@ impl AcmeEngine {
         let name = store::account_file_name(&self.directory_url)?;
         let dir = self.config.state_dir.clone();
         // A permission/ownership problem stays a hard error (read_private).
+        // An unparseable file (truncated, emptied, corrupt) is left exactly
+        // where it is until a NEW account has been registered: a failed
+        // registration loses nothing and the next attempt sees the same file.
+        let mut unreadable: Option<zeroize::Zeroizing<Vec<u8>>> = None;
         if let Some(raw) = store::read_private(&dir, &name)? {
             let raw = zeroize::Zeroizing::new(raw);
             if let Ok(credentials) = serde_json::from_slice::<AccountCredentials>(&raw) {
@@ -553,13 +557,7 @@ impl AcmeEngine {
                     .await
                     .map_err(|e| acme_category(&e, AcmeError::Authority));
             }
-            // Unparseable (truncated, emptied, corrupt): keep it aside for the
-            // operator and register a fresh account, as the runbook promises.
-            let aside = store::quarantine_private(&dir, &name)?;
-            tracing::warn!(
-                file = %aside,
-                "acme: the stored account file was unreadable; kept aside, registering a new account"
-            );
+            unreadable = Some(raw);
         }
         let eab = self.eab()?;
         let contact = self
@@ -580,6 +578,15 @@ impl AcmeEngine {
         let raw = zeroize::Zeroizing::new(
             serde_json::to_vec(&credentials).map_err(|_| AcmeError::Storage)?,
         );
+        if let Some(bad) = unreadable {
+            // Keep the old bytes for the operator (unique name, never
+            // overwritten, at most a few kept), then replace the file.
+            let aside = store::keep_aside(&dir, &name, &bad)?;
+            tracing::warn!(
+                file = %aside,
+                "acme: the stored account file was unreadable; kept aside, a new account is registered"
+            );
+        }
         store::write_private(&dir, &name, &raw)?;
         Ok(account)
     }

@@ -353,6 +353,26 @@ async fn tls_alpn01_issues_through_the_challenge_resolver() {
 async fn a_corrupt_account_file_is_kept_aside_and_replaced() {
     use std::os::unix::fs::PermissionsExt;
     let h = harness(CfAuth::Token("unused".into())).await;
+    // Round 2: a FAILED registration loses nothing. The EAB Pebble rejects
+    // an account without EAB: the corrupt file must stay as it was, with no
+    // copy aside and no replacement written.
+    let eab_dir = env("PEBBLE_EAB_DIRECTORY");
+    let eab_account = multiview_control::acme::store::account_file_name(&eab_dir).unwrap();
+    let eab_path = h.state_dir.join(&eab_account);
+    std::fs::write(&eab_path, b"{ truncated").unwrap();
+    std::fs::set_permissions(&eab_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let rejected = config(
+        &eab_dir,
+        &h.state_dir,
+        AcmeChallenge::TlsAlpn01,
+        &[format!("{}.{ZONE}", unique("acct-eab"))],
+    );
+    assert!(engine(&h, rejected, None).issue_once(None).await.is_err());
+    assert_eq!(std::fs::read(&eab_path).unwrap(), b"{ truncated");
+    assert!(!std::fs::read_dir(&h.state_dir)
+        .unwrap()
+        .filter_map(Result::ok)
+        .any(|e| e.file_name().to_string_lossy().contains(".bad-")));
     let listener = alpn_listener(h.resolver.clone()).await;
     let directory = env("PEBBLE_DIRECTORY");
     let account = multiview_control::acme::store::account_file_name(&directory).unwrap();

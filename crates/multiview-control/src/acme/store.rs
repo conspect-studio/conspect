@@ -165,24 +165,76 @@ pub fn read_owner_file(path: &Path) -> Result<Option<Vec<u8>>, AcmeError> {
     Ok(Some(data))
 }
 
-/// Rename `dir/name` to `dir/name.bad-<unix seconds>` (same directory, so the
-/// 0600 mode and owner stay) and fsync the directory. Returns the new name.
+/// Most `.bad-*` copies kept per file by [`keep_aside`]; older ones are removed.
+pub const MAX_ASIDE: usize = 4;
+
+/// Write `data` to a NEW file `dir/name.bad-<unix nanoseconds, 39 digits>`
+/// (0600, `O_EXCL`: an existing copy is never overwritten), fsync it and the
+/// directory, then keep only the newest [`MAX_ASIDE`] copies of `name`.
+/// Returns the new file name.
 ///
 /// # Errors
 /// [`AcmeError::Storage`] on an invalid name or an I/O failure.
-pub fn quarantine_private(dir: &Path, name: &str) -> Result<String, AcmeError> {
+pub fn keep_aside(dir: &Path, name: &str, data: &[u8]) -> Result<String, AcmeError> {
+    use std::os::unix::fs::OpenOptionsExt;
     plain_name(name)?;
     private_dir(dir)?;
-    let secs = std::time::SystemTime::now()
+    let prefix = format!("{name}.bad-");
+    // Never reuse a name, even one freed by pruning: the stamp is strictly
+    // greater than every existing copy's (nanoseconds, bumped past the newest).
+    let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| d.as_secs());
-    let aside = format!("{name}.bad-{secs}");
-    plain_name(&aside)?;
-    std::fs::rename(dir.join(name), dir.join(&aside)).map_err(|_| AcmeError::Storage)?;
+        .map_or(0, |d| d.as_nanos());
+    let newest = std::fs::read_dir(dir)
+        .map_err(|_| AcmeError::Storage)?
+        .filter_map(Result::ok)
+        .filter_map(|e| e.file_name().into_string().ok())
+        .filter_map(|f| f.strip_prefix(&prefix)?.parse::<u128>().ok())
+        .max();
+    let stamp = newest.map_or(now, |n| now.max(n.saturating_add(1)));
+    let mut created = None;
+    for n in 0..100_u128 {
+        let aside = format!("{prefix}{:039}", stamp.saturating_add(n));
+        plain_name(&aside)?;
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .custom_flags(libc_nofollow())
+            .open(dir.join(&aside))
+        {
+            Ok(mut file) => {
+                file.write_all(data).map_err(|_| AcmeError::Storage)?;
+                file.sync_all().map_err(|_| AcmeError::Storage)?;
+                created = Some(aside);
+                break;
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(_) => return Err(AcmeError::Storage),
+        }
+    }
+    let created = created.ok_or(AcmeError::Storage)?;
+    let mut copies: Vec<String> = std::fs::read_dir(dir)
+        .map_err(|_| AcmeError::Storage)?
+        .filter_map(Result::ok)
+        .filter_map(|e| e.file_name().into_string().ok())
+        .filter(|f| f.starts_with(&prefix))
+        .collect();
+    // Fixed-width, strictly increasing stamps: lexical order is age order.
+    copies.sort();
+    let excess = copies.len().saturating_sub(MAX_ASIDE);
+    for old in copies.iter().take(excess) {
+        let _ = std::fs::remove_file(dir.join(old));
+    }
     std::fs::File::open(dir)
         .and_then(|d| d.sync_all())
         .map_err(|_| AcmeError::Storage)?;
-    Ok(aside)
+    Ok(created)
+}
+
+/// `O_NOFOLLOW` for `OpenOptions::custom_flags`.
+fn libc_nofollow() -> i32 {
+    i32::try_from(rustix::fs::OFlags::NOFOLLOW.bits()).unwrap_or(0)
 }
 
 /// Remove `dir/name` if present (durably).
@@ -498,6 +550,34 @@ mod tests {
         // A pre-existing ancestor is left alone.
         let mode = std::fs::metadata(t.path()).unwrap().permissions().mode() & 0o777;
         assert_ne!(mode, 0, "tempdir untouched");
+    }
+
+    #[test]
+    fn keep_aside_never_overwrites_and_keeps_at_most_max_aside() {
+        let (_t, dir) = private_tmp();
+        let mut made = Vec::new();
+        for i in 0..(MAX_ASIDE + 3) {
+            made.push(keep_aside(&dir, "account.x-1.json", format!("v{i}").as_bytes()).unwrap());
+        }
+        let unique: std::collections::HashSet<_> = made.iter().collect();
+        assert_eq!(unique.len(), made.len(), "every copy has its own name");
+        let mut left: Vec<String> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|e| e.file_name().into_string().unwrap())
+            .filter(|f| f.starts_with("account.x-1.json.bad-"))
+            .collect();
+        left.sort();
+        assert_eq!(left.len(), MAX_ASIDE);
+        assert_eq!(left.last(), made.last(), "the newest copy is kept");
+        let newest = std::fs::read(dir.join(made.last().unwrap())).unwrap();
+        assert_eq!(newest, format!("v{}", MAX_ASIDE + 2).into_bytes());
+        let file_mode = std::fs::metadata(dir.join(made.last().unwrap()))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(file_mode, 0o600);
     }
 
     #[test]

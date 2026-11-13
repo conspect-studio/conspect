@@ -249,8 +249,10 @@ the alarm, the last error token and the reasons. If the engine is not running, i
   overwrites the file and triggers issuance. If the secret comes from the environment, update the
   service environment and restart.
 * **Lost or corrupt account key.** A missing account file, or one that does not parse, is replaced
-  automatically. An unreadable file is kept aside as `account.<directory-host>-<hash>.json.bad-<unix>`
-  and a new ACME account is registered on the next attempt (`multiview tls issue` to start it now).
+  automatically: once the CA has accepted a NEW account, the unreadable bytes are kept as
+  `account.<directory-host>-<hash>.json.bad-<unix ns>` (0600, the 4 newest kept) and the file is
+  replaced. If the registration fails, the file is left exactly as it was. `multiview tls issue`
+  starts an attempt now.
   To force a new account, stop the engine, delete `<state_dir>/account.<directory-host>-<hash>.json`
   and start it. A file with the wrong mode or owner is never replaced: fix it to 0600 and owned by
   the service user. With EAB, Google needs a fresh EAB key, because a key binds one account.
