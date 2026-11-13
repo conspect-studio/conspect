@@ -86,8 +86,12 @@ What is true on main (`1b59d254`), read from the code:
    When only the background changes and B is opaque, this reduces to today's
    incoming-tile-at-weight render, so lane `transitions` keeps its path. The second accumulator
    exists only while a key-changing transition is in flight. On the CPU it is a pooled band
-   buffer sized at attach; on the GPU it is a register. Tied DSKs ride the merge weight or mask
-   as a plain `over` of the DSK tile at that weight (a DSK is defined over the M/E output).
+   buffer sized at attach; on the GPU it is a register. Tied DSKs are `top` layers (a DSK is defined over the
+   M/E output) whose envelope follows the transition's direction. Going **on**, a tied DSK uses
+   MIX `p`, WIPE mask `m` in canvas coordinates, and DIP the incoming contribution `i` (0 until
+   the switch point). Going **off**, it uses MIX `1 − p`, WIPE `1 − m`, and DIP the outgoing
+   contribution `1 − d`. The state toggles on the terminal tick, where the envelope already
+   equals its end value, so there is no jump. `tie` stays set until it is cleared.
 
 3. **Per-tile coverage, computed in the kernel front half (ADR-0056 §4 and ADR-C007 domains).**
    Each source's alpha is used once:
@@ -155,18 +159,34 @@ What is true on main (`1b59d254`), read from the code:
      advances while the other is held.
    - The pair is released when the keyer goes off.
 
-8. **Pre-DSK Clean is composed off the clock, on the `routing-aux` thread.**
-   - While a DSK is defined and an output selects Clean, Clean becomes an aux-composed bus.
-   - Each tick the hook writes a fixed-size, `Copy` render descriptor into a preallocated
-     4-slot seqlock ring (no allocation, wait-free for the writer). The descriptor holds store
-     indices, weights, rects, key parameters, group and merge parameters for every non-DSK tile.
-   - The aux thread reads tick T's descriptor and the stores at `T.pts`: the same frames, by the
-     rule in output-routing.md §2.3. It composes with the run backend at `nice +10`.
-   - Under load the aux drop and hold rules apply (output-routing.md §2.3, §4.4): Clean holds
-     last-good and is counted.
-   - With no DSK defined, Clean stays the zero-cost Program alias of today.
-   - The Program compose and publish never include Clean work. GPU queue sharing is covered by
-     the existing slice-3 gate.
+8. **Pre-DSK Clean is composed off the clock, from the exact images Program used.**
+   - **When it runs:** while a DSK is defined and an output selects Clean, Clean is an
+     aux-composed bus. With no DSK defined, Clean stays the zero-cost Program alias of today.
+   - **Hand-off:** each tick the hook fills one slot of a preallocated 4-slot hand-off ring, which
+     it writes only while that pair of conditions holds. A slot holds a fixed-size `Copy`
+     descriptor of the non-DSK tiles (rects, opacity, weights, key parameters, groups, merge
+     parameters). It also holds a fixed array of up to 16 `Option<Arc<Nv12Image>>` with **the
+     exact images Program resolved for those tiles**: held frames, frozen last-good pairs and
+     slates included. No store is read again, so pruning, reconnects or aux lag can never make
+     Clean differ from Program.
+   - **Slot hand-off is lock-free and allocation-free.** Each slot has a state word
+     (`free → writing → ready → reading → free`) and is claimed with compare-and-swap.
+     - The clock writes only a `free` slot. If none is free, it skips Clean for that tick
+       (counted) and never waits.
+     - Filling a slot clones `Arc`s, which is a refcount increment. Dropping a stale slot's
+       `Arc`s happens on the aux thread when it frees the slot.
+     - Image retention is bounded at 4 slots × 16 images.
+   - **Composition:** the `routing-aux` thread (`nice +10`) composes with **its own GPU
+     compositor instance**, with its own surface pool, scratch and readback buffers, on the
+     admitted device. It never uses Program's `RunBackend`, so the surface-pool lock that Program
+     holds through compose and readback (`gpu/compositor.rs:311-348`) is never shared.
+   - **No GPU:** the integer aux path cannot draw alpha (`aux_layout.rs`). Pre-DSK Clean
+     therefore requires the GPU backend and is refused at plan time with `clean-needs-gpu`
+     otherwise.
+   - **Under load** the aux drop, hold and degrade rules apply (output-routing.md §2.3, §4.4).
+     Clean holds last-good and the drop is counted.
+   - **GPU queue sharing** with Program is covered by the existing slice-3 hard gate, and the
+     item 12 acceptance run includes Clean.
 
 9. **Admission is reserved when a keyer is defined, at its worst case (invariant #9).**
    - Every *defined* keyer reserves its cost whether on air or not: off keyers keep their sources
@@ -175,12 +195,25 @@ What is true on main (`1b59d254`), read from the code:
    - Cost per keyer, in canvas folds:
      `fold × dst_area/canvas_area + u × (fill_px + key_px)/canvas_px`.
      - `fold` is 2 for USKs (folded twice during a key-changing transition) and 1 for DSKs.
-     - `u` is the upload weight. Upload cost depends on source size, not fly size.
+     - `u` is the upload weight. `fill_px` and `key_px` are the declared `max_source` areas: upload
+       cost depends on source size, not fly size.
    - `switcher.keyer_budget` caps the sum. Hard limits: 4 USKs per M/E and 2 DSKs per program.
    - `keyer_set` that raises a cost is admitted against the remaining budget. Boot validation
      refuses a document whose keyers exceed it.
-   - Clean reserves one aux canvas (`routing.max_aux_canvases`) at the routing take when the
-     program has a DSK defined.
+   - **Clean's aux canvas is one reservation tied to a pair of facts.** It is needed exactly when
+     a DSK is defined *and* Clean has at least one subscriber. Whichever change makes both true
+     reserves it atomically, or is refused (409 `capacity`):
+     - a routing take to Clean while a DSK exists;
+     - the first DSK definition while Clean is routed (`keyer_set`, config apply, boot
+       validation).
+     The reservation is shared by all Clean subscribers and released when either fact stops
+     being true.
+   - **Source size envelope.** Each keyer reserves upload and texture memory for a declared
+     maximum source size: `max_source = {w, h}`, which defaults to the canvas size and must fit
+     the device's texture limits. A fill or key frame larger than the envelope is not uploaded.
+     The keyer treats that tick as a non-live read (it draws its last-good pair, then the loss
+     policy applies) and counts `keyer_oversize_frames`. Raising `max_source` is a `keyer_set`
+     admitted like any other cost increase. Pools therefore never grow past the reservation.
    - A fill or key that is not already running is charged as +1 decode under the patch panel's
      decode rule (ADR-0110 §10).
    - `u`, `fold` and the default budget come from the K1 bench and the mda001 run (item 12).
@@ -257,6 +290,8 @@ What is true on main (`1b59d254`), read from the code:
 | Flat `over` of armed keys at the transition weight | Not exact: an opaque key at p = 0.5 leaves 0.25·A + 0.25·B under it (review finding). |
 | Pre-render each scene to an intermediate canvas | Two extra composites and one NV12 generation per tick during every transition. The two-accumulator merge is exact at a fraction of the cost. |
 | Pre-DSK Clean as a second backend call on the clock | Compose finishes before Program is published (`runtime.rs:1083-1091`), and the GPU readback has no deadline (#395). It would delay Program. |
+| Aux Clean that re-reads stores at `T.pts` | Stores prune below the latest reader and fall back to a newer frame (output-routing.md §2.3); a frozen last-good pair or a slate cannot be reproduced. Clean would silently differ from Program. |
+| Aux Clean on Program's `RunBackend` | The GPU compositor holds its surface-pool lock through compose and readback; a stalled aux call would block Program. |
 | Admission when a keyer goes on air | Clean selection, key-changing transitions, edits and boot can raise the cost after admission, and an on-air key cannot be shed. |
 | `in:<n>` as a keyer fill | A re-patch would change what is keyed without a keyer authorization. |
 | `dve_pip` as its own key type | It forbids flying a keyed or alpha fill. |
@@ -264,7 +299,8 @@ What is true on main (`1b59d254`), read from the code:
 
 ## Consequences
 
-- **#1:** keyer runtime, last-good pairs, pending slots, the descriptor ring and tally arrays are
+- **#1:** keyer runtime, last-good pairs, pending slots, the Clean hand-off ring (4 slots, `Arc`
+  refcount increments only, a full ring skips Clean) and tally arrays are
   fixed-size and allocated at attach. The second accumulator is pooled. Store reads are
   lock-free. The existing per-tick `Vec<Tile>` (`drive.rs:645-652`) and the `LatestSlot` publish
   are today's baseline. K1–K3 add no new allocation per tick, measured with a counting

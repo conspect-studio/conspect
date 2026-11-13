@@ -41,6 +41,7 @@ gain = 4.0                             # luma: >= 0
 invert = false
 mask = { x = 0, y = 0, w = 1920, h = 1080 }   # fill-source pixels; optional
 fly = { x = 1280, y = 60, w = 576, h = 324 }  # canvas pixels, even, >= 16; optional = full canvas
+max_source = { w = 1920, h = 1080 }    # admitted source envelope; default = canvas size
 z = 1                                  # order among USKs
 loss = "drop_to_off_air"               # | "hold_last_good" (ADR-R011 §3)
 loss_trigger = "reconnecting"          # | "stale" | "no_signal"
@@ -125,8 +126,10 @@ Merge, per pixel, after the last grouped layer: MIX `lerp(out, in, p)`; WIPE
 `lerp(out, in, m(x, y))` with the wipe mask of lane `transitions`; DIP
 `lerp(lerp(out, colour, d), in, i)` with `dip_weights`. All of this is in premultiplied linear
 light, so it is exact. Then the `top` layers fold with `over`, exactly as before (`over` is
-linear in what lies beneath). A tied DSK is a `top` layer whose weight is the merge weight, or,
-for WIPE, which takes the wipe mask on its own tile.
+linear in what lies beneath). A tied DSK is a `top` layer with a direction-aware envelope: going **on**,
+MIX `p`, WIPE `m(x, y)` (canvas coordinates) and DIP `i` (0 until the switch point); going
+**off**, MIX `1 − p`, WIPE `1 − m(x, y)` and DIP `1 − d`. Its state toggles on the terminal tick,
+where the envelope already equals its end value.
 
 When nothing but the background changes and B is opaque, the merge equals today's "incoming
 tile at weight p". Lane `transitions` and the steady state therefore keep the single-accumulator
@@ -153,7 +156,7 @@ Layer count: at most 1 Program cell + 3 transition tiles + 6 keyers × 2 (fill, 
 | Event | USK (armed) | USK (not armed, on air) | DSK tied | DSK not tied |
 | --- | --- | --- | --- | --- |
 | CUT | flips on the CUT tick | stays | flips on the CUT tick | unchanged |
-| AUTO MIX / DIP / WIPE | group `in` (going on) or `out` (going off), merged exactly (§3.2) | `both` or `top` | `top` at the merge weight or wipe mask | unchanged |
+| AUTO MIX / DIP / WIPE | group `in` (going on) or `out` (going off), merged exactly (§3.2) | `both` or `top` | `top`, direction-aware envelope (§3.2) | unchanged |
 | Key-only transition (background not armed) | selected type and rate; DIP draws as MIX | `both` or `top` | — | — |
 | `keyer_cut` | — (USKs change via `arm` + CUT or AUTO) | — | flips at the next tick | flips at the next tick |
 | `keyer_auto` | — | — | ramps over its rate | ramps over its rate |
@@ -206,29 +209,45 @@ K1 measures, and the default budget waits on the mda001 run (§11.8).
 | Pre-DSK Clean | one aux canvas on `routing-aux` while selected and a DSK is defined | output-routing.md §2.3 |
 | Memory | no new image pools; last-good pairs are 2 `Arc`s per keyer; the key params buffer is grow-only | design |
 
-## 6. Clean (pre-DSK), composed off the clock
+## 6. Clean (pre-DSK), composed off the clock from Program's own images
 
 Clean is Program before the monitoring bake (ADR-0108 §2.5). Once a DSK is defined it needs its
-own picture. A second backend call inside `compose` would delay Program, because compose finishes
-before Program is published (`crates/multiview-engine/src/runtime.rs:1083-1091`) and the GPU
-readback waits without a deadline (`gpu/compositor.rs:1211`, #395). So Clean moves to the aux
-thread:
+own picture. Three facts rule out the obvious designs:
 
-- **Descriptor.** Each tick, after building its tile list, the hook writes a fixed-size `Copy`
-  descriptor of the non-DSK tiles into a preallocated 4-slot seqlock ring, keyed by tick index.
-  The descriptor holds store indices, rects, opacity, weights, key parameters, groups and merge
-  parameters. The writer is wait-free and allocation-free, and it writes nothing while no output
-  selects Clean (one cached `AtomicBool` that the router sets).
-- **Compose.** The `routing-aux` thread (`nice +10`) reads tick T's descriptor. A torn or
-  overwritten slot is treated as a dropped tick. It reads the stores at `T.pts`, which gives the
-  same frames Program used (output-routing.md §2.3), composes with the run backend, and
-  publishes Clean.
-- **Under load** the aux rules apply: drop at the capacity-4 channel, hold last-good, counted,
-  `routing.degraded` after 60 held ticks, and the cadence halves when Program p99 passes half a
-  tick.
+- A second backend call inside `compose` would delay Program. Compose finishes before Program is
+  published (`crates/multiview-engine/src/runtime.rs:1083-1091`), and the GPU readback waits with
+  no deadline (`gpu/compositor.rs:1211`, #395).
+- Re-reading stores on another thread does not give Program's frames. Stores prune below the
+  latest reader and fall back to a newer frame (output-routing.md §2.3). A frozen last-good pair
+  or a slate cannot be reproduced at all.
+- Program's GPU compositor holds its surface-pool lock through compose and readback
+  (`gpu/compositor.rs:311-348`).
+
+So:
+
+- **Hand-off ring.** 4 slots, preallocated at attach. Each slot holds a fixed-size `Copy`
+  descriptor of the non-DSK tiles (rects, opacity, weights, key parameters, groups, merge) and a
+  fixed `[Option<Arc<Nv12Image>>; 16]` with the **exact images Program resolved** for them. That
+  includes held frames, frozen pairs and slates. Each slot has an atomic state,
+  `free → writing → ready → reading → free`, moved by compare-and-swap:
+  - The clock thread claims a `free` slot, clones the `Arc`s (refcount increments, no
+    allocation) and marks it `ready` with its tick index.
+  - If no slot is free, it skips Clean for that tick (`clean_skipped`) and never waits.
+  - The aux thread takes the oldest `ready` slot, composes, publishes Clean for that tick, and
+    drops the `Arc`s as it frees the slot.
+  - Image retention is bounded at 64 `Arc`s.
+- **The ring is written only while needed:** a DSK is defined and Clean has a subscriber (one
+  cached `AtomicBool`).
+- **An independent GPU compositor on the aux thread.** It has its own surface pool, scratch and
+  readback buffers on the admitted device, so Program's `RunBackend` and its locks are never
+  shared. The integer aux path cannot draw alpha (`aux_layout.rs`), so pre-DSK Clean needs the
+  GPU backend. Without it, the routing plan refuses Clean with `clean-needs-gpu` while a DSK is
+  defined.
+- **Under load** the aux rules apply: drop at the capacity-4 channel, hold last-good (counted),
+  `routing.degraded` after 60 held ticks, and halved cadence when Program p99 passes half a tick.
 - **No DSK defined:** Clean stays the zero-cost Program alias of today.
-- **GPU queue sharing** with Program is covered by the existing slice-3 hard gate
-  (output-routing.md §2.3); the §11.8 acceptance run includes Clean.
+- **GPU queue sharing** with Program is covered by the existing slice-3 hard gate; the §11.8
+  acceptance run includes Clean.
 
 ## 7. Admission (invariant #9): reserved at definition
 
@@ -236,7 +255,7 @@ thread:
   and mask in bounds, rate 1..=300, and the 64-layer bound.
 - **Cost of a defined keyer** (whether on air or not), in canvas folds:
   `fold × dst_area / canvas_area + u × (fill_px + key_px) / canvas_px`, with `fold` = 2 for a
-  USK and 1 for a DSK. `u` and `fold` are calibrated in K1. The sum is capped by
+  USK and 1 for a DSK, and `fill_px`/`key_px` the `max_source` areas. `u` and `fold` are calibrated in K1. The sum is capped by
   `switcher.keyer_budget`.
 - **Why reserve at definition:** off keyers keep decoders warm, and no later event (going on
   air, a key-changing transition, a Clean selection, an edit or a boot) may exceed the budget,
@@ -245,7 +264,20 @@ thread:
   - `keyer_set` checks raised costs against the remaining budget.
   - Boot validation refuses a document over budget.
   - A fill or key that is not running is charged +1 decode by the ADR-0110 decode rule.
-  - A routing take to Clean with a DSK defined reserves one aux canvas (`routing.max_aux_canvases`).
+  - **Clean's aux canvas.** One reservation is needed exactly while (a DSK is defined) and
+    (Clean has a subscriber). Whichever change makes both true reserves it atomically or is
+    refused with 409 `capacity`:
+    - a routing take to Clean;
+    - the first `keyer_set` that defines a DSK;
+    - a config apply;
+    - boot validation.
+    All Clean subscribers share it. It is released when either fact stops being true. Tests
+    cover both orders with capacity exhausted.
+  - **Source size envelope.** Each keyer declares `max_source = {w, h}` (default: the canvas
+    size, within device texture limits). Upload and texture memory are reserved for it. A fill
+    or key frame above the envelope is not uploaded: the keyer treats the tick as a non-live
+    read (last-good pair, then the loss policy) and counts `keyer_oversize_frames`. Raising
+    `max_source` is an admitted `keyer_set`. Pools never grow past the reservation.
   - A refused `keyer_set` releases every reservation and lease it took (make-before-break,
     released on refusal or deadline).
 - **Default budget:** until the mda001 run (§11.8) passes, it admits 1 DSK at full canvas only.
@@ -268,7 +300,7 @@ All on the existing switcher routes. Each command is a plan and command pair wit
 | `keyer_cut` | `{me, program, keyer, on: bool}` | DSK, or a USK outside a transition |
 | `keyer_auto` | `{me, program, keyer, on, duration_frames?}` | DSK only, 1..=300 frames |
 | `keyer_tie` | `{me, program, keyer, tie: bool}` | DSK only |
-| `keyer_set` | `{me, program, keyer, fill?, key?, type?, clip?, gain?, invert?, mask?, fly?, rate?, loss?, on_air?: "allow"}` | Class-1 at one tick; persisted after `applied`; changing the fill or key of an on-air keyer needs `on_air = "allow"`, else 409 `on-air-protected` |
+| `keyer_set` | `{me, program, keyer, fill?, key?, type?, clip?, gain?, invert?, mask?, fly?, max_source?, rate?, loss?, on_air?: "allow"}` | Class-1 at one tick; persisted after `applied`; changing the fill or key of an on-air keyer needs `on_air = "allow"`, else 409 `on-air-protected` |
 
 Fill and key are **source ids only**. Mixer inputs (`in:<n>`) are refused (422), so a re-patch
 can never change what a keyer shows behind its authorization.
@@ -372,9 +404,17 @@ Per slice; each item names its slice.
      or keyer-less frames as §7 says, and the next tick's lateness is recorded.
    - A counting global allocator over 10 000 ticks of ramping keyers and key-changing
      transitions, compared with the no-keyer baseline: no new allocations per tick.
-6. **Clean (K2).** With a DSK on and Clean selected, Clean has no DSK pixels and Program does.
-   Clean at tick T is composed from tick T's descriptor and the same frames. With no Clean
-   subscriber, the ring is never written.
+6. **Clean (K2).**
+   - With a DSK on and Clean selected, Clean has no DSK pixels and Program does.
+   - Clean at tick T equals Program's non-DSK composite at T, built from the same `Arc`s, under:
+     - a late publication and a source reconnect between the Program tick and the aux compose;
+     - an aux thread lagging 3 ticks;
+     - fill-only and key-only loss with a frozen pair;
+     - a slate.
+   - A full ring skips Clean and Program never waits.
+   - A stalled aux thread that holds its own compositor lock does not delay Program.
+   - With no Clean subscriber or no DSK, the ring is never written.
+   - Oversize fill and key frames are not uploaded and are counted.
 7. **API (K4).**
    - Per-object authorization on every id, on plan and command.
    - Row filtering and redaction: GET against events for a scoped principal.
@@ -384,6 +424,8 @@ Per slice; each item names its slice.
    - 409 `on-air-protected`, idempotent replay, persistence after `applied`, and a restart with
      keyers off.
    - A repeated failed `keyer_set` leaves no lease and no reservation.
+   - Clean's aux reservation in both activation orders with capacity exhausted, and `max_source`
+     raise admission.
 8. **mda001 acceptance (after K5; run by the lead).** The Program protection bound
    (output-routing.md §10) over 10 minutes at the admitted maximum budget, against the same 10
    minutes with no keyers:
@@ -404,7 +446,7 @@ data plane). K5 is R2.
 | Slice | Scope | Depends on |
 | --- | --- | --- |
 | K1 (#386) | Compositor: per-tile coverage (luma, linear, key source with its own params, mask, weight), independent fill and key sampling, the group tag and two-accumulator merge, CPU oracle then GPU, bench and calibration | — |
-| K2 (#387) | Engine: typed DSK config, keyer runtime, DSK CUT/AUTO/TIE (TIE on CUT and MIX), fresh gate, last-good pair and loss policy, `keyer` demand class, engine-side admission reserved at definition (so K2 is safe on its own), pre-DSK Clean on the aux thread, engine tally, chaos tests | K1, #395 for GPU keyers |
+| K2 (#387) | Engine: typed DSK config, keyer runtime, DSK CUT/AUTO/TIE (TIE on CUT and MIX), fresh gate, last-good pair and loss policy, `keyer` demand class, engine-side admission reserved at definition (so K2 is safe on its own), pre-DSK Clean on the aux thread (hand-off ring, own GPU compositor), engine tally, chaos tests | K1, #395 for GPU keyers |
 | K3 (#388) | USKs and transitions: arm set, groups for key-changing MIX/DIP/WIPE, key-only transitions, tied DSKs on DIP/WIPE | K2, lane `transitions` DIP and WIPE |
 | K4 (#389) | Control API: verbs, plan with scoped visibility, BOLA row filtering and redaction, persistence after `applied`, OpenAPI/AsyncAPI | K2 (K3 for `arm`) |
 | K5 (#390) | Desk: keyer strip, DSK controls, keyer panel, key tally on the wall | K4 |
