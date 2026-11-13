@@ -45,6 +45,8 @@ rustls = { version = "0.23", default-features = false, features = ["std", "ring"
 # Compile-level proof that a `WtSession` plugs into moq-net through the
 # moq-tokio async->poll adapter (and the MoQ handshake test).
 moq-tokio = { version = "=0.19.34", default-features = false, features = ["noq", "ring"] }
+url = "2"
+http-body-util = "0.1"
 
 [lints]
 workspace = true

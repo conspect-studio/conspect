@@ -768,7 +768,7 @@ impl RecvStream {
 
     /// The QUIC stream and any pushed-back bytes, for a WebTransport stream
     /// leaving h3. The guard is dropped with it.
-    pub(crate) fn into_raw(mut self) -> (Option<noq::RecvStream>, Option<Bytes>) {
+    pub fn into_raw(mut self) -> (Option<noq::RecvStream>, Option<Bytes>) {
         self.fin = true;
         (self.stream.take(), self.prefix.take())
     }
