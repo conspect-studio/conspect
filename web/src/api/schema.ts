@@ -2194,7 +2194,10 @@ export interface paths {
         };
         get?: never;
         put?: never;
-        /** Plan 1..64 mixer crosspoints: path, on-air flag and refusals; no change. */
+        /**
+         * Plan 1..64 mixer crosspoints (path, on-air flag, refusals) or the slots of
+         *     one output (§12.4 path P1/P2/P3 and cost); no change.
+         */
         post: operations["plan_patch"];
         delete?: never;
         options?: never;
@@ -2211,7 +2214,12 @@ export interface paths {
         };
         get?: never;
         put?: never;
-        /** Take 1..64 mixer crosspoints atomically at one engine tick. */
+        /**
+         * Take 1..64 mixer crosspoints atomically at one engine tick, or one
+         *     output's video slot 0 (+ audio slot 0 follow) through the same machinery
+         *     as `POST /routing/output/take` (the slot-0 alias; shared idempotency
+         *     store and limits; the outcome rides `route.output`).
+         */
         post: operations["take_patch"];
         delete?: never;
         options?: never;
@@ -6690,11 +6698,11 @@ export interface components {
             input?: number | null;
             /** @description M/E id (`me1`). */
             mixer?: string | null;
-            /** @description Output id (output slots arrive in a later slice; refused here). */
+            /** @description Output API id (an output slot destination, with `slot`). */
             output?: string | null;
             /**
              * Format: int32
-             * @description Output slot index (later slice).
+             * @description Output slot index: video and audio slot 0 in this release.
              */
             slot?: number | null;
         };
@@ -6837,11 +6845,15 @@ export interface components {
         PipelineStage: "decode" | "composite" | "encode";
         /** @description One planned crosspoint. */
         PlannedCrosspoint: {
+            cost?: null | components["schemas"]["SlotCost"];
             /** @description The destination as requested. */
             destination: components["schemas"]["PatchDestination"];
-            /** @description Whether the destination input is on Program now. */
+            /** @description Whether the destination input is on Program now (mixer inputs). */
             on_air: boolean;
-            /** @description The path this crosspoint takes (`mixer-input`). */
+            /**
+             * @description The path this crosspoint takes: `mixer-input`, `P1`, `P2`, `P3`
+             *     (§12.4), or `follow` (an audio slot riding the video take).
+             */
             path: string;
             refusal?: null | components["schemas"]["PatchRefusal"];
         };
@@ -7701,6 +7713,26 @@ export interface components {
              * @description The one-time setup code (8 words) printed on the host.
              */
             code: string;
+        };
+        /** @description The cost of an output-slot crosspoint (§12.4, §12.10). */
+        SlotCost: {
+            /**
+             * Format: int32
+             * @description `1` when a P3 needs a convert whose (picture, format) feed is not
+             *     live yet, else `0`.
+             */
+            converts: number;
+            /** @description Whether the take fits the encoder budget now. */
+            fits: boolean;
+            /**
+             * Format: int32
+             * @description `0` (P1: an encoded bus already carries it) or `1`.
+             */
+            new_encoders: number;
+            /** @description Live-opened encoder sessions in use (whole-system principals only). */
+            sessions_in_use?: number | null;
+            /** @description The session limit (whole-system principals only). */
+            sessions_max?: number | null;
         };
         /**
          * @description The `202 Accepted` body of `POST /api/v1/diagnostics/snapshot`: the id to read
@@ -15451,7 +15483,7 @@ export interface operations {
         };
         requestBody?: never;
         responses: {
-            /** @description `{ mixer: [ { me, inputs: [ { number, label, video: {source}|{redacted:true}|null, on_program, on_preview } ], inputs_version, tick } ] }` from the engine's live readback; a mixer the caller cannot read (M/E object + Program scope) is omitted, and a source it cannot read is `{"redacted": true}`. */
+            /** @description `{ mixer: [ { me, inputs: [ { number, label, video: {source}|{redacted:true}|null, on_program, on_preview } ], inputs_version, tick } ], outputs: [ { output, format: {width,height,fit,…}|null, video: [ { slot: 0, source: {source}|{bus}|{redacted:true}, path: P1|P2|P3, pending: {source, held_ticks}|null, degraded } ], audio: [ { slot, track, language, source: "follow" } ] } ] }` from the engine's live readback; a mixer the caller cannot read (M/E object + Program scope) is omitted, an output it does not pass the output axis for is omitted, and a source it cannot read is `{"redacted": true}`. */
             200: {
                 headers: {
                     [name: string]: unknown;
@@ -15501,7 +15533,7 @@ export interface operations {
                     "application/json": components["schemas"]["PatchPlan"];
                 };
             };
-            /** @description Not authorized for a destination (M/E object + Program scope) or a source. */
+            /** @description Not authorized for a destination (M/E object + Program scope; an output: object + output axis) or a source. */
             403: {
                 headers: {
                     [name: string]: unknown;
@@ -15510,7 +15542,16 @@ export interface operations {
                     "application/json": components["schemas"]["Problem"];
                 };
             };
-            /** @description `switcher-unavailable`. */
+            /** @description Unknown output. */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description `switcher-unavailable` or `routing-unavailable`. */
             409: {
                 headers: {
                     [name: string]: unknown;
@@ -15519,7 +15560,7 @@ export interface operations {
                     "application/json": components["schemas"]["Problem"];
                 };
             };
-            /** @description `slot-medium-mismatch`, `unknown-slot`, `unknown-source`, or not 1..=64 crosspoints. */
+            /** @description `slot-medium-mismatch` (an audio slot other than slot 0 follow, a subtitle slot), `unknown-slot` (video slot >= 1, two outputs, or mixer + output: multi-destination sets arrive with patch salvos #308), `unknown-source` (a layout, #306), or not 1..=64 crosspoints. */
             422: {
                 headers: {
                     [name: string]: unknown;
@@ -15563,7 +15604,16 @@ export interface operations {
                     "application/json": components["schemas"]["Problem"];
                 };
             };
-            /** @description `on-air-protected` (the input on Program under `protect`, or the Program/Preview input during an AUTO), `switcher-unavailable`, or no source lease. */
+            /** @description Unknown output. */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description `on-air-protected` (the input on Program under `protect`, or the Program/Preview input during an AUTO), `switcher-unavailable`, `routing-unavailable`, `switcher-required`, `output-kind-unroutable`, `capacity`, or no source lease. */
             409: {
                 headers: {
                     [name: string]: unknown;
