@@ -1686,6 +1686,25 @@ new init/catalog. The patch on the output's slots survives a reset when the new 
 crosspoints to removed slots are dropped and named in the response. Program, the mixer and every
 other output are untouched; the plan states "resets output hls-1 (about N s)".
 
+**As built in slice B (#342, part B1).** The config lives in `multiview-config::output_format`.
+Slots are declared under `[[outputs.slots.video]]` / `[[outputs.slots.audio]]`, not
+`[[outputs.video]]` / `[[outputs.audio]]`: `[outputs.audio]` is already the ADR-R005 audio
+*selection* table, and TOML cannot make one key both a table and an array of tables. Declaring both
+`audio` and `slots.audio` is refused. With `slots.audio`, the output's effective selection
+(`Output::effective_audio`) is: slot 0 = the program mix (it names no `track`), slot `i > 0` = a
+declared discrete track (`[audio]` route `target_track`). An audio slot's `channels` /
+`sample_rate` / `codec`, when given, must be 2 / 48000 / `aac` (one AAC grid). A video slot carries
+`codec` and `bitrate_kbps` (default: the output's `codec`, 4000 kbit/s); `settings = {…}` (#216)
+comes later. `fit.anchor` is one of `center`, `top`, `bottom`, `left`, `right`, `top_left`,
+`top_right`, `bottom_left`, `bottom_right`. Validation reports a typed message prefix:
+`slot-medium-mismatch:` (more slots than `Output::slot_capability()` allows, a codec on a raw
+output, a video slot on `aes67`) or `slot-format-unsupported:` (a codec the medium does not carry,
+fps ≠ Program (slice C, #343), `tff`/`bff`, colour ≠ canvas (#310), pixel format ≠ canvas, an
+anamorphic `aspect`, a size that is odd, outside 16..=8192 or above 3840×2160 in area, or a
+non-canvas format on a kind slice B does not convert for: `webrtc`, `whip_push`, `ndi`, `display`,
+`aes67`, `rtsp_server`). Only an explicitly declared slot codec is checked. Absent `format` and
+`slots` give exactly the previous behaviour and serialization.
+
 ### 12.4 The cheapest path per crosspoint
 
 For every crosspoint the engine computes a path; the plan shows it, and `GET /patch` reports it per slot.
@@ -1727,6 +1746,23 @@ For every crosspoint the engine computes a path; the plan shows it, and `GET /pa
 
 Totals: 1 demux, 1 decode, 1 convert, 2 encodes. If a fourth output D equals C's format and
 settings, D is P1 (+0).
+
+**As built in slice B (#342, part B1, boot path).** A base (Program) rendition key is
+(codec, width, height, bit rate, fit). Outputs with equal format and slot-0 settings share one
+encoder (P1); others get their own. A base key whose format is not the canvas wraps its encoder in
+a `FormatConvert` (`crates/multiview-cli/src/format_convert.rs`). The convert runs on that key's
+worker thread, never on the bake consumer or the clock; it uses `fit_rects` + `blit_region`
+(integer, even-aligned, 2×2 box) into a bounded ring of 4 buffers, keeps the canvas colour tag,
+and repeats its last picture rather than waiting. Keys at one format share a wait-free `SwapCell`
+cache of the newest converted picture (a race may convert twice, never waits), so there is one
+convert per (picture, format). A format equal to the canvas size with the default fit is
+normalised away: it is the unchanged zero-copy path.
+Routed feeds: `AuxFeed` is keyed (picture bus, format). The aux thread composes a source/PVW tile
+directly at the output's format with its fit, and a tile already at the format passes as the same
+`Arc`. Program/Clean on a dynamic key at a non-canvas format are converted on that key's worker.
+Dynamic keys stay (bus, settings index); the settings index is the output's base key, so it already
+names (format, codec settings), and the encoded bus is keyed (picture, format, settings). A
+formatted output falls back to its own base key (Program at its format).
 
 ### 12.5 Passthrough and invariant #1
 
