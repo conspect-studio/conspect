@@ -130,6 +130,11 @@ fn keys() -> ApiKeyStore {
         },
     );
     keys.register(
+        "route-layout",
+        "route-layout-secret",
+        scoped("route-layout", &["output-1", "NewsOne", "Wide", "a"], None),
+    );
+    keys.register(
         "route-other",
         "route-other-secret",
         scoped(
@@ -149,6 +154,8 @@ struct FakeState {
     needs_encoder: bool,
     in_use: usize,
     live: Option<RoutingLive>,
+    /// Plan a layout as over `routing.max_aux_canvases`.
+    aux_full: bool,
 }
 
 struct Fake {
@@ -202,10 +209,15 @@ impl OutputRouting for Fake {
             return Err(PlanRefusal::SwitcherRequired);
         }
         let s = self.state.lock().unwrap();
+        let layout = matches!(feed, RoutedFeed::Layout(_));
+        if layout && s.aux_full {
+            return Err(PlanRefusal::AuxCapacity { active: 2, max: 2 });
+        }
         Ok(PlanCost {
             needs_encoder: s.needs_encoder,
             sessions_in_use: s.in_use,
             sessions_max: 6,
+            needs_aux_canvas: layout,
         })
     }
     fn plan_audio(
@@ -1600,4 +1612,296 @@ fn concurrent_reservations_of_one_key_with_two_takes_never_share_an_operation() 
             .count();
         assert_eq!((fresh, conflict), (1, 1), "iteration {i}: {results:?}");
     }
+}
+
+struct FakeFrontDoor;
+impl multiview_control::frontdoor_metrics::FrontDoorMetricsSource for FakeFrontDoor {
+    fn read(&self) -> Option<multiview_control::frontdoor_metrics::FrontDoorMetricsReport> {
+        Some(
+            multiview_control::frontdoor_metrics::FrontDoorMetricsReport {
+                received: 42,
+                to_quic: 10,
+                to_rtc: 5,
+                dropped_classify: 0,
+                dropped_per_source: 0,
+                dropped_global: 0,
+                dropped_vn: 0,
+                dropped_initial: 0,
+                dropped_queue_full: 0,
+                dropped_no_consumer: 0,
+                recv_errors: 0,
+                tracked_sources: 2,
+                received_established_socket: 7,
+                received_listener_socket: 35,
+                steered_unverified: 0,
+                steering_overflow: 0,
+                steering_updates: 1,
+                steering_update_errors: 0,
+                steered_peers: 3,
+                kernel_drops_listener: 0,
+                kernel_drops_established: 0,
+                dropped_stun_per_source: 0,
+                dropped_stun_global: 0,
+                dropped_established_peer: 0,
+                quic_retries: 4,
+                udp443_steering: multiview_control::system::Udp443Steering::ReuseportCbpf,
+                nft_floor: multiview_control::system::NftFloorStatus::Present,
+            },
+        )
+    }
+}
+
+#[tokio::test]
+async fn frontdoor_metrics_are_whole_system_only_and_404_without_a_source() {
+    let dir = tempfile::tempdir().unwrap();
+    let plain = rig(&dir.path().join("boot.toml"), false);
+    let resp = send(
+        &plain.router,
+        get("/api/v1/metrics/frontdoor", OPERATOR_TOKEN),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    let state = plain
+        .state
+        .clone()
+        .with_frontdoor_metrics(Arc::new(FakeFrontDoor));
+    let router = multiview_control::router(state);
+    let resp = send(
+        &router,
+        get("/api/v1/metrics/frontdoor", SCOPED_ROUTER_TOKEN),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    let anonymous = Request::builder()
+        .uri("/api/v1/metrics/frontdoor")
+        .body(Body::empty())
+        .unwrap();
+    assert_eq!(
+        send(&router, anonymous).await.status(),
+        StatusCode::UNAUTHORIZED
+    );
+    let body = body_json(send(&router, get("/api/v1/metrics/frontdoor", VIEWER_TOKEN)).await).await;
+    assert_eq!(body["received"], 42);
+    assert_eq!(body["to_quic"], 10);
+    assert_eq!(body["quic_retries"], 4);
+    assert_eq!(body["udp443_steering"], "reuseport_cbpf");
+    assert_eq!(body["nft_floor"], "present");
+}
+
+/// Store a layout in the accepted library (the boot model) and the projection.
+fn store_layout(rig: &Rig, id: &str, body: serde_json::Value) {
+    rig.state
+        .repository
+        .create_layout(
+            id,
+            multiview_control::repository::LayoutInput {
+                name: id.to_owned(),
+                body,
+            },
+        )
+        .unwrap();
+}
+
+fn layout_body(width: u32, opacity: f32) -> serde_json::Value {
+    serde_json::json!({
+        "canvas": {"width": width, "height": 360, "fps": "30000/1001"},
+        "layout": {"kind": "grid", "columns": ["1fr", "1fr"], "rows": ["1fr"], "areas": ["a b"]},
+        "cells": [
+            {"id": "l", "area": "a", "source": {"input_id": "a"}},
+            {"id": "r", "area": "b", "source": {"input_id": "bars"}, "opacity": opacity},
+        ],
+    })
+}
+
+/// ADR-0108 slice 3 (#306) over HTTP: a stored layout is a routable feed.
+/// The plan reports +1 encoder and +1 layout canvas and that audio follows the
+/// program mix; the take carries the resolved body (solved cells and slates);
+/// an unknown layout, a layout authored for another canvas and a layout with
+/// a translucent cell are typed refusals before anything is enqueued; the
+/// engine's aux-canvas limit is a 409 `aux-capacity`; an applied layout take
+/// persists as `{layout = <id>}`; a principal without the layout object is
+/// a 403 whether or not it exists.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[allow(clippy::too_many_lines)] // One HTTP scenario with its assertions.
+async fn a_stored_layout_routes_to_an_output_with_typed_refusals() {
+    let dir = tempfile::tempdir().unwrap();
+    let rig = rig(&dir.path().join("boot.toml"), true);
+    store_layout(&rig, "NewsOne", layout_body(640, 1.0));
+    store_layout(&rig, "Wide", layout_body(1280, 1.0));
+    store_layout(&rig, "Ghost", layout_body(640, 0.5));
+    rig.fake.state.lock().unwrap().needs_encoder = true;
+    let plan = |feed: serde_json::Value| {
+        post(
+            "/api/v1/routing/plan",
+            OPERATOR_TOKEN,
+            None,
+            &body("output-1", feed),
+        )
+    };
+    let planned =
+        body_json(send(&rig.router, plan(serde_json::json!({"layout": "NewsOne"}))).await).await;
+    assert_eq!(planned["cost"]["new_encoders"], 1, "{planned}");
+    assert_eq!(planned["cost"]["new_aux_canvases"], 1, "{planned}");
+    assert_eq!(planned["cost"]["follow_audio"], "program", "{planned}");
+    assert_eq!(planned["refusals"], serde_json::json!([]), "{planned}");
+    for (id, kind) in [
+        ("Missing", "unknown-feed"),
+        ("Wide", "layout-not-admissible"),
+        ("Ghost", "layout-not-admissible"),
+    ] {
+        let planned =
+            body_json(send(&rig.router, plan(serde_json::json!({"layout": id}))).await).await;
+        assert_eq!(planned["refusals"][0]["type"], kind, "{id}: {planned}");
+        // On output-0, spaced past its 2 takes/s limit (a refused take
+        // still counts toward the limit).
+        tokio::time::sleep(Duration::from_millis(550)).await;
+        let resp = send(
+            &rig.router,
+            take(
+                &rig,
+                OPERATOR_TOKEN,
+                &format!("refused-{id}"),
+                "output-0",
+                serde_json::json!({"layout": id}),
+            ),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY, "{id}");
+        assert_eq!(
+            body_json(resp).await["type"]
+                .as_str()
+                .unwrap()
+                .rsplit('/')
+                .next(),
+            Some(kind)
+        );
+    }
+    assert!(rig.fake.takes().is_empty(), "nothing refused was enqueued");
+    // A principal that may not read the layout object: 403, existing or not.
+    for id in ["NewsOne", "Missing"] {
+        let resp = send(
+            &rig.router,
+            take(
+                &rig,
+                SCOPED_ROUTER_TOKEN,
+                &format!("scoped-{id}"),
+                "output-1",
+                serde_json::json!({"layout": id}),
+            ),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN, "{id}");
+    }
+    // #368 review (lens 2): Read on the layout but not on every source its
+    // cells bind (`bars`) is a 403 at plan and take, naming nothing.
+    let resp = send(
+        &rig.router,
+        post(
+            "/api/v1/routing/plan",
+            "route-layout.route-layout-secret",
+            None,
+            &body("output-1", serde_json::json!({"layout": "NewsOne"})),
+        ),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    let problem = body_json(resp).await.to_string();
+    assert!(!problem.contains("bars"), "{problem}");
+    let resp = send(
+        &rig.router,
+        take(
+            &rig,
+            "route-layout.route-layout-secret",
+            "partial-closure",
+            "output-1",
+            serde_json::json!({"layout": "NewsOne"}),
+        ),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    assert!(rig.fake.takes().is_empty(), "nothing enqueued");
+    // Round 2: the closure is checked before the canvas gate, so a layout
+    // authored for another canvas answers the same 403, never the 422 that
+    // would disclose the running canvas.
+    let resp = send(
+        &rig.router,
+        post(
+            "/api/v1/routing/plan",
+            "route-layout.route-layout-secret",
+            None,
+            &body("output-1", serde_json::json!({"layout": "Wide"})),
+        ),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    let problem = body_json(resp).await.to_string();
+    assert!(
+        !problem.contains("640") && !problem.contains("1280"),
+        "{problem}"
+    );
+    // The take carries the resolved body.
+    let resp = send(
+        &rig.router,
+        take(
+            &rig,
+            OPERATOR_TOKEN,
+            "to-layout",
+            "output-1",
+            serde_json::json!({"layout": "NewsOne"}),
+        ),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::ACCEPTED);
+    let op = body_json(resp).await["operation_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let takes = rig.fake.takes();
+    assert_eq!(takes.len(), 1);
+    assert_eq!(takes[0].video, Some(RoutedFeed::Layout("NewsOne".into())));
+    let resolved = &takes[0].layout.as_ref().expect("the resolved body").0;
+    assert_eq!(resolved.id, "NewsOne");
+    assert_eq!(resolved.layout.cells.len(), 2);
+    assert_eq!(resolved.slates.len(), 2);
+    assert_eq!(
+        resolved.layout.cells[1].source.as_deref(),
+        Some("bars"),
+        "the solved cells bind the stored sources"
+    );
+    // Applied persists `{layout = "NewsOne"}`.
+    rig.fake.emit_with_feed(
+        &op,
+        OUT_B_CONFIG_ID,
+        "applied",
+        RoutedFeed::Layout("NewsOne".into()),
+    );
+    wait_for(|| persisted_feed(&rig.state, OUT_B_CONFIG_ID).is_some()).await;
+    assert_eq!(
+        persisted_feed(&rig.state, OUT_B_CONFIG_ID),
+        Some(serde_json::json!({"layout": "NewsOne"}))
+    );
+    // The engine's aux-canvas limit is a 409 `aux-capacity`.
+    rig.fake.state.lock().unwrap().aux_full = true;
+    tokio::time::sleep(Duration::from_millis(1100)).await;
+    let resp = send(
+        &rig.router,
+        take(
+            &rig,
+            OPERATOR_TOKEN,
+            "aux-full",
+            "output-1",
+            serde_json::json!({"layout": "NewsOne"}),
+        ),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::CONFLICT);
+    let problem = body_json(resp).await;
+    assert!(
+        problem["type"].as_str().unwrap().ends_with("aux-capacity"),
+        "{problem}"
+    );
+    assert!(
+        problem["detail"].as_str().unwrap().contains("2 of 2"),
+        "{problem}"
+    );
 }

@@ -28,8 +28,8 @@ use crate::auth::{Action, Principal};
 use crate::concurrency::IdempotencyKey;
 use crate::error::{ControlError, ControlResult};
 use crate::output_routing::{
-    OutputTakeRequest, PendingTake, PlanRefusal, RoutedAudio, RoutedFeed, TakeReplay,
-    TakeReservation, TakeSubmitError,
+    LayoutBody, OutputTakeRequest, PendingTake, PlanRefusal, RoutedAudio, RoutedFeed, RoutedLayout,
+    TakeReplay, TakeReservation, TakeSubmitError,
 };
 use crate::problem::Problem;
 use crate::state::AppState;
@@ -77,8 +77,9 @@ pub enum OutputTargetKind {
 pub struct OutputRouteRequest {
     /// The output and stream.
     pub target: OutputTargetKind,
-    /// The video feed: `{"bus":"program"|"preview"|"clean"}` or
-    /// `{"source":"vt1"}`. Required with `stream: video`; absent with
+    /// The video feed: `{"bus":"program"|"preview"|"clean"}`,
+    /// `{"source":"vt1"}` or `{"layout":"NewsOne"}` (a stored layout,
+    /// ADR-0108 slice 3). Required with `stream: video`; absent with
     /// `stream: audio`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "openapi", schema(value_type = Option<Object>))]
@@ -146,6 +147,14 @@ pub struct OutputPlanCost {
     /// CPU)"; absent when the take costs no audio encode.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub audio_cost: Option<String>,
+    /// `1` when the take starts a new layout canvas (`routing-aux`), else `0`.
+    #[serde(default)]
+    pub new_aux_canvases: u8,
+    /// The audio the output carries on this video feed when its audio
+    /// follows: `program` (the mix), `source` (the source's own) or `preview`
+    /// (the PVW source's). A layout carries the program mix.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub follow_audio: Option<String>,
 }
 
 /// A typed plan refusal (RFC 9457 `type` suffix + operator text).
@@ -153,7 +162,8 @@ pub struct OutputPlanCost {
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 pub struct OutputPlanRefusal {
     /// `capacity` | `unknown-feed` | `switcher-required` |
-    /// `output-kind-unroutable` | `audio-unsupported`.
+    /// `output-kind-unroutable` | `audio-unsupported` | `layout-not-admissible`
+    /// | `aux-capacity`.
     #[serde(rename = "type")]
     pub kind: String,
     /// Operator-facing text (never names an encoder group).
@@ -234,13 +244,16 @@ fn authorize_bus(principal: &Principal) -> ControlResult<()> {
 /// `program` → the bus rule; `tracks` → each track name, and each track's
 /// route input once resolved by [`resolve_audio`]; `none`/`follow` →
 /// nothing beyond the video end).
-fn authorize_ends(principal: &Principal, req: &OutputRouteRequest) -> ControlResult<()> {
+fn authorize_ends(
+    state: &AppState,
+    principal: &Principal,
+    req: &OutputRouteRequest,
+) -> ControlResult<()> {
     authorize_output_end(principal, req.output())?;
     match &req.feed {
         None => {}
-        Some(VideoFeed::Source(id) | VideoFeed::Layout(id)) => {
-            crate::auth::authorize_object(principal, id)?;
-        }
+        Some(VideoFeed::Source(id)) => crate::auth::authorize_object(principal, id)?,
+        Some(VideoFeed::Layout(id)) => authorize_layout_feed(state, principal, id)?,
         Some(VideoFeed::Bus(_)) => authorize_bus(principal)?,
         Some(_) => return Err(ControlError::Forbidden("unsupported feed kind".to_owned())),
     }
@@ -398,29 +411,210 @@ fn audio_cost_text(needs: bool) -> Option<String> {
     needs.then(|| "+1 audio encode (transient, CPU)".to_owned())
 }
 
-/// The feed as a routed feed (Program, Preview, Clean or a source), after existence checks: `Err` is the
-/// typed refusal response (`unknown-feed`, `output-kind-unroutable`).
+/// A feed refusal before the engine is asked: `(status, type, detail)`.
+pub(crate) type FeedRefusal = (u16, &'static str, String);
+
+/// Resolve a stored layout for routing (ADR-0108 slice 3): it must exist in
+/// the accepted layouts library, parse and solve, be authored for the running
+/// canvas (the Class-1 pinned-canvas gate of `apply-layout`), and be drawable
+/// by the aux integer path (every cell opaque). Pure CPU on the control
+/// plane; the engine only composes the result.
+///
+/// Authorization (§6.3, "Read on L AND on every source its cells bind"): the
+/// layout id is authorized before this runs; here every source the layout's
+/// cells bind is authorized too, so a principal cannot view a source it may
+/// not read by routing a layout that shows it. A refusal is a bare 403 that
+/// names nothing (the caller already holds Read on the layout body).
+fn resolve_layout(
+    state: &AppState,
+    principal: &Principal,
+    id: &str,
+) -> ControlResult<Result<RoutedLayout, FeedRefusal>> {
+    let versioned = match crate::routes::authoritative_layouts(state)? {
+        Some(desired) => crate::routes::authoritative_layout(&desired, id),
+        None => state.repository.get_layout(id),
+    };
+    let versioned = match versioned {
+        Ok(v) => v,
+        Err(ControlError::NotFound { .. }) => {
+            return Ok(Err((
+                422,
+                "unknown-feed",
+                "the layout does not exist".to_owned(),
+            )))
+        }
+        Err(other) => return Err(other),
+    };
+    // The closure is authorized BEFORE any parse/solve/canvas answer, so no
+    // 422 detail reaches a principal who may not read every bound source.
+    authorize_document_closure(principal, &versioned.layout.body)?;
+    let resolved = match crate::command::resolve_layout_document(
+        id,
+        &versioned.layout.body,
+        state.running_canvas.as_ref(),
+    ) {
+        Ok(resolved) => resolved,
+        Err(ControlError::Validation(detail)) => {
+            return Ok(Err((422, "layout-not-admissible", detail)));
+        }
+        Err(other) => return Err(other),
+    };
+    authorize_layout_sources(principal, &resolved.solved)?;
+    let routed = RoutedLayout {
+        id: id.to_owned(),
+        slates: resolved.document.cell_slates(),
+        layout: resolved.solved,
+    };
+    if !routed.integer_drawable() {
+        return Ok(Err((
+            422,
+            "layout-not-admissible",
+            "this layout has a translucent cell; a routed layout draws opaque cells only \
+             (set every cell's opacity to 1)"
+                .to_owned(),
+        )));
+    }
+    Ok(Ok(routed))
+}
+
+/// Read on every source `layout`'s cells bind (§6.3). One generic 403 for
+/// any unreadable source: never which one, never whether it exists.
+pub(crate) fn authorize_layout_sources(
+    principal: &Principal,
+    layout: &multiview_core::layout::Layout,
+) -> ControlResult<()> {
+    let readable = layout
+        .cells
+        .iter()
+        .filter_map(|cell| cell.source.as_deref())
+        .all(|source| crate::auth::authorize_object(principal, source).is_ok());
+    if readable {
+        Ok(())
+    } else {
+        Err(closure_forbidden())
+    }
+}
+
+/// Read on every source a stored layout body's cells bind. A body that does
+/// not parse fails closed with the same generic 403.
+fn authorize_document_closure(
+    principal: &Principal,
+    body: &serde_json::Value,
+) -> ControlResult<()> {
+    let Ok(document) = multiview_config::LayoutDocument::from_body(body) else {
+        return Err(closure_forbidden());
+    };
+    let readable = document
+        .cells
+        .iter()
+        .filter_map(|cell| cell.source.input_id.as_deref())
+        .all(|source| crate::auth::authorize_object(principal, source).is_ok());
+    if readable {
+        Ok(())
+    } else {
+        Err(closure_forbidden())
+    }
+}
+
+/// Authorize a `{layout}` video feed (§6.3): Read on the layout id AND on
+/// every source its CURRENT stored body binds, one generic 403. The ONE
+/// authorize step of the alias, `/patch` output crosspoints and their plans
+/// (#342 review T-A1): it runs with the other end checks, BEFORE any output
+/// or feed existence answer, so a denied closure can never become a
+/// 404-vs-403 oracle on the output. An unknown layout passes here and is
+/// answered by existence later (`unknown-feed`).
+///
+/// # Errors
+/// 403 for the id or an unreadable source; repository errors.
+pub(crate) fn authorize_layout_feed(
+    state: &AppState,
+    principal: &Principal,
+    id: &str,
+) -> ControlResult<()> {
+    crate::auth::authorize_object(principal, id)?;
+    authorize_layout_closure(state, principal, id)
+}
+
+/// Re-authorize a recorded layout take's source closure (a replay, #342 B2):
+/// the stored layout as it is NOW. A layout that no longer exists has no
+/// closure to read: the replay answers its own recorded operation.
+fn authorize_layout_closure(
+    state: &AppState,
+    principal: &Principal,
+    id: &str,
+) -> ControlResult<()> {
+    let versioned = match crate::routes::authoritative_layouts(state)? {
+        Some(desired) => crate::routes::authoritative_layout(&desired, id),
+        None => state.repository.get_layout(id),
+    };
+    match versioned {
+        Ok(v) => authorize_document_closure(principal, &v.layout.body),
+        Err(ControlError::NotFound { .. }) => Ok(()),
+        Err(other) => Err(other),
+    }
+}
+
+fn closure_forbidden() -> ControlError {
+    ControlError::Forbidden("not authorized for every source this layout shows".to_owned())
+}
+
+/// The video feed as a routed feed (and, for a layout, its resolved body and
+/// its source closure authorized, §6.3), after existence checks: `Err` is the
+/// typed refusal. Shared by the alias, `/patch` output crosspoints and their
+/// plans (#342 B2), so a layout feed is resolved and authorized once, alike.
 pub(crate) fn resolve_feed(
     state: &AppState,
+    principal: &Principal,
     feed: &VideoFeed,
-) -> ControlResult<Result<RoutedFeed, Response>> {
+) -> ControlResult<Result<(RoutedFeed, Option<LayoutBody>), FeedRefusal>> {
     let Some(routed) = RoutedFeed::of(feed) else {
-        return Ok(Err(refusal_problem(
+        return Ok(Err((
             422,
             "unknown-feed",
             "this feed cannot be routed to an output in this release".to_owned(),
         )));
     };
-    if let RoutedFeed::Source(id) = &routed {
-        if !source_exists(state, id)? {
-            return Ok(Err(refusal_problem(
-                422,
-                "unknown-feed",
-                "the feed does not exist".to_owned(),
-            )));
+    match &routed {
+        RoutedFeed::Source(id) => {
+            if !source_exists(state, id)? {
+                return Ok(Err((
+                    422,
+                    "unknown-feed",
+                    "the feed does not exist".to_owned(),
+                )));
+            }
         }
+        RoutedFeed::Layout(id) => {
+            return Ok(resolve_layout(state, principal, id)?.map(|layout| {
+                (
+                    routed.clone(),
+                    Some(LayoutBody(std::sync::Arc::new(layout))),
+                )
+            }));
+        }
+        _ => {}
     }
-    Ok(Ok(routed))
+    Ok(Ok((routed, None)))
+}
+
+/// The audio a video feed carries when the output's audio follows (§5.1).
+fn follow_audio(feed: &RoutedFeed) -> &'static str {
+    match feed {
+        RoutedFeed::Source(_) => "source",
+        RoutedFeed::Preview => "preview",
+        RoutedFeed::Program | RoutedFeed::Clean | RoutedFeed::Layout(_) => "program",
+    }
+}
+
+pub(crate) fn aux_capacity_text(principal: &Principal, active: usize, max: usize) -> String {
+    if principal.is_global() {
+        format!(
+            "No free layout canvas: {active} of {max} routed layouts are already composing; \
+             take an output off a layout first"
+        )
+    } else {
+        "No free layout canvas for this output".to_owned()
+    }
 }
 
 /// `POST /api/v1/routing/plan` for an output target.
@@ -430,7 +624,7 @@ pub(crate) fn plan_output(
     req: &OutputRouteRequest,
 ) -> ControlResult<Response> {
     principal.role.require(Action::Read)?;
-    authorize_ends(principal, req)?;
+    authorize_ends(state, principal, req)?;
     authorize_track_inputs(state, principal, req)?;
     let video = req.shape()?;
     let Some(control) = state.output_routing.as_ref() else {
@@ -450,15 +644,21 @@ pub(crate) fn plan_output(
         fits: true,
         audio_encoders: 0,
         audio_cost: None,
+        new_aux_canvases: 0,
+        follow_audio: None,
     };
     let mut routed_video = None;
     if let Some(feed) = video {
-        match resolve_feed(state, feed)? {
-            Err(_) => refusals.push(OutputPlanRefusal {
-                kind: "unknown-feed".to_owned(),
-                detail: "the feed does not exist or cannot be routed".to_owned(),
+        match resolve_feed(state, principal, feed)? {
+            Err((_, kind, detail)) => refusals.push(OutputPlanRefusal {
+                kind: kind.to_owned(),
+                detail: if kind == "unknown-feed" {
+                    "the feed does not exist or cannot be routed".to_owned()
+                } else {
+                    detail
+                },
             }),
-            Ok(feed) => {
+            Ok((feed, _)) => {
                 plan_video(
                     control,
                     principal,
@@ -526,7 +726,9 @@ fn plan_video(
 ) {
     match control.routing.plan(config_id, feed) {
         Ok(planned) => {
+            cost.follow_audio = Some(follow_audio(feed).to_owned());
             cost.new_encoders = u8::from(planned.needs_encoder);
+            cost.new_aux_canvases = u8::from(planned.needs_aux_canvas);
             cost.fits = planned.fits();
             if principal.is_global() {
                 cost.encoder_sessions = Some(format!(
@@ -553,6 +755,13 @@ fn plan_video(
             kind: "audio-unsupported".to_owned(),
             detail: NO_AUDIO_SLOT.to_owned(),
         }),
+        Err(PlanRefusal::AuxCapacity { active, max }) => {
+            cost.fits = false;
+            refusals.push(OutputPlanRefusal {
+                kind: "aux-capacity".to_owned(),
+                detail: aux_capacity_text(principal, active, max),
+            });
+        }
     }
 }
 
@@ -624,7 +833,8 @@ fn audio_gate(
     match control.routing.plan_audio(config_id, video, Some(audio)) {
         Err(PlanRefusal::AudioUnsupported) => Some(audio_unsupported()),
         Err(PlanRefusal::OutputKindUnroutable) => Some(unroutable_kind()),
-        Err(PlanRefusal::SwitcherRequired) | Ok(_) => None,
+        // The video plan answers the video refusals.
+        Err(PlanRefusal::SwitcherRequired | PlanRefusal::AuxCapacity { .. }) | Ok(_) => None,
     }
 }
 
@@ -643,6 +853,11 @@ fn plan_gate(
         )),
         Err(PlanRefusal::OutputKindUnroutable) => Some(unroutable_kind()),
         Err(PlanRefusal::AudioUnsupported) => Some(audio_unsupported()),
+        Err(PlanRefusal::AuxCapacity { active, max }) => Some(refusal_problem(
+            409,
+            "aux-capacity",
+            aux_capacity_text(principal, active, max),
+        )),
         Ok(cost) if !cost.fits() => Some(refusal_problem(
             409,
             "capacity",
@@ -672,8 +887,8 @@ fn plan_gate(
             (status = 401, description = "Missing or invalid credentials.", body = crate::problem::Problem),
             (status = 403, description = "Not authorized for the output (object AND output axis) or the feed; a replayed key is re-authorized under the caller's current grants.", body = crate::problem::Problem),
             (status = 404, description = "Unknown output.", body = crate::problem::Problem),
-            (status = 409, description = "`routing-unavailable`, `switcher-required`, `output-kind-unroutable`, `capacity`, `audio-unsupported` (the output has no program-audio slot for a routed audio feed, or its transport cannot select a discrete track), or `conflict` (the Idempotency-Key was first used for another output, feed or audio; nothing is enqueued).", body = crate::problem::Problem),
-            (status = 422, description = "`unknown-feed` (video or audio), `audio-unsupported` (more than one track: the output carries one routed audio feed), a body whose `stream` and `feed`/`audio` do not match (`stream: video` needs `feed`; `stream: audio` needs `audio` and no `feed`), or a missing Idempotency-Key.", body = crate::problem::Problem),
+            (status = 409, description = "`routing-unavailable`, `switcher-required`, `output-kind-unroutable`, `capacity`, `aux-capacity` (no free layout canvas), `audio-unsupported` (the output has no program-audio slot for a routed audio feed, or its transport cannot select a discrete track), or `conflict` (the Idempotency-Key was first used for another output, feed or audio; nothing is enqueued).", body = crate::problem::Problem),
+            (status = 422, description = "`unknown-feed` (video or audio, including an unknown layout), `layout-not-admissible` (a layout authored for another canvas, one that does not solve, or one with a translucent cell), `audio-unsupported` (more than one track: the output carries one routed audio feed), a body whose `stream` and `feed`/`audio` do not match (`stream: video` needs `feed`; `stream: audio` needs `audio` and no `feed`), or a missing Idempotency-Key.", body = crate::problem::Problem),
             (status = 429, description = "Over 2 takes/s per output or 10/s per principal; see Retry-After.", body = crate::problem::Problem),
             (status = 503, description = "`engine-busy`: the take mailbox is full (the key is freed); or `idempotency-capacity`: the caller's (or every) take record is still pending at its cap (fails closed; pending keys still replay; settled records are evicted oldest-first otherwise).", body = crate::problem::Problem),
         ),
@@ -686,7 +901,7 @@ pub(crate) async fn take_output(
     Json(req): Json<OutputRouteRequest>,
 ) -> ControlResult<Response> {
     principal.role.require(Action::Write)?;
-    authorize_ends(&principal, &req)?;
+    authorize_ends(&state, &principal, &req)?;
     authorize_track_inputs(&state, &principal, &req)?;
     let video = req.shape()?;
     let output = req.output().to_owned();
@@ -758,10 +973,7 @@ pub(crate) fn take_output_slot0(
     // first used for. The caller has just authorized this request's ends
     // under the principal's current grants, so a matching replay is
     // re-authorized; a different body is refused and nothing is enqueued.
-    if let Some((replay, recorded)) = control.replay_with_take(&key) {
-        if !same_take(state, &recorded, output_id, video, audio)? {
-            return Err(key_reused());
-        }
+    if let Some(replay) = replay_slot0(state, principal, &control, &key, output_id, video, audio)? {
         return Ok(SlotTake::Replay(replay));
     }
     let Some(output) = output_of(state, output_id)? else {
@@ -778,11 +990,13 @@ pub(crate) fn take_output_slot0(
     {
         return Ok(SlotTake::Refused(too_many(retry)));
     }
-    let feed = match video {
-        None => None,
-        Some(video) => match resolve_feed(state, video)? {
-            Ok(feed) => Some(feed),
-            Err(response) => return Ok(SlotTake::Refused(response)),
+    let (feed, layout) = match video {
+        None => (None, None),
+        Some(video) => match resolve_feed(state, principal, video)? {
+            Ok((feed, layout)) => (Some(feed), layout),
+            Err((status, kind, detail)) => {
+                return Ok(SlotTake::Refused(refusal_problem(status, kind, detail)))
+            }
         },
     };
     let audio = match audio {
@@ -833,6 +1047,7 @@ pub(crate) fn take_output_slot0(
         output: config_id,
         video: feed.clone(),
         audio: audio.clone(),
+        layout,
         principal: principal.key_id.clone(),
     };
     if let Err(error) = control.routing.try_take(take) {
@@ -856,6 +1071,36 @@ pub(crate) fn take_output_slot0(
         })),
     );
     Ok(SlotTake::Accepted(op.to_string()))
+}
+
+/// A replay of a slot-0 take key: `Some` when the key names THIS take
+/// (bound to output, video and audio, #342 review A1). A layout take's
+/// replay re-authorizes the layout's whole source closure under the CURRENT
+/// grants too (§6.3), exactly as a fresh take does: the caller authorized
+/// only the layout id.
+///
+/// # Errors
+/// `conflict` for a key first used for another take; 403 for an unreadable
+/// layout closure; repository errors.
+fn replay_slot0(
+    state: &AppState,
+    principal: &Principal,
+    control: &crate::output_routing::OutputRoutingControl,
+    key: &str,
+    output_id: &str,
+    video: Option<&VideoFeed>,
+    audio: Option<&AudioFeed>,
+) -> ControlResult<Option<TakeReplay>> {
+    let Some((replay, recorded)) = control.replay_with_take(key) else {
+        return Ok(None);
+    };
+    if !same_take(state, &recorded, output_id, video, audio)? {
+        return Err(key_reused());
+    }
+    if let Some(RoutedFeed::Layout(id)) = &recorded.feed {
+        authorize_layout_closure(state, principal, id)?;
+    }
+    Ok(Some(replay))
 }
 
 /// The refusal of a take key first used for another take (409 `conflict`).

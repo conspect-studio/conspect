@@ -765,7 +765,7 @@ Results:
 | Clean | the program mix |
 | Preview | the PVW source's own audio |
 | Source / VT / generator X | X's own audio. A source with no audio (solid, clock) gives silence; bars give the 1 kHz line-up tone (`crates/multiview-cli/src/pipeline.rs:4405-4410`) |
-| Layout L | L's `audio` attribute: `program` (default, so routing a layout changes no one's audio versus today), `none`, or `source:<id>` of one of its cells |
+| Layout L | L's `audio` attribute: `program` (default, so routing a layout changes no one's audio versus today), `none`, or `source:<id>` of one of its cells. **As built (slice 3, §10.1): the program mix**; stored layouts carry no `audio` attribute yet, and the plan says which audio the feed carries (`follow_audio`) |
 
 An explicit `audio` overrides follow: `program`, `source:<id>`, `tracks:[...]` or `none`. Audio
 follows the *feed*, so when a take changes the video feed, a `follow` output's audio changes on the
@@ -1679,6 +1679,61 @@ Slice 1 is the least engine risk:
 | #216 (per-output encoder settings) | Still separate; encoded buses key on its settings once #216 lands |
 | #243 | **Delivered by slice 4** (slice 3 for the wall-on-output half) |
 
+### 10.1 Slice 3 as built (#306)
+
+PR 1 (layout to an output, live) builds, and deviates from §2.3 and §7 as stated here:
+
+- **The compose path is the CPU integer path in every build** (`crates/multiview-cli/src/aux_layout.rs`),
+  never wgpu. It mirrors the reference compositor's geometry exactly: cell rectangles
+  (`cell_dst_rect`), nearest-neighbour `floor(d * src / dst)` scaling, ascending-`z` order, a 2x2
+  chroma block taken from its bottom-right pixel, per-cell `on_loss` slates built once at canvas
+  size, and the canvas background encoded once. Samples are copied, never converted: every tile
+  carries the canvas tag (§2.4). A routed layout and the same layout on a CPU Program differ by at
+  most one code value per sample with identical geometry
+  (`aux_layout::tests::a_routed_layout_equals_the_same_layout_on_program`, odd edges included).
+  The wgpu aux upgrade stays behind §7's hard gate and is not built.
+- **What the integer path does not draw.** A layout with a translucent cell (opacity below 1) is
+  refused at plan and take (`422 layout-not-admissible`). A tile with an alpha plane or a colour
+  tag other than the canvas tag shows its cell's slate (counted), never opaque or mislabelled.
+- **Authorization (§6.3).** A layout take or plan needs Read on the layout AND on every source its
+  cells bind (one generic 403 otherwise); the readback shows a layout feed only under the same
+  closure, computed from the accepted library (an unknown layout is redacted).
+- **Geometry corner cases** match the reference: a cell whose floored rect is zero wide or tall is
+  drawn at the source's own size, clipped to the canvas; a 2x2 chroma block takes the chroma of its
+  bottom-right pixel from the last cell covering it. All index arithmetic is overflow-free (a canvas
+  over 65534 composes and returns).
+- **A re-take of an edited layout** swaps the body the canvas composes and requests an IDR on that
+  layout's encoders (within the per-key force floor), so the edited picture starts on a clean
+  random-access point.
+- **Resolution on the control plane.** The take resolves the stored layout from the accepted
+  library, solves it, and applies the `apply-layout` pinned-canvas gate (a layout authored for
+  another canvas is `422 layout-not-admissible`; an unknown one `422 unknown-feed`). The engine
+  receives the solved body with the take; the aux thread only composes.
+- **Per-output format (#342).** A routed layout is composed once at the canvas, like Program;
+  an output with a non-canvas format converts it on its own key's worker (`ConvertLive`), so one
+  layout canvas serves outputs of every format.
+- **Admission (§7 rule 1).** `routing.max_aux_canvases` is the constant 2
+  (`DEFAULT_MAX_AUX_CANVASES`); it is not a config key yet. It counts distinct layouts held by
+  other outputs; the output's own current layout does not count (the take replaces it). The plan
+  refuses `aux-capacity` (409 at take, with the counts for whole-system principals only) and
+  reports `new_aux_canvases`; the router re-checks at adoption (`Refused(Capacity)`). Two outputs
+  on one layout share one canvas and, with equal settings, one encoder (+0).
+- **Failure.** A held layout canvas degrades at 60 ticks and falls back at 150, and a failed aux
+  thread moves every layout output to Program at once, exactly as for one-cell buses. A dead cell
+  shows its slate; it never makes the layout un-fresh.
+- **Cost, measured (build host, one core).** 1080p, 6 cells: see the PR for the release p50
+  (`aux_layout::tests::a_1080p_layout_compose_costs_less_than_a_tick_on_one_core` prints it).
+- **Not in PR 1, owed by PR 2:** aux sizing (§2.4: decode size follows the routed cell size; until
+  then a routed cell scales the tile decoded for Program, or the 640x360 unbound decode), the
+  Program-lateness back-off (halving the aux cadence), live propagation of layout edits, rename and
+  delete to a routed canvas (a re-take already picks up an edit, at an IDR), and the layout `audio` attribute.
+  Start-up does not re-take a persisted layout feed (no boot take: its body lives in the layouts
+  library, which start-up does not resolve). The output starts and stays on Program, and the
+  readback shows the layout as configured but not on air. Unlike before slice 3, a persisted layout
+  feed no longer refuses a start (`outputs_carry_program` accepts every feed).
+- **Salvos** do not drive output takes on main (`Salvo` has no output recall); layout feeds in
+  salvos belong to #308.
+
 ---
 
 ## 11. Interactions and open points
@@ -2272,20 +2327,37 @@ honour at boot (source gone, slot removed) starts the slot on its default and ra
 
 **As built in slice B (#342, part B2).**
 - **Output slots in `/patch`.** `GET /patch` gains `outputs: [ { output, format, video: [ { slot: 0,
-  source, path, pending, degraded } ], audio: [ { slot, track, language, source: "follow" } ] } ]`.
+  live, source, path, pending, degraded } ], audio: [ { slot, track, language, source: "follow" } ] } ]`.
   - The video slot comes from the engine's live readback (`RoutingLive`, the router snapshot), and
     the audio slots from the accepted output config (`slots.audio`, else one program slot).
+  - With no readback for the output (no running engine, routing unavailable, or the output not in
+    this run) the slot is `live: false` with `source` and `path` null: its live state is unknown and
+    is never reported as Program (review T-M2). With a readback it is `live: true`.
   - An output is listed only if the caller passes the output axis that the patch route checks
     (`ObjectAndOutput` + `authorize_output`). A feed it cannot read is `{redacted: true}`.
 - **Single-output takes.** `POST /patch/plan` and `/patch/take` accept the crosspoints of ONE output:
-  - video slot 0 with `{source}` or `{bus}`;
-  - optionally audio slot 0 with `"follow"`, which rides the video take.
+  - video slot 0 with `{source}`, `{bus}` or `{layout}` (a stored layout, routable since #368);
+  - optionally audio slot 0 with `"follow"`. Named, it rides the video take exactly as the alias's
+    `audio: "follow"` does (the engine take carries Follow, an explicit audio choice is replaced and
+    the persisted row's audio becomes follow, and the two routes replay each other). Omitted, the
+    output keeps its current audio choice, as the alias without `audio` (review T-M1).
+
+  A layout on video slot 0 behaves as on the alias:
+  - its id AND its whole current source closure are authorized (one generic 403) in the shared
+    authorize step, before any output or feed existence answer, so a denied closure is never a
+    404-vs-403 oracle on the output (review T-A1); a replay re-authorizes the closure;
+  - an unknown layout is `unknown-source` in the plan (422 `unknown-feed` on take);
+  - a layout for another canvas, one that does not solve, or one with a translucent cell is
+    `layout-not-admissible` (a plan refusal, 422 on take);
+  - no free layout canvas is `aux-capacity` (a plan refusal, 409 on take);
+  - a layout is composed at the canvas size, so its path is P2 only on a canvas-sized base key and P3
+    (+1 convert on the key's worker) on a formatted one.
 
   Other requests are refused:
   - video slot ≥ 1 → 422 `unknown-slot`;
   - other audio slots → 422 `slot-medium-mismatch` (they are fixed by config in this slice);
   - `subtitle` → 422 `slot-medium-mismatch` (#345);
-  - `{layout}` → 422 `unknown-source` (#306).
+  - a layout or bus on a mixer input → 422 `unknown-source` (#307).
 
   A request carries either mixer-input crosspoints or one output's crosspoints. Two outputs, or a
   mixer input plus an output, → 422 `unknown-slot`: atomic multi-destination sets arrive with patch
@@ -2314,7 +2386,7 @@ honour at boot (source gone, slot removed) starts the slot on its default and ra
     before any operation id or outcome is returned.
 - **Plan identity.** The plan's P2 is the aux thread's own pass-through predicate
   (`routing_aux::passes_through`), so plan and engine cannot drift. Program and Clean are P2 only on a
-  canvas-sized base key. A source or the PVW source is P2 when its newest tile has the output's
+  canvas-sized base key, and so is a routed layout. A source or the PVW source is P2 when its newest tile has the output's
   size, is opaque and carries the canvas colour; any fit of an equal-size picture is the identity.
 - **Audio slot 0 in `GET /patch`.** It reports the output's accepted audio feed exactly as
   `GET /routing` projects and redacts it (default `follow`).

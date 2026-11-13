@@ -195,6 +195,9 @@ pub struct CloudflareDns {
     detected: Mutex<Option<(std::time::Instant, Method)>>,
     /// The method of the last confirmation (for the failure detail).
     last_method: Mutex<Option<Method>>,
+    /// Why the last failed `DoH` confirmation's final poll did not see the
+    /// value (for the failure detail).
+    last_doh: Mutex<Option<DohOutcome>>,
 }
 
 impl std::fmt::Debug for CloudflareDns {
@@ -230,7 +233,7 @@ impl CloudflareDns {
             zone_cache: Mutex::new(Vec::new()),
             confirm: DnsConfirm::Auto,
             probe: PROBE_ADDRS.to_vec(),
-            doh_client: EgressClient::new(
+            doh_client: EgressClient::new_unpooled(
                 EgressPolicy::public(),
                 None,
                 EgressTimeouts::default(),
@@ -239,6 +242,7 @@ impl CloudflareDns {
             doh_url: DOH_URL.to_owned(),
             detected: Mutex::new(None),
             last_method: Mutex::new(None),
+            last_doh: Mutex::new(None),
         })
     }
 
@@ -311,7 +315,7 @@ impl CloudflareDns {
             zone_cache: Mutex::new(Vec::new()),
             confirm: confirm.mode,
             probe: confirm.probe,
-            doh_client: EgressClient::new(
+            doh_client: EgressClient::new_unpooled(
                 EgressPolicy::for_tests_allowing_loopback_ports(false, &[confirm.doh_port]),
                 trust_anchor,
                 EgressTimeouts::default(),
@@ -320,6 +324,7 @@ impl CloudflareDns {
             doh_url: confirm.doh_url,
             detected: Mutex::new(None),
             last_method: Mutex::new(None),
+            last_doh: Mutex::new(None),
         })
     }
 
@@ -365,32 +370,10 @@ impl CloudflareDns {
         method
     }
 
-    /// One `DoH` lookup: whether the resolver answers `value` at `fqdn` now.
-    /// Any HTTP or parse failure is "not seen yet".
-    async fn seen_via_doh(&self, fqdn: &str, value: &str) -> bool {
-        use base64::Engine as _;
-        // RFC 8484 §4.1: id 0 keeps the GET cache-friendly.
-        let Some(wire) = query_wire(fqdn, TXT_TYPE, 0, true) else {
-            return false;
-        };
-        let encoded = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(wire);
-        let Ok(request) = self
-            .doh_client
-            .reqwest()
-            .get(&self.doh_url)
-            .query(&[("dns", encoded.as_str())])
-            .header(reqwest::header::ACCEPT, "application/dns-message")
-            .build()
-        else {
-            return false;
-        };
-        let Ok(response) = self.doh_client.send(request).await else {
-            return false;
-        };
-        if !response.status.is_success() {
-            return false;
-        }
-        txt_answer_matches(&response.body, value)
+    /// One `DoH` lookup: whether the resolver answers `value` at `fqdn` now,
+    /// and if not, why.
+    async fn seen_via_doh(&self, fqdn: &str, value: &str) -> DohOutcome {
+        doh_lookup(&self.doh_client, &self.doh_url, fqdn, value).await
     }
 
     /// Poll `DoH` until `value` is seen or `until` passes.
@@ -408,15 +391,30 @@ impl CloudflareDns {
         value: &str,
         until: tokio::time::Instant,
     ) -> Result<(), AcmeError> {
+        let mut log = DohLog::default();
         loop {
             if tokio::time::Instant::now() + POLL_INTERVAL >= until {
+                log.give_up(fqdn);
+                self.set_last_doh(log.last.as_ref());
                 return Err(AcmeError::Propagation);
             }
             tokio::time::sleep(POLL_INTERVAL).await;
-            if let Ok(true) = tokio::time::timeout_at(until, self.seen_via_doh(fqdn, value)).await {
+            let outcome = tokio::time::timeout_at(until, self.seen_via_doh(fqdn, value))
+                .await
+                .unwrap_or(DohOutcome::Deadline);
+            if outcome == DohOutcome::Seen {
+                log.seen(fqdn);
                 return Ok(());
             }
+            log.not_seen(fqdn, outcome);
         }
+    }
+
+    fn set_last_doh(&self, outcome: Option<&DohOutcome>) {
+        *self
+            .last_doh
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = outcome.cloned();
     }
 
     fn request(
@@ -611,22 +609,268 @@ fn query_wire(name: &str, record_type: u16, id: u16, recursion: bool) -> Option<
 }
 
 /// Whether a DNS answer (wire format) carries a TXT record whose
-/// concatenated character-strings equal `value` byte for byte.
+/// concatenated character-strings equal `value` byte for byte (owner
+/// unchecked; the classifier's own tests).
+#[cfg(test)]
 fn txt_answer_matches(wire: &[u8], value: &str) -> bool {
     use hickory_resolver::proto::op::Message;
-    use hickory_resolver::proto::rr::RData;
-    let Ok(message) = Message::from_vec(wire) else {
-        return false;
+    Message::from_vec(wire).is_ok_and(|m| classify_doh_answer(&m, None, value) == DohOutcome::Seen)
+}
+
+/// The result of one `DoH` poll. Every variant but [`Self::Seen`] is a
+/// bounded, secret-free reason why the value was not seen (no names, no
+/// values, no URLs; counts are small integers from the answer).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DohOutcome {
+    /// The resolver answered `value`.
+    Seen,
+    /// The query could not be built (invalid name).
+    BadName,
+    /// The HTTP request failed (egress screen, TLS, connect, timeout, body cap).
+    Egress(super::egress::EgressFailure),
+    /// The resolver answered with a non-2xx HTTP status.
+    Status(u16),
+    /// The body is not a DNS message.
+    Unparsable,
+    /// The answer is not a response to this query (id, QR, or question).
+    Mismatched,
+    /// A DNS answer without the value: response code, answer count, TXT count.
+    NotSeen {
+        /// DNS response code (0 = `NOERROR`, 3 = `NXDOMAIN`, 2 = `SERVFAIL`).
+        rcode: u16,
+        /// Records in the answer section.
+        answers: usize,
+        /// TXT records in the answer section (none equal to the value).
+        txt: usize,
+    },
+    /// The poll was cut off by the confirmation deadline.
+    Deadline,
+}
+
+impl std::fmt::Display for DohOutcome {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Seen => f.write_str("value present"),
+            Self::BadName => f.write_str("invalid query name"),
+            Self::Egress(failure) => write!(f, "request failed: {failure}"),
+            Self::Status(code) => write!(f, "HTTP status {code}"),
+            Self::Unparsable => f.write_str("body is not a DNS message"),
+            Self::Mismatched => f.write_str("answer does not match the query"),
+            Self::NotSeen {
+                rcode,
+                answers,
+                txt,
+            } => write!(
+                f,
+                "rcode {rcode} ({}), {answers} answer(s), {txt} TXT, value absent",
+                rcode_name(*rcode)
+            ),
+            Self::Deadline => f.write_str("cut off by the deadline"),
+        }
+    }
+}
+
+impl DohOutcome {
+    /// A short stable class for log de-duplication (same class = same line).
+    fn class(&self) -> (u8, u16, &'static str) {
+        match self {
+            Self::Seen => (0, 0, ""),
+            Self::BadName => (1, 0, ""),
+            Self::Egress(f) => (2, 0, f.reason),
+            Self::Status(code) => (3, *code, ""),
+            Self::Unparsable => (4, 0, ""),
+            Self::Mismatched => (5, 0, ""),
+            Self::NotSeen { rcode, .. } => (6, *rcode, ""),
+            Self::Deadline => (7, 0, ""),
+        }
+    }
+}
+
+const fn rcode_name(rcode: u16) -> &'static str {
+    match rcode {
+        0 => "NOERROR",
+        1 => "FORMERR",
+        2 => "SERVFAIL",
+        3 => "NXDOMAIN",
+        4 => "NOTIMP",
+        5 => "REFUSED",
+        _ => "other",
+    }
+}
+
+/// Most "not seen" log lines in one confirmation (a change of reason logs
+/// again, up to this bound; the final reason is always logged on give-up).
+const DOH_LOG_CAP: usize = 8;
+
+/// Bounded logging across the polls of one confirmation: the first poll's
+/// reason, every change of reason (at most [`DOH_LOG_CAP`] lines), and the
+/// final verdict.
+#[derive(Debug, Default)]
+struct DohLog {
+    polls: u32,
+    logged: usize,
+    last: Option<DohOutcome>,
+}
+
+impl DohLog {
+    fn not_seen(&mut self, fqdn: &str, outcome: DohOutcome) {
+        self.polls = self.polls.saturating_add(1);
+        let changed = self.last.as_ref().map(DohOutcome::class) != Some(outcome.class());
+        if changed && self.logged < DOH_LOG_CAP {
+            self.logged += 1;
+            tracing::info!(
+                fqdn,
+                poll = self.polls,
+                reason = %outcome,
+                "acme: DNS-01 DoH poll did not see the TXT value yet"
+            );
+        }
+        self.last = Some(outcome);
+    }
+
+    fn seen(&self, fqdn: &str) {
+        tracing::info!(
+            fqdn,
+            polls = self.polls.saturating_add(1),
+            "acme: DNS-01 TXT value seen via DNS over HTTPS"
+        );
+    }
+
+    fn give_up(&self, fqdn: &str) {
+        let reason = self
+            .last
+            .as_ref()
+            .map_or_else(|| "no poll completed".to_owned(), ToString::to_string);
+        tracing::warn!(
+            fqdn,
+            polls = self.polls,
+            last = %reason,
+            "acme: DNS-01 TXT value not seen via DNS over HTTPS before the deadline"
+        );
+    }
+}
+
+/// One RFC 8484 GET for `fqdn` TXT through `client` at `url`, classified.
+/// This is exactly the engine's confirmation path (also used by
+/// `multiview tls doh-check`).
+pub async fn doh_lookup(client: &EgressClient, url: &str, fqdn: &str, value: &str) -> DohOutcome {
+    use base64::Engine as _;
+    // RFC 8484 §4.1: id 0 keeps the GET cache-friendly.
+    let Some(wire) = query_wire(fqdn, TXT_TYPE, 0, true) else {
+        return DohOutcome::BadName;
     };
-    message.answers.iter().any(|record| match &record.data {
-        RData::TXT(txt) => txt
-            .txt_data
-            .iter()
-            .flat_map(|part| part.iter())
-            .copied()
-            .eq(value.bytes()),
-        _ => false,
-    })
+    let encoded = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(wire);
+    let Ok(request) = client
+        .reqwest()
+        .get(url)
+        .query(&[("dns", encoded.as_str())])
+        .header(reqwest::header::ACCEPT, "application/dns-message")
+        .build()
+    else {
+        return DohOutcome::BadName;
+    };
+    let response = match client.send_explained(request).await {
+        Ok(response) => response,
+        Err(failure) => return DohOutcome::Egress(failure),
+    };
+    if !response.status.is_success() {
+        return DohOutcome::Status(response.status.as_u16());
+    }
+    classify_doh_answer_for(&response.body, fqdn, value)
+}
+
+/// The production `DoH` client: public egress policy, built-in roots, the
+/// same deadlines and body cap as the engine's confirmation.
+///
+/// # Errors
+/// [`AcmeError::Egress`] if the client cannot be built.
+pub fn production_doh_client() -> Result<EgressClient, AcmeError> {
+    EgressClient::new_unpooled(
+        EgressPolicy::public(),
+        None,
+        EgressTimeouts::default(),
+        DOH_BODY_CAP,
+    )
+}
+
+/// The `DoH` endpoint host's addresses as the engine's resolver sees them,
+/// each with the egress screen's verdict (`None` = admitted, else the class).
+/// Diagnostic for `multiview tls doh-check`.
+///
+/// # Errors
+/// The resolver's error text when the name does not resolve.
+pub async fn doh_host_screen() -> Result<Vec<(IpAddr, Option<&'static str>)>, String> {
+    let host = url::Url::parse(DOH_URL)
+        .ok()
+        .and_then(|u| u.host_str().map(str::to_owned))
+        .unwrap_or_default();
+    let policy = EgressPolicy::public();
+    let addrs = tokio::net::lookup_host((host.as_str(), 443))
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(addrs
+        .map(|a| (a.ip(), policy.screen_ip(a.ip(), 0).err().map(|r| r.0)))
+        .collect())
+}
+
+/// Classify a `DoH` answer to the TXT query for `fqdn`.
+fn classify_doh_answer_for(wire: &[u8], fqdn: &str, value: &str) -> DohOutcome {
+    use hickory_resolver::proto::op::{Message, MessageType};
+    use hickory_resolver::proto::rr::{Name, RecordType};
+    let Ok(message) = Message::from_vec(wire) else {
+        return DohOutcome::Unparsable;
+    };
+    let expected = Name::from_ascii(format!("{}.", fqdn.trim_end_matches('.'))).ok();
+    let question_ok = message.queries.len() == 1
+        && message.queries.first().is_some_and(|q| {
+            q.query_type() == RecordType::TXT
+                && expected
+                    .as_ref()
+                    .is_some_and(|n| n.to_lowercase() == q.name().to_lowercase())
+        });
+    if message.metadata.message_type != MessageType::Response
+        || message.metadata.id != 0
+        || !question_ok
+    {
+        return DohOutcome::Mismatched;
+    }
+    classify_doh_answer(&message, expected.as_ref(), value)
+}
+
+/// Classify the answer section of a DNS message against `value`. With
+/// `owner`, only an IN TXT record owned by exactly that name (case-insensitive)
+/// counts; a TXT at any other owner is counted but never "seen".
+fn classify_doh_answer(
+    message: &hickory_resolver::proto::op::Message,
+    owner: Option<&hickory_resolver::proto::rr::Name>,
+    value: &str,
+) -> DohOutcome {
+    use hickory_resolver::proto::rr::{DNSClass, RData};
+    let mut txt = 0;
+    for record in &message.answers {
+        if let RData::TXT(data) = &record.data {
+            txt += 1;
+            let at_owner = owner.is_none_or(|expected| {
+                record.dns_class == DNSClass::IN
+                    && expected.to_lowercase() == record.name.to_lowercase()
+            });
+            if at_owner
+                && data
+                    .txt_data
+                    .iter()
+                    .flat_map(|part| part.iter())
+                    .copied()
+                    .eq(value.bytes())
+            {
+                return DohOutcome::Seen;
+            }
+        }
+    }
+    DohOutcome::NotSeen {
+        rcode: u16::from(message.metadata.response_code),
+        answers: message.answers.len(),
+        txt,
+    }
 }
 
 /// Whether `wire`, received from `from`, is an answer to the probe query
@@ -834,17 +1078,21 @@ impl DnsProvider for CloudflareDns {
             .last_method
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let last_doh = self
+            .last_doh
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            .map_or_else(String::new, |o| format!("; last DoH answer: {o}"));
         method.map(|method| match (method, self.confirm) {
-            (Method::Doh, DnsConfirm::Auto) => {
+            (Method::Doh, DnsConfirm::Auto) => format!(
                 "TXT not seen via DNS over HTTPS (cloudflare-dns.com) before the deadline \
-                 (port 53 intercepted)"
-                    .to_owned()
-            }
-            (Method::Doh, _) => {
+                 (port 53 intercepted){last_doh}"
+            ),
+            (Method::Doh, _) => format!(
                 "TXT not seen via DNS over HTTPS (cloudflare-dns.com) before the deadline \
-                 (confirm = \"doh\")"
-                    .to_owned()
-            }
+                 (confirm = \"doh\"){last_doh}"
+            ),
             (Method::Authoritative, _) => {
                 "TXT not seen at every authoritative nameserver (port 53) before the deadline; \
                  if this network intercepts DNS, set [network.tls.dns] confirm = \"doh\""
@@ -915,6 +1163,88 @@ mod tests {
         assert!(!txt_answer_matches(&answer(vec!["abc ".into()]), "abc"));
         assert!(!txt_answer_matches(b"not dns", "abc"));
         assert!(query_wire("bad..name", TXT_TYPE, 0, true).is_none());
+    }
+
+    #[test]
+    fn doh_answers_are_classified_with_bounded_reasons() {
+        use hickory_resolver::proto::op::{Message, MessageType, OpCode, Query, ResponseCode};
+        use hickory_resolver::proto::rr::{Name, RecordType};
+        let fqdn = "_acme-challenge.a.example.org";
+        let reply = |id: u16, qname: &str, rcode: ResponseCode| {
+            let mut m = Message::new(id, MessageType::Response, OpCode::Query);
+            m.metadata.response_code = rcode;
+            m.add_query(Query::query(
+                Name::from_ascii(qname).unwrap(),
+                RecordType::TXT,
+            ));
+            m.to_vec().unwrap()
+        };
+        let nx = reply(0, "_ACME-challenge.a.example.org.", ResponseCode::NXDomain);
+        let outcome = classify_doh_answer_for(&nx, fqdn, "secret-value");
+        assert_eq!(
+            outcome,
+            DohOutcome::NotSeen {
+                rcode: 3,
+                answers: 0,
+                txt: 0
+            }
+        );
+        let text = outcome.to_string();
+        assert!(text.contains("NXDOMAIN"), "{text}");
+        assert!(!text.contains("secret-value"), "{text}");
+        assert_eq!(
+            classify_doh_answer_for(
+                &reply(9, "_acme-challenge.a.example.org.", ResponseCode::NoError),
+                fqdn,
+                "v"
+            ),
+            DohOutcome::Mismatched
+        );
+        assert_eq!(
+            classify_doh_answer_for(
+                &reply(0, "other.example.org.", ResponseCode::NoError),
+                fqdn,
+                "v"
+            ),
+            DohOutcome::Mismatched
+        );
+        assert_eq!(
+            classify_doh_answer_for(b"junk", fqdn, "v"),
+            DohOutcome::Unparsable
+        );
+    }
+
+    #[test]
+    fn a_doh_txt_counts_only_at_the_queried_owner() {
+        use hickory_resolver::proto::op::{Message, MessageType, OpCode, Query};
+        use hickory_resolver::proto::rr::rdata::TXT;
+        use hickory_resolver::proto::rr::{Name, RData, Record, RecordType};
+        let fqdn = "_acme-challenge.a.example.org";
+        let reply = |owner: &str| {
+            let mut m = Message::new(0, MessageType::Response, OpCode::Query);
+            m.add_query(Query::query(
+                Name::from_ascii(format!("{fqdn}.")).unwrap(),
+                RecordType::TXT,
+            ));
+            m.add_answer(Record::from_rdata(
+                Name::from_ascii(owner).unwrap(),
+                60,
+                RData::TXT(TXT::new(vec!["the-value".into()])),
+            ));
+            m.to_vec().unwrap()
+        };
+        assert_eq!(
+            classify_doh_answer_for(&reply("_ACME-Challenge.a.example.org."), fqdn, "the-value"),
+            DohOutcome::Seen
+        );
+        assert_eq!(
+            classify_doh_answer_for(&reply("elsewhere.example.org."), fqdn, "the-value"),
+            DohOutcome::NotSeen {
+                rcode: 0,
+                answers: 1,
+                txt: 1
+            }
+        );
     }
 
     #[test]

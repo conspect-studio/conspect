@@ -25,7 +25,7 @@ use multiview_config::{MultiviewConfig, StartMode};
 use multiview_control::auth::{ApiKeyStore, Principal, Role};
 use multiview_control::output_routing::{
     OutputLive, OutputOutcome, OutputRouting, OutputTakeRequest, PlanCost, PlanPath, PlanRefusal,
-    RoutedFeed, RoutingLive, SlotPlan, TakeSubmitError,
+    RoutedAudio, RoutedFeed, RoutingLive, SlotPlan, TakeSubmitError,
 };
 use multiview_control::{
     boot_model::BootModel, command_bus, AppState, EngineStateSnapshot, InMemoryRepository,
@@ -108,6 +108,17 @@ fn keys() -> ApiKeyStore {
         "patch-out1-secret",
         scoped("patch-out1", &["output-1", "bars"], &["output-1"]),
     );
+    // The layouts `NewsOne`/`Secret` and the source `a`, but not `secret-cam`.
+    keys.register(
+        "patch-lay",
+        "patch-lay-secret",
+        scoped(
+            "patch-lay",
+            // `output-9` does not exist (review T-A1's oracle probe).
+            &["output-1", "output-9", "Secret", "NewsOne", "a", "bars"],
+            &["output-1", "output-9"],
+        ),
+    );
     keys.register(
         "patch-noaxis",
         "patch-noaxis-secret",
@@ -145,7 +156,7 @@ struct Fake {
     /// Race seam: when armed, every take-time plan waits here, so two
     /// concurrent takes both pass the replay peek before either reserves.
     rendezvous: Mutex<Option<Arc<std::sync::atomic::AtomicUsize>>>,
-    _tx: SyncSender<OutputOutcome>,
+    tx: SyncSender<OutputOutcome>,
     rx: Mutex<Option<Receiver<OutputOutcome>>>,
 }
 
@@ -155,7 +166,7 @@ impl Fake {
         Arc::new(Self {
             state: Mutex::new(FakeState::default()),
             rendezvous: Mutex::new(None),
-            _tx: tx,
+            tx,
             rx: Mutex::new(Some(rx)),
         })
     }
@@ -199,6 +210,7 @@ impl OutputRouting for Fake {
             needs_encoder: *feed != RoutedFeed::Program,
             sessions_in_use: 1,
             sessions_max: 6,
+            needs_aux_canvas: matches!(feed, RoutedFeed::Layout(_)),
         })
     }
     fn plan_slot(&self, output: &str, feed: &RoutedFeed) -> Result<SlotPlan, PlanRefusal> {
@@ -264,6 +276,7 @@ struct Rig {
     router: axum::Router,
     fake: Arc<Fake>,
     keys: Arc<ApiKeyStore>,
+    state: AppState,
 }
 
 fn rig(path: &Path) -> Rig {
@@ -297,9 +310,10 @@ fn rig_with(path: &Path, doc: &str) -> Rig {
     )))
     .with_output_routing(seam);
     Rig {
-        router: multiview_control::router(state),
+        router: multiview_control::router(state.clone()),
         fake,
         keys: api_keys,
+        state,
     }
 }
 
@@ -546,11 +560,9 @@ async fn unsupported_output_slots_are_typed_422s() {
             "slot-medium-mismatch",
             "fixed by the output's configuration",
         ),
-        (
-            vec![video("output-0", json!({"layout": "NewsOne"}))],
-            "unknown-source",
-            "#306",
-        ),
+        // A layout on video slot 0 is routable since #368 (see
+        // `a_layout_patches_onto_output_video_slot_0`); an unknown one is an
+        // unknown feed.
         (
             vec![video("output-0", bars()), video("output-1", bars())],
             "unknown-slot",
@@ -1404,4 +1416,361 @@ async fn an_effectively_equal_format_put_is_a_no_op() {
     assert_eq!(resp.headers()["x-multiview-apply"], "live");
     assert!(resp.headers().get("x-multiview-operation-id").is_some());
     assert_eq!(rig.fake.state.lock().unwrap().reformats.len(), 1);
+}
+
+/// Store a layout (two cells: `a` and `right`) in the repository.
+fn store_layout(rig: &Rig, id: &str, right: &str) {
+    rig.state
+        .repository
+        .create_layout(
+            id,
+            multiview_control::repository::LayoutInput {
+                name: id.to_owned(),
+                body: json!({
+                    "canvas": {"width": 640, "height": 360, "fps": "30000/1001"},
+                    "layout": {"kind": "grid", "columns": ["1fr", "1fr"], "rows": ["1fr"], "areas": ["a b"]},
+                    "cells": [
+                        {"id": "l", "area": "a", "source": {"input_id": "a"}},
+                        {"id": "r", "area": "b", "source": {"input_id": right}},
+                    ],
+                }),
+            },
+        )
+        .unwrap();
+}
+
+/// #342 B2 x #368: `{layout}` on an output's video slot 0 goes through the
+/// shared slot-0 take (the alias's machinery): it plans (+1 encoder), takes
+/// with the resolved layout body, and replays; an unknown layout is
+/// `unknown-source`, and a principal that may read the layout but not every
+/// source it shows is a bare 403 (plan and take), with nothing enqueued.
+#[tokio::test]
+async fn a_layout_patches_onto_output_video_slot_0() {
+    let dir = tempfile::tempdir().unwrap();
+    let rig = rig(&dir.path().join("boot.toml"));
+    store_layout(&rig, "NewsOne", "bars");
+    store_layout(&rig, "Secret", "secret-cam");
+    let body = patch(vec![video("output-0", json!({"layout": "NewsOne"}))]);
+    let (status, plan_body) = plan(&rig, OPERATOR_TOKEN, body.clone()).await;
+    assert_eq!(status, StatusCode::OK, "{plan_body}");
+    assert_eq!(plan_body["can_take"], true, "{plan_body}");
+    let (status, first) = take(&rig, OPERATOR_TOKEN, "lay-1", body.clone()).await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{first}");
+    {
+        let takes = rig.fake.takes();
+        assert_eq!(takes.len(), 1);
+        assert_eq!(
+            takes[0].video,
+            Some(RoutedFeed::Layout("NewsOne".to_owned()))
+        );
+        let layout = takes[0]
+            .layout
+            .as_ref()
+            .expect("the resolved layout body rides the take");
+        assert_eq!(layout.0.id, "NewsOne");
+    }
+    // A replay of the same key answers the same operation, never re-enqueues.
+    let (status, again) = take(&rig, OPERATOR_TOKEN, "lay-1", body).await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+    assert_eq!(again["operation_id"], first["operation_id"]);
+    assert_eq!(rig.fake.takes().len(), 1);
+    // Unknown layout: unknown-source in the plan, a typed 422 on take.
+    let unknown = patch(vec![video("output-0", json!({"layout": "Nope"}))]);
+    let (status, plan_body) = plan(&rig, OPERATOR_TOKEN, unknown.clone()).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(plan_body["can_take"], false, "{plan_body}");
+    assert_eq!(
+        plan_body["crosspoints"][0]["refusal"]["type"],
+        "unknown-source"
+    );
+    let (status, _) = take(&rig, OPERATOR_TOKEN, "lay-2", unknown).await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+    // `patch-lay` may read the layout `Secret` and output-1, but not the
+    // `secret-cam` source the layout shows (§6.3 source closure).
+    let token = "patch-lay.patch-lay-secret";
+    let secret = patch(vec![video("output-1", json!({"layout": "Secret"}))]);
+    let (status, _) = plan(&rig, token, secret.clone()).await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "the layout's closure is authorized"
+    );
+    let (status, _) = take(&rig, token, "lay-3", secret).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(rig.fake.takes().len(), 1, "nothing more reached the engine");
+}
+
+/// #342 B2 x #368: a replayed layout take is re-authorized on the layout's
+/// whole source closure under the CURRENT grants (the shared slot-0 key):
+/// once a source the layout shows is revoked, the replay of the very same
+/// key is a 403 on `/patch/take` and on the alias, and nothing re-enqueues.
+#[tokio::test]
+async fn a_layout_replay_reauthorizes_its_source_closure() {
+    let dir = tempfile::tempdir().unwrap();
+    let rig = rig(&dir.path().join("boot.toml"));
+    store_layout(&rig, "NewsOne", "bars");
+    let token = "patch-lay.patch-lay-secret";
+    let body = || patch(vec![video("output-1", json!({"layout": "NewsOne"}))]);
+    let (status, first) = take(&rig, token, "k", body()).await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{first}");
+    // Revoke `bars` (shown by the layout); the layout object stays.
+    assert!(rig.keys.set_principal(
+        "patch-lay",
+        Principal {
+            key_id: "patch-lay".to_owned(),
+            role: Role::Operator,
+            scoped_object_ids: Some(vec![
+                "output-1".to_owned(),
+                "NewsOne".to_owned(),
+                "a".to_owned(),
+            ]),
+            scoped_output_ids: Some(vec!["output-1".to_owned()]),
+            scoped_discovery_domains: None,
+        },
+    ));
+    let (status, problem) = take(&rig, token, "k", body()).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{problem}");
+    assert!(problem.get("operation_id").is_none());
+    assert_eq!(
+        alias_take(&rig, token, "k", "output-1", json!({"layout": "NewsOne"})).await,
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(rig.fake.takes().len(), 1);
+}
+
+/// Review T-A1: a `{layout}` feed's whole source closure is authorized with
+/// the other end checks, BEFORE any output lookup: a principal holding the
+/// output axis and the layout id but not a source the layout shows gets the
+/// SAME generic 403 for an existing and a nonexistent output, on
+/// `/patch/plan`, `/patch/take` and the alias (take and plan) — never a
+/// 404-vs-403 existence oracle. Nothing reaches the engine.
+#[tokio::test]
+async fn a_denied_layout_closure_is_403_before_the_output_lookup_on_every_route() {
+    let dir = tempfile::tempdir().unwrap();
+    let rig = rig(&dir.path().join("boot.toml"));
+    store_layout(&rig, "Secret", "secret-cam");
+    let token = "patch-lay.patch-lay-secret";
+    let mut answers = Vec::new();
+    for output in ["output-1", "output-9"] {
+        let body = patch(vec![video(output, json!({"layout": "Secret"}))]);
+        let (plan_status, plan_body) = plan(&rig, token, body.clone()).await;
+        let (take_status, take_body) = take(&rig, token, &format!("ta1-{output}"), body).await;
+        let alias_take_status = alias_take(
+            &rig,
+            token,
+            &format!("ta1a-{output}"),
+            output,
+            json!({"layout": "Secret"}),
+        )
+        .await;
+        let alias_plan = send(
+            &rig.router,
+            post(
+                "/api/v1/routing/plan",
+                token,
+                None,
+                &alias(output, json!({"layout": "Secret"})),
+            ),
+        )
+        .await;
+        let alias_plan_status = alias_plan.status();
+        let alias_plan_body = body_json(alias_plan).await;
+        for (route, status) in [
+            ("patch/plan", plan_status),
+            ("patch/take", take_status),
+            ("alias take", alias_take_status),
+            ("alias plan", alias_plan_status),
+        ] {
+            assert_eq!(status, StatusCode::FORBIDDEN, "{route} on {output}");
+        }
+        answers.push((
+            plan_body["detail"].clone(),
+            take_body["detail"].clone(),
+            alias_plan_body["detail"].clone(),
+        ));
+    }
+    assert_eq!(
+        answers[0], answers[1],
+        "identical answers: no existence oracle"
+    );
+    assert!(rig.fake.takes().is_empty(), "nothing reached the engine");
+}
+
+fn bars() -> Value {
+    json!({"source": "bars"})
+}
+
+fn audio_follow(output: &str) -> Value {
+    json!({ "plane": "audio", "destination": {"output": output, "slot": 0}, "source": "follow" })
+}
+
+/// The persisted `[[routing.output]]` row of an output's config id.
+fn persisted_row(rig: &Rig, output: &str) -> Option<Value> {
+    let config: MultiviewConfig = serde_json::from_value(
+        multiview_control::boot_model::current_desired_config(&rig.state).unwrap(),
+    )
+    .unwrap();
+    config
+        .routing
+        .as_ref()
+        .and_then(|t| t.output.iter().find(|xp| xp.output == output))
+        .map(|xp| serde_json::to_value(xp).unwrap())
+}
+
+async fn wait_for<F: Fn() -> bool>(f: F) {
+    for _ in 0..200 {
+        if f() {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    panic!("condition not reached");
+}
+
+/// Review T-M1: audio slot 0 `"follow"` rides the patch take as the alias's
+/// `audio: "follow"`. An output with an explicit audio choice
+/// (`secret-cam`), patched `{video, audio follow}`: the engine take request
+/// carries `Follow`, and once applied the persisted row's audio is follow
+/// (the explicit choice is gone). Without audio slot 0 the take keeps the
+/// output's choice (`audio: None`).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn audio_slot_zero_follow_rides_the_take_and_persists_follow() {
+    let dir = tempfile::tempdir().unwrap();
+    let doc = format!(
+        "{DOC}\n[[routing.output]]\noutput = \"{OUT_B}\"\nprogram = \"main\"\naudio = {{ source = \"secret-cam\" }}\n"
+    );
+    let rig = rig_with(&dir.path().join("boot.toml"), &doc);
+    assert_eq!(
+        persisted_row(&rig, OUT_B).unwrap()["audio"],
+        json!({"source": "secret-cam"})
+    );
+    // No audio slot: the output's choice is kept.
+    let (status, _) = take(
+        &rig,
+        OPERATOR_TOKEN,
+        "keep",
+        patch(vec![video("output-1", bars())]),
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+    assert_eq!(rig.fake.takes()[0].audio, None, "omitted: keep the choice");
+    // Audio slot 0 follow: the engine take carries Follow.
+    let (status, accepted) = take(
+        &rig,
+        OPERATOR_TOKEN,
+        "follow",
+        patch(vec![video("output-1", bars()), audio_follow("output-1")]),
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{accepted}");
+    let takes = rig.fake.takes();
+    assert_eq!(takes[1].audio, Some(RoutedAudio::Follow));
+    rig.fake
+        .tx
+        .send(OutputOutcome {
+            operation_id: accepted["operation_id"].as_str().unwrap().to_owned(),
+            output: OUT_B.into(),
+            tick: 7,
+            outcome: "applied".into(),
+            feed: Some(RoutedFeed::Source("bars".into())),
+            audio: Some(RoutedAudio::Follow),
+        })
+        .unwrap();
+    wait_for(|| {
+        persisted_row(&rig, OUT_B).is_some_and(|r| r["video"] == json!({"source": "bars"}))
+    })
+    .await;
+    let row = persisted_row(&rig, OUT_B).unwrap();
+    assert!(
+        row.get("audio").is_none_or(|a| a == "follow"),
+        "the explicit choice is replaced by follow: {row}"
+    );
+}
+
+/// Review T-M1 addendum: an explicit audio follow is the SAME take on both
+/// slot-0 routes, so one Idempotency-Key replays across them in both
+/// directions (same operation id, never a 409 and never a second enqueue).
+#[tokio::test]
+async fn explicit_follow_replays_across_the_patch_and_the_alias() {
+    let dir = tempfile::tempdir().unwrap();
+    let rig = rig(&dir.path().join("boot.toml"));
+    let alias_follow = |output: &str| {
+        json!({
+            "target": {"kind": "output", "output": output, "stream": "video"},
+            "feed": bars(),
+            "audio": "follow",
+        })
+    };
+    let alias_send = |key: &'static str| {
+        let body = alias_follow("output-1");
+        let router = rig.router.clone();
+        async move {
+            let resp = send(
+                &router,
+                post(
+                    "/api/v1/routing/output/take",
+                    OPERATOR_TOKEN,
+                    Some(key),
+                    &body,
+                ),
+            )
+            .await;
+            (resp.status(), body_json(resp).await)
+        }
+    };
+    let patch_body = || patch(vec![video("output-1", bars()), audio_follow("output-1")]);
+    // Patch first, then the alias with the same key.
+    let (status, first) = take(&rig, OPERATOR_TOKEN, "x1", patch_body()).await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{first}");
+    let (status, again) = alias_send("x1").await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{again}");
+    assert_eq!(again["operation_id"], first["operation_id"]);
+    // Alias first, then the patch with the same key.
+    let (status, first) = alias_send("x2").await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{first}");
+    let (status, again) = take(&rig, OPERATOR_TOKEN, "x2", patch_body()).await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{again}");
+    assert_eq!(again["operation_id"], first["operation_id"]);
+    assert_eq!(rig.fake.takes().len(), 2, "one enqueue per key");
+}
+
+/// Review T-M2: with no live readback (the engine reports no snapshot),
+/// `GET /patch` never invents Program: video slot 0 is `live: false` with a
+/// null `source` and `path`; once a readback exists it is `live: true` with
+/// the readback's feed.
+#[tokio::test]
+async fn get_without_a_readback_reports_the_live_state_unknown() {
+    let dir = tempfile::tempdir().unwrap();
+    let rig = rig(&dir.path().join("boot.toml"));
+    rig.fake.state.lock().unwrap().live = None;
+    let all = body_json(send(&rig.router, get("/api/v1/patch", OPERATOR_TOKEN)).await).await;
+    for output in all["outputs"].as_array().unwrap() {
+        let slot = &output["video"][0];
+        assert_eq!(slot["live"], false, "{all}");
+        assert!(slot["source"].is_null(), "never an invented program: {all}");
+        assert!(slot["path"].is_null(), "{all}");
+        assert!(slot["pending"].is_null(), "{all}");
+    }
+    rig.fake.state.lock().unwrap().live = Some(RoutingLive {
+        outputs: HashMap::from([(
+            OUT_A.to_owned(),
+            OutputLive {
+                bus: "src:bars".to_owned(),
+                since_tick: 1,
+                pending: None,
+                degraded: false,
+                audio: None,
+                pending_audio: None,
+                private_audio: false,
+            },
+        )]),
+        ..RoutingLive::default()
+    });
+    let all = body_json(send(&rig.router, get("/api/v1/patch", OPERATOR_TOKEN)).await).await;
+    let a = &all["outputs"][0]["video"][0];
+    assert_eq!(a["live"], true, "{all}");
+    assert_eq!(a["source"], json!({"source": "bars"}), "{all}");
+    let b = &all["outputs"][1]["video"][0];
+    assert_eq!(b["live"], false, "an output without a readback: {all}");
+    assert!(b["source"].is_null(), "{all}");
 }

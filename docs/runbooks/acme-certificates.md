@@ -175,6 +175,22 @@ the record is visible in the Cloudflare dashboard, and `dig @<cloudflare-ns> _ac
 TXT` (or `dig @192.0.2.1 example.org SOA`, where nothing should answer) returns NOERROR with a bogus
 SOA such as `a.misconfigured.dns.server.invalid`. Keep `confirm = "auto"` or set `confirm = "doh"`.
 
+**DoH diagnostics.** Every DoH poll that does not see the value is classified, and the journal
+logs the first reason and each change of reason (at most 8 lines per attempt, then a final
+`not seen via DNS over HTTPS before the deadline` line). The `dns-propagation-timeout` detail ends
+with `last DoH answer: ...`: an HTTP status, `request failed: egress refused (<class>)` /
+`transport failed (connect|timeout|tls)`, or `rcode N (NXDOMAIN), A answer(s), T TXT, value absent`.
+To run exactly the engine's query from the host, without a config or the engine:
+
+```sh
+multiview tls doh-check _acme-challenge.example.org <expected-value> --wait 120
+```
+
+It prints the endpoint's addresses with the egress screen's verdict, each change of reason, and
+`SEEN` (exit 0) or `NOT SEEN` (exit 1). Every DoH poll opens a fresh connection: Cloudflare's
+resolver can keep answering the pre-publish NXDOMAIN on a kept-alive connection for minutes after
+the record exists (#374).
+
 ### CAA
 
 If the zone has CAA records, allow the CA and the methods:

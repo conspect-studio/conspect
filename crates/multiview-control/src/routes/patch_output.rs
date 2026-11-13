@@ -2,14 +2,14 @@
 //! #342 B2): the `outputs` section of `GET /api/v1/patch`, and the output
 //! crosspoints of `POST /patch/plan` and `POST /patch/take`.
 //!
-//! A request patches the slots of ONE output: its video slot 0 (`{source}`
-//! or `{bus}`) and optionally audio slot 0 with `"follow"`, which rides the
+//! A request patches the slots of ONE output: its video slot 0 (`{source}`,
+//! `{bus}` or `{layout}`: a stored layout, ADR-0108 slice 3) and optionally audio slot 0 with `"follow"`, which rides the
 //! video take. Other slots are fixed by config in this slice. The take goes
 //! through [`super::output_routing::take_output_slot0`], the same machinery
 //! as `POST /routing/output/take` (that route is the slot-0 alias).
 
 use axum::response::Response;
-use multiview_config::{OutputBus, VideoFeed};
+use multiview_config::{AudioFeed, OutputBus, VideoFeed};
 use serde_json::{json, Value};
 
 use super::output_routing::{
@@ -31,14 +31,19 @@ pub(crate) fn may_patch_output(principal: &Principal, output: &str) -> bool {
     super::output_routing::authorize_output_end(principal, output).is_ok()
 }
 
-/// One validated output-slot request: the output and its video feed. Audio
-/// slot 0 `"follow"` (when named) rides the video take exactly as the alias's
-/// `audio: follow` does: the output keeps following its video.
+/// One validated output-slot request: the output, its video feed and
+/// whether audio slot 0 `"follow"` was named. Named, it rides the video take
+/// exactly as the alias's `audio: "follow"` does (the output's audio follows
+/// its video from then on, replacing an explicit choice); omitted, the
+/// output keeps its current audio choice, as the alias without `audio`
+/// (#342 review T-M1).
 pub(crate) struct OutputPatch {
     /// The output API id.
     pub output: String,
     /// Video slot 0's feed.
     pub video: VideoFeed,
+    /// Audio slot 0 `"follow"` was named in the patch.
+    pub audio_follow: bool,
 }
 
 /// Whether any crosspoint addresses an output slot.
@@ -52,7 +57,7 @@ fn video_feed(xp: &PatchCrosspoint) -> Result<VideoFeed, Box<Response>> {
     let refuse = |detail: &str| Box::new(problem(422, "unknown-source", detail.to_owned()));
     let Value::Object(map) = &xp.source else {
         return Err(refuse(
-            "an output video slot takes {\"source\": id} or {\"bus\": \"program\"|\"preview\"|\"clean\"}",
+            "an output video slot takes {\"source\": id}, {\"layout\": id} or {\"bus\": \"program\"|\"preview\"|\"clean\"}",
         ));
     };
     if map.len() != 1 {
@@ -61,16 +66,19 @@ fn video_feed(xp: &PatchCrosspoint) -> Result<VideoFeed, Box<Response>> {
     if let Some(id) = map.get("source").and_then(Value::as_str) {
         return Ok(VideoFeed::Source(id.to_owned()));
     }
+    // A stored layout (ADR-0108 slice 3, #306): its id is authorized by the
+    // patch route's `authorize`, its whole source closure by `resolve_feed`
+    // (plan, take and a replay alike).
+    if let Some(id) = map.get("layout").and_then(Value::as_str) {
+        return Ok(VideoFeed::Layout(id.to_owned()));
+    }
     match map.get("bus").and_then(Value::as_str) {
         Some("program") => Ok(VideoFeed::Bus(OutputBus::Program)),
         Some("preview") => Ok(VideoFeed::Bus(OutputBus::Preview)),
         Some("clean") => Ok(VideoFeed::Bus(OutputBus::Clean)),
         Some(_) => Err(refuse("unknown bus; use program, preview or clean")),
-        None if map.contains_key("layout") => Err(refuse(
-            "layouts as output feeds arrive with layout pictures (#306)",
-        )),
         None => Err(refuse(
-            "an output video slot takes {\"source\": id} or {\"bus\": ...}",
+            "an output video slot takes {\"source\": id}, {\"layout\": id} or {\"bus\": ...}",
         )),
     }
 }
@@ -80,6 +88,7 @@ fn video_feed(xp: &PatchCrosspoint) -> Result<VideoFeed, Box<Response>> {
 pub(crate) fn shape(req: &PatchRequest) -> Result<OutputPatch, Box<Response>> {
     let mut output: Option<&str> = None;
     let mut video: Option<VideoFeed> = None;
+    let mut audio_follow = false;
     for xp in &req.crosspoints {
         let d = &xp.destination;
         let Some(this) = d.output.as_deref() else {
@@ -133,6 +142,14 @@ pub(crate) fn shape(req: &PatchRequest) -> Result<OutputPatch, Box<Response>> {
                          only audio slot 0 with \"follow\" (it rides the video take) is patchable",
                     )));
                 }
+                if audio_follow {
+                    return Err(Box::new(problem(
+                        422,
+                        "unknown-slot",
+                        "audio slot 0 appears twice in one patch",
+                    )));
+                }
+                audio_follow = true;
             }
             "subtitle" => {
                 return Err(Box::new(problem(
@@ -160,6 +177,7 @@ pub(crate) fn shape(req: &PatchRequest) -> Result<OutputPatch, Box<Response>> {
     Ok(OutputPatch {
         output: output.to_owned(),
         video,
+        audio_follow,
     })
 }
 
@@ -189,14 +207,16 @@ pub(crate) fn plan(
     let mut planned_path = "P1";
     let mut cost = None;
     let mut refused: Option<PatchRefusal> = None;
-    match resolve_feed(state, &patch.video)? {
-        Err(_) => {
+    match resolve_feed(state, principal, &patch.video)? {
+        Err((_, "unknown-feed", _)) => {
             refused = Some(refusal(
                 "unknown-source",
                 "the feed does not exist or cannot be routed",
             ));
         }
-        Ok(feed) => match control.routing.plan_slot(&config_id, &feed) {
+        // `layout-not-admissible` (another canvas, unsolvable, translucent).
+        Err((_, kind, detail)) => refused = Some(refusal(kind, detail)),
+        Ok((feed, _)) => match control.routing.plan_slot(&config_id, &feed) {
             Ok(planned) => {
                 planned_path = planned.path.as_str();
                 let fits = planned.cost.fits();
@@ -237,6 +257,12 @@ pub(crate) fn plan(
                     "This output cannot carry a routed audio feed",
                 ));
             }
+            Err(PlanRefusal::AuxCapacity { active, max }) => {
+                refused = Some(refusal(
+                    "aux-capacity",
+                    super::output_routing::aux_capacity_text(principal, active, max),
+                ));
+            }
         },
     }
     let mut crosspoints = Vec::with_capacity(req.crosspoints.len());
@@ -272,15 +298,17 @@ pub(crate) fn take(
         ));
     }
     Ok(
-        // Audio slot 0 `follow` rides the video take: the output's audio
-        // choice is kept (`None`), exactly as the alias without `audio`.
+        // Audio slot 0 `follow`, when named, rides the video take as the
+        // alias's `audio: "follow"` (same engine request, same take record,
+        // so the two routes replay each other); omitted, the output's audio
+        // choice is kept (`None`), as the alias without `audio` (T-M1).
         match take_output_slot0(
             state,
             principal,
             idem,
             &patch.output,
             Some(&patch.video),
-            None,
+            patch.audio_follow.then_some(&AudioFeed::Follow),
         )? {
             SlotTake::Accepted(op) => Ok(op),
             SlotTake::Replay(replay) => Ok(replay.operation_id.to_string()),
@@ -306,6 +334,9 @@ pub(crate) fn outputs_view(state: &AppState, principal: &Principal) -> ControlRe
         .as_ref()
         .and_then(|c| c.routing.snapshot());
     let redacted = json!({ "redacted": true });
+    // A layout feed is readable only with Read on the layout AND every
+    // source it shows (§6.3), exactly as `GET /routing` redacts it.
+    let layouts = super::routing::layout_sources(state)?;
     let mut out = Vec::new();
     for versioned in resources {
         let api_id = versioned.resource.id;
@@ -320,19 +351,22 @@ pub(crate) fn outputs_view(state: &AppState, principal: &Principal) -> ControlRe
         let feed_view = |bus: &str| {
             crate::output_routing::RoutedFeed::from_bus_name(bus)
                 .map(|feed| feed.video_feed())
-                .filter(|feed| super::routing::may_read_feed(principal, feed))
+                .filter(|feed| super::routing::may_read_feed(principal, &layouts, feed))
                 .and_then(|feed| serde_json::to_value(feed).ok())
                 .unwrap_or_else(|| redacted.clone())
         };
-        let video_source = readback.map_or_else(|| feed_view("program"), |r| feed_view(&r.bus));
+        // No readback (no running engine, routing unavailable or the output
+        // not in this run): the live state is unknown and reported as such
+        // (`source`/`path` null, `live: false`), never an invented Program
+        // P1 (#342 review T-M2).
+        let video_source = readback.map_or(Value::Null, |r| feed_view(&r.bus));
         let pending = readback
             .and_then(|r| r.pending.as_ref())
             .map(|(bus, held)| json!({ "source": feed_view(bus), "held_ticks": held }));
-        let path = state
-            .output_routing
-            .as_ref()
+        let path = readback
+            .and(state.output_routing.as_ref())
             .and_then(|c| c.routing.current_path(&body.id()))
-            .map_or("P1", crate::output_routing::PlanPath::as_str);
+            .map(crate::output_routing::PlanPath::as_str);
         // Slot 0 carries the accepted audio feed (default `follow`, redacted
         // per GET /routing's rule); slots i > 0 their configured track.
         let accepted_audio =
@@ -364,6 +398,7 @@ pub(crate) fn outputs_view(state: &AppState, principal: &Principal) -> ControlRe
             "format": body.format(),
             "video": [{
                 "slot": 0,
+                "live": readback.is_some(),
                 "source": video_source,
                 "path": path,
                 "pending": pending,

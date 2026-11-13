@@ -243,7 +243,7 @@ where
         .zip(&seen_audio)
         .zip(&seen_video)
         .map(|((s, a), v)| {
-            if keep_video {
+            if keep_video || template.contains("# keep-video") {
                 recorder_with_video(Arc::clone(s), Arc::clone(a), Some(Arc::clone(v)))
             } else {
                 recorder(Arc::clone(s), Arc::clone(a))
@@ -1605,6 +1605,224 @@ fn an_audio_only_take_routes_a_source_and_returns_to_the_shared_stream() {
     let after = span(1, g(to_program.tick) + 4096, i64::MAX);
     assert!(after.len() > 1024);
     assert!(rms(&after) < 1e-3, "after the return: {}", rms(&after));
+}
+
+/// [`CONFIG`] with two distinct solid sources (dark left, bright right), so
+/// a swap of the halves is visible in the decoded pictures.
+const LAYOUT_CONFIG: &str = r##"
+# keep-video
+schema_version = 1
+[canvas]
+width = 64
+height = 64
+fps = "25/1"
+pixel_format = "nv12"
+background = "#101014"
+[canvas.color]
+profile = "sdr-bt709-limited"
+[layout]
+kind = "grid"
+columns = ["1fr", "1fr"]
+rows = ["1fr"]
+areas = ["a b"]
+[[sources]]
+id = "@_a"
+kind = "solid"
+color = "#202020"
+[[sources]]
+id = "@_b"
+kind = "solid"
+color = "#e0e0e0"
+[[cells]]
+id = "cell_a"
+area = "a"
+[cells.source]
+input_id = "@_a"
+[[cells]]
+id = "cell_b"
+area = "b"
+[cells.source]
+input_id = "@_b"
+[[outputs]]
+id = "out0"
+kind = "hls"
+path = "/tmp/multiview-routing-e2e/@/a/index.m3u8"
+codec = "mpeg2video"
+segment_ms = 1000
+[[outputs]]
+id = "out1"
+kind = "hls"
+path = "/tmp/multiview-routing-e2e/@/b/index.m3u8"
+codec = "mpeg2video"
+segment_ms = 1000
+"##;
+
+/// A routed layout for the 64x64 test canvas: the Program grid with its two
+/// cells swapped (`b` left, `a` right).
+fn swapped_layout(prefix: &str) -> PictureBus {
+    use multiview_core::layout::{Canvas, Cell, FitMode, Layout};
+    let cell = |x: f32, source: &str| Cell {
+        x,
+        y: 0.0,
+        w: 0.5,
+        h: 1.0,
+        z: 0,
+        fit: FitMode::Fill,
+        source: Some(format!("{prefix}_{source}")),
+        opacity: 1.0,
+    };
+    let layout = Layout {
+        name: "swapped".to_owned(),
+        canvas: Canvas {
+            width: 64,
+            height: 64,
+            fps_num: 25,
+            fps_den: 1,
+        },
+        cells: vec![cell(0.0, "b"), cell(0.5, "a")],
+    };
+    PictureBus::Layout(crate::routing_aux::LayoutRef::new(Arc::new(
+        crate::aux_layout::RoutedLayout {
+            id: "swapped".to_owned(),
+            slates: vec![multiview_config::FailoverSlate::Black; 2],
+            layout,
+        },
+    )))
+}
+
+/// ADR-0108 slice 3 (#306) through the real pipeline: output 1 is taken to a
+/// stored layout (Program's two cells swapped), composed by the real
+/// `routing-aux` thread from the stores Program reads. The cut is a keyframe
+/// with a sequence header; output 1's PTS step stays one tick; output 0 keeps
+/// every Program window; output 1's decoded picture is Program's with its
+/// halves swapped (the same sources, no new decoder). Then a flood of 12
+/// back-to-back takes alternating layout/Program: every take gets exactly
+/// one terminal outcome and Program never misses a window. Finally output 1
+/// returns to Program at +0 encoders.
+#[test]
+#[allow(clippy::too_many_lines)] // One end-to-end scenario with its assertions.
+fn a_take_to_a_layout_composes_it_live_and_survives_a_take_flood() {
+    const TICKS: u64 = 400;
+    let observed = Arc::new(Mutex::new(None));
+    let record = Arc::clone(&observed);
+    let run = drive_config(LAYOUT_CONFIG, false, "route_layout", TICKS, move |slot| {
+        let handle = wait_for("the routing handle", Duration::from_secs(10), || {
+            slot.load()
+        });
+        let outcomes = handle.outcomes().expect("one outcome reader");
+        wait_for("the first routing tick", Duration::from_secs(10), || {
+            (handle.snapshot().video_keys > 0).then_some(())
+        });
+        std::thread::sleep(Duration::from_millis(800));
+        let layout = swapped_layout("route_layout");
+        handle
+            .try_take(take("to-layout", 1, layout.clone()))
+            .unwrap();
+        let o = wait_for("to-layout outcome", Duration::from_secs(10), || {
+            outcomes.try_recv().ok()
+        });
+        assert_eq!(o.outcome, TakeResult::Applied, "{o:?}");
+        assert_eq!(o.bus, layout, "applied carries the layout bus");
+        let s = wait_for("snapshot", Duration::from_secs(1), || {
+            let s = handle.snapshot();
+            (s.outputs[1].bus == "aux:swapped").then_some(s)
+        });
+        assert_eq!(s.aux_canvases, vec!["aux:swapped".to_owned()]);
+        assert_eq!(s.video_keys, 2, "+1 encoder for the layout bus");
+        std::thread::sleep(Duration::from_millis(1500));
+        // The flood: 12 takes, no waiting between them.
+        let flood: Vec<String> = (0..12).map(|i| format!("flood-{i}")).collect();
+        for (i, op) in flood.iter().enumerate() {
+            let bus = if i % 2 == 0 {
+                PictureBus::Program
+            } else {
+                layout.clone()
+            };
+            handle.try_take(take(op, 1, bus)).unwrap();
+        }
+        let mut settled = Vec::new();
+        wait_for("every flood outcome", Duration::from_secs(20), || {
+            settled.extend(outcomes.try_iter().map(|o| (o.operation_id, o.outcome)));
+            (settled.len() >= flood.len()).then_some(())
+        });
+        // Exactly one terminal outcome per take, in order; the last applies.
+        let ids: Vec<&String> = settled.iter().map(|(id, _)| id).collect();
+        assert_eq!(ids, flood.iter().collect::<Vec<_>>(), "{settled:?}");
+        assert_eq!(
+            settled.last().unwrap().1,
+            TakeResult::Applied,
+            "{settled:?}"
+        );
+        // The flood ended on the layout; go back to Program at +0.
+        handle
+            .try_take(take("to-program", 1, PictureBus::Program))
+            .unwrap();
+        let back = wait_for("to-program outcome", Duration::from_secs(10), || {
+            outcomes.try_recv().ok()
+        });
+        assert_eq!(back.outcome, TakeResult::Applied, "{back:?}");
+        let s = wait_for("snapshot", Duration::from_secs(1), || {
+            let s = handle.snapshot();
+            (s.outputs[1].bus == "program").then_some(s)
+        });
+        assert_eq!(s.video_keys, 2, "+0 encoders back to Program");
+        *record.lock().unwrap() = Some((o, back));
+    });
+    let (applied, back) = observed.lock().unwrap().clone().expect("applied");
+    assert_eq!(run.frames, TICKS);
+    let all: Vec<i64> = (0..i64::try_from(TICKS).unwrap()).collect();
+    assert_eq!(
+        pts_of(&run.outputs[0]),
+        all,
+        "output 0 gets every Program window"
+    );
+    assert_eq!(
+        pts_of(&run.outputs[1]),
+        all,
+        "output 1: one packet per tick, PTS step one tick across every move"
+    );
+    for at in [applied.tick, back.tick] {
+        let first = run.outputs[1]
+            .iter()
+            .find(|p| p.0 == i64::try_from(at).unwrap())
+            .unwrap();
+        assert!(
+            first.1 && first.2,
+            "cut at {at} is a keyframe with a sequence header"
+        );
+    }
+    // Output 1 shows Program with its halves swapped while on the layout.
+    let program = decode_luma(&run.video[0]);
+    let routed = decode_luma(&run.video[1]);
+    let at = i64::try_from(applied.tick).unwrap();
+    let compared: Vec<i64> = (at + 10..at + 30)
+        .filter(|t| routed.contains_key(t) && program.contains_key(t))
+        .collect();
+    assert!(compared.len() >= 15, "decoded {} pictures", compared.len());
+    let mean = |plane: &[u8], x0: usize| -> i64 {
+        let mut sum = 0i64;
+        let mut n = 0i64;
+        for row in 8..56 {
+            for x in x0 + 8..x0 + 24 {
+                sum += i64::from(plane[row * 64 + x]);
+                n += 1;
+            }
+        }
+        sum / n
+    };
+    for t in &compared {
+        let (p, r) = (&program[t], &routed[t]);
+        let (pl, pr, rl, rr) = (mean(p, 0), mean(p, 32), mean(r, 0), mean(r, 32));
+        assert!(
+            pr - pl > 100,
+            "tick {t}: the halves really differ ({pl}, {pr})"
+        );
+        assert!(
+            (rl - pr).abs() <= 6 && (rr - pl).abs() <= 6,
+            "tick {t}: routed halves ({rl}, {rr}) are Program's swapped ({pl}, {pr})"
+        );
+    }
+    assert_eq!(run.final_snapshot.dynamic_encoders_live, 0);
 }
 
 /// ADR-0108 slice 2 §6.1: a run whose config persists `audio = { source =

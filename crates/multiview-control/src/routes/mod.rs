@@ -142,7 +142,7 @@ fn layout_response(status: StatusCode, versioned: &VersionedLayout) -> Response 
 /// Read the accepted layout library, not its replaceable SQLite projection.
 /// Review R3-03: the in-memory accepted snapshot, not a fresh
 /// `desired.json` read-parse-validate on every layout list/GET.
-fn authoritative_layouts(
+pub(crate) fn authoritative_layouts(
     state: &AppState,
 ) -> ControlResult<Option<std::sync::Arc<crate::boot_model::DesiredState>>> {
     let Some(model) = &state.boot_model else {
@@ -153,7 +153,7 @@ fn authoritative_layouts(
 
 /// Return a layout with the envelope-owned version. Older envelopes without
 /// explicit counters use version one until their next accepted mutation.
-fn authoritative_layout(
+pub(crate) fn authoritative_layout(
     desired: &crate::boot_model::DesiredState,
     id: &str,
 ) -> ControlResult<VersionedLayout> {
@@ -1376,6 +1376,7 @@ fn health_router() -> Router<AppState> {
 
 /// Build the `/api/v1` resource + command routes (without the realtime or docs
 /// routes, which are wired by [`crate::router()`]).
+#[allow(clippy::too_many_lines)] // One `.route()` line per endpoint; splitting it loses the single at-a-glance map.
 pub fn api_router() -> Router<AppState> {
     Router::new()
         .route("/cloudflare/credentials", post(cloudflare::save))
@@ -1448,6 +1449,10 @@ pub fn api_router() -> Router<AppState> {
         .route(
             "/metrics/program",
             get(crate::program_metrics::get_program_metrics),
+        )
+        .route(
+            "/metrics/frontdoor",
+            get(crate::frontdoor_metrics::get_frontdoor_metrics),
         )
         .route("/routing", get(routing::get_routing))
         .route("/routing/plan", post(routing::plan_route))

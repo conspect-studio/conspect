@@ -69,3 +69,22 @@ ClientHello, so a renewal reaches new QUIC handshakes without a restart. `None`
 (every existing caller, including every test) keeps the original path byte for
 byte. Only the QUIC (`noq`) server honours it; the plain-TLS `server_config` path
 is unchanged. No wire behaviour changes.
+
+## QUIC Retry policy on the injected socket (ADR-0107 slice 3, issue #289)
+
+`noq::Injected` gains two opt-in fields: `retry_above_handshakes: Option<usize>`
+and `retry_counter: Option<Arc<AtomicU64>>`; `NoqServer` stores both. New
+`NoqServer::maybe_retry(incoming, handshakes_in_flight)`: with a threshold set,
+once `handshakes_in_flight >= threshold`, an `Incoming` whose remote address is
+not yet validated and that `may_retry()` is answered with `incoming.retry()` (RFC
+9000 section 8.1.2), bumping the counter; a failed `retry()` falls back to
+`ignore()`. Either way it returns `None` and nothing is accepted. The gate sits in
+`Server::accept_next`'s noq arm, before the accept future is pushed:
+`handshakes_in_flight` is `self.accept.len()`, the `FuturesUnordered` holding each
+accepted `Incoming` until its QUIC handshake and MoQ SETUP finish (bounded by the
+setup deadline). Tested in `crates/multiview-frontdoor/tests/retry.rs` with real,
+stalled noq clients: threshold 4 and 8 stalled clients gives exactly 4
+connections and 4 Retried clients, and a normal client then connects through a
+Retry. `None` (every caller before this field, and all of multiview except the
+front-door `MoQ` socket) returns the `Incoming` unchanged: no wire behaviour
+change. `multiview-moq` `SharedSocket` and the front-door tests pass both fields.

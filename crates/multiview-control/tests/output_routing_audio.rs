@@ -176,6 +176,7 @@ impl OutputRouting for Fake {
             needs_encoder: false,
             sessions_in_use: 0,
             sessions_max: 6,
+            needs_aux_canvas: false,
         })
     }
     fn plan_audio(

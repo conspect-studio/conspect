@@ -84,8 +84,9 @@ pub struct PatchCrosspoint {
     pub plane: String,
     /// Where the source is patched.
     pub destination: PatchDestination,
-    /// `{"source": id}` or `"none"` (this slice); `{"layout": id}`,
-    /// `{"bus": ..}`, `"follow"` arrive in later slices.
+    /// A mixer input: `{"source": id}` or `"none"`. An output video slot 0:
+    /// `{"source": id}`, `{"layout": id}` (a stored layout; Read on it AND on
+    /// every source its cells bind) or `{"bus": ..}`; audio slot 0: `"follow"`.
     #[cfg_attr(feature = "openapi", schema(value_type = Object))]
     pub source: Value,
 }
@@ -210,7 +211,7 @@ fn source_id(source: &Value) -> Option<&str> {
 }
 
 /// Authorize both ends of every crosspoint (BOLA), before any existence check.
-fn authorize(principal: &Principal, req: &PatchRequest) -> ControlResult<()> {
+fn authorize(state: &AppState, principal: &Principal, req: &PatchRequest) -> ControlResult<()> {
     for xp in &req.crosspoints {
         let destination = &xp.destination;
         if let Some(mixer) = &destination.mixer {
@@ -220,10 +221,13 @@ fn authorize(principal: &Principal, req: &PatchRequest) -> ControlResult<()> {
         if let Some(output) = &destination.output {
             super::output_routing::authorize_output_end(principal, output)?;
         }
-        if let Some(object) =
-            source_id(&xp.source).or_else(|| xp.source.get("layout").and_then(Value::as_str))
-        {
+        if let Some(object) = source_id(&xp.source) {
             authorize_object(principal, object)?;
+        }
+        // A layout: its id AND its whole current source closure, before any
+        // output or feed existence answer (#342 review T-A1).
+        if let Some(layout) = xp.source.get("layout").and_then(Value::as_str) {
+            super::output_routing::authorize_layout_feed(state, principal, layout)?;
         }
         if xp.source.get("bus").is_some() {
             authorize_object(principal, ME)?;
@@ -426,7 +430,7 @@ fn validate_count(req: &PatchRequest) -> ControlResult<()> {
 /// The live patch (mixer plane), built from the engine's readback.
 #[cfg_attr(feature = "openapi", utoipa::path(get, path = "/api/v1/patch", tag = "patch",
     responses(
-        (status = 200, description = "`{ mixer: [ { me, inputs: [ { number, label, video: {source}|{redacted:true}|null, on_program, on_preview } ], inputs_version, tick } ], outputs: [ { output, format: {width,height,fit,…}|null, video: [ { slot: 0, source: {source}|{bus}|{redacted:true}, path: P1|P2|P3, pending: {source, held_ticks}|null, degraded } ], audio: [ { slot, track, language, source } ] } ] }`. Video slot 0 comes from the engine's live readback; `path` is P1 whenever an encoded bus (Program at the output's format, or a live key of its own) carries it. Audio slot 0's `source` is the output's accepted audio feed (`\"follow\"` by default, else `\"program\"`, `\"none\"`, `{source}` or `{tracks}`), projected and redacted exactly as `GET /routing`; audio slots i > 0 are `{track}`, fixed by config. A mixer the caller cannot read (M/E object + Program scope) is omitted, an output it does not pass the output axis for is omitted, and a feed it cannot read (a source, or a track whose route input it cannot read) is `{\"redacted\": true}`.", body = Object),
+        (status = 200, description = "`{ mixer: [ { me, inputs: [ { number, label, video: {source}|{redacted:true}|null, on_program, on_preview } ], inputs_version, tick } ], outputs: [ { output, format: {width,height,fit,…}|null, video: [ { slot: 0, live, source: {source}|{bus}|{layout}|{redacted:true}|null, path: P1|P2|P3|null, pending: {source, held_ticks}|null, degraded } ], audio: [ { slot, track, language, source } ] } ] }`. Video slot 0 comes from the engine's live readback (`live: true`); `path` is P1 whenever an encoded bus (Program at the output's format, or a live key of its own) carries it. With no readback (no running engine, routing unavailable, or the output not in this run) `live` is false and `source` and `path` are null: the live state is unknown, never reported as Program. Audio slot 0's `source` is the output's accepted audio feed (`\"follow\"` by default, else `\"program\"`, `\"none\"`, `{source}` or `{tracks}`), projected and redacted exactly as `GET /routing`; audio slots i > 0 are `{track}`, fixed by config. A mixer the caller cannot read (M/E object + Program scope) is omitted, an output it does not pass the output axis for is omitted, and a feed it cannot read (a source, or a track whose route input it cannot read) is `{\"redacted\": true}`.", body = Object),
         (status = 401, description = "Missing or invalid credentials.", body = crate::problem::Problem),
         (status = 403, description = "Role lacks Read.", body = crate::problem::Problem),
     )))]
@@ -487,7 +491,7 @@ pub(crate) async fn get_patch(
         (status = 403, description = "Not authorized for a destination (M/E object + Program scope; an output: object + output axis) or a source.", body = crate::problem::Problem),
         (status = 404, description = "Unknown output.", body = crate::problem::Problem),
         (status = 409, description = "`switcher-unavailable` or `routing-unavailable`.", body = crate::problem::Problem),
-        (status = 422, description = "`slot-medium-mismatch` (an audio slot other than slot 0 follow, a subtitle slot), `unknown-slot` (video slot >= 1, two outputs, or mixer + output: multi-destination sets arrive with patch salvos #308), `unknown-source` (a layout, #306), or not 1..=64 crosspoints.", body = crate::problem::Problem),
+        (status = 422, description = "`slot-medium-mismatch` (an audio slot other than slot 0 follow, a subtitle slot), `unknown-slot` (video slot >= 1, two outputs, or mixer + output: multi-destination sets arrive with patch salvos #308), `unknown-source` (a layout or bus on a mixer input; an unknown feed), or not 1..=64 crosspoints. A layout on an output slot is planned like the alias: `layout-not-admissible` and `aux-capacity` are refusals in the plan.", body = crate::problem::Problem),
     )))]
 pub(crate) async fn plan_patch(
     State(state): State<AppState>,
@@ -496,7 +500,7 @@ pub(crate) async fn plan_patch(
 ) -> ControlResult<Response> {
     principal.role.require(Action::Write)?;
     validate_count(&req)?;
-    authorize(&principal, &req)?;
+    authorize(&state, &principal, &req)?;
     if super::patch_output::has_output(&req) {
         let patch = match super::patch_output::shape(&req) {
             Ok(patch) => patch,
@@ -530,8 +534,8 @@ pub(crate) async fn plan_patch(
         (status = 202, body = PatchAccepted),
         (status = 403, description = "Not authorized for a destination (M/E object + Program scope; an output: object AND output axis) or a source; a replayed key is re-authorized.", body = crate::problem::Problem),
         (status = 404, description = "Unknown output.", body = crate::problem::Problem),
-        (status = 409, description = "`conflict` (an output take's Idempotency-Key first used for another output or feed; nothing enqueued), `on-air-protected` (the input on Program under `protect`, or the Program/Preview input during an AUTO), `switcher-unavailable`, `routing-unavailable`, `switcher-required`, `output-kind-unroutable`, `capacity`, or no source lease.", body = crate::problem::Problem),
-        (status = 422, description = "`slot-medium-mismatch`, `unknown-slot`, `unknown-source`, missing Idempotency-Key, or not 1..=64 crosspoints.", body = crate::problem::Problem),
+        (status = 409, description = "`conflict` (an output take's Idempotency-Key first used for another output or feed; nothing enqueued), `on-air-protected` (the input on Program under `protect`, or the Program/Preview input during an AUTO), `switcher-unavailable`, `routing-unavailable`, `switcher-required`, `output-kind-unroutable`, `capacity`, `aux-capacity` (no free layout canvas), or no source lease.", body = crate::problem::Problem),
+        (status = 422, description = "`slot-medium-mismatch`, `unknown-slot`, `unknown-source`, `unknown-feed` / `layout-not-admissible` (an output slot's layout), missing Idempotency-Key, or not 1..=64 crosspoints.", body = crate::problem::Problem),
         (status = 429, description = "Over 2 takes/s per destination or 10/s per principal (one request = one take); see Retry-After.", body = crate::problem::Problem),
         (status = 503, description = "`engine-busy` (the key and leases are released) or `idempotency-capacity`.", body = crate::problem::Problem),
     )))]
@@ -546,7 +550,7 @@ pub(crate) async fn take_patch(
 ) -> ControlResult<Response> {
     principal.role.require(Action::Write)?;
     validate_count(&req)?;
-    authorize(&principal, &req)?;
+    authorize(&state, &principal, &req)?;
     if super::patch_output::has_output(&req) {
         let patch = match super::patch_output::shape(&req) {
             Ok(patch) => patch,

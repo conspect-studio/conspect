@@ -2025,6 +2025,26 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/metrics/frontdoor": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * `GET /api/v1/metrics/frontdoor` — the network front door's live counters
+         *     (role: read; whole-system principals only).
+         */
+        get: operations["get_frontdoor_metrics"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/metrics/program": {
         parameters: {
             query?: never;
@@ -3299,7 +3319,9 @@ export interface paths {
         /**
          * `GET /api/v1/system/capabilities` — the build's codec/compositor backend
          *     availability, compositor classification, effective build-profile licence, and
-         *     NDI attribution (ADR-W030). Role: read.
+         *     NDI attribution (ADR-W030). Role: read. The `network` section (front-door
+         *     host posture) is included only for an unscoped principal; a scoped key
+         *     gets the response without it.
          */
         get: operations["system_capabilities"];
         put?: never;
@@ -5246,6 +5268,146 @@ export interface components {
             fetched_at?: string | null;
         };
         /**
+         * @description The `GET /api/v1/metrics/frontdoor` body: the live
+         *     `multiview_frontdoor::StatsSnapshot` counters, plus the steering,
+         *     kernel-drop and nft-floor gauges and the QUIC retry counter.
+         */
+        FrontDoorMetricsReport: {
+            /**
+             * Format: int64
+             * @description Dropped by the classifier.
+             */
+            dropped_classify: number;
+            /**
+             * Format: int64
+             * @description Dropped by the per-established-peer bucket.
+             */
+            dropped_established_peer: number;
+            /**
+             * Format: int64
+             * @description Dropped by the global new-flow budget.
+             */
+            dropped_global: number;
+            /**
+             * Format: int64
+             * @description Dropped by the global handshake (Initial) budget.
+             */
+            dropped_initial: number;
+            /**
+             * Format: int64
+             * @description Dropped because the lane had no consumer.
+             */
+            dropped_no_consumer: number;
+            /**
+             * Format: int64
+             * @description Dropped by the per-source new-flow bucket.
+             */
+            dropped_per_source: number;
+            /**
+             * Format: int64
+             * @description Dropped because a lane queue was full.
+             */
+            dropped_queue_full: number;
+            /**
+             * Format: int64
+             * @description Dropped by the global STUN budget.
+             */
+            dropped_stun_global: number;
+            /**
+             * Format: int64
+             * @description Dropped by the per-source STUN bucket.
+             */
+            dropped_stun_per_source: number;
+            /**
+             * Format: int64
+             * @description Dropped by the global Version Negotiation budget.
+             */
+            dropped_vn: number;
+            /**
+             * Format: int64
+             * @description Kernel receive drops on the established socket.
+             */
+            kernel_drops_established: number;
+            /**
+             * Format: int64
+             * @description Kernel receive drops on the listener socket.
+             */
+            kernel_drops_listener: number;
+            /**
+             * @description The current nft UDP-443 floor status (re-read periodically; see
+             *     `GET /api/v1/system/capabilities` for the startup snapshot).
+             */
+            nft_floor: components["schemas"]["NftFloorStatus"];
+            /**
+             * Format: int64
+             * @description QUIC Retries sent (RFC 9000 section 8.1.2).
+             */
+            quic_retries: number;
+            /**
+             * Format: int64
+             * @description Datagrams read from the socket(s).
+             */
+            received: number;
+            /**
+             * Format: int64
+             * @description Datagrams read from the established socket (steered peers).
+             */
+            received_established_socket: number;
+            /**
+             * Format: int64
+             * @description Datagrams read from the listener socket.
+             */
+            received_listener_socket: number;
+            /**
+             * Format: int64
+             * @description Socket receive errors (other than `WouldBlock`).
+             */
+            recv_errors: number;
+            /**
+             * Format: int64
+             * @description Peers the current steering program steers.
+             */
+            steered_peers: number;
+            /**
+             * Format: int64
+             * @description Datagrams read from the established socket whose source was in no
+             *     established set.
+             */
+            steered_unverified: number;
+            /**
+             * Format: int64
+             * @description Established peers not steered because of the program's peer cap.
+             */
+            steering_overflow: number;
+            /**
+             * Format: int64
+             * @description Steering attaches that failed.
+             */
+            steering_update_errors: number;
+            /**
+             * Format: int64
+             * @description Steering programs attached.
+             */
+            steering_updates: number;
+            /**
+             * Format: int64
+             * @description Delivered to the QUIC lane.
+             */
+            to_quic: number;
+            /**
+             * Format: int64
+             * @description Delivered to the WebRTC lane.
+             */
+            to_rtc: number;
+            /**
+             * Format: int64
+             * @description Source keys currently tracked by the new-flow limiter.
+             */
+            tracked_sources: number;
+            /** @description How the front door currently receives. */
+            udp443_steering: components["schemas"]["Udp443Steering"];
+        };
+        /**
          * @description `OpenAPI` mirror of [`multiview_licence::GpuLimit`].
          *
          *     Serde-equivalent: adjacently tagged on `kind`, value under `value`,
@@ -6172,6 +6334,41 @@ export interface components {
             url: string;
         };
         /**
+         * @description The front door's capability snapshot (design note section 10.1 and "Slice
+         *     3 as built, part B"), filled
+         *     at startup by the CLI.
+         */
+        NetworkCapability: {
+            /**
+             * @description Whether the kernel-drop gauges are sampled on this platform (Linux
+             *     `/proc/net/udp6` only).
+             */
+            kernel_drops_supported: boolean;
+            /**
+             * @description Whether the nftables UDP-443 floor was seen at startup (design note,
+             *     "Slice 3 as built, part B"): `"present"`, `"absent"`, or `"unknown"`
+             *     (see [`NftFloorStatus`]).
+             */
+            nft_floor: components["schemas"]["NftFloorStatus"];
+            /** @description The receive buffer the kernel granted for the front-door socket(s). */
+            recv_buffer: components["schemas"]["RecvBufferCapability"];
+            /**
+             * @description Why steering is `single_socket` (configuration, platform, or the
+             *     error that forced it). Absent when steering is active.
+             */
+            steering_reason?: string | null;
+            /**
+             * @description How the front door receives: `"reuseport_cbpf"` (validated-flow
+             *     steering active) or `"single_socket"`.
+             */
+            udp443_steering: components["schemas"]["Udp443Steering"];
+        };
+        /**
+         * @description [`NetworkCapability::nft_floor`] (design note, "Slice 3 as built, part B").
+         * @enum {string}
+         */
+        NftFloorStatus: "present" | "absent" | "unknown";
+        /**
          * @description The NMOS access level granted for one API (the `x-nmos-api` value vocabulary).
          * @enum {string}
          */
@@ -6500,6 +6697,17 @@ export interface components {
             /** @description Whether the take fits the encoder budget now. */
             fits: boolean;
             /**
+             * @description The audio the output carries on this video feed when its audio
+             *     follows: `program` (the mix), `source` (the source's own) or `preview`
+             *     (the PVW source's). A layout carries the program mix.
+             */
+            follow_audio?: string | null;
+            /**
+             * Format: int32
+             * @description `1` when the take starts a new layout canvas (`routing-aux`), else `0`.
+             */
+            new_aux_canvases?: number;
+            /**
              * Format: int32
              * @description `0` when an existing encoder carries the feed, `1` for a new one.
              */
@@ -6511,7 +6719,8 @@ export interface components {
             detail: string;
             /**
              * @description `capacity` | `unknown-feed` | `switcher-required` |
-             *     `output-kind-unroutable` | `audio-unsupported`.
+             *     `output-kind-unroutable` | `audio-unsupported` | `layout-not-admissible`
+             *     | `aux-capacity`.
              */
             type: string;
         };
@@ -6542,8 +6751,9 @@ export interface components {
              */
             audio?: Record<string, never> | null;
             /**
-             * @description The video feed: `{"bus":"program"|"preview"|"clean"}` or
-             *     `{"source":"vt1"}`. Required with `stream: video`; absent with
+             * @description The video feed: `{"bus":"program"|"preview"|"clean"}`,
+             *     `{"source":"vt1"}` or `{"layout":"NewsOne"}` (a stored layout,
+             *     ADR-0108 slice 3). Required with `stream: video`; absent with
              *     `stream: audio`.
              */
             feed?: Record<string, never> | null;
@@ -6718,8 +6928,9 @@ export interface components {
             /** @description `video` (this slice), `audio` or `subtitle`. */
             plane: string;
             /**
-             * @description `{"source": id}` or `"none"` (this slice); `{"layout": id}`,
-             *     `{"bus": ..}`, `"follow"` arrive in later slices.
+             * @description A mixer input: `{"source": id}` or `"none"`. An output video slot 0:
+             *     `{"source": id}`, `{"layout": id}` (a stored layout; Read on it AND on
+             *     every source its cells bind) or `{"bus": ..}`; audio slot 0: `"follow"`.
              */
             source: Record<string, never>;
         };
@@ -7239,6 +7450,26 @@ export interface components {
              * @description Backoff ceiling in milliseconds (`initial_ms..=3_600_000`).
              */
             max_ms: number;
+        };
+        /** @description [`NetworkCapability::recv_buffer`]. */
+        RecvBufferCapability: {
+            /** @description `usable < requested`: the kernel clamped the request. */
+            clamped: boolean;
+            /**
+             * Format: int64
+             * @description What `getsockopt(SO_RCVBUF)` reads back.
+             */
+            granted: number;
+            /**
+             * Format: int64
+             * @description The `SO_RCVBUF` request (`network.udp.recv_buffer_bytes`).
+             */
+            requested: number;
+            /**
+             * Format: int64
+             * @description The usable size (`granted / 2` on Linux).
+             */
+            usable: number;
         };
         /**
          * @description What a single redaction removed/masked, surfaced in the preview so the
@@ -8572,6 +8803,7 @@ export interface components {
             /** @description The compositor's resolved acceleration tier. */
             compositor: components["schemas"]["CompositorCapability"];
             ndi_attribution?: null | components["schemas"]["NdiAttribution"];
+            network?: null | components["schemas"]["NetworkCapability"];
             youtube?: null | components["schemas"]["YoutubeCapability"];
         };
         /** @description The `200` body of a hot (Class-1 / Reset-lite) `/routing/{kind}/take`. */
@@ -8962,6 +9194,11 @@ export interface components {
             /** @description The TXT value (decoded as UTF-8 by the browser). */
             value: string;
         };
+        /**
+         * @description [`NetworkCapability::udp443_steering`].
+         * @enum {string}
+         */
+        Udp443Steering: "reuseport_cbpf" | "single_socket";
         /** @description `OpenAPI` mirror of [`multiview_config::UmdRecall`]. */
         UmdRecallDoc: {
             /** @description The cell id whose UMD label changes. */
@@ -14856,6 +15093,53 @@ export interface operations {
             };
         };
     };
+    get_frontdoor_metrics: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Front-door counters and gauges. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["FrontDoorMetricsReport"];
+                };
+            };
+            /** @description Missing or invalid credentials. */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Scoped principal (whole-system metric). */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description No running front door reports metrics. */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
     get_program_metrics: {
         parameters: {
             query?: never;
@@ -15554,7 +15838,7 @@ export interface operations {
         };
         requestBody?: never;
         responses: {
-            /** @description `{ mixer: [ { me, inputs: [ { number, label, video: {source}|{redacted:true}|null, on_program, on_preview } ], inputs_version, tick } ], outputs: [ { output, format: {width,height,fit,…}|null, video: [ { slot: 0, source: {source}|{bus}|{redacted:true}, path: P1|P2|P3, pending: {source, held_ticks}|null, degraded } ], audio: [ { slot, track, language, source } ] } ] }`. Video slot 0 comes from the engine's live readback; `path` is P1 whenever an encoded bus (Program at the output's format, or a live key of its own) carries it. Audio slot 0's `source` is the output's accepted audio feed (`"follow"` by default, else `"program"`, `"none"`, `{source}` or `{tracks}`), projected and redacted exactly as `GET /routing`; audio slots i > 0 are `{track}`, fixed by config. A mixer the caller cannot read (M/E object + Program scope) is omitted, an output it does not pass the output axis for is omitted, and a feed it cannot read (a source, or a track whose route input it cannot read) is `{"redacted": true}`. */
+            /** @description `{ mixer: [ { me, inputs: [ { number, label, video: {source}|{redacted:true}|null, on_program, on_preview } ], inputs_version, tick } ], outputs: [ { output, format: {width,height,fit,…}|null, video: [ { slot: 0, live, source: {source}|{bus}|{layout}|{redacted:true}|null, path: P1|P2|P3|null, pending: {source, held_ticks}|null, degraded } ], audio: [ { slot, track, language, source } ] } ] }`. Video slot 0 comes from the engine's live readback (`live: true`); `path` is P1 whenever an encoded bus (Program at the output's format, or a live key of its own) carries it. With no readback (no running engine, routing unavailable, or the output not in this run) `live` is false and `source` and `path` are null: the live state is unknown, never reported as Program. Audio slot 0's `source` is the output's accepted audio feed (`"follow"` by default, else `"program"`, `"none"`, `{source}` or `{tracks}`), projected and redacted exactly as `GET /routing`; audio slots i > 0 are `{track}`, fixed by config. A mixer the caller cannot read (M/E object + Program scope) is omitted, an output it does not pass the output axis for is omitted, and a feed it cannot read (a source, or a track whose route input it cannot read) is `{"redacted": true}`. */
             200: {
                 headers: {
                     [name: string]: unknown;
@@ -15631,7 +15915,7 @@ export interface operations {
                     "application/json": components["schemas"]["Problem"];
                 };
             };
-            /** @description `slot-medium-mismatch` (an audio slot other than slot 0 follow, a subtitle slot), `unknown-slot` (video slot >= 1, two outputs, or mixer + output: multi-destination sets arrive with patch salvos #308), `unknown-source` (a layout, #306), or not 1..=64 crosspoints. */
+            /** @description `slot-medium-mismatch` (an audio slot other than slot 0 follow, a subtitle slot), `unknown-slot` (video slot >= 1, two outputs, or mixer + output: multi-destination sets arrive with patch salvos #308), `unknown-source` (a layout or bus on a mixer input; an unknown feed), or not 1..=64 crosspoints. A layout on an output slot is planned like the alias: `layout-not-admissible` and `aux-capacity` are refusals in the plan. */
             422: {
                 headers: {
                     [name: string]: unknown;
@@ -15684,7 +15968,7 @@ export interface operations {
                     "application/json": components["schemas"]["Problem"];
                 };
             };
-            /** @description `conflict` (an output take's Idempotency-Key first used for another output or feed; nothing enqueued), `on-air-protected` (the input on Program under `protect`, or the Program/Preview input during an AUTO), `switcher-unavailable`, `routing-unavailable`, `switcher-required`, `output-kind-unroutable`, `capacity`, or no source lease. */
+            /** @description `conflict` (an output take's Idempotency-Key first used for another output or feed; nothing enqueued), `on-air-protected` (the input on Program under `protect`, or the Program/Preview input during an AUTO), `switcher-unavailable`, `routing-unavailable`, `switcher-required`, `output-kind-unroutable`, `capacity`, `aux-capacity` (no free layout canvas), or no source lease. */
             409: {
                 headers: {
                     [name: string]: unknown;
@@ -15693,7 +15977,7 @@ export interface operations {
                     "application/json": components["schemas"]["Problem"];
                 };
             };
-            /** @description `slot-medium-mismatch`, `unknown-slot`, `unknown-source`, missing Idempotency-Key, or not 1..=64 crosspoints. */
+            /** @description `slot-medium-mismatch`, `unknown-slot`, `unknown-source`, `unknown-feed` / `layout-not-admissible` (an output slot's layout), missing Idempotency-Key, or not 1..=64 crosspoints. */
             422: {
                 headers: {
                     [name: string]: unknown;
@@ -17066,7 +17350,7 @@ export interface operations {
                     "application/json": components["schemas"]["Problem"];
                 };
             };
-            /** @description `routing-unavailable`, `switcher-required`, `output-kind-unroutable`, `capacity`, `audio-unsupported` (the output has no program-audio slot for a routed audio feed, or its transport cannot select a discrete track), or `conflict` (the Idempotency-Key was first used for another output, feed or audio; nothing is enqueued). */
+            /** @description `routing-unavailable`, `switcher-required`, `output-kind-unroutable`, `capacity`, `aux-capacity` (no free layout canvas), `audio-unsupported` (the output has no program-audio slot for a routed audio feed, or its transport cannot select a discrete track), or `conflict` (the Idempotency-Key was first used for another output, feed or audio; nothing is enqueued). */
             409: {
                 headers: {
                     [name: string]: unknown;
@@ -17075,7 +17359,7 @@ export interface operations {
                     "application/json": components["schemas"]["Problem"];
                 };
             };
-            /** @description `unknown-feed` (video or audio), `audio-unsupported` (more than one track: the output carries one routed audio feed), a body whose `stream` and `feed`/`audio` do not match (`stream: video` needs `feed`; `stream: audio` needs `audio` and no `feed`), or a missing Idempotency-Key. */
+            /** @description `unknown-feed` (video or audio, including an unknown layout), `layout-not-admissible` (a layout authored for another canvas, one that does not solve, or one with a translucent cell), `audio-unsupported` (more than one track: the output carries one routed audio feed), a body whose `stream` and `feed`/`audio` do not match (`stream: video` needs `feed`; `stream: audio` needs `audio` and no `feed`), or a missing Idempotency-Key. */
             422: {
                 headers: {
                     [name: string]: unknown;

@@ -82,6 +82,8 @@ import { useQuery } from '@tanstack/react-query';
 import { getRoutingState } from '../api/outputRouting';
 import type { OutputRouteState } from '../api/outputRouting';
 import { useMediaPlayers } from '../api/media-playersQueries';
+import { createApiClient } from '../api/client';
+import { useLayouts } from '../api/queries';
 import { useSources } from '../resources/queries';
 import { OutputFeedRow } from './OutputFeedRow';
 import { OutputAudioRow } from './OutputAudioRow';
@@ -1231,9 +1233,14 @@ const GENERATOR_KINDS = new Set(['bars', 'test', 'solid', 'clock', 'timer']);
 function useFeedChoices(
   sources: readonly { readonly id: string; readonly name: string; readonly rawKind: string }[] | undefined,
   players: readonly { readonly id: string }[] | undefined,
+  layouts: readonly { readonly id: string; readonly name: string }[] | undefined,
 ): readonly FeedChoice[] {
   const playerIds = new Set((players ?? []).map((p) => p.id));
-  return (sources ?? []).map((source): FeedChoice => {
+  // Stored layouts route as their own aux canvas (ADR-0108 slice 3).
+  const layoutChoices = (layouts ?? []).map(
+    (layout): FeedChoice => ({ key: `aux:${layout.id}`, label: layout.name, group: 'layouts' }),
+  );
+  return [...layoutChoices, ...(sources ?? []).map((source): FeedChoice => {
     const group: FeedChoice['group'] =
       playerIds.has(source.id) || source.rawKind === 'media_player'
         ? 'players'
@@ -1241,7 +1248,7 @@ function useFeedChoices(
           ? 'generators'
           : 'sources';
     return { key: `src:${source.id}`, label: source.name, group };
-  });
+  })];
 }
 
 const RESOURCE_CONTEXT: ResourceContext = {};
@@ -1276,9 +1283,12 @@ export function OutputsSurface({
   });
   const sources = useSources();
   const players = useMediaPlayers();
+  const apiClient = useMemo(() => createApiClient(), []);
+  const layouts = useLayouts(apiClient);
   const feedChoices = useFeedChoices(
     embedded ? undefined : sources.data,
     embedded ? undefined : players.data,
+    embedded ? undefined : layouts.data,
   );
   const routeOf = (id: string): OutputRouteState | undefined =>
     routeState.data?.outputs.find((row) => row.output === id);

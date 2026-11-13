@@ -3,9 +3,9 @@
 //!
 //! A [`Reformat`] opens a new encoder at the output's new size / fit / bit
 //! rate with the SAME codec, off the clock (the `routing-open` thread),
-//! fed the picture the output carries now (Program or Clean through a
-//! `FormatConvert` at a non-canvas format; a routed source/PVW re-keyed at
-//! the new feed format). Once its first window is staged the output is
+//! fed the picture the output carries now (Program, Clean or a routed
+//! layout — all canvas-sized — through a `FormatConvert` at a non-canvas
+//! format; a routed source/PVW re-keyed at the new feed format). Once its first window is staged the output is
 //! FORCE-moved onto it at an IDR — make-before-break: the old key feeds the
 //! output until the move lands. The move changes the decoder configuration,
 //! which the dispatcher signals (`mark_discontinuity`): HLS writes
@@ -82,7 +82,11 @@ impl OutputRouter {
             let id = self.next_open;
             self.next_open = self.next_open.wrapping_add(1);
             let settings = self.outputs.get(index).map_or(0, |o| o.settings);
-            let format = if super::aux_composed(&bus) {
+            // A routed source/PVW is re-keyed at the new feed format; Program,
+            // Clean and a routed layout stay the canvas picture (#368 composes a
+            // layout at the canvas only) and convert on the new key's worker
+            // to the new base format, exactly as `feed_key` keys them.
+            let format = if super::aux_composed(&bus) && !matches!(bus, PictureBus::Layout(_)) {
                 req.feed_format
             } else {
                 None

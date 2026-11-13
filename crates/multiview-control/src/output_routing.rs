@@ -21,8 +21,8 @@ use std::time::{Duration, Instant};
 
 use multiview_config::{AudioFeed, VideoFeed};
 
-/// The picture bus a take routes onto an output (the slice-1 subset of
-/// [`VideoFeed`]).
+/// The picture bus a take routes onto an output (every [`VideoFeed`]: slice 3
+/// added stored layouts).
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum RoutedFeed {
     /// The Program bus (follows the switcher; the startup encoder).
@@ -33,10 +33,13 @@ pub enum RoutedFeed {
     Clean,
     /// One source directly (camera, media player, generator).
     Source(String),
+    /// A stored layout (ADR-0108 slice 3): an aux canvas of its cells.
+    Layout(String),
 }
 
 impl RoutedFeed {
-    /// The routed feed of `feed`, or `None` for a layout.
+    /// The routed feed of `feed` (`None` for a feed kind this build does not
+    /// know).
     #[must_use]
     pub fn of(feed: &VideoFeed) -> Option<Self> {
         use multiview_config::OutputBus;
@@ -45,11 +48,13 @@ impl RoutedFeed {
             VideoFeed::Bus(OutputBus::Preview) => Some(Self::Preview),
             VideoFeed::Bus(OutputBus::Clean) => Some(Self::Clean),
             VideoFeed::Source(id) => Some(Self::Source(id.clone())),
+            VideoFeed::Layout(id) => Some(Self::Layout(id.clone())),
             _ => None,
         }
     }
 
-    /// The picture-bus name (`program`, `preview`, `clean`, `src:<id>`).
+    /// The picture-bus name (`program`, `preview`, `clean`, `src:<id>`,
+    /// `aux:<layout>`).
     #[must_use]
     pub fn bus_name(&self) -> String {
         match self {
@@ -57,6 +62,7 @@ impl RoutedFeed {
             Self::Preview => "preview".to_owned(),
             Self::Clean => "clean".to_owned(),
             Self::Source(id) => format!("src:{id}"),
+            Self::Layout(id) => format!("aux:{id}"),
         }
     }
 
@@ -69,7 +75,11 @@ impl RoutedFeed {
             "clean" => Some(Self::Clean),
             _ => name
                 .strip_prefix("src:")
-                .map(|id| Self::Source(id.to_owned())),
+                .map(|id| Self::Source(id.to_owned()))
+                .or_else(|| {
+                    name.strip_prefix("aux:")
+                        .map(|id| Self::Layout(id.to_owned()))
+                }),
         }
     }
 
@@ -81,9 +91,46 @@ impl RoutedFeed {
             Self::Preview => VideoFeed::Bus(multiview_config::OutputBus::Preview),
             Self::Clean => VideoFeed::Bus(multiview_config::OutputBus::Clean),
             Self::Source(id) => VideoFeed::Source(id.clone()),
+            Self::Layout(id) => VideoFeed::Layout(id.clone()),
         }
     }
 }
+
+/// A stored layout resolved for routing (ADR-0108 slice 3): solved on the
+/// control plane at take time against the running canvas, so the engine only
+/// composes it (no I/O, no solving off the control plane).
+#[derive(Debug, Clone, PartialEq)]
+pub struct RoutedLayout {
+    /// The stored layout id (the bus is `aux:<id>`).
+    pub id: String,
+    /// The solved layout (its canvas is the running canvas).
+    pub layout: multiview_core::layout::Layout,
+    /// Per cell, in `layout.cells` order: the slate a down cell shows.
+    pub slates: Vec<multiview_config::FailoverSlate>,
+}
+
+impl RoutedLayout {
+    /// Whether every cell can be drawn by the integer aux path (§7): opacity
+    /// exactly 1. A translucent cell needs a linear-light blend, which only
+    /// Program's compositor does.
+    #[must_use]
+    pub fn integer_drawable(&self) -> bool {
+        self.layout.cells.iter().all(|c| c.opacity >= 1.0)
+    }
+}
+
+/// A resolved layout body shared between the control plane and the engine.
+/// Equality is identity (two resolutions are two bodies).
+#[derive(Debug, Clone)]
+pub struct LayoutBody(pub Arc<RoutedLayout>);
+
+impl PartialEq for LayoutBody {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+impl Eq for LayoutBody {}
 
 /// The audio a take routes onto an output (ADR-0108 slice 2, §5.1). A
 /// track is already resolved to its `audio-routing` route's input id.
@@ -147,6 +194,8 @@ pub struct OutputTakeRequest {
     pub video: Option<RoutedFeed>,
     /// The output's new audio choice (`None`: keep the current one).
     pub audio: Option<RoutedAudio>,
+    /// The resolved layout body, for a [`RoutedFeed::Layout`] video feed.
+    pub layout: Option<LayoutBody>,
     /// The authenticated key id the take is charged to (never client input).
     pub principal: String,
 }
@@ -168,6 +217,14 @@ pub enum PlanRefusal {
     OutputKindUnroutable,
     /// Preview or Clean requested on a run without an M/E.
     SwitcherRequired,
+    /// A layout that is not composed yet would exceed
+    /// `routing.max_aux_canvases` (§7 admission rule 1).
+    AuxCapacity {
+        /// Layout canvases composing now.
+        active: usize,
+        /// The limit.
+        max: usize,
+    },
     /// The output has no program-audio slot for a routed audio feed (NDI,
     /// AES67, display, or a run without program audio).
     AudioUnsupported,
@@ -190,6 +247,8 @@ pub struct PlanCost {
     pub sessions_in_use: usize,
     /// The live-opened encoder session limit.
     pub sessions_max: usize,
+    /// `true` when the take starts a new layout canvas (+1 aux canvas).
+    pub needs_aux_canvas: bool,
 }
 
 impl PlanCost {

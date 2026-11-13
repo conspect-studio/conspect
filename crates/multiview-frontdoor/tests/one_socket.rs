@@ -70,6 +70,8 @@ fn start_moq(door: &mut FrontDoor) -> tokio::task::JoinHandle<anyhow::Result<()>
             socket: Box::new(lane),
             endpoint: multiview_frontdoor::quic::endpoint_config(),
             incoming: Some(multiview_frontdoor::quic::incoming_caps()),
+            retry_above_handshakes: None,
+            retry_counter: None,
         });
         let mut listener = server.init()?.listen().await?;
         let request = listener.accept().await.expect("an incoming session");
@@ -361,6 +363,8 @@ fn every_first_byte_on_the_live_socket_misdelivers_nothing() {
             socket: Box::new(lane),
             endpoint: multiview_frontdoor::quic::endpoint_config(),
             incoming: Some(multiview_frontdoor::quic::incoming_caps()),
+            retry_above_handshakes: None,
+            retry_counter: None,
         });
         let mut listener = server.init()?.listen().await?;
         while listener.accept().await.is_some() {
