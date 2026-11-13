@@ -2017,7 +2017,10 @@ What the engine does (`crates/multiview-cli/src/output_routing_reformat.rs`):
   rebuild abandons the segment and recovers at the next RAP; it is never fatal. With a master
   playlist, the video-only rendition muxer is rebuilt the same way at the same segment (same new
   parameters, same single `tables_version` bump, handled before any redirect; review R2-V1), so
-  the main and rendition playlists agree, and a failed rendition rebuild recovers alike.
+  the main and rendition playlists agree, and a failed rendition rebuild recovers alike. The
+  master playlist is then re-rendered from the new parameters (RESOLUTION, BANDWIDTH, CODECS) and
+  republished atomically after the media playlists carrying the reset segment; a failed rebuild
+  keeps the old master until the recovery rebuild succeeds (review R3-1).
 - **A refused move never leaves a gap** (review V1). Retiring a key a binding still reads first routes
   that binding through the RAP-gated fallback; an emptied stage never proves a window it does not hold.
 - **Bounded.**
