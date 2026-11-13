@@ -199,9 +199,16 @@ the OS run queue, which no pacing mechanism controls. The chaos test therefore
 asserts bounds that hold on a loaded runner (#321): with the control runtime
 saturated (a CPU-bound task hogging every worker, blocking calls, a timer storm)
 and a front-door flood, every tick is emitted (count within 2 of
-elapsed/period), **0 repeats on Linux** (at most 1% on macOS), p99 lateness at or
-below **half a period**, and on Linux the clock thread's mean lateness is below
-the old task topology's under the same load. Lateness in the chaos test is read
+elapsed/period) on every platform; on **Linux** additionally 0 repeats, p99
+lateness at or below **half a period**, and a clock-thread mean below the old
+task topology's under the same load.
+
+**Known gap, macOS (#340).** On a CPU-saturated 3-core macOS CI runner (debug
+build) the clock thread still emits one frame per tick, but falls behind and
+repeats (~12–20% of ticks, ~17–20 ms mean) where the old task topology did not —
+with the yielding spin, the halving sleep and QoS `USER_INTERACTIVE` alike. The
+macOS chaos assertion is therefore cadence-only until #340 is investigated on a
+real Mac (release build, Mach time-constraint policy). Production runs on Linux. Lateness in the chaos test is read
 from the engine's own wait-free histogram (fine buckets), so nothing but atomics
 sits on the tick path. The tight target is measured on the
 test server after deploy: p99 < 2 ms and 0 ticks behind under idle, control-plane
