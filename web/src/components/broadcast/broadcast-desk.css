@@ -499,3 +499,11 @@
  .production-desk .bd-wall-heading{min-height:32px}
  .production-desk .bd-route-link{min-height:44px}
 }
+.broadcast-shell .bd-bus button[aria-pressed=true]:disabled{border-style:solid}
+@media(min-width:1280px) and (min-height:600px) and (max-height:700px){
+ .production-desk[data-dense=true] .bd-wall-tile{grid-template-rows:minmax(0,1fr) 20px}
+ .production-desk[data-dense=true] .bd-wall-tile>b{font-size:10px;line-height:11px;padding:1px 4px}
+ .production-desk[data-dense=true] .bd-wall-tile>small{top:2px;left:2px;font-size:9px;line-height:12px;padding:0 2px}
+ .production-desk[data-dense=true] .bd-wall-tile>span:last-child{top:2px;bottom:auto;right:2px;font-size:8px;line-height:10px;padding:0 2px;max-width:65px}
+ .production-desk[data-dense=true] .bd-wall-tile .bd-source-picture{height:calc(100% - 20px)}
+}

@@ -29,6 +29,15 @@ for (const count of [12, 24]) {
         expect(box!.width).toBeGreaterThanOrEqual(44);
         expect(box!.height).toBeGreaterThanOrEqual(44);
       }
+      for (const tile of await tiles.all()) {
+        const parent = await tile.boundingBox();
+        for (const chip of await tile.locator('small, span[id^="desk-signal-"]').all()) {
+          const box = await chip.boundingBox();
+          expect(box!.y).toBeGreaterThanOrEqual(parent!.y);
+          expect(box!.y + box!.height).toBeLessThanOrEqual(parent!.y + parent!.height);
+          expect(await chip.evaluate((el) => el.scrollHeight <= el.clientHeight)).toBe(true);
+        }
+      }
       const boxes = await tiles.evaluateAll((els) => els.map((el) => { const r = el.getBoundingClientRect(); return { x: r.x, y: r.y, right: r.right, bottom: r.bottom }; }));
       for (let i = 0; i < boxes.length; i++) for (let j = i + 1; j < boxes.length; j++) {
         const a = boxes[i], b = boxes[j];
