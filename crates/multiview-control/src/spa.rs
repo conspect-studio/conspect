@@ -235,22 +235,33 @@ async fn gzipped(sha256: [u8; 32], data: bytes::Bytes) -> Option<bytes::Bytes> {
 
 /// Whether the client accepts gzip (`Accept-Encoding`, `q=0` refuses).
 fn accepts_gzip(headers: &HeaderMap) -> bool {
-    headers
+    // RFC 9110 section 12.5.3: a q-value applies to the coding it is attached
+    // to; an explicit `gzip` entry decides, and `*` only stands in for gzip
+    // when gzip is not listed (`gzip, *;q=0` accepts; `gzip;q=0, *` refuses).
+    let mut gzip = None;
+    let mut star = None;
+    for item in headers
         .get_all(header::ACCEPT_ENCODING)
         .iter()
         .filter_map(|v| v.to_str().ok())
         .flat_map(|v| v.split(','))
-        .filter_map(|item| {
-            let mut parts = item.split(';').map(str::trim);
-            let coding = parts.next()?;
-            let refused = parts.any(|p| {
-                p.strip_prefix("q=")
-                    .and_then(|q| q.parse::<f32>().ok())
-                    .is_some_and(|q| q <= 0.0)
-            });
-            Some((coding, refused))
-        })
-        .any(|(coding, refused)| (coding.eq_ignore_ascii_case("gzip") || coding == "*") && !refused)
+    {
+        let mut parts = item.split(';').map(str::trim);
+        let Some(coding) = parts.next() else {
+            continue;
+        };
+        let refused = parts.any(|p| {
+            p.strip_prefix("q=")
+                .and_then(|q| q.parse::<f32>().ok())
+                .is_some_and(|q| q <= 0.0)
+        });
+        if coding.eq_ignore_ascii_case("gzip") {
+            gzip = Some(gzip.unwrap_or(false) || !refused);
+        } else if coding == "*" {
+            star = Some(star.unwrap_or(false) || !refused);
+        }
+    }
+    gzip.or(star).unwrap_or(false)
 }
 
 /// The strong entity tag of an embedded file: its SHA-256 (computed at build
@@ -408,6 +419,12 @@ mod tests {
         assert!(accepts_gzip(&h("*")));
         assert!(!accepts_gzip(&h("gzip;q=0")));
         assert!(!accepts_gzip(&h("br")));
+        // q applies to its own coding: an explicit gzip decides over `*`.
+        assert!(accepts_gzip(&h("gzip, *;q=0")));
+        assert!(!accepts_gzip(&h("*;q=0")));
+        assert!(!accepts_gzip(&h("gzip;q=0, *")));
+        assert!(accepts_gzip(&h("br, *")));
+        assert!(accepts_gzip(&h("GZIP;q=0.5")));
         assert!(!accepts_gzip(&HeaderMap::new()));
     }
 
