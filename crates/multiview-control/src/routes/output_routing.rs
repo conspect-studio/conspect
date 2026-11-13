@@ -244,13 +244,16 @@ fn authorize_bus(principal: &Principal) -> ControlResult<()> {
 /// `program` → the bus rule; `tracks` → each track name, and each track's
 /// route input once resolved by [`resolve_audio`]; `none`/`follow` →
 /// nothing beyond the video end).
-fn authorize_ends(principal: &Principal, req: &OutputRouteRequest) -> ControlResult<()> {
+fn authorize_ends(
+    state: &AppState,
+    principal: &Principal,
+    req: &OutputRouteRequest,
+) -> ControlResult<()> {
     authorize_output_end(principal, req.output())?;
     match &req.feed {
         None => {}
-        Some(VideoFeed::Source(id) | VideoFeed::Layout(id)) => {
-            crate::auth::authorize_object(principal, id)?;
-        }
+        Some(VideoFeed::Source(id)) => crate::auth::authorize_object(principal, id)?,
+        Some(VideoFeed::Layout(id)) => authorize_layout_feed(state, principal, id)?,
         Some(VideoFeed::Bus(_)) => authorize_bus(principal)?,
         Some(_) => return Err(ControlError::Forbidden("unsupported feed kind".to_owned())),
     }
@@ -513,6 +516,25 @@ fn authorize_document_closure(
     }
 }
 
+/// Authorize a `{layout}` video feed (§6.3): Read on the layout id AND on
+/// every source its CURRENT stored body binds, one generic 403. The ONE
+/// authorize step of the alias, `/patch` output crosspoints and their plans
+/// (#342 review T-A1): it runs with the other end checks, BEFORE any output
+/// or feed existence answer, so a denied closure can never become a
+/// 404-vs-403 oracle on the output. An unknown layout passes here and is
+/// answered by existence later (`unknown-feed`).
+///
+/// # Errors
+/// 403 for the id or an unreadable source; repository errors.
+pub(crate) fn authorize_layout_feed(
+    state: &AppState,
+    principal: &Principal,
+    id: &str,
+) -> ControlResult<()> {
+    crate::auth::authorize_object(principal, id)?;
+    authorize_layout_closure(state, principal, id)
+}
+
 /// Re-authorize a recorded layout take's source closure (a replay, #342 B2):
 /// the stored layout as it is NOW. A layout that no longer exists has no
 /// closure to read: the replay answers its own recorded operation.
@@ -602,7 +624,7 @@ pub(crate) fn plan_output(
     req: &OutputRouteRequest,
 ) -> ControlResult<Response> {
     principal.role.require(Action::Read)?;
-    authorize_ends(principal, req)?;
+    authorize_ends(state, principal, req)?;
     authorize_track_inputs(state, principal, req)?;
     let video = req.shape()?;
     let Some(control) = state.output_routing.as_ref() else {
@@ -874,7 +896,7 @@ pub(crate) async fn take_output(
     Json(req): Json<OutputRouteRequest>,
 ) -> ControlResult<Response> {
     principal.role.require(Action::Write)?;
-    authorize_ends(&principal, &req)?;
+    authorize_ends(&state, &principal, &req)?;
     authorize_track_inputs(&state, &principal, &req)?;
     let video = req.shape()?;
     let output = req.output().to_owned();

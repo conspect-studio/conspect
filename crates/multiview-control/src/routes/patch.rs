@@ -211,7 +211,7 @@ fn source_id(source: &Value) -> Option<&str> {
 }
 
 /// Authorize both ends of every crosspoint (BOLA), before any existence check.
-fn authorize(principal: &Principal, req: &PatchRequest) -> ControlResult<()> {
+fn authorize(state: &AppState, principal: &Principal, req: &PatchRequest) -> ControlResult<()> {
     for xp in &req.crosspoints {
         let destination = &xp.destination;
         if let Some(mixer) = &destination.mixer {
@@ -221,10 +221,13 @@ fn authorize(principal: &Principal, req: &PatchRequest) -> ControlResult<()> {
         if let Some(output) = &destination.output {
             super::output_routing::authorize_output_end(principal, output)?;
         }
-        if let Some(object) =
-            source_id(&xp.source).or_else(|| xp.source.get("layout").and_then(Value::as_str))
-        {
+        if let Some(object) = source_id(&xp.source) {
             authorize_object(principal, object)?;
+        }
+        // A layout: its id AND its whole current source closure, before any
+        // output or feed existence answer (#342 review T-A1).
+        if let Some(layout) = xp.source.get("layout").and_then(Value::as_str) {
+            super::output_routing::authorize_layout_feed(state, principal, layout)?;
         }
         if xp.source.get("bus").is_some() {
             authorize_object(principal, ME)?;
@@ -497,7 +500,7 @@ pub(crate) async fn plan_patch(
 ) -> ControlResult<Response> {
     principal.role.require(Action::Write)?;
     validate_count(&req)?;
-    authorize(&principal, &req)?;
+    authorize(&state, &principal, &req)?;
     if super::patch_output::has_output(&req) {
         let patch = match super::patch_output::shape(&req) {
             Ok(patch) => patch,
@@ -547,7 +550,7 @@ pub(crate) async fn take_patch(
 ) -> ControlResult<Response> {
     principal.role.require(Action::Write)?;
     validate_count(&req)?;
-    authorize(&principal, &req)?;
+    authorize(&state, &principal, &req)?;
     if super::patch_output::has_output(&req) {
         let patch = match super::patch_output::shape(&req) {
             Ok(patch) => patch,

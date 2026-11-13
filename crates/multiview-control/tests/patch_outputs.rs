@@ -114,8 +114,9 @@ fn keys() -> ApiKeyStore {
         "patch-lay-secret",
         scoped(
             "patch-lay",
-            &["output-1", "Secret", "NewsOne", "a", "bars"],
-            &["output-1"],
+            // `output-9` does not exist (review T-A1's oracle probe).
+            &["output-1", "output-9", "Secret", "NewsOne", "a", "bars"],
+            &["output-1", "output-9"],
         ),
     );
     keys.register(
@@ -1261,4 +1262,62 @@ async fn a_layout_replay_reauthorizes_its_source_closure() {
         StatusCode::FORBIDDEN
     );
     assert_eq!(rig.fake.takes().len(), 1);
+}
+
+/// Review T-A1: a `{layout}` feed's whole source closure is authorized with
+/// the other end checks, BEFORE any output lookup: a principal holding the
+/// output axis and the layout id but not a source the layout shows gets the
+/// SAME generic 403 for an existing and a nonexistent output, on
+/// `/patch/plan`, `/patch/take` and the alias (take and plan) — never a
+/// 404-vs-403 existence oracle. Nothing reaches the engine.
+#[tokio::test]
+async fn a_denied_layout_closure_is_403_before_the_output_lookup_on_every_route() {
+    let dir = tempfile::tempdir().unwrap();
+    let rig = rig(&dir.path().join("boot.toml"));
+    store_layout(&rig, "Secret", "secret-cam");
+    let token = "patch-lay.patch-lay-secret";
+    let mut answers = Vec::new();
+    for output in ["output-1", "output-9"] {
+        let body = patch(vec![video(output, json!({"layout": "Secret"}))]);
+        let (plan_status, plan_body) = plan(&rig, token, body.clone()).await;
+        let (take_status, take_body) = take(&rig, token, &format!("ta1-{output}"), body).await;
+        let alias_take_status = alias_take(
+            &rig,
+            token,
+            &format!("ta1a-{output}"),
+            output,
+            json!({"layout": "Secret"}),
+        )
+        .await;
+        let alias_plan = send(
+            &rig.router,
+            post(
+                "/api/v1/routing/plan",
+                token,
+                None,
+                &alias(output, json!({"layout": "Secret"})),
+            ),
+        )
+        .await;
+        let alias_plan_status = alias_plan.status();
+        let alias_plan_body = body_json(alias_plan).await;
+        for (route, status) in [
+            ("patch/plan", plan_status),
+            ("patch/take", take_status),
+            ("alias take", alias_take_status),
+            ("alias plan", alias_plan_status),
+        ] {
+            assert_eq!(status, StatusCode::FORBIDDEN, "{route} on {output}");
+        }
+        answers.push((
+            plan_body["detail"].clone(),
+            take_body["detail"].clone(),
+            alias_plan_body["detail"].clone(),
+        ));
+    }
+    assert_eq!(
+        answers[0], answers[1],
+        "identical answers: no existence oracle"
+    );
+    assert!(rig.fake.takes().is_empty(), "nothing reached the engine");
 }
