@@ -5660,7 +5660,7 @@ impl Pipeline {
                         egress_stop.stop();
                     }
                 }
-                SendPolicy::DropOnOverload => match hot_tx.try_send(item) {
+                SendPolicy::DropOnOverload => match send_or_forced_shed(&hot_tx, item) {
                     Ok(()) => bump_occupancy(&in_flight, &peak_occupancy),
                     Err(TrySendError::Full(_)) => {
                         // Shed and COUNT — never block (inv #1/#10).
@@ -6427,6 +6427,23 @@ struct SinkRunOutcome {
     playlist: Option<(PathBuf, String)>,
     /// How many baked frames this sink consumed (for tests).
     frames: usize,
+}
+
+/// The live hot-queue send. In `_chaos-test-seams` builds, a deterministic
+/// shed seam (#350) can refuse one tick exactly as a full queue does.
+// The error is `try_send`'s own: it hands the item back without a copy.
+// Boxing it would allocate on the output path. Its size depends on the
+// codec features, so `allow`, not `expect`.
+#[allow(clippy::result_large_err)]
+fn send_or_forced_shed(
+    hot_tx: &std::sync::mpsc::SyncSender<StreamItem>,
+    item: StreamItem,
+) -> Result<(), TrySendError<StreamItem>> {
+    #[cfg(feature = "_chaos-test-seams")]
+    if chaos::force_shed(item.tick_index) {
+        return Err(TrySendError::Full(item));
+    }
+    hot_tx.try_send(item)
 }
 
 /// Request a tick-boundary stop if the shared encoded-output producer fails.
@@ -26403,6 +26420,27 @@ mod chaos {
             tracing::warn!(ms, "chaos: holding source teardown");
             std::thread::sleep(std::time::Duration::from_millis(ms));
         }
+    }
+
+    /// Refuse ONE hot-queue send in the whole process, at the first tick at
+    /// or after `MULTIVIEW_CHAOS_SHED_AT`: a deterministic shed, independent
+    /// of timing (#350). One shed is enough for the falter verdict (any shed
+    /// makes the run exit 1); with several outputs only the first to reach
+    /// the tick sheds.
+    pub(super) fn force_shed(tick: u64) -> bool {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        static DONE: AtomicBool = AtomicBool::new(false);
+        static AT: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+        let at = *AT.get_or_init(|| {
+            std::env::var("MULTIVIEW_CHAOS_SHED_AT")
+                .ok()
+                .and_then(|v| v.parse::<u64>().ok())
+        });
+        let shed = at.is_some_and(|at| tick >= at && !DONE.swap(true, Ordering::AcqRel));
+        if shed {
+            tracing::warn!(tick, "chaos: forced shed of one hot-queue send");
+        }
+        shed
     }
 
     impl ConsumerStall {
