@@ -1332,7 +1332,17 @@ reader never sees a partial file). Receive buffer: with slice 6's `conspect.sock
 (`ReceiveBuffer=8M`, set by systemd with `SO_RCVBUFFORCE`) `net.core.rmem_max` no longer clamps
 the inherited sockets; `deploy/sysctl/90-conspect-udp.conf` (`net.core.rmem_max = 8388608`) is
 for a host that runs the engine without the socket unit (the engine binds and can only use
-`SO_RCVBUF`).
+`SO_RCVBUF`). The front-door cutover script installs the drop-in and the rollback script removes it.
+
+**Inherited sockets and slice 3 settings.** For sockets systemd passes, the engine never re-requests
+the buffer (`ReceiveBuffer=` is the unit's); it reads the grant back and reports it against
+`network.udp.recv_buffer_bytes`, so `clamped` (and the startup warning) fires when the unit gives
+less than the configured target, e.g. a unit without `ReceiveBuffer=`.
+`network.udp.validated_steering = false` with the inherited `ReusePort=yes` pair closes the
+established member, so the listener is the group's only socket and every datagram shares its one
+queue, exactly as a self-bound single socket. Tests: `tests/socket_activation.rs`
+`an_inherited_socket_reports_its_buffer_against_the_configured_target`,
+`steering_off_closes_the_inherited_established_socket`.
 
 **nft floor, two tiers.** `deploy/nftables/conspect-udp443-floor.nft`: table `inet
 conspect_floor`, base chain `filter hook input priority -5; policy accept`, which sends UDP 443 to

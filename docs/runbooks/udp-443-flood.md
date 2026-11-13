@@ -89,8 +89,9 @@ it reads a status file a privileged systemd `ExecStartPre=+` writes at every sta
    sudo nft -f deploy/nftables/conspect-udp443-floor.nft
    ```
 
-3. **systemd:** the engine units themselves come from
-   [front-door-cutover.md](front-door-cutover.md) (slice 6). Add the floor status drop-in:
+3. **systemd:** the engine units come from [front-door-cutover.md](front-door-cutover.md)
+   (slice 6), whose script also installs the floor status drop-in. On a host already cut over
+   before this drop-in existed, add it by hand:
 
    ```bash
    sudo install -D -m 0644 deploy/systemd/conspect.service.d/20-nft-floor.conf \

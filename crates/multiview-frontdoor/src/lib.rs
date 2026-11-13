@@ -979,27 +979,23 @@ fn bind_socket(
 }
 
 /// Adopt inherited UDP socket(s) (socket activation). A pair gets the first
-/// steering program like a self-bound pair; when the attach fails (or
-/// `steering` is off) both sockets stay open and are both read (the kernel
-/// then spreads datagrams across the group by hash), reported as single
-/// socket with the reason.
+/// steering program like a self-bound pair. With `steering` off the
+/// established socket is closed and the listener runs alone (one queue).
+/// When the attach fails both sockets stay open and are both read (the
+/// kernel spreads datagrams across the group by hash), reported as single
+/// socket with the reason. The buffer report compares what the unit set
+/// with `recv_buffer_bytes`.
 fn adopt_socket(
     inherited: Vec<std::net::UdpSocket>,
     addr: SocketAddr,
     config: &FrontDoorConfig,
     turn_servers: &[SocketAddr],
 ) -> Result<SharedSocket, Error> {
-    let socket =
-        SharedSocket::from_inherited(inherited).map_err(|source| Error::Socket { addr, source })?;
+    let steering = config.steering && cfg!(target_os = "linux");
+    let socket = SharedSocket::from_inherited(inherited, config.recv_buffer_bytes, steering)
+        .map_err(|source| Error::Socket { addr, source })?;
     if !socket.has_established() {
         return Ok(socket);
-    }
-    if !config.steering {
-        return Ok(socket.into_unsteered(
-            "disabled by configuration (steering = false); the inherited ReusePort pair is \
-             read as one socket"
-                .to_owned(),
-        ));
     }
     let first = ProgramSet::build(steering::random_salt(), turn_servers.iter().copied());
     match socket.attach(&first) {
