@@ -162,21 +162,58 @@ pub fn encode_sf_string(value: &str) -> Option<String> {
     Some(out)
 }
 
-/// Picks the first protocol the client offered that the server supports.
+/// The outcome of subprotocol negotiation for one CONNECT.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Selection {
+    /// The client offered nothing usable (no offer header, or one that
+    /// does not parse: draft-ietf-webtrans-http3 section 3.3 says such a
+    /// field is ignored). The session is accepted without `wt-protocol`.
+    NoOffer,
+    /// The client's most preferred offer the server supports; echoed as
+    /// `wt-protocol`.
+    Selected(&'static str),
+    /// The client offered protocols and the server supports none of them.
+    NoMatch,
+}
+
+impl Selection {
+    /// The protocol to echo, if any.
+    #[must_use]
+    pub const fn selected(self) -> Option<&'static str> {
+        match self {
+            Self::Selected(p) => Some(p),
+            Self::NoOffer | Self::NoMatch => None,
+        }
+    }
+}
+
+/// Negotiates the subprotocol: the client lists `wt-available-protocols`
+/// in its preference order (Chrome: an sf-list of sf-strings, exactly as
+/// the page passed `protocols`); the first entry the server supports wins.
 #[must_use]
-pub fn select_protocol(
-    headers: &http::HeaderMap,
-    supported: &[&'static str],
-) -> Option<&'static str> {
+pub fn negotiate(headers: &http::HeaderMap, supported: &[&'static str]) -> Selection {
     let offered: Vec<String> = [AVAILABLE_PROTOCOLS, AVAILABLE_PROTOCOLS_LEGACY]
         .iter()
         .flat_map(|name| headers.get_all(*name))
         .filter_map(|v| v.to_str().ok())
         .flat_map(parse_protocol_list)
         .collect();
+    if offered.is_empty() {
+        return Selection::NoOffer;
+    }
     offered
         .iter()
         .find_map(|o| supported.iter().copied().find(|s| *s == o.as_str()))
+        .map_or(Selection::NoMatch, Selection::Selected)
+}
+
+/// Picks the first protocol the client offered that the server supports.
+#[must_use]
+pub fn select_protocol(
+    headers: &http::HeaderMap,
+    supported: &[&'static str],
+) -> Option<&'static str> {
+    negotiate(headers, supported).selected()
 }
 
 /// The 200 response to an accepted WebTransport CONNECT.
@@ -943,6 +980,11 @@ mod tests {
             Some("moqt-15")
         );
         assert_eq!(select_protocol(&headers, &["none"]), None);
+        assert_eq!(negotiate(&headers, &["none"]), Selection::NoMatch);
+        assert_eq!(
+            negotiate(&http::HeaderMap::new(), &["moqt-16"]),
+            Selection::NoOffer
+        );
         assert_eq!(encode_sf_string("moq"), Some("\"moq\"".into()));
         let resp = connect_response(Some("moqt-15")).unwrap();
         assert_eq!(resp.headers()[SELECTED_PROTOCOL], "\"moqt-15\"");

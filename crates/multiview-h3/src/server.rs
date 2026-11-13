@@ -460,36 +460,148 @@ fn under_prefix(path: &str, prefix: &str) -> bool {
     path.starts_with(prefix) || path == prefix.trim_end_matches('/')
 }
 
+/// Monotonic origin of the refusal-log seconds (process-wide, like the
+/// endpoint counters it budgets).
+static EPOCH: std::sync::LazyLock<std::time::Instant> =
+    std::sync::LazyLock::new(std::time::Instant::now);
+
+/// Why an extended CONNECT was refused: logged (rate-limited) and counted.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Refusal {
+    /// CONNECT without `:protocol` (a proxy tunnel).
+    PlainConnect,
+    /// No WebTransport handler on this endpoint.
+    NoHandler,
+    /// `:protocol` is not `webtransport`.
+    OtherProtocol,
+    /// `:path` outside the WebTransport prefix.
+    OutsidePrefix,
+    /// The connection already carries its one session.
+    SessionSlotTaken,
+    /// The client offered subprotocols, none of which the server speaks.
+    NoCommonSubprotocol,
+    /// The handler needs a subprotocol and the client offered none.
+    NoSubprotocolOffered,
+    /// The handler refused (ticket unknown/used/revoked, capacity, ...).
+    Admit,
+}
+
+impl Refusal {
+    pub(crate) const fn reason(self) -> &'static str {
+        match self {
+            Self::PlainConnect => "CONNECT without :protocol (proxy tunnel) is not served",
+            Self::NoHandler => "no WebTransport handler on this endpoint",
+            Self::OtherProtocol => ":protocol is not webtransport",
+            Self::OutsidePrefix => ":path is outside the WebTransport prefix",
+            Self::SessionSlotTaken => "this connection already carries its one WebTransport session",
+            Self::NoCommonSubprotocol => {
+                "none of the offered wt-available-protocols is supported (the ticket was not used)"
+            }
+            Self::NoSubprotocolOffered => {
+                "no wt-available-protocols offered and the handler requires one (the ticket was not used)"
+            }
+            Self::Admit => "the WebTransport handler refused the session",
+        }
+    }
+}
+
+/// Answers a refused CONNECT with `status`, finishes the stream and logs
+/// why (at most [`crate::counters::REFUSAL_LOGS_PER_SECOND`] lines per
+/// second endpoint-wide; every refusal is counted in `wt_refused`). The
+/// ticket query is never logged.
+async fn refuse(
+    shared: &Shared,
+    stream: &mut H3Stream,
+    req: &http::request::Parts,
+    status: http::StatusCode,
+    refusal: Refusal,
+) {
+    if let Some(suppressed) = shared.counters.refusal(EPOCH.elapsed().as_secs()) {
+        let offered = req
+            .headers
+            .get(webtransport::AVAILABLE_PROTOCOLS)
+            .or_else(|| req.headers.get(webtransport::AVAILABLE_PROTOCOLS_LEGACY))
+            .and_then(|v| v.to_str().ok())
+            .map(|v| v.get(..256).unwrap_or(v));
+        tracing::info!(
+            peer = %shared.peer,
+            path = req.uri.path().get(..128).unwrap_or(req.uri.path()),
+            status = status.as_u16(),
+            reason = refusal.reason(),
+            offered = offered.unwrap_or("-"),
+            supported = ?shared.wt.as_ref().map(|h| h.protocols()),
+            suppressed_since_last = suppressed,
+            "WebTransport CONNECT refused"
+        );
+    }
+    respond_and_finish(stream, status).await;
+}
+
+/// The checks of an extended CONNECT that need no state: method shape,
+/// handler, `:protocol`, prefix, subprotocol negotiation.
+fn check_connect(
+    shared: &Shared,
+    protocol: Option<Protocol>,
+    parts: &http::request::Parts,
+) -> Result<(Arc<dyn WtHandler>, webtransport::Selection), (http::StatusCode, Refusal)> {
+    let Some(protocol) = protocol else {
+        return Err((http::StatusCode::METHOD_NOT_ALLOWED, Refusal::PlainConnect));
+    };
+    let Some(handler) = shared.wt.clone() else {
+        return Err((http::StatusCode::NOT_IMPLEMENTED, Refusal::NoHandler));
+    };
+    if protocol != Protocol::WEB_TRANSPORT {
+        return Err((http::StatusCode::NOT_IMPLEMENTED, Refusal::OtherProtocol));
+    }
+    if !under_prefix(parts.uri.path(), shared.limits.wt_prefix) {
+        return Err((http::StatusCode::NOT_FOUND, Refusal::OutsidePrefix));
+    }
+    // Draft-ietf-webtrans-http3 section 3.3: the server MAY reject a request
+    // without a suitable protocol. Decided before `admit`, so a single-use
+    // ticket is not burned by a client that cannot speak any of our
+    // protocols. No offer at all is accepted (no WT-Protocol) unless the
+    // handler requires one.
+    let selection = webtransport::negotiate(&parts.headers, handler.protocols());
+    if selection == webtransport::Selection::NoMatch {
+        return Err((http::StatusCode::BAD_REQUEST, Refusal::NoCommonSubprotocol));
+    }
+    if selection == webtransport::Selection::NoOffer && handler.requires_protocol() {
+        return Err((http::StatusCode::BAD_REQUEST, Refusal::NoSubprotocolOffered));
+    }
+    Ok((handler, selection))
+}
+
 async fn handle_request(shared: Arc<Shared>, req: http::Request<()>, mut stream: H3Stream) {
     if req.method() != http::Method::CONNECT {
         return serve_site(&shared, req, stream).await;
     }
-    let Some(protocol) = req.extensions().get::<Protocol>().copied() else {
-        // Plain CONNECT (a proxy tunnel): not served here.
-        return respond_and_finish(&mut stream, http::StatusCode::METHOD_NOT_ALLOWED).await;
+    let protocol = req.extensions().get::<Protocol>().copied();
+    let (parts, ()) = req.into_parts();
+    let (handler, selection) = match check_connect(&shared, protocol, &parts) {
+        Ok(ok) => ok,
+        Err((status, refusal)) => {
+            return refuse(&shared, &mut stream, &parts, status, refusal).await;
+        }
     };
-    let Some(handler) = shared.wt.clone() else {
-        return respond_and_finish(&mut stream, http::StatusCode::NOT_IMPLEMENTED).await;
-    };
-    if protocol != Protocol::WEB_TRANSPORT {
-        return respond_and_finish(&mut stream, http::StatusCode::NOT_IMPLEMENTED).await;
-    }
-    if !under_prefix(req.uri().path(), shared.limits.wt_prefix) {
-        return respond_and_finish(&mut stream, http::StatusCode::NOT_FOUND).await;
-    }
     if shared.router.reserve().is_err() {
         Counters::inc(&shared.counters.wt_429);
-        return respond_and_finish(&mut stream, http::StatusCode::TOO_MANY_REQUESTS).await;
+        return refuse(
+            &shared,
+            &mut stream,
+            &parts,
+            http::StatusCode::TOO_MANY_REQUESTS,
+            Refusal::SessionSlotTaken,
+        )
+        .await;
     }
-    let (parts, ()) = req.into_parts();
     let token = match handler.admit(&parts, shared.peer) {
         Ok(token) => token,
         Err(status) => {
             shared.router.release();
-            return respond_and_finish(&mut stream, status).await;
+            return refuse(&shared, &mut stream, &parts, status, Refusal::Admit).await;
         }
     };
-    let selected = webtransport::select_protocol(&parts.headers, handler.protocols());
+    let selected = selection.selected();
     let session_id = stream.send_id().into_inner();
     let (mut send, recv): (H3Send, H3Recv) = stream.split();
     let response = match webtransport::connect_response(selected) {
@@ -502,7 +614,7 @@ async fn handle_request(shared: Arc<Shared>, req: http::Request<()>, mut stream:
         }
     };
     if let Err(err) = send.send_response(response).await {
-        tracing::debug!(%err, "sending the CONNECT response");
+        tracing::info!(peer = %shared.peer, %err, "WebTransport CONNECT: the 200 could not be sent");
         shared.router.release();
         return;
     }
