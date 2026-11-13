@@ -1181,6 +1181,17 @@ where
 /// The guard state on a server-side receive stream.
 struct RecvGuard {
     guard: HeaderGuard,
+    /// The header deadline as a fixed instant, measured from stream accept
+    /// (set at construction, never recomputed).
+    deadline_at: Instant,
+    /// The `Sleep` backing `deadline_at`, created lazily on the first
+    /// `poll_data_max` call rather than at construction: while the stream
+    /// sits in `pending_bi`/awaiting the request semaphore, nothing polls
+    /// this guard (the pending phase is covered by the connection-level
+    /// `pending_timer` instead), so eagerly arming a `Sleep` here for every
+    /// accepted bidi stream (up to 128 per connection) would be dead
+    /// weight. Cleared once the header guard clears its own deadline
+    /// (first frame complete) or the guard is dropped entirely.
     deadline: Option<Pin<Box<tokio::time::Sleep>>>,
     counters: Arc<Counters>,
 }
@@ -1189,9 +1200,20 @@ impl RecvGuard {
     fn new(config: &GuardConfig) -> Self {
         Self {
             guard: HeaderGuard::new(config.max_field_section_size),
-            deadline: Some(Box::pin(tokio::time::sleep(config.header_deadline))),
+            deadline_at: Instant::now() + config.header_deadline,
+            deadline: None,
             counters: Arc::clone(&config.counters),
         }
+    }
+
+    /// Polls the deadline, creating its `Sleep` on first use. `deadline_at`
+    /// in the past (as in a unit test) fires on this first poll.
+    fn poll_deadline(&mut self, cx: &mut task::Context<'_>) -> bool {
+        let at = self.deadline_at;
+        let sleep = self
+            .deadline
+            .get_or_insert_with(|| Box::pin(tokio::time::sleep_until(at)));
+        sleep.as_mut().poll(cx).is_ready()
     }
 }
 
@@ -1322,11 +1344,7 @@ impl RecvStream {
         let chunk = match polled {
             Poll::Ready(res) => res.map_err(convert_read_error_to_stream_error)?,
             Poll::Pending => {
-                let expired = self
-                    .guard
-                    .as_mut()
-                    .and_then(|g| g.deadline.as_mut())
-                    .is_some_and(|d| d.as_mut().poll(cx).is_ready());
+                let expired = self.guard.as_mut().is_some_and(|g| g.poll_deadline(cx));
                 if expired {
                     if let Some(g) = &self.guard {
                         Counters::inc(&g.counters.header_deadline_rejections);
@@ -1621,6 +1639,43 @@ mod tests {
         // at compile time instead of asserting a constant at runtime.
         const _: () = assert!(QPACK_CHUNKS_PER_POLL > 0);
         const _: () = assert!(QPACK_CHUNKS_PER_POLL < QPACK_STREAM_MAX);
+    }
+
+    fn guard_config() -> GuardConfig {
+        GuardConfig {
+            max_field_section_size: 16 * 1024,
+            header_deadline: Duration::from_secs(1),
+            settings_deadline: Duration::from_secs(1),
+            control_frame_deadline: Duration::from_secs(1),
+            counters: Arc::new(Counters::default()),
+        }
+    }
+
+    #[test]
+    fn fresh_recv_guard_holds_no_sleep() {
+        // #358 review2 R2-1: constructing the guard (done for every
+        // accepted bidi stream, up to 128 per connection) must not arm a
+        // `Sleep` before anything polls it.
+        let guard = RecvGuard::new(&guard_config());
+        assert!(guard.deadline.is_none());
+    }
+
+    #[tokio::test]
+    async fn recv_guard_deadline_is_measured_from_accept_and_fires_on_first_poll() {
+        // The deadline instant is fixed at construction (from accept time,
+        // as before); if that instant is already in the past by the time
+        // anything first polls the guard (e.g. the stream sat in
+        // `pending_bi` past its deadline before the request task was
+        // created), the lazily-created `Sleep` must still fire immediately
+        // rather than measuring a fresh `header_deadline` from the first
+        // poll.
+        let mut guard = RecvGuard::new(&guard_config());
+        assert!(guard.deadline.is_none());
+        // Move the deadline into the past, as if accept happened well
+        // before `header_deadline` ago.
+        guard.deadline_at = Instant::now() - Duration::from_secs(10);
+        let fired = std::future::poll_fn(|cx| task::Poll::Ready(guard.poll_deadline(cx))).await;
+        assert!(fired, "a past deadline must fire on the first poll");
     }
 
     #[test]
