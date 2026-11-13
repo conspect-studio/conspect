@@ -428,6 +428,9 @@ fn an_inherited_reuseport_pair_keeps_validated_flow_steering() {
 
 /// The inherited pair as systemd would hand it, with `ReceiveBuffer=`
 /// standing in as `rcvbuf` set by the "service manager" (0 = untouched).
+/// Linux only: a reuseport group and steering are Linux features
+/// (`ReuseportGroup::bind` is `Unsupported` elsewhere).
+#[cfg(target_os = "linux")]
 fn inherited_pair(rcvbuf: usize) -> (u16, Vec<UdpSocket>) {
     let group = multiview_frontdoor::ReuseportGroup::bind(any(0), rcvbuf).unwrap();
     let port = group.listener().local_addr().unwrap().port();
@@ -441,6 +444,7 @@ fn inherited_pair(rcvbuf: usize) -> (u16, Vec<UdpSocket>) {
 /// Review PR 349: an inherited socket's buffer is reported against the
 /// configured `recv_buffer_bytes`, so a unit without `ReceiveBuffer=` (or a
 /// smaller one) reads as clamped instead of `requested: 0, clamped: false`.
+#[cfg(target_os = "linux")]
 #[test]
 fn an_inherited_socket_reports_its_buffer_against_the_configured_target() {
     // The "unit" set 64 KiB; the door wants 8 MiB: clamped.
@@ -486,6 +490,7 @@ fn an_inherited_socket_reports_its_buffer_against_the_configured_target() {
 
 /// Review PR 349: `steering = false` with an inherited pair runs ONE socket:
 /// the established member is closed, so every datagram lands on the listener.
+#[cfg(target_os = "linux")]
 #[test]
 fn steering_off_closes_the_inherited_established_socket() {
     use multiview_frontdoor::SteeringMode;
