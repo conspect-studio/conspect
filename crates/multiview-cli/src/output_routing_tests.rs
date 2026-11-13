@@ -5049,3 +5049,28 @@ fn a_superseded_moving_take_off_an_edited_layout_follows_its_current_audio() {
     assert_eq!(view.bus, "aux:L");
     assert_eq!(view.audio, "src:bars", "the edited attribute is on air");
 }
+
+/// #369 review round 5 (lens 2): a forgotten change fails closed even when
+/// the router remembers an OLDER state of the same layout.
+#[test]
+fn a_forgotten_change_fails_closed_over_an_older_known_state() {
+    let mut x = harness(2, 6, None);
+    let PictureBus::Layout(known) = layout_bus("L") else {
+        panic!("a layout bus");
+    };
+    x.r.remember_state(crate::output_routing::LayoutChange::Edited(known.clone()));
+    let PictureBus::Layout(take_body) = layout_bus("L") else {
+        panic!("a layout bus");
+    };
+    assert!(!x.r.layout_take_is_stale(&take_body));
+    // A newer removal of L was evicted before the router applied it.
+    x.r.layout_states_forgotten = crate::output_routing::next_layout_revision();
+    assert!(x.r.layout_take_is_stale(&take_body), "fails closed");
+    let PictureBus::Layout(later) = layout_bus("L") else {
+        panic!("a layout bus");
+    };
+    assert!(
+        !x.r.layout_take_is_stale(&later),
+        "a later resolution passes"
+    );
+}

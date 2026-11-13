@@ -1591,11 +1591,14 @@ impl OutputRouter {
         {
             return true;
         }
-        match self.layout_states.get(&layout.id) {
-            Some(known) => known.revision() > layout.body.revision,
-            // Unknown: stale only if a forgotten state could be newer.
-            None => layout.body.revision <= self.layout_states_forgotten,
+        // Fail closed: any forgotten (evicted, never applied) change could be
+        // a newer state of this layout, so no take at or below it passes.
+        if layout.body.revision <= self.layout_states_forgotten {
+            return true;
         }
+        self.layout_states
+            .get(&layout.id)
+            .is_some_and(|known| known.revision() > layout.body.revision)
     }
 
     /// Whether layout `id` composes now (an output on it, or a feed for it).
