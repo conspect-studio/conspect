@@ -558,6 +558,12 @@ struct DynamicKey {
     /// `DEGRADED_AFTER_TICKS` marks its outputs degraded;
     /// `FALLBACK_AFTER_TICKS` closes the key (its outputs fall back).
     starved: u64,
+    /// A substitution offer was refused this tick: the surviving tick's
+    /// accepted offer must not reset `starved` (a key that refuses every
+    /// substitution and accepts every survivor is still starved).
+    refused_this_tick: bool,
+    /// Whether the last published snapshot showed this key degraded.
+    reported_degraded: bool,
 }
 
 struct PendingOpen {
@@ -874,9 +880,10 @@ impl OutputRouter {
                     tick,
                     canvas: Arc::clone(&canvas),
                 }) {
-                    Ok(()) => d.starved = 0,
+                    Ok(()) => {}
                     Err(OfferRejection::Overloaded) => {
                         d.starved = d.starved.saturating_add(1);
+                        d.refused_this_tick = true;
                         break;
                     }
                     // `feed` closes an ended worker on this same tick.
@@ -1149,6 +1156,8 @@ impl OutputRouter {
                 generation,
                 silent: 0,
                 starved: 0,
+                refused_this_tick: false,
+                reported_degraded: false,
             });
             // The first offer (frame T, an IDR) is made by `feed` this same
             // tick, after the key exists. The move is requested once the key's
@@ -1617,13 +1626,16 @@ impl OutputRouter {
             // The bus's health is its picture's freshness; this KEY's
             // encoder refusing frames is counted on the key itself, so a
             // healthy sibling key on the same bus cannot reset it.
-            let was_degraded = d.starved >= DEGRADED_AFTER_TICKS;
+            let refused_before = std::mem::take(&mut d.refused_this_tick);
             match offer_result {
-                Ok(()) => d.starved = 0,
+                Ok(()) if !refused_before => d.starved = 0,
                 Err(OfferRejection::Overloaded) => d.starved = d.starved.saturating_add(1),
-                Err(OfferRejection::Ended) => {}
+                Ok(()) | Err(OfferRejection::Ended) => {}
             }
-            if was_degraded != (d.starved >= DEGRADED_AFTER_TICKS) {
+            // Wherever `starved` moved (here or in `substitute_clean`), a
+            // change of the degraded state republishes the snapshot.
+            if d.reported_degraded != (d.starved >= DEGRADED_AFTER_TICKS) {
+                d.reported_degraded = !d.reported_degraded;
                 self.dirty = true;
             }
             fresh_buses.push((d.bus.clone(), fresh));
