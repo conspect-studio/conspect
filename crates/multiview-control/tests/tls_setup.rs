@@ -537,6 +537,15 @@ async fn credential_is_stored_0600_and_never_echoed_or_logged() {
     let traversal = send(&router, post("../active.pem", SECRET)).await;
     assert_eq!(traversal.status(), StatusCode::UNPROCESSABLE_ENTITY);
 
+    // Over the value cap (but inside the body cap): refused, nothing written.
+    let big = "x".repeat(multiview_control::tls_setup::CREDENTIAL_VALUE_MAX + 1);
+    let too_big = send(&router, post("CONSPECT_TEST_TLS_SETUP_CF_TOKEN", &big)).await;
+    assert_eq!(too_big.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    assert!(!f
+        .state_dir
+        .join("secrets")
+        .join("CONSPECT_TEST_TLS_SETUP_CF_TOKEN")
+        .exists());
     let stored = send(&router, post("CONSPECT_TEST_TLS_SETUP_CF_TOKEN", SECRET)).await;
     assert_eq!(stored.status(), StatusCode::NO_CONTENT);
     let stored_body = body_bytes(stored).await;

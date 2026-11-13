@@ -454,6 +454,9 @@ pub fn render_status(value: &serde_json::Value) -> String {
 
 /// Read a secret from stdin: echo off on a terminal, one line, no trailing
 /// newline. Never from argv.
+/// Largest credential value accepted (the admin route's body cap).
+const CREDENTIAL_MAX: usize = 4 * 1024;
+
 fn read_secret_stdin(name: &str) -> anyhow::Result<zeroize_string::Secret> {
     let stdin = std::io::stdin();
     #[cfg(not(all(unix, feature = "acme")))]
@@ -478,7 +481,15 @@ fn read_secret_stdin(name: &str) -> anyhow::Result<zeroize_string::Secret> {
         }
     };
     let mut line = zeroize_string::Secret(String::new());
-    let read = stdin.read_line(&mut line.0);
+    // Bounded: one line of at most CREDENTIAL_MAX bytes (+ newline); a longer
+    // input is refused, never truncated or written.
+    let read = {
+        use std::io::BufRead as _;
+        let limit = u64::try_from(CREDENTIAL_MAX)
+            .unwrap_or(u64::MAX)
+            .saturating_add(2);
+        stdin.lock().take(limit).read_line(&mut line.0)
+    };
     #[cfg(all(unix, feature = "acme"))]
     if let Some(saved) = restore {
         let _ = rustix::termios::tcsetattr(&stdin, rustix::termios::OptionalActions::Now, &saved);
@@ -489,6 +500,9 @@ fn read_secret_stdin(name: &str) -> anyhow::Result<zeroize_string::Secret> {
     let value = zeroize_string::Secret(trimmed);
     if value.0.is_empty() {
         anyhow::bail!("empty value on stdin");
+    }
+    if value.0.len() > CREDENTIAL_MAX {
+        anyhow::bail!("value longer than {CREDENTIAL_MAX} bytes; nothing stored");
     }
     Ok(value)
 }

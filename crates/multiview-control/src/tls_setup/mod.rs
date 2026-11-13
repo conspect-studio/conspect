@@ -55,6 +55,8 @@ pub const SETUP_PAGE_CSP: &str =
 pub const SESSION_COOKIE: &str = "conspect_tls_setup";
 /// Largest accepted `POST /api/v1/tls/credential` body.
 pub const CREDENTIAL_BODY_LIMIT: usize = 8 * 1024;
+/// Largest credential value stored (the CLI applies the same cap to stdin).
+pub const CREDENTIAL_VALUE_MAX: usize = 4 * 1024;
 /// `Retry-After` on the setup-required problem, seconds.
 pub const SETUP_RETRY_AFTER_S: u32 = 30;
 
@@ -531,6 +533,9 @@ async fn admin_credential(State(state): State<AppState>, request: Request) -> Re
     }
     if value.is_empty() {
         return problem(400, "bad-request", "Empty value");
+    }
+    if value.len() > CREDENTIAL_VALUE_MAX {
+        return problem(413, "payload-too-large", "Value larger than 4 KiB");
     }
     match write_secret(&tls.config.state_dir, &name, value.as_bytes()) {
         Ok(()) => {
