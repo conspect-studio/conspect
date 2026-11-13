@@ -91,15 +91,30 @@ fn read_trusted(path: &Path, owner_uid: u32) -> Option<String> {
     if !trusted(&link) {
         return None;
     }
-    let mut file = std::fs::File::open(path).ok()?;
+    let file = std::fs::File::open(path).ok()?;
     let opened = file.metadata().ok()?;
-    if !trusted(&opened) || opened.dev() != link.dev() || opened.ino() != link.ino() {
+    if !trusted(&opened)
+        || opened.dev() != link.dev()
+        || opened.ino() != link.ino()
+        || opened.len() > MAX_STATUS_BYTES
+    {
         return None;
     }
+    // Bounded even if the file grows after the size check.
     let mut content = String::new();
-    file.read_to_string(&mut content).ok()?;
+    file.take(MAX_STATUS_BYTES.saturating_add(1))
+        .read_to_string(&mut content)
+        .ok()?;
+    if u64::try_from(content.len()).unwrap_or(u64::MAX) > MAX_STATUS_BYTES {
+        return None;
+    }
     Some(content)
 }
+
+/// Most bytes read from the status file. The shipped table lists in about
+/// 3.4 KiB; anything over this cap is not the shipped listing and reads as
+/// `unknown` without being read in full (review PR 349).
+pub const MAX_STATUS_BYTES: u64 = 256 * 1024;
 
 /// Non-unix builds have no nft and no ownership model: never trusted.
 #[cfg(not(unix))]
@@ -556,6 +571,27 @@ mod tests {
     }
 
     #[cfg(unix)]
+    #[test]
+    fn an_oversized_file_is_unknown_without_reading_it_all() {
+        let dir = std::env::temp_dir().join(format!("nft-floor-big-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("nft-floor.json");
+        // The shipped listing padded with whitespace past the cap: still
+        // valid JSON, so only the size check rejects it.
+        let mut big = PRESENT_FIXTURE.to_owned();
+        big.push_str(&" ".repeat(usize::try_from(MAX_STATUS_BYTES).unwrap()));
+        std::fs::write(&path, big).unwrap();
+        let mut perms = std::fs::metadata(&path).unwrap().permissions();
+        std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o644);
+        std::fs::set_permissions(&path, perms).unwrap();
+        let uid = std::os::unix::fs::MetadataExt::uid(&std::fs::metadata(&path).unwrap());
+        assert_eq!(probe_owned_by(&path, uid), NftFloorStatus::Unknown);
+        // The same listing under the cap is present.
+        std::fs::write(&path, PRESENT_FIXTURE).unwrap();
+        assert_eq!(probe_owned_by(&path, uid), NftFloorStatus::Present);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
     #[test]
     fn a_directory_is_unknown() {
         use std::os::unix::fs::MetadataExt as _;

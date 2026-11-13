@@ -1243,6 +1243,13 @@ the engine's own TLS. The str0m ICE-TCP consumer and the browser ladder are PR2 
 
 ### Slice 3 as built, part B: Retry policy, config wiring, capability + metrics, deploy artefacts (issue #289)
 
+**UDP 443 during ACME `setup` (slices 3 and 5 together).** With `[network.tls]` the QUIC lane is taken
+at boot and held, with no noq endpoint, until the certificate is `serving` (section 5a: "QUIC listener
+not started"). In that window the port answers no QUIC datagram at all: no Version Negotiation, no Retry,
+no stateless reset, so it cannot amplify; the dispatcher still applies every new-flow budget and the held
+lane's bounded queues (1024 established + 256 new) fill and then drop (`dropped_queue_full`). The Retry
+policy below applies from the moment the endpoint starts. WebRTC on the same socket is unaffected.
+
 **QUIC Retry policy.** Vendored `vendor/moq-tokio`: `noq::Injected` gains `retry_above_handshakes:
 Option<usize>` and `retry_counter: Option<Arc<AtomicU64>>`. In `Server::accept_next`'s `noq_accept`
 arm, `self.accept.len()` (the `FuturesUnordered` of accepted `Incoming`s whose handshake + SETUP
