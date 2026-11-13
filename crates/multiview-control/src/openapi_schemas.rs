@@ -591,6 +591,8 @@ pub enum WarningCodeDoc {
     /// The saved accepted state could not start; the engine started from the
     /// last state that started (#317).
     AcceptedStateRejected,
+    /// The front-door TLS certificate is failing to renew or has expired.
+    TlsCertificate,
 }
 
 /// `OpenAPI` mirror of [`multiview_events::HealthWarning`] (SA-0).

@@ -969,6 +969,28 @@ impl Runtime {
         let local = on.socket.local_addr()?;
         Self::listen_files_inner(local, Some(on), endpoint, protocol, cert, key, || {}).await
     }
+    /// [`listen_files_on`](Self::listen_files_on) with an in-memory certificate
+    /// resolver instead of PEM files (ADR-0107 slice 5): `resolver` is consulted
+    /// on every QUIC `ClientHello`, so a hot-swapped ACME certificate reaches new
+    /// handshakes without restarting the listener. Nothing is read from disk.
+    ///
+    /// # Errors
+    ///
+    /// As for [`listen_files_on`](Self::listen_files_on), minus the file checks.
+    pub async fn listen_resolver_on(
+        on: SharedSocket,
+        endpoint: String,
+        protocol: &str,
+        resolver: Arc<dyn moq_tokio::rustls::server::ResolvesServerCert>,
+    ) -> anyhow::Result<Arc<Self>> {
+        let local = on.socket.local_addr()?;
+        anyhow::ensure!(local.is_ipv6(), "IPv6-first listener required");
+        let mut config = moq_tokio::listen::Config::default();
+        config.bind = Some(moq_tokio::listen::Bind::Addr(local));
+        config.version = vec![protocol.parse().map_err(anyhow::Error::msg)?];
+        config.tls.resolver = Some(resolver);
+        Self::listen_on(config, endpoint, protocol, Some(on)).await
+    }
     async fn listen_files_after_open(
         bind: std::net::SocketAddr,
         endpoint: String,

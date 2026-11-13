@@ -390,6 +390,15 @@ pub mod webrtc_outputs;
 /// MoQ and WebRTC, on its own runtime, when `[network]` is configured.
 pub mod frontdoor;
 
+/// Front-door ACME boot wiring (ADR-0107 section 5a, slice 5): bootstrap
+/// certificate, ACME service, alarm hook, setup code. Behind `acme`, unix.
+#[cfg(all(feature = "acme", unix))]
+pub mod tls_boot;
+
+/// The `multiview tls ...` subcommand: status, setup-code, set-credential,
+/// issue, over the loopback admin listener (or offline from `state_dir`).
+pub mod tls_cli;
+
 /// The **single-socket** WebRTC orchestration (ADR-0048 §4): binds ONE shared
 /// dual-stack UDP socket and adopts every WebRTC role onto it — preview WHEP, WHIP
 /// ingest, WHEP-serve outputs, and `whip_push` outputs — fixing the box-validation

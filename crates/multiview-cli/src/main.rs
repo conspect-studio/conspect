@@ -48,6 +48,87 @@ struct RunningPersist {
     /// for the run's lifetime and dropped at teardown (its runtime shuts down
     /// in the background, never blocking this one).
     front_door: Option<multiview_cli::frontdoor::FrontDoorRun>,
+    /// The front-door ACME wiring (ADR-0107 section 5a) when `[network.tls]`
+    /// is configured: the ACME service thread lives as long as the run.
+    _tls: Option<TlsWiring>,
+}
+
+/// The run's ACME wiring: the service plus a shutdown signal for the task
+/// that holds the QUIC lane until the certificate is serving.
+struct TlsWiring {
+    #[cfg(all(feature = "acme", unix, feature = "moq-output"))]
+    context: Arc<multiview_control::tls_setup::TlsContext>,
+    #[cfg(all(feature = "acme", unix))]
+    boot: multiview_cli::tls_boot::TlsBoot,
+    #[cfg(all(feature = "acme", unix))]
+    shutdown: tokio_util_shutdown::Shutdown,
+}
+
+/// A cloneable one-shot shutdown flag (no extra dependency).
+#[cfg(all(feature = "acme", unix))]
+mod tokio_util_shutdown {
+    /// Fires once; every clone observes it.
+    #[derive(Clone)]
+    pub(crate) struct Shutdown(std::sync::Arc<tokio::sync::watch::Sender<bool>>);
+    impl Shutdown {
+        pub(crate) fn new() -> Self {
+            Self(std::sync::Arc::new(tokio::sync::watch::channel(false).0))
+        }
+        pub(crate) fn fire(&self) {
+            self.0.send_replace(true);
+        }
+        #[cfg(feature = "moq-output")]
+        pub(crate) async fn wait(self) {
+            let mut rx = self.0.subscribe();
+            let _ = rx.wait_for(|v| *v).await;
+        }
+    }
+}
+
+impl Drop for TlsWiring {
+    fn drop(&mut self) {
+        #[cfg(all(feature = "acme", unix))]
+        {
+            self.shutdown.fire();
+            multiview_cli::tls_boot::install_tls_context(None);
+            // `boot` (the ACME service) drops after this: bounded join (2 s).
+            let _ = self.boot.service_finished();
+        }
+    }
+}
+
+/// Start the front-door ACME wiring when `[network.tls]` is configured.
+#[allow(clippy::unnecessary_wraps)]
+fn start_tls(
+    config: &MultiviewConfig,
+    publisher: &Arc<EnginePublisher<EngineStateSnapshot, Event>>,
+) -> anyhow::Result<Option<TlsWiring>> {
+    #[cfg(all(feature = "acme", unix))]
+    {
+        let Some(boot) = multiview_cli::tls_boot::TlsBoot::start(
+            config,
+            Some(Arc::clone(publisher)),
+            &multiview_cli::tls_boot::BootOptions::default(),
+        )?
+        else {
+            return Ok(None);
+        };
+        let context = Arc::clone(&boot.context);
+        multiview_cli::tls_boot::install_tls_context(Some(Arc::clone(&context)));
+        #[cfg(not(feature = "moq-output"))]
+        drop(context);
+        Ok(Some(TlsWiring {
+            #[cfg(feature = "moq-output")]
+            context,
+            boot,
+            shutdown: tokio_util_shutdown::Shutdown::new(),
+        }))
+    }
+    #[cfg(not(all(feature = "acme", unix)))]
+    {
+        let _ = (config, publisher);
+        Ok(None)
+    }
 }
 
 impl RunningPersist {
@@ -192,6 +273,10 @@ async fn dispatch(cli: Cli) -> anyhow::Result<ExitCode> {
         // + control-plane state and exceeds clippy's large-future bound.
         Command::Run(args) => Box::pin(run_run(args)).await,
         Command::Node(args) => run_node(&args),
+        Command::Tls(command) => {
+            println!("{}", multiview_cli::tls_cli::run(&command)?);
+            Ok(ExitCode::SUCCESS)
+        }
         Command::AcknowledgeFallback(args) => run_acknowledge_fallback(&args),
     }
 }
@@ -258,6 +343,10 @@ async fn run_run(args: RunArgs) -> anyhow::Result<ExitCode> {
     // clear error (the DEV-B1 display-output fail-fast precedent) — never
     // silently ride the system clock while the config asks for a PHC.
     multiview_cli::timing_gate::ensure_ptp_phc_supported(start.running.timing.as_ref())
+        .map_err(|reason| anyhow::anyhow!(reason))?;
+    // `[network.tls]` in a build without `acme` cannot provide certificates:
+    // a hard startup error, never a silent plain-HTTP front door.
+    multiview_cli::tls_cli::ensure_acme_supported(&start.running)
         .map_err(|reason| anyhow::anyhow!(reason))?;
 
     if args.software {
@@ -522,7 +611,45 @@ struct ControlPlaneWiring {
 async fn start_moq_listener(
     factory: Option<Arc<dyn multiview_control::moq_provider::AuthorizedFeedFactory>>,
     front_door: Option<&mut multiview_cli::frontdoor::FrontDoorRun>,
+    tls: Option<&TlsWiring>,
 ) -> anyhow::Result<Option<Arc<multiview_control::moq::MoqRegistry>>> {
+    #[cfg(all(feature = "acme", unix))]
+    if let (Some(door), Some(tls)) = (front_door.as_ref(), tls) {
+        // ADR-0107 section 5a: with `[network.tls]` the front-door QUIC lane
+        // serves the ACME certificate and is NOT started while in setup. The
+        // lane is taken now (so nothing else binds it); MoQ starts from a
+        // control-plane task once the source is serving. Until then every MoQ
+        // lease answers the existing honest 503 (provider unavailable).
+        let _ = door;
+        let Some((endpoint, protocol)) =
+            multiview_control::moq_startup::MoqListenerConfig::endpoint_from_env()
+                .map_err(|_| anyhow::anyhow!("invalid explicit MoQ listener configuration"))?
+        else {
+            return Ok(None);
+        };
+        let door = front_door.ok_or_else(|| anyhow::anyhow!("front door unavailable"))?;
+        let socket = door
+            .take_moq_socket()
+            .ok_or_else(|| anyhow::anyhow!("front-door QUIC lane unavailable"))?;
+        let deferred = Arc::new(multiview_control::moq_startup::DeferredProvider::default());
+        let registry = Arc::new(multiview_control::moq::MoqRegistry::new(
+            deferred.clone(),
+            std::time::Duration::from_secs(30),
+            16,
+        ));
+        tokio::spawn(multiview_cli::frontdoor::start_moq_when_serving(
+            tls.context.clone(),
+            tls.shutdown.clone().wait(),
+            endpoint,
+            protocol,
+            factory,
+            socket,
+            deferred,
+        ));
+        return Ok(Some(registry));
+    }
+    #[cfg(not(all(feature = "acme", unix)))]
+    let _ = tls;
     if let Some(door) = front_door {
         // ADR-0107 slice 1: MoQ rides the front-door socket's QUIC lane.
         let Some(config) =
@@ -665,6 +792,11 @@ async fn serve_control_plane(
     // The network front door (ADR-0107 slice 1): with `[network]`, ONE
     // dual-stack UDP socket for MoQ and WebRTC, on its own runtime. Without it,
     // both keep their legacy sockets unchanged.
+    // Front-door ACME (ADR-0107 section 5a): bootstrap certificate + ACME
+    // service + setup code, before the control plane binds. Startup only, on
+    // this control runtime; the output clock never waits on it (the service
+    // runs on its own thread + runtime).
+    let tls = start_tls(config, publisher)?;
     #[allow(unused_mut)]
     let mut front_door = multiview_cli::frontdoor::FrontDoorRun::start(config);
     // Install the capability snapshot + live metrics source for the control
@@ -729,7 +861,7 @@ async fn serve_control_plane(
     // revert-to-start/promote actions, and is the persister's target.
     let boot_model = Arc::new(start.to_boot_model(config_path));
     #[cfg(feature = "moq-output")]
-    let moq = start_moq_listener(moq_factory, front_door.as_mut()).await?;
+    let moq = start_moq_listener(moq_factory, front_door.as_mut(), tls.as_ref()).await?;
     let (addr, handle, state) = control::bind_and_serve_with_moq(
         listen,
         config,
@@ -773,6 +905,7 @@ async fn serve_control_plane(
         ),
         state: state.clone(),
         front_door,
+        _tls: tls,
     };
     // Watch the boot config file for external edits (ADR-W020): a valid write
     // hot-reloads the impacted parts through the SAME router state + command

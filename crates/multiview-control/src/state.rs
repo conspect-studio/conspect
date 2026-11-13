@@ -780,6 +780,11 @@ pub struct AppState {
     pub moq: Arc<crate::moq::MoqRegistry>,
     /// Optional durable Cloudflare management provider, independent of media admission.
     pub cloudflare: Option<Arc<dyn crate::routes::cloudflare::CloudflareManagement>>,
+    /// The front-door certificate context (ADR-0107 section 5a): the ACME
+    /// source, its resolver, the issue trigger and the setup-code authority.
+    /// `None` without `[network.tls]` (the TLS routes are then not mounted).
+    #[cfg(all(feature = "acme", unix))]
+    pub tls: Option<Arc<crate::tls_setup::TlsContext>>,
     /// The WHIP ingest transport seam (RFC 9725 WebRTC contribution sources).
     /// The default ([`NoWhip`](crate::whip::NoWhip)) refuses every publish with
     /// an honest `503`; the binary swaps in a `multiview-webrtc`-backed provider.
@@ -1083,6 +1088,8 @@ impl AppState {
             #[allow(clippy::default_constructed_unit_structs)] // unit on non-unix
             web_capture: crate::web_capture::Provider::default(),
             cloudflare: None,
+            #[cfg(all(feature = "acme", unix))]
+            tls: None,
             whip: crate::whip::no_whip(),
             whep_output: crate::whep_output::no_whep_output(),
             // Secure default: authentication is REQUIRED. An operator opts out
@@ -1468,6 +1475,22 @@ impl AppState {
     ) -> Self {
         self.cloudflare = Some(provider);
         self
+    }
+
+    /// Install the front-door certificate context (ADR-0107 section 5a): mounts
+    /// `/api/v1/tls/*` and arms [`crate::tls_setup::front_door_router`]'s gate.
+    #[cfg(all(feature = "acme", unix))]
+    #[must_use]
+    pub fn with_tls(mut self, tls: Arc<crate::tls_setup::TlsContext>) -> Self {
+        self.tls = Some(tls);
+        self
+    }
+
+    /// The front-door certificate context, when `[network.tls]` is configured.
+    #[cfg(all(feature = "acme", unix))]
+    #[must_use]
+    pub fn tls(&self) -> Option<&Arc<crate::tls_setup::TlsContext>> {
+        self.tls.as_ref()
     }
 
     /// Install the authorized finite `MoQ` registry; the default remains unavailable.
