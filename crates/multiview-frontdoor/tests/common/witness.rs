@@ -326,10 +326,10 @@ pub fn report(name: &str, r: &ClockRun) {
     );
 }
 
-/// The issue #321 assertion: one frame per tick, the output PTS exactly
-/// `from_tick(index)` with consecutive indices (constant delta), and (where
-/// [`WITNESS_RELIABLE`]) zero unexplained repeats. Absolute, never relative to
-/// another arm.
+/// The chaos suite's per-arm assertion (issues #289, #321), also used by the
+/// `stall_witness.rs` controls: [`assert_shape`] on every platform, and where
+/// [`WITNESS_RELIABLE`] (Linux) zero repeats not explained by a whole-process
+/// stall. Absolute, never relative to another arm.
 pub fn assert_cadence(name: &str, r: &ClockRun) {
     assert_shape(name, r);
     let c = classify(r);
@@ -348,12 +348,6 @@ pub fn assert_cadence(name: &str, r: &ClockRun) {
         c.unexplained,
         r.gaps
     );
-}
-
-/// Unexplained repeats (ticks behind the witness cannot attribute to a
-/// whole-process stall), or `None` where the witness is unreliable.
-pub fn unexplained_repeats(r: &ClockRun) -> Option<usize> {
-    WITNESS_RELIABLE.then(|| classify(r).unexplained.len())
 }
 
 /// What the design guarantees on any host, whatever the load: one frame per

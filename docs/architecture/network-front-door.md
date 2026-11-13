@@ -942,8 +942,8 @@ IPv6 /64s via `IPV6_FREEBIND`) drives `tests/chaos_flood.rs`, the steering and a
 tests, and `examples/udp443_flood.rs` (the second-host tool: `--target --pps --secs --threads
 --sources --shapes`). Chaos arms: idle; door on with an established MoQ viewer under each flood kind
 (one source, many IPv4 sources, rotating /64s); door off with the many-source flood. Per arm: tick
-count within 2, every PTS exactly `MediaTime::from_tick(index)` with consecutive indices, zero
-unexplained repeats, viewer >= 95% of groups, RSS bound, and with steering the viewer's datagrams
+count within 2, every PTS exactly `MediaTime::from_tick(index)` with consecutive indices, on Linux
+zero unexplained repeats (absolute, every arm), viewer >= 95% of groups, RSS bound, and with steering the viewer's datagrams
 read from the established socket.
 
 **The #321 stall witness.** The slice-1 suite asserted `repeats == 0` on every arm, which asserted
@@ -970,9 +970,14 @@ it recorded 255-302 gaps of at least 5 ms in a 3 s run with no stall injected, a
 while another thread merely spun (headless processes there get coalesced timers), so it can
 neither prove nor excuse a stall. On macOS the chaos suite asserts what the design guarantees on
 any host (one frame per tick, consecutive indices, exact PTS from the tick, the viewer's >= 95 %,
-RSS) and reports repeats without judging them; the witness-judged controls are `cfg(linux)`. The
-production target (mda001) and the ubuntu CI runner are Linux, where the zero-unexplained-repeats
-assertion holds.
+RSS), prints that ticks behind were not judged, and reports the repeats; the witness-judged
+controls are `cfg(linux)`. The production target (mda001) and the ubuntu CI runner are Linux,
+where the absolute zero-unexplained-repeats assertion runs in every arm. A whole-process stall
+witness cannot see thread-level starvation of the program runtime: on a host oversubscribed 2x
+(60 busy loops on 56 cores) one in six runs showed one such repeat, in the door-off arm as often
+as in a door-on arm; at the build host's normal load (load average 32-76) 10/10 runs had 0
+repeats in every arm. CI runners are not oversubscribed that way; a failure there is a real
+signal to investigate, never to rerun blindly.
 
 ### Slice 4 as built (issue #290)
 
