@@ -1110,6 +1110,58 @@ the bounds and their tests); the wiring PR puts it on the front door.
 * **Not in this slice**: the office acceptance (Chrome `nextHopProtocol=h3`, the WebTransport
   browser matrix, UDP blocked falls to h1), which the lead runs; the reachability prober (slice 9).
 
+#### Slice 2 fix: WebTransport sessions ended at the header deadline (issue #382)
+
+Measured on the test server with PRs 358 + 371: the site over h3 worked, but every `MoQ` viewer
+fell back to WebRTC. Reproduced locally with headless Chrome 149 and 157 (Chrome for Testing)
+against the production stack (`Runtime::external` + `MoqWt` on an `H3Endpoint`, and in the page
+the app's own `startMoqPlaybackWithRefresh`): Chrome's CONNECT carries
+`wt-available-protocols` as an sf-list of sf-strings (all 13 `@moq/net` protocols), the server
+answers `200` with `wt-protocol: "moqt-16"`, `wt.protocol` is `moqt-16` and VP8 frames paint,
+then at 10.07 s the session ends ("MoQ session ended" => `session-failed` => WebRTC).
+
+* **Cause.** The adapter's per-request header deadline (`H3Limits::header_deadline`, 10 s) was
+  meant to stop applying once the HEADERS frame is complete, but only its `Sleep` was cleared;
+  the next pending read re-created it from the fixed, by then past, instant. Every request stream
+  still open 10 s after accept was reset with `H3_REQUEST_REJECTED`: a WebTransport CONNECT
+  stream (which lives as long as its session), and a request body slower than 10 s. Fixed:
+  `RecvGuard::deadline_at` is an `Option` cleared together with the `Sleep`.
+* **The subprotocol rows of the office matrix** ("Opening handshake failed" with `protocols`)
+  were the single-use ticket: the matrix reused one lease URL, the first row claimed the ticket
+  and every later CONNECT got `401`, which Chrome reports exactly so. Reproduced with Chrome 157.
+  The response format was already the draft's (`wt-protocol` as an sf-string echoing one offered
+  value; quiche ignores any other value instead of failing).
+* **Negotiation, now explicit** (draft-ietf-webtrans-http3 section 3.3: the server MAY reject a
+  request without a suitable protocol). The client's most preferred offered protocol the handler
+  supports is selected. An offer with none of them is refused `400`, and a CONNECT without any
+  offer is refused `400` when the handler `requires_protocol()` (`MoqWt` does: the external
+  runtime speaks one `moqt-*` version, negotiated only through `wt-protocol`; a `200` without it
+  was closed by the handler at once, which raced the browser's `ready`). Both are decided **before
+  `admit`**, so a refused CONNECT never claims the single-use ticket.
+* **Every refused CONNECT is logged** (`WebTransport CONNECT refused`, `info`) with peer, path
+  (no query: the ticket is never logged), status, reason, the offer and the supported list, at
+  most 20 lines per second endpoint-wide (the next logged line reports how many were suppressed);
+  every refusal is counted (`Counters::wt_refused`, `wt_refusal_logs_suppressed`). A `200` that
+  could not be sent is logged too.
+* **Invariants.** Sessions now live for as long as the viewer does, not at most 10 s. The R3 chaos
+  test `crates/multiview-cli/tests/h3_chaos.rs` holds 8 sessions, each receiving one
+  server-opened stream per 100 ms, across the idle and hammer runs (15 s, past the deadline): every
+  tick, exact PTS, 0 unexplained repeats, the sessions alive and receiving at the end, no
+  header-deadline reset. With the old guard the same test fails (the sessions stop at ~100
+  streams, 10 s). No new queue; the per-session bounds of the table above are unchanged.
+* **Tests.** `crates/multiview-h3/tests/stream_deadlines.rs` (a session and a slow request body
+  outlive the header deadline; red before the fix), the unit test
+  `a_cleared_deadline_never_fires_again`, `tests/pooling.rs`
+  (`offer_without_a_common_protocol_is_400_before_admit`), `multiview-control` `tests/h3_site.rs`
+  (no offer / no common offer `400` and the ticket still plays). Real browser, CI job
+  `h3-browser-webtransport`: `multiview-h3` `tests/chrome_webtransport.rs` (feature
+  `browser-integration`: `new WebTransport(url, { protocols })` reaches `ready` with the expected
+  `wt.protocol`, the server sees Chrome's exact offer) and `multiview-control`
+  `tests/h3_chrome_moq.rs` (feature `moq-browser-integration`: the app's playback for 15 s,
+  >= 225 painted frames, one lease, `wt.protocol = moqt-16`; then raw sessions on fresh leases).
+  Both drive `web/scripts/wt-chrome-probe.mjs` (Playwright's chromium, or
+  `CONSPECT_WEB_BROWSER`).
+
 ### Slice 3 as built, part A: flood hardening in `multiview-frontdoor` (issues #289, #321, #325)
 
 **Validated-flow steering (Linux).** `FrontDoorConfig::steering` (default `true`).

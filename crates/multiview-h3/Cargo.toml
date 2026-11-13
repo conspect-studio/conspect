@@ -18,6 +18,12 @@ fuzzing = []
 # crates' integration and chaos tests use (dev-dependency only). Off in every
 # shipped build.
 test-client = []
+# Runs `tests/chrome_webtransport.rs`: a real headless Chrome (Playwright's
+# chromium, or `CONSPECT_WEB_BROWSER`) opens WebTransport sessions against the
+# endpoint through `web/scripts/wt-chrome-probe.mjs` (#382). Needs node, the
+# web/ dependencies and a Chrome binary, so it is opt-in (CI job
+# `h3-browser-webtransport`).
+browser-integration = []
 
 [dependencies]
 # hyperium h3 (MIT). The opt-in feature exposes the transport-implementer API
@@ -42,7 +48,7 @@ tokio = { workspace = true, features = ["rt", "sync", "time", "macros"] }
 tracing = { workspace = true }
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["rt-multi-thread", "net", "sync", "time", "macros"] }
+tokio = { workspace = true, features = ["rt-multi-thread", "net", "sync", "time", "macros", "process"] }
 rcgen = "0.14"
 rustls = { version = "0.23", default-features = false, features = ["std", "ring"] }
 # Compile-level proof that a `WtSession` plugs into moq-net through the
@@ -50,6 +56,10 @@ rustls = { version = "0.23", default-features = false, features = ["std", "ring"
 moq-tokio = { version = "=0.19.34", default-features = false, features = ["noq", "ring"] }
 url = "2"
 http-body-util = "0.1"
+# Short-lived certificates for the browser test (Chrome pins a
+# `serverCertificateHashes` certificate only when it is valid for <= 14 days).
+time = "0.3"
+serde_json = { workspace = true }
 
 [lints]
 workspace = true

@@ -74,7 +74,26 @@ pub async fn start(
     limits: H3Limits,
     peers: Option<PeersHook>,
 ) -> Server {
-    let cert = cert();
+    start_full(cert(), site, wt, limits, peers).await
+}
+
+/// Like [`start`], with the given certificate.
+pub async fn start_with_cert(
+    cert: Cert,
+    site: Arc<dyn Site>,
+    wt: Option<Arc<dyn WtHandler>>,
+    limits: H3Limits,
+) -> Server {
+    start_full(cert, site, wt, limits, None).await
+}
+
+async fn start_full(
+    cert: Cert,
+    site: Arc<dyn Site>,
+    wt: Option<Arc<dyn WtHandler>>,
+    limits: H3Limits,
+    peers: Option<PeersHook>,
+) -> Server {
     let socket = std::net::UdpSocket::bind("[::1]:0").unwrap();
     let socket = noq::Runtime::wrap_udp_socket(&noq::TokioRuntime, socket).unwrap();
     let endpoint = H3Endpoint::start(EndpointParts {
