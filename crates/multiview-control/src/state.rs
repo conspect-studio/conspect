@@ -739,6 +739,12 @@ pub struct AppState {
     /// The running engine's cast outputs (ADR-0111); `None` until the binary
     /// installs the engine seam (no cast output can be used).
     pub cast_engine: Option<crate::cast_engine::SharedCastEngine>,
+    /// The cast stream tokens (ADR-0111, design §3): bounded, shared by
+    /// every router clone of this state.
+    pub cast_streams: Arc<crate::cast_streams::CastStreams>,
+    /// The custom Cast receiver app id (8 upper-case hex characters), when
+    /// one is registered (`MULTIVIEW_CAST_APP_ID` or `[control] cast_app_id`).
+    pub cast_app_id: Option<String>,
     /// Program tick lateness / repeats (ADR-0108 §10); `None` = 404.
     pub program_metrics: Option<Arc<crate::program_metrics::ProgramMetrics>>,
     /// The network front door's live counters (ADR-0107 slice 3); `None` =
@@ -1081,6 +1087,8 @@ impl AppState {
             switcher: None,
             output_routing: None,
             cast_engine: None,
+            cast_streams: Arc::new(crate::cast_streams::CastStreams::new()),
+            cast_app_id: None,
             program_metrics: None,
             frontdoor_metrics: None,
             switcher_preview_lease: Arc::new(crate::source_demand::SwitcherPreviewLeases::default()),
@@ -1471,6 +1479,20 @@ impl AppState {
         self.output_routing = Some(Arc::new(crate::output_routing::OutputRoutingControl::new(
             routing,
         )));
+        self
+    }
+
+    /// Replace the cast stream registry (tests inject a clock).
+    #[must_use]
+    pub fn with_cast_streams(mut self, streams: Arc<crate::cast_streams::CastStreams>) -> Self {
+        self.cast_streams = streams;
+        self
+    }
+
+    /// Set the registered custom Cast receiver app id (already validated).
+    #[must_use]
+    pub fn with_cast_app_id(mut self, app_id: Option<String>) -> Self {
+        self.cast_app_id = app_id;
         self
     }
 

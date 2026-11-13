@@ -49,6 +49,7 @@ pub mod auth;
 pub mod automation;
 pub mod boot_model;
 pub mod cast_engine;
+pub mod cast_streams;
 pub mod catalogue;
 #[cfg(all(feature = "tls", unix))]
 pub mod certificate_source;
