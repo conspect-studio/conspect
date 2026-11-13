@@ -2965,9 +2965,11 @@ pub enum Output {
     /// active**.
     ///
     /// Fixed at start like every output and routable like an HLS output
-    /// (`[[routing.output]]` rows are accepted). It **never encodes**: it
-    /// consumes the run's H.264 rendition (invariant #7), so next to an H.264
-    /// output on Program it costs no encoder. It has no public playback URL
+    /// (`[[routing.output]]` rows are accepted). It consumes an H.264
+    /// rendition like every packet output (invariant #7): with no `format`
+    /// (or one equal to the canvas) and the codec and bit rate of another
+    /// H.264 output it shares that output's encode; with its own `format` it
+    /// has its own video key. It has no public playback URL
     /// and is never an `/hls` mount: the control plane serves its files
     /// through a per-stream token.
     Cast {
@@ -2999,6 +3001,17 @@ pub enum Output {
         /// `Dropped` by [`Output::metadata_plan`].
         #[serde(default, skip_serializing_if = "Option::is_none")]
         metadata: Option<OutputMetadata>,
+        /// The picture format this output carries (ADR-0110 / §12.3, slice B).
+        /// Absent ⇒ the Program canvas. The effective picture must be at most
+        /// 1920x1080: on a larger canvas declare a format here (one more
+        /// encoder; without a format the output shares the Program encode).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        format: Option<OutputFormat>,
+        /// The output's media slots (ADR-0110 / §12.3): at most one H.264
+        /// video slot and one (program) audio slot. Absent ⇒ one video slot
+        /// with the output's codec and one program audio slot.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        slots: Option<OutputSlots>,
     },
 }
 
@@ -3012,13 +3025,13 @@ fn is_default_cast_codec(codec: &str) -> bool {
     codec == "h264"
 }
 
-/// The largest canvas an [`Output::Cast`] accepts until per-output formats
-/// exist: width in pixels.
+/// The widest picture an [`Output::Cast`] carries (its `format`, else the
+/// canvas), in pixels.
 pub const CAST_MAX_WIDTH: u32 = 1920;
-/// The largest canvas height an [`Output::Cast`] accepts.
+/// The tallest picture an [`Output::Cast`] carries, in pixels.
 pub const CAST_MAX_HEIGHT: u32 = 1080;
-/// The highest canvas frame rate an [`Output::Cast`] accepts (frames per
-/// second).
+/// The highest frame rate an [`Output::Cast`] carries (frames per second).
+/// Per-output rates do not exist yet (#343), so this bounds the canvas rate.
 pub const CAST_MAX_FPS: u32 = 30;
 
 /// A display mode requested for an [`Output::Display`] head: exact pixel

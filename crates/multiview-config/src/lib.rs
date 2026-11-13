@@ -1536,37 +1536,48 @@ impl MultiviewConfig {
                 rendition::MAX_VIDEO_RENDITIONS_PER_PROGRAM
             )));
         }
-        self.validate_cast_canvas()
+        self.validate_cast_pictures()
     }
 
-    /// A cast output consumes the program rendition as it is, so the canvas
-    /// itself must fit what a Cast receiver decodes: at most 1920x1080 at
-    /// 30 fps (compared exactly on the rational frame rate).
-    fn validate_cast_canvas(&self) -> Result<(), ConfigError> {
-        let Some(id) = self.outputs.iter().find_map(|output| match output {
-            Output::Cast { id, .. } => Some(id),
-            _ => None,
-        }) else {
-            return Ok(());
-        };
+    /// The picture a cast output carries must be one a Cast receiver
+    /// decodes: at most 1920x1080 at 30 fps. The picture is the output's
+    /// `format` when declared, else the canvas; the rate is the canvas rate
+    /// (compared exactly on the rational; per-output rates are #343).
+    fn validate_cast_pictures(&self) -> Result<(), ConfigError> {
         let canvas = &self.canvas;
         let fps = canvas.fps.rational();
         let too_fast = fps.den <= 0
             || i128::from(fps.num) > i128::from(schema::CAST_MAX_FPS) * i128::from(fps.den);
-        if canvas.width > schema::CAST_MAX_WIDTH
-            || canvas.height > schema::CAST_MAX_HEIGHT
-            || too_fast
-        {
-            return Err(ConfigError::Validation(format!(
-                "cast output {id:?}: the canvas is {}x{} at {} fps; a cast output needs a canvas \
-                 of at most {}x{} at {} fps until per-output formats exist",
-                canvas.width,
-                canvas.height,
-                canvas.fps,
-                schema::CAST_MAX_WIDTH,
-                schema::CAST_MAX_HEIGHT,
-                schema::CAST_MAX_FPS,
-            )));
+        for output in &self.outputs {
+            let Output::Cast { id, format, .. } = output else {
+                continue;
+            };
+            let (width, height) = format
+                .as_ref()
+                .map_or((canvas.width, canvas.height), |f| (f.width, f.height));
+            if width > schema::CAST_MAX_WIDTH || height > schema::CAST_MAX_HEIGHT {
+                return Err(ConfigError::Validation(format!(
+                    "cast output {id:?}: the picture is {width}x{height}; a Cast receiver decodes \
+                     at most {}x{} at {} fps. Add [outputs.format] width = {} height = {} to this \
+                     output.",
+                    schema::CAST_MAX_WIDTH,
+                    schema::CAST_MAX_HEIGHT,
+                    schema::CAST_MAX_FPS,
+                    schema::CAST_MAX_WIDTH,
+                    schema::CAST_MAX_HEIGHT,
+                )));
+            }
+            if too_fast {
+                return Err(ConfigError::Validation(format!(
+                    "cast output {id:?}: the canvas runs at {} fps; a Cast receiver decodes at \
+                     most {}x{} at {} fps, so a cast output cannot be used on this canvas until \
+                     per-output frame rates exist (#343)",
+                    canvas.fps,
+                    schema::CAST_MAX_WIDTH,
+                    schema::CAST_MAX_HEIGHT,
+                    schema::CAST_MAX_FPS,
+                )));
+            }
         }
         Ok(())
     }
@@ -2403,10 +2414,9 @@ impl Output {
 
     /// The cast-kind-specific per-item rules (ADR-0111): the id is 1 to 64
     /// characters of `[A-Za-z0-9_-]` (it names a directory and an API
-    /// resource), the codec is an H.264 token (the output consumes the run's
-    /// H.264 rendition, it never encodes), and an authored `dir` is not
-    /// empty. The canvas limit is a document-level rule
-    /// ([`MultiviewConfig::validate`]).
+    /// resource), the codec (and a declared video slot's codec) is H.264,
+    /// and an authored `dir` is not empty. The picture limit is a
+    /// document-level rule ([`MultiviewConfig::validate`]).
     fn validate_cast_rules(&self) -> Result<(), ConfigError> {
         let Output::Cast { id, codec, dir, .. } = self else {
             return Ok(());
@@ -2420,12 +2430,23 @@ impl Output {
                 "cast output id {id:?} must be 1 to 64 characters of letters, digits, '_' or '-'"
             )));
         }
+        let not_h264 = |codec: &str| {
+            ConfigError::Validation(format!(
+                "cast output {id:?}: codec {codec:?} is not supported: a cast output needs \"h264\""
+            ))
+        };
         if rendition::RenditionVideoCodec::parse(codec)
             != Some(rendition::RenditionVideoCodec::H264)
         {
-            return Err(ConfigError::Validation(format!(
-                "cast output {id:?}: codec {codec:?} is not supported: a cast output needs \"h264\""
-            )));
+            return Err(not_h264(codec));
+        }
+        // A declared video slot names the encoded codec (it wins over
+        // `codec`), so it must be H.264 too (encoder names included).
+        if let Some(slot_codec) = self.video_slot0().and_then(|slot| slot.codec.as_deref()) {
+            if output_format::CodecFamily::of(slot_codec) != Some(output_format::CodecFamily::H264)
+            {
+                return Err(not_h264(slot_codec));
+            }
         }
         if matches!(dir.as_deref(), Some("")) {
             return Err(ConfigError::Validation(format!(

@@ -71,10 +71,13 @@ fn minimal_cast_output_defaults_to_h264_and_no_dir() {
         gpu_pin,
         audio,
         metadata,
+        format,
+        slots,
     } = &out
     else {
         panic!("expected Cast, got {out:?}");
     };
+    assert!(format.is_none() && slots.is_none());
     assert_eq!(id, "cast-1");
     assert_eq!(codec, "h264");
     assert!(dir.is_none() && gpu_pin.is_none() && audio.is_none() && metadata.is_none());
@@ -159,10 +162,10 @@ fn an_authored_dir_may_not_be_empty() {
     load_hd(&format!("{CAST}dir = \"/var/lib/cast/one\"\n")).unwrap();
 }
 
+const FORMAT_HD: &str = "[outputs.format]\nwidth = 1920\nheight = 1080\n";
+
 #[test]
-fn the_canvas_limit_is_1920x1080_at_30_fps_and_the_error_names_it() {
-    const LIMIT: &str =
-        "a cast output needs a canvas of at most 1920x1080 at 30 fps until per-output formats exist";
+fn the_picture_limit_is_1920x1080_and_the_error_names_the_fix() {
     for (w, h, fps) in [
         (1920, 1080, "30/1"),
         (1920, 1080, "30000/1001"),
@@ -171,20 +174,85 @@ fn the_canvas_limit_is_1920x1080_at_30_fps_and_the_error_names_it() {
     ] {
         load(&format!("{}{CAST}", base(w, h, fps))).unwrap();
     }
-    for (w, h, fps) in [
-        (3840, 2160, "30/1"),
-        (1920, 1088, "30/1"),
-        (1922, 1080, "30/1"),
-        (1920, 1080, "60000/1001"),
-        (1920, 1080, "50/1"),
-        (1280, 720, "30001/1000"),
-    ] {
-        let err = load(&format!("{}{CAST}", base(w, h, fps))).unwrap_err();
-        assert!(err.contains(LIMIT), "{w}x{h}@{fps}: {err}");
-        assert!(err.contains("cast-1"), "{err}");
-        // The same canvas without a cast output stays valid.
-        load(&base(w, h, fps)).unwrap();
+    for (w, h) in [(3840, 2160), (1920, 1088), (1922, 1080)] {
+        let err = load(&format!("{}{CAST}", base(w, h, "30/1"))).unwrap_err();
+        assert!(
+            err.contains(&format!(
+                "cast output \"cast-1\": the picture is {w}x{h}; a Cast receiver decodes at most \
+                 1920x1080 at 30 fps. Add [outputs.format] width = 1920 height = 1080 to this output."
+            )),
+            "{w}x{h}: {err}"
+        );
+        // The same canvas without a cast output stays valid, and the fix the
+        // error names makes the document valid.
+        load(&base(w, h, "30/1")).unwrap();
+        load(&format!("{}{CAST}{FORMAT_HD}", base(w, h, "30/1"))).unwrap();
     }
+    // A declared format is the picture that is checked, on any canvas.
+    let big = "[outputs.format]\nwidth = 2560\nheight = 1440\n";
+    let err = load(&format!("{}{CAST}{big}", base(3840, 2160, "30/1"))).unwrap_err();
+    assert!(err.contains("the picture is 2560x1440"), "{err}");
+    let err = load(&format!("{}{CAST}{big}", base(1280, 720, "30/1"))).unwrap_err();
+    assert!(err.contains("the picture is 2560x1440"), "{err}");
+    load(&format!(
+        "{}{CAST}[outputs.format]\nwidth = 1280\nheight = 720\n",
+        base(3840, 2160, "30/1")
+    ))
+    .unwrap();
+}
+
+#[test]
+fn a_canvas_above_30_fps_refuses_a_cast_output_until_per_output_rates() {
+    for fps in ["50/1", "60000/1001", "30001/1000"] {
+        for extra in ["", FORMAT_HD] {
+            let err = load(&format!("{}{CAST}{extra}", base(1920, 1080, fps))).unwrap_err();
+            assert!(
+                err.contains("a cast output cannot be used on this canvas until per-output frame rates exist (#343)")
+                    && err.contains("cast-1")
+                    && err.contains(fps),
+                "{fps}: {err}"
+            );
+        }
+        load(&base(1920, 1080, fps)).unwrap();
+    }
+}
+
+#[test]
+fn slots_are_one_h264_video_and_one_program_audio() {
+    let video = |codec: &str| format!("{CAST}[[outputs.slots.video]]\ncodec = \"{codec}\"\n");
+    for good in ["h264", "avc", "libx264", "h264_nvenc"] {
+        load_hd(&video(good)).unwrap();
+    }
+    for bad in ["hevc", "mpeg2video"] {
+        let err = load_hd(&video(bad)).unwrap_err();
+        assert!(
+            err.contains(&format!(
+                "cast output \"cast-1\": codec {bad:?} is not supported: a cast output needs \"h264\""
+            )),
+            "{bad}: {err}"
+        );
+    }
+    load_hd(&format!(
+        "{CAST}[[outputs.slots.video]]\nbitrate_kbps = 6000\n"
+    ))
+    .unwrap();
+    let err = load_hd(&format!(
+        "{CAST}[[outputs.slots.video]]\n[[outputs.slots.video]]\n"
+    ))
+    .unwrap_err();
+    assert!(
+        err.contains("declares 2 video slot(s); this medium carries 1"),
+        "{err}"
+    );
+    load_hd(&format!("{CAST}[[outputs.slots.audio]]\n")).unwrap();
+    let err = load_hd(&format!(
+        "{CAST}[[outputs.slots.audio]]\n[[outputs.slots.audio]]\ntrack = \"eng\"\n{TRACKS}"
+    ))
+    .unwrap_err();
+    assert!(
+        err.contains("declares 2 audio slot(s); this medium carries 1"),
+        "{err}"
+    );
 }
 
 const TRACKS: &str = r#"
@@ -325,23 +393,27 @@ fn a_cast_output_accepts_every_feed_kind_an_hls_output_accepts() {
 }
 
 #[test]
-fn a_cast_output_shares_the_h264_video_key_of_an_hls_output() {
-    // One distinct base video key for the HLS output and the cast output:
-    // the cast output adds no encoder on Program.
-    let cfg = load_hd(CAST).unwrap();
-    assert_eq!(
-        multiview_config::rendition::distinct_base_video_keys(&cfg),
-        1
-    );
-    let alone = load_hd("").unwrap();
-    assert_eq!(
-        multiview_config::rendition::distinct_base_video_keys(&alone),
-        1
-    );
-    // It declares no format and no slots of its own.
+fn the_video_key_is_shared_only_without_an_own_format_codec_or_bit_rate() {
+    use multiview_config::rendition::distinct_base_video_keys as keys;
+    // BASE has one H.264 HLS output: one key.
+    assert_eq!(keys(&load_hd("").unwrap()), 1);
+    // No format: the cast output shares the HLS output's key (+0 encoders).
+    assert_eq!(keys(&load_hd(CAST).unwrap()), 1);
+    // A format equal to the canvas is the canvas key: still shared.
+    assert_eq!(keys(&load_hd(&format!("{CAST}{FORMAT_HD}")).unwrap()), 1);
+    // Its own format: its own key (one more encoder).
+    let own = format!("{CAST}[outputs.format]\nwidth = 1280\nheight = 720\n");
+    assert_eq!(keys(&load_hd(&own).unwrap()), 2);
+    // Its own bit rate: its own key too.
+    let rate = format!("{CAST}[[outputs.slots.video]]\nbitrate_kbps = 6000\n");
+    assert_eq!(keys(&load_hd(&rate).unwrap()), 2);
+    // A UHD canvas: the HLS output at the canvas, the cast output at HD.
+    let uhd = format!("{}{CAST}{FORMAT_HD}", base(3840, 2160, "30/1"));
+    assert_eq!(keys(&load(&uhd).unwrap()), 2);
+    // The slot capability of the medium.
     let out: Output = toml::from_str("kind = \"cast\"\nid = \"c\"\n").unwrap();
     assert!(out.format().is_none() && out.slots().is_none());
     let cap = out.slot_capability();
     assert_eq!((cap.video_max, cap.audio_max), (1, Some(1)));
-    assert!(!cap.format_convertible && !cap.raw_video);
+    assert!(cap.format_convertible && !cap.raw_video);
 }

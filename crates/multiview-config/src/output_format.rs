@@ -339,16 +339,13 @@ impl Output {
             | Output::Webrtc { format, .. }
             | Output::WhipPush { format, .. }
             | Output::Aes67 { format, .. }
-            | Output::Display { format, .. } => format.as_ref(),
-            // A cast output declares no format: it carries the Program
-            // canvas (validated at most 1920x1080 at 30 fps).
-            Output::Cast { .. } => None,
+            | Output::Display { format, .. }
+            | Output::Cast { format, .. } => format.as_ref(),
         }
     }
 
-    /// Mutable access to the declared picture format. `None` for a kind that
-    /// has no `format` field (a cast output).
-    pub fn format_mut(&mut self) -> Option<&mut Option<OutputFormat>> {
+    /// Mutable access to the declared picture format.
+    pub fn format_mut(&mut self) -> &mut Option<OutputFormat> {
         match self {
             Output::RtspServer { format, .. }
             | Output::LlHls { format, .. }
@@ -360,8 +357,8 @@ impl Output {
             | Output::Webrtc { format, .. }
             | Output::WhipPush { format, .. }
             | Output::Aes67 { format, .. }
-            | Output::Display { format, .. } => Some(format),
-            Output::Cast { .. } => None,
+            | Output::Display { format, .. }
+            | Output::Cast { format, .. } => format,
         }
     }
 
@@ -379,16 +376,13 @@ impl Output {
             | Output::Webrtc { slots, .. }
             | Output::WhipPush { slots, .. }
             | Output::Aes67 { slots, .. }
-            | Output::Display { slots, .. } => slots.as_ref(),
-            // A cast output declares no slots: one H.264 video rendition and
-            // the program audio.
-            Output::Cast { .. } => None,
+            | Output::Display { slots, .. }
+            | Output::Cast { slots, .. } => slots.as_ref(),
         }
     }
 
-    /// Mutable access to the declared slots. `None` for a kind that has no
-    /// `slots` field (a cast output).
-    pub fn slots_mut(&mut self) -> Option<&mut Option<OutputSlots>> {
+    /// Mutable access to the declared slots.
+    pub fn slots_mut(&mut self) -> &mut Option<OutputSlots> {
         match self {
             Output::RtspServer { slots, .. }
             | Output::LlHls { slots, .. }
@@ -400,8 +394,8 @@ impl Output {
             | Output::Webrtc { slots, .. }
             | Output::WhipPush { slots, .. }
             | Output::Aes67 { slots, .. }
-            | Output::Display { slots, .. } => Some(slots),
-            Output::Cast { .. } => None,
+            | Output::Display { slots, .. }
+            | Output::Cast { slots, .. } => slots,
         }
     }
 
@@ -445,17 +439,23 @@ impl Output {
                 raw_video: false,
                 format_convertible: false,
             },
-            // A cast output has no `slots`/`format` fields; this is what its
-            // medium carries (one H.264 rendition, one audio rendition).
-            Output::Webrtc { .. } | Output::WhipPush { .. } | Output::Cast { .. } => {
-                SlotCapability {
-                    video_max: 1,
-                    audio_max: Some(1),
-                    video_codecs: H264_ONLY,
-                    raw_video: false,
-                    format_convertible: false,
-                }
-            }
+            Output::Webrtc { .. } | Output::WhipPush { .. } => SlotCapability {
+                video_max: 1,
+                audio_max: Some(1),
+                video_codecs: H264_ONLY,
+                raw_video: false,
+                format_convertible: false,
+            },
+            // A cast stream is one H.264 video rendition and one audio
+            // rendition (CMAF). It is a packet sink like HLS, so the Program
+            // is converted to its format.
+            Output::Cast { .. } => SlotCapability {
+                video_max: 1,
+                audio_max: Some(1),
+                video_codecs: H264_ONLY,
+                raw_video: false,
+                format_convertible: true,
+            },
             Output::Ndi { .. } | Output::Display { .. } => SlotCapability {
                 video_max: 1,
                 audio_max: Some(1),
