@@ -9,6 +9,10 @@ pub struct Counters {
     pub connections_accepted: AtomicU64,
     /// Incoming connections refused by the global or per-source cap.
     pub connections_refused: AtomicU64,
+    /// Incoming connections refused by [`crate::endpoint::SourceFilter`]
+    /// before any cap check (a forwarder hop whose source must fail
+    /// closed, design note §8).
+    pub sources_refused: AtomicU64,
     /// Incoming connections refused because `max_handshakes` (or the
     /// per-source handshake cap) were in progress.
     pub handshakes_refused: AtomicU64,

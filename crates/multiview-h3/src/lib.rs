@@ -63,6 +63,8 @@
 //! front door's own runtime.
 
 pub mod capsule;
+#[cfg(feature = "test-client")]
+pub mod client;
 pub mod config;
 pub mod counters;
 pub mod endpoint;
@@ -82,7 +84,9 @@ use bytes::Bytes;
 
 pub use config::{H3Limits, H3Settings, QuicLimits};
 pub use counters::Counters;
-pub use endpoint::{server_config, server_tls, EndpointParts, H3Endpoint, PeersHook, ALPN_H3};
+pub use endpoint::{
+    server_config, server_tls, EndpointParts, H3Endpoint, PeersHook, SourceFilter, ALPN_H3,
+};
 pub use server::{serve_connection, RequestBody};
 pub use webtransport::{WtError, WtRecvStream, WtSendStream, WtSession};
 
