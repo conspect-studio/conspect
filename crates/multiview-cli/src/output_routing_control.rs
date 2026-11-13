@@ -193,7 +193,10 @@ impl OutputRouting for OutputRoutingAdapter {
             .try_take(OutputTake {
                 operation_id: take.operation_id,
                 output_index: index,
-                bus: picture_bus(&take.feed),
+                bus: Some(picture_bus(&take.feed)),
+                // Explicit audio over HTTP is the API PR (ADR-0108 slice 2
+                // part 3): today's take keeps the output's audio choice.
+                audio: None,
                 principal: take.principal,
             })
             .map_err(|_| TakeSubmitError::Busy)

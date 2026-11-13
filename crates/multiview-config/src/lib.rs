@@ -82,9 +82,9 @@ pub use admission::{
 pub use api::{ApiConfig, ApiKeyConfig, ApiKeyRole};
 use audio::PROGRAM_TRACK as PROGRAM_TRACK_NAME;
 pub use audio::{
-    diff_track_changes, propagate_routing_change, AudioChannels, AudioRoute, AudioRouting,
-    OutputAudio, OutputAudioCapability, OutputAudioMode, OutputAudioUpdate, TrackCapacity,
-    TrackDelivery, PROGRAM_TRACK,
+    diff_track_changes, propagate_routing_change, propagate_routing_feed_change, AudioChannels,
+    AudioRoute, AudioRouting, OutputAudio, OutputAudioCapability, OutputAudioMode,
+    OutputAudioUpdate, OutputFeedAudioUpdate, TrackCapacity, TrackDelivery, PROGRAM_TRACK,
 };
 pub use catalogues::{CataloguesConfig, IptvOrgConfig};
 pub use device::{Device, DeviceAuth, DeviceDisplay, DeviceDriver, DisplayAssign, ReconnectPolicy};
@@ -1709,8 +1709,9 @@ impl MultiviewConfig {
 
     /// Validate one output crosspoint's feed (ADR-0108 §6.1): the `bus` alias
     /// agrees with `video`; a switcher bus needs a declared M/E; a source feed
-    /// names a declared source; layout feeds and explicit audio feeds are not
-    /// routable yet and are refused rather than silently ignored.
+    /// names a declared source; layout feeds are not routable yet and are
+    /// refused rather than silently ignored; an explicit audio feed is
+    /// checked by [`Self::validate_output_audio_feed`].
     fn validate_output_feed(&self, xp: &OutputCrosspoint) -> Result<(), ConfigError> {
         if let Some(video) = &xp.video {
             if xp.bus != OutputBus::Program && *video != VideoFeed::Bus(xp.bus) {
@@ -1750,13 +1751,83 @@ impl MultiviewConfig {
                 )));
             }
         }
+        self.validate_output_audio_feed(xp)
+    }
+
+    /// Validate an output's explicit audio feed (ADR-0108 §5.1, §5.5):
+    /// `follow`, `program` and `none` always; `{ source }` names a declared
+    /// source; `{ tracks }` is non-empty, has no duplicates, names only
+    /// declared discrete tracks (`[audio].routes[].target_track`), and holds
+    /// more than one track only where the output carries discrete tracks
+    /// simultaneously (HLS/LL-HLS select one, NDI/AES67/display carry none,
+    /// legacy RTMP and WebRTC carry one).
+    fn validate_output_audio_feed(&self, xp: &OutputCrosspoint) -> Result<(), ConfigError> {
         match &xp.audio {
-            AudioFeed::Follow => Ok(()),
-            other => Err(ConfigError::Validation(format!(
-                "output {:?}: an explicit audio feed ({other:?}) is not supported yet; \
-                 use `follow` (the audio of the video feed)",
-                xp.output
-            ))),
+            AudioFeed::Follow | AudioFeed::Program | AudioFeed::None => Ok(()),
+            AudioFeed::Source(id) => {
+                if self.sources.iter().any(|s| s.id == *id) {
+                    Ok(())
+                } else {
+                    Err(ConfigError::Validation(format!(
+                        "output {:?}: audio feed names unknown source {id:?}",
+                        xp.output
+                    )))
+                }
+            }
+            AudioFeed::Tracks(tracks) => {
+                if tracks.is_empty() {
+                    return Err(ConfigError::Validation(format!(
+                        "output {:?}: an audio `tracks` feed needs at least one track",
+                        xp.output
+                    )));
+                }
+                let declared: Vec<&str> = self
+                    .audio
+                    .as_ref()
+                    .map(|a| {
+                        a.routes
+                            .iter()
+                            .filter_map(|r| r.target_track.as_deref())
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                for (i, track) in tracks.iter().enumerate() {
+                    if !declared.contains(&track.as_str()) {
+                        return Err(ConfigError::Validation(format!(
+                            "output {:?}: audio feed names undeclared track {track:?} \
+                             (declare it as an [audio].routes target_track)",
+                            xp.output
+                        )));
+                    }
+                    if tracks.iter().take(i).any(|t| t == track) {
+                        return Err(ConfigError::Validation(format!(
+                            "output {:?}: audio feed names track {track:?} twice",
+                            xp.output
+                        )));
+                    }
+                }
+                if tracks.len() > 1 {
+                    let capability = self
+                        .outputs
+                        .iter()
+                        .find(|o| o.id() == xp.output)
+                        .map(Output::audio_capability);
+                    let simultaneous = capability.is_some_and(|c| {
+                        c.delivery == TrackDelivery::Simultaneous
+                            && c.discrete_capacity
+                                .accepts(u32::try_from(tracks.len()).unwrap_or(u32::MAX))
+                    });
+                    if !simultaneous {
+                        return Err(ConfigError::Validation(format!(
+                            "output {:?}: this transport cannot carry {} audio tracks at once; \
+                             route one track",
+                            xp.output,
+                            tracks.len()
+                        )));
+                    }
+                }
+                Ok(())
+            }
         }
     }
 

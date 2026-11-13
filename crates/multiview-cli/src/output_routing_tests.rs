@@ -223,7 +223,8 @@ fn take(op: &str, output: usize, bus: PictureBus) -> OutputTake {
     OutputTake {
         operation_id: op.to_owned(),
         output_index: output,
-        bus,
+        bus: Some(bus),
+        audio: None,
         principal: "p".to_owned(),
     }
 }
@@ -311,9 +312,11 @@ fn unroutable_and_unfresh_takes_are_refused_and_the_mailbox_bounds_floods() {
 }
 
 /// Records each delivered window: (output, [(pts, keyframe-with-params)]).
+/// Audio packets are recorded apart, per output (routed-audio tests).
 #[derive(Default)]
 struct Rec {
     windows: Vec<(usize, Vec<(i64, bool)>)>,
+    audio: Vec<(usize, EncodedPacket)>,
 }
 impl WindowDelivery for Rec {
     fn offer_window(
@@ -326,8 +329,15 @@ impl WindowDelivery for Rec {
     ) -> Result<(), multiview_output::batch::EmissionError> {
         let v = p
             .iter()
+            .filter(|p| p.kind() == multiview_ffmpeg::StreamKind::Video)
             .map(|p| (p.pts().unwrap_or(-1), p.is_keyframe() && p.len() == 77))
             .collect();
+        for a in p
+            .iter()
+            .filter(|p| p.kind() == multiview_ffmpeg::StreamKind::Audio)
+        {
+            self.audio.push((o, a.clone_shared_ref().unwrap()));
+        }
         self.windows.push((o, v));
         Ok(())
     }
@@ -1471,16 +1481,19 @@ fn the_control_adapter_maps_renamed_ids_to_their_own_index() {
             id: None,
             settings: 0,
             routable: true,
+            program_audio: true,
         },
         RunOutput {
             id: Some("renamed".into()),
             settings: 0,
             routable: true,
+            program_audio: true,
         },
         RunOutput {
             id: Some("zz-first".into()),
             settings: 0,
             routable: false,
+            program_audio: true,
         },
     ]);
     let slot = output_routing_slot();
@@ -1855,11 +1868,13 @@ fn the_plan_counts_a_lingering_encoder_as_plus_zero() {
             id: Some("a".into()),
             settings: 0,
             routable: true,
+            program_audio: true,
         },
         RunOutput {
             id: Some("b".into()),
             settings: 0,
             routable: true,
+            program_audio: true,
         },
     ]);
     let slot = output_routing_slot();
@@ -1898,6 +1913,1340 @@ fn the_plan_counts_a_lingering_encoder_as_plus_zero() {
         adapter.plan("b", &cam).unwrap().needs_encoder,
         "after the linger closed: +1"
     );
+}
+
+// ---------------------------------------------------------------------------
+// ADR-0108 slice 2: explicit per-output audio (router + real AAC encoders).
+// ---------------------------------------------------------------------------
+
+use multiview_audio::cadence::SampleClock;
+use multiview_audio::crossfade::{grid_ceil, TakeCrossfade, AAC_FRAME_SAMPLES};
+use multiview_audio::format::{AudioBlock, AudioFormat};
+use std::sync::atomic::AtomicU32;
+
+const NTSC: Rational = Rational::new(30_000, 1_001);
+
+/// The program mix: a stationary 440 Hz tone at 0.3.
+fn prog(n: u64) -> f32 {
+    let t = f32::from(u16::try_from(n % 48_000).unwrap()) / 48_000.0;
+    0.3 * (std::f32::consts::TAU * 440.0 * t).sin()
+}
+
+/// The `bars` source: a stationary 1 kHz tone at 0.5.
+fn bars(n: u64) -> f32 {
+    let t = f32::from(u16::try_from(n % 48_000).unwrap()) / 48_000.0;
+    0.5 * (std::f32::consts::TAU * 1_000.0 * t).sin()
+}
+
+fn audio_only(op: &str, output: usize, choice: AudioChoice) -> OutputTake {
+    OutputTake {
+        operation_id: op.to_owned(),
+        output_index: output,
+        bus: None,
+        audio: Some(choice),
+        principal: "p".to_owned(),
+    }
+}
+
+fn bars_src() -> AudioChoice {
+    AudioChoice::Source("bars".to_owned())
+}
+
+/// A router with program audio over a real dispatcher: a real program AAC
+/// encoder feeds the shared stage, real private buses feed theirs.
+struct AudioHarness {
+    r: OutputRouter,
+    h: OutputRoutingHandle,
+    d: RenditionDispatcher,
+    rec: Rec,
+    outcomes: Receiver<TakeOutcome>,
+    program: multiview_output::AudioRenditionEncoder,
+    tb: Rational,
+    clock: SampleClock,
+    cadence: Rational,
+    gain: Arc<AtomicU32>,
+    bars_live: bool,
+    feed_max: std::time::Duration,
+    /// The longest whole consumer step (router tick, routed-audio feed and
+    /// program-audio dispatch; the simulated encode sleep excluded).
+    step_max: std::time::Duration,
+    store: Arc<TileStore<Nv12Image>>,
+    base_force: Arc<AtomicU64>,
+    tap: crate::routing_audio::AudioTapCell,
+    others: Vec<TakeOutcome>,
+}
+
+fn audio_harness(outputs: usize, cadence: Rational, open: OpenFn) -> AudioHarness {
+    let config = multiview_output::AudioEncodeConfig::aac(48_000, 2, 128_000);
+    let program = multiview_output::AudioRenditionEncoder::new(&config).unwrap();
+    let tb = program.time_base();
+    let store = Arc::new(TileStore::<Nv12Image>::with_defaults("cam"));
+    let lookup = Arc::clone(&store);
+    let base_force = Arc::new(AtomicU64::new(NO_FORCE));
+    let (mut r, h) = OutputRouter::new(
+        RouterConfig {
+            cadence,
+            gop: 5,
+            base_keys: vec![0; outputs],
+            base_force: vec![Arc::clone(&base_force)],
+            max_encoders: 6,
+            max_per_principal: DEFAULT_MAX_PER_PRINCIPAL,
+            has_preview: false,
+        },
+        AuxWiring {
+            feeds: Arc::new(SwapCell::from_pointee(Vec::new())),
+            active: Arc::new(AtomicBool::new(false)),
+            failed: Arc::new(AtomicBool::new(false)),
+            dropped: Arc::new(AtomicU64::new(0)),
+            sent: Arc::new(AtomicU64::new(0)),
+            stores: Arc::new(move |id: &str| (id == "cam").then(|| Arc::clone(&lookup))),
+            preview_selection: None,
+        },
+        open,
+    )
+    .unwrap();
+    let gain = Arc::new(AtomicU32::new(1.0_f32.to_bits()));
+    let g = Arc::clone(&gain);
+    r.enable_audio(
+        config,
+        program.codec_params().codec_config_bytes(),
+        Arc::new(move |id: &str| {
+            if id == "bars" {
+                f32::from_bits(g.load(Ordering::Acquire))
+            } else {
+                1.0
+            }
+        }),
+    );
+    let d = RenditionDispatcher::new(DispatchConfig {
+        video_count: 1,
+        audio_count: 1,
+        video_time_base: vec![DtsTimeBase {
+            num: cadence.den,
+            den: cadence.num,
+        }],
+        audio_time_base: vec![DtsTimeBase {
+            num: tb.num,
+            den: tb.den,
+        }],
+        bindings: (0..outputs)
+            .map(|i| BindingConfig {
+                output_index: i,
+                video_key: Some(0),
+                audio_tracks: vec![0],
+                inband_parameter_changes_ok: true,
+            })
+            .collect(),
+        first_tick: 0,
+        cadence,
+        video_move_gates: vec![Some(Box::new(|p: &EncodedPacket| p.is_keyframe()))],
+    })
+    .unwrap();
+    let outcomes = h.outcomes().unwrap();
+    let tap = Arc::clone(&h.audio_tap);
+    AudioHarness {
+        r,
+        h,
+        d,
+        rec: Rec::default(),
+        outcomes,
+        program,
+        tb,
+        clock: SampleClock::new(48_000, cadence),
+        cadence,
+        gain,
+        bars_live: true,
+        feed_max: std::time::Duration::ZERO,
+        step_max: std::time::Duration::ZERO,
+        store,
+        base_force,
+        tap,
+        others: Vec::new(),
+    }
+}
+
+impl AudioHarness {
+    fn boundary_ns(&self, tick: u64) -> i128 {
+        i128::from(tick) * i128::from(self.cadence.den) * 1_000_000_000
+            / i128::from(self.cadence.num)
+    }
+
+    fn media(&self, tick: u64) -> MediaTime {
+        MediaTime::from_nanos(i64::try_from(self.boundary_ns(tick)).unwrap())
+    }
+
+    fn block(&self, tick: u64, f: fn(u64) -> f32) -> AudioBlock {
+        let (a, b) = (self.clock.total_at(tick), self.clock.total_at(tick + 1));
+        AudioBlock::from_interleaved(
+            AudioFormat::new(48_000, multiview_audio::ChannelLayout::Stereo),
+            (a..b).flat_map(|n| [f(n), f(n)]).collect(),
+        )
+        .unwrap()
+    }
+
+    /// One Program tick in the pipeline's order.
+    fn tick(&mut self, t: u64) {
+        let step = Instant::now();
+        self.r
+            .drain_live_events(&mut self.d, &mut self.rec)
+            .unwrap();
+        if let Some(prev) = t.checked_sub(1) {
+            let forced = take_force(&self.base_force, prev);
+            self.d
+                .dispatch(
+                    DispatchEvent::Video {
+                        key_index: 0,
+                        tick: prev,
+                        timebase: Rational::new(self.cadence.den, self.cadence.num),
+                        packets: vec![pkt(prev, forced || prev % 5 == 0)],
+                        watermark: Some(crate::rendition_workers::DtsWatermark {
+                            complete_before_ns: self.boundary_ns(prev + 1),
+                        }),
+                    },
+                    Instant::now(),
+                    &mut self.rec,
+                )
+                .unwrap();
+        }
+        let frame = Nv12Image::solid(16, 16, 16, 128, 128, CanvasColor::default().output_tag());
+        self.store.publish(frame.unwrap(), self.media(t));
+        if let Some(slot) = self.r.slot(&src()) {
+            slot.latest
+                .store(Some(Arc::new(crate::routing_aux::AuxFrame {
+                    tick: t,
+                    generation: 1,
+                    frame: canvas(),
+                })));
+        }
+        self.r
+            .on_tick(t, self.media(t), &mut self.d, &mut self.rec)
+            .unwrap();
+        let program = self.block(t, prog);
+        let tone = self.block(t, bars);
+        let inputs: Vec<(&str, &AudioBlock)> = if self.bars_live {
+            vec![("bars", &tone)]
+        } else {
+            Vec::new()
+        };
+        let started = Instant::now();
+        self.r.feed_audio(t, &program, &inputs, &mut self.d);
+        self.feed_max = self.feed_max.max(started.elapsed());
+        self.r.tap_program_audio(t, &program);
+        let packets = self
+            .program
+            .encode_interleaved(program.interleaved(), program.frame_count())
+            .unwrap();
+        let wm = packets.last().and_then(|p| {
+            crate::rendition_workers::next_frame_lower_bound_ns(p.pts()?, 1024, 48_000)
+        });
+        self.d
+            .dispatch(
+                DispatchEvent::Audio {
+                    tick: t,
+                    timebases: vec![self.tb],
+                    packets,
+                    watermarks: vec![wm],
+                },
+                Instant::now(),
+                &mut self.rec,
+            )
+            .unwrap();
+        self.step_max = self.step_max.max(step.elapsed());
+        // The private encode threads run within the tick period.
+        std::thread::sleep(std::time::Duration::from_millis(3));
+    }
+
+    /// Tick from `from` until the outcome of `op` arrives (other outcomes
+    /// are kept in `others`); returns it and the next tick.
+    fn until(&mut self, from: u64, op: &str, max: u64) -> (TakeOutcome, u64) {
+        for t in from..from + max {
+            self.tick(t);
+            for o in self.outcomes.try_iter().collect::<Vec<_>>() {
+                if o.operation_id == op {
+                    return (o, t + 1);
+                }
+                self.others.push(o);
+            }
+        }
+        panic!("no outcome for {op} within {max} ticks");
+    }
+
+    fn run(&mut self, from: u64, n: u64) -> u64 {
+        for t in from..from + n {
+            self.tick(t);
+        }
+        from + n
+    }
+
+    fn audio_pts(&self, o: usize) -> Vec<i64> {
+        self.rec
+            .audio
+            .iter()
+            .filter(|(i, _)| *i == o)
+            .map(|(_, p)| p.pts().unwrap())
+            .collect()
+    }
+
+    fn audio_packets(&self, o: usize) -> Vec<&EncodedPacket> {
+        self.rec
+            .audio
+            .iter()
+            .filter(|(i, _)| *i == o)
+            .map(|(_, p)| p)
+            .collect()
+    }
+
+    /// Output `o`'s private-bus PCM (left channel) by absolute sample, from
+    /// the tap; asserts the fed blocks are contiguous.
+    fn private_left(&self, o: usize) -> std::collections::BTreeMap<u64, f32> {
+        let tap = self.tap.lock().unwrap();
+        let mut out = std::collections::BTreeMap::new();
+        let mut next: Option<u64> = None;
+        for (output, start, pcm) in &tap.private {
+            if *output != o {
+                continue;
+            }
+            if let Some(n) = next {
+                // A new bus may start later (after a close), never overlap.
+                assert!(*start >= n, "private PCM overlaps at {start} (< {n})");
+            }
+            for (i, v) in pcm.chunks(2).enumerate() {
+                out.insert(start + u64::try_from(i).unwrap(), v[0]);
+            }
+            next = Some(start + u64::try_from(pcm.len() / 2).unwrap());
+        }
+        out
+    }
+}
+
+/// Every audio packet one AAC frame after the previous one (1024 samples =
+/// 1920 units of the 90 kHz MPEG-TS clock), none missing or duplicated.
+fn assert_pts_step(pts: &[i64], what: &str) {
+    assert!(pts.len() > 4, "{what}: too few audio packets");
+    for pair in pts.windows(2) {
+        assert_eq!(pair[1] - pair[0], 1024, "{what}: audio PTS step");
+        assert_eq!(
+            (pair[1] - pair[0]) * 90_000 / 48_000,
+            1920,
+            "{what}: 90 kHz step"
+        );
+    }
+}
+
+/// A take to `bars` on output 1, then back to Program; returns the drain
+/// ticks of both takes and the next tick.
+fn tone_and_back(x: &mut AudioHarness) -> (u64, u64, u64) {
+    let t = x.run(0, 12);
+    x.h.try_take(audio_only("to-bars", 1, bars_src())).unwrap();
+    let (o, t2) = x.until(t, "to-bars", 60);
+    assert_eq!(o.outcome, TakeResult::Applied, "{o:?}");
+    assert_eq!(o.audio, Some(bars_src()));
+    let t3 = x.run(t2, 15);
+    x.h.try_take(audio_only("to-program", 1, AudioChoice::Program))
+        .unwrap();
+    let (o, t4) = x.until(t3, "to-program", 60);
+    assert_eq!(o.outcome, TakeResult::Applied, "{o:?}");
+    // Long enough for the return to the shared stream and its close.
+    let end = x.run(t4, 20);
+    (t, t3, end)
+}
+
+/// Spec G2: the PCM fed to the private bus across a tone -> program fade is
+/// continuous, the fade lasts exactly one tick of samples from G, no sample
+/// exceeds either side's peak, and the encoded stream keeps one frame per
+/// 1024 samples.
+#[test]
+fn an_audio_only_crossfade_is_sample_continuous_and_one_tick_long() {
+    let mut x = audio_harness(2, NTSC, Box::new(|_| Err("no video".to_owned())));
+    let (_, back_tick, _) = tone_and_back(&mut x);
+    let fades: Vec<(u64, u64)> = x
+        .tap
+        .lock()
+        .unwrap()
+        .fades
+        .iter()
+        .filter(|f| f.0 == 1)
+        .map(|f| (f.1, f.2))
+        .collect();
+    assert_eq!(fades.len(), 2, "one fade per take: {fades:?}");
+    let (g, len) = fades[1];
+    assert_eq!(
+        g,
+        grid_ceil(x.clock.total_at(back_tick), AAC_FRAME_SAMPLES),
+        "G = first grid boundary at or after total_at(T)"
+    );
+    assert_eq!(
+        len,
+        x.clock.total_at(back_tick + 1) - x.clock.total_at(back_tick),
+        "fade length = total_at(T+1) - total_at(T)"
+    );
+    let pcm = x.private_left(1);
+    let step = |a: u64, b: u64| -> f32 {
+        (a..b)
+            .map(|n| (pcm[&(n + 1)] - pcm[&n]).abs())
+            .fold(0.0, f32::max)
+    };
+    // Steady signals on either side of the fade.
+    let s_old = step(g - 3000, g - 1);
+    let s_new = step(g + len, g + len + 3000);
+    assert!(s_old > 0.06 && s_new > 0.01, "steady steps {s_old} {s_new}");
+    for n in g - 3000..g {
+        assert!((pcm[&n] - bars(n)).abs() < 1e-6, "tone before G at {n}");
+    }
+    for n in g + len..g + len + 3000 {
+        assert!(
+            (pcm[&n] - prog(n)).abs() < 1e-6,
+            "program after the fade at {n}"
+        );
+    }
+    // Across the fade: an equal-power pair o·cosθ + n·sinθ moves by at most
+    // hypot(o', n') plus the envelope's own slope (π/2 per fade length).
+    let fade_step = step(g - 1, g + len + 1);
+    let len_f = f32::from(u16::try_from(len).unwrap());
+    let bound = s_old.hypot(s_new) + (0.5 + 0.3) * std::f32::consts::FRAC_PI_2 / len_f;
+    assert!(
+        fade_step <= bound,
+        "largest step across the fade {fade_step} > bound {bound} (steady {s_old}, {s_new})"
+    );
+    let xf = TakeCrossfade { start: g, len };
+    for n in g..g + len {
+        let peak = bars(n).abs().max(prog(n).abs());
+        assert!(pcm[&n].abs() <= peak + 1e-6, "sample {n} above both peaks");
+        let (go, gn) = xf.gains(n);
+        let want = (bars(n) * go + prog(n) * gn).clamp(-peak, peak);
+        assert!((pcm[&n] - want).abs() < 1e-5, "envelope at {n}");
+    }
+    // The encoded streams: one frame per 1024 samples, the same frames.
+    assert_pts_step(&x.audio_pts(1), "output 1");
+    assert_pts_step(&x.audio_pts(0), "output 0");
+    let (p0, p1) = (x.audio_pts(0), x.audio_pts(1));
+    let n = p0.len().min(p1.len());
+    assert_eq!(p0[..n], p1[..n], "the same frames on both outputs");
+}
+
+fn decode(packets: &[&EncodedPacket]) -> Vec<(i64, Vec<f32>)> {
+    let reference = multiview_output::AudioRenditionEncoder::new(
+        &multiview_output::AudioEncodeConfig::aac(48_000, 2, 128_000),
+    )
+    .unwrap();
+    let mut decoder = multiview_ffmpeg::StreamAudioDecoder::from_codec_parameters(
+        reference.codec_params(),
+        reference.time_base(),
+    )
+    .unwrap();
+    packets
+        .iter()
+        .map(|p| {
+            let pcm = decoder.decode_interleaved(p).unwrap();
+            (p.pts().unwrap(), pcm.chunks(2).map(|c| c[0]).collect())
+        })
+        .collect()
+}
+
+/// Spec C + G3: back on the program mix, the private bus returns the output
+/// to the shared program stream at G' (>= 4 frames after the fade) and
+/// closes. Decoded output 1 across G' equals decoded output 0 (shared) within
+/// twice the steady-state difference of the two encoders before G', and
+/// within one 16-bit LSB once both decoders receive the same packets.
+#[test]
+fn a_private_bus_back_on_program_returns_to_the_shared_stream() {
+    let mut x = audio_harness(2, NTSC, Box::new(|_| Err("no video".to_owned())));
+    let (_, back_tick, _) = tone_and_back(&mut x);
+    let snap = x.h.snapshot();
+    assert_eq!(snap.audio_buses_live, 0, "{snap:?}");
+    assert_eq!(snap.audio.returned, 1, "{snap:?}");
+    assert_eq!(snap.audio.failed, 0, "{snap:?}");
+    assert_eq!(snap.outputs[1].audio, "program");
+    assert_eq!(snap.outputs[1].audio_choice, "program");
+    assert_eq!(x.d.binding_audio_key(1), None, "back on the shared stage");
+    let tap = x.tap.lock().unwrap();
+    let fade = *tap.fades.iter().rev().find(|f| f.0 == 1).unwrap();
+    let fade_end = fade.1 + fade.2;
+    let (_, g_ret) = *tap.returns.iter().find(|r| r.0 == 1).expect("a return");
+    drop(tap);
+    assert!(
+        g_ret >= fade_end + 4 * 1024,
+        "G' {g_ret} >= fade end {fade_end} + 4 frames"
+    );
+    assert_eq!(g_ret % 1024, 0, "G' on the grid");
+    // Within ~85 ms + one fade of the take's tick.
+    assert!(
+        g_ret - x.clock.total_at(back_tick) <= 4 * 1024 + 2 * 1602 + 2 * 1024,
+        "returned late: {g_ret}"
+    );
+    let d0 = decode(&x.audio_packets(0));
+    let d1 = decode(&x.audio_packets(1));
+    let g_ret = i64::try_from(g_ret).unwrap();
+    let fade_end = i64::try_from(fade_end).unwrap();
+    let diff = |from: i64, to: i64| -> (f32, usize) {
+        let mut max = 0.0_f32;
+        let mut n = 0;
+        for ((p0, s0), (p1, s1)) in d0.iter().zip(&d1) {
+            assert_eq!(p0, p1);
+            if *p0 >= from && *p0 < to {
+                for (a, b) in s0.iter().zip(s1) {
+                    max = max.max((a - b).abs());
+                    n += 1;
+                }
+            }
+        }
+        (max, n)
+    };
+    // Two encoders coding the same PCM, before G': their steady difference.
+    let (base, nb) = diff(fade_end + 2048, g_ret);
+    assert!(nb >= 1024, "baseline span {nb}");
+    let (across, na) = diff(g_ret, g_ret + 2048);
+    assert!(na >= 2048, "span after G' {na}");
+    assert!(
+        across <= 2.0 * base + 1e-4,
+        "decoded difference across G' {across} > 2 x steady {base}"
+    );
+    let (after, nl) = diff(g_ret + 2048, i64::MAX);
+    assert!(nl > 0);
+    // The same packets from here on: the two decoders' remaining difference
+    // is their own float state (measured ~1e-5), far below one 16-bit LSB.
+    assert!(after < 3e-5, "the same packets after G': {after}");
+    assert_pts_step(&x.audio_pts(1), "output 1 across G'");
+}
+
+/// Spec G4 (chaos): a flood of 5,000 audio-only takes alternating Source /
+/// Program / None on outputs 1 and 2 as fast as the mailbox accepts. Output
+/// 0 (Program) keeps every audio frame and every video window; the mailbox
+/// refuses (`TakeBusy`) instead of growing; private buses never exceed the
+/// outputs; every output's audio stays one frame per 1024 samples.
+#[test]
+fn an_audio_take_flood_never_disturbs_program_and_stays_bounded() {
+    let mut x = audio_harness(3, NTSC, Box::new(|_| Err("no video".to_owned())));
+    let mut t = x.run(0, 8);
+    let choices = [bars_src(), AudioChoice::Program, AudioChoice::Silence];
+    let (mut sent, mut busy) = (0_usize, 0_usize);
+    while sent < 5_000 {
+        loop {
+            let take = audio_only(
+                &format!("f{sent}"),
+                1 + sent % 2,
+                choices[(sent / 2) % 3].clone(),
+            );
+            if x.h.try_take(take).is_err() {
+                busy += 1;
+                break;
+            }
+            sent += 1;
+            if sent == 5_000 {
+                break;
+            }
+        }
+        x.tick(t);
+        t += 1;
+        let live = x.h.snapshot().audio_buses_live;
+        assert!(live <= 2, "private buses {live} > routed outputs");
+    }
+    let end = x.run(t, 40);
+    assert!(busy > 0, "the bounded mailbox refused takes");
+    let video: Vec<i64> = x.windows_of_video(0);
+    let want: Vec<i64> = (0..i64::try_from(video.len()).unwrap()).collect();
+    assert_eq!(video, want, "output 0: one video window per tick");
+    assert!(
+        u64::try_from(video.len()).unwrap() + 8 >= end,
+        "windows {} for {end} ticks",
+        video.len()
+    );
+    let p0 = x.audio_pts(0);
+    assert_pts_step(&p0, "Program (output 0)");
+    let samples = x.clock.total_at(end - 6);
+    assert!(
+        i64::try_from(p0.len()).unwrap() * 1024 >= i64::try_from(samples).unwrap(),
+        "output 0 audio frames {} for {samples} samples",
+        p0.len()
+    );
+    for o in 1..3 {
+        let p = x.audio_pts(o);
+        assert_pts_step(&p, &format!("output {o}"));
+        let n = p.len().min(p0.len());
+        assert_eq!(p[..n], p0[..n], "output {o}: the same frames as Program");
+    }
+    assert!(
+        x.feed_max < std::time::Duration::from_millis(50),
+        "feed {:?}",
+        x.feed_max
+    );
+}
+
+impl AudioHarness {
+    fn windows_of_video(&self, o: usize) -> Vec<i64> {
+        self.rec
+            .windows
+            .iter()
+            .filter(|w| w.0 == o)
+            .flat_map(|w| w.1.iter().map(|p| p.0))
+            .collect()
+    }
+}
+
+/// Spec G5 (chaos): the routed source dies mid-take (before G) and, on a
+/// second take, mid-crossfade. Its audio is silence from then on (no stale
+/// repeat): the bus carries exactly the old audio times the falling
+/// envelope, then nothing. The takes apply (a source without audio is
+/// silence, §5.1); every stream stays continuous.
+#[test]
+fn a_routed_source_dying_mid_take_and_mid_fade_carries_silence() {
+    let mut x = audio_harness(2, NTSC, Box::new(|_| Err("no video".to_owned())));
+    let t = x.run(0, 12);
+    // Mid-take: the strip goes away the tick the take is drained, before G.
+    x.h.try_take(audio_only("die-a", 1, bars_src())).unwrap();
+    x.bars_live = false;
+    let (o, t) = x.until(t, "die-a", 60);
+    assert_eq!(o.outcome, TakeResult::Applied, "{o:?}");
+    let t = x.run(t, 6);
+    let fade_a = *x.tap.lock().unwrap().fades.last().unwrap();
+    let pcm = x.private_left(1);
+    let xf = TakeCrossfade {
+        start: fade_a.1,
+        len: fade_a.2,
+    };
+    for n in fade_a.1..fade_a.1 + fade_a.2 + 2000 {
+        let want = prog(n) * xf.gains(n).0;
+        assert!(
+            (pcm[&n] - want).abs() < 1e-6,
+            "mid-take {n}: {} vs {want}",
+            pcm[&n]
+        );
+    }
+    // Back to Program, then a second take with the source alive that dies
+    // halfway through its fade.
+    x.h.try_take(audio_only("back", 1, AudioChoice::Program))
+        .unwrap();
+    let (_, t) = x.until(t, "back", 60);
+    let t = x.run(t, 4);
+    x.bars_live = true;
+    x.h.try_take(audio_only("die-b", 1, bars_src())).unwrap();
+    let mut t = t;
+    let mut died_at = None;
+    let mut applied = None;
+    for _ in 0..60 {
+        x.tick(t);
+        t += 1;
+        let fade = x.tap.lock().unwrap().fades.last().copied();
+        if let Some((_, g, len)) = fade.filter(|f| f.1 > fade_a.1) {
+            if died_at.is_none() && x.clock.total_at(t) > g {
+                // The tick that fed the fade's start: the source dies now.
+                x.bars_live = false;
+                died_at = Some((x.clock.total_at(t), g, len));
+            }
+        }
+        for o in x.outcomes.try_iter() {
+            if o.operation_id == "die-b" {
+                applied = Some(o.outcome);
+            }
+        }
+        if applied.is_some() && died_at.is_some() {
+            break;
+        }
+    }
+    assert_eq!(applied, Some(TakeResult::Applied));
+    let (dead_from, g, len) = died_at.expect("the fade started");
+    assert!(dead_from > g && dead_from < g + len, "died mid-fade");
+    let t = x.run(t, 4);
+    let pcm = x.private_left(1);
+    let xf = TakeCrossfade { start: g, len };
+    for n in dead_from..g + len + 1000 {
+        if !pcm.contains_key(&n) {
+            break; // the bus returned and closed
+        }
+        let want = prog(n) * xf.gains(n).0;
+        assert!(
+            (pcm[&n] - want).abs() < 1e-6,
+            "mid-fade {n}: {} vs {want} (stale tone?)",
+            pcm[&n]
+        );
+    }
+    let _ = x.run(t, 2);
+    assert_pts_step(&x.audio_pts(0), "Program");
+    assert_pts_step(&x.audio_pts(1), "output 1");
+    assert_eq!(x.h.snapshot().audio.failed, 0);
+}
+
+fn stalled_or_crashing_worker(panic_worker: bool) {
+    let mut x = audio_harness(2, NTSC, Box::new(|_| Err("no video".to_owned())));
+    let (release, wait) = std::sync::mpsc::channel::<()>();
+    let wait = Arc::new(Mutex::new(wait));
+    let wedged = Arc::new(AtomicBool::new(false));
+    let wedge = Arc::clone(&wedged);
+    x.r.set_audio_worker_hook(Arc::new(move |_job| {
+        if !wedge.load(Ordering::Acquire) {
+            return;
+        }
+        assert!(!panic_worker, "injected private-bus worker panic");
+        // A wedged worker: never drains its job queue until released.
+        let _ = wait.lock().unwrap().recv();
+    }));
+    // The take applies first: the output is on its private bus (tone).
+    let t = x.run(0, 12);
+    x.h.try_take(audio_only("tone", 1, bars_src())).unwrap();
+    let (o, t) = x.until(t, "tone", 60);
+    assert_eq!(o.outcome, TakeResult::Applied, "{o:?}");
+    let t = x.run(t, 2);
+    assert_eq!(x.h.snapshot().audio_buses_live, 1);
+    assert!(x.d.binding_audio_key(1).is_some(), "on the private bus");
+    // Now the worker wedges (or panics) at its next job.
+    wedged.store(true, Ordering::Release);
+    let mut failed_at = None;
+    let depth = u64::try_from(crate::routing_audio::PRIVATE_AUDIO_QUEUE).unwrap();
+    for k in 0..depth + 4 {
+        x.tick(t + k);
+        if x.h.snapshot().audio_buses_live == 0 {
+            failed_at = Some(k);
+            break;
+        }
+    }
+    let k = failed_at.expect("the bus failed");
+    assert!(k <= depth + 1, "failed within the queue depth: {k}");
+    if !panic_worker {
+        // Mechanism (measured): the wedged worker emits nothing, so its
+        // dispatcher stage never proves a window; the output's pending FIFO
+        // (4 windows) fills and the dispatcher fails that stage alone
+        // (`AudioFallback`) at about 4 ticks — before the 8-slot PCM queue
+        // would fill (`TrySendError::Full`, the backstop). Either way the
+        // bus fails alone and the consumer never waits (timed below).
+        assert!(k >= 2, "the bus is not failed before the wedge bites: {k}");
+    }
+    let t = x.run(t + k + 1, 4);
+    let snap = x.h.snapshot();
+    assert_eq!(snap.audio.failed, 1, "{snap:?}");
+    assert_eq!(x.d.binding_audio_key(1), None, "back on the shared stage");
+    assert!(
+        x.feed_max < std::time::Duration::from_millis(50),
+        "the consumer never waits: {:?}",
+        x.feed_max
+    );
+    assert!(
+        x.step_max < std::time::Duration::from_millis(100),
+        "the whole consumer step never waits on the wedged worker: {:?}",
+        x.step_max
+    );
+    let _ = x.run(t, 4);
+    let o0: Vec<i64> = x
+        .rec
+        .windows
+        .iter()
+        .filter(|w| w.0 == 0)
+        .filter_map(|w| w.1.first().map(|p| p.0))
+        .collect();
+    assert!(
+        o0.windows(2).all(|w| w[1] == w[0] + 1),
+        "Program video keeps one window per tick through the wedge: {o0:?}"
+    );
+    assert_pts_step(&x.audio_pts(0), "Program");
+    assert_pts_step(&x.audio_pts(1), "output 1");
+    drop(release);
+}
+
+/// Spec G6 (chaos): a wedged private-bus worker fails its bus alone within
+/// the queue depth; the output stays on / returns to the shared program
+/// stream; the consumer never waits; Program is untouched.
+#[test]
+fn a_stalled_private_bus_worker_fails_alone_and_never_blocks() {
+    stalled_or_crashing_worker(false);
+}
+
+/// Spec G6: the same for a panicking private-bus worker.
+#[test]
+fn a_panicking_private_bus_worker_fails_alone() {
+    stalled_or_crashing_worker(true);
+}
+
+/// Spec G7: a combined take (video to a source + audio Program) moves the
+/// video and keeps the program audio (no private bus); a combined take whose
+/// video is refused (feed never fresh) restores the choice and leaves the
+/// audio alone.
+#[test]
+fn a_combined_take_moves_video_with_its_explicit_audio_or_restores_it() {
+    let encoded = Arc::new(AtomicUsize::new(0));
+    let open: OpenFn = Box::new(move |_| {
+        let enc: Box<dyn LiveEncoder> = Box::new(FakeEnc {
+            forced: false,
+            encoded: Arc::clone(&encoded),
+        });
+        Ok(enc)
+    });
+    let mut x = audio_harness(2, CADENCE, open);
+    let t = x.run(0, 5);
+    x.h.try_take(OutputTake {
+        operation_id: "both".to_owned(),
+        output_index: 1,
+        bus: Some(src()),
+        audio: Some(AudioChoice::Program),
+        principal: "p".to_owned(),
+    })
+    .unwrap();
+    let (o, t) = x.until(t, "both", OPEN_DEADLINE_TICKS);
+    assert_eq!(o.outcome, TakeResult::Applied, "{o:?}");
+    assert_eq!(o.bus, src());
+    assert_eq!(o.audio, Some(AudioChoice::Program));
+    let t = x.run(t, 3);
+    let snap = x.h.snapshot();
+    assert_eq!(snap.outputs[1].bus, "src:cam");
+    assert_eq!(snap.outputs[1].audio, "program");
+    assert_eq!(snap.outputs[1].audio_choice, "program");
+    assert_eq!(snap.audio.opened, 0, "no private bus: {snap:?}");
+    // A video take that is never fresh, with audio Source(bars).
+    x.h.try_take(OutputTake {
+        operation_id: "stale".to_owned(),
+        output_index: 1,
+        bus: Some(PictureBus::Source("nowhere".to_owned())),
+        audio: Some(bars_src()),
+        principal: "p".to_owned(),
+    })
+    .unwrap();
+    let (o, _) = x.until(t, "stale", TAKE_PRIME_DEADLINE_TICKS + 2);
+    assert_eq!(o.outcome, TakeResult::Refused(RefuseReason::FeedNotFresh));
+    assert_eq!(o.audio, Some(AudioChoice::Program), "choice restored");
+    let snap = x.h.snapshot();
+    assert_eq!(snap.outputs[1].audio_choice, "program");
+    assert_eq!(snap.outputs[1].audio, "program");
+    assert_eq!(snap.audio_buses_live, 0);
+    assert_eq!(snap.audio.opened, 0, "{snap:?}");
+}
+
+/// Spec G7 (second half, dispatcher-refused): a combined take whose video
+/// move is refused after the audio was installed fades back and restores
+/// the previous choice.
+#[test]
+fn a_superseded_combined_take_restores_the_audio_choice() {
+    let encoded = Arc::new(AtomicUsize::new(0));
+    let open: OpenFn = Box::new(move |_| {
+        let enc: Box<dyn LiveEncoder> = Box::new(FakeEnc {
+            forced: false,
+            encoded: Arc::clone(&encoded),
+        });
+        Ok(enc)
+    });
+    let mut x = audio_harness(2, CADENCE, open);
+    let mut t = x.run(0, 5);
+    x.h.try_take(OutputTake {
+        operation_id: "combined".to_owned(),
+        output_index: 1,
+        bus: Some(src()),
+        audio: Some(bars_src()),
+        principal: "p".to_owned(),
+    })
+    .unwrap();
+    // Wait until the video move is issued (Moving), then supersede it with
+    // a video-only take back to Program before it lands.
+    let mut moving = false;
+    for _ in 0..OPEN_DEADLINE_TICKS {
+        x.tick(t);
+        t += 1;
+        if matches!(
+            x.r.outputs[1].pending.as_ref().map(|p| p.phase),
+            Some(Phase::Moving(_))
+        ) {
+            moving = true;
+            break;
+        }
+    }
+    assert!(moving, "the video move was issued");
+    assert_eq!(x.h.snapshot().outputs[1].audio_choice, "src:bars");
+    x.h.try_take(OutputTake {
+        operation_id: "cancel".to_owned(),
+        output_index: 1,
+        bus: Some(PictureBus::Program),
+        audio: None,
+        principal: "p".to_owned(),
+    })
+    .unwrap();
+    let (o, t) = x.until(t, "cancel", 20);
+    assert_eq!(o.outcome, TakeResult::Applied, "{o:?}");
+    let superseded = x
+        .others
+        .iter()
+        .find(|o| o.operation_id == "combined")
+        .expect("the combined take ended");
+    assert_eq!(superseded.outcome, TakeResult::Superseded);
+    let _ = x.run(t, 12);
+    let snap = x.h.snapshot();
+    assert_eq!(snap.outputs[1].audio_choice, "follow", "choice restored");
+    assert_eq!(snap.outputs[1].audio, "program");
+    assert_eq!(snap.outputs[1].bus, "program");
+}
+
+/// Spec G8: an explicit Source carries its `audio-routing` gain and mute,
+/// read live (a change between ticks applies to the next tick's block); a
+/// Track choice carries its input's block without the route gain.
+#[test]
+fn an_explicit_source_follows_the_live_route_gain_and_a_track_does_not() {
+    let mut x = audio_harness(2, NTSC, Box::new(|_| Err("no video".to_owned())));
+    x.gain.store(0.5_f32.to_bits(), Ordering::Release);
+    let t = x.run(0, 12);
+    x.h.try_take(audio_only("gain", 1, bars_src())).unwrap();
+    let (o, t) = x.until(t, "gain", 60);
+    assert_eq!(o.outcome, TakeResult::Applied);
+    let t = x.run(t, 3);
+    let check = |x: &AudioHarness, tick: u64, f: &dyn Fn(u64) -> f32, what: &str| {
+        let pcm = x.private_left(1);
+        for n in x.clock.total_at(tick)..x.clock.total_at(tick + 1) {
+            assert!((pcm[&n] - f(n)).abs() < 1e-6, "{what} at {n}");
+        }
+    };
+    check(&x, t - 1, &|n| bars(n) * 0.5, "gain 0.5");
+    x.gain.store(0.25_f32.to_bits(), Ordering::Release);
+    x.tick(t);
+    check(&x, t, &|n| bars(n) * 0.25, "gain 0.25 on the next tick");
+    x.gain.store(0.0_f32.to_bits(), Ordering::Release);
+    x.tick(t + 1);
+    check(&x, t + 1, &|_| 0.0, "muted");
+    x.h.try_take(audio_only(
+        "track",
+        1,
+        AudioChoice::Track {
+            name: "eng".to_owned(),
+            input: "bars".to_owned(),
+        },
+    ))
+    .unwrap();
+    let (o, t) = x.until(t + 2, "track", 60);
+    assert_eq!(o.outcome, TakeResult::Applied);
+    let t = x.run(t, 3);
+    check(&x, t - 1, &bars, "a track is not gained");
+    let snap = x.h.snapshot();
+    assert_eq!(snap.outputs[1].audio, "track:eng");
+    assert_eq!(snap.outputs[1].audio_choice, "track:eng");
+}
+
+/// An audio take on a run without program audio, or with neither video nor
+/// audio, is refused `Unroutable`; an audio take that changes nothing
+/// applies at once.
+#[test]
+fn audio_takes_without_a_program_audio_slot_are_unroutable() {
+    let (mut rt, handle, _) = router(2, 6, Box::new(|_| Err("never".to_owned())));
+    let outcomes = handle.outcomes().unwrap();
+    let mut disp = dispatcher(2);
+    handle
+        .try_take(audio_only("a", 1, AudioChoice::Program))
+        .unwrap();
+    handle
+        .try_take(OutputTake {
+            operation_id: "none".to_owned(),
+            output_index: 1,
+            bus: None,
+            audio: None,
+            principal: "p".to_owned(),
+        })
+        .unwrap();
+    rt.on_tick(0, MediaTime::from_nanos(0), &mut disp, &mut NoDelivery)
+        .unwrap();
+    let got: Vec<_> = outcomes.try_iter().map(|o| o.outcome).collect();
+    assert_eq!(
+        got,
+        vec![
+            TakeResult::Refused(RefuseReason::Unroutable),
+            TakeResult::Refused(RefuseReason::Unroutable)
+        ]
+    );
+    let mut x = audio_harness(2, NTSC, Box::new(|_| Err("no video".to_owned())));
+    let t = x.run(0, 3);
+    x.h.try_take(audio_only("same", 1, AudioChoice::Program))
+        .unwrap();
+    let (o, next) = x.until(t, "same", 2);
+    assert_eq!((o.outcome, o.tick), (TakeResult::Applied, next - 1));
+    assert_eq!(x.h.snapshot().audio.opened, 0);
+}
+
+/// Spec B (flood bound): a change taken while a fade runs never overlaps it
+/// and never steps. It starts from the running fade's target at the first
+/// grid boundary after that fade ends; the PCM stays continuous.
+#[test]
+fn a_take_during_a_running_fade_is_queued_after_it() {
+    let mut x = audio_harness(2, NTSC, Box::new(|_| Err("no video".to_owned())));
+    let mut t = x.run(0, 12);
+    x.h.try_take(audio_only("first", 1, bars_src())).unwrap();
+    // Tick until the first fade has started being fed.
+    let mut first = None;
+    for _ in 0..60 {
+        x.tick(t);
+        t += 1;
+        if let Some(f) = x.tap.lock().unwrap().fades.iter().find(|f| f.0 == 1) {
+            first = Some((f.1, f.2));
+        }
+        if first.is_some() {
+            break;
+        }
+    }
+    let (g1, len1) = first.expect("the first fade started");
+    assert!(
+        x.clock.total_at(t) < g1 + len1,
+        "the first fade is still running when the next take drains"
+    );
+    x.h.try_take(audio_only("second", 1, AudioChoice::Silence))
+        .unwrap();
+    let (o, t) = x.until(t, "second", 60);
+    assert_eq!(o.outcome, TakeResult::Applied, "{o:?}");
+    let first_outcome = x.others.iter().find(|o| o.operation_id == "first");
+    assert_eq!(
+        first_outcome.map(|o| o.outcome),
+        Some(TakeResult::Superseded),
+        "latest wins: the first take reports superseded"
+    );
+    let _ = x.run(t, 4);
+    let fades: Vec<(u64, u64)> = x
+        .tap
+        .lock()
+        .unwrap()
+        .fades
+        .iter()
+        .filter(|f| f.0 == 1)
+        .map(|f| (f.1, f.2))
+        .collect();
+    assert_eq!(fades.len(), 2, "{fades:?}");
+    let (g2, _) = fades[1];
+    assert_eq!(fades[0], (g1, len1), "the running fade ran to its end");
+    // The tick block in which the running fade ends is already mixed when
+    // it ends: the next fade starts at the first grid boundary at or after
+    // that block's end (never inside the running fade, never a step).
+    let mut k = 0;
+    while x.clock.total_at(k + 1) < g1 + len1 {
+        k += 1;
+    }
+    assert_eq!(
+        g2,
+        grid_ceil(x.clock.total_at(k + 1), AAC_FRAME_SAMPLES),
+        "the next fade starts at the first grid boundary after the running one ends"
+    );
+    assert!(g2 >= g1 + len1, "no overlap");
+    let pcm = x.private_left(1);
+    // Between the fades the bus carries the first fade's target exactly.
+    for n in g1 + len1..g2 {
+        assert!(
+            (pcm[&n] - bars(n)).abs() < 1e-6,
+            "tone between fades at {n}"
+        );
+    }
+    // No step anywhere above the fade-bounded maximum.
+    let worst = (g1 - 1..g2 + 2000)
+        .map(|n| (pcm[&(n + 1)] - pcm[&n]).abs())
+        .fold(0.0_f32, f32::max);
+    let steady = 0.5 * std::f32::consts::TAU * 1_000.0 / 48_000.0;
+    assert!(
+        worst <= steady * 1.5,
+        "largest step {worst} (steady tone {steady})"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// #330 (PR 319 review): router faults.
+// ---------------------------------------------------------------------------
+
+/// #330 item 1: a take superseded while its open is wedged releases the
+/// open's encoder session at the open's deadline (it leaked forever).
+#[test]
+fn a_superseded_wedged_open_releases_its_session_at_the_deadline() {
+    let (_hold, wait) = mpsc::channel::<()>();
+    let wait = Mutex::new(wait);
+    let open: OpenFn = Box::new(move |_| {
+        let _ = wait.lock().unwrap().recv(); // wedged while the test runs
+        Err("unreachable".to_owned())
+    });
+    let mut x = harness(2, 6, Some(open));
+    x.tick(0);
+    x.h.try_take(take("a", 1, src())).unwrap();
+    x.tick(1);
+    x.tick(2);
+    assert_eq!(x.h.snapshot().opens_in_flight, 1, "the open is in flight");
+    // Superseded by a take back to Program (no waiter remains).
+    x.h.try_take(take("b", 1, PictureBus::Program)).unwrap();
+    for t in 3..=OPEN_DEADLINE_TICKS + 3 {
+        x.tick(t);
+    }
+    let got: Vec<_> = x
+        .outcomes
+        .try_iter()
+        .map(|o| (o.operation_id, o.outcome))
+        .collect();
+    assert!(
+        got.contains(&("a".to_owned(), TakeResult::Superseded)),
+        "{got:?}"
+    );
+    assert_eq!(
+        x.h.snapshot().opens_in_flight,
+        0,
+        "the superseded open's session is released at its deadline"
+    );
+}
+
+/// #330 item 2: two outputs' takes to the same bus with the same settings,
+/// while the first open is still in flight, open ONE encoder (+0 for the
+/// second), never two.
+#[test]
+fn two_in_flight_takes_to_one_bus_open_one_encoder() {
+    let opens = Arc::new(AtomicUsize::new(0));
+    let count = Arc::clone(&opens);
+    let encoded = Arc::new(AtomicUsize::new(0));
+    let open: OpenFn = Box::new(move |_| {
+        count.fetch_add(1, Ordering::Relaxed);
+        // Slow enough that the second take is admitted meanwhile.
+        std::thread::sleep(std::time::Duration::from_millis(30));
+        let enc: Box<dyn LiveEncoder> = Box::new(FakeEnc {
+            forced: false,
+            encoded: Arc::clone(&encoded),
+        });
+        Ok(enc)
+    });
+    let mut x = harness(3, 6, Some(open));
+    x.tick(0);
+    x.h.try_take(take("a", 1, src())).unwrap();
+    x.h.try_take(take("b", 2, src())).unwrap();
+    let mut got = Vec::new();
+    for t in 1..60 {
+        x.tick(t);
+        got.extend(x.outcomes.try_iter().map(|o| (o.operation_id, o.outcome)));
+        if got.len() == 2 {
+            break;
+        }
+    }
+    assert!(
+        got.contains(&("a".to_owned(), TakeResult::Applied)),
+        "{got:?}"
+    );
+    assert!(
+        got.contains(&("b".to_owned(), TakeResult::Applied)),
+        "{got:?}"
+    );
+    assert_eq!(
+        opens.load(Ordering::Relaxed),
+        1,
+        "one encoder for one (bus, settings)"
+    );
+    assert_eq!(x.h.snapshot().dynamic_encoders_live, 1);
+}
+
+/// A fake live encoder whose keyframes can be withheld (its windows then
+/// never pass the move gate, so a move onto it stays pending).
+struct GatedEnc {
+    forced: bool,
+    no_keys: Arc<AtomicBool>,
+}
+
+impl VideoEncodeWorker for GatedEnc {
+    fn encode(&mut self, item: BakedTick) -> Result<Vec<EncodedPacket>, PipelineError> {
+        let key = std::mem::take(&mut self.forced) && !self.no_keys.load(Ordering::Acquire);
+        Ok(vec![pkt(item.tick, key)])
+    }
+    fn reorder_bound(&self) -> ReorderBound {
+        ReorderBound::NoReorder
+    }
+    fn finish(&mut self) -> Result<Vec<EncodedPacket>, PipelineError> {
+        Ok(Vec::new())
+    }
+    fn force_keyframe(&mut self) {
+        self.forced = true;
+    }
+}
+
+impl LiveEncoder for GatedEnc {
+    fn start_at(&mut self, _t0: u64) {
+        self.forced = true;
+    }
+    fn time_base(&self) -> Rational {
+        Rational::new(1, 5)
+    }
+    fn move_gate(&self) -> MoveGate {
+        Box::new(|p| p.is_keyframe() && p.len() == 77)
+    }
+}
+
+/// Output 1 on a live `cam` key (principal `p`), output 2 on a live `cam2`
+/// key (principal `q`), then `cam2`'s keyframes withheld and output 1's take
+/// "c" to `cam2` left pending in `Moving(kB)`. Returns (harness, kA, kB,
+/// next tick, keyframe switch).
+fn stuck_move_onto_a_shared_key() -> (Harness, usize, usize, u64, Arc<AtomicBool>) {
+    let no_keys = Arc::new(AtomicBool::new(false));
+    let flag = Arc::clone(&no_keys);
+    let open: OpenFn = Box::new(move |_| {
+        let enc: Box<dyn LiveEncoder> = Box::new(GatedEnc {
+            forced: false,
+            no_keys: Arc::clone(&flag),
+        });
+        Ok(enc)
+    });
+    let mut x = harness(3, 6, Some(open));
+    x.tick(0);
+    let until_applied = |x: &mut Harness, from: u64, op: &str| -> u64 {
+        for t in from..from + OPEN_DEADLINE_TICKS {
+            x.tick(t);
+            let got: Vec<_> = x.outcomes.try_iter().collect();
+            if got
+                .iter()
+                .any(|o| o.operation_id == op && o.outcome == TakeResult::Applied)
+            {
+                return t + 1;
+            }
+            assert!(got.is_empty(), "unexpected outcomes {got:?}");
+        }
+        panic!("{op} never applied");
+    };
+    x.h.try_take(take("a", 1, src())).unwrap();
+    let t = until_applied(&mut x, 1, "a");
+    let mut b = take("b", 2, PictureBus::Source("cam2".to_owned()));
+    b.principal = "q".to_owned();
+    x.h.try_take(b).unwrap();
+    let t = until_applied(&mut x, t, "b");
+    let ka = x.d.binding_video_key(1).unwrap();
+    let kb = x.d.binding_video_key(2).unwrap();
+    assert!(ka != 0 && kb != 0 && ka != kb, "two live keys: {ka} {kb}");
+    no_keys.store(true, Ordering::Release);
+    x.h.try_take(take("c", 1, PictureBus::Source("cam2".to_owned())))
+        .unwrap();
+    x.tick(t);
+    assert!(x.results().is_empty(), "c is pending");
+    assert!(
+        x.h.snapshot().outputs[1].pending.is_some(),
+        "c moves onto the warm key at once"
+    );
+    assert_eq!(x.d.pending_video_move(1), Some(kb), "the move is pending");
+    (x, ka, kb, t + 1, no_keys)
+}
+
+/// #330 item 3: an aux failure that rebinds an output to Program while its
+/// take's dispatcher move is pending settles that take (it stranded in
+/// `Moving` forever, holding its destination key subscribed), and the
+/// destination key then lingers and closes like any 0-subscriber key.
+#[test]
+fn an_aux_fallback_settles_a_take_whose_move_is_pending() {
+    let (mut x, _ka, kb, mut t, _no_keys) = stuck_move_onto_a_shared_key();
+    x.failed.store(true, Ordering::Release);
+    let fell_at = t;
+    let mut got = Vec::new();
+    for _ in 0..20 {
+        x.tick(t);
+        t += 1;
+        got.extend(
+            x.outcomes
+                .try_iter()
+                .filter(|o| o.output_index == 1)
+                .map(|o| (o.operation_id, o.outcome, o.tick)),
+        );
+    }
+    // Settled at the fallback itself, before it is reported (not later by
+    // the dispatcher's Superseded echo).
+    assert_eq!(
+        got,
+        vec![
+            ("c".to_owned(), TakeResult::Superseded, fell_at),
+            (
+                String::new(),
+                TakeResult::Fallback(FallbackReason::AuxFailed),
+                fell_at
+            ),
+        ],
+        "the pending take gets a terminal outcome at the fallback"
+    );
+    assert!(
+        x.h.snapshot().outputs.iter().all(|o| o.pending.is_none()),
+        "no take stays pending"
+    );
+    assert_eq!(x.d.binding_video_key(1), Some(0), "output 1 on Program");
+    assert_eq!(x.d.binding_video_key(2), Some(0), "output 2 on Program");
+    // kB has no subscriber since the fallback: it lingers, then closes.
+    while t < fell_at + LINGER_TICKS - 2 {
+        x.tick(t);
+        t += 1;
+    }
+    assert!(!x.d.is_key_failed(kb), "kB lingers");
+    for _ in 0..5 {
+        x.tick(t);
+        t += 1;
+    }
+    assert!(x.d.is_key_failed(kb), "kB closed after the linger");
+}
+
+/// #330 item 3, the dispatcher-Fallback arm: the output's live key fails
+/// while its take's move onto another key is pending. The take is settled
+/// at the fallback (Superseded) and its move cancelled: it never lands
+/// later behind the reported Fallback.
+#[test]
+fn an_encoder_fallback_settles_a_take_whose_move_is_pending() {
+    let (mut x, ka, _kb, mut t, no_keys) = stuck_move_onto_a_shared_key();
+    x.r.close(ka, &mut x.d);
+    x.tick(t);
+    t += 1;
+    let got: Vec<_> = x
+        .outcomes
+        .try_iter()
+        .map(|o| (o.operation_id, o.outcome))
+        .collect();
+    assert!(
+        got.contains(&("c".to_owned(), TakeResult::Superseded)),
+        "{got:?}"
+    );
+    assert!(
+        got.contains(&(
+            String::new(),
+            TakeResult::Fallback(FallbackReason::EncoderFailed)
+        )),
+        "{got:?}"
+    );
+    assert!(x.h.snapshot().outputs[1].pending.is_none());
+    assert_eq!(x.d.pending_video_move(1), None, "the move is cancelled");
+    // kB's keyframes return: nothing lands on output 1.
+    no_keys.store(false, Ordering::Release);
+    for _ in 0..15 {
+        x.tick(t);
+        t += 1;
+    }
+    assert_eq!(
+        x.d.binding_video_key(1),
+        Some(0),
+        "output 1 stays on Program"
+    );
+    let o = &x.h.snapshot().outputs[1];
+    assert_eq!((o.bus.as_str(), o.key.as_str()), ("program", "program/0"));
+}
+
+/// #330 item 4: a take superseded while the output's current key is
+/// already retired (its Fallback not yet drained) cannot cancel the old
+/// move by re-asserting that key. The old move is cancelled directly
+/// (counted) and never lands later with no take, and the output's `key` and
+/// `bus` always agree.
+#[test]
+fn a_failed_cancel_never_lets_an_old_move_land() {
+    let (mut x, ka, kb, mut t, no_keys) = stuck_move_onto_a_shared_key();
+    // kA retires between drains (the router has not seen it yet); a take
+    // that stays priming supersedes "c".
+    x.d.retire_video_key(ka).unwrap();
+    x.h.try_take(take("d", 1, PictureBus::Source("nope".to_owned())))
+        .unwrap();
+    x.tick(t);
+    t += 1;
+    let got: Vec<_> = x
+        .outcomes
+        .try_iter()
+        .map(|o| (o.operation_id, o.outcome))
+        .collect();
+    assert!(
+        got.contains(&("c".to_owned(), TakeResult::Superseded)),
+        "{got:?}"
+    );
+    assert_eq!(x.h.snapshot().move_cancel_failures, 1, "counted");
+    assert_eq!(x.d.pending_video_move(1), None, "the old move is gone");
+    // kB's keyframes return while "d" still primes: the old move to kB
+    // must not land.
+    no_keys.store(false, Ordering::Release);
+    for _ in 0..15 {
+        x.tick(t);
+        t += 1;
+        let o = &x.h.snapshot().outputs[1];
+        assert_eq!(
+            o.key,
+            format!("{}/{}", o.bus, x.d.binding_video_key(1).unwrap()),
+            "key and bus agree"
+        );
+    }
+    assert_ne!(
+        x.d.binding_video_key(1),
+        Some(kb),
+        "the old move never lands"
+    );
+    assert_eq!(x.d.binding_video_key(1), Some(0));
 }
 
 /// I1: a live encoder that blocks forever in `encode` (never drains its
