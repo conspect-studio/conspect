@@ -512,14 +512,18 @@ fn a_transition_flood_on_a_real_clock_keeps_cadence_with_a_stalled_consumer() {
     assert!(run.completions > 0, "dips really ran");
 }
 
-/// Negative control: the same watchdog with a hook that blocks 3 s on the
-/// last tick detects the stall, so the gate measures the clock itself.
+/// Negative control: the same watchdog with a hook that blocks 3 s once, in
+/// the second half of the run, detects the stall, so the gate measures the
+/// clock itself. The block fires on the first fresh OR repeat tick at or past
+/// its index (a loaded runner may emit any given tick as a catch-up repeat),
+/// and the run records that it fired.
 #[test]
-fn the_real_clock_watchdog_detects_a_long_block_on_the_terminal_tick() {
+fn the_real_clock_watchdog_detects_a_long_synchronous_block() {
     let run = flood_on_a_real_clock(Block::Once {
-        at: TICKS_RT - 1,
+        at: TICKS_RT / 2,
         for_: std::time::Duration::from_secs(3),
     });
+    assert!(run.injected, "the block was injected");
     assert!(run.max_gap >= MAX_GAP, "detected: {:?}", run.max_gap);
 }
 
@@ -541,6 +545,7 @@ const MAX_GAP: std::time::Duration = std::time::Duration::from_secs(1);
 
 struct RealRun {
     finished: bool,
+    injected: bool,
     max_gap: std::time::Duration,
     repeats: u64,
     full: u64,
@@ -558,27 +563,47 @@ enum Block {
 struct Stall<H> {
     inner: H,
     block: Block,
+    injected: Arc<AtomicBool>,
+}
+
+impl<H> Stall<H> {
+    /// Block for `Once` on the first tick at or after `at`, fresh or a
+    /// catch-up repeat alike, so a loaded runner that emits the terminal tick
+    /// as a repeat still exercises the block (review INV1-01 round 3).
+    fn block_once(&mut self, tick: Tick) {
+        if let Block::Once { at, for_ } = self.block {
+            if tick.index >= at {
+                self.block = Block::None;
+                self.injected.store(true, Ordering::Release);
+                std::thread::sleep(for_);
+            }
+        }
+    }
 }
 
 impl<H: FrameControl> FrameControl for Stall<H> {
     fn before_compose(&mut self, drive: &mut CompositorDrive<Nv12Image>, tick: Tick) {
-        match self.block {
-            Block::Every(delay) => std::thread::sleep(delay),
-            Block::Once { at, for_ } if tick.index == at => std::thread::sleep(for_),
-            _ => {}
+        if let Block::Every(delay) = self.block {
+            self.injected.store(true, Ordering::Release);
+            std::thread::sleep(delay);
         }
+        self.block_once(tick);
         self.inner.before_compose(drive, tick);
     }
     fn after_compose(&mut self, frame: &multiview_engine::CompositedFrame) {
         self.inner.after_compose(frame);
     }
     fn on_repeat(&mut self, drive: &mut CompositorDrive<Nv12Image>, tick: Tick) {
+        self.block_once(tick);
         self.inner.on_repeat(drive, tick);
     }
 }
 
 fn flood_on_a_real_clock(block: Block) -> RealRun {
     use multiview_engine::{MonotonicTimeSource, RealtimePacer};
+    // Pacing is measured from before the runtime seeds its first deadline
+    // (review INV1-03), so setup time can only lengthen `elapsed`.
+    let started = std::time::Instant::now();
     let rig = rig();
     let (a, b) = (Arc::clone(&rig.a), Arc::clone(&rig.b));
     let handle = rig.handle.clone();
@@ -596,6 +621,7 @@ fn flood_on_a_real_clock(block: Block) -> RealRun {
     let _stalled = handle.outcomes();
     let done = Arc::new(AtomicBool::new(false));
     let finished = Arc::new(AtomicBool::new(false));
+    let injected = Arc::new(AtomicBool::new(false));
     let full = Arc::new(AtomicU64::new(0));
     // Sources publish fresh frames on real time, off the clock.
     let feeder = {
@@ -643,6 +669,7 @@ fn flood_on_a_real_clock(block: Block) -> RealRun {
         let hook = Stall {
             inner: rig.hook,
             block,
+            injected: Arc::clone(&injected),
         };
         std::thread::spawn(move || {
             let rt = tokio::runtime::Builder::new_current_thread()
@@ -666,8 +693,7 @@ fn flood_on_a_real_clock(block: Block) -> RealRun {
     };
     // Watchdog: sample the tick counter every 10 ms, record the largest gap
     // between progress, stop watching at a hard deadline (3 s of output + 10 s).
-    let started = std::time::Instant::now();
-    let deadline = started + std::time::Duration::from_secs(13);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(13);
     let mut last = (ticks.load(Ordering::Acquire), std::time::Instant::now());
     let mut max_gap = std::time::Duration::ZERO;
     while !finished.load(Ordering::Acquire) && std::time::Instant::now() < deadline {
@@ -694,6 +720,7 @@ fn flood_on_a_real_clock(block: Block) -> RealRun {
     // A never-finishing engine thread is left detached; the test then fails.
     RealRun {
         finished,
+        injected: injected.load(Ordering::Acquire),
         max_gap,
         repeats: repeated.load(Ordering::Acquire),
         full: full.load(Ordering::Relaxed),
