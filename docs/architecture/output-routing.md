@@ -1877,9 +1877,23 @@ non-canvas format on a kind slice B does not convert for: `webrtc`, `whip_push`,
 `PUT /api/v1/outputs/{id}` whose ONLY effective change is `format` and/or
 `slots.video[0].bitrate_kbps` on a running HLS output (TS segments) is applied live as a Class-2
 reset of that output only. SRT and RIST stay restart-pending in this slice: their single session
-muxer is never rebuilt, so a PAT/PMT bump there needs a session-muxer rebuild (follow-up #380). The answer is `x-multiview-apply: live`, the note
-"resets output <id> (about 1 s); Program and other outputs are not affected", and an operation id
-whose `route.output` outcome is `reset:applied` or `reset:refused:<reason>`.
+muxer is never rebuilt, so a PAT/PMT bump there needs a session-muxer rebuild (follow-up #380). The answer is `x-multiview-apply: live`, the static note
+"resets this output (about 1 s); Program and other outputs are not affected" (never the raw id), and an
+operation id whose `route.output` outcome is `reset:applied` or `reset:refused:<reason>`.
+
+"Effective" (review M-4): an absent `bitrate_kbps` is the run default (4000 kbit/s), and an explicit
+canvas-size format with the default fit is the same as an absent one. A PUT whose format/bitrate differ
+only raw is a no-op: committed and answered `apply: live` with no operation id and no reset.
+
+The request order (review X2), so the store and the engine never silently disagree: validate → authz
+(both axes) → rate limit → commit → submit.
+- Submit refused as `restart-required`: the commit stands and the answer is `apply: restart` (the change
+  applies at the next restart); the rate-limit slot is refunded.
+- Engine busy (the reset mailbox is full): the previous body is re-committed (the store is back to what
+  the engine runs), the slot is refunded and the answer is 503 `engine-busy`. If that rollback fails the
+  answer is an explicit commit-indeterminate error, never a silent mismatch.
+- Commit-then-submit is deliberate: a reset handed to the engine has no cancel, so a commit failing after
+  a submit would leave the engine applying a body the store never took.
 
 What the engine does (`crates/multiview-cli/src/output_routing_reformat.rs`):
 - **Open off the clock.** A bounded `Reformat` command opens a new encoder on the routing-open
@@ -1892,16 +1906,25 @@ What the engine does (`crates/multiview-cli/src/output_routing_reformat.rs`):
   - HLS writes `EXT-X-DISCONTINUITY` at the segment the IDR starts;
   - the segment muxer is rebuilt with the next TS `tables_version`, so PAT/PMT `version_number` changes
     there. That is legal because the segment is discontinuous anyway.
-- **New base key.** The new key becomes the output's base key (fallback and later takes) and never
-  lingers while pinned. A previous reformat key no output uses lingers out and retires.
+- **New base key.** The new key becomes the output's base key (fallback) and never lingers while
+  pinned. A previous reformat key no output uses lingers out and retires.
+- **Later takes keep the reset settings** (review M-2). The output's rendition-settings index stays
+  separate from its base key; the reset's ad-hoc settings are stored per output, so a later source/PVW
+  take opens (or reuses) an encoder at the reset codec, size and bitrate.
+- **The rebuilt muxer is seeded from the NEW encoder** (review V2). Its `StreamCodecParameters` ride the
+  flagged change on the batch lease, so the rebuilt segment's PMT and stream declare the new size. A failed
+  rebuild abandons the segment and recovers at the next RAP; it is never fatal.
+- **A refused move never leaves a gap** (review V1). Retiring a key a binding still reads first routes
+  that binding through the RAP-gated fallback; an emptied stage never proves a window it does not hold.
 - **Bounded.**
   - At most one reformat in flight per output: a newer one supersedes it.
-  - It counts against `max_encoders` (`capacity`).
+  - It counts against `max_encoders` and the principal's own budget (`max_per_principal`), exactly
+    like a take (`capacity`, review X1). A landed reformat key stays charged to that principal.
   - Its deadline is 150 ticks (`encoder-not-ready`); a failed or wedged open leaves the output on its
     old format.
 - **Program and every other output are untouched:** no shared key changes and no clock work.
 - **Same gate as a take:** the reset is authorized on the output axis (`authorize_output_end`) and
-  rate-limited with the take limiter (one reset = one take).
+  rate-limited with the take limiter (one reset = one take, charged only when it reaches the engine).
 
 What stays restart-pending, with today's `x-multiview-apply: restart` and why:
 - **A codec change.** A new encoder family cannot splice into an existing TS elementary stream type.
