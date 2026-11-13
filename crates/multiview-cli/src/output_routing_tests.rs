@@ -1518,6 +1518,7 @@ fn the_control_adapter_refuses_audio_takes_on_an_unroutable_output() {
             id: Some("ok".into()),
             settings: 0,
             feed_format: None,
+            base_format: None,
             routable: true,
             program_audio: true,
         },
@@ -1525,6 +1526,7 @@ fn the_control_adapter_refuses_audio_takes_on_an_unroutable_output() {
             id: Some("vaapi".into()),
             settings: 0,
             feed_format: None,
+            base_format: None,
             routable: false,
             program_audio: true,
         },
@@ -1583,6 +1585,7 @@ fn the_control_adapter_maps_renamed_ids_to_their_own_index() {
             id: None,
             settings: 0,
             feed_format: None,
+            base_format: None,
             routable: true,
             program_audio: true,
         },
@@ -1590,6 +1593,7 @@ fn the_control_adapter_maps_renamed_ids_to_their_own_index() {
             id: Some("renamed".into()),
             settings: 0,
             feed_format: None,
+            base_format: None,
             routable: true,
             program_audio: true,
         },
@@ -1597,6 +1601,7 @@ fn the_control_adapter_maps_renamed_ids_to_their_own_index() {
             id: Some("zz-first".into()),
             settings: 0,
             feed_format: None,
+            base_format: None,
             routable: false,
             program_audio: true,
         },
@@ -1975,6 +1980,7 @@ fn the_plan_counts_a_lingering_encoder_as_plus_zero() {
             id: Some("a".into()),
             settings: 0,
             feed_format: None,
+            base_format: None,
             routable: true,
             program_audio: true,
         },
@@ -1982,6 +1988,7 @@ fn the_plan_counts_a_lingering_encoder_as_plus_zero() {
             id: Some("b".into()),
             settings: 0,
             feed_format: None,
+            base_format: None,
             routable: true,
             program_audio: true,
         },
@@ -4127,6 +4134,7 @@ fn the_plan_counts_a_different_format_as_plus_one() {
             id: Some("tall".into()),
             settings: 0,
             feed_format: Some(vertical_format()),
+            base_format: None,
             routable: true,
             program_audio: true,
         },
@@ -4134,6 +4142,7 @@ fn the_plan_counts_a_different_format_as_plus_one() {
             id: Some("wide".into()),
             settings: 0,
             feed_format: None,
+            base_format: None,
             routable: true,
             program_audio: true,
         },
@@ -4196,6 +4205,126 @@ fn format_keyed_feeds_are_bounded_by_the_encoder_cap() {
     // Once the takes settle (refused beyond the cap), only live keys hold feeds.
     assert!(x.r.feed_keys().len() <= MAX, "{:?}", x.r.feed_keys());
     assert_eq!(x.r.dynamic_keys().len(), MAX);
+}
+
+/// #342 B2 (+ review M1/M2/M4): the plan's §12.4 path through the adapter,
+/// decided by the aux thread's own pass-through predicate. Program is P1
+/// (the base key); Clean is P2 on a canvas-sized base key and P3 on a
+/// formatted one; a source or the PVW source whose newest tile passes
+/// through at the output's feed format is P2 — a canvas-sized cover output
+/// included when the tile is canvas-sized — and any other tile is P3 with one
+/// convert; once a (picture, format) key is live a second output at that
+/// format is P1.
+#[test]
+fn plan_slot_reports_the_cheapest_path() {
+    use multiview_control::output_routing::{OutputRouting, PlanPath, RoutedFeed};
+    let mut x = harness_with(4, 6, None, true);
+    // The canvas below is 16x16; harness tiles are 16x16.
+    let canvas_cover = crate::routing_aux::AuxFormat::new(
+        16,
+        16,
+        multiview_config::OutputFit::new(
+            multiview_config::OutputFitMode::Cover,
+            multiview_config::Anchor::Center,
+        ),
+    );
+    x.r.cfg.formats = vec![
+        None,
+        Some(vertical_format()),
+        Some(vertical_format()),
+        Some(canvas_cover),
+    ];
+    let (s1, s2) = (Arc::clone(&x.store), Arc::clone(&x.store2));
+    let stores: crate::routing_aux::StoreLookup = Arc::new(move |id: &str| match id {
+        "cam" => Some(Arc::clone(&s1)),
+        "cam2" => Some(Arc::clone(&s2)),
+        _ => None,
+    });
+    let canvas = crate::routing_aux::AuxCanvas {
+        width: 16,
+        height: 16,
+        color: CanvasColor::default().output_tag(),
+    };
+    let pvw = Arc::new(SwapCell::new(Some(Arc::<str>::from("cam"))));
+    let run = |id: &str, feed_format, base_format| RunOutput {
+        id: Some(id.into()),
+        settings: 0,
+        feed_format,
+        base_format,
+        routable: true,
+        program_audio: true,
+    };
+    let h =
+        x.h.clone()
+            .with_outputs(vec![
+                run("wide", None, None),
+                run("tall", Some(vertical_format()), Some(vertical_format())),
+                run("tall2", Some(vertical_format()), Some(vertical_format())),
+                // Canvas-sized with a cover fit: its base key is the canvas.
+                run("cover", Some(canvas_cover), None),
+            ])
+            .with_pictures(crate::output_routing::PlanPictures {
+                stores,
+                canvas,
+                preview_selection: Some(Arc::clone(&pvw)),
+            });
+    let slot = output_routing_slot();
+    slot.store(Some(Arc::new(h)));
+    let adapter = crate::output_routing_control::OutputRoutingAdapter::new(Arc::clone(&slot));
+    let cam = RoutedFeed::Source("cam".into());
+    let cam2 = RoutedFeed::Source("cam2".into());
+    for t in 0..5 {
+        x.tick(t);
+    }
+    // cam2's newest tile is 8x16: not the canvas size.
+    x.store2.publish(
+        Nv12Image::solid(8, 16, 16, 128, 128, CanvasColor::default().output_tag()).unwrap(),
+        pts(5),
+    );
+    let path = |output: &str, feed: &RoutedFeed| {
+        let p = adapter.plan_slot(output, feed).unwrap();
+        (p.path, p.converts, p.cost.needs_encoder)
+    };
+    assert_eq!(path("wide", &RoutedFeed::Program), (PlanPath::P1, 0, false));
+    assert_eq!(path("wide", &cam), (PlanPath::P2, 0, true));
+    assert_eq!(path("wide", &cam2), (PlanPath::P3, 1, true), "letterboxed");
+    // M4: a canvas-sized cover output. A canvas-sized tile passes through
+    // (any fit of an equal-size picture is the identity), another is P3.
+    assert_eq!(path("cover", &cam), (PlanPath::P2, 0, true));
+    assert_eq!(path("cover", &cam2), (PlanPath::P3, 1, true), "cover crop");
+    // M2: PVW at a matching size is P2 whatever the feed format; at a
+    // non-matching format P3.
+    assert_eq!(path("wide", &RoutedFeed::Preview), (PlanPath::P2, 0, true));
+    assert_eq!(path("cover", &RoutedFeed::Preview), (PlanPath::P2, 0, true));
+    assert_eq!(path("tall", &RoutedFeed::Preview), (PlanPath::P3, 1, true));
+    // Clean: the canvas picture; converted only on a formatted base key.
+    assert_eq!(path("cover", &RoutedFeed::Clean), (PlanPath::P2, 0, true));
+    assert_eq!(path("tall", &RoutedFeed::Clean), (PlanPath::P3, 1, true));
+    // #368 merge: a routed layout is composed at the CANVAS size (never per
+    // output format), so it is P2 exactly where Program/Clean are: a
+    // canvas-sized base key; a formatted base key converts it (P3).
+    let layout = RoutedFeed::Layout("L".into());
+    assert_eq!(path("wide", &layout), (PlanPath::P2, 0, true));
+    assert_eq!(path("cover", &layout), (PlanPath::P2, 0, true));
+    assert_eq!(path("tall", &layout), (PlanPath::P3, 1, true));
+    assert_eq!(path("tall", &cam), (PlanPath::P3, 1, true));
+    // Take `tall` to the source: its (src:cam@format, settings) key goes live.
+    x.h.try_take(take("t", 1, src())).unwrap();
+    let mut now = take_until_applied(&mut x, &["t"], 6);
+    assert_eq!(path("tall2", &cam), (PlanPath::P1, 0, false));
+    // Review M5: the readback agrees with the plan. `tall`, carried by its
+    // live (picture, format, settings) key, reads back P1 (not P3); a second
+    // output taken onto that live key reads back P1 too.
+    assert_eq!(adapter.current_path("tall"), Some(PlanPath::P1));
+    for _ in 0..FORCE_FLOOR_TICKS {
+        x.tick(now);
+        now += 1;
+    }
+    x.h.try_take(take("t2", 2, src())).unwrap();
+    take_until_applied(&mut x, &["t2"], now);
+    assert_eq!(adapter.current_path("tall2"), Some(PlanPath::P1));
+    // An output still on Program reads back P1 (its base key).
+    assert_eq!(adapter.current_path("wide"), Some(PlanPath::P1));
 }
 
 fn layout_bus(id: &str) -> PictureBus {

@@ -2303,6 +2303,72 @@ boot the engine starts from it; `GET /patch` is built from the engine's live rea
 current source, path and state), never from the document. A persisted crosspoint the engine cannot
 honour at boot (source gone, slot removed) starts the slot on its default and raises an alarm.
 
+**As built in slice B (#342, part B2).**
+- **Output slots in `/patch`.** `GET /patch` gains `outputs: [ { output, format, video: [ { slot: 0,
+  live, source, path, pending, degraded } ], audio: [ { slot, track, language, source: "follow" } ] } ]`.
+  - The video slot comes from the engine's live readback (`RoutingLive`, the router snapshot), and
+    the audio slots from the accepted output config (`slots.audio`, else one program slot).
+  - With no readback for the output (no running engine, routing unavailable, or the output not in
+    this run) the slot is `live: false` with `source` and `path` null: its live state is unknown and
+    is never reported as Program (review T-M2). With a readback it is `live: true`.
+  - An output is listed only if the caller passes the output axis that the patch route checks
+    (`ObjectAndOutput` + `authorize_output`). A feed it cannot read is `{redacted: true}`.
+- **Single-output takes.** `POST /patch/plan` and `/patch/take` accept the crosspoints of ONE output:
+  - video slot 0 with `{source}`, `{bus}` or `{layout}` (a stored layout, routable since #368);
+  - optionally audio slot 0 with `"follow"`. Named, it rides the video take exactly as the alias's
+    `audio: "follow"` does (the engine take carries Follow, an explicit audio choice is replaced and
+    the persisted row's audio becomes follow, and the two routes replay each other). Omitted, the
+    output keeps its current audio choice, as the alias without `audio` (review T-M1).
+
+  A layout on video slot 0 behaves as on the alias:
+  - its id AND its whole current source closure are authorized (one generic 403) in the shared
+    authorize step, before any output or feed existence answer, so a denied closure is never a
+    404-vs-403 oracle on the output (review T-A1); a replay re-authorizes the closure;
+  - an unknown layout is `unknown-source` in the plan (422 `unknown-feed` on take);
+  - a layout for another canvas, one that does not solve, or one with a translucent cell is
+    `layout-not-admissible` (a plan refusal, 422 on take);
+  - no free layout canvas is `aux-capacity` (a plan refusal, 409 on take);
+  - a layout is composed at the canvas size, so its path is P2 only on a canvas-sized base key and P3
+    (+1 convert on the key's worker) on a formatted one.
+
+  Other requests are refused:
+  - video slot ≥ 1 → 422 `unknown-slot`;
+  - other audio slots → 422 `slot-medium-mismatch` (they are fixed by config in this slice);
+  - `subtitle` → 422 `slot-medium-mismatch` (#345);
+  - a layout or bus on a mixer input → 422 `unknown-source` (#307).
+
+  A request carries either mixer-input crosspoints or one output's crosspoints. Two outputs, or a
+  mixer input plus an output, → 422 `unknown-slot`: atomic multi-destination sets arrive with patch
+  salvos (slice E, #308).
+- **Plan.** The plan reports the §12.4 path (`P1` when an encoded bus with key (picture, format,
+  settings) is live, with Program at the output's format always its base key; `P2` when the picture
+  is identity at the output's format; else `P3`). It also reports `cost` = { `new_encoders`,
+  `converts`, `sessions_in_use`/`sessions_max` (whole-system principals only), `fits` } and the
+  existing plan refusals.
+- **`/routing/output/take` is the slot-0 alias.** An output take goes through exactly the same
+  machinery as that route:
+  - one shared function (`take_output_slot0`);
+  - the take-scoped idempotency store, under one shared key namespace, so a key replays across both
+    routes;
+  - the same per-output 2/s and per-principal 10/s limits;
+  - the bounded `try_send`, the `route.output` outcome, and persistence on `applied`.
+
+  The patch take answers `202 {operation_id, status: "accepted"}`; the alias keeps its own bodies.
+- **Authorization (review round 1).** Both routes, and `GET /routing`, check the output end with
+  one function, `authorize_output_end` (object AND output axis, `ObjectAndOutput`). This is an
+  intentional change of the slice-1 contract of `/routing/output/take`, which checked the object
+  axis only. A take key is bound to the whole take it was first used for (output, video feed and
+  explicit audio feed), on either route:
+  - the same key with another output, feed or audio is 409 `conflict` and enqueues nothing;
+  - a matching replay is re-authorized under the caller's current grants, so a revoked axis is 403
+    before any operation id or outcome is returned.
+- **Plan identity.** The plan's P2 is the aux thread's own pass-through predicate
+  (`routing_aux::passes_through`), so plan and engine cannot drift. Program and Clean are P2 only on a
+  canvas-sized base key, and so is a routed layout. A source or the PVW source is P2 when its newest tile has the output's
+  size, is opaque and carries the canvas colour; any fit of an equal-size picture is the identity.
+- **Audio slot 0 in `GET /patch`.** It reports the output's accepted audio feed exactly as
+  `GET /routing` projects and redacts it (default `follow`).
+
 ### 12.9 The Routing page (#308)
 
 The Routing page becomes the patch matrix: **Video | Audio | Subtitle** tabs; rows are sources

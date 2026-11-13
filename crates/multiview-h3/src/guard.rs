@@ -63,6 +63,10 @@ pub struct HeaderGuard {
     first_frame: bool,
     /// Frames whose header and payload were fully seen.
     frames_complete: u64,
+    /// The type of the frame whose payload is being skipped.
+    current: u64,
+    /// A HEADERS frame was fully seen.
+    headers_seen: bool,
     done: Option<Verdict>,
 }
 
@@ -78,6 +82,8 @@ impl HeaderGuard {
             skip: 0,
             first_frame: true,
             frames_complete: 0,
+            current: 0,
+            headers_seen: false,
             done: None,
         }
     }
@@ -88,11 +94,26 @@ impl HeaderGuard {
         self.limit
     }
 
-    /// True once the first frame (the request HEADERS) was fully received:
-    /// the per-request header deadline stops applying from then on.
+    /// True once the first frame was fully received (any type).
     #[must_use]
     pub fn first_frame_complete(&self) -> bool {
         self.frames_complete > 0 || self.done == Some(Verdict::WebTransport)
+    }
+
+    /// True once a complete HEADERS frame was received (unknown or grease
+    /// frames before it, which h3 ignores, do not count), or the stream is
+    /// a WebTransport stream: the per-request header deadline stops
+    /// applying from then on (#382).
+    #[must_use]
+    pub fn headers_complete(&self) -> bool {
+        self.headers_seen || self.done == Some(Verdict::WebTransport)
+    }
+
+    fn frame_done(&mut self) {
+        self.frames_complete = self.frames_complete.saturating_add(1);
+        if self.current == FRAME_HEADERS {
+            self.headers_seen = true;
+        }
     }
 
     /// Feeds the next received bytes. Once a verdict other than
@@ -107,7 +128,7 @@ impl HeaderGuard {
                 let step = self.skip.min(available);
                 self.skip -= step;
                 if self.skip == 0 {
-                    self.frames_complete = self.frames_complete.saturating_add(1);
+                    self.frame_done();
                 }
                 let step = usize::try_from(step).unwrap_or(data.len());
                 data = data.get(step..).unwrap_or_default();
@@ -151,8 +172,9 @@ impl HeaderGuard {
                 });
             }
             self.skip = declared;
+            self.current = frame_type;
             if declared == 0 {
-                self.frames_complete = self.frames_complete.saturating_add(1);
+                self.frame_done();
             }
         }
         Verdict::Continue
@@ -372,6 +394,25 @@ mod tests {
             guard.feed(&frame(0x21, 1 << 30)),
             Verdict::Reject { .. }
         ));
+    }
+
+    #[test]
+    fn headers_complete_ignores_grease_and_partial_headers() {
+        // #382 review: a zero-length grease frame before HEADERS completes
+        // a frame but not the HEADERS; the deadline must keep applying.
+        let mut g = HeaderGuard::new(16 * 1024);
+        let mut grease = Vec::new();
+        varint::encode(0x21, &mut grease);
+        varint::encode(0, &mut grease);
+        assert_eq!(g.feed(&grease), Verdict::Continue);
+        assert!(g.first_frame_complete());
+        assert!(!g.headers_complete());
+        let mut headers = frame(FRAME_HEADERS, 4);
+        headers.extend([0u8; 4]);
+        assert_eq!(g.feed(&headers[..headers.len() - 2]), Verdict::Continue);
+        assert!(!g.headers_complete(), "partial HEADERS");
+        assert_eq!(g.feed(&headers[headers.len() - 2..]), Verdict::Continue);
+        assert!(g.headers_complete());
     }
 
     #[test]

@@ -479,6 +479,13 @@ rate) — the cross-vendor consensus shape, recorded as de-facto industry practi
 Full decision record: [ADR-0056](../decisions/ADR-0056.md). Color kernels:
 [ADR-C007](../decisions/ADR-C007.md).
 
+> **Build design (2026-11-13):** the keyers are designed for the as-built Program drive in
+> [ADR-0113](../decisions/ADR-0113-keyers-on-the-program-drive.md) and the design note
+> [switcher-keyers.md](../architecture/switcher-keyers.md) (render list, cost, admission, API,
+> desk, tally, slices K1–K7). Where this section and ADR-0113 differ, ADR-0113 wins: the flying
+> box is a placement of any keyer, shaped fills are refused for now, and the composition source
+> (§6.5) is out of scope.
+
 ### 6.1 Model
 
 - **Upstream keyers (USKs):** M/E-scoped scene layers; participate in next-transition

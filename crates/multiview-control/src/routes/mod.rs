@@ -45,6 +45,8 @@ pub mod output_routing;
 pub mod outputs;
 pub mod overlays;
 pub mod patch;
+/// Output slots in the patch panel (#342 B2).
+pub(crate) mod patch_output;
 pub mod preview;
 pub mod probes;
 pub mod routing;
