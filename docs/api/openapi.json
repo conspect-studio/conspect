@@ -7908,6 +7908,16 @@
                 }
               }
             }
+          },
+          "503": {
+            "description": "engine-busy: every layout-read slot is in use (a layout on air on a visible output); retry",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
           }
         }
       }
