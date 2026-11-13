@@ -27,13 +27,14 @@ import type { components } from './types';
 /**
  * One live cast session as the control plane returns it. The optional fields
  * past the generated doc are the receiver-state additions of the cast2 lane
- * (`feed`, `player_state`, `idle_reason`, `last_report`); a server without
- * them simply omits them, and `media_url` is redacted or absent for a token
- * stream.
+ * (`stream_id`, `player_state`, `idle_reason`, `last_report`, as
+ * `routes/cast_sessions.rs` serializes them; drop them here once
+ * `docs/api/openapi.json` carries them). `media_url` is redacted
+ * (`…/cast/<redacted>/master.m3u8`) for a token stream; tolerate its absence.
  */
 export type CastSession = Omit<components['schemas']['CastSessionDoc'], 'media_url'> & {
   readonly media_url?: string | null;
-  readonly feed?: unknown;
+  readonly stream_id?: string | null;
   readonly player_state?: string | null;
   readonly idle_reason?: string | null;
   readonly last_report?: { readonly received_unix_ms: number; readonly report: unknown } | null;
