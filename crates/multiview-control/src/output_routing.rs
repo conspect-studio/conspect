@@ -233,6 +233,13 @@ pub trait OutputRouting: Send + Sync {
     fn snapshot(&self) -> Option<RoutingLive>;
     /// The outcome stream; `Some` exactly once.
     fn subscribe_outcomes(&self) -> Option<std::sync::mpsc::Receiver<OutputOutcome>>;
+    /// The §12.4 path the output's video slot 0 is carried on now (#342 B2:
+    /// Program at the output's format is its base key, P1; a routed picture
+    /// identity at the output's format P2; else P3). `None` when unknown.
+    fn current_path(&self, _output: &str) -> Option<PlanPath> {
+        None
+    }
+
     /// Plan a crosspoint onto the output's video slot 0 with its §12.4 path
     /// (#342 B2). The default derives it from [`Self::plan`] alone: P1 when
     /// no encoder is needed, else P3 (an implementor that cannot tell an

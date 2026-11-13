@@ -57,6 +57,43 @@ fn picture_bus(feed: &RoutedFeed) -> PictureBus {
     }
 }
 
+/// Whether `feed` is identity at `run_output`'s format (§12.4 P2): Program
+/// (its base key is at the format); Clean at a canvas-sized output; Preview
+/// not composed at an output format; a source whose newest tile has the
+/// output's size, no alpha and the canvas colour. Wait-free.
+fn is_identity(
+    handle: &OutputRoutingHandle,
+    run_output: &crate::output_routing::RunOutput,
+    feed: &RoutedFeed,
+) -> bool {
+    match feed {
+        RoutedFeed::Program => true,
+        // Clean is the canvas picture: identity whenever the output is
+        // canvas-sized (its key converts only at another size).
+        RoutedFeed::Clean => handle.pictures().is_none_or(|(_, canvas)| {
+            run_output
+                .feed_format
+                .is_none_or(|f| f.width == canvas.width && f.height == canvas.height)
+        }),
+        // Preview is composed from the PVW source tile: identity only when it
+        // is not composed at an output format.
+        RoutedFeed::Preview => run_output.feed_format.is_none(),
+        RoutedFeed::Source(id) => handle.pictures().is_some_and(|(stores, canvas)| {
+            let (w, h) = run_output
+                .feed_format
+                .map_or((canvas.width, canvas.height), |f| (f.width, f.height));
+            stores(id)
+                .and_then(|store| store.slot().load())
+                .is_some_and(|tile| {
+                    tile.width() == w
+                        && tile.height() == h
+                        && tile.alpha_plane().is_none()
+                        && tile.color() == canvas.color
+                })
+        }),
+    }
+}
+
 /// Outcomes buffered between the engine and the control relay.
 const RELAY_CAPACITY: usize = 64;
 
@@ -216,32 +253,7 @@ impl OutputRouting for OutputRoutingAdapter {
                 converts: 0,
             });
         }
-        let identity = match feed {
-            RoutedFeed::Program => true,
-            // Clean is the canvas picture: identity whenever the output is
-            // canvas-sized (its key converts only at another size).
-            RoutedFeed::Clean => handle.pictures().is_none_or(|(_, canvas)| {
-                run_output
-                    .feed_format
-                    .is_none_or(|f| f.width == canvas.width && f.height == canvas.height)
-            }),
-            // Preview is composed from the PVW source tile: identity only
-            // when it is not composed at an output format.
-            RoutedFeed::Preview => run_output.feed_format.is_none(),
-            RoutedFeed::Source(id) => handle.pictures().is_some_and(|(stores, canvas)| {
-                let (w, h) = run_output
-                    .feed_format
-                    .map_or((canvas.width, canvas.height), |f| (f.width, f.height));
-                stores(id)
-                    .and_then(|store| store.slot().load())
-                    .is_some_and(|tile| {
-                        tile.width() == w
-                            && tile.height() == h
-                            && tile.alpha_plane().is_none()
-                            && tile.color() == canvas.color
-                    })
-            }),
-        };
+        let identity = is_identity(&handle, &run_output, feed);
         if identity {
             return Ok(SlotPlan {
                 path: PlanPath::P2,
@@ -257,6 +269,21 @@ impl OutputRouting for OutputRoutingAdapter {
             path: PlanPath::P3,
             cost,
             converts: u8::from(!feed_live),
+        })
+    }
+
+    fn current_path(&self, output: &str) -> Option<PlanPath> {
+        let handle = self.handle()?;
+        let index = handle.index_of(output)?;
+        let run_output = handle.outputs().get(index)?.clone();
+        let snapshot = handle.snapshot();
+        let feed = RoutedFeed::from_bus_name(&snapshot.outputs.get(index)?.bus)?;
+        Some(if feed == RoutedFeed::Program {
+            PlanPath::P1
+        } else if is_identity(&handle, &run_output, &feed) {
+            PlanPath::P2
+        } else {
+            PlanPath::P3
         })
     }
 

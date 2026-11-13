@@ -14,9 +14,15 @@
 //! leases released). The outcome rides the existing `switcher.operation`
 //! event; an applied patch is persisted by [`crate::patch`].
 //!
-//! This slice accepts only `plane = "video"` crosspoints onto mixer inputs
-//! with a configured source or `"none"`; output slots, audio/subtitle planes,
-//! layouts and buses arrive in later slices and are refused with a typed 422.
+//! Mixer inputs take `plane = "video"` crosspoints with a configured source
+//! or `"none"` (slice A). Output slots (#342 B2): a request carries EITHER
+//! mixer crosspoints OR the crosspoints of ONE output — its video slot 0
+//! (`{source}` or `{bus}`) and optionally audio slot 0 `"follow"` (which
+//! rides the video take). An output take goes through exactly the machinery
+//! of `POST /routing/output/take` (that route is the slot-0 alias): the take
+//! store's replay, the per-output and per-principal limits, the bounded
+//! `try_send`, the `route.output` outcome and persistence on `applied`.
+//! Atomic multi-destination sets arrive with patch salvos (#308).
 
 use std::time::Instant;
 
@@ -39,6 +45,12 @@ use crate::error::{ControlError, ControlResult};
 use crate::problem::Problem;
 use crate::state::AppState;
 
+/// The refusal of a request mixing destinations (two outputs, or mixer +
+/// output).
+pub(crate) const MULTI_DESTINATION: &str =
+    "multi-destination patch sets arrive with patch salvos (#308); one request patches mixer \
+     inputs or the slots of one output";
+
 /// The first slice's one M/E and its program.
 const ME: &str = "me1";
 const PROGRAM: &str = "main";
@@ -55,10 +67,10 @@ pub struct PatchDestination {
     /// Mixer input number, 1..=64.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub input: Option<u16>,
-    /// Output id (output slots arrive in a later slice; refused here).
+    /// Output API id (an output slot destination, with `slot`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub output: Option<String>,
-    /// Output slot index (later slice).
+    /// Output slot index: video and audio slot 0 in this release.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub slot: Option<u32>,
 }
@@ -113,16 +125,39 @@ pub struct PatchRefusal {
     pub detail: String,
 }
 
+/// The cost of an output-slot crosspoint (§12.4, §12.10).
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+pub struct SlotCost {
+    /// `0` (P1: an encoded bus already carries it) or `1`.
+    pub new_encoders: u8,
+    /// `1` when a P3 needs a convert whose (picture, format) feed is not
+    /// live yet, else `0`.
+    pub converts: u8,
+    /// Live-opened encoder sessions in use (whole-system principals only).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sessions_in_use: Option<usize>,
+    /// The session limit (whole-system principals only).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sessions_max: Option<usize>,
+    /// Whether the take fits the encoder budget now.
+    pub fits: bool,
+}
+
 /// One planned crosspoint.
 #[derive(Debug, Clone, Serialize)]
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 pub struct PlannedCrosspoint {
     /// The destination as requested.
     pub destination: PatchDestination,
-    /// The path this crosspoint takes (`mixer-input`).
+    /// The path this crosspoint takes: `mixer-input`, `P1`, `P2`, `P3`
+    /// (§12.4), or `follow` (an audio slot riding the video take).
     pub path: &'static str,
-    /// Whether the destination input is on Program now.
+    /// Whether the destination input is on Program now (mixer inputs).
     pub on_air: bool,
+    /// The cost of an output video slot (absent for mixer inputs and audio).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cost: Option<SlotCost>,
     /// `null` when the crosspoint can be taken.
     pub refusal: Option<PatchRefusal>,
 }
@@ -149,7 +184,7 @@ pub struct PatchAccepted {
     pub status: &'static str,
 }
 
-fn problem(status: u16, kind: &str, detail: impl Into<String>) -> Response {
+pub(crate) fn problem(status: u16, kind: &str, detail: impl Into<String>) -> Response {
     Problem::new(status, kind, "Patch refused")
         .with_detail(detail)
         .into_response()
@@ -228,11 +263,7 @@ fn shape(req: &PatchRequest) -> Result<Vec<Member>, Box<Response>> {
         }
         let destination = &xp.destination;
         if destination.output.is_some() || destination.slot.is_some() {
-            return Err(Box::new(problem(
-                422,
-                "unknown-slot",
-                "output slots arrive in a later slice; this release patches mixer inputs only",
-            )));
+            return Err(Box::new(problem(422, "unknown-slot", MULTI_DESTINATION)));
         }
         let (Some(_), Some(input)) = (&destination.mixer, destination.input) else {
             return Err(Box::new(problem(
@@ -375,6 +406,7 @@ fn check(
             destination: xp.destination.clone(),
             path: "mixer-input",
             on_air: on_program,
+            cost: None,
             refusal,
         });
     }
@@ -446,7 +478,12 @@ pub(crate) async fn get_patch(
             }));
         }
     }
-    Ok((StatusCode::OK, Json(json!({ "mixer": mixer }))).into_response())
+    let outputs = super::patch_output::outputs_view(&state, &principal)?;
+    Ok((
+        StatusCode::OK,
+        Json(json!({ "mixer": mixer, "outputs": outputs })),
+    )
+        .into_response())
 }
 
 /// Plan 1..64 mixer crosspoints: path, on-air flag and refusals; no change.
@@ -465,6 +502,18 @@ pub(crate) async fn plan_patch(
     principal.role.require(Action::Write)?;
     validate_count(&req)?;
     authorize(&principal, &req)?;
+    if super::patch_output::has_output(&req) {
+        let patch = match super::patch_output::shape(&req) {
+            Ok(patch) => patch,
+            Err(response) => return Ok(*response),
+        };
+        return Ok(
+            match super::patch_output::plan(&state, &principal, &req, &patch)? {
+                Ok(plan) => (StatusCode::OK, Json(plan)).into_response(),
+                Err(response) => response,
+            },
+        );
+    }
     let (handle, inputs) = match engine_with_inputs(&state) {
         Ok(found) => found,
         Err(response) => return Ok(*response),
@@ -499,6 +548,18 @@ pub(crate) async fn take_patch(
     principal.role.require(Action::Write)?;
     validate_count(&req)?;
     authorize(&principal, &req)?;
+    if super::patch_output::has_output(&req) {
+        let patch = match super::patch_output::shape(&req) {
+            Ok(patch) => patch,
+            Err(response) => return Ok(*response),
+        };
+        return Ok(
+            match super::patch_output::take(&state, &principal, &idem, &patch)? {
+                Ok(op) => accepted(op),
+                Err(response) => response,
+            },
+        );
+    }
     let (handle, inputs) = match engine_with_inputs(&state) {
         Ok(found) => found,
         Err(response) => return Ok(*response),

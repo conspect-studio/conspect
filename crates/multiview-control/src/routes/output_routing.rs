@@ -158,7 +158,7 @@ pub struct OutputTakeAccepted {
 
 /// Operator text of a capacity refusal (§6.3): counts only for whole-system
 /// principals; never names a group or a shared encoder.
-fn capacity_text(principal: &Principal, in_use: usize, max: usize) -> String {
+pub(crate) fn capacity_text(principal: &Principal, in_use: usize, max: usize) -> String {
     if principal.is_global() {
         format!(
             "This output needs its own encoder and the GPU has no free encoder session ({in_use} of {max} in use)"
@@ -187,7 +187,7 @@ fn authorize_ends(principal: &Principal, req: &OutputRouteRequest) -> ControlRes
     Ok(())
 }
 
-fn routing_unavailable() -> Response {
+pub(crate) fn routing_unavailable() -> Response {
     Problem::new(409, "routing-unavailable", "Output routing unavailable")
         .with_detail("this run does not route output feeds")
         .into_response()
@@ -200,7 +200,7 @@ fn refusal_problem(status: u16, kind: &str, detail: String) -> Response {
 }
 
 /// Resolve the request's output API id to its config id (`None` = unknown).
-fn config_id_of(state: &AppState, api_id: &str) -> ControlResult<Option<String>> {
+pub(crate) fn config_id_of(state: &AppState, api_id: &str) -> ControlResult<Option<String>> {
     let resources = crate::boot_model::accepted_resources(state, "outputs")?
         .map_or_else(|| state.outputs.list(), Ok)?;
     for versioned in resources {
@@ -214,7 +214,7 @@ fn config_id_of(state: &AppState, api_id: &str) -> ControlResult<Option<String>>
 }
 
 /// Whether `id` is a source the accepted document declares.
-fn source_exists(state: &AppState, id: &str) -> ControlResult<bool> {
+pub(crate) fn source_exists(state: &AppState, id: &str) -> ControlResult<bool> {
     let config: multiview_config::MultiviewConfig =
         serde_json::from_value(crate::boot_model::current_desired_config(state)?)
             .map_err(|e| ControlError::Repository(format!("desired configuration: {e}")))?;
@@ -223,7 +223,10 @@ fn source_exists(state: &AppState, id: &str) -> ControlResult<bool> {
 
 /// The feed as a routed feed (Program, Preview, Clean or a source), after existence checks: `Err` is the
 /// typed refusal response (`unknown-feed`, `output-kind-unroutable`).
-fn resolve_feed(state: &AppState, feed: &VideoFeed) -> ControlResult<Result<RoutedFeed, Response>> {
+pub(crate) fn resolve_feed(
+    state: &AppState,
+    feed: &VideoFeed,
+) -> ControlResult<Result<RoutedFeed, Response>> {
     let Some(routed) = RoutedFeed::of(feed) else {
         return Ok(Err(refusal_problem(
             422,
@@ -412,48 +415,93 @@ pub(crate) async fn take_output(
 ) -> ControlResult<Response> {
     principal.role.require(Action::Write)?;
     authorize_ends(&principal, &req)?;
+    let feed = req.feed.clone();
+    let output = req.output().to_owned();
+    let accepted_take = match take_output_slot0(&state, &principal, &idem, &output, &feed)? {
+        SlotTake::Accepted(op) => op,
+        SlotTake::Replay(replay) => return Ok(replayed(replay)),
+        SlotTake::Refused(response) => return Ok(response),
+    };
+    Ok(accepted(OutputTakeAccepted {
+        operation_id: accepted_take,
+        status: "accepted".to_owned(),
+        adopt: Some("next_tick".to_owned()),
+        outcome: None,
+        tick: None,
+    }))
+}
+
+/// What [`take_output_slot0`] did with a take.
+pub(crate) enum SlotTake {
+    /// Enqueued under this operation id.
+    Accepted(String),
+    /// The key already names a take: answer it, never enqueue again.
+    Replay(TakeReplay),
+    /// A typed refusal response (409/422/429/503...).
+    Refused(Response),
+}
+
+/// Take `feed` onto output `output`'s video slot 0 — the ONE take machinery
+/// behind `POST /routing/output/take` and an output crosspoint of
+/// `POST /patch/take` (#342 B2): the take store's replay, the per-output and
+/// per-principal limits, existence, the plan gate, the reservation, the
+/// bounded `try_send` and the audit. The caller has checked the role and
+/// authorized both ends.
+///
+/// # Errors
+/// Repository errors, `NotFound` for an unknown output, a missing key, or
+/// `idempotency-capacity`.
+pub(crate) fn take_output_slot0(
+    state: &AppState,
+    principal: &Principal,
+    idem: &IdempotencyKey,
+    output: &str,
+    video: &VideoFeed,
+) -> ControlResult<SlotTake> {
     let Some(control) = state.output_routing.clone() else {
-        return Ok(routing_unavailable());
+        return Ok(SlotTake::Refused(routing_unavailable()));
     };
     let Some(key) = idem.0.as_deref() else {
         return Err(ControlError::Validation(
             "Idempotency-Key is required".into(),
         ));
     };
+    let key = slot0_take_key(key);
     // A replay answers from the take's own record without re-running
-    // anything. `key` is already scoped by principal, method and path.
-    if let Some(replay) = control.replay(key) {
-        return Ok(replayed(replay));
+    // anything. `key` is already scoped by principal and the shared
+    // slot-0 take namespace.
+    if let Some(replay) = control.replay(&key) {
+        return Ok(SlotTake::Replay(replay));
     }
-    let Some(config_id) = config_id_of(&state, req.output())? else {
+    let Some(config_id) = config_id_of(state, output)? else {
         return Err(ControlError::NotFound {
             kind: "output",
-            id: req.output().to_owned(),
+            id: output.to_owned(),
         });
     };
     // Limits key on existing outputs only, so unknown ids cannot churn the map.
     if let Err(retry) = control
         .limiter
-        .admit(req.output(), &principal.key_id, Instant::now())
+        .admit(output, &principal.key_id, Instant::now())
     {
-        return Ok(too_many(retry));
+        return Ok(SlotTake::Refused(too_many(retry)));
     }
-    let feed = match resolve_feed(&state, &req.feed)? {
+    let feed = match resolve_feed(state, video)? {
         Ok(feed) => feed,
-        Err(response) => return Ok(response),
+        Err(response) => return Ok(SlotTake::Refused(response)),
     };
-    if let Some(refused) = plan_gate(&control, &principal, &config_id, &feed) {
-        return Ok(refused);
+    if let Some(refused) = plan_gate(&control, principal, &config_id, &feed) {
+        return Ok(SlotTake::Refused(refused));
     }
     // The record exists before the enqueue, so an outcome never beats it.
     let pending = PendingTake {
-        api_id: req.output().to_owned(),
+        api_id: output.to_owned(),
         feed: feed.clone(),
     };
-    let op = match control.reserve_take(key, pending) {
+    let op = match control.reserve_take(&key, pending) {
         TakeReservation::Capacity => return Err(ControlError::IdempotencyCapacity),
         // Lost a race with a concurrent request bearing the same key.
-        TakeReservation::Replay(replay) => return Ok(replayed(replay)),
+        TakeReservation::Replay(replay) => return Ok(SlotTake::Replay(replay)),
         TakeReservation::Fresh(op) => op,
     };
     let take = OutputTakeRequest {
@@ -464,28 +512,45 @@ pub(crate) async fn take_output(
     };
     if let Err(error) = control.routing.try_take(take) {
         // Only this take's own failed enqueue frees its key.
-        control.release_take(key, &op);
-        return Ok(match error {
+        control.release_take(&key, &op);
+        return Ok(SlotTake::Refused(match error {
             TakeSubmitError::Busy => ControlError::EngineBusy.into_response(),
             TakeSubmitError::Unroutable => unroutable_kind(),
-        });
+        }));
     }
     state.audit(
         &principal.key_id,
         crate::audit::AuditAction::Command,
         "output",
-        req.output(),
+        output,
         Some(serde_json::json!({
             "command": "route_output_take",
             "feed": feed.bus_name(),
             "operation_id": op.to_string(),
         })),
     );
-    Ok(accepted(OutputTakeAccepted {
-        operation_id: op.to_string(),
-        status: "accepted".to_owned(),
-        adopt: Some("next_tick".to_owned()),
-        outcome: None,
-        tick: None,
-    }))
+    Ok(SlotTake::Accepted(op.to_string()))
+}
+
+/// The take-store key of a slot-0 take: the scoped `Idempotency-Key` with
+/// its request path replaced by one shared namespace, so `/routing/output/take`
+/// and an output crosspoint of `/patch/take` replay each other (the alias,
+/// #342 B2). The principal and raw key stay in the scope; only the path is
+/// unified.
+#[must_use]
+pub(crate) fn slot0_take_key(scoped: &str) -> String {
+    const ALIASES: [&str; 2] = ["/routing/output/take", "/patch/take"];
+    for path in ALIASES {
+        let needle = format!(":{}:{path}:", path.len());
+        if let Some(at) = scoped.find(&needle) {
+            let shared = "output-slot0-take";
+            return format!(
+                "{}:{}:{shared}:{}",
+                &scoped[..at],
+                shared.len(),
+                &scoped[at + needle.len()..]
+            );
+        }
+    }
+    scoped.to_owned()
 }
