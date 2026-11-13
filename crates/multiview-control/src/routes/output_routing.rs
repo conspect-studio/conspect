@@ -437,6 +437,20 @@ fn resolve_layout(
         }
         Err(other) => return Err(other),
     };
+    // The closure is authorized BEFORE any parse/solve/canvas answer, so no
+    // 422 detail reaches a principal who may not read every bound source.
+    // A body that does not parse fails closed with the same generic 403.
+    let Ok(document) = multiview_config::LayoutDocument::from_body(&versioned.layout.body) else {
+        return Err(closure_forbidden());
+    };
+    let readable = document
+        .cells
+        .iter()
+        .filter_map(|cell| cell.source.input_id.as_deref())
+        .all(|source| crate::auth::authorize_object(principal, source).is_ok());
+    if !readable {
+        return Err(closure_forbidden());
+    }
     let resolved = match crate::command::resolve_layout_document(
         id,
         &versioned.layout.body,
@@ -480,10 +494,12 @@ pub(crate) fn authorize_layout_sources(
     if readable {
         Ok(())
     } else {
-        Err(ControlError::Forbidden(
-            "not authorized for every source this layout shows".to_owned(),
-        ))
+        Err(closure_forbidden())
     }
+}
+
+fn closure_forbidden() -> ControlError {
+    ControlError::Forbidden("not authorized for every source this layout shows".to_owned())
 }
 
 /// The video feed as a routed feed (and, for a layout, its resolved body),

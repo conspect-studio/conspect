@@ -126,7 +126,7 @@ fn keys() -> ApiKeyStore {
     keys.register(
         "route-layout",
         "route-layout-secret",
-        scoped("route-layout", &["output-1", "NewsOne", "a"], None),
+        scoped("route-layout", &["output-1", "NewsOne", "Wide", "a"], None),
     );
     keys.register(
         "route-other",
@@ -1685,6 +1685,25 @@ async fn a_stored_layout_routes_to_an_output_with_typed_refusals() {
     .await;
     assert_eq!(resp.status(), StatusCode::FORBIDDEN);
     assert!(rig.fake.takes().is_empty(), "nothing enqueued");
+    // Round 2: the closure is checked before the canvas gate, so a layout
+    // authored for another canvas answers the same 403, never the 422 that
+    // would disclose the running canvas.
+    let resp = send(
+        &rig.router,
+        post(
+            "/api/v1/routing/plan",
+            "route-layout.route-layout-secret",
+            None,
+            &body("output-1", serde_json::json!({"layout": "Wide"})),
+        ),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    let problem = body_json(resp).await.to_string();
+    assert!(
+        !problem.contains("640") && !problem.contains("1280"),
+        "{problem}"
+    );
     // The take carries the resolved body.
     let resp = send(
         &rig.router,
