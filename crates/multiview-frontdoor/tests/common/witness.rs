@@ -331,6 +331,34 @@ pub fn report(name: &str, r: &ClockRun) {
 /// [`WITNESS_RELIABLE`]) zero unexplained repeats. Absolute, never relative to
 /// another arm.
 pub fn assert_cadence(name: &str, r: &ClockRun) {
+    assert_shape(name, r);
+    let c = classify(r);
+    if !WITNESS_RELIABLE {
+        eprintln!(
+            "{name}: {} repeats not judged (the stall witness is unreliable on this platform; \
+             see WITNESS_RELIABLE)",
+            c.needing_explanation
+        );
+        return;
+    }
+    assert!(
+        c.unexplained.is_empty(),
+        "{name}: {} repeats/slips not explained by a whole-process stall: {:?} (gaps {:?})",
+        c.unexplained.len(),
+        c.unexplained,
+        r.gaps
+    );
+}
+
+/// Unexplained repeats (ticks behind the witness cannot attribute to a
+/// whole-process stall), or `None` where the witness is unreliable.
+pub fn unexplained_repeats(r: &ClockRun) -> Option<usize> {
+    WITNESS_RELIABLE.then(|| classify(r).unexplained.len())
+}
+
+/// What the design guarantees on any host, whatever the load: one frame per
+/// tick, consecutive indices, every PTS exactly `from_tick(index)`.
+pub fn assert_shape(name: &str, r: &ClockRun) {
     let ticks = r.ticks.len() as u64;
     assert!(
         ticks + 2 >= r.expected && ticks <= r.expected + 2,
@@ -352,22 +380,6 @@ pub fn assert_cadence(name: &str, r: &ClockRun) {
             t.index
         );
     }
-    let c = classify(r);
-    if !WITNESS_RELIABLE {
-        eprintln!(
-            "{name}: {} repeats not judged (the stall witness is unreliable on this platform; \
-             see WITNESS_RELIABLE)",
-            c.needing_explanation
-        );
-        return;
-    }
-    assert!(
-        c.unexplained.is_empty(),
-        "{name}: {} repeats/slips not explained by a whole-process stall: {:?} (gaps {:?})",
-        c.unexplained.len(),
-        c.unexplained,
-        r.gaps
-    );
 }
 
 /// The assertion #321 retired: "no tick ever repeated". It attributes host
