@@ -22,7 +22,9 @@ use multiview_control::source_demand::{SwitcherPreviewLease, SwitcherPreviewLeas
 use multiview_control::SharedSourceDemand;
 use multiview_core::switcher::SourceRef;
 use multiview_engine::switcher::SwitcherState;
+use multiview_config::MixEffectsConfig;
 use multiview_engine::switcher_control::{ScenePair, SwitcherControl};
+use multiview_engine::switcher_inputs::MixerInputs;
 
 use crate::pipeline::{Pipeline, PipelineError};
 use crate::preview::ProgramSlot;
@@ -51,6 +53,25 @@ pub struct FirstSliceSwitcher {
     pub boot_warning: Option<String>,
 }
 
+/// Build the engine's mixer-input table from the M/E declaration, or `None`
+/// when the M/E declares no inputs (today's source-select behaviour).
+///
+/// # Errors
+/// A table the engine cannot hold (a validated document never produces one).
+pub fn mixer_inputs(me: &MixEffectsConfig) -> Result<Option<MixerInputs>, String> {
+    if me.inputs.is_empty() {
+        return Ok(None);
+    }
+    MixerInputs::new(me.inputs.iter().map(|input| {
+        (
+            input.number,
+            input.label.clone(),
+            input.source().map(SourceRef::new),
+        )
+    }))
+    .map(Some)
+}
+
 /// Attach the declared first-slice M/E, if this document declares one.
 ///
 /// `demand` is this run's control-plane demand provider (the same one the
@@ -73,13 +94,26 @@ pub fn attach_first_slice(
         return Ok(None);
     };
     let preview_slot = crate::preview::program_slot();
-    let (control, mut driver) = SwitcherControl::new(SwitcherState::new(
-        SourceRef::new(&me.program_source),
-        SourceRef::new(&me.preview_source),
-        vec![],
-    ));
+    let inputs = mixer_inputs(&me).map_err(PipelineError::Engine)?;
+    let (program, preview) = match (&inputs, me.program_input, me.preview_input) {
+        // Numbered inputs (ADR-0110 §12.2): the machine selects input refs.
+        (Some(_), Some(program), Some(preview)) => {
+            (SourceRef::input(program), SourceRef::input(preview))
+        }
+        _ => (
+            SourceRef::new(&me.program_source),
+            SourceRef::new(&me.preview_source),
+        ),
+    };
+    let (control, mut driver) = SwitcherControl::new(SwitcherState::new(program, preview, vec![]));
     // Shares the already-allocated stores; the driver only samples `is_primed`.
     driver.set_prime_stores(pipeline.preview_stores());
+    if let Some(inputs) = inputs {
+        // Installed before the clock starts; validation guaranteed that the
+        // starting inputs are patched to program_source/preview_source, so the
+        // boot lease and the scene pair below name the resolved sources.
+        driver.set_inputs(inputs);
+    }
     control
         .set_scenes(ScenePair {
             version: FIRST_SLICE_SCENE_VERSION,
@@ -114,4 +148,54 @@ pub fn attach_first_slice(
         program: me.program.clone(),
         boot_warning,
     }))
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod tests {
+    use super::*;
+
+    /// #341 restart truth: a persisted document (round-tripped through TOML,
+    /// as the accepted state is) boots the engine with the same patch.
+    #[test]
+    fn a_persisted_input_table_boots_the_engine_with_the_same_patch() {
+        let text = r#"
+id = "me1"
+program = "main"
+program_source = "vt1"
+preview_source = "abc-news"
+program_input = 2
+preview_input = 1
+[[inputs]]
+number = 1
+label = "Source 1"
+video = { source = "abc-news" }
+[[inputs]]
+number = 2
+video = { source = "vt1" }
+[[inputs]]
+number = 5
+"#;
+        let me: MixEffectsConfig = toml::from_str(text).unwrap();
+        let me: MixEffectsConfig = toml::from_str(&toml::to_string(&me).unwrap()).unwrap();
+        let table = mixer_inputs(&me).unwrap().expect("inputs declared");
+        let readback = table.readback(0, 0);
+        let rows: Vec<_> = readback
+            .inputs
+            .iter()
+            .map(|i| (i.number, i.source.as_ref().map(|s| s.as_str().to_owned())))
+            .collect();
+        assert_eq!(
+            rows,
+            vec![
+                (1, Some("abc-news".to_owned())),
+                (2, Some("vt1".to_owned())),
+                (5, None),
+            ]
+        );
+        assert_eq!(table.resolve(&SourceRef::input(2)).as_str(), "vt1");
+        let mut legacy = me;
+        legacy.inputs.clear();
+        assert!(mixer_inputs(&legacy).unwrap().is_none());
+    }
 }
