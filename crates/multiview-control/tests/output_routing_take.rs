@@ -1614,6 +1614,80 @@ fn concurrent_reservations_of_one_key_with_two_takes_never_share_an_operation() 
     }
 }
 
+struct FakeFrontDoor;
+impl multiview_control::frontdoor_metrics::FrontDoorMetricsSource for FakeFrontDoor {
+    fn read(&self) -> Option<multiview_control::frontdoor_metrics::FrontDoorMetricsReport> {
+        Some(
+            multiview_control::frontdoor_metrics::FrontDoorMetricsReport {
+                received: 42,
+                to_quic: 10,
+                to_rtc: 5,
+                dropped_classify: 0,
+                dropped_per_source: 0,
+                dropped_global: 0,
+                dropped_vn: 0,
+                dropped_initial: 0,
+                dropped_queue_full: 0,
+                dropped_no_consumer: 0,
+                recv_errors: 0,
+                tracked_sources: 2,
+                received_established_socket: 7,
+                received_listener_socket: 35,
+                steered_unverified: 0,
+                steering_overflow: 0,
+                steering_updates: 1,
+                steering_update_errors: 0,
+                steered_peers: 3,
+                kernel_drops_listener: 0,
+                kernel_drops_established: 0,
+                dropped_stun_per_source: 0,
+                dropped_stun_global: 0,
+                dropped_established_peer: 0,
+                quic_retries: 4,
+                udp443_steering: multiview_control::system::Udp443Steering::ReuseportCbpf,
+                nft_floor: multiview_control::system::NftFloorStatus::Present,
+            },
+        )
+    }
+}
+
+#[tokio::test]
+async fn frontdoor_metrics_are_whole_system_only_and_404_without_a_source() {
+    let dir = tempfile::tempdir().unwrap();
+    let plain = rig(&dir.path().join("boot.toml"), false);
+    let resp = send(
+        &plain.router,
+        get("/api/v1/metrics/frontdoor", OPERATOR_TOKEN),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    let state = plain
+        .state
+        .clone()
+        .with_frontdoor_metrics(Arc::new(FakeFrontDoor));
+    let router = multiview_control::router(state);
+    let resp = send(
+        &router,
+        get("/api/v1/metrics/frontdoor", SCOPED_ROUTER_TOKEN),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    let anonymous = Request::builder()
+        .uri("/api/v1/metrics/frontdoor")
+        .body(Body::empty())
+        .unwrap();
+    assert_eq!(
+        send(&router, anonymous).await.status(),
+        StatusCode::UNAUTHORIZED
+    );
+    let body = body_json(send(&router, get("/api/v1/metrics/frontdoor", VIEWER_TOKEN)).await).await;
+    assert_eq!(body["received"], 42);
+    assert_eq!(body["to_quic"], 10);
+    assert_eq!(body["quic_retries"], 4);
+    assert_eq!(body["udp443_steering"], "reuseport_cbpf");
+    assert_eq!(body["nft_floor"], "present");
+}
+
 /// Store a layout in the accepted library (the boot model) and the projection.
 fn store_layout(rig: &Rig, id: &str, body: serde_json::Value) {
     rig.state

@@ -95,7 +95,9 @@ What it does, in order (the script header has the detail):
    `[::1]:8080` listener plain HTTP (`[control.tls]` would switch that one to TLS too).
 3. Keeps rollback copies (`desired.json.pre-cutover`, `conspect.toml.pre-cutover`,
    `nginx-T.pre-cutover.txt` in `~/mv`), installs `/etc/systemd/system/conspect.socket` and
-   `/etc/systemd/system/conspect.service.d/10-socket-activation.conf`, then:
+   `/etc/systemd/system/conspect.service.d/10-socket-activation.conf` and
+   `/etc/systemd/system/conspect.service.d/20-nft-floor.conf` (the nft floor status writer of
+   [udp-443-flood.md](udp-443-flood.md); rollback removes both drop-ins), then:
    `systemctl stop conspect` -> `systemctl disable --now nginx` -> install the new state ->
    `systemctl enable --now conspect.socket` -> `systemctl start conspect`. It prints how long the
    site was down (expect the engine's start-up time, a few seconds).

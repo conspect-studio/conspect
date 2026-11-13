@@ -1376,6 +1376,7 @@ fn health_router() -> Router<AppState> {
 
 /// Build the `/api/v1` resource + command routes (without the realtime or docs
 /// routes, which are wired by [`crate::router()`]).
+#[allow(clippy::too_many_lines)] // One `.route()` line per endpoint; splitting it loses the single at-a-glance map.
 pub fn api_router() -> Router<AppState> {
     Router::new()
         .route("/cloudflare/credentials", post(cloudflare::save))
@@ -1448,6 +1449,10 @@ pub fn api_router() -> Router<AppState> {
         .route(
             "/metrics/program",
             get(crate::program_metrics::get_program_metrics),
+        )
+        .route(
+            "/metrics/frontdoor",
+            get(crate::frontdoor_metrics::get_frontdoor_metrics),
         )
         .route("/routing", get(routing::get_routing))
         .route("/routing/plan", post(routing::plan_route))

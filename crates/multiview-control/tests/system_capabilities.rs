@@ -12,7 +12,10 @@ mod support;
 
 use axum::http::StatusCode;
 use multiview_control::system::{BuildInfo, EffectiveLicense};
-use support::{body_json, get, harness, send, VIEWER_TOKEN};
+use support::{
+    body_json, get, harness, harness_with, send, DISCOVERY_SCOPED_TOKEN, OUTPUT_SCOPED_TOKEN,
+    SCOPED_TOKEN, VIEWER_TOKEN,
+};
 
 // --- Licence mapping: the compliance surface (per feature-combo) ---------------
 
@@ -92,4 +95,43 @@ async fn a_bad_bearer_is_rejected_401() {
     )
     .await;
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+}
+
+/// `network` (front-door host posture: steering, receive buffer, firewall
+/// floor) is whole-system: an unscoped key gets it, a key scoped on any axis
+/// (object, output, discovery domain) gets the capability surface without it.
+#[tokio::test]
+async fn network_posture_is_omitted_for_scoped_principals() {
+    use multiview_control::system::{
+        NetworkCapability, NftFloorStatus, RecvBufferCapability, SystemCapabilities, Udp443Steering,
+    };
+    let h = harness_with(|state| {
+        state.with_capabilities(SystemCapabilities {
+            network: Some(NetworkCapability {
+                udp443_steering: Udp443Steering::ReuseportCbpf,
+                steering_reason: None,
+                recv_buffer: RecvBufferCapability {
+                    requested: 8_388_608,
+                    granted: 16_777_216,
+                    usable: 8_388_608,
+                    clamped: false,
+                },
+                kernel_drops_supported: true,
+                nft_floor: NftFloorStatus::Present,
+            }),
+            ..SystemCapabilities::default()
+        })
+    });
+    let body =
+        body_json(send(&h.router, get("/api/v1/system/capabilities", VIEWER_TOKEN)).await).await;
+    assert_eq!(body["network"]["udp443_steering"], "reuseport_cbpf");
+    assert_eq!(body["network"]["nft_floor"], "present");
+    for token in [SCOPED_TOKEN, OUTPUT_SCOPED_TOKEN, DISCOVERY_SCOPED_TOKEN] {
+        let resp = send(&h.router, get("/api/v1/system/capabilities", token)).await;
+        assert_eq!(resp.status(), StatusCode::OK, "{token}");
+        let body = body_json(resp).await;
+        assert!(body.get("network").is_none(), "{token}: {body}");
+        // The rest of the surface is still served.
+        assert!(body["build"]["effective_license"].is_string(), "{token}");
+    }
 }

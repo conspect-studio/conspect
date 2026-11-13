@@ -11,11 +11,17 @@ use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll, Waker};
 
 use noq::udp::{EcnCodepoint, RecvMeta, Transmit, UdpSocketState};
+use smallvec::SmallVec;
 
 use crate::steering::{ProgramSet, ReuseportGroup, SteeringMode};
 
 /// The largest UDP payload a segment can carry (Ethernet MTU minus IP/UDP).
 const MAX_SEGMENT: usize = 1472;
+
+/// Inline capacity of the per-call `IoSliceMut` slice built in
+/// [`SharedSocket::try_recv_batch`]: every platform's `noq::udp::BATCH_SIZE`
+/// (32 on Linux, 1 elsewhere) fits without spilling to the heap.
+const RECV_BATCH_INLINE: usize = 32;
 
 /// What the kernel granted for one socket's receive buffer.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -54,6 +60,12 @@ fn rmem_max() -> Option<usize> {
 /// Request `bytes` of receive buffer: `SO_RCVBUFFORCE` first on Linux (works
 /// with `CAP_NET_ADMIN`), then `SO_RCVBUF`; read back and report.
 fn size_recv_buffer(socket: &socket2::Socket, bytes: usize) -> RecvBufferReport {
+    request_recv_buffer(socket, bytes);
+    report_recv_buffer(socket, bytes)
+}
+
+/// Ask the kernel for `bytes` of receive buffer (see [`size_recv_buffer`]).
+fn request_recv_buffer(socket: &socket2::Socket, bytes: usize) {
     if bytes > 0 {
         #[cfg(target_os = "linux")]
         let forced = {
@@ -68,6 +80,15 @@ fn size_recv_buffer(socket: &socket2::Socket, bytes: usize) -> RecvBufferReport 
             }
         }
     }
+}
+
+/// Read the granted buffer back and report it against the `bytes` the door
+/// wants (`network.udp.recv_buffer_bytes`), warning when it is short. For a
+/// socket the service manager passed (`ReceiveBuffer=`), nothing is
+/// requested; the report still compares the grant with the configured
+/// target, so a unit without `ReceiveBuffer=` (or a systemd that ignored it)
+/// reads as clamped.
+fn report_recv_buffer(socket: &socket2::Socket, bytes: usize) -> RecvBufferReport {
     let granted = socket.recv_buffer_size().unwrap_or(0);
     let usable = if cfg!(target_os = "linux") {
         granted / 2
@@ -213,7 +234,11 @@ impl SharedSocket {
     /// as for a pair the engine bound itself. The kernel accepts both in one
     /// group because the same owner (systemd) created both. The receive
     /// buffers are left as the unit set them (`ReceiveBuffer=`) and reported.
-    pub(crate) fn from_inherited(mut sockets: Vec<std::net::UdpSocket>) -> io::Result<Self> {
+    pub(crate) fn from_inherited(
+        mut sockets: Vec<std::net::UdpSocket>,
+        recv_buffer_bytes: usize,
+        steering: bool,
+    ) -> io::Result<Self> {
         let prepare =
             |std_socket: std::net::UdpSocket| -> io::Result<(socket2::Socket, RecvBufferReport)> {
                 let socket = socket2::Socket::from(std_socket);
@@ -230,7 +255,9 @@ impl SharedSocket {
                     );
                 }
                 socket.set_nonblocking(true)?;
-                let report = size_recv_buffer(&socket, 0);
+                // The unit set the buffer (`ReceiveBuffer=`); report it against
+                // the configured target without changing it.
+                let report = report_recv_buffer(&socket, recv_buffer_bytes);
                 Ok((socket, report))
             };
         if sockets.len() > 2 {
@@ -245,6 +272,15 @@ impl SharedSocket {
         } else {
             None
         };
+        // Steering off: run the listener alone. Closing the established
+        // socket removes it from the reuseport group, so the kernel delivers
+        // every datagram to the one socket left: one queue, as configured.
+        let established = if steering {
+            established
+        } else {
+            drop(established);
+            None
+        };
         let Some(listener) = sockets.pop() else {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -253,13 +289,18 @@ impl SharedSocket {
         };
         let (listener, l_report) = prepare(listener)?;
         let Some(established) = established else {
+            let reason = if steering {
+                "socket-activated with one UDP socket (pass the ReusePort=yes pair of \
+                 deploy/systemd/conspect.socket for validated-flow steering)"
+            } else {
+                "disabled by configuration (steering = false): the inherited established socket \
+                 was closed, the listener is the only socket in the group"
+            };
             return Self::from_listener(
                 listener.into(),
                 None,
                 SteeringMode::SingleSocket {
-                    reason: "socket-activated with one UDP socket (pass the ReusePort=yes pair \
-                             of deploy/systemd/conspect.socket for validated-flow steering)"
-                        .to_owned(),
+                    reason: reason.to_owned(),
                 },
                 l_report,
             );
@@ -407,11 +448,18 @@ impl SharedSocket {
             },
         };
         io.try_io(tokio::io::Interest::READABLE, || {
-            let mut slices: Vec<IoSliceMut<'_>> = batch
-                .bufs
-                .iter_mut()
-                .map(|b| IoSliceMut::new(b.as_mut_slice()))
-                .collect();
+            // `slices` is a `SmallVec` sized to `RECV_BATCH_INLINE` (>= every
+            // platform's `noq::udp::BATCH_SIZE`), so rebuilding the borrowed
+            // `IoSliceMut`s into `batch.bufs` each call stays on the stack:
+            // no heap allocation per batch (the per-call `Vec<IoSliceMut>`
+            // this replaced always allocated).
+            let mut slices: SmallVec<[IoSliceMut<'_>; RECV_BATCH_INLINE]> = SmallVec::new();
+            slices.extend(
+                batch
+                    .bufs
+                    .iter_mut()
+                    .map(|b| IoSliceMut::new(b.as_mut_slice())),
+            );
             state.recv(io.into(), &mut slices, &mut batch.meta)
         })
     }

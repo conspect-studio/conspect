@@ -184,6 +184,7 @@ pub mod meter_telemetry;
 pub mod metrics_retention;
 /// Startup multicast/container network advisory detector (ADR-0040).
 pub mod network_warn;
+pub mod nft_floor;
 /// The `multiview node` display-node subcommand (DEV-B5 / ADR-0045): the
 /// software bootstrap — node config parse/validate, the keypair-bound
 /// enrollment request + display pairing code, the node clock-mode policy, and

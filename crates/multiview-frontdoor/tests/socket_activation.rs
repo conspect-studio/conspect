@@ -425,3 +425,121 @@ fn an_inherited_reuseport_pair_keeps_validated_flow_steering() {
     }
     door.shutdown_blocking();
 }
+
+/// The inherited pair as systemd would hand it, with `ReceiveBuffer=`
+/// standing in as `rcvbuf` set by the "service manager" (0 = untouched).
+/// Linux only: a reuseport group and steering are Linux features
+/// (`ReuseportGroup::bind` is `Unsupported` elsewhere).
+#[cfg(target_os = "linux")]
+fn inherited_pair(rcvbuf: usize) -> (u16, Vec<UdpSocket>) {
+    let group = multiview_frontdoor::ReuseportGroup::bind(any(0), rcvbuf).unwrap();
+    let port = group.listener().local_addr().unwrap().port();
+    let (listener, established, _) = group.into_parts();
+    let mut inherited = ListenSockets::empty();
+    inherited.push_udp(listener);
+    inherited.push_udp(established);
+    (port, inherited.take_udp_all(any(port)))
+}
+
+/// Review PR 349: an inherited socket's buffer is reported against the
+/// configured `recv_buffer_bytes`, so a unit without `ReceiveBuffer=` (or a
+/// smaller one) reads as clamped instead of `requested: 0, clamped: false`.
+#[cfg(target_os = "linux")]
+#[test]
+fn an_inherited_socket_reports_its_buffer_against_the_configured_target() {
+    // The "unit" set 64 KiB; the door wants 8 MiB: clamped.
+    let (port, pair) = inherited_pair(64 * 1024);
+    let door = FrontDoor::start_with(
+        &FrontDoorConfig {
+            port,
+            workers: 1,
+            recv_buffer_bytes: 8 * 1024 * 1024,
+            ..FrontDoorConfig::default()
+        },
+        pair,
+    )
+    .unwrap();
+    let report = door.buffer_report();
+    assert_eq!(report.requested, 8 * 1024 * 1024, "{report:?}");
+    assert!(report.usable < report.requested, "{report:?}");
+    assert!(report.clamped, "{report:?}");
+    door.shutdown_blocking();
+
+    // The door wants no more than the unit gave: not clamped. (The grant is
+    // read back, never re-requested, on an inherited socket.)
+    let (port, pair) = inherited_pair(64 * 1024);
+    let door = FrontDoor::start_with(
+        &FrontDoorConfig {
+            port,
+            workers: 1,
+            recv_buffer_bytes: 16 * 1024,
+            ..FrontDoorConfig::default()
+        },
+        pair,
+    )
+    .unwrap();
+    let report = door.buffer_report();
+    assert_eq!(report.requested, 16 * 1024, "{report:?}");
+    assert!(
+        report.granted >= 64 * 1024,
+        "the unit's grant is kept: {report:?}"
+    );
+    assert!(!report.clamped, "{report:?}");
+    door.shutdown_blocking();
+}
+
+/// Review PR 349: `steering = false` with an inherited pair runs ONE socket:
+/// the established member is closed, so every datagram lands on the listener.
+#[cfg(target_os = "linux")]
+#[test]
+fn steering_off_closes_the_inherited_established_socket() {
+    use multiview_frontdoor::SteeringMode;
+    let (port, pair) = inherited_pair(0);
+    let door = FrontDoor::start_with(
+        &FrontDoorConfig {
+            port,
+            workers: 1,
+            steering: false,
+            ..FrontDoorConfig::default()
+        },
+        pair,
+    )
+    .unwrap();
+    assert!(
+        matches!(door.steering(), SteeringMode::SingleSocket { ref reason } if reason.contains("closed")),
+        "{:?}",
+        door.steering()
+    );
+    let before = door.stats().snapshot();
+    // Many source ports: with both group members open the kernel would hash
+    // some of them to the second socket.
+    let senders: Vec<UdpSocket> = (0..32)
+        .map(|_| UdpSocket::bind("[::1]:0").unwrap())
+        .collect();
+    let mut short = vec![7u8; 60];
+    short[0] = 0x45;
+    for s in &senders {
+        for _ in 0..4 {
+            s.send_to(&short, ("::1", port)).unwrap();
+        }
+    }
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let s = door.stats().snapshot();
+        if s.received >= before.received + 128 {
+            assert_eq!(
+                s.received_listener_socket - before.received_listener_socket,
+                128,
+                "{s:?}"
+            );
+            assert_eq!(
+                s.received_established_socket,
+                before.received_established_socket
+            );
+            break;
+        }
+        assert!(Instant::now() < deadline, "datagrams never arrived: {s:?}");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    door.shutdown_blocking();
+}
