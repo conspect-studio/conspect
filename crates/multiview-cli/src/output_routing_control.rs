@@ -18,8 +18,8 @@ use multiview_control::output_routing::{
 };
 
 use crate::output_routing::{
-    FallbackReason, OutputRoutingHandle, OutputRoutingSlot, OutputTake, RefuseReason, TakeOutcome,
-    TakeResult, DEFAULT_MAX_ENCODERS,
+    FallbackReason, OutputRoutingHandle, OutputRoutingSlot, OutputTake, ReformatRefusal,
+    RefuseReason, TakeOutcome, TakeResult, DEFAULT_MAX_ENCODERS,
 };
 use crate::routing_audio::AudioChoice;
 use crate::routing_aux::PictureBus;
@@ -37,6 +37,15 @@ pub fn outcome_str(result: TakeResult) -> &'static str {
         TakeResult::Refused(RefuseReason::FormatMismatch) => "refused:format-mismatch",
         TakeResult::Fallback(FallbackReason::AuxFailed) => "fallback:aux-failed",
         TakeResult::Fallback(FallbackReason::EncoderFailed) => "fallback:encoder-failed",
+        TakeResult::ResetApplied => "reset:applied",
+        TakeResult::ResetRefused(ReformatRefusal::RestartRequired) => {
+            "reset:refused:restart-required"
+        }
+        TakeResult::ResetRefused(ReformatRefusal::Capacity) => "reset:refused:capacity",
+        TakeResult::ResetRefused(ReformatRefusal::EncoderNotReady) => {
+            "reset:refused:encoder-not-ready"
+        }
+        TakeResult::ResetRefused(ReformatRefusal::Superseded) => "reset:refused:superseded",
     }
 }
 

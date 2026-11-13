@@ -2181,6 +2181,44 @@ impl RenditionDispatcher {
     }
     /// Whether the output's binding has a program-audio slot (track 0), the
     /// slot a routed audio feed rides (ADR-0108 §5.5).
+    /// Whether the output's container carries its decoder configuration in
+    /// band (MPEG-TS: HLS, SRT, RIST), so a move onto changed parameter sets
+    /// may splice (with a discontinuity) — the outputs a live format reset
+    /// may reach (#342 B3).
+    pub(crate) fn inband_ok(&self, output_index: usize) -> bool {
+        self.bindings
+            .iter()
+            .any(|b| b.output_index == output_index && b.inband_ok)
+    }
+    /// Make `key` the output's startup (fallback) key: a later failure of a
+    /// dynamic key returns the output there (#342 B3, a live format reset
+    /// pins a new base key). `InvalidConfig` for an unknown output or key.
+    ///
+    /// # Errors
+    /// `InvalidConfig` for an unknown output or an unusable key.
+    pub(crate) fn set_fallback_key(
+        &mut self,
+        output_index: usize,
+        key: usize,
+    ) -> Result<(), DispatchError> {
+        if self
+            .video_meta
+            .get(key)
+            .is_none_or(|m| m.failed || m.retired)
+        {
+            return Err(DispatchError::InvalidConfig);
+        }
+        let b = self
+            .bindings
+            .iter_mut()
+            .find(|b| b.output_index == output_index)
+            .ok_or(DispatchError::InvalidConfig)?;
+        if b.fallback.is_none() {
+            return Err(DispatchError::InvalidConfig);
+        }
+        b.fallback = Some(key);
+        Ok(())
+    }
     pub(crate) fn has_program_audio(&self, output_index: usize) -> bool {
         self.bindings
             .iter()

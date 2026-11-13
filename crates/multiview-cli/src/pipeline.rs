@@ -3861,7 +3861,9 @@ impl Pipeline {
             self.rendition_configs.clone(),
             self.rendition_formats.clone(),
         );
-        let (router, handle) = crate::output_routing::OutputRouter::new_with_bus(
+        let reformat_open =
+            reformat_opener(self.encode_cfg.clone(), self.rendition_configs.clone());
+        let (router, handle) = crate::output_routing::OutputRouter::new_with_openers(
             crate::output_routing::RouterConfig {
                 cadence: self.encode_cfg.cadence,
                 gop: self.encode_cfg.gop.max(1),
@@ -3883,6 +3885,7 @@ impl Pipeline {
                 preview_selection: preview_selection.clone(),
             },
             open,
+            Some(reformat_open),
         )
         .map_err(spawn_err)?;
         // Router index i = runner i: the id the control plane addresses, the
@@ -7614,6 +7617,43 @@ struct ConsumerRouting {
 /// End-of-run bound for the routing reaper to finish closed live encoders.
 const ROUTING_SHUTDOWN_GRACE: Duration = Duration::from_secs(1);
 
+/// The opener of a live format reset's ad-hoc settings (#342 B3): the run's
+/// encode config with the new codec name (unchanged), size and bit rate; a
+/// Program/Clean key at a non-canvas format converts on its own worker; a
+/// routed source/PVW arrives already at the new feed format.
+fn reformat_opener(
+    base: EncodeConfig,
+    configs: Vec<EncodeConfig>,
+) -> crate::output_routing::ReformatOpenFn {
+    Box::new(move |settings, bus| {
+        // The encoder's input format follows the codec name; reuse the
+        // run's own config for that codec when present.
+        let mut cfg = configs
+            .iter()
+            .find(|c| c.codec_name == settings.codec_name)
+            .cloned()
+            .unwrap_or_else(|| base.clone());
+        cfg.codec_name.clone_from(&settings.codec_name);
+        cfg.width = settings.width;
+        cfg.height = settings.height;
+        cfg.bit_rate = settings.bit_rate;
+        cfg.audio = None;
+        let encoder = VideoRenditionEncoder::new(&cfg).map_err(|e| e.to_string())?;
+        let live: Box<dyn crate::output_routing::LiveEncoder> =
+            Box::new(PipelineVideoWorker(encoder));
+        let canvas_bus = matches!(
+            bus,
+            crate::routing_aux::PictureBus::Program | crate::routing_aux::PictureBus::Clean
+        );
+        match settings.base_format {
+            Some(format) if canvas_bus => Ok(Box::new(crate::format_convert::ConvertLive::new(
+                format, live,
+            ))),
+            _ => Ok(live),
+        }
+    })
+}
+
 /// The routing opener (ADR-0108, #342): opens a live encoder for a rendition
 /// settings index. A Program/Clean key at a non-canvas format converts on its
 /// own worker (never erroring: it repeats or blacks). A routed source/PVW
@@ -8410,6 +8450,9 @@ fn consumer_main<D: WindowDelivery>(
         // published before the router tick so a Clean encoder gets frame T
         // this tick. One bool check when nothing selects Clean.
         router.publish_clean(item.tick_index, &item.canvas);
+        // A reformatted output's base key reads the BAKED Program picture
+        // (#342 B3); it is published once baked, below (one bool check when
+        // no output was reformatted).
         router
             .on_tick(item.tick_index, tick_pts, &mut dispatcher, &mut delivery)
             .map_err(|e| PipelineError::Output {
@@ -8452,6 +8495,7 @@ fn consumer_main<D: WindowDelivery>(
             None
         };
         let overlaid = baker.bake(&item)?;
+        router.publish_program(item.tick_index, &overlaid);
         // NO-FALTER: fill any ticks this consumer missed (a transient stall
         // shed them from the hot queue) with frame substitution — the last
         // good baked canvas restamped at each missing tick's index. The

@@ -531,6 +531,8 @@ impl Harness {
         let clean = canvas();
         self.r.publish_clean(t, &clean);
         self.clean.push((t, clean));
+        // The baked Program picture, for a reformatted output's key (#342 B3).
+        self.r.publish_program(t, &canvas());
         let started = Instant::now();
         self.r
             .on_tick(t, pts(t), &mut self.d, &mut self.rec)
@@ -1094,6 +1096,8 @@ fn inject(
         bus,
         format: None,
         settings: 0,
+        reformat: false,
+        pinned_for: None,
         key,
         worker: Some(w),
         force_at: force_cell(),
@@ -4265,4 +4269,501 @@ fn plan_slot_reports_the_cheapest_path() {
     assert_eq!(adapter.current_path("tall2"), Some(PlanPath::P1));
     // An output still on Program reads back P1 (its base key).
     assert_eq!(adapter.current_path("wide"), Some(PlanPath::P1));
+}
+
+// ---- #342 B3: live format reset (Reformat) ----
+
+/// Records each output's windows (as `Rec`) AND its decoder-config changes.
+#[derive(Default)]
+struct ReformatRec {
+    inner: Rec,
+    changes: Vec<usize>,
+}
+impl WindowDelivery for ReformatRec {
+    fn offer_window(
+        &mut self,
+        o: usize,
+        g: u64,
+        p: Vec<EncodedPacket>,
+        s: std::time::Duration,
+        n: Instant,
+    ) -> Result<(), multiview_output::batch::EmissionError> {
+        self.inner.offer_window(o, g, p, s, n)
+    }
+    fn report_loss(&mut self, _o: usize, _r: multiview_output::batch::OfferError) {}
+    fn mark_discontinuity(&mut self, o: usize, _r: multiview_output::batch::OfferError) {
+        self.changes.push(o);
+    }
+    fn take_discontinuity(&mut self, _o: usize) -> Option<multiview_output::batch::Discontinuity> {
+        None
+    }
+    fn generation(&self, _o: usize) -> u64 {
+        0
+    }
+    fn statuses(&self) -> Vec<crate::binding_delivery::BindingStatus> {
+        Vec::new()
+    }
+    fn finish(&mut self) {}
+    fn abort(&mut self) {}
+}
+
+/// A reformat key's encoder: one packet per tick, keyframe when forced or
+/// first; its RAPs carry a parameter-set marker unlike the base key's, so a
+/// move onto it is a decoder-config change.
+struct ReformatEnc {
+    forced: bool,
+}
+impl VideoEncodeWorker for ReformatEnc {
+    fn encode(&mut self, item: BakedTick) -> Result<Vec<EncodedPacket>, PipelineError> {
+        let key = std::mem::take(&mut self.forced);
+        Ok(vec![pkt(item.tick, key)])
+    }
+    fn reorder_bound(&self) -> ReorderBound {
+        ReorderBound::NoReorder
+    }
+    fn finish(&mut self) -> Result<Vec<EncodedPacket>, PipelineError> {
+        Ok(Vec::new())
+    }
+    fn force_keyframe(&mut self) {
+        self.forced = true;
+    }
+}
+impl LiveEncoder for ReformatEnc {
+    fn start_at(&mut self, _t0: u64) {
+        self.forced = true;
+    }
+    fn time_base(&self) -> Rational {
+        Rational::new(1, 5)
+    }
+    fn move_gate(&self) -> MoveGate {
+        Box::new(|p| p.is_keyframe() && p.len() == 77)
+    }
+    fn parameter_sets(&self) -> Option<ParameterSets> {
+        Some(Box::new(|p: &EncodedPacket| {
+            if p.is_keyframe() {
+                multiview_ffmpeg::idr::RapParameterSets::Sets(vec![9, 9, 9])
+            } else {
+                multiview_ffmpeg::idr::RapParameterSets::Absent
+            }
+        }))
+    }
+}
+
+/// A router + dispatcher harness for reformats: base key 0 (Program), the
+/// given number of outputs, a reformat opener whose behaviour `mode` picks.
+struct ReformatHarness {
+    r: OutputRouter,
+    h: OutputRoutingHandle,
+    d: RenditionDispatcher,
+    rec: ReformatRec,
+    outcomes: Receiver<TakeOutcome>,
+    base_force: Arc<AtomicU64>,
+    opened: Arc<AtomicUsize>,
+}
+
+#[derive(Clone, Copy)]
+enum OpenMode {
+    Ok,
+    Fail,
+    Wedge,
+}
+
+fn reformat_harness(outputs: usize, max: usize, mode: OpenMode) -> ReformatHarness {
+    let base_force = Arc::new(AtomicU64::new(NO_FORCE));
+    let opened = Arc::new(AtomicUsize::new(0));
+    let counter = Arc::clone(&opened);
+    let (wedge_tx, wedge_rx) = mpsc::channel::<()>();
+    std::mem::forget(wedge_tx);
+    let wedge_rx = Mutex::new(wedge_rx);
+    let reformat_open: ReformatOpenFn = Box::new(move |_settings, _bus| {
+        counter.fetch_add(1, Ordering::SeqCst);
+        match mode {
+            OpenMode::Ok => {
+                let enc: Box<dyn LiveEncoder> = Box::new(ReformatEnc { forced: false });
+                Ok(enc)
+            }
+            OpenMode::Fail => Err("injected open failure".to_owned()),
+            OpenMode::Wedge => {
+                // Blocks the opener forever (the sender is leaked).
+                let _ = wedge_rx.lock().unwrap().recv();
+                Err("unreachable".to_owned())
+            }
+        }
+    });
+    let (r, h) = OutputRouter::new_with_openers(
+        RouterConfig {
+            cadence: CADENCE,
+            gop: 5,
+            base_keys: vec![0; outputs],
+            base_force: vec![Arc::clone(&base_force)],
+            max_encoders: max,
+            max_per_principal: DEFAULT_MAX_PER_PRINCIPAL,
+            has_preview: false,
+            formats: Vec::new(),
+            boot_retry: BootRetryPolicy::default(),
+        },
+        AuxWiring {
+            feeds: Arc::new(SwapCell::from_pointee(Vec::new())),
+            active: Arc::new(AtomicBool::new(false)),
+            failed: Arc::new(AtomicBool::new(false)),
+            dropped: Arc::new(AtomicU64::new(0)),
+            sent: Arc::new(AtomicU64::new(0)),
+            stores: Arc::new(|_: &str| None),
+            preview_selection: None,
+        },
+        Box::new(|_, _| Err("no take opener in this harness".to_owned())),
+        Some(reformat_open),
+    )
+    .unwrap();
+    let outcomes = h.outcomes().unwrap();
+    ReformatHarness {
+        r,
+        h,
+        d: dispatcher(outputs),
+        rec: ReformatRec::default(),
+        outcomes,
+        base_force,
+        opened,
+    }
+}
+
+impl ReformatHarness {
+    fn tick(&mut self, t: u64) {
+        self.r
+            .drain_live_events(&mut self.d, &mut self.rec)
+            .unwrap();
+        if let Some(prev) = t.checked_sub(1) {
+            let ns = i128::from(prev + 1) * TICK_NS;
+            let forced = take_force(&self.base_force, prev);
+            self.d
+                .dispatch(
+                    DispatchEvent::Video {
+                        key_index: 0,
+                        tick: prev,
+                        timebase: Rational::new(1, 5),
+                        packets: vec![pkt(prev, forced || prev % 5 == 0)],
+                        watermark: Some(crate::rendition_workers::DtsWatermark {
+                            complete_before_ns: ns,
+                        }),
+                    },
+                    Instant::now(),
+                    &mut self.rec,
+                )
+                .unwrap();
+        }
+        self.r.publish_clean(t, &canvas());
+        self.r.publish_program(t, &canvas());
+        self.r
+            .on_tick(t, pts(t), &mut self.d, &mut self.rec)
+            .unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(2));
+    }
+    fn reformat(&self, op: &str, output: usize) {
+        self.h
+            .try_reformat(Reformat {
+                operation_id: op.to_owned(),
+                output_index: output,
+                settings: ReformatSettings {
+                    codec_name: "mpeg2video".to_owned(),
+                    width: 8,
+                    height: 16,
+                    bit_rate: 1_000_000,
+                    base_format: Some(crate::routing_aux::AuxFormat::new(
+                        8,
+                        16,
+                        multiview_config::OutputFit::new(
+                            multiview_config::OutputFitMode::Cover,
+                            multiview_config::Anchor::Center,
+                        ),
+                    )),
+                },
+                feed_format: None,
+                principal: "p".to_owned(),
+            })
+            .unwrap();
+    }
+    fn windows_of(&self, o: usize) -> Vec<i64> {
+        self.rec
+            .inner
+            .windows
+            .iter()
+            .filter(|w| w.0 == o)
+            .filter_map(|w| w.1.first().map(|p| p.0))
+            .collect()
+    }
+    fn results(&self) -> Vec<(String, TakeResult, u64)> {
+        self.outcomes
+            .try_iter()
+            .map(|o| (o.operation_id, o.outcome, o.tick))
+            .collect()
+    }
+}
+
+/// Reformat moves ONLY that output, at a flagged IDR (one decoder-config
+/// change on that output, none on the other), make-before-break (its PTS
+/// steps by one tick across the move), the new key is its base key from
+/// then on, and the other output keeps the base key, untouched.
+#[test]
+fn a_reformat_moves_only_that_output_at_a_flagged_idr_and_pins_its_new_key() {
+    let mut x = reformat_harness(2, 6, OpenMode::Ok);
+    for t in 0..5 {
+        x.tick(t);
+    }
+    x.reformat("rf", 1);
+    let mut applied = None;
+    let mut t = 5;
+    while t < 5 + REFORMAT_DEADLINE_TICKS && applied.is_none() {
+        x.tick(t);
+        applied = x
+            .results()
+            .into_iter()
+            .find(|(op, r, _)| op == "rf" && *r == TakeResult::ResetApplied)
+            .map(|(_, _, at)| at);
+        t += 1;
+    }
+    let at = applied.expect("the reformat applied");
+    for t2 in t..t + 10 {
+        x.tick(t2);
+    }
+    let new_key = x.d.binding_video_key(1).unwrap();
+    assert_ne!(new_key, 0, "output 1 moved to the new key");
+    assert_eq!(x.d.binding_video_key(0), Some(0), "output 0 untouched");
+    assert_eq!(
+        x.r.cfg.base_keys,
+        vec![0, new_key],
+        "the new key is output 1's base"
+    );
+    assert_eq!(
+        x.rec.changes,
+        vec![1],
+        "exactly one flagged change, on output 1"
+    );
+    // Make-before-break: output 1 has one window per tick across the move.
+    let o1 = x.windows_of(1);
+    assert!(o1.windows(2).all(|w| w[1] == w[0] + 1), "{o1:?}");
+    assert!(o1.contains(&i64::try_from(at).unwrap()));
+    let o0 = x.windows_of(0);
+    assert!(o0.windows(2).all(|w| w[1] == w[0] + 1), "{o0:?}");
+    assert_eq!(x.r.reformats_in_flight(), 0);
+    // A take back to Program lands on the NEW base key (+0 encoders).
+    x.h.try_take(take("back", 1, PictureBus::Program)).unwrap();
+    for t2 in t + 10..t + 20 {
+        x.tick(t2);
+    }
+    assert_eq!(x.d.binding_video_key(1), Some(new_key));
+    // The pinned key never lingers out from under its output.
+    for t2 in t + 20..t + 20 + LINGER_TICKS + 5 {
+        x.tick(t2);
+    }
+    assert_eq!(x.d.binding_video_key(1), Some(new_key));
+    assert!(!x.d.is_key_failed(new_key));
+}
+
+/// A second reformat of the same output retires the first reformat's key
+/// once nothing uses it (it lingers out like any unused live key).
+#[test]
+fn the_old_reformat_key_retires_after_a_second_reformat() {
+    let mut x = reformat_harness(1, 6, OpenMode::Ok);
+    let mut t = 0;
+    for op in ["first", "second"] {
+        x.reformat(op, 0);
+        let mut done = false;
+        let until = t + REFORMAT_DEADLINE_TICKS;
+        while t < until && !done {
+            x.tick(t);
+            done = x
+                .results()
+                .iter()
+                .any(|(o, r, _)| o == op && *r == TakeResult::ResetApplied);
+            t += 1;
+        }
+        assert!(done, "{op} applied");
+        if op == "first" {
+            // Past the forced-IDR floor before the next reformat.
+            for _ in 0..FORCE_FLOOR_TICKS {
+                x.tick(t);
+                t += 1;
+            }
+        }
+    }
+    let second = x.d.binding_video_key(0).unwrap();
+    let first: Vec<usize> =
+        x.r.dynamic_keys()
+            .iter()
+            .map(|k| k.3)
+            .filter(|&k| k != second)
+            .collect();
+    assert_eq!(first.len(), 1, "the first key still lingers");
+    for _ in 0..LINGER_TICKS + 5 {
+        x.tick(t);
+        t += 1;
+    }
+    assert!(x.d.is_key_failed(first[0]), "the old key retired");
+    assert_eq!(x.d.binding_video_key(0), Some(second));
+    assert_eq!(x.r.dynamic_keys().len(), 1);
+}
+
+/// Refusals: a kind without in-band parameter sets is `restart-required`;
+/// the encoder cap is `capacity`; neither opens anything nor moves the output.
+#[test]
+fn reformat_refusals_restart_required_and_capacity() {
+    // Out-of-band output (fMP4/FLV/SDP): restart required.
+    let mut x = reformat_harness(1, 6, OpenMode::Ok);
+    x.d = RenditionDispatcher::new(DispatchConfig {
+        video_count: 1,
+        audio_count: 0,
+        video_time_base: vec![DtsTimeBase { num: 1, den: 5 }],
+        audio_time_base: Vec::new(),
+        bindings: vec![BindingConfig {
+            output_index: 0,
+            video_key: Some(0),
+            audio_tracks: Vec::new(),
+            inband_parameter_changes_ok: false,
+        }],
+        first_tick: 0,
+        cadence: CADENCE,
+        video_move_gates: vec![Some(Box::new(|p: &EncodedPacket| p.is_keyframe()))],
+    })
+    .unwrap();
+    x.reformat("oob", 0);
+    x.tick(0);
+    assert_eq!(
+        x.results(),
+        vec![(
+            "oob".to_owned(),
+            TakeResult::ResetRefused(ReformatRefusal::RestartRequired),
+            0
+        )]
+    );
+    // Capacity: the global encoder cap is 0.
+    let mut x = reformat_harness(1, 0, OpenMode::Ok);
+    x.reformat("cap", 0);
+    x.tick(0);
+    assert_eq!(
+        x.results(),
+        vec![(
+            "cap".to_owned(),
+            TakeResult::ResetRefused(ReformatRefusal::Capacity),
+            0
+        )]
+    );
+    assert_eq!(x.opened.load(Ordering::SeqCst), 0, "nothing opened");
+    assert_eq!(x.d.binding_video_key(0), Some(0));
+}
+
+/// A reformat whose open fails or wedges leaves the output on its old key
+/// (old format) and is refused (at once, or at the deadline); the base keeps
+/// delivering one window per tick.
+#[test]
+fn a_failed_or_wedged_reformat_open_leaves_the_old_format() {
+    for mode in [OpenMode::Fail, OpenMode::Wedge] {
+        let mut x = reformat_harness(1, 6, mode);
+        x.reformat("rf", 0);
+        let mut refused = None;
+        let mut t = 0;
+        while t < REFORMAT_DEADLINE_TICKS + 5 && refused.is_none() {
+            x.tick(t);
+            refused = x
+                .results()
+                .into_iter()
+                .find(|(op, _, _)| op == "rf")
+                .map(|(_, r, at)| (r, at));
+            t += 1;
+        }
+        let (result, at) = refused.expect("refused");
+        assert_eq!(
+            result,
+            TakeResult::ResetRefused(ReformatRefusal::EncoderNotReady)
+        );
+        assert!(at <= REFORMAT_DEADLINE_TICKS, "within the deadline: {at}");
+        assert_eq!(x.d.binding_video_key(0), Some(0), "old format kept");
+        assert_eq!(x.r.cfg.base_keys, vec![0]);
+        assert_eq!(x.r.reformats_in_flight(), 0);
+        let o0 = x.windows_of(0);
+        assert!(o0.windows(2).all(|w| w[1] == w[0] + 1), "{o0:?}");
+        assert_eq!(x.r.dynamic_keys().len(), 0, "no key leaked");
+    }
+}
+
+/// Chaos (§12.10): 200 reformats at output 1 interleaved with takes at output
+/// 0 never move the clock (one window per tick on both outputs, the base
+/// untouched), never put more than one reformat in flight, and every
+/// reformat is accounted for exactly once: busy at the mailbox, or settled
+/// (most superseded, at most a couple applied).
+#[test]
+fn a_reformat_flood_keeps_one_in_flight_and_the_other_output_untouched() {
+    let mut x = reformat_harness(2, 6, OpenMode::Ok);
+    let mut max_in_flight = 0;
+    let mut sent = 0;
+    let mut busy = 0;
+    let mut results = Vec::new();
+    let mut t = 0;
+    while sent < 200 {
+        // Four reformats a tick (the mailbox holds 8), a take every 10 ticks.
+        for _ in 0..4 {
+            if sent < 200 {
+                let enqueued = x.h.try_reformat(Reformat {
+                    operation_id: format!("rf{sent}"),
+                    output_index: 1,
+                    settings: ReformatSettings {
+                        codec_name: "mpeg2video".to_owned(),
+                        width: 8,
+                        height: 16,
+                        bit_rate: 1_000_000,
+                        base_format: None,
+                    },
+                    feed_format: None,
+                    principal: "p".to_owned(),
+                });
+                busy += usize::from(enqueued.is_err());
+                sent += 1;
+            }
+        }
+        if t % 10 == 0 {
+            let _ =
+                x.h.try_take(take(&format!("tk{t}"), 0, PictureBus::Program));
+        }
+        x.tick(t);
+        results.extend(x.results());
+        max_in_flight = max_in_flight.max(x.r.reformats_in_flight());
+        t += 1;
+    }
+    for _ in 0..REFORMAT_DEADLINE_TICKS {
+        x.tick(t);
+        results.extend(x.results());
+        max_in_flight = max_in_flight.max(x.r.reformats_in_flight());
+        t += 1;
+    }
+    assert!(
+        max_in_flight <= 1,
+        "at most one reformat in flight per output"
+    );
+    let applied = results
+        .iter()
+        .filter(|(op, r, _)| op.starts_with("rf") && *r == TakeResult::ResetApplied)
+        .count();
+    let refused = results
+        .iter()
+        .filter(|(op, r, _)| op.starts_with("rf") && matches!(r, TakeResult::ResetRefused(_)))
+        .count();
+    assert_eq!(
+        applied + refused + busy,
+        200,
+        "{applied} + {refused} + {busy}"
+    );
+    assert!(
+        applied <= 2,
+        "the flood collapses onto the last one: {applied}"
+    );
+    assert_eq!(x.r.reformats_in_flight(), 0);
+    // The other output: one window per tick, on the base key, all along.
+    let o0 = x.windows_of(0);
+    assert_eq!(o0.len(), usize::try_from(t).unwrap() - 1, "one per tick");
+    assert!(o0.windows(2).all(|w| w[1] == w[0] + 1));
+    assert_eq!(x.d.binding_video_key(0), Some(0));
+    let o1 = x.windows_of(1);
+    assert!(
+        o1.windows(2).all(|w| w[1] == w[0] + 1),
+        "output 1 never skips a tick"
+    );
 }
