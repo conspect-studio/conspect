@@ -174,9 +174,11 @@ What is true on main f5f2230e (the full table with citations is in §1 of the no
    - it crossfades old to new from G over one tick, `SampleClock::total_at` exact, inside that
      stream;
    - if the destination is shared, the output moves on to the shared bus at least 4 frames after
-     the fade, and only when the decoded output across that boundary matches the shared bus alone
-     (an encoder-state check, not just equal samples). The private bus lives at most 2 s, and then
-     becomes the output's own audio encode. Other subscribers never hear the fade.
+     the fade. As built (slice 2) this is a fixed rule, not a runtime decoded check: a private bus
+     back on the program mix returns the output to the shared program stream at the next grid
+     boundary after 4 frames, and a deterministic test pins the decoded output across that
+     boundary to the shared stream alone (design note §5.2). Otherwise the private bus is the
+     output's own audio encode. Other subscribers never hear the fade.
    The rule is needed because a spike measured a decoder transient of 97-919 samples when two
    different-content AAC streams are spliced. AudioSpecificConfig identity is checked at open.
    `audio-routing` stays the source of gain, mute and membership. The existing per-output `tracks`

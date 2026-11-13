@@ -1,6 +1,7 @@
 // The Outputs page shortcut for output feed routing (ADR-0108 §8): a Video
 // feed row (grouped select → Plan → cost line → Take, outcome via
-// OperationFeedback) and a read-only Audio row, plus the tally ("PGM" follows
+// OperationFeedback) and an Audio row (the editable OutputAudioRow when the
+// page passes one, else a read-only line), plus the tally ("PGM" follows
 // the switcher vs "direct: <id>").
 //
 // Truth rules (broadcast/README.md): a 202 is *accepted*, never *applied*; the
@@ -51,6 +52,11 @@ export interface OutputFeedRowProps {
   readonly route: OutputRouteState | undefined;
   /** The feeds to offer, grouped. */
   readonly choices: readonly FeedChoice[];
+  /**
+   * The editable Audio row (OutputAudioRow); replaces the read-only audio
+   * line when given.
+   */
+  readonly audioRow?: JSX.Element | undefined;
 }
 
 interface Outcome {
@@ -81,6 +87,7 @@ export function OutputFeedRow({
   outputName,
   route,
   choices,
+  audioRow,
 }: OutputFeedRowProps): JSX.Element {
   const { t } = useLingui();
   const { locked } = useTakeLock();
@@ -390,10 +397,12 @@ export function OutputFeedRow({
             }
           : {})}
       />
-      <div className="flex flex-wrap items-center gap-2">
-        <span className="font-medium"><Trans>Audio</Trans></span>
-        <span data-testid="output-audio">{audioText}</span>
-      </div>
+      {audioRow ?? (
+        <div className="flex flex-wrap items-center gap-2">
+          <span className="font-medium"><Trans>Audio</Trans></span>
+          <span data-testid="output-audio">{audioText}</span>
+        </div>
+      )}
       <Dialog open={confirm} onOpenChange={setConfirm}>
         <DialogContent>
           <DialogHeader>

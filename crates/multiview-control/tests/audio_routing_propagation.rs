@@ -97,13 +97,17 @@ mute = false
 /// duration of the test process (acceptable: each test owns a fresh one and
 /// the process exits after the suite).
 fn harness_with_boot() -> (Router, std::path::PathBuf) {
+    harness_with_doc(BOOT)
+}
+
+fn harness_with_doc(doc: &str) -> (Router, std::path::PathBuf) {
     // `keep()` consumes the `TempDir` without running its `Drop` cleanup
     // (unlike `mem::forget`, which clippy flags on a `Drop` type) — the
     // directory is intentionally kept for the test's duration.
     let dir = tempfile::tempdir().unwrap().keep();
     let path = dir.join("boot.toml");
-    std::fs::write(&path, BOOT).unwrap();
-    let config = MultiviewConfig::load_from_toml(BOOT).unwrap();
+    std::fs::write(&path, doc).unwrap();
+    let config = MultiviewConfig::load_from_toml(doc).unwrap();
     let seeded = multiview_control::seed_resources(&config).unwrap();
     let publisher = Arc::new(EnginePublisher::<EngineStateSnapshot, Event>::new(64));
     let (sender, _receiver) = command_bus(64);
@@ -439,5 +443,52 @@ async fn an_unrelated_routing_change_reports_no_output_updates() {
         body.get("outputs_updated").is_none()
             || body["outputs_updated"].as_array().unwrap().is_empty(),
         "a gain-only change must not report any output update"
+    );
+}
+
+/// ADR-0108 §5.5: a `[[routing.output]] audio = { tracks = [..] }` feed
+/// follows a rename in the same atomic commit, and is reported in
+/// `outputs_updated` like an output's own selection.
+#[tokio::test]
+async fn a_routed_output_audio_feed_follows_a_renamed_track() {
+    let doc = BOOT.replacen(
+        "[[outputs]]\nkind = \"hls\"\npath = \"/tmp/audio-routing-propagation-2.m3u8\"",
+        "[[outputs]]\nid = \"wall\"\nkind = \"hls\"\npath = \"/tmp/audio-routing-propagation-2.m3u8\"",
+        1,
+    ) + "[[routing.output]]\noutput = \"wall\"\naudio = { tracks = [\"au-abc\"] }\n";
+    assert!(doc.contains("id = \"wall\""));
+    let (router, boot_path) = harness_with_doc(&doc);
+    let before = send(&router, get("/api/v1/audio-routing", ADMIN_TOKEN)).await;
+    let old_etag = etag(&before).unwrap();
+    let resp = send(
+        &router,
+        put_json(
+            "/api/v1/audio-routing",
+            ADMIN_TOKEN,
+            Some(&old_etag),
+            &renamed_routing_doc(),
+        ),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = body_json(resp).await;
+    let updated = body["outputs_updated"].as_array().unwrap();
+    let wall = updated
+        .iter()
+        .find(|u| u["output"] == "wall")
+        .unwrap_or_else(|| panic!("wall reported: {updated:?}"));
+    assert_eq!(wall["renamed"][0]["from"], "au-abc");
+    assert_eq!(wall["renamed"][0]["to"], "us-cnn");
+    let desired = load_desired(&boot_path).unwrap().unwrap();
+    let feed = desired
+        .config
+        .output_feeds()
+        .into_iter()
+        .find(|f| f.output == "wall")
+        .unwrap();
+    assert_eq!(
+        feed.audio,
+        multiview_config::AudioFeed::Tracks(vec!["us-cnn".to_owned()]),
+        "the desired record carries the renamed feed"
     );
 }

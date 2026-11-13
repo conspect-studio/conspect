@@ -134,8 +134,9 @@ pub fn switcher_canvas_admission(
 /// Preview, Clean and a source are accepted: the engine starts every output
 /// on Program and then issues one BOOT TAKE per output whose persisted feed is
 /// not Program, through the normal take gate with a bounded retry window (the
-/// output stays on Program if it never becomes takeable). Audio other than
-/// `follow` is refused by validation and is not handled here.
+/// output stays on Program if it never becomes takeable). An explicit
+/// (non-`follow`) audio feed is accepted too: start-up re-applies it as an
+/// audio-only boot take (ADR-0108 slice 2 §6.1).
 ///
 /// # Errors
 /// The start-up refusal text naming the routed output.
@@ -151,6 +152,9 @@ pub fn outputs_carry_program(config: &MultiviewConfig) -> Result<(), String> {
             routed.effective_video().picture_bus()
         ));
     }
+    // ADR-0108 slice 2: an explicit (non-`follow`) audio feed is accepted:
+    // the run starts the output on follow and re-applies the persisted feed
+    // as an audio-only boot take once its routing handle is published.
     Ok(())
 }
 

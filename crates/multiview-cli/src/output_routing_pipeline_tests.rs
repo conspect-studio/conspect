@@ -161,13 +161,39 @@ fn drive_clocked<F>(
 where
     F: FnOnce(OutputRoutingSlot) + Send + 'static,
 {
+    drive_prepared(
+        template,
+        audio,
+        switcher,
+        prefix,
+        ticks,
+        move |pipeline| {
+            if let Some(policy) = boot_retry {
+                pipeline.set_boot_retry(policy);
+            }
+        },
+        control,
+    )
+}
+
+/// As [`drive_full`]; `prep` sees the built pipeline before the run.
+fn drive_prepared<F>(
+    template: &str,
+    audio: bool,
+    switcher: bool,
+    prefix: &str,
+    ticks: u64,
+    prep: impl FnOnce(&mut Pipeline),
+    control: F,
+) -> Run
+where
+    F: FnOnce(OutputRoutingSlot) + Send + 'static,
+{
     let config =
         multiview_config::MultiviewConfig::load_from_toml(&template.replace('@', prefix)).unwrap();
     let mut pipeline = Pipeline::build(&config).unwrap();
     pipeline.address_boot_feeds_to_test_sinks(&config);
-    if let Some(policy) = boot_retry {
-        pipeline.set_boot_retry(policy);
-    }
+    prep(&mut pipeline);
     if audio {
         pipeline.enable_program_audio();
     }
@@ -266,7 +292,8 @@ fn take(op: &str, output: usize, bus: PictureBus) -> OutputTake {
     OutputTake {
         operation_id: op.to_owned(),
         output_index: output,
-        bus,
+        bus: Some(bus),
+        audio: None,
         principal: "operator".to_owned(),
     }
 }
@@ -1069,4 +1096,201 @@ fn a_never_fresh_boot_feed_is_retried_then_given_up_and_program_is_untouched() {
     for (i, output) in run.outputs.iter().enumerate() {
         assert_eq!(pts_of(output), all, "output {i}: Program untouched");
     }
+}
+
+/// ADR-0108 slice 2 (spec G1) through the real pipeline: an audio-only take
+/// of output 1 to `Source(<bars>)` while its video stays on Program. Output
+/// 1's video is output 0's, packet for packet (same encoder, no move); its
+/// audio decodes to the 1 kHz tone after G while output 0 keeps the program
+/// mix. An audio-only take to `Program` returns it to the program mix and,
+/// within ~10 ticks, to the shared stream (`audio_buses_live == 0`). Audio
+/// PTS steps 1024 (1/48000) = 1920 MPEG-TS (90 kHz) units on every packet.
+#[test]
+#[allow(clippy::too_many_lines)] // One end-to-end scenario with its assertions.
+fn an_audio_only_take_routes_a_source_and_returns_to_the_shared_stream() {
+    const TICKS: u64 = 400;
+    let observed = Arc::new(Mutex::new(Observed::default()));
+    let record = Arc::clone(&observed);
+    let buses_after = Arc::new(Mutex::new(None));
+    let buses_out = Arc::clone(&buses_after);
+    let run = drive_config(AUDIO_CONFIG, true, "route_ao", TICKS, move |slot| {
+        let handle = wait_for("the routing handle", Duration::from_secs(10), || {
+            slot.load()
+        });
+        let outcomes = handle.outcomes().expect("one outcome reader");
+        wait_for("the first routing tick", Duration::from_secs(10), || {
+            (handle.snapshot().video_keys > 0).then_some(())
+        });
+        std::thread::sleep(Duration::from_millis(800));
+        let audio_take = |op: &str, choice: super::AudioChoice| {
+            handle
+                .try_take(OutputTake {
+                    operation_id: op.to_owned(),
+                    output_index: 1,
+                    bus: None,
+                    audio: Some(choice),
+                    principal: "operator".to_owned(),
+                })
+                .unwrap();
+            let o = wait_for(&format!("{op} outcome"), Duration::from_secs(5), || {
+                outcomes.try_recv().ok()
+            });
+            assert_eq!(o.operation_id, op);
+            assert_eq!(o.outcome, TakeResult::Applied, "{o:?}");
+            o
+        };
+        let o = audio_take(
+            "to-bars",
+            super::AudioChoice::Source("route_ao_b".to_owned()),
+        );
+        let s = handle.snapshot();
+        assert_eq!(s.outputs[1].bus, "program", "the video stays");
+        assert_eq!(s.outputs[1].audio, "src:route_ao_b");
+        record.lock().unwrap().to_source = Some((o, s.audio_buses_live));
+        std::thread::sleep(Duration::from_millis(1600));
+        let o = audio_take("to-program", super::AudioChoice::Program);
+        record.lock().unwrap().to_program = Some((o, 0));
+        // Back on the shared stream within ~10 ticks (4 frames + a fade):
+        // 10 ticks are 400 ms of the 40 ms-per-tick test clock.
+        let started = std::time::Instant::now();
+        wait_for(
+            "return to the shared stream",
+            Duration::from_secs(5),
+            || (handle.snapshot().audio_buses_live == 0).then_some(()),
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "returned late: {:?}",
+            started.elapsed()
+        );
+        *buses_out.lock().unwrap() = Some(handle.snapshot().audio);
+    });
+    let observed = observed.lock().unwrap();
+    let (to_bars, live) = observed.to_source.clone().expect("take applied");
+    let (to_program, _) = observed.to_program.clone().expect("back applied");
+    assert_eq!(live, 1, "one private bus while on the tone");
+    assert_eq!(run.frames, TICKS);
+    let counters = buses_after.lock().unwrap().expect("returned");
+    assert_eq!(counters.opened, 1, "{counters:?}");
+    assert_eq!(counters.returned, 1, "moved back to the shared stream");
+    assert_eq!(counters.failed, 0, "{counters:?}");
+    assert_eq!(counters.refused, 0, "{counters:?}");
+    assert_eq!(run.final_snapshot.audio_buses_live, 0);
+    // The video: output 1 is output 0, packet for packet.
+    assert_eq!(run.outputs[0], run.outputs[1], "the same video packets");
+    let all: Vec<i64> = (0..i64::try_from(TICKS).unwrap()).collect();
+    assert_eq!(pts_of(&run.outputs[0]), all);
+    let pts = |o: usize| {
+        run.audio[o]
+            .iter()
+            .map(|p| p.pts().unwrap())
+            .collect::<Vec<_>>()
+    };
+    for o in 0..2 {
+        assert!(pts(o).len() > 100);
+        for pair in pts(o).windows(2) {
+            assert_eq!(pair[1] - pair[0], 1024, "output {o}: audio PTS step");
+            assert_eq!(
+                (pair[1] - pair[0]) * 90_000 / 48_000,
+                1920,
+                "output {o}: 90 kHz step"
+            );
+        }
+    }
+    assert_eq!(pts(0), pts(1), "the same audio frames on both outputs");
+    let g = |tick: u64| -> i64 { (i64::try_from(tick).unwrap() * 1920 + 1023) / 1024 * 1024 };
+    let decoded: Vec<_> = (0..2).map(|o| decode_audio(&run.audio[o])).collect();
+    let span = |o: usize, from: i64, to: i64| -> Vec<f32> {
+        decoded[o]
+            .iter()
+            .filter(|(p, _)| *p >= from && *p < to)
+            .flat_map(|(_, s)| s.iter().copied())
+            .collect()
+    };
+    // The outcome tick is the tick whose block holds G: G lies within it.
+    let on_bars = (g(to_bars.tick) + 4096, g(to_program.tick) - 2048);
+    assert!(on_bars.1 - on_bars.0 >= 8 * 1024, "{on_bars:?}");
+    let tone = span(1, on_bars.0, on_bars.1);
+    assert!(
+        rms(&tone) > 0.02,
+        "output 1 carries the tone: {}",
+        rms(&tone)
+    );
+    let ms = tone.len() / 48;
+    let hz = crossings(&tone) * 500 / ms.max(1);
+    assert!((900..=1100).contains(&hz), "output 1 tone at {hz} Hz");
+    let program = span(0, 2048, i64::MAX);
+    assert!(
+        rms(&program) < 1e-3,
+        "output 0 keeps the silent program mix"
+    );
+    let before = span(1, 2048, g(to_bars.tick) - 3072);
+    assert!(rms(&before) < 1e-3, "before the take: {}", rms(&before));
+    let after = span(1, g(to_program.tick) + 4096, i64::MAX);
+    assert!(after.len() > 1024);
+    assert!(rms(&after) < 1e-3, "after the return: {}", rms(&after));
+}
+
+/// ADR-0108 slice 2 §6.1: a run whose config persists `audio = { source =
+/// "<b>" }` on output 1 starts it on follow and re-applies the persisted feed
+/// as an audio-only boot take: within a few ticks of the first routing tick
+/// the router snapshot shows output 1 carrying `src:<b>` (video unchanged),
+/// and output 0 keeps the program mix.
+#[test]
+fn a_persisted_audio_feed_is_re_applied_by_a_boot_take() {
+    const TICKS: u64 = 120;
+    let template = format!(
+        "{AUDIO_CONFIG}\n[[routing.output]]\noutput = \"out1\"\naudio = {{ source = \"@_b\" }}\n"
+    );
+    let seen = Arc::new(Mutex::new(None));
+    let record = Arc::clone(&seen);
+    let prep = |pipeline: &mut Pipeline| {
+        let takes = pipeline.boot_audio_takes_mut();
+        assert_eq!(
+            *takes,
+            vec![(
+                "out1".to_owned(),
+                super::AudioChoice::Source("route_boot_b".to_owned())
+            )],
+            "the persisted feed is parsed into one boot take"
+        );
+        // The harness binds its sinks as `test-sink-N` (positional).
+        takes[0].0 = "test-sink-1".to_owned();
+    };
+    let run = drive_prepared(
+        &template,
+        true,
+        false,
+        "route_boot",
+        TICKS,
+        prep,
+        move |slot| {
+            let handle = wait_for("the routing handle", Duration::from_secs(10), || {
+                slot.load()
+            });
+            let outcomes = handle.outcomes().expect("one outcome reader");
+            let o = wait_for("the boot take outcome", Duration::from_secs(10), || {
+                outcomes.try_recv().ok()
+            });
+            assert_eq!(o.operation_id, "boot-audio:test-sink-1");
+            assert_eq!(o.outcome, TakeResult::Applied, "{o:?}");
+            let s = wait_for("the boot audio on air", Duration::from_secs(5), || {
+                let s = handle.snapshot();
+                (s.outputs
+                    .get(1)
+                    .is_some_and(|v| v.audio == "src:route_boot_b"))
+                .then_some(s)
+            });
+            *record.lock().unwrap() = Some((o.tick, s));
+        },
+    );
+    let (tick, s) = seen.lock().unwrap().take().expect("observed");
+    assert!(
+        tick < 30,
+        "the boot take applies within a few ticks: {tick}"
+    );
+    assert_eq!(s.outputs[1].bus, "program", "the video is untouched");
+    assert_eq!(s.outputs[1].audio_choice, "src:route_boot_b");
+    assert_eq!(s.outputs[0].audio, "program");
+    assert_eq!(run.frames, TICKS);
 }

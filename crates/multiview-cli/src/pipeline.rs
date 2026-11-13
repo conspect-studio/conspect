@@ -290,9 +290,16 @@ fn boot_output_feeds(config: &MultiviewConfig) -> Vec<(String, crate::routing_au
 /// per run, right after the handle exists and before the clock starts; the
 /// mailbox (64) is far larger than the outputs of any run, and a refused
 /// enqueue only logs (the output stays on Program).
+///
+/// A persisted explicit audio feed on the same output rides this take (a
+/// combined take, when the output has a program-audio slot), so the
+/// audio-only boot take of [`Pipeline::issue_boot_audio_takes`] never
+/// supersedes the video boot take on the same output; the router re-issues
+/// the audio alone if the combined take is given up.
 fn enqueue_boot_takes(
     handle: &crate::output_routing::OutputRoutingHandle,
     feeds: &[(String, crate::routing_aux::PictureBus)],
+    audio: &[(String, crate::routing_audio::AudioChoice)],
 ) {
     for (id, bus) in feeds {
         let Some(output_index) = handle.index_of(id) else {
@@ -319,10 +326,21 @@ fn enqueue_boot_takes(
             end -= 1;
         }
         operation_id.truncate(end);
+        let audio = audio
+            .iter()
+            .find(|(output, _)| output == id)
+            .map(|(_, choice)| choice.clone())
+            .filter(|_| {
+                handle
+                    .outputs()
+                    .get(output_index)
+                    .is_some_and(|o| o.program_audio)
+            });
         let take = crate::output_routing::OutputTake {
             operation_id,
             output_index,
-            bus: bus.clone(),
+            bus: Some(bus.clone()),
+            audio,
             principal: crate::output_routing::BOOT_PRINCIPAL.to_owned(),
         };
         if handle.try_take(take).is_err() {
@@ -335,6 +353,47 @@ fn enqueue_boot_takes(
 /// validate` share it (#317).
 fn ensure_outputs_carry_program(config: &MultiviewConfig) -> Result<(), PipelineError> {
     multiview_config::outputs_carry_program(config).map_err(PipelineError::Engine)
+}
+
+/// The persisted non-`follow` audio feeds of `config`'s outputs as engine
+/// choices (a track resolved to its `audio-routing` route input; an
+/// undeclared track or a multi-track feed, which the routed slot cannot
+/// carry, is skipped with a warning).
+fn boot_audio_choices(
+    config: &MultiviewConfig,
+) -> Vec<(String, crate::routing_audio::AudioChoice)> {
+    use crate::routing_audio::AudioChoice;
+    use multiview_config::AudioFeed;
+    config
+        .output_feeds()
+        .into_iter()
+        .filter_map(|xp| {
+            let choice = match &xp.audio {
+                AudioFeed::Program => AudioChoice::Program,
+                AudioFeed::None => AudioChoice::Silence,
+                AudioFeed::Source(id) => AudioChoice::Source(id.clone()),
+                AudioFeed::Tracks(tracks) => {
+                    let input = match tracks.as_slice() {
+                        [name] => config.audio.as_ref().and_then(|a| {
+                            a.routes
+                                .iter()
+                                .find(|r| r.target_track.as_deref() == Some(name.as_str()))
+                                .map(|r| (name.clone(), r.input_id.clone()))
+                        }),
+                        _ => None,
+                    };
+                    let Some((name, input)) = input else {
+                        tracing::warn!(output = %xp.output, "output routing: persisted audio tracks cannot ride the routed slot; the output starts on follow");
+                        return None;
+                    };
+                    AudioChoice::Track { name, input }
+                }
+                // `follow` is what the run starts on.
+                _ => return None,
+            };
+            Some((xp.output, choice))
+        })
+        .collect()
 }
 
 /// Errors building or running the libav\* pipeline.
@@ -2242,6 +2301,10 @@ pub struct Pipeline {
     boot_output_feeds: Vec<(String, crate::routing_aux::PictureBus)>,
     /// The boot takes' retry policy (the defaults; a test shortens it).
     boot_retry: crate::output_routing::BootRetryPolicy,
+    /// Persisted non-`follow` output audio feeds `(output config id, choice)`
+    /// (ADR-0108 slice 2 §6.1): each run issues them as audio-only boot takes
+    /// right after its routing handle is published.
+    boot_audio_takes: Vec<(String, crate::routing_audio::AudioChoice)>,
     /// The running Program's lateness histogram + repeats counter (ADR-0108
     /// §10), published at run start for the control plane's metrics route.
     program_metrics: ProgramMetricsSlot,
@@ -3322,6 +3385,7 @@ impl Pipeline {
             output_routing: crate::output_routing::output_routing_slot(),
             boot_output_feeds: boot_output_feeds(config),
             boot_retry: crate::output_routing::BootRetryPolicy::default(),
+            boot_audio_takes: boot_audio_choices(config),
             program_metrics: Arc::new(multiview_framestore::SwapCell::empty()),
             optional_preview: None,
             window_dependencies: Arc::new(window_dependency_axes(config)),
@@ -3505,6 +3569,7 @@ impl Pipeline {
     fn build_output_routing(
         &self,
         binding_ids: &[Option<String>],
+        audio_tracks: &[Vec<usize>],
     ) -> Result<RunRouting, PipelineError> {
         let spawn_err = |e: std::io::Error| PipelineError::Output {
             kind: "routing",
@@ -3587,10 +3652,13 @@ impl Pipeline {
                 routable: self.rendition_configs.get(settings).is_some_and(|cfg| {
                     !(cfg.codec_name.contains("vaapi") || cfg.codec_name.contains("videotoolbox"))
                 }),
+                // The routed audio rides the binding's program-audio slot
+                // (track 0, present only when this run encodes program audio).
+                program_audio: audio_tracks.get(index).is_some_and(|t| t.contains(&0)),
             })
             .collect();
         let handle = Arc::new(handle.with_outputs(run_outputs));
-        enqueue_boot_takes(&handle, &self.boot_output_feeds);
+        enqueue_boot_takes(&handle, &self.boot_output_feeds, &self.boot_audio_takes);
         self.output_routing.store(Some(handle));
         Ok(RunRouting {
             consumer: ConsumerRouting {
@@ -3602,6 +3670,59 @@ impl Pipeline {
             preview_selection,
             aux,
         })
+    }
+
+    /// Issue one audio-only take per output whose persisted audio feed is not
+    /// `follow` (ADR-0108 slice 2 §6.1), onto the handle
+    /// [`Self::build_output_routing`] just published. The consumer drains them
+    /// on its first ticks. An audio-only take has no fresh gate, so there is
+    /// no retry: a take that cannot be enqueued, or that the engine refuses
+    /// (an output without a program-audio slot), is logged and the persisted
+    /// value stays. Never blocks (bounded `try_send`).
+    fn issue_boot_audio_takes(&self) {
+        if self.boot_audio_takes.is_empty() {
+            return;
+        }
+        let Some(handle) = self.output_routing.load() else {
+            return;
+        };
+        for (output, choice) in &self.boot_audio_takes {
+            let Some(index) = handle.index_of(output) else {
+                tracing::warn!(%output, "output routing: boot audio take for an output this run does not route");
+                continue;
+            };
+            if !handle.outputs().get(index).is_some_and(|o| o.program_audio) {
+                tracing::warn!(%output, audio = %choice.label(), "output routing: this output cannot carry a routed audio feed; it starts on follow");
+                continue;
+            }
+            // A video boot take on this output already carries the audio (a
+            // combined take, see `enqueue_boot_takes`): an audio-only take
+            // here would supersede it.
+            let video_boot = self.boot_output_feeds.iter().any(|(id, _)| id == output)
+                && handle.outputs().get(index).is_some_and(|o| o.routable);
+            if video_boot {
+                continue;
+            }
+            let take = crate::output_routing::OutputTake {
+                operation_id: format!("boot-audio:{output}"),
+                output_index: index,
+                bus: None,
+                audio: Some(choice.clone()),
+                principal: "boot".to_owned(),
+            };
+            if handle.try_take(take).is_err() {
+                tracing::warn!(%output, "output routing: boot audio take not enqueued; it starts on follow");
+            }
+        }
+    }
+
+    /// Test seam: the boot audio takes parsed from the config (the stream
+    /// test harness renames its bindings `test-sink-N`, so a test re-keys them).
+    #[cfg(test)]
+    pub(crate) fn boot_audio_takes_mut(
+        &mut self,
+    ) -> &mut Vec<(String, crate::routing_audio::AudioChoice)> {
+        &mut self.boot_audio_takes
     }
 
     /// Every catalogued source's frame store, keyed by id.
@@ -4963,7 +5084,8 @@ impl Pipeline {
         // Output routing (ADR-0108 slice 1): the clock's aux tick sender (inert
         // until a take routes a feed), the off-clock `routing-aux` thread (it
         // blocks on recv while nothing is routed), and the consumer's router.
-        let routing = self.build_output_routing(&binding_ids)?;
+        let routing = self.build_output_routing(&binding_ids, &enforced_audio_tracks)?;
+        self.issue_boot_audio_takes();
         let RunRouting {
             consumer: consumer_routing,
             aux_tx,
@@ -7700,6 +7822,20 @@ fn consumer_main<D: WindowDelivery>(
         // live-opened encoders. Never waits; a no-take run does nothing here.
         let tick_pts =
             MediaTime::from_tick(i64::try_from(item.tick_index).unwrap_or(i64::MAX), cadence);
+        // The ticks this consumer missed (a transient stall shed them from
+        // the hot queue), computed ONCE before the router tick and reused
+        // below for the base-worker substitution loop: the existing error
+        // behaviour (a gap beyond the admitted envelope fails the run) is
+        // preserved exactly, before anything is offered to either Clean or
+        // the base workers.
+        let missing = missing_ticks_before(last_tick, item.tick_index)?;
+        // Clean is substituted exactly like Program: each missing tick is
+        // offered Clean's own last pre-bake frame BEFORE `publish_clean`
+        // publishes the surviving tick, so the Clean worker sees ticks
+        // strictly increasing (missing ticks, then the surviving tick) and
+        // a consumer stall never relies solely on Clean's own `GapFill` to
+        // absorb the gap. One bool check when Clean is not active.
+        router.substitute_clean(missing.clone());
         // The Clean bus is this tick's Program canvas BEFORE the overlay bake,
         // published before the router tick so a Clean encoder gets frame T
         // this tick. One bool check when nothing selects Clean.
@@ -7753,13 +7889,13 @@ fn consumer_main<D: WindowDelivery>(
         // deployed continuity contract is untouched) and the muxed stream has
         // a frame for EVERY output tick. A gap beyond the admitted envelope
         // fails the run explicitly (never silently skips forward).
-        for missing in missing_ticks_before(last_tick, item.tick_index)? {
+        for missing_tick in missing {
             let canvas = last_baked.as_ref().unwrap_or(&overlaid);
             for worker in &workers {
                 worker
                     .offer_within(
                         BakedTick {
-                            tick: missing,
+                            tick: missing_tick,
                             canvas: Arc::clone(canvas),
                         },
                         offer_horizon,

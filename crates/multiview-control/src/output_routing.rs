@@ -19,7 +19,7 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
-use multiview_config::VideoFeed;
+use multiview_config::{AudioFeed, VideoFeed};
 
 /// The picture bus a take routes onto an output (the slice-1 subset of
 /// [`VideoFeed`]).
@@ -85,15 +85,68 @@ impl RoutedFeed {
     }
 }
 
-/// One take, already authorized by the HTTP layer.
+/// The audio a take routes onto an output (ADR-0108 slice 2, §5.1). A
+/// track is already resolved to its `audio-routing` route's input id.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum RoutedAudio {
+    /// The audio of the output's video feed.
+    Follow,
+    /// The program mix.
+    Program,
+    /// Silence.
+    None,
+    /// One source's own audio.
+    Source(String),
+    /// One discrete `audio-routing` track (`[audio].routes[].target_track`)
+    /// and the route's `input_id` it carries.
+    Track {
+        /// The track name.
+        name: String,
+        /// The route's input id.
+        input: String,
+    },
+}
+
+impl RoutedAudio {
+    /// The engine label of the choice: `follow`, `program`, `none`,
+    /// `src:<id>`, `track:<name>`.
+    #[must_use]
+    pub fn label(&self) -> String {
+        match self {
+            Self::Follow => "follow".to_owned(),
+            Self::Program => "program".to_owned(),
+            Self::None => "none".to_owned(),
+            Self::Source(id) => format!("src:{id}"),
+            Self::Track { name, .. } => format!("track:{name}"),
+        }
+    }
+
+    /// The config [`AudioFeed`] this choice persists as.
+    #[must_use]
+    pub fn audio_feed(&self) -> AudioFeed {
+        match self {
+            Self::Follow => AudioFeed::Follow,
+            Self::Program => AudioFeed::Program,
+            Self::None => AudioFeed::None,
+            Self::Source(id) => AudioFeed::Source(id.clone()),
+            Self::Track { name, .. } => AudioFeed::Tracks(vec![name.clone()]),
+        }
+    }
+}
+
+/// One take, already authorized by the HTTP layer. At least one of `video`
+/// and `audio` is set; `video: None` is an audio-only take (the video is
+/// untouched), `audio: None` keeps the output's audio choice.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OutputTakeRequest {
     /// The operation id minted for the take (echoed in its outcome).
     pub operation_id: String,
     /// The output's config id.
     pub output: String,
-    /// The destination feed.
-    pub feed: RoutedFeed,
+    /// The destination video feed (`None`: audio-only).
+    pub video: Option<RoutedFeed>,
+    /// The output's new audio choice (`None`: keep the current one).
+    pub audio: Option<RoutedAudio>,
     /// The authenticated key id the take is charged to (never client input).
     pub principal: String,
 }
@@ -115,6 +168,17 @@ pub enum PlanRefusal {
     OutputKindUnroutable,
     /// Preview or Clean requested on a run without an M/E.
     SwitcherRequired,
+    /// The output has no program-audio slot for a routed audio feed (NDI,
+    /// AES67, display, or a run without program audio).
+    AudioUnsupported,
+}
+
+/// The predicted audio cost of a take (§5.2, §7).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct AudioPlanCost {
+    /// `true` when the take changes the output's effective audio and the
+    /// output has no private audio bus yet: +1 transient CPU AAC encode.
+    pub needs_encoder: bool,
 }
 
 /// The predicted cost of a take.
@@ -147,6 +211,14 @@ pub struct OutputLive {
     pub pending: Option<(String, u64)>,
     /// The current bus is holding its last picture beyond the degraded bound.
     pub degraded: bool,
+    /// The audio the output carries (engine label: `program`, `none`,
+    /// `src:<id>`, `track:<name>`, `preview`); `None` when the run carries
+    /// no program audio.
+    pub audio: Option<String>,
+    /// The audio choice label of the pending take, when it carries one.
+    pub pending_audio: Option<String>,
+    /// Whether the output runs a private encoded audio bus now.
+    pub private_audio: bool,
 }
 
 /// The engine's routing readback.
@@ -179,6 +251,9 @@ pub struct OutputOutcome {
     /// (always set for `applied`: the feed to persist). Carried here so
     /// persistence never depends on control-plane bookkeeping.
     pub feed: Option<RoutedFeed>,
+    /// The output's audio choice after this outcome, when the engine knows
+    /// it (`None` for a run without program audio).
+    pub audio: Option<RoutedAudio>,
 }
 
 /// The engine seam the binary implements (all calls non-blocking).
@@ -188,6 +263,19 @@ pub trait OutputRouting: Send + Sync {
     /// # Errors
     /// The refusal the take would certainly meet.
     fn plan(&self, output: &str, feed: &RoutedFeed) -> Result<PlanCost, PlanRefusal>;
+    /// Predict a take's audio cost: `video` is the take's new video feed
+    /// (`None`: unchanged), `audio` its audio choice (`None`: unchanged).
+    ///
+    /// # Errors
+    /// [`PlanRefusal::AudioUnsupported`] when `audio` is an explicit choice
+    /// the output cannot carry; [`PlanRefusal::OutputKindUnroutable`] for an
+    /// output the engine does not route.
+    fn plan_audio(
+        &self,
+        output: &str,
+        video: Option<&RoutedFeed>,
+        audio: Option<&RoutedAudio>,
+    ) -> Result<AudioPlanCost, PlanRefusal>;
     /// Enqueue an authorized take without waiting.
     ///
     /// # Errors
@@ -223,6 +311,10 @@ pub const MAX_LIMITED_PRINCIPALS: usize = 1024;
 pub const MAX_LIMITED_OUTPUTS: usize = 1024;
 const RATE_WINDOW: Duration = Duration::from_secs(1);
 
+/// Operation-id prefix of the takes the engine issues itself at run start to
+/// re-apply persisted state (never persisted again on `applied`).
+pub const BOOT_TAKE_PREFIX: &str = "boot-";
+
 /// A recorded terminal outcome.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RecordedOutcome {
@@ -237,8 +329,11 @@ pub struct RecordedOutcome {
 pub struct PendingTake {
     /// The output's API id (the event and the readback name this).
     pub api_id: String,
-    /// The feed to persist on `applied`.
-    pub feed: RoutedFeed,
+    /// The video feed to persist on `applied` (`None`: an audio-only take,
+    /// which keeps the persisted video).
+    pub feed: Option<RoutedFeed>,
+    /// The audio choice the take carries, if any.
+    pub audio: Option<RoutedAudio>,
 }
 
 /// A take's record for the life of its `Idempotency-Key` (or until it is
@@ -671,14 +766,29 @@ async fn relay_one(
         return;
     };
     // The feed to persist rides the outcome itself, so an `applied` persists
-    // whether or not this process still holds the take's record.
-    if outcome.outcome == "applied" {
-        let feed = outcome
-            .feed
+    // whether or not this process still holds the take's record. An
+    // audio-only take (its record says so) keeps the persisted video.
+    // A boot take (operation id `boot-…`) re-applies the persisted state at
+    // run start: there is nothing new to persist.
+    if outcome.outcome == "applied" && !outcome.operation_id.starts_with(BOOT_TAKE_PREFIX) {
+        let audio_only = settled.as_ref().is_some_and(|p| p.feed.is_none());
+        let feed = if audio_only {
+            None
+        } else {
+            outcome
+                .feed
+                .clone()
+                .or_else(|| settled.as_ref().and_then(|p| p.feed.clone()))
+        };
+        let audio = outcome
+            .audio
             .clone()
-            .or_else(|| settled.as_ref().map(|p| p.feed.clone()));
-        if let Some(feed) = feed {
-            if let Err(error) = persist_feed(state, &outcome.output, &feed).await {
+            .or_else(|| settled.as_ref().and_then(|p| p.audio.clone()))
+            .map(|a| a.audio_feed());
+        if feed.is_some() || audio.is_some() {
+            if let Err(error) =
+                persist_route(state, &outcome.output, feed.as_ref(), audio.as_ref()).await
+            {
                 tracing::warn!(%error, output = %api_id, "output routing: applied take not persisted");
             }
         }
@@ -700,6 +810,7 @@ async fn relay_one(
 /// Program row is kept so a restart does not re-seed the boot row), under the
 /// config-mutation lock `apply-layout` uses. Called only after the engine
 /// reported `applied`. Start-up carries these rows (store-backed, #329).
+/// Keeps the row's audio.
 ///
 /// # Errors
 /// The accepted document cannot be read, validated or committed.
@@ -707,6 +818,22 @@ pub async fn persist_feed(
     state: &crate::AppState,
     output: &str,
     feed: &RoutedFeed,
+) -> crate::ControlResult<()> {
+    persist_route(state, output, Some(feed), None).await
+}
+
+/// Persist an applied take on `output`'s `[[routing.output]]` row: `video`
+/// replaces its video feed and `audio` its audio feed (`None` keeps each).
+/// A row that ends on Program video and `follow` audio is removed (absent =
+/// default, today's behaviour). Under the config-mutation lock.
+///
+/// # Errors
+/// The accepted document cannot be read, validated or committed.
+pub async fn persist_route(
+    state: &crate::AppState,
+    output: &str,
+    video: Option<&RoutedFeed>,
+    audio: Option<&AudioFeed>,
 ) -> crate::ControlResult<()> {
     if state.boot_model.is_none() {
         return Ok(());
@@ -723,24 +850,37 @@ pub async fn persist_feed(
     // Only the output rows change: an absent table stays free of desugared
     // cell/audio rows (a later layout edit must not meet stale crosspoints).
     let mut table = config.routing.take().unwrap_or_default();
-    table.output.retain(|xp| xp.output != output);
+    let previous = table
+        .output
+        .iter()
+        .position(|xp| xp.output == output)
+        .map(|i| table.output.remove(i));
+    let (kept_video, kept_audio) = previous.map_or((VideoFeed::PROGRAM, AudioFeed::Follow), |xp| {
+        (xp.effective_video(), xp.audio)
+    });
+    let video = video.map_or(kept_video, RoutedFeed::video_feed);
+    let audio = audio.cloned().unwrap_or(kept_audio);
     // A start-up seeds an output with no accepted row from the BOOT file's
-    // row (#329), so a take back to Program must stay explicit when the boot
-    // file routes that output elsewhere — or a restart would undo it.
+    // row (#329), so a take back to Program (and `follow`) must stay explicit
+    // when the boot file routes that output elsewhere — or a restart would
+    // undo it.
     let boot_seeds_other = state.boot_model.as_ref().is_some_and(|model| {
         model.loaded().routing.as_ref().is_some_and(|t| {
             t.output.iter().any(|xp| {
-                xp.output == output && xp.effective_video() != multiview_config::VideoFeed::PROGRAM
+                xp.output == output
+                    && (xp.effective_video() != VideoFeed::PROGRAM || !xp.audio.is_follow())
             })
         })
     });
-    if *feed != RoutedFeed::Program || boot_seeds_other {
+    if video != VideoFeed::PROGRAM || !audio.is_follow() || boot_seeds_other {
         let mut xp = multiview_config::OutputCrosspoint::program(output, program);
-        xp.video = Some(feed.video_feed());
+        if video != VideoFeed::PROGRAM {
+            xp.video = Some(video);
+        }
+        xp.audio = audio;
         table.output.push(xp);
     }
-    // Otherwise Program removes the entry (absent = Program, today's
-    // behaviour).
+    // Otherwise Program + follow removes the entry (absent = the default).
     let empty = table.output.is_empty()
         && table.video.is_empty()
         && table.audio.is_empty()
@@ -798,7 +938,8 @@ mod tests {
         let mut store = TakeStore::new(3, 3);
         let pending = || PendingTake {
             api_id: "o".to_owned(),
-            feed: RoutedFeed::Program,
+            feed: Some(RoutedFeed::Program),
+            audio: None,
         };
         let mut ops = Vec::new();
         for i in 0..3 {
@@ -832,7 +973,8 @@ mod tests {
     fn pending_take() -> PendingTake {
         PendingTake {
             api_id: "o".to_owned(),
-            feed: RoutedFeed::Program,
+            feed: Some(RoutedFeed::Program),
+            audio: None,
         }
     }
 
@@ -935,6 +1077,22 @@ mod tests {
         ] {
             assert_eq!(RoutedFeed::from_bus_name(&feed.bus_name()), Some(feed));
         }
+    }
+
+    #[test]
+    fn routed_audio_labels_match_the_engine_and_persist_as_config_feeds() {
+        let track = RoutedAudio::Track {
+            name: "eng".into(),
+            input: "cam".into(),
+        };
+        assert_eq!(track.label(), "track:eng");
+        assert_eq!(track.audio_feed(), AudioFeed::Tracks(vec!["eng".into()]));
+        assert_eq!(RoutedAudio::None.label(), "none");
+        assert_eq!(
+            RoutedAudio::Source("x".into()).audio_feed(),
+            AudioFeed::Source("x".into())
+        );
+        assert_eq!(RoutedAudio::Follow.audio_feed(), AudioFeed::Follow);
     }
 
     #[test]

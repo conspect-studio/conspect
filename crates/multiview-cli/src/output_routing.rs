@@ -34,6 +34,8 @@ use crate::rendition_workers::{
     BakedTick, ClosingWorker, DispatchEvent, OfferRejection, RenditionWorker, ReorderBound,
     VideoEncodeWorker,
 };
+pub use crate::routing_audio::AudioChoice;
+use crate::routing_audio::{AudioTakeProgress, AudioTakeStart};
 use crate::routing_aux::{AuxFeed, AuxFeeds, PictureBus, PictureBusSlot};
 
 /// Longest accepted `principal` / `operation_id`, in bytes.
@@ -63,7 +65,10 @@ pub const OPEN_QUEUE: usize = 4;
 /// Reaper queue capacity; full = the handle is dropped unjoined (counted).
 pub const REAPER_QUEUE: usize = 8;
 /// Largest gap a live-opened worker fills with its last canvas.
-pub const MAX_GAP_FILL_TICKS: u64 = 8;
+/// Sized to cover a full consumer substitution gap (`FRAME_SUBSTITUTION_LIMIT`
+/// = 8 in the pipeline) on top of a full worker queue (`WORKER_QUEUE_TICKS` = 4)
+/// and the offers dropped meanwhile, so a transient stall never fails a key.
+pub const MAX_GAP_FILL_TICKS: u64 = 24;
 /// Operation-id prefix of a start-up (boot) take: `boot:<output config id>`.
 pub const BOOT_TAKE_PREFIX: &str = "boot:";
 /// The principal a boot take is charged to.
@@ -84,8 +89,11 @@ pub struct OutputTake {
     pub operation_id: String,
     /// Output index in the run's output list.
     pub output_index: usize,
-    /// Destination picture bus.
-    pub bus: PictureBus,
+    /// Destination picture bus (`None`: an audio-only take, the video is
+    /// untouched).
+    pub bus: Option<PictureBus>,
+    /// The output's new audio choice (`None`: keep the current one).
+    pub audio: Option<AudioChoice>,
     /// The principal the encoder is attributed to.
     pub principal: String,
 }
@@ -187,13 +195,18 @@ pub struct TakeOutcome {
     /// The output's bus after this outcome (for `Applied`, the taken bus):
     /// lets the control plane persist an applied take from the outcome alone.
     pub bus: PictureBus,
+    /// The output's audio choice after this outcome (`None` for a run
+    /// without program audio), for persistence.
+    pub audio: Option<AudioChoice>,
 }
 
 /// A pending take, as seen in the snapshot.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PendingView {
-    /// Destination bus name.
+    /// Destination bus name (the current bus for an audio-only take).
     pub bus: String,
+    /// The take's audio choice label, when it carries one.
+    pub audio: Option<String>,
     /// Ticks it has waited.
     pub held_ticks: u64,
 }
@@ -211,6 +224,15 @@ pub struct OutputRouteView {
     pub pending: Option<PendingView>,
     /// The current bus is holding its last picture beyond the degraded bound.
     pub degraded: bool,
+    /// The audio the output carries (once scheduled changes landed):
+    /// `program`, `none`, `src:<id>`, `track:<name>`, `preview`.
+    pub audio: String,
+    /// The output's audio choice: `follow`, `program`, `none`, `src:<id>`,
+    /// `track:<name>`.
+    pub audio_choice: String,
+    /// Whether the output runs a private encoded audio bus now (a take that
+    /// changes its audio then costs no new audio encode).
+    pub private_audio: bool,
 }
 
 /// Wait-free routing state, written by the consumer only on change.
@@ -254,6 +276,10 @@ pub struct RoutingSnapshot {
     pub boot_takes_pending: usize,
     /// Start-up takes given up: the output stayed on Program.
     pub boot_takes_given_up: u64,
+    /// Pending dispatcher moves the router could not cancel by re-asserting
+    /// the output's key (it was already failed/retired); the move was
+    /// cancelled directly instead (#330 item 4).
+    pub move_cancel_failures: u64,
 }
 
 /// The control-plane handle (clone freely).
@@ -285,6 +311,9 @@ pub struct RunOutput {
     /// Whether slice 1 can cut this output cleanly (its encoder family has
     /// the parameter-set RAP check; VAAPI/VideoToolbox do not, §4.2).
     pub routable: bool,
+    /// Whether the output's binding has a program-audio slot, the slot a
+    /// routed audio feed rides (§5.5). `false`: audio takes are refused.
+    pub program_audio: bool,
 }
 
 impl std::fmt::Debug for OutputRoutingHandle {
@@ -583,6 +612,12 @@ struct DynamicKey {
     /// Consecutive ticks this key was offered a frame with no event from its
     /// worker since; reset by every event. `WEDGED_ENCODER_TICKS` = wedged.
     silent: u32,
+    /// Consecutive offers to this key's worker refused (`Overloaded`); reset
+    /// by an accepted offer. Counted per key, never per bus: a healthy
+    /// sibling key on the same bus must not hide a starved one.
+    /// `DEGRADED_AFTER_TICKS` marks its outputs degraded;
+    /// `FALLBACK_AFTER_TICKS` closes the key (its outputs fall back).
+    starved: u64,
 }
 
 struct PendingOpen {
@@ -605,6 +640,8 @@ enum Phase {
     Warming { key: usize, deadline: u64 },
     /// A dispatcher move to `key` was requested.
     Moving(usize),
+    /// An audio-only take's crossfade is scheduled; refused at `deadline`.
+    AudioMoving { deadline: u64 },
 }
 
 struct Pending {
@@ -667,6 +704,7 @@ pub struct OutputRouter {
     /// Events dropped by live-opened workers' sinks (shared with them).
     dyn_dropped: Arc<AtomicU64>,
     parameter_set_changes: u64,
+    move_cancel_failures: u64,
     video_keys: usize,
     /// Items handed to the reaper this run (0 = nothing to wait for at the end).
     reaped: u64,
@@ -677,12 +715,22 @@ pub struct OutputRouter {
     audio: Option<crate::routing_audio::RoutedAudio>,
     #[cfg(test)]
     audio_tap: crate::routing_audio::AudioTapCell,
-    /// Per output: its boot take while inside the retry window.
-    boot: Vec<Option<BootRetry>>,
+    /// Start-up (boot) takes (#329).
+    boot: BootTakes,
     /// The run's first tick (the boot retry window's origin).
     first_tick: Option<u64>,
+}
+
+/// The router's start-up (boot) take state, O(outputs).
+#[derive(Default)]
+struct BootTakes {
+    /// Per output: its boot take while inside the retry window.
+    slots: Vec<Option<BootRetry>>,
     /// Boot takes given up (refused for good, or the window ended).
-    boot_given_up: u64,
+    given_up: u64,
+    /// The audio of given-up combined boot takes, re-issued alone on the
+    /// next tick (at most one per output).
+    audio_after: Vec<OutputTake>,
 }
 
 impl OutputRouter {
@@ -782,6 +830,7 @@ impl OutputRouter {
             dead_encoders: 0,
             dyn_dropped: Arc::new(AtomicU64::new(0)),
             parameter_set_changes: 0,
+            move_cancel_failures: 0,
             video_keys: 0,
             reaped: 0,
             dirty: true,
@@ -789,9 +838,8 @@ impl OutputRouter {
             audio: None,
             #[cfg(test)]
             audio_tap,
-            boot: Vec::new(),
+            boot: BootTakes::default(),
             first_tick: None,
-            boot_given_up: 0,
         };
         router.publish_snapshot();
         Ok((router, handle))
@@ -817,6 +865,14 @@ impl OutputRouter {
         #[cfg(test)]
         if let Some(audio) = self.audio.as_mut() {
             audio.tap = Some(Arc::clone(&self.audio_tap));
+        }
+    }
+
+    /// Test seam: inject the private-bus encode thread's per-job hook.
+    #[cfg(test)]
+    pub(crate) fn set_audio_worker_hook(&mut self, hook: crate::routing_audio::WorkerHook) {
+        if let Some(audio) = self.audio.as_mut() {
+            audio.worker_hook = Some(hook);
         }
     }
 
@@ -849,9 +905,9 @@ impl OutputRouter {
         dispatcher: &mut RenditionDispatcher,
     ) {
         if let Some(audio) = self.audio.as_mut() {
-            let before = audio.private_buses();
+            let before = (audio.private_buses(), audio.counters());
             audio.feed(tick, program, inputs, dispatcher);
-            if audio.private_buses() != before {
+            if (audio.private_buses(), audio.counters()) != before {
                 self.dirty = true;
             }
         }
@@ -878,6 +934,58 @@ impl OutputRouter {
         }
     }
 
+    /// Substitute every tick in `ticks` on the Clean bus with its own last
+    /// pre-bake frame, exactly like Program's base-worker substitution:
+    /// call on the bake consumer BEFORE [`Self::publish_clean`]/[`Self::on_tick`]
+    /// for the surviving tick, with the SAME range the base-worker
+    /// substitution loop computes, when a consumer stall sheds ticks from
+    /// the hot queue. Without this, a Clean live encoder would see only
+    /// surviving ticks and rely on its own `GapFill` (bounded by
+    /// [`MAX_GAP_FILL_TICKS`]) to absorb a consumer gap — which, combined
+    /// with any dropped offers, can exceed that bound and fail the key.
+    ///
+    /// For each Clean dynamic key with a last-fed canvas, offers
+    /// `BakedTick { tick, canvas: last_fed }` (non-blocking, like
+    /// [`Self::feed`]) for every tick in `ticks`, in increasing order, and
+    /// stops at the first refused offer (counted as starvation; the rest of
+    /// the gap is filled by the key's own `GapFill`, whose bound covers a
+    /// full substitution gap plus a full queue). `feed()` then offers only
+    /// the surviving tick. Does nothing (one bool check) unless Clean is
+    /// active. Never blocks.
+    pub(crate) fn substitute_clean(&mut self, ticks: std::ops::Range<u64>) {
+        if !self.clean_active {
+            return;
+        }
+        for d in &mut self.dynamic {
+            if d.bus != PictureBus::Clean {
+                continue;
+            }
+            let Some(worker) = d.worker.as_ref() else {
+                continue;
+            };
+            let Some(canvas) = d.last_fed.clone() else {
+                continue;
+            };
+            // Stop at the first refused offer: the ticks after it stay
+            // visible as a gap the key's own `GapFill` fills (bounded) once
+            // its queue drains, and the refusal counts toward starvation.
+            for tick in ticks.clone() {
+                match worker.offer(BakedTick {
+                    tick,
+                    canvas: Arc::clone(&canvas),
+                }) {
+                    Ok(()) => d.starved = 0,
+                    Err(OfferRejection::Overloaded) => {
+                        d.starved = d.starved.saturating_add(1);
+                        break;
+                    }
+                    // `feed` closes an ended worker on this same tick.
+                    Err(OfferRejection::Ended) => break,
+                }
+            }
+        }
+    }
+
     /// One Program tick: drain dynamic events, takes, opens and dispatcher
     /// outcomes; advance every take; feed live-opened encoders. Never waits.
     ///
@@ -900,7 +1008,9 @@ impl OutputRouter {
         self.first_tick.get_or_insert(tick);
         self.drain_takes(tick, dispatcher);
         self.retry_boot_takes(tick);
+        self.issue_boot_audio_after(tick, dispatcher);
         self.drain_opens(tick, dispatcher);
+        self.expire_orphan_opens(tick);
         self.drain_moves(tick, dispatcher);
         self.advance_takes(tick, pts, dispatcher);
         self.feed(tick, dispatcher);
@@ -937,7 +1047,13 @@ impl OutputRouter {
             self.close(key, dispatcher);
         }
         if let Some(audio) = self.audio.as_mut() {
+            let before = (audio.private_buses(), audio.counters());
             audio.drain(dispatcher, delivery)?;
+            // A bus the dispatcher failed (stall, watchdog) closed here: the
+            // readback must say so.
+            if (audio.private_buses(), audio.counters()) != before {
+                self.dirty = true;
+            }
         }
         while let Ok((generation, event)) = self.dyn_rx.try_recv() {
             // Accept only an event whose generation AND key index both name
@@ -982,6 +1098,7 @@ impl OutputRouter {
             .outputs
             .get(output_index)
             .map_or(PictureBus::Program, |o| o.bus.clone());
+        let audio = self.audio.as_ref().map(|a| a.choice(output_index));
         if self
             .outcomes
             .try_send(TakeOutcome {
@@ -990,6 +1107,7 @@ impl OutputRouter {
                 tick,
                 outcome,
                 bus,
+                audio,
             })
             .is_err()
         {
@@ -1020,7 +1138,7 @@ impl OutputRouter {
         outcome: TakeResult,
     ) {
         let retry_ticks = self.ticks_for(self.cfg.boot_retry.retry_secs);
-        let Some(slot) = self.boot.get_mut(index).filter(|slot| {
+        let Some(slot) = self.boot.slots.get_mut(index).filter(|slot| {
             slot.as_ref()
                 .is_some_and(|b| b.take.operation_id == operation_id)
         }) else {
@@ -1036,10 +1154,11 @@ impl OutputRouter {
             }
             TakeResult::Refused(reason) => {
                 if let Some(boot) = slot.take() {
-                    self.boot_given_up = self.boot_given_up.saturating_add(1);
+                    self.boot.given_up = self.boot.given_up.saturating_add(1);
+                    self.boot_audio_alone(&boot.take);
                     tracing::warn!(
                         output = index,
-                        feed = %boot.take.bus.as_str(),
+                        feed = %boot.take.bus.as_ref().map_or_else(|| "-".into(), PictureBus::as_str),
                         reason = reason.operator_message(),
                         "routing: the start-up take cannot be carried; the output stays on Program"
                     );
@@ -1051,14 +1170,59 @@ impl OutputRouter {
         }
     }
 
+    /// A given-up boot take that also carried a persisted audio feed (a
+    /// combined take): its audio is still applied, alone (audio-only takes
+    /// have no fresh gate), so the video's refusal never drops it.
+    fn boot_audio_alone(&mut self, take: &OutputTake) {
+        let Some(audio) = take.audio.clone() else {
+            return;
+        };
+        if self.boot.audio_after.len() >= self.outputs.len().max(1) {
+            return;
+        }
+        let output = take
+            .operation_id
+            .strip_prefix(BOOT_TAKE_PREFIX)
+            .unwrap_or(&take.operation_id);
+        self.boot.audio_after.push(OutputTake {
+            operation_id: format!("boot-audio:{output}"),
+            output_index: take.output_index,
+            bus: None,
+            audio: Some(audio),
+            principal: take.principal.clone(),
+        });
+    }
+
+    /// Start the audio-only takes [`Self::boot_audio_alone`] queued, on an
+    /// output with no take in flight (an operator take wins).
+    fn issue_boot_audio_after(&mut self, tick: u64, dispatcher: &mut RenditionDispatcher) {
+        for take in std::mem::take(&mut self.boot.audio_after) {
+            let index = take.output_index;
+            let Some(out) = self.outputs.get_mut(index) else {
+                continue;
+            };
+            if out.pending.is_some() {
+                continue;
+            }
+            out.pending = Some(Pending {
+                take,
+                started: tick,
+                phase: Phase::Priming,
+            });
+            self.dirty = true;
+            self.start_audio_take(index, tick, dispatcher);
+        }
+    }
+
     /// Re-issue due boot takes inside the window; give up after it. Bounded:
     /// one check per output, only while a boot take is still unresolved.
     fn retry_boot_takes(&mut self, tick: u64) {
         let window = self.ticks_for(self.cfg.boot_retry.window_secs);
         let first = self.first_tick.unwrap_or(tick);
-        for index in 0..self.boot.len() {
+        for index in 0..self.boot.slots.len() {
             let Some(due) = self
                 .boot
+                .slots
                 .get(index)
                 .and_then(|b| b.as_ref())
                 .and_then(|b| b.due)
@@ -1069,12 +1233,13 @@ impl OutputRouter {
                 continue;
             }
             if tick.saturating_sub(first) > window {
-                if let Some(boot) = self.boot.get_mut(index).and_then(Option::take) {
-                    self.boot_given_up = self.boot_given_up.saturating_add(1);
+                if let Some(boot) = self.boot.slots.get_mut(index).and_then(Option::take) {
+                    self.boot.given_up = self.boot.given_up.saturating_add(1);
+                    self.boot_audio_alone(&boot.take);
                     self.dirty = true;
                     tracing::warn!(
                         output = index,
-                        feed = %boot.take.bus.as_str(),
+                        feed = %boot.take.bus.as_ref().map_or_else(|| "-".into(), PictureBus::as_str),
                         window_secs = self.cfg.boot_retry.window_secs,
                         "routing: the start-up feed never became takeable; the output stays on \
                          Program (the configured feed is kept)"
@@ -1082,7 +1247,7 @@ impl OutputRouter {
                 }
                 continue;
             }
-            let Some(boot) = self.boot.get_mut(index).and_then(Option::as_mut) else {
+            let Some(boot) = self.boot.slots.get_mut(index).and_then(Option::as_mut) else {
                 continue;
             };
             boot.issued = tick;
@@ -1109,10 +1274,12 @@ impl OutputRouter {
             // A boot take enters its retry window; an operator take on the
             // same output replaces the boot intent for good. One slot per
             // output, allocated on the first take (bounded by the outputs).
-            if self.boot.len() < self.outputs.len() {
-                self.boot.resize_with(self.outputs.len(), || None);
+            if self.boot.slots.len() < self.outputs.len() {
+                self.boot.slots.resize_with(self.outputs.len(), || None);
             }
-            if let Some(slot) = self.boot.get_mut(index) {
+            // Any later take on the output replaces a queued boot audio too.
+            self.boot.audio_after.retain(|b| b.output_index != index);
+            if let Some(slot) = self.boot.slots.get_mut(index) {
                 *slot = take
                     .operation_id
                     .starts_with(BOOT_TAKE_PREFIX)
@@ -1122,8 +1289,16 @@ impl OutputRouter {
                         due: None,
                     });
             }
-            let needs_switcher = matches!(take.bus, PictureBus::Preview | PictureBus::Clean);
-            let routable = index < self.outputs.len() && (!needs_switcher || self.cfg.has_preview);
+            let needs_switcher = matches!(take.bus, Some(PictureBus::Preview | PictureBus::Clean));
+            // Audio rides the output's program-audio slot (§5.5): a run
+            // without program audio, or an output without that slot (NDI,
+            // AES67, display), cannot take an audio choice.
+            let audio_ok = take.audio.is_none()
+                || (self.audio.is_some() && dispatcher.has_program_audio(index));
+            let routable = index < self.outputs.len()
+                && (!needs_switcher || self.cfg.has_preview)
+                && (take.bus.is_some() || take.audio.is_some())
+                && audio_ok;
             if !routable {
                 self.emit(
                     take.operation_id,
@@ -1134,6 +1309,7 @@ impl OutputRouter {
                 continue;
             }
             self.supersede(index, tick, dispatcher);
+            let audio_only = take.bus.is_none();
             let Some(out) = self.outputs.get_mut(index) else {
                 continue;
             };
@@ -1143,6 +1319,67 @@ impl OutputRouter {
                 phase: Phase::Priming,
             });
             self.dirty = true;
+            if audio_only {
+                // Adopted at this drain tick: no fresh gate for audio (a
+                // source without audio is silence, §5.1).
+                self.start_audio_take(index, tick, dispatcher);
+            }
+        }
+    }
+
+    /// Start the pending take's audio change on the output's current video
+    /// bus (an audio-only take, or a combined take whose video is already
+    /// on air).
+    fn start_audio_take(&mut self, index: usize, tick: u64, dispatcher: &mut RenditionDispatcher) {
+        let Some((choice, bus)) = self.outputs.get(index).and_then(|o| {
+            o.pending
+                .as_ref()
+                .and_then(|p| p.take.audio.clone())
+                .map(|c| (c, o.bus.clone()))
+        }) else {
+            return;
+        };
+        let started = self.audio.as_mut().map_or(AudioTakeStart::Refused, |a| {
+            a.take_audio(index, choice, &bus, tick, dispatcher)
+        });
+        match started {
+            AudioTakeStart::Unchanged => {
+                if let Some(p) = self.outputs.get_mut(index).and_then(|o| o.pending.take()) {
+                    self.emit(p.take.operation_id, index, tick, TakeResult::Applied);
+                }
+            }
+            AudioTakeStart::Refused => {
+                self.refuse_pending(index, tick, RefuseReason::EncoderNotReady, dispatcher);
+            }
+            AudioTakeStart::Started => {
+                if let Some(p) = self.outputs.get_mut(index).and_then(|o| o.pending.as_mut()) {
+                    p.phase = Phase::AudioMoving {
+                        deadline: tick.saturating_add(TAKE_PRIME_DEADLINE_TICKS),
+                    };
+                }
+            }
+        }
+    }
+
+    /// The pending take ended without applying: undo its audio (restore the
+    /// choice; audio already scheduled fades back).
+    fn abandon_audio(
+        &mut self,
+        index: usize,
+        phase: Phase,
+        tick: u64,
+        dispatcher: &mut RenditionDispatcher,
+    ) {
+        let bus = self
+            .outputs
+            .get(index)
+            .map_or(PictureBus::Program, |o| o.bus.clone());
+        if let Some(audio) = self.audio.as_mut() {
+            if matches!(phase, Phase::AudioMoving { .. }) {
+                audio.finish_take(index, false, &bus, tick, dispatcher);
+            } else {
+                audio.video_refused(index, tick, dispatcher);
+            }
         }
     }
 
@@ -1154,10 +1391,8 @@ impl OutputRouter {
         };
         if matches!(old.phase, Phase::Moving(_)) {
             self.cancel_dispatcher_move(index, dispatcher, tick);
-            if let Some(audio) = self.audio.as_mut() {
-                audio.video_refused(index, tick);
-            }
         }
+        self.abandon_audio(index, old.phase, tick, dispatcher);
         if let Phase::Opening(id) = old.phase {
             if let Some(open) = self.opens.get_mut(&id) {
                 open.waiter = None;
@@ -1166,14 +1401,78 @@ impl OutputRouter {
         self.emit(old.take.operation_id, index, tick, TakeResult::Superseded);
     }
 
+    /// [`Self::supersede`] only a take whose dispatcher move is in flight
+    /// (`Moving`): a fallback replaces that move. A take still priming,
+    /// opening or warming stays valid from the output's new feed.
+    fn supersede_move(&mut self, index: usize, tick: u64, dispatcher: &mut RenditionDispatcher) {
+        let moving = self
+            .outputs
+            .get(index)
+            .and_then(|o| o.pending.as_ref())
+            .is_some_and(|p| matches!(p.phase, Phase::Moving(_)));
+        if moving {
+            self.supersede(index, tick, dispatcher);
+        }
+    }
+
+    /// Cancel the output's pending dispatcher move by re-asserting its
+    /// current key. When that key is already failed/retired (its fallback is
+    /// on the way), the rebind is refused and the old move would stay
+    /// pending and could land later with no take (#330 item 4): cancel it
+    /// directly instead, and count it.
     fn cancel_dispatcher_move(
-        &self,
+        &mut self,
         index: usize,
         dispatcher: &mut RenditionDispatcher,
         tick: u64,
     ) {
-        if let Some(out) = self.outputs.get(index) {
-            let _ = dispatcher.rebind_video(index, out.key, tick, 1);
+        let Some(key) = self.outputs.get(index).map(|o| o.key) else {
+            return;
+        };
+        if let Err(error) = dispatcher.rebind_video(index, key, tick, 1) {
+            self.move_cancel_failures = self.move_cancel_failures.saturating_add(1);
+            self.dirty = true;
+            let cancelled = dispatcher.cancel_video_move(index);
+            tracing::warn!(
+                output = index,
+                key,
+                ?error,
+                cancelled,
+                "routing: could not re-assert the current key; pending move cancelled directly"
+            );
+        }
+    }
+
+    /// The picture bus a video key carries (`None`: unknown, e.g. closed).
+    fn bus_of_key(&self, key: usize) -> Option<PictureBus> {
+        if self.cfg.base_keys.contains(&key) {
+            return Some(PictureBus::Program);
+        }
+        self.dynamic
+            .iter()
+            .find(|d| d.key == key)
+            .map(|d| d.bus.clone())
+    }
+
+    /// A pending take whose dispatcher move vanished without an Applied or
+    /// Refused (a newer rebind replaced it): settle it as Superseded so it
+    /// never strands (#330 item 3, defensive).
+    fn settle_stranded(&mut self, index: usize, tick: u64, dispatcher: &mut RenditionDispatcher) {
+        let stranded = self
+            .outputs
+            .get(index)
+            .and_then(|o| o.pending.as_ref())
+            .and_then(|p| match p.phase {
+                Phase::Moving(k) => Some(k),
+                _ => None,
+            })
+            .is_some_and(|k| dispatcher.pending_video_move(index) != Some(k));
+        if !stranded {
+            return;
+        }
+        if let Some(old) = self.outputs.get_mut(index).and_then(|o| o.pending.take()) {
+            self.abandon_audio(index, old.phase, tick, dispatcher);
+            self.emit(old.take.operation_id, index, tick, TakeResult::Superseded);
         }
     }
 
@@ -1188,13 +1487,13 @@ impl OutputRouter {
             };
             self.dirty = true;
             let waiter = open.waiter;
-            let refuse = |router: &mut Self| {
+            let refuse = |router: &mut Self, dispatcher: &mut RenditionDispatcher| {
                 if let Some(index) = waiter {
-                    router.refuse_pending(index, tick, RefuseReason::EncoderNotReady);
+                    router.refuse_pending(index, tick, RefuseReason::EncoderNotReady, dispatcher);
                 }
             };
             let Ok(mut encoder) = result.encoder else {
-                refuse(self);
+                refuse(self, dispatcher);
                 continue;
             };
             let tb = encoder.time_base();
@@ -1210,7 +1509,7 @@ impl OutputRouter {
             let Some(index) = waiting.filter(|_| tick < open.deadline) else {
                 self.reap(Reap::Encoder(encoder));
                 if waiting.is_some() {
-                    refuse(self);
+                    refuse(self, dispatcher);
                 }
                 continue;
             };
@@ -1224,7 +1523,7 @@ impl OutputRouter {
                 gate,
             ) else {
                 self.reap(Reap::Encoder(encoder));
-                refuse(self);
+                refuse(self, dispatcher);
                 continue;
             };
             if let Some(params) = encoder.parameter_sets() {
@@ -1244,7 +1543,7 @@ impl OutputRouter {
                 self.spawn_live_worker(key, generation, tb, Box::new(worker), Arc::clone(&lost));
             let Ok(worker) = spawned else {
                 let _ = dispatcher.retire_video_key(key);
-                refuse(self);
+                refuse(self, dispatcher);
                 continue;
             };
             self.last_forced.insert(key, tick);
@@ -1263,6 +1562,7 @@ impl OutputRouter {
                 lost,
                 generation,
                 silent: 0,
+                starved: 0,
             });
             // The first offer (frame T, an IDR) is made by `feed` this same
             // tick, after the key exists. The move is requested once the key's
@@ -1273,6 +1573,19 @@ impl OutputRouter {
                     deadline: open.deadline,
                 };
             }
+        }
+    }
+
+    /// An open whose take was superseded (no waiter) and whose result never
+    /// arrived releases its capacity at its deadline, like a waited one
+    /// (#330: otherwise a wedged open leaked an encoder session forever).
+    /// A result arriving later goes to the reaper (`drain_opens`).
+    fn expire_orphan_opens(&mut self, tick: u64) {
+        let before = self.opens.len();
+        self.opens
+            .retain(|_, o| o.waiter.is_some() || tick < o.deadline);
+        if self.opens.len() != before {
+            self.dirty = true;
         }
     }
 
@@ -1310,9 +1623,20 @@ impl OutputRouter {
         })
     }
 
-    fn refuse_pending(&mut self, index: usize, tick: u64, reason: RefuseReason) {
-        if let Some(audio) = self.audio.as_mut() {
-            audio.video_refused(index, tick);
+    fn refuse_pending(
+        &mut self,
+        index: usize,
+        tick: u64,
+        reason: RefuseReason,
+        dispatcher: &mut RenditionDispatcher,
+    ) {
+        let phase = self
+            .outputs
+            .get(index)
+            .and_then(|o| o.pending.as_ref())
+            .map(|p| p.phase);
+        if let Some(phase) = phase {
+            self.abandon_audio(index, phase, tick, dispatcher);
         }
         if let Some(p) = self.outputs.get_mut(index).and_then(|o| o.pending.take()) {
             self.emit(
@@ -1325,6 +1649,7 @@ impl OutputRouter {
     }
 
     fn drain_moves(&mut self, tick: u64, dispatcher: &mut RenditionDispatcher) {
+        let mut superseded: Vec<usize> = Vec::new();
         for outcome in dispatcher.take_move_outcomes() {
             match outcome {
                 MoveOutcome::Applied {
@@ -1343,16 +1668,30 @@ impl OutputRouter {
                     let expected = matches!(out.pending.as_ref().map(|p| p.phase), Some(Phase::Moving(k)) if k == key);
                     if expected {
                         if let Some(p) = out.pending.take() {
-                            out.bus = p.take.bus.clone();
+                            if let Some(bus) = p.take.bus.clone() {
+                                out.bus = bus;
+                            }
                             out.key = key;
                             out.since = at;
+                            if let Some(audio) = self.audio.as_mut() {
+                                audio.video_applied(output_index);
+                            }
                             self.emit(p.take.operation_id, output_index, at, TakeResult::Applied);
                         }
                     } else if out.key != key {
-                        // A fallback move landing (no take pending for it).
-                        out.key = key;
-                        out.since = at;
-                        self.dirty = true;
+                        // A fallback (or a stale, uncancelled) move landing
+                        // with no take pending for it: the bus follows the
+                        // key, so `key` and `bus` never disagree (#330 item
+                        // 4). An unknown key (already closed) is left to its
+                        // own Fallback.
+                        if let Some(bus) = self.bus_of_key(key) {
+                            if let Some(out) = self.outputs.get_mut(output_index) {
+                                out.bus = bus;
+                                out.key = key;
+                                out.since = at;
+                            }
+                            self.dirty = true;
+                        }
                     }
                 }
                 MoveOutcome::Refused {
@@ -1371,17 +1710,18 @@ impl OutputRouter {
                                 RefuseReason::EncoderNotReady
                             }
                         };
-                        self.refuse_pending(output_index, tick, reason);
+                        self.refuse_pending(output_index, tick, reason, dispatcher);
                     }
                 }
-                MoveOutcome::Superseded { .. }
-                | MoveOutcome::AudioApplied { .. }
-                | MoveOutcome::AudioRefused { .. }
-                | MoveOutcome::AudioFallback { .. } => {}
-                MoveOutcome::Fallback { output_index } => {
+                MoveOutcome::Superseded { output_index } => superseded.push(output_index),
+                MoveOutcome::AudioFallback { .. } => {}
+                MoveOutcome::AudioApplied { .. } | MoveOutcome::AudioRefused { .. } => {
                     if let Some(audio) = self.audio.as_mut() {
-                        audio.follow(output_index, &PictureBus::Program, tick, None, dispatcher);
+                        audio.on_outcome(&outcome, dispatcher);
                     }
+                    self.dirty = true;
+                }
+                MoveOutcome::Fallback { output_index } => {
                     if let Some(out) = self.outputs.get_mut(output_index) {
                         out.bus = PictureBus::Program;
                         out.key = self
@@ -1392,6 +1732,13 @@ impl OutputRouter {
                             .unwrap_or(out.key);
                         out.since = tick;
                     }
+                    // A take whose dispatcher move is in flight is settled
+                    // (Superseded, its audio restored) and the move cancelled,
+                    // before the audio falls back (#330 item 3).
+                    self.supersede_move(output_index, tick, dispatcher);
+                    if let Some(audio) = self.audio.as_mut() {
+                        audio.fallback(output_index, &PictureBus::Program, tick, None, dispatcher);
+                    }
                     self.emit(
                         String::new(),
                         output_index,
@@ -1400,6 +1747,11 @@ impl OutputRouter {
                     );
                 }
             }
+        }
+        // Decided after the whole batch: an Applied/Refused later in it has
+        // already settled the take.
+        for index in superseded {
+            self.settle_stranded(index, tick, dispatcher);
         }
     }
 
@@ -1429,6 +1781,11 @@ impl OutputRouter {
                 let Some(&base) = self.cfg.base_keys.get(index) else {
                     continue;
                 };
+                // A take whose dispatcher move is in flight is settled first
+                // (Superseded, audio restored): the forced rebind replaces
+                // that move, which would otherwise strand it forever (#330
+                // item 3).
+                self.supersede_move(index, tick, dispatcher);
                 let windows = self.request_idr(base, tick);
                 // A fallback: the routed feed is gone, so it is never refused
                 // for a format mismatch (an out-of-band output takes a loss).
@@ -1440,7 +1797,7 @@ impl OutputRouter {
                         out.bus = PictureBus::Program;
                     }
                     if let Some(audio) = self.audio.as_mut() {
-                        audio.follow(index, &PictureBus::Program, tick, Some(base), dispatcher);
+                        audio.fallback(index, &PictureBus::Program, tick, Some(base), dispatcher);
                     }
                     self.emit(
                         String::new(),
@@ -1496,20 +1853,30 @@ impl OutputRouter {
 
     fn advance_takes(&mut self, tick: u64, pts: MediaTime, dispatcher: &mut RenditionDispatcher) {
         for index in 0..self.outputs.len() {
-            let Some((bus, started, phase, principal)) = self.outputs.get(index).and_then(|o| {
-                o.pending.as_ref().map(|p| {
-                    (
-                        p.take.bus.clone(),
-                        p.started,
-                        p.phase,
-                        p.take.principal.clone(),
-                    )
+            let Some((bus, choice, started, phase, principal)) =
+                self.outputs.get(index).and_then(|o| {
+                    o.pending.as_ref().map(|p| {
+                        (
+                            p.take.bus.clone(),
+                            p.take.audio.clone(),
+                            p.started,
+                            p.phase,
+                            p.take.principal.clone(),
+                        )
+                    })
                 })
-            }) else {
+            else {
+                continue;
+            };
+            if let Phase::AudioMoving { deadline } = phase {
+                self.advance_audio_take(index, tick, deadline, dispatcher);
+                continue;
+            }
+            let Some(bus) = bus else {
                 continue;
             };
             match phase {
-                Phase::Moving(_) => {}
+                Phase::Moving(_) | Phase::AudioMoving { .. } => {}
                 Phase::Warming { key, deadline } => {
                     let seen = self
                         .dynamic
@@ -1517,7 +1884,7 @@ impl OutputRouter {
                         .find(|d| d.key == key)
                         .map(|d| d.seen_event);
                     if tick >= deadline || seen.is_none() || dispatcher.is_key_failed(key) {
-                        self.refuse_pending(index, tick, RefuseReason::EncoderNotReady);
+                        self.refuse_pending(index, tick, RefuseReason::EncoderNotReady, dispatcher);
                     } else if seen == Some(true) {
                         // The key has no subscriber yet: an IDR on it costs no
                         // viewer anything, so the warm-up force skips the floor.
@@ -1534,10 +1901,15 @@ impl OutputRouter {
                                 p.phase = Phase::Moving(key);
                             }
                             if let Some(audio) = self.audio.as_mut() {
-                                audio.follow(index, &bus, at, Some(key), dispatcher);
+                                audio.follow(index, &bus, choice, at, Some(key), dispatcher);
                             }
                         } else {
-                            self.refuse_pending(index, tick, RefuseReason::EncoderNotReady);
+                            self.refuse_pending(
+                                index,
+                                tick,
+                                RefuseReason::EncoderNotReady,
+                                dispatcher,
+                            );
                         }
                     }
                 }
@@ -1546,26 +1918,99 @@ impl OutputRouter {
                     if late {
                         // The result, if it ever comes, goes to the reaper.
                         self.opens.remove(&id);
-                        self.refuse_pending(index, tick, RefuseReason::EncoderNotReady);
+                        self.refuse_pending(index, tick, RefuseReason::EncoderNotReady, dispatcher);
                     }
                 }
                 Phase::Priming => {
                     let current = self.outputs.get(index).map(|o| o.bus.clone());
                     if current.as_ref() == Some(&bus) {
-                        if let Some(p) = self.outputs.get_mut(index).and_then(|o| o.pending.take())
+                        self.cancel_dispatcher_move(index, dispatcher, tick);
+                        if choice.is_some() {
+                            // The video is already on air: the audio alone.
+                            self.start_audio_take(index, tick, dispatcher);
+                        } else if let Some(p) =
+                            self.outputs.get_mut(index).and_then(|o| o.pending.take())
                         {
-                            self.cancel_dispatcher_move(index, dispatcher, tick);
                             self.emit(p.take.operation_id, index, tick, TakeResult::Applied);
                         }
                         continue;
                     }
                     if !self.feed_fresh(&bus, tick, pts) {
                         if tick.saturating_sub(started) >= TAKE_PRIME_DEADLINE_TICKS {
-                            self.refuse_pending(index, tick, RefuseReason::FeedNotFresh);
+                            self.refuse_pending(
+                                index,
+                                tick,
+                                RefuseReason::FeedNotFresh,
+                                dispatcher,
+                            );
                         }
                         continue;
                     }
-                    self.start_move(index, &bus, &principal, tick, dispatcher);
+                    if self.wait_for_shared_open(index, &bus, started, tick, dispatcher) {
+                        continue;
+                    }
+                    self.start_move(index, &bus, choice.as_ref(), &principal, tick, dispatcher);
+                }
+            }
+        }
+    }
+
+    /// Encode once per (bus, settings) (§4.3): while an open for the same
+    /// key is in flight, the take waits for it and then reuses its encoder
+    /// (#330: two takes opened two encoders). Returns `true` while waiting;
+    /// the wait is bounded by [`OPEN_DEADLINE_TICKS`].
+    fn wait_for_shared_open(
+        &mut self,
+        index: usize,
+        bus: &PictureBus,
+        started: u64,
+        tick: u64,
+        dispatcher: &mut RenditionDispatcher,
+    ) -> bool {
+        let settings = self.cfg.base_keys.get(index).copied();
+        let in_flight = self
+            .opens
+            .values()
+            .any(|o| o.bus == *bus && Some(o.settings) == settings);
+        if in_flight && tick.saturating_sub(started) >= OPEN_DEADLINE_TICKS {
+            self.refuse_pending(index, tick, RefuseReason::EncoderNotReady, dispatcher);
+        }
+        in_flight
+    }
+
+    /// An audio-only take in flight: applied once on air (the tick whose
+    /// block holds `G`), refused when its bus fails or at `deadline`.
+    fn advance_audio_take(
+        &mut self,
+        index: usize,
+        tick: u64,
+        deadline: u64,
+        dispatcher: &mut RenditionDispatcher,
+    ) {
+        let progress = self
+            .audio
+            .as_ref()
+            .map_or(AudioTakeProgress::Failed, |a| a.take_progress(index));
+        match progress {
+            AudioTakeProgress::Done(g) => {
+                let bus = self
+                    .outputs
+                    .get(index)
+                    .map_or(PictureBus::Program, |o| o.bus.clone());
+                let at = self.audio.as_mut().map_or(tick, |a| {
+                    a.finish_take(index, true, &bus, tick, dispatcher);
+                    a.tick_of_sample(g)
+                });
+                if let Some(p) = self.outputs.get_mut(index).and_then(|o| o.pending.take()) {
+                    self.emit(p.take.operation_id, index, at, TakeResult::Applied);
+                }
+            }
+            AudioTakeProgress::Failed => {
+                self.refuse_pending(index, tick, RefuseReason::EncoderNotReady, dispatcher);
+            }
+            AudioTakeProgress::Waiting => {
+                if tick >= deadline {
+                    self.refuse_pending(index, tick, RefuseReason::EncoderNotReady, dispatcher);
                 }
             }
         }
@@ -1575,6 +2020,7 @@ impl OutputRouter {
         &mut self,
         index: usize,
         bus: &PictureBus,
+        choice: Option<&AudioChoice>,
         principal: &str,
         tick: u64,
         dispatcher: &mut RenditionDispatcher,
@@ -1585,7 +2031,7 @@ impl OutputRouter {
         // Take admission: open the output's private audio bus before the
         // video move (§5.2), so it is warm at the grid boundary G.
         if let Some(audio) = self.audio.as_mut() {
-            audio.admit(index, bus, tick, dispatcher);
+            audio.admit(index, bus, choice, tick, dispatcher);
         }
         let existing = if *bus == PictureBus::Program {
             Some(settings)
@@ -1620,7 +2066,7 @@ impl OutputRouter {
             if dispatcher.rebind_video(index, key, tick, windows).is_ok() {
                 set(self, Phase::Moving(key));
                 if let Some(audio) = self.audio.as_mut() {
-                    audio.follow(index, bus, tick, Some(key), dispatcher);
+                    audio.follow(index, bus, choice.cloned(), tick, Some(key), dispatcher);
                 }
                 // A re-take of a lingering key adopts it (re-attributed,
                 // linger cleared). A key another output still subscribes
@@ -1633,7 +2079,7 @@ impl OutputRouter {
                     d.linger_deadline = None;
                 }
             } else {
-                self.refuse_pending(index, tick, RefuseReason::EncoderNotReady);
+                self.refuse_pending(index, tick, RefuseReason::EncoderNotReady, dispatcher);
             }
             return;
         }
@@ -1644,7 +2090,7 @@ impl OutputRouter {
             }
         }
         if !self.has_capacity(principal) {
-            self.refuse_pending(index, tick, RefuseReason::Capacity);
+            self.refuse_pending(index, tick, RefuseReason::Capacity, dispatcher);
             return;
         }
         let id = self.next_open;
@@ -1667,7 +2113,7 @@ impl OutputRouter {
                 self.dirty = true;
             }
             Err(TrySendError::Full(_) | TrySendError::Disconnected(_)) => {
-                self.refuse_pending(index, tick, RefuseReason::Capacity);
+                self.refuse_pending(index, tick, RefuseReason::Capacity, dispatcher);
             }
         }
     }
@@ -1701,12 +2147,11 @@ impl OutputRouter {
     }
 
     /// Feed every live-opened encoder its bus's frame for this tick (hold
-    /// the last one when none is new), counting held ticks per bus. A bus
-    /// is held for a tick when its picture did not advance OR its encoder
-    /// refused the frame (`OfferRejection::Overloaded`): a live encoder that
-    /// never drains its input queue must degrade and fall back exactly like
-    /// a lagging feed, even though its picture bus (Clean included) is
-    /// published fresh every tick by the bake consumer itself.
+    /// the last one when none is new), counting held ticks per bus (picture
+    /// freshness) and refused offers per KEY (`DynamicKey::starved`): a live
+    /// encoder that never drains its input queue degrades and its key is
+    /// closed (outputs fall back) even though its picture bus (Clean
+    /// included) is published fresh every tick by the bake consumer.
     fn feed(&mut self, tick: u64, dispatcher: &mut RenditionDispatcher) {
         let mut fresh_buses: Vec<(PictureBus, bool)> = Vec::new();
         let mut dead: Vec<usize> = Vec::new();
@@ -1729,18 +2174,30 @@ impl OutputRouter {
             // Never blocks: a full queue drops and the worker gap-fills.
             let offer_result = worker.offer(BakedTick { tick, canvas });
             let ended = matches!(offer_result, Err(OfferRejection::Ended));
-            let dropped = matches!(offer_result, Err(OfferRejection::Overloaded));
-            // Fresh for health purposes requires BOTH: the slot advanced
-            // AND the encoder actually accepted the frame. A dropped offer
-            // counts as a held tick for this key's bus, exactly like a
-            // lagging aux frame, so a slow-but-alive encoder holding one
-            // frame forever cannot stay "fresh" forever.
-            fresh_buses.push((d.bus.clone(), fresh && !dropped));
+            // The bus's health is its picture's freshness; this KEY's
+            // encoder refusing frames is counted on the key itself, so a
+            // healthy sibling key on the same bus cannot reset it.
+            let was_degraded = d.starved >= DEGRADED_AFTER_TICKS;
+            match offer_result {
+                Ok(()) => d.starved = 0,
+                Err(OfferRejection::Overloaded) => d.starved = d.starved.saturating_add(1),
+                Err(OfferRejection::Ended) => {}
+            }
+            if was_degraded != (d.starved >= DEGRADED_AFTER_TICKS) {
+                self.dirty = true;
+            }
+            fresh_buses.push((d.bus.clone(), fresh));
             d.silent = d.silent.saturating_add(1);
             // A panicked/exited worker, or one that emits nothing while fed
             // (wedged), would freeze its outputs forever: close the key so
             // they fall back to Program (Fallback(EncoderFailed)).
-            if ended || worker.is_finished() || d.silent >= WEDGED_ENCODER_TICKS {
+            // A key starved for FALLBACK_AFTER_TICKS (it never drains its
+            // queue) is closed the same way.
+            if ended
+                || worker.is_finished()
+                || d.silent >= WEDGED_ENCODER_TICKS
+                || d.starved >= FALLBACK_AFTER_TICKS
+            {
                 dead.push(d.key);
             }
         }
@@ -1856,7 +2313,7 @@ impl OutputRouter {
         wanted.extend(
             self.outputs
                 .iter()
-                .filter_map(|o| o.pending.as_ref().map(|p| p.take.bus.clone())),
+                .filter_map(|o| o.pending.as_ref().and_then(|p| p.take.bus.clone())),
         );
         wanted.retain(|b| *b != PictureBus::Program);
         let unchanged = wanted.iter().all(|b| self.feeds.contains_key(b))
@@ -1911,18 +2368,33 @@ impl OutputRouter {
         let outputs = self
             .outputs
             .iter()
-            .map(|o| OutputRouteView {
+            .enumerate()
+            .map(|(i, o)| OutputRouteView {
                 bus: o.bus.as_str().into_owned(),
                 key: format!("{}/{}", o.bus.as_str(), o.key),
                 since_tick: o.since,
                 pending: o.pending.as_ref().map(|p| PendingView {
-                    bus: p.take.bus.as_str().into_owned(),
+                    bus: p.take.bus.as_ref().unwrap_or(&o.bus).as_str().into_owned(),
+                    audio: p.take.audio.as_ref().map(AudioChoice::label),
                     held_ticks: tick.saturating_sub(p.started),
                 }),
                 degraded: self
                     .health
                     .get(&o.bus)
-                    .is_some_and(|h| h.held >= DEGRADED_AFTER_TICKS),
+                    .is_some_and(|h| h.held >= DEGRADED_AFTER_TICKS)
+                    || self
+                        .dynamic
+                        .iter()
+                        .any(|d| d.key == o.key && d.starved >= DEGRADED_AFTER_TICKS),
+                audio: self
+                    .audio
+                    .as_ref()
+                    .map_or_else(|| "program".to_owned(), |a| a.carried_label(i)),
+                audio_choice: self
+                    .audio
+                    .as_ref()
+                    .map_or_else(|| "follow".to_owned(), |a| a.choice(i).label()),
+                private_audio: self.audio.as_ref().is_some_and(|a| a.has_private_bus(i)),
             })
             .collect();
         let next = RoutingSnapshot {
@@ -1947,8 +2419,9 @@ impl OutputRouter {
                 .map(crate::routing_audio::RoutedAudio::counters)
                 .unwrap_or_default(),
             live_keys: self.live_keys.clone(),
-            boot_takes_pending: self.boot.iter().filter(|b| b.is_some()).count(),
-            boot_takes_given_up: self.boot_given_up,
+            boot_takes_pending: self.boot.slots.iter().filter(|b| b.is_some()).count(),
+            boot_takes_given_up: self.boot.given_up,
+            move_cancel_failures: self.move_cancel_failures,
         };
         if *self.snapshot.load() != next {
             self.snapshot.store(Arc::new(next));

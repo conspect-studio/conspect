@@ -167,6 +167,7 @@ impl Fake {
                 tick: 77,
                 outcome: outcome.to_owned(),
                 feed: None,
+                audio: None,
             })
             .unwrap();
     }
@@ -179,6 +180,7 @@ impl Fake {
                 tick: 78,
                 outcome: outcome.to_owned(),
                 feed: Some(feed),
+                audio: None,
             })
             .unwrap();
     }
@@ -195,6 +197,14 @@ impl OutputRouting for Fake {
             sessions_in_use: s.in_use,
             sessions_max: 6,
         })
+    }
+    fn plan_audio(
+        &self,
+        _output: &str,
+        _video: Option<&RoutedFeed>,
+        _audio: Option<&multiview_control::output_routing::RoutedAudio>,
+    ) -> Result<multiview_control::output_routing::AudioPlanCost, PlanRefusal> {
+        Ok(multiview_control::output_routing::AudioPlanCost::default())
     }
     fn try_take(&self, take: OutputTakeRequest) -> Result<(), TakeSubmitError> {
         let mut s = self.state.lock().unwrap();
@@ -328,7 +338,7 @@ async fn take_is_202_replays_with_its_outcome_and_persists_only_after_applied() 
         takes[0].output, OUT_B_CONFIG_ID,
         "API id mapped to the config id"
     );
-    assert_eq!(takes[0].feed, RoutedFeed::Source("bars".into()));
+    assert_eq!(takes[0].video, Some(RoutedFeed::Source("bars".into())));
     assert_eq!(takes[0].principal, "operator-key", "charged to the key id");
     // Replay before the outcome: same op id, no outcome, nothing re-enqueued.
     let replay = body_json(
@@ -719,6 +729,9 @@ async fn readback_carries_live_state_and_redacts_unreadable_pending_feeds() {
             since_tick: 900,
             pending: Some(("src:secret-cam".into(), 12)),
             degraded: false,
+            audio: None,
+            pending_audio: None,
+            private_audio: false,
         },
     );
     rig.fake.state.lock().unwrap().live = Some(RoutingLive {
@@ -924,7 +937,8 @@ fn fill_take_store(
             &format!("{prefix}-principal-{i}"),
             multiview_control::output_routing::PendingTake {
                 api_id: "output-0".to_owned(),
-                feed: RoutedFeed::Program,
+                feed: Some(RoutedFeed::Program),
+                audio: None,
             },
         );
         assert!(
@@ -1107,6 +1121,7 @@ async fn two_principals_with_the_same_raw_key_get_separate_takes() {
 /// feed (a refused boot take, a fallback), `video` and `tally` are the LIVE
 /// bus and `configured_video` the persisted feed; each is redacted by its own
 /// rule; without a snapshot the row is today's configured view.
+#[allow(clippy::too_many_lines)] // One scenario: configured, then live readback.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn readback_reports_the_live_bus_and_the_configured_feed_separately() {
     let dir = tempfile::tempdir().unwrap();
@@ -1158,6 +1173,9 @@ async fn readback_reports_the_live_bus_and_the_configured_feed_separately() {
             since_tick: 3,
             pending: None,
             degraded: false,
+            audio: None,
+            pending_audio: None,
+            private_audio: false,
         },
     );
     rig.fake.state.lock().unwrap().live = Some(RoutingLive {
