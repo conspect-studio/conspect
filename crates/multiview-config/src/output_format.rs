@@ -715,7 +715,10 @@ fn validate_format(
             .filter(|(a, b)| *a > 0 && *b > 0);
         let g = gcd(u64::from(w), u64::from(h));
         let square = (u64::from(w) / g, u64::from(h) / g);
-        let ok = parsed.is_some_and(|(a, b)| a * square.1 == b * square.0);
+        // u128: an authored `a:b` of two u64s cannot overflow the product.
+        let ok = parsed.is_some_and(|(a, b)| {
+            u128::from(a) * u128::from(square.1) == u128::from(b) * u128::from(square.0)
+        });
         if !ok {
             return Err(unsupported(
                 output,

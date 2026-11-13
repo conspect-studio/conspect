@@ -526,3 +526,19 @@ codec = "h264"
         );
     }
 }
+
+#[test]
+fn a_huge_aspect_never_overflows() {
+    // 18446744073709551615 * 9 is above 2^64: a u64 product would wrap.
+    assert_code(
+        &hls_format("width = 1920\nheight = 1080\naspect = \"18446744073709551615:9\""),
+        SLOT_FORMAT_UNSUPPORTED,
+        "square pixels",
+    );
+    // A huge but exactly proportional pair is accepted (16:9 scaled).
+    parse(&hls_format(
+        "width = 1920\nheight = 1080\naspect = \"18446744073709551600:10376293541461622775\"",
+    ))
+    .validate()
+    .expect("proportional");
+}
