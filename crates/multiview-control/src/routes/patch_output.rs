@@ -364,7 +364,7 @@ pub(crate) fn outputs_view(state: &AppState, principal: &Principal) -> ControlRe
             .and_then(|r| r.pending.as_ref())
             .map(|(bus, held)| json!({ "source": feed_view(bus), "held_ticks": held }));
         let path = readback
-            .and_then(|_| state.output_routing.as_ref())
+            .and(state.output_routing.as_ref())
             .and_then(|c| c.routing.current_path(&body.id()))
             .map(crate::output_routing::PlanPath::as_str);
         // Slot 0 carries the accepted audio feed (default `follow`, redacted
