@@ -820,8 +820,9 @@ async fn an_early_reserved_key_survives_many_later_takes_and_still_persists() {
     // route records them: a fresh reservation in the take store.
     let control = rig.state.output_routing.clone().unwrap();
     fill_take_store(&control, "later", 1500);
-    // Replay the early key with a different body.
-    let replay = send(
+    // #342 review A1: the early key with a DIFFERENT body is refused (409)
+    // and enqueues nothing; the same body still replays its own operation.
+    let reused = send(
         &rig.router,
         take(
             &rig,
@@ -830,6 +831,13 @@ async fn an_early_reserved_key_survives_many_later_takes_and_still_persists() {
             "output-1",
             serde_json::json!({"bus": "program"}),
         ),
+    )
+    .await;
+    assert_eq!(reused.status(), StatusCode::CONFLICT);
+    assert_eq!(rig.fake.takes().len(), 1, "a reused key never enqueues");
+    let replay = send(
+        &rig.router,
+        take(&rig, OPERATOR_TOKEN, "early", "output-1", src.clone()),
     )
     .await;
     assert_eq!(replay.status(), StatusCode::ACCEPTED);
