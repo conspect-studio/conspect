@@ -126,7 +126,7 @@ tempfile = { version = "3", optional = true }
 # dir we own, fail closed on one we don't). Already in the workspace graph (the
 # engine's `ptp` feature); MIT/Apache-2.0/BSD, `cargo deny`-clean. Optional + gated
 # so the default build never pulls the `fs`/`process` surface.
-rustix = { workspace = true, features = ["fs", "process"], optional = true }
+rustix = { workspace = true, features = ["fs", "process", "stdio"], optional = true }
 
 # Used ONLY by the `heartbeat` feature for the device-PoP keypair (CONSPECT-3,
 # ADR-I007): GENERATE (the only RNG in the product, at the cli boundary — the leaf
@@ -202,12 +202,33 @@ proptest = "1.5.0"
 # graph transitively via `xtask`'s `ureq`; pulling it here as a direct dev-dep
 # adds no new license/advisory surface.
 flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
+# Test-only TLS client for the front-door TCP door's ACME TLS-ALPN-01
+# resolver wiring test (#290/#291): a rustls client with an EXPLICIT `ring`
+# provider (distinct from the server side's `aws-lc-rs`, matching the design
+# note's "ring or aws-lc provider" allowance) that negotiates the
+# `acme-tls/1` ALPN and inspects the leaf it receives. All three are already
+# in the lock via `multiview-frontdoor`'s dev-deps / `multiview-control`'s
+# `tls` feature; no new crate.
+rustls = { version = "0.23", default-features = false, features = [
+    "std",
+    "ring",
+    "tls12",
+] }
+tokio-rustls = { version = "0.26", default-features = false }
+rcgen = "0.14"
 
 # The pipeline-ingest integration test needs the `ffmpeg` feature (a libav*
 # build + the `ffmpeg`/`ffprobe` CLIs at runtime).
 [[test]]
 name = "pipeline_ingest"
 required-features = ["ffmpeg"]
+
+# The front-door TCP door's ACME TLS-ALPN-01 resolver wiring test needs the
+# `tls` feature (multiview-control's `acme_challenge_server_config` +
+# `StaticCertificateSource`, unix only).
+[[test]]
+name = "acme_tls_alpn_resolver"
+required-features = ["tls"]
 
 # Audio routing applies live to the running program bus (no restart).
 [[test]]
@@ -285,6 +306,10 @@ name = "synth_render_cost"
 required-features = ["overlay"]
 
 [features]
+# Chaos seams for the bounded fatal-exit work (#309): an env-armed one-shot
+# consumer stall that makes the output fall behind the clock. Test/measurement
+# builds only; the release-feature guard rejects any `*test-seam*` feature.
+"_chaos-test-seams" = []
 # Real existing-output conversion only; never opens a viewer encoder.
 moq-output = ["ffmpeg", "dep:multiview-moq", "dep:bytes", "dep:hang", "dep:url", "dep:rustix", "multiview-control/moq-transport"]
 default = ["software"]
@@ -486,6 +511,8 @@ ptp = ["multiview-engine/ptp"]
 # "requires srt-libsrt" error (never libsrt's opaque "Bad parameters").
 ffmpeg = [
     "dep:ffmpeg-next",
+    # #309: the exit watchdog's SIGKILL backstop (safe `rustix::process::kill_process`).
+    "dep:rustix",
     "dep:tempfile",
     "dep:ureq",
     "dep:url",

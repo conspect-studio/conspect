@@ -222,4 +222,34 @@ describe('OutputFeedRow', () => {
     expect(screen.getByTestId('output-tally')).toHaveTextContent('direct: bars');
     expect(screen.getByTestId('output-audio')).toHaveTextContent('Follow (bars)');
   });
+
+  it('offers Clean next to Program and Preview, plans it as the clean bus, and tallies it', async () => {
+    const { unmount } = renderWithProviders(
+      <OutputFeedRow output="out-1" outputName="Out 1" route={directRow} choices={choices} />,
+    );
+    const select = screen.getByLabelText(/Video feed for Out 1/);
+    const options = Array.from(select.querySelectorAll('option')).map((o) => o.textContent);
+    expect(options).toContain('Clean (Program without labels and tally)');
+    expect(options.indexOf('Clean (Program without labels and tally)')).toBe(
+      options.indexOf('Preview') + 1,
+    );
+    fireEvent.change(select, { target: { value: 'bus:clean' } });
+    await waitFor(() => {
+      expect(planBody).toEqual({
+        target: { kind: 'output', output: 'out-1', stream: 'video' },
+        feed: { bus: 'clean' },
+      });
+    });
+    unmount();
+    const cleanRow: OutputRouteState = {
+      ...programRow,
+      video: { bus: 'clean' } as unknown as OutputRouteState['video'],
+      tally: 'clean',
+    };
+    renderWithProviders(
+      <OutputFeedRow output="out-1" outputName="Out 1" route={cleanRow} choices={choices} />,
+    );
+    expect(screen.getByTestId('output-tally')).toHaveTextContent('CLEAN');
+    expect(screen.getByLabelText(/Video feed for Out 1/)).toHaveValue('bus:clean');
+  });
 });

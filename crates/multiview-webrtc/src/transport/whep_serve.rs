@@ -39,7 +39,7 @@ use crate::config::EndpointConfig;
 use crate::egress::{EgressFeed, EgressMedia};
 use crate::error::{Result, WebRtcError};
 use crate::session::{SessionId, SessionRole, SessionTable};
-use crate::transport::{Session, SessionConfig, WebRtcEndpoint};
+use crate::transport::{Session, SessionConfig, Transport, WebRtcEndpoint};
 use crate::turn::TurnRelayDriver;
 
 /// The maximum UDP datagram the recv loop reads.
@@ -91,6 +91,9 @@ pub(crate) struct WhepShared {
     commands: mpsc::Sender<Command>,
     /// Host candidate addresses gathered at bind, IPv6-first (ADR-0042).
     host_candidates: Vec<SocketAddr>,
+    /// Passive ICE-TCP candidates (the front door's TCP port), added after the
+    /// UDP host candidates; empty without ICE-TCP.
+    tcp_candidates: Vec<SocketAddr>,
     /// The endpoint-global viewer-pool session table (ADR-0048 §8); guarded by a
     /// short-lived mutex the engine never touches.
     table: Mutex<SessionTable>,
@@ -160,11 +163,13 @@ impl WhepServeHandle {
     pub(crate) fn build(
         config: &EndpointConfig,
         host_candidates: Vec<SocketAddr>,
+        tcp_candidates: Vec<SocketAddr>,
     ) -> (Self, mpsc::Receiver<Command>, Arc<WhepShared>) {
         let (tx, rx) = mpsc::channel(64);
         let shared = Arc::new(WhepShared {
             commands: tx,
             host_candidates,
+            tcp_candidates,
             table: Mutex::new(SessionTable::new(
                 config.max_sessions,
                 config.session_idle_timeout,
@@ -255,6 +260,10 @@ impl WhepServeHandle {
             }
             session.add_host_candidate(*addr)?;
             gathered += 1;
+        }
+        // Passive ICE-TCP after UDP (str0m ranks a TCP host below a UDP host).
+        for addr in &self.inner.tcp_candidates {
+            session.add_tcp_passive_candidate(*addr)?;
         }
         if let Ok(relays) = self.inner.learned_relays.lock() {
             for relay in relays.iter() {
@@ -389,7 +398,8 @@ impl WhepServeEndpoint {
     pub fn bind(config: EndpointConfig) -> Result<(Self, WhepServeHandle)> {
         let endpoint = WebRtcEndpoint::bind(config)?;
         let host_candidates = endpoint.host_candidates()?;
-        let (handle, commands, shared) = WhepServeHandle::build(endpoint.config(), host_candidates);
+        let (handle, commands, shared) =
+            WhepServeHandle::build(endpoint.config(), host_candidates, Vec::new());
         Ok((
             Self {
                 endpoint,
@@ -430,6 +440,7 @@ impl WhepServeEndpoint {
         let mut commands = self.commands;
         let mut buf = vec![0u8; RECV_BUFFER];
         let mut tick = tokio::time::interval(DRIVER_TICK);
+        let egress = crate::transport::Egress::udp(&socket);
 
         loop {
             if stop.load(Ordering::Acquire) {
@@ -451,13 +462,13 @@ impl WhepServeEndpoint {
                         }
                     }
                     Self::pump_turn(&socket, &mut turn, now, &self.shared).await;
-                    Self::pump_outbound(&socket, &mut viewers, &mut turn, now).await;
+                    Self::pump_outbound(egress, &mut viewers, &mut turn, now).await;
                 }
                 _ = tick.tick() => {
                     let now = Instant::now();
                     Self::tick(&mut viewers, &self.shared, now);
                     Self::pump_turn(&socket, &mut turn, now, &self.shared).await;
-                    Self::pump_outbound(&socket, &mut viewers, &mut turn, now).await;
+                    Self::pump_outbound(egress, &mut viewers, &mut turn, now).await;
                     Self::reap(&mut viewers, &self.shared);
                 }
             }
@@ -499,10 +510,10 @@ impl WhepServeEndpoint {
                 peer,
                 relay,
                 payload,
-            } => Self::route_datagram(viewers, peer, relay, &payload, now),
+            } => Self::route_datagram(viewers, Transport::Udp, peer, relay, &payload, now),
             crate::transport::relay_io::Inbound::TurnControl => {}
             crate::transport::relay_io::Inbound::Media => {
-                Self::route_datagram(viewers, src, local_addr, payload, now);
+                Self::route_datagram(viewers, Transport::Udp, src, local_addr, payload, now);
             }
         }
     }
@@ -577,13 +588,16 @@ impl WhepServeEndpoint {
     /// Route one received datagram to the first viewer session that accepts it.
     pub(crate) fn route_datagram(
         viewers: &mut [ViewerSession],
+        proto: Transport,
         src: SocketAddr,
         local: SocketAddr,
         payload: &[u8],
         now: Instant,
     ) {
         for v in viewers.iter_mut() {
-            let _ = v.session.handle_datagram(src, local, payload, now);
+            let _ = v
+                .session
+                .handle_datagram_proto(proto, src, local, payload, now);
             v.was_connected |= v.session.is_connected();
         }
     }
@@ -591,15 +605,14 @@ impl WhepServeEndpoint {
     /// Drain every viewer's outbound datagrams onto the socket (non-blocking send;
     /// a send error drops the datagram — never blocks the loop).
     pub(crate) async fn pump_outbound(
-        socket: &tokio::net::UdpSocket,
+        egress: crate::transport::Egress<'_>,
         viewers: &mut [ViewerSession],
         turn: &mut TurnRelayDriver,
         now: Instant,
     ) {
         for v in viewers.iter_mut() {
-            while let Some((source, dst, payload)) = v.session.poll_transmit(now) {
-                crate::transport::relay_io::send_routed(socket, turn, source, dst, &payload, now)
-                    .await;
+            while let Some(dg) = v.session.poll_transmit_routed(now) {
+                crate::transport::relay_io::send_routed(egress, turn, &dg, now).await;
             }
         }
     }

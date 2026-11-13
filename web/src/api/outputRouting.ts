@@ -10,9 +10,9 @@ import { apiUrl, buildHeaders, OperationApiError, readProblem, sendCommand } fro
 import type { RequestOptions } from './operations';
 import type { components } from './types';
 
-/** A slice-1 output video feed (externally tagged, never untagged). */
+/** An output video feed (externally tagged, never untagged). */
 export type OutputVideoFeed =
-  | { readonly bus: 'program' | 'preview' }
+  | { readonly bus: 'program' | 'preview' | 'clean' }
   | { readonly source: string };
 
 /** One output's routing row (feeds are `{redacted: true}` when hidden). */
@@ -123,7 +123,9 @@ export function isRedacted(value: unknown): boolean {
 /** The feed a routing row's `video` carries, or `undefined` if hidden/unknown. */
 export function feedOf(value: unknown): OutputVideoFeed | undefined {
   if (!isRecord(value)) return undefined;
-  if (value.bus === 'program' || value.bus === 'preview') return { bus: value.bus };
+  if (value.bus === 'program' || value.bus === 'preview' || value.bus === 'clean') {
+    return { bus: value.bus };
+  }
   if (typeof value.source === 'string') return { source: value.source };
   return undefined;
 }
@@ -137,6 +139,7 @@ export function feedKey(feed: OutputVideoFeed): string {
 export function feedFromKey(key: string): OutputVideoFeed | undefined {
   if (key === 'bus:program') return { bus: 'program' };
   if (key === 'bus:preview') return { bus: 'preview' };
+  if (key === 'bus:clean') return { bus: 'clean' };
   if (key.startsWith('src:') && key.length > 4) return { source: key.slice(4) };
   return undefined;
 }

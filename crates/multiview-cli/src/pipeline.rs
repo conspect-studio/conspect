@@ -3969,7 +3969,7 @@ impl Pipeline {
         control: FC,
     ) -> Result<PipelineReport, PipelineError>
     where
-        FC: FnMut(&mut CompositorDrive<Nv12Image>),
+        FC: FnMut(&mut CompositorDrive<Nv12Image>) + Send,
     {
         self.run_until_serving_observed(stop, publisher, preview, control, None)
             .await
@@ -4000,7 +4000,7 @@ impl Pipeline {
         tick_observer: Option<Arc<AtomicU64>>,
     ) -> Result<PipelineReport, PipelineError>
     where
-        FC: FnMut(&mut CompositorDrive<Nv12Image>),
+        FC: FnMut(&mut CompositorDrive<Nv12Image>) + Send,
     {
         let time: Arc<dyn TimeSource> = Arc::new(MonotonicTimeSource::new());
         // Live daemon: drop-on-overload so a wedged encoder can never stall the
@@ -4264,7 +4264,7 @@ impl Pipeline {
     ///
     /// Returns a [`PipelineError`] if the clock/engine reject the canvas, the
     /// bake fails, or a sink runner returns an error.
-    pub async fn drive_streaming_for_test<P: Pacer>(
+    pub async fn drive_streaming_for_test<P: Pacer + Send>(
         &mut self,
         params: StreamTestParams<P>,
         stop: &StopSignal,
@@ -4370,8 +4370,8 @@ impl Pipeline {
         control: FC,
     ) -> Result<DriveStreamOutcome, PipelineError>
     where
-        P: Pacer,
-        FC: FnMut(&mut CompositorDrive<Nv12Image>),
+        P: Pacer + Send,
+        FC: FnMut(&mut CompositorDrive<Nv12Image>) + Send,
     {
         // #103: an AES67 source/output only functions on the program-audio bus, so
         // fail closed BEFORE the output clock starts if this run carries none —
@@ -5127,7 +5127,14 @@ impl Pipeline {
             // The output clock completes this tick; then the program owner
             // joins the consumer and propagates its exact fatal cause. A UI
             // that still answers HTTP must never mask stopped encoded media.
-            stop_on_egress_failure(&egress_fatal, &egress_stop, false);
+            // #309: the engine side of the fatal output decision (covers a
+            // consumer that died without returning, e.g. a panic). Live runs
+            // only; wait-free; a no-op unless the binary enabled the watchdog.
+            if stop_on_egress_failure(&egress_fatal, &egress_stop, false)
+                && matches!(policy, SendPolicy::DropOnOverload)
+            {
+                crate::exit_watchdog::arm(crate::exit_watchdog::ExitCause::Fatal);
+            }
             match policy {
                 SendPolicy::BlockForExact => {
                     // A blocking send back-pressures the OFFLINE renderer (not a
@@ -5145,13 +5152,19 @@ impl Pipeline {
                     Err(TrySendError::Full(_)) => {
                         // Shed and COUNT — never block (inv #1/#10).
                         hot_dropped.fetch_add(1, Ordering::Release);
+                        // #309: a shed frame makes the run's verdict FALTERED (exit 1).
+                        crate::exit_watchdog::note_run_failed();
                     }
                     Err(TrySendError::Disconnected(_)) => {
                         // The output producer died. Stop at this tick boundary
                         // rather than reporting a healthy UI over dead streams.
                         egress_fatal.store(true, Ordering::Release);
                         egress_stop.stop();
+                        // #309: wait-free; bounded exit from this decision.
+                        crate::exit_watchdog::arm(crate::exit_watchdog::ExitCause::Fatal);
                         hot_dropped.fetch_add(1, Ordering::Release);
+                        // #309: a shed frame makes the run's verdict FALTERED (exit 1).
+                        crate::exit_watchdog::note_run_failed();
                     }
                 },
             }
@@ -5229,94 +5242,143 @@ impl Pipeline {
         // `EngineRuntime` path — the run methods no longer take `stop`; the same
         // bounded (`run_for`) vs forever (`run`) split + the same publisher /
         // state/event projections / per-frame control hook are threaded verbatim.
-        let outcome = if let Some(mut switcher_driver) = self.switcher_driver.take() {
-            switcher_driver.set_prime_stores(self.catalogue_stores());
-            let Some(preview_slot) = self.switcher_preview.clone() else {
-                return Err(PipelineError::Engine("switcher preview tap missing".into()));
-            };
-            let Some(cell_id) = self.switcher_cell_id.clone() else {
-                return Err(PipelineError::Engine(
-                    "switcher Program cell id missing".into(),
-                ));
-            };
-            let mut hook = multiview_engine::switcher_hook::SwitcherFrameHook::new(
-                switcher_driver,
-                cell_id,
-                control,
-            );
-            hook.preview_slot = Some(preview_slot);
-            hook.preview_stores = Some(self.catalogue_stores());
-            hook.preview_selection = preview_selection;
-            // The only clock-side routing duty: one non-blocking `try_send`
-            // after a fresh compose, and only while a routed feed is active.
-            // The engine run future is boxed (one allocation per run, never
-            // per tick) so the hook's state does not inflate this future.
-            let hook = multiview_engine::WithAuxTick {
-                inner: hook,
-                aux: aux_tx,
-            };
-            match max_ticks {
-                Some(max) => {
-                    Box::pin(
-                        program
-                            .run_for_with_frame_control(publisher, max, state_of, event_of, hook),
-                    )
-                    .await
+        let clock_thread_name = format!("clock-{}", self.program_spec.id.as_str());
+        let engine_loop =
+            async {
+                if let Some(mut switcher_driver) = self.switcher_driver.take() {
+                    switcher_driver.set_prime_stores(self.catalogue_stores());
+                    let Some(preview_slot) = self.switcher_preview.clone() else {
+                        return Err(PipelineError::Engine("switcher preview tap missing".into()));
+                    };
+                    let Some(cell_id) = self.switcher_cell_id.clone() else {
+                        return Err(PipelineError::Engine(
+                            "switcher Program cell id missing".into(),
+                        ));
+                    };
+                    let mut hook = multiview_engine::switcher_hook::SwitcherFrameHook::new(
+                        switcher_driver,
+                        cell_id,
+                        control,
+                    );
+                    hook.preview_slot = Some(preview_slot);
+                    hook.preview_stores = Some(self.catalogue_stores());
+                    hook.preview_selection = preview_selection;
+                    // The only clock-side routing duty: one non-blocking `try_send`
+                    // after a fresh compose, and only while a routed feed is active.
+                    // The engine run future is boxed (one allocation per run, never
+                    // per tick) so the hook's state does not inflate this future.
+                    let hook = multiview_engine::WithAuxTick {
+                        inner: hook,
+                        aux: aux_tx,
+                    };
+                    match max_ticks {
+                        Some(max) => {
+                            Box::pin(program.run_for_with_frame_control(
+                                publisher, max, state_of, event_of, hook,
+                            ))
+                            .await
+                        }
+                        None => {
+                            Box::pin(
+                                program.run_with_frame_control(publisher, state_of, event_of, hook),
+                            )
+                            .await
+                        }
+                    }
+                    .map_err(|e| PipelineError::Engine(e.to_string()))
+                } else {
+                    // `ClosureControl` calls `control` exactly as `run_with_control`'s
+                    // adapter does (before every compose and on every repeat).
+                    let hook = multiview_engine::WithAuxTick {
+                        inner: multiview_engine::ClosureControl(control),
+                        aux: aux_tx,
+                    };
+                    match max_ticks {
+                        Some(max) => {
+                            Box::pin(program.run_for_with_frame_control(
+                                publisher, max, state_of, event_of, hook,
+                            ))
+                            .await
+                        }
+                        None => {
+                            Box::pin(
+                                program.run_with_frame_control(publisher, state_of, event_of, hook),
+                            )
+                            .await
+                        }
+                    }
+                    .map_err(|e| PipelineError::Engine(e.to_string()))
                 }
-                None => {
-                    Box::pin(program.run_with_frame_control(publisher, state_of, event_of, hook))
-                        .await
-                }
-            }
-        } else {
-            // `ClosureControl` calls `control` exactly as `run_with_control`'s
-            // adapter does (before every compose and on every repeat).
-            let hook = multiview_engine::WithAuxTick {
-                inner: multiview_engine::ClosureControl(control),
-                aux: aux_tx,
             };
-            match max_ticks {
-                Some(max) => {
-                    Box::pin(
-                        program
-                            .run_for_with_frame_control(publisher, max, state_of, event_of, hook),
-                    )
-                    .await
-                }
-                None => {
-                    Box::pin(program.run_with_frame_control(publisher, state_of, event_of, hook))
-                        .await
-                }
-            }
-        }
-        .map_err(|e| PipelineError::Engine(e.to_string()));
+        // #311 / ADR-0109: the protected tick loop runs on a dedicated, named
+        // output-clock thread (precise absolute-deadline pacing, no shared
+        // executor worker or timer wheel with the control plane). This task's
+        // worker is handed back to the runtime while the loop runs.
+        // A thread that could not start is an engine error that still flows
+        // through the teardown below (ingest stop, egress join), never `?`.
+        let outcome =
+            multiview_engine::clock_thread::run_on_clock_thread(&clock_thread_name, engine_loop)
+                .await
+                .unwrap_or_else(|e| {
+                    Err(PipelineError::Engine(format!("output clock thread: {e}")))
+                });
 
-        // The clock has stopped (bounded budget reached, or `stop` raised): tear
-        // ingest down deterministically (signal + join), then close the egress and
-        // finalise. The hot queue is already closed by this point — see below.
+        // #309: every teardown stage is timed from the moment the clock returned,
+        // so a slow exit names its stage in the log.
+        let teardown_start = Instant::now();
+        let stage = |name: &str| {
+            tracing::info!(
+                stage = name,
+                elapsed_ms =
+                    u64::try_from(teardown_start.elapsed().as_millis()).unwrap_or(u64::MAX),
+                "teardown stage done"
+            );
+        };
+        // #309: an engine error is a fatal decision too; arm before anything
+        // that can block (a log line), before the slow source teardown.
+        if outcome.is_err() && matches!(policy, SendPolicy::DropOnOverload) {
+            crate::exit_watchdog::arm(crate::exit_watchdog::ExitCause::Fatal);
+        }
+        stage("clock-returned");
+        if let Some(cause) = crate::exit_watchdog::armed() {
+            tracing::info!(?cause, "exit deadline armed; finalising outputs first");
+        }
+
+        // #309: finalise the OUTPUTS first. The engine loop consumed the
+        // `state_of` closure (the ONLY owner of the hot sender) when
+        // `run_for`/`run` returned above, so the hot queue is already closed →
+        // the bake consumer's `recv()` has seen end-of-input, drains the queue,
+        // fans the remainder, and drops the per-sink senders → each sink sees its
+        // channel close and finalises (writes its trailer). Dropping the program
+        // here only releases the engine's own resources (its wrapped
+        // `EngineRuntime` = clock + drive + time source + pacer).
+        drop(program);
+        stage("program-dropped");
+        // Join the bake consumer + sink threads BEFORE the (slow) source
+        // teardown, so the trailers and the HLS manifest land within ~100 ms of
+        // the clock returning — inside the exit bound — and BEFORE propagating
+        // any engine error, so a mid-run engine error still finalises the
+        // partial output. The engine error (the root cause) is surfaced first;
+        // an egress/sink error second.
+        let egress_result = egress.join();
+        // #309: an output that failed to finalise is a failed run, even during a
+        // stop: upgrade the exit cause before anything else (even a log line).
+        if egress_result.is_err() && matches!(policy, SendPolicy::DropOnOverload) {
+            crate::exit_watchdog::arm(crate::exit_watchdog::ExitCause::Fatal);
+        }
+        stage("egress-joined");
+        // Then tear ingest down (signal + bounded join per producer). Producers
+        // blocked in libav network reads use their full grace here; the exit
+        // watchdog bounds the total.
         demand.stop_all();
+        stage("demand-stop-all");
         supervisor.shutdown();
+        stage("ingest-supervisor");
         // Invalidate every startup producer, including any libav worker detached
         // after the bounded join. No old run may write into a later run's slot.
         for (id, lifecycle) in startup_lifecycles {
             end_live_lifecycle(&id, lifecycle);
         }
-        // The engine loop consumed the `state_of` closure (the ONLY owner of the
-        // hot sender) when `run_for`/`run` returned above, so the hot queue is
-        // already closed → the bake consumer's `recv()` has seen end-of-input,
-        // drains the queue, fans the remainder, and drops the per-sink senders →
-        // each sink sees its channel close and finalises (writes its trailer).
-        // Dropping the program here only releases the engine's own resources
-        // (its wrapped `EngineRuntime` = clock + drive + time source + pacer).
-        drop(program);
-
-        // Join the bake consumer + sink threads FIRST — folding their outcome and
-        // writing the trailers (the sinks' own `run()` finalisation) — BEFORE
-        // propagating any engine error, so a mid-run engine error still finalises
-        // the partial output and never detaches the egress threads with a trailer
-        // unwritten. The engine error (the root cause) is surfaced first; an
-        // egress/sink error second.
-        let egress_result = egress.join();
         let outcome = outcome?;
         let egress_out = egress_result?;
 
@@ -6047,6 +6109,8 @@ struct StreamEgress {
     /// The engine reads one atomic bit per tick and requests a clean tick-boundary
     /// stop; the owner then propagates the exact joined error to its supervisor.
     fatal: Arc<AtomicBool>,
+    /// Live run (#309): a consumer that overruns the join upgrades the exit.
+    arm_on_wedge: bool,
     sinks: Vec<JoinHandle<Result<SinkRunOutcome, PipelineError>>>,
     /// Frames currently queued in the hot-loop → consumer channel (bumped by the
     /// hot loop on send, decremented by the consumer on recv).
@@ -6266,6 +6330,16 @@ impl StreamEgress {
         }
 
         let (hot_tx, hot_rx) = std::sync::mpsc::sync_channel::<StreamItem>(policy.queue_cap());
+        // #309: only a live (realtime, drop-on-overload) run with no test seam
+        // arms the process exit deadline on a fatal (and only when the binary
+        // enabled it); an offline render and the test seams never do.
+        let arm_exit_on_fatal = matches!(policy, SendPolicy::DropOnOverload)
+            && consumer_fault_after_ticks.is_none()
+            && shed_at_tick.is_none();
+        if arm_exit_on_fatal {
+            // #309: open until the egress join finalises every output.
+            crate::exit_watchdog::outputs_opened();
+        }
         let consumer_in_flight = Arc::clone(&in_flight);
         let fatal = Arc::new(AtomicBool::new(false));
         let consumer_fatal = Arc::clone(&fatal);
@@ -6372,8 +6446,13 @@ impl StreamEgress {
                     result
                 };
                 if let Err(error) = &result {
-                    tracing::error!(error = %error, "fatal encoded-output consumer failure");
+                    // #309: decide first, log second — a blocked log writer must
+                    // not delay the stop flag or the exit deadline.
                     consumer_fatal.store(true, Ordering::Release);
+                    if arm_exit_on_fatal {
+                        crate::exit_watchdog::arm(crate::exit_watchdog::ExitCause::Fatal);
+                    }
+                    tracing::error!(error = %error, "fatal encoded-output consumer failure");
                 }
                 result
             })
@@ -6383,6 +6462,9 @@ impl StreamEgress {
                 // drop, closing the channels so the hot loop sees Disconnected and
                 // each sink sees end-of-program — nothing wedges.
                 fatal.store(true, Ordering::Release);
+                if arm_exit_on_fatal {
+                    crate::exit_watchdog::arm(crate::exit_watchdog::ExitCause::Fatal);
+                }
                 std::thread::spawn(|| {
                     Err(PipelineError::Output {
                         kind: "bake-consumer",
@@ -6395,6 +6477,7 @@ impl StreamEgress {
             Self {
                 consumer,
                 fatal,
+                arm_on_wedge: arm_exit_on_fatal,
                 sinks,
                 in_flight,
                 peak_occupancy,
@@ -6423,57 +6506,62 @@ impl StreamEgress {
     /// Returns a [`PipelineError`] if the consumer panicked, or a sink that DID
     /// finish errored/panicked (a detached wedged sink is reported, not errored).
     fn join(self) -> Result<EgressOutcome, PipelineError> {
+        // #309: this egress's outputs count as open until join resolves them.
+        // Every return path resolves them (the guard's Drop), except a consumer
+        // still running at the grace or a sink detached as wedged: those
+        // outputs are not finalised and stay open.
+        let mut open_guard = OutputsOpenGuard::new(self.arm_on_wedge);
+        let mut any_sink_wedged = false;
         // A fatal native encoder can wedge in libav without returning an error.
         // Do not let shutdown wait forever: systemd owns a fresh-process restart
         // after this bounded error, and the detached thread cannot poison a new
         // in-process encoder generation.
-        let deadline = Instant::now() + SINK_WEDGE_GRACE;
+        // #309: every phase of the join (this consumer wait, then the sinks) gets
+        // `join_budget()` = min(SINK_WEDGE_GRACE, time left to an armed exit
+        // deadline). With a deadline armed, every phase therefore ends at that
+        // same instant, so the join never outlives the bound; without one
+        // (offline/library runs) each phase keeps its full grace.
+        let deadline = Instant::now() + join_budget();
         while !self.consumer.is_finished() && Instant::now() < deadline {
             std::thread::park_timeout(Duration::from_millis(10));
         }
         if !self.consumer.is_finished() {
+            open_guard.keep_open();
             return Err(PipelineError::Output {
                 kind: "bake-consumer",
                 reason: "encoder consumer failed to stop within bounded teardown".to_owned(),
             });
         }
-        let bindings = self
+        // #309: on a consumer error (the fatal path) the sinks are still
+        // finalising (they see end-of-program once the returning consumer
+        // dropped their senders): join them too, bounded, before returning the
+        // consumer's error, so the trailers / HLS finalize land and a wedged
+        // sink is accounted for.
+        let consumer_result = self
             .consumer
             .join()
-            .map_err(|_| PipelineError::Engine("bake consumer thread panicked".to_owned()))??;
+            .map_err(|_| PipelineError::Engine("bake consumer thread panicked".to_owned()))
+            .and_then(|r| r);
+        let bindings = match consumer_result {
+            Ok(bindings) => bindings,
+            Err(error) => {
+                if !join_sinks_after_consumer_failure(self.sinks) {
+                    open_guard.keep_open();
+                }
+                return Err(error);
+            }
+        };
         let mut lines = Vec::with_capacity(self.sinks.len() + bindings.len());
         let mut frames = Vec::with_capacity(self.sinks.len());
         // Per-binding delivery truth, emitted BEFORE the sink lines so a lost or
         // failed binding is visible even when its sink thread produced a file.
-        for (index, binding) in bindings.iter().enumerate() {
-            lines.push(format!(
-                "binding {index}: {} windows / {} packets admitted, {} windows lost \
-                 ({} packets), generation {}, queued {}, in-flight {}/{} bytes{}",
-                binding.admitted_batches,
-                binding.admitted_packets,
-                binding.rejected_batches,
-                binding.rejected_packets,
-                binding.generation,
-                binding.queued_windows,
-                binding.reserved_packets,
-                binding.reserved_bytes,
-                match binding.last_rejection {
-                    Some(reason) => format!(
-                        ", last loss: {}{}",
-                        reason.label(),
-                        if binding.failed {
-                            " (binding failed)"
-                        } else {
-                            ""
-                        }
-                    ),
-                    None => String::new(),
-                }
-            ));
-        }
+        lines.extend(binding_report_lines(&bindings));
         // A shared teardown budget: healthy sinks finish in milliseconds; only a
-        // genuinely wedged sink consumes the grace before being detached.
-        let deadline = Instant::now() + SINK_WEDGE_GRACE;
+        // genuinely wedged sink consumes the grace before being detached. A
+        // fresh budget (the sinks start finalising only once the consumer has
+        // returned), still capped by an armed exit deadline (#309): with one
+        // armed, a sink first reached after it counts as wedged.
+        let deadline = Instant::now() + join_budget();
         for (i, handle) in self.sinks.into_iter().enumerate() {
             while !handle.is_finished() && Instant::now() < deadline {
                 std::thread::sleep(Duration::from_millis(10));
@@ -6489,28 +6577,136 @@ impl StreamEgress {
                 lines.push(format!(
                     "sink {i}: WEDGED (teardown grace exceeded, detached)"
                 ));
+                any_sink_wedged = true;
                 frames.push(0);
                 continue;
             }
-            let outcome = handle.join().map_err(|_| PipelineError::Output {
-                kind: "sink",
-                reason: "sink thread panicked".to_owned(),
-            })??;
+            let outcome = match handle
+                .join()
+                .map_err(|_| PipelineError::Output {
+                    kind: "sink",
+                    reason: "sink thread panicked".to_owned(),
+                })
+                .and_then(|r| r)
+            {
+                Ok(outcome) => outcome,
+                Err(error) => {
+                    // #309: an output that failed is not finalised.
+                    open_guard.keep_open();
+                    return Err(error);
+                }
+            };
             // Write the HLS playlist (if any) once the segment encode completed.
             if let Some((path, text)) = outcome.playlist {
-                std::fs::write(&path, text.as_bytes()).map_err(|e| PipelineError::Output {
-                    kind: "hls",
-                    reason: format!("writing playlist {}: {e}", path.display()),
-                })?;
+                if let Err(e) = std::fs::write(&path, text.as_bytes()) {
+                    open_guard.keep_open();
+                    return Err(PipelineError::Output {
+                        kind: "hls",
+                        reason: format!("writing playlist {}: {e}", path.display()),
+                    });
+                }
             }
             lines.push(outcome.line);
             frames.push(outcome.frames);
+        }
+        if any_sink_wedged {
+            open_guard.keep_open();
         }
         Ok(EgressOutcome {
             lines,
             peak_occupancy: self.peak_occupancy.load(Ordering::Acquire),
             sink_frames: frames,
         })
+    }
+}
+
+/// One report line per binding: its delivery truth (admitted / lost windows,
+/// generation, queue and in-flight state, and the last loss reason).
+fn binding_report_lines(bindings: &[crate::binding_delivery::BindingStatus]) -> Vec<String> {
+    let mut lines = Vec::with_capacity(bindings.len());
+    for (index, binding) in bindings.iter().enumerate() {
+        lines.push(format!(
+            "binding {index}: {} windows / {} packets admitted, {} windows lost \
+             ({} packets), generation {}, queued {}, in-flight {}/{} bytes{}",
+            binding.admitted_batches,
+            binding.admitted_packets,
+            binding.rejected_batches,
+            binding.rejected_packets,
+            binding.generation,
+            binding.queued_windows,
+            binding.reserved_packets,
+            binding.reserved_bytes,
+            match binding.last_rejection {
+                Some(reason) => format!(
+                    ", last loss: {}{}",
+                    reason.label(),
+                    if binding.failed {
+                        " (binding failed)"
+                    } else {
+                        ""
+                    }
+                ),
+                None => String::new(),
+            }
+        ));
+    }
+    lines
+}
+
+/// The egress join's wait budget (#309): [`SINK_WEDGE_GRACE`], never past an
+/// armed exit deadline (the watchdog ends the process there anyway).
+fn join_budget() -> Duration {
+    crate::exit_watchdog::remaining().map_or(SINK_WEDGE_GRACE, |left| left.min(SINK_WEDGE_GRACE))
+}
+
+/// After a consumer failure, join every sink within one [`SINK_WEDGE_GRACE`]
+/// (#309): they are still finalising. Returns `false` if any sink failed or
+/// was still running and had to be detached (its output is not finalised).
+fn join_sinks_after_consumer_failure(
+    sinks: Vec<JoinHandle<Result<SinkRunOutcome, PipelineError>>>,
+) -> bool {
+    let deadline = Instant::now() + join_budget();
+    let mut all_finalised = true;
+    for (i, handle) in sinks.into_iter().enumerate() {
+        while !handle.is_finished() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        if handle.is_finished() {
+            if !matches!(handle.join(), Ok(Ok(_))) {
+                all_finalised = false;
+            }
+        } else {
+            tracing::warn!(
+                sink = i,
+                "sink wedged finalising after a consumer failure; detaching"
+            );
+            all_finalised = false;
+        }
+    }
+    all_finalised
+}
+
+/// Resolves one live egress's "outputs open" count (#309) on drop, unless told
+/// the outputs stayed open (a wedged consumer or sink).
+struct OutputsOpenGuard {
+    armed: bool,
+}
+
+impl OutputsOpenGuard {
+    const fn new(armed: bool) -> Self {
+        Self { armed }
+    }
+
+    fn keep_open(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for OutputsOpenGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            crate::exit_watchdog::outputs_finalised();
+        }
     }
 }
 
@@ -6548,10 +6744,42 @@ mod egress_fatal_tests {
         StreamEgress {
             consumer,
             fatal: Arc::new(AtomicBool::new(fatal)),
+            arm_on_wedge: false,
             sinks: Vec::new(),
             in_flight: Arc::new(AtomicI64::new(0)),
             peak_occupancy: Arc::new(AtomicUsize::new(0)),
         }
+    }
+
+    /// #309: after a consumer error the sinks are still finalising; the join
+    /// waits for them (bounded) instead of detaching them, and only then
+    /// returns the consumer's error.
+    #[test]
+    fn a_consumer_error_still_joins_the_finalising_sinks() {
+        let finished = Arc::new(AtomicBool::new(false));
+        let done = Arc::clone(&finished);
+        let sink = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(150));
+            done.store(true, Ordering::Release);
+            Ok(super::SinkRunOutcome {
+                line: "sink".to_owned(),
+                playlist: None,
+                frames: 0,
+            })
+        });
+        let consumer = std::thread::spawn(|| {
+            Err(PipelineError::Output {
+                kind: "video-worker",
+                reason: "fell behind".to_owned(),
+            })
+        });
+        let mut egress = egress_with_consumer(consumer, true);
+        egress.sinks.push(sink);
+        assert!(egress.join().is_err(), "the consumer's error is returned");
+        assert!(
+            finished.load(Ordering::Acquire),
+            "the sink finished finalising before join returned"
+        );
     }
 
     /// The per-tick hot-loop check: a healthy consumer leaves the run running;
@@ -7545,9 +7773,13 @@ fn consumer_main<D: WindowDelivery>(
     let mut last_audio_tick = None;
     // `recv()` returns `Err` only when the hot sender drops = end-of-program
     // (clean stop / EOF), which ends the loop.
+    #[cfg(feature = "_chaos-test-seams")]
+    let mut chaos_stall = chaos::ConsumerStall::from_env();
     while let Ok(item) = hot_rx.recv() {
         // One frame left the queue.
         in_flight.fetch_sub(1, Ordering::AcqRel);
+        #[cfg(feature = "_chaos-test-seams")]
+        chaos_stall.maybe_stall(item.tick_index);
         // Live-opened encoders' windows first: a live window T must be staged
         // before base window T closes, or a move onto it is refused.
         router
@@ -7584,6 +7816,24 @@ fn consumer_main<D: WindowDelivery>(
         // live-opened encoders. Never waits; a no-take run does nothing here.
         let tick_pts =
             MediaTime::from_tick(i64::try_from(item.tick_index).unwrap_or(i64::MAX), cadence);
+        // The ticks this consumer missed (a transient stall shed them from
+        // the hot queue), computed ONCE before the router tick and reused
+        // below for the base-worker substitution loop: the existing error
+        // behaviour (a gap beyond the admitted envelope fails the run) is
+        // preserved exactly, before anything is offered to either Clean or
+        // the base workers.
+        let missing = missing_ticks_before(last_tick, item.tick_index)?;
+        // Clean is substituted exactly like Program: each missing tick is
+        // offered Clean's own last pre-bake frame BEFORE `publish_clean`
+        // publishes the surviving tick, so the Clean worker sees ticks
+        // strictly increasing (missing ticks, then the surviving tick) and
+        // a consumer stall never relies solely on Clean's own `GapFill` to
+        // absorb the gap. One bool check when Clean is not active.
+        router.substitute_clean(missing.clone());
+        // The Clean bus is this tick's Program canvas BEFORE the overlay bake,
+        // published before the router tick so a Clean encoder gets frame T
+        // this tick. One bool check when nothing selects Clean.
+        router.publish_clean(item.tick_index, &item.canvas);
         router
             .on_tick(item.tick_index, tick_pts, &mut dispatcher, &mut delivery)
             .map_err(|e| PipelineError::Output {
@@ -7633,13 +7883,13 @@ fn consumer_main<D: WindowDelivery>(
         // deployed continuity contract is untouched) and the muxed stream has
         // a frame for EVERY output tick. A gap beyond the admitted envelope
         // fails the run explicitly (never silently skips forward).
-        for missing in missing_ticks_before(last_tick, item.tick_index)? {
+        for missing_tick in missing {
             let canvas = last_baked.as_ref().unwrap_or(&overlaid);
             for worker in &workers {
                 worker
                     .offer_within(
                         BakedTick {
-                            tick: missing,
+                            tick: missing_tick,
                             canvas: Arc::clone(canvas),
                         },
                         offer_horizon,
@@ -9463,10 +9713,15 @@ impl IngestSupervisor {
     /// the produced output nor stall the caller. This keeps the output-clock
     /// guarantee (invariant #1) intact end-to-end, including teardown.
     fn join_all(&mut self) {
+        #[cfg(feature = "_chaos-test-seams")]
+        chaos::slow_teardown();
         for (stop, _) in &self.producers {
             stop.store(true, Ordering::Release);
         }
-        let deadline = Instant::now() + INGEST_JOIN_GRACE;
+        // #309: never past an armed process exit deadline.
+        let grace = crate::exit_watchdog::remaining()
+            .map_or(INGEST_JOIN_GRACE, |left| left.min(INGEST_JOIN_GRACE));
+        let deadline = Instant::now() + grace;
         for (_, handle) in self.producers.drain(..) {
             let name = handle.thread().name().unwrap_or("ingest").to_owned();
             while !handle.is_finished() && Instant::now() < deadline {
@@ -12984,6 +13239,13 @@ struct StreamingPacketSource {
     current_permit: Option<Arc<multiview_output::batch::BatchLease>>,
     /// How many packets this source delivered (for the per-sink report count).
     delivered: usize,
+    /// The lease the last packet came from (identity only: a `Weak` keeps the
+    /// allocation, so its address cannot be reused by the next window, while
+    /// the lease itself and its reservation are released as before).
+    last_lease: std::sync::Weak<multiview_output::batch::BatchLease>,
+    /// The current window opened a decoder-configuration change not yet
+    /// reported to the sink (reported once per lease).
+    config_change_unreported: bool,
 }
 
 impl StreamingPacketSource {
@@ -12992,6 +13254,8 @@ impl StreamingPacketSource {
             rx,
             current_permit: None,
             delivered: 0,
+            last_lease: std::sync::Weak::new(),
+            config_change_unreported: false,
         }
     }
 }
@@ -13004,9 +13268,20 @@ impl PacketSource for StreamingPacketSource {
         let Ok(leased) = self.rx.recv() else {
             return Ok(None);
         };
+        // The pump fans one window's packets with clones of ONE `Arc`
+        // permit, so a different address is the next window.
+        let lease = Arc::downgrade(&leased.permit);
+        if !self.last_lease.ptr_eq(&lease) {
+            self.last_lease = lease;
+            self.config_change_unreported = leased.permit.decoder_config_changed();
+        }
         self.current_permit = Some(leased.permit);
         self.delivered = self.delivered.saturating_add(1);
         Ok(Some(leased.packet))
+    }
+
+    fn take_decoder_config_change(&mut self) -> bool {
+        std::mem::take(&mut self.config_change_unreported)
     }
 }
 
@@ -25523,5 +25798,61 @@ mod device_open_tests {
             }),
             Err("denied".to_owned())
         );
+    }
+}
+
+/// Chaos seams for issue #309 (never in a release build: the
+/// `_chaos-test-seams` feature matches the release-feature guard's
+/// `*test-seam*` rule).
+#[cfg(feature = "_chaos-test-seams")]
+mod chaos {
+    /// Stall the bake consumer ONCE, for `MULTIVIEW_CHAOS_CONSUMER_STALL_MS`
+    /// milliseconds, at tick `MULTIVIEW_CHAOS_CONSUMER_STALL_AT` (default 150):
+    /// the output then falls behind the clock exactly like a slow encode.
+    pub(super) struct ConsumerStall {
+        at: u64,
+        stall: Option<std::time::Duration>,
+    }
+
+    /// Hold source teardown for `MULTIVIEW_CHAOS_SLOW_TEARDOWN_MS`
+    /// milliseconds: the stand-in for producers blocked in libav network
+    /// reads, which used their full grace in production (#309).
+    pub(super) fn slow_teardown() {
+        if let Some(ms) = std::env::var("MULTIVIEW_CHAOS_SLOW_TEARDOWN_MS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+        {
+            tracing::warn!(ms, "chaos: holding source teardown");
+            std::thread::sleep(std::time::Duration::from_millis(ms));
+        }
+    }
+
+    impl ConsumerStall {
+        pub(super) fn from_env() -> Self {
+            let ms = std::env::var("MULTIVIEW_CHAOS_CONSUMER_STALL_MS")
+                .ok()
+                .and_then(|v| v.parse::<u64>().ok());
+            let at = std::env::var("MULTIVIEW_CHAOS_CONSUMER_STALL_AT")
+                .ok()
+                .and_then(|v| v.parse::<u64>().ok())
+                .unwrap_or(150);
+            Self {
+                at,
+                stall: ms.map(std::time::Duration::from_millis),
+            }
+        }
+
+        pub(super) fn maybe_stall(&mut self, tick: u64) {
+            if tick >= self.at {
+                if let Some(d) = self.stall.take() {
+                    tracing::warn!(
+                        tick,
+                        stall_ms = d.as_millis(),
+                        "chaos: stalling the bake consumer"
+                    );
+                    std::thread::sleep(d);
+                }
+            }
+        }
     }
 }

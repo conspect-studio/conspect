@@ -202,7 +202,20 @@ impl Supervisor {
     /// Backoffs are awaited with [`tokio::time::sleep`] (paused-time aware, so
     /// tests can drive it deterministically). This never touches the output
     /// clock; a misbehaving actor is contained entirely within this loop.
-    pub async fn supervise<A: Actor>(&self, mut actor: A) -> SupervisionOutcome {
+    pub async fn supervise<A: Actor>(&self, actor: A) -> SupervisionOutcome {
+        self.supervise_until(actor, None).await
+    }
+
+    /// Like [`Supervisor::supervise`], but a raised `stop` cuts a restart
+    /// backoff short (checked every 10 ms) and ends supervision with
+    /// [`StopReason::Completed`] instead of restarting. Used on the dedicated
+    /// output-clock thread (#311) so stopping a failing program never waits
+    /// out a backoff of up to the policy maximum.
+    pub async fn supervise_until<A: Actor>(
+        &self,
+        mut actor: A,
+        stop: Option<&crate::runtime::StopSignal>,
+    ) -> SupervisionOutcome {
         let mut restarts_used: u32 = 0;
         loop {
             let exit = actor.run().await;
@@ -227,10 +240,40 @@ impl Supervisor {
                         backoff_ms = backoff.as_millis(),
                         "actor failed; restarting after backoff"
                     );
-                    tokio::time::sleep(backoff).await;
+                    if !backoff_until_stop(backoff, stop).await {
+                        info!(
+                            actor = actor.name(),
+                            restarts_used, "stopped during restart backoff"
+                        );
+                        return SupervisionOutcome {
+                            restarts: restarts_used,
+                            reason: StopReason::Completed,
+                        };
+                    }
                 }
             }
         }
+    }
+}
+
+/// Sleep `backoff` in steps of at most 10 ms, returning `false` early if
+/// `stop` is raised (always `true` with no stop signal).
+async fn backoff_until_stop(backoff: Duration, stop: Option<&crate::runtime::StopSignal>) -> bool {
+    let Some(stop) = stop else {
+        tokio::time::sleep(backoff).await;
+        return true;
+    };
+    let poll_step = Duration::from_millis(10);
+    let deadline = tokio::time::Instant::now() + backoff;
+    loop {
+        if stop.is_stopped() {
+            return false;
+        }
+        let now = tokio::time::Instant::now();
+        if now >= deadline {
+            return true;
+        }
+        tokio::time::sleep((deadline - now).min(poll_step)).await;
     }
 }
 

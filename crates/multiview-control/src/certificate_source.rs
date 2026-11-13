@@ -243,6 +243,17 @@ impl ChallengeResolver {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .remove(name);
     }
+
+    /// The challenge certificate currently published for `name`, if any.
+    /// Never falls back to the site certificate (unlike [`ResolvesServerCert::resolve`]).
+    #[must_use]
+    pub fn challenge(&self, name: &str) -> Option<Arc<CertifiedKey>> {
+        self.challenges
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(name)
+            .cloned()
+    }
 }
 
 impl std::fmt::Debug for ChallengeResolver {

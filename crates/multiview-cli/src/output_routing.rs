@@ -63,7 +63,10 @@ pub const OPEN_QUEUE: usize = 4;
 /// Reaper queue capacity; full = the handle is dropped unjoined (counted).
 pub const REAPER_QUEUE: usize = 8;
 /// Largest gap a live-opened worker fills with its last canvas.
-pub const MAX_GAP_FILL_TICKS: u64 = 8;
+/// Sized to cover a full consumer substitution gap (`FRAME_SUBSTITUTION_LIMIT`
+/// = 8 in the pipeline) on top of a full worker queue (`WORKER_QUEUE_TICKS` = 4)
+/// and the offers dropped meanwhile, so a transient stall never fails a key.
+pub const MAX_GAP_FILL_TICKS: u64 = 24;
 /// Live-opened workers' event queue to the consumer.
 const DYNAMIC_EVENT_QUEUE: usize = 64;
 const NO_FORCE: u64 = u64::MAX;
@@ -192,7 +195,7 @@ pub struct PendingView {
 /// One output's routing state.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OutputRouteView {
-    /// Current bus name (`program`, `preview`, `src:<id>`).
+    /// Current bus name (`program`, `preview`, `clean`, `src:<id>`).
     pub bus: String,
     /// Internal encoding label.
     pub key: String,
@@ -237,6 +240,10 @@ pub struct RoutingSnapshot {
     pub audio_buses_live: usize,
     /// Routed-audio counters (opened, failed, refused, faded back).
     pub audio: crate::routing_audio::AudioRoutingCounters,
+    /// Live-opened encoder keys as `(bus name, settings index)`, sorted,
+    /// lingering ones included and failed ones excluded: a take onto one of
+    /// these reuses it (+0 encoders).
+    pub live_keys: Vec<(String, usize)>,
 }
 
 /// The control-plane handle (clone freely).
@@ -545,6 +552,18 @@ struct DynamicKey {
     /// Consecutive ticks this key was offered a frame with no event from its
     /// worker since; reset by every event. `WEDGED_ENCODER_TICKS` = wedged.
     silent: u32,
+    /// Consecutive offers to this key's worker refused (`Overloaded`); reset
+    /// by an accepted offer. Counted per key, never per bus: a healthy
+    /// sibling key on the same bus must not hide a starved one.
+    /// `DEGRADED_AFTER_TICKS` marks its outputs degraded;
+    /// `FALLBACK_AFTER_TICKS` closes the key (its outputs fall back).
+    starved: u64,
+    /// A substitution offer was refused this tick: the surviving tick's
+    /// accepted offer must not reset `starved` (a key that refuses every
+    /// substitution and accepts every survivor is still starved).
+    refused_this_tick: bool,
+    /// Whether the last published snapshot showed this key degraded.
+    reported_degraded: bool,
 }
 
 struct PendingOpen {
@@ -605,6 +624,11 @@ pub struct OutputRouter {
     dyn_rx: Receiver<(u64, DispatchEvent)>,
     next_generation: u64,
     feeds: HashMap<PictureBus, AuxFeed>,
+    /// Whether a Clean feed is active (cached so `publish_clean` costs one
+    /// bool load when nothing selects Clean).
+    clean_active: bool,
+    /// The last published `live_keys` (recomputed only while keys exist).
+    live_keys: Vec<(String, usize)>,
     health: HashMap<PictureBus, BusHealth>,
     last_forced: HashMap<usize, u64>,
     dropped_outcomes: u64,
@@ -714,6 +738,8 @@ impl OutputRouter {
             dyn_rx,
             next_generation: 0,
             feeds: HashMap::new(),
+            clean_active: false,
+            live_keys: Vec::new(),
             health: HashMap::new(),
             last_forced: HashMap::new(),
             dropped_outcomes: 0,
@@ -793,6 +819,80 @@ impl OutputRouter {
         }
     }
 
+    /// Publish this tick's Clean picture: the Program canvas BEFORE the
+    /// overlay bake. Call on the bake consumer before [`Self::on_tick`] for
+    /// the same tick, so a Clean encoder is fed frame `tick` that tick. Does
+    /// nothing (one bool load) unless some take or encoder uses Clean; never
+    /// copies the picture (one `Arc` clone into a wait-free slot).
+    pub(crate) fn publish_clean(&mut self, tick: u64, canvas: &Arc<Nv12Image>) {
+        if !self.clean_active {
+            return;
+        }
+        if let Some(feed) = self.feeds.get(&PictureBus::Clean) {
+            feed.slot
+                .latest
+                .store(Some(Arc::new(crate::routing_aux::AuxFrame {
+                    tick,
+                    generation: 0,
+                    frame: Arc::clone(canvas),
+                })));
+            feed.slot.composed.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// Substitute every tick in `ticks` on the Clean bus with its own last
+    /// pre-bake frame, exactly like Program's base-worker substitution:
+    /// call on the bake consumer BEFORE [`Self::publish_clean`]/[`Self::on_tick`]
+    /// for the surviving tick, with the SAME range the base-worker
+    /// substitution loop computes, when a consumer stall sheds ticks from
+    /// the hot queue. Without this, a Clean live encoder would see only
+    /// surviving ticks and rely on its own `GapFill` (bounded by
+    /// [`MAX_GAP_FILL_TICKS`]) to absorb a consumer gap — which, combined
+    /// with any dropped offers, can exceed that bound and fail the key.
+    ///
+    /// For each Clean dynamic key with a last-fed canvas, offers
+    /// `BakedTick { tick, canvas: last_fed }` (non-blocking, like
+    /// [`Self::feed`]) for every tick in `ticks`, in increasing order, and
+    /// stops at the first refused offer (counted as starvation; the rest of
+    /// the gap is filled by the key's own `GapFill`, whose bound covers a
+    /// full substitution gap plus a full queue). `feed()` then offers only
+    /// the surviving tick. Does nothing (one bool check) unless Clean is
+    /// active. Never blocks.
+    pub(crate) fn substitute_clean(&mut self, ticks: std::ops::Range<u64>) {
+        if !self.clean_active {
+            return;
+        }
+        for d in &mut self.dynamic {
+            if d.bus != PictureBus::Clean {
+                continue;
+            }
+            let Some(worker) = d.worker.as_ref() else {
+                continue;
+            };
+            let Some(canvas) = d.last_fed.clone() else {
+                continue;
+            };
+            // Stop at the first refused offer: the ticks after it stay
+            // visible as a gap the key's own `GapFill` fills (bounded) once
+            // its queue drains, and the refusal counts toward starvation.
+            for tick in ticks.clone() {
+                match worker.offer(BakedTick {
+                    tick,
+                    canvas: Arc::clone(&canvas),
+                }) {
+                    Ok(()) => {}
+                    Err(OfferRejection::Overloaded) => {
+                        d.starved = d.starved.saturating_add(1);
+                        d.refused_this_tick = true;
+                        break;
+                    }
+                    // `feed` closes an ended worker on this same tick.
+                    Err(OfferRejection::Ended) => break,
+                }
+            }
+        }
+    }
+
     /// One Program tick: drain dynamic events, takes, opens and dispatcher
     /// outcomes; advance every take; feed live-opened encoders. Never waits.
     ///
@@ -820,6 +920,7 @@ impl OutputRouter {
         self.check_aux(tick, dispatcher);
         self.linger(tick, dispatcher);
         self.sync_feeds();
+        self.sync_live_keys(dispatcher);
         if self.dirty || self.outputs.iter().any(|o| o.pending.is_some()) {
             self.publish_snapshot_at(tick);
         }
@@ -913,8 +1014,8 @@ impl OutputRouter {
                 Err(TryRecvError::Empty | TryRecvError::Disconnected) => return,
             };
             let index = take.output_index;
-            let routable = index < self.outputs.len()
-                && (take.bus != PictureBus::Preview || self.cfg.has_preview);
+            let needs_switcher = matches!(take.bus, PictureBus::Preview | PictureBus::Clean);
+            let routable = index < self.outputs.len() && (!needs_switcher || self.cfg.has_preview);
             if !routable {
                 self.emit(
                     take.operation_id,
@@ -1054,6 +1155,9 @@ impl OutputRouter {
                 lost,
                 generation,
                 silent: 0,
+                starved: 0,
+                refused_this_tick: false,
+                reported_degraded: false,
             });
             // The first offer (frame T, an IDR) is made by `feed` this same
             // tick, after the key exists. The move is requested once the key's
@@ -1195,12 +1299,17 @@ impl OutputRouter {
     }
 
     /// Lag rule and aux failure: move every output on a held bus to Program.
+    /// The aux thread failing moves only the buses it composes: Clean is fed
+    /// by the bake consumer itself and stays.
     fn check_aux(&mut self, tick: u64, dispatcher: &mut RenditionDispatcher) {
         let failed = self.aux.failed.load(Ordering::Acquire);
         let fallen: Vec<PictureBus> = self
             .health
             .iter_mut()
-            .filter(|(_, h)| !h.fallen && (failed || h.held >= FALLBACK_AFTER_TICKS))
+            .filter(|(bus, h)| {
+                let aux_failed = failed && aux_composed(bus);
+                !h.fallen && (aux_failed || h.held >= FALLBACK_AFTER_TICKS)
+            })
             .map(|(bus, h)| {
                 h.fallen = true;
                 bus.clone()
@@ -1268,7 +1377,9 @@ impl OutputRouter {
 
     fn feed_fresh(&self, bus: &PictureBus, tick: u64, pts: MediaTime) -> bool {
         let source: Option<Arc<str>> = match bus {
-            PictureBus::Program => return true,
+            // Program and Clean are always fresh (§4.5): both come from the
+            // bake consumer's own Program canvas.
+            PictureBus::Program | PictureBus::Clean => return true,
             PictureBus::Source(id) => Some(Arc::from(id.as_str())),
             PictureBus::Preview => self.aux.preview_selection.as_ref().and_then(|s| s.load()),
         };
@@ -1485,7 +1596,11 @@ impl OutputRouter {
     }
 
     /// Feed every live-opened encoder its bus's frame for this tick (hold
-    /// the last one when none is new), counting held ticks per bus.
+    /// the last one when none is new), counting held ticks per bus (picture
+    /// freshness) and refused offers per KEY (`DynamicKey::starved`): a live
+    /// encoder that never drains its input queue degrades and its key is
+    /// closed (outputs fall back) even though its picture bus (Clean
+    /// included) is published fresh every tick by the bake consumer.
     fn feed(&mut self, tick: u64, dispatcher: &mut RenditionDispatcher) {
         let mut fresh_buses: Vec<(PictureBus, bool)> = Vec::new();
         let mut dead: Vec<usize> = Vec::new();
@@ -1499,20 +1614,42 @@ impl OutputRouter {
                 d.last_aux_tick = Some(frame.tick);
                 d.last_fed = Some(Arc::clone(&frame.frame));
             }
-            fresh_buses.push((d.bus.clone(), fresh));
             let (Some(canvas), Some(worker)) = (d.last_fed.clone(), d.worker.as_ref()) else {
+                // No canvas to offer yet: nothing was dropped, so this is
+                // not (yet) a held tick for the bus beyond slot freshness.
+                fresh_buses.push((d.bus.clone(), fresh));
                 continue;
             };
             // Never blocks: a full queue drops and the worker gap-fills.
-            let ended = matches!(
-                worker.offer(BakedTick { tick, canvas }),
-                Err(OfferRejection::Ended)
-            );
+            let offer_result = worker.offer(BakedTick { tick, canvas });
+            let ended = matches!(offer_result, Err(OfferRejection::Ended));
+            // The bus's health is its picture's freshness; this KEY's
+            // encoder refusing frames is counted on the key itself, so a
+            // healthy sibling key on the same bus cannot reset it.
+            let refused_before = std::mem::take(&mut d.refused_this_tick);
+            match offer_result {
+                Ok(()) if !refused_before => d.starved = 0,
+                Err(OfferRejection::Overloaded) => d.starved = d.starved.saturating_add(1),
+                Ok(()) | Err(OfferRejection::Ended) => {}
+            }
+            // Wherever `starved` moved (here or in `substitute_clean`), a
+            // change of the degraded state republishes the snapshot.
+            if d.reported_degraded != (d.starved >= DEGRADED_AFTER_TICKS) {
+                d.reported_degraded = !d.reported_degraded;
+                self.dirty = true;
+            }
+            fresh_buses.push((d.bus.clone(), fresh));
             d.silent = d.silent.saturating_add(1);
             // A panicked/exited worker, or one that emits nothing while fed
             // (wedged), would freeze its outputs forever: close the key so
             // they fall back to Program (Fallback(EncoderFailed)).
-            if ended || worker.is_finished() || d.silent >= WEDGED_ENCODER_TICKS {
+            // A key starved for FALLBACK_AFTER_TICKS (it never drains its
+            // queue) is closed the same way.
+            if ended
+                || worker.is_finished()
+                || d.silent >= WEDGED_ENCODER_TICKS
+                || d.starved >= FALLBACK_AFTER_TICKS
+            {
                 dead.push(d.key);
             }
         }
@@ -1619,8 +1756,9 @@ impl OutputRouter {
         }
     }
 
-    /// Keep the aux thread's feed set equal to the buses in use; raise the
-    /// clock's send gate only while one exists.
+    /// Keep the feed set equal to the buses in use. The aux thread is handed
+    /// (and the clock's send gate raised for) only the buses it composes
+    /// (Preview, sources): routing only Clean never wakes it.
     fn sync_feeds(&mut self) {
         let mut wanted: Vec<PictureBus> = self.dynamic.iter().map(|d| d.bus.clone()).collect();
         wanted.extend(self.opens.values().map(|o| o.bus.clone()));
@@ -1642,11 +1780,36 @@ impl OutputRouter {
                 .entry(bus.clone())
                 .or_insert_with(|| AuxFeed::new(bus));
         }
-        let list: Vec<AuxFeed> = self.feeds.values().cloned().collect();
+        self.clean_active = self.feeds.contains_key(&PictureBus::Clean);
+        let list: Vec<AuxFeed> = self
+            .feeds
+            .values()
+            .filter(|f| aux_composed(&f.bus))
+            .cloned()
+            .collect();
         let active = !list.is_empty();
         self.aux.feeds.store(Arc::new(list));
         self.aux.active.store(active, Ordering::Release);
         self.dirty = true;
+    }
+
+    /// Recompute `live_keys` (only while live keys exist or were published).
+    fn sync_live_keys(&mut self, dispatcher: &RenditionDispatcher) {
+        if self.dynamic.is_empty() && self.live_keys.is_empty() {
+            return;
+        }
+        let mut keys: Vec<(String, usize)> = self
+            .dynamic
+            .iter()
+            .filter(|d| !dispatcher.is_key_failed(d.key))
+            .map(|d| (d.bus.as_str().into_owned(), d.settings))
+            .collect();
+        keys.sort_unstable();
+        keys.dedup();
+        if keys != self.live_keys {
+            self.live_keys = keys;
+            self.dirty = true;
+        }
     }
 
     fn publish_snapshot(&mut self) {
@@ -1668,7 +1831,11 @@ impl OutputRouter {
                 degraded: self
                     .health
                     .get(&o.bus)
-                    .is_some_and(|h| h.held >= DEGRADED_AFTER_TICKS),
+                    .is_some_and(|h| h.held >= DEGRADED_AFTER_TICKS)
+                    || self
+                        .dynamic
+                        .iter()
+                        .any(|d| d.key == o.key && d.starved >= DEGRADED_AFTER_TICKS),
             })
             .collect();
         let next = RoutingSnapshot {
@@ -1692,6 +1859,7 @@ impl OutputRouter {
                 .as_ref()
                 .map(crate::routing_audio::RoutedAudio::counters)
                 .unwrap_or_default(),
+            live_keys: self.live_keys.clone(),
         };
         if *self.snapshot.load() != next {
             self.snapshot.store(Arc::new(next));
@@ -1731,6 +1899,7 @@ impl OutputRouter {
             self.dyn_dropped.fetch_add(1, Ordering::Relaxed);
         }
         self.video_keys = dispatcher.video_key_count();
+        self.live_keys.clear();
         self.publish_snapshot();
         let reaper = self.reaper.take();
         let handed_over = self.reaped;
@@ -1748,6 +1917,12 @@ impl OutputRouter {
             }
         }
     }
+}
+
+/// Whether the `routing-aux` thread composes `bus` (Program and Clean come
+/// from the bake consumer).
+fn aux_composed(bus: &PictureBus) -> bool {
+    matches!(bus, PictureBus::Preview | PictureBus::Source(_))
 }
 
 #[cfg(test)]

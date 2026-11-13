@@ -371,28 +371,34 @@ impl IceTcpSender {
         let mut frame = Vec::with_capacity(payload.len() + 2);
         frame.extend_from_slice(&len.to_be_bytes());
         frame.extend_from_slice(payload);
-        let outcome = {
+        // Evicted frames are moved out under the lock and freed after it is
+        // released: freeing up to OUT_QUEUE_BYTES never extends the critical
+        // section the connection's writer also takes.
+        let mut evicted: Vec<Vec<u8>> = Vec::new();
+        {
             let mut out = conn
                 .out
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let mut dropped = false;
             while out.frames.len() >= OUT_QUEUE
                 || (!out.frames.is_empty() && out.bytes + frame.len() > OUT_QUEUE_BYTES)
             {
-                out.pop();
-                Stats::bump(&self.shared.stats.ice_tcp_dropped_out);
-                dropped = true;
+                if let Some(old) = out.pop() {
+                    evicted.push(old);
+                }
             }
-            let outcome = if dropped {
-                SendOutcome::DroppedOldest
-            } else {
-                SendOutcome::Queued
-            };
             out.bytes += frame.len();
             out.frames.push_back(frame);
-            outcome
+        }
+        for _ in &evicted {
+            Stats::bump(&self.shared.stats.ice_tcp_dropped_out);
+        }
+        let outcome = if evicted.is_empty() {
+            SendOutcome::Queued
+        } else {
+            SendOutcome::DroppedOldest
         };
+        drop(evicted);
         conn.answered.store(true, Ordering::Release);
         conn.ready.notify_one();
         outcome
@@ -481,6 +487,44 @@ impl IceTcpLane {
     #[must_use]
     pub fn local_port(&self) -> u16 {
         self.local_port
+    }
+}
+
+/// The str0m driver's view of the lane (feature `webrtc`), mirroring
+/// [`crate::rtc`]'s `SharedInbound` adapter: inbound frames in, a non-blocking
+/// send out.
+#[cfg(feature = "webrtc")]
+mod webrtc_adapter {
+    use super::{IceTcpFrame, IceTcpLane, SendOutcome};
+    use multiview_webrtc::transport::{InboundFrame, SharedTcp, TcpSend};
+    use std::net::SocketAddr;
+    use std::task::{Context, Poll};
+
+    fn convert(f: IceTcpFrame) -> InboundFrame {
+        InboundFrame {
+            peer: f.peer,
+            local: f.local,
+            payload: f.payload,
+        }
+    }
+
+    impl TcpSend for IceTcpLane {
+        fn send(&self, peer: SocketAddr, payload: &[u8]) -> bool {
+            matches!(
+                self.sender.send(peer, payload),
+                SendOutcome::Queued | SendOutcome::DroppedOldest
+            )
+        }
+    }
+
+    impl SharedTcp for IceTcpLane {
+        fn poll_next(&mut self, cx: &mut Context<'_>) -> Poll<Option<InboundFrame>> {
+            self.poll_recv(cx).map(|f| f.map(convert))
+        }
+
+        fn try_next(&mut self) -> Option<InboundFrame> {
+            self.try_recv().map(convert)
+        }
     }
 }
 
@@ -755,6 +799,38 @@ mod tests {
         let body = u16::try_from(m.len() - 20).unwrap();
         m[2..4].copy_from_slice(&body.to_be_bytes());
         m
+    }
+
+    /// Review I2 (PR 337): one send into a full queue evicts outside the
+    /// lock, reports `DroppedOldest`, counts exactly one drop and keeps the
+    /// queue within its frame and byte bounds.
+    #[test]
+    fn send_into_a_full_queue_drops_oldest_within_bounds() {
+        let stats = Arc::new(Stats::default());
+        let shared = IceShared::new(4, Arc::clone(&stats));
+        let peer: SocketAddr = "[2001:db8::1]:5000".parse().unwrap();
+        let (close, _rx) = watch::channel(false);
+        let conn = Arc::new(Conn {
+            out: Mutex::new(OutState::default()),
+            ready: Notify::new(),
+            close,
+            answered: AtomicBool::new(false),
+            write_timeout: Duration::from_secs(1),
+        });
+        shared.table().insert(peer, Arc::clone(&conn));
+        let sender = IceTcpSender {
+            shared: Arc::clone(&shared),
+        };
+        let payload = [0x5Au8; 100];
+        for _ in 0..OUT_QUEUE {
+            assert_eq!(sender.send(peer, &payload), SendOutcome::Queued);
+        }
+        assert_eq!(sender.queued(peer), OUT_QUEUE);
+        assert_eq!(sender.send(peer, &payload), SendOutcome::DroppedOldest);
+        assert_eq!(sender.queued(peer), OUT_QUEUE);
+        assert_eq!(sender.queued_bytes(peer), OUT_QUEUE * (payload.len() + 2));
+        assert!(sender.queued_bytes(peer) <= OUT_QUEUE_BYTES);
+        assert_eq!(stats.ice_tcp_dropped_out.load(Ordering::Relaxed), 1);
     }
 
     #[test]

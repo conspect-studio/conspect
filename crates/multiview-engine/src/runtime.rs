@@ -88,6 +88,11 @@ pub const MAX_REPEATS_BETWEEN_CONTROL: u32 = 8;
 /// sleep, subject only to the tokio timer's normal wake latency.
 const PACER_STOP_POLL: Duration = Duration::from_millis(10);
 
+/// How often a handoff successor re-checks for its predecessor's cut while it
+/// waits. Well under one period at every broadcast cadence, so the successor
+/// sees the cut (chosen [`HANDOFF_LEAD_TICKS`] ahead) long before it is due.
+const HANDOFF_POLL: Duration = Duration::from_millis(1);
+
 /// How the runtime waits for a tick's wall-clock deadline.
 ///
 /// The runtime computes the absolute deadline (on the [`TimeSource`] timeline)
@@ -122,7 +127,14 @@ pub trait Pacer {
     ) -> impl std::future::Future<Output = ()> + Send;
 }
 
-/// Production pacer: a real [`tokio::time::sleep`] until the deadline.
+/// Production pacer: waits for the tick's absolute deadline.
+///
+/// On a dedicated output-clock thread ([`crate::clock_thread::spawn`], the
+/// production topology since #311) it blocks that thread in
+/// [`crate::clock_thread::sleep_until`] (`clock_nanosleep(TIMER_ABSTIME)` on
+/// Linux, a sleep-then-spin fallback elsewhere). Off a clock thread (tests and
+/// tools that still drive a runtime on a tokio task) it is a real
+/// [`tokio::time::sleep`] until the deadline, as before.
 ///
 /// Computes the remaining duration from the time source and sleeps it (in steps
 /// of at most `PACER_STOP_POLL` so a raised [`StopSignal`] is observed
@@ -134,6 +146,15 @@ pub struct RealtimePacer;
 
 impl Pacer for RealtimePacer {
     async fn wait_until(&self, deadline_nanos: i64, source: &dyn TimeSource, stop: &StopSignal) {
+        // On a dedicated output-clock thread (#311, ADR-0109) wait with the
+        // blocking absolute-deadline sleep: no runtime timer wheel, no
+        // scheduler hop, and nothing else on that thread to block. Anywhere
+        // else (a tokio worker) keep the async sleep below — a blocking sleep
+        // there would stall every other task on the worker.
+        if crate::clock_thread::on_clock_thread() {
+            crate::clock_thread::sleep_until(deadline_nanos, source, stop);
+            return;
+        }
         loop {
             if stop.is_stopped() {
                 return;
@@ -221,6 +242,120 @@ pub enum RunStop {
     Stopped,
     /// The requested fixed tick budget was reached (used by bounded test runs).
     Completed,
+    /// The loop handed its timeline to a successor at the agreed cut tick
+    /// ([`Handoff`], #311): it emitted every tick below the cut and none at or
+    /// above it.
+    HandedOff,
+}
+
+/// How many ticks ahead of its next tick an outgoing program places the
+/// handoff cut. Two ticks give the waiting successor at least one full period
+/// to observe the cut and pace to it.
+pub const HANDOFF_LEAD_TICKS: u64 = 2;
+
+/// The thread handoff between two programs on the same timeline (#311,
+/// ADR-0109 §4): an outgoing program (OLD) and a successor (NEW) built with
+/// OLD's seed ([`EngineRuntime::with_seed`]).
+///
+/// Only OLD's own tick loop chooses the cut: once [`Handoff::request`] is
+/// raised, OLD, at its next frame boundary, stores `cut = next + `
+/// [`HANDOFF_LEAD_TICKS`] and keeps emitting every tick below `cut`, then
+/// returns [`RunStop::HandedOff`] without emitting `cut`. NEW waits (off the
+/// emit path) until the cut is known, skips its clock to `cut` and emits from
+/// there. Because OLD picks a cut strictly ahead of anything it has emitted
+/// and stops exactly below it, and NEW starts exactly at it, no tick index is
+/// missed or emitted twice. One atomic state (compare-and-swap transitions); no lock, no await, no channel. A
+/// rolled-back request is withdrawn with [`Handoff::retract`].
+#[derive(Debug)]
+pub struct Handoff {
+    /// One atomic state: `HANDOFF_IDLE`, `HANDOFF_REQUESTED`, or the cut tick.
+    /// Every transition is a compare-and-swap, so a request, the outgoing
+    /// loop's cut choice and a rollback's [`Handoff::retract`] can never race
+    /// into an inconsistent state.
+    state: AtomicU64,
+}
+
+/// No handoff requested.
+const HANDOFF_IDLE: u64 = u64::MAX;
+/// Requested; the outgoing loop has not chosen a cut yet.
+const HANDOFF_REQUESTED: u64 = u64::MAX - 1;
+
+impl Default for Handoff {
+    fn default() -> Self {
+        Self {
+            state: AtomicU64::new(HANDOFF_IDLE),
+        }
+    }
+}
+
+impl Handoff {
+    /// A fresh, unrequested handoff.
+    #[must_use]
+    pub fn shared() -> Arc<Self> {
+        Arc::new(Self::default())
+    }
+
+    /// Ask the outgoing program to hand off at its next frame boundary. A
+    /// no-op if already requested or cut.
+    pub fn request(&self) {
+        let _ = self.state.compare_exchange(
+            HANDOFF_IDLE,
+            HANDOFF_REQUESTED,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
+    }
+
+    /// Withdraw a request whose cut has not been chosen (a rolled-back
+    /// migration): the outgoing program then simply keeps running.
+    ///
+    /// # Errors
+    ///
+    /// `Err(cut)` when the outgoing program already chose its cut: the
+    /// handoff happened and cannot be withdrawn.
+    pub fn retract(&self) -> Result<(), u64> {
+        match self.state.compare_exchange(
+            HANDOFF_REQUESTED,
+            HANDOFF_IDLE,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) | Err(HANDOFF_IDLE) => Ok(()),
+            Err(cut) => Err(cut),
+        }
+    }
+
+    /// The agreed cut tick, once the outgoing program has chosen it.
+    #[must_use]
+    pub fn cut(&self) -> Option<u64> {
+        let state = self.state.load(Ordering::Acquire);
+        (state < HANDOFF_REQUESTED).then_some(state)
+    }
+
+    /// OLD side, on loop exit: if a handoff is requested and no cut chosen
+    /// yet, the cut is `next` (the first tick OLD did not emit).
+    fn cut_for_outgoing_at_exit(&self, next: u64) {
+        let _ = self.state.compare_exchange(
+            HANDOFF_REQUESTED,
+            next.min(HANDOFF_REQUESTED - 1),
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
+    }
+
+    /// OLD side, at a frame boundary: choose the cut if requested and not yet
+    /// chosen.
+    fn cut_for_outgoing(&self, next: u64) {
+        let cut = next
+            .saturating_add(HANDOFF_LEAD_TICKS)
+            .min(HANDOFF_REQUESTED - 1);
+        let _ = self.state.compare_exchange(
+            HANDOFF_REQUESTED,
+            cut,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
+    }
 }
 
 /// The result of a runtime run: how many ticks were emitted and why it stopped.
@@ -287,6 +422,12 @@ pub struct EngineRuntime<P> {
     /// Program tick lateness (emit − deadline) at each publish, fresh or
     /// repeat (ADR-0108 §10). Wait-free atomics only.
     lateness: Arc<crate::lateness::TickLateness>,
+    /// This runtime's outgoing handoff cell: raised by a supervisor to hand
+    /// the timeline to a successor (#311). Two atomic loads per tick.
+    handoff_out: Arc<Handoff>,
+    /// Set on a successor: the predecessor's handoff cell this runtime waits
+    /// on before its first tick.
+    handoff_in: Option<Arc<Handoff>>,
 }
 
 impl<P: Pacer> EngineRuntime<P> {
@@ -300,6 +441,22 @@ impl<P: Pacer> EngineRuntime<P> {
         pacer: P,
     ) -> Self {
         let seed_nanos = time_source.now_nanos();
+        Self::with_seed(clock, drive, time_source, pacer, seed_nanos)
+    }
+
+    /// Build a runtime anchored to an explicit `seed_nanos` (tick `i` is due at
+    /// `seed + pts_at(i)`) instead of "now". This is the migration handoff
+    /// (#311): a NEW program built with OLD's seed and a clock skipped to an
+    /// upcoming index emits exactly OLD's tick indices, PTS and deadlines, so a
+    /// frame-boundary cut from OLD to NEW neither misses nor doubles a tick.
+    #[must_use]
+    pub fn with_seed(
+        clock: OutputClock,
+        drive: CompositorDrive<Nv12Image>,
+        time_source: Arc<dyn TimeSource>,
+        pacer: P,
+        seed_nanos: i64,
+    ) -> Self {
         Self {
             clock,
             drive,
@@ -309,6 +466,8 @@ impl<P: Pacer> EngineRuntime<P> {
             ticks_emitted: Arc::new(AtomicU64::new(0)),
             frames_repeated: Arc::new(AtomicU64::new(0)),
             lateness: crate::lateness::TickLateness::shared(),
+            handoff_out: Handoff::shared(),
+            handoff_in: None,
         }
     }
 
@@ -370,6 +529,20 @@ impl<P: Pacer> EngineRuntime<P> {
     #[must_use]
     pub fn lateness(&self) -> Arc<crate::lateness::TickLateness> {
         Arc::clone(&self.lateness)
+    }
+
+    /// This runtime's outgoing handoff cell (raise [`Handoff::request`] on it
+    /// to hand the timeline to a successor waiting on the same cell).
+    #[must_use]
+    pub fn handoff(&self) -> Arc<Handoff> {
+        Arc::clone(&self.handoff_out)
+    }
+
+    /// Make this runtime the successor of the program owning `predecessor`:
+    /// its first run waits for the predecessor's cut and starts exactly there.
+    /// Build it with the predecessor's seed ([`EngineRuntime::with_seed`]).
+    pub fn succeed(&mut self, predecessor: Arc<Handoff>) {
+        self.handoff_in = Some(predecessor);
     }
 
     /// Record the lateness of the tick just published (one time-source read
@@ -638,7 +811,45 @@ impl<P: Pacer> EngineRuntime<P> {
         .await
     }
 
+    /// Whether the next tick belongs to a successor (a handoff cut was chosen
+    /// and the clock reached it). Two atomic loads.
+    fn at_or_past_cut(&self) -> bool {
+        self.handoff_out
+            .cut()
+            .is_some_and(|cut| self.clock.next_index() >= cut)
+    }
+
     async fn run_inner<S, E, FS, FE, FC>(
+        &mut self,
+        publisher: &EnginePublisher<S, E>,
+        stop: &StopSignal,
+        max_ticks: Option<u64>,
+        state_of: &mut FS,
+        event_of: &mut FE,
+        control: &mut FC,
+    ) -> crate::Result<RunOutcome>
+    where
+        FS: FnMut(&CompositedFrame) -> S,
+        FE: FnMut(&CompositedFrame) -> Option<E>,
+        FC: FrameControl,
+    {
+        let outcome = self
+            .run_loop(publisher, stop, max_ticks, state_of, event_of, control)
+            .await;
+        // However the loop ended (stop, budget, error), a requested handoff
+        // always gets a cut: the next tick this runtime has not emitted. A
+        // successor waiting on it then starts exactly there instead of waiting
+        // forever for a predecessor that is gone (#311).
+        self.handoff_out
+            .cut_for_outgoing_at_exit(self.clock.next_index());
+        outcome
+    }
+
+    #[allow(clippy::too_many_lines)]
+    // reason: the protected tick loop reads top to bottom as one unit (pace,
+    // cadence-hold repeats, compose, publish) with its handoff and stop exits
+    // inline; splitting it would scatter the invariant-#1 reasoning.
+    async fn run_loop<S, E, FS, FE, FC>(
         &mut self,
         publisher: &EnginePublisher<S, E>,
         stop: &StopSignal,
@@ -663,6 +874,14 @@ impl<P: Pacer> EngineRuntime<P> {
         // `MAX_REPEATS_BETWEEN_CONTROL`, so command drain can never be starved by
         // a catch-up burst however slow a per-tick stage is.
         let mut repeats_since_control: u32 = 0;
+        // Successor side of a handoff (#311): wait, off the emit path, until
+        // the predecessor has chosen its cut, then start exactly at the cut.
+        if !self.await_predecessor_cut(stop).await {
+            return Ok(RunOutcome {
+                ticks: 0,
+                stop: RunStop::Stopped,
+            });
+        }
         loop {
             if stop.is_stopped() {
                 return Ok(RunOutcome {
@@ -677,6 +896,16 @@ impl<P: Pacer> EngineRuntime<P> {
                         stop: RunStop::Completed,
                     });
                 }
+            }
+
+            // Outgoing side of a handoff (#311): choose the cut once requested,
+            // and never emit the cut or any later tick.
+            self.handoff_out.cut_for_outgoing(self.clock.next_index());
+            if self.at_or_past_cut() {
+                return Ok(RunOutcome {
+                    ticks: emitted,
+                    stop: RunStop::HandedOff,
+                });
             }
 
             // 1. Pace to the due tick's absolute deadline (the only `.await` that
@@ -726,6 +955,12 @@ impl<P: Pacer> EngineRuntime<P> {
                         }
                     }
                     let next = self.clock.next_index();
+                    if self.at_or_past_cut() {
+                        return Ok(RunOutcome {
+                            ticks: emitted,
+                            stop: RunStop::HandedOff,
+                        });
+                    }
                     let now = self.time_source.now_nanos();
                     // `next` is the freshest due tick exactly when the tick AFTER it
                     // is not yet due. Gate strictly on the exact deadline (never a
@@ -746,7 +981,11 @@ impl<P: Pacer> EngineRuntime<P> {
                         // ONE `skip_to`, accepting one bounded discontinuity rather than
                         // unbounded catch-up. `cap_resync_floor` is O(1) and never
                         // composes a tick before its deadline (inv #1) — see its docs.
-                        self.clock.skip_to(self.cap_resync_floor(now, next));
+                        // Never resync past a handoff cut: the successor owns
+                        // every tick from the cut on (#311).
+                        let floor = self.cap_resync_floor(now, next);
+                        let floor = self.handoff_out.cut().map_or(floor, |cut| floor.min(cut));
+                        self.clock.skip_to(floor);
                         break;
                     }
                     // Re-emit last-good under the fresh tick: the held canvas is
@@ -790,6 +1029,15 @@ impl<P: Pacer> EngineRuntime<P> {
                 }
             }
 
+            // A catch-up resync (`skip_to`) may have jumped past a handoff cut:
+            // the successor owns every tick from the cut on.
+            if self.at_or_past_cut() {
+                return Ok(RunOutcome {
+                    ticks: emitted,
+                    stop: RunStop::HandedOff,
+                });
+            }
+
             // 2. Advance the clock for the fresh tick (pure `out_pts = f(tick)`).
             let tick: Tick = self.clock.tick();
 
@@ -826,6 +1074,30 @@ impl<P: Pacer> EngineRuntime<P> {
 
             emitted = emitted.saturating_add(1);
             self.ticks_emitted.fetch_add(1, Ordering::AcqRel);
+        }
+    }
+
+    /// Successor side of a handoff: if this runtime succeeds a predecessor,
+    /// wait (pacer-paced, stop-aware, never on the emit path) until the
+    /// predecessor has chosen its cut, then skip the clock to it. Returns
+    /// `false` if `stop` was raised first.
+    async fn await_predecessor_cut(&mut self, stop: &StopSignal) -> bool {
+        let Some(predecessor) = self.handoff_in.take() else {
+            return true;
+        };
+        let poll = i64::try_from(HANDOFF_POLL.as_nanos()).unwrap_or(i64::MAX);
+        loop {
+            if stop.is_stopped() {
+                return false;
+            }
+            if let Some(cut) = predecessor.cut() {
+                self.clock.skip_to(cut);
+                return true;
+            }
+            let until = self.time_source.now_nanos().saturating_add(poll);
+            self.pacer
+                .wait_until(until, self.time_source.as_ref(), stop)
+                .await;
         }
     }
 

@@ -742,7 +742,7 @@ pub fn stop_rail(
 /// Bounded-wait until every producer's `exited` latch is set (it left), so a
 /// replacement never races a still-writing predecessor on a reused store.
 fn await_exits(id: &str, producers: &[ProducerStop]) {
-    let deadline = Instant::now() + TEARDOWN_JOIN_GRACE;
+    let deadline = Instant::now() + teardown_grace();
     for producer in producers {
         while !producer.exited.load(Ordering::Acquire) && Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(5));
@@ -757,12 +757,20 @@ fn await_exits(id: &str, producers: &[ProducerStop]) {
     }
 }
 
+/// The teardown wait budget: [`TEARDOWN_JOIN_GRACE`], never past an armed
+/// process exit deadline (#309) — past it the process is ending anyway, so a
+/// producer still running is detached at once.
+fn teardown_grace() -> Duration {
+    crate::exit_watchdog::remaining()
+        .map_or(TEARDOWN_JOIN_GRACE, |left| left.min(TEARDOWN_JOIN_GRACE))
+}
+
 /// Join a producer thread within [`TEARDOWN_JOIN_GRACE`], detaching (with a
 /// warning) one that does not finish — it only ever writes a lock-free store
 /// it shares by `Arc`, so detaching cannot corrupt output (the same policy as
 /// the ingest supervisor's bounded join).
 fn join_bounded(id: &str, handle: JoinHandle<()>) {
-    let deadline = Instant::now() + TEARDOWN_JOIN_GRACE;
+    let deadline = Instant::now() + teardown_grace();
     while !handle.is_finished() && Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(10));
     }
