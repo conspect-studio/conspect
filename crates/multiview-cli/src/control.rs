@@ -1551,7 +1551,7 @@ pub fn cast_delivery(
             return None;
         }
     };
-    let mut delivery = CastDelivery::new();
+    let mut delivery = CastDelivery::new().with_base(base.clone());
     for mount in hls_mounts(config) {
         let Some(playlist) = mount.playlist else {
             tracing::warn!(

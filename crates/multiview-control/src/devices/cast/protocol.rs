@@ -22,7 +22,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use super::media::CastMediaTarget;
+use super::media::{CastMediaTarget, HlsSegmentFormat};
 
 /// The connection namespace (virtual CONNECT/CLOSE per destination).
 pub const NS_CONNECTION: &str = "urn:x-cast:com.google.cast.tp.connection";
@@ -36,6 +36,48 @@ pub const NS_MEDIA: &str = "urn:x-cast:com.google.cast.media";
 /// Google's hosted **Default Media Receiver** app id (ADR-M011): requires no
 /// developer registration, no public URL, and no cloud account.
 pub const DEFAULT_MEDIA_RECEIVER_APP_ID: &str = "CC1AD845";
+
+/// A Cast receiver app id: exactly 8 ASCII hex characters, kept upper-case.
+/// `Copy` so the session timings record stays `Copy`.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub struct CastAppId([u8; 8]);
+
+impl CastAppId {
+    /// Google's Default Media Receiver (`CC1AD845`).
+    pub const DEFAULT_MEDIA_RECEIVER: Self = Self(*b"CC1AD845");
+
+    /// Parse an app id: 8 hex characters (any case, stored upper-case).
+    #[must_use]
+    pub fn parse(raw: &str) -> Option<Self> {
+        let bytes: [u8; 8] = raw.trim().as_bytes().try_into().ok()?;
+        if !bytes.iter().all(u8::is_ascii_hexdigit) {
+            return None;
+        }
+        Some(Self(bytes.map(|b| b.to_ascii_uppercase())))
+    }
+
+    /// The app id as sent in a `LAUNCH` and matched in `RECEIVER_STATUS`.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        // Only ASCII hex digits are ever stored.
+        std::str::from_utf8(&self.0).unwrap_or(DEFAULT_MEDIA_RECEIVER_APP_ID)
+    }
+}
+
+impl Default for CastAppId {
+    fn default() -> Self {
+        Self::DEFAULT_MEDIA_RECEIVER
+    }
+}
+
+impl std::fmt::Debug for CastAppId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// The `customData.title` of a LOAD when the session names none.
+pub const DEFAULT_LOAD_TITLE: &str = "Conspect";
 
 /// Our sender id on the channel (the conventional first-sender id).
 pub const SENDER_ID: &str = "sender-0";
@@ -137,6 +179,31 @@ pub fn get_status_frame(request_id: u32) -> CastFrame {
 /// (`fmp4` for a CMAF rendition, `mpeg2_ts` otherwise).
 #[must_use]
 pub fn load_frame(request_id: u32, transport_id: &str, media: &CastMediaTarget) -> CastFrame {
+    load_frame_titled(request_id, transport_id, media, DEFAULT_LOAD_TITLE)
+}
+
+/// [`load_frame`] with the operator-facing `customData.title`. The media
+/// carries `contentId` and `contentUrl` (the same URL: CAF receivers read
+/// `contentUrl` first), and for an fMP4 rendition also `hlsSegmentFormat:
+/// "fmp4"` (the audio segment container of a CMAF stream).
+#[must_use]
+pub fn load_frame_titled(
+    request_id: u32,
+    transport_id: &str,
+    media: &CastMediaTarget,
+    title: &str,
+) -> CastFrame {
+    let mut body = serde_json::json!({
+        "contentId": media.url,
+        "contentUrl": media.url,
+        "contentType": HLS_CONTENT_TYPE,
+        "streamType": "LIVE",
+        "hlsVideoSegmentFormat": media.format.wire_token(),
+        "customData": { "title": title },
+    });
+    if media.format == HlsSegmentFormat::Fmp4 {
+        body["hlsSegmentFormat"] = serde_json::Value::from("fmp4");
+    }
     frame(
         NS_MEDIA,
         transport_id,
@@ -144,12 +211,7 @@ pub fn load_frame(request_id: u32, transport_id: &str, media: &CastMediaTarget) 
             "type": "LOAD",
             "requestId": request_id,
             "autoplay": true,
-            "media": {
-                "contentId": media.url,
-                "contentType": HLS_CONTENT_TYPE,
-                "streamType": "LIVE",
-                "hlsVideoSegmentFormat": media.format.wire_token(),
-            }
+            "media": body,
         }),
     )
 }

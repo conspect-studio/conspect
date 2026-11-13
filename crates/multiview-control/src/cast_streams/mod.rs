@@ -30,7 +30,7 @@ pub mod token;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use registry::Registry;
 pub use registry::{Claim, ClaimError, Ended, ReportError, StreamView};
@@ -102,7 +102,7 @@ pub struct ReceiverFetch {
 }
 
 /// The last receiver report of a stream, as received.
-#[derive(Debug, Clone, PartialEq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 pub struct ReceiverReport {
     /// When it arrived (Unix ms).

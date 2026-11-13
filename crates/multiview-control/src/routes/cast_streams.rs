@@ -337,6 +337,8 @@ pub(crate) async fn delete_cast_stream(
         Some(serde_json::json!({ "output": view.output })),
     );
     crate::cast_streams::lifecycle::sweep_now(&state);
+    // A server-side cast session that played this stream ends with it.
+    crate::routes::cast_sessions::reap_streamless_sessions(&state);
     Ok(StatusCode::NO_CONTENT.into_response())
 }
 
@@ -497,6 +499,34 @@ pub(crate) async fn create_cast_stream(
 ) -> ControlResult<Response> {
     principal.role.require(Action::Write)?;
     let req = body.map(|Json(b)| b).unwrap_or_default();
+    Ok(match mint_stream(&state, &principal, &req).await? {
+        Ok(minted) => {
+            let doc = stream_doc(&state, minted.view, Some(&minted.token));
+            (StatusCode::CREATED, Json(doc)).into_response()
+        }
+        Err(refused) => refused,
+    })
+}
+
+/// A stream just created: its view and its token (secret).
+pub(crate) struct Minted {
+    /// The stream (no token).
+    pub view: StreamView,
+    /// The plaintext token (for the owner, or the session that owns it).
+    pub token: String,
+}
+
+/// Create a cast stream for `principal` exactly as `POST /cast/streams`
+/// does (authorization of both ends, limiter, feed choice, take, activate,
+/// audit). `Ok(Err(response))` is a refusal to answer as it is; the owner of
+/// the stream is `principal`.
+pub(crate) async fn mint_stream(
+    state: &AppState,
+    principal: &Principal,
+    req: &CreateCastStream,
+) -> ControlResult<Result<Minted, Response>> {
+    let state = state.clone();
+    let principal = principal.clone();
     crate::cast_streams::lifecycle::sweep_now(&state);
     // Authorization of both ends before any existence answer (as the take).
     let chosen_output = match &req.output {
@@ -516,15 +546,15 @@ pub(crate) async fn create_cast_stream(
         None => None,
     };
     if let Err(retry) = state.cast_streams.admit_create(&principal.key_id) {
-        return Ok(crate::routes::output_routing::too_many(retry));
+        return Ok(Err(crate::routes::output_routing::too_many(retry)));
     }
     if state.cast_engine.is_none() {
-        return Ok(unavailable("The engine is not running a cast output"));
+        return Ok(Err(unavailable("The engine is not running a cast output")));
     }
     let (choice, feed, layout_body) = if let Some(output) = chosen_output {
         match by_output(&state, &principal, &output, wanted.as_ref(), layout).await? {
             Ok(found) => found,
-            Err(response) => return Ok(response),
+            Err(response) => return Ok(Err(response)),
         }
     } else {
         {
@@ -537,14 +567,14 @@ pub(crate) async fn create_cast_stream(
             )? {
                 Ok(found) => found,
                 Err((status, kind, detail)) => {
-                    return Ok(crate::routes::output_routing::refusal_problem(
+                    return Ok(Err(crate::routes::output_routing::refusal_problem(
                         status, kind, detail,
-                    ))
+                    )))
                 }
             };
             match choose(&state, &principal, &routed) {
                 Ok(choice) => (choice, routed, body),
-                Err(response) => return Ok(*response),
+                Err(response) => return Ok(Err(*response)),
             }
         }
     };
@@ -635,7 +665,7 @@ async fn open_stream(
     choice: Choice,
     feed: RoutedFeed,
     layout: Option<crate::output_routing::LayoutBody>,
-) -> ControlResult<Response> {
+) -> ControlResult<Result<Minted, Response>> {
     use crate::cast_streams::lifecycle::{take_and_wait, TakeResult};
     use crate::cast_streams::ClaimError;
     let (take, (status, output)) = match choice {
@@ -644,7 +674,7 @@ async fn open_stream(
     };
     if take {
         if let Some(refused) = cast_plan_gate(state, principal, &status.id, &feed) {
-            return Ok(refused);
+            return Ok(Err(refused));
         }
     }
     let claim = match state
@@ -653,17 +683,17 @@ async fn open_stream(
     {
         Ok(claim) => claim,
         Err(ClaimError::Capacity | ClaimError::PrincipalCapacity | ClaimError::Taken) => {
-            return Ok(cast_problem(
+            return Ok(Err(cast_problem(
                 409,
                 "cast-capacity",
                 "Too many casts: stop a cast and try again",
-            ))
+            )))
         }
     };
     let engine = state.cast_engine.clone();
     let Some(engine) = engine else {
         state.cast_streams.release_claim(&claim.id, claim.first);
-        return Ok(unavailable("The engine is not running a cast output"));
+        return Ok(Err(unavailable("The engine is not running a cast output")));
     };
     if take {
         let result = take_and_wait(state, &status.id, &feed, layout, &principal.key_id).await;
@@ -694,7 +724,7 @@ async fn open_stream(
                 state.cast_streams.release_claim(&claim.id, claim.first);
             }
             crate::cast_streams::lifecycle::sweep_now(state);
-            return Ok(response);
+            return Ok(Err(response));
         }
         state.cast_streams.mark_moved(&status.id);
     }
@@ -708,7 +738,7 @@ async fn open_stream(
             state.cast_streams.release_claim(&claim.id, claim.first);
         }
         crate::cast_streams::lifecycle::sweep_now(state);
-        return Ok(engine_refused(&error));
+        return Ok(Err(engine_refused(&error)));
     }
     state.audit(
         &principal.key_id,
@@ -722,8 +752,7 @@ async fn open_stream(
         })),
     );
     let Some((view, token)) = state.cast_streams.get(&claim.id) else {
-        return Ok(unavailable("The cast stream ended before it started"));
+        return Ok(Err(unavailable("The cast stream ended before it started")));
     };
-    let doc = stream_doc(state, view, Some(&token));
-    Ok((StatusCode::CREATED, Json(doc)).into_response())
+    Ok(Ok(Minted { view, token }))
 }

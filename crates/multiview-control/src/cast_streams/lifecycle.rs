@@ -164,6 +164,7 @@ pub(crate) fn spawn_sweeper(state: &AppState) {
                 return;
             }
             sweep_now(&state);
+            crate::routes::cast_sessions::reap_streamless_sessions(&state);
         }
     });
 }
