@@ -122,3 +122,42 @@ async fn a_renewal_between_load_and_first_poll_is_not_missed() {
     wait_for(&source, &second).await;
     task.abort();
 }
+
+/// A torn pair (new chain, old key) is retried until it loads even when the
+/// completing write leaves every stamp (inode, size, mtime) identical to the
+/// torn state: a failed stamp must not suppress parsing forever.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_torn_pair_completed_with_identical_stamps_is_still_loaded() {
+    let dir = tempfile::tempdir().unwrap();
+    let cert_path = dir.path().join("chain.pem");
+    let key_path = dir.path().join("key.pem");
+    let a = rcgen::generate_simple_self_signed(vec!["a.example".to_owned()]).unwrap();
+    let b = rcgen::generate_simple_self_signed(vec!["b.example".to_owned()]).unwrap();
+    std::fs::write(&cert_path, a.cert.pem()).unwrap();
+    std::fs::write(&key_path, a.signing_key.serialize_pem()).unwrap();
+    let tls = TlsConfig::Static {
+        cert_file: cert_path.clone(),
+        key_file: key_path.clone(),
+    };
+    let source = Arc::new(static_certificate_source(&tls).unwrap());
+    let task = spawn_static_certificate_reload(tls, Arc::clone(&source), Duration::from_millis(20));
+
+    // Torn: new chain B, key still A's. Several polls see and reject it.
+    std::fs::write(&cert_path, b.cert.pem()).unwrap();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(leaf(&source), a.cert.der().to_vec());
+
+    // Complete it in place, forcing the key file's stamp to its torn value.
+    let mtime = std::fs::metadata(&key_path).unwrap().modified().unwrap();
+    let new_key = b.signing_key.serialize_pem();
+    assert_eq!(new_key.len(), a.signing_key.serialize_pem().len());
+    let file = std::fs::OpenOptions::new()
+        .write(true)
+        .open(&key_path)
+        .unwrap();
+    std::io::Write::write_all(&mut &file, new_key.as_bytes()).unwrap();
+    file.set_modified(mtime).unwrap();
+    drop(file);
+    wait_for(&source, b.cert.der().as_ref()).await;
+    task.abort();
+}

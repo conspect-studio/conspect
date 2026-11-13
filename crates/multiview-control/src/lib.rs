@@ -1070,6 +1070,12 @@ fn read_stamped(path: &std::path::Path) -> std::io::Result<(FileStamp, Vec<u8>)>
     );
     let mut bytes = Vec::new();
     (&mut file).take(MAX_PEM_BYTES).read_to_end(&mut bytes)?;
+    // An in-place rewrite between the fstat and the read would pair the old
+    // stamp with new/torn bytes; re-stat and call the file unsettled instead.
+    let after = file.metadata()?;
+    if (after.len(), after.mtime(), after.mtime_nsec()) != (stamp.2, stamp.3, stamp.4) {
+        return Err(std::io::Error::other("file changed while being read"));
+    }
     Ok((stamp, bytes))
 }
 
@@ -1154,7 +1160,7 @@ pub fn spawn_static_certificate_reload(
             let Some(now) = snapshot(tls.clone()).await else {
                 continue;
             };
-            if Some(now.stamps) == last || Some(now.stamps) == failed {
+            if Some(now.stamps) == last {
                 continue;
             }
             // Parse exactly the bytes whose stamps were taken: the stamps
@@ -1169,6 +1175,7 @@ pub fn spawn_static_certificate_reload(
                     last = Some(stamps);
                     failed = None;
                     if certificate_source::CertificateSource::current(&*source).cert == key.cert {
+                        // Same certificate as served (first poll): no swap, no log.
                         continue;
                     }
                     source.replace(std::sync::Arc::new(key));
@@ -1179,7 +1186,14 @@ pub fn spawn_static_certificate_reload(
                     // renewed, key not yet) changes again when the write
                     // completes and is retried then. The same broken pair is
                     // reported once, not every poll.
+                    // Re-parsed every poll (cheap): an in-place rewrite that
+                    // completes with identical stamps is still picked up.
+                    // Only the log line is deduplicated.
+                    let repeat = failed == Some(stamps);
                     failed = Some(stamps);
+                    if repeat {
+                        continue;
+                    }
                     tracing::warn!(%error, "[control.tls] static certificate changed on disk but does not load; the previous certificate keeps serving");
                 }
                 Err(_) => {}
