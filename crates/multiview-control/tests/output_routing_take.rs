@@ -98,10 +98,16 @@ fn keys() -> ApiKeyStore {
         scoped_output_ids: outputs,
         scoped_discovery_domains: None,
     };
+    // #342 review A2: the alias checks the output axis too, so each scoped
+    // key also carries the output-axis grant for the output it may route.
     keys.register(
         "route-scoped",
         "route-scoped-secret",
-        scoped("route-scoped", &["output-1", "bars"], None),
+        scoped(
+            "route-scoped",
+            &["output-1", "bars"],
+            Some(vec!["output-1".to_owned()]),
+        ),
     );
     keys.register(
         "route-bus",
@@ -153,7 +159,11 @@ fn keys() -> ApiKeyStore {
     keys.register(
         "route-other",
         "route-other-secret",
-        scoped("route-other", &["output-0", "bars"], None),
+        scoped(
+            "route-other",
+            &["output-0", "bars"],
+            Some(vec!["output-0".to_owned()]),
+        ),
     );
     keys
 }
@@ -907,8 +917,9 @@ async fn an_early_reserved_key_survives_many_later_takes_and_still_persists() {
     // route records them: a fresh reservation in the take store.
     let control = rig.state.output_routing.clone().unwrap();
     fill_take_store(&control, "later", 1500);
-    // Replay the early key with a different body.
-    let replay = send(
+    // #342 review A1: the early key with a DIFFERENT body is refused (409)
+    // and enqueues nothing; the same body still replays its own operation.
+    let reused = send(
         &rig.router,
         take(
             &rig,
@@ -917,6 +928,13 @@ async fn an_early_reserved_key_survives_many_later_takes_and_still_persists() {
             "output-1",
             serde_json::json!({"bus": "program"}),
         ),
+    )
+    .await;
+    assert_eq!(reused.status(), StatusCode::CONFLICT);
+    assert_eq!(rig.fake.takes().len(), 1, "a reused key never enqueues");
+    let replay = send(
+        &rig.router,
+        take(&rig, OPERATOR_TOKEN, "early", "output-1", src.clone()),
     )
     .await;
     assert_eq!(replay.status(), StatusCode::ACCEPTED);
@@ -1718,6 +1736,48 @@ async fn readback_redacts_live_and_configured_video_independently() {
     );
     assert_eq!(r["tally"], "program", "{r}");
     assert_eq!(r["state"], "on_air", "{r}");
+}
+
+/// #342 review A1-r2, at the store: two threads reserve the SAME key with
+/// two DIFFERENT takes at the same instant (barrier), 200 times. Exactly one
+/// is `Fresh` and the other is `Conflict` — never `Replay` of the other's
+/// operation — because the body binding is decided under the reservation's
+/// own lock.
+#[test]
+fn concurrent_reservations_of_one_key_with_two_takes_never_share_an_operation() {
+    use multiview_control::output_routing::{OutputRoutingControl, PendingTake, TakeReservation};
+    let control = Arc::new(OutputRoutingControl::new(Fake::new()));
+    for i in 0..200 {
+        let key = format!("race-{i}");
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        let spawn = |output: &'static str, feed: RoutedFeed| {
+            let (control, barrier, key) = (Arc::clone(&control), Arc::clone(&barrier), key.clone());
+            std::thread::spawn(move || {
+                barrier.wait();
+                control.reserve_take(
+                    &key,
+                    "p",
+                    PendingTake {
+                        api_id: output.to_owned(),
+                        feed: Some(feed),
+                        audio: None,
+                    },
+                )
+            })
+        };
+        let a = spawn("output-0", RoutedFeed::Source("bars".into()));
+        let b = spawn("output-1", RoutedFeed::Program);
+        let results = [a.join().unwrap(), b.join().unwrap()];
+        let fresh = results
+            .iter()
+            .filter(|r| matches!(r, TakeReservation::Fresh(_)))
+            .count();
+        let conflict = results
+            .iter()
+            .filter(|r| matches!(r, TakeReservation::Conflict))
+            .count();
+        assert_eq!((fresh, conflict), (1, 1), "iteration {i}: {results:?}");
+    }
 }
 
 struct FakeFrontDoor;
