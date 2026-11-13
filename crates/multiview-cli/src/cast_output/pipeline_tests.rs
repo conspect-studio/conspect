@@ -1102,7 +1102,7 @@ fn a_foreign_directory_disables_the_cast_output_without_touching_it_or_the_run()
         Err(CastEngineError::NotRunning)
     );
     slot.store(Arc::new(Vec::new()));
-    assert!(engine.outputs().is_empty());
+    assert_eq!(engine.outputs(), Vec::new());
     assert_eq!(
         engine.deactivate("cast-1"),
         Err(CastEngineError::NotRunning)
