@@ -582,6 +582,21 @@ impl OutputRoutingControl {
         self.records().replay(key)
     }
 
+    /// The replay of `key` together with the take it recorded (output API id
+    /// and feed), so a replay can be bound to its request (#342 review A1).
+    #[must_use]
+    pub fn replay_with_take(&self, key: &str) -> Option<(TakeReplay, PendingTake)> {
+        let records = self.records();
+        let record = records.by_key.get(key)?;
+        Some((
+            TakeReplay {
+                operation_id: record.operation_id.clone(),
+                outcome: record.outcome.clone(),
+            },
+            record.take.clone(),
+        ))
+    }
+
     /// Reserve `key` for a take of `pending`: fresh, replay of the key's own
     /// operation, or capacity (fail closed; nothing is evicted). The record
     /// exists before the enqueue, so an outcome can never beat it.

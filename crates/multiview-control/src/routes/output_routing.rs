@@ -485,10 +485,21 @@ pub(crate) fn take_output_slot0(
         ));
     };
     let key = slot0_take_key(key);
-    // A replay answers from the take's own record without re-running
-    // anything. `key` is already scoped by principal and the shared
-    // slot-0 take namespace.
-    if let Some(replay) = control.replay(&key) {
+    // A replay answers from the take's own record without re-running the
+    // take, but only for the SAME take (#342 review A1): the key is shared
+    // by both slot-0 routes, so it is bound to the (output, feed) it was
+    // first used for. The caller has just authorized this request's ends
+    // (output axis + feed read) under the principal's CURRENT grants, so a
+    // matching replay is re-authorized; a different body is refused and
+    // nothing is enqueued.
+    if let Some((replay, recorded)) = control.replay_with_take(&key) {
+        let same =
+            recorded.api_id == output && RoutedFeed::of(video).as_ref() == Some(&recorded.feed);
+        if !same {
+            return Err(ControlError::Conflict(
+                "Idempotency-Key reused with a different request".into(),
+            ));
+        }
         return Ok(SlotTake::Replay(replay));
     }
     let Some(config_id) = config_id_of(state, output)? else {
