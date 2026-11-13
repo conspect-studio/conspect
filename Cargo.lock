@@ -3888,6 +3888,7 @@ dependencies = [
  "multiview-framestore",
  "multiview-frontdoor",
  "multiview-graphics",
+ "multiview-h3",
  "multiview-hal",
  "multiview-input",
  "multiview-licence",

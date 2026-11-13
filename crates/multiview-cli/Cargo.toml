@@ -79,6 +79,9 @@ multiview-webrtc = { workspace = true, optional = true }
 # own runtime. Pure Rust in the default build; its WebRTC adapter (str0m) is
 # enabled only by `webrtc-native`.
 multiview-frontdoor = { workspace = true }
+# The HTTP/3 + WebTransport endpoint on the front door's QUIC lane (slice 2,
+# #288): the site and MoQ over one QUIC endpoint.
+multiview-h3 = { path = "../multiview-h3" }
 # The `whip_push` output's HTTP signalling (ADR-0049 §5.2): the WHIP `POST`
 # offer->answer against the remote origin (Bearer, https-only 307/308 redirects).
 # OPTIONAL, pulled in ONLY by `webrtc-native`; pinned to the `rustls-tls` backend

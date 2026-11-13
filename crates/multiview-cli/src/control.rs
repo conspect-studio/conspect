@@ -763,7 +763,8 @@ where
         &state,
         #[cfg(all(feature = "tls", unix))]
         door_source.as_ref().map(|(_, source)| Arc::clone(source)),
-        move |watch| multiview_control::ConnectionServer::new(site_app, &site_options, watch),
+        site_app,
+        move |app, watch| multiview_control::ConnectionServer::new(app, &site_options, watch),
         shutdown,
     )?;
     let handle = match config
@@ -902,13 +903,17 @@ fn attach_front_door_site<F>(
     #[cfg(all(feature = "tls", unix))] static_source: Option<
         Arc<multiview_control::certificate_source::StaticCertificateSource>,
     >,
-    server: impl FnOnce(tokio::sync::watch::Receiver<bool>) -> multiview_control::ConnectionServer,
+    site_app: multiview_control::ControlRouter,
+    server: impl FnOnce(
+        multiview_control::ControlRouter,
+        tokio::sync::watch::Receiver<bool>,
+    ) -> multiview_control::ConnectionServer,
     shutdown: F,
 ) -> std::io::Result<std::pin::Pin<Box<dyn Future<Output = ()> + Send + 'static>>>
 where
     F: Future<Output = ()> + Send + 'static,
 {
-    let Some(door) = front_door.filter(|d| d.has_tcp_door()) else {
+    let Some(door) = front_door else {
         return Ok(Box::pin(shutdown));
     };
     #[cfg(all(feature = "acme", unix))]
@@ -918,6 +923,7 @@ where
         let _ = state;
         None
     };
+    let deferred = acme.is_some();
     let (site, challenge) = match acme {
         Some(door_tls) => door_tls,
         None => (
@@ -930,11 +936,59 @@ where
         ),
     };
     let (signal, watch) = tokio::sync::watch::channel(false);
-    door.install_site(server(watch), site, challenge);
+    // Slice 2: the SAME router (gated by setup in ACME mode) over HTTP/3 on
+    // the QUIC lane, sharing this shutdown watch. With `[network.tls]` the
+    // endpoint waits for `serving` (no QUIC in setup).
+    door.start_h3(
+        Arc::new(multiview_control::h3_site::H3Site::new(
+            site_app.clone(),
+            watch.clone(),
+        )),
+        h3_tls(state, site.clone(), deferred),
+    );
+    if door.has_tcp_door() {
+        // Alt-Svc on the TCP door only (never the plain `[control]` listener);
+        // the switch is off until the h3 endpoint is up.
+        let app = multiview_control::h3_site::alt_svc_layer(site_app, door.alt_svc());
+        door.install_site(server(app, watch), site, challenge);
+    }
     Ok(Box::pin(async move {
         shutdown.await;
         let _ = signal.send(true);
     }))
+}
+
+/// The h3 endpoint's certificate: the door's site configuration (ALPN and
+/// 0-RTT are overridden by `multiview-h3`); with `[network.tls]` held until
+/// the ACME source is `serving`.
+fn h3_tls(
+    state: &multiview_control::AppState,
+    site: Option<multiview_frontdoor::SiteTlsConfig>,
+    deferred: bool,
+) -> crate::frontdoor::H3Tls {
+    #[cfg(all(feature = "acme", unix))]
+    if deferred {
+        if let Some(tls) = state.tls.as_ref() {
+            // No shutdown arm needed: `FrontDoorRun::shutdown` aborts the
+            // starter, and `wait_serving` returns `false` once the source is
+            // dropped.
+            let certificates = Arc::clone(&tls.certificates);
+            return crate::frontdoor::H3Tls {
+                config: site,
+                ready: Some(Box::pin(crate::tls_boot::wait_serving(
+                    certificates,
+                    std::future::pending::<()>(),
+                ))),
+                source: "[network.tls] (ACME)",
+            };
+        }
+    }
+    let _ = (state, deferred);
+    crate::frontdoor::H3Tls {
+        config: site,
+        ready: None,
+        source: "the door's static certificate",
+    }
 }
 
 /// The door site over a static certificate: `[network] cert_file/key_file`,

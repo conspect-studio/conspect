@@ -71,6 +71,68 @@ pub struct FrontDoorRun {
     door: multiview_frontdoor::FrontDoor,
     /// The TCP door runs with ICE-TCP on (direct mode, `network.ice_tcp`).
     ice_tcp: bool,
+    /// The HTTP/3 endpoint on the QUIC lane (slice 2).
+    h3: H3Slot,
+}
+
+/// `MoQ` over the h3 endpoint, installed by the run before the control plane
+/// binds ([`FrontDoorRun::set_h3_moq`]).
+pub struct H3Moq {
+    /// The WebTransport handler (`MoqWt`).
+    pub wt: Arc<dyn multiview_h3::WtHandler>,
+    /// Called once the endpoint is up (installs the real `MoQ` provider, so
+    /// leases are issued only while the endpoint serves them).
+    pub on_up: Box<dyn FnOnce() + Send>,
+    /// The endpoint certificate when no site certificate is configured (the
+    /// `MULTIVIEW_MOQ_CERTIFICATE` pair).
+    pub fallback_tls: Option<multiview_frontdoor::SiteTlsConfig>,
+}
+
+impl std::fmt::Debug for H3Moq {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("H3Moq")
+            .field("fallback_tls", &self.fallback_tls.is_some())
+            .finish_non_exhaustive()
+    }
+}
+
+/// The certificate the h3 endpoint serves, and when it may start.
+pub struct H3Tls {
+    /// The site TLS configuration (ALPN is overridden to `h3`, 0-RTT off).
+    /// `None`: the `MoQ` fallback pair, else no endpoint.
+    pub config: Option<multiview_frontdoor::SiteTlsConfig>,
+    /// With `[network.tls]`: resolves `true` once the certificate is
+    /// `serving` (`false`: never, e.g. shutdown). No QUIC in `setup`.
+    pub ready: Option<std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send>>>,
+    /// Why this certificate (for the startup log).
+    pub source: &'static str,
+}
+
+impl std::fmt::Debug for H3Tls {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("H3Tls")
+            .field("config", &self.config.is_some())
+            .field("deferred", &self.ready.is_some())
+            .field("source", &self.source)
+            .finish()
+    }
+}
+
+/// The h3 endpoint's state inside the run.
+struct H3Slot {
+    lane: Mutex<Option<multiview_frontdoor::QuicLane>>,
+    moq: Mutex<Option<H3Moq>>,
+    alt_svc: Arc<multiview_control::h3_site::AltSvc>,
+    /// `[network] alt_svc` (the operator's "UDP reachable").
+    alt_svc_allowed: bool,
+    endpoint: Arc<Mutex<Option<multiview_h3::H3Endpoint>>>,
+    starter: Mutex<Option<tokio::task::JoinHandle<()>>>,
+}
+
+/// Locks, recovering from poisoning (the guarded values stay consistent:
+/// every critical section is a single take/insert).
+fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 /// The TCP door settings derived from `[network]` (slice 4): `None` unless
@@ -158,12 +220,16 @@ impl multiview_frontdoor::SiteService for ControlSite {
     }
 }
 
+/// Upper bound on the h3 endpoint's shutdown (its own drain is 2 s).
+const H3_SHUTDOWN_BOUND: std::time::Duration = std::time::Duration::from_secs(3);
+
 impl std::fmt::Debug for FrontDoorRun {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("FrontDoorRun")
             .field("local_addr", &self.door.local_addr())
             .field("ice_tcp", &self.ice_tcp)
-            .finish()
+            .field("h3_running", &self.h3_running())
+            .finish_non_exhaustive()
     }
 }
 
@@ -256,10 +322,24 @@ impl FrontDoorRun {
             fd_config.port,
         ));
         let run = match multiview_frontdoor::FrontDoor::start_with(&fd_config, udp) {
-            Ok(door) => {
+            Ok(mut door) => {
+                let lane = door.take_quic_lane().ok();
+                let port = door.local_addr().port();
+                let alt_svc_allowed = config
+                    .network
+                    .as_ref()
+                    .is_none_or(multiview_config::NetworkConfig::alt_svc_enabled);
                 let mut run = Self {
                     door,
                     ice_tcp: false,
+                    h3: H3Slot {
+                        lane: Mutex::new(lane),
+                        moq: Mutex::new(None),
+                        alt_svc: Arc::new(multiview_control::h3_site::AltSvc::new(port)),
+                        alt_svc_allowed,
+                        endpoint: Arc::new(Mutex::new(None)),
+                        starter: Mutex::new(None),
+                    },
                 };
                 run.start_tcp(config, &mut inherited);
                 Some(run)
@@ -428,31 +508,145 @@ impl FrontDoorRun {
         self.door.take_ice_tcp_lane().ok()
     }
 
-    /// Take the QUIC lane, wrapped for the `MoQ` listener.
-    #[cfg(feature = "moq-output")]
-    pub fn take_moq_socket(&mut self) -> Option<multiview_moq::provider::SharedSocket> {
-        let lane = self.door.take_quic_lane().ok()?;
+    /// Install `MoQ` on the h3 endpoint (before [`start_h3`](Self::start_h3)).
+    pub fn set_h3_moq(&self, moq: H3Moq) {
+        *lock(&self.h3.moq) = Some(moq);
+    }
+
+    /// The `Alt-Svc` switch the TCP door's site layer reads.
+    #[must_use]
+    pub fn alt_svc(&self) -> Arc<multiview_control::h3_site::AltSvc> {
+        Arc::clone(&self.h3.alt_svc)
+    }
+
+    /// Whether the h3 endpoint is serving.
+    #[must_use]
+    pub fn h3_running(&self) -> bool {
+        lock(&self.h3.endpoint).is_some()
+    }
+
+    /// The h3 endpoint's local address, while it serves.
+    #[must_use]
+    pub fn h3_local_addr(&self) -> Option<SocketAddr> {
+        lock(&self.h3.endpoint)
+            .as_ref()
+            .and_then(|e| e.local_addr().ok())
+    }
+
+    /// Start the HTTP/3 endpoint on the QUIC lane (slice 2, design note
+    /// section 5): `site` answers every request, `MoQ` ([`set_h3_moq`](Self::set_h3_moq))
+    /// every WebTransport CONNECT under `/moq/`. Everything (the noq driver,
+    /// the accept loop, each connection, this starter) runs on the front
+    /// door's runtime. With `tls.ready` the endpoint starts only once it
+    /// resolves `true` (ACME: `serving`); `Alt-Svc` turns on once the endpoint
+    /// is up, unless `[network] alt_svc = false`. Without any certificate no
+    /// endpoint starts (a warning says so) and `MoQ` stays unavailable.
+    /// A second call does nothing.
+    pub fn start_h3(&self, site: Arc<dyn multiview_h3::Site>, tls: H3Tls) {
+        let Some(lane) = lock(&self.h3.lane).take() else {
+            return;
+        };
+        let moq = lock(&self.h3.moq).take();
+        let (wt, on_up, fallback) = match moq {
+            Some(m) => (Some(m.wt), Some(m.on_up), m.fallback_tls),
+            None => (None, None, None),
+        };
+        let (config, source) = match (tls.config, fallback) {
+            (Some(config), _) => (config, tls.source),
+            (None, Some(config)) => (config, "MULTIVIEW_MOQ_CERTIFICATE"),
+            (None, None) => {
+                tracing::warn!(
+                    udp = %self.door.local_addr(),
+                    "front door: no certificate for the HTTP/3 endpoint ([network.tls], \
+                     [network] cert_file/key_file or [control.tls] in a `tls` build, or the \
+                     MULTIVIEW_MOQ_CERTIFICATE pair); QUIC is not served, the site stays on \
+                     TCP, MoQ is unavailable, no Alt-Svc"
+                );
+                return;
+            }
+        };
         let established = self.door.quic_established();
-        let peers: multiview_moq::provider::PeerHook = Arc::new(move |peer, up| {
+        let peers: multiview_h3::PeersHook = Arc::new(move |peer, up| {
             if up {
                 established.insert(peer);
             } else {
                 established.remove(peer);
             }
         });
-        Some(multiview_moq::provider::SharedSocket {
+        let runtime = self.door.handle();
+        let parts = multiview_h3::EndpointParts {
             socket: Box::new(lane),
             endpoint: multiview_frontdoor::quic::endpoint_config(),
-            incoming: Some(multiview_frontdoor::quic::incoming_caps()),
-            runtime: self.door.handle(),
+            incoming: multiview_frontdoor::quic::incoming_caps(),
+            tls: config,
+            runtime: runtime.clone(),
+            site,
+            wt,
+            limits: multiview_h3::H3Limits::default(),
             peers: Some(peers),
-        })
+        };
+        let slot = Arc::clone(&self.h3.endpoint);
+        let alt_svc = Arc::clone(&self.h3.alt_svc);
+        let alt_allowed = self.h3.alt_svc_allowed;
+        let ready = tls.ready;
+        let starter = runtime.spawn(async move {
+            if let Some(ready) = ready {
+                tracing::info!("front door: QUIC/HTTP/3 held until the ACME certificate is serving");
+                if !ready.await {
+                    return;
+                }
+            }
+            let moq = parts.wt.is_some();
+            match multiview_h3::H3Endpoint::start(parts).await {
+                Ok(endpoint) => {
+                    let udp = endpoint.local_addr().ok();
+                    *lock(&slot) = Some(endpoint);
+                    if let Some(on_up) = on_up {
+                        on_up();
+                    }
+                    alt_svc.set(alt_allowed);
+                    tracing::info!(
+                        udp = ?udp,
+                        alpn = "h3",
+                        zero_rtt = false,
+                        moq,
+                        certificate = source,
+                        alt_svc = alt_allowed,
+                        alt_svc_why = if alt_allowed {
+                            "endpoint up, [network] alt_svc on"
+                        } else {
+                            "[network] alt_svc = false (UDP declared unreachable)"
+                        },
+                        "front door: HTTP/3 endpoint up (site over h3, MoQ over WebTransport under /moq/)"
+                    );
+                }
+                Err(error) => {
+                    tracing::error!(%error, "front door: the HTTP/3 endpoint failed to start; the site stays on TCP, MoQ unavailable, no Alt-Svc");
+                }
+            }
+        });
+        *lock(&self.h3.starter) = Some(starter);
     }
 
     /// Shut the front door down: its runtime (dispatcher, QUIC and WebRTC
     /// tasks) stops and the socket is closed, waiting at most
     /// [`multiview_frontdoor::SHUTDOWN_TIMEOUT`] on a blocking-pool thread.
     pub async fn shutdown(self) {
+        // The h3 endpoint first (Alt-Svc off, connections closed, bounded by
+        // its shutdown timeout), then the runtime it runs on.
+        self.h3.alt_svc.set(false);
+        if let Some(starter) = lock(&self.h3.starter).take() {
+            starter.abort();
+        }
+        let endpoint = lock(&self.h3.endpoint).take();
+        if let Some(endpoint) = endpoint {
+            if tokio::time::timeout(H3_SHUTDOWN_BOUND, endpoint.shutdown())
+                .await
+                .is_err()
+            {
+                tracing::warn!("front door: the HTTP/3 endpoint did not drain in time");
+            }
+        }
         let door = self.door;
         if tokio::task::spawn_blocking(move || door.shutdown_blocking())
             .await
@@ -477,39 +671,6 @@ impl FrontDoorRun {
 #[must_use]
 pub fn front_door_tls() -> Option<Arc<multiview_control::certificate_source::ChallengeResolver>> {
     crate::tls_boot::installed_tls_context().map(|tls| Arc::clone(&tls.resolver))
-}
-
-/// Hold the front-door QUIC lane until the ACME source is serving, then start
-/// `MoQ` on it with the ACME certificate and install the real provider into
-/// `deferred`. Bounded by `shutdown`; a control-plane task, never on the
-/// output clock (it only awaits a watch channel).
-#[cfg(all(feature = "acme", unix, feature = "moq-output"))]
-pub async fn start_moq_when_serving(
-    tls: Arc<multiview_control::tls_setup::TlsContext>,
-    shutdown: impl std::future::Future<Output = ()>,
-    endpoint: String,
-    protocol: String,
-    factory: Option<Arc<dyn multiview_control::moq_provider::AuthorizedFeedFactory>>,
-    socket: multiview_moq::provider::SharedSocket,
-    deferred: Arc<multiview_control::moq_startup::DeferredProvider>,
-) {
-    tracing::info!("front door: QUIC/MoQ held until the ACME certificate is serving");
-    if !crate::tls_boot::wait_serving(Arc::clone(&tls.certificates), shutdown).await {
-        return;
-    }
-    let resolver: Arc<dyn multiview_moq::moq_tokio_rustls::server::ResolvesServerCert> = Arc::new(
-        multiview_control::certificate_source::SourceResolver(Arc::clone(&tls.certificates)),
-    );
-    if let Ok(provider) = multiview_control::moq_startup::start_shared_resolver(
-        endpoint, protocol, factory, socket, resolver,
-    )
-    .await
-    {
-        deferred.set(provider);
-        tracing::info!("front door: certificate serving; QUIC/MoQ started");
-    } else {
-        tracing::error!("front door: MoQ listener failed to start on the QUIC lane");
-    }
 }
 
 #[cfg(test)]
