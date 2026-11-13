@@ -178,15 +178,6 @@ tokio = { workspace = true, features = [
     "io-util",
 ] }
 tempfile = "3"
-# Test-only certificates for `tests/tls_cli.rs` (offline status reads a stored
-# bundle; the dead-CA boot test needs a trust anchor). Already in the lock.
-rcgen = "0.14"
-# Test-only TLS client for `tests/tls_door.rs` (the real TCP door with
-# `[network.tls]`: bootstrap certificate, TLS-ALPN-01, renewal swap). rustls
-# 0.23 / tokio-rustls 0.26 with their default aws-lc-rs provider, already in
-# the lock via multiview-control's `tls`.
-rustls = "0.23"
-tokio-rustls = "0.26"
 # Test-only crypto for the device-ACTIVATE never-off-air chaos gate (ADR-I008): an
 # ECDSA-P256 root signs a fabricated attested keyset (so the chaos server's
 # `fetch_keys` passes `TrustedKeys::verify` and `activate_once` actually REACHES the
@@ -211,12 +202,36 @@ proptest = "1.5.0"
 # graph transitively via `xtask`'s `ureq`; pulling it here as a direct dev-dep
 # adds no new license/advisory surface.
 flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
+# Test-only TLS client for the front-door TCP door's ACME TLS-ALPN-01
+# resolver wiring test (#290/#291): a rustls client with an EXPLICIT `ring`
+# provider (distinct from the server side's `aws-lc-rs`, matching the design
+# note's "ring or aws-lc provider" allowance) that negotiates the
+# `acme-tls/1` ALPN and inspects the leaf it receives. All three are already
+# in the lock via `multiview-frontdoor`'s dev-deps / `multiview-control`'s
+# `tls` feature; no new crate. Also used by `tests/tls_cli.rs` (rcgen: a
+# stored bundle and a trust anchor) and `tests/tls_door.rs` (the real door
+# with `[network.tls]`), which use the `aws-lc-rs` provider explicitly.
+rustls = { version = "0.23", default-features = false, features = [
+    "std",
+    "ring",
+    "aws_lc_rs",
+    "tls12",
+] }
+tokio-rustls = { version = "0.26", default-features = false }
+rcgen = "0.14"
 
 # The pipeline-ingest integration test needs the `ffmpeg` feature (a libav*
 # build + the `ffmpeg`/`ffprobe` CLIs at runtime).
 [[test]]
 name = "pipeline_ingest"
 required-features = ["ffmpeg"]
+
+# The front-door TCP door's ACME TLS-ALPN-01 resolver wiring test needs the
+# `tls` feature (multiview-control's `acme_challenge_server_config` +
+# `StaticCertificateSource`, unix only).
+[[test]]
+name = "acme_tls_alpn_resolver"
+required-features = ["tls"]
 
 # Audio routing applies live to the running program bus (no restart).
 [[test]]
