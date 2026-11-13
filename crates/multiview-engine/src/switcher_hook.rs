@@ -65,7 +65,9 @@ impl<C: FnMut(&mut CompositorDrive<Nv12Image>)> FrameControl for SwitcherFrameHo
         self.fps_den = drive.layout().canvas.fps_den;
         (self.legacy)(drive);
         self.driver.drain_at_tick(tick);
-        let (program, preview) = self.driver.selections();
+        // Resolved SOURCES: a re-patch of the PGM input changes `program`
+        // without a machine change, and rebinds the cell on this same tick.
+        let (program, preview) = self.driver.resolved_selections();
         let mut failure = None;
         if self.last_program.as_ref() != Some(program) {
             match drive.rebind_cell(&self.cell_id, program.as_str()) {
@@ -104,7 +106,7 @@ impl<C: FnMut(&mut CompositorDrive<Nv12Image>)> FrameControl for SwitcherFrameHo
             let _ = drive.set_mix_overlay(None);
             // Keep the drive coherent with the restored machine (SW2-03): if
             // this tick re-pointed the cell before failing, point it back.
-            let (restored, _) = self.driver.selections();
+            let (restored, _) = self.driver.resolved_selections();
             if self.last_program.as_ref() != Some(restored)
                 && drive.rebind_cell(&self.cell_id, restored.as_str()).is_ok()
             {
@@ -115,7 +117,7 @@ impl<C: FnMut(&mut CompositorDrive<Nv12Image>)> FrameControl for SwitcherFrameHo
 
     fn after_compose(&mut self, frame: &CompositedFrame) {
         if let Some(selection) = &self.preview_selection {
-            let (_, preview) = self.driver.selections();
+            let (_, preview) = self.driver.resolved_selections();
             if self.last_preview.as_deref() != Some(preview.as_str()) {
                 let id: Arc<str> = Arc::from(preview.as_str());
                 selection.store(Some(Arc::clone(&id)));
@@ -127,7 +129,7 @@ impl<C: FnMut(&mut CompositorDrive<Nv12Image>)> FrameControl for SwitcherFrameHo
         // actual configured full-rate PVW output must instead own its own
         // admitted compositor/rendition — this tap never composes or encodes.
         if let (Some(slot), Some(stores)) = (&self.preview_slot, &self.preview_stores) {
-            let (_, preview) = self.driver.selections();
+            let (_, preview) = self.driver.resolved_selections();
             let picture = stores
                 .get(preview.as_str())
                 .and_then(|store| store.read_at(frame.tick.pts).frame().cloned());

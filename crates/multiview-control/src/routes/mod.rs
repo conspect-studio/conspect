@@ -44,6 +44,7 @@ pub mod moq;
 pub mod output_routing;
 pub mod outputs;
 pub mod overlays;
+pub mod patch;
 pub mod preview;
 pub mod probes;
 pub mod routing;
@@ -1194,6 +1195,8 @@ fn resource_router() -> Router<AppState> {
                 .delete(probes::delete_probe),
         )
         .merge(device_router())
+        // The patch panel, mixer-input slice (ADR-0110 §12.8, #341).
+        .merge(patch::router())
 }
 
 /// Build the managed-devices surface (ADR-M008/M009/M011/W017): the device

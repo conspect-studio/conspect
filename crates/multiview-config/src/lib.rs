@@ -148,7 +148,10 @@ pub use schema::{
     SourceAuth, SourceKind, SourceOrigin, SrtBackend, SrtEncryption, SrtKeyLength, SrtMode,
     SrtOptions,
 };
-pub use switcher::{MixEffectsConfig, SwitcherConfig};
+pub use switcher::{
+    MixEffectsConfig, MixerInput, MixerInputVideo, SwitcherConfig, INPUT_REF_PREFIX,
+    MAX_MIXER_INPUTS,
+};
 pub use sync_group::{SyncGroup, SyncGroupMode, SyncMember};
 pub use tally::{BitColor, IndexCell, TallyProfile};
 pub use timer::{

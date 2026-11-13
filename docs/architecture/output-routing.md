@@ -1615,6 +1615,15 @@ there is no compressed tap.
 - **Cycles.** A layout cell or mixer input that (transitively) contains the bus that shows it is a
   cycle: `me1.in3 ← me1.program` is refused at plan and at adoption (`feed-cycle`), as §3.
 
+**As built in slice A (#341).** Two narrowings of the text above, both kept on purpose:
+`program_source`/`preview_source` stay **required** with inputs declared (they must equal the
+sources patched to `program_input`/`preview_input`; the start-up admission rule still binds the
+one Program cell to `program_source`), and with inputs declared no source id may start with `in:`,
+the engine's spelling of an input reference. An applied patch persists the table, keeps the
+starting input numbers and moves `program_source`/`preview_source` (and the placeholder Program
+cell) to the sources now behind them; live PGM/PVW selections are not persisted, as before. Patch
+outcomes ride `switcher.operation`; a dedicated `patch.take` event is a follow-up.
+
 ### 12.3 Output format and slots
 
 ```toml
