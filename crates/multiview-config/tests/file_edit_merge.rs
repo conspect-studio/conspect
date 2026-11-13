@@ -310,3 +310,81 @@ fn an_iptv_key_edit_keeps_the_published_entries() {
         ["iptv entry restream"]
     );
 }
+
+/// Review L1 round 2 (1): a file that resets a field to its serde default
+/// (skipped on serialization) applies the reset, even while another field of
+/// the same unit differs in the accepted state.
+#[test]
+fn a_reset_to_the_default_value_applies() {
+    let me = |program: &str, flip: bool| {
+        format!(
+            "[switcher]\n[[switcher.mix_effects]]\nid = \"me1\"\nprogram = \"main\"\nprogram_source = \"{program}\"\npreview_source = \"in_c\"\nflip_flop = {flip}\n"
+        )
+    };
+    let base = accepted();
+    // prev: flip_flop = false (non-default); file resets it to the default true.
+    let prev = parse(&format!("{base}{}", me("in_b", false)));
+    let next = parse(&format!("{base}{}", me("in_b", true)));
+    // The API changed program_source meanwhile.
+    let accepted = parse(&format!("{base}{}", me("in_hls", false)));
+    let merged = merge_file_edit(&prev, &next, &accepted);
+    let m = &merged.switcher.as_ref().unwrap().mix_effects[0];
+    assert!(m.flip_flop, "the file's reset to the default lands");
+    assert_eq!(m.program_source, "in_hls", "the API-set field stays");
+
+    // [iptv] enabled: true -> false (the default) while the API set a URL.
+    let iptv = |enabled: bool, url: bool| {
+        let mut t = format!("[iptv]\nenabled = {enabled}\n");
+        if url {
+            t.push_str("public_base_url = \"https://tv.example\"\n");
+        }
+        t
+    };
+    let file = boot("/srv/ui-old");
+    let prev = parse(&format!("{file}{}", iptv(true, false)));
+    let next = parse(&format!("{file}{}", iptv(false, false)));
+    let accepted = parse(&format!("{}{}", self::accepted(), iptv(true, true)));
+    let merged = merge_file_edit(&prev, &next, &accepted);
+    let out = merged.iptv.unwrap();
+    assert!(!out.enabled, "the file's reset to the default lands");
+    assert_eq!(out.public_base_url.as_deref(), Some("https://tv.example"));
+}
+
+/// Review L1 round 2 (2a): a file edit of one IPTV entry field keeps the
+/// API-set other fields of that entry.
+#[test]
+fn an_iptv_entry_field_edit_keeps_the_api_set_fields() {
+    let entry = |name: &str, logo: bool| {
+        let mut t = format!(
+            "[iptv]\nenabled = true\n[[iptv.entries]]\nkind = \"output\"\nref = \"restream\"\nname = \"{name}\"\n"
+        );
+        if logo {
+            t.push_str("logo = \"https://tv.example/logo.png\"\n");
+        }
+        t
+    };
+    let file = boot("/srv/ui-old");
+    let prev = parse(&format!("{file}{}", entry("Old", false)));
+    let next = parse(&format!("{file}{}", entry("New", false)));
+    let accepted = parse(&format!("{}{}", accepted(), entry("Old", true)));
+    let merged = merge_file_edit(&prev, &next, &accepted);
+    let e = &merged.iptv.as_ref().unwrap().entries[0];
+    assert_eq!(e.name.as_deref(), Some("New"));
+    assert_eq!(e.logo.as_deref(), Some("https://tv.example/logo.png"));
+}
+
+/// Review L1 round 2 (2b): a canvas colour profile edit keeps API-set colour
+/// axes.
+#[test]
+fn a_canvas_colour_profile_edit_keeps_the_other_colour_axes() {
+    let prev = parse(&boot("/srv/ui-old"));
+    let next = parse(&boot("/srv/ui-old").replace("sdr-bt709-limited", "sdr-bt709-full"));
+    if next.canvas.color == prev.canvas.color {
+        return;
+    }
+    let mut accepted = parse(&accepted());
+    accepted.canvas.color.transfer = Some("bt709".to_owned());
+    let merged = merge_file_edit(&prev, &next, &accepted);
+    assert_eq!(merged.canvas.color.profile, next.canvas.color.profile);
+    assert_eq!(merged.canvas.color.transfer.as_deref(), Some("bt709"));
+}

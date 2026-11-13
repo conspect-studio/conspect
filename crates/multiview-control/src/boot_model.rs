@@ -302,18 +302,25 @@ async fn write_desired(state: &AppState, desired: DesiredState) -> ControlResult
     let result = tokio::task::spawn_blocking({
         let model = Arc::clone(&model);
         move || {
-            let _serial = model.lock_writes();
-            // #367: re-checked under the write serial, immediately before the
-            // rename: a commit that was already past every earlier check when
-            // the run decided to exit (or waited behind another write) does
-            // not land.
-            if frozen.accepted_state_frozen() {
-                return Err(AtomicWriteError::BeforeRename(std::io::Error::other(
-                    SHUTTING_DOWN,
-                )));
-            }
+            // #367: the directory create, temp write and fsync happen WITHOUT
+            // the write serial, so a frozen writer does no disk I/O under it
+            // and the exit-time `active.toml` persist never waits on this
+            // fsync. Only the rename runs under the serial, right after the
+            // freeze re-check, so a commit already past every earlier check
+            // when the run decided to exit does not land.
             create_state_dir(&model.state_dir()).map_err(AtomicWriteError::BeforeRename)?;
-            write_atomic_commit(&model.state_dir().join(DESIRED_FILE), &json)
+            let target = model.state_dir().join(DESIRED_FILE);
+            let prepared = prepare_atomic(&target, &json)?;
+            {
+                let _serial = model.lock_writes();
+                if frozen.accepted_state_frozen() {
+                    return Err(AtomicWriteError::BeforeRename(std::io::Error::other(
+                        SHUTTING_DOWN,
+                    )));
+                }
+                prepared.rename()?;
+            }
+            sync_parent_directory(&target_dir(&target)).map_err(AtomicWriteError::AfterRename)
         }
     })
     .await
@@ -2373,6 +2380,41 @@ pub const MAX_REPLACED: usize = 5;
 /// How many names one millisecond's copy may try before failing closed.
 const MAX_NAME_ATTEMPTS: u32 = 1000;
 
+/// Whether the kept copy at `path` holds exactly `content` (#324/#367
+/// dedup), without ever following a link or blocking: the file is opened
+/// `O_NOFOLLOW | O_NONBLOCK`, the DESCRIPTOR is `fstat`ed and must be a regular
+/// file of exactly `content.len()` bytes, and at most that many bytes are
+/// read from it. A symlink, FIFO, device, a swapped name or any I/O error is
+/// "not equal". Blocking I/O: call off the reactor.
+#[must_use]
+pub fn kept_copy_equals(path: &Path, content: &str) -> bool {
+    use std::io::Read as _;
+    let Ok(len) = u64::try_from(content.len()) else {
+        return false;
+    };
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        let flags = rustix::fs::OFlags::NOFOLLOW | rustix::fs::OFlags::NONBLOCK;
+        options.custom_flags(i32::try_from(flags.bits()).unwrap_or(0));
+    }
+    let Ok(file) = options.open(path) else {
+        return false;
+    };
+    if !file
+        .metadata()
+        .is_ok_and(|m| m.file_type().is_file() && m.len() == len)
+    {
+        return false;
+    }
+    let mut kept = Vec::with_capacity(content.len());
+    file.take(len.saturating_add(1))
+        .read_to_end(&mut kept)
+        .is_ok_and(|_| kept == content.as_bytes())
+}
+
 /// Keep a copy of a state about to be replaced (#367) as
 /// `<dir>/<prefix>-<13-digit ms>-<3-digit n>.json`: owner-only directory,
 /// atomic write, deduplicated (identical bytes already kept are reused) and
@@ -2421,11 +2463,7 @@ pub fn keep_state_copy(
     // Dedup reads only a regular file (never a symlink, FIFO or device:
     // `DirEntry::file_type` does not follow links) whose size equals the new
     // content's, so a planted or oversized file is never read.
-    if let Some(existing) = list(dir).into_iter().find(|p| {
-        std::fs::symlink_metadata(p).is_ok_and(|m| {
-            m.file_type().is_file() && u64::try_from(content.len()).is_ok_and(|len| m.len() == len)
-        }) && std::fs::read_to_string(p).is_ok_and(|kept| kept == content)
-    }) {
+    if let Some(existing) = list(dir).into_iter().find(|p| kept_copy_equals(p, content)) {
         prune(&existing);
         return Ok(existing);
     }
@@ -2437,9 +2475,7 @@ pub fn keep_state_copy(
         .ok_or_else(|| format!("no free copy name in {}", dir.display()))?;
     match write_atomic_commit(&kept, content) {
         Ok(()) => {}
-        Err(AtomicWriteError::AfterRename(error))
-            if std::fs::read_to_string(&kept).is_ok_and(|now| now == content) =>
-        {
+        Err(AtomicWriteError::AfterRename(error)) if kept_copy_equals(&kept, content) => {
             tracing::warn!(path = %kept.display(), %error, "written, but the directory sync failed");
         }
         Err(error) => return Err(format!("writing {}: {error}", kept.display())),
@@ -2500,6 +2536,53 @@ fn write_atomic_commit(path: &Path, content: &str) -> Result<(), AtomicWriteErro
 
 fn sync_parent_directory(dir: &Path) -> std::io::Result<()> {
     std::fs::File::open(dir).and_then(|handle| handle.sync_all())
+}
+
+/// The directory an atomic write's rename lands in.
+fn target_dir(path: &Path) -> PathBuf {
+    path.parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .map_or_else(|| PathBuf::from("."), Path::to_path_buf)
+}
+
+/// A durable temp file ready to be renamed over its target: written, mode
+/// clamped and fsynced, not yet visible (#367: prepared outside the write
+/// serial, renamed under it).
+struct PreparedWrite {
+    tmp: tempfile::NamedTempFile,
+    path: PathBuf,
+}
+
+impl PreparedWrite {
+    /// The atomic `rename(2)`; the directory sync is the caller's.
+    fn rename(self) -> Result<(), AtomicWriteError> {
+        self.tmp
+            .persist(&self.path)
+            .map(|_| ())
+            .map_err(|e| AtomicWriteError::BeforeRename(e.error))
+    }
+}
+
+/// Write `content` to an exclusive, owner-only temp next to `path` and fsync
+/// it (the same discipline as `write_atomic_with_sync`, without the rename).
+fn prepare_atomic(path: &Path, content: &str) -> Result<PreparedWrite, AtomicWriteError> {
+    use std::io::Write as _;
+    let before = AtomicWriteError::BeforeRename;
+    if path.file_name().is_none() {
+        return Err(before(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("atomic write target {} has no file name", path.display()),
+        )));
+    }
+    let mut tmp = tempfile::NamedTempFile::new_in(target_dir(path)).map_err(before)?;
+    tmp.write_all(content.as_bytes()).map_err(before)?;
+    tmp.flush().map_err(before)?;
+    set_owner_only_mode(tmp.as_file(), atomic_target_mode(path)).map_err(before)?;
+    tmp.as_file().sync_all().map_err(before)?;
+    Ok(PreparedWrite {
+        tmp,
+        path: path.to_path_buf(),
+    })
 }
 
 fn write_atomic_with_sync(

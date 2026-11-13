@@ -125,8 +125,13 @@ fn keyed_with<'a, T: PartialEq + Clone, K: Eq + Hash>(
 }
 
 /// Merge one object field by field (one level): a field the file changed
-/// takes the file's value, every other field keeps the accepted value. When
-/// the result does not deserialize (e.g. a tagged enum whose kind changed), the
+/// takes the file's value, every other field keeps the accepted value. A
+/// field skipped on serialization (`skip_serializing_if`, its default) is
+/// absent on both sides alike, so "absent" compares as "the default": a file
+/// that resets a field to its default (present -> absent) removes it from the
+/// result, which deserializes back to the default; a field that is the
+/// default in both file documents was not touched by the edit. When the
+/// result does not deserialize (e.g. a tagged enum whose kind changed), the
 /// file's whole value is taken.
 fn fields<T: PartialEq + Clone + Serialize + DeserializeOwned>(
     prev: &T,
@@ -181,7 +186,7 @@ fn merge_canvas(prev: &Canvas, next: &Canvas, accepted: &Canvas) -> Canvas {
         &accepted.pixel_format,
     );
     out.background = section(&prev.background, &next.background, &accepted.background);
-    out.color = section(&prev.color, &next.color, &accepted.color);
+    out.color = fields(&prev.color, &next.color, &accepted.color);
     out
 }
 
@@ -223,9 +228,13 @@ fn merge_iptv(
         return next.cloned();
     };
     let mut out = fields(p, n, a);
-    out.entries = keyed(&p.entries, &n.entries, &a.entries, |e| {
-        (e.kind, e.reference.clone())
-    });
+    out.entries = keyed_with(
+        &p.entries,
+        &n.entries,
+        &a.entries,
+        |e| (e.kind, e.reference.clone()),
+        fields,
+    );
     Some(out)
 }
 

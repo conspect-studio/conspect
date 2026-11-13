@@ -119,9 +119,9 @@ output when one `[control] ui_dir` key changed (#367).
   crosspoints) the unit is the item — an item the file added or changed takes the file's
   value, an item the file removed is removed, every other accepted item stays (hash-indexed,
   linear in the list sizes). Smaller units where the operator edits parts of a section: the
-  canvas's pinned signal (width, height, cadence) is one unit and each other canvas axis is
-  its own; the switcher and its M/Es (by id) and the IPTV publication (entries by kind + ref)
-  merge field by field, so editing one key keeps the API-set others; a layout change takes the
+  canvas's pinned signal (width, height, cadence) is one unit, pixel format and background are
+  each their own, and the colour block merges field by field; the switcher and its M/Es (by
+  id) and the IPTV publication (scalars, and each entry by kind + ref) merge field by field, so editing one key keeps the API-set others; a layout change takes the
   file's layout with its cells (cells name the layout's areas), while a cells-only edit merges
   cells by id. When the accepted list still equals the previous file's list, the new list is
   taken whole (a reorder lands). The function destructures `MultiviewConfig` exhaustively, so a new section is a
@@ -135,8 +135,9 @@ output when one `[control] ui_dir` key changed (#367).
 * Before a file commit **removes sources, outputs, the switcher (or an M/E), audio routes or
   IPTV entries that exist in the accepted state**, the watcher keeps a byte copy of the accepted envelope as
   `.multiview/rejected/replaced-<unix-ms>-<n>.json` (owner-only, atomic, deduplicated by
-  reading only same-size regular files, never a symlink; at most 1000 name attempts; newest 5
-  kept) and raises the latched critical warning **`config-file-removed-accepted`**
+  reading only a same-size regular file through an `O_NOFOLLOW | O_NONBLOCK` descriptor; at
+  most 1000 name attempts, failing closed; newest 5 kept; the #324 `desired-*.json` copies
+  use the same rules) and raises the latched critical warning **`config-file-removed-accepted`**
   naming every removed item and the copy's path. No copy, no commit (the edit is retried).
 
 ### 3b. No accepted-state commit after the exit decision (#367)
@@ -150,9 +151,11 @@ is closed`).
   the pipeline path), and the return of either drive loop (stop, fatal fault or error, on both
   the pipeline and the software path), before tenant teardown and the final persist.
 * The durable write (`write_desired`, which every accepted-state commit goes through: the
-  watcher, the REST mutations and revert-to-start) re-checks the freeze **under its write
-  serial, immediately before the rename**. A commit that was already past every earlier check
-  when the exit was decided fails, and so does one waiting behind another write.
+  watcher, the REST mutations and revert-to-start) prepares and fsyncs its temp file outside
+  the write serial, then re-checks the freeze **under the serial, immediately before the
+  rename**. A commit that was already past every earlier check when the exit was decided
+  fails, and so does one waiting behind another write; the exit-time `active.toml` persist
+  shares that serial and waits at most for a rename, never for an fsync.
 * The watcher also checks "stopped, frozen, or command bus closed" under the config-mutation
   lock before every commit path. A closed bus (the receiver already dropped) is only a
   backstop: it becomes true after the exit decision, never in a normal run.

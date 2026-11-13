@@ -435,3 +435,36 @@ async fn no_commit_from_any_path_once_the_accepted_state_is_frozen() {
     assert_eq!(rig.desired_bytes(), before, "desired.json untouched");
     assert_eq!(rig.state.config_watch.snapshot().applied_count, 0);
 }
+
+/// Review (L2 round 2): the copy dedup never follows a link and never blocks
+/// on a FIFO planted under a kept-copy name.
+#[cfg(unix)]
+#[test]
+fn the_copy_dedup_never_follows_a_link_or_blocks_on_a_fifo() {
+    use multiview_control::boot_model::{keep_state_copy, kept_copy_equals};
+    let dir = tempfile::tempdir().unwrap();
+    let rejected = dir.path().join("rejected");
+    std::fs::create_dir(&rejected).unwrap();
+    let content = "{\"same\":true}";
+    // A symlink to a file with the same bytes is never treated as the copy.
+    let outside = dir.path().join("outside.json");
+    std::fs::write(&outside, content).unwrap();
+    let link = rejected.join("replaced-0000000000001-000.json");
+    std::os::unix::fs::symlink(&outside, &link).unwrap();
+    assert!(!kept_copy_equals(&link, content));
+    // A FIFO under a kept-copy name: the check returns at once (non-blocking).
+    let fifo = rejected.join("replaced-0000000000002-000.json");
+    let made = std::process::Command::new("mkfifo")
+        .arg(&fifo)
+        .status()
+        .unwrap();
+    assert!(made.success(), "mkfifo");
+    assert!(!kept_copy_equals(&fifo, content));
+    // A keep with both planted: a NEW regular copy, never the link or FIFO.
+    let kept = keep_state_copy(&rejected, "replaced", content, 3).unwrap();
+    assert!(std::fs::symlink_metadata(&kept)
+        .unwrap()
+        .file_type()
+        .is_file());
+    assert!(kept_copy_equals(&kept, content));
+}
