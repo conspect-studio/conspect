@@ -69,8 +69,20 @@ pub const REAPER_QUEUE: usize = 8;
 /// = 8 in the pipeline) on top of a full worker queue (`WORKER_QUEUE_TICKS` = 4)
 /// and the offers dropped meanwhile, so a transient stall never fails a key.
 pub const MAX_GAP_FILL_TICKS: u64 = 24;
-/// Operation-id prefix of a start-up (boot) take: `boot:<output config id>`.
-pub const BOOT_TAKE_PREFIX: &str = "boot:";
+/// Operation-id prefixes of a start-up (boot) take — `boot:<output config id>`
+/// and the audio-only `boot:audio:<output config id>` — defined once in the
+/// control plane, whose outcome relay never persists a boot outcome
+/// ([`multiview_control::output_routing::is_boot_take`]).
+pub use multiview_control::output_routing::{BOOT_AUDIO_TAKE_PREFIX, BOOT_TAKE_PREFIX};
+
+/// Whether `operation_id` is a video (or combined) boot take — the kind that
+/// enters the bounded retry window. An audio-only boot take
+/// (`boot:audio:<id>`) is a boot take too (never persisted) but has no fresh
+/// gate, so it is never retried.
+fn is_boot_video_take(operation_id: &str) -> bool {
+    multiview_control::output_routing::is_boot_take(operation_id)
+        && !operation_id.starts_with(BOOT_AUDIO_TAKE_PREFIX)
+}
 /// The principal a boot take is charged to.
 pub const BOOT_PRINCIPAL: &str = "system:boot";
 /// A refused boot take is re-issued at most once per this many seconds …
@@ -1096,7 +1108,7 @@ impl OutputRouter {
 
     fn emit(&mut self, operation_id: String, output_index: usize, tick: u64, outcome: TakeResult) {
         self.dirty = true;
-        if operation_id.starts_with(BOOT_TAKE_PREFIX) {
+        if is_boot_video_take(&operation_id) {
             self.on_boot_outcome(&operation_id, output_index, tick, outcome);
         }
         // Outcomes are rare control events (not per tick); the clone is the
@@ -1192,7 +1204,7 @@ impl OutputRouter {
             .strip_prefix(BOOT_TAKE_PREFIX)
             .unwrap_or(&take.operation_id);
         self.boot.audio_after.push(OutputTake {
-            operation_id: format!("boot-audio:{output}"),
+            operation_id: format!("{BOOT_AUDIO_TAKE_PREFIX}{output}"),
             output_index: take.output_index,
             bus: None,
             audio: Some(audio),
@@ -1287,14 +1299,11 @@ impl OutputRouter {
             // Any later take on the output replaces a queued boot audio too.
             self.boot.audio_after.retain(|b| b.output_index != index);
             if let Some(slot) = self.boot.slots.get_mut(index) {
-                *slot = take
-                    .operation_id
-                    .starts_with(BOOT_TAKE_PREFIX)
-                    .then(|| BootRetry {
-                        take: take.clone(),
-                        issued: tick,
-                        due: None,
-                    });
+                *slot = is_boot_video_take(&take.operation_id).then(|| BootRetry {
+                    take: take.clone(),
+                    issued: tick,
+                    due: None,
+                });
             }
             let needs_switcher = matches!(take.bus, Some(PictureBus::Preview | PictureBus::Clean));
             // Audio rides the output's program-audio slot (§5.5): a run

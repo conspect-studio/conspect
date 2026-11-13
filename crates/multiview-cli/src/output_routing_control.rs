@@ -255,6 +255,11 @@ impl OutputRouting for OutputRoutingAdapter {
         let Some(run_output) = handle.outputs().get(index) else {
             return Err(PlanRefusal::OutputKindUnroutable);
         };
+        // The same kind gate as a video take: an output the engine does not
+        // route (VAAPI/VideoToolbox, §4.2) takes no audio either.
+        if !run_output.routable {
+            return Err(PlanRefusal::OutputKindUnroutable);
+        }
         let snapshot = handle.snapshot();
         audio_cost(
             run_output.program_audio,
@@ -269,7 +274,15 @@ impl OutputRouting for OutputRoutingAdapter {
         let index = handle
             .index_of(&take.output)
             .ok_or(TakeSubmitError::Unroutable)?;
-        let program_audio = handle.outputs().get(index).is_some_and(|o| o.program_audio);
+        let run_output = handle
+            .outputs()
+            .get(index)
+            .ok_or(TakeSubmitError::Unroutable)?;
+        // Every take — video, combined or audio-only — honours the kind gate.
+        if !run_output.routable {
+            return Err(TakeSubmitError::Unroutable);
+        }
+        let program_audio = run_output.program_audio;
         let audio = take_audio(take.audio.as_ref(), program_audio);
         if audio.is_some() && !program_audio {
             // The engine would refuse it `unroutable`; the control plane

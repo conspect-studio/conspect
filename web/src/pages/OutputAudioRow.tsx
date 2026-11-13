@@ -58,6 +58,47 @@ function phaseOf(outcome: string | undefined): OperationPhase {
   return 'failed';
 }
 
+/**
+ * The select value of what the output CARRIES now (`effective_audio`, the
+ * live value): `program`, `none`, `{source}` / `src:<id>`, `{tracks}` /
+ * `track:<name>`, and `preview` / `preview_source` (only `follow` carries the
+ * PVW source, so it maps back to `follow`). `undefined` when hidden/unknown.
+ */
+function effectiveKey(value: unknown): string | undefined {
+  if (value === 'preview' || value === 'preview_source') return 'follow';
+  if (typeof value === 'string') {
+    if (value === 'program' || value === 'none') return value;
+    const label = audioFromKey(value);
+    return label === undefined || typeof label === 'string' ? undefined : audioKey(label);
+  }
+  const feed = audioOf(value);
+  return feed === undefined || feed === 'follow' ? undefined : audioKey(feed);
+}
+
+/** The select value `follow` of the on-air video `video` carries. */
+function followCarries(video: unknown): string | undefined {
+  if (!isRecord(video)) return undefined;
+  if (video.bus === 'program' || video.bus === 'clean') return 'program';
+  if (video.bus === 'preview') return 'follow';
+  if (typeof video.source === 'string') return `src:${video.source}`;
+  return undefined;
+}
+
+/**
+ * The current (on-air) select value of a routing row: the configured value
+ * when it is what the output carries (so `follow` stays `follow`), else the
+ * live `effective_audio`; the configured value when the live one is hidden.
+ */
+function onAirKeyOf(route: OutputRouteState): { readonly key: string; readonly configured: string } {
+  const configuredFeed = audioOf(route.audio);
+  const configured = configuredFeed === undefined ? '' : audioKey(configuredFeed);
+  const live = effectiveKey(route.effective_audio);
+  if (live === undefined) return { key: configured, configured };
+  if (configured === live) return { key: configured, configured };
+  if (configured === 'follow' && followCarries(route.video) === live) return { key: 'follow', configured };
+  return { key: live, configured };
+}
+
 interface Choice {
   readonly key: string;
   readonly label: string;
@@ -72,8 +113,12 @@ export function OutputAudioRow({
   tracks,
 }: OutputAudioRowProps): JSX.Element {
   const { t } = useLingui();
-  const current: OutputAudioFeed | undefined = route === undefined ? undefined : audioOf(route.audio);
-  const currentKey = current === undefined ? '' : audioKey(current);
+  // `effective_audio` is what is ON AIR (the engine's live value); `audio`
+  // the configured choice. The select and label follow the live value.
+  const onAir = route === undefined ? undefined : onAirKeyOf(route);
+  const currentKey = onAir?.key ?? '';
+  const current: OutputAudioFeed | undefined = audioFromKey(currentKey);
+  const configuredKey = onAir?.configured ?? '';
   const [onAirKey, setOnAirKey] = useState<string>(currentKey);
   const [selected, setSelected] = useState<string>(currentKey);
   const [plan, setPlan] = useState<OutputPlan | undefined>();
@@ -165,6 +210,15 @@ export function OutputAudioRow({
     return all;
   }, [followLabel, sources, tracks, onAirKey, t]);
 
+  const configuredNote =
+    configuredKey !== '' && configuredKey !== currentKey
+      ? (choices.find((c) => c.key === configuredKey)?.label ??
+        (() => {
+          const feed = audioFromKey(configuredKey);
+          if (feed === undefined || typeof feed === 'string') return configuredKey;
+          return 'source' in feed ? feed.source : feed.tracks.join(', ');
+        })())
+      : undefined;
   const selectedAudio = audioFromKey(selected);
   const redacted = route !== undefined && isRedacted(route.audio);
   const refusal = plan?.refusals[0];
@@ -269,6 +323,11 @@ export function OutputAudioRow({
         <span className="text-xs text-muted-foreground" data-testid="output-audio">
           {redacted ? t`Hidden` : (choices.find((c) => c.key === onAirKey)?.label ?? followLabel)}
         </span>
+        {configuredNote !== undefined && !redacted ? (
+          <span className="text-xs text-muted-foreground" data-testid="output-configured-audio">
+            {((label: string): string => t`configured: ${label} (not on air)`)(configuredNote)}
+          </span>
+        ) : null}
         {tracks === undefined ? (
           <span className="text-xs text-muted-foreground" data-testid="output-audio-no-tracks">
             <Trans>Tracks unavailable (audio routing not loaded)</Trans>

@@ -980,13 +980,13 @@ encoded as frame T.
   at start-up (`outputs_carry_program` no longer refuses it). The run starts every output on
   `follow` and, right after its routing handle is published, issues one **audio-only boot take**
   per output whose persisted audio is not `follow` (`Pipeline::issue_boot_audio_takes`, operation
-  id `boot-audio:<output>`). An audio-only take has no fresh gate, so there is no retry: a boot take
+  id `boot:audio:<output>`). An audio-only take has no fresh gate, so there is no retry: a boot take
   that cannot be enqueued or is refused (an output without a program-audio slot, a multi-track or
   undeclared-track feed) is logged, the output stays on `follow`, and the persisted value is kept.
   When the same row also persists a non-Program video feed, the audio rides that output's video
   **boot take** instead (one combined take, `boot:<output>`, see Restart below), so the two never
   supersede each other; if that boot take is given up, the router issues its audio alone as
-  `boot-audio:<output>` (no fresh gate), so a refused video never drops the persisted audio.
+  `boot:audio:<output>` (no fresh gate), so a refused video never drops the persisted audio.
 
 ---
 
@@ -1017,7 +1017,7 @@ desugar (`crates/multiview-config/src/lib.rs:1590-1600`) keeps writing Program.
 **Audio rows (slice 2).** `audio` in a `[[routing.output]]` row is accepted at start-up and
 re-applied by a boot audio take (§5.5). A take persists its audio feed with its video: an applied
 audio-only take writes `audio` and keeps the row's video; a row that ends on Program video and
-`follow` audio is removed (absent = the default). Boot takes are not persisted again.
+`follow` audio is removed (absent = the default). A boot outcome (any id under `boot:`, `is_boot_take`) is never persisted, applied or not.
 
 A take is persisted **only after its `applied` outcome**, never on `refused:*` or `superseded`, under
 the same config-mutation lock `apply-layout` uses (`crates/multiview-control/src/routes/mod.rs:811`). This differs from
@@ -1042,11 +1042,13 @@ already owns the take state machine, and needs no extra thread or timer. An oper
 output ends the boot take for good. After the window, or on a refusal that cannot clear (unroutable,
 format mismatch), the output stays on Program, a warning is logged, and the routing snapshot counts it
 (`boot_takes_given_up`). A refused or expired boot take never deletes the persisted feed: the operator's
-intent stays. An applied boot take re-persists the same feed, which is harmless.
+intent stays. An applied boot take is not persisted either: every boot id (`boot:<id>`, `boot:audio:<id>`) shares the one
+`BOOT_TAKE_PREFIX` in `multiview-control`, and the outcome relay skips persistence for `is_boot_take` ids.
 
 **What the operator sees when a boot take is refused.** `GET /routing` shows `video: {"bus":
-"program"}` with tally `program` (what is on air) and `configured_video` with the persisted feed. The
-Outputs page shows the live feed in the select and a "configured: X (not on air)" note. Start-up
+"program"}` with tally `program` (what is on air) and `configured_video` with the persisted feed, each
+redacted by its own read rule. The Outputs page shows the live feed (and the live `effective_audio` in the
+Audio row) in the select and a "configured: X (not on air)" note. Start-up
 admission (`outputs_carry_program`, the single start-up rule) refuses only a feed the engine cannot
 carry at all: a layout, which validation already refuses until slice 3.
 

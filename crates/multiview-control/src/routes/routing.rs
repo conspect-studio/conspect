@@ -625,17 +625,27 @@ fn on_air_route_state(
     live: Option<&crate::output_routing::OutputLive>,
     output: String,
 ) -> OutputRouteState {
-    let configured = output_route_state(principal, feed, output.clone());
     let Some(on_air) = live
         .and_then(|l| crate::output_routing::RoutedFeed::from_bus_name(&l.bus))
         .map(|bus| bus.video_feed())
     else {
-        return configured;
+        return output_route_state(principal, feed, output);
     };
+    // `video`, `tally` and `effective_audio`: the LIVE bus, by
+    // `may_read_feed(live)` alone.
     let mut live_xp = feed.clone();
     live_xp.video = Some(on_air);
     let mut row = output_route_state(principal, &live_xp, output);
-    row.configured_video = configured.configured_video;
+    // `configured_video`: the persisted feed, by `may_read_feed(configured)`
+    // alone — never derived from the live row, so neither field's
+    // readability can hide or disclose the other.
+    let configured = feed.effective_video();
+    row.configured_video = if may_read_feed(principal, &configured) {
+        serde_json::to_value(&configured)
+            .unwrap_or_else(|_| serde_json::json!({ "redacted": true }))
+    } else {
+        serde_json::json!({ "redacted": true })
+    };
     row
 }
 
@@ -862,7 +872,7 @@ fn output_route_state(
 
 #[cfg(test)]
 mod redaction_tests {
-    use super::{output_route_state, OutputTally};
+    use super::{on_air_route_state, output_route_state, OutputTally};
     use crate::auth::{Principal, Role};
     use multiview_config::{AudioFeed, OutputCrosspoint, VideoFeed};
 
@@ -874,6 +884,91 @@ mod redaction_tests {
             scoped_output_ids: None,
             scoped_discovery_domains: None,
         }
+    }
+
+    /// A key on output `o` with the Program scope (and the M/E), and the
+    /// extra objects `objects`.
+    fn program_scoped(objects: &[&str]) -> Principal {
+        let mut all = vec!["o", "me1"];
+        all.extend_from_slice(objects);
+        Principal {
+            scoped_output_ids: Some(vec!["program:main".into(), "o".into()]),
+            ..scoped(&all)
+        }
+    }
+
+    fn live(bus: &str) -> crate::output_routing::OutputLive {
+        crate::output_routing::OutputLive {
+            bus: bus.to_owned(),
+            since_tick: 1,
+            pending: None,
+            degraded: false,
+            audio: None,
+            pending_audio: None,
+            private_audio: false,
+        }
+    }
+
+    /// PR #352 review (HIGH, abuse): `video` (the live bus) and
+    /// `configured_video` (the persisted feed) are redacted independently.
+    #[test]
+    fn live_and_configured_video_are_redacted_independently() {
+        let redacted = serde_json::json!({ "redacted": true });
+        let mut feed = OutputCrosspoint::program("o", "main");
+        feed.video = Some(VideoFeed::Source("secret-cam".into()));
+        // Live bus readable (Program scope), persisted source not.
+        let row = on_air_route_state(
+            &program_scoped(&[]),
+            &feed,
+            Some(&live("program")),
+            "o".into(),
+        );
+        assert_eq!(row.video, serde_json::json!({ "bus": "program" }));
+        assert_eq!(row.configured_video, redacted);
+        assert_eq!(row.tally, OutputTally::Program);
+        let json = serde_json::to_string(&row).unwrap_or_default();
+        assert!(!json.contains("secret"), "{json}");
+        // The reverse: persisted source readable, live source not.
+        feed.video = Some(VideoFeed::Source("bars".into()));
+        let row = on_air_route_state(
+            &scoped(&["o", "bars"]),
+            &feed,
+            Some(&live("src:secret-cam")),
+            "o".into(),
+        );
+        assert_eq!(row.video, redacted);
+        assert_eq!(
+            row.configured_video,
+            serde_json::json!({ "source": "bars" })
+        );
+        assert_eq!(row.tally, OutputTally::Redacted);
+        assert_eq!(row.effective_audio, redacted, "follow of a hidden bus");
+        let json = serde_json::to_string(&row).unwrap_or_default();
+        assert!(!json.contains("secret"), "{json}");
+        // Neither readable: both redacted; both readable: both shown.
+        feed.video = Some(VideoFeed::Source("secret-mic".into()));
+        let row = on_air_route_state(
+            &scoped(&["o"]),
+            &feed,
+            Some(&live("src:secret-cam")),
+            "o".into(),
+        );
+        assert_eq!(
+            (row.video.clone(), row.configured_video.clone()),
+            (redacted.clone(), redacted)
+        );
+        let row = on_air_route_state(
+            &scoped(&["o", "secret-mic", "secret-cam"]),
+            &feed,
+            Some(&live("src:secret-cam")),
+            "o".into(),
+        );
+        assert_eq!(row.video, serde_json::json!({ "source": "secret-cam" }));
+        assert_eq!(
+            row.configured_video,
+            serde_json::json!({ "source": "secret-mic" })
+        );
+        assert_eq!(row.tally, OutputTally::Direct);
     }
 
     #[test]

@@ -139,6 +139,8 @@ struct FakeState {
     takes: Vec<OutputTakeRequest>,
     /// The output has no program-audio slot.
     no_audio_slot: bool,
+    /// The output's kind is not routable (`RunOutput.routable: false`).
+    unroutable: bool,
     /// The audio label the output carries now (the plan compares it).
     carried: String,
     private_audio: bool,
@@ -183,6 +185,9 @@ impl OutputRouting for Fake {
         audio: Option<&RoutedAudio>,
     ) -> Result<AudioPlanCost, PlanRefusal> {
         let s = self.state.lock().unwrap();
+        if s.unroutable {
+            return Err(PlanRefusal::OutputKindUnroutable);
+        }
         if s.no_audio_slot && audio.is_some_and(|a| *a != RoutedAudio::Follow) {
             return Err(PlanRefusal::AudioUnsupported);
         }
@@ -192,7 +197,11 @@ impl OutputRouting for Fake {
         })
     }
     fn try_take(&self, take: OutputTakeRequest) -> Result<(), TakeSubmitError> {
-        self.state.lock().unwrap().takes.push(take);
+        let mut s = self.state.lock().unwrap();
+        if s.unroutable {
+            return Err(TakeSubmitError::Unroutable);
+        }
+        s.takes.push(take);
         Ok(())
     }
     fn snapshot(&self) -> Option<RoutingLive> {
@@ -707,5 +716,30 @@ async fn readback_effective_audio_is_the_live_audio_redacted_per_object() {
         track["pending"]["audio"],
         serde_json::json!({"redacted": true}),
         "{track}"
+    );
+}
+
+/// PR #352 review (MEDIUM, media): an audio-only take on an output whose kind
+/// the engine does not route is `409 output-kind-unroutable` from the gate,
+/// before any reservation or enqueue (the key is not burned).
+#[tokio::test]
+async fn an_audio_take_on_an_unroutable_output_is_409_before_reserve() {
+    let dir = tempfile::tempdir().unwrap();
+    let rig = rig(&dir.path().join("boot.toml"), DOC);
+    rig.fake.state.lock().unwrap().unroutable = true;
+    let src = audio_body("output-1", serde_json::json!({"source": "bars"}));
+    let (status, kind) = problem_type(take(&rig, OPERATOR_TOKEN, "k1", src.clone()).await).await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert!(kind.ends_with("output-kind-unroutable"), "{kind}");
+    assert!(rig.fake.takes().is_empty(), "nothing reached the engine");
+    let routing = rig.state.output_routing.as_ref().unwrap();
+    assert_eq!(routing.records_len(), 0, "refused before reserve");
+    let planned = plan(&rig, OPERATOR_TOKEN, src.clone()).await;
+    assert_eq!(planned["refusals"][0]["type"], "output-kind-unroutable");
+    // Once routable, the same key is a fresh take.
+    rig.fake.state.lock().unwrap().unroutable = false;
+    assert_eq!(
+        take(&rig, OPERATOR_TOKEN, "k1", src).await.status(),
+        StatusCode::ACCEPTED
     );
 }

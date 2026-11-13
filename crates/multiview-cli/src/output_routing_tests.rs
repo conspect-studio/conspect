@@ -1470,6 +1470,69 @@ fn untrusted_ids_are_bounded_and_a_held_key_is_never_re_attributed() {
     assert!(x.r.has_capacity("q"), "the newcomer is not charged");
 }
 
+/// PR #352 review (MEDIUM, media): an audio take on a `routable: false`
+/// output is refused like a video take — `OutputKindUnroutable` at plan,
+/// `Unroutable` at take — and nothing reaches the engine mailbox.
+#[test]
+fn the_control_adapter_refuses_audio_takes_on_an_unroutable_output() {
+    use multiview_control::output_routing::{
+        OutputRouting, OutputTakeRequest, PlanRefusal, RoutedAudio, TakeSubmitError,
+    };
+    let (mut r, h, _aux) = router(2, 6, Box::new(|_| Err("never".to_owned())));
+    let h = h.with_outputs(vec![
+        RunOutput {
+            id: Some("ok".into()),
+            settings: 0,
+            routable: true,
+            program_audio: true,
+        },
+        RunOutput {
+            id: Some("vaapi".into()),
+            settings: 0,
+            routable: false,
+            program_audio: true,
+        },
+    ]);
+    let slot = output_routing_slot();
+    slot.store(Some(Arc::new(h)));
+    let adapter = crate::output_routing_control::OutputRoutingAdapter::new(Arc::clone(&slot));
+    let outcomes = adapter.subscribe_outcomes().unwrap();
+    let src = RoutedAudio::Source("bars".into());
+    assert_eq!(
+        adapter.plan_audio("vaapi", None, Some(&src)),
+        Err(PlanRefusal::OutputKindUnroutable)
+    );
+    assert!(adapter.plan_audio("ok", None, Some(&src)).is_ok());
+    let audio_take = |output: &str| OutputTakeRequest {
+        operation_id: format!("op-{output}"),
+        output: output.into(),
+        video: None,
+        audio: Some(src.clone()),
+        principal: "p".into(),
+    };
+    assert_eq!(
+        adapter.try_take(audio_take("vaapi")),
+        Err(TakeSubmitError::Unroutable)
+    );
+    adapter.try_take(audio_take("ok")).unwrap();
+    let mut d = dispatcher(2);
+    for t in 0..4 {
+        r.on_tick(t, MediaTime::from_nanos(0), &mut d, &mut NoDelivery)
+            .unwrap();
+    }
+    let seen: Vec<_> = std::iter::from_fn(|| {
+        outcomes
+            .recv_timeout(std::time::Duration::from_millis(200))
+            .ok()
+    })
+    .map(|o| o.operation_id)
+    .collect();
+    assert!(
+        seen.iter().all(|op| op != "op-vaapi"),
+        "the refused take never reached the engine: {seen:?}"
+    );
+}
+
 /// The control adapter maps config ids → router indices from the run's own
 /// output map (binding ids), never from config order: with an internal anchor
 /// at index 0 and outputs renamed/reordered, a take addressed to "renamed"
@@ -2259,7 +2322,7 @@ fn tone_and_back(x: &mut AudioHarness) -> (u64, u64, u64) {
 /// with a video feed AND an explicit audio feed boots as ONE combined boot
 /// take (so the audio-only boot take never supersedes the video one). When
 /// that take's video is refused for good, the boot take is given up but its
-/// audio is still applied, alone, as `boot-audio:<id>`.
+/// audio is still applied, alone, as `boot:audio:<id>`.
 #[test]
 fn a_given_up_combined_boot_take_still_applies_its_audio() {
     let mut x = audio_harness(2, NTSC, Box::new(|_| Err("no video".to_owned())));
@@ -2273,8 +2336,14 @@ fn a_given_up_combined_boot_take_still_applies_its_audio() {
         principal: BOOT_PRINCIPAL.to_owned(),
     })
     .unwrap();
-    let (o, t) = x.until(t, "boot-audio:o1", 60);
+    let (o, t) = x.until(t, &format!("{BOOT_AUDIO_TAKE_PREFIX}o1"), 60);
     assert_eq!(o.outcome, TakeResult::Applied, "{o:?}");
+    // The router-minted audio id is a boot take to the control plane (never
+    // persisted), with the shared `boot:` prefix.
+    assert_eq!(o.operation_id, "boot:audio:o1");
+    assert!(multiview_control::output_routing::is_boot_take(
+        &o.operation_id
+    ));
     assert_eq!(o.audio, Some(bars_src()));
     let boot: Vec<_> = x
         .others

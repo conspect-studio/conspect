@@ -966,6 +966,10 @@ fn a_persisted_source_feed_is_on_air_after_the_boot_take() {
                     o.operation_id == "boot:test-sink-1" && o.outcome == TakeResult::Applied
                 })
             });
+            // The pipeline-minted id is a boot take to the control plane.
+            assert!(multiview_control::output_routing::is_boot_take(
+                &o.operation_id
+            ));
             // The readback agrees with the outcome: out1 on air on the source.
             wait_for(
                 "the readback shows the source on air",
@@ -1272,7 +1276,10 @@ fn a_persisted_audio_feed_is_re_applied_by_a_boot_take() {
             let o = wait_for("the boot take outcome", Duration::from_secs(10), || {
                 outcomes.try_recv().ok()
             });
-            assert_eq!(o.operation_id, "boot-audio:test-sink-1");
+            assert_eq!(o.operation_id, "boot:audio:test-sink-1");
+            assert!(multiview_control::output_routing::is_boot_take(
+                &o.operation_id
+            ));
             assert_eq!(o.outcome, TakeResult::Applied, "{o:?}");
             let s = wait_for("the boot audio on air", Duration::from_secs(5), || {
                 let s = handle.snapshot();

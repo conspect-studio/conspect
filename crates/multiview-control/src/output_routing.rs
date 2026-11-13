@@ -311,9 +311,23 @@ pub const MAX_LIMITED_PRINCIPALS: usize = 1024;
 pub const MAX_LIMITED_OUTPUTS: usize = 1024;
 const RATE_WINDOW: Duration = Duration::from_secs(1);
 
-/// Operation-id prefix of the takes the engine issues itself at run start to
-/// re-apply persisted state (never persisted again on `applied`).
-pub const BOOT_TAKE_PREFIX: &str = "boot-";
+/// Operation-id prefix of EVERY take the engine issues itself at run start to
+/// re-apply persisted state (a start-up, or boot, take): `boot:<output config
+/// id>` for the video (or combined) take, [`BOOT_AUDIO_TAKE_PREFIX`] for an
+/// audio-only one. The one shared definition: the engine mints these ids and
+/// the outcome relay recognises them by [`is_boot_take`]. A boot outcome is
+/// never persisted, applied or not: the accepted row is the operator's intent.
+pub const BOOT_TAKE_PREFIX: &str = "boot:";
+/// Operation-id prefix of an audio-only boot take: `boot:audio:<output config
+/// id>` (itself under [`BOOT_TAKE_PREFIX`]).
+pub const BOOT_AUDIO_TAKE_PREFIX: &str = "boot:audio:";
+
+/// Whether `operation_id` names a start-up (boot) take the engine issued
+/// itself — never a client take (those carry a minted [`crate::command::OperationId`]).
+#[must_use]
+pub fn is_boot_take(operation_id: &str) -> bool {
+    operation_id.starts_with(BOOT_TAKE_PREFIX)
+}
 
 /// A recorded terminal outcome.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -390,10 +404,16 @@ struct TakeStore {
 
 impl TakeStore {
     fn new(cap: usize, per_principal: usize) -> Self {
+        Self::starting_at(cap, per_principal, 0)
+    }
+
+    /// A store whose next reservation gets `next_seq` (`new` starts at 0; a
+    /// test starts near `u64::MAX` to prove the age never wraps).
+    fn starting_at(cap: usize, per_principal: usize, next_seq: u64) -> Self {
         Self {
             cap,
             per_principal,
-            next_seq: 0,
+            next_seq,
             by_key: HashMap::new(),
             by_op: HashMap::new(),
             held: HashMap::new(),
@@ -447,6 +467,13 @@ impl TakeStore {
         if let Some(replay) = self.replay(key) {
             return TakeReservation::Replay(replay);
         }
+        // The reservation order is the eviction age: it must never wrap (a
+        // wrapped seq would sort the NEWEST record first and evict it). A u64
+        // cannot realistically run out; if it ever did, fail closed before
+        // evicting anything.
+        let (seq, Some(next_seq)) = (self.next_seq, self.next_seq.checked_add(1)) else {
+            return TakeReservation::Capacity;
+        };
         if self.held.get(principal).copied().unwrap_or(0) >= self.per_principal
             && !self.evict_oldest_settled(Some(principal))
         {
@@ -456,8 +483,7 @@ impl TakeStore {
             return TakeReservation::Capacity;
         }
         let op = crate::command::OperationId::new();
-        let seq = self.next_seq;
-        self.next_seq = self.next_seq.wrapping_add(1);
+        self.next_seq = next_seq;
         self.by_op.insert(op.as_str().to_owned(), key.to_owned());
         *self.held.entry(principal.to_owned()).or_insert(0) += 1;
         self.by_key.insert(
@@ -768,9 +794,10 @@ async fn relay_one(
     // The feed to persist rides the outcome itself, so an `applied` persists
     // whether or not this process still holds the take's record. An
     // audio-only take (its record says so) keeps the persisted video.
-    // A boot take (operation id `boot-…`) re-applies the persisted state at
-    // run start: there is nothing new to persist.
-    if outcome.outcome == "applied" && !outcome.operation_id.starts_with(BOOT_TAKE_PREFIX) {
+    // A boot take (operation id `boot:…`, see [`is_boot_take`]) re-applies the
+    // persisted state at run start: its outcome is NEVER persisted (applied or
+    // not), so it can neither rewrite nor delete the operator's row.
+    if outcome.outcome == "applied" && !is_boot_take(&outcome.operation_id) {
         let audio_only = settled.as_ref().is_some_and(|p| p.feed.is_none());
         let feed = if audio_only {
             None
@@ -1065,6 +1092,43 @@ mod tests {
         // A replay of an evicted key is a new take (the documented trade-off).
         assert_eq!(store.by_key.len(), 4);
         assert!(store.held.len() <= 4, "per-principal counts are bounded");
+    }
+
+    /// PR #352 review (MEDIUM, abuse): the eviction age is the reservation
+    /// order and never wraps — near `u64::MAX` the oldest settled record by
+    /// reservation (not by settling) is evicted, and an exhausted sequence
+    /// fails closed (`idempotency-capacity`) without evicting anything.
+    #[test]
+    fn eviction_follows_reservation_order_and_the_age_never_wraps() {
+        let mut store = TakeStore::starting_at(3, 3, u64::MAX - 4);
+        let k0 = fresh(&mut store, "k0", "p");
+        fresh(&mut store, "k1", "p");
+        let k2 = fresh(&mut store, "k2", "p");
+        // Settled newest-first: reservation order, not settling order, wins.
+        settle(&mut store, &k2);
+        settle(&mut store, &k0);
+        fresh(&mut store, "k3", "p");
+        assert!(
+            store.replay("k0").is_none(),
+            "the oldest reserved settled goes"
+        );
+        assert!(store.replay("k2").is_some());
+        assert_eq!(store.next_seq, u64::MAX);
+        // The sequence is exhausted: fail closed, nothing evicted (a wrap
+        // would give the next record age 0, the oldest of all).
+        assert_eq!(
+            store.reserve("k4", "p", pending_take()),
+            TakeReservation::Capacity
+        );
+        for key in ["k1", "k2", "k3"] {
+            assert!(store.replay(key).is_some(), "{key} kept");
+        }
+        assert_eq!(store.by_key.len(), 3);
+        // A replay still answers from its record.
+        assert!(matches!(
+            store.reserve("k2", "p", pending_take()),
+            TakeReservation::Replay(_)
+        ));
     }
 
     #[test]

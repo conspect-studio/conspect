@@ -104,6 +104,61 @@ describe('OutputAudioRow', () => {
     expect(screen.getByTestId('output-audio-no-tracks')).toBeInTheDocument();
   });
 
+  it('selects and labels what is on air (effective_audio), noting a different configured audio', () => {
+    // Configured `{source: x}`, but the engine carries the program mix (a
+    // refused start-up take): the select shows the live value.
+    const drifted: OutputRouteState = {
+      ...followRow,
+      audio: { source: 'x' } as unknown as OutputRouteState['audio'],
+      effective_audio: 'program' as unknown as OutputRouteState['effective_audio'],
+    };
+    const { unmount } = renderWithProviders(
+      <OutputAudioRow output="out-1" outputName="Out 1" route={drifted} sources={sources} tracks={['eng']} />,
+    );
+    const select = screen.getByLabelText(/Audio feed for Out 1/);
+    expect(select).toHaveValue('program');
+    expect(screen.getByTestId('output-audio')).toHaveTextContent('Program mix');
+    expect(screen.getByTestId('output-configured-audio')).toHaveTextContent('configured: Camera X (not on air)');
+    unmount();
+    // On air a track and a source the page does not list; configured `none`.
+    for (const [effective, key, label] of [
+      [{ tracks: ['eng'] }, 'track:eng', 'eng'],
+      [{ source: 'cam9' }, 'src:cam9', 'cam9'],
+      ['none', 'none', 'Silence'],
+    ] as const) {
+      const row: OutputRouteState = {
+        ...followRow,
+        audio: (key === 'none' ? 'program' : 'none') as unknown as OutputRouteState['audio'],
+        effective_audio: effective as unknown as OutputRouteState['effective_audio'],
+      };
+      const r = renderWithProviders(
+        <OutputAudioRow output="out-1" outputName="Out 1" route={row} sources={sources} tracks={['eng']} />,
+      );
+      expect(screen.getByLabelText(/Audio feed for Out 1/)).toHaveValue(key);
+      expect(screen.getByTestId('output-audio')).toHaveTextContent(label);
+      expect(screen.getByTestId('output-configured-audio')).toHaveTextContent(/configured: .* \(not on air\)/);
+      r.unmount();
+    }
+    // Configured `follow` carrying what follow resolves to: still `follow`,
+    // no note; `follow` on Preview carries the PVW source.
+    for (const [video, effective] of [
+      [{ source: 'x' }, { source: 'x' }],
+      [{ bus: 'preview' }, 'preview_source'],
+    ] as const) {
+      const row: OutputRouteState = {
+        ...followRow,
+        video: video as unknown as OutputRouteState['video'],
+        effective_audio: effective as unknown as OutputRouteState['effective_audio'],
+      };
+      const r = renderWithProviders(
+        <OutputAudioRow output="out-1" outputName="Out 1" route={row} sources={sources} tracks={['eng']} />,
+      );
+      expect(screen.getByLabelText(/Audio feed for Out 1/)).toHaveValue('follow');
+      expect(screen.queryByTestId('output-configured-audio')).toBeNull();
+      r.unmount();
+    }
+  });
+
   it('plans stream audio, shows the cost line, and posts the audio-only take', async () => {
     renderWithProviders(
       <OutputAudioRow output="out-1" outputName="Out 1" route={followRow} sources={sources} tracks={['eng']} />,

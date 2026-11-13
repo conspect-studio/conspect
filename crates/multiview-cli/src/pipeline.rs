@@ -3704,7 +3704,7 @@ impl Pipeline {
                 continue;
             }
             let take = crate::output_routing::OutputTake {
-                operation_id: format!("boot-audio:{output}"),
+                operation_id: format!("{}{output}", crate::output_routing::BOOT_AUDIO_TAKE_PREFIX),
                 output_index: index,
                 bus: None,
                 audio: Some(choice.clone()),
