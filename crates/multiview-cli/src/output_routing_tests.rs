@@ -4250,6 +4250,19 @@ fn plan_slot_reports_the_cheapest_path() {
     assert_eq!(path("tall", &cam), (PlanPath::P3, 1, true));
     // Take `tall` to the source: its (src:cam@format, settings) key goes live.
     x.h.try_take(take("t", 1, src())).unwrap();
-    take_until_applied(&mut x, &["t"], 6);
+    let mut now = take_until_applied(&mut x, &["t"], 6);
     assert_eq!(path("tall2", &cam), (PlanPath::P1, 0, false));
+    // Review M5: the readback agrees with the plan. `tall`, carried by its
+    // live (picture, format, settings) key, reads back P1 (not P3); a second
+    // output taken onto that live key reads back P1 too.
+    assert_eq!(adapter.current_path("tall"), Some(PlanPath::P1));
+    for _ in 0..FORCE_FLOOR_TICKS {
+        x.tick(now);
+        now += 1;
+    }
+    x.h.try_take(take("t2", 2, src())).unwrap();
+    take_until_applied(&mut x, &["t2"], now);
+    assert_eq!(adapter.current_path("tall2"), Some(PlanPath::P1));
+    // An output still on Program reads back P1 (its base key).
+    assert_eq!(adapter.current_path("wide"), Some(PlanPath::P1));
 }

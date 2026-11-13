@@ -148,6 +148,39 @@ fn take_audio(audio: Option<&RoutedAudio>, program_audio: bool) -> Option<AudioC
     }
 }
 
+/// Whether an encoded bus with key (picture, format, settings) — the key
+/// `run_output` would use for `feed` — is carried by a live key (§4.3,
+/// §12.4 P1): an output with the same settings carries it at the same feed
+/// name, or a live (lingering) encoder for (feed name, settings) runs. The one predicate behind the plan's +0
+/// and the readback's P1 (#342 review M5).
+fn carried_by_live_key(
+    handle: &OutputRoutingHandle,
+    snapshot: &crate::output_routing::RoutingSnapshot,
+    run_output: &crate::output_routing::RunOutput,
+    feed: &RoutedFeed,
+) -> bool {
+    let bus = feed.bus_name();
+    // #342: a routed source/PVW is encoded at the output's feed format, so
+    // its key is (bus@format, settings); Program/Clean stay the bus.
+    let routed = matches!(feed, RoutedFeed::Source(_) | RoutedFeed::Preview);
+    let key_name = |format: Option<crate::routing_aux::AuxFormat>| -> String {
+        if routed {
+            crate::routing_aux::feed_name(&picture_bus(feed), format)
+        } else {
+            bus.clone()
+        }
+    };
+    let wanted = key_name(run_output.feed_format);
+    handle.outputs().iter().enumerate().any(|(i, o)| {
+        o.settings == run_output.settings
+            && key_name(o.feed_format) == wanted
+            && snapshot.outputs.get(i).is_some_and(|v| v.bus == bus)
+    }) || snapshot
+        .live_keys
+        .iter()
+        .any(|(b, settings)| *b == wanted && *settings == run_output.settings)
+}
+
 /// Outcomes buffered between the engine and the control relay.
 const RELAY_CAPACITY: usize = 64;
 
@@ -253,32 +286,8 @@ impl OutputRouting for OutputRoutingAdapter {
             return Err(PlanRefusal::SwitcherRequired);
         }
         let snapshot = handle.snapshot();
-        let bus = feed.bus_name();
-        // #342: a routed source/PVW is encoded at the output's feed format,
-        // so its key is (bus@format, settings); Program/Clean stay the bus.
-        let routed = matches!(feed, RoutedFeed::Source(_) | RoutedFeed::Preview);
-        let key_name = |format: Option<crate::routing_aux::AuxFormat>| -> String {
-            if routed {
-                crate::routing_aux::feed_name(&picture_bus(feed), format)
-            } else {
-                bus.clone()
-            }
-        };
-        let wanted = key_name(run_output.feed_format);
-        // +0 when the feed is Program (the base encoder), another output
-        // with the same settings already carries this bus, or a live encoder
-        // for (bus, settings) still runs (a lingering one is reused by the
-        // take): encode once per (bus, settings), §4.3.
         let shared = *feed == RoutedFeed::Program
-            || handle.outputs().iter().enumerate().any(|(i, o)| {
-                o.settings == run_output.settings
-                    && key_name(o.feed_format) == wanted
-                    && snapshot.outputs.get(i).is_some_and(|v| v.bus == bus)
-            })
-            || snapshot
-                .live_keys
-                .iter()
-                .any(|(b, settings)| *b == wanted && *settings == run_output.settings);
+            || carried_by_live_key(&handle, &snapshot, run_output, feed);
         Ok(PlanCost {
             needs_encoder: !shared,
             sessions_in_use: snapshot
@@ -333,13 +342,20 @@ impl OutputRouting for OutputRoutingAdapter {
         let run_output = handle.outputs().get(index)?.clone();
         let snapshot = handle.snapshot();
         let feed = RoutedFeed::from_bus_name(&snapshot.outputs.get(index)?.bus)?;
-        Some(if feed == RoutedFeed::Program {
-            PlanPath::P1
-        } else if is_identity(&handle, &run_output, &feed) {
-            PlanPath::P2
-        } else {
-            PlanPath::P3
-        })
+        // P1 exactly when the plan would say +0 for this feed (#342 review
+        // M5): Program (its base key) or a live key of its own (feed name,
+        // settings) carries the output's current bus.
+        Some(
+            if feed == RoutedFeed::Program
+                || carried_by_live_key(&handle, &snapshot, &run_output, &feed)
+            {
+                PlanPath::P1
+            } else if is_identity(&handle, &run_output, &feed) {
+                PlanPath::P2
+            } else {
+                PlanPath::P3
+            },
+        )
     }
 
     fn plan_audio(
