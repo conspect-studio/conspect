@@ -446,6 +446,52 @@ fn a_routing_row_bus_edit_keeps_the_api_set_audio_feed() {
     assert_eq!(out.audio, api_audio);
 }
 
+/// `routing.max_aux_canvases` (PR 383) is a scalar: a file edit of it lands,
+/// and a file edit elsewhere in `[routing]` keeps the accepted value.
+#[test]
+fn a_routing_max_aux_canvases_edit_lands_and_other_edits_keep_it() {
+    use multiview_config::routing::{OutputBus, RoutingTable};
+    let table = |bus: OutputBus, max: Option<usize>| {
+        let mut table: RoutingTable =
+            toml::from_str("[[output]]\noutput = \"restream\"\n").unwrap();
+        table.output[0].bus = bus;
+        table.max_aux_canvases = max;
+        table
+    };
+    let base = parse(&accepted());
+    let with = |t: RoutingTable| {
+        let mut c = base.clone();
+        c.routing = Some(t);
+        c
+    };
+    // The file changes only the limit: it lands.
+    let merged = merge_file_edit(
+        &with(table(OutputBus::Program, None)),
+        &with(table(OutputBus::Program, Some(4))),
+        &with(table(OutputBus::Preview, None)),
+    );
+    let r = merged.routing.as_ref().unwrap();
+    assert_eq!(r.max_aux_canvases, Some(4), "the file's limit lands");
+    assert_eq!(
+        r.output[0].bus,
+        OutputBus::Preview,
+        "the accepted row stays"
+    );
+    // The file changes only a row: the accepted limit stays.
+    let merged = merge_file_edit(
+        &with(table(OutputBus::Program, None)),
+        &with(table(OutputBus::Preview, None)),
+        &with(table(OutputBus::Program, Some(3))),
+    );
+    let r = merged.routing.as_ref().unwrap();
+    assert_eq!(r.max_aux_canvases, Some(3), "the accepted limit stays");
+    assert_eq!(
+        r.output[0].bus,
+        OutputBus::Preview,
+        "the file's row edit lands"
+    );
+}
+
 /// Review L1 round 4: a graphics channel is merged field by field. A file
 /// rename keeps the API-set rundown.
 #[test]

@@ -468,11 +468,18 @@ fn merge_routing(
             |x| x.output.clone(),
             fields,
         ),
+        // A scalar setting: the file's edit wins only when the file changed it.
+        max_aux_canvases: section(
+            &p.max_aux_canvases,
+            &n.max_aux_canvases,
+            &a.max_aux_canvases,
+        ),
     };
     let none = merged.video.is_empty()
         && merged.audio.is_empty()
         && merged.subtitle.is_empty()
-        && merged.output.is_empty();
+        && merged.output.is_empty()
+        && merged.max_aux_canvases.is_none();
     (!none).then_some(merged)
 }
 
