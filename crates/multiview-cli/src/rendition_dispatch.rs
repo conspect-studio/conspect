@@ -1940,6 +1940,32 @@ impl RenditionDispatcher {
     pub(crate) fn take_move_outcomes(&mut self) -> Vec<MoveOutcome> {
         self.outcomes.drain(..).collect()
     }
+    /// Drop the output's pending video move without a replacement (pushes
+    /// `Superseded`). Returns whether one was pending. Used when the move
+    /// cannot be cancelled by re-asserting the output's current key (that
+    /// key already failed/retired).
+    pub(crate) fn cancel_video_move(&mut self, output_index: usize) -> bool {
+        let Some(b) = self
+            .bindings
+            .iter_mut()
+            .find(|b| b.output_index == output_index)
+        else {
+            return false;
+        };
+        if b.mv.take().is_none() {
+            return false;
+        }
+        push_outcome(&mut self.outcomes, MoveOutcome::Superseded { output_index });
+        self.reconcile_audio_gates();
+        true
+    }
+    /// The destination key of the output's pending video move, if any.
+    pub(crate) fn pending_video_move(&self, output_index: usize) -> Option<usize> {
+        self.bindings
+            .iter()
+            .find(|b| b.output_index == output_index)
+            .and_then(|b| b.mv.map(|m| m.key))
+    }
     /// The video key an output currently reads (test observation; the router
     /// tracks its own bindings from the move outcomes).
     #[cfg(test)]
@@ -2151,6 +2177,21 @@ impl RenditionDispatcher {
         self.bindings
             .iter()
             .find(|b| b.output_index == output_index)
+            .and_then(|b| b.audio_key)
+    }
+    /// Whether the output's binding has a program-audio slot (track 0), the
+    /// slot a routed audio feed rides (ADR-0108 §5.5).
+    pub(crate) fn has_program_audio(&self, output_index: usize) -> bool {
+        self.bindings
+            .iter()
+            .any(|b| b.output_index == output_index && b.audio_tracks.contains(&0))
+    }
+    /// The dynamic audio stage the output's program-audio slot reads now
+    /// (`None` = the shared program stage, or no program-audio slot).
+    pub(crate) fn audio_slot_key(&self, output_index: usize) -> Option<usize> {
+        self.bindings
+            .iter()
+            .find(|b| b.output_index == output_index && b.audio_tracks.contains(&0))
             .and_then(|b| b.audio_key)
     }
     /// True for an unknown, failed or retired dynamic audio stage.

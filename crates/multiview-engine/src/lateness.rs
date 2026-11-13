@@ -120,6 +120,90 @@ fn coarse_of(fine: &[u64; FINE_LATENESS_BUCKETS]) -> [u64; LATENESS_BUCKETS] {
     coarse
 }
 
+/// The per-tick phase histograms of the Program loop (#311 reopen): where a
+/// tick's emit lateness comes from. Each is a [`TickLateness`] recording a
+/// duration (`record(end, start)`), so they share its fine buckets.
+///
+/// * `wake` — time right after the pacer's wait returns, minus the tick's
+///   deadline (OS wake latency plus any CPU-starvation of the clock thread).
+/// * `compose` — the whole fresh-tick body: the frame-boundary control hook
+///   (`before_compose`) through `publish_state`. Emit lateness of a fresh
+///   tick is roughly `wake + compose`.
+/// * `hook`, `composite`, `after`, `project` — the four parts of `compose`:
+///   `before_compose`, `CompositorDrive::compose`, `after_compose`, and the
+///   state projection plus `publish_state`.
+///
+/// Recording is a time-source read plus a few relaxed atomics per phase — no
+/// lock, no allocation (invariant #1).
+#[derive(Debug, Default)]
+pub struct TickPhases {
+    /// Wake lateness: wait return minus deadline.
+    pub wake: TickLateness,
+    /// `before_compose` through `publish_state`.
+    pub compose: TickLateness,
+    /// `before_compose` (the frame-boundary control hook).
+    pub hook: TickLateness,
+    /// `CompositorDrive::compose` (sample + composite).
+    pub composite: TickLateness,
+    /// `after_compose` (switcher commit, preview tap, routing aux offer).
+    pub after: TickLateness,
+    /// The state projection (`state_of`) plus `publish_state`.
+    pub project: TickLateness,
+}
+
+/// A point-in-time copy of [`TickPhases`] (cumulative).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PhasesSnapshot {
+    /// See [`TickPhases::wake`].
+    pub wake: LatenessSnapshot,
+    /// See [`TickPhases::compose`].
+    pub compose: LatenessSnapshot,
+    /// See [`TickPhases::hook`].
+    pub hook: LatenessSnapshot,
+    /// See [`TickPhases::composite`].
+    pub composite: LatenessSnapshot,
+    /// See [`TickPhases::after`].
+    pub after: LatenessSnapshot,
+    /// See [`TickPhases::project`].
+    pub project: LatenessSnapshot,
+}
+
+impl TickPhases {
+    /// A fresh shared set.
+    #[must_use]
+    pub fn shared() -> Arc<Self> {
+        Arc::new(Self::default())
+    }
+
+    /// The cumulative counters now.
+    #[must_use]
+    pub fn snapshot(&self) -> PhasesSnapshot {
+        PhasesSnapshot {
+            wake: self.wake.snapshot(),
+            compose: self.compose.snapshot(),
+            hook: self.hook.snapshot(),
+            composite: self.composite.snapshot(),
+            after: self.after.snapshot(),
+            project: self.project.snapshot(),
+        }
+    }
+}
+
+impl PhasesSnapshot {
+    /// The counts recorded since `earlier` (a window).
+    #[must_use]
+    pub fn since(&self, earlier: &Self) -> Self {
+        Self {
+            wake: self.wake.since(&earlier.wake),
+            compose: self.compose.since(&earlier.compose),
+            hook: self.hook.since(&earlier.hook),
+            composite: self.composite.since(&earlier.composite),
+            after: self.after.since(&earlier.after),
+            project: self.project.since(&earlier.project),
+        }
+    }
+}
+
 /// The upper edge (ns) of the bucket holding quantile `permille`/1000 over
 /// `buckets` with upper `edges` (the last bucket is the overflow).
 fn quantile_over(buckets: &[u64], edges: &[u64], permille: u64) -> Option<u64> {

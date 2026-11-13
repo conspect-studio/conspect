@@ -217,6 +217,13 @@ impl<P: Pacer> MultiviewProgram<P> {
         self.runtime.lateness()
     }
 
+    /// The program's wait-free per-tick phase histograms (wake latency and
+    /// compose phases, #311).
+    #[must_use]
+    pub fn phases(&self) -> std::sync::Arc<crate::lateness::TickPhases> {
+        self.runtime.phases()
+    }
+
     /// The program's wait-free cumulative repeats counter.
     #[must_use]
     pub fn frames_repeated_counter(&self) -> std::sync::Arc<std::sync::atomic::AtomicU64> {
