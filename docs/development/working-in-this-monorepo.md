@@ -111,9 +111,9 @@ the task, not just after an ENOSPC failure.
   Otherwise do not start another large build, dependency install or fan-out. Reclaim verified
   disposable task artifacts, reduce concurrency, or arrange capacity first. Recheck during long
   runs and between waves.
-- The local push gate (`bin/check`) enforces its own hard floor, `MIN_FREE` = 300 GiB free, and a
+- The local push gate (`bin/check`) enforces its own hard floor, `MIN_FREE` = 150 GiB free, and a
   15 GiB cap on its own targets. That floor is deliberately lower than the planning rule above
-  (owner decision, 2026-11-11): the build host disk is shared with other repositories, whose
+  (owner decision, 2026-11-11; lowered again from 300 to 150 GiB on 2026-11-13, when free space sat at 277-313 GiB for hours and blocked every gate while each gate needs about 15 GiB): the build host disk is shared with other repositories, whose
   activity moved free space by more than 60 GiB within an hour and aborted gates mid-run. The
   planning rule still applies before any fan-out or several concurrent build lanes; run gates
   one at a time.
