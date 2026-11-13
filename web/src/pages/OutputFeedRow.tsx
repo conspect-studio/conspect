@@ -38,7 +38,7 @@ import { subscribeRealtime } from '../realtime/shared';
 export interface FeedChoice {
   readonly key: string;
   readonly label: string;
-  readonly group: 'buses' | 'players' | 'generators' | 'sources';
+  readonly group: 'buses' | 'layouts' | 'players' | 'generators' | 'sources';
   readonly disabledReason?: string | undefined;
 }
 
@@ -185,6 +185,9 @@ export function OutputFeedRow({
     if (onAir !== undefined && 'source' in onAir && !all.some((c) => c.key === onAirKey)) {
       all.push({ key: onAirKey, label: onAir.source, group: 'sources' });
     }
+    if (onAir !== undefined && 'layout' in onAir && !all.some((c) => c.key === onAirKey)) {
+      all.push({ key: onAirKey, label: onAir.layout, group: 'layouts' });
+    }
     return all;
   }, [choices, onAirKey, t]);
 
@@ -252,9 +255,22 @@ export function OutputFeedRow({
   const costLine =
     cost === undefined
       ? undefined
-      : cost.new_encoders === 0
-        ? t`+0 encoders`
-        : t`+1 encoder`;
+      : cost.new_aux_canvases === 1
+        ? cost.new_encoders === 0
+          ? t`+0 encoders, +1 layout canvas`
+          : t`+1 encoder, +1 layout canvas`
+        : cost.new_encoders === 0
+          ? t`+0 encoders`
+          : t`+1 encoder`;
+  // Which audio the output carries on the planned feed when audio follows.
+  const plannedAudio =
+    cost?.follow_audio === 'program'
+      ? t`Audio follows: program mix`
+      : cost?.follow_audio === 'source'
+        ? t`Audio follows: this source's own audio`
+        : cost?.follow_audio === 'preview'
+          ? t`Audio follows: the preview source's audio`
+          : undefined;
   const feedLabel = allChoices.find((c) => c.key === selected)?.label ?? selected;
   const sessionsRaw = cost?.encoder_sessions ?? undefined;
   const sessions = (() => {
@@ -292,10 +308,15 @@ export function OutputFeedRow({
       const id = current.source;
       return t`direct: ${id}`;
     }
+    if (current !== undefined && 'layout' in current) {
+      const id = current.layout;
+      return t`layout: ${id}`;
+    }
     return t`Hidden`;
   })();
   const groups: readonly (readonly [FeedChoice['group'], string])[] = [
     ['buses', t`Buses`],
+    ['layouts', t`Layouts`],
     ['players', t`Players`],
     ['generators', t`Generators`],
     ['sources', t`Sources`],
@@ -345,7 +366,9 @@ export function OutputFeedRow({
               const label =
                 'source' in configuredNote
                   ? configuredNote.source
-                  : allChoices.find((c) => c.key === feedKey(configuredNote))?.label ?? configuredNote.bus;
+                  : 'layout' in configuredNote
+                    ? (allChoices.find((c) => c.key === feedKey(configuredNote))?.label ?? configuredNote.layout)
+                    : (allChoices.find((c) => c.key === feedKey(configuredNote))?.label ?? configuredNote.bus);
               return t`configured: ${label} (not on air)`;
             })()}
           </span>
@@ -369,6 +392,11 @@ export function OutputFeedRow({
           ) : (
             <Trans>{feedLabel} → {costLine} ({sessions})</Trans>
           )}
+        </p>
+      ) : null}
+      {plannedAudio !== undefined ? (
+        <p className="break-words text-xs text-muted-foreground" data-testid="output-plan-audio">
+          {plannedAudio}
         </p>
       ) : null}
       <div className="flex flex-wrap items-start gap-2">
