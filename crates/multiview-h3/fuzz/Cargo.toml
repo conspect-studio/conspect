@@ -1,0 +1,45 @@
+[package]
+name = "multiview-h3-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+multiview-h3 = { path = "..", features = ["fuzzing"] }
+
+# Outside the main workspace (listed in the root `exclude`).
+[workspace]
+members = ["."]
+
+# The vendored transports the main workspace patches in.
+[patch.crates-io]
+web-transport-trait = { path = "../../../vendor/web-transport-trait" }
+moq-tokio = { path = "../../../vendor/moq-tokio" }
+moq-net = { path = "../../../vendor/moq-net" }
+web-transport-moq = { path = "../../../vendor/web-transport-moq" }
+rustls-platform-verifier = { path = "../../../vendor/rustls-platform-verifier" }
+
+[[bin]]
+name = "header_guard"
+path = "fuzz_targets/header_guard.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "capsule"
+path = "fuzz_targets/capsule.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "h3_request"
+path = "fuzz_targets/h3_request.rs"
+test = false
+doc = false
+bench = false

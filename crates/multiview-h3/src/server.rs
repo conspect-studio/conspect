@@ -39,11 +39,35 @@ pub const CONNECTION_SPECIFIC: [&str; 5] = [
     "upgrade",
 ];
 
+/// The receive half of a request stream, type-erased so the request body
+/// does not name the transport (the fuzz harness uses an in-memory one).
+trait RecvSide: Send {
+    fn poll_data(&mut self, cx: &mut Context<'_>) -> Poll<Result<Option<Bytes>, BoxError>>;
+    fn poll_trailers(&mut self, cx: &mut Context<'_>) -> Poll<Result<Option<http::HeaderMap>, BoxError>>;
+}
+
+impl<S> RecvSide for RequestStream<S, Bytes>
+where
+    S: h3::quic::RecvStream + Send,
+{
+    fn poll_data(&mut self, cx: &mut Context<'_>) -> Poll<Result<Option<Bytes>, BoxError>> {
+        match ready!(self.poll_recv_data(cx)) {
+            Ok(Some(mut buf)) => Poll::Ready(Ok(Some(buf.copy_to_bytes(buf.remaining())))),
+            Ok(None) => Poll::Ready(Ok(None)),
+            Err(err) => Poll::Ready(Err(Box::new(err))),
+        }
+    }
+
+    fn poll_trailers(&mut self, cx: &mut Context<'_>) -> Poll<Result<Option<http::HeaderMap>, BoxError>> {
+        self.poll_recv_trailers(cx).map_err(|err| -> BoxError { Box::new(err) })
+    }
+}
+
 /// The h3 request body: streams DATA frames on demand (one chunk per poll,
 /// nothing buffered beyond it; backpressure is QUIC flow control), then the
 /// trailers if any.
 pub struct RequestBody {
-    stream: Option<H3Recv>,
+    stream: Option<Box<dyn RecvSide>>,
     data_done: bool,
 }
 
@@ -57,9 +81,12 @@ impl std::fmt::Debug for RequestBody {
 }
 
 impl RequestBody {
-    fn new(stream: H3Recv) -> Self {
+    pub(crate) fn new<S>(stream: RequestStream<S, Bytes>) -> Self
+    where
+        S: h3::quic::RecvStream + Send + 'static,
+    {
         Self {
-            stream: Some(stream),
+            stream: Some(Box::new(stream)),
             data_done: false,
         }
     }
@@ -87,24 +114,21 @@ impl Body for RequestBody {
             return Poll::Ready(None);
         };
         if !this.data_done {
-            match ready!(stream.poll_recv_data(cx)) {
-                Ok(Some(mut buf)) => {
-                    let data = buf.copy_to_bytes(buf.remaining());
-                    return Poll::Ready(Some(Ok(Frame::data(data))));
-                }
+            match ready!(stream.poll_data(cx)) {
+                Ok(Some(data)) => return Poll::Ready(Some(Ok(Frame::data(data)))),
                 Ok(None) => this.data_done = true,
                 Err(err) => {
                     this.stream = None;
-                    return Poll::Ready(Some(Err(Box::new(err))));
+                    return Poll::Ready(Some(Err(err)));
                 }
             }
         }
-        let res = ready!(stream.poll_recv_trailers(cx));
+        let res = ready!(stream.poll_trailers(cx));
         this.stream = None;
         match res {
             Ok(Some(trailers)) => Poll::Ready(Some(Ok(Frame::trailers(trailers)))),
             Ok(None) => Poll::Ready(None),
-            Err(err) => Poll::Ready(Some(Err(Box::new(err)))),
+            Err(err) => Poll::Ready(Some(Err(err))),
         }
     }
 
@@ -486,7 +510,7 @@ async fn handle_request(shared: Arc<Shared>, req: http::Request<()>, mut stream:
 /// Converts the h3 request for the [`Site`]: `host` from `:authority` when
 /// absent (h3 already moved the pseudo-headers into method/uri/extensions),
 /// version HTTP/3.
-fn site_request(req: http::Request<()>, body: RequestBody) -> http::Request<RequestBody> {
+pub(crate) fn site_request(req: http::Request<()>, body: RequestBody) -> http::Request<RequestBody> {
     let (mut parts, ()) = req.into_parts();
     if !parts.headers.contains_key(http::header::HOST) {
         if let Some(value) = parts

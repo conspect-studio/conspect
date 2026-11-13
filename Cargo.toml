@@ -8,7 +8,7 @@ rustls-platform-verifier = { path = "vendor/rustls-platform-verifier" }
 [workspace]
 resolver = "2"
 members = ["crates/*", "xtask"]
-exclude = ["vendor/moq-net", "vendor/web-transport-moq", "vendor/web-transport-trait", "vendor/moq-tokio"]
+exclude = ["vendor/moq-net", "vendor/web-transport-moq", "vendor/web-transport-trait", "vendor/moq-tokio", "crates/multiview-h3/fuzz"]
 
 [workspace.package]
 version = "0.1.0"
