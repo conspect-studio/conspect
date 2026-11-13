@@ -1,6 +1,6 @@
 # Production desk
 
-The desktop desk uses the viewport as its working area at widths of 1280 px or more and heights of 700 px or more. Program and Preview share the top row. The source wall occupies the next row; twelve sources use six columns, and thirteen through twenty-four use eight. Two compact bus banks and CUT/AUTO remain beneath the wall. Smaller or zoomed viewports retain document flow rather than clipping controls.
+The desktop desk uses the viewport as its working area at widths of 1280 px or more and heights of 600 px or more. Program and Preview share the top row. The source wall occupies the next row; twelve sources use six columns, and thirteen through twenty-four use eight. Two compact bus banks and CUT/AUTO remain beneath the wall. Smaller or zoomed viewports retain document flow rather than clipping controls.
 
 Click or keyboard-activate a source tile to select Preview. This uses the same plan, source eligibility, freshness and in-flight guard as the Preview bus. Direct Program taps still confirm. Locked CUT/AUTO still confirm once. Tally remains engine-confirmed and independent from signal state.
 

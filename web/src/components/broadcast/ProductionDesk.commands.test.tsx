@@ -76,13 +76,14 @@ describe('ProductionDesk single-authority completion', { timeout: 15000 }, () =>
     );
     page();
     const tile = await screen.findByRole('button', { name: 'Preview CAM 3' });
-    await waitFor(() => { expect(tile).not.toBeDisabled(); }, { timeout: 6000 });
+    await waitFor(() => { expect(tile).toHaveAttribute('aria-disabled', 'false'); }, { timeout: 6000 });
     tile.focus();
     await userEvent.keyboard('{Enter}');
     await waitFor(() => { expect(commandCount).toBe(1); });
     expect(body).toMatchObject({ action: 'select_preview', source: 'cam-3' });
     expect(screen.queryByRole('button', { name: 'Confirm take' })).not.toBeInTheDocument();
-    expect(tile).toBeDisabled();
+    expect(tile).toHaveAttribute('aria-disabled', 'true');
+    expect(tile).toHaveAccessibleDescription(/Signal unconfirmed/);
     await userEvent.click(tile);
     expect(commandCount).toBe(1);
   });
