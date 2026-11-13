@@ -526,7 +526,31 @@ pub enum DnsProviderConfig {
         /// DNS propagation deadline in seconds.
         #[serde(default = "default_propagation_timeout")]
         propagation_timeout_s: u64,
+        /// How the engine confirms the TXT record before telling the CA
+        /// (`auto` by default; see [`DnsConfirm`]).
+        #[serde(default)]
+        confirm: DnsConfirm,
     },
+}
+
+/// How a DNS-01 TXT record is confirmed before the CA is told to validate.
+///
+/// Some networks intercept every outbound port-53 query (UDP and TCP) and
+/// answer it from a hijacking resolver, so asking the zone's authoritative
+/// nameservers directly can never see the record. DNS over HTTPS (RFC 8484,
+/// Cloudflare's own resolver `cloudflare-dns.com`) still works there.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum DnsConfirm {
+    /// Probe for port-53 interception (a query to documentation addresses
+    /// where nothing listens; any answer means interception): intercepted →
+    /// DNS over HTTPS, otherwise the authoritative nameservers.
+    #[default]
+    Auto,
+    /// Always ask every authoritative nameserver directly (UDP, then TCP, port 53).
+    Authoritative,
+    /// Always confirm through DNS over HTTPS at Cloudflare's resolver.
+    Doh,
 }
 
 const fn default_propagation_timeout() -> u64 {
@@ -1091,6 +1115,7 @@ impl NetworkTlsConfig {
                     email_env,
                     api_key_env,
                     propagation_timeout_s,
+                    ..
                 }),
             ) => {
                 let token = token_env.is_some();

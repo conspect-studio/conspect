@@ -25177,6 +25177,13 @@
             ],
             "description": "Sanitized token of the last failure (e.g. `ca-unavailable`)."
           },
+          "last_error_detail": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Human detail of the last failure: the CA's problem type and detail\n(with subproblems and the challenge's own error), or a short local\nexplanation (e.g. \"TXT not seen via DNS over HTTPS\"). Control\ncharacters stripped, at most 512 bytes, never a credential."
+          },
           "names": {
             "type": "array",
             "items": {

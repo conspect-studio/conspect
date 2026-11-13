@@ -218,6 +218,17 @@ impl OutputRouting for OutputRoutingAdapter {
         }
         let snapshot = handle.snapshot();
         let bus = feed.bus_name();
+        // #342: a routed source/PVW is encoded at the output's feed format,
+        // so its key is (bus@format, settings); Program/Clean stay the bus.
+        let routed = matches!(feed, RoutedFeed::Source(_) | RoutedFeed::Preview);
+        let key_name = |format: Option<crate::routing_aux::AuxFormat>| -> String {
+            if routed {
+                crate::routing_aux::feed_name(&picture_bus(feed), format)
+            } else {
+                bus.clone()
+            }
+        };
+        let wanted = key_name(run_output.feed_format);
         // +0 when the feed is Program (the base encoder), another output
         // with the same settings already carries this bus, or a live encoder
         // for (bus, settings) still runs (a lingering one is reused by the
@@ -225,12 +236,13 @@ impl OutputRouting for OutputRoutingAdapter {
         let shared = *feed == RoutedFeed::Program
             || handle.outputs().iter().enumerate().any(|(i, o)| {
                 o.settings == run_output.settings
+                    && key_name(o.feed_format) == wanted
                     && snapshot.outputs.get(i).is_some_and(|v| v.bus == bus)
             })
             || snapshot
                 .live_keys
                 .iter()
-                .any(|(b, settings)| *b == bus && *settings == run_output.settings);
+                .any(|(b, settings)| *b == wanted && *settings == run_output.settings);
         Ok(PlanCost {
             needs_encoder: !shared,
             sessions_in_use: snapshot

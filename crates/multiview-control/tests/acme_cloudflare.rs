@@ -11,8 +11,12 @@ mod acme_support;
 
 use std::time::Duration;
 
-use acme_support::{cf_router, cf_state, fixture_pki, serve_https, write_root, CfAuth, CfFault};
-use multiview_control::acme::cloudflare::{CloudflareCredential, CloudflareDns};
+use acme_support::{
+    cf_router, cf_state, fake_dns, fixture_pki, serve_https, write_root, CfAuth, CfFault, DohMode,
+    FakeDns,
+};
+use multiview_config::DnsConfirm;
+use multiview_control::acme::cloudflare::{CloudflareCredential, CloudflareDns, TestConfirm};
 use multiview_control::acme::{AcmeError, DnsProvider, TxtHandle};
 use zeroize::Zeroizing;
 
@@ -238,4 +242,130 @@ fn debug_of_the_provider_is_redacted() {
         let debug = format!("{dns:?}");
         assert!(!debug.contains("SECRET"), "{debug}");
     });
+}
+
+/// A provider whose API and `DoH` endpoint are the same fake (`state`), with
+/// the given confirmation mode, probe targets and authoritative servers.
+async fn fake_with_confirm(
+    state: &acme_support::SharedCf,
+    mode: DnsConfirm,
+    probe: Vec<std::net::SocketAddr>,
+    authoritative: Vec<std::net::SocketAddr>,
+) -> (CloudflareDns, tempfile::TempDir) {
+    let pki = fixture_pki();
+    let addr = serve_https(cf_router(state.clone()), &pki).await;
+    let tmp = tempfile::tempdir().unwrap();
+    let root = write_root(&pki, tmp.path());
+    let dns = CloudflareDns::for_tests_with_confirm(
+        CloudflareCredential::Token(Zeroizing::new("t".into())),
+        &format!("https://[::1]:{}/client/v4", addr.port()),
+        addr.port(),
+        Some(&root),
+        authoritative,
+        TestConfirm {
+            mode,
+            probe,
+            doh_url: format!("https://[::1]:{}/dns-query", addr.port()),
+            doh_port: addr.port(),
+        },
+    )
+    .unwrap();
+    (dns, tmp)
+}
+
+fn doh_state() -> acme_support::SharedCf {
+    cf_state(CfAuth::Token("t".into()), &[("example.org", ZONE_ID)], None)
+}
+
+const FQDN: &str = "_acme-challenge.a.example.org";
+
+#[tokio::test]
+async fn auto_detects_an_intercepting_resolver_and_confirms_via_doh() {
+    // The "network" answers every port-53 query itself, including those to
+    // the probe target and to the authoritative server: the record can never
+    // be seen there.
+    let (hijack, _task) = fake_dns(FakeDns::Intercepting).await;
+    let state = doh_state();
+    let (dns, _t) = fake_with_confirm(&state, DnsConfirm::Auto, vec![hijack], vec![hijack]).await;
+    dns.publish_txt(FQDN, "the-value").await.unwrap();
+    tokio::time::timeout(
+        Duration::from_secs(6),
+        dns.confirm_at_authoritative(FQDN, "the-value", Duration::from_secs(5)),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert!(state.lock().unwrap().doh_queries >= 1);
+    let detail = dns.propagation_detail().unwrap();
+    assert!(detail.contains("DNS over HTTPS"), "{detail}");
+    assert!(detail.contains("intercepted"), "{detail}");
+}
+
+#[tokio::test]
+async fn doh_that_never_shows_the_value_is_a_propagation_error() {
+    for mode in [DohMode::Empty, DohMode::Value("another-value".into())] {
+        let state = doh_state();
+        state.lock().unwrap().doh = mode.clone();
+        let (dns, _t) = fake_with_confirm(&state, DnsConfirm::Doh, Vec::new(), Vec::new()).await;
+        dns.publish_txt(FQDN, "the-value").await.unwrap();
+        let result = tokio::time::timeout(
+            Duration::from_secs(6),
+            dns.confirm_at_authoritative(FQDN, "the-value", Duration::from_secs(5)),
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.unwrap_err(), AcmeError::Propagation, "{mode:?}");
+        assert!(state.lock().unwrap().doh_queries >= 1, "{mode:?}");
+    }
+}
+
+#[tokio::test]
+async fn auto_with_a_silent_probe_uses_the_authoritative_servers() {
+    let (silent, _quiet) = fake_dns(FakeDns::Silent).await;
+    let state = doh_state();
+    // An honest authoritative server answering from the fake's records.
+    let (auth, _task) = fake_dns(FakeDns::Authoritative(state.clone())).await;
+    let (dns, _t) = fake_with_confirm(&state, DnsConfirm::Auto, vec![silent], vec![auth]).await;
+    dns.publish_txt(FQDN, "the-value").await.unwrap();
+    tokio::time::timeout(
+        Duration::from_secs(6),
+        dns.confirm_at_authoritative(FQDN, "the-value", Duration::from_secs(5)),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(state.lock().unwrap().doh_queries, 0, "DoH never asked");
+    let detail = dns.propagation_detail().unwrap();
+    assert!(detail.contains("authoritative"), "{detail}");
+}
+
+/// Review C2: only a reply to THIS probe query (QR=response, same id) from a
+/// probe target counts as interception. A stray datagram with another id, or
+/// a correct-looking reply from a peer that is not a probe target, leaves the
+/// verdict at "authoritative" (no `DoH` query at all).
+#[tokio::test]
+async fn a_probe_reply_with_the_wrong_id_or_from_elsewhere_is_not_interception() {
+    for mode in [FakeDns::WrongId, FakeDns::ReplyFromElsewhere] {
+        let label = format!("{mode:?}");
+        let (probe, _p) = fake_dns(mode).await;
+        let state = doh_state();
+        let (auth, _a) = fake_dns(FakeDns::Authoritative(state.clone())).await;
+        let (dns, _t) = fake_with_confirm(&state, DnsConfirm::Auto, vec![probe], vec![auth]).await;
+        dns.publish_txt(FQDN, "the-value").await.unwrap();
+        tokio::time::timeout(
+            Duration::from_secs(6),
+            dns.confirm_at_authoritative(FQDN, "the-value", Duration::from_secs(5)),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            state.lock().unwrap().doh_queries,
+            0,
+            "{label}: DoH never asked"
+        );
+        let detail = dns.propagation_detail().unwrap();
+        assert!(detail.contains("authoritative"), "{label}: {detail}");
+        assert!(!detail.contains("intercepted"), "{label}: {detail}");
+    }
 }
