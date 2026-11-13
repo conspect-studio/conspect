@@ -1774,3 +1774,158 @@ async fn get_without_a_readback_reports_the_live_state_unknown() {
     assert_eq!(b["live"], false, "an output without a readback: {all}");
     assert!(b["source"].is_null(), "{all}");
 }
+
+/// A repository that counts `get_layout` calls and delegates everything.
+struct CountingRepository {
+    inner: Arc<dyn multiview_control::repository::Repository>,
+    gets: std::sync::atomic::AtomicUsize,
+}
+
+impl multiview_control::repository::Repository for CountingRepository {
+    fn list_layouts(
+        &self,
+    ) -> multiview_control::error::ControlResult<Vec<multiview_control::repository::VersionedLayout>>
+    {
+        self.inner.list_layouts()
+    }
+    fn get_layout(
+        &self,
+        id: &str,
+    ) -> multiview_control::error::ControlResult<multiview_control::repository::VersionedLayout>
+    {
+        self.gets.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.inner.get_layout(id)
+    }
+    fn create_layout(
+        &self,
+        id: &str,
+        input: multiview_control::repository::LayoutInput,
+    ) -> multiview_control::error::ControlResult<multiview_control::repository::VersionedLayout>
+    {
+        self.inner.create_layout(id, input)
+    }
+    fn update_layout(
+        &self,
+        id: &str,
+        input: multiview_control::repository::LayoutInput,
+    ) -> multiview_control::error::ControlResult<multiview_control::repository::VersionedLayout>
+    {
+        self.inner.update_layout(id, input)
+    }
+    fn delete_layout(&self, id: &str) -> multiview_control::error::ControlResult<()> {
+        self.inner.delete_layout(id)
+    }
+}
+
+/// A rig whose layout repository counts its reads.
+fn counting_rig(path: &Path) -> (Rig, Arc<CountingRepository>) {
+    let mut rig = rig(path);
+    let counting = Arc::new(CountingRepository {
+        inner: Arc::clone(&rig.state.repository),
+        gets: std::sync::atomic::AtomicUsize::new(0),
+    });
+    let repository: Arc<dyn multiview_control::repository::Repository> = counting.clone();
+    rig.state.repository = repository;
+    rig.router = multiview_control::router(rig.state.clone());
+    (rig, counting)
+}
+
+/// Review T-I1: a `{layout}` request reads the stored layout exactly ONCE
+/// (off the async worker), and that one read feeds the closure authorization,
+/// the resolve and a replay's re-authorization — on `/patch/plan`,
+/// `/patch/take` (fresh and replayed), the alias take and the alias plan.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_layout_request_reads_the_stored_layout_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let (rig, counting) = counting_rig(&dir.path().join("boot.toml"));
+    store_layout(&rig, "NewsOne", "bars");
+    let gets = || counting.gets.load(std::sync::atomic::Ordering::SeqCst);
+    let body = || patch(vec![video("output-0", json!({"layout": "NewsOne"}))]);
+    let mut before = gets();
+    let mut once = |what: &str| {
+        let now = gets();
+        assert_eq!(now - before, 1, "{what}: one read per request");
+        before = now;
+    };
+    let (status, _) = plan(&rig, OPERATOR_TOKEN, body()).await;
+    assert_eq!(status, StatusCode::OK);
+    once("patch plan");
+    let (status, first) = take(&rig, OPERATOR_TOKEN, "once", body()).await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{first}");
+    once("patch take");
+    let (status, again) = take(&rig, OPERATOR_TOKEN, "once", body()).await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+    assert_eq!(again["operation_id"], first["operation_id"]);
+    once("patch take replay");
+    let status = alias_take(
+        &rig,
+        OPERATOR_TOKEN,
+        "once-alias",
+        "output-0",
+        json!({"layout": "NewsOne"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+    once("alias take");
+    let resp = send(
+        &rig.router,
+        post(
+            "/api/v1/routing/plan",
+            OPERATOR_TOKEN,
+            None,
+            &alias("output-0", json!({"layout": "NewsOne"})),
+        ),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    once("alias plan");
+    // A request without a layout never reads one.
+    let (status, _) = plan(&rig, OPERATOR_TOKEN, patch(vec![video("output-0", bars())])).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(gets(), before, "no layout, no read");
+}
+
+/// Review T-I1: the layout reads are admitted by a process-wide semaphore
+/// (`try_acquire`): with every permit held, a `{layout}` request on any
+/// slot-0 route is 503 `engine-busy` with a generic body and the repository
+/// is never called; once a permit frees, the same request proceeds.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn layout_reads_without_a_free_permit_are_503_and_never_touch_the_repository() {
+    let dir = tempfile::tempdir().unwrap();
+    let (rig, counting) = counting_rig(&dir.path().join("boot.toml"));
+    store_layout(&rig, "NewsOne", "bars");
+    let gets = || counting.gets.load(std::sync::atomic::Ordering::SeqCst);
+    let held = Arc::clone(&rig.state.layout_reads)
+        .try_acquire_many_owned(
+            u32::try_from(multiview_control::routes::output_routing::LAYOUT_READ_PERMITS).unwrap(),
+        )
+        .unwrap();
+    let body = || patch(vec![video("output-0", json!({"layout": "NewsOne"}))]);
+    let (status, problem) = plan(&rig, OPERATOR_TOKEN, body()).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{problem}");
+    assert!(
+        problem["type"].as_str().unwrap().ends_with("engine-busy"),
+        "{problem}"
+    );
+    assert!(
+        !problem.to_string().contains("NewsOne") && !problem.to_string().contains("output-0"),
+        "generic: {problem}"
+    );
+    let (status, _) = take(&rig, OPERATOR_TOKEN, "busy", body()).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    let status = alias_take(
+        &rig,
+        OPERATOR_TOKEN,
+        "busy-a",
+        "output-0",
+        json!({"layout": "NewsOne"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(gets(), 0, "the repository was never called");
+    assert_eq!(rig.fake.takes().len(), 0, "nothing reached the engine");
+    drop(held);
+    let (status, _) = take(&rig, OPERATOR_TOKEN, "busy", body()).await;
+    assert_eq!(status, StatusCode::ACCEPTED, "proceeds once a permit frees");
+    assert_eq!(gets(), 1);
+}

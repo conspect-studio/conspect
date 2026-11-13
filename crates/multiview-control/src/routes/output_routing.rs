@@ -245,15 +245,15 @@ fn authorize_bus(principal: &Principal) -> ControlResult<()> {
 /// route input once resolved by [`resolve_audio`]; `none`/`follow` →
 /// nothing beyond the video end).
 fn authorize_ends(
-    state: &AppState,
     principal: &Principal,
     req: &OutputRouteRequest,
+    layout: Option<&LayoutRead>,
 ) -> ControlResult<()> {
     authorize_output_end(principal, req.output())?;
     match &req.feed {
         None => {}
         Some(VideoFeed::Source(id)) => crate::auth::authorize_object(principal, id)?,
-        Some(VideoFeed::Layout(id)) => authorize_layout_feed(state, principal, id)?,
+        Some(VideoFeed::Layout(id)) => authorize_layout_feed(principal, id, layout)?,
         Some(VideoFeed::Bus(_)) => authorize_bus(principal)?,
         Some(_) => return Err(ControlError::Forbidden("unsupported feed kind".to_owned())),
     }
@@ -414,6 +414,96 @@ fn audio_cost_text(needs: bool) -> Option<String> {
 /// A feed refusal before the engine is asked: `(status, type, detail)`.
 pub(crate) type FeedRefusal = (u16, &'static str, String);
 
+/// Concurrent stored-layout reads the slot-0 routes admit (#342 review
+/// T-I1): the repository is synchronous (SQLite behind it, a 5 s busy
+/// timeout), so a `{layout}` flood must never park the async workers.
+pub const LAYOUT_READ_PERMITS: usize = 8;
+
+/// The process-wide layout-read admission ([`LAYOUT_READ_PERMITS`]).
+#[must_use]
+pub fn layout_read_semaphore() -> std::sync::Arc<tokio::sync::Semaphore> {
+    std::sync::Arc::new(tokio::sync::Semaphore::new(LAYOUT_READ_PERMITS))
+}
+
+/// The ONE read of a request's stored layout (#342 review T-I1): fetched
+/// once, off the async worker, before any authorization answer, and reused
+/// by the closure authorization, the resolve and a replay's
+/// re-authorization. `None` = the layout does not exist.
+#[derive(Debug, Clone)]
+pub(crate) struct LayoutRead {
+    /// The layout id the request named.
+    pub id: String,
+    /// Its stored body, `None` when no such layout exists.
+    pub body: Option<serde_json::Value>,
+}
+
+/// The stored body of layout `id` (sync; run only through
+/// [`read_layout`]): the accepted library when a boot model is installed,
+/// else the repository.
+fn fetch_layout(state: &AppState, id: &str) -> ControlResult<Option<serde_json::Value>> {
+    let versioned = match crate::routes::authoritative_layouts(state)? {
+        Some(desired) => crate::routes::authoritative_layout(&desired, id),
+        None => state.repository.get_layout(id),
+    };
+    match versioned {
+        Ok(v) => Ok(Some(v.layout.body)),
+        Err(ControlError::NotFound { .. }) => Ok(None),
+        Err(other) => Err(other),
+    }
+}
+
+/// Read a request's stored layout ONCE on `spawn_blocking`, admitted by the
+/// process-wide [`AppState::layout_reads`] semaphore (`try_acquire`): with
+/// no free permit the request is 503 `engine-busy` (generic: nothing about
+/// the layout or the output) and the repository is never called.
+///
+/// # Errors
+/// `EngineBusy` without a permit or when the blocking task fails;
+/// repository errors.
+pub(crate) async fn read_layout(state: &AppState, id: &str) -> ControlResult<LayoutRead> {
+    let Ok(permit) = std::sync::Arc::clone(&state.layout_reads).try_acquire_owned() else {
+        return Err(ControlError::EngineBusy);
+    };
+    let task_state = state.clone();
+    let task_id = id.to_owned();
+    let body = tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        fetch_layout(&task_state, &task_id)
+    })
+    .await
+    .map_err(|_| ControlError::EngineBusy)??;
+    Ok(LayoutRead {
+        id: id.to_owned(),
+        body,
+    })
+}
+
+/// The layout a video feed names, read once (`None` for any other feed),
+/// after Read on the layout id itself: a caller without it never costs a
+/// read.
+///
+/// # Errors
+/// 403 for the layout id; as [`read_layout`].
+pub(crate) async fn read_feed_layout(
+    state: &AppState,
+    principal: &Principal,
+    feed: Option<&VideoFeed>,
+) -> ControlResult<Option<LayoutRead>> {
+    match feed {
+        Some(VideoFeed::Layout(id)) => {
+            crate::auth::authorize_object(principal, id)?;
+            Ok(Some(read_layout(state, id).await?))
+        }
+        _ => Ok(None),
+    }
+}
+
+/// The pre-read body of layout `id` (`None` = no such layout). A read for
+/// another id (never by construction) fails closed as not found.
+fn layout_body<'a>(read: Option<&'a LayoutRead>, id: &str) -> Option<&'a serde_json::Value> {
+    read.filter(|r| r.id == id).and_then(|r| r.body.as_ref())
+}
+
 /// Resolve a stored layout for routing (ADR-0108 slice 3): it must exist in
 /// the accepted layouts library, parse and solve, be authored for the running
 /// canvas (the Class-1 pinned-canvas gate of `apply-layout`), and be drawable
@@ -429,36 +519,26 @@ fn resolve_layout(
     state: &AppState,
     principal: &Principal,
     id: &str,
+    read: Option<&LayoutRead>,
 ) -> ControlResult<Result<RoutedLayout, FeedRefusal>> {
-    let versioned = match crate::routes::authoritative_layouts(state)? {
-        Some(desired) => crate::routes::authoritative_layout(&desired, id),
-        None => state.repository.get_layout(id),
-    };
-    let versioned = match versioned {
-        Ok(v) => v,
-        Err(ControlError::NotFound { .. }) => {
-            return Ok(Err((
-                422,
-                "unknown-feed",
-                "the layout does not exist".to_owned(),
-            )))
-        }
-        Err(other) => return Err(other),
+    let Some(body) = layout_body(read, id) else {
+        return Ok(Err((
+            422,
+            "unknown-feed",
+            "the layout does not exist".to_owned(),
+        )));
     };
     // The closure is authorized BEFORE any parse/solve/canvas answer, so no
     // 422 detail reaches a principal who may not read every bound source.
-    authorize_document_closure(principal, &versioned.layout.body)?;
-    let resolved = match crate::command::resolve_layout_document(
-        id,
-        &versioned.layout.body,
-        state.running_canvas.as_ref(),
-    ) {
-        Ok(resolved) => resolved,
-        Err(ControlError::Validation(detail)) => {
-            return Ok(Err((422, "layout-not-admissible", detail)));
-        }
-        Err(other) => return Err(other),
-    };
+    authorize_document_closure(principal, body)?;
+    let resolved =
+        match crate::command::resolve_layout_document(id, body, state.running_canvas.as_ref()) {
+            Ok(resolved) => resolved,
+            Err(ControlError::Validation(detail)) => {
+                return Ok(Err((422, "layout-not-admissible", detail)));
+            }
+            Err(other) => return Err(other),
+        };
     authorize_layout_sources(principal, &resolved.solved)?;
     let routed = RoutedLayout {
         id: id.to_owned(),
@@ -527,31 +607,24 @@ fn authorize_document_closure(
 /// # Errors
 /// 403 for the id or an unreadable source; repository errors.
 pub(crate) fn authorize_layout_feed(
-    state: &AppState,
     principal: &Principal,
     id: &str,
+    read: Option<&LayoutRead>,
 ) -> ControlResult<()> {
     crate::auth::authorize_object(principal, id)?;
-    authorize_layout_closure(state, principal, id)
+    authorize_layout_closure(principal, id, read)
 }
 
-/// Re-authorize a recorded layout take's source closure (a replay, #342 B2):
-/// the stored layout as it is NOW. A layout that no longer exists has no
-/// closure to read: the replay answers its own recorded operation.
+/// Authorize a layout's source closure from the request's ONE pre-read body
+/// (#342 review T-I1): the stored layout as it is NOW. A layout that does
+/// not exist has no closure to read (existence answers later; a replay
+/// answers its own recorded operation).
 fn authorize_layout_closure(
-    state: &AppState,
     principal: &Principal,
     id: &str,
+    read: Option<&LayoutRead>,
 ) -> ControlResult<()> {
-    let versioned = match crate::routes::authoritative_layouts(state)? {
-        Some(desired) => crate::routes::authoritative_layout(&desired, id),
-        None => state.repository.get_layout(id),
-    };
-    match versioned {
-        Ok(v) => authorize_document_closure(principal, &v.layout.body),
-        Err(ControlError::NotFound { .. }) => Ok(()),
-        Err(other) => Err(other),
-    }
+    layout_body(read, id).map_or(Ok(()), |body| authorize_document_closure(principal, body))
 }
 
 fn closure_forbidden() -> ControlError {
@@ -566,6 +639,7 @@ pub(crate) fn resolve_feed(
     state: &AppState,
     principal: &Principal,
     feed: &VideoFeed,
+    layout: Option<&LayoutRead>,
 ) -> ControlResult<Result<(RoutedFeed, Option<LayoutBody>), FeedRefusal>> {
     let Some(routed) = RoutedFeed::of(feed) else {
         return Ok(Err((
@@ -585,7 +659,7 @@ pub(crate) fn resolve_feed(
             }
         }
         RoutedFeed::Layout(id) => {
-            return Ok(resolve_layout(state, principal, id)?.map(|layout| {
+            return Ok(resolve_layout(state, principal, id, layout)?.map(|layout| {
                 (
                     routed.clone(),
                     Some(LayoutBody(std::sync::Arc::new(layout))),
@@ -618,13 +692,18 @@ pub(crate) fn aux_capacity_text(principal: &Principal, active: usize, max: usize
 }
 
 /// `POST /api/v1/routing/plan` for an output target.
-pub(crate) fn plan_output(
+pub(crate) async fn plan_output(
     state: &AppState,
     principal: &Principal,
     req: &OutputRouteRequest,
 ) -> ControlResult<Response> {
     principal.role.require(Action::Read)?;
-    authorize_ends(state, principal, req)?;
+    // The request's ONE layout read, before any authorization answer: the
+    // closure is then authorized from it before the output lookup (T-A1,
+    // T-I1).
+    authorize_output_end(principal, req.output())?;
+    let layout = read_feed_layout(state, principal, req.feed.as_ref()).await?;
+    authorize_ends(principal, req, layout.as_ref())?;
     authorize_track_inputs(state, principal, req)?;
     let video = req.shape()?;
     let Some(control) = state.output_routing.as_ref() else {
@@ -649,7 +728,7 @@ pub(crate) fn plan_output(
     };
     let mut routed_video = None;
     if let Some(feed) = video {
-        match resolve_feed(state, principal, feed)? {
+        match resolve_feed(state, principal, feed, layout.as_ref())? {
             Err((_, kind, detail)) => refusals.push(OutputPlanRefusal {
                 kind: kind.to_owned(),
                 detail: if kind == "unknown-feed" {
@@ -890,7 +969,7 @@ fn plan_gate(
             (status = 409, description = "`routing-unavailable`, `switcher-required`, `output-kind-unroutable`, `capacity`, `aux-capacity` (no free layout canvas), `audio-unsupported` (the output has no program-audio slot for a routed audio feed, or its transport cannot select a discrete track), or `conflict` (the Idempotency-Key was first used for another output, feed or audio; nothing is enqueued).", body = crate::problem::Problem),
             (status = 422, description = "`unknown-feed` (video or audio, including an unknown layout), `layout-not-admissible` (a layout authored for another canvas, one that does not solve, or one with a translucent cell), `audio-unsupported` (more than one track: the output carries one routed audio feed), a body whose `stream` and `feed`/`audio` do not match (`stream: video` needs `feed`; `stream: audio` needs `audio` and no `feed`), or a missing Idempotency-Key.", body = crate::problem::Problem),
             (status = 429, description = "Over 2 takes/s per output or 10/s per principal; see Retry-After.", body = crate::problem::Problem),
-            (status = 503, description = "`engine-busy`: the take mailbox is full (the key is freed); or `idempotency-capacity`: the caller's (or every) take record is still pending at its cap (fails closed; pending keys still replay; settled records are evicted oldest-first otherwise).", body = crate::problem::Problem),
+            (status = 503, description = "`engine-busy`: the take mailbox is full (the key is freed), or a `{layout}` feed could not be read now (every layout-read slot is in use; nothing reserved); or `idempotency-capacity`: the caller's (or every) take record is still pending at its cap (fails closed; pending keys still replay; settled records are evicted oldest-first otherwise).", body = crate::problem::Problem),
         ),
     )
 )]
@@ -901,7 +980,11 @@ pub(crate) async fn take_output(
     Json(req): Json<OutputRouteRequest>,
 ) -> ControlResult<Response> {
     principal.role.require(Action::Write)?;
-    authorize_ends(&state, &principal, &req)?;
+    // The request's ONE layout read (T-I1), after the output end and before
+    // the closure answer (T-A1).
+    authorize_output_end(&principal, req.output())?;
+    let layout = read_feed_layout(&state, &principal, req.feed.as_ref()).await?;
+    authorize_ends(&principal, &req, layout.as_ref())?;
     authorize_track_inputs(&state, &principal, &req)?;
     let video = req.shape()?;
     let output = req.output().to_owned();
@@ -912,6 +995,7 @@ pub(crate) async fn take_output(
         &output,
         video,
         req.audio.as_ref(),
+        layout.as_ref(),
     )? {
         SlotTake::Accepted(op) => op,
         SlotTake::Replay(replay) => return Ok(replayed(replay)),
@@ -950,6 +1034,9 @@ pub(crate) enum SlotTake {
 /// # Errors
 /// Repository errors, `NotFound` for an unknown output, a missing key, a key
 /// reused for another take (409), or `idempotency-capacity`.
+#[allow(clippy::too_many_arguments)]
+// reason: the slot-0 take's inputs are the request's parts plus its ONE
+// pre-read layout (T-I1); a struct would only rename them.
 pub(crate) fn take_output_slot0(
     state: &AppState,
     principal: &Principal,
@@ -957,23 +1044,18 @@ pub(crate) fn take_output_slot0(
     output_id: &str,
     video: Option<&VideoFeed>,
     audio: Option<&AudioFeed>,
+    layout: Option<&LayoutRead>,
 ) -> ControlResult<SlotTake> {
     let Some(control) = state.output_routing.clone() else {
         return Ok(SlotTake::Refused(routing_unavailable()));
     };
-    let Some(key) = idem.0.as_deref() else {
-        return Err(ControlError::Validation(
-            "Idempotency-Key is required".into(),
-        ));
-    };
-    let key = slot0_take_key(key);
-    // A replay answers from the take's own record without re-running the
-    // take, but only for the SAME take (#342 review A1): the key is shared by
-    // both slot-0 routes, so it is bound to the (output, video, audio) it was
-    // first used for. The caller has just authorized this request's ends
-    // under the principal's current grants, so a matching replay is
-    // re-authorized; a different body is refused and nothing is enqueued.
-    if let Some(replay) = replay_slot0(state, principal, &control, &key, output_id, video, audio)? {
+    let key = slot0_key_of(idem)?;
+    // A replay answers only the SAME take (output, video, audio; review A1),
+    // re-authorized under current grants (the closure from the request's one
+    // pre-read layout); a different body is refused, nothing enqueued.
+    if let Some(replay) = replay_slot0(
+        state, principal, &control, &key, output_id, video, audio, layout,
+    )? {
         return Ok(SlotTake::Replay(replay));
     }
     let Some(output) = output_of(state, output_id)? else {
@@ -992,7 +1074,7 @@ pub(crate) fn take_output_slot0(
     }
     let (feed, layout) = match video {
         None => (None, None),
-        Some(video) => match resolve_feed(state, principal, video)? {
+        Some(video) => match resolve_feed(state, principal, video, layout)? {
             Ok((feed, layout)) => (Some(feed), layout),
             Err((status, kind, detail)) => {
                 return Ok(SlotTake::Refused(refusal_problem(status, kind, detail)))
@@ -1082,6 +1164,8 @@ pub(crate) fn take_output_slot0(
 /// # Errors
 /// `conflict` for a key first used for another take; 403 for an unreadable
 /// layout closure; repository errors.
+#[allow(clippy::too_many_arguments)]
+// reason: as `take_output_slot0`, plus the take store.
 fn replay_slot0(
     state: &AppState,
     principal: &Principal,
@@ -1090,6 +1174,7 @@ fn replay_slot0(
     output_id: &str,
     video: Option<&VideoFeed>,
     audio: Option<&AudioFeed>,
+    layout: Option<&LayoutRead>,
 ) -> ControlResult<Option<TakeReplay>> {
     let Some((replay, recorded)) = control.replay_with_take(key) else {
         return Ok(None);
@@ -1097,8 +1182,10 @@ fn replay_slot0(
     if !same_take(state, &recorded, output_id, video, audio)? {
         return Err(key_reused());
     }
+    // The recorded feed equals this request's (`same_take`), so the
+    // request's one pre-read layout is the recorded layout's body (T-I1).
     if let Some(RoutedFeed::Layout(id)) = &recorded.feed {
-        authorize_layout_closure(state, principal, id)?;
+        authorize_layout_closure(principal, id, layout)?;
     }
     Ok(Some(replay))
 }
@@ -1141,6 +1228,17 @@ fn same_take(
         },
         _ => false,
     })
+}
+
+/// The shared slot-0 take-store key of a request ([`slot0_take_key`]).
+///
+/// # Errors
+/// A missing `Idempotency-Key` (422).
+fn slot0_key_of(idem: &IdempotencyKey) -> ControlResult<String> {
+    idem.0
+        .as_deref()
+        .map(slot0_take_key)
+        .ok_or_else(|| ControlError::Validation("Idempotency-Key is required".into()))
 }
 
 /// The take-store key of a slot-0 take: the scoped `Idempotency-Key` with

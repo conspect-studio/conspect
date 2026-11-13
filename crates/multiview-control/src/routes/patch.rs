@@ -211,7 +211,11 @@ fn source_id(source: &Value) -> Option<&str> {
 }
 
 /// Authorize both ends of every crosspoint (BOLA), before any existence check.
-fn authorize(state: &AppState, principal: &Principal, req: &PatchRequest) -> ControlResult<()> {
+fn authorize(
+    principal: &Principal,
+    req: &PatchRequest,
+    layout: Option<&super::output_routing::LayoutRead>,
+) -> ControlResult<()> {
     for xp in &req.crosspoints {
         let destination = &xp.destination;
         if let Some(mixer) = &destination.mixer {
@@ -226,8 +230,8 @@ fn authorize(state: &AppState, principal: &Principal, req: &PatchRequest) -> Con
         }
         // A layout: its id AND its whole current source closure, before any
         // output or feed existence answer (#342 review T-A1).
-        if let Some(layout) = xp.source.get("layout").and_then(Value::as_str) {
-            super::output_routing::authorize_layout_feed(state, principal, layout)?;
+        if let Some(id) = xp.source.get("layout").and_then(Value::as_str) {
+            super::output_routing::authorize_layout_feed(principal, id, layout)?;
         }
         if xp.source.get("bus").is_some() {
             authorize_object(principal, ME)?;
@@ -235,6 +239,34 @@ fn authorize(state: &AppState, principal: &Principal, req: &PatchRequest) -> Con
         }
     }
     Ok(())
+}
+
+/// The request's ONE stored-layout read (#342 review T-I1): the layout a
+/// crosspoint names (an output slot's; a mixer crosspoint's layout is
+/// refused by shape and needs no read), read off the async worker under the
+/// layout-read permit BEFORE any authorization answer, and only once every
+/// destination passed its own authorization, so an unauthorized caller
+/// never costs a read. The body feeds the closure authorization (T-A1) and
+/// the later resolve.
+///
+/// # Errors
+/// 403 for a destination; `EngineBusy` without a read permit; repository
+/// errors.
+async fn read_patch_layout(
+    state: &AppState,
+    principal: &Principal,
+    req: &PatchRequest,
+) -> ControlResult<Option<super::output_routing::LayoutRead>> {
+    let Some(id) = req
+        .crosspoints
+        .iter()
+        .find_map(|xp| xp.source.get("layout").and_then(Value::as_str))
+    else {
+        return Ok(None);
+    };
+    authorize(principal, req, None)?;
+    authorize_object(principal, id)?;
+    Ok(Some(super::output_routing::read_layout(state, id).await?))
 }
 
 /// A validated mixer crosspoint.
@@ -492,6 +524,7 @@ pub(crate) async fn get_patch(
         (status = 404, description = "Unknown output.", body = crate::problem::Problem),
         (status = 409, description = "`switcher-unavailable` or `routing-unavailable`.", body = crate::problem::Problem),
         (status = 422, description = "`slot-medium-mismatch` (an audio slot other than slot 0 follow, a subtitle slot), `unknown-slot` (video slot >= 1, two outputs, or mixer + output: multi-destination sets arrive with patch salvos #308), `unknown-source` (a layout or bus on a mixer input; an unknown feed), or not 1..=64 crosspoints. A layout on an output slot is planned like the alias: `layout-not-admissible` and `aux-capacity` are refusals in the plan.", body = crate::problem::Problem),
+        (status = 503, description = "`engine-busy`: an output slot's `{layout}` could not be read now (every layout-read slot is in use); retry.", body = crate::problem::Problem),
     )))]
 pub(crate) async fn plan_patch(
     State(state): State<AppState>,
@@ -500,14 +533,15 @@ pub(crate) async fn plan_patch(
 ) -> ControlResult<Response> {
     principal.role.require(Action::Write)?;
     validate_count(&req)?;
-    authorize(&state, &principal, &req)?;
+    let layout = read_patch_layout(&state, &principal, &req).await?;
+    authorize(&principal, &req, layout.as_ref())?;
     if super::patch_output::has_output(&req) {
         let patch = match super::patch_output::shape(&req) {
             Ok(patch) => patch,
             Err(response) => return Ok(*response),
         };
         return Ok(
-            match super::patch_output::plan(&state, &principal, &req, &patch)? {
+            match super::patch_output::plan(&state, &principal, &req, &patch, layout.as_ref())? {
                 Ok(plan) => (StatusCode::OK, Json(plan)).into_response(),
                 Err(response) => response,
             },
@@ -537,7 +571,7 @@ pub(crate) async fn plan_patch(
         (status = 409, description = "`conflict` (an output take's Idempotency-Key first used for another output or feed; nothing enqueued), `on-air-protected` (the input on Program under `protect`, or the Program/Preview input during an AUTO), `switcher-unavailable`, `routing-unavailable`, `switcher-required`, `output-kind-unroutable`, `capacity`, `aux-capacity` (no free layout canvas), or no source lease.", body = crate::problem::Problem),
         (status = 422, description = "`slot-medium-mismatch`, `unknown-slot`, `unknown-source`, `unknown-feed` / `layout-not-admissible` (an output slot's layout), missing Idempotency-Key, or not 1..=64 crosspoints.", body = crate::problem::Problem),
         (status = 429, description = "Over 2 takes/s per destination or 10/s per principal (one request = one take); see Retry-After.", body = crate::problem::Problem),
-        (status = 503, description = "`engine-busy` (the key and leases are released) or `idempotency-capacity`.", body = crate::problem::Problem),
+        (status = 503, description = "`engine-busy` (the key and leases are released; or an output slot's `{layout}` could not be read now: every layout-read slot is in use) or `idempotency-capacity`.", body = crate::problem::Problem),
     )))]
 #[allow(clippy::too_many_lines)]
 // reason: one linear admission sequence whose order (authz → shape → existence
@@ -550,14 +584,15 @@ pub(crate) async fn take_patch(
 ) -> ControlResult<Response> {
     principal.role.require(Action::Write)?;
     validate_count(&req)?;
-    authorize(&state, &principal, &req)?;
+    let layout = read_patch_layout(&state, &principal, &req).await?;
+    authorize(&principal, &req, layout.as_ref())?;
     if super::patch_output::has_output(&req) {
         let patch = match super::patch_output::shape(&req) {
             Ok(patch) => patch,
             Err(response) => return Ok(*response),
         };
         return Ok(
-            match super::patch_output::take(&state, &principal, &idem, &patch)? {
+            match super::patch_output::take(&state, &principal, &idem, &patch, layout.as_ref())? {
                 Ok(op) => accepted(op),
                 Err(response) => response,
             },

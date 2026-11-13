@@ -2,6 +2,7 @@
 
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use tokio::task::JoinHandle;
@@ -18,6 +19,12 @@ pub const ALPN_H3: &[u8] = b"h3";
 /// Called `(remote, true)` once a handshake completes and `(remote, false)`
 /// when that connection ends (also on abort).
 pub type PeersHook = Arc<dyn Fn(SocketAddr, bool) + Send + Sync>;
+
+/// Returns `true` when a QUIC source address must be refused before any cap
+/// check runs (design note §8: a forwarder hop that lost the client's real
+/// address must fail closed, the same way the TCP door fails closed on a
+/// missing/untrusted PROXY v2 header).
+pub type SourceFilter = Arc<dyn Fn(SocketAddr) -> bool + Send + Sync>;
 
 /// Everything [`H3Endpoint::start`] needs.
 pub struct EndpointParts {
@@ -40,6 +47,18 @@ pub struct EndpointParts {
     pub limits: H3Limits,
     /// Established-peer hook.
     pub peers: Option<PeersHook>,
+    /// Optional per-source refusal, checked before any cap in the accept
+    /// loop. `None` admits every source to the cap checks (direct mode, or
+    /// `behind_proxy` with a source-preserving forward).
+    pub refuse_source: Option<SourceFilter>,
+    /// QUIC Retry policy (RFC 9000 §8.1.2; `network.quic.retry_above_handshakes`,
+    /// design note "Slice 3 as built, part B"): once this many handshakes
+    /// are in flight, an Initial from an unvalidated address is answered
+    /// with a stateless Retry instead of handshake state. `Some(0)` retries
+    /// every unvalidated Initial; `None` never retries.
+    pub retry_above_handshakes: Option<usize>,
+    /// Bumped once per Retry sent (the front door's metrics read it).
+    pub retry_counter: Option<Arc<AtomicU64>>,
 }
 
 /// The TLS config the endpoint actually uses: a clone of `tls` with ALPN
@@ -219,6 +238,9 @@ impl H3Endpoint {
             wt,
             limits,
             peers,
+            refuse_source,
+            retry_above_handshakes,
+            retry_counter,
         } = parts;
         let server = server_config(&tls, &limits, incoming)?;
         let counters = Arc::new(Counters::default());
@@ -240,6 +262,13 @@ impl H3Endpoint {
                     wt,
                     limits,
                     peers,
+                    Admission {
+                        refuse_source,
+                        retry: Retry {
+                            above_handshakes: retry_above_handshakes,
+                            counter: retry_counter,
+                        },
+                    },
                     loop_counters,
                 ));
                 Ok::<_, Error>((endpoint, accept))
@@ -310,6 +339,57 @@ impl Handshakes {
     fn try_take(&self, remote: SocketAddr) -> Option<CapGuard> {
         Caps::try_take(&self.0, remote)
     }
+
+    /// Handshakes in flight now (slots taken and not yet released).
+    fn in_flight(&self) -> usize {
+        unpoison(self.0.lock()).total
+    }
+}
+
+/// The accept loop's pre-handshake admission policy: the source filter and
+/// the Retry policy, both applied before any handshake state is created.
+struct Admission {
+    refuse_source: Option<SourceFilter>,
+    retry: Retry,
+}
+
+/// The accept loop's Retry policy ([`EndpointParts::retry_above_handshakes`]).
+struct Retry {
+    above_handshakes: Option<usize>,
+    counter: Option<Arc<AtomicU64>>,
+}
+
+impl Retry {
+    /// The same semantics as the vendored `MoQ` server's
+    /// `moq_tokio::noq::Server::maybe_retry`: with `handshakes_in_flight`
+    /// at or over the threshold, an `Incoming` whose address is not yet
+    /// validated and that may still be retried is answered with a Retry
+    /// (counted) and consumed. A `retry()` that fails is ignored instead;
+    /// either way `None` is returned and the caller never accepts it.
+    /// Otherwise `incoming` is returned unchanged.
+    fn apply(&self, incoming: noq::Incoming, handshakes_in_flight: usize) -> Option<noq::Incoming> {
+        let Some(threshold) = self.above_handshakes else {
+            return Some(incoming);
+        };
+        if handshakes_in_flight < threshold
+            || incoming.remote_address_validated()
+            || !incoming.may_retry()
+        {
+            return Some(incoming);
+        }
+        match incoming.retry() {
+            Ok(()) => {
+                if let Some(counter) = &self.counter {
+                    counter.fetch_add(1, Ordering::Relaxed);
+                }
+                None
+            }
+            Err(err) => {
+                err.into_incoming().ignore();
+                None
+            }
+        }
+    }
 }
 
 async fn accept_loop(
@@ -318,8 +398,13 @@ async fn accept_loop(
     wt: Option<Arc<dyn WtHandler>>,
     limits: H3Limits,
     peers: Option<PeersHook>,
+    admission: Admission,
     counters: Arc<Counters>,
 ) {
+    let Admission {
+        refuse_source,
+        retry,
+    } = admission;
     let caps = Arc::new(Mutex::new(Caps {
         total: 0,
         per_source: HashMap::new(),
@@ -330,11 +415,23 @@ async fn accept_loop(
     let runtime = tokio::runtime::Handle::current();
     while let Some(incoming) = endpoint.accept().await {
         let remote = incoming.remote_address();
+        if refuse_source.as_ref().is_some_and(|filter| filter(remote)) {
+            Counters::inc(&counters.sources_refused);
+            incoming.refuse();
+            continue;
+        }
         if Caps::full(&caps, remote) {
             Counters::inc(&counters.connections_refused);
             incoming.refuse();
             continue;
         }
+        // Retry before a handshake slot is taken (after the cheap
+        // refusals, so a full endpoint refuses instead of Retry-then-refuse):
+        // a Retried Initial costs no state, and the client's token-carrying
+        // second Initial (address validated) is then admitted normally.
+        let Some(incoming) = retry.apply(incoming, handshakes.in_flight()) else {
+            continue;
+        };
         let Some(handshake) = handshakes.try_take(remote) else {
             Counters::inc(&counters.handshakes_refused);
             incoming.refuse();

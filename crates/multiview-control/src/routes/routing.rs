@@ -101,6 +101,7 @@ const ROUTING_KIND: &str = "crosspoint";
             (status = 200, description = "A crosspoint: the #11 classification (class1/reset_lite/class2 + coerced). An output target (`target.kind = output`): an `OutputPlan` with cost and refusals.", body = RoutingPlanResponseDoc),
             (status = 401, description = "Missing or invalid credentials.", body = crate::problem::Problem),
             (status = 403, description = "Not authorized to plan this crosspoint (an output target: object AND output axis).", body = crate::problem::Problem),
+            (status = 503, description = "`engine-busy`: an output target's `{layout}` feed could not be read now (every layout-read slot is in use); retry.", body = crate::problem::Problem),
         ),
     )
 )]
@@ -119,7 +120,7 @@ pub(crate) async fn plan_route(
         principal.role.require(Action::Read)?;
         let req: super::output_routing::OutputRouteRequest = serde_json::from_value(body)
             .map_err(|e| ControlError::Validation(format!("output plan body: {e}")))?;
-        return super::output_routing::plan_output(&state, &principal, &req);
+        return super::output_routing::plan_output(&state, &principal, &req).await;
     }
     let req: RouteTakeRequest = serde_json::from_value(body)
         .map_err(|e| ControlError::Validation(format!("plan body: {e}")))?;

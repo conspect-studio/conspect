@@ -15924,6 +15924,15 @@ export interface operations {
                     "application/json": components["schemas"]["Problem"];
                 };
             };
+            /** @description `engine-busy`: an output slot's `{layout}` could not be read now (every layout-read slot is in use); retry. */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
         };
     };
     take_patch: {
@@ -15995,7 +16004,7 @@ export interface operations {
                     "application/json": components["schemas"]["Problem"];
                 };
             };
-            /** @description `engine-busy` (the key and leases are released) or `idempotency-capacity`. */
+            /** @description `engine-busy` (the key and leases are released; or an output slot's `{layout}` could not be read now: every layout-read slot is in use) or `idempotency-capacity`. */
             503: {
                 headers: {
                     [name: string]: unknown;
@@ -17377,7 +17386,7 @@ export interface operations {
                     "application/json": components["schemas"]["Problem"];
                 };
             };
-            /** @description `engine-busy`: the take mailbox is full (the key is freed); or `idempotency-capacity`: the caller's (or every) take record is still pending at its cap (fails closed; pending keys still replay; settled records are evicted oldest-first otherwise). */
+            /** @description `engine-busy`: the take mailbox is full (the key is freed), or a `{layout}` feed could not be read now (every layout-read slot is in use; nothing reserved); or `idempotency-capacity`: the caller's (or every) take record is still pending at its cap (fails closed; pending keys still replay; settled records are evicted oldest-first otherwise). */
             503: {
                 headers: {
                     [name: string]: unknown;
@@ -17421,6 +17430,15 @@ export interface operations {
             };
             /** @description Not authorized to plan this crosspoint (an output target: object AND output axis). */
             403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description `engine-busy`: an output target's `{layout}` feed could not be read now (every layout-read slot is in use); retry. */
+            503: {
                 headers: {
                     [name: string]: unknown;
                 };

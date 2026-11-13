@@ -286,6 +286,14 @@ pub struct NetworkConfig {
     /// The private key for [`cert_file`](Self::cert_file). Absolute path.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub key_file: Option<std::path::PathBuf>,
+    /// Advertise HTTP/3 on the TCP door (`alt-svc: h3=":<https_port>";
+    /// ma=86400`, slice 2) once the h3 endpoint on the UDP socket is up.
+    /// Default `true`. Set `false` when UDP `https_port` is known unreachable
+    /// from clients (a firewall drops it): browsers then never try h3 and
+    /// never pay the fallback delay. The operator's manual switch until the
+    /// slice-9 UDP reachability prober drives it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub alt_svc: Option<bool>,
 }
 
 impl Default for NetworkConfig {
@@ -308,6 +316,7 @@ impl Default for NetworkConfig {
             acme_webroot: None,
             cert_file: None,
             key_file: None,
+            alt_svc: None,
         }
     }
 }
@@ -652,6 +661,12 @@ fn directory_ip_is_private(ip: IpAddr) -> Result<bool, ConfigError> {
 }
 
 impl NetworkConfig {
+    /// Whether the TCP door may advertise HTTP/3 (`alt_svc`, default on).
+    #[must_use]
+    pub fn alt_svc_enabled(&self) -> bool {
+        self.alt_svc.unwrap_or(true)
+    }
+
     /// Validate front-door certificate shape before runtime startup.
     ///
     /// # Errors
