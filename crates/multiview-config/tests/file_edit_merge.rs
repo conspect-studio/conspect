@@ -568,3 +568,37 @@ fn tag_like_fields_merge_per_key_and_variant_switches_are_whole() {
     let merged = merge_file_edit(&prev, &next, &accepted);
     assert_eq!(merged.sources[0].captions, accepted.sources[0].captions);
 }
+
+/// Review L1 round 8: a file variant switch is a per-key edit. A probe the
+/// file switches `black -> freeze` keeps the API-set dwell and latch; a
+/// probe the API switched keeps its variant while a file edit of a shared
+/// field still lands.
+#[test]
+fn a_variant_switch_keeps_the_other_sides_untouched_fields() {
+    let probe = |body: &str| {
+        parse(&format!(
+            "{}[[probes]]\nid = \"p1\"\ncell = \"c\"\n{body}\n",
+            boot("/srv/ui-old")
+        ))
+    };
+    let prev = probe("kind = \"black\"\nluma_threshold = 16\nlatched = false");
+    let next = probe("kind = \"freeze\"\ndifference_threshold = 5\nlatched = false");
+    let accepted = probe("kind = \"black\"\nluma_threshold = 16\nlatched = true\n[probes.dwell]\nup_ms = 5000\ndown_ms = 1000");
+    let merged = merge_file_edit(&prev, &next, &accepted);
+    merged.validate().unwrap();
+    let p = &merged.probes[0];
+    assert_eq!(p.kind, next.probes[0].kind, "the file's switch lands");
+    assert!(p.latched, "the API latch stays");
+    assert_eq!(p.dwell.up_ms, 5000, "the API dwell stays");
+
+    // The API switched the variant; the file edited a shared field and an
+    // old-variant-only field.
+    let prev = probe("kind = \"black\"\nluma_threshold = 16\nlatched = false");
+    let next = probe("kind = \"black\"\nluma_threshold = 20\nlatched = true");
+    let accepted = probe("kind = \"freeze\"\ndifference_threshold = 5\nlatched = false");
+    let merged = merge_file_edit(&prev, &next, &accepted);
+    merged.validate().unwrap();
+    let p = &merged.probes[0];
+    assert_eq!(p.kind, accepted.probes[0].kind, "the API variant stays");
+    assert!(p.latched, "the file's shared-field edit lands");
+}

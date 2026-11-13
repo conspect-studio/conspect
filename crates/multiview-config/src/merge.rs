@@ -18,9 +18,8 @@
 //! number-keyed arrays per item too), so an API write of one field (a
 //! catalogue URL follow, an armed automation rule, a Program cell rebind, a
 //! propagated output track, a mixer patch) survives a file edit of another
-//! field of the same item. A file that switches an object to another enum
-//! variant (a tag key changed and the field set with it) replaces that object;
-//! for a variant flattened into an item (a timer target) that is the item. When the accepted list still equals the previous file's list, the
+//! field of the same item, including across an enum variant switch on either
+//! side (see [`merge_value`]). When the accepted list still equals the previous file's list, the
 //! new list is taken whole (a reorder lands). Exceptions by design: the
 //! canvas's pinned signal (width, height, cadence) is one unit, and a layout
 //! change takes the file's cells (cells name the layout's areas).
@@ -157,11 +156,14 @@ fn fields<T: PartialEq + Clone + Serialize + DeserializeOwned>(
 /// The recursive three-way merge behind [`fields`].
 ///
 /// * unchanged by the file (`prev == next`): the accepted value;
-/// * objects: an object the file switched to another enum variant (a tag
-///   key — `kind`, `target`, `mode`, `by`, `slate`, `provider` — changed and
-///   the field set changed with it) is the file's whole object; one only the
-///   accepted state switched stays accepted (the file edited a variant that
-///   is gone); otherwise per key, recursively;
+/// * objects: per key, recursively. A file switch of an enum variant (a tag
+///   key — `kind`, `target`, `mode`, `by`, `slate`, `provider` — changed) is an
+///   ordinary edit: the tag and the fields the file changed land, shared fields
+///   it did not touch keep the accepted value. When only the accepted state
+///   switched variant, the file's edits land on the fields the accepted
+///   variant has; a field only the old variant had is never copied over. When
+///   both switched to different variants, the file's variant wins and fields
+///   only the accepted variant had are dropped;
 /// * arrays of objects that all carry a unique `id` (or `number`): per item,
 ///   recursively, accepted order kept and file additions appended — the same
 ///   rule as the top-level id-keyed lists;
@@ -180,30 +182,41 @@ fn merge_value(
     }
     match (prev, next, accepted) {
         (Value::Object(p), Value::Object(n), Value::Object(a)) => {
-            if variant_changed(p, n) {
-                // The file changed the variant: the file's whole object.
-                return next.clone();
-            }
-            if variant_changed(p, a) {
-                // The API changed the variant and the file edited the old
-                // one: those fields no longer exist; the accepted object stays.
-                return accepted.clone();
-            }
+            let file_switched = tag_changed(p, n);
+            let api_switched = tag_changed(p, a);
             let mut out = a.clone();
+            if api_switched && !file_switched {
+                // The API switched the variant; the file edited the old one.
+                // File edits land only on keys the accepted variant has (or
+                // that the file newly added); a key only the old variant had
+                // is never copied onto the new one.
+                let keys: HashSet<&String> = p.keys().chain(n.keys()).collect();
+                for k in keys {
+                    if TAG_KEYS.contains(&k.as_str()) || p.get(k) == n.get(k) {
+                        continue;
+                    }
+                    let only_old_variant = p.contains_key(k) && !a.contains_key(k);
+                    if only_old_variant {
+                        continue;
+                    }
+                    merge_key(&mut out, k, p.get(k), n.get(k), a.get(k));
+                }
+                return Value::Object(out);
+            }
+            // Per key: a file-side variant switch is an ordinary edit (the tag
+            // and the fields the file changed land; shared fields the file did
+            // not touch keep the accepted value; old-variant-only fields the
+            // file removed are removed).
             let keys: HashSet<&String> = p.keys().chain(n.keys()).collect();
             for k in keys {
-                match (p.get(k), n.get(k), a.get(k)) {
-                    (pv, nv, _) if pv == nv => {}
-                    (_, None, _) => {
-                        out.remove(k);
-                    }
-                    (Some(pv), Some(nv), Some(av)) => {
-                        out.insert(k.clone(), merge_value(pv, nv, av));
-                    }
-                    (_, Some(nv), _) => {
-                        out.insert(k.clone(), nv.clone());
-                    }
+                if p.get(k) != n.get(k) {
+                    merge_key(&mut out, k, p.get(k), n.get(k), a.get(k));
                 }
+            }
+            if file_switched && api_switched && tag_changed(n, a) {
+                // Both switched, to different variants: the file's variant
+                // wins, so keys only the accepted variant had are dropped.
+                out.retain(|k, _| n.contains_key(k) || p.contains_key(k));
             }
             Value::Object(out)
         }
@@ -229,25 +242,36 @@ fn merge_value(
 /// The keys this schema uses as internal enum tags (`#[serde(tag = ...)]`).
 const TAG_KEYS: [&str; 6] = ["kind", "target", "mode", "by", "slate", "provider"];
 
-/// Whether `from -> to` switched an internally tagged enum to another variant:
-/// a tag key changed AND the object's other fields changed shape (a variant
-/// has its own field set). A key that merely carries a string named like a
-/// tag (e.g. a cell source's inline `kind`) keeps its field set, so it merges
-/// per key like any other field.
-fn variant_changed(
+/// Whether a tag key differs between two versions of one object (the object
+/// switched variant). A plain field that merely holds a tag-like string (a
+/// cell source's inline `kind`) counts too; the rules applied on a switch are
+/// the ordinary per-key ones, so that is harmless.
+fn tag_changed(
     from: &serde_json::Map<String, serde_json::Value>,
     to: &serde_json::Map<String, serde_json::Value>,
 ) -> bool {
-    let shape = |m: &serde_json::Map<String, serde_json::Value>| -> HashSet<String> {
-        m.keys()
-            .filter(|k| !TAG_KEYS.contains(&k.as_str()))
-            .cloned()
-            .collect()
-    };
-    TAG_KEYS
-        .iter()
-        .any(|t| from.get(*t).is_some() && to.get(*t).is_some() && from.get(*t) != to.get(*t))
-        && shape(from) != shape(to)
+    TAG_KEYS.iter().any(|t| from.get(*t) != to.get(*t))
+}
+
+/// Apply one key's file edit `p -> n` onto the accepted object `out`.
+fn merge_key(
+    out: &mut serde_json::Map<String, serde_json::Value>,
+    key: &str,
+    p: Option<&serde_json::Value>,
+    n: Option<&serde_json::Value>,
+    a: Option<&serde_json::Value>,
+) {
+    match (p, n, a) {
+        (_, None, _) => {
+            out.remove(key);
+        }
+        (Some(pv), Some(nv), Some(av)) => {
+            out.insert(key.to_owned(), merge_value(pv, nv, av));
+        }
+        (_, Some(nv), _) => {
+            out.insert(key.to_owned(), nv.clone());
+        }
+    }
 }
 
 /// Whether every element of `list` is an object carrying a scalar `key`, and

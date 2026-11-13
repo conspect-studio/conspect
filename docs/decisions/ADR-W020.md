@@ -122,13 +122,13 @@ output when one `[control] ui_dir` key changed (#367).
   field at every depth** (a recursive three-way merge of its serialized form; nested arrays of
   `id`- or `number`-keyed objects per item), so an API write of one field — a catalogue URL
   follow, an armed automation rule, a Program cell rebind, a propagated output track, a mixer
-  patch, a channel rundown — survives a file edit of another field of the same item. A file
-  that switches an object to another enum variant — one of the schema's tag keys (`kind`,
-  `target`, `mode`, `by`, `slate`, `provider`) changed **and** the object's field set changed
-  with it — replaces that object (for a variant flattened into an item, e.g. a timer
-  `target`, that is the item); a file edit of a variant the API switched away from is
-  dropped. A key that merely holds a tag-like string with an unchanged field set (a cell
-  source's inline `kind`) merges per key like any field. A merged item that does not
+  patch, a channel rundown — survives a file edit of another field of the same item. An enum
+  variant switch (one of the schema's tag keys — `kind`, `target`, `mode`, `by`, `slate`,
+  `provider` — changed) is merged per key too: a file switch lands the tag and the fields the
+  file changed while shared fields it did not touch keep the accepted value; when only the
+  accepted state switched, the file's edits land on the fields the accepted variant has and a
+  field only the old variant had is never copied over; when both switched to different
+  variants, the file's wins. A merged item that does not
   deserialize falls back to the file's whole item. Deliberate whole units: the canvas's pinned signal (width, height, cadence),
   and a layout change, which takes the file's cells (cells name the layout's areas). When
   the accepted list still equals the previous file's list, the new list is taken whole (a
