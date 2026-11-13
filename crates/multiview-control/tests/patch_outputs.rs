@@ -133,6 +133,7 @@ fn keys() -> ApiKeyStore {
 #[derive(Default)]
 struct FakeState {
     takes: Vec<OutputTakeRequest>,
+    reformats: Vec<multiview_control::output_routing::OutputReformatRequest>,
     paths: HashMap<(String, RoutedFeed), (PlanPath, bool, u8)>,
     live: Option<RoutingLive>,
 }
@@ -225,6 +226,18 @@ impl OutputRouting for Fake {
         _audio: Option<&multiview_control::output_routing::RoutedAudio>,
     ) -> Result<multiview_control::output_routing::AudioPlanCost, PlanRefusal> {
         Ok(multiview_control::output_routing::AudioPlanCost::default())
+    }
+    fn try_reformat(
+        &self,
+        request: multiview_control::output_routing::OutputReformatRequest,
+    ) -> Result<(), multiview_control::output_routing::ReformatSubmitError> {
+        // The fake engine resets HLS outputs live, anything else needs a
+        // restart (the real router decides by the binding's container).
+        if !matches!(request.config, multiview_config::Output::Hls { .. }) {
+            return Err(multiview_control::output_routing::ReformatSubmitError::RestartRequired);
+        }
+        self.state.lock().unwrap().reformats.push(request);
+        Ok(())
     }
     fn current_path(&self, output: &str) -> Option<PlanPath> {
         (output == OUT_B).then_some(PlanPath::P3)
@@ -1130,4 +1143,123 @@ async fn a_track_feed_with_an_unreadable_route_input_is_redacted_on_both_endpoin
     let routing = body_json(send(&rig.router, get("/api/v1/routing", OPERATOR_TOKEN)).await).await;
     assert_eq!(patch_audio(&patch), json!({"tracks": ["eng"]}), "{patch}");
     assert_eq!(patch_audio(&patch), routing_audio(&routing));
+}
+
+fn put_output(
+    token: &str,
+    id: &str,
+    etag: &str,
+    name: &str,
+    body: &Value,
+) -> Request<Body> {
+    let mut request = post(&format!("/api/v1/outputs/{id}"), token, None, &json!({"name": name, "body": body}));
+    *request.method_mut() = axum::http::Method::PUT;
+    request
+        .headers_mut()
+        .insert(header::IF_MATCH, etag.parse().unwrap());
+    request
+}
+
+async fn current_output(rig: &Rig, id: &str) -> (String, String, Value) {
+    let resp = send(&rig.router, get(&format!("/api/v1/outputs/{id}"), OPERATOR_TOKEN)).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let etag = resp
+        .headers()
+        .get(header::ETAG)
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_owned();
+    let body = body_json(resp).await;
+    (etag, body["name"].as_str().unwrap().to_owned(), body["body"].clone())
+}
+
+/// #342 B3: a PUT changing ONLY an HLS output's format (and video bitrate)
+/// is committed and applied live: `x-multiview-apply: live`, the reset note,
+/// the operation id, and one reformat with the new config reaches the
+/// engine; any other change (a codec change) keeps the restart answer and
+/// starts no reset.
+#[tokio::test]
+async fn a_format_only_put_resets_the_output_live_and_a_codec_change_is_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    let rig = rig(&dir.path().join("boot.toml"));
+    let (etag, name, mut body) = current_output(&rig, "output-1").await;
+    body["format"] = json!({"width": 720, "height": 1280, "fit": {"mode": "cover"}});
+    body["slots"]["video"] = json!([{"bitrate_kbps": 3000}]);
+    let resp = send(&rig.router, put_output(OPERATOR_TOKEN, "output-1", &etag, &name, &body)).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(resp.headers()["x-multiview-apply"], "live");
+    assert_eq!(
+        resp.headers()["x-multiview-apply-note"],
+        "resets output output-1 (about 1 s); Program and other outputs are not affected"
+    );
+    let op = resp.headers()["x-multiview-operation-id"]
+        .to_str()
+        .unwrap()
+        .to_owned();
+    let reformats = rig.fake.state.lock().unwrap().reformats.clone();
+    assert_eq!(reformats.len(), 1);
+    assert_eq!(reformats[0].operation_id, op);
+    assert_eq!(reformats[0].output, OUT_B);
+    assert_eq!(reformats[0].principal, "operator-key");
+    let format = reformats[0].config.format().unwrap();
+    assert_eq!((format.width, format.height), (720, 1280));
+    // The commit is the store: GET returns the new format.
+    let (etag, name, stored) = current_output(&rig, "output-1").await;
+    assert_eq!(stored["format"]["width"], 720);
+    // A codec change: restart, no reset.
+    let mut codec = stored.clone();
+    codec["codec"] = json!("h264");
+    let resp = send(&rig.router, put_output(OPERATOR_TOKEN, "output-1", &etag, &name, &codec)).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(resp.headers()["x-multiview-apply"], "restart");
+    assert!(resp.headers().get("x-multiview-operation-id").is_none());
+    assert_eq!(rig.fake.state.lock().unwrap().reformats.len(), 1);
+}
+
+/// #342 B3: the live reset is authorized on the output axis too (BOLA): a
+/// key with the output object but without the output-axis grant is 403 and
+/// nothing is committed or reset.
+#[tokio::test]
+async fn a_live_reset_needs_the_output_axis() {
+    let dir = tempfile::tempdir().unwrap();
+    let rig = rig(&dir.path().join("boot.toml"));
+    let (etag, name, mut body) = current_output(&rig, "output-1").await;
+    body["format"]["width"] = json!(720);
+    let resp = send(&rig.router, put_output(NO_OUTPUT_AXIS, "output-1", &etag, &name, &body)).await;
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    assert!(rig.fake.state.lock().unwrap().reformats.is_empty());
+    let (after, _, stored) = current_output(&rig, "output-1").await;
+    assert_eq!(after, etag, "nothing committed");
+    assert_eq!(stored["format"]["width"], 360);
+    // With the output axis it is applied live.
+    let resp = send(&rig.router, put_output(OUT1, "output-1", &etag, &name, &body)).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(resp.headers()["x-multiview-apply"], "live");
+}
+
+/// #342 B3: live resets are rate-limited per output with the take limiter
+/// (one reset = one take: 2/s per output): the third reset within a second
+/// is 429 with Retry-After and is neither committed nor sent.
+#[tokio::test]
+async fn live_resets_are_rate_limited_like_takes() {
+    let dir = tempfile::tempdir().unwrap();
+    let rig = rig(&dir.path().join("boot.toml"));
+    for (i, width) in [720, 1080, 540].into_iter().enumerate() {
+        let (etag, name, mut body) = current_output(&rig, "output-1").await;
+        body["format"]["width"] = json!(width);
+        let resp =
+            send(&rig.router, put_output(OPERATOR_TOKEN, "output-1", &etag, &name, &body)).await;
+        if i < 2 {
+            assert_eq!(resp.status(), StatusCode::OK, "reset {i}");
+            assert_eq!(resp.headers()["x-multiview-apply"], "live");
+        } else {
+            assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+            assert!(resp.headers().get(header::RETRY_AFTER).is_some());
+            let (after, _, stored) = current_output(&rig, "output-1").await;
+            assert_eq!(after, etag, "a limited reset commits nothing");
+            assert_eq!(stored["format"]["width"], 1080);
+        }
+    }
+    assert_eq!(rig.fake.state.lock().unwrap().reformats.len(), 2);
 }

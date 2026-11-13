@@ -1517,6 +1517,7 @@ fn the_control_adapter_refuses_audio_takes_on_an_unroutable_output() {
             base_format: None,
             routable: true,
             program_audio: true,
+            codec_name: String::new(),
         },
         RunOutput {
             id: Some("vaapi".into()),
@@ -1525,6 +1526,7 @@ fn the_control_adapter_refuses_audio_takes_on_an_unroutable_output() {
             base_format: None,
             routable: false,
             program_audio: true,
+            codec_name: String::new(),
         },
     ]);
     let slot = output_routing_slot();
@@ -1583,6 +1585,7 @@ fn the_control_adapter_maps_renamed_ids_to_their_own_index() {
             base_format: None,
             routable: true,
             program_audio: true,
+            codec_name: String::new(),
         },
         RunOutput {
             id: Some("renamed".into()),
@@ -1591,6 +1594,7 @@ fn the_control_adapter_maps_renamed_ids_to_their_own_index() {
             base_format: None,
             routable: true,
             program_audio: true,
+            codec_name: String::new(),
         },
         RunOutput {
             id: Some("zz-first".into()),
@@ -1599,6 +1603,7 @@ fn the_control_adapter_maps_renamed_ids_to_their_own_index() {
             base_format: None,
             routable: false,
             program_audio: true,
+            codec_name: String::new(),
         },
     ]);
     let slot = output_routing_slot();
@@ -1977,6 +1982,7 @@ fn the_plan_counts_a_lingering_encoder_as_plus_zero() {
             base_format: None,
             routable: true,
             program_audio: true,
+            codec_name: String::new(),
         },
         RunOutput {
             id: Some("b".into()),
@@ -1985,6 +1991,7 @@ fn the_plan_counts_a_lingering_encoder_as_plus_zero() {
             base_format: None,
             routable: true,
             program_audio: true,
+            codec_name: String::new(),
         },
     ]);
     let slot = output_routing_slot();
@@ -4088,6 +4095,7 @@ fn the_plan_counts_a_different_format_as_plus_one() {
             base_format: None,
             routable: true,
             program_audio: true,
+            codec_name: String::new(),
         },
         RunOutput {
             id: Some("wide".into()),
@@ -4096,6 +4104,7 @@ fn the_plan_counts_a_different_format_as_plus_one() {
             base_format: None,
             routable: true,
             program_audio: true,
+            codec_name: String::new(),
         },
     ]);
     let slot = output_routing_slot();
@@ -4204,6 +4213,7 @@ fn plan_slot_reports_the_cheapest_path() {
         base_format,
         routable: true,
         program_audio: true,
+        codec_name: String::new(),
     };
     let h =
         x.h.clone()

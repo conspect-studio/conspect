@@ -430,6 +430,9 @@ pub struct RunOutput {
     /// Whether the output's binding has a program-audio slot, the slot a
     /// routed audio feed rides (§5.5). `false`: audio takes are refused.
     pub program_audio: bool,
+    /// The concrete video encoder name of the output's base key (#342 B3: a
+    /// live format reset keeps it; a codec change is restart-required).
+    pub codec_name: String,
 }
 
 impl std::fmt::Debug for OutputRoutingHandle {

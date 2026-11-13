@@ -19,7 +19,9 @@ use crate::concurrency::IfMatch;
 use crate::error::{ControlError, ControlResult};
 use crate::resource_store::{Resource, ResourceInput, VersionedResource, OUTPUT_KIND};
 use crate::state::AppState;
-use crate::typed_resources::{validated_body, with_apply_restart, TypedCollection};
+use crate::typed_resources::{
+    validated_body, with_apply, with_apply_restart, ApplyMode, TypedCollection,
+};
 
 /// Read accepted intent rather than a lagging, fallible SQLite projection.
 fn accepted_outputs(state: &AppState) -> ControlResult<Vec<VersionedResource>> {
@@ -225,6 +227,24 @@ pub(crate) async fn update_output(
         name: input.name,
         body: validated_body(TypedCollection::Outputs, &id, &input.body)?,
     };
+    // #342 B3: a change of ONLY the picture format and/or video slot 0's
+    // bitrate on a running output resets that output live. Authorized on the
+    // output axis too (the slot's destination check) and rate-limited like a
+    // take, both BEFORE the commit so a refused request changes nothing.
+    let live_reset =
+        reset_only(&current.resource.body, &input.body) && state.output_routing.is_some();
+    if live_reset {
+        super::output_routing::authorize_output_end(&principal, &id)?;
+        if let Some(control) = state.output_routing.as_ref() {
+            if let Err(retry) =
+                control
+                    .limiter
+                    .admit(&id, &principal.key_id, std::time::Instant::now())
+            {
+                return Ok(super::output_routing::too_many_pub(retry));
+            }
+        }
+    }
     crate::boot_model::commit_resource(
         &state,
         "outputs",
@@ -251,10 +271,99 @@ pub(crate) async fn update_output(
         &id,
         Some(versioned.resource.body.clone()),
     );
+    if live_reset {
+        if let Some(response) = start_live_reset(&state, &principal, &id, &versioned) {
+            return Ok(response);
+        }
+    }
     Ok(with_apply_restart(output_response(
         StatusCode::OK,
         &versioned,
     )))
+}
+
+/// The header carrying a live reset's operation id (its outcome rides
+/// `route.output` as `reset:applied` / `reset:refused:<reason>`).
+const RESET_OPERATION_HEADER: header::HeaderName =
+    header::HeaderName::from_static("x-multiview-operation-id");
+/// The header carrying the operator note of a live reset.
+const RESET_NOTE_HEADER: header::HeaderName =
+    header::HeaderName::from_static("x-multiview-apply-note");
+
+/// Whether `next` differs from `current` ONLY in `format` and/or
+/// `slots.video[0].bitrate_kbps` (and at least in one of them): the change a
+/// live reset can carry (#342 B3).
+fn reset_only(current: &serde_json::Value, next: &serde_json::Value) -> bool {
+    let strip = |v: &serde_json::Value| -> serde_json::Value {
+        let mut v = v.clone();
+        if let Some(map) = v.as_object_mut() {
+            map.remove("format");
+            if let Some(slots) = map
+                .get_mut("slots")
+                .and_then(serde_json::Value::as_object_mut)
+            {
+                if let Some(slot0) = slots
+                    .get_mut("video")
+                    .and_then(serde_json::Value::as_array_mut)
+                    .and_then(|video| video.first_mut())
+                    .and_then(serde_json::Value::as_object_mut)
+                {
+                    slot0.remove("bitrate_kbps");
+                }
+                // An emptied slot / slot list / slots table is "absent".
+                if let Some(video) = slots
+                    .get_mut("video")
+                    .and_then(serde_json::Value::as_array_mut)
+                {
+                    video.retain(|slot| slot.as_object().is_none_or(|o| !o.is_empty()));
+                    if video.is_empty() {
+                        slots.remove("video");
+                    }
+                }
+                if slots.is_empty() {
+                    map.remove("slots");
+                }
+            }
+        }
+        v
+    };
+    current != next && strip(current) == strip(next)
+}
+
+/// Hand a committed format/bitrate change to the engine as a live reset of
+/// that output. `None`: the engine cannot reset it live (or is busy) and the
+/// caller answers today's restart-pending response.
+fn start_live_reset(
+    state: &AppState,
+    principal: &Principal,
+    id: &str,
+    versioned: &VersionedResource,
+) -> Option<Response> {
+    let control = state.output_routing.as_ref()?;
+    let config: multiview_config::Output =
+        serde_json::from_value(versioned.resource.body.clone()).ok()?;
+    let operation_id = crate::command::OperationId::new().to_string();
+    let submitted = control
+        .routing
+        .try_reformat(crate::output_routing::OutputReformatRequest {
+            operation_id: operation_id.clone(),
+            output: config.id(),
+            config,
+            principal: principal.key_id.clone(),
+        });
+    if submitted.is_err() {
+        return None;
+    }
+    let mut response = with_apply(ApplyMode::Live, output_response(StatusCode::OK, versioned));
+    let note =
+        format!("resets output {id} (about 1 s); Program and other outputs are not affected");
+    if let Ok(value) = header::HeaderValue::from_str(&operation_id) {
+        response.headers_mut().insert(RESET_OPERATION_HEADER, value);
+    }
+    if let Ok(value) = header::HeaderValue::from_str(&note) {
+        response.headers_mut().insert(RESET_NOTE_HEADER, value);
+    }
+    Some(response)
 }
 
 /// `DELETE /api/v1/outputs/{id}` — delete an output (role: administer; If-Match).

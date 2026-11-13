@@ -237,6 +237,32 @@ pub struct SlotPlan {
     pub converts: u8,
 }
 
+/// A live format reset of one output (#342 B3), already authorized and
+/// committed by the HTTP layer.
+#[derive(Debug, Clone, PartialEq)]
+pub struct OutputReformatRequest {
+    /// The operation id minted for the reset (echoed in its outcome).
+    pub operation_id: String,
+    /// The output's config id.
+    pub output: String,
+    /// The output's NEW accepted config (its `format` and video slot 0
+    /// bitrate are what changed).
+    pub config: multiview_config::Output,
+    /// The authenticated key id the encoder is charged to.
+    pub principal: String,
+}
+
+/// Why a live format reset could not be started: the caller keeps the
+/// restart-pending answer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReformatSubmitError {
+    /// The change needs a restart (the kind carries parameter sets out of
+    /// band, the codec changed, no running engine, …).
+    RestartRequired,
+    /// The engine mailbox is full or the run ended.
+    Busy,
+}
+
 /// One output's live routing readback.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OutputLive {
@@ -322,6 +348,18 @@ pub trait OutputRouting: Send + Sync {
     fn snapshot(&self) -> Option<RoutingLive>;
     /// The outcome stream; `Some` exactly once.
     fn subscribe_outcomes(&self) -> Option<std::sync::mpsc::Receiver<OutputOutcome>>;
+    /// Reset `output` live to its new format / video bitrate (#342 B3):
+    /// non-blocking; the outcome rides `route.output` (`reset:applied` or
+    /// `reset:refused:<reason>`). The default answers `RestartRequired`
+    /// (an engine without a live reset path).
+    ///
+    /// # Errors
+    /// [`ReformatSubmitError`] when it cannot be started live.
+    fn try_reformat(&self, request: OutputReformatRequest) -> Result<(), ReformatSubmitError> {
+        let _ = request;
+        Err(ReformatSubmitError::RestartRequired)
+    }
+
     /// The §12.4 path the output's video slot 0 is carried on now (#342 B2:
     /// Program at the output's format is its base key, P1; a routed picture
     /// identity at the output's format P2; else P3). `None` when unknown.

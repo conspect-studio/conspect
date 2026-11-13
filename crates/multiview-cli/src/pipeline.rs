@@ -3273,7 +3273,7 @@ impl Pipeline {
             format: encoder.format,
             cadence,
             gop,
-            bit_rate: 4_000_000,
+            bit_rate: DEFAULT_VIDEO_KBPS as usize * 1000,
             // AUD-4: video-only until the program-audio path is wired through
             // drive_streaming (subsequent slice); `None` keeps the muxer
             // single-stream so the existing run output is unchanged.
@@ -3905,6 +3905,11 @@ impl Pipeline {
                 // The routed audio rides the binding's program-audio slot
                 // (track 0, present only when this run encodes program audio).
                 program_audio: audio_tracks.get(index).is_some_and(|t| t.contains(&0)),
+                codec_name: self
+                    .rendition_configs
+                    .get(settings)
+                    .map(|cfg| cfg.codec_name.clone())
+                    .unwrap_or_default(),
             })
             .collect();
         let handle = Arc::new(handle.with_outputs(run_outputs).with_pictures(
@@ -12356,6 +12361,15 @@ fn round_f64_to_i32(v: f64) -> i32 {
     } else {
         value
     }
+}
+
+/// The video bitrate of an output whose video slot 0 names none, kbit/s
+/// (the run's base encode default).
+pub(crate) const DEFAULT_VIDEO_KBPS: u32 = 4_000;
+
+/// The configured codec token of an output (`None` for raw kinds).
+pub(crate) fn configured_codec(output: &Output) -> Option<&str> {
+    output_codec(output)
 }
 
 fn output_codec(output: &Output) -> Option<&str> {

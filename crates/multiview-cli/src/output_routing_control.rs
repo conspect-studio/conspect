@@ -13,8 +13,9 @@ use std::sync::mpsc::{Receiver, SyncSender};
 use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 
 use multiview_control::output_routing::{
-    AudioPlanCost, OutputLive, OutputOutcome, OutputRouting, OutputTakeRequest, PlanCost, PlanPath,
-    PlanRefusal, RoutedAudio, RoutedFeed, RoutingLive, SlotPlan, TakeSubmitError,
+    AudioPlanCost, OutputLive, OutputOutcome, OutputReformatRequest, OutputRouting,
+    OutputTakeRequest, PlanCost, PlanPath, PlanRefusal, ReformatSubmitError, RoutedAudio,
+    RoutedFeed, RoutingLive, SlotPlan, TakeSubmitError,
 };
 
 use crate::output_routing::{
@@ -394,6 +395,70 @@ impl OutputRouting for OutputRoutingAdapter {
             video,
             audio,
         )
+    }
+
+    /// A live format reset (#342 B3): the new config's encoded size, fit and
+    /// video bitrate for the SAME encoder; a codec change, an output the run
+    /// does not route or a kind whose container carries parameter sets out
+    /// of band (refused by the router) is restart-required.
+    fn try_reformat(&self, request: OutputReformatRequest) -> Result<(), ReformatSubmitError> {
+        let handle = self.handle().ok_or(ReformatSubmitError::RestartRequired)?;
+        let index = handle
+            .index_of(&request.output)
+            .ok_or(ReformatSubmitError::RestartRequired)?;
+        let run_output = handle
+            .outputs()
+            .get(index)
+            .ok_or(ReformatSubmitError::RestartRequired)?;
+        let pictures = handle
+            .pictures()
+            .ok_or(ReformatSubmitError::RestartRequired)?;
+        if !run_output.routable {
+            return Err(ReformatSubmitError::RestartRequired);
+        }
+        // The SAME codec: the new config's slot-0 codec (absent = the output
+        // codec) must resolve to the running encoder's family.
+        let requested = request
+            .config
+            .video_slot0()
+            .and_then(|v| v.codec.as_deref())
+            .or_else(|| crate::pipeline::configured_codec(&request.config));
+        let same = requested.is_some_and(|token| {
+            multiview_config::CodecFamily::of(token)
+                == multiview_config::CodecFamily::of(&run_output.codec_name)
+        });
+        if !same {
+            return Err(ReformatSubmitError::RestartRequired);
+        }
+        let canvas = pictures.canvas;
+        let base_format = crate::routing_aux::AuxFormat::base_of_output(&request.config, canvas);
+        let feed_format = crate::routing_aux::AuxFormat::feed_of_output(&request.config, canvas);
+        let (width, height) =
+            base_format.map_or((canvas.width, canvas.height), |f| (f.width, f.height));
+        let kbps = request
+            .config
+            .video_slot0()
+            .and_then(|v| v.bitrate_kbps)
+            .unwrap_or(crate::pipeline::DEFAULT_VIDEO_KBPS);
+        let bit_rate = usize::try_from(kbps)
+            .ok()
+            .and_then(|k| k.checked_mul(1000))
+            .ok_or(ReformatSubmitError::RestartRequired)?;
+        handle
+            .try_reformat(crate::output_routing::Reformat {
+                operation_id: request.operation_id,
+                output_index: index,
+                settings: crate::output_routing::ReformatSettings {
+                    codec_name: run_output.codec_name.clone(),
+                    width,
+                    height,
+                    bit_rate,
+                    base_format,
+                },
+                feed_format,
+                principal: request.principal,
+            })
+            .map_err(|_| ReformatSubmitError::Busy)
     }
 
     fn try_take(&self, take: OutputTakeRequest) -> Result<(), TakeSubmitError> {
