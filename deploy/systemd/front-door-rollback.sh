@@ -58,7 +58,11 @@ PY
 echo "== validate the rolled-back state (nothing stopped yet)"
 report="$(sudo -u "$SVC_USER" "$BIN" validate "$scratch/conspect.toml" 2>&1)" || true
 printf '%s\n' "$report"
-if ! printf '%s\n' "$report" | grep -q '^OK   start: accepted state'; then
+# The OK line must be for the accepted state the engine will start from:
+# exactly the scratch desired.json built above (the line after it names it).
+want="     $scratch/.multiview/desired.json"
+if ! printf '%s\n' "$report" | grep -A1 '^OK   start: accepted state' | grep -qxF -- "$want" \
+   || printf '%s\n' "$report" | grep -q '^FAIL'; then
     echo "ROLLBACK ABORTED: the rolled-back state does not validate; nothing was changed" >&2
     exit 1
 fi

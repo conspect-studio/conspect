@@ -176,6 +176,31 @@ async fn spa_caching_etag_gzip_and_missing_assets() {
         .unwrap();
     assert_eq!(inflated, on_disk);
 
+    // A 304 is for the SELECTED representation only (#353 review A2): the
+    // gzip tag revalidates the gzip copy, not the identity one, and the 304
+    // carries the selected representation's tag.
+    let gz_tag = format!(
+        "{}-gz\"",
+        etag_of_identity(&path, &h).await.trim_end_matches('"')
+    );
+    let hit = send(
+        &h.router,
+        get(
+            &path,
+            &[("accept-encoding", "gzip"), ("if-none-match", &gz_tag)],
+        ),
+    )
+    .await;
+    assert_eq!(hit.status(), StatusCode::NOT_MODIFIED);
+    assert_eq!(hit.headers()[header::ETAG].to_str().unwrap(), gz_tag);
+    let miss = send(&h.router, get(&path, &[("if-none-match", &gz_tag)])).await;
+    assert_eq!(
+        miss.status(),
+        StatusCode::OK,
+        "identity selected: the gzip tag must not match"
+    );
+    assert!(miss.headers().get(header::CONTENT_ENCODING).is_none());
+
     // index.html is HTML: gzip applies only above the minimum size; either
     // way the decoded body equals the identity one.
     let index_gz = send(&h.router, get("/", &[("accept-encoding", "gzip")])).await;
@@ -208,4 +233,17 @@ async fn spa_caching_etag_gzip_and_missing_assets() {
         on_disk.len().to_string()
     );
     assert_eq!(body_bytes(head).await, Vec::<u8>::new());
+}
+
+async fn etag_of_identity(path: &str, h: &support::Harness) -> String {
+    let r = send(
+        &h.router,
+        Request::builder()
+            .method("GET")
+            .uri(path)
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    r.headers()[header::ETAG].to_str().unwrap().to_owned()
 }

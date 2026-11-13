@@ -265,45 +265,44 @@ fn entity_tag(sha256: &[u8; 32], gzip: bool) -> Option<HeaderValue> {
     HeaderValue::from_str(&format!("\"{hex}{suffix}\"")).ok()
 }
 
-/// `If-None-Match` matches either representation's tag (a client that
-/// cached the gzip copy and one that cached the identity copy both get 304).
-fn if_none_match(headers: &HeaderMap, sha256: &[u8; 32]) -> bool {
+/// Whether `If-None-Match` matches `tag`, the validator of the representation
+/// this response selects (RFC 9110 section 13.1.2, weak comparison; `*`
+/// matches any current representation).
+fn if_none_match(headers: &HeaderMap, tag: Option<&HeaderValue>) -> bool {
     let Some(value) = headers
         .get(header::IF_NONE_MATCH)
         .and_then(|v| v.to_str().ok())
     else {
         return false;
     };
-    let plain = entity_tag(sha256, false);
-    let gz = entity_tag(sha256, true);
     value.split(',').map(str::trim).any(|candidate| {
         let candidate = candidate.strip_prefix("W/").unwrap_or(candidate);
-        candidate == "*"
-            || plain
-                .as_ref()
-                .is_some_and(|t| t.as_bytes() == candidate.as_bytes())
-            || gz
-                .as_ref()
-                .is_some_and(|t| t.as_bytes() == candidate.as_bytes())
+        candidate == "*" || tag.is_some_and(|t| t.as_bytes() == candidate.as_bytes())
     })
 }
 
 /// Build a response serving an embedded file with its guessed content type,
-/// the cache tier of [`cache_control`], a strong `ETag` (`304` on a match),
-/// and a gzipped body for text assets when the client accepts it.
+/// the cache tier of [`cache_control`], a strong `ETag`, and a gzipped body
+/// for text assets when the client accepts it.
+///
+/// The representation (identity or gzip) is selected from `Accept-Encoding`
+/// FIRST; `If-None-Match` is then compared with that representation's tag,
+/// and a `304` carries that tag (RFC 9110 sections 8.8.1, 15.4.5), so a
+/// client holding the other representation is never told it is current.
 async fn serve_asset(key: &str, method: &Method, headers: &HeaderMap) -> Option<Response> {
     let (data, sha256) = lookup(key)?;
     let mime = mime_guess::from_path(key).first_or_octet_stream();
     let text = compressible(mime.as_ref());
-    let mut response = if if_none_match(headers, &sha256) {
+    let gzip = if text && data.len() >= GZIP_MIN_LENGTH && accepts_gzip(headers) {
+        gzipped(key, data.clone()).await
+    } else {
+        None
+    };
+    let encoded = gzip.is_some();
+    let tag = entity_tag(&sha256, encoded);
+    let mut response = if if_none_match(headers, tag.as_ref()) {
         StatusCode::NOT_MODIFIED.into_response()
     } else {
-        let gzip = if text && data.len() >= GZIP_MIN_LENGTH && accepts_gzip(headers) {
-            gzipped(key, data.clone()).await
-        } else {
-            None
-        };
-        let encoded = gzip.is_some();
         let body = gzip.unwrap_or(data);
         let len = body.len();
         let mut response = if *method == Method::HEAD {
@@ -319,23 +318,18 @@ async fn serve_asset(key: &str, method: &Method, headers: &HeaderMap) -> Option<
         if encoded {
             out.insert(header::CONTENT_ENCODING, HeaderValue::from_static("gzip"));
         }
-        if let Some(tag) = entity_tag(&sha256, encoded) {
-            out.insert(header::ETAG, tag);
-        }
         response
     };
     let out = response.headers_mut();
+    if let Some(tag) = tag {
+        out.insert(header::ETAG, tag);
+    }
     out.insert(
         header::CACHE_CONTROL,
         HeaderValue::from_static(cache_control(key)),
     );
     if text {
         out.insert(header::VARY, HeaderValue::from_static("Accept-Encoding"));
-    }
-    if response.status() == StatusCode::NOT_MODIFIED {
-        if let Some(tag) = entity_tag(&sha256, false) {
-            response.headers_mut().insert(header::ETAG, tag);
-        }
     }
     Some(response)
 }

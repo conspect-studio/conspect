@@ -381,8 +381,17 @@ fn not_modified(
         let Ok(inm) = inm.to_str() else {
             return false;
         };
+        // RFC 9110 section 13.2.1: a range request needs a strong validator.
+        // With `Range`, only an exact strong match revalidates (as nginx); a
+        // weak tag or `*` falls through to the range (206), never an empty
+        // 304 for a partial fetch.
+        let ranged = headers.contains_key(header::RANGE);
         return inm.split(',').map(str::trim).any(|candidate| {
-            candidate == "*" || candidate.strip_prefix("W/").unwrap_or(candidate) == etag
+            if ranged {
+                candidate == etag
+            } else {
+                candidate == "*" || candidate.strip_prefix("W/").unwrap_or(candidate) == etag
+            }
         });
     }
     let (Some(ims), Some(modified)) = (

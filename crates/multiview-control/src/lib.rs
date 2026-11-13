@@ -996,15 +996,46 @@ pub fn static_certificate_source(
 #[cfg(all(feature = "tls", unix))]
 pub const STATIC_CERTIFICATE_POLL: std::time::Duration = std::time::Duration::from_secs(30);
 
-/// The change fingerprint of the static PEM pair: per file the resolved
-/// target (certbot's `live/` names are symlinks into `archive/`), its size,
-/// modification time and inode. A renewal changes at least one.
+/// The change fingerprint of one PEM file: `(dev, inode, size, mtime s, mtime
+/// ns)` of the file actually opened (`fstat` of the descriptor that is then
+/// read), so the fingerprint and the bytes always describe the same file even
+/// if certbot re-points the `live/` symlink in between.
 #[cfg(all(feature = "tls", unix))]
-type PemFingerprint = Vec<(std::path::PathBuf, u64, i64, i64, u64)>;
+type FileStamp = (u64, u64, u64, i64, i64);
+
+/// One snapshot of the static pair: the stamps and the bytes they describe.
+#[cfg(all(feature = "tls", unix))]
+struct PemSnapshot {
+    stamps: [FileStamp; 2],
+    cert: Vec<u8>,
+    key: Vec<u8>,
+}
+
+/// The most bytes read from one PEM file (a chain is a few KiB).
+#[cfg(all(feature = "tls", unix))]
+const MAX_PEM_BYTES: u64 = 1024 * 1024;
 
 #[cfg(all(feature = "tls", unix))]
-fn pem_fingerprint(tls: &multiview_config::TlsConfig) -> Option<PemFingerprint> {
+fn read_stamped(path: &std::path::Path) -> std::io::Result<(FileStamp, Vec<u8>)> {
+    use std::io::Read as _;
     use std::os::unix::fs::MetadataExt;
+    let mut file = std::fs::File::open(path)?;
+    let meta = file.metadata()?;
+    let stamp = (
+        meta.dev(),
+        meta.ino(),
+        meta.len(),
+        meta.mtime(),
+        meta.mtime_nsec(),
+    );
+    let mut bytes = Vec::new();
+    (&mut file).take(MAX_PEM_BYTES).read_to_end(&mut bytes)?;
+    Ok((stamp, bytes))
+}
+
+/// Read both files once each. `None` when either cannot be read.
+#[cfg(all(feature = "tls", unix))]
+fn pem_snapshot(tls: &multiview_config::TlsConfig) -> Option<PemSnapshot> {
     let multiview_config::TlsConfig::Static {
         cert_file,
         key_file,
@@ -1012,20 +1043,30 @@ fn pem_fingerprint(tls: &multiview_config::TlsConfig) -> Option<PemFingerprint> 
     else {
         return None;
     };
-    [cert_file, key_file]
-        .into_iter()
-        .map(|path| {
-            let target = std::fs::canonicalize(path).ok()?;
-            let meta = std::fs::metadata(&target).ok()?;
-            Some((
-                target,
-                meta.len(),
-                meta.mtime(),
-                meta.mtime_nsec(),
-                meta.ino(),
-            ))
-        })
-        .collect()
+    let (cert_stamp, cert) = read_stamped(cert_file).ok()?;
+    let (key_stamp, key) = read_stamped(key_file).ok()?;
+    Some(PemSnapshot {
+        stamps: [cert_stamp, key_stamp],
+        cert,
+        key,
+    })
+}
+
+/// Parse a snapshot's bytes (exactly the bytes that were stamped) into a
+/// checked key (the key must match the leaf).
+#[cfg(all(feature = "tls", unix))]
+fn certified_key_from(snapshot: &PemSnapshot) -> Result<rustls::sign::CertifiedKey, String> {
+    use rustls_pki_types::pem::PemObject;
+    use rustls_pki_types::{CertificateDer, PrivateKeyDer};
+    let certs = CertificateDer::pem_slice_iter(&snapshot.cert)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| format!("certificate: {e}"))?;
+    if certs.is_empty() {
+        return Err("certificate: no PEM certificate".to_owned());
+    }
+    let key = PrivateKeyDer::from_pem_slice(&snapshot.key).map_err(|e| format!("key: {e}"))?;
+    let provider = rustls::crypto::aws_lc_rs::default_provider();
+    rustls::sign::CertifiedKey::from_der(certs, key, &provider).map_err(|e| e.to_string())
 }
 
 /// Watch the `[control.tls] mode = "static"` PEM files and swap a renewed
@@ -1034,9 +1075,11 @@ fn pem_fingerprint(tls: &multiview_config::TlsConfig) -> Option<PemFingerprint> 
 /// `archive/` file), and every handshake after the swap presents the new
 /// certificate (the door's resolver reads the source per `ClientHello`).
 ///
-/// Polls every `every` (a `stat` of two files; no inotify watch to lose on a
-/// symlink swap). A changed pair is parsed and checked (the key must match
-/// the leaf) before it replaces the served one; a half-written or broken pair
+/// Polls every `every`: each file is opened once, `fstat`ed and read (at most
+/// 1 MiB), and the bytes parsed are exactly the bytes whose stamps decide
+/// "changed" (no inotify watch to lose on a symlink swap). A changed pair is
+/// parsed and checked (the key must match the leaf) before it replaces the
+/// served one; a half-written or broken pair
 /// is logged and the previous certificate keeps serving, and the reload is
 /// retried on the next change. Runs on the caller's runtime (the control
 /// plane's), never touches the engine, and blocks nothing: file reads run on
@@ -1049,45 +1092,48 @@ pub fn spawn_static_certificate_reload(
     every: std::time::Duration,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
-        let fingerprint = |tls: multiview_config::TlsConfig| async move {
-            tokio::task::spawn_blocking(move || pem_fingerprint(&tls))
+        let snapshot = |tls: multiview_config::TlsConfig| async move {
+            tokio::task::spawn_blocking(move || pem_snapshot(&tls))
                 .await
                 .ok()
                 .flatten()
         };
-        let mut last = fingerprint(tls.clone()).await;
-        let mut failed = None;
+        // The pair served now is the one loaded at start-up; its stamps are
+        // the baseline (a change between that load and this read is simply a
+        // change, picked up on the first poll).
+        let mut last = snapshot(tls.clone()).await.map(|s| s.stamps);
+        let mut failed: Option<[FileStamp; 2]> = None;
         let mut ticker = tokio::time::interval(every);
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         ticker.tick().await;
         loop {
             ticker.tick().await;
-            let now = fingerprint(tls.clone()).await;
-            if now.is_none() || now == last || now == failed {
+            let Some(now) = snapshot(tls.clone()).await else {
+                continue;
+            };
+            if Some(now.stamps) == last || Some(now.stamps) == failed {
                 continue;
             }
-            let load = tls.clone();
-            let loaded = tokio::task::spawn_blocking(move || {
-                let (certs, key_der) = load_pem_pair(&load)?;
-                let provider = rustls::crypto::aws_lc_rs::default_provider();
-                Ok::<_, TlsSetupError>(rustls::sign::CertifiedKey::from_der(
-                    certs, key_der, &provider,
-                )?)
+            // Parse exactly the bytes whose stamps were taken: the stamps
+            // recorded as `last` always describe the certificate served.
+            let parsed = tokio::task::spawn_blocking(move || {
+                let key = certified_key_from(&now);
+                (now.stamps, key)
             })
             .await;
-            match loaded {
-                Ok(Ok(key)) => {
+            match parsed {
+                Ok((stamps, Ok(key))) => {
                     source.replace(std::sync::Arc::new(key));
-                    last = now;
+                    last = Some(stamps);
                     failed = None;
                     tracing::info!("[control.tls] static certificate changed on disk; new handshakes use the renewed certificate");
                 }
-                Ok(Err(error)) => {
+                Ok((stamps, Err(error))) => {
                     // `last` is not advanced: a pair caught mid-write (cert
                     // renewed, key not yet) changes again when the write
                     // completes and is retried then. The same broken pair is
                     // reported once, not every poll.
-                    failed = now;
+                    failed = Some(stamps);
                     tracing::warn!(%error, "[control.tls] static certificate changed on disk but does not load; the previous certificate keeps serving");
                 }
                 Err(_) => {}

@@ -1,6 +1,6 @@
 //! Slice 6 (issue #292): the engine's HLS delivery replaces nginx on mda001,
 //! so it must answer like the nginx contract it replaces
-//! (`deploy/hls-nginx.conf` + nginx's static-file module). One golden table:
+//! (`deploy/hls-nginx.conf` + nginx's static-file module). One golden table (25 rows):
 //! each row is a request and the exact status plus the headers nginx sends
 //! for it (`Cache-Control`, `Content-Type`, `Accept-Ranges`, `Content-Range`,
 //! `Content-Length`, CORS, `ETag`/`Last-Modified` and `304`, `If-Range`).
@@ -246,6 +246,45 @@ fn table(f: &Fixture) -> Vec<Row> {
             body: Some(b""),
         },
         Row {
+            name: "weak If-None-Match with Range serves the range",
+            method: Method::GET,
+            path: "/seg1.m4s",
+            request: vec![
+                (header::RANGE, s("bytes=0-1")),
+                (header::IF_NONE_MATCH, format!("W/{etag}")),
+            ],
+            status: StatusCode::PARTIAL_CONTENT,
+            expect: vec![(header::CONTENT_RANGE, s("bytes 0-1/16"))],
+            absent: vec![],
+            body: Some(b"01"),
+        },
+        Row {
+            name: "star If-None-Match with Range serves the range",
+            method: Method::GET,
+            path: "/seg1.m4s",
+            request: vec![
+                (header::RANGE, s("bytes=2-3")),
+                (header::IF_NONE_MATCH, s("*")),
+            ],
+            status: StatusCode::PARTIAL_CONTENT,
+            expect: vec![(header::CONTENT_RANGE, s("bytes 2-3/16"))],
+            absent: vec![],
+            body: Some(b"23"),
+        },
+        Row {
+            name: "strong If-None-Match with Range is 304",
+            method: Method::GET,
+            path: "/seg1.m4s",
+            request: vec![
+                (header::RANGE, s("bytes=0-1")),
+                (header::IF_NONE_MATCH, etag.clone()),
+            ],
+            status: StatusCode::NOT_MODIFIED,
+            expect: vec![],
+            absent: vec![header::CONTENT_RANGE],
+            body: Some(b""),
+        },
+        Row {
             name: "If-None-Match miss",
             method: Method::GET,
             path: "/seg1.m4s",
@@ -402,7 +441,7 @@ async fn hls_answers_the_nginx_golden_table() {
             assert_eq!(&got[..], body, "{}", row.name);
         }
     }
-    assert_eq!(count, 22);
+    assert_eq!(count, 25);
 }
 
 /// A segment larger than one body chunk streams byte for byte, in bounded

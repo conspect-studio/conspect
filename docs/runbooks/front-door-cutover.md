@@ -246,7 +246,7 @@ cutover, which replaces them) afterwards.
   while no engine runs are served by the next one); an inherited `ReusePort` pair keeps
   validated-flow steering (50/50 datagrams on the right socket); without activation the door
   binds itself.
-* `crates/multiview-output/tests/hls_nginx_parity.rs`: the 22-row nginx golden table.
+* `crates/multiview-output/tests/hls_nginx_parity.rs`: the 25-row nginx golden table.
 * `crates/multiview-control/tests/embed_web.rs`: UI caching, `ETag`/`304`, gzip, stale chunk 404.
 * `crates/multiview-control/tests/static_cert_reload.rs`: certbot-style symlink renewal served
   without a restart; a torn pair keeps the old certificate.
