@@ -40,7 +40,8 @@ restarting.
      - It starts a backstop thread. That thread ends the process if the rest has not
        finished within 500 ms: `SIGKILL` in builds with `rustix` (every `ffmpeg` build),
        `abort()` otherwise. Both skip atexit handlers. If the backstop cannot start, the
-       watchdog exits at once, without the notice.
+       watchdog calls `exit` at once, without the notice; the C exit path is then not
+       bounded (a thread that cannot start is a far worse fault than a slow exit).
      - It writes one line to fd 2 itself, with raw complete writes (no std stderr lock, no
        tracing: either may be the stuck part). A blocked stderr is cut by the backstop.
      - It calls `std::process::exit` with the cause's code: 1 for a fatal, 0 for a stop.

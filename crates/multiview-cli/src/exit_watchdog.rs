@@ -143,7 +143,9 @@ impl Watchdog {
         loop {
             let due = self.due_ns.load(Ordering::Acquire);
             if due == 0 {
-                std::thread::park();
+                // Bounded, so an arm whose unpark raced this load is seen
+                // within MAX_PARK even if its wake token was consumed.
+                std::thread::park_timeout(MAX_PARK);
                 continue;
             }
             let due_at = self.origin + Duration::from_nanos(due);
@@ -525,9 +527,10 @@ mod tests {
     #[test]
     fn a_fatal_during_a_stop_upgrades_the_code_and_keeps_the_first_deadline() {
         // #365: deterministic. Both arms happen BEFORE the watchdog thread
-        // starts, so the fire cannot race the upgrade. The Fatal asks for a
-        // 10 s deadline: if an upgrade moved the deadline, the fire would come
-        // 10 s later, not at the first decision's 300 ms.
+        // starts, so the fire cannot race the upgrade (the old form slept
+        // 200 ms against a 300 ms deadline). The Fatal asks for a 10 s
+        // deadline: an upgrade that moved the deadline would fire far later
+        // than the first decision's 300 ms.
         static W: OnceLock<Watchdog> = OnceLock::new();
         let w = W.get_or_init(Watchdog::new);
         let start = Instant::now();
@@ -554,9 +557,13 @@ mod tests {
             at >= start + Duration::from_millis(300),
             "not before the first deadline"
         );
+        // The first decision's deadline holds: the fire comes near 300 ms,
+        // not at the Fatal's 10 s nor a reset EXIT_DEADLINE (2 s). 1 s is the
+        // same margin class as the sibling test (150 ms deadline, < 400 ms).
         assert!(
-            at < start + Duration::from_secs(8),
-            "the first decision's deadline holds; the upgrade does not extend it to 10 s"
+            at < start + Duration::from_secs(1),
+            "fired at {:?}; the upgrade must not move the first deadline",
+            at - start
         );
     }
 
