@@ -144,9 +144,29 @@ fn drive_full<F>(
 where
     F: FnOnce(OutputRoutingSlot) + Send + 'static,
 {
+    drive_hooked(template, audio, switcher, prefix, ticks, control, None)
+}
+
+/// As [`drive_full`], with an optional hook run on every `format-convert`
+/// thread before each convert (#342 review I3 chaos).
+fn drive_hooked<F>(
+    template: &str,
+    audio: bool,
+    switcher: bool,
+    prefix: &str,
+    ticks: u64,
+    control: F,
+    convert_hook: Option<crate::format_convert::ConvertHook>,
+) -> Run
+where
+    F: FnOnce(OutputRoutingSlot) + Send + 'static,
+{
     let config =
         multiview_config::MultiviewConfig::load_from_toml(&template.replace('@', prefix)).unwrap();
     let mut pipeline = Pipeline::build(&config).unwrap();
+    if let Some(hook) = convert_hook {
+        pipeline.set_convert_hook(hook);
+    }
     if audio {
         pipeline.enable_program_audio();
     }
@@ -1041,4 +1061,112 @@ bitrate_kbps = 1500
     assert_eq!((configs[keys[2]].0, configs[keys[2]].1), (64, 64));
     assert_eq!(configs[keys[2]].2, 4_000_000, "default bit rate unchanged");
     assert_eq!(configs[keys[4]].2, 1_500_000);
+}
+
+/// One canvas output and one 32x64 cover output.
+const MIXED_FORMAT_CONFIG: &str = r##"
+schema_version = 1
+[canvas]
+width = 64
+height = 64
+fps = "25/1"
+pixel_format = "nv12"
+background = "#101014"
+[canvas.color]
+profile = "sdr-bt709-limited"
+[layout]
+kind = "grid"
+columns = ["1fr", "1fr"]
+rows = ["1fr"]
+areas = ["a b"]
+[[sources]]
+id = "@_a"
+kind = "test"
+[[sources]]
+id = "@_b"
+kind = "test"
+[[cells]]
+id = "cell_a"
+area = "a"
+[cells.source]
+input_id = "@_a"
+[[cells]]
+id = "cell_b"
+area = "b"
+[cells.source]
+input_id = "@_b"
+[[outputs]]
+id = "out0"
+kind = "hls"
+path = "/tmp/multiview-routing-e2e/@/a/index.m3u8"
+codec = "mpeg2video"
+segment_ms = 1000
+[[outputs]]
+id = "out1"
+kind = "hls"
+path = "/tmp/multiview-routing-e2e/@/b/index.m3u8"
+codec = "mpeg2video"
+segment_ms = 1000
+[outputs.format]
+width = 32
+height = 64
+fit = { mode = "cover" }
+"##;
+
+/// #342 review I3 (§12.10 "a wedged convert thread"): the convert thread of
+/// a non-canvas output wedges forever from tick 20. The canvas output keeps
+/// exactly one frame per tick with a steady PTS step for 320 ticks, the run
+/// is not fatal, and the wedged output keeps one frame per tick too (its
+/// picture frozen at the last converted one).
+#[test]
+fn a_wedged_convert_thread_never_moves_the_clock_or_another_output() {
+    const TICKS: u64 = 320;
+    const WEDGE_AT: u64 = 20;
+    let (release, wait) = std::sync::mpsc::channel::<()>();
+    let wait = Mutex::new(wait);
+    let wedged = Arc::new(AtomicBool::new(false));
+    let flag = Arc::clone(&wedged);
+    let hook: crate::format_convert::ConvertHook = Arc::new(move |tick| {
+        if tick >= WEDGE_AT {
+            flag.store(true, Ordering::Release);
+            // Blocks until the test ends (the sender is dropped then).
+            let _ = wait.lock().unwrap().recv();
+        }
+    });
+    let run = drive_hooked(
+        MIXED_FORMAT_CONFIG,
+        false,
+        false,
+        "route_wedge",
+        TICKS,
+        |_slot| {},
+        Some(hook),
+    );
+    assert!(wedged.load(Ordering::Acquire), "the convert thread wedged");
+    assert_eq!(run.frames, TICKS, "the clock emitted every tick");
+    let all: Vec<i64> = (0..i64::try_from(TICKS).unwrap()).collect();
+    assert_eq!(
+        pts_of(&run.outputs[0]),
+        all,
+        "canvas output: one frame per tick, PTS step one tick"
+    );
+    assert_eq!(
+        pts_of(&run.outputs[1]),
+        all,
+        "wedged output: still one (frozen) frame per tick"
+    );
+    assert_eq!(decode_size(&run.video[1]), Some((32, 64)));
+    // Frozen: every keyframe well after the wedge decodes to one picture.
+    let luma = decode_luma(&run.video[1]);
+    let late_keys: Vec<&Vec<u8>> = run.outputs[1]
+        .iter()
+        .filter(|(pts, key, _)| *key && *pts > i64::try_from(WEDGE_AT).unwrap() + 30)
+        .filter_map(|(pts, _, _)| luma.get(pts))
+        .collect();
+    assert!(late_keys.len() >= 5, "keyframes after the wedge");
+    assert!(
+        late_keys.windows(2).all(|w| w[0] == w[1]),
+        "the wedged output's picture is frozen"
+    );
+    drop(release);
 }
