@@ -783,6 +783,9 @@ struct DynamicKey {
     bus: PictureBus,
     format: Option<AuxFormat>,
     settings: usize,
+    /// The ad-hoc settings this key was opened at (an output's landed
+    /// reset, review M-2); `None` = the rendition at `settings`.
+    reset: Option<ReformatSettings>,
     /// A live format reset's key (#342 B3): never shared with another
     /// output's take (its settings are the reset output's own); while
     /// pinned (that output's base key) it never lingers.
@@ -827,6 +830,8 @@ struct PendingOpen {
     bus: PictureBus,
     format: Option<AuxFormat>,
     settings: usize,
+    /// The ad-hoc settings opened (review M-2); `None` = the rendition.
+    reset: Option<ReformatSettings>,
     /// Set for a live format reset's open (its key is that output's own).
     reformat: bool,
     principal: String,
@@ -859,6 +864,14 @@ struct Pending {
 struct OutputState {
     bus: PictureBus,
     key: usize,
+    /// The output's rendition settings index (review M-2): fixed for the
+    /// run, never the base video key (a live reset moves the base key to a
+    /// dynamic key while the settings index stays).
+    settings: usize,
+    /// The ad-hoc encoder settings of this output's landed live reset
+    /// (#342 B3, review M-2): a later take opens (or reuses) a key at THESE
+    /// settings, not the rendition's.
+    reset: Option<ReformatSettings>,
     since: u64,
     pending: Option<Pending>,
     /// A live format reset in flight (at most one per output, #342 B3).
@@ -1030,6 +1043,8 @@ impl OutputRouter {
             .map(|&key| OutputState {
                 bus: PictureBus::Program,
                 key,
+                settings: key,
+                reset: None,
                 since: 0,
                 pending: None,
                 reformat: None,
@@ -1856,6 +1871,7 @@ impl OutputRouter {
                 bus: open.bus,
                 format: open.format,
                 settings: open.settings,
+                reset: open.reset,
                 reformat: false,
                 pinned_for: None,
                 key,
@@ -2286,11 +2302,12 @@ impl OutputRouter {
         tick: u64,
         dispatcher: &mut RenditionDispatcher,
     ) -> bool {
-        let settings = self.cfg.base_keys.get(index).copied();
-        let in_flight = self
-            .opens
-            .values()
-            .any(|o| o.bus == *bus && Some(o.settings) == settings);
+        let Some(out) = self.outputs.get(index) else {
+            return false;
+        };
+        let in_flight = self.opens.values().any(|o| {
+            o.bus == *bus && o.settings == out.settings && o.reset == out.reset && !o.reformat
+        });
         if in_flight && tick.saturating_sub(started) >= OPEN_DEADLINE_TICKS {
             self.refuse_pending(index, tick, RefuseReason::EncoderNotReady, dispatcher);
         }
@@ -2344,12 +2361,16 @@ impl OutputRouter {
         tick: u64,
         dispatcher: &mut RenditionDispatcher,
     ) {
-        let Some(&settings) = self.cfg.base_keys.get(index) else {
+        let (Some(&base), Some(out)) = (self.cfg.base_keys.get(index), self.outputs.get(index))
+        else {
             return;
         };
-        // The settings index already names (format, codec settings): the
-        // base key of the output. Its feed is (bus, format) for a routed
-        // source/PVW, the canvas picture for Clean.
+        // The output's encoder settings (review M-2): its rendition settings
+        // index plus, after a live reset, that reset's ad-hoc settings. The
+        // base key is only Program's encoder. Its feed is (bus, format) for
+        // a routed source/PVW, the canvas picture for Clean.
+        let settings = out.settings;
+        let reset = out.reset.clone();
         let (_, format) = self.feed_key(index, bus);
         // Take admission: open the output's private audio bus before the
         // video move (§5.2), so it is warm at the grid boundary G.
@@ -2357,7 +2378,7 @@ impl OutputRouter {
             audio.admit(index, bus, choice, tick, dispatcher);
         }
         let existing = if *bus == PictureBus::Program {
-            Some(settings)
+            Some(base)
         } else {
             self.dynamic
                 .iter()
@@ -2365,6 +2386,7 @@ impl OutputRouter {
                     d.bus == *bus
                         && d.format == format
                         && d.settings == settings
+                        && d.reset == reset
                         && !d.reformat
                         && !dispatcher.is_key_failed(d.key)
                 })
@@ -2427,7 +2449,7 @@ impl OutputRouter {
             id,
             settings,
             bus: bus.clone(),
-            reformat: None,
+            reformat: reset.clone(),
         }) {
             Ok(()) => {
                 self.opens.insert(
@@ -2436,6 +2458,7 @@ impl OutputRouter {
                         bus: bus.clone(),
                         format,
                         settings,
+                        reset,
                         reformat: false,
                         principal: principal.to_owned(),
                         deadline: tick.saturating_add(OPEN_DEADLINE_TICKS),
@@ -2721,7 +2744,9 @@ impl OutputRouter {
         let mut keys: Vec<(String, usize)> = self
             .dynamic
             .iter()
-            .filter(|d| !dispatcher.is_key_failed(d.key))
+            // A key at a reset's ad-hoc settings is not the rendition's
+            // (review M-2): never reported as carrying `settings`.
+            .filter(|d| !dispatcher.is_key_failed(d.key) && d.reset.is_none() && !d.reformat)
             .map(|d| (crate::routing_aux::feed_name(&d.bus, d.format), d.settings))
             .collect();
         keys.sort_unstable();

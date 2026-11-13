@@ -81,7 +81,7 @@ impl OutputRouter {
                 .map_or(PictureBus::Program, |o| o.bus.clone());
             let id = self.next_open;
             self.next_open = self.next_open.wrapping_add(1);
-            let settings = self.cfg.base_keys.get(index).copied().unwrap_or(0);
+            let settings = self.outputs.get(index).map_or(0, |o| o.settings);
             let format = if super::aux_composed(&bus) {
                 req.feed_format
             } else {
@@ -100,6 +100,7 @@ impl OutputRouter {
                             bus,
                             format,
                             settings,
+                            reset: Some(req.settings.clone()),
                             reformat: true,
                             principal: req.principal.clone(),
                             deadline: tick.saturating_add(OPEN_DEADLINE_TICKS),
@@ -213,6 +214,7 @@ impl OutputRouter {
             bus: open.bus.clone(),
             format: open.format,
             settings: open.settings,
+            reset: open.reset.clone(),
             reformat: true,
             pinned_for: None,
             key,
@@ -365,6 +367,8 @@ impl OutputRouter {
         if let Some(out) = self.outputs.get_mut(index) {
             out.key = key;
             out.since = at;
+            // Later takes open at the reset's settings (review M-2).
+            out.reset = Some(req.settings.clone());
         }
         // The old base: a previous reformat's dynamic key nobody else uses
         // is unpinned and lingers out like any other live key; a run base

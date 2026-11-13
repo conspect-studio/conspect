@@ -1098,6 +1098,7 @@ fn inject(
         bus,
         format: None,
         settings: 0,
+        reset: None,
         reformat: false,
         pinned_for: None,
         key,
@@ -4373,6 +4374,11 @@ struct ReformatHarness {
     outcomes: Receiver<TakeOutcome>,
     base_force: Arc<AtomicU64>,
     opened: Arc<AtomicUsize>,
+    /// Every open, in order: the (bus, ad-hoc settings) the opener was
+    /// asked for (`None` settings = the rendition's, review M-2).
+    opens: Arc<Mutex<Vec<(PictureBus, Option<ReformatSettings>)>>>,
+    /// Source "cam", published every tick.
+    store: Arc<TileStore<Nv12Image>>,
 }
 
 #[derive(Clone, Copy)]
@@ -4390,7 +4396,15 @@ fn reformat_harness(outputs: usize, max: usize, mode: OpenMode) -> ReformatHarne
     // wedged open blocks until the run ends (never a disconnect).
     let (wedge_tx, wedge_rx) = mpsc::channel::<()>();
     let wedge_rx = Mutex::new(wedge_rx);
-    let reformat_open: ReformatOpenFn = Box::new(move |_settings, _bus| {
+    let opens: Arc<Mutex<Vec<(PictureBus, Option<ReformatSettings>)>>> = Arc::default();
+    let log = Arc::clone(&opens);
+    let take_log = Arc::clone(&opens);
+    let store = Arc::new(TileStore::<Nv12Image>::with_defaults("cam"));
+    let lookup = Arc::clone(&store);
+    let reformat_open: ReformatOpenFn = Box::new(move |settings, bus| {
+        log.lock()
+            .unwrap()
+            .push((bus.clone(), Some(settings.clone())));
         let _keep_sender = &wedge_tx;
         counter.fetch_add(1, Ordering::SeqCst);
         match mode {
@@ -4425,10 +4439,11 @@ fn reformat_harness(outputs: usize, max: usize, mode: OpenMode) -> ReformatHarne
             failed: Arc::new(AtomicBool::new(false)),
             dropped: Arc::new(AtomicU64::new(0)),
             sent: Arc::new(AtomicU64::new(0)),
-            stores: Arc::new(|_: &str| None),
+            stores: Arc::new(move |id: &str| (id == "cam").then(|| Arc::clone(&lookup))),
             preview_selection: None,
         },
-        Box::new(|_, _| {
+        Box::new(move |_, bus| {
+            take_log.lock().unwrap().push((bus.clone(), None));
             let enc: Box<dyn LiveEncoder> = Box::new(ReformatEnc { forced: false });
             Ok(enc)
         }),
@@ -4444,11 +4459,17 @@ fn reformat_harness(outputs: usize, max: usize, mode: OpenMode) -> ReformatHarne
         outcomes,
         base_force,
         opened,
+        opens,
+        store,
     }
 }
 
 impl ReformatHarness {
     fn tick(&mut self, t: u64) {
+        self.store.publish(
+            Nv12Image::solid(16, 16, 16, 128, 128, CanvasColor::default().output_tag()).unwrap(),
+            pts(t),
+        );
         self.r
             .drain_live_events(&mut self.d, &mut self.rec)
             .unwrap();
@@ -4470,6 +4491,14 @@ impl ReformatHarness {
                     &mut self.rec,
                 )
                 .unwrap();
+        }
+        if let Some(slot) = self.r.slot(&PictureBus::Source("cam".to_owned())) {
+            slot.latest
+                .store(Some(Arc::new(crate::routing_aux::AuxFrame {
+                    tick: t,
+                    generation: 1,
+                    frame: canvas(),
+                })));
         }
         self.r.publish_clean(t, &canvas());
         self.r.publish_program(t, &canvas());
@@ -4616,6 +4645,56 @@ fn a_reformatted_clean_key_reports_its_own_bus() {
         "the Clean key is the base key"
     );
     assert_eq!(x.r.bus_of_key(key), Some(PictureBus::Clean));
+}
+
+/// Review M-2: after a reset, a take of a source opens its encoder at the
+/// RESET's settings (codec, size, bit rate), not the rendition's: the base
+/// key is no longer the output's settings index.
+#[test]
+fn a_source_take_after_a_reset_opens_at_the_reset_settings() {
+    let mut x = reformat_harness(2, 6, OpenMode::Ok);
+    let mut t = 0;
+    let mut seen = Vec::new();
+    let mut run = |x: &mut ReformatHarness, t: &mut u64, op: &str, want: &TakeResult| {
+        let until = *t + REFORMAT_DEADLINE_TICKS;
+        while *t < until
+            && !seen
+                .iter()
+                .any(|(o, r, _): &(String, TakeResult, u64)| o == op && r == want)
+        {
+            x.tick(*t);
+            *t += 1;
+            seen.extend(x.results());
+        }
+        assert!(
+            seen.iter().any(|(o, r, _)| o == op && r == want),
+            "{op}: {seen:?}"
+        );
+    };
+    x.reformat("rf", 1);
+    run(&mut x, &mut t, "rf", &TakeResult::ResetApplied);
+    let reset = x.opens.lock().unwrap().last().cloned().unwrap().1;
+    assert!(reset.is_some(), "the reset opened at its own settings");
+    let cam = PictureBus::Source("cam".to_owned());
+    x.h.try_take(take("src", 1, cam.clone())).unwrap();
+    run(&mut x, &mut t, "src", &TakeResult::Applied);
+    let (bus, settings) = x.opens.lock().unwrap().last().cloned().unwrap();
+    assert_eq!(bus, cam);
+    let settings = settings.expect("opened at the reset's settings, not the rendition's");
+    assert_eq!(
+        (settings.width, settings.height, settings.bit_rate),
+        (8, 16, 1_000_000)
+    );
+    // The other output's source take still opens at the rendition (and is
+    // never shared with the reset output's key).
+    // Another principal: "p" spent its budget (2) on the reset key and
+    // this one (review X1).
+    let mut other = take("src0", 0, cam.clone());
+    other.principal = "q".to_owned();
+    x.h.try_take(other).unwrap();
+    run(&mut x, &mut t, "src0", &TakeResult::Applied);
+    assert_eq!(x.opens.lock().unwrap().last().cloned(), Some((cam, None)));
+    assert_ne!(x.d.binding_video_key(0), x.d.binding_video_key(1));
 }
 
 /// A second reformat of the same output retires the first reformat's key
