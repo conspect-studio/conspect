@@ -94,7 +94,9 @@ impl ExitFreeze {
 
 /// How long an exit waits for a `desired.json` rename already past its
 /// freeze check (#367). A rename is a metadata operation; the bound only
-/// matters on a stalled filesystem, where the exit watchdog still applies.
+/// matters on a stalled filesystem, where the later `active.toml` persist
+/// (same directory, same write serial) stalls as it did before #367 and the
+/// exit watchdog (#309) bounds the exit.
 const ACCEPTED_COMMIT_SETTLE: std::time::Duration = std::time::Duration::from_millis(500);
 
 /// The run's handle on the debounced ADR-W024 Running persister: the spawned

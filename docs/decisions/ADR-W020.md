@@ -174,8 +174,11 @@ is closed`).
   exit then waits for the gate, **bounded (500 ms) and off the async workers** — on the
   exit-durable thread (after the watchdog is armed) and on the blocking pool when a drive
   loop returns — so no `desired.json` rename is in flight when the teardown and the final
-  persist run. The wait never covers an fsync; the exit-time `active.toml` persist shares the
-  write serial and likewise waits at most for a rename.
+  persist run. The wait never covers an fsync. The exit-time `active.toml` persist shares the
+  write serial, so it waits for an in-flight rename (before #367 it waited for the whole
+  temp write, fsync and rename). A filesystem that stalls a rename in `.multiview/` also
+  stalls the `active.toml` write in the same directory; the exit watchdog (#309) is what
+  bounds that case, not this settle.
 * The watcher also checks "stopped, frozen, or command bus closed" under the config-mutation
   lock before every commit path. A closed bus (the receiver already dropped) is only a
   backstop: it becomes true after the exit decision, never in a normal run.
