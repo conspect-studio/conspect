@@ -349,6 +349,13 @@ impl multiview_h3::WtHandler for MoqWt {
     fn protocols(&self) -> &[&'static str] {
         &self.protocols
     }
+
+    /// The external runtime speaks exactly one `moqt-*` version, which is
+    /// negotiated only through `wt-protocol`: a session without it would be
+    /// closed at once, so it is refused before the ticket is claimed.
+    fn requires_protocol(&self) -> bool {
+        true
+    }
 }
 
 /// The `MoQ` registry over an external runtime for the front door's HTTP/3

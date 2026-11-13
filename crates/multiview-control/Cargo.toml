@@ -292,6 +292,8 @@ hang = "=0.21.22"
 url = "2"
 moq-net = "=0.3.21"
 moq-tokio = { version = "=0.19.34", default-features = false, features = ["noq", "ring"] }
+# Short-lived certificate for the Chrome MoQ test (`tests/h3_chrome_moq.rs`).
+time = "0.3"
 multiview-cloudflare = { path = "../multiview-cloudflare", features = ["testing"] }
 multiview-compositor = { workspace = true }
 multiview-framestore = { workspace = true }
@@ -363,6 +365,10 @@ x509-parser = "0.18"
 capture-browser-integration = []
 # Authenticated QUIC transport remains opt-in until a production feed factory is wired.
 moq-transport = ["dep:multiview-moq", "dep:url"]
+# #382: a real headless Chrome plays MoQ from the HTTP/3 front door
+# (`tests/h3_chrome_moq.rs`). Needs node + web/ deps, Chrome and ffmpeg/libvpx;
+# run by the `h3-browser-webtransport` CI job.
+moq-browser-integration = ["moq-transport"]
 "default" = ["openapi"]
 "openapi" = ["dep:utoipa", "dep:utoipa-axum", "dep:utoipa-scalar"]
 "embed-web" = ["dep:rust-embed", "dep:mime_guess"]
@@ -509,6 +515,10 @@ required-features = ["acme"]
 [[test]]
 name = "h3_site"
 required-features = ["moq-transport"]
+
+[[test]]
+name = "h3_chrome_moq"
+required-features = ["moq-browser-integration"]
 
 [[example]]
 # The real authority fixture imports the optional native MoQ provider.

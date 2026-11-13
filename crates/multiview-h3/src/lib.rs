@@ -34,6 +34,17 @@
 //! CONNECT the handler's [`WtHandler::admit`] rejects (401/403/...) does not
 //! take the slot.
 //!
+//! # Subprotocols and refusals
+//!
+//! The client's most preferred `wt-available-protocols` entry (an sf-list)
+//! that [`WtHandler::protocols`] contains is echoed as `wt-protocol` (an
+//! sf-string). An offer with none of them, or no offer when
+//! [`WtHandler::requires_protocol`], is answered `400` BEFORE
+//! [`WtHandler::admit`] (a single-use ticket is not claimed). Every refused
+//! CONNECT is counted ([`Counters::wt_refused`]) and logged with its reason
+//! (never the query), at most [`counters::REFUSAL_LOGS_PER_SECOND`] lines
+//! per second.
+//!
 //! # Bounds (invariant #10)
 //!
 //! Every queue or allocation an HTTP/3 peer can drive, and what caps it:
@@ -45,7 +56,7 @@
 //! | Streams per connection | QUIC [`QuicLimits::max_concurrent_bidi_streams`] (128) / [`QuicLimits::max_concurrent_uni_streams`] (128); every stream the adapter holds while classifying it is one of these |
 //! | Unclassified streams | the classifier reads at most [`noq_adapter::HEAD_MAX`] (16) bytes per stream into a fixed buffer; a stream still unclassified at [`H3Limits::header_deadline`] is reset (bidi `H3_REQUEST_REJECTED`, uni `H3_STREAM_CREATION_ERROR`) by one timer polled from the accept path, so a silent stream never stalls the connection |
 //! | Bytes per stream / connection | [`QuicLimits::stream_receive_window`] (1 MiB) / [`QuicLimits::receive_window`] (16 MiB) |
-//! | Request header block | the guard ([`guard`]) rejects any non-DATA frame declaring more than `max_field_section_size` (16 384) + 1 KiB the moment its length varint arrives (`H3_EXCESSIVE_LOAD`), before h3 buffers it; QPACK then enforces the field-section size; header deadline [`H3Limits::header_deadline`] (10 s from stream accept to a complete HEADERS frame, else `H3_REQUEST_REJECTED`) |
+//! | Request header block | the guard ([`guard`]) rejects any non-DATA frame declaring more than `max_field_section_size` (16 384) + 1 KiB the moment its length varint arrives (`H3_EXCESSIVE_LOAD`), before h3 buffers it; QPACK then enforces the field-section size; header deadline [`H3Limits::header_deadline`] (10 s from stream accept to a complete HEADERS frame, else `H3_REQUEST_REJECTED`; once the HEADERS frame is complete no deadline applies to the stream again: a request body or a WebTransport CONNECT stream lives on, #382) |
 //! | Peer control stream | [`guard::ControlGuard`]: SETTINGS at most 1 KiB, `CANCEL_PUSH`/GOAWAY/`MAX_PUSH_ID` at most 16 bytes, any other frame at most 1 KiB and 16 KiB over the connection's life, else the connection is closed `H3_EXCESSIVE_LOAD`; SETTINGS complete within [`H3Limits::settings_deadline`] (10 s from connection start, else `H3_MISSING_SETTINGS`); no frame partially received for longer than [`H3Limits::control_frame_deadline`] (10 s, else `H3_EXCESSIVE_LOAD`). The timer is polled from the accept path |
 //! | Peer QPACK streams | one encoder and one decoder (a second is `H3_STREAM_CREATION_ERROR`), drained by the adapter, [`noq_adapter::QPACK_STREAM_MAX`] (64) bytes each over their life (the server's dynamic table is 0), else `QPACK_ENCODER/DECODER_STREAM_ERROR` |
 //! | Other peer uni streams | push and unknown/grease types are stopped with `H3_STREAM_CREATION_ERROR` at classification |
@@ -142,10 +153,22 @@ pub trait WtHandler: Send + Sync + 'static {
         peer: SocketAddr,
     ) -> BoxFuture<'static, ()>;
 
-    /// Subprotocols the server supports, in preference order; the first one
-    /// the client also offers in `wt-available-protocols` is selected and
-    /// echoed as `wt-protocol`.
+    /// Subprotocols the server supports. The client's most preferred offer
+    /// in `wt-available-protocols` (an sf-list) that is in this list is
+    /// selected and echoed as `wt-protocol` (an sf-string); an offer with
+    /// none of them is refused with `400` before [`admit`](Self::admit).
     fn protocols(&self) -> &[&'static str];
+
+    /// Whether a session needs a negotiated subprotocol. When `true`, a
+    /// CONNECT whose offer selects none of [`protocols`](Self::protocols)
+    /// (no offer included) is refused with `400` before
+    /// [`admit`](Self::admit), so it neither burns a single-use ticket nor
+    /// gets a `200` the handler would close at once (which races the
+    /// browser's `ready`, #382). Default `false`: no offer is accepted
+    /// without `wt-protocol`.
+    fn requires_protocol(&self) -> bool {
+        false
+    }
 }
 
 /// Errors of this crate.
