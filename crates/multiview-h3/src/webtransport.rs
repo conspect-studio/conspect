@@ -130,14 +130,11 @@ fn offered_protocols(headers: &http::HeaderMap) -> Option<Vec<String>> {
     };
     let mut lines = headers.get_all(name).iter().peekable();
     lines.peek()?;
-    let mut combined = String::new();
-    for line in lines {
-        let line = line.to_str().ok()?;
-        if !combined.is_empty() {
-            combined.push_str(", ");
-        }
-        combined.push_str(line);
-    }
+    // RFC 9110 section 5.3: lines combine with ", " between EVERY pair, an
+    // empty line included (an empty member then makes the List malformed,
+    // so the field is ignored rather than its other lines used).
+    let lines: Vec<&str> = lines.map(|l| l.to_str().ok()).collect::<Option<_>>()?;
+    let combined = lines.join(", ");
     parse_protocol_list(&combined)
 }
 
