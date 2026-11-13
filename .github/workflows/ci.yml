@@ -1171,9 +1171,11 @@ jobs:
         # Mandatory chaos test for the invariant-#1 exit bound: the REAL binary
         # (with the env-armed `_chaos-test-seams`) is forced behind the clock
         # (fatal) and SIGTERMed, with source teardown held 10x past the bound.
-        # Every run: the watchdog fires 2000-2050 ms after the decision (its own
-        # clock) and the process is gone within 2.6 s as the shell sees it, with
-        # valid HLS on disk (docs/architecture/bounded-exit.md).
+        # Every run: the watchdog fires 2 s after the decision (its own clock),
+        # late only by its reported wake latency (bounded at 500 ms on this
+        # shared VM; 50 ms on a dedicated host), and the process is gone within
+        # 550 ms of the fire, with valid HLS on disk
+        # (docs/architecture/bounded-exit.md).
         run: |
           set -euo pipefail
           cargo build --locked --release -p multiview-cli --features apple,_chaos-test-seams

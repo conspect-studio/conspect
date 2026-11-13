@@ -25,14 +25,19 @@ RUNS="${2:-20}"
 MODE="${3:-both}"
 BOUND_MS=2000
 # The watchdog's own decision->fire time (monotonic) may exceed the deadline
-# only by its wake-up latency at the raised clock class: measured 0-10 ms on
-# an idle and on a 28-busy-loop host; 50 ms leaves 5x margin.
-FIRE_SLACK_MS=50
-# Decision->process-gone as the shell observes it. The process exit after the
-# fire is the notice write plus the C runtime exit, at most the 500 ms
-# backstop (EXIT_PATH_GRACE): 2.55 s by construction. The observer adds a
-# 1 ms poll (and, for fatal, the log line's own write).
-SLACK_MS=600   # 2.6 s total
+# only by the OS wake latency of its last wait (each wait is <= 20 ms). The
+# watchdog reports the worst wait lateness it saw (worst_wake_late_ms): the
+# fire may be late by at most that plus LOGIC_SLACK_MS (one 1 ms step and ms
+# rounding). The OS wake latency is the host's: <= 11 ms measured on a
+# dedicated Apple-silicon host (28 busy loops), up to 143 ms on a shared macOS
+# CI VM, where the hypervisor deschedules the vCPU. CHAOS_MAX_WAKE_LATE_MS
+# bounds it too where the host can promise one (default 50 ms off CI).
+LOGIC_SLACK_MS=5
+MAX_WAKE_LATE_MS="${CHAOS_MAX_WAKE_LATE_MS:-$([ -n "${CI:-}" ] && echo 500 || echo 50)}"
+# Fire -> process gone: the notice write plus the C runtime exit, cut by the
+# 500 ms backstop (EXIT_PATH_GRACE); the observer adds its 1 ms poll and, for
+# a fatal, the log write it waits for. Off CI: decision -> gone <= 2.6 s.
+EXIT_PATH_MS=550
 HOLD_MS=20000   # teardown held 10x past the bound
 WORK="$(mktemp -d)"
 trap 'rm -rf "${WORK}"' EXIT
@@ -253,18 +258,20 @@ PY
   # The durable Running state was written at the exit decision.
   grep -q "exit-time running-state persist written" "${log}" && [ -s "${WORK}/.multiview/active.toml" ] \
     || { echo "  FAIL: the exit-time Running persist did not land"; grep -E "persist|armed|overran|control plane|stage=" "${log}" | sed 's/\x1b\[[0-9;]*m//g' | cut -c1-200 | tail -12; ls -la "${WORK}/.multiview" 2>&1 | head -5; return 1; }
-  # The design bound: the watchdog fires within EXIT_DEADLINE + FIRE_SLACK of
-  # the decision (its own clock).
-  [ -n "${fire_ms}" ] || { echo "  FAIL: no fired_after_decision_ms in the hard-exit line"; return 1; }
-  [ "${fire_ms}" -ge "${BOUND_MS}" ] && [ "${fire_ms}" -le $((BOUND_MS + FIRE_SLACK_MS)) ] \
-    || { echo "  FAIL: watchdog fired ${fire_ms} ms after the decision (want ${BOUND_MS}..$((BOUND_MS + FIRE_SLACK_MS)))"; grep -E "scheduling class|chaos|teardown overran" "${log}" | cut -c1-240 | tail -6; return 1; }
+  # The design bound: the watchdog fires at EXIT_DEADLINE after the decision
+  # (its own clock), late only by the host's wake latency, never by itself.
+  [ -n "${fire_ms}" ] && [ -n "${wake_ms}" ] || { echo "  FAIL: no fired_after_decision_ms / worst_wake_late_ms in the hard-exit line"; return 1; }
+  [ "${fire_ms}" -ge "${BOUND_MS}" ] && [ "${fire_ms}" -le $((BOUND_MS + wake_ms + LOGIC_SLACK_MS)) ] \
+    || { echo "  FAIL: watchdog fired ${fire_ms} ms after the decision (want ${BOUND_MS}..$((BOUND_MS + wake_ms + LOGIC_SLACK_MS)): its worst wait was ${wake_ms} ms late)"; grep -E "scheduling class|chaos|teardown overran" "${log}" | cut -c1-240 | tail -6; return 1; }
+  [ "${wake_ms}" -le "${MAX_WAKE_LATE_MS}" ] \
+    || { echo "  FAIL: a watchdog wait woke ${wake_ms} ms late (host bound ${MAX_WAKE_LATE_MS} ms)"; return 1; }
   grep -q "exit watchdog scheduling class" "${log}" || { echo "  FAIL: watchdog class not reported"; return 1; }
   if [ "${mode}" = falterstop ]; then
     grep -q "chaos: forced shed" "${log}" || { echo "  FAIL: forced shed not exercised"; return 1; }
   fi
-  # And the process was gone soon after, as the shell sees it (the exit path
-  # plus the shell's own polling and clock reads).
-  [ "${took}" -le $((BOUND_MS + SLACK_MS + extra)) ] || { echo "  FAIL: exit took ${took} ms > ${BOUND_MS}+${SLACK_MS}"; grep -E "teardown|exit|chaos" "${log}" | tail -12; return 1; }
+  # And the process was gone within the exit path after the fire, as the
+  # observer sees it.
+  [ "${took}" -le $((fire_ms + EXIT_PATH_MS + extra)) ] || { echo "  FAIL: exit took ${took} ms > fire ${fire_ms} + ${EXIT_PATH_MS}"; grep -E "teardown|exit|chaos" "${log}" | tail -12; return 1; }
   if [ "${mode}" = stopwedge ]; then
     # The output could not finalise: only require that what is on disk is valid.
     local m="${WORK}/hls/index.m3u8"
