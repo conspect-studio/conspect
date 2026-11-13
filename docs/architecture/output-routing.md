@@ -1977,8 +1977,10 @@ a multi-crosspoint take where one member cannot key or prime (a destination bus 
 floor, a passthrough member without an admitted picture bridge, a never-fresh source) leaves every
 member's destination unchanged until the single adoption tick, or refuses the whole set within 150
 ticks, while Program's tick count and PTS are unchanged; an output format reset leaves Program's
-tick count and PTS and another output untouched; passthrough: PTS = tick on every packet across 10
-min, a cold start and a restart with a persisted passthrough patch emit the encoded path or the
+tick count and PTS and another output untouched; passthrough: across 10 min exactly one AU per tick, the run's first IDR
+has DTS equal to the move tick, every later AU has DTS = previous DTS + 1 tick and PTS − DTS equal
+to the source's reorder offset (a B-frame run keeps its non-zero reorder), and slate and picture
+bridge AUs have PTS = DTS = tick; a cold start and a restart with a persisted passthrough patch emit the encoded path or the
 format slate from the output's first tick, a source stall bridges on the same tick (no hole, no
 repeat beyond the bridge) and returns not before 30 stable ticks, a parameter change bridges, writes
 the medium's discontinuity and returns not before 300 stable ticks, a 200 ppm drift both ways keeps
