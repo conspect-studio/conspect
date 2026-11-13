@@ -198,6 +198,17 @@ pub struct NetworkConfig {
     /// path; `direct` mode with the redirect enabled only.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub acme_webroot: Option<String>,
+    /// A static PEM certificate chain for the front door's TCP door only
+    /// (slice 6, issue #292): the site certificate on TCP 443 without turning
+    /// the loopback `[control] listen` admin listener into TLS (which
+    /// `[control.tls]` does). Reloaded when the file changes (certbot renews in
+    /// place). Needs [`key_file`](Self::key_file); not with `[network.tls]`
+    /// (ACME issues the door's certificate then). Absolute path.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cert_file: Option<std::path::PathBuf>,
+    /// The private key for [`cert_file`](Self::cert_file). Absolute path.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key_file: Option<std::path::PathBuf>,
 }
 
 impl Default for NetworkConfig {
@@ -216,6 +227,8 @@ impl Default for NetworkConfig {
             proxy_listen: None,
             ice_tcp: None,
             acme_webroot: None,
+            cert_file: None,
+            key_file: None,
         }
     }
 }
@@ -408,6 +421,28 @@ impl NetworkConfig {
     pub fn validate(&self) -> Result<(), ConfigError> {
         self.validate_socket()?;
         self.validate_tcp()?;
+        match (&self.cert_file, &self.key_file) {
+            (None, None) => {}
+            (Some(cert), Some(key)) => {
+                if !cert.is_absolute() || !key.is_absolute() {
+                    return Err(ConfigError::Validation(
+                        "network.cert_file and network.key_file must be absolute paths".to_owned(),
+                    ));
+                }
+                if self.tls.is_some() {
+                    return Err(ConfigError::Validation(
+                        "network.cert_file/key_file and [network.tls] are exclusive: ACME issues \
+                         the front door's certificate when [network.tls] is set"
+                            .to_owned(),
+                    ));
+                }
+            }
+            _ => {
+                return Err(ConfigError::Validation(
+                    "network.cert_file and network.key_file go together".to_owned(),
+                ))
+            }
+        }
         if let Some(webroot) = &self.acme_webroot {
             if !std::path::Path::new(webroot).is_absolute() {
                 return Err(ConfigError::Validation(
@@ -444,6 +479,16 @@ impl NetworkConfig {
             )),
             (_, None) => Ok(()),
         }
+    }
+
+    /// The door-only static certificate pair as a `[control.tls]`-shaped
+    /// value (`network.cert_file` + `network.key_file`), when set.
+    #[must_use]
+    pub fn static_site_tls(&self) -> Option<crate::tls::TlsConfig> {
+        Some(crate::tls::TlsConfig::Static {
+            cert_file: self.cert_file.clone()?,
+            key_file: self.key_file.clone()?,
+        })
     }
 
     /// The `[network.ice_tcp] enabled` value (default true).

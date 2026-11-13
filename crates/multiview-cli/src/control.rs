@@ -720,25 +720,50 @@ where
     // One static certificate source for both listeners, reloaded when certbot
     // renews the files in place (slice 6, #292): no restart for a renewal.
     #[cfg(all(feature = "tls", unix))]
-    let static_source = static_tls_source(config)?;
+    let static_source = static_tls_source(config.control.as_ref().and_then(|c| c.tls.clone()))?;
+    // The door's own static pair (`[network] cert_file/key_file`) wins over
+    // `[control.tls]` for the door; the loopback listener keeps `[control.tls]`
+    // (or plain HTTP).
+    #[cfg(all(feature = "tls", unix))]
+    let door_source = match static_tls_source(
+        config
+            .network
+            .as_ref()
+            .and_then(multiview_config::NetworkConfig::static_site_tls),
+    )? {
+        Some(pair) => Some(pair),
+        None => static_source.clone(),
+    };
     #[cfg(all(feature = "tls", unix))]
     let shutdown = {
-        let reload = static_source.as_ref().map(|(tls, source)| {
-            AbortTask(multiview_control::spawn_static_certificate_reload(
+        let mut reloads = Vec::new();
+        for (tls, source) in static_source.iter().chain(door_source.iter()) {
+            if reloads.iter().any(|(t, _)| t == tls) {
+                continue;
+            }
+            reloads.push((
                 tls.clone(),
-                Arc::clone(source),
-                multiview_control::STATIC_CERTIFICATE_POLL,
-            ))
-        });
+                AbortTask(multiview_control::spawn_static_certificate_reload(
+                    tls.clone(),
+                    Arc::clone(source),
+                    multiview_control::STATIC_CERTIFICATE_POLL,
+                )),
+            ));
+        }
         async move {
-            let _reload = reload;
+            let _reloads = reloads;
             shutdown.await;
         }
     };
     let shutdown = attach_front_door_site(
         front_door,
         #[cfg(all(feature = "tls", unix))]
-        static_source.as_ref().map(|(_, source)| Arc::clone(source)),
+        door_source.as_ref().map(|(_, source)| Arc::clone(source)),
+        #[cfg(not(all(feature = "tls", unix)))]
+        config
+            .network
+            .as_ref()
+            .is_some_and(|n| n.static_site_tls().is_some()),
         move |watch| multiview_control::ConnectionServer::new(site_app, &site_options, watch),
         shutdown,
     )?;
@@ -804,6 +829,7 @@ fn attach_front_door_site<F>(
     #[cfg(all(feature = "tls", unix))] static_source: Option<
         Arc<multiview_control::certificate_source::StaticCertificateSource>,
     >,
+    #[cfg(not(all(feature = "tls", unix)))] config_has_door_cert: bool,
     server: impl FnOnce(tokio::sync::watch::Receiver<bool>) -> multiview_control::ConnectionServer,
     shutdown: F,
 ) -> std::io::Result<std::pin::Pin<Box<dyn Future<Output = ()> + Send + 'static>>>
@@ -813,6 +839,14 @@ where
     let Some(door) = front_door.filter(|d| d.has_tcp_door()) else {
         return Ok(Box::pin(shutdown));
     };
+    #[cfg(not(all(feature = "tls", unix)))]
+    if config_has_door_cert {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "network.cert_file/key_file is set but this `multiview` build lacks the `tls` \
+             feature (or the platform is not unix); rebuild with --features tls",
+        ));
+    }
     #[cfg(all(feature = "tls", unix))]
     let site = match static_source {
         Some(source) => Some(
@@ -863,27 +897,27 @@ fn install_ui_dir(config: &MultiviewConfig) -> std::io::Result<()> {
     }
 }
 
-/// The `[control.tls] mode = "static"` pair loaded once into a reloadable
-/// source shared by the plain TLS listener and the front door (slice 6).
+/// A `mode = "static"` pair (`[control.tls]`, or the door's `[network]
+/// cert_file/key_file`) loaded once into a reloadable source (slice 6).
 ///
 /// # Errors
 /// A certificate that cannot be loaded (startup fails loudly, as before).
 #[cfg(all(feature = "tls", unix))]
 #[allow(clippy::type_complexity)]
 fn static_tls_source(
-    config: &MultiviewConfig,
+    tls: Option<multiview_config::TlsConfig>,
 ) -> std::io::Result<
     Option<(
         multiview_config::TlsConfig,
         Arc<multiview_control::certificate_source::StaticCertificateSource>,
     )>,
 > {
-    let Some(tls) = config.control.as_ref().and_then(|c| c.tls.as_ref()) else {
+    let Some(tls) = tls else {
         return Ok(None);
     };
-    let source = multiview_control::static_certificate_source(tls)
+    let source = multiview_control::static_certificate_source(&tls)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
-    Ok(Some((tls.clone(), Arc::new(source))))
+    Ok(Some((tls, Arc::new(source))))
 }
 
 /// Abort the off-clock management task when the server exits or is cancelled.

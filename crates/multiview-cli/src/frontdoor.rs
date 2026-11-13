@@ -318,7 +318,7 @@ impl FrontDoorRun {
             return;
         };
         let Some(site) = tls_site else {
-            tracing::warn!(%tcp, "front-door TCP door: no site certificate ([control.tls] static, a `tls` build on unix), so TLS on the door is unavailable; ICE-TCP still runs");
+            tracing::warn!(%tcp, "front-door TCP door: no site certificate ([network] cert_file/key_file or [control.tls] static, a `tls` build on unix), so TLS on the door is unavailable; ICE-TCP still runs");
             return;
         };
         // Read-modify-write: only the site half changes here, so a previously
