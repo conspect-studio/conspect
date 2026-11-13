@@ -41,7 +41,9 @@ use std::net::SocketAddr;
 ///    direct, multi-homed case): return it unchanged.
 /// 2. **Same-family match** — no exact match (NAT 1:1 / Docker reports the
 ///    private interface IP while the gathered candidate is the public advertised
-///    address): return the first gathered candidate of the same IP family.
+///    address): return the first gathered candidate of the same IP family. An
+///    IPv4-mapped arrival (`[::ffff:10.0.0.5]`, a dual-stack socket's IPv4
+///    flow) is unmapped first and counts as IPv4.
 /// 3. **First concrete candidate** — neither matched: return the first gathered
 ///    candidate (str0m will pair it with the remote; any valid pair connects).
 ///
@@ -56,12 +58,69 @@ pub fn resolve_local_destination(arrival: SocketAddr, candidates: &[SocketAddr])
     if candidates.contains(&arrival) {
         return arrival;
     }
+    // An IPv4-mapped arrival (`[::ffff:a.b.c.d]`, as a dual-stack socket
+    // reports an IPv4 flow) is IPv4 for matching purposes.
+    let unmapped = unmap(arrival);
+    if unmapped != arrival && candidates.contains(&unmapped) {
+        return unmapped;
+    }
     // 2. Same-family match: pick the gathered candidate of the same IP family.
-    if let Some(same_family) = candidates.iter().find(|c| c.is_ipv4() == arrival.is_ipv4()) {
+    if let Some(same_family) = candidates
+        .iter()
+        .find(|c| c.is_ipv4() == unmapped.is_ipv4())
+    {
         return *same_family;
     }
     // 3. Fall back to the first gathered candidate; if none, leave arrival as-is.
     candidates.first().copied().unwrap_or(arrival)
+}
+
+/// An IPv4-mapped IPv6 socket address as plain IPv4; anything else unchanged.
+fn unmap(addr: SocketAddr) -> SocketAddr {
+    match addr {
+        SocketAddr::V6(v6) => v6
+            .ip()
+            .to_ipv4_mapped()
+            .map_or(addr, |v4| SocketAddr::new(v4.into(), v6.port())),
+        SocketAddr::V4(_) => addr,
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod resolve_tests {
+    use super::*;
+
+    /// Review M1 (PR 337): an IPv4-mapped arrival behind NAT 1:1 resolves
+    /// onto the advertised IPv4 candidate, not the IPv6 one.
+    #[test]
+    fn a_mapped_v4_arrival_picks_the_v4_candidate() {
+        let arrival: SocketAddr = "[::ffff:10.0.0.5]:443".parse().unwrap();
+        let v6: SocketAddr = "[2001:db8::10]:443".parse().unwrap();
+        let v4: SocketAddr = "203.0.113.10:443".parse().unwrap();
+        assert_eq!(resolve_local_destination(arrival, &[v6, v4]), v4);
+        assert_eq!(resolve_local_destination(arrival, &[v4, v6]), v4);
+    }
+
+    /// A mapped arrival whose unmapped form is itself a candidate is that
+    /// candidate exactly.
+    #[test]
+    fn a_mapped_arrival_matches_its_unmapped_candidate_exactly() {
+        let arrival: SocketAddr = "[::ffff:203.0.113.10]:443".parse().unwrap();
+        let v6: SocketAddr = "[2001:db8::10]:443".parse().unwrap();
+        let v4: SocketAddr = "203.0.113.10:443".parse().unwrap();
+        let other_v4: SocketAddr = "198.51.100.1:443".parse().unwrap();
+        assert_eq!(resolve_local_destination(arrival, &[v6, other_v4, v4]), v4);
+    }
+
+    /// A native IPv6 arrival is unaffected by the unmapping.
+    #[test]
+    fn a_native_v6_arrival_still_picks_the_v6_candidate() {
+        let arrival: SocketAddr = "[fd00::5]:443".parse().unwrap();
+        let v6: SocketAddr = "[2001:db8::10]:443".parse().unwrap();
+        let v4: SocketAddr = "203.0.113.10:443".parse().unwrap();
+        assert_eq!(resolve_local_destination(arrival, &[v4, v6]), v6);
+    }
 }
 
 #[cfg(all(test, target_os = "linux"))]

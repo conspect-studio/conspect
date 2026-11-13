@@ -248,6 +248,29 @@ describe('<WhepPlayer>', () => {
     expect(onStatus).toHaveBeenCalledWith('playing');
   });
 
+  it('reports the selected ICE pair (WebRTC over TCP) on data-ice-pair', async () => {
+    const fetchImpl = makeFetch(() => sdpResponse(201, 'sessions/abc'));
+    const { getByTestId } = renderWithProviders(
+      <WhepPlayer
+        endpoint="/api/v1/preview/program/whep"
+        label="Program"
+        pcFactory={() => new FakePeerConnection() as unknown as RTCPeerConnection}
+        fetchImpl={fetchImpl}
+      />,
+    );
+    await act(async () => { await vi.advanceTimersByTimeAsync(0); });
+    expect(getByTestId('whep-player').getAttribute('data-ice-pair')).toBe('none');
+    const pc = FakePeerConnection.last;
+    if (pc) pc.statsRows = [
+      { id: 'T', type: 'transport', selectedCandidatePairId: 'P' },
+      { id: 'P', type: 'candidate-pair', localCandidateId: 'L', remoteCandidateId: 'R' },
+      { id: 'L', type: 'local-candidate', candidateType: 'host', protocol: 'tcp' },
+      { id: 'R', type: 'remote-candidate', candidateType: 'host', protocol: 'tcp' },
+    ];
+    await act(async () => { await vi.advanceTimersByTimeAsync(1000); });
+    expect(getByTestId('whep-player').getAttribute('data-ice-pair')).toBe('tcp/host-host');
+  });
+
   it.each([['video', 'audio'], ['audio', 'video']] as const)(
     'keeps video attached when %s arrives before %s on separate streams',
     (first, second) => {

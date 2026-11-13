@@ -35,7 +35,7 @@ use crate::error::{Result, WebRtcError};
 use crate::transport::whep_serve::{ServeLane, WhepServeHandle};
 use crate::transport::whip_endpoint::{IngestLane, WhipEndpoint, WhipHandle};
 use crate::transport::whip_push::{PushLane, WhipPushSpec};
-use crate::transport::{WebRtcEndpoint, WhepServeEndpoint};
+use crate::transport::{Transport, WebRtcEndpoint, WhepServeEndpoint};
 use crate::turn::TurnRelayDriver;
 
 /// The maximum UDP datagram the unified recv loop reads.
@@ -147,6 +147,11 @@ struct RunProbe {
     /// pure unused instrumentation state in a release build.
     #[cfg(test)]
     handoff_services: std::sync::atomic::AtomicU64,
+    /// Completed idle-tick servicing passes (`ServiceOrigin::IdleTick`).
+    /// `cfg(test)`-only: the shared-lane fairness test asserts the tick keeps
+    /// running under a permanently ready lane.
+    #[cfg(test)]
+    idle_tick_services: std::sync::atomic::AtomicU64,
     /// Times a readable wake drained the socket to `WouldBlock` (or failed)
     /// instead of exhausting its budget — a NATURAL yield point, after which
     /// the next `readable()` can return `Pending`. `cfg(test)`-only (review
@@ -232,6 +237,99 @@ pub trait SharedInbound: Send + 'static {
     fn invalidated(&mut self, peer: SocketAddr);
 }
 
+/// One deframed ICE-TCP frame delivered by a shared front door's TCP door
+/// (ADR-0107 slice 4, RFC 6544 / RFC 4571).
+#[derive(Debug, Clone)]
+pub struct InboundFrame {
+    /// The remote peer (IPv4-mapped addresses unmapped).
+    pub peer: SocketAddr,
+    /// The accepted connection's local address (the TCP door's address).
+    pub local: SocketAddr,
+    /// The frame payload, without the RFC 4571 length prefix.
+    pub payload: Vec<u8>,
+}
+
+/// The send half of an ICE-TCP lane, usable as `&dyn TcpSend` by every pump.
+pub trait TcpSend: Send + Sync {
+    /// Never blocks: queue the frame on the peer's connection (drop-oldest
+    /// inside). `false` = no such connection.
+    fn send(&self, peer: SocketAddr, payload: &[u8]) -> bool;
+}
+
+/// The ICE-TCP lane of a front door's TCP door: deframed inbound frames from
+/// every ICE-TCP connection, and a non-blocking send (via [`TcpSend`]).
+pub trait SharedTcp: TcpSend + 'static {
+    /// Poll the next frame; `Ready(None)` once the door is gone.
+    fn poll_next(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<InboundFrame>>;
+    /// Take a queued frame without waiting.
+    fn try_next(&mut self) -> Option<InboundFrame>;
+}
+
+/// Where a pump sends: the UDP socket, plus the ICE-TCP lane when the endpoint
+/// runs on a front door with ICE-TCP. A [`Transport::Tcp`] datagram goes to
+/// `tcp` (dropped when absent), never to the socket.
+#[derive(Clone, Copy)]
+pub struct Egress<'a> {
+    /// The UDP send socket.
+    pub socket: &'a tokio::net::UdpSocket,
+    /// The ICE-TCP send half, if any.
+    pub tcp: Option<&'a dyn TcpSend>,
+}
+
+impl std::fmt::Debug for Egress<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Egress")
+            .field("socket", &self.socket)
+            .field("tcp", &self.tcp.is_some())
+            .finish()
+    }
+}
+
+impl<'a> Egress<'a> {
+    /// UDP only (the socket-owning drivers).
+    #[must_use]
+    pub fn udp(socket: &'a tokio::net::UdpSocket) -> Self {
+        Self { socket, tcp: None }
+    }
+}
+
+fn egress_of<'a, T: SharedTcp>(
+    socket: &'a tokio::net::UdpSocket,
+    tcp: Option<&'a T>,
+) -> Egress<'a> {
+    Egress {
+        socket,
+        tcp: match tcp {
+            Some(t) => Some(t),
+            None => None,
+        },
+    }
+}
+
+/// The absent ICE-TCP lane of [`UnifiedEndpoint::run_shared`].
+enum NoTcp {}
+
+impl TcpSend for NoTcp {
+    fn send(&self, _peer: SocketAddr, _payload: &[u8]) -> bool {
+        match *self {}
+    }
+}
+
+impl SharedTcp for NoTcp {
+    fn poll_next(
+        &mut self,
+        _cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<InboundFrame>> {
+        match *self {}
+    }
+    fn try_next(&mut self) -> Option<InboundFrame> {
+        match *self {}
+    }
+}
+
 /// The single-socket WebRTC endpoint: ONE bound dual-stack UDP socket and ONE
 /// TURN relay driver, shared by every WebRTC role (ADR-0048 §4).
 ///
@@ -247,6 +345,10 @@ pub struct UnifiedEndpoint {
     /// role. Inbound datagrams' local destination is resolved onto one of these so
     /// str0m's STUN matching accepts them (box-validation defect #3).
     host_candidates: Vec<SocketAddr>,
+    /// The passive ICE-TCP candidates every role advertises (empty unless
+    /// `ice_tcp_port` is set on a front-door endpoint). An inbound frame's local
+    /// address is resolved onto one of these.
+    tcp_candidates: Vec<SocketAddr>,
     /// The WHIP ingest lane (registered when the config has `webrtc` sources).
     ingest: Option<IngestLane>,
     /// The WHEP output-serve lane (registered when the config has `webrtc` outputs).
@@ -276,6 +378,7 @@ impl std::fmt::Debug for UnifiedEndpoint {
 pub struct UnifiedBuilder {
     endpoint: UnifiedEndpoint,
     host_candidates: Vec<SocketAddr>,
+    tcp_candidates: Vec<SocketAddr>,
 }
 
 impl std::fmt::Debug for UnifiedBuilder {
@@ -292,7 +395,10 @@ impl UnifiedEndpoint {
     /// # Errors
     ///
     /// [`WebRtcError::Socket`] / [`WebRtcError::Config`] if the bind fails.
-    pub fn bind(config: EndpointConfig) -> Result<UnifiedBuilder> {
+    pub fn bind(mut config: EndpointConfig) -> Result<UnifiedBuilder> {
+        // The socket-owning driver ([`run`](Self::run)) has no ICE-TCP lane:
+        // never advertise a TCP candidate nothing serves.
+        config.ice_tcp_port = None;
         Self::builder(config.clone(), WebRtcEndpoint::bind(config)?)
     }
 
@@ -313,11 +419,15 @@ impl UnifiedEndpoint {
 
     fn builder(config: EndpointConfig, endpoint: WebRtcEndpoint) -> Result<UnifiedBuilder> {
         let host_candidates = endpoint.host_candidates()?;
+        let tcp_candidates =
+            crate::transport::tcp_passive_candidates(&host_candidates, config.ice_tcp_port);
         Ok(UnifiedBuilder {
+            tcp_candidates: tcp_candidates.clone(),
             endpoint: Self {
                 endpoint,
                 config,
                 host_candidates: host_candidates.clone(),
+                tcp_candidates,
                 ingest: None,
                 serve: None,
                 preview: None,
@@ -344,6 +454,13 @@ impl UnifiedBuilder {
         &self.host_candidates
     }
 
+    /// The passive ICE-TCP candidates every role advertises (empty without
+    /// `ice_tcp_port`).
+    #[must_use]
+    pub fn tcp_candidates(&self) -> &[SocketAddr] {
+        &self.tcp_candidates
+    }
+
     /// The local address the single shared socket is bound to (the relay
     /// candidate's `raddr` base; the bound host candidate the preview egress uses).
     ///
@@ -358,8 +475,11 @@ impl UnifiedBuilder {
     /// [`WhipHandle`] the control plane negotiates publishers against.
     #[must_use]
     pub fn with_ingest(mut self) -> (Self, WhipHandle) {
-        let (handle, commands, shared) =
-            WhipHandle::build(&self.endpoint.config, self.host_candidates.clone());
+        let (handle, commands, shared) = WhipHandle::build(
+            &self.endpoint.config,
+            self.host_candidates.clone(),
+            self.tcp_candidates.clone(),
+        );
         self.endpoint.ingest = Some(IngestLane {
             commands,
             shared,
@@ -372,8 +492,11 @@ impl UnifiedBuilder {
     /// [`WhepServeHandle`] the control plane negotiates viewers against.
     #[must_use]
     pub fn with_serve(mut self) -> (Self, WhepServeHandle) {
-        let (handle, commands, shared) =
-            WhepServeHandle::build(&self.endpoint.config, self.host_candidates.clone());
+        let (handle, commands, shared) = WhepServeHandle::build(
+            &self.endpoint.config,
+            self.host_candidates.clone(),
+            self.tcp_candidates.clone(),
+        );
         self.endpoint.serve = Some(ServeLane {
             commands,
             shared,
@@ -407,6 +530,7 @@ impl UnifiedBuilder {
                 feed,
                 audio,
                 host_candidates: self.host_candidates.clone(),
+                tcp_candidates: self.tcp_candidates.clone(),
             },
             signaller,
         ));
@@ -507,6 +631,10 @@ impl UnifiedEndpoint {
 
         let mut buf = vec![0u8; RECV_BUFFER];
         let mut tick = tokio::time::interval(tick_period);
+        // A late tick runs once and the cadence restarts from it (no burst).
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        // The socket-owning driver has no ICE-TCP lane (UDP only).
+        let egress = Egress::udp(&socket);
 
         loop {
             if stop.load(Ordering::Acquire) {
@@ -524,7 +652,7 @@ impl UnifiedEndpoint {
                 _ = tick.tick() => {
                     let now = Instant::now();
                     Self::service_timers_and_gc(
-                        &socket, &mut turn,
+                        egress, &mut turn,
                         &mut ingest, &mut serve, preview.as_ref(), &mut push,
                         local_addr, now, probe,
                         #[cfg(test)]
@@ -581,7 +709,7 @@ impl UnifiedEndpoint {
                         }
                         tokio::task::yield_now().await;
                         Self::service_timers_and_gc(
-                            &socket, &mut turn,
+                            egress, &mut turn,
                             &mut ingest, &mut serve, preview.as_ref(), &mut push,
                             local_addr, now, probe,
                             #[cfg(test)]
@@ -597,7 +725,7 @@ impl UnifiedEndpoint {
                         // (the full tick servicing runs on the idle tick arm). No
                         // re-arm is needed — tokio cleared readiness.
                         Self::pump_all(
-                            &socket, &mut turn,
+                            egress, &mut turn,
                             ingest.as_mut(), serve.as_mut(), preview.as_ref(), &mut push,
                             local_addr, now,
                             #[cfg(test)]
@@ -616,21 +744,62 @@ impl UnifiedEndpoint {
     /// endpoint's own descriptor (a duplicate of the shared socket), and report
     /// validated peers back so the dispatcher can tell established flows from
     /// new ones. Same bounded per-wake budget and servicing handoff as
-    /// [`run`](Self::run). Spawn it on the front door's runtime.
+    /// [`run`](Self::run). Spawn it on the front door's runtime. No ICE-TCP:
+    /// see [`run_shared_with_tcp`](Self::run_shared_with_tcp).
     ///
     /// # Errors
     ///
     /// [`WebRtcError::Socket`] if converting the send socket to async fails.
+    pub async fn run_shared<I: SharedInbound>(
+        self,
+        inbound: I,
+        stop: Arc<AtomicBool>,
+    ) -> Result<()> {
+        self.run_shared_with_tcp(inbound, None::<NoTcp>, stop).await
+    }
+
+    /// [`run_shared`](Self::run_shared) plus the front door's ICE-TCP lane
+    /// (slice 4): deframed frames from `tcp` reach every role as
+    /// [`Transport::Tcp`] on the gathered passive TCP candidate, and every
+    /// [`Transport::Tcp`] transmit goes to [`TcpSend::send`] (synchronous,
+    /// never blocks on a peer). A lane that ends (`Ready(None)`) is no longer
+    /// polled; UDP keeps running.
+    ///
+    /// Scheduling (invariant #10): the `select!` is biased tick → UDP → TCP,
+    /// and the tick uses [`MissedTickBehavior::Delay`](tokio::time::MissedTickBehavior::Delay)
+    /// (a late tick never bursts). Each lane wake drains at most one budget
+    /// ([`MAX_DATAGRAMS_PER_WAKE`] items / [`MAX_DRAIN_TIME`]). When a wake
+    /// exhausts its budget, the OTHER lane is drained once, without waiting,
+    /// with the same budget (`try_next` loop) — so a permanently ready lane
+    /// can never starve the other: every lane is served at least once per two
+    /// budgets. An exhausted wake (either lane) is then followed by
+    /// `yield_now` and one full servicing pass (the bounded handoff), and the
+    /// biased tick arm is polled first on the next iteration.
+    ///
+    /// # Errors
+    ///
+    /// [`WebRtcError::Socket`] if converting the send socket to async fails.
+    pub async fn run_shared_with_tcp<I: SharedInbound, T: SharedTcp>(
+        self,
+        inbound: I,
+        tcp: Option<T>,
+        stop: Arc<AtomicBool>,
+    ) -> Result<()> {
+        self.run_shared_body(inbound, tcp, stop, &RunProbe::default())
+            .await
+    }
+
     #[allow(
         clippy::too_many_lines,
         reason = "one select! loop, mirroring run_inner_body for the shared-socket input"
     )]
-    pub async fn run_shared<I: SharedInbound>(
+    async fn run_shared_body<I: SharedInbound, T: SharedTcp>(
         self,
         mut inbound: I,
+        mut tcp: Option<T>,
         stop: Arc<AtomicBool>,
+        probe: &RunProbe,
     ) -> Result<()> {
-        let probe = RunProbe::default();
         let bind_addr = self.endpoint.config().bind_addr();
         let local_addr = self.endpoint.local_addr()?;
         let concrete_candidates: Vec<SocketAddr> = self
@@ -639,6 +808,7 @@ impl UnifiedEndpoint {
             .copied()
             .filter(|a| !a.ip().is_unspecified())
             .collect();
+        let tcp_candidates = self.tcp_candidates;
         let mut turn = TurnRelayDriver::from_config(&self.config, Instant::now());
         let std_socket = self.endpoint.into_socket();
         std_socket
@@ -657,9 +827,12 @@ impl UnifiedEndpoint {
         let preview = self.preview;
         let mut push = self.push;
         let mut tick = tokio::time::interval(DRIVER_TICK);
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         // Bounded by the session caps: one entry per validated session peer.
         let mut reported: std::collections::HashSet<SocketAddr> = std::collections::HashSet::new();
         let mut current: Vec<SocketAddr> = Vec::new();
+        // The TCP lane ended (the door is gone): stop polling it.
+        let mut tcp_done = tcp.is_none();
 
         loop {
             if stop.load(Ordering::Acquire) {
@@ -668,20 +841,22 @@ impl UnifiedEndpoint {
                 }
                 return Ok(());
             }
-            tokio::select! {
+            let exhausted = tokio::select! {
                 biased;
                 _ = tick.tick() => {
                     let now = Instant::now();
+                    let egress = egress_of(&socket, tcp.as_ref());
                     Self::service_timers_and_gc(
-                        &socket, &mut turn,
+                        egress, &mut turn,
                         &mut ingest, &mut serve, preview.as_ref(), &mut push,
-                        local_addr, now, &probe,
+                        local_addr, now, probe,
                         #[cfg(test)]
                         ServiceOrigin::IdleTick,
                     ).await;
                     current.clear();
                     Self::validated_peers(ingest.as_ref(), serve.as_ref(), preview.as_ref(), &push, &mut current);
                     Self::sync_validated(&mut inbound, &mut reported, &current);
+                    continue;
                 }
                 first = std::future::poll_fn(|cx| inbound.poll_next(cx)) => {
                     let Some(first) = first else {
@@ -689,59 +864,189 @@ impl UnifiedEndpoint {
                         return Ok(());
                     };
                     let now = Instant::now();
-                    let started = Instant::now();
-                    let mut next = Some(first);
-                    let mut read = 0usize;
-                    while let Some(d) = next.take() {
-                        read += 1;
-                        // No PKTINFO on a wildcard-bound socket: the concrete
-                        // local destination is unknown, so drop the datagram
-                        // rather than map it onto a guessed candidate, exactly
-                        // as the socket-owning driver does (defect #3).
-                        let Some(dst_ip) = d
-                            .dst_ip
-                            .or_else(|| (!local_addr.ip().is_unspecified()).then(|| local_addr.ip()))
-                        else {
-                            if read < MAX_DATAGRAMS_PER_WAKE && started.elapsed() < MAX_DRAIN_TIME {
-                                next = inbound.try_next();
-                            }
-                            continue;
-                        };
-                        let arrival = SocketAddr::new(dst_ip, local_addr.port());
-                        let dst = crate::transport::resolve_local_destination(arrival, &concrete_candidates);
-                        Self::route_inbound(
-                            &mut turn, ingest.as_mut(), serve.as_mut(), preview.as_ref(), &mut push,
-                            d.src, dst, &d.payload, now,
-                        );
-                        if read < MAX_DATAGRAMS_PER_WAKE && started.elapsed() < MAX_DRAIN_TIME {
-                            next = inbound.try_next();
+                    let mut exhausted = Self::drain_udp_lane(
+                        &mut inbound, Some(first), &mut turn,
+                        &mut ingest, &mut serve, preview.as_ref(), &mut push,
+                        local_addr, &concrete_candidates, now,
+                    );
+                    if exhausted {
+                        // Fairness: a saturated UDP lane must not starve TCP.
+                        if let Some(lane) = tcp.as_mut().filter(|_| !tcp_done) {
+                            exhausted |= Self::drain_tcp_lane(
+                                lane, None,
+                                &mut ingest, &mut serve, preview.as_ref(), &mut push,
+                                &tcp_candidates, now,
+                            );
                         }
                     }
-                    if read >= MAX_DATAGRAMS_PER_WAKE || started.elapsed() >= MAX_DRAIN_TIME {
-                        // Budget spent with input possibly still queued: the same
-                        // bounded handoff as the socket-owning driver.
-                        tokio::task::yield_now().await;
-                        Self::service_timers_and_gc(
-                            &socket, &mut turn,
-                            &mut ingest, &mut serve, preview.as_ref(), &mut push,
-                            local_addr, now, &probe,
-                            #[cfg(test)]
-                            ServiceOrigin::ExhaustionHandoff,
-                        ).await;
-                    } else {
-                        Self::pump_all(
-                            &socket, &mut turn,
-                            ingest.as_mut(), serve.as_mut(), preview.as_ref(), &mut push,
-                            local_addr, now,
-                            #[cfg(test)]
-                            &probe,
-                            #[cfg(test)]
-                            ServiceOrigin::DrainedDry,
-                        ).await;
-                    }
+                    exhausted
                 }
+                frame = std::future::poll_fn(|cx| match tcp.as_mut() {
+                    Some(lane) if !tcp_done => lane.poll_next(cx),
+                    _ => std::task::Poll::Pending,
+                }) => {
+                    let Some(first) = frame else {
+                        // The TCP door is gone; UDP keeps running.
+                        tcp_done = true;
+                        continue;
+                    };
+                    let now = Instant::now();
+                    let Some(lane) = tcp.as_mut() else { continue };
+                    let mut exhausted = Self::drain_tcp_lane(
+                        lane, Some(first),
+                        &mut ingest, &mut serve, preview.as_ref(), &mut push,
+                        &tcp_candidates, now,
+                    );
+                    if exhausted {
+                        // Fairness: a saturated TCP lane must not starve UDP.
+                        exhausted |= Self::drain_udp_lane(
+                            &mut inbound, None, &mut turn,
+                            &mut ingest, &mut serve, preview.as_ref(), &mut push,
+                            local_addr, &concrete_candidates, now,
+                        );
+                    }
+                    exhausted
+                }
+            };
+            let now = Instant::now();
+            let egress = egress_of(&socket, tcp.as_ref());
+            if exhausted {
+                // Budget spent with input possibly still queued: the same
+                // bounded handoff as the socket-owning driver.
+                probe.recv_budgets_exhausted.fetch_add(1, Ordering::Relaxed);
+                tokio::task::yield_now().await;
+                Self::service_timers_and_gc(
+                    egress,
+                    &mut turn,
+                    &mut ingest,
+                    &mut serve,
+                    preview.as_ref(),
+                    &mut push,
+                    local_addr,
+                    now,
+                    probe,
+                    #[cfg(test)]
+                    ServiceOrigin::ExhaustionHandoff,
+                )
+                .await;
+            } else {
+                Self::pump_all(
+                    egress,
+                    &mut turn,
+                    ingest.as_mut(),
+                    serve.as_mut(),
+                    preview.as_ref(),
+                    &mut push,
+                    local_addr,
+                    now,
+                    #[cfg(test)]
+                    probe,
+                    #[cfg(test)]
+                    ServiceOrigin::DrainedDry,
+                )
+                .await;
             }
         }
+    }
+
+    /// Drain at most one budget of shared-socket datagrams, starting with
+    /// `first` (if any) and continuing with `try_next` (never waits). Returns
+    /// whether the budget (count or time) was exhausted.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the single demux fans one datagram to every role lane"
+    )]
+    fn drain_udp_lane<I: SharedInbound>(
+        inbound: &mut I,
+        first: Option<InboundDatagram>,
+        turn: &mut TurnRelayDriver,
+        ingest: &mut Option<IngestLane>,
+        serve: &mut Option<ServeLane>,
+        preview: Option<&Arc<crate::whep_egress::WhepEgress>>,
+        push: &mut [PushLane],
+        local_addr: SocketAddr,
+        concrete_candidates: &[SocketAddr],
+        now: Instant,
+    ) -> bool {
+        let started = Instant::now();
+        let mut next = first.or_else(|| inbound.try_next());
+        let mut read = 0usize;
+        while let Some(d) = next.take() {
+            read += 1;
+            // No PKTINFO on a wildcard-bound socket: the concrete local
+            // destination is unknown, so drop the datagram rather than map it
+            // onto a guessed candidate, exactly as the socket-owning driver
+            // does (defect #3).
+            if let Some(dst_ip) = d
+                .dst_ip
+                .or_else(|| (!local_addr.ip().is_unspecified()).then(|| local_addr.ip()))
+            {
+                let arrival = SocketAddr::new(dst_ip, local_addr.port());
+                let dst = crate::transport::resolve_local_destination(arrival, concrete_candidates);
+                Self::route_inbound(
+                    turn,
+                    ingest.as_mut(),
+                    serve.as_mut(),
+                    preview,
+                    push,
+                    d.src,
+                    dst,
+                    &d.payload,
+                    now,
+                );
+            }
+            if read < MAX_DATAGRAMS_PER_WAKE && started.elapsed() < MAX_DRAIN_TIME {
+                next = inbound.try_next();
+            }
+        }
+        read >= MAX_DATAGRAMS_PER_WAKE || started.elapsed() >= MAX_DRAIN_TIME
+    }
+
+    /// Drain at most one budget of ICE-TCP frames, starting with `first` (if
+    /// any) and continuing with `try_next` (never waits). Returns whether the
+    /// budget (count or time) was exhausted.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the single demux fans one frame to every role lane"
+    )]
+    fn drain_tcp_lane<T: SharedTcp>(
+        lane: &mut T,
+        first: Option<InboundFrame>,
+        ingest: &mut Option<IngestLane>,
+        serve: &mut Option<ServeLane>,
+        preview: Option<&Arc<crate::whep_egress::WhepEgress>>,
+        push: &mut [PushLane],
+        tcp_candidates: &[SocketAddr],
+        now: Instant,
+    ) -> bool {
+        let started = Instant::now();
+        let mut next = first.or_else(|| lane.try_next());
+        let mut read = 0usize;
+        while let Some(f) = next.take() {
+            read += 1;
+            // No TURN classification: TURN is UDP here. The frame's local
+            // address is resolved onto the advertised passive TCP candidate
+            // (NAT 1:1 / Docker as for UDP); with no TCP candidate advertised
+            // nothing can accept it.
+            if !tcp_candidates.is_empty() {
+                let dst = crate::transport::resolve_local_destination(f.local, tcp_candidates);
+                Self::route_to_roles(
+                    ingest.as_mut(),
+                    serve.as_mut(),
+                    preview,
+                    push,
+                    Transport::Tcp,
+                    f.peer,
+                    dst,
+                    &f.payload,
+                    now,
+                );
+            }
+            if read < MAX_DATAGRAMS_PER_WAKE && started.elapsed() < MAX_DRAIN_TIME {
+                next = lane.try_next();
+            }
+        }
+        read >= MAX_DATAGRAMS_PER_WAKE || started.elapsed() >= MAX_DRAIN_TIME
     }
 
     /// Every connected session's ICE-validated remote address, across roles.
@@ -804,7 +1109,7 @@ impl UnifiedEndpoint {
         reason = "the single servicing pass drives every role on one socket"
     )]
     async fn service_timers_and_gc(
-        socket: &tokio::net::UdpSocket,
+        egress: Egress<'_>,
         turn: &mut TurnRelayDriver,
         ingest: &mut Option<IngestLane>,
         serve: &mut Option<ServeLane>,
@@ -826,7 +1131,7 @@ impl UnifiedEndpoint {
             WhepServeEndpoint::tick(&mut lane.viewers, &lane.shared, now);
         }
         Self::pump_all(
-            socket,
+            egress,
             turn,
             ingest.as_mut(),
             serve.as_mut(),
@@ -855,6 +1160,10 @@ impl UnifiedEndpoint {
         #[cfg(test)]
         if origin == ServiceOrigin::ExhaustionHandoff {
             probe.handoff_services.fetch_add(1, Ordering::Relaxed);
+        }
+        #[cfg(test)]
+        if origin == ServiceOrigin::IdleTick {
+            probe.idle_tick_services.fetch_add(1, Ordering::Relaxed);
         }
     }
 
@@ -1003,19 +1312,47 @@ impl UnifiedEndpoint {
                 crate::transport::relay_io::Inbound::Media => (src, local_dst, payload.to_vec()),
             };
 
-        // Fan the (decapsulated) datagram to every registered role; str0m's demux
-        // means only the owning session consumes it.
+        Self::route_to_roles(
+            ingest,
+            serve,
+            preview,
+            push,
+            Transport::Udp,
+            route_src,
+            route_dst,
+            &bytes,
+            now,
+        );
+    }
+
+    /// Fan one datagram (UDP, relay-decapsulated, or an ICE-TCP frame) to every
+    /// registered role; str0m's demux means only the owning session consumes it.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the single demux fans one datagram to every role lane"
+    )]
+    fn route_to_roles(
+        ingest: Option<&mut IngestLane>,
+        serve: Option<&mut ServeLane>,
+        preview: Option<&Arc<crate::whep_egress::WhepEgress>>,
+        push: &mut [PushLane],
+        proto: Transport,
+        src: SocketAddr,
+        dst: SocketAddr,
+        bytes: &[u8],
+        now: Instant,
+    ) {
         if let Some(lane) = ingest {
-            WhipEndpoint::route_datagram(&mut lane.sessions, route_src, route_dst, &bytes, now);
+            WhipEndpoint::route_datagram(&mut lane.sessions, proto, src, dst, bytes, now);
         }
         if let Some(lane) = serve {
-            WhepServeEndpoint::route_datagram(&mut lane.viewers, route_src, route_dst, &bytes, now);
+            WhepServeEndpoint::route_datagram(&mut lane.viewers, proto, src, dst, bytes, now);
         }
         if let Some(preview) = preview {
-            let _ = preview.handle_datagram_broadcast(route_src, route_dst, &bytes, now);
+            let _ = preview.handle_datagram_broadcast_proto(proto, src, dst, bytes, now);
         }
         for lane in push.iter_mut() {
-            lane.handle_inbound(route_src, route_dst, &bytes, now);
+            lane.handle_inbound_proto(proto, src, dst, bytes, now);
         }
     }
 
@@ -1025,7 +1362,7 @@ impl UnifiedEndpoint {
         reason = "the single loop drives every role on one socket"
     )]
     async fn pump_all(
-        socket: &tokio::net::UdpSocket,
+        egress: Egress<'_>,
         turn: &mut TurnRelayDriver,
         ingest: Option<&mut IngestLane>,
         serve: Option<&mut ServeLane>,
@@ -1039,7 +1376,7 @@ impl UnifiedEndpoint {
         // Drive the shared TURN driver first so a fresh relay is published before
         // the roles gather candidates for the next negotiation.
         while let Some((destination, payload)) = turn.poll_transmit(now) {
-            let _ = socket.send_to(&payload, destination).await;
+            let _ = egress.socket.send_to(&payload, destination).await;
         }
         let new_relays = turn.take_new_relays();
         if !new_relays.is_empty() {
@@ -1054,7 +1391,7 @@ impl UnifiedEndpoint {
 
         if let Some(lane) = ingest {
             WhipEndpoint::pump_outbound(
-                socket,
+                egress,
                 &mut lane.sessions,
                 turn,
                 now,
@@ -1064,20 +1401,17 @@ impl UnifiedEndpoint {
             .await;
         }
         if let Some(lane) = serve {
-            WhepServeEndpoint::pump_outbound(socket, &mut lane.viewers, turn, now).await;
+            WhepServeEndpoint::pump_outbound(egress, &mut lane.viewers, turn, now).await;
         }
         if let Some(preview) = preview {
-            if let Ok(out) = preview.drive_all(now) {
-                for (source, dst, payload) in out {
-                    crate::transport::relay_io::send_routed(
-                        socket, turn, source, dst, &payload, now,
-                    )
-                    .await;
+            if let Ok(out) = preview.drive_all_routed(now) {
+                for dg in out {
+                    crate::transport::relay_io::send_routed(egress, turn, &dg, now).await;
                 }
             }
         }
         for lane in push.iter_mut() {
-            lane.step(socket, turn, local_addr, now).await;
+            lane.step(egress, turn, local_addr, now).await;
         }
     }
 
@@ -1892,5 +2226,131 @@ mod tests {
             !outcome.budget_exhausted,
             "an empty socket drains to WouldBlock, it does not exhaust the budget"
         );
+    }
+
+    /// A shared UDP lane that is ALWAYS ready: an infinite stream of garbage
+    /// datagrams (review I1, PR 337).
+    struct EndlessUdp;
+
+    impl SharedInbound for EndlessUdp {
+        fn poll_next(
+            &mut self,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Option<InboundDatagram>> {
+            std::task::Poll::Ready(self.try_next())
+        }
+        fn try_next(&mut self) -> Option<InboundDatagram> {
+            Some(InboundDatagram {
+                src: "[2001:db8::99]:4000".parse().expect("v6 literal"),
+                dst_ip: Some(Ipv6Addr::LOCALHOST.into()),
+                payload: vec![0xAB; 64],
+            })
+        }
+        fn validated(&mut self, _peer: SocketAddr) -> bool {
+            false
+        }
+        fn invalidated(&mut self, _peer: SocketAddr) {}
+    }
+
+    /// An ICE-TCP lane holding a finite number of frames; counts consumption.
+    struct CountingTcp {
+        queued: std::collections::VecDeque<InboundFrame>,
+        consumed: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl TcpSend for CountingTcp {
+        fn send(&self, _peer: SocketAddr, _payload: &[u8]) -> bool {
+            false
+        }
+    }
+
+    impl SharedTcp for CountingTcp {
+        fn poll_next(
+            &mut self,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Option<InboundFrame>> {
+            // Never becomes ready again once empty: no waker is needed.
+            match self.try_next() {
+                Some(f) => std::task::Poll::Ready(Some(f)),
+                None => std::task::Poll::Pending,
+            }
+        }
+        fn try_next(&mut self) -> Option<InboundFrame> {
+            let f = self.queued.pop_front()?;
+            self.consumed.fetch_add(1, Ordering::Relaxed);
+            Some(f)
+        }
+    }
+
+    /// Review I1 (PR 337): with the shared UDP lane permanently ready, the
+    /// biased `select!` alone never reaches the TCP arm. The cross-lane drain
+    /// after an exhausted budget must still consume every TCP frame, and the
+    /// idle tick must keep firing.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_saturated_udp_lane_cannot_starve_the_tcp_lane_or_the_tick() {
+        const FRAMES: usize = 3 * MAX_DATAGRAMS_PER_WAKE + 17;
+        const MIN_TICKS: u64 = 5;
+        let socket = UdpSocket::bind(SocketAddr::V6(SocketAddrV6::new(
+            Ipv6Addr::UNSPECIFIED,
+            0,
+            0,
+            0,
+        )))
+        .expect("dual-stack bind");
+        let port = socket.local_addr().expect("local addr").port();
+        let cfg = crate::config::EndpointConfig {
+            udp_port: port,
+            advertised_addresses: vec![Ipv6Addr::LOCALHOST.into()],
+            ice_tcp_port: Some(port),
+            ..crate::config::EndpointConfig::default()
+        };
+        let endpoint = UnifiedEndpoint::with_shared_socket(cfg, socket)
+            .expect("shared endpoint")
+            .build();
+        let local: SocketAddr = SocketAddr::new(Ipv6Addr::LOCALHOST.into(), port);
+        let consumed = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let tcp = CountingTcp {
+            queued: (0..FRAMES)
+                .map(|_| InboundFrame {
+                    peer: "192.0.2.7:5000".parse().expect("v4 literal"),
+                    local,
+                    payload: vec![0xCD; 32],
+                })
+                .collect(),
+            consumed: Arc::clone(&consumed),
+        };
+        let probe = Arc::new(RunProbe::default());
+        let stop = Arc::new(AtomicBool::new(false));
+        let driver = {
+            let probe = Arc::clone(&probe);
+            let stop = Arc::clone(&stop);
+            tokio::spawn(async move {
+                endpoint
+                    .run_shared_body(EndlessUdp, Some(tcp), stop, &probe)
+                    .await
+            })
+        };
+        let done = tokio::time::timeout(Duration::from_secs(20), async {
+            while consumed.load(Ordering::Relaxed) < FRAMES
+                || probe.idle_tick_services.load(Ordering::Relaxed) < MIN_TICKS
+            {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await;
+        stop.store(true, Ordering::Release);
+        let exhausted = probe.recv_budgets_exhausted.load(Ordering::Relaxed);
+        let ticks = probe.idle_tick_services.load(Ordering::Relaxed);
+        let got = consumed.load(Ordering::Relaxed);
+        assert!(
+            done.is_ok(),
+            "within the bound: {got}/{FRAMES} TCP frames consumed, {ticks} idle ticks \
+             (need {MIN_TICKS}), {exhausted} exhausted budgets"
+        );
+        assert!(exhausted > 0, "the UDP lane must have been saturating");
+        driver
+            .await
+            .expect("driver task joins")
+            .expect("driver exits cleanly");
     }
 }
