@@ -542,3 +542,35 @@ fn a_huge_aspect_never_overflows() {
     .validate()
     .expect("proportional");
 }
+
+#[test]
+fn video_slot_bitrate_is_bounded() {
+    for kbps in [0_u64, 1_000_001, 4_294_967_295] {
+        assert_code(
+            &format!(
+                r#"
+[[outputs]]
+kind = "hls"
+path = "/srv/hls/a"
+codec = "h264"
+[[outputs.slots.video]]
+bitrate_kbps = {kbps}
+"#
+            ),
+            SLOT_FORMAT_UNSUPPORTED,
+            "bitrate_kbps must be 1..=1000000",
+        );
+    }
+    parse(
+        r#"
+[[outputs]]
+kind = "hls"
+path = "/srv/hls/a"
+codec = "h264"
+[[outputs.slots.video]]
+bitrate_kbps = 1000000
+"#,
+    )
+    .validate()
+    .expect("the cap itself is accepted");
+}

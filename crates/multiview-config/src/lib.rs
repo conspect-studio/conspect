@@ -122,7 +122,8 @@ pub use network_tls::{
 pub use origin::{Origin, OriginParseError};
 pub use output_format::{
     validate_output_format, Anchor, AudioSlot, CodecFamily, OutputFit, OutputFitMode, OutputFormat,
-    OutputSlots, Scan, SlotCapability, VideoSlot, SLOT_FORMAT_UNSUPPORTED, SLOT_MEDIUM_MISMATCH,
+    OutputSlots, Scan, SlotCapability, VideoSlot, MAX_SLOT_BITRATE_KBPS, SLOT_FORMAT_UNSUPPORTED,
+    SLOT_MEDIUM_MISMATCH,
 };
 pub use placement::{DevicePin, MigrationPolicy, PinVendor, PlacementConfig, PlacementWeights};
 pub use playback::{

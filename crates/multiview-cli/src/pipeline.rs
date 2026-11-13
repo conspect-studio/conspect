@@ -3146,9 +3146,17 @@ impl Pipeline {
             let (width, height) = format.map_or((cfg.width, cfg.height), |f| (f.width, f.height));
             let bit_rate = declared
                 .and_then(|item| item.video_slot0().and_then(|v| v.bitrate_kbps))
-                .map_or(cfg.bit_rate, |kbps| {
-                    usize::try_from(kbps).unwrap_or(usize::MAX / 1000) * 1000
-                });
+                .map_or(Ok(cfg.bit_rate), |kbps| {
+                    // Config caps a slot at MAX_SLOT_BITRATE_KBPS; never wrap.
+                    usize::try_from(kbps)
+                        .ok()
+                        .and_then(|kbps| kbps.checked_mul(1000))
+                        .filter(|_| kbps <= multiview_config::MAX_SLOT_BITRATE_KBPS)
+                        .ok_or_else(|| PipelineError::Codec {
+                            codec: requested.to_owned(),
+                            reason: format!("video bit rate {kbps} kbit/s is out of range"),
+                        })
+                })?;
             // One base encoder per distinct (codec, width, height, bitrate,
             // fit): outputs with equal format and settings share it (P1).
             let key = if let Some(index) = rendition_configs

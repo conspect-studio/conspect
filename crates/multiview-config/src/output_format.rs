@@ -40,6 +40,9 @@ pub const MAX_FORMAT_EDGE: u32 = 8192;
 /// Largest accepted format area (UHD), in pixels.
 pub const MAX_FORMAT_AREA: u64 = 3840 * 2160;
 
+/// Largest accepted video slot bit rate, in kbit/s (1 Gbit/s).
+pub const MAX_SLOT_BITRATE_KBPS: u32 = 1_000_000;
+
 /// The audio grid every audio slot is encoded on (ADR-0108 §5.2): stereo.
 pub const SLOT_AUDIO_CHANNELS: u16 = 2;
 /// The audio grid every audio slot is encoded on: 48 kHz.
@@ -555,10 +558,13 @@ fn validate_video_slots(
                 ));
             }
         }
-        if slot.bitrate_kbps == Some(0) {
+        if slot
+            .bitrate_kbps
+            .is_some_and(|kbps| kbps == 0 || kbps > MAX_SLOT_BITRATE_KBPS)
+        {
             return Err(unsupported(
                 output,
-                &format!("video slot {i} bitrate_kbps must be > 0"),
+                &format!("video slot {i} bitrate_kbps must be 1..={MAX_SLOT_BITRATE_KBPS}"),
             ));
         }
     }
