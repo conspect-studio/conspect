@@ -85,6 +85,34 @@ pub struct LayoutDocument {
     /// Cells (tiles) and their source bindings, in declaration order.
     #[serde(default)]
     pub cells: Vec<Cell>,
+    /// The audio an output carries when it routes this layout and its audio
+    /// follows the video (ADR-0108 §5.1). Absent = the program mix.
+    #[serde(default, skip_serializing_if = "LayoutAudio::is_program")]
+    pub audio: LayoutAudio,
+}
+
+/// A stored layout's `audio` attribute (ADR-0108 §5.1): what `follow`
+/// resolves to on an output routed to the layout. Externally tagged like
+/// [`crate::AudioFeed`]: `"program"`, `"none"`, or `{ "source": "<id>" }`.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum LayoutAudio {
+    /// The program mix (the default: routing a layout changes no one's audio).
+    #[default]
+    Program,
+    /// Silence.
+    None,
+    /// The own audio of one source a cell of this layout binds.
+    Source(String),
+}
+
+impl LayoutAudio {
+    /// Whether this is the default `program` (serde skip predicate).
+    #[must_use]
+    pub fn is_program(&self) -> bool {
+        *self == Self::Program
+    }
 }
 
 impl LayoutDocument {
@@ -114,6 +142,7 @@ impl LayoutDocument {
     /// [`ConfigError::Validation`] for a duplicate/empty cell id, a cell without
     /// a placement, an unknown grid area, or invalid solved geometry.
     pub fn solve_named(&self, name: &str) -> Result<CoreLayout, ConfigError> {
+        self.validate_audio()?;
         let mut seen: std::collections::HashSet<&str> =
             std::collections::HashSet::with_capacity(self.cells.len());
         for cell in &self.cells {
@@ -156,6 +185,27 @@ impl LayoutDocument {
             other => ConfigError::Validation(other.to_string()),
         })?;
         Ok(solved)
+    }
+
+    /// `audio = { source = "x" }` must name a source one of this layout's
+    /// cells binds (ADR-0108 §5.1): the layout's audio is one of its pictures.
+    ///
+    /// # Errors
+    ///
+    /// [`ConfigError::Validation`] for a source no cell binds.
+    pub fn validate_audio(&self) -> Result<(), ConfigError> {
+        if let LayoutAudio::Source(id) = &self.audio {
+            let bound = self
+                .cells
+                .iter()
+                .any(|c| c.source.input_id.as_deref() == Some(id.as_str()));
+            if !bound {
+                return Err(ConfigError::Validation(format!(
+                    "the layout's audio source {id:?} is not bound by any of its cells"
+                )));
+            }
+        }
+        Ok(())
     }
 
     /// The cell ids in declaration order — exactly `solve_named`'s cell order —
@@ -278,6 +328,34 @@ mod tests {
     #[test]
     fn unparseable_body_is_an_error() {
         let body = serde_json::json!({ "canvas": { "width": "wide" }, "cells": [] });
+        assert!(LayoutDocument::from_body(&body).is_err());
+    }
+
+    #[test]
+    fn the_layout_audio_attribute_defaults_to_program_and_names_a_bound_source() {
+        let doc = LayoutDocument::from_body(&editor_body()).unwrap();
+        assert_eq!(doc.audio, LayoutAudio::Program);
+        // The default never serializes, so stored bodies do not change.
+        assert!(serde_json::to_value(&doc).unwrap().get("audio").is_none());
+
+        let mut body = editor_body();
+        body["audio"] = serde_json::json!("none");
+        let doc = LayoutDocument::from_body(&body).unwrap();
+        assert_eq!(doc.audio, LayoutAudio::None);
+        doc.solve_named("l").unwrap();
+
+        body["audio"] = serde_json::json!({ "source": "in_a" });
+        let doc = LayoutDocument::from_body(&body).unwrap();
+        assert_eq!(doc.audio, LayoutAudio::Source("in_a".to_owned()));
+        doc.solve_named("l").unwrap();
+
+        // A source no cell binds is refused at solve (and so at apply/route).
+        body["audio"] = serde_json::json!({ "source": "elsewhere" });
+        let doc = LayoutDocument::from_body(&body).unwrap();
+        let err = doc.solve_named("l").unwrap_err();
+        assert!(err.to_string().contains("not bound"), "{err}");
+
+        body["audio"] = serde_json::json!("follow");
         assert!(LayoutDocument::from_body(&body).is_err());
     }
 }
