@@ -2287,6 +2287,11 @@ struct SegmentState<'a> {
     /// segment. Unused (and stays `0`) for the batch flavour, which keeps its
     /// historical `done.len()`-derived names.
     seg_index: u64,
+    /// The MPEG-TS PAT/PMT `version_number` (5 bits) the segment muxer
+    /// writes. Bumped (mod 32) when a decoder-configuration change starts a
+    /// segment: that output's muxer is rebuilt with `tables_version`+1 so a
+    /// receiver re-reads its tables (#342 B3). 0 = libav's default.
+    tables_version: u8,
     /// OUTMETA (ADR-0088/0089): the per-output metadata + tag-path display
     /// matrix applied to the long-lived video muxer ONCE, before its first
     /// `write_header` (the codec/stream layout is fixed for the run, invariant
@@ -2393,6 +2398,7 @@ impl<'a> SegmentState<'a> {
             stats: EncodeStats::default(),
             live: None,
             seg_index: 0,
+            tables_version: 0,
             meta: None,
             tracks: None,
             renditions: None,
@@ -2876,7 +2882,7 @@ impl<'a> SegmentState<'a> {
                 // invariant #7); the first packet is always a keyframe.
                 let is_key = packet.is_keyframe();
                 if is_key {
-                    self.start_segment(pts)?;
+                    self.start_segment_with(pts, config_changed)?;
                     if config_changed {
                         self.mark_started_segment_discontinuous();
                     }
@@ -3038,6 +3044,16 @@ impl<'a> SegmentState<'a> {
     /// later call redirects it in place — see [`SegmentState`]'s doc for why
     /// this is the continuity-counter fix, not an optimization.
     fn start_segment(&mut self, start_pts: MediaTime) -> Result<()> {
+        self.start_segment_with(start_pts, false)
+    }
+
+    /// [`Self::start_segment`]; `config_changed` (a keyframe opening a new
+    /// decoder configuration, #342 B3) rebuilds the segment muxer with the
+    /// next TS `tables_version` instead of redirecting the long-lived one,
+    /// so the PAT/PMT `version_number` changes at the segment that starts
+    /// here. Legal: that segment is `EXT-X-DISCONTINUITY` anyway, so its
+    /// continuity counters may restart.
+    fn start_segment_with(&mut self, start_pts: MediaTime, config_changed: bool) -> Result<()> {
         if let Err(error) = self.close_current(start_pts) {
             self.publication_failed = true;
             return Err(error);
@@ -3068,6 +3084,14 @@ impl<'a> SegmentState<'a> {
             path.clone()
         };
         self.open_audio_segments(index)?;
+        if config_changed {
+            if let Some(mut old) = self.current.take() {
+                // Flush and close the finished segment's file (already
+                // published by `close_current`); the muxer is then rebuilt.
+                old.muxer.release_output().map_err(ff)?;
+            }
+            self.tables_version = (self.tables_version + 1) % 32;
+        }
         if let Some(segment) = self.current.as_mut() {
             // Redirect the SAME long-lived muxer to the new file. Every
             // PID's continuity counter, PCR bookkeeping, etc. on this
@@ -3081,8 +3105,19 @@ impl<'a> SegmentState<'a> {
             segment.start_pts = start_pts;
         } else {
             // First segment of the run: build the ONE long-lived muxer +
-            // register its streams. Never rebuilt for a later segment.
-            let mut muxer = Muxer::create_as(&write_path, "mpegts").map_err(ff)?;
+            // register its streams. Rebuilt for a later segment only at a
+            // decoder-configuration change (with the next tables_version).
+            let mut muxer = if self.tables_version == 0 {
+                Muxer::create_as(&write_path, "mpegts").map_err(ff)?
+            } else {
+                let version = self.tables_version.to_string();
+                Muxer::create_with_options(
+                    &write_path,
+                    "mpegts",
+                    &[("tables_version", version.as_str())],
+                )
+                .map_err(ff)?
+            };
             // Register video then audio BEFORE the header — every segment
             // carries the same pinned two-stream layout (ADR-R005 §3.3,
             // AUD-4).
@@ -3748,6 +3783,108 @@ mod tests {
             *next_uri, "seg2.ts",
             "the discontinuity precedes the segment starting at the flagged keyframe:\n{flagged}"
         );
+    }
+
+    /// The `version_number` of the PAT and of the PMT it points at, from the
+    /// first sections of each in a written `.ts` file.
+    fn ts_table_versions(path: &std::path::Path) -> (u8, u8) {
+        let bytes = std::fs::read(path).unwrap();
+        let section = |pid: u16| -> Option<Vec<u8>> {
+            bytes.chunks_exact(188).find_map(|p| {
+                let this = (u16::from(p[1] & 0x1f) << 8) | u16::from(p[2]);
+                let start = p[1] & 0x40 != 0;
+                if p[0] != 0x47 || this != pid || !start {
+                    return None;
+                }
+                let mut at = 4;
+                if p[3] & 0x20 != 0 {
+                    at += 1 + usize::from(p[4]);
+                }
+                let pointer = usize::from(p[at]);
+                Some(p[at + 1 + pointer..].to_vec())
+            })
+        };
+        let pat = section(0).unwrap();
+        assert_eq!(pat[0], 0x00, "PAT table id");
+        let pat_version = (pat[5] >> 1) & 0x1f;
+        // The first program entry after the 8-byte header.
+        let pmt_pid = (u16::from(pat[10] & 0x1f) << 8) | u16::from(pat[11]);
+        let pmt = section(pmt_pid).unwrap();
+        assert_eq!(pmt[0], 0x02, "PMT table id");
+        (pat_version, (pmt[5] >> 1) & 0x1f)
+    }
+
+    /// #342 B3: a decoder-configuration change also bumps the TS PAT/PMT
+    /// `version_number` of the segment it starts (the muxer is rebuilt with
+    /// `tables_version`+1), and only there: earlier segments keep the old
+    /// version, later ones keep the new one; one `EXT-X-DISCONTINUITY`.
+    #[test]
+    fn a_decoder_config_change_bumps_the_ts_table_version_at_its_segment() {
+        use super::{PacketSource, SegmentState, StreamSeed};
+        use crate::hls::LivePlaylist;
+        use ffmpeg::codec::packet::{Flags, Packet};
+        use multiview_ffmpeg::{EncodedPacket, StreamCodecParameters, VideoEncoder};
+
+        struct Flagged {
+            packets: std::vec::IntoIter<EncodedPacket>,
+            last_pts: Option<i64>,
+        }
+        impl PacketSource for Flagged {
+            fn next_packet(&mut self) -> Result<Option<EncodedPacket>> {
+                let next = self.packets.next();
+                self.last_pts = next.as_ref().and_then(EncodedPacket::pts);
+                Ok(next)
+            }
+            fn take_decoder_config_change(&mut self) -> bool {
+                self.last_pts == Some(6)
+            }
+        }
+        let _counter_guard = counter_guard();
+        let dir = tempfile::tempdir().unwrap();
+        let encoder = VideoEncoder::new(&EncodeConfig::mpeg2(WIDTH, HEIGHT).target()).unwrap();
+        let params = StreamCodecParameters::from_encoder(&encoder);
+        let mut state = SegmentState::new(
+            StreamSeed::Params(&params),
+            encoder.time_base(),
+            None,
+            dir.path(),
+            "seg",
+        );
+        state.live = Some(LivePlaylist::new(dir.path().join("index.m3u8"), 10));
+        let packets: Vec<EncodedPacket> = (0..12)
+            .map(|index| {
+                let mut packet = Packet::copy(&[0, 0, 1, 0, 0, 8, 0, 0]);
+                packet.set_flags(if index % 3 == 0 {
+                    Flags::KEY
+                } else {
+                    Flags::empty()
+                });
+                packet.set_pts(Some(index));
+                packet.set_dts(Some(index));
+                EncodedPacket::from_packet(packet)
+            })
+            .collect();
+        let mut source = Flagged {
+            packets: packets.into_iter(),
+            last_pts: None,
+        };
+        state.drive_from_packets(&mut source).unwrap();
+        let mut report = crate::hls::MediaPlaylist::new(crate::hls::SegmentType::MpegTs);
+        state.finish(&mut report, 33_333_333).unwrap();
+        let playlist = std::fs::read_to_string(dir.path().join("index.m3u8")).unwrap();
+        assert_eq!(
+            playlist.matches("#EXT-X-DISCONTINUITY\n").count(),
+            1,
+            "{playlist}"
+        );
+        let versions: Vec<(u8, u8)> = (0..4)
+            .map(|i| ts_table_versions(&dir.path().join(format!("seg{i}.ts"))))
+            .collect();
+        assert_eq!(versions[0], versions[1], "unchanged before the flag");
+        assert_eq!(versions[2], versions[3], "stable after the flag");
+        assert_ne!(versions[1].1, versions[2].1, "PMT version_number changed");
+        assert_ne!(versions[1].0, versions[2].0, "PAT version_number changed");
+        assert_eq!(versions[2].1, (versions[1].1 + 1) % 32, "bumped by one");
     }
 
     #[test]
