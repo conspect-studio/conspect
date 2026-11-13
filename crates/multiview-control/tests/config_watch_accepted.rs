@@ -436,41 +436,42 @@ async fn no_commit_from_any_path_once_the_accepted_state_is_frozen() {
     assert_eq!(rig.state.config_watch.snapshot().applied_count, 0);
 }
 
-/// Review round 11 (L1-01): a freeze that arrives while a writer is between
-/// its freeze check and the `desired.json` rename waits for that rename, so
-/// no rename lands after `freeze_accepted_state` returns.
+/// Review round 11 (L1-01, L3): the freeze is wait-free even while a writer
+/// is between its freeze check and the `desired.json` rename (a stalled
+/// filesystem must not hang the exit before the watchdog arms); the exit's
+/// settle wait is bounded, sees that rename in flight, and after it no
+/// commit can start.
 #[tokio::test]
-async fn a_freeze_waits_for_an_in_flight_rename_and_blocks_later_ones() {
-    use std::sync::atomic::{AtomicBool, Ordering};
+async fn a_freeze_is_wait_free_and_the_settle_sees_an_in_flight_rename() {
+    use std::time::{Duration, Instant};
     let rig = Box::pin(rig()).await;
     let state = rig.state.clone();
-    let froze = Arc::new(AtomicBool::new(false));
-    let freezer = state
+    state
         .commit_unless_frozen(|| {
-            let (started, wait) = std::sync::mpsc::channel();
-            let freezer = std::thread::spawn({
+            let froze = std::thread::spawn({
                 let state = state.clone();
-                let froze = Arc::clone(&froze);
                 move || {
-                    started.send(()).unwrap();
+                    let started = Instant::now();
                     state.freeze_accepted_state();
-                    froze.store(true, Ordering::SeqCst);
+                    let freeze = started.elapsed();
+                    let settled = state.await_accepted_commits(Duration::from_millis(50));
+                    (freeze, settled)
                 }
-            });
-            wait.recv().unwrap();
-            std::thread::sleep(std::time::Duration::from_millis(100));
+            })
+            .join()
+            .unwrap();
             assert!(
-                !froze.load(Ordering::SeqCst),
-                "the freeze waits while a rename is in flight"
+                froze.0 < Duration::from_millis(20),
+                "the freeze does not wait for the rename"
             );
-            freezer
+            assert!(!froze.1, "the bounded settle reports the rename in flight");
         })
         .expect("not frozen before the freeze");
-    freezer.join().unwrap();
-    assert!(froze.load(Ordering::SeqCst));
+    assert!(state.accepted_state_frozen());
+    assert!(state.await_accepted_commits(Duration::from_millis(50)));
     assert!(
         state.commit_unless_frozen(|| ()).is_none(),
-        "no rename after the freeze returned"
+        "no commit starts after the freeze"
     );
     rig.watch.stop();
 }

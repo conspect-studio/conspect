@@ -66,7 +66,36 @@ impl ExitFreeze {
             watch.stop();
         }
     }
+
+    /// Freeze, then wait (blocking, at most [`ACCEPTED_COMMIT_SETTLE`]) for a
+    /// `desired.json` rename whose freeze check ran before the freeze. Call
+    /// only off the async workers and after the exit watchdog is armed.
+    fn freeze_and_settle(&self) {
+        self.freeze();
+        if let Some(state) = &self.state {
+            if !state.await_accepted_commits(ACCEPTED_COMMIT_SETTLE) {
+                tracing::warn!(
+                    "a desired.json rename decided before the exit is still in flight; exiting without waiting further"
+                );
+            }
+        }
+    }
+
+    /// [`Self::freeze_and_settle`] from async code: the freeze runs at once
+    /// (wait-free), the bounded wait on the blocking pool.
+    async fn freeze_and_settle_async(&self) {
+        self.freeze();
+        let this = self.clone();
+        if let Err(error) = tokio::task::spawn_blocking(move || this.freeze_and_settle()).await {
+            tracing::warn!(error = %error, "the exit-time accepted-state settle task failed");
+        }
+    }
 }
+
+/// How long an exit waits for a `desired.json` rename already past its
+/// freeze check (#367). A rename is a metadata operation; the bound only
+/// matters on a stalled filesystem, where the exit watchdog still applies.
+const ACCEPTED_COMMIT_SETTLE: std::time::Duration = std::time::Duration::from_millis(500);
 
 /// The run's handle on the debounced ADR-W024 Running persister: the spawned
 /// task plus the served [`multiview_control::AppState`] it persists from.
@@ -1336,8 +1365,9 @@ async fn run_pipeline_until_ctrl_c(
                 std::thread::sleep(std::time::Duration::from_millis(5));
             }
             // #367: no config-file commit after an exit is decided (a fatal
-            // output fault as well as a stop signal).
-            decided_freeze.freeze();
+            // output fault as well as a stop signal). This OS thread runs
+            // after the watchdog is armed, so the bounded settle is safe here.
+            decided_freeze.freeze_and_settle();
             // Begin the control plane's graceful drain now (the deadline cuts it).
             decided_drain.notify_one();
             // Journal counters first (bounded wait for the worker to apply it):
@@ -1489,8 +1519,9 @@ async fn run_pipeline_until_ctrl_c(
         drive_main_program_in_set(pipeline, cadence, &stop, &publisher, &preview_slot, drain).await;
     // #367: the drive loop returned (a stop, a fatal fault, or an error): the
     // run is exiting, so no config-file commit may write the accepted state
-    // from here on, whatever made it return.
-    exit_freeze.freeze();
+    // from here on, whatever made it return. The settle (bounded) lets a
+    // rename decided before the freeze finish before the teardown.
+    exit_freeze.freeze_and_settle_async().await;
     let report = report?;
     let tenants_start = std::time::Instant::now();
 
@@ -1901,7 +1932,8 @@ async fn run_software_until_ctrl_c(
         config_watch.as_ref(),
         running_persist.as_ref().map(|p| &p.state),
     )
-    .freeze();
+    .freeze_and_settle_async()
+    .await;
     if report.is_err() {
         // #309: an engine error is an exit decision.
         multiview_cli::exit_watchdog::arm(multiview_cli::exit_watchdog::ExitCause::Fatal);

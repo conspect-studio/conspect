@@ -166,12 +166,16 @@ is closed`).
   freezes as soon as the stop signal is raised or any exit is armed.
 * The durable write (`write_desired`, which every accepted-state commit goes through: the
   watcher, the REST mutations and revert-to-start) prepares and fsyncs its temp file outside
-  the write serial, then checks the freeze and renames **under a commit gate that the freeze
-  itself takes** (`AppState::commit_unless_frozen`). A freeze therefore either lands before
-  the check (the commit fails) or waits for that one rename (the commit is ordered before the
-  exit decision); no rename lands after `freeze_accepted_state` returns. The freeze waits at
-  most for one rename, never for an fsync; the exit-time `active.toml` persist shares the write
-  serial and likewise waits at most for a rename.
+  the write serial, then checks the freeze and renames **under a commit gate**
+  (`AppState::commit_unless_frozen`). The commit's decision point is that check: a commit
+  whose check ran after the freeze fails; one whose check ran before it was decided before
+  the exit and may finish its rename. The freeze itself is wait-free (one atomic store), so a
+  stalled filesystem cannot hang the stop-signal task before the exit watchdog is armed. The
+  exit then waits for the gate, **bounded (500 ms) and off the async workers** — on the
+  exit-durable thread (after the watchdog is armed) and on the blocking pool when a drive
+  loop returns — so no `desired.json` rename is in flight when the teardown and the final
+  persist run. The wait never covers an fsync; the exit-time `active.toml` persist shares the
+  write serial and likewise waits at most for a rename.
 * The watcher also checks "stopped, frozen, or command bus closed" under the config-mutation
   lock before every commit path. A closed bus (the receiver already dropped) is only a
   backstop: it becomes true after the exit decision, never in a normal run.

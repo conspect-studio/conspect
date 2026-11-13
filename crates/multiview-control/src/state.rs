@@ -951,11 +951,9 @@ pub struct AppState {
     /// when the exit is decided does not land after it. One-way; never cleared.
     accepted_frozen: Arc<std::sync::atomic::AtomicBool>,
     /// The commit gate (#367): held across "check the freeze, then rename
-    /// `desired.json`", and taken by [`AppState::freeze_accepted_state`]
-    /// before it sets the flag. So a freeze either lands before a writer's
-    /// check (the writer refuses) or waits for that one rename to finish (the
-    /// commit is ordered before the exit). Never held across an fsync or an
-    /// `.await`.
+    /// `desired.json`" (never across an fsync or an `.await`). The freeze
+    /// itself never takes it (wait-free); the exit path waits on it, bounded,
+    /// to know no rename is still in flight.
     commit_gate: Arc<std::sync::Mutex<()>>,
     /// The coalescing **Running-changed** signal (ADR-W024 §3): a one-permit
     /// [`tokio::sync::Notify`] fired by [`AppState::audit`] — the ONE choke
@@ -1306,27 +1304,49 @@ impl AppState {
     }
 
     /// Freeze the accepted state (#367): the run decided to exit, so no commit
-    /// may write `desired.json` any more. Call it at every exit decision.
-    /// One-way. It takes the commit gate first, so it waits at most for one
-    /// `desired.json` rename already past its freeze check (a metadata
-    /// operation, never an fsync); when it returns, no later rename can land.
+    /// may write `desired.json` any more. Wait-free (one atomic store; safe on
+    /// a runtime worker and before the exit watchdog is armed); call it at
+    /// every exit decision. One-way. A writer whose freeze check ran before
+    /// this store may still be inside its rename: wait for it with
+    /// [`Self::await_accepted_commits`] where the exit path can afford a
+    /// bounded wait.
     pub fn freeze_accepted_state(&self) {
-        let _gate = self.lock_commit_gate();
         self.accepted_frozen
-            .store(true, std::sync::atomic::Ordering::Release);
+            .store(true, std::sync::atomic::Ordering::SeqCst);
     }
 
     /// Run `commit` (the `desired.json` rename) only while the accepted state
-    /// is not frozen, atomically with respect to
-    /// [`Self::freeze_accepted_state`]. `None` when frozen; `commit` did not
-    /// run. Keep `commit` short: no fsync, no blocking on another lock that
-    /// an fsync holds.
+    /// is not frozen. `None` when frozen; `commit` did not run. The check and
+    /// `commit` run under the commit gate, so once the state is frozen and
+    /// [`Self::await_accepted_commits`] returned `true`, no rename is in
+    /// flight and none can start. Keep `commit` short: no fsync.
     pub fn commit_unless_frozen<R>(&self, commit: impl FnOnce() -> R) -> Option<R> {
         let _gate = self.lock_commit_gate();
         if self.accepted_state_frozen() {
             return None;
         }
         Some(commit())
+    }
+
+    /// Wait, at most `bound`, until no `desired.json` rename is in flight
+    /// (#367). Blocking (it polls the commit gate every millisecond): call it
+    /// off the async runtime workers, after the exit watchdog is armed, so a
+    /// stalled filesystem can delay the exit only up to `bound`. `true` when
+    /// the gate was free within the bound; after a freeze that means no
+    /// accepted-state commit can land any more.
+    #[must_use]
+    pub fn await_accepted_commits(&self, bound: std::time::Duration) -> bool {
+        let deadline = std::time::Instant::now() + bound;
+        loop {
+            match self.commit_gate.try_lock() {
+                Ok(_) | Err(std::sync::TryLockError::Poisoned(_)) => return true,
+                Err(std::sync::TryLockError::WouldBlock) => {}
+            }
+            if std::time::Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
     }
 
     fn lock_commit_gate(&self) -> std::sync::MutexGuard<'_, ()> {
@@ -1340,7 +1360,7 @@ impl AppState {
     #[must_use]
     pub fn accepted_state_frozen(&self) -> bool {
         self.accepted_frozen
-            .load(std::sync::atomic::Ordering::Acquire)
+            .load(std::sync::atomic::Ordering::SeqCst)
     }
 
     /// Declare what the **running** engine can take live (ADR-W022). The

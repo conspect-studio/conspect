@@ -313,8 +313,9 @@ async fn write_desired(state: &AppState, desired: DesiredState) -> ControlResult
             let prepared = prepare_atomic(&target, &json)?;
             {
                 let _serial = model.lock_writes();
-                // The check and the rename run under the commit gate the
-                // freeze also takes, so no rename lands after a freeze.
+                // The check and the rename run under the commit gate the exit
+                // path waits on, so after freeze + a successful wait no
+                // rename is in flight and none can start.
                 frozen
                     .commit_unless_frozen(|| prepared.rename())
                     .ok_or_else(|| {
