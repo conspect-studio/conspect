@@ -799,7 +799,7 @@ impl SoftwareEngine {
                 None,
                 move |f: &multiview_engine::CompositedFrame| {
                     if f.tick.index % PREVIEW_CAPTURE_EVERY == 0 {
-                        preview.store(Some(Arc::new(f.canvas.clone())));
+                        preview.store(Some(Arc::clone(&f.canvas)));
                     }
                     let mut snapshot = crate::control::state_snapshot(
                         f.tick.index,

@@ -318,15 +318,31 @@ fn more_than_one_track_only_where_tracks_are_carried_at_once() {
 }
 
 #[test]
-fn start_up_refuses_an_explicit_audio_feed_it_does_not_carry() {
-    let cfg = load(&feed("srt-out", r#""none""#)).unwrap();
-    let err = multiview_config::outputs_carry_program(&cfg).unwrap_err();
-    assert!(
-        err.contains("this engine starts every output on follow audio"),
-        "{err}"
-    );
-    let cfg = load(&feed("srt-out", r#""follow""#)).unwrap();
+fn start_up_accepts_an_explicit_audio_feed_it_re_applies_as_a_boot_take() {
+    // ADR-0108 slice 2: a persisted explicit audio feed is admitted; the run
+    // re-applies it as an audio-only boot take (it used to be refused).
+    for audio in [
+        r#""none""#,
+        r#""program""#,
+        r#"{ source = "bars" }"#,
+        r#""follow""#,
+    ] {
+        let cfg = load(&feed("srt-out", audio)).unwrap();
+        multiview_config::outputs_carry_program(&cfg).unwrap();
+    }
+    // #329 F1 (behaviour intentionally changed): a directly routed source
+    // video feed is accepted at start-up (the run issues it as a boot take);
+    // a layout feed is accepted too (below).
+    let cfg = load("\n[[routing.output]]\noutput = \"srt-out\"\nvideo = { source = \"bars\" }\n")
+        .unwrap();
     multiview_config::outputs_carry_program(&cfg).unwrap();
+    let layout = MultiviewConfig::load_from_toml(&format!(
+        "{BASE}\n[[routing.output]]\noutput = \"srt-out\"\nvideo = {{ layout = \"L\" }}\n"
+    ))
+    .unwrap();
+    // ADR-0108 slice 3 (#306, behaviour intentionally changed): a persisted
+    // layout feed no longer refuses a start (it starts on Program).
+    multiview_config::outputs_carry_program(&layout).unwrap();
 }
 
 fn routing(tracks: &[(&str, &str)]) -> multiview_config::AudioRouting {

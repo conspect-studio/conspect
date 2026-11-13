@@ -185,6 +185,7 @@ fn router(
             max_per_principal: DEFAULT_MAX_PER_PRINCIPAL,
             has_preview: false,
             max_aux_canvases: DEFAULT_MAX_AUX_CANVASES,
+            boot_retry: BootRetryPolicy::default(),
         },
         aux,
         open,
@@ -419,6 +420,7 @@ fn harness_with(outputs: usize, max: usize, open: Option<OpenFn>, has_preview: b
             max_per_principal: DEFAULT_MAX_PER_PRINCIPAL,
             has_preview,
             max_aux_canvases: DEFAULT_MAX_AUX_CANVASES,
+            boot_retry: BootRetryPolicy::default(),
         },
         AuxWiring {
             feeds: Arc::new(SwapCell::from_pointee(Vec::new())),
@@ -1470,6 +1472,70 @@ fn untrusted_ids_are_bounded_and_a_held_key_is_never_re_attributed() {
     assert!(x.r.has_capacity("q"), "the newcomer is not charged");
 }
 
+/// PR #352 review (MEDIUM, media): an audio take on a `routable: false`
+/// output is refused like a video take — `OutputKindUnroutable` at plan,
+/// `Unroutable` at take — and nothing reaches the engine mailbox.
+#[test]
+fn the_control_adapter_refuses_audio_takes_on_an_unroutable_output() {
+    use multiview_control::output_routing::{
+        OutputRouting, OutputTakeRequest, PlanRefusal, RoutedAudio, TakeSubmitError,
+    };
+    let (mut r, h, _aux) = router(2, 6, Box::new(|_| Err("never".to_owned())));
+    let h = h.with_outputs(vec![
+        RunOutput {
+            id: Some("ok".into()),
+            settings: 0,
+            routable: true,
+            program_audio: true,
+        },
+        RunOutput {
+            id: Some("vaapi".into()),
+            settings: 0,
+            routable: false,
+            program_audio: true,
+        },
+    ]);
+    let slot = output_routing_slot();
+    slot.store(Some(Arc::new(h)));
+    let adapter = crate::output_routing_control::OutputRoutingAdapter::new(Arc::clone(&slot));
+    let outcomes = adapter.subscribe_outcomes().unwrap();
+    let src = RoutedAudio::Source("bars".into());
+    assert_eq!(
+        adapter.plan_audio("vaapi", None, Some(&src)),
+        Err(PlanRefusal::OutputKindUnroutable)
+    );
+    assert!(adapter.plan_audio("ok", None, Some(&src)).is_ok());
+    let audio_take = |output: &str| OutputTakeRequest {
+        operation_id: format!("op-{output}"),
+        output: output.into(),
+        video: None,
+        audio: Some(src.clone()),
+        layout: None,
+        principal: "p".into(),
+    };
+    assert_eq!(
+        adapter.try_take(audio_take("vaapi")),
+        Err(TakeSubmitError::Unroutable)
+    );
+    adapter.try_take(audio_take("ok")).unwrap();
+    let mut d = dispatcher(2);
+    for t in 0..4 {
+        r.on_tick(t, MediaTime::from_nanos(0), &mut d, &mut NoDelivery)
+            .unwrap();
+    }
+    let seen: Vec<_> = std::iter::from_fn(|| {
+        outcomes
+            .recv_timeout(std::time::Duration::from_millis(200))
+            .ok()
+    })
+    .map(|o| o.operation_id)
+    .collect();
+    assert!(
+        seen.iter().all(|op| op != "op-vaapi"),
+        "the refused take never reached the engine: {seen:?}"
+    );
+}
+
 /// The control adapter maps config ids → router indices from the run's own
 /// output map (binding ids), never from config order: with an internal anchor
 /// at index 0 and outputs renamed/reordered, a take addressed to "renamed"
@@ -1521,7 +1587,8 @@ fn the_control_adapter_maps_renamed_ids_to_their_own_index() {
         .try_take(OutputTakeRequest {
             operation_id: "op-1".into(),
             output: "renamed".into(),
-            feed: RoutedFeed::Program,
+            video: Some(RoutedFeed::Program),
+            audio: None,
             layout: None,
             principal: "p".into(),
         })
@@ -1996,6 +2063,7 @@ fn audio_harness(outputs: usize, cadence: Rational, open: OpenFn) -> AudioHarnes
             max_per_principal: DEFAULT_MAX_PER_PRINCIPAL,
             has_preview: false,
             max_aux_canvases: DEFAULT_MAX_AUX_CANVASES,
+            boot_retry: BootRetryPolicy::default(),
         },
         AuxWiring {
             feeds: Arc::new(SwapCell::from_pointee(Vec::new())),
@@ -2253,6 +2321,60 @@ fn tone_and_back(x: &mut AudioHarness) -> (u64, u64, u64) {
     // Long enough for the return to the shared stream and its close.
     let end = x.run(t4, 20);
     (t, t3, end)
+}
+
+/// Integration of #329 boot takes with slice-2 boot audio: a persisted row
+/// with a video feed AND an explicit audio feed boots as ONE combined boot
+/// take (so the audio-only boot take never supersedes the video one). When
+/// that take's video is refused for good, the boot take is given up but its
+/// audio is still applied, alone, as `boot:audio:<output index>` — keyed on
+/// the OUTPUT INDEX, never by re-parsing the give-up take's `operation_id`
+/// (PR #352 round 2): the id below deliberately does NOT name the output
+/// index (an HLS config id is a path and can be arbitrarily long and
+/// unrelated to the index), yet the re-issued audio id is still
+/// `boot:audio:1`.
+#[test]
+fn a_given_up_combined_boot_take_still_applies_its_audio() {
+    let mut x = audio_harness(2, NTSC, Box::new(|_| Err("no video".to_owned())));
+    let t = x.run(0, 6);
+    // Preview on a run without a switcher: refused `unroutable` for good. The
+    // operation id is a long, unrelated string (as a truncated HLS path
+    // would be, under the take-id length cap) to prove `boot_audio_alone`
+    // never parses it.
+    let long_config_id_take = format!("{BOOT_TAKE_PREFIX}{}", "z".repeat(100));
+    x.h.try_take(OutputTake {
+        operation_id: long_config_id_take.clone(),
+        output_index: 1,
+        bus: Some(PictureBus::Preview),
+        audio: Some(bars_src()),
+        principal: BOOT_PRINCIPAL.to_owned(),
+    })
+    .unwrap();
+    let (o, t) = x.until(t, &format!("{BOOT_AUDIO_TAKE_PREFIX}1"), 60);
+    assert_eq!(o.outcome, TakeResult::Applied, "{o:?}");
+    // The router-minted audio id is keyed on the output index (1), not on
+    // any substring of the give-up take's (unrelated) operation id.
+    assert_eq!(o.operation_id, "boot:audio:1");
+    assert!(multiview_control::output_routing::is_boot_take(
+        &o.operation_id
+    ));
+    assert_eq!(o.audio, Some(bars_src()));
+    let boot: Vec<_> = x
+        .others
+        .iter()
+        .filter(|o| o.operation_id == long_config_id_take)
+        .collect();
+    assert_eq!(boot.len(), 1, "{:?}", x.others);
+    assert_eq!(
+        boot[0].outcome,
+        TakeResult::Refused(RefuseReason::Unroutable)
+    );
+    x.run(t, 4);
+    let s = x.h.snapshot();
+    assert_eq!(s.boot_takes_given_up, 1);
+    assert_eq!(s.boot_takes_pending, 0);
+    assert_eq!(s.outputs[1].bus, "program", "the video stays on Program");
+    assert_eq!(s.outputs[1].audio_choice, "src:bars");
 }
 
 /// Spec G2: the PCM fed to the private bus across a tone -> program fade is
@@ -3522,6 +3644,67 @@ fn a_transient_offer_stall_within_the_gap_fill_horizon_never_degrades() {
     );
     assert_eq!(x.d.binding_video_key(1), Some(1), "still on the Clean key");
     drop(release);
+}
+
+/// #329: a refused boot take is re-issued no sooner than the retry period;
+/// an operator take on the same output ends the boot intent for good (the
+/// boot take is superseded and never re-issued).
+#[test]
+fn an_operator_take_ends_a_boot_take_retry_window() {
+    let (mut r, h, _aux) = router(2, 6, Box::new(|_| Err("never".to_owned())));
+    let outcomes = h.outcomes().unwrap();
+    let mut d = dispatcher(2);
+    let boot = OutputTake {
+        operation_id: format!("{BOOT_TAKE_PREFIX}o1"),
+        output_index: 1,
+        bus: Some(PictureBus::Source("cam".to_owned())),
+        audio: None,
+        principal: BOOT_PRINCIPAL.to_owned(),
+    };
+    h.try_take(boot).unwrap();
+    // CADENCE is 5/1: 2 s = 10 ticks; the prime deadline is 50 ticks.
+    let mut t = 0;
+    let mut refused = Vec::new();
+    while refused.len() < 2 {
+        r.on_tick(t, MediaTime::from_nanos(0), &mut d, &mut NoDelivery)
+            .unwrap();
+        refused.extend(outcomes.try_iter().map(|o| (o.tick, o.outcome)));
+        t += 1;
+        assert!(t < 400, "never retried: {refused:?}");
+    }
+    assert!(refused
+        .iter()
+        .all(|(_, o)| *o == TakeResult::Refused(RefuseReason::FeedNotFresh)));
+    assert!(refused[1].0 - refused[0].0 >= TAKE_PRIME_DEADLINE_TICKS);
+    assert_eq!(r.snapshot.load().boot_takes_pending, 1);
+    // The operator takes Program on that output while the boot take retries.
+    h.try_take(take("op", 1, PictureBus::Program)).unwrap();
+    for _ in 0..200 {
+        r.on_tick(t, MediaTime::from_nanos(0), &mut d, &mut NoDelivery)
+            .unwrap();
+        t += 1;
+    }
+    let after: Vec<_> = outcomes
+        .try_iter()
+        .map(|o| (o.operation_id, o.outcome))
+        .collect();
+    // At most one boot outcome (the pending attempt, superseded) and then
+    // only the operator's take.
+    let boot: Vec<_> = after
+        .iter()
+        .filter(|(op, _)| op.starts_with(BOOT_TAKE_PREFIX))
+        .collect();
+    assert!(
+        boot.len() <= 1 && boot.iter().all(|(_, o)| *o == TakeResult::Superseded),
+        "the boot take is never re-issued after an operator take: {after:?}"
+    );
+    assert!(
+        after
+            .iter()
+            .any(|(op, o)| op == "op" && *o == TakeResult::Applied),
+        "{after:?}"
+    );
+    assert_eq!(r.snapshot.load().boot_takes_pending, 0);
 }
 
 /// R2-1 (media lens): a bake-consumer stall sheds hot-queue ticks from the

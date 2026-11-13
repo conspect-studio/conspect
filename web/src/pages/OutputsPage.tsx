@@ -86,6 +86,7 @@ import { createApiClient } from '../api/client';
 import { useLayouts } from '../api/queries';
 import { useSources } from '../resources/queries';
 import { OutputFeedRow } from './OutputFeedRow';
+import { OutputAudioRow } from './OutputAudioRow';
 import type { FeedChoice } from './OutputFeedRow';
 import { PageHeader } from '../components/PageHeader';
 import { Badge } from '../components/ui/badge';
@@ -1290,6 +1291,16 @@ export function OutputsSurface({
   const routeOf = (id: string): OutputRouteState | undefined =>
     routeState.data?.outputs.find((row) => row.output === id);
   const selectableTracks = routing.data?.state.selectable_tracks;
+  // Discrete tracks a routed audio feed may carry (the program bus `prog` is
+  // the "Program mix" item); unknown until audio-routing has loaded.
+  const audioTracks = useMemo(
+    () => selectableTracks?.filter((track) => track !== 'prog'),
+    [selectableTracks],
+  );
+  const audioSources = useMemo(
+    () => (embedded ? [] : (sources.data ?? []).map((s) => ({ id: s.id, label: s.name }))),
+    [embedded, sources.data],
+  );
   const playbackPaths = hlsPlaybackPaths(outputs.data ?? []);
   const playbackCollisions = hlsPlaybackCollisionIds(outputs.data ?? []);
   const save = useSaveResource('outputs', RESOURCE_CONTEXT);
@@ -1482,6 +1493,15 @@ export function OutputsSurface({
                       outputName={output.name}
                       route={routeOf(output.id)}
                       choices={feedChoices}
+                      audioRow={
+                        <OutputAudioRow
+                          output={output.id}
+                          outputName={output.name}
+                          route={routeOf(output.id)}
+                          sources={audioSources}
+                          tracks={audioTracks}
+                        />
+                      }
                     />
                   )
                 }

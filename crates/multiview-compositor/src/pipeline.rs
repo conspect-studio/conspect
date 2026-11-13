@@ -273,34 +273,47 @@ impl AlphaPlanePool {
     }
 }
 
+/// Spare output planes kept per plane kind. A composited canvas is shared
+/// (`Arc`) by the encode hand-off, the preview and the held last-good frame,
+/// so its planes come back whenever the last of them lets go, sometimes
+/// several in one tick and then none (#311 reopen). Three spares absorb that
+/// jitter so a steady run never allocates a plane on the clock thread; any
+/// further return is dropped, so retained memory stays bounded (3 canvases).
+const PLANE_SPARES: usize = 3;
+
 /// Shared return path for CPU-compositor output-plane leases. `Nv12Image::drop`
-/// pushes its two vectors back into these bounded one-slot caches; if a later
-/// frame is still outstanding, the returned smaller slot is dropped rather than
-/// growing memory without bound.
+/// pushes its two vectors back into these bounded caches (at most
+/// [`PLANE_SPARES`] each); beyond that a returned plane is dropped rather than
+/// growing memory without bound. Each lock guards only a `Vec` push or pop of
+/// the spare list (never a copy, an allocation of plane size, or a wait on a
+/// consumer).
 #[derive(Debug, Default)]
 struct PlaneReturn {
-    y: std::sync::Mutex<Option<Vec<u8>>>,
-    uv: std::sync::Mutex<Option<Vec<u8>>>,
+    y: std::sync::Mutex<Vec<Vec<u8>>>,
+    uv: std::sync::Mutex<Vec<Vec<u8>>>,
 }
 
 impl PlaneReturn {
-    /// Return a completed frame's planes into the one-slot caches. Poison is
-    /// recovered (hot-path safety); only one spare per plane is retained.
+    /// Return a completed frame's planes into the bounded caches. Poison is
+    /// recovered (hot-path safety).
     fn give_back(&self, y: Vec<u8>, uv: Vec<u8>) {
-        let mut y_slot = match self.y.lock() {
+        Self::keep(&self.y, y);
+        Self::keep(&self.uv, uv);
+    }
+
+    fn keep(slot: &std::sync::Mutex<Vec<Vec<u8>>>, plane: Vec<u8>) {
+        let mut spares = match slot.lock() {
             Ok(guard) => guard,
             Err(poisoned) => poisoned.into_inner(),
         };
-        if y_slot.is_none() {
-            *y_slot = Some(y);
-        }
-        drop(y_slot);
-        let mut uv_slot = match self.uv.lock() {
-            Ok(guard) => guard,
-            Err(poisoned) => poisoned.into_inner(),
-        };
-        if uv_slot.is_none() {
-            *uv_slot = Some(uv);
+        if spares.len() < PLANE_SPARES {
+            // Capacity is reserved once (`take_plane`), so this push
+            // never reallocates the list.
+            spares.push(plane);
+        } else {
+            // Drop the surplus plane outside the lock.
+            drop(spares);
+            drop(plane);
         }
     }
 }
@@ -865,7 +878,7 @@ impl ScratchPool {
     /// Lease output planes of exactly `y_len`/`uv_len` bytes. A returned vector
     /// with enough capacity is resized+zeroed in place; otherwise one new vector
     /// is allocated and counted. The image's `Drop` returns the vectors through
-    /// the shared one-slot cache.
+    /// the shared bounded spare cache ([`PLANE_SPARES`] per plane kind).
     fn lease_planes(&self, y_len: usize, uv_len: usize) -> (Vec<u8>, Vec<u8>, Arc<PlaneReturn>) {
         let y = Self::take_plane(&self.planes.y, y_len, &self.alloc_count);
         let uv = Self::take_plane(&self.planes.uv, uv_len, &self.alloc_count);
@@ -875,7 +888,7 @@ impl ScratchPool {
     /// Take one cached plane, growing/allocating only if its capacity cannot
     /// serve `len`. Poison is recovered to protect the output clock.
     fn take_plane(
-        slot: &std::sync::Mutex<Option<Vec<u8>>>,
+        slot: &std::sync::Mutex<Vec<Vec<u8>>>,
         len: usize,
         counter: &AtomicU64,
     ) -> Vec<u8> {
@@ -883,7 +896,14 @@ impl ScratchPool {
             Ok(guard) => guard,
             Err(poisoned) => poisoned.into_inner(),
         };
-        let mut plane = guard.take().unwrap_or_default();
+        // Keep the spare list's own capacity for PLANE_SPARES entries so a
+        // later return never grows it (one small allocation at warmup).
+        if guard.capacity() < PLANE_SPARES {
+            guard.reserve_exact(PLANE_SPARES);
+        }
+        let taken = guard.pop();
+        drop(guard);
+        let mut plane = taken.unwrap_or_default();
         if plane.capacity() < len {
             counter.fetch_add(1, Ordering::Relaxed);
         }

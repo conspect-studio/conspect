@@ -63,7 +63,11 @@ pub struct CompositedFrame {
     /// The tick this frame was produced for.
     pub tick: Tick,
     /// The tagged output canvas (NV12, BT.709 limited per the canvas).
-    pub canvas: Nv12Image,
+    ///
+    /// Shared, never copied on the clock thread (#311): every consumer of the
+    /// tick (encode hand-off, preview, display, NDI, the held last-good frame)
+    /// takes an `Arc` clone of the one composited canvas.
+    pub canvas: Arc<Nv12Image>,
     /// Per-source lifecycle state sampled this tick (`source_id -> state`).
     ///
     /// Includes every cell-bound source; a cell with no bound source is omitted.
@@ -675,7 +679,7 @@ impl CompositorDrive<Nv12Image> {
 
         Ok(CompositedFrame {
             tick,
-            canvas: canvas_image,
+            canvas: Arc::new(canvas_image),
             source_states,
             source_times,
             repeat: false,

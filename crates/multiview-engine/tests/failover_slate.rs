@@ -194,7 +194,7 @@ fn live_cell_is_byte_identical_across_policies() {
     let (w, h) = (128, 64);
     let live_luma = 200_u8;
 
-    let compose_live = |slate: FailoverSlate| -> Nv12Image {
+    let compose_live = |slate: FailoverSlate| -> Arc<Nv12Image> {
         let store = Arc::new(TileStore::<Nv12Image>::with_defaults("cam-a"));
         store.publish(solid(w, h, live_luma), MediaTime::ZERO);
         let mut stores = HashMap::new();

@@ -416,6 +416,11 @@ impl RoutedAudio {
         self.outputs.iter().filter(|o| o.bus.is_some()).count()
     }
 
+    /// Whether `output` runs a private audio bus now.
+    pub(crate) fn has_private_bus(&self, output: usize) -> bool {
+        self.outputs.get(output).is_some_and(|o| o.bus.is_some())
+    }
+
     /// The output's audio choice.
     pub(crate) fn choice(&self, output: usize) -> AudioChoice {
         self.outputs

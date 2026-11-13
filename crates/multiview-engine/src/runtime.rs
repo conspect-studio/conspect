@@ -422,6 +422,9 @@ pub struct EngineRuntime<P> {
     /// Program tick lateness (emit − deadline) at each publish, fresh or
     /// repeat (ADR-0108 §10). Wait-free atomics only.
     lateness: Arc<crate::lateness::TickLateness>,
+    /// Where each tick's lateness comes from: wake latency and the compose
+    /// phases (#311). Wait-free atomics only.
+    phases: Arc<crate::lateness::TickPhases>,
     /// This runtime's outgoing handoff cell: raised by a supervisor to hand
     /// the timeline to a successor (#311). Two atomic loads per tick.
     handoff_out: Arc<Handoff>,
@@ -466,6 +469,7 @@ impl<P: Pacer> EngineRuntime<P> {
             ticks_emitted: Arc::new(AtomicU64::new(0)),
             frames_repeated: Arc::new(AtomicU64::new(0)),
             lateness: crate::lateness::TickLateness::shared(),
+            phases: crate::lateness::TickPhases::shared(),
             handoff_out: Handoff::shared(),
             handoff_in: None,
         }
@@ -531,6 +535,13 @@ impl<P: Pacer> EngineRuntime<P> {
         Arc::clone(&self.lateness)
     }
 
+    /// The shared per-tick phase histograms (wake latency, compose phases;
+    /// read off-thread).
+    #[must_use]
+    pub fn phases(&self) -> Arc<crate::lateness::TickPhases> {
+        Arc::clone(&self.phases)
+    }
+
     /// This runtime's outgoing handoff cell (raise [`Handoff::request`] on it
     /// to hand the timeline to a successor waiting on the same cell).
     #[must_use]
@@ -547,9 +558,11 @@ impl<P: Pacer> EngineRuntime<P> {
 
     /// Record the lateness of the tick just published (one time-source read
     /// plus atomics; never allocates or locks).
-    fn record_lateness(&self, tick_index: u64) {
+    fn record_lateness(&self, tick_index: u64) -> i64 {
         let deadline = self.clock.deadline_nanos(tick_index, self.seed_nanos);
-        self.lateness.record(self.time_source.now_nanos(), deadline);
+        let now = self.time_source.now_nanos();
+        self.lateness.record(now, deadline);
+        now
     }
 
     /// Run the tick loop **forever**, until `stop` is raised.
@@ -926,6 +939,11 @@ impl<P: Pacer> EngineRuntime<P> {
                     stop: RunStop::Stopped,
                 });
             }
+            // Wake lateness (#311): the instant the wait returned, recorded
+            // below against the deadline of the tick that is composed fresh
+            // (after any cadence-hold repeats), so a fresh tick's emit
+            // lateness is its wake plus its compose. One time read.
+            let t_wake = self.time_source.now_nanos();
 
             // 1.5 DROP/REPEAT-TO-CADENCE (ADR-T018). If compose has fallen behind
             //     wall-clock (a CPU/GPU-contended host), re-emit the held last-good
@@ -1048,18 +1066,34 @@ impl<P: Pacer> EngineRuntime<P> {
             //     non-blocking queue and applies O(1) `set_layout`/`insert_store`);
             //     it never awaits and never holds a lock a client can fill, so the
             //     output clock cannot be stalled by control (invariants #1 + #10).
+            //     Each phase boundary below is one time-source read feeding the
+            //     wait-free phase histograms (#311), so the cost of a tick is
+            //     attributable without a profiler.
+            self.phases.wake.record(
+                t_wake,
+                self.clock.deadline_nanos(tick.index, self.seed_nanos),
+            );
+            let t_hook = self.time_source.now_nanos();
             control.before_compose(&mut self.drive, tick);
             repeats_since_control = 0;
+            let t_composite = self.time_source.now_nanos();
 
             // 3. Sample + compose exactly one frame (lock-free, never blocks on
             //    an input).
             let frame = self.drive.compose(tick)?;
+            let t_after = self.time_source.now_nanos();
             control.after_compose(&frame);
+            let t_project = self.time_source.now_nanos();
 
             // 4. Publish outward — wait-free state slot + non-blocking drop-oldest
             //    event stream. Neither can be back-pressured by a consumer.
             publisher.publish_state(state_of(&frame));
-            self.record_lateness(tick.index);
+            let t_published = self.record_lateness(tick.index);
+            self.phases.hook.record(t_composite, t_hook);
+            self.phases.composite.record(t_after, t_composite);
+            self.phases.after.record(t_project, t_after);
+            self.phases.project.record(t_published, t_project);
+            self.phases.compose.record(t_published, t_hook);
             // Events are sparse: publish only when the projection yields one, so
             // the drop-oldest broadcast carries state changes, not a per-tick
             // flood. The state slot above still refreshes every tick.

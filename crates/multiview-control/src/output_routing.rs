@@ -11,14 +11,15 @@
 //! (`try_take` is a bounded `try_send`, `snapshot` a wait-free load). The
 //! outcome relay runs on its own thread + task and never touches the clock.
 //! All state here is bounded: the take store (one record per take
-//! `Idempotency-Key`, fail-closed at its cap, never evicted) and both rate
+//! `Idempotency-Key`, capped in total and per principal; settled records are
+//! evicted oldest-first under pressure, pending ones never) and both rate
 //! limiters have fixed caps.
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
-use multiview_config::VideoFeed;
+use multiview_config::{AudioFeed, VideoFeed};
 
 /// The picture bus a take routes onto an output (every [`VideoFeed`]: slice 3
 /// added stored layouts).
@@ -131,16 +132,69 @@ impl PartialEq for LayoutBody {
 
 impl Eq for LayoutBody {}
 
-/// One take, already authorized by the HTTP layer.
+/// The audio a take routes onto an output (ADR-0108 slice 2, §5.1). A
+/// track is already resolved to its `audio-routing` route's input id.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum RoutedAudio {
+    /// The audio of the output's video feed.
+    Follow,
+    /// The program mix.
+    Program,
+    /// Silence.
+    None,
+    /// One source's own audio.
+    Source(String),
+    /// One discrete `audio-routing` track (`[audio].routes[].target_track`)
+    /// and the route's `input_id` it carries.
+    Track {
+        /// The track name.
+        name: String,
+        /// The route's input id.
+        input: String,
+    },
+}
+
+impl RoutedAudio {
+    /// The engine label of the choice: `follow`, `program`, `none`,
+    /// `src:<id>`, `track:<name>`.
+    #[must_use]
+    pub fn label(&self) -> String {
+        match self {
+            Self::Follow => "follow".to_owned(),
+            Self::Program => "program".to_owned(),
+            Self::None => "none".to_owned(),
+            Self::Source(id) => format!("src:{id}"),
+            Self::Track { name, .. } => format!("track:{name}"),
+        }
+    }
+
+    /// The config [`AudioFeed`] this choice persists as.
+    #[must_use]
+    pub fn audio_feed(&self) -> AudioFeed {
+        match self {
+            Self::Follow => AudioFeed::Follow,
+            Self::Program => AudioFeed::Program,
+            Self::None => AudioFeed::None,
+            Self::Source(id) => AudioFeed::Source(id.clone()),
+            Self::Track { name, .. } => AudioFeed::Tracks(vec![name.clone()]),
+        }
+    }
+}
+
+/// One take, already authorized by the HTTP layer. At least one of `video`
+/// and `audio` is set; `video: None` is an audio-only take (the video is
+/// untouched), `audio: None` keeps the output's audio choice.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OutputTakeRequest {
     /// The operation id minted for the take (echoed in its outcome).
     pub operation_id: String,
     /// The output's config id.
     pub output: String,
-    /// The destination feed.
-    pub feed: RoutedFeed,
-    /// The resolved layout body, for a [`RoutedFeed::Layout`] feed.
+    /// The destination video feed (`None`: audio-only).
+    pub video: Option<RoutedFeed>,
+    /// The output's new audio choice (`None`: keep the current one).
+    pub audio: Option<RoutedAudio>,
+    /// The resolved layout body, for a [`RoutedFeed::Layout`] video feed.
     pub layout: Option<LayoutBody>,
     /// The authenticated key id the take is charged to (never client input).
     pub principal: String,
@@ -171,6 +225,17 @@ pub enum PlanRefusal {
         /// The limit.
         max: usize,
     },
+    /// The output has no program-audio slot for a routed audio feed (NDI,
+    /// AES67, display, or a run without program audio).
+    AudioUnsupported,
+}
+
+/// The predicted audio cost of a take (§5.2, §7).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct AudioPlanCost {
+    /// `true` when the take changes the output's effective audio and the
+    /// output has no private audio bus yet: +1 transient CPU AAC encode.
+    pub needs_encoder: bool,
 }
 
 /// The predicted cost of a take.
@@ -205,6 +270,14 @@ pub struct OutputLive {
     pub pending: Option<(String, u64)>,
     /// The current bus is holding its last picture beyond the degraded bound.
     pub degraded: bool,
+    /// The audio the output carries (engine label: `program`, `none`,
+    /// `src:<id>`, `track:<name>`, `preview`); `None` when the run carries
+    /// no program audio.
+    pub audio: Option<String>,
+    /// The audio choice label of the pending take, when it carries one.
+    pub pending_audio: Option<String>,
+    /// Whether the output runs a private encoded audio bus now.
+    pub private_audio: bool,
 }
 
 /// The engine's routing readback.
@@ -237,6 +310,9 @@ pub struct OutputOutcome {
     /// (always set for `applied`: the feed to persist). Carried here so
     /// persistence never depends on control-plane bookkeeping.
     pub feed: Option<RoutedFeed>,
+    /// The output's audio choice after this outcome, when the engine knows
+    /// it (`None` for a run without program audio).
+    pub audio: Option<RoutedAudio>,
 }
 
 /// The engine seam the binary implements (all calls non-blocking).
@@ -246,6 +322,19 @@ pub trait OutputRouting: Send + Sync {
     /// # Errors
     /// The refusal the take would certainly meet.
     fn plan(&self, output: &str, feed: &RoutedFeed) -> Result<PlanCost, PlanRefusal>;
+    /// Predict a take's audio cost: `video` is the take's new video feed
+    /// (`None`: unchanged), `audio` its audio choice (`None`: unchanged).
+    ///
+    /// # Errors
+    /// [`PlanRefusal::AudioUnsupported`] when `audio` is an explicit choice
+    /// the output cannot carry; [`PlanRefusal::OutputKindUnroutable`] for an
+    /// output the engine does not route.
+    fn plan_audio(
+        &self,
+        output: &str,
+        video: Option<&RoutedFeed>,
+        audio: Option<&RoutedAudio>,
+    ) -> Result<AudioPlanCost, PlanRefusal>;
     /// Enqueue an authorized take without waiting.
     ///
     /// # Errors
@@ -260,12 +349,16 @@ pub trait OutputRouting: Send + Sync {
 /// Shared handle to an installed [`OutputRouting`].
 pub type SharedOutputRouting = Arc<dyn OutputRouting>;
 
-/// Take records held by the take store. At the cap a new distinct key fails
-/// closed (`idempotency-capacity`); a record is never evicted, so every key
-/// that was answered `accepted` replays its own operation for the life of the
-/// process (the same lifetime as [`crate::concurrency::IdempotencyStore`]
-/// keys, which also never expire).
+/// Take records held by the take store (all principals together). At the cap
+/// a new distinct key evicts the oldest **settled** record; only when every
+/// record is still pending does it fail closed (`idempotency-capacity`). A
+/// pending record is never evicted, so a key answered `accepted` always replays
+/// its own operation while its outcome is unknown.
 pub const MAX_TAKE_RECORDS: usize = crate::concurrency::MAX_IDEMPOTENCY_RESERVATIONS;
+/// Take records one principal may hold. At this cap the principal's own oldest
+/// settled record is evicted first; a principal whose records are all pending
+/// gets `idempotency-capacity` while every other principal is unaffected.
+pub const MAX_TAKE_RECORDS_PER_PRINCIPAL: usize = 256;
 /// Takes per second per output (§6.4).
 pub const TAKES_PER_OUTPUT_PER_SEC: usize = 2;
 /// Takes per second per principal (§6.4).
@@ -276,6 +369,29 @@ pub const MAX_LIMITED_PRINCIPALS: usize = 1024;
 /// still bounds the map if outputs churn).
 pub const MAX_LIMITED_OUTPUTS: usize = 1024;
 const RATE_WINDOW: Duration = Duration::from_secs(1);
+
+/// Operation-id prefix of EVERY take the engine issues itself at run start to
+/// re-apply persisted state (a start-up, or boot, take): `boot:<output
+/// index>` for the video (or combined) take, [`BOOT_AUDIO_TAKE_PREFIX`] for an
+/// audio-only one. The one shared definition: the engine mints these ids and
+/// the outcome relay recognises them by [`is_boot_take`]. A boot outcome is
+/// never persisted, applied or not: the accepted row is the operator's intent.
+/// PR #352 round 2: the engine keys every boot id on the run's OUTPUT INDEX,
+/// never on a parsed config id — a config id (an HLS one is a path) can be
+/// arbitrarily long, so a config-id-derived id risked truncation collisions
+/// or outright rejection by the take-id length check. The relay here only
+/// ever matches the prefix, so it is unaffected either way.
+pub const BOOT_TAKE_PREFIX: &str = "boot:";
+/// Operation-id prefix of an audio-only boot take: `boot:audio:<output
+/// index>` (itself under [`BOOT_TAKE_PREFIX`]).
+pub const BOOT_AUDIO_TAKE_PREFIX: &str = "boot:audio:";
+
+/// Whether `operation_id` names a start-up (boot) take the engine issued
+/// itself — never a client take (those carry a minted [`crate::command::OperationId`]).
+#[must_use]
+pub fn is_boot_take(operation_id: &str) -> bool {
+    operation_id.starts_with(BOOT_TAKE_PREFIX)
+}
 
 /// A recorded terminal outcome.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -291,16 +407,24 @@ pub struct RecordedOutcome {
 pub struct PendingTake {
     /// The output's API id (the event and the readback name this).
     pub api_id: String,
-    /// The feed to persist on `applied`.
-    pub feed: RoutedFeed,
+    /// The video feed to persist on `applied` (`None`: an audio-only take,
+    /// which keeps the persisted video).
+    pub feed: Option<RoutedFeed>,
+    /// The audio choice the take carries, if any.
+    pub audio: Option<RoutedAudio>,
 }
 
-/// A take's record for the life of its `Idempotency-Key`.
+/// A take's record for the life of its `Idempotency-Key` (or until it is
+/// settled and evicted under pressure).
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct TakeRecord {
     operation_id: crate::command::OperationId,
     take: PendingTake,
     outcome: Option<RecordedOutcome>,
+    /// The principal the record is charged to.
+    principal: String,
+    /// Reservation order (the eviction age).
+    seq: u64,
 }
 
 /// The result of [`OutputRoutingControl::reserve_take`].
@@ -310,7 +434,8 @@ pub enum TakeReservation {
     Fresh(crate::command::OperationId),
     /// The key already names a take: answer it, never enqueue again.
     Replay(TakeReplay),
-    /// The store is full: fail closed (`idempotency-capacity`).
+    /// No record can be made: the principal's records (or, globally, every
+    /// record) are all pending. Fail closed (`idempotency-capacity`).
     Capacity,
 }
 
@@ -324,20 +449,39 @@ pub struct TakeReplay {
 }
 
 /// The take-scoped idempotency store: scoped key → record, plus operation id
-/// → scoped key for settling. Bounded by `cap`; never evicts.
+/// → scoped key for settling. Bounded by `cap` records in total and
+/// `per_principal` records per principal; under pressure the oldest SETTLED
+/// record is evicted (the principal's own first), never a pending one.
 #[derive(Debug)]
 struct TakeStore {
     cap: usize,
+    per_principal: usize,
+    next_seq: u64,
     by_key: HashMap<String, TakeRecord>,
     by_op: HashMap<String, String>,
+    /// Records held per principal (an entry is removed at zero, so this map is
+    /// bounded by the record count).
+    held: HashMap<String, usize>,
+    /// Settled records by reservation order: the eviction queue.
+    settled: std::collections::BTreeMap<u64, String>,
 }
 
 impl TakeStore {
-    fn new(cap: usize) -> Self {
+    fn new(cap: usize, per_principal: usize) -> Self {
+        Self::starting_at(cap, per_principal, 0)
+    }
+
+    /// A store whose next reservation gets `next_seq` (`new` starts at 0; a
+    /// test starts near `u64::MAX` to prove the age never wraps).
+    fn starting_at(cap: usize, per_principal: usize, next_seq: u64) -> Self {
         Self {
             cap,
+            per_principal,
+            next_seq,
             by_key: HashMap::new(),
             by_op: HashMap::new(),
+            held: HashMap::new(),
+            settled: std::collections::BTreeMap::new(),
         }
     }
 
@@ -348,21 +492,72 @@ impl TakeStore {
         })
     }
 
-    fn reserve(&mut self, key: &str, take: PendingTake) -> TakeReservation {
+    /// Remove `key`'s record and every index of it.
+    fn remove(&mut self, key: &str) {
+        let Some(record) = self.by_key.remove(key) else {
+            return;
+        };
+        self.by_op.remove(record.operation_id.as_str());
+        self.settled.remove(&record.seq);
+        if let Some(count) = self.held.get_mut(&record.principal) {
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                self.held.remove(&record.principal);
+            }
+        }
+    }
+
+    /// Evict the oldest settled record (of `principal` only, when given).
+    /// `false` when there is none: every candidate is pending.
+    fn evict_oldest_settled(&mut self, principal: Option<&str>) -> bool {
+        // O(records) at worst, on the control plane only, bounded by `cap`.
+        let victim = self
+            .settled
+            .values()
+            .find(|key| {
+                principal.is_none_or(|p| self.by_key.get(*key).is_some_and(|r| r.principal == p))
+            })
+            .cloned();
+        match victim {
+            Some(key) => {
+                self.remove(&key);
+                true
+            }
+            None => false,
+        }
+    }
+
+    fn reserve(&mut self, key: &str, principal: &str, take: PendingTake) -> TakeReservation {
         if let Some(replay) = self.replay(key) {
             return TakeReservation::Replay(replay);
         }
-        if self.by_key.len() >= self.cap {
+        // The reservation order is the eviction age: it must never wrap (a
+        // wrapped seq would sort the NEWEST record first and evict it). A u64
+        // cannot realistically run out; if it ever did, fail closed before
+        // evicting anything.
+        let (seq, Some(next_seq)) = (self.next_seq, self.next_seq.checked_add(1)) else {
+            return TakeReservation::Capacity;
+        };
+        if self.held.get(principal).copied().unwrap_or(0) >= self.per_principal
+            && !self.evict_oldest_settled(Some(principal))
+        {
+            return TakeReservation::Capacity;
+        }
+        if self.by_key.len() >= self.cap && !self.evict_oldest_settled(None) {
             return TakeReservation::Capacity;
         }
         let op = crate::command::OperationId::new();
+        self.next_seq = next_seq;
         self.by_op.insert(op.as_str().to_owned(), key.to_owned());
+        *self.held.entry(principal.to_owned()).or_insert(0) += 1;
         self.by_key.insert(
             key.to_owned(),
             TakeRecord {
                 operation_id: op.clone(),
                 take,
                 outcome: None,
+                principal: principal.to_owned(),
+                seq,
             },
         );
         TakeReservation::Fresh(op)
@@ -370,14 +565,19 @@ impl TakeStore {
 
     fn release(&mut self, key: &str, op: &crate::command::OperationId) {
         if self.by_key.get(key).is_some_and(|r| r.operation_id == *op) {
-            self.by_key.remove(key);
-            self.by_op.remove(op.as_str());
+            self.remove(key);
         }
     }
 
-    fn record_mut(&mut self, operation_id: &str) -> Option<&mut TakeRecord> {
-        let key = self.by_op.get(operation_id)?;
-        self.by_key.get_mut(key)
+    /// Record `outcome` on `operation_id`'s take; the take it settles.
+    fn settle(&mut self, operation_id: &str, outcome: RecordedOutcome) -> Option<PendingTake> {
+        let key = self.by_op.get(operation_id)?.clone();
+        let record = self.by_key.get_mut(&key)?;
+        if record.outcome.is_none() {
+            self.settled.insert(record.seq, key);
+        }
+        record.outcome = Some(outcome);
+        Some(record.take.clone())
     }
 
     fn record(&self, operation_id: &str) -> Option<&TakeRecord> {
@@ -563,7 +763,10 @@ impl OutputRoutingControl {
         Self {
             routing,
             limiter: TakeLimiter::default(),
-            records: Mutex::new(TakeStore::new(MAX_TAKE_RECORDS)),
+            records: Mutex::new(TakeStore::new(
+                MAX_TAKE_RECORDS,
+                MAX_TAKE_RECORDS_PER_PRINCIPAL,
+            )),
         }
     }
 
@@ -578,11 +781,18 @@ impl OutputRoutingControl {
         self.records().replay(key)
     }
 
-    /// Reserve `key` for a take of `pending`: fresh, replay of the key's own
-    /// operation, or capacity (fail closed; nothing is evicted). The record
-    /// exists before the enqueue, so an outcome can never beat it.
-    pub fn reserve_take(&self, key: &str, pending: PendingTake) -> TakeReservation {
-        self.records().reserve(key, pending)
+    /// Reserve `key` for a take of `pending` charged to `principal` (the
+    /// authenticated key id): fresh, replay of the key's own operation, or
+    /// capacity. Under pressure the oldest settled record is evicted (the
+    /// principal's own first, at its per-principal cap); a pending record never
+    /// is. The record exists before the enqueue, so an outcome never beats it.
+    pub fn reserve_take(
+        &self,
+        key: &str,
+        principal: &str,
+        pending: PendingTake,
+    ) -> TakeReservation {
+        self.records().reserve(key, principal, pending)
     }
 
     /// Free `key` after its own take failed to enqueue (busy/unroutable), but
@@ -597,13 +807,13 @@ impl OutputRoutingControl {
         if outcome.operation_id.is_empty() {
             return None;
         }
-        let mut records = self.records();
-        let record = records.record_mut(&outcome.operation_id)?;
-        record.outcome = Some(RecordedOutcome {
-            outcome: outcome.outcome.clone(),
-            tick: outcome.tick,
-        });
-        Some(record.take.clone())
+        self.records().settle(
+            &outcome.operation_id,
+            RecordedOutcome {
+                outcome: outcome.outcome.clone(),
+                tick: outcome.tick,
+            },
+        )
     }
 
     /// The recorded terminal outcome of `operation_id`, once known.
@@ -680,14 +890,30 @@ async fn relay_one(
         return;
     };
     // The feed to persist rides the outcome itself, so an `applied` persists
-    // whether or not this process still holds the take's record.
-    if outcome.outcome == "applied" {
-        let feed = outcome
-            .feed
+    // whether or not this process still holds the take's record. An
+    // audio-only take (its record says so) keeps the persisted video.
+    // A boot take (operation id `boot:…`, see [`is_boot_take`]) re-applies the
+    // persisted state at run start: its outcome is NEVER persisted (applied or
+    // not), so it can neither rewrite nor delete the operator's row.
+    if outcome.outcome == "applied" && !is_boot_take(&outcome.operation_id) {
+        let audio_only = settled.as_ref().is_some_and(|p| p.feed.is_none());
+        let feed = if audio_only {
+            None
+        } else {
+            outcome
+                .feed
+                .clone()
+                .or_else(|| settled.as_ref().and_then(|p| p.feed.clone()))
+        };
+        let audio = outcome
+            .audio
             .clone()
-            .or_else(|| settled.as_ref().map(|p| p.feed.clone()));
-        if let Some(feed) = feed {
-            if let Err(error) = persist_feed(state, &outcome.output, &feed).await {
+            .or_else(|| settled.as_ref().and_then(|p| p.audio.clone()))
+            .map(|a| a.audio_feed());
+        if feed.is_some() || audio.is_some() {
+            if let Err(error) =
+                persist_route(state, &outcome.output, feed.as_ref(), audio.as_ref()).await
+            {
                 tracing::warn!(%error, output = %api_id, "output routing: applied take not persisted");
             }
         }
@@ -705,8 +931,11 @@ async fn relay_one(
 }
 
 /// Persist `feed` as `output`'s `[[routing.output]]` entry (Program removes
-/// it), under the config-mutation lock `apply-layout` uses. Called only after
-/// the engine reported `applied`.
+/// it, unless the boot file routes that output elsewhere: then an explicit
+/// Program row is kept so a restart does not re-seed the boot row), under the
+/// config-mutation lock `apply-layout` uses. Called only after the engine
+/// reported `applied`. Start-up carries these rows (store-backed, #329).
+/// Keeps the row's audio.
 ///
 /// # Errors
 /// The accepted document cannot be read, validated or committed.
@@ -714,6 +943,22 @@ pub async fn persist_feed(
     state: &crate::AppState,
     output: &str,
     feed: &RoutedFeed,
+) -> crate::ControlResult<()> {
+    persist_route(state, output, Some(feed), None).await
+}
+
+/// Persist an applied take on `output`'s `[[routing.output]]` row: `video`
+/// replaces its video feed and `audio` its audio feed (`None` keeps each).
+/// A row that ends on Program video and `follow` audio is removed (absent =
+/// default, today's behaviour). Under the config-mutation lock.
+///
+/// # Errors
+/// The accepted document cannot be read, validated or committed.
+pub async fn persist_route(
+    state: &crate::AppState,
+    output: &str,
+    video: Option<&RoutedFeed>,
+    audio: Option<&AudioFeed>,
 ) -> crate::ControlResult<()> {
     if state.boot_model.is_none() {
         return Ok(());
@@ -730,13 +975,37 @@ pub async fn persist_feed(
     // Only the output rows change: an absent table stays free of desugared
     // cell/audio rows (a later layout edit must not meet stale crosspoints).
     let mut table = config.routing.take().unwrap_or_default();
-    table.output.retain(|xp| xp.output != output);
-    if *feed != RoutedFeed::Program {
+    let previous = table
+        .output
+        .iter()
+        .position(|xp| xp.output == output)
+        .map(|i| table.output.remove(i));
+    let (kept_video, kept_audio) = previous.map_or((VideoFeed::PROGRAM, AudioFeed::Follow), |xp| {
+        (xp.effective_video(), xp.audio)
+    });
+    let video = video.map_or(kept_video, RoutedFeed::video_feed);
+    let audio = audio.cloned().unwrap_or(kept_audio);
+    // A start-up seeds an output with no accepted row from the BOOT file's
+    // row (#329), so a take back to Program (and `follow`) must stay explicit
+    // when the boot file routes that output elsewhere — or a restart would
+    // undo it.
+    let boot_seeds_other = state.boot_model.as_ref().is_some_and(|model| {
+        model.loaded().routing.as_ref().is_some_and(|t| {
+            t.output.iter().any(|xp| {
+                xp.output == output
+                    && (xp.effective_video() != VideoFeed::PROGRAM || !xp.audio.is_follow())
+            })
+        })
+    });
+    if video != VideoFeed::PROGRAM || !audio.is_follow() || boot_seeds_other {
         let mut xp = multiview_config::OutputCrosspoint::program(output, program);
-        xp.video = Some(feed.video_feed());
+        if video != VideoFeed::PROGRAM {
+            xp.video = Some(video);
+        }
+        xp.audio = audio;
         table.output.push(xp);
     }
-    // Program: the entry is removed (absent = Program, today's behaviour).
+    // Otherwise Program + follow removes the entry (absent = the default).
     let empty = table.output.is_empty()
         && table.video.is_empty()
         && table.audio.is_empty()
@@ -791,19 +1060,23 @@ mod tests {
 
     #[test]
     fn take_records_are_bounded_and_fail_closed_without_eviction() {
-        let mut store = TakeStore::new(3);
+        let mut store = TakeStore::new(3, 3);
         let pending = || PendingTake {
             api_id: "o".to_owned(),
-            feed: RoutedFeed::Program,
+            feed: Some(RoutedFeed::Program),
+            audio: None,
         };
         let mut ops = Vec::new();
         for i in 0..3 {
-            let TakeReservation::Fresh(op) = store.reserve(&format!("k{i}"), pending()) else {
+            let TakeReservation::Fresh(op) = store.reserve(&format!("k{i}"), "p", pending()) else {
                 panic!("fresh");
             };
             ops.push(op);
         }
-        assert_eq!(store.reserve("k9", pending()), TakeReservation::Capacity);
+        assert_eq!(
+            store.reserve("k9", "p", pending()),
+            TakeReservation::Capacity
+        );
         assert_eq!(store.by_key.len(), 3);
         for (i, op) in ops.iter().enumerate() {
             let Some(replay) = store.replay(&format!("k{i}")) else {
@@ -817,8 +1090,142 @@ mod tests {
         store.release("k0", &ops[0]);
         assert!(store.replay("k0").is_none() && store.record(ops[0].as_str()).is_none());
         assert!(matches!(
-            store.reserve("k9", pending()),
+            store.reserve("k9", "p", pending()),
             TakeReservation::Fresh(_)
+        ));
+    }
+
+    fn pending_take() -> PendingTake {
+        PendingTake {
+            api_id: "o".to_owned(),
+            feed: Some(RoutedFeed::Program),
+            audio: None,
+        }
+    }
+
+    fn fresh(store: &mut TakeStore, key: &str, principal: &str) -> crate::command::OperationId {
+        match store.reserve(key, principal, pending_take()) {
+            TakeReservation::Fresh(op) => op,
+            other => panic!("{key}: expected fresh, got {other:?}"),
+        }
+    }
+
+    fn settle(store: &mut TakeStore, op: &crate::command::OperationId) {
+        assert!(store
+            .settle(
+                op.as_str(),
+                RecordedOutcome {
+                    outcome: "applied".to_owned(),
+                    tick: 1,
+                },
+            )
+            .is_some());
+    }
+
+    #[test]
+    fn one_principal_filling_its_cap_cannot_block_another() {
+        let mut store = TakeStore::new(100, 4);
+        for i in 0..4 {
+            fresh(&mut store, &format!("a{i}"), "alice");
+        }
+        // All of alice's records are pending: alice fails closed …
+        assert_eq!(
+            store.reserve("a-more", "alice", pending_take()),
+            TakeReservation::Capacity
+        );
+        // … and bob is unaffected.
+        fresh(&mut store, "b0", "bob");
+        // Every alice key still replays its own operation while pending.
+        for i in 0..4 {
+            assert!(store.replay(&format!("a{i}")).is_some());
+        }
+    }
+
+    #[test]
+    fn a_principal_at_its_cap_evicts_its_own_oldest_settled_record_first() {
+        let mut store = TakeStore::new(100, 3);
+        let bob = fresh(&mut store, "b0", "bob");
+        settle(&mut store, &bob);
+        let a0 = fresh(&mut store, "a0", "alice");
+        let a1 = fresh(&mut store, "a1", "alice");
+        fresh(&mut store, "a2", "alice");
+        settle(&mut store, &a1);
+        settle(&mut store, &a0);
+        // Alice is at her cap: her OWN oldest settled (a0, reserved first) is
+        // evicted, not bob's older settled record and not her pending a2.
+        fresh(&mut store, "a3", "alice");
+        assert!(
+            store.replay("a0").is_none(),
+            "alice's oldest settled evicted"
+        );
+        assert!(store.replay("a1").is_some());
+        assert!(store.replay("a2").is_some(), "pending never evicted");
+        assert!(store.replay("b0").is_some(), "another principal untouched");
+        assert_eq!(store.by_key.len(), 4);
+    }
+
+    #[test]
+    fn settled_records_are_evicted_oldest_first_at_the_global_cap_and_pending_never() {
+        let mut store = TakeStore::new(4, 4);
+        let k0 = fresh(&mut store, "k0", "p0");
+        fresh(&mut store, "k1", "p1");
+        let k2 = fresh(&mut store, "k2", "p2");
+        fresh(&mut store, "k3", "p3");
+        settle(&mut store, &k2);
+        settle(&mut store, &k0);
+        // Full: the oldest SETTLED by reservation order (k0) goes first.
+        fresh(&mut store, "k4", "p4");
+        assert!(store.replay("k0").is_none());
+        assert!(store.record(k0.as_str()).is_none(), "both indexes cleared");
+        fresh(&mut store, "k5", "p5");
+        assert!(store.replay("k2").is_none());
+        // Only pending records remain: fail closed, nothing evicted.
+        assert_eq!(
+            store.reserve("k6", "p6", pending_take()),
+            TakeReservation::Capacity
+        );
+        for key in ["k1", "k3", "k4", "k5"] {
+            assert!(store.replay(key).is_some(), "{key} pending, kept");
+        }
+        // A replay of an evicted key is a new take (the documented trade-off).
+        assert_eq!(store.by_key.len(), 4);
+        assert!(store.held.len() <= 4, "per-principal counts are bounded");
+    }
+
+    /// PR #352 review (MEDIUM, abuse): the eviction age is the reservation
+    /// order and never wraps — near `u64::MAX` the oldest settled record by
+    /// reservation (not by settling) is evicted, and an exhausted sequence
+    /// fails closed (`idempotency-capacity`) without evicting anything.
+    #[test]
+    fn eviction_follows_reservation_order_and_the_age_never_wraps() {
+        let mut store = TakeStore::starting_at(3, 3, u64::MAX - 4);
+        let k0 = fresh(&mut store, "k0", "p");
+        fresh(&mut store, "k1", "p");
+        let k2 = fresh(&mut store, "k2", "p");
+        // Settled newest-first: reservation order, not settling order, wins.
+        settle(&mut store, &k2);
+        settle(&mut store, &k0);
+        fresh(&mut store, "k3", "p");
+        assert!(
+            store.replay("k0").is_none(),
+            "the oldest reserved settled goes"
+        );
+        assert!(store.replay("k2").is_some());
+        assert_eq!(store.next_seq, u64::MAX);
+        // The sequence is exhausted: fail closed, nothing evicted (a wrap
+        // would give the next record age 0, the oldest of all).
+        assert_eq!(
+            store.reserve("k4", "p", pending_take()),
+            TakeReservation::Capacity
+        );
+        for key in ["k1", "k2", "k3"] {
+            assert!(store.replay(key).is_some(), "{key} kept");
+        }
+        assert_eq!(store.by_key.len(), 3);
+        // A replay still answers from its record.
+        assert!(matches!(
+            store.reserve("k2", "p", pending_take()),
+            TakeReservation::Replay(_)
         ));
     }
 
@@ -832,6 +1239,22 @@ mod tests {
         ] {
             assert_eq!(RoutedFeed::from_bus_name(&feed.bus_name()), Some(feed));
         }
+    }
+
+    #[test]
+    fn routed_audio_labels_match_the_engine_and_persist_as_config_feeds() {
+        let track = RoutedAudio::Track {
+            name: "eng".into(),
+            input: "cam".into(),
+        };
+        assert_eq!(track.label(), "track:eng");
+        assert_eq!(track.audio_feed(), AudioFeed::Tracks(vec!["eng".into()]));
+        assert_eq!(RoutedAudio::None.label(), "none");
+        assert_eq!(
+            RoutedAudio::Source("x".into()).audio_feed(),
+            AudioFeed::Source("x".into())
+        );
+        assert_eq!(RoutedAudio::Follow.audio_feed(), AudioFeed::Follow);
     }
 
     #[test]

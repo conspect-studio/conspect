@@ -56,6 +56,7 @@ afterAll(() => {
 const programRow: OutputRouteState = {
   output: 'out-1',
   video: { bus: 'program' } as unknown as OutputRouteState['video'],
+  configured_video: { bus: 'program' } as unknown as OutputRouteState['configured_video'],
   audio: 'follow' as unknown as OutputRouteState['audio'],
   effective_audio: 'program' as unknown as OutputRouteState['effective_audio'],
   tally: 'program',
@@ -65,6 +66,7 @@ const programRow: OutputRouteState = {
 const directRow: OutputRouteState = {
   ...programRow,
   video: { source: 'bars' } as unknown as OutputRouteState['video'],
+  configured_video: { source: 'bars' } as unknown as OutputRouteState['configured_video'],
   effective_audio: { source: 'bars' } as unknown as OutputRouteState['effective_audio'],
   tally: 'direct',
 };
@@ -244,6 +246,7 @@ describe('OutputFeedRow', () => {
     const cleanRow: OutputRouteState = {
       ...programRow,
       video: { bus: 'clean' } as unknown as OutputRouteState['video'],
+      configured_video: { bus: 'clean' } as unknown as OutputRouteState['configured_video'],
       tally: 'clean',
     };
     renderWithProviders(
@@ -292,5 +295,26 @@ describe('OutputFeedRow', () => {
     );
     expect(screen.getByTestId('output-tally')).toHaveTextContent('layout: NewsOne');
     expect(screen.getByLabelText(/Video feed for Out 1/)).toHaveValue('aux:NewsOne');
+  });
+
+  it('shows the live feed on air and names a configured feed that is not', () => {
+    // A refused start-up take: configured `bars`, Program on air.
+    const fellBack: OutputRouteState = {
+      ...programRow,
+      configured_video: { source: 'bars' } as unknown as OutputRouteState['configured_video'],
+    };
+    renderWithProviders(
+      <OutputFeedRow output="out-1" outputName="Out 1" route={fellBack} choices={choices} />,
+    );
+    expect(screen.getByLabelText(/Video feed for Out 1/)).toHaveValue('bus:program');
+    expect(screen.getByTestId('output-tally')).toHaveTextContent('PGM');
+    expect(screen.getByTestId('output-configured-feed')).toHaveTextContent('configured: bars (not on air)');
+  });
+
+  it('shows no configured note when the configured feed is on air', () => {
+    renderWithProviders(
+      <OutputFeedRow output="out-1" outputName="Out 1" route={directRow} choices={choices} />,
+    );
+    expect(screen.queryByTestId('output-configured-feed')).toBeNull();
   });
 });

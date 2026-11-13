@@ -1,6 +1,7 @@
 // The Outputs page shortcut for output feed routing (ADR-0108 §8): a Video
 // feed row (grouped select → Plan → cost line → Take, outcome via
-// OperationFeedback) and a read-only Audio row, plus the tally ("PGM" follows
+// OperationFeedback) and an Audio row (the editable OutputAudioRow when the
+// page passes one, else a read-only line), plus the tally ("PGM" follows
 // the switcher vs "direct: <id>").
 //
 // Truth rules (broadcast/README.md): a 202 is *accepted*, never *applied*; the
@@ -51,6 +52,11 @@ export interface OutputFeedRowProps {
   readonly route: OutputRouteState | undefined;
   /** The feeds to offer, grouped. */
   readonly choices: readonly FeedChoice[];
+  /**
+   * The editable Audio row (OutputAudioRow); replaces the read-only audio
+   * line when given.
+   */
+  readonly audioRow?: JSX.Element | undefined;
 }
 
 interface Outcome {
@@ -81,10 +87,18 @@ export function OutputFeedRow({
   outputName,
   route,
   choices,
+  audioRow,
 }: OutputFeedRowProps): JSX.Element {
   const { t } = useLingui();
   const { locked } = useTakeLock();
+  // `video` is what is ON AIR (the engine's live bus); `configured_video` the
+  // persisted feed. They differ after a refused start-up take or a fallback.
   const current = route === undefined ? undefined : feedOf(route.video);
+  const configured = route === undefined ? undefined : feedOf(route.configured_video);
+  const configuredNote =
+    current !== undefined && configured !== undefined && feedKey(configured) !== feedKey(current)
+      ? configured
+      : undefined;
   const currentKey = current === undefined ? '' : feedKey(current);
   // The feed on air: the readback's, or the one an applied take just put there
   // (before the readback catches up). The select starts on it and returns to
@@ -346,6 +360,19 @@ export function OutputFeedRow({
         <span className="pill" data-testid="output-tally">
           {tally}
         </span>
+        {configuredNote !== undefined ? (
+          <span className="text-xs text-muted-foreground" data-testid="output-configured-feed">
+            {(() => {
+              const label =
+                'source' in configuredNote
+                  ? configuredNote.source
+                  : 'layout' in configuredNote
+                    ? (allChoices.find((c) => c.key === feedKey(configuredNote))?.label ?? configuredNote.layout)
+                    : (allChoices.find((c) => c.key === feedKey(configuredNote))?.label ?? configuredNote.bus);
+              return t`configured: ${label} (not on air)`;
+            })()}
+          </span>
+        ) : null}
         {route?.state !== undefined && route.state !== 'configured' ? (
           <span className="text-xs text-muted-foreground" data-testid="output-route-state">
             {route.state === 'on_air' ? t`on air` : route.state === 'pending' ? t`take pending` : route.state === 'degraded' ? t`degraded (holding last picture)` : route.state}
@@ -398,10 +425,12 @@ export function OutputFeedRow({
             }
           : {})}
       />
-      <div className="flex flex-wrap items-center gap-2">
-        <span className="font-medium"><Trans>Audio</Trans></span>
-        <span data-testid="output-audio">{audioText}</span>
-      </div>
+      {audioRow ?? (
+        <div className="flex flex-wrap items-center gap-2">
+          <span className="font-medium"><Trans>Audio</Trans></span>
+          <span data-testid="output-audio">{audioText}</span>
+        </div>
+      )}
       <Dialog open={confirm} onOpenChange={setConfirm}>
         <DialogContent>
           <DialogHeader>

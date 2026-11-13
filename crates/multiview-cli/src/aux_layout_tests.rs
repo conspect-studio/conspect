@@ -135,7 +135,7 @@ fn program_frame(
     )
     .unwrap()
     .with_cell_slates(slates);
-    drive.compose(Tick { index: 7, pts }).unwrap().canvas
+    Nv12Image::clone(&drive.compose(Tick { index: 7, pts }).unwrap().canvas)
 }
 
 /// Max per-sample absolute difference of two planes.

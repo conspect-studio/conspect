@@ -144,9 +144,56 @@ fn drive_full<F>(
 where
     F: FnOnce(OutputRoutingSlot) + Send + 'static,
 {
+    drive_clocked(template, audio, switcher, prefix, ticks, None, control)
+}
+
+/// As [`drive_full`], with an optional boot-take retry policy (a test of the
+/// give-up path shortens the 30 s window to stay within its wall bound).
+fn drive_clocked<F>(
+    template: &str,
+    audio: bool,
+    switcher: bool,
+    prefix: &str,
+    ticks: u64,
+    boot_retry: Option<super::BootRetryPolicy>,
+    control: F,
+) -> Run
+where
+    F: FnOnce(OutputRoutingSlot) + Send + 'static,
+{
+    drive_prepared(
+        template,
+        audio,
+        switcher,
+        prefix,
+        ticks,
+        move |pipeline| {
+            if let Some(policy) = boot_retry {
+                pipeline.set_boot_retry(policy);
+            }
+        },
+        control,
+    )
+}
+
+/// As [`drive_full`]; `prep` sees the built pipeline before the run.
+fn drive_prepared<F>(
+    template: &str,
+    audio: bool,
+    switcher: bool,
+    prefix: &str,
+    ticks: u64,
+    prep: impl FnOnce(&mut Pipeline),
+    control: F,
+) -> Run
+where
+    F: FnOnce(OutputRoutingSlot) + Send + 'static,
+{
     let config =
         multiview_config::MultiviewConfig::load_from_toml(&template.replace('@', prefix)).unwrap();
     let mut pipeline = Pipeline::build(&config).unwrap();
+    pipeline.address_boot_feeds_to_test_sinks(&config);
+    prep(&mut pipeline);
     if audio {
         pipeline.enable_program_audio();
     }
@@ -883,6 +930,252 @@ fn a_take_to_clean_carries_the_pre_bake_canvas_through_the_real_pipeline() {
     }
 }
 
+/// `CONFIG` plus a persisted feed for `out1`: `video = { source = "<id>" }`,
+/// and a third source `@_never`: a file source whose file does not exist, so
+/// it never produces a picture (never fresh).
+fn boot_config(feed_source: &str) -> String {
+    format!(
+        "{CONFIG}\n[[sources]]\nid = \"@_never\"\nkind = \"file\"\npath = \"/nonexistent/multiview-routing-e2e/@/never.ts\"\n[[routing.output]]\noutput = \"out1\"\nvideo = {{ source = \"{feed_source}\" }}\n"
+    )
+}
+
+/// #329 F1(b): a run whose config persists `out1 = { source = X }` comes up
+/// with `out1` on `src:X` after the boot take (a live source; a refused boot
+/// take on a starved host is re-issued within the window), `out0` on Program
+/// throughout, one window per tick on both.
+#[test]
+fn a_persisted_source_feed_is_on_air_after_the_boot_take() {
+    const TICKS: u64 = 300;
+    let applied = Arc::new(Mutex::new(None::<TakeOutcome>));
+    let record = Arc::clone(&applied);
+    let template = boot_config("@_b");
+    let run = drive_clocked(
+        &template,
+        false,
+        false,
+        "route_boot",
+        TICKS,
+        None,
+        move |slot| {
+            let handle = wait_for("the routing handle", Duration::from_secs(10), || {
+                slot.load()
+            });
+            let outcomes = handle.outcomes().expect("one outcome reader");
+            // Keyed on the output index (PR #352 round 2), not the config
+            // id: `boot:1`, never `boot:test-sink-1`.
+            let o = wait_for("the boot take applied", Duration::from_secs(10), || {
+                outcomes
+                    .try_iter()
+                    .find(|o| o.operation_id == "boot:1" && o.outcome == TakeResult::Applied)
+            });
+            // The pipeline-minted id is a boot take to the control plane.
+            assert!(multiview_control::output_routing::is_boot_take(
+                &o.operation_id
+            ));
+            // The readback agrees with the outcome: out1 on air on the source.
+            wait_for(
+                "the readback shows the source on air",
+                Duration::from_secs(1),
+                || {
+                    let s = handle.snapshot();
+                    (s.outputs[1].bus == "src:route_boot_b"
+                        && s.outputs[0].bus == "program"
+                        && s.boot_takes_pending == 0)
+                        .then_some(())
+                },
+            );
+            *record.lock().unwrap() = Some(o);
+        },
+    );
+    let applied = applied.lock().unwrap().clone().expect("boot take applied");
+    assert_eq!(applied.output_index, 1);
+    assert_eq!(applied.bus, PictureBus::Source("route_boot_b".to_owned()));
+    assert_eq!(run.final_snapshot.boot_takes_given_up, 0);
+    assert_eq!(run.frames, TICKS);
+    let all: Vec<i64> = (0..i64::try_from(TICKS).unwrap()).collect();
+    assert_eq!(pts_of(&run.outputs[0]), all, "out0: every Program window");
+    // Contiguous, one window per tick, from tick 0 through the cut and on to
+    // within 5 ticks of the end. The last few windows of a live-opened
+    // encoder race the run's shutdown (seen under a parallel test load: one
+    // tail window missing); that end-of-run tail is outside this test.
+    let steady: Vec<i64> = pts_of(&run.outputs[1])
+        .into_iter()
+        .filter(|&t| t < i64::try_from(TICKS).unwrap() - 5)
+        .collect();
+    assert_eq!(
+        steady,
+        all[..steady.len()],
+        "out1: one window per tick across the cut"
+    );
+    assert_eq!(
+        u64::try_from(steady.len()).unwrap(),
+        TICKS - 5,
+        "out1 carried to the end"
+    );
+    let first = run.outputs[1]
+        .iter()
+        .find(|p| p.0 == i64::try_from(applied.tick).unwrap())
+        .unwrap();
+    assert!(
+        first.1 && first.2,
+        "the cut lands on a keyframe with a sequence header: {first:?}"
+    );
+}
+
+/// PR #352 round 2: a run output whose config id is 300 bytes long (an HLS
+/// config id is its path, which has no length bound) — well over
+/// `MAX_TAKE_ID_BYTES` (128). The boot take must still be minted, retried on
+/// its own slot, given up correctly, and its audio re-issued for the right
+/// output — all keyed on the output index, never on the (unbounded) id.
+#[test]
+fn a_300_byte_config_id_boot_take_is_retried_and_given_up_on_the_right_slot() {
+    // 25 fps: the 8 s window = 200 ticks; run past it.
+    const TICKS: u64 = 330;
+    let long_id = "o".repeat(300);
+    assert!(
+        long_id.len() > super::MAX_TAKE_ID_BYTES,
+        "the config id itself must exceed the take-id cap"
+    );
+    let template = boot_config("@_never")
+        .replace("id = \"out1\"", &format!("id = \"{long_id}\""))
+        .replacen("output = \"out1\"", &format!("output = \"{long_id}\""), 1);
+    let policy = super::BootRetryPolicy {
+        retry_secs: 2,
+        window_secs: 8,
+    };
+    let refusals = Arc::new(Mutex::new(Vec::<String>::new()));
+    let record = Arc::clone(&refusals);
+    let run = drive_clocked(
+        &template,
+        false,
+        false,
+        "route_bootlong",
+        TICKS,
+        Some(policy),
+        move |slot| {
+            let handle = wait_for("the routing handle", Duration::from_secs(10), || {
+                slot.load()
+            });
+            let outcomes = handle.outcomes().expect("one outcome reader");
+            let start = Instant::now();
+            while start.elapsed() < Duration::from_secs(30) {
+                while let Ok(o) = outcomes.try_recv() {
+                    // Always `boot:1`, never a truncated/garbled form of the
+                    // 300-byte id (which would also risk colliding with
+                    // another output's truncated id).
+                    assert_eq!(o.operation_id, "boot:1", "{o:?}");
+                    assert!(
+                        o.operation_id.len() < super::MAX_TAKE_ID_BYTES,
+                        "the minted id stays well under the cap: {o:?}"
+                    );
+                    record.lock().unwrap().push(o.operation_id.clone());
+                }
+                if handle.snapshot().boot_takes_given_up == 1 {
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            panic!("the boot take was never given up");
+        },
+    );
+    let seen = refusals.lock().unwrap().clone();
+    assert!(seen.len() >= 2, "retried on the same slot: {seen:?}");
+    let s = &run.final_snapshot;
+    assert_eq!(s.boot_takes_given_up, 1);
+    assert_eq!(s.boot_takes_pending, 0);
+    // The output stays on Program (never routed, since the long-id source
+    // never became fresh): the slot match, keyed on the output index, never
+    // let a stray outcome for a different output's index collide.
+    assert!(s
+        .outputs
+        .iter()
+        .all(|o| o.bus == "program" && o.pending.is_none()));
+    assert_eq!(run.frames, TICKS);
+}
+
+/// #329 F1(b): a persisted feed whose source never becomes fresh: the boot
+/// take is refused `feed-not-fresh`, re-issued (at most once per retry
+/// period) through the window, then given up; the output stays on Program and
+/// Program is untouched (one window per tick on both outputs). The policy is
+/// shortened (retry 2 s, window 8 s) only to bound the wall time; production
+/// uses 2 s / 30 s (`BootRetryPolicy::default`).
+#[test]
+fn a_never_fresh_boot_feed_is_retried_then_given_up_and_program_is_untouched() {
+    // 25 fps: the 8 s window = 200 ticks; run past it.
+    const TICKS: u64 = 330;
+    const WINDOW_TICKS: u64 = 200;
+    let refusals = Arc::new(Mutex::new(Vec::<u64>::new()));
+    let record = Arc::clone(&refusals);
+    let template = boot_config("@_never");
+    let policy = super::BootRetryPolicy {
+        retry_secs: 2,
+        window_secs: 8,
+    };
+    let run = drive_clocked(
+        &template,
+        false,
+        false,
+        "route_bootnf",
+        TICKS,
+        Some(policy),
+        move |slot| {
+            let handle = wait_for("the routing handle", Duration::from_secs(10), || {
+                slot.load()
+            });
+            let outcomes = handle.outcomes().expect("one outcome reader");
+            let start = Instant::now();
+            while start.elapsed() < Duration::from_secs(30) {
+                while let Ok(o) = outcomes.try_recv() {
+                    // Keyed on the output index (PR #352 round 2).
+                    assert_eq!(o.operation_id, "boot:1", "{o:?}");
+                    assert_eq!(
+                        o.outcome,
+                        TakeResult::Refused(super::RefuseReason::FeedNotFresh),
+                        "{o:?}"
+                    );
+                    record.lock().unwrap().push(o.tick);
+                }
+                if handle.snapshot().boot_takes_given_up == 1 {
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            panic!("the boot take was never given up");
+        },
+    );
+    let ticks = refusals.lock().unwrap().clone();
+    // Each attempt waits out the 50-tick prime deadline; a re-issue comes no
+    // sooner than 2 s (50 ticks) after the previous issue, and only inside
+    // the window — so at most WINDOW/50 + 1 attempts.
+    assert!(ticks.len() >= 2, "retried: {ticks:?}");
+    assert!(ticks.len() <= 5, "bounded: {ticks:?}");
+    for pair in ticks.windows(2) {
+        assert!(
+            pair[1] - pair[0] >= 50,
+            "at most one attempt per 2 s: {ticks:?}"
+        );
+    }
+    assert!(
+        ticks
+            .iter()
+            .all(|&t| t <= WINDOW_TICKS + super::TAKE_PRIME_DEADLINE_TICKS + 2),
+        "no attempt after the window: {ticks:?}"
+    );
+    let s = &run.final_snapshot;
+    assert_eq!(s.boot_takes_given_up, 1);
+    assert_eq!(s.boot_takes_pending, 0);
+    assert!(s
+        .outputs
+        .iter()
+        .all(|o| o.bus == "program" && o.pending.is_none()));
+    assert_eq!(s.dynamic_encoders_live, 0, "no encoder was ever opened");
+    assert_eq!(run.frames, TICKS);
+    let all: Vec<i64> = (0..i64::try_from(TICKS).unwrap()).collect();
+    for (i, output) in run.outputs.iter().enumerate() {
+        assert_eq!(pts_of(output), all, "output {i}: Program untouched");
+    }
+}
+
 /// ADR-0108 slice 2 (spec G1) through the real pipeline: an audio-only take
 /// of output 1 to `Source(<bars>)` while its video stays on Program. Output
 /// 1's video is output 0's, packet for packet (same encoder, no move); its
@@ -1232,4 +1525,132 @@ fn a_take_to_a_layout_composes_it_live_and_survives_a_take_flood() {
         );
     }
     assert_eq!(run.final_snapshot.dynamic_encoders_live, 0);
+}
+
+/// ADR-0108 slice 2 §6.1: a run whose config persists `audio = { source =
+/// "<b>" }` on output 1 starts it on follow and re-applies the persisted feed
+/// as an audio-only boot take: within a few ticks of the first routing tick
+/// the router snapshot shows output 1 carrying `src:<b>` (video unchanged),
+/// and output 0 keeps the program mix.
+#[test]
+fn a_persisted_audio_feed_is_re_applied_by_a_boot_take() {
+    const TICKS: u64 = 120;
+    let template = format!(
+        "{AUDIO_CONFIG}\n[[routing.output]]\noutput = \"out1\"\naudio = {{ source = \"@_b\" }}\n"
+    );
+    let seen = Arc::new(Mutex::new(None));
+    let record = Arc::clone(&seen);
+    let prep = |pipeline: &mut Pipeline| {
+        let takes = pipeline.boot_audio_takes_mut();
+        assert_eq!(
+            *takes,
+            vec![(
+                "out1".to_owned(),
+                super::AudioChoice::Source("route_boot_b".to_owned())
+            )],
+            "the persisted feed is parsed into one boot take"
+        );
+        // The harness binds its sinks as `test-sink-N` (positional).
+        takes[0].0 = "test-sink-1".to_owned();
+    };
+    let run = drive_prepared(
+        &template,
+        true,
+        false,
+        "route_boot",
+        TICKS,
+        prep,
+        move |slot| {
+            let handle = wait_for("the routing handle", Duration::from_secs(10), || {
+                slot.load()
+            });
+            let outcomes = handle.outcomes().expect("one outcome reader");
+            let o = wait_for("the boot take outcome", Duration::from_secs(10), || {
+                outcomes.try_recv().ok()
+            });
+            // Keyed on the output index (PR #352 round 2), not `test-sink-1`.
+            assert_eq!(o.operation_id, "boot:audio:1");
+            assert!(multiview_control::output_routing::is_boot_take(
+                &o.operation_id
+            ));
+            assert_eq!(o.outcome, TakeResult::Applied, "{o:?}");
+            let s = wait_for("the boot audio on air", Duration::from_secs(5), || {
+                let s = handle.snapshot();
+                (s.outputs
+                    .get(1)
+                    .is_some_and(|v| v.audio == "src:route_boot_b"))
+                .then_some(s)
+            });
+            *record.lock().unwrap() = Some((o.tick, s));
+        },
+    );
+    let (tick, s) = seen.lock().unwrap().take().expect("observed");
+    assert!(
+        tick < 30,
+        "the boot take applies within a few ticks: {tick}"
+    );
+    assert_eq!(s.outputs[1].bus, "program", "the video is untouched");
+    assert_eq!(s.outputs[1].audio_choice, "src:route_boot_b");
+    assert_eq!(s.outputs[0].audio, "program");
+    assert_eq!(run.frames, TICKS);
+}
+
+/// PR #352 round 2: an audio-only boot take (no combined video) whose
+/// output's config id is 300 bytes long is still enqueued — not rejected by
+/// `try_take`'s length check, which the OLD `boot:audio:<config id>` id
+/// would hit for an id this long. `boot_audio_choices` parses the long id
+/// faithfully (it is not truncated at parse time); only the later mint, now
+/// keyed on the output index, must stay short.
+#[test]
+fn an_audio_only_boot_take_with_a_300_byte_config_id_is_enqueued() {
+    const TICKS: u64 = 120;
+    let long_id = "b".repeat(300);
+    let template = AUDIO_CONFIG.replace("id = \"out1\"", &format!("id = \"{long_id}\""))
+        + &format!("[[routing.output]]\noutput = \"{long_id}\"\naudio = {{ source = \"@_b\" }}\n");
+    let seen = Arc::new(Mutex::new(None));
+    let record = Arc::clone(&seen);
+    let prep = |pipeline: &mut Pipeline| {
+        let takes = pipeline.boot_audio_takes_mut();
+        assert_eq!(takes.len(), 1, "one persisted audio feed");
+        assert_eq!(
+            takes[0].0.len(),
+            300,
+            "boot_audio_choices preserves the long id, unparsed/untruncated"
+        );
+        // The harness binds its sinks as `test-sink-N` (positional); the
+        // real run would resolve the 300-byte id to its own output index the
+        // same way.
+        takes[0].0 = "test-sink-1".to_owned();
+    };
+    let run = drive_prepared(
+        &template,
+        true,
+        false,
+        "route_bootlongaudio",
+        TICKS,
+        prep,
+        move |slot| {
+            let handle = wait_for("the routing handle", Duration::from_secs(10), || {
+                slot.load()
+            });
+            let outcomes = handle.outcomes().expect("one outcome reader");
+            let o = wait_for("the boot take outcome", Duration::from_secs(10), || {
+                outcomes.try_recv().ok()
+            });
+            // Short and fixed, keyed on the output index: never a truncated
+            // 300-byte id, and never refused for being too long.
+            assert_eq!(o.operation_id, "boot:audio:1");
+            assert!(o.operation_id.len() < super::MAX_TAKE_ID_BYTES, "{o:?}");
+            assert_eq!(o.outcome, TakeResult::Applied, "{o:?}");
+            *record.lock().unwrap() = Some(o);
+        },
+    );
+    let o = seen.lock().unwrap().take().expect("observed");
+    assert_eq!(
+        o.audio,
+        Some(super::AudioChoice::Source(
+            "route_bootlongaudio_b".to_owned()
+        ))
+    );
+    assert_eq!(run.frames, TICKS);
 }
