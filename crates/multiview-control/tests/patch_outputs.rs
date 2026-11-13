@@ -367,7 +367,7 @@ async fn bola_without_the_output_grant_is_403_on_plan_and_take() {
     let body = patch(vec![video("output-1", json!({"source": "secret-cam"}))]);
     let (status, _) = take(&rig, OUT1, "k2", body).await;
     assert_eq!(status, StatusCode::FORBIDDEN);
-    assert!(rig.fake.takes().is_empty());
+    assert_eq!(rig.fake.takes().len(), 0, "nothing reached the engine");
 }
 
 #[tokio::test]
@@ -658,12 +658,13 @@ async fn a_take_flood_is_429_and_never_starves_another_principal() {
         limited += l;
         other += o;
     }
-    let elapsed = started.elapsed().as_secs_f64();
+    let elapsed = started.elapsed();
     assert_eq!(other, 0, "every flood answer is 202 or 429");
     assert_eq!(accepted + limited, 2000);
     // The per-output limit is 2 per sliding second.
-    let allowed = 2 * (elapsed.ceil() as usize + 1);
-    assert!(accepted <= allowed, "{accepted} accepted in {elapsed:.2}s");
+    let seconds = usize::try_from(elapsed.as_secs()).unwrap() + 1;
+    let allowed = 2 * (seconds + 1);
+    assert!(accepted <= allowed, "{accepted} accepted in {elapsed:?}");
     let flood_takes = rig
         .fake
         .takes()

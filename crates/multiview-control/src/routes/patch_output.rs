@@ -171,11 +171,11 @@ pub(crate) fn shape(req: &PatchRequest) -> Result<OutputPatch, Box<Response>> {
     })
 }
 
-fn refusal(kind: &str, detail: impl Into<String>) -> Option<PatchRefusal> {
-    Some(PatchRefusal {
+fn refusal(kind: &str, detail: impl Into<String>) -> PatchRefusal {
+    PatchRefusal {
         kind: kind.to_owned(),
         detail: detail.into(),
-    })
+    }
 }
 
 /// Plan an output patch (after role, count, authorization and shape).
@@ -194,19 +194,19 @@ pub(crate) fn plan(
             id: patch.output.clone(),
         });
     };
-    let mut path = "P1";
+    let mut planned_path = "P1";
     let mut cost = None;
-    let mut refused = None;
+    let mut refused: Option<PatchRefusal> = None;
     match resolve_feed(state, &patch.video)? {
         Err(_) => {
-            refused = refusal(
+            refused = Some(refusal(
                 "unknown-source",
                 "the feed does not exist or cannot be routed",
-            );
+            ));
         }
         Ok(feed) => match control.routing.plan_slot(&config_id, &feed) {
             Ok(planned) => {
-                path = planned.path.as_str();
+                planned_path = planned.path.as_str();
                 let fits = planned.cost.fits();
                 let global = principal.is_global();
                 cost = Some(SlotCost {
@@ -217,27 +217,27 @@ pub(crate) fn plan(
                     fits,
                 });
                 if !fits {
-                    refused = refusal(
+                    refused = Some(refusal(
                         "capacity",
                         capacity_text(
                             principal,
                             planned.cost.sessions_in_use,
                             planned.cost.sessions_max,
                         ),
-                    );
+                    ));
                 }
             }
             Err(PlanRefusal::SwitcherRequired) => {
-                refused = refusal(
+                refused = Some(refusal(
                     "switcher-required",
                     "Preview and Clean need a switcher (M/E) in this run",
-                );
+                ));
             }
             Err(PlanRefusal::OutputKindUnroutable) => {
-                refused = refusal(
+                refused = Some(refusal(
                     "output-kind-unroutable",
                     "This output's kind cannot switch feeds live in this release",
-                );
+                ));
             }
         },
     }
@@ -246,7 +246,7 @@ pub(crate) fn plan(
         let video = xp.plane == "video";
         crosspoints.push(PlannedCrosspoint {
             destination: xp.destination.clone(),
-            path: if video { path } else { "follow" },
+            path: if video { planned_path } else { "follow" },
             on_air: false,
             cost: if video { cost.clone() } else { None },
             refusal: if video { refused.clone() } else { None },
