@@ -1930,16 +1930,17 @@ async fn run_software_until_ctrl_c(
     decided.abort();
     // #367: the engine loop returned (a stop or an error): the run is exiting,
     // so no config-file commit may write the accepted state from here on.
+    if report.is_err() {
+        // #309: an engine error is an exit decision. Armed before the settle
+        // below, so the watchdog bounds the whole exit.
+        multiview_cli::exit_watchdog::arm(multiview_cli::exit_watchdog::ExitCause::Fatal);
+    }
     ExitFreeze::new(
         config_watch.as_ref(),
         running_persist.as_ref().map(|p| &p.state),
     )
     .freeze_and_settle_async()
     .await;
-    if report.is_err() {
-        // #309: an engine error is an exit decision.
-        multiview_cli::exit_watchdog::arm(multiview_cli::exit_watchdog::ExitCause::Fatal);
-    }
     let report = report.context("headless run until Ctrl-C")?;
 
     // The engine loop returned; tear down every run tenant in one call.
