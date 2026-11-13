@@ -142,9 +142,12 @@ fn is_missing_table_error(content: &str) -> bool {
         && lines.next().map(str::trim) == Some("list table inet conspect_floor")
 }
 
-/// `{"nftables": [...]}` containing `table inet conspect_floor`, a `set`
-/// named each of [`FLOOR_METERS`] with that exact `type`, and a `chain`
-/// named each of [`FLOOR_CHAINS`], all in that table.
+/// `{"nftables": [...]}` containing `table inet conspect_floor`, a bounded
+/// dynamic `set` (`size`, flags `dynamic` + `timeout`) named each of
+/// [`FLOOR_METERS`] with that exact `type`, a `chain` named each of
+/// [`FLOOR_CHAINS`], and the shipped verdicts in those chains (see
+/// [`verdicts_are_the_shipped_ones`]): `present` means the floor fails
+/// closed, not merely that its objects exist.
 fn lists_the_shipped_floor(value: &serde_json::Value) -> bool {
     let Some(items) = value.get("nftables").and_then(serde_json::Value::as_array) else {
         return false;
@@ -165,10 +168,24 @@ fn lists_the_shipped_floor(value: &serde_json::Value) -> bool {
             && str_of(v, "table").as_deref() == Some("conspect_floor")
             && str_of(v, "name").as_deref() == Some(name)
     };
+    // A bounded dynamic set: `size` present and `dynamic` + `timeout` flags
+    // (without them a full set or an idle source behaves differently).
     let has_set = |name: &str, ty: &str| {
         items.iter().any(|item| {
             item.get("set").is_some_and(|set| {
-                in_table(set, name) && str_of(set, "type").as_deref() == Some(ty)
+                let flags: Vec<&str> = set
+                    .get("flags")
+                    .and_then(serde_json::Value::as_array)
+                    .map(|f| f.iter().filter_map(serde_json::Value::as_str).collect())
+                    .unwrap_or_default();
+                in_table(set, name)
+                    && str_of(set, "type").as_deref() == Some(ty)
+                    && set
+                        .get("size")
+                        .and_then(serde_json::Value::as_u64)
+                        .is_some_and(|n| n > 0)
+                    && flags.contains(&"dynamic")
+                    && flags.contains(&"timeout")
             })
         })
     };
@@ -177,9 +194,152 @@ fn lists_the_shipped_floor(value: &serde_json::Value) -> bool {
             .iter()
             .any(|item| item.get("chain").is_some_and(|chain| in_table(chain, name)))
     };
+    let rules_of = |chain: &str| -> Vec<Vec<String>> {
+        items
+            .iter()
+            .filter_map(|item| item.get("rule"))
+            .filter(|rule| {
+                str_of(rule, "family").as_deref() == Some("inet")
+                    && str_of(rule, "table").as_deref() == Some("conspect_floor")
+                    && str_of(rule, "chain").as_deref() == Some(chain)
+            })
+            .map(|rule| {
+                rule.get("expr")
+                    .and_then(serde_json::Value::as_array)
+                    .map(|exprs| exprs.iter().filter_map(shape).collect())
+                    .unwrap_or_default()
+            })
+            .collect()
+    };
     has_table
         && FLOOR_METERS.iter().all(|(name, ty)| has_set(name, ty))
         && FLOOR_CHAINS.iter().all(|name| has_chain(name))
+        && verdicts_are_the_shipped_ones(&rules_of)
+}
+
+/// The rule verdicts the shipped floor depends on (review PR 349 round 3:
+/// `present` means the floor fails closed, not merely that its objects
+/// exist). Rates and bursts are the operator's to tune and are not checked;
+/// the structure is:
+/// * `input` jumps to `udp443_new` for UDP 443 in ct state new and then to
+///   `udp443_all` for every UDP 443 packet;
+/// * each tier chain is, in order: `update` of its v4 set with a `limit`
+///   then `accept`; `update` of its v6 set (keyed on the /64) with a
+///   `limit` then `accept`; and a final `drop`, so a packet over its rate,
+///   or from a source the full set cannot take, is dropped.
+fn verdicts_are_the_shipped_ones(rules_of: &dyn Fn(&str) -> Vec<Vec<String>>) -> bool {
+    let input = rules_of("input");
+    let jumps = |target: &str, needs_new: bool| {
+        input.iter().any(|rule| {
+            rule.iter().any(|t| t == "dport443")
+                && rule.iter().any(|t| t == &format!("jump:{target}"))
+                && (!needs_new || rule.iter().any(|t| t == "ct:new"))
+        })
+    };
+    let tier = |chain: &str, v4: &str, v6: &str| {
+        let rules = rules_of(chain);
+        let update =
+            |set: &str, key: &str| vec![format!("update:@{set}:{key}:limit"), "accept".to_owned()];
+        rules.len() == 3
+            && rules.first() == Some(&update(v4, "ip"))
+            && rules.get(1) == Some(&update(v6, "ip6/64"))
+            && rules
+                .get(2)
+                .is_some_and(|last| last.last().map(String::as_str) == Some("drop"))
+    };
+    jumps("udp443_new", true)
+        && jumps("udp443_all", false)
+        && tier("udp443_new", "udp443_new_v4", "udp443_new_v6")
+        && tier("udp443_all", "udp443_all_v4", "udp443_all_v6")
+}
+
+/// One nft JSON statement reduced to the token the floor check compares
+/// (counters and limit values ignored).
+fn shape(expr: &serde_json::Value) -> Option<String> {
+    if expr.get("accept").is_some() {
+        return Some("accept".to_owned());
+    }
+    if expr.get("drop").is_some() {
+        return Some("drop".to_owned());
+    }
+    if let Some(target) = expr
+        .pointer("/jump/target")
+        .and_then(serde_json::Value::as_str)
+    {
+        return Some(format!("jump:{target}"));
+    }
+    if let Some(m) = expr.get("match") {
+        if m.pointer("/left/payload/field")
+            .and_then(serde_json::Value::as_str)
+            == Some("dport")
+            && m.pointer("/left/payload/protocol")
+                .and_then(serde_json::Value::as_str)
+                == Some("udp")
+            && m.get("right").and_then(serde_json::Value::as_u64) == Some(443)
+        {
+            return Some("dport443".to_owned());
+        }
+        if m.pointer("/left/ct/key")
+            .and_then(serde_json::Value::as_str)
+            == Some("state")
+        {
+            let right = m.get("right")?;
+            let has_new = right.as_str() == Some("new")
+                || right
+                    .as_array()
+                    .is_some_and(|a| a.iter().any(|v| v.as_str() == Some("new")));
+            return has_new.then(|| "ct:new".to_owned());
+        }
+        return Some("match".to_owned());
+    }
+    if let Some(set) = expr.get("set") {
+        if set.get("op").and_then(serde_json::Value::as_str) != Some("update") {
+            return Some("set".to_owned());
+        }
+        let name = set.get("set").and_then(serde_json::Value::as_str)?;
+        let elem = set.get("elem")?;
+        let key = if elem
+            .pointer("/payload/protocol")
+            .and_then(serde_json::Value::as_str)
+            == Some("ip")
+            && elem
+                .pointer("/payload/field")
+                .and_then(serde_json::Value::as_str)
+                == Some("saddr")
+        {
+            "ip"
+        } else if elem
+            .get("&")
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|a| {
+                a.first()
+                    .and_then(|p| p.pointer("/payload/protocol"))
+                    .and_then(serde_json::Value::as_str)
+                    == Some("ip6")
+                    && a.get(1).and_then(serde_json::Value::as_str) == Some("ffff:ffff:ffff:ffff::")
+            })
+        {
+            "ip6/64"
+        } else {
+            "other"
+        };
+        let limited = set
+            .get("stmt")
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|stmts| {
+                stmts
+                    .iter()
+                    .any(|st| st.get("limit").is_some_and(|l| l.get("inv").is_none()))
+            });
+        return Some(format!(
+            "update:{name}:{key}:{}",
+            if limited { "limit" } else { "nolimit" }
+        ));
+    }
+    if expr.get("counter").is_some() {
+        return None;
+    }
+    Some("other".to_owned())
 }
 
 #[cfg(test)]
@@ -190,7 +350,9 @@ mod tests {
     /// `nft -j list table inet conspect_floor` (nft 1.1.3) after loading
     /// the shipped file in a `unshare -Urn` namespace, verbatim except that
     /// the rule objects are omitted (the parser does not read them).
-    const PRESENT_FIXTURE: &str = r#"{"nftables": [{"metainfo": {"version": "1.1.3", "release_name": "Commodore Bullmoose #4", "json_schema_version": 1}}, {"table": {"family": "inet", "name": "conspect_floor", "handle": 1}}, {"chain": {"family": "inet", "table": "conspect_floor", "name": "input", "handle": 1, "type": "filter", "hook": "input", "prio": -5, "policy": "accept"}}, {"chain": {"family": "inet", "table": "conspect_floor", "name": "udp443_new", "handle": 2}}, {"chain": {"family": "inet", "table": "conspect_floor", "name": "udp443_all", "handle": 3}}, {"set": {"family": "inet", "name": "udp443_new_v4", "table": "conspect_floor", "type": "ipv4_addr", "handle": 4, "size": 65536, "flags": ["timeout", "dynamic"], "timeout": 120}}, {"set": {"family": "inet", "name": "udp443_new_v6", "table": "conspect_floor", "type": "ipv6_addr", "handle": 5, "size": 65536, "flags": ["timeout", "dynamic"], "timeout": 120}}, {"set": {"family": "inet", "name": "udp443_all_v4", "table": "conspect_floor", "type": "ipv4_addr", "handle": 6, "size": 65536, "flags": ["timeout", "dynamic"], "timeout": 120}}, {"set": {"family": "inet", "name": "udp443_all_v6", "table": "conspect_floor", "type": "ipv6_addr", "handle": 7, "size": 65536, "flags": ["timeout", "dynamic"], "timeout": 120}}]}"#;
+    /// `nft -j list table inet conspect_floor` of the shipped ruleset (nft
+    /// 1.1.3, rules included).
+    const PRESENT_FIXTURE: &str = r#"{"nftables": [{"metainfo": {"version": "1.1.3", "release_name": "Commodore Bullmoose #4", "json_schema_version": 1}}, {"table": {"family": "inet", "name": "conspect_floor", "handle": 1}}, {"chain": {"family": "inet", "table": "conspect_floor", "name": "input", "handle": 1, "type": "filter", "hook": "input", "prio": -5, "policy": "accept"}}, {"chain": {"family": "inet", "table": "conspect_floor", "name": "udp443_new", "handle": 2}}, {"chain": {"family": "inet", "table": "conspect_floor", "name": "udp443_all", "handle": 3}}, {"set": {"family": "inet", "name": "udp443_new_v4", "table": "conspect_floor", "type": "ipv4_addr", "handle": 4, "size": 65536, "flags": ["timeout", "dynamic"], "timeout": 120}}, {"set": {"family": "inet", "name": "udp443_new_v6", "table": "conspect_floor", "type": "ipv6_addr", "handle": 5, "size": 65536, "flags": ["timeout", "dynamic"], "timeout": 120}}, {"set": {"family": "inet", "name": "udp443_all_v4", "table": "conspect_floor", "type": "ipv4_addr", "handle": 6, "size": 65536, "flags": ["timeout", "dynamic"], "timeout": 120}}, {"set": {"family": "inet", "name": "udp443_all_v6", "table": "conspect_floor", "type": "ipv6_addr", "handle": 7, "size": 65536, "flags": ["timeout", "dynamic"], "timeout": 120}}, {"rule": {"family": "inet", "table": "conspect_floor", "chain": "input", "handle": 8, "expr": [{"match": {"op": "==", "left": {"payload": {"protocol": "udp", "field": "dport"}}, "right": 443}}, {"match": {"op": "in", "left": {"ct": {"key": "state"}}, "right": ["new", "untracked"]}}, {"jump": {"target": "udp443_new"}}]}}, {"rule": {"family": "inet", "table": "conspect_floor", "chain": "input", "handle": 9, "expr": [{"match": {"op": "==", "left": {"payload": {"protocol": "udp", "field": "dport"}}, "right": 443}}, {"jump": {"target": "udp443_all"}}]}}, {"rule": {"family": "inet", "table": "conspect_floor", "chain": "udp443_new", "handle": 10, "expr": [{"set": {"op": "update", "elem": {"payload": {"protocol": "ip", "field": "saddr"}}, "set": "@udp443_new_v4", "stmt": [{"limit": {"rate": 2000, "burst": 1000, "per": "second"}}]}}, {"accept": null}]}}, {"rule": {"family": "inet", "table": "conspect_floor", "chain": "udp443_new", "handle": 11, "expr": [{"set": {"op": "update", "elem": {"&": [{"payload": {"protocol": "ip6", "field": "saddr"}}, "ffff:ffff:ffff:ffff::"]}, "set": "@udp443_new_v6", "stmt": [{"limit": {"rate": 2000, "burst": 1000, "per": "second"}}]}}, {"accept": null}]}}, {"rule": {"family": "inet", "table": "conspect_floor", "chain": "udp443_new", "handle": 12, "expr": [{"counter": {"packets": 0, "bytes": 0}}, {"drop": null}]}}, {"rule": {"family": "inet", "table": "conspect_floor", "chain": "udp443_all", "handle": 13, "expr": [{"set": {"op": "update", "elem": {"payload": {"protocol": "ip", "field": "saddr"}}, "set": "@udp443_all_v4", "stmt": [{"limit": {"rate": 25000, "burst": 10000, "per": "second"}}]}}, {"accept": null}]}}, {"rule": {"family": "inet", "table": "conspect_floor", "chain": "udp443_all", "handle": 14, "expr": [{"set": {"op": "update", "elem": {"&": [{"payload": {"protocol": "ip6", "field": "saddr"}}, "ffff:ffff:ffff:ffff::"]}, "set": "@udp443_all_v6", "stmt": [{"limit": {"rate": 25000, "burst": 10000, "per": "second"}}]}}, {"accept": null}]}}, {"rule": {"family": "inet", "table": "conspect_floor", "chain": "udp443_all", "handle": 15, "expr": [{"counter": {"packets": 0, "bytes": 0}}, {"drop": null}]}}]}"#;
 
     /// nft 1.1.3's stderr for the same command with no such table (observed).
     const MISSING_TABLE: &str =
@@ -199,6 +361,57 @@ mod tests {
     #[test]
     fn the_shipped_floor_listing_is_present() {
         assert_eq!(parse(PRESENT_FIXTURE), NftFloorStatus::Present);
+    }
+
+    /// Drop the rule objects for which `drop_rule` is true.
+    fn without_rules(drop_rule: impl Fn(&serde_json::Value) -> bool) -> String {
+        let mut v: serde_json::Value = serde_json::from_str(PRESENT_FIXTURE).unwrap();
+        let items = v["nftables"].as_array_mut().unwrap();
+        items.retain(|item| item.get("rule").is_none_or(|r| !drop_rule(r)));
+        v.to_string()
+    }
+
+    #[test]
+    fn a_floor_without_its_verdicts_is_not_present() {
+        // Objects all there, but a tier's final drop is gone: fails open.
+        let no_drop = without_rules(|r| {
+            r["chain"] == "udp443_all"
+                && r["expr"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|e| e.get("drop").is_some())
+        });
+        assert_eq!(parse(&no_drop), NftFloorStatus::Unknown);
+        // The new-tier jump is gone.
+        let no_jump =
+            without_rules(|r| r["chain"] == "input" && r.to_string().contains("udp443_new"));
+        assert_eq!(parse(&no_jump), NftFloorStatus::Unknown);
+        // The v6 update is gone.
+        let no_v6 = without_rules(|r| r.to_string().contains("@udp443_new_v6"));
+        assert_eq!(parse(&no_v6), NftFloorStatus::Unknown);
+        // No rules at all (objects only).
+        assert_eq!(parse(&without_rules(|_| true)), NftFloorStatus::Unknown);
+    }
+
+    #[test]
+    fn a_set_without_size_or_dynamic_timeout_is_not_present() {
+        for (field, value) in [
+            ("size", serde_json::Value::Null),
+            ("flags", serde_json::json!(["dynamic"])),
+        ] {
+            let mut v: serde_json::Value = serde_json::from_str(PRESENT_FIXTURE).unwrap();
+            for item in v["nftables"].as_array_mut().unwrap() {
+                if let Some(set) = item.get_mut("set") {
+                    if value.is_null() {
+                        set.as_object_mut().unwrap().remove(field);
+                    } else {
+                        set[field] = value.clone();
+                    }
+                }
+            }
+            assert_eq!(parse(&v.to_string()), NftFloorStatus::Unknown, "{field}");
+        }
     }
 
     #[test]
