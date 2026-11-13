@@ -185,7 +185,7 @@ msgstr ""
 msgid "{0} today weather"
 msgstr ""
 
-#: src/pages/OutputAudioRow.tsx:345
+#: src/pages/OutputAudioRow.tsx:360
 msgid "{choiceLabel} → {costLine}"
 msgstr ""
 
@@ -1526,7 +1526,7 @@ msgstr ""
 #: src/app/navigation.tsx:58
 #: src/components/broadcast/BroadcastShell.tsx:34
 #: src/components/broadcast/library/Chips.tsx:139
-#: src/pages/OutputAudioRow.tsx:292
+#: src/pages/OutputAudioRow.tsx:307
 #: src/pages/OutputFeedRow.tsx:402
 #: src/pages/OutputsPage.tsx:893
 msgid "Audio"
@@ -1536,11 +1536,11 @@ msgstr ""
 msgid "Audio at or below this level counts as silent (e.g. −60)."
 msgstr ""
 
-#: src/pages/OutputAudioRow.tsx:363
+#: src/pages/OutputAudioRow.tsx:378
 msgid "Audio change on {outputName}"
 msgstr ""
 
-#: src/pages/OutputAudioRow.tsx:299
+#: src/pages/OutputAudioRow.tsx:314
 msgid "Audio feed for {outputName}"
 msgstr ""
 
@@ -2317,11 +2317,11 @@ msgstr ""
 msgid "Choose a source"
 msgstr ""
 
-#: src/pages/OutputAudioRow.tsx:227
+#: src/pages/OutputAudioRow.tsx:242
 msgid "Choose an audio feed and plan it first"
 msgstr ""
 
-#: src/pages/OutputAudioRow.tsx:308
+#: src/pages/OutputAudioRow.tsx:323
 msgid "Choose an audio feed…"
 msgstr ""
 
@@ -2703,7 +2703,7 @@ msgstr ""
 msgid "Configured weather locations"
 msgstr ""
 
-#: src/pages/OutputAudioRow.tsx:328
+#: src/pages/OutputAudioRow.tsx:343
 #: src/pages/OutputFeedRow.tsx:349
 msgid "configured: {label} (not on air)"
 msgstr ""
@@ -4879,30 +4879,30 @@ msgstr ""
 msgid "Focus transport"
 msgstr ""
 
-#: src/pages/OutputAudioRow.tsx:182
-#: src/pages/OutputAudioRow.tsx:190
-#: src/pages/OutputAudioRow.tsx:281
+#: src/pages/OutputAudioRow.tsx:193
+#: src/pages/OutputAudioRow.tsx:201
+#: src/pages/OutputAudioRow.tsx:296
 #: src/pages/OutputFeedRow.tsx:270
 #: src/pages/OutputFeedRow.tsx:277
 msgid "Follow"
 msgstr ""
 
-#: src/pages/OutputAudioRow.tsx:188
+#: src/pages/OutputAudioRow.tsx:199
 #: src/pages/OutputFeedRow.tsx:275
 msgid "Follow ({id})"
 msgstr ""
 
-#: src/pages/OutputAudioRow.tsx:184
+#: src/pages/OutputAudioRow.tsx:195
 #: src/pages/OutputFeedRow.tsx:272
 msgid "Follow (preview source)"
 msgstr ""
 
-#: src/pages/OutputAudioRow.tsx:183
+#: src/pages/OutputAudioRow.tsx:194
 #: src/pages/OutputFeedRow.tsx:271
 msgid "Follow (program mix)"
 msgstr ""
 
-#: src/pages/OutputAudioRow.tsx:185
+#: src/pages/OutputAudioRow.tsx:196
 msgid "Follow (silence)"
 msgstr ""
 
@@ -5317,7 +5317,7 @@ msgstr ""
 msgid "HH:MM:SS:FF (with frames)"
 msgstr ""
 
-#: src/pages/OutputAudioRow.tsx:324
+#: src/pages/OutputAudioRow.tsx:339
 #: src/pages/OutputFeedRow.tsx:295
 msgid "Hidden"
 msgstr ""
@@ -7308,7 +7308,7 @@ msgstr ""
 msgid "No exit is armed."
 msgstr ""
 
-#: src/pages/OutputAudioRow.tsx:272
+#: src/pages/OutputAudioRow.tsx:287
 msgid "No extra encoder"
 msgstr ""
 
@@ -8399,12 +8399,12 @@ msgstr ""
 msgid "Plan a source → {0}"
 msgstr ""
 
-#: src/pages/OutputAudioRow.tsx:245
+#: src/pages/OutputAudioRow.tsx:260
 #: src/pages/OutputFeedRow.tsx:214
 msgid "Plan failed"
 msgstr ""
 
-#: src/pages/OutputAudioRow.tsx:229
+#: src/pages/OutputAudioRow.tsx:244
 msgid "Plan this audio feed first"
 msgstr ""
 
@@ -8430,7 +8430,7 @@ msgstr ""
 msgid "Planned cue in"
 msgstr ""
 
-#: src/pages/OutputAudioRow.tsx:338
+#: src/pages/OutputAudioRow.tsx:353
 #: src/pages/OutputFeedRow.tsx:360
 msgid "Planning…"
 msgstr ""
@@ -8733,8 +8733,8 @@ msgid "Program meters"
 msgstr ""
 
 #: src/pages/AudioPage.tsx:1226
-#: src/pages/OutputAudioRow.tsx:196
-#: src/pages/OutputAudioRow.tsx:282
+#: src/pages/OutputAudioRow.tsx:207
+#: src/pages/OutputAudioRow.tsx:297
 msgid "Program mix"
 msgstr ""
 
@@ -10060,8 +10060,8 @@ msgstr ""
 msgid "Signal unknown"
 msgstr ""
 
-#: src/pages/OutputAudioRow.tsx:197
-#: src/pages/OutputAudioRow.tsx:283
+#: src/pages/OutputAudioRow.tsx:208
+#: src/pages/OutputAudioRow.tsx:298
 msgid "Silence"
 msgstr ""
 
@@ -10195,7 +10195,7 @@ msgstr ""
 #: src/layout/components/SourcePalette.tsx:203
 #: src/pages/docs/ConfigPage.tsx:141
 #: src/pages/docs/FeaturesPage.tsx:38
-#: src/pages/OutputAudioRow.tsx:284
+#: src/pages/OutputAudioRow.tsx:299
 #: src/pages/OutputFeedRow.tsx:301
 msgid "Sources"
 msgstr "المصادر"
@@ -10682,7 +10682,7 @@ msgstr ""
 msgid "Tags"
 msgstr ""
 
-#: src/pages/OutputAudioRow.tsx:358
+#: src/pages/OutputAudioRow.tsx:373
 #: src/pages/OutputFeedRow.tsx:382
 #: src/pages/RoutingPage.tsx:632
 #: src/pages/SalvosPage.tsx:269
@@ -10697,7 +10697,7 @@ msgstr ""
 msgid "Take applied"
 msgstr ""
 
-#: src/pages/OutputAudioRow.tsx:356
+#: src/pages/OutputAudioRow.tsx:371
 msgid "Take audio to {outputName}"
 msgstr ""
 
@@ -10705,7 +10705,7 @@ msgstr ""
 msgid "Take exit"
 msgstr ""
 
-#: src/pages/OutputAudioRow.tsx:264
+#: src/pages/OutputAudioRow.tsx:279
 #: src/pages/OutputFeedRow.tsx:236
 msgid "Take failed"
 msgstr ""
@@ -11573,7 +11573,7 @@ msgstr ""
 msgid "This machine is not claimed to an owner yet."
 msgstr ""
 
-#: src/pages/OutputAudioRow.tsx:233
+#: src/pages/OutputAudioRow.tsx:248
 msgid "This output already carries this audio"
 msgstr ""
 
@@ -11783,7 +11783,7 @@ msgstr ""
 msgid "Track title (route {row})"
 msgstr ""
 
-#: src/pages/OutputAudioRow.tsx:285
+#: src/pages/OutputAudioRow.tsx:300
 #: src/pages/OutputsPage.tsx:827
 msgid "Tracks"
 msgstr ""
@@ -11796,7 +11796,7 @@ msgstr ""
 msgid "Tracks must be a number with a unit: 1fr, 200px or 25%."
 msgstr ""
 
-#: src/pages/OutputAudioRow.tsx:333
+#: src/pages/OutputAudioRow.tsx:348
 msgid "Tracks unavailable (audio routing not loaded)"
 msgstr ""
 
