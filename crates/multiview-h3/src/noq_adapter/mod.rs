@@ -132,6 +132,13 @@ pub const HEAD_MAX: usize = 16;
 /// capacity 0 and its decoder has nothing to acknowledge.
 pub const QPACK_STREAM_MAX: usize = 64;
 
+/// Chunks read per QPACK stream per [`Connection::poll_qpack`] call. A peer
+/// delivering the stream as many minimum-size QUIC `STREAM` frames (one
+/// byte each) would otherwise make a single accept poll loop up to the
+/// lifetime cap in one-byte steps; this bounds that work to a small
+/// constant per call regardless of how the peer fragments its writes.
+const QPACK_CHUNKS_PER_POLL: usize = 4;
+
 /// HTTP/3 unidirectional stream types the adapter handles.
 const UNI_CONTROL: u64 = 0x00;
 const UNI_QPACK_ENCODER: u64 = 0x02;
@@ -551,18 +558,32 @@ impl Connection {
     }
 
     /// Drains the peer's QPACK streams (at most [`QPACK_STREAM_MAX`] bytes
-    /// each over their life, else the connection is closed).
+    /// each over their life, else the connection is closed). Reads at most
+    /// [`QPACK_CHUNKS_PER_POLL`] chunks per stream per call: a peer that
+    /// delivers its stream as many minimum-size frames cannot make one
+    /// accept poll do work proportional to the receive window. If the
+    /// budget is used up without the stream going pending, this wakes the
+    /// task and returns so other accept-path work (and other streams) get a
+    /// turn; the stream's own waker, already registered by the last
+    /// `poll_data_max` call, brings this one back too.
     fn poll_qpack(&mut self, cx: &mut task::Context<'_>) -> Result<(), ConnectionErrorIncoming> {
         let mut i = 0;
+        let mut budget_exhausted = false;
         while i < self.qpack.len() {
             let Some(entry) = self.qpack.get_mut(i) else {
                 break;
             };
-            let room = QPACK_STREAM_MAX.saturating_sub(entry.seen) + 1;
+            let mut chunks = 0;
             let ended = loop {
+                if chunks >= QPACK_CHUNKS_PER_POLL {
+                    budget_exhausted = true;
+                    break false;
+                }
+                let room = QPACK_STREAM_MAX.saturating_sub(entry.seen) + 1;
                 match entry.recv.poll_data_max(cx, room) {
                     Poll::Pending => break false,
                     Poll::Ready(Ok(Some(chunk))) => {
+                        chunks += 1;
                         entry.seen = entry.seen.saturating_add(chunk.len());
                         if entry.seen > QPACK_STREAM_MAX {
                             let code = if entry.encoder {
@@ -588,6 +609,9 @@ impl Connection {
                 entry.recv.stop_final(Code::H3_NO_ERROR.value());
             }
             i += 1;
+        }
+        if budget_exhausted {
+            cx.waker().wake_by_ref();
         }
         Ok(())
     }
@@ -1584,6 +1608,19 @@ mod tests {
         assert_eq!(head.room(), 0);
         assert_eq!(head.push(&[1, 2, 3]), 3);
         assert_eq!(head.as_slice().len(), HEAD_MAX);
+    }
+
+    #[test]
+    fn qpack_chunk_budget_is_a_small_fixed_constant() {
+        // #358 review2 F2: the budget bounds work per `poll_qpack` call to
+        // a small constant regardless of how a peer fragments its writes,
+        // not "read until pending". It must be smaller than a one-byte-per-
+        // frame delivery of the lifetime cap, or it would not bound
+        // anything in the worst case the finding describes. Both sides of
+        // this are compile-time constants, so the check is evaluated once
+        // at compile time instead of asserting a constant at runtime.
+        const _: () = assert!(QPACK_CHUNKS_PER_POLL > 0);
+        const _: () = assert!(QPACK_CHUNKS_PER_POLL < QPACK_STREAM_MAX);
     }
 
     #[test]

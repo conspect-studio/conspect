@@ -139,6 +139,51 @@ async fn chatty_qpack_stream_closes_the_connection() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn qpack_stream_sent_as_one_byte_frames_still_closes_the_connection() {
+    // #358 review2 F2: a peer delivering its QPACK stream as many separate
+    // one-byte writes (each flushed as its own tiny STREAM frame) must not
+    // make a single accept poll do unbounded work; the connection is still
+    // closed once the lifetime cap is crossed, and another connection is
+    // served meanwhile.
+    let server = start(TestSite::new(), None, limits(), None).await;
+    let mut client = h3_client(&server).await;
+    let (resp, _) = fetch(&mut client.send, request(http::Method::GET, "/")).await;
+    assert_eq!(resp.status(), 200);
+
+    let conn = quic_connect(&server, b"h3").await.unwrap();
+    let mut control = conn.open_uni().await.unwrap();
+    let mut bytes = vec![0x00];
+    bytes.extend(frame_header(0x04, 0));
+    control.write_all(&bytes).await.unwrap();
+    let mut decoder = conn.open_uni().await.unwrap();
+    // The stream-type varint, then 200 separate one-byte writes (each
+    // `write_all` + the implicit per-call flush is its own STREAM frame):
+    // well past the 64-byte lifetime cap, in the most fragmented shape a
+    // peer can send it.
+    decoder.write_all(&[0x03]).await.unwrap();
+    for _ in 0..200 {
+        // The server closes the connection as soon as the 64-byte cap is
+        // crossed, so a later write in this loop can race the close and
+        // fail; that is the expected outcome here, not a test bug, so stop
+        // feeding bytes once the peer is gone instead of unwrapping.
+        if decoder.write_all(&[0u8]).await.is_err() {
+            break;
+        }
+    }
+    let started = Instant::now();
+    assert_eq!(closed_code(&conn).await, 0x202); // QPACK_DECODER_STREAM_ERROR
+                                                 // Bounded per-call work means this closes promptly, not after the
+                                                 // accept task has chewed through all 200 single-byte frames in one
+                                                 // poll; it is also well under the test timeout either way, so the
+                                                 // meaningful assertion is the second connection below staying
+                                                 // responsive throughout.
+    assert!(started.elapsed() < Duration::from_secs(5));
+    // The other connection is unaffected and was servable the whole time.
+    let (resp, _) = fetch(&mut client.send, request(http::Method::GET, "/after")).await;
+    assert_eq!(resp.status(), 200);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn unknown_uni_stream_is_stopped() {
     let server = start(TestSite::new(), None, limits(), None).await;
     let mut client = h3_client(&server).await;
