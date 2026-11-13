@@ -156,7 +156,15 @@ impl OutputRouter {
             return true;
         };
         let tb = encoder.time_base();
-        encoder.start_at(tick);
+        // The baked Program picture is published AFTER the router's tick
+        // (`publish_program`, once baked), so a key on Program is first fed
+        // at the next tick; every other bus is fed this tick (`feed`).
+        let first = if open.bus == PictureBus::Program {
+            tick.saturating_add(1)
+        } else {
+            tick
+        };
+        encoder.start_at(first);
         let gate = encoder.move_gate();
         let Ok(key) = dispatcher.add_video_key(
             DtsTimeBase {
