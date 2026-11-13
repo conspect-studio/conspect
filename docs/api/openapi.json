@@ -7190,7 +7190,7 @@
         },
         "responses": {
           "200": {
-            "description": "The replaced output (new ETag in the response header).",
+            "description": "The replaced output (new ETag in the response header). `x-multiview-apply: live` when the change is ONLY the output's `format` and/or `slots.video[0].bitrate_kbps` on a running HLS, SRT or RIST output: that output is reset live (about 1 s; Program and other outputs are not affected; `x-multiview-apply-note` says so, `x-multiview-operation-id` correlates the `route.output` outcome `reset:applied` or `reset:refused:<reason>`). Otherwise `x-multiview-apply: restart` (a codec, audio-slot or other change, or a kind whose container carries parameter sets out of band).",
             "content": {
               "application/json": {
                 "schema": {
@@ -7210,7 +7210,7 @@
             }
           },
           "403": {
-            "description": "Not authorized to write.",
+            "description": "Not authorized to write (a live reset also needs the output axis).",
             "content": {
               "application/json": {
                 "schema": {
@@ -7231,6 +7231,16 @@
           },
           "412": {
             "description": "If-Match precondition failed.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "A live reset over 2/s for this output or 10/s for the principal (one reset = one take); nothing committed. See Retry-After.",
             "content": {
               "application/json": {
                 "schema": {
