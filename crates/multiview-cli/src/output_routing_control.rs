@@ -355,15 +355,19 @@ impl OutputRouting for OutputRoutingAdapter {
     }
 
     fn layout_changed(&self, id: &str, body: Option<LayoutBody>) -> bool {
+        // No run: nothing composes the layout, nothing to tell.
         let Some(handle) = self.handle() else {
-            return false;
+            return true;
         };
         let change = match body {
             Some(body) if body.0.id == id => crate::output_routing::LayoutChange::Edited(
                 crate::routing_aux::LayoutRef::new(Arc::clone(&body.0)),
             ),
             Some(_) => return false,
-            None => crate::output_routing::LayoutChange::Removed(id.to_owned()),
+            None => crate::output_routing::LayoutChange::Removed {
+                id: id.to_owned(),
+                revision: crate::output_routing::next_layout_revision(),
+            },
         };
         handle.try_layout_change(change).is_ok()
     }

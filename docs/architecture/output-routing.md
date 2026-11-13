@@ -1724,14 +1724,18 @@ PR 1 (layout to an output, live) builds, and deviates from §2.3 and §7 as stat
   shows its slate; it never makes the layout un-fresh.
 - **Cost, measured (build host, one core).** 1080p, 6 cells: see the PR for the release p50
   (`aux_layout::tests::a_1080p_layout_compose_costs_less_than_a_tick_on_one_core` prints it).
-- **Live edits (PR 2).** A committed `PUT /layouts/{id}` of a layout on air (or pending) on any
-  output is re-resolved on the control plane and handed to the router (`LayoutChange::Edited`, a
-  bounded mailbox of 16, drop-and-log when full). The router swaps the body every output and pending
-  take on that layout composes, from the next tick, and requests an IDR on its encoders (within the
-  per-key force floor); outputs whose audio follows re-resolve the layout's `audio` attribute. It is
-  not a take: no outcome, no persistence change. Authorization (§6.3): such an edit needs Write on
-  every output the layout feeds and Read on every source the new body binds, else 403
-  `routed-layout` (one generic refusal, naming nothing).
+- **Live edits (PR 2).** Every committed `PUT /layouts/{id}` is re-resolved on the control plane
+  and handed to the router (`LayoutChange::Edited`). The changes are coalesced per layout id in a
+  bounded inbox (64 ids, newest revision wins; the router drains it with `try_lock`, so it never
+  blocks). The router swaps the body that every output and pending take on that layout composes,
+  from the next tick, and requests an IDR on its encoders (within the per-key force floor). Outputs
+  whose audio follows re-resolve the layout's `audio` attribute. It is not a take: no outcome, no
+  persistence change. Every resolved body carries a process-wide revision taken after the library
+  read or commit. A take queued with a body older than a later edit or removal of its layout is
+  refused (`refused:unroutable`). Such a take can neither revert an edit nor air content its taker
+  was not authorized for. Authorization (§6.3): such an edit or delete needs Write on every output
+  the layout feeds, and an edit also needs Read on every source the new body binds. Otherwise the
+  request gets a 403 `routed-layout` (one generic refusal, naming nothing).
 - **Delete, rename and an edit that no longer routes (PR 2).** A deleted layout, or an edit that
   makes it unroutable here (another canvas, a translucent cell), sends `LayoutChange::Removed`: a
   take priming onto it is refused (`refused:unroutable`), and every output on it falls back to
@@ -1756,7 +1760,8 @@ PR 1 (layout to an output, live) builds, and deviates from §2.3 and §7 as stat
   histogram (`ProgramMetricsSlot`) on each tick it receives. When the p99 of a 10 s window
   exceeds half the tick, it composes only even ticks; every routed picture holds on odd ticks. A
   window back under half restores the full cadence. While halved, a picture one tick old is fresh,
-  and a skipped tick is not a hold, so routed outputs neither degrade nor fall back. Readback:
+  so routed outputs neither degrade nor fall back. A canvas that stops publishing still counts as
+  held every tick and falls back. Readback:
   `RoutingSnapshot.aux_halved`. It never touches Program.
 - **Still not built:** a persisted layout feed is not re-taken at start-up (no boot take: its body
   lives in the layouts library, which start-up does not resolve). The output starts and stays on

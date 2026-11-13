@@ -123,13 +123,70 @@ pub enum LayoutChange {
     /// The layout was edited: its newly resolved body (same id). Outputs on
     /// it compose the new body from the next tick, at an IDR.
     Edited(LayoutRef),
-    /// The layout was deleted, renamed away, or no longer routes (another
-    /// canvas, a translucent cell): outputs on it fall back to Program.
-    Removed(String),
+    /// The layout was deleted or no longer routes (another canvas, a
+    /// translucent cell), at `revision` ([`next_layout_revision`] order):
+    /// outputs on it fall back to Program, and a take carrying an older body
+    /// is refused.
+    Removed {
+        /// The layout id.
+        id: String,
+        /// The revision of the removal.
+        revision: u64,
+    },
 }
 
-/// Layout changes queued between the control plane and the router.
-pub const LAYOUT_CHANGE_MAILBOX: usize = 16;
+impl LayoutChange {
+    fn id(&self) -> &str {
+        match self {
+            Self::Edited(layout) => &layout.id,
+            Self::Removed { id, .. } => id,
+        }
+    }
+
+    fn revision(&self) -> u64 {
+        match self {
+            Self::Edited(layout) => layout.body.revision,
+            Self::Removed { revision, .. } => *revision,
+        }
+    }
+}
+
+pub use multiview_control::output_routing::next_layout_revision;
+
+/// Layout ids whose latest state the router remembers (pending changes on
+/// the control side, known states on the router side); removals are
+/// forgotten first, then the oldest revision. A forgotten removal only lets a
+/// take queued before it through (the take mailbox drains every tick).
+pub const LAYOUT_STATES: usize = 64;
+
+/// Latest layout changes not yet applied, coalesced per id (the newest
+/// revision wins), so a burst of edits never loses the last one. Written by
+/// the control plane, drained by the router with `try_lock` (never blocks
+/// the consumer; on contention it retries next tick).
+type LayoutInbox = Arc<Mutex<HashMap<String, LayoutChange>>>;
+
+/// Insert `change` into a revision-ordered, bounded map (an older revision
+/// for the same id is ignored; the oldest entry is evicted at the bound).
+fn remember(map: &mut HashMap<String, LayoutChange>, change: LayoutChange) {
+    if map
+        .get(change.id())
+        .is_some_and(|known| known.revision() > change.revision())
+    {
+        return;
+    }
+    if !map.contains_key(change.id()) && map.len() >= LAYOUT_STATES {
+        // A removal is forgotten before an edit (an edit carries a body
+        // that outputs may be composing), then the oldest revision.
+        if let Some(oldest) = map
+            .iter()
+            .min_by_key(|(_, c)| (matches!(c, LayoutChange::Edited(_)), c.revision()))
+            .map(|(id, _)| id.clone())
+        {
+            map.remove(&oldest);
+        }
+    }
+    map.insert(change.id().to_owned(), change);
+}
 
 /// The take was not enqueued: the mailbox is full or the run ended (HTTP 503
 /// `engine-busy` in the later API PR), or the take's `principal` /
@@ -335,7 +392,7 @@ pub struct OutputRoutingHandle {
     #[cfg(test)]
     pub(crate) audio_tap: crate::routing_audio::AudioTapCell,
     takes: SyncSender<OutputTake>,
-    layout_changes: SyncSender<LayoutChange>,
+    layout_changes: LayoutInbox,
     snapshot: Arc<SwapCell<Arc<RoutingSnapshot>>>,
     outcomes: Arc<Mutex<Option<Receiver<TakeOutcome>>>>,
     outputs: Arc<[RunOutput]>,
@@ -383,21 +440,21 @@ impl OutputRoutingHandle {
         self.takes.try_send(take).map_err(|_| TakeBusy)
     }
 
-    /// Tell the router a stored layout changed, without waiting. A full
-    /// mailbox drops the change (the caller logs it; a re-take still picks
-    /// up the edit).
+    /// Tell the router a stored layout changed. Coalesced per id (the
+    /// newest revision wins) and bounded; never waits on the router.
     ///
     /// # Errors
-    /// [`TakeBusy`] when the mailbox is full or the run ended.
+    /// [`TakeBusy`] when the id is longer than [`MAX_TAKE_ID_BYTES`].
     pub fn try_layout_change(&self, change: LayoutChange) -> Result<(), TakeBusy> {
-        let id_len = match &change {
-            LayoutChange::Edited(layout) => layout.id.len(),
-            LayoutChange::Removed(id) => id.len(),
-        };
-        if id_len > MAX_TAKE_ID_BYTES {
+        if change.id().len() > MAX_TAKE_ID_BYTES {
             return Err(TakeBusy);
         }
-        self.layout_changes.try_send(change).map_err(|_| TakeBusy)
+        let mut inbox = self
+            .layout_changes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        remember(&mut inbox, change);
+        Ok(())
     }
 
     /// The layouts on air or pending on any output (`aux:<id>` ids), from the
@@ -788,7 +845,10 @@ pub struct OutputRouter {
     cfg: RouterConfig,
     aux: AuxWiring,
     takes: Receiver<OutputTake>,
-    layout_changes: Receiver<LayoutChange>,
+    layout_changes: LayoutInbox,
+    /// The latest known state of each layout seen (bounded): a take carrying
+    /// an older body than a later edit or removal is refused.
+    layout_states: HashMap<String, LayoutChange>,
     outcomes: SyncSender<TakeOutcome>,
     snapshot: Arc<SwapCell<Arc<RoutingSnapshot>>>,
     outputs: Vec<OutputState>,
@@ -871,7 +931,8 @@ impl OutputRouter {
         mut open: BusOpenFn,
     ) -> std::io::Result<(Self, OutputRoutingHandle)> {
         let (take_tx, takes) = mpsc::sync_channel(TAKE_MAILBOX);
-        let (layout_tx, layout_changes) = mpsc::sync_channel(LAYOUT_CHANGE_MAILBOX);
+        let layout_changes: LayoutInbox = Arc::new(Mutex::new(HashMap::new()));
+        let layout_tx = Arc::clone(&layout_changes);
         let (outcomes, outcome_rx) = mpsc::sync_channel(OUTCOME_CAPACITY);
         let (open_tx, open_req_rx) = mpsc::sync_channel::<OpenRequest>(OPEN_QUEUE);
         let (open_res_tx, open_rx) = mpsc::sync_channel::<OpenResult>(OPEN_QUEUE);
@@ -939,6 +1000,7 @@ impl OutputRouter {
             aux,
             takes,
             layout_changes,
+            layout_states: HashMap::new(),
             outcomes,
             snapshot,
             outputs,
@@ -1421,18 +1483,40 @@ impl OutputRouter {
         }
     }
 
-    /// Apply stored-layout changes (bounded by the mailbox; O(outputs) each).
+    /// Apply stored-layout changes (at most [`LAYOUT_STATES`]; O(outputs)
+    /// each). Never blocks: a contended inbox is retried next tick.
     fn drain_layout_changes(&mut self, tick: u64, dispatcher: &mut RenditionDispatcher) {
-        while let Ok(change) = self.layout_changes.try_recv() {
+        let changes: Vec<LayoutChange> = match self.layout_changes.try_lock() {
+            Ok(mut inbox) if !inbox.is_empty() => inbox.drain().map(|(_, c)| c).collect(),
+            _ => return,
+        };
+        for change in changes {
+            if self
+                .layout_states
+                .get(change.id())
+                .is_some_and(|known| known.revision() >= change.revision())
+            {
+                continue;
+            }
+            remember(&mut self.layout_states, change.clone());
             match change {
                 LayoutChange::Edited(layout) => {
                     if self.refresh_layout_body(&layout, tick) {
                         self.refollow_layout_audio(&layout, tick, dispatcher);
                     }
                 }
-                LayoutChange::Removed(id) => self.drop_layout(&id, tick, dispatcher),
+                LayoutChange::Removed { id, .. } => self.drop_layout(&id, tick, dispatcher),
             }
         }
+    }
+
+    /// Whether a take onto `layout` carries a body older than a later edit
+    /// or removal of that layout (it was authorized for content that is no
+    /// longer the layout's): such a take is refused.
+    fn layout_take_is_stale(&self, layout: &LayoutRef) -> bool {
+        self.layout_states
+            .get(&layout.id)
+            .is_some_and(|known| known.revision() > layout.body.revision)
     }
 
     /// Outputs whose audio follows a layout re-resolve it after its body
@@ -1448,7 +1532,13 @@ impl OutputRouter {
             return;
         };
         for (index, o) in self.outputs.iter().enumerate() {
-            if o.bus == bus && o.pending.is_none() {
+            // An output mid-move settles its audio with the move (a refused
+            // move restores the choice, which then resolves on this body).
+            let moving = o
+                .pending
+                .as_ref()
+                .is_some_and(|p| matches!(p.phase, Phase::Moving(_) | Phase::AudioMoving { .. }));
+            if o.bus == bus && !moving {
                 audio.fallback(index, &bus, tick, None, dispatcher);
             }
         }
@@ -1511,6 +1601,19 @@ impl OutputRouter {
             // §7 rule 1, checked again here (the plan's answer can be stale):
             // a layout not composing yet needs a free aux canvas.
             if let Some(PictureBus::Layout(layout)) = &take.bus {
+                if self.layout_take_is_stale(layout) {
+                    self.emit(
+                        take.operation_id,
+                        take.output_index,
+                        tick,
+                        TakeResult::Refused(RefuseReason::Unroutable),
+                    );
+                    continue;
+                }
+                remember(
+                    &mut self.layout_states,
+                    LayoutChange::Edited(layout.clone()),
+                );
                 // A re-take of a composing layout carries its latest body
                 // (an edited layout): the canvas follows it from this tick.
                 let _ = self.refresh_layout_body(layout, tick);
@@ -2482,8 +2585,10 @@ impl OutputRouter {
         }
         let halved = self.aux.halved.load(Ordering::Relaxed);
         for (bus, fresh) in fresh_buses {
-            // A tick the halved aux cadence skips by design is not a hold.
-            let fresh = fresh || (halved && aux_composed(&bus.0) && tick % 2 == 1);
+            // A tick the halved aux cadence skips by design is not a hold:
+            // only while the slot's latest picture is at most one tick old
+            // (a stalled canvas still counts every tick).
+            let fresh = fresh || (halved && aux_composed(&bus.0) && self.slot_fresh(&bus, tick));
             let health = self.health.entry(bus).or_insert(BusHealth {
                 held: 0,
                 fallen: false,
@@ -2648,8 +2753,10 @@ impl OutputRouter {
             return;
         };
         let mut cells: Vec<multiview_core::layout::Cell> = Vec::new();
-        for (bus, _) in self.feeds.keys() {
-            if let PictureBus::Layout(layout) = bus {
+        // The VALUE's bus: a live edit swaps the body there (the key keeps
+        // the id it hashes by).
+        for feed in self.feeds.values() {
+            if let PictureBus::Layout(layout) = &feed.bus {
                 cells.extend(layout.body.layout.cells.iter().cloned());
             }
         }
@@ -2778,7 +2885,9 @@ impl OutputRouter {
             return false;
         };
         if let PictureBus::Layout(current) = &feed.bus {
-            if Arc::ptr_eq(&current.body, &layout.body) {
+            if Arc::ptr_eq(&current.body, &layout.body)
+                || current.body.revision > layout.body.revision
+            {
                 return false;
             }
         }

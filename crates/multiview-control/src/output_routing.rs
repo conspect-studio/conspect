@@ -110,6 +110,19 @@ pub struct RoutedLayout {
     /// The layout's `audio` attribute: what an output carries when it routes
     /// this layout and its audio follows (§5.1).
     pub audio: multiview_config::LayoutAudio,
+    /// Resolution order ([`next_layout_revision`]): a body resolved later
+    /// (after a later committed edit) has a higher revision, so the engine
+    /// never lets an older body replace a newer one.
+    pub revision: u64,
+}
+
+/// The next layout resolution revision (process-wide, monotonic). Taken
+/// AFTER the layouts library is read (a take) or committed (an edit, a
+/// delete), so a higher revision always reflects a later library state.
+#[must_use]
+pub fn next_layout_revision() -> u64 {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    NEXT.fetch_add(1, std::sync::atomic::Ordering::AcqRel)
 }
 
 impl RoutedLayout {
@@ -363,7 +376,7 @@ pub trait OutputRouting: Send + Sync {
     /// `Some(body)` is its newly resolved body (outputs on it follow it live,
     /// at an IDR); `None` means it was deleted or no longer routes (outputs
     /// on it fall back to Program). Never waits; `false` when the engine
-    /// did not take the change (no run, a full mailbox).
+    /// refused the change (with no run there is nothing to tell: `true`).
     fn layout_changed(&self, id: &str, body: Option<LayoutBody>) -> bool {
         let _ = (id, body);
         false

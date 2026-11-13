@@ -136,6 +136,21 @@ fn keys() -> ApiKeyStore {
         scoped("layout-editor", &["NewsOne", "a", "bars"], None),
     );
     keys.register(
+        "layout-admin",
+        "layout-admin-secret",
+        Principal {
+            key_id: "layout-admin".to_owned(),
+            role: Role::Admin,
+            scoped_object_ids: Some(vec![
+                "NewsOne".to_owned(),
+                "a".to_owned(),
+                "bars".to_owned(),
+            ]),
+            scoped_output_ids: None,
+            scoped_discovery_domains: None,
+        },
+    );
+    keys.register(
         "route-other",
         "route-other-secret",
         scoped("route-other", &["output-0", "bars"], None),
@@ -1817,8 +1832,8 @@ async fn a_stored_layout_routes_to_an_output_with_typed_refusals() {
 /// of a layout on air on an output needs Write on that output (403
 /// `routed-layout` otherwise) and reaches the engine live with the newly
 /// resolved body; an edit that no longer routes and a delete tell the engine
-/// to fall the layout's outputs back (no body). A layout routed nowhere is
-/// edited without telling the engine anything.
+/// to fall the layout's outputs back (no body); deleting it needs Write on
+/// those outputs too.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[allow(clippy::too_many_lines)] // One HTTP scenario with its assertions.
 async fn layout_audio_and_live_edits_of_a_routed_layout() {
@@ -1882,7 +1897,9 @@ async fn layout_audio_and_live_edits_of_a_routed_layout() {
     .await;
     assert_eq!(resp.status(), StatusCode::OK);
     let tag = support::etag(&resp).unwrap();
-    assert_eq!(rig.fake.state.lock().unwrap().layout_changes.len(), 0);
+    // Every edit is told to the engine (a take may be queued but not yet in
+    // the readback); the engine ignores a layout it does not compose.
+    assert_eq!(rig.fake.state.lock().unwrap().layout_changes.len(), 1);
 
     // NewsOne goes on air on output-1.
     {
@@ -1923,7 +1940,7 @@ async fn layout_audio_and_live_edits_of_a_routed_layout() {
     let problem = body_json(resp).await.to_string();
     assert!(problem.contains("routed-layout"), "{problem}");
     assert!(!problem.contains("output-1"), "names nothing: {problem}");
-    assert_eq!(rig.fake.state.lock().unwrap().layout_changes.len(), 0);
+    assert_eq!(rig.fake.state.lock().unwrap().layout_changes.len(), 1);
 
     // A permitted edit reaches the engine with the new body.
     let mut edited = layout_body(640, 1.0);
@@ -1958,6 +1975,18 @@ async fn layout_audio_and_live_edits_of_a_routed_layout() {
         .layout_changes
         .last()
         .is_some_and(|(id, body)| id == "NewsOne" && body.is_none()));
+    // A scoped administrator without Write on output-1 cannot delete the
+    // layout on air there (it would move output-1 to Program).
+    let resp = send(
+        &rig.router,
+        support::delete_if_match(
+            "/api/v1/layouts/NewsOne",
+            "layout-admin.layout-admin-secret",
+            Some(&tag),
+        ),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
     // A delete tells the engine too.
     let n = rig.fake.state.lock().unwrap().layout_changes.len();
     let resp = send(

@@ -1459,6 +1459,7 @@ mod tests {
                     },
                     slates: Vec::new(),
                     audio,
+                    revision: 0,
                 },
             )))
         };

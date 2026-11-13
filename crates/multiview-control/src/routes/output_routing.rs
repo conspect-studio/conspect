@@ -469,6 +469,7 @@ fn resolve_layout(
         slates: resolved.document.cell_slates(),
         audio: resolved.document.audio.clone(),
         layout: resolved.solved,
+        revision: crate::output_routing::next_layout_revision(),
     };
     if !routed.integer_drawable() {
         return Ok(Err((
@@ -513,7 +514,7 @@ pub(crate) fn authorize_routed_layout_edit(
     state: &AppState,
     principal: &Principal,
     id: &str,
-    body: &serde_json::Value,
+    body: Option<&serde_json::Value>,
 ) -> ControlResult<()> {
     let outputs = outputs_on_layout(state, id);
     if outputs.is_empty() {
@@ -521,8 +522,8 @@ pub(crate) fn authorize_routed_layout_edit(
     }
     let forbidden = || {
         ControlError::Forbidden(
-            "routed-layout: this layout is on air on an output; the edit needs Write on every \
-             output it feeds and Read on every source it shows"
+            "routed-layout: this layout is on air on an output; changing it needs Write on \
+             every output it feeds and Read on every source it shows"
                 .to_owned(),
         )
     };
@@ -535,7 +536,7 @@ pub(crate) fn authorize_routed_layout_edit(
     }
     // A body that does not parse is answered by the update's own validation;
     // here it binds no source.
-    if let Ok(document) = multiview_config::LayoutDocument::from_body(body) {
+    if let Some(Ok(document)) = body.map(multiview_config::LayoutDocument::from_body) {
         let readable = document
             .cells
             .iter()
@@ -549,18 +550,16 @@ pub(crate) fn authorize_routed_layout_edit(
 }
 
 /// After a committed layout edit (`body: Some`) or delete (`None`): tell the
-/// engine, when the layout is routed, so outputs on it follow the edit live
-/// (at an IDR) or fall back to Program. An edited body that no longer routes
-/// (another canvas, a translucent cell, a bad audio source) also falls back.
-/// Best-effort and non-blocking: a dropped change is logged (a re-take still
-/// picks up the edit).
+/// engine, so outputs on it follow the edit live (at an IDR) or fall back to
+/// Program, and a take still queued with an older body is refused. Sent for
+/// every edit (a take may be queued but not yet in the readback); the engine
+/// ignores a layout it does not route. An edited body that no longer routes
+/// (another canvas, a translucent cell, a bad audio source) is a removal.
+/// Non-blocking and coalesced per layout on the engine side.
 pub(crate) fn notify_layout_change(state: &AppState, id: &str, body: Option<&serde_json::Value>) {
     let Some(control) = state.output_routing.as_ref() else {
         return;
     };
-    if !control.routing.routed_layouts().iter().any(|l| l == id) {
-        return;
-    }
     let resolved = body.and_then(|body| {
         let resolved =
             crate::command::resolve_layout_document(id, body, state.running_canvas.as_ref())
@@ -570,16 +569,14 @@ pub(crate) fn notify_layout_change(state: &AppState, id: &str, body: Option<&ser
             slates: resolved.document.cell_slates(),
             audio: resolved.document.audio.clone(),
             layout: resolved.solved,
+            revision: crate::output_routing::next_layout_revision(),
         };
         routed
             .integer_drawable()
             .then(|| LayoutBody(std::sync::Arc::new(routed)))
     });
-    let edited = resolved.is_some();
     if !control.routing.layout_changed(id, resolved) {
         tracing::warn!(layout = %id, "output routing: a layout change was not delivered to the engine; outputs on it keep their picture until a re-take");
-    } else if !edited {
-        tracing::info!(layout = %id, "output routing: a routed layout was deleted or no longer routes; its outputs fall back to Program");
     }
 }
 

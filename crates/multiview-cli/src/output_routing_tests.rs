@@ -4220,6 +4220,7 @@ fn layout_bus(id: &str) -> PictureBus {
             },
             slates: vec![multiview_config::FailoverSlate::Black],
             audio: multiview_config::LayoutAudio::default(),
+            revision: crate::output_routing::next_layout_revision(),
         },
     )))
 }
@@ -4486,6 +4487,11 @@ fn a_live_layout_edit_swaps_the_body_without_a_take() {
             .expect("the layout still composes");
     assert!(Arc::ptr_eq(&body, &new.body), "the edit is live");
     assert_eq!(
+        *sizing.load(),
+        new.body.layout.cells,
+        "the decoders size for the edited cells"
+    );
+    assert_eq!(
         x.r.last_forced.get(&x.r.dynamic[0].key).copied(),
         Some(t + 1),
         "an IDR is requested on the layout's encoder"
@@ -4521,9 +4527,10 @@ fn a_deleted_layout_falls_its_outputs_back_to_program() {
     x.h.try_take(take("two", 2, l1.clone())).unwrap();
     t += 1;
     x.tick(t);
-    x.h.try_layout_change(crate::output_routing::LayoutChange::Removed(
-        "L1".to_owned(),
-    ))
+    x.h.try_layout_change(crate::output_routing::LayoutChange::Removed {
+        id: "L1".to_owned(),
+        revision: crate::output_routing::next_layout_revision(),
+    })
     .unwrap();
     t += 1;
     x.tick(t);
@@ -4578,4 +4585,127 @@ fn a_halved_aux_cadence_neither_degrades_nor_falls_back() {
     assert!(x.outcomes.try_iter().next().is_none(), "no fallback");
     assert_eq!(x.h.snapshot().outputs[1].bus, "aux:L1");
     assert!(x.h.snapshot().aux_halved);
+}
+
+/// #369 review (lens 1 #1/#2): a take queued with a body older than a later
+/// edit or removal of its layout is refused, never adopted: it can neither
+/// revert the edit nor air a deleted layout.
+#[test]
+fn a_take_carrying_a_stale_layout_body_is_refused() {
+    let mut x = harness(3, 6, None);
+    let old = layout_bus("L1");
+    let mut t = on_layout(&mut x, &old);
+    let edited = layout_bus("L1");
+    let PictureBus::Layout(new) = &edited else {
+        panic!("a layout bus");
+    };
+    x.h.try_layout_change(crate::output_routing::LayoutChange::Edited(new.clone()))
+        .unwrap();
+    // Output 2's take was resolved before the edit (it carries `old`).
+    x.h.try_take(take("stale", 2, old.clone())).unwrap();
+    t += 1;
+    x.tick_layouts(t, std::slice::from_ref(&edited));
+    assert_eq!(
+        x.results(),
+        vec![TakeResult::Refused(RefuseReason::Unroutable)]
+    );
+    let composing =
+        x.r.aux
+            .feeds
+            .load()
+            .iter()
+            .find_map(|f| match &f.bus {
+                PictureBus::Layout(l) => Some(Arc::clone(&l.body)),
+                _ => None,
+            })
+            .unwrap();
+    assert!(Arc::ptr_eq(&composing, &new.body), "the edit stands");
+    // A removal, then a take queued with the pre-removal body: refused.
+    x.h.try_layout_change(crate::output_routing::LayoutChange::Removed {
+        id: "L1".to_owned(),
+        revision: crate::output_routing::next_layout_revision(),
+    })
+    .unwrap();
+    x.h.try_take(take("after-delete", 2, edited.clone()))
+        .unwrap();
+    t += 1;
+    x.tick(t);
+    let results = x.results();
+    assert!(
+        results.contains(&TakeResult::Refused(RefuseReason::Unroutable)),
+        "{results:?}"
+    );
+    assert_eq!(
+        x.d.binding_video_key(2),
+        Some(0),
+        "never on the deleted layout"
+    );
+    // A layout re-created later (a newer resolution) is not stale: it is
+    // admitted (whatever its encoder then does).
+    let PictureBus::Layout(recreated) = layout_bus("L1") else {
+        panic!("a layout bus");
+    };
+    assert!(!x.r.layout_take_is_stale(&recreated));
+    assert!(x.r.layout_take_is_stale(new));
+}
+
+/// #369 review (lens 1 #4, lens 3 #1): a halved cadence never hides a
+/// stalled canvas: with no new picture, the layout still falls back.
+#[test]
+fn a_stalled_canvas_falls_back_even_while_halved() {
+    let mut x = harness(2, 6, None);
+    let l1 = layout_bus("L1");
+    let mut t = on_layout(&mut x, &l1);
+    x.r.aux.halved.store(true, Ordering::Relaxed);
+    let mut fell = false;
+    for _ in 0..FALLBACK_AFTER_TICKS + 10 {
+        t += 1;
+        x.tick(t); // nothing composes
+        if x.results()
+            .contains(&TakeResult::Fallback(FallbackReason::AuxFailed))
+        {
+            fell = true;
+            break;
+        }
+    }
+    assert!(fell, "a stalled canvas falls back while halved");
+}
+
+/// #369 review (lens 3 #3): a burst of changes is coalesced per layout,
+/// newest revision first, and never loses the last one.
+#[test]
+fn layout_changes_coalesce_and_keep_the_newest() {
+    let mut x = harness(2, 6, None);
+    let first = layout_bus("L1");
+    let mut t = on_layout(&mut x, &first);
+    let mut last = None;
+    for _ in 0..100 {
+        let PictureBus::Layout(next) = layout_bus("L1") else {
+            panic!("a layout bus");
+        };
+        x.h.try_layout_change(crate::output_routing::LayoutChange::Edited(next.clone()))
+            .unwrap();
+        last = Some(next);
+    }
+    for i in 0..100 {
+        x.h.try_layout_change(crate::output_routing::LayoutChange::Removed {
+            id: format!("other-{i}"),
+            revision: crate::output_routing::next_layout_revision(),
+        })
+        .unwrap();
+    }
+    t += 1;
+    x.tick_layouts(t, std::slice::from_ref(&first));
+    let composing =
+        x.r.aux
+            .feeds
+            .load()
+            .iter()
+            .find_map(|f| match &f.bus {
+                PictureBus::Layout(l) => Some(Arc::clone(&l.body)),
+                _ => None,
+            })
+            .unwrap();
+    assert!(Arc::ptr_eq(&composing, &last.unwrap().body));
+    assert!(x.r.layout_states.len() <= crate::output_routing::LAYOUT_STATES);
 }

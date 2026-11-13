@@ -1691,6 +1691,7 @@ fn two_cell_layout(prefix: &str, order: [&str; 2]) -> PictureBus {
             id: "swapped".to_owned(),
             slates: vec![multiview_config::FailoverSlate::Black; 2],
             audio: multiview_config::LayoutAudio::default(),
+            revision: crate::output_routing::next_layout_revision(),
             layout,
         },
     )))
@@ -1870,9 +1871,10 @@ fn a_live_edit_reaches_the_routed_layout_and_a_delete_falls_back() {
         assert!(outcomes.try_recv().is_err(), "a live edit is not a take");
         assert_eq!(handle.snapshot().outputs[1].bus, "aux:swapped");
         handle
-            .try_layout_change(crate::output_routing::LayoutChange::Removed(
-                "swapped".to_owned(),
-            ))
+            .try_layout_change(crate::output_routing::LayoutChange::Removed {
+                id: "swapped".to_owned(),
+                revision: crate::output_routing::next_layout_revision(),
+            })
             .unwrap();
         let fell = wait_for("fallback outcome", Duration::from_secs(10), || {
             outcomes.try_recv().ok()

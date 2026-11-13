@@ -344,7 +344,7 @@ async fn update_layout(
     if_match.require(LAYOUT_KIND, &id, current.version)?;
     // §6.3: an edit of a layout on air on an output needs Write on those
     // outputs and Read on every source the new body shows.
-    output_routing::authorize_routed_layout_edit(&state, &principal, &id, &input.body)?;
+    output_routing::authorize_routed_layout_edit(&state, &principal, &id, Some(&input.body))?;
     let versioned = if state.boot_model.is_some() {
         let mut layouts = crate::boot_model::layout_library(&state)?;
         let layout = layouts
@@ -411,6 +411,9 @@ async fn delete_layout(
         state.repository.get_layout(&id)?
     };
     if_match.require(LAYOUT_KIND, &id, current.version)?;
+    // §6.3: deleting a layout on air moves its outputs to Program, so it
+    // needs Write on every output it feeds (403 `routed-layout`).
+    output_routing::authorize_routed_layout_edit(&state, &principal, &id, None)?;
     if state.boot_model.is_some() {
         let mut layouts = crate::boot_model::layout_library(&state)?;
         let config: multiview_config::MultiviewConfig =
