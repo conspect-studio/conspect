@@ -34,8 +34,10 @@
 //! streams to its bounded queues before h3 sees them, and the connection
 //! driver keeps serving page requests on the same connection.
 
-use std::future::Future;
+use std::future::{poll_fn, Future};
+use std::pin::Pin;
 use std::sync::{Arc, Mutex, PoisonError};
+use std::task::Poll;
 
 use bytes::{Buf, Bytes};
 use h3::server::RequestStream;
@@ -659,15 +661,45 @@ impl web_transport_trait::SendStream for WtSendStream {
 
     async fn write(&mut self, buf: &[u8]) -> Result<usize, Self::Error> {
         self.check_session()?;
-        let state = Arc::clone(&self.state);
-        tokio::select! {
-            res = self.stream.write(buf) => res.map_err(map_write_error),
-            err = state.wait_closed() => {
-                let _ = self.stream.reset(noq::VarInt::from_u64(SESSION_GONE).unwrap_or(noq::VarInt::MAX));
-                self.finished = true;
-                Err(err)
+        // `tokio::select!` between `self.stream.write(buf)` and the close
+        // watch, even `biased`, can lose or duplicate bytes: noq's `write`
+        // commits bytes into the QUIC send buffer synchronously inside
+        // `execute_poll` (moq-noq-1.3.5 send_stream.rs) on the very poll
+        // that returns `Ready`, and `proto::Send::write`/`write_source`
+        // (moq-noq-proto-1.3.5 connection/streams/send.rs and send.rs) is
+        // all-or-nothing per poll: a poll either writes (returns `Ready`
+        // with the committed count) or returns `Err(Blocked)` with no
+        // write attempted at all — there is no state where a poll both
+        // commits bytes and resolves `Pending`. `select!` would still
+        // drop a `Ready(Ok(n))` outcome if the close branch happened to
+        // win the race in the same `poll()` round, reporting the session
+        // closed while `n` bytes were in fact already sent.
+        //
+        // `SendStream::poll_write` is itself poll-based, so poll it
+        // directly and give it priority: report any `Ready` outcome
+        // immediately (every committed byte is observed), and only look
+        // at the session's close state when the stream poll is `Pending`
+        // (by the invariant above, nothing was committed in that case),
+        // which makes the two outcomes mutually exclusive by construction
+        // rather than by race-loser luck.
+        let stream = &mut self.stream;
+        let state = &self.state;
+        let result: Result<usize, WtError> = poll_fn(|cx| {
+            if let Poll::Ready(res) = Pin::new(&mut *stream).poll_write(cx, buf) {
+                return Poll::Ready(res.map_err(map_write_error));
             }
+            let closed = state.wait_closed();
+            let mut closed = std::pin::pin!(closed);
+            closed.as_mut().poll(cx).map(Err)
+        })
+        .await;
+        if result.is_err() {
+            let _ = self
+                .stream
+                .reset(noq::VarInt::from_u64(SESSION_GONE).unwrap_or(noq::VarInt::MAX));
+            self.finished = true;
         }
+        result
     }
 
     fn set_priority(&mut self, order: u8) {
@@ -742,14 +774,41 @@ impl web_transport_trait::RecvStream for WtRecvStream {
             return Ok(Some(n));
         }
         self.check_session()?;
-        let state = Arc::clone(&self.state);
-        tokio::select! {
-            res = self.stream.read(dst) => res.map_err(map_read_error),
-            err = state.wait_closed() => {
-                let _ = self.stream.stop(noq::VarInt::from_u64(SESSION_GONE).unwrap_or(noq::VarInt::MAX));
-                Err(err)
+        // See the comment on `WtSendStream::write`: noq's `read` consumes
+        // already-buffered assembler chunks inside `poll_read_buf`
+        // (moq-noq-1.3.5 recv_stream.rs `poll_read_generic`) on the very
+        // poll that returns `Ready`, atomically with returning the data —
+        // a `Pending` poll is `ReadStatus::Failed(None, Blocked)` with
+        // nothing consumed. `select!` can still drop a `Ready` outcome in
+        // favor of the close branch, discarding bytes the peer already
+        // sent and that this side already removed from the stream's
+        // buffer (they are not re-delivered on a later read). Poll the
+        // stream directly and give it priority for the same mutual-
+        // exclusion reason as the write side.
+        let stream = &mut self.stream;
+        let state = &self.state;
+        let empty = dst.is_empty();
+        let result: Result<Option<usize>, WtError> = poll_fn(|cx| {
+            if let Poll::Ready(res) = Pin::new(&mut *stream).poll_read(cx, dst) {
+                return Poll::Ready(
+                    res.map(|n| match n {
+                        0 if !empty => None,
+                        n => Some(n),
+                    })
+                    .map_err(map_read_error),
+                );
             }
+            let closed = state.wait_closed();
+            let mut closed = std::pin::pin!(closed);
+            closed.as_mut().poll(cx).map(Err)
+        })
+        .await;
+        if result.is_err() {
+            let _ = self
+                .stream
+                .stop(noq::VarInt::from_u64(SESSION_GONE).unwrap_or(noq::VarInt::MAX));
         }
+        result
     }
 
     async fn read_chunk(&mut self, max: usize) -> Result<Option<Bytes>, Self::Error> {
