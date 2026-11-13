@@ -91,7 +91,17 @@ impl VariantStream {
 #[derive(Debug, Clone, Default)]
 pub struct MasterPlaylist {
     variants: Vec<VariantStream>,
-    audio: Vec<AudioRendition>,
+    audio: Vec<AudioEntry>,
+    audio_group_id: Option<String>,
+}
+
+/// One listed audio rendition plus the attributes [`AudioRendition`] does not
+/// carry (kept apart so existing `AudioRendition { .. }` literals keep
+/// compiling and rendering unchanged).
+#[derive(Debug, Clone)]
+struct AudioEntry {
+    rendition: AudioRendition,
+    channels: Option<String>,
 }
 
 /// A separately playable audio-only rendition in an HLS audio group.
@@ -121,7 +131,29 @@ impl MasterPlaylist {
 
     /// Add a separately playable audio-only media playlist.
     pub fn push_audio(&mut self, rendition: AudioRendition) {
-        self.audio.push(rendition);
+        self.audio.push(AudioEntry {
+            rendition,
+            channels: None,
+        });
+    }
+
+    /// Add a separately playable audio-only media playlist that declares its
+    /// `CHANNELS` attribute (e.g. `"2"`), rendered just before `URI`.
+    pub fn push_audio_with_channels(
+        &mut self,
+        rendition: AudioRendition,
+        channels: impl Into<String>,
+    ) {
+        self.audio.push(AudioEntry {
+            rendition,
+            channels: Some(channels.into()),
+        });
+    }
+
+    /// Override the audio `GROUP-ID` (default `"audio"`) used by every
+    /// `EXT-X-MEDIA` entry and by the variants' `AUDIO` attribute.
+    pub fn set_audio_group_id(&mut self, group_id: impl Into<String>) {
+        self.audio_group_id = Some(group_id.into());
     }
 
     /// Number of variants listed.
@@ -138,16 +170,26 @@ impl MasterPlaylist {
         let _ = writeln!(out, "#EXTM3U");
         let _ = writeln!(out, "#EXT-X-VERSION:7");
         let _ = writeln!(out, "#EXT-X-INDEPENDENT-SEGMENTS");
-        for audio in &self.audio {
+        let group = self
+            .audio_group_id
+            .as_deref()
+            .map_or_else(|| "audio".to_owned(), escape_attribute);
+        for entry in &self.audio {
+            let audio = &entry.rendition;
             let language = audio.language.as_ref().map_or_else(String::new, |tag| {
                 format!(",LANGUAGE=\"{}\"", escape_attribute(tag))
             });
+            let channels = entry.channels.as_ref().map_or_else(String::new, |value| {
+                format!(",CHANNELS=\"{}\"", escape_attribute(value))
+            });
             let _ = writeln!(
                 out,
-                "#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"audio\",NAME=\"{}\",DEFAULT={},AUTOSELECT={},URI=\"{}\"{}",
+                "#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"{}\",NAME=\"{}\",DEFAULT={},AUTOSELECT={}{},URI=\"{}\"{}",
+                group,
                 escape_attribute(&audio.name),
                 if audio.default { "YES" } else { "NO" },
                 if audio.default { "YES" } else { "NO" },
+                channels,
                 escape_attribute(&audio.uri),
                 language
             );
@@ -155,7 +197,7 @@ impl MasterPlaylist {
         for variant in &self.variants {
             let mut inf = variant.render_stream_inf();
             if !self.audio.is_empty() {
-                inf.push_str(",AUDIO=\"audio\"");
+                let _ = write!(inf, ",AUDIO=\"{group}\"");
             }
             let _ = writeln!(out, "{inf}");
             let _ = writeln!(out, "{}", variant.uri);
