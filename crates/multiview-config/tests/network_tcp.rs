@@ -170,3 +170,79 @@ segment_ms = 2000
         .to_string()
         .contains("IPv6-first"));
 }
+
+/// Slice 6 (#292): the cutover keys. `cert_file`/`key_file` (the door's own
+/// static certificate) go together, are absolute and exclude `[network.tls]`;
+/// `acme_webroot` is absolute and needs the redirect listener.
+#[test]
+fn slice6_cutover_keys() {
+    let ok = "https_port = 443\nmode = \"direct\"\npublic_host = \"h.example\"\n\
+              cert_file = \"/etc/letsencrypt/live/h.example/fullchain.pem\"\n\
+              key_file = \"/etc/letsencrypt/live/h.example/privkey.pem\"\n\
+              acme_webroot = \"/var/lib/conspect/acme-webroot\"";
+    let n = net(ok);
+    n.validate().unwrap();
+    assert!(matches!(
+        n.static_site_tls(),
+        Some(multiview_config::TlsConfig::Static { .. })
+    ));
+    let back: NetworkConfig = serde_json::from_str(&serde_json::to_string(&n).unwrap()).unwrap();
+    assert_eq!(n, back);
+    rejects("https_port = 443\ncert_file = \"/c.pem\"", "go together");
+    rejects(
+        "https_port = 443\ncert_file = \"c.pem\"\nkey_file = \"/k.pem\"",
+        "absolute",
+    );
+    rejects(
+        "https_port = 443\nmode = \"direct\"\npublic_host = \"h.example\"\nacme_webroot = \"rel\"",
+        "absolute",
+    );
+    rejects(
+        "https_port = 443\nmode = \"direct\"\npublic_host = \"h.example\"\nhttp_redirect_port = 0\nacme_webroot = \"/w\"",
+        "redirect",
+    );
+    rejects("https_port = 443\nacme_webroot = \"/w\"", "redirect");
+    rejects(
+        "https_port = 443\npublic_host = \"h.example\"\ncert_file = \"/c\"\nkey_file = \"/k\"\n\
+         [tls]\nca = \"letsencrypt\"\nchallenge = \"tls-alpn-01\"\ndomains = [\"h.example\"]\nstate_dir = \"/var/lib/conspect/tls\"",
+        "exclusive",
+    );
+    // A config with none of the new keys is unchanged.
+    assert!(net("https_port = 443").static_site_tls().is_none());
+}
+
+#[test]
+fn control_ui_dir_must_be_absolute() {
+    let base = r##"schema_version = 1
+[canvas]
+width = 64
+height = 64
+fps = "25/1"
+pixel_format = "nv12"
+background = "#101014"
+[canvas.color]
+profile = "sdr-bt709-limited"
+[layout]
+kind = "grid"
+columns = ["1fr"]
+rows = ["1fr"]
+areas = ["a"]
+[[outputs]]
+kind = "hls"
+path = "/tmp/ui-dir-test.m3u8"
+codec = "mpeg2video"
+segment_ms = 1000
+[control]
+listen = "[::1]:8080"
+"##;
+    let good =
+        MultiviewConfig::load_from_toml(&format!("{base}ui_dir = \"/var/www/conspect-ui/abc\"\n"))
+            .unwrap();
+    good.validate().unwrap();
+    let bad = MultiviewConfig::load_from_toml(&format!("{base}ui_dir = \"dist\"\n"));
+    let err = match bad {
+        Ok(c) => c.validate().unwrap_err().to_string(),
+        Err(e) => e.to_string(),
+    };
+    assert!(err.contains("ui_dir"), "{err}");
+}
