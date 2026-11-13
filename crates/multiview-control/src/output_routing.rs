@@ -107,6 +107,9 @@ pub struct RoutedLayout {
     pub layout: multiview_core::layout::Layout,
     /// Per cell, in `layout.cells` order: the slate a down cell shows.
     pub slates: Vec<multiview_config::FailoverSlate>,
+    /// The layout's `audio` attribute: what an output carries when it routes
+    /// this layout and its audio follows (§5.1).
+    pub audio: multiview_config::LayoutAudio,
 }
 
 impl RoutedLayout {
@@ -335,11 +338,41 @@ pub trait OutputRouting: Send + Sync {
         video: Option<&RoutedFeed>,
         audio: Option<&RoutedAudio>,
     ) -> Result<AudioPlanCost, PlanRefusal>;
+    /// [`Self::plan_audio`] for a take onto a routed layout whose `audio`
+    /// attribute is `layout_audio` (what `follow` resolves to on it, §5.1).
+    /// The default ignores the attribute (the program mix).
+    ///
+    /// # Errors
+    /// As [`Self::plan_audio`].
+    fn plan_layout_audio(
+        &self,
+        output: &str,
+        video: &RoutedFeed,
+        layout_audio: &multiview_config::LayoutAudio,
+        audio: Option<&RoutedAudio>,
+    ) -> Result<AudioPlanCost, PlanRefusal> {
+        let _ = layout_audio;
+        self.plan_audio(output, Some(video), audio)
+    }
     /// Enqueue an authorized take without waiting.
     ///
     /// # Errors
     /// [`TakeSubmitError`] when it cannot be enqueued.
     fn try_take(&self, take: OutputTakeRequest) -> Result<(), TakeSubmitError>;
+    /// A stored layout changed in the accepted library (ADR-0108 §10.1):
+    /// `Some(body)` is its newly resolved body (outputs on it follow it live,
+    /// at an IDR); `None` means it was deleted or no longer routes (outputs
+    /// on it fall back to Program). Never waits; `false` when the engine
+    /// did not take the change (no run, a full mailbox).
+    fn layout_changed(&self, id: &str, body: Option<LayoutBody>) -> bool {
+        let _ = (id, body);
+        false
+    }
+    /// The layout ids on air or pending on any output, from the latest
+    /// readback (empty with no run).
+    fn routed_layouts(&self) -> Vec<String> {
+        Vec::new()
+    }
     /// The latest readback (`None` before a run published one).
     fn snapshot(&self) -> Option<RoutingLive>;
     /// The outcome stream; `Some` exactly once.
@@ -1009,7 +1042,8 @@ pub async fn persist_route(
     let empty = table.output.is_empty()
         && table.video.is_empty()
         && table.audio.is_empty()
-        && table.subtitle.is_empty();
+        && table.subtitle.is_empty()
+        && table.max_aux_canvases.is_none();
     config.routing = (!empty).then_some(table);
     config
         .validate()

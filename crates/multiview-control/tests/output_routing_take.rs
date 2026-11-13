@@ -128,6 +128,13 @@ fn keys() -> ApiKeyStore {
         "route-layout-secret",
         scoped("route-layout", &["output-1", "NewsOne", "Wide", "a"], None),
     );
+    // May edit the layout and read every source it shows, but may not write
+    // output-1 (the output the layout is on air on).
+    keys.register(
+        "layout-editor",
+        "layout-editor-secret",
+        scoped("layout-editor", &["NewsOne", "a", "bars"], None),
+    );
     keys.register(
         "route-other",
         "route-other-secret",
@@ -146,6 +153,15 @@ struct FakeState {
     live: Option<RoutingLive>,
     /// Plan a layout as over `routing.max_aux_canvases`.
     aux_full: bool,
+    /// Layout changes the control plane reported (id, edited body or None).
+    layout_changes: Vec<(
+        String,
+        Option<multiview_control::output_routing::LayoutBody>,
+    )>,
+    /// Layout ids the engine reports as routed.
+    routed: Vec<String>,
+    /// The layout `audio` attribute the last layout audio plan saw.
+    planned_layout_audio: Option<multiview_config::LayoutAudio>,
 }
 
 struct Fake {
@@ -217,6 +233,31 @@ impl OutputRouting for Fake {
         _audio: Option<&multiview_control::output_routing::RoutedAudio>,
     ) -> Result<multiview_control::output_routing::AudioPlanCost, PlanRefusal> {
         Ok(multiview_control::output_routing::AudioPlanCost::default())
+    }
+    fn plan_layout_audio(
+        &self,
+        _output: &str,
+        _video: &RoutedFeed,
+        layout_audio: &multiview_config::LayoutAudio,
+        _audio: Option<&multiview_control::output_routing::RoutedAudio>,
+    ) -> Result<multiview_control::output_routing::AudioPlanCost, PlanRefusal> {
+        self.state.lock().unwrap().planned_layout_audio = Some(layout_audio.clone());
+        Ok(multiview_control::output_routing::AudioPlanCost::default())
+    }
+    fn layout_changed(
+        &self,
+        id: &str,
+        body: Option<multiview_control::output_routing::LayoutBody>,
+    ) -> bool {
+        self.state
+            .lock()
+            .unwrap()
+            .layout_changes
+            .push((id.to_owned(), body));
+        true
+    }
+    fn routed_layouts(&self) -> Vec<String> {
+        self.state.lock().unwrap().routed.clone()
     }
     fn try_take(&self, take: OutputTakeRequest) -> Result<(), TakeSubmitError> {
         let mut s = self.state.lock().unwrap();
@@ -1769,4 +1810,166 @@ async fn a_stored_layout_routes_to_an_output_with_typed_refusals() {
         problem["detail"].as_str().unwrap().contains("2 of 2"),
         "{problem}"
     );
+}
+
+/// PR 2 (#306): a stored layout's `audio` attribute is what `follow`
+/// resolves to on it (the plan says so and asks the engine with it); an edit
+/// of a layout on air on an output needs Write on that output (403
+/// `routed-layout` otherwise) and reaches the engine live with the newly
+/// resolved body; an edit that no longer routes and a delete tell the engine
+/// to fall the layout's outputs back (no body). A layout routed nowhere is
+/// edited without telling the engine anything.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[allow(clippy::too_many_lines)] // One HTTP scenario with its assertions.
+async fn layout_audio_and_live_edits_of_a_routed_layout() {
+    let dir = tempfile::tempdir().unwrap();
+    let rig = rig(&dir.path().join("boot.toml"), true);
+    let mut silent = layout_body(640, 1.0);
+    silent["audio"] = serde_json::json!("none");
+    store_layout(&rig, "NewsOne", silent);
+    let planned = body_json(
+        send(
+            &rig.router,
+            post(
+                "/api/v1/routing/plan",
+                OPERATOR_TOKEN,
+                None,
+                &body("output-1", serde_json::json!({"layout": "NewsOne"})),
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(planned["cost"]["follow_audio"], "none", "{planned}");
+    assert_eq!(
+        rig.fake.state.lock().unwrap().planned_layout_audio,
+        Some(multiview_config::LayoutAudio::None)
+    );
+    // The take carries the attribute in the resolved body.
+    let resp = send(
+        &rig.router,
+        take(
+            &rig,
+            OPERATOR_TOKEN,
+            "silent-layout",
+            "output-1",
+            serde_json::json!({"layout": "NewsOne"}),
+        ),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::ACCEPTED);
+    let takes = rig.fake.takes();
+    assert_eq!(
+        takes[0].layout.as_ref().unwrap().0.audio,
+        multiview_config::LayoutAudio::None
+    );
+
+    // An edit while nothing routes the layout: no engine change.
+    let current = send(&rig.router, get("/api/v1/layouts/NewsOne", OPERATOR_TOKEN)).await;
+    let tag = support::etag(&current).unwrap();
+    let edit = |token: &str, tag: &str, body: serde_json::Value| {
+        support::put_json(
+            "/api/v1/layouts/NewsOne",
+            token,
+            Some(tag),
+            &serde_json::json!({"name": "NewsOne", "body": body}),
+        )
+    };
+    let resp = send(
+        &rig.router,
+        edit(OPERATOR_TOKEN, &tag, layout_body(640, 1.0)),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let tag = support::etag(&resp).unwrap();
+    assert_eq!(rig.fake.state.lock().unwrap().layout_changes.len(), 0);
+
+    // NewsOne goes on air on output-1.
+    {
+        let mut s = rig.fake.state.lock().unwrap();
+        s.routed = vec!["NewsOne".to_owned()];
+        let mut outputs = HashMap::new();
+        outputs.insert(
+            OUT_B_CONFIG_ID.to_owned(),
+            multiview_control::output_routing::OutputLive {
+                bus: "aux:NewsOne".to_owned(),
+                since_tick: 1,
+                pending: None,
+                degraded: false,
+                audio: None,
+                pending_audio: None,
+                private_audio: false,
+            },
+        );
+        s.live = Some(RoutingLive {
+            outputs,
+            encoders: 2,
+            sessions_in_use: 1,
+            sessions_max: 6,
+            dropped_ticks: 0,
+        });
+    }
+    // An editor without Write on output-1: 403 routed-layout, unchanged.
+    let resp = send(
+        &rig.router,
+        edit(
+            "layout-editor.layout-editor-secret",
+            &tag,
+            layout_body(640, 1.0),
+        ),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    let problem = body_json(resp).await.to_string();
+    assert!(problem.contains("routed-layout"), "{problem}");
+    assert!(!problem.contains("output-1"), "names nothing: {problem}");
+    assert_eq!(rig.fake.state.lock().unwrap().layout_changes.len(), 0);
+
+    // A permitted edit reaches the engine with the new body.
+    let mut edited = layout_body(640, 1.0);
+    edited["audio"] = serde_json::json!({"source": "a"});
+    let resp = send(&rig.router, edit(OPERATOR_TOKEN, &tag, edited)).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let tag = support::etag(&resp).unwrap();
+    {
+        let s = rig.fake.state.lock().unwrap();
+        let (id, body) = s.layout_changes.last().cloned().unwrap();
+        assert_eq!(id, "NewsOne");
+        let body = body.expect("an edited body");
+        assert_eq!(
+            body.0.audio,
+            multiview_config::LayoutAudio::Source("a".into())
+        );
+        assert_eq!(body.0.layout.cells.len(), 2);
+    }
+    // An edit that no longer routes (a translucent cell) falls back.
+    let resp = send(
+        &rig.router,
+        edit(OPERATOR_TOKEN, &tag, layout_body(640, 0.5)),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let tag = support::etag(&resp).unwrap();
+    assert!(rig
+        .fake
+        .state
+        .lock()
+        .unwrap()
+        .layout_changes
+        .last()
+        .is_some_and(|(id, body)| id == "NewsOne" && body.is_none()));
+    // A delete tells the engine too.
+    let n = rig.fake.state.lock().unwrap().layout_changes.len();
+    let resp = send(
+        &rig.router,
+        support::delete_if_match("/api/v1/layouts/NewsOne", support::ADMIN_TOKEN, Some(&tag)),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+    let s = rig.fake.state.lock().unwrap();
+    assert_eq!(s.layout_changes.len(), n + 1);
+    assert!(s
+        .layout_changes
+        .last()
+        .is_some_and(|(id, body)| id == "NewsOne" && body.is_none()));
 }

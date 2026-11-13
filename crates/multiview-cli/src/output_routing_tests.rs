@@ -164,6 +164,8 @@ fn router(
         sent: Arc::new(AtomicU64::new(0)),
         stores: Arc::new(|_: &str| None),
         preview_selection: None,
+        halved: Arc::new(AtomicBool::new(false)),
+        sizing: None,
     };
     let aux = wiring();
     let mirror = AuxWiring {
@@ -174,6 +176,8 @@ fn router(
         sent: Arc::clone(&aux.sent),
         stores: Arc::clone(&aux.stores),
         preview_selection: None,
+        halved: Arc::new(AtomicBool::new(false)),
+        sizing: None,
     };
     let (r, h) = OutputRouter::new(
         RouterConfig {
@@ -436,6 +440,8 @@ fn harness_with(outputs: usize, max: usize, open: Option<OpenFn>, has_preview: b
                 _ => None,
             }),
             preview_selection: None,
+            halved: Arc::new(AtomicBool::new(false)),
+            sizing: None,
         },
         open,
     )
@@ -2107,6 +2113,8 @@ fn audio_harness(outputs: usize, cadence: Rational, open: OpenFn) -> AudioHarnes
             sent: Arc::new(AtomicU64::new(0)),
             stores: Arc::new(move |id: &str| (id == "cam").then(|| Arc::clone(&lookup))),
             preview_selection: None,
+            halved: Arc::new(AtomicBool::new(false)),
+            sizing: None,
         },
         open,
     )
@@ -4211,6 +4219,7 @@ fn layout_bus(id: &str) -> PictureBus {
                 }],
             },
             slates: vec![multiview_config::FailoverSlate::Black],
+            audio: multiview_config::LayoutAudio::default(),
         },
     )))
 }
@@ -4422,4 +4431,151 @@ fn a_re_take_of_an_edited_layout_swaps_the_body_and_requests_an_idr() {
         Some(t + 1),
         "an IDR is requested on the layout's encoder"
     );
+}
+
+/// A layout taken onto output 1, ticked until applied. Returns the tick.
+fn on_layout(x: &mut Harness, bus: &PictureBus) -> u64 {
+    let mut t = 0;
+    x.tick_layouts(t, std::slice::from_ref(bus));
+    x.h.try_take(take("one", 1, bus.clone())).unwrap();
+    while !x
+        .outcomes
+        .try_iter()
+        .any(|o| o.outcome == TakeResult::Applied)
+    {
+        t += 1;
+        x.tick_layouts(t, std::slice::from_ref(bus));
+        assert!(t < 60);
+    }
+    t
+}
+
+/// PR 2 (#306): an edit of a stored layout reaches the routed canvas live,
+/// with no take: the body swaps, the output stays on the layout, an IDR is
+/// requested, the decoders' aux sizing follows the new cells, and no take
+/// outcome is emitted.
+#[test]
+fn a_live_layout_edit_swaps_the_body_without_a_take() {
+    let mut x = harness(2, 6, None);
+    let sizing = crate::display_size::aux_sizing_slot();
+    x.r.aux.sizing = Some(Arc::clone(&sizing));
+    let first = layout_bus("L1");
+    let mut t = on_layout(&mut x, &first);
+    assert_eq!(sizing.load().len(), 1, "the routed cell sizes its decode");
+    for _ in 0..FORCE_FLOOR_TICKS {
+        t += 1;
+        x.tick_layouts(t, std::slice::from_ref(&first));
+    }
+    let edited = layout_bus("L1");
+    let PictureBus::Layout(new) = &edited else {
+        panic!("a layout bus");
+    };
+    x.h.try_layout_change(crate::output_routing::LayoutChange::Edited(new.clone()))
+        .unwrap();
+    t += 1;
+    x.tick_layouts(t, std::slice::from_ref(&edited));
+    let body =
+        x.r.aux
+            .feeds
+            .load()
+            .iter()
+            .find_map(|f| match &f.bus {
+                PictureBus::Layout(l) => Some(Arc::clone(&l.body)),
+                _ => None,
+            })
+            .expect("the layout still composes");
+    assert!(Arc::ptr_eq(&body, &new.body), "the edit is live");
+    assert_eq!(
+        x.r.last_forced.get(&x.r.dynamic[0].key).copied(),
+        Some(t + 1),
+        "an IDR is requested on the layout's encoder"
+    );
+    assert!(
+        x.outcomes.try_iter().next().is_none(),
+        "a live edit is not a take"
+    );
+    assert_eq!(x.h.snapshot().outputs[1].bus, "aux:L1");
+    // An edit of a layout nothing routes is a no-op.
+    let PictureBus::Layout(other) = layout_bus("Other") else {
+        panic!("a layout bus");
+    };
+    x.h.try_layout_change(crate::output_routing::LayoutChange::Edited(other))
+        .unwrap();
+    t += 1;
+    x.tick_layouts(t, std::slice::from_ref(&edited));
+    assert_eq!(x.h.snapshot().aux_canvases, vec!["aux:L1".to_owned()]);
+}
+
+/// PR 2 (#306): a deleted (or no longer routable) layout moves every output
+/// on it back to Program at a RAP, refuses a take still priming onto it, and
+/// frees its canvas and its aux sizing.
+#[test]
+fn a_deleted_layout_falls_its_outputs_back_to_program() {
+    let mut x = harness(3, 6, None);
+    let sizing = crate::display_size::aux_sizing_slot();
+    x.r.aux.sizing = Some(Arc::clone(&sizing));
+    let l1 = layout_bus("L1");
+    let mut t = on_layout(&mut x, &l1);
+    // A second output starts a take onto L1 but has not landed yet: the
+    // canvas is not published this tick, so it stays priming.
+    x.h.try_take(take("two", 2, l1.clone())).unwrap();
+    t += 1;
+    x.tick(t);
+    x.h.try_layout_change(crate::output_routing::LayoutChange::Removed(
+        "L1".to_owned(),
+    ))
+    .unwrap();
+    t += 1;
+    x.tick(t);
+    let mut results = x.results();
+    results.sort_by_key(|r| format!("{r:?}"));
+    assert_eq!(
+        results,
+        vec![
+            TakeResult::Fallback(FallbackReason::AuxFailed),
+            TakeResult::Refused(RefuseReason::Unroutable),
+        ],
+    );
+    for _ in 0..10 {
+        t += 1;
+        x.tick(t);
+    }
+    assert_eq!(x.d.binding_video_key(1), Some(0), "back on Program");
+    assert_eq!(x.h.snapshot().outputs[1].bus, "program");
+    // Its encoder lingers like any unused key, then closes: the canvas and
+    // its aux sizing go with it.
+    for _ in 0..LINGER_TICKS + 5 {
+        t += 1;
+        x.tick(t);
+    }
+    assert_eq!(x.h.snapshot().aux_canvases, Vec::<String>::new());
+    assert_eq!(sizing.load().len(), 0, "no routed cells left to size for");
+    assert_eq!(
+        x.windows_of(0).len(),
+        usize::try_from(t).unwrap(),
+        "Program never missed a window"
+    );
+}
+
+/// PR 2 (#306, §7): while the aux cadence is halved, a routed picture one
+/// tick old is still fresh and a skipped tick is not a hold, so a layout
+/// composed every second tick neither degrades nor falls back.
+#[test]
+fn a_halved_aux_cadence_neither_degrades_nor_falls_back() {
+    let mut x = harness(2, 6, None);
+    let l1 = layout_bus("L1");
+    let mut t = on_layout(&mut x, &l1);
+    x.r.aux.halved.store(true, Ordering::Relaxed);
+    for _ in 0..FALLBACK_AFTER_TICKS * 2 {
+        t += 1;
+        if t % 2 == 0 {
+            x.tick_layouts(t, std::slice::from_ref(&l1));
+        } else {
+            x.tick(t);
+        }
+        assert!(!x.h.snapshot().outputs[1].degraded, "tick {t}");
+    }
+    assert!(x.outcomes.try_iter().next().is_none(), "no fallback");
+    assert_eq!(x.h.snapshot().outputs[1].bus, "aux:L1");
+    assert!(x.h.snapshot().aux_halved);
 }

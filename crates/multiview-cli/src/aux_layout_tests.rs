@@ -116,6 +116,7 @@ fn routed(layout: Layout) -> Arc<RoutedLayout> {
         id: layout.name.clone(),
         layout,
         slates,
+        audio: multiview_config::LayoutAudio::default(),
     })
 }
 
@@ -235,6 +236,7 @@ fn a_dead_or_undrawable_cell_shows_its_slate_and_never_blocks() {
         id: "x".to_owned(),
         layout: layout.clone(),
         slates: slates.clone(),
+        audio: multiview_config::LayoutAudio::default(),
     });
     let mut canvas = LayoutCanvas::new(Arc::clone(&body), spec(W, H)).unwrap();
     let ours = canvas.compose(&stores.lookup(), pts).unwrap();
