@@ -65,7 +65,10 @@ pub const OPEN_QUEUE: usize = 4;
 /// Reaper queue capacity; full = the handle is dropped unjoined (counted).
 pub const REAPER_QUEUE: usize = 8;
 /// Largest gap a live-opened worker fills with its last canvas.
-pub const MAX_GAP_FILL_TICKS: u64 = 8;
+/// Sized to cover a full consumer substitution gap (`FRAME_SUBSTITUTION_LIMIT`
+/// = 8 in the pipeline) on top of a full worker queue (`WORKER_QUEUE_TICKS` = 4)
+/// and the offers dropped meanwhile, so a transient stall never fails a key.
+pub const MAX_GAP_FILL_TICKS: u64 = 24;
 /// Live-opened workers' event queue to the consumer.
 const DYNAMIC_EVENT_QUEUE: usize = 64;
 const NO_FORCE: u64 = u64::MAX;
@@ -572,6 +575,12 @@ struct DynamicKey {
     /// Consecutive ticks this key was offered a frame with no event from its
     /// worker since; reset by every event. `WEDGED_ENCODER_TICKS` = wedged.
     silent: u32,
+    /// Consecutive offers to this key's worker refused (`Overloaded`); reset
+    /// by an accepted offer. Counted per key, never per bus: a healthy
+    /// sibling key on the same bus must not hide a starved one.
+    /// `DEGRADED_AFTER_TICKS` marks its outputs degraded;
+    /// `FALLBACK_AFTER_TICKS` closes the key (its outputs fall back).
+    starved: u64,
 }
 
 struct PendingOpen {
@@ -857,6 +866,58 @@ impl OutputRouter {
                     frame: Arc::clone(canvas),
                 })));
             feed.slot.composed.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// Substitute every tick in `ticks` on the Clean bus with its own last
+    /// pre-bake frame, exactly like Program's base-worker substitution:
+    /// call on the bake consumer BEFORE [`Self::publish_clean`]/[`Self::on_tick`]
+    /// for the surviving tick, with the SAME range the base-worker
+    /// substitution loop computes, when a consumer stall sheds ticks from
+    /// the hot queue. Without this, a Clean live encoder would see only
+    /// surviving ticks and rely on its own `GapFill` (bounded by
+    /// [`MAX_GAP_FILL_TICKS`]) to absorb a consumer gap — which, combined
+    /// with any dropped offers, can exceed that bound and fail the key.
+    ///
+    /// For each Clean dynamic key with a last-fed canvas, offers
+    /// `BakedTick { tick, canvas: last_fed }` (non-blocking, like
+    /// [`Self::feed`]) for every tick in `ticks`, in increasing order, and
+    /// stops at the first refused offer (counted as starvation; the rest of
+    /// the gap is filled by the key's own `GapFill`, whose bound covers a
+    /// full substitution gap plus a full queue). `feed()` then offers only
+    /// the surviving tick. Does nothing (one bool check) unless Clean is
+    /// active. Never blocks.
+    pub(crate) fn substitute_clean(&mut self, ticks: std::ops::Range<u64>) {
+        if !self.clean_active {
+            return;
+        }
+        for d in &mut self.dynamic {
+            if d.bus != PictureBus::Clean {
+                continue;
+            }
+            let Some(worker) = d.worker.as_ref() else {
+                continue;
+            };
+            let Some(canvas) = d.last_fed.clone() else {
+                continue;
+            };
+            // Stop at the first refused offer: the ticks after it stay
+            // visible as a gap the key's own `GapFill` fills (bounded) once
+            // its queue drains, and the refusal counts toward starvation.
+            for tick in ticks.clone() {
+                match worker.offer(BakedTick {
+                    tick,
+                    canvas: Arc::clone(&canvas),
+                }) {
+                    Ok(()) => d.starved = 0,
+                    Err(OfferRejection::Overloaded) => {
+                        d.starved = d.starved.saturating_add(1);
+                        break;
+                    }
+                    // `feed` closes an ended worker on this same tick.
+                    Err(OfferRejection::Ended) => break,
+                }
+            }
         }
     }
 
@@ -1263,6 +1324,7 @@ impl OutputRouter {
                 lost,
                 generation,
                 silent: 0,
+                starved: 0,
             });
             // The first offer (frame T, an IDR) is made by `feed` this same
             // tick, after the key exists. The move is requested once the key's
@@ -1847,7 +1909,11 @@ impl OutputRouter {
     }
 
     /// Feed every live-opened encoder its bus's frame for this tick (hold
-    /// the last one when none is new), counting held ticks per bus.
+    /// the last one when none is new), counting held ticks per bus (picture
+    /// freshness) and refused offers per KEY (`DynamicKey::starved`): a live
+    /// encoder that never drains its input queue degrades and its key is
+    /// closed (outputs fall back) even though its picture bus (Clean
+    /// included) is published fresh every tick by the bake consumer.
     fn feed(&mut self, tick: u64, dispatcher: &mut RenditionDispatcher) {
         let mut fresh_buses: Vec<(PictureBus, bool)> = Vec::new();
         let mut dead: Vec<usize> = Vec::new();
@@ -1861,20 +1927,39 @@ impl OutputRouter {
                 d.last_aux_tick = Some(frame.tick);
                 d.last_fed = Some(Arc::clone(&frame.frame));
             }
-            fresh_buses.push((d.bus.clone(), fresh));
             let (Some(canvas), Some(worker)) = (d.last_fed.clone(), d.worker.as_ref()) else {
+                // No canvas to offer yet: nothing was dropped, so this is
+                // not (yet) a held tick for the bus beyond slot freshness.
+                fresh_buses.push((d.bus.clone(), fresh));
                 continue;
             };
             // Never blocks: a full queue drops and the worker gap-fills.
-            let ended = matches!(
-                worker.offer(BakedTick { tick, canvas }),
-                Err(OfferRejection::Ended)
-            );
+            let offer_result = worker.offer(BakedTick { tick, canvas });
+            let ended = matches!(offer_result, Err(OfferRejection::Ended));
+            // The bus's health is its picture's freshness; this KEY's
+            // encoder refusing frames is counted on the key itself, so a
+            // healthy sibling key on the same bus cannot reset it.
+            let was_degraded = d.starved >= DEGRADED_AFTER_TICKS;
+            match offer_result {
+                Ok(()) => d.starved = 0,
+                Err(OfferRejection::Overloaded) => d.starved = d.starved.saturating_add(1),
+                Err(OfferRejection::Ended) => {}
+            }
+            if was_degraded != (d.starved >= DEGRADED_AFTER_TICKS) {
+                self.dirty = true;
+            }
+            fresh_buses.push((d.bus.clone(), fresh));
             d.silent = d.silent.saturating_add(1);
             // A panicked/exited worker, or one that emits nothing while fed
             // (wedged), would freeze its outputs forever: close the key so
             // they fall back to Program (Fallback(EncoderFailed)).
-            if ended || worker.is_finished() || d.silent >= WEDGED_ENCODER_TICKS {
+            // A key starved for FALLBACK_AFTER_TICKS (it never drains its
+            // queue) is closed the same way.
+            if ended
+                || worker.is_finished()
+                || d.silent >= WEDGED_ENCODER_TICKS
+                || d.starved >= FALLBACK_AFTER_TICKS
+            {
                 dead.push(d.key);
             }
         }
@@ -2058,7 +2143,11 @@ impl OutputRouter {
                 degraded: self
                     .health
                     .get(&o.bus)
-                    .is_some_and(|h| h.held >= DEGRADED_AFTER_TICKS),
+                    .is_some_and(|h| h.held >= DEGRADED_AFTER_TICKS)
+                    || self
+                        .dynamic
+                        .iter()
+                        .any(|d| d.key == o.key && d.starved >= DEGRADED_AFTER_TICKS),
                 audio: self
                     .audio
                     .as_ref()

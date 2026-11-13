@@ -427,15 +427,18 @@ mod tests {
 
     #[test]
     fn picture_bus_names_match_the_config_feed_names() {
+        // Clean is now a routable picture bus (behaviour intentionally
+        // changed by #305): it joins the accepted feeds below instead of
+        // being refused. Only an actual layout feed is still unroutable.
         for feed in [
             VideoFeed::PROGRAM,
             VideoFeed::Bus(OutputBus::Preview),
+            VideoFeed::Bus(OutputBus::Clean),
             VideoFeed::Source("cam-1".to_owned()),
         ] {
             let bus = PictureBus::try_from(&feed).unwrap();
             assert_eq!(bus.as_str(), feed.picture_bus());
         }
-        assert!(PictureBus::try_from(&VideoFeed::Bus(OutputBus::Clean)).is_err());
         assert!(PictureBus::try_from(&VideoFeed::Layout("l".to_owned())).is_err());
     }
 
