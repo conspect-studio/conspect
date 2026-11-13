@@ -168,7 +168,7 @@ Before telling the CA to validate, the engine checks that the TXT record is visi
 * `auto` (default): send one query to documentation addresses where nothing listens
   (`192.0.2.1`, `2001:db8::1`). Any answer means the network intercepts port 53, and the engine
   uses DoH; otherwise it asks the authoritative servers. The journal says which (`acme: DNS-01
-  confirmation via ...`), and the choice is reused for 10 minutes.
+  confirmation via ...`), and the probe runs once per issuance attempt.
 
 **Interception symptoms.** `dns-propagation-timeout` after the full `propagation_timeout_s` while
 the record is visible in the Cloudflare dashboard, and `dig @<cloudflare-ns> _acme-challenge.<name>

@@ -330,7 +330,8 @@ page alone.
   to `cloudflare-dns.com`, through the screened egress client). Trade-off: DoH is a resolver's
   view, not a check of each authoritative server; it is Cloudflare's own resolver, adjacent to the
   authoritative servers of a Cloudflare zone, and the challenge TTL is 60 s. The verdict is
-  cached per provider for 10 minutes.
+  probed once per issuance attempt (the provider is rebuilt with the credential each attempt;
+  within one attempt it is reused for at most 10 minutes).
 * `TLS-ALPN-01` (RFC 8737). Answered on TCP 443: a ClientHello offering only `acme-tls/1` gets the
   challenge certificate (built with `rcgen`'s `CustomExtension::new_acme_identifier`), in both
   states, before any real certificate exists. It needs the CA to reach TCP 443 of the host.
@@ -432,7 +433,7 @@ wiring, the `multiview tls` CLI and the setup routes are PR B (next section).
   the fallback for every env-var name.
 * Cleanup: every attempt runs inside a 10 min timeout. The aftermath runs after the attempt, outside
   that timeout, under its own total cap (60 s): ALPN challenges are removed at once, then published
-  TXT records are removed (30 s total, 30 s per call), then, after a failure, the placed order's
+  TXT records are removed (30 s in total, each call also capped at 30 s), then, after a failure, the placed order's
   still-pending authorizations are deactivated (30 s total, 10 s per call). A `Shutdown` cuts the
   aftermath short. A `Shutdown` during the attempt runs only ALPN removal and at most 1 s of TXT
   removal, with no CA call. `AcmeHandle` drop still detaches the thread after 2 s, so process

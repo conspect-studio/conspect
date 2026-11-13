@@ -544,7 +544,7 @@ pub fn offline_status(
         let meta = multiview_control::acme::stored_meta(&tls.state_dir).map_err(|e| {
             anyhow::anyhow!(
                 "stored certificate in {} unreadable ({})",
-                tls.state_dir.display(),
+                shown(&tls.state_dir),
                 e.as_reason()
             )
         })?;
