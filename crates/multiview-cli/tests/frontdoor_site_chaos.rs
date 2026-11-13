@@ -109,6 +109,9 @@ fn build_drive() -> CompositorDrive<Nv12Image> {
     .unwrap()
 }
 
+// `max_late_ms` is reported (Debug) for the log, not asserted (RULES: no
+// tight timing bounds on loaded runners).
+#[allow(dead_code)]
 #[derive(Debug)]
 struct ClockRun {
     ticks: u64,
@@ -453,12 +456,17 @@ key_file = "{key}"
         loaded.repeats,
         idle.repeats
     );
-    assert!(downloads.load(Ordering::Relaxed) >= 1, "the door served downloads");
-    assert!(redirects.load(Ordering::Relaxed) >= 1, "the redirect served");
+    assert!(
+        downloads.load(Ordering::Relaxed) >= 1,
+        "the door served downloads"
+    );
+    assert!(
+        redirects.load(Ordering::Relaxed) >= 1,
+        "the redirect served"
+    );
     assert!(
         rss_loaded.saturating_sub(rss_before) < RSS_BOUND_KB,
-        "{} stalled 4 MiB downloads must not be buffered: rss {rss_before} -> {rss_loaded} kB",
-        STALLED
+        "{STALLED} stalled 4 MiB downloads must not be buffered: rss {rss_before} -> {rss_loaded} kB"
     );
     let fd_door = door;
     client_rt.shutdown_timeout(Duration::from_secs(2));

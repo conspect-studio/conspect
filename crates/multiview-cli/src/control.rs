@@ -782,10 +782,11 @@ where
         Some(tls) => {
             #[cfg(unix)]
             let material = match static_source.as_ref() {
-                Some((_, source)) => multiview_control::rustls_material_from_source(Arc::clone(
-                    source,
-                )
-                    as Arc<dyn multiview_control::certificate_source::CertificateSource>),
+                Some((_, source)) => {
+                    let source: Arc<dyn multiview_control::certificate_source::CertificateSource> =
+                        source.clone();
+                    multiview_control::rustls_material_from_source(source)
+                }
                 None => multiview_control::load_tls_material(tls),
             };
             #[cfg(not(unix))]
@@ -850,9 +851,8 @@ where
     #[cfg(all(feature = "tls", unix))]
     let site = match static_source {
         Some(source) => Some(
-            multiview_control::site_server_config(source).map_err(|e| {
-                std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string())
-            })?,
+            multiview_control::site_server_config(source)
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?,
         ),
         None => None,
     };

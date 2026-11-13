@@ -133,9 +133,7 @@ fn main() -> ExitCode {
     // clear `LISTEN_FDS`/`LISTEN_PID` BEFORE the runtime starts any thread
     // (mutating the environment is not thread-safe). The front door claims
     // them when `run` starts it; without activation this is a no-op.
-    multiview_cli::frontdoor::set_inherited_sockets(
-        multiview_frontdoor::ListenSockets::from_env(),
-    );
+    multiview_cli::frontdoor::set_inherited_sockets(multiview_frontdoor::ListenSockets::from_env());
     match tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()

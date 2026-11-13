@@ -50,7 +50,10 @@ fn leaf(source: &StaticCertificateSource) -> Vec<u8> {
 async fn wait_for(source: &StaticCertificateSource, want: &[u8]) {
     let deadline = Instant::now() + Duration::from_secs(5);
     while leaf(source) != want {
-        assert!(Instant::now() < deadline, "the renewed certificate never loaded");
+        assert!(
+            Instant::now() < deadline,
+            "the renewed certificate never loaded"
+        );
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
 }
@@ -66,10 +69,8 @@ async fn a_certbot_style_renewal_is_served_without_a_restart() {
     let source = Arc::new(static_certificate_source(&tls).unwrap());
     assert_eq!(leaf(&source), first);
     // The plain listener's material reads the same source per handshake.
-    let _material = rustls_material_from_source(
-        Arc::clone(&source) as Arc<dyn CertificateSource>
-    )
-    .unwrap();
+    let dyn_source: Arc<dyn CertificateSource> = source.clone();
+    let _material = rustls_material_from_source(dyn_source).unwrap();
     let task = spawn_static_certificate_reload(
         tls.clone(),
         Arc::clone(&source),

@@ -90,7 +90,7 @@ impl UiDir {
                     continue;
                 };
                 let data = std::fs::read(&path)?;
-                total = total.saturating_add(data.len() as u64);
+                total = total.saturating_add(u64::try_from(data.len()).unwrap_or(u64::MAX));
                 if files.len() >= UI_DIR_MAX_FILES || total > UI_DIR_MAX_BYTES {
                     return Err(std::io::Error::other(format!(
                         "control.ui_dir {} is larger than {UI_DIR_MAX_FILES} files / {UI_DIR_MAX_BYTES} bytes",
@@ -268,7 +268,10 @@ fn entity_tag(sha256: &[u8; 32], gzip: bool) -> Option<HeaderValue> {
 /// `If-None-Match` matches either representation's tag (a client that
 /// cached the gzip copy and one that cached the identity copy both get 304).
 fn if_none_match(headers: &HeaderMap, sha256: &[u8; 32]) -> bool {
-    let Some(value) = headers.get(header::IF_NONE_MATCH).and_then(|v| v.to_str().ok()) else {
+    let Some(value) = headers
+        .get(header::IF_NONE_MATCH)
+        .and_then(|v| v.to_str().ok())
+    else {
         return false;
     };
     let plain = entity_tag(sha256, false);
@@ -276,8 +279,12 @@ fn if_none_match(headers: &HeaderMap, sha256: &[u8; 32]) -> bool {
     value.split(',').map(str::trim).any(|candidate| {
         let candidate = candidate.strip_prefix("W/").unwrap_or(candidate);
         candidate == "*"
-            || plain.as_ref().is_some_and(|t| t.as_bytes() == candidate.as_bytes())
-            || gz.as_ref().is_some_and(|t| t.as_bytes() == candidate.as_bytes())
+            || plain
+                .as_ref()
+                .is_some_and(|t| t.as_bytes() == candidate.as_bytes())
+            || gz
+                .as_ref()
+                .is_some_and(|t| t.as_bytes() == candidate.as_bytes())
     })
 }
 

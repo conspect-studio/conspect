@@ -133,7 +133,7 @@ async fn spa_caching_etag_gzip_and_missing_assets() {
     let again = send(&h.router, get("/", &[("if-none-match", &etag)])).await;
     assert_eq!(again.status(), StatusCode::NOT_MODIFIED);
     assert_eq!(again.headers()[header::CACHE_CONTROL], "no-cache");
-    assert!(body_bytes(again).await.is_empty());
+    assert_eq!(body_bytes(again).await, Vec::<u8>::new());
     // A deep link serves the same document with the same validator.
     let deep = send(&h.router, get("/layouts/new", &[])).await;
     assert_eq!(deep.headers()[header::ETAG].to_str().unwrap(), etag);
@@ -164,7 +164,10 @@ async fn spa_caching_etag_gzip_and_missing_assets() {
     assert_eq!(body_bytes(identity).await, on_disk);
     let gz = send(&h.router, get(&path, &[("accept-encoding", "gzip, br")])).await;
     assert_eq!(gz.headers()[header::CONTENT_ENCODING], "gzip");
-    assert!(gz.headers()[header::ETAG].to_str().unwrap().ends_with("-gz\""));
+    assert!(gz.headers()[header::ETAG]
+        .to_str()
+        .unwrap()
+        .ends_with("-gz\""));
     let compressed = body_bytes(gz).await;
     assert!(compressed.len() < on_disk.len() / 2);
     let mut inflated = Vec::new();
@@ -204,5 +207,5 @@ async fn spa_caching_etag_gzip_and_missing_assets() {
         head.headers()[header::CONTENT_LENGTH].to_str().unwrap(),
         on_disk.len().to_string()
     );
-    assert!(body_bytes(head).await.is_empty());
+    assert_eq!(body_bytes(head).await, Vec::<u8>::new());
 }

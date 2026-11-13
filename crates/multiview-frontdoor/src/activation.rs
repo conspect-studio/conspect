@@ -197,16 +197,29 @@ mod tests {
     fn matches_by_type_and_port_and_never_port_zero() {
         let t = TcpListener::bind("[::1]:0").unwrap();
         let u = UdpSocket::bind("[::1]:0").unwrap();
-        let (tp, up) = (t.local_addr().unwrap().port(), u.local_addr().unwrap().port());
+        let (tp, up) = (
+            t.local_addr().unwrap().port(),
+            u.local_addr().unwrap().port(),
+        );
         let mut s = ListenSockets::empty();
         s.push_tcp(t);
         s.push_udp(u);
         assert!(s.take_tcp("[::]:0".parse().unwrap()).is_none());
-        assert!(s.take_udp(SocketAddr::new("::".parse().unwrap(), tp)).is_none() || tp == up);
-        let got = s.take_tcp(SocketAddr::new("::".parse().unwrap(), tp)).unwrap();
+        assert!(
+            s.take_udp(SocketAddr::new("::".parse().unwrap(), tp))
+                .is_none()
+                || tp == up
+        );
+        let got = s
+            .take_tcp(SocketAddr::new("::".parse().unwrap(), tp))
+            .unwrap();
         assert_eq!(got.local_addr().unwrap().port(), tp);
-        assert!(s.take_tcp(SocketAddr::new("::".parse().unwrap(), tp)).is_none());
-        assert!(s.take_udp(SocketAddr::new("::".parse().unwrap(), up)).is_some());
+        assert!(s
+            .take_tcp(SocketAddr::new("::".parse().unwrap(), tp))
+            .is_none());
+        assert!(s
+            .take_udp(SocketAddr::new("::".parse().unwrap(), up))
+            .is_some());
         assert!(s.is_empty());
     }
 }

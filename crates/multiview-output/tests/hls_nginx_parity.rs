@@ -9,7 +9,7 @@
 //! `ngx_http_range_filter_module`, `ngx_http_not_modified_filter_module`):
 //! * `ETag: "<mtime hex>-<size hex>"`, `Last-Modified` from the mtime;
 //! * `If-None-Match` match -> `304` with the validators and `Cache-Control`
-//!   (the `always` add_header), no body; `If-Modified-Since` equal -> `304`;
+//!   (the `always` `add_header`), no body; `If-Modified-Since` equal -> `304`;
 //! * a single range -> `206` + `Content-Range: bytes a-b/len`; an
 //!   unsatisfiable one -> `416` + `Content-Range: bytes */len`;
 //! * `If-Range` that does not match the current `ETag` -> the full `200`.
@@ -331,7 +331,10 @@ fn table(f: &Fixture) -> Vec<Row> {
             request: vec![(header::ORIGIN, s("https://receiver.example"))],
             status: StatusCode::NO_CONTENT,
             expect: vec![
-                (header::ACCESS_CONTROL_ALLOW_METHODS, s("GET, HEAD, OPTIONS")),
+                (
+                    header::ACCESS_CONTROL_ALLOW_METHODS,
+                    s("GET, HEAD, OPTIONS"),
+                ),
                 (
                     header::ACCESS_CONTROL_ALLOW_HEADERS,
                     s("Content-Type, Range, Accept-Encoding"),

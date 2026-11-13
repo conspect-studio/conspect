@@ -413,7 +413,8 @@ fn if_range_matches(
     match headers.get(header::IF_RANGE) {
         None => true,
         Some(value) => {
-            Some(value) == etag || (!value.as_bytes().starts_with(b"\"") && Some(value) == last_modified)
+            Some(value) == etag
+                || (!value.as_bytes().starts_with(b"\"") && Some(value) == last_modified)
         }
     }
 }

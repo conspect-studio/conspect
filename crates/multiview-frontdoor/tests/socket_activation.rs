@@ -16,6 +16,7 @@
 //! 3. `without_activation_the_door_binds_itself`: no inherited sockets, the
 //!    same calls bind their own (the non-activated path is unchanged).
 #![allow(
+    clippy::too_many_lines,
     clippy::unwrap_used,
     clippy::expect_used,
     clippy::panic,
@@ -94,11 +95,11 @@ fn start_door(
 /// `real_systemd_socket_activate_hands_tcp_redirect_and_udp_to_the_door`.
 #[test]
 fn activation_child() {
-    let Some(ports) = std::env::var_os(CHILD_ENV) else {
+    let Some(spec) = std::env::var_os(CHILD_ENV) else {
         return;
     };
-    let ports = ports.into_string().unwrap();
-    let mut parts = ports.splitn(3, ',');
+    let spec = spec.into_string().unwrap();
+    let mut parts = spec.splitn(3, ',');
     let https: u16 = parts.next().unwrap().parse().unwrap();
     let redirect: u16 = parts.next().unwrap().parse().unwrap();
     let stop = std::path::PathBuf::from(parts.next().unwrap());
@@ -132,17 +133,21 @@ fn activation_child() {
 #[test]
 fn real_systemd_socket_activate_hands_tcp_redirect_and_udp_to_the_door() {
     use std::process::{Command, Stdio};
-    let tool = ["/usr/bin/systemd-socket-activate", "/bin/systemd-socket-activate"]
-        .into_iter()
-        .find(|p| std::path::Path::new(p).exists())
-        .expect("systemd-socket-activate is installed (package `systemd`)");
+    let tool = [
+        "/usr/bin/systemd-socket-activate",
+        "/bin/systemd-socket-activate",
+    ]
+    .into_iter()
+    .find(|p| std::path::Path::new(p).exists())
+    .expect("systemd-socket-activate is installed (package `systemd`)");
     let https = free_port();
     let redirect = free_port();
     let exe = std::env::current_exe().unwrap();
     // systemd-socket-activate binds the sockets itself (as root does for
     // conspect.socket) and execs the command with LISTEN_FDS=3 and
     // LISTEN_PID = the exec'd pid. `-d` makes the following -l datagram.
-    let stop = std::env::temp_dir().join(format!("fd-activation-stop-{}-{https}", std::process::id()));
+    let stop =
+        std::env::temp_dir().join(format!("fd-activation-stop-{}-{https}", std::process::id()));
     let _ = std::fs::remove_file(&stop);
     // `--datagram` applies to every --listen of one invocation, so the TCP
     // sockets come from an outer activator and the UDP one from an inner
@@ -159,7 +164,12 @@ fn real_systemd_socket_activate_hands_tcp_redirect_and_udp_to_the_door() {
             stop.display()
         ))
         .arg(exe)
-        .args(["--exact", "activation_child", "--nocapture", "--test-threads=1"])
+        .args([
+            "--exact",
+            "activation_child",
+            "--nocapture",
+            "--test-threads=1",
+        ])
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit())
@@ -176,14 +186,19 @@ fn real_systemd_socket_activate_hands_tcp_redirect_and_udp_to_the_door() {
         }
     };
     first.write_all(b"GET /first HTTP/1.1\r\n\r\n").unwrap();
-    first.set_read_timeout(Some(Duration::from_secs(60))).unwrap();
+    first
+        .set_read_timeout(Some(Duration::from_secs(60)))
+        .unwrap();
     let mut out = std::io::BufReader::new(child.stdout.take().unwrap());
     let mut ready = String::new();
     let deadline = Instant::now() + Duration::from_secs(60);
     while !ready.contains("READY ") {
         ready.clear();
         assert!(Instant::now() < deadline, "child never became ready");
-        assert!(out.read_line(&mut ready).unwrap() > 0, "child exited before READY");
+        assert!(
+            out.read_line(&mut ready).unwrap() > 0,
+            "child exited before READY"
+        );
     }
     assert!(
         ready
@@ -202,11 +217,15 @@ fn real_systemd_socket_activate_hands_tcp_redirect_and_udp_to_the_door() {
     // The redirect: a real 301 from the inherited port-80 socket.
     let mut s = TcpStream::connect(("::1", redirect)).unwrap();
     s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
-    s.write_all(b"GET /x HTTP/1.1\r\nHost: evil\r\n\r\n").unwrap();
+    s.write_all(b"GET /x HTTP/1.1\r\nHost: evil\r\n\r\n")
+        .unwrap();
     let mut body = String::new();
     s.read_to_string(&mut body).unwrap();
     assert!(body.starts_with("HTTP/1.1 301"), "{body}");
-    assert!(body.contains("Location: https://door.example/x\r\n"), "{body}");
+    assert!(
+        body.contains("Location: https://door.example/x\r\n"),
+        "{body}"
+    );
 
     // The TCP door: accepted and classified (a plaintext byte is closed).
     let mut t = TcpStream::connect(("::1", https)).unwrap();
@@ -231,7 +250,10 @@ fn real_systemd_socket_activate_hands_tcp_redirect_and_udp_to_the_door() {
     let mut stats = String::new();
     while !stats.contains("STATS ") {
         stats.clear();
-        assert!(out.read_line(&mut stats).unwrap() > 0, "child exited before STATS");
+        assert!(
+            out.read_line(&mut stats).unwrap() > 0,
+            "child exited before STATS"
+        );
     }
     let field = |name: &str| -> u64 {
         stats
@@ -310,7 +332,10 @@ fn a_restart_keeps_the_sockets() {
     );
     let deadline = Instant::now() + Duration::from_secs(5);
     while b.stats().snapshot().received == 0 {
-        assert!(Instant::now() < deadline, "the queued datagram was never read");
+        assert!(
+            Instant::now() < deadline,
+            "the queued datagram was never read"
+        );
         std::thread::sleep(Duration::from_millis(20));
     }
     assert!(b.stats().snapshot().tcp_accepted >= 1);
@@ -366,7 +391,10 @@ fn an_inherited_reuseport_pair_keeps_validated_flow_steering() {
     while door.stats().snapshot().steered_peers != 1
         || door.stats().snapshot().steering_updates <= before.steering_updates
     {
-        assert!(Instant::now() < deadline, "the steering program never attached");
+        assert!(
+            Instant::now() < deadline,
+            "the steering program never attached"
+        );
         std::thread::sleep(Duration::from_millis(5));
     }
     let mut short = vec![7u8; 60];
@@ -380,8 +408,16 @@ fn an_inherited_reuseport_pair_keeps_validated_flow_steering() {
     loop {
         let s = door.stats().snapshot();
         if s.received >= before.received + 100 {
-            assert_eq!(s.received_established_socket - before.received_established_socket, 50, "{s:?}");
-            assert_eq!(s.received_listener_socket - before.received_listener_socket, 50, "{s:?}");
+            assert_eq!(
+                s.received_established_socket - before.received_established_socket,
+                50,
+                "{s:?}"
+            );
+            assert_eq!(
+                s.received_listener_socket - before.received_listener_socket,
+                50,
+                "{s:?}"
+            );
             break;
         }
         assert!(Instant::now() < deadline, "datagrams never arrived: {s:?}");

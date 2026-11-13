@@ -537,7 +537,7 @@ supported as `[network] mode = "behind_proxy"`:
 
 | Target | How 80/443 are bound |
 | --- | --- |
-| Linux systemd (mda001) | systemd socket activation: `conspect.socket` with `ListenStream=[::]:443`, `ListenStream=[::]:80`, `ListenDatagram=[::]:443`, `BindIPv6Only=both`, `ReceiveBuffer=8M`, `FileDescriptorName=` per socket. The service keeps `User=operations` and needs no capability. Fallback: `AmbientCapabilities=CAP_NET_BIND_SERVICE` when started without the socket unit |
+| Linux systemd (mda001) | systemd socket activation: `conspect.socket` with `ListenStream=[::]:443`, `ListenStream=[::]:80`, `ListenDatagram=[::]:443` twice with `ReusePort=yes` (the validated-flow steering pair, as built in slice 6), `BindIPv6Only=both`, `ReceiveBuffer=8M`; sockets are matched by type and port, so no `FileDescriptorName=` is needed. The service keeps `User=operations` and needs no capability. Fallback: `AmbientCapabilities=CAP_NET_BIND_SERVICE` when started without the socket unit |
 | Restarts | with socket activation the sockets survive an engine restart: the kernel queues TCP SYNs (backlog) and UDP datagrams (rcvbuf) while the engine restarts, so a browser's retry lands on the new process instead of a refused port. QUIC connections still die with the process (keys are in memory); clients reconnect |
 | Container | `--cap-add NET_BIND_SERVICE` is not needed in Docker when the container runs as root inside its namespace. Rootless: `net.ipv4.ip_unprivileged_port_start=443` in the container sysctls, or map host 443 to 8443. `deploy/compose.yaml` publishes `443/tcp`, `443/udp`, `80/tcp` |
 | macOS | reported to allow unprivileged binds below 1024 since macOS 10.14 (unverified: no primary Apple source found); launchd `Sockets` can pass the sockets in either way. The office matrix checks it on mst001 before slice 4 closes |
@@ -1143,3 +1143,56 @@ the engine's own TLS. The str0m ICE-TCP consumer and the browser ladder are PR2 
   no SNI fail the handshake with no certificate presented; the published name still works).
 * **Not in this PR**: a real-browser ICE-TCP check (browsers gather active TCP candidates
   themselves); the deferred items above other than the str0m consumer.
+
+### Slice 6 as built (issue #292)
+
+The engine serves TCP 443, TCP 80 and UDP 443 on mda001; nginx is removed by the
+[front-door cutover runbook](../runbooks/front-door-cutover.md).
+
+* **Socket activation** (`multiview-frontdoor::activation`, `deploy/systemd/conspect.socket`):
+  `main` adopts `LISTEN_FDS` (`listenfd`, which checks each descriptor's type, sets close-on-exec
+  and clears `LISTEN_PID`/`LISTEN_FDS`) before the Tokio runtime exists, so the environment is
+  never changed while another thread reads it. Each inherited socket is matched to its listener
+  by **type and port** (TCP `tcp_port`/`https_port` = the TCP door, TCP `http_redirect_port` =
+  the redirect, UDP `https_port` = the UDP door); an unmatched socket is logged. Any listener
+  without an inherited socket binds its own, so the non-activated path is unchanged.
+  `FrontDoor::start_with` / `start_tcp_with` / `start_redirect_with` take the inherited sockets.
+* **Deviation, UDP pair**: section 9 had one `ListenDatagram=`. Slice 3a's validated-flow
+  steering needs a `SO_REUSEPORT` pair whose members share an owner, so the unit passes **two**
+  UDP 443 sockets with `ReusePort=yes`, in listener-then-established order (the reuseport group
+  index order); the engine attaches the CBPF program to the inherited pair exactly as to one it
+  bound. One inherited UDP socket runs single-socket (logged with the reason).
+* **Restart window**: the door accepts before the control plane is built; a site `ClientHello`
+  in that window (with activation: every connection the kernel queued during the restart) waits
+  for the site, bounded by the 10 s handshake deadline (`FrontDoor::set_site_pending`), instead
+  of being closed. With no `[control]` nothing waits.
+* **Certificates for the cutover**: `[network] cert_file`/`key_file` give the door its own static
+  certificate without making the loopback admin listener TLS; exclusive with `[network.tls]`.
+  Static pairs (these and `[control.tls]`) are reloaded without a restart: a 30 s `stat` poll of
+  the resolved target, size, mtime and inode (certbot re-points `live/` symlinks), parse and
+  key/leaf check on the blocking pool, swap into the `StaticCertificateSource` the resolver reads
+  per handshake; a broken pair keeps the old certificate. `[network] acme_webroot` makes the
+  port-80 listener answer `/.well-known/acme-challenge/<base64url token>` from
+  `<webroot>/.well-known/acme-challenge/` (regular files, at most 1 KiB, no symlinks), so certbot
+  `--webroot` renews without nginx. The move to the engine's own ACME and the point where
+  certbot is retired are in the runbook.
+* **HLS** (`multiview-output::hls::http`): confinement, open and `fstat` in one blocking-pool
+  hop (was five `tokio::fs` round trips); the length and validators come from the opened handle;
+  64 KiB body chunks (`BODY_CHUNK`, never the whole file); nginx's `ETag` format
+  (`"<mtime hex>-<size hex>"`), `Last-Modified`, `If-None-Match`/`If-Modified-Since` -> `304`,
+  `If-Range`. `deploy/hls-nginx.conf` stays the contract; `tests/hls_nginx_parity.rs` pins it.
+  Zero-copy `sendfile` is not possible under rustls without kTLS; the bounded chunked read is
+  the as-built form, and `scripts/hls-ttfb.py` measures TTFB against nginx (acceptance on
+  mda001).
+* **UI** (`multiview-control::spa`): strong `ETag` (SHA-256), `304`, gzip for text assets with
+  `Vary: Accept-Encoding` (compressed once per asset, cached for the process; bounded by the
+  embedded file set), a missing `/assets/*` is `404`. `[control] ui_dir` serves a UI build from
+  disk instead of the embedded copy, read into memory at start-up (at most 10 000 files /
+  256 MiB) so a request never touches the filesystem.
+* **Invariants #1/#10**: everything above runs on the front-door runtime or the control plane's;
+  file I/O on the blocking pool; nothing is shared with the program runtime.
+  `multiview-cli/tests/frontdoor_site_chaos.rs` runs the real tick loop while 64 stalled 4 MiB
+  downloads, download/range lanes and a port-80 flood hit the door: one frame per tick, no extra
+  repeats, RSS growth under 64 MiB.
+* **Not in this slice**: HTTP/2 (slice 7), the mda001 measurements (TTFB, restart window, office
+  browser rows of #290), which the lead runs from the runbook.

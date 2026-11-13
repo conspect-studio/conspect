@@ -188,10 +188,7 @@ fn slice6_cutover_keys() {
     ));
     let back: NetworkConfig = serde_json::from_str(&serde_json::to_string(&n).unwrap()).unwrap();
     assert_eq!(n, back);
-    rejects(
-        "https_port = 443\ncert_file = \"/c.pem\"",
-        "go together",
-    );
+    rejects("https_port = 443\ncert_file = \"/c.pem\"", "go together");
     rejects(
         "https_port = 443\ncert_file = \"c.pem\"\nkey_file = \"/k.pem\"",
         "absolute",
@@ -238,10 +235,9 @@ segment_ms = 1000
 [control]
 listen = "[::1]:8080"
 "##;
-    let good = MultiviewConfig::load_from_toml(&format!(
-        "{base}ui_dir = \"/var/www/conspect-ui/abc\"\n"
-    ))
-    .unwrap();
+    let good =
+        MultiviewConfig::load_from_toml(&format!("{base}ui_dir = \"/var/www/conspect-ui/abc\"\n"))
+            .unwrap();
     good.validate().unwrap();
     let bad = MultiviewConfig::load_from_toml(&format!("{base}ui_dir = \"dist\"\n"));
     let err = match bad {

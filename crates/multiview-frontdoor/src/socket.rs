@@ -214,24 +214,25 @@ impl SharedSocket {
     /// group because the same owner (systemd) created both. The receive
     /// buffers are left as the unit set them (`ReceiveBuffer=`) and reported.
     pub(crate) fn from_inherited(mut sockets: Vec<std::net::UdpSocket>) -> io::Result<Self> {
-        let prepare = |std_socket: std::net::UdpSocket| -> io::Result<(socket2::Socket, RecvBufferReport)> {
-            let socket = socket2::Socket::from(std_socket);
-            if !matches!(socket.local_addr()?.as_socket(), Some(SocketAddr::V6(_))) {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "an inherited front-door UDP socket must be IPv6 (dual-stack [::]:443)",
-                ));
-            }
-            if socket.only_v6().unwrap_or(false) {
-                tracing::warn!(
-                    "front door: an inherited UDP socket is IPv6-only (BindIPv6Only=both \
+        let prepare =
+            |std_socket: std::net::UdpSocket| -> io::Result<(socket2::Socket, RecvBufferReport)> {
+                let socket = socket2::Socket::from(std_socket);
+                if !matches!(socket.local_addr()?.as_socket(), Some(SocketAddr::V6(_))) {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "an inherited front-door UDP socket must be IPv6 (dual-stack [::]:443)",
+                    ));
+                }
+                if socket.only_v6().unwrap_or(false) {
+                    tracing::warn!(
+                        "front door: an inherited UDP socket is IPv6-only (BindIPv6Only=both \
                      missing from the socket unit); IPv4 clients cannot reach it"
-                );
-            }
-            socket.set_nonblocking(true)?;
-            let report = size_recv_buffer(&socket, 0);
-            Ok((socket, report))
-        };
+                    );
+                }
+                socket.set_nonblocking(true)?;
+                let report = size_recv_buffer(&socket, 0);
+                Ok((socket, report))
+            };
         if sockets.len() > 2 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -239,7 +240,11 @@ impl SharedSocket {
                  the ReusePort=yes pair)",
             ));
         }
-        let established = if sockets.len() == 2 { sockets.pop() } else { None };
+        let established = if sockets.len() == 2 {
+            sockets.pop()
+        } else {
+            None
+        };
         let Some(listener) = sockets.pop() else {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,

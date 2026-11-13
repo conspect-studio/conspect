@@ -50,9 +50,7 @@ pub const MAX_ACME_RESPONSE: u64 = 1024;
 /// the challenge directory (no `/`, no `.`, no `..`).
 #[must_use]
 pub fn acme_token(request_head: &[u8]) -> Option<&str> {
-    let line_end = request_head
-        .windows(2)
-        .position(|w| w == b"\r\n")?;
+    let line_end = request_head.windows(2).position(|w| w == b"\r\n")?;
     let line = request_head.get(..line_end)?;
     let mut parts = line.split(|&b| b == b' ');
     let method = parts.next()?;
@@ -176,7 +174,10 @@ mod tests {
         ] {
             assert_eq!(acme_token(head), None, "{head:?}");
         }
-        let long = format!("GET /.well-known/acme-challenge/{} HTTP/1.1\r\n", "a".repeat(129));
+        let long = format!(
+            "GET /.well-known/acme-challenge/{} HTTP/1.1\r\n",
+            "a".repeat(129)
+        );
         assert_eq!(acme_token(long.as_bytes()), None);
     }
 

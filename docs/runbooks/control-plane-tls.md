@@ -104,8 +104,7 @@ above). On Windows (no reload) replace the PEMs and restart.
 
 ## Scope / limits
 
-- **No ACME / auto-renew** in this mode (ACME is `[network.tls]`, see
-  [acme-certificates](acme-certificates.md) once merged); renewal is external (certbot or the
+- **No ACME / auto-renew** in this mode (ACME is `[network.tls]`, PR #338); renewal is external (certbot or the
   operator), and the engine picks the renewed files up without a restart (above).
 - **Slowloris** (half-open slow-header floods) remain out of scope for the
   in-process floor (as for plain HTTP, [ADR-W028](../decisions/ADR-W028.md)); front

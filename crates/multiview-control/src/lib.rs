@@ -1000,9 +1000,16 @@ pub const STATIC_CERTIFICATE_POLL: std::time::Duration = std::time::Duration::fr
 /// target (certbot's `live/` names are symlinks into `archive/`), its size,
 /// modification time and inode. A renewal changes at least one.
 #[cfg(all(feature = "tls", unix))]
-fn pem_fingerprint(tls: &multiview_config::TlsConfig) -> Option<Vec<(std::path::PathBuf, u64, i64, i64, u64)>> {
+type PemFingerprint = Vec<(std::path::PathBuf, u64, i64, i64, u64)>;
+
+#[cfg(all(feature = "tls", unix))]
+fn pem_fingerprint(tls: &multiview_config::TlsConfig) -> Option<PemFingerprint> {
     use std::os::unix::fs::MetadataExt;
-    let multiview_config::TlsConfig::Static { cert_file, key_file } = tls else {
+    let multiview_config::TlsConfig::Static {
+        cert_file,
+        key_file,
+    } = tls
+    else {
         return None;
     };
     [cert_file, key_file]
@@ -1010,7 +1017,13 @@ fn pem_fingerprint(tls: &multiview_config::TlsConfig) -> Option<Vec<(std::path::
         .map(|path| {
             let target = std::fs::canonicalize(path).ok()?;
             let meta = std::fs::metadata(&target).ok()?;
-            Some((target, meta.len(), meta.mtime(), meta.mtime_nsec(), meta.ino()))
+            Some((
+                target,
+                meta.len(),
+                meta.mtime(),
+                meta.mtime_nsec(),
+                meta.ino(),
+            ))
         })
         .collect()
 }
@@ -1029,6 +1042,7 @@ fn pem_fingerprint(tls: &multiview_config::TlsConfig) -> Option<Vec<(std::path::
 /// plane's), never touches the engine, and blocks nothing: file reads run on
 /// the blocking pool.
 #[cfg(all(feature = "tls", unix))]
+#[must_use = "dropping the handle does not stop the task; abort it to stop reloading"]
 pub fn spawn_static_certificate_reload(
     tls: multiview_config::TlsConfig,
     source: std::sync::Arc<certificate_source::StaticCertificateSource>,

@@ -630,7 +630,10 @@ fn redirect_serves_http01_challenges_from_the_webroot() {
     assert!(ok.contains("Content-Length: 19\r\n"), "{ok}");
     assert!(ok.ends_with("\r\n\r\ntok_EN-1.thumbprint"), "{ok}");
     let head = get(b"HEAD /.well-known/acme-challenge/tok_EN-1 HTTP/1.1\r\n\r\n");
-    assert!(head.starts_with("HTTP/1.1 200 OK\r\n") && head.ends_with("\r\n\r\n"), "{head}");
+    assert!(
+        head.starts_with("HTTP/1.1 200 OK\r\n") && head.ends_with("\r\n\r\n"),
+        "{head}"
+    );
     for missing in [
         &b"GET /.well-known/acme-challenge/nope HTTP/1.1\r\n\r\n"[..],
         b"GET /.well-known/acme-challenge/big HTTP/1.1\r\n\r\n",
@@ -644,7 +647,62 @@ fn redirect_serves_http01_challenges_from_the_webroot() {
     assert!(out.starts_with("HTTP/1.1 301"), "{out}");
     assert!(!out.contains("never served"));
     let out = get(b"GET /app HTTP/1.1\r\n\r\n");
-    assert!(out.contains("Location: https://mda001.example.net/app\r\n"), "{out}");
+    assert!(
+        out.contains("Location: https://mda001.example.net/app\r\n"),
+        "{out}"
+    );
     door.shutdown_blocking();
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Slice 6 (#292): the door accepts before the control plane is built (and,
+/// socket-activated, receives the connections queued during a restart). A
+/// site hello in that window waits for the site, bounded by the handshake
+/// deadline, instead of being closed; with nothing pending it closes at once.
+#[test]
+fn a_site_hello_waits_for_a_pending_site_within_the_handshake_deadline() {
+    let mut door = udp_door();
+    let addr = door
+        .start_tcp(
+            TcpDoorConfig {
+                tls_handshake_timeout: Duration::from_secs(3),
+                ..fast("[::1]:0")
+            },
+            TlsRouting::default(),
+            None,
+        )
+        .unwrap();
+    door.set_site_pending(true).unwrap();
+    let rt = client_rt();
+    let early = rt.spawn(async move { https_get(addr, "localhost").await });
+    std::thread::sleep(Duration::from_millis(300));
+    // The control plane attaches: certificate, then the site.
+    door.set_site_config(Some(site_config())).unwrap();
+    let site = Arc::new(FixedSite::default());
+    door.set_site(Some(site.clone())).unwrap();
+    let got = rt.block_on(early).unwrap().unwrap();
+    assert!(got.starts_with("HTTP/1.1 200"), "{got:?}");
+    assert_eq!(site.served.load(Ordering::SeqCst), 1);
+
+    // Pending again but never installed: the hello is released at the
+    // handshake deadline (bounded), not held forever.
+    let mut door2 = udp_door();
+    let addr2 = door2
+        .start_tcp(
+            TcpDoorConfig {
+                tls_handshake_timeout: Duration::from_millis(600),
+                ..fast("[::1]:0")
+            },
+            TlsRouting::default(),
+            None,
+        )
+        .unwrap();
+    door2.set_site_pending(true).unwrap();
+    let started = std::time::Instant::now();
+    let r = rt.block_on(https_get(addr2, "localhost"));
+    assert!(r.is_err() || r.unwrap().is_empty());
+    assert!(started.elapsed() < Duration::from_secs(3));
+    assert!(door2.stats().snapshot().tcp_tls_handshake_timeout >= 1);
+    door.shutdown_blocking();
+    door2.shutdown_blocking();
 }
