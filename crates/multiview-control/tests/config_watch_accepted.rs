@@ -436,6 +436,45 @@ async fn no_commit_from_any_path_once_the_accepted_state_is_frozen() {
     assert_eq!(rig.state.config_watch.snapshot().applied_count, 0);
 }
 
+/// Review round 11 (L1-01): a freeze that arrives while a writer is between
+/// its freeze check and the `desired.json` rename waits for that rename, so
+/// no rename lands after `freeze_accepted_state` returns.
+#[tokio::test]
+async fn a_freeze_waits_for_an_in_flight_rename_and_blocks_later_ones() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let rig = Box::pin(rig()).await;
+    let state = rig.state.clone();
+    let froze = Arc::new(AtomicBool::new(false));
+    let freezer = state
+        .commit_unless_frozen(|| {
+            let (started, wait) = std::sync::mpsc::channel();
+            let freezer = std::thread::spawn({
+                let state = state.clone();
+                let froze = Arc::clone(&froze);
+                move || {
+                    started.send(()).unwrap();
+                    state.freeze_accepted_state();
+                    froze.store(true, Ordering::SeqCst);
+                }
+            });
+            wait.recv().unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            assert!(
+                !froze.load(Ordering::SeqCst),
+                "the freeze waits while a rename is in flight"
+            );
+            freezer
+        })
+        .expect("not frozen before the freeze");
+    freezer.join().unwrap();
+    assert!(froze.load(Ordering::SeqCst));
+    assert!(
+        state.commit_unless_frozen(|| ()).is_none(),
+        "no rename after the freeze returned"
+    );
+    rig.watch.stop();
+}
+
 /// Review (L2 round 2): the copy dedup never follows a link and never blocks
 /// on a FIFO planted under a kept-copy name.
 #[cfg(unix)]

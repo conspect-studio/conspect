@@ -946,10 +946,17 @@ pub struct AppState {
     /// never back-pressure the engine (invariant #10).
     config_mutation_lock: Arc<tokio::sync::Mutex<()>>,
     /// Set once the run decided to exit (#367): from then on no commit writes
-    /// the accepted state (`desired.json`). Checked by the durable write itself,
-    /// after it holds the write serial, so a commit already in flight when the
-    /// exit is decided does not land either. One-way; never cleared.
+    /// the accepted state (`desired.json`). Checked by the durable write itself
+    /// under the commit gate, right before the rename, so a commit in flight
+    /// when the exit is decided does not land after it. One-way; never cleared.
     accepted_frozen: Arc<std::sync::atomic::AtomicBool>,
+    /// The commit gate (#367): held across "check the freeze, then rename
+    /// `desired.json`", and taken by [`AppState::freeze_accepted_state`]
+    /// before it sets the flag. So a freeze either lands before a writer's
+    /// check (the writer refuses) or waits for that one rename to finish (the
+    /// commit is ordered before the exit). Never held across an fsync or an
+    /// `.await`.
+    commit_gate: Arc<std::sync::Mutex<()>>,
     /// The coalescing **Running-changed** signal (ADR-W024 §3): a one-permit
     /// [`tokio::sync::Notify`] fired by [`AppState::audit`] — the ONE choke
     /// point every successful mutation passes through — that the debounced
@@ -1158,6 +1165,7 @@ impl AppState {
             // The promote/revert mutation serial (ADR-W024 MAJOR-C2/C3).
             config_mutation_lock: Arc::new(tokio::sync::Mutex::new(())),
             accepted_frozen: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            commit_gate: Arc::new(std::sync::Mutex::new(())),
             // Honest default: nothing applies live until the binary declares
             // what the running engine can take (ADR-W022).
             live_apply: crate::live_apply::LiveApplyCaps::default(),
@@ -1298,11 +1306,34 @@ impl AppState {
     }
 
     /// Freeze the accepted state (#367): the run decided to exit, so no commit
-    /// may write `desired.json` any more. Wait-free; call it at every exit
-    /// decision. One-way.
+    /// may write `desired.json` any more. Call it at every exit decision.
+    /// One-way. It takes the commit gate first, so it waits at most for one
+    /// `desired.json` rename already past its freeze check (a metadata
+    /// operation, never an fsync); when it returns, no later rename can land.
     pub fn freeze_accepted_state(&self) {
+        let _gate = self.lock_commit_gate();
         self.accepted_frozen
             .store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    /// Run `commit` (the `desired.json` rename) only while the accepted state
+    /// is not frozen, atomically with respect to
+    /// [`Self::freeze_accepted_state`]. `None` when frozen; `commit` did not
+    /// run. Keep `commit` short: no fsync, no blocking on another lock that
+    /// an fsync holds.
+    pub fn commit_unless_frozen<R>(&self, commit: impl FnOnce() -> R) -> Option<R> {
+        let _gate = self.lock_commit_gate();
+        if self.accepted_state_frozen() {
+            return None;
+        }
+        Some(commit())
+    }
+
+    fn lock_commit_gate(&self) -> std::sync::MutexGuard<'_, ()> {
+        match self.commit_gate.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        }
     }
 
     /// Whether [`Self::freeze_accepted_state`] ran.

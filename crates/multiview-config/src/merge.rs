@@ -396,6 +396,10 @@ fn merge_iptv(
     Some(out)
 }
 
+fn route_key(route: &crate::audio::AudioRoute) -> (String, Option<String>) {
+    (route.input_id.clone(), route.target_track.clone())
+}
+
 /// `[audio]`: the sample rate is one value, the routes are keyed by
 /// `(input_id, target_track)`. Removing the whole block in the file removes
 /// the whole block (the file said so); otherwise per route.
@@ -410,20 +414,21 @@ fn merge_audio(
     let (Some(next), Some(accepted)) = (next, accepted) else {
         return next.cloned();
     };
-    let empty = AudioRouting {
-        sample_rate_hz: next.sample_rate_hz,
-        routes: Vec::new(),
+    // A block the file adds (absent before) states its sample rate: that is
+    // a file change, so it wins. Its routes merge onto the accepted ones.
+    let Some(prev) = prev else {
+        return Some(AudioRouting {
+            sample_rate_hz: next.sample_rate_hz,
+            routes: keyed(&[], &next.routes, &accepted.routes, route_key),
+        });
     };
-    let prev = prev.unwrap_or(&empty);
     Some(AudioRouting {
         sample_rate_hz: section(
             &prev.sample_rate_hz,
             &next.sample_rate_hz,
             &accepted.sample_rate_hz,
         ),
-        routes: keyed(&prev.routes, &next.routes, &accepted.routes, |r| {
-            (r.input_id.clone(), r.target_track.clone())
-        }),
+        routes: keyed(&prev.routes, &next.routes, &accepted.routes, route_key),
     })
 }
 

@@ -216,6 +216,24 @@ fn a_file_audio_route_edit_keeps_the_accepted_routes() {
     assert_eq!(tracks, [Some("clean".to_owned()), Some("file".to_owned())]);
 }
 
+/// Review round 11 (L1-02): the file adds an `[audio]` block it did not
+/// have before. Its sample rate is a file change and wins over the accepted
+/// (API-set) rate; the accepted routes stay.
+#[test]
+fn a_file_added_audio_block_sets_its_sample_rate() {
+    let prev = parse(&boot("/srv/ui-old"));
+    let next = parse(&format!(
+        "{}[audio]\nsample_rate_hz = 44100\n",
+        boot("/srv/ui-old")
+    ));
+    let accepted = parse(&accepted());
+    assert_eq!(accepted.audio.as_ref().unwrap().sample_rate_hz, 48000);
+    let merged = merge_file_edit(&prev, &next, &accepted);
+    let audio = merged.audio.unwrap();
+    assert_eq!(audio.sample_rate_hz, 44100, "the file's new rate applies");
+    assert_eq!(audio.routes, accepted.audio.unwrap().routes);
+}
+
 /// Review L1-2: a cosmetic canvas edit keeps the accepted pinned signal.
 #[test]
 fn a_canvas_background_edit_keeps_the_accepted_resolution() {

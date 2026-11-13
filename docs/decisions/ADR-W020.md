@@ -132,7 +132,9 @@ output when one `[control] ui_dir` key changed (#367).
   the accepted object lacks are skipped as old-variant-only); when both switched to different
   variants, the file's wins. A merged item that does not
   deserialize falls back to the file's whole item. Deliberate whole units: the canvas's pinned signal (width, height, cadence),
-  and a layout change, which takes the file's cells (cells name the layout's areas). When
+  and a layout change, which takes the file's cells (cells name the layout's areas). A
+  singleton block the file adds (e.g. `[audio]` absent before) states its scalar values
+  (the sample rate), so they win; its keyed lists still merge onto the accepted ones. When
   the accepted list still equals the previous file's list, the new list is taken whole (a
   reorder lands). The function destructures `MultiviewConfig` exhaustively, so a new section
   is a compile error until the merge decides how an edit carries it.
@@ -164,10 +166,12 @@ is closed`).
   freezes as soon as the stop signal is raised or any exit is armed.
 * The durable write (`write_desired`, which every accepted-state commit goes through: the
   watcher, the REST mutations and revert-to-start) prepares and fsyncs its temp file outside
-  the write serial, then re-checks the freeze **under the serial, immediately before the
-  rename**. A commit that was already past every earlier check when the exit was decided
-  fails, and so does one waiting behind another write; the exit-time `active.toml` persist
-  shares that serial and waits at most for a rename, never for an fsync.
+  the write serial, then checks the freeze and renames **under a commit gate that the freeze
+  itself takes** (`AppState::commit_unless_frozen`). A freeze therefore either lands before
+  the check (the commit fails) or waits for that one rename (the commit is ordered before the
+  exit decision); no rename lands after `freeze_accepted_state` returns. The freeze waits at
+  most for one rename, never for an fsync; the exit-time `active.toml` persist shares the write
+  serial and likewise waits at most for a rename.
 * The watcher also checks "stopped, frozen, or command bus closed" under the config-mutation
   lock before every commit path. A closed bus (the receiver already dropped) is only a
   backstop: it becomes true after the exit decision, never in a normal run.

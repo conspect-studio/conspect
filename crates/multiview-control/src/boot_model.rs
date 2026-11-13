@@ -313,12 +313,13 @@ async fn write_desired(state: &AppState, desired: DesiredState) -> ControlResult
             let prepared = prepare_atomic(&target, &json)?;
             {
                 let _serial = model.lock_writes();
-                if frozen.accepted_state_frozen() {
-                    return Err(AtomicWriteError::BeforeRename(std::io::Error::other(
-                        SHUTTING_DOWN,
-                    )));
-                }
-                prepared.rename()?;
+                // The check and the rename run under the commit gate the
+                // freeze also takes, so no rename lands after a freeze.
+                frozen
+                    .commit_unless_frozen(|| prepared.rename())
+                    .ok_or_else(|| {
+                        AtomicWriteError::BeforeRename(std::io::Error::other(SHUTTING_DOWN))
+                    })??;
             }
             sync_parent_directory(&target_dir(&target)).map_err(AtomicWriteError::AfterRename)
         }
