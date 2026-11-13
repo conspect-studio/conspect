@@ -20,7 +20,7 @@ use std::sync::Arc;
 
 use anyhow::Context as _;
 use clap::Parser as _;
-use multiview_cli::cli::{Cli, Command, NodeArgs, RunArgs, ValidateArgs};
+use multiview_cli::cli::{AcknowledgeFallbackArgs, Cli, Command, NodeArgs, RunArgs, ValidateArgs};
 use multiview_cli::control;
 use multiview_cli::run::{RunReport, SoftwareEngine};
 use multiview_cli::validate::validate_config;
@@ -192,7 +192,28 @@ async fn dispatch(cli: Cli) -> anyhow::Result<ExitCode> {
         // + control-plane state and exceeds clippy's large-future bound.
         Command::Run(args) => Box::pin(run_run(args)).await,
         Command::Node(args) => run_node(&args),
+        Command::AcknowledgeFallback(args) => run_acknowledge_fallback(&args),
     }
+}
+
+/// The `acknowledge-fallback` subcommand (#324): remove the persisted
+/// start-up fallback marker, silencing the current `accepted-state-rejected`
+/// alarm. A later start that still cannot use the saved configuration raises
+/// it again. The saved configuration is not touched.
+fn run_acknowledge_fallback(args: &AcknowledgeFallbackArgs) -> anyhow::Result<ExitCode> {
+    match multiview_cli::last_good::acknowledge(&args.config).map_err(anyhow::Error::msg)? {
+        Some(message) => {
+            println!("acknowledged the start-up fallback warning: {message}");
+            println!(
+                "the saved configuration is unchanged. The warning is raised again on every \
+                 start that still cannot use it, until it is fixed or replaced; a start that \
+                 uses it clears the warning by itself. A running engine's banner is cleared \
+                 only through the API (POST /api/v1/health/accepted-state-rejected/ack)."
+            );
+        }
+        None => println!("no start-up fallback warning is pending"),
+    }
+    Ok(ExitCode::SUCCESS)
 }
 
 /// The `node` subcommand (DEV-B5 / ADR-0045): resolve + validate the display-
@@ -267,14 +288,22 @@ async fn run_software(
     // (S1). A running engine is NEVER re-gated; this only refuses a *new* start at
     // the block-new-instance rung (the never-off-air promise).
     let plane = multiview_cli::licence::EntitlementPlane::from_env();
-    // #317: build from the start decision; a build failure on the accepted
-    // state falls back to a different last-good that builds. Only AFTER a
-    // successful build is a planned fallback committed to disk.
-    let (start, mut engine) =
-        multiview_cli::boot::build_with_fallback(start.clone(), &args.config, |config| {
-            SoftwareEngine::build_gated(config, plane.level()).map_err(|e| e.to_string())
-        })
-        .map_err(anyhow::Error::msg)?;
+    // #317/#324: build from the start decision; a STATE-class build failure on
+    // the accepted state falls back to a different last-good that builds, an
+    // environment-class one (an expired lease) is retried and then fails. Only
+    // AFTER a successful build is a planned fallback recorded (a kept copy +
+    // the persisted marker; desired.json itself is never changed).
+    let (start, mut engine) = multiview_cli::boot::build_with_fallback(
+        start.clone(),
+        &args.config,
+        &multiview_cli::boot::RetryPolicy::startup(),
+        |config| {
+            SoftwareEngine::build_gated(config, plane.level()).map_err(|e| {
+                multiview_cli::boot::BuildFailure::new(e.failure_class(), e.to_string())
+            })
+        },
+    )
+    .map_err(anyhow::Error::msg)?;
     let start =
         multiview_cli::boot::commit_fallback(start, &args.config).map_err(anyhow::Error::msg)?;
     let start = &start;
@@ -323,15 +352,30 @@ async fn run_pipeline(
     // re-gated (the never-off-air promise).
     let plane = multiview_cli::licence::EntitlementPlane::from_env();
     multiview_cli::run::start_gate(plane.level()).map_err(|e| anyhow::anyhow!("{e}"))?;
-    // #317: build from the start decision; a build failure on the accepted
-    // state falls back to a different last-good that builds. Only AFTER a
-    // successful build is a planned fallback committed to disk (the operator's
-    // state is never moved aside for a fault that breaks every state).
-    let (start, built) =
-        multiview_cli::boot::build_with_fallback(start.clone(), &args.config, |config| {
-            Pipeline::build(config).map_err(|e| format!("building the pipeline: {e}"))
-        })
-        .map_err(anyhow::Error::msg)?;
+    // #317/#324: build from the start decision; a STATE-class build failure on
+    // the accepted state falls back to a different last-good that builds. An
+    // environment-class one (`PipelineError::Io` classified by its OS error
+    // kind — e.g. permission denied / a full volume creating the HLS dir — or a
+    // refused thread spawn) is retried on the same state and then fails: a
+    // fault that breaks every state never falls back. Only AFTER a successful
+    // build is a planned fallback recorded (a kept copy + the persisted marker;
+    // desired.json itself is never changed). No socket binds during the build:
+    // the control-plane/MoQ listeners bind later, so EADDRINUSE there fails
+    // start-up and never reaches this decision.
+    let (start, built) = multiview_cli::boot::build_with_fallback(
+        start.clone(),
+        &args.config,
+        &multiview_cli::boot::RetryPolicy::startup(),
+        |config| {
+            Pipeline::build(config).map_err(|e| {
+                multiview_cli::boot::BuildFailure::new(
+                    e.failure_class(),
+                    format!("building the pipeline: {e}"),
+                )
+            })
+        },
+    )
+    .map_err(anyhow::Error::msg)?;
     let start =
         multiview_cli::boot::commit_fallback(start, &args.config).map_err(anyhow::Error::msg)?;
     let start = &start;
@@ -1234,7 +1278,8 @@ async fn run_pipeline_until_ctrl_c(
         .unwrap_or(i64::MAX);
         let _ = multiview_control::emit_network_warnings(publisher.as_ref(), mismatch, since_nanos);
     }
-    announce_boot_fallback(start, publisher.as_ref());
+    // #317/#324: this start's fallback, or a persisted one not yet acknowledged.
+    let _raised = multiview_cli::last_good::announce(config_path, start, publisher.as_ref());
     let _last_good = spawn_last_good_recorder(start, config_path, &publisher, &stop);
 
     // MP-1 (ADR-0030 §2.2): build the engine `ProgramSet` and drive this single
@@ -1279,25 +1324,6 @@ async fn run_pipeline_until_ctrl_c(
     decided_stop.store(true, std::sync::atomic::Ordering::Release);
     drop(decided);
     Ok(report)
-}
-
-/// #317: when this run started from the last-good copy because the accepted
-/// state could not start, raise the latched `accepted-state-rejected` warning
-/// (UI banner + `GET /api/v1/health`). Before the output clock exists (inv #1),
-/// through the drop-oldest lane (inv #10).
-fn announce_boot_fallback(
-    start: &multiview_cli::boot::StartConfig,
-    publisher: &EnginePublisher<EngineStateSnapshot, Event>,
-) {
-    if let Some(fallback) = &start.boot_fallback {
-        let since_nanos = i64::try_from(
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map_or(0, |d| d.as_nanos()),
-        )
-        .unwrap_or(i64::MAX);
-        multiview_control::emit_accepted_state_rejected(publisher, fallback.message(), since_nanos);
-    }
 }
 
 /// #317: record the started accepted state as last-good after the first tick
@@ -1613,8 +1639,9 @@ async fn run_software_until_ctrl_c(
     // CONSPECT engine-seam S5 (ADR-0052 §3): the consent-independent local-metrics
     // retention feed for the software run.
     let (retention_store, retention_task) = spawn_metrics_retention(&publisher);
-    // #317: after the control plane's warning ingest subscribed.
-    announce_boot_fallback(start, publisher.as_ref());
+    // #317/#324: after the control plane's warning ingest subscribed — this
+    // start's fallback, or a persisted one not yet acknowledged.
+    let _raised = multiview_cli::last_good::announce(config_path, start, publisher.as_ref());
     let _last_good = spawn_last_good_recorder(start, config_path, &publisher, &stop);
 
     // DEV-C1 (ADR-M010): the outbound presentation epoch publishes on the

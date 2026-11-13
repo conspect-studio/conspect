@@ -1299,6 +1299,34 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/health/{code}/ack": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * `POST /api/v1/health/{code}/ack` — acknowledge the persisted
+         *     `accepted-state-rejected` warning (role: write, unscoped; #324).
+         * @description Removes the start-up fallback marker (on the blocking pool, under the
+         *     config-mutation lock — file I/O never runs on a runtime worker, and never on
+         *     the engine), then publishes `health.warning.cleared` through the
+         *     drop-oldest lane (inv #10) and waits briefly for the warning ingest to apply
+         *     it. Acknowledging silences the CURRENT alarm only: a later start that still
+         *     cannot use the saved configuration raises it again. The saved configuration
+         *     is not touched. An unreadable or unparsable marker still counts as pending
+         *     and is removed.
+         */
+        post: operations["ack_health_warning"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/inputs/{id}/events": {
         parameters: {
             query?: never;
@@ -12097,6 +12125,54 @@ export interface operations {
             };
             /** @description Authenticated but not authorized to read. */
             403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
+    ack_health_warning: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Warning code to acknowledge; only `accepted-state-rejected` is acknowledgeable. */
+                code: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Acknowledged: the persisted marker is removed and the warning cleared. */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Missing or invalid credentials. */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Not authorized to acknowledge (read-only role, or a scoped key: this is a whole-system action). */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Not an acknowledgeable code, no config-file run, or nothing pending. */
+            404: {
                 headers: {
                     [name: string]: unknown;
                 };

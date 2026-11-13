@@ -3260,17 +3260,20 @@ fn salvo_event(salvo: String, phase: SalvoPhase, head: Option<String>) -> SalvoE
     }
 }
 
-/// Restore the complete saved library from its authoritative envelope.
+/// Restore the complete saved library from its authoritative envelope — the
+/// model's accepted snapshot, NOT a fresh read of `desired.json`: after a
+/// start-up fallback (#324) the file still holds the operator's rejected state
+/// while the snapshot holds the last-good one the engine actually runs.
 fn restore_desired_layouts(
     model: &multiview_control::boot_model::BootModel,
 ) -> Option<Arc<dyn multiview_control::repository::Repository>> {
-    let desired = multiview_control::boot_model::load_desired(model.boot_path()).ok()??;
+    let desired = model.accepted().ok()??;
     let restored = multiview_control::InMemoryRepository::new();
-    for layout in desired.layouts {
-        let id = layout.id;
+    for layout in &desired.layouts {
+        let id = layout.id.clone();
         let input = multiview_control::repository::LayoutInput {
-            name: layout.name,
-            body: layout.body,
+            name: layout.name.clone(),
+            body: layout.body.clone(),
         };
         if let Err(error) =
             multiview_control::repository::Repository::create_layout(&restored, &id, input)
@@ -3312,11 +3315,10 @@ async fn persist_layouts(
                     // Once an envelope exists the database is only its
                     // projection: it stays the live repository, and the repair
                     // task `bind_and_serve` starts reconciles it. A corrupt
-                    // envelope fails startup in the caller.
-                    if !matches!(
-                        multiview_control::boot_model::load_desired(model.boot_path()),
-                        Ok(None)
-                    ) {
+                    // envelope fails startup in the caller. The model's snapshot
+                    // (not `desired.json`) decides: after a fallback (#324) it is
+                    // the last-good envelope the engine runs.
+                    if !matches!(model.accepted(), Ok(None)) {
                         return Arc::new(repo);
                     }
                     // A legacy library: seed ONLY absent ids. Never overwrite an
