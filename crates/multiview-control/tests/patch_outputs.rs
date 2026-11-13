@@ -212,21 +212,27 @@ impl OutputRouting for Fake {
 struct Rig {
     router: axum::Router,
     fake: Arc<Fake>,
+    keys: Arc<ApiKeyStore>,
 }
 
 fn rig(path: &Path) -> Rig {
-    let config = MultiviewConfig::load_from_toml(DOC).unwrap();
+    rig_with(path, DOC)
+}
+
+fn rig_with(path: &Path, doc: &str) -> Rig {
+    let config = MultiviewConfig::load_from_toml(doc).unwrap();
     config.validate().unwrap();
     let seeded = multiview_control::seed_resources(&config).unwrap();
     let engine = Arc::new(EnginePublisher::<EngineStateSnapshot, Event>::new(256));
     let (sender, _receiver) = command_bus(64);
     let fake = Fake::new();
     let seam: Arc<dyn OutputRouting> = fake.clone();
+    let api_keys = Arc::new(keys());
     let state = AppState::new(
         Arc::clone(&engine),
         sender,
         Arc::new(InMemoryRepository::new()),
-        Arc::new(keys()),
+        Arc::clone(&api_keys),
     )
     .with_seeded_resources(seeded)
     .with_base_document(serde_json::to_value(&config).unwrap())
@@ -242,6 +248,7 @@ fn rig(path: &Path) -> Rig {
     Rig {
         router: multiview_control::router(state),
         fake,
+        keys: api_keys,
     }
 }
 
@@ -681,4 +688,198 @@ async fn a_take_flood_is_429_and_never_starves_another_principal() {
         .takes()
         .iter()
         .any(|t| t.principal == "patch-other" && t.output == OUT_A));
+}
+
+async fn alias_take(rig: &Rig, token: &str, key: &str, output: &str, feed: Value) -> StatusCode {
+    send(
+        &rig.router,
+        post(
+            "/api/v1/routing/output/take",
+            token,
+            Some(key),
+            &alias(output, feed),
+        ),
+    )
+    .await
+    .status()
+}
+
+/// Review A1: a take key is bound to its (output, feed) across both routes:
+/// the same key with another output or feed is 409 on either route and
+/// enqueues nothing; the same body still replays its first operation.
+#[tokio::test]
+async fn a_reused_key_with_another_body_is_409_on_both_routes() {
+    let dir = tempfile::tempdir().unwrap();
+    let rig = rig(&dir.path().join("boot.toml"));
+    let (status, first) = take(
+        &rig,
+        OPERATOR_TOKEN,
+        "bound",
+        patch(vec![video("output-0", json!({"source": "bars"}))]),
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+    // Another output, another feed, on the alias and on the patch route.
+    for (output, feed) in [
+        ("output-1", json!({"source": "bars"})),
+        ("output-0", json!({"source": "a"})),
+        ("output-1", json!({"bus": "program"})),
+    ] {
+        assert_eq!(
+            alias_take(&rig, OPERATOR_TOKEN, "bound", output, feed.clone()).await,
+            StatusCode::CONFLICT,
+            "alias {output} {feed}"
+        );
+        let (status, problem) = take(
+            &rig,
+            OPERATOR_TOKEN,
+            "bound",
+            patch(vec![video(output, feed.clone())]),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT, "patch {output} {feed}");
+        assert!(
+            problem["detail"].as_str().unwrap().contains("reused"),
+            "{problem}"
+        );
+    }
+    assert_eq!(rig.fake.takes().len(), 1, "zero extra enqueues");
+    // The same body replays on both routes.
+    let (status, replay) = take(
+        &rig,
+        OPERATOR_TOKEN,
+        "bound",
+        patch(vec![video("output-0", json!({"source": "bars"}))]),
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+    assert_eq!(replay["operation_id"], first["operation_id"]);
+    assert_eq!(
+        alias_take(
+            &rig,
+            OPERATOR_TOKEN,
+            "bound",
+            "output-0",
+            json!({"source": "bars"})
+        )
+        .await,
+        StatusCode::ACCEPTED
+    );
+    assert_eq!(rig.fake.takes().len(), 1);
+}
+
+/// Review A1/A2: a replay is re-authorized under the principal's CURRENT
+/// grants on both routes: a key accepted while the principal held the output
+/// axis is 403 on either route once that grant is gone, and nothing (no op
+/// id, no outcome) is returned.
+#[tokio::test]
+async fn a_replay_is_reauthorized_and_403_once_the_output_axis_is_gone() {
+    let dir = tempfile::tempdir().unwrap();
+    let rig = rig(&dir.path().join("boot.toml"));
+    let body = || patch(vec![video("output-1", json!({"source": "bars"}))]);
+    let (status, _) = take(&rig, OUT1, "k", body()).await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+    // Revoke the output axis (the object grant stays).
+    assert!(rig.keys.set_principal(
+        "patch-out1",
+        Principal {
+            key_id: "patch-out1".to_owned(),
+            role: Role::Operator,
+            scoped_object_ids: Some(vec!["output-1".to_owned(), "bars".to_owned()]),
+            scoped_output_ids: Some(vec![]),
+            scoped_discovery_domains: None,
+        },
+    ));
+    let (status, problem) = take(&rig, OUT1, "k", body()).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{problem}");
+    assert!(problem.get("operation_id").is_none());
+    assert_eq!(
+        alias_take(&rig, OUT1, "k", "output-1", json!({"source": "bars"})).await,
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(rig.fake.takes().len(), 1);
+}
+
+/// Review A2: the alias requires the output axis: an object grant without it
+/// is 403 on `/routing/output/take` (and plan), before existence.
+#[tokio::test]
+async fn the_alias_requires_the_output_axis() {
+    let dir = tempfile::tempdir().unwrap();
+    let rig = rig(&dir.path().join("boot.toml"));
+    for output in ["output-1", "no-such-output"] {
+        assert_eq!(
+            alias_take(&rig, NO_OUTPUT_AXIS, "x", output, json!({"source": "bars"})).await,
+            StatusCode::FORBIDDEN,
+            "{output}"
+        );
+        let resp = send(
+            &rig.router,
+            post(
+                "/api/v1/routing/plan",
+                NO_OUTPUT_AXIS,
+                None,
+                &alias(output, json!({"source": "bars"})),
+            ),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN, "plan {output}");
+    }
+    // The same object grant WITH the output axis is accepted.
+    assert_eq!(
+        alias_take(&rig, OUT1, "y", "output-1", json!({"source": "bars"})).await,
+        StatusCode::ACCEPTED
+    );
+    assert_eq!(rig.fake.takes().len(), 1);
+}
+
+/// Review A3: one principal flooding MANY outputs is capped by the
+/// per-principal limit, not just the per-output one: over 12 outputs (12 x
+/// 2/s = 24/s of per-output room) at most 10 takes per started second reach
+/// the engine; every other answer is 429.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn one_principal_flooding_many_outputs_is_capped_at_ten_per_second() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut doc = DOC.to_owned();
+    for i in 0..10 {
+        doc.push_str(&format!(
+            "[[outputs]]\nkind = \"hls\"\npath = \"/tmp/patch-outputs/m{i}/index.m3u8\"\ncodec = \"mpeg2video\"\nsegment_ms = 1000\n"
+        ));
+    }
+    let rig = rig_with(&dir.path().join("boot.toml"), &doc);
+    let started = std::time::Instant::now();
+    let mut accepted = 0usize;
+    let mut limited = 0usize;
+    for i in 0..1200 {
+        let output = format!("output-{}", i % 12);
+        let (status, _) = take(
+            &rig,
+            OPERATOR_TOKEN,
+            &format!("many-{i}"),
+            patch(vec![video(&output, json!({"bus": "program"}))]),
+        )
+        .await;
+        match status {
+            StatusCode::ACCEPTED => accepted += 1,
+            StatusCode::TOO_MANY_REQUESTS => limited += 1,
+            other => panic!("unexpected {other}"),
+        }
+    }
+    let seconds = usize::try_from(started.elapsed().as_secs()).unwrap() + 1;
+    assert_eq!(accepted + limited, 1200);
+    assert!(accepted >= 10, "the first window admits ten");
+    assert!(
+        accepted <= 10 * (seconds + 1),
+        "{accepted} admitted in {seconds}s: the principal cap is 10/s"
+    );
+    assert_eq!(
+        rig.fake.takes().len(),
+        accepted,
+        "only admitted takes reach the mailbox"
+    );
+    let outputs: std::collections::HashSet<_> =
+        rig.fake.takes().iter().map(|t| t.output.clone()).collect();
+    assert!(
+        outputs.len() >= 5,
+        "takes spread over many outputs: {outputs:?}"
+    );
 }
