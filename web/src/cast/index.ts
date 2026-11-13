@@ -7,3 +7,4 @@ export { CastController, describeCastError, IDLE_SNAPSHOT } from './castControll
 export type { CastReceiverConfig, CastStatus, CastSnapshot, CastStreamApi, CastTarget } from './castController';
 export { castQualityLine, castStatusLabel } from './castLabels';
 export { CAST_NAMESPACE, receiverErrorCodes } from './castReport';
+export { DeskCastButton } from './DeskCastButton';

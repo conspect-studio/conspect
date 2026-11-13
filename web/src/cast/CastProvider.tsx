@@ -42,6 +42,12 @@ export function useCastController(): CastController {
   return controller;
 }
 
+/** Whether a `CastProvider` is mounted above (surfaces that may render without one hide their Cast UI). */
+// eslint-disable-next-line react-refresh/only-export-components -- shared hook alongside its provider
+export function useHasCastProvider(): boolean {
+  return useContext(CastControllerContext) !== null;
+}
+
 /** The controller's live snapshot. */
 // eslint-disable-next-line react-refresh/only-export-components -- shared hook alongside its provider
 export function useCastSnapshot(): CastSnapshot {
