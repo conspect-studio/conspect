@@ -4110,6 +4110,62 @@
         }
       }
     },
+    "/api/v1/health/{code}/ack": {
+      "post": {
+        "tags": [
+          "health"
+        ],
+        "summary": "`POST /api/v1/health/{code}/ack` — acknowledge the persisted\n`accepted-state-rejected` warning (role: write, unscoped; #324).",
+        "description": "Removes the start-up fallback marker (on the blocking pool, under the\nconfig-mutation lock — file I/O never runs on a runtime worker, and never on\nthe engine), then publishes `health.warning.cleared` through the\ndrop-oldest lane (inv #10) and waits briefly for the warning ingest to apply\nit. Acknowledging silences the CURRENT alarm only: a later start that still\ncannot use the saved configuration raises it again. The saved configuration\nis not touched. An unreadable or unparsable marker still counts as pending\nand is removed.",
+        "operationId": "ack_health_warning",
+        "parameters": [
+          {
+            "name": "code",
+            "in": "path",
+            "description": "Warning code to acknowledge; only `accepted-state-rejected` is acknowledgeable.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Acknowledged: the persisted marker is removed and the warning cleared."
+          },
+          "401": {
+            "description": "Missing or invalid credentials.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Not authorized to acknowledge (read-only role, or a scoped key: this is a whole-system action).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Not an acknowledgeable code, no config-file run, or nothing pending.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/v1/inputs/{id}/events": {
       "get": {
         "tags": [
@@ -19483,7 +19539,7 @@
           },
           "feed": {
             "type": "object",
-            "description": "The feed: `{\"bus\":\"program\"|\"preview\"}` or `{\"source\":\"vt1\"}`."
+            "description": "The feed: `{\"bus\":\"program\"|\"preview\"|\"clean\"}` or `{\"source\":\"vt1\"}`."
           },
           "target": {
             "$ref": "#/components/schemas/OutputTargetKind",
@@ -20253,7 +20309,10 @@
           "frames_repeated_total",
           "frames_repeated_window",
           "bucket_edges_ms",
-          "buckets_total"
+          "buckets_total",
+          "fine_bucket_edges_ms",
+          "fine_buckets_total",
+          "fine_buckets_window"
         ],
         "properties": {
           "bucket_edges_ms": {
@@ -20273,6 +20332,32 @@
             },
             "description": "Cumulative per-bucket counts (edges, then overflow)."
           },
+          "fine_bucket_edges_ms": {
+            "type": "array",
+            "items": {
+              "type": "number",
+              "format": "double"
+            },
+            "description": "The fine bucket upper edges, ms (0.05, 0.1, 0.25, then the coarse\nedges; a final overflow bucket follows)."
+          },
+          "fine_buckets_total": {
+            "type": "array",
+            "items": {
+              "type": "integer",
+              "format": "int64",
+              "minimum": 0
+            },
+            "description": "Cumulative per-fine-bucket counts (fine edges, then overflow)."
+          },
+          "fine_buckets_window": {
+            "type": "array",
+            "items": {
+              "type": "integer",
+              "format": "int64",
+              "minimum": 0
+            },
+            "description": "Per-fine-bucket counts in the window."
+          },
           "frames_repeated_total": {
             "type": "integer",
             "format": "int64",
@@ -20290,11 +20375,35 @@
             "format": "double",
             "description": "Largest lateness since the run started, ms."
           },
+          "lateness_mean_ms": {
+            "type": [
+              "number",
+              "null"
+            ],
+            "format": "double",
+            "description": "Mean lateness over the window, ms (`null` when the window is empty)."
+          },
+          "lateness_mean_total_ms": {
+            "type": [
+              "number",
+              "null"
+            ],
+            "format": "double",
+            "description": "Mean lateness since the run started, ms."
+          },
           "lateness_over_max_bucket": {
             "type": "integer",
             "format": "int64",
             "description": "Window ticks later than the last bucket edge (66.8 ms).",
             "minimum": 0
+          },
+          "lateness_p50_fine_ms": {
+            "type": [
+              "number",
+              "null"
+            ],
+            "format": "double",
+            "description": "p50 lateness over the window on the fine edges, ms."
           },
           "lateness_p50_ms": {
             "type": [
@@ -20303,6 +20412,14 @@
             ],
             "format": "double",
             "description": "p50 lateness over the window: the upper edge of its bucket, ms\n(`null` when empty or beyond the last edge)."
+          },
+          "lateness_p99_fine_ms": {
+            "type": [
+              "number",
+              "null"
+            ],
+            "format": "double",
+            "description": "p99 lateness over the window on the fine edges, ms."
           },
           "lateness_p99_ms": {
             "type": [
@@ -24840,7 +24957,7 @@
     },
     {
       "name": "health",
-      "description": "Health warnings: active capability mismatches + remediation (read-only)"
+      "description": "Health warnings: active capability mismatches + remediation; acknowledge the persisted start-up fallback warning"
     },
     {
       "name": "licence",

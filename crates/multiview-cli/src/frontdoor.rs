@@ -96,6 +96,8 @@ pub struct FrontDoorRun {
     /// [`crate::nft_floor::NFT_FLOOR_REREAD_INTERVAL`] on the front-door
     /// runtime, never the program runtime), plus the path to read.
     nft_floor: Arc<NftFloorCell>,
+    /// The TCP door runs with ICE-TCP on (direct mode, `network.ice_tcp`).
+    ice_tcp: bool,
 }
 
 /// The TCP door settings derived from `[network]` (slice 4): `None` unless
@@ -151,6 +153,9 @@ pub fn tcp_config_from(config: &MultiviewConfig) -> Option<TcpPlan> {
             Some(TcpPlan {
                 door: multiview_frontdoor::TcpDoorConfig {
                     listen: network.proxy_listen_addr().ok()?,
+                    // Design note section 8: no ICE-TCP behind a proxy (the
+                    // proxy's port is not ours to advertise as a candidate).
+                    ice_tcp: false,
                     proxy: Some(multiview_frontdoor::TrustedProxies::new(
                         trusted.iter().map(|t| (t.addr, t.prefix)),
                     )),
@@ -182,6 +187,7 @@ impl std::fmt::Debug for FrontDoorRun {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("FrontDoorRun")
             .field("local_addr", &self.door.local_addr())
+            .field("ice_tcp", &self.ice_tcp)
             .finish_non_exhaustive()
     }
 }
@@ -357,6 +363,7 @@ impl FrontDoorRun {
                     retry_counter: Arc::new(AtomicU64::new(0)),
                     retry_above_handshakes: retry_above_handshakes(config),
                     nft_floor,
+                    ice_tcp: false,
                 };
                 run.start_tcp(config);
                 Some(run)
@@ -397,6 +404,7 @@ impl FrontDoorRun {
                 }
             }
         });
+        self.ice_tcp = ice_tcp;
         tracing::info!(
             %tcp,
             mode = ?plan.mode,
@@ -429,15 +437,39 @@ impl FrontDoorRun {
             tracing::warn!(%tcp, "front-door TCP door: no site certificate ([control.tls] static, a `tls` build on unix), so TLS on the door is unavailable; ICE-TCP still runs");
             return;
         };
-        let routing = multiview_frontdoor::TlsRouting {
-            site: Some(site),
-            // TODO(#291): slice 5 wires the ACME `ChallengeResolver` here
-            // (TLS-ALPN-01); until then an `acme-tls/1` hello is closed.
-            acme: None,
-        };
+        // Read-modify-write: only the site half changes here, so a previously
+        // installed ACME (TLS-ALPN-01) responder is never clobbered back to
+        // `None` (#291).
         let service: Arc<dyn multiview_frontdoor::SiteService> = Arc::new(ControlSite(server));
-        if self.door.set_tls_routing(routing).is_ok() && self.door.set_site(Some(service)).is_ok() {
+        if self.door.set_site_config(Some(site)).is_ok()
+            && self.door.set_site(Some(service)).is_ok()
+        {
             tracing::info!(%tcp, tls_site = true, "front-door TCP door serves the site (HTTP/1.1 over the [control.tls] certificate)");
+        }
+    }
+
+    /// Install (or replace) the ACME TLS-ALPN-01 challenge responder on the
+    /// TCP door: only the ACME half of the routing changes, so a previously
+    /// installed site certificate keeps serving. `multiview run` calls this
+    /// once slice 5 PR B boots the `AcmeService` (#291); not called from this
+    /// crate yet.
+    #[cfg(all(feature = "tls", unix))]
+    pub fn install_acme_resolver(
+        &self,
+        resolver: Arc<multiview_control::certificate_source::ChallengeResolver>,
+    ) {
+        let Some(tcp) = self.door.tcp_local_addr() else {
+            return;
+        };
+        match multiview_control::acme_challenge_server_config(resolver) {
+            Ok(config) => {
+                if self.door.set_acme_config(Some(config)).is_ok() {
+                    tracing::info!(%tcp, "front-door TCP door serves the ACME TLS-ALPN-01 challenge responder");
+                }
+            }
+            Err(error) => {
+                tracing::error!(%error, %tcp, "front-door TCP door: building the ACME challenge TLS configuration failed; acme-tls/1 hellos keep closing");
+            }
         }
     }
 
@@ -457,6 +489,17 @@ impl FrontDoorRun {
     #[cfg(feature = "webrtc-native")]
     pub fn take_rtc_lane(&mut self) -> Option<multiview_frontdoor::RtcLane> {
         self.door.take_rtc_lane().ok()
+    }
+
+    /// Take the ICE-TCP lane (slice 4): `Some` only when the TCP door runs in
+    /// `direct` mode with `network.ice_tcp.enabled`. Its
+    /// [`local_port`](multiview_frontdoor::IceTcpLane::local_port) is the
+    /// passive candidates' port.
+    pub fn take_ice_tcp_lane(&mut self) -> Option<multiview_frontdoor::IceTcpLane> {
+        if !self.ice_tcp {
+            return None;
+        }
+        self.door.take_ice_tcp_lane().ok()
     }
 
     /// Take the QUIC lane, wrapped for the `MoQ` listener. Carries
@@ -734,6 +777,8 @@ areas = ["a"]
         let plan = tcp_config_from(&config).unwrap();
         assert_eq!(plan.door.listen, "[::1]:8443".parse().unwrap());
         assert!(plan.redirect.is_none());
+        // Design note section 8: no ICE-TCP behind a proxy.
+        assert!(!plan.door.ice_tcp);
         let trusted = plan.door.proxy.unwrap();
         assert!(trusted.contains("::1".parse().unwrap()));
         assert!(trusted.contains("10.9.8.7".parse().unwrap()));

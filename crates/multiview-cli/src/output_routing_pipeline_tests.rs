@@ -69,8 +69,14 @@ segment_ms = 1000
 type Seen = Arc<Mutex<Vec<(i64, bool, bool)>>>;
 /// Program-audio packets as a sink saw them.
 type SeenAudio = Arc<Mutex<Vec<multiview_ffmpeg::EncodedPacket>>>;
+/// Video packets as a sink saw them (for decoding).
+type SeenVideo = Arc<Mutex<Vec<multiview_ffmpeg::EncodedPacket>>>;
 
 fn recorder(seen: Seen, audio: SeenAudio) -> TestSinkRunner {
+    recorder_with_video(seen, audio, None)
+}
+
+fn recorder_with_video(seen: Seen, audio: SeenAudio, video: Option<SeenVideo>) -> TestSinkRunner {
     Box::new(move |rx| {
         let mut frames = 0;
         while let Ok(packet) = rx.recv() {
@@ -82,6 +88,12 @@ fn recorder(seen: Seen, audio: SeenAudio) -> TestSinkRunner {
                     .push(packet.clone_shared_ref().unwrap());
             }
             if packet.kind() == multiview_ffmpeg::StreamKind::Video {
+                if let Some(video) = video.as_ref() {
+                    video
+                        .lock()
+                        .unwrap()
+                        .push(packet.clone_shared_ref().unwrap());
+                }
                 let header = packet
                     .payload()
                     .is_some_and(|p| p.windows(4).any(|w| w == [0, 0, 1, 0xB3]));
@@ -100,6 +112,7 @@ struct Run {
     audio: Vec<Vec<multiview_ffmpeg::EncodedPacket>>,
     rendition_configs: usize,
     final_snapshot: Arc<RoutingSnapshot>,
+    video: Vec<Vec<multiview_ffmpeg::EncodedPacket>>,
 }
 
 /// Drive `ticks` real pipeline ticks; `control` runs on its own thread with
@@ -115,20 +128,49 @@ fn drive_config<F>(template: &str, audio: bool, prefix: &str, ticks: u64, contro
 where
     F: FnOnce(OutputRoutingSlot) + Send + 'static,
 {
+    drive_full(template, audio, false, prefix, ticks, control)
+}
+
+/// As [`drive_config`]; `switcher` attaches the document's M/E (Preview and
+/// Clean routable) and every output's video packets are kept for decoding.
+fn drive_full<F>(
+    template: &str,
+    audio: bool,
+    switcher: bool,
+    prefix: &str,
+    ticks: u64,
+    control: F,
+) -> Run
+where
+    F: FnOnce(OutputRoutingSlot) + Send + 'static,
+{
     let config =
         multiview_config::MultiviewConfig::load_from_toml(&template.replace('@', prefix)).unwrap();
     let mut pipeline = Pipeline::build(&config).unwrap();
     if audio {
         pipeline.enable_program_audio();
     }
+    if switcher {
+        crate::switcher_runtime::attach_first_slice(&mut pipeline, None)
+            .unwrap()
+            .expect("the document declares an M/E");
+    }
     let rendition_configs = pipeline.rendition_config_count();
     let slot = pipeline.output_routing();
     let seen: Vec<Seen> = (0..2).map(|_| Arc::new(Mutex::new(Vec::new()))).collect();
     let seen_audio: Vec<SeenAudio> = (0..2).map(|_| Arc::new(Mutex::new(Vec::new()))).collect();
+    let seen_video: Vec<SeenVideo> = (0..2).map(|_| Arc::new(Mutex::new(Vec::new()))).collect();
     let runners: Vec<TestSinkRunner> = seen
         .iter()
         .zip(&seen_audio)
-        .map(|(s, a)| recorder(Arc::clone(s), Arc::clone(a)))
+        .zip(&seen_video)
+        .map(|((s, a), v)| {
+            if switcher {
+                recorder_with_video(Arc::clone(s), Arc::clone(a), Some(Arc::clone(v)))
+            } else {
+                recorder(Arc::clone(s), Arc::clone(a))
+            }
+        })
         .collect();
     let clock = Arc::new(multiview_engine::ManualTimeSource::new());
     let stop_clock = Arc::new(AtomicBool::new(false));
@@ -177,6 +219,10 @@ where
             .collect(),
         rendition_configs,
         final_snapshot,
+        video: seen_video
+            .iter()
+            .map(|v| std::mem::take(&mut *v.lock().unwrap()))
+            .collect(),
     }
 }
 
@@ -638,4 +684,200 @@ fn a_private_bus_is_fed_the_post_loudnorm_program_pcm_up_to_g() {
         energy > 1.0,
         "the program mix is not silent before G: {energy}"
     );
+}
+
+/// One full-canvas cell on a bright solid source, an M/E (Clean routable),
+/// two HLS outputs with identical settings. A canvas large enough for the
+/// overlay bake to draw its per-tile chrome (state badge, label) in an
+/// `overlay` build.
+const CLEAN_CONFIG: &str = r##"
+schema_version = 1
+[canvas]
+width = 320
+height = 192
+fps = "25/1"
+pixel_format = "nv12"
+background = "#101014"
+[canvas.color]
+profile = "sdr-bt709-limited"
+[layout]
+kind = "grid"
+columns = ["1fr"]
+rows = ["1fr"]
+areas = ["a"]
+[[sources]]
+id = "@_a"
+kind = "solid"
+color = "#f0f0f0"
+[[sources]]
+id = "@_b"
+kind = "solid"
+color = "#202020"
+[[cells]]
+id = "pgm"
+area = "a"
+fit = "fill"
+[cells.source]
+input_id = "@_a"
+[[outputs]]
+id = "out0"
+kind = "hls"
+path = "/tmp/multiview-routing-e2e/@/a/index.m3u8"
+codec = "mpeg2video"
+segment_ms = 1000
+[[outputs]]
+id = "out1"
+kind = "hls"
+path = "/tmp/multiview-routing-e2e/@/b/index.m3u8"
+codec = "mpeg2video"
+segment_ms = 1000
+[switcher]
+[[switcher.mix_effects]]
+id = "me1"
+program = "main"
+program_source = "@_a"
+preview_source = "@_b"
+"##;
+
+/// Decode one output's video packets (mpeg2video, no reordering): the luma
+/// plane of every decoded picture, by packet PTS.
+fn decode_luma(
+    packets: &[multiview_ffmpeg::EncodedPacket],
+) -> std::collections::BTreeMap<i64, Vec<u8>> {
+    let codec = ffmpeg_next::decoder::find(ffmpeg_next::codec::Id::MPEG2VIDEO).unwrap();
+    let mut decoder = ffmpeg_next::codec::context::Context::new_with_codec(codec)
+        .decoder()
+        .video()
+        .unwrap();
+    let mut out = std::collections::BTreeMap::new();
+    let mut pending: std::collections::VecDeque<i64> = std::collections::VecDeque::new();
+    let mut frame = ffmpeg_next::frame::Video::empty();
+    let mut drain = |decoder: &mut ffmpeg_next::decoder::Video,
+                     pending: &mut std::collections::VecDeque<i64>,
+                     out: &mut std::collections::BTreeMap<i64, Vec<u8>>| {
+        while decoder.receive_frame(&mut frame).is_ok() {
+            let (w, h) = (
+                usize::try_from(frame.width()).unwrap(),
+                usize::try_from(frame.height()).unwrap(),
+            );
+            let stride = frame.stride(0);
+            let data = frame.data(0);
+            let mut luma = Vec::with_capacity(w * h);
+            for row in 0..h {
+                luma.extend_from_slice(&data[row * stride..row * stride + w]);
+            }
+            if let Some(pts) = pending.pop_front() {
+                out.insert(pts, luma);
+            }
+        }
+    };
+    for p in packets {
+        pending.push_back(p.pts().unwrap());
+        decoder.send_packet(&p.to_owned_packet()).unwrap();
+        drain(&mut decoder, &mut pending, &mut out);
+    }
+    decoder.send_eof().unwrap();
+    drain(&mut decoder, &mut pending, &mut out);
+    out
+}
+
+/// ADR-0108 slice 2 (§2.5): a take of output 1 to Clean through the real
+/// pipeline. Output 1 then carries the Program canvas BEFORE the overlay
+/// bake: in an `overlay` build its pictures differ from output 0's (Program,
+/// baked: per-tile chrome) where the bake draws, and are the flat source
+/// colour there; without `overlay` the bake is the identity and both match.
+/// PTS step stays one tick on both outputs; output 0 is untouched; routing
+/// only Clean never wakes the aux thread.
+#[test]
+fn a_take_to_clean_carries_the_pre_bake_canvas_through_the_real_pipeline() {
+    const TICKS: u64 = 250;
+    let observed = Arc::new(Mutex::new(None));
+    let record = Arc::clone(&observed);
+    let run = drive_full(
+        CLEAN_CONFIG,
+        false,
+        true,
+        "route_clean",
+        TICKS,
+        move |slot| {
+            let handle = wait_for("the routing handle", Duration::from_secs(10), || {
+                slot.load()
+            });
+            assert!(handle.has_preview(), "the M/E is attached");
+            let outcomes = handle.outcomes().expect("one outcome reader");
+            wait_for("the first routing tick", Duration::from_secs(10), || {
+                (handle.snapshot().video_keys > 0).then_some(())
+            });
+            std::thread::sleep(Duration::from_millis(400));
+            handle
+                .try_take(take("to-clean", 1, PictureBus::Clean))
+                .unwrap();
+            let o = wait_for("to-clean outcome", Duration::from_secs(10), || {
+                outcomes.try_recv().ok()
+            });
+            assert_eq!(o.outcome, TakeResult::Applied, "{o:?}");
+            let s = wait_for("snapshot", Duration::from_secs(1), || {
+                let s = handle.snapshot();
+                (s.outputs[1].bus == "clean").then_some(s)
+            });
+            assert_eq!(s.aux_ticks_sent, 0, "only Clean routed: no aux tick");
+            *record.lock().unwrap() = Some(o);
+        },
+    );
+    let applied = observed.lock().unwrap().clone().expect("applied");
+    assert_eq!(run.frames, TICKS);
+    assert_eq!(run.final_snapshot.aux_ticks_sent, 0, "aux never woke");
+    let all: Vec<i64> = (0..i64::try_from(TICKS).unwrap()).collect();
+    assert_eq!(pts_of(&run.outputs[0]), all, "output 0 untouched");
+    // Output 1 ends the run on a live-opened key: the router's end-of-run
+    // shutdown retires it and drops its last in-flight windows (an existing
+    // slice-1 end-of-run behaviour, not a Clean one), so its tail may be a
+    // few ticks short. Every packet it did get is contiguous from tick 0.
+    let o1 = pts_of(&run.outputs[1]);
+    assert!(
+        o1.len() + 4 >= all.len(),
+        "output 1 tail: {} of {}",
+        o1.len(),
+        all.len()
+    );
+    assert_eq!(o1, all[..o1.len()], "output 1: PTS step one tick, no gap");
+    let at = i64::try_from(applied.tick).unwrap();
+    let first = run.outputs[1].iter().find(|p| p.0 == at).unwrap();
+    assert!(
+        first.1 && first.2,
+        "the cut is a keyframe with a sequence header"
+    );
+    let program = decode_luma(&run.video[0]);
+    let clean = decode_luma(&run.video[1]);
+    // Compare settled pictures well after the cut (both encoders converged
+    // on the flat field).
+    let compared: Vec<i64> = (at + 20..at + 60)
+        .filter(|t| clean.contains_key(t))
+        .collect();
+    assert!(compared.len() >= 30, "decoded {} pictures", compared.len());
+    for t in &compared {
+        let (p, c) = (&program[t], &clean[t]);
+        assert_eq!(p.len(), c.len());
+        // The Clean picture is the un-overlaid canvas: one flat colour.
+        let (lo, hi) = c
+            .iter()
+            .fold((u8::MAX, u8::MIN), |(lo, hi), v| (lo.min(*v), hi.max(*v)));
+        assert!(
+            hi - lo <= 6,
+            "tick {t}: Clean is the flat source picture ({lo}..{hi})"
+        );
+        let differing = p
+            .iter()
+            .zip(c)
+            .filter(|(a, b)| a.abs_diff(**b) > 24)
+            .count();
+        if cfg!(feature = "overlay") {
+            assert!(
+                differing > 0,
+                "tick {t}: Program carries the baked chrome, Clean does not"
+            );
+        } else {
+            assert_eq!(differing, 0, "tick {t}: no bake in this build");
+        }
+    }
 }

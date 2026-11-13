@@ -1359,6 +1359,16 @@ fn conspect_router() -> Router<AppState> {
         )
 }
 
+/// The health-warning routes: the read-only list (SA-0 / ADR-0035: active
+/// capability mismatches, e.g. GPU present but compositing fell back to CPU,
+/// with remediation) and the acknowledgement of the persisted
+/// `accepted-state-rejected` warning (#324).
+fn health_router() -> Router<AppState> {
+    Router::new()
+        .route("/health", get(health::list_health))
+        .route("/health/{code}/ack", post(health::ack_health_warning))
+}
+
 /// Build the `/api/v1` resource + command routes (without the realtime or docs
 /// routes, which are wired by [`crate::router()`]).
 #[allow(clippy::too_many_lines)] // One `.route()` line per endpoint; splitting it loses the single at-a-glance map.
@@ -1377,9 +1387,7 @@ pub fn api_router() -> Router<AppState> {
         // Read-only structured log tail (ADR-0060): recent buffered records from
         // the bounded drop-oldest ring, filterable by resource/kind/level/since.
         .route("/logs", get(logs::list_logs))
-        // Read-only health warnings (SA-0 / ADR-0035): active capability mismatches
-        // (e.g. GPU present but compositing fell back to CPU) with remediation.
-        .route("/health", get(health::list_health))
+        .merge(health_router())
         // Read-only system capability + licence surface (ADR-W030): which
         // codec/compositor backends are available, the compositor class, the
         // effective build-profile licence, and the NDI attribution. System-global

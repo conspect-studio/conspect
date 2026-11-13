@@ -107,6 +107,26 @@ impl<P: Pacer> MultiviewProgram<P> {
         pacer: P,
         stop: StopSignal,
     ) -> Result<Self> {
+        let seed = time.now_nanos();
+        Self::with_seed(spec, clock, drive, time, pacer, stop, seed)
+    }
+
+    /// Like [`MultiviewProgram::new`] but anchored to an explicit tick-0
+    /// `seed_nanos` (see [`EngineRuntime::with_seed`]) — the migration handoff
+    /// that lets a NEW program continue OLD's exact tick timeline (#311).
+    ///
+    /// # Errors
+    ///
+    /// See [`MultiviewProgram::new`].
+    pub fn with_seed(
+        spec: &ProgramSpec,
+        clock: OutputClock,
+        drive: CompositorDrive<Nv12Image>,
+        time: Arc<dyn TimeSource>,
+        pacer: P,
+        stop: StopSignal,
+        seed_nanos: i64,
+    ) -> Result<Self> {
         // `ProgramKind` is `#[non_exhaustive]`: handle the multiview kind this
         // program serves and reject any other (future) kind with a typed error —
         // never a panic, never a silent skip.
@@ -117,7 +137,7 @@ impl<P: Pacer> MultiviewProgram<P> {
         if clock.cadence() != spec_cadence.rational() {
             return Err(Error::invalid_cadence(clock.cadence()));
         }
-        let runtime = EngineRuntime::new(clock, drive, time, pacer);
+        let runtime = EngineRuntime::with_seed(clock, drive, time, pacer, seed_nanos);
         Ok(Self {
             id: spec.id.clone(),
             runtime,
@@ -177,6 +197,18 @@ impl<P: Pacer> MultiviewProgram<P> {
     #[must_use]
     pub fn ticks_counter(&self) -> std::sync::Arc<std::sync::atomic::AtomicU64> {
         self.runtime.ticks_counter()
+    }
+
+    /// This program's outgoing handoff cell (see [`crate::runtime::Handoff`]).
+    #[must_use]
+    pub fn handoff(&self) -> std::sync::Arc<crate::runtime::Handoff> {
+        self.runtime.handoff()
+    }
+
+    /// Make this program the successor of the program owning `predecessor`
+    /// (see [`EngineRuntime::succeed`]).
+    pub fn succeed(&mut self, predecessor: std::sync::Arc<crate::runtime::Handoff>) {
+        self.runtime.succeed(predecessor);
     }
 
     /// The program's wait-free tick-lateness histogram (ADR-0108 §10).

@@ -738,8 +738,11 @@ impl FrontDoor {
         self.redirect
     }
 
-    /// Replace the TLS routing (site / ACME configurations); applies to the
-    /// next handshake.
+    /// Replace the whole TLS routing (site / ACME configurations); applies to
+    /// the next handshake. Overwrites both halves: prefer
+    /// [`set_site_config`](Self::set_site_config) /
+    /// [`set_acme_config`](Self::set_acme_config) to install one half without
+    /// clobbering the other.
     ///
     /// # Errors
     ///
@@ -751,6 +754,56 @@ impl FrontDoor {
             .tls
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = tls;
+        Ok(())
+    }
+
+    /// The current TLS routing (a read-modify-write seam for callers that
+    /// install one half at a time).
+    ///
+    /// # Errors
+    ///
+    /// [`Error::NoTcpDoor`] when the TCP door is not running.
+    pub fn tls_routing(&self) -> Result<TlsRouting, Error> {
+        let (_, state) = self.tcp.as_ref().ok_or(Error::NoTcpDoor)?;
+        Ok(state
+            .routing
+            .tls
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone())
+    }
+
+    /// Replace the site half of the TLS routing, keeping the current ACME
+    /// half untouched; applies to the next handshake.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::NoTcpDoor`] when the TCP door is not running.
+    pub fn set_site_config(&self, site: Option<Arc<rustls::ServerConfig>>) -> Result<(), Error> {
+        let (_, state) = self.tcp.as_ref().ok_or(Error::NoTcpDoor)?;
+        state
+            .routing
+            .tls
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .site = site;
+        Ok(())
+    }
+
+    /// Replace the ACME (TLS-ALPN-01) half of the TLS routing, keeping the
+    /// current site half untouched; applies to the next handshake.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::NoTcpDoor`] when the TCP door is not running.
+    pub fn set_acme_config(&self, acme: Option<Arc<rustls::ServerConfig>>) -> Result<(), Error> {
+        let (_, state) = self.tcp.as_ref().ok_or(Error::NoTcpDoor)?;
+        state
+            .routing
+            .tls
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .acme = acme;
         Ok(())
     }
 
