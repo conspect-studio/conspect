@@ -439,17 +439,19 @@ pub fn merge_file_edit(
                 &a.graphics.data_sources,
                 |d| d.id.clone(),
             ),
-            items: keyed(
+            items: keyed_with(
                 &p_graphics.items,
                 &n.graphics.items,
                 &a.graphics.items,
                 |i| i.id.clone(),
+                fields,
             ),
-            channels: keyed(
+            channels: keyed_with(
                 &p_graphics.channels,
                 &n.graphics.channels,
                 &a.graphics.channels,
                 |c| c.id.clone(),
+                fields,
             ),
         }),
         events: section(p_events, &n.events, &a.events),

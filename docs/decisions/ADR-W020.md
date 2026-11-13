@@ -123,7 +123,8 @@ output when one `[control] ui_dir` key changed (#367).
   each their own, and the colour block merges field by field; the switcher and its M/Es (by
   id) and the IPTV publication (scalars, and each entry by kind + ref) merge field by field, so editing one key keeps the API-set others; a layout change takes the
   file's layout with its cells (cells name the layout's areas), while a cells-only edit merges
-  cells by id; each routing crosspoint row (keyed by its destination) merges field by field,
+  cells by id; each routing crosspoint row (keyed by its destination) and each graphics item and channel (by
+  id) merge field by field,
   so a `bus` edit keeps an API-set audio/video feed. When the accepted list still equals the previous file's list, the new list is
   taken whole (a reorder lands). The function destructures `MultiviewConfig` exhaustively, so a new section is a
   compile error until the merge decides how an edit carries it.

@@ -427,3 +427,22 @@ fn a_routing_row_bus_edit_keeps_the_api_set_audio_feed() {
     assert_eq!(out.bus, OutputBus::Preview);
     assert_eq!(out.audio, api_audio);
 }
+
+/// Review L1 round 4: a graphics channel is merged field by field. A file
+/// rename keeps the API-set rundown.
+#[test]
+fn a_graphics_channel_rename_keeps_the_api_set_rundown() {
+    let doc = |name: &str, rundown: &str| {
+        parse(&format!(
+            "{}[[graphics.data_sources]]\nid = \"syd\"\nname = \"Sydney\"\nkind = \"bom_weather\"\nforecast_product = \"IDN11060\"\naac = \"NSW_PT131\"\n[[graphics.items]]\nid = \"a\"\nname = \"A\"\ntemplate = \"weather.today\"\ndata_source = \"syd\"\n[[graphics.items]]\nid = \"b\"\nname = \"B\"\ntemplate = \"weather.today\"\ndata_source = \"syd\"\n[[graphics.channels]]\nid = \"gfx1\"\nname = \"{name}\"\nrundown = [{rundown}]\n",
+            boot("/srv/ui-old")
+        ))
+    };
+    let prev = doc("Old", "\"a\"");
+    let next = doc("New", "\"a\"");
+    let accepted = doc("Old", "\"a\", \"b\"");
+    let merged = merge_file_edit(&prev, &next, &accepted);
+    let channel = &merged.graphics.channels[0];
+    assert_eq!(channel.name, "New");
+    assert_eq!(channel.rundown, ["a", "b"], "the API-set rundown stays");
+}
