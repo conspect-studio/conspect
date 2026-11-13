@@ -28,7 +28,7 @@ use crate::state::AppState;
 
 /// The receiver page's Content-Security-Policy (measured with the real CAF
 /// SDK: 0 violations; `receiver-work/REPORT.md`).
-pub const RECEIVER_CSP: &str = "default-src 'none'; script-src 'self' https://www.gstatic.com https://ajax.googleapis.com; style-src 'self' 'unsafe-inline'; img-src 'self' data:; media-src 'self' blob:; connect-src 'self' ws://localhost:8008; font-src 'self' https://fonts.gstatic.com; worker-src blob:";
+pub const RECEIVER_CSP: &str = "default-src 'none'; script-src 'self' https://www.gstatic.com https://ajax.googleapis.com; style-src 'self' 'unsafe-inline'; img-src 'self' data:; media-src 'self' https: blob:; connect-src 'self' https: ws://localhost:8008; font-src 'self' https://fonts.gstatic.com; worker-src blob:";
 
 const INDEX_HTML: &str = include_str!("../cast_receiver/index.html");
 const RECEIVER_JS: &str = include_str!("../cast_receiver/receiver.js");

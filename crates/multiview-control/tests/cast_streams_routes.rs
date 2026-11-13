@@ -1019,6 +1019,10 @@ async fn receiver_app_routes_headers_and_precedence() {
             h[header::CONTENT_SECURITY_POLICY],
             multiview_control::routes::cast_public::RECEIVER_CSP
         );
+        assert_eq!(
+            h[header::CONTENT_SECURITY_POLICY],
+            "default-src 'none'; script-src 'self' https://www.gstatic.com https://ajax.googleapis.com; style-src 'self' 'unsafe-inline'; img-src 'self' data:; media-src 'self' https: blob:; connect-src 'self' https: ws://localhost:8008; font-src 'self' https://fonts.gstatic.com; worker-src blob:"
+        );
     }
     let r = send(
         &rig.router,
@@ -1124,4 +1128,48 @@ fn the_token_never_reaches_a_log_line_an_event_or_the_audit_log() {
             assert!(!text.contains(&token), "token in an event");
         }
     });
+}
+
+#[tokio::test]
+async fn the_hosted_receiver_origin_is_reflected_everywhere() {
+    // The hosted receiver (another origin) plays any engine: its Origin is
+    // reflected on the media route, the report POST and both preflights,
+    // like any Origin.
+    let rig = rig();
+    let (_, doc) = create(&rig, OPERATOR_TOKEN, serde_json::json!({})).await;
+    let token = token_of(&doc);
+    let hosted = "https://cast.conspect.studio";
+    for (method, path) in [
+        ("OPTIONS", format!("/cast/{token}/report")),
+        ("OPTIONS", format!("/cast/{token}/master.m3u8")),
+        ("GET", format!("/cast/{token}/master.m3u8")),
+        ("GET", format!("/cast/{token}/seg-v-1-0.m4s")),
+        ("GET", format!("/cast/{}/master.m3u8", "D".repeat(43))),
+    ] {
+        let r = send(
+            &rig.router,
+            public(method, &path)
+                .header(header::ORIGIN, hosted)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(
+            r.headers()[header::ACCESS_CONTROL_ALLOW_ORIGIN],
+            hosted,
+            "{method} {path}"
+        );
+        assert_eq!(r.headers()[header::VARY], "Origin");
+    }
+    let r = send(
+        &rig.router,
+        public("POST", &format!("/cast/{token}/report"))
+            .header(header::CONTENT_TYPE, "application/json")
+            .header(header::ORIGIN, hosted)
+            .body(Body::from("{\"v\":1,\"state\":\"playing\"}"))
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(r.status(), StatusCode::NO_CONTENT);
+    assert_eq!(r.headers()[header::ACCESS_CONTROL_ALLOW_ORIGIN], hosted);
 }

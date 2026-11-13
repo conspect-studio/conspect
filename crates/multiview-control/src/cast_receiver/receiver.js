@@ -617,13 +617,17 @@
 
   // ---------------------------------------------------------------- LOAD
 
-  /** Accept only http(s)://<our origin>/cast/<token>/master.m3u8. Returns {url, base, tag} or null. */
+  /**
+   * Accept only <engine origin>/cast/<token>/master.m3u8. The engine is any https origin (the hosted receiver at
+   * cast.conspect.studio plays every install's engine); plain http only on this page's own origin (a self-hosted
+   * receiver). No credentials; a query or fragment is dropped. Returns {url, base, tag} or null.
+   */
   function parseStreamUrl(raw) {
     if (typeof raw !== 'string' || raw.length === 0 || raw.length > 512) { return null; }
     var u;
     try { u = new URL(raw); } catch (e) { return null; }
-    if (u.protocol !== 'http:' && u.protocol !== 'https:') { return null; }
-    if (u.origin !== location.origin || u.username || u.password) { return null; }
+    if (u.username || u.password) { return null; }
+    if (u.protocol !== 'https:' && !(u.protocol === 'http:' && u.origin === location.origin)) { return null; }
     var m = PATH_RE.exec(u.pathname);
     if (!m) { return null; }
     return { url: u.origin + u.pathname, base: u.origin + '/cast/' + m[1] + '/', tag: m[1].slice(0, 6) };
