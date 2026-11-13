@@ -1299,6 +1299,34 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/health/{code}/ack": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * `POST /api/v1/health/{code}/ack` — acknowledge the persisted
+         *     `accepted-state-rejected` warning (role: write, unscoped; #324).
+         * @description Removes the start-up fallback marker (on the blocking pool, under the
+         *     config-mutation lock — file I/O never runs on a runtime worker, and never on
+         *     the engine), then publishes `health.warning.cleared` through the
+         *     drop-oldest lane (inv #10) and waits briefly for the warning ingest to apply
+         *     it. Acknowledging silences the CURRENT alarm only: a later start that still
+         *     cannot use the saved configuration raises it again. The saved configuration
+         *     is not touched. An unreadable or unparsable marker still counts as pending
+         *     and is removed.
+         */
+        post: operations["ack_health_warning"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/inputs/{id}/events": {
         parameters: {
             query?: never;
@@ -6310,7 +6338,7 @@ export interface components {
         /** @description The body of an output plan / take. */
         OutputRouteRequest: {
             audio?: null | components["schemas"]["OutputTakeAudio"];
-            /** @description The feed: `{"bus":"program"|"preview"}` or `{"source":"vt1"}`. */
+            /** @description The feed: `{"bus":"program"|"preview"|"clean"}` or `{"source":"vt1"}`. */
             feed: Record<string, never>;
             /** @description The output and stream. */
             target: components["schemas"]["OutputTargetKind"];
@@ -6714,6 +6742,15 @@ export interface components {
             /** @description Cumulative per-bucket counts (edges, then overflow). */
             buckets_total: number[];
             /**
+             * @description The fine bucket upper edges, ms (0.05, 0.1, 0.25, then the coarse
+             *     edges; a final overflow bucket follows).
+             */
+            fine_bucket_edges_ms: number[];
+            /** @description Cumulative per-fine-bucket counts (fine edges, then overflow). */
+            fine_buckets_total: number[];
+            /** @description Per-fine-bucket counts in the window. */
+            fine_buckets_window: number[];
+            /**
              * Format: int64
              * @description Last-good repeats since the run started (`frames_repeated`).
              */
@@ -6729,16 +6766,36 @@ export interface components {
              */
             lateness_max_ms: number;
             /**
+             * Format: double
+             * @description Mean lateness over the window, ms (`null` when the window is empty).
+             */
+            lateness_mean_ms?: number | null;
+            /**
+             * Format: double
+             * @description Mean lateness since the run started, ms.
+             */
+            lateness_mean_total_ms?: number | null;
+            /**
              * Format: int64
              * @description Window ticks later than the last bucket edge (66.8 ms).
              */
             lateness_over_max_bucket: number;
             /**
              * Format: double
+             * @description p50 lateness over the window on the fine edges, ms.
+             */
+            lateness_p50_fine_ms?: number | null;
+            /**
+             * Format: double
              * @description p50 lateness over the window: the upper edge of its bucket, ms
              *     (`null` when empty or beyond the last edge).
              */
             lateness_p50_ms?: number | null;
+            /**
+             * Format: double
+             * @description p99 lateness over the window on the fine edges, ms.
+             */
+            lateness_p99_fine_ms?: number | null;
             /**
              * Format: double
              * @description p99 lateness over the window: the upper edge of its bucket, ms.
@@ -12068,6 +12125,54 @@ export interface operations {
             };
             /** @description Authenticated but not authorized to read. */
             403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
+    ack_health_warning: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Warning code to acknowledge; only `accepted-state-rejected` is acknowledgeable. */
+                code: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Acknowledged: the persisted marker is removed and the warning cleared. */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Missing or invalid credentials. */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Not authorized to acknowledge (read-only role, or a scoped key: this is a whole-system action). */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Not an acknowledgeable code, no config-file run, or nothing pending. */
+            404: {
                 headers: {
                     [name: string]: unknown;
                 };

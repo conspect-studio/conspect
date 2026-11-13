@@ -5,6 +5,11 @@
 //!   new-flow budget on top, and a separate global budget for datagrams that can
 //!   draw a QUIC Version Negotiation reply. Owned by the one dispatcher task, so
 //!   it needs no lock. Checked **before** any allocation for the datagram.
+//!   Well-formed STUN from an unvalidated source pays its own per-source and
+//!   global STUN budgets first (issue #289).
+//! * [`PeerBuckets`]: a generous per-established-peer bucket, so one spoofed
+//!   established 4-tuple cannot take the whole established lane queue
+//!   (issue #325). Bounded by the established-set caps.
 //! * [`EstablishedSet`]: the validated 4-tuples (remote addresses), written only
 //!   by the consumers after validation, capped, never cleared by traffic. The
 //!   dispatcher reads it with `try_read` and treats a contended lock as "not
@@ -12,6 +17,7 @@
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::RwLock;
 use std::time::Instant;
 
@@ -84,6 +90,21 @@ pub struct NewFlowLimits {
     /// addresses, all sources: bounds how fast noq can be made to create
     /// handshake state (each pending handshake lives until its deadline).
     pub initial_pps: u32,
+    /// Sustained well-formed STUN messages per second per source key from
+    /// unvalidated sources. An ICE agent paces checks at Ta >= 50 ms per
+    /// candidate pair, so 50/s fits a few pairs.
+    pub stun_per_source_pps: u32,
+    /// STUN burst per source key.
+    pub stun_per_source_burst: u32,
+    /// Sustained STUN messages per second from unvalidated sources, all
+    /// sources together (burst: a tenth of a second).
+    pub stun_global_pps: u32,
+    /// Sustained datagrams per second per established peer (generous: a
+    /// 4K WebRTC stream is ~1 500/s). Bounds what one spoofed established
+    /// 4-tuple can push into the established queue (issue #325).
+    pub established_peer_pps: u32,
+    /// Burst per established peer.
+    pub established_peer_burst: u32,
 }
 
 impl Default for NewFlowLimits {
@@ -95,6 +116,11 @@ impl Default for NewFlowLimits {
             max_sources: 16_384,
             vn_pps: 200,
             initial_pps: 200,
+            stun_per_source_pps: 50,
+            stun_per_source_burst: 50,
+            stun_global_pps: 5_000,
+            established_peer_pps: 20_000,
+            established_peer_burst: 4_000,
         }
     }
 }
@@ -110,6 +136,10 @@ pub enum Refusal {
     VersionNegotiation,
     /// The global handshake (Initial) budget is spent.
     Initial,
+    /// The source's STUN bucket is empty.
+    StunPerSource,
+    /// The global STUN budget is spent.
+    StunGlobal,
 }
 
 /// Which extra global budget a new-flow datagram pays, besides the
@@ -122,6 +152,9 @@ pub enum Budget {
     VersionNegotiation,
     /// The handshake (Initial) budget.
     Initial,
+    /// The per-source and global STUN budgets (a well-formed STUN message
+    /// from a non-established source).
+    Stun,
 }
 
 /// Per-source buckets (bounded LRU) plus global budgets. Single owner.
@@ -132,6 +165,8 @@ pub struct NewFlowLimiter {
     global: TokenBucket,
     vn: TokenBucket,
     initial: TokenBucket,
+    stun_sources: LruCache<SourceKey, TokenBucket>,
+    stun_global: TokenBucket,
 }
 
 impl NewFlowLimiter {
@@ -146,6 +181,12 @@ impl NewFlowLimiter {
             global: TokenBucket::new(limits.global_pps, (limits.global_pps / 10).max(1), now),
             vn: TokenBucket::new(limits.vn_pps, (limits.vn_pps / 10).max(1), now),
             initial: TokenBucket::new(limits.initial_pps, (limits.initial_pps / 10).max(1), now),
+            stun_sources: LruCache::new(max_sources),
+            stun_global: TokenBucket::new(
+                limits.stun_global_pps,
+                (limits.stun_global_pps / 10).max(1),
+                now,
+            ),
         }
     }
 
@@ -156,7 +197,9 @@ impl NewFlowLimiter {
     /// `initial_pps` handshakes per second, whatever the per-source and global
     /// budgets allow. Then
     /// the per-source bucket, so a single noisy source cannot spend the global
-    /// budget beyond its own rate, then the global budget.
+    /// budget beyond its own rate, then the global budget. A STUN message
+    /// pays its own per-source STUN bucket and the global STUN budget first,
+    /// so a refused STUN message spends nothing else.
     ///
     /// # Errors
     ///
@@ -167,6 +210,7 @@ impl NewFlowLimiter {
                 return Err(Refusal::VersionNegotiation);
             }
             Budget::Initial if !self.initial.try_take(now) => return Err(Refusal::Initial),
+            Budget::Stun => self.admit_stun(src, now)?,
             _ => {}
         }
         let key = SourceKey::of(src);
@@ -194,6 +238,53 @@ impl NewFlowLimiter {
         Ok(())
     }
 
+    fn admit_stun(&mut self, src: SocketAddr, now: Instant) -> Result<(), Refusal> {
+        let key = SourceKey::of(src);
+        let per_source = if let Some(bucket) = self.stun_sources.get_mut(&key) {
+            bucket.try_take(now)
+        } else {
+            let mut bucket = TokenBucket::new(
+                self.limits.stun_per_source_pps,
+                self.limits.stun_per_source_burst,
+                now,
+            );
+            let ok = bucket.try_take(now);
+            self.stun_sources.insert(key, bucket);
+            ok
+        };
+        if !per_source {
+            return Err(Refusal::StunPerSource);
+        }
+        if !self.stun_global.try_take(now) {
+            return Err(Refusal::StunGlobal);
+        }
+        Ok(())
+    }
+
+    /// Charge a supported-version Initial from an **established** source
+    /// address: the handshake budget and the global new-flow budget, never
+    /// the per-source bucket (issue #325: the address alone is spoofable, so
+    /// an Initial never bypasses the budgets that bound handshake state).
+    ///
+    /// # Errors
+    ///
+    /// [`Refusal::Initial`] or [`Refusal::Global`].
+    pub fn admit_initial_established(&mut self, now: Instant) -> Result<(), Refusal> {
+        if !self.initial.try_take(now) {
+            return Err(Refusal::Initial);
+        }
+        if !self.global.try_take(now) {
+            return Err(Refusal::Global);
+        }
+        Ok(())
+    }
+
+    /// STUN source keys currently tracked (never more than `max_sources`).
+    #[must_use]
+    pub fn tracked_stun_sources(&self) -> usize {
+        self.stun_sources.len()
+    }
+
     /// Source keys currently tracked (never more than `max_sources`).
     #[must_use]
     pub fn tracked_sources(&self) -> usize {
@@ -212,10 +303,16 @@ impl NewFlowLimiter {
 /// connected with MESSAGE-INTEGRITY; a confirmed QUIC handshake), read by the
 /// dispatcher without blocking. Lives entirely on the front-door runtime: no
 /// program-runtime task ever touches this lock.
+///
+/// Every insert that adds a new address and every remove that deletes one
+/// bumps a generation counter and wakes the steering updater
+/// ([`changed`](Self::changed)); the dispatcher never waits on it.
 #[derive(Debug)]
 pub struct EstablishedSet {
     cap: usize,
     addrs: RwLock<HashMap<SocketAddr, u32>>,
+    generation: AtomicU64,
+    changed: tokio::sync::Notify,
 }
 
 impl EstablishedSet {
@@ -225,6 +322,8 @@ impl EstablishedSet {
         Self {
             cap,
             addrs: RwLock::new(HashMap::with_capacity(cap.min(4096))),
+            generation: AtomicU64::new(0),
+            changed: tokio::sync::Notify::new(),
         }
     }
 
@@ -264,7 +363,38 @@ impl EstablishedSet {
             return false;
         }
         set.insert(addr, 1);
+        drop(set);
+        self.bump();
         true
+    }
+
+    fn bump(&self) {
+        self.generation.fetch_add(1, Ordering::Release);
+        // A stored permit: an updater that is busy compiling sees it next.
+        self.changed.notify_one();
+    }
+
+    /// Bumped on every membership change (an address added or removed).
+    #[must_use]
+    pub fn generation(&self) -> u64 {
+        self.generation.load(Ordering::Acquire)
+    }
+
+    /// Resolves after the next membership change (or at once if one happened
+    /// since the last wait). For the steering updater, never the dispatcher.
+    pub async fn changed(&self) {
+        self.changed.notified().await;
+    }
+
+    /// A copy of the addresses (bounded by the cap). Takes the read lock
+    /// (writers hold it for one map operation); for the steering updater,
+    /// never the dispatcher.
+    #[must_use]
+    pub fn snapshot(&self) -> Vec<SocketAddr> {
+        self.addrs
+            .read()
+            .map(|s| s.keys().copied().collect())
+            .unwrap_or_default()
     }
 
     /// Drop one reference to `addr` (its session or connection ended); the
@@ -276,6 +406,8 @@ impl EstablishedSet {
                 *refs = refs.saturating_sub(1);
                 if *refs == 0 {
                     set.remove(&addr);
+                    drop(set);
+                    self.bump();
                 }
             }
         }
@@ -298,6 +430,58 @@ impl EstablishedSet {
     #[must_use]
     pub const fn cap(&self) -> usize {
         self.cap
+    }
+}
+
+/// Per-established-peer token buckets, owned by the dispatcher (no lock).
+/// Bounded: at most `cap` entries (the sum of the established-set caps), LRU
+/// beyond; entries whose address left the established sets are pruned when
+/// the sets' generation changes.
+#[derive(Debug)]
+pub struct PeerBuckets {
+    pps: u32,
+    burst: u32,
+    buckets: LruCache<SocketAddr, TokenBucket>,
+}
+
+impl PeerBuckets {
+    /// An empty table of at most `cap` peers.
+    #[must_use]
+    pub fn new(limits: &NewFlowLimits, cap: usize) -> Self {
+        Self {
+            pps: limits.established_peer_pps,
+            burst: limits.established_peer_burst,
+            buckets: LruCache::new(cap.max(1)),
+        }
+    }
+
+    /// Take one token from `peer`'s bucket.
+    pub fn admit(&mut self, peer: SocketAddr, now: Instant) -> bool {
+        let peer = canonical(peer);
+        if let Some(b) = self.buckets.get_mut(&peer) {
+            return b.try_take(now);
+        }
+        let mut b = TokenBucket::new(self.pps, self.burst, now);
+        let ok = b.try_take(now);
+        self.buckets.insert(peer, b);
+        ok
+    }
+
+    /// Drop the buckets of peers `keep` no longer accepts.
+    pub fn retain(&mut self, mut keep: impl FnMut(SocketAddr) -> bool) {
+        self.buckets.retain(|addr, _| keep(*addr));
+    }
+
+    /// Peers tracked.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.buckets.len()
+    }
+
+    /// Whether no peer is tracked.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.buckets.is_empty()
     }
 }
 
@@ -437,6 +621,137 @@ mod tests {
         // Other new-flow traffic is unaffected by a spent handshake budget.
         let src: SocketAddr = "[2001:db8::7]:5".parse().unwrap();
         assert!(l.admit(src, Budget::None, t0).is_ok());
+    }
+
+    #[test]
+    fn one_source_is_held_to_its_stun_burst() {
+        let t0 = Instant::now();
+        let mut l = NewFlowLimiter::new(NewFlowLimits::default(), t0);
+        let src: SocketAddr = "[2001:db8:5::1]:3478".parse().unwrap();
+        let mut ok = 0;
+        let mut per_source = 0;
+        for _ in 0..1_000 {
+            match l.admit(src, Budget::Stun, t0) {
+                Ok(()) => ok += 1,
+                Err(Refusal::StunPerSource) => per_source += 1,
+                Err(other) => panic!("unexpected {other:?}"),
+            }
+        }
+        assert_eq!(ok, 50, "stun_per_source_burst");
+        assert_eq!(per_source, 950);
+        // A refused STUN message spent nothing of the generic per-source
+        // bucket: the same source still gets its whole 200 burst for other
+        // new-flow traffic.
+        let other = (0..1_000)
+            .filter(|_| l.admit(src, Budget::None, t0).is_ok())
+            .count();
+        assert_eq!(
+            other,
+            200 - 50,
+            "the 50 admitted STUN also paid the generic bucket"
+        );
+        // 100 ms later: 5 more STUN tokens (50/s).
+        let t1 = t0 + Duration::from_millis(100);
+        let again = (0..100)
+            .filter(|_| l.admit(src, Budget::Stun, t1).is_ok())
+            .count();
+        assert!(again <= 5, "{again}");
+    }
+
+    #[test]
+    fn rotating_slash_64s_are_held_to_the_global_stun_burst() {
+        let limits = NewFlowLimits {
+            max_sources: 1024,
+            ..NewFlowLimits::default()
+        };
+        let t0 = Instant::now();
+        let mut l = NewFlowLimiter::new(limits, t0);
+        let mut ok = 0usize;
+        let mut global = 0usize;
+        for i in 0..50_000u32 {
+            let o = i.to_be_bytes();
+            let src = SocketAddr::new(
+                IpAddr::V6(Ipv6Addr::new(
+                    0x2001,
+                    0xdb8,
+                    u16::from_be_bytes([o[0], o[1]]),
+                    u16::from_be_bytes([o[2], o[3]]),
+                    0,
+                    0,
+                    0,
+                    1,
+                )),
+                5000,
+            );
+            match l.admit(src, Budget::Stun, t0) {
+                Ok(()) => ok += 1,
+                Err(Refusal::StunGlobal) => global += 1,
+                Err(other) => panic!("unexpected {other:?}"),
+            }
+            assert!(l.tracked_stun_sources() <= 1024, "table never above cap");
+        }
+        assert_eq!(ok, 500, "global STUN burst = stun_global_pps / 10");
+        assert_eq!(global, 49_500);
+        assert_eq!(l.tracked_stun_sources(), 1024);
+        // Other traffic is unaffected by a spent STUN budget.
+        let src: SocketAddr = "[2001:db8:ffff::1]:5".parse().unwrap();
+        assert!(l.admit(src, Budget::None, t0).is_ok());
+        assert!(l.admit(src, Budget::Initial, t0).is_ok());
+    }
+
+    #[test]
+    fn an_initial_from_an_established_address_pays_initial_and_global() {
+        let t0 = Instant::now();
+        let mut l = NewFlowLimiter::new(NewFlowLimits::default(), t0);
+        let ok = (0..2_000)
+            .filter(|_| l.admit_initial_established(t0).is_ok())
+            .count();
+        assert_eq!(ok, 20, "initial burst");
+        assert_eq!(l.tracked_sources(), 0, "no per-source key");
+    }
+
+    #[test]
+    fn peer_buckets_bound_one_peer_and_the_table() {
+        let t0 = Instant::now();
+        let limits = NewFlowLimits::default();
+        let mut b = PeerBuckets::new(&limits, 4);
+        let peer: SocketAddr = "192.0.2.9:4000".parse().unwrap();
+        let mapped: SocketAddr = "[::ffff:192.0.2.9]:4000".parse().unwrap();
+        let ok = (0..10_000).filter(|_| b.admit(mapped, t0)).count();
+        assert_eq!(ok, 4_000, "established_peer_burst");
+        assert!(!b.admit(peer, t0), "mapped and plain v4 are one peer");
+        for i in 0..10u16 {
+            b.admit(SocketAddr::new(peer.ip(), i), t0);
+            assert!(b.len() <= 4);
+        }
+        b.retain(|a| a.port() == 9);
+        assert_eq!(b.len(), 1);
+    }
+
+    #[test]
+    fn established_set_changes_bump_the_generation() {
+        let set = EstablishedSet::new(4);
+        let a: SocketAddr = "[2001:db8::1]:1".parse().unwrap();
+        let g0 = set.generation();
+        assert!(set.insert(a));
+        assert_eq!(set.generation(), g0 + 1);
+        assert!(set.insert(a), "second reference");
+        assert_eq!(set.generation(), g0 + 1, "no membership change");
+        set.remove(a);
+        assert_eq!(set.generation(), g0 + 1, "one reference left");
+        set.remove(a);
+        assert_eq!(set.generation(), g0 + 2);
+        assert_eq!(set.snapshot(), Vec::<SocketAddr>::new());
+        // The stored permit: a waiter after the change resolves at once.
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            tokio::time::timeout(Duration::from_secs(1), set.changed())
+                .await
+                .unwrap();
+        });
     }
 
     #[test]

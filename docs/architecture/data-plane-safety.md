@@ -107,6 +107,10 @@ hard-rejects the forbidden configure flags, and CI `cargo deny` gates licenses a
   long synchronous codec/CUDA/VideoToolbox calls **must never** run on Tokio workers. A
   **control/IO plane** uses Tokio for networking and the HTTP/WS API.
   ([ADR-0009](../decisions/ADR-0009.md), [overview §4](overview.md))
+- **The output clock is a data-plane thread too.** Each program's tick loop runs on its own named
+  `clock-<program>` OS thread paced by an absolute-deadline sleep, never as a task on the control
+  runtime; everything it touches is a wait-free publish or a `try_*`
+  ([ADR-0109](../decisions/ADR-0109-output-clock-thread.md)).
 - **One decode actor per source**, feeding a small bounded drop-oldest queue — per-source isolation
   prevents head-of-line blocking, so one dead RTSP camera never freezes the multiview.
 - **Channels carry ref-counted pooled frame handles, never pixels.**

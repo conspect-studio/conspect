@@ -239,9 +239,10 @@ pub use versioning::{
     RevisionId, CONFIG_REVISION_KIND,
 };
 pub use warning_ingest::{
-    emit_accepted_state_rejected, emit_capability_warnings, emit_network_warnings,
+    bounded_text, bounded_warning_text, emit_accepted_state_rejected,
+    emit_accepted_state_rejected_cleared, emit_capability_warnings, emit_network_warnings,
     run_warning_ingest, warning_ingest_step, warning_transition, CompositeMismatchView,
-    NetworkMismatchView, WarningIngestStep,
+    NetworkMismatchView, WarningIngestStep, MAX_WARNING_TEXT,
 };
 pub use warning_store::{InMemoryWarningStore, WarningFilter, WarningRepository, WARNING_KIND};
 pub use watch_status::{ConfigWatchStatus, WatchStamp, WatchStatusBody};

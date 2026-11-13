@@ -20,7 +20,7 @@ use std::sync::Arc;
 
 use anyhow::Context as _;
 use clap::Parser as _;
-use multiview_cli::cli::{Cli, Command, NodeArgs, RunArgs, ValidateArgs};
+use multiview_cli::cli::{AcknowledgeFallbackArgs, Cli, Command, NodeArgs, RunArgs, ValidateArgs};
 use multiview_cli::control;
 use multiview_cli::run::{RunReport, SoftwareEngine};
 use multiview_cli::validate::validate_config;
@@ -157,12 +157,19 @@ async fn async_main() -> ExitCode {
     }
 
     let cli = Cli::parse();
+    // #309: this binary may be ended by the exit watchdog once an exit is
+    // decided (a fatal output fault, a stop signal, a failed run).
+    multiview_cli::exit_watchdog::enable();
     // Boxed: `dispatch` holds a whole `Pipeline` across awaits (clippy::large_futures).
     match Box::pin(dispatch(cli)).await {
         Ok(code) => code,
         Err(err) => {
             tracing::error!(error = %format!("{err:#}"), "command failed");
             eprintln!("multiview: error: {err:#}");
+            // #309: the Tokio runtime is dropped after this returns; anything
+            // still running on it is waited for there. Logged so the gap to the
+            // process exit is measurable.
+            tracing::info!("main returning; runtime shutdown next");
             ExitCode::FAILURE
         }
     }
@@ -204,7 +211,28 @@ async fn dispatch(cli: Cli) -> anyhow::Result<ExitCode> {
         // + control-plane state and exceeds clippy's large-future bound.
         Command::Run(args) => Box::pin(run_run(args)).await,
         Command::Node(args) => run_node(&args),
+        Command::AcknowledgeFallback(args) => run_acknowledge_fallback(&args),
     }
+}
+
+/// The `acknowledge-fallback` subcommand (#324): remove the persisted
+/// start-up fallback marker, silencing the current `accepted-state-rejected`
+/// alarm. A later start that still cannot use the saved configuration raises
+/// it again. The saved configuration is not touched.
+fn run_acknowledge_fallback(args: &AcknowledgeFallbackArgs) -> anyhow::Result<ExitCode> {
+    match multiview_cli::last_good::acknowledge(&args.config).map_err(anyhow::Error::msg)? {
+        Some(message) => {
+            println!("acknowledged the start-up fallback warning: {message}");
+            println!(
+                "the saved configuration is unchanged. The warning is raised again on every \
+                 start that still cannot use it, until it is fixed or replaced; a start that \
+                 uses it clears the warning by itself. A running engine's banner is cleared \
+                 only through the API (POST /api/v1/health/accepted-state-rejected/ack)."
+            );
+        }
+        None => println!("no start-up fallback warning is pending"),
+    }
+    Ok(ExitCode::SUCCESS)
 }
 
 /// The `node` subcommand (DEV-B5 / ADR-0045): resolve + validate the display-
@@ -279,14 +307,22 @@ async fn run_software(
     // (S1). A running engine is NEVER re-gated; this only refuses a *new* start at
     // the block-new-instance rung (the never-off-air promise).
     let plane = multiview_cli::licence::EntitlementPlane::from_env();
-    // #317: build from the start decision; a build failure on the accepted
-    // state falls back to a different last-good that builds. Only AFTER a
-    // successful build is a planned fallback committed to disk.
-    let (start, mut engine) =
-        multiview_cli::boot::build_with_fallback(start.clone(), &args.config, |config| {
-            SoftwareEngine::build_gated(config, plane.level()).map_err(|e| e.to_string())
-        })
-        .map_err(anyhow::Error::msg)?;
+    // #317/#324: build from the start decision; a STATE-class build failure on
+    // the accepted state falls back to a different last-good that builds, an
+    // environment-class one (an expired lease) is retried and then fails. Only
+    // AFTER a successful build is a planned fallback recorded (a kept copy +
+    // the persisted marker; desired.json itself is never changed).
+    let (start, mut engine) = multiview_cli::boot::build_with_fallback(
+        start.clone(),
+        &args.config,
+        &multiview_cli::boot::RetryPolicy::startup(),
+        |config| {
+            SoftwareEngine::build_gated(config, plane.level()).map_err(|e| {
+                multiview_cli::boot::BuildFailure::new(e.failure_class(), e.to_string())
+            })
+        },
+    )
+    .map_err(anyhow::Error::msg)?;
     let start =
         multiview_cli::boot::commit_fallback(start, &args.config).map_err(anyhow::Error::msg)?;
     let start = &start;
@@ -299,7 +335,14 @@ async fn run_software(
             .context("software bounded run")?
     } else {
         tracing::info!("software run: until Ctrl-C");
-        run_software_until_ctrl_c(&mut engine, start, &plane, &args.config).await?
+        {
+            let run = run_software_until_ctrl_c(&mut engine, start, &plane, &args.config).await;
+            if run.is_err() {
+                // #309: a failed run is an exit decision.
+                multiview_cli::exit_watchdog::arm(multiview_cli::exit_watchdog::ExitCause::Fatal);
+            }
+            run?
+        }
     };
 
     println!("{}", report.render());
@@ -328,15 +371,30 @@ async fn run_pipeline(
     // re-gated (the never-off-air promise).
     let plane = multiview_cli::licence::EntitlementPlane::from_env();
     multiview_cli::run::start_gate(plane.level()).map_err(|e| anyhow::anyhow!("{e}"))?;
-    // #317: build from the start decision; a build failure on the accepted
-    // state falls back to a different last-good that builds. Only AFTER a
-    // successful build is a planned fallback committed to disk (the operator's
-    // state is never moved aside for a fault that breaks every state).
-    let (start, built) =
-        multiview_cli::boot::build_with_fallback(start.clone(), &args.config, |config| {
-            Pipeline::build(config).map_err(|e| format!("building the pipeline: {e}"))
-        })
-        .map_err(anyhow::Error::msg)?;
+    // #317/#324: build from the start decision; a STATE-class build failure on
+    // the accepted state falls back to a different last-good that builds. An
+    // environment-class one (`PipelineError::Io` classified by its OS error
+    // kind — e.g. permission denied / a full volume creating the HLS dir — or a
+    // refused thread spawn) is retried on the same state and then fails: a
+    // fault that breaks every state never falls back. Only AFTER a successful
+    // build is a planned fallback recorded (a kept copy + the persisted marker;
+    // desired.json itself is never changed). No socket binds during the build:
+    // the control-plane/MoQ listeners bind later, so EADDRINUSE there fails
+    // start-up and never reaches this decision.
+    let (start, built) = multiview_cli::boot::build_with_fallback(
+        start.clone(),
+        &args.config,
+        &multiview_cli::boot::RetryPolicy::startup(),
+        |config| {
+            Pipeline::build(config).map_err(|e| {
+                multiview_cli::boot::BuildFailure::new(
+                    e.failure_class(),
+                    format!("building the pipeline: {e}"),
+                )
+            })
+        },
+    )
+    .map_err(anyhow::Error::msg)?;
     let start =
         multiview_cli::boot::commit_fallback(start, &args.config).map_err(anyhow::Error::msg)?;
     let start = &start;
@@ -374,7 +432,7 @@ async fn run_pipeline(
         // pipeline in (the set spawns it on its own supervised task).
         // Boxed: the run future carries the whole control-plane wiring
         // (clippy::large_futures; the front-door handle grew it past 16 KiB).
-        Box::pin(run_pipeline_until_ctrl_c(
+        let run = Box::pin(run_pipeline_until_ctrl_c(
             pipeline,
             start,
             &plane,
@@ -382,7 +440,13 @@ async fn run_pipeline(
             #[cfg(feature = "moq-output")]
             preview_budget,
         ))
-        .await?
+        .await;
+        if run.is_err() {
+            // #309: a failed run (startup or engine) is an exit decision; bound
+            // the runtime drop that follows `main`.
+            multiview_cli::exit_watchdog::arm(multiview_cli::exit_watchdog::ExitCause::Fatal);
+        }
+        run?
     };
 
     println!("{}", report.render());
@@ -875,7 +939,22 @@ async fn run_pipeline_until_ctrl_c(
     // engine `ProgramSet` member metadata.
     let cadence = pipeline.cadence();
 
-    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+    let (shutdown_tx, outer_shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+    // #309: the control server's drain starts at the end-of-run shutdown OR as
+    // soon as an exit is decided (`early_drain`), whichever comes first, so the
+    // drain gets the exit bound instead of starting after the source teardown.
+    let early_drain = std::sync::Arc::new(tokio::sync::Notify::new());
+    let (drain_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+    {
+        let early_drain = std::sync::Arc::clone(&early_drain);
+        tokio::spawn(async move {
+            tokio::select! {
+                _ = outer_shutdown_rx => {}
+                () = early_drain.notified() => {}
+            }
+            let _ = drain_tx.send(());
+        });
+    }
     // Conspect local-mesh (ADR-0051 §2/§5): start the always-on discovery loop
     // (best-effort, never blocks — inv #10) before serving, so `/api/v1/mesh/peers`
     // reflects live neighbours. The shared `MeshState` is wired into the control
@@ -1053,12 +1132,70 @@ async fn run_pipeline_until_ctrl_c(
     let stop_for_signal = stop.clone();
     let signal = tokio::spawn(async move {
         let which = await_shutdown_signal().await;
+        // #309: decide first, log second.
+        stop_for_signal.stop();
+        multiview_cli::exit_watchdog::arm(multiview_cli::exit_watchdog::ExitCause::Stop);
         tracing::info!(
             signal = which,
             "stop signal received; stopping after the current frame"
         );
-        stop_for_signal.stop();
     });
+    // #309: the durable shutdown work must land inside the exit bound, so it
+    // starts the moment ANY exit is decided (a stop signal or a fatal output
+    // fault), concurrently with the pipeline teardown — not after the slow
+    // source teardown. The ordinary end-of-run steps still run if there is time
+    // (the persist writes the same Running state again; idempotent).
+    let early_persist_state = running_persist.as_ref().map(|p| p.state.clone());
+    let decided_drain = std::sync::Arc::clone(&early_drain);
+    // A dedicated OS thread with its own small runtime: the main runtime's
+    // workers can be busy with the synchronous pipeline teardown (a task parked
+    // behind it would miss the bound), and this work must not depend on them.
+    let decided_stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let decided_stop_flag = Arc::clone(&decided_stop);
+    let decided = std::thread::Builder::new()
+        .name("multiview-exit-durable".to_owned())
+        .spawn(move || {
+            while multiview_cli::exit_watchdog::armed().is_none() {
+                if decided_stop_flag.load(std::sync::atomic::Ordering::Acquire) {
+                    return;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            // Begin the control plane's graceful drain now (the deadline cuts it).
+            decided_drain.notify_one();
+            // Journal counters first (bounded wait for the worker to apply it):
+            // the persist below can be the slower step.
+            if !multiview_cli::event_journal::flush_and_wait(std::time::Duration::from_millis(500))
+            {
+                tracing::warn!("the exit-time journal flush was not applied in time");
+            }
+            if let Some(state) = early_persist_state {
+                match tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                {
+                    Ok(rt) => match rt
+                        .block_on(multiview_control::boot_model::persist_running_now(&state))
+                    {
+                        Ok(()) => tracing::info!("exit-time running-state persist written"),
+                        Err(error) => tracing::warn!(
+                            error = %error,
+                            "the exit-time running-state persist was skipped (fail-soft)"
+                        ),
+                    },
+                    Err(error) => {
+                        tracing::warn!(error = %error, "no runtime for the exit-time persist");
+                    }
+                }
+            }
+        })
+        .map_err(|error| {
+            tracing::error!(
+                error = %error,
+                "could not start the exit-durable thread; the exit-time drain, persist and journal flush will not run early"
+            );
+        })
+        .ok();
 
     // Sample CPU/host-memory/per-GPU load at ~1.3 Hz and PUSH `Event::SystemMetrics`
     // onto the SAME outbound publisher the control plane forwards to the WebUI
@@ -1160,7 +1297,8 @@ async fn run_pipeline_until_ctrl_c(
         .unwrap_or(i64::MAX);
         let _ = multiview_control::emit_network_warnings(publisher.as_ref(), mismatch, since_nanos);
     }
-    announce_boot_fallback(start, publisher.as_ref());
+    // #317/#324: this start's fallback, or a persisted one not yet acknowledged.
+    let _raised = multiview_cli::last_good::announce(config_path, start, publisher.as_ref());
     let _last_good = spawn_last_good_recorder(start, config_path, &publisher, &stop);
 
     // MP-1 (ADR-0030 §2.2): build the engine `ProgramSet` and drive this single
@@ -1169,6 +1307,7 @@ async fn run_pipeline_until_ctrl_c(
     let report =
         drive_main_program_in_set(pipeline, cadence, &stop, &publisher, &preview_slot, drain)
             .await?;
+    let tenants_start = std::time::Instant::now();
 
     // The run is over: release this generation's preview demand explicitly
     // (the sweeper has stopped on the same signal, so nothing can re-adopt a
@@ -1192,29 +1331,18 @@ async fn run_pipeline_until_ctrl_c(
         signal,
     })
     .await;
+    tracing::info!(
+        stage = "run-tenants",
+        elapsed_ms = u64::try_from(tenants_start.elapsed().as_millis()).unwrap_or(u64::MAX),
+        "teardown stage done"
+    );
     // Ask the journal thread to persist pending repeat counters. Not joined, so
     // a counter still queued at process exit can be lost; its record is not.
     multiview_cli::event_journal::flush();
+    // A clean, undecided finish: let the durable thread end (it never armed).
+    decided_stop.store(true, std::sync::atomic::Ordering::Release);
+    drop(decided);
     Ok(report)
-}
-
-/// #317: when this run started from the last-good copy because the accepted
-/// state could not start, raise the latched `accepted-state-rejected` warning
-/// (UI banner + `GET /api/v1/health`). Before the output clock exists (inv #1),
-/// through the drop-oldest lane (inv #10).
-fn announce_boot_fallback(
-    start: &multiview_cli::boot::StartConfig,
-    publisher: &EnginePublisher<EngineStateSnapshot, Event>,
-) {
-    if let Some(fallback) = &start.boot_fallback {
-        let since_nanos = i64::try_from(
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map_or(0, |d| d.as_nanos()),
-        )
-        .unwrap_or(i64::MAX);
-        multiview_control::emit_accepted_state_rejected(publisher, fallback.message(), since_nanos);
-    }
 }
 
 /// #317: record the started accepted state as last-good after the first tick
@@ -1314,7 +1442,13 @@ async fn drive_main_program_in_set(
     // that first, THEN `shutdown` (raise any still-running program's stop — a no-op
     // here — and join every supervised task so no task is left detached).
     let recovered = report_rx.await;
+    let shutdown_start = std::time::Instant::now();
     programs.shutdown().await;
+    tracing::info!(
+        stage = "programset-shutdown",
+        elapsed_ms = u64::try_from(shutdown_start.elapsed().as_millis()).unwrap_or(u64::MAX),
+        "teardown stage done"
+    );
     match recovered {
         Ok(Ok(report)) => Ok(report),
         Ok(Err(reason)) => Err(anyhow::anyhow!(reason)).context("pipeline run until Ctrl-C"),
@@ -1497,11 +1631,13 @@ async fn run_software_until_ctrl_c(
     let stop_for_signal = stop.clone();
     let signal = tokio::spawn(async move {
         let which = await_shutdown_signal().await;
+        // #309: decide first, log second.
+        stop_for_signal.stop();
+        multiview_cli::exit_watchdog::arm(multiview_cli::exit_watchdog::ExitCause::Stop);
         tracing::info!(
             signal = which,
             "stop signal received; stopping after the current frame"
         );
-        stop_for_signal.stop();
     });
 
     // The off-hot-path system-metrics poller: samples whole-system CPU + host
@@ -1522,8 +1658,9 @@ async fn run_software_until_ctrl_c(
     // CONSPECT engine-seam S5 (ADR-0052 §3): the consent-independent local-metrics
     // retention feed for the software run.
     let (retention_store, retention_task) = spawn_metrics_retention(&publisher);
-    // #317: after the control plane's warning ingest subscribed.
-    announce_boot_fallback(start, publisher.as_ref());
+    // #317/#324: after the control plane's warning ingest subscribed — this
+    // start's fallback, or a persisted one not yet acknowledged.
+    let _raised = multiview_cli::last_good::announce(config_path, start, publisher.as_ref());
     let _last_good = spawn_last_good_recorder(start, config_path, &publisher, &stop);
 
     // DEV-C1 (ADR-M010): the outbound presentation epoch publishes on the
@@ -1546,8 +1683,12 @@ async fn run_software_until_ctrl_c(
 
     let report = engine
         .run_until_stopped_with_control(&stop, publisher.as_ref(), drain)
-        .await
-        .context("headless run until Ctrl-C")?;
+        .await;
+    if report.is_err() {
+        // #309: an engine error is an exit decision.
+        multiview_cli::exit_watchdog::arm(multiview_cli::exit_watchdog::ExitCause::Fatal);
+    }
+    let report = report.context("headless run until Ctrl-C")?;
 
     // The engine loop returned; tear down every run tenant in one call.
     shutdown_run_tenants(RunTenants {

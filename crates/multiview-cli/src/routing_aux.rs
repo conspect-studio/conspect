@@ -47,24 +47,28 @@ pub enum PictureBus {
     Program,
     /// The M/E's PVW source as a one-cell canvas.
     Preview,
+    /// The Program canvas before the overlay bake (published by the bake
+    /// consumer itself; not composed here).
+    Clean,
     /// One source as a one-cell canvas.
     Source(String),
 }
 
 impl PictureBus {
     /// The picture-bus name, matching [`VideoFeed::picture_bus`]:
-    /// `program`, `preview` or `src:<id>`.
+    /// `program`, `preview`, `clean` or `src:<id>`.
     #[must_use]
     pub fn as_str(&self) -> Cow<'_, str> {
         match self {
             Self::Program => Cow::Borrowed("program"),
             Self::Preview => Cow::Borrowed("preview"),
+            Self::Clean => Cow::Borrowed("clean"),
             Self::Source(id) => Cow::Owned(format!("src:{id}")),
         }
     }
 }
 
-/// A feed slice 1 cannot route (Clean or a layout).
+/// A feed that cannot be routed onto an output (a layout).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct UnroutableFeed;
 
@@ -75,6 +79,7 @@ impl TryFrom<&VideoFeed> for PictureBus {
         match feed {
             VideoFeed::Bus(OutputBus::Program) => Ok(Self::Program),
             VideoFeed::Bus(OutputBus::Preview) => Ok(Self::Preview),
+            VideoFeed::Bus(OutputBus::Clean) => Ok(Self::Clean),
             VideoFeed::Source(id) => Ok(Self::Source(id.clone())),
             _ => Err(UnroutableFeed),
         }
@@ -257,7 +262,8 @@ impl AuxState {
         }
         for feed in feeds.iter() {
             let source: Arc<str> = match &feed.bus {
-                PictureBus::Program => continue,
+                // Program and Clean come from the bake consumer, never here.
+                PictureBus::Program | PictureBus::Clean => continue,
                 PictureBus::Source(id) => match self.per_feed.get(&feed.key) {
                     Some(FeedState {
                         source: Some(s), ..
@@ -421,15 +427,18 @@ mod tests {
 
     #[test]
     fn picture_bus_names_match_the_config_feed_names() {
+        // Clean is now a routable picture bus (behaviour intentionally
+        // changed by #305): it joins the accepted feeds below instead of
+        // being refused. Only an actual layout feed is still unroutable.
         for feed in [
             VideoFeed::PROGRAM,
             VideoFeed::Bus(OutputBus::Preview),
+            VideoFeed::Bus(OutputBus::Clean),
             VideoFeed::Source("cam-1".to_owned()),
         ] {
             let bus = PictureBus::try_from(&feed).unwrap();
             assert_eq!(bus.as_str(), feed.picture_bus());
         }
-        assert!(PictureBus::try_from(&VideoFeed::Bus(OutputBus::Clean)).is_err());
         assert!(PictureBus::try_from(&VideoFeed::Layout("l".to_owned())).is_err());
     }
 

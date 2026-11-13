@@ -287,6 +287,26 @@ pub fn is_well_formed_stun(datagram: &[u8]) -> bool {
     declared % 4 == 0 && declared + 20 == datagram.len()
 }
 
+/// Whether a datagram the classifier delivers to the WebRTC lane is a STUN
+/// message (first byte 0-3 and a well-formed header): the dispatcher charges
+/// STUN from an unvalidated source to the STUN budgets ([`crate::Budget::Stun`]).
+#[must_use]
+pub fn is_stun(datagram: &[u8]) -> bool {
+    matches!(datagram.first(), Some(0..=3)) && is_well_formed_stun(datagram)
+}
+
+/// A QUIC Version Negotiation shape in the RTP range (issue #325): first byte
+/// 128-191 (only the top bit is fixed for VN, RFC 8999 section 5.3) and a zero
+/// version field (bytes 1-4). As RTP that would be payload type 0, sequence 0
+/// and timestamp high bytes 0, which a real stream sends at most once; the
+/// dispatcher drops it only from a source that is **not** established
+/// (unvalidated peers send no RTP before ICE and DTLS), so an established
+/// peer's media is never touched.
+#[must_use]
+pub fn is_vn_shaped_rtp(datagram: &[u8]) -> bool {
+    matches!(datagram.first(), Some(128..=191)) && datagram.get(1..5) == Some(&[0u8; 4][..])
+}
+
 /// A DTLS record long enough to carry a header: 13 bytes for the DTLS 1.2
 /// record layer (content types 20-25), 5 for a DTLS 1.3 unified header
 /// (`0b001xxxxx`, 32-63).
@@ -587,6 +607,31 @@ mod tests {
         assert_eq!(
             classify(&[0xc0, 0, 0, 0], false),
             Verdict::Drop(DropReason::BadQuicLong)
+        );
+    }
+
+    #[test]
+    fn stun_and_vn_shaped_rtp_helpers() {
+        assert!(is_stun(&stun_binding_request(2)));
+        let mut dtls = vec![0u8; 40];
+        dtls[0] = 22;
+        assert!(!is_stun(&dtls));
+        for first in 128..=191u8 {
+            let mut vn = vec![0u8; 40];
+            vn[0] = first;
+            assert!(is_vn_shaped_rtp(&vn), "{first}");
+            vn[2] = 96;
+            assert!(!is_vn_shaped_rtp(&vn));
+        }
+        let mut rtp = vec![0u8; 172];
+        rtp[0] = 0x80;
+        rtp[1] = 96;
+        assert!(!is_vn_shaped_rtp(&rtp), "ordinary RTP");
+        let mut vn_long = vec![0u8; 40];
+        vn_long[0] = 0xc0;
+        assert!(
+            !is_vn_shaped_rtp(&vn_long),
+            "192-255 is the long-header path"
         );
     }
 

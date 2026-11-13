@@ -34,6 +34,12 @@ tracing = { workspace = true }
 multiview-webrtc = { workspace = true, optional = true }
 listenfd = "1.0.2"
 
+# `SO_ATTACH_REUSEPORT_CBPF` (validated-flow steering) and `SO_RCVBUFFORCE`:
+# two `setsockopt` calls that neither std nor socket2 expose. Already in
+# Cargo.lock (MIT OR Apache-2.0); used only in `src/sys.rs`, Linux only.
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2.186"
+
 [features]
 default = []
 webrtc = ["dep:multiview-webrtc", "multiview-webrtc/native"]
@@ -57,5 +63,35 @@ moq-tokio = { version = "=0.19.34", default-features = false, features = ["noq",
 url = "2"
 anyhow = "1"
 
-[lints]
-workspace = true
+# FFI exception (as crates/multiview-ntpsys): the workspace forbids
+# `unsafe_code`, and a `forbid` cannot be relaxed by an inner attribute, so this
+# crate restates the workspace lint set verbatim with the single change of
+# `unsafe_code` from `forbid` to `deny`. The only `unsafe` is in `src/sys.rs`
+# (two `setsockopt` calls), each block `#[allow(unsafe_code)]` with a
+# `// SAFETY:` note. Keep in sync with the root Cargo.toml `[workspace.lints]`.
+[lints.rust]
+unsafe_code = "deny"
+unreachable_pub = "warn"
+rust_2018_idioms = { level = "warn", priority = -1 }
+
+[lints.clippy]
+all      = { level = "deny",  priority = -2 }
+pedantic = { level = "warn",  priority = -1 }
+unwrap_used      = "deny"
+expect_used      = "deny"
+panic            = "deny"
+todo             = "deny"
+unimplemented    = "deny"
+unreachable      = "deny"
+get_unwrap       = "deny"
+indexing_slicing = "deny"
+as_conversions   = "deny"
+exit             = "deny"
+mem_forget       = "deny"
+dbg_macro        = "deny"
+print_stdout     = "deny"
+print_stderr     = "deny"
+str_to_string    = "deny"
+missing_errors_doc = "warn"
+missing_panics_doc = "warn"
+must_use_candidate = "warn"
