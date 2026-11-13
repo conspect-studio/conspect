@@ -138,12 +138,19 @@ async fn main() -> ExitCode {
     }
 
     let cli = Cli::parse();
+    // #309: this binary may be ended by the exit watchdog once an exit is
+    // decided (a fatal output fault, a stop signal, a failed run).
+    multiview_cli::exit_watchdog::enable();
     // Boxed: `dispatch` holds a whole `Pipeline` across awaits (clippy::large_futures).
     match Box::pin(dispatch(cli)).await {
         Ok(code) => code,
         Err(err) => {
             tracing::error!(error = %format!("{err:#}"), "command failed");
             eprintln!("multiview: error: {err:#}");
+            // #309: the Tokio runtime is dropped after this returns; anything
+            // still running on it is waited for there. Logged so the gap to the
+            // process exit is measurable.
+            tracing::info!("main returning; runtime shutdown next");
             ExitCode::FAILURE
         }
     }
@@ -280,7 +287,14 @@ async fn run_software(
             .context("software bounded run")?
     } else {
         tracing::info!("software run: until Ctrl-C");
-        run_software_until_ctrl_c(&mut engine, start, &plane, &args.config).await?
+        {
+            let run = run_software_until_ctrl_c(&mut engine, start, &plane, &args.config).await;
+            if run.is_err() {
+                // #309: a failed run is an exit decision.
+                multiview_cli::exit_watchdog::arm(multiview_cli::exit_watchdog::ExitCause::Fatal);
+            }
+            run?
+        }
     };
 
     println!("{}", report.render());
@@ -355,7 +369,7 @@ async fn run_pipeline(
         // pipeline in (the set spawns it on its own supervised task).
         // Boxed: the run future carries the whole control-plane wiring
         // (clippy::large_futures; the front-door handle grew it past 16 KiB).
-        Box::pin(run_pipeline_until_ctrl_c(
+        let run = Box::pin(run_pipeline_until_ctrl_c(
             pipeline,
             start,
             &plane,
@@ -363,7 +377,13 @@ async fn run_pipeline(
             #[cfg(feature = "moq-output")]
             preview_budget,
         ))
-        .await?
+        .await;
+        if run.is_err() {
+            // #309: a failed run (startup or engine) is an exit decision; bound
+            // the runtime drop that follows `main`.
+            multiview_cli::exit_watchdog::arm(multiview_cli::exit_watchdog::ExitCause::Fatal);
+        }
+        run?
     };
 
     println!("{}", report.render());
@@ -856,7 +876,22 @@ async fn run_pipeline_until_ctrl_c(
     // engine `ProgramSet` member metadata.
     let cadence = pipeline.cadence();
 
-    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+    let (shutdown_tx, outer_shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+    // #309: the control server's drain starts at the end-of-run shutdown OR as
+    // soon as an exit is decided (`early_drain`), whichever comes first, so the
+    // drain gets the exit bound instead of starting after the source teardown.
+    let early_drain = std::sync::Arc::new(tokio::sync::Notify::new());
+    let (drain_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+    {
+        let early_drain = std::sync::Arc::clone(&early_drain);
+        tokio::spawn(async move {
+            tokio::select! {
+                _ = outer_shutdown_rx => {}
+                () = early_drain.notified() => {}
+            }
+            let _ = drain_tx.send(());
+        });
+    }
     // Conspect local-mesh (ADR-0051 §2/§5): start the always-on discovery loop
     // (best-effort, never blocks — inv #10) before serving, so `/api/v1/mesh/peers`
     // reflects live neighbours. The shared `MeshState` is wired into the control
@@ -1034,12 +1069,70 @@ async fn run_pipeline_until_ctrl_c(
     let stop_for_signal = stop.clone();
     let signal = tokio::spawn(async move {
         let which = await_shutdown_signal().await;
+        // #309: decide first, log second.
+        stop_for_signal.stop();
+        multiview_cli::exit_watchdog::arm(multiview_cli::exit_watchdog::ExitCause::Stop);
         tracing::info!(
             signal = which,
             "stop signal received; stopping after the current frame"
         );
-        stop_for_signal.stop();
     });
+    // #309: the durable shutdown work must land inside the exit bound, so it
+    // starts the moment ANY exit is decided (a stop signal or a fatal output
+    // fault), concurrently with the pipeline teardown — not after the slow
+    // source teardown. The ordinary end-of-run steps still run if there is time
+    // (the persist writes the same Running state again; idempotent).
+    let early_persist_state = running_persist.as_ref().map(|p| p.state.clone());
+    let decided_drain = std::sync::Arc::clone(&early_drain);
+    // A dedicated OS thread with its own small runtime: the main runtime's
+    // workers can be busy with the synchronous pipeline teardown (a task parked
+    // behind it would miss the bound), and this work must not depend on them.
+    let decided_stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let decided_stop_flag = Arc::clone(&decided_stop);
+    let decided = std::thread::Builder::new()
+        .name("multiview-exit-durable".to_owned())
+        .spawn(move || {
+            while multiview_cli::exit_watchdog::armed().is_none() {
+                if decided_stop_flag.load(std::sync::atomic::Ordering::Acquire) {
+                    return;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            // Begin the control plane's graceful drain now (the deadline cuts it).
+            decided_drain.notify_one();
+            // Journal counters first (bounded wait for the worker to apply it):
+            // the persist below can be the slower step.
+            if !multiview_cli::event_journal::flush_and_wait(std::time::Duration::from_millis(500))
+            {
+                tracing::warn!("the exit-time journal flush was not applied in time");
+            }
+            if let Some(state) = early_persist_state {
+                match tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                {
+                    Ok(rt) => match rt
+                        .block_on(multiview_control::boot_model::persist_running_now(&state))
+                    {
+                        Ok(()) => tracing::info!("exit-time running-state persist written"),
+                        Err(error) => tracing::warn!(
+                            error = %error,
+                            "the exit-time running-state persist was skipped (fail-soft)"
+                        ),
+                    },
+                    Err(error) => {
+                        tracing::warn!(error = %error, "no runtime for the exit-time persist");
+                    }
+                }
+            }
+        })
+        .map_err(|error| {
+            tracing::error!(
+                error = %error,
+                "could not start the exit-durable thread; the exit-time drain, persist and journal flush will not run early"
+            );
+        })
+        .ok();
 
     // Sample CPU/host-memory/per-GPU load at ~1.3 Hz and PUSH `Event::SystemMetrics`
     // onto the SAME outbound publisher the control plane forwards to the WebUI
@@ -1150,6 +1243,7 @@ async fn run_pipeline_until_ctrl_c(
     let report =
         drive_main_program_in_set(pipeline, cadence, &stop, &publisher, &preview_slot, drain)
             .await?;
+    let tenants_start = std::time::Instant::now();
 
     // The run is over: release this generation's preview demand explicitly
     // (the sweeper has stopped on the same signal, so nothing can re-adopt a
@@ -1173,9 +1267,17 @@ async fn run_pipeline_until_ctrl_c(
         signal,
     })
     .await;
+    tracing::info!(
+        stage = "run-tenants",
+        elapsed_ms = u64::try_from(tenants_start.elapsed().as_millis()).unwrap_or(u64::MAX),
+        "teardown stage done"
+    );
     // Ask the journal thread to persist pending repeat counters. Not joined, so
     // a counter still queued at process exit can be lost; its record is not.
     multiview_cli::event_journal::flush();
+    // A clean, undecided finish: let the durable thread end (it never armed).
+    decided_stop.store(true, std::sync::atomic::Ordering::Release);
+    drop(decided);
     Ok(report)
 }
 
@@ -1295,7 +1397,13 @@ async fn drive_main_program_in_set(
     // that first, THEN `shutdown` (raise any still-running program's stop — a no-op
     // here — and join every supervised task so no task is left detached).
     let recovered = report_rx.await;
+    let shutdown_start = std::time::Instant::now();
     programs.shutdown().await;
+    tracing::info!(
+        stage = "programset-shutdown",
+        elapsed_ms = u64::try_from(shutdown_start.elapsed().as_millis()).unwrap_or(u64::MAX),
+        "teardown stage done"
+    );
     match recovered {
         Ok(Ok(report)) => Ok(report),
         Ok(Err(reason)) => Err(anyhow::anyhow!(reason)).context("pipeline run until Ctrl-C"),
@@ -1478,11 +1586,13 @@ async fn run_software_until_ctrl_c(
     let stop_for_signal = stop.clone();
     let signal = tokio::spawn(async move {
         let which = await_shutdown_signal().await;
+        // #309: decide first, log second.
+        stop_for_signal.stop();
+        multiview_cli::exit_watchdog::arm(multiview_cli::exit_watchdog::ExitCause::Stop);
         tracing::info!(
             signal = which,
             "stop signal received; stopping after the current frame"
         );
-        stop_for_signal.stop();
     });
 
     // The off-hot-path system-metrics poller: samples whole-system CPU + host
@@ -1527,8 +1637,12 @@ async fn run_software_until_ctrl_c(
 
     let report = engine
         .run_until_stopped_with_control(&stop, publisher.as_ref(), drain)
-        .await
-        .context("headless run until Ctrl-C")?;
+        .await;
+    if report.is_err() {
+        // #309: an engine error is an exit decision.
+        multiview_cli::exit_watchdog::arm(multiview_cli::exit_watchdog::ExitCause::Fatal);
+    }
+    let report = report.context("headless run until Ctrl-C")?;
 
     // The engine loop returned; tear down every run tenant in one call.
     shutdown_run_tenants(RunTenants {
