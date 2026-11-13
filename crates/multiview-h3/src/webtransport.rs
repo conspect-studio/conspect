@@ -758,6 +758,39 @@ impl WtRecvStream {
     }
 }
 
+impl WtRecvStream {
+    /// One chunk from the QUIC stream, at most `max` bytes; `None` is the FIN.
+    ///
+    /// The stream is polled first and the session-close watch only when it
+    /// is `Pending`. noq's `ReadChunk::poll` removes the chunk from the
+    /// receive buffer in the same poll that returns `Ready` (moq-noq 1.3.5
+    /// `recv_stream.rs` `poll_read_chunk` -> `Assembler::read`) and consumes
+    /// nothing when it returns `Pending`; a `select!` could drop a `Ready`
+    /// chunk in favour of the close branch and lose it. A fresh `ReadChunk`
+    /// per poll is equivalent to one long-lived future: it holds no state.
+    async fn next_chunk(&mut self, max: usize) -> Result<Option<Bytes>, WtError> {
+        let stream = &mut self.stream;
+        let state = &self.state;
+        let result: Result<Option<Bytes>, WtError> = poll_fn(|cx| {
+            let read = stream.read_chunk(max);
+            let mut read = std::pin::pin!(read);
+            if let Poll::Ready(res) = read.as_mut().poll(cx) {
+                return Poll::Ready(res.map_err(map_read_error));
+            }
+            let closed = state.wait_closed();
+            let mut closed = std::pin::pin!(closed);
+            closed.as_mut().poll(cx).map(Err)
+        })
+        .await;
+        if result.is_err() {
+            let _ = self
+                .stream
+                .stop(noq::VarInt::from_u64(SESSION_GONE).unwrap_or(noq::VarInt::MAX));
+        }
+        result
+    }
+}
+
 impl web_transport_trait::RecvStream for WtRecvStream {
     type Error = WtError;
 
@@ -774,41 +807,26 @@ impl web_transport_trait::RecvStream for WtRecvStream {
             return Ok(Some(n));
         }
         self.check_session()?;
-        // See the comment on `WtSendStream::write`: noq's `read` consumes
-        // already-buffered assembler chunks inside `poll_read_buf`
-        // (moq-noq-1.3.5 recv_stream.rs `poll_read_generic`) on the very
-        // poll that returns `Ready`, atomically with returning the data —
-        // a `Pending` poll is `ReadStatus::Failed(None, Blocked)` with
-        // nothing consumed. `select!` can still drop a `Ready` outcome in
-        // favor of the close branch, discarding bytes the peer already
-        // sent and that this side already removed from the stream's
-        // buffer (they are not re-delivered on a later read). Poll the
-        // stream directly and give it priority for the same mutual-
-        // exclusion reason as the write side.
-        let stream = &mut self.stream;
-        let state = &self.state;
-        let empty = dst.is_empty();
-        let result: Result<Option<usize>, WtError> = poll_fn(|cx| {
-            if let Poll::Ready(res) = Pin::new(&mut *stream).poll_read(cx, dst) {
-                return Poll::Ready(
-                    res.map(|n| match n {
-                        0 if !empty => None,
-                        n => Some(n),
-                    })
-                    .map_err(map_read_error),
-                );
-            }
-            let closed = state.wait_closed();
-            let mut closed = std::pin::pin!(closed);
-            closed.as_mut().poll(cx).map(Err)
-        })
-        .await;
-        if result.is_err() {
-            let _ = self
-                .stream
-                .stop(noq::VarInt::from_u64(SESSION_GONE).unwrap_or(noq::VarInt::MAX));
+        if dst.is_empty() {
+            return Ok(Some(0));
         }
-        result
+        // Read through `read_chunk` so a FIN (`None`) is never confused with
+        // a zero-length read: noq's `poll_read` reports both as `Ok(0)`.
+        // (moq-noq-proto 1.3.5's assembler never stores an empty chunk, so
+        // an empty `Some` is skipped defensively, not expected.)
+        loop {
+            match self.next_chunk(dst.len()).await? {
+                None => return Ok(None),
+                Some(chunk) if chunk.is_empty() => {}
+                Some(chunk) => {
+                    let n = chunk.len().min(dst.len());
+                    if let (Some(out), Some(src)) = (dst.get_mut(..n), chunk.get(..n)) {
+                        out.copy_from_slice(src);
+                    }
+                    return Ok(Some(n));
+                }
+            }
+        }
     }
 
     async fn read_chunk(&mut self, max: usize) -> Result<Option<Bytes>, Self::Error> {
@@ -820,14 +838,7 @@ impl web_transport_trait::RecvStream for WtRecvStream {
             return Ok(Some(chunk));
         }
         self.check_session()?;
-        let state = Arc::clone(&self.state);
-        tokio::select! {
-            res = self.stream.read_chunk(max) => res.map_err(map_read_error),
-            err = state.wait_closed() => {
-                let _ = self.stream.stop(noq::VarInt::from_u64(SESSION_GONE).unwrap_or(noq::VarInt::MAX));
-                Err(err)
-            }
-        }
+        self.next_chunk(max).await
     }
 
     fn stop(&mut self, code: u32) {

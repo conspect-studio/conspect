@@ -186,6 +186,22 @@ async fn qpack_stream_sent_as_one_byte_frames_still_closes_the_connection() {
                                                  // meaningful assertion is the second connection below staying
                                                  // responsive throughout.
     assert!(started.elapsed() < Duration::from_secs(5));
+    // The work is bounded, observed rather than inferred: the drain reads
+    // one chunk per one-byte frame and stops at the 64-byte lifetime cap
+    // (at most 65 chunks), never draining the 200 frames sent.
+    let chunks = Counters::get(&server.endpoint.counters().qpack_chunks_read);
+    assert!((1..=65).contains(&chunks), "chunks read: {chunks}");
+    // And no single accept poll read more than the per-poll budget (4) from
+    // the stream (a high-water mark kept by the server). Limitation: noq's
+    // client coalesces small writes into larger STREAM frames, so this test
+    // cannot force more than a few chunks to be buffered at once; it checks
+    // the invariant whenever it does happen, and the 65-chunk bound above
+    // checks that the drain stops at the cap.
+    let per_poll = Counters::get(&server.endpoint.counters().qpack_max_chunks_per_poll);
+    assert!(
+        (1..=4).contains(&per_poll),
+        "chunks in one poll: {per_poll}"
+    );
     // The other connection is unaffected and was servable the whole time.
     let (resp, _) = fetch(&mut client.send, request(http::Method::GET, "/after")).await;
     assert_eq!(resp.status(), 200);

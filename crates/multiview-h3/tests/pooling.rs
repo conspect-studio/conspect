@@ -187,6 +187,25 @@ async fn pooled_connection_serves_pages_around_one_session() {
         .unwrap();
     assert_eq!(echoed, b"echo me");
 
+    // A larger payload in many small writes: `WtRecvStream::read` (behind
+    // `read_all`) must deliver every byte, in order, and report end of
+    // stream only at the FIN.
+    let payload: Vec<u8> = (0..300 * 1024u32)
+        .map(|i| u8::try_from(i % 251).unwrap())
+        .collect();
+    let (mut send, mut recv_stream) = client.conn.open_bi().await.unwrap();
+    send.write_all(&header).await.unwrap();
+    for piece in payload.chunks(997) {
+        send.write_all(piece).await.unwrap();
+    }
+    send.finish().unwrap();
+    let echoed = tokio::time::timeout(TIMEOUT, recv_stream.read_to_end(1024 * 1024))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(echoed.len(), payload.len());
+    assert!(echoed == payload, "the echoed bytes differ");
+
     // A second CONNECT on the same connection: 429, stream finished.
     let (resp, mut second) = open_session(&mut client, "/moq/x?ticket=u").await;
     assert_eq!(resp.status(), 429);

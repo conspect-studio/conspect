@@ -37,11 +37,24 @@ pub struct Counters {
     /// WebTransport streams reset because the session's bounded queue was
     /// full, or no session matched.
     pub wt_streams_rejected: AtomicU64,
+    /// Chunks the adapter read from peer QPACK streams (drained, never
+    /// decoded): bounded by the per-poll budget and the lifetime byte cap.
+    pub qpack_chunks_read: AtomicU64,
+    /// Accept-path polls of the QPACK drain that stopped on the per-poll
+    /// chunk budget with data still buffered.
+    pub qpack_budget_yields: AtomicU64,
+    /// The most chunks one QPACK-drain poll read from one stream (a
+    /// high-water mark, not a sum): at most the per-poll budget.
+    pub qpack_max_chunks_per_poll: AtomicU64,
 }
 
 impl Counters {
     pub(crate) fn inc(counter: &AtomicU64) {
         counter.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn max(counter: &AtomicU64, value: u64) {
+        counter.fetch_max(value, Ordering::Relaxed);
     }
 
     /// Reads one counter.

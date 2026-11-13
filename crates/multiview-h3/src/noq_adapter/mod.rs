@@ -584,6 +584,13 @@ impl Connection {
                     Poll::Pending => break false,
                     Poll::Ready(Ok(Some(chunk))) => {
                         chunks += 1;
+                        if let Some(g) = &self.guard {
+                            Counters::inc(&g.counters.qpack_chunks_read);
+                            Counters::max(
+                                &g.counters.qpack_max_chunks_per_poll,
+                                u64::try_from(chunks).unwrap_or(u64::MAX),
+                            );
+                        }
                         entry.seen = entry.seen.saturating_add(chunk.len());
                         if entry.seen > QPACK_STREAM_MAX {
                             let code = if entry.encoder {
@@ -611,6 +618,9 @@ impl Connection {
             i += 1;
         }
         if budget_exhausted {
+            if let Some(g) = &self.guard {
+                Counters::inc(&g.counters.qpack_budget_yields);
+            }
             cx.waker().wake_by_ref();
         }
         Ok(())
