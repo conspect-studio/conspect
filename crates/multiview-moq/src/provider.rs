@@ -1344,6 +1344,33 @@ impl Runtime {
         })
     }
 
+    /// [`serve_external`](Self::serve_external) for an async-interface
+    /// WebTransport session (`web_transport_trait::Session`, e.g. a
+    /// `multiview_h3::WtSession`), wrapped with moq-tokio's async-to-poll
+    /// adapter exactly as moq-tokio's own listener does.
+    pub async fn serve_webtransport<S>(
+        &self,
+        claim: Claim,
+        session: S,
+        peer: std::net::SocketAddr,
+        peers: Option<PeerHook>,
+    ) where
+        S: moq_net::web_transport_trait::Session,
+        moq_tokio::transport::Session<S>: moq_net::transport::poll::Boxable,
+        <moq_tokio::transport::Session<S> as moq_net::web_transport_trait::poll::Session>::SendStream:
+            moq_net::web_transport_trait::MaybeSync,
+        <moq_tokio::transport::Session<S> as moq_net::web_transport_trait::poll::Session>::RecvStream:
+            moq_net::web_transport_trait::MaybeSync,
+{
+        self.serve_external(
+            claim,
+            moq_tokio::transport::Session::new(session),
+            peer,
+            peers,
+        )
+        .await;
+    }
+
     /// Serves one external `MoQ` session for `claim` on the CURRENT runtime
     /// (the caller runs it on the front door's): the `MoQ` SETUP with exactly
     /// the configured version, bounded by [`EXTERNAL_HANDSHAKE_TIMEOUT`];
