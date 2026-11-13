@@ -152,9 +152,9 @@ impl DualBusDrive {
     pub fn compose(&self, tick: Tick, projection: SwitcherProjection) -> Result<BusFrames> {
         let pgm = self.program.compose(tick)?;
         let pvw = self.preview.compose(tick)?;
-        let pvw = Arc::new(pvw.canvas);
+        let pvw = pvw.canvas;
         let pgm = if projection.progress == Progress::ZERO {
-            Arc::new(pgm.canvas)
+            pgm.canvas
         } else if projection.progress == Progress::COMPLETE {
             Arc::clone(&pvw)
         } else {

@@ -1070,6 +1070,7 @@ impl multiview_control::program_metrics::ProgramMetricsSource for Counters {
         Some(multiview_control::program_metrics::ProgramCounters {
             lateness: self.0.snapshot(),
             frames_repeated: 3,
+            phases: multiview_engine::lateness::PhasesSnapshot::default(),
         })
     }
 }

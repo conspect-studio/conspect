@@ -15234,6 +15234,34 @@
           }
         }
       },
+      "ComposePhases": {
+        "type": "object",
+        "description": "The four parts of `compose_duration` (fresh ticks only).",
+        "required": [
+          "hook",
+          "composite",
+          "after_compose",
+          "project"
+        ],
+        "properties": {
+          "after_compose": {
+            "$ref": "#/components/schemas/PhaseHistogram",
+            "description": "`after_compose` (switcher commit, preview tap, routing aux offer)."
+          },
+          "composite": {
+            "$ref": "#/components/schemas/PhaseHistogram",
+            "description": "Sampling the sources and compositing the canvas."
+          },
+          "hook": {
+            "$ref": "#/components/schemas/PhaseHistogram",
+            "description": "The frame-boundary control hook (`before_compose`: command drain,\nswitcher, routing)."
+          },
+          "project": {
+            "$ref": "#/components/schemas/PhaseHistogram",
+            "description": "The per-tick state projection (encode hand-off, taps, state snapshot)\nplus `publish_state`."
+          }
+        }
+      },
       "CompositorCapability": {
         "type": "object",
         "description": "The compositor's resolved acceleration tier.",
@@ -19642,6 +19670,79 @@
           "manual_override"
         ]
       },
+      "PhaseHistogram": {
+        "type": "object",
+        "description": "One per-tick histogram on the fine edges (`fine_bucket_edges_ms`), over\nthe ~10 s window plus run totals (#311).",
+        "required": [
+          "window_ticks",
+          "max_ms",
+          "buckets_window",
+          "buckets_total"
+        ],
+        "properties": {
+          "buckets_total": {
+            "type": "array",
+            "items": {
+              "type": "integer",
+              "format": "int64",
+              "minimum": 0
+            },
+            "description": "Cumulative per-fine-bucket counts."
+          },
+          "buckets_window": {
+            "type": "array",
+            "items": {
+              "type": "integer",
+              "format": "int64",
+              "minimum": 0
+            },
+            "description": "Per-fine-bucket counts in the window (fine edges, then overflow)."
+          },
+          "max_ms": {
+            "type": "number",
+            "format": "double",
+            "description": "Largest value since the run started, ms."
+          },
+          "mean_ms": {
+            "type": [
+              "number",
+              "null"
+            ],
+            "format": "double",
+            "description": "Mean over the window, ms (`null` when empty)."
+          },
+          "mean_total_ms": {
+            "type": [
+              "number",
+              "null"
+            ],
+            "format": "double",
+            "description": "Mean since the run started, ms."
+          },
+          "p50_ms": {
+            "type": [
+              "number",
+              "null"
+            ],
+            "format": "double",
+            "description": "p50 over the window: the upper fine-bucket edge, ms (`null` when empty\nor beyond the last edge)."
+          },
+          "p99_ms": {
+            "type": [
+              "number",
+              "null"
+            ],
+            "format": "double",
+            "description": "p99 over the window: the upper fine-bucket edge, ms."
+          },
+          "window_ticks": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Ticks recorded in the window.",
+            "minimum": 0
+          }
+        }
+      },
       "PinVendorDoc": {
         "type": "string",
         "description": "`OpenAPI` mirror of `multiview_config::placement::PinVendor`.",
@@ -20024,7 +20125,11 @@
           "buckets_total",
           "fine_bucket_edges_ms",
           "fine_buckets_total",
-          "fine_buckets_window"
+          "fine_buckets_window",
+          "emit_lateness",
+          "wake_lateness",
+          "compose_duration",
+          "compose_phases"
         ],
         "properties": {
           "bucket_edges_ms": {
@@ -20043,6 +20148,18 @@
               "minimum": 0
             },
             "description": "Cumulative per-bucket counts (edges, then overflow)."
+          },
+          "compose_duration": {
+            "$ref": "#/components/schemas/PhaseHistogram",
+            "description": "Fresh-tick work: `before_compose` through `publish_state` (#311)."
+          },
+          "compose_phases": {
+            "$ref": "#/components/schemas/ComposePhases",
+            "description": "`compose_duration` split into its four parts."
+          },
+          "emit_lateness": {
+            "$ref": "#/components/schemas/PhaseHistogram",
+            "description": "Emit lateness (publish minus deadline, the value of the `lateness_*`\nfields above) as one fine histogram, fresh and repeated ticks (#311)."
           },
           "fine_bucket_edges_ms": {
             "type": "array",
@@ -20146,6 +20263,10 @@
             "format": "int64",
             "description": "Ticks emitted since the run started.",
             "minimum": 0
+          },
+          "wake_lateness": {
+            "$ref": "#/components/schemas/PhaseHistogram",
+            "description": "Wake lateness: the pacer's wait returning minus the deadline, before any\ncompose work (#311). OS wake latency plus clock-thread CPU starvation.\nWhen the previous tick's work overran this deadline the wait returns at\nonce and the value is that backlog, not a wake (fresh ticks only)."
           },
           "window_ticks": {
             "type": "integer",

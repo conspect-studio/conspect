@@ -1937,6 +1937,8 @@ impl RunnableOutput {
 pub struct ProgramMetricsHandles {
     /// Tick lateness histogram.
     pub lateness: Arc<multiview_engine::lateness::TickLateness>,
+    /// Wake latency and compose-phase histograms (#311).
+    pub phases: Arc<multiview_engine::lateness::TickPhases>,
     /// Cumulative last-good repeats.
     pub frames_repeated: Arc<std::sync::atomic::AtomicU64>,
 }
@@ -5063,6 +5065,7 @@ impl Pipeline {
         self.program_metrics
             .store(Some(Arc::new(ProgramMetricsHandles {
                 lateness: program.lateness(),
+                phases: program.phases(),
                 frames_repeated: program.frames_repeated_counter(),
             })));
         // Publish the run's epoch anchor (tick-0 seed + monotonic source) into
@@ -5211,10 +5214,11 @@ impl Pipeline {
             if let Some(obs) = hot_tick_observer.as_ref() {
                 obs.fetch_add(1, Ordering::Release);
             }
-            // The composited canvas, cloned once into an `Arc` reused for BOTH
-            // the bake/encode fan-out AND the live-preview slot (a single wait-
-            // free swap; the control plane serves the latest still off it).
-            let canvas = Arc::new(frame.canvas.clone());
+            // The composited canvas, shared (never copied on the clock thread,
+            // #311) by the bake/encode fan-out AND the live-preview slot (a
+            // single wait-free swap; the control plane serves the latest still
+            // off it).
+            let canvas = Arc::clone(&frame.canvas);
             preview.store(Some(Arc::clone(&canvas)));
             // The display heads ride the SAME pre-encode canvas `Arc` through
             // their wait-free mailboxes (one atomic bump + one lock-free swap

@@ -591,6 +591,8 @@ const ASYNCAPI_JSON: &str = include_str!("../../../docs/api/asyncapi.json");
         crate::routes::output_routing::OutputPlanRefusal,
         crate::routes::output_routing::OutputTakeAccepted,
         crate::program_metrics::ProgramMetricsReport,
+        crate::program_metrics::PhaseHistogram,
+        crate::program_metrics::ComposePhases,
         crate::routing::RoutePlan,
         crate::routing::RouteClass,
         crate::nmos::is04::Node,
