@@ -195,6 +195,14 @@ impl OutputRouting for Fake {
             converts,
         })
     }
+    fn plan_audio(
+        &self,
+        _output: &str,
+        _video: Option<&RoutedFeed>,
+        _audio: Option<&multiview_control::output_routing::RoutedAudio>,
+    ) -> Result<multiview_control::output_routing::AudioPlanCost, PlanRefusal> {
+        Ok(multiview_control::output_routing::AudioPlanCost::default())
+    }
     fn current_path(&self, output: &str) -> Option<PlanPath> {
         (output == OUT_B).then_some(PlanPath::P3)
     }
@@ -308,6 +316,9 @@ async fn get_lists_output_slots_with_redaction_and_per_object_omission() {
                     since_tick: 1,
                     pending: None,
                     degraded: false,
+                    audio: None,
+                    pending_audio: None,
+                    private_audio: false,
                 },
             ),
             (
@@ -317,6 +328,9 @@ async fn get_lists_output_slots_with_redaction_and_per_object_omission() {
                     since_tick: 5,
                     pending: Some(("src:bars".to_owned(), 3)),
                     degraded: true,
+                    audio: None,
+                    pending_audio: None,
+                    private_audio: false,
                 },
             ),
         ]),
@@ -554,7 +568,7 @@ async fn the_patch_take_and_the_alias_share_one_idempotency_store_and_limiter() 
     let takes = rig.fake.takes();
     assert_eq!(takes.len(), 1);
     assert_eq!(takes[0].output, OUT_A);
-    assert_eq!(takes[0].feed, RoutedFeed::Source("bars".into()));
+    assert_eq!(takes[0].video, Some(RoutedFeed::Source("bars".into())));
     // The same key on the alias replays the same operation; nothing new.
     let resp = send(
         &rig.router,

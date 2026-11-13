@@ -69,6 +69,29 @@ pub const REAPER_QUEUE: usize = 8;
 /// = 8 in the pipeline) on top of a full worker queue (`WORKER_QUEUE_TICKS` = 4)
 /// and the offers dropped meanwhile, so a transient stall never fails a key.
 pub const MAX_GAP_FILL_TICKS: u64 = 24;
+/// Operation-id prefixes of a start-up (boot) take — `boot:<output index>`
+/// and the audio-only `boot:audio:<output index>` — defined once in the
+/// control plane, whose outcome relay never persists a boot outcome
+/// ([`multiview_control::output_routing::is_boot_take`]). Every boot id is
+/// keyed on the OUTPUT INDEX, never parsed from the config id (PR #352 round
+/// 2): a config id (an HLS one is a path) can be arbitrarily long.
+pub use multiview_control::output_routing::{BOOT_AUDIO_TAKE_PREFIX, BOOT_TAKE_PREFIX};
+
+/// Whether `operation_id` is a video (or combined) boot take — the kind that
+/// enters the bounded retry window. An audio-only boot take
+/// (`boot:audio:<id>`) is a boot take too (never persisted) but has no fresh
+/// gate, so it is never retried.
+fn is_boot_video_take(operation_id: &str) -> bool {
+    multiview_control::output_routing::is_boot_take(operation_id)
+        && !operation_id.starts_with(BOOT_AUDIO_TAKE_PREFIX)
+}
+/// The principal a boot take is charged to.
+pub const BOOT_PRINCIPAL: &str = "system:boot";
+/// A refused boot take is re-issued at most once per this many seconds …
+pub const BOOT_RETRY_SECS: i64 = 2;
+/// … for at most this long after the run's first tick; then the output stays
+/// on Program (logged).
+pub const BOOT_WINDOW_SECS: i64 = 30;
 /// Live-opened workers' event queue to the consumer.
 const DYNAMIC_EVENT_QUEUE: usize = 64;
 const NO_FORCE: u64 = u64::MAX;
@@ -221,6 +244,9 @@ pub struct OutputRouteView {
     /// The output's audio choice: `follow`, `program`, `none`, `src:<id>`,
     /// `track:<name>`.
     pub audio_choice: String,
+    /// Whether the output runs a private encoded audio bus now (a take that
+    /// changes its audio then costs no new audio encode).
+    pub private_audio: bool,
 }
 
 /// Wait-free routing state, written by the consumer only on change.
@@ -262,6 +288,10 @@ pub struct RoutingSnapshot {
     /// canvas format and `bus@WxH/mode/anchor` for an output format (#342):
     /// a different format is a different key (+1).
     pub live_keys: Vec<(String, usize)>,
+    /// Start-up (boot) takes still inside their retry window (#329).
+    pub boot_takes_pending: usize,
+    /// Start-up takes given up: the output stayed on Program.
+    pub boot_takes_given_up: u64,
     /// Pending dispatcher moves the router could not cancel by re-asserting
     /// the output's key (it was already failed/retired); the move was
     /// cancelled directly instead (#330 item 4).
@@ -566,6 +596,27 @@ pub struct RouterConfig {
     /// Program/Clean ignore it: their key's format is the output's base key
     /// (its settings index), converted on the key's worker by the opener.
     pub formats: Vec<Option<AuxFormat>>,
+    /// The start-up take retry policy (#329).
+    pub boot_retry: BootRetryPolicy,
+}
+
+/// How a refused start-up (boot) take is retried: re-issued at most once per
+/// `retry_secs`, for at most `window_secs` after the run's first tick.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BootRetryPolicy {
+    /// Minimum seconds between two issues of one output's boot take.
+    pub retry_secs: i64,
+    /// The window after the first tick; then the output stays on Program.
+    pub window_secs: i64,
+}
+
+impl Default for BootRetryPolicy {
+    fn default() -> Self {
+        Self {
+            retry_secs: BOOT_RETRY_SECS,
+            window_secs: BOOT_WINDOW_SECS,
+        }
+    }
 }
 
 /// One picture feed: a bus at an output format (`None` = the canvas).
@@ -687,6 +738,16 @@ struct OutputState {
     pending: Option<Pending>,
 }
 
+/// A boot take being carried through its retry window (#329): one per output
+/// at most, so the state is O(outputs).
+struct BootRetry {
+    take: OutputTake,
+    /// The tick it was last issued (entered the take state machine).
+    issued: u64,
+    /// When refused: the tick it may be re-issued.
+    due: Option<u64>,
+}
+
 struct BusHealth {
     held: u64,
     fallen: bool,
@@ -735,6 +796,22 @@ pub struct OutputRouter {
     audio: Option<crate::routing_audio::RoutedAudio>,
     #[cfg(test)]
     audio_tap: crate::routing_audio::AudioTapCell,
+    /// Start-up (boot) takes (#329).
+    boot: BootTakes,
+    /// The run's first tick (the boot retry window's origin).
+    first_tick: Option<u64>,
+}
+
+/// The router's start-up (boot) take state, O(outputs).
+#[derive(Default)]
+struct BootTakes {
+    /// Per output: its boot take while inside the retry window.
+    slots: Vec<Option<BootRetry>>,
+    /// Boot takes given up (refused for good, or the window ended).
+    given_up: u64,
+    /// The audio of given-up combined boot takes, re-issued alone on the
+    /// next tick (at most one per output).
+    audio_after: Vec<OutputTake>,
 }
 
 impl OutputRouter {
@@ -757,31 +834,11 @@ impl OutputRouter {
     pub fn new_with_bus(
         cfg: RouterConfig,
         aux: AuxWiring,
-        mut open: BusOpenFn,
+        open: BusOpenFn,
     ) -> std::io::Result<(Self, OutputRoutingHandle)> {
         let (take_tx, takes) = mpsc::sync_channel(TAKE_MAILBOX);
         let (outcomes, outcome_rx) = mpsc::sync_channel(OUTCOME_CAPACITY);
-        let (open_tx, open_req_rx) = mpsc::sync_channel::<OpenRequest>(OPEN_QUEUE);
-        let (open_res_tx, open_rx) = mpsc::sync_channel::<OpenResult>(OPEN_QUEUE);
-        std::thread::Builder::new()
-            .name("routing-open".to_owned())
-            .spawn(move || {
-                while let Ok(req) = open_req_rx.recv() {
-                    let encoder = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        open(req.settings, &req.bus)
-                    }))
-                    .unwrap_or_else(|_| Err("encoder open panicked".to_owned()));
-                    if open_res_tx
-                        .send(OpenResult {
-                            id: req.id,
-                            encoder,
-                        })
-                        .is_err()
-                    {
-                        return;
-                    }
-                }
-            })?;
+        let (open_tx, open_rx) = spawn_opener(open)?;
         let (reap_tx, reap_rx) = mpsc::sync_channel::<Reap>(REAPER_QUEUE);
         let reaper = std::thread::Builder::new()
             .name("routing-reaper".to_owned())
@@ -855,6 +912,8 @@ impl OutputRouter {
             audio: None,
             #[cfg(test)]
             audio_tap,
+            boot: BootTakes::default(),
+            first_tick: None,
         };
         router.publish_snapshot();
         Ok((router, handle))
@@ -1041,7 +1100,10 @@ impl OutputRouter {
             self.video_keys = keys;
             self.dirty = true;
         }
+        self.first_tick.get_or_insert(tick);
         self.drain_takes(tick, dispatcher);
+        self.retry_boot_takes(tick);
+        self.issue_boot_audio_after(tick, dispatcher);
         self.drain_opens(tick, dispatcher);
         self.expire_orphan_opens(tick);
         self.drain_moves(tick, dispatcher);
@@ -1122,6 +1184,9 @@ impl OutputRouter {
 
     fn emit(&mut self, operation_id: String, output_index: usize, tick: u64, outcome: TakeResult) {
         self.dirty = true;
+        if is_boot_video_take(&operation_id) {
+            self.on_boot_outcome(&operation_id, output_index, tick, outcome);
+        }
         // Outcomes are rare control events (not per tick); the clone is the
         // output's current bus name at most.
         let bus = self
@@ -1145,6 +1210,155 @@ impl OutputRouter {
         }
     }
 
+    /// Ticks in `secs` seconds at the Program cadence (rounded up, at least 1).
+    fn ticks_for(&self, secs: i64) -> u64 {
+        let (num, den) = (self.cfg.cadence.num, self.cfg.cadence.den);
+        if num <= 0 || den <= 0 {
+            return 1;
+        }
+        let ticks = secs.saturating_mul(num).saturating_add(den - 1) / den;
+        u64::try_from(ticks).unwrap_or(1).max(1)
+    }
+
+    /// A boot take's outcome: applied or superseded ends it; a refusal the
+    /// gate may lift later (not fresh, capacity, encoder not ready) schedules
+    /// a re-issue, no sooner than [`BOOT_RETRY_SECS`] after the last one; any
+    /// other refusal gives up. The persisted feed is never touched here: the
+    /// operator's intent stays, the readback shows the live bus.
+    fn on_boot_outcome(
+        &mut self,
+        operation_id: &str,
+        index: usize,
+        tick: u64,
+        outcome: TakeResult,
+    ) {
+        let retry_ticks = self.ticks_for(self.cfg.boot_retry.retry_secs);
+        let Some(slot) = self.boot.slots.get_mut(index).filter(|slot| {
+            slot.as_ref()
+                .is_some_and(|b| b.take.operation_id == operation_id)
+        }) else {
+            return;
+        };
+        match outcome {
+            TakeResult::Refused(
+                RefuseReason::FeedNotFresh | RefuseReason::Capacity | RefuseReason::EncoderNotReady,
+            ) => {
+                if let Some(boot) = slot.as_mut() {
+                    boot.due = Some(tick.max(boot.issued.saturating_add(retry_ticks)));
+                }
+            }
+            TakeResult::Refused(reason) => {
+                if let Some(boot) = slot.take() {
+                    self.boot.given_up = self.boot.given_up.saturating_add(1);
+                    self.boot_audio_alone(&boot.take);
+                    tracing::warn!(
+                        output = index,
+                        feed = %boot.take.bus.as_ref().map_or_else(|| "-".into(), PictureBus::as_str),
+                        reason = reason.operator_message(),
+                        "routing: the start-up take cannot be carried; the output stays on Program"
+                    );
+                }
+            }
+            TakeResult::Applied | TakeResult::Superseded | TakeResult::Fallback(_) => {
+                *slot = None;
+            }
+        }
+    }
+
+    /// A given-up boot take that also carried a persisted audio feed (a
+    /// combined take): its audio is still applied, alone (audio-only takes
+    /// have no fresh gate), so the video's refusal never drops it. Keyed on
+    /// the OUTPUT INDEX (PR #352 round 2), never by re-parsing the give-up
+    /// take's `operation_id`: a config id can be arbitrarily long (an HLS
+    /// config id is its path), so the audio id is minted fresh from the
+    /// index, always well under `MAX_TAKE_ID_BYTES`.
+    fn boot_audio_alone(&mut self, take: &OutputTake) {
+        let Some(audio) = take.audio.clone() else {
+            return;
+        };
+        if self.boot.audio_after.len() >= self.outputs.len().max(1) {
+            return;
+        }
+        self.boot.audio_after.push(OutputTake {
+            operation_id: format!("{BOOT_AUDIO_TAKE_PREFIX}{}", take.output_index),
+            output_index: take.output_index,
+            bus: None,
+            audio: Some(audio),
+            principal: take.principal.clone(),
+        });
+    }
+
+    /// Start the audio-only takes [`Self::boot_audio_alone`] queued, on an
+    /// output with no take in flight (an operator take wins).
+    fn issue_boot_audio_after(&mut self, tick: u64, dispatcher: &mut RenditionDispatcher) {
+        for take in std::mem::take(&mut self.boot.audio_after) {
+            let index = take.output_index;
+            let Some(out) = self.outputs.get_mut(index) else {
+                continue;
+            };
+            if out.pending.is_some() {
+                continue;
+            }
+            out.pending = Some(Pending {
+                take,
+                started: tick,
+                phase: Phase::Priming,
+            });
+            self.dirty = true;
+            self.start_audio_take(index, tick, dispatcher);
+        }
+    }
+
+    /// Re-issue due boot takes inside the window; give up after it. Bounded:
+    /// one check per output, only while a boot take is still unresolved.
+    fn retry_boot_takes(&mut self, tick: u64) {
+        let window = self.ticks_for(self.cfg.boot_retry.window_secs);
+        let first = self.first_tick.unwrap_or(tick);
+        for index in 0..self.boot.slots.len() {
+            let Some(due) = self
+                .boot
+                .slots
+                .get(index)
+                .and_then(|b| b.as_ref())
+                .and_then(|b| b.due)
+            else {
+                continue;
+            };
+            if tick < due || self.outputs.get(index).is_none_or(|o| o.pending.is_some()) {
+                continue;
+            }
+            if tick.saturating_sub(first) > window {
+                if let Some(boot) = self.boot.slots.get_mut(index).and_then(Option::take) {
+                    self.boot.given_up = self.boot.given_up.saturating_add(1);
+                    self.boot_audio_alone(&boot.take);
+                    self.dirty = true;
+                    tracing::warn!(
+                        output = index,
+                        feed = %boot.take.bus.as_ref().map_or_else(|| "-".into(), PictureBus::as_str),
+                        window_secs = self.cfg.boot_retry.window_secs,
+                        "routing: the start-up feed never became takeable; the output stays on \
+                         Program (the configured feed is kept)"
+                    );
+                }
+                continue;
+            }
+            let Some(boot) = self.boot.slots.get_mut(index).and_then(Option::as_mut) else {
+                continue;
+            };
+            boot.issued = tick;
+            boot.due = None;
+            let take = boot.take.clone();
+            if let Some(out) = self.outputs.get_mut(index) {
+                out.pending = Some(Pending {
+                    take,
+                    started: tick,
+                    phase: Phase::Priming,
+                });
+                self.dirty = true;
+            }
+        }
+    }
+
     fn drain_takes(&mut self, tick: u64, dispatcher: &mut RenditionDispatcher) {
         loop {
             let take = match self.takes.try_recv() {
@@ -1152,6 +1366,21 @@ impl OutputRouter {
                 Err(TryRecvError::Empty | TryRecvError::Disconnected) => return,
             };
             let index = take.output_index;
+            // A boot take enters its retry window; an operator take on the
+            // same output replaces the boot intent for good. One slot per
+            // output, allocated on the first take (bounded by the outputs).
+            if self.boot.slots.len() < self.outputs.len() {
+                self.boot.slots.resize_with(self.outputs.len(), || None);
+            }
+            // Any later take on the output replaces a queued boot audio too.
+            self.boot.audio_after.retain(|b| b.output_index != index);
+            if let Some(slot) = self.boot.slots.get_mut(index) {
+                *slot = is_boot_video_take(&take.operation_id).then(|| BootRetry {
+                    take: take.clone(),
+                    issued: tick,
+                    due: None,
+                });
+            }
             let needs_switcher = matches!(take.bus, Some(PictureBus::Preview | PictureBus::Clean));
             // Audio rides the output's program-audio slot (§5.5): a run
             // without program audio, or an output without that slot (NDI,
@@ -2306,6 +2535,7 @@ impl OutputRouter {
                     .audio
                     .as_ref()
                     .map_or_else(|| "follow".to_owned(), |a| a.choice(i).label()),
+                private_audio: self.audio.as_ref().is_some_and(|a| a.has_private_bus(i)),
             })
             .collect();
         let next = RoutingSnapshot {
@@ -2330,6 +2560,8 @@ impl OutputRouter {
                 .map(crate::routing_audio::RoutedAudio::counters)
                 .unwrap_or_default(),
             live_keys: self.live_keys.clone(),
+            boot_takes_pending: self.boot.slots.iter().filter(|b| b.is_some()).count(),
+            boot_takes_given_up: self.boot.given_up,
             move_cancel_failures: self.move_cancel_failures,
         };
         if *self.snapshot.load() != next {
@@ -2432,6 +2664,35 @@ fn feed_order(key: &FeedKey) -> (String, Option<(u32, u32, String)>) {
             )
         }),
     )
+}
+
+/// Spawn the `routing-open` thread: it opens live encoders off the consumer
+/// (a panicking open is an error result, never a dead thread).
+fn spawn_opener(
+    mut open: BusOpenFn,
+) -> std::io::Result<(SyncSender<OpenRequest>, Receiver<OpenResult>)> {
+    let (open_tx, open_req_rx) = mpsc::sync_channel::<OpenRequest>(OPEN_QUEUE);
+    let (open_res_tx, open_rx) = mpsc::sync_channel::<OpenResult>(OPEN_QUEUE);
+    std::thread::Builder::new()
+        .name("routing-open".to_owned())
+        .spawn(move || {
+            while let Ok(req) = open_req_rx.recv() {
+                let encoder = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    open(req.settings, &req.bus)
+                }))
+                .unwrap_or_else(|_| Err("encoder open panicked".to_owned()));
+                if open_res_tx
+                    .send(OpenResult {
+                        id: req.id,
+                        encoder,
+                    })
+                    .is_err()
+                {
+                    return;
+                }
+            }
+        })?;
+    Ok((open_tx, open_rx))
 }
 
 /// Whether the `routing-aux` thread composes `bus` (Program and Clean come

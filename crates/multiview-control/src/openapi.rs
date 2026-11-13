@@ -607,7 +607,6 @@ const ASYNCAPI_JSON: &str = include_str!("../../../docs/api/asyncapi.json");
         crate::routes::output_routing::OutputTargetKind,
         crate::routes::output_routing::OutputTarget,
         crate::routes::output_routing::OutputStream,
-        crate::routes::output_routing::OutputTakeAudio,
         crate::routes::output_routing::OutputPlan,
         crate::routes::output_routing::OutputPlanCost,
         crate::routes::output_routing::OutputPlanRefusal,

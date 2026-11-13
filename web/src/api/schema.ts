@@ -2642,7 +2642,9 @@ export interface paths {
         put?: never;
         /**
          * `POST /api/v1/routing/output/take` — take an output feed (role: write;
-         *     both ends authorized; `Idempotency-Key` required). `202 {operation_id,
+         *     both ends authorized; `Idempotency-Key` required). `stream: video` takes
+         *     `feed` (and `audio` with it when present); `stream: audio` takes only
+         *     `audio` and leaves the video untouched. `202 {operation_id,
          *     status:"accepted", adopt:"next_tick"}`; a replay of the key answers the
          *     same operation with `status` `pending` or `settled` (+ outcome) and is never
          *     enqueued again. The outcome rides `route.output`.
@@ -6482,6 +6484,17 @@ export interface components {
         };
         /** @description The cost of an output take (§6.2, §6.3). */
         OutputPlanCost: {
+            /**
+             * @description Operator text of the audio cost, e.g. "+1 audio encode (transient,
+             *     CPU)"; absent when the take costs no audio encode.
+             */
+            audio_cost?: string | null;
+            /**
+             * Format: int32
+             * @description `1` when the take changes the output's audio and the output has no
+             *     private audio bus yet (+1 transient CPU AAC encode), else `0`.
+             */
+            audio_encoders?: number;
             /** @description `"N of M in use"` — whole-system principals only. */
             encoder_sessions?: string | null;
             /** @description Whether the take fits the encoder budget now. */
@@ -6496,7 +6509,10 @@ export interface components {
         OutputPlanRefusal: {
             /** @description Operator-facing text (never names an encoder group). */
             detail: string;
-            /** @description `capacity` | `unknown-feed` | `switcher-required` | `output-kind-unroutable`. */
+            /**
+             * @description `capacity` | `unknown-feed` | `switcher-required` |
+             *     `output-kind-unroutable` | `audio-unsupported`.
+             */
             type: string;
         };
         /** @description `OpenAPI` mirror of the `GET /api/v1/outputs/{id}/playback` response body. */
@@ -6516,9 +6532,21 @@ export interface components {
         };
         /** @description The body of an output plan / take. */
         OutputRouteRequest: {
-            audio?: null | components["schemas"]["OutputTakeAudio"];
-            /** @description The feed: `{"bus":"program"|"preview"|"clean"}` or `{"source":"vt1"}`. */
-            feed: Record<string, never>;
+            /**
+             * @description The audio feed, externally tagged like the config `audio`:
+             *     `"follow" | "program" | "none" | {"source":"<id>"} |
+             *     {"tracks":["<name>"]}`. Required with `stream: audio` (an audio-only
+             *     take); optional with `stream: video` (audio taken together with the
+             *     video; absent keeps the output's audio choice). One track at most:
+             *     the routed audio rides the output's single program-audio slot.
+             */
+            audio?: Record<string, never> | null;
+            /**
+             * @description The video feed: `{"bus":"program"|"preview"|"clean"}` or
+             *     `{"source":"vt1"}`. Required with `stream: video`; absent with
+             *     `stream: audio`.
+             */
+            feed?: Record<string, never> | null;
             /** @description The output and stream. */
             target: components["schemas"]["OutputTargetKind"];
         };
@@ -6527,8 +6555,16 @@ export interface components {
             /** @description The configured audio feed (`"follow"` unless set). */
             audio: Record<string, never>;
             /**
-             * @description What the audio carries now: `"program"` (the program mix),
-             *     `{"source": id}`, `"preview_source"`, or `{"redacted": true}`.
+             * @description The configured (persisted) video feed, redacted by the same rule. It
+             *     differs from `video` after a refused start-up take or a fallback: the
+             *     operator's intent is kept, Program is on air.
+             */
+            configured_video: Record<string, never>;
+            /**
+             * @description What the audio carries now (from the on-air feed): `"program"` (the program mix),
+             *     `{"source": id}`, `"preview_source"`, `"none"` (silence),
+             *     `{"tracks": [name]}`, or `{"redacted": true}`. From the engine's live
+             *     readback when it reports one, else resolved from the configured feed.
              */
             effective_audio: Record<string, never>;
             /** @description The output's API id (the id `/api/v1/outputs/{id}` addresses). */
@@ -6545,13 +6581,15 @@ export interface components {
              */
             state: string;
             /**
-             * @description Whether the feed follows the switcher (`program`) or is direct
+             * @description Whether the ON-AIR feed follows the switcher (`program`) or is direct
              *     (`source`) or the preview bus — the tally distinction (§8).
              */
             tally: components["schemas"]["OutputTally"];
             /**
-             * @description The configured video feed: `{"bus": "program"}`, `{"source": "vt1"}`,
-             *     or `{"redacted": true}` when the caller may not read the feed.
+             * @description The video feed ON AIR: the engine's live bus when it reports one for
+             *     this output, else the configured feed. `{"bus": "program"}`,
+             *     `{"source": "vt1"}`, or `{"redacted": true}` when the caller may not
+             *     read the feed.
              */
             video: Record<string, never>;
         };
@@ -6559,7 +6597,7 @@ export interface components {
          * @description The stream of an output a take re-points.
          * @enum {string}
          */
-        OutputStream: "video";
+        OutputStream: "video" | "audio";
         /** @description The `202` body of an output take. */
         OutputTakeAccepted: {
             /**
@@ -6584,11 +6622,6 @@ export interface components {
             tick?: number | null;
         };
         /**
-         * @description The audio request of an output take; slice 1 accepts only `follow`.
-         * @enum {string}
-         */
-        OutputTakeAudio: "follow";
-        /**
          * @description How an output's feed relates to the switcher (ADR-0108 §8 tally).
          * @enum {string}
          */
@@ -6597,7 +6630,11 @@ export interface components {
         OutputTarget: {
             /** @description The output API id (the id `/api/v1/outputs/{id}` addresses). */
             output: string;
-            /** @description The stream re-pointed: only `video` in slice 1. */
+            /**
+             * @description The stream re-pointed: `video` (the video feed, with an optional
+             *     audio feed alongside) or `audio` (an audio-only take: the video is
+             *     untouched).
+             */
             stream: components["schemas"]["OutputStream"];
         };
         /** @description The target of an output crosspoint, tagged on `kind` (never untagged). */
@@ -6773,11 +6810,20 @@ export interface components {
         /** @description A take in progress on one output. */
         PendingRoute: {
             /**
+             * @description The audio feed the pending take carries, when it carries one
+             *     (`"follow"`, `"program"`, `"none"`, `{"source": id}`,
+             *     `{"tracks": [name]}`, or `{"redacted": true}`).
+             */
+            audio?: Record<string, never> | null;
+            /**
              * Format: int64
              * @description Ticks the take has been held.
              */
             held_ticks: number;
-            /** @description The destination feed, or `{"redacted": true}`. */
+            /**
+             * @description The destination feed (the current feed for an audio-only take), or
+             *     `{"redacted": true}`.
+             */
             video: Record<string, never>;
         };
         /**
@@ -16995,7 +17041,7 @@ export interface operations {
                     "application/json": components["schemas"]["Problem"];
                 };
             };
-            /** @description `routing-unavailable`, `switcher-required`, `output-kind-unroutable`, `capacity`, or `conflict` (the Idempotency-Key was first used for another output or feed; nothing is enqueued). */
+            /** @description `routing-unavailable`, `switcher-required`, `output-kind-unroutable`, `capacity`, `audio-unsupported` (the output has no program-audio slot for a routed audio feed, or its transport cannot select a discrete track), or `conflict` (the Idempotency-Key was first used for another output, feed or audio; nothing is enqueued). */
             409: {
                 headers: {
                     [name: string]: unknown;
@@ -17004,7 +17050,7 @@ export interface operations {
                     "application/json": components["schemas"]["Problem"];
                 };
             };
-            /** @description `unknown-feed`, missing Idempotency-Key, or an unsupported audio request. */
+            /** @description `unknown-feed` (video or audio), `audio-unsupported` (more than one track: the output carries one routed audio feed), a body whose `stream` and `feed`/`audio` do not match (`stream: video` needs `feed`; `stream: audio` needs `audio` and no `feed`), or a missing Idempotency-Key. */
             422: {
                 headers: {
                     [name: string]: unknown;
@@ -17022,7 +17068,7 @@ export interface operations {
                     "application/json": components["schemas"]["Problem"];
                 };
             };
-            /** @description `engine-busy`: the take mailbox is full (the key is freed); or `idempotency-capacity`: the take store holds its maximum of distinct keys (fails closed; existing keys still replay). */
+            /** @description `engine-busy`: the take mailbox is full (the key is freed); or `idempotency-capacity`: the caller's (or every) take record is still pending at its cap (fails closed; pending keys still replay; settled records are evicted oldest-first otherwise). */
             503: {
                 headers: {
                     [name: string]: unknown;

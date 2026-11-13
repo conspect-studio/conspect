@@ -24,10 +24,11 @@ use crate::error::{ControlError, ControlResult};
 use crate::output_routing::PlanRefusal;
 use crate::state::AppState;
 
-/// Whether `principal` passes the output axis for `output` (the patch
-/// route's destination check: `ObjectAndOutput` + `authorize_output`).
+/// Whether `principal` passes the output end for `output`: object AND output
+/// axis, the one destination check of the patch routes, the alias and
+/// `GET /routing` ([`super::output_routing::authorize_output_end`]).
 pub(crate) fn may_patch_output(principal: &Principal, output: &str) -> bool {
-    super::output_routing::authorize_output_slot(principal, output).is_ok()
+    super::output_routing::authorize_output_end(principal, output).is_ok()
 }
 
 /// One validated output-slot request: the output and its video feed. Audio
@@ -230,6 +231,12 @@ pub(crate) fn plan(
                     "This output's kind cannot switch feeds live in this release",
                 ));
             }
+            Err(PlanRefusal::AudioUnsupported) => {
+                refused = Some(refusal(
+                    "audio-unsupported",
+                    "This output cannot carry a routed audio feed",
+                ));
+            }
         },
     }
     let mut crosspoints = Vec::with_capacity(req.crosspoints.len());
@@ -265,7 +272,16 @@ pub(crate) fn take(
         ));
     }
     Ok(
-        match take_output_slot0(state, principal, idem, &patch.output, &patch.video)? {
+        // Audio slot 0 `follow` rides the video take: the output's audio
+        // choice is kept (`None`), exactly as the alias without `audio`.
+        match take_output_slot0(
+            state,
+            principal,
+            idem,
+            &patch.output,
+            Some(&patch.video),
+            None,
+        )? {
             SlotTake::Accepted(op) => Ok(op),
             SlotTake::Replay(replay) => Ok(replay.operation_id.to_string()),
             SlotTake::Refused(response) => Err(response),

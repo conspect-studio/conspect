@@ -218,7 +218,7 @@ fn authorize(principal: &Principal, req: &PatchRequest) -> ControlResult<()> {
             authorize_scope(principal, AuthzScope::Program(PROGRAM))?;
         }
         if let Some(output) = &destination.output {
-            super::output_routing::authorize_output_slot(principal, output)?;
+            super::output_routing::authorize_output_end(principal, output)?;
         }
         if let Some(object) =
             source_id(&xp.source).or_else(|| xp.source.get("layout").and_then(Value::as_str))

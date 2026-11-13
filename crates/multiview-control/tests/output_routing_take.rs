@@ -79,8 +79,13 @@ const OUT_B_CONFIG_ID: &str = "hls /tmp/output-routing-take/b/index.m3u8";
 
 /// Scoped to output-1 and bars only (no Program scope, no M/E).
 const SCOPED_ROUTER_TOKEN: &str = "route-scoped.route-scoped-secret";
-/// Scoped to output-1 + the Program scope + me1 (may route buses).
+/// Scoped to output-1 (object AND output axis) + the Program scope + me1 (may
+/// route buses). Its output axis names output-1 explicitly: a key with an
+/// output allowlist may route only the outputs on it (#329 F2).
 const BUS_ROUTER_TOKEN: &str = "route-bus.route-bus-secret";
+/// Confined on the OUTPUT axis only (`scoped_output_ids = ["output-1"]`, no
+/// object list): ADR-W026's output-scoped key (#329 F2).
+const OUTPUT_AXIS_TOKEN: &str = "route-outaxis.route-outaxis-secret";
 /// Scoped to output-0 only.
 const OTHER_OUTPUT_TOKEN: &str = "route-other.route-other-secret";
 
@@ -112,6 +117,17 @@ fn keys() -> ApiKeyStore {
             &["output-1", "me1"],
             Some(vec!["program:main".to_owned(), "output-1".to_owned()]),
         ),
+    );
+    keys.register(
+        "route-outaxis",
+        "route-outaxis-secret",
+        Principal {
+            key_id: "route-outaxis".to_owned(),
+            role: Role::Operator,
+            scoped_object_ids: None,
+            scoped_output_ids: Some(vec!["output-1".to_owned()]),
+            scoped_discovery_domains: None,
+        },
     );
     keys.register(
         "route-other",
@@ -161,6 +177,7 @@ impl Fake {
                 tick: 77,
                 outcome: outcome.to_owned(),
                 feed: None,
+                audio: None,
             })
             .unwrap();
     }
@@ -173,6 +190,7 @@ impl Fake {
                 tick: 78,
                 outcome: outcome.to_owned(),
                 feed: Some(feed),
+                audio: None,
             })
             .unwrap();
     }
@@ -189,6 +207,14 @@ impl OutputRouting for Fake {
             sessions_in_use: s.in_use,
             sessions_max: 6,
         })
+    }
+    fn plan_audio(
+        &self,
+        _output: &str,
+        _video: Option<&RoutedFeed>,
+        _audio: Option<&multiview_control::output_routing::RoutedAudio>,
+    ) -> Result<multiview_control::output_routing::AudioPlanCost, PlanRefusal> {
+        Ok(multiview_control::output_routing::AudioPlanCost::default())
     }
     fn try_take(&self, take: OutputTakeRequest) -> Result<(), TakeSubmitError> {
         let mut s = self.state.lock().unwrap();
@@ -322,7 +348,7 @@ async fn take_is_202_replays_with_its_outcome_and_persists_only_after_applied() 
         takes[0].output, OUT_B_CONFIG_ID,
         "API id mapped to the config id"
     );
-    assert_eq!(takes[0].feed, RoutedFeed::Source("bars".into()));
+    assert_eq!(takes[0].video, Some(RoutedFeed::Source("bars".into())));
     assert_eq!(takes[0].principal, "operator-key", "charged to the key id");
     // Replay before the outcome: same op id, no outcome, nothing re-enqueued.
     let replay = body_json(
@@ -713,6 +739,9 @@ async fn readback_carries_live_state_and_redacts_unreadable_pending_feeds() {
             since_tick: 900,
             pending: Some(("src:secret-cam".into(), 12)),
             degraded: false,
+            audio: None,
+            pending_audio: None,
+            private_audio: false,
         },
     );
     rig.fake.state.lock().unwrap().live = Some(RoutingLive {
@@ -913,7 +942,8 @@ async fn replays_for_other_bodies_never_apply_twice_and_take_requires_a_key() {
     assert_eq!(rig.fake.takes().len(), 1);
 }
 
-/// Reserve `n` distinct takes in the take store the way the route does.
+/// Reserve `n` distinct takes in the take store the way the route does, each
+/// charged to its own principal (so no per-principal cap is met).
 fn fill_take_store(
     control: &multiview_control::output_routing::OutputRoutingControl,
     prefix: &str,
@@ -922,9 +952,11 @@ fn fill_take_store(
     for i in 0..n {
         let reserved = control.reserve_take(
             &format!("{prefix}-{i}"),
+            &format!("{prefix}-principal-{i}"),
             multiview_control::output_routing::PendingTake {
                 api_id: "output-0".to_owned(),
-                feed: RoutedFeed::Program,
+                feed: Some(RoutedFeed::Program),
+                audio: None,
             },
         );
         assert!(
@@ -949,11 +981,14 @@ fn scoped_take_key(key_id: &str, raw: &str) -> String {
     )
 }
 
-/// Review E1(a): the take store fails closed at its cap and never evicts:
-/// with 4096 records one more distinct key is `idempotency-capacity`, nothing
-/// is enqueued, and the oldest key still replays its own operation + outcome.
+/// Review E1(a), revised by #329 F3: the take store fails closed at its cap
+/// only when every record is PENDING — then one more distinct key is
+/// `idempotency-capacity`, nothing is enqueued, and the oldest (pending) key
+/// still replays its own operation. Once that oldest record is settled, the
+/// next distinct key evicts it (oldest settled first) and is accepted; a
+/// replay of the evicted key is then a new take (the documented trade-off).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_full_take_store_fails_closed_and_the_oldest_key_still_replays() {
+async fn a_full_take_store_fails_closed_only_when_all_pending_and_evicts_the_oldest_settled() {
     let dir = tempfile::tempdir().unwrap();
     let rig = rig(&dir.path().join("boot.toml"), true);
     let src = serde_json::json!({"source": "bars"});
@@ -967,9 +1002,7 @@ async fn a_full_take_store_fails_closed_and_the_oldest_key_still_replays() {
     .await;
     assert_eq!(first["status"], "accepted");
     let op = first["operation_id"].as_str().unwrap().to_owned();
-    rig.fake.emit(&op, OUT_B_CONFIG_ID, "refused:capacity");
     let control = rig.state.output_routing.clone().unwrap();
-    wait_for(|| control.outcome_of(&op).is_some()).await;
     let cap = multiview_control::output_routing::MAX_TAKE_RECORDS;
     assert_eq!(cap, 4096);
     fill_take_store(&control, "filler", cap - 1);
@@ -993,16 +1026,36 @@ async fn a_full_take_store_fails_closed_and_the_oldest_key_still_replays() {
     let replay = body_json(
         send(
             &rig.router,
-            take(&rig, OPERATOR_TOKEN, "oldest", "output-1", src),
+            take(&rig, OPERATOR_TOKEN, "oldest", "output-1", src.clone()),
         )
         .await,
     )
     .await;
     assert_eq!(replay["operation_id"], op.as_str());
-    assert_eq!(replay["status"], "settled");
-    assert_eq!(replay["outcome"], "refused:capacity");
-    assert_eq!(replay["tick"], 77);
-    assert_eq!(rig.fake.takes().len(), 1);
+    assert_eq!(
+        replay["status"], "pending",
+        "a pending record is never evicted"
+    );
+    // Settle the oldest: it becomes the eviction candidate.
+    rig.fake.emit(&op, OUT_B_CONFIG_ID, "refused:capacity");
+    wait_for(|| control.outcome_of(&op).is_some()).await;
+    // Past the per-output rate window before the next fresh take.
+    tokio::time::sleep(Duration::from_millis(1100)).await;
+    let resp = body_json(
+        send(
+            &rig.router,
+            take(&rig, OPERATOR_TOKEN, "one-more", "output-1", src.clone()),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(resp["status"], "accepted", "{resp}");
+    assert_eq!(rig.fake.takes().len(), 2);
+    assert_eq!(control.records_len(), cap, "one evicted, one added");
+    assert!(
+        control.outcome_of(&op).is_none(),
+        "the oldest settled record was evicted"
+    );
 }
 
 /// Review E1(b): another route releasing (or rebinding) the same scoped string
@@ -1082,6 +1135,203 @@ async fn two_principals_with_the_same_raw_key_get_separate_takes() {
     assert_eq!(rig.fake.takes().len(), 2);
 }
 
+/// #329 F1(c): with a live snapshot whose bus differs from the persisted
+/// feed (a refused boot take, a fallback), `video` and `tally` are the LIVE
+/// bus and `configured_video` the persisted feed; each is redacted by its own
+/// rule; without a snapshot the row is today's configured view.
+#[allow(clippy::too_many_lines)] // One scenario: configured, then live readback.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn readback_reports_the_live_bus_and_the_configured_feed_separately() {
+    let dir = tempfile::tempdir().unwrap();
+    let rig = rig(&dir.path().join("boot.toml"), true);
+    let row = |state: &serde_json::Value| {
+        state["outputs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["output"] == "output-1")
+            .cloned()
+            .unwrap()
+    };
+    // Persist out1 = source bars (an applied take), no live snapshot yet.
+    let resp = send(
+        &rig.router,
+        take(
+            &rig,
+            OPERATOR_TOKEN,
+            "p1",
+            "output-1",
+            serde_json::json!({"source": "bars"}),
+        ),
+    )
+    .await;
+    let op = body_json(resp).await["operation_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    rig.fake.emit_with_feed(
+        &op,
+        OUT_B_CONFIG_ID,
+        "applied",
+        RoutedFeed::Source("bars".into()),
+    );
+    wait_for(|| persisted_feed(&rig.state, OUT_B_CONFIG_ID).is_some()).await;
+    let r = row(&body_json(send(&rig.router, get("/api/v1/routing", OPERATOR_TOKEN)).await).await);
+    assert_eq!(r["state"], "configured");
+    assert_eq!(r["video"], serde_json::json!({"source": "bars"}));
+    assert_eq!(r["configured_video"], serde_json::json!({"source": "bars"}));
+    assert_eq!(r["tally"], "direct");
+    // The engine is on Program for that output (e.g. after a restart whose
+    // boot take was refused).
+    let mut outputs = HashMap::new();
+    outputs.insert(
+        OUT_B_CONFIG_ID.to_owned(),
+        OutputLive {
+            bus: "program".into(),
+            since_tick: 3,
+            pending: None,
+            degraded: false,
+            audio: None,
+            pending_audio: None,
+            private_audio: false,
+        },
+    );
+    rig.fake.state.lock().unwrap().live = Some(RoutingLive {
+        outputs,
+        encoders: 1,
+        sessions_in_use: 0,
+        sessions_max: 6,
+        dropped_ticks: 0,
+    });
+    let r = row(&body_json(send(&rig.router, get("/api/v1/routing", OPERATOR_TOKEN)).await).await);
+    assert_eq!(r["state"], "on_air");
+    assert_eq!(r["video"], serde_json::json!({"bus": "program"}), "{r}");
+    assert_eq!(
+        r["configured_video"],
+        serde_json::json!({"source": "bars"}),
+        "{r}"
+    );
+    assert_eq!(r["tally"], "program", "tally from the live bus: {r}");
+    assert_eq!(r["effective_audio"], "program", "{r}");
+    // A key whose output allowlist lacks `program:main` (so it may not read
+    // the Program bus) but may read bars: the live Program bus is redacted,
+    // the configured feed is shown.
+    let r =
+        row(&body_json(send(&rig.router, get("/api/v1/routing", OUTPUT_AXIS_TOKEN)).await).await);
+    assert_eq!(r["video"], serde_json::json!({"redacted": true}), "{r}");
+    assert_eq!(r["tally"], "redacted", "{r}");
+    assert_eq!(
+        r["configured_video"],
+        serde_json::json!({"source": "bars"}),
+        "{r}"
+    );
+    // And the reverse: on air a source the caller cannot read.
+    rig.fake
+        .state
+        .lock()
+        .unwrap()
+        .live
+        .as_mut()
+        .unwrap()
+        .outputs
+        .get_mut(OUT_B_CONFIG_ID)
+        .unwrap()
+        .bus = "src:secret-cam".into();
+    let scoped =
+        body_json(send(&rig.router, get("/api/v1/routing", SCOPED_ROUTER_TOKEN)).await).await;
+    assert!(!scoped.to_string().contains("secret-cam"), "{scoped}");
+    let r = row(&scoped);
+    assert_eq!(r["video"], serde_json::json!({"redacted": true}));
+    assert_eq!(r["configured_video"], serde_json::json!({"source": "bars"}));
+    let r = row(&body_json(send(&rig.router, get("/api/v1/routing", OPERATOR_TOKEN)).await).await);
+    assert_eq!(r["video"], serde_json::json!({"source": "secret-cam"}));
+    assert_eq!(
+        r["effective_audio"],
+        serde_json::json!({"source": "secret-cam"})
+    );
+    assert_eq!(r["tally"], "direct");
+}
+
+/// #329 F2: a key confined by `scoped_output_ids` alone (no object list) can
+/// plan/take, read and hear only its own outputs.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_output_scoped_key_routes_reads_and_hears_only_its_outputs() {
+    let dir = tempfile::tempdir().unwrap();
+    let rig = rig(&dir.path().join("boot.toml"), true);
+    let bars = || serde_json::json!({"source": "bars"});
+    // The other output: 403 on plan AND take, nothing enqueued, key unburned.
+    for path in ["/api/v1/routing/plan", "/api/v1/routing/output/take"] {
+        let resp = send(
+            &rig.router,
+            post(
+                path,
+                OUTPUT_AXIS_TOKEN,
+                Some("k"),
+                &body("output-0", bars()),
+            ),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN, "{path} output-0");
+    }
+    assert_eq!(rig.fake.takes().len(), 0);
+    // Its own output: 200 plan, 202 take.
+    let resp = send(
+        &rig.router,
+        post(
+            "/api/v1/routing/plan",
+            OUTPUT_AXIS_TOKEN,
+            None,
+            &body("output-1", bars()),
+        ),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let resp = send(
+        &rig.router,
+        take(&rig, OUTPUT_AXIS_TOKEN, "k", "output-1", bars()),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::ACCEPTED);
+    assert_eq!(rig.fake.takes().len(), 1);
+    // GET /routing lists only output-1.
+    let state = body_json(send(&rig.router, get("/api/v1/routing", OUTPUT_AXIS_TOKEN)).await).await;
+    let rows: Vec<&str> = state["outputs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r["output"].as_str().unwrap())
+        .collect();
+    assert_eq!(rows, vec!["output-1"], "{state}");
+    // Realtime: the same session filter the WS/SSE handlers install for it.
+    let mut session = SessionStream::new(rig.engine.subscribe(), "o", None).with_scopes(
+        None,
+        Some(vec!["output-1".to_owned()]),
+        None,
+    );
+    for output in ["output-0", "output-1"] {
+        rig.engine
+            .publish_event(Event::RouteOutput(multiview_events::RouteOutputEvent {
+                output: output.into(),
+                operation_id: String::new(),
+                tick: 1,
+                outcome: "applied".into(),
+            }));
+    }
+    let got = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if let Some(f) = session.next_delta().await.unwrap() {
+                return f;
+            }
+        }
+    })
+    .await
+    .unwrap();
+    match got.envelope.payload {
+        Event::RouteOutput(e) => assert_eq!(e.output, "output-1", "output-0 was filtered"),
+        other => panic!("{other:?}"),
+    }
+}
+
 struct Counters(Arc<multiview_engine::lateness::TickLateness>);
 impl multiview_control::program_metrics::ProgramMetricsSource for Counters {
     fn read(&self) -> Option<multiview_control::program_metrics::ProgramCounters> {
@@ -1117,4 +1367,195 @@ async fn program_metrics_are_whole_system_only() {
     assert_eq!(body["frames_repeated_total"], 3);
     assert_eq!(body["lateness_p99_ms"], 2.0);
     assert_eq!(body["lateness_max_ms"], 1.5);
+}
+
+/// PR #352 review (HIGH): an engine-minted boot take — `boot:<id>` and the
+/// audio-only `boot:audio:<id>` — is NEVER persisted, applied or not, so it
+/// cannot rewrite or delete the operator's accepted `[[routing.output]]` row;
+/// a normal applied take still persists. The accepted store itself is
+/// checked (its revision and its row), not just a snapshot.
+#[allow(clippy::too_many_lines)] // One scenario: an operator row, then both boot ids.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_applied_boot_take_never_rewrites_the_accepted_row() {
+    use multiview_control::output_routing::{is_boot_take, RoutedAudio};
+    let dir = tempfile::tempdir().unwrap();
+    let rig = rig(&dir.path().join("boot.toml"), true);
+    let mut events = SessionStream::new(rig.engine.subscribe(), "s", None);
+    // A normal applied take persists (out1 = bars).
+    let resp = send(
+        &rig.router,
+        take(
+            &rig,
+            OPERATOR_TOKEN,
+            "n1",
+            "output-1",
+            serde_json::json!({"source": "bars"}),
+        ),
+    )
+    .await;
+    let op = body_json(resp).await["operation_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert!(!is_boot_take(&op), "a client take is never a boot take");
+    rig.fake.emit_with_feed(
+        &op,
+        OUT_B_CONFIG_ID,
+        "applied",
+        RoutedFeed::Source("bars".into()),
+    );
+    wait_for(|| persisted_feed(&rig.state, OUT_B_CONFIG_ID).is_some()).await;
+    let accepted = || {
+        rig.state
+            .boot_model
+            .as_ref()
+            .unwrap()
+            .accepted()
+            .unwrap()
+            .unwrap()
+    };
+    let before = accepted();
+    let row_of = |d: &multiview_control::boot_model::DesiredState| {
+        d.config
+            .routing
+            .as_ref()
+            .and_then(|t| t.output.iter().find(|xp| xp.output == OUT_B_CONFIG_ID))
+            .cloned()
+    };
+    let before_row = row_of(&before).expect("the operator's row");
+    let boot_path = dir.path().join("boot.toml");
+    let on_disk = || {
+        multiview_control::boot_model::load_desired(&boot_path)
+            .unwrap()
+            .expect("desired.json")
+    };
+    assert_eq!(row_of(&on_disk()).as_ref(), Some(&before_row));
+    // Boot outcomes whose feed/audio differ from the row: Program video
+    // (would DELETE the row) and an audio-only `none` (would rewrite it).
+    let boot_ops = [
+        format!("boot:{OUT_B_CONFIG_ID}"),
+        format!("boot:audio:{OUT_B_CONFIG_ID}"),
+    ];
+    for (op, audio) in boot_ops
+        .iter()
+        .zip([RoutedAudio::Follow, RoutedAudio::None])
+    {
+        assert!(is_boot_take(op), "{op}");
+        rig.fake
+            .tx
+            .send(OutputOutcome {
+                operation_id: op.clone(),
+                output: OUT_B_CONFIG_ID.to_owned(),
+                tick: 90,
+                outcome: "applied".to_owned(),
+                feed: Some(RoutedFeed::Program),
+                audio: Some(audio),
+            })
+            .unwrap();
+    }
+    // The relay handles outcomes in order: both events prove both were seen.
+    let mut seen = Vec::new();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while seen.len() < boot_ops.len() {
+            if let Some(frame) = events.next_delta().await.unwrap() {
+                if let Event::RouteOutput(e) = &frame.envelope.payload {
+                    if is_boot_take(&e.operation_id) {
+                        seen.push(e.operation_id.clone());
+                    }
+                }
+            }
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(seen, boot_ops);
+    let after = accepted();
+    assert_eq!(
+        row_of(&after).as_ref(),
+        Some(&before_row),
+        "a boot outcome never rewrites the accepted row"
+    );
+    assert!(
+        Arc::ptr_eq(&before, &after),
+        "nothing was committed to the accepted store"
+    );
+    assert_eq!(
+        row_of(&on_disk()).as_ref(),
+        Some(&before_row),
+        "the durable store keeps the operator's row"
+    );
+    assert_eq!(
+        persisted_feed(&rig.state, OUT_B_CONFIG_ID),
+        Some(serde_json::json!({"source": "bars"}))
+    );
+}
+
+/// PR #352 review (HIGH, abuse): `video` (the live bus) and
+/// `configured_video` (the persisted feed) are redacted each by its own rule
+/// over HTTP: a key that may read the output and the Program bus but not the
+/// persisted source sees the live bus and `configured_video` redacted.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn readback_redacts_live_and_configured_video_independently() {
+    let dir = tempfile::tempdir().unwrap();
+    let rig = rig(&dir.path().join("boot.toml"), true);
+    // Persist out1 = secret-cam (an operator take, applied).
+    let resp = send(
+        &rig.router,
+        take(
+            &rig,
+            OPERATOR_TOKEN,
+            "s1",
+            "output-1",
+            serde_json::json!({"source": "secret-cam"}),
+        ),
+    )
+    .await;
+    let op = body_json(resp).await["operation_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    rig.fake.emit_with_feed(
+        &op,
+        OUT_B_CONFIG_ID,
+        "applied",
+        RoutedFeed::Source("secret-cam".into()),
+    );
+    wait_for(|| persisted_feed(&rig.state, OUT_B_CONFIG_ID).is_some()).await;
+    let mut outputs = HashMap::new();
+    outputs.insert(
+        OUT_B_CONFIG_ID.to_owned(),
+        OutputLive {
+            bus: "program".into(),
+            since_tick: 3,
+            pending: None,
+            degraded: false,
+            audio: None,
+            pending_audio: None,
+            private_audio: false,
+        },
+    );
+    rig.fake.state.lock().unwrap().live = Some(RoutingLive {
+        outputs,
+        encoders: 1,
+        sessions_in_use: 0,
+        sessions_max: 6,
+        dropped_ticks: 0,
+    });
+    let state = body_json(send(&rig.router, get("/api/v1/routing", BUS_ROUTER_TOKEN)).await).await;
+    assert!(!state.to_string().contains("secret-cam"), "{state}");
+    let r = state["outputs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["output"] == "output-1")
+        .cloned()
+        .unwrap();
+    assert_eq!(r["video"], serde_json::json!({"bus": "program"}), "{r}");
+    assert_eq!(
+        r["configured_video"],
+        serde_json::json!({"redacted": true}),
+        "{r}"
+    );
+    assert_eq!(r["tally"], "program", "{r}");
+    assert_eq!(r["state"], "on_air", "{r}");
 }

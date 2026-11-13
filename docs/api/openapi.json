@@ -9612,7 +9612,7 @@
         "tags": [
           "routing"
         ],
-        "summary": "`POST /api/v1/routing/output/take` — take an output feed (role: write;\nboth ends authorized; `Idempotency-Key` required). `202 {operation_id,\nstatus:\"accepted\", adopt:\"next_tick\"}`; a replay of the key answers the\nsame operation with `status` `pending` or `settled` (+ outcome) and is never\nenqueued again. The outcome rides `route.output`.",
+        "summary": "`POST /api/v1/routing/output/take` — take an output feed (role: write;\nboth ends authorized; `Idempotency-Key` required). `stream: video` takes\n`feed` (and `audio` with it when present); `stream: audio` takes only\n`audio` and leaves the video untouched. `202 {operation_id,\nstatus:\"accepted\", adopt:\"next_tick\"}`; a replay of the key answers the\nsame operation with `status` `pending` or `settled` (+ outcome) and is never\nenqueued again. The outcome rides `route.output`.",
         "operationId": "take_output",
         "parameters": [
           {
@@ -9677,7 +9677,7 @@
             }
           },
           "409": {
-            "description": "`routing-unavailable`, `switcher-required`, `output-kind-unroutable`, `capacity`, or `conflict` (the Idempotency-Key was first used for another output or feed; nothing is enqueued).",
+            "description": "`routing-unavailable`, `switcher-required`, `output-kind-unroutable`, `capacity`, `audio-unsupported` (the output has no program-audio slot for a routed audio feed, or its transport cannot select a discrete track), or `conflict` (the Idempotency-Key was first used for another output, feed or audio; nothing is enqueued).",
             "content": {
               "application/json": {
                 "schema": {
@@ -9687,7 +9687,7 @@
             }
           },
           "422": {
-            "description": "`unknown-feed`, missing Idempotency-Key, or an unsupported audio request.",
+            "description": "`unknown-feed` (video or audio), `audio-unsupported` (more than one track: the output carries one routed audio feed), a body whose `stream` and `feed`/`audio` do not match (`stream: video` needs `feed`; `stream: audio` needs `audio` and no `feed`), or a missing Idempotency-Key.",
             "content": {
               "application/json": {
                 "schema": {
@@ -9707,7 +9707,7 @@
             }
           },
           "503": {
-            "description": "`engine-busy`: the take mailbox is full (the key is freed); or `idempotency-capacity`: the take store holds its maximum of distinct keys (fails closed; existing keys still replay).",
+            "description": "`engine-busy`: the take mailbox is full (the key is freed); or `idempotency-capacity`: the caller's (or every) take record is still pending at its cap (fails closed; pending keys still replay; settled records are evicted oldest-first otherwise).",
             "content": {
               "application/json": {
                 "schema": {
@@ -19683,6 +19683,19 @@
           "fits"
         ],
         "properties": {
+          "audio_cost": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Operator text of the audio cost, e.g. \"+1 audio encode (transient,\nCPU)\"; absent when the take costs no audio encode."
+          },
+          "audio_encoders": {
+            "type": "integer",
+            "format": "int32",
+            "description": "`1` when the take changes the output's audio and the output has no\nprivate audio bus yet (+1 transient CPU AAC encode), else `0`.",
+            "minimum": 0
+          },
           "encoder_sessions": {
             "type": [
               "string",
@@ -19716,7 +19729,7 @@
           },
           "type": {
             "type": "string",
-            "description": "`capacity` | `unknown-feed` | `switcher-required` | `output-kind-unroutable`."
+            "description": "`capacity` | `unknown-feed` | `switcher-required` |\n`output-kind-unroutable` | `audio-unsupported`."
           }
         }
       },
@@ -19758,24 +19771,22 @@
         "type": "object",
         "description": "The body of an output plan / take.",
         "required": [
-          "target",
-          "feed"
+          "target"
         ],
         "properties": {
           "audio": {
-            "oneOf": [
-              {
-                "type": "null"
-              },
-              {
-                "$ref": "#/components/schemas/OutputTakeAudio",
-                "description": "Optional audio (take only; `follow` is the only slice-1 value)."
-              }
-            ]
+            "type": [
+              "object",
+              "null"
+            ],
+            "description": "The audio feed, externally tagged like the config `audio`:\n`\"follow\" | \"program\" | \"none\" | {\"source\":\"<id>\"} |\n{\"tracks\":[\"<name>\"]}`. Required with `stream: audio` (an audio-only\ntake); optional with `stream: video` (audio taken together with the\nvideo; absent keeps the output's audio choice). One track at most:\nthe routed audio rides the output's single program-audio slot."
           },
           "feed": {
-            "type": "object",
-            "description": "The feed: `{\"bus\":\"program\"|\"preview\"|\"clean\"}` or `{\"source\":\"vt1\"}`."
+            "type": [
+              "object",
+              "null"
+            ],
+            "description": "The video feed: `{\"bus\":\"program\"|\"preview\"|\"clean\"}` or\n`{\"source\":\"vt1\"}`. Required with `stream: video`; absent with\n`stream: audio`."
           },
           "target": {
             "$ref": "#/components/schemas/OutputTargetKind",
@@ -19790,6 +19801,7 @@
         "required": [
           "output",
           "video",
+          "configured_video",
           "audio",
           "effective_audio",
           "tally",
@@ -19800,9 +19812,13 @@
             "type": "object",
             "description": "The configured audio feed (`\"follow\"` unless set)."
           },
+          "configured_video": {
+            "type": "object",
+            "description": "The configured (persisted) video feed, redacted by the same rule. It\ndiffers from `video` after a refused start-up take or a fallback: the\noperator's intent is kept, Program is on air."
+          },
           "effective_audio": {
             "type": "object",
-            "description": "What the audio carries now: `\"program\"` (the program mix),\n`{\"source\": id}`, `\"preview_source\"`, or `{\"redacted\": true}`."
+            "description": "What the audio carries now (from the on-air feed): `\"program\"` (the program mix),\n`{\"source\": id}`, `\"preview_source\"`, `\"none\"` (silence),\n`{\"tracks\": [name]}`, or `{\"redacted\": true}`. From the engine's live\nreadback when it reports one, else resolved from the configured feed."
           },
           "output": {
             "type": "string",
@@ -19834,11 +19850,11 @@
           },
           "tally": {
             "$ref": "#/components/schemas/OutputTally",
-            "description": "Whether the feed follows the switcher (`program`) or is direct\n(`source`) or the preview bus — the tally distinction (§8)."
+            "description": "Whether the ON-AIR feed follows the switcher (`program`) or is direct\n(`source`) or the preview bus — the tally distinction (§8)."
           },
           "video": {
             "type": "object",
-            "description": "The configured video feed: `{\"bus\": \"program\"}`, `{\"source\": \"vt1\"}`,\nor `{\"redacted\": true}` when the caller may not read the feed."
+            "description": "The video feed ON AIR: the engine's live bus when it reports one for\nthis output, else the configured feed. `{\"bus\": \"program\"}`,\n`{\"source\": \"vt1\"}`, or `{\"redacted\": true}` when the caller may not\nread the feed."
           }
         }
       },
@@ -19846,7 +19862,8 @@
         "type": "string",
         "description": "The stream of an output a take re-points.",
         "enum": [
-          "video"
+          "video",
+          "audio"
         ]
       },
       "OutputTakeAccepted": {
@@ -19890,13 +19907,6 @@
           }
         }
       },
-      "OutputTakeAudio": {
-        "type": "string",
-        "description": "The audio request of an output take; slice 1 accepts only `follow`.",
-        "enum": [
-          "follow"
-        ]
-      },
       "OutputTally": {
         "type": "string",
         "description": "How an output's feed relates to the switcher (ADR-0108 §8 tally).",
@@ -19922,7 +19932,7 @@
           },
           "stream": {
             "$ref": "#/components/schemas/OutputStream",
-            "description": "The stream re-pointed: only `video` in slice 1."
+            "description": "The stream re-pointed: `video` (the video feed, with an optional\naudio feed alongside) or `audio` (an audio-only take: the video is\nuntouched)."
           }
         },
         "additionalProperties": false
@@ -20277,6 +20287,13 @@
           "held_ticks"
         ],
         "properties": {
+          "audio": {
+            "type": [
+              "object",
+              "null"
+            ],
+            "description": "The audio feed the pending take carries, when it carries one\n(`\"follow\"`, `\"program\"`, `\"none\"`, `{\"source\": id}`,\n`{\"tracks\": [name]}`, or `{\"redacted\": true}`)."
+          },
           "held_ticks": {
             "type": "integer",
             "format": "int64",
@@ -20285,7 +20302,7 @@
           },
           "video": {
             "type": "object",
-            "description": "The destination feed, or `{\"redacted\": true}`."
+            "description": "The destination feed (the current feed for an audio-only take), or\n`{\"redacted\": true}`."
           }
         }
       },

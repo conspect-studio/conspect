@@ -391,18 +391,27 @@ impl CrosspointKind {
 pub struct OutputRouteState {
     /// The output's API id (the id `/api/v1/outputs/{id}` addresses).
     pub output: String,
-    /// The configured video feed: `{"bus": "program"}`, `{"source": "vt1"}`,
-    /// or `{"redacted": true}` when the caller may not read the feed.
+    /// The video feed ON AIR: the engine's live bus when it reports one for
+    /// this output, else the configured feed. `{"bus": "program"}`,
+    /// `{"source": "vt1"}`, or `{"redacted": true}` when the caller may not
+    /// read the feed.
     #[cfg_attr(feature = "openapi", schema(value_type = Object))]
     pub video: serde_json::Value,
+    /// The configured (persisted) video feed, redacted by the same rule. It
+    /// differs from `video` after a refused start-up take or a fallback: the
+    /// operator's intent is kept, Program is on air.
+    #[cfg_attr(feature = "openapi", schema(value_type = Object))]
+    pub configured_video: serde_json::Value,
     /// The configured audio feed (`"follow"` unless set).
     #[cfg_attr(feature = "openapi", schema(value_type = Object))]
     pub audio: serde_json::Value,
-    /// What the audio carries now: `"program"` (the program mix),
-    /// `{"source": id}`, `"preview_source"`, or `{"redacted": true}`.
+    /// What the audio carries now (from the on-air feed): `"program"` (the program mix),
+    /// `{"source": id}`, `"preview_source"`, `"none"` (silence),
+    /// `{"tracks": [name]}`, or `{"redacted": true}`. From the engine's live
+    /// readback when it reports one, else resolved from the configured feed.
     #[cfg_attr(feature = "openapi", schema(value_type = Object))]
     pub effective_audio: serde_json::Value,
-    /// Whether the feed follows the switcher (`program`) or is direct
+    /// Whether the ON-AIR feed follows the switcher (`program`) or is direct
     /// (`source`) or the preview bus — the tally distinction (§8).
     pub tally: OutputTally,
     /// `configured` until the engine reports readback for this output, then
@@ -420,9 +429,16 @@ pub struct OutputRouteState {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 pub struct PendingRoute {
-    /// The destination feed, or `{"redacted": true}`.
+    /// The destination feed (the current feed for an audio-only take), or
+    /// `{"redacted": true}`.
     #[cfg_attr(feature = "openapi", schema(value_type = Object))]
     pub video: serde_json::Value,
+    /// The audio feed the pending take carries, when it carries one
+    /// (`"follow"`, `"program"`, `"none"`, `{"source": id}`,
+    /// `{"tracks": [name]}`, or `{"redacted": true}`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "openapi", schema(value_type = Option<Object>))]
+    pub audio: Option<serde_json::Value>,
     /// Ticks the take has been held.
     pub held_ticks: u64,
 }
@@ -549,7 +565,8 @@ pub(crate) async fn get_routing(
     let mut outputs = Vec::with_capacity(resources.len());
     for versioned in resources {
         let id = versioned.resource.id;
-        if crate::auth::authorize_object(&principal, &id).is_err() {
+        // The same two-axis rule the take uses (object + output axis).
+        if super::output_routing::authorize_output_end(&principal, &id).is_err() {
             continue;
         }
         let body: multiview_config::Output = serde_json::from_value(versioned.resource.body)
@@ -565,10 +582,12 @@ pub(crate) async fn get_routing(
                     multiview_config::MAIN_PROGRAM,
                 )
             });
-        let mut row = output_route_state(&principal, &feed, id);
+        let live_output = live.as_ref().and_then(|l| l.outputs.get(&config_id));
+        let mut row = on_air_route_state(&principal, &feed, live_output, id);
         if let Some(live) = live.as_ref() {
             apply_live(&principal, &mut row, live.outputs.get(&config_id));
         }
+        redact_track_inputs(&principal, &config, &mut row);
         outputs.push(row);
     }
     let buses = live.as_ref().map(|live| RoutingBuses {
@@ -593,6 +612,41 @@ pub(crate) fn api_id_of(state: &AppState, config_id: &str) -> Option<String> {
             serde_json::from_value(versioned.resource.body).ok()?;
         (body.id() == config_id).then_some(versioned.resource.id)
     })
+}
+
+/// The row for `feed` (the configured crosspoint) when `live` (the engine's
+/// readback for this output) says what is on air: `video`, `tally` and
+/// `effective_audio` come from the LIVE bus, `configured_video` from the
+/// configured feed — each redacted by its own per-object rule (#329). A live
+/// bus the control plane cannot name keeps the configured view.
+fn on_air_route_state(
+    principal: &Principal,
+    feed: &multiview_config::OutputCrosspoint,
+    live: Option<&crate::output_routing::OutputLive>,
+    output: String,
+) -> OutputRouteState {
+    let Some(on_air) = live
+        .and_then(|l| crate::output_routing::RoutedFeed::from_bus_name(&l.bus))
+        .map(|bus| bus.video_feed())
+    else {
+        return output_route_state(principal, feed, output);
+    };
+    // `video`, `tally` and `effective_audio`: the LIVE bus, by
+    // `may_read_feed(live)` alone.
+    let mut live_xp = feed.clone();
+    live_xp.video = Some(on_air);
+    let mut row = output_route_state(principal, &live_xp, output);
+    // `configured_video`: the persisted feed, by `may_read_feed(configured)`
+    // alone — never derived from the live row, so neither field's
+    // readability can hide or disclose the other.
+    let configured = feed.effective_video();
+    row.configured_video = if may_read_feed(principal, &configured) {
+        serde_json::to_value(&configured)
+            .unwrap_or_else(|_| serde_json::json!({ "redacted": true }))
+    } else {
+        serde_json::json!({ "redacted": true })
+    };
+    row
 }
 
 /// Fold the engine readback into a row, redacting per the row's own rules:
@@ -628,9 +682,93 @@ fn apply_live(
             .unwrap_or_else(|| redacted.clone());
         PendingRoute {
             video,
+            audio: live.pending_audio.as_deref().map(|label| {
+                audio_of_label(label)
+                    .filter(|feed| may_read_audio(principal, feed))
+                    .and_then(|feed| serde_json::to_value(feed).ok())
+                    .unwrap_or_else(|| redacted.clone())
+            }),
             held_ticks: *held,
         }
     });
+    // What the output carries now, from the engine (a hidden video feed keeps
+    // its effective audio hidden: `follow` would disclose it).
+    if row.tally != OutputTally::Redacted {
+        if let Some(label) = live.audio.as_deref() {
+            row.effective_audio = effective_audio_of_label(principal, label);
+        }
+    }
+}
+
+/// A `{"tracks": [..]}` value carries each track's route input audio
+/// (§6.3): one the caller may not read redacts the whole value, the same
+/// rule the take's authorization applies.
+fn redact_track_inputs(
+    principal: &Principal,
+    config: &multiview_config::MultiviewConfig,
+    row: &mut OutputRouteState,
+) {
+    let readable = |value: &serde_json::Value| -> bool {
+        let Some(tracks) = value.get("tracks").and_then(serde_json::Value::as_array) else {
+            return true;
+        };
+        tracks
+            .iter()
+            .filter_map(serde_json::Value::as_str)
+            .all(|track| {
+                super::output_routing::track_input(config, track)
+                    .is_none_or(|input| crate::auth::authorize_object(principal, &input).is_ok())
+            })
+    };
+    let redacted = serde_json::json!({ "redacted": true });
+    if !readable(&row.audio) {
+        row.audio = redacted.clone();
+    }
+    if !readable(&row.effective_audio) {
+        row.effective_audio = redacted.clone();
+    }
+    if let Some(audio) = row.pending.as_mut().and_then(|p| p.audio.as_mut()) {
+        if !readable(audio) {
+            *audio = redacted;
+        }
+    }
+}
+
+/// An engine choice label (`follow`, `program`, `none`, `src:<id>`,
+/// `track:<name>`) as the config audio feed (`None` for `preview` or an
+/// unknown label).
+fn audio_of_label(label: &str) -> Option<multiview_config::AudioFeed> {
+    use multiview_config::AudioFeed;
+    match label {
+        "follow" => Some(AudioFeed::Follow),
+        "program" => Some(AudioFeed::Program),
+        "none" => Some(AudioFeed::None),
+        _ => label
+            .strip_prefix("src:")
+            .map(|id| AudioFeed::Source(id.to_owned()))
+            .or_else(|| {
+                label
+                    .strip_prefix("track:")
+                    .map(|name| AudioFeed::Tracks(vec![name.to_owned()]))
+            }),
+    }
+}
+
+/// The `effective_audio` value of an engine carried-audio label, redacted
+/// per [`may_read_audio`] (the PVW source's audio needs the Program scope).
+fn effective_audio_of_label(principal: &Principal, label: &str) -> serde_json::Value {
+    let redacted = serde_json::json!({ "redacted": true });
+    if label == "preview" {
+        return if program_scope(principal) {
+            serde_json::json!("preview_source")
+        } else {
+            redacted
+        };
+    }
+    audio_of_label(label)
+        .filter(|feed| may_read_audio(principal, feed))
+        .and_then(|feed| serde_json::to_value(feed).ok())
+        .unwrap_or(redacted)
 }
 
 /// Whether `principal` may read `feed` (ADR-0108 §6.3): Read on a source; the
@@ -708,6 +846,7 @@ fn output_route_state(
         return OutputRouteState {
             output,
             video: redacted.clone(),
+            configured_video: redacted.clone(),
             audio,
             effective_audio: redacted,
             tally: OutputTally::Redacted,
@@ -725,14 +864,22 @@ fn output_route_state(
     // `follow` of a readable video feed resolves to audio of that same feed
     // (its own source, the PVW source or the mix), so it discloses nothing
     // beyond what the readable video already shows.
-    let effective_audio = match FollowAudio::of(&video) {
-        FollowAudio::Source(id) => serde_json::json!({ "source": id }),
-        FollowAudio::PreviewSource => serde_json::json!("preview_source"),
-        _ => serde_json::json!("program"),
+    // An explicit audio feed is what the output carries (already redacted
+    // per its own rule above).
+    let effective_audio = if feed.audio.is_follow() {
+        match FollowAudio::of(&video) {
+            FollowAudio::Source(id) => serde_json::json!({ "source": id }),
+            FollowAudio::PreviewSource => serde_json::json!("preview_source"),
+            _ => serde_json::json!("program"),
+        }
+    } else {
+        audio.clone()
     };
+    let video = serde_json::to_value(&video).unwrap_or_else(|_| redacted.clone());
     OutputRouteState {
         output,
-        video: serde_json::to_value(&video).unwrap_or_else(|_| redacted.clone()),
+        configured_video: video.clone(),
+        video,
         audio,
         effective_audio,
         tally,
@@ -744,7 +891,7 @@ fn output_route_state(
 
 #[cfg(test)]
 mod redaction_tests {
-    use super::{output_route_state, OutputTally};
+    use super::{on_air_route_state, output_route_state, OutputTally};
     use crate::auth::{Principal, Role};
     use multiview_config::{AudioFeed, OutputCrosspoint, VideoFeed};
 
@@ -756,6 +903,91 @@ mod redaction_tests {
             scoped_output_ids: None,
             scoped_discovery_domains: None,
         }
+    }
+
+    /// A key on output `o` with the Program scope (and the M/E), and the
+    /// extra objects `objects`.
+    fn program_scoped(objects: &[&str]) -> Principal {
+        let mut all = vec!["o", "me1"];
+        all.extend_from_slice(objects);
+        Principal {
+            scoped_output_ids: Some(vec!["program:main".into(), "o".into()]),
+            ..scoped(&all)
+        }
+    }
+
+    fn live(bus: &str) -> crate::output_routing::OutputLive {
+        crate::output_routing::OutputLive {
+            bus: bus.to_owned(),
+            since_tick: 1,
+            pending: None,
+            degraded: false,
+            audio: None,
+            pending_audio: None,
+            private_audio: false,
+        }
+    }
+
+    /// PR #352 review (HIGH, abuse): `video` (the live bus) and
+    /// `configured_video` (the persisted feed) are redacted independently.
+    #[test]
+    fn live_and_configured_video_are_redacted_independently() {
+        let redacted = serde_json::json!({ "redacted": true });
+        let mut feed = OutputCrosspoint::program("o", "main");
+        feed.video = Some(VideoFeed::Source("secret-cam".into()));
+        // Live bus readable (Program scope), persisted source not.
+        let row = on_air_route_state(
+            &program_scoped(&[]),
+            &feed,
+            Some(&live("program")),
+            "o".into(),
+        );
+        assert_eq!(row.video, serde_json::json!({ "bus": "program" }));
+        assert_eq!(row.configured_video, redacted);
+        assert_eq!(row.tally, OutputTally::Program);
+        let json = serde_json::to_string(&row).unwrap_or_default();
+        assert!(!json.contains("secret"), "{json}");
+        // The reverse: persisted source readable, live source not.
+        feed.video = Some(VideoFeed::Source("bars".into()));
+        let row = on_air_route_state(
+            &scoped(&["o", "bars"]),
+            &feed,
+            Some(&live("src:secret-cam")),
+            "o".into(),
+        );
+        assert_eq!(row.video, redacted);
+        assert_eq!(
+            row.configured_video,
+            serde_json::json!({ "source": "bars" })
+        );
+        assert_eq!(row.tally, OutputTally::Redacted);
+        assert_eq!(row.effective_audio, redacted, "follow of a hidden bus");
+        let json = serde_json::to_string(&row).unwrap_or_default();
+        assert!(!json.contains("secret"), "{json}");
+        // Neither readable: both redacted; both readable: both shown.
+        feed.video = Some(VideoFeed::Source("secret-mic".into()));
+        let row = on_air_route_state(
+            &scoped(&["o"]),
+            &feed,
+            Some(&live("src:secret-cam")),
+            "o".into(),
+        );
+        assert_eq!(
+            (row.video.clone(), row.configured_video.clone()),
+            (redacted.clone(), redacted)
+        );
+        let row = on_air_route_state(
+            &scoped(&["o", "secret-mic", "secret-cam"]),
+            &feed,
+            Some(&live("src:secret-cam")),
+            "o".into(),
+        );
+        assert_eq!(row.video, serde_json::json!({ "source": "secret-cam" }));
+        assert_eq!(
+            row.configured_video,
+            serde_json::json!({ "source": "secret-mic" })
+        );
+        assert_eq!(row.tally, OutputTally::Direct);
     }
 
     #[test]
