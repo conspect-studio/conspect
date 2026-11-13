@@ -335,7 +335,8 @@ pub(crate) fn outputs_view(state: &AppState, principal: &Principal) -> ControlRe
             .map_or("P1", crate::output_routing::PlanPath::as_str);
         // Slot 0 carries the accepted audio feed (default `follow`, redacted
         // per GET /routing's rule); slots i > 0 their configured track.
-        let accepted_audio = super::routing::audio_feed_view(principal, &feeds, &body.id());
+        let accepted_audio =
+            super::routing::audio_feed_view(principal, &config, &feeds, &body.id());
         let audio: Vec<Value> = match body.slots().map(|s| s.audio.as_slice()) {
             Some(slots) if !slots.is_empty() => slots
                 .iter()

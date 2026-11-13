@@ -89,6 +89,8 @@ const OUT_B: &str = "hls /tmp/patch-outputs/b/index.m3u8";
 const OUT1: &str = "patch-out1.patch-out1-secret";
 /// output-1 on the object axis only: no output-axis grant.
 const NO_OUTPUT_AXIS: &str = "patch-noaxis.patch-noaxis-secret";
+/// output-1 on both axes, bars and the track name `eng`, not `secret-cam`.
+const TRACK_ONLY: &str = "patch-track.patch-track-secret";
 /// A second principal with output-0 + output-1 on both axes and bars.
 const OTHER: &str = "patch-other.patch-other-secret";
 
@@ -110,6 +112,11 @@ fn keys() -> ApiKeyStore {
         "patch-noaxis",
         "patch-noaxis-secret",
         scoped("patch-noaxis", &["output-1", "bars"], &[]),
+    );
+    keys.register(
+        "patch-track",
+        "patch-track-secret",
+        scoped("patch-track", &["output-1", "bars", "eng"], &["output-1"]),
     );
     keys.register(
         "patch-other",
@@ -1075,4 +1082,52 @@ fn api_path(api_id: &str) -> String {
         1 => "b".to_owned(),
         n => format!("r{}", n - 2),
     }
+}
+
+/// Review M6: a `tracks` audio feed whose route input the caller may not
+/// read is `{redacted: true}` on BOTH `GET /patch` (audio slot 0) and
+/// `GET /routing` (the row's `audio`): one rule, so the endpoints never
+/// disagree. A caller who may read the input sees the tracks on both.
+#[tokio::test]
+async fn a_track_feed_with_an_unreadable_route_input_is_redacted_on_both_endpoints() {
+    let dir = tempfile::tempdir().unwrap();
+    let doc = format!(
+        "{DOC}\n[audio]\nsample_rate_hz = 48000\n[[audio.routes]]\ninput_id = \"secret-cam\"\nchannels = {{ kind = \"stereo\" }}\ntarget_track = \"eng\"\n\n[[routing.output]]\noutput = \"{OUT_B}\"\nprogram = \"main\"\naudio = {{ tracks = [\"eng\"] }}\n"
+    );
+    let rig = rig_with(&dir.path().join("boot.toml"), &doc);
+    // TRACK_ONLY: output-1 on both axes, bars and the track name `eng` —
+    // but not the track's route input `secret-cam`.
+    let track_token = TRACK_ONLY;
+    let routing_audio = |body: &Value| {
+        body["outputs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["output"] == "output-1")
+            .map(|r| r["audio"].clone())
+            .unwrap()
+    };
+    let patch_audio = |body: &Value| {
+        body["outputs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|o| o["output"] == "output-1")
+            .map(|o| o["audio"][0]["source"].clone())
+            .unwrap()
+    };
+    // The scoped caller: redacted on both.
+    let patch = body_json(send(&rig.router, get("/api/v1/patch", track_token)).await).await;
+    let routing = body_json(send(&rig.router, get("/api/v1/routing", track_token)).await).await;
+    assert_eq!(patch_audio(&patch), json!({"redacted": true}), "{patch}");
+    assert_eq!(
+        routing_audio(&routing),
+        json!({"redacted": true}),
+        "{routing}"
+    );
+    // The whole-system operator: the tracks on both, identically.
+    let patch = body_json(send(&rig.router, get("/api/v1/patch", OPERATOR_TOKEN)).await).await;
+    let routing = body_json(send(&rig.router, get("/api/v1/routing", OPERATOR_TOKEN)).await).await;
+    assert_eq!(patch_audio(&patch), json!({"tracks": ["eng"]}), "{patch}");
+    assert_eq!(patch_audio(&patch), routing_audio(&routing));
 }
