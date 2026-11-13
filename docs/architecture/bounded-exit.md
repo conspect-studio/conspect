@@ -82,7 +82,10 @@ restarting.
      - **The deadline:** the watchdog fires 2 s after the first exit decision, measured on
        its own monotonic clock. It runs at the output clock's scheduling class (macOS QoS
        user-interactive; the class it got is logged). Its wake-up was 0–10 ms late on an idle
-       host and on one loaded with 28 busy CPU loops. The chaos test requires at most 50 ms.
+       host and on one loaded with 28 busy CPU loops. On a macOS CI VM, one 2 s timed wait
+       woke 92 ms late: the OS lets a long timed wait wake late by an amount that grows with
+       the timeout (timer coalescing). So the watchdog waits until 20 ms before the deadline,
+       then in 1 ms steps, which wake almost on time. The chaos test requires at most 50 ms.
      - **The exit path:** after the fire, a backstop thread starts first; then the watchdog
        writes the notice (a complete raw write to fd 2) and calls the C runtime exit. If
        either blocks, the backstop kills the process: at most 500 ms

@@ -149,8 +149,16 @@ impl Watchdog {
             let due_at = self.origin + Duration::from_nanos(due);
             let now = Instant::now();
             if due_at > now {
-                // Wake at the deadline, or earlier on an arm that moved it.
-                std::thread::park_timeout(due_at - now);
+                // #350: macOS lets a timed wait wake late by a slop that grows
+                // with the timeout (timer coalescing; a CI VM fired 92 ms late
+                // after one 2 s wait). Wait until FINAL_APPROACH before the
+                // deadline, then in short steps that get almost no slop.
+                let left = due_at - now;
+                std::thread::park_timeout(
+                    left.checked_sub(FINAL_APPROACH)
+                        .filter(|far| !far.is_zero())
+                        .unwrap_or_else(|| left.min(FINAL_STEP)),
+                );
                 continue;
             }
             // Decision (the first arm) -> fire, on the monotonic clock.
@@ -198,6 +206,12 @@ impl Default for Watchdog {
         Self::new()
     }
 }
+
+/// The watchdog's last approach to the deadline is made in [`FINAL_STEP`]
+/// waits, which the OS wakes almost on time (#350).
+const FINAL_APPROACH: Duration = Duration::from_millis(20);
+/// One short wait of the final approach.
+const FINAL_STEP: Duration = Duration::from_millis(1);
 
 /// How long the ordinary exit path may take before the process is killed.
 pub const EXIT_PATH_GRACE: Duration = Duration::from_millis(500);

@@ -255,7 +255,7 @@ PY
   # the decision (its own clock).
   [ -n "${fire_ms}" ] || { echo "  FAIL: no fired_after_decision_ms in the hard-exit line"; return 1; }
   [ "${fire_ms}" -ge "${BOUND_MS}" ] && [ "${fire_ms}" -le $((BOUND_MS + FIRE_SLACK_MS)) ] \
-    || { echo "  FAIL: watchdog fired ${fire_ms} ms after the decision (want ${BOUND_MS}..$((BOUND_MS + FIRE_SLACK_MS)))"; return 1; }
+    || { echo "  FAIL: watchdog fired ${fire_ms} ms after the decision (want ${BOUND_MS}..$((BOUND_MS + FIRE_SLACK_MS)))"; grep -E "scheduling class|chaos|teardown overran" "${log}" | cut -c1-240 | tail -6; return 1; }
   grep -q "exit watchdog scheduling class" "${log}" || { echo "  FAIL: watchdog class not reported"; return 1; }
   if [ "${mode}" = falterstop ]; then
     grep -q "chaos: forced shed" "${log}" || { echo "  FAIL: forced shed not exercised"; return 1; }
